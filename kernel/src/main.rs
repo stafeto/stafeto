@@ -35,6 +35,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     let rest = mm::phys::init(&boot);
     mm::kmap::switch_to_kernel_tables(&boot);
     mm::phys::add(rest.as_slice());
+    mm::aspace::init(&boot);
     arch::gic::init(&boot.info);
     let clock = arch::timer::init();
     report(&boot, clock);

@@ -25,9 +25,17 @@ pub fn sctlr_el1() -> u64 {
     read_sysreg!("sctlr_el1")
 }
 
-#[cfg(feature = "ktest")]
 pub fn ttbr0_el1() -> u64 {
     read_sysreg!("ttbr0_el1")
+}
+
+pub fn id_aa64mmfr0_el1() -> u64 {
+    read_sysreg!("id_aa64mmfr0_el1")
+}
+
+#[cfg(feature = "ktest")]
+pub fn tcr_el1() -> u64 {
+    read_sysreg!("tcr_el1")
 }
 
 #[cfg(feature = "ktest")]
@@ -58,6 +66,29 @@ pub fn at_s1e1w(va: usize) -> u64 {
     // SAFETY: as in `at_s1e1r`.
     unsafe {
         core::arch::asm!("at s1e1w, {va}", "isb", "mrs {par}, par_el1", va = in(reg) va, par = out(reg) par, options(nostack, preserves_flags))
+    };
+    par
+}
+
+/// PAR_EL1 after a stage-1 translation of `va` for an EL0 read: EL0's
+/// rights, looked up from EL1.
+#[cfg(feature = "ktest")]
+pub fn at_s1e0r(va: usize) -> u64 {
+    let par: u64;
+    // SAFETY: as in `at_s1e1r`.
+    unsafe {
+        core::arch::asm!("at s1e0r, {va}", "isb", "mrs {par}, par_el1", va = in(reg) va, par = out(reg) par, options(nostack, preserves_flags))
+    };
+    par
+}
+
+/// PAR_EL1 after a stage-1 translation of `va` for an EL0 write.
+#[cfg(feature = "ktest")]
+pub fn at_s1e0w(va: usize) -> u64 {
+    let par: u64;
+    // SAFETY: as in `at_s1e1r`.
+    unsafe {
+        core::arch::asm!("at s1e0w, {va}", "isb", "mrs {par}, par_el1", va = in(reg) va, par = out(reg) par, options(nostack, preserves_flags))
     };
     par
 }

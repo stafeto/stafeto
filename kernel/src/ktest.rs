@@ -7,6 +7,7 @@
 use crate::arch::symbols;
 use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
+use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::KernelPages;
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
@@ -15,9 +16,13 @@ use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
 use kcore::frames::{PAGE_SIZE, PhysMem};
 use kcore::gic::{Ack, DEFAULT_PRIORITY};
-use kcore::layout::{GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, frame_fits};
+use kcore::layout::{
+    GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, USER_END, frame_fits, image_pa,
+};
 use kcore::memmap;
-use kcore::paging::{MAIR_DEVICE, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, attr_index};
+use kcore::paging::{
+    Attrs, MAIR_DEVICE, MapError, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
+};
 use kcore::slab::Pool;
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
@@ -96,6 +101,38 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "pending_interrupt_shows_while_masked",
         pending_interrupt_shows_while_masked,
+    ),
+    (
+        "asids_are_as_wide_as_tcr_allows",
+        asids_are_as_wide_as_tcr_allows,
+    ),
+    (
+        "user_pages_follow_their_rights",
+        user_pages_follow_their_rights,
+    ),
+    (
+        "switching_spaces_switches_translations",
+        switching_spaces_switches_translations,
+    ),
+    (
+        "unmapped_page_no_longer_translates",
+        unmapped_page_no_longer_translates,
+    ),
+    (
+        "asid_rollover_hides_old_mappings",
+        asid_rollover_hides_old_mappings,
+    ),
+    (
+        "released_asid_hides_old_mappings",
+        released_asid_hides_old_mappings,
+    ),
+    (
+        "destroying_a_space_returns_its_tables",
+        destroying_a_space_returns_its_tables,
+    ),
+    (
+        "ttbr0_is_empty_outside_processes",
+        ttbr0_is_empty_outside_processes,
     ),
 ];
 
@@ -259,6 +296,9 @@ struct LiveTables;
 unsafe impl TableMemory for LiveTables {
     fn alloc_table(&mut self) -> Option<u64> {
         None
+    }
+    fn free_table(&mut self, _: u64) {
+        panic!("the live-table walk frees nothing");
     }
     fn read(&self, pa: u64) -> u64 {
         // SAFETY: the walk only reads the live kernel tables.
@@ -628,5 +668,369 @@ fn pending_interrupt_shows_while_masked(_: &Boot) -> Result<(), &'static str> {
     check(
         !arch::irq_pending(),
         "ISR_EL1 shows an interrupt after the EOI",
+    )
+}
+
+fn asids_are_as_wide_as_tcr_allows(_: &Boot) -> Result<(), &'static str> {
+    check(
+        registers::tcr_el1() & (1 << 36) != 0,
+        "TCR_EL1.AS is clear on a CPU with 16-bit ASIDs",
+    )?;
+    check(
+        aspace::asid_bits() == 16,
+        "the ASID allocator is not 16 bits wide",
+    )
+}
+
+/// A user address for the address space tests: 4 MiB, away from 0.
+const USER_VA: usize = 0x40_0000;
+const PAGE: usize = PAGE_SIZE as usize;
+
+/// PAR_EL1.PA, bits [47:12], after a translation that succeeded.
+const PAR_PA: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// A frame from the allocator, every word of it set to `pattern`.
+fn frame_with(pattern: u64) -> Result<u64, &'static str> {
+    let pa = phys::FRAMES
+        .lock()
+        .as_mut()
+        .ok_or("no frame allocator")?
+        .alloc(0)
+        .ok_or("out of frames")?;
+    // SAFETY: the frame was just taken from the allocator.
+    let mut mem = unsafe { LinearMem::new() };
+    for i in 0..PAGE_SIZE / 8 {
+        mem.write(pa + i * 8, pattern);
+    }
+    Ok(pa)
+}
+
+fn free_frame(pa: u64) {
+    phys::FRAMES
+        .lock()
+        .as_mut()
+        .expect("frame allocator")
+        .free(pa, 0);
+}
+
+/// The word at user address `va` in the active address space.
+fn read_user(va: usize) -> u64 {
+    // SAFETY: the caller has mapped `va` in the active space. The
+    // cortex-a72 has no PAN, so EL1 reads pages that EL0 may read.
+    unsafe { (va as *const u64).read_volatile() }
+}
+
+/// An address space that a test destroys when it is done with it, also on
+/// an early return.
+struct TestSpace(AddressSpace);
+
+impl Drop for TestSpace {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+impl core::ops::Deref for TestSpace {
+    type Target = AddressSpace;
+    fn deref(&self) -> &AddressSpace {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for TestSpace {
+    fn deref_mut(&mut self) -> &mut AddressSpace {
+        &mut self.0
+    }
+}
+
+fn new_space() -> Result<TestSpace, &'static str> {
+    AddressSpace::new()
+        .map(TestSpace)
+        .map_err(|_| "no frame for a root table")
+}
+
+fn map(space: &mut AddressSpace, va: usize, pa: u64, attrs: Attrs) -> Result<(), &'static str> {
+    space
+        .map(va, pa, PAGE_SIZE, attrs)
+        .map_err(|_| "a user page did not map")
+}
+
+fn user_pages_follow_their_rights(_: &Boot) -> Result<(), &'static str> {
+    let frame = frame_with(0x1111)?;
+    let result = check_user_rights(frame);
+    free_frame(frame);
+    result
+}
+
+fn check_user_rights(frame: u64) -> Result<(), &'static str> {
+    let mut space = new_space()?;
+    let pages = [
+        (USER_VA, Attrs::USER_RODATA),
+        (USER_VA + PAGE, Attrs::USER_DATA),
+        (USER_VA + 2 * PAGE, Attrs::USER_TEXT),
+    ];
+    for (va, attrs) in pages {
+        map(&mut space, va, frame, attrs)?;
+    }
+    space.activate();
+    for (va, attrs) in pages {
+        let (_, d) = space
+            .translate(va)
+            .ok_or("a user page is not in the tables")?;
+        check(d & NG != 0, "a user page is global")?;
+        check(d & PXN != 0, "the kernel may execute a user page")?;
+        check(
+            (d & UXN == 0) == attrs.user_exec,
+            "EL0 may execute a page it should not, or the other way round",
+        )?;
+        let read = registers::at_s1e0r(va);
+        check(
+            translates(read) && read & PAR_PA == frame,
+            "EL0 cannot read its page",
+        )?;
+        check(
+            translates(registers::at_s1e0w(va)) == attrs.write,
+            "EL0 may write a page it should not, or the other way round",
+        )?;
+        check(
+            translates(registers::at_s1e1r(va)),
+            "the kernel cannot read a user page",
+        )?;
+    }
+    check(
+        !translates(registers::at_s1e0r(USER_VA + 3 * PAGE)),
+        "a page nobody mapped translates",
+    )
+}
+
+fn switching_spaces_switches_translations(_: &Boot) -> Result<(), &'static str> {
+    let first = frame_with(0xA1)?;
+    let second = frame_with(0xB2)?;
+    let result = check_two_spaces(first, second);
+    free_frame(first);
+    free_frame(second);
+    result
+}
+
+fn check_two_spaces(first: u64, second: u64) -> Result<(), &'static str> {
+    let mut a = new_space()?;
+    let mut b = new_space()?;
+    map(&mut a, USER_VA, first, Attrs::USER_DATA)?;
+    map(&mut b, USER_VA, second, Attrs::USER_DATA)?;
+    a.activate();
+    check(
+        read_user(USER_VA) == 0xA1,
+        "the first space misses its page",
+    )?;
+    b.activate();
+    check(
+        read_user(USER_VA) == 0xB2,
+        "the second space sees the first one's page",
+    )?;
+    a.activate();
+    check(
+        read_user(USER_VA) == 0xA1,
+        "the first space sees the second one's page",
+    )?;
+    let (x, y) = (a.asid(), b.asid());
+    check(
+        x.is_some() && y.is_some() && x != y && x != Some(0) && y != Some(0),
+        "two live spaces share an ASID or run with the kernel's",
+    )
+}
+
+fn unmapped_page_no_longer_translates(_: &Boot) -> Result<(), &'static str> {
+    let frame = frame_with(0xC3)?;
+    let other = frame_with(0xE5)?;
+    let result = check_unmap(frame, other);
+    free_frame(frame);
+    free_frame(other);
+    result
+}
+
+fn check_unmap(frame: u64, other: u64) -> Result<(), &'static str> {
+    let mut space = new_space()?;
+    map(&mut space, USER_VA, frame, Attrs::USER_DATA)?;
+    space.activate();
+    // The read brings the page into the TLB, which the unmap must drop.
+    check(read_user(USER_VA) == 0xC3, "the page misses its contents")?;
+    check(
+        space.unmap(USER_VA) == Ok(frame),
+        "unmap did not return the page's frame",
+    )?;
+    check(
+        !translates(registers::at_s1e0r(USER_VA)) && !translates(registers::at_s1e1r(USER_VA)),
+        "an unmapped page still translates",
+    )?;
+    check(
+        space.translate(USER_VA).is_none(),
+        "the tables still hold an unmapped page",
+    )?;
+    check(
+        space.unmap(USER_VA) == Err(MapError::NotMapped),
+        "a page was unmapped twice",
+    )?;
+    // Another frame at the same address shows through at once; a TLB entry
+    // that the unmap left behind would still show the old one.
+    map(&mut space, USER_VA, other, Attrs::USER_DATA)?;
+    check(
+        read_user(USER_VA) == 0xE5,
+        "the TLB still holds the unmapped page",
+    )
+}
+
+/// Two spaces map one address to different frames and run, one after the
+/// other, with the same ASID of two generations: the TLB entry the first
+/// one left must not show through in the second.
+fn asid_rollover_hides_old_mappings(_: &Boot) -> Result<(), &'static str> {
+    let first = frame_with(0xA1)?;
+    let second = frame_with(0xB2)?;
+    let result = check_rollover(first, second);
+    free_frame(first);
+    free_frame(second);
+    result
+}
+
+fn check_rollover(first: u64, second: u64) -> Result<(), &'static str> {
+    let mut a = new_space()?;
+    let mut b = new_space()?;
+    map(&mut a, USER_VA, first, Attrs::USER_DATA)?;
+    map(&mut b, USER_VA, second, Attrs::USER_DATA)?;
+    let start = aspace::asid_generation();
+    aspace::use_up_asids();
+    a.activate();
+    check(
+        aspace::asid_generation() == start + 1 && a.asid() == Some(1),
+        "running out of ASIDs did not begin a new generation at ASID 1",
+    )?;
+    check(
+        read_user(USER_VA) == 0xA1,
+        "the first space misses its page",
+    )?;
+    aspace::use_up_asids();
+    b.activate();
+    check(
+        aspace::asid_generation() == start + 2 && b.asid() == Some(1),
+        "the second rollover did not hand out ASID 1 again",
+    )?;
+    check(
+        read_user(USER_VA) == 0xB2,
+        "a reused ASID shows the old space's page",
+    )?;
+    check(
+        a.asid().is_none(),
+        "an ASID of the old generation is still valid",
+    )?;
+    a.activate();
+    check(
+        a.asid().is_some_and(|asid| asid > 1),
+        "the old space did not get a new ASID",
+    )?;
+    check(
+        read_user(USER_VA) == 0xA1,
+        "the old space lost its page in the new generation",
+    )
+}
+
+/// A space goes while its ASID still tags a TLB entry; the next space gets
+/// the same ASID and must not see the old page.
+fn released_asid_hides_old_mappings(_: &Boot) -> Result<(), &'static str> {
+    let first = frame_with(0xA1)?;
+    let second = frame_with(0xB2)?;
+    let result = check_released_asid(first, second);
+    free_frame(first);
+    free_frame(second);
+    result
+}
+
+fn check_released_asid(first: u64, second: u64) -> Result<(), &'static str> {
+    let mut a = new_space()?;
+    let mut b = new_space()?;
+    map(&mut a, USER_VA, first, Attrs::USER_DATA)?;
+    map(&mut b, USER_VA, second, Attrs::USER_DATA)?;
+    a.activate();
+    check(
+        read_user(USER_VA) == 0xA1,
+        "the first space misses its page",
+    )?;
+    let asid = a.asid();
+    // Only the ASID of `a` comes free when it goes.
+    aspace::use_up_asids();
+    let generation = aspace::asid_generation();
+    // Destroys the space.
+    drop(a);
+    b.activate();
+    check(
+        aspace::asid_generation() == generation && b.asid() == asid,
+        "the next space did not get the ASID of the one that went",
+    )?;
+    check(
+        read_user(USER_VA) == 0xB2,
+        "a released ASID shows the page of the space that went",
+    )
+}
+
+fn destroying_a_space_returns_its_tables(_: &Boot) -> Result<(), &'static str> {
+    let before = phys::free_frames();
+    let frame = frame_with(0)?;
+    let result = check_table_count(frame, before);
+    free_frame(frame);
+    result?;
+    check(
+        phys::free_frames() == before,
+        "the tables did not go back to the frame allocator",
+    )
+}
+
+/// Maps one frame at five addresses that need 13 tables between them, the
+/// root included, and runs the space; it is destroyed when this returns.
+fn check_table_count(frame: u64, before: u64) -> Result<(), &'static str> {
+    let mut space = new_space()?;
+    for va in [0x1000, USER_VA, 1 << 30, 1 << 39, USER_END - PAGE] {
+        map(&mut space, va, frame, Attrs::USER_RODATA)?;
+    }
+    check(
+        phys::free_frames() == before - 14,
+        "13 tables and a page did not come from the frame allocator",
+    )?;
+    space.activate();
+    Ok(())
+}
+
+fn ttbr0_is_empty_outside_processes(boot: &Boot) -> Result<(), &'static str> {
+    let empty = image_pa(boot.kernel_pa, symbols::empty_table());
+    check(
+        registers::ttbr0_el1() == empty,
+        "TTBR0 is not the empty table with ASID 0 after the tests before",
+    )?;
+    let frame = frame_with(0xD4)?;
+    let result = check_deactivate(frame, empty);
+    free_frame(frame);
+    result
+}
+
+fn check_deactivate(frame: u64, empty: u64) -> Result<(), &'static str> {
+    let mut space = new_space()?;
+    map(&mut space, USER_VA, frame, Attrs::USER_DATA)?;
+    space.activate();
+    check(
+        registers::ttbr0_el1() >> 48 != 0,
+        "an address space runs with the kernel's ASID",
+    )?;
+    aspace::deactivate();
+    check(
+        registers::ttbr0_el1() == empty,
+        "deactivate did not bring back the empty table",
+    )?;
+    check(
+        !translates(registers::at_s1e0r(USER_VA)),
+        "a user page translates outside processes",
+    )?;
+    space.activate();
+    // Destroys the running space.
+    drop(space);
+    check(
+        registers::ttbr0_el1() == empty,
+        "destroying the running space left TTBR0 on its tables",
     )
 }

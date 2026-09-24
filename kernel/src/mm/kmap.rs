@@ -20,8 +20,8 @@ pub struct FrameTables<'a> {
 }
 
 // SAFETY: every table is a frame just taken from the allocator and zeroed
-// here; the tree owns it from then on. Tables are reached through the
-// linear map.
+// here; the tree owns it until `free_table` gives it back. Tables are
+// reached through the linear map.
 unsafe impl TableMemory for FrameTables<'_> {
     fn alloc_table(&mut self) -> Option<u64> {
         let pa = self.frames.alloc(0)?;
@@ -30,7 +30,15 @@ unsafe impl TableMemory for FrameTables<'_> {
         for i in 0..512 {
             mem.write(pa + i * 8, 0);
         }
+        // The zeroes reach the table walker before a parent entry links
+        // this table into a live tree; the asm block also keeps the
+        // compiler from moving the stores.
+        mmu::tables_written();
         Some(pa)
+    }
+
+    fn free_table(&mut self, pa: u64) {
+        self.frames.free(pa, 0);
     }
 
     fn read(&self, pa: u64) -> u64 {

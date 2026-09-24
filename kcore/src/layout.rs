@@ -9,6 +9,10 @@ pub const LINEAR_BASE: usize = 0xFFFF_0000_0000_0000;
 /// Virtual address of the first byte of the kernel image.
 pub const KERNEL_VIRT: usize = 0xFFFF_FFFF_C000_0000;
 
+/// End of the lower half, which TTBR0 translates (T0SZ = 16) and which
+/// belongs to the running process: user addresses lie in `[0, USER_END)`.
+pub const USER_END: usize = 1 << 48;
+
 /// Physical address of `va` inside the kernel image loaded at `kernel_pa`.
 pub fn image_pa(kernel_pa: u64, va: usize) -> u64 {
     let offset = va

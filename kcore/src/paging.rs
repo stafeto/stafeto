@@ -6,6 +6,8 @@
 //! tables; this module issues no barriers or TLB maintenance, which is the
 //! caller's job when a table is live.
 
+use crate::layout::USER_END;
+
 pub const PAGE: u64 = 4096;
 pub const BLOCK_2M: u64 = 2 << 20;
 /// Output address bits [47:12] of a descriptor.
@@ -17,7 +19,8 @@ const AP_EL0: u64 = 1 << 6;
 const AP_READ_ONLY: u64 = 1 << 7;
 const SH_INNER: u64 = 0b11 << 8;
 const AF: u64 = 1 << 10;
-const NG: u64 = 1 << 11;
+/// Not global: the TLB entry belongs to one ASID.
+pub const NG: u64 = 1 << 11;
 pub const PXN: u64 = 1 << 53;
 pub const UXN: u64 = 1 << 54;
 /// MAIR_EL1 entries that head.S sets: normal write-back memory at index 0,
@@ -67,6 +70,22 @@ impl Attrs {
     pub const DEVICE: Attrs = Attrs {
         memory: Memory::Device,
         ..Attrs::KERNEL_DATA
+    };
+    /// A program's code: EL0 reads and executes it.
+    pub const USER_TEXT: Attrs = Attrs {
+        memory: Memory::Normal,
+        write: false,
+        kernel_exec: false,
+        user: true,
+        user_exec: true,
+    };
+    pub const USER_RODATA: Attrs = Attrs {
+        user_exec: false,
+        ..Attrs::USER_TEXT
+    };
+    pub const USER_DATA: Attrs = Attrs {
+        write: true,
+        ..Attrs::USER_RODATA
     };
 
     /// W^X, no executable device memory, EL0 execution only on EL0 pages,
@@ -125,13 +144,17 @@ pub fn table_descriptor(pa: u64) -> u64 {
 /// # Safety
 /// `alloc_table` returns the physical address of a zeroed 4 KiB frame,
 /// aligned to 4 KiB, that belongs to the table tree from then on and that
-/// nothing else uses. `read` and `write` access the 8-byte word at a
-/// physical address inside a table of the tree, and nothing else; `read`
-/// returns the last word written. The MMU walks these tables, so a table
-/// that is not real, zeroed and owned memory maps whatever it happens to hold.
+/// nothing else uses. `free_table` takes back only such a table, once the
+/// tree no longer refers to it. `read` and `write` access the 8-byte word
+/// at a physical address inside a table of the tree, and nothing else;
+/// `read` returns the last word written. A table from `alloc_table` reads
+/// as zero to the table walker before the tree links it. The MMU walks
+/// these tables, so a table that is not real, zeroed and owned memory maps
+/// whatever it happens to hold.
 pub unsafe trait TableMemory {
     /// Physical address of a zeroed 4 KiB table, or None when memory runs out.
     fn alloc_table(&mut self) -> Option<u64>;
+    fn free_table(&mut self, pa: u64);
     fn read(&self, pa: u64) -> u64;
     fn write(&mut self, pa: u64, value: u64);
 }
@@ -142,10 +165,35 @@ pub enum MapError {
     WriteAndExecute,
     AlreadyMapped,
     NoMemory,
+    /// No 4 KiB page maps the address.
+    NotMapped,
+    /// A user mapping with kernel attributes, or at addresses TTBR0 does
+    /// not translate.
+    NotUser,
 }
 
 fn index(va: u64, level: u32) -> u64 {
     (va >> (39 - 9 * level)) & 0x1FF
+}
+
+/// A valid descriptor with bit 1 set: a table at levels 0-2, a page at level 3.
+fn is_table_or_page(d: u64) -> bool {
+    d & (VALID | TABLE_OR_PAGE) == VALID | TABLE_OR_PAGE
+}
+
+/// Frees the level-`level` table at `table` and every table below it.
+fn free_tree(mem: &mut impl TableMemory, table: u64, level: u32) -> usize {
+    let mut freed = 0;
+    if level < 3 {
+        for i in 0..512 {
+            let d = mem.read(table + i * 8);
+            if is_table_or_page(d) {
+                freed += free_tree(mem, d & OA_MASK, level + 1);
+            }
+        }
+    }
+    mem.free_table(table);
+    freed + 1
 }
 
 /// A translation table tree, named by the physical address of its root.
@@ -180,6 +228,39 @@ impl PageTable {
         size: u64,
         attrs: Attrs,
     ) -> Result<(), MapError> {
+        self.map_range(mem, va, pa, size, attrs, true)
+    }
+
+    /// Maps `[va, va + size)` to `[pa, pa + size)` for a program: user
+    /// attributes only, below USER_END, and in 4 KiB pages even where a
+    /// block would fit, so that every page can be unmapped on its own. On
+    /// error part of the range may already be mapped.
+    pub fn map_user(
+        &mut self,
+        mem: &mut impl TableMemory,
+        va: u64,
+        pa: u64,
+        size: u64,
+        attrs: Attrs,
+    ) -> Result<(), MapError> {
+        let inside = va
+            .checked_add(size)
+            .is_some_and(|end| end <= USER_END as u64);
+        if !attrs.user || !inside {
+            return Err(MapError::NotUser);
+        }
+        self.map_range(mem, va, pa, size, attrs, false)
+    }
+
+    fn map_range(
+        &mut self,
+        mem: &mut impl TableMemory,
+        va: u64,
+        pa: u64,
+        size: u64,
+        attrs: Attrs,
+        blocks: bool,
+    ) -> Result<(), MapError> {
         if !attrs.is_valid() {
             return Err(MapError::WriteAndExecute);
         }
@@ -189,8 +270,10 @@ impl PageTable {
         let mut off = 0;
         while off < size {
             let (v, p) = (va.wrapping_add(off), pa + off);
-            let block =
-                v.is_multiple_of(BLOCK_2M) && p.is_multiple_of(BLOCK_2M) && size - off >= BLOCK_2M;
+            let block = blocks
+                && v.is_multiple_of(BLOCK_2M)
+                && p.is_multiple_of(BLOCK_2M)
+                && size - off >= BLOCK_2M;
             let (level, desc, step) = if block {
                 (2, block_descriptor(p, attrs), BLOCK_2M)
             } else {
@@ -212,7 +295,7 @@ impl PageTable {
         for l in 0..level {
             let slot = table + index(va, l) * 8;
             let d = mem.read(slot);
-            table = if d & (VALID | TABLE_OR_PAGE) == VALID | TABLE_OR_PAGE {
+            table = if is_table_or_page(d) {
                 d & OA_MASK
             } else if d & VALID == 0 {
                 let t = mem.alloc_table().ok_or(MapError::NoMemory)?;
@@ -223,6 +306,38 @@ impl PageTable {
             };
         }
         Ok(table + index(va, level) * 8)
+    }
+
+    /// Removes the 4 KiB page that maps `va` and returns its physical
+    /// address. Tables stay, even when they become empty; a 2 MiB block is
+    /// not a page and stays too. The caller invalidates the TLB entry.
+    pub fn unmap_page(&mut self, mem: &mut impl TableMemory, va: u64) -> Result<u64, MapError> {
+        if !va.is_multiple_of(PAGE) {
+            return Err(MapError::Misaligned);
+        }
+        let mut table = self.root;
+        for level in 0..3 {
+            let d = mem.read(table + index(va, level) * 8);
+            if !is_table_or_page(d) {
+                return Err(MapError::NotMapped);
+            }
+            table = d & OA_MASK;
+        }
+        let slot = table + index(va, 3) * 8;
+        let d = mem.read(slot);
+        if !is_table_or_page(d) {
+            return Err(MapError::NotMapped);
+        }
+        mem.write(slot, 0);
+        Ok(d & OA_MASK)
+    }
+
+    /// Frees every table of the tree, the root last, and returns how many
+    /// there were. The pages and blocks it maps belong to others and stay.
+    /// The MMU must no longer walk the tree: no TTBR points at it, and the
+    /// TLB holds nothing from it.
+    pub fn release(self, mem: &mut impl TableMemory) -> usize {
+        free_tree(mem, self.root, 0)
     }
 
     /// Physical address and leaf descriptor that `va` translates to.
@@ -261,7 +376,10 @@ mod tests {
         words: HashMap<u64, u64>,
         next: u64,
         left: usize,
+        freed: Vec<u64>,
     }
+
+    const FIRST_TABLE: u64 = 0x8000_0000;
 
     // SAFETY: tables are distinct, zeroed (absent words read as 0) and owned
     // by the test; `read` returns the last `write`.
@@ -275,6 +393,9 @@ mod tests {
             self.next += PAGE;
             Some(t)
         }
+        fn free_table(&mut self, pa: u64) {
+            self.freed.push(pa);
+        }
         fn read(&self, pa: u64) -> u64 {
             *self.words.get(&pa).unwrap_or(&0)
         }
@@ -283,11 +404,19 @@ mod tests {
         }
     }
 
+    impl Tables {
+        /// Every table handed out so far.
+        fn allocated(&self) -> Vec<u64> {
+            (FIRST_TABLE..self.next).step_by(PAGE as usize).collect()
+        }
+    }
+
     fn tables(n: usize) -> Tables {
         Tables {
             words: HashMap::new(),
-            next: 0x8000_0000,
+            next: FIRST_TABLE,
             left: n,
+            freed: Vec::new(),
         }
     }
 
@@ -522,5 +651,173 @@ mod tests {
             .unwrap();
         let again = PageTable::from_root(pt.root());
         assert_eq!(again.translate(&t, 0x2000).unwrap().0, 0x4000_2000);
+    }
+
+    #[test]
+    fn user_page_descriptors() {
+        assert_eq!(
+            page_descriptor(0x4567_8000, Attrs::USER_DATA),
+            0x0060_0000_4567_8F43
+        );
+        assert_eq!(
+            page_descriptor(0x4567_8000, Attrs::USER_RODATA),
+            0x0060_0000_4567_8FC3
+        );
+        assert_eq!(
+            page_descriptor(0x4567_8000, Attrs::USER_TEXT),
+            0x0020_0000_4567_8FC3
+        );
+        for attrs in [Attrs::USER_TEXT, Attrs::USER_RODATA, Attrs::USER_DATA] {
+            assert!(attrs.is_valid());
+            let d = page_descriptor(0x4567_8000, attrs);
+            assert_ne!(d & NG, 0, "user pages are not global");
+            assert_ne!(d & PXN, 0, "the kernel never executes a user page");
+        }
+    }
+
+    #[test]
+    fn user_ranges_map_as_pages_even_where_a_block_fits() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        pt.map_user(&mut t, 0x20_0000, 0x4020_0000, BLOCK_2M, Attrs::USER_DATA)
+            .unwrap();
+        let (pa, d) = pt.translate(&t, 0x20_0000).unwrap();
+        assert_eq!((pa, d & 0b11), (0x4020_0000, 0b11));
+        let (pa, d) = pt.translate(&t, 0x3F_F123).unwrap();
+        assert_eq!((pa, d & 0b11), (0x403F_F123, 0b11));
+    }
+
+    #[test]
+    fn user_ranges_refuse_kernel_attributes() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        assert_eq!(
+            pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE, Attrs::KERNEL_DATA),
+            Err(MapError::NotUser)
+        );
+        let wx = Attrs {
+            write: true,
+            ..Attrs::USER_TEXT
+        };
+        assert_eq!(
+            pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE, wx),
+            Err(MapError::WriteAndExecute)
+        );
+        assert_eq!(pt.translate(&t, 0x1000), None);
+    }
+
+    #[test]
+    fn user_ranges_stay_below_user_end() {
+        let end = USER_END as u64;
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        let d = Attrs::USER_DATA;
+        assert_eq!(
+            pt.map_user(&mut t, end, 0x4000_0000, PAGE, d),
+            Err(MapError::NotUser)
+        );
+        assert_eq!(
+            pt.map_user(&mut t, end - PAGE, 0x4000_0000, 2 * PAGE, d),
+            Err(MapError::NotUser)
+        );
+        assert_eq!(
+            pt.map_user(&mut t, u64::MAX - PAGE + 1, 0x4000_0000, PAGE, d),
+            Err(MapError::NotUser)
+        );
+        pt.map_user(&mut t, end - PAGE, 0x4000_0000, PAGE, d)
+            .unwrap();
+        assert_eq!(pt.translate(&t, end - 1).unwrap().0, 0x4000_0FFF);
+    }
+
+    #[test]
+    fn unmapping_a_page_returns_its_frame() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        pt.map_user(&mut t, 0x1000, 0x4000_0000, 2 * PAGE, Attrs::USER_DATA)
+            .unwrap();
+        assert_eq!(pt.unmap_page(&mut t, 0x1000), Ok(0x4000_0000));
+        assert_eq!(pt.translate(&t, 0x1000), None);
+        assert_eq!(pt.translate(&t, 0x2000).unwrap().0, 0x4000_1000);
+        assert_eq!(pt.unmap_page(&mut t, 0x1000), Err(MapError::NotMapped));
+    }
+
+    #[test]
+    fn unmapping_needs_a_page_address() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE, Attrs::USER_DATA)
+            .unwrap();
+        assert_eq!(pt.unmap_page(&mut t, 0x1008), Err(MapError::Misaligned));
+        assert!(pt.translate(&t, 0x1000).is_some());
+    }
+
+    #[test]
+    fn unmapping_where_nothing_is_mapped_creates_no_tables() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        assert_eq!(pt.unmap_page(&mut t, 0x1234_5000), Err(MapError::NotMapped));
+        assert_eq!(t.allocated(), [pt.root()]);
+    }
+
+    #[test]
+    fn unmapping_leaves_a_block_alone() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        pt.map(
+            &mut t,
+            0x4000_0000,
+            0x4000_0000,
+            BLOCK_2M,
+            Attrs::KERNEL_DATA,
+        )
+        .unwrap();
+        assert_eq!(pt.unmap_page(&mut t, 0x4000_1000), Err(MapError::NotMapped));
+        assert!(pt.translate(&t, 0x4000_1000).is_some());
+    }
+
+    #[test]
+    fn release_frees_every_table_once() {
+        let mut t = tables(16);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        // Two leaf tables under one L2 table, a second L1 entry, a second and
+        // the last L0 entry: 1 root, 3 L1, 4 L2 and 5 L3 tables.
+        for va in [
+            0x1000,
+            0x40_0000,
+            0x4000_0000,
+            0x80_0000_0000,
+            USER_END as u64 - PAGE,
+        ] {
+            pt.map_user(&mut t, va, 0x5000_0000, PAGE, Attrs::USER_DATA)
+                .unwrap();
+        }
+        let root = pt.root();
+        assert_eq!(pt.release(&mut t), 13);
+        let mut freed = t.freed.clone();
+        assert_eq!(freed.last(), Some(&root), "the root goes last");
+        freed.sort();
+        assert_eq!(freed, t.allocated(), "each table exactly once");
+        assert!(
+            !freed.contains(&0x5000_0000),
+            "a mapped page is not a table"
+        );
+    }
+
+    #[test]
+    fn release_skips_blocks() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        pt.map(
+            &mut t,
+            0x4000_0000,
+            0x4000_0000,
+            BLOCK_2M + PAGE,
+            Attrs::KERNEL_DATA,
+        )
+        .unwrap();
+        assert_eq!(pt.release(&mut t), 4);
+        let mut freed = t.freed.clone();
+        freed.sort();
+        assert_eq!(freed, t.allocated());
     }
 }
