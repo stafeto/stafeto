@@ -136,6 +136,53 @@ pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct TestReport {
+    pub passed: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub done: Option<u32>,
+}
+
+/// Reads `TEST <name> ok`, `TEST <name> FAIL <why>` and `TESTS DONE failed=<n>` lines.
+pub fn parse_report(lines: &[String]) -> TestReport {
+    let mut r = TestReport { passed: Vec::new(), failed: Vec::new(), done: None };
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("TEST ") {
+            let mut parts = rest.splitn(3, ' ');
+            let name = parts.next().unwrap_or_default().to_string();
+            match parts.next() {
+                Some("ok") => r.passed.push(name),
+                Some("FAIL") => r.failed.push((name, parts.next().unwrap_or_default().to_string())),
+                _ => {}
+            }
+        } else if let Some(n) = line.strip_prefix("TESTS DONE failed=") {
+            r.done = n.trim().parse().ok();
+        }
+    }
+    r
+}
+
+pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
+    if o.timed_out {
+        return Err(format!("QEMU did not finish in time; last lines: {:?}", tail(&o.lines)));
+    }
+    if !r.failed.is_empty() {
+        return Err(format!("{} kernel test(s) failed: {:?}", r.failed.len(), r.failed));
+    }
+    match r.done {
+        Some(0) => {}
+        Some(n) => return Err(format!("kernel reported {n} failed test(s)")),
+        None => return Err(format!("kernel never printed TESTS DONE; last lines: {:?}", tail(&o.lines))),
+    }
+    if r.passed.is_empty() {
+        return Err("no kernel tests ran".into());
+    }
+    match o.status {
+        Some(s) if s.success() => Ok(()),
+        other => Err(format!("QEMU exit status {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +256,44 @@ mod tests {
     fn marker_must_appear() {
         let o = Outcome { lines: vec!["booting".into()], status: None, timed_out: true, stopped_on_marker: false };
         assert!(expect_marker(&o, "no device tree").is_err());
+    }
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn report_collects_passes_failures_and_total() {
+        let r = parse_report(&lines(&[
+            "stafeto 0.1.0 booting",
+            "TEST a ok",
+            "TEST b FAIL memory is not 512 MiB",
+            "TESTS DONE failed=1",
+        ]));
+        assert_eq!(r.passed, ["a"]);
+        assert_eq!(r.failed, [("b".to_string(), "memory is not 512 MiB".to_string())]);
+        assert_eq!(r.done, Some(1));
+    }
+
+    #[test]
+    fn verdict_accepts_a_clean_run() {
+        let o = Outcome { lines: lines(&["TEST a ok", "TESTS DONE failed=0"]), status: Some(ExitStatus::from_raw(0)), timed_out: false, stopped_on_marker: false };
+        assert!(verdict(&o, &parse_report(&o.lines)).is_ok());
+    }
+
+    #[test]
+    fn verdict_rejects_failures_hangs_crashes_and_empty_runs() {
+        let base = Outcome { lines: vec![], status: Some(ExitStatus::from_raw(0)), timed_out: false, stopped_on_marker: false };
+        let with = |l: &[&str]| Outcome { lines: lines(l), ..base.clone() };
+        let failed = with(&["TEST a FAIL x", "TESTS DONE failed=1"]);
+        assert!(verdict(&failed, &parse_report(&failed.lines)).is_err());
+        let hung = Outcome { timed_out: true, status: None, ..with(&["TEST a ok"]) };
+        assert!(verdict(&hung, &parse_report(&hung.lines)).is_err());
+        let crashed = with(&["TEST a ok", "KERNEL PANIC: boom"]);
+        assert!(verdict(&crashed, &parse_report(&crashed.lines)).is_err());
+        let empty = with(&["TESTS DONE failed=0"]);
+        assert!(verdict(&empty, &parse_report(&empty.lines)).is_err());
+        let bad_status = Outcome { status: Some(ExitStatus::from_raw(1 << 8)), ..with(&["TEST a ok", "TESTS DONE failed=0"]) };
+        assert!(verdict(&bad_status, &parse_report(&bad_status.lines)).is_err());
     }
 }

@@ -14,6 +14,7 @@ const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
 /// Spec 3.4: the kernel image file stays under 200 KB.
 const KERNEL_LIMIT: u64 = 200 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "usage: cargo xtask <command>
 
@@ -113,6 +114,7 @@ fn test() -> Result<(), String> {
     host_tests()?;
     boot_smoke()?;
     elf_boot_reports_missing_device_tree()?;
+    kernel_tests()?;
     println!("all checks passed");
     Ok(())
 }
@@ -137,4 +139,16 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"))?;
     qemu::expect_marker(&o, "no device tree in x0")
+}
+
+/// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
+fn kernel_tests() -> Result<(), String> {
+    let a = build(true)?;
+    let mut cmd = qemu::command(&a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS).arg("-semihosting");
+    let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
+    let r = qemu::parse_report(&o.lines);
+    qemu::verdict(&o, &r)?;
+    println!("kernel tests: {} passed", r.passed.len());
+    Ok(())
 }

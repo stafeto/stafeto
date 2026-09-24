@@ -10,6 +10,8 @@
 #[macro_use]
 mod console;
 mod arch;
+#[cfg(feature = "ktest")]
+mod ktest;
 mod panicking;
 mod psci;
 
@@ -19,6 +21,7 @@ use kcore::layout::{dtb_gib_is_mappable, fits_in_one_gib, KERNEL_VIRT, LINEAR_BA
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
+    arch::exceptions::init();
     console::init();
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     if dtb_pa == 0 {
@@ -40,9 +43,15 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     finish(&info)
 }
 
+#[cfg(not(feature = "ktest"))]
 fn finish(_info: &BootInfo) -> ! {
     kprintln!("boot complete");
     psci::system_off()
+}
+
+#[cfg(feature = "ktest")]
+fn finish(info: &BootInfo) -> ! {
+    ktest::run(info)
 }
 
 fn report(info: &BootInfo, dtb_pa: usize, kernel_pa: usize) {

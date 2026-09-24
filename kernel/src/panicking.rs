@@ -10,6 +10,12 @@ fn panic(info: &PanicInfo<'_>) -> ! {
     stop()
 }
 
+#[cfg(not(feature = "ktest"))]
 fn stop() -> ! {
     crate::psci::system_off()
+}
+
+#[cfg(feature = "ktest")]
+fn stop() -> ! {
+    crate::arch::semihosting::exit(1)
 }
