@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn linear_map_and_kernel_window_are_in_the_upper_half() {
         assert_eq!(LINEAR_BASE >> 48, 0xFFFF);
-        assert!(LINEAR_BASE < KERNEL_VIRT);
+        const { assert!(LINEAR_BASE < KERNEL_VIRT) };
         assert_eq!(KERNEL_VIRT % (GIB as usize), 0);
     }
 

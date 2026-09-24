@@ -12,11 +12,23 @@ use kcore::layout::{GIB, KERNEL_VIRT, LINEAR_BASE};
 type TestFn = fn(&BootInfo) -> Result<(), &'static str>;
 
 const TESTS: &[(&str, TestFn)] = &[
-    ("device_tree_matches_qemu_virt", device_tree_matches_qemu_virt),
-    ("boot_image_is_readable_through_linear_map", boot_image_is_readable_through_linear_map),
-    ("kernel_runs_in_upper_half_with_mmu_on", kernel_runs_in_upper_half_with_mmu_on),
+    (
+        "device_tree_matches_qemu_virt",
+        device_tree_matches_qemu_virt,
+    ),
+    (
+        "boot_image_is_readable_through_linear_map",
+        boot_image_is_readable_through_linear_map,
+    ),
+    (
+        "kernel_runs_in_upper_half_with_mmu_on",
+        kernel_runs_in_upper_half_with_mmu_on,
+    ),
     ("identity_map_is_dropped", identity_map_is_dropped),
-    ("brk_is_caught_and_execution_resumes", brk_is_caught_and_execution_resumes),
+    (
+        "brk_is_caught_and_execution_resumes",
+        brk_is_caught_and_execution_resumes,
+    ),
 ];
 
 pub fn run(info: &BootInfo) -> ! {
@@ -39,24 +51,51 @@ fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
 }
 
 fn device_tree_matches_qemu_virt(info: &BootInfo) -> Result<(), &'static str> {
-    check(info.memory.as_slice() == [Region { base: 0x4000_0000, size: 512 << 20 }], "memory is not 512 MiB at 0x4000_0000")?;
-    check(info.uart_pl011.map(|r| r.base) == Some(0x0900_0000), "PL011 is not at 0x0900_0000")?;
-    check(info.gic_distributor.map(|r| r.base) == Some(0x0800_0000), "GIC distributor is not at 0x0800_0000")?;
-    check(info.gic_cpu_interface.map(|r| r.base) == Some(0x0801_0000), "GIC CPU interface is not at 0x0801_0000")?;
+    check(
+        info.memory.as_slice()
+            == [Region {
+                base: 0x4000_0000,
+                size: 512 << 20,
+            }],
+        "memory is not 512 MiB at 0x4000_0000",
+    )?;
+    check(
+        info.uart_pl011.map(|r| r.base) == Some(0x0900_0000),
+        "PL011 is not at 0x0900_0000",
+    )?;
+    check(
+        info.gic_distributor.map(|r| r.base) == Some(0x0800_0000),
+        "GIC distributor is not at 0x0800_0000",
+    )?;
+    check(
+        info.gic_cpu_interface.map(|r| r.base) == Some(0x0801_0000),
+        "GIC CPU interface is not at 0x0801_0000",
+    )?;
     check(info.psci == PsciConduit::Hvc, "PSCI conduit is not HVC")?;
     check(info.initrd.is_some(), "no boot image in /chosen")
 }
 
 fn boot_image_is_readable_through_linear_map(info: &BootInfo) -> Result<(), &'static str> {
     let initrd = info.initrd.ok_or("no boot image in /chosen")?;
-    check(initrd.base / GIB == 1, "boot image is outside the GiB mapped at boot")?;
+    check(
+        initrd.base / GIB == 1,
+        "boot image is outside the GiB mapped at boot",
+    )?;
     // SAFETY: the boot image lies in the GiB at 0x4000_0000, mapped as RAM by head.S.
-    let head = unsafe { core::slice::from_raw_parts((LINEAR_BASE + initrd.base as usize) as *const u8, 8) };
-    check(head == b"STAFBOOT", "boot image does not start with STAFBOOT")
+    let head = unsafe {
+        core::slice::from_raw_parts((LINEAR_BASE + initrd.base as usize) as *const u8, 8)
+    };
+    check(
+        head == b"STAFBOOT",
+        "boot image does not start with STAFBOOT",
+    )
 }
 
 fn kernel_runs_in_upper_half_with_mmu_on(_: &BootInfo) -> Result<(), &'static str> {
-    check(kernel_runs_in_upper_half_with_mmu_on as usize >= KERNEL_VIRT, "code runs below the kernel window")?;
+    check(
+        kernel_runs_in_upper_half_with_mmu_on as *const () as usize >= KERNEL_VIRT,
+        "code runs below the kernel window",
+    )?;
     check(registers::sctlr_el1() & 1 == 1, "SCTLR_EL1.M is clear")?;
     check(registers::current_el() == 1, "kernel is not at EL1")
 }
@@ -72,5 +111,8 @@ fn brk_is_caught_and_execution_resumes(_: &BootInfo) -> Result<(), &'static str>
     exceptions::LAST_BRK.store(u64::MAX, Ordering::Relaxed);
     // SAFETY: the exception handler records BRK and returns past it.
     unsafe { core::arch::asm!("brk #0x51") };
-    check(exceptions::LAST_BRK.load(Ordering::Relaxed) == 0x51, "BRK was not recorded")
+    check(
+        exceptions::LAST_BRK.load(Ordering::Relaxed) == 0x51,
+        "BRK was not recorded",
+    )
 }

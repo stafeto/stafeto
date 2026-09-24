@@ -13,10 +13,18 @@ use std::time::{Duration, Instant};
 pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monitor", "none"];
 
 pub fn args(kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
-    let mut a: Vec<String> = ["-machine", "virt,gic-version=2", "-cpu", "cortex-a72", "-m", "512M", "-kernel"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut a: Vec<String> = [
+        "-machine",
+        "virt,gic-version=2",
+        "-cpu",
+        "cortex-a72",
+        "-m",
+        "512M",
+        "-kernel",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     a.push(kernel.display().to_string());
     if let Some(b) = boot_image {
         a.push("-initrd".into());
@@ -41,8 +49,15 @@ pub struct Outcome {
 
 /// Runs `cmd`, echoing and collecting its stdout lines. Kills it when a line
 /// contains `stop_marker` or when `timeout` passes.
-pub fn run_until(mut cmd: Command, timeout: Duration, stop_marker: Option<&str>) -> Result<Outcome, String> {
-    let mut child = cmd.stdout(Stdio::piped()).spawn().map_err(|e| format!("{cmd:?}: {e}"))?;
+pub fn run_until(
+    mut cmd: Command,
+    timeout: Duration,
+    stop_marker: Option<&str>,
+) -> Result<Outcome, String> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd:?}: {e}"))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -80,7 +95,12 @@ pub fn run_until(mut cmd: Command, timeout: Duration, stop_marker: Option<&str>)
                 if hit {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Ok(Outcome { lines, status: None, timed_out: false, stopped_on_marker: true });
+                    return Ok(Outcome {
+                        lines,
+                        status: None,
+                        timed_out: false,
+                        stopped_on_marker: true,
+                    });
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -90,12 +110,22 @@ pub fn run_until(mut cmd: Command, timeout: Duration, stop_marker: Option<&str>)
                 // blocking wait so the deadline still applies.
                 loop {
                     if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                        return Ok(Outcome { lines, status: Some(status), timed_out: false, stopped_on_marker: false });
+                        return Ok(Outcome {
+                            lines,
+                            status: Some(status),
+                            timed_out: false,
+                            stopped_on_marker: false,
+                        });
                     }
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        return Ok(Outcome { lines, status: None, timed_out: true, stopped_on_marker: false });
+                        return Ok(Outcome {
+                            lines,
+                            status: None,
+                            timed_out: true,
+                            stopped_on_marker: false,
+                        });
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -104,7 +134,12 @@ pub fn run_until(mut cmd: Command, timeout: Duration, stop_marker: Option<&str>)
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok(Outcome { lines, status: None, timed_out: true, stopped_on_marker: false });
+            return Ok(Outcome {
+                lines,
+                status: None,
+                timed_out: true,
+                stopped_on_marker: false,
+            });
         }
     }
 }
@@ -116,10 +151,16 @@ fn tail(lines: &[String]) -> &[String] {
 /// The machine must print `line` and then power off by itself with status 0.
 pub fn expect_clean_exit_with(o: &Outcome, line: &str) -> Result<(), String> {
     if o.timed_out {
-        return Err(format!("QEMU did not finish in time; last lines: {:?}", tail(&o.lines)));
+        return Err(format!(
+            "QEMU did not finish in time; last lines: {:?}",
+            tail(&o.lines)
+        ));
     }
     if !o.lines.iter().any(|l| l == line) {
-        return Err(format!("kernel never printed {line:?}; last lines: {:?}", tail(&o.lines)));
+        return Err(format!(
+            "kernel never printed {line:?}; last lines: {:?}",
+            tail(&o.lines)
+        ));
     }
     match o.status {
         Some(s) if s.success() => Ok(()),
@@ -132,7 +173,10 @@ pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     if o.lines.iter().any(|l| l.contains(marker)) {
         Ok(())
     } else {
-        Err(format!("kernel never printed {marker:?}; last lines: {:?}", tail(&o.lines)))
+        Err(format!(
+            "kernel never printed {marker:?}; last lines: {:?}",
+            tail(&o.lines)
+        ))
     }
 }
 
@@ -145,14 +189,20 @@ pub struct TestReport {
 
 /// Reads `TEST <name> ok`, `TEST <name> FAIL <why>` and `TESTS DONE failed=<n>` lines.
 pub fn parse_report(lines: &[String]) -> TestReport {
-    let mut r = TestReport { passed: Vec::new(), failed: Vec::new(), done: None };
+    let mut r = TestReport {
+        passed: Vec::new(),
+        failed: Vec::new(),
+        done: None,
+    };
     for line in lines {
         if let Some(rest) = line.strip_prefix("TEST ") {
             let mut parts = rest.splitn(3, ' ');
             let name = parts.next().unwrap_or_default().to_string();
             match parts.next() {
                 Some("ok") => r.passed.push(name),
-                Some("FAIL") => r.failed.push((name, parts.next().unwrap_or_default().to_string())),
+                Some("FAIL") => r
+                    .failed
+                    .push((name, parts.next().unwrap_or_default().to_string())),
                 _ => {}
             }
         } else if let Some(n) = line.strip_prefix("TESTS DONE failed=") {
@@ -164,15 +214,27 @@ pub fn parse_report(lines: &[String]) -> TestReport {
 
 pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     if o.timed_out {
-        return Err(format!("QEMU did not finish in time; last lines: {:?}", tail(&o.lines)));
+        return Err(format!(
+            "QEMU did not finish in time; last lines: {:?}",
+            tail(&o.lines)
+        ));
     }
     if !r.failed.is_empty() {
-        return Err(format!("{} kernel test(s) failed: {:?}", r.failed.len(), r.failed));
+        return Err(format!(
+            "{} kernel test(s) failed: {:?}",
+            r.failed.len(),
+            r.failed
+        ));
     }
     match r.done {
         Some(0) => {}
         Some(n) => return Err(format!("kernel reported {n} failed test(s)")),
-        None => return Err(format!("kernel never printed TESTS DONE; last lines: {:?}", tail(&o.lines))),
+        None => {
+            return Err(format!(
+                "kernel never printed TESTS DONE; last lines: {:?}",
+                tail(&o.lines)
+            ));
+        }
     }
     if r.passed.is_empty() {
         return Err("no kernel tests ran".into());
@@ -217,7 +279,12 @@ mod tests {
     #[test]
     fn kills_a_process_that_outlives_the_deadline() {
         let start = Instant::now();
-        let o = run_until(sh("echo started; sleep 10"), Duration::from_millis(300), None).unwrap();
+        let o = run_until(
+            sh("echo started; sleep 10"),
+            Duration::from_millis(300),
+            None,
+        )
+        .unwrap();
         assert!(o.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(expect_clean_exit_with(&o, "started").is_err());
@@ -226,7 +293,12 @@ mod tests {
     #[test]
     fn stops_on_the_marker() {
         let start = Instant::now();
-        let o = run_until(sh("echo booting; echo 'KERNEL PANIC: no device tree'; sleep 10"), Duration::from_secs(20), Some("no device tree")).unwrap();
+        let o = run_until(
+            sh("echo booting; echo 'KERNEL PANIC: no device tree'; sleep 10"),
+            Duration::from_secs(20),
+            Some("no device tree"),
+        )
+        .unwrap();
         assert!(o.stopped_on_marker && !o.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(expect_marker(&o, "no device tree").is_ok());
@@ -234,18 +306,34 @@ mod tests {
 
     #[test]
     fn clean_exit_needs_the_line_and_status_zero() {
-        let ok = Outcome { lines: vec!["boot complete".into()], status: Some(ExitStatus::from_raw(0)), timed_out: false, stopped_on_marker: false };
+        let ok = Outcome {
+            lines: vec!["boot complete".into()],
+            status: Some(ExitStatus::from_raw(0)),
+            timed_out: false,
+            stopped_on_marker: false,
+        };
         assert!(expect_clean_exit_with(&ok, "boot complete").is_ok());
-        let missing = Outcome { lines: vec!["booting".into()], ..ok.clone() };
+        let missing = Outcome {
+            lines: vec!["booting".into()],
+            ..ok.clone()
+        };
         assert!(expect_clean_exit_with(&missing, "boot complete").is_err());
-        let failed = Outcome { status: Some(ExitStatus::from_raw(1 << 8)), ..ok.clone() };
+        let failed = Outcome {
+            status: Some(ExitStatus::from_raw(1 << 8)),
+            ..ok.clone()
+        };
         assert!(expect_clean_exit_with(&failed, "boot complete").is_err());
     }
 
     #[test]
     fn survives_non_utf8_output() {
         let start = Instant::now();
-        let o = run_until(sh("printf 'bad \\377 byte\\n'; echo after; sleep 10"), Duration::from_millis(300), None).unwrap();
+        let o = run_until(
+            sh("printf 'bad \\377 byte\\n'; echo after; sleep 10"),
+            Duration::from_millis(300),
+            None,
+        )
+        .unwrap();
         assert!(o.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(o.lines.iter().any(|l| l.starts_with("bad ")));
@@ -254,7 +342,12 @@ mod tests {
 
     #[test]
     fn marker_must_appear() {
-        let o = Outcome { lines: vec!["booting".into()], status: None, timed_out: true, stopped_on_marker: false };
+        let o = Outcome {
+            lines: vec!["booting".into()],
+            status: None,
+            timed_out: true,
+            stopped_on_marker: false,
+        };
         assert!(expect_marker(&o, "no device tree").is_err());
     }
 
@@ -271,29 +364,52 @@ mod tests {
             "TESTS DONE failed=1",
         ]));
         assert_eq!(r.passed, ["a"]);
-        assert_eq!(r.failed, [("b".to_string(), "memory is not 512 MiB".to_string())]);
+        assert_eq!(
+            r.failed,
+            [("b".to_string(), "memory is not 512 MiB".to_string())]
+        );
         assert_eq!(r.done, Some(1));
     }
 
     #[test]
     fn verdict_accepts_a_clean_run() {
-        let o = Outcome { lines: lines(&["TEST a ok", "TESTS DONE failed=0"]), status: Some(ExitStatus::from_raw(0)), timed_out: false, stopped_on_marker: false };
+        let o = Outcome {
+            lines: lines(&["TEST a ok", "TESTS DONE failed=0"]),
+            status: Some(ExitStatus::from_raw(0)),
+            timed_out: false,
+            stopped_on_marker: false,
+        };
         assert!(verdict(&o, &parse_report(&o.lines)).is_ok());
     }
 
     #[test]
     fn verdict_rejects_failures_hangs_crashes_and_empty_runs() {
-        let base = Outcome { lines: vec![], status: Some(ExitStatus::from_raw(0)), timed_out: false, stopped_on_marker: false };
-        let with = |l: &[&str]| Outcome { lines: lines(l), ..base.clone() };
+        let base = Outcome {
+            lines: vec![],
+            status: Some(ExitStatus::from_raw(0)),
+            timed_out: false,
+            stopped_on_marker: false,
+        };
+        let with = |l: &[&str]| Outcome {
+            lines: lines(l),
+            ..base.clone()
+        };
         let failed = with(&["TEST a FAIL x", "TESTS DONE failed=1"]);
         assert!(verdict(&failed, &parse_report(&failed.lines)).is_err());
-        let hung = Outcome { timed_out: true, status: None, ..with(&["TEST a ok"]) };
+        let hung = Outcome {
+            timed_out: true,
+            status: None,
+            ..with(&["TEST a ok"])
+        };
         assert!(verdict(&hung, &parse_report(&hung.lines)).is_err());
         let crashed = with(&["TEST a ok", "KERNEL PANIC: boom"]);
         assert!(verdict(&crashed, &parse_report(&crashed.lines)).is_err());
         let empty = with(&["TESTS DONE failed=0"]);
         assert!(verdict(&empty, &parse_report(&empty.lines)).is_err());
-        let bad_status = Outcome { status: Some(ExitStatus::from_raw(1 << 8)), ..with(&["TEST a ok", "TESTS DONE failed=0"]) };
+        let bad_status = Outcome {
+            status: Some(ExitStatus::from_raw(1 << 8)),
+            ..with(&["TEST a ok", "TESTS DONE failed=0"])
+        };
         assert!(verdict(&bad_status, &parse_report(&bad_status.lines)).is_err());
     }
 }

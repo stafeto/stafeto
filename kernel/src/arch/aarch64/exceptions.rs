@@ -20,10 +20,22 @@ pub struct TrapFrame {
 const _: () = assert!(core::mem::size_of::<TrapFrame>() == 272);
 
 const VECTOR_NAMES: [&str; 16] = [
-    "EL1t sync", "EL1t irq", "EL1t fiq", "EL1t serror",
-    "EL1h sync", "EL1h irq", "EL1h fiq", "EL1h serror",
-    "EL0 sync", "EL0 irq", "EL0 fiq", "EL0 serror",
-    "EL0 AArch32 sync", "EL0 AArch32 irq", "EL0 AArch32 fiq", "EL0 AArch32 serror",
+    "EL1t sync",
+    "EL1t irq",
+    "EL1t fiq",
+    "EL1t serror",
+    "EL1h sync",
+    "EL1h irq",
+    "EL1h fiq",
+    "EL1h serror",
+    "EL0 sync",
+    "EL0 irq",
+    "EL0 fiq",
+    "EL0 serror",
+    "EL0 AArch32 sync",
+    "EL0 AArch32 irq",
+    "EL0 AArch32 fiq",
+    "EL0 AArch32 serror",
 ];
 const VECTOR_EL1H_SYNC: u64 = 4;
 /// ESR_EL1.EC of a BRK instruction in AArch64 state.

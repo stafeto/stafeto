@@ -7,6 +7,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 use kcore::bootinfo::PsciConduit;
 
+#[cfg_attr(feature = "ktest", allow(dead_code))]
 const SYSTEM_OFF: u64 = 0x8400_0008;
 static CONDUIT: AtomicU8 = AtomicU8::new(0);
 
@@ -19,6 +20,7 @@ pub fn set_conduit(c: PsciConduit) {
     CONDUIT.store(v, Ordering::Relaxed);
 }
 
+#[cfg_attr(feature = "ktest", allow(dead_code))]
 pub fn system_off() -> ! {
     // SAFETY: SYSTEM_OFF does not return when it succeeds; the SMC calling
     // convention clobbers x0-x17, which clobber_abi("C") covers.

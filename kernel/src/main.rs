@@ -17,7 +17,7 @@ mod psci;
 
 use kcore::bootinfo::{self, BootInfo};
 use kcore::fdt::Fdt;
-use kcore::layout::{dtb_gib_is_mappable, fits_in_one_gib, KERNEL_VIRT, LINEAR_BASE};
+use kcore::layout::{KERNEL_VIRT, LINEAR_BASE, dtb_gib_is_mappable, fits_in_one_gib};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
@@ -70,7 +70,11 @@ fn report(info: &BootInfo, dtb_pa: usize, kernel_pa: usize) {
         kprintln!("pl011      {:#x}", r.base);
     }
     if let (Some(d), Some(c)) = (info.gic_distributor, info.gic_cpu_interface) {
-        kprintln!("gic        distributor {:#x}, cpu interface {:#x}", d.base, c.base);
+        kprintln!(
+            "gic        distributor {:#x}, cpu interface {:#x}",
+            d.base,
+            c.base
+        );
     }
     kprintln!("psci       {:?}", info.psci);
 }

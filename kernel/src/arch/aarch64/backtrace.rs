@@ -11,10 +11,14 @@ const MAX_FRAMES: usize = 32;
 pub fn print() {
     let mut fp: usize;
     // SAFETY: reading x29 has no side effects.
-    unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags)) };
-    kprintln!("backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/aarch64-unknown-none-softfloat/release/kernel):");
+    unsafe {
+        core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
+    };
+    kprintln!(
+        "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/aarch64-unknown-none-softfloat/release/kernel):"
+    );
     for depth in 0..MAX_FRAMES {
-        if fp < KERNEL_VIRT || fp % 16 != 0 {
+        if fp < KERNEL_VIRT || !fp.is_multiple_of(16) {
             break;
         }
         // SAFETY: fp is a 16-byte aligned address inside the kernel window,

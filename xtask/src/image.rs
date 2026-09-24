@@ -13,7 +13,10 @@ pub const FLAGS: u64 = 0xa;
 
 pub fn check_header(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() < 64 {
-        return Err(format!("kernel image is {} bytes, shorter than the 64-byte arm64 header", bytes.len()));
+        return Err(format!(
+            "kernel image is {} bytes, shorter than the 64-byte arm64 header",
+            bytes.len()
+        ));
     }
     let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
     let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -24,7 +27,10 @@ pub fn check_header(bytes: &[u8]) -> Result<(), String> {
         return Err("image_size in the header is smaller than the file".into());
     }
     if u64_at(FLAGS_OFFSET) != FLAGS {
-        return Err(format!("unexpected Image flags {:#x}, want {FLAGS:#x}", u64_at(FLAGS_OFFSET)));
+        return Err(format!(
+            "unexpected Image flags {:#x}, want {FLAGS:#x}",
+            u64_at(FLAGS_OFFSET)
+        ));
     }
     Ok(())
 }
@@ -33,7 +39,9 @@ pub fn check_size(len: u64, limit: u64) -> Result<(), String> {
     if len <= limit {
         Ok(())
     } else {
-        Err(format!("kernel image is {len} bytes, over the {limit}-byte limit"))
+        Err(format!(
+            "kernel image is {len} bytes, over the {limit}-byte limit"
+        ))
     }
 }
 

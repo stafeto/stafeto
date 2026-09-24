@@ -10,7 +10,9 @@ const ADP_STOPPED_APPLICATION_EXIT: u64 = 0x2_0026;
 pub fn exit(code: u32) -> ! {
     let block = [ADP_STOPPED_APPLICATION_EXIT, u64::from(code)];
     // SAFETY: under -semihosting QEMU reads the parameter block and exits.
-    unsafe { core::arch::asm!("hlt #0xf000", in("x0") SYS_EXIT, in("x1") block.as_ptr(), options(nostack)) };
+    unsafe {
+        core::arch::asm!("hlt #0xf000", in("x0") SYS_EXIT, in("x1") block.as_ptr(), options(nostack))
+    };
     loop {
         core::hint::spin_loop();
     }

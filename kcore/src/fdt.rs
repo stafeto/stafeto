@@ -58,7 +58,10 @@ pub(crate) fn be64(data: &[u8], off: usize) -> Result<u64, FdtError> {
 
 /// The NUL-terminated UTF-8 string at the start of `bytes`.
 fn cstr(bytes: &[u8]) -> Result<&str, FdtError> {
-    let len = bytes.iter().position(|&b| b == 0).ok_or(FdtError::Truncated)?;
+    let len = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(FdtError::Truncated)?;
     core::str::from_utf8(&bytes[..len]).map_err(|_| FdtError::BadString)
 }
 
@@ -85,11 +88,22 @@ impl<'a> Fdt<'a> {
         }
         let size_strings = be32(data, 32)? as usize;
         let size_struct = be32(data, 36)? as usize;
-        let within = |off: usize, size: usize| off.checked_add(size).is_some_and(|end| end <= total);
-        if !within(off_struct, size_struct) || !within(off_strings, size_strings) || off_rsvmap >= total {
+        let within =
+            |off: usize, size: usize| off.checked_add(size).is_some_and(|end| end <= total);
+        if !within(off_struct, size_struct)
+            || !within(off_strings, size_strings)
+            || off_rsvmap >= total
+        {
             return Err(FdtError::Truncated);
         }
-        Ok(Self { data, off_struct, size_struct, off_strings, size_strings, off_rsvmap })
+        Ok(Self {
+            data,
+            off_struct,
+            size_struct,
+            off_strings,
+            size_strings,
+            off_rsvmap,
+        })
     }
 
     /// Reads a device tree in place.
@@ -114,7 +128,10 @@ impl<'a> Fdt<'a> {
 
     /// Entries of the memory reservation block, up to the terminating zero pair.
     pub fn reservations(&self) -> Reservations<'a> {
-        Reservations { data: self.data, off: self.off_rsvmap }
+        Reservations {
+            data: self.data,
+            off: self.off_rsvmap,
+        }
     }
 
     /// Walks the structure block depth first, calling `f` for every node start,
@@ -159,13 +176,23 @@ impl<'a> Fdt<'a> {
                     if value_end > end {
                         return Err(FdtError::Truncated);
                     }
-                    let name = strings.get(nameoff..).ok_or(FdtError::BadString).and_then(cstr)?;
-                    f(Event::Prop { name, value: &data[off..value_end] });
+                    let name = strings
+                        .get(nameoff..)
+                        .ok_or(FdtError::BadString)
+                        .and_then(cstr)?;
+                    f(Event::Prop {
+                        name,
+                        value: &data[off..value_end],
+                    });
                     off = align4(value_end);
                 }
                 TOKEN_NOP => {}
                 TOKEN_END => {
-                    return if depth == 0 { Ok(()) } else { Err(FdtError::Truncated) };
+                    return if depth == 0 {
+                        Ok(())
+                    } else {
+                        Err(FdtError::Truncated)
+                    };
                 }
                 other => return Err(FdtError::BadToken(other)),
             }
@@ -250,7 +277,11 @@ mod tests {
         let fdt = Fdt::new(VIRT).unwrap();
         let mut method = None;
         fdt.walk(|e| {
-            if let Event::Prop { name: "method", value } = e {
+            if let Event::Prop {
+                name: "method",
+                value,
+            } = e
+            {
                 method = Some(value);
             }
         })
@@ -261,7 +292,10 @@ mod tests {
     #[test]
     fn reservations_list_memreserve_entries() {
         let fdt = Fdt::new(VIRT).unwrap();
-        assert_eq!(fdt.reservations().collect::<Vec<_>>(), [(0x4800_0000, 0x1000)]);
+        assert_eq!(
+            fdt.reservations().collect::<Vec<_>>(),
+            [(0x4800_0000, 0x1000)]
+        );
     }
 
     #[test]
@@ -273,20 +307,29 @@ mod tests {
 
     #[test]
     fn rejects_blob_shorter_than_totalsize() {
-        assert_eq!(Fdt::new(&VIRT[..VIRT.len() - 1]).err(), Some(FdtError::Truncated));
+        assert_eq!(
+            Fdt::new(&VIRT[..VIRT.len() - 1]).err(),
+            Some(FdtError::Truncated)
+        );
     }
 
     #[test]
     fn rejects_empty_and_tiny_inputs() {
         assert_eq!(Fdt::new(&[]).err(), Some(FdtError::Truncated));
-        assert_eq!(Fdt::new(&[0xd0, 0x0d, 0xfe, 0xed]).err(), Some(FdtError::Truncated));
+        assert_eq!(
+            Fdt::new(&[0xd0, 0x0d, 0xfe, 0xed]).err(),
+            Some(FdtError::Truncated)
+        );
     }
 
     #[test]
     fn rejects_old_versions() {
         let mut blob = VIRT.to_vec();
         blob[20..24].copy_from_slice(&16u32.to_be_bytes());
-        assert_eq!(Fdt::new(&blob).err(), Some(FdtError::UnsupportedVersion(16)));
+        assert_eq!(
+            Fdt::new(&blob).err(),
+            Some(FdtError::UnsupportedVersion(16))
+        );
     }
 
     #[test]

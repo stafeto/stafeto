@@ -5,7 +5,7 @@
 //! the boot image (initrd), the early console, the interrupt controller and
 //! the PSCI conduit.
 
-use crate::fdt::{be32, be64, Event, Fdt, FdtError, MAX_DEPTH};
+use crate::fdt::{Event, Fdt, FdtError, MAX_DEPTH, be32, be64};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
@@ -51,7 +51,10 @@ pub struct RegionList<const N: usize> {
 
 impl<const N: usize> RegionList<N> {
     pub const fn new() -> Self {
-        Self { items: [Region { base: 0, size: 0 }; N], len: 0 }
+        Self {
+            items: [Region { base: 0, size: 0 }; N],
+            len: 0,
+        }
     }
 
     pub fn push(&mut self, r: Region) -> Result<(), BootInfoError> {
@@ -92,7 +95,10 @@ struct Cells {
 }
 
 /// Devicetree specification defaults when a node has no `#address-cells` or `#size-cells`.
-const DEFAULT_CELLS: Cells = Cells { address: 2, size: 1 };
+const DEFAULT_CELLS: Cells = Cells {
+    address: 2,
+    size: 1,
+};
 
 /// Properties of one node, collected until its end, when the node is classified.
 #[derive(Debug, Clone, Copy)]
@@ -128,11 +134,17 @@ impl<'a> Node<'a> {
     }
 
     fn is_compatible(&self, wanted: &str) -> bool {
-        self.compatible.split(|&b| b == 0).any(|s| s == wanted.as_bytes())
+        self.compatible
+            .split(|&b| b == 0)
+            .any(|s| s == wanted.as_bytes())
     }
 
     fn named(&self, base: &str) -> bool {
-        self.name == base || self.name.strip_prefix(base).is_some_and(|rest| rest.starts_with('@'))
+        self.name == base
+            || self
+                .name
+                .strip_prefix(base)
+                .is_some_and(|rest| rest.starts_with('@'))
     }
 }
 
@@ -157,10 +169,14 @@ impl<'a> RegIter<'a> {
             return Err(BootInfoError::BadReg);
         }
         let entry = 4 * (cells.address + cells.size) as usize;
-        if data.len() % entry != 0 {
+        if !data.len().is_multiple_of(entry) {
             return Err(BootInfoError::BadReg);
         }
-        Ok(Self { data, cells, off: 0 })
+        Ok(Self {
+            data,
+            cells,
+            off: 0,
+        })
     }
 
     fn read(&mut self, n: u32) -> Result<u64, BootInfoError> {
@@ -190,7 +206,12 @@ impl Iterator for RegIter<'_> {
     }
 }
 
-fn classify(node: &Node<'_>, depth: usize, cells: Cells, info: &mut BootInfo) -> Result<(), BootInfoError> {
+fn classify(
+    node: &Node<'_>,
+    depth: usize,
+    cells: Cells,
+    info: &mut BootInfo,
+) -> Result<(), BootInfoError> {
     let top = depth == 2;
     if node.device_type == b"memory\0" || (top && node.named("memory")) {
         for r in RegIter::new(node.reg, cells)? {
@@ -201,7 +222,10 @@ fn classify(node: &Node<'_>, depth: usize, cells: Cells, info: &mut BootInfo) ->
         info.initrd = match (node.initrd_start, node.initrd_end) {
             (None, None) => None,
             (Some(s), Some(e)) if e == s => None,
-            (Some(s), Some(e)) if e > s => Some(Region { base: s, size: e - s }),
+            (Some(s), Some(e)) if e > s => Some(Region {
+                base: s,
+                size: e - s,
+            }),
             _ => return Err(BootInfoError::BadInitrd),
         };
     }
@@ -266,7 +290,11 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
                 }
             }
             Event::EndNode => {
-                let cells = if depth >= 2 { stack[depth - 1].child_cells } else { DEFAULT_CELLS };
+                let cells = if depth >= 2 {
+                    stack[depth - 1].child_cells
+                } else {
+                    DEFAULT_CELLS
+                };
                 if let Err(e) = classify(&stack[depth], depth, cells, &mut info) {
                     failure = Some(e);
                 }
@@ -306,7 +334,10 @@ mod tests {
 
     #[test]
     fn virt_memory() {
-        assert_eq!(info(VIRT).unwrap().memory.as_slice(), [region(0x4000_0000, 0x2000_0000)]);
+        assert_eq!(
+            info(VIRT).unwrap().memory.as_slice(),
+            [region(0x4000_0000, 0x2000_0000)]
+        );
     }
 
     #[test]
@@ -338,7 +369,10 @@ mod tests {
 
     #[test]
     fn root_without_cells_uses_defaults() {
-        assert_eq!(info(NOCELLS).unwrap().memory.as_slice(), [region(0x4000_0000, 0x1000_0000)]);
+        assert_eq!(
+            info(NOCELLS).unwrap().memory.as_slice(),
+            [region(0x4000_0000, 0x1000_0000)]
+        );
     }
 
     #[test]
