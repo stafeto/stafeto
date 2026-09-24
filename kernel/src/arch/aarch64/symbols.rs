@@ -24,3 +24,9 @@ macro_rules! symbol {
 pub fn boot_stack() -> core::ops::Range<usize> {
     symbol!("boot_stack")..symbol!("boot_stack_top")
 }
+
+/// The whole kernel image in virtual memory: code, data, .bss, the boot
+/// stack and the boot page tables.
+pub fn image() -> core::ops::Range<usize> {
+    symbol!("__image_start")..symbol!("__image_end")
+}

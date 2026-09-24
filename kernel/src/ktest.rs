@@ -5,11 +5,12 @@
 //! format xtask parses; the run ends with a semihosting exit code.
 
 use crate::arch::{exceptions, registers, semihosting};
+use crate::boot::Boot;
 use core::sync::atomic::Ordering;
-use kcore::bootinfo::{BootInfo, PsciConduit, Region};
+use kcore::bootinfo::{PsciConduit, Region};
 use kcore::layout::{GIB, KERNEL_VIRT, LINEAR_BASE};
 
-type TestFn = fn(&BootInfo) -> Result<(), &'static str>;
+type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
 const TESTS: &[(&str, TestFn)] = &[
     (
@@ -29,12 +30,16 @@ const TESTS: &[(&str, TestFn)] = &[
         "brk_is_caught_and_execution_resumes",
         brk_is_caught_and_execution_resumes,
     ),
+    (
+        "usable_memory_leaves_the_boot_alone",
+        usable_memory_leaves_the_boot_alone,
+    ),
 ];
 
-pub fn run(info: &BootInfo) -> ! {
+pub fn run(boot: &Boot) -> ! {
     let mut failed = 0u32;
     for (name, test) in TESTS {
-        match test(info) {
+        match test(boot) {
             Ok(()) => kprintln!("TEST {name} ok"),
             Err(why) => {
                 failed += 1;
@@ -50,7 +55,8 @@ fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
     if ok { Ok(()) } else { Err(why) }
 }
 
-fn device_tree_matches_qemu_virt(info: &BootInfo) -> Result<(), &'static str> {
+fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
+    let info = &boot.info;
     check(
         info.memory.as_slice()
             == [Region {
@@ -75,8 +81,8 @@ fn device_tree_matches_qemu_virt(info: &BootInfo) -> Result<(), &'static str> {
     check(info.initrd.is_some(), "no boot image in /chosen")
 }
 
-fn boot_image_is_readable_through_linear_map(info: &BootInfo) -> Result<(), &'static str> {
-    let initrd = info.initrd.ok_or("no boot image in /chosen")?;
+fn boot_image_is_readable_through_linear_map(boot: &Boot) -> Result<(), &'static str> {
+    let initrd = boot.info.initrd.ok_or("no boot image in /chosen")?;
     check(
         initrd.base / GIB == 1,
         "boot image is outside the GiB mapped at boot",
@@ -91,7 +97,7 @@ fn boot_image_is_readable_through_linear_map(info: &BootInfo) -> Result<(), &'st
     )
 }
 
-fn kernel_runs_in_upper_half_with_mmu_on(_: &BootInfo) -> Result<(), &'static str> {
+fn kernel_runs_in_upper_half_with_mmu_on(_: &Boot) -> Result<(), &'static str> {
     check(
         kernel_runs_in_upper_half_with_mmu_on as *const () as usize >= KERNEL_VIRT,
         "code runs below the kernel window",
@@ -100,19 +106,41 @@ fn kernel_runs_in_upper_half_with_mmu_on(_: &BootInfo) -> Result<(), &'static st
     check(registers::current_el() == 1, "kernel is not at EL1")
 }
 
-fn identity_map_is_dropped(_: &BootInfo) -> Result<(), &'static str> {
+fn identity_map_is_dropped(_: &Boot) -> Result<(), &'static str> {
     let table = (registers::ttbr0_el1() & 0x0000_FFFF_FFFF_F000) as usize;
     // SAFETY: TTBR0 points at boot_empty_l0 inside the kernel image, whose GiB is in the linear map.
     let l0 = unsafe { core::slice::from_raw_parts((LINEAR_BASE + table) as *const u64, 512) };
     check(l0.iter().all(|&e| e == 0), "TTBR0 still maps something")
 }
 
-fn brk_is_caught_and_execution_resumes(_: &BootInfo) -> Result<(), &'static str> {
+fn brk_is_caught_and_execution_resumes(_: &Boot) -> Result<(), &'static str> {
     exceptions::LAST_BRK.store(u64::MAX, Ordering::Relaxed);
     // SAFETY: the exception handler records BRK and returns past it.
     unsafe { core::arch::asm!("brk #0x51") };
     check(
         exceptions::LAST_BRK.load(Ordering::Relaxed) == 0x51,
         "BRK was not recorded",
+    )
+}
+
+fn usable_memory_leaves_the_boot_alone(boot: &Boot) -> Result<(), &'static str> {
+    let taken = [Some(boot.kernel_image), Some(boot.dtb), boot.info.initrd];
+    let mut total = 0;
+    for u in boot.usable.as_slice() {
+        check(
+            u.base.is_multiple_of(4096) && u.size.is_multiple_of(4096),
+            "usable region is not page-aligned",
+        )?;
+        for t in taken.iter().flatten() {
+            check(
+                u.end() <= t.base || u.base >= t.end(),
+                "usable memory overlaps the kernel, the device tree or the boot image",
+            )?;
+        }
+        total += u.size;
+    }
+    check(
+        total > 500 << 20 && total < 512 << 20,
+        "usable memory is not just under 512 MiB",
     )
 }

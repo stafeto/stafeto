@@ -11,3 +11,4 @@ pub mod bootinfo;
 pub mod esr;
 pub mod fdt;
 pub mod layout;
+pub mod memmap;

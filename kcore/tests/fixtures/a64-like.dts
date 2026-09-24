@@ -15,6 +15,21 @@
 		reg = <0x40000000 0x80000000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		secmon@40000000 {
+			reg = <0x40000000 0x80000>;
+			no-map;
+		};
+
+		framebuffer@7e000000 {
+			reg = <0x7e000000 0x1000000>;
+		};
+	};
+
 	chosen {
 		linux,initrd-start = <0x4ff00000>;
 		linux,initrd-end = <0x4ff10000>;
