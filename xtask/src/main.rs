@@ -16,6 +16,32 @@ const KERNEL_LIMIT: u64 = 200 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Kernel builds xtask makes; each keeps its own ELF and image under target/.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    Normal,
+    Test,
+    FaultProbe,
+}
+
+impl Variant {
+    fn feature(self) -> Option<&'static str> {
+        match self {
+            Variant::Normal => None,
+            Variant::Test => Some("ktest"),
+            Variant::FaultProbe => Some("fault-probe"),
+        }
+    }
+
+    fn stem(self) -> &'static str {
+        match self {
+            Variant::Normal => "stafeto",
+            Variant::Test => "stafeto-ktest",
+            Variant::FaultProbe => "stafeto-probe",
+        }
+    }
+}
+
 const USAGE: &str = "usage: cargo xtask <command>
 
 commands:
@@ -29,7 +55,7 @@ commands:
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
-        Some("build") => build(false).map(|_| ()),
+        Some("build") => build(Variant::Normal).map(|_| ()),
         Some("run") => run(),
         Some("test") => test(),
         Some("gdb") => gdb(),
@@ -106,7 +132,7 @@ struct Artifacts {
     boot_image: PathBuf,
 }
 
-fn build(ktest: bool) -> Result<Artifacts, String> {
+fn build(variant: Variant) -> Result<Artifacts, String> {
     let mut cmd = cargo();
     cmd.args([
         "build",
@@ -116,19 +142,15 @@ fn build(ktest: bool) -> Result<Artifacts, String> {
         "--target",
         KERNEL_TARGET,
     ]);
-    if ktest {
-        cmd.args(["--features", "ktest"]);
+    if let Some(feature) = variant.feature() {
+        cmd.args(["--features", feature]);
     }
     run_cmd(&mut cmd)?;
     let target = root().join("target");
-    // Both builds write the same cargo output path; a copy next to each image
+    // Every variant writes the same cargo output path; a copy next to each image
     // keeps the symbols that match it.
-    let (elf, image) = if ktest {
-        ("stafeto-ktest.elf", "stafeto-ktest.img")
-    } else {
-        ("stafeto.elf", "stafeto.img")
-    };
-    let (elf, image) = (target.join(elf), target.join(image));
+    let elf = target.join(format!("{}.elf", variant.stem()));
+    let image = target.join(format!("{}.img", variant.stem()));
     let built = target.join(KERNEL_TARGET).join("release").join("kernel");
     std::fs::copy(&built, &elf)
         .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
@@ -157,7 +179,7 @@ fn build(ktest: bool) -> Result<Artifacts, String> {
 }
 
 fn run() -> Result<(), String> {
-    let a = build(false)?;
+    let a = build(Variant::Normal)?;
     run_cmd(qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image)).arg("-nographic"))
 }
 
@@ -166,6 +188,7 @@ fn test() -> Result<(), String> {
     boot_smoke()?;
     el2_boot_smoke()?;
     elf_boot_reports_missing_device_tree()?;
+    fault_report()?;
     kernel_tests()?;
     println!("all checks passed");
     Ok(())
@@ -177,7 +200,7 @@ fn host_tests() -> Result<(), String> {
 
 /// A normal build boots, prints its report and powers the machine off.
 fn boot_smoke() -> Result<(), String> {
-    let a = build(false)?;
+    let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
@@ -188,7 +211,7 @@ fn boot_smoke() -> Result<(), String> {
 /// must drop to EL1, and power-off goes through SMC. Not the ktest build: its
 /// device tree test expects HVC.
 fn el2_boot_smoke() -> Result<(), String> {
-    let a = build(false)?;
+    let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT_EL2, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
@@ -197,7 +220,7 @@ fn el2_boot_smoke() -> Result<(), String> {
 
 /// Booting the ELF leaves x0 = 0; the kernel must say why it stops.
 fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
-    let a = build(false)?;
+    let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.elf, None);
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"))?;
@@ -208,9 +231,28 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     Ok(())
 }
 
+/// A kernel that executes an undefined instruction must name the exception
+/// class and print the registers and a backtrace.
+fn fault_report() -> Result<(), String> {
+    let a = build(Variant::FaultProbe)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    for marker in [
+        "unknown or undefined instruction",
+        "x0  0x",
+        "backtrace (",
+        "  #0 ",
+        "  #1 ",
+    ] {
+        qemu::expect_marker(&o, marker)?;
+    }
+    Ok(())
+}
+
 /// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
 fn kernel_tests() -> Result<(), String> {
-    let a = build(true)?;
+    let a = build(Variant::Test)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS).arg("-semihosting");
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
@@ -221,7 +263,7 @@ fn kernel_tests() -> Result<(), String> {
 }
 
 fn gdb() -> Result<(), String> {
-    let a = build(false)?;
+    let a = build(Variant::Normal)?;
     println!(
         "QEMU is halted before the kernel starts (kernel entry: PA 0x40200000). In another terminal:\n  lldb {} -o 'gdb-remote 1234'\nCode before the MMU runs at physical addresses; see docs/debugging.md.",
         a.elf.display()
@@ -278,5 +320,35 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "kernel",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+        "--features",
+        "fault-probe",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     test()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variants_have_their_own_artifacts_and_features() {
+        let all = [Variant::Normal, Variant::Test, Variant::FaultProbe];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.stem(), b.stem());
+                assert_ne!(a.feature(), b.feature());
+            }
+        }
+        assert_eq!(Variant::Normal.feature(), None);
+    }
 }

@@ -211,6 +211,7 @@ upper_half:
     b       7b
 8:  mov     x0, x19
     mov     x1, x20
+    mov     x29, xzr                // the frame-record chain ends here
     bl      kernel_main
 
 park:
@@ -229,7 +230,10 @@ l0_identity:    .skip 4096
 l1_identity:    .skip 4096
 boot_empty_l0:  .skip 4096
 
-.section .bss.boot_stack, "aw", %nobits
-.balign 16
+// The boot stack, the kernel stack of CPU 0, in its own page-aligned
+// section: the linker script leaves an unmapped guard page below it.
+.section .boot_stack, "aw", %nobits
+.balign 4096
+.global boot_stack, boot_stack_top
 boot_stack:     .skip 65536
 boot_stack_top:

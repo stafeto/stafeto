@@ -16,7 +16,7 @@ mod panicking;
 mod psci;
 
 use kcore::bootinfo::{self, BootInfo};
-use kcore::fdt::Fdt;
+use kcore::fdt::{self, Fdt};
 use kcore::layout::{KERNEL_VIRT, LINEAR_BASE, dtb_gib_is_mappable, fits_in_one_gib};
 
 #[unsafe(no_mangle)]
@@ -30,16 +30,25 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     if !dtb_gib_is_mappable(dtb_pa as u64) {
         panic!("device tree pointer {dtb_pa:#x} is outside the RAM the boot page tables map");
     }
-    // SAFETY: head.S mapped the GiB holding the device tree into the linear map,
-    // and nothing writes to the device tree.
-    let fdt = unsafe { Fdt::from_ptr((LINEAR_BASE + dtb_pa) as *const u8) }
+    let dtb = (LINEAR_BASE + dtb_pa) as *const u8;
+    if !fits_in_one_gib(dtb_pa as u64, fdt::HEADER_SIZE as u64) {
+        panic!("device tree header at {dtb_pa:#x} crosses a GiB boundary");
+    }
+    // SAFETY: head.S mapped the GiB holding the device tree; the header lies in it.
+    let header = unsafe { core::slice::from_raw_parts(dtb, fdt::HEADER_SIZE) };
+    let total = fdt::total_size_from_header(header)
         .unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
-    if !fits_in_one_gib(dtb_pa as u64, fdt.total_size() as u64) {
+    if !fits_in_one_gib(dtb_pa as u64, total as u64) {
         panic!("device tree at {dtb_pa:#x} crosses a GiB boundary; only its first GiB is mapped");
     }
+    // SAFETY: the whole blob lies in the mapped GiB, and nothing writes to it.
+    let fdt = unsafe { Fdt::from_ptr(dtb) }
+        .unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
     let info = bootinfo::parse(&fdt).unwrap_or_else(|e| panic!("device tree: {e:?}"));
     psci::set_conduit(info.psci);
     report(&info, dtb_pa, kernel_pa);
+    #[cfg(feature = "fault-probe")]
+    arch::probe::undefined_instruction();
     finish(&info)
 }
 

@@ -41,6 +41,16 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* One page that the kernel page tables leave unmapped: a stack overflow
+     * faults there instead of overwriting .bss. */
+    . = ALIGN(4096);
+    __stack_guard = .;
+    . += 4096;
+
+    .boot_stack (NOLOAD) : AT(ADDR(.boot_stack) - KOFF) {
+        *(.boot_stack)
+    }
+
     . = ALIGN(4096);
     .boot_pt (NOLOAD) : AT(ADDR(.boot_pt) - KOFF) {
         __boot_pt_start = .;

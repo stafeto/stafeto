@@ -3,9 +3,12 @@
 
 pub mod backtrace;
 pub mod exceptions;
+#[cfg(feature = "fault-probe")]
+pub mod probe;
 pub mod registers;
 #[cfg(feature = "ktest")]
 pub mod semihosting;
+pub mod symbols;
 
 core::arch::global_asm!(include_str!("head.S"), options(raw));
 core::arch::global_asm!(include_str!("vectors.S"), options(raw));

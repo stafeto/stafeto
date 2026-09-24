@@ -6,6 +6,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod backtrace;
 pub mod bootinfo;
+pub mod esr;
 pub mod fdt;
 pub mod layout;
