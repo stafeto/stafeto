@@ -5,7 +5,7 @@
 //! format xtask parses; the run ends with a semihosting exit code.
 
 use crate::arch::symbols;
-use crate::arch::{exceptions, registers, semihosting};
+use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
 use crate::mm::pages::KernelPages;
 use crate::mm::phys;
@@ -14,6 +14,7 @@ use core::sync::atomic::Ordering;
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
 use kcore::frames::{PAGE_SIZE, PhysMem};
+use kcore::gic::{Ack, DEFAULT_PRIORITY};
 use kcore::layout::{GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, frame_fits};
 use kcore::memmap;
 use kcore::paging::{MAIR_DEVICE, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, attr_index};
@@ -73,6 +74,28 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "pools_take_pages_from_the_frame_allocator",
         pools_take_pages_from_the_frame_allocator,
+    ),
+    (
+        "virtual_counter_runs_at_the_reported_frequency",
+        virtual_counter_runs_at_the_reported_frequency,
+    ),
+    (
+        "timer_interrupt_arrives_through_the_gic",
+        timer_interrupt_arrives_through_the_gic,
+    ),
+    ("past_deadline_fires_at_once", past_deadline_fires_at_once),
+    ("far_deadline_does_not_fire", far_deadline_does_not_fire),
+    (
+        "spurious_interrupt_needs_no_eoi",
+        spurious_interrupt_needs_no_eoi,
+    ),
+    (
+        "timer_line_without_istatus_is_spurious",
+        timer_line_without_istatus_is_spurious,
+    ),
+    (
+        "pending_interrupt_shows_while_masked",
+        pending_interrupt_shows_while_masked,
     ),
 ];
 
@@ -437,5 +460,173 @@ fn pools_take_pages_from_the_frame_allocator(_: &Boot) -> Result<(), &'static st
     check(
         pool.in_use() == 0,
         "objects are still in use after freeing all",
+    )
+}
+
+fn virtual_counter_runs_at_the_reported_frequency(_: &Boot) -> Result<(), &'static str> {
+    check(
+        timer::frequency() == 62_500_000,
+        "CNTFRQ_EL0 is not the 62.5 MHz of QEMU's cortex-a72",
+    )?;
+    let start = timer::now();
+    check(
+        (0..1_000_000).any(|_| timer::now() > start),
+        "the virtual counter does not move",
+    )
+}
+
+/// Wake-ups `wait_for_timer` allows before giving up. `wfi` may end without
+/// a pending interrupt; an interrupt that never comes hangs the test instead.
+const WAKE_UPS: usize = 1000;
+
+/// Sleeps with interrupts masked until the GIC hands out an interrupt, which
+/// must be the timer's.
+fn wait_for_timer() -> Result<Ack, &'static str> {
+    for _ in 0..WAKE_UPS {
+        if let Some(ack) = gic::wait() {
+            if ack.intid() == timer::INTID {
+                return Ok(ack);
+            }
+            gic::end(ack);
+            return Err("an interrupt other than the timer's arrived");
+        }
+    }
+    Err("the timer interrupt did not arrive")
+}
+
+fn timer_interrupt_arrives_through_the_gic(_: &Boot) -> Result<(), &'static str> {
+    check(
+        gic::is_enabled(timer::INTID) && gic::priority(timer::INTID) == DEFAULT_PRIORITY,
+        "the timer line is masked or has another priority",
+    )?;
+    let deadline = timer::clock().deadline_after(timer::now(), 1_000_000);
+    timer::arm(deadline);
+    let ack = wait_for_timer()?;
+    let fired = timer::now();
+    let condition = timer::fired();
+    let active = gic::is_active(timer::INTID);
+    // The line is level-triggered: quiet the timer before the EOI.
+    timer::disarm();
+    gic::end(ack);
+    check(fired >= deadline, "the timer fired before its deadline")?;
+    check(
+        condition,
+        "the timer interrupt came without the timer's condition",
+    )?;
+    check(active, "the timer interrupt is not active before its EOI")?;
+    check(
+        !gic::is_active(timer::INTID),
+        "the timer interrupt is still active after its EOI",
+    )?;
+    nothing_pending("an interrupt is pending after the EOI")
+}
+
+/// Err with `error` when the GIC hands out an interrupt. That interrupt
+/// gets its EOI, so a failed test leaves no line active for the next.
+fn nothing_pending(error: &'static str) -> Result<(), &'static str> {
+    match gic::acknowledge() {
+        Some(ack) => {
+            gic::end(ack);
+            Err(error)
+        }
+        None => Ok(()),
+    }
+}
+
+fn past_deadline_fires_at_once(_: &Boot) -> Result<(), &'static str> {
+    let clock = timer::clock();
+    let start = timer::now();
+    timer::arm(start.saturating_sub(clock.ns_to_ticks(1_000_000)));
+    let ack = wait_for_timer()?;
+    let waited = clock.ns_until(start, timer::now());
+    timer::disarm();
+    gic::end(ack);
+    check(
+        waited < 20_000_000,
+        "a deadline in the past did not fire at once",
+    )
+}
+
+/// A deadline centuries away must not wrap into the past: the timer stays
+/// quiet while 1 ms of counter time passes.
+fn far_deadline_does_not_fire(_: &Boot) -> Result<(), &'static str> {
+    let clock = timer::clock();
+    let start = timer::now();
+    timer::arm(clock.deadline_after(start, u64::MAX));
+    let later = clock.deadline_after(start, 1_000_000);
+    while timer::now() < later {}
+    let fired = gic::acknowledge();
+    timer::disarm();
+    match fired {
+        Some(ack) => {
+            gic::end(ack);
+            Err("a deadline centuries away fired")
+        }
+        None => Ok(()),
+    }
+}
+
+/// GICC_IAR with nothing to hand out reads a spurious INTID, which gets no
+/// EOI; so does a line the distributor masks. Neither disturbs the next
+/// real interrupt.
+fn spurious_interrupt_needs_no_eoi(_: &Boot) -> Result<(), &'static str> {
+    nothing_pending("IAR handed out an interrupt with nothing pending")?;
+    gic::mask(timer::INTID);
+    timer::arm(0);
+    let masked = gic::acknowledge();
+    gic::unmask(timer::INTID);
+    if let Some(ack) = masked {
+        timer::disarm();
+        gic::end(ack);
+        return Err("IAR handed out a masked line");
+    }
+    let ack = wait_for_timer()?;
+    timer::disarm();
+    gic::end(ack);
+    check(
+        !gic::is_active(timer::INTID),
+        "the timer interrupt is still active after its EOI",
+    )
+}
+
+/// On real hardware a level line may reach the GIC once more after the EOI
+/// that followed a disarm. The handler then finds the timer off and treats
+/// INTID 27 as spurious; the test makes the line pending by hand to get
+/// that late interrupt.
+fn timer_line_without_istatus_is_spurious(_: &Boot) -> Result<(), &'static str> {
+    timer::disarm();
+    gic::set_pending(timer::INTID);
+    let ack = wait_for_timer()?;
+    let fired = timer::fired();
+    gic::end(ack);
+    check(!fired, "a disarmed timer says its deadline has passed")?;
+    check(
+        !gic::is_active(timer::INTID),
+        "the timer interrupt is still active after its EOI",
+    )?;
+    nothing_pending("an interrupt is pending after the EOI")
+}
+
+/// Long kernel operations poll for pending interrupts (spec 7.7): ISR_EL1
+/// shows one while PSTATE masks it, and none once it is acknowledged.
+fn pending_interrupt_shows_while_masked(_: &Boot) -> Result<(), &'static str> {
+    check(
+        !arch::irq_pending(),
+        "ISR_EL1 shows an interrupt with nothing pending",
+    )?;
+    timer::arm(0);
+    let seen = (0..1_000_000).any(|_| arch::irq_pending());
+    let ack = wait_for_timer()?;
+    let after_ack = arch::irq_pending();
+    timer::disarm();
+    gic::end(ack);
+    check(seen, "ISR_EL1 does not show the pending timer interrupt")?;
+    check(
+        !after_ack,
+        "ISR_EL1 still shows the interrupt after its acknowledgement",
+    )?;
+    check(
+        !arch::irq_pending(),
+        "ISR_EL1 shows an interrupt after the EOI",
     )
 }

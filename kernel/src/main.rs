@@ -20,6 +20,7 @@ mod psci;
 use boot::Boot;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::KERNEL_VIRT;
+use kcore::time::Clock;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
@@ -34,7 +35,9 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     let rest = mm::phys::init(&boot);
     mm::kmap::switch_to_kernel_tables(&boot);
     mm::phys::add(rest.as_slice());
-    report(&boot);
+    arch::gic::init(&boot.info);
+    let clock = arch::timer::init();
+    report(&boot, clock);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
     #[cfg(feature = "overflow-probe")]
@@ -53,7 +56,7 @@ fn finish(boot: &Boot) -> ! {
     ktest::run(boot)
 }
 
-fn report(boot: &Boot) {
+fn report(boot: &Boot, clock: Clock) {
     let info = &boot.info;
     for r in info.memory.as_slice() {
         kprintln!("memory     {:#x}..{:#x}", r.base, r.end());
@@ -82,6 +85,7 @@ fn report(boot: &Boot) {
         );
     }
     kprintln!("psci       {:?}", info.psci);
+    kprintln!("timer      {} Hz", clock.hz());
     for r in boot.usable.as_slice() {
         kprintln!("usable     {:#x}..{:#x}", r.base, r.end());
     }

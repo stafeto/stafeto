@@ -221,13 +221,18 @@ fn host_tests() -> Result<(), String> {
     ]))
 }
 
-/// A normal build boots, prints its report and powers the machine off.
+/// A normal build boots, prints its report with the timer frequency and
+/// powers the machine off.
 fn boot_smoke() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    qemu::expect_clean_exit_with(&o, "boot complete")
+    qemu::expect_clean_exit_with(&o, "boot complete")?;
+    match qemu::number_after(&o.lines, "timer ") {
+        Some(hz) if hz > 0 => Ok(()),
+        _ => Err("the kernel printed no `timer N Hz` line".into()),
+    }
 }
 
 /// The same build entered at EL2, as the PinePhone's loader does: head.S
