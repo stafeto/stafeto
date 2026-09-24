@@ -13,4 +13,5 @@ pub mod fdt;
 pub mod frames;
 pub mod layout;
 pub mod memmap;
+pub mod paging;
 pub mod sync;
