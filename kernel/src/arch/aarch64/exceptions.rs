@@ -5,7 +5,7 @@
 //! stops the kernel. Test builds skip one BRK marker (kcore::esr::TEST_BRK)
 //! to prove the vectors and the return path work.
 
-use super::registers;
+use super::{registers, symbols};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::esr::{self, BrkAction};
 
@@ -75,16 +75,24 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     }
     let far = registers::far_el1();
     let class = esr::ec(syndrome);
+    if matches!(class, esr::EC_DABT_SAME | esr::EC_IABT_SAME) {
+        let guard = symbols::image_layout().stack_guard as u64;
+        if (guard..guard + 4096).contains(&far) {
+            kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
+        }
+    }
     print_frame(frame);
     if matches!(
         class,
         esr::EC_IABT_LOWER | esr::EC_IABT_SAME | esr::EC_DABT_LOWER | esr::EC_DABT_SAME
     ) {
-        kprintln!(
-            "abort: {} at level {}, FAR={far:#x}",
-            esr::fault_status_name(syndrome),
-            esr::fault_level(syndrome)
-        );
+        match esr::fault_level(syndrome) {
+            Some(level) => kprintln!(
+                "abort: {} at level {level}, FAR={far:#x}",
+                esr::fault_status_name(syndrome)
+            ),
+            None => kprintln!("abort: {}, FAR={far:#x}", esr::fault_status_name(syndrome)),
+        }
     }
     panic!(
         "unexpected exception {}: {} (EC {class:#x}) ESR={syndrome:#x} ELR={:#x} FAR={far:#x}",

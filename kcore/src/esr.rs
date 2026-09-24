@@ -59,9 +59,11 @@ pub fn fault_status_name(esr: u64) -> &'static str {
     }
 }
 
-/// Translation table level of an address size, translation, access flag or permission fault.
-pub fn fault_level(esr: u64) -> u8 {
-    (esr & 0b11) as u8
+/// Translation table level of an address size, translation, access flag or
+/// permission fault (ISS[1:0], DFSC/IFSC 0x00..=0x0F); other fault statuses
+/// carry no level.
+pub fn fault_level(esr: u64) -> Option<u8> {
+    matches!(esr & 0x3F, 0x00..=0x0F).then(|| (esr & 0b11) as u8)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +113,10 @@ mod tests {
 
     #[test]
     fn fault_level_is_the_low_two_bits() {
-        assert_eq!(fault_level(0x06), 2);
-        assert_eq!(fault_level(0x0F), 3);
+        assert_eq!(fault_level(0x06), Some(2));
+        assert_eq!(fault_level(0x0F), Some(3));
+        assert_eq!(fault_level(0x10), None);
+        assert_eq!(fault_level(0x21), None);
     }
 
     #[test]
