@@ -196,7 +196,15 @@ fn test() -> Result<(), String> {
 }
 
 fn host_tests() -> Result<(), String> {
-    run_cmd(cargo().args(["test", "--package", "kcore", "--package", "xtask"]))
+    run_cmd(cargo().args([
+        "test",
+        "--package",
+        "abi",
+        "--package",
+        "kcore",
+        "--package",
+        "xtask",
+    ]))
 }
 
 /// A normal build boots, prints its report and powers the machine off.
@@ -295,6 +303,8 @@ fn ci() -> Result<(), String> {
     run_cmd(cargo().args([
         "clippy",
         "--package",
+        "abi",
+        "--package",
         "kcore",
         "--package",
         "xtask",
@@ -305,6 +315,8 @@ fn ci() -> Result<(), String> {
     ]))?;
     run_cmd(cargo().args([
         "clippy",
+        "--package",
+        "abi",
         "--package",
         "kcore",
         "--target",

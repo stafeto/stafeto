@@ -3,8 +3,15 @@
 version = 4
 
 [[package]]
+name = "abi"
+version = "0.1.0"
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
+dependencies = [
+ "abi",
+]
 
 [[package]]
 name = "kernel"

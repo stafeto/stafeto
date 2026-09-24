@@ -1,0 +1,11 @@
+[package]
+name = "abi"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The stafeto kernel interface: handles, rights and error codes"
+
+[lib]
+bench = false
