@@ -429,4 +429,16 @@ mod tests {
         let mut t: HandleTable<u32> = HandleTable::new(10);
         assert_eq!(t.insert(&mut src, 1, RW), Err(HandleError::NoMemory));
     }
+
+    #[test]
+    fn forged_handle_to_a_free_entry_is_bad() {
+        let mut src = boxes(1);
+        let mut t = HandleTable::new(10);
+        let a = t.insert(&mut src, 1, RW).unwrap();
+        t.remove(a).unwrap();
+        let forged = Handle::new(a.index(), a.generation() + 1);
+        assert_eq!(t.get(forged), Err(HandleError::BadHandle));
+        assert_eq!(t.remove(forged), Err(HandleError::BadHandle));
+        t.release(&mut src);
+    }
 }
