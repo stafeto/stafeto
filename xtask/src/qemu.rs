@@ -219,6 +219,59 @@ pub fn number_after(lines: &[String], prefix: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// The hex value starting at `line[at + 2..]` (right after a `0x`).
+fn hex_at(line: &str, at: usize) -> Option<u64> {
+    let digits: String = line[at + 2..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    u64::from_str_radix(&digits, 16).ok()
+}
+
+/// The address after `ELR=0x` on the kernel's panic line, if any.
+fn elr_in_panic(lines: &[String]) -> Option<u64> {
+    let line = lines.iter().find(|l| l.contains("ELR=0x"))?;
+    hex_at(line, line.find("ELR=0x")? + "ELR=".len())
+}
+
+/// Addresses on backtrace frame lines (`kcore::backtrace`'s `  #N  0x...`).
+fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
+    lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .filter_map(|l| l.find("0x").and_then(|at| hex_at(l, at)))
+        .collect()
+}
+
+/// The backtrace must name the interrupted instruction (its `ELR`) and at
+/// least one caller above it: proof that exception entry recorded a frame
+/// linking the fault into the backtrace, not just the panic handler's own
+/// frames (which a backtrace prints regardless of that record).
+pub fn backtrace_names_the_fault(lines: &[String]) -> Result<(), String> {
+    let elr = elr_in_panic(lines).ok_or("no panic line with ELR=0x...")?;
+    let frames = backtrace_addresses(lines);
+    let at = frames
+        .iter()
+        .position(|&a| a == elr)
+        .ok_or_else(|| format!("ELR {elr:#x} is not in the backtrace: {frames:#x?}"))?;
+    if at + 1 >= frames.len() {
+        return Err(format!("ELR {elr:#x} is the last frame in the backtrace"));
+    }
+    Ok(())
+}
+
+/// QEMU must have finished before the deadline.
+pub fn expect_not_timed_out(o: &Outcome) -> Result<(), String> {
+    if o.timed_out {
+        Err(format!(
+            "QEMU did not finish in time; last lines: {:?}",
+            tail(&o.lines)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestReport {
     pub passed: Vec<String>,
@@ -329,6 +382,40 @@ mod tests {
     fn number_after_needs_the_prefix_and_a_number() {
         assert_eq!(number_after(&lines(&["boot"]), "frames "), None);
         assert_eq!(number_after(&lines(&["frames none"]), "frames "), None);
+    }
+
+    #[test]
+    fn backtrace_names_the_fault_accepts_the_elr_with_a_caller_above_it() {
+        let l = lines(&[
+            "unexpected exception EL1h sync: unknown or undefined instruction (EC 0x0) ESR=0x2000000 ELR=0xffffffffc00017c0 FAR=0x0",
+            "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/stafeto-probe.elf):",
+            "  #0  0xffffffffc0001204",
+            "  #4  0xffffffffc00017c0",
+            "  #5  0xffffffffc0002378",
+        ]);
+        assert!(backtrace_names_the_fault(&l).is_ok());
+    }
+
+    #[test]
+    fn backtrace_names_the_fault_rejects_a_missing_elr() {
+        let l = lines(&[
+            "unexpected exception EL1h sync: ... ELR=0xffffffffc00017c0 FAR=0x0",
+            "backtrace (look up: ...):",
+            "  #0  0xffffffffc0001204",
+            "  #1  0xffffffffc0002438",
+        ]);
+        assert!(backtrace_names_the_fault(&l).is_err());
+    }
+
+    #[test]
+    fn backtrace_names_the_fault_rejects_the_elr_as_the_last_frame() {
+        let l = lines(&[
+            "unexpected exception EL1h sync: ... ELR=0xffffffffc00017c0 FAR=0x0",
+            "backtrace (look up: ...):",
+            "  #0  0xffffffffc0001204",
+            "  #4  0xffffffffc00017c0",
+        ]);
+        assert!(backtrace_names_the_fault(&l).is_err());
     }
 
     #[test]

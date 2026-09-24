@@ -257,22 +257,19 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
 }
 
 /// A kernel that executes an undefined instruction must name the exception
-/// class and print the registers and a backtrace.
+/// class, print the registers, and its backtrace must name the interrupted
+/// instruction: proof that exception entry recorded a frame, not just that
+/// the panic handler's own frames print (they would with no record at all).
 fn fault_report() -> Result<(), String> {
     let a = build(Variant::FaultProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    for marker in [
-        "unknown or undefined instruction",
-        "x0  0x",
-        "backtrace (",
-        "  #0 ",
-        "  #1 ",
-    ] {
+    qemu::expect_not_timed_out(&o)?;
+    for marker in ["unknown or undefined instruction", "x0  0x", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
     }
-    Ok(())
+    qemu::backtrace_names_the_fault(&o.lines)
 }
 
 /// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
