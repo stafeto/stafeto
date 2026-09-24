@@ -27,6 +27,9 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
     psci::set_conduit(boot.info.psci);
+    // Until the kernel's own tables are built, the allocator sees only the
+    // RAM in the GiBs the boot page tables map; the kernel tables are built
+    // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(&boot);
     mm::kmap::switch_to_kernel_tables(&boot);
     mm::phys::add(rest.as_slice());

@@ -7,7 +7,8 @@
 // switch itself runs at its physical address through the identity map in
 // TTBR0: TTBR1 first goes to an empty table and the TLBs are flushed, then
 // to the new tables, so old 2 MiB blocks and new 4 KiB pages never meet in
-// the TLB (break-before-make for the whole of TTBR1). Interrupts are masked.
+// the TLB (break-before-make for the whole of TTBR1). The caller must mask
+// interrupts (DAIF) before calling and keep them masked until it returns.
 
 .section .text.mmu, "ax"
 .global switch_ttbr1

@@ -44,7 +44,10 @@ SECTIONS
     }
 
     /* One page that the kernel page tables leave unmapped: a stack overflow
-     * faults there instead of overwriting .bss. */
+     * faults here first. Exception entry then pushes its own trap frame
+     * below the already-overflowed SP, past this page, so the fault is
+     * caught but its report has no usable call stack; milestone 1.2b adds
+     * a dedicated stack for exception entry. */
     . = ALIGN(4096);
     __stack_guard = .;
     . += 4096;
