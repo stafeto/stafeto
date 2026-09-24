@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kcore", "xtask"]
+members = ["kcore", "kernel", "xtask"]
 default-members = ["kcore", "xtask"]
 
 [workspace.package]

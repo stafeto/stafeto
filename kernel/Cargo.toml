@@ -1,0 +1,19 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The stafeto microkernel"
+
+[[bin]]
+name = "kernel"
+test = false
+bench = false
+
+[dependencies]
+kcore = { path = "../kcore" }
+
+[features]
+ktest = []
