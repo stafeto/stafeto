@@ -4,7 +4,7 @@
 pub mod backtrace;
 pub mod exceptions;
 pub mod mmu;
-#[cfg(feature = "fault-probe")]
+#[cfg(any(feature = "fault-probe", feature = "overflow-probe"))]
 pub mod probe;
 pub mod registers;
 #[cfg(feature = "ktest")]

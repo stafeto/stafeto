@@ -37,6 +37,8 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     report(&boot);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
+    #[cfg(feature = "overflow-probe")]
+    arch::probe::recurse(0);
     finish(&boot)
 }
 

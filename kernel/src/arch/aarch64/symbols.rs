@@ -25,6 +25,12 @@ pub fn boot_stack() -> core::ops::Range<usize> {
     symbol!("boot_stack")..symbol!("boot_stack_top")
 }
 
+/// The stack that exception entry switches to when the kernel stack has no
+/// room for the trap frame (vectors.S).
+pub fn emergency_stack() -> core::ops::Range<usize> {
+    symbol!("emergency_stack")..symbol!("emergency_stack_top")
+}
+
 /// The whole kernel image in virtual memory: code, data, .bss, the boot
 /// stack and the boot page tables.
 pub fn image() -> core::ops::Range<usize> {

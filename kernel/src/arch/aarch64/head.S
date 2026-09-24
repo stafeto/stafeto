@@ -231,11 +231,9 @@ l0_identity:    .skip 4096
 l1_identity:    .skip 4096
 boot_empty_l0:  .skip 4096
 
-// The boot stack, the kernel stack of CPU 0, in its own page-aligned
-// section: the linker script leaves an unmapped guard page below it. A
-// stack overflow faults on that page, but exception entry shares this
-// stack and pushes its own trap frame lower still, so the report may have
-// no usable call stack; see kernel.ld.
+// The boot stack, the kernel stack of CPU 0, in its own section: the
+// linker script aligns it to 128 KiB and puts an unmapped guard page and the
+// emergency stack below it. Its size is kcore::layout::KERNEL_STACK_SIZE.
 .section .boot_stack, "aw", %nobits
 .balign 4096
 .global boot_stack, boot_stack_top

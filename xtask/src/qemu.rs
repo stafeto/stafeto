@@ -4,6 +4,7 @@
 //! Running QEMU with a deadline and judging its console output.
 
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -262,6 +263,42 @@ pub fn backtrace_names_the_fault(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The address range of the function `name` in `llvm-nm -C --print-size`
+/// output (lines of address, size, type and name).
+pub fn symbol_range(nm: &str, name: &str) -> Option<Range<u64>> {
+    nm.lines().find_map(|l| {
+        let mut f = l.splitn(4, ' ');
+        let (addr, size, _kind, sym) = (f.next()?, f.next()?, f.next()?, f.next()?);
+        if sym != name {
+            return None;
+        }
+        let addr = u64::from_str_radix(addr, 16).ok()?;
+        Some(addr..addr + u64::from_str_radix(size, 16).ok()?)
+    })
+}
+
+/// The report of a stack overflow in the recursive function `f`: the
+/// panic line's ELR lies in `f`, and the backtrace shows the ELR and, above
+/// it, more frames of `f`. Those frames come from the kernel stack, while the
+/// report runs on the emergency stack: proof that the walk crossed over.
+pub fn overflow_report_names(lines: &[String], f: Range<u64>) -> Result<(), String> {
+    let elr = elr_in_panic(lines).ok_or("no panic line with ELR=0x...")?;
+    if !f.contains(&elr) {
+        return Err(format!("ELR {elr:#x} is outside the recursion {f:#x?}"));
+    }
+    let frames = backtrace_addresses(lines);
+    let at = frames
+        .iter()
+        .position(|&a| a == elr)
+        .ok_or_else(|| format!("ELR {elr:#x} is not in the backtrace: {frames:#x?}"))?;
+    if !frames[at + 1..].iter().any(|a| f.contains(a)) {
+        return Err(format!(
+            "the backtrace has no frames of the recursion above the ELR: {frames:#x?}"
+        ));
+    }
+    Ok(())
+}
+
 /// QEMU must have finished before the deadline.
 pub fn expect_not_timed_out(o: &Outcome) -> Result<(), String> {
     if o.timed_out {
@@ -271,6 +308,15 @@ pub fn expect_not_timed_out(o: &Outcome) -> Result<(), String> {
         ))
     } else {
         Ok(())
+    }
+}
+
+/// The machine must power itself off before the deadline, with status 0.
+pub fn expect_powered_off(o: &Outcome) -> Result<(), String> {
+    expect_not_timed_out(o)?;
+    match o.status {
+        Some(s) if s.success() => Ok(()),
+        other => Err(format!("QEMU exit status {other:?}")),
     }
 }
 
@@ -424,6 +470,111 @@ mod tests {
             "  #4  0xffffffffc00017c0",
         ]);
         assert!(backtrace_names_the_fault(&l).is_err());
+    }
+
+    const NM: &str = "\
+ffffffffc0003a0c 0000000000000014 t kernel::arch::aarch64::probe::recurse
+ffffffffc00042f0 0000000000000438 T handle_exception
+ffffffffc0009000 T __text_end
+";
+
+    #[test]
+    fn powered_off_needs_an_exit_in_time_with_status_zero() {
+        let off = Outcome {
+            lines: vec![],
+            status: Some(ExitStatus::from_raw(0)),
+            timed_out: false,
+            stopped_on_marker: false,
+        };
+        assert!(expect_powered_off(&off).is_ok());
+        let failed = Outcome {
+            status: Some(ExitStatus::from_raw(1 << 8)),
+            ..off.clone()
+        };
+        assert!(expect_powered_off(&failed).is_err());
+        let hung = Outcome {
+            status: None,
+            timed_out: true,
+            ..off
+        };
+        assert!(expect_powered_off(&hung).is_err());
+    }
+
+    #[test]
+    fn symbol_range_reads_address_and_size() {
+        assert_eq!(
+            symbol_range(NM, "handle_exception"),
+            Some(0xffff_ffff_c000_42f0..0xffff_ffff_c000_4728)
+        );
+    }
+
+    #[test]
+    fn symbol_range_needs_the_whole_name_and_a_size() {
+        assert_eq!(symbol_range(NM, "recurse"), None);
+        assert_eq!(symbol_range(NM, "__text_end"), None);
+        assert_eq!(symbol_range(NM, "kernel_main"), None);
+    }
+
+    const RECURSE: std::ops::Range<u64> = 0xffff_ffff_c000_3a0c..0xffff_ffff_c000_3a20;
+
+    fn overflow_report(elr: &str, frames: &[&str]) -> Vec<String> {
+        let mut l = vec![
+            "kernel stack overflow: no room for the trap frame at SP 0xffffffffc001fef0"
+                .to_string(),
+            format!(
+                "unexpected exception EL1h sync: data abort in the kernel (EC 0x25) ESR=0x96000047 ELR={elr} FAR=0xffffffffc001ff70"
+            ),
+            "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/stafeto-overflow.elf):"
+                .to_string(),
+        ];
+        l.extend(
+            frames
+                .iter()
+                .enumerate()
+                .map(|(i, f)| format!("  #{i:<2} {f}")),
+        );
+        l
+    }
+
+    #[test]
+    fn overflow_report_accepts_the_elr_in_the_recursion_with_more_of_it_above() {
+        let l = overflow_report(
+            "0xffffffffc0003a10",
+            &[
+                "0xffffffffc0004400",
+                "0xffffffffc0003a10",
+                "0xffffffffc0003a18",
+            ],
+        );
+        assert!(overflow_report_names(&l, RECURSE).is_ok());
+    }
+
+    #[test]
+    fn overflow_report_rejects_an_elr_outside_the_recursion() {
+        let l = overflow_report(
+            "0xffffffffc0004400",
+            &["0xffffffffc0004400", "0xffffffffc0003a18"],
+        );
+        assert!(overflow_report_names(&l, RECURSE).is_err());
+    }
+
+    #[test]
+    fn overflow_report_rejects_an_elr_missing_from_the_backtrace() {
+        let l = overflow_report("0xffffffffc0003a10", &["0xffffffffc0003a18"]);
+        assert!(overflow_report_names(&l, RECURSE).is_err());
+    }
+
+    #[test]
+    fn overflow_report_rejects_a_backtrace_that_stops_at_the_elr() {
+        let l = overflow_report(
+            "0xffffffffc0003a10",
+            &[
+                "0xffffffffc0004400",
+                "0xffffffffc0003a10",
+                "0xffffffffc0004800",
+            ],
+        );
+        assert!(overflow_report_names(&l, RECURSE).is_err());
     }
 
     #[test]

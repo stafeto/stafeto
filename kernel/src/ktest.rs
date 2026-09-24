@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering;
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
 use kcore::frames::{PAGE_SIZE, PhysMem};
-use kcore::layout::{GIB, KERNEL_VIRT, LINEAR_BASE};
+use kcore::layout::{GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, frame_fits};
 use kcore::memmap;
 use kcore::paging::{MAIR_DEVICE, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, attr_index};
 use kcore::slab::Pool;
@@ -56,6 +56,10 @@ const TESTS: &[(&str, TestFn)] = &[
         only_kernel_text_is_executable,
     ),
     ("stack_guard_page_is_unmapped", stack_guard_page_is_unmapped),
+    (
+        "kernel_stacks_suit_the_overflow_check",
+        kernel_stacks_suit_the_overflow_check,
+    ),
     (
         "physical_addresses_do_not_translate",
         physical_addresses_do_not_translate,
@@ -311,6 +315,38 @@ fn stack_guard_page_is_unmapped(_: &Boot) -> Result<(), &'static str> {
         !translates(registers::at_s1e1r(guard)),
         "the stack guard page is mapped",
     )
+}
+
+/// The layout exception entry relies on (vectors.S): the boot stack aligned
+/// to twice its size, the emergency stack right below the guard page and
+/// inside the range where no trap frame fits, so an entry on it starts over
+/// at its top; the emergency stack is writable and never executable.
+fn kernel_stacks_suit_the_overflow_check(_: &Boot) -> Result<(), &'static str> {
+    let stack = symbols::boot_stack();
+    check(
+        stack.start.is_multiple_of(2 * KERNEL_STACK_SIZE) && stack.len() == KERNEL_STACK_SIZE,
+        "the boot stack is not 64 KiB aligned to 128 KiB",
+    )?;
+    let emergency = symbols::emergency_stack();
+    check(
+        emergency.end == symbols::image_layout().stack_guard,
+        "the emergency stack does not end at the guard page",
+    )?;
+    check(
+        !frame_fits(emergency.start) && !frame_fits(emergency.end - 16),
+        "a trap frame fits on the emergency stack",
+    )?;
+    for va in [emergency.start, emergency.end - 8] {
+        check(
+            translates(registers::at_s1e1w(va)),
+            "the emergency stack is not writable",
+        )?;
+        check(
+            kernel_descriptor(va).is_some_and(|d| d & PXN != 0),
+            "the emergency stack is executable",
+        )?;
+    }
+    Ok(())
 }
 
 fn physical_addresses_do_not_translate(boot: &Boot) -> Result<(), &'static str> {

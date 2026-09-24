@@ -3,10 +3,12 @@
 
 //! Exception entry. Every exception is reported with its registers and
 //! stops the kernel. Test builds skip one BRK marker (kcore::esr::TEST_BRK)
-//! to prove the vectors and the return path work.
+//! to prove the vectors and the return path work. An entry from EL1 that
+//! finds no room on the kernel stack runs on the emergency stack and never
+//! returns.
 
 use super::{registers, symbols};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::esr::{self, BrkAction};
 
 /// Registers saved by vectors.S, in its layout, and the frame record that
@@ -17,10 +19,13 @@ pub struct TrapFrame {
     pub sp_el0: u64,
     pub elr: u64,
     pub spsr: u64,
+    /// SP_EL1 of the interrupted code.
+    pub sp: u64,
+    _padding: u64,
     pub frame_record: [u64; 2],
 }
 
-const _: () = assert!(core::mem::size_of::<TrapFrame>() == 288);
+const _: () = assert!(core::mem::size_of::<TrapFrame>() == 304);
 
 const VECTOR_NAMES: [&str; 16] = [
     "EL1t sync",
@@ -41,9 +46,16 @@ const VECTOR_NAMES: [&str; 16] = [
     "EL0 AArch32 serror",
 ];
 const VECTOR_EL1H_SYNC: u64 = 4;
+/// Set in the vector index when the entry switched to the emergency stack.
+const ON_EMERGENCY_STACK: u64 = 1 << 4;
 
 /// Immediate of the last BRK skipped in kernel code.
 pub static LAST_BRK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Set by the first entry on the emergency stack. Another one starts over
+/// at the top of that stack, on the frames of the first report, and may
+/// fail the same way again: it stops the machine without a word.
+static ON_EMERGENCY: AtomicBool = AtomicBool::new(false);
 
 /// Points VBAR_EL1 at the vector table.
 pub fn init() {
@@ -64,6 +76,8 @@ pub fn init() {
 #[unsafe(no_mangle)]
 extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     let syndrome = registers::esr_el1();
+    // Only an entry on the kernel stack may return: after a switch to the
+    // emergency stack the vector has no way back to the interrupted SP.
     if index == VECTOR_EL1H_SYNC
         && let Some(imm) = esr::brk_immediate(syndrome)
         && esr::kernel_brk_action(imm, cfg!(feature = "ktest")) == BrkAction::Skip
@@ -75,11 +89,22 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     }
     let far = registers::far_el1();
     let class = esr::ec(syndrome);
-    if matches!(class, esr::EC_DABT_SAME | esr::EC_IABT_SAME) {
-        let guard = symbols::image_layout().stack_guard as u64;
-        if (guard..guard + 4096).contains(&far) {
-            kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
+    let guard = symbols::image_layout().stack_guard as u64;
+    if index & ON_EMERGENCY_STACK != 0 {
+        if ON_EMERGENCY.swap(true, Ordering::Relaxed) {
+            crate::panicking::stop()
         }
+        let stack = symbols::boot_stack();
+        kprintln!(
+            "kernel stack overflow: no room for the trap frame at SP {:#x} (kernel stack {:#x}..{:#x}); reporting on the emergency stack",
+            frame.sp,
+            stack.start,
+            stack.end
+        );
+    } else if matches!(class, esr::EC_DABT_SAME | esr::EC_IABT_SAME)
+        && (guard..guard + 4096).contains(&far)
+    {
+        kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
     }
     print_frame(frame);
     if matches!(
@@ -108,7 +133,8 @@ fn print_frame(f: &TrapFrame) {
         crate::console::print(format_args!("x{i:<2} {v:#018x}{sep}"));
     }
     kprintln!(
-        "\nsp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}",
+        "\nsp  {:#018x}  sp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}",
+        f.sp,
         f.sp_el0,
         f.elr,
         f.spsr

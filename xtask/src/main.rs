@@ -15,6 +15,8 @@ const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
 const KERNEL_LIMIT: u64 = 200 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The overflow probe's recursive function, as `llvm-nm -C` names it.
+const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,16 +24,23 @@ enum Variant {
     Normal,
     Test,
     FaultProbe,
+    OverflowProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 3] = [Variant::Normal, Variant::Test, Variant::FaultProbe];
+    const ALL: [Variant; 4] = [
+        Variant::Normal,
+        Variant::Test,
+        Variant::FaultProbe,
+        Variant::OverflowProbe,
+    ];
 
     fn feature(self) -> Option<&'static str> {
         match self {
             Variant::Normal => None,
             Variant::Test => Some("ktest"),
             Variant::FaultProbe => Some("fault-probe"),
+            Variant::OverflowProbe => Some("overflow-probe"),
         }
     }
 
@@ -40,6 +49,7 @@ impl Variant {
             Variant::Normal => "stafeto",
             Variant::Test => "stafeto-ktest",
             Variant::FaultProbe => "stafeto-probe",
+            Variant::OverflowProbe => "stafeto-overflow",
         }
     }
 }
@@ -192,6 +202,7 @@ fn test() -> Result<(), String> {
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     fault_report()?;
+    stack_overflow_report()?;
     kernel_tests(&qemu::VIRT)?;
     kernel_tests(&qemu::VIRT_2G)?;
     println!("all checks passed");
@@ -273,6 +284,29 @@ fn fault_report() -> Result<(), String> {
         qemu::expect_marker(&o, marker)?;
     }
     qemu::backtrace_names_the_fault(&o.lines)
+}
+
+/// A kernel that recurses without end must report the overflow from the
+/// emergency stack and power off: the report names the real ELR inside the
+/// recursive function, and its backtrace goes on into the recursion on the
+/// kernel stack. The function's address range comes from the ELF's symbols.
+fn stack_overflow_report() -> Result<(), String> {
+    let a = build(Variant::OverflowProbe)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    qemu::expect_powered_off(&o)?;
+    for marker in ["kernel stack overflow", "backtrace ("] {
+        qemu::expect_marker(&o, marker)?;
+    }
+    let nm = stdout_of(
+        Command::new(llvm_tool("llvm-nm")?)
+            .args(["-C", "--print-size", "--defined-only"])
+            .arg(&a.elf),
+    )?;
+    let f = qemu::symbol_range(&nm, OVERFLOW_PROBE_FN)
+        .ok_or_else(|| format!("{OVERFLOW_PROBE_FN} is not in {}", a.elf.display()))?;
+    qemu::overflow_report_names(&o.lines, f)
 }
 
 /// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU

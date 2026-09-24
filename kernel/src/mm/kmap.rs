@@ -94,13 +94,13 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
                 image.rodata_end,
                 image.stack_guard,
                 Attrs::KERNEL_DATA,
-                "kernel data",
+                "kernel data, boot tables and emergency stack",
             ),
             (
                 image.stack_guard + PAGE_SIZE as usize,
                 image.end,
                 Attrs::KERNEL_DATA,
-                "boot stack and boot tables",
+                "boot stack",
             ),
         ];
         for (start, end, attrs, what) in sections {
