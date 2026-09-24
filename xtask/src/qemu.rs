@@ -35,11 +35,14 @@ pub const VIRT_EL2: Machine = Machine {
     memory: "512M",
 };
 
-/// The spec machine with 2 GiB: RAM spans two GiBs, and the second one is
-/// not in the boot page tables.
+/// The spec machine with 2 GiB and the PinePhone's Cortex-A53: RAM spans
+/// two GiBs, and the second one is not in the boot page tables. The A53
+/// reports a VIPT instruction cache, so the kernel tests take that path of
+/// the cache maintenance too; the kernel is entered at EL1 and PSCI goes
+/// through HVC, as on VIRT.
 pub const VIRT_2G: Machine = Machine {
     machine: "virt,gic-version=2",
-    cpu: "cortex-a72",
+    cpu: "cortex-a53",
     memory: "2G",
 };
 
@@ -417,7 +420,8 @@ mod tests {
     fn two_gib_machine_asks_for_2g() {
         let joined = args(&VIRT_2G, Path::new("k.img"), None).join(" ");
         assert!(joined.contains("-m 2G"));
-        assert!(joined.contains("-cpu cortex-a72"));
+        assert!(joined.contains("-cpu cortex-a53"));
+        assert!(!joined.contains("virtualization"));
     }
 
     #[test]

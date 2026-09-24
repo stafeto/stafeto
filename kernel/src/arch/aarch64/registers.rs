@@ -25,6 +25,31 @@ pub fn sctlr_el1() -> u64 {
     read_sysreg!("sctlr_el1")
 }
 
+#[cfg(feature = "ktest")]
+pub fn cpacr_el1() -> u64 {
+    read_sysreg!("cpacr_el1")
+}
+
+#[cfg(feature = "ktest")]
+pub fn cntkctl_el1() -> u64 {
+    read_sysreg!("cntkctl_el1")
+}
+
+#[cfg(feature = "ktest")]
+pub fn mdscr_el1() -> u64 {
+    read_sysreg!("mdscr_el1")
+}
+
+/// Only where kcore::sysreg::has_pmu says the register exists.
+#[cfg(feature = "ktest")]
+pub fn pmuserenr_el0() -> u64 {
+    read_sysreg!("pmuserenr_el0")
+}
+
+pub fn id_aa64dfr0_el1() -> u64 {
+    read_sysreg!("id_aa64dfr0_el1")
+}
+
 pub fn ttbr0_el1() -> u64 {
     read_sysreg!("ttbr0_el1")
 }

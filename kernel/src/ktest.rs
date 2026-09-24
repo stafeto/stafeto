@@ -2,16 +2,23 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! In-kernel tests for `cargo xtask test`. Each test prints one line in the
-//! format xtask parses; the run ends with a semihosting exit code.
+//! format xtask parses; the run ends with a semihosting exit code. The tests
+//! at EL0 (`el0`) come last, as a chain that never returns here.
+
+pub mod el0;
 
 use crate::arch::symbols;
+use crate::arch::user::UserRegs;
 use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
 use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::KernelPages;
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
-use core::sync::atomic::Ordering;
+use crate::thread::Policy;
+use crate::{process, thread};
+use abi::Error;
+use core::sync::atomic::{AtomicU32, Ordering};
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
 use kcore::frames::{PAGE_SIZE, PhysMem};
@@ -24,6 +31,7 @@ use kcore::paging::{
     Attrs, MAIR_DEVICE, MapError, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
 };
 use kcore::slab::Pool;
+use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
@@ -134,19 +142,40 @@ const TESTS: &[(&str, TestFn)] = &[
         "ttbr0_is_empty_outside_processes",
         ttbr0_is_empty_outside_processes,
     ),
+    ("system_registers_open_el0", system_registers_open_el0),
+    (
+        "kernel_memory_is_closed_to_el0",
+        kernel_memory_is_closed_to_el0,
+    ),
+    (
+        "processes_and_threads_return_their_memory",
+        processes_and_threads_return_their_memory,
+    ),
 ];
 
+/// Tests that failed so far, the EL0 tests' included.
+static FAILED: AtomicU32 = AtomicU32::new(0);
+
 pub fn run(boot: &Boot) -> ! {
-    let mut failed = 0u32;
     for (name, test) in TESTS {
-        match test(boot) {
-            Ok(()) => kprintln!("TEST {name} ok"),
-            Err(why) => {
-                failed += 1;
-                kprintln!("TEST {name} FAIL {why}");
-            }
+        report(name, test(boot));
+    }
+    el0::run()
+}
+
+fn report(name: &str, result: Result<(), &'static str>) {
+    match result {
+        Ok(()) => kprintln!("TEST {name} ok"),
+        Err(why) => {
+            FAILED.fetch_add(1, Ordering::Relaxed);
+            kprintln!("TEST {name} FAIL {why}");
         }
     }
+}
+
+/// Prints the verdict and leaves QEMU.
+fn finish() -> ! {
+    let failed = FAILED.load(Ordering::Relaxed);
     kprintln!("TESTS DONE failed={failed}");
     semihosting::exit(if failed == 0 { 0 } else { 1 })
 }
@@ -506,7 +535,7 @@ fn pools_take_pages_from_the_frame_allocator(_: &Boot) -> Result<(), &'static st
 fn virtual_counter_runs_at_the_reported_frequency(_: &Boot) -> Result<(), &'static str> {
     check(
         timer::frequency() == 62_500_000,
-        "CNTFRQ_EL0 is not the 62.5 MHz of QEMU's cortex-a72",
+        "CNTFRQ_EL0 is not the 62.5 MHz of QEMU's cortex-a72 and cortex-a53",
     )?;
     let start = timer::now();
     check(
@@ -716,7 +745,8 @@ fn free_frame(pa: u64) {
 /// The word at user address `va` in the active address space.
 fn read_user(va: usize) -> u64 {
     // SAFETY: the caller has mapped `va` in the active space. The
-    // cortex-a72 has no PAN, so EL1 reads pages that EL0 may read.
+    // cortex-a72 and cortex-a53 have no PAN, so EL1 reads pages that EL0
+    // may read.
     unsafe { (va as *const u64).read_volatile() }
 }
 
@@ -1033,4 +1063,161 @@ fn check_deactivate(frame: u64, empty: u64) -> Result<(), &'static str> {
         registers::ttbr0_el1() == empty,
         "destroying the running space left TTBR0 on its tables",
     )
+}
+
+fn system_registers_open_el0(_: &Boot) -> Result<(), &'static str> {
+    check(
+        registers::sctlr_el1() == SCTLR_EL1,
+        "SCTLR_EL1 is not the value for programs at EL0",
+    )?;
+    check(
+        registers::cpacr_el1() == CPACR_EL1,
+        "FP and SIMD instructions trap",
+    )?;
+    check(
+        registers::cntkctl_el1() == CNTKCTL_EL1,
+        "EL0 cannot read the virtual counter, or can reach more timer registers",
+    )?;
+    check(
+        registers::mdscr_el1() == MDSCR_EL1,
+        "EL0 reaches the debug channel, or debug events are on",
+    )?;
+    check(
+        !sysreg::has_pmu(registers::id_aa64dfr0_el1()) || registers::pmuserenr_el0() == 0,
+        "EL0 reaches the performance monitors",
+    )
+}
+
+/// EL0 reaches no kernel address: neither the image, nor the stacks, nor
+/// the linear map, nor the devices.
+fn kernel_memory_is_closed_to_el0(boot: &Boot) -> Result<(), &'static str> {
+    // AT has no fetch variant, and AP alone does not keep EL0 from
+    // fetching: every kernel page needs UXN. A probe the kernel cannot read
+    // proves nothing.
+    let closed = |va: usize| {
+        translates(registers::at_s1e1r(va))
+            && !translates(registers::at_s1e0r(va))
+            && !translates(registers::at_s1e0w(va))
+            && kernel_descriptor(va).is_some_and(|d| d & UXN != 0)
+    };
+    let layout = symbols::image_layout();
+    for va in [
+        layout.start,
+        layout.text_end,
+        layout.rodata_end,
+        symbols::emergency_stack().start,
+        symbols::boot_stack().start,
+        symbols::boot_stack().end - 8,
+    ] {
+        check(closed(va), "EL0 reaches the kernel image or a kernel stack")?;
+    }
+    for_each_ram_probe(boot, |pa| {
+        check(
+            closed(LINEAR_BASE + pa as usize),
+            "EL0 reaches the linear map",
+        )
+    })?;
+    let info = &boot.info;
+    for dev in [
+        info.uart_pl011,
+        info.gic_distributor,
+        info.gic_cpu_interface,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        check(
+            closed(LINEAR_BASE + dev.base as usize),
+            "EL0 reaches a device",
+        )?;
+    }
+    Ok(())
+}
+
+/// A process with a thread and mapped frames gives every frame back when
+/// both go. The pools keep the page each takes for its first object, so
+/// one round runs before the count.
+fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static str> {
+    process_round()?;
+    let before = phys::free_frames();
+    process_round()?;
+    check(
+        phys::free_frames() == before,
+        "a process or a thread kept frames after it went",
+    )?;
+    check(
+        process::in_use() == 0 && thread::in_use() == 0,
+        "a process or a thread is still in its pool",
+    )
+}
+
+fn process_round() -> Result<(), &'static str> {
+    let mut p = process::create().map_err(|_| "no process")?;
+    let before = phys::free_frames();
+    // SAFETY: the process was just created, and only this test uses it.
+    let mapped = unsafe { p.as_mut() }.map_frames(USER_VA, 3 * PAGE_SIZE, Attrs::USER_DATA);
+    let result = match mapped {
+        Ok(pa) => check_fresh_frames(pa, before).and_then(|()| check_thread_start(p)),
+        Err(_) => Err("three pages did not map"),
+    };
+    // SAFETY: the process has no threads left, and nothing uses it afterwards.
+    unsafe { process::destroy(p) };
+    result
+}
+
+/// Three pages take a zeroed block of four frames and three tables over it.
+fn check_fresh_frames(pa: u64, before: u64) -> Result<(), &'static str> {
+    check(
+        phys::free_frames() == before - 7,
+        "three pages did not take a block of four frames and three tables",
+    )?;
+    // SAFETY: the block belongs to the test's process, which nothing runs.
+    let mem = unsafe { LinearMem::new() };
+    check(
+        (0..4 * PAGE_SIZE / 8).all(|i| mem.read(pa + i * 8) == 0),
+        "the frames of a process are not zeroed",
+    )
+}
+
+/// A new thread starts with the registers it was given and nothing else;
+/// bad starts are refused.
+fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'static str> {
+    let stack = USER_VA + 3 * PAGE;
+    let t = thread::create(p, USER_VA, stack, 7, 10, Policy::Fifo).map_err(|_| "no thread")?;
+    // SAFETY: the thread was just created, and only this test uses it.
+    let started = unsafe { t.as_ref() };
+    let regs: &UserRegs = &started.regs;
+    let result = check(
+        regs.x[0] == 7
+            && regs.x[1..].iter().all(|&x| x == 0)
+            && regs.sp == stack as u64
+            && regs.elr == USER_VA as u64
+            && regs.spsr == SPSR_EL0T
+            && regs.tpidr == 0
+            && regs.tpidrro == 0
+            && started.priority == 10
+            && started.policy == Policy::Fifo
+            && started.process() == p,
+        "a new thread does not start as it was told",
+    );
+    // SAFETY: the thread is not running, and nothing uses it afterwards.
+    unsafe { thread::destroy(t) };
+    result?;
+    for (entry, stack, priority) in [
+        (USER_END, stack, 10),
+        (USER_VA + 2, stack, 10),
+        (USER_VA, stack - 8, 10),
+        (USER_VA, stack, 0),
+    ] {
+        match thread::create(p, entry, stack, 0, priority, Policy::RoundRobin) {
+            Err(Error::InvalidArgs) => {}
+            Ok(t) => {
+                // SAFETY: the thread never ran, and nothing uses it afterwards.
+                unsafe { thread::destroy(t) };
+                return Err("a thread with a bad start was created");
+            }
+            Err(_) => return Err("a bad start failed with another error"),
+        }
+    }
+    Ok(())
 }

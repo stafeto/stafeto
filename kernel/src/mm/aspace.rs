@@ -14,7 +14,7 @@ use crate::boot::Boot;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::asid::{self, AsidAllocator, AsidTag};
 use kcore::layout::image_pa;
-use kcore::paging::{Attrs, MapError, PageTable};
+use kcore::paging::{Attrs, MapError, PageTable, TTBR_ROOT_MASK};
 use kcore::sync::Lock;
 use kcore::tlb::{self, Mmu};
 
@@ -126,8 +126,8 @@ impl AddressSpace {
     /// page, with user attributes (EL0 access, nG, never executable by the
     /// kernel). On error part of the range may already be mapped. Code the
     /// kernel wrote into the frames needs the instruction cache made
-    /// coherent before a mapping with `Attrs::USER_TEXT` runs it: `dc cvau`
-    /// and `ic ivau` by line, with the line sizes from CTR_EL0.
+    /// coherent (arch::cache::sync_icache) before a mapping with
+    /// `Attrs::USER_TEXT` runs it.
     #[cfg_attr(
         not(feature = "ktest"),
         expect(
@@ -179,15 +179,15 @@ impl AddressSpace {
         with_asids(|a| a.current(&self.tag))
     }
 
+    /// Whether TTBR0 holds this space's tables. The space in TTBR0 always
+    /// has an ASID of this generation: a new generation begins only in the
+    /// `activate` of another space, which then takes TTBR0.
+    pub fn is_active(&self) -> bool {
+        registers::ttbr0_el1() & TTBR_ROOT_MASK == self.tables.root()
+    }
+
     /// Switches TTBR0 to this space, with a new ASID when its old one is of
     /// an earlier generation (kcore::tlb::switch_to).
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "the way to EL0 switches address spaces; so far only the kernel tests do"
-        )
-    )]
     pub fn activate(&mut self) {
         let (root, empty) = (self.tables.root(), empty_root());
         with_asids(|a| tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu));

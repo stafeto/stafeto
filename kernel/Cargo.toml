@@ -13,6 +13,7 @@ test = false
 bench = false
 
 [dependencies]
+abi = { path = "../lib/abi" }
 kcore = { path = "../kcore" }
 
 [features]

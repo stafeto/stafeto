@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 pub mod backtrace;
+pub mod cache;
 pub mod exceptions;
 pub mod gic;
 pub mod mmu;
@@ -12,6 +13,7 @@ pub mod registers;
 pub mod semihosting;
 pub mod symbols;
 pub mod timer;
+pub mod user;
 
 core::arch::global_asm!(include_str!("head.S"), options(raw));
 core::arch::global_asm!(include_str!("vectors.S"), options(raw));

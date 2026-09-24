@@ -3,7 +3,7 @@
 
 //! The stafeto kernel interface shared by the kernel and programs (spec 5,
 //! 12): handle layout, rights and error codes. System call numbers join it
-//! with the first system calls.
+//! with the first system calls; the numbers kept for tests are here already.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -74,6 +74,10 @@ impl core::ops::BitOr for Rights {
         self.union(other)
     }
 }
+
+/// System call numbers that belong to the kernel's test builds (spec 11):
+/// no real system call gets one.
+pub const TEST_CALLS: core::ops::RangeInclusive<u16> = 0xFF00..=0xFFFF;
 
 /// Error codes of system calls (spec 12); zero means success.
 #[repr(u32)]

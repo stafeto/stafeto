@@ -19,5 +19,7 @@ pub mod memmap;
 pub mod paging;
 pub mod slab;
 pub mod sync;
+pub mod sysreg;
+pub mod thread;
 pub mod time;
 pub mod tlb;

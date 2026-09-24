@@ -15,7 +15,10 @@ mod boot;
 mod ktest;
 mod mm;
 mod panicking;
+mod process;
 mod psci;
+mod syscall;
+mod thread;
 
 use boot::Boot;
 use kcore::frames::PAGE_SIZE;
@@ -32,18 +35,19 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // Until the kernel's own tables are built, the allocator sees only the
     // RAM in the GiBs the boot page tables map; the kernel tables are built
     // from that RAM, and the rest of RAM joins the allocator once they are live.
-    let rest = mm::phys::init(&boot);
-    mm::kmap::switch_to_kernel_tables(&boot);
+    let rest = mm::phys::init(boot);
+    mm::kmap::switch_to_kernel_tables(boot);
+    arch::user::init();
     mm::phys::add(rest.as_slice());
-    mm::aspace::init(&boot);
+    mm::aspace::init(boot);
     arch::gic::init(&boot.info);
     let clock = arch::timer::init();
-    report(&boot, clock);
+    report(boot, clock);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
-    finish(&boot)
+    finish(boot)
 }
 
 #[cfg(not(feature = "ktest"))]

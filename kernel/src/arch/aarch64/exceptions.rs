@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Exception entry. Every exception is reported with its registers and
-//! stops the kernel. Test builds skip one BRK marker (kcore::esr::TEST_BRK)
-//! to prove the vectors and the return path work. An entry from EL1 that
-//! finds no room on the kernel stack runs on the emergency stack and never
-//! returns.
+//! Exception entry. A system call from EL0 goes to the dispatcher; every
+//! other exception is reported with its registers and stops the kernel.
+//! Test builds skip one BRK marker (kcore::esr::TEST_BRK) to prove the
+//! vectors and the return path work. An entry from EL1 that finds no room
+//! on the kernel stack runs on the emergency stack and never returns.
 
+use super::user::UserRegs;
 use super::{registers, symbols};
+use crate::thread::{self, Thread};
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::esr::{self, BrkAction};
 
@@ -46,6 +49,7 @@ const VECTOR_NAMES: [&str; 16] = [
     "EL0 AArch32 serror",
 ];
 const VECTOR_EL1H_SYNC: u64 = 4;
+const VECTOR_EL0_SYNC: u64 = 8;
 /// Set in the vector index when the entry switched to the emergency stack.
 const ON_EMERGENCY_STACK: u64 = 1 << 4;
 
@@ -106,7 +110,90 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     {
         kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
     }
-    print_frame(frame);
+    print_x(&frame.x);
+    kprintln!(
+        "\nsp  {:#018x}  sp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}",
+        frame.sp,
+        frame.sp_el0,
+        frame.elr,
+        frame.spsr
+    );
+    stop(index, syndrome, far, frame.elr)
+}
+
+/// Entry from EL0 (vectors.S): the program's registers are in the running
+/// thread. A system call goes to the dispatcher and the thread goes on.
+/// Any other synchronous exception is the program's fault and stops the
+/// machine for now (milestone 1.2c ends just the process, spec 7.9); an
+/// asynchronous one that no handler takes is an error of the system.
+#[unsafe(no_mangle)]
+extern "C" fn handle_user_exception(index: u64) -> ! {
+    let thread = thread::current().expect("an entry from EL0 with no thread running");
+    let syndrome = registers::esr_el1();
+    match index {
+        VECTOR_EL0_SYNC => match esr::svc_immediate(syndrome) {
+            Some(number) => crate::syscall::dispatch(thread, number),
+            None => user_fault(thread, index, syndrome),
+        },
+        // Not the program's fault: no interrupt reaches EL0 yet; PSTATE
+        // masks SErrors inside the kernel, so one the kernel caused arrives
+        // at EL0 as well; FIQs never reach EL1.
+        _ => system_error(thread, index, syndrome),
+    }
+    thread::run(thread)
+}
+
+/// Reports a fault of the program at EL0 like a kernel fault, marked EL0,
+/// and stops the machine. In test builds the running test may expect the
+/// fault and go on instead.
+fn user_fault(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
+    let far = registers::far_el1();
+    #[cfg(feature = "ktest")]
+    crate::ktest::el0::user_fault(thread, syndrome, far);
+    report_el0(thread, "program fault", index, syndrome, far)
+}
+
+/// An asynchronous exception at EL0 that no handler takes: an error of the
+/// system, such as an SError from a write of the kernel, which the running
+/// program did not cause. The report shows that program all the same, and
+/// the machine stops.
+fn system_error(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
+    report_el0(
+        thread,
+        "system error",
+        index,
+        syndrome,
+        registers::far_el1(),
+    )
+}
+
+/// Reports an exception taken at EL0 with the program's registers and
+/// stops the machine.
+fn report_el0(thread: NonNull<Thread>, what: &str, index: u64, syndrome: u64, far: u64) -> ! {
+    // SAFETY: the running thread is alive; nothing else refers to it now.
+    let regs: &UserRegs = unsafe { &thread.as_ref().regs };
+    kprintln!("{what} at EL0, thread {:#x}", thread.as_ptr() as usize);
+    print_x(&regs.x);
+    kprintln!(
+        "\nsp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}  tpidr_el0 {:#018x}",
+        regs.sp,
+        regs.elr,
+        regs.spsr,
+        regs.tpidr
+    );
+    stop(index, syndrome, far, regs.elr)
+}
+
+fn print_x(x: &[u64; 31]) {
+    for (i, v) in x.iter().enumerate() {
+        let sep = if i % 4 == 3 { "\n" } else { "  " };
+        crate::console::print(format_args!("x{i:<2} {v:#018x}{sep}"));
+    }
+}
+
+/// Names the fault of an abort and panics with the exception's syndrome.
+fn stop(index: u64, syndrome: u64, far: u64, elr: u64) -> ! {
+    let class = esr::ec(syndrome);
     if matches!(
         class,
         esr::EC_IABT_LOWER | esr::EC_IABT_SAME | esr::EC_DABT_LOWER | esr::EC_DABT_SAME
@@ -120,23 +207,8 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
         }
     }
     panic!(
-        "unexpected exception {}: {} (EC {class:#x}) ESR={syndrome:#x} ELR={:#x} FAR={far:#x}",
+        "unexpected exception {}: {} (EC {class:#x}) ESR={syndrome:#x} ELR={elr:#x} FAR={far:#x}",
         VECTOR_NAMES[(index & 15) as usize],
         esr::class_name(class),
-        frame.elr
-    );
-}
-
-fn print_frame(f: &TrapFrame) {
-    for (i, v) in f.x.iter().enumerate() {
-        let sep = if i % 4 == 3 { "\n" } else { "  " };
-        crate::console::print(format_args!("x{i:<2} {v:#018x}{sep}"));
-    }
-    kprintln!(
-        "\nsp  {:#018x}  sp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}",
-        f.sp,
-        f.sp_el0,
-        f.elr,
-        f.spsr
     );
 }
