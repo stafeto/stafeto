@@ -14,4 +14,5 @@ pub mod frames;
 pub mod layout;
 pub mod memmap;
 pub mod paging;
+pub mod slab;
 pub mod sync;

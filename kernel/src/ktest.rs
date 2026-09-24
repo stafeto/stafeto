@@ -7,6 +7,7 @@
 use crate::arch::symbols;
 use crate::arch::{exceptions, registers, semihosting};
 use crate::boot::Boot;
+use crate::mm::pages::KernelPages;
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
 use core::sync::atomic::Ordering;
@@ -15,6 +16,7 @@ use kcore::frames::PhysMem;
 use kcore::layout::{KERNEL_VIRT, LINEAR_BASE};
 use kcore::memmap;
 use kcore::paging::{PXN, PageTable, TableMemory};
+use kcore::slab::Pool;
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
@@ -59,6 +61,10 @@ const TESTS: &[(&str, TestFn)] = &[
     ),
     ("linear_map_covers_all_ram", linear_map_covers_all_ram),
     ("console_is_device_memory", console_is_device_memory),
+    (
+        "pools_take_pages_from_the_frame_allocator",
+        pools_take_pages_from_the_frame_allocator,
+    ),
 ];
 
 pub fn run(boot: &Boot) -> ! {
@@ -282,5 +288,39 @@ fn console_is_device_memory(boot: &Boot) -> Result<(), &'static str> {
     check(
         (d >> 2) & 0b111 == 1,
         "the PL011 is not mapped as device memory",
+    )
+}
+
+fn pools_take_pages_from_the_frame_allocator(_: &Boot) -> Result<(), &'static str> {
+    let before = phys::free_frames();
+    let mut pool: Pool<[u64; 32]> = Pool::new();
+    let mut src = KernelPages;
+    let mut objects = [None; 40];
+    for (i, slot) in objects.iter_mut().enumerate() {
+        *slot = Some(
+            pool.alloc(&mut src, [i as u64; 32])
+                .map_err(|_| "out of pages")?,
+        );
+    }
+    check(
+        pool.pages() == 3,
+        "40 objects of 256 bytes did not take 3 pages",
+    )?;
+    check(
+        phys::free_frames() == before - 3,
+        "pool pages did not come from the frame allocator",
+    )?;
+    for (i, object) in objects.iter().flatten().enumerate() {
+        // SAFETY: the object is live.
+        let last = unsafe { object.as_ref()[31] };
+        check(last == i as u64, "an object lost its value")?;
+    }
+    for object in objects.iter().flatten() {
+        // SAFETY: each object is live and not used afterwards.
+        unsafe { pool.free(*object) };
+    }
+    check(
+        pool.in_use() == 0,
+        "objects are still in use after freeing all",
     )
 }
