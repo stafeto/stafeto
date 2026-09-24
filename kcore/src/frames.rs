@@ -3,8 +3,10 @@
 
 //! Physical page allocator (spec 7.1): a binary buddy system over 4 KiB
 //! frames. Free blocks form doubly linked lists threaded through the free
-//! memory itself; one byte per frame records which frames head a free block
-//! and at what order, so a buddy is found and unlinked in O(1).
+//! memory itself; one byte per frame records whether that frame heads a
+//! free block, an allocated block, or neither, and at what order, so a
+//! buddy is found and unlinked in O(1) and a free of the wrong block is
+//! caught.
 
 pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
@@ -12,8 +14,11 @@ pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 pub const MAX_ORDER: u8 = 10;
 const ORDERS: usize = MAX_ORDER as usize + 1;
 const NIL: u64 = u64::MAX;
-/// Metadata byte of a frame that does not head a free block; a head stores order + 1.
+/// Metadata byte of a frame that does not head a free block; a head of a
+/// free block stores order + 1; a head of an allocated block stores
+/// `ALLOCATED | order`, which never collides with either of those.
 const NOT_FREE: u8 = 0;
+const ALLOCATED: u8 = 0x80;
 
 /// Word access to the physical memory the allocator manages.
 pub trait PhysMem {
@@ -96,6 +101,7 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
             o -= 1;
             self.push(pfn + (1 << o), o);
         }
+        self.set_meta(pfn, ALLOCATED | order);
         self.free_frames -= 1 << order;
         Some(pfn << PAGE_SHIFT)
     }
@@ -115,6 +121,11 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
             self.in_range(pfn, order),
             "free of {pa:#x} outside the allocator"
         );
+        if self.meta_at(pfn) != (ALLOCATED | order) {
+            assert!(!self.in_free_block(pfn), "double free of frame {pa:#x}");
+            panic!("free of frame {pa:#x} that was not allocated with order {order}");
+        }
+        self.set_meta(pfn, NOT_FREE);
         self.free_block(pfn, order);
     }
 
@@ -361,5 +372,36 @@ mod tests {
     fn free_outside_the_allocator_panics() {
         let mut meta = vec![0; FRAMES];
         full(&mut meta).free(0x1000, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not allocated")]
+    fn freeing_an_interior_frame_of_a_live_block_panics() {
+        let mut meta = vec![0; FRAMES];
+        let mut a = full(&mut meta);
+        let big = a.alloc(9).unwrap();
+        a.free(big + PAGE_SIZE, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "not allocated")]
+    fn freeing_with_a_larger_order_panics() {
+        let mut meta = vec![0; FRAMES];
+        let mut a = full(&mut meta);
+        // Two order-0 allocations from a freshly built allocator come out in
+        // increasing address order, so the first one is 2-frame aligned.
+        let x = a.alloc(0).unwrap();
+        assert!(x.is_multiple_of(2 * PAGE_SIZE));
+        a.free(x, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "not allocated")]
+    fn freeing_a_frame_in_a_hole_panics() {
+        let mut meta = vec![0; FRAMES];
+        let mut a = allocator(&mut meta);
+        a.add_region(BASE, BASE + (1 << 20));
+        a.add_region(BASE + (2 << 20), BASE + (3 << 20));
+        a.free(BASE + (1 << 20), 0);
     }
 }
