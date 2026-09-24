@@ -5,6 +5,9 @@
 
 use std::process::exit;
 
+mod image;
+mod qemu;
+
 const USAGE: &str = "usage: cargo xtask <command>
 
 commands:
