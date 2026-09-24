@@ -6,6 +6,7 @@
 
 use crate::arch::{exceptions, registers, semihosting};
 use crate::boot::Boot;
+use crate::mm::phys;
 use core::sync::atomic::Ordering;
 use kcore::bootinfo::{PsciConduit, Region};
 use kcore::layout::{GIB, KERNEL_VIRT, LINEAR_BASE};
@@ -33,6 +34,10 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "usable_memory_leaves_the_boot_alone",
         usable_memory_leaves_the_boot_alone,
+    ),
+    (
+        "frames_are_aligned_distinct_and_usable",
+        frames_are_aligned_distinct_and_usable,
     ),
 ];
 
@@ -142,5 +147,32 @@ fn usable_memory_leaves_the_boot_alone(boot: &Boot) -> Result<(), &'static str> 
     check(
         total > 500 << 20 && total < 512 << 20,
         "usable memory is not just under 512 MiB",
+    )
+}
+
+fn frames_are_aligned_distinct_and_usable(_: &Boot) -> Result<(), &'static str> {
+    let mut guard = phys::FRAMES.lock();
+    let frames = guard.as_mut().ok_or("no frame allocator")?;
+    let before = frames.free_frames();
+    let a = frames.alloc(0).ok_or("out of frames")?;
+    let b = frames.alloc(0).ok_or("out of frames")?;
+    let big = frames.alloc(9).ok_or("no 2 MiB block")?;
+    check(a != b, "two allocations returned the same frame")?;
+    check(big.is_multiple_of(2 << 20), "2 MiB block is misaligned")?;
+    for (pa, pattern) in [(a, 0xA5A5_u64), (b, 0x5A5A)] {
+        let p = (LINEAR_BASE + pa as usize) as *mut u64;
+        // SAFETY: the frame was just allocated and lies in the linear map.
+        let back = unsafe {
+            p.write_volatile(pattern);
+            p.read_volatile()
+        };
+        check(back == pattern, "a frame does not keep what was written")?;
+    }
+    frames.free(a, 0);
+    frames.free(b, 0);
+    frames.free(big, 9);
+    check(
+        frames.free_frames() == before,
+        "free frame count did not come back",
     )
 }

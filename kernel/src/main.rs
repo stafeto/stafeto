@@ -13,6 +13,7 @@ mod arch;
 mod boot;
 #[cfg(feature = "ktest")]
 mod ktest;
+mod mm;
 mod panicking;
 mod psci;
 
@@ -26,6 +27,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
     psci::set_conduit(boot.info.psci);
+    let _rest = mm::phys::init(&boot); // RAM outside the GiBs mapped at boot
     report(&boot);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
@@ -77,4 +79,8 @@ fn report(boot: &Boot) {
     }
     let total: u64 = boot.usable.as_slice().iter().map(|r| r.size).sum();
     kprintln!("usable     {} MiB in total", total >> 20);
+    kprintln!(
+        "frames     {} MiB free",
+        (mm::phys::free_frames() * 4096) >> 20
+    );
 }

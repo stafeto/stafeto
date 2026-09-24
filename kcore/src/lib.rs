@@ -10,5 +10,7 @@ pub mod backtrace;
 pub mod bootinfo;
 pub mod esr;
 pub mod fdt;
+pub mod frames;
 pub mod layout;
 pub mod memmap;
+pub mod sync;
