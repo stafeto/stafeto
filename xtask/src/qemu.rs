@@ -12,15 +12,28 @@ use std::time::{Duration, Instant};
 /// Console on stdio, no window, no monitor: for runs whose output is parsed.
 pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monitor", "none"];
 
-pub fn args(kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
+/// A QEMU machine type with its options, and a CPU model.
+pub struct Machine {
+    pub machine: &'static str,
+    pub cpu: &'static str,
+}
+
+/// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
+pub const VIRT: Machine = Machine {
+    machine: "virt,gic-version=2",
+    cpu: "cortex-a72",
+};
+
+/// The kernel is entered at EL2, as on the PinePhone's Cortex-A53; PSCI then
+/// goes through SMC.
+pub const VIRT_EL2: Machine = Machine {
+    machine: "virt,gic-version=2,virtualization=on",
+    cpu: "cortex-a53",
+};
+
+pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-machine",
-        "virt,gic-version=2",
-        "-cpu",
-        "cortex-a72",
-        "-m",
-        "512M",
-        "-kernel",
+        "-machine", m.machine, "-cpu", m.cpu, "-m", "512M", "-kernel",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -33,9 +46,9 @@ pub fn args(kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     a
 }
 
-pub fn command(kernel: &Path, boot_image: Option<&Path>) -> Command {
+pub fn command(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Command {
     let mut c = Command::new("qemu-system-aarch64");
-    c.args(args(kernel, boot_image));
+    c.args(args(m, kernel, boot_image));
     c
 }
 
@@ -261,14 +274,30 @@ mod tests {
 
     #[test]
     fn args_select_the_spec_machine_and_boot_image() {
-        let a = args(Path::new("k.img"), Some(Path::new("b.img")));
+        let a = args(&VIRT, Path::new("k.img"), Some(Path::new("b.img")));
         let joined = a.join(" ");
         assert!(joined.contains("-machine virt,gic-version=2"));
+        assert!(!joined.contains("virtualization"));
         assert!(joined.contains("-cpu cortex-a72"));
         assert!(joined.contains("-m 512M"));
         assert!(joined.contains("-kernel k.img"));
         assert!(joined.contains("-initrd b.img"));
-        assert!(!args(Path::new("k.elf"), None).join(" ").contains("-initrd"));
+        assert!(
+            !args(&VIRT, Path::new("k.elf"), None)
+                .join(" ")
+                .contains("-initrd")
+        );
+    }
+
+    #[test]
+    fn el2_args_turn_on_virtualization_on_a_cortex_a53() {
+        let a = args(&VIRT_EL2, Path::new("k.img"), Some(Path::new("b.img")));
+        let joined = a.join(" ");
+        assert!(joined.contains("-machine virt,gic-version=2,virtualization=on"));
+        assert!(joined.contains("-cpu cortex-a53"));
+        assert!(joined.contains("-m 512M"));
+        assert!(joined.contains("-kernel k.img"));
+        assert!(joined.contains("-initrd b.img"));
     }
 
     #[test]

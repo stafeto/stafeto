@@ -158,12 +158,13 @@ fn build(ktest: bool) -> Result<Artifacts, String> {
 
 fn run() -> Result<(), String> {
     let a = build(false)?;
-    run_cmd(qemu::command(&a.image, Some(&a.boot_image)).arg("-nographic"))
+    run_cmd(qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image)).arg("-nographic"))
 }
 
 fn test() -> Result<(), String> {
     host_tests()?;
     boot_smoke()?;
+    el2_boot_smoke()?;
     elf_boot_reports_missing_device_tree()?;
     kernel_tests()?;
     println!("all checks passed");
@@ -177,7 +178,18 @@ fn host_tests() -> Result<(), String> {
 /// A normal build boots, prints its report and powers the machine off.
 fn boot_smoke() -> Result<(), String> {
     let a = build(false)?;
-    let mut cmd = qemu::command(&a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    qemu::expect_clean_exit_with(&o, "boot complete")
+}
+
+/// The same build entered at EL2, as the PinePhone's loader does: head.S
+/// must drop to EL1, and power-off goes through SMC. Not the ktest build: its
+/// device tree test expects HVC.
+fn el2_boot_smoke() -> Result<(), String> {
+    let a = build(false)?;
+    let mut cmd = qemu::command(&qemu::VIRT_EL2, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")
@@ -186,7 +198,7 @@ fn boot_smoke() -> Result<(), String> {
 /// Booting the ELF leaves x0 = 0; the kernel must say why it stops.
 fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     let a = build(false)?;
-    let mut cmd = qemu::command(&a.elf, None);
+    let mut cmd = qemu::command(&qemu::VIRT, &a.elf, None);
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"))?;
     qemu::expect_marker(&o, "no device tree in x0")?;
@@ -199,7 +211,7 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
 /// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
 fn kernel_tests() -> Result<(), String> {
     let a = build(true)?;
-    let mut cmd = qemu::command(&a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS).arg("-semihosting");
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
@@ -214,7 +226,9 @@ fn gdb() -> Result<(), String> {
         "QEMU is halted before the kernel starts (kernel entry: PA 0x40200000). In another terminal:\n  lldb {} -o 'gdb-remote 1234'\nCode before the MMU runs at physical addresses; see docs/debugging.md.",
         a.elf.display()
     );
-    run_cmd(qemu::command(&a.image, Some(&a.boot_image)).args(["-nographic", "-s", "-S"]))
+    run_cmd(
+        qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image)).args(["-nographic", "-s", "-S"]),
+    )
 }
 
 fn ci() -> Result<(), String> {
