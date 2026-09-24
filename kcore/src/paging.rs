@@ -62,12 +62,14 @@ impl Attrs {
         ..Attrs::KERNEL_DATA
     };
 
-    /// W^X, no executable device memory, and EL0 execution only on EL0 pages.
+    /// W^X, no executable device memory, EL0 execution only on EL0 pages,
+    /// and the kernel never executes a user page.
     pub fn is_valid(&self) -> bool {
         let exec = self.kernel_exec || self.user_exec;
         !(self.write && exec)
             && !(self.memory == Memory::Device && exec)
             && !(self.user_exec && !self.user)
+            && !(self.user && self.kernel_exec)
     }
 
     /// Descriptor bits besides the address and the type. User mappings are
@@ -333,6 +335,18 @@ mod tests {
             ..Attrs::KERNEL_RODATA
         };
         assert!(!ux.is_valid());
+    }
+
+    #[test]
+    fn kernel_cannot_execute_user_pages() {
+        let attrs = Attrs {
+            memory: Memory::Normal,
+            write: false,
+            kernel_exec: true,
+            user: true,
+            user_exec: false,
+        };
+        assert!(!attrs.is_valid());
     }
 
     #[test]
