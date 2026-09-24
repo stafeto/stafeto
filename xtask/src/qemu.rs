@@ -48,13 +48,16 @@ pub struct Outcome {
 }
 
 /// Runs `cmd`, echoing and collecting its stdout lines. Kills it when a line
-/// contains `stop_marker` or when `timeout` passes.
+/// contains `stop_marker` or when `timeout` passes. The child gets /dev/null
+/// as stdin: with `-serial stdio` QEMU puts a terminal on stdin into raw mode
+/// and a killed QEMU cannot restore it.
 pub fn run_until(
     mut cmd: Command,
     timeout: Duration,
     stop_marker: Option<&str>,
 ) -> Result<Outcome, String> {
     let mut child = cmd
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("{cmd:?}: {e}"))?;
@@ -274,6 +277,21 @@ mod tests {
         assert!(!o.timed_out && !o.stopped_on_marker);
         assert_eq!(o.lines, ["one", "two"]);
         assert!(o.status.unwrap().success());
+    }
+
+    #[test]
+    fn child_stdin_is_the_null_device() {
+        // QEMU's `-serial stdio` puts a terminal on its stdin into raw mode,
+        // and a killed QEMU never restores it, so the child must not inherit
+        // the caller's stdin. This catches a regression whenever the test
+        // runner's own stdin is not /dev/null, as in a terminal.
+        let o = run_until(
+            sh("if [ /dev/stdin -ef /dev/null ]; then echo null; else echo inherited; fi"),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        assert_eq!(o.lines, ["null"]);
     }
 
     #[test]
