@@ -314,6 +314,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_totalsize_smaller_than_the_header() {
+        for total in [39u32, 0] {
+            let mut blob = VIRT.to_vec();
+            blob[4..8].copy_from_slice(&total.to_be_bytes());
+            assert_eq!(Fdt::new(&blob).err(), Some(FdtError::Truncated), "{total}");
+        }
+    }
+
+    #[test]
     fn rejects_empty_and_tiny_inputs() {
         assert_eq!(Fdt::new(&[]).err(), Some(FdtError::Truncated));
         assert_eq!(
