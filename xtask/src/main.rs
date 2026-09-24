@@ -7,7 +7,7 @@ mod image;
 mod qemu;
 
 use std::path::{Path, PathBuf};
-use std::process::{exit, Command};
+use std::process::{Command, exit};
 use std::time::Duration;
 
 const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
@@ -21,7 +21,9 @@ const USAGE: &str = "usage: cargo xtask <command>
 commands:
   build     build the kernel image and the boot image
   run       build and boot in QEMU (Ctrl-A X quits)
-  test      host tests, then boot checks in QEMU
+  test      host tests, then boot checks and kernel tests in QEMU
+  gdb       boot in QEMU halted at the first instruction, debugger on :1234
+  ci        formatting, clippy, then everything `test` does
   help      this text";
 
 fn main() {
@@ -30,6 +32,8 @@ fn main() {
         Some("build") => build(false).map(|_| ()),
         Some("run") => run(),
         Some("test") => test(),
+        Some("gdb") => gdb(),
+        Some("ci") => ci(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -43,7 +47,10 @@ fn main() {
 }
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives in the workspace").to_path_buf()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives in the workspace")
+        .to_path_buf()
 }
 
 fn cargo() -> Command {
@@ -68,14 +75,28 @@ fn stdout_of(cmd: &mut Command) -> Result<String, String> {
 
 /// Path of an LLVM tool from the `llvm-tools` rustup component.
 fn llvm_tool(name: &str) -> Result<PathBuf, String> {
-    let sysroot = stdout_of(Command::new("rustc").current_dir(root()).args(["--print", "sysroot"]))?;
+    let sysroot = stdout_of(
+        Command::new("rustc")
+            .current_dir(root())
+            .args(["--print", "sysroot"]),
+    )?;
     let version = stdout_of(Command::new("rustc").current_dir(root()).arg("-vV"))?;
-    let host = version.lines().find_map(|l| l.strip_prefix("host: ")).ok_or("`rustc -vV` has no host line")?;
-    let path = Path::new(sysroot.trim()).join("lib/rustlib").join(host).join("bin").join(name);
+    let host = version
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .ok_or("`rustc -vV` has no host line")?;
+    let path = Path::new(sysroot.trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin")
+        .join(name);
     if path.exists() {
         Ok(path)
     } else {
-        Err(format!("{} not found: run `rustup component add llvm-tools`", path.display()))
+        Err(format!(
+            "{} not found: run `rustup component add llvm-tools`",
+            path.display()
+        ))
     }
 }
 
@@ -87,22 +108,47 @@ struct Artifacts {
 
 fn build(ktest: bool) -> Result<Artifacts, String> {
     let mut cmd = cargo();
-    cmd.args(["build", "--package", "kernel", "--release", "--target", KERNEL_TARGET]);
+    cmd.args([
+        "build",
+        "--package",
+        "kernel",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+    ]);
     if ktest {
         cmd.args(["--features", "ktest"]);
     }
     run_cmd(&mut cmd)?;
     let target = root().join("target");
     let elf = target.join(KERNEL_TARGET).join("release").join("kernel");
-    let image = target.join(if ktest { "stafeto-ktest.img" } else { "stafeto.img" });
-    run_cmd(Command::new(llvm_tool("llvm-objcopy")?).args(["-O", "binary"]).arg(&elf).arg(&image))?;
+    let image = target.join(if ktest {
+        "stafeto-ktest.img"
+    } else {
+        "stafeto.img"
+    });
+    run_cmd(
+        Command::new(llvm_tool("llvm-objcopy")?)
+            .args(["-O", "binary"])
+            .arg(&elf)
+            .arg(&image),
+    )?;
     let bytes = std::fs::read(&image).map_err(|e| format!("{}: {e}", image.display()))?;
     image::check_header(&bytes)?;
     image::check_size(bytes.len() as u64, KERNEL_LIMIT)?;
     let boot_image = target.join("boot.img");
-    std::fs::write(&boot_image, image::placeholder_boot_image()).map_err(|e| format!("{}: {e}", boot_image.display()))?;
-    println!("kernel image {} ({} bytes, limit {KERNEL_LIMIT})", image.display(), bytes.len());
-    Ok(Artifacts { elf, image, boot_image })
+    std::fs::write(&boot_image, image::placeholder_boot_image())
+        .map_err(|e| format!("{}: {e}", boot_image.display()))?;
+    println!(
+        "kernel image {} ({} bytes, limit {KERNEL_LIMIT})",
+        image.display(),
+        bytes.len()
+    );
+    Ok(Artifacts {
+        elf,
+        image,
+        boot_image,
+    })
 }
 
 fn run() -> Result<(), String> {
@@ -138,7 +184,11 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     let mut cmd = qemu::command(&a.elf, None);
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"))?;
-    qemu::expect_marker(&o, "no device tree in x0")
+    qemu::expect_marker(&o, "no device tree in x0")?;
+    if !o.stopped_on_marker {
+        return Err("QEMU was not stopped on the marker line".into());
+    }
+    Ok(())
 }
 
 /// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
@@ -151,4 +201,63 @@ fn kernel_tests() -> Result<(), String> {
     qemu::verdict(&o, &r)?;
     println!("kernel tests: {} passed", r.passed.len());
     Ok(())
+}
+
+fn gdb() -> Result<(), String> {
+    let a = build(false)?;
+    println!(
+        "QEMU is halted before the kernel starts (kernel entry: PA 0x40200000). In another terminal:\n  lldb {} -o 'gdb-remote 1234'\nCode before the MMU runs at physical addresses; see docs/debugging.md.",
+        a.elf.display()
+    );
+    run_cmd(qemu::command(&a.image, Some(&a.boot_image)).args(["-nographic", "-s", "-S"]))
+}
+
+fn ci() -> Result<(), String> {
+    run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "kcore",
+        "--package",
+        "xtask",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "kcore",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "kernel",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "kernel",
+        "--release",
+        "--target",
+        KERNEL_TARGET,
+        "--features",
+        "ktest",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    test()
 }

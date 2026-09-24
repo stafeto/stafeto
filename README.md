@@ -20,6 +20,21 @@ A learning phone OS built on its own microkernel (Rust, AArch64).
 
 Проектирование подпроекта 1: ядро и минимальная пользовательская часть.
 
+## Сборка и запуск
+
+Нужны rustup, QEMU и dtc (на macOS: `brew install qemu dtc`). Версию Rust,
+компоненты и цели rustup ставит сам по `rust-toolchain.toml`.
+
+| Команда | Что делает |
+|---|---|
+| `cargo xtask build` | собирает ядро в `target/stafeto.img` и проверяет, что образ меньше 200 КБ |
+| `cargo xtask run` | запускает систему в QEMU; выход: Ctrl-A, затем X |
+| `cargo xtask test` | тесты на хосте, загрузка в QEMU и тесты внутри ядра |
+| `cargo xtask gdb` | QEMU останавливается до старта ядра и ждёт отладчик на порту 1234 |
+| `cargo xtask ci` | форматирование, clippy и все тесты |
+
+Как разбирать зависания и падения: [docs/debugging.md](docs/debugging.md).
+
 ## Лицензия
 
 Ядро, службы, драйверы и инструменты распространяются под GPL-3.0-or-later
