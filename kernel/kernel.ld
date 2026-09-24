@@ -63,6 +63,7 @@ SECTIONS
         __boot_pt_end = .;
     }
 
+    . = ALIGN(4096);
     __image_end = .;
     __image_size = __image_end - __image_start;
 

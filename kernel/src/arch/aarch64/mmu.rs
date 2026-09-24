@@ -4,7 +4,7 @@
 //! Replacing the kernel's translation tables (TTBR1) while running from them.
 
 use super::symbols;
-use kcore::layout::KERNEL_VIRT;
+use kcore::layout::image_pa;
 
 unsafe extern "C" {
     fn switch_ttbr1(new_root: u64, identity_root: u64, empty_root: u64, trampoline: u64);
@@ -23,7 +23,7 @@ unsafe extern "C" {
 /// cores. `kernel_pa` must be the kernel image's actual physical load
 /// address, or the physical addresses computed from it are wrong.
 pub unsafe fn replace_ttbr1(new_root: u64, kernel_pa: u64) {
-    let pa = |va: usize| kernel_pa + (va - KERNEL_VIRT) as u64;
+    let pa = |va: usize| image_pa(kernel_pa, va);
     let trampoline = pa(ttbr1_trampoline as *const () as usize);
     // SAFETY: head.S's identity map covers the kernel's GiB, so the trampoline
     // runs at its physical address; the caller vouches for the new tables.

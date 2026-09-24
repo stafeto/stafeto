@@ -34,7 +34,8 @@ pub const VIRT_EL2: Machine = Machine {
     memory: "512M",
 };
 
-/// The spec machine with 2 GiB: RAM spans two GiBs.
+/// The spec machine with 2 GiB: RAM spans two GiBs, and the second one is
+/// not in the boot page tables.
 pub const VIRT_2G: Machine = Machine {
     machine: "virt,gic-version=2",
     cpu: "cortex-a72",
@@ -206,7 +207,8 @@ pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     }
 }
 
-/// The first number on the first line that starts with `prefix`.
+/// The first number after `prefix` on the first line that contains it,
+/// anywhere in the line.
 pub fn number_after(lines: &[String], prefix: &str) -> Option<u64> {
     let rest = lines
         .iter()
@@ -376,6 +378,12 @@ mod tests {
     fn number_after_reads_the_first_number() {
         let l = lines(&["boot", "frames     1987 MiB free"]);
         assert_eq!(number_after(&l, "frames "), Some(1987));
+    }
+
+    #[test]
+    fn number_after_finds_the_prefix_inside_a_line() {
+        let l = lines(&["[0.1] frames     12 MiB free"]);
+        assert_eq!(number_after(&l, "frames "), Some(12));
     }
 
     #[test]

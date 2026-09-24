@@ -11,11 +11,12 @@ use crate::mm::pages::KernelPages;
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
 use core::sync::atomic::Ordering;
-use kcore::bootinfo::{PsciConduit, Region};
-use kcore::frames::PhysMem;
-use kcore::layout::{KERNEL_VIRT, LINEAR_BASE};
+use kcore::bootinfo::PsciConduit;
+use kcore::esr::TEST_BRK;
+use kcore::frames::{PAGE_SIZE, PhysMem};
+use kcore::layout::{GIB, KERNEL_VIRT, LINEAR_BASE};
 use kcore::memmap;
-use kcore::paging::{PXN, PageTable, TableMemory};
+use kcore::paging::{MAIR_DEVICE, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, attr_index};
 use kcore::slab::Pool;
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
@@ -60,6 +61,10 @@ const TESTS: &[(&str, TestFn)] = &[
         physical_addresses_do_not_translate,
     ),
     ("linear_map_covers_all_ram", linear_map_covers_all_ram),
+    (
+        "boot_stack_linear_map_and_devices_are_not_executable",
+        boot_stack_linear_map_and_devices_are_not_executable,
+    ),
     ("console_is_device_memory", console_is_device_memory),
     (
         "pools_take_pages_from_the_frame_allocator",
@@ -86,15 +91,20 @@ fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
     if ok { Ok(()) } else { Err(why) }
 }
 
+/// RAM of the machine as the device tree reports it.
+fn ram_size(boot: &Boot) -> u64 {
+    boot.info.memory.as_slice().iter().map(|r| r.size).sum()
+}
+
 fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
     let info = &boot.info;
+    // xtask runs the tests on machines with 512 MiB and 2 GiB.
+    let memory = info.memory.as_slice();
     check(
-        info.memory.as_slice()
-            == [Region {
-                base: 0x4000_0000,
-                size: 512 << 20,
-            }],
-        "memory is not 512 MiB at 0x4000_0000",
+        memory.len() == 1
+            && memory[0].base == 0x4000_0000
+            && [512 << 20, 2 << 30].contains(&memory[0].size),
+        "memory is not 512 MiB or 2 GiB at 0x4000_0000",
     )?;
     check(
         info.uart_pl011.map(|r| r.base) == Some(0x0900_0000),
@@ -134,7 +144,7 @@ fn kernel_runs_in_upper_half_with_mmu_on(_: &Boot) -> Result<(), &'static str> {
 }
 
 fn identity_map_is_dropped(_: &Boot) -> Result<(), &'static str> {
-    let table = (registers::ttbr0_el1() & 0x0000_FFFF_FFFF_F000) as usize;
+    let table = (registers::ttbr0_el1() & TTBR_ROOT_MASK) as usize;
     // SAFETY: TTBR0 points at boot_empty_l0 inside the kernel image, whose GiB is in the linear map.
     let l0 = unsafe { core::slice::from_raw_parts((LINEAR_BASE + table) as *const u64, 512) };
     check(l0.iter().all(|&e| e == 0), "TTBR0 still maps something")
@@ -143,9 +153,9 @@ fn identity_map_is_dropped(_: &Boot) -> Result<(), &'static str> {
 fn brk_is_caught_and_execution_resumes(_: &Boot) -> Result<(), &'static str> {
     exceptions::LAST_BRK.store(u64::MAX, Ordering::Relaxed);
     // SAFETY: the exception handler records BRK and returns past it.
-    unsafe { core::arch::asm!("brk #0x51") };
+    unsafe { core::arch::asm!("brk #{imm}", imm = const TEST_BRK) };
     check(
-        exceptions::LAST_BRK.load(Ordering::Relaxed) == 0x51,
+        exceptions::LAST_BRK.load(Ordering::Relaxed) == u64::from(TEST_BRK),
         "BRK was not recorded",
     )
 }
@@ -166,13 +176,15 @@ fn usable_memory_leaves_the_boot_alone(boot: &Boot) -> Result<(), &'static str> 
         }
         total += u.size;
     }
+    let ram = ram_size(boot);
     check(
-        total > 500 << 20 && total < 512 << 20,
-        "usable memory is not just under 512 MiB",
+        total > ram - (12 << 20) && total < ram,
+        "usable memory is not just under the machine's RAM",
     )
 }
 
-fn frames_are_aligned_distinct_and_usable(_: &Boot) -> Result<(), &'static str> {
+fn frames_are_aligned_distinct_and_usable(boot: &Boot) -> Result<(), &'static str> {
+    let meta = phys::metadata();
     let mut guard = phys::FRAMES.lock();
     let frames = guard.as_mut().ok_or("no frame allocator")?;
     let before = frames.free_frames();
@@ -181,6 +193,19 @@ fn frames_are_aligned_distinct_and_usable(_: &Boot) -> Result<(), &'static str> 
     let big = frames.alloc(9).ok_or("no 2 MiB block")?;
     check(a != b, "two allocations returned the same frame")?;
     check(big.is_multiple_of(2 << 20), "2 MiB block is misaligned")?;
+    for (pa, size) in [(a, PAGE_SIZE), (b, PAGE_SIZE), (big, 2 << 20)] {
+        check(
+            boot.usable
+                .as_slice()
+                .iter()
+                .any(|u| pa >= u.base && pa + size <= u.end()),
+            "a block lies outside usable RAM",
+        )?;
+        check(
+            pa + size <= meta.base || pa >= meta.end(),
+            "a block overlaps the allocator's metadata",
+        )?;
+    }
     for (pa, pattern) in [(a, 0xA5A5_u64), (b, 0x5A5A)] {
         let p = (LINEAR_BASE + pa as usize) as *mut u64;
         // SAFETY: the frame was just allocated and lies in the linear map.
@@ -202,12 +227,15 @@ fn frames_are_aligned_distinct_and_usable(_: &Boot) -> Result<(), &'static str> 
 /// Walks the live kernel tables through the linear map; never allocates.
 struct LiveTables;
 
-impl TableMemory for LiveTables {
+// SAFETY: it never allocates and never writes; reads reach the live
+// kernel tables through the linear map.
+unsafe impl TableMemory for LiveTables {
     fn alloc_table(&mut self) -> Option<u64> {
         None
     }
     fn read(&self, pa: u64) -> u64 {
-        LinearMem.read(pa)
+        // SAFETY: the walk only reads the live kernel tables.
+        unsafe { LinearMem::new() }.read(pa)
     }
     fn write(&mut self, _: u64, _: u64) {
         panic!("the live-table walk writes nothing");
@@ -219,7 +247,35 @@ fn translates(par: u64) -> bool {
 }
 
 fn kernel_tables() -> PageTable {
-    PageTable::from_root(registers::ttbr1_el1() & 0x0000_FFFF_FFFF_F000)
+    PageTable::from_root(registers::ttbr1_el1() & TTBR_ROOT_MASK)
+}
+
+/// Leaf descriptor of `va` in the live kernel tables.
+fn kernel_descriptor(va: usize) -> Option<u64> {
+    kernel_tables()
+        .translate(&LiveTables, va as u64)
+        .map(|(_, d)| d)
+}
+
+/// Calls `f` with the first and last page of every RAM region and the first
+/// page of every GiB inside it, so a machine with more than 1 GiB also
+/// probes RAM the boot page tables did not map.
+fn for_each_ram_probe(
+    boot: &Boot,
+    mut f: impl FnMut(u64) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let ram = memmap::usable::<32>(boot.info.memory.as_slice(), boot.info.no_map.as_slice())
+        .map_err(|_| "too many RAM regions")?;
+    for r in ram.as_slice() {
+        f(r.base)?;
+        let mut gib = (r.base / GIB + 1) * GIB;
+        while gib < r.end() {
+            f(gib)?;
+            gib += GIB;
+        }
+        f(r.end() - PAGE_SIZE)?;
+    }
+    Ok(())
 }
 
 fn kernel_text_is_read_only_and_data_writable(_: &Boot) -> Result<(), &'static str> {
@@ -241,11 +297,9 @@ fn kernel_text_is_read_only_and_data_writable(_: &Boot) -> Result<(), &'static s
 
 fn only_kernel_text_is_executable(_: &Boot) -> Result<(), &'static str> {
     let layout = symbols::image_layout();
-    let pt = kernel_tables();
-    let desc = |va: usize| pt.translate(&LiveTables, va as u64).map(|(_, d)| d);
-    let text = desc(layout.start).ok_or("kernel text is unmapped")?;
-    let rodata = desc(layout.text_end).ok_or("kernel rodata is unmapped")?;
-    let data = desc(layout.rodata_end).ok_or("kernel data is unmapped")?;
+    let text = kernel_descriptor(layout.start).ok_or("kernel text is unmapped")?;
+    let rodata = kernel_descriptor(layout.text_end).ok_or("kernel rodata is unmapped")?;
+    let data = kernel_descriptor(layout.rodata_end).ok_or("kernel data is unmapped")?;
     check(text & PXN == 0, "kernel text is not executable")?;
     check(rodata & PXN != 0, "kernel rodata is executable")?;
     check(data & PXN != 0, "kernel data is executable")
@@ -267,26 +321,51 @@ fn physical_addresses_do_not_translate(boot: &Boot) -> Result<(), &'static str> 
 }
 
 fn linear_map_covers_all_ram(boot: &Boot) -> Result<(), &'static str> {
-    let ram = memmap::usable::<32>(boot.info.memory.as_slice(), boot.info.no_map.as_slice())
-        .map_err(|_| "too many RAM regions")?;
-    for r in ram.as_slice() {
-        for pa in [r.base, r.end() - 4096] {
-            check(
-                translates(registers::at_s1e1r(LINEAR_BASE + pa as usize)),
-                "RAM is missing from the linear map",
-            )?;
-        }
+    for_each_ram_probe(boot, |pa| {
+        check(
+            translates(registers::at_s1e1r(LINEAR_BASE + pa as usize)),
+            "RAM is missing from the linear map",
+        )
+    })
+}
+
+fn boot_stack_linear_map_and_devices_are_not_executable(boot: &Boot) -> Result<(), &'static str> {
+    let kernel_never_executes = |va: usize| kernel_descriptor(va).is_some_and(|d| d & PXN != 0);
+    let stack = symbols::boot_stack();
+    for va in [stack.start, stack.end - 1] {
+        check(
+            kernel_never_executes(va),
+            "the boot stack is unmapped or executable",
+        )?;
+    }
+    for_each_ram_probe(boot, |pa| {
+        check(
+            kernel_never_executes(LINEAR_BASE + pa as usize),
+            "the linear map is unmapped or executable",
+        )
+    })?;
+    let info = &boot.info;
+    for dev in [
+        info.uart_pl011,
+        info.gic_distributor,
+        info.gic_cpu_interface,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        check(
+            kernel_never_executes(LINEAR_BASE + dev.base as usize),
+            "a device is unmapped or executable",
+        )?;
     }
     Ok(())
 }
 
 fn console_is_device_memory(boot: &Boot) -> Result<(), &'static str> {
     let uart = boot.info.uart_pl011.ok_or("no PL011 in the device tree")?;
-    let (_, d) = kernel_tables()
-        .translate(&LiveTables, (LINEAR_BASE + uart.base as usize) as u64)
-        .ok_or("the PL011 is unmapped")?;
+    let d = kernel_descriptor(LINEAR_BASE + uart.base as usize).ok_or("the PL011 is unmapped")?;
     check(
-        (d >> 2) & 0b111 == 1,
+        attr_index(d) == MAIR_DEVICE,
         "the PL011 is not mapped as device memory",
     )
 }

@@ -12,10 +12,24 @@ use kcore::layout::{GIB, LINEAR_BASE};
 use kcore::memmap;
 use kcore::sync::Lock;
 
-/// Physical memory through the linear map.
-pub struct LinearMem;
+/// Physical memory through the linear map. `read` and `write` take any
+/// physical address, so only code that owns the memory it names may make one.
+pub struct LinearMem(());
 
-impl PhysMem for LinearMem {
+impl LinearMem {
+    /// # Safety
+    /// Every address later passed to `read` or `write` is RAM the caller
+    /// owns: free frames for the allocator, tables of a tree it builds, or
+    /// frames it has just taken.
+    pub const unsafe fn new() -> LinearMem {
+        LinearMem(())
+    }
+}
+
+// SAFETY: the linear map holds all RAM as normal memory, so a word written
+// at `LINEAR_BASE + pa` reads back there. The allocator is given only RAM
+// that nothing else uses.
+unsafe impl PhysMem for LinearMem {
     fn read(&self, pa: u64) -> u64 {
         // SAFETY: callers touch only RAM that the linear map covers.
         unsafe { ((LINEAR_BASE + pa as usize) as *const u64).read() }
@@ -30,6 +44,9 @@ impl PhysMem for LinearMem {
 pub type Frames = FrameAllocator<'static, LinearMem>;
 
 pub static FRAMES: Lock<Option<Frames>> = Lock::new(None);
+
+/// The allocator's metadata, which `init` carves out of usable RAM.
+static METADATA: Lock<Region> = Lock::new(Region { base: 0, size: 0 });
 
 /// Starts the allocator with the usable RAM that is mapped now; returns the
 /// rest, which becomes reachable with the kernel page tables.
@@ -65,11 +82,17 @@ pub fn init(boot: &Boot) -> RegionList<32> {
         .position(|r| r.size >= meta_size)
         .expect("no room for frame allocator metadata");
     let meta_pa = now.as_slice()[host].base;
+    *METADATA.lock() = Region {
+        base: meta_pa,
+        size: meta_size,
+    };
     // SAFETY: these pages are usable RAM in a mapped GiB, and nothing else uses them.
     let meta = unsafe {
         core::slice::from_raw_parts_mut((LINEAR_BASE + meta_pa as usize) as *mut u8, meta_len)
     };
-    let mut frames = Frames::new(LinearMem, span_base, meta);
+    // SAFETY: the allocator touches only the RAM given to it below, which
+    // nothing else uses.
+    let mut frames = Frames::new(unsafe { LinearMem::new() }, span_base, meta);
     for (i, r) in now.as_slice().iter().enumerate() {
         let base = if i == host {
             r.base + meta_size
@@ -80,6 +103,12 @@ pub fn init(boot: &Boot) -> RegionList<32> {
     }
     *FRAMES.lock() = Some(frames);
     memmap::usable(boot.usable.as_slice(), mapped).expect("memory map")
+}
+
+/// Where the allocator keeps its metadata.
+#[cfg(feature = "ktest")]
+pub fn metadata() -> Region {
+    *METADATA.lock()
 }
 
 pub fn free_frames() -> u64 {

@@ -20,10 +20,17 @@ const AF: u64 = 1 << 10;
 const NG: u64 = 1 << 11;
 pub const PXN: u64 = 1 << 53;
 pub const UXN: u64 = 1 << 54;
-/// AttrIndx values; MAIR_EL1 (head.S) holds normal write-back memory at 0 and
-/// Device-nGnRE at 1.
-const ATTR_NORMAL: u64 = 0 << 2;
-const ATTR_DEVICE: u64 = 1 << 2;
+/// MAIR_EL1 entries that head.S sets: normal write-back memory at index 0,
+/// Device-nGnRE at index 1.
+pub const MAIR_NORMAL: u64 = 0;
+pub const MAIR_DEVICE: u64 = 1;
+/// AttrIndx, descriptor bits [4:2], selects a MAIR_EL1 entry.
+const ATTR_SHIFT: u32 = 2;
+const ATTR_NORMAL: u64 = MAIR_NORMAL << ATTR_SHIFT;
+const ATTR_DEVICE: u64 = MAIR_DEVICE << ATTR_SHIFT;
+/// Root table address bits of TTBR0_EL1 and TTBR1_EL1; the ASID sits above
+/// them, CnP in bit 0.
+pub const TTBR_ROOT_MASK: u64 = OA_MASK;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Memory {
@@ -96,6 +103,11 @@ impl Attrs {
     }
 }
 
+/// The MAIR_EL1 index a block or page descriptor selects.
+pub fn attr_index(desc: u64) -> u64 {
+    (desc >> ATTR_SHIFT) & 0b111
+}
+
 pub fn page_descriptor(pa: u64, attrs: Attrs) -> u64 {
     (pa & OA_MASK) | attrs.bits() | TABLE_OR_PAGE | VALID
 }
@@ -109,7 +121,15 @@ pub fn table_descriptor(pa: u64) -> u64 {
 }
 
 /// Memory for translation tables.
-pub trait TableMemory {
+///
+/// # Safety
+/// `alloc_table` returns the physical address of a zeroed 4 KiB frame,
+/// aligned to 4 KiB, that belongs to the table tree from then on and that
+/// nothing else uses. `read` and `write` access the 8-byte word at a
+/// physical address inside a table of the tree, and nothing else; `read`
+/// returns the last word written. The MMU walks these tables, so a table
+/// that is not real, zeroed and owned memory maps whatever it happens to hold.
+pub unsafe trait TableMemory {
     /// Physical address of a zeroed 4 KiB table, or None when memory runs out.
     fn alloc_table(&mut self) -> Option<u64>;
     fn read(&self, pa: u64) -> u64;
@@ -218,6 +238,10 @@ impl PageTable {
                 table = d & OA_MASK;
                 continue;
             }
+            // A level-0 block does not exist with a 4 KiB granule, and at
+            // level 3 bit 1 clear is reserved. Tables built here hold
+            // neither; the check keeps a foreign or damaged table (such as
+            // one read through `from_root`) from turning into a bogus mapping.
             if level == 0 || (level == 3 && !is_table_or_page) {
                 return None;
             }
@@ -239,7 +263,9 @@ mod tests {
         left: usize,
     }
 
-    impl TableMemory for Tables {
+    // SAFETY: tables are distinct, zeroed (absent words read as 0) and owned
+    // by the test; `read` returns the last `write`.
+    unsafe impl TableMemory for Tables {
         fn alloc_table(&mut self) -> Option<u64> {
             if self.left == 0 {
                 return None;
@@ -263,6 +289,28 @@ mod tests {
             next: 0x8000_0000,
             left: n,
         }
+    }
+
+    #[test]
+    fn attr_index_names_the_mair_entry() {
+        assert_eq!(
+            attr_index(page_descriptor(0x0900_0000, Attrs::DEVICE)),
+            MAIR_DEVICE
+        );
+        assert_eq!(
+            attr_index(page_descriptor(0x4000_0000, Attrs::KERNEL_DATA)),
+            MAIR_NORMAL
+        );
+        assert_eq!(
+            attr_index(block_descriptor(0x4000_0000, Attrs::KERNEL_TEXT)),
+            MAIR_NORMAL
+        );
+    }
+
+    #[test]
+    fn ttbr_root_mask_drops_the_asid_and_the_low_bits() {
+        let ttbr = (0xABCD_u64 << 48) | 0x4008_1000 | 1;
+        assert_eq!(ttbr & TTBR_ROOT_MASK, 0x4008_1000);
     }
 
     #[test]

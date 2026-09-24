@@ -18,6 +18,7 @@ mod panicking;
 mod psci;
 
 use boot::Boot;
+use kcore::frames::PAGE_SIZE;
 use kcore::layout::KERNEL_VIRT;
 
 #[unsafe(no_mangle)]
@@ -86,6 +87,6 @@ fn report(boot: &Boot) {
     kprintln!("usable     {} MiB in total", total >> 20);
     kprintln!(
         "frames     {} MiB free",
-        (mm::phys::free_frames() * 4096) >> 20
+        (mm::phys::free_frames() * PAGE_SIZE) >> 20
     );
 }

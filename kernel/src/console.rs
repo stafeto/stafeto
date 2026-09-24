@@ -17,7 +17,10 @@ const FR_TXFF: u32 = 1 << 5;
 const CR_ENABLE: u32 = 0x301;
 
 pub fn init() {
-    // SAFETY: the linear map holds the PL011 as device memory (the kernel page tables map it from the device tree; on QEMU virt it is PL011_PA).
+    // SAFETY: the PL011 is device memory in the linear map both before and
+    // after the switch to the kernel tables: head.S maps the first GiB of
+    // physical addresses as devices, mm::kmap maps the PL011 from the device
+    // tree, and on QEMU virt it sits at PL011_PA.
     unsafe { ((BASE + CR) as *mut u32).write_volatile(CR_ENABLE) }
 }
 

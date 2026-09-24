@@ -6,6 +6,7 @@
 //! a bug and panics. Multi-core support changes only the inside of this type.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -30,13 +31,33 @@ impl<T> Lock<T> {
         if self.locked.swap(true, Ordering::Acquire) {
             panic!("kernel lock re-entered");
         }
-        LockGuard { lock: self }
+        LockGuard {
+            lock: self,
+            _not_auto: PhantomData,
+        }
     }
 }
 
+/// Access to a locked value; dropping the guard unlocks. A shared guard
+/// hands out `&T`, so the guard is `Sync` only when `T` is:
+///
+/// ```compile_fail,E0277
+/// fn shared<T: Sync>() {}
+/// shared::<kcore::sync::LockGuard<'static, core::cell::Cell<u8>>>();
+/// ```
 pub struct LockGuard<'a, T> {
     lock: &'a Lock<T>,
+    /// Turns off the automatic `Send` and `Sync`: they would follow
+    /// `&Lock<T>` and make the guard `Sync` for every `T: Send`.
+    _not_auto: PhantomData<*mut T>,
 }
+
+// SAFETY: moving the guard moves exclusive access to the value, as moving a
+// `&mut T` does.
+unsafe impl<T: Send> Send for LockGuard<'_, T> {}
+
+// SAFETY: through a shared guard other threads reach only `&T`.
+unsafe impl<T: Sync> Sync for LockGuard<'_, T> {}
 
 impl<T> Deref for LockGuard<'_, T> {
     type Target = T;
@@ -77,6 +98,15 @@ mod tests {
             let _g = l.lock();
         }
         let _g = l.lock();
+    }
+
+    #[test]
+    fn guard_is_send_and_sync_as_a_mut_reference_would_be() {
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<LockGuard<'static, u32>>();
+        sync::<LockGuard<'static, u32>>();
+        send::<LockGuard<'static, core::cell::Cell<u8>>>();
     }
 
     #[test]

@@ -223,7 +223,7 @@ fn classify(
             info.memory.push(r?)?;
         }
     }
-    if depth == 3 && parent == "reserved-memory" {
+    if depth == 3 && parent == "reserved-memory" && node.enabled() {
         for r in RegIter::new(node.reg, cells)? {
             let r = r?;
             info.reserved.push(r)?;
@@ -419,6 +419,14 @@ mod tests {
             ]
         );
         assert_eq!(i.no_map.as_slice(), [region(0x4000_0000, 0x8_0000)]);
+    }
+
+    #[test]
+    fn disabled_reserved_memory_children_are_not_reserved() {
+        let i = info(A64).unwrap();
+        let disabled = region(0x7f00_0000, 0x10_0000);
+        assert!(!i.reserved.as_slice().contains(&disabled));
+        assert!(!i.no_map.as_slice().contains(&disabled));
     }
 
     #[test]

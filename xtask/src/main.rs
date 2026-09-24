@@ -25,6 +25,8 @@ enum Variant {
 }
 
 impl Variant {
+    const ALL: [Variant; 3] = [Variant::Normal, Variant::Test, Variant::FaultProbe];
+
     fn feature(self) -> Option<&'static str> {
         match self {
             Variant::Normal => None,
@@ -190,7 +192,8 @@ fn test() -> Result<(), String> {
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     fault_report()?;
-    kernel_tests()?;
+    kernel_tests(&qemu::VIRT)?;
+    kernel_tests(&qemu::VIRT_2G)?;
     println!("all checks passed");
     Ok(())
 }
@@ -272,15 +275,17 @@ fn fault_report() -> Result<(), String> {
     qemu::backtrace_names_the_fault(&o.lines)
 }
 
-/// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
-fn kernel_tests() -> Result<(), String> {
+/// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
+/// through semihosting. On 2 GiB the tests also cover RAM the boot page
+/// tables did not map.
+fn kernel_tests(m: &qemu::Machine) -> Result<(), String> {
     let a = build(Variant::Test)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS).arg("-semihosting");
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
     qemu::verdict(&o, &r)?;
-    println!("kernel tests: {} passed", r.passed.len());
+    println!("kernel tests on {}: {} passed", m.memory, r.passed.len());
     Ok(())
 }
 
@@ -322,43 +327,21 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--package",
-        "kernel",
-        "--release",
-        "--target",
-        KERNEL_TARGET,
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--package",
-        "kernel",
-        "--release",
-        "--target",
-        KERNEL_TARGET,
-        "--features",
-        "ktest",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--package",
-        "kernel",
-        "--release",
-        "--target",
-        KERNEL_TARGET,
-        "--features",
-        "fault-probe",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
+    for variant in Variant::ALL {
+        let mut cmd = cargo();
+        cmd.args([
+            "clippy",
+            "--package",
+            "kernel",
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+        ]);
+        if let Some(feature) = variant.feature() {
+            cmd.args(["--features", feature]);
+        }
+        run_cmd(cmd.args(["--", "-D", "warnings"]))?;
+    }
     test()
 }
 
@@ -368,7 +351,7 @@ mod tests {
 
     #[test]
     fn variants_have_their_own_artifacts_and_features() {
-        let all = [Variant::Normal, Variant::Test, Variant::FaultProbe];
+        let all = Variant::ALL;
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.stem(), b.stem());

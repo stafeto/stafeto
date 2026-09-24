@@ -10,7 +10,7 @@ use crate::arch::{mmu, symbols};
 use crate::boot::Boot;
 use kcore::bootinfo::Region;
 use kcore::frames::{PAGE_SIZE, PhysMem};
-use kcore::layout::{KERNEL_VIRT, LINEAR_BASE};
+use kcore::layout::{LINEAR_BASE, image_pa};
 use kcore::memmap;
 use kcore::paging::{Attrs, PageTable, TableMemory};
 
@@ -19,10 +19,14 @@ pub struct FrameTables<'a> {
     pub frames: &'a mut Frames,
 }
 
-impl TableMemory for FrameTables<'_> {
+// SAFETY: every table is a frame just taken from the allocator and zeroed
+// here; the tree owns it from then on. Tables are reached through the
+// linear map.
+unsafe impl TableMemory for FrameTables<'_> {
     fn alloc_table(&mut self) -> Option<u64> {
         let pa = self.frames.alloc(0)?;
-        let mut mem = LinearMem;
+        // SAFETY: the frame was just taken from the allocator.
+        let mut mem = unsafe { LinearMem::new() };
         for i in 0..512 {
             mem.write(pa + i * 8, 0);
         }
@@ -30,11 +34,13 @@ impl TableMemory for FrameTables<'_> {
     }
 
     fn read(&self, pa: u64) -> u64 {
-        LinearMem.read(pa)
+        // SAFETY: the trees these tables serve own every table they reach.
+        unsafe { LinearMem::new() }.read(pa)
     }
 
     fn write(&mut self, pa: u64, value: u64) {
-        LinearMem.write(pa, value)
+        // SAFETY: as in `read`.
+        unsafe { LinearMem::new() }.write(pa, value)
     }
 }
 
@@ -70,7 +76,7 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
         };
         let mut pt = PageTable::new(&mut mem).expect("no frame for the root table");
         let image = symbols::image_layout();
-        let pa = |va: usize| boot.kernel_pa + (va - KERNEL_VIRT) as u64;
+        let pa = |va: usize| image_pa(boot.kernel_pa, va);
         let sections = [
             (
                 image.start,

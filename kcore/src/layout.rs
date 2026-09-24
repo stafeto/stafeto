@@ -9,6 +9,14 @@ pub const LINEAR_BASE: usize = 0xFFFF_0000_0000_0000;
 /// Virtual address of the first byte of the kernel image.
 pub const KERNEL_VIRT: usize = 0xFFFF_FFFF_C000_0000;
 
+/// Physical address of `va` inside the kernel image loaded at `kernel_pa`.
+pub fn image_pa(kernel_pa: u64, va: usize) -> u64 {
+    let offset = va
+        .checked_sub(KERNEL_VIRT)
+        .expect("address below the kernel image");
+    kernel_pa + offset as u64
+}
+
 /// The boot page tables map physical memory in whole, naturally aligned GiBs.
 pub const GIB: u64 = 1 << 30;
 
@@ -62,6 +70,18 @@ mod tests {
         assert_eq!(LINEAR_BASE >> 48, 0xFFFF);
         const { assert!(LINEAR_BASE < KERNEL_VIRT) };
         assert_eq!(KERNEL_VIRT % (GIB as usize), 0);
+    }
+
+    #[test]
+    fn image_pa_offsets_from_the_load_address() {
+        assert_eq!(image_pa(0x4020_0000, KERNEL_VIRT), 0x4020_0000);
+        assert_eq!(image_pa(0x4020_0000, KERNEL_VIRT + 0x1234), 0x4020_1234);
+    }
+
+    #[test]
+    #[should_panic(expected = "below the kernel image")]
+    fn address_below_the_image_has_no_image_pa() {
+        image_pa(0x4020_0000, KERNEL_VIRT - 1);
     }
 
     #[test]

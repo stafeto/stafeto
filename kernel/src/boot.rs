@@ -40,8 +40,8 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> Boot {
         panic!("device tree at {dtb_pa:#x} crosses a GiB boundary; only its first GiB is mapped");
     }
     // SAFETY: the whole blob lies in the mapped GiB, and nothing writes to it.
-    let fdt = unsafe { Fdt::from_ptr(dtb) }
-        .unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
+    let blob = unsafe { core::slice::from_raw_parts(dtb, total) };
+    let fdt = Fdt::new(blob).unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
     let info = bootinfo::parse(&fdt).unwrap_or_else(|e| panic!("device tree: {e:?}"));
 
     let image = symbols::image();

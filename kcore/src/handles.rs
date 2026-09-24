@@ -40,7 +40,12 @@ pub struct Chunk<T> {
 }
 
 /// Memory for chunks.
-pub trait ChunkSource<T> {
+///
+/// # Safety
+/// `alloc_chunk` returns memory valid for reads and writes of
+/// `size_of::<Chunk<T>>()` bytes, aligned to `align_of::<Chunk<T>>()`, that
+/// nothing else uses until the table hands it back through `free_chunk`.
+pub unsafe trait ChunkSource<T> {
     /// Uninitialised memory for one chunk.
     fn alloc_chunk(&mut self) -> Option<NonNull<Chunk<T>>>;
 
@@ -297,7 +302,8 @@ mod tests {
         freed: usize,
     }
 
-    impl<T> ChunkSource<T> for Boxes {
+    // SAFETY: each chunk is a fresh Box, freed only in `free_chunk`.
+    unsafe impl<T> ChunkSource<T> for Boxes {
         fn alloc_chunk(&mut self) -> Option<NonNull<Chunk<T>>> {
             if self.left == 0 {
                 return None;
