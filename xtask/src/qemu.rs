@@ -46,9 +46,25 @@ pub fn run_until(mut cmd: Command, timeout: Duration, stop_marker: Option<&str>)
     let stdout = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
+        // Read raw bytes and decode lossily: a stray non-UTF-8 byte in the
+        // child's output must not end the reader early (BufRead::lines()
+        // would return an Err for such a line and stop there).
+        let mut reader = BufReader::new(stdout);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if buf.last() == Some(&b'\n') {
+                        buf.pop();
+                    }
+                    let line = String::from_utf8_lossy(&buf).into_owned();
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
     });
@@ -69,8 +85,20 @@ pub fn run_until(mut cmd: Command, timeout: Duration, stop_marker: Option<&str>)
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let status = child.wait().map_err(|e| e.to_string())?;
-                return Ok(Outcome { lines, status: Some(status), timed_out: false, stopped_on_marker: false });
+                // The reader thread exited (EOF or a read error), but the
+                // child process may still be running: poll instead of a
+                // blocking wait so the deadline still applies.
+                loop {
+                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                        return Ok(Outcome { lines, status: Some(status), timed_out: false, stopped_on_marker: false });
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Ok(Outcome { lines, status: None, timed_out: true, stopped_on_marker: false });
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
             }
         }
         if Instant::now() >= deadline {
@@ -165,6 +193,16 @@ mod tests {
         assert!(expect_clean_exit_with(&missing, "boot complete").is_err());
         let failed = Outcome { status: Some(ExitStatus::from_raw(1 << 8)), ..ok.clone() };
         assert!(expect_clean_exit_with(&failed, "boot complete").is_err());
+    }
+
+    #[test]
+    fn survives_non_utf8_output() {
+        let start = Instant::now();
+        let o = run_until(sh("printf 'bad \\377 byte\\n'; echo after; sleep 10"), Duration::from_millis(300), None).unwrap();
+        assert!(o.timed_out);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(o.lines.iter().any(|l| l.starts_with("bad ")));
+        assert!(o.lines.iter().any(|l| l == "after"));
     }
 
     #[test]
