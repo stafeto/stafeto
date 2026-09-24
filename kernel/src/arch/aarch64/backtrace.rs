@@ -7,6 +7,11 @@
 use kcore::layout::KERNEL_VIRT;
 
 const MAX_FRAMES: usize = 32;
+/// The ELF with this build's symbols; xtask copies it there.
+#[cfg(not(feature = "ktest"))]
+const ELF: &str = "target/stafeto.elf";
+#[cfg(feature = "ktest")]
+const ELF: &str = "target/stafeto-ktest.elf";
 
 pub fn print() {
     let mut fp: usize;
@@ -14,9 +19,7 @@ pub fn print() {
     unsafe {
         core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags))
     };
-    kprintln!(
-        "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/aarch64-unknown-none-softfloat/release/kernel):"
-    );
+    kprintln!("backtrace (look up: lldb -b -o 'image lookup -a ADDR' {ELF}):");
     for depth in 0..MAX_FRAMES {
         if fp < KERNEL_VIRT || !fp.is_multiple_of(16) {
             break;

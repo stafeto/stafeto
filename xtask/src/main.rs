@@ -121,12 +121,17 @@ fn build(ktest: bool) -> Result<Artifacts, String> {
     }
     run_cmd(&mut cmd)?;
     let target = root().join("target");
-    let elf = target.join(KERNEL_TARGET).join("release").join("kernel");
-    let image = target.join(if ktest {
-        "stafeto-ktest.img"
+    // Both builds write the same cargo output path; a copy next to each image
+    // keeps the symbols that match it.
+    let (elf, image) = if ktest {
+        ("stafeto-ktest.elf", "stafeto-ktest.img")
     } else {
-        "stafeto.img"
-    });
+        ("stafeto.elf", "stafeto.img")
+    };
+    let (elf, image) = (target.join(elf), target.join(image));
+    let built = target.join(KERNEL_TARGET).join("release").join("kernel");
+    std::fs::copy(&built, &elf)
+        .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
     run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
             .args(["-O", "binary"])

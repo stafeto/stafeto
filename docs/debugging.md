@@ -32,9 +32,12 @@
 Паника печатает стек вызовов адресами. Имя функции и строку по адресу даёт lldb:
 
 ```
-lldb -b -o 'image lookup -a 0xffffffffc0001234' \
-  target/aarch64-unknown-none-softfloat/release/kernel
+lldb -b -o 'image lookup -a 0xffffffffc0001234' target/stafeto.elf
 ```
+
+xtask кладёт ELF рядом с образом: `target/stafeto.elf` для обычной сборки,
+`target/stafeto-ktest.elf` для сборки с тестами ядра из `cargo xtask test`.
+Адреса из паники тестового ядра искать во втором файле.
 
 ## Отладчик
 
@@ -43,7 +46,7 @@ lldb -b -o 'image lookup -a 0xffffffffc0001234' \
 лежит по адресу `0x40200000`. Затем в другом терминале:
 
 ```
-lldb target/aarch64-unknown-none-softfloat/release/kernel -o 'gdb-remote 1234'
+lldb target/stafeto.elf -o 'gdb-remote 1234'
 ```
 
 Пока MMU выключен, код исполняется по физическим адресам (образ стоит с
