@@ -23,6 +23,11 @@ pub fn fits_in_one_gib(base: u64, size: u64) -> bool {
     }
 }
 
+/// True when the boot page tables can map the GiB holding physical address pa: not the first GiB (devices) and inside the 512 GiB one L1 table covers.
+pub fn dtb_gib_is_mappable(pa: u64) -> bool {
+    (1..512).contains(&(pa / GIB))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +62,35 @@ mod tests {
         assert_eq!(LINEAR_BASE >> 48, 0xFFFF);
         assert!(LINEAR_BASE < KERNEL_VIRT);
         assert_eq!(KERNEL_VIRT % (GIB as usize), 0);
+    }
+
+    #[test]
+    fn dtb_in_a_ram_gib_is_mappable() {
+        assert!(dtb_gib_is_mappable(0x4800_0000));
+    }
+
+    #[test]
+    fn dtb_at_zero_is_not_mappable() {
+        assert!(!dtb_gib_is_mappable(0x0));
+    }
+
+    #[test]
+    fn dtb_in_the_device_gib_is_not_mappable() {
+        assert!(!dtb_gib_is_mappable(0x0900_0000));
+    }
+
+    #[test]
+    fn dtb_in_the_last_gib_of_the_l1_table_is_mappable() {
+        assert!(dtb_gib_is_mappable(511 * GIB + 0x1000));
+    }
+
+    #[test]
+    fn dtb_at_512_gib_is_not_mappable() {
+        assert!(!dtb_gib_is_mappable(512 * GIB));
+    }
+
+    #[test]
+    fn dtb_at_the_top_of_the_address_space_is_not_mappable() {
+        assert!(!dtb_gib_is_mappable(u64::MAX));
     }
 }

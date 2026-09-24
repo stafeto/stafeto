@@ -117,8 +117,11 @@ at_el1:
     lsl     x11, x10, #30
     orr     x11, x11, x9
     str     x11, [x3, x10, lsl #3]
-    cbz     x19, 3f
+    // Device tree GiB index must be 1..511: keep in sync with kcore::layout::dtb_gib_is_mappable.
     lsr     x10, x19, #30
+    cbz     x10, 3f
+    cmp     x10, #511
+    b.hi    3f
     lsl     x11, x10, #30
     orr     x11, x11, x9
     str     x11, [x3, x10, lsl #3]

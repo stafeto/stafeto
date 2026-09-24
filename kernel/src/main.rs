@@ -15,7 +15,7 @@ mod psci;
 
 use kcore::bootinfo::{self, BootInfo};
 use kcore::fdt::Fdt;
-use kcore::layout::{fits_in_one_gib, KERNEL_VIRT, LINEAR_BASE};
+use kcore::layout::{dtb_gib_is_mappable, fits_in_one_gib, KERNEL_VIRT, LINEAR_BASE};
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
@@ -23,6 +23,9 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     if dtb_pa == 0 {
         panic!("no device tree in x0: boot the arm64 Image, not the ELF");
+    }
+    if !dtb_gib_is_mappable(dtb_pa as u64) {
+        panic!("device tree pointer {dtb_pa:#x} is outside the RAM the boot page tables map");
     }
     // SAFETY: head.S mapped the GiB holding the device tree into the linear map,
     // and nothing writes to the device tree.
