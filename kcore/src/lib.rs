@@ -6,5 +6,6 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod bootinfo;
 pub mod fdt;
 pub mod layout;
