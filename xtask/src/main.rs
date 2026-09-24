@@ -399,4 +399,38 @@ mod tests {
         }
         assert_eq!(Variant::Normal.feature(), None);
     }
+
+    /// The kernel keeps the FP and SIMD registers for programs and saves
+    /// them only when threads switch (spec 8), so FP or SIMD anywhere else
+    /// in the kernel would change a program's registers without a word.
+    /// Only the thread switch and the EL0 test programs may assemble them.
+    #[test]
+    fn only_the_thread_switch_uses_fp() {
+        let mut found = Vec::new();
+        let mut paths = vec![root().join("kernel")];
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                let entries = std::fs::read_dir(&path).expect("a readable directory");
+                paths.extend(entries.map(|e| e.expect("a directory entry").path()));
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let fp = text.lines().any(|l| {
+                (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
+                    || ((l.contains("target_feature") || l.contains("target-feature"))
+                        && (l.contains("neon") || l.contains("fp-armv8")))
+            });
+            if fp {
+                let name = path.strip_prefix(root()).expect("a path in the workspace");
+                found.push(name.to_string_lossy().into_owned());
+            }
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
+        );
+    }
 }

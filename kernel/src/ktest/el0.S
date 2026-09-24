@@ -10,6 +10,7 @@
 
 .equ SVC_NOP, 0xFF00                    // ktest::el0::SVC_NOP
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
+.equ SVC_YIELD, 0xFF02                  // ktest::el0::SVC_YIELD
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
 .equ P_NZCV, 256
@@ -96,10 +97,33 @@ el0_pattern_unknown:
     svc     #SVC_UNKNOWN
     svc     #SVC_DONE
 
+// Fills every register and waits in a loop for the timer's interrupt;
+// the kernel moves the thread past the loop once it has come.
+.global el0_pattern_loop, el0_wait_loop
+el0_pattern_loop:
+    LOAD_PATTERN
+el0_wait_loop:
+    b       el0_wait_loop
+    svc     #SVC_DONE
+
+// Fills every register and lets the test's other thread, in another
+// process, run and fill them with its own pattern.
+.global el0_pattern_yield
+el0_pattern_yield:
+    LOAD_PATTERN
+    svc     #SVC_YIELD
+    svc     #SVC_DONE
+
 // Loads from the kernel address in x0, which must fault.
 .global el0_load
 el0_load:
     ldr     x1, [x0]
+    svc     #SVC_DONE
+
+// Ends at once: the kernel checks the FP and SIMD registers a new thread
+// finds, after tests that left their patterns in them.
+.global el0_done_at_once
+el0_done_at_once:
     svc     #SVC_DONE
 
 el0_programs_end:

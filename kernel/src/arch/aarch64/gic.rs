@@ -101,26 +101,12 @@ pub fn mask(intid: u32) {
 /// Reads GICC_IAR once. The interrupt becomes active until `end`; None for
 /// a spurious read, which needs no EOI.
 #[must_use = "an acknowledged interrupt stays active until gic::end"]
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the interrupt path from EL0 will acknowledge; so far only the kernel tests do"
-    )
-)]
 pub fn acknowledge() -> Option<Ack> {
     Ack::from_iar(read(&CPU, GICC_IAR))
 }
 
 /// EOI: ends an acknowledged interrupt. A level-triggered source must be
 /// quiet by now, or the line fires again at once.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the interrupt path from EL0 will end interrupts; so far only the kernel tests do"
-    )
-)]
 pub fn end(ack: Ack) {
     write(&CPU, GICC_EOIR, ack.eoi_value());
 }

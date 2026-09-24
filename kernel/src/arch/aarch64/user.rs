@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Programs at EL0 (spec 8.1): the system registers that let them run, the
-//! registers of a program, and the way back to EL0. Entry from EL0 is in
-//! vectors.S: it saves the registers straight into the area TPIDR_EL1
+//! Programs at EL0 (spec 8, 8.1): the system registers that let them run,
+//! the registers of a program, the FP and SIMD registers that a switch
+//! between threads saves and loads, and the way back to EL0. Entry from EL0
+//! is in vectors.S: it saves the registers straight into the area TPIDR_EL1
 //! points at, the running thread's, and calls handle_user_exception on the
 //! empty kernel stack.
 
@@ -54,8 +55,50 @@ impl UserRegs {
     }
 }
 
+/// A program's FP and SIMD registers, in the layout of fpsimd.S. The
+/// kernel never uses them, so they are saved and loaded only when threads
+/// switch (spec 8), not on every entry.
+#[repr(C, align(16))]
+pub struct FpRegs {
+    pub v: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<FpRegs>() == 528);
+    assert!(core::mem::offset_of!(FpRegs, fpcr) == 512);
+    assert!(core::mem::offset_of!(FpRegs, fpsr) == 520);
+};
+
+impl FpRegs {
+    /// A new thread's: every register zero, round to nearest, no
+    /// exception flags.
+    pub const ZERO: FpRegs = FpRegs {
+        v: [0; 32],
+        fpcr: 0,
+        fpsr: 0,
+    };
+}
+
 unsafe extern "C" {
     fn return_to_user(regs: *mut UserRegs) -> !;
+    fn fp_save(regs: *mut FpRegs);
+    fn fp_load(regs: *const FpRegs);
+}
+
+/// Stores the FP and SIMD registers, which hold the state of the thread
+/// that ran last.
+pub fn save_fp(regs: &mut FpRegs) {
+    // SAFETY: fp_save writes the 528 bytes of `regs` and nothing else.
+    unsafe { fp_save(regs) }
+}
+
+/// Loads the FP and SIMD registers for the thread that runs next.
+pub fn load_fp(regs: &FpRegs) {
+    // SAFETY: fp_load reads `regs` and changes only FP and SIMD registers,
+    // which the kernel does not use.
+    unsafe { fp_load(regs) }
 }
 
 /// Opens EL0 (kcore::sysreg): FP and SIMD, the virtual counter, and the

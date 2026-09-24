@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Exception entry. A system call from EL0 goes to the dispatcher; every
-//! other exception is reported with its registers and stops the kernel.
-//! Test builds skip one BRK marker (kcore::esr::TEST_BRK) to prove the
-//! vectors and the return path work. An entry from EL1 that finds no room
-//! on the kernel stack runs on the emergency stack and never returns.
+//! Exception entry. A system call from EL0 goes to the dispatcher and an
+//! interrupt at EL0 to its handler; every other exception is reported with
+//! its registers and stops the kernel. Test builds skip one BRK marker
+//! (kcore::esr::TEST_BRK) to prove the vectors and the return path work. An
+//! entry from EL1 that finds no room on the kernel stack runs on the
+//! emergency stack and never returns.
 
 use super::user::UserRegs;
 use super::{registers, symbols};
@@ -50,6 +51,7 @@ const VECTOR_NAMES: [&str; 16] = [
 ];
 const VECTOR_EL1H_SYNC: u64 = 4;
 const VECTOR_EL0_SYNC: u64 = 8;
+const VECTOR_EL0_IRQ: u64 = 9;
 /// Set in the vector index when the entry switched to the emergency stack.
 const ON_EMERGENCY_STACK: u64 = 1 << 4;
 
@@ -122,8 +124,8 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
 }
 
 /// Entry from EL0 (vectors.S): the program's registers are in the running
-/// thread. A system call goes to the dispatcher and the thread goes on.
-/// Any other synchronous exception is the program's fault and stops the
+/// thread. After a system call or an interrupt the thread goes on. Any
+/// other synchronous exception is the program's fault and stops the
 /// machine for now (milestone 1.2c ends just the process, spec 7.9); an
 /// asynchronous one that no handler takes is an error of the system.
 #[unsafe(no_mangle)]
@@ -135,9 +137,10 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
             Some(number) => crate::syscall::dispatch(thread, number),
             None => user_fault(thread, index, syndrome),
         },
-        // Not the program's fault: no interrupt reaches EL0 yet; PSTATE
-        // masks SErrors inside the kernel, so one the kernel caused arrives
-        // at EL0 as well; FIQs never reach EL1.
+        VECTOR_EL0_IRQ => crate::interrupt::handle(),
+        // Not the program's fault: PSTATE masks SErrors inside the kernel,
+        // so one the kernel caused arrives at EL0 as well; FIQs never reach
+        // EL1.
         _ => system_error(thread, index, syndrome),
     }
     thread::run(thread)

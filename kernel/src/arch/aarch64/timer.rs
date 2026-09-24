@@ -92,13 +92,6 @@ pub fn disarm() {
 /// True when the timer is on and its deadline has passed. A level line may
 /// reach the GIC once more after the EOI that followed a `disarm`: an
 /// INTID 27 without this is spurious and gets only its EOI.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the interrupt path from EL0 will ask it; so far only the kernel tests do"
-    )
-)]
 pub fn fired() -> bool {
     let ctl: u64;
     // SAFETY: reading CNTV_CTL_EL0 has no side effects.

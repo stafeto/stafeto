@@ -10,8 +10,8 @@
 //! are in el0.S.
 
 use super::{check, finish, report};
-use crate::arch::user::UserRegs;
-use crate::arch::{cache, symbols, timer};
+use crate::arch::user::{self, FpRegs, UserRegs};
+use crate::arch::{cache, gic, symbols, timer};
 use crate::process::{self, Process};
 use crate::syscall;
 use crate::thread::{self, Policy, Thread};
@@ -32,16 +32,22 @@ unsafe extern "C" {
     static el0_read_counter: u8;
     static el0_pattern_nop: u8;
     static el0_pattern_unknown: u8;
+    static el0_pattern_loop: u8;
+    static el0_wait_loop: u8;
+    static el0_pattern_yield: u8;
     static el0_load: u8;
+    static el0_done_at_once: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
 /// builds only (el0.S uses them too). NOP returns 0 in x0; DONE ends the
-/// program.
+/// program; YIELD returns 0 in x0 and runs the test's other thread, if
+/// there is one.
 pub const SVC_NOP: u16 = 0xFF00;
 pub const SVC_DONE: u16 = 0xFF01;
+pub const SVC_YIELD: u16 = 0xFF02;
 
-const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_DONE <= *abi::TEST_CALLS.end());
+const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_YIELD <= *abi::TEST_CALLS.end());
 
 /// Where the test processes see their pages: the programs at TEXT_VA, and
 /// one page of data at DATA_VA with the register pattern at its start and
@@ -80,6 +86,26 @@ const EL0_TESTS: &[El0Test] = &[
         start: start_kernel_load,
         done: done_kernel_load,
     },
+    El0Test {
+        name: "registers_survive_a_timer_interrupt",
+        start: start_interrupt,
+        done: done_interrupt,
+    },
+    El0Test {
+        name: "registers_survive_a_switch_to_another_process",
+        start: start_switch,
+        done: done_switch,
+    },
+    El0Test {
+        name: "registers_survive_a_switch_within_a_process",
+        start: start_switch_within,
+        done: done_switch,
+    },
+    El0Test {
+        name: "a_new_thread_starts_with_clear_fp",
+        start: start_clear_fp,
+        done: done_clear_fp,
+    },
 ];
 
 /// What the running test built and expects: up to two processes with one
@@ -99,6 +125,10 @@ struct Fixture {
     /// the same, near the top of the kernel stack.
     stack: Option<usize>,
     stack_ok: bool,
+    /// Timer interrupts taken at EL0, and whether one of them moved the
+    /// thread past its wait loop.
+    interrupts: u32,
+    left_loop: bool,
 }
 
 // SAFETY: the fixture's objects are reached only under the kernel's rules
@@ -117,6 +147,8 @@ impl Fixture {
             fault_at: None,
             stack: None,
             stack_ok: true,
+            interrupts: 0,
+            left_loop: false,
         }
     }
 
@@ -165,6 +197,7 @@ fn end(result: Result<(), &'static str>) -> ! {
 }
 
 fn teardown() {
+    timer::disarm();
     let (threads, processes) = {
         let mut f = FIXTURE.lock();
         (
@@ -189,9 +222,43 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
     match number {
         SVC_NOP => syscall::set_result(thread, Ok(())),
         SVC_DONE => done(thread),
+        SVC_YIELD => yield_to_other(thread),
         _ => return false,
     }
     true
+}
+
+/// Runs the test's other thread; returns when there is none.
+fn yield_to_other(thread: NonNull<Thread>) {
+    syscall::set_result(thread, Ok(()));
+    let other = {
+        let f = FIXTURE.lock();
+        // SAFETY: the running thread is alive.
+        let slot = f.slot(unsafe { thread.as_ref() });
+        f.threads[1 - slot]
+    };
+    if let Some(other) = other {
+        thread::run(other)
+    }
+}
+
+/// The timer's interrupt at EL0. In the interrupt test the thread waits for
+/// it in a loop, and the kernel moves the thread past the loop; one that
+/// comes before the thread reaches the loop arms the timer again.
+pub fn timer_fired() {
+    let Some(mut thread) = thread::current() else {
+        return;
+    };
+    let mut f = FIXTURE.lock();
+    f.interrupts += 1;
+    // SAFETY: the running thread is alive, and nothing else refers to it now.
+    let regs = unsafe { &mut thread.as_mut().regs };
+    if regs.elr == user_address(&raw const el0_wait_loop) as u64 {
+        regs.elr += 4;
+        f.left_loop = true;
+    } else {
+        timer::arm(timer::clock().deadline_after(timer::now(), 100_000));
+    }
 }
 
 /// Every entry from EL0 starts at the top of the kernel stack (spec 8.1),
@@ -264,21 +331,25 @@ fn user_address(symbol: *const u8) -> usize {
     TEXT_VA + (symbol as usize - &raw const el0_programs as usize)
 }
 
-/// A process with the programs at TEXT_VA and a data page at DATA_VA
-/// holding the pattern of slot `slot`, and in it a thread that starts at
-/// `entry` (a symbol in el0.S) with `arg` in x0 and the pattern's
-/// TPIDRRO_EL0. Both go into that slot of the fixture.
+/// A process with the programs at TEXT_VA and a thread in it, as
+/// `new_thread` makes it with the data page at DATA_VA. Both go into slot
+/// `slot` of the fixture.
 fn spawn(
     f: &mut Fixture,
     slot: usize,
     entry: *const u8,
     arg: u64,
 ) -> Result<NonNull<Thread>, &'static str> {
+    let p = new_process(f, slot)?;
+    new_thread(f, slot, p, DATA_VA, entry, arg)
+}
+
+/// A process with the programs at TEXT_VA, in slot `slot` of the fixture.
+fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'static str> {
     let mut p = process::create().map_err(|_| "no process")?;
     f.processes[slot] = Some(p);
     // SAFETY: the process was just created, and only this test uses it.
-    let process = unsafe { p.as_mut() };
-    let text = process
+    let text = unsafe { p.as_mut() }
         .map_frames(TEXT_VA, PAGE_SIZE, Attrs::USER_TEXT)
         .map_err(|_| "the programs did not map")?;
     let start = &raw const el0_programs as usize;
@@ -289,8 +360,24 @@ fn spawn(
     // one page, and reached through the linear map.
     unsafe { core::ptr::copy_nonoverlapping(start as *const u8, text_va as *mut u8, len) };
     cache::sync_icache(text_va, len);
-    let data = process
-        .map_frames(DATA_VA, PAGE_SIZE, Attrs::USER_DATA)
+    Ok(p)
+}
+
+/// A data page at `data_va` in process `p` holding the pattern of slot
+/// `slot`, and a thread of `p` in that slot of the fixture that starts at
+/// `entry` (a symbol in el0.S) with `arg` in x0, its stack at the end of
+/// the page and the pattern's TPIDRRO_EL0.
+fn new_thread(
+    f: &mut Fixture,
+    slot: usize,
+    mut p: NonNull<Process>,
+    data_va: usize,
+    entry: *const u8,
+    arg: u64,
+) -> Result<NonNull<Thread>, &'static str> {
+    // SAFETY: the process belongs to this test, and nothing else uses it.
+    let data = unsafe { p.as_mut() }
+        .map_frames(data_va, PAGE_SIZE, Attrs::USER_DATA)
         .map_err(|_| "the data page did not map")?;
     // SAFETY: the frame is new, one page, aligned for the pattern, and
     // reached through the linear map.
@@ -298,7 +385,7 @@ fn spawn(
     let t = thread::create(
         p,
         user_address(entry),
-        DATA_VA + PAGE,
+        data_va + PAGE,
         arg,
         PRIORITY,
         Policy::RoundRobin,
@@ -399,7 +486,17 @@ fn check_pattern(regs: &UserRegs, p: &Pattern, x0: u64) -> Result<(), &'static s
         "the thread left EL0t or masked an exception",
     )?;
     check(regs.tpidr == p.tpidr, "TPIDR_EL0 changed")?;
-    check(regs.tpidrro == p.tpidrro, "TPIDRRO_EL0 changed")
+    check(regs.tpidrro == p.tpidrro, "TPIDRRO_EL0 changed")?;
+    // The kernel never touches the FP and SIMD registers, so they still
+    // hold the running thread's.
+    let mut fp = FpRegs::ZERO;
+    user::save_fp(&mut fp);
+    if let Some(i) = (0..32).find(|&i| fp.v[i] != p.v[i]) {
+        kprintln!("v{i} is {:#x}, the pattern has {:#x}", fp.v[i], p.v[i]);
+        return Err("an FP or SIMD register changed");
+    }
+    check(fp.fpcr == p.fpcr, "FPCR changed")?;
+    check(fp.fpsr == p.fpsr, "FPSR changed")
 }
 
 fn start_counter(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
@@ -446,4 +543,77 @@ fn start_kernel_load(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
 
 fn done_kernel_load(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
     Err("a load from kernel memory at EL0 did not fault")
+}
+
+/// The timer fires 1 ms after the start, while the program loops at EL0.
+fn start_interrupt(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    f.patterns[0] = Pattern::new(1);
+    let t = spawn(f, 0, &raw const el0_pattern_loop, DATA_VA as u64)?;
+    timer::arm(timer::clock().deadline_after(timer::now(), 1_000_000));
+    Ok(t)
+}
+
+fn done_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        f.left_loop && f.interrupts >= 1,
+        "the thread left its loop without the timer interrupt",
+    )?;
+    check(
+        !gic::is_active(timer::INTID),
+        "the timer interrupt did not end at the GIC",
+    )?;
+    let p = &f.patterns[0];
+    check_pattern(&t.regs, p, p.x[0])
+}
+
+/// Two processes run the same program with different patterns; each yields
+/// to the other once, and each checks its registers when it runs again.
+fn start_switch(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    f.patterns = [Pattern::new(1), Pattern::new(2)];
+    let first = spawn(f, 0, &raw const el0_pattern_yield, DATA_VA as u64)?;
+    spawn(f, 1, &raw const el0_pattern_yield, DATA_VA as u64)?;
+    Ok(first)
+}
+
+fn done_switch(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check_pattern(&t.regs, &f.patterns[f.slot(t)], 0)
+}
+
+/// Two threads of one process run the same program, each with its own
+/// pattern in its own data page, and yield to each other once: the switch
+/// between them changes the FP and SIMD registers and leaves TTBR0 alone.
+fn start_switch_within(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    const SECOND: usize = DATA_VA + 2 * PAGE;
+    f.patterns = [Pattern::new(1), Pattern::new(2)];
+    f.patterns[1].sp += 2 * PAGE as u64;
+    let p = new_process(f, 0)?;
+    let first = new_thread(
+        f,
+        0,
+        p,
+        DATA_VA,
+        &raw const el0_pattern_yield,
+        DATA_VA as u64,
+    )?;
+    new_thread(f, 1, p, SECOND, &raw const el0_pattern_yield, SECOND as u64)?;
+    Ok(first)
+}
+
+/// Runs after the pattern tests: their threads are gone, and the last
+/// pattern is still in the FP and SIMD registers.
+fn start_clear_fp(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    spawn(f, 0, &raw const el0_done_at_once, 0)
+}
+
+fn done_clear_fp(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
+    let mut fp = FpRegs {
+        v: [u128::MAX; 32],
+        fpcr: u64::MAX,
+        fpsr: u64::MAX,
+    };
+    user::save_fp(&mut fp);
+    check(
+        fp.v.iter().all(|&v| v == 0) && fp.fpcr == 0 && fp.fpsr == 0,
+        "a new thread found the FP or SIMD values of another",
+    )
 }

@@ -18,6 +18,7 @@ pub mod user;
 core::arch::global_asm!(include_str!("head.S"), options(raw));
 core::arch::global_asm!(include_str!("vectors.S"), options(raw));
 core::arch::global_asm!(include_str!("mmu.S"), options(raw));
+core::arch::global_asm!(include_str!("fpsimd.S"), options(raw));
 
 /// True while an IRQ is pending at this CPU (ISR_EL1.I, bit 7), which it is
 /// also while PSTATE masks it: long kernel operations poll this between

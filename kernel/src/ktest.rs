@@ -1195,6 +1195,9 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
             && regs.spsr == SPSR_EL0T
             && regs.tpidr == 0
             && regs.tpidrro == 0
+            && started.fp.v.iter().all(|&v| v == 0)
+            && started.fp.fpcr == 0
+            && started.fp.fpsr == 0
             && started.priority == 10
             && started.policy == Policy::Fifo
             && started.process() == p,
