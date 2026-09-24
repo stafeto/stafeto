@@ -187,6 +187,7 @@ fn test() -> Result<(), String> {
     host_tests()?;
     boot_smoke()?;
     el2_boot_smoke()?;
+    two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     fault_report()?;
     kernel_tests()?;
@@ -216,6 +217,22 @@ fn el2_boot_smoke() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")
+}
+
+/// With 2 GiB of RAM the second GiB is not mapped at boot: the allocator
+/// must receive it after the kernel page tables map all RAM.
+fn two_gib_boot() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let mut cmd = qemu::command(&qemu::VIRT_2G, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    qemu::expect_clean_exit_with(&o, "boot complete")?;
+    let free =
+        qemu::number_after(&o.lines, "frames ").ok_or("the kernel printed no frames line")?;
+    if free < 1900 {
+        return Err(format!("only {free} MiB of frames free with 2 GiB of RAM"));
+    }
+    Ok(())
 }
 
 /// Booting the ELF leaves x0 = 0; the kernel must say why it stops.

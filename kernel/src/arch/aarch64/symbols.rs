@@ -30,3 +30,32 @@ pub fn boot_stack() -> core::ops::Range<usize> {
 pub fn image() -> core::ops::Range<usize> {
     symbol!("__image_start")..symbol!("__image_end")
 }
+
+/// Page-aligned boundaries of the kernel image (see kernel.ld).
+pub struct ImageLayout {
+    pub start: usize,
+    pub text_end: usize,
+    pub rodata_end: usize,
+    pub stack_guard: usize,
+    pub end: usize,
+}
+
+pub fn image_layout() -> ImageLayout {
+    ImageLayout {
+        start: symbol!("__image_start"),
+        text_end: symbol!("__text_end"),
+        rodata_end: symbol!("__rodata_end"),
+        stack_guard: symbol!("__stack_guard"),
+        end: symbol!("__image_end"),
+    }
+}
+
+/// head.S's identity-map root table (TTBR0 while the MMU is switched on).
+pub fn identity_table() -> usize {
+    symbol!("l0_identity")
+}
+
+/// An all-zero root table: TTBR0 while the kernel runs, TTBR1 for an instant.
+pub fn empty_table() -> usize {
+    symbol!("boot_empty_l0")
+}

@@ -7,4 +7,5 @@ fn main() {
     println!("cargo:rerun-if-changed=kernel.ld");
     println!("cargo:rerun-if-changed=src/arch/aarch64/head.S");
     println!("cargo:rerun-if-changed=src/arch/aarch64/vectors.S");
+    println!("cargo:rerun-if-changed=src/arch/aarch64/mmu.S");
 }

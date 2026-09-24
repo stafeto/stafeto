@@ -3,4 +3,5 @@
 
 //! The kernel's memory: physical frames, its page tables and object pages.
 
+pub mod kmap;
 pub mod phys;

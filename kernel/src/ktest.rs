@@ -4,12 +4,17 @@
 //! In-kernel tests for `cargo xtask test`. Each test prints one line in the
 //! format xtask parses; the run ends with a semihosting exit code.
 
+use crate::arch::symbols;
 use crate::arch::{exceptions, registers, semihosting};
 use crate::boot::Boot;
 use crate::mm::phys;
+use crate::mm::phys::LinearMem;
 use core::sync::atomic::Ordering;
 use kcore::bootinfo::{PsciConduit, Region};
-use kcore::layout::{GIB, KERNEL_VIRT, LINEAR_BASE};
+use kcore::frames::PhysMem;
+use kcore::layout::{KERNEL_VIRT, LINEAR_BASE};
+use kcore::memmap;
+use kcore::paging::{PXN, PageTable, TableMemory};
 
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
@@ -39,6 +44,21 @@ const TESTS: &[(&str, TestFn)] = &[
         "frames_are_aligned_distinct_and_usable",
         frames_are_aligned_distinct_and_usable,
     ),
+    (
+        "kernel_text_is_read_only_and_data_writable",
+        kernel_text_is_read_only_and_data_writable,
+    ),
+    (
+        "only_kernel_text_is_executable",
+        only_kernel_text_is_executable,
+    ),
+    ("stack_guard_page_is_unmapped", stack_guard_page_is_unmapped),
+    (
+        "physical_addresses_do_not_translate",
+        physical_addresses_do_not_translate,
+    ),
+    ("linear_map_covers_all_ram", linear_map_covers_all_ram),
+    ("console_is_device_memory", console_is_device_memory),
 ];
 
 pub fn run(boot: &Boot) -> ! {
@@ -88,11 +108,7 @@ fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
 
 fn boot_image_is_readable_through_linear_map(boot: &Boot) -> Result<(), &'static str> {
     let initrd = boot.info.initrd.ok_or("no boot image in /chosen")?;
-    check(
-        initrd.base / GIB == 1,
-        "boot image is outside the GiB mapped at boot",
-    )?;
-    // SAFETY: the boot image lies in the GiB at 0x4000_0000, mapped as RAM by head.S.
+    // SAFETY: the boot image is RAM, and the kernel page tables map all RAM.
     let head = unsafe {
         core::slice::from_raw_parts((LINEAR_BASE + initrd.base as usize) as *const u8, 8)
     };
@@ -174,5 +190,97 @@ fn frames_are_aligned_distinct_and_usable(_: &Boot) -> Result<(), &'static str> 
     check(
         frames.free_frames() == before,
         "free frame count did not come back",
+    )
+}
+
+/// Walks the live kernel tables through the linear map; never allocates.
+struct LiveTables;
+
+impl TableMemory for LiveTables {
+    fn alloc_table(&mut self) -> Option<u64> {
+        None
+    }
+    fn read(&self, pa: u64) -> u64 {
+        LinearMem.read(pa)
+    }
+    fn write(&mut self, _: u64, _: u64) {
+        panic!("the live-table walk writes nothing");
+    }
+}
+
+fn translates(par: u64) -> bool {
+    par & 1 == 0
+}
+
+fn kernel_tables() -> PageTable {
+    PageTable::from_root(registers::ttbr1_el1() & 0x0000_FFFF_FFFF_F000)
+}
+
+fn kernel_text_is_read_only_and_data_writable(_: &Boot) -> Result<(), &'static str> {
+    let text = kernel_text_is_read_only_and_data_writable as *const () as usize;
+    check(
+        translates(registers::at_s1e1r(text)),
+        "kernel text is not readable",
+    )?;
+    check(
+        !translates(registers::at_s1e1w(text)),
+        "kernel text is writable",
+    )?;
+    let data = &exceptions::LAST_BRK as *const _ as usize;
+    check(
+        translates(registers::at_s1e1w(data)),
+        "kernel data is not writable",
+    )
+}
+
+fn only_kernel_text_is_executable(_: &Boot) -> Result<(), &'static str> {
+    let layout = symbols::image_layout();
+    let pt = kernel_tables();
+    let desc = |va: usize| pt.translate(&LiveTables, va as u64).map(|(_, d)| d);
+    let text = desc(layout.start).ok_or("kernel text is unmapped")?;
+    let rodata = desc(layout.text_end).ok_or("kernel rodata is unmapped")?;
+    let data = desc(layout.rodata_end).ok_or("kernel data is unmapped")?;
+    check(text & PXN == 0, "kernel text is not executable")?;
+    check(rodata & PXN != 0, "kernel rodata is executable")?;
+    check(data & PXN != 0, "kernel data is executable")
+}
+
+fn stack_guard_page_is_unmapped(_: &Boot) -> Result<(), &'static str> {
+    let guard = symbols::image_layout().stack_guard;
+    check(
+        !translates(registers::at_s1e1r(guard)),
+        "the stack guard page is mapped",
+    )
+}
+
+fn physical_addresses_do_not_translate(boot: &Boot) -> Result<(), &'static str> {
+    check(
+        !translates(registers::at_s1e1r(boot.kernel_pa as usize)),
+        "the kernel's physical address still translates through TTBR0",
+    )
+}
+
+fn linear_map_covers_all_ram(boot: &Boot) -> Result<(), &'static str> {
+    let ram = memmap::usable::<32>(boot.info.memory.as_slice(), boot.info.no_map.as_slice())
+        .map_err(|_| "too many RAM regions")?;
+    for r in ram.as_slice() {
+        for pa in [r.base, r.end() - 4096] {
+            check(
+                translates(registers::at_s1e1r(LINEAR_BASE + pa as usize)),
+                "RAM is missing from the linear map",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn console_is_device_memory(boot: &Boot) -> Result<(), &'static str> {
+    let uart = boot.info.uart_pl011.ok_or("no PL011 in the device tree")?;
+    let (_, d) = kernel_tables()
+        .translate(&LiveTables, (LINEAR_BASE + uart.base as usize) as u64)
+        .ok_or("the PL011 is unmapped")?;
+    check(
+        (d >> 2) & 0b111 == 1,
+        "the PL011 is not mapped as device memory",
     )
 }

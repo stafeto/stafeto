@@ -16,12 +16,14 @@ pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monito
 pub struct Machine {
     pub machine: &'static str,
     pub cpu: &'static str,
+    pub memory: &'static str,
 }
 
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
 pub const VIRT: Machine = Machine {
     machine: "virt,gic-version=2",
     cpu: "cortex-a72",
+    memory: "512M",
 };
 
 /// The kernel is entered at EL2, as on the PinePhone's Cortex-A53; PSCI then
@@ -29,11 +31,19 @@ pub const VIRT: Machine = Machine {
 pub const VIRT_EL2: Machine = Machine {
     machine: "virt,gic-version=2,virtualization=on",
     cpu: "cortex-a53",
+    memory: "512M",
+};
+
+/// The spec machine with 2 GiB: RAM spans two GiBs.
+pub const VIRT_2G: Machine = Machine {
+    machine: "virt,gic-version=2",
+    cpu: "cortex-a72",
+    memory: "2G",
 };
 
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-machine", m.machine, "-cpu", m.cpu, "-m", "512M", "-kernel",
+        "-machine", m.machine, "-cpu", m.cpu, "-m", m.memory, "-kernel",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -196,6 +206,19 @@ pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     }
 }
 
+/// The first number on the first line that starts with `prefix`.
+pub fn number_after(lines: &[String], prefix: &str) -> Option<u64> {
+    let rest = lines
+        .iter()
+        .find_map(|l| l.find(prefix).map(|i| &l[i + prefix.len()..]))?;
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestReport {
     pub passed: Vec<String>,
@@ -287,6 +310,25 @@ mod tests {
                 .join(" ")
                 .contains("-initrd")
         );
+    }
+
+    #[test]
+    fn two_gib_machine_asks_for_2g() {
+        let joined = args(&VIRT_2G, Path::new("k.img"), None).join(" ");
+        assert!(joined.contains("-m 2G"));
+        assert!(joined.contains("-cpu cortex-a72"));
+    }
+
+    #[test]
+    fn number_after_reads_the_first_number() {
+        let l = lines(&["boot", "frames     1987 MiB free"]);
+        assert_eq!(number_after(&l, "frames "), Some(1987));
+    }
+
+    #[test]
+    fn number_after_needs_the_prefix_and_a_number() {
+        assert_eq!(number_after(&lines(&["boot"]), "frames "), None);
+        assert_eq!(number_after(&lines(&["frames none"]), "frames "), None);
     }
 
     #[test]

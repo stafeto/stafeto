@@ -226,6 +226,7 @@ l0_high:        .skip 4096
 l1_linear:      .skip 4096
 l1_image:       .skip 4096
 l2_image:       .skip 4096
+.global l0_identity, boot_empty_l0
 l0_identity:    .skip 4096
 l1_identity:    .skip 4096
 boot_empty_l0:  .skip 4096

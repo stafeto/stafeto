@@ -3,6 +3,7 @@
 
 pub mod backtrace;
 pub mod exceptions;
+pub mod mmu;
 #[cfg(feature = "fault-probe")]
 pub mod probe;
 pub mod registers;
@@ -12,3 +13,4 @@ pub mod symbols;
 
 core::arch::global_asm!(include_str!("head.S"), options(raw));
 core::arch::global_asm!(include_str!("vectors.S"), options(raw));
+core::arch::global_asm!(include_str!("mmu.S"), options(raw));

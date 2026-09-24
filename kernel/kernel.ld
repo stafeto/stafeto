@@ -22,11 +22,13 @@ SECTIONS
     }
 
     . = ALIGN(4096);
+    __text_end = .;
     .rodata : AT(ADDR(.rodata) - KOFF) {
         *(.rodata .rodata.*)
     }
 
     . = ALIGN(4096);
+    __rodata_end = .;
     .data : AT(ADDR(.data) - KOFF) {
         *(.data .data.*)
         *(.got .got.*)

@@ -85,3 +85,12 @@ pub fn init(boot: &Boot) -> RegionList<32> {
 pub fn free_frames() -> u64 {
     FRAMES.lock().as_ref().map_or(0, |f| f.free_frames())
 }
+
+/// Hands more RAM to the allocator.
+pub fn add(regions: &[Region]) {
+    let mut guard = FRAMES.lock();
+    let frames = guard.as_mut().expect("frame allocator");
+    for r in regions {
+        frames.add_region(r.base, r.end());
+    }
+}

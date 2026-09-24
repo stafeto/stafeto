@@ -27,7 +27,9 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
     psci::set_conduit(boot.info.psci);
-    let _rest = mm::phys::init(&boot); // RAM outside the GiBs mapped at boot
+    let rest = mm::phys::init(&boot);
+    mm::kmap::switch_to_kernel_tables(&boot);
+    mm::phys::add(rest.as_slice());
     report(&boot);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
