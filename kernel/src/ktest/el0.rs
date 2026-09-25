@@ -23,6 +23,7 @@ use crate::object::Object;
 use crate::process::{self, Process, Stage};
 use crate::syscall::{self, Values};
 use crate::thread::{self, Policy, Thread};
+use crate::timer::{self as timers, Timer};
 use crate::{sched, session};
 use abi::{
     Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, ProcessState,
@@ -75,6 +76,8 @@ unsafe extern "C" {
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
     static el0_raise_then_notify: u8;
+    static el0_pattern_receive: u8;
+    static el0_alarm_then: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -142,6 +145,10 @@ const BITS: u64 = 0b1010;
 const CROWD: usize = 2 * MAX_THREADS as usize;
 /// The ceiling of the waiters' process in `set_priority_moves_a_waiting_thread`.
 const CAPPED: u8 = PRIORITY + 3;
+/// Timers of `expired_timers_fire_in_batches` on one deadline: more than
+/// one interrupt takes (timers::BATCH), and more than one process pays for
+/// (abi::MAX_TIMERS).
+const BATCHED: usize = 100;
 
 struct El0Test {
     name: &'static str,
@@ -222,6 +229,11 @@ const EL0_TESTS: &[El0Test] = &[
         name: "idle_keeps_the_priority_mask_open",
         start: start_idle,
         done: done_idle_mask,
+    },
+    El0Test {
+        name: "registers_survive_a_wait_in_idle",
+        start: start_idle,
+        done: done_wait_in_idle,
     },
     El0Test {
         name: "fifo_thread_runs_with_the_timer_off",
@@ -334,6 +346,21 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_close_portions,
     },
     El0Test {
+        name: "quantum_ends_with_a_far_timer_set",
+        start: start_far_timer,
+        done: done_far_timer,
+    },
+    El0Test {
+        name: "timer_latency_is_counted",
+        start: start_timer_latency,
+        done: done_timer_latency,
+    },
+    El0Test {
+        name: "expired_timers_fire_in_batches",
+        start: start_batches,
+        done: done_batches,
+    },
+    El0Test {
         name: "cleanup_yields_to_a_pending_interrupt",
         start: start_cleanup,
         done: done_cleanup_yields,
@@ -422,10 +449,10 @@ struct Fixture {
     /// The physical address of the page whose words the threads of a
     /// scheduling test share (sched_process).
     data: u64,
-    /// The thread in slot 0 starts only at this counter value, from the
-    /// timer's interrupt (timer_fired).
-    wake: Option<u64>,
-    /// CNTV_CVAL_EL0 when that interrupt came.
+    /// The test's alarm, a timer of a program on the channel the thread in
+    /// slot 0 waits on (`alarm`); the teardown lets it go.
+    alarm: Option<NonNull<Timer>>,
+    /// CNTV_CVAL_EL0 when the first timer interrupt of the test came.
     fired_at: Option<u64>,
     /// Ticks asleep in `wfi` (sched::stats) when the test began.
     idle: u64,
@@ -434,15 +461,15 @@ struct Fixture {
     /// GICC_PMR in the idle wait.
     idle_mask: Option<u8>,
     /// Portions of cleanup since the test began, the one after which the
-    /// timer's interrupt comes and wakes the thread in slot 0, and how many
-    /// portions apart more interrupts come (portion_done).
+    /// alarm fires in the timer's interrupt and wakes the thread in slot 0,
+    /// and how many portions apart more interrupts come (portion_done).
     portions: u32,
     interrupt_after: Option<u32>,
     interrupt_every: Option<u32>,
     /// Free frames and the pages of kernel pools together when the test
     /// began: the same once what the test made gave back what it took.
     memory: u64,
-    /// Items in the cleanup queue when the wake-up came.
+    /// Items in the cleanup queue when the first timer interrupt came.
     queued_at_wake: Option<u64>,
     /// The counter before the thread started.
     counter: u64,
@@ -474,6 +501,8 @@ struct Fixture {
     crowd: [Option<NonNull<Thread>>; CROWD],
     /// Threads in their pools (thread::in_use) once the test was built.
     live_threads: usize,
+    /// Timers the test holds besides its alarm; the teardown lets them go.
+    timers: [Option<NonNull<Timer>>; BATCHED],
 }
 
 // SAFETY: the fixture's objects are reached only under the kernel's rules
@@ -491,7 +520,7 @@ impl Fixture {
             patterns: [Pattern::ZERO; SLOTS],
             handles: [None; SLOTS],
             data: 0,
-            wake: None,
+            alarm: None,
             fired_at: None,
             idle: 0,
             idle_depth: None,
@@ -513,6 +542,7 @@ impl Fixture {
             unheld: None,
             crowd: [None; CROWD],
             live_threads: 0,
+            timers: [None; BATCHED],
         }
     }
 
@@ -539,21 +569,21 @@ pub fn count() -> usize {
 }
 
 /// Starts the tests from `first` on: the scheduler starts each test's
-/// threads, but the one that waits for its wake-up, and runs them. A test
-/// that cannot start fails, and the next one starts. Each test finds the
-/// cleanup queue empty. After the last test the pools hold no process and
-/// no thread: the kernel's references and the tests' own went.
+/// threads and runs them. A test that cannot start fails, and the next one
+/// starts. Each test finds the cleanup queue empty. After the last test the
+/// pools hold no process, thread, channel, session or timer: the kernel's
+/// references and the tests' own went.
 fn start(first: usize) -> ! {
     for (i, test) in tests().enumerate().skip(first) {
         cleanup::drain();
         let started = {
             let mut f = FIXTURE.lock();
             *f = Fixture::new(i);
-            (test.start)(&mut f).map(|()| (f.threads, f.wake.is_some()))
+            (test.start)(&mut f).map(|()| f.threads)
         };
         match started {
-            Ok((threads, wake)) => {
-                for t in threads.into_iter().skip(usize::from(wake)).flatten() {
+            Ok(threads) => {
+                for t in threads.into_iter().flatten() {
                     thread::start(t).expect("a new thread starts");
                 }
                 sched::resume()
@@ -571,8 +601,9 @@ fn start(first: usize) -> ! {
             process::in_use() == 0
                 && thread::in_use() == 0
                 && channel::in_use() == 0
-                && session::in_use() == 0,
-            "a process, a thread, a channel or a session of the EL0 tests stayed in its pool",
+                && session::in_use() == 0
+                && timers::in_use() == 0,
+            "a process, a thread, a channel, a session or a timer of the EL0 tests stayed in its pool",
         ),
     );
     finish()
@@ -586,18 +617,25 @@ fn end(result: Result<(), &'static str>) -> ! {
     start(i + 1)
 }
 
-/// Drops what the test built. The timer stays the scheduler's: the next
-/// decision arms it for the next test.
+/// Drops what the test built. The kernel's timer stays the scheduler's:
+/// the next decision arms it for the next test. A timer that goes leaves
+/// the heap with its portion.
 fn teardown() {
-    let (handles, threads, crowd, processes) = {
+    let (handles, threads, crowd, alarm, timers, processes) = {
         let mut f = FIXTURE.lock();
         (
             core::mem::take(&mut f.handles),
             core::mem::take(&mut f.threads),
             core::mem::replace(&mut f.crowd, [None; CROWD]),
+            f.alarm.take(),
+            core::mem::replace(&mut f.timers, [None; BATCHED]),
             core::mem::take(&mut f.processes),
         )
     };
+    for t in timers.into_iter().chain([alarm]).flatten() {
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { timers::release(t, CAUSE) };
+    }
     for (p, h) in handles.into_iter().flatten() {
         // A handle the test closed itself is bad by now, which is fine.
         let _ = process::close_handle(p, h, CAUSE);
@@ -628,12 +666,13 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
     true
 }
 
-/// The timer's interrupt, after the scheduler's part (interrupt::handle).
-/// In the interrupt test the thread waits for it in a loop, and the kernel
-/// moves the thread past the loop; one that comes before the thread
-/// reaches the loop leaves it be, and the next quantum brings another. At
-/// the running test's wake-up the thread in slot 0 starts. The first
-/// interrupt ends the process of `exit_at_interrupt`.
+/// The timer's interrupt, after the scheduler's part, which fired the
+/// expired timers of programs (interrupt::handle). In the interrupt test
+/// the thread waits for it in a loop, and the kernel moves the thread past
+/// the loop; one that comes before the thread reaches the loop leaves it
+/// be, and the next quantum brings another. The first interrupt of a test
+/// leaves its compare value and the length of the cleanup queue for the
+/// judges, and ends the process of `exit_at_interrupt`.
 pub fn timer_fired() {
     let exit = {
         let mut f = FIXTURE.lock();
@@ -648,36 +687,20 @@ pub fn timer_fired() {
         // SAFETY: the test holds a reference to the process.
         unsafe { process::end(p, exited, cause) };
     }
-    let wake = {
-        let mut f = FIXTURE.lock();
-        f.interrupts += 1;
-        if let Some(mut thread) = thread::current() {
-            // SAFETY: the thread is alive, and nothing else refers to it now.
-            let regs = unsafe { &mut thread.as_mut().regs };
-            if regs.elr == user_address(&raw const el0_wait_loop) as u64 {
-                regs.elr += 4;
-                f.left_loop = true;
-            }
+    let mut f = FIXTURE.lock();
+    f.interrupts += 1;
+    if let Some(mut thread) = thread::current() {
+        // SAFETY: the thread is alive, and nothing else refers to it now.
+        let regs = unsafe { &mut thread.as_mut().regs };
+        if regs.elr == user_address(&raw const el0_wait_loop) as u64 {
+            regs.elr += 4;
+            f.left_loop = true;
         }
-        match f.wake {
-            Some(at) if timer::now() >= at => {
-                f.wake = None;
-                f.fired_at = Some(timer::cval());
-                f.queued_at_wake = Some(cleanup::len());
-                f.threads[0]
-            }
-            _ => None,
-        }
-    };
-    if let Some(t) = wake {
-        thread::start(t).expect("the waking thread starts");
     }
-}
-
-/// The running test's wake-up, which the scheduler's timer serves as well
-/// (sched::decide).
-pub fn deadline() -> Option<u64> {
-    FIXTURE.lock().wake
+    if f.fired_at.is_none() {
+        f.fired_at = Some(timer::cval());
+        f.queued_at_wake = Some(cleanup::len());
+    }
 }
 
 /// Every entry from EL0 starts at the top of the kernel stack (spec 8.1),
@@ -709,12 +732,13 @@ pub fn note_idle_stack() {
 }
 
 /// After each portion of cleanup (cleanup::portion): in the cleanup tests,
-/// portion `interrupt_after` arms the timer for now and waits until its
-/// interrupt is pending, so the way out of the kernel finds it at the
-/// next poll; the interrupt starts the thread in slot 0 (`wake`). Every
-/// `interrupt_every` portions another interrupt comes the same way.
+/// portion `interrupt_after` fires the test's alarm in timer_set, which
+/// wakes the thread in slot 0, then arms the kernel's timer for now and
+/// waits until its interrupt is pending, so the way out of the kernel
+/// finds it at the next poll. Every `interrupt_every` portions another
+/// interrupt comes the same way, with no alarm.
 pub fn portion_done() {
-    let now = {
+    let (alarm, now) = {
         let mut f = FIXTURE.lock();
         f.portions += 1;
         let first = f.interrupt_after == Some(f.portions);
@@ -724,13 +748,15 @@ pub fn portion_done() {
         if !first && !again {
             return;
         }
-        let now = timer::now();
         if first {
             f.interrupt_after = None;
-            f.wake = Some(now);
         }
-        now
+        (f.alarm.filter(|_| first), timer::now())
     };
+    if let Some(t) = alarm {
+        // A deadline that passed fires in the call (spec 10).
+        timers::set(t, 0, CAUSE).expect("the alarm's channel is open");
+    }
     timer::arm(now);
     while !arch::irq_pending() {}
 }
@@ -1334,24 +1360,70 @@ fn give_kept(f: &mut Fixture, object: Object) -> Result<u64, &'static str> {
     Ok(h.0)
 }
 
-/// The thread in slot 0 starts 1 ms from now, when the timer's interrupt
-/// comes; nothing else is ready meanwhile, so the kernel idles.
+/// The test's alarm (spec 10): a channel of `p`, which a handle of `p`
+/// with RECEIVE holds, and a timer on it at PRIORITY that `p` pays for,
+/// armed for the counter value `at` when there is one. Returns the
+/// handle's value, for the thread that waits on the channel.
+fn alarm(f: &mut Fixture, p: NonNull<Process>, at: Option<u64>) -> Result<u64, &'static str> {
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    let t = timers::create(p, c, 0, PRIORITY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel, and so does the timer.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let t = t.map_err(|_| "no timer")?;
+    f.alarm = Some(t);
+    if let Some(at) = at {
+        timers::set(t, at, CAUSE).map_err(|_| "the alarm did not arm")?;
+    }
+    h
+}
+
+/// x1-x11 of a receive that took one expiry of a timer made through a
+/// handle with no label.
+fn timer_notice() -> [u64; 11] {
+    Notification {
+        source: Source::Timer,
+        label: 0,
+        bits: 1,
+        count: 1,
+    }
+    .to_words()
+}
+
+/// The thread in slot 0 fills its registers from a pattern and waits in
+/// receive on the test's alarm, armed 1 ms from now; nothing else is ready
+/// meanwhile, so the kernel idles until the alarm's interrupt.
 fn start_idle(f: &mut Fixture) -> Result<(), &'static str> {
-    spawn(f, 0, &raw const el0_read_counter, 0)?;
-    f.idle = sched::stats().idle;
+    let p = new_process(f, 0)?;
     f.counter = timer::clock().deadline_after(timer::now(), 1_000_000);
-    f.wake = Some(f.counter);
+    let h = alarm(f, p, Some(f.counter))?;
+    call_pattern(f, &[h, 0]);
+    new_thread(
+        f,
+        0,
+        p,
+        DATA_VA,
+        &raw const el0_pattern_receive,
+        DATA_VA as u64,
+    )?;
+    f.idle = sched::stats().idle;
+    sched::reset_latencies();
     Ok(())
 }
 
 fn done_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         f.fired_at == Some(f.counter),
-        "the idle kernel did not arm the timer for the deadline",
+        "the idle kernel did not arm the timer for the alarm",
     )?;
     check(
-        t.regs.x[0] >= f.counter,
-        "the thread ran before its deadline",
+        t.regs.x[0] == 0 && t.regs.x[1..12] == timer_notice(),
+        "the thread did not wake with the alarm's notification",
+    )?;
+    check(
+        timer::now() >= f.counter,
+        "the judge ran before the alarm's deadline",
     )?;
     check(
         sched::stats().idle > f.idle,
@@ -1374,6 +1446,15 @@ fn done_idle_mask(f: &Fixture, _: &Thread) -> Result<(), &'static str> {
         f.idle_mask == Some(PRIORITY_MASK),
         "the idle wait changed GICC_PMR",
     )
+}
+
+/// A wait in receive through the idle kernel changes x0-x11 alone (spec
+/// 11): x0 0 and the alarm's notification in x1-x11, and every other
+/// register, FP and SIMD ones too, as the pattern left it.
+fn done_wait_in_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let mut results = [0; 12];
+    results[1..].copy_from_slice(&timer_notice());
+    check_pattern(&t.regs, &f.patterns[0], &results)
 }
 
 /// A FIFO thread spins for two quanta and yields: no timer interrupt comes,
@@ -1983,23 +2064,25 @@ fn done_orphan(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 // the only handles to its CHILD_THREADS stopped threads: each thread's
 // last reference goes, and each takes one portion of cleanup at the
 // killer's level. After INTERRUPT_AFTER portions the timer's interrupt
-// comes (portion_done) and starts the thread in slot 0 above the killer;
-// the judge in slot 2 is below both.
+// comes (portion_done) and fires the test's alarm, which wakes the thread
+// in slot 0 above the killer from its receive; the judge in slot 2 is
+// below both.
 
 /// The cleanup tests' threads and child.
 fn start_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
     killer_and_child(f, child_with_threads)
 }
 
-/// The threads of a test that kills the child `make` makes: the waking
-/// thread in slot 0, the killer in slot 1 with a handle to the child, the
-/// judge in slot 2. The interrupt comes after INTERRUPT_AFTER portions.
+/// The threads of a test that kills the child `make` makes: the thread in
+/// slot 0 that waits for the alarm, the killer in slot 1 with a handle to
+/// the child, the judge in slot 2. The interrupt comes after
+/// INTERRUPT_AFTER portions.
 fn killer_and_child(
     f: &mut Fixture,
     make: fn() -> Result<NonNull<Process>, &'static str>,
 ) -> Result<(), &'static str> {
     sched_process(f)?;
-    sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY + 10, FIFO)?;
+    waiting_for_the_alarm(f)?;
     let killer = sched_thread(f, 1, &raw const el0_kill, PRIORITY, FIFO)?;
     sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
     f.memory = phys::free_frames() + pages::taken() as u64;
@@ -2009,10 +2092,18 @@ fn killer_and_child(
     // the child.
     unsafe { process::release(child, CAUSE) };
     set_args(killer, &[h?]);
-    // Slot 0 waits for the interrupt, which no deadline brings.
-    f.wake = Some(u64::MAX);
     f.interrupt_after = Some(INTERRUPT_AFTER);
     cleanup::take_late();
+    Ok(())
+}
+
+/// The thread in slot 0 of the test's process, above the others, which
+/// waits in receive for the test's alarm, not armed yet.
+fn waiting_for_the_alarm(f: &mut Fixture) -> Result<(), &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let h = alarm(f, p, None)?;
+    let waiter = sched_thread(f, 0, &raw const el0_receive, PRIORITY + 10, FIFO)?;
+    set_args(waiter, &[h, 0]);
     Ok(())
 }
 
@@ -2098,12 +2189,13 @@ fn start_exit_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
     child_ends_itself(f, user_address(&raw const el0_info_then_exit))
 }
 
-/// The waking thread in slot 0 and the judge in slot 2, as for the kill;
-/// in slot 1 the child with the programs and CHILD_THREADS stopped
-/// threads, and its thread that starts at `entry` and ends it.
+/// The thread that waits for the alarm in slot 0 and the judge in slot 2,
+/// as for the kill; in slot 1 the child with the programs and
+/// CHILD_THREADS stopped threads, and its thread that starts at `entry`
+/// and ends it.
 fn child_ends_itself(f: &mut Fixture, entry: usize) -> Result<(), &'static str> {
     sched_process(f)?;
-    sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY + 10, FIFO)?;
+    waiting_for_the_alarm(f)?;
     sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
     let child = new_process(f, 1)?;
     give_threads(child)?;
@@ -2111,8 +2203,6 @@ fn child_ends_itself(f: &mut Fixture, entry: usize) -> Result<(), &'static str> 
         .map_err(|_| "no thread in the child")?;
     f.threads[1] = Some(t);
     f.ends[1] = true;
-    // Slot 0 waits for the interrupt, which no deadline brings.
-    f.wake = Some(u64::MAX);
     f.interrupt_after = Some(INTERRUPT_AFTER);
     cleanup::take_late();
     Ok(())
@@ -2228,14 +2318,17 @@ fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// kernel ends C as process_exit from that thread would, with its
 /// priority as the cause. The stage Stop runs at C's ceiling and stops the
 /// grandchild's thread before it runs again: its count stays until the
-/// judge in slot 0 wakes above it three quanta after the start, and by
-/// then the teardown of both went to its end at the level of the cause,
-/// and the exit notification of C, which its parent's channel hears of at
-/// that level (spec 7.9), waits for the judge's receive.
+/// judge in slot 0 wakes above it three quanta after the start, at its
+/// alarm, and by then the teardown of both went to its end at the level of
+/// the cause, and the exit notification of C, which its parent's channel
+/// hears of at that level (spec 7.9), waits for the judge's receive.
 fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
-    let judge = spawn(f, 0, &raw const el0_receive, 0)?;
+    let judge = spawn(f, 0, &raw const el0_alarm_then, 0)?;
     sched::set_priority(judge, PRIORITY + 10, FIFO).map_err(|_| "no judge")?;
     let parent = f.processes[0].expect("the judge's process");
+    let quanta = 3 * abi::RR_QUANTUM_NS;
+    let wake = timer::clock().deadline_after(timer::now(), quanta);
+    let a = alarm(f, parent, Some(wake))?;
     let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
     let h = give(parent, Object::Channel(c), Rights::RECEIVE);
     let child = process::create_child(parent, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING);
@@ -2247,7 +2340,8 @@ fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the channel, and so does the child's exit.
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
-    set_args(judge, &[h?, NO_WAIT]);
+    let receive = user_address(&raw const el0_receive) as u64;
+    set_args(judge, &[a, 0, receive, h?, NO_WAIT]);
     let child = heard.map_err(|_| "no child")?;
     f.processes[2] = Some(child);
     let low = PRIORITY - 5;
@@ -2265,8 +2359,6 @@ fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
     sched::set_priority(counter, PRIORITY + 2, RR).map_err(|_| "no counter")?;
     f.ends[1] = true;
     f.exit_at_interrupt = Some((child, low));
-    let quanta = 3 * abi::RR_QUANTUM_NS;
-    f.wake = Some(timer::clock().deadline_after(timer::now(), quanta));
     Ok(())
 }
 
@@ -2280,6 +2372,7 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         f.slot(t) == 0,
         "the grandchild's thread ran to its end after its parent ended",
     )?;
+    check(t.regs.x[23] == 0, "the judge did not wake at its alarm")?;
     check(
         t.regs.x[0] == 0 && t.regs.x[1..12] == exit_notice(EXIT_LABEL),
         "the child's exit notification did not wait in its parent's channel",
@@ -2305,14 +2398,17 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-/// The killer in slot 0, woken 1 ms after the start, kills its child C;
-/// C's child, the grandchild in slot 1, has a thread below the killer that
-/// counts meanwhile. The end of C ends the grandchild and stops its thread
-/// (spec 4), and the teardown of both runs at the killer's level, before
-/// the kill returns. Each child's quota comes off its parent's.
+/// The killer in slot 0, woken by its alarm 1 ms after the start, kills
+/// its child C; C's child, the grandchild in slot 1, has a thread below
+/// the killer that counts meanwhile. The end of C ends the grandchild and
+/// stops its thread (spec 4), and the teardown of both runs at the
+/// killer's level, before the kill returns. Each child's quota comes off
+/// its parent's.
 fn start_grandchild(f: &mut Fixture) -> Result<(), &'static str> {
-    let killer = spawn(f, 0, &raw const el0_kill, 0)?;
+    let killer = spawn(f, 0, &raw const el0_alarm_then, 0)?;
     let killers = f.processes[0].expect("the killer's process");
+    let wake = timer::clock().deadline_after(timer::now(), 1_000_000);
+    let a = alarm(f, killers, Some(wake))?;
     let child = process::create_child(killers, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING)
         .map_err(|_| "no child")?;
     let h = give_kept(f, Object::Process(child));
@@ -2328,14 +2424,17 @@ fn start_grandchild(f: &mut Fixture) -> Result<(), &'static str> {
     let counter = counter?;
     set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
     sched::set_priority(counter, PRIORITY - 2, FIFO).map_err(|_| "no counter")?;
-    set_args(killer, &[h?]);
+    let kill = user_address(&raw const el0_kill) as u64;
+    set_args(killer, &[a, 0, kill, h?]);
     f.ends[1] = true;
-    f.wake = Some(timer::clock().deadline_after(timer::now(), 1_000_000));
     Ok(())
 }
 
 fn done_grandchild(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(t.regs.x[0] == 0, "process_kill failed")?;
+    check(
+        t.regs.x[23] == 0 && t.regs.x[0] == 0,
+        "the killer's alarm or process_kill failed",
+    )?;
     check(
         state(f, 1) == ProcessState::Killed,
         "the grandchild outlived its parent",
@@ -2647,5 +2746,155 @@ fn done_close_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         !cleanup::take_late() && f.interrupts >= 2,
         "a portion began while an interrupt was pending",
+    )
+}
+
+// Timers of programs (spec 10): the kernel's timer serves the nearer of
+// the end of a quantum and the earliest timer of a program, and its
+// interrupt fires the timers that expired.
+
+/// A round-robin thread alone at its level spins for three quanta while a
+/// timer of a program is armed a second away: the kernel's timer serves
+/// the end of the quantum, the nearer deadline (spec 8), so a quantum ends
+/// on the way; the timer stays armed. The FIFO thread below never runs
+/// meanwhile.
+fn start_far_timer(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spin = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, RR)?;
+    let low = sched_thread(f, 1, &raw const el0_mark, PRIORITY - 5, FIFO)?;
+    set_args(spin, &[word(0), 3 * quantum()]);
+    set_args(low, &[word(0)]);
+    let p = f.processes[0].expect("the test's process");
+    f.counter = timer::clock().deadline_after(timer::now(), 1_000_000_000);
+    alarm(f, p, Some(f.counter))?;
+    Ok(())
+}
+
+fn done_far_timer(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 0 {
+        return Ok(());
+    }
+    check(
+        f.interrupts >= 1,
+        "no quantum ended while a far timer was armed",
+    )?;
+    check(
+        t.regs.x[3] == 0,
+        "the end of a quantum let a lower thread run",
+    )?;
+    check(
+        f.alarm.and_then(timers::deadline) == Some(f.counter),
+        "the far timer did not stay armed",
+    )
+}
+
+/// A thread waits in receive for the test's alarm, 1 ms from the start,
+/// while a round-robin thread below it spins at EL0 for 2 ms, within its
+/// quantum: the kernel's timer serves the alarm, the nearer deadline
+/// (spec 8), and its interrupt comes while a program runs. The thread it
+/// wakes runs before the spinner ends, and the time from the alarm's
+/// deadline to it counts, from nothing at the start, as the latency of an
+/// interrupt outside idle (spec 16).
+fn start_timer_latency(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spin = sched_thread(f, 1, &raw const el0_spin_then_yield, PRIORITY, RR)?;
+    let clock = timer::clock();
+    set_args(spin, &[word(0), clock.ns_to_ticks(2_000_000)]);
+    let p = f.processes[0].expect("the test's process");
+    let at = clock.deadline_after(timer::now(), 1_000_000);
+    let h = alarm(f, p, Some(at))?;
+    let waiter = sched_thread(f, 0, &raw const el0_receive, PRIORITY + 10, FIFO)?;
+    set_args(waiter, &[h, 0]);
+    sched::reset_latencies();
+    Ok(())
+}
+
+fn done_timer_latency(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 0 {
+        return Ok(());
+    }
+    check(
+        t.regs.x[0] == 0 && t.regs.x[1..12] == timer_notice(),
+        "the thread did not wake with the alarm's notification",
+    )?;
+    check(!f.passed[1], "the alarm waited for the round-robin spinner")?;
+    check(
+        sched::stats().irq_latency > 0,
+        "the latency from a timer of a program to the thread it woke was not counted",
+    )
+}
+
+/// BATCHED timers of programs on one channel, which two processes pay for,
+/// all for one deadline 1 ms from the start, while a FIFO thread in slot 1
+/// spins at EL0 for 2 ms. The first interrupt fires timers::BATCH of them
+/// and ends the process in slot 0 at the spinner's level, whose teardown
+/// comes before the spinner (spec 7.7); the rest waits in the heap, and the
+/// next decision arms the kernel's timer for the deadline already past, so
+/// the second interrupt fires the rest before any portion of that
+/// teardown begins (spec 10). The judge in slot 2 finds every timer's slot
+/// queued in the channel, two interrupts, no portion begun with one
+/// pending, and the batch measured for KSTATS.
+fn start_batches(f: &mut Fixture) -> Result<(), &'static str> {
+    let victim = new_process(f, 0)?;
+    let own = new_process(f, 1)?;
+    let spin = new_thread(
+        f,
+        1,
+        own,
+        DATA_VA,
+        &raw const el0_spin_then_yield,
+        DATA_VA as u64,
+    )?;
+    set_args(
+        spin,
+        &[DATA_VA as u64, timer::clock().ns_to_ticks(2_000_000)],
+    );
+    judge(f, 2)?;
+    let payers = [own, f.processes[2].expect("the judge's process")];
+    let c = channel::create(own, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(own, Object::Channel(c), Rights::RECEIVE);
+    let made = (0..BATCHED).try_for_each(|i| {
+        f.timers[i] = Some(timers::create(payers[i % 2], c, 0, PRIORITY)?);
+        Ok(())
+    });
+    // The deadline comes once every timer is made, so that it is still
+    // ahead when the last one is armed.
+    let at = timer::clock().deadline_after(timer::now(), 1_000_000);
+    let made = made.and_then(|()| {
+        f.timers
+            .iter()
+            .flatten()
+            .try_for_each(|&t| timers::set(t, at, CAUSE))
+    });
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel, and so do the timers.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    h?;
+    made.map_err(|_| "a timer was not made or armed")?;
+    f.exit_at_interrupt = Some((victim, PRIORITY));
+    cleanup::take_late();
+    timers::reset_longest_batch();
+    Ok(())
+}
+
+fn done_batches(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 2 {
+        return Ok(());
+    }
+    check(
+        f.timers.iter().flatten().all(|&t| timers::posted(t)),
+        "an expired timer did not post into its slot",
+    )?;
+    check(
+        f.interrupts == 2,
+        "the expired timers did not take two interrupts, a batch and the rest",
+    )?;
+    check(
+        !cleanup::take_late(),
+        "a portion began while the rest of the timers waited for their interrupt",
+    )?;
+    check(
+        timers::longest_batch() > 0,
+        "the batch of expired timers was not measured",
     )
 }

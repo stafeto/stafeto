@@ -30,8 +30,21 @@ hello from EL0 and its two threads taking turns. Part 1.3a (teardown and
 quotas) is done: kernel objects go through a cleanup queue in chunks with
 interrupt polling, processes form a tree, and a process's death terminates
 its descendants; each process's kernel memory is charged against its quota
-and returned to the parent precisely. Next is part 1.3b: channels,
-sessions, notifications, and program timers.
+and returned to the parent precisely.
+
+Part 1.3b (channels, sessions, notifications, and timers) is done. A
+channel takes notifications that merge their bits and count them, each
+source in a slot of its own at its own priority, and a receiver works at
+the priority of what it took, under its process's ceiling. A label on a
+copy of a channel handle makes a session, which posts `CLIENT_GONE` when
+its last copy goes. A parent hears of a child's end through the child's
+exit channel once the child gave its quota back, and a start channel moves
+into the child. Timers of programs stand in one heap for the whole system
+and bound a wait in `receive`; the kernel's timer serves the nearer of the
+end of a quantum and the earliest timer, and its interrupt fires at most 64
+timers at once. The kernel objects of a process lie in pools its quota pays
+for by the page, and a dying tree stops above its cause before it is taken
+apart. The next part, 1.3c, brings requests and replies.
 
 ## Build and run
 

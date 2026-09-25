@@ -8,6 +8,7 @@
 //! from EL0 are in `el0`.
 
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
+use crate::arch::timer;
 use crate::boot::Boot;
 use crate::channel::{self, Channel};
 use crate::cleanup;
@@ -16,6 +17,7 @@ use crate::object::Object;
 use crate::process::{self, Process};
 use crate::session::{self, Session};
 use crate::thread::{self, Policy, Thread};
+use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
     CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
@@ -300,6 +302,7 @@ fn info_kinds_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
+        longest_batch: crate::timer::longest_batch(),
     };
     check(
         counted.longest_portion > 0 && counted.free_frames > 0 && counted.pool_pages > 0,
@@ -1888,4 +1891,243 @@ pub fn notices_to_a_dying_parent_go_with_its_channel(_: &Boot) -> Result<(), &'s
         process::in_use() == processes && channel::in_use() == channels,
         "the child, the parent or the channel stayed",
     )
+}
+
+/// x1-x9 of a receive that took `count` expiries of a timer made through
+/// a handle with no label.
+fn timer_notice(count: u32) -> [u64; 9] {
+    let n = Notification {
+        source: Source::Timer,
+        label: 0,
+        bits: 1,
+        count,
+    };
+    n.to_words()[..9].try_into().expect("x1-x9")
+}
+
+/// The timer behind the caller's handle `h`.
+fn timer_of(c: &Caller, h: Handle) -> Result<NonNull<Timer>, &'static str> {
+    // SAFETY: the caller's process is the test's.
+    unsafe { c.process.as_ref() }
+        .lookup(h, Rights::NONE, Object::timer)
+        .map_err(|_| "the handle does not name a timer")
+}
+
+/// A second from now in nanoseconds on the scale of clock_now.
+fn a_second_away() -> u64 {
+    timer::clock().ticks_to_ns(timer::now()) + 1_000_000_000
+}
+
+/// Runs `body` with a channel of the caller at 10, a timer on it at 10 and
+/// the caller's handles to both; closes the handles afterwards.
+fn with_timer(
+    c: &Caller,
+    body: impl FnOnce(Handle, Handle, NonNull<Timer>) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let t = c.created(Call::TimerCreate.number(), &[h.0, 10]);
+    let result = t.and_then(|t| {
+        let result = timer_of(c, t).and_then(|tm| body(h, t, tm));
+        // A test may have closed it already.
+        let _ = process::close_handle(c.process, t, CAUSE);
+        result
+    });
+    let _ = process::close_handle(c.process, h, CAUSE);
+    result
+}
+
+/// timer_create, timer_set, timer_cancel and clock_now check in the order
+/// of spec 11 and change x0 alone on an error: the priority first (outside
+/// 1-63), then the handle (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without
+/// RECEIVE or MANAGE), then the ceiling (a priority above the caller's
+/// 30), then the caller's table (LIMIT_REACHED) and its quota for a page
+/// of its pool of timers (NO_MEMORY), with nothing made. A good
+/// timer_create returns a handle with abi::OWNER_RIGHTS to a timer the
+/// caller pays for, not armed; timer_set and timer_cancel return nothing,
+/// and cancelling a timer that is not armed is no error. timer_set on a
+/// closed channel fails with PEER_CLOSED and leaves the timer armed as it
+/// was. clock_now returns the counter in nanoseconds in x1 alone.
+pub fn timer_calls_check_their_arguments(_: &Boot) -> Result<(), &'static str> {
+    let timers = timers::in_use();
+    let c = Caller::with_ceiling(30)?;
+    let result = timer_create_cases(&c).and_then(|()| clock_now_case(&c));
+    c.release();
+    result?;
+    check(
+        timers::in_use() == timers,
+        "a timer of the test stayed in its pool",
+    )
+}
+
+fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::TimerCreate.number();
+    let resource = c.insert(Object::Resource, Rights::NONE)?;
+    let closed = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(closed)?;
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let result = channel_of(c, h).and_then(|ch| {
+        let notify_only = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
+        for priority in [0, 64, 0x100 | 10] {
+            c.fails(n, &[closed.0, priority], Error::InvalidArgs)?;
+        }
+        c.fails(n, &[closed.0, 10], Error::BadHandle)?;
+        c.fails(n, &[resource.0, 10], Error::WrongType)?;
+        c.fails(n, &[notify_only.0, 10], Error::AccessDenied)?;
+        c.fails(n, &[h.0, 31], Error::AccessDenied)?;
+        let timers = timers::in_use();
+        with_used_quota(c, || {
+            c.fails(n, &[h.0, 30], Error::NoMemory)?;
+            with_full_table(c, n, &[h.0, 30])
+        })?;
+        cleanup::drain();
+        check(
+            timers::in_use() == timers,
+            "a timer that did not fit stayed",
+        )?;
+        let t = c.created(n, &[h.0, 30])?;
+        let result = timer_set_cases(c, [h, t, notify_only, resource, closed]);
+        c.close(t)?;
+        c.close(notify_only)?;
+        result
+    });
+    // The case of the closed channel closed it already.
+    let _ = process::close_handle(c.process, h, CAUSE);
+    c.close(resource)?;
+    result
+}
+
+fn timer_set_cases(c: &Caller, handles: [Handle; 5]) -> Result<(), &'static str> {
+    let [h, t, notify_only, resource, closed] = handles;
+    let (set, cancel) = (Call::TimerSet.number(), Call::TimerCancel.number());
+    let tm = timer_of(c, t)?;
+    // SAFETY: the caller's process is the test's.
+    let rights = unsafe { c.process.as_ref() }.lookup(t, OWNER_RIGHTS, Object::timer);
+    check(
+        rights.is_ok() && timers::payer(tm) == c.process && timers::deadline(tm).is_none(),
+        "the handle does not carry the owner's rights, the caller does not pay, or the timer is armed",
+    )?;
+    let seen = c.insert(Object::Timer(tm), Rights::DUPLICATE)?;
+    for (n, args) in [(set, &[closed.0, 0][..]), (cancel, &[closed.0][..])] {
+        c.fails(n, args, Error::BadHandle)?;
+    }
+    c.fails(set, &[resource.0, 0], Error::WrongType)?;
+    c.fails(cancel, &[h.0], Error::WrongType)?;
+    c.fails(set, &[seen.0, 0], Error::AccessDenied)?;
+    c.fails(cancel, &[seen.0], Error::AccessDenied)?;
+    c.close(seen)?;
+    let far = a_second_away();
+    let at = timer::clock().ns_to_ticks(far);
+    c.succeeds(set, &[t.0, far], &[])?;
+    check(
+        timers::deadline(tm) == Some(at),
+        "timer_set did not arm the timer",
+    )?;
+    c.succeeds(cancel, &[t.0], &[])?;
+    c.succeeds(cancel, &[t.0], &[])?;
+    check(
+        timers::deadline(tm).is_none(),
+        "timer_cancel left the timer armed",
+    )?;
+    c.succeeds(set, &[t.0, far], &[])?;
+    // The last handle with RECEIVE goes: the channel closes (spec 6.8).
+    c.close(h)?;
+    c.fails(set, &[t.0, 0], Error::PeerClosed)?;
+    c.fails(
+        Call::Notify.number(),
+        &[notify_only.0, 1],
+        Error::PeerClosed,
+    )?;
+    check(
+        timers::deadline(tm) == Some(at) && !timers::posted(tm),
+        "timer_set on a closed channel changed the timer",
+    )?;
+    c.succeeds(cancel, &[t.0], &[])
+}
+
+fn clock_now_case(c: &Caller) -> Result<(), &'static str> {
+    let clock = timer::clock();
+    let before = clock.ticks_to_ns(timer::now());
+    let got = c.call(Call::ClockNow.number(), &[]);
+    let after = clock.ticks_to_ns(timer::now());
+    let mut want = with_marks(&[]);
+    want[0] = 0;
+    want[1] = got[1];
+    check(
+        got == want && (before..=after).contains(&got[1]),
+        "clock_now did not return the counter in nanoseconds in x1 alone",
+    )
+}
+
+/// timer_set rounds its deadline up to counter ticks (spec 10): for every
+/// deadline of a stretch of 64 ns a second away, on the ticks and between
+/// them, the timer stands in the heap at the first tick whose time, as
+/// clock_now counts it, is not before the deadline; the tick before it is.
+pub fn timer_never_fires_early(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        with_timer(c, |_, t, tm| {
+            let clock = timer::clock();
+            let base = a_second_away();
+            for deadline in base..base + 64 {
+                c.succeeds(Call::TimerSet.number(), &[t.0, deadline], &[])?;
+                let at = timers::deadline(tm).ok_or("the timer is not armed")?;
+                check(
+                    clock.ticks_to_ns(at) >= deadline && clock.ticks_to_ns(at - 1) < deadline,
+                    "the timer's tick is not the first one at or after its deadline",
+                )?;
+            }
+            Ok(())
+        })
+    })
+}
+
+/// A deadline the counter reached fires in timer_set itself (spec 10):
+/// right after the call, with no interrupt in between, the timer's slot
+/// stands in the channel's queue and the timer is in no heap. So it goes
+/// for 0, for the time clock_now would give, and for an armed timer set
+/// back into the past; each time receive takes one expiry, bit 0 once.
+pub fn timer_in_the_past_fires_at_once(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        with_timer(c, |h, t, tm| {
+            let (set, receive) = (Call::TimerSet.number(), Call::Receive.number());
+            let now = timer::clock().ticks_to_ns(timer::now());
+            for (armed, past) in [(false, 0), (false, now), (true, 1)] {
+                if armed {
+                    c.succeeds(set, &[t.0, a_second_away()], &[])?;
+                }
+                c.succeeds(set, &[t.0, past], &[])?;
+                check(
+                    timers::posted(tm) && timers::deadline(tm).is_none(),
+                    "a deadline in the past did not fire in timer_set",
+                )?;
+                c.succeeds(receive, &[h.0, NO_WAIT], &timer_notice(1))?;
+            }
+            Ok(())
+        })
+    })
+}
+
+/// A timer whose last handle went is dying (spec 7.7): the cleanup queue
+/// holds it, and the heap still does until its portion. The kernel's timer
+/// interrupt at its deadline takes it off the heap and posts nothing; its
+/// portion then lets it go.
+pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
+    let timers = timers::in_use();
+    with_caller(|c| {
+        with_timer(c, |h, t, tm| {
+            c.succeeds(Call::TimerSet.number(), &[t.0, a_second_away()], &[])?;
+            let at = timers::deadline(tm).ok_or("the timer is not armed")?;
+            c.close(t)?;
+            let queued = cleanup::len();
+            timers::expire(at);
+            let (posted, armed) = (timers::posted(tm), timers::deadline(tm).is_some());
+            c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
+            cleanup::drain();
+            check(queued == 1, "the timer's last handle did not queue it")?;
+            check(
+                !posted && !armed,
+                "a dying timer fired, or stayed in the heap",
+            )
+        })
+    })?;
+    check(timers::in_use() == timers, "the dying timer stayed")
 }

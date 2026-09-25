@@ -171,6 +171,7 @@ pub fn portion() {
             Object::Thread(t) => thread::clean(t, level),
             Object::Channel(c) => channel::clean(c, level),
             Object::Session(s) => session::clean(s, level),
+            Object::Timer(t) => crate::timer::clean(t, level),
             Object::Resource => unreachable!("the system resource is never queued"),
         }
     }

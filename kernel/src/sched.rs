@@ -5,17 +5,19 @@
 //! the kernel's threads, the virtual timer and the cleanup queue. Every
 //! entry into the kernel ends in `resume`, the one way out: a loop on the
 //! empty kernel stack that handles a pending interrupt, decides, arms the
-//! timer for the deadline that decision needs, writing the timer only when
-//! the deadline changes, and then runs the chosen thread, does one portion
-//! of cleanup (spec 7.7) or sleeps in `wfi` with interrupts masked. Idle is
-//! that loop with nothing ready: no thread object, and cleanup of every
-//! level runs there. Between two polls for interrupts the kernel does at
-//! most one portion, and it begins one only with no interrupt pending.
-//! The kernel holds a reference to every thread the scheduler holds, from
-//! `start` until `exit`, a thread that waits in `receive` too. The queues
-//! of receivers of channels link threads through the scheduler's own links,
-//! so the code that changes them runs under the scheduler's lock
-//! (`locked`).
+//! timer for the deadline that decision needs, the nearer of the end of a
+//! quantum and the earliest timer of a program (spec 8, 10), writing the
+//! timer only when the deadline changes, and then runs the chosen thread,
+//! does one portion of cleanup (spec 7.7) or sleeps in `wfi` with
+//! interrupts masked. Idle is that loop with nothing ready: no thread
+//! object, and cleanup of every level runs there. Between two polls for
+//! interrupts the kernel does at most one portion, and it begins one only
+//! with no interrupt pending. The kernel holds a reference to every thread
+//! the scheduler holds, from `start` until `exit`, a thread that waits in
+//! `receive` too. The queues of receivers of channels link threads through
+//! the scheduler's own links, so the code that changes them runs under the
+//! scheduler's lock (`locked`). The lock of the heap of timers is never
+//! held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
 use crate::thread::{self, Policy, Thread};
@@ -61,8 +63,9 @@ static SCHED: Lock<Sched> = Lock::new(Sched {
 pub struct Stats {
     /// Asleep in `wfi`.
     pub idle: u64,
-    /// The longest time from a timer's deadline to the thread run after
-    /// its interrupt, when the interrupt woke the kernel from `wfi`.
+    /// The longest time from the deadline of the timer's interrupt, the end
+    /// of a quantum or a timer of a program, to the thread run after it,
+    /// when the interrupt woke the kernel from `wfi`.
     pub idle_latency: u64,
     /// The same for an interrupt that came while the kernel was awake: at
     /// EL0, or found by the poll on the way out.
@@ -183,20 +186,26 @@ pub fn locked<R>(f: impl FnOnce(&mut Scheduler<Thread>) -> R) -> R {
 
 /// The timer's interrupt, before its EOI: the timer goes off, since its
 /// line is level-triggered and must be quiet by the EOI, and a round-robin
-/// thread whose quantum is over goes to the tail of its level. `resume`
+/// thread whose quantum is over goes to the tail of its level; an
+/// interrupt that came for a timer of a program ends no quantum. Then the
+/// timers of programs that expired post their notifications, up to
+/// timer::BATCH of them, after the scheduler's lock (spec 10). `resume`
 /// arms the timer again. The deadline that fired, CNTV_CVAL_EL0, waits
 /// for the next thread to run, which measures the latency for KSTATS.
 pub fn timer_fired() {
     let now = timer::now();
-    let mut g = SCHED.lock();
-    let g = &mut *g;
-    g.fired = Some((timer::cval(), g.waking));
-    // The line must drop before the EOI whatever `armed` remembers: the
-    // hardware said the timer is on.
-    VirtualTimer.disarm();
-    g.armed = Armed::new();
-    // SAFETY: the scheduler's threads are alive.
-    unsafe { g.s.tick(now) };
+    {
+        let mut g = SCHED.lock();
+        let g = &mut *g;
+        g.fired = Some((timer::cval(), g.waking));
+        // The line must drop before the EOI whatever `armed` remembers: the
+        // hardware said the timer is on.
+        VirtualTimer.disarm();
+        g.armed = Armed::new();
+        // SAFETY: the scheduler's threads are alive.
+        unsafe { g.s.tick(now) };
+    }
+    crate::timer::expire(now);
 }
 
 /// The way out of the kernel (spec 8.1, 7.7): `exit_loop` on the empty
@@ -235,15 +244,14 @@ extern "C" fn exit_loop() -> ! {
 }
 
 /// Decides what the kernel does from now on and arms the timer for the
-/// deadline that needs: the end of a round-robin thread's quantum;
-/// nothing for a FIFO thread, for cleanup or while idle. From milestone
-/// 1.3 the nearest timer of a program joins it; test builds add the
-/// running test's own deadline (ktest::el0::deadline). A thread chosen
-/// after a timer's interrupt ends that interrupt's latency.
+/// deadline that needs: the nearer of the end of a round-robin thread's
+/// quantum and the earliest timer of a program; only the timer for a FIFO
+/// thread, for cleanup or while idle (spec 8, 10). The heap's lock goes
+/// before the scheduler's is taken. A thread chosen after a timer's
+/// interrupt ends that interrupt's latency.
 fn decide() -> Decision<Thread> {
-    #[cfg(feature = "ktest")]
-    let test = crate::ktest::el0::deadline();
     let cleanup = cleanup::top();
+    let next_timer = crate::timer::first();
     let now = timer::now();
     let mut g = SCHED.lock();
     let g = &mut *g;
@@ -265,11 +273,7 @@ fn decide() -> Decision<Thread> {
         // part of its latency.
         g.fired = None;
     }
-    // Programs have no timers yet (spec 10): the heap's earliest deadline
-    // (kcore::timer::Heap::first) comes here with them.
-    let deadline = g.s.deadline(None);
-    #[cfg(feature = "ktest")]
-    let deadline = deadline.into_iter().chain(test).min();
+    let deadline = g.s.deadline(next_timer);
     g.armed.set(&mut VirtualTimer, deadline);
     decision
 }
@@ -297,4 +301,12 @@ fn sleep() {
 #[cfg(feature = "ktest")]
 pub fn first(level: u8) -> Option<NonNull<Thread>> {
     SCHED.lock().s.ready().first(level)
+}
+
+/// Forgets the longest latencies, so that a test measures its own.
+#[cfg(feature = "ktest")]
+pub fn reset_latencies() {
+    let mut g = SCHED.lock();
+    g.idle_latency = 0;
+    g.irq_latency = 0;
 }

@@ -21,7 +21,8 @@
 //! cleanup it may start takes. A process pays from its quota for what goes
 //! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
 //! threads, the blocks of its handle table, the shells of its children, the
-//! channels it made and the sessions of the labels it gave (spec 5.3); and
+//! channels it made, the sessions of the labels it gave (spec 5.3) and its
+//! timers, at most abi::MAX_TIMERS (spec 10); and
 //! for the tables of its space, the message buffers of its threads and the
 //! frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
@@ -37,7 +38,8 @@ use crate::object::{self, Block, Chunks, Handles, Object};
 use crate::sched;
 use crate::session::Session;
 use crate::thread::{self, Siblings, Thread};
-use abi::{Error, Handle, MAX_THREADS, ProcessState, Rights};
+use crate::timer::Timer;
+use abi::{Error, Handle, MAX_THREADS, MAX_TIMERS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
@@ -78,8 +80,8 @@ pub struct Process {
     /// References that keep the object but not the process: each child's
     /// to its parent, until the child's shell goes, when the rest of the
     /// child's quota comes back (spec 7.5), and each channel's and each
-    /// session's the process pays for, until its place goes back to the
-    /// pool (spec 7.8).
+    /// session's and each timer's the process pays for, until its place
+    /// goes back to the pool (spec 7.8).
     /// A ring of a parent that holds a handle to its child and a child that
     /// holds its parent does not keep the parent alive.
     shell_refs: u32,
@@ -103,6 +105,8 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
+    /// Timers in its pool of timers, at most abi::MAX_TIMERS (spec 10).
+    timer_count: u32,
     /// The process that made it (process_create, `create_child`), whose
     /// shell it holds until its own shell goes (`shell_refs`) and which its
     /// quota came from; None for init and the other processes `create`
@@ -151,6 +155,8 @@ struct Pools {
     channels: Pool<Channel>,
     /// The sessions of the labels it gave (handle_duplicate).
     sessions: Pool<Session>,
+    /// The timers it made.
+    timers: Pool<Timer>,
 }
 
 /// The source of a process's exit notification (spec 6.5, 7.9): its slot,
@@ -445,11 +451,13 @@ fn create(
             children: Pool::new(),
             channels: Pool::new(),
             sessions: Pool::new(),
+            timers: Pool::new(),
         },
         ceiling,
         life: Life::new(),
         threads: None,
         thread_count: 0,
+        timer_count: 0,
         parent: None,
         children: None,
         child_siblings: None,
@@ -1378,6 +1386,49 @@ pub fn session_slot(
 pub unsafe fn free_session_slot(process: NonNull<Process>, s: NonNull<Session>) {
     // SAFETY: the caller's promise; only the pool is touched.
     unsafe { (*process.as_ptr()).pools.sessions.free(s) }
+}
+
+/// LIMIT_REACHED when `process` pays for abi::MAX_TIMERS timers (spec 10):
+/// timer::create asks before it takes a slot of the channel or of the pool.
+pub fn timer_room(process: NonNull<Process>) -> Result<(), Error> {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is read.
+    if unsafe { (*process.as_ptr()).timer_count } < MAX_TIMERS {
+        Ok(())
+    } else {
+        Err(Error::LimitReached)
+    }
+}
+
+/// A place for `timer`, which `process` makes (timer::create) after
+/// `timer_room` let it, in the process's pool of timers, whose quota pays
+/// for a page when the pool grows (spec 7.8): one more timer of the
+/// process. NO_MEMORY when the quota falls short.
+pub fn timer_slot(process: NonNull<Process>, timer: Timer) -> Result<NonNull<Timer>, Error> {
+    // SAFETY: the caller holds a reference to the process; the timer is no
+    // field of it.
+    let t = unsafe { paid_slot(process, |pools| &mut pools.timers, timer) }
+        .map_err(|_| Error::NoMemory)?;
+    // SAFETY: as above; only the field is touched.
+    unsafe { (*process.as_ptr()).timer_count += 1 };
+    Ok(t)
+}
+
+/// Gives the place of `t`, a timer that `process` paid for and that goes
+/// (timer::clean), back to the process's pool of timers, where its page
+/// stays paid until the process's shell goes: one timer fewer.
+///
+/// # Safety
+/// `t` came from `timer_slot` of `process`, whose shell it holds, and
+/// nothing uses it afterwards.
+pub unsafe fn free_timer_slot(process: NonNull<Process>, t: NonNull<Timer>) {
+    // SAFETY: the caller's promise; only the pool and the count are
+    // touched.
+    unsafe {
+        let p = process.as_ptr();
+        (*p).pools.timers.free(t);
+        (*p).timer_count -= 1;
+    }
 }
 
 /// The links of `t`, a thread in its process's list.

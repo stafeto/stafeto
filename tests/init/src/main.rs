@@ -27,7 +27,7 @@ use abi::{
     ProcessMemory, ProcessState, Rights, Source,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Process, Resource, Thread};
+use rt::handle::{Channel, Process, Resource, Thread, Timer};
 use rt::sys::{self, Received, Regs};
 use rt::{Handle, Stack, init, println, time};
 
@@ -37,7 +37,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 48] = [
+const TESTS: [Test; 57] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -176,6 +176,24 @@ const TESTS: [Test; 48] = [
         client_gone_when_the_child_dies,
     ),
     (
+        "clock_now_follows_the_counter",
+        clock_now_follows_the_counter,
+    ),
+    ("timer_needs_receive", timer_needs_receive),
+    ("timer_bounds_a_wait", timer_bounds_a_wait),
+    (
+        "notification_before_the_timer_comes_first",
+        notification_before_the_timer_comes_first,
+    ),
+    (
+        "timer_in_the_past_fires_at_once",
+        timer_in_the_past_fires_at_once,
+    ),
+    ("timer_set_moves_the_deadline", timer_set_moves_the_deadline),
+    ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
+    ("timer_never_fires_early", timer_never_fires_early),
+    ("timer_limit_is_64", timer_limit_is_64),
+    (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
     ),
@@ -208,6 +226,10 @@ const SLOTS: usize = 2;
 /// The label of the copy of a test's exit channel that names its
 /// children (process_create x3).
 const CHILD: u64 = 0xC41D;
+/// The label of the copy of a channel a timer is made through.
+const TIMED: u64 = 0x71AE;
+/// The bits a thread of init notifies with before a timer's deadline.
+const NOTIFIED: u64 = 0b1001;
 
 static STACKS: [Stack<STACK_SIZE>; SLOTS] = [const { Stack::new() }; SLOTS];
 
@@ -989,7 +1011,7 @@ fn process_info_kinds() -> Outcome {
 
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
 /// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
-/// though it writes; init's resource gets the counts in x1-x7 and changes
+/// though it writes; init's resource gets the counts in x1-x8 and changes
 /// nothing past them. Nothing waits in the cleanup queue while init runs,
 /// and the frames and pool pages are there.
 fn kernel_stats_need_kstats() -> Outcome {
@@ -1010,10 +1032,10 @@ fn kernel_stats_need_kstats() -> Outcome {
     // SAFETY: object_info only reads its registers.
     let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
     check(
-        after[0] == 0 && after[8..] == x[8..],
-        "KERNEL_STATS failed or changed registers past x7",
+        after[0] == 0 && after[9..] == x[9..],
+        "KERNEL_STATS failed or changed registers past x8",
     )?;
-    let stats = abi::KernelStats::from_words(after[1..8].try_into().expect("x1-x7"));
+    let stats = abi::KernelStats::from_words(after[1..9].try_into().expect("x1-x8"));
     check(
         stats.cleanup_queue == 0 && stats.free_frames > 0 && stats.pool_pages > 0,
         "the queue is not empty, or no frame or pool page is counted",
@@ -2171,5 +2193,316 @@ fn client_gone_when_the_child_dies() -> Outcome {
                     Err(Error::WouldBlock),
                 ],
         "the child's end did not post CLIENT_GONE and then the exit notification with the label",
+    )
+}
+
+/// A timer on `c` at QUIET, whose notifications never lift init above its
+/// threads (spec 6.6).
+fn timer(c: &Handle<Channel>) -> Result<Handle<Timer>, &'static str> {
+    sys::timer_create(c, QUIET).map_err(|_| "timer_create failed")
+}
+
+/// timer_create with raw registers.
+fn raw_timer_create(x: Regs) -> Regs {
+    // SAFETY: timer_create only reads its registers.
+    unsafe { sys::raw::<{ Call::TimerCreate.number() }>(x) }
+}
+
+fn clock_now() -> Result<u64, &'static str> {
+    sys::clock_now().map_err(|_| "clock_now failed")
+}
+
+fn arm(t: &Handle<Timer>, deadline: u64) -> Outcome {
+    sys::timer_set(t, deadline).map_err(|_| "timer_set failed")
+}
+
+/// Spins until the counter, in nanoseconds, passed `ns`.
+fn spin_past(ns: u64) {
+    while time::ticks_to_ns(time::now()) <= ns {}
+}
+
+/// `count` expiries of a timer made through a handle with `label`: bit 0.
+fn expiry(label: u64, count: u32) -> Received {
+    Received::Notification {
+        source: Source::Timer,
+        label,
+        bits: 1,
+        count,
+    }
+}
+
+/// Spec 15.2 (time): a program reads the counter itself (CNTVCT_EL0,
+/// spec 10), and clock_now between two such readings returns nanoseconds
+/// between theirs, rounded down as rt::time converts them; it changes x0
+/// and x1 alone.
+fn clock_now_follows_the_counter() -> Outcome {
+    let x = marked();
+    let before = time::now();
+    // SAFETY: clock_now reads no register.
+    let after = unsafe { sys::raw::<{ Call::ClockNow.number() }>(x) };
+    let later = time::now();
+    let typed = sys::clock_now();
+    check(
+        after[0] == 0 && after[2..] == x[2..],
+        "clock_now failed or changed registers past x1",
+    )?;
+    check(
+        (time::ticks_to_ns(before)..=time::ticks_to_ns(later)).contains(&after[1]),
+        "clock_now is not between two readings of the counter",
+    )?;
+    check(typed.is_ok_and(|ns| ns >= after[1]), "clock_now went back")
+}
+
+/// timer_create takes a channel with RECEIVE (spec 6.5, 10): a timer is a
+/// bound on its creator's own wait, and the slots of the channel and the
+/// priorities that lift its receivers are the receiver's. A priority
+/// outside 1-63 fails with INVALID_ARGS before the handle is looked at, a
+/// bad handle with BAD_HANDLE, a handle to another kind with WRONG_TYPE, a
+/// copy with NOTIFY alone with ACCESS_DENIED; each changes x0 alone. A copy
+/// with RECEIVE and a label makes a timer whose expiries carry the label.
+fn timer_needs_receive() -> Outcome {
+    let c = channel(QUIET)?;
+    let notify = copy(&c, Rights::NOTIFY)?;
+    let labelled = session(&c, Rights::RECEIVE, TIMED, QUIET)?;
+    let cases = [
+        (abi::Handle::INVALID, 0, Error::InvalidArgs),
+        (c.raw(), 64, Error::InvalidArgs),
+        (c.raw(), 0x100 | u64::from(QUIET), Error::InvalidArgs),
+        (abi::Handle::INVALID, QUIET.into(), Error::BadHandle),
+        (init::PROCESS.raw(), QUIET.into(), Error::WrongType),
+        (notify.raw(), QUIET.into(), Error::AccessDenied),
+    ];
+    let refused = cases.map(|(h, priority, error)| {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[h.0, priority]);
+        failed(raw_timer_create(x), x, error)
+    });
+    let t = sys::timer_create(&labelled, QUIET);
+    let fired = t
+        .as_ref()
+        .map_err(|&e| e)
+        .and_then(|t| sys::timer_set(t, 0));
+    let got = sys::try_receive(&c);
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    close(labelled)?;
+    close(notify)?;
+    close(c)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "timer_create took a channel without RECEIVE or a bad argument, or changed more than x0",
+    )?;
+    check(
+        fired.is_ok() && got == Ok(expiry(TIMED, 1)),
+        "a timer made through a labelled copy did not carry the label",
+    )
+}
+
+/// Spec 15.2 (time): a timer on a channel and receive make a wait with a
+/// bound (spec 6.1, 10). Init waits on an empty channel whose timer fires
+/// 1 ms from now and wakes with the timer's notification, bit 0 once, not
+/// before the deadline; nothing else comes.
+fn timer_bounds_a_wait() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let deadline = clock_now()? + 1_000_000;
+    let set = arm(&t, deadline);
+    let got = sys::receive(&c);
+    let woke = clock_now();
+    let rest = sys::try_receive(&c);
+    close(t)?;
+    close(c)?;
+    set?;
+    check(
+        got == Ok(expiry(0, 1)),
+        "the wait did not end with the timer's notification",
+    )?;
+    check(
+        woke.is_ok_and(|ns| ns >= deadline),
+        "the wait ended before the timer's deadline",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "something came after the timer",
+    )
+}
+
+/// Spec 15.2 (time): what comes before the bound ends the wait first. A
+/// thread of init below it notifies the channel as soon as init waits,
+/// long before the timer's deadline: init wakes with that notification,
+/// cancels the timer, and once the deadline passed nothing more comes.
+fn notification_before_the_timer_comes_first() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let deadline = clock_now()? + 2_000_000;
+    let set = arm(&t, deadline);
+    let n = spawn(0, notify_once, c.raw().0, LOW, Policy::Fifo)?;
+    let got = sys::receive(&c);
+    let cancelled = sys::timer_cancel(&t);
+    spin_past(deadline);
+    let rest = sys::try_receive(&c);
+    let_run()?;
+    close(n)?;
+    close(t)?;
+    close(c)?;
+    set?;
+    check(cancelled.is_ok(), "timer_cancel failed")?;
+    check(
+        got == Ok(unlabeled(NOTIFIED, 1)),
+        "the notification before the deadline did not come first",
+    )?;
+    check(rest == Err(Error::WouldBlock), "the cancelled timer fired")
+}
+
+/// Notifies the channel `h` with NOTIFIED and ends.
+extern "C" fn notify_once(h: u64) -> ! {
+    let c = Handle::<Channel>::from_raw(abi::Handle(h));
+    let _ = sys::notify(&c, NOTIFIED);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (time): a deadline that passed fires in timer_set itself
+/// (spec 10). Right after timer_set with 0, with the time clock_now gave,
+/// and with a past deadline for an armed timer, the timer's notification
+/// is there, bit 0 once each time.
+fn timer_in_the_past_fires_at_once() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let result = past_deadlines(&c, &t);
+    close(t)?;
+    close(c)?;
+    result
+}
+
+fn past_deadlines(c: &Handle<Channel>, t: &Handle<Timer>) -> Outcome {
+    let now = clock_now()?;
+    for (armed, past) in [(false, 0), (false, now), (true, now)] {
+        if armed {
+            arm(t, now + 1_000_000_000)?;
+        }
+        arm(t, past)?;
+        check(
+            sys::try_receive(c) == Ok(expiry(0, 1)),
+            "a deadline in the past did not fire at once",
+        )?;
+    }
+    check(
+        sys::try_receive(c) == Err(Error::WouldBlock),
+        "a timer set into the past fired once more",
+    )
+}
+
+/// timer_set of an armed timer moves it (spec 10): armed a second away and
+/// then 1 ms away, it fires at the nearer deadline, long before the far
+/// one; armed 10 ms away and then a second away, it does not fire at the
+/// nearer one, which a stall of the host cannot pass before the call.
+fn timer_set_moves_the_deadline() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let result = moves(&c, &t);
+    close(t)?;
+    close(c)?;
+    result
+}
+
+fn moves(c: &Handle<Channel>, t: &Handle<Timer>) -> Outcome {
+    let now = clock_now()?;
+    let (near, far) = (now + 1_000_000, now + 1_000_000_000);
+    arm(t, far)?;
+    arm(t, near)?;
+    let got = sys::receive(c);
+    let at = clock_now()?;
+    check(
+        got == Ok(expiry(0, 1)) && (near..far).contains(&at),
+        "the timer did not move to the nearer deadline",
+    )?;
+    let now = clock_now()?;
+    let (near, far) = (now + 10_000_000, now + 1_000_000_000);
+    arm(t, near)?;
+    arm(t, far)?;
+    spin_past(near + 1_000_000);
+    let rest = sys::try_receive(c);
+    sys::timer_cancel(t).map_err(|_| "timer_cancel failed")?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "the timer fired at the deadline it moved away from",
+    )
+}
+
+/// timer_cancel leaves what the timer posted (spec 10): a timer that fired
+/// in timer_set and is cancelled afterwards still has its notification
+/// waiting; cancelling a timer that is not armed is no error.
+fn cancel_keeps_posted_bits() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let fired = arm(&t, 0);
+    let cancelled = sys::timer_cancel(&t);
+    let got = sys::try_receive(&c);
+    let again = sys::timer_cancel(&t);
+    close(t)?;
+    close(c)?;
+    fired?;
+    check(cancelled.is_ok() && again.is_ok(), "timer_cancel failed")?;
+    check(
+        got == Ok(expiry(0, 1)),
+        "timer_cancel took back what the timer posted",
+    )
+}
+
+/// Spec 15.2 (time): a timer never fires before its deadline (spec 10).
+/// For deadlines 200 µs away at 16 offsets a nanosecond apart, on the
+/// ticks of the counter and between them, init wakes with the timer's
+/// notification at a time clock_now gives no earlier than the deadline.
+fn timer_never_fires_early() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let result = (0..16).try_for_each(|offset| {
+        let deadline = clock_now()? + 200_000 + offset;
+        arm(&t, deadline)?;
+        let got = sys::receive(&c);
+        let woke = clock_now()?;
+        check(
+            got == Ok(expiry(0, 1)) && woke >= deadline,
+            "a timer fired before its deadline",
+        )
+    });
+    close(t)?;
+    close(c)?;
+    result
+}
+
+/// Spec 15.2 (notifications): a process pays for abi::MAX_TIMERS timers at
+/// most (spec 10). With 64 made, the next timer_create fails with
+/// LIMIT_REACHED and changes x0 alone; once one of them went, another
+/// fits.
+fn timer_limit_is_64() -> Outcome {
+    let c = channel(QUIET)?;
+    let mut timers = [const { None }; abi::MAX_TIMERS as usize];
+    let made = timers.iter_mut().try_for_each(|slot| {
+        *slot = Some(timer(&c)?);
+        Ok(())
+    });
+    let mut x = marked();
+    x[..2].copy_from_slice(&[c.raw().0, QUIET.into()]);
+    let after = raw_timer_create(x);
+    let freed = timers[0].take().map(close);
+    let again = sys::timer_create(&c, QUIET);
+    let remade = again.is_ok();
+    if let Ok(t) = again {
+        close(t)?;
+    }
+    for t in timers.into_iter().flatten() {
+        close(t)?;
+    }
+    close(c)?;
+    made?;
+    check(
+        failed(after, x, Error::LimitReached),
+        "a timer past 64 was made, or the call changed more than x0",
+    )?;
+    check(
+        freed == Some(Ok(())) && remade,
+        "no new timer fit once one went",
     )
 }

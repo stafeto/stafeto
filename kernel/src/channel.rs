@@ -13,21 +13,23 @@
 //! queues happens under the scheduler's lock (sched::locked). A channel
 //! lives while references to it are left: handles with any rights, threads
 //! that wait in it, the sources of notifications that have a slot there
-//! (sessions and exits of processes), and the cleanup queue's while it
-//! closes; the last one queues its shell (spec 7.7). Every source holds
-//! one of its abi::MAX_SLOTS slots, the slot of label 0 among them, from
-//! its creation until it goes, and a slot that stands in the queue holds
-//! its owner until receive or the stage Close takes it (spec 6.5). The last
-//! handle with RECEIVE closes it in the call itself: `notify` fails with
-//! PEER_CLOSED from then on, nothing new waits or is queued, and the stage
-//! Close wakes the receivers that wait with PEER_CLOSED and empties the
-//! queued slots, letting their owners go, CLOSE_PORTION a portion.
+//! (sessions, exits of processes and timers), and the cleanup queue's
+//! while it closes; the last one queues its shell (spec 7.7). Every source
+//! holds one of its abi::MAX_SLOTS slots, the slot of label 0 among them,
+//! from its creation until it goes, and a slot that stands in the queue
+//! holds its owner until receive or the stage Close takes it (spec 6.5).
+//! The last handle with RECEIVE closes it in the call itself: `notify`
+//! fails with PEER_CLOSED from then on, nothing new waits or is queued,
+//! and the stage Close wakes the receivers that wait with PEER_CLOSED and
+//! empties the queued slots, letting their owners go, CLOSE_PORTION a
+//! portion.
 
 use crate::cleanup::{self, Item};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::session::{self, Session};
 use crate::thread::Thread;
+use crate::timer::{self, Timer};
 use crate::{sched, syscall};
 use abi::{Error, MAX_SLOTS, Notification, Rights, Source};
 use core::ptr::NonNull;
@@ -50,6 +52,8 @@ pub enum Owner {
     Session(NonNull<Session>),
     /// The end of a process, whose shell holds the slot (spec 7.9).
     Exit(NonNull<Process>),
+    /// A timer (spec 10).
+    Timer(NonNull<Timer>),
 }
 
 impl Owner {
@@ -58,6 +62,7 @@ impl Owner {
             Owner::Channel => Source::Unlabeled,
             Owner::Session(_) => Source::Session,
             Owner::Exit(_) => Source::Exit,
+            Owner::Timer(_) => Source::Timer,
         }
     }
 
@@ -66,6 +71,7 @@ impl Owner {
             Owner::Channel => 0,
             Owner::Session(s) => session::label(s),
             Owner::Exit(p) => process::exit_label(p),
+            Owner::Timer(t) => timer::label(t),
         }
     }
 
@@ -77,6 +83,7 @@ impl Owner {
             Owner::Channel => {}
             Owner::Session(s) => session::hold(s),
             Owner::Exit(p) => process::retain_shell(p),
+            Owner::Timer(t) => timer::retain(t),
         }
     }
 
@@ -92,6 +99,8 @@ impl Owner {
             Owner::Session(s) => unsafe { session::unref(s, cause) },
             // SAFETY: as above.
             Owner::Exit(p) => unsafe { process::release_shell(p, cause) },
+            // SAFETY: as above.
+            Owner::Timer(t) => unsafe { timer::release(t, cause) },
         }
     }
 }

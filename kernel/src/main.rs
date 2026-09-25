@@ -30,6 +30,7 @@ mod sched;
 mod session;
 mod syscall;
 mod thread;
+mod timer;
 
 use boot::Boot;
 use bootimg::Program;

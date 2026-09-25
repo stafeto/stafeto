@@ -122,6 +122,15 @@ el0_wait_loop:
     b       el0_wait_loop
     svc     #SVC_DONE
 
+// Fills every register from a pattern whose x0 and x1 hold a channel and
+// flags, and waits in receive: the kernel checks that the wait changed
+// x0-x11 alone.
+.global el0_pattern_receive
+el0_pattern_receive:
+    LOAD_PATTERN
+    svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
 // Fills every register and yields to the test's other thread, a FIFO
 // thread at the same level, which fills them with its own pattern.
 .global el0_pattern_yield
@@ -443,5 +452,21 @@ el0_raise_then_notify:
     mov     x1, x22
     svc     #CALL_NOTIFY
     svc     #SVC_DONE
+
+// The test's alarm: waits in receive(x0 channel, x1 flags) until a timer
+// on the channel fires, then goes on at the program x2 with x3-x5 in
+// x0-x2 and the result of receive in x23. receive changes x0-x11 alone.
+.global el0_alarm_then
+el0_alarm_then:
+    mov     x19, x2
+    mov     x20, x3
+    mov     x21, x4
+    mov     x22, x5
+    svc     #CALL_RECEIVE
+    mov     x23, x0
+    mov     x0, x20
+    mov     x1, x21
+    mov     x2, x22
+    br      x19
 
 el0_programs_end:

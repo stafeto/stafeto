@@ -100,7 +100,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 48;
+const INIT_TESTS: u32 = 57;
 /// A data segment bigger than the 4 MiB one block of frames holds.
 const BIG_DATA: u64 = 8 << 20;
 
@@ -848,19 +848,11 @@ mod tests {
         }
     }
 
-    /// The kernel keeps the FP and SIMD registers for programs and saves
-    /// them only when threads switch (spec 8), so FP or SIMD anywhere else
-    /// in the kernel would change a program's registers without a word.
-    /// Only the thread switch and the EL0 test programs may assemble them.
-    /// Every crate linked into the kernel is searched: the kernel itself,
-    /// kcore, abi and bootimg.
-    #[test]
-    fn only_the_thread_switch_uses_fp() {
+    /// The text of every file under `dirs` of the workspace that reads as
+    /// UTF-8, with its path from the workspace's root.
+    fn texts(dirs: &[&str]) -> Vec<(String, String)> {
         let mut found = Vec::new();
-        let mut paths: Vec<_> = ["kernel", "kcore", "lib/abi", "lib/bootimg"]
-            .iter()
-            .map(|dir| root().join(dir))
-            .collect();
+        let mut paths: Vec<_> = dirs.iter().map(|dir| root().join(dir)).collect();
         while let Some(path) = paths.pop() {
             if path.is_dir() {
                 let entries = std::fs::read_dir(&path).expect("a readable directory");
@@ -870,20 +862,51 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let fp = text.lines().any(|l| {
-                (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
-                    || ((l.contains("target_feature") || l.contains("target-feature"))
-                        && (l.contains("neon") || l.contains("fp-armv8")))
-            });
-            if fp {
-                let name = path.strip_prefix(root()).expect("a path in the workspace");
-                found.push(name.to_string_lossy().into_owned());
-            }
+            let name = path.strip_prefix(root()).expect("a path in the workspace");
+            found.push((name.to_string_lossy().into_owned(), text));
         }
+        found
+    }
+
+    /// The kernel keeps the FP and SIMD registers for programs and saves
+    /// them only when threads switch (spec 8), so FP or SIMD anywhere else
+    /// in the kernel would change a program's registers without a word.
+    /// Only the thread switch and the EL0 test programs may assemble them.
+    /// Every crate linked into the kernel is searched: the kernel itself,
+    /// kcore, abi and bootimg.
+    #[test]
+    fn only_the_thread_switch_uses_fp() {
+        let mut found: Vec<_> = texts(&["kernel", "kcore", "lib/abi", "lib/bootimg"])
+            .into_iter()
+            .filter(|(_, text)| {
+                text.lines().any(|l| {
+                    (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
+                        || ((l.contains("target_feature") || l.contains("target-feature"))
+                            && (l.contains("neon") || l.contains("fp-armv8")))
+                })
+            })
+            .map(|(name, _)| name)
+            .collect();
         found.sort();
         assert_eq!(
             found,
             ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
         );
+    }
+
+    /// The kernel tests wake their threads through timers of programs
+    /// (spec 10): the test builds keep no deadline of their own for the
+    /// kernel's timer to serve besides the programs' timers.
+    #[test]
+    fn kernel_tests_keep_no_deadline_of_their_own() {
+        let found: Vec<_> = texts(&["kernel/src"])
+            .into_iter()
+            .filter(|(name, text)| {
+                text.contains("el0::deadline")
+                    || (name.starts_with("kernel/src/ktest") && text.contains("fn deadline("))
+            })
+            .map(|(name, _)| name)
+            .collect();
+        assert!(found.is_empty(), "a test deadline in {found:?}");
     }
 }

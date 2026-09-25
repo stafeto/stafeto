@@ -79,8 +79,9 @@ impl core::ops::BitOr for Rights {
     }
 }
 
-/// Rights of the handle that `process_create` or `thread_create` returns,
-/// and of init's handles to its own process and first thread.
+/// Rights of the handle that `process_create`, `thread_create` or
+/// `timer_create` returns, and of init's handles to its own process and
+/// first thread.
 pub const OWNER_RIGHTS: Rights =
     Rights(Rights::DUPLICATE.0 | Rights::TRANSFER.0 | Rights::MANAGE.0);
 
@@ -122,6 +123,10 @@ pub const START_CHANNEL: Handle = Handle::new(0, 1);
 /// Threads of one process that have not ended, at most (spec 8):
 /// `thread_create` past it fails with LIMIT_REACHED.
 pub const MAX_THREADS: u32 = 64;
+
+/// Timers one process pays for, at most (spec 10): `timer_create` past it
+/// fails with LIMIT_REACHED.
+pub const MAX_TIMERS: u32 = 64;
 
 /// Top of the stack of init's first thread (spec 13.3). The kernel maps the
 /// stack the boot image asks for right under it, with an unmapped guard
@@ -370,7 +375,7 @@ pub const INFO_PROCESS_MEMORY: u64 = 2;
 /// returns `ProcessHandles::to_words` in x1-x3.
 pub const INFO_PROCESS_HANDLES: u64 = 3;
 /// KERNEL_STATS takes the system resource with KSTATS and returns
-/// `KernelStats::to_words` in x1-x7.
+/// `KernelStats::to_words` in x1-x8.
 pub const INFO_KERNEL_STATS: u64 = 4;
 
 /// A process's memory quota (spec 7.5), in bytes: the limit its parent
@@ -451,11 +456,15 @@ pub struct KernelStats {
     /// them: a pool takes a page as it grows, and the pages of a payer's
     /// pools go back with its shell (spec 7.8).
     pub pool_pages: u64,
+    /// The longest batch of expired timers one timer interrupt took, in
+    /// ticks: what the timers of programs add to the blocking of any
+    /// thread (spec 10).
+    pub longest_batch: u64,
 }
 
 impl KernelStats {
-    /// The words `object_info` returns in x1-x7.
-    pub const fn to_words(self) -> [u64; 7] {
+    /// The words `object_info` returns in x1-x8.
+    pub const fn to_words(self) -> [u64; 8] {
         [
             self.idle,
             self.idle_latency,
@@ -464,11 +473,12 @@ impl KernelStats {
             self.longest_portion,
             self.free_frames,
             self.pool_pages,
+            self.longest_batch,
         ]
     }
 
-    /// The counts from x1-x7 of `object_info`.
-    pub const fn from_words(words: [u64; 7]) -> KernelStats {
+    /// The counts from x1-x8 of `object_info`.
+    pub const fn from_words(words: [u64; 8]) -> KernelStats {
         KernelStats {
             idle: words[0],
             idle_latency: words[1],
@@ -477,6 +487,7 @@ impl KernelStats {
             longest_portion: words[4],
             free_frames: words[5],
             pool_pages: words[6],
+            longest_batch: words[7],
         }
     }
 }
@@ -787,6 +798,11 @@ mod tests {
     }
 
     #[test]
+    fn timers_have_a_fixed_bound() {
+        assert_eq!(MAX_TIMERS, 64);
+    }
+
+    #[test]
     fn notification_travels_in_eleven_words() {
         let n = Notification {
             source: Source::Session,
@@ -856,9 +872,9 @@ mod tests {
     }
 
     #[test]
-    fn kernel_stats_travel_in_seven_words() {
+    fn kernel_stats_travel_in_eight_words() {
         assert_eq!(INFO_KERNEL_STATS, 4);
-        let words = [1, 2, 3, 4, 5, 6, 7];
+        let words = [1, 2, 3, 4, 5, 6, 7, 8];
         let stats = KernelStats::from_words(words);
         assert_eq!(
             (stats.idle, stats.cleanup_queue, stats.pool_pages),
@@ -868,7 +884,7 @@ mod tests {
             (stats.idle_latency, stats.irq_latency, stats.longest_portion),
             (2, 3, 5)
         );
-        assert_eq!(stats.free_frames, 6);
+        assert_eq!((stats.free_frames, stats.longest_batch), (6, 8));
         assert_eq!(stats.to_words(), words);
     }
 

@@ -11,7 +11,7 @@
 //! which take and return handles typed by the kind of their object
 //! (`Handle`).
 
-use crate::handle::{Channel, Handle, Process, Resource, Thread};
+use crate::handle::{Channel, Handle, Process, Resource, Thread, Timer};
 use abi::{
     Call, Error, KernelStats, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState,
     Rights, Source,
@@ -266,7 +266,7 @@ pub fn kernel_stats(resource: &Handle<Resource>) -> Result<KernelStats, Error> {
     let args = [resource.raw().0, abi::INFO_KERNEL_STATS, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(KernelStats::from_words([
-        x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
     ]))
 }
 
@@ -367,4 +367,39 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
         bits,
         count,
     })
+}
+
+/// clock_now: nanoseconds on the counter's scale (spec 10), rounded down;
+/// the scale of the deadlines of `timer_set`. A program may read the
+/// counter itself (`time::now`) and convert it the same way
+/// (`time::ticks_to_ns`).
+pub fn clock_now() -> Result<u64, Error> {
+    let x = call::<{ Call::ClockNow.number() }>(&[])?;
+    Ok(x[1])
+}
+
+/// timer_create: a timer on `channel`, a handle with RECEIVE, whose
+/// notifications have `priority` (1-63, no higher than the caller's
+/// ceiling) and the label of the handle (spec 10). It is not armed. The
+/// caller's quota pays for it, and it holds one of the channel's slots
+/// until it goes; a process pays for abi::MAX_TIMERS at most
+/// (LIMIT_REACHED). The handle carries DUPLICATE, TRANSFER and MANAGE.
+pub fn timer_create(channel: &Handle<Channel>, priority: u8) -> Result<Handle<Timer>, Error> {
+    let x = call::<{ Call::TimerCreate.number() }>(&[channel.raw().0, priority.into()])?;
+    Ok(returned(&x))
+}
+
+/// timer_set: the timer fires at `deadline`, nanoseconds on the scale of
+/// `clock_now`, never before: bit 0 goes into its slot, and `receive`
+/// reports it as a notification of a timer. A deadline that passed fires
+/// in the call itself; a timer that was armed moves to the new deadline.
+/// PEER_CLOSED once the channel closed.
+pub fn timer_set(timer: &Handle<Timer>, deadline: u64) -> Result<(), Error> {
+    call::<{ Call::TimerSet.number() }>(&[timer.raw().0, deadline]).map(drop)
+}
+
+/// timer_cancel: the timer is armed no more; what it posted already stays
+/// in its slot. A timer that is not armed is left as it is.
+pub fn timer_cancel(timer: &Handle<Timer>) -> Result<(), Error> {
+    call::<{ Call::TimerCancel.number() }>(&[timer.raw().0]).map(drop)
 }

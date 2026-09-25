@@ -21,7 +21,7 @@ use crate::mm::phys::LinearMem;
 use crate::object::Object;
 use crate::process::Stage;
 use crate::thread::Policy;
-use crate::{process, sched, session, thread};
+use crate::{process, sched, session, thread, timer as timers};
 use abi::{Error, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -293,6 +293,19 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "notices_to_a_dying_parent_go_with_its_channel",
         calls::notices_to_a_dying_parent_go_with_its_channel,
+    ),
+    (
+        "timer_calls_check_their_arguments",
+        calls::timer_calls_check_their_arguments,
+    ),
+    ("timer_never_fires_early", calls::timer_never_fires_early),
+    (
+        "timer_in_the_past_fires_at_once",
+        calls::timer_in_the_past_fires_at_once,
+    ),
+    (
+        "dying_timer_does_not_fire",
+        calls::dying_timer_does_not_fire,
     ),
 ];
 
@@ -1432,9 +1445,10 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
 /// children fill every kind they pay for by the page, one after another,
 /// until their quotas run out: threads with their buffers and the tables
 /// over them, handles, children with a page of quota, channels, and
-/// sessions of a channel. After every kind the free frames are exactly the
-/// part of the quotas of the tree nobody used: no page was taken without
-/// its charge, and none that passed its charge missed its frame.
+/// sessions and timers of a channel. After every kind the free frames are
+/// exactly the part of the quotas of the tree nobody used: no page was
+/// taken without its charge, and none that passed its charge missed its
+/// frame.
 fn paid_charge_always_finds_a_frame(_: &Boot) -> Result<(), &'static str> {
     const PAGES: u64 = 160;
     cleanup::drain();
@@ -1462,14 +1476,16 @@ enum Kind {
     Children,
     Channels,
     Sessions,
+    Timers,
 }
 
-const KINDS: [Kind; 5] = [
+const KINDS: [Kind; 6] = [
     Kind::Threads,
     Kind::Handles,
     Kind::Children,
     Kind::Channels,
     Kind::Sessions,
+    Kind::Timers,
 ];
 
 /// Three children of `root`, each filling the kinds in another order, and
@@ -1494,10 +1510,10 @@ fn fill_the_tree(root: NonNull<process::Process>) -> Result<(), &'static str> {
 }
 
 /// Objects of `kind` for `p` until its quota runs out: the only error the
-/// kind may end with is NO_MEMORY, but for threads past abi::MAX_THREADS
-/// and sessions past the slots of their channel (abi::MAX_SLOTS). Handles
-/// in the table of `p` hold them; the sessions are of one channel that `p`
-/// makes first.
+/// kind may end with is NO_MEMORY, but for threads past abi::MAX_THREADS,
+/// sessions past the slots of their channel (abi::MAX_SLOTS) and timers
+/// past abi::MAX_TIMERS. Handles in the table of `p` hold them; the
+/// sessions and the timers are of one channel that `p` makes first.
 fn fill_kind(p: NonNull<process::Process>, kind: Kind) -> Result<(), &'static str> {
     let buffers = USER_VA + 16 * PAGE;
     let mut target = None;
@@ -1530,11 +1546,24 @@ fn fill_kind(p: NonNull<process::Process>, kind: Kind) -> Result<(), &'static st
                     held.map(|_| ())
                 }),
             },
+            Kind::Timers => match target {
+                None => held_channel(p).map(|c| target = Some(c)),
+                Some(c) => timers::create(p, c, 0, 10).and_then(|t| {
+                    let held = process::insert_handle(p, Object::Timer(t), Rights::NONE);
+                    // SAFETY: as above.
+                    unsafe { timers::release(t, CAUSE) };
+                    held.map(|_| ())
+                }),
+            },
         };
         match made {
             Ok(()) => {}
             Err(Error::NoMemory) => break,
-            Err(Error::LimitReached) if matches!(kind, Kind::Threads | Kind::Sessions) => break,
+            Err(Error::LimitReached)
+                if matches!(kind, Kind::Threads | Kind::Sessions | Kind::Timers) =>
+            {
+                break;
+            }
             Err(_) => return Err("a kind ended with another error than NO_MEMORY"),
         }
     }

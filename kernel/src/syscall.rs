@@ -21,11 +21,12 @@
 //! the wait ends (spec 11). Test builds also know numbers of their own, in
 //! abi::TEST_CALLS.
 
+use crate::arch::timer as clock;
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Thread};
-use crate::{channel, cleanup, sched, session};
+use crate::{channel, cleanup, sched, session, timer};
 use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, Notification, OWNER_RIGHTS, ProcessHandles,
     ProcessMemory, ProcessState, Rights,
@@ -89,6 +90,10 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::Yield) => yield_now(),
+        Some(Call::ClockNow) => clock_now(),
+        Some(Call::TimerCreate) => timer_create(thread, &args),
+        Some(Call::TimerSet) => timer_set(thread, &args),
+        Some(Call::TimerCancel) => timer_cancel(thread, &args),
         Some(Call::ObjectInfo) => object_info(thread, &args),
         Some(Call::DebugWrite) => debug_write(thread, &args),
         // Numbers no call has, and those of calls that come later.
@@ -509,12 +514,71 @@ fn yield_now() -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// clock_now(): x1 returns the counter in nanoseconds, rounded down
+/// (spec 10): the scale of the deadlines of timer_set.
+fn clock_now() -> Result<Values, Error> {
+    Ok(Values::new(&[clock::clock().ticks_to_ns(clock::now())]))
+}
+
+/// timer_create(x0 channel with RECEIVE, x1 priority): a timer on the
+/// channel, not armed, whose notifications have the priority and the
+/// label of the handle (spec 10); x1 returns a handle to it with
+/// DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS). The channel is the
+/// caller's own to receive from: its slots and the priorities that lift
+/// its receivers are the receiver's. The checks in the order of spec 11:
+/// the priority, 1-63 (INVALID_ARGS); the handle (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without RECEIVE); the priority above the caller's ceiling
+/// (ACCESS_DENIED); then the resources in the order the call takes them:
+/// room in the caller's table (LIMIT_REACHED), abi::MAX_TIMERS timers the
+/// caller pays for (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED,
+/// spec 6.5), a page of the caller's pool of timers and a block of its
+/// table (NO_MEMORY). A channel with a handle with RECEIVE is open. A
+/// timer whose handle did not go in goes again.
+fn timer_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let priority = priority_arg(a[1])?;
+    let (c, label) = lookup(thread, a[0], Rights::RECEIVE, |o| {
+        Some((o.channel()?, o.session().map_or(0, session::label)))
+    })?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    process::handle_room(caller(thread))?;
+    let t = timer::create(caller(thread), c, label, priority)?;
+    let h = process::insert_handle(caller(thread), Object::Timer(t), OWNER_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the timer, and without it the timer goes.
+    unsafe { timer::release(t, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// timer_set(x0 timer with MANAGE, x1 deadline): the timer fires at the
+/// deadline, nanoseconds on the scale of clock_now, rounded up to counter
+/// ticks so that it never fires early (spec 10). A deadline the counter
+/// reached fires in the call: bit 0 into the timer's slot, which goes to
+/// the top receiver that waits or into the channel's queue, as notify
+/// puts it; any other arms the timer, and an armed one moves. PEER_CLOSED
+/// once the channel closed, and the timer stays as it was. No memory is
+/// taken.
+fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
+    let deadline = clock::clock().ns_to_ticks(a[1]);
+    timer::set(t, deadline, cause(thread))?;
+    Ok(Values::NONE)
+}
+
+/// timer_cancel(x0 timer with MANAGE): the timer is armed no more; bits it
+/// posted stay in its slot until receive takes them (spec 10). A timer
+/// that is not armed is left as it is: 0.
+fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
+    timer::cancel(t);
+    Ok(Values::NONE)
+}
+
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any
 /// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
 /// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
-/// resource with KSTATS and returns abi::KernelStats in x1-x7 (spec 16).
+/// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if a[2] != 0 {
         return Err(Error::InvalidArgs);
@@ -554,8 +618,9 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 }
 
 /// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
-/// idle time and latencies, the cleanup queue, the frames and the pages of
-/// the pools and of the page logs of their payers.
+/// idle time and latencies, the cleanup queue, the frames, the pages of
+/// the pools and of the page logs of their payers, and the longest batch
+/// of expired timers.
 fn kernel_stats() -> KernelStats {
     let s = sched::stats();
     KernelStats {
@@ -566,6 +631,7 @@ fn kernel_stats() -> KernelStats {
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
+        longest_batch: timer::longest_batch(),
     }
 }
 
