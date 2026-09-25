@@ -80,6 +80,10 @@ impl Mmu for Cpu {
         unsafe { mmu::set_ttbr0(ttbr) }
     }
 
+    fn tables_written(&mut self) {
+        mmu::tables_written()
+    }
+
     fn flush_all(&mut self) {
         mmu::flush_tlb()
     }
@@ -144,7 +148,9 @@ impl AddressSpace {
     }
 
     /// Unmaps the page at `va`, drops its TLB entry and returns the frame
-    /// it mapped.
+    /// it mapped. The cleared descriptor reaches the table walker before
+    /// this returns, also when the space has no ASID and so no TLB entry
+    /// (kcore::tlb::forget_page): the frame may go elsewhere right after.
     #[cfg_attr(
         not(feature = "ktest"),
         expect(

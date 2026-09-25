@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The order of TTBR0 writes and TLB maintenance around address spaces
-//! (spec 7.2). QEMU drops its whole TLB whenever the ASID in TTBR0 changes,
-//! so it shows no missing step here; the tests run the same order against
-//! a TLB that caches whatever the tables in TTBR0 map, at any moment.
+//! The order of TTBR0 writes, barriers and TLB maintenance around address
+//! spaces (spec 7.2). QEMU drops its whole TLB whenever the ASID in TTBR0
+//! changes, and its table walker sees every store at once, so it shows no
+//! missing step here; the tests run the same order against a TLB that
+//! caches whatever the tables in TTBR0 map, at any moment, and a walker
+//! that may still read a cleared descriptor until a barrier.
 
 use crate::asid::{AsidAllocator, AsidTag, tlbi_asid, tlbi_page, ttbr0};
 use crate::paging::TTBR_ROOT_MASK;
@@ -15,7 +17,10 @@ pub trait Mmu {
     fn ttbr0(&self) -> u64;
     /// `msr ttbr0_el1; isb`
     fn set_ttbr0(&mut self, ttbr: u64);
-    /// `tlbi vmalle1; dsb nsh; isb`: every EL1&0 entry of this CPU.
+    /// `dsb ishst; isb`: earlier table stores reach the table walker.
+    fn tables_written(&mut self);
+    /// `dsb nshst; tlbi vmalle1; dsb nsh; isb`: every EL1&0 entry of this
+    /// CPU, after earlier table stores reach its walker.
     fn flush_all(&mut self);
     /// `dsb ishst; tlbi vale1is; dsb ish; isb`; `operand` from `tlbi_page`.
     fn invalidate_page(&mut self, operand: u64);
@@ -45,12 +50,15 @@ pub fn switch_to(
 }
 
 /// Drops the TLB entry of the page at `va` once the tables of the space
-/// with `tag` no longer map it. Without an ASID of this generation the TLB
-/// holds nothing of the space: the flush that began the generation dropped
-/// it.
+/// with `tag` no longer map it, and makes the store that cleared its
+/// descriptor reach the table walker before this returns. Without an ASID
+/// of this generation the TLB holds nothing of the space (the flush that
+/// began the generation dropped it), so only the barrier is left: the next
+/// activation may put the tables into TTBR0 with no barrier of its own.
 pub fn forget_page(asids: &AsidAllocator, tag: &AsidTag, va: u64, mmu: &mut impl Mmu) {
-    if let Some(asid) = asids.current(tag) {
-        mmu.invalidate_page(tlbi_page(va, asid));
+    match asids.current(tag) {
+        Some(asid) => mmu.invalidate_page(tlbi_page(va, asid)),
+        None => mmu.tables_written(),
     }
 }
 
@@ -83,6 +91,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum Op {
         SetTtbr0(u64),
+        TablesWritten,
         FlushAll,
         InvalidatePage(u64),
         InvalidateAsid(u64),
@@ -102,6 +111,9 @@ mod tests {
         fn set_ttbr0(&mut self, ttbr: u64) {
             self.ttbr0 = ttbr;
             self.ops.push(Op::SetTtbr0(ttbr));
+        }
+        fn tables_written(&mut self) {
+            self.ops.push(Op::TablesWritten);
         }
         fn flush_all(&mut self) {
             self.ops.push(Op::FlushAll);
@@ -154,7 +166,32 @@ mod tests {
         log.ops.clear();
         forget_page(&asids, &other, PAGES[0], &mut log);
         retire(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
-        assert!(log.ops.is_empty(), "a retired space touched the TLB");
+        assert_eq!(
+            log.ops,
+            [Op::TablesWritten],
+            "a retired space touched the TLB"
+        );
+    }
+
+    /// An unmap ends with a barrier whether or not the space has an ASID
+    /// of this generation: with one the barrier leads the TLBI, without one
+    /// it stands alone.
+    #[test]
+    fn forget_page_always_ends_the_table_store() {
+        let mut asids = AsidAllocator::new(8);
+        let mut log = Log::default();
+        let (mut ran, never_ran) = (AsidTag::default(), AsidTag::default());
+        switch_to(&mut asids, &mut ran, 0x5000, EMPTY, &mut log);
+        log.ops.clear();
+        forget_page(&asids, &ran, PAGES[0], &mut log);
+        forget_page(&asids, &never_ran, PAGES[0], &mut log);
+        assert_eq!(
+            log.ops,
+            [
+                Op::InvalidatePage(tlbi_page(PAGES[0], 1)),
+                Op::TablesWritten
+            ]
+        );
     }
 
     /// A cached translation: the ASID that tags it, the space whose tables
@@ -162,15 +199,40 @@ mod tests {
     type Entry = (u16, u32, u64);
 
     /// A TLB that walks the tables in TTBR0 before and after every
-    /// operation, as a CPU may at any moment, and keeps what it finds.
+    /// operation, as a CPU may at any moment, and keeps what it finds. A
+    /// descriptor cleared in memory stays visible to the walk until the
+    /// next barrier.
     struct Model {
         ttbr0: u64,
         tlb: HashSet<Entry>,
         /// Live tables by root: the space they belong to and its pages.
         tables: HashMap<u64, (u32, HashSet<u64>)>,
+        /// Pages unmapped in memory, as (root, page), whose cleared
+        /// descriptors the walker may not see yet.
+        stale: HashSet<(u64, u64)>,
     }
 
     impl Model {
+        fn new() -> Model {
+            Model {
+                ttbr0: ttbr0(EMPTY, 0),
+                tlb: HashSet::new(),
+                tables: HashMap::new(),
+                stale: HashSet::new(),
+            }
+        }
+
+        /// Clears the descriptor of `va` in the tables at `root`, a plain
+        /// store; returns whether the page was mapped.
+        fn unmap(&mut self, root: u64, va: u64) -> bool {
+            let pages = &mut self.tables.get_mut(&root).expect("live tables").1;
+            let mapped = pages.remove(&va);
+            if mapped {
+                self.stale.insert((root, va));
+            }
+            mapped
+        }
+
         fn walk(&mut self) {
             let root = self.ttbr0 & TTBR_ROOT_MASK;
             if root == EMPTY {
@@ -181,7 +243,8 @@ mod tests {
                 .get(&root)
                 .expect("TTBR0 holds tables that went back to the allocator");
             let asid = (self.ttbr0 >> 48) as u16;
-            for &va in pages {
+            let stale = self.stale.iter().filter(|s| s.0 == root).map(|s| s.1);
+            for va in pages.iter().copied().chain(stale) {
                 self.tlb.insert((asid, *space, va));
             }
         }
@@ -220,13 +283,21 @@ mod tests {
             self.ttbr0 = ttbr;
             self.walk();
         }
+        fn tables_written(&mut self) {
+            self.walk();
+            self.stale.clear();
+            self.walk();
+        }
+        // Each TLBI below begins with a barrier for the table stores.
         fn flush_all(&mut self) {
             self.walk();
+            self.stale.clear();
             self.tlb.clear();
             self.walk();
         }
         fn invalidate_page(&mut self, operand: u64) {
             self.walk();
+            self.stale.clear();
             let asid = (operand >> 48) as u16;
             let page = operand & ((1 << 44) - 1);
             self.tlb.retain(|&(a, _, va)| a != asid || va >> 12 != page);
@@ -234,10 +305,26 @@ mod tests {
         }
         fn invalidate_asid(&mut self, operand: u64) {
             self.walk();
+            self.stale.clear();
             let asid = (operand >> 48) as u16;
             self.tlb.retain(|&(a, _, _)| a != asid);
             self.walk();
         }
+    }
+
+    /// A space that never ran, and so has no ASID, unmaps a page and then
+    /// runs: the unmap needs no TLBI, but the walk after the switch must
+    /// not find the page.
+    #[test]
+    fn an_unmap_without_an_asid_reaches_the_walker_before_the_space_runs() {
+        let mut asids = AsidAllocator::new(8);
+        let mut m = Model::new();
+        m.tables.insert(0x5000, (1, PAGES.into_iter().collect()));
+        let mut tag = AsidTag::default();
+        assert!(m.unmap(0x5000, PAGES[0]));
+        forget_page(&asids, &tag, PAGES[0], &mut m);
+        switch_to(&mut asids, &mut tag, 0x5000, EMPTY, &mut m);
+        m.check(0);
     }
 
     struct Space {
@@ -253,11 +340,7 @@ mod tests {
     #[test]
     fn no_space_sees_what_it_should_not() {
         let mut asids = AsidAllocator::new(8);
-        let mut m = Model {
-            ttbr0: ttbr0(EMPTY, 0),
-            tlb: HashSet::new(),
-            tables: HashMap::new(),
-        };
+        let mut m = Model::new();
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut ids = 0;
         let mut new_space = |m: &mut Model, root: u64, bits: u64| {
@@ -284,9 +367,12 @@ mod tests {
             match x % 8 {
                 0 => {
                     let va = PAGES[(x >> 32) as usize % PAGES.len()];
-                    let pages = &mut m.tables.get_mut(&s.root).unwrap().1;
-                    if pages.remove(&va) {
+                    if m.unmap(s.root, va) {
                         forget_page(&asids, &s.tag, va, &mut m);
+                        assert!(
+                            m.stale.is_empty(),
+                            "step {step}: the walker may still see page {va:#x} after forget_page"
+                        );
                     }
                 }
                 1 => {
@@ -297,7 +383,10 @@ mod tests {
                         "step {step}: space {} left entries in the TLB",
                         s.id
                     );
-                    // The tables of the new space take the frames back at once.
+                    // The tables of the new space take the frames back at
+                    // once; their own stores and barrier come after any
+                    // left from the old space.
+                    m.stale.retain(|&(root, _)| root != s.root);
                     *s = new_space(&mut m, s.root, x >> 40);
                 }
                 _ => switch_to(&mut asids, &mut s.tag, s.root, EMPTY, &mut m),

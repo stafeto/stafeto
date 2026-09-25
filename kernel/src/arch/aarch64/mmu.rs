@@ -78,11 +78,14 @@ pub fn invalidate_asid(operand: u64) {
     };
 }
 
-/// Drops every EL1&0 TLB entry of this CPU.
+/// Drops every EL1&0 TLB entry of this CPU, after earlier table stores
+/// reach its walker, so that no walk between the stores and the TLBI brings
+/// an old descriptor back (Linux's local_flush_tlb_all).
 pub fn flush_tlb() {
     // SAFETY: as in `invalidate_page`.
     unsafe {
         asm!(
+            "dsb nshst",
             "tlbi vmalle1",
             "dsb nsh",
             "isb",
