@@ -120,7 +120,7 @@ pub const INIT_MSGBUF: u64 = INIT_STACK_TOP + 0x1000;
 pub enum Call {
     HandleClose = 1,
     HandleDuplicate = 2,
-    ChannelCreate = 3,
+    CreateChannel = 3,
     Send = 4,
     Receive = 5,
     Reply = 6,
@@ -153,7 +153,7 @@ impl Call {
     pub const ALL: [Call; 28] = [
         Call::HandleClose,
         Call::HandleDuplicate,
-        Call::ChannelCreate,
+        Call::CreateChannel,
         Call::Send,
         Call::Receive,
         Call::Reply,
