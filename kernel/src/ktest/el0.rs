@@ -21,9 +21,9 @@ use crate::cleanup;
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
-use crate::sched;
 use crate::syscall::{self, Values};
 use crate::thread::{self, Policy, Thread};
+use crate::{sched, session};
 use abi::{
     Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, ProcessState,
     Rights, Source,
@@ -560,8 +560,11 @@ fn start(first: usize) -> ! {
     report(
         "el0_tests_return_their_objects",
         check(
-            process::in_use() == 0 && thread::in_use() == 0 && channel::in_use() == 0,
-            "a process, a thread or a channel of the EL0 tests stayed in its pool",
+            process::in_use() == 0
+                && thread::in_use() == 0
+                && channel::in_use() == 0
+                && session::in_use() == 0,
+            "a process, a thread, a channel or a session of the EL0 tests stayed in its pool",
         ),
     );
     finish()

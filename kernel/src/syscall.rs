@@ -25,12 +25,13 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Thread};
-use crate::{channel, cleanup, sched};
+use crate::{channel, cleanup, sched, session};
 use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, Notification, OWNER_RIGHTS, ProcessHandles,
     ProcessMemory, ProcessState, Rights,
 };
 use core::ptr::NonNull;
+use kcore::handles::rights_arg;
 use kcore::notify::{bits_arg, wait_arg};
 use kcore::process::{handle_limit_arg, quota_arg};
 use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
@@ -76,6 +77,7 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     args.copy_from_slice(&unsafe { thread.as_ref() }.regs.x[..10]);
     let result = match Call::from_number(number) {
         Some(Call::HandleClose) => handle_close(thread, &args),
+        Some(Call::HandleDuplicate) => handle_duplicate(thread, &args),
         Some(Call::CreateChannel) => channel_create(thread, &args),
         Some(Call::Receive) => return receive(thread, &args),
         Some(Call::Notify) => notify(thread, &args),
@@ -152,6 +154,53 @@ fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// handle_duplicate(x0 handle with DUPLICATE, x1 rights, x2 label, x3
+/// priority): a copy of the handle with the rights, a subset of the
+/// handle's own, in x1 (spec 5.2, 5.3). With label 0 and priority 0 the
+/// copy names the same object, whatever its kind; a copy of a handle with
+/// a label carries that label and counts as one more copy of its session.
+/// A label that is not 0 goes on a copy of a channel handle that has none:
+/// the copy names a new session of the channel with the label and a slot
+/// of the priority, 1-63, which the caller's pool of sessions holds and its
+/// quota pays for. The checks in the order of spec 11: bits no right has, a
+/// priority without a label or a label without a priority 1-63
+/// (INVALID_ARGS); the handle (BAD_HANDLE), a label on what is no channel
+/// (WRONG_TYPE), no DUPLICATE or a right the handle lacks (ACCESS_DENIED);
+/// the priority above the caller's ceiling (ACCESS_DENIED); a label on a
+/// handle with one (BAD_STATE) or on a closed channel (PEER_CLOSED); then
+/// the resources in the order the call takes them: room in the caller's
+/// table (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED, spec 6.5),
+/// a page of the caller's pool of sessions and a block of its table
+/// (NO_MEMORY). A session whose handle did not go in goes again.
+fn handle_duplicate(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let rights = rights_arg(a[1])?;
+    let label = a[2];
+    let priority = notify_priority_arg(a[3], label != 0)?;
+    let needed = Rights::DUPLICATE | rights;
+    if label == 0 {
+        let object = lookup(thread, a[0], needed, |o| Some(*o))?;
+        let h = process::insert_handle(caller(thread), object, rights)?;
+        return Ok(Values::new(&[h.0]));
+    }
+    let (c, labelled) = lookup(thread, a[0], needed, |o| {
+        Some((o.channel()?, o.session().is_some()))
+    })?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    if labelled {
+        return Err(Error::BadState);
+    }
+    if channel::is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    process::handle_room(caller(thread))?;
+    let s = session::create(caller(thread), c, label, priority)?;
+    let h = process::insert_handle(caller(thread), Object::Session(s), rights);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the session, and without it the session goes.
+    unsafe { session::unref(s, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
 /// The priority ceiling of the caller's process.
 fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
     // SAFETY: the calling thread holds its process.
@@ -182,14 +231,20 @@ fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// notify(x0 channel with NOTIFY, x1 bits): the bits first, since bit 63,
 /// CLIENT_GONE, is the kernel's (INVALID_ARGS); then the handle, and
 /// PEER_CLOSED once no handle with RECEIVE is left (spec 6.5, 6.8). The
-/// bits go into the channel's slot of label 0, ORed with those not yet
+/// bits go into the channel's slot of label 0, or through a handle with a
+/// label into its session's slot (spec 5.3), ORed with those not yet
 /// received, and the slot to the top receiver that waits or into the
 /// queue of slots. A receiver woken above the caller runs before the call
 /// returns. No memory is taken, and nothing waits.
 fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let bits = bits_arg(a[1])?;
-    let c = lookup(thread, a[0], Rights::NOTIFY, Object::channel)?;
-    channel::notify(c, bits, cause(thread))?;
+    let (c, s) = lookup(thread, a[0], Rights::NOTIFY, |o| {
+        Some((o.channel()?, o.session()))
+    })?;
+    match s {
+        Some(s) => session::notify(s, bits, cause(thread))?,
+        None => channel::notify(c, bits, cause(thread))?,
+    }
     Ok(Values::NONE)
 }
 

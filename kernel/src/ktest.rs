@@ -21,7 +21,7 @@ use crate::mm::phys::LinearMem;
 use crate::object::Object;
 use crate::process::Stage;
 use crate::thread::Policy;
-use crate::{process, sched, thread};
+use crate::{process, sched, session, thread};
 use abi::{Error, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -265,6 +265,22 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "notify_after_close_is_peer_closed",
         calls::notify_after_close_is_peer_closed,
+    ),
+    (
+        "handle_duplicate_checks_its_arguments",
+        calls::handle_duplicate_checks_its_arguments,
+    ),
+    (
+        "session_is_paid_by_the_caller",
+        calls::session_is_paid_by_the_caller,
+    ),
+    (
+        "sessions_of_a_closed_channel_go",
+        calls::sessions_of_a_closed_channel_go,
+    ),
+    (
+        "client_gone_when_the_holder_dies",
+        calls::client_gone_when_the_holder_dies,
     ),
 ];
 
@@ -1403,10 +1419,10 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
 /// frames cut down to what a root's quota leaves, the root and its three
 /// children fill every kind they pay for by the page, one after another,
 /// until their quotas run out: threads with their buffers and the tables
-/// over them, handles, children with a page of quota, and channels. After every
-/// kind the free frames are exactly the part of the quotas of the tree
-/// nobody used: no page was taken without its charge, and none that
-/// passed its charge missed its frame.
+/// over them, handles, children with a page of quota, channels, and
+/// sessions of a channel. After every kind the free frames are exactly the
+/// part of the quotas of the tree nobody used: no page was taken without
+/// its charge, and none that passed its charge missed its frame.
 fn paid_charge_always_finds_a_frame(_: &Boot) -> Result<(), &'static str> {
     const PAGES: u64 = 160;
     cleanup::drain();
@@ -1433,9 +1449,16 @@ enum Kind {
     Handles,
     Children,
     Channels,
+    Sessions,
 }
 
-const KINDS: [Kind; 4] = [Kind::Threads, Kind::Handles, Kind::Children, Kind::Channels];
+const KINDS: [Kind; 5] = [
+    Kind::Threads,
+    Kind::Handles,
+    Kind::Children,
+    Kind::Channels,
+    Kind::Sessions,
+];
 
 /// Three children of `root`, each filling the kinds in another order, and
 /// then the root itself; the free frames are checked after each kind.
@@ -1459,10 +1482,13 @@ fn fill_the_tree(root: NonNull<process::Process>) -> Result<(), &'static str> {
 }
 
 /// Objects of `kind` for `p` until its quota runs out: the only error the
-/// kind may end with is NO_MEMORY, but for threads past abi::MAX_THREADS.
-/// Handles in the table of `p` hold them.
+/// kind may end with is NO_MEMORY, but for threads past abi::MAX_THREADS
+/// and sessions past the slots of their channel (abi::MAX_SLOTS). Handles
+/// in the table of `p` hold them; the sessions are of one channel that `p`
+/// makes first.
 fn fill_kind(p: NonNull<process::Process>, kind: Kind) -> Result<(), &'static str> {
     let buffers = USER_VA + 16 * PAGE;
+    let mut target = None;
     for i in 0.. {
         let made = match kind {
             Kind::Handles => process::insert_handle(p, Object::Resource, Rights::NONE).map(|_| ()),
@@ -1482,22 +1508,37 @@ fn fill_kind(p: NonNull<process::Process>, kind: Kind) -> Result<(), &'static st
                 unsafe { process::release(c, CAUSE) };
                 held.map(|_| ())
             }),
-            Kind::Channels => channel::create(p, 10).and_then(|c| {
-                let held = process::insert_handle(p, Object::Channel(c), Rights::RECEIVE);
-                // SAFETY: as above.
-                unsafe { channel::release(c, Rights::NONE, CAUSE) };
-                held.map(|_| ())
-            }),
+            Kind::Channels => held_channel(p).map(drop),
+            Kind::Sessions => match target {
+                None => held_channel(p).map(|c| target = Some(c)),
+                Some(c) => session::create(p, c, i as u64, 10).and_then(|s| {
+                    let held = process::insert_handle(p, Object::Session(s), Rights::NONE);
+                    // SAFETY: as above.
+                    unsafe { session::unref(s, CAUSE) };
+                    held.map(|_| ())
+                }),
+            },
         };
         match made {
             Ok(()) => {}
             Err(Error::NoMemory) => break,
-            Err(Error::LimitReached) if matches!(kind, Kind::Threads) => break,
+            Err(Error::LimitReached) if matches!(kind, Kind::Threads | Kind::Sessions) => break,
             Err(_) => return Err("a kind ended with another error than NO_MEMORY"),
         }
     }
     cleanup::drain();
     Ok(())
+}
+
+/// A channel of `p`, which a handle of `p` with RECEIVE holds.
+fn held_channel(p: NonNull<process::Process>) -> Result<NonNull<channel::Channel>, Error> {
+    channel::create(p, 10).and_then(|c| {
+        let held = process::insert_handle(p, Object::Channel(c), Rights::RECEIVE);
+        // SAFETY: the test's reference goes; the handle, if it went in,
+        // holds the channel.
+        unsafe { channel::release(c, Rights::NONE, CAUSE) };
+        held.map(|_| c)
+    })
 }
 
 /// The free frames are the part of the quotas of `tree` that nobody used:

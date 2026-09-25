@@ -2,15 +2,18 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
-//! reference to its process, thread or channel, and the last reference
-//! queues the object for cleanup (spec 7.7); a channel counts its handles
-//! with RECEIVE too, since the last of them closes it (spec 6.8). The
-//! system resource is one for the whole system and is not counted: what a
-//! handle to it allows is in the handle's rights.
+//! reference to its process, thread, channel or session, and the last
+//! reference queues the object for cleanup (spec 7.7); a channel counts its
+//! handles with RECEIVE too, since the last of them closes it (spec 6.8).
+//! A channel handle with a label names the label's session, which names
+//! the channel (spec 5.3) and counts its handles as its copies. The system
+//! resource is one for the whole system and is not counted: what a handle
+//! to it allows is in the handle's rights.
 
 use crate::channel::{self, Channel};
 use crate::mm::pages::KernelPages;
 use crate::process::{self, Process};
+use crate::session::{self, Session};
 use crate::thread::{self, Thread};
 use abi::Rights;
 use core::mem::{MaybeUninit, align_of, size_of};
@@ -23,6 +26,8 @@ pub enum Object {
     Process(NonNull<Process>),
     Thread(NonNull<Thread>),
     Channel(NonNull<Channel>),
+    /// A channel handle with a label (spec 5.3).
+    Session(NonNull<Session>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -52,10 +57,20 @@ impl Object {
         }
     }
 
-    /// The channel, for a lookup that needs one.
+    /// The channel, for a lookup that needs one: a handle with a label
+    /// names one through its session.
     pub fn channel(&self) -> Option<NonNull<Channel>> {
         match *self {
             Object::Channel(c) => Some(c),
+            Object::Session(s) => Some(session::channel(s)),
+            _ => None,
+        }
+    }
+
+    /// The session of a channel handle with a label.
+    pub fn session(&self) -> Option<NonNull<Session>> {
+        match *self {
+            Object::Session(s) => Some(s),
             _ => None,
         }
     }
@@ -72,6 +87,7 @@ pub fn retain(object: Object, rights: Rights) {
         Object::Process(p) => process::retain(p),
         Object::Thread(t) => thread::retain(t),
         Object::Channel(c) => channel::retain(c, rights),
+        Object::Session(s) => session::retain(s, rights),
         Object::Resource => {}
     }
 }
@@ -80,7 +96,8 @@ pub fn retain(object: Object, rights: Rights) {
 /// the object for cleanup at `cause` (1-63): the effective priority of the
 /// thread whose call let the reference go, or the level of the object
 /// whose portion did (spec 7.7). The last handle with RECEIVE to a channel
-/// closes it. Nothing is taken apart here.
+/// closes it, and the last copy of a session posts CLIENT_GONE (spec 5.3).
+/// Nothing is taken apart here.
 ///
 /// # Safety
 /// The reference was the handle's, and the handle is gone.
@@ -91,6 +108,7 @@ pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
             Object::Process(p) => process::release(p, cause),
             Object::Thread(t) => thread::release(t, cause),
             Object::Channel(c) => channel::release(c, rights, cause),
+            Object::Session(s) => session::release(s, rights, cause),
             Object::Resource => {}
         }
     }

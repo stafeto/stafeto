@@ -14,12 +14,13 @@ use crate::cleanup;
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
+use crate::session::{self, Session};
 use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
 use abi::{
-    CHANNEL_RIGHTS, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
+    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
     INFO_PROCESS_MEMORY, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
-    INIT_RESOURCE_RIGHTS, INIT_THREAD, KernelStats, NO_WAIT, Notification, OWNER_RIGHTS,
+    INIT_RESOURCE_RIGHTS, INIT_THREAD, KernelStats, MAX_SLOTS, NO_WAIT, Notification, OWNER_RIGHTS,
     ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
@@ -1325,4 +1326,395 @@ pub fn notify_after_close_is_peer_closed(_: &Boot) -> Result<(), &'static str> {
         channel::in_use() == channels,
         "the channel stayed after its last handle",
     )
+}
+
+/// x1-x9 of a receive that took `count` posts of `bits` from the slot of
+/// the session with `label`, which x10 holds (`label_of`).
+fn labelled(label: u64, bits: u64, count: u32) -> [u64; 9] {
+    let n = Notification {
+        source: Source::Session,
+        label,
+        bits,
+        count,
+    };
+    n.to_words()[..9].try_into().expect("x1-x9")
+}
+
+/// x10 of the caller's thread: the label of what its receive took.
+fn label_of(c: &Caller) -> u64 {
+    // SAFETY: the thread is the test's and never runs.
+    unsafe { c.thread.as_ref() }.regs.x[10]
+}
+
+/// The session behind the caller's handle `h`.
+fn session_of(c: &Caller, h: Handle) -> Result<NonNull<Session>, &'static str> {
+    // SAFETY: the caller's process is the test's.
+    unsafe { c.process.as_ref() }
+        .lookup(h, Rights::NONE, Object::session)
+        .map_err(|_| "the handle does not name a session")
+}
+
+/// handle_duplicate(x0 handle, x1 rights, x2 label, x3 priority) checks in
+/// the order of spec 11 and changes x0 alone on an error: values first
+/// (bits no right has, a priority without a label, a label without one, a
+/// priority outside 1-63), then the handle (BAD_HANDLE; a label on a
+/// handle that is no channel, WRONG_TYPE; no DUPLICATE or a right the
+/// original lacks, ACCESS_DENIED), then the ceiling (a priority above the
+/// caller's 30), then the state (a new label on a handle with one,
+/// BAD_STATE; on a closed channel, PEER_CLOSED), then the resources in the
+/// order the call takes them: the caller's table (LIMIT_REACHED), the
+/// channel's slots (LIMIT_REACHED, abi::MAX_SLOTS with the slot of label
+/// 0), the caller's quota for a page of its pool of sessions (NO_MEMORY);
+/// nothing is made then. A good call returns the copy in x1 alone: with
+/// label 0 it names the same object, a session's copy the same session;
+/// a label makes a session of the channel at the priority, which the
+/// caller pays for. A copy with a label and RECEIVE keeps the channel
+/// open.
+pub fn handle_duplicate_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+    let (sessions, channels) = (session::in_use(), channel::in_use());
+    let callers = [30, 63].map(Caller::with_ceiling);
+    let result = match &callers {
+        [Ok(c), Ok(other)] => duplicate_cases(c, other),
+        _ => Err("no process or thread"),
+    };
+    for caller in callers.into_iter().flatten() {
+        caller.release();
+    }
+    result?;
+    check(
+        session::in_use() == sessions && channel::in_use() == channels,
+        "a session or a channel of the test stayed in its pool",
+    )
+}
+
+fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let result = channel_of(c, h).and_then(|ch| {
+        let resource = c.insert(Object::Resource, Rights::DEBUG | Rights::DUPLICATE)?;
+        let notify_only = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
+        let own = c.insert(Object::Process(c.process), Rights::NONE)?;
+        let result = duplicate_check_order(c, [h, resource, notify_only, own])
+            .and_then(|()| duplicate_resources(c, h))
+            .and_then(|()| duplicate_results(c, [h, resource]))
+            .and_then(|()| slots_come_before_the_quota(c, other));
+        for handle in [resource, notify_only, own] {
+            c.close(handle)?;
+        }
+        result
+    });
+    // Closed already when the cases went through.
+    let _ = process::close_handle(c.process, h, super::CAUSE);
+    result
+}
+
+fn duplicate_check_order(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static str> {
+    let n = Call::HandleDuplicate.number();
+    let [h, resource, notify_only, own] = handles.map(|h| h.0);
+    let closed = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(closed)?;
+    let closed = closed.0;
+    let notify = u64::from(Rights::NOTIFY.0);
+    for [rights, label, priority] in [
+        [1 << 12, 0, 0],
+        [1 << 32, 0, 0],
+        [0, 0, 5],
+        [0, 7, 0],
+        [0, 7, 64],
+        [0, 7, 0x100 | 5],
+    ] {
+        c.fails(n, &[closed, rights, label, priority], Error::InvalidArgs)?;
+    }
+    c.fails(n, &[closed, 0, 0, 0], Error::BadHandle)?;
+    c.fails(n, &[0, 0, 7, 5], Error::BadHandle)?;
+    // A label on what is no channel, before the missing right.
+    c.fails(n, &[resource, 0, 7, 5], Error::WrongType)?;
+    c.fails(n, &[own, 0, 7, 5], Error::WrongType)?;
+    c.fails(n, &[own, 0, 0, 0], Error::AccessDenied)?;
+    c.fails(n, &[notify_only, notify, 0, 0], Error::AccessDenied)?;
+    c.fails(n, &[notify_only, notify, 7, 5], Error::AccessDenied)?;
+    let more = u64::from((Rights::DEBUG | Rights::KSTATS).0);
+    c.fails(n, &[resource, more, 0, 0], Error::AccessDenied)?;
+    c.fails(
+        n,
+        &[h, u64::from(Rights::MANAGE.0), 0, 0],
+        Error::AccessDenied,
+    )?;
+    // The ceiling comes after the handle.
+    c.fails(n, &[closed, notify, 7, 31], Error::BadHandle)?;
+    c.fails(n, &[h, notify, 7, 31], Error::AccessDenied)
+}
+
+/// The resources of a label, none of which makes a session: the caller's
+/// quota falls short for the first page of its pool of sessions
+/// (NO_MEMORY), and its full table comes first (LIMIT_REACHED).
+fn duplicate_resources(c: &Caller, h: Handle) -> Result<(), &'static str> {
+    let n = Call::HandleDuplicate.number();
+    let args = [h.0, u64::from(Rights::NOTIFY.0), 7, 10];
+    let sessions = session::in_use();
+    with_used_quota(c, || {
+        c.fails(n, &args, Error::NoMemory)?;
+        with_full_table(c, n, &args)
+    })?;
+    with_full_table(c, n, &[h.0, u64::from(Rights::NOTIFY.0), 0, 0])?;
+    cleanup::drain();
+    check(
+        session::in_use() == sessions,
+        "a session of a call that failed stayed",
+    )
+}
+
+/// Good calls: copies with label 0 of the resource and of a session, a
+/// session of the channel, a new label on a session (BAD_STATE, after the
+/// ceiling), and a copy with a label and RECEIVE that keeps the channel
+/// open once its handle with no label went; its close closes the channel,
+/// and a new label on it fails with PEER_CLOSED.
+fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
+    let n = Call::HandleDuplicate.number();
+    let [h, resource] = handles;
+    let (notify, receive) = (u64::from(Rights::NOTIFY.0), u64::from(Rights::RECEIVE.0));
+    let debug = c.created(n, &[resource.0, u64::from(Rights::DEBUG.0), 0, 0])?;
+    // SAFETY: the caller's process is the test's.
+    let table = unsafe { c.process.as_ref() };
+    check(
+        table.lookup(debug, Rights::DEBUG, Object::resource).is_ok()
+            && table.lookup(debug, Rights::DUPLICATE, Object::resource) == Err(Error::AccessDenied),
+        "the copy of the resource does not carry DEBUG alone",
+    )?;
+    c.close(debug)?;
+    let duplicate = u64::from((Rights::NOTIFY | Rights::DUPLICATE).0);
+    let first = c.created(n, &[h.0, duplicate, 7, 30])?;
+    let same = c.created(n, &[first.0, notify, 0, 0])?;
+    let s = session_of(c, first)?;
+    let named = session_of(c, same).is_ok_and(|t| t == s)
+        && session::label(s) == 7
+        && session::priority(s) == 30
+        && Some(session::channel(s)) == channel_of(c, h).ok()
+        && session::payer(s) == c.process;
+    c.fails(n, &[first.0, notify, 8, 31], Error::AccessDenied)?;
+    c.fails(n, &[first.0, notify, 8, 30], Error::BadState)?;
+    let left = c.created(n, &[h.0, duplicate, 0, 0])?;
+    let receiver = c.created(n, &[h.0, receive, 9, 10])?;
+    c.close(h)?;
+    c.succeeds(Call::Notify.number(), &[same.0, 1], &[])?;
+    c.succeeds(
+        Call::Receive.number(),
+        &[receiver.0, NO_WAIT],
+        &labelled(7, 1, 1),
+    )?;
+    let label = label_of(c);
+    c.close(receiver)?;
+    c.fails(n, &[left.0, notify, 8, 10], Error::PeerClosed)?;
+    c.fails(Call::Notify.number(), &[same.0, 1], Error::PeerClosed)?;
+    for handle in [first, same, left] {
+        c.close(handle)?;
+    }
+    cleanup::drain();
+    check(
+        named,
+        "the session does not carry the label, the priority, the channel and the caller as its payer",
+    )?;
+    check(
+        label == 7,
+        "a copy with a label and RECEIVE did not keep the channel open",
+    )
+}
+
+/// The channel's slots come before the quota: `other` fills the slots of
+/// the channel with sessions it closes at once, CLIENT_GONE holding each,
+/// until LIMIT_REACHED; then a label fails with LIMIT_REACHED even with
+/// the caller's quota used up. The channel is a new one: the first closed.
+fn slots_come_before_the_quota(c: &Caller, other: &Caller) -> Result<(), &'static str> {
+    let n = Call::HandleDuplicate.number();
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let result = channel_of(c, h).and_then(|ch| {
+        let d = other.insert(Object::Channel(ch), Rights::DUPLICATE)?;
+        let mut made = 0;
+        let full = loop {
+            let got = other.call(n, &[d.0, 0, made + 1, 10]);
+            if got[0] != 0 {
+                break got[0];
+            }
+            other.close(Handle(got[1]))?;
+            made += 1;
+        };
+        other.close(d)?;
+        check(
+            full == Error::LimitReached.code() && made == u64::from(MAX_SLOTS) - 1,
+            "the slots of a channel did not end at abi::MAX_SLOTS with the slot of label 0",
+        )?;
+        with_used_quota(c, || {
+            c.fails(
+                n,
+                &[h.0, u64::from(Rights::NOTIFY.0), 1, 10],
+                Error::LimitReached,
+            )
+        })
+    });
+    c.close(h)?;
+    cleanup::drain();
+    result
+}
+
+/// A session lies in the pool of the process that called handle_duplicate,
+/// which pays for its page (spec 5.3, 7.8): the owner makes a channel, a
+/// client with a copy with DUPLICATE labels it twice; the client's used
+/// memory grows by one page, and the owner's does not change.
+pub fn session_is_paid_by_the_caller(_: &Boot) -> Result<(), &'static str> {
+    let sessions = session::in_use();
+    let callers = [63, 63].map(Caller::with_ceiling);
+    let result = match &callers {
+        [Ok(owner), Ok(client)] => paid_sessions(owner, client),
+        _ => Err("no process or thread"),
+    };
+    for caller in callers.into_iter().flatten() {
+        caller.release();
+    }
+    result?;
+    check(
+        session::in_use() == sessions,
+        "a session of the test stayed in its pool",
+    )
+}
+
+fn paid_sessions(owner: &Caller, client: &Caller) -> Result<(), &'static str> {
+    let n = Call::HandleDuplicate.number();
+    let h = owner.created(Call::CreateChannel.number(), &[10])?;
+    let result = channel_of(owner, h).and_then(|ch| {
+        // The client's table has its first page of blocks: the page below
+        // is the pool's.
+        let d = client.insert(Object::Channel(ch), Rights::NOTIFY | Rights::DUPLICATE)?;
+        let used = |c: &Caller| process::quota(c.process).used();
+        let before = (used(client), used(owner));
+        let notify = u64::from(Rights::NOTIFY.0);
+        let sessions = [1, 2].map(|label| client.created(n, &[d.0, notify, label, 10]));
+        let after = (used(client), used(owner));
+        let payer = sessions[0].and_then(|s| session_of(client, s)).map(session::payer);
+        for s in sessions.into_iter().flatten() {
+            client.close(s)?;
+        }
+        client.close(d)?;
+        check(
+            after == (before.0 + PAGE_SIZE, before.1),
+            "the caller of handle_duplicate did not pay one page for its sessions, or the channel's owner paid",
+        )?;
+        check(
+            payer == Ok(client.process),
+            "the session does not name its caller as its payer",
+        )
+    });
+    owner.close(h)?;
+    cleanup::drain();
+    result
+}
+
+/// Sessions of a closed channel go (spec 5.3, 6.8): the stage Close
+/// empties the slot with CLIENT_GONE, and its session goes, queued at the
+/// level of the portion that let it go (spec 7.7); a session whose slot
+/// was queued with bits and whose copy is left stays, and so does one with
+/// nothing queued, until their copies close. The channel goes after them,
+/// and once the caller went the pages of its pools too.
+pub fn sessions_of_a_closed_channel_go(_: &Boot) -> Result<(), &'static str> {
+    // One round first: the pool of shells of the tests' processes keeps
+    // the page it takes.
+    Caller::new()?.release();
+    let (sessions, channels, taken) = (session::in_use(), channel::in_use(), pages::taken());
+    let c = Caller::new()?;
+    let result = closed_sessions(&c, sessions);
+    c.release();
+    result?;
+    check(
+        session::in_use() == sessions && channel::in_use() == channels,
+        "a session or the channel stayed after the channel closed",
+    )?;
+    check(
+        pages::taken() == taken,
+        "the pages of the pools did not go with the caller",
+    )
+}
+
+fn closed_sessions(c: &Caller, sessions: usize) -> Result<(), &'static str> {
+    let n = Call::HandleDuplicate.number();
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let notify = u64::from(Rights::NOTIFY.0);
+    let [idle, gone, posted] = [1, 2, 3].map(|label| c.created(n, &[h.0, notify, label, 10]));
+    let (idle, gone, posted) = (idle?, gone?, posted?);
+    c.succeeds(Call::Notify.number(), &[posted.0, 1], &[])?;
+    c.close(gone)?;
+    c.close(h)?;
+    let queued = cleanup::len();
+    cleanup::portion();
+    let released = cleanup::top();
+    cleanup::drain();
+    let held = session::in_use() - sessions;
+    c.close(idle)?;
+    c.close(posted)?;
+    cleanup::drain();
+    check(
+        queued == 1,
+        "the closed channel did not go to its stage Close",
+    )?;
+    check(
+        released == Some(CAUSE),
+        "the stage Close did not let the session with CLIENT_GONE go at its level",
+    )?;
+    check(
+        held == 2,
+        "the stage Close did not let the session with CLIENT_GONE go, or let one with a copy go",
+    )
+}
+
+/// Spec 15.2 (refusals): a process that holds the only handle with a label
+/// dies (spec 5.3, 6.8). Its teardown runs at R, the level of its end, and
+/// its stage Handles lets the last copy go, which posts CLIENT_GONE with
+/// the label into the session's slot: nothing is there before, the
+/// channel's owner takes the notice afterwards, and the session goes at
+/// the priority of its slot, 20, which the receive runs at (spec 6.6,
+/// 7.7).
+pub fn client_gone_when_the_holder_dies(_: &Boot) -> Result<(), &'static str> {
+    let (sessions, processes) = (session::in_use(), process::in_use());
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let result = channel_of(c, h).and_then(|ch| holder_dies(c, h, ch));
+        c.close(h)?;
+        result
+    })?;
+    check(
+        session::in_use() == sessions && process::in_use() == processes,
+        "the session or the holder stayed",
+    )
+}
+
+/// The level of the holder's end.
+const HOLDER_END: u8 = 5;
+
+fn holder_dies(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'static str> {
+    let holder = Caller::new()?;
+    let result = (|| {
+        let d = holder.insert(Object::Channel(ch), Rights::NOTIFY | Rights::DUPLICATE)?;
+        let notify = u64::from(Rights::NOTIFY.0);
+        holder.created(Call::HandleDuplicate.number(), &[d.0, notify, 0xD1E, 20])?;
+        holder.close(d)?;
+        // SAFETY: the holder's process is the test's.
+        unsafe { process::end(holder.process, ProcessState::Killed, HOLDER_END) };
+        let level = cleanup::top();
+        c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
+        cleanup::drain();
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &labelled(0xD1E, CLIENT_GONE, 1),
+        )?;
+        let gone_at = cleanup::top();
+        cleanup::drain();
+        check(
+            gone_at == Some(20),
+            "the session did not go at the priority of its CLIENT_GONE",
+        )?;
+        check(
+            level == Some(HOLDER_END) && label_of(c) == 0xD1E,
+            "the holder's teardown did not run at the level of its end, or the label did not come",
+        )
+    })();
+    holder.release();
+    result
 }

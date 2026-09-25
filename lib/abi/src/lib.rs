@@ -59,6 +59,9 @@ impl Rights {
     pub const DEVICE: Rights = Rights(1 << 9);
     pub const DEBUG: Rights = Rights(1 << 10);
     pub const KSTATS: Rights = Rights(1 << 11);
+    /// Every right there is: `handle_duplicate` fails any other bit with
+    /// INVALID_ARGS.
+    pub const ALL: Rights = Rights((1 << 12) - 1);
 
     pub const fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
@@ -255,6 +258,16 @@ pub const NO_WAIT: u64 = 1 << 16;
 
 /// Where the kind of what `receive` took starts in its x1: bits 24-27.
 pub const SOURCE_SHIFT: u32 = 24;
+
+/// Bit 63 of the bits of a session's notification: the last handle with
+/// its label went, or the process that held it ended (spec 5.3). Only the
+/// kernel posts it: `notify` with it fails with INVALID_ARGS.
+pub const CLIENT_GONE: u64 = 1 << 63;
+
+/// Notification slots of one channel, its slot of label 0 among them
+/// (spec 6.5): a source past them fails with LIMIT_REACHED. A source holds
+/// its slot from its creation until it goes.
+pub const MAX_SLOTS: u32 = 1024;
 
 /// What `receive` took (spec 6.5, 11): bits 24-27 of its x1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,6 +684,7 @@ mod tests {
         ];
         let union = all.iter().fold(Rights::NONE, |a, b| a | *b);
         assert_eq!(union.0.count_ones(), 12);
+        assert_eq!(union, Rights::ALL);
     }
 
     #[test]
@@ -764,6 +778,12 @@ mod tests {
         assert_eq!(Source::from_code(15), Source::Unknown(15));
         assert_eq!(Source::Unknown(15).code(), 15);
         assert_eq!((NO_WAIT, SOURCE_SHIFT), (1 << 16, 24));
+    }
+
+    #[test]
+    fn sessions_have_fixed_bounds() {
+        assert_eq!(CLIENT_GONE, 1 << 63);
+        assert_eq!(MAX_SLOTS, 1024);
     }
 
     #[test]

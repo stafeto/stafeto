@@ -19,10 +19,10 @@
 //! it once more. Every release names the level of its cause, which the
 //! cleanup it may start takes. A process pays from its quota for what goes
 //! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
-//! threads, the blocks of its handle table, the shells of its children and
-//! the channels it made; and for the tables of its space, the message
-//! buffers of its threads and
-//! the frames of `map_frames`. The pages of its pools go back only with
+//! threads, the blocks of its handle table, the shells of its children, the
+//! channels it made and the sessions of the labels it gave (spec 5.3); and
+//! for the tables of its space, the message buffers of its threads and the
+//! frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
 //! rest with its shell.
@@ -34,6 +34,7 @@ use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys::FRAMES;
 use crate::object::{self, Block, Chunks, Handles, Object};
 use crate::sched;
+use crate::session::Session;
 use crate::thread::{self, Siblings, Thread};
 use abi::{Error, Handle, MAX_THREADS, ProcessState, Rights};
 use core::ptr::NonNull;
@@ -71,8 +72,9 @@ pub struct Process {
     refs: u32,
     /// References that keep the object but not the process: each child's
     /// to its parent, until the child's shell goes, when the rest of the
-    /// child's quota comes back (spec 7.5), and each channel's the process
-    /// pays for, until the channel's slot goes back to its pool (spec 7.8).
+    /// child's quota comes back (spec 7.5), and each channel's and each
+    /// session's the process pays for, until its place goes back to the
+    /// pool (spec 7.8).
     /// A ring of a parent that holds a handle to its child and a child that
     /// holds its parent does not keep the parent alive.
     shell_refs: u32,
@@ -138,6 +140,8 @@ struct Pools {
     children: Pool<Process>,
     /// The channels it made.
     channels: Pool<Channel>,
+    /// The sessions of the labels it gave (handle_duplicate).
+    sessions: Pool<Session>,
 }
 
 /// Neighbours in the list of a parent's children.
@@ -400,6 +404,7 @@ fn create(
             blocks: Pool::new(),
             children: Pool::new(),
             channels: Pool::new(),
+            sessions: Pool::new(),
         },
         ceiling,
         life: Life::new(),
@@ -1270,6 +1275,30 @@ pub fn channel_slot(
 pub unsafe fn free_channel_slot(process: NonNull<Process>, c: NonNull<Channel>) {
     // SAFETY: the caller's promise; only the pool is touched.
     unsafe { (*process.as_ptr()).pools.channels.free(c) }
+}
+
+/// A place for `session`, which `process` makes (session::create), in the
+/// process's pool of sessions, whose quota pays for a page when the pool
+/// grows (spec 5.3, 7.8). NO_MEMORY when the quota falls short.
+pub fn session_slot(
+    process: NonNull<Process>,
+    session: Session,
+) -> Result<NonNull<Session>, Error> {
+    // SAFETY: the caller holds a reference to the process; the session is
+    // no field of it.
+    unsafe { paid_slot(process, |pools| &mut pools.sessions, session) }.map_err(|_| Error::NoMemory)
+}
+
+/// Gives the place of `s`, a session that `process` paid for and that goes
+/// (session::clean), back to the process's pool of sessions, where its
+/// page stays paid until the process's shell goes.
+///
+/// # Safety
+/// `s` came from `session_slot` of `process`, whose shell it holds, and
+/// nothing uses it afterwards.
+pub unsafe fn free_session_slot(process: NonNull<Process>, s: NonNull<Session>) {
+    // SAFETY: the caller's promise; only the pool is touched.
+    unsafe { (*process.as_ptr()).pools.sessions.free(s) }
 }
 
 /// The links of `t`, a thread in its process's list.

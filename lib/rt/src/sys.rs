@@ -14,7 +14,7 @@
 use crate::handle::{Channel, Handle, Process, Resource, Thread};
 use abi::{
     Call, Error, KernelStats, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState,
-    Source,
+    Rights, Source,
 };
 use core::arch::asm;
 
@@ -83,6 +83,33 @@ impl<K> Handle<K> {
     pub fn close(self) -> Result<(), Error> {
         call::<{ Call::HandleClose.number() }>(&[self.raw().0]).map(drop)
     }
+}
+
+/// handle_duplicate with no new label (spec 5.2, 5.3): a copy of `h` with
+/// `rights`, which the handle has, and it needs DUPLICATE. A copy of a
+/// handle with a label carries that label.
+pub fn handle_duplicate<K>(h: &Handle<K>, rights: Rights) -> Result<Handle<K>, Error> {
+    let args = [h.raw().0, rights.0.into(), 0, 0];
+    let x = call::<{ Call::HandleDuplicate.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
+/// handle_duplicate with a new label: a copy of `channel`, a handle with no
+/// label and with DUPLICATE, that carries `rights` and `label` (not 0).
+/// The kernel makes a session for it (spec 5.3), whose slot has `priority`
+/// (1-63, no higher than the caller's ceiling) and which the caller's
+/// quota pays for. notify through the copy and its copies goes into the
+/// session's slot, and receive reports the label; when the last of them
+/// goes, the session's slot gets CLIENT_GONE.
+pub fn handle_label(
+    channel: &Handle<Channel>,
+    rights: Rights,
+    label: u64,
+    priority: u8,
+) -> Result<Handle<Channel>, Error> {
+    let args = [channel.raw().0, rights.0.into(), label, priority.into()];
+    let x = call::<{ Call::HandleDuplicate.number() }>(&args)?;
+    Ok(returned(&x))
 }
 
 /// process_create with no exit channel and no start channel, the only kind

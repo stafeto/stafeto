@@ -17,7 +17,7 @@ use core::ptr::NonNull;
 
 /// Bit 63, CLIENT_GONE: only the kernel posts it, into the slot of a
 /// session whose last copy went (spec 5.3).
-pub const BIT_CLIENT_GONE: u64 = 1 << 63;
+pub const BIT_CLIENT_GONE: u64 = abi::CLIENT_GONE;
 
 /// The bits of `notify` from a register: INVALID_ARGS with bit 63, in any
 /// slot, so that no client fakes the end of another; no bits at all are

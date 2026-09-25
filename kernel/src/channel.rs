@@ -12,19 +12,24 @@
 //! links threads through the scheduler's own links, so every change to the
 //! queues happens under the scheduler's lock (sched::locked). A channel
 //! lives while references to it are left: handles with any rights, threads
-//! that wait in it, and the cleanup queue's while it closes; the last one
-//! queues its shell (spec 7.7). The last handle with RECEIVE closes it in
-//! the call itself: `notify` fails with PEER_CLOSED from then on, nothing
-//! new waits or is queued, and the stage Close wakes the receivers that
-//! wait with PEER_CLOSED and empties the queued slots, CLOSE_PORTION a
-//! portion.
+//! that wait in it, the sources of notifications that have a slot there
+//! (sessions from milestone 1.3b on), and the cleanup queue's while it
+//! closes; the last one queues its shell (spec 7.7). Every source holds
+//! one of its abi::MAX_SLOTS slots, the slot of label 0 among them, from
+//! its creation until it goes, and a slot that stands in the queue holds
+//! its owner until receive or the stage Close takes it (spec 6.5). The last
+//! handle with RECEIVE closes it in the call itself: `notify` fails with
+//! PEER_CLOSED from then on, nothing new waits or is queued, and the stage
+//! Close wakes the receivers that wait with PEER_CLOSED and empties the
+//! queued slots, letting their owners go, CLOSE_PORTION a portion.
 
 use crate::cleanup::{self, Item};
 use crate::object::Object;
 use crate::process::{self, Process};
+use crate::session::{self, Session};
 use crate::thread::Thread;
 use crate::{sched, syscall};
-use abi::{Error, Notification, Rights, Source};
+use abi::{Error, MAX_SLOTS, Notification, Rights, Source};
 use core::ptr::NonNull;
 use kcore::notify::{Post, Queue, Slot};
 use kcore::sched::Scheduler;
@@ -34,23 +39,52 @@ use kcore::sched::Scheduler;
 const CLOSE_PORTION: usize = 64;
 
 /// Whose slot it is (spec 6.5), which gives the source and the label that
-/// `receive` reports. The slot of label 0 is the channel's own.
+/// `receive` reports. The slot of label 0 is the channel's own; the slot of
+/// any other source lies in its owner, which a queued slot holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Owner {
     /// The channel: `notify` through a handle with no label.
     Channel,
+    /// A session: `notify` through a handle with its label, and
+    /// CLIENT_GONE (spec 5.3).
+    Session(NonNull<Session>),
 }
 
 impl Owner {
     fn source(self) -> Source {
         match self {
             Owner::Channel => Source::Unlabeled,
+            Owner::Session(_) => Source::Session,
         }
     }
 
     fn label(self) -> u64 {
         match self {
             Owner::Channel => 0,
+            Owner::Session(s) => session::label(s),
+        }
+    }
+
+    /// The slot just went into the queue, and it holds its owner from now
+    /// on (spec 6.5); the channel holds its own slot. Only counts, so it
+    /// runs under the scheduler's lock.
+    fn hold(self) {
+        match self {
+            Owner::Channel => {}
+            Owner::Session(s) => session::hold(s),
+        }
+    }
+
+    /// The slot left the queue: receive or the stage Close took it, and
+    /// the reference `hold` took goes at `cause`, which may queue the owner.
+    ///
+    /// # Safety
+    /// `hold` took the reference, and the slot is in no queue.
+    unsafe fn let_go(self, cause: u8) {
+        match self {
+            Owner::Channel => {}
+            // SAFETY: the caller's promise.
+            Owner::Session(s) => unsafe { session::unref(s, cause) },
         }
     }
 }
@@ -63,9 +97,13 @@ pub struct Channel {
     queue: Queue<Owner, Thread>,
     /// Handles to it with RECEIVE; the last one to go closes it.
     receivers: u32,
-    /// Handles to it, threads that wait in it, and the cleanup queue's
-    /// while it is at its stage Close: the references that keep it.
+    /// Handles to it, threads that wait in it, the sources that have a
+    /// slot in it, and the cleanup queue's while it is at its stage Close:
+    /// the references that keep it.
     refs: u32,
+    /// Sources with a slot in it, the slot of label 0 among them: at most
+    /// abi::MAX_SLOTS (spec 6.5).
+    sources: u32,
     /// No handle with RECEIVE is left (spec 6.8).
     closed: bool,
     /// The process whose pool of channels holds it, and whose shell it
@@ -105,6 +143,7 @@ pub fn create(payer: NonNull<Process>, priority: u8) -> Result<NonNull<Channel>,
         queue: Queue::new(),
         receivers: 0,
         refs: 1,
+        sources: 1,
         closed: false,
         payer,
         cleanup: Item::new(),
@@ -193,6 +232,39 @@ pub unsafe fn release(c: NonNull<Channel>, rights: Rights, cause: u8) {
     }
 }
 
+/// Whether the last handle with RECEIVE to `c`, which the caller holds,
+/// went (spec 6.8).
+pub fn is_closed(c: NonNull<Channel>) -> bool {
+    // SAFETY: the caller holds a reference to the channel; only the field
+    // is read.
+    unsafe { (*c.as_ptr()).closed }
+}
+
+/// A new source of notifications takes one of the slots of `c`, which the
+/// caller holds (spec 6.5): LIMIT_REACHED when abi::MAX_SLOTS are taken,
+/// the slot of label 0 among them. The source gives it back as it goes
+/// (`remove_source`).
+pub fn add_source(c: NonNull<Channel>) -> Result<(), Error> {
+    // SAFETY: the caller holds a reference to the channel; only the field
+    // is touched.
+    let sources = unsafe { &mut (*c.as_ptr()).sources };
+    if *sources >= MAX_SLOTS {
+        return Err(Error::LimitReached);
+    }
+    *sources += 1;
+    Ok(())
+}
+
+/// A source of `c` goes, or was not made, and gives its slot back.
+pub fn remove_source(c: NonNull<Channel>) {
+    // SAFETY: the source holds the channel; only the field is touched.
+    let sources = unsafe { &mut (*c.as_ptr()).sources };
+    *sources = sources
+        .checked_sub(1)
+        .filter(|&n| n > 0)
+        .expect("a source gave back a slot it did not take");
+}
+
 /// The last handle with RECEIVE went (spec 6.1, 6.8): the channel is closed
 /// from now on. With receivers that wait or slots queued it goes to the
 /// cleanup queue at `cause`, with a reference of the queue's own, for its
@@ -253,31 +325,39 @@ pub fn notify(c: NonNull<Channel>, bits: u64, cause: u8) -> Result<(), Error> {
 }
 
 /// A post of `bits` into `slot`, one of the slots of `c` (spec 6.5):
-/// PEER_CLOSED once the channel closed, and nothing is posted then; each
+/// PEER_CLOSED once the channel closed, and nothing is posted then: each
 /// source of notifications comes here, so none posts into a closed
-/// channel. Otherwise the bits merge. A slot that stood in no queue goes
-/// to the top receiver that waits, which takes it at once: its registers
-/// get the notification, it works at the slot's priority under its
-/// ceiling, it becomes ready at the tail of that level with a new quantum
-/// (spec 6.1), and the reference of its wait goes. Otherwise the slot goes
-/// to the tail of its level in the queue of slots. O(1).
+/// channel, and a source that is no call drops that error. Otherwise the
+/// bits merge. A slot that stood in no queue goes to the top receiver that
+/// waits, which takes it at once: its registers get the notification, it
+/// works at the slot's priority under its ceiling, it becomes ready at the
+/// tail of that level with a new quantum (spec 6.1), and the reference of
+/// its wait goes. Otherwise the slot goes to the tail of its level in the
+/// queue of slots and holds its owner there. It takes the scheduler's lock
+/// itself. O(1).
 ///
 /// # Safety
-/// The caller holds a reference to `c`, and `slot` lives as long as `c`.
-unsafe fn post(
+/// The caller holds a reference to `c` and to the owner of `slot`, which
+/// lives as long as the owner.
+pub unsafe fn post(
     c: NonNull<Channel>,
     slot: NonNull<Slot<Owner>>,
     bits: u64,
     cause: u8,
 ) -> Result<(), Error> {
-    // SAFETY: the caller's reference keeps the channel alive.
-    if unsafe { (*c.as_ptr()).closed } {
+    if is_closed(c) {
         return Err(Error::PeerClosed);
     }
     let woke = sched::locked(|s| {
         // SAFETY: the caller's promise; the slot stays in place.
-        let Post::Deliver(t) = (unsafe { queue(c, s).post(slot, bits) }) else {
-            return false;
+        let t = match unsafe { queue(c, s).post(slot, bits) } {
+            Post::Merged => return false,
+            Post::Queued => {
+                // SAFETY: as above.
+                unsafe { (*slot.as_ptr()).owner() }.hold();
+                return false;
+            }
+            Post::Deliver(t) => t,
         };
         // SAFETY: the slot left no queue; `t` left the queue of receivers
         // and is alive, since the kernel's reference keeps a thread that
@@ -303,7 +383,8 @@ unsafe fn post(
 /// which it holds a handle with RECEIVE, so the channel is open. First the
 /// boost of `t`'s last notification ends. Then the head of the top level of
 /// the queue of slots leaves the queue, emptied, and `t` works at the
-/// slot's priority under its ceiling until its next receive: Some. With no
+/// slot's priority under its ceiling until its next receive; the slot lets
+/// its owner go at that priority, after the scheduler's lock: Some. With no
 /// slot queued, WOULD_BLOCK when `wait` is false; otherwise `t` waits at the
 /// tail of its level of the receivers, holding a reference to `c`, and
 /// gets its result when the wait ends (`post`, `clean`): None. O(1).
@@ -313,7 +394,7 @@ pub fn receive(
     wait: bool,
 ) -> Result<Option<Notification>, Error> {
     let ceiling = ceiling(t);
-    sched::locked(|s| {
+    let taken = sched::locked(|s| {
         // SAFETY: the running thread and the channel, which its handle
         // holds, are alive.
         unsafe {
@@ -321,7 +402,7 @@ pub fn receive(
             if let Some(slot) = queue(c, s).take_slot() {
                 let (n, priority) = notice(slot);
                 s.boost(t, priority, ceiling);
-                return Ok(Some(n));
+                return Ok(Some((n, (*slot.as_ptr()).owner())));
             }
             if !wait {
                 return Err(Error::WouldBlock);
@@ -333,7 +414,14 @@ pub fn receive(
         }
         retain(c, Rights::NONE);
         Ok(None)
-    })
+    })?;
+    let Some((n, owner)) = taken else {
+        return Ok(None);
+    };
+    // SAFETY: the slot left the queue, whose reference to its owner goes;
+    // the running thread is alive.
+    unsafe { owner.let_go(t.as_ref().priority()) };
+    Ok(Some(n))
 }
 
 /// The end of `t` while it waits in a channel (sched::exit, spec 7.7): it
@@ -376,11 +464,13 @@ pub unsafe fn requeue(t: NonNull<Thread>, locked: &mut Scheduler<Thread>) {
 /// to CLOSE_PORTION heads leave the queues, receivers that wait first, each
 /// woken with PEER_CLOSED at the tail of its level with a new quantum
 /// (spec 6.1, 6.8) and without the reference of its wait, then slots,
-/// emptied (a slot of label 0 holds nothing else); with heads left the
-/// channel goes back to the head of `level`, and otherwise the queue's
-/// reference goes, which queues the shell when it was the last. With no
-/// reference left, the shell's portion: the slot goes back to the payer's
-/// pool, and then the reference to the payer's shell.
+/// emptied, each letting its owner go at `level` (a session whose copies
+/// went goes, as after receive); a head a time under the scheduler's lock,
+/// its owner after it. With heads left the channel goes back to the head
+/// of `level`, and otherwise the queue's reference goes, which queues the
+/// shell when it was the last. With no reference left, the shell's
+/// portion: the slot goes back to the payer's pool, and then the reference
+/// to the payer's shell.
 ///
 /// # Safety
 /// The channel was just taken from the queue.
@@ -392,29 +482,36 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
         unsafe { free(c, level) };
         return;
     }
-    let (woken, heads, left) = sched::locked(|s| {
-        let mut woken = 0u32;
-        let mut heads = 0u32;
-        for _ in 0..CLOSE_PORTION {
+    let mut woken = 0u32;
+    let mut heads = 0u32;
+    for _ in 0..CLOSE_PORTION {
+        let head = sched::locked(|s| {
             // SAFETY: the channel is alive; a thread that waits is alive,
-            // and a queued slot lives as long as the channel.
+            // and a queued slot holds its owner, in which it lies.
             unsafe {
                 if let Some(t) = queue(c, s).take_waiter() {
                     (*t.as_ptr()).waits = None;
                     syscall::set_result(t, Err(Error::PeerClosed));
                     s.wake(t);
-                    woken += 1;
-                } else if let Some(slot) = queue(c, s).take_slot() {
-                    (*slot.as_ptr()).take();
-                } else {
-                    break;
+                    return Some(None);
                 }
+                queue(c, s).take_slot().map(|slot| {
+                    (*slot.as_ptr()).take();
+                    Some((*slot.as_ptr()).owner())
+                })
             }
-            heads += 1;
+        });
+        match head {
+            None => break,
+            Some(None) => woken += 1,
+            // SAFETY: the slot left the queue, whose reference to its
+            // owner goes.
+            Some(Some(owner)) => unsafe { owner.let_go(level) },
         }
-        // SAFETY: as above.
-        (woken, heads, unsafe { !queue(c, s).is_empty() })
-    });
+        heads += 1;
+    }
+    // SAFETY: as above.
+    let left = sched::locked(|s| unsafe { !queue(c, s).is_empty() });
     #[cfg(feature = "ktest")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -443,18 +540,19 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
 
 /// A channel's shell portion: its slot goes back to the pool it came from,
 /// the payer's, and then the reference to the payer's shell, which queues
-/// that shell at `level` if it was the last. The queues are empty by now:
-/// a thread that waits and the stage Close hold references.
+/// that shell at `level` if it was the last. The queues are empty by now,
+/// and no source but the slot of label 0 is left: a thread that waits,
+/// the stage Close and every source hold references.
 ///
 /// # Safety
 /// Nothing refers to the channel, and it is in no queue.
 unsafe fn free(c: NonNull<Channel>, level: u8) {
-    // SAFETY: the caller's promise; only the field is read.
-    let payer = unsafe { (*c.as_ptr()).payer };
+    // SAFETY: the caller's promise; only the fields are read.
+    let (payer, sources) = unsafe { ((*c.as_ptr()).payer, (*c.as_ptr()).sources) };
     assert!(
         // SAFETY: as above.
-        sched::locked(|s| unsafe { queue(c, s).is_empty() }),
-        "a channel goes with something in its queues"
+        sources == 1 && sched::locked(|s| unsafe { queue(c, s).is_empty() }),
+        "a channel goes with a source or something in its queues"
     );
     // SAFETY: nothing uses the channel afterwards; the payer's pool is
     // there, since the channel holds the payer's shell.

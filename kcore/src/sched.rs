@@ -837,8 +837,10 @@ pub fn policy_arg(raw: u64) -> Result<Policy, Error> {
     Policy::from_raw(raw).ok_or(Error::InvalidArgs)
 }
 
-/// The notification priority of `process_create`: 0 exactly when there is
-/// no exit channel, otherwise a priority. INVALID_ARGS for anything else.
+/// The priority of a source's slot (spec 6.5) from a register: in
+/// `process_create` 0 exactly when there is no exit channel, in
+/// `handle_duplicate` exactly when there is no new label (`channel` false),
+/// otherwise a priority. INVALID_ARGS for anything else.
 pub fn notify_priority_arg(raw: u64, channel: bool) -> Result<u8, Error> {
     match (channel, raw) {
         (false, 0) => Ok(0),

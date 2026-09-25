@@ -27,6 +27,7 @@ mod panicking;
 mod process;
 mod psci;
 mod sched;
+mod session;
 mod syscall;
 mod thread;
 

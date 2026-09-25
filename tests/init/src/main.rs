@@ -22,7 +22,8 @@
 #![no_main]
 
 use abi::{
-    Call, Error, INIT_BOOT_IMAGE, Policy, ProcessHandles, ProcessMemory, ProcessState, Source,
+    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, Policy, ProcessHandles,
+    ProcessMemory, ProcessState, Rights, Source,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Process, Resource, Thread};
@@ -35,7 +36,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 31] = [
+const TESTS: [Test; 39] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -120,6 +121,29 @@ const TESTS: [Test; 31] = [
         "waiting_receiver_gets_peer_closed",
         waiting_receiver_gets_peer_closed,
     ),
+    ("duplicate_narrows_rights", duplicate_narrows_rights),
+    (
+        "client_gone_after_the_last_copy",
+        client_gone_after_the_last_copy,
+    ),
+    ("label_cannot_change", label_cannot_change),
+    (
+        "session_priority_under_the_ceiling",
+        session_priority_under_the_ceiling,
+    ),
+    (
+        "session_notice_carries_its_label",
+        session_notice_carries_its_label,
+    ),
+    (
+        "higher_notification_comes_first",
+        higher_notification_comes_first,
+    ),
+    (
+        "notify_after_close_is_peer_closed",
+        notify_after_close_is_peer_closed,
+    ),
+    ("slot_limit_is_1024", slot_limit_is_1024),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -924,15 +948,22 @@ fn process_info_kinds() -> Outcome {
 }
 
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
-/// is WRONG_TYPE; init's resource gets the counts in x1-x7 and changes
+/// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
+/// though it writes; init's resource gets the counts in x1-x7 and changes
 /// nothing past them. Nothing waits in the cleanup queue while init runs,
-/// and the frames and pool pages are there. A copy of the resource without
-/// KSTATS, which ACCESS_DENIED needs, comes with handle_duplicate
-/// (milestone 1.3b).
+/// and the frames and pool pages are there.
 fn kernel_stats_need_kstats() -> Outcome {
     check(
         sys::kernel_stats(&retyped(&init::PROCESS)) == Err(Error::WrongType),
         "a process handle gave the kernel's counts",
+    )?;
+    let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let denied = sys::kernel_stats(&debug);
+    let written = sys::debug_write(&debug, b"");
+    close(debug)?;
+    check(
+        denied == Err(Error::AccessDenied) && written == Ok(0),
+        "a copy of the resource without KSTATS gave the kernel's counts, or did not write",
     )?;
     let mut x = marked();
     x[..3].copy_from_slice(&[init::RESOURCE.raw().0, abi::INFO_KERNEL_STATS, 0]);
@@ -1141,9 +1172,9 @@ fn channel_create_checks_its_priority() -> Outcome {
 }
 
 /// notify and receive take a channel (spec 11): a process is WRONG_TYPE,
-/// a closed handle BAD_HANDLE, and x0 alone changes. ACCESS_DENIED needs a
-/// copy of a channel handle without NOTIFY or RECEIVE, which only
-/// handle_duplicate makes (task 5); the kernel tests have it now.
+/// a closed handle BAD_HANDLE, and x0 alone changes. A copy of the channel
+/// with RECEIVE alone does not notify, and one with NOTIFY alone does not
+/// receive: ACCESS_DENIED, and x0 alone changes.
 fn notify_and_receive_need_their_rights() -> Outcome {
     let c = channel(QUIET)?;
     let gone = c.raw();
@@ -1166,7 +1197,25 @@ fn notify_and_receive_need_their_rights() -> Outcome {
             "receive took a handle that is not a live channel",
         )?;
     }
-    Ok(())
+    let c = channel(QUIET)?;
+    let (notify_only, receive_only) = (copy(&c, Rights::NOTIFY)?, copy(&c, Rights::RECEIVE)?);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[receive_only.raw().0, 1]);
+    let notified = raw_notify(x);
+    let mut y = marked();
+    y[..2].copy_from_slice(&[notify_only.raw().0, abi::NO_WAIT]);
+    let received = raw_receive(y);
+    close(notify_only)?;
+    close(receive_only)?;
+    close(c)?;
+    check(
+        notified[0] == Error::AccessDenied.code() && notified[1..] == x[1..],
+        "a copy without NOTIFY notified",
+    )?;
+    check(
+        received[0] == Error::AccessDenied.code() && received[1..] == y[1..],
+        "a copy without RECEIVE received",
+    )
 }
 
 /// Spec 15.2 (notifications): three notify calls with different bits before
@@ -1342,5 +1391,330 @@ fn waiting_receiver_gets_peer_closed() -> Outcome {
     check(
         mark(0) == Error::PeerClosed.code(),
         "the waiting receiver did not get PEER_CLOSED",
+    )
+}
+
+/// A copy of `h` with `rights` and no new label.
+fn copy<K>(h: &Handle<K>, rights: Rights) -> Result<Handle<K>, &'static str> {
+    sys::handle_duplicate(h, rights).map_err(|_| "handle_duplicate failed")
+}
+
+/// A copy of the channel handle `c` with `rights` and the new label
+/// `label`: a session whose slot has `priority`.
+fn session(
+    c: &Handle<Channel>,
+    rights: Rights,
+    label: u64,
+    priority: u8,
+) -> Result<Handle<Channel>, &'static str> {
+    sys::handle_label(c, rights, label, priority).map_err(|_| "a label did not go on a copy")
+}
+
+/// handle_duplicate with raw registers.
+fn raw_duplicate(x: Regs) -> Regs {
+    // SAFETY: handle_duplicate only reads its registers.
+    unsafe { sys::raw::<{ Call::HandleDuplicate.number() }>(x) }
+}
+
+/// x0-x9 for handle_duplicate of `h` with `rights`, `label` and
+/// `priority`, the rest marked.
+fn duplicate_regs(h: abi::Handle, rights: Rights, label: u64, priority: u64) -> Regs {
+    let mut x = marked();
+    x[..4].copy_from_slice(&[h.0, rights.0.into(), label, priority]);
+    x
+}
+
+/// A notification of the session with `label`.
+fn labelled(label: u64, bits: u64, count: u32) -> Received {
+    Received::Notification {
+        source: Source::Session,
+        label,
+        bits,
+        count,
+    }
+}
+
+/// handle_duplicate copies a handle of any kind with a subset of its
+/// rights (spec 5.2, 11) and changes x0 and x1 alone: a copy of a channel
+/// with NOTIFY alone notifies, does not receive (ACCESS_DENIED) and, with
+/// no DUPLICATE, is copied no further. A right the original lacks fails
+/// with ACCESS_DENIED, bits no right has with INVALID_ARGS before the
+/// handle is looked at, and both change x0 alone. A copy of init's process
+/// with no rights names it still.
+fn duplicate_narrows_rights() -> Outcome {
+    let c = channel(QUIET)?;
+    let x = duplicate_regs(c.raw(), Rights::NOTIFY, 0, 0);
+    let after = raw_duplicate(x);
+    let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
+    let n = Handle::<Channel>::from_raw(abi::Handle(after[1]));
+    let posted = sys::notify(&n, 1);
+    let refused = sys::try_receive(&n);
+    let further = sys::handle_duplicate(&n, Rights::NOTIFY);
+    let got = take_one(&c);
+    let y = duplicate_regs(c.raw(), CHANNEL_RIGHTS | Rights::MANAGE, 0, 0);
+    let wider = raw_duplicate(y);
+    let odd = [1 << 12, 1 << 32].map(|rights| {
+        let mut z = x;
+        z[..2].copy_from_slice(&[0, rights]);
+        let after = raw_duplicate(z);
+        after[0] == Error::InvalidArgs.code() && after[1..] == z[1..]
+    });
+    let own = copy(&init::PROCESS, Rights::NONE)?;
+    let state = sys::process_state(&own);
+    close(own)?;
+    close(n)?;
+    close(c)?;
+    check(made, "the copy did not come in x1 alone")?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)),
+        "the copy with NOTIFY did not notify",
+    )?;
+    check(
+        refused == Err(Error::AccessDenied),
+        "the copy with NOTIFY alone received",
+    )?;
+    check(
+        further == Err(Error::AccessDenied),
+        "a copy without DUPLICATE was copied",
+    )?;
+    check(
+        wider[0] == Error::AccessDenied.code() && wider[1..] == y[1..],
+        "a copy took a right the original lacks",
+    )?;
+    check(
+        odd.iter().all(|&ok| ok),
+        "bits no right has did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        state == Ok(ProcessState::Alive),
+        "a copy of init's process with no rights does not name it",
+    )
+}
+
+/// A label goes on a channel handle once (spec 5.3): a new label on a
+/// handle that carries one fails with BAD_STATE and changes x0 alone, and
+/// a copy with label 0 carries the same label. A label on a handle that is
+/// no channel fails with WRONG_TYPE.
+fn label_cannot_change() -> Outcome {
+    let c = channel(QUIET)?;
+    let first = session(&c, Rights::NOTIFY | Rights::DUPLICATE, 7, QUIET)?;
+    let x = duplicate_regs(first.raw(), Rights::NOTIFY, 8, QUIET.into());
+    let after = raw_duplicate(x);
+    let same = copy(&first, Rights::NOTIFY)?;
+    let posted = sys::notify(&same, 1);
+    let got = take_one(&c);
+    let process = sys::handle_label(&retyped(&init::PROCESS), Rights::NONE, 9, QUIET);
+    close(c)?;
+    close(same)?;
+    close(first)?;
+    check(
+        after[0] == Error::BadState.code() && after[1..] == x[1..],
+        "a handle with a label took a new one",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(labelled(7, 1, 1)),
+        "a copy with label 0 did not keep the label",
+    )?;
+    check(
+        process == Err(Error::WrongType),
+        "a handle to a process took a label",
+    )
+}
+
+/// The priority of a session's slot (spec 5.3, 6.5): with a label 1-63,
+/// 63, init's ceiling, included; without one exactly 0; anything else
+/// fails with INVALID_ARGS and changes x0 alone. A receiver at LOW waits
+/// on a channel whose slot of label 0 has LEVEL, below init; notify
+/// through a session of priority NOTICE wakes it above init (spec 6.6), so
+/// it runs before notify returns. ACCESS_DENIED for a priority above the
+/// caller's ceiling is a kernel test: init's ceiling is the highest level.
+fn session_priority_under_the_ceiling() -> Outcome {
+    let (c, r) = waiting_receiver(LEVEL)?;
+    let refused = [
+        (9, 0),
+        (0, u64::from(QUIET)),
+        (9, abi::PRIORITY_LEVELS.into()),
+        (9, 0x100 | u64::from(QUIET)),
+    ]
+    .map(|(label, priority)| {
+        let x = duplicate_regs(c.raw(), Rights::NOTIFY, label, priority);
+        let after = raw_duplicate(x);
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..]
+    });
+    let top = session(&c, Rights::NOTIFY, 63, abi::PRIORITY_LEVELS - 1)?;
+    let s = session(&c, Rights::NOTIFY, 25, NOTICE)?;
+    let waited = mark(0);
+    let posted = sys::notify(&s, 1);
+    let ran = mark(0);
+    let_run()?;
+    close(r)?;
+    close(c)?;
+    close(s)?;
+    close(top)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "a priority outside 1-63 with a label, or one without a label, was taken",
+    )?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        posted.is_ok() && ran == 1,
+        "the receiver did not run at the session's priority before notify returned",
+    )
+}
+
+/// Spec 15.2 (notifications): notify through a handle with a label goes
+/// into its session's slot (spec 5.3, 6.5), and receive gives the source
+/// «session», the label, the bits and the count; notify through the handle
+/// with no label still goes into the slot of label 0. At one level they
+/// come in the order they came. Bit 63 fails through a session too.
+fn session_notice_carries_its_label() -> Outcome {
+    let c = channel(QUIET)?;
+    let s = session(&c, Rights::NOTIFY, 0x5E55, QUIET)?;
+    let posted = [
+        sys::notify(&s, 0b01),
+        sys::notify(&s, 0b10),
+        sys::notify(&c, 0b100),
+    ];
+    let bit_63 = sys::notify(&s, CLIENT_GONE);
+    let first = sys::try_receive(&c);
+    let second = take_one(&c);
+    close(c)?;
+    close(s)?;
+    check(posted.iter().all(Result::is_ok), "notify failed")?;
+    check(
+        bit_63 == Err(Error::InvalidArgs),
+        "bit 63 went through a session",
+    )?;
+    check(
+        first == Ok(labelled(0x5E55, 0b11, 2)),
+        "the session's notification did not carry its label, bits and count",
+    )?;
+    check(
+        second == Ok(unlabeled(0b100, 1)),
+        "the slot of label 0 did not come after the session's",
+    )
+}
+
+/// Spec 15.2 (refusals): two handles carry one label, the second a copy of
+/// the first. Closing the first posts nothing; closing the last posts
+/// CLIENT_GONE, bit 63, into the session's slot with the label (spec 5.3),
+/// and the bits the client posted before it left come in the same receive.
+fn client_gone_after_the_last_copy() -> Outcome {
+    let c = channel(QUIET)?;
+    let first = session(&c, Rights::NOTIFY | Rights::DUPLICATE, 0xC1, QUIET)?;
+    let last = copy(&first, Rights::NOTIFY)?;
+    close(first)?;
+    check(
+        sys::try_receive(&c) == Err(Error::WouldBlock),
+        "closing one of two copies posted into the session's slot",
+    )?;
+    let posted = sys::notify(&last, 0b10);
+    close(last)?;
+    let got = take_one(&c);
+    close(c)?;
+    check(
+        posted.is_ok() && got == Ok(labelled(0xC1, 0b10 | CLIENT_GONE, 2)),
+        "the last copy did not leave CLIENT_GONE with the label and the client's bits",
+    )
+}
+
+/// Spec 15.2 (notifications): slots come by priority, and in the order they
+/// came within a level (spec 6.3). The slot of label 0 at LEVEL is posted
+/// first, then two sessions at HIGH: receive takes the first session, the
+/// second, then the slot of label 0.
+fn higher_notification_comes_first() -> Outcome {
+    let c = channel(LEVEL)?;
+    let a = session(&c, Rights::NOTIFY, 0xA, HIGH)?;
+    let b = session(&c, Rights::NOTIFY, 0xB, HIGH)?;
+    let posted = [sys::notify(&c, 1), sys::notify(&a, 2), sys::notify(&b, 4)];
+    let got = [(); 4].map(|()| sys::try_receive(&c));
+    close(c)?;
+    close(a)?;
+    close(b)?;
+    check(posted.iter().all(Result::is_ok), "notify failed")?;
+    check(
+        got == [
+            Ok(labelled(0xA, 2, 1)),
+            Ok(labelled(0xB, 4, 1)),
+            Ok(unlabeled(1, 1)),
+            Err(Error::WouldBlock),
+        ],
+        "the slots did not come by priority and within a level in their order",
+    )
+}
+
+/// Spec 15.2 (refusals): when the last handle with RECEIVE goes, the
+/// channel closes (spec 6.5, 6.8): notify through a copy with NOTIFY and
+/// through a session fails with PEER_CLOSED and changes x0 alone, and so
+/// does a new label; a copy with label 0 is still made.
+fn notify_after_close_is_peer_closed() -> Outcome {
+    let c = channel(QUIET)?;
+    let left = copy(&c, Rights::NOTIFY | Rights::DUPLICATE)?;
+    let s = session(&c, Rights::NOTIFY, 0xDEAD, QUIET)?;
+    let posted = sys::notify(&s, 1);
+    close(c)?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[left.raw().0, 1]);
+    let mut y = marked();
+    y[..2].copy_from_slice(&[s.raw().0, 1]);
+    let z = duplicate_regs(left.raw(), Rights::NOTIFY, 0xBEEF, QUIET.into());
+    let after = [raw_notify(x), raw_notify(y), raw_duplicate(z)];
+    let plain = copy(&left, Rights::NOTIFY);
+    let copied = plain.is_ok();
+    if let Ok(h) = plain {
+        close(h)?;
+    }
+    close(left)?;
+    close(s)?;
+    check(posted.is_ok(), "notify through a session failed")?;
+    check(
+        after
+            .iter()
+            .zip([x, y, z])
+            .all(|(a, x)| a[0] == Error::PeerClosed.code() && a[1..] == x[1..]),
+        "notify or a new label on a closed channel did not fail with PEER_CLOSED alone",
+    )?;
+    check(
+        copied,
+        "a copy of a closed channel with label 0 was not made",
+    )
+}
+
+/// Spec 15.2 (notifications): a channel has abi::MAX_SLOTS slots, its slot
+/// of label 0 among them (spec 6.5). Init makes 1023 sessions and closes
+/// each at once, and CLIENT_GONE keeps each in the channel's queue. The
+/// next label fails with LIMIT_REACHED and changes x0 alone. Once receive
+/// took the first CLIENT_GONE, that session went, and a new label fits.
+/// Every session leaves with CLIENT_GONE, in the order they left.
+fn slot_limit_is_1024() -> Outcome {
+    let c = channel(QUIET)?;
+    let last = u64::from(abi::MAX_SLOTS) - 1;
+    for label in 1..=last {
+        close(session(&c, Rights::NONE, label, QUIET)?)?;
+    }
+    let x = duplicate_regs(c.raw(), Rights::NONE, last + 1, QUIET.into());
+    let after = raw_duplicate(x);
+    let first = sys::try_receive(&c);
+    let again = sys::handle_label(&c, Rights::NONE, last + 1, QUIET);
+    let remade = again.is_ok();
+    if let Ok(h) = again {
+        close(h)?;
+    }
+    let order =
+        (2..=last + 1).all(|label| sys::try_receive(&c) == Ok(labelled(label, CLIENT_GONE, 1)));
+    let rest = sys::try_receive(&c);
+    close(c)?;
+    check(
+        after[0] == Error::LimitReached.code() && after[1..] == x[1..],
+        "a session past 1023 and the slot of label 0 was made",
+    )?;
+    check(
+        first == Ok(labelled(1, CLIENT_GONE, 1)),
+        "the first session did not leave with CLIENT_GONE",
+    )?;
+    check(remade, "no new session fit once one went")?;
+    check(
+        order && rest == Err(Error::WouldBlock),
+        "the sessions did not leave with CLIENT_GONE in their order",
     )
 }
