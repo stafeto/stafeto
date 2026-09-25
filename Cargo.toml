@@ -15,5 +15,15 @@ codegen-units = 1
 panic = "abort"
 debug = true
 
+# Spec 14: the kernel and kcore build at opt-level 2, the programs at "s".
+# At "s" small copies go through calls to memcpy and memset and the short
+# functions of the queues are not inlined, which costs the hot paths
+# 15-41% of their instructions.
+[profile.release.package.kernel]
+opt-level = 2
+
+[profile.release.package.kcore]
+opt-level = 2
+
 [profile.dev]
 panic = "abort"
