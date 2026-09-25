@@ -7,11 +7,11 @@
 //! on success x0 is 0 and the values follow in x1 and up. The same calls
 //! from EL0 are in `el0`.
 
-use super::{CAUSE, check};
+use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::boot::Boot;
 use crate::cleanup;
 use crate::mm::phys;
-use crate::object::Object;
+use crate::object::{self, Object};
 use crate::process::{self, Process};
 use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
@@ -21,6 +21,7 @@ use abi::{
 };
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
+use kcore::handles::CHUNK;
 use kcore::layout::{LINEAR_BASE, USER_END};
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
@@ -53,7 +54,7 @@ impl Caller {
     /// A caller whose process has priority ceiling `ceiling`; its thread
     /// is FIFO at 10.
     fn with_ceiling(ceiling: u8) -> Result<Caller, &'static str> {
-        let process = process::create(LIMIT, ceiling).map_err(|_| "no process")?;
+        let process = process::create_root(QUOTA, LIMIT, ceiling).map_err(|_| "no process")?;
         match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(thread) => Ok(Caller { process, thread }),
             Err(_) => {
@@ -245,7 +246,7 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
 pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(|c| {
-        let other = process::create(LIMIT, CEILING).map_err(|_| "no second process")?;
+        let other = process::create_root(QUOTA, LIMIT, CEILING).map_err(|_| "no second process")?;
         let t = match thread::create(other, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(t) => t,
             Err(_) => {
@@ -427,11 +428,11 @@ fn set_priority_cases(
 }
 
 /// process_create checks the values first, then the exit channel and the
-/// start channel, then the ceiling against the caller's (spec 11); a good
-/// call returns a handle with the owner's rights to a live process with
-/// the ceiling given, a child of the caller's process (spec 4). With the
-/// caller's table full it fails with LIMIT_REACHED, and the new process
-/// goes again. The caller's ceiling is 30.
+/// start channel, then the ceiling against the caller's, then the quotas
+/// (spec 11); a good call returns a handle with the owner's rights to a
+/// live process with the ceiling given, a child of the caller's process
+/// (spec 4). With the caller's table full it fails with LIMIT_REACHED, and
+/// the new process goes again. The caller's ceiling is 30.
 pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;
@@ -484,7 +485,8 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     c.fails(n, &[page, 16, 31, closed, 5, 0], Error::BadHandle)?;
     c.fails(n, &[page, 16, 31, 0, 0, closed], Error::BadHandle)?;
     c.fails(n, &[page, 16, 31, 0, 0, 0], Error::AccessDenied)?;
-    let child = c.created(n, &[page, 16, 30, 0, 0, 0])?;
+    quota_cases(c, n)?;
+    let child = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
     let found = unsafe { c.process.as_ref() }.lookup(child, OWNER_RIGHTS, Object::process);
     // SAFETY: the handle holds the child.
@@ -502,13 +504,121 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     full_table_cases(c, n)
 }
 
+/// The child's quota comes off the caller's (spec 7.5): more than is left
+/// there is NO_MEMORY, after the ceiling. The least quota covers the
+/// child's shell, its root table, its directory and the chunk with entry
+/// 0, 12 KiB; less is NO_MEMORY, whether the shell and the root table do
+/// not fit or the chunk does not, and the caller gets the quota back
+/// whole. A thread does not fit in the least child: NO_MEMORY, and what
+/// the call took goes back.
+fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
+    let page = PAGE_SIZE;
+    let q = process::quota(c.process);
+    let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(page);
+    c.fails(n, &[over, 16, 31, 0, 0, 0], Error::AccessDenied)?;
+    c.fails(n, &[over, 16, 30, 0, 0, 0], Error::NoMemory)?;
+    let least = (process::SHELL_COST + page + object::DIRECTORY_COST + object::CHUNK_COST)
+        .next_multiple_of(page);
+    check(
+        least == 3 * page,
+        "the least quota of a child is not 12 KiB",
+    )?;
+    let before = q.used();
+    for short in [page, least - page] {
+        c.fails(n, &[short, 16, 30, 0, 0, 0], Error::NoMemory)?;
+        cleanup::drain();
+        check(
+            process::quota(c.process).used() == before,
+            "a child that was not made kept the caller's quota",
+        )?;
+    }
+    let least = c.created(n, &[least, 16, 30, 0, 0, 0])?;
+    let result = full_child_cases(c, least);
+    c.close(least)?;
+    cleanup::drain();
+    result?;
+    check(
+        process::quota(c.process).used() == before,
+        "the least child's quota did not come back",
+    )
+}
+
+/// thread_create in `child`, whose quota its own objects take up: its
+/// thread's buffer does not fit, NO_MEMORY, and the thread goes again.
+fn full_child_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    let used = process::quota(p).used();
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
+    c.fails(Call::ThreadCreate.number(), &args, Error::NoMemory)?;
+    cleanup::drain();
+    check(
+        process::quota(p).used() == used,
+        "a thread that did not fit kept the child's quota",
+    )
+}
+
+/// Every process pays for the directory and chunks of its own table,
+/// whoever puts the handle there (spec 7.5): process_create charges the
+/// caller the child's quota alone, and the child pays from it for its
+/// shell, its root table, its directory and the chunk with entry 0. A
+/// handle the kernel puts in the child's table past its first chunk
+/// takes a second one, which the child pays for too. Once the child goes,
+/// the caller has its quota back whole.
+pub fn table_chunks_are_paid_by_the_owner(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        // The caller's table has its directory and first chunk from here on.
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        let before = process::quota(c.process).used();
+        let n = Call::ProcessCreate.number();
+        let child = c.created(n, &[CHILD_QUOTA, 2 * CHUNK as u64, 20, 0, 0, 0])?;
+        let result = owner_pays(c, child, before);
+        c.close(child)?;
+        cleanup::drain();
+        c.close(first)?;
+        result?;
+        check(
+            process::quota(c.process).used() == before,
+            "the child's quota did not come back whole",
+        )
+    })
+}
+
+fn owner_pays(c: &Caller, child: Handle, before: u64) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    let own = process::SHELL_COST + PAGE_SIZE + object::DIRECTORY_COST + object::CHUNK_COST;
+    check(
+        process::quota(c.process).used() == before + CHILD_QUOTA,
+        "the caller paid for more than the child's quota",
+    )?;
+    check(
+        process::quota(p).used() == own,
+        "the child did not pay for its shell, root table, directory and first chunk",
+    )?;
+    // Entry 0 and 63 more fill the first chunk; the next takes a second.
+    for _ in 0..=CHUNK {
+        process::insert_handle(p, Object::Resource, Rights::NONE)
+            .map_err(|_| "a handle did not go into the child")?;
+    }
+    check(
+        process::quota(p).used() == own + object::CHUNK_COST
+            && process::quota(c.process).used() == before + CHILD_QUOTA,
+        "the child's second chunk was not charged to the child",
+    )
+}
+
 /// A child that process_create made has a stub in entry 0 of its table
 /// (spec 13.3): the first handle that goes in there gets another value,
 /// and START_CHANNEL stays bad.
 pub fn entry_0_of_a_child_stays_bad(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let n = Call::ProcessCreate.number();
-        let child = c.created(n, &[PAGE_SIZE, 16, 20, 0, 0, 0])?;
+        let child = c.created(n, &[CHILD_QUOTA, 16, 20, 0, 0, 0])?;
         let result = start_entry_cases(c, child);
         c.close(child)?;
         result
@@ -534,7 +644,7 @@ fn start_entry_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
 fn full_table_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     cleanup::drain();
     let processes = process::in_use();
-    with_full_table(c, n, &[PAGE_SIZE, 16, 30, 0, 0, 0])?;
+    with_full_table(c, n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
     cleanup::drain();
     check(
         process::in_use() == processes,
@@ -715,7 +825,10 @@ pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static
 }
 
 fn kill_cases(c: &Caller) -> Result<(), &'static str> {
-    let child = c.created(Call::ProcessCreate.number(), &[PAGE_SIZE, 16, 20, 0, 0, 0])?;
+    let child = c.created(
+        Call::ProcessCreate.number(),
+        &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+    )?;
     let make = |buffer| {
         let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, buffer);
         c.created(Call::ThreadCreate.number(), &args)

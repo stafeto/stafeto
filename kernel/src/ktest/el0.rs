@@ -13,7 +13,7 @@
 //! dry in between. After the last one the run ends. The programs are in
 //! el0.S.
 
-use super::{CAUSE, check, finish, report};
+use super::{CAUSE, CHILD_QUOTA, QUOTA, check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::arch::{self, cache, gic, symbols, timer};
 use crate::cleanup;
@@ -711,7 +711,17 @@ fn spawn(
 
 /// A process with the programs at TEXT_VA, in slot `slot` of the fixture.
 fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'static str> {
-    let mut p = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no process")?;
+    let p = process::create_root(QUOTA, HANDLE_LIMIT, CEILING).map_err(|_| "no process")?;
+    with_programs(f, slot, p)
+}
+
+/// Puts `p`, a new process whose first reference the fixture takes, in
+/// slot `slot` and maps the programs at TEXT_VA there.
+fn with_programs(
+    f: &mut Fixture,
+    slot: usize,
+    mut p: NonNull<Process>,
+) -> Result<NonNull<Process>, &'static str> {
     f.processes[slot] = Some(p);
     // SAFETY: the process was just created, and only this test uses it.
     let text = unsafe { p.as_mut() }
@@ -1909,7 +1919,7 @@ fn killer_and_child(
 /// A process with CHILD_THREADS stopped threads that only handles in its
 /// own table hold.
 fn child_with_threads() -> Result<NonNull<Process>, &'static str> {
-    let child = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    let child = process::create_root(QUOTA, HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
     let made = give_threads(child);
     if made.is_err() {
         // SAFETY: the test's reference goes, and nothing uses it afterwards.
@@ -2060,7 +2070,7 @@ fn start_big_teardown(f: &mut Fixture) -> Result<(), &'static str> {
 /// The big teardown's child: one frame of its own, mapped at every
 /// 2 MiB of the gigabyte from BIG_BASE, and a full table.
 fn big_child() -> Result<NonNull<Process>, &'static str> {
-    let child = process::create(MAX_HANDLES, CEILING).map_err(|_| "no child")?;
+    let child = process::create_root(QUOTA, MAX_HANDLES, CEILING).map_err(|_| "no child")?;
     let filled = fill_big_child(child);
     if filled.is_err() {
         // SAFETY: the test's reference goes, and nothing uses it afterwards.
@@ -2114,21 +2124,25 @@ fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// C's child, the grandchild in slot 1, has a thread below the killer that
 /// counts meanwhile. The end of C ends the grandchild and stops its thread
 /// (spec 4), and the teardown of both runs at the killer's level, before
-/// the kill returns.
+/// the kill returns. Each child's quota comes off its parent's.
 fn start_grandchild(f: &mut Fixture) -> Result<(), &'static str> {
     let killer = spawn(f, 0, &raw const el0_kill, 0)?;
-    let counter = spawn(f, 1, &raw const el0_count_until, 0)?;
-    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
-    sched::set_priority(counter, PRIORITY - 2, FIFO).map_err(|_| "no counter")?;
     let killers = f.processes[0].expect("the killer's process");
-    let grandchild = f.processes[1].expect("the grandchild");
-    let child = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
-    process::adopt(killers, child);
-    process::adopt(child, grandchild);
+    let child = process::create_child(killers, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING)
+        .map_err(|_| "no child")?;
     let h = give_kept(f, Object::Process(child));
+    let counter = process::create_child(child, CHILD_QUOTA, HANDLE_LIMIT, CEILING)
+        .map_err(|_| "no grandchild")
+        .and_then(|grandchild| {
+            let p = with_programs(f, 1, grandchild)?;
+            new_thread(f, 1, p, DATA_VA, &raw const el0_count_until, 0)
+        });
     // SAFETY: the test's reference goes; the handle, if it went in, holds
     // the child.
     unsafe { process::release(child, CAUSE) };
+    let counter = counter?;
+    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
+    sched::set_priority(counter, PRIORITY - 2, FIFO).map_err(|_| "no counter")?;
     set_args(killer, &[h?]);
     f.ends[1] = true;
     f.wake = Some(timer::clock().deadline_after(timer::now(), 1_000_000));

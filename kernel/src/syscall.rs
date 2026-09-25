@@ -141,17 +141,21 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 /// process with an empty address space and handle table; x1 returns a
 /// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
 /// the first two for milestone 1.3, so that the set never changes. The
-/// quota is whole pages, at least one, and counts from milestone 1.3; the
-/// limit 1-16384; the ceiling 1-63 and no higher than the caller's
-/// (ACCESS_DENIED). Exit channels come in milestone 1.3b: x3 is 0, and x4
-/// with it; any other x3 is looked up as a channel and fails (BAD_HANDLE,
-/// WRONG_TYPE). The start channel, a channel with TRANSFER, moves into
-/// entry 0 of the child's table from milestone 1.3c (spec 13.3): x5 is 0,
-/// and any other value is looked up after x3 and fails the same way. Entry
-/// 0 then holds a stub that goes at once (process::reserve_start). The
-/// child is the caller's process's (spec 4): it ends when its parent does.
+/// quota is whole pages, at least one; the limit 1-16384; the ceiling 1-63
+/// and no higher than the caller's (ACCESS_DENIED). Exit channels come in
+/// milestone 1.3b: x3 is 0, and x4 with it; any other x3 is looked up as a
+/// channel and fails (BAD_HANDLE, WRONG_TYPE). The start channel, a
+/// channel with TRANSFER, moves into entry 0 of the child's table from
+/// milestone 1.3c (spec 13.3): x5 is 0, and any other value is looked up
+/// after x3 and fails the same way. Entry 0 then holds a stub that goes at
+/// once (process::reserve_start). The child is the caller's process's
+/// (spec 4): it ends when its parent does. The quota comes off the
+/// caller's (spec 7.5), and the child pays from it for its shell, its root
+/// table and the chunk with entry 0: NO_MEMORY when either quota falls
+/// short, a resource checked last. The quota comes back to the caller in
+/// full once the child and whatever holds its shell went.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    quota_arg(a[0])?;
+    let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
     let channel = a[3] != 0;
@@ -166,8 +170,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
-    let child = process::create(limit, ceiling)?;
-    process::adopt(caller(thread), child);
+    let child = process::create_child(caller(thread), quota, limit, ceiling)?;
     let h = process::reserve_start(child).and_then(|()| {
         process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
     });

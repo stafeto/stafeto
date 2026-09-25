@@ -33,7 +33,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 17] = [
+const TESTS: [Test; 18] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -81,6 +81,7 @@ const TESTS: [Test; 17] = [
         "kill_takes_a_ready_thread_off_the_queue",
         kill_takes_a_ready_thread_off_the_queue,
     ),
+    ("quota_is_enforced", quota_is_enforced),
 ];
 
 /// Init's priority while the tests run.
@@ -93,6 +94,13 @@ const HIGH: u8 = 30;
 
 const PAGE: usize = 4096;
 const STACK_SIZE: usize = 16 * 1024;
+/// The quota of a child with a thread or two (spec 7.5).
+const CHILD_QUOTA: u64 = 64 * 1024;
+/// The least quota this kernel takes for a child: its shell, its root
+/// table, the directory of its table and the chunk with entry 0.
+const LEAST_QUOTA: u64 = 12 * 1024;
+/// More than init's quota, which is at most the machine's RAM.
+const HUGE_QUOTA: u64 = 1 << 32;
 /// Threads of init's own process a test may have at a time.
 const SLOTS: usize = 2;
 
@@ -234,9 +242,10 @@ fn let_run() -> Outcome {
         .map_err(|_| "init could not take its priority back")
 }
 
-/// A child with no code, room for 16 handles and ceiling `ceiling`.
+/// A child with no code, CHILD_QUOTA, room for 16 handles and ceiling
+/// `ceiling`.
 fn child(ceiling: u8) -> Result<Handle, &'static str> {
-    sys::process_create(PAGE as u64, 16, ceiling).map_err(|_| "process_create failed")
+    sys::process_create(CHILD_QUOTA, 16, ceiling).map_err(|_| "process_create failed")
 }
 
 /// A stopped thread of `process` at CHILD_ENTRY, FIFO at `priority`.
@@ -458,7 +467,7 @@ fn priority_ceilings_hold() -> Outcome {
         "policy 2 was taken",
     )?;
     check(
-        sys::process_create(PAGE as u64, 16, abi::PRIORITY_LEVELS) == Err(Error::InvalidArgs),
+        sys::process_create(CHILD_QUOTA, 16, abi::PRIORITY_LEVELS) == Err(Error::InvalidArgs),
         "ceiling 64 was taken",
     )?;
     let c = child(LEVEL)?;
@@ -756,4 +765,34 @@ fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
         "the child did not end as killed",
     )?;
     check(again.is_ok(), "a second kill of the dead child failed")
+}
+
+/// A child's quota comes off init's (spec 7.5): more than init has fails
+/// with NO_MEMORY and changes x0 alone, and so does a quota too small for
+/// the child's own objects. In a child with the least quota a thread does
+/// not fit: NO_MEMORY again.
+fn quota_is_enforced() -> Outcome {
+    let mut x = marked();
+    x[..6].copy_from_slice(&[HUGE_QUOTA, 16, LOW.into(), 0, 0, 0]);
+    // SAFETY: process_create only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::ProcessCreate.number() }>(x) };
+    check(
+        after[0] == Error::NoMemory.code() && after[1..] == x[1..],
+        "a quota above init's did not fail with NO_MEMORY alone",
+    )?;
+    check(
+        sys::process_create(PAGE as u64, 16, LOW) == Err(Error::NoMemory),
+        "a child took a quota of one page",
+    )?;
+    let c = sys::process_create(LEAST_QUOTA, 16, LOW)
+        .map_err(|_| "a child with the least quota was not made")?;
+    let t = child_thread(c, LOW);
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    check(
+        t == Err(Error::NoMemory),
+        "a thread fit in a child with the least quota",
+    )
 }

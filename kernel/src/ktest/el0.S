@@ -335,7 +335,7 @@ el0_buffer_mark:
 
 // A parent. x0: the child's priority ceiling; x1: the entry of the
 // child's thread; x2: that thread's priority; x3: its message buffer.
-// process_create(4096, 16, x0, 0, 0), thread_create(child, x1, 0, 0, x2,
+// process_create(64 KiB, 16, x0, 0, 0), thread_create(child, x1, 0, 0, x2,
 // FIFO, x3), thread_start, then object_info(child, PROCESS_STATE). Ends
 // with the last call's x0-x4, the child's handle in x23 and its thread's
 // in x24.
@@ -345,7 +345,7 @@ el0_child_fault:
     mov     x20, x1
     mov     x21, x2
     mov     x22, x3
-    mov     x0, #4096
+    mov     x0, #0x10000
     mov     x1, #16
     mov     x2, x19
     mov     x3, #0

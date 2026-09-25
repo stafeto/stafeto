@@ -5,7 +5,8 @@
 //! translates, with tables from the frame allocator and user pages only,
 //! and an ASID that tags its TLB entries, so a switch between processes
 //! flushes nothing. Outside processes TTBR0 holds head.S's empty table with
-//! ASID 0, the kernel's.
+//! ASID 0, the kernel's. Each table costs the quota of the space's process
+//! a page (spec 7.5): the calls that take or give back tables name it.
 
 use super::kmap::FrameTables;
 use super::phys::FRAMES;
@@ -14,8 +15,10 @@ use crate::boot::Boot;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::asid::{self, AsidAllocator, AsidTag};
+use kcore::frames::PAGE_SIZE;
 use kcore::layout::image_pa;
-use kcore::paging::{Attrs, MapError, PageTable, Release, TTBR_ROOT_MASK};
+use kcore::paging::{Attrs, MapError, PageTable, Release, TTBR_ROOT_MASK, TableMemory};
+use kcore::quota::Account;
 use kcore::sync::Lock;
 use kcore::tlb::{self, Mmu};
 
@@ -43,6 +46,50 @@ fn with_tables<R>(f: impl FnOnce(&mut FrameTables<'_>) -> R) -> R {
     let mut guard = FRAMES.lock();
     f(&mut FrameTables {
         frames: guard.as_mut().expect("frame allocator"),
+    })
+}
+
+/// Tables from the frame allocator, each charged to `quota`: a table that
+/// does not fit there is no memory, as one the allocator lacks.
+struct Charged<'a> {
+    tables: FrameTables<'a>,
+    quota: &'a mut Account,
+}
+
+// SAFETY: the tables are FrameTables', which keep that contract; the
+// charge changes only the count.
+unsafe impl TableMemory for Charged<'_> {
+    fn alloc_table(&mut self) -> Option<u64> {
+        self.quota.charge(PAGE_SIZE).ok()?;
+        let table = self.tables.alloc_table();
+        if table.is_none() {
+            self.quota.refund(PAGE_SIZE);
+        }
+        table
+    }
+
+    fn free_table(&mut self, pa: u64) {
+        self.tables.free_table(pa);
+        self.quota.refund(PAGE_SIZE);
+    }
+
+    fn read(&self, pa: u64) -> u64 {
+        self.tables.read(pa)
+    }
+
+    fn write(&mut self, pa: u64, value: u64) {
+        self.tables.write(pa, value)
+    }
+}
+
+/// `with_tables` with every table taken or given back charged to `quota`.
+fn with_charged<R>(quota: &mut Account, f: impl FnOnce(&mut Charged<'_>) -> R) -> R {
+    let mut guard = FRAMES.lock();
+    f(&mut Charged {
+        tables: FrameTables {
+            frames: guard.as_mut().expect("frame allocator"),
+        },
+        quota,
     })
 }
 
@@ -112,22 +159,33 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    /// An empty address space: one root table, no ASID until it first runs.
-    pub fn new() -> Result<AddressSpace, MapError> {
+    /// An empty address space: one root table, charged to `quota`, and no
+    /// ASID until it first runs.
+    pub fn new(quota: &mut Account) -> Result<AddressSpace, MapError> {
         Ok(AddressSpace {
-            tables: with_tables(|mem| PageTable::new(mem))?,
+            tables: with_charged(quota, |mem| PageTable::new(mem))?,
             tag: AsidTag::default(),
         })
     }
 
     /// Maps `[va, va + size)` to the frames at `[pa, pa + size)`, page by
     /// page, with user attributes (EL0 access, nG, never executable by the
-    /// kernel). On error part of the range may already be mapped. Code the
-    /// kernel wrote into the frames needs the instruction cache made
-    /// coherent (arch::cache::sync_icache) before a mapping with
-    /// `Attrs::USER_TEXT` runs it.
-    pub fn map(&mut self, va: usize, pa: u64, size: u64, attrs: Attrs) -> Result<(), MapError> {
-        let result = with_tables(|mem| self.tables.map_user(mem, va as u64, pa, size, attrs));
+    /// kernel); the tables it takes are charged to `quota`. On error part
+    /// of the range may already be mapped. Code the kernel wrote into the
+    /// frames needs the instruction cache made coherent
+    /// (arch::cache::sync_icache) before a mapping with `Attrs::USER_TEXT`
+    /// runs it.
+    pub fn map(
+        &mut self,
+        va: usize,
+        pa: u64,
+        size: u64,
+        attrs: Attrs,
+        quota: &mut Account,
+    ) -> Result<(), MapError> {
+        let result = with_charged(quota, |mem| {
+            self.tables.map_user(mem, va as u64, pa, size, attrs)
+        });
         // An entry that turns valid needs no TLB maintenance: the stores
         // only have to reach the table walker.
         mmu::tables_written();
@@ -192,13 +250,13 @@ impl AddressSpace {
         }
     }
 
-    /// `retire`, then every step of the release in a row. The work grows
-    /// with the number of tables and runs with interrupts masked: for tests
-    /// and for a process that never got its object; processes give their
-    /// tables back a portion at a time.
-    pub fn destroy(self) {
+    /// `retire`, then every step of the release in a row, the tables
+    /// refunded to `quota`. The work grows with the number of tables and
+    /// runs with interrupts masked: for tests and for a process that never
+    /// got its object; processes give their tables back a portion at a time.
+    pub fn destroy(self, quota: &mut Account) {
         let mut release = self.retire();
-        while !release.step() {}
+        while !release.step(quota) {}
     }
 }
 
@@ -223,11 +281,11 @@ pub struct SpaceRelease {
 
 impl SpaceRelease {
     /// One step: at most 512 entries read and at most one table back to
-    /// the allocator, the root last. True once every table went, and on
-    /// every step after that.
-    pub fn step(&mut self) -> bool {
+    /// the allocator and refunded to `quota`, the root last. True once
+    /// every table went, and on every step after that.
+    pub fn step(&mut self, quota: &mut Account) -> bool {
         if !self.spent {
-            self.spent = with_tables(|mem| self.tables.step(mem));
+            self.spent = with_charged(quota, |mem| self.tables.step(mem));
         }
         self.spent
     }

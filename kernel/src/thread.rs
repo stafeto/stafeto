@@ -10,7 +10,9 @@
 //! the one `create` hands out, and the kernel's while the scheduler holds
 //! the thread; it holds a reference to its process. A thread that ended
 //! stays as a shell without its buffer until its last reference goes,
-//! which queues it for cleanup (spec 7.7).
+//! which queues it for cleanup (spec 7.7). Its process pays from its quota
+//! for the thread's slot until the shell goes and for the buffer while it
+//! lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::cleanup::{self, Item};
@@ -90,6 +92,9 @@ unsafe impl Schedulable for Thread {
 
 static THREADS: Lock<Pool<Thread>> = Lock::new(Pool::new());
 
+/// What a thread costs its process's quota: its slot in the pool.
+pub const SHELL_COST: u64 = Pool::<Thread>::SLOT as u64;
+
 impl Thread {
     /// The thread's process, which the thread holds a reference to.
     pub fn process(&self) -> NonNull<Process> {
@@ -107,12 +112,13 @@ impl Thread {
 /// pointer `stack` and `arg` in x0, at `priority` under `policy`, once
 /// `start` makes it ready. It has no message buffer until `give_buffer`.
 /// The caller gets the first reference; the thread holds one to `process`
-/// and joins its threads. INVALID_ARGS for a start outside the lower half,
-/// a misaligned one or priority 0, LIMIT_REACHED when the process has
-/// abi::MAX_THREADS threads that have not ended, NO_MEMORY when the pool
-/// gets no page. The limit comes first of the two: a thread past it takes
-/// nothing. `priority` is at most the ceiling of `process`: the call
-/// checked it.
+/// and joins its threads, and its slot is charged to the quota of
+/// `process`. INVALID_ARGS for a start outside the lower half, a
+/// misaligned one or priority 0, LIMIT_REACHED when the process has
+/// abi::MAX_THREADS threads that have not ended, NO_MEMORY when the quota
+/// does not cover the slot or the pool gets no page. The limit comes first:
+/// a thread past it takes nothing. `priority` is at most the ceiling of
+/// `process`: the call checked it.
 pub fn create(
     process: NonNull<Process>,
     entry: usize,
@@ -129,6 +135,7 @@ pub fn create(
         "a thread above the ceiling of its process; the call checks it first"
     );
     process::thread_room(process)?;
+    process::charge(process, SHELL_COST)?;
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
@@ -140,10 +147,10 @@ pub fn create(
         refs: 1,
         cleanup: Item::new(),
     };
-    let thread = THREADS
-        .lock()
-        .alloc(&mut KernelPages, thread)
-        .map_err(|_| Error::NoMemory)?;
+    let Ok(thread) = THREADS.lock().alloc(&mut KernelPages, thread) else {
+        process::refund(process, SHELL_COST);
+        return Err(Error::NoMemory);
+    };
     process::retain(process);
     process::add_thread(process, thread);
     Ok(thread)
@@ -151,16 +158,19 @@ pub fn create(
 
 /// Gives `t` its message buffer (spec 11): a fresh zeroed frame mapped
 /// at page `va` of its process, readable and writable, never executable.
-/// The frame is the thread's and goes when the thread ends. INVALID_ARGS
-/// for a page that is mapped already, NO_MEMORY when frames or table
+/// The frame is the thread's and goes when the thread ends; the quota of
+/// the process pays for it and for the tables. INVALID_ARGS for a page
+/// that is mapped already, NO_MEMORY when the quota, frames or table
 /// memory run out; the thread has no buffer then.
 pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
-    let pa = FRAMES
-        .lock()
-        .as_mut()
-        .expect("frame allocator")
-        .alloc(0)
-        .ok_or(Error::NoMemory)?;
+    // SAFETY: the caller holds a reference to the thread, which holds its
+    // process.
+    let p = unsafe { t.as_ref() }.process;
+    process::charge(p, PAGE_SIZE)?;
+    let Some(pa) = FRAMES.lock().as_mut().expect("frame allocator").alloc(0) else {
+        process::refund(p, PAGE_SIZE);
+        return Err(Error::NoMemory);
+    };
     // SAFETY: the frame was just allocated and lies in the linear map; no
     // program sees it before it is zeroed.
     unsafe {
@@ -170,11 +180,9 @@ pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
             PAGE_SIZE as usize,
         )
     };
-    // SAFETY: the caller holds a reference to the thread, which holds its
-    // process.
-    let p = unsafe { t.as_ref() }.process;
     if let Err(e) = process::map_page(p, va, pa, Attrs::USER_DATA) {
         FRAMES.lock().as_mut().expect("frame allocator").free(pa, 0);
+        process::refund(p, PAGE_SIZE);
         return Err(e);
     }
     // SAFETY: as above; only the field is written.
@@ -182,9 +190,10 @@ pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Gives the message buffer's frame back, if the thread has one: its page
-/// is unmapped first, with its TLB entry, while the process's space lives;
-/// otherwise the page went with the space.
+/// Gives the message buffer's frame back, if the thread has one, and
+/// refunds it to the process: its page is unmapped first, with its TLB
+/// entry, while the process's space lives; otherwise the page went with
+/// the space.
 ///
 /// # Safety
 /// `t` is alive and does not run at EL0 again with its buffer.
@@ -201,6 +210,7 @@ pub unsafe fn drop_buffer(t: NonNull<Thread>) {
         "a message buffer's page mapped another frame"
     );
     FRAMES.lock().as_mut().expect("frame allocator").free(pa, 0);
+    process::refund(p, PAGE_SIZE);
 }
 
 /// A stopped thread becomes ready (thread_start, and the kernel for
@@ -297,8 +307,9 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
 
 /// The portion of a thread nobody refers to (cleanup): its buffer goes,
 /// it leaves its process's list if it is still there, its slot goes back
-/// to the pool, and then its reference to its process, queued at `level`
-/// if it was the last. When the thread ran last, no thread ran after it.
+/// to the pool and to its process's quota, and then its reference to its
+/// process, queued at `level` if it was the last. When the thread ran
+/// last, no thread ran after it.
 ///
 /// # Safety
 /// No reference to `thread` is left, and it is in no queue.
@@ -323,6 +334,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
             core::mem::size_of::<Thread>() - 8,
         );
     }
+    process::refund(process, SHELL_COST);
     // SAFETY: the thread's reference to its process goes with it.
     unsafe { process::release(process, level) };
 }
