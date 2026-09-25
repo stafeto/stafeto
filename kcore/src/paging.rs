@@ -181,19 +181,28 @@ fn is_table_or_page(d: u64) -> bool {
     d & (VALID | TABLE_OR_PAGE) == VALID | TABLE_OR_PAGE
 }
 
-/// Frees the level-`level` table at `table` and every table below it.
-fn free_tree(mem: &mut impl TableMemory, table: u64, level: u32) -> usize {
-    let mut freed = 0;
-    if level < 3 {
-        for i in 0..512 {
-            let d = mem.read(table + i * 8);
-            if is_table_or_page(d) {
-                freed += free_tree(mem, d & OA_MASK, level + 1);
-            }
-        }
-    }
-    mem.free_table(table);
-    freed + 1
+/// Where a stepwise release of a table tree stands: the path from the
+/// root to the table being read, as (table, next entry) for levels 0-2,
+/// and how many tables went. Only its `Release` holds it.
+#[derive(Debug)]
+struct Cursor {
+    path: [(u64, u16); 3],
+    /// Tables on the path; 0 before the first step and after the last.
+    depth: usize,
+    freed: usize,
+    done: bool,
+}
+
+/// A table tree on its way back to the allocator (spec 7.7), from
+/// `PageTable::into_release`: the tree is consumed, so nothing maps,
+/// unmaps or translates through it any more, and `step` frees it a table
+/// at a time. It is neither Clone nor Copy: the place of the walk has one
+/// owner, the object whose tree goes, and no second walk can repeat a
+/// step and free a table twice.
+#[derive(Debug)]
+pub struct Release {
+    root: u64,
+    cursor: Cursor,
 }
 
 /// A translation table tree, named by the physical address of its root.
@@ -337,7 +346,22 @@ impl PageTable {
     /// The MMU must no longer walk the tree: no TTBR points at it, and the
     /// TLB holds nothing from it.
     pub fn release(self, mem: &mut impl TableMemory) -> usize {
-        free_tree(mem, self.root, 0)
+        let mut release = self.into_release();
+        while !release.step(mem) {}
+        release.freed()
+    }
+
+    /// The tree as a release that has not begun (`Release::step`).
+    pub fn into_release(self) -> Release {
+        Release {
+            root: self.root,
+            cursor: Cursor {
+                path: [(0, 0); 3],
+                depth: 0,
+                freed: 0,
+                done: false,
+            },
+        }
     }
 
     /// Physical address and leaf descriptor that `va` translates to.
@@ -367,9 +391,59 @@ impl PageTable {
     }
 }
 
+impl Release {
+    /// One step of the release: it reads entries of one table of levels
+    /// 0-2, at most 512, and frees at most one table: the next level-3
+    /// table below a level-2 one, whose entries map pages and need no
+    /// reading, or the table itself once no table is left below it, which
+    /// takes the walk back up. A table below levels 0 and 1 is only
+    /// entered, and the next step reads it. The root goes last; then the
+    /// step returns true, and so does every later one, freeing nothing.
+    /// The same conditions as for `PageTable::release` hold from the first
+    /// step on.
+    pub fn step(&mut self, mem: &mut impl TableMemory) -> bool {
+        let cursor = &mut self.cursor;
+        if cursor.done {
+            return true;
+        }
+        if cursor.depth == 0 {
+            cursor.path[0] = (self.root, 0);
+            cursor.depth = 1;
+        }
+        let level = cursor.depth - 1;
+        let (table, from) = cursor.path[level];
+        for i in u64::from(from)..512 {
+            let d = mem.read(table + i * 8);
+            if !is_table_or_page(d) {
+                continue;
+            }
+            cursor.path[level].1 = i as u16 + 1;
+            if level == 2 {
+                mem.free_table(d & OA_MASK);
+                cursor.freed += 1;
+            } else {
+                cursor.path[level + 1] = (d & OA_MASK, 0);
+                cursor.depth += 1;
+            }
+            return false;
+        }
+        mem.free_table(table);
+        cursor.freed += 1;
+        cursor.depth -= 1;
+        cursor.done = cursor.depth == 0;
+        cursor.done
+    }
+
+    /// Tables freed so far.
+    pub fn freed(&self) -> usize {
+        self.cursor.freed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
 
     struct Tables {
@@ -377,6 +451,8 @@ mod tests {
         next: u64,
         left: usize,
         freed: Vec<u64>,
+        /// Addresses read since the log was last taken.
+        reads: RefCell<Vec<u64>>,
     }
 
     const FIRST_TABLE: u64 = 0x8000_0000;
@@ -397,6 +473,7 @@ mod tests {
             self.freed.push(pa);
         }
         fn read(&self, pa: u64) -> u64 {
+            self.reads.borrow_mut().push(pa);
             *self.words.get(&pa).unwrap_or(&0)
         }
         fn write(&mut self, pa: u64, value: u64) {
@@ -409,6 +486,11 @@ mod tests {
         fn allocated(&self) -> Vec<u64> {
             (FIRST_TABLE..self.next).step_by(PAGE as usize).collect()
         }
+
+        /// The addresses read since the last call.
+        fn take_reads(&self) -> Vec<u64> {
+            self.reads.take()
+        }
     }
 
     fn tables(n: usize) -> Tables {
@@ -417,6 +499,7 @@ mod tests {
             next: FIRST_TABLE,
             left: n,
             freed: Vec::new(),
+            reads: RefCell::new(Vec::new()),
         }
     }
 
@@ -801,6 +884,83 @@ mod tests {
             !freed.contains(&0x5000_0000),
             "a mapped page is not a table"
         );
+    }
+
+    #[test]
+    fn release_in_steps_frees_every_table_once() {
+        let mut t = tables(16);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        // As in release_frees_every_table_once: 1 root, 3 L1, 4 L2 and 5 L3.
+        for va in [
+            0x1000,
+            0x40_0000,
+            0x4000_0000,
+            0x80_0000_0000,
+            USER_END as u64 - PAGE,
+        ] {
+            pt.map_user(&mut t, va, 0x5000_0000, PAGE, Attrs::USER_DATA)
+                .unwrap();
+        }
+        let root = pt.root();
+        let mut release = pt.into_release();
+        let mut steps = 1;
+        while !release.step(&mut t) {
+            steps += 1;
+        }
+        // A step per child table of levels 0-2 and one to free each of
+        // them: (3 + 1) + (4 + 3) + (5 + 4).
+        assert_eq!((steps, release.freed()), (20, 13));
+        let mut freed = t.freed.clone();
+        assert_eq!(freed.last(), Some(&root), "the root goes last");
+        freed.sort();
+        assert_eq!(freed, t.allocated(), "each table exactly once");
+        // Once done, a step does nothing.
+        assert!(release.step(&mut t));
+        assert_eq!(t.freed.len(), 13);
+    }
+
+    #[test]
+    fn a_step_reads_at_most_one_table() {
+        // A page every 2 MiB through 1 GiB: 512 L3 tables under one L2.
+        let mut t = tables(516);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        for va in (0..1 << 30).step_by(BLOCK_2M as usize) {
+            pt.map_user(&mut t, va, 0x5000_0000, PAGE, Attrs::USER_DATA)
+                .unwrap();
+        }
+        let all = t.allocated();
+        assert_eq!(all.len(), 515);
+        let leaves: Vec<u64> = all[3..].to_vec();
+        t.take_reads();
+        let mut release = pt.into_release();
+        let mut steps = 0;
+        loop {
+            let freed = t.freed.len();
+            let done = release.step(&mut t);
+            steps += 1;
+            let reads = t.take_reads();
+            let table = reads.first().map(|pa| pa & !(PAGE - 1));
+            assert!(
+                reads.len() <= 512,
+                "step {steps} read {} words",
+                reads.len()
+            );
+            assert!(
+                reads.iter().all(|pa| Some(pa & !(PAGE - 1)) == table),
+                "step {steps} read more than one table"
+            );
+            assert!(
+                table.is_none_or(|table| !leaves.contains(&table)),
+                "step {steps} read a level-3 table"
+            );
+            assert!(t.freed.len() - freed <= 1, "step {steps} freed two tables");
+            if done {
+                break;
+            }
+        }
+        // Root and L1: a step to enter and one to free; L2: one per leaf
+        // and one to free itself.
+        assert_eq!((steps, release.freed()), (2 + 2 + 513, 515));
     }
 
     #[test]

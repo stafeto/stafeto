@@ -11,7 +11,7 @@ use crate::process::{self, Process};
 use crate::thread::{self, Thread};
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
-use kcore::handles::{Chunk, ChunkSource, HandleTable};
+use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
 use kcore::slab::Pool;
 use kcore::sync::Lock;
 
@@ -78,15 +78,17 @@ pub unsafe fn release(object: Object) {
     }
 }
 
-/// Memory for the chunks of handle tables: two chunks to a pool page. The
-/// pool's lock is taken for each chunk alone, so a table that releases
-/// its objects may release other tables meanwhile.
+/// Memory for the chunks and directories of handle tables, each from a
+/// pool of its own: two chunks or two directories to a pool page. A
+/// pool's lock is taken for each chunk or directory alone, so a table
+/// that releases its objects may release other tables meanwhile.
 pub struct Chunks;
 
 static CHUNKS: Lock<Pool<MaybeUninit<Chunk<Object>>>> = Lock::new(Pool::new());
+static DIRECTORIES: Lock<Pool<MaybeUninit<Directory<Object>>>> = Lock::new(Pool::new());
 
-// SAFETY: a chunk is a free slot of the pool, sized and aligned for
-// Chunk<Object>; the pool hands it to no one else until it comes back.
+// SAFETY: a chunk or a directory is a free slot of its pool, sized and
+// aligned for it; the pool hands it to no one else until it comes back.
 unsafe impl ChunkSource<Object> for Chunks {
     fn alloc_chunk(&mut self) -> Option<NonNull<Chunk<Object>>> {
         let slot = CHUNKS
@@ -99,5 +101,19 @@ unsafe impl ChunkSource<Object> for Chunks {
     unsafe fn free_chunk(&mut self, chunk: NonNull<Chunk<Object>>) {
         // SAFETY: the chunk came from alloc_chunk; MaybeUninit drops nothing.
         unsafe { CHUNKS.lock().free(chunk.cast()) };
+    }
+
+    fn alloc_directory(&mut self) -> Option<NonNull<Directory<Object>>> {
+        let slot = DIRECTORIES
+            .lock()
+            .alloc(&mut KernelPages, MaybeUninit::uninit())
+            .ok()?;
+        Some(slot.cast())
+    }
+
+    unsafe fn free_directory(&mut self, directory: NonNull<Directory<Object>>) {
+        // SAFETY: the directory came from alloc_directory; MaybeUninit
+        // drops nothing.
+        unsafe { DIRECTORIES.lock().free(directory.cast()) };
     }
 }

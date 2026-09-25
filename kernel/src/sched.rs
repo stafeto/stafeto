@@ -15,7 +15,7 @@ use crate::arch::{self, gic, timer};
 use crate::thread::{self, Policy, Thread};
 use abi::Error;
 use core::ptr::NonNull;
-use kcore::sched::{Armed, Scheduler, State, Timer};
+use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
 use kcore::sync::Lock;
 use kcore::time::Clock;
 
@@ -153,8 +153,12 @@ fn decide() -> Option<NonNull<Thread>> {
     let test = crate::ktest::el0::deadline();
     let mut g = SCHED.lock();
     let g = &mut *g;
-    // SAFETY: the scheduler's threads are alive.
-    let next = unsafe { g.s.pick(timer::now()) };
+    // SAFETY: the scheduler's threads are alive. No cleanup queue yet:
+    // nothing decides `Clean`.
+    let next = match unsafe { g.s.pick(timer::now(), None) } {
+        Decision::Run(t) => Some(t),
+        Decision::Clean | Decision::Idle => None,
+    };
     let deadline = g.s.deadline();
     #[cfg(feature = "ktest")]
     let deadline = deadline.into_iter().chain(test).min();

@@ -4,7 +4,9 @@
 //! Handle tables (spec 5.1, 5.2). Lookup is O(1); the generation in every
 //! handle catches stale ones, and an entry freed at the last generation is
 //! retired, so a table never hands out the same value twice. Rights only
-//! shrink when copied. A table grows by chunks up to a limit fixed at creation.
+//! shrink when copied. A table grows by chunks up to a limit fixed at
+//! creation; a directory, an object of its own, says where the chunks lie.
+//! The table goes a chunk at a time (`release_step`), the directory last.
 
 use abi::{Error, Handle, Rights};
 use core::ptr::NonNull;
@@ -53,12 +55,22 @@ pub struct Chunk<T> {
     entries: [Entry<T>; CHUNK],
 }
 
-/// Memory for chunks.
+/// Where the chunks of a table lie, in the order of their entries.
+pub struct Directory<T> {
+    chunks: [Option<NonNull<Chunk<T>>>; MAX_CHUNKS],
+}
+
+// SAFETY: a directory belongs to one table, which owns the chunks and the
+// objects in them.
+unsafe impl<T: Send> Send for Directory<T> {}
+
+/// Memory for chunks and directories.
 ///
 /// # Safety
 /// `alloc_chunk` returns memory valid for reads and writes of
 /// `size_of::<Chunk<T>>()` bytes, aligned to `align_of::<Chunk<T>>()`, that
-/// nothing else uses until the table hands it back through `free_chunk`.
+/// nothing else uses until the table hands it back through `free_chunk`;
+/// `alloc_directory` the same for a `Directory<T>` and `free_directory`.
 pub unsafe trait ChunkSource<T> {
     /// Uninitialised memory for one chunk.
     fn alloc_chunk(&mut self) -> Option<NonNull<Chunk<T>>>;
@@ -68,15 +80,28 @@ pub unsafe trait ChunkSource<T> {
     /// # Safety
     /// `chunk` came from `alloc_chunk` of this source and its entries were dropped.
     unsafe fn free_chunk(&mut self, chunk: NonNull<Chunk<T>>);
+
+    /// Uninitialised memory for one directory.
+    fn alloc_directory(&mut self) -> Option<NonNull<Directory<T>>>;
+
+    /// Takes back a directory's memory.
+    ///
+    /// # Safety
+    /// `directory` came from `alloc_directory` of this source, and the
+    /// table no longer uses it.
+    unsafe fn free_directory(&mut self, directory: NonNull<Directory<T>>);
 }
 
-/// A process's handles. The owner calls `release` before dropping it.
+/// A process's handles. The owner calls `release` (or `release_step` until
+/// it returns true) before dropping it.
 ///
 /// Every entry below `used` is live, free (on the free list) or retired
 /// (freed at the last generation and never handed out again); retired
-/// entries still count toward the limit.
+/// entries still count toward the limit. While a stepwise release is under
+/// way the table takes nothing new, and only `len` still counts.
 pub struct HandleTable<T> {
-    chunks: [Option<NonNull<Chunk<T>>>; MAX_CHUNKS],
+    /// Present from the first chunk until the release ends.
+    directory: Option<NonNull<Directory<T>>>,
     chunk_count: usize,
     /// Entries initialised so far; each index below this is valid.
     used: u32,
@@ -87,6 +112,8 @@ pub struct HandleTable<T> {
     retired: u32,
     /// Generation of fresh entries: 1, except in tests that start near the end.
     first_generation: u64,
+    /// A stepwise release is under way.
+    closing: bool,
 }
 
 // SAFETY: the table owns its chunks and the objects in them.
@@ -99,7 +126,7 @@ impl<T> HandleTable<T> {
             return Err(HandleError::InvalidArgs);
         }
         Ok(Self {
-            chunks: [None; MAX_CHUNKS],
+            directory: None,
             chunk_count: 0,
             used: 0,
             limit,
@@ -108,6 +135,7 @@ impl<T> HandleTable<T> {
             free_count: 0,
             retired: 0,
             first_generation: 1,
+            closing: false,
         })
     }
 
@@ -134,21 +162,71 @@ impl<T> HandleTable<T> {
     }
 
     /// How many inserts succeed before `LimitReached`, whatever the chunk
-    /// source can give; lets a transfer check the receiver first.
+    /// source can give; lets a transfer check the receiver first. None
+    /// while the table is being released.
     pub fn room(&self) -> u32 {
+        if self.closing {
+            return 0;
+        }
         self.free_count + (self.limit - self.used)
     }
 
+    /// The directory's slot for chunk `c`.
+    fn chunk_slot(&mut self, c: usize) -> &mut Option<NonNull<Chunk<T>>> {
+        let directory = self.directory.expect("a directory");
+        // SAFETY: the directory is initialised and owned by the table, and
+        // `&mut self` makes the access exclusive.
+        unsafe { &mut (*directory.as_ptr()).chunks[c] }
+    }
+
+    fn chunk(&self, index: u32) -> NonNull<Chunk<T>> {
+        let directory = self.directory.expect("a directory");
+        // SAFETY: the directory is initialised and owned by the table.
+        let chunk = unsafe { (*directory.as_ptr()).chunks[index as usize / CHUNK] };
+        chunk.expect("an initialised chunk")
+    }
+
     fn entry(&self, index: u32) -> &Entry<T> {
-        let chunk = self.chunks[index as usize / CHUNK].expect("an initialised chunk");
+        let chunk = self.chunk(index);
         // SAFETY: every chunk below chunk_count is initialised and owned by the table.
         unsafe { &(*chunk.as_ptr()).entries[index as usize % CHUNK] }
     }
 
     fn entry_mut(&mut self, index: u32) -> &mut Entry<T> {
-        let chunk = self.chunks[index as usize / CHUNK].expect("an initialised chunk");
+        let chunk = self.chunk(index);
         // SAFETY: as in `entry`, and `&mut self` makes the access exclusive.
         unsafe { &mut (*chunk.as_ptr()).entries[index as usize % CHUNK] }
+    }
+
+    /// A new chunk at the end, and the directory first if there is none;
+    /// NoMemory when the source has no memory for either. A directory
+    /// that came without a chunk stays until the release.
+    fn grow(&mut self, src: &mut impl ChunkSource<T>) -> Result<(), HandleError> {
+        if self.directory.is_none() {
+            let directory = src.alloc_directory().ok_or(HandleError::NoMemory)?;
+            // SAFETY: fresh memory for one directory, written whole before use.
+            unsafe {
+                (&raw mut (*directory.as_ptr()).chunks).write([None; MAX_CHUNKS]);
+            }
+            self.directory = Some(directory);
+        }
+        let chunk = src.alloc_chunk().ok_or(HandleError::NoMemory)?;
+        let generation = self.first_generation;
+        // SAFETY: fresh memory for one chunk; every entry is written before use.
+        unsafe {
+            let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
+            for i in 0..CHUNK {
+                entries.add(i).write(Entry {
+                    object: None,
+                    rights: Rights::NONE,
+                    generation,
+                    next_free: NO_ENTRY,
+                });
+            }
+        }
+        *self.chunk_slot(self.chunk_count) = Some(chunk);
+        self.chunk_count += 1;
+        Ok(())
     }
 
     pub fn insert(
@@ -157,6 +235,9 @@ impl<T> HandleTable<T> {
         object: T,
         rights: Rights,
     ) -> Result<Handle, HandleError> {
+        if self.closing {
+            return Err(HandleError::LimitReached);
+        }
         let index = if self.free_head != NO_ENTRY {
             let i = self.free_head;
             self.free_head = self.entry(i).next_free;
@@ -167,22 +248,7 @@ impl<T> HandleTable<T> {
                 return Err(HandleError::LimitReached);
             }
             if self.used as usize == self.chunk_count * CHUNK {
-                let chunk = src.alloc_chunk().ok_or(HandleError::NoMemory)?;
-                let generation = self.first_generation;
-                // SAFETY: fresh memory for one chunk; every entry is written before use.
-                unsafe {
-                    let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
-                    for i in 0..CHUNK {
-                        entries.add(i).write(Entry {
-                            object: None,
-                            rights: Rights::NONE,
-                            generation,
-                            next_free: NO_ENTRY,
-                        });
-                    }
-                }
-                self.chunks[self.chunk_count] = Some(chunk);
-                self.chunk_count += 1;
+                self.grow(src)?;
             }
             self.used += 1;
             self.used - 1
@@ -291,8 +357,22 @@ impl<T> HandleTable<T> {
     /// the table is empty afterwards. Objects that need more than a drop
     /// when their handle goes, such as counted references, leave this way.
     pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T)) {
-        for c in 0..self.chunk_count {
-            let chunk = self.chunks[c].take().expect("an initialised chunk");
+        while !self.release_step(src, &mut f) {}
+    }
+
+    /// One step of a release: the last chunk goes, its live objects
+    /// handed to `f`, at most CHUNK of them; with the last chunk, or when
+    /// there is none, the directory. True when the table holds no memory
+    /// any more: it is then empty and fresh, with its limit. From the
+    /// first step until then the table takes nothing new, handles into
+    /// chunks that went are bad, and `len` counts the objects left.
+    pub fn release_step(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T)) -> bool {
+        if let Some(c) = self.chunk_count.checked_sub(1) {
+            self.closing = true;
+            self.free_head = NO_ENTRY;
+            let chunk = self.chunk_slot(c).take().expect("an initialised chunk");
+            self.chunk_count = c;
+            self.used = self.used.min((c * CHUNK) as u32);
             // SAFETY: the chunk's entries are initialised; each object is
             // taken out once, then each entry is dropped once before its
             // memory goes back.
@@ -300,19 +380,28 @@ impl<T> HandleTable<T> {
                 let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
                 for i in 0..CHUNK {
                     if let Some(object) = (*entries.add(i)).object.take() {
+                        self.live -= 1;
                         f(object);
                     }
                     entries.add(i).drop_in_place();
                 }
                 src.free_chunk(chunk);
             }
+            if c > 0 {
+                return false;
+            }
         }
-        self.chunk_count = 0;
+        if let Some(directory) = self.directory.take() {
+            // SAFETY: no chunk is left, and the directory goes with the table.
+            unsafe { src.free_directory(directory) };
+        }
         self.used = 0;
         self.free_head = NO_ENTRY;
         self.live = 0;
         self.free_count = 0;
         self.retired = 0;
+        self.closing = false;
+        true
     }
 }
 
@@ -328,7 +417,7 @@ impl<T> Drop for HandleTable<T> {
         // source. The kernel builds without debug assertions, so the check
         // is a plain assert.
         assert!(
-            self.chunk_count == 0,
+            self.directory.is_none(),
             "handle table dropped without release"
         );
     }
@@ -342,13 +431,20 @@ mod tests {
     use std::mem::MaybeUninit;
     use std::rc::Rc;
 
+    /// Chunks and directories in boxes: at most `left` chunks, any number
+    /// of directories.
     #[derive(Default)]
     struct Boxes {
         left: usize,
         freed: usize,
+        /// Directories handed out and not back yet.
+        directories: usize,
+        /// What came back, in order: 'c' for a chunk, 'd' for a directory.
+        back: String,
     }
 
-    // SAFETY: each chunk is a fresh Box, freed only in `free_chunk`.
+    // SAFETY: each chunk and directory is a fresh Box, freed only in
+    // `free_chunk` and `free_directory`.
     unsafe impl<T> ChunkSource<T> for Boxes {
         fn alloc_chunk(&mut self) -> Option<NonNull<Chunk<T>>> {
             if self.left == 0 {
@@ -361,13 +457,30 @@ mod tests {
 
         unsafe fn free_chunk(&mut self, chunk: NonNull<Chunk<T>>) {
             self.freed += 1;
+            self.back.push('c');
             // SAFETY: the chunk came from alloc_chunk; its entries were dropped.
             drop(unsafe { Box::from_raw(chunk.as_ptr().cast::<MaybeUninit<Chunk<T>>>()) });
+        }
+
+        fn alloc_directory(&mut self) -> Option<NonNull<Directory<T>>> {
+            self.directories += 1;
+            let b: Box<MaybeUninit<Directory<T>>> = Box::new_uninit();
+            NonNull::new(Box::into_raw(b)).map(NonNull::cast)
+        }
+
+        unsafe fn free_directory(&mut self, directory: NonNull<Directory<T>>) {
+            self.directories -= 1;
+            self.back.push('d');
+            // SAFETY: the directory came from alloc_directory.
+            drop(unsafe { Box::from_raw(directory.as_ptr().cast::<MaybeUninit<Directory<T>>>()) });
         }
     }
 
     fn boxes(n: usize) -> Boxes {
-        Boxes { left: n, freed: 0 }
+        Boxes {
+            left: n,
+            ..Boxes::default()
+        }
     }
 
     fn table<T>(limit: u32) -> HandleTable<T> {
@@ -840,6 +953,63 @@ mod tests {
     }
 
     #[test]
+    fn release_step_frees_one_chunk() {
+        let mut src = boxes(4);
+        let mut t = table(1000);
+        let hs: Vec<Handle> = (0..200)
+            .map(|i| t.insert(&mut src, i, RW).unwrap())
+            .collect();
+        t.remove(hs[199]).unwrap();
+        // The last chunk goes first: entries 192-198 are live in it.
+        let mut out = Vec::new();
+        assert!(!t.release_step(&mut src, |v| out.push(v)));
+        assert_eq!(out, (192..199).collect::<Vec<u32>>());
+        assert_eq!((src.freed, src.back.as_str(), t.len()), (1, "c", 192));
+        // Handles into the chunk that went are bad, the others still hold.
+        assert_eq!(t.get(hs[192]), Err(HandleError::BadHandle));
+        assert_eq!(t.get(hs[191]), Ok((&191, RW)));
+        // The table takes nothing new meanwhile.
+        assert_eq!(t.room(), 0);
+        assert_eq!(t.insert(&mut src, 9, RW), Err(HandleError::LimitReached));
+        out.clear();
+        assert!(!t.release_step(&mut src, |v| out.push(v)));
+        assert_eq!(out, (128..192).collect::<Vec<u32>>());
+        let mut steps = 2;
+        while !t.release_step(&mut src, |v| out.push(v)) {
+            steps += 1;
+        }
+        assert_eq!((steps + 1, out.len()), (4, 192));
+        assert_eq!((src.freed, src.directories), (4, 0));
+        // Released, the table is fresh.
+        assert_eq!((t.len(), t.room()), (0, 1000));
+        src.left = 1;
+        assert_eq!(t.insert(&mut src, 7, RW).map(|h| h.index()), Ok(0));
+        t.release(&mut src);
+    }
+
+    #[test]
+    fn directory_goes_last() {
+        let mut src = boxes(3);
+        let mut t = table(1000);
+        for i in 0..150 {
+            t.insert(&mut src, i, RW).unwrap();
+        }
+        assert_eq!(src.directories, 1);
+        while !t.release_step(&mut src, drop) {
+            assert_eq!(src.directories, 1, "the directory went before a chunk");
+        }
+        assert_eq!(src.back, "cccd");
+        assert!(t.release_step(&mut src, |_| panic!("an empty table has no objects")));
+        assert_eq!(src.back, "cccd");
+        // A directory that came without a chunk goes in one step.
+        let mut empty = boxes(0);
+        assert_eq!(t.insert(&mut empty, 1, RW), Err(HandleError::NoMemory));
+        assert_eq!(empty.directories, 1);
+        assert!(t.release_step(&mut empty, drop));
+        assert_eq!((empty.back.as_str(), empty.directories), ("d", 0));
+    }
+
+    #[test]
     fn handle_errors_are_the_abi_errors() {
         use abi::Error;
         let pairs = [
@@ -915,6 +1085,9 @@ mod tests {
         let mut src = boxes(0);
         let mut t: HandleTable<u32> = table(10);
         assert_eq!(t.insert(&mut src, 1, RW), Err(HandleError::NoMemory));
+        // The directory came, and goes with the release.
+        t.release(&mut src);
+        assert_eq!(src.directories, 0);
     }
 
     #[test]

@@ -7,7 +7,10 @@
 //! the deadline the timer needs, and the checks of priorities against the
 //! ceilings of processes. Every operation takes constant time. Times are
 //! counter ticks; the kernel keeps one `Scheduler` and calls it at every
-//! decision. The running thread is in no list (Benno scheduling).
+//! decision. The running thread is in no list (Benno scheduling). The same
+//! queue of 64 levels holds the kernel's cleanup work (spec 7.7), which
+//! the decision treats as one more thread: a portion runs when its level
+//! is at least the running thread's and every ready one's.
 //!
 //! Where a thread goes; into a tail always with a new quantum, into a head
 //! always with the rest of its quantum:
@@ -39,16 +42,60 @@ pub enum State {
     Dead,
 }
 
+/// Where an item of a `ReadyQueue` stands: its level and its neighbours
+/// there. The item keeps it inside itself; only the queue changes the
+/// neighbours, and the level changes only while the item is in no list.
+pub struct Link<T> {
+    level: u8,
+    queued: bool,
+    prev: Option<NonNull<T>>,
+    next: Option<NonNull<T>>,
+}
+
+impl<T> Link<T> {
+    /// An item at `level`, in no list.
+    pub const fn new(level: u8) -> Link<T> {
+        Link {
+            level,
+            queued: false,
+            prev: None,
+            next: None,
+        }
+    }
+
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
+    /// Moves an item that is in no list to `level`.
+    pub fn set_level(&mut self, level: u8) {
+        assert!(!self.queued, "the level of a queued item changes");
+        self.level = level;
+    }
+
+    /// Whether the item stands in a queue.
+    pub fn is_queued(&self) -> bool {
+        self.queued
+    }
+}
+
+/// An item a `ReadyQueue` can hold.
+///
+/// # Safety
+/// `link` returns a pointer to a `Link` inside the object `this` points
+/// at, valid as long as that object lives.
+pub unsafe trait Linked: Sized {
+    fn link(this: NonNull<Self>) -> NonNull<Link<Self>>;
+}
+
 /// What the scheduler keeps in each thread.
 pub struct Node<T> {
-    /// The effective priority, which picks the thread's level.
-    priority: u8,
     policy: Policy,
     state: State,
     /// Ticks left of a round-robin quantum while the thread is ready.
     slice_left: u64,
-    prev: Option<NonNull<T>>,
-    next: Option<NonNull<T>>,
+    /// The level is the effective priority.
+    link: Link<T>,
 }
 
 impl<T> Node<T> {
@@ -56,17 +103,16 @@ impl<T> Node<T> {
     /// (priority_arg, kcore::thread::check_start).
     pub const fn new(priority: u8, policy: Policy) -> Node<T> {
         Node {
-            priority,
             policy,
             state: State::Stopped,
             slice_left: 0,
-            prev: None,
-            next: None,
+            link: Link::new(priority),
         }
     }
 
+    /// The effective priority, which picks the thread's level.
     pub fn priority(&self) -> u8 {
-        self.priority
+        self.link.level
     }
 
     pub fn policy(&self) -> Policy {
@@ -92,6 +138,15 @@ pub unsafe trait Schedulable: Sized {
     fn node(this: NonNull<Self>) -> NonNull<Node<Self>>;
 }
 
+// SAFETY: the link is a field of the node, which lives as long as the
+// thread (Schedulable's contract).
+unsafe impl<T: Schedulable> Linked for T {
+    fn link(this: NonNull<T>) -> NonNull<Link<T>> {
+        // SAFETY: the node is alive while `this` is.
+        unsafe { NonNull::new_unchecked(&raw mut (*T::node(this).as_ptr()).link) }
+    }
+}
+
 /// The node of `t`.
 ///
 /// # Safety
@@ -101,15 +156,26 @@ unsafe fn node<'a, T: Schedulable>(t: NonNull<T>) -> &'a mut Node<T> {
     unsafe { T::node(t).as_mut() }
 }
 
-/// The ready threads: a doubly linked list for each level, its links in
-/// the threads' nodes, and a bit for each level with a thread in it.
+/// The link of `t`.
+///
+/// # Safety
+/// As for `node`.
+unsafe fn link<'a, T: Linked>(t: NonNull<T>) -> &'a mut Link<T> {
+    // SAFETY: the caller's promise and Linked's contract.
+    unsafe { T::link(t).as_mut() }
+}
+
+/// Items ready at 64 levels: threads ready to run, or objects ready to be
+/// taken apart (the kernel's cleanup queue). A doubly linked list for each
+/// level, its links in the items, and a bit for each level with an item in
+/// it. Every operation takes constant time.
 pub struct ReadyQueue<T> {
     mask: u64,
     heads: [Option<NonNull<T>>; LEVELS],
     tails: [Option<NonNull<T>>; LEVELS],
 }
 
-impl<T: Schedulable> ReadyQueue<T> {
+impl<T: Linked> ReadyQueue<T> {
     pub const fn new() -> Self {
         ReadyQueue {
             mask: 0,
@@ -122,8 +188,8 @@ impl<T: Schedulable> ReadyQueue<T> {
         self.mask == 0
     }
 
-    /// The highest level with a ready thread: 63 minus the leading zeros
-    /// of the mask, one instruction (CLZ).
+    /// The highest level with an item: 63 minus the leading zeros of the
+    /// mask, one instruction (CLZ).
     pub fn top(&self) -> Option<u8> {
         if self.mask == 0 {
             None
@@ -132,21 +198,22 @@ impl<T: Schedulable> ReadyQueue<T> {
         }
     }
 
-    /// The thread at the head of `level`: the next to run there.
+    /// The item at the head of `level`: the next to run or be worked on
+    /// there.
     pub fn first(&self, level: u8) -> Option<NonNull<T>> {
         self.heads[usize::from(level)]
     }
 
-    /// The level of `t`, checked: level 0 goes to no thread.
+    /// The level of `t`, checked: level 0 goes to nothing.
     ///
     /// # Safety
     /// As for `node`.
     unsafe fn level(t: NonNull<T>) -> usize {
         // SAFETY: the caller's promise.
-        let level = unsafe { node(t) }.priority;
+        let level = unsafe { link(t) }.level;
         assert!(
             (1..PRIORITY_LEVELS).contains(&level),
-            "a thread at level {level} is queued; level 0 goes to no thread"
+            "an item at level {level} is queued; level 0 goes to nothing"
         );
         usize::from(level)
     }
@@ -156,16 +223,18 @@ impl<T: Schedulable> ReadyQueue<T> {
     /// # Safety
     /// `t` is alive and in no list, and stays alive and in place until it
     /// leaves this one.
-    unsafe fn push_head(&mut self, t: NonNull<T>) {
+    pub unsafe fn push_head(&mut self, t: NonNull<T>) {
         // SAFETY: the caller's promise; the old head is in this list.
         unsafe {
             let level = Self::level(t);
             let old = self.heads[level];
-            let n = node(t);
-            n.prev = None;
-            n.next = old;
+            let l = link(t);
+            assert!(!l.queued, "an item is queued twice");
+            l.queued = true;
+            l.prev = None;
+            l.next = old;
             match old {
-                Some(h) => node(h).prev = Some(t),
+                Some(h) => link(h).prev = Some(t),
                 None => self.tails[level] = Some(t),
             }
             self.heads[level] = Some(t);
@@ -177,16 +246,18 @@ impl<T: Schedulable> ReadyQueue<T> {
     ///
     /// # Safety
     /// As for `push_head`.
-    unsafe fn push_tail(&mut self, t: NonNull<T>) {
+    pub unsafe fn push_tail(&mut self, t: NonNull<T>) {
         // SAFETY: the caller's promise; the old tail is in this list.
         unsafe {
             let level = Self::level(t);
             let old = self.tails[level];
-            let n = node(t);
-            n.next = None;
-            n.prev = old;
+            let l = link(t);
+            assert!(!l.queued, "an item is queued twice");
+            l.queued = true;
+            l.next = None;
+            l.prev = old;
             match old {
-                Some(tail) => node(tail).next = Some(t),
+                Some(tail) => link(tail).next = Some(t),
                 None => self.heads[level] = Some(t),
             }
             self.tails[level] = Some(t);
@@ -198,19 +269,21 @@ impl<T: Schedulable> ReadyQueue<T> {
     /// clears its bit.
     ///
     /// # Safety
-    /// `t` is in this queue.
-    unsafe fn remove(&mut self, t: NonNull<T>) {
+    /// `t` is alive and in this queue.
+    pub unsafe fn remove(&mut self, t: NonNull<T>) {
         // SAFETY: the caller's promise; its neighbours are in this list.
         unsafe {
             let level = Self::level(t);
-            let n = node(t);
-            let (prev, next) = (n.prev.take(), n.next.take());
+            let l = link(t);
+            assert!(l.queued, "an item leaves a queue it is not in");
+            l.queued = false;
+            let (prev, next) = (l.prev.take(), l.next.take());
             match prev {
-                Some(p) => node(p).next = next,
+                Some(p) => link(p).next = next,
                 None => self.heads[level] = next,
             }
             match next {
-                Some(x) => node(x).prev = prev,
+                Some(x) => link(x).prev = prev,
                 None => self.tails[level] = prev,
             }
             if self.heads[level].is_none() {
@@ -220,10 +293,20 @@ impl<T: Schedulable> ReadyQueue<T> {
     }
 }
 
-impl<T: Schedulable> Default for ReadyQueue<T> {
+impl<T: Linked> Default for ReadyQueue<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What the kernel does next, from a decision.
+pub enum Decision<T> {
+    /// This thread runs.
+    Run(NonNull<T>),
+    /// One portion of the cleanup queue's work, then a new decision.
+    Clean,
+    /// Nothing to do: the kernel sleeps until an interrupt.
+    Idle,
 }
 
 /// The ready queue, the running thread and the end of its quantum.
@@ -305,26 +388,37 @@ impl<T: Schedulable> Scheduler<T> {
         Ok(())
     }
 
-    /// The decision: the thread to run from `now` on, or None to idle. The
-    /// running thread goes on unless a ready thread is above its level;
-    /// then it goes back to the head of its level with the rest of its
-    /// quantum. The chosen thread's quantum runs from `now`.
+    /// The decision at `now`, with `cleanup` the top level of the cleanup
+    /// queue (None when it is empty). The running thread goes on unless a
+    /// ready thread is above its level or the cleanup is at its level or
+    /// above; then it goes back to the head of its level with the rest of
+    /// its quantum, so that neither eats into its quantum. Cleanup at a
+    /// level no ready thread is above comes next (`Clean`), before a thread
+    /// of its own level; else the head of the top level runs (`Run`), its
+    /// quantum from `now`; with neither, `Idle`.
     ///
     /// # Safety
     /// Every thread the scheduler holds is alive.
-    pub unsafe fn pick(&mut self, now: u64) -> Option<NonNull<T>> {
+    pub unsafe fn pick(&mut self, now: u64, cleanup: Option<u8>) -> Decision<T> {
         if let Some(r) = self.running {
             // SAFETY: the running thread is alive.
-            let level = unsafe { node(r) }.priority;
-            match self.ready.top() {
-                Some(top) if top > level => {
-                    // SAFETY: as above.
-                    unsafe { self.preempt(r, now) }
-                }
-                _ => return Some(r),
+            let level = unsafe { node(r) }.priority();
+            let above = self.ready.top().is_some_and(|top| top > level);
+            if !above && cleanup.is_none_or(|c| c < level) {
+                return Decision::Run(r);
             }
+            // SAFETY: as above.
+            unsafe { self.preempt(r, now) }
         }
-        let top = self.ready.top()?;
+        let top = self.ready.top();
+        if let Some(c) = cleanup
+            && top.is_none_or(|top| c >= top)
+        {
+            return Decision::Clean;
+        }
+        let Some(top) = top else {
+            return Decision::Idle;
+        };
         let next = self.ready.first(top).expect("a level with its bit set");
         // SAFETY: a ready thread is alive and in the queue.
         unsafe {
@@ -337,7 +431,7 @@ impl<T: Schedulable> Scheduler<T> {
             n.slice_left = 0;
         }
         self.running = Some(next);
-        Some(next)
+        Decision::Run(next)
     }
 
     /// The running thread `r` goes back to the head of its level with the
@@ -432,7 +526,7 @@ impl<T: Schedulable> Scheduler<T> {
         let (state, old, to_round_robin) = unsafe {
             let n = node(t);
             let to_round_robin = n.policy == Policy::Fifo && policy == Policy::RoundRobin;
-            (n.state, n.priority, to_round_robin)
+            (n.state, n.priority(), to_round_robin)
         };
         let moves = state == State::Ready && priority != old;
         match state {
@@ -447,7 +541,9 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the caller's promise; the thread is in no list if it moves.
         unsafe {
             let n = node(t);
-            n.priority = priority;
+            if priority != old {
+                n.link.set_level(priority);
+            }
             n.policy = policy;
             if state == State::Ready && (priority > old || to_round_robin) {
                 n.slice_left = self.quantum;
@@ -641,11 +737,22 @@ mod tests {
             unsafe { self.s.start(t) }.unwrap();
         }
 
-        /// The name of the thread `pick` chooses at `now`, '-' for idle.
+        /// The name of the thread `pick` chooses at `now` with an empty
+        /// cleanup queue, '-' for idle.
         fn pick(&mut self, now: u64) -> char {
+            self.decide(now, None)
+        }
+
+        /// The decision at `now` with the cleanup queue's top level
+        /// `cleanup`: the name of the thread that runs, '*' for a portion
+        /// of cleanup, '-' for idle.
+        fn decide(&mut self, now: u64, cleanup: Option<u8>) -> char {
             // SAFETY: as above.
-            let t = unsafe { self.s.pick(now) };
-            t.map_or('-', name)
+            match unsafe { self.s.pick(now, cleanup) } {
+                Decision::Run(t) => name(t),
+                Decision::Clean => '*',
+                Decision::Idle => '-',
+            }
         }
 
         /// The timer's interrupt at `now`, then a decision.
@@ -677,7 +784,7 @@ mod tests {
             let mut t = self.s.ready().first(level);
             while let Some(next) = t {
                 names.push(name(next));
-                t = node(next).next;
+                t = node(next).link.next;
             }
             names
         }
@@ -711,7 +818,7 @@ mod tests {
         // SAFETY: the thread outlives its time in the scheduler.
         unsafe {
             s.start(t).unwrap();
-            assert_eq!(s.pick(MS), Some(t));
+            assert!(matches!(s.pick(MS, None), Decision::Run(r) if r == t));
             assert_eq!(s.deadline(), Some(5 * MS));
             s.exit(t);
         }
@@ -1176,6 +1283,181 @@ mod tests {
         armed.set(&mut timer, w.s.deadline());
         assert_eq!((timer.armed, timer.writes), (Some(10 * MS), 4));
         assert_eq!(armed.get(), Some(10 * MS));
+    }
+
+    #[test]
+    fn cleanup_runs_when_its_level_is_highest() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        w.started('b', 5, RR);
+        assert_eq!(w.decide(0, Some(20)), '*');
+        // Nothing runs while the cleanup works; the thread waits at the
+        // head of its level.
+        assert_eq!(w.s.running(), None);
+        assert_eq!(w.s.deadline(), None);
+        assert_eq!(w.level(10), "a");
+        assert_eq!(w.decide(MS, None), 'a');
+        // A running thread gives the CPU up to cleanup above it.
+        assert_eq!(w.decide(2 * MS, Some(11)), '*');
+        assert_eq!(w.level(10), "a");
+        assert_eq!(node(a).state(), State::Ready);
+        // In idle every level of cleanup runs, 1 too.
+        w.exit(a);
+        let mut idle = World::new();
+        assert_eq!(idle.decide(0, Some(1)), '*');
+        assert_eq!(idle.decide(0, None), '-');
+    }
+
+    #[test]
+    fn equal_level_cleanup_goes_first() {
+        let mut w = World::new();
+        let a = w.started('a', 10, FIFO);
+        w.started('b', 10, FIFO);
+        // Before a ready thread of its level.
+        assert_eq!(w.decide(0, Some(10)), '*');
+        assert_eq!(w.level(10), "ab");
+        assert_eq!(w.decide(0, None), 'a');
+        // Before the running thread of its level, which waits at the head.
+        assert_eq!(w.decide(MS, Some(10)), '*');
+        assert_eq!(w.level(10), "ab");
+        assert_eq!(node(a).state(), State::Ready);
+        assert_eq!(w.decide(2 * MS, None), 'a');
+    }
+
+    #[test]
+    fn preempted_by_cleanup_keeps_the_rest_of_its_quantum() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        let b = w.started('b', 10, RR);
+        assert_eq!(w.pick(0), 'a');
+        assert_eq!(w.s.deadline(), Some(4 * MS));
+        // 1 ms in, cleanup at the same level takes 2 ms.
+        assert_eq!(w.decide(MS, Some(10)), '*');
+        assert_eq!(node(a).slice_left(), 3 * MS);
+        assert_eq!(w.decide(2 * MS, Some(10)), '*');
+        // A goes on before B, with the 3 ms it had left.
+        assert_eq!(w.decide(3 * MS, None), 'a');
+        assert_eq!(w.s.deadline(), Some(6 * MS));
+        assert_eq!(w.tick(6 * MS), 'b');
+        // A quantum that ended under the cleanup starts anew at the tail.
+        assert_eq!(w.decide(10 * MS, Some(10)), '*');
+        assert_eq!(w.level(10), "ab");
+        assert_eq!(node(b).slice_left(), Q);
+    }
+
+    #[test]
+    fn cleanup_below_a_ready_thread_waits() {
+        let mut w = World::new();
+        w.started('a', 10, FIFO);
+        assert_eq!(w.decide(0, Some(9)), 'a');
+        assert_eq!(w.decide(MS, Some(9)), 'a');
+        // A thread above the cleanup runs first, the cleanup after it.
+        let h = w.started('h', 20, FIFO);
+        assert_eq!(w.decide(2 * MS, Some(15)), 'h');
+        w.exit(h);
+        assert_eq!(w.decide(3 * MS, Some(15)), '*');
+        assert_eq!(w.decide(4 * MS, Some(9)), 'a');
+    }
+
+    /// Items that are not threads: the cleanup queue's.
+    struct Item {
+        link: Link<Item>,
+        name: char,
+    }
+
+    // SAFETY: the link is a field of the item.
+    unsafe impl Linked for Item {
+        fn link(this: NonNull<Item>) -> NonNull<Link<Item>> {
+            // SAFETY: `this` points at a live item.
+            unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).link) }
+        }
+    }
+
+    fn names(q: &ReadyQueue<Item>, level: u8) -> String {
+        let mut names = String::new();
+        let mut t = q.first(level);
+        while let Some(i) = t {
+            // SAFETY: the test keeps its items alive.
+            let item = unsafe { i.as_ref() };
+            names.push(item.name);
+            t = item.link.next;
+        }
+        names
+    }
+
+    #[test]
+    fn ready_queue_holds_any_linked_item() {
+        let mut items: Vec<Box<Item>> = [('a', 10), ('b', 10), ('c', 30), ('d', 10)]
+            .into_iter()
+            .map(|(name, level)| {
+                Box::new(Item {
+                    link: Link::new(level),
+                    name,
+                })
+            })
+            .collect();
+        let [a, b, c, d] = [0, 1, 2, 3].map(|i| NonNull::from(&mut *items[i]));
+        let mut q = ReadyQueue::new();
+        // SAFETY: the items stay alive and in place while queued.
+        unsafe {
+            q.push_tail(a);
+            q.push_tail(b);
+            q.push_tail(c);
+            q.push_head(d);
+        }
+        assert_eq!(
+            (q.top(), names(&q, 10), names(&q, 30)),
+            (Some(30), "dab".into(), "c".into())
+        );
+        assert!(items[0].link.is_queued());
+        // SAFETY: as above.
+        unsafe {
+            q.remove(c);
+            q.remove(a);
+        }
+        assert_eq!((q.top(), names(&q, 10)), (Some(10), "db".into()));
+        // Out of the queue, an item may change its level and come back.
+        items[2].link.set_level(5);
+        // SAFETY: as above.
+        unsafe { q.push_tail(c) };
+        assert_eq!((q.first(5), items[2].link.level()), (Some(c), 5));
+        // SAFETY: as above.
+        unsafe {
+            q.remove(b);
+            q.remove(d);
+            q.remove(c);
+        }
+        assert!(q.is_empty() && !items[0].link.is_queued());
+    }
+
+    #[test]
+    #[should_panic(expected = "an item is queued twice")]
+    fn an_item_is_queued_once() {
+        let mut item = Box::new(Item {
+            link: Link::new(3),
+            name: 'x',
+        });
+        let i = NonNull::from(&mut *item);
+        let mut q = ReadyQueue::new();
+        // SAFETY: the item stays alive and in place while queued.
+        unsafe {
+            q.push_tail(i);
+            q.push_head(i);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the level of a queued item changes")]
+    fn a_queued_item_keeps_its_level() {
+        let mut item = Box::new(Item {
+            link: Link::new(3),
+            name: 'x',
+        });
+        let i = NonNull::from(&mut *item);
+        let mut q = ReadyQueue::new();
+        // SAFETY: the item stays alive and in place while queued.
+        unsafe { q.push_tail(i) };
+        item.link.set_level(4);
     }
 
     #[test]

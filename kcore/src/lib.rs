@@ -18,6 +18,7 @@ pub mod layout;
 pub mod memmap;
 pub mod paging;
 pub mod process;
+pub mod quota;
 pub mod sched;
 pub mod slab;
 pub mod sync;
