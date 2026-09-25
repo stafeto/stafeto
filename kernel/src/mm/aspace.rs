@@ -11,10 +11,11 @@ use super::kmap::FrameTables;
 use super::phys::FRAMES;
 use crate::arch::{mmu, registers, symbols};
 use crate::boot::Boot;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::asid::{self, AsidAllocator, AsidTag};
 use kcore::layout::image_pa;
-use kcore::paging::{Attrs, MapError, PageTable, TTBR_ROOT_MASK};
+use kcore::paging::{Attrs, MapError, PageTable, Release, TTBR_ROOT_MASK};
 use kcore::sync::Lock;
 use kcore::tlb::{self, Mmu};
 
@@ -76,7 +77,7 @@ impl Mmu for Cpu {
 
     fn set_ttbr0(&mut self, ttbr: u64) {
         // SAFETY: the tables map user pages only and live as long as their
-        // space, which `destroy` consumes after it takes TTBR0 off them;
+        // space, which `retire` consumes after it takes TTBR0 off them;
         // the empty table maps nothing.
         unsafe { mmu::set_ttbr0(ttbr) }
     }
@@ -98,12 +99,13 @@ impl Mmu for Cpu {
     }
 }
 
-/// The lower half of one process. `destroy` consumes the space and frees
-/// its tables, so no method can reach them afterwards; a space dropped
-/// without it stops the kernel. The frames its pages map belong to others
-/// and stay. Every method takes the frame allocator's lock or the ASID
-/// allocator's, one at a time and never one inside the other, so none may
-/// be called while the caller holds either.
+/// The lower half of one process. `retire` consumes the space, and its
+/// tables go back through the release it returns, so no method can reach
+/// them afterwards; a space dropped without it stops the kernel. The
+/// frames its pages map belong to others and stay. Every method takes the
+/// frame allocator's lock or the ASID allocator's, one at a time and
+/// never one inside the other, so none may be called while the caller
+/// holds either.
 pub struct AddressSpace {
     tables: PageTable,
     tag: AsidTag,
@@ -170,28 +172,77 @@ impl AddressSpace {
         with_asids(|a| tlb::switch_to(a, &mut self.tag, root, empty, &mut Cpu));
     }
 
-    /// Takes TTBR0 off the tables, drops their TLB entries with the ASID,
-    /// which is free again afterwards (kcore::tlb::retire), and gives the
-    /// tables back to the frame allocator. The work grows with the number of
-    /// tables and runs with interrupts masked; milestone 1.3 splits it into
-    /// portions through the cleanup queue (spec 7.7).
-    pub fn destroy(mut self) {
-        let (root, empty) = (self.tables.root(), empty_root());
-        with_asids(|a| tlb::retire(a, &mut self.tag, root, empty, &mut Cpu));
-        with_tables(|mem| PageTable::from_root(root).release(mem));
-        // The tables are gone with the only value that named them. Neither
-        // field has anything to drop, and `drop` is for a space that never
-        // came here.
-        core::mem::forget(self);
+    /// Takes TTBR0 off the tables and drops their TLB entries with the
+    /// ASID, which is free again afterwards (kcore::tlb::retire). The space
+    /// is consumed: nothing maps, unmaps, translates or runs through it any
+    /// more, and no walk reaches the tables, so they may go back in any
+    /// order and at any pace, through the release this returns (spec 7.7).
+    pub fn retire(self) -> SpaceRelease {
+        // `drop` is for a space that never came here, and the tag has
+        // nothing to drop.
+        let mut space = ManuallyDrop::new(self);
+        let (root, empty) = (space.tables.root(), empty_root());
+        with_asids(|a| tlb::retire(a, &mut space.tag, root, empty, &mut Cpu));
+        // SAFETY: the space is never dropped or used again, so the tables
+        // pass to the release, the only value that names them from now on.
+        let tables = unsafe { core::ptr::read(&space.tables) };
+        SpaceRelease {
+            tables: tables.into_release(),
+            spent: false,
+        }
+    }
+
+    /// `retire`, then every step of the release in a row. The work grows
+    /// with the number of tables and runs with interrupts masked: for tests
+    /// and for a process that never got its object; processes give their
+    /// tables back a portion at a time.
+    pub fn destroy(self) {
+        let mut release = self.retire();
+        while !release.step() {}
     }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        // Only a check: the work is `destroy`'s, which takes two locks and
+        // Only a check: the work is `retire`'s, which takes two locks and
         // consumes the space without dropping it, while a drop may happen
         // anywhere. Reaching here means the tables were never freed.
-        panic!("address space dropped without destroy");
+        panic!("address space dropped without retire");
+    }
+}
+
+/// The tables of a retired space on their way back to the frame allocator
+/// (kcore::paging::Release). It has one owner, the process at the stage
+/// Space, and a release dropped before its last table went stops the
+/// kernel.
+pub struct SpaceRelease {
+    tables: Release,
+    /// Every table went back.
+    spent: bool,
+}
+
+impl SpaceRelease {
+    /// One step: at most 512 entries read and at most one table back to
+    /// the allocator, the root last. True once every table went, and on
+    /// every step after that.
+    pub fn step(&mut self) -> bool {
+        if !self.spent {
+            self.spent = with_tables(|mem| self.tables.step(mem));
+        }
+        self.spent
+    }
+
+    /// Tables given back so far.
+    #[cfg(feature = "ktest")]
+    pub fn freed(&self) -> usize {
+        self.tables.freed()
+    }
+}
+
+impl Drop for SpaceRelease {
+    fn drop(&mut self) {
+        // Only a check, as for AddressSpace: the work is `step`'s.
+        assert!(self.spent, "a space dropped before its tables went");
     }
 }
 

@@ -68,11 +68,12 @@ pub fn handle_close(h: Handle) -> Result<(), Error> {
     call::<{ Call::HandleClose.number() }>(&[h.0]).map(drop)
 }
 
-/// process_create with no exit channel, the only kind milestone 1.2c has:
-/// a process with an empty address space, a memory quota of `quota` bytes
-/// (whole pages, counted from milestone 1.3), room for `handle_limit`
-/// handles and priority ceiling `ceiling`. The handle carries DUPLICATE,
-/// TRANSFER and MANAGE.
+/// process_create with no exit channel and no start channel, the only kind
+/// before channels come: a process with an empty address space, a memory
+/// quota of `quota` bytes (whole pages, counted from milestone 1.3), room
+/// for `handle_limit` handles and priority ceiling `ceiling`. Entry 0 of
+/// its table is a stub, so abi::START_CHANNEL is bad there for good. The
+/// handle carries DUPLICATE, TRANSFER and MANAGE.
 pub fn process_create(quota: u64, handle_limit: u32, ceiling: u8) -> Result<Handle, Error> {
     let args = [quota, handle_limit.into(), ceiling.into(), 0, 0];
     let x = call::<{ Call::ProcessCreate.number() }>(&args)?;

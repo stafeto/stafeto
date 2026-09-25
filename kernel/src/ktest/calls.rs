@@ -17,7 +17,7 @@ use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
 use abi::{
     Call, Error, Handle, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
-    INIT_RESOURCE_RIGHTS, INIT_THREAD, OWNER_RIGHTS, ProcessState, Rights,
+    INIT_RESOURCE_RIGHTS, INIT_THREAD, OWNER_RIGHTS, ProcessState, Rights, START_CHANNEL,
 };
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
@@ -426,11 +426,12 @@ fn set_priority_cases(
     c.fails(n, &[to_low, 20, fifo], Error::BadState)
 }
 
-/// process_create checks the values first, then the exit channel, then
-/// the ceiling against the caller's (spec 11); a good call returns a handle
-/// with the owner's rights to a live process with the ceiling given. With
-/// the caller's table full it fails with LIMIT_REACHED, and the new process
-/// goes again. The caller's ceiling is 30.
+/// process_create checks the values first, then the exit channel and the
+/// start channel, then the ceiling against the caller's (spec 11); a good
+/// call returns a handle with the owner's rights to a live process with
+/// the ceiling given. With the caller's table full it fails with
+/// LIMIT_REACHED, and the new process goes again. The caller's ceiling is
+/// 30.
 pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;
@@ -461,20 +462,29 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
         [page, 16, 64],
         [page, 16, 0x100 | 20],
     ] {
-        c.fails(n, &[quota, limit, ceiling, 0, 0], Error::InvalidArgs)?;
+        c.fails(n, &[quota, limit, ceiling, 0, 0, 0], Error::InvalidArgs)?;
         // Values come before handles.
-        c.fails(n, &[quota, limit, ceiling, closed, 5], Error::InvalidArgs)?;
+        c.fails(
+            n,
+            &[quota, limit, ceiling, closed, 5, closed],
+            Error::InvalidArgs,
+        )?;
     }
     // A notification priority without a channel, a channel without one.
-    c.fails(n, &[page, 16, 20, 0, 5], Error::InvalidArgs)?;
-    c.fails(n, &[page, 16, 20, closed, 0], Error::InvalidArgs)?;
-    c.fails(n, &[page, 16, 20, closed, 5], Error::BadHandle)?;
-    // No object is a channel before milestone 1.3.
-    c.fails(n, &[page, 16, 20, resource, 5], Error::WrongType)?;
+    c.fails(n, &[page, 16, 20, 0, 5, 0], Error::InvalidArgs)?;
+    c.fails(n, &[page, 16, 20, closed, 0, 0], Error::InvalidArgs)?;
+    c.fails(n, &[page, 16, 20, closed, 5, 0], Error::BadHandle)?;
+    // No object is a channel before milestone 1.3b.
+    c.fails(n, &[page, 16, 20, resource, 5, 0], Error::WrongType)?;
+    c.fails(n, &[page, 16, 20, 0, 0, closed], Error::BadHandle)?;
+    c.fails(n, &[page, 16, 20, 0, 0, resource], Error::WrongType)?;
+    // The exit channel comes before the start channel.
+    c.fails(n, &[page, 16, 20, resource, 5, closed], Error::WrongType)?;
     // Handles come before the ceiling.
-    c.fails(n, &[page, 16, 31, closed, 5], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 31, 0, 0], Error::AccessDenied)?;
-    let child = c.created(n, &[page, 16, 30, 0, 0])?;
+    c.fails(n, &[page, 16, 31, closed, 5, 0], Error::BadHandle)?;
+    c.fails(n, &[page, 16, 31, 0, 0, closed], Error::BadHandle)?;
+    c.fails(n, &[page, 16, 31, 0, 0, 0], Error::AccessDenied)?;
+    let child = c.created(n, &[page, 16, 30, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
     let found = unsafe { c.process.as_ref() }.lookup(child, OWNER_RIGHTS, Object::process);
     // SAFETY: the handle holds the child.
@@ -489,11 +499,39 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     full_table_cases(c, n)
 }
 
+/// A child that process_create made has a stub in entry 0 of its table
+/// (spec 13.3): the first handle that goes in there gets another value,
+/// and START_CHANNEL stays bad.
+pub fn entry_0_of_a_child_stays_bad(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::ProcessCreate.number();
+        let child = c.created(n, &[PAGE_SIZE, 16, 20, 0, 0, 0])?;
+        let result = start_entry_cases(c, child);
+        c.close(child)?;
+        result
+    })
+}
+
+fn start_entry_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    let first = process::insert_handle(p, Object::Resource, Rights::DEBUG)
+        .map_err(|_| "a handle did not go into the child")?;
+    // SAFETY: the caller's handle holds the child.
+    let start = unsafe { p.as_ref() }.lookup(START_CHANNEL, Rights::NONE, Object::resource);
+    check(
+        first != START_CHANNEL && start == Err(Error::BadHandle),
+        "START_CHANNEL names a handle of the child",
+    )
+}
+
 /// A full table of the caller: LIMIT_REACHED, and the new process goes.
 fn full_table_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     cleanup::drain();
     let processes = process::in_use();
-    with_full_table(c, n, &[PAGE_SIZE, 16, 30, 0, 0])?;
+    with_full_table(c, n, &[PAGE_SIZE, 16, 30, 0, 0, 0])?;
     cleanup::drain();
     check(
         process::in_use() == processes,
@@ -656,13 +694,14 @@ fn new_thread_cases(c: &Caller, low: NonNull<Process>, h: Handle) -> Result<(), 
 }
 
 /// process_kill ends a process whatever state its threads are in: a ready
-/// thread leaves the queue, a stopped one ends where it is (spec 11).
-/// The process's space and its threads' buffers go at once; handles keep
-/// the shells, and object_info reports «killed». Killing it again
-/// succeeds; thread_start, thread_create and thread_set_priority find it
-/// and its threads ended (BAD_STATE). thread_start and process_kill check
-/// their handles first. A running thread's case is `process_kills_itself`
-/// at EL0.
+/// thread leaves the queue, a stopped one ends where it is (spec 11), both
+/// in the call. The process's space and its threads' buffers go with the
+/// cleanup at the caller's level, which runs before the caller does again:
+/// here the test runs the queue itself. Handles keep the shells, and
+/// object_info reports «killed». Killing it again succeeds; thread_start,
+/// thread_create and thread_set_priority find it and its threads ended
+/// (BAD_STATE). thread_start and process_kill check their handles first.
+/// A running thread's case is `process_kills_itself` at EL0.
 pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(kill_cases)?;
@@ -673,7 +712,7 @@ pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static
 }
 
 fn kill_cases(c: &Caller) -> Result<(), &'static str> {
-    let child = c.created(Call::ProcessCreate.number(), &[PAGE_SIZE, 16, 20, 0, 0])?;
+    let child = c.created(Call::ProcessCreate.number(), &[PAGE_SIZE, 16, 20, 0, 0, 0])?;
     let make = |buffer| {
         let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, buffer);
         c.created(Call::ThreadCreate.number(), &args)
@@ -733,23 +772,38 @@ fn kill_calls(
     c.fails(kill, &[weak_child.0], Error::AccessDenied)?;
     let frames = phys::free_frames();
     c.succeeds(kill, &[child.0], &[])?;
-    // Four tables (levels 0-3 over both buffers) and two buffers.
-    check(
-        phys::free_frames() == frames + 6,
-        "the killed process kept its tables or its threads' buffers",
-    )?;
     // SAFETY: the handles hold the threads.
     let dead = unsafe { [tr, ts].map(|t| t.as_ref().sched.state() == State::Dead) };
     check(
         dead == [true, true] && sched::first(10).is_none(),
         "a thread of the killed process did not end",
     )?;
+    check(
+        (cleanup::len(), cleanup::top()) == (1, Some(10)),
+        "the killed process was not queued at the caller's level",
+    )?;
+    // Until the stage Space the space is there, and a free page for a
+    // buffer too: only the end keeps a new thread and its buffer out of
+    // the process.
+    let buffer = BUFFER + 2 * PAGE_SIZE;
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, buffer);
+    let threads = thread::in_use();
+    c.fails(Call::ThreadCreate.number(), &args, Error::BadState)?;
+    check(
+        thread::in_use() == threads,
+        "thread_create made a thread in a process that ended",
+    )?;
+    cleanup::drain();
+    // Four tables (levels 0-3 over both buffers) and two buffers.
+    check(
+        phys::free_frames() == frames + 6,
+        "the killed process kept its tables or its threads' buffers",
+    )?;
     let info = Call::ObjectInfo.number();
     let killed = ProcessState::Killed.to_words();
     c.succeeds(info, &[child.0, INFO_PROCESS_STATE, 0], &killed)?;
     c.succeeds(kill, &[child.0], &[])?;
     c.fails(start, &[stopped.0], Error::BadState)?;
-    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
     c.fails(Call::ThreadCreate.number(), &args, Error::BadState)?;
     let set = Call::ThreadSetPriority.number();
     c.fails(set, &[ready.0, 10, FIFO], Error::BadState)

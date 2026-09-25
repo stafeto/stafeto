@@ -2,26 +2,27 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Processes (spec 4, 8): an address space, the frames the process owns
-//! there, its handle table, its priority ceiling, its threads and how it
-//! lives, in objects from a kernel pool. A process lives while references
-//! to it are left: handles to it, its threads, and the one `create` hands
-//! out; the last `release` queues it for cleanup, and its portion takes it
-//! apart (`clean`). A process ends earlier (`end`):
-//! process_exit, process_kill, a fault at EL0 or the exit of its last
-//! started thread stop its threads and give back what it holds, and a
-//! shell with the reason stays for object_info until the last reference
-//! (spec 4, 7.9). Every release names the level of its cause, which the
-//! cleanup it may start takes (spec 7.7).
-//! Quotas come with the calls that need them.
+//! there, its handle table, its priority ceiling, its threads that have
+//! not ended and how it lives, in objects from a kernel pool. A process
+//! lives while references to it are left: handles to it, its threads, and
+//! the one `create` hands out. It ends (`end`) through process_exit,
+//! process_kill, a fault at EL0 or the exit of its last started thread,
+//! and when its last reference goes while it lives. The end itself only
+//! stops its threads, at most abi::MAX_THREADS, and queues the process for
+//! cleanup; the queue takes it apart in stages, a portion at a time, with
+//! how far it came kept in the process (`Stage`, spec 7.7). A shell with
+//! the reason stays for object_info until the last reference queues it
+//! once more. Every release names the level of its cause, which the
+//! cleanup it may start takes. Quotas come with the calls that need them.
 
 use crate::cleanup::{self, Item};
-use crate::mm::aspace::AddressSpace;
+use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::KernelPages;
 use crate::mm::phys::FRAMES;
 use crate::object::{self, Chunks, Handles, Object};
 use crate::sched;
 use crate::thread::{self, Siblings, Thread};
-use abi::{Error, Handle, ProcessState, Rights};
+use abi::{Error, Handle, MAX_THREADS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
@@ -34,30 +35,70 @@ use kcore::sync::Lock;
 const MAX_BLOCKS: usize = 8;
 
 pub struct Process {
-    /// Destroyed before `frames` and the threads' message buffers go:
-    /// TTBR0 leaves its tables, its TLB entries go and the tables return
-    /// to the allocator before the frames the tables mapped. Present from
-    /// `create` until the process ends or goes; destroying a space
-    /// consumes it.
+    /// From `create` until the first portion of the stage Space takes it:
+    /// from then on no call reaches its tables (`map_page` fails,
+    /// `translate` finds nothing).
     space: Option<AddressSpace>,
+    /// The tables of the space on their way back, from that first portion
+    /// until the root went: TTBR0 left them and their TLB entries went
+    /// first, so the tables go before `frames` and the threads' message
+    /// buffers, which the tables mapped.
+    retired: Option<SpaceRelease>,
     frames: OwnedFrames,
-    /// Released first when the process ends or goes: its handles hold
-    /// references to other objects.
+    /// Released at the stage Handles: its handles hold references to
+    /// other objects.
     handles: Handles,
-    /// Handles to the process, its threads, and the reference `create`
-    /// hands out.
+    /// Handles to the process, its threads, the reference `create` hands
+    /// out, and the cleanup queue's while the process is on its stages.
     refs: u32,
     /// No thread of the process gets a base priority above it (spec 8).
     ceiling: u8,
-    /// The threads it started and whether it ended, and why.
+    /// The threads it started and whether it ended, and why. A process
+    /// lives exactly while it is whole (`stage`).
     life: Life,
-    /// The process's threads, alive or ended, linked through
-    /// Thread::siblings: a thread joins at `create` and leaves when it goes.
+    /// The threads that have not ended, linked through Thread::siblings:
+    /// a thread joins at `create` and leaves at thread_exit, at the stage
+    /// Buffers after the end stopped it, or when it goes. Shells of
+    /// threads that ended are not in it.
     threads: Option<NonNull<Thread>>,
+    /// Threads in `threads`, at most abi::MAX_THREADS.
+    thread_count: u32,
     /// Init's end ends the run (spec 7.9).
     init: bool,
-    /// Its place in the cleanup queue once its last reference goes.
+    /// How far its teardown came.
+    stage: Stage,
+    /// Its place in the cleanup queue: on its stages, and as a shell once
+    /// its last reference goes.
     cleanup: Item,
+}
+
+/// Where the teardown of a process stands (spec 7.7). A process is whole
+/// until it ends; then the cleanup queue holds it, with a reference of its
+/// own, and each portion takes one step of its stage, in the order below,
+/// with how far it came kept in the process. Handles and Space take as
+/// many portions as their steps; the others one. After the last stage the
+/// queue lets its reference go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// No teardown began: the process lives.
+    Whole,
+    /// A chunk of the handle table a portion, up to 64 handles, each
+    /// releasing its object; the chunk directory with the last chunk
+    /// (HandleTable::release_step).
+    Handles,
+    /// The first portion takes the space: TTBR0 leaves its tables and
+    /// their TLB entries go with the ASID (AddressSpace::retire). Then a
+    /// table a portion (SpaceRelease::step).
+    Space,
+    /// The message buffers of the threads the end stopped, at most
+    /// abi::MAX_THREADS, and the threads leave the list. After Space, so
+    /// that no TLB entry maps a frame that goes.
+    Buffers,
+    /// The blocks of frames the process owned, at most MAX_BLOCKS.
+    Frames,
+    /// Nothing but the object and the reason are left: the last reference
+    /// queues the shell, and its portion gives the slot back.
+    Shell,
 }
 
 /// Blocks of frames, as (physical address, order), that `release` gives
@@ -196,13 +237,16 @@ pub fn create(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error>
     let space = AddressSpace::new().map_err(|_| Error::NoMemory)?;
     let process = Process {
         space: Some(space),
+        retired: None,
         frames: OwnedFrames([None; MAX_BLOCKS]),
         handles,
         refs: 1,
         ceiling,
         life: Life::new(),
         threads: None,
+        thread_count: 0,
         init: false,
+        stage: Stage::Whole,
         cleanup: Item::new(),
     };
     let allocated = PROCESSES.lock().alloc(&mut KernelPages, process);
@@ -241,7 +285,10 @@ pub fn retain(process: NonNull<Process>) {
 }
 
 /// Drops a reference; the last one queues the process for cleanup at
-/// `cause`, the level of the cleanup this release starts (spec 7.7).
+/// `cause`, the level of the cleanup this release starts (spec 7.7): a
+/// process that lives ends, killed, and its teardown begins; a shell goes.
+/// No other process can lose its last reference: the queue holds one to a
+/// process on its stages.
 ///
 /// # Safety
 /// The reference is the caller's, and the caller does not use it afterwards.
@@ -254,29 +301,168 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
             .expect("a process is released once too often");
         *refs == 0
     };
-    if last {
-        // SAFETY: that was the last reference: nothing reaches the process
-        // until its portion, and the pool keeps it in place.
-        unsafe {
-            let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
-            cleanup::enqueue(item, Object::Process(process), cause);
+    if !last {
+        return;
+    }
+    // SAFETY: that was the last reference: nothing else reaches the
+    // process, and the pool keeps it in place; only the fields are touched.
+    unsafe {
+        match (*process.as_ptr()).stage {
+            // No thread holds it, so none is left to stop.
+            Stage::Whole => {
+                let ended = (*life(process)).end(ProcessState::Killed);
+                assert!(ended, "a whole process that ended");
+                begin(process, cause);
+            }
+            Stage::Shell => {
+                let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
+                cleanup::enqueue(item, Object::Process(process), cause);
+            }
+            _ => unreachable!("the cleanup queue holds a process on its stages"),
         }
     }
 }
 
-/// The portion of a process nobody refers to (cleanup): what it holds
-/// goes, unless it went when the process ended (`release_contents`), and
-/// then the shell. What it releases is queued at `level`. The pool's lock
-/// comes last, when nothing in the object owns memory any more.
+/// The teardown of a process that just ended begins: the cleanup queue
+/// takes a reference of its own and queues the process at `level` for its
+/// first stage.
 ///
 /// # Safety
-/// No reference to `process` is left, and it is in no queue.
+/// `process` is alive, whole, and in no queue.
+unsafe fn begin(process: NonNull<Process>, level: u8) {
+    // SAFETY: the caller's promise; only the fields are touched.
+    unsafe {
+        let p = process.as_ptr();
+        assert!(
+            (*p).stage == Stage::Whole,
+            "the teardown of a process begins twice"
+        );
+        (*p).stage = Stage::Handles;
+        // The queue's own reference. `retain` refuses a count of 0, which
+        // it is when the last reference ended the process (`release`).
+        let refs = refs(process);
+        *refs = refs.checked_add(1).expect("process references overflow");
+        let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+        cleanup::enqueue(item, Object::Process(process), level);
+    }
+}
+
+/// One portion of a process in the cleanup queue (cleanup::portion): one
+/// step of its stage (`Stage`); what the step releases is queued at
+/// `level`. With work left the process goes back to the head of `level`,
+/// so the next portion there goes on with it; after the stage Frames the
+/// queue lets its reference go, which queues the shell when it was the
+/// last. A shell's portion gives the slot back.
+///
+/// # Safety
+/// The process was just taken from the queue: it is on its stages, with
+/// the queue's reference, or a shell nobody refers to.
 pub unsafe fn clean(process: NonNull<Process>, level: u8) {
-    // SAFETY: no reference is left, so no handle in the table names this
-    // process or one of its threads, each of which would hold one: the
-    // objects released there are other processes' and threads'.
-    unsafe { release_contents(process, level) };
-    // SAFETY: nothing refers to the process any more.
+    let p = process.as_ptr();
+    // SAFETY: the caller's promise; only the field is read.
+    let stage = unsafe { (*p).stage };
+    let done = match stage {
+        Stage::Whole => unreachable!("a whole process in the cleanup queue"),
+        // SAFETY: the process is alive, and the step borrows only the
+        // field it works on.
+        Stage::Handles => unsafe { release_handles(process, level) },
+        // SAFETY: as above.
+        Stage::Space => unsafe { release_space(p) },
+        // SAFETY: as above.
+        Stage::Buffers => unsafe { release_buffers(process) },
+        // SAFETY: as above; the stage Space is over, so no TLB entry
+        // maps the frames.
+        Stage::Frames => unsafe {
+            (*p).frames.release();
+            true
+        },
+        Stage::Shell => {
+            // SAFETY: nothing refers to the shell.
+            unsafe { free(process) };
+            return;
+        }
+    };
+    let next = match (stage, done) {
+        (_, false) => stage,
+        (Stage::Handles, true) => Stage::Space,
+        (Stage::Space, true) => Stage::Buffers,
+        (Stage::Buffers, true) => Stage::Frames,
+        // After Frames only the shell is left.
+        _ => Stage::Shell,
+    };
+    // SAFETY: the process is alive; the queue's reference goes last, and
+    // nothing uses the process afterwards.
+    unsafe {
+        (*p).stage = next;
+        if next == Stage::Shell {
+            release(process, level);
+        } else {
+            let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+            cleanup::requeue(item, Object::Process(process), level);
+        }
+    }
+}
+
+/// The stage Handles: one step of the table's release, each handle's
+/// object released at `level`. True once the table holds nothing.
+///
+/// # Safety
+/// `process` is alive and on its stages.
+unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
+    // SAFETY: only the table is borrowed: releasing its objects reaches no
+    // other field but `refs`, through raw pointers, since a release only
+    // counts and queues.
+    let handles = unsafe { &mut (*process.as_ptr()).handles };
+    handles.release_step(&mut Chunks, |object| {
+        // SAFETY: the table let the handle go, and its reference with it.
+        unsafe { object::release(object, level) }
+    })
+}
+
+/// The stage Space: the first portion takes the space and retires it,
+/// each later one gives a table back. True once the root went.
+///
+/// # Safety
+/// `p` is alive and on its stages.
+unsafe fn release_space(p: *mut Process) -> bool {
+    // SAFETY: the caller's promise; only the fields are borrowed.
+    let (space, retired) = unsafe { (&mut (*p).space, &mut (*p).retired) };
+    let Some(release) = retired.as_mut() else {
+        let space = space.take().expect("a space at the stage Space");
+        *retired = Some(space.retire());
+        return false;
+    };
+    let spent = release.step();
+    if spent {
+        *retired = None;
+    }
+    spent
+}
+
+/// The stage Buffers: the message buffers of the threads the end stopped
+/// go, and the threads leave the list. The ASID went at the stage Space,
+/// so the frames go back without unmapping. One portion: true.
+///
+/// # Safety
+/// `process` is alive and on its stages.
+unsafe fn release_buffers(process: NonNull<Process>) -> bool {
+    // SAFETY: the caller's promise; the threads of the list are alive,
+    // since each is either held or queued for cleanup behind this portion.
+    unsafe {
+        while let Some(t) = (*process.as_ptr()).threads {
+            thread::drop_buffer(t);
+            remove_thread(process, t);
+        }
+    }
+    true
+}
+
+/// A shell's portion: the slot goes back to the pool.
+///
+/// # Safety
+/// Nothing refers to the shell, and it is in no queue.
+unsafe fn free(process: NonNull<Process>) {
+    // SAFETY: the caller's promise; every stage gave its memory back.
     unsafe { PROCESSES.lock().free(process) };
     // Test builds poison the slot past the pool's link: a use after free
     // then reads garbage instead of the old fields, and `life` stops it.
@@ -299,49 +485,15 @@ const POISON: u8 = 0xA5;
 #[cfg(feature = "ktest")]
 const _: () = assert!(core::mem::offset_of!(Process, refs) >= 8);
 
-/// Gives back what the process holds, in this order: its handles, each
-/// releasing its object, which may queue that object for cleanup at
-/// `cause`; its address space (TTBR0 leaves the tables, their TLB entries
-/// go, the tables return to the allocator); the message buffers of the
-/// threads that are left, and the frames the process owned, which the
-/// tables mapped. Each step takes its locks alone. A second call finds
-/// nothing left to do.
-///
-/// # Safety
-/// `process` is alive, and nothing borrows its table.
-unsafe fn release_contents(process: NonNull<Process>, cause: u8) {
-    let p = process.as_ptr();
-    // SAFETY: only the table is borrowed: releasing its objects may reach
-    // the process's other fields (`refs`, `space`, `threads`) through its
-    // threads, but never the table.
-    let handles = unsafe { &mut (*p).handles };
-    handles.release_with(&mut Chunks, |object| {
-        // SAFETY: the table is gone, and with it the handle's reference.
-        unsafe { object::release(object, cause) }
-    });
-    // SAFETY: the table is done; nothing else borrows the process now.
-    unsafe {
-        (*p).destroy_space();
-        let mut next = (*p).threads;
-        while let Some(t) = next {
-            next = (*t.as_ptr()).siblings.next;
-            // Shells that handles elsewhere hold: their pages went with
-            // the space.
-            thread::drop_buffer(t);
-        }
-        (*p).frames.release();
-    }
-}
-
 /// Ends `process` with `reason` unless it ended before, when the first
-/// reason stays: process_exit, process_kill and a fault at EL0 come here. Every thread of the process leaves the scheduler for good;
-/// the handle table, the address space, the threads' message buffers and
-/// the frames go; a shell with the reason stays for `object_info` until
-/// the last reference. What that releases is queued for cleanup at
-/// `cause`: the effective priority of the thread that made the call or
-/// the fault. The running thread may be one of the process's: it never
-/// runs again and may be gone afterwards, so the caller leaves through
-/// sched::resume. When the process is init, the run ends (`init_ended`).
+/// reason stays: process_exit, process_kill and a fault at EL0 come here.
+/// In the call itself every thread of the process leaves the scheduler for
+/// good, and the process is queued for its teardown at `cause`, the
+/// effective priority of the thread that made the call or the fault; what
+/// the teardown releases is queued at that level too. The running thread
+/// may be one of the process's: it never runs again and may be gone
+/// afterwards, so the caller leaves through sched::resume. When the
+/// process is init, the run ends (`init_ended`).
 ///
 /// # Safety
 /// The caller holds a reference to `process`.
@@ -349,7 +501,7 @@ pub unsafe fn end(process: NonNull<Process>, reason: ProcessState, cause: u8) {
     // SAFETY: the caller's reference keeps the process alive.
     if unsafe { (*life(process)).end(reason) } {
         // SAFETY: as above; the end was just recorded.
-        unsafe { teardown(process, cause) };
+        unsafe { stop(process, cause) };
     }
 }
 
@@ -363,7 +515,7 @@ pub unsafe fn thread_exited(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's reference keeps the process alive.
     if unsafe { (*life(process)).exit() } {
         // SAFETY: as above; the end was just recorded.
-        unsafe { teardown(process, cause) };
+        unsafe { stop(process, cause) };
     }
 }
 
@@ -396,32 +548,30 @@ unsafe fn life(process: NonNull<Process>) -> *mut Life {
     unsafe { &raw mut (*process.as_ptr()).life }
 }
 
-/// The rest of an end whose reason was just recorded: the threads stop,
-/// then what the process holds goes (`release_contents`), releases queued
-/// at `cause`. A reference taken for the while keeps the process through
-/// its threads' and its table's releases, which may drop every other one.
-/// From milestone 1.3 the quota goes back to the parent and the exit
-/// channel hears of the end afterwards.
+/// The part of an end that runs in the call, once its reason was just
+/// recorded: each thread of the list, at most abi::MAX_THREADS, leaves the
+/// scheduler and loses the kernel's reference, which may queue it for
+/// cleanup at `cause`, though it stays alive and in the list until its
+/// portion or the stage Buffers; then the teardown begins at `cause`
+/// (spec 7.7). From milestone 1.3b the exit channel hears of the end once
+/// the stages gave back what they can.
 ///
 /// # Safety
 /// As for `end`.
-unsafe fn teardown(process: NonNull<Process>, cause: u8) {
-    retain(process);
+unsafe fn stop(process: NonNull<Process>, cause: u8) {
     let p = process.as_ptr();
-    // SAFETY: the reference above keeps the process alive. A thread whose
-    // last reference was the kernel's stays until its portion, in the list.
+    // SAFETY: the caller's reference keeps the process alive, and a
+    // release only queues, so every thread of the list stays alive here.
     unsafe {
         let mut next = (*p).threads;
         while let Some(t) = next {
-            next = (*t.as_ptr()).siblings.next;
+            next = (*t.as_ptr()).siblings.and_then(|s| s.next);
             sched::exit(t, cause);
         }
-        release_contents(process, cause);
+        begin(process, cause);
     }
     // SAFETY: as above.
     let (init, state) = unsafe { ((*p).init, (*life(process)).state()) };
-    // SAFETY: the reference taken above.
-    unsafe { release(process, cause) };
     if init {
         init_ended(state);
     }
@@ -463,48 +613,77 @@ pub fn is_init(process: NonNull<Process>) -> bool {
     unsafe { (*process.as_ptr()).init }
 }
 
-/// Puts `t`, a new thread of `process`, at the head of its threads.
+/// LIMIT_REACHED when `process` has abi::MAX_THREADS threads that have
+/// not ended (spec 8): thread::create asks before it takes a slot.
+pub fn thread_room(process: NonNull<Process>) -> Result<(), Error> {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is read.
+    if unsafe { (*process.as_ptr()).thread_count } < MAX_THREADS {
+        Ok(())
+    } else {
+        Err(Error::LimitReached)
+    }
+}
+
+/// Puts `t`, a new thread of `process`, at the head of its threads, after
+/// `thread_room` let it.
 pub fn add_thread(process: NonNull<Process>, t: NonNull<Thread>) {
     // SAFETY: the process and its threads are alive, and a thread holds a
     // reference to its process; only the list's fields are touched.
     unsafe {
-        let head = &raw mut (*process.as_ptr()).threads;
-        let old = *head;
-        (*t.as_ptr()).siblings = Siblings {
+        let p = process.as_ptr();
+        (*p).thread_count += 1;
+        let old = (*p).threads;
+        (*t.as_ptr()).siblings = Some(Siblings {
             prev: None,
             next: old,
-        };
+        });
         if let Some(o) = old {
-            (*o.as_ptr()).siblings.prev = Some(t);
+            sibling(o).prev = Some(t);
         }
-        *head = Some(t);
+        (*p).threads = Some(t);
     }
 }
 
-/// Takes `t` out of its process's threads, when it goes.
+/// Takes `t` out of its process's threads, if it is there: when it exits,
+/// at the stage Buffers, or when it goes.
 ///
 /// # Safety
-/// `t` is a live thread of `process`, in its list.
+/// `t` is a live thread of `process`.
 pub unsafe fn remove_thread(process: NonNull<Process>, t: NonNull<Thread>) {
     // SAFETY: the caller's promise; only the list's fields are touched.
     unsafe {
-        let Siblings { prev, next } = (*t.as_ptr()).siblings;
+        let Some(Siblings { prev, next }) = (*t.as_ptr()).siblings.take() else {
+            return;
+        };
+        let p = process.as_ptr();
+        (*p).thread_count -= 1;
         match prev {
-            Some(p) => (*p.as_ptr()).siblings.next = next,
-            None => (*process.as_ptr()).threads = next,
+            Some(q) => sibling(q).next = next,
+            None => (*p).threads = next,
         }
         if let Some(n) = next {
-            (*n.as_ptr()).siblings.prev = prev;
+            sibling(n).prev = prev;
         }
     }
+}
+
+/// The links of `t`, a thread in its process's list.
+///
+/// # Safety
+/// `t` is alive and in the list; nothing else borrows its links.
+unsafe fn sibling<'a>(t: NonNull<Thread>) -> &'a mut Siblings {
+    // SAFETY: the caller's promise.
+    unsafe { (*t.as_ptr()).siblings.as_mut() }.expect("a thread in the list")
 }
 
 /// Maps the frame at `pa` at page `va` of the process with `attrs`.
 /// INVALID_ARGS for a page that is mapped already or outside the lower
-/// half, NO_MEMORY when no frame is left for a table.
+/// half, NO_MEMORY when no frame is left for a table, BAD_STATE once the
+/// stage Space took the space.
 pub fn map_page(process: NonNull<Process>, va: usize, pa: u64, attrs: Attrs) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the process; only the field
-    // is borrowed (see `retain`).
+    // is borrowed (see `refs`).
     let space = unsafe { &mut (*process.as_ptr()).space };
     let space = space.as_mut().ok_or(Error::BadState)?;
     space.map(va, pa, PAGE_SIZE, attrs).map_err(|e| match e {
@@ -514,8 +693,8 @@ pub fn map_page(process: NonNull<Process>, va: usize, pa: u64, attrs: Attrs) -> 
 }
 
 /// Unmaps page `va` of the process and drops its TLB entry; returns the
-/// frame it mapped, or None when nothing maps it or the process's space
-/// went with its end.
+/// frame it mapped, or None when nothing maps it or the stage Space took
+/// the space: its ASID went then, and with it every TLB entry.
 pub fn unmap_page(process: NonNull<Process>, va: usize) -> Option<u64> {
     // SAFETY: as in `map_page`.
     let space = unsafe { &mut (*process.as_ptr()).space };
@@ -523,7 +702,8 @@ pub fn unmap_page(process: NonNull<Process>, va: usize) -> Option<u64> {
 }
 
 /// What page `va` of the process translates to: the frame and the leaf
-/// descriptor; None when nothing maps it or the process's space went.
+/// descriptor; None when nothing maps it or the stage Space took the
+/// space.
 pub fn translate(process: NonNull<Process>, va: usize) -> Option<(u64, u64)> {
     // SAFETY: as in `map_page`.
     let space = unsafe { &(*process.as_ptr()).space };
@@ -595,8 +775,34 @@ pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> R
     Ok(())
 }
 
+/// Entry 0 of the fresh table of a child that process_create made
+/// (spec 13.3): with no start channel, a stub goes in and out at once, so
+/// abi::START_CHANNEL stays bad there for good, even for a channel the
+/// child makes itself. NO_MEMORY when no chunk is left for the table.
+pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
+    let stub = insert_handle(child, Object::Resource, Rights::NONE)?;
+    assert_eq!(
+        stub,
+        abi::START_CHANNEL,
+        "the start entry went into a table that was not fresh"
+    );
+    // The system resource is never queued: any level will do.
+    close_handle(child, stub, 1)
+}
+
 /// Objects the process pool holds now.
 #[cfg(feature = "ktest")]
 pub fn in_use() -> usize {
     PROCESSES.lock().in_use()
+}
+
+/// How far the teardown of `process` came: its stage, the handles left in
+/// its table, and the tables of its space that went back.
+#[cfg(feature = "ktest")]
+pub fn progress(process: NonNull<Process>) -> (Stage, u32, usize) {
+    // SAFETY: the test holds a reference to the process, and nothing
+    // runs its portions meanwhile.
+    let p = unsafe { process.as_ref() };
+    let tables = p.retired.as_ref().map_or(0, |r| r.freed());
+    (p.stage, p.handles.len(), tables)
 }

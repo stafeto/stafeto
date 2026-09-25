@@ -17,6 +17,7 @@ use super::{CAUSE, check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::arch::{self, cache, gic, symbols, timer};
 use crate::cleanup;
+use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::sched;
@@ -27,8 +28,9 @@ use core::ptr::NonNull;
 use kcore::esr;
 use kcore::frames::PAGE_SIZE;
 use kcore::gic::PRIORITY_MASK;
+use kcore::handles::{MAX_CHUNKS, MAX_HANDLES};
 use kcore::layout::LINEAR_BASE;
-use kcore::paging::Attrs;
+use kcore::paging::{Attrs, BLOCK_2M};
 use kcore::sched::State;
 use kcore::sync::Lock;
 use kcore::sysreg::SPSR_NZCV;
@@ -110,6 +112,13 @@ const SWITCHES: u64 = 3;
 const CHILD_THREADS: usize = 8;
 /// The portion of cleanup after which the cleanup tests' interrupt comes.
 const INTERRUPT_AFTER: u32 = 2;
+/// The big teardown's interrupts come after every so many portions: a
+/// prime, so that they fall on different places of both long stages.
+const INTERRUPT_EVERY: u32 = 61;
+/// Where the big teardown's child has its pages: one every 2 MiB through
+/// the gigabyte from here, a table of the last level for each.
+const BIG_BASE: usize = 1 << 30;
+const BIG_PAGES: usize = 512;
 
 struct El0Test {
     name: &'static str,
@@ -277,6 +286,16 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_cleanup_level,
     },
     El0Test {
+        name: "fault_cleanup_runs_at_the_priority_of_the_fault",
+        start: start_fault_cleanup,
+        done: done_own_cleanup,
+    },
+    El0Test {
+        name: "exit_cleanup_runs_at_the_priority_of_the_exit",
+        start: start_exit_cleanup,
+        done: done_own_cleanup,
+    },
+    El0Test {
         name: "init_fault_stops_the_machine",
         start: start_init_fault,
         done: done_init_fault,
@@ -292,7 +311,8 @@ const EL0_TESTS: &[El0Test] = &[
 /// something happens. Only a run under `-icount`, where virtual time counts
 /// instructions and a stall of the host does not eat into a quantum, makes
 /// them repeatable: the `icount` build, which xtask runs that way, adds
-/// them after the others.
+/// them after the others. The teardown of a big process, hundreds of
+/// portions with interrupts between them, runs there too.
 const ICOUNT_TESTS: &[El0Test] = &[
     El0Test {
         name: "lone_round_robin_thread_is_not_switched",
@@ -303,6 +323,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "preempted_rr_thread_resumes_before_its_peer",
         start: start_rest,
         done: done_rest,
+    },
+    El0Test {
+        name: "teardown_yields_to_a_pending_interrupt",
+        start: start_big_teardown,
+        done: done_big_teardown,
     },
 ];
 
@@ -350,10 +375,15 @@ struct Fixture {
     idle_depth: Option<usize>,
     /// GICC_PMR in the idle wait.
     idle_mask: Option<u8>,
-    /// Portions of cleanup since the test began, and the one after which
-    /// the timer's interrupt comes (portion_done).
+    /// Portions of cleanup since the test began, the one after which the
+    /// timer's interrupt comes and wakes the thread in slot 0, and how many
+    /// portions apart more interrupts come (portion_done).
     portions: u32,
     interrupt_after: Option<u32>,
+    interrupt_every: Option<u32>,
+    /// Free frames and the pages of kernel pools together when the test
+    /// began: the same once what the test made gave back what it took.
+    memory: u64,
     /// Items in the cleanup queue when the wake-up came.
     queued_at_wake: Option<u64>,
     /// The counter before the thread started.
@@ -393,6 +423,8 @@ impl Fixture {
             idle_mask: None,
             portions: 0,
             interrupt_after: None,
+            interrupt_every: None,
+            memory: 0,
             queued_at_wake: None,
             counter: 0,
             faults: false,
@@ -580,17 +612,24 @@ pub fn note_idle_stack() {
 /// After each portion of cleanup (cleanup::portion): in the cleanup tests,
 /// portion `interrupt_after` arms the timer for now and waits until its
 /// interrupt is pending, so the way out of the kernel finds it at the
-/// next poll; the interrupt starts the thread in slot 0 (`wake`).
+/// next poll; the interrupt starts the thread in slot 0 (`wake`). Every
+/// `interrupt_every` portions another interrupt comes the same way.
 pub fn portion_done() {
     let now = {
         let mut f = FIXTURE.lock();
         f.portions += 1;
-        if f.interrupt_after != Some(f.portions) {
+        let first = f.interrupt_after == Some(f.portions);
+        let again = f
+            .interrupt_every
+            .is_some_and(|n| f.portions.is_multiple_of(n));
+        if !first && !again {
             return;
         }
-        f.interrupt_after = None;
         let now = timer::now();
-        f.wake = Some(now);
+        if first {
+            f.interrupt_after = None;
+            f.wake = Some(now);
+        }
         now
     };
     timer::arm(now);
@@ -1830,11 +1869,22 @@ fn done_orphan(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 
 /// The cleanup tests' threads and child.
 fn start_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
+    killer_and_child(f, child_with_threads)
+}
+
+/// The threads of a test that kills the child `make` makes: the waking
+/// thread in slot 0, the killer in slot 1 with a handle to the child, the
+/// judge in slot 2. The interrupt comes after INTERRUPT_AFTER portions.
+fn killer_and_child(
+    f: &mut Fixture,
+    make: fn() -> Result<NonNull<Process>, &'static str>,
+) -> Result<(), &'static str> {
     sched_process(f)?;
     sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY + 10, FIFO)?;
     let killer = sched_thread(f, 1, &raw const el0_kill, PRIORITY, FIFO)?;
     sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
-    let child = child_with_threads()?;
+    f.memory = phys::free_frames() + pages::taken() as u64;
+    let child = make()?;
     let h = give_kept(f, Object::Process(child));
     // SAFETY: the test's reference goes; the handle, if it went in, holds
     // the child.
@@ -1851,23 +1901,29 @@ fn start_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
 /// own table hold.
 fn child_with_threads() -> Result<NonNull<Process>, &'static str> {
     let child = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    let made = give_threads(child);
+    if made.is_err() {
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { process::release(child, CAUSE) };
+    }
+    made.map(|()| child)
+}
+
+/// CHILD_THREADS stopped threads of `child` that only handles in its own
+/// table hold.
+fn give_threads(child: NonNull<Process>) -> Result<(), &'static str> {
     for _ in 0..CHILD_THREADS {
-        let made =
-            thread::create(child, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO).and_then(|t| {
+        thread::create(child, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO)
+            .and_then(|t| {
                 let h = process::insert_handle(child, Object::Thread(t), Rights::NONE);
                 // SAFETY: the reference `create` handed out goes; the handle,
                 // if it went in, holds the thread.
                 unsafe { thread::release(t, CAUSE) };
                 h
-            });
-        if made.is_err() {
-            // SAFETY: the test's reference goes, and nothing uses it
-            // afterwards.
-            unsafe { process::release(child, CAUSE) };
-            return Err("no thread in the child");
-        }
+            })
+            .map_err(|_| "no thread in the child")?;
     }
-    Ok(child)
+    Ok(())
 }
 
 /// The interrupt that came after INTERRUPT_AFTER portions was handled
@@ -1907,6 +1963,64 @@ fn done_cleanup_level(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     }
 }
 
+// The child ends itself, through a thread of its own in slot 1 at the
+// killer's level: by a fault, or by thread_exit as its last started
+// thread. The teardown runs at that thread's priority, as the kill's runs
+// at the killer's (spec 7.7).
+
+/// The fault: the child's thread starts where nothing is mapped.
+fn start_fault_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
+    f.faults = true;
+    child_ends_itself(f, CHILD_ENTRY as usize)
+}
+
+/// The exit: the child's thread makes a call that fails and exits.
+fn start_exit_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
+    child_ends_itself(f, user_address(&raw const el0_info_then_exit))
+}
+
+/// The waking thread in slot 0 and the judge in slot 2, as for the kill;
+/// in slot 1 the child with the programs and CHILD_THREADS stopped
+/// threads, and its thread that starts at `entry` and ends it.
+fn child_ends_itself(f: &mut Fixture, entry: usize) -> Result<(), &'static str> {
+    sched_process(f)?;
+    sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY + 10, FIFO)?;
+    sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    let child = new_process(f, 1)?;
+    give_threads(child)?;
+    let t = thread::create(child, entry, DATA_VA + PAGE, 0, PRIORITY, FIFO)
+        .map_err(|_| "no thread in the child")?;
+    f.threads[1] = Some(t);
+    f.ends[1] = true;
+    // Slot 0 waits for the interrupt, which no deadline brings.
+    f.wake = Some(u64::MAX);
+    f.interrupt_after = Some(INTERRUPT_AFTER);
+    cleanup::take_late();
+    Ok(())
+}
+
+/// The thread above the child's thread runs while work is left, and the
+/// judge below comes last, once the child's thread ended the child.
+fn done_own_cleanup(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            cleanup::len() > 0,
+            "the thread above the cause waited for the cleanup",
+        ),
+        1 => Err("the child's thread did not end the child"),
+        _ => {
+            check(
+                matches!(
+                    state(f, 1),
+                    ProcessState::Fault { .. } | ProcessState::Exited { code: 0 }
+                ),
+                "the child did not end through its own thread",
+            )?;
+            cleanup_done()
+        }
+    }
+}
+
 /// The child's threads went back to their pool; the child stays as a
 /// shell that the test's handle holds.
 fn cleanup_done() -> Result<(), &'static str> {
@@ -1918,4 +2032,71 @@ fn cleanup_done() -> Result<(), &'static str> {
         thread::in_use() == SLOTS && process::in_use() == 2,
         "the killed child's threads stayed in their pool",
     )
+}
+
+/// The teardown of a child with a full table of MAX_HANDLES handles and
+/// BIG_PAGES pages spread over a gigabyte (spec 7.7): it goes in portions,
+/// a chunk of the table or a table of the space each, and an interrupt
+/// comes every INTERRUPT_EVERY portions. None of them waits for the next
+/// portion: every portion begins with no interrupt pending, and the thread
+/// the first one wakes runs while work is left. Afterwards the child's
+/// memory is back.
+fn start_big_teardown(f: &mut Fixture) -> Result<(), &'static str> {
+    killer_and_child(f, big_child)?;
+    f.interrupt_after = Some(INTERRUPT_EVERY);
+    f.interrupt_every = Some(INTERRUPT_EVERY);
+    Ok(())
+}
+
+/// The big teardown's child: one frame of its own, mapped at every
+/// 2 MiB of the gigabyte from BIG_BASE, and a full table.
+fn big_child() -> Result<NonNull<Process>, &'static str> {
+    let child = process::create(MAX_HANDLES, CEILING).map_err(|_| "no child")?;
+    let filled = fill_big_child(child);
+    if filled.is_err() {
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { process::release(child, CAUSE) };
+    }
+    filled.map(|()| child)
+}
+
+fn fill_big_child(mut child: NonNull<Process>) -> Result<(), &'static str> {
+    // SAFETY: the child was just created, and only this test uses it.
+    let pa = unsafe { child.as_mut() }
+        .map_frames(BIG_BASE, PAGE_SIZE, Attrs::USER_DATA)
+        .map_err(|_| "the child's page did not map")?;
+    for i in 1..BIG_PAGES {
+        let va = BIG_BASE + i * BLOCK_2M as usize;
+        process::map_page(child, va, pa, Attrs::USER_DATA)
+            .map_err(|_| "a page of the child did not map")?;
+    }
+    for _ in 0..MAX_HANDLES {
+        process::insert_handle(child, Object::Resource, Rights::NONE)
+            .map_err(|_| "a handle did not go into the child")?;
+    }
+    Ok(())
+}
+
+fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            cleanup::len() > 0,
+            "the interrupt waited for the teardown to end",
+        ),
+        1 => check(t.regs.x[0] == 0, "process_kill failed"),
+        _ => {
+            check(
+                f.portions as usize >= MAX_CHUNKS + BIG_PAGES,
+                "the teardown did not go a chunk or a table a portion",
+            )?;
+            check(
+                !cleanup::take_late() && f.interrupts >= f.portions / INTERRUPT_EVERY,
+                "a portion began while an interrupt was pending",
+            )?;
+            check(
+                cleanup::len() == 0 && phys::free_frames() + pages::taken() as u64 == f.memory,
+                "the child's frames did not come back",
+            )
+        }
+    }
 }

@@ -137,29 +137,38 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 }
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
-/// x3 exit channel, x4 notification priority): a new process with an empty
-/// address space and handle table; x1 returns a handle to it with
-/// DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS), the first two for
-/// milestone 1.3, so that the set never changes. The quota is whole pages,
-/// at least one, and counts from milestone 1.3; the limit 1-16384; the
-/// ceiling 1-63 and no higher than the caller's (ACCESS_DENIED). Exit
-/// channels come in milestone 1.3: x3 is 0, and x4 with it; any other x3
-/// is looked up as a channel and fails (BAD_HANDLE, WRONG_TYPE).
+/// x3 exit channel, x4 notification priority, x5 start channel): a new
+/// process with an empty address space and handle table; x1 returns a
+/// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
+/// the first two for milestone 1.3, so that the set never changes. The
+/// quota is whole pages, at least one, and counts from milestone 1.3; the
+/// limit 1-16384; the ceiling 1-63 and no higher than the caller's
+/// (ACCESS_DENIED). Exit channels come in milestone 1.3b: x3 is 0, and x4
+/// with it; any other x3 is looked up as a channel and fails (BAD_HANDLE,
+/// WRONG_TYPE). The start channel, a channel with TRANSFER, moves into
+/// entry 0 of the child's table from milestone 1.3c (spec 13.3): x5 is 0,
+/// and any other value is looked up after x3 and fails the same way. Entry
+/// 0 then holds a stub that goes at once (process::reserve_start).
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
     let channel = a[3] != 0;
     let notify = notify_priority_arg(a[4], channel)?;
+    // No object is a channel before milestone 1.3b.
     if channel {
-        // No object is a channel before milestone 1.3.
         lookup(thread, a[3], Rights::NOTIFY, |_| None::<()>)?;
+    }
+    if a[5] != 0 {
+        lookup(thread, a[5], Rights::TRANSFER, |_| None::<()>)?;
     }
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
     let child = process::create(limit, ceiling)?;
-    let h = process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS);
+    let h = process::reserve_start(child).and_then(|()| {
+        process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
+    });
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the child.
     unsafe { process::release(child, cause(thread)) };
@@ -167,9 +176,11 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 }
 
 /// process_kill(x0 process with MANAGE): the process ends, reason
-/// «killed» (spec 11): its threads stop in whatever state they
-/// are, and what it holds goes. A process that ended already: 0. Killing
-/// the caller's own process never returns.
+/// «killed» (spec 11): its threads stop in whatever state they are, and
+/// the cleanup queue takes what it holds apart at the caller's priority,
+/// before the caller runs again. A process that ended already: 0, and its
+/// teardown keeps the level of the end that began it. Killing the caller's
+/// own process never returns.
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
     let own = target == caller(thread);
@@ -201,7 +212,8 @@ fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
 /// aligned, the buffer a whole page there (INVALID_ARGS); the priority no
 /// higher than the ceiling of the process nor than the caller's
 /// (ACCESS_DENIED); the process has not ended (BAD_STATE); the buffer's
-/// page is free there (INVALID_ARGS).
+/// page is free there (INVALID_ARGS); the process has fewer than
+/// abi::MAX_THREADS threads that have not ended (LIMIT_REACHED).
 fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
     let policy = policy_arg(a[5])?;

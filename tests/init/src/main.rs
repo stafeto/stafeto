@@ -33,7 +33,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 16] = [
+const TESTS: [Test; 17] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -52,6 +52,7 @@ const TESTS: [Test; 16] = [
     ("unknown_system_calls_fail", unknown_system_calls_fail),
     ("priority_ceilings_hold", priority_ceilings_hold),
     ("thread_states", thread_states),
+    ("thread_limit_is_64", thread_limit_is_64),
     (
         "higher_priority_start_preempts_at_once",
         higher_priority_start_preempts_at_once,
@@ -499,6 +500,55 @@ fn thread_states() -> Outcome {
     check(
         killed.is_ok() && late == Err(Error::BadState),
         "a process that ended took a new thread",
+    )
+}
+
+/// A stopped thread of init's process that runs add_mark(0) on the stack
+/// of slot 0, at `priority`, with its message buffer on page `page` above
+/// init's own.
+fn marker(page: usize, priority: u8) -> Result<Handle, Error> {
+    // SAFETY: of the threads that share the stack of slot 0 at a time, at
+    // most one runs, and it ends before the next test.
+    unsafe {
+        sys::thread_create(
+            INIT_PROCESS,
+            add_mark,
+            STACKS[0].top(),
+            0,
+            priority,
+            Policy::Fifo,
+            buffer(page),
+        )
+    }
+}
+
+/// A process has at most abi::MAX_THREADS threads that have not ended
+/// (spec 8), init's first thread among them: past that thread_create
+/// fails with LIMIT_REACHED. A thread that exits makes room again, while
+/// its handle keeps its shell.
+fn thread_limit_is_64() -> Outcome {
+    reset_marks();
+    let mut made = [None; abi::MAX_THREADS as usize - 1];
+    for (page, slot) in made.iter_mut().enumerate() {
+        *slot = marker(page, HIGH).ok();
+    }
+    let past = marker(made.len(), HIGH);
+    // Above init, it runs and exits before thread_start returns.
+    let started = made[0].map(sys::thread_start);
+    let again = marker(made.len(), HIGH);
+    let all = made.iter().all(Option::is_some);
+    for h in made.into_iter().flatten().chain(past).chain(again) {
+        close(h)?;
+    }
+    check(all, "63 threads next to init's did not fit")?;
+    check(past == Err(Error::LimitReached), "a 65th thread was made")?;
+    check(
+        started == Some(Ok(())) && mark(0) == 1,
+        "a thread of the full process did not run to its exit",
+    )?;
+    check(
+        again.is_ok(),
+        "the exit of a thread did not make room for another",
     )
 }
 

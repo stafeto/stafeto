@@ -71,20 +71,43 @@ static QUEUE: Lock<Queue> = Lock::new(Queue {
     late: false,
 });
 
-/// Queues `object`, whose last reference just went, at the tail of
-/// `level` (1-63).
+/// Queues `object` at the tail of `level` (1-63): its last reference just
+/// went, or its teardown begins (process::end).
 ///
 /// # Safety
 /// `item` is the object's own and in no queue; the object stays alive and
-/// in place, and nothing else uses it, until its portion.
+/// in place, and nothing else takes it apart, until its portion.
 pub unsafe fn enqueue(item: NonNull<Item>, object: Object, level: u8) {
+    // SAFETY: the caller's promise.
+    unsafe { push(item, object, level, false) }
+}
+
+/// Queues `object` again at the head of `level` after its portion left
+/// work for the next one: the next portion at that level goes on with it,
+/// as a preempted thread goes on first at its level (spec 8), so one
+/// teardown ends before the next begins.
+///
+/// # Safety
+/// As for `enqueue`.
+pub unsafe fn requeue(item: NonNull<Item>, object: Object, level: u8) {
+    // SAFETY: the caller's promise.
+    unsafe { push(item, object, level, true) }
+}
+
+/// # Safety
+/// As for `enqueue`.
+unsafe fn push(item: NonNull<Item>, object: Object, level: u8, head: bool) {
     let mut q = QUEUE.lock();
     // SAFETY: the caller's promise.
     unsafe {
         let i = &mut *item.as_ptr();
         i.object = Some(object);
         i.link.set_level(level);
-        q.items.push_tail(item);
+        if head {
+            q.items.push_head(item);
+        } else {
+            q.items.push_tail(item);
+        }
     }
     q.len += 1;
 }
@@ -96,7 +119,8 @@ pub fn top() -> Option<u8> {
 
 /// One portion (sched::resume): the item at the head of the top level
 /// leaves the queue, and its object's portion runs; what that releases is
-/// queued at the same level. Nothing happens when the queue is empty.
+/// queued at the same level, and an object with work left queues itself
+/// again (`requeue`). Nothing happens when the queue is empty.
 pub fn portion() {
     #[cfg(feature = "ktest")]
     if crate::arch::irq_pending() {

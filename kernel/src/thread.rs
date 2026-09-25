@@ -43,11 +43,13 @@ pub struct Thread {
     /// policy, the state, the rest of a quantum and the links of the ready
     /// list. Only the scheduler changes it (sched).
     pub sched: Node<Thread>,
-    /// Links in the list of its process's threads, which process::end
-    /// walks; only process::{add_thread, remove_thread} change them.
-    pub siblings: Siblings,
+    /// Links in the list of its process's threads that have not ended,
+    /// which process::end walks; None once the thread left it. Only
+    /// process::{add_thread, remove_thread} change them.
+    pub siblings: Option<Siblings>,
     /// The page `give_buffer` mapped for messages; it goes when the thread
-    /// ends (`exit`, process::end) or goes.
+    /// exits (`exit`), at the stage Buffers of its process, or when the
+    /// thread goes.
     buffer: Option<Buffer>,
     process: NonNull<Process>,
     /// Handles to the thread, the reference `create` hands out and the
@@ -106,8 +108,11 @@ impl Thread {
 /// `start` makes it ready. It has no message buffer until `give_buffer`.
 /// The caller gets the first reference; the thread holds one to `process`
 /// and joins its threads. INVALID_ARGS for a start outside the lower half,
-/// a misaligned one or priority 0, NO_MEMORY when the pool gets no page.
-/// `priority` is at most the ceiling of `process`: the call checked it.
+/// a misaligned one or priority 0, LIMIT_REACHED when the process has
+/// abi::MAX_THREADS threads that have not ended, NO_MEMORY when the pool
+/// gets no page. The limit comes first of the two: a thread past it takes
+/// nothing. `priority` is at most the ceiling of `process`: the call
+/// checked it.
 pub fn create(
     process: NonNull<Process>,
     entry: usize,
@@ -123,15 +128,13 @@ pub fn create(
         priority <= ceiling,
         "a thread above the ceiling of its process; the call checks it first"
     );
+    process::thread_room(process)?;
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
         base_priority: priority,
         sched: Node::new(priority, policy),
-        siblings: Siblings {
-            prev: None,
-            next: None,
-        },
+        siblings: None,
         buffer: None,
         process,
         refs: 1,
@@ -214,10 +217,11 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 }
 
 /// thread_exit: the running thread `t` ends. Its buffer goes, it leaves
-/// the scheduler, with the kernel's reference, and as the last started
-/// thread of its process it ends the process. What that releases is
-/// queued for cleanup at the thread's priority. The caller leaves through
-/// sched::resume: `t` may be queued for cleanup.
+/// the scheduler, with the kernel's reference, and its process's list of
+/// threads that have not ended; as the last started thread of its process
+/// it ends the process. What that releases is queued for cleanup at the
+/// thread's priority. The caller leaves through sched::resume: `t` may be
+/// queued for cleanup.
 ///
 /// # Safety
 /// `t` is the running thread, and the caller does not use it afterwards.
@@ -231,6 +235,7 @@ pub unsafe fn exit(t: NonNull<Thread>) {
     unsafe {
         drop_buffer(t);
         sched::exit(t, cause);
+        process::remove_thread(p, t);
         process::thread_exited(p, cause);
         process::release(p, cause);
     }
@@ -291,9 +296,9 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
 }
 
 /// The portion of a thread nobody refers to (cleanup): its buffer goes,
-/// it leaves its process's list, its slot goes back to the pool, and then
-/// its reference to its process, queued at `level` if it was the last.
-/// When the thread ran last, no thread ran after it.
+/// it leaves its process's list if it is still there, its slot goes back
+/// to the pool, and then its reference to its process, queued at `level`
+/// if it was the last. When the thread ran last, no thread ran after it.
 ///
 /// # Safety
 /// No reference to `thread` is left, and it is in no queue.

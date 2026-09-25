@@ -100,6 +100,16 @@ pub const INIT_THREAD: Handle = Handle::new(2, 1);
 /// names another object.
 pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 
+/// The first handle of a process that `process_create` made (spec 13.3):
+/// entry 0 of its fresh table. The sixth argument of `process_create`, a
+/// channel, moves there from milestone 1.3c on; without one the entry
+/// holds a stub that goes at once, and the value is BAD_HANDLE for good.
+pub const START_CHANNEL: Handle = Handle::new(0, 1);
+
+/// Threads of one process that have not ended, at most (spec 8):
+/// `thread_create` past it fails with LIMIT_REACHED.
+pub const MAX_THREADS: u32 = 64;
+
 /// Top of the stack of init's first thread (spec 13.3). The kernel maps the
 /// stack the boot image asks for right under it, with an unmapped guard
 /// page below; init's program lies under that guard page.
