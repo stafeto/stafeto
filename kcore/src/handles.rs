@@ -20,38 +20,6 @@ const NO_ENTRY: u32 = u32::MAX;
 
 const _: () = assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandleError {
-    BadHandle,
-    WrongType,
-    AccessDenied,
-    InvalidArgs,
-    LimitReached,
-    NoMemory,
-}
-
-/// The rights of a copy from a register (spec 5.2, 11): INVALID_ARGS for
-/// a bit that is no right.
-pub fn rights_arg(raw: u64) -> Result<Rights, Error> {
-    match u32::try_from(raw) {
-        Ok(bits) if Rights::ALL.contains(Rights(bits)) => Ok(Rights(bits)),
-        _ => Err(Error::InvalidArgs),
-    }
-}
-
-impl From<HandleError> for Error {
-    fn from(e: HandleError) -> Error {
-        match e {
-            HandleError::BadHandle => Error::BadHandle,
-            HandleError::WrongType => Error::WrongType,
-            HandleError::AccessDenied => Error::AccessDenied,
-            HandleError::InvalidArgs => Error::InvalidArgs,
-            HandleError::LimitReached => Error::LimitReached,
-            HandleError::NoMemory => Error::NoMemory,
-        }
-    }
-}
-
 struct Entry<T> {
     object: Option<T>,
     rights: Rights,
@@ -101,8 +69,8 @@ pub unsafe trait ChunkSource<T> {
     unsafe fn free_directory(&mut self, directory: NonNull<Directory<T>>);
 }
 
-/// A process's handles. The owner calls `release` (or `release_step` until
-/// it returns true) before dropping it.
+/// A process's handles. The owner calls `release_step` until it returns
+/// true before dropping it.
 ///
 /// Every entry below `used` is live, free (on the free list) or retired
 /// (freed at the last generation and never handed out again); retired
@@ -119,7 +87,9 @@ pub struct HandleTable<T> {
     live: u32,
     free_count: u32,
     retired: u32,
-    /// Generation of fresh entries: 1, except in tests that start near the end.
+    /// Generation of fresh entries, for tests that start near the end; the
+    /// kernel's tables start at 1.
+    #[cfg(test)]
     first_generation: u64,
     /// A stepwise release is under way.
     closing: bool,
@@ -130,9 +100,9 @@ unsafe impl<T: Send> Send for HandleTable<T> {}
 
 impl<T> HandleTable<T> {
     /// An empty table for at most `limit` entries; `InvalidArgs` above MAX_HANDLES.
-    pub fn new(limit: u32) -> Result<Self, HandleError> {
+    pub fn new(limit: u32) -> Result<Self, Error> {
         if limit > MAX_HANDLES {
-            return Err(HandleError::InvalidArgs);
+            return Err(Error::InvalidArgs);
         }
         Ok(Self {
             directory: None,
@@ -143,6 +113,7 @@ impl<T> HandleTable<T> {
             live: 0,
             free_count: 0,
             retired: 0,
+            #[cfg(test)]
             first_generation: 1,
             closing: false,
         })
@@ -217,17 +188,20 @@ impl<T> HandleTable<T> {
     /// A new chunk at the end, and the directory first if there is none;
     /// NoMemory when the source has no memory for either. A directory
     /// that came without a chunk stays until the release.
-    fn grow(&mut self, src: &mut impl ChunkSource<T>) -> Result<(), HandleError> {
+    fn grow(&mut self, src: &mut impl ChunkSource<T>) -> Result<(), Error> {
         if self.directory.is_none() {
-            let directory = src.alloc_directory().ok_or(HandleError::NoMemory)?;
+            let directory = src.alloc_directory().ok_or(Error::NoMemory)?;
             // SAFETY: fresh memory for one directory, written whole before use.
             unsafe {
                 (&raw mut (*directory.as_ptr()).chunks).write([None; MAX_CHUNKS]);
             }
             self.directory = Some(directory);
         }
-        let chunk = src.alloc_chunk().ok_or(HandleError::NoMemory)?;
+        let chunk = src.alloc_chunk().ok_or(Error::NoMemory)?;
+        #[cfg(test)]
         let generation = self.first_generation;
+        #[cfg(not(test))]
+        let generation = 1;
         // SAFETY: fresh memory for one chunk; every entry is written before use.
         unsafe {
             let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
@@ -250,9 +224,9 @@ impl<T> HandleTable<T> {
         src: &mut impl ChunkSource<T>,
         object: T,
         rights: Rights,
-    ) -> Result<Handle, HandleError> {
+    ) -> Result<Handle, Error> {
         if self.closing {
-            return Err(HandleError::LimitReached);
+            return Err(Error::LimitReached);
         }
         let index = if self.free_head != NO_ENTRY {
             let i = self.free_head;
@@ -261,7 +235,7 @@ impl<T> HandleTable<T> {
             i
         } else {
             if self.used >= self.limit {
-                return Err(HandleError::LimitReached);
+                return Err(Error::LimitReached);
             }
             if self.used as usize == self.chunk_count * CHUNK {
                 self.grow(src)?;
@@ -277,30 +251,16 @@ impl<T> HandleTable<T> {
         Ok(Handle::new(index, generation))
     }
 
-    fn slot(&self, h: Handle) -> Result<u32, HandleError> {
+    /// The object and the rights of a live handle: one look at its entry.
+    pub fn get(&self, h: Handle) -> Result<(&T, Rights), Error> {
         let i = h.index();
         if i >= self.used {
-            return Err(HandleError::BadHandle);
+            return Err(Error::BadHandle);
         }
         let e = self.entry(i);
-        if e.object.is_none() || e.generation != h.generation() {
-            return Err(HandleError::BadHandle);
-        }
-        Ok(i)
-    }
-
-    pub fn get(&self, h: Handle) -> Result<(&T, Rights), HandleError> {
-        let e = self.entry(self.slot(h)?);
-        Ok((e.object.as_ref().expect("a live entry"), e.rights))
-    }
-
-    /// The object, when the handle carries at least `required`.
-    pub fn get_with(&self, h: Handle, required: Rights) -> Result<&T, HandleError> {
-        let (object, rights) = self.get(h)?;
-        if rights.contains(required) {
-            Ok(object)
-        } else {
-            Err(HandleError::AccessDenied)
+        match &e.object {
+            Some(object) if e.generation == h.generation() => Ok((object, e.rights)),
+            _ => Err(Error::BadHandle),
         }
     }
 
@@ -312,23 +272,29 @@ impl<T> HandleTable<T> {
         h: Handle,
         required: Rights,
         kind: impl FnOnce(&T) -> Option<U>,
-    ) -> Result<U, HandleError> {
+    ) -> Result<U, Error> {
         let (object, rights) = self.get(h)?;
-        let typed = kind(object).ok_or(HandleError::WrongType)?;
+        let typed = kind(object).ok_or(Error::WrongType)?;
         if rights.contains(required) {
             Ok(typed)
         } else {
-            Err(HandleError::AccessDenied)
+            Err(Error::AccessDenied)
         }
     }
 
     /// Takes the object out. The entry moves to the next generation, or
     /// retires when this was its last one.
-    pub fn remove(&mut self, h: Handle) -> Result<(T, Rights), HandleError> {
-        let i = self.slot(h)?;
+    pub fn remove(&mut self, h: Handle) -> Result<(T, Rights), Error> {
+        let i = h.index();
+        if i >= self.used {
+            return Err(Error::BadHandle);
+        }
         let free_head = self.free_head;
         let e = self.entry_mut(i);
-        let object = e.object.take().expect("a live entry");
+        if e.generation != h.generation() {
+            return Err(Error::BadHandle);
+        }
+        let object = e.object.take().ok_or(Error::BadHandle)?;
         let rights = e.rights;
         let retire = e.generation == Handle::MAX_GENERATION;
         if !retire {
@@ -346,25 +312,28 @@ impl<T> HandleTable<T> {
     }
 
     /// A new handle to the same object with a subset of the rights; the
-    /// original must carry DUPLICATE.
+    /// original must carry DUPLICATE. For tests: the kernel copies
+    /// through `get_as` and `insert`.
+    #[cfg(test)]
     pub fn duplicate(
         &mut self,
         src: &mut impl ChunkSource<T>,
         h: Handle,
         rights: Rights,
-    ) -> Result<Handle, HandleError>
+    ) -> Result<Handle, Error>
     where
         T: Clone,
     {
         let (object, have) = self.get(h)?;
         if !have.contains(Rights::DUPLICATE) || !have.contains(rights) {
-            return Err(HandleError::AccessDenied);
+            return Err(Error::AccessDenied);
         }
         let copy = object.clone();
         self.insert(src, copy, rights)
     }
 
     /// Drops every object and gives every chunk back; the table is empty afterwards.
+    #[cfg(test)]
     pub fn release(&mut self, src: &mut impl ChunkSource<T>) {
         self.release_with(src, |object, _| drop(object));
     }
@@ -373,6 +342,7 @@ impl<T> HandleTable<T> {
     /// and gives every chunk back; the table is empty afterwards. Objects
     /// that need more than a drop when their handle goes, such as counted
     /// references, leave this way.
+    #[cfg(test)]
     pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T, Rights)) {
         while !self.release_step(src, &mut f) {}
     }
@@ -436,7 +406,7 @@ impl<T> Drop for HandleTable<T> {
         if std::thread::panicking() {
             return;
         }
-        // Only a check: the work is `release`'s, which needs the chunk
+        // Only a check: the work is `release_step`'s, which needs the chunk
         // source. The kernel builds without debug assertions, so the check
         // is a plain assert.
         assert!(
@@ -546,7 +516,7 @@ mod tests {
     fn limit_above_max_handles_is_rejected() {
         assert!(matches!(
             HandleTable::<u32>::new(MAX_HANDLES + 1),
-            Err(HandleError::InvalidArgs)
+            Err(Error::InvalidArgs)
         ));
         assert!(HandleTable::<u32>::new(MAX_HANDLES).is_ok());
     }
@@ -557,8 +527,8 @@ mod tests {
         let mut t = table(10);
         let h = t.insert(&mut src, 1, RW).unwrap();
         assert_eq!(t.remove(h), Ok((1, RW)));
-        assert_eq!(t.get(h), Err(HandleError::BadHandle));
-        assert_eq!(t.remove(h), Err(HandleError::BadHandle));
+        assert_eq!(t.get(h), Err(Error::BadHandle));
+        assert_eq!(t.remove(h), Err(Error::BadHandle));
         t.release(&mut src);
     }
 
@@ -569,13 +539,12 @@ mod tests {
         let h = t.insert(&mut src, 1, RW).unwrap();
         t.remove(h).unwrap();
         t.insert(&mut src, 2, RW).unwrap();
-        assert_eq!(t.get(h), Err(HandleError::BadHandle));
-        assert_eq!(t.get_with(h, Rights::NONE), Err(HandleError::BadHandle));
+        assert_eq!(t.get(h), Err(Error::BadHandle));
         assert_eq!(
             t.duplicate(&mut src, h, Rights::NONE),
-            Err(HandleError::BadHandle)
+            Err(Error::BadHandle)
         );
-        assert_eq!(t.remove(h), Err(HandleError::BadHandle));
+        assert_eq!(t.remove(h), Err(Error::BadHandle));
         assert_eq!(t.len(), 1);
         t.release(&mut src);
     }
@@ -596,7 +565,7 @@ mod tests {
             t.insert(&mut src, i, RW).unwrap();
         }
         assert_eq!((t.len(), t.room()), (5, 0));
-        assert_eq!(t.insert(&mut src, 9, RW), Err(HandleError::LimitReached));
+        assert_eq!(t.insert(&mut src, 9, RW), Err(Error::LimitReached));
         t.release(&mut src);
         assert_eq!((t.len(), t.room()), (0, 5));
     }
@@ -610,7 +579,7 @@ mod tests {
         let b = t.insert(&mut src, 2, RW).unwrap();
         assert_eq!(a.index(), b.index());
         assert_ne!(a.generation(), b.generation());
-        assert_eq!(t.get(a), Err(HandleError::BadHandle));
+        assert_eq!(t.get(a), Err(Error::BadHandle));
         t.release(&mut src);
     }
 
@@ -625,7 +594,7 @@ mod tests {
             let h = t.insert(&mut src, i, RW).unwrap();
             assert_ne!(h, Handle::INVALID);
             assert!(seen.insert(h), "handle {h:?} issued twice");
-            assert_eq!(t.get(first), Err(HandleError::BadHandle));
+            assert_eq!(t.get(first), Err(Error::BadHandle));
             t.remove(h).unwrap();
         }
         t.release(&mut src);
@@ -648,7 +617,7 @@ mod tests {
         for i in 0..256 {
             let h = t.insert(&mut src, 1000 + i, RW).unwrap();
             assert_eq!(h.index(), kept.index());
-            assert_eq!(t.get(kept), Err(HandleError::BadHandle));
+            assert_eq!(t.get(kept), Err(Error::BadHandle));
             t.remove(h).unwrap();
         }
         t.release(&mut src);
@@ -663,7 +632,7 @@ mod tests {
         t.remove(old).unwrap();
         let new = t.insert(&mut src, 2, RW).unwrap();
         assert_eq!(new.generation(), 1 << 32);
-        assert_eq!(t.get(old), Err(HandleError::BadHandle));
+        assert_eq!(t.get(old), Err(Error::BadHandle));
         assert_eq!(t.get(new), Ok((&2, RW)));
         t.release(&mut src);
     }
@@ -680,14 +649,14 @@ mod tests {
         }
         let generations: Vec<u64> = issued.iter().map(|h| h.generation()).collect();
         assert_eq!(generations, [LAST - 2, LAST - 1, LAST]);
-        assert_eq!(t.insert(&mut src, 9, RW), Err(HandleError::LimitReached));
+        assert_eq!(t.insert(&mut src, 9, RW), Err(Error::LimitReached));
         assert_eq!((t.len(), t.retired(), t.room()), (0, 1, 0));
         for h in issued {
-            assert_eq!(t.get(h), Err(HandleError::BadHandle));
-            assert_eq!(t.remove(h), Err(HandleError::BadHandle));
+            assert_eq!(t.get(h), Err(Error::BadHandle));
+            assert_eq!(t.remove(h), Err(Error::BadHandle));
         }
-        assert_eq!(t.get(Handle::new(0, 1)), Err(HandleError::BadHandle));
-        assert_eq!(t.get(Handle::new(0, 0)), Err(HandleError::BadHandle));
+        assert_eq!(t.get(Handle::new(0, 1)), Err(Error::BadHandle));
+        assert_eq!(t.get(Handle::new(0, 0)), Err(Error::BadHandle));
         t.release(&mut src);
     }
 
@@ -700,9 +669,9 @@ mod tests {
         t.remove(old).unwrap();
         let new = t.insert(&mut src, 2, RW).unwrap();
         assert_eq!(new.index(), 1);
-        assert_eq!(t.get(old), Err(HandleError::BadHandle));
-        assert_eq!(t.get(Handle::new(0, 1)), Err(HandleError::BadHandle));
-        assert_eq!(t.remove(old), Err(HandleError::BadHandle));
+        assert_eq!(t.get(old), Err(Error::BadHandle));
+        assert_eq!(t.get(Handle::new(0, 1)), Err(Error::BadHandle));
+        assert_eq!(t.remove(old), Err(Error::BadHandle));
         t.release(&mut src);
     }
 
@@ -715,7 +684,7 @@ mod tests {
         assert_eq!((t.retired(), t.room()), (1, 2));
         let b = t.insert(&mut src, 2, RW).unwrap();
         let c = t.insert(&mut src, 3, RW).unwrap();
-        assert_eq!(t.insert(&mut src, 4, RW), Err(HandleError::LimitReached));
+        assert_eq!(t.insert(&mut src, 4, RW), Err(Error::LimitReached));
         assert_eq!(t.get(b), Ok((&2, RW)));
         assert_eq!(t.get(c), Ok((&3, RW)));
         assert_eq!(t.len(), 2);
@@ -756,7 +725,7 @@ mod tests {
                 0 | 1 => {
                     let got = t.insert(&mut src, step, RW);
                     if room == 0 {
-                        assert_eq!(got, Err(HandleError::LimitReached));
+                        assert_eq!(got, Err(Error::LimitReached));
                     } else {
                         let h = got.unwrap();
                         assert!(h != Handle::INVALID && issued.insert(h), "{h:?} reissued");
@@ -766,7 +735,7 @@ mod tests {
                 2 if !live.is_empty() => {
                     let (h, v) = live.swap_remove((x >> 8) as usize % live.len());
                     assert_eq!(t.remove(h), Ok((v, RW)));
-                    assert_eq!(t.get(h), Err(HandleError::BadHandle));
+                    assert_eq!(t.get(h), Err(Error::BadHandle));
                     closed.push(h);
                     let retired_now = t.retired() - retired;
                     assert!(retired_now <= 1);
@@ -776,7 +745,7 @@ mod tests {
                     let (h, v) = live[(x >> 8) as usize % live.len()];
                     let got = t.duplicate(&mut src, h, RW);
                     if room == 0 {
-                        assert_eq!(got, Err(HandleError::LimitReached));
+                        assert_eq!(got, Err(Error::LimitReached));
                     } else {
                         let d = got.unwrap();
                         assert!(d != Handle::INVALID && issued.insert(d), "{d:?} reissued");
@@ -786,7 +755,7 @@ mod tests {
                 _ => {}
             }
             if let Some(&old) = closed.get((x >> 16) as usize % closed.len().max(1)) {
-                assert_eq!(t.get(old), Err(HandleError::BadHandle));
+                assert_eq!(t.get(old), Err(Error::BadHandle));
             }
             // Any value at all, and one with an index inside the table: an
             // entry the model holds, or BadHandle, never a panic.
@@ -794,20 +763,19 @@ mod tests {
             for probe in [Handle(x), near] {
                 match t.get(probe) {
                     Ok((v, _)) => assert!(live.contains(&(probe, *v)), "{probe:?} opens {v}"),
-                    Err(e) => assert_eq!(e, HandleError::BadHandle),
+                    Err(e) => assert_eq!(e, Error::BadHandle),
                 }
             }
             assert_eq!(t.len() as usize, live.len());
             assert_eq!(t.len() + t.retired + t.free_count, t.used);
         }
         for h in closed {
-            assert_eq!(t.get(h), Err(HandleError::BadHandle));
-            assert_eq!(t.get_with(h, Rights::NONE), Err(HandleError::BadHandle));
+            assert_eq!(t.get(h), Err(Error::BadHandle));
             assert_eq!(
                 t.duplicate(&mut src, h, Rights::NONE),
-                Err(HandleError::BadHandle)
+                Err(Error::BadHandle)
             );
-            assert_eq!(t.remove(h), Err(HandleError::BadHandle));
+            assert_eq!(t.remove(h), Err(Error::BadHandle));
         }
         for (h, v) in live {
             assert_eq!(t.get(h), Ok((&v, RW)));
@@ -857,7 +825,7 @@ mod tests {
                 };
                 if let Some(got) = got {
                     if room == 0 {
-                        assert_eq!(got, Err(HandleError::LimitReached));
+                        assert_eq!(got, Err(Error::LimitReached));
                     } else {
                         let h = got.unwrap();
                         assert!(h != Handle::INVALID && !issued.contains(&h));
@@ -866,7 +834,7 @@ mod tests {
                     }
                 }
                 for h in &closed {
-                    assert_eq!(t.get(*h), Err(HandleError::BadHandle));
+                    assert_eq!(t.get(*h), Err(Error::BadHandle));
                 }
                 assert_eq!(t.len() + t.retired + t.free_count, t.used);
             }
@@ -880,7 +848,7 @@ mod tests {
         let mut t = table(2);
         t.insert(&mut src, 1, RW).unwrap();
         t.insert(&mut src, 2, RW).unwrap();
-        assert_eq!(t.insert(&mut src, 3, RW), Err(HandleError::LimitReached));
+        assert_eq!(t.insert(&mut src, 3, RW), Err(Error::LimitReached));
         t.release(&mut src);
     }
 
@@ -916,35 +884,12 @@ mod tests {
         let h = t.insert(&mut src, 5, RW).unwrap();
         assert_eq!(
             t.duplicate(&mut src, h, RW | Rights::MANAGE),
-            Err(HandleError::AccessDenied)
+            Err(Error::AccessDenied)
         );
         let no_dup = t.insert(&mut src, 6, Rights::SEND).unwrap();
         assert_eq!(
             t.duplicate(&mut src, no_dup, Rights::SEND),
-            Err(HandleError::AccessDenied)
-        );
-        t.release(&mut src);
-    }
-
-    #[test]
-    fn rights_arg_takes_the_known_rights_only() {
-        assert_eq!(rights_arg(0), Ok(Rights::NONE));
-        assert_eq!(rights_arg(Rights::ALL.0.into()), Ok(Rights::ALL));
-        assert_eq!(rights_arg(0b1001), Ok(Rights::DUPLICATE | Rights::NOTIFY));
-        for raw in [1 << 12, 1 << 31, 1 << 32, u64::MAX] {
-            assert_eq!(rights_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
-        }
-    }
-
-    #[test]
-    fn get_with_checks_rights() {
-        let mut src = boxes(1);
-        let mut t = table(10);
-        let h = t.insert(&mut src, 5, Rights::SEND).unwrap();
-        assert_eq!(t.get_with(h, Rights::SEND), Ok(&5));
-        assert_eq!(
-            t.get_with(h, Rights::RECEIVE),
-            Err(HandleError::AccessDenied)
+            Err(Error::AccessDenied)
         );
         t.release(&mut src);
     }
@@ -957,23 +902,14 @@ mod tests {
         let h = t.insert(&mut src, 4, Rights::SEND).unwrap();
         let odd = t.insert(&mut src, 5, Rights::NONE).unwrap();
         assert_eq!(t.get_as(h, Rights::SEND, even), Ok(4));
-        assert_eq!(
-            t.get_as(h, Rights::RECEIVE, even),
-            Err(HandleError::AccessDenied)
-        );
+        assert_eq!(t.get_as(h, Rights::RECEIVE, even), Err(Error::AccessDenied));
         // A wrong type comes before missing rights, a bad handle before both.
-        assert_eq!(
-            t.get_as(odd, Rights::RECEIVE, even),
-            Err(HandleError::WrongType)
-        );
+        assert_eq!(t.get_as(odd, Rights::RECEIVE, even), Err(Error::WrongType));
         t.remove(h).unwrap();
-        assert_eq!(
-            t.get_as(h, Rights::RECEIVE, even),
-            Err(HandleError::BadHandle)
-        );
+        assert_eq!(t.get_as(h, Rights::RECEIVE, even), Err(Error::BadHandle));
         assert_eq!(
             t.get_as(Handle::INVALID, Rights::NONE, even),
-            Err(HandleError::BadHandle)
+            Err(Error::BadHandle)
         );
         t.release(&mut src);
     }
@@ -1026,11 +962,11 @@ mod tests {
         assert_eq!(out, (192..199).collect::<Vec<u32>>());
         assert_eq!((src.freed, src.back.as_str(), t.len()), (1, "c", 192));
         // Handles into the chunk that went are bad, the others still hold.
-        assert_eq!(t.get(hs[192]), Err(HandleError::BadHandle));
+        assert_eq!(t.get(hs[192]), Err(Error::BadHandle));
         assert_eq!(t.get(hs[191]), Ok((&191, RW)));
         // The table takes nothing new meanwhile.
         assert_eq!(t.room(), 0);
-        assert_eq!(t.insert(&mut src, 9, RW), Err(HandleError::LimitReached));
+        assert_eq!(t.insert(&mut src, 9, RW), Err(Error::LimitReached));
         out.clear();
         assert!(!t.release_step(&mut src, |v, _| out.push(v)));
         assert_eq!(out, (128..192).collect::<Vec<u32>>());
@@ -1063,26 +999,10 @@ mod tests {
         assert_eq!(src.back, "cccd");
         // A directory that came without a chunk goes in one step.
         let mut empty = boxes(0);
-        assert_eq!(t.insert(&mut empty, 1, RW), Err(HandleError::NoMemory));
+        assert_eq!(t.insert(&mut empty, 1, RW), Err(Error::NoMemory));
         assert_eq!(empty.directories, 1);
         assert!(t.release_step(&mut empty, |_, _| {}));
         assert_eq!((empty.back.as_str(), empty.directories), ("d", 0));
-    }
-
-    #[test]
-    fn handle_errors_are_the_abi_errors() {
-        use abi::Error;
-        let pairs = [
-            (HandleError::BadHandle, Error::BadHandle),
-            (HandleError::WrongType, Error::WrongType),
-            (HandleError::AccessDenied, Error::AccessDenied),
-            (HandleError::InvalidArgs, Error::InvalidArgs),
-            (HandleError::LimitReached, Error::LimitReached),
-            (HandleError::NoMemory, Error::NoMemory),
-        ];
-        for (from, to) in pairs {
-            assert_eq!(Error::from(from), to);
-        }
     }
 
     #[test]
@@ -1090,19 +1010,16 @@ mod tests {
         let mut src = boxes(1);
         let mut t = table(10);
         let h = t.insert(&mut src, 5, RW).unwrap();
-        assert_eq!(t.get(Handle::INVALID), Err(HandleError::BadHandle));
-        assert_eq!(
-            t.get(Handle::new(h.index() + 1, 1)),
-            Err(HandleError::BadHandle)
-        );
+        assert_eq!(t.get(Handle::INVALID), Err(Error::BadHandle));
+        assert_eq!(t.get(Handle::new(h.index() + 1, 1)), Err(Error::BadHandle));
         assert_eq!(
             t.get(Handle::new(Handle::MAX_INDEX, 1)),
-            Err(HandleError::BadHandle)
+            Err(Error::BadHandle)
         );
-        assert_eq!(t.get(Handle(u64::MAX)), Err(HandleError::BadHandle));
+        assert_eq!(t.get(Handle(u64::MAX)), Err(Error::BadHandle));
         assert_eq!(
             t.get(Handle::new(h.index(), h.generation() + 1)),
-            Err(HandleError::BadHandle)
+            Err(Error::BadHandle)
         );
         t.release(&mut src);
     }
@@ -1114,8 +1031,8 @@ mod tests {
         let a = t.insert(&mut src, 1, RW).unwrap();
         t.remove(a).unwrap();
         let forged = Handle::new(a.index(), a.generation() + 1);
-        assert_eq!(t.get(forged), Err(HandleError::BadHandle));
-        assert_eq!(t.remove(forged), Err(HandleError::BadHandle));
+        assert_eq!(t.get(forged), Err(Error::BadHandle));
+        assert_eq!(t.remove(forged), Err(Error::BadHandle));
         t.release(&mut src);
     }
 
@@ -1144,7 +1061,7 @@ mod tests {
     fn running_out_of_chunk_memory_is_reported() {
         let mut src = boxes(0);
         let mut t: HandleTable<u32> = table(10);
-        assert_eq!(t.insert(&mut src, 1, RW), Err(HandleError::NoMemory));
+        assert_eq!(t.insert(&mut src, 1, RW), Err(Error::NoMemory));
         // The directory came, and goes with the release.
         t.release(&mut src);
         assert_eq!(src.directories, 0);
@@ -1157,7 +1074,7 @@ mod tests {
         for i in 0..CHUNK as u32 {
             t.insert(&mut src, i, RW).unwrap();
         }
-        assert_eq!(t.insert(&mut src, 64, RW), Err(HandleError::NoMemory));
+        assert_eq!(t.insert(&mut src, 64, RW), Err(Error::NoMemory));
         assert_eq!((t.len(), t.room()), (64, 36));
         src.left = 1;
         let h = t.insert(&mut src, 64, RW).unwrap();

@@ -176,8 +176,7 @@ pub fn portion() {
         }
     }
     let took = timer::now().saturating_sub(start);
-    #[cfg(feature = "ktest")]
-    crate::ktest::el0::portion_done();
+    crate::testpoint::portion_done();
     let mut q = QUEUE.lock();
     q.longest = q.longest.max(took);
 }

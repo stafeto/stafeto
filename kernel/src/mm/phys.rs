@@ -6,8 +6,9 @@
 //! once the kernel page tables map all RAM.
 
 use crate::boot::Boot;
+use kcore::PAGE_SIZE;
 use kcore::bootinfo::{Region, RegionList};
-use kcore::frames::{FrameAllocator, PAGE_SIZE, PhysMem};
+use kcore::frames::{FrameAllocator, PhysMem};
 use kcore::layout::{GIB, LINEAR_BASE};
 use kcore::memmap;
 use kcore::sync::Lock;

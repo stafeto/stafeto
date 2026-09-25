@@ -20,9 +20,9 @@
 //! held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
-use crate::thread::{self, Policy, Thread};
+use crate::thread::{self, Thread};
 use crate::{channel, cleanup};
-use abi::{Error, Rights};
+use abi::{Error, Policy, Rights};
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
 use kcore::sync::Lock;
@@ -281,8 +281,7 @@ fn decide() -> Decision<Thread> {
 /// Nothing to do: sleeps in `wfi` with interrupts masked until one is
 /// pending, and handles it; the time asleep counts for KSTATS.
 fn sleep() {
-    #[cfg(feature = "ktest")]
-    crate::ktest::el0::note_idle_stack();
+    crate::testpoint::idle();
     let slept = timer::now();
     let ack = gic::wait();
     let woke = timer::now();

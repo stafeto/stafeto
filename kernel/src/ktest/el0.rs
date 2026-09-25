@@ -22,16 +22,16 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
 use crate::syscall::{self, Values};
-use crate::thread::{self, Policy, Thread};
+use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, session};
 use abi::{
-    Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, ProcessState,
-    Rights, START_CHANNEL, Source,
+    Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, Policy,
+    ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
+use kcore::PAGE_SIZE;
 use kcore::esr;
-use kcore::frames::PAGE_SIZE;
 use kcore::gic::PRIORITY_MASK;
 use kcore::handles::{MAX_CHUNKS, MAX_HANDLES};
 use kcore::layout::LINEAR_BASE;

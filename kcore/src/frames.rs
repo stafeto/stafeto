@@ -8,8 +8,8 @@
 //! buddy is found and unlinked in O(1) and a free of the wrong block is
 //! caught.
 
-pub const PAGE_SHIFT: u32 = 12;
-pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
+use crate::{PAGE_SHIFT, PAGE_SIZE};
+
 /// The largest block holds 2^MAX_ORDER frames (4 MiB).
 pub const MAX_ORDER: u8 = 10;
 const ORDERS: usize = MAX_ORDER as usize + 1;

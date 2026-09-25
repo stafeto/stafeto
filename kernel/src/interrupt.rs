@@ -26,8 +26,7 @@ pub fn handle(ack: Ack) {
         // them (spec 10), and arms the timer for its next deadline on the
         // way out.
         sched::timer_fired();
-        #[cfg(feature = "ktest")]
-        crate::ktest::el0::timer_fired();
+        crate::testpoint::timer_fired();
     }
     gic::end(ack);
 }

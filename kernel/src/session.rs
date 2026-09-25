@@ -21,9 +21,9 @@ use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
 use crate::object::Object;
 use crate::process::{self, Process};
-use abi::{Error, Rights};
+use abi::{CLIENT_GONE, Error, Rights};
 use core::ptr::NonNull;
-use kcore::notify::{BIT_CLIENT_GONE, Slot};
+use kcore::notify::Slot;
 
 pub struct Session {
     /// The slot of its notifications: notify through its handles, and
@@ -168,7 +168,7 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
             .expect("a session's handle is released once too often");
         if (*p).copies == 0 {
             // PEER_CLOSED: the session goes at once (spec 5.3).
-            let _ = channel::post(c, slot(s), BIT_CLIENT_GONE, cause);
+            let _ = channel::post(c, slot(s), CLIENT_GONE, cause);
         }
         unref(s, cause);
     }
@@ -259,24 +259,30 @@ const POISON: u8 = 0xA5;
 #[cfg(feature = "ktest")]
 const _: () = assert!(core::mem::offset_of!(Session, refs) >= 8);
 
-/// Sessions whose places have not gone back.
 #[cfg(feature = "ktest")]
-pub fn in_use() -> usize {
-    LIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
+pub use test_access::{in_use, payer, priority};
 
-/// The priority of the slot of `s`, which the test holds.
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn priority(s: NonNull<Session>) -> u8 {
-    // SAFETY: the test holds a reference to the session; only the slot is
-    // read.
-    unsafe { (*s.as_ptr()).slot.priority() }
-}
+mod test_access {
+    use super::*;
 
-/// The process that pays for `s`, which the test holds.
-#[cfg(feature = "ktest")]
-pub fn payer(s: NonNull<Session>) -> NonNull<Process> {
-    // SAFETY: the test holds a reference to the session; only the field is
-    // read.
-    unsafe { (*s.as_ptr()).payer }
+    /// Sessions whose places have not gone back.
+    pub fn in_use() -> usize {
+        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The priority of the slot of `s`, which the test holds.
+    pub fn priority(s: NonNull<Session>) -> u8 {
+        // SAFETY: the test holds a reference to the session; only the slot is
+        // read.
+        unsafe { (*s.as_ptr()).slot.priority() }
+    }
+
+    /// The process that pays for `s`, which the test holds.
+    pub fn payer(s: NonNull<Session>) -> NonNull<Process> {
+        // SAFETY: the test holds a reference to the session; only the field is
+        // read.
+        unsafe { (*s.as_ptr()).payer }
+    }
 }

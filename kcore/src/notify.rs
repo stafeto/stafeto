@@ -12,33 +12,7 @@
 //! allocates, and every operation takes constant time.
 
 use crate::sched::{self, Link, Linked, ReadyQueue, Schedulable};
-use abi::Error;
 use core::ptr::NonNull;
-
-/// Bit 63, CLIENT_GONE: only the kernel posts it, into the slot of a
-/// session whose last copy went (spec 5.3).
-pub const BIT_CLIENT_GONE: u64 = abi::CLIENT_GONE;
-
-/// The bits of `notify` from a register: INVALID_ARGS with bit 63, in any
-/// slot, so that no client fakes the end of another; no bits at all are
-/// fine.
-pub fn bits_arg(raw: u64) -> Result<u64, Error> {
-    if raw & BIT_CLIENT_GONE == 0 {
-        Ok(raw)
-    } else {
-        Err(Error::InvalidArgs)
-    }
-}
-
-/// The flags of `receive` (spec 6.1, 11): true when the call waits, false
-/// for abi::NO_WAIT; INVALID_ARGS for any other bit.
-pub fn wait_arg(raw: u64) -> Result<bool, Error> {
-    match raw {
-        0 => Ok(true),
-        abi::NO_WAIT => Ok(false),
-        _ => Err(Error::InvalidArgs),
-    }
-}
 
 /// What a post did to a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +224,7 @@ impl<O: Copy, T: Schedulable> Default for Queue<O, T> {
 mod tests {
     use super::*;
     use crate::sched::Node;
-    use abi::Policy;
+    use abi::{CLIENT_GONE, Policy};
 
     /// A slot that stays in place while the test runs, and its pointer.
     fn slot(priority: u8, name: char) -> (Box<Slot<char>>, NonNull<Slot<char>>) {
@@ -300,30 +274,9 @@ mod tests {
         assert_eq!(s.take(), (0, 0));
         s.post(1 << 40);
         assert_eq!(s.take(), (1 << 40, 1));
-    }
-
-    #[test]
-    fn bit_63_is_refused() {
-        assert_eq!(BIT_CLIENT_GONE, 1 << 63);
-        for raw in [BIT_CLIENT_GONE, BIT_CLIENT_GONE | 1, u64::MAX] {
-            assert_eq!(bits_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
-        }
-        for raw in [0, 1, !BIT_CLIENT_GONE] {
-            assert_eq!(bits_arg(raw), Ok(raw), "{raw:#x}");
-        }
-        // The kernel posts it itself when a client goes.
-        let (mut s, _) = slot(10, 'a');
-        s.post(BIT_CLIENT_GONE);
-        assert_eq!(s.take(), (BIT_CLIENT_GONE, 1));
-    }
-
-    #[test]
-    fn receive_waits_unless_told_not_to() {
-        assert_eq!(wait_arg(0), Ok(true));
-        assert_eq!(wait_arg(abi::NO_WAIT), Ok(false));
-        for raw in [1, abi::NO_WAIT | 1, 1 << 17, 1 << 63, u64::MAX] {
-            assert_eq!(wait_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
-        }
+        // The kernel posts CLIENT_GONE itself when a client goes.
+        s.post(CLIENT_GONE);
+        assert_eq!(s.take(), (CLIENT_GONE, 1));
     }
 
     #[test]

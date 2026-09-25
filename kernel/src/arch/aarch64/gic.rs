@@ -123,36 +123,39 @@ pub fn wait() -> Option<Ack> {
 }
 
 #[cfg(feature = "ktest")]
-fn test_bit(bank: usize, intid: u32) -> bool {
-    let (offset, bit) = gic::bit(bank, intid);
-    read(&DIST, offset) & bit != 0
-}
+pub use test_access::{is_active, is_enabled, priority, priority_mask, set_pending};
 
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn is_active(intid: u32) -> bool {
-    test_bit(kcore::gic::GICD_ISACTIVER, intid)
-}
+mod test_access {
+    use super::*;
 
-#[cfg(feature = "ktest")]
-pub fn is_enabled(intid: u32) -> bool {
-    test_bit(GICD_ISENABLER, intid)
-}
+    fn test_bit(bank: usize, intid: u32) -> bool {
+        let (offset, bit) = gic::bit(bank, intid);
+        read(&DIST, offset) & bit != 0
+    }
 
-/// Makes the line pending at the distributor, as if its source had fired.
-#[cfg(feature = "ktest")]
-pub fn set_pending(intid: u32) {
-    let (offset, bit) = gic::bit(kcore::gic::GICD_ISPENDR, intid);
-    write(&DIST, offset, bit);
-}
+    pub fn is_active(intid: u32) -> bool {
+        test_bit(kcore::gic::GICD_ISACTIVER, intid)
+    }
 
-/// This CPU interface's priority mask, GICC_PMR.
-#[cfg(feature = "ktest")]
-pub fn priority_mask() -> u8 {
-    read(&CPU, GICC_PMR) as u8
-}
+    pub fn is_enabled(intid: u32) -> bool {
+        test_bit(GICD_ISENABLER, intid)
+    }
 
-#[cfg(feature = "ktest")]
-pub fn priority(intid: u32) -> u8 {
-    let (offset, shift) = gic::byte(GICD_IPRIORITYR, intid);
-    (read(&DIST, offset) >> shift) as u8
+    /// Makes the line pending at the distributor, as if its source had fired.
+    pub fn set_pending(intid: u32) {
+        let (offset, bit) = gic::bit(kcore::gic::GICD_ISPENDR, intid);
+        write(&DIST, offset, bit);
+    }
+
+    /// This CPU interface's priority mask, GICC_PMR.
+    pub fn priority_mask() -> u8 {
+        read(&CPU, GICC_PMR) as u8
+    }
+
+    pub fn priority(intid: u32) -> u8 {
+        let (offset, shift) = gic::byte(GICD_IPRIORITYR, intid);
+        (read(&DIST, offset) >> shift) as u8
+    }
 }

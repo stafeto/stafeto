@@ -6,10 +6,8 @@
 //! first end records for good. The last started thread to exit ends the
 //! process with code 0; threads that never started do not keep it alive,
 //! and a process in which no thread ever started lives until its
-//! references go. Also the checks on the values `process_create` takes.
+//! references go.
 
-use crate::frames::PAGE_SIZE;
-use crate::handles::MAX_HANDLES;
 use abi::{Error, ProcessState};
 
 pub struct Life {
@@ -79,25 +77,6 @@ impl Default for Life {
     }
 }
 
-/// The memory quota `process_create` takes, in bytes: whole pages, at
-/// least one. INVALID_ARGS otherwise.
-pub fn quota_arg(raw: u64) -> Result<u64, Error> {
-    if raw > 0 && raw.is_multiple_of(PAGE_SIZE) {
-        Ok(raw)
-    } else {
-        Err(Error::InvalidArgs)
-    }
-}
-
-/// The handle limit `process_create` takes: 1 to MAX_HANDLES. INVALID_ARGS
-/// otherwise.
-pub fn handle_limit_arg(raw: u64) -> Result<u32, Error> {
-    match u32::try_from(raw) {
-        Ok(limit) if (1..=MAX_HANDLES).contains(&limit) => Ok(limit),
-        _ => Err(Error::InvalidArgs),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,20 +119,5 @@ mod tests {
         assert!(life.end(ProcessState::Exited { code: u64::MAX }));
         assert!(!life.end(FAULT));
         assert_eq!(life.state(), ProcessState::Exited { code: u64::MAX });
-    }
-
-    #[test]
-    fn process_create_values() {
-        for quota in [PAGE_SIZE, 3 * PAGE_SIZE, 1 << 40] {
-            assert_eq!(quota_arg(quota), Ok(quota));
-        }
-        for quota in [0, 1, PAGE_SIZE - 1, PAGE_SIZE + 8, u64::MAX] {
-            assert_eq!(quota_arg(quota), Err(Error::InvalidArgs));
-        }
-        assert_eq!(handle_limit_arg(1), Ok(1));
-        assert_eq!(handle_limit_arg(u64::from(MAX_HANDLES)), Ok(MAX_HANDLES));
-        for limit in [0, u64::from(MAX_HANDLES) + 1, 1 << 32 | 16, u64::MAX] {
-            assert_eq!(handle_limit_arg(limit), Err(Error::InvalidArgs));
-        }
     }
 }

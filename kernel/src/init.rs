@@ -15,16 +15,22 @@
 
 use crate::arch::cache;
 use crate::process::{self, Process};
-use crate::thread::{self, Policy};
+use crate::thread;
+use abi::Policy;
 use bootimg::{Part, Program};
 use core::fmt;
 use core::ptr::NonNull;
-use kcore::frames::{MAX_ORDER, PAGE_SIZE};
+use kcore::PAGE_SIZE;
+use kcore::frames::MAX_ORDER;
 use kcore::layout::LINEAR_BASE;
 use kcore::paging::Attrs;
 
 /// Init's priority and priority ceiling (spec 13.3): the highest.
 const PRIORITY: u8 = 63;
+
+// The boot image aligns files and segments to its own page (spec 13.1),
+// and the kernel maps them in its pages: the two must be one size.
+const _: () = assert!(bootimg::PAGE_SIZE == PAGE_SIZE);
 
 /// Makes init from `program` and leaves the kernel for it. Init's end
 /// ends the run (process::set_init). Its shell takes the page the kernel

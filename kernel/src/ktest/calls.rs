@@ -16,17 +16,17 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::session::{self, Session};
-use crate::thread::{self, Policy, Thread};
+use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
     CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
     INFO_PROCESS_MEMORY, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
     INIT_RESOURCE_RIGHTS, INIT_THREAD, KernelStats, MAX_SLOTS, NO_WAIT, Notification, OWNER_RIGHTS,
-    ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
+    Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
-use kcore::frames::PAGE_SIZE;
+use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
 use kcore::layout::{LINEAR_BASE, USER_END};
 use kcore::paging::{Attrs, page_descriptor};

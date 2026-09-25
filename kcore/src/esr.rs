@@ -16,9 +16,6 @@ pub const EC_BRK64: u8 = 0x3C;
 /// FnV, ISS bit 10 of an abort: FAR_EL1 is not valid.
 pub const ISS_FNV: u64 = 1 << 10;
 
-/// Immediate of the BRK that kernel tests use to prove the exception return path.
-pub const TEST_BRK: u16 = 0x51;
-
 /// Exception class, ESR bits [31:26]. Newer cores use bits above 31, so they are masked off.
 pub fn ec(esr: u64) -> u8 {
     ((esr >> 26) & 0x3F) as u8
@@ -89,23 +86,6 @@ pub fn fault_level(esr: u64) -> Option<u8> {
     matches!(esr & 0x3F, 0x00..=0x0F).then(|| (esr & 0b11) as u8)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrkAction {
-    Skip,
-    Panic,
-}
-
-/// A BRK in kernel code is a deliberate trap (Rust lowers aborts and
-/// unreachable code to BRK) and stops the kernel; only the test marker in a
-/// test build is skipped.
-pub fn kernel_brk_action(imm: u16, test_build: bool) -> BrkAction {
-    if test_build && imm == TEST_BRK {
-        BrkAction::Skip
-    } else {
-        BrkAction::Panic
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,18 +127,6 @@ mod tests {
         assert_eq!(fault_level(0x0F), Some(3));
         assert_eq!(fault_level(0x10), None);
         assert_eq!(fault_level(0x21), None);
-    }
-
-    #[test]
-    fn test_build_skips_only_the_test_marker() {
-        assert_eq!(kernel_brk_action(TEST_BRK, true), BrkAction::Skip);
-        assert_eq!(kernel_brk_action(1, true), BrkAction::Panic);
-    }
-
-    #[test]
-    fn normal_build_never_skips_brk() {
-        assert_eq!(kernel_brk_action(TEST_BRK, false), BrkAction::Panic);
-        assert_eq!(kernel_brk_action(1, false), BrkAction::Panic);
     }
 
     #[test]

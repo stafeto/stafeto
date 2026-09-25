@@ -601,28 +601,34 @@ const POISON: u8 = 0xA5;
 #[cfg(feature = "ktest")]
 const _: () = assert!(core::mem::offset_of!(Channel, refs) >= 8);
 
-/// Channels whose slots have not gone back.
 #[cfg(feature = "ktest")]
-pub fn in_use() -> usize {
-    LIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
+pub use test_access::{in_use, payer, take_close_portions};
 
-/// Portions of the stage Close since the last call, the most heads one
-/// took, and the levels they ran at.
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn take_close_portions() -> (u32, u32, u64) {
-    use core::sync::atomic::Ordering::Relaxed;
-    (
-        CLOSE_PORTIONS.swap(0, Relaxed),
-        CLOSE_HEADS.swap(0, Relaxed),
-        CLOSE_LEVELS.swap(0, Relaxed),
-    )
-}
+mod test_access {
+    use super::*;
 
-/// The process that pays for `c`, which the test holds.
-#[cfg(feature = "ktest")]
-pub fn payer(c: NonNull<Channel>) -> NonNull<Process> {
-    // SAFETY: the test holds a reference to the channel; only the field is
-    // read.
-    unsafe { (*c.as_ptr()).payer }
+    /// Channels whose slots have not gone back.
+    pub fn in_use() -> usize {
+        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Portions of the stage Close since the last call, the most heads one
+    /// took, and the levels they ran at.
+    pub fn take_close_portions() -> (u32, u32, u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            CLOSE_PORTIONS.swap(0, Relaxed),
+            CLOSE_HEADS.swap(0, Relaxed),
+            CLOSE_LEVELS.swap(0, Relaxed),
+        )
+    }
+
+    /// The process that pays for `c`, which the test holds.
+    pub fn payer(c: NonNull<Channel>) -> NonNull<Process> {
+        // SAFETY: the test holds a reference to the channel; only the field is
+        // read.
+        unsafe { (*c.as_ptr()).payer }
+    }
 }
