@@ -404,10 +404,15 @@ mod tests {
     /// them only when threads switch (spec 8), so FP or SIMD anywhere else
     /// in the kernel would change a program's registers without a word.
     /// Only the thread switch and the EL0 test programs may assemble them.
+    /// Every crate linked into the kernel is searched: the kernel itself,
+    /// kcore and abi.
     #[test]
     fn only_the_thread_switch_uses_fp() {
         let mut found = Vec::new();
-        let mut paths = vec![root().join("kernel")];
+        let mut paths: Vec<_> = ["kernel", "kcore", "lib/abi"]
+            .iter()
+            .map(|dir| root().join(dir))
+            .collect();
         while let Some(path) = paths.pop() {
             if path.is_dir() {
                 let entries = std::fs::read_dir(&path).expect("a readable directory");
