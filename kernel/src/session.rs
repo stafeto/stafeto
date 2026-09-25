@@ -21,9 +21,9 @@ use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
 use crate::object::Object;
 use crate::process::{self, Process};
-use abi::{Error, Rights};
+use abi::{CLIENT_GONE, Error, Rights};
 use core::ptr::NonNull;
-use kcore::notify::{BIT_CLIENT_GONE, Slot};
+use kcore::notify::Slot;
 
 pub struct Session {
     /// The slot of its notifications: notify through its handles, and
@@ -168,7 +168,7 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
             .expect("a session's handle is released once too often");
         if (*p).copies == 0 {
             // PEER_CLOSED: the session goes at once (spec 5.3).
-            let _ = channel::post(c, slot(s), BIT_CLIENT_GONE, cause);
+            let _ = channel::post(c, slot(s), CLIENT_GONE, cause);
         }
         unref(s, cause);
     }

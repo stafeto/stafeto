@@ -5,7 +5,7 @@
 //! the checks on where a new thread starts and where its message buffer
 //! goes.
 
-use crate::frames::PAGE_SIZE;
+use crate::PAGE_SIZE;
 use crate::layout::USER_END;
 use abi::Error;
 pub use abi::{PRIORITY_LEVELS, Policy};

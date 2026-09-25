@@ -38,7 +38,7 @@ pub unsafe fn give_back(page: NonNull<u8>) {
     #[cfg(feature = "ktest")]
     // SAFETY: the caller's promise: the page is the caller's to the end.
     unsafe {
-        core::ptr::write_bytes(page.as_ptr(), POISON, kcore::slab::PAGE)
+        core::ptr::write_bytes(page.as_ptr(), POISON, kcore::PAGE_SIZE as usize)
     };
     let pa = (page.as_ptr() as usize - LINEAR_BASE) as u64;
     FRAMES.lock().as_mut().expect("frame allocator").free(pa, 0);

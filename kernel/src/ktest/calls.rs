@@ -26,7 +26,7 @@ use abi::{
     ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
-use kcore::frames::PAGE_SIZE;
+use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
 use kcore::layout::{LINEAR_BASE, USER_END};
 use kcore::paging::{Attrs, page_descriptor};

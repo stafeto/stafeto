@@ -8,8 +8,9 @@
 use super::phys::{self, Frames, LinearMem};
 use crate::arch::{mmu, symbols};
 use crate::boot::Boot;
+use kcore::PAGE_SIZE;
 use kcore::bootinfo::Region;
-use kcore::frames::{PAGE_SIZE, PhysMem};
+use kcore::frames::PhysMem;
 use kcore::layout::{LINEAR_BASE, image_pa};
 use kcore::memmap;
 use kcore::paging::{Attrs, PageTable, TableMemory};

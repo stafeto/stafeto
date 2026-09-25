@@ -25,9 +25,10 @@ use crate::{process, sched, session, thread, timer as timers};
 use abi::{Error, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
+use kcore::PAGE_SIZE;
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
-use kcore::frames::{MAX_ORDER, PAGE_SIZE, PhysMem};
+use kcore::frames::{MAX_ORDER, PhysMem};
 use kcore::gic::{Ack, DEFAULT_PRIORITY};
 use kcore::handles::{CHUNK, MAX_HANDLES};
 use kcore::layout::{

@@ -101,8 +101,8 @@ pub unsafe trait ChunkSource<T> {
     unsafe fn free_directory(&mut self, directory: NonNull<Directory<T>>);
 }
 
-/// A process's handles. The owner calls `release` (or `release_step` until
-/// it returns true) before dropping it.
+/// A process's handles. The owner calls `release_step` until it returns
+/// true before dropping it.
 ///
 /// Every entry below `used` is live, free (on the free list) or retired
 /// (freed at the last generation and never handed out again); retired
@@ -119,7 +119,9 @@ pub struct HandleTable<T> {
     live: u32,
     free_count: u32,
     retired: u32,
-    /// Generation of fresh entries: 1, except in tests that start near the end.
+    /// Generation of fresh entries, for tests that start near the end; the
+    /// kernel's tables start at 1.
+    #[cfg(test)]
     first_generation: u64,
     /// A stepwise release is under way.
     closing: bool,
@@ -143,6 +145,7 @@ impl<T> HandleTable<T> {
             live: 0,
             free_count: 0,
             retired: 0,
+            #[cfg(test)]
             first_generation: 1,
             closing: false,
         })
@@ -227,7 +230,10 @@ impl<T> HandleTable<T> {
             self.directory = Some(directory);
         }
         let chunk = src.alloc_chunk().ok_or(HandleError::NoMemory)?;
+        #[cfg(test)]
         let generation = self.first_generation;
+        #[cfg(not(test))]
+        let generation = 1;
         // SAFETY: fresh memory for one chunk; every entry is written before use.
         unsafe {
             let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
@@ -294,16 +300,6 @@ impl<T> HandleTable<T> {
         Ok((e.object.as_ref().expect("a live entry"), e.rights))
     }
 
-    /// The object, when the handle carries at least `required`.
-    pub fn get_with(&self, h: Handle, required: Rights) -> Result<&T, HandleError> {
-        let (object, rights) = self.get(h)?;
-        if rights.contains(required) {
-            Ok(object)
-        } else {
-            Err(HandleError::AccessDenied)
-        }
-    }
-
     /// What `kind` makes of the object, checked in the order of the system
     /// calls (spec 11): a live handle (else BadHandle), an object `kind`
     /// accepts (else WrongType), then at least `required` (else AccessDenied).
@@ -346,7 +342,9 @@ impl<T> HandleTable<T> {
     }
 
     /// A new handle to the same object with a subset of the rights; the
-    /// original must carry DUPLICATE.
+    /// original must carry DUPLICATE. For tests: the kernel copies
+    /// through `get_as` and `insert`.
+    #[cfg(test)]
     pub fn duplicate(
         &mut self,
         src: &mut impl ChunkSource<T>,
@@ -365,6 +363,7 @@ impl<T> HandleTable<T> {
     }
 
     /// Drops every object and gives every chunk back; the table is empty afterwards.
+    #[cfg(test)]
     pub fn release(&mut self, src: &mut impl ChunkSource<T>) {
         self.release_with(src, |object, _| drop(object));
     }
@@ -373,6 +372,7 @@ impl<T> HandleTable<T> {
     /// and gives every chunk back; the table is empty afterwards. Objects
     /// that need more than a drop when their handle goes, such as counted
     /// references, leave this way.
+    #[cfg(test)]
     pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T, Rights)) {
         while !self.release_step(src, &mut f) {}
     }
@@ -436,7 +436,7 @@ impl<T> Drop for HandleTable<T> {
         if std::thread::panicking() {
             return;
         }
-        // Only a check: the work is `release`'s, which needs the chunk
+        // Only a check: the work is `release_step`'s, which needs the chunk
         // source. The kernel builds without debug assertions, so the check
         // is a plain assert.
         assert!(
@@ -570,7 +570,6 @@ mod tests {
         t.remove(h).unwrap();
         t.insert(&mut src, 2, RW).unwrap();
         assert_eq!(t.get(h), Err(HandleError::BadHandle));
-        assert_eq!(t.get_with(h, Rights::NONE), Err(HandleError::BadHandle));
         assert_eq!(
             t.duplicate(&mut src, h, Rights::NONE),
             Err(HandleError::BadHandle)
@@ -802,7 +801,6 @@ mod tests {
         }
         for h in closed {
             assert_eq!(t.get(h), Err(HandleError::BadHandle));
-            assert_eq!(t.get_with(h, Rights::NONE), Err(HandleError::BadHandle));
             assert_eq!(
                 t.duplicate(&mut src, h, Rights::NONE),
                 Err(HandleError::BadHandle)
@@ -934,19 +932,6 @@ mod tests {
         for raw in [1 << 12, 1 << 31, 1 << 32, u64::MAX] {
             assert_eq!(rights_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
         }
-    }
-
-    #[test]
-    fn get_with_checks_rights() {
-        let mut src = boxes(1);
-        let mut t = table(10);
-        let h = t.insert(&mut src, 5, Rights::SEND).unwrap();
-        assert_eq!(t.get_with(h, Rights::SEND), Ok(&5));
-        assert_eq!(
-            t.get_with(h, Rights::RECEIVE),
-            Err(HandleError::AccessDenied)
-        );
-        t.release(&mut src);
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::process::{self, Process};
 use crate::sched;
 use abi::Error;
 use core::ptr::NonNull;
-use kcore::frames::PAGE_SIZE;
+use kcore::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};

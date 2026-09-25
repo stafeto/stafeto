@@ -8,7 +8,7 @@
 //! and a process in which no thread ever started lives until its
 //! references go. Also the checks on the values `process_create` takes.
 
-use crate::frames::PAGE_SIZE;
+use crate::PAGE_SIZE;
 use crate::handles::MAX_HANDLES;
 use abi::{Error, ProcessState};
 

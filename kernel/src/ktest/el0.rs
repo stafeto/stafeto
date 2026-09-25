@@ -30,8 +30,8 @@ use abi::{
     Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
+use kcore::PAGE_SIZE;
 use kcore::esr;
-use kcore::frames::PAGE_SIZE;
 use kcore::gic::PRIORITY_MASK;
 use kcore::handles::{MAX_CHUNKS, MAX_HANDLES};
 use kcore::layout::LINEAR_BASE;

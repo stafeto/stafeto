@@ -5,10 +5,9 @@
 //! in whole 4 KiB pages; and whether the boot image lies where the kernel
 //! can read it.
 
+use crate::PAGE_SIZE;
 use crate::bootinfo::{Region, RegionList};
 use core::fmt;
-
-pub const PAGE: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemMapError {
@@ -16,11 +15,11 @@ pub enum MemMapError {
 }
 
 fn align_down(x: u64) -> u64 {
-    x & !(PAGE - 1)
+    x & !(PAGE_SIZE - 1)
 }
 
 fn align_up(x: u64) -> u64 {
-    x.checked_add(PAGE - 1)
+    x.checked_add(PAGE_SIZE - 1)
         .map_or(align_down(u64::MAX), align_down)
 }
 
@@ -151,7 +150,7 @@ pub fn check_boot_image(
     kernel: Region,
     dtb: Region,
 ) -> Result<(), BootImageError> {
-    if !image.base.is_multiple_of(PAGE) {
+    if !image.base.is_multiple_of(PAGE_SIZE) {
         return Err(BootImageError::Misaligned);
     }
     let mapped = usable::<32>(memory, no_map).map_err(|_| BootImageError::TooManyRegions)?;

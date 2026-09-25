@@ -6,9 +6,9 @@
 //! tables; this module issues no barriers or TLB maintenance, which is the
 //! caller's job when a table is live.
 
+use crate::PAGE_SIZE;
 use crate::layout::USER_END;
 
-pub const PAGE: u64 = 4096;
 pub const BLOCK_2M: u64 = 2 << 20;
 /// Output address bits [47:12] of a descriptor.
 const OA_MASK: u64 = 0x0000_FFFF_FFFF_F000;
@@ -273,7 +273,10 @@ impl PageTable {
         if !attrs.is_valid() {
             return Err(MapError::WriteAndExecute);
         }
-        if !va.is_multiple_of(PAGE) || !pa.is_multiple_of(PAGE) || !size.is_multiple_of(PAGE) {
+        if !va.is_multiple_of(PAGE_SIZE)
+            || !pa.is_multiple_of(PAGE_SIZE)
+            || !size.is_multiple_of(PAGE_SIZE)
+        {
             return Err(MapError::Misaligned);
         }
         let mut off = 0;
@@ -286,7 +289,7 @@ impl PageTable {
             let (level, desc, step) = if block {
                 (2, block_descriptor(p, attrs), BLOCK_2M)
             } else {
-                (3, page_descriptor(p, attrs), PAGE)
+                (3, page_descriptor(p, attrs), PAGE_SIZE)
             };
             let slot = self.entry(mem, v, level)?;
             if mem.read(slot) != 0 {
@@ -321,7 +324,7 @@ impl PageTable {
     /// address. Tables stay, even when they become empty; a 2 MiB block is
     /// not a page and stays too. The caller invalidates the TLB entry.
     pub fn unmap_page(&mut self, mem: &mut impl TableMemory, va: u64) -> Result<u64, MapError> {
-        if !va.is_multiple_of(PAGE) {
+        if !va.is_multiple_of(PAGE_SIZE) {
             return Err(MapError::Misaligned);
         }
         let mut table = self.root;
@@ -466,7 +469,7 @@ mod tests {
             }
             self.left -= 1;
             let t = self.next;
-            self.next += PAGE;
+            self.next += PAGE_SIZE;
             Some(t)
         }
         fn free_table(&mut self, pa: u64) {
@@ -484,7 +487,9 @@ mod tests {
     impl Tables {
         /// Every table handed out so far.
         fn allocated(&self) -> Vec<u64> {
-            (FIRST_TABLE..self.next).step_by(PAGE as usize).collect()
+            (FIRST_TABLE..self.next)
+                .step_by(PAGE_SIZE as usize)
+                .collect()
         }
 
         /// The addresses read since the last call.
@@ -582,7 +587,7 @@ mod tests {
             ..Attrs::KERNEL_TEXT
         };
         assert_eq!(
-            pt.map(&mut t, 0x4000_0000, 0x4000_0000, PAGE, wx),
+            pt.map(&mut t, 0x4000_0000, 0x4000_0000, PAGE_SIZE, wx),
             Err(MapError::WriteAndExecute)
         );
         let dx = Attrs {
@@ -615,11 +620,11 @@ mod tests {
         let mut pt = PageTable::new(&mut t).unwrap();
         let d = Attrs::KERNEL_DATA;
         assert_eq!(
-            pt.map(&mut t, 0x4000_0800, 0x4000_0000, PAGE, d),
+            pt.map(&mut t, 0x4000_0800, 0x4000_0000, PAGE_SIZE, d),
             Err(MapError::Misaligned)
         );
         assert_eq!(
-            pt.map(&mut t, 0x4000_0000, 0x4000_0800, PAGE, d),
+            pt.map(&mut t, 0x4000_0000, 0x4000_0800, PAGE_SIZE, d),
             Err(MapError::Misaligned)
         );
         assert_eq!(
@@ -632,8 +637,14 @@ mod tests {
     fn single_page_maps_and_translates() {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
-        pt.map(&mut t, 0x1234_5000, 0x4567_8000, PAGE, Attrs::KERNEL_DATA)
-            .unwrap();
+        pt.map(
+            &mut t,
+            0x1234_5000,
+            0x4567_8000,
+            PAGE_SIZE,
+            Attrs::KERNEL_DATA,
+        )
+        .unwrap();
         let (pa, d) = pt.translate(&t, 0x1234_5ABC).unwrap();
         assert_eq!(pa, 0x4567_8ABC);
         assert_eq!(d & 0b11, 0b11);
@@ -665,7 +676,7 @@ mod tests {
             &mut t,
             0x401F_F000,
             0x401F_F000,
-            BLOCK_2M + 2 * PAGE,
+            BLOCK_2M + 2 * PAGE_SIZE,
             Attrs::KERNEL_DATA,
         )
         .unwrap();
@@ -680,7 +691,7 @@ mod tests {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
         let va = 0xFFFF_FFFF_C000_0000;
-        pt.map(&mut t, va, 0x4020_0000, PAGE, Attrs::KERNEL_TEXT)
+        pt.map(&mut t, va, 0x4020_0000, PAGE_SIZE, Attrs::KERNEL_TEXT)
             .unwrap();
         assert_ne!(t.read(pt.root() + 511 * 8), 0);
         assert_eq!(pt.translate(&t, va + 8).unwrap().0, 0x4020_0008);
@@ -690,10 +701,10 @@ mod tests {
     fn mapping_twice_is_refused() {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
-        pt.map(&mut t, 0x1000, 0x4000_0000, PAGE, Attrs::KERNEL_DATA)
+        pt.map(&mut t, 0x1000, 0x4000_0000, PAGE_SIZE, Attrs::KERNEL_DATA)
             .unwrap();
         assert_eq!(
-            pt.map(&mut t, 0x1000, 0x4000_1000, PAGE, Attrs::KERNEL_DATA),
+            pt.map(&mut t, 0x1000, 0x4000_1000, PAGE_SIZE, Attrs::KERNEL_DATA),
             Err(MapError::AlreadyMapped)
         );
     }
@@ -711,7 +722,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pt.map(&mut t, 0x4000_1000, 0x5000_0000, PAGE, Attrs::KERNEL_DATA),
+            pt.map(
+                &mut t,
+                0x4000_1000,
+                0x5000_0000,
+                PAGE_SIZE,
+                Attrs::KERNEL_DATA
+            ),
             Err(MapError::AlreadyMapped)
         );
     }
@@ -721,7 +738,7 @@ mod tests {
         let mut t = tables(2);
         let mut pt = PageTable::new(&mut t).unwrap();
         assert_eq!(
-            pt.map(&mut t, 0x1000, 0x4000_0000, PAGE, Attrs::KERNEL_DATA),
+            pt.map(&mut t, 0x1000, 0x4000_0000, PAGE_SIZE, Attrs::KERNEL_DATA),
             Err(MapError::NoMemory)
         );
     }
@@ -730,7 +747,7 @@ mod tests {
     fn from_root_walks_existing_tables() {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
-        pt.map(&mut t, 0x2000, 0x4000_2000, PAGE, Attrs::KERNEL_DATA)
+        pt.map(&mut t, 0x2000, 0x4000_2000, PAGE_SIZE, Attrs::KERNEL_DATA)
             .unwrap();
         let again = PageTable::from_root(pt.root());
         assert_eq!(again.translate(&t, 0x2000).unwrap().0, 0x4000_2000);
@@ -775,7 +792,7 @@ mod tests {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
         assert_eq!(
-            pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE, Attrs::KERNEL_DATA),
+            pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE_SIZE, Attrs::KERNEL_DATA),
             Err(MapError::NotUser)
         );
         let wx = Attrs {
@@ -783,7 +800,7 @@ mod tests {
             ..Attrs::USER_TEXT
         };
         assert_eq!(
-            pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE, wx),
+            pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE_SIZE, wx),
             Err(MapError::WriteAndExecute)
         );
         assert_eq!(pt.translate(&t, 0x1000), None);
@@ -796,18 +813,18 @@ mod tests {
         let mut pt = PageTable::new(&mut t).unwrap();
         let d = Attrs::USER_DATA;
         assert_eq!(
-            pt.map_user(&mut t, end, 0x4000_0000, PAGE, d),
+            pt.map_user(&mut t, end, 0x4000_0000, PAGE_SIZE, d),
             Err(MapError::NotUser)
         );
         assert_eq!(
-            pt.map_user(&mut t, end - PAGE, 0x4000_0000, 2 * PAGE, d),
+            pt.map_user(&mut t, end - PAGE_SIZE, 0x4000_0000, 2 * PAGE_SIZE, d),
             Err(MapError::NotUser)
         );
         assert_eq!(
-            pt.map_user(&mut t, u64::MAX - PAGE + 1, 0x4000_0000, PAGE, d),
+            pt.map_user(&mut t, u64::MAX - PAGE_SIZE + 1, 0x4000_0000, PAGE_SIZE, d),
             Err(MapError::NotUser)
         );
-        pt.map_user(&mut t, end - PAGE, 0x4000_0000, PAGE, d)
+        pt.map_user(&mut t, end - PAGE_SIZE, 0x4000_0000, PAGE_SIZE, d)
             .unwrap();
         assert_eq!(pt.translate(&t, end - 1).unwrap().0, 0x4000_0FFF);
     }
@@ -816,7 +833,7 @@ mod tests {
     fn unmapping_a_page_returns_its_frame() {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
-        pt.map_user(&mut t, 0x1000, 0x4000_0000, 2 * PAGE, Attrs::USER_DATA)
+        pt.map_user(&mut t, 0x1000, 0x4000_0000, 2 * PAGE_SIZE, Attrs::USER_DATA)
             .unwrap();
         assert_eq!(pt.unmap_page(&mut t, 0x1000), Ok(0x4000_0000));
         assert_eq!(pt.translate(&t, 0x1000), None);
@@ -828,7 +845,7 @@ mod tests {
     fn unmapping_needs_a_page_address() {
         let mut t = tables(8);
         let mut pt = PageTable::new(&mut t).unwrap();
-        pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE, Attrs::USER_DATA)
+        pt.map_user(&mut t, 0x1000, 0x4000_0000, PAGE_SIZE, Attrs::USER_DATA)
             .unwrap();
         assert_eq!(pt.unmap_page(&mut t, 0x1008), Err(MapError::Misaligned));
         assert!(pt.translate(&t, 0x1000).is_some());
@@ -869,9 +886,9 @@ mod tests {
             0x40_0000,
             0x4000_0000,
             0x80_0000_0000,
-            USER_END as u64 - PAGE,
+            USER_END as u64 - PAGE_SIZE,
         ] {
-            pt.map_user(&mut t, va, 0x5000_0000, PAGE, Attrs::USER_DATA)
+            pt.map_user(&mut t, va, 0x5000_0000, PAGE_SIZE, Attrs::USER_DATA)
                 .unwrap();
         }
         let root = pt.root();
@@ -896,9 +913,9 @@ mod tests {
             0x40_0000,
             0x4000_0000,
             0x80_0000_0000,
-            USER_END as u64 - PAGE,
+            USER_END as u64 - PAGE_SIZE,
         ] {
-            pt.map_user(&mut t, va, 0x5000_0000, PAGE, Attrs::USER_DATA)
+            pt.map_user(&mut t, va, 0x5000_0000, PAGE_SIZE, Attrs::USER_DATA)
                 .unwrap();
         }
         let root = pt.root();
@@ -925,7 +942,7 @@ mod tests {
         let mut t = tables(516);
         let mut pt = PageTable::new(&mut t).unwrap();
         for va in (0..1 << 30).step_by(BLOCK_2M as usize) {
-            pt.map_user(&mut t, va, 0x5000_0000, PAGE, Attrs::USER_DATA)
+            pt.map_user(&mut t, va, 0x5000_0000, PAGE_SIZE, Attrs::USER_DATA)
                 .unwrap();
         }
         let all = t.allocated();
@@ -939,14 +956,14 @@ mod tests {
             let done = release.step(&mut t);
             steps += 1;
             let reads = t.take_reads();
-            let table = reads.first().map(|pa| pa & !(PAGE - 1));
+            let table = reads.first().map(|pa| pa & !(PAGE_SIZE - 1));
             assert!(
                 reads.len() <= 512,
                 "step {steps} read {} words",
                 reads.len()
             );
             assert!(
-                reads.iter().all(|pa| Some(pa & !(PAGE - 1)) == table),
+                reads.iter().all(|pa| Some(pa & !(PAGE_SIZE - 1)) == table),
                 "step {steps} read more than one table"
             );
             assert!(
@@ -971,7 +988,7 @@ mod tests {
             &mut t,
             0x4000_0000,
             0x4000_0000,
-            BLOCK_2M + PAGE,
+            BLOCK_2M + PAGE_SIZE,
             Attrs::KERNEL_DATA,
         )
         .unwrap();

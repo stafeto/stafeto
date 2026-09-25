@@ -116,10 +116,6 @@ impl<'a> Fdt<'a> {
         })
     }
 
-    pub fn total_size(&self) -> usize {
-        self.data.len()
-    }
-
     /// Entries of the memory reservation block, up to the terminating zero pair.
     pub fn reservations(&self) -> Reservations<'a> {
         Reservations {
@@ -225,8 +221,7 @@ mod tests {
 
     #[test]
     fn parses_header_of_valid_blob() {
-        let fdt = Fdt::new(VIRT).unwrap();
-        assert_eq!(fdt.total_size(), VIRT.len());
+        assert!(Fdt::new(VIRT).is_ok());
     }
 
     #[test]

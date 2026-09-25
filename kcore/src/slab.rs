@@ -8,19 +8,18 @@
 //! each page to the payer's quota and writes it down in the payer's
 //! `PageLog`; the pages go back when the payer's shell goes.
 
+use crate::PAGE_SIZE;
 use crate::quota::Account;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 
-pub const PAGE: usize = 4096;
-
 /// Source of 4 KiB pages, as virtual addresses.
 ///
 /// # Safety
-/// `alloc_page` returns a pointer to PAGE bytes, aligned to PAGE, valid for
-/// reads and writes, that nothing else uses until the one who took it
-/// gives it back: a pool writes its objects there, and only a page log
+/// `alloc_page` returns a pointer to PAGE_SIZE bytes, aligned to
+/// PAGE_SIZE, valid for reads and writes, that nothing else uses until the
+/// one who took it gives it back: a pool writes its objects there, and only a page log
 /// gives its pages back.
 pub unsafe trait PageSource {
     fn alloc_page(&mut self) -> Option<NonNull<u8>>;
@@ -71,10 +70,10 @@ impl<T> Pool<T> {
     /// ```
     pub const PER_PAGE: usize = {
         assert!(
-            Self::SLOT <= PAGE && Self::ALIGN <= PAGE,
+            Self::SLOT <= PAGE_SIZE as usize && Self::ALIGN <= PAGE_SIZE as usize,
             "objects of this type do not fit a pool page"
         );
-        PAGE / Self::SLOT
+        PAGE_SIZE as usize / Self::SLOT
     };
 
     pub const fn new() -> Self {
@@ -158,7 +157,7 @@ impl<T> Default for Pool<T> {
 /// Addresses a page log keeps in itself; the rest go to list pages.
 pub const INLINE_PAGES: usize = 8;
 /// Addresses one list page holds, besides the link to the one before.
-pub const LIST_ENTRIES: usize = PAGE / size_of::<usize>() - 1;
+pub const LIST_ENTRIES: usize = PAGE_SIZE as usize / size_of::<usize>() - 1;
 
 /// A page of a page log: addresses of pool pages, and the list page
 /// written before it.
@@ -168,7 +167,7 @@ struct ListPage {
     next: Option<NonNull<ListPage>>,
 }
 
-const _: () = assert!(size_of::<ListPage>() == PAGE);
+const _: () = assert!(size_of::<ListPage>() == PAGE_SIZE as usize);
 
 /// The pages the pools of one payer took (spec 7.8), and the list pages
 /// that name them: the first INLINE_PAGES addresses in the log itself,
@@ -221,8 +220,8 @@ impl PageLog {
     /// Makes `page` the newest list page.
     ///
     /// # Safety
-    /// `page` is PAGE bytes, aligned to PAGE, that nothing else uses until
-    /// the log gives it back.
+    /// `page` is PAGE_SIZE bytes, aligned to PAGE_SIZE, that nothing else
+    /// uses until the log gives it back.
     unsafe fn add_list_page(&mut self, page: NonNull<u8>) {
         let list = page.cast::<ListPage>();
         // SAFETY: the caller's promise; only the link is written, and each
@@ -302,9 +301,9 @@ impl Drop for PageLog {
     }
 }
 
-/// Pages a payer pays for (spec 7.5, 7.8): each costs its quota PAGE bytes
-/// before `frames` gives it, and goes into its page log, a list page first
-/// when the log needs one. A page is charged once, when a pool grows, and
+/// Pages a payer pays for (spec 7.5, 7.8): each costs its quota PAGE_SIZE
+/// bytes before `frames` gives it, and goes into its page log, a list page
+/// first when the log needs one. A page is charged once, when a pool grows, and
 /// refunded when the log gives it back; slots cost nothing. A charge that
 /// passed always finds a frame: every frame taken after boot is charged to
 /// someone, and the quotas add up to the frames free at boot, so a source
@@ -324,7 +323,7 @@ impl<'a, F: PageSource> PaidPages<'a, F> {
 
     /// A frame charged to the quota; None when the quota falls short.
     fn take(&mut self) -> Option<NonNull<u8>> {
-        self.quota.charge(PAGE as u64).ok()?;
+        self.quota.charge(PAGE_SIZE).ok()?;
         let page = self.frames.alloc_page();
         Some(page.expect("a charge that passed found no frame (spec 7.8)"))
     }
@@ -362,7 +361,9 @@ mod tests {
                 return None;
             }
             self.left -= 1;
-            let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
+            let layout =
+                std::alloc::Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize)
+                    .unwrap();
             // SAFETY: the layout has a non-zero size; the page is leaked on purpose.
             NonNull::new(unsafe { std::alloc::alloc(layout) })
         }
@@ -456,7 +457,10 @@ mod tests {
         assert_eq!(Pool::<u8>::SLOT, 8);
         assert_eq!(Pool::<[u32; 3]>::SLOT, 16);
         assert_eq!(Pool::<[u8; 4000]>::SLOT, 4000);
-        assert_eq!(Pool::<[u64; 32]>::SLOT * Pool::<[u64; 32]>::PER_PAGE, PAGE);
+        assert_eq!(
+            Pool::<[u64; 32]>::SLOT * Pool::<[u64; 32]>::PER_PAGE,
+            PAGE_SIZE as usize
+        );
     }
 
     #[test]
@@ -516,7 +520,8 @@ mod tests {
     }
 
     fn give_back(page: NonNull<u8>) {
-        let layout = std::alloc::Layout::from_size_align(PAGE, PAGE).unwrap();
+        let layout =
+            std::alloc::Layout::from_size_align(PAGE_SIZE as usize, PAGE_SIZE as usize).unwrap();
         // SAFETY: the page came from the host allocator with this layout.
         unsafe { std::alloc::dealloc(page.as_ptr(), layout) };
     }
@@ -527,7 +532,7 @@ mod tests {
         let mut back = Vec::new();
         let done = log.release_step(usize::MAX, |page| {
             back.push(page.as_ptr() as usize);
-            quota.refund(PAGE as u64);
+            quota.refund(PAGE_SIZE);
             give_back(page);
         });
         assert!(done);
@@ -542,11 +547,11 @@ mod tests {
         let mut pool: Pool<u64> = Pool::new();
         pool.alloc(&mut PaidPages::new(&mut frames, &mut quota, &mut log), 1)
             .unwrap();
-        assert_eq!(quota.used(), PAGE as u64);
+        assert_eq!(quota.used(), PAGE_SIZE);
         assert_eq!((log.pages(), log.list_pages(), pool.pages()), (1, 0, 1));
         // Short of a page, the pool does not grow: nothing is charged, and
         // no frame is taken.
-        let mut short = Account::new(PAGE as u64 - 1);
+        let mut short = Account::new(PAGE_SIZE - 1);
         let mut other_log = PageLog::new();
         let mut other: Pool<u64> = Pool::new();
         let paid = &mut PaidPages::new(&mut frames, &mut short, &mut other_log);
@@ -568,11 +573,11 @@ mod tests {
         for i in 0..Pool::<[u64; 32]>::PER_PAGE {
             let paid = &mut PaidPages::new(&mut frames, &mut quota, &mut log);
             pool.alloc(paid, [i as u64; 32]).unwrap();
-            assert_eq!(quota.used(), PAGE as u64);
+            assert_eq!(quota.used(), PAGE_SIZE);
         }
         let paid = &mut PaidPages::new(&mut frames, &mut quota, &mut log);
         pool.alloc(paid, [0; 32]).unwrap();
-        assert_eq!((quota.used(), log.pages()), (2 * PAGE as u64, 2));
+        assert_eq!((quota.used(), log.pages()), (2 * PAGE_SIZE, 2));
         release(&mut log, &mut quota);
     }
 
@@ -587,11 +592,11 @@ mod tests {
         pool.alloc(paid, 2).unwrap();
         // SAFETY: a is live and not used afterwards.
         unsafe { pool.free(a) };
-        assert_eq!(quota.used(), PAGE as u64);
+        assert_eq!(quota.used(), PAGE_SIZE);
         // The slot is there for the next object of the kind, at no cost.
         let paid = &mut PaidPages::new(&mut frames, &mut quota, &mut log);
         assert_eq!(pool.alloc(paid, 3).unwrap(), a);
-        assert_eq!((quota.used(), log.pages()), (PAGE as u64, 1));
+        assert_eq!((quota.used(), log.pages()), (PAGE_SIZE, 1));
         release(&mut log, &mut quota);
     }
 
@@ -624,7 +629,7 @@ mod tests {
         // Nothing is left for another step.
         assert!(log.release_step(64, |_| panic!("a page went back twice")));
         for page in given {
-            quota.refund(PAGE as u64);
+            quota.refund(PAGE_SIZE);
             give_back(NonNull::new(page as *mut u8).unwrap());
         }
         assert_eq!(quota.used(), 0);

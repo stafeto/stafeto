@@ -41,7 +41,7 @@ use crate::thread::{self, Siblings, Thread};
 use crate::timer::Timer;
 use abi::{Error, Handle, MAX_THREADS, MAX_TIMERS, ProcessState, Rights};
 use core::ptr::NonNull;
-use kcore::frames::PAGE_SIZE;
+use kcore::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
 use kcore::notify::Slot;
 use kcore::paging::{Attrs, MapError};
@@ -569,7 +569,7 @@ pub fn quota(process: NonNull<Process>) -> Account {
 
 /// The count of references to `process`. Only the count is borrowed,
 /// through the raw pointer: the process's own table may be in the middle
-/// of `release_with` meanwhile (`release_contents`). Test builds stop a
+/// of `release_step` meanwhile (`release_handles`). Test builds stop a
 /// process that went: the poison of its slot reaches the count.
 ///
 /// # Safety

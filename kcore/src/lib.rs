@@ -6,6 +6,11 @@
 
 #![cfg_attr(not(test), no_std)]
 
+/// Pages of 4 KiB (spec 7.1, 7.2): frames, translation tables, pools and
+/// quotas all count in them.
+pub const PAGE_SHIFT: u32 = 12;
+pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
+
 pub mod asid;
 pub mod backtrace;
 pub mod bootinfo;

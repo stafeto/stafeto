@@ -34,7 +34,7 @@ mod timer;
 
 use boot::Boot;
 use bootimg::Program;
-use kcore::frames::PAGE_SIZE;
+use kcore::PAGE_SIZE;
 use kcore::layout::KERNEL_VIRT;
 use kcore::time::Clock;
 
