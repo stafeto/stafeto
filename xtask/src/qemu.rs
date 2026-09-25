@@ -16,12 +16,14 @@ pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monito
 pub struct Machine {
     pub machine: &'static str,
     pub cpu: &'static str,
+    pub memory: &'static str,
 }
 
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
 pub const VIRT: Machine = Machine {
     machine: "virt,gic-version=2",
     cpu: "cortex-a72",
+    memory: "512M",
 };
 
 /// The kernel is entered at EL2, as on the PinePhone's Cortex-A53; PSCI then
@@ -29,11 +31,19 @@ pub const VIRT: Machine = Machine {
 pub const VIRT_EL2: Machine = Machine {
     machine: "virt,gic-version=2,virtualization=on",
     cpu: "cortex-a53",
+    memory: "512M",
+};
+
+/// The spec machine with 2 GiB: RAM spans two GiBs.
+pub const VIRT_2G: Machine = Machine {
+    machine: "virt,gic-version=2",
+    cpu: "cortex-a72",
+    memory: "2G",
 };
 
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-machine", m.machine, "-cpu", m.cpu, "-m", "512M", "-kernel",
+        "-machine", m.machine, "-cpu", m.cpu, "-m", m.memory, "-kernel",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -196,6 +206,72 @@ pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     }
 }
 
+/// The first number on the first line that starts with `prefix`.
+pub fn number_after(lines: &[String], prefix: &str) -> Option<u64> {
+    let rest = lines
+        .iter()
+        .find_map(|l| l.find(prefix).map(|i| &l[i + prefix.len()..]))?;
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+/// The hex value starting at `line[at + 2..]` (right after a `0x`).
+fn hex_at(line: &str, at: usize) -> Option<u64> {
+    let digits: String = line[at + 2..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    u64::from_str_radix(&digits, 16).ok()
+}
+
+/// The address after `ELR=0x` on the kernel's panic line, if any.
+fn elr_in_panic(lines: &[String]) -> Option<u64> {
+    let line = lines.iter().find(|l| l.contains("ELR=0x"))?;
+    hex_at(line, line.find("ELR=0x")? + "ELR=".len())
+}
+
+/// Addresses on backtrace frame lines (`kcore::backtrace`'s `  #N  0x...`).
+fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
+    lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with('#'))
+        .filter_map(|l| l.find("0x").and_then(|at| hex_at(l, at)))
+        .collect()
+}
+
+/// The backtrace must name the interrupted instruction (its `ELR`) and at
+/// least one caller above it: proof that exception entry recorded a frame
+/// linking the fault into the backtrace, not just the panic handler's own
+/// frames (which a backtrace prints regardless of that record).
+pub fn backtrace_names_the_fault(lines: &[String]) -> Result<(), String> {
+    let elr = elr_in_panic(lines).ok_or("no panic line with ELR=0x...")?;
+    let frames = backtrace_addresses(lines);
+    let at = frames
+        .iter()
+        .position(|&a| a == elr)
+        .ok_or_else(|| format!("ELR {elr:#x} is not in the backtrace: {frames:#x?}"))?;
+    if at + 1 >= frames.len() {
+        return Err(format!("ELR {elr:#x} is the last frame in the backtrace"));
+    }
+    Ok(())
+}
+
+/// QEMU must have finished before the deadline.
+pub fn expect_not_timed_out(o: &Outcome) -> Result<(), String> {
+    if o.timed_out {
+        Err(format!(
+            "QEMU did not finish in time; last lines: {:?}",
+            tail(&o.lines)
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct TestReport {
     pub passed: Vec<String>,
@@ -287,6 +363,59 @@ mod tests {
                 .join(" ")
                 .contains("-initrd")
         );
+    }
+
+    #[test]
+    fn two_gib_machine_asks_for_2g() {
+        let joined = args(&VIRT_2G, Path::new("k.img"), None).join(" ");
+        assert!(joined.contains("-m 2G"));
+        assert!(joined.contains("-cpu cortex-a72"));
+    }
+
+    #[test]
+    fn number_after_reads_the_first_number() {
+        let l = lines(&["boot", "frames     1987 MiB free"]);
+        assert_eq!(number_after(&l, "frames "), Some(1987));
+    }
+
+    #[test]
+    fn number_after_needs_the_prefix_and_a_number() {
+        assert_eq!(number_after(&lines(&["boot"]), "frames "), None);
+        assert_eq!(number_after(&lines(&["frames none"]), "frames "), None);
+    }
+
+    #[test]
+    fn backtrace_names_the_fault_accepts_the_elr_with_a_caller_above_it() {
+        let l = lines(&[
+            "unexpected exception EL1h sync: unknown or undefined instruction (EC 0x0) ESR=0x2000000 ELR=0xffffffffc00017c0 FAR=0x0",
+            "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/stafeto-probe.elf):",
+            "  #0  0xffffffffc0001204",
+            "  #4  0xffffffffc00017c0",
+            "  #5  0xffffffffc0002378",
+        ]);
+        assert!(backtrace_names_the_fault(&l).is_ok());
+    }
+
+    #[test]
+    fn backtrace_names_the_fault_rejects_a_missing_elr() {
+        let l = lines(&[
+            "unexpected exception EL1h sync: ... ELR=0xffffffffc00017c0 FAR=0x0",
+            "backtrace (look up: ...):",
+            "  #0  0xffffffffc0001204",
+            "  #1  0xffffffffc0002438",
+        ]);
+        assert!(backtrace_names_the_fault(&l).is_err());
+    }
+
+    #[test]
+    fn backtrace_names_the_fault_rejects_the_elr_as_the_last_frame() {
+        let l = lines(&[
+            "unexpected exception EL1h sync: ... ELR=0xffffffffc00017c0 FAR=0x0",
+            "backtrace (look up: ...):",
+            "  #0  0xffffffffc0001204",
+            "  #4  0xffffffffc00017c0",
+        ]);
+        assert!(backtrace_names_the_fault(&l).is_err());
     }
 
     #[test]

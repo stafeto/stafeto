@@ -9,3 +9,6 @@ description = "Hardware-independent kernel logic of stafeto, tested on the host"
 
 [lib]
 bench = false
+
+[dependencies]
+abi = { path = "../lib/abi" }

@@ -12,8 +12,8 @@
 //   TTBR1 L0[511] -> L1[511] -> kernel image at 0xFFFF_FFFF_C000_0000
 //   TTBR0         -> identity map of the kernel's GiB, used only while the MMU
 //                    is being switched on, then replaced by an empty table
-// The image blocks are writable and executable at once; milestone 2 replaces
-// them with 4 KiB pages that keep W^X.
+// The image blocks are writable and executable at once; mm::kmap replaces
+// them with 4 KiB pages that keep W^X once the frame allocator works.
 
 .equ MAIR_VALUE,     0x4404FF            // Attr0 normal WB, Attr1 Device-nGnRE, Attr2 normal non-cacheable
 .equ TCR_BASE,       0xB5103510          // T0SZ=T1SZ=16, TG0=4K (0b00), TG1=4K (0b10), WBWA walks, inner shareable
@@ -36,7 +36,7 @@ _head:
     b       primary_entry           // code0
     .long   0                       // code1
     .quad   0                       // text_offset
-    .quad   __image_size            // image_size: file plus .bss and boot page tables
+    .quad   __image_size            // image_size: file plus .bss, the stack guard page, the boot stack and the boot page tables
     .quad   0xa                     // flags: little endian, 4 KiB pages, place anywhere
     .quad   0                       // res2
     .quad   0                       // res3
@@ -211,6 +211,7 @@ upper_half:
     b       7b
 8:  mov     x0, x19
     mov     x1, x20
+    mov     x29, xzr                // the frame-record chain ends here
     bl      kernel_main
 
 park:
@@ -225,11 +226,18 @@ l0_high:        .skip 4096
 l1_linear:      .skip 4096
 l1_image:       .skip 4096
 l2_image:       .skip 4096
+.global l0_identity, boot_empty_l0
 l0_identity:    .skip 4096
 l1_identity:    .skip 4096
 boot_empty_l0:  .skip 4096
 
-.section .bss.boot_stack, "aw", %nobits
-.balign 16
+// The boot stack, the kernel stack of CPU 0, in its own page-aligned
+// section: the linker script leaves an unmapped guard page below it. A
+// stack overflow faults on that page, but exception entry shares this
+// stack and pushes its own trap frame lower still, so the report may have
+// no usable call stack; see kernel.ld.
+.section .boot_stack, "aw", %nobits
+.balign 4096
+.global boot_stack, boot_stack_top
 boot_stack:     .skip 65536
 boot_stack_top:

@@ -17,3 +17,4 @@ kcore = { path = "../kcore" }
 
 [features]
 ktest = []
+fault-probe = []

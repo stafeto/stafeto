@@ -81,6 +81,8 @@ impl<const N: usize> Default for RegionList<N> {
 pub struct BootInfo {
     pub memory: RegionList<8>,
     pub reserved: RegionList<16>,
+    /// Reserved regions marked `no-map`: never allocated and never mapped.
+    pub no_map: RegionList<8>,
     pub initrd: Option<Region>,
     pub uart_pl011: Option<Region>,
     pub gic_distributor: Option<Region>,
@@ -112,6 +114,7 @@ struct Node<'a> {
     method: &'a [u8],
     initrd_start: Option<u64>,
     initrd_end: Option<u64>,
+    no_map: bool,
 }
 
 impl<'a> Node<'a> {
@@ -126,6 +129,7 @@ impl<'a> Node<'a> {
             method: &[],
             initrd_start: None,
             initrd_end: None,
+            no_map: false,
         }
     }
 
@@ -208,6 +212,7 @@ impl Iterator for RegIter<'_> {
 
 fn classify(
     node: &Node<'_>,
+    parent: &str,
     depth: usize,
     cells: Cells,
     info: &mut BootInfo,
@@ -216,6 +221,15 @@ fn classify(
     if node.device_type == b"memory\0" || (top && node.named("memory")) {
         for r in RegIter::new(node.reg, cells)? {
             info.memory.push(r?)?;
+        }
+    }
+    if depth == 3 && parent == "reserved-memory" {
+        for r in RegIter::new(node.reg, cells)? {
+            let r = r?;
+            info.reserved.push(r)?;
+            if node.no_map {
+                info.no_map.push(r)?;
+            }
         }
     }
     if top && node.name == "chosen" {
@@ -256,6 +270,7 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
     let mut info = BootInfo {
         memory: RegionList::new(),
         reserved: RegionList::new(),
+        no_map: RegionList::new(),
         initrd: None,
         uart_pl011: None,
         gic_distributor: None,
@@ -286,16 +301,17 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
                     "method" => node.method = value,
                     "linux,initrd-start" => node.initrd_start = number(value),
                     "linux,initrd-end" => node.initrd_end = number(value),
+                    "no-map" => node.no_map = true,
                     _ => {}
                 }
             }
             Event::EndNode => {
-                let cells = if depth >= 2 {
-                    stack[depth - 1].child_cells
+                let (cells, parent) = if depth >= 2 {
+                    (stack[depth - 1].child_cells, stack[depth - 1].name)
                 } else {
-                    DEFAULT_CELLS
+                    (DEFAULT_CELLS, "")
                 };
-                if let Err(e) = classify(&stack[depth], depth, cells, &mut info) {
+                if let Err(e) = classify(&stack[depth], parent, depth, cells, &mut info) {
                     failure = Some(e);
                 }
                 depth -= 1;
@@ -390,6 +406,24 @@ mod tests {
         let mut list = RegionList::<1>::new();
         assert!(list.push(region(1, 1)).is_ok());
         assert_eq!(list.push(region(2, 2)), Err(BootInfoError::TooManyRegions));
+    }
+
+    #[test]
+    fn reserved_memory_children_are_reserved_and_no_map_is_noted() {
+        let i = info(A64).unwrap();
+        assert_eq!(
+            i.reserved.as_slice(),
+            [
+                region(0x4000_0000, 0x8_0000),
+                region(0x7e00_0000, 0x100_0000)
+            ]
+        );
+        assert_eq!(i.no_map.as_slice(), [region(0x4000_0000, 0x8_0000)]);
+    }
+
+    #[test]
+    fn virt_has_no_no_map_regions() {
+        assert!(info(VIRT).unwrap().no_map.as_slice().is_empty());
     }
 
     #[test]

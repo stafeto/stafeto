@@ -2,14 +2,16 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 //
 // Exception vectors: 16 entries of 0x80 bytes in a 2 KiB aligned table.
-// Every entry saves a full trap frame on the current stack and calls
-// handle_exception(frame, index). Milestone 1 expects only kernel-mode
-// exceptions; milestone 2 moves EL0 entries to per-thread register areas.
+// Every entry saves a full trap frame on the current stack, adds a frame
+// record that links the interrupted code into backtraces and calls
+// handle_exception(frame, index). Milestone 1.2b moves EL0 entries to
+// per-thread register areas.
 
-.equ FRAME_SIZE, 272                    // x0-x30, sp_el0, elr_el1, spsr_el1
+.equ FRAME_SIZE, 288                    // x0-x30, sp_el0, elr_el1, spsr_el1, frame record
+.equ FRAME_RECORD, 272                  // offset of the frame record in the trap frame
 
 .macro VECTOR index
-    .balign 0x80
+    .org    exception_vectors + \index * 0x80   // fails to assemble if a slot overflows
     sub     sp, sp, #FRAME_SIZE
     stp     x0, x1, [sp]
     mov     x0, #\index
@@ -57,6 +59,11 @@ exception_common:
     mrs     x22, elr_el1
     mrs     x23, spsr_el1
     stp     x22, x23, [sp, #(16 * 16)]
+    // Frame record {interrupted x29, ELR + 4}: the backtrace prints each
+    // return address minus 4, so the interrupted instruction itself shows.
+    add     x24, x22, #4
+    stp     x29, x24, [sp, #FRAME_RECORD]
+    add     x29, sp, #FRAME_RECORD
     mov     x1, x0                      // vector index
     mov     x0, sp                      // &mut TrapFrame
     bl      handle_exception

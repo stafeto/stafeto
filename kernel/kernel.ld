@@ -22,11 +22,13 @@ SECTIONS
     }
 
     . = ALIGN(4096);
+    __text_end = .;
     .rodata : AT(ADDR(.rodata) - KOFF) {
         *(.rodata .rodata.*)
     }
 
     . = ALIGN(4096);
+    __rodata_end = .;
     .data : AT(ADDR(.data) - KOFF) {
         *(.data .data.*)
         *(.got .got.*)
@@ -39,6 +41,19 @@ SECTIONS
         *(COMMON)
         . = ALIGN(16);
         __bss_end = .;
+    }
+
+    /* One page that the kernel page tables leave unmapped: a stack overflow
+     * faults here first. Exception entry then pushes its own trap frame
+     * below the already-overflowed SP, past this page, so the fault is
+     * caught but its report has no usable call stack; milestone 1.2b adds
+     * a dedicated stack for exception entry. */
+    . = ALIGN(4096);
+    __stack_guard = .;
+    . += 4096;
+
+    .boot_stack (NOLOAD) : AT(ADDR(.boot_stack) - KOFF) {
+        *(.boot_stack)
     }
 
     . = ALIGN(4096);

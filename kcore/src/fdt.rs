@@ -6,7 +6,8 @@
 //! bounds checked, so a malformed blob yields an error instead of a fault.
 
 const MAGIC: u32 = 0xd00d_feed;
-const HEADER_SIZE: usize = 40;
+/// Size of the FDT header; enough to learn the size of the whole blob.
+pub const HEADER_SIZE: usize = 40;
 const TOKEN_BEGIN_NODE: u32 = 1;
 const TOKEN_END_NODE: u32 = 2;
 const TOKEN_PROP: u32 = 3;
@@ -69,6 +70,18 @@ fn align4(x: usize) -> usize {
     (x + 3) & !3
 }
 
+/// Size of the whole blob, read from its header alone.
+pub fn total_size_from_header(header: &[u8]) -> Result<usize, FdtError> {
+    if be32(header, 0)? != MAGIC {
+        return Err(FdtError::BadMagic);
+    }
+    let total = be32(header, 4)? as usize;
+    if total < HEADER_SIZE {
+        return Err(FdtError::Truncated);
+    }
+    Ok(total)
+}
+
 impl<'a> Fdt<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self, FdtError> {
         if be32(data, 0)? != MAGIC {
@@ -114,10 +127,7 @@ impl<'a> Fdt<'a> {
     pub unsafe fn from_ptr(ptr: *const u8) -> Result<Fdt<'static>, FdtError> {
         // SAFETY: the caller guarantees the header is readable.
         let header = unsafe { core::slice::from_raw_parts(ptr, HEADER_SIZE) };
-        if be32(header, 0)? != MAGIC {
-            return Err(FdtError::BadMagic);
-        }
-        let total = be32(header, 4)? as usize;
+        let total = total_size_from_header(header)?;
         // SAFETY: the caller guarantees `totalsize` bytes are readable.
         Fdt::new(unsafe { core::slice::from_raw_parts(ptr, total) })
     }
@@ -360,6 +370,22 @@ mod tests {
         blob[nameoff..nameoff + 4].copy_from_slice(&0xFFFF_FF00u32.to_be_bytes());
         let fdt = Fdt::new(&blob).unwrap();
         assert_eq!(fdt.walk(|_| {}), Err(FdtError::BadString));
+    }
+
+    #[test]
+    fn total_size_from_header_reads_the_whole_size() {
+        assert_eq!(total_size_from_header(&VIRT[..HEADER_SIZE]), Ok(VIRT.len()));
+    }
+
+    #[test]
+    fn total_size_from_header_rejects_bad_magic_short_input_and_tiny_totals() {
+        let mut bad = VIRT[..HEADER_SIZE].to_vec();
+        bad[0] ^= 0xff;
+        assert_eq!(total_size_from_header(&bad), Err(FdtError::BadMagic));
+        assert_eq!(total_size_from_header(&VIRT[..6]), Err(FdtError::Truncated));
+        let mut tiny = VIRT[..HEADER_SIZE].to_vec();
+        tiny[4..8].copy_from_slice(&39u32.to_be_bytes());
+        assert_eq!(total_size_from_header(&tiny), Err(FdtError::Truncated));
     }
 
     #[test]
