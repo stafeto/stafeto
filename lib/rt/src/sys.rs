@@ -112,20 +112,41 @@ pub fn handle_label(
     Ok(returned(&x))
 }
 
-/// process_create with no exit channel and no start channel, the only kind
-/// before channels come: a process with an empty address space, a memory
-/// quota of `quota` bytes (whole pages, counted from milestone 1.3), room
-/// for `handle_limit` handles and priority ceiling `ceiling`. Entry 0 of
-/// its table is a stub, so abi::START_CHANNEL is bad there for good. The
-/// handle carries DUPLICATE, TRANSFER and MANAGE.
+/// process_create with no exit channel and no start channel: a process
+/// with an empty address space, a memory quota of `quota` bytes (whole
+/// pages, counted from milestone 1.3), room for `handle_limit` handles and
+/// priority ceiling `ceiling`. Entry 0 of its table is a stub, so
+/// abi::START_CHANNEL is bad there for good. The handle carries
+/// DUPLICATE, TRANSFER and MANAGE.
 pub fn process_create(
     quota: u64,
     handle_limit: u32,
     ceiling: u8,
 ) -> Result<Handle<Process>, Error> {
-    let args = [quota, handle_limit.into(), ceiling.into(), 0, 0];
-    let x = call::<{ Call::ProcessCreate.number() }>(&args)?;
-    Ok(returned(&x))
+    process_create_with(quota, handle_limit, ceiling, None, None).map_err(|(e, _)| e)
+}
+
+/// process_create with channels (spec 7.9, 13.3). `exit`, a channel handle
+/// with NOTIFY and a priority (1-63, no higher than the caller's
+/// ceiling), hears of the child's end once the child gave its quota back:
+/// a notification of that priority, bit 0, with the label of the handle.
+/// `start`, a channel handle with TRANSFER, moves into the child's entry 0
+/// (abi::START_CHANNEL) with its rights, label and all; when the call
+/// fails it stays the caller's and comes back with the error.
+pub fn process_create_with(
+    quota: u64,
+    handle_limit: u32,
+    ceiling: u8,
+    exit: Option<(&Handle<Channel>, u8)>,
+    start: Option<Handle<Channel>>,
+) -> Result<Handle<Process>, (Error, Option<Handle<Channel>>)> {
+    let (x3, x4) = exit.map_or((0, 0), |(c, priority)| (c.raw().0, priority.into()));
+    let x5 = start.as_ref().map_or(0, |c| c.raw().0);
+    let args = [quota, handle_limit.into(), ceiling.into(), x3, x4, x5];
+    match call::<{ Call::ProcessCreate.number() }>(&args) {
+        Ok(x) => Ok(returned(&x)),
+        Err(e) => Err((e, start)),
+    }
 }
 
 /// process_kill: the process ends, whatever its threads do; 0 for one that

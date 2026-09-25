@@ -277,52 +277,115 @@ fn receive(thread: NonNull<Thread>, a: &Args) {
 /// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
 /// the first two for milestone 1.3, so that the set never changes. The
 /// quota is whole pages, at least one; the limit 1-16384; the ceiling 1-63
-/// and no higher than the caller's (ACCESS_DENIED). Exit channels come
-/// later in milestone 1.3b: x3 is 0, and x4 with it; any other x3 is looked
-/// up and fails (BAD_HANDLE, WRONG_TYPE, a channel too until then). The
-/// start channel, a channel with TRANSFER, moves into entry 0 of the
-/// child's table (spec 13.3) from then on as well: x5 is 0, and any other
-/// value is looked up after x3 and fails the same way. Entry 0 then holds a stub that goes at
-/// once (process::reserve_start). The child is the caller's process's
-/// (spec 4): it ends when its parent does. Resources come last and in the
-/// order the call occupies them, a limit that needs no allocation first
-/// (spec 11): the caller's own table has room for the new handle
-/// (LIMIT_REACHED), then the quota comes off the caller's (spec 7.5), the
-/// child pays from it for its root table, the caller for a page of its
-/// pool of shells when the pool grows (spec 7.8), and the child for the
-/// page of its pool of blocks with the chunk of entry 0 (NO_MEMORY when
-/// either quota falls short): the least quota is 8 KiB. A full caller
-/// table fails before the child is built, so nothing is made and torn
-/// down for it. The quota comes back to the caller in full once the child
-/// and whatever holds its shell went; the page of shells stays the
-/// caller's.
+/// and no higher than the caller's (ACCESS_DENIED). x3, a channel handle
+/// with NOTIFY, with a label or none, or 0, hears of the child's end once
+/// the child gave its quota back (spec 7.9): a notification of priority
+/// x4, 1-63 and no higher than the caller's ceiling, exactly 0 without x3,
+/// bit 0, with the label of the handle; the child's teardown runs at x4 at
+/// least (spec 7.7). x5, a channel handle with TRANSFER or 0, moves into
+/// entry 0 of the child's table with its rights (spec 13.3): the child
+/// takes it first, and the caller's handle goes once the child is made;
+/// without x5 entry 0 holds a stub that goes at once
+/// (process::reserve_start). x3 and x5 may be one handle: the label is
+/// read before the move. The child is the caller's process's (spec 4): it
+/// ends when its parent does. The checks in the order of spec 11: the
+/// values; x3, then x5 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED); the
+/// ceilings; x3 on a channel that closed (PEER_CLOSED); then the resources
+/// in the order the call occupies them, a limit that needs no allocation
+/// first: the caller's own table has room for the new handle
+/// (LIMIT_REACHED), the channel of x3 a slot for the exit notification
+/// (LIMIT_REACHED, spec 6.5), then the quota comes off the caller's
+/// (spec 7.5), the child pays from it for its root table, the caller for a
+/// page of its pool of shells when the pool grows (spec 7.8), and the
+/// child for the page of its pool of blocks with the chunk of entry 0
+/// (NO_MEMORY when either quota falls short): the least quota is 8 KiB. A
+/// full caller table fails before the child is built, so nothing is made
+/// and torn down for it; a child that fails later goes again, hears of
+/// nothing and leaves x5 with the caller. The quota comes back to the
+/// caller in full once the child and whatever holds its shell went; the
+/// page of shells stays the caller's.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
-    let channel = a[3] != 0;
-    let notify = notify_priority_arg(a[4], channel)?;
-    // No object is taken as an exit channel or a start channel yet.
-    if channel {
-        lookup(thread, a[3], Rights::NOTIFY, |_| None::<()>)?;
-    }
-    if a[5] != 0 {
-        lookup(thread, a[5], Rights::TRANSFER, |_| None::<()>)?;
-    }
+    let notify = notify_priority_arg(a[4], a[3] != 0)?;
+    let exit = match a[3] {
+        0 => None,
+        h => Some(lookup(thread, h, Rights::NOTIFY, |o| {
+            Some((o.channel()?, o.session().map_or(0, session::label)))
+        })?),
+    };
+    let start = match a[5] {
+        0 => None,
+        h => {
+            // SAFETY: the calling thread holds its process.
+            let table = unsafe { caller(thread).as_ref() };
+            let (object, rights) = table
+                .lookup_with_rights(Handle(h), Rights::TRANSFER, |o| o.channel().map(|_| *o))?;
+            Some((Handle(h), object, rights))
+        }
+    };
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
+    if let Some((c, _)) = exit
+        && channel::is_closed(c)
+    {
+        return Err(Error::PeerClosed);
+    }
     // The caller's table first: it needs no allocation, and the call would
     // insert the child's handle there last (spec 11).
     process::handle_room(caller(thread))?;
+    if let Some((c, _)) = exit {
+        channel::add_source(c)?;
+    }
+    let made = new_child(thread, quota, limit, ceiling, start.map(|(_, o, r)| (o, r)));
+    match made {
+        Ok((child, _)) => {
+            if let Some((c, label)) = exit {
+                process::set_exit(child, c, label, notify);
+            }
+            if let Some((moved, _, _)) = start {
+                // The child holds the channel now; the caller's handle goes.
+                let closed = process::close_handle(caller(thread), moved, cause(thread));
+                assert!(closed.is_ok(), "the start channel's handle went on the way");
+            }
+            // SAFETY: the reference `create` handed out goes; the handle
+            // holds the child.
+            unsafe { process::release(child, cause(thread)) };
+        }
+        Err(_) => {
+            if let Some((c, _)) = exit {
+                channel::remove_source(c);
+            }
+        }
+    }
+    Ok(Values::new(&[made?.1.0]))
+}
+
+/// A child of the caller's process for process_create, with entry 0 of its
+/// table, the start channel `start` or a stub, and a handle to it in the
+/// caller's table; the reference `create` handed out comes along. A child
+/// that fails on the way goes again, and the caller keeps its handles.
+fn new_child(
+    thread: NonNull<Thread>,
+    quota: u64,
+    limit: u32,
+    ceiling: u8,
+    start: Option<(Object, Rights)>,
+) -> Result<(NonNull<Process>, Handle), Error> {
     let child = process::create_child(caller(thread), quota, limit, ceiling)?;
-    let h = process::reserve_start(child).and_then(|()| {
-        process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
-    });
-    // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the child.
-    unsafe { process::release(child, cause(thread)) };
-    Ok(Values::new(&[h?.0]))
+    match start {
+        Some((object, rights)) => process::move_start(child, object, rights),
+        None => process::reserve_start(child),
+    }
+    .and_then(|()| process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS))
+    .map(|h| (child, h))
+    .inspect_err(|_| {
+        // SAFETY: the reference `create` handed out goes, and nothing else
+        // holds the child, which goes again.
+        unsafe { process::release(child, cause(thread)) }
+    })
 }
 
 /// process_kill(x0 process with MANAGE): the process ends, reason

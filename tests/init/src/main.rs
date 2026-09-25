@@ -13,10 +13,11 @@
 //! priority the kernel gave init; the others with init at TEST_PRIORITY.
 //! A thread above it runs at once; threads below it run when init lowers
 //! itself to 1 (`let_run`), and init runs again once they all have ended
-//! or wait: the order of priorities joins threads. Notifications that init
-//! takes in its own thread have priority 1 (QUIET), and init asks once
-//! more afterwards: their boost never lifts init above its threads (spec
-//! 6.6).
+//! or wait: the order of priorities joins threads. Init hears of the end
+//! of a child through the child's exit channel (`wait_exit`, spec 7.9).
+//! Notifications that init takes in its own thread have priority 1
+//! (QUIET), and init asks once more afterwards: their boost never lifts
+//! init above its threads (spec 6.6).
 
 #![no_std]
 #![no_main]
@@ -36,7 +37,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 39] = [
+const TESTS: [Test; 48] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -145,6 +146,36 @@ const TESTS: [Test; 39] = [
     ),
     ("slot_limit_is_1024", slot_limit_is_1024),
     (
+        "exit_notice_comes_after_the_quota",
+        exit_notice_comes_after_the_quota,
+    ),
+    (
+        "exit_notice_carries_the_label",
+        exit_notice_carries_the_label,
+    ),
+    ("exit_channel_needs_notify", exit_channel_needs_notify),
+    (
+        "exit_priority_under_the_ceiling",
+        exit_priority_under_the_ceiling,
+    ),
+    (
+        "failed_create_keeps_the_start_handle",
+        failed_create_keeps_the_start_handle,
+    ),
+    (
+        "start_channel_moves_into_the_child",
+        start_channel_moves_into_the_child,
+    ),
+    ("start_channel_needs_transfer", start_channel_needs_transfer),
+    (
+        "start_handle_must_be_a_channel",
+        start_handle_must_be_a_channel,
+    ),
+    (
+        "client_gone_when_the_child_dies",
+        client_gone_when_the_child_dies,
+    ),
+    (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
     ),
@@ -174,6 +205,9 @@ const LEAST_QUOTA: u64 = 8 * 1024;
 const CYCLES: u32 = 1000;
 /// Threads of init's own process a test may have at a time.
 const SLOTS: usize = 2;
+/// The label of the copy of a test's exit channel that names its
+/// children (process_create x3).
+const CHILD: u64 = 0xC41D;
 
 static STACKS: [Stack<STACK_SIZE>; SLOTS] = [const { Stack::new() }; SLOTS];
 
@@ -793,16 +827,22 @@ extern "C" fn spin_then_yield(ticks: u64) -> ! {
 
 /// Spec 15.2 (faults): a child with no code gets a thread above init whose
 /// entry maps nothing. The thread runs at once and faults, which ends the
-/// child; object_info tells init why, and the kernel prints the fault,
-/// which xtask reads whole.
+/// child; init hears of the end on the child's exit channel (spec 7.9),
+/// object_info tells it why, and the kernel prints the fault, which xtask
+/// reads whole.
 fn child_fault_reason_reaches_the_parent() -> Outcome {
-    let c = child(HIGH)?;
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, HIGH)?;
     let t = child_thread(&c, HIGH).map_err(|_| "thread_create in the child failed")?;
     let started = sys::thread_start(&t);
+    let heard = wait_exit(&exits, CHILD);
     let state = sys::process_state(&c);
     close(t)?;
     close(c)?;
+    close(exits)?;
+    close(name)?;
     check(started.is_ok(), "thread_start failed")?;
+    heard?;
     let fault = ProcessState::Fault {
         esr: CHILD_FAULT_ESR,
         far: CHILD_ENTRY,
@@ -982,21 +1022,30 @@ fn kernel_stats_need_kstats() -> Outcome {
 
 /// Init at TEST_PRIORITY kills a child with a thread: the cleanup runs at
 /// init's level before the call returns (spec 7.7), so right afterwards
-/// the queue is empty and the child gave back all but the pages of its
-/// pools of threads and blocks, which go with its shell (spec 7.8): the
-/// shell of its thread, which init's handle keeps, lies in one of them.
+/// the queue is empty, the exit notification is there (spec 7.9), and the
+/// child gave back all but the pages of its pools of threads and blocks,
+/// which go with its shell (spec 7.8): the shell of its thread, which
+/// init's handle keeps, lies in one of them.
 fn process_kill_returns_after_the_teardown() -> Outcome {
-    let c = child(LOW)?;
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, LOW)?;
     let t = child_thread(&c, LOW);
     let killed = sys::process_kill(&c);
     let stats = sys::kernel_stats(&init::RESOURCE);
     let memory = sys::process_memory(&c);
+    let heard = take_one(&exits);
     let made = t.is_ok() && killed.is_ok();
     close(c)?;
     if let Ok(t) = t {
         close(t)?;
     }
+    close(exits)?;
+    close(name)?;
     check(made, "thread_create or process_kill failed")?;
+    check(
+        heard == Ok(exit_notice(CHILD)),
+        "the exit notification was not there when process_kill returned",
+    )?;
     check(
         stats.is_ok_and(|s| s.cleanup_queue == 0),
         "the cleanup queue was not empty when process_kill returned",
@@ -1057,17 +1106,26 @@ fn child_quota_comes_back() -> Outcome {
     )
 }
 
-/// CYCLES rounds of a child with a ready thread, killed and closed, leave
-/// init's used memory, the free frames and the pages of kernel pools as
-/// they were, exactly (spec 7.5, 7.8): each child gives back every frame
-/// it took and the pages of its pools with its shell, and the kill takes
-/// the kernel's reference to the thread along. One round runs first: the
-/// page of init's pool of shells that it takes stays init's.
+/// CYCLES rounds of a child with a ready thread, killed and closed, and
+/// of its exit notification leave init's used memory, the free frames and
+/// the pages of kernel pools as they were, exactly (spec 7.5, 7.8): each
+/// child gives back every frame it took and the pages of its pools with
+/// its shell, which goes once init took the notification, and the kill
+/// takes the kernel's reference to the thread along. One round runs
+/// first: the page of init's pool of shells that it takes stays init's.
 fn create_kill_cycles_leak_nothing() -> Outcome {
-    cycle()?;
+    let (exits, name) = exit_channel()?;
+    let result = cycles(&exits, &name);
+    close(exits)?;
+    close(name)?;
+    result
+}
+
+fn cycles(exits: &Handle<Channel>, name: &Handle<Channel>) -> Outcome {
+    cycle(exits, name)?;
     let before = counts()?;
     for _ in 0..CYCLES {
-        cycle()?;
+        cycle(exits, name)?;
     }
     let after = counts()?;
     check(
@@ -1078,10 +1136,11 @@ fn create_kill_cycles_leak_nothing() -> Outcome {
     check(after.2 == before.2, "the pools took pages over the rounds")
 }
 
-/// A child with a started thread that init kills and forgets. The thread
-/// is ready below init and never runs: the kill takes it off the queue.
-fn cycle() -> Outcome {
-    let c = child(LOW)?;
+/// A child with a started thread that init kills and forgets, and whose
+/// exit notification init takes. The thread is ready below init and never
+/// runs: the kill takes it off the queue.
+fn cycle(exits: &Handle<Channel>, name: &Handle<Channel>) -> Outcome {
+    let c = heard_child(name, QUIET, LOW)?;
     let t = child_thread(&c, LOW);
     let started = t.as_ref().map_err(|&e| e).and_then(sys::thread_start);
     let killed = sys::process_kill(&c);
@@ -1092,7 +1151,8 @@ fn cycle() -> Outcome {
     check(
         started.is_ok() && killed.is_ok(),
         "a round of create and kill failed",
-    )
+    )?;
+    wait_exit(exits, CHILD)
 }
 
 /// Init's used memory, the free frames and the pages of kernel pools.
@@ -1683,9 +1743,11 @@ fn notify_after_close_is_peer_closed() -> Outcome {
 /// Spec 15.2 (notifications): a channel has abi::MAX_SLOTS slots, its slot
 /// of label 0 among them (spec 6.5). Init makes 1023 sessions and closes
 /// each at once, and CLIENT_GONE keeps each in the channel's queue. The
-/// next label fails with LIMIT_REACHED and changes x0 alone. Once receive
-/// took the first CLIENT_GONE, that session went, and a new label fits.
-/// Every session leaves with CLIENT_GONE, in the order they left.
+/// next label fails with LIMIT_REACHED and changes x0 alone, and so does a
+/// child with the channel as its exit channel, even with a quota init has
+/// not: the slot comes before the quota (spec 11). Once receive took the
+/// first CLIENT_GONE, that session went, and a new label fits. Every
+/// session leaves with CLIENT_GONE, in the order they left.
 fn slot_limit_is_1024() -> Outcome {
     let c = channel(QUIET)?;
     let last = u64::from(abi::MAX_SLOTS) - 1;
@@ -1694,6 +1756,10 @@ fn slot_limit_is_1024() -> Outcome {
     }
     let x = duplicate_regs(c.raw(), Rights::NONE, last + 1, QUIET.into());
     let after = raw_duplicate(x);
+    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let mut y = create_regs(c.raw(), QUIET.into(), abi::Handle::INVALID);
+    y[0] = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
+    let exit = raw_create(y);
     let first = sys::try_receive(&c);
     let again = sys::handle_label(&c, Rights::NONE, last + 1, QUIET);
     let remade = again.is_ok();
@@ -1709,6 +1775,10 @@ fn slot_limit_is_1024() -> Outcome {
         "a session past 1023 and the slot of label 0 was made",
     )?;
     check(
+        failed(exit, y, Error::LimitReached),
+        "an exit channel with no slot left did not fail with LIMIT_REACHED before the quota",
+    )?;
+    check(
         first == Ok(labelled(1, CLIENT_GONE, 1)),
         "the first session did not leave with CLIENT_GONE",
     )?;
@@ -1716,5 +1786,390 @@ fn slot_limit_is_1024() -> Outcome {
     check(
         order && rest == Err(Error::WouldBlock),
         "the sessions did not leave with CLIENT_GONE in their order",
+    )
+}
+
+/// A test's exit channel, at QUIET, and a copy of it with NOTIFY and the
+/// label CHILD that names the test's children as their x3. Closing the
+/// channel first lets the copy's session go without CLIENT_GONE.
+fn exit_channel() -> Result<(Handle<Channel>, Handle<Channel>), &'static str> {
+    let exits = channel(QUIET)?;
+    let name = session(&exits, Rights::NOTIFY, CHILD, QUIET)?;
+    Ok((exits, name))
+}
+
+/// A child with no code like `child`, whose end the channel of `name`
+/// hears of at `priority` (process_create x3, x4; spec 7.9).
+fn heard_child(
+    name: &Handle<Channel>,
+    priority: u8,
+    ceiling: u8,
+) -> Result<Handle<Process>, &'static str> {
+    sys::process_create_with(CHILD_QUOTA, 16, ceiling, Some((name, priority)), None)
+        .map_err(|_| "process_create with an exit channel failed")
+}
+
+/// The exit notification of a child whose exit channel carried `label`:
+/// bit 0, once (spec 7.9).
+fn exit_notice(label: u64) -> Received {
+    Received::Notification {
+        source: Source::Exit,
+        label,
+        bits: 1,
+        count: 1,
+    }
+}
+
+/// Waits in receive on `exits` for the exit notification of the child
+/// whose exit channel carried `label` (spec 7.9); then a receive without
+/// waiting ends its boost and finds nothing more.
+fn wait_exit(exits: &Handle<Channel>, label: u64) -> Outcome {
+    let got = sys::receive(exits);
+    let rest = sys::try_receive(exits);
+    check(
+        got == Ok(exit_notice(label)),
+        "the exit notification did not come with the child's label",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "something came after the exit notification",
+    )
+}
+
+/// x0-x9 for process_create of a child with CHILD_QUOTA, 16 handles and
+/// ceiling LOW, and `x3`, `x4` and `x5`, the rest marked.
+fn create_regs(x3: abi::Handle, x4: u64, x5: abi::Handle) -> Regs {
+    let mut x = marked();
+    x[..6].copy_from_slice(&[CHILD_QUOTA, 16, LOW.into(), x3.0, x4, x5.0]);
+    x
+}
+
+/// process_create with raw registers.
+fn raw_create(x: Regs) -> Regs {
+    // SAFETY: process_create only reads its registers.
+    unsafe { sys::raw::<{ Call::ProcessCreate.number() }>(x) }
+}
+
+/// The call failed with `error` and changed x0 alone.
+fn failed(after: Regs, x: Regs, error: Error) -> bool {
+    after[0] == error.code() && after[1..] == x[1..]
+}
+
+/// Spec 7.9: the parent hears of a child's end once the child gave back
+/// the free part of its quota. A thread of init above init waits on the
+/// exit channel; init kills the child, whose teardown runs at init's
+/// level, and the notification wakes the thread in the middle of it:
+/// PROCESS_MEMORY of the child shows then that the child returned its
+/// quota but what it still uses.
+fn exit_notice_comes_after_the_quota() -> Outcome {
+    reset_marks();
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, LOW)?;
+    MARKS[1].store(c.raw().0, Relaxed);
+    let w = spawn(0, watch_exit, exits.raw().0, HIGH, Policy::Fifo)?;
+    let killed = sys::process_kill(&c);
+    let (heard, returned, free) = (mark(0), mark(2), mark(3));
+    close(w)?;
+    close(c)?;
+    close(exits)?;
+    close(name)?;
+    check(killed.is_ok(), "process_kill failed")?;
+    check(
+        heard == 1,
+        "the waiting thread did not get the exit notification",
+    )?;
+    check(
+        returned > 0 && returned == free,
+        "the exit notification came before the child's quota went back",
+    )
+}
+
+/// A thread of init that waits in receive on the channel `h` for the exit
+/// notification of the child whose handle mark 1 holds and reads the
+/// child's memory at once: 1 in mark 0 when the notification came, what
+/// the child returned in mark 2 and its quota but what it uses in mark 3.
+/// Ends afterwards.
+extern "C" fn watch_exit(h: u64) -> ! {
+    let exits = Handle::<Channel>::from_raw(abi::Handle(h));
+    let got = sys::receive(&exits);
+    let child = Handle::<Process>::from_raw(abi::Handle(mark(1)));
+    if let Ok(m) = sys::process_memory(&child) {
+        MARKS[2].store(m.returned, Relaxed);
+        MARKS[3].store(m.quota - m.used, Relaxed);
+    }
+    MARKS[0].store(u64::from(got == Ok(exit_notice(CHILD))), Relaxed);
+    sys::thread_exit()
+}
+
+/// The exit notification carries the label of the handle process_create
+/// took as x3 (spec 7.9): a copy with a label gives it, the channel's
+/// handle with none gives 0; the source is «exit», bit 0, count 1.
+fn exit_notice_carries_the_label() -> Outcome {
+    let (exits, name) = exit_channel()?;
+    let labelled = heard_child(&name, QUIET, LOW)?;
+    let plain = heard_child(&exits, QUIET, LOW)?;
+    let killed = [sys::process_kill(&labelled), sys::process_kill(&plain)];
+    let first = sys::try_receive(&exits);
+    let second = take_one(&exits);
+    close(labelled)?;
+    close(plain)?;
+    close(exits)?;
+    close(name)?;
+    check(killed.iter().all(Result::is_ok), "process_kill failed")?;
+    check(
+        first == Ok(exit_notice(CHILD)),
+        "the exit notification did not carry the label of x3",
+    )?;
+    check(
+        second == Ok(exit_notice(0)),
+        "the exit notification through a handle with no label did not carry 0",
+    )
+}
+
+/// x3 of process_create is a channel with NOTIFY (spec 11, 13.3): a copy
+/// without NOTIFY fails with ACCESS_DENIED, a process with WRONG_TYPE, a
+/// closed handle with BAD_HANDLE, a channel that closed with PEER_CLOSED;
+/// each changes x0 alone, and no child is made.
+fn exit_channel_needs_notify() -> Outcome {
+    let c = channel(QUIET)?;
+    let receive_only = copy(&c, Rights::RECEIVE)?;
+    let shut = channel(QUIET)?;
+    let left = copy(&shut, Rights::NOTIFY)?;
+    let gone = shut.raw();
+    close(shut)?;
+    let before = sys::process_handles(&init::PROCESS);
+    let refused = [
+        (receive_only.raw(), Error::AccessDenied),
+        (init::PROCESS.raw(), Error::WrongType),
+        (gone, Error::BadHandle),
+        (left.raw(), Error::PeerClosed),
+    ]
+    .map(|(h, error)| {
+        let x = create_regs(h, QUIET.into(), abi::Handle::INVALID);
+        failed(raw_create(x), x, error)
+    });
+    let after = sys::process_handles(&init::PROCESS);
+    close(receive_only)?;
+    close(left)?;
+    close(c)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "x3 that is no open channel with NOTIFY did not fail alone",
+    )?;
+    check(
+        before.is_ok() && after == before,
+        "a child of a call that failed has a handle",
+    )
+}
+
+/// x4 of process_create, the priority of the exit notification (spec 7.9,
+/// 11): 1-63 with an exit channel, 63, init's ceiling, included, and
+/// exactly 0 without one; anything else fails with INVALID_ARGS and
+/// changes x0 alone. A receiver at LOW waits on the exit channel; the
+/// end of a child that init kills comes at NOTICE and wakes it above init
+/// before process_kill returns. ACCESS_DENIED above the caller's ceiling
+/// is a kernel test: init's ceiling is the highest level.
+fn exit_priority_under_the_ceiling() -> Outcome {
+    let (c, r) = waiting_receiver(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let n = name.raw();
+    let refused = [
+        (n, 0),
+        (abi::Handle::INVALID, u64::from(QUIET)),
+        (n, abi::PRIORITY_LEVELS.into()),
+        (n, 0x100 | u64::from(QUIET)),
+    ]
+    .map(|(x3, x4)| {
+        let x = create_regs(x3, x4, abi::Handle::INVALID);
+        failed(raw_create(x), x, Error::InvalidArgs)
+    });
+    let top = heard_child(&name, abi::PRIORITY_LEVELS - 1, LOW);
+    let heard = heard_child(&name, NOTICE, LOW)?;
+    let waited = mark(0);
+    let killed = sys::process_kill(&heard);
+    let ran = mark(0);
+    let_run()?;
+    close(r)?;
+    close(c)?;
+    close(heard)?;
+    let highest = top.is_ok();
+    if let Ok(top) = top {
+        close(top)?;
+    }
+    close(name)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "a priority outside 1-63 with x3, or one without x3, was taken",
+    )?;
+    check(
+        highest,
+        "the exit priority 63 under init's ceiling was refused",
+    )?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        killed.is_ok() && ran == 1,
+        "the receiver did not run at the exit notification's priority before process_kill returned",
+    )
+}
+
+/// A child that fails leaves the start channel with init (spec 13.3): a
+/// quota of a page falls short at entry 0 of the child's table, NO_MEMORY,
+/// and x0 alone changes; the handle x5 named still works, and init has its
+/// quota back. The exit channel of the failed call gets its slot back: the
+/// channel goes afterwards with no source left.
+fn failed_create_keeps_the_start_handle() -> Outcome {
+    let c = channel(QUIET)?;
+    let exit = copy(&c, Rights::NOTIFY)?;
+    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let before = used();
+    let mut x = create_regs(exit.raw(), QUIET.into(), c.raw());
+    x[0] = PAGE as u64;
+    let after = raw_create(x);
+    let back = used();
+    let posted = sys::notify(&c, 1);
+    let got = take_one(&c);
+    let kept = c.close();
+    // The channel goes now: it holds no source but its slot of label 0.
+    close(exit)?;
+    check(
+        failed(after, x, Error::NoMemory),
+        "a child with a quota of a page did not fail with NO_MEMORY alone",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)) && kept.is_ok(),
+        "init lost the start channel of a child that failed",
+    )?;
+    check(
+        before.is_ok() && back == before,
+        "a child that failed kept init's quota",
+    )
+}
+
+/// x5 of process_create moves a channel handle with TRANSFER into entry 0
+/// of the child's table (spec 13.3): init's handle is gone (BAD_HANDLE),
+/// the child's table holds one live handle, and the channel lives on with
+/// it, since it carried RECEIVE: a copy of init with NOTIFY notifies. The
+/// child's end lets that handle go, and the channel closes: notify then
+/// fails with PEER_CLOSED. The child's exit channel closes before its end
+/// with nothing queued; the notification is lost, and the child's shell
+/// goes once init closes its handle.
+fn start_channel_moves_into_the_child() -> Outcome {
+    let c = channel(QUIET)?;
+    let n = copy(&c, Rights::NOTIFY)?;
+    let (exits, name) = exit_channel()?;
+    let moved = c.raw();
+    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let before = used();
+    let made = sys::process_create_with(CHILD_QUOTA, 16, LOW, Some((&name, QUIET)), Some(c));
+    let Ok(child) = made else {
+        close(n)?;
+        close(exits)?;
+        close(name)?;
+        return Err("process_create with a start channel failed");
+    };
+    // The exit channel closes with nothing queued: the stage Close has
+    // nothing to take, and the exit notification finds it closed.
+    close(exits)?;
+    let gone = Handle::<Channel>::from_raw(moved).close();
+    let table = sys::process_handles(&child);
+    let open = sys::notify(&n, 1);
+    let killed = sys::process_kill(&child);
+    let shut = sys::notify(&n, 1);
+    close(child)?;
+    let back = used();
+    close(n)?;
+    close(name)?;
+    check(
+        before.is_ok() && back == before,
+        "the child's shell stayed after its exit notification met a closed channel",
+    )?;
+    check(gone == Err(Error::BadHandle), "init kept the start channel")?;
+    check(
+        table.is_ok_and(|t| t.live == 1),
+        "the child's table does not hold the start channel",
+    )?;
+    check(
+        open.is_ok() && killed.is_ok() && shut == Err(Error::PeerClosed),
+        "the channel did not live with the child's handle and close with it",
+    )
+}
+
+/// x5 needs TRANSFER (spec 11): a copy without it fails with ACCESS_DENIED
+/// and changes x0 alone, and the handle stays init's.
+fn start_channel_needs_transfer() -> Outcome {
+    let c = channel(QUIET)?;
+    let kept = copy(&c, Rights::NOTIFY | Rights::RECEIVE)?;
+    let x = create_regs(abi::Handle::INVALID, 0, kept.raw());
+    let after = raw_create(x);
+    let posted = sys::notify(&kept, 1);
+    let got = take_one(&kept);
+    close(kept)?;
+    close(c)?;
+    check(
+        failed(after, x, Error::AccessDenied),
+        "x5 without TRANSFER did not fail with ACCESS_DENIED alone",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)),
+        "the handle without TRANSFER did not stay init's",
+    )
+}
+
+/// x5 names a channel (spec 11, 13.3): a process fails with WRONG_TYPE, a
+/// closed handle with BAD_HANDLE, and x3 is looked at first.
+fn start_handle_must_be_a_channel() -> Outcome {
+    let c = channel(QUIET)?;
+    let gone = c.raw();
+    close(c)?;
+    let own = init::PROCESS.raw();
+    let refused = [
+        (abi::Handle::INVALID, 0, own, Error::WrongType),
+        (abi::Handle::INVALID, 0, gone, Error::BadHandle),
+        (gone, u64::from(QUIET), own, Error::BadHandle),
+    ]
+    .map(|(x3, x4, x5, error)| {
+        let x = create_regs(x3, x4, x5);
+        failed(raw_create(x), x, error)
+    });
+    check(
+        refused.iter().all(|&ok| ok),
+        "x5 that is no live channel did not fail alone, or came before x3",
+    )
+}
+
+/// Spec 15.2 (refusals): one handle, a copy with a label, NOTIFY and
+/// TRANSFER, is both x3 and x5 (spec 13.3): it moves into the child, and
+/// its label names the child's end. When init kills the child, the
+/// child's table lets the copy go, which posts CLIENT_GONE with the label
+/// (spec 5.3), and after the child's stage Quota the exit notification
+/// comes with the same label.
+fn client_gone_when_the_child_dies() -> Outcome {
+    let exits = channel(QUIET)?;
+    let name = session(&exits, Rights::NOTIFY | Rights::TRANSFER, CHILD, QUIET)?;
+    let x = create_regs(name.raw(), QUIET.into(), name.raw());
+    let after = raw_create(x);
+    let made = after[0] == 0 && after[2..] == x[2..];
+    let moved = name.close();
+    let child = Handle::<Process>::from_raw(abi::Handle(after[1]));
+    let killed = sys::process_kill(&child);
+    let got = [(); 3].map(|()| sys::try_receive(&exits));
+    if made {
+        close(child)?;
+    }
+    close(exits)?;
+    check(made, "process_create with one handle as x3 and x5 failed")?;
+    check(
+        moved == Err(Error::BadHandle),
+        "the copy did not move into the child",
+    )?;
+    check(
+        killed.is_ok()
+            && got
+                == [
+                    Ok(labelled(CHILD, CLIENT_GONE, 1)),
+                    Ok(exit_notice(CHILD)),
+                    Err(Error::WouldBlock),
+                ],
+        "the child's end did not post CLIENT_GONE and then the exit notification with the label",
     )
 }

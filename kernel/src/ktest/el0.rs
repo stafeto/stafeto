@@ -26,7 +26,7 @@ use crate::thread::{self, Policy, Thread};
 use crate::{sched, session};
 use abi::{
     Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, ProcessState,
-    Rights, Source,
+    Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
 use kcore::esr;
@@ -71,6 +71,7 @@ unsafe extern "C" {
     static el0_child_fault: u8;
     static el0_start_then_close: u8;
     static el0_receive: u8;
+    static el0_notify: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
     static el0_raise_then_notify: u8;
@@ -308,6 +309,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_descendants,
     },
     El0Test {
+        name: "child_notifies_through_its_start_channel",
+        start: start_start_channel,
+        done: done_start_channel,
+    },
+    El0Test {
         name: "kill_takes_a_waiting_thread_off_the_channel",
         start: start_kill_waiting,
         done: done_kill_waiting,
@@ -443,10 +449,12 @@ struct Fixture {
     /// Whether the test expects a fault at EL0, which then ends the
     /// faulting process as in a build without tests.
     faults: bool,
-    /// SP in the first test system call, and whether every later one had
-    /// the same, near the top of the kernel stack.
+    /// SP in the first test system call, and whether a later one had
+    /// another, or one far from the top of the kernel stack. The fixture
+    /// starts all zero, so FIXTURE lies in .bss and adds nothing to the
+    /// kernel image (spec 3.4).
     stack: Option<usize>,
-    stack_ok: bool,
+    stack_moved: bool,
     /// Timer interrupts taken at EL0, and whether one of them moved the
     /// thread past its wait loop.
     interrupts: u32,
@@ -496,7 +504,7 @@ impl Fixture {
             counter: 0,
             faults: false,
             stack: None,
-            stack_ok: true,
+            stack_moved: false,
             interrupts: 0,
             left_loop: false,
             exit_at_interrupt: None,
@@ -683,7 +691,7 @@ fn note_stack() {
     let top = symbols::boot_stack().end;
     let mut f = FIXTURE.lock();
     let first = *f.stack.get_or_insert(sp);
-    f.stack_ok &= sp == first && top - sp < PAGE;
+    f.stack_moved |= sp != first || top - sp >= PAGE;
 }
 
 /// The idle wait starts near the top of the kernel stack (the way out of
@@ -736,7 +744,7 @@ fn done(thread: NonNull<Thread>) -> ! {
         // SAFETY: the running thread is alive; nothing changes it meanwhile.
         let t = unsafe { thread.as_ref() };
         let result = check(
-            f.stack_ok,
+            !f.stack_moved,
             "an entry from EL0 did not start at the top of the kernel stack",
         )
         .and_then(|()| (test(f.test).done)(&f, t));
@@ -2221,13 +2229,26 @@ fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// priority as the cause. The stage Stop runs at C's ceiling and stops the
 /// grandchild's thread before it runs again: its count stays until the
 /// judge in slot 0 wakes above it three quanta after the start, and by
-/// then the teardown of both went to its end at the level of the cause.
+/// then the teardown of both went to its end at the level of the cause,
+/// and the exit notification of C, which its parent's channel hears of at
+/// that level (spec 7.9), waits for the judge's receive.
 fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
-    let judge = spawn(f, 0, &raw const el0_done_at_once, 0)?;
+    let judge = spawn(f, 0, &raw const el0_receive, 0)?;
     sched::set_priority(judge, PRIORITY + 10, FIFO).map_err(|_| "no judge")?;
     let parent = f.processes[0].expect("the judge's process");
-    let child = process::create_child(parent, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING)
-        .map_err(|_| "no child")?;
+    let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(parent, Object::Channel(c), Rights::RECEIVE);
+    let child = process::create_child(parent, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING);
+    let heard = child.and_then(|child| {
+        channel::add_source(c)?;
+        process::set_exit(child, c, EXIT_LABEL, PRIORITY - 5);
+        Ok(child)
+    });
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel, and so does the child's exit.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    set_args(judge, &[h?, NO_WAIT]);
+    let child = heard.map_err(|_| "no child")?;
     f.processes[2] = Some(child);
     let low = PRIORITY - 5;
     let t = thread::create(child, TEXT_VA, DATA_VA + PAGE, 0, low, FIFO)
@@ -2258,6 +2279,10 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         f.slot(t) == 0,
         "the grandchild's thread ran to its end after its parent ended",
+    )?;
+    check(
+        t.regs.x[0] == 0 && t.regs.x[1..12] == exit_notice(EXIT_LABEL),
+        "the child's exit notification did not wait in its parent's channel",
     )?;
     check(
         f.count_at_exit.is_some_and(|n| n > 0),
@@ -2328,6 +2353,70 @@ fn done_grandchild(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 // Channels (spec 6.1, 6.8, 7.7): threads that wait in receive.
+
+/// The label of the exit channel and of the start channel of the tests'
+/// children.
+const EXIT_LABEL: u64 = 0xE417;
+
+/// x1-x11 of a receive that took the exit notification of a child whose
+/// exit channel carried `label` (spec 7.9).
+fn exit_notice(label: u64) -> [u64; 11] {
+    Notification {
+        source: Source::Exit,
+        label,
+        bits: 1,
+        count: 1,
+    }
+    .to_words()
+}
+
+/// A child with the programs, in slot 0, whose entry 0 holds its start
+/// channel: a copy of its parent's channel with a label and NOTIFY (spec
+/// 13.3). Its thread notifies through abi::START_CHANNEL; the parent's
+/// thread in slot 1, below it, takes the notification with the label
+/// without waiting.
+fn start_start_channel(f: &mut Fixture) -> Result<(), &'static str> {
+    let parent = new_process(f, 1)?;
+    let receiver = new_thread(f, 1, parent, DATA_VA, &raw const el0_receive, 0)?;
+    sched::set_priority(receiver, JUDGE, FIFO).map_err(|_| "no receiver")?;
+    let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(parent, Object::Channel(c), Rights::RECEIVE);
+    let s = session::create(parent, c, EXIT_LABEL, PRIORITY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel, and so does the session.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let s = s.map_err(|_| "no session")?;
+    let child = process::create_child(parent, CHILD_QUOTA, HANDLE_LIMIT, CEILING);
+    let moved =
+        child.and_then(|child| process::move_start(child, Object::Session(s), Rights::NOTIFY));
+    // SAFETY: the reference `create` handed out goes; entry 0 of the
+    // child, if the move went, holds the session.
+    unsafe { session::unref(s, CAUSE) };
+    let child = child.map_err(|_| "no child")?;
+    let child = with_programs(f, 0, child)?;
+    let notifier = new_thread(f, 0, child, DATA_VA, &raw const el0_notify, 0)?;
+    moved.map_err(|_| "the start channel did not move")?;
+    set_args(notifier, &[START_CHANNEL.0, BITS]);
+    set_args(receiver, &[h?, NO_WAIT]);
+    Ok(())
+}
+
+fn done_start_channel(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) == 0 {
+        return check(x[0] == 0, "notify through START_CHANNEL failed");
+    }
+    let session = Notification {
+        source: Source::Session,
+        label: EXIT_LABEL,
+        bits: BITS,
+        count: 1,
+    };
+    check(
+        x[0] == 0 && x[1..12] == session.to_words(),
+        "the parent did not get the child's notification with its label",
+    )
+}
 
 /// x1-x11 of a receive that took one post of `bits` from the slot of label
 /// 0.

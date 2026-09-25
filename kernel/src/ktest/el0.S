@@ -398,6 +398,12 @@ el0_receive:
     svc     #CALL_RECEIVE
     svc     #SVC_DONE
 
+// notify(x0 channel, x1 bits); the kernel judges its result.
+.global el0_notify
+el0_notify:
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
 // receive(x0 channel, x1 flags), then thread_exit: the result stays in
 // the thread's registers for the test.
 .global el0_receive_then_exit

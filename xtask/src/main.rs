@@ -17,8 +17,13 @@ const PROGRAM_TARGET: &str = "aarch64-unknown-none";
 /// The stack of init's first thread, in bytes, which init's program asks
 /// the kernel for (lib/bootimg); the size is ours.
 const INIT_STACK_SIZE: u32 = 64 * 1024;
-/// Spec 3.4: the kernel image file stays under 200 KB.
+/// Spec 3.4: the kernel image file stays under 200 KB: the build that
+/// ships and the probes built from it.
 const KERNEL_LIMIT: u64 = 200 * 1024;
+/// The builds with the kernel tests carry the tests' programs, fixtures
+/// and judges besides the kernel, and spec 3.4 does not bound them; a
+/// limit of their own still catches a runaway growth.
+const TEST_KERNEL_LIMIT: u64 = 512 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
@@ -95,7 +100,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 39;
+const INIT_TESTS: u32 = 48;
 /// A data segment bigger than the 4 MiB one block of frames holds.
 const BIG_DATA: u64 = 8 << 20;
 
@@ -126,6 +131,16 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+        }
+    }
+
+    /// The limit of its image file, and where the limit comes from.
+    fn limit(self) -> (u64, &'static str) {
+        match self {
+            Variant::Normal | Variant::FaultProbe | Variant::OverflowProbe => {
+                (KERNEL_LIMIT, "spec 3.4")
+            }
+            Variant::Test | Variant::TestIcount => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -260,10 +275,11 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     )?;
     let bytes = std::fs::read(&image).map_err(|e| format!("{}: {e}", image.display()))?;
     image::check_header(&bytes)?;
-    image::check_size(bytes.len() as u64, KERNEL_LIMIT)?;
+    let (limit, source) = variant.limit();
+    image::check_size(bytes.len() as u64, limit)?;
     let boot_image = build_boot_image("init", "boot.img")?;
     println!(
-        "kernel image {} ({} bytes, limit {KERNEL_LIMIT})",
+        "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),
         bytes.len()
     );
@@ -818,6 +834,18 @@ mod tests {
             }
         }
         assert_eq!(Variant::Normal.feature(), None);
+    }
+
+    /// The build that ships and its probes keep the limit of spec 3.4; the
+    /// builds with the kernel tests have one of their own.
+    #[test]
+    fn test_builds_have_a_limit_of_their_own() {
+        for variant in [Variant::Normal, Variant::FaultProbe, Variant::OverflowProbe] {
+            assert_eq!(variant.limit(), (204_800, "spec 3.4"));
+        }
+        for variant in [Variant::Test, Variant::TestIcount] {
+            assert_eq!(variant.limit(), (524_288, "test builds"));
+        }
     }
 
     /// The kernel keeps the FP and SIMD registers for programs and saves

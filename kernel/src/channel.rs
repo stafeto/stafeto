@@ -13,7 +13,7 @@
 //! queues happens under the scheduler's lock (sched::locked). A channel
 //! lives while references to it are left: handles with any rights, threads
 //! that wait in it, the sources of notifications that have a slot there
-//! (sessions from milestone 1.3b on), and the cleanup queue's while it
+//! (sessions and exits of processes), and the cleanup queue's while it
 //! closes; the last one queues its shell (spec 7.7). Every source holds
 //! one of its abi::MAX_SLOTS slots, the slot of label 0 among them, from
 //! its creation until it goes, and a slot that stands in the queue holds
@@ -48,6 +48,8 @@ pub enum Owner {
     /// A session: `notify` through a handle with its label, and
     /// CLIENT_GONE (spec 5.3).
     Session(NonNull<Session>),
+    /// The end of a process, whose shell holds the slot (spec 7.9).
+    Exit(NonNull<Process>),
 }
 
 impl Owner {
@@ -55,6 +57,7 @@ impl Owner {
         match self {
             Owner::Channel => Source::Unlabeled,
             Owner::Session(_) => Source::Session,
+            Owner::Exit(_) => Source::Exit,
         }
     }
 
@@ -62,6 +65,7 @@ impl Owner {
         match self {
             Owner::Channel => 0,
             Owner::Session(s) => session::label(s),
+            Owner::Exit(p) => process::exit_label(p),
         }
     }
 
@@ -72,6 +76,7 @@ impl Owner {
         match self {
             Owner::Channel => {}
             Owner::Session(s) => session::hold(s),
+            Owner::Exit(p) => process::retain_shell(p),
         }
     }
 
@@ -85,6 +90,8 @@ impl Owner {
             Owner::Channel => {}
             // SAFETY: the caller's promise.
             Owner::Session(s) => unsafe { session::unref(s, cause) },
+            // SAFETY: as above.
+            Owner::Exit(p) => unsafe { process::release_shell(p, cause) },
         }
     }
 }

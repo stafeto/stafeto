@@ -115,7 +115,7 @@ pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 
 /// The first handle of a process that `process_create` made (spec 13.3):
 /// entry 0 of its fresh table. The sixth argument of `process_create`, a
-/// channel, moves there from milestone 1.3c on; without one the entry
+/// channel, moves there from milestone 1.3b on; without one the entry
 /// holds a stub that goes at once, and the value is BAD_HANDLE for good.
 pub const START_CHANNEL: Handle = Handle::new(0, 1);
 

@@ -282,6 +282,18 @@ const TESTS: &[(&str, TestFn)] = &[
         "client_gone_when_the_holder_dies",
         calls::client_gone_when_the_holder_dies,
     ),
+    (
+        "teardown_level_is_at_least_the_notice",
+        calls::teardown_level_is_at_least_the_notice,
+    ),
+    (
+        "exit_notice_keeps_the_shell",
+        calls::exit_notice_keeps_the_shell,
+    ),
+    (
+        "notices_to_a_dying_parent_go_with_its_channel",
+        calls::notices_to_a_dying_parent_go_with_its_channel,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
@@ -1847,8 +1859,13 @@ fn check_stages(
     )?;
     cleanup::portion();
     check(
+        process::progress(p).0 == Stage::Notify && cleanup::len() == 1,
+        "the stage Quota took more than a portion",
+    )?;
+    cleanup::portion();
+    check(
         process::progress(p).0 == Stage::Shell && cleanup::len() == 0,
-        "the stage Quota took more than a portion, or the shell was queued",
+        "the stage Notify took more than a portion, or the shell was queued",
     )
 }
 

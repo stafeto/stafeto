@@ -14,9 +14,10 @@
 //! takes it apart in stages, a portion at a time, with how far it came
 //! kept in the process (`Stage`, spec 7.7): first a wave that stops its
 //! descendants above the cause, at its priority ceiling, then the
-//! teardown at the level of the cause, its descendants first. A shell
-//! with the reason stays for object_info until the last reference queues
-//! it once more. Every release names the level of its cause, which the
+//! teardown at the level of the cause, its descendants first. Once it gave
+//! its quota back, its exit channel hears of the end (spec 7.9), through a
+//! slot in its shell. A shell with the reason stays for object_info until
+//! the last reference queues it once more. Every release names the level of its cause, which the
 //! cleanup it may start takes. A process pays from its quota for what goes
 //! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
 //! threads, the blocks of its handle table, the shells of its children, the
@@ -27,7 +28,7 @@
 //! back in two parts: what is free at the child's stage Quota, and the
 //! rest with its shell.
 
-use crate::channel::Channel;
+use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
@@ -40,6 +41,7 @@ use abi::{Error, Handle, MAX_THREADS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
+use kcore::notify::Slot;
 use kcore::paging::{Attrs, MapError};
 use kcore::process::Life;
 use kcore::quota::Account;
@@ -51,6 +53,9 @@ const MAX_BLOCKS: usize = 8;
 
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7).
 const SHELL_PORTION: usize = 64;
+
+/// The bits of an exit notification (spec 6.5, 7.9): bit 0, once.
+const EXIT_BITS: u64 = 1;
 
 pub struct Process {
     /// From `create` until the first portion of the stage Space takes it:
@@ -113,9 +118,13 @@ pub struct Process {
     /// Init's end ends the run (spec 7.9).
     init: bool,
     /// R, the level of its teardown once it ended (spec 7.7): the highest
-    /// cause of its end and of the calls that hastened it (`hasten`). It
-    /// only grows.
+    /// of the priority of its exit notification (`set_exit`), the cause of
+    /// its end and those of the calls that hastened it (`hasten`). It only
+    /// grows.
     level: u8,
+    /// Where its end goes as a notification (process_create x3, spec 7.9):
+    /// set once, before anything can end the process.
+    exit: Option<Exit>,
     /// At the stage Stop, the child it stops next; a child that leaves
     /// the list moves it on (`leave_parent`).
     stop_next: Option<NonNull<Process>>,
@@ -142,6 +151,17 @@ struct Pools {
     channels: Pool<Channel>,
     /// The sessions of the labels it gave (handle_duplicate).
     sessions: Pool<Session>,
+}
+
+/// The source of a process's exit notification (spec 6.5, 7.9): its slot,
+/// which lies in the shell and holds the shell while it stands in the
+/// channel's queue, the label of the handle process_create took as x3,
+/// and the channel, which the shell holds, with one of its slots, until
+/// the shell goes.
+struct Exit {
+    slot: Slot<Owner>,
+    label: u64,
+    channel: NonNull<Channel>,
 }
 
 /// Neighbours in the list of a parent's children.
@@ -195,16 +215,22 @@ pub enum Stage {
     /// process leaves its parent's list of children: by now its
     /// descendants passed their own stage Quota (spec 7.5).
     Quota,
+    /// The exit channel, if there is one and it is open, hears of the end
+    /// (spec 7.9): bit 0 into the slot in the shell, which goes to a
+    /// receiver that waits or into the channel's queue, where it holds the
+    /// shell. After Quota: the parent hears of the end once the process and
+    /// its descendants gave back what they could. One portion.
+    Notify,
     /// Nothing but the object and the reason are left: the last reference
     /// queues the shell. Each portion gives up to SHELL_PORTION pages of
     /// its pools back to the frame allocator; the last one gives the slot
-    /// back to its parent's pool, the rest of the quota to the parent and
-    /// then the reference to the parent's shell.
+    /// back to its parent's pool, the rest of the quota to the parent, and
+    /// then the references to the exit channel and to the parent's shell.
     Shell,
 }
 
 /// The stages of a teardown in the order they run (spec 7.7).
-const STAGES: [Stage; 8] = [
+const STAGES: [Stage; 9] = [
     Stage::Stop,
     Stage::Children,
     Stage::Handles,
@@ -212,6 +238,7 @@ const STAGES: [Stage; 8] = [
     Stage::Buffers,
     Stage::Frames,
     Stage::Quota,
+    Stage::Notify,
     Stage::Shell,
 ];
 
@@ -366,6 +393,19 @@ impl Process {
     ) -> Result<U, Error> {
         self.handles.get_as(h, rights, kind).map_err(Error::from)
     }
+
+    /// As `lookup`, with every right of the handle as well: what a handle
+    /// that moves takes along (process_create x5).
+    pub fn lookup_with_rights<U>(
+        &self,
+        h: Handle,
+        rights: Rights,
+        kind: impl FnOnce(&Object) -> Option<U>,
+    ) -> Result<(U, Rights), Error> {
+        let found = self.lookup(h, rights, kind)?;
+        let (_, all) = self.handles.get(h).map_err(Error::from)?;
+        Ok((found, all))
+    }
 }
 
 /// A process with a quota of `quota` bytes, an empty address space, an
@@ -415,6 +455,7 @@ fn create(
         child_siblings: None,
         init: false,
         level: 0,
+        exit: None,
         stop_next: None,
         stage: Stage::Whole,
         cleanup: Item::new(),
@@ -582,9 +623,10 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
     }
 }
 
-/// Adds a reference to the shell of `process`, which lives: an object in
-/// its pools that it pays for holds one (spec 7.8), so its pages stay
-/// until the object's slot went back.
+/// Adds a reference to the shell of `process`: an object in its pools
+/// that it pays for holds one (spec 7.8), so its pages stay until the
+/// object's slot went back, and so does its exit slot while it stands in
+/// the queue of the exit channel (spec 6.5).
 pub fn retain_shell(process: NonNull<Process>) {
     // SAFETY: the caller holds a reference to the process; only the field
     // is touched, and `refs` checks the object.
@@ -599,9 +641,9 @@ pub fn retain_shell(process: NonNull<Process>) {
 }
 
 /// Drops a reference to the shell of `process`: a child's to its parent at
-/// the child's shell portion (`free`), or an object's to its payer once its
-/// slot went back; the last reference of either kind queues the shell at
-/// `cause`.
+/// the child's shell portion (`free`), an object's to its payer once its
+/// slot went back, or the exit slot's once receive or the stage Close took
+/// it; the last reference of either kind queues the shell at `cause`.
 ///
 /// # Safety
 /// The reference is the caller's, and the caller does not use it afterwards.
@@ -755,6 +797,8 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         },
         // SAFETY: as above.
         Stage::Quota => unsafe { leave_parent(process) },
+        // SAFETY: as above; the queue's reference keeps the shell.
+        Stage::Notify => unsafe { notify_exit(process, r) },
         Stage::Shell => {
             // SAFETY: nothing refers to the shell, so nothing lives in its
             // pools; the shell stays in place until its last portion.
@@ -939,6 +983,28 @@ unsafe fn leave_parent(process: NonNull<Process>) -> bool {
     true
 }
 
+/// The stage Notify: bit 0 goes into the slot of the exit channel, at
+/// `level` (R), unless there is none (spec 7.9); a channel that closed
+/// gets nothing (channel::post), and the notification is lost with it, as
+/// a notification to a parent that ends with its channel. True: one
+/// portion.
+///
+/// # Safety
+/// `process` is alive and on its stages.
+unsafe fn notify_exit(process: NonNull<Process>, level: u8) -> bool {
+    // SAFETY: the caller's promise; the slot lives as long as the shell,
+    // which the channel's queue holds while the slot stands there.
+    unsafe {
+        let exit = &raw mut (*process.as_ptr()).exit;
+        if let Some(e) = (*exit).as_mut() {
+            let slot = NonNull::new_unchecked(&raw mut e.slot);
+            // PEER_CLOSED: nothing is posted (spec 6.5).
+            let _ = channel::post(e.channel, slot, EXIT_BITS, level);
+        }
+    }
+    true
+}
+
 /// The links of `child`, a process in its parent's list.
 ///
 /// # Safety
@@ -995,7 +1061,8 @@ unsafe fn release_pages(p: *mut Process) -> bool {
 }
 
 /// A shell's last portion, once its pages went: the slot goes back to the
-/// pool it came from, its parent's or ROOTS, the rest of the quota to the
+/// pool it came from, its parent's or ROOTS, then the exit channel gets
+/// its slot and its reference back, the rest of the quota goes to the
 /// parent (Account::return_rest: nothing is charged by now, since
 /// whatever held the shell went), and then the reference to the parent's
 /// shell, which queues that shell at `level` if it was the last.
@@ -1004,9 +1071,16 @@ unsafe fn release_pages(p: *mut Process) -> bool {
 /// Nothing refers to the shell, its pages went, and it is in no queue.
 unsafe fn free(process: NonNull<Process>, level: u8) {
     // SAFETY: the caller's promise; only the fields are touched.
-    let (parent, rest) = unsafe {
+    let (parent, rest, exit) = unsafe {
         let p = process.as_ptr();
-        ((*p).parent, (*p).quota.return_rest())
+        let exit = (*p).exit.as_ref().map(|e| {
+            assert!(
+                !e.slot.is_queued(),
+                "a shell goes while its exit slot is queued"
+            );
+            e.channel
+        });
+        ((*p).parent, (*p).quota.return_rest(), exit)
     };
     // SAFETY: the caller's promise; every stage gave its memory back, and
     // the parent's pool is there, since the shell holds the parent's.
@@ -1029,6 +1103,11 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
             core::mem::size_of::<Process>() - 8,
         )
     };
+    if let Some(c) = exit {
+        channel::remove_source(c);
+        // SAFETY: the shell's reference to its exit channel goes with it.
+        unsafe { channel::release(c, Rights::NONE, level) };
+    }
     if let Some(parent) = parent {
         refund(parent, rest);
         // SAFETY: the shell's reference to its parent goes with it.
@@ -1445,6 +1524,66 @@ pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
     );
     // The system resource is never queued: any level will do.
     close_handle(child, stub, 1)
+}
+
+/// Entry 0 of the fresh table of a child that process_create made
+/// (spec 13.3): the start channel, `object` with `rights`, which the
+/// caller's handle names. The handle takes a new reference first; the
+/// caller's handle goes only once the child is made, so the count of
+/// handles with RECEIVE and the copies of a session never fall to zero
+/// on the way, and a child that fails leaves the handle where it was. The
+/// directory and the first chunk share the first page of the child's pool
+/// of blocks, which the child pays for: NO_MEMORY when its quota falls
+/// short.
+pub fn move_start(child: NonNull<Process>, object: Object, rights: Rights) -> Result<(), Error> {
+    let h = insert_handle(child, object, rights)?;
+    assert_eq!(
+        h,
+        abi::START_CHANNEL,
+        "the start entry went into a table that was not fresh"
+    );
+    Ok(())
+}
+
+/// The end of `child`, which process_create just made, goes as a
+/// notification into `c` (spec 7.9): a slot of `priority` in the child's
+/// shell with `label`, the label of the caller's handle, which took one of
+/// the channel's slots already (channel::add_source). The shell holds the
+/// channel until it goes. R, the level of the child's teardown, is at
+/// least `priority` from now on (spec 7.7). Nothing can end the child
+/// before: it has no thread, and only the caller holds it.
+pub fn set_exit(child: NonNull<Process>, c: NonNull<Channel>, label: u64, priority: u8) {
+    // SAFETY: the caller holds a reference to the child, which is whole;
+    // only the fields are touched.
+    unsafe {
+        let p = child.as_ptr();
+        assert!(
+            (*p).stage == Stage::Whole && (*p).exit.is_none(),
+            "an exit channel for a process that ended, or has one"
+        );
+        (*p).exit = Some(Exit {
+            slot: Slot::new(priority, Owner::Exit(child)),
+            label,
+            channel: c,
+        });
+        (*p).level = (*p).level.max(priority);
+    }
+    channel::retain(c, Rights::NONE);
+}
+
+/// The label of the exit notification of `process`, which receive reports
+/// with its slot.
+pub fn exit_label(process: NonNull<Process>) -> u64 {
+    // SAFETY: the exit slot is being taken, and it holds the shell; only
+    // the field is read, and `refs` checks the object.
+    unsafe {
+        refs(process);
+        (*process.as_ptr())
+            .exit
+            .as_ref()
+            .expect("an exit slot")
+            .label
+    }
 }
 
 /// The handles of `process`, which the caller holds, for object_info's

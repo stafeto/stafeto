@@ -500,11 +500,12 @@ fn set_priority_cases(
 /// (spec 11); a good call returns a handle with the owner's rights to a
 /// live process with the ceiling given, a child of the caller's process
 /// (spec 4). With the caller's table full it fails with LIMIT_REACHED, and
-/// the new process goes again. The caller's ceiling is 30.
+/// the new process goes again. The caller's ceiling is 30. Channels in x3
+/// and x5 have cases of their own (`exit_and_start_cases`).
 pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;
-    let result = process_create_cases(&c);
+    let result = process_create_cases(&c).and_then(|()| exit_and_start_cases(&c));
     c.release();
     result?;
     check(
@@ -601,6 +602,63 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     check(
         process::quota(c.process).used() == before + page,
         "the least child's quota did not come back",
+    )
+}
+
+/// Channels in x3 and x5 of process_create, where a caller below the
+/// highest ceiling matters; the test init checks the rest from EL0
+/// (spec 11, 13.3). x4 above the caller's ceiling fails with ACCESS_DENIED
+/// after the handles, and x3 on a channel that closed with PEER_CLOSED
+/// only after the ceilings; the caller's full table comes before the
+/// channel's slots and the quota (LIMIT_REACHED). A good call moves x5
+/// into entry 0 of the child's table with its rights, and the caller's
+/// handle goes.
+fn exit_and_start_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::ProcessCreate.number();
+    let q = CHILD_QUOTA;
+    let closed = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(closed)?;
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    let shut = c.created(Call::CreateChannel.number(), &[10])?;
+    let result = channel_of(c, shut)
+        .and_then(|s| c.insert(Object::Channel(s), Rights::NOTIFY))
+        .and_then(|left| {
+            c.close(shut)?;
+            let (h, left) = (h.0, left.0);
+            c.fails(n, &[q, 16, 20, closed.0, 31, h], Error::BadHandle)?;
+            c.fails(n, &[q, 16, 20, h, 31, closed.0], Error::BadHandle)?;
+            c.fails(n, &[q, 16, 20, h, 31, 0], Error::AccessDenied)?;
+            c.fails(n, &[q, 16, 20, left, 31, 0], Error::AccessDenied)?;
+            c.fails(n, &[q, 16, 20, left, 30, 0], Error::PeerClosed)?;
+            c.close(Handle(left))?;
+            with_full_table(c, n, &[q, 16, 20, h, 5, 0])
+        })
+        .and_then(|()| channel_of(c, h))
+        .and_then(|ch| moved_start(c, h, ch));
+    c.close(h)?;
+    cleanup::drain();
+    result
+}
+
+/// x5 moves: a copy with NOTIFY and TRANSFER goes into entry 0 of the
+/// child's table with those rights, and the caller's handle is bad.
+fn moved_start(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'static str> {
+    let rights = Rights::NOTIFY | Rights::TRANSFER;
+    let start = c.insert(Object::Channel(ch), rights)?;
+    let n = Call::ProcessCreate.number();
+    let child = c.created(n, &[CHILD_QUOTA, 16, 20, h.0, 5, start.0])?;
+    // SAFETY: the caller's process is the test's.
+    let table = unsafe { c.process.as_ref() };
+    let gone = table.lookup(start, Rights::NONE, Object::channel);
+    let entry = child_of(c, child).map(|p| {
+        // SAFETY: the caller's handle holds the child.
+        unsafe { p.as_ref() }.lookup_with_rights(START_CHANNEL, Rights::NONE, Object::channel)
+    });
+    c.close(child)?;
+    cleanup::drain();
+    check(
+        gone == Err(Error::BadHandle) && entry == Ok(Ok((ch, rights))),
+        "the caller kept x5, or entry 0 of the child does not name it with its rights",
     )
 }
 
@@ -1717,4 +1775,117 @@ fn holder_dies(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'stat
     })();
     holder.release();
     result
+}
+
+/// x1-x9 of a receive that took the exit notification of a child whose
+/// exit channel carried `label`: bit 0, once (spec 7.9).
+fn exit_notice(label: u64) -> [u64; 9] {
+    let n = Notification {
+        source: Source::Exit,
+        label,
+        bits: 1,
+        count: 1,
+    };
+    n.to_words()[..9].try_into().expect("x1-x9")
+}
+
+/// The child behind the caller's handle `h`.
+fn child_of(c: &Caller, h: Handle) -> Result<NonNull<Process>, &'static str> {
+    // SAFETY: the caller's process is the test's.
+    unsafe { c.process.as_ref() }
+        .lookup(h, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name a process")
+}
+
+/// R, the level of a teardown, is at least the priority of the exit
+/// notification, x4 (spec 7.7, 7.9): a child whose exit channel hears of
+/// it at 20 ends at 5, and its teardown stands at 20 in the cleanup queue,
+/// above a thread at 10 that is ready. The notification comes after it.
+pub fn teardown_level_is_at_least_the_notice(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let result = c
+            .created(
+                Call::ProcessCreate.number(),
+                &[CHILD_QUOTA, 16, 20, h.0, 20, 0],
+            )
+            .and_then(|child| {
+                let level = child_of(c, child).map(|p| {
+                    // SAFETY: the caller's handle holds the child.
+                    unsafe { process::end(p, ProcessState::Killed, 5) };
+                    cleanup::top()
+                });
+                cleanup::drain();
+                c.close(child)?;
+                c.succeeds(Call::Receive.number(), &[h.0, NO_WAIT], &exit_notice(0))?;
+                check(
+                    level == Ok(Some(20)),
+                    "the teardown of a child that ended at 5 is not at its exit priority 20",
+                )
+            });
+        c.close(h)?;
+        result
+    })
+}
+
+/// The slot of the exit notification lies in the child's shell and holds
+/// it while it stands in the channel's queue (spec 6.5, 7.9): the parent
+/// kills the child and closes its handle before it receives. The shell
+/// stays, the notification comes, and after it the shell goes.
+pub fn exit_notice_keeps_the_shell(_: &Boot) -> Result<(), &'static str> {
+    let processes = process::in_use();
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let result = c
+            .created(
+                Call::ProcessCreate.number(),
+                &[CHILD_QUOTA, 16, 20, h.0, 10, 0],
+            )
+            .and_then(|child| {
+                c.succeeds(Call::ProcessKill.number(), &[child.0], &[])?;
+                c.close(child)?;
+                cleanup::drain();
+                let kept = process::in_use() == processes + 2;
+                c.succeeds(Call::Receive.number(), &[h.0, NO_WAIT], &exit_notice(0))?;
+                cleanup::drain();
+                let gone = process::in_use() == processes + 1;
+                check(
+                    kept,
+                    "the child's shell went while its exit notification stood in the channel",
+                )?;
+                check(gone, "the child's shell stayed after its exit notification")
+            });
+        c.close(h)?;
+        result
+    })?;
+    check(
+        process::in_use() == processes,
+        "a process of the test stayed",
+    )
+}
+
+/// A parent's end ends its child (spec 4), whose exit notification goes
+/// into a channel of the parent: the parent's stage Handles closes the
+/// channel, the stage Close takes the notification (spec 6.8, 7.9), and
+/// the child's shell goes with it. Nothing of the tree stays.
+pub fn notices_to_a_dying_parent_go_with_its_channel(_: &Boot) -> Result<(), &'static str> {
+    let (processes, channels) = (process::in_use(), channel::in_use());
+    let parent = Caller::new()?;
+    let made = parent
+        .created(Call::CreateChannel.number(), &[10])
+        .and_then(|h| {
+            parent.created(
+                Call::ProcessCreate.number(),
+                &[CHILD_QUOTA, 16, 20, h.0, 10, 0],
+            )
+        });
+    // SAFETY: the parent's process is the test's.
+    unsafe { process::end(parent.process, ProcessState::Killed, CAUSE) };
+    cleanup::drain();
+    parent.release();
+    made?;
+    check(
+        process::in_use() == processes && channel::in_use() == channels,
+        "the child, the parent or the channel stayed",
+    )
 }
