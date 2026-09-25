@@ -39,16 +39,21 @@ const DEBUG_WRITE_LINES: [&str; 3] = [
 ];
 /// Tests only the `icount` build has: the first checks that the run is
 /// under -icount; the next two depend on how much of a quantum is left,
-/// which only -icount makes repeatable; the last takes a big process
+/// which only -icount makes repeatable; the fourth takes a big process
 /// apart in hundreds of portions with interrupts between them, where
 /// virtual time counts instructions and a stall of the host changes
-/// nothing.
-const ICOUNT_TESTS: [&str; 4] = [
+/// nothing; the last measures the round trip of a request, which only
+/// -icount counts in instructions (spec 15.3).
+const ICOUNT_TESTS: [&str; 5] = [
     "virtual_time_counts_instructions",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "teardown_yields_to_a_pending_interrupt",
+    "ipc_round_trip_is_measured",
 ];
+/// The rows of the line of `ipc_round_trip_is_measured`, in its order
+/// (spec 15.3).
+const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
 /// checked.
@@ -100,7 +105,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 57;
+const INIT_TESTS: u32 = 99;
 /// A data segment bigger than the 4 MiB one block of frames holds.
 const BIG_DATA: u64 = 8 << 20;
 
@@ -727,7 +732,39 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
         m.memory,
         r.passed.len()
     );
+    if icount {
+        let ticks = round_trip_ticks(&o.lines)?;
+        let rows: Vec<_> = ROUND_TRIP_ROWS
+            .iter()
+            .zip(ticks)
+            .map(|(row, n)| format!("{row}={n}"))
+            .collect();
+        println!("ipc round trip ticks on {}: {}", m.memory, rows.join(" "));
+    }
     Ok(())
+}
+
+/// The numbers of the line `ipc round trip ticks: null=... handles=...`
+/// that `ipc_round_trip_is_measured` prints, one for each of
+/// ROUND_TRIP_ROWS in that order: an error when no line has them all.
+fn round_trip_ticks(lines: &[String]) -> Result<[u64; 6], String> {
+    let line = lines
+        .iter()
+        .find_map(|l| l.strip_prefix("ipc round trip ticks: "))
+        .ok_or("the kernel printed no round trip")?;
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() != ROUND_TRIP_ROWS.len() {
+        return Err(format!("the round trip has other rows: {line:?}"));
+    }
+    let mut ticks = [0; 6];
+    for ((t, row), field) in ticks.iter_mut().zip(ROUND_TRIP_ROWS).zip(fields) {
+        *t = field
+            .strip_prefix(row)
+            .and_then(|f| f.strip_prefix('='))
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| format!("{field:?} is no {row} row of the round trip"))?;
+    }
+    Ok(ticks)
 }
 
 /// The test init (tests/init) as init of the normal build, the kernel that
@@ -937,6 +974,24 @@ mod tests {
             found,
             ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
         );
+    }
+
+    /// The round trip's line gives its six rows in order, and nothing else
+    /// passes for it.
+    #[test]
+    fn round_trip_line_gives_six_rows() {
+        let line = "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6";
+        let lines = ["TEST fast_path_is_taken ok", line].map(String::from);
+        assert_eq!(round_trip_ticks(&lines), Ok([1, 2, 3, 4, 5, 6]));
+        for bad in [
+            "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5",
+            "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 handles=5 buffer=6",
+            "ipc round trip ticks: null=x switch=2 fast=3 slow=4 buffer=5 handles=6",
+            "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6 more=7",
+        ] {
+            assert!(round_trip_ticks(&[bad.to_string()]).is_err(), "{bad}");
+        }
+        assert!(round_trip_ticks(&[]).is_err());
     }
 
     /// The kernel tests wake their threads through timers of programs

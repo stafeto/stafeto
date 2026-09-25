@@ -27,14 +27,16 @@
 //! frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
-//! rest with its shell.
+//! rest with its shell. The requests its threads accepted wait in it for
+//! their replies (spec 4, 6.8); once it ended, its stage Replies wakes
+//! their clients with PEER_CLOSED.
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
-use crate::mm::phys::FRAMES;
-use crate::object::{self, Block, Chunks, Handles, Object};
+use crate::mm::phys::{self, Frame};
+use crate::object::{self, Block, Chunks, Handles, Moving, Object};
 use crate::sched;
 use crate::session::Session;
 use crate::thread::{self, Siblings, Thread};
@@ -42,11 +44,11 @@ use crate::timer::Timer;
 use abi::{Error, Handle, MAX_THREADS, MAX_TIMERS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
-use kcore::layout::LINEAR_BASE;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::process::Life;
 use kcore::quota::Account;
+use kcore::sched::{ReadyQueue, Scheduler};
 use kcore::slab::{PageLog, PaidPages, Pool};
 use kcore::sync::Lock;
 
@@ -55,9 +57,9 @@ mod teardown;
 
 pub use table::{
     close_handle, handle_counts, handle_room, insert_handle, install_init_handles, move_start,
-    reserve_start,
+    put_handles, reserve_handles, reserve_start, take_handles,
 };
-pub use teardown::{Stage, clean, exit_label, hasten, set_exit};
+pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
 use teardown::{begin, queue_shell};
 
 /// Blocks of frames one process may own.
@@ -136,12 +138,23 @@ pub struct Process {
     /// At the stage Stop, the child it stops next; a child that leaves
     /// the list moves it on (`leave_parent`).
     stop_next: Option<NonNull<Process>>,
+    /// The requests its threads accepted and have not answered (spec 6.1,
+    /// 6.8): the own slots of their clients, which wait for the replies, at
+    /// the levels the clients had. Any thread of the process may answer.
+    /// A request holds no reference to its client: while it stands here the
+    /// client lives, and a client that ends takes its slot out
+    /// (channel::cancel). Reached only with the scheduler locked
+    /// (`accepted`).
+    accepted: ReadyQueue<Slot<Owner>>,
     /// How far its teardown came.
     stage: Stage,
     /// Its place in the cleanup queue: on its stages, and as a shell once
     /// its last reference goes.
     cleanup: Item,
 }
+
+// Two shells to a page of a pool (spec 7.8).
+const _: () = assert!(Pool::<Process>::PER_PAGE >= 2);
 
 /// The pools of what a process pays for by the page (spec 7.5, 7.8): a
 /// page is charged when a pool grows, a slot that goes back refunds
@@ -181,19 +194,21 @@ struct ChildLinks {
     next: Option<NonNull<Process>>,
 }
 
-/// Blocks of frames, as (physical address, order), that `release` gives
-/// back to the allocator when their owner goes.
-struct OwnedFrames([Option<(u64, u8)>; MAX_BLOCKS]);
+/// Blocks of frames that `release` gives back to the allocator when their
+/// owner goes.
+struct OwnedFrames([Option<Frame>; MAX_BLOCKS]);
 
 impl OwnedFrames {
     /// Gives every block back to the frame allocator and refunds it to
-    /// `quota`.
-    fn release(&mut self, quota: &mut Account) {
-        let mut guard = FRAMES.lock();
-        let frames = guard.as_mut().expect("frame allocator");
-        for (pa, order) in self.0.iter_mut().filter_map(Option::take) {
-            frames.free(pa, order);
-            quota.refund(PAGE_SIZE << order);
+    /// `quota` (phys::free, spec 7.7).
+    ///
+    /// # Safety
+    /// No table of a program maps the blocks any more, and the TLB entries
+    /// of such mappings went.
+    unsafe fn release(&mut self, quota: &mut Account) {
+        for frame in self.0.iter_mut().filter_map(Option::take) {
+            // SAFETY: the caller's promise.
+            unsafe { phys::free(frame, quota) };
         }
     }
 }
@@ -267,31 +282,11 @@ impl Process {
             .position(Option::is_none)
             .ok_or(Error::NoMemory)?;
         let order = (size / PAGE_SIZE).next_power_of_two().trailing_zeros() as u8;
-        self.quota.charge(PAGE_SIZE << order)?;
-        let Some(pa) = FRAMES
-            .lock()
-            .as_mut()
-            .expect("frame allocator")
-            .alloc(order)
-        else {
-            // A block may miss while its frames are free apart; a single
-            // frame may not (spec 7.8).
-            assert!(order > 0, "a charge that passed found no frame (spec 7.8)");
-            self.quota.refund(PAGE_SIZE << order);
-            return Err(Error::NoMemory);
-        };
-        // SAFETY: the block was just allocated and lies in the linear map;
-        // no program sees it before it is zeroed.
-        unsafe {
-            core::ptr::write_bytes(
-                (LINEAR_BASE + pa as usize) as *mut u8,
-                0,
-                (PAGE_SIZE << order) as usize,
-            )
-        };
+        let frame = phys::alloc_zeroed(order, &mut self.quota)?;
+        let pa = frame.pa();
         // Owned before it is mapped: on an error part of the range may be
         // mapped, and the frames must stay until the tables go.
-        self.frames.0[slot] = Some((pa, order));
+        self.frames.0[slot] = Some(frame);
         let space = self.space.as_mut().expect("frames map into a space");
         space.map(va, pa, size, attrs, &mut self.quota)?;
         Ok(pa)
@@ -333,7 +328,7 @@ fn create(
     let process = Process {
         space: Some(space),
         retired: None,
-        frames: OwnedFrames([None; MAX_BLOCKS]),
+        frames: OwnedFrames([const { None }; MAX_BLOCKS]),
         handles,
         refs: 1,
         shell_refs: 0,
@@ -359,6 +354,7 @@ fn create(
         level: 0,
         exit: None,
         stop_next: None,
+        accepted: ReadyQueue::new(),
         stage: Stage::Whole,
         cleanup: Item::new(),
     };
@@ -451,6 +447,19 @@ pub fn charge(process: NonNull<Process>, bytes: u64) -> Result<(), Error> {
 pub fn refund(process: NonNull<Process>, bytes: u64) {
     // SAFETY: as in `charge`.
     unsafe { (*process.as_ptr()).quota.refund(bytes) }
+}
+
+/// The quota of `process`, which pays for the frames it owns
+/// (phys::alloc_zeroed, phys::free, spec 7.5): the message buffers of its
+/// threads. Only the field is borrowed (see `refs`).
+///
+/// # Safety
+/// The caller holds a reference to `process`, which has not passed its
+/// stage Quota, and nothing else borrows its quota while the caller holds
+/// the borrow.
+pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
+    // SAFETY: the caller's promise.
+    unsafe { &mut (*process.as_ptr()).quota }
 }
 
 /// The quota of `process`, which the caller holds: object_info's
@@ -906,6 +915,20 @@ pub unsafe fn free_timer_slot(process: NonNull<Process>, t: NonNull<Timer>) {
     }
 }
 
+/// The queue of the requests `process` accepted (Process::accepted), which
+/// changes together with the states of the clients in it: reached only
+/// with the scheduler locked, which `_locked` shows (sched::locked).
+///
+/// # Safety
+/// `process` is alive.
+pub unsafe fn accepted(
+    process: NonNull<Process>,
+    _locked: &mut Scheduler<Thread>,
+) -> &mut ReadyQueue<Slot<Owner>> {
+    // SAFETY: the caller's promise; only the field is borrowed.
+    unsafe { &mut (*process.as_ptr()).accepted }
+}
+
 /// The links of `t`, a thread in its process's list.
 ///
 /// # Safety
@@ -955,7 +978,7 @@ pub fn translate(process: NonNull<Process>, va: usize) -> Option<(u64, u64)> {
 static EARLY_QUOTA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(feature = "ktest")]
-pub use test_access::{in_use, parent, progress, take_early_quota};
+pub use test_access::{has_accepted, in_use, parent, progress, take_early_quota};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -978,6 +1001,14 @@ mod test_access {
         // SAFETY: the test holds a reference to the process; only the field is
         // read.
         unsafe { (*process.as_ptr()).parent }
+    }
+
+    /// Whether requests the threads of `process`, which the test holds,
+    /// accepted wait for their replies.
+    pub fn has_accepted(process: NonNull<Process>) -> bool {
+        // SAFETY: the test holds a reference to the process; only the mask
+        // of the queue is read.
+        sched::locked(|k| unsafe { !accepted(process, k.s).is_empty() })
     }
 
     /// How far the teardown of `process` came: its stage, the handles left in

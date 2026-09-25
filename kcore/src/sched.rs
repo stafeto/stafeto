@@ -11,14 +11,16 @@
 //! queue of 64 levels holds the kernel's cleanup work (spec 7.7), which
 //! the decision treats as one more thread: a portion runs when its level
 //! is at least the running thread's and every ready one's. A thread that
-//! waits in `receive` (spec 8.1) is in no ready list either: it stands in
-//! the queue of what it waits for, a queue of 64 levels of its own through
-//! the same link, by the same rules (`requeue`).
+//! waits in `send` or `receive` (spec 8.1) is in no list of the scheduler:
+//! the kernel keeps it in the queue of what it waits for through a slot of
+//! its own (kcore::notify), which moves there by the same rules
+//! (ReadyQueue::move_to).
 //!
 //! A thread has a base priority, which thread_create and
-//! thread_set_priority set, and a boost by the notification slot it took
-//! in `receive` (spec 6.6), never above the ceiling of its process; the
-//! effective priority, the higher of the two, picks its level.
+//! thread_set_priority set, and one boost, by the notification slot or by
+//! the client of the request it took in `receive` (spec 6.6), never above
+//! the ceiling of its process; the effective priority, the higher of the
+//! two, picks its level.
 //!
 //! Where a thread goes; into a tail always with a new quantum, into a head
 //! always with the rest of its quantum:
@@ -46,8 +48,8 @@ pub enum State {
     Ready,
     /// On the CPU, in no list.
     Running,
-    /// Waits in `receive` (spec 8.1): off the CPU and in no ready list; it
-    /// may stand in the queue of what it waits for.
+    /// Waits in `send` or `receive` (spec 8.1): off the CPU and in no list
+    /// of the scheduler.
     Waiting,
     /// Ended; it never runs again.
     Dead,
@@ -107,8 +109,8 @@ pub struct Node<T> {
     slice_left: u64,
     /// The base priority.
     base: u8,
-    /// The boost by a notification slot (spec 6.6), already cut down to
-    /// the ceiling of the thread's process; 0 for none.
+    /// The boost by a notification slot or a request (spec 6.6), already
+    /// cut down to the ceiling of the thread's process; 0 for none.
     boost: u8,
     /// The level is the effective priority.
     link: Link<T>,
@@ -138,14 +140,14 @@ impl<T> Node<T> {
         self.base
     }
 
-    /// The boost by a notification slot; 0 when there is none.
+    /// The boost by a notification slot or a request; 0 when there is
+    /// none.
     pub fn boost(&self) -> u8 {
         self.boost
     }
 
-    /// The level the base and the boost make. It differs from `priority`
-    /// only for a waiting thread between thread_set_priority and
-    /// `requeue`.
+    /// The level the base and the boost make, which `relevel` gives the
+    /// link.
     fn effective(&self) -> u8 {
         self.base.max(self.boost)
     }
@@ -200,14 +202,14 @@ unsafe fn link<'a, T: Linked>(t: NonNull<T>) -> &'a mut Link<T> {
     unsafe { T::link(t).as_mut() }
 }
 
-/// Items ready at 64 levels: threads ready to run, or objects ready to be
-/// taken apart (the kernel's cleanup queue). A doubly linked list for each
-/// level, its links in the items, and a bit for each level with an item in
-/// it. Every operation takes constant time.
+/// Items ready at 64 levels: threads ready to run, objects ready to be
+/// taken apart (the kernel's cleanup queue), or the slots of a channel
+/// (kcore::notify). A ring for each level, its links in the items, of which
+/// the queue keeps only the head: the tail is the item before it. A bit for
+/// each level with an item in it. Every operation takes constant time.
 pub struct ReadyQueue<T> {
     mask: u64,
     heads: [Option<NonNull<T>>; LEVELS],
-    tails: [Option<NonNull<T>>; LEVELS],
 }
 
 impl<T: Linked> ReadyQueue<T> {
@@ -215,7 +217,6 @@ impl<T: Linked> ReadyQueue<T> {
         ReadyQueue {
             mask: 0,
             heads: [None; LEVELS],
-            tails: [None; LEVELS],
         }
     }
 
@@ -259,21 +260,11 @@ impl<T: Linked> ReadyQueue<T> {
     /// `t` is alive and in no list, and stays alive and in place until it
     /// leaves this one.
     pub unsafe fn push_head(&mut self, t: NonNull<T>) {
-        // SAFETY: the caller's promise; the old head is in this list.
+        // SAFETY: the caller's promise.
         unsafe {
             let level = Self::level(t);
-            let old = self.heads[level];
-            let l = link(t);
-            assert!(!l.queued, "an item is queued twice");
-            l.queued = true;
-            l.prev = None;
-            l.next = old;
-            match old {
-                Some(h) => link(h).prev = Some(t),
-                None => self.tails[level] = Some(t),
-            }
+            self.link_last(t, level);
             self.heads[level] = Some(t);
-            self.mask |= 1 << level;
         }
     }
 
@@ -282,47 +273,87 @@ impl<T: Linked> ReadyQueue<T> {
     /// # Safety
     /// As for `push_head`.
     pub unsafe fn push_tail(&mut self, t: NonNull<T>) {
-        // SAFETY: the caller's promise; the old tail is in this list.
+        // SAFETY: the caller's promise.
         unsafe {
             let level = Self::level(t);
-            let old = self.tails[level];
-            let l = link(t);
-            assert!(!l.queued, "an item is queued twice");
-            l.queued = true;
-            l.next = None;
-            l.prev = old;
-            match old {
-                Some(tail) => link(tail).next = Some(t),
-                None => self.heads[level] = Some(t),
-            }
-            self.tails[level] = Some(t);
-            self.mask |= 1 << level;
+            self.link_last(t, level);
         }
     }
 
-    /// Takes `t` out of its level, wherever it stands; an emptied level
-    /// clears its bit.
+    /// Links `t` into the ring of `level` right before its head, where the
+    /// tail stands; `t` becomes the head of a level that was empty.
+    ///
+    /// # Safety
+    /// As for `push_head`; `level` is the level of `t`.
+    unsafe fn link_last(&mut self, t: NonNull<T>, level: usize) {
+        // SAFETY: the caller's promise; the head and the tail are in this
+        // ring, and each borrow of a link ends before the next begins.
+        unsafe {
+            let l = link(t);
+            assert!(!l.queued, "an item is queued twice");
+            l.queued = true;
+            let Some(head) = self.heads[level] else {
+                l.prev = Some(t);
+                l.next = Some(t);
+                self.heads[level] = Some(t);
+                self.mask |= 1 << level;
+                return;
+            };
+            let tail = link(head).prev.expect("a ring");
+            l.prev = Some(tail);
+            l.next = Some(head);
+            link(tail).next = Some(t);
+            link(head).prev = Some(t);
+        }
+    }
+
+    /// Takes `t` out of its level, wherever it stands; the item after it
+    /// becomes the head when `t` was, and an emptied level clears its bit.
     ///
     /// # Safety
     /// `t` is alive and in this queue.
     pub unsafe fn remove(&mut self, t: NonNull<T>) {
-        // SAFETY: the caller's promise; its neighbours are in this list.
+        // SAFETY: the caller's promise; its neighbours are in this ring.
         unsafe {
             let level = Self::level(t);
             let l = link(t);
             assert!(l.queued, "an item leaves a queue it is not in");
             l.queued = false;
-            let (prev, next) = (l.prev.take(), l.next.take());
-            match prev {
-                Some(p) => link(p).next = next,
-                None => self.heads[level] = next,
-            }
-            match next {
-                Some(x) => link(x).prev = prev,
-                None => self.tails[level] = prev,
-            }
-            if self.heads[level].is_none() {
+            let prev = l.prev.take().expect("a ring");
+            let next = l.next.take().expect("a ring");
+            if next == t {
+                self.heads[level] = None;
                 self.mask &= !(1 << level);
+                return;
+            }
+            link(prev).next = Some(next);
+            link(next).prev = Some(prev);
+            if self.heads[level] == Some(t) {
+                self.heads[level] = Some(next);
+            }
+        }
+    }
+
+    /// Moves `t`, which stands in this queue, to `level` by the rules of
+    /// the ready queue (spec 6.3, 8): raised, to the tail of its new level;
+    /// lowered, to the head; at its own level it stays where it is.
+    ///
+    /// # Safety
+    /// `t` is alive and in this queue; `level` is 1-63.
+    pub unsafe fn move_to(&mut self, t: NonNull<T>, level: u8) {
+        // SAFETY: the caller's promise; the borrow of the link ends before
+        // the queue takes the item.
+        unsafe {
+            let old = link(t).level;
+            if level == old {
+                return;
+            }
+            self.remove(t);
+            link(t).set_level(level);
+            if level > old {
+                self.push_tail(t);
+            } else {
+                self.push_head(t);
             }
         }
     }
@@ -553,9 +584,9 @@ impl<T: Schedulable> Scheduler<T> {
     /// `now` when it runs. A running thread stays on the CPU and keeps its
     /// quantum; lowered below a ready thread, it gives the CPU up at the
     /// next `pick`. A stopped thread only takes the values; so does a
-    /// waiting one, and when it stands in the queue of what it waits for,
-    /// `requeue` moves it there right after. BAD_STATE for a thread that
-    /// ended. `priority` is 1-63, as args::priority_arg checks.
+    /// waiting one, whose slot the kernel moves in the queue it waits in
+    /// (ReadyQueue::move_to). BAD_STATE for a thread that ended. `priority`
+    /// is 1-63, as args::priority_arg checks.
     ///
     /// # Safety
     /// `t` is alive; the scheduler's threads are alive.
@@ -596,14 +627,14 @@ impl<T: Schedulable> Scheduler<T> {
         Ok(())
     }
 
-    /// `receive` hands `t` a notification slot of `level` (spec 6.6): the
-    /// effective priority becomes the higher of the base and `level`, but
-    /// never above `ceiling`, the priority ceiling of the thread's process
-    /// (spec 8). A boost only raises: one below the thread's boost leaves
-    /// it as it is. The thread moves as a raised one: running, it keeps
-    /// the CPU and its quantum; ready, it goes to the tail of its new level
-    /// with a new quantum; waiting and out of every queue, it takes the
-    /// level, and `wake` puts it there.
+    /// `receive` hands `t` a notification slot or a request of `level`
+    /// (spec 6.6): the effective priority becomes the higher of the base
+    /// and `level`, but never above `ceiling`, the priority ceiling of the
+    /// thread's process (spec 8). A boost only raises: one below the
+    /// thread's boost leaves it as it is. The thread moves as a raised one:
+    /// running, it keeps the CPU and its quantum; ready, it goes to the
+    /// tail of its new level with a new quantum; waiting and out of every
+    /// queue, it takes the level, and `wake` puts it there.
     ///
     /// # Safety
     /// As for `set_priority`; a waiting `t` stands in no queue.
@@ -618,11 +649,11 @@ impl<T: Schedulable> Scheduler<T> {
         unsafe { self.relevel(t, level) };
     }
 
-    /// The boost ends (the thread's next `receive`): the effective priority
-    /// falls back to the base. A running thread keeps the CPU and its
-    /// quantum and gives the CPU up at the next `pick` to a ready thread
-    /// above its base; a ready one goes to the head of its base's level
-    /// with the rest of its quantum.
+    /// The boost ends (the thread's next `receive`, or its reply with the
+    /// token of the boost): the effective priority falls back to the base.
+    /// A running thread keeps the CPU and its quantum and gives the CPU up
+    /// at the next `pick` to a ready thread above its base; a ready one
+    /// goes to the head of its base's level with the rest of its quantum.
     ///
     /// # Safety
     /// As for `boost`.
@@ -638,8 +669,8 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     /// Moves `t` to `level` by the rules of the table above; only a ready
-    /// thread changes its list and quantum. A waiting thread that stands
-    /// in a queue keeps its level until the caller's `requeue`.
+    /// thread changes its list and quantum, and every other one only takes
+    /// the level.
     ///
     /// # Safety
     /// As for `set_priority`.
@@ -647,34 +678,28 @@ impl<T: Schedulable> Scheduler<T> {
         // SAFETY: the caller's promise; every borrow of the node ends
         // before a list takes the thread.
         unsafe {
-            let (state, old, queued) = {
+            let (state, old) = {
                 let n = node(t);
-                (n.state, n.link.level, n.link.queued)
+                (n.state, n.link.level)
             };
             if level == old {
                 return;
             }
-            match state {
-                State::Ready => {
-                    self.ready.remove(t);
-                    node(t).link.set_level(level);
-                    if level > old {
-                        node(t).slice_left = self.quantum;
-                        self.ready.push_tail(t);
-                    } else {
-                        self.ready.push_head(t);
-                    }
-                }
-                State::Waiting if queued => {}
-                _ => node(t).link.set_level(level),
+            if state != State::Ready {
+                node(t).link.set_level(level);
+                return;
             }
+            if level > old {
+                node(t).slice_left = self.quantum;
+            }
+            self.ready.move_to(t, level);
         }
     }
 
-    /// `receive` with nothing to take (spec 8.1): the running thread waits.
-    /// It leaves the CPU for no list; the caller puts it in the queue it
-    /// waits in. Nothing runs until `pick`. The rest of its quantum is
-    /// gone: the end of the wait gives it a new one.
+    /// `send`, or `receive` with nothing to take (spec 8.1): the running
+    /// thread waits. It leaves the CPU for no list; the caller puts its
+    /// slot in the queue it waits in. Nothing runs until `pick`. The rest of
+    /// its quantum is gone: the end of the wait gives it a new one.
     ///
     /// # Safety
     /// As for `pick`.
@@ -701,14 +726,37 @@ impl<T: Schedulable> Scheduler<T> {
                 n.state == State::Waiting,
                 "a thread that does not wait wakes"
             );
-            assert!(
-                n.link.level == n.effective(),
-                "a thread wakes at a stale level"
-            );
             n.state = State::Ready;
             n.slice_left = self.quantum;
             self.ready.push_tail(t);
         }
+    }
+
+    /// The fast path of `send` (spec 6.4): `t`, which waits, runs at once
+    /// in place of the thread that just began to wait (`block`), with a new
+    /// quantum from `now`: the state `wake` and then `pick` at `now` leave
+    /// when `t`'s level is above every ready thread's and the cleanup's.
+    /// The caller checked the cleanup; a ready thread at or above `t`'s
+    /// level, a running thread or a `t` that does not wait stop the kernel.
+    ///
+    /// # Safety
+    /// As for `wake`.
+    pub unsafe fn hand_off(&mut self, t: NonNull<T>, now: u64) {
+        assert!(self.running.is_none(), "a thread runs at a hand-off");
+        // SAFETY: the caller's promise.
+        let n = unsafe { node(t) };
+        assert!(
+            n.state == State::Waiting,
+            "a thread that does not wait takes the CPU"
+        );
+        assert!(
+            self.ready.top().is_none_or(|top| top < n.priority()),
+            "a hand-off passes a ready thread"
+        );
+        n.state = State::Running;
+        n.slice_left = 0;
+        self.slice_end = now.saturating_add(self.quantum);
+        self.running = Some(t);
     }
 
     /// The thread ends (thread_exit, process_kill, a fault, the stop
@@ -739,38 +787,6 @@ impl<T: Schedulable> Scheduler<T> {
         }
         // SAFETY: the caller's promise.
         unsafe { node(t) }.state = State::Dead;
-    }
-}
-
-/// thread_set_priority of `t`, which waits in `queue` (spec 6.3, 8): it
-/// moves to the level its base and boost make, by the rules of the ready
-/// queue. Raised, it goes to the tail of its new level; lowered, to the
-/// head; unchanged, it stays.
-///
-/// # Safety
-/// `t` is alive, waits, and stands in `queue`.
-pub unsafe fn requeue<T: Schedulable>(queue: &mut ReadyQueue<T>, t: NonNull<T>) {
-    // SAFETY: the caller's promise; every borrow of the node ends before
-    // the queue takes the thread.
-    unsafe {
-        let (state, old, level) = {
-            let n = node(t);
-            (n.state, n.link.level, n.effective())
-        };
-        assert!(
-            state == State::Waiting,
-            "a thread that does not wait moves in a queue of waiters"
-        );
-        if level == old {
-            return;
-        }
-        queue.remove(t);
-        node(t).link.set_level(level);
-        if level > old {
-            queue.push_tail(t);
-        } else {
-            queue.push_head(t);
-        }
     }
 }
 
@@ -958,13 +974,14 @@ mod tests {
         }
     }
 
-    /// The names on `level` of `q`, head first.
+    /// The names on `level` of `q`, head first, once round its ring.
     fn queued(q: &ReadyQueue<Fake>, level: u8) -> String {
         let mut names = String::new();
-        let mut t = q.first(level);
+        let head = q.first(level);
+        let mut t = head;
         while let Some(next) = t {
             names.push(name(next));
-            t = node(next).link.next;
+            t = node(next).link.next.filter(|&n| Some(n) != head);
         }
         names
     }
@@ -1484,63 +1501,35 @@ mod tests {
         w.exit(a);
     }
 
+    /// A waiting thread stands in no list of the scheduler: a new base
+    /// priority and a boost give it its level at once, and the end of the
+    /// wait puts it at the tail of that level. The kernel moves its slot in
+    /// the queue it waits in (ReadyQueue::move_to).
     #[test]
-    fn waiting_thread_moves_in_its_queue_on_a_new_priority() {
+    fn waiting_thread_takes_a_new_priority_at_once() {
         let mut w = World::new();
-        let mut q = ReadyQueue::new();
-        // A, B and C wait in `q`, in the order they came.
-        let [a, b, c] = [('a', 10), ('b', 10), ('c', 20)].map(|(name, level)| {
+        let [a, b] = [('a', 10), ('b', 10)].map(|(name, level)| {
             w.started(name, level, RR);
             assert_eq!(w.pick(0), name);
-            let t = w.block();
-            // SAFETY: the world keeps its threads alive.
-            unsafe { q.push_tail(t) };
-            t
+            w.block()
         });
-        // Raised: the tail of its new level.
-        w.set(a, 20, RR, MS);
-        // SAFETY: A waits in `q`.
-        unsafe { requeue(&mut q, a) };
-        assert_eq!((queued(&q, 20), queued(&q, 10)), ("ca".into(), "b".into()));
-        // Lowered: the head of its new level.
-        w.set(c, 10, RR, MS);
-        // SAFETY: C waits in `q`.
-        unsafe { requeue(&mut q, c) };
-        assert_eq!((queued(&q, 20), queued(&q, 10)), ("a".into(), "cb".into()));
-        // Unchanged: it stays, at the head too.
-        w.set(c, 10, FIFO, MS);
-        // SAFETY: C waits in `q`.
-        unsafe { requeue(&mut q, c) };
-        assert_eq!(queued(&q, 10), "cb");
+        w.set(a, 30, RR, MS);
+        w.set(b, 5, FIFO, MS);
+        w.boost(b, 25, 63);
         assert_eq!(
-            [a, b, c].map(|t| (node(t).priority(), node(t).state())),
-            [
-                (20, State::Waiting),
-                (10, State::Waiting),
-                (10, State::Waiting)
-            ]
+            [a, b].map(|t| (
+                node(t).priority(),
+                node(t).state(),
+                node(t).link.is_queued()
+            )),
+            [(30, State::Waiting, false), (25, State::Waiting, false)]
         );
-        // They wait: neither the ready queue nor the CPU holds them.
         assert!(w.s.ready().is_empty() && w.s.running().is_none());
-        // Through the channel's queue: the raised waiter takes the post.
-        let mut ch: crate::notify::Queue<char, Fake> = crate::notify::Queue::new();
-        let [d, _e] = [('d', 10), ('e', 20)].map(|(name, level)| {
-            w.started(name, level, RR);
-            assert_eq!(w.pick(2 * MS), name);
-            let t = w.block();
-            // SAFETY: the world keeps its threads alive.
-            unsafe { ch.wait(t) };
-            t
-        });
-        w.set(d, 30, RR, 2 * MS);
-        // SAFETY: D waits in `ch`.
-        unsafe { ch.requeue(d) };
-        let mut s = crate::notify::Slot::new(5, 's');
-        // SAFETY: the slot outlives the queue's use of it.
-        let crate::notify::Post::Deliver(t) = (unsafe { ch.post(NonNull::from(&mut s), 1) }) else {
-            panic!("no delivery");
-        };
-        assert_eq!(t, d);
+        w.started('c', 30, RR);
+        w.wake(a);
+        w.wake(b);
+        assert_eq!((w.level(30), w.level(25)), ("ca".into(), "b".into()));
+        assert_eq!(node(a).slice_left(), Q);
     }
 
     #[test]
@@ -1644,6 +1633,113 @@ mod tests {
         assert_eq!(w.pick(2 * MS), 'h');
         assert_eq!(w.level(5), "rb");
         assert_eq!(node(r).slice_left(), 2 * MS);
+    }
+
+    /// A world drawn from `seed` where the fast path of `send` applies
+    /// (spec 6.4): the receiver R waits, a client above every ready thread
+    /// runs and begins to wait, and R, boosted or not, is above every ready
+    /// thread and above the cleanup's level, which comes along. Ready
+    /// threads used parts of their quanta on the way. None for a draw that
+    /// is no such case.
+    fn fast_case(seed: u64) -> Option<(World, NonNull<Fake>, u64, Option<u8>)> {
+        let mut rng = Rng(seed);
+        let mut w = World::new();
+        let policy = |x: u64| if x == 0 { RR } else { FIFO };
+        let r = w.started('r', 1 + rng.below(40) as u8, policy(rng.below(2)));
+        let mut now = rng.below(Q);
+        assert_eq!(w.pick(now), 'r');
+        w.block();
+        for i in 0..rng.below(6) as u8 {
+            let level = 1 + rng.below(40) as u8;
+            w.started(char::from(b'a' + i), level, policy(rng.below(2)));
+        }
+        for _ in 0..rng.below(8) {
+            now += rng.below(Q);
+            match rng.below(3) {
+                0 => w.tick(now),
+                1 => w.yield_at(now),
+                _ => w.pick(now),
+            };
+        }
+        w.started('c', 41 + rng.below(20) as u8, policy(rng.below(2)));
+        now += rng.below(Q);
+        assert_eq!(w.pick(now), 'c');
+        w.block();
+        if rng.below(2) == 0 {
+            w.boost(r, 1 + rng.below(63) as u8, 1 + rng.below(63) as u8);
+        }
+        let level = node(r).priority();
+        if w.s.ready().top().is_some_and(|top| top >= level) {
+            return None;
+        }
+        let cleanup = rng.below(u64::from(level)) as u8;
+        now += rng.below(Q);
+        Some((w, r, now, (cleanup > 0).then_some(cleanup)))
+    }
+
+    /// Everything the scheduler keeps: the running thread, the end of its
+    /// quantum, each level of the ready queue, and each thread's state,
+    /// level and rest of a quantum.
+    fn snapshot(w: &World) -> String {
+        let mut s = format!("{:?} {} ", w.s.running().map(name), w.s.slice_end);
+        for level in 1..PRIORITY_LEVELS {
+            s += &w.level(level);
+            s.push('|');
+        }
+        for t in &w.threads {
+            let n = &t.node;
+            s += &format!("{}{:?}{}/{} ", t.name, n.state, n.priority(), n.slice_left);
+        }
+        s
+    }
+
+    /// 10 000 worlds drawn with a fixed seed where the fast path applies:
+    /// the receiver woken and then picked leaves the scheduler just as
+    /// `hand_off` does (spec 6.4).
+    #[test]
+    fn hand_off_matches_wake_and_pick() {
+        let mut cases = 0;
+        let mut seeds = Rng(0x5EED_F00D_2468_1357);
+        for _ in 0..10_000 {
+            let seed = seeds.below(u64::MAX) | 1;
+            let Some((mut slow, r, now, cleanup)) = fast_case(seed) else {
+                continue;
+            };
+            let (mut fast, r2, _, _) = fast_case(seed).expect("the same draw");
+            slow.wake(r);
+            assert_eq!(slow.decide(now, cleanup), 'r', "seed {seed:#x}");
+            // SAFETY: the world keeps its threads alive; R waits.
+            unsafe { fast.s.hand_off(r2, now) };
+            assert_eq!(snapshot(&slow), snapshot(&fast), "seed {seed:#x}");
+            cases += 1;
+        }
+        assert!(
+            cases > 2_000,
+            "only {cases} worlds where the fast path applies"
+        );
+    }
+
+    /// A thread handed the CPU runs with a new quantum from then: a
+    /// round-robin one sets the deadline a quantum ahead, a FIFO one none.
+    #[test]
+    fn hand_off_gives_a_new_quantum() {
+        for (policy, want) in [(RR, Some(3 * MS + Q)), (FIFO, None)] {
+            let mut w = World::new();
+            let r = w.started('r', 20, policy);
+            assert_eq!(w.pick(0), 'r');
+            w.block();
+            w.started('l', 5, RR);
+            w.started('c', 10, RR);
+            assert_eq!(w.pick(MS), 'c');
+            w.block();
+            // SAFETY: the world keeps its threads alive; R waits.
+            unsafe { w.s.hand_off(r, 3 * MS) };
+            assert_eq!(
+                (w.s.running(), node(r).state(), node(r).slice_left()),
+                (Some(r), State::Running, 0)
+            );
+            assert_eq!((w.s.deadline(None), w.level(5)), (want, "l".into()));
+        }
     }
 
     /// Counts what the scheduler writes to the timer.
@@ -1813,16 +1909,127 @@ mod tests {
         }
     }
 
+    /// The names on `level` of `q`, head first, once round its ring.
     fn names(q: &ReadyQueue<Item>, level: u8) -> String {
+        walk(q, level, |l| l.next)
+    }
+
+    /// The names on `level` of `q` from its head through the links `step`
+    /// picks, once round its ring.
+    fn walk(
+        q: &ReadyQueue<Item>,
+        level: u8,
+        step: impl Fn(&Link<Item>) -> Option<NonNull<Item>>,
+    ) -> String {
         let mut names = String::new();
-        let mut t = q.first(level);
+        let head = q.first(level);
+        let mut t = head;
         while let Some(i) = t {
             // SAFETY: the test keeps its items alive.
             let item = unsafe { i.as_ref() };
             names.push(item.name);
-            t = item.link.next;
+            t = step(&item.link).filter(|&n| Some(n) != head);
         }
         names
+    }
+
+    /// A queue has one head for each level and a bit mask: 520 bytes,
+    /// whatever it holds.
+    #[test]
+    fn ready_queue_is_520_bytes() {
+        assert_eq!(core::mem::size_of::<ReadyQueue<Item>>(), 520);
+        assert_eq!(core::mem::size_of::<ReadyQueue<Fake>>(), 520);
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// 100 000 random steps on 24 items at four levels against a model, a
+    /// list of names for each level: pushes at the head and at the tail,
+    /// removals wherever the item stands, moves to another level by the
+    /// rules of the ready queue. After every step each level reads as the
+    /// model from its head forwards and, reversed, from its head backwards,
+    /// and the top level follows.
+    #[test]
+    fn one_head_per_level_keeps_every_order() {
+        let mut items: Vec<Box<Item>> = (0..24u8)
+            .map(|i| {
+                Box::new(Item {
+                    link: Link::new(1),
+                    name: char::from(b'a' + i),
+                })
+            })
+            .collect();
+        let ptrs: Vec<NonNull<Item>> = items.iter_mut().map(|b| NonNull::from(&mut **b)).collect();
+        let mut q = ReadyQueue::new();
+        let mut model: [Vec<usize>; 5] = Default::default();
+        let mut rng = Rng(0x0DD5_EED5_1357_2468);
+        for step in 0..100_000 {
+            let i = rng.below(24) as usize;
+            let level = 1 + rng.below(4) as u8;
+            let at = (1..=4).find(|&l| model[l].contains(&i));
+            // SAFETY: the test keeps its items alive and in place; an item
+            // changes its level only out of the queue.
+            unsafe {
+                match (rng.below(2), at) {
+                    (0, None) => {
+                        (*ptrs[i].as_ptr()).link.set_level(level);
+                        q.push_head(ptrs[i]);
+                        model[usize::from(level)].insert(0, i);
+                    }
+                    (_, None) => {
+                        (*ptrs[i].as_ptr()).link.set_level(level);
+                        q.push_tail(ptrs[i]);
+                        model[usize::from(level)].push(i);
+                    }
+                    (0, Some(l)) => {
+                        q.remove(ptrs[i]);
+                        model[l].retain(|&x| x != i);
+                    }
+                    (_, Some(l)) => {
+                        q.move_to(ptrs[i], level);
+                        let new = usize::from(level);
+                        if new > l {
+                            model[l].retain(|&x| x != i);
+                            model[new].push(i);
+                        } else if new < l {
+                            model[l].retain(|&x| x != i);
+                            model[new].insert(0, i);
+                        }
+                    }
+                }
+            }
+            for l in 1..=4u8 {
+                let want: String = model[usize::from(l)]
+                    .iter()
+                    .map(|&x| char::from(b'a' + x as u8))
+                    .collect();
+                let mut back: String = walk(&q, l, |k| k.prev).chars().skip(1).collect();
+                back = back.chars().rev().collect();
+                let head: String = want.chars().take(1).collect();
+                assert_eq!(names(&q, l), want, "step {step}, level {l}");
+                assert_eq!(head + &back, want, "step {step}, level {l} backwards");
+            }
+            let top = (1..=4u8).rev().find(|&l| !model[usize::from(l)].is_empty());
+            assert_eq!(q.top(), top, "step {step}");
+        }
+        for p in ptrs {
+            // SAFETY: as above.
+            if unsafe { p.as_ref() }.link.is_queued() {
+                // SAFETY: as above; the item is queued.
+                unsafe { q.remove(p) };
+            }
+        }
+        assert!(q.is_empty());
+        drop(items);
     }
 
     #[test]

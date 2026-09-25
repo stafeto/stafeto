@@ -28,7 +28,12 @@ stafeto boots in QEMU and runs programs at EL0. What works today:
 - **Objects and calls:** 64-bit handles with rights; processes, threads,
   channels, sessions and program timers; the first system calls
   (`debug_write`, `yield`, `thread_*`, `process_*`, `channel_create`,
-  `notify`, `receive`, `timer_*`, `object_info`).
+  `notify`, `send`, `receive`, `reply`, `timer_*`, `object_info`).
+- **Messages:** synchronous requests and replies of up to 1 KB, the first
+  64 bytes in registers and the rest through a per-thread message buffer;
+  up to four handles move with a message, keeping their rights and labels;
+  a service works at its client's priority under its own ceiling until it
+  replies; a fast path hands the CPU straight to a waiting service.
 - **Faults:** a program fault ends only its own process, and the parent
   learns why through its exit channel.
 
@@ -52,8 +57,8 @@ parts. Each finished part is merged through a pull request.
 | | 1.2c System calls and scheduler | first system calls, 64-level scheduler, `init` from the boot image | ✅ [#5](https://github.com/stafeto/stafeto/pull/5) |
 | 1.3 Messages and objects | 1.3a Teardown and quotas | cleanup queue in bounded portions, process tree, quotas | ✅ [#6](https://github.com/stafeto/stafeto/pull/6) |
 | | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
-| | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | 🚧 |
-| | 1.3d Memory objects | `mem_create`, `mem_map`, lazy pages, child processes with code | ⬜ |
+| | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | ✅ [#11](https://github.com/stafeto/stafeto/pull/11) |
+| | 1.3d Memory objects | `mem_create`, `mem_map`, lazy pages, child processes with code | 🚧 |
 | | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ⬜ |
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ⬜ |
 

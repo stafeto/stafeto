@@ -14,19 +14,27 @@
 //! interrupts the kernel does at most one portion, and it begins one only
 //! with no interrupt pending. The kernel holds a reference to every thread
 //! the scheduler holds, from `start` until `exit`, a thread that waits in
-//! `receive` too. The queues of receivers of channels link threads through
-//! the scheduler's own links, so the code that changes them runs under the
-//! scheduler's lock (`locked`). The lock of the heap of timers is never
-//! held with it (crate::timer).
+//! `send` or `receive` too. The queues of channels and of accepted
+//! requests change together with the states of the threads that wait in
+//! them, and so does the table of thread numbers (spec 6.1, 7.8), which
+//! lies here, in memory the kernel takes at boot: the code that changes
+//! them runs under the scheduler's lock (`locked`). The lock of the heap of
+//! timers is never held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
-use crate::thread::{self, Thread};
+use crate::thread::{self, THREADS, Thread};
 use crate::{channel, cleanup};
-use abi::{Error, Policy, Rights};
+use abi::{Error, Policy};
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
 use kcore::sync::Lock;
 use kcore::time::Clock;
+use kcore::token::Table;
+
+/// The table of thread numbers (spec 6.1, 7.8): THREADS entries of 16
+/// bytes.
+pub type Tokens = Table<Thread, THREADS>;
 
 struct Sched {
     s: Scheduler<Thread>,
@@ -57,6 +65,18 @@ static SCHED: Lock<Sched> = Lock::new(Sched {
     idle_latency: 0,
     irq_latency: 0,
 });
+
+/// The table of thread numbers, which the scheduler's lock guards: only
+/// `locked` reaches it, while it holds that lock. Zeroed at boot (spec
+/// 7.8).
+static TOKENS: Guarded<Tokens> = Guarded(UnsafeCell::new(Table::new()));
+
+/// A value the scheduler's lock guards, apart from SCHED.
+struct Guarded<T>(UnsafeCell<T>);
+
+// SAFETY: only `locked` reaches the value, while it holds the scheduler's
+// lock, which makes the access exclusive.
+unsafe impl<T: Send> Sync for Guarded<T> {}
 
 /// What the scheduler counts for KSTATS (spec 16), in counter ticks.
 #[derive(Debug, Clone, Copy)]
@@ -118,30 +138,34 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 }
 
 /// Ends `t` for the scheduler, whatever its state: it never runs again,
-/// and the reference the kernel took at `start` goes, with `cause` for the
-/// cleanup its last reference starts. A thread that waits in `receive`
-/// leaves its channel's queue first, and the reference of its wait goes
-/// too (spec 7.7). When `t` was the running thread, `resume` decides who
-/// runs next. A thread that ended before stays as it is. O(1).
+/// its number goes back to the table (thread::give_number), and the
+/// reference the kernel took at `start` goes, with `cause` for the cleanup
+/// its last reference starts. A thread that waits in `send` or `receive`,
+/// or for a reply, first leaves the queue its slot stands in
+/// (channel::cancel), and the reference of its wait goes too (spec 6.8,
+/// 7.7). When `t` was the running thread, `resume` decides who runs next.
+/// A thread that ended before stays as it is. O(1).
 ///
 /// # Safety
 /// `t` is alive. When the kernel's reference is its last, `t` is queued
 /// for cleanup here, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
-    let (held, waited) = {
-        let mut g = SCHED.lock();
+    let (held, waited) = locked(|k| {
         // SAFETY: `t` is alive; its node is read before the scheduler takes it.
         let state = unsafe { t.as_ref() }.sched.state();
         // SAFETY: `t` and the scheduler's threads are alive; the queue
         // gives up the thread before the scheduler ends it.
-        let waited = unsafe { channel::cancel(t, &mut g.s) };
+        let waited = unsafe { channel::cancel(t, k) };
         // SAFETY: as above.
-        unsafe { g.s.exit(t) };
+        unsafe {
+            k.s.exit(t);
+            thread::give_number(t, k.tokens);
+        }
         (!matches!(state, State::Stopped | State::Dead), waited)
-    };
-    if let Some(c) = waited {
+    });
+    if let Some(via) = waited {
         // SAFETY: the reference was the wait's.
-        unsafe { channel::release(c, Rights::NONE, cause) };
+        unsafe { via.let_go(cause) };
     }
     if held {
         // SAFETY: the reference `start` took ends with the thread.
@@ -158,30 +182,87 @@ pub fn yield_running() {
 }
 
 /// thread_set_priority: `priority` (1-63) becomes the base priority of
-/// `t`, and the effective one follows unless the boost of a notification
-/// keeps it higher (spec 6.6); the thread moves by the rules of
-/// `pthread_setschedprio` (kcore::sched), and one that waits in `receive`
-/// moves in its channel's queue by the same rules (spec 6.1). The next
+/// `t`, and the effective one follows unless a boost keeps it higher (spec
+/// 6.6); the thread moves by the rules of `pthread_setschedprio`
+/// (kcore::sched), and the slot of one that waits moves in its queue by
+/// the same rules (spec 6.1, 6.3; channel::requeue); then, after the lock,
+/// a channel at its stage Close or a process at its stage Replies that it
+/// waits in follows its top waiter (channel::raise, spec 7.7). The next
 /// `resume` runs a thread raised above the running one, or another one
 /// when the running thread lowered itself below it. BAD_STATE for a
 /// thread that ended.
 pub fn set_priority(t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<(), Error> {
     let now = timer::now();
-    let mut g = SCHED.lock();
-    // SAFETY: the caller holds a reference to `t`; the scheduler's threads
-    // are alive, and so is the channel a thread waits in.
-    unsafe {
-        g.s.set_priority(t, priority, policy, now)?;
-        channel::requeue(t, &mut g.s);
+    let waits = locked(|k| {
+        // SAFETY: the caller holds a reference to `t`; the scheduler's
+        // threads are alive, and so is the channel a thread waits in.
+        unsafe {
+            k.s.set_priority(t, priority, policy, now)?;
+            Ok::<_, Error>(channel::requeue(t, k))
+        }
+    })?;
+    if let Some(w) = waits {
+        // SAFETY: the thread still waits in `w`.
+        unsafe { channel::raise(w) };
     }
     Ok(())
 }
 
-/// Runs `f` with the scheduler locked. The queues of receivers of channels
-/// hold threads through the scheduler's links (kcore::notify::Queue), so
-/// the code that changes them, with the threads' states, runs here.
-pub fn locked<R>(f: impl FnOnce(&mut Scheduler<Thread>) -> R) -> R {
-    f(&mut SCHED.lock().s)
+/// What the scheduler's lock guards for the rest of the kernel: the
+/// scheduler, and the table of thread numbers.
+pub struct Locked<'a> {
+    pub s: &'a mut Scheduler<Thread>,
+    pub tokens: &'a mut Tokens,
+}
+
+/// Runs `f` with the scheduler locked. The queues of channels and of
+/// accepted requests hold the slots of threads that wait
+/// (kcore::notify::Queue), and requests take tokens from the table of
+/// thread numbers, so the code that changes them, with the threads'
+/// states, runs here.
+pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
+    let mut g = SCHED.lock();
+    // SAFETY: the guard of the scheduler's lock lives until `f` returns,
+    // so this is the only reference to the table (TOKENS).
+    let tokens = unsafe { &mut *TOKENS.0.get() };
+    f(&mut Locked {
+        s: &mut g.s,
+        tokens,
+    })
+}
+
+/// The fast path of send (spec 6.4): `meet` runs with the scheduler locked,
+/// as under `locked`, and either makes the meeting and returns the
+/// receiver, or returns None and changes nothing. The receiver then runs at
+/// once in place of the caller, which waits (Scheduler::hand_off), with a
+/// new quantum from now, and the timer is armed for the deadline it needs:
+/// the nearer of the end of that quantum when the receiver is round robin
+/// and `next_timer`, the earliest timer of a program, which the caller read
+/// before the lock (spec 8, 10). The state is the one `wake` and the next
+/// decision would leave; the caller runs the receiver (thread::run). O(1).
+pub fn hand_off(
+    next_timer: Option<u64>,
+    meet: impl FnOnce(&mut Locked<'_>) -> Option<NonNull<Thread>>,
+) -> Option<NonNull<Thread>> {
+    let now = timer::now();
+    let mut g = SCHED.lock();
+    let g = &mut *g;
+    // The decision that ran the caller took the deadline that fired, and
+    // no interrupt came since: its latency needs no more.
+    #[cfg(feature = "ktest")]
+    assert!(g.fired.is_none(), "a fired deadline waits at the fast path");
+    // SAFETY: as in `locked`.
+    let tokens = unsafe { &mut *TOKENS.0.get() };
+    let r = meet(&mut Locked {
+        s: &mut g.s,
+        tokens,
+    })?;
+    // SAFETY: the receiver is alive, and `meet` made it the meeting's: it
+    // waits in no queue, above every ready thread and the cleanup.
+    unsafe { g.s.hand_off(r, now) };
+    let deadline = g.s.deadline(next_timer);
+    g.armed.set(&mut VirtualTimer, deadline);
+    Some(r)
 }
 
 /// The timer's interrupt, before its EOI: the timer goes off, since its
@@ -300,6 +381,31 @@ fn sleep() {
 #[cfg(feature = "ktest")]
 pub fn first(level: u8) -> Option<NonNull<Thread>> {
     SCHED.lock().s.ready().first(level)
+}
+
+/// What the scheduler holds now (test builds).
+#[cfg(feature = "ktest")]
+pub struct View {
+    /// The running thread, and the first ready thread of the top level.
+    pub running: Option<NonNull<Thread>>,
+    pub ready: Option<NonNull<Thread>>,
+    /// The deadline the scheduler needs with no timer of a program: the end
+    /// of the running thread's quantum when it is round robin.
+    pub slice_end: Option<u64>,
+    /// The deadline the timer holds.
+    pub armed: Option<u64>,
+}
+
+/// The scheduler's `View` now (test builds).
+#[cfg(feature = "ktest")]
+pub fn view() -> View {
+    let g = SCHED.lock();
+    View {
+        running: g.s.running(),
+        ready: g.s.ready().top().and_then(|l| g.s.ready().first(l)),
+        slice_end: g.s.deadline(None),
+        armed: g.armed.get(),
+    }
 }
 
 /// Forgets the longest latencies, so that a test measures its own.

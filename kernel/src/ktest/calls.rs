@@ -16,7 +16,7 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::session::{self, Session};
-use crate::thread::{self, Thread};
+use crate::thread::{self, THREADS, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
@@ -31,6 +31,7 @@ use kcore::handles::CHUNK;
 use kcore::layout::{LINEAR_BASE, USER_END};
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
+use kcore::token::MAX_COUNT;
 
 /// The line `debug_write_checks_its_arguments` prints: 64 bytes, all of
 /// x2-x9. xtask looks for it in the output.
@@ -992,6 +993,28 @@ fn new_thread_cases(c: &Caller, low: NonNull<Process>, h: Handle) -> Result<(), 
     check(zero, "the buffer is not zeroed")
 }
 
+/// thread_create whose quota covers the frame of the new thread's buffer
+/// but no table to map it: NO_MEMORY, and the frame goes back to the
+/// allocator and to the quota, with the thread (spec 7.5, 7.8, 11).
+pub fn buffer_that_does_not_map_goes_back(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let args = thread_args(own.0, USER_VA as u64, 0x80_1000, 10, FIFO, BUFFER);
+        let before = (process::quota(c.process).used(), phys::free_frames());
+        let result = with_quota_left(c, PAGE_SIZE, || {
+            c.fails(Call::ThreadCreate.number(), &args, Error::NoMemory)
+        });
+        cleanup::drain();
+        c.close(own)?;
+        result?;
+        check(
+            (process::quota(c.process).used(), phys::free_frames()) == before
+                && process::translate(c.process, BUFFER as usize).is_none(),
+            "the frame of a buffer that did not map stayed taken",
+        )
+    })
+}
+
 /// process_kill ends a process whatever state its threads are in: a ready
 /// thread leaves the queue, a stopped one ends where it is (spec 11), both
 /// in the call. The process's space and its threads' buffers go with the
@@ -1196,8 +1219,18 @@ fn with_used_quota(
     c: &Caller,
     body: impl FnOnce() -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
+    with_quota_left(c, 0, body)
+}
+
+/// Runs `body` with all but `left` bytes of the caller's quota charged,
+/// and refunds the charge afterwards.
+fn with_quota_left(
+    c: &Caller,
+    left: u64,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let q = process::quota(c.process);
-    let rest = q.limit() - q.returned() - q.used();
+    let rest = q.limit() - q.returned() - q.used() - left;
     process::charge(c.process, rest).map_err(|_| "the rest of the quota did not charge")?;
     let result = body();
     process::refund(c.process, rest);
@@ -2130,4 +2163,139 @@ pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
         })
     })?;
     check(timers::in_use() == timers, "the dying timer stayed")
+}
+
+/// A thread whose count of requests reached its end gets BAD_STATE from
+/// send (spec 6.1, 11): after the checks of the description and of the
+/// handle, before the state of the channel, a closed one too; x0 alone
+/// changes, and nothing waits.
+pub fn call_counter_runs_out_as_bad_state(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let copies = channel_of(c, h).and_then(|ch| {
+            Ok([
+                c.insert(Object::Channel(ch), Rights::SEND)?,
+                c.insert(Object::Channel(ch), Rights::NOTIFY)?,
+            ])
+        });
+        let index = thread::index(c.thread);
+        sched::locked(|k| k.tokens.skip_to(index, MAX_COUNT));
+        let result = copies.and_then(|[send, notify]| {
+            let n = Call::Send.number();
+            c.fails(n, &[send.0, 1 << 15], Error::InvalidArgs)?;
+            c.fails(n, &[notify.0, 0], Error::AccessDenied)?;
+            c.fails(n, &[send.0, 8, 1, 2], Error::BadState)?;
+            c.fails(n, &[send.0, NO_WAIT], Error::BadState)?;
+            // The last handle with RECEIVE goes, and the channel closes.
+            c.close(h)?;
+            c.fails(n, &[send.0, 0], Error::BadState)?;
+            c.close(send)?;
+            c.close(notify)
+        });
+        cleanup::drain();
+        result
+    })
+}
+
+/// The system has thread::THREADS numbers (spec 8, 11): with all but one
+/// taken, thread_create makes a thread and fails the next with
+/// LIMIT_REACHED, x0 alone changing; with no quota left too, the limit
+/// comes first. The numbers come back.
+pub fn thread_limit_of_the_system(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let mut taken = [0u16; THREADS];
+        let n = sched::locked(|k| {
+            let mut n = 0;
+            while k.tokens.available() > 1 {
+                taken[n] = k.tokens.alloc(NonNull::dangling()).expect("a free number");
+                n += 1;
+            }
+            n
+        });
+        let create = Call::ThreadCreate.number();
+        let args = |buffer| thread_args(own.0, USER_VA as u64, 0x80_1000, 10, FIFO, buffer);
+        let result = c.created(create, &args(BUFFER)).and_then(|t| {
+            let past = c
+                .fails(create, &args(BUFFER + PAGE_SIZE), Error::LimitReached)
+                .and_then(|()| {
+                    with_used_quota(c, || {
+                        c.fails(create, &args(BUFFER + PAGE_SIZE), Error::LimitReached)
+                    })
+                });
+            c.close(t)?;
+            past
+        });
+        sched::locked(|k| taken[..n].iter().for_each(|&i| k.tokens.free(i)));
+        c.close(own)?;
+        result
+    })
+}
+
+/// Numbers go back to the table as their threads end, and with the
+/// portion of a thread that never started (spec 6.1, 7.7): a thread that
+/// cannot be made for want of quota takes none, and 1000 threads made,
+/// started and ended one after another, then 1000 made and let go without
+/// a start, leave as many numbers free as there were.
+pub fn thread_numbers_come_back(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let before = sched::locked(|k| k.tokens.available());
+        no_quota_takes_no_number(c)?;
+        for _ in 0..1000 {
+            let t = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            let started = thread::start(t);
+            // SAFETY: the test's reference goes after the thread left the
+            // scheduler, as a kill leaves it.
+            unsafe {
+                sched::exit(t, CAUSE);
+                thread::release(t, CAUSE);
+            }
+            started.map_err(|_| "a thread did not start")?;
+            cleanup::drain();
+        }
+        for _ in 0..1000 {
+            let t = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            // SAFETY: the test's reference, the only one, goes; the thread
+            // never started.
+            unsafe { thread::release(t, CAUSE) };
+            cleanup::drain();
+        }
+        check(
+            sched::locked(|k| k.tokens.available()) == before,
+            "thread numbers did not come back",
+        )
+    })
+}
+
+/// With the caller's quota used up, threads go into the free places of its
+/// pool of threads until the pool needs a page: then `thread::create`
+/// fails with NO_MEMORY and takes no number (spec 7.8). The threads made
+/// go again.
+fn no_quota_takes_no_number(c: &Caller) -> Result<(), &'static str> {
+    let before = sched::locked(|k| k.tokens.available());
+    let mut made = [None; 8];
+    let result = with_used_quota(c, || {
+        for (n, m) in made.iter_mut().enumerate() {
+            match thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
+                Ok(t) => *m = Some(t),
+                Err(e) => {
+                    return check(
+                        e == Error::NoMemory
+                            && sched::locked(|k| k.tokens.available()) == before - n,
+                        "a thread_create out of quota took a number",
+                    );
+                }
+            }
+        }
+        Err("threads did not run out of quota")
+    });
+    for t in made.into_iter().flatten() {
+        // SAFETY: the test's reference, the only one, goes; the thread
+        // never started.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    cleanup::drain();
+    result
 }

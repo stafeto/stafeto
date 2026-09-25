@@ -28,7 +28,7 @@ use abi::{
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Process, Resource, Thread, Timer};
-use rt::sys::{self, Received, Regs};
+use rt::sys::{self, Received, Regs, Reply, Token};
 use rt::{Handle, Stack, init, println, time};
 
 rt::entry!(main);
@@ -37,7 +37,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 57] = [
+const TESTS: [Test; 99] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -159,10 +159,6 @@ const TESTS: [Test; 57] = [
         exit_priority_under_the_ceiling,
     ),
     (
-        "failed_create_keeps_the_start_handle",
-        failed_create_keeps_the_start_handle,
-    ),
-    (
         "start_channel_moves_into_the_child",
         start_channel_moves_into_the_child,
     ),
@@ -193,6 +189,132 @@ const TESTS: [Test; 57] = [
     ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
     ("timer_never_fires_early", timer_never_fires_early),
     ("timer_limit_is_64", timer_limit_is_64),
+    ("send_checks_its_arguments", send_checks_its_arguments),
+    (
+        "request_carries_registers_and_label",
+        request_carries_registers_and_label,
+    ),
+    (
+        "bytes_past_the_length_come_as_zero",
+        bytes_past_the_length_come_as_zero,
+    ),
+    ("reply_carries_registers_back", reply_carries_registers_back),
+    ("second_reply_is_bad_state", second_reply_is_bad_state),
+    (
+        "send_without_waiting_is_would_block",
+        send_without_waiting_is_would_block,
+    ),
+    (
+        "send_without_waiting_to_a_waiting_server_gets_the_reply",
+        send_without_waiting_to_a_waiting_server_gets_the_reply,
+    ),
+    ("requests_come_by_priority", requests_come_by_priority),
+    (
+        "requests_and_notifications_share_one_order",
+        requests_and_notifications_share_one_order,
+    ),
+    (
+        "server_below_its_client_runs_at_the_client",
+        server_below_its_client_runs_at_the_client,
+    ),
+    ("boost_ends_with_its_reply", boost_ends_with_its_reply),
+    ("other_reply_keeps_the_boost", other_reply_keeps_the_boost),
+    ("receive_ends_a_request_boost", receive_ends_a_request_boost),
+    (
+        "high_client_waits_for_one_started_request",
+        high_client_waits_for_one_started_request,
+    ),
+    (
+        "send_to_a_closed_channel_is_peer_closed",
+        send_to_a_closed_channel_is_peer_closed,
+    ),
+    (
+        "queued_client_gets_peer_closed_on_close",
+        queued_client_gets_peer_closed_on_close,
+    ),
+    (
+        "accepted_request_outlives_the_close",
+        accepted_request_outlives_the_close,
+    ),
+    ("close_runs_at_the_top_waiter", close_runs_at_the_top_waiter),
+    (
+        "client_gone_comes_after_queued_requests",
+        client_gone_comes_after_queued_requests,
+    ),
+    (
+        "set_priority_moves_a_waiting_sender",
+        set_priority_moves_a_waiting_sender,
+    ),
+    (
+        "notification_boost_outlives_an_older_reply",
+        notification_boost_outlives_an_older_reply,
+    ),
+    (
+        "exited_threads_hold_no_numbers",
+        exited_threads_hold_no_numbers,
+    ),
+    ("buffer_address_is_in_tpidrro", buffer_address_is_in_tpidrro),
+    ("long_request_arrives_whole", long_request_arrives_whole),
+    ("long_reply_arrives_whole", long_reply_arrives_whole),
+    (
+        "short_message_leaves_the_buffers_alone",
+        short_message_leaves_the_buffers_alone,
+    ),
+    (
+        "kernel_leaves_bytes_0_to_63_of_the_buffer",
+        kernel_leaves_bytes_0_to_63_of_the_buffer,
+    ),
+    ("bytes_past_the_length_stay", bytes_past_the_length_stay),
+    // Before the tests that fill init's table: a table that grew to its
+    // limit takes no chunk again.
+    (
+        "receiver_quota_fails_the_sender",
+        receiver_quota_fails_the_sender,
+    ),
+    (
+        "failed_create_keeps_the_start_handle",
+        failed_create_keeps_the_start_handle,
+    ),
+    ("handles_move_with_a_request", handles_move_with_a_request),
+    ("handles_move_with_a_reply", handles_move_with_a_reply),
+    ("rights_stay_narrowed", rights_stay_narrowed),
+    (
+        "label_travels_with_its_handle",
+        label_travels_with_its_handle,
+    ),
+    (
+        "receive_right_moves_without_closing_the_channel",
+        receive_right_moves_without_closing_the_channel,
+    ),
+    (
+        "a_failed_check_takes_no_handle",
+        a_failed_check_takes_no_handle,
+    ),
+    (
+        "peer_closed_takes_the_handles",
+        peer_closed_takes_the_handles,
+    ),
+    (
+        "full_waiting_receiver_fails_the_sender",
+        full_waiting_receiver_fails_the_sender,
+    ),
+    (
+        "queued_request_that_does_not_fit_fails_its_sender",
+        queued_request_that_does_not_fit_fails_its_sender,
+    ),
+    (
+        "reply_that_does_not_fit_fails_both",
+        reply_that_does_not_fit_fails_both,
+    ),
+    (
+        "closed_handle_stays_bad_after_many_transfers",
+        closed_handle_stays_bad_after_many_transfers,
+    ),
+    (
+        "send_handle_cannot_travel_in_its_own_send",
+        send_handle_cannot_travel_in_its_own_send,
+    ),
+    ("same_handle_twice_is_invalid", same_handle_twice_is_invalid),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -222,7 +344,7 @@ const LEAST_QUOTA: u64 = 8 * 1024;
 /// Rounds of `create_kill_cycles_leak_nothing`.
 const CYCLES: u32 = 1000;
 /// Threads of init's own process a test may have at a time.
-const SLOTS: usize = 2;
+const SLOTS: usize = 4;
 /// The label of the copy of a test's exit channel that names its
 /// children (process_create x3).
 const CHILD: u64 = 0xC41D;
@@ -2037,8 +2159,10 @@ fn exit_priority_under_the_ceiling() -> Outcome {
 /// A child that fails leaves the start channel with init (spec 13.3): a
 /// quota of a page falls short at entry 0 of the child's table, NO_MEMORY,
 /// and x0 alone changes; the handle x5 named still works, and init has its
-/// quota back. The exit channel of the failed call gets its slot back: the
-/// channel goes afterwards with no source left.
+/// quota back. With init's table full the call fails with LIMIT_REACHED
+/// before it makes anything (spec 11), x0 alone, and x5 stays as well. The
+/// exit channel of the failed calls gets its slot back: the channel goes
+/// afterwards with no source left.
 fn failed_create_keeps_the_start_handle() -> Outcome {
     let c = channel(QUIET)?;
     let exit = copy(&c, Rights::NOTIFY)?;
@@ -2048,6 +2172,10 @@ fn failed_create_keeps_the_start_handle() -> Outcome {
     x[0] = PAGE as u64;
     let after = raw_create(x);
     let back = used();
+    let n = fill_table(0)?;
+    let y = create_regs(exit.raw(), QUIET.into(), c.raw());
+    let full = raw_create(y);
+    empty_table(n)?;
     let posted = sys::notify(&c, 1);
     let got = take_one(&c);
     let kept = c.close();
@@ -2056,6 +2184,10 @@ fn failed_create_keeps_the_start_handle() -> Outcome {
     check(
         failed(after, x, Error::NoMemory),
         "a child with a quota of a page did not fail with NO_MEMORY alone",
+    )?;
+    check(
+        failed(full, y, Error::LimitReached),
+        "a child with init's table full did not fail with LIMIT_REACHED alone",
     )?;
     check(
         posted.is_ok() && got == Ok(unlabeled(1, 1)) && kept.is_ok(),
@@ -2505,4 +2637,2072 @@ fn timer_limit_is_64() -> Outcome {
         freed == Some(Ok(())) && remade,
         "no new timer fit once one went",
     )
+}
+
+// Requests and replies (spec 6.1, 6.6): init and threads of its own
+// process are clients and services of one another.
+
+/// The label of a client's copy of a channel.
+const CLIENT_LABEL: u64 = 0xC11E;
+
+/// Per slot: the handle the thread there uses (`client`, `server`), and
+/// what it got (`result`).
+static HANDLES: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+static RESULTS: [[AtomicU64; 12]; SLOTS] = [const { [const { AtomicU64::new(0) }; 12] }; SLOTS];
+/// Per slot: the thread there came back from its call.
+static ENDED: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+/// x0-x9 of the send of `raw_client`.
+static RAW: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Mark 1 when `server` took its request.
+static SEEN: AtomicU64 = AtomicU64::new(0);
+
+fn reset_results() {
+    reset_marks();
+    SEEN.store(0, Relaxed);
+    for word in RESULTS
+        .iter()
+        .flatten()
+        .chain(&HANDLES)
+        .chain(&ENDED)
+        .chain(&RAW)
+    {
+        word.store(0, Relaxed);
+    }
+}
+
+/// What the thread in `slot` got: the error code of its call or 0, then
+/// as `send` or `receive` leave a message: the length, the words of bytes
+/// 0-63, the label and the token.
+fn result(slot: usize) -> [u64; 12] {
+    core::array::from_fn(|i| RESULTS[slot][i].load(Relaxed))
+}
+
+fn record(slot: usize, words: &[u64]) {
+    for (r, &w) in RESULTS[slot].iter().zip(words) {
+        r.store(w, Relaxed);
+    }
+}
+
+/// Whether the thread in `slot` came back from its call.
+fn ended(slot: usize) -> bool {
+    ENDED[slot].load(Relaxed) == 1
+}
+
+/// The channel handle that HANDLES holds for `slot`.
+fn handle(slot: usize) -> Handle<Channel> {
+    Handle::from_raw(abi::Handle(HANDLES[slot].load(Relaxed)))
+}
+
+/// The 16 bytes the client in `slot` sends.
+fn request(slot: usize) -> [u8; 16] {
+    core::array::from_fn(|i| (16 * slot + i + 1) as u8)
+}
+
+/// `bytes` as x2-x9 carry them.
+fn words(bytes: &[u8]) -> [u64; 8] {
+    abi::inline_words(bytes)
+}
+
+/// send with raw registers.
+fn raw_send(x: Regs) -> Regs {
+    // SAFETY: send only reads its registers; the calls that come here fail
+    // or are answered by threads of the test.
+    unsafe { sys::raw::<{ Call::Send.number() }>(x) }
+}
+
+/// reply with raw registers.
+fn raw_reply(x: Regs) -> Regs {
+    // SAFETY: reply only reads its registers and never waits.
+    unsafe { sys::raw::<{ Call::Reply.number() }>(x) }
+}
+
+/// The token of the request queued in `c`, taken without waiting.
+fn take_token(c: &Handle<Channel>) -> Result<Token, &'static str> {
+    match sys::try_receive(c) {
+        Ok(Received::Message { token, .. }) => Ok(token),
+        _ => Err("no request came"),
+    }
+}
+
+/// A client of a test in `slot`: sends request(slot) through the handle
+/// HANDLES holds for it and waits for the reply, which `result` gives,
+/// with 0 for the code; then ends.
+extern "C" fn client(slot: u64) -> ! {
+    let s = slot as usize;
+    match sys::send(&handle(s), &request(s)) {
+        Ok(reply) => {
+            let mut w = [0; 10];
+            w[1] = reply.len as u64;
+            w[2..].copy_from_slice(&reply.words);
+            record(s, &w);
+        }
+        Err(e) => record(s, &[e.code()]),
+    }
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A client that sends with the registers RAW holds and leaves x0-x9 of
+/// the call in `result`; then ends.
+extern "C" fn raw_client(slot: u64) -> ! {
+    let s = slot as usize;
+    let after = raw_send(core::array::from_fn(|i| RAW[i].load(Relaxed)));
+    record(s, &after);
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A service in `slot`: takes a request on the channel HANDLES holds for
+/// it and leaves its length, words, label and token in `result`, and mark
+/// 1 at that moment in SEEN; answers with the request's own bytes and
+/// leaves the reply's code in `result`; sets mark 2 and ends.
+extern "C" fn server(slot: u64) -> ! {
+    let s = slot as usize;
+    match sys::receive(&handle(s)) {
+        Ok(Received::Message {
+            label,
+            len,
+            token,
+            words,
+            ..
+        }) => {
+            let mut w = [0; 12];
+            w[1] = len as u64;
+            w[2..10].copy_from_slice(&words);
+            w[10] = label;
+            w[11] = token.raw();
+            record(s, &w);
+            SEEN.store(mark(1), Relaxed);
+            let bytes = abi::inline_bytes(&words);
+            let replied = token.reply(&bytes[..len.min(abi::INLINE_MAX)]);
+            RESULTS[s][0].store(replied.map_or_else(|e| e.code(), |()| 0), Relaxed);
+        }
+        Ok(_) => record(s, &[u64::MAX]),
+        Err(e) => record(s, &[e.code()]),
+    }
+    MARKS[2].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// send and reply check their values first (spec 6.1, 11): a length above
+/// 1024, more than 4 handles, a bit no description has, and NO_WAIT for
+/// reply fail with INVALID_ARGS before the handle or the token is looked
+/// at; then the handle of send: BAD_HANDLE, WRONG_TYPE for a process,
+/// ACCESS_DENIED for a copy without SEND, and PEER_CLOSED once the channel
+/// closed. Each changes x0 alone. rt refuses more than 1024 bytes
+/// itself.
+fn send_checks_its_arguments() -> Outcome {
+    let c = channel(QUIET)?;
+    let notify_only = copy(&c, Rights::NOTIFY)?;
+    let shut = channel(QUIET)?;
+    let left = copy(&shut, Rights::SEND)?;
+    let gone = shut.raw();
+    close(shut)?;
+    let cases = [
+        (c.raw(), 1025, Error::InvalidArgs),
+        (c.raw(), 5 << abi::HANDLES_SHIFT, Error::InvalidArgs),
+        (c.raw(), 1 << 11, Error::InvalidArgs),
+        (c.raw(), 1 << 24, Error::InvalidArgs),
+        (c.raw(), 1 << 63, Error::InvalidArgs),
+        (gone, 1025, Error::InvalidArgs),
+        (gone, 8, Error::BadHandle),
+        (init::PROCESS.raw(), 8, Error::WrongType),
+        (notify_only.raw(), 8, Error::AccessDenied),
+        (left.raw(), 8, Error::PeerClosed),
+    ];
+    let sent = cases.map(|(h, desc, error)| {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[h.0, desc]);
+        failed(raw_send(x), x, error)
+    });
+    let replied =
+        [(0, abi::NO_WAIT), (1 << 16, abi::NO_WAIT | 8), (0, 1025)].map(|(token, desc)| {
+            let mut x = marked();
+            x[..2].copy_from_slice(&[token, desc]);
+            failed(raw_reply(x), x, Error::InvalidArgs)
+        });
+    let typed = sys::send(&c, &[0; abi::MESSAGE_MAX + 1]);
+    close(notify_only)?;
+    close(left)?;
+    close(c)?;
+    check(
+        sent.iter().all(|&ok| ok),
+        "send took a bad description or handle, or changed more than x0",
+    )?;
+    check(
+        replied.iter().all(|&ok| ok),
+        "reply took a bad description or looked at the token first",
+    )?;
+    check(
+        typed == Err(Error::InvalidArgs),
+        "rt sent more than 1024 bytes",
+    )
+}
+
+/// Spec 15.2 (messages): a request carries its bytes 0-63 in x2-x9 and
+/// comes with the label of the handle it went through (spec 5.3, 6.1). A
+/// client above init sends 16 bytes through a copy with a label, and then
+/// another through the channel's own handle; init takes each request
+/// without waiting: its bytes, no handles, a token that is not 0, and the
+/// label, or 0. Init's reply lets each client go.
+fn request_carries_registers_and_label() -> Outcome {
+    let c = channel(QUIET)?;
+    let labelled = session(&c, Rights::SEND, CLIENT_LABEL, QUIET)?;
+    let result = [(&labelled, CLIENT_LABEL), (&c, 0)]
+        .into_iter()
+        .try_for_each(|(h, label)| {
+            reset_results();
+            HANDLES[0].store(h.raw().0, Relaxed);
+            let t = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+            let taken = match sys::try_receive(&c) {
+                Ok(Received::Message {
+                    label: l,
+                    len,
+                    handles,
+                    token,
+                    words: w,
+                }) => {
+                    let whole = (l, len, handles, w) == (label, 16, 0, words(&request(0)));
+                    let named = token.raw() != 0;
+                    token.reply(&[]).is_ok() && whole && named
+                }
+                _ => false,
+            };
+            close(t)?;
+            check(
+                taken,
+                "the request did not come with its bytes, its label and a token",
+            )?;
+            check(
+                ended(0) && result(0)[..2] == [0, 0],
+                "the client did not get the reply",
+            )
+        });
+    close(labelled)?;
+    close(c)?;
+    result
+}
+
+/// Bytes past the length come as zeros (spec 6.1): a client sends 13 bytes
+/// through raw registers with every bit of x2-x9 set; init takes x2 whole,
+/// the low 5 bytes of x3 and zeros in x4-x9.
+fn bytes_past_the_length_come_as_zero() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let x: Regs = core::array::from_fn(|i| match i {
+        0 => c.raw().0,
+        1 => 13,
+        _ => u64::MAX,
+    });
+    for (r, v) in RAW.iter().zip(x) {
+        r.store(v, Relaxed);
+    }
+    let t = spawn(0, raw_client, 0, HIGH, Policy::Fifo)?;
+    let (seen, replied) = match sys::try_receive(&c) {
+        Ok(Received::Message {
+            len, words, token, ..
+        }) => (Some((len, words)), token.reply(&[]).is_ok()),
+        _ => (None, false),
+    };
+    close(t)?;
+    close(c)?;
+    let mut want = [0; 8];
+    want[0] = u64::MAX;
+    want[1] = (1 << 40) - 1;
+    check(
+        seen == Some((13, want)),
+        "the bytes past the length did not come as zeros",
+    )?;
+    check(replied && ended(0), "the client did not get the reply")
+}
+
+/// Spec 15.2 (messages): the reply comes back in x0-x9 of send (spec 6.1,
+/// 11): 0, its description and its bytes. Init answers a client with 13
+/// bytes through raw registers, every bit of x2-x9 set: the client gets x2
+/// whole, 5 bytes of x3 and zeros, and init's reply changes its x0 alone.
+/// A second client gets 64 bytes whole.
+fn reply_carries_registers_back() -> Outcome {
+    let c = channel(QUIET)?;
+    let result = reply_rounds(&c);
+    close(c)?;
+    result
+}
+
+fn reply_rounds(c: &Handle<Channel>) -> Outcome {
+    reset_results();
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let t = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+    let mut x = [u64::MAX; 10];
+    x[0] = take_token(c)?.raw();
+    x[1] = 13;
+    let after = raw_reply(x);
+    close(t)?;
+    let mut want = [0; 10];
+    want[1] = 13;
+    want[2] = u64::MAX;
+    want[3] = (1 << 40) - 1;
+    check(
+        after[0] == 0 && after[1..] == x[1..],
+        "reply failed or changed more than x0",
+    )?;
+    check(
+        ended(0) && result(0)[..10] == want,
+        "the reply did not come with zeros past its length",
+    )?;
+    HANDLES[1].store(c.raw().0, Relaxed);
+    let t = spawn(1, client, 1, HIGH, Policy::Fifo)?;
+    let bytes: [u8; 64] = core::array::from_fn(|i| 0xC0 ^ i as u8);
+    let replied = take_token(c)?.reply(&bytes);
+    close(t)?;
+    let mut want = [0; 10];
+    want[1] = 64;
+    want[2..].copy_from_slice(&words(&bytes));
+    check(
+        replied.is_ok() && ended(1) && result(1)[..10] == want,
+        "the 64 bytes of a reply did not come whole",
+    )
+}
+
+/// A client that sends twice through the channel HANDLES holds for
+/// `slot`, the second time once the first reply came; `result` gives the
+/// second reply. Ends then.
+extern "C" fn client_twice(slot: u64) -> ! {
+    let s = slot as usize;
+    let first = sys::send(&handle(s), &request(s));
+    let second = sys::send(&handle(s), &request(s));
+    record(s, &[first.and(second).map_or_else(|e| e.code(), |_| 0)]);
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (messages): a token answers once (spec 6.1). Init answers a
+/// client, which sends again at once; while init holds the second request,
+/// the first token, the count after the second and count 0 fail with
+/// BAD_STATE, change x0 alone and leave the client waiting; the second
+/// token answers it.
+fn second_reply_is_bad_state() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let t = spawn(0, client_twice, 0, HIGH, Policy::Fifo)?;
+    let result = second_rounds(&c);
+    close(t)?;
+    close(c)?;
+    result
+}
+
+fn second_rounds(c: &Handle<Channel>) -> Outcome {
+    let first = take_token(c)?;
+    let stale = first.raw();
+    let replied = first.reply(&[]);
+    let second = take_token(c)?;
+    let raw = second.raw();
+    let again = [stale, raw + (1 << 16), raw & 0xFFFF].map(|v| {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[v, 0]);
+        failed(raw_reply(x), x, Error::BadState)
+    });
+    let waited = !ended(0);
+    let last = second.reply(&[]);
+    check(
+        replied.is_ok() && last.is_ok() && ended(0) && result(0)[0] == 0,
+        "a reply did not reach the client",
+    )?;
+    check(
+        again.iter().all(|&ok| ok) && waited,
+        "an old, guessed or zero token was taken, or the call changed more than x0",
+    )
+}
+
+/// Spec 15.2 (refusals): send with NO_WAIT fails with WOULD_BLOCK when no
+/// thread waits in receive (spec 6.1), changes x0 alone and queues
+/// nothing. A thread above init makes the call, so init finds its result
+/// when spawn returns; a request it left would get a reply, so that the
+/// thread never stays waiting.
+fn send_without_waiting_is_would_block() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[c.raw().0, abi::NO_WAIT | 8]);
+    for (r, v) in RAW.iter().zip(x) {
+        r.store(v, Relaxed);
+    }
+    let t = spawn(0, raw_client, 0, HIGH, Policy::Fifo)?;
+    let (came_back, after) = (ended(0), result(0));
+    let left = match sys::try_receive(&c) {
+        Ok(Received::Message { token, .. }) => {
+            let _ = token.reply(&[]);
+            true
+        }
+        got => got != Err(Error::WouldBlock),
+    };
+    close(c)?;
+    let_run()?;
+    close(t)?;
+    check(
+        came_back && after[0] == Error::WouldBlock.code() && after[1..10] == x[1..],
+        "send with NO_WAIT and no receiver did not fail with WOULD_BLOCK alone",
+    )?;
+    check(!left, "a send that failed left a request")
+}
+
+/// With NO_WAIT, send to a service that waits in receive goes through
+/// (spec 6.1): the service takes the request at once, and init waits for
+/// the reply all the same: its own bytes back.
+fn send_without_waiting_to_a_waiting_server_gets_the_reply() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let s = spawn(0, server, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let bytes = request(3);
+    let got = sys::try_send(&c, &bytes);
+    let_run()?;
+    close(s)?;
+    close(c)?;
+    check(
+        got == Ok(Reply {
+            len: 16,
+            handles: 0,
+            words: words(&bytes),
+        }),
+        "send with NO_WAIT to a waiting service did not get the reply",
+    )?;
+    check(
+        mark(2) == 1 && result(0)[0] == 0,
+        "the service's reply failed",
+    )
+}
+
+/// Spec 15.2 (priorities): requests wait by the priorities of their
+/// clients, within a level in the order they came (spec 6.3). Clients at
+/// 10, 30 and 20 send in that order, through copies labelled with their
+/// priorities, before init receives; init takes them as 30, 20, 10.
+fn requests_come_by_priority() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let levels = [LEVEL, HIGH, TEST_PRIORITY];
+    let mut copies = [const { None }; 3];
+    for (i, &level) in levels.iter().enumerate() {
+        let h = session(&c, Rights::SEND, level.into(), QUIET)?;
+        HANDLES[i].store(h.raw().0, Relaxed);
+        copies[i] = Some(h);
+    }
+    let mut threads = [const { None }; 3];
+    for (i, &level) in levels.iter().enumerate() {
+        threads[i] = Some(spawn(i, client, i as u64, level, Policy::Fifo)?);
+        // Each sends before the next: the client at 30 at once, the others
+        // once init lets them.
+        let_run()?;
+    }
+    let got = [(); 3].map(|()| sys::try_receive(&c));
+    let labels = got.each_ref().map(|g| match g {
+        Ok(Received::Message { label, .. }) => *label,
+        _ => 0,
+    });
+    let replied = answer_all(got);
+    let_run()?;
+    for h in threads.into_iter().flatten() {
+        close(h)?;
+    }
+    for h in copies.into_iter().flatten() {
+        close(h)?;
+    }
+    close(c)?;
+    check(
+        labels == [30, 20, 10],
+        "the requests did not come by the priorities of their clients",
+    )?;
+    check(
+        replied && (0..3).all(ended),
+        "a client did not get its reply",
+    )
+}
+
+/// Answers each request among `got` with no bytes; true when every reply
+/// went.
+fn answer_all<const N: usize>(got: [Result<Received, Error>; N]) -> bool {
+    got.into_iter().all(|g| match g {
+        Ok(Received::Message { token, .. }) => token.reply(&[]).is_ok(),
+        _ => true,
+    })
+}
+
+/// Requests and notifications wait in one order by level (spec 6.3):
+/// clients at 30 and 10 send, and init notifies the channel, whose slot of
+/// label 0 has priority 25: receive gives the request at 30, the
+/// notification, then the request at 10.
+fn requests_and_notifications_share_one_order() -> Outcome {
+    reset_results();
+    let c = channel(NOTICE)?;
+    let high = session(&c, Rights::SEND, HIGH.into(), QUIET)?;
+    let low = session(&c, Rights::SEND, LEVEL.into(), QUIET)?;
+    HANDLES[0].store(high.raw().0, Relaxed);
+    HANDLES[1].store(low.raw().0, Relaxed);
+    let a = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+    let b = spawn(1, client, 1, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let posted = sys::notify(&c, 1);
+    let got = [(); 3].map(|()| sys::try_receive(&c));
+    let order = got.each_ref().map(|g| match g {
+        Ok(Received::Message { label, .. }) => *label,
+        Ok(Received::Notification {
+            source: Source::Unlabeled,
+            ..
+        }) => NOTICE.into(),
+        _ => 0,
+    });
+    let replied = answer_all(got);
+    let_run()?;
+    for h in [a, b] {
+        close(h)?;
+    }
+    for h in [high, low, c] {
+        close(h)?;
+    }
+    check(
+        posted.is_ok() && order == [30, 25, 10],
+        "the requests and the notification did not come in one order by level",
+    )?;
+    check(
+        replied && ended(0) && ended(1),
+        "a client did not get its reply",
+    )
+}
+
+/// Spec 15.2 (priorities): a service below its client works at the
+/// client's priority from the request on (spec 6.6). A service at 10
+/// waits, a thread at init's level 20 is ready behind init, and a client
+/// at 30 sends: the service answers before the thread at 20 runs, which it
+/// sees in that thread's mark, and the client has its reply by the time
+/// init runs again.
+fn server_below_its_client_runs_at_the_client() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[2].store(c.raw().0, Relaxed);
+    let s = spawn(0, server, 0, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let peer = spawn(1, add_mark, 1, TEST_PRIORITY, Policy::Fifo)?;
+    let k = spawn(2, client, 2, HIGH, Policy::Fifo)?;
+    let answered = ended(2);
+    let_run()?;
+    for h in [k, peer, s] {
+        close(h)?;
+    }
+    close(c)?;
+    check(
+        answered && SEEN.load(Relaxed) == 0,
+        "the service did not answer at its client's priority before the thread at 20 ran",
+    )?;
+    check(
+        mark(1) == 1 && mark(2) == 1,
+        "the thread at 20 or the service did not end",
+    )
+}
+
+/// The boost by a client ends with the reply to it (spec 6.6): a service
+/// at 10 takes the request of a client at 30 and answers it, and it drops
+/// to 10 at once: init at 20 runs before the service goes on past its
+/// reply.
+fn boost_ends_with_its_reply() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[1].store(c.raw().0, Relaxed);
+    let s = spawn(0, server, 0, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let k = spawn(1, client, 1, HIGH, Policy::Fifo)?;
+    let (answered, went_on) = (ended(1), mark(2));
+    let_run()?;
+    for h in [k, s] {
+        close(h)?;
+    }
+    close(c)?;
+    check(answered, "the client did not get the reply")?;
+    check(
+        went_on == 0,
+        "the service went on past its reply at its client's priority",
+    )?;
+    check(mark(2) == 1, "the service did not end")
+}
+
+/// A service that takes two requests on the channel HANDLES holds for
+/// `slot`, the second while it holds the first; it answers the first and
+/// sets mark 2, answers the second and sets mark 3, and ends.
+extern "C" fn serve_two(slot: u64) -> ! {
+    let c = handle(slot as usize);
+    if let (
+        Ok(Received::Message { token: first, .. }),
+        Ok(Received::Message { token: second, .. }),
+    ) = (sys::receive(&c), sys::receive(&c))
+    {
+        let _ = first.reply(&[]);
+        MARKS[2].store(1, Relaxed);
+        let _ = second.reply(&[]);
+        MARKS[3].store(1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// A reply with another token keeps the boost (spec 6.6): a service at 10
+/// takes the request of a client at 25, then in its next receive that of
+/// a client at 30, which boosts it to 30. It answers the first and goes on
+/// at 30: its mark is there before init at 20 runs. It answers the second
+/// and drops to 10: init runs before it goes on.
+fn other_reply_keeps_the_boost() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    for h in &HANDLES[..3] {
+        h.store(c.raw().0, Relaxed);
+    }
+    let s = spawn(0, serve_two, 0, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let first = spawn(1, client, 1, NOTICE, Policy::Fifo)?;
+    let second = spawn(2, client, 2, HIGH, Policy::Fifo)?;
+    let (kept, dropped, answered) = (mark(2), mark(3), ended(1) && ended(2));
+    let_run()?;
+    for h in [first, second, s] {
+        close(h)?;
+    }
+    close(c)?;
+    check(answered, "a client did not get its reply")?;
+    check(kept == 1, "a reply with another token ended the boost")?;
+    check(
+        dropped == 0,
+        "the reply with the boost's own token did not end it",
+    )
+}
+
+/// A service that takes a request on the channel HANDLES holds for
+/// `slot`, asks it again without waiting, sets mark 2, and mark 3 when
+/// that found nothing; then answers and ends.
+extern "C" fn serve_after_empty_receive(slot: u64) -> ! {
+    let c = handle(slot as usize);
+    if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
+        let again = sys::try_receive(&c);
+        MARKS[2].store(1, Relaxed);
+        MARKS[3].store(u64::from(again == Err(Error::WouldBlock)), Relaxed);
+        let _ = token.reply(&[]);
+    }
+    sys::thread_exit()
+}
+
+/// The next receive ends the boost by a client (spec 6.6): a service at 10
+/// takes the request of a client at 30 and asks the channel again without
+/// waiting: WOULD_BLOCK, and it drops to 10, so init at 20 runs before it
+/// goes on; its reply from 10 still reaches the client.
+fn receive_ends_a_request_boost() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[1].store(c.raw().0, Relaxed);
+    let s = spawn(0, serve_after_empty_receive, 0, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let k = spawn(1, client, 1, HIGH, Policy::Fifo)?;
+    let went_on = mark(2);
+    let_run()?;
+    for h in [k, s] {
+        close(h)?;
+    }
+    close(c)?;
+    check(
+        went_on == 0,
+        "the service went on at its client's priority past its next receive",
+    )?;
+    check(
+        mark(3) == 1 && ended(1) && result(1)[0] == 0,
+        "the second receive found something, or the client did not get the reply",
+    )
+}
+
+/// The service of `high_client_waits_for_one_started_request`: takes a
+/// request on the channel HANDLES holds for slot 0 and holds it until the
+/// channel of slot 3 gets a notification, as for work of its own; answers
+/// it, and takes the next request at once. SEEN gets mark 1 at the first
+/// reply, mark 0 mark 1 at the second take. It answers that request too,
+/// sets mark 3 and ends.
+extern "C" fn worker(_: u64) -> ! {
+    let c = handle(0);
+    if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
+        let _ = sys::receive(&handle(3));
+        SEEN.store(mark(1), Relaxed);
+        let _ = token.reply(&[]);
+        if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
+            MARKS[0].store(mark(1), Relaxed);
+            let _ = token.reply(&[]);
+        }
+    }
+    MARKS[3].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The spinning thread of `high_client_waits_for_one_started_request`:
+/// counts in mark 1, notifies the channel HANDLES holds for slot 3 once,
+/// and counts on until mark 3 is set; then ends.
+extern "C" fn spin(_: u64) -> ! {
+    MARKS[1].fetch_add(1, Relaxed);
+    let _ = sys::notify(&handle(3), 1);
+    while mark(3) == 0 {
+        MARKS[1].fetch_add(1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (priorities): a client above others waits for at most one
+/// request its service began (spec 6.6). A service at 30 takes the request
+/// of a client at 10 and holds it; a client at 25 sends meanwhile, and a
+/// thread at 20 counts and then lets the service go on. The service
+/// answers the first request and takes the second at once: the counting
+/// thread did not run in between, and both clients get their replies.
+fn high_client_waits_for_one_started_request() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let work = channel(QUIET)?;
+    for (h, v) in HANDLES.iter().zip([&c, &c, &c, &work]) {
+        h.store(v.raw().0, Relaxed);
+    }
+    let s = spawn(0, worker, 0, HIGH, Policy::Fifo)?;
+    let first = spawn(1, client, 1, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let counting = spawn(3, spin, 3, TEST_PRIORITY, Policy::Fifo)?;
+    let second = spawn(2, client, 2, NOTICE, Policy::Fifo)?;
+    let_run()?;
+    for h in [s, first, counting, second] {
+        close(h)?;
+    }
+    close(work)?;
+    close(c)?;
+    let (at_reply, at_take) = (SEEN.load(Relaxed), mark(0));
+    check(ended(1) && ended(2), "a client did not get its reply")?;
+    check(
+        at_reply > 0 && at_take == at_reply,
+        "the thread at 20 ran between the reply and the next request",
+    )
+}
+
+// The departure of a side (spec 5.3, 6.8, 7.7): a closed channel refuses
+// requests and wakes those that wait; a request a service took outlives
+// the close; CLIENT_GONE comes after the requests of its label; a thread
+// gives its number back as it ends.
+
+/// Spec 15.2 (refusals): send through any handle of a channel whose last
+/// handle with RECEIVE went fails with PEER_CLOSED (spec 6.8), with
+/// NO_WAIT too, and changes x0 alone.
+fn send_to_a_closed_channel_is_peer_closed() -> Outcome {
+    let c = channel(QUIET)?;
+    let plain = copy(&c, Rights::SEND)?;
+    let named = session(&c, Rights::SEND, CLIENT_LABEL, QUIET)?;
+    close(c)?;
+    let sent = [(&plain, 8), (&named, 8), (&plain, abi::NO_WAIT | 8)].map(|(h, desc)| {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[h.raw().0, desc]);
+        failed(raw_send(x), x, Error::PeerClosed)
+    });
+    close(plain)?;
+    close(named)?;
+    check(
+        sent.iter().all(|&ok| ok),
+        "send to a closed channel did not fail with PEER_CLOSED alone",
+    )
+}
+
+/// Spec 15.2 (refusals): a request that waits in the queue of a channel
+/// whose last handle with RECEIVE goes gets PEER_CLOSED (spec 6.8): a
+/// client below init sends through a copy with SEND and waits; init closes
+/// its own handle, and the stage Close wakes the client, whose send fails
+/// with PEER_CLOSED in x0 alone.
+fn queued_client_gets_peer_closed_on_close() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let sender = copy(&c, Rights::SEND)?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[sender.raw().0, 8]);
+    for (r, v) in RAW.iter().zip(x) {
+        r.store(v, Relaxed);
+    }
+    let t = spawn(0, raw_client, 0, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let waited = !ended(0);
+    close(c)?;
+    let_run()?;
+    close(t)?;
+    close(sender)?;
+    check(waited, "the client did not wait")?;
+    let after = result(0);
+    check(
+        ended(0) && after[0] == Error::PeerClosed.code() && after[1..10] == x[1..],
+        "the queued client did not get PEER_CLOSED alone when the channel closed",
+    )
+}
+
+/// Spec 15.2 (refusals): a request a service took outlives the close of
+/// its channel (spec 6.8): init takes the request of a client, closes the
+/// channel's last handle with RECEIVE, and answers; the client gets the
+/// reply.
+fn accepted_request_outlives_the_close() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let sender = copy(&c, Rights::SEND)?;
+    HANDLES[0].store(sender.raw().0, Relaxed);
+    let t = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c);
+    close(c)?;
+    let replied = token.map(|token| token.reply(&request(0)));
+    close(t)?;
+    close(sender)?;
+    let mut want = [0; 10];
+    want[1] = 16;
+    want[2..].copy_from_slice(&words(&request(0)));
+    check(
+        replied == Ok(Ok(())) && ended(0) && result(0)[..10] == want,
+        "the reply to a request taken before the close did not reach the client",
+    )
+}
+
+/// The stage Close runs at the level of the top thread that waits (spec
+/// 7.7): a thread at 30 waits in receive on a channel whose last handle
+/// with RECEIVE lies in a child with no code; a thread at 5 kills the
+/// child, whose teardown runs at 5, closes the channel with the child's
+/// handles and then tells a thread at 20 of the end through the exit
+/// channel. The waiter wakes with PEER_CLOSED before the thread at 20 runs.
+/// Then the same with a sender at 30 whose request waits in the queue.
+fn close_runs_at_the_top_waiter() -> Outcome {
+    [false, true].into_iter().try_for_each(close_round)
+}
+
+/// A round of `close_runs_at_the_top_waiter`: the thread at 30 sends when
+/// `sender`, and receives otherwise.
+fn close_round(sender: bool) -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let moved = copy(&c, Rights::RECEIVE | Rights::TRANSFER)?;
+    let (exits, name) = exit_channel()?;
+    let child = sys::process_create_with(CHILD_QUOTA, 16, LOW, Some((&name, QUIET)), Some(moved))
+        .map_err(|_| "process_create with a start channel failed")?;
+    let send = copy(&c, Rights::SEND)?;
+    let waits = if sender { &send } else { &c };
+    HANDLES[0].store(waits.raw().0, Relaxed);
+    HANDLES[1].store(exits.raw().0, Relaxed);
+    HANDLES[2].store(child.raw().0, Relaxed);
+    let entry = if sender {
+        send_then_look
+    } else {
+        receive_then_look
+    };
+    let w = spawn(0, entry, 0, HIGH, Policy::Fifo)?;
+    // The child's copy is the last handle with RECEIVE from now on.
+    close(c)?;
+    let m = spawn(1, mark_at_notice, 1, TEST_PRIORITY, Policy::Fifo)?;
+    let k = spawn(2, kill_child, 2, LOW, Policy::Fifo)?;
+    let_run()?;
+    for h in [w, m, k] {
+        close(h)?;
+    }
+    for h in [send, exits, name] {
+        close(h)?;
+    }
+    close(child)?;
+    let got = result(0);
+    check(
+        ended(0) && got[0] == Error::PeerClosed.code() && result(2)[0] == 0,
+        "the thread that waited did not get PEER_CLOSED, or process_kill failed",
+    )?;
+    check(
+        got[1] == 0 && mark(1) == 1,
+        "the thread at 20 ran before the stage Close woke the thread at 30",
+    )
+}
+
+/// Waits in receive on the channel HANDLES holds for `slot`; leaves the
+/// error code of the call and mark 1 at its return in `result`; ends.
+extern "C" fn receive_then_look(slot: u64) -> ! {
+    let s = slot as usize;
+    let code = sys::receive(&handle(s)).map_or_else(|e| e.code(), |_| 0);
+    record(s, &[code, mark(1)]);
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The same with send of request(slot).
+extern "C" fn send_then_look(slot: u64) -> ! {
+    let s = slot as usize;
+    let code = sys::send(&handle(s), &request(s)).map_or_else(|e| e.code(), |_| 0);
+    record(s, &[code, mark(1)]);
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Waits in receive on the channel HANDLES holds for `slot`, sets mark 1
+/// at its return, and ends.
+extern "C" fn mark_at_notice(slot: u64) -> ! {
+    let _ = sys::receive(&handle(slot as usize));
+    MARKS[1].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Kills the process whose handle HANDLES holds for `slot`, leaves the
+/// code of the call in `result`, and ends.
+extern "C" fn kill_child(slot: u64) -> ! {
+    let s = slot as usize;
+    let child = Handle::<Process>::from_raw(abi::Handle(HANDLES[s].load(Relaxed)));
+    let code = sys::process_kill(&child).map_or_else(|e| e.code(), |()| 0);
+    record(s, &[code]);
+    sys::thread_exit()
+}
+
+/// CLIENT_GONE comes after the requests of its label (spec 5.3): a client
+/// at 10 sends through a copy with a label, whose session's slot has
+/// priority 40, and init closes the copy, the last one, while the request
+/// waits in the queue. Init takes the request first, then CLIENT_GONE
+/// with the label: the request held a copy until init took it.
+fn client_gone_comes_after_queued_requests() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let named = session(&c, Rights::SEND, CLIENT_LABEL, 40)?;
+    HANDLES[0].store(named.raw().0, Relaxed);
+    let t = spawn(0, client, 0, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    close(named)?;
+    // The last receive finds nothing, which ends the boost of CLIENT_GONE.
+    let got = [(); 3].map(|()| sys::try_receive(&c));
+    let label = match &got[0] {
+        Ok(Received::Message { label, .. }) => *label,
+        _ => 0,
+    };
+    let after =
+        got[1] == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)) && got[2] == Err(Error::WouldBlock);
+    let replied = answer_all(got);
+    let_run()?;
+    close(t)?;
+    close(c)?;
+    check(
+        label == CLIENT_LABEL,
+        "the request did not come first, with its label",
+    )?;
+    check(after, "CLIENT_GONE did not come after the request")?;
+    check(
+        replied && ended(0) && result(0)[0] == 0,
+        "the client did not get the reply",
+    )
+}
+
+/// thread_set_priority moves a thread that waits in send in the channel's
+/// queue by the rules of the ready queue (spec 6.3): clients at 10, 10 and
+/// 11 send in that order through copies labelled 1, 2 and 3; init raises
+/// the second to 11, which puts it at the tail of 11, behind the third,
+/// and takes the requests: 3, 2, 1.
+fn set_priority_moves_a_waiting_sender() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let mut copies = [const { None }; 3];
+    for (i, h) in copies.iter_mut().enumerate() {
+        let s = session(&c, Rights::SEND, i as u64 + 1, QUIET)?;
+        HANDLES[i].store(s.raw().0, Relaxed);
+        *h = Some(s);
+    }
+    let mut threads = [const { None }; 3];
+    for (i, level) in [LEVEL, LEVEL, LEVEL + 1].into_iter().enumerate() {
+        threads[i] = Some(spawn(i, client, i as u64, level, Policy::Fifo)?);
+        // Each sends before the next, once init lets it.
+        let_run()?;
+    }
+    let raised = threads[1]
+        .as_ref()
+        .map(|t| sys::thread_set_priority(t, LEVEL + 1, Policy::Fifo));
+    let got = [(); 3].map(|()| sys::try_receive(&c));
+    let labels = got.each_ref().map(|g| match g {
+        Ok(Received::Message { label, .. }) => *label,
+        _ => 0,
+    });
+    let replied = answer_all(got);
+    let_run()?;
+    for h in threads.into_iter().flatten() {
+        close(h)?;
+    }
+    for h in copies.into_iter().flatten() {
+        close(h)?;
+    }
+    close(c)?;
+    check(
+        raised == Some(Ok(())) && labels == [3, 2, 1],
+        "the raised sender did not move to the tail of its new level",
+    )?;
+    check(
+        replied && (0..3).all(ended),
+        "a client did not get its reply",
+    )
+}
+
+/// The service of `notification_boost_outlives_an_older_reply`: takes a
+/// request on the channel HANDLES holds for `slot`, then a notification on
+/// it; answers the request and sets SEEN to 1 more than mark 1; ends.
+extern "C" fn answer_after_notice(slot: u64) -> ! {
+    let c = handle(slot as usize);
+    if let Ok(Received::Message { token, .. }) = sys::receive(&c) {
+        let _ = sys::receive(&c);
+        let _ = token.reply(&[]);
+        SEEN.store(mark(1) + 1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// A reply to an older request keeps the boost of a notification taken
+/// after it (spec 6.6): a service at 10 takes the request of a client at
+/// 15 and then, in its next receive, a notification of the channel's slot
+/// at 30; it answers the request and sets its mark still at 30, before a
+/// ready thread at init's level runs. That receive ended the boost by the
+/// request and forgot its token.
+fn notification_boost_outlives_an_older_reply() -> Outcome {
+    reset_results();
+    let c = channel(HIGH)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[1].store(c.raw().0, Relaxed);
+    let s = spawn(0, answer_after_notice, 0, LEVEL, Policy::Fifo)?;
+    let k = spawn(1, client, 1, 15, Policy::Fifo)?;
+    // The client's request waits until the service takes it, and the
+    // service waits again.
+    let_run()?;
+    let peer = spawn(2, add_mark, 1, TEST_PRIORITY, Policy::Fifo)?;
+    let posted = sys::notify(&c, 1);
+    let seen = SEEN.load(Relaxed);
+    let_run()?;
+    for h in [s, k, peer] {
+        close(h)?;
+    }
+    close(c)?;
+    check(
+        posted.is_ok() && seen == 1,
+        "the reply to the older request ended the boost of the notification",
+    )?;
+    check(
+        ended(1) && mark(1) == 1,
+        "the client did not get its reply, or the thread at 20 did not end",
+    )
+}
+
+/// More threads than the system has numbers (spec 8: 1024).
+const PAST_NUMBERS: usize = 1100;
+
+/// The handles `exited_threads_hold_no_numbers` keeps.
+static HELD: [AtomicU64; PAST_NUMBERS] = [const { AtomicU64::new(0) }; PAST_NUMBERS];
+
+/// A thread gives its number back as it ends (spec 6.1, 8): init makes
+/// more threads than the system has numbers, one after another, each above
+/// init, so that it runs and exits at once, and keeps its handle; none
+/// fails with LIMIT_REACHED. Then init closes the handles.
+fn exited_threads_hold_no_numbers() -> Outcome {
+    reset_marks();
+    let mut made = Ok(());
+    for held in &HELD {
+        let t = thread(0, add_mark, 0, HIGH, Policy::Fifo).and_then(|t| {
+            let started = sys::thread_start(&t);
+            held.store(t.raw().0, Relaxed);
+            started.map_err(|_| "thread_start failed")
+        });
+        if let Err(why) = t {
+            made = Err(why);
+            break;
+        }
+    }
+    for held in &HELD {
+        let h = held.swap(0, Relaxed);
+        if h != 0 {
+            close(Handle::<Thread>::from_raw(abi::Handle(h)))?;
+        }
+    }
+    check(
+        made.is_ok() && mark(0) == PAST_NUMBERS as u64,
+        "a thread that exited kept its number: thread_create failed",
+    )
+}
+
+// The message buffer (spec 6.2): TPIDRRO_EL0 holds its address; bytes 64
+// and up of a message go from the sender's buffer into the receiver's, at
+// their offsets, and the kernel leaves bytes 0-63 and the bytes past the
+// length alone.
+
+/// The seeds of the patterns of the buffer tests: init's buffer, a
+/// client's buffer, and the bytes of a message.
+const INIT_SEED: u8 = 0x11;
+const CLIENT_SEED: u8 = 0x5B;
+const MESSAGE_SEED: u8 = 0xC3;
+
+/// MESSAGE_MAX bytes that differ from those of another seed at each
+/// offset.
+fn pattern(seed: u8) -> [u8; abi::MESSAGE_MAX] {
+    core::array::from_fn(|i| (i as u8).wrapping_mul(31) ^ (i >> 8) as u8 ^ seed)
+}
+
+/// Fills the data of the calling thread's message buffer with
+/// pattern(seed).
+fn fill_buffer(seed: u8) {
+    rt::msgbuf::write(0, &pattern(seed));
+}
+
+/// The data of the calling thread's message buffer.
+fn buffer_data() -> [u8; abi::MESSAGE_MAX] {
+    let mut data = [0; abi::MESSAGE_MAX];
+    rt::msgbuf::read(0, &mut data);
+    data
+}
+
+/// Leaves the address of its message buffer in mark `i` and ends.
+extern "C" fn note_buffer(i: u64) -> ! {
+    MARKS[i as usize].store(rt::msgbuf::address() as u64, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 6.2: TPIDRRO_EL0 holds the address of the thread's message buffer:
+/// abi::INIT_MSGBUF for init's first thread, and for a thread
+/// thread_create made, the page it named.
+fn buffer_address_is_in_tpidrro() -> Outcome {
+    reset_marks();
+    let own = rt::msgbuf::address();
+    let t = spawn(0, note_buffer, 0, HIGH, Policy::Fifo)?;
+    close(t)?;
+    check(
+        own == abi::INIT_MSGBUF as usize,
+        "init's TPIDRRO_EL0 does not hold its message buffer",
+    )?;
+    check(
+        mark(0) == buffer(0) as u64,
+        "a new thread's TPIDRRO_EL0 does not hold its message buffer",
+    )
+}
+
+/// A client in slot 0 that fills its buffer with pattern(CLIENT_SEED),
+/// sends the first `len` bytes of pattern(MESSAGE_SEED) through the
+/// channel HANDLES holds for it, and leaves the code and the length of
+/// the reply in `result`; ends.
+extern "C" fn pattern_client(len: u64) -> ! {
+    fill_buffer(CLIENT_SEED);
+    match sys::send(&handle(0), &pattern(MESSAGE_SEED)[..len as usize]) {
+        Ok(reply) => record(0, &[0, reply.len as u64]),
+        Err(e) => record(0, &[e.code()]),
+    }
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (messages): a request of 1024 bytes arrives whole (spec 6.1,
+/// 6.2): a client above init sends pattern bytes, and init takes the
+/// request without waiting: its buffer holds all of them.
+fn long_request_arrives_whole() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let max = abi::MESSAGE_MAX;
+    let t = spawn(0, pattern_client, max as u64, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let whole = matches!(got, Ok(Received::Message { len, .. }) if len == max)
+        && buffer_data() == pattern(MESSAGE_SEED);
+    let replied = answer_all([got]);
+    close(t)?;
+    close(c)?;
+    check(whole, "the request of 1024 bytes did not arrive whole")?;
+    check(
+        replied && ended(0) && result(0)[..2] == [0, 0],
+        "the client did not get the reply",
+    )
+}
+
+/// A client in slot 0 that sends request(0) through the channel HANDLES
+/// holds for it and, once the reply came, leaves in `result` the code, the
+/// length of the reply and 1 when its buffer holds pattern(MESSAGE_SEED);
+/// ends.
+extern "C" fn client_looks(_: u64) -> ! {
+    match sys::send(&handle(0), &request(0)) {
+        Ok(reply) => {
+            let whole = buffer_data() == pattern(MESSAGE_SEED);
+            record(0, &[0, reply.len as u64, u64::from(whole)]);
+        }
+        Err(e) => record(0, &[e.code()]),
+    }
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (messages): a reply of 1024 bytes arrives whole: a client
+/// above init sends 16 bytes, init answers with pattern bytes, and the
+/// client's buffer holds all of them when its send returns.
+fn long_reply_arrives_whole() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let t = spawn(0, client_looks, 0, HIGH, Policy::Fifo)?;
+    let replied = take_token(&c).map(|token| token.reply(&pattern(MESSAGE_SEED)));
+    close(t)?;
+    close(c)?;
+    check(
+        replied == Ok(Ok(())) && ended(0),
+        "the reply failed or did not reach the client",
+    )?;
+    check(
+        result(0)[..3] == [0, abi::MESSAGE_MAX as u64, 1],
+        "the reply of 1024 bytes did not arrive whole",
+    )
+}
+
+/// A client in slot 0 that fills its buffer with pattern(CLIENT_SEED),
+/// sends 64 bytes through the channel HANDLES holds for it and leaves in
+/// `result` the code and 1 when its buffer still holds the pattern after
+/// the reply; ends.
+extern "C" fn short_client(_: u64) -> ! {
+    fill_buffer(CLIENT_SEED);
+    match sys::send(&handle(0), &[0xC5; abi::INLINE_MAX]) {
+        Ok(_) => record(0, &[0, u64::from(buffer_data() == pattern(CLIENT_SEED))]),
+        Err(e) => record(0, &[e.code()]),
+    }
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Messages of 64 bytes leave the buffers alone (spec 6.2): they travel in
+/// x2-x9 only. Init's buffer and a client's hold patterns; the client
+/// sends 64 bytes, init takes them and answers with 64: both buffers keep
+/// their patterns.
+fn short_message_leaves_the_buffers_alone() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    fill_buffer(INIT_SEED);
+    let t = spawn(0, short_client, 0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c);
+    let kept = buffer_data() == pattern(INIT_SEED);
+    let replied = token.map(|token| token.reply(&[0x3C; abi::INLINE_MAX]));
+    close(t)?;
+    close(c)?;
+    check(kept, "a request of 64 bytes changed the receiver's buffer")?;
+    check(
+        replied == Ok(Ok(())) && ended(0) && result(0)[..2] == [0, 1],
+        "a reply of 64 bytes changed the client's buffer",
+    )
+}
+
+/// A client in slot 0 that fills its buffer with pattern(CLIENT_SEED) and
+/// sends 8 bytes with raw registers through the channel HANDLES holds for
+/// it; then leaves in `result` x0-x2 of the call and 1 when its buffer
+/// holds bytes 64-127 of pattern(INIT_SEED) and its own pattern elsewhere;
+/// ends.
+extern "C" fn raw_looker(_: u64) -> ! {
+    fill_buffer(CLIENT_SEED);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[HANDLES[0].load(Relaxed), 8]);
+    let after = raw_send(x);
+    let mut want = pattern(CLIENT_SEED);
+    want[64..128].copy_from_slice(&pattern(INIT_SEED)[64..128]);
+    let seen = u64::from(buffer_data() == want);
+    record(0, &[after[0], after[1], after[2], seen]);
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The kernel leaves bytes 0-63 of the buffers alone (spec 6.2): they
+/// travel in x2-x9. A client fills its buffer with a pattern and sends;
+/// init fills its own with another and answers with 128 bytes through raw
+/// registers, every bit of x2-x9 set. The client gets init's registers in
+/// x2-x9 and bytes 64-127 of init's buffer; its own bytes 0-63 and past
+/// 127 stay.
+fn kernel_leaves_bytes_0_to_63_of_the_buffer() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let t = spawn(0, raw_looker, 0, HIGH, Policy::Fifo)?;
+    fill_buffer(INIT_SEED);
+    let mut x = [u64::MAX; 10];
+    x[1] = 128;
+    let after = take_token(&c).map(|token| {
+        x[0] = token.raw();
+        raw_reply(x)
+    });
+    close(t)?;
+    close(c)?;
+    check(
+        after.is_ok_and(|a| a[0] == 0) && ended(0),
+        "the reply failed or did not reach the client",
+    )?;
+    check(
+        result(0)[..4] == [0, 128, u64::MAX, 1],
+        "the kernel touched bytes 0-63 or past the length of a buffer",
+    )
+}
+
+/// The receiver's buffer past the length stays as it was (spec 6.2): init's
+/// buffer holds a pattern; a client, its buffer full of another, sends 100
+/// bytes, and init takes them: its buffer holds the 100 bytes and its own
+/// pattern after them.
+fn bytes_past_the_length_stay() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    fill_buffer(INIT_SEED);
+    let t = spawn(0, pattern_client, 100, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let came = matches!(got, Ok(Received::Message { len: 100, .. }));
+    let data = buffer_data();
+    let replied = answer_all([got]);
+    close(t)?;
+    close(c)?;
+    let mut want = pattern(INIT_SEED);
+    want[..100].copy_from_slice(&pattern(MESSAGE_SEED)[..100]);
+    check(
+        came && data == want,
+        "a request of 100 bytes changed the receiver's buffer past its length",
+    )?;
+    check(
+        replied && ended(0) && result(0)[..2] == [0, 0],
+        "the client did not get the reply",
+    )
+}
+
+// Handles in messages (spec 6.1, 6.2): a request or a reply carries up to
+// four handles, whose values lie in the message buffer; they move from the
+// sender's table into the receiver's with their rights and labels, and the
+// buffer tells the receiver the kind and the rights of each. They stay
+// with the sender when a check of the call fails, and go when the call
+// fails with PEER_CLOSED, LIMIT_REACHED or NO_MEMORY.
+
+/// The handles `handle_client` sends, and how many of them.
+static GIVEN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static GIVEN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Entries init's table has at most (kcore::handles::MAX_HANDLES): its
+/// limit, which the kernel sets.
+const INIT_HANDLES: usize = 16384;
+
+/// The copies `fill_table` made, which `empty_table` closes.
+static FILLED: [AtomicU64; INIT_HANDLES] = [const { AtomicU64::new(0) }; INIT_HANDLES];
+
+/// Values that name no live handle: the next generation of entry 1000 of
+/// init's table, which no test reaches (spec 5.1).
+const STALE: abi::Handle = abi::Handle::new(1000, 1 << 40);
+
+/// Sets the handles `handle_client` sends.
+fn give(handles: &[abi::Handle]) {
+    for (g, h) in GIVEN.iter().zip(handles) {
+        g.store(h.0, Relaxed);
+    }
+    GIVEN_COUNT.store(handles.len() as u64, Relaxed);
+}
+
+/// A client in `slot` that sends request(slot) with the handles GIVEN
+/// holds through the channel HANDLES holds for it, and leaves in `result`
+/// the code, the length and the count of handles of the reply, then the
+/// value and the info word of each handle the reply brought; ends.
+extern "C" fn handle_client(slot: u64) -> ! {
+    let s = slot as usize;
+    let n = GIVEN_COUNT.load(Relaxed) as usize;
+    let handles: [abi::Handle; 4] = core::array::from_fn(|i| abi::Handle(GIVEN[i].load(Relaxed)));
+    match sys::send_handles(&handle(s), &request(s), &handles[..n]) {
+        Ok(reply) => {
+            let mut w = [0; 11];
+            w[1] = reply.len as u64;
+            w[2] = reply.handles as u64;
+            for i in 0..reply.handles {
+                let (h, (kind, rights)) = rt::msgbuf::handle(i);
+                w[3 + 2 * i] = h.0;
+                w[4 + 2 * i] = abi::msgbuf::info(kind, rights);
+            }
+            record(s, &w);
+        }
+        Err(e) => record(s, &[e.code()]),
+    }
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// handle_close with the value `h`, for values that must be bad.
+fn close_raw(h: abi::Handle) -> Result<(), Error> {
+    Handle::<Channel>::from_raw(h).close()
+}
+
+/// Whether each of `handles` is gone: closing it is BAD_HANDLE.
+fn all_gone(handles: &[abi::Handle]) -> bool {
+    handles
+        .iter()
+        .all(|&h| close_raw(h) == Err(Error::BadHandle))
+}
+
+/// A copy of `h` with `rights` as a raw value, which the test hands the
+/// kernel in a message.
+fn copy_raw<K>(h: &Handle<K>, rights: Rights) -> Result<abi::Handle, &'static str> {
+    copy(h, rights).map(|c| c.raw())
+}
+
+/// x0-x9 of a raw send through `h` of 8 bytes and `handles`, whose values
+/// go into the message buffer, the rest marked.
+fn handle_regs(h: abi::Handle, handles: &[abi::Handle], flags: u64) -> Regs {
+    rt::msgbuf::put_handles(handles);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[
+        h.0,
+        8 | (handles.len() as u64) << abi::HANDLES_SHIFT | flags,
+    ]);
+    x
+}
+
+/// Fills init's table with copies of the system resource without rights
+/// until it has room for `room` handles more; returns how many copies it
+/// keeps, which `empty_table` closes.
+fn fill_table(room: usize) -> Result<usize, &'static str> {
+    let mut n = 0;
+    loop {
+        match sys::handle_duplicate(&init::RESOURCE, Rights::NONE) {
+            Ok(h) => FILLED[n].store(h.raw().0, Relaxed),
+            Err(Error::LimitReached) => break,
+            Err(_) => return Err("handle_duplicate failed"),
+        }
+        n += 1;
+    }
+    for _ in 0..room {
+        n -= 1;
+        close_raw(abi::Handle(FILLED[n].load(Relaxed))).map_err(|_| "handle_close failed")?;
+    }
+    Ok(n)
+}
+
+/// Closes the first `n` copies of `fill_table`.
+fn empty_table(n: usize) -> Outcome {
+    FILLED[..n].iter().try_for_each(|h| {
+        close_raw(abi::Handle(h.load(Relaxed))).map_err(|_| "handle_close failed")
+    })
+}
+
+/// Spec 15.2 (messages): handles move with a request (spec 6.1, 6.2). A
+/// client above init sends a copy of a channel, a timer, init's process
+/// and the system resource, each with TRANSFER and some other rights;
+/// init takes the request without waiting: four handles, whose info words
+/// give the kind and the rights of each, the same as the client's. The
+/// client's values are gone from the table (BAD_HANDLE), and the new ones
+/// live.
+fn handles_move_with_a_request() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    let tm = timer(&e)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let rights = [
+        Rights::SEND | Rights::NOTIFY | Rights::TRANSFER,
+        Rights::MANAGE | Rights::TRANSFER,
+        Rights::MANAGE | Rights::TRANSFER,
+        Rights::DEBUG | Rights::TRANSFER,
+    ];
+    let sent = [
+        copy_raw(&e, rights[0])?,
+        copy_raw(&tm, rights[1])?,
+        copy_raw(&init::PROCESS, rights[2])?,
+        copy_raw(&init::RESOURCE, rights[3])?,
+    ];
+    give(&sent);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let came: [_; 4] = core::array::from_fn(rt::msgbuf::handle);
+    let kinds = [
+        abi::ObjectKind::Channel,
+        abi::ObjectKind::Timer,
+        abi::ObjectKind::Process,
+        abi::ObjectKind::Resource,
+    ];
+    let four = matches!(got, Ok(Received::Message { handles: 4, .. }));
+    let told = (0..4).all(|i| came[i].1 == (kinds[i], rights[i]));
+    let replied = answer_all([got]);
+    let gone = all_gone(&sent);
+    let live = came.iter().all(|&(h, _)| close_raw(h).is_ok());
+    close(t)?;
+    for h in [c, e] {
+        close(h)?;
+    }
+    close(tm)?;
+    check(
+        four && told,
+        "the request did not bring four handles with their kinds and rights",
+    )?;
+    check(
+        gone && live,
+        "the handles did not leave the client's values for new ones",
+    )?;
+    check(
+        replied && ended(0) && result(0)[..3] == [0, 0, 0],
+        "the client did not get the reply",
+    )
+}
+
+/// Spec 15.2 (messages): handles move with a reply. A client above init
+/// sends; init answers with a copy of a channel and one of the client's
+/// thread: the client's send brings two handles, whose values and info
+/// words it leaves; init's values are gone, and the client's live.
+fn handles_move_with_a_reply() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    give(&[]);
+    let rights = [
+        Rights::NOTIFY | Rights::TRANSFER,
+        Rights::MANAGE | Rights::TRANSFER,
+    ];
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let sent = [copy_raw(&e, rights[0])?, copy_raw(&t, rights[1])?];
+    let replied = take_token(&c)?.reply_handles(&[], &sent);
+    let got = result(0);
+    let gone = all_gone(&sent);
+    let live = [got[3], got[5]]
+        .iter()
+        .all(|&h| close_raw(abi::Handle(h)).is_ok());
+    close(t)?;
+    close(c)?;
+    close(e)?;
+    let infos = [
+        abi::msgbuf::info(abi::ObjectKind::Channel, rights[0]),
+        abi::msgbuf::info(abi::ObjectKind::Thread, rights[1]),
+    ];
+    check(
+        replied.is_ok() && ended(0) && got[..3] == [0, 0, 2],
+        "the reply did not bring two handles",
+    )?;
+    check(
+        [got[4], got[6]] == infos,
+        "the handles of the reply came with other kinds or rights",
+    )?;
+    check(
+        gone && live,
+        "the handles did not leave init's values for the client's",
+    )
+}
+
+/// Spec 15.2 (messages): rights stay as narrow as the handle that moved
+/// (spec 5.2, 6.1). A client sends a copy of a channel with SEND and
+/// TRANSFER only; init's new handle says so, receives through it with
+/// ACCESS_DENIED, and cannot copy it without DUPLICATE.
+fn rights_stay_narrowed() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let narrow = Rights::SEND | Rights::TRANSFER;
+    give(&[copy_raw(&c, narrow)?]);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let (h, info) = rt::msgbuf::handle(0);
+    let came = Handle::<Channel>::from_raw(h);
+    let refused = sys::try_receive(&came) == Err(Error::AccessDenied)
+        && sys::handle_duplicate(&came, Rights::NONE) == Err(Error::AccessDenied);
+    let replied = answer_all([got]);
+    close(came)?;
+    close(t)?;
+    close(c)?;
+    check(
+        info == (abi::ObjectKind::Channel, narrow),
+        "the handle came with other rights",
+    )?;
+    check(refused, "a right the handle lacked came with it")?;
+    check(replied && ended(0), "the client did not get the reply")
+}
+
+/// Spec 15.2 (messages): a label travels with its handle, and the copies
+/// of its session stay as they were (spec 5.3): a client sends the only
+/// copy with a label of a channel; no CLIENT_GONE comes meanwhile, a
+/// notification through init's new handle comes with the label, and
+/// CLIENT_GONE comes once init closes it.
+fn label_travels_with_its_handle() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let named = session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?;
+    give(&[named.raw()]);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let (h, info) = rt::msgbuf::handle(0);
+    let came = Handle::<Channel>::from_raw(h);
+    let early = sys::try_receive(&e);
+    let posted = sys::notify(&came, 1);
+    let heard = take_one(&e);
+    close(came)?;
+    let gone = take_one(&e);
+    let replied = answer_all([got]);
+    close(t)?;
+    close(c)?;
+    close(e)?;
+    check(
+        early == Err(Error::WouldBlock),
+        "the session's CLIENT_GONE came while its handle moved",
+    )?;
+    check(
+        info == (abi::ObjectKind::Channel, Rights::NOTIFY | Rights::TRANSFER),
+        "a handle with a label came as another kind",
+    )?;
+    check(
+        posted.is_ok() && heard == Ok(labelled(CLIENT_LABEL, 1, 1)),
+        "a notification through the handle that moved lost its label",
+    )?;
+    check(
+        gone == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "CLIENT_GONE did not come once the handle that moved went",
+    )?;
+    check(replied && ended(0), "the client did not get the reply")
+}
+
+/// The last handle with RECEIVE moves without closing its channel (spec
+/// 5.3, 6.1): a client sends it; a copy with NOTIFY notifies meanwhile,
+/// and init receives the notification through its new handle; once init
+/// closes that, notify fails with PEER_CLOSED.
+fn receive_right_moves_without_closing_the_channel() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    let n = copy(&e, Rights::NOTIFY)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    give(&[e.raw()]);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let came = Handle::<Channel>::from_raw(rt::msgbuf::handle(0).0);
+    let open = sys::notify(&n, 1);
+    let heard = take_one(&came);
+    close(came)?;
+    let shut = sys::notify(&n, 1);
+    let replied = answer_all([got]);
+    close(n)?;
+    close(t)?;
+    close(c)?;
+    check(
+        open.is_ok() && heard == Ok(unlabeled(1, 1)),
+        "the channel closed when its last handle with RECEIVE moved",
+    )?;
+    check(
+        shut == Err(Error::PeerClosed),
+        "the channel stayed open once the handle that moved went",
+    )?;
+    check(replied && ended(0), "the client did not get the reply")
+}
+
+/// The handles stay with the sender when a check of the call fails (spec
+/// 6.1, 11): a bad x0, one of another kind or without SEND, a handle of the
+/// message without TRANSFER or bad after good ones, and NO_WAIT with no
+/// receiver fail send, as a token that names nothing fails reply; each
+/// changes x0 alone, and the good handles still close.
+fn a_failed_check_takes_no_handle() -> Outcome {
+    let c = channel(QUIET)?;
+    let notify_only = copy(&c, Rights::NOTIFY)?;
+    let e = channel(QUIET)?;
+    let good = [
+        copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?,
+        copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?,
+    ];
+    let held = copy_raw(&e, Rights::NOTIFY)?;
+    let [a, b] = good;
+    let cases = [
+        (STALE, &[a, b][..], 0, Error::BadHandle),
+        (init::PROCESS.raw(), &[a, b], 0, Error::WrongType),
+        (notify_only.raw(), &[a, b], 0, Error::AccessDenied),
+        (c.raw(), &[a, b, held], 0, Error::AccessDenied),
+        (c.raw(), &[a, b, STALE], 0, Error::BadHandle),
+        (c.raw(), &[a, b], abi::NO_WAIT, Error::WouldBlock),
+    ];
+    let sent = cases.map(|(h, handles, flags, error)| {
+        let x = handle_regs(h, handles, flags);
+        failed(raw_send(x), x, error)
+    });
+    let x = handle_regs(abi::Handle(1 << 16), &[a, b], 0);
+    let replied = failed(raw_reply(x), x, Error::BadState);
+    let kept = [a, b, held].iter().all(|&h| close_raw(h).is_ok());
+    close(notify_only)?;
+    close(c)?;
+    close(e)?;
+    check(
+        sent.iter().all(|&ok| ok),
+        "send with a failing check did not fail as it should, x0 alone",
+    )?;
+    check(
+        replied,
+        "reply with a bad token did not fail with BAD_STATE alone",
+    )?;
+    check(kept, "a call that failed a check took a handle")
+}
+
+/// PEER_CLOSED takes the handles (spec 6.1): send with two handles through
+/// a copy of a channel whose last handle with RECEIVE went fails with
+/// PEER_CLOSED in x0 alone, and the handles are gone.
+fn peer_closed_takes_the_handles() -> Outcome {
+    let c = channel(QUIET)?;
+    let left = copy(&c, Rights::SEND)?;
+    let e = channel(QUIET)?;
+    let sent = [
+        copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?,
+        copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?,
+    ];
+    close(c)?;
+    let x = handle_regs(left.raw(), &sent, 0);
+    let after = raw_send(x);
+    let gone = all_gone(&sent);
+    close(left)?;
+    close(e)?;
+    check(
+        failed(after, x, Error::PeerClosed),
+        "send to a closed channel did not fail with PEER_CLOSED alone",
+    )?;
+    check(gone, "PEER_CLOSED left the handles with the sender")
+}
+
+/// A receiver whose table has no room fails the sender (spec 6.1): a
+/// thread of init waits in receive, and init fills its own table but for
+/// three entries; send with four handles fails with LIMIT_REACHED in x0
+/// alone, the handles are gone, and the receiver waits on: a request with
+/// no handles and NO_WAIT then reaches it.
+fn full_waiting_receiver_fails_the_sender() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let w = spawn(0, server, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let sent: [abi::Handle; 4] = [
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+    ];
+    let n = fill_table(3)?;
+    let x = handle_regs(c.raw(), &sent, 0);
+    let after = raw_send(x);
+    empty_table(n)?;
+    let gone = all_gone(&sent);
+    let waited = result(0) == [0; 12];
+    let got = sys::try_send(&c, &request(1));
+    let_run()?;
+    close(w)?;
+    close(c)?;
+    check(
+        failed(after, x, Error::LimitReached),
+        "send to a receiver with no room did not fail with LIMIT_REACHED alone",
+    )?;
+    check(
+        gone && waited,
+        "the handles stayed, or the receiver took the request",
+    )?;
+    check(
+        got.is_ok() && result(0)[..2] == [0, 16] && result(0)[2..4] == words(&request(1))[..2],
+        "the receiver did not take the next request",
+    )
+}
+
+/// A receiver whose quota falls short for a chunk of its table fails the
+/// sender (spec 6.1, 7.5): a thread of init waits in receive; init fills
+/// its table to the end of a page of its pool of blocks, a child takes the
+/// rest of init's quota, and send with four handles fails with NO_MEMORY in
+/// x0 alone; the handles are gone, and the receiver waits on: a request
+/// with no handles and NO_WAIT then reaches it.
+fn receiver_quota_fails_the_sender() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let w = spawn(0, server, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let sent: [abi::Handle; 4] = [
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+    ];
+    // A free place in init's pool of shells for the child below.
+    close(child(LOW)?)?;
+    let n = fill_to_a_page()?;
+    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let rest = (own.quota - own.returned - own.used) / PAGE as u64 * PAGE as u64;
+    let hog = sys::process_create(rest, 16, LOW);
+    let x = handle_regs(c.raw(), &sent, 0);
+    let after = raw_send(x);
+    let made = hog.is_ok();
+    if let Ok(hog) = hog {
+        close(hog)?;
+    }
+    empty_table(n)?;
+    let gone = all_gone(&sent);
+    let waited = result(0) == [0; 12];
+    let got = sys::try_send(&c, &request(1));
+    let_run()?;
+    close(w)?;
+    close(c)?;
+    check(made, "the child that takes init's quota was not made")?;
+    check(
+        failed(after, x, Error::NoMemory),
+        "send to a receiver with no quota for a chunk did not fail with NO_MEMORY alone",
+    )?;
+    check(
+        gone && waited,
+        "the handles stayed, or the receiver took the request",
+    )?;
+    check(
+        got.is_ok() && result(0)[..2] == [0, 16],
+        "the receiver did not take the next request",
+    )
+}
+
+/// Fills init's table to the end of a page of its pool of blocks, which
+/// holds two chunks of 64 entries (spec 5.1, 7.8), but for one entry: the
+/// copy that makes init pay for a page starts the page's first chunk, and
+/// 126 more fill it and the second but for its last entry. Returns the
+/// copies, which `empty_table` closes; it closes them itself on a failure.
+fn fill_to_a_page() -> Result<usize, &'static str> {
+    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let mut n = 0;
+    let mut left = None;
+    while left != Some(0) {
+        let before = used();
+        let Ok(h) = sys::handle_duplicate(&init::RESOURCE, Rights::NONE) else {
+            empty_table(n)?;
+            return Err("handle_duplicate failed");
+        };
+        FILLED[n].store(h.raw().0, Relaxed);
+        n += 1;
+        left = match left {
+            Some(k) => Some(k - 1),
+            None if used() != before => Some(126),
+            None => None,
+        };
+    }
+    Ok(n)
+}
+
+/// A request whose handles do not fit fails its sender, and receive takes
+/// the next head (spec 6.1): a client below init sends four handles
+/// through a copy with a label, and another one no handles through the
+/// channel, and both wait; init closes the copy, so the first request
+/// holds the session's last copy (spec 5.3), fills its table and receives
+/// without waiting: the first client gets LIMIT_REACHED, and init gets the
+/// second request. Before the first client runs again, its handles are
+/// gone, the only copy of a session of another channel among them, whose
+/// CLIENT_GONE comes there; and so is the copy its request held, whose
+/// CLIENT_GONE comes after the second request.
+fn queued_request_that_does_not_fit_fails_its_sender() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    let named = session(&c, Rights::SEND, CLIENT_LABEL, QUIET)?;
+    HANDLES[0].store(named.raw().0, Relaxed);
+    HANDLES[1].store(c.raw().0, Relaxed);
+    let sent: [abi::Handle; 4] = [
+        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.raw(),
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+    ];
+    give(&sent);
+    let first = spawn(0, handle_client, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    close(named)?;
+    let second = spawn(1, client, 1, LOW, Policy::Fifo)?;
+    let_run()?;
+    let n = fill_table(0)?;
+    let got = sys::try_receive(&c);
+    empty_table(n)?;
+    let gone = all_gone(&sent);
+    let dropped = take_one(&e);
+    let released = take_one(&c);
+    let waited = !ended(0);
+    let words_of = match &got {
+        Ok(Received::Message { words, .. }) => Some(*words),
+        _ => None,
+    };
+    let replied = answer_all([got]);
+    let_run()?;
+    close(first)?;
+    close(second)?;
+    close(c)?;
+    close(e)?;
+    check(
+        ended(0) && result(0)[0] == Error::LimitReached.code(),
+        "the sender whose handles did not fit did not get LIMIT_REACHED",
+    )?;
+    check(waited, "the sender that failed ran before init looked")?;
+    check(
+        gone && dropped == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the handles of the request that failed stayed with its sender",
+    )?;
+    check(
+        released == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the request that failed kept its copy of the session",
+    )?;
+    check(
+        words_of == Some(words(&request(1))) && replied && ended(1) && result(1)[0] == 0,
+        "receive did not take the next request",
+    )
+}
+
+/// A reply whose handles do not fit fails both sides and uses the token up
+/// (spec 6.1): a client above init sends; init fills its table and answers
+/// with four handles, the only copy of a session of another channel among
+/// them: LIMIT_REACHED for the reply, in x0 alone, and for the client's
+/// send; the handles are gone, and CLIENT_GONE comes on the other channel;
+/// a second reply with the token is BAD_STATE. Init's next reply, with a
+/// handle, brings it to a second client: the reply that failed left
+/// nothing on its way.
+fn reply_that_does_not_fit_fails_both() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    for h in &HANDLES[..2] {
+        h.store(c.raw().0, Relaxed);
+    }
+    let sent: [abi::Handle; 4] = [
+        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.raw(),
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+    ];
+    let t = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c)?.raw();
+    let n = fill_table(0)?;
+    let x = handle_regs(abi::Handle(token), &sent, 0);
+    let after = raw_reply(x);
+    empty_table(n)?;
+    let gone = all_gone(&sent);
+    let dropped = take_one(&e);
+    let mut again = marked();
+    again[..2].copy_from_slice(&[token, 0]);
+    let second = raw_reply(again);
+    give(&[]);
+    let next = spawn(1, handle_client, 1, HIGH, Policy::Fifo)?;
+    let moved = copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?;
+    let replied = take_token(&c)?.reply_handles(&[], &[moved]);
+    let came = result(1);
+    let live = close_raw(abi::Handle(came[3])).is_ok();
+    close(t)?;
+    close(next)?;
+    close(c)?;
+    close(e)?;
+    check(
+        failed(after, x, Error::LimitReached),
+        "a reply with no room at the client did not fail with LIMIT_REACHED alone",
+    )?;
+    check(
+        ended(0) && result(0)[0] == Error::LimitReached.code(),
+        "the client's send did not fail with the reply",
+    )?;
+    check(
+        gone && dropped == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the handles of the reply that failed stayed",
+    )?;
+    check(
+        failed(second, again, Error::BadState),
+        "the reply that failed left its token",
+    )?;
+    check(
+        replied.is_ok() && ended(1) && came[..3] == [0, 0, 1] && live,
+        "the next reply did not bring its handle",
+    )
+}
+
+/// Rounds of `closed_handle_stays_bad_after_many_transfers`.
+const TRANSFERS: u64 = 1000;
+
+/// A client that sends TRANSFERS requests through the channel HANDLES
+/// holds for `slot`, each with a new copy of the handle GIVEN holds, the
+/// next once the reply came; leaves the first error or 0 in `result`;
+/// ends.
+extern "C" fn transfers(slot: u64) -> ! {
+    let s = slot as usize;
+    let object = Handle::<Channel>::from_raw(abi::Handle(GIVEN[0].load(Relaxed)));
+    let mut code = 0;
+    for _ in 0..TRANSFERS {
+        let sent = sys::handle_duplicate(&object, Rights::NOTIFY | Rights::TRANSFER)
+            .and_then(|h| sys::send_handles(&handle(s), &[], &[h.raw()]));
+        if let Err(e) = sent {
+            code = e.code();
+            break;
+        }
+    }
+    record(s, &[code]);
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (messages): a handle that was closed stays bad however often
+/// the client sends that object again (spec 5.1): a client sends a new copy
+/// of a channel 1000 times; init keeps the value of the first handle that
+/// came and closes each: the first value is BAD_HANDLE after every
+/// transfer, and no later one repeats it.
+fn closed_handle_stays_bad_after_many_transfers() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    give(&[e.raw()]);
+    let t = spawn(0, transfers, 0, HIGH, Policy::Fifo)?;
+    let mut first = None;
+    let mut bad = true;
+    for round in 0..TRANSFERS {
+        let got = sys::try_receive(&c);
+        let (h, _) = rt::msgbuf::handle(0);
+        let came = matches!(got, Ok(Received::Message { handles: 1, .. }));
+        let first = *first.get_or_insert(h);
+        bad &= came
+            && (round == 0) == (h == first)
+            && close_raw(h).is_ok()
+            && close_raw(first) == Err(Error::BadHandle);
+        if !answer_all([got]) {
+            bad = false;
+        }
+        if !bad {
+            break;
+        }
+    }
+    close(t)?;
+    close(c)?;
+    close(e)?;
+    check(
+        bad,
+        "the value of a handle that was closed came back or named a handle",
+    )?;
+    check(
+        ended(0) && result(0)[0] == 0,
+        "the client's transfers failed",
+    )
+}
+
+/// Spec 15.2 (messages): x0 of send cannot travel in its own message (spec
+/// 6.1): send whose handles hold x0, a channel or a copy with a label,
+/// fails with INVALID_ARGS in x0 alone, and the handle still works.
+fn send_handle_cannot_travel_in_its_own_send() -> Outcome {
+    let c = channel(QUIET)?;
+    let named = session(&c, Rights::SEND | Rights::TRANSFER, CLIENT_LABEL, QUIET)?;
+    let sent = [c.raw(), named.raw()].map(|h| {
+        let x = handle_regs(h, &[h], abi::NO_WAIT);
+        failed(raw_send(x), x, Error::InvalidArgs)
+    });
+    let posted = sys::notify(&c, 1);
+    let heard = take_one(&c);
+    close(named)?;
+    let gone = take_one(&c);
+    close(c)?;
+    check(
+        sent.iter().all(|&ok| ok),
+        "send took its own handle in its message",
+    )?;
+    check(
+        posted.is_ok() && heard == Ok(unlabeled(1, 1)),
+        "the channel's handle did not stay",
+    )?;
+    check(
+        gone == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the copy with a label did not stay",
+    )
+}
+
+/// A value listed twice in a message fails send and reply with
+/// INVALID_ARGS before anything is looked up (spec 6.1, 11), x0 alone; the
+/// handle stays.
+fn same_handle_twice_is_invalid() -> Outcome {
+    let c = channel(QUIET)?;
+    let e = channel(QUIET)?;
+    let a = copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?;
+    let x = handle_regs(c.raw(), &[a, a], abi::NO_WAIT);
+    let sent = failed(raw_send(x), x, Error::InvalidArgs);
+    let y = handle_regs(abi::Handle(0), &[a, a], 0);
+    let replied = failed(raw_reply(y), y, Error::InvalidArgs);
+    let kept = close_raw(a).is_ok();
+    close(c)?;
+    close(e)?;
+    check(sent, "send took a handle listed twice")?;
+    check(replied, "reply took a handle listed twice")?;
+    check(kept, "a handle listed twice was taken")
 }

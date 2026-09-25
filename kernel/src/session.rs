@@ -8,14 +8,17 @@
 //! takes one of the channel's slots (abi::MAX_SLOTS) until it goes. It lies
 //! in the pool of sessions of the process that made the call, which pays
 //! for it by the page (spec 7.8), and holds that process's shell until its
-//! slot goes back. It counts the handles that name it, its copies: when
-//! the last one goes, through handle_close or with the table of a process
-//! that ended, CLIENT_GONE goes into its slot while the channel is open
-//! (spec 5.3, 6.8). A session lives while references to it are left: its
-//! copies, the one `create` hands out, and its slot's while the slot stands
-//! in the channel's queue (spec 6.5), which receive and the channel's
-//! stage Close let go when they take the slot; the last one queues it, and
-//! its portion lets the channel and the payer's shell go.
+//! slot goes back. It counts its copies: the handles that name it, and the
+//! requests sent through them that wait in the channel's queue (spec 5.3,
+//! 6.1). When the last one goes, through handle_close, with the table of a
+//! process that ended, or as receive, the stage Close or the end of its
+//! thread takes the last such request, CLIENT_GONE goes into its slot while
+//! the channel is open (spec 5.3, 6.8): after every request of the label.
+//! A session lives while references to it are left: its copies, the one
+//! `create` hands out, and its slot's while the slot stands in the
+//! channel's queue (spec 6.5), which receive and the channel's stage Close
+//! let go when they take the slot; the last one queues it, and its portion
+//! lets the channel and the payer's shell go.
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
@@ -32,7 +35,8 @@ pub struct Session {
     /// Its copies, the reference `create` hands out, and its slot's while
     /// the slot is queued: the references that keep it.
     refs: u32,
-    /// Handles that name it (spec 5.3).
+    /// Handles that name it and requests through them that wait in the
+    /// channel's queue (spec 5.3).
     copies: u32,
     label: u64,
     /// The channel, which it holds with a counted reference.
@@ -125,9 +129,10 @@ pub fn label(s: NonNull<Session>) -> u64 {
     unsafe { (*s.as_ptr()).label }
 }
 
-/// Adds a handle with `rights` that names `s`: one more copy (spec 5.3).
-/// A copy with RECEIVE counts toward the channel's handles with RECEIVE
-/// as well, whose last one closes it.
+/// Adds a handle with `rights` that names `s`, or a request through one
+/// that waits in the channel's queue (no rights): one more copy (spec
+/// 5.3). A copy with RECEIVE counts toward the channel's handles with
+/// RECEIVE as well, whose last one closes it. Only counts.
 pub fn retain(s: NonNull<Session>, rights: Rights) {
     // SAFETY: the caller holds a reference, so the session is alive; only
     // the fields are touched.
@@ -143,15 +148,16 @@ pub fn retain(s: NonNull<Session>, rights: Rights) {
     }
 }
 
-/// Drops a handle with `rights` that named `s`, at `cause`: a copy with
-/// RECEIVE first leaves the channel's count, whose last one closes the
-/// channel. The last copy posts CLIENT_GONE, bit 63, into the session's
-/// slot (spec 5.3, 6.8), where it merges with the bits not yet received; a
-/// closed channel gets nothing (channel::post). Then the handle's
-/// reference goes (`unref`), and with nothing left the session goes. O(1).
+/// Drops a copy of `s` with `rights`, at `cause`: a handle, or a request
+/// that left the channel's queue. A copy with RECEIVE first leaves the
+/// channel's count, whose last one closes the channel. The last copy posts
+/// CLIENT_GONE, bit 63, into the session's slot (spec 5.3, 6.8), where it
+/// merges with the bits not yet received; a closed channel gets nothing
+/// (channel::post). Then the copy's reference goes (`unref`), and with
+/// nothing left the session goes. It takes the scheduler's lock. O(1).
 ///
 /// # Safety
-/// The handle was the caller's, and it is gone.
+/// The copy was the caller's, and it is gone.
 pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
     // SAFETY: the handle's reference keeps the session alive until its
     // `unref`; only the fields are touched.
@@ -174,9 +180,9 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
     }
 }
 
-/// The slot of `s` just went into its channel's queue (channel::post),
-/// which holds the session from now on (spec 6.5): until receive or the
-/// stage Close takes the slot and lets the reference go (`unref`).
+/// The slot of `s` just went into its channel's queue (channel::post), and
+/// it holds the session from now on (spec 6.5): until receive or the stage
+/// Close takes it and lets the reference go (`unref`).
 pub fn hold(s: NonNull<Session>) {
     // SAFETY: the channel's caller holds a reference to the session; only
     // the count is touched.

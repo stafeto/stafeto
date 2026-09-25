@@ -20,6 +20,12 @@ mod points {
     #[inline(always)]
     pub fn portion_done() {}
 
+    /// After a portion of the stage Close of a channel or of the stage
+    /// Replies of a process (channel::clean, process::clean): the level it
+    /// ran at and the heads it took.
+    #[inline(always)]
+    pub fn heads_taken(_: u8, _: usize) {}
+
     /// After the scheduler's part of the timer's interrupt
     /// (interrupt::handle).
     #[inline(always)]
@@ -48,6 +54,13 @@ mod points {
     #[inline(always)]
     pub fn init_ended() {}
 
+    /// Whether send takes its fast path, whose conditions hold
+    /// (channel::send, spec 6.4): always.
+    #[inline(always)]
+    pub fn fast_path() -> bool {
+        true
+    }
+
     /// Whether a BRK with immediate `imm` in kernel code is a test's marker
     /// to step over (exceptions::handle_exception): never, so every BRK
     /// stops the kernel.
@@ -66,6 +79,10 @@ mod points {
 
     pub fn portion_done() {
         el0::portion_done();
+    }
+
+    pub fn heads_taken(level: u8, heads: usize) {
+        el0::heads_taken(level, heads);
     }
 
     pub fn timer_fired() {
@@ -92,5 +109,10 @@ mod points {
 
     pub fn skip_brk(imm: u16) -> bool {
         ktest::brk(imm)
+    }
+
+    /// The tests count the fast path's hits and may turn it off.
+    pub fn fast_path() -> bool {
+        el0::fast_path()
     }
 }

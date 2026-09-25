@@ -7,14 +7,17 @@
 //! x0-x9, so that a later kernel may return more values, and `receive`
 //! x0-x11; the kernel keeps every other register. `raw` makes any call
 //! with any registers, for tests that hand the kernel bad ones; the
-//! functions after it are the typed calls of milestones 1.2c to 1.3b,
+//! functions after it are the typed calls of milestones 1.2c to 1.3c,
 //! which take and return handles typed by the kind of their object
-//! (`Handle`).
+//! (`Handle`), and the token of a request, which answers it once
+//! (`Token`).
 
 use crate::handle::{Channel, Handle, Process, Resource, Thread, Timer};
+use crate::msgbuf;
 use abi::{
-    Call, Error, KernelStats, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState,
-    Rights, Source,
+    Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX, Message,
+    Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT,
+    Source,
 };
 use core::arch::asm;
 
@@ -301,9 +304,11 @@ pub fn notify(channel: &Handle<Channel>, bits: u64) -> Result<(), Error> {
     call::<{ Call::Notify.number() }>(&[channel.raw().0, bits]).map(drop)
 }
 
-/// What `receive` took (spec 6.1, 6.5): a notification; requests come in
-/// milestone 1.3c.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What `receive` took (spec 6.1, 6.5): a notification, or a request with
+/// its bytes 0-63 and the token that answers it. A request of more than
+/// 64 bytes lies whole in the thread's message buffer (`msgbuf`), and so
+/// do the handles it brought (msgbuf::handle).
+#[derive(Debug, PartialEq, Eq)]
 pub enum Received {
     Notification {
         source: Source,
@@ -311,12 +316,170 @@ pub enum Received {
         bits: u64,
         count: u32,
     },
+    Message {
+        /// The label of the handle the request came through, 0 for none.
+        label: u64,
+        len: usize,
+        handles: usize,
+        token: Token,
+        /// Bytes 0-63 as abi::inline_words packs them, zero past `len`.
+        words: [u64; 8],
+    },
+}
+
+/// The token of a request `receive` took (spec 6.1, 13.2): the right to
+/// answer it once, from any thread of the process. It is neither `Copy`
+/// nor `Clone`, and `reply` takes it, so a second reply does not build.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Token(u64);
+
+// Token is not Clone, and so not Copy (spec 13.2): were it Clone, the
+// path below would name two impls of the trait, and the crate would not
+// build.
+const _: fn() = || {
+    trait AmbiguousIfClone<A> {
+        fn some_item() {}
+    }
+    impl<T> AmbiguousIfClone<()> for T {}
+    #[allow(dead_code)]
+    struct IsClone;
+    impl<T: Clone> AmbiguousIfClone<IsClone> for T {}
+    let _ = <Token as AmbiguousIfClone<_>>::some_item;
+};
+
+impl Token {
+    /// The value the kernel knows the token by, for tests that hand the
+    /// kernel values it must refuse.
+    pub const fn raw(&self) -> u64 {
+        self.0
+    }
+
+    /// reply: `bytes`, up to abi::MESSAGE_MAX, go to the client, whose
+    /// send returns them (spec 6.1): bytes 0-63 in x2-x9, the rest through
+    /// the message buffers. The call never waits. BAD_STATE when the token
+    /// names no request that waits for this process's reply, PEER_CLOSED
+    /// when its client ended while it waited. More bytes fail with
+    /// INVALID_ARGS, as the kernel would fail them.
+    pub fn reply(self, bytes: &[u8]) -> Result<(), Error> {
+        self.reply_handles(bytes, &[])
+    }
+
+    /// reply with `handles` as well, at most abi::MESSAGE_HANDLES, each
+    /// with TRANSFER: they move into the client's table with their rights
+    /// and labels (spec 6.1). They leave the caller's table when the call
+    /// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
+    /// NO_MEMORY; with the last two the table of the client had no room
+    /// for them, and its send fails the same way. On any other error they
+    /// stay.
+    pub fn reply_handles(self, bytes: &[u8], handles: &[abi::Handle]) -> Result<(), Error> {
+        let args = message_regs(self.0, bytes, handles, 0)?;
+        call::<{ Call::Reply.number() }>(&args).map(drop)
+    }
+}
+
+/// What `send` returns (spec 6.1): the reply's length, the count of
+/// handles it brought, and its bytes 0-63 as abi::inline_words packs them,
+/// zero past `len`. A reply of more than 64 bytes lies whole in the
+/// thread's message buffer (`msgbuf`), and so do its handles
+/// (msgbuf::handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reply {
+    pub len: usize,
+    pub handles: usize,
+    pub words: [u64; 8],
+}
+
+/// x0-x9 of a message of `bytes` and `handles` through `target`, a channel
+/// or a token, with `flags` in its description: bytes 0-63 in x2-x9, and
+/// the rest, written into the message buffer at their offsets, with the
+/// values of the handles (msgbuf::put_handles). INVALID_ARGS for more than
+/// abi::MESSAGE_MAX bytes or abi::MESSAGE_HANDLES handles.
+fn message_regs(
+    target: u64,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+    flags: u64,
+) -> Result<Regs, Error> {
+    if bytes.len() > MESSAGE_MAX || handles.len() > MESSAGE_HANDLES {
+        return Err(Error::InvalidArgs);
+    }
+    let (inline, rest) = bytes.split_at(bytes.len().min(INLINE_MAX));
+    msgbuf::write(INLINE_MAX, rest);
+    msgbuf::put_handles(handles);
+    let mut x = [0; 10];
+    x[0] = target;
+    x[1] = bytes.len() as u64 | (handles.len() as u64) << HANDLES_SHIFT | flags;
+    x[2..].copy_from_slice(&abi::inline_words(inline));
+    Ok(x)
+}
+
+/// After a message of `len` bytes came in x2-x9 as `words`: one of more
+/// than 64 bytes gets its bytes 0-63 into the message buffer too, where
+/// the kernel put the rest (spec 6.2).
+fn keep_whole(len: usize, words: &[u64; 8]) {
+    if len > INLINE_MAX {
+        msgbuf::write(0, &abi::inline_bytes(words));
+    }
+}
+
+/// send: the request `bytes`, up to abi::MESSAGE_MAX, through `channel`,
+/// a handle with SEND, with or without a label, and the wait for its reply
+/// (spec 6.1): bytes 0-63 go in x2-x9, the rest through the message
+/// buffers. The request waits by the caller's effective priority, and the
+/// receiver works at that priority until it answers (spec 6.6).
+/// PEER_CLOSED once the channel closed or when the service ended before
+/// its reply, BAD_STATE when the thread's count of requests ran out; more
+/// bytes fail with INVALID_ARGS.
+pub fn send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error> {
+    send_with(channel, bytes, &[], 0)
+}
+
+/// send with abi::NO_WAIT: WOULD_BLOCK when no thread waits in receive on
+/// the channel. A request a receiver took waits for its reply all the
+/// same.
+pub fn try_send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error> {
+    send_with(channel, bytes, &[], abi::NO_WAIT)
+}
+
+/// send with `handles` as well, at most abi::MESSAGE_HANDLES, each with
+/// TRANSFER, none of them `channel`: they move into the receiver's table
+/// with their rights and labels (spec 6.1), and the reply may bring handles
+/// back (msgbuf::handle). They leave the caller's table when the call
+/// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
+/// NO_MEMORY, the last two when the receiver's table or the reply's had no
+/// room for them; on any other error they stay.
+pub fn send_handles(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+) -> Result<Reply, Error> {
+    send_with(channel, bytes, handles, 0)
+}
+
+fn send_with(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+    flags: u64,
+) -> Result<Reply, Error> {
+    let args = message_regs(channel.raw().0, bytes, handles, flags)?;
+    let x = call::<{ Call::Send.number() }>(&args)?;
+    let mut words = [0; 11];
+    words[..9].copy_from_slice(&x[1..]);
+    let m = Message::from_words(words);
+    keep_whole(m.len, &m.words);
+    Ok(Reply {
+        len: m.len,
+        handles: m.handles,
+        words: m.words,
+    })
 }
 
 /// receive: waits until the channel has something and takes it. The caller
-/// works at the priority of the notification it took, under its ceiling,
-/// until its next receive (spec 6.6). PEER_CLOSED when the last handle
-/// with RECEIVE goes while the caller waits.
+/// works at the priority of the notification or of the client it took,
+/// under its ceiling, until its next receive or, for a request, its reply
+/// with the token (spec 6.6). PEER_CLOSED when the last handle with
+/// RECEIVE goes while the caller waits.
 pub fn receive(channel: &Handle<Channel>) -> Result<Received, Error> {
     receive_with(channel, 0)
 }
@@ -354,7 +517,18 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
     if let Some(e) = Error::from_code(x[0]) {
         return Err(e);
     }
-    let words = x[1..].try_into().expect("x1-x11");
+    let words: [u64; 11] = x[1..].try_into().expect("x1-x11");
+    if Source::from_code((words[0] >> SOURCE_SHIFT) & 0xF) == Source::Message {
+        let m = Message::from_words(words);
+        keep_whole(m.len, &m.words);
+        return Ok(Received::Message {
+            label: m.label,
+            len: m.len,
+            handles: m.handles,
+            token: Token(m.token),
+            words: m.words,
+        });
+    }
     let Notification {
         source,
         label,
