@@ -119,13 +119,6 @@ impl Process {
     /// MAX_BLOCKS blocks already. O(size) with interrupts masked: for tests
     /// and for loading init at boot; calls from programs map memory objects
     /// in portions (spec 7.7).
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "the loader of init (milestone 1.2c) maps frames; so far only the kernel tests do"
-        )
-    )]
     pub fn map_frames(&mut self, va: usize, size: u64, attrs: Attrs) -> Result<u64, Error> {
         if size == 0 || !size.is_multiple_of(PAGE_SIZE) || !(va as u64).is_multiple_of(PAGE_SIZE) {
             return Err(Error::InvalidArgs);
@@ -432,13 +425,6 @@ fn init_ended(_: ProcessState) -> ! {
 }
 
 /// Marks `process` as init (spec 13.3): its end ends the run.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the kernel starts init in milestone 1.2c; so far only the kernel tests do"
-    )
-)]
 pub fn set_init(process: NonNull<Process>) {
     // SAFETY: the caller holds a reference to the process.
     unsafe { (*process.as_ptr()).init = true };
@@ -560,13 +546,6 @@ pub fn close_handle(mut process: NonNull<Process>, h: Handle) -> Result<(), Erro
 /// INIT_BOOT_IMAGE stays bad (until milestone 1.3 brings the boot image as
 /// a memory object). The values follow from the order in a fresh table and
 /// are those abi fixes.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the kernel starts init in milestone 1.2c; so far only the kernel tests do"
-    )
-)]
 pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> Result<(), Error> {
     let handles = [
         insert_handle(init, Object::Resource, abi::INIT_RESOURCE_RIGHTS)?,

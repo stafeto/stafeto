@@ -321,6 +321,29 @@ pub enum Error {
     BadState = 9,
 }
 
+impl Error {
+    /// The error whose code x0 holds after a call; None for 0, which is
+    /// success, and for a code no error has.
+    pub const fn from_code(code: u64) -> Option<Error> {
+        match code {
+            1 => Some(Error::BadHandle),
+            2 => Some(Error::WrongType),
+            3 => Some(Error::AccessDenied),
+            4 => Some(Error::InvalidArgs),
+            5 => Some(Error::NoMemory),
+            6 => Some(Error::LimitReached),
+            7 => Some(Error::PeerClosed),
+            8 => Some(Error::WouldBlock),
+            9 => Some(Error::BadState),
+            _ => None,
+        }
+    }
+}
+
+/// The exit code of a program that panicked (lib/rt), the one Rust's own
+/// programs exit with.
+pub const PANIC_EXIT_CODE: u64 = 101;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +514,22 @@ mod tests {
         assert_eq!(Error::BadHandle as u32, 1);
         assert_eq!(Error::WouldBlock as u32, 8);
         assert_eq!(Error::BadState as u32, 9);
+    }
+
+    #[test]
+    fn error_codes_come_back_from_x0() {
+        for code in 1..=9 {
+            let e = Error::from_code(code).expect("a known code");
+            assert_eq!(e as u64, code);
+        }
+        assert_eq!(Error::from_code(4), Some(Error::InvalidArgs));
+        for code in [0, 10, 1 << 32, u64::MAX] {
+            assert_eq!(Error::from_code(code), None);
+        }
+    }
+
+    #[test]
+    fn a_panic_ends_a_program_with_its_own_code() {
+        assert_eq!(PANIC_EXIT_CODE, 101);
     }
 }

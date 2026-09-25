@@ -18,6 +18,7 @@ name = "init"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "rt",
 ]
 
 [[package]]
@@ -34,6 +35,21 @@ dependencies = [
  "abi",
  "bootimg",
  "kcore",
+]
+
+[[package]]
+name = "rt"
+version = "0.1.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
+name = "test-init"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
 ]
 
 [[package]]

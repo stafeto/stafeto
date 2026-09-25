@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The stafeto kernel. Milestone 1.2b: boot, read the device tree, set up
-//! the kernel's memory, the interrupt controller and the timer, report and
-//! power off. Threads of processes run at EL0 in the kernel tests only,
-//! until init comes in milestone 1.2c.
+//! The stafeto kernel. Milestone 1.2c: boot, read the device tree and the
+//! boot image, set up the kernel's memory, the interrupt controller, the
+//! timer and the scheduler, report, and start init from the boot image;
+//! init's end ends the run. Test builds run the kernel tests instead of
+//! init.
 
 #![no_std]
 #![no_main]
@@ -13,6 +14,8 @@
 mod console;
 mod arch;
 mod boot;
+#[cfg(not(feature = "ktest"))]
+mod init;
 mod interrupt;
 #[cfg(feature = "ktest")]
 mod ktest;
@@ -55,17 +58,19 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::probe::undefined_instruction();
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
-    finish(boot)
+    finish(boot, &init)
 }
 
+/// The kernel leaves for init (spec 13.3); init's exit turns the machine
+/// off, and its fault or kill stops it (process::init_ended).
 #[cfg(not(feature = "ktest"))]
-fn finish(_boot: &Boot) -> ! {
+fn finish(_boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");
-    psci::system_off()
+    init::start(program)
 }
 
 #[cfg(feature = "ktest")]
-fn finish(boot: &Boot) -> ! {
+fn finish(boot: &Boot, _program: &Program) -> ! {
     ktest::run(boot)
 }
 
