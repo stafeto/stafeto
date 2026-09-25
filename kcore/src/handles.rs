@@ -281,7 +281,10 @@ impl<T> Drop for HandleTable<T> {
         if std::thread::panicking() {
             return;
         }
-        debug_assert!(
+        // Only a check: the work is `release`'s, which needs the chunk
+        // source. The kernel builds without debug assertions, so the check
+        // is a plain assert.
+        assert!(
             self.chunk_count == 0,
             "handle table dropped without release"
         );
@@ -339,6 +342,15 @@ mod tests {
         assert_eq!(t.get(h), Ok((&42, RW)));
         assert_eq!(t.len(), 1);
         t.release(&mut src);
+    }
+
+    #[test]
+    #[should_panic(expected = "handle table dropped without release")]
+    fn a_table_dropped_without_release_stops() {
+        let mut src = boxes(1);
+        let mut t = table(10);
+        t.insert(&mut src, 1, RW).unwrap();
+        drop(t);
     }
 
     #[test]
