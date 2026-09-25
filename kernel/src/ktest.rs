@@ -751,31 +751,33 @@ fn read_user(va: usize) -> u64 {
 }
 
 /// An address space that a test destroys when it is done with it, also on
-/// an early return.
-struct TestSpace(AddressSpace);
+/// an early return. Only `drop` takes the space out.
+struct TestSpace(Option<AddressSpace>);
 
 impl Drop for TestSpace {
     fn drop(&mut self) {
-        self.0.destroy();
+        if let Some(space) = self.0.take() {
+            space.destroy();
+        }
     }
 }
 
 impl core::ops::Deref for TestSpace {
     type Target = AddressSpace;
     fn deref(&self) -> &AddressSpace {
-        &self.0
+        self.0.as_ref().expect("a test space until it drops")
     }
 }
 
 impl core::ops::DerefMut for TestSpace {
     fn deref_mut(&mut self) -> &mut AddressSpace {
-        &mut self.0
+        self.0.as_mut().expect("a test space until it drops")
     }
 }
 
 fn new_space() -> Result<TestSpace, &'static str> {
     AddressSpace::new()
-        .map(TestSpace)
+        .map(|space| TestSpace(Some(space)))
         .map_err(|_| "no frame for a root table")
 }
 

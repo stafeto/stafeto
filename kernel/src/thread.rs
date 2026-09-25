@@ -130,11 +130,8 @@ pub fn run(next: NonNull<Thread>) -> ! {
             }
             user::load_fp(&next.as_ref().fp);
         }
-        // TTBR0 itself says whose space it holds, whatever switched it.
         let mut process = next.as_ref().process;
-        if !process.as_ref().space.is_active() {
-            process.as_mut().space.activate();
-        }
+        process.as_mut().activate();
         user::enter(next.as_ptr().cast())
     }
 }

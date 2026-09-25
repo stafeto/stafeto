@@ -23,8 +23,9 @@ const MAX_BLOCKS: usize = 8;
 pub struct Process {
     /// Destroyed first by `destroy`: TTBR0 leaves its tables, its TLB
     /// entries go and the tables return to the allocator before `frames`
-    /// gives back the frames the tables mapped.
-    pub space: AddressSpace,
+    /// gives back the frames the tables mapped. Present from `create` on;
+    /// `destroy` takes it out, since destroying a space consumes it.
+    space: Option<AddressSpace>,
     frames: OwnedFrames,
     threads: usize,
 }
@@ -57,6 +58,31 @@ impl Drop for OwnedFrames {
 static PROCESSES: Lock<Pool<Process>> = Lock::new(Pool::new());
 
 impl Process {
+    fn space(&mut self) -> &mut AddressSpace {
+        self.space
+            .as_mut()
+            .expect("a process is used after its address space went")
+    }
+
+    /// Destroys the address space (AddressSpace::destroy); the process has
+    /// none afterwards.
+    fn destroy_space(&mut self) {
+        self.space
+            .take()
+            .expect("an address space is destroyed twice")
+            .destroy();
+    }
+
+    /// Puts the process's address space into TTBR0 unless it is there
+    /// already. TTBR0 itself says whose space it holds, whatever switched
+    /// it.
+    pub fn activate(&mut self) {
+        let space = self.space();
+        if !space.is_active() {
+            space.activate();
+        }
+    }
+
     /// Maps `size` bytes of fresh zeroed frames at `va` with `attrs` and
     /// returns their physical address, through which the kernel fills them
     /// (the linear map). The frames belong to the process until it goes.
@@ -101,7 +127,7 @@ impl Process {
         // Owned before it is mapped: on an error part of the range may be
         // mapped, and the frames must stay until the tables go.
         self.frames.0[slot] = Some((pa, order));
-        self.space.map(va, pa, size, attrs).map_err(|e| match e {
+        self.space().map(va, pa, size, attrs).map_err(|e| match e {
             MapError::NoMemory => Error::NoMemory,
             _ => Error::InvalidArgs,
         })?;
@@ -129,14 +155,14 @@ impl Process {
 pub fn create() -> Result<NonNull<Process>, Error> {
     let space = AddressSpace::new().map_err(|_| Error::NoMemory)?;
     let process = Process {
-        space,
+        space: Some(space),
         frames: OwnedFrames([None; MAX_BLOCKS]),
         threads: 0,
     };
     let allocated = PROCESSES.lock().alloc(&mut KernelPages, process);
     allocated.map_err(|mut process| {
         // No object for it: its space goes, with the pool's lock released.
-        process.space.destroy();
+        process.destroy_space();
         Error::NoMemory
     })
 }
@@ -164,7 +190,7 @@ pub unsafe fn destroy(mut process: NonNull<Process>) {
         "a process goes while it has {} threads",
         p.threads
     );
-    p.space.destroy();
+    p.destroy_space();
     p.frames.release();
     // SAFETY: as above.
     unsafe { PROCESSES.lock().free(process) };

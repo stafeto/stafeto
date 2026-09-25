@@ -75,8 +75,9 @@ impl Mmu for Cpu {
     }
 
     fn set_ttbr0(&mut self, ttbr: u64) {
-        // SAFETY: the tables map user pages only, and `destroy` takes TTBR0
-        // off them before they go; the empty table maps nothing.
+        // SAFETY: the tables map user pages only and live as long as their
+        // space, which `destroy` consumes after it takes TTBR0 off them;
+        // the empty table maps nothing.
         unsafe { mmu::set_ttbr0(ttbr) }
     }
 
@@ -97,16 +98,15 @@ impl Mmu for Cpu {
     }
 }
 
-/// The lower half of one process. `destroy` frees its tables, and it must
-/// run before the space is dropped; the frames its pages map belong to
-/// others and stay. Every method takes the frame allocator's lock or the
-/// ASID allocator's, one at a time and never one inside the other, so none
-/// may be called while the caller holds either.
+/// The lower half of one process. `destroy` consumes the space and frees
+/// its tables, so no method can reach them afterwards; a space dropped
+/// without it stops the kernel. The frames its pages map belong to others
+/// and stay. Every method takes the frame allocator's lock or the ASID
+/// allocator's, one at a time and never one inside the other, so none may
+/// be called while the caller holds either.
 pub struct AddressSpace {
     tables: PageTable,
     tag: AsidTag,
-    /// Set by `destroy`: the tables are gone.
-    destroyed: bool,
 }
 
 impl AddressSpace {
@@ -122,7 +122,6 @@ impl AddressSpace {
         Ok(AddressSpace {
             tables: with_tables(|mem| PageTable::new(mem))?,
             tag: AsidTag::default(),
-            destroyed: false,
         })
     }
 
@@ -211,21 +210,23 @@ impl AddressSpace {
             reason = "processes destroy their address spaces; so far only the kernel tests do"
         )
     )]
-    pub fn destroy(&mut self) {
-        assert!(!self.destroyed, "an address space is destroyed twice");
+    pub fn destroy(mut self) {
         let (root, empty) = (self.tables.root(), empty_root());
         with_asids(|a| tlb::retire(a, &mut self.tag, root, empty, &mut Cpu));
         with_tables(|mem| PageTable::from_root(root).release(mem));
-        self.destroyed = true;
+        // The tables are gone with the only value that named them. Neither
+        // field has anything to drop, and `drop` is for a space that never
+        // came here.
+        core::mem::forget(self);
     }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        // Only a check: the work is `destroy`'s, which takes two locks,
-        // and a drop may happen anywhere. The kernel builds without debug
-        // assertions, so the check is a plain assert.
-        assert!(self.destroyed, "address space dropped without destroy");
+        // Only a check: the work is `destroy`'s, which takes two locks and
+        // consumes the space without dropping it, while a drop may happen
+        // anywhere. Reaching here means the tables were never freed.
+        panic!("address space dropped without destroy");
     }
 }
 
