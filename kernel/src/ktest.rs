@@ -5,6 +5,7 @@
 //! format xtask parses; the run ends with a semihosting exit code. The tests
 //! at EL0 (`el0`) come last, as a chain that never returns here.
 
+pub mod calls;
 pub mod el0;
 
 use crate::arch::symbols;
@@ -151,6 +152,26 @@ const TESTS: &[(&str, TestFn)] = &[
         "processes_and_threads_return_their_memory",
         processes_and_threads_return_their_memory,
     ),
+    (
+        "unknown_system_calls_fail_with_invalid_args",
+        calls::unknown_system_calls_fail_with_invalid_args,
+    ),
+    (
+        "debug_write_checks_its_arguments",
+        calls::debug_write_checks_its_arguments,
+    ),
+    (
+        "object_info_reports_a_live_process",
+        calls::object_info_reports_a_live_process,
+    ),
+    (
+        "closing_a_handle_releases_its_object",
+        calls::closing_a_handle_releases_its_object,
+    ),
+    (
+        "init_handles_have_their_fixed_values",
+        calls::init_handles_have_their_fixed_values,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
@@ -173,10 +194,12 @@ fn report(name: &str, result: Result<(), &'static str>) {
     }
 }
 
-/// Prints the verdict and leaves QEMU.
+/// Prints the verdict and leaves QEMU. The line counts the tests of the
+/// build, so that xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
-    kprintln!("TESTS DONE failed={failed}");
+    let total = TESTS.len() + el0::count();
+    kprintln!("TESTS DONE total={total} failed={failed}");
     semihosting::exit(if failed == 0 { 0 } else { 1 })
 }
 
@@ -1154,7 +1177,7 @@ fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static st
 }
 
 fn process_round() -> Result<(), &'static str> {
-    let mut p = process::create().map_err(|_| "no process")?;
+    let mut p = process::create(16).map_err(|_| "no process")?;
     let before = phys::free_frames();
     // SAFETY: the process was just created, and only this test uses it.
     let mapped = unsafe { p.as_mut() }.map_frames(USER_VA, 3 * PAGE_SIZE, Attrs::USER_DATA);
@@ -1162,8 +1185,9 @@ fn process_round() -> Result<(), &'static str> {
         Ok(pa) => check_fresh_frames(pa, before).and_then(|()| check_thread_start(p)),
         Err(_) => Err("three pages did not map"),
     };
-    // SAFETY: the process has no threads left, and nothing uses it afterwards.
-    unsafe { process::destroy(p) };
+    // SAFETY: the process's threads went, the test's reference is the last,
+    // and nothing uses it afterwards.
+    unsafe { process::release(p) };
     result
 }
 
@@ -1206,7 +1230,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
         "a new thread does not start as it was told",
     );
     // SAFETY: the thread is not running, and nothing uses it afterwards.
-    unsafe { thread::destroy(t) };
+    unsafe { thread::release(t) };
     result?;
     for (entry, stack, priority) in [
         (USER_END, stack, 10),
@@ -1218,7 +1242,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
             Err(Error::InvalidArgs) => {}
             Ok(t) => {
                 // SAFETY: the thread never ran, and nothing uses it afterwards.
-                unsafe { thread::destroy(t) };
+                unsafe { thread::release(t) };
                 return Err("a thread with a bad start was created");
             }
             Err(_) => return Err("a bad start failed with another error"),

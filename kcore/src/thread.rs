@@ -1,28 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Threads (spec 4, 8): scheduling parameters and the checks on where a
-//! new thread starts. The scheduler that uses priority and policy comes in
-//! milestone 1.2c; until then they are only stored.
+//! Threads (spec 4, 8): scheduling parameters, whose values abi fixes, and
+//! the checks on where a new thread starts.
 
 use crate::layout::USER_END;
 use abi::Error;
-
-/// Priority levels (spec 8): 0 to 63, higher runs first. Level 0 belongs to
-/// the idle thread alone.
-pub const PRIORITY_LEVELS: u8 = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Policy {
-    /// Round robin with a 4 ms quantum.
-    RoundRobin,
-    /// First in, first out, no quantum: for real-time threads.
-    Fifo,
-}
+pub use abi::{PRIORITY_LEVELS, Policy};
 
 /// Checks the start of a program's thread: `entry` is an instruction in the
 /// lower half, `stack` a 16-byte-aligned stack pointer no higher than its
-/// top, and `priority` a level other than the idle thread's.
+/// top, and `priority` a level other than 0, which goes to no thread.
 pub fn check_start(entry: u64, stack: u64, priority: u8) -> Result<(), Error> {
     let entry_ok = entry < USER_END as u64 && entry.is_multiple_of(4);
     let stack_ok = stack <= USER_END as u64 && stack.is_multiple_of(16);

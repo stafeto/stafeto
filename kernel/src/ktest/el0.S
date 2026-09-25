@@ -12,6 +12,9 @@
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
 .equ SVC_YIELD, 0xFF02                  // ktest::el0::SVC_YIELD
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
+.equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
+.equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
+.equ CALL_DEBUG_WRITE, 28               // abi::Call::DebugWrite
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
 .equ P_NZCV, 256
 .equ P_TPIDR, 264
@@ -124,6 +127,26 @@ el0_load:
 // finds, after tests that left their patterns in them.
 .global el0_done_at_once
 el0_done_at_once:
+    svc     #SVC_DONE
+
+// Fill every register from a pattern whose x0-x9 hold a call's arguments,
+// make the call and end: the kernel checks what the call wrote.
+.global el0_pattern_close
+el0_pattern_close:
+    LOAD_PATTERN
+    svc     #CALL_HANDLE_CLOSE
+    svc     #SVC_DONE
+
+.global el0_pattern_object_info
+el0_pattern_object_info:
+    LOAD_PATTERN
+    svc     #CALL_OBJECT_INFO
+    svc     #SVC_DONE
+
+.global el0_pattern_debug_write
+el0_pattern_debug_write:
+    LOAD_PATTERN
+    svc     #CALL_DEBUG_WRITE
     svc     #SVC_DONE
 
 el0_programs_end:

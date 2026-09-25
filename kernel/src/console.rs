@@ -32,16 +32,21 @@ fn putc(byte: u8) {
     }
 }
 
+/// Writes `bytes` as they are, but for a CR before each LF.
+pub fn write_bytes(bytes: &[u8]) {
+    for &b in bytes {
+        if b == b'\n' {
+            putc(b'\r');
+        }
+        putc(b);
+    }
+}
+
 struct Console;
 
 impl Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            if b == b'\n' {
-                putc(b'\r');
-            }
-            putc(b);
-        }
+        write_bytes(s.as_bytes());
         Ok(())
     }
 }

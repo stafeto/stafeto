@@ -12,10 +12,11 @@
 use super::{check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::arch::{cache, gic, symbols, timer};
+use crate::object::Object;
 use crate::process::{self, Process};
-use crate::syscall;
+use crate::syscall::{self, Values};
 use crate::thread::{self, Policy, Thread};
-use abi::Error;
+use abi::{Call, Error, INFO_PROCESS_STATE, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::esr;
 use kcore::frames::PAGE_SIZE;
@@ -37,6 +38,9 @@ unsafe extern "C" {
     static el0_pattern_yield: u8;
     static el0_load: u8;
     static el0_done_at_once: u8;
+    static el0_pattern_close: u8;
+    static el0_pattern_object_info: u8;
+    static el0_pattern_debug_write: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -49,6 +53,16 @@ pub const SVC_YIELD: u16 = 0xFF02;
 
 const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_YIELD <= *abi::TEST_CALLS.end());
 
+// el0.S makes these calls by number.
+const _: () = assert!(
+    Call::HandleClose.number() == 1
+        && Call::ObjectInfo.number() == 27
+        && Call::DebugWrite.number() == 28
+);
+
+/// The line `debug_write_from_el0` prints; xtask looks for it in the output.
+const EL0_LINE: &[u8] = b"debug_write from EL0 reaches the console\n";
+
 /// Where the test processes see their pages: the programs at TEXT_VA, and
 /// one page of data at DATA_VA with the register pattern at its start and
 /// the stack at its end.
@@ -56,6 +70,7 @@ const TEXT_VA: usize = 0x40_0000;
 const DATA_VA: usize = 0x80_0000;
 const PAGE: usize = PAGE_SIZE as usize;
 const PRIORITY: u8 = 10;
+const HANDLE_LIMIT: u32 = 16;
 
 struct El0Test {
     name: &'static str,
@@ -105,6 +120,21 @@ const EL0_TESTS: &[El0Test] = &[
         name: "a_new_thread_starts_with_clear_fp",
         start: start_clear_fp,
         done: done_clear_fp,
+    },
+    El0Test {
+        name: "debug_write_from_el0",
+        start: start_debug_write,
+        done: done_debug_write,
+    },
+    El0Test {
+        name: "object_info_from_el0",
+        start: start_object_info,
+        done: done_object_info,
+    },
+    El0Test {
+        name: "failed_call_from_el0_changes_x0_only",
+        start: start_closed_handle,
+        done: done_closed_handle,
     },
 ];
 
@@ -168,6 +198,11 @@ pub fn run() -> ! {
     start(0)
 }
 
+/// How many TEST lines the EL0 tests print.
+pub fn count() -> usize {
+    EL0_TESTS.len()
+}
+
 /// Starts the tests from `first` on; a test that cannot start fails, and
 /// the next one starts.
 fn start(first: usize) -> ! {
@@ -206,13 +241,13 @@ fn teardown() {
         )
     };
     for t in threads.into_iter().flatten() {
-        // SAFETY: the test's threads go with it; the running one stops
-        // being the running one.
-        unsafe { thread::destroy(t) };
+        // SAFETY: the test's references go with it; a thread that runs
+        // stops being the running one.
+        unsafe { thread::release(t) };
     }
     for p in processes.into_iter().flatten() {
-        // SAFETY: the test's processes go with it, their threads gone.
-        unsafe { process::destroy(p) };
+        // SAFETY: as above; the threads released their references first.
+        unsafe { process::release(p) };
     }
 }
 
@@ -220,7 +255,7 @@ fn teardown() {
 pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
     note_stack();
     match number {
-        SVC_NOP => syscall::set_result(thread, Ok(())),
+        SVC_NOP => syscall::set_result(thread, Ok(Values::NONE)),
         SVC_DONE => done(thread),
         SVC_YIELD => yield_to_other(thread),
         _ => return false,
@@ -230,7 +265,7 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
 
 /// Runs the test's other thread; returns when there is none.
 fn yield_to_other(thread: NonNull<Thread>) {
-    syscall::set_result(thread, Ok(()));
+    syscall::set_result(thread, Ok(Values::NONE));
     let other = {
         let f = FIXTURE.lock();
         // SAFETY: the running thread is alive.
@@ -346,7 +381,7 @@ fn spawn(
 
 /// A process with the programs at TEXT_VA, in slot `slot` of the fixture.
 fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'static str> {
-    let mut p = process::create().map_err(|_| "no process")?;
+    let mut p = process::create(HANDLE_LIMIT).map_err(|_| "no process")?;
     f.processes[slot] = Some(p);
     // SAFETY: the process was just created, and only this test uses it.
     let text = unsafe { p.as_mut() }
@@ -472,11 +507,11 @@ impl Pattern {
     }
 }
 
-/// The thread's registers are the pattern's, except x0, which is `x0` (a
-/// system call's result replaces the pattern's value there).
-fn check_pattern(regs: &UserRegs, p: &Pattern, x0: u64) -> Result<(), &'static str> {
+/// The thread's registers are the pattern's, except x0 and up, which hold
+/// `results`: a system call's result code and values.
+fn check_pattern(regs: &UserRegs, p: &Pattern, results: &[u64]) -> Result<(), &'static str> {
     let mut want = p.x;
-    want[0] = x0;
+    want[..results.len()].copy_from_slice(results);
     if let Some(i) = (0..31).find(|&i| regs.x[i] != want[i]) {
         kprintln!("x{i} is {:#x}, the pattern has {:#x}", regs.x[i], want[i]);
         return Err("a general register changed");
@@ -524,7 +559,7 @@ fn start_nop(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
 }
 
 fn done_nop(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[0], 0)
+    check_pattern(&t.regs, &f.patterns[0], &[0])
 }
 
 fn start_unknown(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
@@ -533,7 +568,7 @@ fn start_unknown(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
 }
 
 fn done_unknown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[0], Error::InvalidArgs as u64)
+    check_pattern(&t.regs, &f.patterns[0], &[Error::InvalidArgs as u64])
 }
 
 /// The program loads from FIXTURE itself, a kernel variable.
@@ -565,7 +600,7 @@ fn done_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the timer interrupt did not end at the GIC",
     )?;
     let p = &f.patterns[0];
-    check_pattern(&t.regs, p, p.x[0])
+    check_pattern(&t.regs, p, &p.x[..1])
 }
 
 /// Two processes run the same program with different patterns; each yields
@@ -578,7 +613,7 @@ fn start_switch(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
 }
 
 fn done_switch(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[f.slot(t)], 0)
+    check_pattern(&t.regs, &f.patterns[f.slot(t)], &[0])
 }
 
 /// Two threads of one process run the same program, each with its own
@@ -618,4 +653,84 @@ fn done_clear_fp(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
         fp.v.iter().all(|&v| v == 0) && fp.fpcr == 0 && fp.fpsr == 0,
         "a new thread found the FP or SIMD values of another",
     )
+}
+
+/// The pattern of slot 0 with `args` in x0 and up, for a program that
+/// fills its registers from it and makes a call.
+fn call_pattern(f: &mut Fixture, args: &[u64]) {
+    f.patterns[0] = Pattern::new(1);
+    f.patterns[0].x[..args.len()].copy_from_slice(args);
+}
+
+/// A handle in process `p`'s table, for the test's program.
+fn give(p: NonNull<Process>, object: Object, rights: Rights) -> Result<u64, &'static str> {
+    process::insert_handle(p, object, rights)
+        .map(|h| h.0)
+        .map_err(|_| "a handle did not go in")
+}
+
+/// The program writes EL0_LINE through a handle to the system resource.
+fn start_debug_write(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    let p = new_process(f, 0)?;
+    let h = give(p, Object::Resource, Rights::DEBUG)?;
+    let mut args = [0; 10];
+    args[0] = h;
+    args[1] = EL0_LINE.len() as u64;
+    args[2..].copy_from_slice(&abi::inline_words(EL0_LINE));
+    call_pattern(f, &args);
+    new_thread(
+        f,
+        0,
+        p,
+        DATA_VA,
+        &raw const el0_pattern_debug_write,
+        DATA_VA as u64,
+    )
+}
+
+fn done_debug_write(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check_pattern(&t.regs, &f.patterns[0], &[0, EL0_LINE.len() as u64])
+}
+
+/// The program asks for the state of another process, which lives: four
+/// values in x1-x4.
+fn start_object_info(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    let p = new_process(f, 0)?;
+    let other = new_process(f, 1)?;
+    let h = give(p, Object::Process(other), Rights::NONE)?;
+    call_pattern(f, &[h, INFO_PROCESS_STATE, 0]);
+    new_thread(
+        f,
+        0,
+        p,
+        DATA_VA,
+        &raw const el0_pattern_object_info,
+        DATA_VA as u64,
+    )
+}
+
+fn done_object_info(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let [w1, w2, w3, w4] = ProcessState::Alive.to_words();
+    check_pattern(&t.regs, &f.patterns[0], &[0, w1, w2, w3, w4])
+}
+
+/// The program closes a handle that is closed already: BAD_HANDLE in x0,
+/// every other register as the pattern left it.
+fn start_closed_handle(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+    let p = new_process(f, 0)?;
+    let h = give(p, Object::Resource, Rights::DEBUG)?;
+    process::close_handle(p, abi::Handle(h)).map_err(|_| "the handle did not close")?;
+    call_pattern(f, &[h]);
+    new_thread(
+        f,
+        0,
+        p,
+        DATA_VA,
+        &raw const el0_pattern_close,
+        DATA_VA as u64,
+    )
+}
+
+fn done_closed_handle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check_pattern(&t.regs, &f.patterns[0], &[Error::BadHandle as u64])
 }

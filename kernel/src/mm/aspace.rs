@@ -203,13 +203,6 @@ impl AddressSpace {
     /// tables back to the frame allocator. The work grows with the number of
     /// tables and runs with interrupts masked; milestone 1.3 splits it into
     /// portions through the cleanup queue (spec 7.7).
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "processes destroy their address spaces; so far only the kernel tests do"
-        )
-    )]
     pub fn destroy(mut self) {
         let (root, empty) = (self.tables.root(), empty_root());
         with_asids(|a| tlb::retire(a, &mut self.tag, root, empty, &mut Cpu));

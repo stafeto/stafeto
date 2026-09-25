@@ -199,6 +199,18 @@ pub fn expect_clean_exit_with(o: &Outcome, line: &str) -> Result<(), String> {
     }
 }
 
+/// Some line must be `line`, whole.
+pub fn expect_line(o: &Outcome, line: &str) -> Result<(), String> {
+    if o.lines.iter().any(|l| l == line) {
+        Ok(())
+    } else {
+        Err(format!(
+            "no line is {line:?}; last lines: {:?}",
+            tail(&o.lines)
+        ))
+    }
+}
+
 /// Some line must contain `marker`.
 pub fn expect_marker(o: &Outcome, marker: &str) -> Result<(), String> {
     if o.lines.iter().any(|l| l.contains(marker)) {
@@ -327,15 +339,20 @@ pub fn expect_powered_off(o: &Outcome) -> Result<(), String> {
 pub struct TestReport {
     pub passed: Vec<String>,
     pub failed: Vec<(String, String)>,
+    /// Failures the run counted itself (`failed=<n>`).
     pub done: Option<u32>,
+    /// Tests the run says it has (`total=<n>`), when it says so.
+    pub total: Option<u32>,
 }
 
-/// Reads `TEST <name> ok`, `TEST <name> FAIL <why>` and `TESTS DONE failed=<n>` lines.
+/// Reads `TEST <name> ok`, `TEST <name> FAIL <why>` and
+/// `TESTS DONE [total=<n>] failed=<n>` lines.
 pub fn parse_report(lines: &[String]) -> TestReport {
     let mut r = TestReport {
         passed: Vec::new(),
         failed: Vec::new(),
         done: None,
+        total: None,
     };
     for line in lines {
         if let Some(rest) = line.strip_prefix("TEST ") {
@@ -348,13 +365,21 @@ pub fn parse_report(lines: &[String]) -> TestReport {
                     .push((name, parts.next().unwrap_or_default().to_string())),
                 _ => {}
             }
-        } else if let Some(n) = line.strip_prefix("TESTS DONE failed=") {
-            r.done = n.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("TESTS DONE ") {
+            for field in rest.split_whitespace() {
+                if let Some(n) = field.strip_prefix("total=") {
+                    r.total = n.parse().ok();
+                } else if let Some(n) = field.strip_prefix("failed=") {
+                    r.done = n.parse().ok();
+                }
+            }
         }
     }
     r
 }
 
+/// A run of tests in QEMU finished in time with status 0, some tests
+/// passed, none failed, and the run said so.
 pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     if o.timed_out {
         return Err(format!(
@@ -363,29 +388,47 @@ pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
         ));
     }
     if !r.failed.is_empty() {
-        return Err(format!(
-            "{} kernel test(s) failed: {:?}",
-            r.failed.len(),
-            r.failed
-        ));
+        return Err(format!("{} test(s) failed: {:?}", r.failed.len(), r.failed));
     }
     match r.done {
         Some(0) => {}
-        Some(n) => return Err(format!("kernel reported {n} failed test(s)")),
+        Some(n) => return Err(format!("the run reported {n} failed test(s)")),
         None => {
             return Err(format!(
-                "kernel never printed TESTS DONE; last lines: {:?}",
+                "no TESTS DONE line; last lines: {:?}",
                 tail(&o.lines)
             ));
         }
     }
     if r.passed.is_empty() {
-        return Err("no kernel tests ran".into());
+        return Err("no tests ran".into());
     }
     match o.status {
         Some(s) if s.success() => Ok(()),
         other => Err(format!("QEMU exit status {other:?}")),
     }
+}
+
+/// As `verdict`, for a run that counts its tests: it prints
+/// `TESTS DONE total=<n> ...`, and each of the n passed once. A test line
+/// that went missing in the output fails the run.
+pub fn counted_verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
+    verdict(o, r)?;
+    let total = r.total.ok_or("the run never said how many tests it has")?;
+    let mut names = r.passed.clone();
+    names.sort();
+    names.dedup();
+    if names.len() != r.passed.len() {
+        return Err(format!("a test passed twice: {:?}", r.passed));
+    }
+    if r.passed.len() != total as usize {
+        return Err(format!(
+            "{} of {total} tests reported: {:?}",
+            r.passed.len(),
+            r.passed
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -750,5 +793,44 @@ ffffffffc0009000 T __text_end
             ..with(&["TEST a ok", "TESTS DONE failed=0"])
         };
         assert!(verdict(&bad_status, &parse_report(&bad_status.lines)).is_err());
+    }
+
+    fn finished(l: &[&str]) -> Outcome {
+        Outcome {
+            lines: lines(l),
+            status: Some(ExitStatus::from_raw(0)),
+            timed_out: false,
+            stopped_on_marker: false,
+        }
+    }
+
+    #[test]
+    fn report_reads_the_total_of_a_counted_run() {
+        let r = parse_report(&lines(&["TEST a ok", "TESTS DONE total=2 failed=1"]));
+        assert_eq!((r.total, r.done), (Some(2), Some(1)));
+        let uncounted = parse_report(&lines(&["TESTS DONE failed=0"]));
+        assert_eq!((uncounted.total, uncounted.done), (None, Some(0)));
+    }
+
+    #[test]
+    fn counted_verdict_needs_every_test_once() {
+        let clean = finished(&["TEST a ok", "TEST b ok", "TESTS DONE total=2 failed=0"]);
+        assert!(counted_verdict(&clean, &parse_report(&clean.lines)).is_ok());
+        let lost = finished(&["TEST a ok", "TESTS DONE total=2 failed=0"]);
+        assert!(counted_verdict(&lost, &parse_report(&lost.lines)).is_err());
+        let twice = finished(&["TEST a ok", "TEST a ok", "TESTS DONE total=2 failed=0"]);
+        assert!(counted_verdict(&twice, &parse_report(&twice.lines)).is_err());
+        let uncounted = finished(&["TEST a ok", "TESTS DONE failed=0"]);
+        assert!(counted_verdict(&uncounted, &parse_report(&uncounted.lines)).is_err());
+        let failed = finished(&["TEST a ok", "TEST b FAIL x", "TESTS DONE total=2 failed=1"]);
+        assert!(counted_verdict(&failed, &parse_report(&failed.lines)).is_err());
+    }
+
+    #[test]
+    fn a_line_must_match_whole() {
+        let o = finished(&["TEST a ok", "\u{0}debug_write stops at its length###"]);
+        assert!(expect_line(&o, "TEST a ok").is_ok());
+        assert!(expect_line(&o, "TEST a").is_err());
+        assert!(expect_line(&o, "debug_write stops at its length").is_err());
     }
 }

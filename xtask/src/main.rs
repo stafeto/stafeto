@@ -17,6 +17,15 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
+/// Lines the kernel tests write through `debug_write`, each whole: from
+/// the kernel, all of x2-x9 (ktest::calls::LINE) and the bytes of a
+/// length with other bytes past it (ktest::calls::STOPS), and from EL0
+/// (ktest::el0::EL0_LINE).
+const DEBUG_WRITE_LINES: [&str; 3] = [
+    "kernel test: debug_write prints all 64 bytes of x2-x9 in order.",
+    "debug_write stops at its length",
+    "debug_write from EL0 reaches the console",
+];
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,14 +325,18 @@ fn stack_overflow_report() -> Result<(), String> {
 
 /// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
 /// through semihosting. On 2 GiB the tests also cover RAM the boot page
-/// tables did not map.
+/// tables did not map. Every test the kernel counts passes once, and what
+/// the tests wrote through `debug_write` reaches the console whole.
 fn kernel_tests(m: &qemu::Machine) -> Result<(), String> {
     let a = build(Variant::Test)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS).arg("-semihosting");
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
-    qemu::verdict(&o, &r)?;
+    qemu::counted_verdict(&o, &r)?;
+    for line in DEBUG_WRITE_LINES {
+        qemu::expect_line(&o, line)?;
+    }
     println!("kernel tests on {}: {} passed", m.memory, r.passed.len());
     Ok(())
 }

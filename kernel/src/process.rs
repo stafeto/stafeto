@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Processes (spec 4): for now an address space, the frames the process
-//! owns there and the count of its threads, in objects from a kernel pool.
-//! The handle table, quotas and the priority ceiling come with the system
-//! calls that need them.
+//! Processes (spec 4): an address space, the frames the process owns
+//! there, its handle table and its state, in objects from a kernel pool. A
+//! process lives while references to it are left: handles to it, its
+//! threads, and the one `create` hands out; the last `release` destroys it.
+//! Quotas and the priority ceiling come with the calls that need them.
 
 use crate::mm::aspace::AddressSpace;
 use crate::mm::pages::KernelPages;
 use crate::mm::phys::FRAMES;
-use abi::Error;
+use crate::object::{self, Chunks, Handles, Object};
+use crate::thread::Thread;
+use abi::{Error, Handle, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
@@ -27,7 +30,13 @@ pub struct Process {
     /// `destroy` takes it out, since destroying a space consumes it.
     space: Option<AddressSpace>,
     frames: OwnedFrames,
-    threads: usize,
+    /// Released first when the process goes: its handles hold references
+    /// to other objects.
+    handles: Handles,
+    /// Handles to the process, its threads, and the reference `create`
+    /// hands out.
+    refs: u32,
+    state: ProcessState,
 }
 
 /// Blocks of frames, as (physical address, order), that `release` gives
@@ -134,17 +143,28 @@ impl Process {
         Ok(pa)
     }
 
-    pub fn add_thread(&mut self) {
-        self.threads += 1;
+    /// Whether the process lives and, if not, why it ended.
+    pub fn state(&self) -> ProcessState {
+        self.state
     }
 
-    pub fn remove_thread(&mut self) {
-        self.threads -= 1;
+    /// What `kind` makes of the object behind `h`, checked in the order of
+    /// the system calls: BAD_HANDLE, WRONG_TYPE, then ACCESS_DENIED when
+    /// the handle lacks `rights`.
+    pub fn lookup<U>(
+        &self,
+        h: Handle,
+        rights: Rights,
+        kind: impl FnOnce(&Object) -> Option<U>,
+    ) -> Result<U, Error> {
+        self.handles.get_as(h, rights, kind).map_err(Error::from)
     }
 }
 
-/// A process with an empty address space. NO_MEMORY when no frame is left
-/// for its root table or its pool.
+/// A process with an empty address space and an empty handle table for up
+/// to `handle_limit` handles; the caller gets its first reference.
+/// INVALID_ARGS for a limit above kcore::handles::MAX_HANDLES, NO_MEMORY
+/// when no frame is left for its root table or its pool.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(
@@ -152,12 +172,15 @@ impl Process {
         reason = "init (milestone 1.2c) is the first process; so far only the kernel tests do"
     )
 )]
-pub fn create() -> Result<NonNull<Process>, Error> {
+pub fn create(handle_limit: u32) -> Result<NonNull<Process>, Error> {
+    let handles = Handles::new(handle_limit).map_err(Error::from)?;
     let space = AddressSpace::new().map_err(|_| Error::NoMemory)?;
     let process = Process {
         space: Some(space),
         frames: OwnedFrames([None; MAX_BLOCKS]),
-        threads: 0,
+        handles,
+        refs: 1,
+        state: ProcessState::Alive,
     };
     let allocated = PROCESSES.lock().alloc(&mut KernelPages, process);
     allocated.map_err(|mut process| {
@@ -167,33 +190,132 @@ pub fn create() -> Result<NonNull<Process>, Error> {
     })
 }
 
-/// Destroys a process. Everything it holds goes here and nowhere else,
-/// in this order: its address space (TTBR0 leaves the tables, their TLB
-/// entries go, the tables return to the allocator), then the frames it
-/// owned, which the tables mapped. Each step takes its locks alone; the
-/// pool's lock comes last, when nothing in the object owns memory any more.
-///
-/// # Safety
-/// `process` came from `create`, and nothing uses it afterwards.
+/// Adds a reference to a live process.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(
         dead_code,
-        reason = "process_exit (milestone 1.2c) destroys processes; so far only the kernel tests do"
+        reason = "threads and handles of milestone 1.2c refer to processes; so far only the kernel tests do"
     )
 )]
-pub unsafe fn destroy(mut process: NonNull<Process>) {
-    // SAFETY: the caller hands over a live process.
+pub fn retain(mut process: NonNull<Process>) {
+    // SAFETY: the caller holds a reference, so the process is alive.
     let p = unsafe { process.as_mut() };
-    assert!(
-        p.threads == 0,
-        "a process goes while it has {} threads",
-        p.threads
-    );
+    p.refs = p.refs.checked_add(1).expect("process references overflow");
+}
+
+/// Drops a reference; the last one destroys the process.
+///
+/// # Safety
+/// The reference is the caller's, and the caller does not use it afterwards.
+pub unsafe fn release(mut process: NonNull<Process>) {
+    // SAFETY: the caller's reference keeps the process alive until here.
+    let last = unsafe {
+        let p = process.as_mut();
+        p.refs -= 1;
+        p.refs == 0
+    };
+    if last {
+        // SAFETY: that was the last reference.
+        unsafe { destroy(process) };
+    }
+}
+
+/// Destroys a process nobody refers to. Everything it holds goes here and
+/// nowhere else, in this order: its handles, each releasing its object,
+/// which may destroy that object in turn; its address space (TTBR0 leaves
+/// the tables, their TLB entries go, the tables return to the allocator);
+/// the frames it owned, which the tables mapped. Each step takes its locks
+/// alone; the pool's lock comes last, when nothing in the object owns
+/// memory any more.
+///
+/// # Safety
+/// No reference to `process` is left.
+unsafe fn destroy(mut process: NonNull<Process>) {
+    // SAFETY: no reference is left, so no handle in the table names this
+    // process or one of its threads, each of which would hold one: the
+    // objects released below are other processes' and threads'.
+    let p = unsafe { process.as_mut() };
+    p.handles.release_with(&mut Chunks, |object| {
+        // SAFETY: the table is gone, and with it the handle's reference.
+        unsafe { object::release(object) }
+    });
     p.destroy_space();
     p.frames.release();
-    // SAFETY: as above.
+    // SAFETY: nothing refers to the process any more.
     unsafe { PROCESSES.lock().free(process) };
+}
+
+/// Puts `object` in the handle table of `process` with `rights`; the new
+/// handle holds a reference to it. LIMIT_REACHED at the table's limit,
+/// NO_MEMORY when no chunk is left for the table.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "init's handles and thread_create (milestone 1.2c) make handles; so far only the kernel tests do"
+    )
+)]
+pub fn insert_handle(
+    mut process: NonNull<Process>,
+    object: Object,
+    rights: Rights,
+) -> Result<Handle, Error> {
+    // SAFETY: the caller holds a reference to the process.
+    let h = unsafe { process.as_mut() }
+        .handles
+        .insert(&mut Chunks, object, rights)
+        .map_err(Error::from)?;
+    object::retain(object);
+    Ok(h)
+}
+
+/// Closes handle `h` of `process`: its reference goes, and the object goes
+/// with its last one. BAD_HANDLE for a handle that is not live.
+pub fn close_handle(mut process: NonNull<Process>, h: Handle) -> Result<(), Error> {
+    // SAFETY: the caller holds a reference to the process other than the
+    // handle, so the process outlives the release below.
+    let (object, _) = unsafe { process.as_mut() }
+        .handles
+        .remove(h)
+        .map_err(Error::from)?;
+    // SAFETY: the handle is gone, and its reference with it.
+    unsafe { object::release(object) };
+    Ok(())
+}
+
+/// Puts init's first handles in the fresh table of `init` (spec 13.3): the
+/// system resource with every right, init's process and its `first`
+/// thread, and an entry for the boot image that goes at once, so that
+/// INIT_BOOT_IMAGE stays bad (until milestone 1.3 brings the boot image as
+/// a memory object). The values follow from the order in a fresh table and
+/// are those abi fixes.
+#[cfg_attr(
+    not(feature = "ktest"),
+    expect(
+        dead_code,
+        reason = "the kernel starts init in milestone 1.2c; so far only the kernel tests do"
+    )
+)]
+pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> Result<(), Error> {
+    let handles = [
+        insert_handle(init, Object::Resource, abi::INIT_RESOURCE_RIGHTS)?,
+        insert_handle(init, Object::Process(init), abi::OWNER_RIGHTS)?,
+        insert_handle(init, Object::Thread(first), abi::OWNER_RIGHTS)?,
+        insert_handle(init, Object::Resource, Rights::NONE)?,
+    ];
+    close_handle(init, handles[3])?;
+    assert_eq!(
+        handles,
+        [
+            abi::INIT_RESOURCE,
+            abi::INIT_PROCESS,
+            abi::INIT_THREAD,
+            abi::INIT_BOOT_IMAGE
+        ],
+        "init's handles went into a table that was not fresh"
+    );
+    Ok(())
 }
 
 /// Objects the process pool holds now.

@@ -5,11 +5,13 @@
 //! its scheduling parameters and its process, in objects from a kernel
 //! pool. The registers come first, so TPIDR_EL1, which points at the
 //! running thread, points at them too (vectors.S). The running thread is the
-//! one TPIDR_EL1 names; the kernel stack holds nothing of it.
+//! one TPIDR_EL1 names; the kernel stack holds nothing of it. A thread
+//! lives while references to it are left, handles and the one `create`
+//! hands out, and holds a reference to its process.
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::mm::pages::KernelPages;
-use crate::process::Process;
+use crate::process::{self, Process};
 use abi::Error;
 use core::ptr::NonNull;
 use kcore::slab::Pool;
@@ -26,6 +28,8 @@ pub struct Thread {
     pub priority: u8,
     pub policy: Policy,
     process: NonNull<Process>,
+    /// Handles to the thread and the reference `create` hands out.
+    refs: u32,
 }
 
 const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
@@ -37,21 +41,16 @@ unsafe impl Send for Thread {}
 static THREADS: Lock<Pool<Thread>> = Lock::new(Pool::new());
 
 impl Thread {
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "only the kernel tests ask for a thread's process so far"
-        )
-    )]
+    /// The thread's process, which the thread holds a reference to.
     pub fn process(&self) -> NonNull<Process> {
         self.process
     }
 }
 
 /// A thread of `process` that will start at `entry` with stack pointer
-/// `stack` and `arg` in x0; it runs once `run` picks it. INVALID_ARGS for a
-/// start outside the lower half, a misaligned one or the idle priority,
+/// `stack` and `arg` in x0; it runs once `run` picks it. The caller gets
+/// the first reference; the thread holds one to `process`. INVALID_ARGS for
+/// a start outside the lower half, a misaligned one or priority 0,
 /// NO_MEMORY when the pool gets no page.
 #[cfg_attr(
     not(feature = "ktest"),
@@ -61,7 +60,7 @@ impl Thread {
     )
 )]
 pub fn create(
-    mut process: NonNull<Process>,
+    process: NonNull<Process>,
     entry: usize,
     stack: usize,
     arg: u64,
@@ -75,37 +74,51 @@ pub fn create(
         priority,
         policy,
         process,
+        refs: 1,
     };
     let thread = THREADS
         .lock()
         .alloc(&mut KernelPages, thread)
         .map_err(|_| Error::NoMemory)?;
-    // SAFETY: the caller's process is alive; its threads keep it so.
-    unsafe { process.as_mut() }.add_thread();
+    process::retain(process);
     Ok(thread)
 }
 
-/// Destroys a thread. When it is the running one, no thread runs after it.
-///
-/// # Safety
-/// `thread` came from `create`, and nothing uses it afterwards.
+/// Adds a reference to a live thread.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(
         dead_code,
-        reason = "thread_exit (milestone 1.2c) destroys threads; so far only the kernel tests do"
+        reason = "init's handles and thread_create (milestone 1.2c) make handles; so far only the kernel tests do"
     )
 )]
-pub unsafe fn destroy(thread: NonNull<Thread>) {
+pub fn retain(mut thread: NonNull<Thread>) {
+    // SAFETY: the caller holds a reference, so the thread is alive.
+    let t = unsafe { thread.as_mut() };
+    t.refs = t.refs.checked_add(1).expect("thread references overflow");
+}
+
+/// Drops a reference; the last one destroys the thread, which then drops
+/// its reference to its process. When the thread is the running one, no
+/// thread runs after it.
+///
+/// # Safety
+/// The reference is the caller's, and the caller does not use it afterwards.
+pub unsafe fn release(mut thread: NonNull<Thread>) {
+    // SAFETY: the caller's reference keeps the thread alive until here.
+    let t = unsafe { thread.as_mut() };
+    t.refs -= 1;
+    if t.refs > 0 {
+        return;
+    }
+    let process = t.process;
     if current() == Some(thread) {
         user::clear_current();
     }
-    // SAFETY: the caller hands over a live thread.
-    let mut process = unsafe { thread.as_ref() }.process;
-    // SAFETY: as above; nothing uses the thread afterwards.
+    // SAFETY: that was the last reference; nothing uses the thread afterwards.
     unsafe { THREADS.lock().free(thread) };
-    // SAFETY: the thread's process outlives it.
-    unsafe { process.as_mut() }.remove_thread();
+    // SAFETY: the thread's reference to its process goes with it.
+    unsafe { process::release(process) };
 }
 
 /// The running thread, whose registers the last entry from EL0 saved.

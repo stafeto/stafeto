@@ -17,6 +17,7 @@ mod interrupt;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod mm;
+mod object;
 mod panicking;
 mod process;
 mod psci;

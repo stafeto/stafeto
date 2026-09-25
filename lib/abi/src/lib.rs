@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The stafeto kernel interface shared by the kernel and programs (spec 5,
-//! 12): handle layout, rights and error codes. System call numbers join it
-//! with the first system calls; the numbers kept for tests are here already.
+//! 8, 11, 12, 13.3): handle layout, rights, system call numbers and where
+//! their arguments and results go, init's first handles, scheduling
+//! policies and error codes.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -75,9 +76,227 @@ impl core::ops::BitOr for Rights {
     }
 }
 
+/// Rights of the handle that `process_create` or `thread_create` returns,
+/// and of init's handles to its own process and first thread.
+pub const OWNER_RIGHTS: Rights =
+    Rights(Rights::DUPLICATE.0 | Rights::TRANSFER.0 | Rights::MANAGE.0);
+
+/// Rights of init's handle to the system resource (spec 13.3).
+pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
+    Rights::DEVICE.0
+        | Rights::DEBUG.0
+        | Rights::KSTATS.0
+        | Rights::DUPLICATE.0
+        | Rights::TRANSFER.0,
+);
+
+/// Init's first handles (spec 13.3): the kernel puts them in the first
+/// entries of init's table, so each has generation 1.
+pub const INIT_RESOURCE: Handle = Handle::new(0, 1);
+pub const INIT_PROCESS: Handle = Handle::new(1, 1);
+pub const INIT_THREAD: Handle = Handle::new(2, 1);
+/// Kept for the boot image, a memory object from milestone 1.3 on. Until
+/// then the entry is freed at once: the value is BAD_HANDLE and never
+/// names another object.
+pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
+
+/// System calls (spec 11). The number goes in the immediate of `svc #n`.
+/// Arguments go in x0-x9. On success x0 is 0 and the call's values are in
+/// x1 and up; on an error x0 holds the error code and nothing else
+/// changes. Registers from x10 up, SP_EL0, the flags, TPIDR_EL0 and the FP
+/// and SIMD registers stay as they were. Unknown numbers, 0 included, and
+/// reserved values of arguments fail with INVALID_ARGS; a narrow argument
+/// with bits set above its width is such a value.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Call {
+    HandleClose = 1,
+    HandleDuplicate = 2,
+    ChannelCreate = 3,
+    Send = 4,
+    Receive = 5,
+    Reply = 6,
+    Notify = 7,
+    MemCreate = 8,
+    MemMap = 9,
+    MemUnmap = 10,
+    MemProtect = 11,
+    ProcessCreate = 12,
+    ProcessKill = 13,
+    ProcessExit = 14,
+    ThreadCreate = 15,
+    ThreadStart = 16,
+    ThreadExit = 17,
+    ThreadSetPriority = 18,
+    Yield = 19,
+    DeviceWindowCreate = 20,
+    IrqBind = 21,
+    IrqAck = 22,
+    ClockNow = 23,
+    TimerCreate = 24,
+    TimerSet = 25,
+    TimerCancel = 26,
+    ObjectInfo = 27,
+    DebugWrite = 28,
+}
+
+impl Call {
+    /// Every call, in the order of its number.
+    pub const ALL: [Call; 28] = [
+        Call::HandleClose,
+        Call::HandleDuplicate,
+        Call::ChannelCreate,
+        Call::Send,
+        Call::Receive,
+        Call::Reply,
+        Call::Notify,
+        Call::MemCreate,
+        Call::MemMap,
+        Call::MemUnmap,
+        Call::MemProtect,
+        Call::ProcessCreate,
+        Call::ProcessKill,
+        Call::ProcessExit,
+        Call::ThreadCreate,
+        Call::ThreadStart,
+        Call::ThreadExit,
+        Call::ThreadSetPriority,
+        Call::Yield,
+        Call::DeviceWindowCreate,
+        Call::IrqBind,
+        Call::IrqAck,
+        Call::ClockNow,
+        Call::TimerCreate,
+        Call::TimerSet,
+        Call::TimerCancel,
+        Call::ObjectInfo,
+        Call::DebugWrite,
+    ];
+
+    pub const fn number(self) -> u16 {
+        self as u16
+    }
+
+    /// The call with this number, if any.
+    pub const fn from_number(number: u16) -> Option<Call> {
+        match number {
+            1..=28 => Some(Self::ALL[number as usize - 1]),
+            _ => None,
+        }
+    }
+}
+
 /// System call numbers that belong to the kernel's test builds (spec 11):
 /// no real system call gets one.
 pub const TEST_CALLS: core::ops::RangeInclusive<u16> = 0xFF00..=0xFFFF;
+
+/// Registers a call returns values in on success: x1-x9.
+pub const RESULT_VALUES: usize = 9;
+
+/// Bytes a call carries in registers x2-x9 (spec 11): `debug_write` and,
+/// from milestone 1.3, messages.
+pub const INLINE_MAX: usize = 64;
+
+/// Packs up to INLINE_MAX bytes into the words for x2-x9: byte i goes into
+/// word i / 8 at bit 8 * (i % 8), low byte first; the rest is zero.
+pub fn inline_words(bytes: &[u8]) -> [u64; 8] {
+    assert!(bytes.len() <= INLINE_MAX, "x2-x9 carry at most 64 bytes");
+    let mut words = [0; 8];
+    for (i, chunk) in bytes.chunks(8).enumerate() {
+        let mut word = [0; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        words[i] = u64::from_le_bytes(word);
+    }
+    words
+}
+
+/// The bytes that x2-x9 carry, in the order of `inline_words`.
+pub fn inline_bytes(words: &[u64; 8]) -> [u8; INLINE_MAX] {
+    let mut bytes = [0; INLINE_MAX];
+    for (chunk, word) in bytes.chunks_mut(8).zip(words) {
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
+    bytes
+}
+
+/// Kinds of `object_info` (spec 11); 0 is reserved.
+///
+/// PROCESS_STATE takes a process handle, with no right needed, and returns
+/// `ProcessState::to_words` in x1-x4.
+pub const INFO_PROCESS_STATE: u64 = 1;
+
+/// Whether a process lives and, if not, why it ended (spec 7.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    Alive,
+    Exited {
+        code: u64,
+    },
+    Killed,
+    /// A synchronous exception at EL0. FAR is 0 unless the fault sets it.
+    Fault {
+        esr: u64,
+        far: u64,
+        elr: u64,
+    },
+}
+
+impl ProcessState {
+    /// The words `object_info` returns in x1-x4: the state (0 alive, 1
+    /// exited, 2 killed, 3 fault), then the exit code, or ESR, FAR and ELR.
+    pub const fn to_words(self) -> [u64; 4] {
+        match self {
+            ProcessState::Alive => [0, 0, 0, 0],
+            ProcessState::Exited { code } => [1, code, 0, 0],
+            ProcessState::Killed => [2, 0, 0, 0],
+            ProcessState::Fault { esr, far, elr } => [3, esr, far, elr],
+        }
+    }
+
+    /// The state from x1-x4 of `object_info`; None for an unknown one.
+    pub const fn from_words(words: [u64; 4]) -> Option<ProcessState> {
+        match words[0] {
+            0 => Some(ProcessState::Alive),
+            1 => Some(ProcessState::Exited { code: words[1] }),
+            2 => Some(ProcessState::Killed),
+            3 => Some(ProcessState::Fault {
+                esr: words[1],
+                far: words[2],
+                elr: words[3],
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Priority levels (spec 8): 0 to 63, higher runs first. Level 0 goes to
+/// no thread: the kernel idles when no thread is ready.
+pub const PRIORITY_LEVELS: u8 = 64;
+
+/// The round-robin quantum (spec 8).
+pub const RR_QUANTUM_NS: u64 = 4_000_000;
+
+/// Scheduling policies (spec 8), as `thread_create` and
+/// `thread_set_priority` take them.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Round robin with a quantum of RR_QUANTUM_NS.
+    RoundRobin = 0,
+    /// First in, first out, no quantum: for real-time threads.
+    Fifo = 1,
+}
+
+impl Policy {
+    /// The policy a register holds; None for any other value.
+    pub const fn from_raw(raw: u64) -> Option<Policy> {
+        match raw {
+            0 => Some(Policy::RoundRobin),
+            1 => Some(Policy::Fifo),
+            _ => None,
+        }
+    }
+}
 
 /// Error codes of system calls (spec 12); zero means success.
 #[repr(u32)]
@@ -154,6 +373,103 @@ mod tests {
         ];
         let union = all.iter().fold(Rights::NONE, |a, b| a | *b);
         assert_eq!(union.0.count_ones(), 12);
+    }
+
+    #[test]
+    fn call_numbers_are_dense_from_one() {
+        assert_eq!(Call::ALL.len(), 28);
+        for (i, call) in Call::ALL.iter().enumerate() {
+            assert_eq!(call.number(), i as u16 + 1);
+            assert_eq!(Call::from_number(call.number()), Some(*call));
+            assert!(!TEST_CALLS.contains(&call.number()));
+        }
+        for n in [0, 29, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+            assert_eq!(Call::from_number(n), None);
+        }
+    }
+
+    #[test]
+    fn calls_keep_the_order_of_the_spec() {
+        assert_eq!(Call::HandleClose.number(), 1);
+        assert_eq!(Call::MemCreate.number(), 8);
+        assert_eq!(Call::ProcessCreate.number(), 12);
+        assert_eq!(Call::ThreadCreate.number(), 15);
+        assert_eq!(Call::Yield.number(), 19);
+        assert_eq!(Call::ClockNow.number(), 23);
+        assert_eq!(Call::ObjectInfo.number(), 27);
+        assert_eq!(Call::DebugWrite.number(), 28);
+        assert_eq!(RESULT_VALUES, 9);
+    }
+
+    #[test]
+    fn inline_bytes_fill_x2_to_x9_low_byte_first() {
+        assert_eq!(INLINE_MAX, 64);
+        let bytes: [u8; INLINE_MAX] = core::array::from_fn(|i| i as u8 + 1);
+        let words = inline_words(&bytes);
+        assert_eq!(words[0], 0x0807_0605_0403_0201);
+        assert_eq!(words[7], 0x403F_3E3D_3C3B_3A39);
+        assert_eq!(inline_bytes(&words), bytes);
+        assert_eq!(inline_words(b"abc"), [0x63_6261, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(inline_words(b""), [0; 8]);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 64 bytes")]
+    fn inline_words_take_at_most_64_bytes() {
+        inline_words(&[0; INLINE_MAX + 1]);
+    }
+
+    #[test]
+    fn init_handles_are_the_first_entries_at_generation_one() {
+        assert_eq!(INIT_RESOURCE, Handle::new(0, 1));
+        assert_eq!(INIT_PROCESS, Handle::new(1, 1));
+        assert_eq!(INIT_THREAD, Handle::new(2, 1));
+        assert_eq!(INIT_BOOT_IMAGE, Handle::new(3, 1));
+    }
+
+    #[test]
+    fn handles_from_the_kernel_carry_fixed_rights() {
+        assert_eq!(
+            INIT_RESOURCE_RIGHTS,
+            Rights::DEVICE | Rights::DEBUG | Rights::KSTATS | Rights::DUPLICATE | Rights::TRANSFER
+        );
+        assert_eq!(
+            OWNER_RIGHTS,
+            Rights::DUPLICATE | Rights::TRANSFER | Rights::MANAGE
+        );
+    }
+
+    #[test]
+    fn process_state_travels_in_four_words() {
+        assert_eq!(INFO_PROCESS_STATE, 1);
+        let fault = ProcessState::Fault {
+            esr: 0x9200_0004,
+            far: 0x1000,
+            elr: 0x40_0000,
+        };
+        let states = [
+            (ProcessState::Alive, [0, 0, 0, 0]),
+            (ProcessState::Exited { code: 7 }, [1, 7, 0, 0]),
+            (ProcessState::Killed, [2, 0, 0, 0]),
+            (fault, [3, 0x9200_0004, 0x1000, 0x40_0000]),
+        ];
+        for (state, words) in states {
+            assert_eq!(state.to_words(), words);
+            assert_eq!(ProcessState::from_words(words), Some(state));
+        }
+        assert_eq!(ProcessState::from_words([4, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn policies_and_levels_are_fixed() {
+        assert_eq!(Policy::RoundRobin as u8, 0);
+        assert_eq!(Policy::Fifo as u8, 1);
+        assert_eq!(Policy::from_raw(0), Some(Policy::RoundRobin));
+        assert_eq!(Policy::from_raw(1), Some(Policy::Fifo));
+        assert_eq!(Policy::from_raw(2), None);
+        assert_eq!(Policy::from_raw(1 << 32), None);
+        assert_eq!(PRIORITY_LEVELS, 64);
+        assert_eq!(RR_QUANTUM_NS, 4_000_000);
     }
 
     #[test]
