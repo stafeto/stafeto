@@ -6,3 +6,13 @@ rustflags = [
     "-C", "force-frame-pointers=yes",
     "-C", "link-arg=--fix-cortex-a53-843419",
 ]
+
+# Programs (spec 14): 4 KiB pages, each loadable segment on pages of its
+# own, and one writable segment with no RELRO split, as the boot image's
+# program format wants (lib/bootimg).
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-zmax-page-size=4096",
+    "-C", "link-arg=-zseparate-loadable-segments",
+    "-C", "link-arg=-znorelro",
+]

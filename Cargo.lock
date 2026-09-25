@@ -7,6 +7,21 @@ name = "abi"
 version = "0.1.0"
 
 [[package]]
+name = "bootimg"
+version = "0.1.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
+]
+
+[[package]]
 name = "kcore"
 version = "0.1.0"
 dependencies = [
@@ -18,9 +33,29 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
  "kcore",
+]
+
+[[package]]
+name = "rt"
+version = "0.1.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
+name = "test-init"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
 ]
 
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "abi",
+ "bootimg",
+]

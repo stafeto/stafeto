@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The stafeto kernel. Milestone 1.2b: boot, read the device tree, set up
-//! the kernel's memory, the interrupt controller and the timer, report and
-//! power off. Threads of processes run at EL0 in the kernel tests only,
-//! until init comes in milestone 1.2c.
+//! The stafeto kernel. Milestone 1.2c: boot, read the device tree and the
+//! boot image, set up the kernel's memory, the interrupt controller, the
+//! timer and the scheduler, report, and start init from the boot image;
+//! init's end ends the run. Test builds run the kernel tests instead of
+//! init.
 
 #![no_std]
 #![no_main]
@@ -13,17 +14,22 @@
 mod console;
 mod arch;
 mod boot;
+#[cfg(not(feature = "ktest"))]
+mod init;
 mod interrupt;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod mm;
+mod object;
 mod panicking;
 mod process;
 mod psci;
+mod sched;
 mod syscall;
 mod thread;
 
 use boot::Boot;
+use bootimg::Program;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::KERNEL_VIRT;
 use kcore::time::Clock;
@@ -40,31 +46,35 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
     mm::kmap::switch_to_kernel_tables(boot);
+    let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
     mm::aspace::init(boot);
     arch::gic::init(&boot.info);
     let clock = arch::timer::init();
-    report(boot, clock);
+    sched::init(clock);
+    report(boot, clock, &init);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
-    finish(boot)
+    finish(boot, &init)
 }
 
+/// The kernel leaves for init (spec 13.3); init's exit turns the machine
+/// off, and its fault or kill stops it (process::init_ended).
 #[cfg(not(feature = "ktest"))]
-fn finish(_boot: &Boot) -> ! {
+fn finish(_boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");
-    psci::system_off()
+    init::start(program)
 }
 
 #[cfg(feature = "ktest")]
-fn finish(boot: &Boot) -> ! {
+fn finish(boot: &Boot, _program: &Program) -> ! {
     ktest::run(boot)
 }
 
-fn report(boot: &Boot, clock: Clock) {
+fn report(boot: &Boot, clock: Clock, init: &Program) {
     let info = &boot.info;
     for r in info.memory.as_slice() {
         kprintln!("memory     {:#x}..{:#x}", r.base, r.end());
@@ -75,6 +85,15 @@ fn report(boot: &Boot, clock: Clock) {
     if let Some(r) = info.initrd {
         kprintln!("boot image {:#x}..{:#x}", r.base, r.end());
     }
+    let [code, rodata, data] = &init.segments;
+    kprintln!(
+        "init       entry {:#x}, stack {:#x}, code {:#x?}, rodata {:#x?}, data {:#x?}",
+        init.entry,
+        init.stack_size,
+        code.pages(),
+        rodata.pages(),
+        data.pages()
+    );
     kprintln!("kernel     PA {:#x} at VA {KERNEL_VIRT:#x}", boot.kernel_pa);
     kprintln!(
         "image      {:#x}..{:#x}",

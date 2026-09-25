@@ -38,3 +38,25 @@ pub fn irq_pending() -> bool {
     };
     isr & (1 << 7) != 0
 }
+
+/// Runs `f` on the empty kernel stack: SP goes to the top of the stack, as
+/// return_to_user leaves it for the next entry, so the stack `f` finds does
+/// not depend on how deep the caller was. The caller's frames are
+/// abandoned and no value on them is ever dropped, so the caller holds none
+/// with a `Drop`. Backtraces end at `f`.
+pub fn on_empty_stack(f: extern "C" fn() -> !) -> ! {
+    // SAFETY: nothing on the kernel stack is used again: `f` never returns,
+    // and the caller's frames hold nothing that needs dropping.
+    unsafe {
+        core::arch::asm!(
+            "adrp x1, boot_stack_top",
+            "add x1, x1, :lo12:boot_stack_top",
+            "mov sp, x1",
+            "mov x29, xzr",
+            "mov x30, xzr",
+            "br x0",
+            in("x0") f,
+            options(noreturn),
+        )
+    }
+}

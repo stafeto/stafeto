@@ -6,7 +6,7 @@
 //! retired, so a table never hands out the same value twice. Rights only
 //! shrink when copied. A table grows by chunks up to a limit fixed at creation.
 
-use abi::{Handle, Rights};
+use abi::{Error, Handle, Rights};
 use core::ptr::NonNull;
 
 pub const CHUNK: usize = 64;
@@ -21,10 +21,24 @@ const _: () = assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleError {
     BadHandle,
+    WrongType,
     AccessDenied,
     InvalidArgs,
     LimitReached,
     NoMemory,
+}
+
+impl From<HandleError> for Error {
+    fn from(e: HandleError) -> Error {
+        match e {
+            HandleError::BadHandle => Error::BadHandle,
+            HandleError::WrongType => Error::WrongType,
+            HandleError::AccessDenied => Error::AccessDenied,
+            HandleError::InvalidArgs => Error::InvalidArgs,
+            HandleError::LimitReached => Error::LimitReached,
+            HandleError::NoMemory => Error::NoMemory,
+        }
+    }
 }
 
 struct Entry<T> {
@@ -208,6 +222,24 @@ impl<T> HandleTable<T> {
         }
     }
 
+    /// What `kind` makes of the object, checked in the order of the system
+    /// calls (spec 11): a live handle (else BadHandle), an object `kind`
+    /// accepts (else WrongType), then at least `required` (else AccessDenied).
+    pub fn get_as<U>(
+        &self,
+        h: Handle,
+        required: Rights,
+        kind: impl FnOnce(&T) -> Option<U>,
+    ) -> Result<U, HandleError> {
+        let (object, rights) = self.get(h)?;
+        let typed = kind(object).ok_or(HandleError::WrongType)?;
+        if rights.contains(required) {
+            Ok(typed)
+        } else {
+            Err(HandleError::AccessDenied)
+        }
+    }
+
     /// Takes the object out. The entry moves to the next generation, or
     /// retires when this was its last one.
     pub fn remove(&mut self, h: Handle) -> Result<(T, Rights), HandleError> {
@@ -252,13 +284,24 @@ impl<T> HandleTable<T> {
 
     /// Drops every object and gives every chunk back; the table is empty afterwards.
     pub fn release(&mut self, src: &mut impl ChunkSource<T>) {
+        self.release_with(src, drop);
+    }
+
+    /// Hands every object to `f`, once each, and gives every chunk back;
+    /// the table is empty afterwards. Objects that need more than a drop
+    /// when their handle goes, such as counted references, leave this way.
+    pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T)) {
         for c in 0..self.chunk_count {
             let chunk = self.chunks[c].take().expect("an initialised chunk");
-            // SAFETY: the chunk's entries are initialised; each is dropped once
-            // before its memory goes back.
+            // SAFETY: the chunk's entries are initialised; each object is
+            // taken out once, then each entry is dropped once before its
+            // memory goes back.
             unsafe {
                 let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
                 for i in 0..CHUNK {
+                    if let Some(object) = (*entries.add(i)).object.take() {
+                        f(object);
+                    }
                     entries.add(i).drop_in_place();
                 }
                 src.free_chunk(chunk);
@@ -745,6 +788,71 @@ mod tests {
             Err(HandleError::AccessDenied)
         );
         t.release(&mut src);
+    }
+
+    #[test]
+    fn get_as_checks_the_handle_then_the_type_then_the_rights() {
+        let even = |v: &u32| v.is_multiple_of(2).then_some(*v);
+        let mut src = boxes(1);
+        let mut t = table(10);
+        let h = t.insert(&mut src, 4, Rights::SEND).unwrap();
+        let odd = t.insert(&mut src, 5, Rights::NONE).unwrap();
+        assert_eq!(t.get_as(h, Rights::SEND, even), Ok(4));
+        assert_eq!(
+            t.get_as(h, Rights::RECEIVE, even),
+            Err(HandleError::AccessDenied)
+        );
+        // A wrong type comes before missing rights, a bad handle before both.
+        assert_eq!(
+            t.get_as(odd, Rights::RECEIVE, even),
+            Err(HandleError::WrongType)
+        );
+        t.remove(h).unwrap();
+        assert_eq!(
+            t.get_as(h, Rights::RECEIVE, even),
+            Err(HandleError::BadHandle)
+        );
+        assert_eq!(
+            t.get_as(Handle::INVALID, Rights::NONE, even),
+            Err(HandleError::BadHandle)
+        );
+        t.release(&mut src);
+    }
+
+    #[test]
+    fn release_with_hands_every_object_out_once() {
+        let mut src = boxes(2);
+        let mut t = table(100);
+        let hs: Vec<Handle> = (0..70)
+            .map(|i| t.insert(&mut src, i, RW).unwrap())
+            .collect();
+        for h in &hs[10..20] {
+            t.remove(*h).unwrap();
+        }
+        let mut out = Vec::new();
+        t.release_with(&mut src, |v| out.push(v));
+        out.sort();
+        let want: Vec<u32> = (0..10).chain(20..70).collect();
+        assert_eq!(out, want);
+        assert_eq!(src.freed, 2);
+        assert_eq!((t.len(), t.room()), (0, 100));
+        t.release_with(&mut src, |_| panic!("an empty table has no objects"));
+    }
+
+    #[test]
+    fn handle_errors_are_the_abi_errors() {
+        use abi::Error;
+        let pairs = [
+            (HandleError::BadHandle, Error::BadHandle),
+            (HandleError::WrongType, Error::WrongType),
+            (HandleError::AccessDenied, Error::AccessDenied),
+            (HandleError::InvalidArgs, Error::InvalidArgs),
+            (HandleError::LimitReached, Error::LimitReached),
+            (HandleError::NoMemory, Error::NoMemory),
+        ];
+        for (from, to) in pairs {
+            assert_eq!(Error::from(from), to);
+        }
     }
 
     #[test]

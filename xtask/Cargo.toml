@@ -6,3 +6,7 @@ authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
 publish = false
+
+[dependencies]
+abi = { path = "../lib/abi" }
+bootimg = { path = "../lib/bootimg", features = ["write"] }

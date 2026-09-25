@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Exception entry. A system call from EL0 goes to the dispatcher and an
-//! interrupt at EL0 to its handler; every other exception is reported with
+//! Exception entry. A system call from EL0 goes to the dispatcher, an
+//! interrupt at EL0 to its handler, and any other synchronous exception at
+//! EL0 ends the program's process; every other exception is reported with
 //! its registers and stops the kernel. Test builds skip one BRK marker
 //! (kcore::esr::TEST_BRK) to prove the vectors and the return path work. An
 //! entry from EL1 that finds no room on the kernel stack runs on the
 //! emergency stack and never returns.
 
 use super::user::UserRegs;
-use super::{registers, symbols};
+use super::{gic, registers, symbols};
+use crate::process;
 use crate::thread::{self, Thread};
+use abi::ProcessState;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::esr::{self, BrkAction};
@@ -124,10 +127,10 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
 }
 
 /// Entry from EL0 (vectors.S): the program's registers are in the running
-/// thread. After a system call or an interrupt the thread goes on. Any
-/// other synchronous exception is the program's fault and stops the
-/// machine for now (milestone 1.2c ends just the process, spec 7.9); an
-/// asynchronous one that no handler takes is an error of the system.
+/// thread. Any other synchronous exception than a system call is the
+/// program's fault and ends its process (spec 7.9); an asynchronous one
+/// that no handler takes is an error of the system and stops the machine.
+/// Then the scheduler decides who runs (sched::resume).
 #[unsafe(no_mangle)]
 extern "C" fn handle_user_exception(index: u64) -> ! {
     let thread = thread::current().expect("an entry from EL0 with no thread running");
@@ -135,25 +138,57 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
     match index {
         VECTOR_EL0_SYNC => match esr::svc_immediate(syndrome) {
             Some(number) => crate::syscall::dispatch(thread, number),
-            None => user_fault(thread, index, syndrome),
+            None => user_fault(thread, syndrome),
         },
-        VECTOR_EL0_IRQ => crate::interrupt::handle(),
+        VECTOR_EL0_IRQ => {
+            // A spurious read needs no EOI.
+            if let Some(ack) = gic::acknowledge() {
+                crate::interrupt::handle(ack);
+            }
+        }
         // Not the program's fault: PSTATE masks SErrors inside the kernel,
         // so one the kernel caused arrives at EL0 as well; FIQs never reach
         // EL1.
         _ => system_error(thread, index, syndrome),
     }
-    thread::run(thread)
+    crate::sched::resume()
 }
 
-/// Reports a fault of the program at EL0 like a kernel fault, marked EL0,
-/// and stops the machine. In test builds the running test may expect the
-/// fault and go on instead.
-fn user_fault(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
+/// A fault of the program at EL0 ends its process (spec 7.9): the reason
+/// goes into the process, with FAR only where the fault sets it
+/// (kcore::esr::fault_address), and until milestone 1.4 the kernel prints
+/// it on one line; for init, whose end stops the machine, the program's
+/// registers follow. The thread never runs again. In test builds a fault
+/// the running test does not expect stops the machine with the full
+/// report instead, as before: a mistake in a test program shows at once.
+fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     let far = registers::far_el1();
     #[cfg(feature = "ktest")]
-    crate::ktest::el0::user_fault(thread, syndrome, far);
-    report_el0(thread, "program fault", index, syndrome, far)
+    if !crate::ktest::el0::expects_fault() {
+        report_el0(thread, "program fault", VECTOR_EL0_SYNC, syndrome, far)
+    }
+    let far = esr::fault_address(syndrome, far);
+    // SAFETY: the running thread is alive and holds its process.
+    let (elr, p) = unsafe { (thread.as_ref().regs.elr, thread.as_ref().process()) };
+    let class = esr::ec(syndrome);
+    kprintln!(
+        "process fault: {} (EC {class:#x}) ESR={syndrome:#x} FAR={far:#x} ELR={elr:#x}",
+        esr::class_name(class)
+    );
+    if process::is_init(p) {
+        // Init's end stops the machine, and the panic shows only the
+        // kernel: the program's registers go out first.
+        // SAFETY: the running thread is alive; nothing else refers to it now.
+        print_program(unsafe { &thread.as_ref().regs });
+    }
+    let reason = ProcessState::Fault {
+        esr: syndrome,
+        far,
+        elr,
+    };
+    // SAFETY: the thread's reference keeps the process until the end takes
+    // its own; the thread is not used afterwards.
+    unsafe { process::end(p, reason) };
 }
 
 /// An asynchronous exception at EL0 that no handler takes: an error of the
@@ -176,6 +211,13 @@ fn report_el0(thread: NonNull<Thread>, what: &str, index: u64, syndrome: u64, fa
     // SAFETY: the running thread is alive; nothing else refers to it now.
     let regs: &UserRegs = unsafe { &thread.as_ref().regs };
     kprintln!("{what} at EL0, thread {:#x}", thread.as_ptr() as usize);
+    print_program(regs);
+    stop(index, syndrome, far, regs.elr)
+}
+
+/// A program's registers: x0-x30, then SP_EL0, ELR, SPSR and TPIDR_EL0 on
+/// a line of their own.
+fn print_program(regs: &UserRegs) {
     print_x(&regs.x);
     kprintln!(
         "\nsp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}  tpidr_el0 {:#018x}",
@@ -184,7 +226,6 @@ fn report_el0(thread: NonNull<Thread>, what: &str, index: u64, syndrome: u64, fa
         regs.spsr,
         regs.tpidr
     );
-    stop(index, syndrome, far, regs.elr)
 }
 
 fn print_x(x: &[u64; 31]) {

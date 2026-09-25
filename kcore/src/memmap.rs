@@ -2,9 +2,11 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Usable RAM (spec 7.1): memory regions minus what the boot left in place,
-//! in whole 4 KiB pages.
+//! in whole 4 KiB pages; and whether the boot image lies where the kernel
+//! can read it.
 
 use crate::bootinfo::{Region, RegionList};
+use core::fmt;
 
 pub const PAGE: u64 = 4096;
 
@@ -112,6 +114,63 @@ pub fn usable<const N: usize>(
     Ok(out)
 }
 
+/// Why the kernel cannot read the boot image where the loader put it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootImageError {
+    /// Its start is not at a 4 KiB boundary.
+    Misaligned,
+    /// Some of it lies outside the RAM the linear map covers.
+    NotMapped,
+    OverlapsKernel,
+    OverlapsDeviceTree,
+    TooManyRegions,
+}
+
+impl fmt::Display for BootImageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            BootImageError::Misaligned => "is not at a 4 KiB boundary",
+            BootImageError::NotMapped => "is not in the RAM the kernel maps",
+            BootImageError::OverlapsKernel => "overlaps the kernel",
+            BootImageError::OverlapsDeviceTree => "overlaps the device tree",
+            BootImageError::TooManyRegions => "lies in a memory map with too many regions",
+        })
+    }
+}
+
+/// Checks where the boot image `image` lies before the kernel reads it
+/// through the linear map: at a 4 KiB boundary, so that milestone 1.3 can
+/// map its files; inside the RAM the linear map covers, which is `memory`
+/// without the `no_map` ranges, in whole pages (as mm::kmap maps it); and
+/// clear of the kernel image and the device tree, which the kernel writes
+/// and reads.
+pub fn check_boot_image(
+    memory: &[Region],
+    no_map: &[Region],
+    image: Region,
+    kernel: Region,
+    dtb: Region,
+) -> Result<(), BootImageError> {
+    if !image.base.is_multiple_of(PAGE) {
+        return Err(BootImageError::Misaligned);
+    }
+    let mapped = usable::<32>(memory, no_map).map_err(|_| BootImageError::TooManyRegions)?;
+    let inside = mapped
+        .as_slice()
+        .iter()
+        .any(|m| m.base <= image.base && image.end() <= m.end());
+    if !inside {
+        return Err(BootImageError::NotMapped);
+    }
+    if clip(image, kernel).is_some() {
+        return Err(BootImageError::OverlapsKernel);
+    }
+    if clip(image, dtb).is_some() {
+        return Err(BootImageError::OverlapsDeviceTree);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +250,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(u.as_slice(), [r(0x4000_0000, MIB)]);
+    }
+
+    #[test]
+    fn boot_image_lies_in_mapped_ram_clear_of_the_kernel_and_the_device_tree() {
+        let memory = [r(0x4000_0000, 512 * MIB)];
+        let no_map = [r(0x5000_0000, MIB)];
+        let kernel = r(0x4020_0000, MIB);
+        let dtb = r(0x4810_0000, 0x1_0000);
+        let check = |image| check_boot_image(&memory, &no_map, image, kernel, dtb);
+        assert_eq!(check(r(0x4800_0000, 0x2_1000)), Ok(()));
+        assert_eq!(check(r(0x4800_0000, MIB)), Ok(()));
+        assert_eq!(
+            check(r(0x4800_0008, 0x1000)),
+            Err(BootImageError::Misaligned)
+        );
+        // In a no-map range; past the end of memory.
+        for image in [r(0x4FFF_F000, 0x2000), r(0x5FFF_F000, 0x2000)] {
+            assert_eq!(check(image), Err(BootImageError::NotMapped), "{image:?}");
+        }
+        assert_eq!(
+            check(r(0x401F_F000, 0x2000)),
+            Err(BootImageError::OverlapsKernel)
+        );
+        assert_eq!(
+            check(r(0x480F_F000, 0x2000)),
+            Err(BootImageError::OverlapsDeviceTree)
+        );
+        // The last page of a region that ends off a page is not mapped.
+        let ragged = [r(0x4000_0000, 16 * MIB - 0x800)];
+        assert_eq!(
+            check_boot_image(&ragged, &[], r(0x40FF_F000, 0x800), kernel, dtb),
+            Err(BootImageError::NotMapped)
+        );
+        let many: Vec<Region> = (0..33).map(|i| r(0x4000_0000 + i * MIB, 0x1000)).collect();
+        assert_eq!(
+            check_boot_image(&many, &[], r(0x4000_0000, 0x1000), kernel, dtb),
+            Err(BootImageError::TooManyRegions)
+        );
+        assert_eq!(
+            BootImageError::OverlapsKernel.to_string(),
+            "overlaps the kernel"
+        );
     }
 
     #[test]

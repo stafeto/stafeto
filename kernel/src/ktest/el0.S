@@ -10,14 +10,27 @@
 
 .equ SVC_NOP, 0xFF00                    // ktest::el0::SVC_NOP
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
-.equ SVC_YIELD, 0xFF02                  // ktest::el0::SVC_YIELD
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
+.equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
+.equ CALL_PROCESS_CREATE, 12            // abi::Call::ProcessCreate
+.equ CALL_PROCESS_KILL, 13              // abi::Call::ProcessKill
+.equ CALL_PROCESS_EXIT, 14              // abi::Call::ProcessExit
+.equ CALL_THREAD_CREATE, 15             // abi::Call::ThreadCreate
+.equ CALL_THREAD_START, 16              // abi::Call::ThreadStart
+.equ CALL_THREAD_EXIT, 17               // abi::Call::ThreadExit
+.equ CALL_THREAD_SET_PRIORITY, 18       // abi::Call::ThreadSetPriority
+.equ CALL_YIELD, 19                     // abi::Call::Yield
+.equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
+.equ CALL_DEBUG_WRITE, 28               // abi::Call::DebugWrite
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
 .equ P_NZCV, 256
 .equ P_TPIDR, 264
 .equ P_FPCR, 272
 .equ P_FPSR, 280
 .equ P_V, 288
+.equ DATA_VA, 0x800000                  // ktest::el0::DATA_VA
+.equ INFO_PROCESS_STATE, 1              // abi::INFO_PROCESS_STATE
+.equ FIFO, 1                            // abi::Policy::Fifo
 
 .arch_extension fp
 .arch_extension simd
@@ -106,12 +119,12 @@ el0_wait_loop:
     b       el0_wait_loop
     svc     #SVC_DONE
 
-// Fills every register and lets the test's other thread, in another
-// process, run and fill them with its own pattern.
+// Fills every register and yields to the test's other thread, a FIFO
+// thread at the same level, which fills them with its own pattern.
 .global el0_pattern_yield
 el0_pattern_yield:
     LOAD_PATTERN
-    svc     #SVC_YIELD
+    svc     #CALL_YIELD
     svc     #SVC_DONE
 
 // Loads from the kernel address in x0, which must fault.
@@ -125,5 +138,253 @@ el0_load:
 .global el0_done_at_once
 el0_done_at_once:
     svc     #SVC_DONE
+
+// Fill every register from a pattern whose x0-x9 hold a call's arguments,
+// make the call and end: the kernel checks what the call wrote.
+.global el0_pattern_close
+el0_pattern_close:
+    LOAD_PATTERN
+    svc     #CALL_HANDLE_CLOSE
+    svc     #SVC_DONE
+
+.global el0_pattern_object_info
+el0_pattern_object_info:
+    LOAD_PATTERN
+    svc     #CALL_OBJECT_INFO
+    svc     #SVC_DONE
+
+.global el0_pattern_debug_write
+el0_pattern_debug_write:
+    LOAD_PATTERN
+    svc     #CALL_DEBUG_WRITE
+    svc     #SVC_DONE
+
+// Scheduling tests (ktest::el0). The threads of a test share the words of
+// one data page and take their arguments in x0 and up. Counter readings
+// follow an ISB, so that they are not taken early.
+
+// Adds 1 to the word at x0 and ends: a mark that the thread ran.
+.global el0_mark
+el0_mark:
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    svc     #SVC_DONE
+
+// Adds 1 to the word at x0 over and over until the word at x1 is set.
+.global el0_count_until
+el0_count_until:
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    ldr     x3, [x1]
+    cbz     x3, 1b
+    svc     #SVC_DONE
+
+// Spins until x1 counter ticks have passed, then yields. Ends with the
+// word at x0 read before the yield in x3, after it in x4, and the yield's
+// result in x0.
+.global el0_spin_then_yield
+el0_spin_then_yield:
+    mov     x2, x0
+    isb
+    mrs     x5, cntvct_el0
+    add     x5, x5, x1
+1:  isb
+    mrs     x6, cntvct_el0
+    cmp     x6, x5
+    b.lo    1b
+    ldr     x3, [x2]
+    svc     #CALL_YIELD
+    ldr     x4, [x2]
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 thread, x1 priority, x2 policy), with the word at
+// x3 read before the call into x4 and after it into x5.
+.global el0_set_priority
+el0_set_priority:
+    ldr     x4, [x3]
+    svc     #CALL_THREAD_SET_PRIORITY
+    ldr     x5, [x3]
+    svc     #SVC_DONE
+
+// The same once the word at x3, a peer's count, has moved: the peer at
+// the same level ran, after this thread's quantum ended, and the call
+// comes at the start of the new quantum this thread gets back after the
+// peer's. Afterwards sets the word at x6, which lets the peer end.
+.global el0_set_priority_after_peer
+el0_set_priority_after_peer:
+    ldr     x4, [x3]
+1:  ldr     x5, [x3]
+    cmp     x5, x4
+    b.eq    1b
+    mov     x4, x5
+    svc     #CALL_THREAD_SET_PRIORITY
+    ldr     x5, [x3]
+    mov     x7, #1
+    str     x7, [x6]
+    svc     #SVC_DONE
+
+// Round robin next to a peer at the same level. x0: this thread's words
+// {count, switches}; x1: the peer's; x2: switches to wait for. Each turn
+// of the loop adds 1 to the count, reads the counter, the peer's count
+// and the counter again. When the peer's count has moved since the last
+// turn, the peer ran in between: a switch. The stretch from the first
+// reading of the last turn to the second of this one holds that whole
+// run; the shortest such stretch goes to x3, the switches seen to x4
+// (stretches after the x2-th switch do not count: a peer that is done
+// ends its run early). Ends once both threads have seen x2 switches.
+.global el0_alternate
+el0_alternate:
+    mov     x3, #-1
+    mov     x4, #0
+    isb
+    mrs     x6, cntvct_el0              // first reading of the last turn
+    ldr     x5, [x1]                    // the peer's count at the last turn
+1:  ldr     x7, [x0]
+    add     x7, x7, #1
+    str     x7, [x0]
+    isb
+    mrs     x8, cntvct_el0
+    ldr     x9, [x1]
+    isb
+    mrs     x10, cntvct_el0
+    cmp     x9, x5
+    b.eq    2f
+    mov     x5, x9
+    cmp     x4, x2
+    b.hs    2f
+    add     x4, x4, #1
+    str     x4, [x0, #8]
+    sub     x11, x10, x6
+    cmp     x11, x3
+    csel    x3, x11, x3, lo
+2:  mov     x6, x8
+    cmp     x4, x2
+    b.lo    1b
+    ldr     x9, [x1, #8]
+    cmp     x9, x2
+    b.lo    1b
+    svc     #SVC_DONE
+
+// Process and thread tests (ktest::el0). A call that must not return is
+// followed by `svc #SVC_DONE`, where the kernel fails the test.
+
+// WFI traps at EL0 (SCTLR_EL1.nTWI is clear): the program's fault.
+.global el0_wfi
+el0_wfi:
+    wfi
+    svc     #SVC_DONE
+
+// process_kill with the handle in x0.
+.global el0_kill
+el0_kill:
+    svc     #CALL_PROCESS_KILL
+    svc     #SVC_DONE
+
+// process_exit with the code in x0.
+.global el0_exit_process
+el0_exit_process:
+    svc     #CALL_PROCESS_EXIT
+    svc     #SVC_DONE
+
+// thread_create with the arguments in x0-x6, then thread_exit: the new
+// thread stays stopped.
+.global el0_create_then_exit
+el0_create_then_exit:
+    svc     #CALL_THREAD_CREATE
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// object_info with the arguments in x0-x2, then thread_exit.
+.global el0_info_then_exit
+el0_info_then_exit:
+    svc     #CALL_OBJECT_INFO
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// thread_create with the arguments in x0-x6 and thread_start of the new
+// thread; then, when x7 is not 0, handle_close of its handle. Ends with
+// the last call's x0 and the handle in x19.
+.global el0_start_and_close
+el0_start_and_close:
+    svc     #CALL_THREAD_CREATE
+    cbnz    x0, 1f
+    mov     x19, x1
+    mov     x0, x19
+    svc     #CALL_THREAD_START
+    cbnz    x0, 1f
+    cbz     x7, 1f
+    mov     x0, x19
+    svc     #CALL_HANDLE_CLOSE
+1:  svc     #SVC_DONE
+
+// The thread el0_start_and_close makes: adds 1 to the first word of its
+// message buffer, at x0, and stores the word in word 0 of the shared page,
+// so that word holds 1 when the buffer read as zero and took the write;
+// then exits.
+.global el0_buffer_mark
+el0_buffer_mark:
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    ldr     x1, [x0]
+    mov     x2, #DATA_VA
+    str     x1, [x2]
+    svc     #CALL_THREAD_EXIT
+
+// A parent. x0: the child's priority ceiling; x1: the entry of the
+// child's thread; x2: that thread's priority; x3: its message buffer.
+// process_create(4096, 16, x0, 0, 0), thread_create(child, x1, 0, 0, x2,
+// FIFO, x3), thread_start, then object_info(child, PROCESS_STATE). Ends
+// with the last call's x0-x4, the child's handle in x23 and its thread's
+// in x24.
+.global el0_child_fault
+el0_child_fault:
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x2
+    mov     x22, x3
+    mov     x0, #4096
+    mov     x1, #16
+    mov     x2, x19
+    mov     x3, #0
+    mov     x4, #0
+    svc     #CALL_PROCESS_CREATE
+    cbnz    x0, 1f
+    mov     x23, x1
+    mov     x0, x23
+    mov     x1, x20
+    mov     x2, #0
+    mov     x3, #0
+    mov     x4, x21
+    mov     x5, #FIFO
+    mov     x6, x22
+    svc     #CALL_THREAD_CREATE
+    cbnz    x0, 1f
+    mov     x24, x1
+    mov     x0, x24
+    svc     #CALL_THREAD_START
+    cbnz    x0, 1f
+    mov     x0, x23
+    mov     x1, #INFO_PROCESS_STATE
+    mov     x2, #0
+    svc     #CALL_OBJECT_INFO
+1:  svc     #SVC_DONE
+
+// thread_start of the thread in x0, then handle_close of x0 and of x1.
+// Ends with the last call's x0.
+.global el0_start_then_close
+el0_start_then_close:
+    mov     x19, x0
+    mov     x20, x1
+    svc     #CALL_THREAD_START
+    cbnz    x0, 1f
+    mov     x0, x19
+    svc     #CALL_HANDLE_CLOSE
+    cbnz    x0, 1f
+    mov     x0, x20
+    svc     #CALL_HANDLE_CLOSE
+1:  svc     #SVC_DONE
 
 el0_programs_end:

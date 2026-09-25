@@ -9,7 +9,6 @@ use core::ptr::NonNull;
 use kcore::layout::LINEAR_BASE;
 use kcore::slab::PageSource;
 
-#[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub struct KernelPages;
 
 // SAFETY: every page is a frame just taken from the allocator, 4 KiB

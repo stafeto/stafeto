@@ -1,0 +1,17 @@
+[package]
+name = "init"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The first program of stafeto"
+
+[[bin]]
+name = "init"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+rt = { path = "../../lib/rt" }

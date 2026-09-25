@@ -18,13 +18,6 @@ const L1IP_PIPT: u64 = 0b11;
 /// syncs every page it maps executable, whole, and not only the bytes it
 /// copied: the rest of the page was zeroed through the data side, and a
 /// PIPT instruction cache may still hold the frame's previous code there.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the loader of init (milestone 1.2c) will call it; so far only the kernel tests do"
-    )
-)]
 pub fn sync_icache(va: usize, len: usize) {
     let ctr: u64;
     // SAFETY: reading CTR_EL0 has no side effects.

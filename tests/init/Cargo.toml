@@ -1,0 +1,17 @@
+[package]
+name = "test-init"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Tests of the system calls from EL0, run as init on the normal build of the kernel"
+
+[[bin]]
+name = "test-init"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+rt = { path = "../../lib/rt" }
