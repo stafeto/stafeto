@@ -81,10 +81,11 @@ pub fn start(program: &Program<'_>) -> ! {
     process::install_init_handles(p, t).unwrap_or_else(|e| panic!("init: no handles: {e:?}"));
     thread::start(t).unwrap_or_else(|e| panic!("init: its thread did not start: {e:?}"));
     // SAFETY: the references `create` handed out go; init's handles, its
-    // thread and the scheduler hold init from now on.
+    // thread and the scheduler hold init from now on, so neither is the
+    // last and nothing is queued for cleanup.
     unsafe {
-        thread::release(t);
-        process::release(p);
+        thread::release(t, PRIORITY);
+        process::release(p, PRIORITY);
     }
     crate::sched::resume()
 }

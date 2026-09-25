@@ -2,9 +2,10 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
-//! reference to its process or thread, and the object goes with its last
-//! reference. The system resource is one for the whole system and is not
-//! counted: what a handle to it allows is in the handle's rights.
+//! reference to its process or thread, and the last reference queues the
+//! object for cleanup (spec 7.7). The system resource is one for the whole
+//! system and is not counted: what a handle to it allows is in the
+//! handle's rights.
 
 use crate::mm::pages::KernelPages;
 use crate::process::{self, Process};
@@ -63,16 +64,19 @@ pub fn retain(object: Object) {
     }
 }
 
-/// Drops the reference a handle held; the object goes with its last one.
+/// Drops the reference a handle held; the last one queues the object for
+/// cleanup at `cause` (1-63): the effective priority of the thread whose
+/// call let the reference go, or the level of the object whose portion
+/// did (spec 7.7). Nothing is taken apart here.
 ///
 /// # Safety
 /// The reference was the handle's, and the handle is gone.
-pub unsafe fn release(object: Object) {
+pub unsafe fn release(object: Object, cause: u8) {
     // SAFETY: the caller hands over the handle's reference.
     unsafe {
         match object {
-            Object::Process(p) => process::release(p),
-            Object::Thread(t) => thread::release(t),
+            Object::Process(p) => process::release(p, cause),
+            Object::Thread(t) => thread::release(t, cause),
             Object::Resource => {}
         }
     }

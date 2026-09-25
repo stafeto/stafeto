@@ -12,13 +12,15 @@ use crate::arch::symbols;
 use crate::arch::user::UserRegs;
 use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
+use crate::cleanup;
 use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::KernelPages;
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
+use crate::object::Object;
 use crate::thread::Policy;
 use crate::{process, thread};
-use abi::Error;
+use abi::{Error, Rights};
 use core::sync::atomic::{AtomicU32, Ordering};
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
@@ -154,6 +156,10 @@ const TESTS: &[(&str, TestFn)] = &[
         processes_and_threads_return_their_memory,
     ),
     (
+        "last_reference_only_queues_the_object",
+        last_reference_only_queues_the_object,
+    ),
+    (
         "unknown_system_calls_fail_with_invalid_args",
         calls::unknown_system_calls_fail_with_invalid_args,
     ),
@@ -193,6 +199,10 @@ const TESTS: &[(&str, TestFn)] = &[
 
 /// Tests that failed so far, the EL0 tests' included.
 static FAILED: AtomicU32 = AtomicU32::new(0);
+
+/// The level of the cleanup the tests' own releases start: the tests run
+/// the queue dry themselves (cleanup::drain), so any level will do.
+pub const CAUSE: u8 = 1;
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -1214,8 +1224,69 @@ fn process_round() -> Result<(), &'static str> {
     };
     // SAFETY: the process's threads went, the test's reference is the last,
     // and nothing uses it afterwards.
-    unsafe { process::release(p) };
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
     result
+}
+
+/// A chain of processes, each holding the only handle to the next: the
+/// last reference to the first only queues it, at the level of its cause;
+/// each portion takes one process apart and queues the next at its own
+/// level, never taking the next apart inside itself (spec 7.7).
+fn last_reference_only_queues_the_object(_: &Boot) -> Result<(), &'static str> {
+    const CHAIN: usize = 16;
+    const LEVEL: u8 = 7;
+    cleanup::drain();
+    let base = process::in_use();
+    let first = process::create(16, 63).map_err(|_| "no process")?;
+    let mut last = first;
+    for _ in 1..CHAIN {
+        let Ok(next) = process::create(16, 63) else {
+            break;
+        };
+        let held = process::insert_handle(last, Object::Process(next), Rights::NONE);
+        // SAFETY: the test's reference goes; the handle, if it went in,
+        // holds the process.
+        unsafe { process::release(next, CAUSE) };
+        if held.is_err() {
+            break;
+        }
+        last = next;
+    }
+    let whole = process::in_use() == base + CHAIN;
+    // SAFETY: the test's reference is the last, and nothing uses it
+    // afterwards.
+    unsafe { process::release(first, LEVEL) };
+    let result = check(whole, "the chain of processes was not built")
+        .and_then(|()| portions_one_by_one(base, CHAIN, LEVEL));
+    cleanup::drain();
+    result
+}
+
+/// `chain` processes above `base` go one portion each, the queue holding
+/// the next at `level` meanwhile.
+fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'static str> {
+    check(
+        process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (1, Some(level)),
+        "the last reference did more than queue the process at the level of its cause",
+    )?;
+    for left in (0..chain).rev() {
+        cleanup::portion();
+        check(
+            process::in_use() == base + left,
+            "a portion took more or less than one process apart",
+        )?;
+        let queued = if left > 0 {
+            (1, Some(level))
+        } else {
+            (0, None)
+        };
+        check(
+            (cleanup::len(), cleanup::top()) == queued,
+            "a portion did not queue the next process at its own level",
+        )?;
+    }
+    Ok(())
 }
 
 /// Three pages take a zeroed block of four frames and three tables over it.
@@ -1259,7 +1330,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
         "a new thread does not start as it was told",
     );
     // SAFETY: the thread is not running, and nothing uses it afterwards.
-    unsafe { thread::release(t) };
+    unsafe { thread::release(t, CAUSE) };
     result?;
     for (entry, stack, priority) in [
         (USER_END, stack, 10),
@@ -1271,7 +1342,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
             Err(Error::InvalidArgs) => {}
             Ok(t) => {
                 // SAFETY: the thread never ran, and nothing uses it afterwards.
-                unsafe { thread::release(t) };
+                unsafe { thread::release(t, CAUSE) };
                 return Err("a thread with a bad start was created");
             }
             Err(_) => return Err("a bad start failed with another error"),

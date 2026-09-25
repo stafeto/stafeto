@@ -104,6 +104,13 @@ fn caller(thread: NonNull<Thread>) -> NonNull<Process> {
     unsafe { thread.as_ref() }.process()
 }
 
+/// The level of the cleanup the caller's call causes: its effective
+/// priority (spec 7.7).
+fn cause(thread: NonNull<Thread>) -> u8 {
+    // SAFETY: the thread that made the call is alive.
+    unsafe { thread.as_ref() }.priority()
+}
+
 /// Looks `h` up in the caller's table (Process::lookup).
 fn lookup<U>(
     thread: NonNull<Thread>,
@@ -116,10 +123,10 @@ fn lookup<U>(
 }
 
 /// handle_close(x0 handle), no right needed: the handle's reference goes,
-/// and the object goes with its last reference. Closing a handle to a
-/// thread or a process does not end it.
+/// and the last reference queues the object for cleanup at the caller's
+/// priority. Closing a handle to a thread or a process does not end it.
 fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    process::close_handle(caller(thread), Handle(a[0]))?;
+    process::close_handle(caller(thread), Handle(a[0]), cause(thread))?;
     Ok(Values::NONE)
 }
 
@@ -155,7 +162,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let h = process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS);
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the child.
-    unsafe { process::release(child) };
+    unsafe { process::release(child, cause(thread)) };
     Ok(Values::new(&[h?.0]))
 }
 
@@ -168,7 +175,7 @@ fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let own = target == caller(thread);
     // SAFETY: the handle holds the process; the end takes its own
     // reference before the table that holds the handle may go.
-    unsafe { process::end(target, ProcessState::Killed) };
+    unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
     if own {
         // The caller ended with its process and may be gone.
         sched::resume()
@@ -179,9 +186,10 @@ fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// process_exit(x0 code): the caller's process ends with `code`. Never
 /// returns.
 fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
+    let exited = ProcessState::Exited { code: a[0] };
     // SAFETY: the calling thread holds its process until the end takes
     // its own reference.
-    unsafe { process::end(caller(thread), ProcessState::Exited { code: a[0] }) };
+    unsafe { process::end(caller(thread), exited, cause(thread)) };
     sched::resume()
 }
 
@@ -212,9 +220,9 @@ fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let h = thread::give_buffer(t, buffer)
         .and_then(|()| process::insert_handle(caller(thread), Object::Thread(t), OWNER_RIGHTS));
     // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the thread, and without it the thread goes with its
-    // buffer.
-    unsafe { thread::release(t) };
+    // went in, holds the thread, and without it the thread is queued for
+    // cleanup and goes with its buffer.
+    unsafe { thread::release(t, cause(thread)) };
     Ok(Values::new(&[h?.0]))
 }
 

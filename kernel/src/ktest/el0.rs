@@ -9,12 +9,14 @@
 //! program ends with `svc #SVC_DONE`: the test judges the thread, which
 //! leaves the scheduler; once every thread of the test has passed or
 //! ended as the test expects (`Fixture::ends`), or one has failed, the
-//! test prints its line and the next one starts. After the last one the
-//! run ends. The programs are in el0.S.
+//! test prints its line and the next one starts; the cleanup queue runs
+//! dry in between. After the last one the run ends. The programs are in
+//! el0.S.
 
-use super::{check, finish, report};
+use super::{CAUSE, check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
-use crate::arch::{cache, gic, symbols, timer};
+use crate::arch::{self, cache, gic, symbols, timer};
+use crate::cleanup;
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::sched;
@@ -24,6 +26,7 @@ use abi::{Call, Error, Handle, INFO_PROCESS_STATE, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::esr;
 use kcore::frames::PAGE_SIZE;
+use kcore::gic::PRIORITY_MASK;
 use kcore::layout::LINEAR_BASE;
 use kcore::paging::Attrs;
 use kcore::sched::State;
@@ -103,6 +106,10 @@ const CEILING: u8 = 63;
 const SLOTS: usize = 3;
 /// Switches each thread of `rr_threads_alternate_by_quantum` waits for.
 const SWITCHES: u64 = 3;
+/// Threads of the child whose kill the cleanup tests queue: a portion each.
+const CHILD_THREADS: usize = 8;
+/// The portion of cleanup after which the cleanup tests' interrupt comes.
+const INTERRUPT_AFTER: u32 = 2;
 
 struct El0Test {
     name: &'static str,
@@ -180,6 +187,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_idle,
     },
     El0Test {
+        name: "idle_keeps_the_priority_mask_open",
+        start: start_idle,
+        done: done_idle_mask,
+    },
+    El0Test {
         name: "fifo_thread_runs_with_the_timer_off",
         start: start_timer_off,
         done: done_timer_off,
@@ -255,6 +267,16 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_orphan,
     },
     El0Test {
+        name: "cleanup_yields_to_a_pending_interrupt",
+        start: start_cleanup,
+        done: done_cleanup_yields,
+    },
+    El0Test {
+        name: "cleanup_runs_at_the_priority_of_its_cause",
+        start: start_cleanup,
+        done: done_cleanup_level,
+    },
+    El0Test {
         name: "init_fault_stops_the_machine",
         start: start_init_fault,
         done: done_init_fault,
@@ -322,10 +344,18 @@ struct Fixture {
     wake: Option<u64>,
     /// CNTV_CVAL_EL0 when that interrupt came.
     fired_at: Option<u64>,
-    /// sched::idle_ticks when the test began.
+    /// Ticks asleep in `wfi` (sched::stats) when the test began.
     idle: u64,
-    /// How far below the top of the kernel stack the idle loop began.
+    /// How far below the top of the kernel stack the idle wait began.
     idle_depth: Option<usize>,
+    /// GICC_PMR in the idle wait.
+    idle_mask: Option<u8>,
+    /// Portions of cleanup since the test began, and the one after which
+    /// the timer's interrupt comes (portion_done).
+    portions: u32,
+    interrupt_after: Option<u32>,
+    /// Items in the cleanup queue when the wake-up came.
+    queued_at_wake: Option<u64>,
     /// The counter before the thread started.
     counter: u64,
     /// Whether the test expects a fault at EL0, which then ends the
@@ -360,6 +390,10 @@ impl Fixture {
             fired_at: None,
             idle: 0,
             idle_depth: None,
+            idle_mask: None,
+            portions: 0,
+            interrupt_after: None,
+            queued_at_wake: None,
             counter: 0,
             faults: false,
             stack: None,
@@ -393,11 +427,12 @@ pub fn count() -> usize {
 
 /// Starts the tests from `first` on: the scheduler starts each test's
 /// threads, but the one that waits for its wake-up, and runs them. A test
-/// that cannot start fails, and the next one starts. After the last test
-/// the pools hold no process and no thread: the kernel's references and
-/// the tests' own went.
+/// that cannot start fails, and the next one starts. Each test finds the
+/// cleanup queue empty. After the last test the pools hold no process and
+/// no thread: the kernel's references and the tests' own went.
 fn start(first: usize) -> ! {
     for (i, test) in tests().enumerate().skip(first) {
+        cleanup::drain();
         let started = {
             let mut f = FIXTURE.lock();
             *f = Fixture::new(i);
@@ -416,6 +451,7 @@ fn start(first: usize) -> ! {
             }
         }
     }
+    cleanup::drain();
     report(
         "el0_tests_return_their_objects",
         check(
@@ -447,20 +483,20 @@ fn teardown() {
     };
     for (p, h) in handles.into_iter().flatten() {
         // A handle the test closed itself is bad by now, which is fine.
-        let _ = process::close_handle(p, h);
+        let _ = process::close_handle(p, h, CAUSE);
     }
     for t in threads.into_iter().flatten() {
         // SAFETY: the test's references go with it; the thread leaves the
         // scheduler first, and a thread that runs stops being the running
         // one.
         unsafe {
-            sched::exit(t);
-            thread::release(t);
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
         }
     }
     for p in processes.into_iter().flatten() {
         // SAFETY: as above; the threads released their references first.
-        unsafe { process::release(p) };
+        unsafe { process::release(p, CAUSE) };
     }
 }
 
@@ -496,6 +532,7 @@ pub fn timer_fired() {
             Some(at) if timer::now() >= at => {
                 f.wake = None;
                 f.fired_at = Some(timer::cval());
+                f.queued_at_wake = Some(cleanup::len());
                 f.threads[0]
             }
             _ => None,
@@ -526,15 +563,38 @@ fn note_stack() {
     f.stack_ok &= sp == first && top - sp < PAGE;
 }
 
-/// The idle loop starts on the empty kernel stack (arch::on_empty_stack),
-/// however deep the path that found nothing to run.
+/// The idle wait starts near the top of the kernel stack (the way out of
+/// the kernel runs on the empty stack, arch::on_empty_stack), however
+/// deep the path that found nothing to run; the priority mask stays open.
 pub fn note_idle_stack() {
     let sp: usize;
     // SAFETY: reading SP has no side effects.
     unsafe {
         core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
     };
-    FIXTURE.lock().idle_depth = Some(symbols::boot_stack().end - sp);
+    let mut f = FIXTURE.lock();
+    f.idle_depth = Some(symbols::boot_stack().end - sp);
+    f.idle_mask = Some(gic::priority_mask());
+}
+
+/// After each portion of cleanup (cleanup::portion): in the cleanup tests,
+/// portion `interrupt_after` arms the timer for now and waits until its
+/// interrupt is pending, so the way out of the kernel finds it at the
+/// next poll; the interrupt starts the thread in slot 0 (`wake`).
+pub fn portion_done() {
+    let now = {
+        let mut f = FIXTURE.lock();
+        f.portions += 1;
+        if f.interrupt_after != Some(f.portions) {
+            return;
+        }
+        f.interrupt_after = None;
+        let now = timer::now();
+        f.wake = Some(now);
+        now
+    };
+    timer::arm(now);
+    while !arch::irq_pending() {}
 }
 
 /// A thread's `svc #SVC_DONE`: the test judges it. Once every thread of
@@ -557,8 +617,10 @@ fn done(thread: NonNull<Thread>) -> ! {
     };
     match result {
         Ok(()) if !all => {
+            // SAFETY: the running thread is alive.
+            let cause = unsafe { thread.as_ref() }.priority();
             // SAFETY: the test still holds its own reference to the thread.
-            unsafe { sched::exit(thread) };
+            unsafe { sched::exit(thread, cause) };
             sched::resume()
         }
         result => end(result),
@@ -882,6 +944,10 @@ fn done_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         !gic::is_active(timer::INTID),
         "the timer interrupt did not end at the GIC",
     )?;
+    check(
+        sched::stats().irq_latency > 0,
+        "the latency from the deadline to the thread after an interrupt at EL0 was not counted",
+    )?;
     let p = &f.patterns[0];
     check_pattern(&t.regs, p, &p.x[..1])
 }
@@ -1007,7 +1073,7 @@ fn done_object_info(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 fn start_closed_handle(f: &mut Fixture) -> Result<(), &'static str> {
     let p = new_process(f, 0)?;
     let h = give(p, Object::Resource, Rights::DEBUG)?;
-    process::close_handle(p, abi::Handle(h)).map_err(|_| "the handle did not close")?;
+    process::close_handle(p, abi::Handle(h), CAUSE).map_err(|_| "the handle did not close")?;
     call_pattern(f, &[h]);
     new_thread(
         f,
@@ -1118,7 +1184,7 @@ fn give_kept(f: &mut Fixture, object: Object) -> Result<u64, &'static str> {
 /// comes; nothing else is ready meanwhile, so the kernel idles.
 fn start_idle(f: &mut Fixture) -> Result<(), &'static str> {
     spawn(f, 0, &raw const el0_read_counter, 0)?;
-    f.idle = sched::idle_ticks();
+    f.idle = sched::stats().idle;
     f.counter = timer::clock().deadline_after(timer::now(), 1_000_000);
     f.wake = Some(f.counter);
     Ok(())
@@ -1134,12 +1200,25 @@ fn done_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the thread ran before its deadline",
     )?;
     check(
-        sched::idle_ticks() > f.idle,
-        "the kernel did not sleep in its idle loop",
+        sched::stats().idle > f.idle,
+        "the kernel did not sleep in its idle wait",
+    )?;
+    check(
+        sched::stats().idle_latency > 0,
+        "the latency from the deadline to the thread after wfi was not counted",
     )?;
     check(
         f.idle_depth.is_some_and(|d| d <= 256),
-        "the idle loop did not start at the top of the kernel stack",
+        "the idle wait did not start near the top of the kernel stack",
+    )
+}
+
+/// The idle wait leaves the GIC's priority mask open: every line the
+/// kernel unmasked wakes it (spec 8.1).
+fn done_idle_mask(f: &Fixture, _: &Thread) -> Result<(), &'static str> {
+    check(
+        f.idle_mask == Some(PRIORITY_MASK),
+        "the idle wait changed GICC_PMR",
     )
 }
 
@@ -1604,7 +1683,7 @@ fn done_keep_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let ended = made.is_ok_and(|m| unsafe { m.as_ref() }.sched.state() == State::Dead);
     let result = check(ended, "the handle does not keep the thread that exited")
         .and_then(|()| made_thread_exited(f));
-    let closed = process::close_handle(p, h);
+    let closed = process::close_handle(p, h, CAUSE);
     result?;
     check(closed.is_ok(), "the handle to the thread did not close")
 }
@@ -1708,12 +1787,12 @@ fn start_orphan(f: &mut Fixture, entry: u64) -> Result<(), &'static str> {
     let handles = t.ok().map(|t| {
         let ht = process::insert_handle(p, Object::Thread(t), Rights::MANAGE);
         // SAFETY: the reference `create` handed out goes.
-        unsafe { thread::release(t) };
+        unsafe { thread::release(t, CAUSE) };
         ht
     });
     let hc = process::insert_handle(p, Object::Process(child), Rights::MANAGE);
     // SAFETY: as above.
-    unsafe { process::release(child) };
+    unsafe { process::release(child, CAUSE) };
     match (handles, hc) {
         (Some(Ok(ht)), Ok(hc)) => {
             set_args(maker, &[ht.0, hc.0]);
@@ -1739,5 +1818,104 @@ fn done_orphan(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         process::in_use() == 1 && thread::in_use() == 2,
         "the orphan process or its thread stayed, or went twice",
+    )
+}
+
+// Cleanup (spec 7.7). The thread in slot 1 kills a child whose table holds
+// the only handles to its CHILD_THREADS stopped threads: each thread's
+// last reference goes, and each takes one portion of cleanup at the
+// killer's level. After INTERRUPT_AFTER portions the timer's interrupt
+// comes (portion_done) and starts the thread in slot 0 above the killer;
+// the judge in slot 2 is below both.
+
+/// The cleanup tests' threads and child.
+fn start_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY + 10, FIFO)?;
+    let killer = sched_thread(f, 1, &raw const el0_kill, PRIORITY, FIFO)?;
+    sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    let child = child_with_threads()?;
+    let h = give_kept(f, Object::Process(child));
+    // SAFETY: the test's reference goes; the handle, if it went in, holds
+    // the child.
+    unsafe { process::release(child, CAUSE) };
+    set_args(killer, &[h?]);
+    // Slot 0 waits for the interrupt, which no deadline brings.
+    f.wake = Some(u64::MAX);
+    f.interrupt_after = Some(INTERRUPT_AFTER);
+    cleanup::take_late();
+    Ok(())
+}
+
+/// A process with CHILD_THREADS stopped threads that only handles in its
+/// own table hold.
+fn child_with_threads() -> Result<NonNull<Process>, &'static str> {
+    let child = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    for _ in 0..CHILD_THREADS {
+        let made =
+            thread::create(child, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO).and_then(|t| {
+                let h = process::insert_handle(child, Object::Thread(t), Rights::NONE);
+                // SAFETY: the reference `create` handed out goes; the handle,
+                // if it went in, holds the thread.
+                unsafe { thread::release(t, CAUSE) };
+                h
+            });
+        if made.is_err() {
+            // SAFETY: the test's reference goes, and nothing uses it
+            // afterwards.
+            unsafe { process::release(child, CAUSE) };
+            return Err("no thread in the child");
+        }
+    }
+    Ok(child)
+}
+
+/// The interrupt that came after INTERRUPT_AFTER portions was handled
+/// while work was left, and no portion began while it was pending.
+fn done_cleanup_yields(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => Ok(()),
+        1 => check(t.regs.x[0] == 0, "process_kill failed"),
+        _ => {
+            check(
+                f.queued_at_wake.is_some_and(|n| n > 0),
+                "the interrupt waited for the cleanup to end",
+            )?;
+            check(
+                !cleanup::take_late(),
+                "a portion began while an interrupt was pending",
+            )?;
+            cleanup_done()
+        }
+    }
+}
+
+/// The cleanup runs at the killer's level: the thread above it runs while
+/// work is left, the killer's call returns only after the work of its own
+/// level, and the judge below comes last.
+fn done_cleanup_level(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            cleanup::len() > 0,
+            "the thread above the cause waited for the cleanup",
+        ),
+        1 => check(
+            t.regs.x[0] == 0 && cleanup::len() == 0,
+            "process_kill returned before the cleanup at its caller's level",
+        ),
+        _ => cleanup_done(),
+    }
+}
+
+/// The child's threads went back to their pool; the child stays as a
+/// shell that the test's handle holds.
+fn cleanup_done() -> Result<(), &'static str> {
+    check(
+        cleanup::len() == 0 && cleanup::longest() > 0,
+        "the cleanup queue is not empty, or no portion was measured",
+    )?;
+    check(
+        thread::in_use() == SLOTS && process::in_use() == 2,
+        "the killed child's threads stayed in their pool",
     )
 }

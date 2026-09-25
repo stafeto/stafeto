@@ -7,8 +7,9 @@
 //! on success x0 is 0 and the values follow in x1 and up. The same calls
 //! from EL0 are in `el0`.
 
-use super::check;
+use super::{CAUSE, check};
 use crate::boot::Boot;
+use crate::cleanup;
 use crate::mm::phys;
 use crate::object::Object;
 use crate::process::{self, Process};
@@ -57,20 +58,22 @@ impl Caller {
             Ok(thread) => Ok(Caller { process, thread }),
             Err(_) => {
                 // SAFETY: the process is the test's, and nothing uses it afterwards.
-                unsafe { process::release(process) };
+                unsafe { process::release(process, CAUSE) };
+                cleanup::drain();
                 Err("no thread")
             }
         }
     }
 
     /// Drops the test's references; the thread and the process go unless
-    /// a handle still holds them.
+    /// a handle still holds them, and the cleanup queue runs dry.
     fn release(self) {
         // SAFETY: the references are the test's, and nothing uses them afterwards.
         unsafe {
-            thread::release(self.thread);
-            process::release(self.process);
+            thread::release(self.thread, CAUSE);
+            process::release(self.process, CAUSE);
         }
+        cleanup::drain();
     }
 
     fn insert(&self, object: Object, rights: Rights) -> Result<Handle, &'static str> {
@@ -78,7 +81,7 @@ impl Caller {
     }
 
     fn close(&self, h: Handle) -> Result<(), &'static str> {
-        process::close_handle(self.process, h).map_err(|_| "a handle did not close")
+        process::close_handle(self.process, h, CAUSE).map_err(|_| "a handle did not close")
     }
 
     /// Makes call `number` with `args` in x0 and up, the rest of x0-x9
@@ -236,8 +239,9 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
     c.succeeds(n, &[own, state, 0], &ProcessState::Alive.to_words())
 }
 
-/// A handle holds its object: the last close lets a thread and a process
-/// go back to their pools, and a closed handle is bad from then on.
+/// A handle holds its object: the last close queues a thread and a
+/// process for cleanup at the level of the caller, 10, and their portions
+/// let them go back to their pools; a closed handle is bad from then on.
 pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(|c| {
@@ -246,7 +250,7 @@ pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str
             Ok(t) => t,
             Err(_) => {
                 // SAFETY: the process is the test's, and nothing uses it afterwards.
-                unsafe { process::release(other) };
+                unsafe { process::release(other, CAUSE) };
                 return Err("no second thread");
             }
         };
@@ -257,8 +261,8 @@ pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str
         // SAFETY: the test's references go; the handles, if any, hold the
         // objects from here on.
         unsafe {
-            thread::release(t);
-            process::release(other);
+            thread::release(t, CAUSE);
+            process::release(other, CAUSE);
         }
         let (Ok(hp), Ok(ht)) = handles else {
             return Err("a handle did not go in");
@@ -285,11 +289,21 @@ fn close_cases(
     )?;
     c.succeeds(n, &[ht.0], &[])?;
     check(
+        thread::in_use() == threads + 2 && (cleanup::len(), cleanup::top()) == (1, Some(10)),
+        "the last handle to a thread closed, and the thread was not queued at the caller's level",
+    )?;
+    cleanup::drain();
+    check(
         thread::in_use() == threads + 1,
         "the last handle to a thread closed, and the thread stayed",
     )?;
     c.fails(n, &[ht.0], Error::BadHandle)?;
     c.succeeds(n, &[hp.0], &[])?;
+    check(
+        process::in_use() == processes + 2 && cleanup::len() == 1,
+        "the last handle to a process closed, and the process was not queued",
+    )?;
+    cleanup::drain();
     check(
         process::in_use() == processes + 1,
         "the last handle to a process closed, and the process stayed",
@@ -407,7 +421,7 @@ fn set_priority_cases(
     // A thread that ended: BAD_STATE, which comes after the ceilings.
     sched::start(low).map_err(|_| "the thread did not start")?;
     // SAFETY: the test holds its own reference to the thread.
-    unsafe { sched::exit(low) };
+    unsafe { sched::exit(low, CAUSE) };
     c.fails(n, &[to_low, 21, fifo], Error::AccessDenied)?;
     c.fails(n, &[to_low, 20, fifo], Error::BadState)
 }
@@ -477,8 +491,10 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
 
 /// A full table of the caller: LIMIT_REACHED, and the new process goes.
 fn full_table_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
+    cleanup::drain();
     let processes = process::in_use();
     with_full_table(c, n, &[PAGE_SIZE, 16, 30, 0, 0])?;
+    cleanup::drain();
     check(
         process::in_use() == processes,
         "the process of a call that failed stayed",
@@ -589,6 +605,7 @@ fn thread_create_cases(
     c.fails(n, &good(to_low, 21), Error::AccessDenied)?;
     c.close(h)?;
     result?;
+    cleanup::drain();
     check(
         process::translate(low, BUFFER as usize).is_none(),
         "the buffer's page outlived its thread",
@@ -597,6 +614,7 @@ fn thread_create_cases(
     // its buffer go; the buffer's page tables stay with the process.
     let (threads, frames) = (thread::in_use(), phys::free_frames());
     with_full_table(c, n, &good(to_low, 20))?;
+    cleanup::drain();
     check(
         thread::in_use() == threads
             && process::translate(low, BUFFER as usize).is_none()

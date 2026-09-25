@@ -5,13 +5,16 @@
 //! there, its handle table, its priority ceiling, its threads and how it
 //! lives, in objects from a kernel pool. A process lives while references
 //! to it are left: handles to it, its threads, and the one `create` hands
-//! out; the last `release` destroys it. A process ends earlier (`end`):
+//! out; the last `release` queues it for cleanup, and its portion takes it
+//! apart (`clean`). A process ends earlier (`end`):
 //! process_exit, process_kill, a fault at EL0 or the exit of its last
 //! started thread stop its threads and give back what it holds, and a
 //! shell with the reason stays for object_info until the last reference
-//! (spec 4, 7.9).
+//! (spec 4, 7.9). Every release names the level of its cause, which the
+//! cleanup it may start takes (spec 7.7).
 //! Quotas come with the calls that need them.
 
+use crate::cleanup::{self, Item};
 use crate::mm::aspace::AddressSpace;
 use crate::mm::pages::KernelPages;
 use crate::mm::phys::FRAMES;
@@ -53,6 +56,8 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Init's end ends the run (spec 7.9).
     init: bool,
+    /// Its place in the cleanup queue once its last reference goes.
+    cleanup: Item,
 }
 
 /// Blocks of frames, as (physical address, order), that `release` gives
@@ -198,6 +203,7 @@ pub fn create(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error>
         life: Life::new(),
         threads: None,
         init: false,
+        cleanup: Item::new(),
     };
     let allocated = PROCESSES.lock().alloc(&mut KernelPages, process);
     allocated.map_err(|mut process| {
@@ -207,45 +213,69 @@ pub fn create(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error>
     })
 }
 
-/// Adds a reference to a live process. Only the count is borrowed,
+/// The count of references to `process`. Only the count is borrowed,
 /// through the raw pointer: the process's own table may be in the middle
-/// of `release_with` meanwhile (`release_contents`).
-pub fn retain(process: NonNull<Process>) {
-    // SAFETY: the caller holds a reference, so the process is alive; only
-    // the field is borrowed.
+/// of `release_with` meanwhile (`release_contents`). Test builds stop a
+/// process that went: the poison of its slot reaches the count.
+///
+/// # Safety
+/// `process` is alive, and nothing else borrows the count.
+unsafe fn refs<'a>(process: NonNull<Process>) -> &'a mut u32 {
+    // SAFETY: the caller's promise; only the field is borrowed.
     let refs = unsafe { &mut (*process.as_ptr()).refs };
+    #[cfg(feature = "ktest")]
+    assert!(
+        *refs != u32::from_ne_bytes([POISON; 4]),
+        "a process is used after it went"
+    );
+    refs
+}
+
+/// Adds a reference to a live process. A process nobody refers to waits
+/// for its portion, and taking it back from the queue would free it twice.
+pub fn retain(process: NonNull<Process>) {
+    // SAFETY: the caller holds a reference, so the process is alive.
+    let refs = unsafe { refs(process) };
+    assert!(*refs > 0, "a process nobody refers to is retained");
     *refs = refs.checked_add(1).expect("process references overflow");
 }
 
-/// Drops a reference; the last one destroys the process.
+/// Drops a reference; the last one queues the process for cleanup at
+/// `cause`, the level of the cleanup this release starts (spec 7.7).
 ///
 /// # Safety
 /// The reference is the caller's, and the caller does not use it afterwards.
-pub unsafe fn release(process: NonNull<Process>) {
-    // SAFETY: the caller's reference keeps the process alive until here;
-    // only the field is borrowed, as in `retain`.
+pub unsafe fn release(process: NonNull<Process>, cause: u8) {
+    // SAFETY: the caller's reference keeps the process alive until here.
     let last = unsafe {
-        let refs = &mut (*process.as_ptr()).refs;
-        *refs -= 1;
+        let refs = refs(process);
+        *refs = refs
+            .checked_sub(1)
+            .expect("a process is released once too often");
         *refs == 0
     };
     if last {
-        // SAFETY: that was the last reference.
-        unsafe { destroy(process) };
+        // SAFETY: that was the last reference: nothing reaches the process
+        // until its portion, and the pool keeps it in place.
+        unsafe {
+            let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
+            cleanup::enqueue(item, Object::Process(process), cause);
+        }
     }
 }
 
-/// Destroys a process nobody refers to: what it holds goes, unless it went
-/// when the process ended (`release_contents`), and then the shell. The
-/// pool's lock comes last, when nothing in the object owns memory any more.
+/// The portion of a process nobody refers to (cleanup): what it holds
+/// goes, unless it went when the process ended (`release_contents`), and
+/// then the shell. What it releases is queued at `level`. The pool's lock
+/// comes last, when nothing in the object owns memory any more.
 ///
 /// # Safety
-/// No reference to `process` is left.
-unsafe fn destroy(process: NonNull<Process>) {
+/// No reference to `process` is left, and it is in no queue.
+pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     // SAFETY: no reference is left, so no handle in the table names this
     // process or one of its threads, each of which would hold one: the
     // objects released there are other processes' and threads'.
-    unsafe { release_contents(process) };
+    unsafe { release_contents(process, level) };
     // SAFETY: nothing refers to the process any more.
     unsafe { PROCESSES.lock().free(process) };
     // Test builds poison the slot past the pool's link: a use after free
@@ -265,21 +295,21 @@ unsafe fn destroy(process: NonNull<Process>) {
 #[cfg(feature = "ktest")]
 const POISON: u8 = 0xA5;
 
-// The poison reaches `refs`, which `life` checks.
+// The poison reaches `refs`, which `refs` checks.
 #[cfg(feature = "ktest")]
 const _: () = assert!(core::mem::offset_of!(Process, refs) >= 8);
 
 /// Gives back what the process holds, in this order: its handles, each
-/// releasing its object, which may destroy that object in turn; its
-/// address space (TTBR0 leaves the tables, their TLB entries go, the
-/// tables return to the allocator); the message buffers of the threads
-/// that are left, and the frames the process owned, which the tables
-/// mapped. Each step takes its locks alone. A second call finds nothing
-/// left to do.
+/// releasing its object, which may queue that object for cleanup at
+/// `cause`; its address space (TTBR0 leaves the tables, their TLB entries
+/// go, the tables return to the allocator); the message buffers of the
+/// threads that are left, and the frames the process owned, which the
+/// tables mapped. Each step takes its locks alone. A second call finds
+/// nothing left to do.
 ///
 /// # Safety
 /// `process` is alive, and nothing borrows its table.
-unsafe fn release_contents(process: NonNull<Process>) {
+unsafe fn release_contents(process: NonNull<Process>, cause: u8) {
     let p = process.as_ptr();
     // SAFETY: only the table is borrowed: releasing its objects may reach
     // the process's other fields (`refs`, `space`, `threads`) through its
@@ -287,7 +317,7 @@ unsafe fn release_contents(process: NonNull<Process>) {
     let handles = unsafe { &mut (*p).handles };
     handles.release_with(&mut Chunks, |object| {
         // SAFETY: the table is gone, and with it the handle's reference.
-        unsafe { object::release(object) }
+        unsafe { object::release(object, cause) }
     });
     // SAFETY: the table is done; nothing else borrows the process now.
     unsafe {
@@ -307,32 +337,33 @@ unsafe fn release_contents(process: NonNull<Process>) {
 /// reason stays: process_exit, process_kill and a fault at EL0 come here. Every thread of the process leaves the scheduler for good;
 /// the handle table, the address space, the threads' message buffers and
 /// the frames go; a shell with the reason stays for `object_info` until
-/// the last reference. The running thread may be one of the process's: it
-/// never runs again and may be gone afterwards, so the caller leaves
-/// through sched::resume. When the process is init, the run ends
-/// (`init_ended`).
+/// the last reference. What that releases is queued for cleanup at
+/// `cause`: the effective priority of the thread that made the call or
+/// the fault. The running thread may be one of the process's: it never
+/// runs again and may be gone afterwards, so the caller leaves through
+/// sched::resume. When the process is init, the run ends (`init_ended`).
 ///
 /// # Safety
 /// The caller holds a reference to `process`.
-pub unsafe fn end(process: NonNull<Process>, reason: ProcessState) {
+pub unsafe fn end(process: NonNull<Process>, reason: ProcessState, cause: u8) {
     // SAFETY: the caller's reference keeps the process alive.
     if unsafe { (*life(process)).end(reason) } {
         // SAFETY: as above; the end was just recorded.
-        unsafe { teardown(process) };
+        unsafe { teardown(process, cause) };
     }
 }
 
 /// A started thread of `process` ended through thread_exit; the last one
-/// ends the process with code 0. Threads that never started do not
-/// count.
+/// ends the process with code 0, with the thread's priority as the
+/// `cause`. Threads that never started do not count.
 ///
 /// # Safety
 /// As for `end`.
-pub unsafe fn thread_exited(process: NonNull<Process>) {
+pub unsafe fn thread_exited(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's reference keeps the process alive.
     if unsafe { (*life(process)).exit() } {
         // SAFETY: as above; the end was just recorded.
-        unsafe { teardown(process) };
+        unsafe { teardown(process, cause) };
     }
 }
 
@@ -353,49 +384,44 @@ pub fn check_alive(process: NonNull<Process>) -> Result<(), Error> {
     }
 }
 
-/// The process's life, as a raw pointer to its field (see `retain`). Test
-/// builds stop a process that went: its poisoned `refs` gives it away.
+/// The process's life, as a raw pointer to its field (see `refs`). Test
+/// builds stop a process that went, as `refs` does.
 ///
 /// # Safety
 /// `process` is alive.
 unsafe fn life(process: NonNull<Process>) -> *mut Life {
-    #[cfg(feature = "ktest")]
-    assert!(
-        // SAFETY: the caller's promise; only the field is read.
-        unsafe { (*process.as_ptr()).refs } != u32::from_ne_bytes([POISON; 4]),
-        "a process is used after it went"
-    );
+    // SAFETY: the caller's promise; the count is only checked.
+    unsafe { refs(process) };
     // SAFETY: the caller's promise.
     unsafe { &raw mut (*process.as_ptr()).life }
 }
 
 /// The rest of an end whose reason was just recorded: the threads stop,
-/// then what the process holds goes (`release_contents`).
-/// A reference taken for the while keeps the process through its threads'
-/// and its table's releases, which may drop every other one. From
-/// milestone 1.3 the quota goes back to the parent and the exit channel
-/// hears of the end afterwards.
+/// then what the process holds goes (`release_contents`), releases queued
+/// at `cause`. A reference taken for the while keeps the process through
+/// its threads' and its table's releases, which may drop every other one.
+/// From milestone 1.3 the quota goes back to the parent and the exit
+/// channel hears of the end afterwards.
 ///
 /// # Safety
 /// As for `end`.
-unsafe fn teardown(process: NonNull<Process>) {
+unsafe fn teardown(process: NonNull<Process>, cause: u8) {
     retain(process);
     let p = process.as_ptr();
-    // SAFETY: the reference above keeps the process alive. A thread is
-    // read before it leaves the scheduler: the kernel's reference may be
-    // its last, and the thread goes there, out of the list.
+    // SAFETY: the reference above keeps the process alive. A thread whose
+    // last reference was the kernel's stays until its portion, in the list.
     unsafe {
         let mut next = (*p).threads;
         while let Some(t) = next {
             next = (*t.as_ptr()).siblings.next;
-            sched::exit(t);
+            sched::exit(t, cause);
         }
-        release_contents(process);
+        release_contents(process, cause);
     }
     // SAFETY: as above.
     let (init, state) = unsafe { ((*p).init, (*life(process)).state()) };
     // SAFETY: the reference taken above.
-    unsafe { release(process) };
+    unsafe { release(process, cause) };
     if init {
         init_ended(state);
     }
@@ -526,9 +552,10 @@ pub fn insert_handle(
     Ok(h)
 }
 
-/// Closes handle `h` of `process`: its reference goes, and the object goes
-/// with its last one. BAD_HANDLE for a handle that is not live.
-pub fn close_handle(mut process: NonNull<Process>, h: Handle) -> Result<(), Error> {
+/// Closes handle `h` of `process`: its reference goes, and the last one
+/// queues the object for cleanup at `cause`. BAD_HANDLE for a handle that
+/// is not live.
+pub fn close_handle(mut process: NonNull<Process>, h: Handle, cause: u8) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the process other than the
     // handle, so the process outlives the release below.
     let (object, _) = unsafe { process.as_mut() }
@@ -536,7 +563,7 @@ pub fn close_handle(mut process: NonNull<Process>, h: Handle) -> Result<(), Erro
         .remove(h)
         .map_err(Error::from)?;
     // SAFETY: the handle is gone, and its reference with it.
-    unsafe { object::release(object) };
+    unsafe { object::release(object, cause) };
     Ok(())
 }
 
@@ -553,7 +580,8 @@ pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> R
         insert_handle(init, Object::Thread(first), abi::OWNER_RIGHTS)?,
         insert_handle(init, Object::Resource, Rights::NONE)?,
     ];
-    close_handle(init, handles[3])?;
+    // The system resource is never queued: any level will do.
+    close_handle(init, handles[3], 1)?;
     assert_eq!(
         handles,
         [

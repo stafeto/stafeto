@@ -9,11 +9,14 @@
 //! nothing of it. A thread lives while references to it are left: handles,
 //! the one `create` hands out, and the kernel's while the scheduler holds
 //! the thread; it holds a reference to its process. A thread that ended
-//! stays as a shell without its buffer until its last reference goes.
+//! stays as a shell without its buffer until its last reference goes,
+//! which queues it for cleanup (spec 7.7).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
+use crate::cleanup::{self, Item};
 use crate::mm::pages::KernelPages;
 use crate::mm::phys::FRAMES;
+use crate::object::Object;
 use crate::process::{self, Process};
 use crate::sched;
 use abi::Error;
@@ -50,6 +53,8 @@ pub struct Thread {
     /// Handles to the thread, the reference `create` hands out and the
     /// kernel's from `start` to the end.
     refs: u32,
+    /// Its place in the cleanup queue once its last reference goes.
+    cleanup: Item,
 }
 
 /// Neighbours in the list of a process's threads.
@@ -88,6 +93,12 @@ impl Thread {
     pub fn process(&self) -> NonNull<Process> {
         self.process
     }
+
+    /// The effective priority: the level of the cleanup the thread's calls
+    /// and faults cause (spec 7.7).
+    pub fn priority(&self) -> u8 {
+        self.sched.priority()
+    }
 }
 
 /// A stopped thread of `process` that will start at `entry` with stack
@@ -124,6 +135,7 @@ pub fn create(
         buffer: None,
         process,
         refs: 1,
+        cleanup: Item::new(),
     };
     let thread = THREADS
         .lock()
@@ -203,71 +215,120 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 
 /// thread_exit: the running thread `t` ends. Its buffer goes, it leaves
 /// the scheduler, with the kernel's reference, and as the last started
-/// thread of its process it ends the process. The caller leaves through
-/// sched::resume: `t` may be gone.
+/// thread of its process it ends the process. What that releases is
+/// queued for cleanup at the thread's priority. The caller leaves through
+/// sched::resume: `t` may be queued for cleanup.
 ///
 /// # Safety
 /// `t` is the running thread, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>) {
     // SAFETY: the running thread is alive and holds its process; the
     // reference taken here keeps the process when the thread goes.
-    let p = unsafe { t.as_ref() }.process;
+    let (p, cause) = unsafe { (t.as_ref().process, t.as_ref().priority()) };
     process::retain(p);
     // SAFETY: the thread never runs at EL0 again, and the caller hands it
     // over; the process lives until the release below.
     unsafe {
         drop_buffer(t);
-        sched::exit(t);
-        process::thread_exited(p);
-        process::release(p);
+        sched::exit(t, cause);
+        process::thread_exited(p, cause);
+        process::release(p, cause);
     }
 }
 
-/// Adds a reference to a live thread.
-pub fn retain(mut thread: NonNull<Thread>) {
-    // SAFETY: the caller holds a reference, so the thread is alive.
-    let t = unsafe { thread.as_mut() };
-    t.refs = t.refs.checked_add(1).expect("thread references overflow");
+/// The count of references to `thread`, through the raw pointer. Test
+/// builds stop a thread that went: the poison of its slot reaches the
+/// count (`clean`).
+///
+/// # Safety
+/// `thread` is alive, and nothing else borrows the count.
+unsafe fn refs<'a>(thread: NonNull<Thread>) -> &'a mut u32 {
+    // SAFETY: the caller's promise; only the field is borrowed.
+    let refs = unsafe { &mut (*thread.as_ptr()).refs };
+    #[cfg(feature = "ktest")]
+    assert!(
+        *refs != u32::from_ne_bytes([POISON; 4]),
+        "a thread is used after it went"
+    );
+    refs
 }
 
-/// Drops a reference; the last one destroys the thread, which then drops
-/// its reference to its process. When the thread is the running one, no
-/// thread runs after it.
+/// Adds a reference to a live thread. A thread nobody refers to waits for
+/// its portion, and taking it back from the queue would free it twice.
+pub fn retain(thread: NonNull<Thread>) {
+    // SAFETY: the caller holds a reference, so the thread is alive.
+    let refs = unsafe { refs(thread) };
+    assert!(*refs > 0, "a thread nobody refers to is retained");
+    *refs = refs.checked_add(1).expect("thread references overflow");
+}
+
+/// Drops a reference; the last one queues the thread for cleanup at
+/// `cause`, the level of the cleanup this release starts (spec 7.7).
 ///
 /// # Safety
 /// The reference is the caller's, and the caller does not use it afterwards.
-pub unsafe fn release(mut thread: NonNull<Thread>) {
+pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     // SAFETY: the caller's reference keeps the thread alive until here.
-    let t = unsafe { thread.as_mut() };
-    t.refs -= 1;
-    if t.refs > 0 {
+    let refs = unsafe { refs(thread) };
+    *refs = refs
+        .checked_sub(1)
+        .expect("a thread is released once too often");
+    if *refs > 0 {
         return;
     }
+    // SAFETY: as above; only the scheduler's part is read.
+    let state = unsafe { thread.as_ref() }.sched.state();
     assert!(
-        !matches!(t.sched.state(), State::Ready | State::Running),
+        !matches!(state, State::Ready | State::Running),
         "a thread the scheduler holds lost its last reference"
     );
-    let process = t.process;
+    // SAFETY: that was the last reference: nothing reaches the thread
+    // until its portion, and the pool keeps it in place.
+    unsafe {
+        let item = NonNull::new_unchecked(&raw mut (*thread.as_ptr()).cleanup);
+        cleanup::enqueue(item, Object::Thread(thread), cause);
+    }
+}
+
+/// The portion of a thread nobody refers to (cleanup): its buffer goes,
+/// it leaves its process's list, its slot goes back to the pool, and then
+/// its reference to its process, queued at `level` if it was the last.
+/// When the thread ran last, no thread ran after it.
+///
+/// # Safety
+/// No reference to `thread` is left, and it is in no queue.
+pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
+    // SAFETY: the caller's promise.
+    let process = unsafe { thread.as_ref() }.process;
     if current() == Some(thread) {
         user::clear_current();
     }
-    // SAFETY: that was the last reference; nothing uses the thread
-    // afterwards, and it leaves its process's list before its slot goes.
+    // SAFETY: nothing uses the thread afterwards, and it leaves its
+    // process's list before its slot goes.
     unsafe {
         drop_buffer(thread);
         process::remove_thread(process, thread);
         THREADS.lock().free(thread);
-        // Test builds poison the slot past the pool's link, as for processes.
+        // Test builds poison the slot past the pool's link, as for
+        // processes: `refs` stops a use after free.
         #[cfg(feature = "ktest")]
         core::ptr::write_bytes(
             thread.cast::<u8>().as_ptr().add(8),
-            0xA5,
+            POISON,
             core::mem::size_of::<Thread>() - 8,
         );
     }
     // SAFETY: the thread's reference to its process goes with it.
-    unsafe { process::release(process) };
+    unsafe { process::release(process, level) };
 }
+
+/// What test builds fill a gone thread with, past the pool's link.
+#[cfg(feature = "ktest")]
+const POISON: u8 = 0xA5;
+
+// The poison reaches `refs`, which `refs` checks.
+#[cfg(feature = "ktest")]
+const _: () = assert!(core::mem::offset_of!(Thread, refs) >= 8);
 
 /// The thread whose registers, FP registers and address space are live:
 /// the running one, or while the kernel idles the one that ran last.

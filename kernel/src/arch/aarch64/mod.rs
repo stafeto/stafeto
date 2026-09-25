@@ -21,15 +21,8 @@ core::arch::global_asm!(include_str!("mmu.S"), options(raw));
 core::arch::global_asm!(include_str!("fpsimd.S"), options(raw));
 
 /// True while an IRQ is pending at this CPU (ISR_EL1.I, bit 7), which it is
-/// also while PSTATE masks it: long kernel operations poll this between
-/// their portions (spec 7.7).
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "long operations (milestone 1.3) poll it; so far only the kernel tests do"
-    )
-)]
+/// also while PSTATE masks it: the way out of the kernel polls this before
+/// every decision, so between two portions of cleanup too (spec 7.7).
 pub fn irq_pending() -> bool {
     let isr: u64;
     // SAFETY: reading ISR_EL1 has no side effects.
