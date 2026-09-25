@@ -33,7 +33,7 @@
 //! took lives on without the channel.
 
 use crate::cleanup::{self, Item};
-use crate::object::{self, Moving, Object};
+use crate::object::{self, Object};
 use crate::process::{self, Process};
 use crate::sched::{self, Locked};
 use crate::session::{self, Session};
@@ -41,7 +41,7 @@ use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
 use crate::{arch, testpoint};
-use abi::{Error, INLINE_MAX, MAX_SLOTS, MESSAGE_HANDLES, Notification, Rights, Source};
+use abi::{Error, INLINE_MAX, MAX_SLOTS, Notification, Rights, Source};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
 use kcore::notify::{Post, Queue, Slot};
@@ -514,9 +514,6 @@ enum Taken {
     Request(Via, Option<NonNull<Thread>>),
 }
 
-/// No handles.
-const NO_HANDLES: Moving = [None; MESSAGE_HANDLES];
-
 /// What the first look of receive at a channel's queue came to.
 enum Looked {
     /// What it took under the scheduler's lock, if anything.
@@ -738,7 +735,7 @@ pub fn send(
     if !values.is_empty() {
         // SAFETY: the running thread holds its process, and its handles on
         // their way are its own.
-        unsafe { (*t.as_ptr()).transit = process::take_handles(t.as_ref().process(), values) };
+        unsafe { thread::set_transit(t, process::take_handles(t.as_ref().process(), values)) };
     }
     let took = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
@@ -851,8 +848,7 @@ unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
             thread::copy_message(to, from, INLINE_MAX..desc.len);
         }
         if desc.handles > 0 {
-            let moving = core::mem::replace(&mut (*from.as_ptr()).transit, NO_HANDLES);
-            let put = process::put_handles(to.as_ref().process(), moving);
+            let put = process::put_handles(to.as_ref().process(), thread::take_transit(from));
             thread::write_handles(to, &put[..desc.handles]);
         }
     }
@@ -945,7 +941,7 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
             Ok(())
         } else {
             let fit = process::reserve_handles(client.as_ref().process(), values.len());
-            (*t.as_ptr()).transit = process::take_handles(t.as_ref().process(), values);
+            thread::set_transit(t, process::take_handles(t.as_ref().process(), values));
             fit
         }
     };

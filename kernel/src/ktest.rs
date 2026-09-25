@@ -1937,7 +1937,7 @@ fn give_carriers(
         }
         // SAFETY: the thread never runs, and its handles on their way are
         // the test's to set.
-        unsafe { (*t.as_ptr()).transit = process::take_handles(p, &values) };
+        unsafe { thread::set_transit(t, process::take_handles(p, &values)) };
     }
     Ok(())
 }

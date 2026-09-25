@@ -61,8 +61,9 @@ pub struct Thread {
     /// waits. A request that waits in the queue of a channel keeps them;
     /// they go with PEER_CLOSED at the stage Close, with the buffer when the
     /// thread ends, and when the meeting finds no room for them
-    /// (`drop_transit`). Only the channel changes it.
-    pub transit: Moving,
+    /// (`drop_transit`). Only `set_transit`, `take_transit` and
+    /// `drop_transit` change it.
+    transit: Moving,
     /// Its number in the system table (spec 6.1, 7.8), from `create` until
     /// it ends (sched::exit) or, when it never started, until its portion
     /// of cleanup: the tokens of its requests carry it. None once it went
@@ -303,6 +304,36 @@ pub unsafe fn copy_message(to: NonNull<Thread>, from: NonNull<Thread>, range: Ra
         unreachable!("a thread that takes part in a message has its buffer");
     };
     to.frame.copy_from(&from.frame, range);
+}
+
+/// Puts `moving`, the handles of a message of `t` that just left its
+/// process's table (process::take_handles), on their way in `t`
+/// (Thread::transit, spec 6.1). The field is empty: the handles of the
+/// thread's last message went into a table (`take_transit`) or were
+/// released (`drop_transit`). A field that is not empty stops the kernel,
+/// since handles written over would keep their references for ever.
+///
+/// # Safety
+/// `t` is alive, and nothing else borrows the field.
+pub unsafe fn set_transit(t: NonNull<Thread>, moving: Moving) {
+    // SAFETY: the caller's promise; only the field is touched.
+    let transit = unsafe { &mut (*t.as_ptr()).transit };
+    assert!(
+        transit.iter().all(Option::is_none),
+        "handles on their way are written over"
+    );
+    *transit = moving;
+}
+
+/// The handles on their way in `t` (Thread::transit), which leave it empty
+/// for the table of the thread their message comes to (channel::deliver).
+///
+/// # Safety
+/// `t` is alive, and nothing else borrows the field.
+pub unsafe fn take_transit(t: NonNull<Thread>) -> Moving {
+    // SAFETY: the caller's promise; only the field is touched.
+    let transit = unsafe { &mut (*t.as_ptr()).transit };
+    core::mem::replace(transit, [None; MESSAGE_HANDLES])
 }
 
 /// The handles on their way in `t` (Thread::transit), which no table took,

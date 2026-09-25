@@ -4464,18 +4464,24 @@ fn fill_to_a_page() -> Result<usize, &'static str> {
 }
 
 /// A request whose handles do not fit fails its sender, and receive takes
-/// the next head (spec 6.1): a client below init sends four handles and
-/// another one no handles, and both wait; init fills its table and
-/// receives without waiting: the first client gets LIMIT_REACHED and its
-/// handles are gone, and init gets the second request.
+/// the next head (spec 6.1): a client below init sends four handles
+/// through a copy with a label, and another one no handles through the
+/// channel, and both wait; init closes the copy, so the first request
+/// holds the session's last copy (spec 5.3), fills its table and receives
+/// without waiting: the first client gets LIMIT_REACHED, and init gets the
+/// second request. Before the first client runs again, its handles are
+/// gone, the only copy of a session of another channel among them, whose
+/// CLIENT_GONE comes there; and so is the copy its request held, whose
+/// CLIENT_GONE comes after the second request.
 fn queued_request_that_does_not_fit_fails_its_sender() -> Outcome {
     reset_results();
     let c = channel(QUIET)?;
-    for h in &HANDLES[..2] {
-        h.store(c.raw().0, Relaxed);
-    }
+    let e = channel(QUIET)?;
+    let named = session(&c, Rights::SEND, CLIENT_LABEL, QUIET)?;
+    HANDLES[0].store(named.raw().0, Relaxed);
+    HANDLES[1].store(c.raw().0, Relaxed);
     let sent: [abi::Handle; 4] = [
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.raw(),
         copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
         copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
         copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
@@ -4483,26 +4489,39 @@ fn queued_request_that_does_not_fit_fails_its_sender() -> Outcome {
     give(&sent);
     let first = spawn(0, handle_client, 0, LOW, Policy::Fifo)?;
     let_run()?;
+    close(named)?;
     let second = spawn(1, client, 1, LOW, Policy::Fifo)?;
     let_run()?;
     let n = fill_table(0)?;
     let got = sys::try_receive(&c);
     empty_table(n)?;
+    let gone = all_gone(&sent);
+    let dropped = take_one(&e);
+    let released = take_one(&c);
+    let waited = !ended(0);
     let words_of = match &got {
         Ok(Received::Message { words, .. }) => Some(*words),
         _ => None,
     };
     let replied = answer_all([got]);
     let_run()?;
-    let gone = all_gone(&sent);
     close(first)?;
     close(second)?;
     close(c)?;
+    close(e)?;
     check(
         ended(0) && result(0)[0] == Error::LimitReached.code(),
         "the sender whose handles did not fit did not get LIMIT_REACHED",
     )?;
-    check(gone, "the handles of the request that failed stayed")?;
+    check(waited, "the sender that failed ran before init looked")?;
+    check(
+        gone && dropped == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the handles of the request that failed stayed with its sender",
+    )?;
+    check(
+        released == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the request that failed kept its copy of the session",
+    )?;
     check(
         words_of == Some(words(&request(1))) && replied && ended(1) && result(1)[0] == 0,
         "receive did not take the next request",
@@ -4511,15 +4530,21 @@ fn queued_request_that_does_not_fit_fails_its_sender() -> Outcome {
 
 /// A reply whose handles do not fit fails both sides and uses the token up
 /// (spec 6.1): a client above init sends; init fills its table and answers
-/// with four handles: LIMIT_REACHED for the reply, in x0 alone, and for the
-/// client's send; the handles are gone, and a second reply with the token
-/// is BAD_STATE.
+/// with four handles, the only copy of a session of another channel among
+/// them: LIMIT_REACHED for the reply, in x0 alone, and for the client's
+/// send; the handles are gone, and CLIENT_GONE comes on the other channel;
+/// a second reply with the token is BAD_STATE. Init's next reply, with a
+/// handle, brings it to a second client: the reply that failed left
+/// nothing on its way.
 fn reply_that_does_not_fit_fails_both() -> Outcome {
     reset_results();
     let c = channel(QUIET)?;
-    HANDLES[0].store(c.raw().0, Relaxed);
+    let e = channel(QUIET)?;
+    for h in &HANDLES[..2] {
+        h.store(c.raw().0, Relaxed);
+    }
     let sent: [abi::Handle; 4] = [
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.raw(),
         copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
         copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
         copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
@@ -4531,11 +4556,20 @@ fn reply_that_does_not_fit_fails_both() -> Outcome {
     let after = raw_reply(x);
     empty_table(n)?;
     let gone = all_gone(&sent);
+    let dropped = take_one(&e);
     let mut again = marked();
     again[..2].copy_from_slice(&[token, 0]);
     let second = raw_reply(again);
+    give(&[]);
+    let next = spawn(1, handle_client, 1, HIGH, Policy::Fifo)?;
+    let moved = copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?;
+    let replied = take_token(&c)?.reply_handles(&[], &[moved]);
+    let came = result(1);
+    let live = close_raw(abi::Handle(came[3])).is_ok();
     close(t)?;
+    close(next)?;
     close(c)?;
+    close(e)?;
     check(
         failed(after, x, Error::LimitReached),
         "a reply with no room at the client did not fail with LIMIT_REACHED alone",
@@ -4544,10 +4578,17 @@ fn reply_that_does_not_fit_fails_both() -> Outcome {
         ended(0) && result(0)[0] == Error::LimitReached.code(),
         "the client's send did not fail with the reply",
     )?;
-    check(gone, "the handles of the reply that failed stayed")?;
+    check(
+        gone && dropped == Ok(labelled(CLIENT_LABEL, CLIENT_GONE, 1)),
+        "the handles of the reply that failed stayed",
+    )?;
     check(
         failed(second, again, Error::BadState),
         "the reply that failed left its token",
+    )?;
+    check(
+        replied.is_ok() && ended(1) && came[..3] == [0, 0, 1] && live,
+        "the next reply did not bring its handle",
     )
 }
 
