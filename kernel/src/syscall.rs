@@ -10,19 +10,24 @@
 //! WRONG_TYPE, then ACCESS_DENIED for missing rights); priority ceilings
 //! (ACCESS_DENIED); the state of objects (BAD_STATE); values checked
 //! against an object, such as a page that is mapped already
-//! (INVALID_ARGS); resources (NO_MEMORY, LIMIT_REACHED). The kernel never
-//! reads or writes memory of a program through an address it is given:
-//! addresses are only numbers to check. A call that ends its caller
-//! (thread_exit, process_exit, process_kill of its own process) never
-//! returns: it leaves through sched::resume, and the caller's registers
-//! keep the arguments. Test builds also know numbers of their own, in
-//! abi::TEST_CALLS.
+//! (INVALID_ARGS); resources (NO_MEMORY, LIMIT_REACHED), in the order the
+//! call occupies them and a limit that needs no allocation first. The
+//! kernel never reads or writes memory of a program through an address it
+//! is given: addresses are only numbers to check. A call that ends its
+//! caller (thread_exit, process_exit, process_kill of its own process)
+//! never returns: it leaves through sched::resume, and the caller's
+//! registers keep the arguments. Test builds also know numbers of their
+//! own, in abi::TEST_CALLS.
 
+use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::sched;
 use crate::thread::{self, Thread};
-use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
+use crate::{cleanup, sched};
+use abi::{
+    Call, Error, Handle, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState,
+    Rights,
+};
 use core::ptr::NonNull;
 use kcore::process::{handle_limit_arg, quota_arg};
 use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
@@ -104,6 +109,13 @@ fn caller(thread: NonNull<Thread>) -> NonNull<Process> {
     unsafe { thread.as_ref() }.process()
 }
 
+/// The level of the cleanup the caller's call causes: its effective
+/// priority (spec 7.7).
+fn cause(thread: NonNull<Thread>) -> u8 {
+    // SAFETY: the thread that made the call is alive.
+    unsafe { thread.as_ref() }.priority()
+}
+
 /// Looks `h` up in the caller's table (Process::lookup).
 fn lookup<U>(
     thread: NonNull<Thread>,
@@ -116,10 +128,10 @@ fn lookup<U>(
 }
 
 /// handle_close(x0 handle), no right needed: the handle's reference goes,
-/// and the object goes with its last reference. Closing a handle to a
-/// thread or a process does not end it.
+/// and the last reference queues the object for cleanup at the caller's
+/// priority. Closing a handle to a thread or a process does not end it.
 fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    process::close_handle(caller(thread), Handle(a[0]))?;
+    process::close_handle(caller(thread), Handle(a[0]), cause(thread))?;
     Ok(Values::NONE)
 }
 
@@ -130,45 +142,68 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 }
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
-/// x3 exit channel, x4 notification priority): a new process with an empty
-/// address space and handle table; x1 returns a handle to it with
-/// DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS), the first two for
-/// milestone 1.3, so that the set never changes. The quota is whole pages,
-/// at least one, and counts from milestone 1.3; the limit 1-16384; the
-/// ceiling 1-63 and no higher than the caller's (ACCESS_DENIED). Exit
-/// channels come in milestone 1.3: x3 is 0, and x4 with it; any other x3
-/// is looked up as a channel and fails (BAD_HANDLE, WRONG_TYPE).
+/// x3 exit channel, x4 notification priority, x5 start channel): a new
+/// process with an empty address space and handle table; x1 returns a
+/// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
+/// the first two for milestone 1.3, so that the set never changes. The
+/// quota is whole pages, at least one; the limit 1-16384; the ceiling 1-63
+/// and no higher than the caller's (ACCESS_DENIED). Exit channels come in
+/// milestone 1.3b: x3 is 0, and x4 with it; any other x3 is looked up as a
+/// channel and fails (BAD_HANDLE, WRONG_TYPE). The start channel, a
+/// channel with TRANSFER, moves into entry 0 of the child's table from
+/// milestone 1.3c (spec 13.3): x5 is 0, and any other value is looked up
+/// after x3 and fails the same way. Entry 0 then holds a stub that goes at
+/// once (process::reserve_start). The child is the caller's process's
+/// (spec 4): it ends when its parent does. Resources come last and in the
+/// order the call occupies them, a limit that needs no allocation first
+/// (spec 11): the caller's own table has room for the new handle
+/// (LIMIT_REACHED), then the quota comes off the caller's (spec 7.5), and
+/// the child pays from it for its shell, its root table and the chunk with
+/// entry 0 (NO_MEMORY when either quota falls short). A full caller table
+/// fails before the child is built, so nothing is made and torn down for
+/// it. The quota comes back to the caller in full once the child and
+/// whatever holds its shell went.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    quota_arg(a[0])?;
+    let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
     let channel = a[3] != 0;
     let notify = notify_priority_arg(a[4], channel)?;
+    // No object is a channel before milestone 1.3b.
     if channel {
-        // No object is a channel before milestone 1.3.
         lookup(thread, a[3], Rights::NOTIFY, |_| None::<()>)?;
+    }
+    if a[5] != 0 {
+        lookup(thread, a[5], Rights::TRANSFER, |_| None::<()>)?;
     }
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
-    let child = process::create(limit, ceiling)?;
-    let h = process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS);
+    // The caller's table first: it needs no allocation, and the call would
+    // insert the child's handle there last (spec 11).
+    process::handle_room(caller(thread))?;
+    let child = process::create_child(caller(thread), quota, limit, ceiling)?;
+    let h = process::reserve_start(child).and_then(|()| {
+        process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
+    });
     // SAFETY: the reference `create` handed out goes; the handle, if it
     // went in, holds the child.
-    unsafe { process::release(child) };
+    unsafe { process::release(child, cause(thread)) };
     Ok(Values::new(&[h?.0]))
 }
 
 /// process_kill(x0 process with MANAGE): the process ends, reason
-/// «killed» (spec 11): its threads stop in whatever state they
-/// are, and what it holds goes. A process that ended already: 0. Killing
-/// the caller's own process never returns.
+/// «killed» (spec 11): its threads stop in whatever state they are, and
+/// the cleanup queue takes what it holds apart at the caller's priority,
+/// before the caller runs again. A process that ended already: 0, and its
+/// teardown keeps the level of the end that began it. Killing the caller's
+/// own process never returns.
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
     let own = target == caller(thread);
     // SAFETY: the handle holds the process; the end takes its own
     // reference before the table that holds the handle may go.
-    unsafe { process::end(target, ProcessState::Killed) };
+    unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
     if own {
         // The caller ended with its process and may be gone.
         sched::resume()
@@ -179,9 +214,10 @@ fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// process_exit(x0 code): the caller's process ends with `code`. Never
 /// returns.
 fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
+    let exited = ProcessState::Exited { code: a[0] };
     // SAFETY: the calling thread holds its process until the end takes
     // its own reference.
-    unsafe { process::end(caller(thread), ProcessState::Exited { code: a[0] }) };
+    unsafe { process::end(caller(thread), exited, cause(thread)) };
     sched::resume()
 }
 
@@ -193,7 +229,12 @@ fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
 /// aligned, the buffer a whole page there (INVALID_ARGS); the priority no
 /// higher than the ceiling of the process nor than the caller's
 /// (ACCESS_DENIED); the process has not ended (BAD_STATE); the buffer's
-/// page is free there (INVALID_ARGS).
+/// page is free there (INVALID_ARGS). Resources come last and in the order
+/// the call occupies them, a limit that needs no allocation first (spec 11):
+/// the caller's own table has room for the new handle (LIMIT_REACHED),
+/// then the target has fewer than abi::MAX_THREADS threads that have not
+/// ended (LIMIT_REACHED, checked inside thread::create before it charges
+/// anything), then the target's quota (NO_MEMORY).
 fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
     let policy = policy_arg(a[5])?;
@@ -208,13 +249,16 @@ fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if process::translate(target, buffer).is_some() {
         return Err(Error::InvalidArgs);
     }
+    // The caller's table first: it needs no allocation, and the call would
+    // insert the new thread's handle there last (spec 11).
+    process::handle_room(caller(thread))?;
     let t = thread::create(target, a[1] as usize, a[2] as usize, a[3], priority, policy)?;
     let h = thread::give_buffer(t, buffer)
         .and_then(|()| process::insert_handle(caller(thread), Object::Thread(t), OWNER_RIGHTS));
     // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the thread, and without it the thread goes with its
-    // buffer.
-    unsafe { thread::release(t) };
+    // went in, holds the thread, and without it the thread is queued for
+    // cleanup and goes with its buffer.
+    unsafe { thread::release(t, cause(thread)) };
     Ok(Values::new(&[h?.0]))
 }
 
@@ -263,17 +307,64 @@ fn yield_now() -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
-/// object_info(x0 handle, x1 kind, x2 reserved and 0). One kind so far:
-/// PROCESS_STATE, for a process handle with any rights, returns
-/// abi::ProcessState::to_words in x1-x4.
+/// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
+/// first (INVALID_ARGS), then the handle. For a process handle with any
+/// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
+/// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
+/// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
+/// resource with KSTATS and returns abi::KernelStats in x1-x7 (spec 16).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    if a[1] != abi::INFO_PROCESS_STATE || a[2] != 0 {
+    if a[2] != 0 {
         return Err(Error::InvalidArgs);
     }
-    let p = lookup(thread, a[0], Rights::NONE, Object::process)?;
-    // SAFETY: the handle holds the process.
-    let state = unsafe { p.as_ref() }.state();
-    Ok(Values::new(&state.to_words()))
+    let target = || lookup(thread, a[0], Rights::NONE, Object::process);
+    match a[1] {
+        abi::INFO_PROCESS_STATE => {
+            let p = target()?;
+            // SAFETY: the handle holds the process.
+            let state = unsafe { p.as_ref() }.state();
+            Ok(Values::new(&state.to_words()))
+        }
+        abi::INFO_PROCESS_MEMORY => {
+            let q = process::quota(target()?);
+            let memory = ProcessMemory {
+                quota: q.limit(),
+                used: q.used(),
+                returned: q.returned(),
+            };
+            Ok(Values::new(&memory.to_words()))
+        }
+        abi::INFO_PROCESS_HANDLES => {
+            let (live, retired, limit) = process::handle_counts(target()?);
+            let handles = ProcessHandles {
+                live: live.into(),
+                retired: retired.into(),
+                limit: limit.into(),
+            };
+            Ok(Values::new(&handles.to_words()))
+        }
+        abi::INFO_KERNEL_STATS => {
+            lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+            Ok(Values::new(&kernel_stats().to_words()))
+        }
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
+/// idle time and latencies, the cleanup queue, the frames and the pages of
+/// the pools.
+fn kernel_stats() -> KernelStats {
+    let s = sched::stats();
+    KernelStats {
+        idle: s.idle,
+        idle_latency: s.idle_latency,
+        irq_latency: s.irq_latency,
+        cleanup_queue: cleanup::len(),
+        longest_portion: cleanup::longest(),
+        free_frames: phys::free_frames(),
+        pool_pages: pages::taken() as u64,
+    }
 }
 
 /// debug_write(x0 system resource with DEBUG, x1 length up to 64, x2-x9

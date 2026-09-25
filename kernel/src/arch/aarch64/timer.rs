@@ -100,7 +100,6 @@ pub fn enabled() -> bool {
 }
 
 /// The compare value the timer was last armed with; `disarm` leaves it.
-#[cfg(feature = "ktest")]
 pub fn cval() -> u64 {
     let cval: u64;
     // SAFETY: reading CNTV_CVAL_EL0 has no side effects.

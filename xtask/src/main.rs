@@ -33,12 +33,16 @@ const DEBUG_WRITE_LINES: [&str; 3] = [
     "debug_write from EL0 reaches the console",
 ];
 /// Tests only the `icount` build has: the first checks that the run is
-/// under -icount; the others depend on how much of a quantum is left,
-/// which only -icount makes repeatable.
-const ICOUNT_TESTS: [&str; 3] = [
+/// under -icount; the next two depend on how much of a quantum is left,
+/// which only -icount makes repeatable; the last takes a big process
+/// apart in hundreds of portions with interrupts between them, where
+/// virtual time counts instructions and a stall of the host changes
+/// nothing.
+const ICOUNT_TESTS: [&str; 4] = [
     "virtual_time_counts_instructions",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
+    "teardown_yields_to_a_pending_interrupt",
 ];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
@@ -91,7 +95,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 16;
+const INIT_TESTS: u32 = 23;
 /// A data segment bigger than the 4 MiB one block of frames holds.
 const BIG_DATA: u64 = 8 << 20;
 

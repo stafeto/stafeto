@@ -7,19 +7,23 @@
 //! on success x0 is 0 and the values follow in x1 and up. The same calls
 //! from EL0 are in `el0`.
 
-use super::check;
+use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::boot::Boot;
-use crate::mm::phys;
-use crate::object::Object;
+use crate::cleanup;
+use crate::mm::{pages, phys};
+use crate::object::{self, Object};
 use crate::process::{self, Process};
 use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
 use abi::{
-    Call, Error, Handle, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
-    INIT_RESOURCE_RIGHTS, INIT_THREAD, OWNER_RIGHTS, ProcessState, Rights,
+    Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY,
+    INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE, INIT_RESOURCE_RIGHTS,
+    INIT_THREAD, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState, Rights,
+    START_CHANNEL,
 };
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
+use kcore::handles::CHUNK;
 use kcore::layout::{LINEAR_BASE, USER_END};
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
@@ -52,25 +56,27 @@ impl Caller {
     /// A caller whose process has priority ceiling `ceiling`; its thread
     /// is FIFO at 10.
     fn with_ceiling(ceiling: u8) -> Result<Caller, &'static str> {
-        let process = process::create(LIMIT, ceiling).map_err(|_| "no process")?;
+        let process = process::create_root(QUOTA, LIMIT, ceiling).map_err(|_| "no process")?;
         match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(thread) => Ok(Caller { process, thread }),
             Err(_) => {
                 // SAFETY: the process is the test's, and nothing uses it afterwards.
-                unsafe { process::release(process) };
+                unsafe { process::release(process, CAUSE) };
+                cleanup::drain();
                 Err("no thread")
             }
         }
     }
 
     /// Drops the test's references; the thread and the process go unless
-    /// a handle still holds them.
+    /// a handle still holds them, and the cleanup queue runs dry.
     fn release(self) {
         // SAFETY: the references are the test's, and nothing uses them afterwards.
         unsafe {
-            thread::release(self.thread);
-            process::release(self.process);
+            thread::release(self.thread, CAUSE);
+            process::release(self.process, CAUSE);
         }
+        cleanup::drain();
     }
 
     fn insert(&self, object: Object, rights: Rights) -> Result<Handle, &'static str> {
@@ -78,7 +84,7 @@ impl Caller {
     }
 
     fn close(&self, h: Handle) -> Result<(), &'static str> {
-        process::close_handle(self.process, h).map_err(|_| "a handle did not close")
+        process::close_handle(self.process, h, CAUSE).map_err(|_| "a handle did not close")
     }
 
     /// Makes call `number` with `args` in x0 and up, the rest of x0-x9
@@ -207,7 +213,7 @@ fn debug_write_cases(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static st
 }
 
 /// PROCESS_STATE of a live process: four zeros in x1-x4, whatever rights
-/// the handle carries. Other kinds, a nonzero x2 and handles to other
+/// the handle carries. Unknown kinds, a nonzero x2 and handles to other
 /// objects fail.
 pub fn object_info_reports_a_live_process(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
@@ -226,7 +232,7 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
     let n = Call::ObjectInfo.number();
     let state = INFO_PROCESS_STATE;
     c.fails(n, &[own, 0, 0], Error::InvalidArgs)?;
-    c.fails(n, &[own, 2, 0], Error::InvalidArgs)?;
+    c.fails(n, &[own, INFO_KERNEL_STATS + 1, 0], Error::InvalidArgs)?;
     c.fails(n, &[own, state | 1 << 32, 0], Error::InvalidArgs)?;
     c.fails(n, &[own, state, 8], Error::InvalidArgs)?;
     c.fails(n, &[0, 0, 0], Error::InvalidArgs)?;
@@ -236,17 +242,82 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
     c.succeeds(n, &[own, state, 0], &ProcessState::Alive.to_words())
 }
 
-/// A handle holds its object: the last close lets a thread and a process
-/// go back to their pools, and a closed handle is bad from then on.
+/// PROCESS_MEMORY and PROCESS_HANDLES take a process handle with any
+/// rights and return its quota and its table in x1-x3; KERNEL_STATS takes
+/// the system resource with KSTATS and returns what the kernel counts in
+/// x1-x7 (spec 11, 16). The kind and x2 come before the handle, a wrong
+/// type before a missing right, and x8 and x9 keep their marks.
+pub fn object_info_reports_memory_handles_and_statistics(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), Rights::NONE)?;
+        let stats = c.insert(Object::Resource, Rights::KSTATS)?;
+        let debug = c.insert(Object::Resource, Rights::DEBUG)?;
+        let result = info_kinds_cases(c, [own, stats, debug]);
+        c.close(own)?;
+        result
+    })
+}
+
+fn info_kinds_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str> {
+    let [own, stats, debug] = handles.map(|h| h.0);
+    let n = Call::ObjectInfo.number();
+    let (memory, table, kernel) = (INFO_PROCESS_MEMORY, INFO_PROCESS_HANDLES, INFO_KERNEL_STATS);
+    for kind in [memory, table, kernel] {
+        c.fails(n, &[own, kind, 1], Error::InvalidArgs)?;
+        c.fails(n, &[0, kind, 1], Error::InvalidArgs)?;
+        c.fails(n, &[0, kind, 0], Error::BadHandle)?;
+    }
+    c.fails(n, &[stats, memory, 0], Error::WrongType)?;
+    c.fails(n, &[stats, table, 0], Error::WrongType)?;
+    c.fails(n, &[own, kernel, 0], Error::WrongType)?;
+    c.fails(n, &[debug, kernel, 0], Error::AccessDenied)?;
+    let q = process::quota(c.process);
+    let quota = ProcessMemory {
+        quota: q.limit(),
+        used: q.used(),
+        returned: q.returned(),
+    };
+    check(
+        quota.quota == QUOTA && quota.used > 0 && quota.returned == 0,
+        "the caller's quota is not what it was given, or nothing is charged to it",
+    )?;
+    c.succeeds(n, &[own, memory, 0], &quota.to_words())?;
+    let table_now = ProcessHandles {
+        live: 3,
+        retired: 0,
+        limit: LIMIT.into(),
+    };
+    c.succeeds(n, &[own, table, 0], &table_now.to_words())?;
+    cleanup::drain();
+    let s = sched::stats();
+    let counted = KernelStats {
+        idle: s.idle,
+        idle_latency: s.idle_latency,
+        irq_latency: s.irq_latency,
+        cleanup_queue: 0,
+        longest_portion: cleanup::longest(),
+        free_frames: phys::free_frames(),
+        pool_pages: pages::taken() as u64,
+    };
+    check(
+        counted.longest_portion > 0 && counted.free_frames > 0 && counted.pool_pages > 0,
+        "the kernel counted no portion, frame or pool page",
+    )?;
+    c.succeeds(n, &[stats, kernel, 0], &counted.to_words())
+}
+
+/// A handle holds its object: the last close queues a thread and a
+/// process for cleanup at the level of the caller, 10, and their portions
+/// let them go back to their pools; a closed handle is bad from then on.
 pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(|c| {
-        let other = process::create(LIMIT, CEILING).map_err(|_| "no second process")?;
+        let other = process::create_root(QUOTA, LIMIT, CEILING).map_err(|_| "no second process")?;
         let t = match thread::create(other, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(t) => t,
             Err(_) => {
                 // SAFETY: the process is the test's, and nothing uses it afterwards.
-                unsafe { process::release(other) };
+                unsafe { process::release(other, CAUSE) };
                 return Err("no second thread");
             }
         };
@@ -257,8 +328,8 @@ pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str
         // SAFETY: the test's references go; the handles, if any, hold the
         // objects from here on.
         unsafe {
-            thread::release(t);
-            process::release(other);
+            thread::release(t, CAUSE);
+            process::release(other, CAUSE);
         }
         let (Ok(hp), Ok(ht)) = handles else {
             return Err("a handle did not go in");
@@ -285,11 +356,21 @@ fn close_cases(
     )?;
     c.succeeds(n, &[ht.0], &[])?;
     check(
+        thread::in_use() == threads + 2 && (cleanup::len(), cleanup::top()) == (1, Some(10)),
+        "the last handle to a thread closed, and the thread was not queued at the caller's level",
+    )?;
+    cleanup::drain();
+    check(
         thread::in_use() == threads + 1,
         "the last handle to a thread closed, and the thread stayed",
     )?;
     c.fails(n, &[ht.0], Error::BadHandle)?;
     c.succeeds(n, &[hp.0], &[])?;
+    check(
+        process::in_use() == processes + 2 && cleanup::len() == 1,
+        "the last handle to a process closed, and the process was not queued",
+    )?;
+    cleanup::drain();
     check(
         process::in_use() == processes + 1,
         "the last handle to a process closed, and the process stayed",
@@ -407,16 +488,17 @@ fn set_priority_cases(
     // A thread that ended: BAD_STATE, which comes after the ceilings.
     sched::start(low).map_err(|_| "the thread did not start")?;
     // SAFETY: the test holds its own reference to the thread.
-    unsafe { sched::exit(low) };
+    unsafe { sched::exit(low, CAUSE) };
     c.fails(n, &[to_low, 21, fifo], Error::AccessDenied)?;
     c.fails(n, &[to_low, 20, fifo], Error::BadState)
 }
 
-/// process_create checks the values first, then the exit channel, then
-/// the ceiling against the caller's (spec 11); a good call returns a handle
-/// with the owner's rights to a live process with the ceiling given. With
-/// the caller's table full it fails with LIMIT_REACHED, and the new process
-/// goes again. The caller's ceiling is 30.
+/// process_create checks the values first, then the exit channel and the
+/// start channel, then the ceiling against the caller's, then the quotas
+/// (spec 11); a good call returns a handle with the owner's rights to a
+/// live process with the ceiling given, a child of the caller's process
+/// (spec 4). With the caller's table full it fails with LIMIT_REACHED, and
+/// the new process goes again. The caller's ceiling is 30.
 pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;
@@ -447,38 +529,205 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
         [page, 16, 64],
         [page, 16, 0x100 | 20],
     ] {
-        c.fails(n, &[quota, limit, ceiling, 0, 0], Error::InvalidArgs)?;
+        c.fails(n, &[quota, limit, ceiling, 0, 0, 0], Error::InvalidArgs)?;
         // Values come before handles.
-        c.fails(n, &[quota, limit, ceiling, closed, 5], Error::InvalidArgs)?;
+        c.fails(
+            n,
+            &[quota, limit, ceiling, closed, 5, closed],
+            Error::InvalidArgs,
+        )?;
     }
     // A notification priority without a channel, a channel without one.
-    c.fails(n, &[page, 16, 20, 0, 5], Error::InvalidArgs)?;
-    c.fails(n, &[page, 16, 20, closed, 0], Error::InvalidArgs)?;
-    c.fails(n, &[page, 16, 20, closed, 5], Error::BadHandle)?;
-    // No object is a channel before milestone 1.3.
-    c.fails(n, &[page, 16, 20, resource, 5], Error::WrongType)?;
+    c.fails(n, &[page, 16, 20, 0, 5, 0], Error::InvalidArgs)?;
+    c.fails(n, &[page, 16, 20, closed, 0, 0], Error::InvalidArgs)?;
+    c.fails(n, &[page, 16, 20, closed, 5, 0], Error::BadHandle)?;
+    // No object is a channel before milestone 1.3b.
+    c.fails(n, &[page, 16, 20, resource, 5, 0], Error::WrongType)?;
+    c.fails(n, &[page, 16, 20, 0, 0, closed], Error::BadHandle)?;
+    c.fails(n, &[page, 16, 20, 0, 0, resource], Error::WrongType)?;
+    // The exit channel comes before the start channel.
+    c.fails(n, &[page, 16, 20, resource, 5, closed], Error::WrongType)?;
     // Handles come before the ceiling.
-    c.fails(n, &[page, 16, 31, closed, 5], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 31, 0, 0], Error::AccessDenied)?;
-    let child = c.created(n, &[page, 16, 30, 0, 0])?;
+    c.fails(n, &[page, 16, 31, closed, 5, 0], Error::BadHandle)?;
+    c.fails(n, &[page, 16, 31, 0, 0, closed], Error::BadHandle)?;
+    c.fails(n, &[page, 16, 31, 0, 0, 0], Error::AccessDenied)?;
+    quota_cases(c, n)?;
+    let child = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
     let found = unsafe { c.process.as_ref() }.lookup(child, OWNER_RIGHTS, Object::process);
     // SAFETY: the handle holds the child.
     let good = found.is_ok_and(|p| unsafe {
-        p != c.process && p.as_ref().ceiling() == 30 && p.as_ref().state() == ProcessState::Alive
+        p != c.process
+            && p.as_ref().ceiling() == 30
+            && p.as_ref().state() == ProcessState::Alive
+            && process::parent(p) == Some(c.process)
     });
     c.close(child)?;
     check(
         good,
-        "the handle does not name a live child with the owner's rights and its ceiling",
+        "the handle does not name a live child of the caller with the owner's rights and its ceiling",
     )?;
     full_table_cases(c, n)
 }
 
+/// The child's quota comes off the caller's (spec 7.5): more than is left
+/// there is NO_MEMORY, after the ceiling. The least quota covers the
+/// child's shell, its root table, its directory and the chunk with entry
+/// 0, 12 KiB; less is NO_MEMORY, whether the shell and the root table do
+/// not fit or the chunk does not, and the caller gets the quota back
+/// whole. A thread does not fit in the least child: NO_MEMORY, and what
+/// the call took goes back.
+fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
+    let page = PAGE_SIZE;
+    let q = process::quota(c.process);
+    let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(page);
+    c.fails(n, &[over, 16, 31, 0, 0, 0], Error::AccessDenied)?;
+    c.fails(n, &[over, 16, 30, 0, 0, 0], Error::NoMemory)?;
+    let least = (process::SHELL_COST + page + object::DIRECTORY_COST + object::CHUNK_COST)
+        .next_multiple_of(page);
+    check(
+        least == 3 * page,
+        "the least quota of a child is not 12 KiB",
+    )?;
+    let before = q.used();
+    for short in [page, least - page] {
+        c.fails(n, &[short, 16, 30, 0, 0, 0], Error::NoMemory)?;
+        cleanup::drain();
+        check(
+            process::quota(c.process).used() == before,
+            "a child that was not made kept the caller's quota",
+        )?;
+    }
+    let least = c.created(n, &[least, 16, 30, 0, 0, 0])?;
+    let result = full_child_cases(c, least).and_then(|()| full_table_thread_quota_cases(c, least));
+    c.close(least)?;
+    cleanup::drain();
+    result?;
+    check(
+        process::quota(c.process).used() == before,
+        "the least child's quota did not come back",
+    )
+}
+
+/// thread_create in `child`, whose quota its own objects take up: its
+/// thread's buffer does not fit, NO_MEMORY, and the thread goes again.
+fn full_child_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    let used = process::quota(p).used();
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
+    c.fails(Call::ThreadCreate.number(), &args, Error::NoMemory)?;
+    cleanup::drain();
+    check(
+        process::quota(p).used() == used,
+        "a thread that did not fit kept the child's quota",
+    )
+}
+
+/// thread_create into `child`, whose quota has no room for the thread
+/// either, with the caller's table full too: LIMIT_REACHED, checked before
+/// the quota (spec 11), even though the quota alone already fails the
+/// call (`full_child_cases`).
+fn full_table_thread_quota_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
+    let n = Call::ThreadCreate.number();
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
+    with_full_table(c, n, &args)
+}
+
+/// Every process pays for the directory and chunks of its own table,
+/// whoever puts the handle there (spec 7.5): process_create charges the
+/// caller the child's quota alone, and the child pays from it for its
+/// shell, its root table, its directory and the chunk with entry 0. A
+/// handle the kernel puts in the child's table past its first chunk
+/// takes a second one, which the child pays for too. Once the child goes,
+/// the caller has its quota back whole.
+pub fn table_chunks_are_paid_by_the_owner(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        // The caller's table has its directory and first chunk from here on.
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        let before = process::quota(c.process).used();
+        let n = Call::ProcessCreate.number();
+        let child = c.created(n, &[CHILD_QUOTA, 2 * CHUNK as u64, 20, 0, 0, 0])?;
+        let result = owner_pays(c, child, before);
+        c.close(child)?;
+        cleanup::drain();
+        c.close(first)?;
+        result?;
+        check(
+            process::quota(c.process).used() == before,
+            "the child's quota did not come back whole",
+        )
+    })
+}
+
+fn owner_pays(c: &Caller, child: Handle, before: u64) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    let own = process::SHELL_COST + PAGE_SIZE + object::DIRECTORY_COST + object::CHUNK_COST;
+    check(
+        process::quota(c.process).used() == before + CHILD_QUOTA,
+        "the caller paid for more than the child's quota",
+    )?;
+    check(
+        process::quota(p).used() == own,
+        "the child did not pay for its shell, root table, directory and first chunk",
+    )?;
+    // Entry 0 and 63 more fill the first chunk; the next takes a second.
+    for _ in 0..=CHUNK {
+        process::insert_handle(p, Object::Resource, Rights::NONE)
+            .map_err(|_| "a handle did not go into the child")?;
+    }
+    check(
+        process::quota(p).used() == own + object::CHUNK_COST
+            && process::quota(c.process).used() == before + CHILD_QUOTA,
+        "the child's second chunk was not charged to the child",
+    )
+}
+
+/// A child that process_create made has a stub in entry 0 of its table
+/// (spec 13.3): the first handle that goes in there gets another value,
+/// and START_CHANNEL stays bad.
+pub fn entry_0_of_a_child_stays_bad(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::ProcessCreate.number();
+        let child = c.created(n, &[CHILD_QUOTA, 16, 20, 0, 0, 0])?;
+        let result = start_entry_cases(c, child);
+        c.close(child)?;
+        result
+    })
+}
+
+fn start_entry_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    let first = process::insert_handle(p, Object::Resource, Rights::DEBUG)
+        .map_err(|_| "a handle did not go into the child")?;
+    // SAFETY: the caller's handle holds the child.
+    let start = unsafe { p.as_ref() }.lookup(START_CHANNEL, Rights::NONE, Object::resource);
+    check(
+        first != START_CHANNEL && start == Err(Error::BadHandle),
+        "START_CHANNEL names a handle of the child",
+    )
+}
+
 /// A full table of the caller: LIMIT_REACHED, and the new process goes.
+/// LIMIT_REACHED even when the quota would not have covered the child
+/// either (spec 11): the table has no room, a limit that needs no
+/// allocation, and the call checks it before it ever charges the quota.
 fn full_table_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
+    cleanup::drain();
     let processes = process::in_use();
-    with_full_table(c, n, &[PAGE_SIZE, 16, 30, 0, 0])?;
+    with_full_table(c, n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
+    let q = process::quota(c.process);
+    let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(PAGE_SIZE);
+    with_full_table(c, n, &[over, 16, 30, 0, 0, 0])?;
+    cleanup::drain();
     check(
         process::in_use() == processes,
         "the process of a call that failed stayed",
@@ -589,6 +838,7 @@ fn thread_create_cases(
     c.fails(n, &good(to_low, 21), Error::AccessDenied)?;
     c.close(h)?;
     result?;
+    cleanup::drain();
     check(
         process::translate(low, BUFFER as usize).is_none(),
         "the buffer's page outlived its thread",
@@ -597,6 +847,7 @@ fn thread_create_cases(
     // its buffer go; the buffer's page tables stay with the process.
     let (threads, frames) = (thread::in_use(), phys::free_frames());
     with_full_table(c, n, &good(to_low, 20))?;
+    cleanup::drain();
     check(
         thread::in_use() == threads
             && process::translate(low, BUFFER as usize).is_none()
@@ -638,13 +889,14 @@ fn new_thread_cases(c: &Caller, low: NonNull<Process>, h: Handle) -> Result<(), 
 }
 
 /// process_kill ends a process whatever state its threads are in: a ready
-/// thread leaves the queue, a stopped one ends where it is (spec 11).
-/// The process's space and its threads' buffers go at once; handles keep
-/// the shells, and object_info reports «killed». Killing it again
-/// succeeds; thread_start, thread_create and thread_set_priority find it
-/// and its threads ended (BAD_STATE). thread_start and process_kill check
-/// their handles first. A running thread's case is `process_kills_itself`
-/// at EL0.
+/// thread leaves the queue, a stopped one ends where it is (spec 11), both
+/// in the call. The process's space and its threads' buffers go with the
+/// cleanup at the caller's level, which runs before the caller does again:
+/// here the test runs the queue itself. Handles keep the shells, and
+/// object_info reports «killed». Killing it again succeeds; thread_start,
+/// thread_create and thread_set_priority find it and its threads ended
+/// (BAD_STATE). thread_start and process_kill check their handles first.
+/// A running thread's case is `process_kills_itself` at EL0.
 pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(kill_cases)?;
@@ -655,7 +907,10 @@ pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static
 }
 
 fn kill_cases(c: &Caller) -> Result<(), &'static str> {
-    let child = c.created(Call::ProcessCreate.number(), &[PAGE_SIZE, 16, 20, 0, 0])?;
+    let child = c.created(
+        Call::ProcessCreate.number(),
+        &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+    )?;
     let make = |buffer| {
         let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, buffer);
         c.created(Call::ThreadCreate.number(), &args)
@@ -715,23 +970,38 @@ fn kill_calls(
     c.fails(kill, &[weak_child.0], Error::AccessDenied)?;
     let frames = phys::free_frames();
     c.succeeds(kill, &[child.0], &[])?;
-    // Four tables (levels 0-3 over both buffers) and two buffers.
-    check(
-        phys::free_frames() == frames + 6,
-        "the killed process kept its tables or its threads' buffers",
-    )?;
     // SAFETY: the handles hold the threads.
     let dead = unsafe { [tr, ts].map(|t| t.as_ref().sched.state() == State::Dead) };
     check(
         dead == [true, true] && sched::first(10).is_none(),
         "a thread of the killed process did not end",
     )?;
+    check(
+        (cleanup::len(), cleanup::top()) == (1, Some(10)),
+        "the killed process was not queued at the caller's level",
+    )?;
+    // Until the stage Space the space is there, and a free page for a
+    // buffer too: only the end keeps a new thread and its buffer out of
+    // the process.
+    let buffer = BUFFER + 2 * PAGE_SIZE;
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, buffer);
+    let threads = thread::in_use();
+    c.fails(Call::ThreadCreate.number(), &args, Error::BadState)?;
+    check(
+        thread::in_use() == threads,
+        "thread_create made a thread in a process that ended",
+    )?;
+    cleanup::drain();
+    // Four tables (levels 0-3 over both buffers) and two buffers.
+    check(
+        phys::free_frames() == frames + 6,
+        "the killed process kept its tables or its threads' buffers",
+    )?;
     let info = Call::ObjectInfo.number();
     let killed = ProcessState::Killed.to_words();
     c.succeeds(info, &[child.0, INFO_PROCESS_STATE, 0], &killed)?;
     c.succeeds(kill, &[child.0], &[])?;
     c.fails(start, &[stopped.0], Error::BadState)?;
-    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
     c.fails(Call::ThreadCreate.number(), &args, Error::BadState)?;
     let set = Call::ThreadSetPriority.number();
     c.fails(set, &[ready.0, 10, FIFO], Error::BadState)

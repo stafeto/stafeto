@@ -2,15 +2,16 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Exception entry. A system call from EL0 goes to the dispatcher, an
-//! interrupt at EL0 to its handler, and any other synchronous exception at
-//! EL0 ends the program's process; every other exception is reported with
+//! interrupt at EL0 to the way out of the kernel, which handles it, and
+//! any other synchronous exception at EL0 ends the program's process;
+//! every other exception is reported with
 //! its registers and stops the kernel. Test builds skip one BRK marker
 //! (kcore::esr::TEST_BRK) to prove the vectors and the return path work. An
 //! entry from EL1 that finds no room on the kernel stack runs on the
 //! emergency stack and never returns.
 
 use super::user::UserRegs;
-use super::{gic, registers, symbols};
+use super::{registers, symbols};
 use crate::process;
 use crate::thread::{self, Thread};
 use abi::ProcessState;
@@ -128,9 +129,11 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
 
 /// Entry from EL0 (vectors.S): the program's registers are in the running
 /// thread. Any other synchronous exception than a system call is the
-/// program's fault and ends its process (spec 7.9); an asynchronous one
-/// that no handler takes is an error of the system and stops the machine.
-/// Then the scheduler decides who runs (sched::resume).
+/// program's fault and ends its process (spec 7.9); an interrupt stays
+/// pending, and sched::resume acknowledges and handles it first thing; an
+/// asynchronous exception that no handler takes is an error of the system
+/// and stops the machine. Then the scheduler decides who runs
+/// (sched::resume).
 #[unsafe(no_mangle)]
 extern "C" fn handle_user_exception(index: u64) -> ! {
     let thread = thread::current().expect("an entry from EL0 with no thread running");
@@ -140,12 +143,8 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
             Some(number) => crate::syscall::dispatch(thread, number),
             None => user_fault(thread, syndrome),
         },
-        VECTOR_EL0_IRQ => {
-            // A spurious read needs no EOI.
-            if let Some(ack) = gic::acknowledge() {
-                crate::interrupt::handle(ack);
-            }
-        }
+        // PSTATE masks it now, and ISR_EL1 shows it to sched::resume.
+        VECTOR_EL0_IRQ => {}
         // Not the program's fault: PSTATE masks SErrors inside the kernel,
         // so one the kernel caused arrives at EL0 as well; FIQs never reach
         // EL1.
@@ -186,9 +185,11 @@ fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
         far,
         elr,
     };
+    // SAFETY: the running thread is alive.
+    let cause = unsafe { thread.as_ref() }.priority();
     // SAFETY: the thread's reference keeps the process until the end takes
     // its own; the thread is not used afterwards.
-    unsafe { process::end(p, reason) };
+    unsafe { process::end(p, reason, cause) };
 }
 
 /// An asynchronous exception at EL0 that no handler takes: an error of the

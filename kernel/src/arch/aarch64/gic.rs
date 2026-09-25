@@ -145,6 +145,12 @@ pub fn set_pending(intid: u32) {
     write(&DIST, offset, bit);
 }
 
+/// This CPU interface's priority mask, GICC_PMR.
+#[cfg(feature = "ktest")]
+pub fn priority_mask() -> u8 {
+    read(&CPU, GICC_PMR) as u8
+}
+
 #[cfg(feature = "ktest")]
 pub fn priority(intid: u32) -> u8 {
     let (offset, shift) = gic::byte(GICD_IPRIORITYR, intid);

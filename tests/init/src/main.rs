@@ -21,7 +21,7 @@
 
 use abi::{
     Call, Error, Handle, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE, INIT_THREAD, Policy,
-    ProcessState,
+    ProcessHandles, ProcessMemory, ProcessState,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use rt::sys::{self, Regs};
@@ -33,7 +33,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 16] = [
+const TESTS: [Test; 23] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -52,6 +52,7 @@ const TESTS: [Test; 16] = [
     ("unknown_system_calls_fail", unknown_system_calls_fail),
     ("priority_ceilings_hold", priority_ceilings_hold),
     ("thread_states", thread_states),
+    ("thread_limit_is_64", thread_limit_is_64),
     (
         "higher_priority_start_preempts_at_once",
         higher_priority_start_preempts_at_once,
@@ -80,6 +81,18 @@ const TESTS: [Test; 16] = [
         "kill_takes_a_ready_thread_off_the_queue",
         kill_takes_a_ready_thread_off_the_queue,
     ),
+    ("quota_is_enforced", quota_is_enforced),
+    ("process_info_kinds", process_info_kinds),
+    ("kernel_stats_need_kstats", kernel_stats_need_kstats),
+    (
+        "process_kill_returns_after_the_teardown",
+        process_kill_returns_after_the_teardown,
+    ),
+    ("child_quota_comes_back", child_quota_comes_back),
+    (
+        "create_kill_cycles_leak_nothing",
+        create_kill_cycles_leak_nothing,
+    ),
 ];
 
 /// Init's priority while the tests run.
@@ -92,6 +105,13 @@ const HIGH: u8 = 30;
 
 const PAGE: usize = 4096;
 const STACK_SIZE: usize = 16 * 1024;
+/// The quota of a child with a thread or two (spec 7.5).
+const CHILD_QUOTA: u64 = 64 * 1024;
+/// The least quota this kernel takes for a child: its shell, its root
+/// table, the directory of its table and the chunk with entry 0.
+const LEAST_QUOTA: u64 = 12 * 1024;
+/// Rounds of `create_kill_cycles_leak_nothing`.
+const CYCLES: u32 = 1000;
 /// Threads of init's own process a test may have at a time.
 const SLOTS: usize = 2;
 
@@ -233,9 +253,10 @@ fn let_run() -> Outcome {
         .map_err(|_| "init could not take its priority back")
 }
 
-/// A child with no code, room for 16 handles and ceiling `ceiling`.
+/// A child with no code, CHILD_QUOTA, room for 16 handles and ceiling
+/// `ceiling`.
 fn child(ceiling: u8) -> Result<Handle, &'static str> {
-    sys::process_create(PAGE as u64, 16, ceiling).map_err(|_| "process_create failed")
+    sys::process_create(CHILD_QUOTA, 16, ceiling).map_err(|_| "process_create failed")
 }
 
 /// A stopped thread of `process` at CHILD_ENTRY, FIFO at `priority`.
@@ -457,7 +478,7 @@ fn priority_ceilings_hold() -> Outcome {
         "policy 2 was taken",
     )?;
     check(
-        sys::process_create(PAGE as u64, 16, abi::PRIORITY_LEVELS) == Err(Error::InvalidArgs),
+        sys::process_create(CHILD_QUOTA, 16, abi::PRIORITY_LEVELS) == Err(Error::InvalidArgs),
         "ceiling 64 was taken",
     )?;
     let c = child(LEVEL)?;
@@ -499,6 +520,55 @@ fn thread_states() -> Outcome {
     check(
         killed.is_ok() && late == Err(Error::BadState),
         "a process that ended took a new thread",
+    )
+}
+
+/// A stopped thread of init's process that runs add_mark(0) on the stack
+/// of slot 0, at `priority`, with its message buffer on page `page` above
+/// init's own.
+fn marker(page: usize, priority: u8) -> Result<Handle, Error> {
+    // SAFETY: of the threads that share the stack of slot 0 at a time, at
+    // most one runs, and it ends before the next test.
+    unsafe {
+        sys::thread_create(
+            INIT_PROCESS,
+            add_mark,
+            STACKS[0].top(),
+            0,
+            priority,
+            Policy::Fifo,
+            buffer(page),
+        )
+    }
+}
+
+/// A process has at most abi::MAX_THREADS threads that have not ended
+/// (spec 8), init's first thread among them: past that thread_create
+/// fails with LIMIT_REACHED. A thread that exits makes room again, while
+/// its handle keeps its shell.
+fn thread_limit_is_64() -> Outcome {
+    reset_marks();
+    let mut made = [None; abi::MAX_THREADS as usize - 1];
+    for (page, slot) in made.iter_mut().enumerate() {
+        *slot = marker(page, HIGH).ok();
+    }
+    let past = marker(made.len(), HIGH);
+    // Above init, it runs and exits before thread_start returns.
+    let started = made[0].map(sys::thread_start);
+    let again = marker(made.len(), HIGH);
+    let all = made.iter().all(Option::is_some);
+    for h in made.into_iter().flatten().chain(past).chain(again) {
+        close(h)?;
+    }
+    check(all, "63 threads next to init's did not fit")?;
+    check(past == Err(Error::LimitReached), "a 65th thread was made")?;
+    check(
+        started == Some(Ok(())) && mark(0) == 1,
+        "a thread of the full process did not run to its exit",
+    )?;
+    check(
+        again.is_ok(),
+        "the exit of a thread did not make room for another",
     )
 }
 
@@ -706,4 +776,254 @@ fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
         "the child did not end as killed",
     )?;
     check(again.is_ok(), "a second kill of the dead child failed")
+}
+
+/// A child's quota comes off init's (spec 7.5): more than init has free
+/// fails with NO_MEMORY and changes x0 alone, and so does a quota too
+/// small for the child's own objects; a child that was not made gave
+/// init's quota back before the call returned, also one that failed only
+/// at its entry 0. In a child with the least quota a thread does not fit:
+/// NO_MEMORY again.
+fn quota_is_enforced() -> Outcome {
+    let own = sys::process_memory(INIT_PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let over = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
+    let mut x = marked();
+    x[..6].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0]);
+    // SAFETY: process_create only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::ProcessCreate.number() }>(x) };
+    check(
+        after[0] == Error::NoMemory.code() && after[1..] == x[1..],
+        "a quota above init's did not fail with NO_MEMORY alone",
+    )?;
+    for short in [PAGE as u64, LEAST_QUOTA - PAGE as u64] {
+        check(
+            sys::process_create(short, 16, LOW) == Err(Error::NoMemory),
+            "a child took a quota below the least",
+        )?;
+        check(
+            sys::process_memory(INIT_PROCESS).map(|m| m.used) == Ok(own.used),
+            "a child that was not made kept init's quota after the call",
+        )?;
+    }
+    let c = sys::process_create(LEAST_QUOTA, 16, LOW)
+        .map_err(|_| "a child with the least quota was not made")?;
+    let t = child_thread(c, LOW);
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    check(
+        t == Err(Error::NoMemory),
+        "a thread fit in a child with the least quota",
+    )
+}
+
+/// object_info's PROCESS_MEMORY and PROCESS_HANDLES (spec 11): a new child
+/// has the quota init gave it, pays for its own objects from it, less than
+/// the least quota, and returned nothing; its table is empty, entry 0 went
+/// back, and its limit is the one init set. A thread makes the child pay
+/// for the thread, its buffer and the tables over it. Init's table counts
+/// the handles to both, and init's quota, every frame free when it was
+/// made, covers what it uses.
+fn process_info_kinds() -> Outcome {
+    let before = sys::process_handles(INIT_PROCESS);
+    let c = child(LOW)?;
+    let made = sys::process_memory(c);
+    let table = sys::process_handles(c);
+    let t = child_thread(c, LOW);
+    let with_thread = sys::process_memory(c);
+    let after = sys::process_handles(INIT_PROCESS);
+    let own = sys::process_memory(INIT_PROCESS);
+    let stats = sys::kernel_stats(INIT_RESOURCE);
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    let Ok(made) = made else {
+        return Err("PROCESS_MEMORY of the child failed");
+    };
+    check(
+        made.quota == CHILD_QUOTA
+            && made.used > 0
+            && made.used <= LEAST_QUOTA
+            && made.returned == 0,
+        "a new child does not pay for its own objects from the quota init gave it",
+    )?;
+    check(
+        table
+            == Ok(ProcessHandles {
+                live: 0,
+                retired: 0,
+                limit: 16,
+            }),
+        "a new child's table is not empty with the limit init set",
+    )?;
+    check(
+        t.is_ok() && with_thread.is_ok_and(|m| m.used > made.used + 4 * PAGE as u64),
+        "the child did not pay for its thread, the buffer and three tables",
+    )?;
+    let (Ok(before), Ok(after)) = (before, after) else {
+        return Err("PROCESS_HANDLES of init failed");
+    };
+    check(
+        after.live == before.live + 2
+            && (after.retired, after.limit) == (before.retired, before.limit),
+        "init's table did not count the handles to the child and its thread",
+    )?;
+    check(
+        own.is_ok_and(|m| m.used + m.returned < m.quota && m.returned == 0)
+            && stats.is_ok_and(|s| own.is_ok_and(|m| m.quota > s.free_frames * PAGE as u64)),
+        "init's quota is not the frames that were free when it was made",
+    )
+}
+
+/// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
+/// is WRONG_TYPE; init's resource gets the counts in x1-x7 and changes
+/// nothing past them. Nothing waits in the cleanup queue while init runs,
+/// and the frames and pool pages are there. A copy of the resource without
+/// KSTATS, which ACCESS_DENIED needs, comes with handle_duplicate
+/// (milestone 1.3b).
+fn kernel_stats_need_kstats() -> Outcome {
+    check(
+        sys::kernel_stats(INIT_PROCESS) == Err(Error::WrongType),
+        "a process handle gave the kernel's counts",
+    )?;
+    let mut x = marked();
+    x[..3].copy_from_slice(&[INIT_RESOURCE.0, abi::INFO_KERNEL_STATS, 0]);
+    // SAFETY: object_info only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+    check(
+        after[0] == 0 && after[8..] == x[8..],
+        "KERNEL_STATS failed or changed registers past x7",
+    )?;
+    let stats = abi::KernelStats::from_words(after[1..8].try_into().expect("x1-x7"));
+    check(
+        stats.cleanup_queue == 0 && stats.free_frames > 0 && stats.pool_pages > 0,
+        "the queue is not empty, or no frame or pool page is counted",
+    )
+}
+
+/// Init at TEST_PRIORITY kills a child with a thread: the cleanup runs at
+/// init's level before the call returns (spec 7.7), so right afterwards
+/// the queue is empty and the child gave back all but the shells init's
+/// handles keep.
+fn process_kill_returns_after_the_teardown() -> Outcome {
+    let c = child(LOW)?;
+    let t = child_thread(c, LOW);
+    let killed = sys::process_kill(c);
+    let stats = sys::kernel_stats(INIT_RESOURCE);
+    let memory = sys::process_memory(c);
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    check(
+        t.is_ok() && killed.is_ok(),
+        "thread_create or process_kill failed",
+    )?;
+    check(
+        stats.is_ok_and(|s| s.cleanup_queue == 0),
+        "the cleanup queue was not empty when process_kill returned",
+    )?;
+    check(
+        memory.is_ok_and(|m| m.returned > 0 && m.used + m.returned == m.quota),
+        "the child's quota was not back when process_kill returned",
+    )
+}
+
+/// A child's quota comes back to init in two parts (spec 7.5): once the
+/// child is killed, all but what the shells of the child and of its
+/// thread hold, which init's handles keep; the rest once init closes the
+/// handles. Then init uses what it used before the child.
+fn child_quota_comes_back() -> Outcome {
+    let used = || sys::process_memory(INIT_PROCESS).map(|m| m.used);
+    let before = used();
+    let c = child(LOW)?;
+    let made = used();
+    let t = child_thread(c, LOW);
+    let killed = sys::process_kill(c);
+    let after_kill = used();
+    let child_memory = sys::process_memory(c);
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    let after_thread = used();
+    close(c)?;
+    let after = used();
+    check(
+        t.is_ok() && killed.is_ok(),
+        "thread_create or process_kill failed",
+    )?;
+    let (Ok(before), Ok(made), Ok(after_kill), Ok(child_memory)) =
+        (before, made, after_kill, child_memory)
+    else {
+        return Err("PROCESS_MEMORY failed");
+    };
+    check(
+        made == before + CHILD_QUOTA,
+        "the child's quota did not come off init's",
+    )?;
+    check(
+        child_memory
+            == ProcessMemory {
+                quota: CHILD_QUOTA,
+                used: after_kill - before,
+                returned: CHILD_QUOTA - (after_kill - before),
+            }
+            && child_memory.used > 0,
+        "the free part of the child's quota did not come back at its end",
+    )?;
+    check(
+        after_thread == Ok(after_kill),
+        "closing the handle to the child's thread changed init's used memory",
+    )?;
+    check(
+        after == Ok(before),
+        "init did not get the rest of the child's quota with its shell",
+    )
+}
+
+/// CYCLES rounds of a child with a ready thread, killed and closed, leave
+/// init's used memory, the free frames and the pages of kernel pools as
+/// they were (spec 7.5, 7.8): each child gives back every frame and pool
+/// slot it took, and the kill takes the kernel's reference to the thread
+/// along. One round runs first, so that the pools have the pages a round
+/// needs.
+fn create_kill_cycles_leak_nothing() -> Outcome {
+    cycle()?;
+    let before = counts()?;
+    for _ in 0..CYCLES {
+        cycle()?;
+    }
+    let after = counts()?;
+    check(
+        after.0 == before.0,
+        "init's used memory grew over the rounds",
+    )?;
+    check(after.1 == before.1, "frames were lost over the rounds")?;
+    check(after.2 == before.2, "the pools took pages over the rounds")
+}
+
+/// A child with a started thread that init kills and forgets. The thread
+/// is ready below init and never runs: the kill takes it off the queue.
+fn cycle() -> Outcome {
+    let c = child(LOW)?;
+    let t = child_thread(c, LOW);
+    let started = t.and_then(sys::thread_start);
+    let killed = sys::process_kill(c);
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    check(
+        started.is_ok() && killed.is_ok(),
+        "a round of create and kill failed",
+    )
+}
+
+/// Init's used memory, the free frames and the pages of kernel pools.
+fn counts() -> Result<(u64, u64, u64), &'static str> {
+    let used = sys::process_memory(INIT_PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let stats = sys::kernel_stats(INIT_RESOURCE).map_err(|_| "KERNEL_STATS failed")?;
+    Ok((used.used, stats.free_frames, stats.pool_pages))
 }

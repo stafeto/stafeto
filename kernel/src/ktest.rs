@@ -12,18 +12,23 @@ use crate::arch::symbols;
 use crate::arch::user::UserRegs;
 use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
+use crate::cleanup;
 use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::KernelPages;
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
+use crate::object::Object;
+use crate::process::Stage;
 use crate::thread::Policy;
-use crate::{process, thread};
-use abi::Error;
+use crate::{process, sched, thread};
+use abi::{Error, ProcessState, Rights};
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
 use kcore::frames::{PAGE_SIZE, PhysMem};
 use kcore::gic::{Ack, DEFAULT_PRIORITY};
+use kcore::handles::CHUNK;
 use kcore::layout::{
     GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, USER_END, frame_fits, image_pa,
 };
@@ -31,6 +36,7 @@ use kcore::memmap;
 use kcore::paging::{
     Attrs, MAIR_DEVICE, MapError, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
 };
+use kcore::quota::Account;
 use kcore::sched::State;
 use kcore::slab::Pool;
 use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
@@ -154,6 +160,26 @@ const TESTS: &[(&str, TestFn)] = &[
         processes_and_threads_return_their_memory,
     ),
     (
+        "last_reference_only_queues_the_object",
+        last_reference_only_queues_the_object,
+    ),
+    (
+        "teardown_resumes_where_it_stopped",
+        teardown_resumes_where_it_stopped,
+    ),
+    (
+        "parent_quota_stage_sees_children_done",
+        parent_quota_stage_sees_children_done,
+    ),
+    (
+        "children_do_not_keep_their_parent_alive",
+        children_do_not_keep_their_parent_alive,
+    ),
+    (
+        "child_quota_comes_back_in_two_parts",
+        child_quota_comes_back_in_two_parts,
+    ),
+    (
         "unknown_system_calls_fail_with_invalid_args",
         calls::unknown_system_calls_fail_with_invalid_args,
     ),
@@ -164,6 +190,10 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "object_info_reports_a_live_process",
         calls::object_info_reports_a_live_process,
+    ),
+    (
+        "object_info_reports_memory_handles_and_statistics",
+        calls::object_info_reports_memory_handles_and_statistics,
     ),
     (
         "closing_a_handle_releases_its_object",
@@ -182,6 +212,14 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::process_create_checks_its_arguments,
     ),
     (
+        "entry_0_of_a_child_stays_bad",
+        calls::entry_0_of_a_child_stays_bad,
+    ),
+    (
+        "table_chunks_are_paid_by_the_owner",
+        calls::table_chunks_are_paid_by_the_owner,
+    ),
+    (
         "thread_create_checks_its_arguments",
         calls::thread_create_checks_its_arguments,
     ),
@@ -193,6 +231,16 @@ const TESTS: &[(&str, TestFn)] = &[
 
 /// Tests that failed so far, the EL0 tests' included.
 static FAILED: AtomicU32 = AtomicU32::new(0);
+
+/// The level of the cleanup the tests' own releases start: the tests run
+/// the queue dry themselves (cleanup::drain), so any level will do.
+pub const CAUSE: u8 = 1;
+
+/// The quota of the tests' processes that have no parent: more than any
+/// of them takes, a full table and a gigabyte of tables included.
+pub const QUOTA: u64 = 16 << 20;
+/// The quota of a child with a thread or two (spec 7.5).
+pub const CHILD_QUOTA: u64 = 64 << 10;
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -801,13 +849,14 @@ fn read_user(va: usize) -> u64 {
 }
 
 /// An address space that a test destroys when it is done with it, also on
-/// an early return. Only `drop` takes the space out.
-struct TestSpace(Option<AddressSpace>);
+/// an early return, and the quota its tables are charged to. Only `drop`
+/// takes the space out.
+struct TestSpace(Option<AddressSpace>, Account);
 
 impl Drop for TestSpace {
     fn drop(&mut self) {
         if let Some(space) = self.0.take() {
-            space.destroy();
+            space.destroy(&mut self.1);
         }
     }
 }
@@ -826,14 +875,18 @@ impl core::ops::DerefMut for TestSpace {
 }
 
 fn new_space() -> Result<TestSpace, &'static str> {
-    AddressSpace::new()
-        .map(|space| TestSpace(Some(space)))
+    let mut quota = Account::new(QUOTA);
+    AddressSpace::new(&mut quota)
+        .map(|space| TestSpace(Some(space), quota))
         .map_err(|_| "no frame for a root table")
 }
 
-fn map(space: &mut AddressSpace, va: usize, pa: u64, attrs: Attrs) -> Result<(), &'static str> {
-    space
-        .map(va, pa, PAGE_SIZE, attrs)
+fn map(space: &mut TestSpace, va: usize, pa: u64, attrs: Attrs) -> Result<(), &'static str> {
+    let TestSpace(Some(tables), quota) = space else {
+        return Err("a test space after its drop");
+    };
+    tables
+        .map(va, pa, PAGE_SIZE, attrs, quota)
         .map_err(|_| "a user page did not map")
 }
 
@@ -1065,7 +1118,8 @@ fn destroying_a_space_returns_its_tables(_: &Boot) -> Result<(), &'static str> {
 }
 
 /// Maps one frame at five addresses that need 13 tables between them, the
-/// root included, and runs the space; it is destroyed when this returns.
+/// root included, each charged to the space's quota, and runs the space;
+/// it is destroyed when this returns.
 fn check_table_count(frame: u64, before: u64) -> Result<(), &'static str> {
     let mut space = new_space()?;
     for va in [0x1000, USER_VA, 1 << 30, 1 << 39, USER_END - PAGE] {
@@ -1074,6 +1128,10 @@ fn check_table_count(frame: u64, before: u64) -> Result<(), &'static str> {
     check(
         phys::free_frames() == before - 14,
         "13 tables and a page did not come from the frame allocator",
+    )?;
+    check(
+        space.1.used() == 13 * PAGE_SIZE,
+        "the tables are not charged to the quota a page each",
     )?;
     space.activate();
     Ok(())
@@ -1204,25 +1262,476 @@ fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static st
 }
 
 fn process_round() -> Result<(), &'static str> {
-    let mut p = process::create(16, 63).map_err(|_| "no process")?;
-    let before = phys::free_frames();
+    let mut p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let before = (phys::free_frames(), process::quota(p).used());
     // SAFETY: the process was just created, and only this test uses it.
     let mapped = unsafe { p.as_mut() }.map_frames(USER_VA, 3 * PAGE_SIZE, Attrs::USER_DATA);
     let result = match mapped {
-        Ok(pa) => check_fresh_frames(pa, before).and_then(|()| check_thread_start(p)),
+        Ok(pa) => check_fresh_frames(p, pa, before).and_then(|()| check_thread_start(p)),
         Err(_) => Err("three pages did not map"),
     };
     // SAFETY: the process's threads went, the test's reference is the last,
     // and nothing uses it afterwards.
-    unsafe { process::release(p) };
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
     result
 }
 
-/// Three pages take a zeroed block of four frames and three tables over it.
-fn check_fresh_frames(pa: u64, before: u64) -> Result<(), &'static str> {
+/// A chain of processes, each holding the only handle to the next: the
+/// last reference to the first only queues it, at the level of its cause.
+/// Its portion of the stage Handles lets the next one's last reference go,
+/// which queues the next at the same level and takes nothing apart inside
+/// the portion (spec 7.7). Every later portion frees at most one process, and the
+/// queue stays as short as it was: one teardown ends before the next
+/// begins. A thread's portion lets the last reference to its process go
+/// at the thread's level as well.
+fn last_reference_only_queues_the_object(_: &Boot) -> Result<(), &'static str> {
+    const CHAIN: usize = 16;
+    const LEVEL: u8 = 7;
+    cleanup::drain();
+    let base = process::in_use();
+    let first = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let mut last = first;
+    for _ in 1..CHAIN {
+        let Ok(next) = process::create_root(QUOTA, 16, 63) else {
+            break;
+        };
+        let held = process::insert_handle(last, Object::Process(next), Rights::NONE);
+        // SAFETY: the test's reference goes; the handle, if it went in,
+        // holds the process.
+        unsafe { process::release(next, CAUSE) };
+        if held.is_err() {
+            break;
+        }
+        last = next;
+    }
+    let whole = process::in_use() == base + CHAIN;
+    // SAFETY: the test's reference is the last, and nothing uses it
+    // afterwards.
+    unsafe { process::release(first, LEVEL) };
+    let result = check(whole, "the chain of processes was not built")
+        .and_then(|()| portions_one_by_one(base, CHAIN, LEVEL))
+        .and_then(|()| thread_portion_keeps_its_level(LEVEL));
+    cleanup::drain();
+    result
+}
+
+/// A thread holds the last reference to its process, and its own last
+/// one goes at `level`: the thread's portion lets the process go at the
+/// same level, which queues the process there.
+fn thread_portion_keeps_its_level(level: u8) -> Result<(), &'static str> {
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo);
+    // SAFETY: the test's reference goes; the thread, if it was made,
+    // holds the process.
+    unsafe { process::release(p, CAUSE) };
+    let t = t.map_err(|_| "no thread")?;
+    let threads = thread::in_use();
+    // SAFETY: the test's reference to the thread is its last, and nothing
+    // uses it afterwards.
+    unsafe { thread::release(t, level) };
+    cleanup::portion();
     check(
-        phys::free_frames() == before - 7,
+        thread::in_use() + 1 == threads && (cleanup::len(), cleanup::top()) == (1, Some(level)),
+        "a thread's portion did not queue its process at its own level",
+    )
+}
+
+/// `chain` processes above `base` go in portions at `level`, the first
+/// one only queueing the next.
+fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'static str> {
+    check(
+        process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (1, Some(level)),
+        "the last reference did more than queue the process at the level of its cause",
+    )?;
+    // The stage Children, with no child, then the stage Handles.
+    cleanup::portion();
+    cleanup::portion();
+    check(
+        process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (2, Some(level)),
+        "a portion did not queue the next process at its own level",
+    )?;
+    // Each process takes a handful of portions: a guard against a loop.
+    for _ in 0..16 * chain {
+        let before = process::in_use();
+        cleanup::portion();
+        check(
+            process::in_use() + 1 >= before,
+            "a portion took more than one process apart",
+        )?;
+        check(
+            cleanup::top().is_none_or(|l| l == level) && cleanup::len() <= 3,
+            "a portion queued work at another level, or teardowns ran side by side",
+        )?;
+        if cleanup::top().is_none() {
+            break;
+        }
+    }
+    check(
+        process::in_use() == base,
+        "a process of the chain was not taken apart",
+    )
+}
+
+/// A process ends and goes in stages, one step a portion, and each
+/// portion goes on where the one before stopped (spec 7.7): with no
+/// children, the stage Children takes one portion; the table a chunk a
+/// portion; the space first loses TTBR0 and its ASID, and no call reaches
+/// its tables from then on, then a table a portion; the buffers of the
+/// threads the end stopped in one portion, the process's frames and the
+/// stage Quota in one more each. Then the shell stays for the test's
+/// reference.
+fn teardown_resumes_where_it_stopped(boot: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 9;
+    cleanup::drain();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 3 * CHUNK as u32, 63).map_err(|_| "no process")?;
+    let made = [0, 1].map(|_| thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo));
+    let result = match made {
+        [Ok(ready), Ok(stopped)] => fill_for_teardown(p, ready, stopped)
+            .and_then(|()| check_stages(boot, p, [ready, stopped], LEVEL)),
+        _ => Err("no thread"),
+    };
+    // SAFETY: the test's references go, and nothing uses them afterwards.
+    unsafe {
+        for t in made.into_iter().flatten() {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+        process::release(p, CAUSE);
+    }
+    cleanup::drain();
+    result?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "the process or its threads stayed in their pools",
+    )
+}
+
+/// Three full chunks of handles; a page in each of two gigabytes of the
+/// space, so that six tables map them; buffers for both threads, one of
+/// which is ready; and the space in TTBR0 with an ASID.
+fn fill_for_teardown(
+    mut p: NonNull<process::Process>,
+    ready: NonNull<thread::Thread>,
+    stopped: NonNull<thread::Thread>,
+) -> Result<(), &'static str> {
+    for _ in 0..3 * CHUNK {
+        process::insert_handle(p, Object::Resource, Rights::NONE)
+            .map_err(|_| "a handle did not go in")?;
+    }
+    for va in [USER_VA, USER_VA + GIB as usize] {
+        // SAFETY: the process is the test's, and nothing runs it.
+        unsafe { p.as_mut() }
+            .map_frames(va, PAGE_SIZE, Attrs::USER_DATA)
+            .map_err(|_| "a page did not map")?;
+    }
+    for (t, page) in [(ready, 2), (stopped, 3)] {
+        thread::give_buffer(t, USER_VA + page * PAGE).map_err(|_| "no buffer")?;
+    }
+    thread::start(ready).map_err(|_| "the thread did not start")?;
+    // SAFETY: as above.
+    unsafe { p.as_mut() }.activate();
+    Ok(())
+}
+
+fn check_stages(
+    boot: &Boot,
+    p: NonNull<process::Process>,
+    threads: [NonNull<thread::Thread>; 2],
+    level: u8,
+) -> Result<(), &'static str> {
+    let frames = phys::free_frames();
+    // SAFETY: the test holds a reference to the process.
+    unsafe { process::end(p, ProcessState::Killed, level) };
+    // SAFETY: the test holds references to the threads.
+    let dead = threads.map(|t| unsafe { t.as_ref() }.sched.state() == State::Dead);
+    check(
+        dead == [true, true] && sched::first(10).is_none(),
+        "the end did not stop the threads in the call",
+    )?;
+    check(
+        (cleanup::len(), cleanup::top()) == (1, Some(level))
+            && process::progress(p) == (Stage::Children, 3 * CHUNK as u32, 0),
+        "the end did more than queue the process",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p) == (Stage::Handles, 3 * CHUNK as u32, 0),
+        "the stage Children of a process with no child took more than a portion",
+    )?;
+    for left in [2, 1, 0] {
+        cleanup::portion();
+        let stage = if left > 0 {
+            Stage::Handles
+        } else {
+            Stage::Space
+        };
+        check(
+            process::progress(p) == (stage, left * CHUNK as u32, 0) && cleanup::len() == 1,
+            "a portion of the stage Handles did not take one chunk",
+        )?;
+    }
+    cleanup::portion();
+    let empty = image_pa(boot.kernel_pa, symbols::empty_table());
+    check(
+        registers::ttbr0_el1() == empty && phys::free_frames() == frames,
+        "the stage Space did not begin with TTBR0 and the ASID alone",
+    )?;
+    // The space is the stage's now: no call reaches its tables.
+    check(
+        process::translate(p, USER_VA).is_none()
+            && process::map_page(p, USER_VA + 4 * PAGE, 0, Attrs::USER_DATA)
+                == Err(Error::BadState),
+        "the tables of the space are reachable at the stage Space",
+    )?;
+    check_space_steps(p, frames)?;
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 6 + 2,
+        "the stage Buffers did not give the buffers back in one portion",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Quota && phys::free_frames() == frames + 6 + 2 + 2,
+        "the stage Frames did not give the frames back",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Shell && cleanup::len() == 0,
+        "the stage Quota took more than a portion, or the shell was queued",
+    )
+}
+
+/// The end of a process ends its descendants, which go depth first
+/// (spec 4, 7.7): two children, one with a child of its own whose thread
+/// is ready, each child and grandchild held only by a handle in its
+/// parent's table. Each process passes its stage Quota only after its
+/// children passed theirs, the ready thread leaves the scheduler, the
+/// whole teardown runs at the level of the end, and the tree goes.
+fn parent_quota_stage_sees_children_done(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 12;
+    cleanup::drain();
+    process::take_early_quota();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let built = child_of(root, 4 * CHILD_QUOTA).and_then(|a| {
+        child_of(root, CHILD_QUOTA)?;
+        let grandchild = child_of(a, CHILD_QUOTA)?;
+        ready_thread(grandchild)
+    });
+    let result = built.and_then(|t| check_tree_end(root, t, LEVEL));
+    if result == Err(STUCK) {
+        // A drain would never end: the failure is named instead, and the
+        // tree stays in the pools.
+        return result;
+    }
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "a process or a thread of the tree stayed in its pool",
+    )
+}
+
+/// A parent holds handles to its child, which holds its parent's shell,
+/// and the child holds one to a grandchild: the last reference to the
+/// parent ends it all the same (spec 4, 7.5), since a child's reference
+/// keeps the shell and never the process, and the whole tree goes.
+fn children_do_not_keep_their_parent_alive(_: &Boot) -> Result<(), &'static str> {
+    cleanup::drain();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let built = child_of(root, 4 * CHILD_QUOTA).and_then(|child| child_of(child, CHILD_QUOTA));
+    // SAFETY: the test's reference, the root's last, goes, and nothing
+    // uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    built?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "the children kept their parent alive, and the tree stayed",
+    )
+}
+
+/// A child of `parent` with `quota` that only a handle in `parent`'s table
+/// holds.
+fn child_of(
+    parent: NonNull<process::Process>,
+    quota: u64,
+) -> Result<NonNull<process::Process>, &'static str> {
+    let child = process::create_child(parent, quota, 16, 63).map_err(|_| "no child")?;
+    let held = process::insert_handle(parent, Object::Process(child), Rights::NONE);
+    // SAFETY: the test's reference goes; the handle, if it went in, holds
+    // the child.
+    unsafe { process::release(child, CAUSE) };
+    held.map(|_| child).map_err(|_| "a handle did not go in")
+}
+
+/// A ready thread of `p` that only a handle in `p`'s table and the
+/// scheduler hold.
+fn ready_thread(p: NonNull<process::Process>) -> Result<NonNull<thread::Thread>, &'static str> {
+    let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+    let held = process::insert_handle(p, Object::Thread(t), Rights::NONE)
+        .map_err(|_| "a handle did not go in")
+        .and_then(|_| thread::start(t).map_err(|_| "the thread did not start"));
+    // SAFETY: the test's reference goes; the handle, if it went in, holds
+    // the thread.
+    unsafe { thread::release(t, CAUSE) };
+    held.map(|()| t)
+}
+
+/// A child's quota comes back to its parent in two parts that add up to
+/// it (spec 7.5). The end of the child gives back at its stage Quota
+/// everything but the shells that still hold the quota: its own, which the
+/// parent's handle keeps, and the shell of its thread, which a handle in
+/// the parent's table keeps. The rest comes back when the child's shell
+/// goes, after the thread's.
+fn child_quota_comes_back_in_two_parts(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 11;
+    cleanup::drain();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let result = child_of(root, CHILD_QUOTA).and_then(|child| {
+        let t = thread::create(child, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        let held = process::insert_handle(root, Object::Thread(t), Rights::NONE);
+        // SAFETY: the test's reference goes; the handle, if it went in,
+        // holds the thread.
+        unsafe { thread::release(t, CAUSE) };
+        let held = held.map_err(|_| "a handle did not go in")?;
+        check_two_parts(root, child, held, LEVEL)
+    });
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "the child or its thread stayed in its pool",
+    )
+}
+
+/// Ends `child`, which only the root's handles hold, together with its
+/// thread's shell, `held`, and follows the root's quota as the two parts
+/// come back.
+fn check_two_parts(
+    root: NonNull<process::Process>,
+    child: NonNull<process::Process>,
+    held: abi::Handle,
+    level: u8,
+) -> Result<(), &'static str> {
+    let before = process::quota(root).used();
+    // SAFETY: the root's handle holds the child.
+    unsafe { process::end(child, ProcessState::Killed, level) };
+    cleanup::drain();
+    let q = process::quota(child);
+    let rest = process::SHELL_COST + thread::SHELL_COST;
+    check(
+        q.limit() == CHILD_QUOTA && q.used() == rest && q.returned() == CHILD_QUOTA - rest,
+        "the stage Quota did not give back all but the two shells",
+    )?;
+    check(
+        process::quota(root).used() == before - q.returned(),
+        "the parent did not get the free part at the child's stage Quota",
+    )?;
+    process::close_handle(root, held, CAUSE).map_err(|_| "the thread's handle did not close")?;
+    cleanup::drain();
+    check(
+        process::quota(child).used() == process::SHELL_COST
+            && process::quota(root).used() == before - q.returned(),
+        "the thread's shell did not go back to the child alone",
+    )?;
+    // The root's handle to the child is the first handle of its table.
+    let first = abi::Handle::new(0, 1);
+    process::close_handle(root, first, CAUSE).map_err(|_| "the child's handle did not close")?;
+    cleanup::drain();
+    check(
+        process::quota(root).used() == before - CHILD_QUOTA,
+        "the rest of the child's quota did not come back with its shell",
+    )
+}
+
+/// What `check_tree_end` says when the queue still holds work after its
+/// portions: an object that goes back in front of the one it waits for.
+const STUCK: &str = "the tree's teardown made no progress";
+
+/// Ends `root` and runs the queue a portion at a time: every portion runs
+/// at `level`, the whole tree goes in a bounded number of portions, the
+/// grandchild's thread leaves the scheduler, and no process comes to its
+/// stage Quota before its children.
+fn check_tree_end(
+    root: NonNull<process::Process>,
+    t: NonNull<thread::Thread>,
+    level: u8,
+) -> Result<(), &'static str> {
+    // SAFETY: the test holds a reference to the root.
+    unsafe { process::end(root, ProcessState::Killed, level) };
+    for _ in 0..256 {
+        if cleanup::top().is_none() {
+            break;
+        }
+        check(
+            cleanup::top() == Some(level),
+            "the tree's teardown ran at another level",
+        )?;
+        cleanup::portion();
+    }
+    let ready = sched::first(10) == Some(t);
+    if ready {
+        // A thread left ready would run in the tests at EL0.
+        // SAFETY: a ready thread is alive; the scheduler's reference goes.
+        unsafe { sched::exit(t, CAUSE) };
+    }
+    check(cleanup::top().is_none(), STUCK)?;
+    check(!ready, "the grandchild's thread is still ready")?;
+    check(
+        process::take_early_quota() == 0,
+        "a process came to its stage Quota before its children passed theirs",
+    )
+}
+
+/// The stage Space frees a table a portion, at most, and keeps count; the
+/// six tables go, the root last.
+fn check_space_steps(p: NonNull<process::Process>, frames: u64) -> Result<(), &'static str> {
+    for _ in 0..16 {
+        let before = phys::free_frames();
+        cleanup::portion();
+        let (stage, _, tables) = process::progress(p);
+        check(
+            phys::free_frames() <= before + 1,
+            "a portion of the stage Space freed more than one table",
+        )?;
+        if stage != Stage::Space {
+            return check(
+                stage == Stage::Buffers && phys::free_frames() == frames + 6,
+                "the stage Space ended before its six tables went",
+            );
+        }
+        check(
+            tables as u64 == phys::free_frames() - frames,
+            "the space does not count the tables it freed",
+        )?;
+    }
+    Err("the stage Space did not end")
+}
+
+/// Three pages take a zeroed block of four frames and three tables over
+/// it, and the process pays for all seven (spec 7.5).
+fn check_fresh_frames(
+    p: NonNull<process::Process>,
+    pa: u64,
+    (frames, used): (u64, u64),
+) -> Result<(), &'static str> {
+    check(
+        phys::free_frames() == frames - 7,
         "three pages did not take a block of four frames and three tables",
+    )?;
+    check(
+        process::quota(p).used() == used + 7 * PAGE_SIZE,
+        "the block of map_frames and its tables were not charged to the process",
     )?;
     // SAFETY: the block belongs to the test's process, which nothing runs.
     let mem = unsafe { LinearMem::new() };
@@ -1259,7 +1768,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
         "a new thread does not start as it was told",
     );
     // SAFETY: the thread is not running, and nothing uses it afterwards.
-    unsafe { thread::release(t) };
+    unsafe { thread::release(t, CAUSE) };
     result?;
     for (entry, stack, priority) in [
         (USER_END, stack, 10),
@@ -1271,7 +1780,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
             Err(Error::InvalidArgs) => {}
             Ok(t) => {
                 // SAFETY: the thread never ran, and nothing uses it afterwards.
-                unsafe { thread::release(t) };
+                unsafe { thread::release(t, CAUSE) };
                 return Err("a thread with a bad start was created");
             }
             Err(_) => return Err("a bad start failed with another error"),

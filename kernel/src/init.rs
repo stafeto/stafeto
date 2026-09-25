@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Starting init (spec 3.3, 13.3) from the program in the boot
-//! image: its process, each segment on fresh frames with the protection
+//! image: its process, with every free frame as its quota (spec 7.5),
+//! each segment on fresh frames with the protection
 //! its place in the program gives it, the stack right under
 //! abi::INIT_STACK_TOP with an unmapped guard page below, the first
 //! thread with its message buffer at abi::INIT_MSGBUF, init's first
@@ -12,6 +13,7 @@
 //! that names it.
 
 use crate::arch::cache;
+use crate::mm::phys;
 use crate::process::{self, Process};
 use crate::thread::{self, Policy};
 use bootimg::{Part, Program};
@@ -25,9 +27,12 @@ use kcore::paging::Attrs;
 const PRIORITY: u8 = 63;
 
 /// Makes init from `program` and leaves the kernel for it. Init's end
-/// ends the run (process::set_init).
+/// ends the run (process::set_init). Its quota is every frame free when it
+/// is made, and its own structures are charged to it as to any process;
+/// it has no parent to give the quota back to.
 pub fn start(program: &Program<'_>) -> ! {
-    let p = process::create(kcore::handles::MAX_HANDLES, PRIORITY)
+    let quota = phys::free_frames() * PAGE_SIZE;
+    let p = process::create_init(quota, kcore::handles::MAX_HANDLES, PRIORITY)
         .unwrap_or_else(|e| panic!("init: no process: {e:?}"));
     process::set_init(p);
     for part in Part::ALL {
@@ -81,10 +86,11 @@ pub fn start(program: &Program<'_>) -> ! {
     process::install_init_handles(p, t).unwrap_or_else(|e| panic!("init: no handles: {e:?}"));
     thread::start(t).unwrap_or_else(|e| panic!("init: its thread did not start: {e:?}"));
     // SAFETY: the references `create` handed out go; init's handles, its
-    // thread and the scheduler hold init from now on.
+    // thread and the scheduler hold init from now on, so neither is the
+    // last and nothing is queued for cleanup.
     unsafe {
-        thread::release(t);
-        process::release(p);
+        thread::release(t, PRIORITY);
+        process::release(p, PRIORITY);
     }
     crate::sched::resume()
 }

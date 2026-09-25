@@ -41,7 +41,10 @@ impl<T> Pool<T> {
     } else {
         align_of::<FreeSlot>()
     };
-    const SLOT: usize = {
+    /// Bytes one object takes in a page: its size, at least a free slot's
+    /// link, rounded up to the alignment. A quota pays this for each object
+    /// (spec 7.5).
+    pub const SLOT: usize = {
         let size = if size_of::<T>() > size_of::<FreeSlot>() {
             size_of::<T>()
         } else {
@@ -234,6 +237,15 @@ mod tests {
         // SAFETY: a is live and not used afterwards.
         unsafe { pool.free(a) };
         assert_eq!(pool.in_use(), 1);
+    }
+
+    #[test]
+    fn slot_is_the_size_rounded_to_the_alignment() {
+        // At least the link of a free slot, 8 bytes.
+        assert_eq!(Pool::<u8>::SLOT, 8);
+        assert_eq!(Pool::<[u32; 3]>::SLOT, 16);
+        assert_eq!(Pool::<[u8; 4000]>::SLOT, 4000);
+        assert_eq!(Pool::<[u64; 32]>::SLOT * Pool::<[u64; 32]>::PER_PAGE, PAGE);
     }
 
     #[test]

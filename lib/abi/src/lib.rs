@@ -100,6 +100,16 @@ pub const INIT_THREAD: Handle = Handle::new(2, 1);
 /// names another object.
 pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 
+/// The first handle of a process that `process_create` made (spec 13.3):
+/// entry 0 of its fresh table. The sixth argument of `process_create`, a
+/// channel, moves there from milestone 1.3c on; without one the entry
+/// holds a stub that goes at once, and the value is BAD_HANDLE for good.
+pub const START_CHANNEL: Handle = Handle::new(0, 1);
+
+/// Threads of one process that have not ended, at most (spec 8):
+/// `thread_create` past it fails with LIMIT_REACHED.
+pub const MAX_THREADS: u32 = 64;
+
 /// Top of the stack of init's first thread (spec 13.3). The kernel maps the
 /// stack the boot image asks for right under it, with an unmapped guard
 /// page below; init's program lies under that guard page.
@@ -227,11 +237,128 @@ pub fn inline_bytes(words: &[u64; 8]) -> [u8; INLINE_MAX] {
     bytes
 }
 
-/// Kinds of `object_info` (spec 11); 0 is reserved.
+/// Kinds of `object_info` (spec 11); 0 is reserved, and so is x2, which
+/// is 0.
 ///
 /// PROCESS_STATE takes a process handle, with no right needed, and returns
 /// `ProcessState::to_words` in x1-x4.
 pub const INFO_PROCESS_STATE: u64 = 1;
+/// PROCESS_MEMORY takes a process handle, with no right needed, and
+/// returns `ProcessMemory::to_words` in x1-x3.
+pub const INFO_PROCESS_MEMORY: u64 = 2;
+/// PROCESS_HANDLES takes a process handle, with no right needed, and
+/// returns `ProcessHandles::to_words` in x1-x3.
+pub const INFO_PROCESS_HANDLES: u64 = 3;
+/// KERNEL_STATS takes the system resource with KSTATS and returns
+/// `KernelStats::to_words` in x1-x7.
+pub const INFO_KERNEL_STATS: u64 = 4;
+
+/// A process's memory quota (spec 7.5), in bytes: the limit its parent
+/// gave it, what is charged to it now, and what went back to the parent.
+/// At its stage Quota the free part goes back, `returned` becomes `quota`
+/// minus `used`, and then stays: what is charged, its shell and the shells
+/// others still hold, only shrinks, and the rest goes back with its shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemory {
+    pub quota: u64,
+    pub used: u64,
+    pub returned: u64,
+}
+
+impl ProcessMemory {
+    /// The words `object_info` returns in x1-x3.
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.quota, self.used, self.returned]
+    }
+
+    /// The quota from x1-x3 of `object_info`.
+    pub const fn from_words(words: [u64; 3]) -> ProcessMemory {
+        ProcessMemory {
+            quota: words[0],
+            used: words[1],
+            returned: words[2],
+        }
+    }
+}
+
+/// A process's handle table (spec 5.1): the handles that are live, the
+/// entries retired at their last generation, which still take room, and
+/// the limit `process_create` set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessHandles {
+    pub live: u64,
+    pub retired: u64,
+    pub limit: u64,
+}
+
+impl ProcessHandles {
+    /// The words `object_info` returns in x1-x3.
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.live, self.retired, self.limit]
+    }
+
+    /// The table from x1-x3 of `object_info`.
+    pub const fn from_words(words: [u64; 3]) -> ProcessHandles {
+        ProcessHandles {
+            live: words[0],
+            retired: words[1],
+            limit: words[2],
+        }
+    }
+}
+
+/// What the kernel counts about itself (spec 15.3, 16). Times are in ticks
+/// of the counter CNTVCT_EL0 reads, at the frequency CNTFRQ_EL0 gives
+/// (rt::time::frequency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelStats {
+    /// Ticks the kernel slept in `wfi` with nothing to do.
+    pub idle: u64,
+    /// The longest time from a timer's deadline to the thread that ran
+    /// after its interrupt, when the interrupt woke the kernel from `wfi`.
+    pub idle_latency: u64,
+    /// The same, when the interrupt came while a thread ran at EL0 or the
+    /// kernel worked.
+    pub irq_latency: u64,
+    /// Objects in the cleanup queue now.
+    pub cleanup_queue: u64,
+    /// The longest portion of cleanup so far, in ticks: what one portion
+    /// adds to the blocking of any thread (spec 7.7).
+    pub longest_portion: u64,
+    /// Free frames of the frame allocator.
+    pub free_frames: u64,
+    /// Pages the pools of kernel objects hold, which they never give back
+    /// (spec 7.8).
+    pub pool_pages: u64,
+}
+
+impl KernelStats {
+    /// The words `object_info` returns in x1-x7.
+    pub const fn to_words(self) -> [u64; 7] {
+        [
+            self.idle,
+            self.idle_latency,
+            self.irq_latency,
+            self.cleanup_queue,
+            self.longest_portion,
+            self.free_frames,
+            self.pool_pages,
+        ]
+    }
+
+    /// The counts from x1-x7 of `object_info`.
+    pub const fn from_words(words: [u64; 7]) -> KernelStats {
+        KernelStats {
+            idle: words[0],
+            idle_latency: words[1],
+            irq_latency: words[2],
+            cleanup_queue: words[3],
+            longest_portion: words[4],
+            free_frames: words[5],
+            pool_pages: words[6],
+        }
+    }
+}
 
 /// Whether a process lives and, if not, why it ended (spec 7.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -526,6 +653,47 @@ mod tests {
             assert_eq!(state.to_words(), words);
             assert_eq!(ProcessState::from_words(words), state);
         }
+    }
+
+    #[test]
+    fn process_memory_travels_in_three_words() {
+        assert_eq!(INFO_PROCESS_MEMORY, 2);
+        let memory = ProcessMemory {
+            quota: 64 << 10,
+            used: 1536,
+            returned: (64 << 10) - 1536,
+        };
+        assert_eq!(memory.to_words(), [64 << 10, 1536, (64 << 10) - 1536]);
+        assert_eq!(ProcessMemory::from_words(memory.to_words()), memory);
+    }
+
+    #[test]
+    fn process_handles_travel_in_three_words() {
+        assert_eq!(INFO_PROCESS_HANDLES, 3);
+        let handles = ProcessHandles {
+            live: 5,
+            retired: 1,
+            limit: 16,
+        };
+        assert_eq!(handles.to_words(), [5, 1, 16]);
+        assert_eq!(ProcessHandles::from_words(handles.to_words()), handles);
+    }
+
+    #[test]
+    fn kernel_stats_travel_in_seven_words() {
+        assert_eq!(INFO_KERNEL_STATS, 4);
+        let words = [1, 2, 3, 4, 5, 6, 7];
+        let stats = KernelStats::from_words(words);
+        assert_eq!(
+            (stats.idle, stats.cleanup_queue, stats.pool_pages),
+            (1, 4, 7)
+        );
+        assert_eq!(
+            (stats.idle_latency, stats.irq_latency, stats.longest_portion),
+            (2, 3, 5)
+        );
+        assert_eq!(stats.free_frames, 6);
+        assert_eq!(stats.to_words(), words);
     }
 
     #[test]

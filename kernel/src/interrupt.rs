@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Interrupts (spec 8.1, 9). PSTATE masks them inside the kernel: they are
-//! taken while a program runs at EL0, and the idle loop fetches them itself
-//! through gic::wait. Either way the scheduler decides afterwards who runs
-//! (sched::resume).
+//! Interrupts (spec 8.1, 9). PSTATE masks them inside the kernel: one
+//! taken while a program runs at EL0 stays pending, and the way out of the
+//! kernel (sched::resume) acknowledges and handles it, as it does between
+//! two portions of cleanup and after the idle wait (gic::wait). The
+//! scheduler decides afterwards who runs.
 
 use crate::arch::{gic, timer};
 use crate::sched;
