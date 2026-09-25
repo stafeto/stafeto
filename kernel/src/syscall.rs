@@ -16,9 +16,11 @@
 
 use crate::object::Object;
 use crate::process::{self, Process};
+use crate::sched;
 use crate::thread::Thread;
 use abi::{Call, Error, Handle, Rights};
 use core::ptr::NonNull;
+use kcore::sched::{policy_arg, priority_arg, under_ceilings};
 
 /// A call's arguments: x0-x9 of the thread that made it.
 type Args = [u64; 10];
@@ -47,8 +49,9 @@ impl Values {
 }
 
 /// Carries out system call `number` for `thread`, the running thread that
-/// made it. Returns when `thread` is to go on; a call that switches to
-/// another thread does not return.
+/// made it, and writes the result into its registers. The scheduler then
+/// decides who runs (sched::resume): a call that lets another thread run
+/// has written the caller's result first.
 pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     #[cfg(feature = "ktest")]
     if abi::TEST_CALLS.contains(&number) && crate::ktest::el0::syscall(thread, number) {
@@ -59,6 +62,8 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     args.copy_from_slice(&unsafe { thread.as_ref() }.regs.x[..10]);
     let result = match Call::from_number(number) {
         Some(Call::HandleClose) => handle_close(thread, &args),
+        Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
+        Some(Call::Yield) => yield_now(),
         Some(Call::ObjectInfo) => object_info(thread, &args),
         Some(Call::DebugWrite) => debug_write(thread, &args),
         // Numbers no call has, and those of calls that come later.
@@ -103,6 +108,39 @@ fn lookup<U>(
 /// thread or a process does not end it.
 fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     process::close_handle(caller(thread), Handle(a[0]))?;
+    Ok(Values::NONE)
+}
+
+/// thread_set_priority(x0 thread with MANAGE, x1 priority 1-63, x2
+/// policy): the thread's base priority and policy change. The priority is
+/// no higher than the ceiling of the thread's process nor than the
+/// caller's (ACCESS_DENIED): a handle to another process's thread does not
+/// lift the thread above the caller's own ceiling. BAD_STATE for a thread
+/// that ended. The thread moves by the rules of `pthread_setschedprio`; a
+/// thread raised above the caller runs before the call returns, and so
+/// does a thread the caller lowered itself below.
+fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let priority = priority_arg(a[1])?;
+    let policy = policy_arg(a[2])?;
+    let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
+    // SAFETY: the handle holds the target thread, which holds its process;
+    // the calling thread holds its own.
+    let ceilings = unsafe {
+        [
+            target.as_ref().process().as_ref().ceiling(),
+            caller(thread).as_ref().ceiling(),
+        ]
+    };
+    under_ceilings(priority, &ceilings)?;
+    sched::set_priority(target, priority, policy)?;
+    Ok(Values::NONE)
+}
+
+/// yield(): the caller goes to the tail of its level with a new quantum,
+/// and the next thread of that level runs; alone there, the caller goes on
+/// at once. Lower levels never run through yield.
+fn yield_now() -> Result<Values, Error> {
+    sched::yield_running();
     Ok(Values::NONE)
 }
 

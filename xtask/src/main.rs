@@ -26,20 +26,31 @@ const DEBUG_WRITE_LINES: [&str; 3] = [
     "debug_write stops at its length",
     "debug_write from EL0 reaches the console",
 ];
+/// Tests only the `icount` build has: the first checks that the run is
+/// under -icount; the others depend on how much of a quantum is left,
+/// which only -icount makes repeatable.
+const ICOUNT_TESTS: [&str; 3] = [
+    "virtual_time_counts_instructions",
+    "lone_round_robin_thread_is_not_switched",
+    "preempted_rr_thread_resumes_before_its_peer",
+];
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Variant {
     Normal,
     Test,
+    /// The kernel tests with those that need QEMU's `-icount` (qemu::ICOUNT).
+    TestIcount,
     FaultProbe,
     OverflowProbe,
 }
 
 impl Variant {
-    const ALL: [Variant; 4] = [
+    const ALL: [Variant; 5] = [
         Variant::Normal,
         Variant::Test,
+        Variant::TestIcount,
         Variant::FaultProbe,
         Variant::OverflowProbe,
     ];
@@ -48,6 +59,7 @@ impl Variant {
         match self {
             Variant::Normal => None,
             Variant::Test => Some("ktest"),
+            Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
         }
@@ -57,6 +69,7 @@ impl Variant {
         match self {
             Variant::Normal => "stafeto",
             Variant::Test => "stafeto-ktest",
+            Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
         }
@@ -212,8 +225,10 @@ fn test() -> Result<(), String> {
     elf_boot_reports_missing_device_tree()?;
     fault_report()?;
     stack_overflow_report()?;
-    kernel_tests(&qemu::VIRT)?;
-    kernel_tests(&qemu::VIRT_2G)?;
+    kernel_tests(&qemu::VIRT, Variant::Test)?;
+    kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
+    kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
+    kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
     println!("all checks passed");
     Ok(())
 }
@@ -326,18 +341,38 @@ fn stack_overflow_report() -> Result<(), String> {
 /// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
 /// through semihosting. On 2 GiB the tests also cover RAM the boot page
 /// tables did not map. Every test the kernel counts passes once, and what
-/// the tests wrote through `debug_write` reaches the console whole.
-fn kernel_tests(m: &qemu::Machine) -> Result<(), String> {
-    let a = build(Variant::Test)?;
+/// the tests wrote through `debug_write` reaches the console whole. The
+/// `icount` build runs under qemu::ICOUNT, where virtual time counts
+/// instructions: the tests that depend on how much of a quantum is left
+/// run only there. A hang, such as a quantum that never ends, fails at
+/// TEST_TIMEOUT.
+fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
+    let a = build(variant)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS).arg("-semihosting");
+    let icount = variant == Variant::TestIcount;
+    if icount {
+        cmd.args(qemu::ICOUNT);
+    }
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r)?;
     for line in DEBUG_WRITE_LINES {
         qemu::expect_line(&o, line)?;
     }
-    println!("kernel tests on {}: {} passed", m.memory, r.passed.len());
+    for name in ICOUNT_TESTS {
+        if r.passed.iter().any(|p| p == name) != icount {
+            return Err(format!(
+                "{name} must pass in the icount build and only there"
+            ));
+        }
+    }
+    let under = if icount { " under icount" } else { "" };
+    println!(
+        "kernel tests{under} on {}: {} passed",
+        m.memory,
+        r.passed.len()
+    );
     Ok(())
 }
 

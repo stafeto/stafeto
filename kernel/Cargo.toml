@@ -18,5 +18,7 @@ kcore = { path = "../kcore" }
 
 [features]
 ktest = []
+# The kernel tests with those that need `-icount` added (ktest::el0).
+icount = ["ktest"]
 fault-probe = []
 overflow-probe = []

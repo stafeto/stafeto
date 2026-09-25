@@ -37,13 +37,6 @@ pub fn clock() -> Clock {
 /// The virtual counter, read after all earlier instructions. The kernel
 /// reads the counter here and nowhere else: on the PinePhone this read
 /// needs the A64 counter workaround (spec 10).
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the scheduler (milestone 1.2c) reads the time; so far only the kernel tests do"
-    )
-)]
 pub fn now() -> u64 {
     let ticks: u64;
     // SAFETY: reading the counter has no side effects; the ISB keeps the read
@@ -54,14 +47,9 @@ pub fn now() -> u64 {
     ticks
 }
 
-/// Fires once the counter reaches `cval`; a value already passed fires at once.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the scheduler (milestone 1.2c) arms deadlines; so far only the kernel tests do"
-    )
-)]
+/// Fires once the counter reaches `cval`; a value already passed fires at
+/// once. Outside the kernel tests only the scheduler arms and disarms the
+/// timer (sched), which remembers what the timer holds.
 pub fn arm(cval: u64) {
     // SAFETY: programming the EL1 virtual timer affects only its interrupt;
     // the ISB makes the new state take effect.
@@ -93,12 +81,33 @@ pub fn disarm() {
 /// reach the GIC once more after the EOI that followed a `disarm`: an
 /// INTID 27 without this is spurious and gets only its EOI.
 pub fn fired() -> bool {
+    ctl() & (CTL_ENABLE | CTL_ISTATUS) == CTL_ENABLE | CTL_ISTATUS
+}
+
+fn ctl() -> u64 {
     let ctl: u64;
     // SAFETY: reading CNTV_CTL_EL0 has no side effects.
     unsafe {
         core::arch::asm!("mrs {}, cntv_ctl_el0", out(reg) ctl, options(nomem, nostack, preserves_flags))
     };
-    ctl & (CTL_ENABLE | CTL_ISTATUS) == CTL_ENABLE | CTL_ISTATUS
+    ctl
+}
+
+/// True while the timer is on.
+#[cfg(feature = "ktest")]
+pub fn enabled() -> bool {
+    ctl() & CTL_ENABLE != 0
+}
+
+/// The compare value the timer was last armed with; `disarm` leaves it.
+#[cfg(feature = "ktest")]
+pub fn cval() -> u64 {
+    let cval: u64;
+    // SAFETY: reading CNTV_CVAL_EL0 has no side effects.
+    unsafe {
+        core::arch::asm!("mrs {}, cntv_cval_el0", out(reg) cval, options(nomem, nostack, preserves_flags))
+    };
+    cval
 }
 
 /// Disarms the timer and lets its line through the GIC. Returns the clock

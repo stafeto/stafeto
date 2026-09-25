@@ -11,13 +11,14 @@ use super::check;
 use crate::boot::Boot;
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::syscall;
 use crate::thread::{self, Policy, Thread};
+use crate::{sched, syscall};
 use abi::{
     Call, Error, Handle, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
     INIT_RESOURCE_RIGHTS, INIT_THREAD, OWNER_RIGHTS, ProcessState, Rights,
 };
 use core::ptr::NonNull;
+use kcore::sched::State;
 
 /// The line `debug_write_checks_its_arguments` prints: 64 bytes, all of
 /// x2-x9. xtask looks for it in the output.
@@ -27,6 +28,7 @@ const LINE: &[u8; 64] = b"kernel test: debug_write prints all 64 bytes of x2-x9 
 const STOPS: &[u8] = b"debug_write stops at its length";
 
 const LIMIT: u32 = 16;
+const CEILING: u8 = 63;
 const USER_VA: usize = 0x40_0000;
 
 /// A process with a thread that never runs; the kernel makes calls for it.
@@ -37,7 +39,13 @@ struct Caller {
 
 impl Caller {
     fn new() -> Result<Caller, &'static str> {
-        let process = process::create(LIMIT).map_err(|_| "no process")?;
+        Caller::with_ceiling(CEILING)
+    }
+
+    /// A caller whose process has priority ceiling `ceiling`; its thread
+    /// is FIFO at 10.
+    fn with_ceiling(ceiling: u8) -> Result<Caller, &'static str> {
+        let process = process::create(LIMIT, ceiling).map_err(|_| "no process")?;
         match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(thread) => Ok(Caller { process, thread }),
             Err(_) => {
@@ -213,7 +221,7 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
 pub fn closing_a_handle_releases_its_object(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(|c| {
-        let other = process::create(LIMIT).map_err(|_| "no second process")?;
+        let other = process::create(LIMIT, CEILING).map_err(|_| "no second process")?;
         let t = match thread::create(other, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(t) => t,
             Err(_) => {
@@ -315,4 +323,71 @@ fn init_handle_cases(c: &Caller) -> Result<(), &'static str> {
     let fresh = next == Handle::new(INIT_BOOT_IMAGE.index(), 2);
     c.close(next)?;
     check(fresh, "the boot image's entry came back at another value")
+}
+
+/// thread_set_priority checks the values first, then the handle, then the
+/// two ceilings, the target thread's process's and the caller's, then the
+/// thread's state (spec 11). A stopped thread only takes the new values.
+/// The caller's process has ceiling 30; the target threads' processes 20
+/// and 63.
+pub fn thread_set_priority_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+    let callers = [30, 20, 63].map(Caller::with_ceiling);
+    let result = match &callers {
+        [Ok(c), Ok(low), Ok(high)] => set_priority_handles(c, low, high),
+        _ => Err("no process or thread"),
+    };
+    for caller in callers.into_iter().flatten() {
+        caller.release();
+    }
+    result
+}
+
+fn set_priority_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), &'static str> {
+    let handles = [
+        c.insert(Object::Thread(low.thread), Rights::MANAGE)?,
+        c.insert(Object::Thread(high.thread), Rights::MANAGE)?,
+        c.insert(Object::Thread(low.thread), Rights::DUPLICATE)?,
+        c.insert(Object::Resource, Rights::DEBUG)?,
+        c.insert(Object::Resource, Rights::DEBUG)?,
+    ];
+    c.close(handles[4])?;
+    set_priority_cases(c, low.thread, handles)
+}
+
+fn set_priority_cases(
+    c: &Caller,
+    low: NonNull<Thread>,
+    handles: [Handle; 5],
+) -> Result<(), &'static str> {
+    let [to_low, to_high, no_manage, resource, closed] = handles.map(|h| h.0);
+    let n = Call::ThreadSetPriority.number();
+    let (rr, fifo) = (Policy::RoundRobin as u64, Policy::Fifo as u64);
+    for (priority, policy) in [(0, rr), (64, rr), (0x100 | 10, rr), (10, 2), (10, 1 << 32)] {
+        c.fails(n, &[to_low, priority, policy], Error::InvalidArgs)?;
+    }
+    c.fails(n, &[closed, 64, rr], Error::InvalidArgs)?;
+    c.fails(n, &[closed, 10, rr], Error::BadHandle)?;
+    c.fails(n, &[resource, 10, rr], Error::WrongType)?;
+    c.fails(n, &[no_manage, 10, rr], Error::AccessDenied)?;
+    // Above the ceiling of the target's process, 20, under the caller's.
+    c.fails(n, &[to_low, 21, rr], Error::AccessDenied)?;
+    // Under the ceiling of the target's process, 63, above the caller's.
+    c.fails(n, &[to_high, 31, rr], Error::AccessDenied)?;
+    c.succeeds(n, &[to_high, 30, rr], &[])?;
+    c.succeeds(n, &[to_low, 20, rr], &[])?;
+    // SAFETY: the thread is the test's and never runs.
+    let t = unsafe { low.as_ref() };
+    check(
+        t.base_priority == 20
+            && t.sched.priority() == 20
+            && t.sched.policy() == Policy::RoundRobin
+            && t.sched.state() == State::Stopped,
+        "a stopped thread did not take its new priority and policy",
+    )?;
+    // A thread that ended: BAD_STATE, which comes after the ceilings.
+    sched::start(low).map_err(|_| "the thread did not start")?;
+    // SAFETY: the test holds its own reference to the thread.
+    unsafe { sched::exit(low) };
+    c.fails(n, &[to_low, 21, fifo], Error::AccessDenied)?;
+    c.fails(n, &[to_low, 20, fifo], Error::BadState)
 }

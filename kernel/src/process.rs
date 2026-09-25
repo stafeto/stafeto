@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Processes (spec 4): an address space, the frames the process owns
-//! there, its handle table and its state, in objects from a kernel pool. A
-//! process lives while references to it are left: handles to it, its
-//! threads, and the one `create` hands out; the last `release` destroys it.
-//! Quotas and the priority ceiling come with the calls that need them.
+//! Processes (spec 4, 8): an address space, the frames the process owns
+//! there, its handle table, its priority ceiling and its state, in objects
+//! from a kernel pool. A process lives while references to it are left:
+//! handles to it, its threads, and the one `create` hands out; the last
+//! `release` destroys it. Quotas come with the calls that need them.
 
 use crate::mm::aspace::AddressSpace;
 use crate::mm::pages::KernelPages;
@@ -36,6 +36,8 @@ pub struct Process {
     /// Handles to the process, its threads, and the reference `create`
     /// hands out.
     refs: u32,
+    /// No thread of the process gets a base priority above it (spec 8).
+    ceiling: u8,
     state: ProcessState,
 }
 
@@ -148,6 +150,11 @@ impl Process {
         self.state
     }
 
+    /// The highest base priority a thread of the process may have.
+    pub fn ceiling(&self) -> u8 {
+        self.ceiling
+    }
+
     /// What `kind` makes of the object behind `h`, checked in the order of
     /// the system calls: BAD_HANDLE, WRONG_TYPE, then ACCESS_DENIED when
     /// the handle lacks `rights`.
@@ -161,10 +168,11 @@ impl Process {
     }
 }
 
-/// A process with an empty address space and an empty handle table for up
-/// to `handle_limit` handles; the caller gets its first reference.
-/// INVALID_ARGS for a limit above kcore::handles::MAX_HANDLES, NO_MEMORY
-/// when no frame is left for its root table or its pool.
+/// A process with an empty address space, an empty handle table for up to
+/// `handle_limit` handles and priority ceiling `ceiling`; the caller gets
+/// its first reference. INVALID_ARGS for a limit above
+/// kcore::handles::MAX_HANDLES or a ceiling outside 1-63, NO_MEMORY when
+/// no frame is left for its root table or its pool.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(
@@ -172,7 +180,8 @@ impl Process {
         reason = "init (milestone 1.2c) is the first process; so far only the kernel tests do"
     )
 )]
-pub fn create(handle_limit: u32) -> Result<NonNull<Process>, Error> {
+pub fn create(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error> {
+    let ceiling = kcore::sched::priority_arg(u64::from(ceiling))?;
     let handles = Handles::new(handle_limit).map_err(Error::from)?;
     let space = AddressSpace::new().map_err(|_| Error::NoMemory)?;
     let process = Process {
@@ -180,6 +189,7 @@ pub fn create(handle_limit: u32) -> Result<NonNull<Process>, Error> {
         frames: OwnedFrames([None; MAX_BLOCKS]),
         handles,
         refs: 1,
+        ceiling,
         state: ProcessState::Alive,
     };
     let allocated = PROCESSES.lock().alloc(&mut KernelPages, process);

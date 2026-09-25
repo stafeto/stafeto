@@ -13,6 +13,13 @@ use std::time::{Duration, Instant};
 /// Console on stdio, no window, no monitor: for runs whose output is parsed.
 pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monitor", "none"];
 
+/// Virtual time counts instructions, one per 2^4 ns, which at the 62.5 MHz
+/// of the counter is one per tick; with `sleep=off` it jumps to the next
+/// timer deadline while the CPU sleeps in `wfi`. Every run of a kernel
+/// then sees the same times, whatever the host does. An idle kernel with
+/// no deadline stops time and hangs.
+pub const ICOUNT: &[&str] = &["-icount", "shift=4,sleep=off"];
+
 /// A QEMU machine type with its options, and a CPU model.
 pub struct Machine {
     pub machine: &'static str,

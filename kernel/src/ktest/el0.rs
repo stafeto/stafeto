@@ -2,21 +2,24 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel tests at EL0. They run after all the others, one after another,
-//! as a chain: a test builds its processes and threads and returns to EL0,
-//! and since every entry from EL0 starts over at the top of the kernel
-//! stack, the kernel never comes back to the test's frame. A program ends
-//! with `svc #SVC_DONE`: the test judges the thread, prints its line and
-//! starts the next test; after the last one the run ends. The programs
-//! are in el0.S.
+//! as a chain: a test builds its processes and threads, the scheduler
+//! starts the threads and the kernel leaves for EL0 through
+//! sched::resume; since every entry from EL0 starts over at the top of
+//! the kernel stack, the kernel never comes back to the test's frame. A
+//! program ends with `svc #SVC_DONE`: the test judges the thread, which
+//! leaves the scheduler; once every thread of the test has passed, or one
+//! has failed, the test prints its line and the next one starts. After
+//! the last one the run ends. The programs are in el0.S.
 
 use super::{check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::arch::{cache, gic, symbols, timer};
 use crate::object::Object;
 use crate::process::{self, Process};
+use crate::sched;
 use crate::syscall::{self, Values};
 use crate::thread::{self, Policy, Thread};
-use abi::{Call, Error, INFO_PROCESS_STATE, ProcessState, Rights};
+use abi::{Call, Error, Handle, INFO_PROCESS_STATE, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::esr;
 use kcore::frames::PAGE_SIZE;
@@ -36,6 +39,12 @@ unsafe extern "C" {
     static el0_pattern_loop: u8;
     static el0_wait_loop: u8;
     static el0_pattern_yield: u8;
+    static el0_mark: u8;
+    static el0_count_until: u8;
+    static el0_spin_then_yield: u8;
+    static el0_set_priority: u8;
+    static el0_set_priority_after_peer: u8;
+    static el0_alternate: u8;
     static el0_load: u8;
     static el0_done_at_once: u8;
     static el0_pattern_close: u8;
@@ -45,17 +54,17 @@ unsafe extern "C" {
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
 /// builds only (el0.S uses them too). NOP returns 0 in x0; DONE ends the
-/// program; YIELD returns 0 in x0 and runs the test's other thread, if
-/// there is one.
+/// program.
 pub const SVC_NOP: u16 = 0xFF00;
 pub const SVC_DONE: u16 = 0xFF01;
-pub const SVC_YIELD: u16 = 0xFF02;
 
-const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_YIELD <= *abi::TEST_CALLS.end());
+const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_DONE <= *abi::TEST_CALLS.end());
 
 // el0.S makes these calls by number.
 const _: () = assert!(
     Call::HandleClose.number() == 1
+        && Call::ThreadSetPriority.number() == 18
+        && Call::Yield.number() == 19
         && Call::ObjectInfo.number() == 27
         && Call::DebugWrite.number() == 28
 );
@@ -71,11 +80,17 @@ const DATA_VA: usize = 0x80_0000;
 const PAGE: usize = PAGE_SIZE as usize;
 const PRIORITY: u8 = 10;
 const HANDLE_LIMIT: u32 = 16;
+const CEILING: u8 = 63;
+/// Threads a test may have.
+const SLOTS: usize = 3;
+/// Switches each thread of `rr_threads_alternate_by_quantum` waits for.
+const SWITCHES: u64 = 3;
 
 struct El0Test {
     name: &'static str,
-    /// Builds the test's threads; returns the one to run first.
-    start: fn(&mut Fixture) -> Result<NonNull<Thread>, &'static str>,
+    /// Builds the test's threads, which the scheduler then starts in the
+    /// order of their slots.
+    start: fn(&mut Fixture) -> Result<(), &'static str>,
     /// Judges a thread at its `svc #SVC_DONE`.
     done: fn(&Fixture, &Thread) -> Result<(), &'static str>,
 }
@@ -136,17 +151,105 @@ const EL0_TESTS: &[El0Test] = &[
         start: start_closed_handle,
         done: done_closed_handle,
     },
+    El0Test {
+        name: "idle_waits_for_the_timer",
+        start: start_idle,
+        done: done_idle,
+    },
+    El0Test {
+        name: "fifo_thread_runs_with_the_timer_off",
+        start: start_timer_off,
+        done: done_timer_off,
+    },
+    El0Test {
+        name: "fifo_threads_do_not_alternate",
+        start: start_fifo_pair,
+        done: done_fifo_pair,
+    },
+    El0Test {
+        name: "yield_does_not_let_lower_levels_run",
+        start: start_yield_alone,
+        done: done_yield_alone,
+    },
+    El0Test {
+        name: "lowering_itself_lets_higher_threads_run",
+        start: start_lowering,
+        done: done_lowering,
+    },
+    El0Test {
+        name: "raising_a_ready_thread_preempts",
+        start: start_raising,
+        done: done_raising,
+    },
+    El0Test {
+        name: "preempted_thread_is_at_the_head",
+        start: start_head,
+        done: done_head,
+    },
+    El0Test {
+        name: "rr_threads_alternate_by_quantum",
+        start: start_alternate,
+        done: done_alternate,
+    },
 ];
 
-/// What the running test built and expects: up to two processes with one
-/// thread each.
+/// Tests whose outcome depends on how much of a quantum is left when
+/// something happens. Only a run under `-icount`, where virtual time counts
+/// instructions and a stall of the host does not eat into a quantum, makes
+/// them repeatable: the `icount` build, which xtask runs that way, adds
+/// them after the others.
+const ICOUNT_TESTS: &[El0Test] = &[
+    El0Test {
+        name: "lone_round_robin_thread_is_not_switched",
+        start: start_lone,
+        done: done_lone,
+    },
+    El0Test {
+        name: "preempted_rr_thread_resumes_before_its_peer",
+        start: start_rest,
+        done: done_rest,
+    },
+];
+
+/// The tests of this build, in the order they run.
+fn tests() -> impl Iterator<Item = &'static El0Test> {
+    let icount: &[El0Test] = if cfg!(feature = "icount") {
+        ICOUNT_TESTS
+    } else {
+        &[]
+    };
+    EL0_TESTS.iter().chain(icount)
+}
+
+fn test(i: usize) -> &'static El0Test {
+    tests().nth(i).expect("a test of this build")
+}
+
+/// What the running test built and expects: up to SLOTS threads, each in
+/// its own process or all in the one of slot 0.
 struct Fixture {
     test: usize,
-    processes: [Option<NonNull<Process>>; 2],
-    threads: [Option<NonNull<Thread>>; 2],
+    processes: [Option<NonNull<Process>>; SLOTS],
+    threads: [Option<NonNull<Thread>>; SLOTS],
     /// Threads that passed their `svc #SVC_DONE`.
-    passed: [bool; 2],
-    patterns: [Pattern; 2],
+    passed: [bool; SLOTS],
+    patterns: [Pattern; SLOTS],
+    /// Handles to threads the test put in its processes' tables. A handle
+    /// to a thread of its own process would keep both alive; the teardown
+    /// closes them first.
+    handles: [Option<(NonNull<Process>, Handle)>; SLOTS],
+    /// The physical address of the page whose words the threads of a
+    /// scheduling test share (sched_process).
+    data: u64,
+    /// The thread in slot 0 starts only at this counter value, from the
+    /// timer's interrupt (timer_fired).
+    wake: Option<u64>,
+    /// CNTV_CVAL_EL0 when that interrupt came.
+    fired_at: Option<u64>,
+    /// sched::idle_ticks when the test began.
+    idle: u64,
+    /// How far below the top of the kernel stack the idle loop began.
+    idle_depth: Option<usize>,
     /// The counter before the thread started.
     counter: u64,
     /// A kernel address the program loads from and must fault on.
@@ -169,10 +272,16 @@ impl Fixture {
     const fn new(test: usize) -> Fixture {
         Fixture {
             test,
-            processes: [None; 2],
-            threads: [None; 2],
-            passed: [false; 2],
-            patterns: [Pattern::ZERO; 2],
+            processes: [None; SLOTS],
+            threads: [None; SLOTS],
+            passed: [false; SLOTS],
+            patterns: [Pattern::ZERO; SLOTS],
+            handles: [None; SLOTS],
+            data: 0,
+            wake: None,
+            fired_at: None,
+            idle: 0,
+            idle_depth: None,
             counter: 0,
             fault_at: None,
             stack: None,
@@ -198,52 +307,78 @@ pub fn run() -> ! {
     start(0)
 }
 
-/// How many TEST lines the EL0 tests print.
+/// How many TEST lines the EL0 tests print: one per test of this build,
+/// and el0_tests_return_their_objects.
 pub fn count() -> usize {
-    EL0_TESTS.len()
+    tests().count() + 1
 }
 
-/// Starts the tests from `first` on; a test that cannot start fails, and
-/// the next one starts.
+/// Starts the tests from `first` on: the scheduler starts each test's
+/// threads, but the one that waits for its wake-up, and runs them. A test
+/// that cannot start fails, and the next one starts. After the last test
+/// the pools hold no process and no thread: the kernel's references and
+/// the tests' own went.
 fn start(first: usize) -> ! {
-    for (i, test) in EL0_TESTS.iter().enumerate().skip(first) {
+    for (i, test) in tests().enumerate().skip(first) {
         let started = {
             let mut f = FIXTURE.lock();
             *f = Fixture::new(i);
-            (test.start)(&mut f)
+            (test.start)(&mut f).map(|()| (f.threads, f.wake.is_some()))
         };
         match started {
-            Ok(thread) => thread::run(thread),
+            Ok((threads, wake)) => {
+                for t in threads.into_iter().skip(usize::from(wake)).flatten() {
+                    sched::start(t).expect("a new thread starts");
+                }
+                sched::resume()
+            }
             Err(why) => {
                 report(test.name, Err(why));
                 teardown();
             }
         }
     }
+    report(
+        "el0_tests_return_their_objects",
+        check(
+            process::in_use() == 0 && thread::in_use() == 0,
+            "a process or a thread of the EL0 tests stayed in its pool",
+        ),
+    );
     finish()
 }
 
 /// Ends the running test with `result` and starts the next one.
 fn end(result: Result<(), &'static str>) -> ! {
-    let test = FIXTURE.lock().test;
-    report(EL0_TESTS[test].name, result);
+    let i = FIXTURE.lock().test;
+    report(test(i).name, result);
     teardown();
-    start(test + 1)
+    start(i + 1)
 }
 
+/// Drops what the test built. The timer stays the scheduler's: the next
+/// decision arms it for the next test.
 fn teardown() {
-    timer::disarm();
-    let (threads, processes) = {
+    let (handles, threads, processes) = {
         let mut f = FIXTURE.lock();
         (
+            core::mem::take(&mut f.handles),
             core::mem::take(&mut f.threads),
             core::mem::take(&mut f.processes),
         )
     };
+    for (p, h) in handles.into_iter().flatten() {
+        // A handle the test closed itself is bad by now, which is fine.
+        let _ = process::close_handle(p, h);
+    }
     for t in threads.into_iter().flatten() {
-        // SAFETY: the test's references go with it; a thread that runs
-        // stops being the running one.
-        unsafe { thread::release(t) };
+        // SAFETY: the test's references go with it; the thread leaves the
+        // scheduler first, and a thread that runs stops being the running
+        // one.
+        unsafe {
+            sched::exit(t);
+            thread::release(t);
+        }
     }
     for p in processes.into_iter().flatten() {
         // SAFETY: as above; the threads released their references first.
@@ -257,43 +392,46 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
     match number {
         SVC_NOP => syscall::set_result(thread, Ok(Values::NONE)),
         SVC_DONE => done(thread),
-        SVC_YIELD => yield_to_other(thread),
         _ => return false,
     }
     true
 }
 
-/// Runs the test's other thread; returns when there is none.
-fn yield_to_other(thread: NonNull<Thread>) {
-    syscall::set_result(thread, Ok(Values::NONE));
-    let other = {
-        let f = FIXTURE.lock();
-        // SAFETY: the running thread is alive.
-        let slot = f.slot(unsafe { thread.as_ref() });
-        f.threads[1 - slot]
+/// The timer's interrupt, after the scheduler's part (interrupt::handle).
+/// In the interrupt test the thread waits for it in a loop, and the kernel
+/// moves the thread past the loop; one that comes before the thread
+/// reaches the loop leaves it be, and the next quantum brings another. At
+/// the running test's wake-up the thread in slot 0 starts.
+pub fn timer_fired() {
+    let wake = {
+        let mut f = FIXTURE.lock();
+        f.interrupts += 1;
+        if let Some(mut thread) = thread::current() {
+            // SAFETY: the thread is alive, and nothing else refers to it now.
+            let regs = unsafe { &mut thread.as_mut().regs };
+            if regs.elr == user_address(&raw const el0_wait_loop) as u64 {
+                regs.elr += 4;
+                f.left_loop = true;
+            }
+        }
+        match f.wake {
+            Some(at) if timer::now() >= at => {
+                f.wake = None;
+                f.fired_at = Some(timer::cval());
+                f.threads[0]
+            }
+            _ => None,
+        }
     };
-    if let Some(other) = other {
-        thread::run(other)
+    if let Some(t) = wake {
+        sched::start(t).expect("the waking thread starts");
     }
 }
 
-/// The timer's interrupt at EL0. In the interrupt test the thread waits for
-/// it in a loop, and the kernel moves the thread past the loop; one that
-/// comes before the thread reaches the loop arms the timer again.
-pub fn timer_fired() {
-    let Some(mut thread) = thread::current() else {
-        return;
-    };
-    let mut f = FIXTURE.lock();
-    f.interrupts += 1;
-    // SAFETY: the running thread is alive, and nothing else refers to it now.
-    let regs = unsafe { &mut thread.as_mut().regs };
-    if regs.elr == user_address(&raw const el0_wait_loop) as u64 {
-        regs.elr += 4;
-        f.left_loop = true;
-    } else {
-        timer::arm(timer::clock().deadline_after(timer::now(), 100_000));
-    }
+/// The running test's wake-up, which the scheduler's timer serves as well
+/// (sched::decide).
+pub fn deadline() -> Option<u64> {
+    FIXTURE.lock().wake
 }
 
 /// Every entry from EL0 starts at the top of the kernel stack (spec 8.1),
@@ -310,10 +448,22 @@ fn note_stack() {
     f.stack_ok &= sp == first && top - sp < PAGE;
 }
 
-/// A thread's `svc #SVC_DONE`: the test judges it; once every thread of the
-/// test has passed, the test ends, else the next of them runs.
+/// The idle loop starts on the empty kernel stack (arch::on_empty_stack),
+/// however deep the path that found nothing to run.
+pub fn note_idle_stack() {
+    let sp: usize;
+    // SAFETY: reading SP has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags))
+    };
+    FIXTURE.lock().idle_depth = Some(symbols::boot_stack().end - sp);
+}
+
+/// A thread's `svc #SVC_DONE`: the test judges it. Once every thread of
+/// the test has passed, or this one failed, the test ends; else the thread
+/// leaves the scheduler, and the scheduler runs the next.
 fn done(thread: NonNull<Thread>) -> ! {
-    let (result, next) = {
+    let (result, all) = {
         let mut f = FIXTURE.lock();
         // SAFETY: the running thread is alive; nothing changes it meanwhile.
         let t = unsafe { thread.as_ref() };
@@ -321,15 +471,19 @@ fn done(thread: NonNull<Thread>) -> ! {
             f.stack_ok,
             "an entry from EL0 did not start at the top of the kernel stack",
         )
-        .and_then(|()| (EL0_TESTS[f.test].done)(&f, t));
+        .and_then(|()| (test(f.test).done)(&f, t));
         let slot = f.slot(t);
         f.passed[slot] = result.is_ok();
-        let next = (0..2).find(|&i| f.threads[i].is_some() && !f.passed[i]);
-        (result, next.and_then(|i| f.threads[i]))
+        let all = (0..SLOTS).all(|i| f.threads[i].is_none() || f.passed[i]);
+        (result, all)
     };
-    match (result, next) {
-        (Ok(()), Some(next)) => thread::run(next),
-        (result, _) => end(result),
+    match result {
+        Ok(()) if !all => {
+            // SAFETY: the test still holds its own reference to the thread.
+            unsafe { sched::exit(thread) };
+            sched::resume()
+        }
+        result => end(result),
     }
 }
 
@@ -381,7 +535,7 @@ fn spawn(
 
 /// A process with the programs at TEXT_VA, in slot `slot` of the fixture.
 fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'static str> {
-    let mut p = process::create(HANDLE_LIMIT).map_err(|_| "no process")?;
+    let mut p = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no process")?;
     f.processes[slot] = Some(p);
     // SAFETY: the process was just created, and only this test uses it.
     let text = unsafe { p.as_mut() }
@@ -403,7 +557,8 @@ fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'stati
 /// A data page at `data_va` in process `p` holding the pattern of slot
 /// `slot`, and a thread of `p` in that slot of the fixture that starts at
 /// `entry` (a symbol in el0.S) with `arg` in x0, its stack at the end of
-/// the page and the pattern's TPIDRRO_EL0.
+/// the page and the pattern's TPIDRRO_EL0. The thread is FIFO: the timer
+/// stays out of its way.
 fn new_thread(
     f: &mut Fixture,
     slot: usize,
@@ -425,7 +580,7 @@ fn new_thread(
         data_va + PAGE,
         arg,
         PRIORITY,
-        Policy::RoundRobin,
+        Policy::Fifo,
     )
     .map_err(|_| "no thread")?;
     f.threads[slot] = Some(t);
@@ -536,9 +691,10 @@ fn check_pattern(regs: &UserRegs, p: &Pattern, results: &[u64]) -> Result<(), &'
     check(fp.fpsr == p.fpsr, "FPSR changed")
 }
 
-fn start_counter(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_counter(f: &mut Fixture) -> Result<(), &'static str> {
     f.counter = timer::now();
-    spawn(f, 0, &raw const el0_read_counter, 0)
+    spawn(f, 0, &raw const el0_read_counter, 0)?;
+    Ok(())
 }
 
 fn done_counter(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -553,18 +709,20 @@ fn done_counter(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-fn start_nop(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_nop(f: &mut Fixture) -> Result<(), &'static str> {
     f.patterns[0] = Pattern::new(1);
-    spawn(f, 0, &raw const el0_pattern_nop, DATA_VA as u64)
+    spawn(f, 0, &raw const el0_pattern_nop, DATA_VA as u64)?;
+    Ok(())
 }
 
 fn done_nop(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check_pattern(&t.regs, &f.patterns[0], &[0])
 }
 
-fn start_unknown(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_unknown(f: &mut Fixture) -> Result<(), &'static str> {
     f.patterns[0] = Pattern::new(1);
-    spawn(f, 0, &raw const el0_pattern_unknown, DATA_VA as u64)
+    spawn(f, 0, &raw const el0_pattern_unknown, DATA_VA as u64)?;
+    Ok(())
 }
 
 fn done_unknown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -572,22 +730,23 @@ fn done_unknown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 /// The program loads from FIXTURE itself, a kernel variable.
-fn start_kernel_load(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_kernel_load(f: &mut Fixture) -> Result<(), &'static str> {
     let target = &raw const FIXTURE as u64;
     f.fault_at = Some(target);
-    spawn(f, 0, &raw const el0_load, target)
+    spawn(f, 0, &raw const el0_load, target)?;
+    Ok(())
 }
 
 fn done_kernel_load(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
     Err("a load from kernel memory at EL0 did not fault")
 }
 
-/// The timer fires 1 ms after the start, while the program loops at EL0.
-fn start_interrupt(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+/// The end of the thread's quantum brings the timer's interrupt while the
+/// program loops at EL0: the thread is round robin, alone at its level.
+fn start_interrupt(f: &mut Fixture) -> Result<(), &'static str> {
     f.patterns[0] = Pattern::new(1);
     let t = spawn(f, 0, &raw const el0_pattern_loop, DATA_VA as u64)?;
-    timer::arm(timer::clock().deadline_after(timer::now(), 1_000_000));
-    Ok(t)
+    sched::set_priority(t, PRIORITY, Policy::RoundRobin).map_err(|_| "no round robin")
 }
 
 fn done_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -605,11 +764,12 @@ fn done_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 
 /// Two processes run the same program with different patterns; each yields
 /// to the other once, and each checks its registers when it runs again.
-fn start_switch(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
-    f.patterns = [Pattern::new(1), Pattern::new(2)];
-    let first = spawn(f, 0, &raw const el0_pattern_yield, DATA_VA as u64)?;
+fn start_switch(f: &mut Fixture) -> Result<(), &'static str> {
+    f.patterns[0] = Pattern::new(1);
+    f.patterns[1] = Pattern::new(2);
+    spawn(f, 0, &raw const el0_pattern_yield, DATA_VA as u64)?;
     spawn(f, 1, &raw const el0_pattern_yield, DATA_VA as u64)?;
-    Ok(first)
+    Ok(())
 }
 
 fn done_switch(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -619,12 +779,13 @@ fn done_switch(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// Two threads of one process run the same program, each with its own
 /// pattern in its own data page, and yield to each other once: the switch
 /// between them changes the FP and SIMD registers and leaves TTBR0 alone.
-fn start_switch_within(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_switch_within(f: &mut Fixture) -> Result<(), &'static str> {
     const SECOND: usize = DATA_VA + 2 * PAGE;
-    f.patterns = [Pattern::new(1), Pattern::new(2)];
+    f.patterns[0] = Pattern::new(1);
+    f.patterns[1] = Pattern::new(2);
     f.patterns[1].sp += 2 * PAGE as u64;
     let p = new_process(f, 0)?;
-    let first = new_thread(
+    new_thread(
         f,
         0,
         p,
@@ -633,13 +794,14 @@ fn start_switch_within(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str>
         DATA_VA as u64,
     )?;
     new_thread(f, 1, p, SECOND, &raw const el0_pattern_yield, SECOND as u64)?;
-    Ok(first)
+    Ok(())
 }
 
 /// Runs after the pattern tests: their threads are gone, and the last
 /// pattern is still in the FP and SIMD registers.
-fn start_clear_fp(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
-    spawn(f, 0, &raw const el0_done_at_once, 0)
+fn start_clear_fp(f: &mut Fixture) -> Result<(), &'static str> {
+    spawn(f, 0, &raw const el0_done_at_once, 0)?;
+    Ok(())
 }
 
 fn done_clear_fp(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
@@ -670,7 +832,7 @@ fn give(p: NonNull<Process>, object: Object, rights: Rights) -> Result<u64, &'st
 }
 
 /// The program writes EL0_LINE through a handle to the system resource.
-fn start_debug_write(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_debug_write(f: &mut Fixture) -> Result<(), &'static str> {
     let p = new_process(f, 0)?;
     let h = give(p, Object::Resource, Rights::DEBUG)?;
     let mut args = [0; 10];
@@ -685,7 +847,8 @@ fn start_debug_write(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
         DATA_VA,
         &raw const el0_pattern_debug_write,
         DATA_VA as u64,
-    )
+    )?;
+    Ok(())
 }
 
 fn done_debug_write(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -694,7 +857,7 @@ fn done_debug_write(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 
 /// The program asks for the state of another process, which lives: four
 /// values in x1-x4.
-fn start_object_info(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_object_info(f: &mut Fixture) -> Result<(), &'static str> {
     let p = new_process(f, 0)?;
     let other = new_process(f, 1)?;
     let h = give(p, Object::Process(other), Rights::NONE)?;
@@ -706,7 +869,8 @@ fn start_object_info(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
         DATA_VA,
         &raw const el0_pattern_object_info,
         DATA_VA as u64,
-    )
+    )?;
+    Ok(())
 }
 
 fn done_object_info(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -716,7 +880,7 @@ fn done_object_info(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 
 /// The program closes a handle that is closed already: BAD_HANDLE in x0,
 /// every other register as the pattern left it.
-fn start_closed_handle(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str> {
+fn start_closed_handle(f: &mut Fixture) -> Result<(), &'static str> {
     let p = new_process(f, 0)?;
     let h = give(p, Object::Resource, Rights::DEBUG)?;
     process::close_handle(p, abi::Handle(h)).map_err(|_| "the handle did not close")?;
@@ -728,9 +892,346 @@ fn start_closed_handle(f: &mut Fixture) -> Result<NonNull<Thread>, &'static str>
         DATA_VA,
         &raw const el0_pattern_close,
         DATA_VA as u64,
-    )
+    )?;
+    Ok(())
 }
 
 fn done_closed_handle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check_pattern(&t.regs, &f.patterns[0], &[Error::BadHandle as u64])
+}
+
+// Scheduling tests. The threads of each share the process in slot 0 and
+// the words of its data page; their programs take their arguments in x0
+// and up.
+
+const FIFO: Policy = Policy::Fifo;
+const RR: Policy = Policy::RoundRobin;
+
+/// The quantum in counter ticks, as abi::RR_QUANTUM_NS fixes it.
+fn quantum() -> u64 {
+    timer::clock().ns_to_ticks(abi::RR_QUANTUM_NS)
+}
+
+/// The address the programs see word `i` of the shared page at.
+fn word(i: usize) -> u64 {
+    (DATA_VA + 8 * i) as u64
+}
+
+/// Word `i` of the shared page, read through the linear map.
+fn shared(f: &Fixture, i: usize) -> u64 {
+    // SAFETY: the page belongs to the test's process, and the linear map
+    // reaches it; the programs write it, so the read is volatile.
+    unsafe {
+        ((LINEAR_BASE + f.data as usize) as *const u64)
+            .add(i)
+            .read_volatile()
+    }
+}
+
+/// The process of a scheduling test, in slot 0, with the page of shared
+/// words at DATA_VA.
+fn sched_process(f: &mut Fixture) -> Result<(), &'static str> {
+    let mut p = new_process(f, 0)?;
+    // SAFETY: the process belongs to this test, and nothing else uses it.
+    f.data = unsafe { p.as_mut() }
+        .map_frames(DATA_VA, PAGE_SIZE, Attrs::USER_DATA)
+        .map_err(|_| "the shared page did not map")?;
+    Ok(())
+}
+
+/// A thread of the test's process in slot `slot` that starts at `entry`
+/// (a symbol in el0.S) at `priority` under `policy`. The programs use no
+/// stack.
+fn sched_thread(
+    f: &mut Fixture,
+    slot: usize,
+    entry: *const u8,
+    priority: u8,
+    policy: Policy,
+) -> Result<NonNull<Thread>, &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let t = thread::create(p, user_address(entry), DATA_VA + PAGE, 0, priority, policy)
+        .map_err(|_| "no thread")?;
+    f.threads[slot] = Some(t);
+    Ok(t)
+}
+
+/// Puts `args` in x0 and up of a thread that has not run.
+fn set_args(mut t: NonNull<Thread>, args: &[u64]) {
+    // SAFETY: the thread belongs to the test and does not run yet.
+    unsafe { t.as_mut() }.regs.x[..args.len()].copy_from_slice(args);
+}
+
+/// A handle with MANAGE to thread `t` in the test's process; the teardown
+/// closes it.
+fn give_thread(f: &mut Fixture, t: NonNull<Thread>) -> Result<u64, &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let h = process::insert_handle(p, Object::Thread(t), Rights::MANAGE)
+        .map_err(|_| "a handle did not go in")?;
+    let slot = f
+        .handles
+        .iter()
+        .position(Option::is_none)
+        .expect("room for a handle");
+    f.handles[slot] = Some((p, h));
+    Ok(h.0)
+}
+
+/// The thread in slot 0 starts 1 ms from now, when the timer's interrupt
+/// comes; nothing else is ready meanwhile, so the kernel idles.
+fn start_idle(f: &mut Fixture) -> Result<(), &'static str> {
+    spawn(f, 0, &raw const el0_read_counter, 0)?;
+    f.idle = sched::idle_ticks();
+    f.counter = timer::clock().deadline_after(timer::now(), 1_000_000);
+    f.wake = Some(f.counter);
+    Ok(())
+}
+
+fn done_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        f.fired_at == Some(f.counter),
+        "the idle kernel did not arm the timer for the deadline",
+    )?;
+    check(
+        t.regs.x[0] >= f.counter,
+        "the thread ran before its deadline",
+    )?;
+    check(
+        sched::idle_ticks() > f.idle,
+        "the kernel did not sleep in its idle loop",
+    )?;
+    check(
+        f.idle_depth.is_some_and(|d| d <= 256),
+        "the idle loop did not start at the top of the kernel stack",
+    )
+}
+
+/// A FIFO thread spins for two quanta and yields: no timer interrupt comes,
+/// and the timer is off while the thread runs.
+fn start_timer_off(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let t = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, FIFO)?;
+    set_args(t, &[word(0), 2 * quantum()]);
+    Ok(())
+}
+
+fn done_timer_off(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        f.interrupts == 0,
+        "a timer interrupt came while a FIFO thread ran",
+    )?;
+    check(
+        !timer::enabled(),
+        "the timer is on while a FIFO thread runs",
+    )?;
+    check(t.regs.x[0] == 0, "yield failed")
+}
+
+/// Two FIFO threads at one level. The first spins for three quanta while
+/// the second, ready all along, does not run; then the first yields, and
+/// the second runs before the yield returns.
+fn start_fifo_pair(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spin = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, FIFO)?;
+    let mark = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    set_args(spin, &[word(0), 3 * quantum()]);
+    set_args(mark, &[word(0)]);
+    Ok(())
+}
+
+fn done_fifo_pair(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) != 0 {
+        return Ok(());
+    }
+    check(x[3] == 0, "a FIFO thread let its peer run without yield")?;
+    check(
+        x[0] == 0 && x[4] == 1,
+        "the peer did not run when the FIFO thread yielded",
+    )
+}
+
+/// A thread alone at its level yields while a thread below it is ready:
+/// the yield returns at once, and the lower thread does not run.
+fn start_yield_alone(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spin = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, FIFO)?;
+    let low = sched_thread(f, 1, &raw const el0_mark, PRIORITY - 5, FIFO)?;
+    set_args(spin, &[word(0), 0]);
+    set_args(low, &[word(0)]);
+    Ok(())
+}
+
+fn done_yield_alone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(
+        f.slot(t) != 0 || (x[0] == 0 && x[3] == 0 && x[4] == 0),
+        "yield let a lower thread run",
+    )
+}
+
+/// A thread lowers itself below a ready thread: that thread runs before
+/// the call returns, and the caller keeps its new priority.
+fn start_lowering(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let me = sched_thread(f, 0, &raw const el0_set_priority, PRIORITY + 10, FIFO)?;
+    let other = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    let h = give_thread(f, me)?;
+    set_args(me, &[h, u64::from(PRIORITY - 5), FIFO as u64, word(0)]);
+    set_args(other, &[word(0)]);
+    Ok(())
+}
+
+fn done_lowering(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) != 0 {
+        return Ok(());
+    }
+    check(x[0] == 0, "thread_set_priority failed")?;
+    check(
+        x[4] == 0 && x[5] == 1,
+        "the higher thread did not run before the call returned",
+    )?;
+    check(
+        t.base_priority == PRIORITY - 5 && t.sched.priority() == PRIORITY - 5,
+        "the thread did not keep its new priority",
+    )
+}
+
+/// A thread raises a ready thread above itself: that thread runs before
+/// the call returns.
+fn start_raising(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let me = sched_thread(f, 0, &raw const el0_set_priority, PRIORITY, FIFO)?;
+    let other = sched_thread(f, 1, &raw const el0_mark, PRIORITY - 5, FIFO)?;
+    let h = give_thread(f, other)?;
+    set_args(me, &[h, u64::from(PRIORITY + 10), FIFO as u64, word(0)]);
+    set_args(other, &[word(0)]);
+    Ok(())
+}
+
+fn done_raising(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) != 0 {
+        return Ok(());
+    }
+    check(x[0] == 0, "thread_set_priority failed")?;
+    check(
+        x[4] == 0 && x[5] == 1,
+        "the raised thread did not run before the call returned",
+    )
+}
+
+/// Three FIFO threads: the first and its peer at one level, a third below.
+/// The first raises the third above itself and is preempted: it goes back
+/// to the head of its level, and runs again before its peer.
+fn start_head(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let me = sched_thread(f, 0, &raw const el0_set_priority, PRIORITY, FIFO)?;
+    let peer = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    let high = sched_thread(f, 2, &raw const el0_mark, PRIORITY - 5, FIFO)?;
+    let h = give_thread(f, high)?;
+    set_args(me, &[h, u64::from(PRIORITY + 10), FIFO as u64, word(1)]);
+    set_args(peer, &[word(1)]);
+    set_args(high, &[word(2)]);
+    Ok(())
+}
+
+fn done_head(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            t.regs.x[0] == 0 && t.regs.x[5] == 0,
+            "the peer ran before the preempted thread",
+        ),
+        // The raised thread: the kernel has the preempted one first.
+        2 => check(
+            sched::first(PRIORITY) == f.threads[0],
+            "the preempted thread is not at the head of its level",
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Two round-robin threads at one level spin without a system call. Each
+/// sees the other run three times between two turns of its loop, and each
+/// time the stretch between those turns, which holds the other's whole
+/// run, is at least a quantum long: the timer does not fire before its
+/// compare value.
+fn start_alternate(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let a = sched_thread(f, 0, &raw const el0_alternate, PRIORITY, RR)?;
+    let b = sched_thread(f, 1, &raw const el0_alternate, PRIORITY, RR)?;
+    set_args(a, &[word(0), word(2), SWITCHES]);
+    set_args(b, &[word(2), word(0), SWITCHES]);
+    Ok(())
+}
+
+fn done_alternate(_: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(
+        x[4] == SWITCHES,
+        "a round-robin thread did not see its peer run",
+    )?;
+    check(
+        x[3] >= quantum(),
+        "a round-robin thread ran for less than a quantum",
+    )
+}
+
+/// A round-robin thread alone at its level spins for three quanta: at
+/// least two quanta end, each gives the thread a new one, and the FIFO
+/// thread below it never runs.
+fn start_lone(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let spin = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, RR)?;
+    let low = sched_thread(f, 1, &raw const el0_mark, PRIORITY - 5, FIFO)?;
+    set_args(spin, &[word(0), 3 * quantum()]);
+    set_args(low, &[word(0)]);
+    Ok(())
+}
+
+fn done_lone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) != 0 {
+        return Ok(());
+    }
+    check(f.interrupts >= 2, "fewer than two quanta ended in three")?;
+    check(
+        x[3] == 0 && x[4] == 0,
+        "the end of a quantum let a lower thread run",
+    )
+}
+
+/// Two round-robin threads at one level and a FIFO thread below. The first
+/// waits for its peer to run, which is after its own quantum ends; it goes
+/// on with a new quantum after the peer's, raises the FIFO thread above
+/// itself and is preempted with nearly all that quantum left. It goes back
+/// to the head of its level and uses up the quantum before its peer runs
+/// again.
+fn start_rest(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let me = sched_thread(f, 0, &raw const el0_set_priority_after_peer, PRIORITY, RR)?;
+    let peer = sched_thread(f, 1, &raw const el0_count_until, PRIORITY, RR)?;
+    let high = sched_thread(f, 2, &raw const el0_mark, PRIORITY - 5, FIFO)?;
+    let h = give_thread(f, high)?;
+    let (count, stop) = (word(0), word(1));
+    let raise = u64::from(PRIORITY + 10);
+    set_args(me, &[h, raise, FIFO as u64, count, 0, 0, stop]);
+    set_args(peer, &[count, stop]);
+    set_args(high, &[word(2)]);
+    Ok(())
+}
+
+fn done_rest(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            t.regs.x[0] == 0 && t.regs.x[4] == t.regs.x[5],
+            "the peer ran before the preempted thread had used up its quantum",
+        ),
+        2 => check(
+            sched::first(PRIORITY) == f.threads[0],
+            "the preempted thread is not at the head of its level",
+        ),
+        _ => check(shared(f, 1) == 1, "the peer ended before it was let"),
+    }
 }

@@ -41,13 +41,6 @@ impl Object {
     }
 
     /// The thread, for a lookup that needs one.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "thread_start and thread_set_priority (milestone 1.2c) look threads up; so far only the kernel tests do"
-        )
-    )]
     pub fn thread(&self) -> Option<NonNull<Thread>> {
         match *self {
             Object::Thread(t) => Some(t),

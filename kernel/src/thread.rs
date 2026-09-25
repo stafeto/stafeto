@@ -6,14 +6,16 @@
 //! pool. The registers come first, so TPIDR_EL1, which points at the
 //! running thread, points at them too (vectors.S). The running thread is the
 //! one TPIDR_EL1 names; the kernel stack holds nothing of it. A thread
-//! lives while references to it are left, handles and the one `create`
-//! hands out, and holds a reference to its process.
+//! lives while references to it are left: handles, the one `create` hands
+//! out, and the kernel's while the scheduler holds the thread; it holds a
+//! reference to its process.
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::mm::pages::KernelPages;
 use crate::process::{self, Process};
 use abi::Error;
 use core::ptr::NonNull;
+use kcore::sched::{Node, Schedulable, State};
 use kcore::slab::Pool;
 use kcore::sync::Lock;
 pub use kcore::thread::Policy;
@@ -24,9 +26,14 @@ pub struct Thread {
     pub regs: UserRegs,
     /// Saved while the thread does not run.
     pub fp: FpRegs,
-    /// Stored for the scheduler of milestone 1.2c.
-    pub priority: u8,
-    pub policy: Policy,
+    /// The priority `create` or thread_set_priority gave. The effective
+    /// one, which picks the level, is in `sched`; the two differ from
+    /// milestone 1.3 on, while a service works for a request (spec 6.6).
+    pub base_priority: u8,
+    /// What the scheduler keeps in the thread: the effective priority, the
+    /// policy, the state, the rest of a quantum and the links of the ready
+    /// list. Only the scheduler changes it (sched).
+    pub sched: Node<Thread>,
     process: NonNull<Process>,
     /// Handles to the thread and the reference `create` hands out.
     refs: u32,
@@ -38,6 +45,14 @@ const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
 // CPU, interrupts masked inside the kernel, the pool behind a lock.
 unsafe impl Send for Thread {}
 
+// SAFETY: the node is a field of the thread and lives as long as it does.
+unsafe impl Schedulable for Thread {
+    fn node(this: NonNull<Thread>) -> NonNull<Node<Thread>> {
+        // SAFETY: `this` points at a live thread.
+        unsafe { NonNull::new_unchecked(&raw mut (*this.as_ptr()).sched) }
+    }
+}
+
 static THREADS: Lock<Pool<Thread>> = Lock::new(Pool::new());
 
 impl Thread {
@@ -47,11 +62,12 @@ impl Thread {
     }
 }
 
-/// A thread of `process` that will start at `entry` with stack pointer
-/// `stack` and `arg` in x0; it runs once `run` picks it. The caller gets
-/// the first reference; the thread holds one to `process`. INVALID_ARGS for
-/// a start outside the lower half, a misaligned one or priority 0,
-/// NO_MEMORY when the pool gets no page.
+/// A stopped thread of `process` that will start at `entry` with stack
+/// pointer `stack` and `arg` in x0, at `priority` under `policy`, once
+/// sched::start makes it ready. The caller gets the first reference; the
+/// thread holds one to `process`. INVALID_ARGS for a start outside the
+/// lower half, a misaligned one or priority 0, NO_MEMORY when the pool
+/// gets no page.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(
@@ -71,8 +87,8 @@ pub fn create(
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
-        priority,
-        policy,
+        base_priority: priority,
+        sched: Node::new(priority, policy),
         process,
         refs: 1,
     };
@@ -85,13 +101,6 @@ pub fn create(
 }
 
 /// Adds a reference to a live thread.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "init's handles and thread_create (milestone 1.2c) make handles; so far only the kernel tests do"
-    )
-)]
 pub fn retain(mut thread: NonNull<Thread>) {
     // SAFETY: the caller holds a reference, so the thread is alive.
     let t = unsafe { thread.as_mut() };
@@ -111,6 +120,10 @@ pub unsafe fn release(mut thread: NonNull<Thread>) {
     if t.refs > 0 {
         return;
     }
+    assert!(
+        !matches!(t.sched.state(), State::Ready | State::Running),
+        "a thread the scheduler holds lost its last reference"
+    );
     let process = t.process;
     if current() == Some(thread) {
         user::clear_current();
@@ -121,7 +134,8 @@ pub unsafe fn release(mut thread: NonNull<Thread>) {
     unsafe { process::release(process) };
 }
 
-/// The running thread, whose registers the last entry from EL0 saved.
+/// The thread whose registers, FP registers and address space are live:
+/// the running one, or while the kernel idles the one that ran last.
 pub fn current() -> Option<NonNull<Thread>> {
     NonNull::new(user::current().cast())
 }

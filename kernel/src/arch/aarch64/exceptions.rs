@@ -9,7 +9,7 @@
 //! emergency stack and never returns.
 
 use super::user::UserRegs;
-use super::{registers, symbols};
+use super::{gic, registers, symbols};
 use crate::thread::{self, Thread};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -124,10 +124,11 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
 }
 
 /// Entry from EL0 (vectors.S): the program's registers are in the running
-/// thread. After a system call or an interrupt the thread goes on. Any
-/// other synchronous exception is the program's fault and stops the
-/// machine for now (milestone 1.2c ends just the process, spec 7.9); an
-/// asynchronous one that no handler takes is an error of the system.
+/// thread. After a system call or an interrupt the scheduler decides who
+/// runs (sched::resume). Any other synchronous exception is the program's
+/// fault and stops the machine for now (milestone 1.2c ends just the
+/// process, spec 7.9); an asynchronous one that no handler takes is an
+/// error of the system.
 #[unsafe(no_mangle)]
 extern "C" fn handle_user_exception(index: u64) -> ! {
     let thread = thread::current().expect("an entry from EL0 with no thread running");
@@ -137,13 +138,18 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
             Some(number) => crate::syscall::dispatch(thread, number),
             None => user_fault(thread, index, syndrome),
         },
-        VECTOR_EL0_IRQ => crate::interrupt::handle(),
+        VECTOR_EL0_IRQ => {
+            // A spurious read needs no EOI.
+            if let Some(ack) = gic::acknowledge() {
+                crate::interrupt::handle(ack);
+            }
+        }
         // Not the program's fault: PSTATE masks SErrors inside the kernel,
         // so one the kernel caused arrives at EL0 as well; FIQs never reach
         // EL1.
         _ => system_error(thread, index, syndrome),
     }
-    thread::run(thread)
+    crate::sched::resume()
 }
 
 /// Reports a fault of the program at EL0 like a kernel fault, marked EL0,

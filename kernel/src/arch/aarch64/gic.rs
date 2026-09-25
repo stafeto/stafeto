@@ -115,13 +115,6 @@ pub fn end(ack: Ack) {
 /// PSTATE keeps interrupts masked, so none is taken; `wfi` ends all the
 /// same. None when the wake-up brought nothing to acknowledge.
 #[must_use = "an acknowledged interrupt stays active until gic::end"]
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the idle loop (milestone 1.2c) waits here; so far only the kernel tests do"
-    )
-)]
 pub fn wait() -> Option<Ack> {
     // SAFETY: waiting for an interrupt has no side effects; the DSB lets
     // earlier stores (to the GIC and the timer) complete first.

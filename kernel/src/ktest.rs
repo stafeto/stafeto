@@ -31,6 +31,7 @@ use kcore::memmap;
 use kcore::paging::{
     Attrs, MAIR_DEVICE, MapError, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
 };
+use kcore::sched::State;
 use kcore::slab::Pool;
 use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
 
@@ -172,12 +173,21 @@ const TESTS: &[(&str, TestFn)] = &[
         "init_handles_have_their_fixed_values",
         calls::init_handles_have_their_fixed_values,
     ),
+    (
+        "thread_set_priority_checks_its_arguments",
+        calls::thread_set_priority_checks_its_arguments,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
 static FAILED: AtomicU32 = AtomicU32::new(0);
 
 pub fn run(boot: &Boot) -> ! {
+    #[cfg(feature = "icount")]
+    report(
+        "virtual_time_counts_instructions",
+        virtual_time_counts_instructions(),
+    );
     for (name, test) in TESTS {
         report(name, test(boot));
     }
@@ -198,7 +208,7 @@ fn report(name: &str, result: Result<(), &'static str>) {
 /// build, so that xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
-    let total = TESTS.len() + el0::count();
+    let total = usize::from(cfg!(feature = "icount")) + TESTS.len() + el0::count();
     kprintln!("TESTS DONE total={total} failed={failed}");
     semihosting::exit(if failed == 0 { 0 } else { 1 })
 }
@@ -633,10 +643,15 @@ fn past_deadline_fires_at_once(_: &Boot) -> Result<(), &'static str> {
     let waited = clock.ns_until(start, timer::now());
     timer::disarm();
     gic::end(ack);
-    check(
-        waited < 20_000_000,
-        "a deadline in the past did not fire at once",
-    )
+    // An upper bound on time holds only where time counts instructions:
+    // elsewhere a stall of the host could take longer (report 7.1).
+    if cfg!(feature = "icount") {
+        check(
+            waited < 1_000_000,
+            "a deadline in the past did not fire at once",
+        )?;
+    }
+    Ok(())
 }
 
 /// A deadline centuries away must not wrap into the past: the timer stays
@@ -1177,7 +1192,7 @@ fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static st
 }
 
 fn process_round() -> Result<(), &'static str> {
-    let mut p = process::create(16).map_err(|_| "no process")?;
+    let mut p = process::create(16, 63).map_err(|_| "no process")?;
     let before = phys::free_frames();
     // SAFETY: the process was just created, and only this test uses it.
     let mapped = unsafe { p.as_mut() }.map_frames(USER_VA, 3 * PAGE_SIZE, Attrs::USER_DATA);
@@ -1224,8 +1239,10 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
             && started.fp.v.iter().all(|&v| v == 0)
             && started.fp.fpcr == 0
             && started.fp.fpsr == 0
-            && started.priority == 10
-            && started.policy == Policy::Fifo
+            && started.base_priority == 10
+            && started.sched.priority() == 10
+            && started.sched.policy() == Policy::Fifo
+            && started.sched.state() == State::Stopped
             && started.process() == p,
         "a new thread does not start as it was told",
     );
@@ -1249,4 +1266,32 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
         }
     }
     Ok(())
+}
+
+/// The icount build runs under `-icount shift=4` (xtask, qemu::ICOUNT):
+/// one instruction per tick of the 62.5 MHz counter. 10 000 turns of a
+/// two-instruction loop then take 20 000 ticks and a few more.
+#[cfg(feature = "icount")]
+fn virtual_time_counts_instructions() -> Result<(), &'static str> {
+    let (start, end): (u64, u64);
+    // SAFETY: a counted loop between two counter reads; no memory access.
+    unsafe {
+        core::arch::asm!(
+            "isb",
+            "mrs {start}, cntvct_el0",
+            "mov {n}, #10000",
+            "1: subs {n}, {n}, #1",
+            "b.ne 1b",
+            "isb",
+            "mrs {end}, cntvct_el0",
+            start = out(reg) start,
+            end = out(reg) end,
+            n = out(reg) _,
+            options(nomem, nostack),
+        )
+    };
+    check(
+        (20_000..=20_100).contains(&(end - start)),
+        "the run is not under -icount: the counter does not count instructions",
+    )
 }

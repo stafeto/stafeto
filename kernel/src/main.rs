@@ -21,6 +21,7 @@ mod object;
 mod panicking;
 mod process;
 mod psci;
+mod sched;
 mod syscall;
 mod thread;
 
@@ -46,6 +47,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     mm::aspace::init(boot);
     arch::gic::init(&boot.info);
     let clock = arch::timer::init();
+    sched::init(clock);
     report(boot, clock);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();

@@ -10,9 +10,10 @@
 
 .equ SVC_NOP, 0xFF00                    // ktest::el0::SVC_NOP
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
-.equ SVC_YIELD, 0xFF02                  // ktest::el0::SVC_YIELD
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
+.equ CALL_THREAD_SET_PRIORITY, 18       // abi::Call::ThreadSetPriority
+.equ CALL_YIELD, 19                     // abi::Call::Yield
 .equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
 .equ CALL_DEBUG_WRITE, 28               // abi::Call::DebugWrite
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
@@ -109,12 +110,12 @@ el0_wait_loop:
     b       el0_wait_loop
     svc     #SVC_DONE
 
-// Fills every register and lets the test's other thread, in another
-// process, run and fill them with its own pattern.
+// Fills every register and yields to the test's other thread, a FIFO
+// thread at the same level, which fills them with its own pattern.
 .global el0_pattern_yield
 el0_pattern_yield:
     LOAD_PATTERN
-    svc     #SVC_YIELD
+    svc     #CALL_YIELD
     svc     #SVC_DONE
 
 // Loads from the kernel address in x0, which must fault.
@@ -147,6 +148,114 @@ el0_pattern_object_info:
 el0_pattern_debug_write:
     LOAD_PATTERN
     svc     #CALL_DEBUG_WRITE
+    svc     #SVC_DONE
+
+// Scheduling tests (ktest::el0). The threads of a test share the words of
+// one data page and take their arguments in x0 and up. Counter readings
+// follow an ISB, so that they are not taken early.
+
+// Adds 1 to the word at x0 and ends: a mark that the thread ran.
+.global el0_mark
+el0_mark:
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    svc     #SVC_DONE
+
+// Adds 1 to the word at x0 over and over until the word at x1 is set.
+.global el0_count_until
+el0_count_until:
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    ldr     x3, [x1]
+    cbz     x3, 1b
+    svc     #SVC_DONE
+
+// Spins until x1 counter ticks have passed, then yields. Ends with the
+// word at x0 read before the yield in x3, after it in x4, and the yield's
+// result in x0.
+.global el0_spin_then_yield
+el0_spin_then_yield:
+    mov     x2, x0
+    isb
+    mrs     x5, cntvct_el0
+    add     x5, x5, x1
+1:  isb
+    mrs     x6, cntvct_el0
+    cmp     x6, x5
+    b.lo    1b
+    ldr     x3, [x2]
+    svc     #CALL_YIELD
+    ldr     x4, [x2]
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 thread, x1 priority, x2 policy), with the word at
+// x3 read before the call into x4 and after it into x5.
+.global el0_set_priority
+el0_set_priority:
+    ldr     x4, [x3]
+    svc     #CALL_THREAD_SET_PRIORITY
+    ldr     x5, [x3]
+    svc     #SVC_DONE
+
+// The same once the word at x3, a peer's count, has moved: the peer at
+// the same level ran, after this thread's quantum ended, and the call
+// comes at the start of the new quantum this thread gets back after the
+// peer's. Afterwards sets the word at x6, which lets the peer end.
+.global el0_set_priority_after_peer
+el0_set_priority_after_peer:
+    ldr     x4, [x3]
+1:  ldr     x5, [x3]
+    cmp     x5, x4
+    b.eq    1b
+    mov     x4, x5
+    svc     #CALL_THREAD_SET_PRIORITY
+    ldr     x5, [x3]
+    mov     x7, #1
+    str     x7, [x6]
+    svc     #SVC_DONE
+
+// Round robin next to a peer at the same level. x0: this thread's words
+// {count, switches}; x1: the peer's; x2: switches to wait for. Each turn
+// of the loop adds 1 to the count, reads the counter, the peer's count
+// and the counter again. When the peer's count has moved since the last
+// turn, the peer ran in between: a switch. The stretch from the first
+// reading of the last turn to the second of this one holds that whole
+// run; the shortest such stretch goes to x3, the switches seen to x4
+// (stretches after the x2-th switch do not count: a peer that is done
+// ends its run early). Ends once both threads have seen x2 switches.
+.global el0_alternate
+el0_alternate:
+    mov     x3, #-1
+    mov     x4, #0
+    isb
+    mrs     x6, cntvct_el0              // first reading of the last turn
+    ldr     x5, [x1]                    // the peer's count at the last turn
+1:  ldr     x7, [x0]
+    add     x7, x7, #1
+    str     x7, [x0]
+    isb
+    mrs     x8, cntvct_el0
+    ldr     x9, [x1]
+    isb
+    mrs     x10, cntvct_el0
+    cmp     x9, x5
+    b.eq    2f
+    mov     x5, x9
+    cmp     x4, x2
+    b.hs    2f
+    add     x4, x4, #1
+    str     x4, [x0, #8]
+    sub     x11, x10, x6
+    cmp     x11, x3
+    csel    x3, x11, x3, lo
+2:  mov     x6, x8
+    cmp     x4, x2
+    b.lo    1b
+    ldr     x9, [x1, #8]
+    cmp     x9, x2
+    b.lo    1b
     svc     #SVC_DONE
 
 el0_programs_end:
