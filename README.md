@@ -57,8 +57,8 @@ parts. Each finished part is merged through a pull request.
 | | 1.2c System calls and scheduler | first system calls, 64-level scheduler, `init` from the boot image | ✅ [#5](https://github.com/stafeto/stafeto/pull/5) |
 | 1.3 Messages and objects | 1.3a Teardown and quotas | cleanup queue in bounded portions, process tree, quotas | ✅ [#6](https://github.com/stafeto/stafeto/pull/6) |
 | | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
-| | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | 🚧 |
-| | 1.3d Memory objects | `mem_create`, `mem_map`, lazy pages, child processes with code | ⬜ |
+| | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | ✅ [#11](https://github.com/stafeto/stafeto/pull/11) |
+| | 1.3d Memory objects | `mem_create`, `mem_map`, lazy pages, child processes with code | 🚧 |
 | | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ⬜ |
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ⬜ |
 
