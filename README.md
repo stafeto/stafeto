@@ -2,58 +2,57 @@
 
 A learning phone OS built on its own microkernel (Rust, AArch64).
 
-Учебная ОС для телефона на собственном микроядре. Цель: телефон, на который
-можно ставить программы из любых источников.
+*Stafeto* is Esperanto for "messenger" and "relay". The system is built
+around messages that pass control from hand to hand.
 
-*Stafeto* на эсперанто значит «гонец» и «эстафета». Система держится на
-сообщениях, которые передают управление из рук в руки.
+## Foundation
 
-## Основа
+- a Rust microkernel for AArch64: QEMU first, then PinePhone;
+- synchronous messages and handles with rights (a capability model);
+- drivers and services run as ordinary processes;
+- soft real time: every path inside the kernel is bounded in time;
+- the kernel is under 200 KB.
 
-- микроядро на Rust для AArch64: сначала QEMU, потом PinePhone;
-- синхронные сообщения и дескрипторы с правами (модель возможностей);
-- драйверы и службы работают как обычные процессы;
-- мягкое реальное время: каждый путь внутри ядра ограничен по времени;
-- ядро меньше 200 КБ.
+## Status
 
-## Состояние
-
-Подпроект 1, этап 1.2 (ядро: память, потоки, планировщик) готов. Ядро в
-формате arm64 Image загружается в QEMU, проверяет загрузочный образ и запускает
-из него `init` на EL0. Программы пользуются первыми системными вызовами
+Subproject 1, stage 1.2 (kernel: memory, threads, scheduler) is done. The
+kernel, in arm64 Image format, boots in QEMU, verifies the boot image, and
+starts `init` from it at EL0. Programs use the first system calls
 (`debug_write`, `yield`, `thread_*`, `process_*`, `handle_close`,
-`object_info`). Планировщик с 64 уровнями приоритета, круговой очередью с
-квантом 4 мс и FIFO вытесняет потоки по таймеру без периодического тика. У
-каждого процесса своё адресное пространство с ASID; регистры и FP/SIMD
-сохраняются при каждом переключении. Сбой программы завершает только её
-процесс, причину читает родитель. Под ядром: собственные таблицы страниц с
-W^X, распределитель близнецов, пулы объектов, дескрипторы по 64 бита с
-правами, GICv2 и виртуальный таймер. `cargo xtask run` показывает, как `init`
-здоровается из EL0 и два его потока работают по очереди. Часть 1.3а (разбор и квоты) готова: объекты ядра уходят через очередь
-очистки порциями с опросом прерываний, процессы образуют дерево, и смерть
-процесса завершает потомков, память ядра каждого процесса списывается с его
-квоты и точно возвращается родителю. Следующая часть 1.3б: каналы, сеансы,
-уведомления и таймеры программ.
+`object_info`). A scheduler with 64 priority levels, a round-robin queue
+with a 4 ms quantum, and FIFO preempts threads on a timer with no periodic
+tick. Each process has its own address space with an ASID; registers and
+FP/SIMD state are saved on every switch. A program fault terminates only
+its own process, and the parent reads the cause. Below the kernel: its own
+page tables with W^X, a buddy allocator, object pools, 64-bit handles with
+rights, a GICv2, and a virtual timer. `cargo xtask run` shows `init` saying
+hello from EL0 and its two threads taking turns. Part 1.3a (teardown and
+quotas) is done: kernel objects go through a cleanup queue in chunks with
+interrupt polling, processes form a tree, and a process's death terminates
+its descendants; each process's kernel memory is charged against its quota
+and returned to the parent precisely. Next is part 1.3b: channels,
+sessions, notifications, and program timers.
 
-## Сборка и запуск
+## Build and run
 
-Нужны rustup, QEMU и dtc (на macOS: `brew install qemu dtc`). Версию Rust,
-компоненты и цели rustup ставит сам по `rust-toolchain.toml`.
+You need rustup, QEMU, and dtc (on macOS: `brew install qemu dtc`). rustup
+installs the Rust version, components, and targets itself from
+`rust-toolchain.toml`.
 
-| Команда | Что делает |
+| Command | What it does |
 |---|---|
-| `cargo xtask build` | собирает ядро в `target/stafeto.img` и проверяет, что образ меньше 200 КБ |
-| `cargo xtask run` | запускает систему в QEMU; выход: Ctrl-A, затем X |
-| `cargo xtask test` | тесты на хосте, загрузка в QEMU и тесты внутри ядра |
-| `cargo xtask gdb` | QEMU останавливается до старта ядра и ждёт отладчик на порту 1234 |
-| `cargo xtask ci` | форматирование, clippy и все тесты |
+| `cargo xtask build` | builds the kernel into `target/stafeto.img` and checks that the image is under 200 KB |
+| `cargo xtask run` | runs the system in QEMU; exit with Ctrl-A, then X |
+| `cargo xtask test` | host tests, boot in QEMU, and tests inside the kernel |
+| `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
+| `cargo xtask ci` | formatting, clippy, and all tests |
 
-Как разбирать зависания и падения: [docs/debugging.md](docs/debugging.md).
+How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 
-## Лицензия
+## License
 
-Ядро, службы, драйверы и инструменты распространяются под GPL-3.0-or-later
-([LICENSE](LICENSE)). Библиотеки для программ (`lib/abi`, `lib/rt`,
-`lib/bootimg`, `proto/*`) распространяются под MIT
-([LICENSE-MIT](LICENSE-MIT)), поэтому программы для stafeto можно выпускать под
-любой лицензией.
+The kernel, services, drivers, and tools are distributed under
+GPL-3.0-or-later ([LICENSE](LICENSE)). Libraries for programs (`lib/abi`,
+`lib/rt`, `lib/bootimg`, `proto/*`) are distributed under MIT
+([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can be released under
+any license.

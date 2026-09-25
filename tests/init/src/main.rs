@@ -728,7 +728,7 @@ extern "C" fn spin_then_yield(ticks: u64) -> ! {
     sys::thread_exit()
 }
 
-/// Spec 15.2, «Сбои»: a child with no code gets a thread above init whose
+/// Spec 15.2 (faults): a child with no code gets a thread above init whose
 /// entry maps nothing. The thread runs at once and faults, which ends the
 /// child; object_info tells init why, and the kernel prints the fault,
 /// which xtask reads whole.

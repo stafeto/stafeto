@@ -1560,7 +1560,7 @@ fn never_ran(f: &Fixture, slot: usize) -> Result<(), &'static str> {
 /// The parent, a program, makes an empty child process and a thread in it
 /// above itself whose entry maps nothing, and starts it: the thread runs at
 /// once and faults, which ends the child, and object_info tells the parent
-/// why (spec 15.2, «Сбои»).
+/// why (spec 15.2 (faults)).
 fn start_child_fault(f: &mut Fixture) -> Result<(), &'static str> {
     f.faults = true;
     let parent = spawn(f, 0, &raw const el0_child_fault, 0)?;
