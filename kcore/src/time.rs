@@ -33,7 +33,15 @@ impl Clock {
     pub fn ns_to_ticks(self, ns: u64) -> u64 {
         saturate((u128::from(ns) * u128::from(self.hz)).div_ceil(u128::from(NANOS_PER_SEC)))
     }
+}
 
+fn saturate(v: u128) -> u64 {
+    u64::try_from(v).unwrap_or(u64::MAX)
+}
+
+/// For the kernel tests, which set deadlines of their own and measure
+/// waits; the kernel itself converts through `ns_to_ticks`.
+impl Clock {
     /// Compare value for a deadline `ns` nanoseconds after the counter
     /// value `now`. A deadline beyond the counter's range saturates at
     /// u64::MAX, which the counter never reaches, instead of wrapping into
@@ -47,10 +55,6 @@ impl Clock {
     pub fn ns_until(self, now: u64, cval: u64) -> u64 {
         self.ticks_to_ns(cval.saturating_sub(now))
     }
-}
-
-fn saturate(v: u128) -> u64 {
-    u64::try_from(v).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

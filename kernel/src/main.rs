@@ -29,6 +29,7 @@ mod psci;
 mod sched;
 mod session;
 mod syscall;
+mod testpoint;
 mod thread;
 mod timer;
 

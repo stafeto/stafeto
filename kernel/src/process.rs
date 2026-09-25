@@ -1225,9 +1225,10 @@ unsafe fn stop(process: NonNull<Process>, cause: u8) {
 
 /// Init ended (spec 7.9): until milestone 1.4 an exit ends the run and
 /// turns the machine off, while a fault or a kill stops it with a report,
-/// as a panic does.
-#[cfg(not(feature = "ktest"))]
+/// as a panic does. In test builds the running test judges init's end
+/// instead, and the tests go on (testpoint::init_ended).
 fn init_ended(state: ProcessState) -> ! {
+    crate::testpoint::init_ended();
     match state {
         ProcessState::Exited { code } => {
             kprintln!("init exited with code {code}");
@@ -1238,12 +1239,6 @@ fn init_ended(state: ProcessState) -> ! {
         }
         other => panic!("init terminated: {other:?}"),
     }
-}
-
-/// In test builds the running test judges init's end and the tests go on.
-#[cfg(feature = "ktest")]
-fn init_ended(_: ProcessState) -> ! {
-    crate::ktest::el0::init_ended()
 }
 
 /// Marks `process` as init (spec 13.3): its end ends the run.
@@ -1632,39 +1627,44 @@ pub fn handle_counts(process: NonNull<Process>) -> (u32, u32, u32) {
     (handles.len(), handles.retired(), handles.limit())
 }
 
-/// Processes whose shells have not gone.
-#[cfg(feature = "ktest")]
-pub fn in_use() -> usize {
-    LIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 /// Processes that came to their stage Quota with children still in their
 /// list: none may, since the stage Children waits for each (test builds).
 #[cfg(feature = "ktest")]
 static EARLY_QUOTA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// How many processes came to their stage Quota before their children
-/// passed theirs, since the last call.
 #[cfg(feature = "ktest")]
-pub fn take_early_quota() -> u32 {
-    EARLY_QUOTA.swap(0, core::sync::atomic::Ordering::Relaxed)
-}
+pub use test_access::{in_use, parent, progress, take_early_quota};
 
-/// The parent of `process`, which the test holds.
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn parent(process: NonNull<Process>) -> Option<NonNull<Process>> {
-    // SAFETY: the test holds a reference to the process; only the field is
-    // read.
-    unsafe { (*process.as_ptr()).parent }
-}
+mod test_access {
+    use super::*;
 
-/// How far the teardown of `process` came: its stage, the handles left in
-/// its table, and the tables of its space that went back.
-#[cfg(feature = "ktest")]
-pub fn progress(process: NonNull<Process>) -> (Stage, u32, usize) {
-    // SAFETY: the test holds a reference to the process, and nothing
-    // runs its portions meanwhile.
-    let p = unsafe { process.as_ref() };
-    let tables = p.retired.as_ref().map_or(0, |r| r.freed());
-    (p.stage, p.handles.len(), tables)
+    /// Processes whose shells have not gone.
+    pub fn in_use() -> usize {
+        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many processes came to their stage Quota before their children
+    /// passed theirs, since the last call.
+    pub fn take_early_quota() -> u32 {
+        EARLY_QUOTA.swap(0, core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The parent of `process`, which the test holds.
+    pub fn parent(process: NonNull<Process>) -> Option<NonNull<Process>> {
+        // SAFETY: the test holds a reference to the process; only the field is
+        // read.
+        unsafe { (*process.as_ptr()).parent }
+    }
+
+    /// How far the teardown of `process` came: its stage, the handles left in
+    /// its table, and the tables of its space that went back.
+    pub fn progress(process: NonNull<Process>) -> (Stage, u32, usize) {
+        // SAFETY: the test holds a reference to the process, and nothing
+        // runs its portions meanwhile.
+        let p = unsafe { process.as_ref() };
+        let tables = p.retired.as_ref().map_or(0, |r| r.freed());
+        (p.stage, p.handles.len(), tables)
+    }
 }

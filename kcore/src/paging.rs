@@ -123,11 +123,6 @@ impl Attrs {
     }
 }
 
-/// The MAIR_EL1 index a block or page descriptor selects.
-pub fn attr_index(desc: u64) -> u64 {
-    (desc >> ATTR_SHIFT) & 0b111
-}
-
 pub fn page_descriptor(pa: u64, attrs: Attrs) -> u64 {
     (pa & OA_MASK) | attrs.bits() | TABLE_OR_PAGE | VALID
 }
@@ -453,6 +448,12 @@ impl Release {
     pub fn freed(&self) -> usize {
         self.cursor.freed
     }
+}
+
+/// The MAIR_EL1 index a block or page descriptor selects; for the kernel
+/// tests, which check the attributes of live mappings.
+pub fn attr_index(desc: u64) -> u64 {
+    (desc >> ATTR_SHIFT) & 0b111
 }
 
 #[cfg(test)]

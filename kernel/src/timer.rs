@@ -344,39 +344,43 @@ const POISON: u8 = 0xA5;
 #[cfg(feature = "ktest")]
 const _: () = assert!(core::mem::offset_of!(Timer, refs) >= 8);
 
-/// Timers whose places have not gone back.
 #[cfg(feature = "ktest")]
-pub fn in_use() -> usize {
-    LIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
+pub use test_access::{deadline, in_use, payer, posted, reset_longest_batch};
 
-/// The deadline of `t`, which the test knows alive, in ticks while it is
-/// armed.
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn deadline(t: NonNull<Timer>) -> Option<u64> {
-    // SAFETY: the test knows the timer alive; only the node is read.
-    let node = unsafe { &(*t.as_ptr()).node };
-    node.is_linked().then(|| node.deadline())
-}
+mod test_access {
+    use super::*;
 
-/// Whether the slot of `t`, which is alive, stands in its channel's queue:
-/// the timer posted, and nothing took the slot since.
-#[cfg(feature = "ktest")]
-pub fn posted(t: NonNull<Timer>) -> bool {
-    // SAFETY: the test knows the timer alive; only the slot is read.
-    unsafe { (*t.as_ptr()).slot.is_queued() }
-}
+    /// Timers whose places have not gone back.
+    pub fn in_use() -> usize {
+        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+    }
 
-/// The process that pays for `t`, which the test holds.
-#[cfg(feature = "ktest")]
-pub fn payer(t: NonNull<Timer>) -> NonNull<Process> {
-    // SAFETY: the test holds a reference to the timer; only the field is
-    // read.
-    unsafe { (*t.as_ptr()).payer }
-}
+    /// The deadline of `t`, which the test knows alive, in ticks while it is
+    /// armed.
+    pub fn deadline(t: NonNull<Timer>) -> Option<u64> {
+        // SAFETY: the test knows the timer alive; only the node is read.
+        let node = unsafe { &(*t.as_ptr()).node };
+        node.is_linked().then(|| node.deadline())
+    }
 
-/// Forgets the longest batch, so that a test measures its own.
-#[cfg(feature = "ktest")]
-pub fn reset_longest_batch() {
-    TIMERS.lock().longest_batch = 0;
+    /// Whether the slot of `t`, which is alive, stands in its channel's queue:
+    /// the timer posted, and nothing took the slot since.
+    pub fn posted(t: NonNull<Timer>) -> bool {
+        // SAFETY: the test knows the timer alive; only the slot is read.
+        unsafe { (*t.as_ptr()).slot.is_queued() }
+    }
+
+    /// The process that pays for `t`, which the test holds.
+    pub fn payer(t: NonNull<Timer>) -> NonNull<Process> {
+        // SAFETY: the test holds a reference to the timer; only the field is
+        // read.
+        unsafe { (*t.as_ptr()).payer }
+    }
+
+    /// Forgets the longest batch, so that a test measures its own.
+    pub fn reset_longest_batch() {
+        TIMERS.lock().longest_batch = 0;
+    }
 }

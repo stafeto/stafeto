@@ -259,24 +259,30 @@ const POISON: u8 = 0xA5;
 #[cfg(feature = "ktest")]
 const _: () = assert!(core::mem::offset_of!(Session, refs) >= 8);
 
-/// Sessions whose places have not gone back.
 #[cfg(feature = "ktest")]
-pub fn in_use() -> usize {
-    LIVE.load(core::sync::atomic::Ordering::Relaxed)
-}
+pub use test_access::{in_use, payer, priority};
 
-/// The priority of the slot of `s`, which the test holds.
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn priority(s: NonNull<Session>) -> u8 {
-    // SAFETY: the test holds a reference to the session; only the slot is
-    // read.
-    unsafe { (*s.as_ptr()).slot.priority() }
-}
+mod test_access {
+    use super::*;
 
-/// The process that pays for `s`, which the test holds.
-#[cfg(feature = "ktest")]
-pub fn payer(s: NonNull<Session>) -> NonNull<Process> {
-    // SAFETY: the test holds a reference to the session; only the field is
-    // read.
-    unsafe { (*s.as_ptr()).payer }
+    /// Sessions whose places have not gone back.
+    pub fn in_use() -> usize {
+        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The priority of the slot of `s`, which the test holds.
+    pub fn priority(s: NonNull<Session>) -> u8 {
+        // SAFETY: the test holds a reference to the session; only the slot is
+        // read.
+        unsafe { (*s.as_ptr()).slot.priority() }
+    }
+
+    /// The process that pays for `s`, which the test holds.
+    pub fn payer(s: NonNull<Session>) -> NonNull<Process> {
+        // SAFETY: the test holds a reference to the session; only the field is
+        // read.
+        unsafe { (*s.as_ptr()).payer }
+    }
 }

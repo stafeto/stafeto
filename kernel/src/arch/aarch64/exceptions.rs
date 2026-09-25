@@ -6,7 +6,7 @@
 //! any other synchronous exception at EL0 ends the program's process;
 //! every other exception is reported with
 //! its registers and stops the kernel. Test builds skip one BRK marker
-//! (kcore::esr::TEST_BRK) to prove the vectors and the return path work. An
+//! (testpoint::skip_brk) to prove the vectors and the return path work. An
 //! entry from EL1 that finds no room on the kernel stack runs on the
 //! emergency stack and never returns.
 
@@ -16,8 +16,8 @@ use crate::process;
 use crate::thread::{self, Thread};
 use abi::ProcessState;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use kcore::esr::{self, BrkAction};
+use core::sync::atomic::{AtomicBool, Ordering};
+use kcore::esr;
 
 /// Registers saved by vectors.S, in its layout, and the frame record that
 /// links the interrupted code into backtraces.
@@ -59,9 +59,6 @@ const VECTOR_EL0_IRQ: u64 = 9;
 /// Set in the vector index when the entry switched to the emergency stack.
 const ON_EMERGENCY_STACK: u64 = 1 << 4;
 
-/// Immediate of the last BRK skipped in kernel code.
-pub static LAST_BRK: AtomicU64 = AtomicU64::new(u64::MAX);
-
 /// Set by the first entry on the emergency stack. Another one starts over
 /// at the top of that stack, on the frames of the first report, and may
 /// fail the same way again: it stops the machine without a word.
@@ -90,9 +87,8 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     // emergency stack the vector has no way back to the interrupted SP.
     if index == VECTOR_EL1H_SYNC
         && let Some(imm) = esr::brk_immediate(syndrome)
-        && esr::kernel_brk_action(imm, cfg!(feature = "ktest")) == BrkAction::Skip
+        && crate::testpoint::skip_brk(imm)
     {
-        LAST_BRK.store(u64::from(imm), Ordering::Relaxed);
         // A BRK exception returns to the BRK itself; step over it.
         frame.elr += 4;
         return;
@@ -162,8 +158,7 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
 /// report instead, as before: a mistake in a test program shows at once.
 fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     let far = registers::far_el1();
-    #[cfg(feature = "ktest")]
-    if !crate::ktest::el0::expects_fault() {
+    if !crate::testpoint::expects_fault() {
         report_el0(thread, "program fault", VECTOR_EL0_SYNC, syndrome, far)
     }
     let far = esr::fault_address(syndrome, far);

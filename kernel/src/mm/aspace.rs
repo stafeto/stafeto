@@ -97,19 +97,6 @@ fn empty_root() -> u64 {
     empty
 }
 
-/// Points TTBR0 at the empty table with ASID 0: no user address translates.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "the idle loop (milestone 1.2c) leaves user tables; so far only the kernel tests do"
-    )
-)]
-pub fn deactivate() {
-    // SAFETY: the empty table maps nothing.
-    unsafe { mmu::set_ttbr0(asid::ttbr0(empty_root(), 0)) };
-}
-
 /// This CPU's TTBR0 and TLB, in the order kcore::tlb gives. Only this
 /// module makes one, and it hands kcore::tlb nothing but the roots of live
 /// address spaces and the empty table.
@@ -205,15 +192,6 @@ impl AddressSpace {
         with_tables(|mem| self.tables.translate(mem, va as u64))
     }
 
-    /// The space's ASID, when it has one of this generation.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(dead_code, reason = "only the kernel tests ask for the ASID so far")
-    )]
-    pub fn asid(&self) -> Option<u16> {
-        with_asids(|a| a.current(&self.tag))
-    }
-
     /// Whether TTBR0 holds this space's tables. The space in TTBR0 always
     /// has an ASID of this generation: a new generation begins only in the
     /// `activate` of another space, which then takes TTBR0.
@@ -287,12 +265,6 @@ impl SpaceRelease {
         }
         self.spent
     }
-
-    /// Tables given back so far.
-    #[cfg(feature = "ktest")]
-    pub fn freed(&self) -> usize {
-        self.tables.freed()
-    }
 }
 
 impl Drop for SpaceRelease {
@@ -302,24 +274,51 @@ impl Drop for SpaceRelease {
     }
 }
 
-/// Width of the ASIDs the allocator hands out.
 #[cfg(feature = "ktest")]
-pub fn asid_bits() -> u32 {
-    with_asids(|a| a.bits())
-}
+pub use test_access::{asid_bits, asid_generation, deactivate, use_up_asids};
 
+/// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
-pub fn asid_generation() -> u64 {
-    with_asids(|a| a.generation())
-}
+mod test_access {
+    use super::*;
 
-/// Takes every ASID still free in this generation, so that the next
-/// activation of a space without one begins a new generation.
-#[cfg(feature = "ktest")]
-pub fn use_up_asids() {
-    with_asids(|a| {
-        for _ in 0..a.free_asids() {
-            let _ = a.activate(&mut AsidTag::default());
+    impl AddressSpace {
+        /// The space's ASID, when it has one of this generation.
+        pub fn asid(&self) -> Option<u16> {
+            with_asids(|a| a.current(&self.tag))
         }
-    });
+    }
+
+    impl SpaceRelease {
+        /// Tables given back so far.
+        pub fn freed(&self) -> usize {
+            self.tables.freed()
+        }
+    }
+
+    /// Points TTBR0 at the empty table with ASID 0: no user address
+    /// translates.
+    pub fn deactivate() {
+        // SAFETY: the empty table maps nothing.
+        unsafe { mmu::set_ttbr0(asid::ttbr0(empty_root(), 0)) };
+    }
+
+    /// Width of the ASIDs the allocator hands out.
+    pub fn asid_bits() -> u32 {
+        with_asids(|a| a.bits())
+    }
+
+    pub fn asid_generation() -> u64 {
+        with_asids(|a| a.generation())
+    }
+
+    /// Takes every ASID still free in this generation, so that the next
+    /// activation of a space without one begins a new generation.
+    pub fn use_up_asids() {
+        with_asids(|a| {
+            for _ in 0..a.free_asids() {
+                let _ = a.activate(&mut AsidTag::default());
+            }
+        });
+    }
 }

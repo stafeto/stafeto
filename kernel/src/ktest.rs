@@ -7,10 +7,11 @@
 
 pub mod calls;
 pub mod el0;
+mod registers;
 
 use crate::arch::symbols;
 use crate::arch::user::UserRegs;
-use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
+use crate::arch::{self, gic, semihosting, timer};
 use crate::boot::Boot;
 use crate::channel;
 use crate::cleanup;
@@ -23,10 +24,9 @@ use crate::process::Stage;
 use crate::{process, sched, session, thread, timer as timers};
 use abi::{Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
 use kcore::bootinfo::PsciConduit;
-use kcore::esr::TEST_BRK;
 use kcore::frames::{MAX_ORDER, PhysMem};
 use kcore::gic::{Ack, DEFAULT_PRIORITY};
 use kcore::handles::{CHUNK, MAX_HANDLES};
@@ -416,12 +416,29 @@ fn identity_map_is_dropped(_: &Boot) -> Result<(), &'static str> {
     check(l0.iter().all(|&e| e == 0), "TTBR0 still maps something")
 }
 
+/// Immediate of the BRK marker that proves the exception return path.
+const TEST_BRK: u16 = 0x51;
+
+/// Immediate of the last BRK skipped in kernel code.
+static LAST_BRK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// A BRK in kernel code (testpoint::skip_brk): the test marker is recorded
+/// and stepped over; any other BRK stops the kernel, as in the build that
+/// ships, since Rust lowers aborts and unreachable code to BRK.
+pub fn brk(imm: u16) -> bool {
+    if imm != TEST_BRK {
+        return false;
+    }
+    LAST_BRK.store(u64::from(imm), Ordering::Relaxed);
+    true
+}
+
 fn brk_is_caught_and_execution_resumes(_: &Boot) -> Result<(), &'static str> {
-    exceptions::LAST_BRK.store(u64::MAX, Ordering::Relaxed);
+    LAST_BRK.store(u64::MAX, Ordering::Relaxed);
     // SAFETY: the exception handler records BRK and returns past it.
     unsafe { core::arch::asm!("brk #{imm}", imm = const TEST_BRK) };
     check(
-        exceptions::LAST_BRK.load(Ordering::Relaxed) == u64::from(TEST_BRK),
+        LAST_BRK.load(Ordering::Relaxed) == u64::from(TEST_BRK),
         "BRK was not recorded",
     )
 }
@@ -557,7 +574,7 @@ fn kernel_text_is_read_only_and_data_writable(_: &Boot) -> Result<(), &'static s
         !translates(registers::at_s1e1w(text)),
         "kernel text is writable",
     )?;
-    let data = &exceptions::LAST_BRK as *const _ as usize;
+    let data = &LAST_BRK as *const _ as usize;
     check(
         translates(registers::at_s1e1w(data)),
         "kernel data is not writable",

@@ -68,8 +68,7 @@ impl Values {
 /// decides who runs (sched::resume): a call that lets another thread run
 /// has written the caller's result first.
 pub fn dispatch(thread: NonNull<Thread>, number: u16) {
-    #[cfg(feature = "ktest")]
-    if abi::TEST_CALLS.contains(&number) && crate::ktest::el0::syscall(thread, number) {
+    if crate::testpoint::test_call(thread, number) {
         return;
     }
     let mut args: Args = [0; 10];
