@@ -9,7 +9,10 @@
 use crate::PAGE_SIZE;
 use crate::handles::MAX_HANDLES;
 use crate::layout::USER_END;
-use abi::{CLIENT_GONE, Error, PRIORITY_LEVELS, Policy, Rights};
+use abi::{
+    CLIENT_GONE, Error, HANDLES_SHIFT, MESSAGE_HANDLES, MESSAGE_MAX, NO_WAIT, PRIORITY_LEVELS,
+    Policy, Rights,
+};
 
 /// A priority from a register, as `thread_create` and
 /// `thread_set_priority` take it: 1-63. INVALID_ARGS for 0, 64 and up, and
@@ -119,6 +122,86 @@ pub fn inline_len_arg(raw: u64) -> Result<usize, Error> {
     match usize::try_from(raw) {
         Ok(len) if len <= abi::INLINE_MAX => Ok(len),
         _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// The description of a message (spec 6.1, 11): x1 of `send` and `reply`,
+/// and of the results that carry a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Desc {
+    /// Bytes of data, at most abi::MESSAGE_MAX: 0-63 in x2-x9, the rest in
+    /// the message buffer.
+    pub len: usize,
+    /// Handles it carries, at most abi::MESSAGE_HANDLES.
+    pub handles: usize,
+    /// `send` only (abi::NO_WAIT): WOULD_BLOCK when no receiver waits.
+    pub no_wait: bool,
+}
+
+/// The bits of the length in a description: 0-10.
+const LEN_BITS: u64 = (1 << 11) - 1;
+/// The bits of the count of handles: 12-14.
+const HANDLE_BITS: u64 = 0b111 << HANDLES_SHIFT;
+
+impl Desc {
+    /// The description of `send` from x1: INVALID_ARGS for a length above
+    /// abi::MESSAGE_MAX, more than abi::MESSAGE_HANDLES handles, and any bit
+    /// but those of the length, of the handles and NO_WAIT.
+    pub fn from_send(raw: u64) -> Result<Desc, Error> {
+        Desc::parse(raw, NO_WAIT)
+    }
+
+    /// The description of `reply` from x1: as for `send`, and NO_WAIT is
+    /// INVALID_ARGS too, since `reply` never waits.
+    pub fn from_reply(raw: u64) -> Result<Desc, Error> {
+        Desc::parse(raw, 0)
+    }
+
+    fn parse(raw: u64, flags: u64) -> Result<Desc, Error> {
+        let len = (raw & LEN_BITS) as usize;
+        let handles = ((raw & HANDLE_BITS) >> HANDLES_SHIFT) as usize;
+        if raw & !(LEN_BITS | HANDLE_BITS | flags) != 0
+            || len > MESSAGE_MAX
+            || handles > MESSAGE_HANDLES
+        {
+            return Err(Error::InvalidArgs);
+        }
+        Ok(Desc {
+            len,
+            handles,
+            no_wait: raw & NO_WAIT != 0,
+        })
+    }
+
+    /// x1 of a result that carries the message: its length and handles,
+    /// with the source 0 (abi::Source::Message) and no flag.
+    pub fn result(self) -> u64 {
+        self.len as u64 | (self.handles as u64) << HANDLES_SHIFT
+    }
+}
+
+/// The values of the handles a message carries, as the sender lists them
+/// (spec 6.1): INVALID_ARGS for a value listed twice or equal to `channel`,
+/// x0 of `send`, which cannot travel in its own message. The comparison
+/// needs no lookup, so it comes before the handles (spec 11).
+pub fn handle_values_arg(values: &[u64], channel: Option<u64>) -> Result<(), Error> {
+    for (i, &v) in values.iter().enumerate() {
+        if Some(v) == channel || values[..i].contains(&v) {
+            return Err(Error::InvalidArgs);
+        }
+    }
+    Ok(())
+}
+
+/// Zeroes the bytes at `len` and past it in `words`, bytes 0-63 of a
+/// message as abi::inline_words packs them into x2-x9 (spec 6.1): the
+/// receiver sees nothing the sender did not mean to send.
+pub fn mask_tail(words: &mut [u64], len: usize) {
+    for (i, w) in words.iter_mut().enumerate() {
+        let kept = len.saturating_sub(8 * i);
+        if kept < 8 {
+            *w &= (1u64 << (8 * kept)).wrapping_sub(1);
+        }
     }
 }
 
@@ -247,6 +330,82 @@ mod tests {
         assert_eq!(inline_len_arg(abi::INLINE_MAX as u64), Ok(abi::INLINE_MAX));
         for raw in [abi::INLINE_MAX as u64 + 1, 1 << 32, u64::MAX] {
             assert_eq!(inline_len_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+    }
+
+    /// The description of `send` and `reply` (spec 6.1, 11): a length up
+    /// to 1024, up to 4 handles, NO_WAIT for `send` only; any other bit,
+    /// bits 24-27 of the source included, and a length or a count past its
+    /// bound fail with INVALID_ARGS. The result carries the length and the
+    /// handles, with the source 0.
+    #[test]
+    fn descriptor_bits_are_checked() {
+        let desc = |len, handles, no_wait| Desc {
+            len,
+            handles,
+            no_wait,
+        };
+        assert_eq!(Desc::from_send(0), Ok(desc(0, 0, false)));
+        assert_eq!(Desc::from_send(1024 | 4 << 12), Ok(desc(1024, 4, false)));
+        assert_eq!(Desc::from_send(64 | NO_WAIT), Ok(desc(64, 0, true)));
+        assert_eq!(Desc::from_reply(1 << 12 | 7), Ok(desc(7, 1, false)));
+        for raw in [
+            1025,
+            0x7FF,
+            1 << 11,
+            5 << 12,
+            7 << 12,
+            1 << 15,
+            1 << 17,
+            1 << 24,
+            0xF << 24,
+            1 << 63,
+        ] {
+            assert_eq!(Desc::from_send(raw), Err(Error::InvalidArgs), "{raw:#x}");
+            assert_eq!(Desc::from_reply(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+        assert_eq!(Desc::from_reply(NO_WAIT), Err(Error::InvalidArgs));
+        assert_eq!(desc(1024, 4, true).result(), 1024 | 4 << 12);
+        assert_eq!(desc(3, 0, false).result(), 3);
+    }
+
+    /// A message carries each handle once, and never the channel `send`
+    /// goes through (spec 6.1); `reply` has no channel to compare with.
+    #[test]
+    fn handle_values_must_differ_from_each_other_and_the_channel() {
+        assert_eq!(handle_values_arg(&[], Some(5)), Ok(()));
+        assert_eq!(handle_values_arg(&[1, 2, 3, 4], Some(5)), Ok(()));
+        assert_eq!(
+            handle_values_arg(&[1, 2, 3, 1], Some(5)),
+            Err(Error::InvalidArgs)
+        );
+        assert_eq!(handle_values_arg(&[2, 2], None), Err(Error::InvalidArgs));
+        assert_eq!(handle_values_arg(&[1, 5], Some(5)), Err(Error::InvalidArgs));
+        assert_eq!(handle_values_arg(&[5], None), Ok(()));
+    }
+
+    /// Bytes 0-63 go in x2-x9, and the receiver sees zeros at the length
+    /// and past it (spec 6.1): whole words up to the length, the part of
+    /// the last one, and nothing after.
+    #[test]
+    fn short_data_is_masked_past_its_length() {
+        let full: [u64; 8] = core::array::from_fn(|i| 0x1111_1111_1111_1111 * (i as u64 + 1));
+        for (len, want) in [
+            (0, [0; 8]),
+            (1, [0x11, 0, 0, 0, 0, 0, 0, 0]),
+            (13, [full[0], 0x22_2222_2222, 0, 0, 0, 0, 0, 0]),
+            (16, [full[0], full[1], 0, 0, 0, 0, 0, 0]),
+            (63, {
+                let mut w = full;
+                w[7] &= (1 << 56) - 1;
+                w
+            }),
+            (64, full),
+            (1024, full),
+        ] {
+            let mut words = full;
+            mask_tail(&mut words, len);
+            assert_eq!(words, want, "length {len}");
         }
     }
 

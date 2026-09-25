@@ -219,6 +219,23 @@ impl<T> HandleTable<T> {
         Ok(())
     }
 
+    /// Makes room for the `n` inserts of a transfer, n at most CHUNK
+    /// (spec 6.1): LIMIT_REACHED when the table has room for fewer, and
+    /// NO_MEMORY when they need a chunk, or the directory with it, that
+    /// `src` does not give; the table is as it was then. After Ok the next
+    /// `n` inserts cannot fail. It adds at most one chunk (spec 5.1).
+    pub fn reserve(&mut self, src: &mut impl ChunkSource<T>, n: u32) -> Result<(), Error> {
+        assert!(n as usize <= CHUNK, "a transfer of more than a chunk");
+        if self.room() < n {
+            return Err(Error::LimitReached);
+        }
+        let fresh = n.saturating_sub(self.free_count);
+        if (self.used + fresh) as usize > self.chunk_count * CHUNK {
+            self.grow(src)?;
+        }
+        Ok(())
+    }
+
     pub fn insert(
         &mut self,
         src: &mut impl ChunkSource<T>,
@@ -1080,6 +1097,62 @@ mod tests {
         let h = t.insert(&mut src, 64, RW).unwrap();
         assert_eq!(h.index(), 64);
         assert_eq!(t.get(h), Ok((&64, RW)));
+        t.release(&mut src);
+    }
+
+    /// Spec 6.1: a transfer goes in whole or not at all. A table without
+    /// room for all of it refuses with LIMIT_REACHED, one whose inserts
+    /// need a chunk the quota does not give with NO_MEMORY, and each stays
+    /// as it was; once `reserve` passed, every insert goes in, whatever the
+    /// source has left.
+    #[test]
+    fn transfer_is_all_or_nothing() {
+        let mut src = boxes(1);
+        let mut t = table(66);
+        let hs: Vec<Handle> = (0..63)
+            .map(|i| t.insert(&mut src, i, RW).unwrap())
+            .collect();
+        assert_eq!(t.reserve(&mut src, 4), Err(Error::LimitReached));
+        assert_eq!((t.len(), t.room()), (63, 3));
+        t.remove(hs[0]).unwrap();
+        t.remove(hs[1]).unwrap();
+        // Two free entries and the last of the chunk: the fourth insert
+        // needs a new chunk, and the source has none.
+        assert_eq!(t.reserve(&mut src, 4), Err(Error::NoMemory));
+        assert_eq!((t.len(), t.room()), (61, 5));
+        src.left = 1;
+        assert_eq!(t.reserve(&mut src, 4), Ok(()));
+        assert_eq!(src.left, 0);
+        for i in 0..4 {
+            assert!(t.insert(&mut src, 100 + i, RW).is_ok(), "insert {i}");
+        }
+        assert_eq!(t.len(), 65);
+        t.release(&mut src);
+    }
+
+    /// Counting the steps: four inserts across the end of a chunk take one
+    /// new chunk in `reserve` and none afterwards; the first transfer into
+    /// an empty table takes the directory and one chunk; a transfer that
+    /// fits in free entries takes nothing (spec 5.1).
+    #[test]
+    fn reserve_adds_at_most_one_chunk() {
+        let mut src = boxes(3);
+        let mut t = table(1000);
+        assert_eq!(t.reserve(&mut src, 4), Ok(()));
+        assert_eq!((src.left, src.directories), (2, 1));
+        for i in 0..62 {
+            t.insert(&mut src, i, RW).unwrap();
+        }
+        assert_eq!(src.left, 2);
+        assert_eq!(t.reserve(&mut src, 4), Ok(()));
+        assert_eq!(src.left, 1);
+        let hs: Vec<Handle> = (0..4).map(|i| t.insert(&mut src, i, RW).unwrap()).collect();
+        assert_eq!((src.left, t.len()), (1, 66));
+        for h in hs {
+            t.remove(h).unwrap();
+        }
+        assert_eq!(t.reserve(&mut src, 4), Ok(()));
+        assert_eq!(src.left, 1);
         t.release(&mut src);
     }
 

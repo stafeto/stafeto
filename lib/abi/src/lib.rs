@@ -261,6 +261,18 @@ pub fn inline_bytes(words: &[u64; 8]) -> [u8; INLINE_MAX] {
 /// the flags are reserved.
 pub const NO_WAIT: u64 = 1 << 16;
 
+/// Bytes a message carries at most (spec 6.1, 6.2): bytes 0-63 in x2-x9,
+/// the rest in the message buffer.
+pub const MESSAGE_MAX: usize = 1024;
+
+/// Handles a message carries at most (spec 6.1).
+pub const MESSAGE_HANDLES: usize = 4;
+
+/// Where the count of handles starts in the description of a message, x1
+/// of `send`, `reply` and of the results that carry a message (spec 11):
+/// bits 12-14. The length takes bits 0-10.
+pub const HANDLES_SHIFT: u32 = 12;
+
 /// Where the kind of what `receive` took starts in its x1: bits 24-27.
 pub const SOURCE_SHIFT: u32 = 24;
 
@@ -789,6 +801,7 @@ mod tests {
         assert_eq!(Source::from_code(15), Source::Unknown(15));
         assert_eq!(Source::Unknown(15).code(), 15);
         assert_eq!((NO_WAIT, SOURCE_SHIFT), (1 << 16, 24));
+        assert_eq!((MESSAGE_MAX, MESSAGE_HANDLES, HANDLES_SHIFT), (1024, 4, 12));
     }
 
     #[test]

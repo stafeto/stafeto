@@ -14,10 +14,10 @@
 //! interrupts the kernel does at most one portion, and it begins one only
 //! with no interrupt pending. The kernel holds a reference to every thread
 //! the scheduler holds, from `start` until `exit`, a thread that waits in
-//! `receive` too. The queues of receivers of channels link threads through
-//! the scheduler's own links, so the code that changes them runs under the
-//! scheduler's lock (`locked`). The lock of the heap of timers is never
-//! held with it (crate::timer).
+//! `receive` too. The queues of channels change together with the states
+//! of the threads that wait in them, so the code that changes them runs
+//! under the scheduler's lock (`locked`). The lock of the heap of timers is
+//! never held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
 use crate::thread::{self, Thread};
@@ -177,9 +177,9 @@ pub fn set_priority(t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<
     Ok(())
 }
 
-/// Runs `f` with the scheduler locked. The queues of receivers of channels
-/// hold threads through the scheduler's links (kcore::notify::Queue), so
-/// the code that changes them, with the threads' states, runs here.
+/// Runs `f` with the scheduler locked. The queues of channels hold the
+/// slots of threads that wait (kcore::notify::Queue), so the code that
+/// changes them, with the threads' states, runs here.
 pub fn locked<R>(f: impl FnOnce(&mut Scheduler<Thread>) -> R) -> R {
     f(&mut SCHED.lock().s)
 }

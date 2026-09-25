@@ -17,7 +17,7 @@
 //! while it lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
-use crate::channel::Channel;
+use crate::channel::{Channel, Owner};
 use crate::cleanup::{self, Item};
 use crate::mm::phys::FRAMES;
 use crate::object::Object;
@@ -27,6 +27,7 @@ use abi::{Error, Policy};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
+use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
 
@@ -39,13 +40,17 @@ pub struct Thread {
     /// What the scheduler keeps in the thread: the base priority, which
     /// `create` or thread_set_priority gave, the boost of a notification
     /// (spec 6.6) and the effective priority they make, the policy, the
-    /// state, the rest of a quantum and the links of the ready list or of
-    /// the queue of receivers of its channel. Only the scheduler changes it
-    /// (sched), and the channel under the scheduler's lock.
+    /// state, the rest of a quantum and the links of the ready list. Only
+    /// the scheduler changes it (sched), and the channel under the
+    /// scheduler's lock.
     pub sched: Node<Thread>,
     /// The channel it waits in, in `receive`; it holds a reference to it
     /// meanwhile (channel::receive).
     pub waits: Option<NonNull<Channel>>,
+    /// Its own slot of a channel's queue (spec 6.1): its place there while
+    /// it waits in `receive`, at the level of its effective priority. Only
+    /// the channel changes it, under the scheduler's lock.
+    slot: Slot<Owner>,
     /// Links in the list of its process's threads that have not ended,
     /// which process::end walks; None once the thread left it. Only
     /// process::{add_thread, remove_thread} change them.
@@ -140,6 +145,8 @@ pub fn create(
         fp: FpRegs::ZERO,
         sched: Node::new(priority, policy),
         waits: None,
+        // The owner is the thread's own place, known once it has one.
+        slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
         siblings: None,
         buffer: None,
         process,
@@ -147,11 +154,21 @@ pub fn create(
         cleanup: Item::new(),
     };
     let thread = process::thread_slot(process, thread)?;
+    // SAFETY: the thread was just made, nothing else refers to it, and its
+    // slot is in no queue.
+    unsafe { (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread)) };
     #[cfg(feature = "ktest")]
     LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     process::retain(process);
     process::add_thread(process, thread);
     Ok(thread)
+}
+
+/// The own slot of `t` (Thread::slot), which lives as long as the thread.
+pub fn slot(t: NonNull<Thread>) -> NonNull<Slot<Owner>> {
+    // SAFETY: the caller holds the thread; only the field's address is
+    // taken.
+    unsafe { NonNull::new_unchecked(&raw mut (*t.as_ptr()).slot) }
 }
 
 /// Gives `t` its message buffer (spec 11): a fresh zeroed frame mapped
