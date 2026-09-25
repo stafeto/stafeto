@@ -14,6 +14,7 @@
 mod console;
 mod arch;
 mod boot;
+mod channel;
 mod cleanup;
 #[cfg(not(feature = "ktest"))]
 mod init;

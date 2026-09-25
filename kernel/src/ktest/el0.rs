@@ -16,6 +16,7 @@
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::arch::{self, cache, gic, symbols, timer};
+use crate::channel::{self, Channel};
 use crate::cleanup;
 use crate::mm::{pages, phys};
 use crate::object::Object;
@@ -23,7 +24,10 @@ use crate::process::{self, Process, Stage};
 use crate::sched;
 use crate::syscall::{self, Values};
 use crate::thread::{self, Policy, Thread};
-use abi::{Call, Error, Handle, INFO_PROCESS_STATE, ProcessState, Rights};
+use abi::{
+    Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, ProcessState,
+    Rights, Source,
+};
 use core::ptr::NonNull;
 use kcore::esr;
 use kcore::frames::PAGE_SIZE;
@@ -66,6 +70,10 @@ unsafe extern "C" {
     static el0_buffer_mark: u8;
     static el0_child_fault: u8;
     static el0_start_then_close: u8;
+    static el0_receive: u8;
+    static el0_receive_then_exit: u8;
+    static el0_kill_notify_receive: u8;
+    static el0_raise_then_notify: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -79,6 +87,8 @@ const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_DONE <= *abi::T
 // el0.S makes these calls by number and knows these values.
 const _: () = assert!(
     Call::HandleClose.number() == 1
+        && Call::Receive.number() == 5
+        && Call::Notify.number() == 7
         && Call::ProcessCreate.number() == 12
         && Call::ProcessKill.number() == 13
         && Call::ProcessExit.number() == 14
@@ -90,7 +100,12 @@ const _: () = assert!(
         && Call::ObjectInfo.number() == 27
         && Call::DebugWrite.number() == 28
 );
-const _: () = assert!(DATA_VA == 0x80_0000 && INFO_PROCESS_STATE == 1 && Policy::Fifo as u8 == 1);
+const _: () = assert!(
+    DATA_VA == 0x80_0000
+        && INFO_PROCESS_STATE == 1
+        && Policy::Fifo as u8 == 1
+        && NO_WAIT == 0x10000
+);
 
 /// The line `debug_write_from_el0` prints; xtask looks for it in the output.
 const EL0_LINE: &[u8] = b"debug_write from EL0 reaches the console\n";
@@ -119,6 +134,13 @@ const INTERRUPT_EVERY: u32 = 61;
 /// the gigabyte from here, a table of the last level for each.
 const BIG_BASE: usize = 1 << 30;
 const BIG_PAGES: usize = 512;
+/// The bits of the notifications of the channel tests.
+const BITS: u64 = 0b1010;
+/// Threads that wait in one channel in `closing_a_channel_wakes_waiters_in_portions`:
+/// two processes full of them.
+const CROWD: usize = 2 * MAX_THREADS as usize;
+/// The ceiling of the waiters' process in `set_priority_moves_a_waiting_thread`.
+const CAPPED: u8 = PRIORITY + 3;
 
 struct El0Test {
     name: &'static str,
@@ -286,6 +308,26 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_descendants,
     },
     El0Test {
+        name: "kill_takes_a_waiting_thread_off_the_channel",
+        start: start_kill_waiting,
+        done: done_kill_waiting,
+    },
+    El0Test {
+        name: "waiting_thread_keeps_the_kernel_reference",
+        start: start_kernel_reference,
+        done: done_kernel_reference,
+    },
+    El0Test {
+        name: "set_priority_moves_a_waiting_thread",
+        start: start_requeue,
+        done: done_requeue,
+    },
+    El0Test {
+        name: "closing_a_channel_wakes_waiters_in_portions",
+        start: start_close_portions,
+        done: done_close_portions,
+    },
+    El0Test {
         name: "cleanup_yields_to_a_pending_interrupt",
         start: start_cleanup,
         done: done_cleanup_yields,
@@ -414,6 +456,16 @@ struct Fixture {
     /// slot 1 counted in x2 then.
     exit_at_interrupt: Option<(NonNull<Process>, u8)>,
     count_at_exit: Option<u64>,
+    /// Values the test's start fixes for its judges.
+    kept: [u64; 2],
+    /// A thread the test holds no reference to, which only the kernel's
+    /// reference keeps alive while it waits.
+    unheld: Option<NonNull<Thread>>,
+    /// Threads the test holds besides those of its slots; the teardown
+    /// lets them go.
+    crowd: [Option<NonNull<Thread>>; CROWD],
+    /// Threads in their pools (thread::in_use) once the test was built.
+    live_threads: usize,
 }
 
 // SAFETY: the fixture's objects are reached only under the kernel's rules
@@ -449,6 +501,10 @@ impl Fixture {
             left_loop: false,
             exit_at_interrupt: None,
             count_at_exit: None,
+            kept: [0; 2],
+            unheld: None,
+            crowd: [None; CROWD],
+            live_threads: 0,
         }
     }
 
@@ -504,8 +560,8 @@ fn start(first: usize) -> ! {
     report(
         "el0_tests_return_their_objects",
         check(
-            process::in_use() == 0 && thread::in_use() == 0,
-            "a process or a thread of the EL0 tests stayed in its pool",
+            process::in_use() == 0 && thread::in_use() == 0 && channel::in_use() == 0,
+            "a process, a thread or a channel of the EL0 tests stayed in its pool",
         ),
     );
     finish()
@@ -522,11 +578,12 @@ fn end(result: Result<(), &'static str>) -> ! {
 /// Drops what the test built. The timer stays the scheduler's: the next
 /// decision arms it for the next test.
 fn teardown() {
-    let (handles, threads, processes) = {
+    let (handles, threads, crowd, processes) = {
         let mut f = FIXTURE.lock();
         (
             core::mem::take(&mut f.handles),
             core::mem::take(&mut f.threads),
+            core::mem::replace(&mut f.crowd, [None; CROWD]),
             core::mem::take(&mut f.processes),
         )
     };
@@ -534,7 +591,7 @@ fn teardown() {
         // A handle the test closed itself is bad by now, which is fine.
         let _ = process::close_handle(p, h, CAUSE);
     }
-    for t in threads.into_iter().flatten() {
+    for t in threads.into_iter().chain(crowd).flatten() {
         // SAFETY: the test's references go with it; the thread leaves the
         // scheduler first, and a thread that runs stops being the running
         // one.
@@ -1201,7 +1258,13 @@ fn shared(f: &Fixture, i: usize) -> u64 {
 /// The process of a scheduling test, in slot 0, with the page of shared
 /// words at DATA_VA.
 fn sched_process(f: &mut Fixture) -> Result<(), &'static str> {
-    let mut p = new_process(f, 0)?;
+    sched_process_under(f, CEILING)
+}
+
+/// `sched_process` with priority ceiling `ceiling`.
+fn sched_process_under(f: &mut Fixture, ceiling: u8) -> Result<(), &'static str> {
+    let p = process::create_root(QUOTA, HANDLE_LIMIT, ceiling).map_err(|_| "no process")?;
+    let mut p = with_programs(f, 0, p)?;
     // SAFETY: the process belongs to this test, and nothing else uses it.
     f.data = unsafe { p.as_mut() }
         .map_frames(DATA_VA, PAGE_SIZE, Attrs::USER_DATA)
@@ -1389,7 +1452,7 @@ fn done_lowering(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "the higher thread did not run before the call returned",
     )?;
     check(
-        t.base_priority == PRIORITY - 5 && t.sched.priority() == PRIORITY - 5,
+        t.sched.base() == PRIORITY - 5 && t.sched.priority() == PRIORITY - 5,
         "the thread did not keep its new priority",
     )
 }
@@ -2258,5 +2321,239 @@ fn done_grandchild(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         cleanup::len() == 0 && process::translate(grandchild, DATA_VA).is_none(),
         "the grandchild's teardown did not end before the kill returned",
+    )
+}
+
+// Channels (spec 6.1, 6.8, 7.7): threads that wait in receive.
+
+/// x1-x11 of a receive that took one post of `bits` from the slot of label
+/// 0.
+fn notice(bits: u64) -> [u64; 11] {
+    Notification {
+        source: Source::Unlabeled,
+        label: 0,
+        bits,
+        count: 1,
+    }
+    .to_words()
+}
+
+/// A thread waits in receive, in a process of its own. Below it, a thread
+/// of another process, which holds the channel with RECEIVE too, kills
+/// that process, notifies the channel and takes the notification back at
+/// once: the kill took the waiting thread off the channel (spec 7.7), the
+/// slot went to no thread that ended, and the thread that waited kept its
+/// arguments in its registers.
+fn start_kill_waiting(f: &mut Fixture) -> Result<(), &'static str> {
+    let waiter = spawn(f, 0, &raw const el0_receive, 0)?;
+    let killer = spawn(f, 1, &raw const el0_kill_notify_receive, 0)?;
+    sched::set_priority(killer, JUDGE, FIFO).map_err(|_| "no killer")?;
+    let p = f.processes[0].expect("the waiter's process");
+    let q = f.processes[1].expect("the killer's process");
+    let c = channel::create(q, PRIORITY).map_err(|_| "no channel")?;
+    let handles = [
+        give(p, Object::Channel(c), Rights::RECEIVE),
+        give(q, Object::Channel(c), Rights::NOTIFY | Rights::RECEIVE),
+        give(q, Object::Process(p), Rights::MANAGE),
+    ];
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let [waiting, own, target] = handles;
+    let (waiting, own) = (waiting?, own?);
+    set_args(waiter, &[waiting, 0]);
+    set_args(killer, &[target?, own, BITS]);
+    f.kept = [waiting, 0];
+    f.ends[0] = true;
+    Ok(())
+}
+
+fn done_kill_waiting(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 1, "the killed thread came back from receive")?;
+    let x = &t.regs.x;
+    check(x[19] == 0 && x[20] == 0, "process_kill or notify failed")?;
+    check(
+        x[0] == 0 && x[1..12] == notice(BITS),
+        "the notification did not stay in the channel for the killer",
+    )?;
+    let waiter = slot_thread(f, 0);
+    check(
+        waiter.sched.state() == State::Dead && waiter.regs.x[..2] == f.kept,
+        "the killed thread got a result of receive",
+    )
+}
+
+/// A thread waits in receive, and nothing but the kernel refers to it: no
+/// handle, and the test let its own reference go. The kernel's reference
+/// keeps it while it waits (spec 8.1): a checker below it finds it in its
+/// pool and waiting. The killer below the checker kills its process; the
+/// thread leaves the channel and goes with the kernel's reference before
+/// the kill returns.
+fn start_kernel_reference(f: &mut Fixture) -> Result<(), &'static str> {
+    let p = new_process(f, 0)?;
+    let q = new_process(f, 1)?;
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let held = give(p, Object::Channel(c), Rights::RECEIVE);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let entry = user_address(&raw const el0_receive_then_exit);
+    let waiter = thread::create(p, entry, 0, held?, PRIORITY, FIFO).map_err(|_| "no thread")?;
+    let started = thread::start(waiter);
+    // SAFETY: the reference `create` handed out goes; the kernel's keeps
+    // the thread once it started.
+    unsafe { thread::release(waiter, CAUSE) };
+    started.map_err(|_| "the waiting thread did not start")?;
+    f.unheld = Some(waiter);
+    let target = give(q, Object::Process(p), Rights::MANAGE)?;
+    let checker = user_address(&raw const el0_done_at_once);
+    let killer = user_address(&raw const el0_kill);
+    for (slot, entry, arg, priority) in [(1, checker, 0, JUDGE + 1), (2, killer, target, JUDGE)] {
+        let t = thread::create(q, entry, 0, arg, priority, FIFO).map_err(|_| "no thread")?;
+        f.threads[slot] = Some(t);
+    }
+    f.live_threads = thread::in_use();
+    Ok(())
+}
+
+fn done_kernel_reference(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        check(
+            thread::in_use() == f.live_threads,
+            "a waiting thread that nothing but the kernel refers to went",
+        )?;
+        // SAFETY: the kernel's reference keeps the thread, as the count
+        // shows.
+        let waiter = unsafe { f.unheld.expect("the waiting thread").as_ref() };
+        return check(
+            waiter.sched.state() == State::Waiting,
+            "the thread does not wait",
+        );
+    }
+    check(t.regs.x[0] == 0, "process_kill failed")?;
+    check(
+        thread::in_use() == f.live_threads - 1 && cleanup::len() == 0,
+        "the thread that waited did not go with the kernel's reference",
+    )
+}
+
+/// Two threads wait in receive at one level, the first ahead of the
+/// second. A thread below them raises the second above the first and
+/// notifies the channel: the second moved in the queue of receivers (spec
+/// 6.1) and takes the notification at once; the first waits on. The
+/// channel's slot, at 40, is above the waiters' ceiling, and the raised
+/// thread works at the ceiling (spec 6.6).
+fn start_requeue(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process_under(f, CAPPED)?;
+    let first = sched_thread(f, 0, &raw const el0_receive, PRIORITY, FIFO)?;
+    let second = sched_thread(f, 1, &raw const el0_receive, PRIORITY, FIFO)?;
+    let raiser = sched_thread(f, 2, &raw const el0_raise_then_notify, JUDGE, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    // The channel's slot is above the waiters' ceiling: its payer's is 63.
+    let q = new_process(f, 1)?;
+    let c = channel::create(q, 40).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::NOTIFY | Rights::RECEIVE);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let h = h?;
+    let raised = give_thread(f, second)?;
+    set_args(first, &[h, 0]);
+    set_args(second, &[h, 0]);
+    let above = u64::from(PRIORITY + 2);
+    set_args(raiser, &[raised, above, FIFO as u64, h, BITS]);
+    f.ends[0] = true;
+    Ok(())
+}
+
+fn done_requeue(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => Err("the thread that kept its level took the notification"),
+        1 => check(
+            x[0] == 0
+                && x[1..12] == notice(BITS)
+                && t.sched.base() == PRIORITY + 2
+                && t.sched.priority() == CAPPED,
+            "the raised thread did not take the notification at its new level",
+        ),
+        _ => {
+            check(
+                x[19] == 0 && x[0] == 0,
+                "thread_set_priority or notify failed",
+            )?;
+            check(
+                slot_thread(f, 0).sched.state() == State::Waiting,
+                "the first thread does not wait on",
+            )
+        }
+    }
+}
+
+/// Threads of two processes wait in receive on one channel, a process
+/// full of them each, each process with a handle with RECEIVE. The closer
+/// below them closes both handles, and the last one closes the channel
+/// (spec 6.8): the stage Close wakes the waiters with PEER_CLOSED, 64 a
+/// portion, in two portions at the closer's level (spec 7.7); an interrupt
+/// comes after every portion, and none begins while one is pending. The
+/// judge below the closer finds every waiter ended with PEER_CLOSED.
+fn start_close_portions(f: &mut Fixture) -> Result<(), &'static str> {
+    let own = new_process(f, 0)?;
+    let entry = user_address(&raw const el0_done_at_once);
+    for (slot, priority) in [(0, JUDGE), (1, JUDGE - 1)] {
+        let t = thread::create(own, entry, 0, 0, priority, FIFO).map_err(|_| "no thread")?;
+        f.threads[slot] = Some(t);
+    }
+    let c = channel::create(own, PRIORITY).map_err(|_| "no channel")?;
+    let made = (1..=2).try_for_each(|slot| crowd_of(f, slot, c));
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    made?;
+    let _ = channel::take_close_portions();
+    cleanup::take_late();
+    f.interrupt_every = Some(1);
+    Ok(())
+}
+
+/// A process in slot `slot` with a handle with RECEIVE to `c`, which the
+/// test keeps, and abi::MAX_THREADS threads of it, started, that will wait
+/// in receive on the channel, in the crowd.
+fn crowd_of(f: &mut Fixture, slot: usize, c: NonNull<Channel>) -> Result<(), &'static str> {
+    let p = new_process(f, slot)?;
+    let h = process::insert_handle(p, Object::Channel(c), Rights::RECEIVE)
+        .map_err(|_| "a handle did not go in")?;
+    f.handles[slot - 1] = Some((p, h));
+    let entry = user_address(&raw const el0_receive_then_exit);
+    let n = MAX_THREADS as usize;
+    for i in (slot - 1) * n..slot * n {
+        let t = thread::create(p, entry, 0, h.0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+        f.crowd[i] = Some(t);
+        thread::start(t).map_err(|_| "a thread did not start")?;
+    }
+    Ok(())
+}
+
+fn done_close_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    // SAFETY: the test holds a reference to each thread of the crowd.
+    let crowd = || f.crowd.iter().flatten().map(|w| unsafe { w.as_ref() });
+    if f.slot(t) == 0 {
+        let waiting = crowd().all(|w| w.sched.state() == State::Waiting);
+        for &(p, h) in f.handles.iter().flatten() {
+            process::close_handle(p, h, JUDGE).map_err(|_| "a handle did not close")?;
+        }
+        return check(waiting, "a thread of the crowd did not wait");
+    }
+    check(
+        crowd().all(|w| w.sched.state() == State::Dead && w.regs.x[0] == Error::PeerClosed.code()),
+        "a thread that waited did not end with PEER_CLOSED",
+    )?;
+    check(
+        channel::take_close_portions() == (2, 64, 1 << JUDGE),
+        "the stage Close did not wake the waiters 64 a portion at the closer's level",
+    )?;
+    check(
+        !cleanup::take_late() && f.interrupts >= 2,
+        "a portion began while an interrupt was pending",
     )
 }

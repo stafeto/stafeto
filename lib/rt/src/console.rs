@@ -7,24 +7,26 @@
 //! abi::INLINE_MAX bytes, one call per piece. A line of up to 64 bytes,
 //! its newline included, is one call, so lines of threads do not mix.
 
+use crate::handle::{Handle, Resource};
 use crate::sys;
-use abi::{Error, Handle, INLINE_MAX};
+use abi::{Error, INLINE_MAX};
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// The handle output goes through; Handle::INVALID until `set`.
-static CONSOLE: AtomicU64 = AtomicU64::new(Handle::INVALID.0);
+/// The handle output goes through; abi::Handle::INVALID until `set`.
+static CONSOLE: AtomicU64 = AtomicU64::new(abi::Handle::INVALID.0);
 
-/// Output goes through `resource` from now on.
-pub fn set(resource: Handle) {
-    CONSOLE.store(resource.0, Ordering::Relaxed);
+/// Output goes through `resource` from now on; the program keeps the
+/// handle open meanwhile.
+pub fn set(resource: &Handle<Resource>) {
+    CONSOLE.store(resource.raw().0, Ordering::Relaxed);
 }
 
 /// The handle `set` gave; BAD_HANDLE before it.
-fn resource() -> Result<Handle, Error> {
-    match Handle(CONSOLE.load(Ordering::Relaxed)) {
-        Handle::INVALID => Err(Error::BadHandle),
-        h => Ok(h),
+fn resource() -> Result<Handle<Resource>, Error> {
+    match abi::Handle(CONSOLE.load(Ordering::Relaxed)) {
+        abi::Handle::INVALID => Err(Error::BadHandle),
+        h => Ok(Handle::from_raw(h)),
     }
 }
 
@@ -33,7 +35,7 @@ fn resource() -> Result<Handle, Error> {
 pub fn write(bytes: &[u8]) -> Result<(), Error> {
     let resource = resource()?;
     for piece in bytes.chunks(INLINE_MAX) {
-        sys::debug_write(resource, piece)?;
+        sys::debug_write(&resource, piece)?;
     }
     Ok(())
 }
@@ -56,7 +58,7 @@ pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<(), Error> {
 
 /// Formatted bytes on their way out, a piece at a time.
 struct Pieces {
-    resource: Handle,
+    resource: Handle<Resource>,
     buf: [u8; INLINE_MAX],
     len: usize,
     /// The first call that failed; nothing is written after it.
@@ -67,7 +69,7 @@ impl Pieces {
     fn flush(&mut self) {
         if self.len > 0
             && self.error.is_none()
-            && let Err(e) = sys::debug_write(self.resource, &self.buf[..self.len])
+            && let Err(e) = sys::debug_write(&self.resource, &self.buf[..self.len])
         {
             self.error = Some(e);
         }

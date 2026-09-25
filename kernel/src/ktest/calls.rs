@@ -9,6 +9,7 @@
 
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::boot::Boot;
+use crate::channel::{self, Channel};
 use crate::cleanup;
 use crate::mm::{pages, phys};
 use crate::object::Object;
@@ -16,10 +17,10 @@ use crate::process::{self, Process};
 use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
 use abi::{
-    Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY,
-    INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE, INIT_RESOURCE_RIGHTS,
-    INIT_THREAD, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState, Rights,
-    START_CHANNEL,
+    CHANNEL_RIGHTS, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
+    INFO_PROCESS_MEMORY, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
+    INIT_RESOURCE_RIGHTS, INIT_THREAD, KernelStats, NO_WAIT, Notification, OWNER_RIGHTS,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
@@ -479,7 +480,7 @@ fn set_priority_cases(
     // SAFETY: the thread is the test's and never runs.
     let t = unsafe { low.as_ref() };
     check(
-        t.base_priority == 20
+        t.sched.base() == 20
             && t.sched.priority() == 20
             && t.sched.policy() == Policy::RoundRobin
             && t.sched.state() == State::Stopped,
@@ -541,7 +542,7 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     c.fails(n, &[page, 16, 20, 0, 5, 0], Error::InvalidArgs)?;
     c.fails(n, &[page, 16, 20, closed, 0, 0], Error::InvalidArgs)?;
     c.fails(n, &[page, 16, 20, closed, 5, 0], Error::BadHandle)?;
-    // No object is a channel before milestone 1.3b.
+    // The system resource is no channel.
     c.fails(n, &[page, 16, 20, resource, 5, 0], Error::WrongType)?;
     c.fails(n, &[page, 16, 20, 0, 0, closed], Error::BadHandle)?;
     c.fails(n, &[page, 16, 20, 0, 0, resource], Error::WrongType)?;
@@ -910,7 +911,7 @@ fn new_thread_cases(c: &Caller, low: NonNull<Process>, h: Handle) -> Result<(), 
         t.regs.x[0] == 7
             && t.regs.elr == USER_VA as u64
             && t.regs.sp == 0x80_1000
-            && t.base_priority == 20
+            && t.sched.base() == 20
             && t.sched.policy() == Policy::Fifo
             && t.sched.state() == State::Stopped
             && t.process() == low,
@@ -1104,5 +1105,224 @@ fn hasten_cases(c: &Caller, child: Handle, ready: NonNull<Thread>) -> Result<(),
     check(
         sched::first(10) == Some(ready),
         "the thread at 10 did not stay ready",
+    )
+}
+
+/// x1-x9 of a receive that took `count` posts of `bits` from the slot of
+/// label 0; x10 and x11, the label and the token, are 0.
+fn unlabeled(bits: u64, count: u32) -> [u64; 9] {
+    let n = Notification {
+        source: Source::Unlabeled,
+        label: 0,
+        bits,
+        count,
+    };
+    n.to_words()[..9].try_into().expect("x1-x9")
+}
+
+/// The channel behind the caller's handle `h`.
+fn channel_of(c: &Caller, h: Handle) -> Result<NonNull<Channel>, &'static str> {
+    // SAFETY: the caller's process is the test's.
+    unsafe { c.process.as_ref() }
+        .lookup(h, Rights::NONE, Object::channel)
+        .map_err(|_| "the handle does not name a channel")
+}
+
+/// Runs `body` with the rest of the caller's quota charged, so that no new
+/// page fits (NO_MEMORY), and gives the rest back afterwards.
+fn with_used_quota(
+    c: &Caller,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let q = process::quota(c.process);
+    let rest = q.limit() - q.returned() - q.used();
+    process::charge(c.process, rest).map_err(|_| "the rest of the quota did not charge")?;
+    let result = body();
+    process::refund(c.process, rest);
+    result
+}
+
+/// channel_create, notify and receive check in the order of spec 11 and
+/// change x0 alone on an error: values first (a priority outside 1-63, bit
+/// 63 of the bits, flags other than NO_WAIT), then the handle (BAD_HANDLE,
+/// WRONG_TYPE, ACCESS_DENIED without NOTIFY or RECEIVE), then the ceiling
+/// (a priority above the caller's 30), then the caller's table
+/// (LIMIT_REACHED) and its quota for a page of its pool of channels
+/// (NO_MEMORY), with nothing made. A good channel_create returns a handle
+/// with abi::CHANNEL_RIGHTS to a channel the caller pays for; notify
+/// returns nothing; receive with NO_WAIT on an empty channel fails with
+/// WOULD_BLOCK, and otherwise returns the notification in x1-x11.
+pub fn channel_calls_check_their_arguments(_: &Boot) -> Result<(), &'static str> {
+    let channels = channel::in_use();
+    let c = Caller::with_ceiling(30)?;
+    let result = channel_create_cases(&c);
+    c.release();
+    result?;
+    check(
+        channel::in_use() == channels,
+        "a channel of the test stayed in its pool",
+    )
+}
+
+fn channel_create_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::CreateChannel.number();
+    for priority in [0, 64, 0x100 | 10] {
+        c.fails(n, &[priority], Error::InvalidArgs)?;
+    }
+    c.fails(n, &[31], Error::AccessDenied)?;
+    // The table's first page of blocks, so that the page below is the
+    // pool's.
+    let resource = c.insert(Object::Resource, Rights::NONE)?;
+    let channels = channel::in_use();
+    with_used_quota(c, || {
+        c.fails(n, &[30], Error::NoMemory)?;
+        with_full_table(c, n, &[30])
+    })?;
+    cleanup::drain();
+    check(
+        channel::in_use() == channels,
+        "a channel that did not fit stayed",
+    )?;
+    let h = c.created(n, &[30])?;
+    let result = channel_of(c, h).and_then(|ch| {
+        // SAFETY: the caller's process is the test's.
+        let rights = unsafe { c.process.as_ref() }.lookup(h, CHANNEL_RIGHTS, Object::channel);
+        check(
+            rights.is_ok() && channel::payer(ch) == c.process,
+            "the handle does not carry the channel's rights, or the caller does not pay",
+        )?;
+        let notify_only = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
+        let receive_only = c.insert(Object::Channel(ch), Rights::RECEIVE)?;
+        let result = notify_receive_cases(c, [h, notify_only, receive_only, resource]);
+        c.close(notify_only)?;
+        c.close(receive_only)?;
+        result
+    });
+    c.close(h)?;
+    c.close(resource)?;
+    result
+}
+
+fn notify_receive_cases(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static str> {
+    let [h, notify_only, receive_only, resource] = handles.map(|h| h.0);
+    let closed = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(closed)?;
+    let closed = closed.0;
+    let (notify, receive) = (Call::Notify.number(), Call::Receive.number());
+    c.fails(notify, &[closed, 1 << 63], Error::InvalidArgs)?;
+    c.fails(notify, &[closed, 1], Error::BadHandle)?;
+    c.fails(notify, &[resource, 1], Error::WrongType)?;
+    c.fails(notify, &[receive_only, 1], Error::AccessDenied)?;
+    for flags in [1, NO_WAIT | 1 << 17, 1 << 63] {
+        c.fails(receive, &[closed, flags], Error::InvalidArgs)?;
+    }
+    c.fails(receive, &[closed, NO_WAIT], Error::BadHandle)?;
+    c.fails(receive, &[resource, NO_WAIT], Error::WrongType)?;
+    c.fails(receive, &[notify_only, NO_WAIT], Error::AccessDenied)?;
+    c.fails(receive, &[receive_only, NO_WAIT], Error::WouldBlock)?;
+    c.succeeds(notify, &[notify_only, 0b110], &[])?;
+    c.succeeds(notify, &[h, 1], &[])?;
+    let mut t = c.thread;
+    // SAFETY: the thread is the test's and never runs.
+    unsafe { t.as_mut() }.regs.x[10..12].copy_from_slice(&[0x5A, 0x5B]);
+    // A slot is queued: receive takes it and does not wait.
+    c.succeeds(receive, &[receive_only, 0], &unlabeled(0b111, 2))?;
+    // SAFETY: as above.
+    let (label, token) = unsafe { (t.as_ref().regs.x[10], t.as_ref().regs.x[11]) };
+    check(
+        (label, token) == (0, 0),
+        "receive did not write the label and the token in x10 and x11",
+    )?;
+    c.fails(receive, &[h, NO_WAIT], Error::WouldBlock)
+}
+
+/// (base, effective) priority of `t`, which never runs.
+fn priorities(t: NonNull<Thread>) -> (u8, u8) {
+    // SAFETY: the thread is the test's.
+    let n = unsafe { &t.as_ref().sched };
+    (n.base(), n.priority())
+}
+
+/// The boost by a notification never lifts a thread above the ceiling of
+/// its process (spec 6.6, 8): a channel of priority 40, which a process
+/// under ceiling 63 made, notifies a receiver at base 10 under ceiling 30,
+/// which works at 30 afterwards; a receiver at base 10 under ceiling 63
+/// works at 40. The next receive of each ends its boost.
+pub fn boost_is_capped_by_the_ceiling(_: &Boot) -> Result<(), &'static str> {
+    let callers = [63, 30].map(Caller::with_ceiling);
+    let result = match &callers {
+        [Ok(owner), Ok(low)] => boost_cases(owner, low),
+        _ => Err("no process or thread"),
+    };
+    for caller in callers.into_iter().flatten() {
+        caller.release();
+    }
+    result
+}
+
+fn boost_cases(owner: &Caller, low: &Caller) -> Result<(), &'static str> {
+    let h = owner.created(Call::CreateChannel.number(), &[40])?;
+    let result = channel_of(owner, h).and_then(|ch| {
+        let r = low.insert(Object::Channel(ch), Rights::RECEIVE)?;
+        let result = boost_levels(owner, low, h, r);
+        low.close(r)?;
+        result
+    });
+    owner.close(h)?;
+    result
+}
+
+fn boost_levels(owner: &Caller, low: &Caller, h: Handle, r: Handle) -> Result<(), &'static str> {
+    let (notify, receive) = (Call::Notify.number(), Call::Receive.number());
+    owner.succeeds(notify, &[h.0, 1], &[])?;
+    low.succeeds(receive, &[r.0, NO_WAIT], &unlabeled(1, 1))?;
+    check(
+        priorities(low.thread) == (10, 30),
+        "the boost of a receiver under ceiling 30 is not 30",
+    )?;
+    owner.succeeds(notify, &[h.0, 1], &[])?;
+    owner.succeeds(receive, &[h.0, NO_WAIT], &unlabeled(1, 1))?;
+    check(
+        priorities(owner.thread) == (10, 40),
+        "the boost of a receiver under ceiling 63 is not the notification's 40",
+    )?;
+    low.fails(receive, &[r.0, NO_WAIT], Error::WouldBlock)?;
+    owner.fails(receive, &[h.0, NO_WAIT], Error::WouldBlock)?;
+    check(
+        priorities(low.thread) == (10, 10) && priorities(owner.thread) == (10, 10),
+        "the next receive did not end the boost",
+    )
+}
+
+/// Spec 15.2 (refusals): when the last handle with RECEIVE goes, the
+/// channel closes (spec 6.5, 6.8), and the slot queued in it goes at the
+/// stage Close. notify through a handle that is left, which a program gets
+/// with handle_duplicate (task 5) and the kernel puts in here, fails with
+/// PEER_CLOSED after its own checks, and changes x0 alone. Its last handle
+/// lets the channel go.
+pub fn notify_after_close_is_peer_closed(_: &Boot) -> Result<(), &'static str> {
+    let channels = channel::in_use();
+    with_caller(|c| {
+        let n = Call::Notify.number();
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let left = channel_of(c, h).and_then(|ch| c.insert(Object::Channel(ch), Rights::NOTIFY));
+        c.succeeds(n, &[h.0, 1], &[])?;
+        c.close(h)?;
+        let left = left?;
+        let queued = cleanup::len();
+        cleanup::drain();
+        let result = c
+            .fails(n, &[left.0, 1 << 63], Error::InvalidArgs)
+            .and_then(|()| c.fails(n, &[left.0, 1], Error::PeerClosed));
+        c.close(left)?;
+        result?;
+        check(
+            queued == 1,
+            "the closed channel did not go to its stage Close with its slot queued",
+        )
+    })?;
+    check(
+        channel::in_use() == channels,
+        "the channel stayed after its last handle",
     )
 }

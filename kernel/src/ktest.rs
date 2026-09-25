@@ -12,6 +12,7 @@ use crate::arch::symbols;
 use crate::arch::user::UserRegs;
 use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
+use crate::channel;
 use crate::cleanup;
 use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::{self, KernelPages};
@@ -252,6 +253,18 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "kill_hastens_a_dying_process",
         calls::kill_hastens_a_dying_process,
+    ),
+    (
+        "channel_calls_check_their_arguments",
+        calls::channel_calls_check_their_arguments,
+    ),
+    (
+        "boost_is_capped_by_the_ceiling",
+        calls::boost_is_capped_by_the_ceiling,
+    ),
+    (
+        "notify_after_close_is_peer_closed",
+        calls::notify_after_close_is_peer_closed,
     ),
 ];
 
@@ -1390,7 +1403,7 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
 /// frames cut down to what a root's quota leaves, the root and its three
 /// children fill every kind they pay for by the page, one after another,
 /// until their quotas run out: threads with their buffers and the tables
-/// over them, handles, and children with a page of quota. After every
+/// over them, handles, children with a page of quota, and channels. After every
 /// kind the free frames are exactly the part of the quotas of the tree
 /// nobody used: no page was taken without its charge, and none that
 /// passed its charge missed its frame.
@@ -1419,9 +1432,10 @@ enum Kind {
     Threads,
     Handles,
     Children,
+    Channels,
 }
 
-const KINDS: [Kind; 3] = [Kind::Threads, Kind::Handles, Kind::Children];
+const KINDS: [Kind; 4] = [Kind::Threads, Kind::Handles, Kind::Children, Kind::Channels];
 
 /// Three children of `root`, each filling the kinds in another order, and
 /// then the root itself; the free frames are checked after each kind.
@@ -1466,6 +1480,12 @@ fn fill_kind(p: NonNull<process::Process>, kind: Kind) -> Result<(), &'static st
                 let held = process::insert_handle(p, Object::Process(c), Rights::NONE);
                 // SAFETY: as above.
                 unsafe { process::release(c, CAUSE) };
+                held.map(|_| ())
+            }),
+            Kind::Channels => channel::create(p, 10).and_then(|c| {
+                let held = process::insert_handle(p, Object::Channel(c), Rights::RECEIVE);
+                // SAFETY: as above.
+                unsafe { channel::release(c, Rights::NONE, CAUSE) };
                 held.map(|_| ())
             }),
         };
@@ -2259,7 +2279,7 @@ fn check_thread_start(p: core::ptr::NonNull<process::Process>) -> Result<(), &'s
             && started.fp.v.iter().all(|&v| v == 0)
             && started.fp.fpcr == 0
             && started.fp.fpsr == 0
-            && started.base_priority == 10
+            && started.sched.base() == 10
             && started.sched.priority() == 10
             && started.sched.policy() == Policy::Fifo
             && started.sched.state() == State::Stopped

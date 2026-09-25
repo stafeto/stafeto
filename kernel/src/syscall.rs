@@ -16,19 +16,22 @@
 //! is given: addresses are only numbers to check. A call that ends its
 //! caller (thread_exit, process_exit, process_kill of its own process)
 //! never returns: it leaves through sched::resume, and the caller's
-//! registers keep the arguments. Test builds also know numbers of their
-//! own, in abi::TEST_CALLS.
+//! registers keep the arguments. `receive` writes x10 and x11 as well when
+//! it takes something, and a thread that waits in it gets its result when
+//! the wait ends (spec 11). Test builds also know numbers of their own, in
+//! abi::TEST_CALLS.
 
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Thread};
-use crate::{cleanup, sched};
+use crate::{channel, cleanup, sched};
 use abi::{
-    Call, Error, Handle, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState,
-    Rights,
+    CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, Notification, OWNER_RIGHTS, ProcessHandles,
+    ProcessMemory, ProcessState, Rights,
 };
 use core::ptr::NonNull;
+use kcore::notify::{bits_arg, wait_arg};
 use kcore::process::{handle_limit_arg, quota_arg};
 use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
 use kcore::thread::{check_buffer, check_start};
@@ -73,6 +76,9 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     args.copy_from_slice(&unsafe { thread.as_ref() }.regs.x[..10]);
     let result = match Call::from_number(number) {
         Some(Call::HandleClose) => handle_close(thread, &args),
+        Some(Call::CreateChannel) => channel_create(thread, &args),
+        Some(Call::Receive) => return receive(thread, &args),
+        Some(Call::Notify) => notify(thread, &args),
         Some(Call::ProcessCreate) => process_create(thread, &args),
         Some(Call::ProcessKill) => process_kill(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args),
@@ -101,6 +107,17 @@ pub fn set_result(mut thread: NonNull<Thread>, result: Result<Values, Error>) {
         }
         Err(e) => x[0] = e.code(),
     }
+}
+
+/// Writes what `receive` took into the thread's registers: 0 in x0 and the
+/// notification in x1-x11 (abi::Notification::to_words). x10 and x11 lie
+/// past the values of `Values`: only `receive` writes them (spec 11).
+pub fn set_notification(mut thread: NonNull<Thread>, n: Notification) {
+    // SAFETY: the thread is alive, and nothing else refers to its
+    // registers now.
+    let x = &mut unsafe { thread.as_mut() }.regs.x;
+    x[0] = 0;
+    x[1..=11].copy_from_slice(&n.to_words());
 }
 
 /// The process of the thread that made the call.
@@ -141,18 +158,76 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
     unsafe { caller(thread).as_ref() }.ceiling()
 }
 
+/// channel_create(x0 priority): a channel whose slot of label 0 has the
+/// priority (spec 6.5); x1 returns a handle to it with SEND, NOTIFY,
+/// RECEIVE, DUPLICATE and TRANSFER (abi::CHANNEL_RIGHTS). The priority is
+/// 1-63 (INVALID_ARGS) and no higher than the caller's ceiling
+/// (ACCESS_DENIED). Resources come last, in the order the call occupies
+/// them (spec 11): the caller's table has room for the handle
+/// (LIMIT_REACHED), then the caller's quota pays for a page of its pool of
+/// channels when the pool grows and for a block of its table (NO_MEMORY).
+/// A channel whose handle did not go in goes again.
+fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let priority = priority_arg(a[0])?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    process::handle_room(caller(thread))?;
+    let c = channel::create(caller(thread), priority)?;
+    let h = process::insert_handle(caller(thread), Object::Channel(c), CHANNEL_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// notify(x0 channel with NOTIFY, x1 bits): the bits first, since bit 63,
+/// CLIENT_GONE, is the kernel's (INVALID_ARGS); then the handle, and
+/// PEER_CLOSED once no handle with RECEIVE is left (spec 6.5, 6.8). The
+/// bits go into the channel's slot of label 0, ORed with those not yet
+/// received, and the slot to the top receiver that waits or into the
+/// queue of slots. A receiver woken above the caller runs before the call
+/// returns. No memory is taken, and nothing waits.
+fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let bits = bits_arg(a[1])?;
+    let c = lookup(thread, a[0], Rights::NOTIFY, Object::channel)?;
+    channel::notify(c, bits, cause(thread))?;
+    Ok(Values::NONE)
+}
+
+/// receive(x0 channel with RECEIVE, x1 flags): the flags first, bit 16
+/// NO_WAIT and no other (INVALID_ARGS), then the handle. A call that passed
+/// its checks ends the caller's boost by its last notification (spec
+/// 6.6). What the queue of slots has comes at once: x1-x11 as
+/// abi::Notification::to_words puts them, and the caller works at the
+/// slot's priority, under its ceiling, until its next receive. With
+/// nothing queued, WOULD_BLOCK under NO_WAIT; otherwise the caller waits
+/// in the channel (spec 6.1), and the end of the wait writes its result:
+/// a notification, or PEER_CLOSED in x0 alone once the last handle with
+/// RECEIVE went. The call writes its own result: x0-x11 are its.
+fn receive(thread: NonNull<Thread>, a: &Args) {
+    let taken = wait_arg(a[1]).and_then(|wait| {
+        let c = lookup(thread, a[0], Rights::RECEIVE, Object::channel)?;
+        channel::receive(thread, c, wait)
+    });
+    match taken {
+        Ok(Some(n)) => set_notification(thread, n),
+        // The thread waits: the end of the wait writes its registers.
+        Ok(None) => {}
+        Err(e) => set_result(thread, Err(e)),
+    }
+}
+
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
 /// x3 exit channel, x4 notification priority, x5 start channel): a new
 /// process with an empty address space and handle table; x1 returns a
 /// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
 /// the first two for milestone 1.3, so that the set never changes. The
 /// quota is whole pages, at least one; the limit 1-16384; the ceiling 1-63
-/// and no higher than the caller's (ACCESS_DENIED). Exit channels come in
-/// milestone 1.3b: x3 is 0, and x4 with it; any other x3 is looked up as a
-/// channel and fails (BAD_HANDLE, WRONG_TYPE). The start channel, a
-/// channel with TRANSFER, moves into entry 0 of the child's table from
-/// milestone 1.3c (spec 13.3): x5 is 0, and any other value is looked up
-/// after x3 and fails the same way. Entry 0 then holds a stub that goes at
+/// and no higher than the caller's (ACCESS_DENIED). Exit channels come
+/// later in milestone 1.3b: x3 is 0, and x4 with it; any other x3 is looked
+/// up and fails (BAD_HANDLE, WRONG_TYPE, a channel too until then). The
+/// start channel, a channel with TRANSFER, moves into entry 0 of the
+/// child's table (spec 13.3) from then on as well: x5 is 0, and any other
+/// value is looked up after x3 and fails the same way. Entry 0 then holds a stub that goes at
 /// once (process::reserve_start). The child is the caller's process's
 /// (spec 4): it ends when its parent does. Resources come last and in the
 /// order the call occupies them, a limit that needs no allocation first
@@ -172,7 +247,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let ceiling = priority_arg(a[2])?;
     let channel = a[3] != 0;
     let notify = notify_priority_arg(a[4], channel)?;
-    // No object is a channel before milestone 1.3b.
+    // No object is taken as an exit channel or a start channel yet.
     if channel {
         lookup(thread, a[3], Rights::NOTIFY, |_| None::<()>)?;
     }

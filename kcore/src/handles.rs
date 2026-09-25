@@ -357,23 +357,29 @@ impl<T> HandleTable<T> {
 
     /// Drops every object and gives every chunk back; the table is empty afterwards.
     pub fn release(&mut self, src: &mut impl ChunkSource<T>) {
-        self.release_with(src, drop);
+        self.release_with(src, |object, _| drop(object));
     }
 
-    /// Hands every object to `f`, once each, and gives every chunk back;
-    /// the table is empty afterwards. Objects that need more than a drop
-    /// when their handle goes, such as counted references, leave this way.
-    pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T)) {
+    /// Hands every object to `f` with the rights of its handle, once each,
+    /// and gives every chunk back; the table is empty afterwards. Objects
+    /// that need more than a drop when their handle goes, such as counted
+    /// references, leave this way.
+    pub fn release_with(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T, Rights)) {
         while !self.release_step(src, &mut f) {}
     }
 
     /// One step of a release: the last chunk goes, its live objects
-    /// handed to `f`, at most CHUNK of them; with the last chunk, or when
-    /// there is none, the directory. True when the table holds no memory
-    /// any more: it is then empty and fresh, with its limit. From the
-    /// first step until then the table takes nothing new, handles into
-    /// chunks that went are bad, and `len` counts the objects left.
-    pub fn release_step(&mut self, src: &mut impl ChunkSource<T>, mut f: impl FnMut(T)) -> bool {
+    /// handed to `f` with the rights of their handles, at most CHUNK of
+    /// them; with the last chunk, or when there is none, the directory.
+    /// True when the table holds no memory any more: it is then empty and
+    /// fresh, with its limit. From the first step until then the table
+    /// takes nothing new, handles into chunks that went are bad, and `len`
+    /// counts the objects left.
+    pub fn release_step(
+        &mut self,
+        src: &mut impl ChunkSource<T>,
+        mut f: impl FnMut(T, Rights),
+    ) -> bool {
         if let Some(c) = self.chunk_count.checked_sub(1) {
             self.closing = true;
             self.free_head = NO_ENTRY;
@@ -386,9 +392,10 @@ impl<T> HandleTable<T> {
             unsafe {
                 let entries = (&raw mut (*chunk.as_ptr()).entries).cast::<Entry<T>>();
                 for i in 0..CHUNK {
-                    if let Some(object) = (*entries.add(i)).object.take() {
+                    let entry = &mut *entries.add(i);
+                    if let Some(object) = entry.object.take() {
                         self.live -= 1;
-                        f(object);
+                        f(object, entry.rights);
                     }
                     entries.add(i).drop_in_place();
                 }
@@ -963,13 +970,27 @@ mod tests {
             t.remove(*h).unwrap();
         }
         let mut out = Vec::new();
-        t.release_with(&mut src, |v| out.push(v));
+        t.release_with(&mut src, |v, _| out.push(v));
         out.sort();
         let want: Vec<u32> = (0..10).chain(20..70).collect();
         assert_eq!(out, want);
         assert_eq!(src.freed, 2);
         assert_eq!((t.len(), t.room()), (0, 100));
-        t.release_with(&mut src, |_| panic!("an empty table has no objects"));
+        t.release_with(&mut src, |_, _| panic!("an empty table has no objects"));
+    }
+
+    #[test]
+    fn release_hands_out_the_rights_of_each_handle() {
+        let mut src = boxes(1);
+        let mut t = table(10);
+        let rights = [Rights::RECEIVE, Rights::NONE, RW];
+        for (i, r) in rights.iter().enumerate() {
+            t.insert(&mut src, i as u32, *r).unwrap();
+        }
+        let mut out = Vec::new();
+        assert!(t.release_step(&mut src, |v, r| out.push((v, r))));
+        out.sort_by_key(|&(v, _)| v);
+        assert_eq!(out, vec![(0, Rights::RECEIVE), (1, Rights::NONE), (2, RW)]);
     }
 
     #[test]
@@ -982,7 +1003,7 @@ mod tests {
         t.remove(hs[199]).unwrap();
         // The last chunk goes first: entries 192-198 are live in it.
         let mut out = Vec::new();
-        assert!(!t.release_step(&mut src, |v| out.push(v)));
+        assert!(!t.release_step(&mut src, |v, _| out.push(v)));
         assert_eq!(out, (192..199).collect::<Vec<u32>>());
         assert_eq!((src.freed, src.back.as_str(), t.len()), (1, "c", 192));
         // Handles into the chunk that went are bad, the others still hold.
@@ -992,10 +1013,10 @@ mod tests {
         assert_eq!(t.room(), 0);
         assert_eq!(t.insert(&mut src, 9, RW), Err(HandleError::LimitReached));
         out.clear();
-        assert!(!t.release_step(&mut src, |v| out.push(v)));
+        assert!(!t.release_step(&mut src, |v, _| out.push(v)));
         assert_eq!(out, (128..192).collect::<Vec<u32>>());
         let mut steps = 2;
-        while !t.release_step(&mut src, |v| out.push(v)) {
+        while !t.release_step(&mut src, |v, _| out.push(v)) {
             steps += 1;
         }
         assert_eq!((steps + 1, out.len()), (4, 192));
@@ -1015,17 +1036,17 @@ mod tests {
             t.insert(&mut src, i, RW).unwrap();
         }
         assert_eq!(src.directories, 1);
-        while !t.release_step(&mut src, drop) {
+        while !t.release_step(&mut src, |_, _| {}) {
             assert_eq!(src.directories, 1, "the directory went before a chunk");
         }
         assert_eq!(src.back, "cccd");
-        assert!(t.release_step(&mut src, |_| panic!("an empty table has no objects")));
+        assert!(t.release_step(&mut src, |_, _| panic!("an empty table has no objects")));
         assert_eq!(src.back, "cccd");
         // A directory that came without a chunk goes in one step.
         let mut empty = boxes(0);
         assert_eq!(t.insert(&mut empty, 1, RW), Err(HandleError::NoMemory));
         assert_eq!(empty.directories, 1);
-        assert!(t.release_step(&mut empty, drop));
+        assert!(t.release_step(&mut empty, |_, _| {}));
         assert_eq!((empty.back.as_str(), empty.directories), ("d", 0));
     }
 

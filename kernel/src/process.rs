@@ -19,13 +19,15 @@
 //! it once more. Every release names the level of its cause, which the
 //! cleanup it may start takes. A process pays from its quota for what goes
 //! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
-//! threads, the blocks of its handle table and the shells of its children;
-//! and for the tables of its space, the message buffers of its threads and
+//! threads, the blocks of its handle table, the shells of its children and
+//! the channels it made; and for the tables of its space, the message
+//! buffers of its threads and
 //! the frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
 //! rest with its shell.
 
+use crate::channel::Channel;
 use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
@@ -69,9 +71,10 @@ pub struct Process {
     refs: u32,
     /// References that keep the object but not the process: each child's
     /// to its parent, until the child's shell goes, when the rest of the
-    /// child's quota comes back (spec 7.5). A ring of a parent that holds a
-    /// handle to its child and a child that holds its parent does not keep
-    /// the parent alive.
+    /// child's quota comes back (spec 7.5), and each channel's the process
+    /// pays for, until the channel's slot goes back to its pool (spec 7.8).
+    /// A ring of a parent that holds a handle to its child and a child that
+    /// holds its parent does not keep the parent alive.
     shell_refs: u32,
     /// Its memory quota: the limit its parent gave, what is charged to
     /// it, and what went back to the parent (spec 7.5).
@@ -133,6 +136,8 @@ struct Pools {
     blocks: Pool<Block>,
     /// The shells of its children.
     children: Pool<Process>,
+    /// The channels it made.
+    channels: Pool<Channel>,
 }
 
 /// Neighbours in the list of a parent's children.
@@ -394,6 +399,7 @@ fn create(
             threads: Pool::new(),
             blocks: Pool::new(),
             children: Pool::new(),
+            channels: Pool::new(),
         },
         ceiling,
         life: Life::new(),
@@ -571,13 +577,30 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
     }
 }
 
-/// Drops a child's reference to its parent's shell, at the child's shell
-/// portion (`free`); the last reference of either kind queues the shell
-/// at `cause`.
+/// Adds a reference to the shell of `process`, which lives: an object in
+/// its pools that it pays for holds one (spec 7.8), so its pages stay
+/// until the object's slot went back.
+pub fn retain_shell(process: NonNull<Process>) {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is touched, and `refs` checks the object.
+    unsafe {
+        refs(process);
+        let p = process.as_ptr();
+        (*p).shell_refs = (*p)
+            .shell_refs
+            .checked_add(1)
+            .expect("shell references overflow");
+    }
+}
+
+/// Drops a reference to the shell of `process`: a child's to its parent at
+/// the child's shell portion (`free`), or an object's to its payer once its
+/// slot went back; the last reference of either kind queues the shell at
+/// `cause`.
 ///
 /// # Safety
 /// The reference is the caller's, and the caller does not use it afterwards.
-unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
+pub unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's reference keeps the object alive until here;
     // only the fields are touched, the count through `refs`.
     unsafe {
@@ -807,9 +830,9 @@ unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
     // SAFETY: releasing its objects reaches no other field but `refs`,
     // through raw pointers, since a release only counts and queues.
     let (handles, mut chunks) = unsafe { table(process) };
-    handles.release_step(&mut chunks, |object| {
+    handles.release_step(&mut chunks, |object, rights| {
         // SAFETY: the table let the handle go, and its reference with it.
-        unsafe { object::release(object, level) }
+        unsafe { object::release(object, rights, level) }
     })
 }
 
@@ -1225,6 +1248,30 @@ pub unsafe fn free_thread_slot(process: NonNull<Process>, t: NonNull<Thread>) {
     unsafe { (*process.as_ptr()).pools.threads.free(t) }
 }
 
+/// A slot for `channel`, a new channel of `process` (channel::create), in
+/// the process's pool of channels, whose quota pays for a page when the
+/// pool grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
+pub fn channel_slot(
+    process: NonNull<Process>,
+    channel: Channel,
+) -> Result<NonNull<Channel>, Error> {
+    // SAFETY: the caller holds a reference to the process; the channel is
+    // no field of it.
+    unsafe { paid_slot(process, |pools| &mut pools.channels, channel) }.map_err(|_| Error::NoMemory)
+}
+
+/// Gives the slot of `c`, a channel that `process` paid for and that goes
+/// (channel::clean), back to the process's pool of channels, where its
+/// page stays paid until the process's shell goes.
+///
+/// # Safety
+/// `c` came from `channel_slot` of `process`, whose shell it holds, and
+/// nothing uses it afterwards.
+pub unsafe fn free_channel_slot(process: NonNull<Process>, c: NonNull<Channel>) {
+    // SAFETY: the caller's promise; only the pool is touched.
+    unsafe { (*process.as_ptr()).pools.channels.free(c) }
+}
+
 /// The links of `t`, a thread in its process's list.
 ///
 /// # Safety
@@ -1307,7 +1354,7 @@ pub fn insert_handle(
     let h = handles
         .insert(&mut chunks, object, rights)
         .map_err(Error::from)?;
-    object::retain(object);
+    object::retain(object, rights);
     Ok(h)
 }
 
@@ -1317,12 +1364,12 @@ pub fn insert_handle(
 pub fn close_handle(mut process: NonNull<Process>, h: Handle, cause: u8) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the process other than the
     // handle, so the process outlives the release below.
-    let (object, _) = unsafe { process.as_mut() }
+    let (object, rights) = unsafe { process.as_mut() }
         .handles
         .remove(h)
         .map_err(Error::from)?;
     // SAFETY: the handle is gone, and its reference with it.
-    unsafe { object::release(object, cause) };
+    unsafe { object::release(object, rights, cause) };
     Ok(())
 }
 

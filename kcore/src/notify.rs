@@ -30,6 +30,16 @@ pub fn bits_arg(raw: u64) -> Result<u64, Error> {
     }
 }
 
+/// The flags of `receive` (spec 6.1, 11): true when the call waits, false
+/// for abi::NO_WAIT; INVALID_ARGS for any other bit.
+pub fn wait_arg(raw: u64) -> Result<bool, Error> {
+    match raw {
+        0 => Ok(true),
+        abi::NO_WAIT => Ok(false),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
 /// What a post did to a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posted {
@@ -305,6 +315,15 @@ mod tests {
         let (mut s, _) = slot(10, 'a');
         s.post(BIT_CLIENT_GONE);
         assert_eq!(s.take(), (BIT_CLIENT_GONE, 1));
+    }
+
+    #[test]
+    fn receive_waits_unless_told_not_to() {
+        assert_eq!(wait_arg(0), Ok(true));
+        assert_eq!(wait_arg(abi::NO_WAIT), Ok(false));
+        for raw in [1, abi::NO_WAIT | 1, 1 << 17, 1 << 63, u64::MAX] {
+            assert_eq!(wait_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
     }
 
     #[test]

@@ -11,13 +11,16 @@
 //! that loop with nothing ready: no thread object, and cleanup of every
 //! level runs there. Between two polls for interrupts the kernel does at
 //! most one portion, and it begins one only with no interrupt pending.
-//! The kernel holds a reference to every thread the
-//! scheduler holds, from `start` until `exit`.
+//! The kernel holds a reference to every thread the scheduler holds, from
+//! `start` until `exit`, a thread that waits in `receive` too. The queues
+//! of receivers of channels link threads through the scheduler's own links,
+//! so the code that changes them runs under the scheduler's lock
+//! (`locked`).
 
 use crate::arch::{self, gic, timer};
-use crate::cleanup;
 use crate::thread::{self, Policy, Thread};
-use abi::Error;
+use crate::{channel, cleanup};
+use abi::{Error, Rights};
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
 use kcore::sync::Lock;
@@ -113,22 +116,30 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 
 /// Ends `t` for the scheduler, whatever its state: it never runs again,
 /// and the reference the kernel took at `start` goes, with `cause` for the
-/// cleanup its last reference starts. When `t` was the running thread,
-/// `resume` decides who runs next. A thread that ended before stays as it
-/// is.
+/// cleanup its last reference starts. A thread that waits in `receive`
+/// leaves its channel's queue first, and the reference of its wait goes
+/// too (spec 7.7). When `t` was the running thread, `resume` decides who
+/// runs next. A thread that ended before stays as it is. O(1).
 ///
 /// # Safety
 /// `t` is alive. When the kernel's reference is its last, `t` is queued
 /// for cleanup here, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
-    let held = {
+    let (held, waited) = {
         let mut g = SCHED.lock();
         // SAFETY: `t` is alive; its node is read before the scheduler takes it.
         let state = unsafe { t.as_ref() }.sched.state();
-        // SAFETY: `t` and the scheduler's threads are alive.
+        // SAFETY: `t` and the scheduler's threads are alive; the queue
+        // gives up the thread before the scheduler ends it.
+        let waited = unsafe { channel::cancel(t, &mut g.s) };
+        // SAFETY: as above.
         unsafe { g.s.exit(t) };
-        matches!(state, State::Ready | State::Running)
+        (!matches!(state, State::Stopped | State::Dead), waited)
     };
+    if let Some(c) = waited {
+        // SAFETY: the reference was the wait's.
+        unsafe { channel::release(c, Rights::NONE, cause) };
+    }
     if held {
         // SAFETY: the reference `start` took ends with the thread.
         unsafe { thread::release(t, cause) };
@@ -144,19 +155,30 @@ pub fn yield_running() {
 }
 
 /// thread_set_priority: `priority` (1-63) becomes the base priority of
-/// `t`, and with it the effective one until milestone 1.3; the thread
-/// moves by the rules of `pthread_setschedprio` (kcore::sched). The next
+/// `t`, and the effective one follows unless the boost of a notification
+/// keeps it higher (spec 6.6); the thread moves by the rules of
+/// `pthread_setschedprio` (kcore::sched), and one that waits in `receive`
+/// moves in its channel's queue by the same rules (spec 6.1). The next
 /// `resume` runs a thread raised above the running one, or another one
 /// when the running thread lowered itself below it. BAD_STATE for a
 /// thread that ended.
-pub fn set_priority(mut t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<(), Error> {
+pub fn set_priority(t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<(), Error> {
     let now = timer::now();
+    let mut g = SCHED.lock();
     // SAFETY: the caller holds a reference to `t`; the scheduler's threads
-    // are alive.
-    unsafe { SCHED.lock().s.set_priority(t, priority, policy, now)? };
-    // SAFETY: as above; the scheduler is done with the thread.
-    unsafe { t.as_mut() }.base_priority = priority;
+    // are alive, and so is the channel a thread waits in.
+    unsafe {
+        g.s.set_priority(t, priority, policy, now)?;
+        channel::requeue(t, &mut g.s);
+    }
     Ok(())
+}
+
+/// Runs `f` with the scheduler locked. The queues of receivers of channels
+/// hold threads through the scheduler's links (kcore::notify::Queue), so
+/// the code that changes them, with the threads' states, runs here.
+pub fn locked<R>(f: impl FnOnce(&mut Scheduler<Thread>) -> R) -> R {
+    f(&mut SCHED.lock().s)
 }
 
 /// The timer's interrupt, before its EOI: the timer goes off, since its

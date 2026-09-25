@@ -9,13 +9,15 @@
 //! running thread is the one TPIDR_EL1 names; the kernel stack holds
 //! nothing of it. A thread lives while references to it are left: handles,
 //! the one `create` hands out, and the kernel's while the scheduler holds
-//! the thread; it holds a reference to its process. A thread that ended
+//! the thread, from its start until its end, while it waits in `receive`
+//! too (spec 8.1); it holds a reference to its process. A thread that ended
 //! stays as a shell without its buffer until its last reference goes,
 //! which queues it for cleanup (spec 7.7). Its process pays from its quota
 //! for the pages of its pool of threads (spec 7.8) and for the buffer
 //! while it lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
+use crate::channel::Channel;
 use crate::cleanup::{self, Item};
 use crate::mm::phys::FRAMES;
 use crate::object::Object;
@@ -35,14 +37,16 @@ pub struct Thread {
     pub regs: UserRegs,
     /// Saved while the thread does not run.
     pub fp: FpRegs,
-    /// The priority `create` or thread_set_priority gave. The effective
-    /// one, which picks the level, is in `sched`; the two differ from
-    /// milestone 1.3 on, while a service works for a request (spec 6.6).
-    pub base_priority: u8,
-    /// What the scheduler keeps in the thread: the effective priority, the
-    /// policy, the state, the rest of a quantum and the links of the ready
-    /// list. Only the scheduler changes it (sched).
+    /// What the scheduler keeps in the thread: the base priority, which
+    /// `create` or thread_set_priority gave, the boost of a notification
+    /// (spec 6.6) and the effective priority they make, the policy, the
+    /// state, the rest of a quantum and the links of the ready list or of
+    /// the queue of receivers of its channel. Only the scheduler changes it
+    /// (sched), and the channel under the scheduler's lock.
     pub sched: Node<Thread>,
+    /// The channel it waits in, in `receive`; it holds a reference to it
+    /// meanwhile (channel::receive).
+    pub waits: Option<NonNull<Channel>>,
     /// Links in the list of its process's threads that have not ended,
     /// which process::end walks; None once the thread left it. Only
     /// process::{add_thread, remove_thread} change them.
@@ -135,8 +139,8 @@ pub fn create(
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
-        base_priority: priority,
         sched: Node::new(priority, policy),
+        waits: None,
         siblings: None,
         buffer: None,
         process,
@@ -292,7 +296,7 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     // SAFETY: as above; only the scheduler's part is read.
     let state = unsafe { thread.as_ref() }.sched.state();
     assert!(
-        !matches!(state, State::Ready | State::Running),
+        matches!(state, State::Stopped | State::Dead),
         "a thread the scheduler holds lost its last reference"
     );
     // SAFETY: that was the last reference: nothing reaches the thread

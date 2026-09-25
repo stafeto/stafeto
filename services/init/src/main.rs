@@ -11,9 +11,9 @@
 #![no_std]
 #![no_main]
 
-use abi::{Error, INIT_PROCESS, INIT_RESOURCE, INIT_THREAD, Policy};
+use abi::{Error, Policy};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use rt::{Stack, println, sys};
+use rt::{Stack, init, println, sys};
 
 rt::entry!(main);
 
@@ -40,14 +40,14 @@ static PROGRESS: [Progress; 2] = [const {
 static STACKS: [Stack<STACK_SIZE>; 2] = [const { Stack::new() }; 2];
 
 fn main(_: u64) -> u64 {
-    rt::console::set(INIT_RESOURCE);
+    rt::console::set(&init::RESOURCE);
     println!("init: hello from EL0");
     println!("init: threads 1 and 2 take turns at priority {LEVEL}, round robin");
     for i in 0..2 {
         start(i).expect("init starts its threads");
     }
     // Both threads are above init now; the call returns once both ended.
-    sys::thread_set_priority(INIT_THREAD, 1, Policy::Fifo).expect("init lowers itself");
+    sys::thread_set_priority(&init::THREAD, 1, Policy::Fifo).expect("init lowers itself");
     println!("init: both threads are done");
     0
 }
@@ -58,7 +58,7 @@ fn start(i: usize) -> Result<(), Error> {
     // SAFETY: the stack is the thread's alone.
     let t = unsafe {
         sys::thread_create(
-            INIT_PROCESS,
+            &init::PROCESS,
             turns,
             STACKS[i].top(),
             i as u64,
@@ -67,9 +67,9 @@ fn start(i: usize) -> Result<(), Error> {
             buffer,
         )
     }?;
-    sys::thread_start(t)?;
+    sys::thread_start(&t)?;
     // The thread goes on without the handle.
-    sys::handle_close(t)
+    t.close()
 }
 
 /// Thread `me` of the two (0 or 1) prints its turn, then counts, with no

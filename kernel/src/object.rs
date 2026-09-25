@@ -2,14 +2,17 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
-//! reference to its process or thread, and the last reference queues the
-//! object for cleanup (spec 7.7). The system resource is one for the whole
-//! system and is not counted: what a handle to it allows is in the
-//! handle's rights.
+//! reference to its process, thread or channel, and the last reference
+//! queues the object for cleanup (spec 7.7); a channel counts its handles
+//! with RECEIVE too, since the last of them closes it (spec 6.8). The
+//! system resource is one for the whole system and is not counted: what a
+//! handle to it allows is in the handle's rights.
 
+use crate::channel::{self, Channel};
 use crate::mm::pages::KernelPages;
 use crate::process::{self, Process};
 use crate::thread::{self, Thread};
+use abi::Rights;
 use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
 use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
@@ -19,6 +22,7 @@ use kcore::slab::{PaidPages, Pool};
 pub enum Object {
     Process(NonNull<Process>),
     Thread(NonNull<Thread>),
+    Channel(NonNull<Channel>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -48,34 +52,45 @@ impl Object {
         }
     }
 
+    /// The channel, for a lookup that needs one.
+    pub fn channel(&self) -> Option<NonNull<Channel>> {
+        match *self {
+            Object::Channel(c) => Some(c),
+            _ => None,
+        }
+    }
+
     /// Some for the system resource, for a lookup that needs it.
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
     }
 }
 
-/// Adds the reference a new handle holds.
-pub fn retain(object: Object) {
+/// Adds the reference a new handle with `rights` holds.
+pub fn retain(object: Object, rights: Rights) {
     match object {
         Object::Process(p) => process::retain(p),
         Object::Thread(t) => thread::retain(t),
+        Object::Channel(c) => channel::retain(c, rights),
         Object::Resource => {}
     }
 }
 
-/// Drops the reference a handle held; the last one queues the object for
-/// cleanup at `cause` (1-63): the effective priority of the thread whose
-/// call let the reference go, or the level of the object whose portion
-/// did (spec 7.7). Nothing is taken apart here.
+/// Drops the reference a handle with `rights` held; the last one queues
+/// the object for cleanup at `cause` (1-63): the effective priority of the
+/// thread whose call let the reference go, or the level of the object
+/// whose portion did (spec 7.7). The last handle with RECEIVE to a channel
+/// closes it. Nothing is taken apart here.
 ///
 /// # Safety
 /// The reference was the handle's, and the handle is gone.
-pub unsafe fn release(object: Object, cause: u8) {
+pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
     // SAFETY: the caller hands over the handle's reference.
     unsafe {
         match object {
             Object::Process(p) => process::release(p, cause),
             Object::Thread(t) => thread::release(t, cause),
+            Object::Channel(c) => channel::release(c, rights, cause),
             Object::Resource => {}
         }
     }

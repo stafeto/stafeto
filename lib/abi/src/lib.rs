@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The stafeto kernel interface shared by the kernel and programs (spec 5,
-//! 8, 11, 12, 13.3): handle layout, rights, system call numbers and where
-//! their arguments and results go, init's first handles, scheduling
-//! policies and error codes.
+//! 6, 8, 11, 12, 13.3): handle layout, rights, system call numbers and
+//! where their arguments and results go, what `receive` returns, init's
+//! first handles, scheduling policies and error codes.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -81,6 +81,16 @@ impl core::ops::BitOr for Rights {
 pub const OWNER_RIGHTS: Rights =
     Rights(Rights::DUPLICATE.0 | Rights::TRANSFER.0 | Rights::MANAGE.0);
 
+/// Rights of the handle that `channel_create` returns (spec 5.2): SEND for
+/// requests (milestone 1.3c), NOTIFY, RECEIVE, DUPLICATE and TRANSFER.
+pub const CHANNEL_RIGHTS: Rights = Rights(
+    Rights::SEND.0
+        | Rights::NOTIFY.0
+        | Rights::RECEIVE.0
+        | Rights::DUPLICATE.0
+        | Rights::TRANSFER.0,
+);
+
 /// Rights of init's handle to the system resource (spec 13.3).
 pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
     Rights::DEVICE.0
@@ -122,7 +132,8 @@ pub const INIT_MSGBUF: u64 = INIT_STACK_TOP + 0x1000;
 /// Arguments go in x0-x9. On success x0 is 0 and the call's values are in
 /// x1 and up; on an error x0 holds the error code and nothing else
 /// changes. Registers from x10 up, SP_EL0, the flags, TPIDR_EL0 and the FP
-/// and SIMD registers stay as they were. Unknown numbers, 0 included, and
+/// and SIMD registers stay as they were, but for x10 and x11 of a
+/// `receive` that took something (`Notification`). Unknown numbers, 0 included, and
 /// reserved values of arguments fail with INVALID_ARGS; a narrow argument
 /// with bits set above its width is such a value.
 #[repr(u16)]
@@ -235,6 +246,102 @@ pub fn inline_bytes(words: &[u64; 8]) -> [u8; INLINE_MAX] {
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     bytes
+}
+
+/// Bit 16 of the flags of `receive` (spec 6.1, 11), and of the description
+/// of `send` from milestone 1.3c: the call does not wait. The other bits of
+/// the flags are reserved.
+pub const NO_WAIT: u64 = 1 << 16;
+
+/// Where the kind of what `receive` took starts in its x1: bits 24-27.
+pub const SOURCE_SHIFT: u32 = 24;
+
+/// What `receive` took (spec 6.5, 11): bits 24-27 of its x1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A request (milestone 1.3c).
+    Message,
+    /// The channel's slot of label 0: `notify` through a handle with no
+    /// label.
+    Unlabeled,
+    /// The slot of a session: `notify` through a labelled handle, or
+    /// CLIENT_GONE (spec 5.3).
+    Session,
+    /// A timer (spec 10).
+    Timer,
+    /// The exit of a process (`process_create` x3, spec 7.9).
+    Exit,
+    /// An interrupt line (milestone 1.3e).
+    Interrupt,
+    /// A kind this abi does not know, which a later kernel may return: its
+    /// code.
+    Unknown(u64),
+}
+
+impl Source {
+    /// The code in bits 24-27 of x1.
+    pub const fn code(self) -> u64 {
+        match self {
+            Source::Message => 0,
+            Source::Unlabeled => 1,
+            Source::Session => 2,
+            Source::Timer => 3,
+            Source::Exit => 4,
+            Source::Interrupt => 5,
+            Source::Unknown(code) => code,
+        }
+    }
+
+    /// The kind with this code; `Unknown` for a code this abi does not
+    /// know.
+    pub const fn from_code(code: u64) -> Source {
+        match code {
+            0 => Source::Message,
+            1 => Source::Unlabeled,
+            2 => Source::Session,
+            3 => Source::Timer,
+            4 => Source::Exit,
+            5 => Source::Interrupt,
+            _ => Source::Unknown(code),
+        }
+    }
+}
+
+/// A notification as `receive` returns it (spec 6.5, 11): the kind of its
+/// source, the label of the handle the source came through (0 for none),
+/// the bits posted since the last `receive` took the slot, ORed together,
+/// and how many posts they merge, up to u32::MAX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Notification {
+    pub source: Source,
+    pub label: u64,
+    pub bits: u64,
+    pub count: u32,
+}
+
+impl Notification {
+    /// x1-x11 as `receive` leaves them: x1 the description (no data and no
+    /// handles, the source in bits 24-27), x2 the bits, x3 the count, x4-x9
+    /// zero, x10 the label, and x11 the token of a request, which a
+    /// notification does not have: 0.
+    pub const fn to_words(self) -> [u64; 11] {
+        let mut words = [0; 11];
+        words[0] = self.source.code() << SOURCE_SHIFT;
+        words[1] = self.bits;
+        words[2] = self.count as u64;
+        words[9] = self.label;
+        words
+    }
+
+    /// The notification from x1-x11 after `receive`.
+    pub const fn from_words(words: [u64; 11]) -> Notification {
+        Notification {
+            source: Source::from_code((words[0] >> SOURCE_SHIFT) & 0xF),
+            label: words[9],
+            bits: words[1],
+            count: words[2] as u32,
+        }
+    }
 }
 
 /// Kinds of `object_info` (spec 11); 0 is reserved, and so is x2, which
@@ -634,6 +741,54 @@ mod tests {
             OWNER_RIGHTS,
             Rights::DUPLICATE | Rights::TRANSFER | Rights::MANAGE
         );
+        assert_eq!(
+            CHANNEL_RIGHTS,
+            Rights::SEND | Rights::NOTIFY | Rights::RECEIVE | Rights::DUPLICATE | Rights::TRANSFER
+        );
+    }
+
+    #[test]
+    fn sources_keep_their_codes() {
+        let known = [
+            (Source::Message, 0),
+            (Source::Unlabeled, 1),
+            (Source::Session, 2),
+            (Source::Timer, 3),
+            (Source::Exit, 4),
+            (Source::Interrupt, 5),
+        ];
+        for (source, code) in known {
+            assert_eq!(source.code(), code);
+            assert_eq!(Source::from_code(code), source);
+        }
+        assert_eq!(Source::from_code(15), Source::Unknown(15));
+        assert_eq!(Source::Unknown(15).code(), 15);
+        assert_eq!((NO_WAIT, SOURCE_SHIFT), (1 << 16, 24));
+    }
+
+    #[test]
+    fn notification_travels_in_eleven_words() {
+        let n = Notification {
+            source: Source::Session,
+            label: 0x1ABE1,
+            bits: 1 << 63 | 5,
+            count: u32::MAX,
+        };
+        let words = [
+            2 << 24,
+            1 << 63 | 5,
+            0xFFFF_FFFF,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x1ABE1,
+            0,
+        ];
+        assert_eq!(n.to_words(), words);
+        assert_eq!(Notification::from_words(words), n);
     }
 
     #[test]
