@@ -108,7 +108,7 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
             stack.end
         );
     } else if matches!(class, esr::EC_DABT_SAME | esr::EC_IABT_SAME)
-        && (guard..guard + 4096).contains(&far)
+        && (guard..guard + kcore::PAGE_SIZE).contains(&far)
     {
         kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
     }

@@ -299,6 +299,19 @@ pub fn symbol_range(nm: &str, name: &str) -> Option<Range<u64>> {
     })
 }
 
+/// Rust module paths that must never reach the shipped image (spec 3.4):
+/// the kernel's own tests and the hooks that call them.
+const TEST_MODULES: [&str; 2] = ["kernel::ktest", "kernel::testpoint"];
+
+/// The lines of `llvm-nm -C` output that name a symbol in a test module
+/// (TEST_MODULES), matched as a substring so a closure or a generic
+/// instantiation of a test function is caught too.
+pub fn test_symbols(nm: &str) -> Vec<&str> {
+    nm.lines()
+        .filter(|l| TEST_MODULES.iter().any(|m| l.contains(m)))
+        .collect()
+}
+
 /// The report of a stack overflow in the recursive function `f`: the
 /// panic line's ELR lies in `f`, and the backtrace shows the ELR and, above
 /// it, more frames of `f`. Those frames come from the kernel stack, while the
@@ -567,6 +580,33 @@ ffffffffc0009000 T __text_end
         assert_eq!(symbol_range(NM, "recurse"), None);
         assert_eq!(symbol_range(NM, "__text_end"), None);
         assert_eq!(symbol_range(NM, "kernel_main"), None);
+    }
+
+    const NM_WITH_TEST_MODULES: &str = "\
+ffffffffc00042f0 0000000000000438 T handle_exception
+ffffffffc0009000 T kernel::attestation::not_a_test_module
+ffffffffc0001000 t core::ptr::drop_glue::<kernel::ktest::TestSpace>
+ffffffffc0001100 t kernel::ktest::calls::with_used_quota
+ffffffffc0001200 t kernel::testpoint::skip_brk
+";
+
+    #[test]
+    fn test_symbols_finds_ktest_and_testpoint_module_paths() {
+        let found = test_symbols(NM_WITH_TEST_MODULES);
+        assert_eq!(found.len(), 3);
+        assert!(
+            found
+                .iter()
+                .all(|l| l.contains("kernel::ktest") || l.contains("kernel::testpoint"))
+        );
+    }
+
+    #[test]
+    fn test_symbols_ignores_names_that_merely_contain_test() {
+        assert!(test_symbols(NM).is_empty());
+        assert!(
+            test_symbols("ffffffffc0009000 T kernel::attestation::not_a_test_module\n").is_empty()
+        );
     }
 
     const RECURSE: std::ops::Range<u64> = 0xffff_ffff_c000_3a0c..0xffff_ffff_c000_3a20;

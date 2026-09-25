@@ -102,6 +102,26 @@ pub fn handle_limit_arg(raw: u64) -> Result<u32, Error> {
     }
 }
 
+/// A reserved register that must be 0: INVALID_ARGS otherwise. `object_info`
+/// takes x2 this way, kept clear for a use the spec has not named yet.
+pub fn reserved_arg(raw: u64) -> Result<(), Error> {
+    if raw == 0 {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs)
+    }
+}
+
+/// The length of an inline byte buffer packed into x2-x9 (spec 11), as
+/// `debug_write` takes it in x1: at most abi::INLINE_MAX. INVALID_ARGS
+/// otherwise.
+pub fn inline_len_arg(raw: u64) -> Result<usize, Error> {
+    match usize::try_from(raw) {
+        Ok(len) if len <= abi::INLINE_MAX => Ok(len),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
 /// Checks the start of a program's thread: `entry` is an instruction in the
 /// lower half, `stack` a 16-byte-aligned stack pointer no higher than its
 /// top, and `priority` a level other than 0, which goes to no thread.
@@ -210,6 +230,23 @@ mod tests {
         assert_eq!(handle_limit_arg(u64::from(MAX_HANDLES)), Ok(MAX_HANDLES));
         for limit in [0, u64::from(MAX_HANDLES) + 1, 1 << 32 | 16, u64::MAX] {
             assert_eq!(handle_limit_arg(limit), Err(Error::InvalidArgs));
+        }
+    }
+
+    #[test]
+    fn a_reserved_register_takes_only_zero() {
+        assert_eq!(reserved_arg(0), Ok(()));
+        for raw in [1, 1 << 32, u64::MAX] {
+            assert_eq!(reserved_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+    }
+
+    #[test]
+    fn an_inline_length_stops_at_inline_max() {
+        assert_eq!(inline_len_arg(0), Ok(0));
+        assert_eq!(inline_len_arg(abi::INLINE_MAX as u64), Ok(abi::INLINE_MAX));
+        for raw in [abi::INLINE_MAX as u64 + 1, 1 << 32, u64::MAX] {
+            assert_eq!(inline_len_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
         }
     }
 

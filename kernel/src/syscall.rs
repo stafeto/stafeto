@@ -33,8 +33,8 @@ use abi::{
 };
 use core::ptr::NonNull;
 use kcore::args::{
-    bits_arg, check_buffer, check_start, handle_limit_arg, notify_priority_arg, policy_arg,
-    priority_arg, quota_arg, rights_arg, under_ceilings, wait_arg,
+    bits_arg, check_buffer, check_start, handle_limit_arg, inline_len_arg, notify_priority_arg,
+    policy_arg, priority_arg, quota_arg, reserved_arg, rights_arg, under_ceilings, wait_arg,
 };
 
 /// A call's arguments: x0-x9 of the thread that made it.
@@ -578,9 +578,7 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
 /// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    if a[2] != 0 {
-        return Err(Error::InvalidArgs);
-    }
+    reserved_arg(a[2])?;
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
     match a[1] {
         abi::INFO_PROCESS_STATE => {
@@ -637,10 +635,7 @@ fn kernel_stats() -> KernelStats {
 /// the bytes as abi::inline_words packs them): writes the bytes to the
 /// console at once, interrupts masked, and returns their count in x1.
 fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    if a[1] > abi::INLINE_MAX as u64 {
-        return Err(Error::InvalidArgs);
-    }
-    let len = a[1] as usize;
+    let len = inline_len_arg(a[1])?;
     lookup(thread, a[0], Rights::DEBUG, Object::resource)?;
     let words: &[u64; 8] = a[2..].try_into().expect("x2-x9");
     crate::console::write_bytes(&abi::inline_bytes(words)[..len]);

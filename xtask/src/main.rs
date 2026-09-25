@@ -400,6 +400,7 @@ fn test() -> Result<(), String> {
     init_fault_stops_the_machine()?;
     fault_report()?;
     stack_overflow_report()?;
+    test_build_carries_test_symbols()?;
     init_tests(&qemu::VIRT, false)?;
     init_tests(&qemu::VIRT_2G, false)?;
     init_tests(&qemu::VIRT, true)?;
@@ -437,9 +438,12 @@ fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
 
 /// A normal build boots, prints its report with the timer frequency and
 /// init's entry point from the boot image, starts init, and powers the
-/// machine off when init exits.
+/// machine off when init exits. The image also carries none of the
+/// kernel's own tests (spec 3.4): `no_test_symbols` checks it here so
+/// every normal build, not just the one that ships, is covered.
 fn boot_smoke() -> Result<(), String> {
     let a = build(Variant::Normal)?;
+    no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
@@ -622,6 +626,47 @@ fn fault_report() -> Result<(), String> {
         qemu::expect_marker(&o, marker)?;
     }
     qemu::backtrace_names_the_fault(&o.lines)
+}
+
+/// `llvm-nm -C`, defined symbols only, on `elf`.
+fn nm_defined(elf: &Path) -> Result<String, String> {
+    stdout_of(
+        Command::new(llvm_tool("llvm-nm")?)
+            .args(["-C", "--defined-only"])
+            .arg(elf),
+    )
+}
+
+/// The image that ships carries none of the kernel's own tests (spec 3.4):
+/// no symbol of `elf` lies in `kernel::ktest` or `kernel::testpoint`
+/// (qemu::test_symbols).
+fn no_test_symbols(elf: &Path) -> Result<(), String> {
+    let nm = nm_defined(elf)?;
+    let found = qemu::test_symbols(&nm);
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} carries test symbols it must not ship:\n{}",
+            elf.display(),
+            found.join("\n")
+        ))
+    }
+}
+
+/// `no_test_symbols` is not a check on an image that never carries test
+/// symbols at all: the ktest build's own ELF does.
+fn test_build_carries_test_symbols() -> Result<(), String> {
+    let a = build(Variant::Test)?;
+    let nm = nm_defined(&a.elf)?;
+    if qemu::test_symbols(&nm).is_empty() {
+        Err(format!(
+            "{} has no test symbols; no_test_symbols would pass on anything",
+            a.elf.display()
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// A kernel that recurses without end must report the overflow from the
