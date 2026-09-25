@@ -12,7 +12,9 @@
 //! its parent ends. The end itself only stops its threads, at most
 //! abi::MAX_THREADS, and queues the process for cleanup; the queue
 //! takes it apart in stages, a portion at a time, with how far it came
-//! kept in the process (`Stage`, spec 7.7), its descendants first. A shell
+//! kept in the process (`Stage`, spec 7.7): first a wave that stops its
+//! descendants above the cause, at its priority ceiling, then the
+//! teardown at the level of the cause, its descendants first. A shell
 //! with the reason stays for object_info until the last reference queues
 //! it once more. Every release names the level of its cause, which the
 //! cleanup it may start takes. A process pays from its quota for what goes
@@ -105,6 +107,13 @@ pub struct Process {
     child_siblings: Option<ChildLinks>,
     /// Init's end ends the run (spec 7.9).
     init: bool,
+    /// R, the level of its teardown once it ended (spec 7.7): the highest
+    /// cause of its end and of the calls that hastened it (`hasten`). It
+    /// only grows.
+    level: u8,
+    /// At the stage Stop, the child it stops next; a child that leaves
+    /// the list moves it on (`leave_parent`).
+    stop_next: Option<NonNull<Process>>,
     /// How far its teardown came.
     stage: Stage,
     /// Its place in the cleanup queue: on its stages, and as a shell once
@@ -136,18 +145,28 @@ struct ChildLinks {
 /// Where the teardown of a process stands (spec 7.7). A process is whole
 /// until it ends; then the cleanup queue holds it, with a reference of its
 /// own, and each portion takes one step of its stage, in the order of
-/// STAGES, with how far it came kept in the process. Children, Handles,
-/// Space and Shell take as many portions as their steps; the others one.
-/// After the stage Quota the queue lets its reference go.
+/// STAGES, with how far it came kept in the process. Stop, Children,
+/// Handles, Space and Shell take as many portions as their steps; the
+/// others one. The stage Stop runs at S, the higher of the process's
+/// ceiling and R (`level`); the others at R, but for Shell, which runs at
+/// the level of the last reference. After the stage Quota the queue lets
+/// its reference go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// No teardown began: the process lives.
     Whole,
-    /// A child a portion: the first child in the list ends, killed, if it
-    /// lives, and goes right in front of the process in the queue; the
-    /// process waits behind it until the child leaves the list at its own
-    /// stage Quota. Descendants go depth first, and the kernel stack does
-    /// not grow with the depth of the tree (spec 4).
+    /// Only for a process with children when it ends: a child a portion,
+    /// the one at the cursor `stop_next`, ends, killed, at R, if it lives,
+    /// which stops its threads and begins its own teardown (`end`). At S
+    /// no thread of a descendant runs meanwhile: none has an effective
+    /// priority above its process's ceiling, and no ceiling of a
+    /// descendant is above this one's (spec 4, 8).
+    Stop,
+    /// A child a portion: the first child in the list, which the stage
+    /// Stop ended, goes right in front of the process in the queue
+    /// (`hasten`); the process waits behind it until the child leaves the
+    /// list at its own stage Quota. Descendants go depth first, and the
+    /// kernel stack does not grow with the depth of the tree (spec 4).
     Children,
     /// A chunk of the handle table a portion, up to 64 handles, each
     /// releasing its object; the chunk directory with the last chunk
@@ -176,7 +195,8 @@ pub enum Stage {
 }
 
 /// The stages of a teardown in the order they run (spec 7.7).
-const STAGES: [Stage; 7] = [
+const STAGES: [Stage; 8] = [
+    Stage::Stop,
     Stage::Children,
     Stage::Handles,
     Stage::Space,
@@ -383,6 +403,8 @@ fn create(
         children: None,
         child_siblings: None,
         init: false,
+        level: 0,
+        stop_next: None,
         stage: Stage::Whole,
         cleanup: Item::new(),
     };
@@ -588,13 +610,14 @@ unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
     }
 }
 
-/// The teardown of a process that just ended begins: the cleanup queue
-/// takes a reference of its own and queues the process at `level` for its
-/// first stage.
+/// The teardown of a process that just ended begins at `cause` (spec
+/// 7.7): R grows to it, and the cleanup queue takes a reference of its
+/// own and queues the process for its first stage: Stop at S for a
+/// process with children, Children at R otherwise.
 ///
 /// # Safety
 /// `process` is alive, whole, and in no queue.
-unsafe fn begin(process: NonNull<Process>, level: u8) {
+unsafe fn begin(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's promise; only the fields are touched.
     unsafe {
         let p = process.as_ptr();
@@ -602,36 +625,88 @@ unsafe fn begin(process: NonNull<Process>, level: u8) {
             (*p).stage == Stage::Whole,
             "the teardown of a process begins twice"
         );
-        (*p).stage = STAGES[0];
+        (*p).level = (*p).level.max(cause);
+        (*p).stop_next = (*p).children;
+        (*p).stage = if (*p).children.is_some() {
+            Stage::Stop
+        } else {
+            Stage::Children
+        };
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
         let refs = refs(process);
         *refs = refs.checked_add(1).expect("process references overflow");
         let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-        cleanup::enqueue(item, Object::Process(process), level);
+        cleanup::enqueue(item, Object::Process(process), stage_level(p));
     }
 }
 
-/// One portion of a process in the cleanup queue (cleanup::portion): one
-/// step of its stage (`Stage`); what the step releases is queued at
-/// `level`. With work left the process goes back to the head of `level`,
-/// so the next portion there goes on with it, and at the stage Children
-/// its first child goes in front of it; after the stage Quota the queue
-/// lets its reference go, which queues the shell when it was the last. A
-/// shell's portion gives pages of its pools back, and the last one the
-/// slot.
+/// The level the stage of `p` runs at: S, the higher of its ceiling and
+/// R, at the stage Stop, R at the others (spec 7.7).
+///
+/// # Safety
+/// `p` is alive; only the fields are read.
+unsafe fn stage_level(p: *const Process) -> u8 {
+    // SAFETY: the caller's promise.
+    unsafe {
+        match (*p).stage {
+            Stage::Stop => (*p).ceiling.max((*p).level),
+            _ => (*p).level,
+        }
+    }
+}
+
+/// Hastens the teardown of `process`, which ended (spec 7.7, 11): R grows
+/// to `level`, and the process goes to the head of the level of its stage
+/// (`stage_level`), however high it stood in the queue, so that it runs
+/// before anything that waits for it there. A shell has no stage left to
+/// hasten. process_kill of a process that ended comes here with the
+/// caller's priority, and so does the stage Children for each child. O(1).
+///
+/// # Safety
+/// `process` ended; the caller holds a reference to it, or it is in its
+/// parent's list, and none of its portions runs now.
+pub unsafe fn hasten(process: NonNull<Process>, level: u8) {
+    // SAFETY: the caller's promise; a process on its stages is queued
+    // outside its own portions, since the queue holds it.
+    unsafe {
+        let p = process.as_ptr();
+        refs(process);
+        (*p).level = (*p).level.max(level);
+        match (*p).stage {
+            Stage::Whole => unreachable!("a process that lives is hastened"),
+            Stage::Shell => {}
+            _ => {
+                let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+                cleanup::raise(item, stage_level(p));
+            }
+        }
+    }
+}
+
+/// One portion of a process in the cleanup queue (cleanup::portion), taken
+/// at `level`: one step of its stage (`Stage`); what the step releases is
+/// queued at R, whatever level the stage runs at. With work left the
+/// process goes back to the head of the level of its stage, so the next
+/// portion there goes on with it, and at the stage Children its first
+/// child goes in front of it; after the stage Quota the queue lets its
+/// reference go, which queues the shell when it was the last. A shell's
+/// portion, at `level`, gives pages of its pools back, and the last one
+/// the slot.
 ///
 /// # Safety
 /// The process was just taken from the queue: it is on its stages, with
 /// the queue's reference, or a shell nobody refers to.
 pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     let p = process.as_ptr();
-    // SAFETY: the caller's promise; only the field is read.
-    let stage = unsafe { (*p).stage };
+    // SAFETY: the caller's promise; only the fields are read.
+    let (stage, r) = unsafe { ((*p).stage, (*p).level) };
     // The child that goes in front of the process at the stage Children.
     let mut first = None;
     let done = match stage {
         Stage::Whole => unreachable!("a whole process in the cleanup queue"),
+        // SAFETY: the process is alive, and its children in the list too.
+        Stage::Stop => unsafe { stop_child(process, r) },
         Stage::Children => {
             // SAFETY: the process is alive; only the field is read.
             first = unsafe { (*p).children };
@@ -639,7 +714,7 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         }
         // SAFETY: the process is alive, and the step borrows only the
         // field it works on.
-        Stage::Handles => unsafe { release_handles(process, level) },
+        Stage::Handles => unsafe { release_handles(process, r) },
         // SAFETY: as above.
         Stage::Space => unsafe { release_space(p) },
         // SAFETY: as above.
@@ -673,33 +748,54 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     unsafe {
         (*p).stage = next;
         if next == Stage::Shell {
-            release(process, level);
+            release(process, r);
         } else {
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-            cleanup::requeue(item, Object::Process(process), level);
+            cleanup::requeue(item, Object::Process(process), stage_level(p));
         }
         if let Some(child) = first {
-            end_child(child, level);
+            wait_for_child(child, r);
         }
     }
 }
 
-/// The stage Children, after the parent went back to the head of `level`:
-/// the parent's first child ends, killed, if it lives, which stops its
-/// threads and queues it (`end`), and goes to the head of `level` unless
-/// it stands higher, right in front of the parent.
+/// The stage Stop: the child at the cursor ends, killed, at `level` (R) if
+/// it lives (`end`), and the cursor moves on. A child that ended before
+/// is on its own stages already and stops its own descendants. True once
+/// the cursor is past the last child. The child is used through `end`
+/// first, whose check stops test builds on a shell that went.
+///
+/// # Safety
+/// `process` is alive and at its stage Stop.
+unsafe fn stop_child(process: NonNull<Process>, level: u8) -> bool {
+    let p = process.as_ptr();
+    // SAFETY: the caller's promise; the child at the cursor is in the
+    // list, so it is alive as an object.
+    unsafe {
+        if let Some(child) = (*p).stop_next {
+            end(child, ProcessState::Killed, level);
+            (*p).stop_next = child_links(child).next;
+        }
+        (*p).stop_next.is_none()
+    }
+}
+
+/// The stage Children, after the parent went back to the head of its level
+/// R, `level`: the parent's first child, which ended at the stage Stop,
+/// goes to the head of the level of its own stage, right in front of the
+/// parent at the same level (`hasten`).
 ///
 /// # Safety
 /// `child` is in its parent's list, so it is alive; the parent is queued.
-unsafe fn end_child(child: NonNull<Process>, level: u8) {
-    // SAFETY: the caller's promise; only the fields are touched.
-    unsafe {
-        if (*child.as_ptr()).stage == Stage::Whole {
-            end(child, ProcessState::Killed, level);
-        }
-        let item = NonNull::new_unchecked(&raw mut (*child.as_ptr()).cleanup);
-        cleanup::raise(item, level);
-    }
+unsafe fn wait_for_child(child: NonNull<Process>, level: u8) {
+    // SAFETY: the caller's promise; only the field is read.
+    let stage = unsafe { (*child.as_ptr()).stage };
+    assert!(
+        stage != Stage::Whole,
+        "a child lives at its parent's stage Children"
+    );
+    // SAFETY: as above; the child's portions are not running.
+    unsafe { hasten(child, level) };
 }
 
 /// The stage Handles: one step of the table's release, each handle's
@@ -799,6 +895,11 @@ unsafe fn leave_parent(process: NonNull<Process>) -> bool {
             .child_siblings
             .take()
             .expect("a child in its parent's list until its stage Quota");
+        // The cursor of the parent's stage Stop never names a child that
+        // left: O(1), since no child joins a process that ended.
+        if (*parent.as_ptr()).stop_next == Some(process) {
+            (*parent.as_ptr()).stop_next = next;
+        }
         match prev {
             Some(q) => child_links(q).next = next,
             None => (*parent.as_ptr()).children = next,
@@ -916,23 +1017,28 @@ const POISON: u8 = 0xA5;
 const _: () = assert!(core::mem::offset_of!(Process, refs) >= 8);
 
 /// Ends `process` with `reason` unless it ended before, when the first
-/// reason stays: process_exit, process_kill and a fault at EL0 come here.
-/// In the call itself every thread of the process leaves the scheduler for
-/// good, and the process is queued for its teardown at `cause`, the
-/// effective priority of the thread that made the call or the fault; what
-/// the teardown releases is queued at that level too. The running thread
-/// may be one of the process's: it never runs again and may be gone
-/// afterwards, so the caller leaves through sched::resume. When the
-/// process is init, the run ends (`init_ended`).
+/// reason stays: process_exit, process_kill, a fault at EL0 and the stage
+/// Stop of its parent come here. In the call itself every thread of the
+/// process leaves the scheduler for good, and the process is queued for
+/// its teardown at `cause`, the effective priority of the thread that made
+/// the call or the fault (`begin`): its stage Stop at its ceiling, the
+/// rest at the level of the cause, and what the teardown releases is
+/// queued at that level too. The running thread may be one of the
+/// process's: it never runs again and may be gone afterwards, so the
+/// caller leaves through sched::resume. When the process is init, the run
+/// ends (`init_ended`). True when the process ended here.
 ///
 /// # Safety
-/// The caller holds a reference to `process`.
-pub unsafe fn end(process: NonNull<Process>, reason: ProcessState, cause: u8) {
+/// The caller holds a reference to `process`, or `process` is in its
+/// parent's list.
+pub unsafe fn end(process: NonNull<Process>, reason: ProcessState, cause: u8) -> bool {
     // SAFETY: the caller's reference keeps the process alive.
-    if unsafe { (*life(process)).end(reason) } {
+    let ended = unsafe { (*life(process)).end(reason) };
+    if ended {
         // SAFETY: as above; the end was just recorded.
         unsafe { stop(process, cause) };
     }
+    ended
 }
 
 /// A started thread of `process` ended through thread_exit; the last one

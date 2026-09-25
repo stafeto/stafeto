@@ -181,6 +181,15 @@ const TESTS: &[(&str, TestFn)] = &[
         parent_quota_stage_sees_children_done,
     ),
     (
+        "stop_wave_runs_at_the_ceiling",
+        stop_wave_runs_at_the_ceiling,
+    ),
+    ("hasten_reaches_the_children", hasten_reaches_the_children),
+    (
+        "stop_cursor_skips_a_child_that_left",
+        stop_cursor_skips_a_child_that_left,
+    ),
+    (
         "children_do_not_keep_their_parent_alive",
         children_do_not_keep_their_parent_alive,
     ),
@@ -239,6 +248,10 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "process_kill_ends_threads_in_every_state",
         calls::process_kill_ends_threads_in_every_state,
+    ),
+    (
+        "kill_hastens_a_dying_process",
+        calls::kill_hastens_a_dying_process,
     ),
 ];
 
@@ -1269,7 +1282,7 @@ fn pool_churn_stays_under_the_quota(_: &Boot) -> Result<(), &'static str> {
     const Q: u64 = 8 * PAGE_SIZE;
     cleanup::drain();
     let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
-    let first = child_with(root, Q, 16).and_then(|(_, h)| {
+    let first = child_with(root, Q, 16, 63).and_then(|(_, h)| {
         process::close_handle(root, h, CAUSE).map_err(|_| "the child's handle did not close")
     });
     cleanup::drain();
@@ -1288,7 +1301,7 @@ fn pool_churn_stays_under_the_quota(_: &Boot) -> Result<(), &'static str> {
 /// fails the judgement stays.
 fn churn(root: NonNull<process::Process>, q: u64) -> Result<(), &'static str> {
     let (taken, frames) = (pages::taken(), phys::free_frames());
-    let (child, held) = child_with(root, q, 16)?;
+    let (child, held) = child_with(root, q, 16, 63)?;
     let mut threads = [None; abi::MAX_THREADS as usize];
     let mut last = Ok(());
     for slot in &mut threads {
@@ -1415,7 +1428,7 @@ const KINDS: [Kind; 3] = [Kind::Threads, Kind::Handles, Kind::Children];
 fn fill_the_tree(root: NonNull<process::Process>) -> Result<(), &'static str> {
     let mut tree = [Some(root), None, None, None];
     for i in 1..tree.len() {
-        tree[i] = Some(child_with(root, 24 * PAGE_SIZE, MAX_HANDLES)?.0);
+        tree[i] = Some(child_with(root, 24 * PAGE_SIZE, MAX_HANDLES, 63)?.0);
         for k in 0..KINDS.len() {
             fill_kind(tree[i].expect("the child"), KINDS[(i + k) % KINDS.len()])?;
             frames_match_the_quotas(&tree)?;
@@ -1782,8 +1795,8 @@ fn check_stages(
 /// (spec 4, 7.7): two children, one with a child of its own whose thread
 /// is ready, each child and grandchild held only by a handle in its
 /// parent's table. Each process passes its stage Quota only after its
-/// children passed theirs, the ready thread leaves the scheduler, the
-/// whole teardown runs at the level of the end, and the tree goes.
+/// children passed theirs, the ready thread leaves the scheduler, and the
+/// tree goes; the levels of the stages are `stop_wave_runs_at_the_ceiling`'s.
 fn parent_quota_stage_sees_children_done(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 12;
     cleanup::drain();
@@ -1808,6 +1821,207 @@ fn parent_quota_stage_sees_children_done(_: &Boot) -> Result<(), &'static str> {
     check(
         process::in_use() == processes && thread::in_use() == threads,
         "a process or a thread of the tree stayed in its pool",
+    )
+}
+
+/// The end of a process stops its descendants in a wave above the level of
+/// the cause (spec 4, 7.7): a root with ceiling 40 ends at 12 with two
+/// children, one with ceiling 30 and a child of its own, and a ready
+/// thread in each process. The stage Stop takes a portion for each process
+/// it ends, at the ceiling of the process that ends it: the root's at 40,
+/// its child's at 30. Once it is over, no process of the tree lives and
+/// every thread of it is dead; the rest of the teardown runs at 12. A
+/// second such tree ends at 50, above every ceiling in it: its stage Stop
+/// runs at 50, as the rest of its teardown does.
+fn stop_wave_runs_at_the_ceiling(_: &Boot) -> Result<(), &'static str> {
+    cleanup::drain();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    for (level, stops) in [(12, [40, 40, 30]), (50, [50, 50, 50])] {
+        let root = process::create_root(QUOTA, 16, 40).map_err(|_| "no process")?;
+        let tree = child_with(root, 4 * CHILD_QUOTA, 16, 30).and_then(|(a, _)| {
+            let (b, _) = child_with(root, CHILD_QUOTA, 16, 40)?;
+            let (g, _) = child_with(a, CHILD_QUOTA, 16, 30)?;
+            let mut t = [None; 4];
+            for (slot, p) in t.iter_mut().zip([root, a, b, g]) {
+                *slot = Some((p, ready_thread(p)?));
+            }
+            Ok(t.map(|x| x.expect("a process and its thread")))
+        });
+        let tree = tree.inspect_err(|_| {
+            // SAFETY: the test's reference goes, and nothing uses it
+            // afterwards.
+            unsafe { process::release(root, CAUSE) };
+            cleanup::drain();
+        })?;
+        // A teardown at the wrong levels may never end: a failure is named,
+        // and the tree stays in the pools, as in
+        // `parent_quota_stage_sees_children_done`.
+        check_waves(tree, level, stops)?;
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { process::release(root, CAUSE) };
+        cleanup::drain();
+    }
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "a process or a thread of the tree stayed in its pool",
+    )
+}
+
+/// Ends the first process of `tree` at `level` and follows the portions:
+/// three of the stage Stop at `stops`, then the teardown at `level`. When
+/// the stops are above `level`, no process of the tree lives and every
+/// thread of it is dead after them.
+fn check_waves(
+    tree: [(NonNull<process::Process>, NonNull<thread::Thread>); 4],
+    level: u8,
+    stops: [u8; 3],
+) -> Result<(), &'static str> {
+    // SAFETY: the test holds a reference to the root.
+    unsafe { process::end(tree[0].0, ProcessState::Killed, level) };
+    let mut levels = [0; 3];
+    for l in &mut levels {
+        *l = cleanup::top().unwrap_or(0);
+        cleanup::portion();
+    }
+    check(
+        levels == stops,
+        "the stage Stop did not take a portion for each process it ended at the greater of the cause and the ceiling of the one that ended it",
+    )?;
+    // Above the cause, the wave is over before the rest of the teardown
+    // runs; at the cause, the stages of the tree take turns.
+    let stopped = tree.iter().all(|&(p, t)| {
+        // SAFETY: handles in the tree hold the processes and the threads.
+        process::progress(p).0 != Stage::Whole && unsafe { t.as_ref() }.sched.state() == State::Dead
+    });
+    check(
+        stopped || stops.iter().any(|&s| s <= level),
+        "a process of the tree lives, or a thread of it did not stop, after the stage Stop",
+    )?;
+    for _ in 0..256 {
+        let Some(top) = cleanup::top() else {
+            return Ok(());
+        };
+        check(
+            top == level,
+            "the teardown after the stage Stop ran at another level than its cause",
+        )?;
+        cleanup::portion();
+    }
+    Err(STUCK)
+}
+
+/// process_kill of a process that ended hastens its descendants too
+/// (spec 7.7): a root with ceiling 10 ends at 2, its stage Stop ends its
+/// child at 2, and the raise to 20 takes the whole tree above 20. A stage
+/// Children that raised the child without its level would find it below
+/// again at each portion, and the teardown would not end.
+fn hasten_reaches_the_children(_: &Boot) -> Result<(), &'static str> {
+    cleanup::drain();
+    let processes = process::in_use();
+    let root = process::create_root(QUOTA, 16, 10).map_err(|_| "no process")?;
+    let result = child_with(root, CHILD_QUOTA, 16, 10).and_then(|_| {
+        // SAFETY: the test holds a reference to the root.
+        unsafe { process::end(root, ProcessState::Killed, 2) };
+        while cleanup::top().is_some_and(|l| l > 2) {
+            cleanup::portion();
+        }
+        // SAFETY: as above; no portion runs.
+        unsafe { process::hasten(root, 20) };
+        for _ in 0..256 {
+            if !cleanup::top().is_some_and(|l| l >= 20) {
+                return check(
+                    process::progress(root).0 == Stage::Shell && cleanup::len() == 0,
+                    "the tree's teardown did not end above the level of the kill",
+                );
+            }
+            cleanup::portion();
+        }
+        Err(STUCK)
+    });
+    if result == Err(STUCK) {
+        // As in `parent_quota_stage_sees_children_done`.
+        return result;
+    }
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        process::in_use() == processes,
+        "a process of the tree stayed in its pool",
+    )
+}
+
+/// The cursor of the stage Stop moves past a child that leaves the list
+/// (spec 7.7): a root at ceiling 40 with three children ends at 12, and
+/// its first portion of the stage Stop ends its newest child. The middle
+/// one, which only the test's reference holds, ends then at 50, above the
+/// wave; its whole teardown, the stage Quota and its shell included, runs
+/// before the root's next portion, and that portion ends the oldest child.
+/// A cursor left on the middle child would reach its poisoned shell.
+fn stop_cursor_skips_a_child_that_left(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 12;
+    cleanup::drain();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let root = process::create_root(QUOTA, 16, 40).map_err(|_| "no process")?;
+    let made = [0, 1, 2].map(|_| process::create_child(root, CHILD_QUOTA, 16, 40));
+    let result = match made {
+        [Ok(oldest), Ok(middle), Ok(newest)] => {
+            let result = check_cursor(root, [oldest, middle, newest], LEVEL);
+            for p in [oldest, newest] {
+                // SAFETY: the test's references go, and nothing uses them
+                // afterwards; the middle one went inside the check.
+                unsafe { process::release(p, CAUSE) };
+            }
+            result
+        }
+        _ => Err("no child"),
+    };
+    // SAFETY: as above.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "a process of the test stayed in its pool",
+    )
+}
+
+fn check_cursor(
+    root: NonNull<process::Process>,
+    [oldest, middle, newest]: [NonNull<process::Process>; 3],
+    level: u8,
+) -> Result<(), &'static str> {
+    let live = |p: NonNull<process::Process>| {
+        // SAFETY: the test holds a reference to the process.
+        unsafe { p.as_ref() }.state() == ProcessState::Alive
+    };
+    // SAFETY: the test holds a reference to the root.
+    unsafe { process::end(root, ProcessState::Killed, level) };
+    cleanup::portion();
+    check(
+        !live(newest) && live(middle) && live(oldest),
+        "the first portion of the stage Stop did not end the newest child alone",
+    )?;
+    let processes = process::in_use();
+    // SAFETY: the test's reference, the middle child's last, goes: the
+    // child ends, killed, at 50.
+    unsafe { process::release(middle, 50) };
+    while cleanup::top() == Some(50) {
+        cleanup::portion();
+    }
+    check(
+        process::in_use() + 1 == processes,
+        "the middle child did not go before the next portion of its parent",
+    )?;
+    check(
+        cleanup::top() == Some(40),
+        "the stage Stop of the root is not next",
+    )?;
+    cleanup::portion();
+    check(
+        !live(oldest),
+        "the stage Stop did not go on to the next child",
     )
 }
 
@@ -1837,17 +2051,19 @@ fn child_of(
     parent: NonNull<process::Process>,
     quota: u64,
 ) -> Result<NonNull<process::Process>, &'static str> {
-    child_with(parent, quota, 16).map(|(child, _)| child)
+    child_with(parent, quota, 16, 63).map(|(child, _)| child)
 }
 
-/// A child of `parent` with `quota` and room for `limit` handles that only
-/// the handle returned, in `parent`'s table, holds.
+/// A child of `parent` with `quota`, room for `limit` handles and priority
+/// ceiling `ceiling` that only the handle returned, in `parent`'s table,
+/// holds.
 fn child_with(
     parent: NonNull<process::Process>,
     quota: u64,
     limit: u32,
+    ceiling: u8,
 ) -> Result<(NonNull<process::Process>, abi::Handle), &'static str> {
-    let child = process::create_child(parent, quota, limit, 63).map_err(|_| "no child")?;
+    let child = process::create_child(parent, quota, limit, ceiling).map_err(|_| "no child")?;
     let held = process::insert_handle(parent, Object::Process(child), Rights::NONE);
     // SAFETY: the test's reference goes; the handle, if it went in, holds
     // the child.
@@ -1945,10 +2161,10 @@ fn check_two_parts(
 /// portions: an object that goes back in front of the one it waits for.
 const STUCK: &str = "the tree's teardown made no progress";
 
-/// Ends `root` and runs the queue a portion at a time: every portion runs
-/// at `level`, the whole tree goes in a bounded number of portions, the
-/// grandchild's thread leaves the scheduler, and no process comes to its
-/// stage Quota before its children.
+/// Ends `root` and runs the queue a portion at a time: the whole tree goes
+/// in a bounded number of portions, the grandchild's thread leaves the
+/// scheduler, and no process comes to its stage Quota before its
+/// children.
 fn check_tree_end(
     root: NonNull<process::Process>,
     t: NonNull<thread::Thread>,
@@ -1960,10 +2176,6 @@ fn check_tree_end(
         if cleanup::top().is_none() {
             break;
         }
-        check(
-            cleanup::top() == Some(level),
-            "the tree's teardown ran at another level",
-        )?;
         cleanup::portion();
     }
     let ready = sched::first(10) == Some(t);

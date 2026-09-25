@@ -1047,3 +1047,62 @@ fn kill_calls(
     let set = Call::ThreadSetPriority.number();
     c.fails(set, &[ready.0, 10, FIFO], Error::BadState)
 }
+
+/// process_kill of a process that ended before hastens its teardown
+/// (spec 7.7, 11): a child ended at 2 waits behind a thread ready at 10
+/// of the caller's process; the kill from the caller's thread at 20 raises
+/// the teardown to 20, so that the whole of it, the stage Quota included,
+/// runs before the caller's thread does again, and the queue is empty
+/// then. The thread at 10 is still ready.
+pub fn kill_hastens_a_dying_process(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        sched::set_priority(c.thread, 20, Policy::Fifo).map_err(|_| "no priority 20")?;
+        let child = c.created(
+            Call::ProcessCreate.number(),
+            &[CHILD_QUOTA, 16, 20, 0, 0, 0],
+        )?;
+        let ready = thread::create(c.process, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+            .map_err(|_| "no thread")?;
+        let result = thread::start(ready)
+            .map_err(|_| "the thread did not start")
+            .and_then(|()| hasten_cases(c, child, ready));
+        // SAFETY: the test's references go; the ready thread leaves the
+        // scheduler first.
+        unsafe {
+            sched::exit(ready, CAUSE);
+            thread::release(ready, CAUSE);
+        }
+        c.close(child)?;
+        result
+    })
+}
+
+fn hasten_cases(c: &Caller, child: Handle, ready: NonNull<Thread>) -> Result<(), &'static str> {
+    // SAFETY: the caller's process is the test's.
+    let p = unsafe { c.process.as_ref() }
+        .lookup(child, Rights::NONE, Object::process)
+        .map_err(|_| "the handle does not name the child")?;
+    // SAFETY: the handle holds the child.
+    unsafe { process::end(p, ProcessState::Killed, 2) };
+    check(
+        cleanup::top() == Some(2) && sched::first(10) == Some(ready),
+        "the child's teardown does not wait at 2 behind the thread at 10",
+    )?;
+    c.succeeds(Call::ProcessKill.number(), &[child.0], &[])?;
+    check(
+        cleanup::top() == Some(20),
+        "process_kill of a process that ended did not raise its teardown to the caller's level",
+    )?;
+    // What runs before the caller's thread at 20 does again.
+    while cleanup::top().is_some_and(|level| level >= 20) {
+        cleanup::portion();
+    }
+    check(
+        process::progress(p).0 == process::Stage::Shell && cleanup::len() == 0,
+        "the teardown did not pass its stage Quota before the caller ran again",
+    )?;
+    check(
+        sched::first(10) == Some(ready),
+        "the thread at 10 did not stay ready",
+    )
+}

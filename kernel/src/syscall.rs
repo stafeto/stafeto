@@ -196,20 +196,26 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 }
 
 /// process_kill(x0 process with MANAGE): the process ends, reason
-/// «killed» (spec 11): its threads stop in whatever state they are, and
-/// the cleanup queue takes what it holds apart at the caller's priority,
-/// before the caller runs again. A process that ended already: 0, and its
-/// teardown keeps the level of the end that began it. Killing the caller's
-/// own process never returns.
+/// «killed» (spec 11): its threads stop in whatever state they are, its
+/// descendants stop in a wave at its ceiling, and the cleanup queue takes
+/// what it holds apart at the caller's priority, before the caller runs
+/// again. A process that ended already: 0, and its teardown is raised to
+/// the caller's priority (process::hasten), so that the call returns after
+/// it as well. Killing the caller's own process never returns.
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
     let own = target == caller(thread);
     // SAFETY: the handle holds the process; the end takes its own
     // reference before the table that holds the handle may go.
-    unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
+    let ended = unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
     if own {
         // The caller ended with its process and may be gone.
         sched::resume()
+    }
+    if !ended {
+        // SAFETY: the handle holds the process, which ended before; no
+        // portion runs during a call.
+        unsafe { process::hasten(target, cause(thread)) };
     }
     Ok(Values::NONE)
 }

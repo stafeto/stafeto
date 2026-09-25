@@ -19,7 +19,7 @@ use crate::arch::{self, cache, gic, symbols, timer};
 use crate::cleanup;
 use crate::mm::{pages, phys};
 use crate::object::Object;
-use crate::process::{self, Process};
+use crate::process::{self, Process, Stage};
 use crate::sched;
 use crate::syscall::{self, Values};
 use crate::thread::{self, Policy, Thread};
@@ -281,6 +281,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_grandchild,
     },
     El0Test {
+        name: "descendants_stop_above_the_cause",
+        start: start_descendants,
+        done: done_descendants,
+    },
+    El0Test {
         name: "cleanup_yields_to_a_pending_interrupt",
         start: start_cleanup,
         done: done_cleanup_yields,
@@ -404,6 +409,11 @@ struct Fixture {
     /// thread past its wait loop.
     interrupts: u32,
     left_loop: bool,
+    /// A process that the first timer interrupt ends, as process_exit from
+    /// a thread of it at the level given would, and what the thread in
+    /// slot 1 counted in x2 then.
+    exit_at_interrupt: Option<(NonNull<Process>, u8)>,
+    count_at_exit: Option<u64>,
 }
 
 // SAFETY: the fixture's objects are reached only under the kernel's rules
@@ -437,6 +447,8 @@ impl Fixture {
             stack_ok: true,
             interrupts: 0,
             left_loop: false,
+            exit_at_interrupt: None,
+            count_at_exit: None,
         }
     }
 
@@ -552,8 +564,22 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
 /// In the interrupt test the thread waits for it in a loop, and the kernel
 /// moves the thread past the loop; one that comes before the thread
 /// reaches the loop leaves it be, and the next quantum brings another. At
-/// the running test's wake-up the thread in slot 0 starts.
+/// the running test's wake-up the thread in slot 0 starts. The first
+/// interrupt ends the process of `exit_at_interrupt`.
 pub fn timer_fired() {
+    let exit = {
+        let mut f = FIXTURE.lock();
+        let exit = f.exit_at_interrupt.take();
+        if exit.is_some() {
+            f.count_at_exit = Some(counted(&f));
+        }
+        exit
+    };
+    if let Some((p, cause)) = exit {
+        let exited = ProcessState::Exited { code: EXIT_CODE };
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(p, exited, cause) };
+    }
     let wake = {
         let mut f = FIXTURE.lock();
         f.interrupts += 1;
@@ -2118,6 +2144,74 @@ fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
             )
         }
     }
+}
+
+/// The child C of the judge's process, with ceiling CEILING, ends itself
+/// from its thread in slot 2, below the grandchild's thread in slot 1,
+/// which counts in x2, round robin at PRIORITY + 2 (spec 4, 7.7). The
+/// thread of C never gets the processor while the grandchild's counts, so
+/// at the first timer interrupt, the end of the counter's quantum, the
+/// kernel ends C as process_exit from that thread would, with its
+/// priority as the cause. The stage Stop runs at C's ceiling and stops the
+/// grandchild's thread before it runs again: its count stays until the
+/// judge in slot 0 wakes above it three quanta after the start, and by
+/// then the teardown of both went to its end at the level of the cause.
+fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
+    let judge = spawn(f, 0, &raw const el0_done_at_once, 0)?;
+    sched::set_priority(judge, PRIORITY + 10, FIFO).map_err(|_| "no judge")?;
+    let parent = f.processes[0].expect("the judge's process");
+    let child = process::create_child(parent, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING)
+        .map_err(|_| "no child")?;
+    f.processes[2] = Some(child);
+    let low = PRIORITY - 5;
+    let t = thread::create(child, TEXT_VA, DATA_VA + PAGE, 0, low, FIFO)
+        .map_err(|_| "no thread in the child")?;
+    f.threads[2] = Some(t);
+    f.ends[2] = true;
+    let counter = process::create_child(child, CHILD_QUOTA, HANDLE_LIMIT, CEILING)
+        .map_err(|_| "no grandchild")
+        .and_then(|grandchild| {
+            let p = with_programs(f, 1, grandchild)?;
+            new_thread(f, 1, p, DATA_VA, &raw const el0_count_until, 0)
+        })?;
+    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
+    sched::set_priority(counter, PRIORITY + 2, RR).map_err(|_| "no counter")?;
+    f.ends[1] = true;
+    f.exit_at_interrupt = Some((child, low));
+    let quanta = 3 * abi::RR_QUANTUM_NS;
+    f.wake = Some(timer::clock().deadline_after(timer::now(), quanta));
+    Ok(())
+}
+
+/// What the thread in slot 1 counted, in x2 (el0_count_until).
+fn counted(f: &Fixture) -> u64 {
+    slot_thread(f, 1).regs.x[2]
+}
+
+fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        f.slot(t) == 0,
+        "the grandchild's thread ran to its end after its parent ended",
+    )?;
+    check(
+        f.count_at_exit.is_some_and(|n| n > 0),
+        "the grandchild's thread did not count before its parent ended",
+    )?;
+    check(
+        Some(counted(f)) == f.count_at_exit,
+        "the grandchild's thread ran after its parent ended",
+    )?;
+    check(
+        slot_thread(f, 1).sched.state() == State::Dead
+            && state(f, 2) == ProcessState::Exited { code: EXIT_CODE },
+        "the child did not end with its thread's exit, or the grandchild's thread did not stop",
+    )?;
+    let shell =
+        |slot: usize| process::progress(f.processes[slot].expect("a process")).0 == Stage::Shell;
+    check(
+        cleanup::len() == 0 && shell(1) && shell(2),
+        "the teardown of the child and the grandchild did not go to its end",
+    )
 }
 
 /// The killer in slot 0, woken 1 ms after the start, kills its child C;
