@@ -3,6 +3,7 @@
 
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
+mod elf;
 mod image;
 mod qemu;
 
@@ -11,6 +12,10 @@ use std::process::{Command, exit};
 use std::time::Duration;
 
 const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
+/// Spec 14: programs, which run at EL0, are built for this target.
+const PROGRAM_TARGET: &str = "aarch64-unknown-none";
+/// The stack of init's first thread, in bytes (report 5.2; the size is ours).
+const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// Spec 3.4: the kernel image file stays under 200 KB.
 const KERNEL_LIMIT: u64 = 200 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -197,9 +202,7 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     let bytes = std::fs::read(&image).map_err(|e| format!("{}: {e}", image.display()))?;
     image::check_header(&bytes)?;
     image::check_size(bytes.len() as u64, KERNEL_LIMIT)?;
-    let boot_image = target.join("boot.img");
-    std::fs::write(&boot_image, image::placeholder_boot_image())
-        .map_err(|e| format!("{}: {e}", boot_image.display()))?;
+    let boot_image = build_boot_image("init", "boot.img")?;
     println!(
         "kernel image {} ({} bytes, limit {KERNEL_LIMIT})",
         image.display(),
@@ -210,6 +213,46 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
         image,
         boot_image,
     })
+}
+
+/// Builds program `package` for EL0 and, under target/, a boot image
+/// `name` whose only file is that program as init (spec 3.3, 13.1).
+fn build_boot_image(package: &str, name: &str) -> Result<PathBuf, String> {
+    run_cmd(cargo().args([
+        "build",
+        "--package",
+        package,
+        "--release",
+        "--target",
+        PROGRAM_TARGET,
+    ]))?;
+    let target = root().join("target");
+    let elf = target.join(PROGRAM_TARGET).join("release").join(package);
+    let why = |e: String| format!("{}: {e}", elf.display());
+    let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
+    let program = elf::program(&bytes, INIT_STACK_SIZE).map_err(why)?;
+    let init = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
+    let image = bootimg::write::image(&[("init", &init)]).map_err(|e| why(e.to_string()))?;
+    let path = target.join(name);
+    std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
+    println!(
+        "boot image {} ({} bytes): init from {}",
+        path.display(),
+        image.len(),
+        elf.display()
+    );
+    Ok(path)
+}
+
+/// Init's entry point in the boot image at `path`, read as the kernel
+/// reads it.
+fn init_entry(path: &Path) -> Result<u64, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let init = bootimg::BootImage::parse(&bytes)
+        .and_then(bootimg::BootImage::init)
+        .and_then(bootimg::Program::parse)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(init.entry)
 }
 
 fn run() -> Result<(), String> {
@@ -223,6 +266,7 @@ fn test() -> Result<(), String> {
     el2_boot_smoke()?;
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
+    bad_boot_images_stop_the_boot()?;
     fault_report()?;
     stack_overflow_report()?;
     kernel_tests(&qemu::VIRT, Variant::Test)?;
@@ -239,6 +283,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "abi",
         "--package",
+        "bootimg",
+        "--package",
         "kcore",
         "--package",
         "xtask",
@@ -246,13 +292,15 @@ fn host_tests() -> Result<(), String> {
 }
 
 /// A normal build boots, prints its report with the timer frequency and
-/// powers the machine off.
+/// init's entry point from the boot image, and powers the machine off.
 fn boot_smoke() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")?;
+    let entry = init_entry(&a.boot_image)?;
+    qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     match qemu::number_after(&o.lines, "timer ") {
         Some(hz) if hz > 0 => Ok(()),
         _ => Err("the kernel printed no `timer N Hz` line".into()),
@@ -295,6 +343,49 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     qemu::expect_marker(&o, "no device tree in x0")?;
     if !o.stopped_on_marker {
         return Err("QEMU was not stopped on the marker line".into());
+    }
+    Ok(())
+}
+
+/// A boot image that is missing, cut short or damaged stops the boot with
+/// a panic that says what is wrong (spec 3.3, 13.1). The cases: no boot
+/// image; the image without its last byte; the image's signature spoiled;
+/// init's signature spoiled.
+fn bad_boot_images_stop_the_boot() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let good =
+        std::fs::read(&a.boot_image).map_err(|e| format!("{}: {e}", a.boot_image.display()))?;
+    let init_at = bootimg::BootImage::parse(&good)
+        .map_err(|e| e.to_string())?
+        .files()
+        .next()
+        .ok_or("the boot image has no files")?
+        .offset as usize;
+    let mut unsigned = good.clone();
+    unsigned[0] = b's';
+    let mut bad_init = good.clone();
+    bad_init[init_at] = b's';
+    let cases = [
+        (None, "no boot image"),
+        (Some(&good[..good.len() - 1]), "boot image: cut short"),
+        (Some(&unsigned[..]), "boot image: no STAFBOOT signature"),
+        (
+            Some(&bad_init[..]),
+            "boot image: init: no STAFPROG signature",
+        ),
+    ];
+    let path = root().join("target").join("bad-boot.img");
+    for (bytes, marker) in cases {
+        if let Some(b) = bytes {
+            std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        let image = bytes.map(|_| path.as_path());
+        let mut cmd = qemu::command(&qemu::VIRT, &a.image, image);
+        cmd.args(qemu::HEADLESS);
+        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        qemu::expect_powered_off(&o)?;
+        qemu::expect_marker(&o, "KERNEL PANIC")?;
+        qemu::expect_marker(&o, marker)?;
     }
     Ok(())
 }
@@ -394,6 +485,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "abi",
         "--package",
+        "bootimg",
+        "--package",
         "kcore",
         "--package",
         "xtask",
@@ -407,9 +500,21 @@ fn ci() -> Result<(), String> {
         "--package",
         "abi",
         "--package",
+        "bootimg",
+        "--package",
         "kcore",
         "--target",
         KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "init",
+        "--target",
+        PROGRAM_TARGET,
         "--",
         "-D",
         "warnings",
@@ -453,11 +558,11 @@ mod tests {
     /// in the kernel would change a program's registers without a word.
     /// Only the thread switch and the EL0 test programs may assemble them.
     /// Every crate linked into the kernel is searched: the kernel itself,
-    /// kcore and abi.
+    /// kcore, abi and bootimg.
     #[test]
     fn only_the_thread_switch_uses_fp() {
         let mut found = Vec::new();
-        let mut paths: Vec<_> = ["kernel", "kcore", "lib/abi"]
+        let mut paths: Vec<_> = ["kernel", "kcore", "lib/abi", "lib/bootimg"]
             .iter()
             .map(|dir| root().join(dir))
             .collect();

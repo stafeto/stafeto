@@ -100,6 +100,14 @@ pub const INIT_THREAD: Handle = Handle::new(2, 1);
 /// names another object.
 pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 
+/// Top of the stack of init's first thread (spec 13.3). The kernel maps the
+/// stack the boot image asks for right under it, with an unmapped guard
+/// page below; init's program lies under that guard page.
+pub const INIT_STACK_TOP: u64 = 0x1_0000_0000;
+/// The message buffer of init's first thread: one page above the stack,
+/// with an unmapped page between them.
+pub const INIT_MSGBUF: u64 = INIT_STACK_TOP + 0x1000;
+
 /// System calls (spec 11). The number goes in the immediate of `svc #n`.
 /// Arguments go in x0-x9. On success x0 is 0 and the call's values are in
 /// x1 and up; on an error x0 holds the error code and nothing else
@@ -425,6 +433,12 @@ mod tests {
         assert_eq!(INIT_PROCESS, Handle::new(1, 1));
         assert_eq!(INIT_THREAD, Handle::new(2, 1));
         assert_eq!(INIT_BOOT_IMAGE, Handle::new(3, 1));
+    }
+
+    #[test]
+    fn init_stack_and_message_buffer_have_fixed_places() {
+        assert_eq!(INIT_STACK_TOP, 0x1_0000_0000);
+        assert_eq!(INIT_MSGBUF, 0x1_0000_1000);
     }
 
     #[test]

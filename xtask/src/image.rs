@@ -45,14 +45,6 @@ pub fn check_size(len: u64, limit: u64) -> Result<(), String> {
     }
 }
 
-/// Stand-in boot image until the real format arrives in milestone 4: the
-/// signature the kernel tests look for, padded to one page.
-pub fn placeholder_boot_image() -> Vec<u8> {
-    let mut v = b"STAFBOOT".to_vec();
-    v.resize(4096, 0);
-    v
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,12 +86,5 @@ mod tests {
     fn size_limit_is_inclusive() {
         assert!(check_size(204_800, 204_800).is_ok());
         assert!(check_size(204_801, 204_800).is_err());
-    }
-
-    #[test]
-    fn placeholder_boot_image_is_one_page_with_signature() {
-        let p = placeholder_boot_image();
-        assert_eq!(&p[..8], b"STAFBOOT");
-        assert_eq!(p.len(), 4096);
     }
 }

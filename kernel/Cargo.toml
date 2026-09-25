@@ -14,6 +14,7 @@ bench = false
 
 [dependencies]
 abi = { path = "../lib/abi" }
+bootimg = { path = "../lib/bootimg" }
 kcore = { path = "../kcore" }
 
 [features]

@@ -1,0 +1,18 @@
+[package]
+name = "bootimg"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The stafeto boot image format: read in no_std, written on the host"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../abi" }
+
+[features]
+# The writer, for xtask on the host.
+write = []

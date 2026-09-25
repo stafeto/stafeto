@@ -26,6 +26,7 @@ mod syscall;
 mod thread;
 
 use boot::Boot;
+use bootimg::Program;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::KERNEL_VIRT;
 use kcore::time::Clock;
@@ -42,13 +43,14 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
     mm::kmap::switch_to_kernel_tables(boot);
+    let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
     mm::aspace::init(boot);
     arch::gic::init(&boot.info);
     let clock = arch::timer::init();
     sched::init(clock);
-    report(boot, clock);
+    report(boot, clock, &init);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
     #[cfg(feature = "overflow-probe")]
@@ -67,7 +69,7 @@ fn finish(boot: &Boot) -> ! {
     ktest::run(boot)
 }
 
-fn report(boot: &Boot, clock: Clock) {
+fn report(boot: &Boot, clock: Clock, init: &Program) {
     let info = &boot.info;
     for r in info.memory.as_slice() {
         kprintln!("memory     {:#x}..{:#x}", r.base, r.end());
@@ -78,6 +80,15 @@ fn report(boot: &Boot, clock: Clock) {
     if let Some(r) = info.initrd {
         kprintln!("boot image {:#x}..{:#x}", r.base, r.end());
     }
+    let [code, rodata, data] = &init.segments;
+    kprintln!(
+        "init       entry {:#x}, stack {:#x}, code {:#x?}, rodata {:#x?}, data {:#x?}",
+        init.entry,
+        init.stack_size,
+        code.pages(),
+        rodata.pages(),
+        data.pages()
+    );
     kprintln!("kernel     PA {:#x} at VA {KERNEL_VIRT:#x}", boot.kernel_pa);
     kprintln!(
         "image      {:#x}..{:#x}",

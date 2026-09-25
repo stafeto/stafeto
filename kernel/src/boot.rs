@@ -2,9 +2,11 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! What the kernel learns at boot: the device tree's information, the memory
-//! the boot itself occupies and the RAM left for the allocator.
+//! the boot itself occupies, the RAM left for the allocator, and init from
+//! the boot image.
 
 use crate::arch::symbols;
+use bootimg::{BootImage, Program};
 use kcore::bootinfo::{self, BootInfo, Region, RegionList};
 use kcore::fdt::{self, Fdt};
 use kcore::layout::{LINEAR_BASE, dtb_gib_is_mappable, fits_in_one_gib};
@@ -82,4 +84,38 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
     };
     BOOT.set(boot)
         .unwrap_or_else(|_| panic!("boot::collect runs once"))
+}
+
+/// Init from the boot image (spec 3.3, 13.1), checked in full: where the
+/// image lies (memmap::check_boot_image), its header and table, then
+/// init's program. The kernel reads the image
+/// through the linear map, so only once its own tables map all RAM; the
+/// allocator never gets the image's frames, so the bytes stay for good. A
+/// boot image that is missing, damaged or cut short stops the boot here
+/// with a panic that says what is wrong.
+pub fn init_program(boot: &Boot) -> Program<'static> {
+    let Some(r) = boot.info.initrd else {
+        panic!("no boot image: QEMU takes it with -initrd, U-Boot's booti as its ramdisk");
+    };
+    memmap::check_boot_image(
+        boot.info.memory.as_slice(),
+        boot.info.no_map.as_slice(),
+        r,
+        boot.kernel_image,
+        boot.dtb,
+    )
+    .unwrap_or_else(|e| panic!("boot image {:#x}..{:#x} {e}", r.base, r.end()));
+    // SAFETY: the image lies in RAM the linear map covers, apart from the
+    // kernel and the device tree, and the allocator never gets its frames,
+    // so nothing writes to it.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (LINEAR_BASE + r.base as usize) as *const u8,
+            r.size as usize,
+        )
+    };
+    let init = BootImage::parse(bytes)
+        .and_then(BootImage::init)
+        .unwrap_or_else(|e| panic!("boot image: {e}"));
+    Program::parse(init).unwrap_or_else(|e| panic!("boot image: init: {e}"))
 }
