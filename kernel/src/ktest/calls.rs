@@ -97,7 +97,7 @@ impl Caller {
     /// The call fails with `error` and changes x0 alone.
     fn fails(&self, number: u16, args: &[u64], error: Error) -> Result<(), &'static str> {
         let mut want = with_marks(args);
-        want[0] = error as u64;
+        want[0] = error.code();
         self.expect(number, args, want)
     }
 

@@ -796,7 +796,7 @@ fn start_unknown(f: &mut Fixture) -> Result<(), &'static str> {
 }
 
 fn done_unknown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[0], &[Error::InvalidArgs as u64])
+    check_pattern(&t.regs, &f.patterns[0], &[Error::InvalidArgs.code()])
 }
 
 /// The program loads from FIXTURE itself, a kernel variable: the
@@ -1021,7 +1021,7 @@ fn start_closed_handle(f: &mut Fixture) -> Result<(), &'static str> {
 }
 
 fn done_closed_handle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[0], &[Error::BadHandle as u64])
+    check_pattern(&t.regs, &f.patterns[0], &[Error::BadHandle.code()])
 }
 
 // Scheduling tests. The threads of each share the process in slot 0 and
@@ -1437,8 +1437,7 @@ fn start_child_fault(f: &mut Fixture) -> Result<(), &'static str> {
 fn done_child_fault(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let x = &t.regs.x;
     check(x[0] == 0, "a call of the parent failed")?;
-    let Some(ProcessState::Fault { esr, far, elr }) =
-        ProcessState::from_words([x[1], x[2], x[3], x[4]])
+    let ProcessState::Fault { esr, far, elr } = ProcessState::from_words([x[1], x[2], x[3], x[4]])
     else {
         return Err("object_info does not report the child's fault");
     };

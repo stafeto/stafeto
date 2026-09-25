@@ -247,6 +247,10 @@ pub enum ProcessState {
         far: u64,
         elr: u64,
     },
+    /// A state this abi does not know, which a later kernel may return:
+    /// the four words as `object_info` left them. The kernel this abi
+    /// comes with never returns one.
+    Unknown([u64; 4]),
 }
 
 impl ProcessState {
@@ -258,21 +262,23 @@ impl ProcessState {
             ProcessState::Exited { code } => [1, code, 0, 0],
             ProcessState::Killed => [2, 0, 0, 0],
             ProcessState::Fault { esr, far, elr } => [3, esr, far, elr],
+            ProcessState::Unknown(words) => words,
         }
     }
 
-    /// The state from x1-x4 of `object_info`; None for an unknown one.
-    pub const fn from_words(words: [u64; 4]) -> Option<ProcessState> {
+    /// The state from x1-x4 of `object_info`; `Unknown` for a state this
+    /// abi does not know.
+    pub const fn from_words(words: [u64; 4]) -> ProcessState {
         match words[0] {
-            0 => Some(ProcessState::Alive),
-            1 => Some(ProcessState::Exited { code: words[1] }),
-            2 => Some(ProcessState::Killed),
-            3 => Some(ProcessState::Fault {
+            0 => ProcessState::Alive,
+            1 => ProcessState::Exited { code: words[1] },
+            2 => ProcessState::Killed,
+            3 => ProcessState::Fault {
                 esr: words[1],
                 far: words[2],
                 elr: words[3],
-            }),
-            _ => None,
+            },
+            _ => ProcessState::Unknown(words),
         }
     }
 }
@@ -306,36 +312,62 @@ impl Policy {
     }
 }
 
-/// Error codes of system calls (spec 12); zero means success.
-#[repr(u32)]
+/// Errors of system calls (spec 12), each with its code in x0; zero means
+/// success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    BadHandle = 1,
-    WrongType = 2,
-    AccessDenied = 3,
-    InvalidArgs = 4,
-    NoMemory = 5,
-    LimitReached = 6,
-    PeerClosed = 7,
-    WouldBlock = 8,
-    BadState = 9,
+    BadHandle,
+    WrongType,
+    AccessDenied,
+    InvalidArgs,
+    NoMemory,
+    LimitReached,
+    PeerClosed,
+    WouldBlock,
+    BadState,
+    /// A code this abi does not know, which a later kernel may return; it
+    /// is above the codes of `KNOWN`. The kernel this abi comes with never
+    /// returns one.
+    Unknown(u64),
 }
 
 impl Error {
+    /// The errors this abi knows, in the order of their codes from 1.
+    pub const KNOWN: [Error; 9] = [
+        Error::BadHandle,
+        Error::WrongType,
+        Error::AccessDenied,
+        Error::InvalidArgs,
+        Error::NoMemory,
+        Error::LimitReached,
+        Error::PeerClosed,
+        Error::WouldBlock,
+        Error::BadState,
+    ];
+
+    /// The code of the error in x0.
+    pub const fn code(self) -> u64 {
+        match self {
+            Error::BadHandle => 1,
+            Error::WrongType => 2,
+            Error::AccessDenied => 3,
+            Error::InvalidArgs => 4,
+            Error::NoMemory => 5,
+            Error::LimitReached => 6,
+            Error::PeerClosed => 7,
+            Error::WouldBlock => 8,
+            Error::BadState => 9,
+            Error::Unknown(code) => code,
+        }
+    }
+
     /// The error whose code x0 holds after a call; None for 0, which is
-    /// success, and for a code no error has.
+    /// success, and `Unknown` for a code this abi does not know.
     pub const fn from_code(code: u64) -> Option<Error> {
         match code {
-            1 => Some(Error::BadHandle),
-            2 => Some(Error::WrongType),
-            3 => Some(Error::AccessDenied),
-            4 => Some(Error::InvalidArgs),
-            5 => Some(Error::NoMemory),
-            6 => Some(Error::LimitReached),
-            7 => Some(Error::PeerClosed),
-            8 => Some(Error::WouldBlock),
-            9 => Some(Error::BadState),
-            _ => None,
+            0 => None,
+            1..=9 => Some(Self::KNOWN[code as usize - 1]),
+            _ => Some(Error::Unknown(code)),
         }
     }
 }
@@ -492,9 +524,17 @@ mod tests {
         ];
         for (state, words) in states {
             assert_eq!(state.to_words(), words);
-            assert_eq!(ProcessState::from_words(words), Some(state));
+            assert_eq!(ProcessState::from_words(words), state);
         }
-        assert_eq!(ProcessState::from_words([4, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn unknown_process_state_keeps_its_words() {
+        for words in [[4, 5, 6, 7], [u64::MAX, 0, 0, 1]] {
+            let state = ProcessState::from_words(words);
+            assert_eq!(state, ProcessState::Unknown(words));
+            assert_eq!(state.to_words(), words);
+        }
     }
 
     #[test]
@@ -511,20 +551,28 @@ mod tests {
 
     #[test]
     fn error_codes_are_stable() {
-        assert_eq!(Error::BadHandle as u32, 1);
-        assert_eq!(Error::WouldBlock as u32, 8);
-        assert_eq!(Error::BadState as u32, 9);
+        assert_eq!(Error::BadHandle.code(), 1);
+        assert_eq!(Error::InvalidArgs.code(), 4);
+        assert_eq!(Error::WouldBlock.code(), 8);
+        assert_eq!(Error::BadState.code(), 9);
     }
 
     #[test]
     fn error_codes_come_back_from_x0() {
-        for code in 1..=9 {
-            let e = Error::from_code(code).expect("a known code");
-            assert_eq!(e as u64, code);
+        assert_eq!(Error::from_code(0), None);
+        for (i, e) in Error::KNOWN.iter().enumerate() {
+            let code = i as u64 + 1;
+            assert_eq!(e.code(), code);
+            assert_eq!(Error::from_code(code), Some(*e));
         }
         assert_eq!(Error::from_code(4), Some(Error::InvalidArgs));
-        for code in [0, 10, 1 << 32, u64::MAX] {
-            assert_eq!(Error::from_code(code), None);
+    }
+
+    #[test]
+    fn unknown_error_codes_come_back_as_they_are() {
+        for code in [10, 1 << 32, u64::MAX] {
+            assert_eq!(Error::from_code(code), Some(Error::Unknown(code)));
+            assert_eq!(Error::Unknown(code).code(), code);
         }
     }
 

@@ -94,7 +94,7 @@ pub fn set_result(mut thread: NonNull<Thread>, result: Result<Values, Error>) {
             x[0] = 0;
             x[1..=v.len].copy_from_slice(&v.x[..v.len]);
         }
-        Err(e) => x[0] = e as u64,
+        Err(e) => x[0] = e.code(),
     }
 }
 

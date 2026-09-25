@@ -48,16 +48,17 @@ pub unsafe fn raw<const N: u16>(x: Regs) -> Regs {
 }
 
 /// Call `N` with `args` in x0 and up and zero in the rest: x0-x9 on
-/// success, the error otherwise.
+/// success, the error otherwise, `Error::Unknown` for a code of a later
+/// kernel.
 fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let mut x = [0; 10];
     x[..args.len()].copy_from_slice(args);
     // SAFETY: the calls made through here run no code of the program and
     // use none of its memory; thread_create, which can, is unsafe itself.
     let x = unsafe { raw::<N>(x) };
-    match x[0] {
-        0 => Ok(x),
-        code => Err(Error::from_code(code).expect("the kernel returns abi's error codes only")),
+    match Error::from_code(x[0]) {
+        None => Ok(x),
+        Some(e) => Err(e),
     }
 }
 
@@ -162,12 +163,11 @@ pub fn yield_now() -> Result<(), Error> {
 }
 
 /// object_info(PROCESS_STATE): whether the process lives and, if not,
-/// why it ended.
+/// why it ended; a state of a later kernel comes back as `Unknown`.
 pub fn process_state(process: Handle) -> Result<ProcessState, Error> {
     let args = [process.0, abi::INFO_PROCESS_STATE, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
-    let state = ProcessState::from_words([x[1], x[2], x[3], x[4]]);
-    Ok(state.expect("the kernel returns abi's process states only"))
+    Ok(ProcessState::from_words([x[1], x[2], x[3], x[4]]))
 }
 
 /// debug_write: up to abi::INLINE_MAX bytes to the console through the

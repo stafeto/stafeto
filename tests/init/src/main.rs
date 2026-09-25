@@ -376,7 +376,7 @@ fn debug_write_checks_its_arguments() -> Outcome {
     // SAFETY: debug_write only reads its registers.
     let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
     check(
-        after[0] == Error::InvalidArgs as u64 && after[1..] == x[1..],
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
         "65 bytes did not fail with INVALID_ARGS alone",
     )?;
     check(
@@ -422,7 +422,7 @@ fn unknown<const N: u16>() -> Outcome {
     // SAFETY: no call has number N.
     let after = unsafe { sys::raw::<N>(x) };
     check(
-        after[0] == Error::InvalidArgs as u64 && after[1..] == x[1..],
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
         "an unknown number did not fail with INVALID_ARGS alone",
     )
 }
@@ -449,11 +449,11 @@ fn priority_ceilings_hold() -> Outcome {
     };
     check(
         set_priority(0x100 | u64::from(TEST_PRIORITY), Policy::Fifo as u64)
-            == Error::InvalidArgs as u64,
+            == Error::InvalidArgs.code(),
         "a priority with bits above its byte was taken",
     )?;
     check(
-        set_priority(TEST_PRIORITY.into(), 2) == Error::InvalidArgs as u64,
+        set_priority(TEST_PRIORITY.into(), 2) == Error::InvalidArgs.code(),
         "policy 2 was taken",
     )?;
     check(
