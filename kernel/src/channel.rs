@@ -211,7 +211,10 @@ pub fn retain(c: NonNull<Channel>, rights: Rights) {
         if rights.contains(Rights::RECEIVE) {
             let p = c.as_ptr();
             assert!(!(*p).closed, "a handle with RECEIVE to a closed channel");
-            (*p).receivers += 1;
+            (*p).receivers = (*p)
+                .receivers
+                .checked_add(1)
+                .expect("channel receivers overflow");
         }
     }
 }

@@ -1359,9 +1359,9 @@ fn boost_levels(owner: &Caller, low: &Caller, h: Handle, r: Handle) -> Result<()
 /// Spec 15.2 (refusals): when the last handle with RECEIVE goes, the
 /// channel closes (spec 6.5, 6.8), and the slot queued in it goes at the
 /// stage Close. notify through a handle that is left, which a program gets
-/// with handle_duplicate (task 5) and the kernel puts in here, fails with
-/// PEER_CLOSED after its own checks, and changes x0 alone. Its last handle
-/// lets the channel go.
+/// with handle_duplicate (spec 5.2, 5.3) and the kernel puts in here, fails
+/// with PEER_CLOSED after its own checks, and changes x0 alone. Its last
+/// handle lets the channel go.
 pub fn notify_after_close_is_peer_closed(_: &Boot) -> Result<(), &'static str> {
     let channels = channel::in_use();
     with_caller(|c| {

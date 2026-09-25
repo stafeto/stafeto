@@ -184,7 +184,7 @@ struct ChildLinks {
 /// Handles, Space and Shell take as many portions as their steps; the
 /// others one. The stage Stop runs at S, the higher of the process's
 /// ceiling and R (`level`); the others at R, but for Shell, which runs at
-/// the level of the last reference. After the stage Quota the queue lets
+/// the level of the last reference. After the stage Notify the queue lets
 /// its reference go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -767,7 +767,7 @@ pub unsafe fn hasten(process: NonNull<Process>, level: u8) {
 /// queued at R, whatever level the stage runs at. With work left the
 /// process goes back to the head of the level of its stage, so the next
 /// portion there goes on with it, and at the stage Children its first
-/// child goes in front of it; after the stage Quota the queue lets its
+/// child goes in front of it; after the stage Notify the queue lets its
 /// reference go, which queues the shell when it was the last. A shell's
 /// portion, at `level`, gives pages of its pools back, and the last one
 /// the slot.

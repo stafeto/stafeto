@@ -136,7 +136,7 @@ pub fn retain(s: NonNull<Session>, rights: Rights) {
         assert!(*refs > 0, "a session nobody refers to is retained");
         *refs = refs.checked_add(1).expect("session references overflow");
         let p = s.as_ptr();
-        (*p).copies += 1;
+        (*p).copies = (*p).copies.checked_add(1).expect("session copies overflow");
         if rights.contains(Rights::RECEIVE) {
             channel::retain((*p).channel, Rights::RECEIVE);
         }
