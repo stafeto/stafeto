@@ -12,20 +12,24 @@
 //! checks in the runs under -icount. The first test runs with the
 //! priority the kernel gave init; the others with init at TEST_PRIORITY.
 //! A thread above it runs at once; threads below it run when init lowers
-//! itself to 1 (`let_run`), and init runs again once they all have ended:
-//! nothing to wait on exists in milestone 1.2c, so the order of priorities
-//! joins threads.
+//! itself to 1 (`let_run`), and init runs again once they all have ended
+//! or wait: the order of priorities joins threads. Init hears of the end
+//! of a child through the child's exit channel (`wait_exit`, spec 7.9).
+//! Notifications that init takes in its own thread have priority 1
+//! (QUIET), and init asks once more afterwards: their boost never lifts
+//! init above its threads (spec 6.6).
 
 #![no_std]
 #![no_main]
 
 use abi::{
-    Call, Error, Handle, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE, INIT_THREAD, Policy,
-    ProcessHandles, ProcessMemory, ProcessState,
+    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, Policy, ProcessHandles,
+    ProcessMemory, ProcessState, Rights, Source,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use rt::sys::{self, Regs};
-use rt::{Stack, println, time};
+use rt::handle::{Channel, Process, Resource, Thread, Timer};
+use rt::sys::{self, Received, Regs};
+use rt::{Handle, Stack, init, println, time};
 
 rt::entry!(main);
 
@@ -33,7 +37,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 23] = [
+const TESTS: [Test; 57] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -90,6 +94,106 @@ const TESTS: [Test; 23] = [
     ),
     ("child_quota_comes_back", child_quota_comes_back),
     (
+        "channel_create_checks_its_priority",
+        channel_create_checks_its_priority,
+    ),
+    (
+        "notify_and_receive_need_their_rights",
+        notify_and_receive_need_their_rights,
+    ),
+    (
+        "notifications_merge_bits_and_count",
+        notifications_merge_bits_and_count,
+    ),
+    ("notify_refuses_bit_63", notify_refuses_bit_63),
+    (
+        "receive_without_waiting_is_would_block",
+        receive_without_waiting_is_would_block,
+    ),
+    (
+        "notification_runs_at_its_priority",
+        notification_runs_at_its_priority,
+    ),
+    (
+        "boost_ends_at_the_next_receive",
+        boost_ends_at_the_next_receive,
+    ),
+    (
+        "waiting_receiver_gets_peer_closed",
+        waiting_receiver_gets_peer_closed,
+    ),
+    ("duplicate_narrows_rights", duplicate_narrows_rights),
+    (
+        "client_gone_after_the_last_copy",
+        client_gone_after_the_last_copy,
+    ),
+    ("label_cannot_change", label_cannot_change),
+    (
+        "session_priority_under_the_ceiling",
+        session_priority_under_the_ceiling,
+    ),
+    (
+        "session_notice_carries_its_label",
+        session_notice_carries_its_label,
+    ),
+    (
+        "higher_notification_comes_first",
+        higher_notification_comes_first,
+    ),
+    (
+        "notify_after_close_is_peer_closed",
+        notify_after_close_is_peer_closed,
+    ),
+    ("slot_limit_is_1024", slot_limit_is_1024),
+    (
+        "exit_notice_comes_after_the_quota",
+        exit_notice_comes_after_the_quota,
+    ),
+    (
+        "exit_notice_carries_the_label",
+        exit_notice_carries_the_label,
+    ),
+    ("exit_channel_needs_notify", exit_channel_needs_notify),
+    (
+        "exit_priority_under_the_ceiling",
+        exit_priority_under_the_ceiling,
+    ),
+    (
+        "failed_create_keeps_the_start_handle",
+        failed_create_keeps_the_start_handle,
+    ),
+    (
+        "start_channel_moves_into_the_child",
+        start_channel_moves_into_the_child,
+    ),
+    ("start_channel_needs_transfer", start_channel_needs_transfer),
+    (
+        "start_handle_must_be_a_channel",
+        start_handle_must_be_a_channel,
+    ),
+    (
+        "client_gone_when_the_child_dies",
+        client_gone_when_the_child_dies,
+    ),
+    (
+        "clock_now_follows_the_counter",
+        clock_now_follows_the_counter,
+    ),
+    ("timer_needs_receive", timer_needs_receive),
+    ("timer_bounds_a_wait", timer_bounds_a_wait),
+    (
+        "notification_before_the_timer_comes_first",
+        notification_before_the_timer_comes_first,
+    ),
+    (
+        "timer_in_the_past_fires_at_once",
+        timer_in_the_past_fires_at_once,
+    ),
+    ("timer_set_moves_the_deadline", timer_set_moves_the_deadline),
+    ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
+    ("timer_never_fires_early", timer_never_fires_early),
+    ("timer_limit_is_64", timer_limit_is_64),
+    (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
     ),
@@ -102,18 +206,30 @@ const TEST_PRIORITY: u8 = 20;
 const LOW: u8 = 5;
 const LEVEL: u8 = 10;
 const HIGH: u8 = 30;
+/// The priority of the notifications of the priority tests: above init.
+const NOTICE: u8 = 25;
+/// The priority of the notifications init takes itself: the lowest level.
+const QUIET: u8 = 1;
 
 const PAGE: usize = 4096;
 const STACK_SIZE: usize = 16 * 1024;
 /// The quota of a child with a thread or two (spec 7.5).
 const CHILD_QUOTA: u64 = 64 * 1024;
-/// The least quota this kernel takes for a child: its shell, its root
-/// table, the directory of its table and the chunk with entry 0.
-const LEAST_QUOTA: u64 = 12 * 1024;
+/// The least quota this kernel takes for a child (spec 7.5): its root
+/// table and the page of its pool of blocks, with the directory of its
+/// table and the chunk with entry 0. Its shell is init's (spec 7.8).
+const LEAST_QUOTA: u64 = 8 * 1024;
 /// Rounds of `create_kill_cycles_leak_nothing`.
 const CYCLES: u32 = 1000;
 /// Threads of init's own process a test may have at a time.
 const SLOTS: usize = 2;
+/// The label of the copy of a test's exit channel that names its
+/// children (process_create x3).
+const CHILD: u64 = 0xC41D;
+/// The label of the copy of a channel a timer is made through.
+const TIMED: u64 = 0x71AE;
+/// The bits a thread of init notifies with before a timer's deadline.
+const NOTIFIED: u64 = 0b1001;
 
 static STACKS: [Stack<STACK_SIZE>; SLOTS] = [const { Stack::new() }; SLOTS];
 
@@ -134,12 +250,12 @@ const CHILD_FAULT_ESR: u64 = 0x8200_0007;
 const STOPS: &[u8] = b"debug_write stops at its length";
 
 fn main(_: u64) -> u64 {
-    rt::console::set(INIT_RESOURCE);
+    rt::console::set(&init::RESOURCE);
     println!("counter ticks of 10000 turns: {}", loop_ticks());
     let mut failed = 0;
     for (i, (name, test)) in TESTS.into_iter().enumerate() {
         if i == 1 {
-            sys::thread_set_priority(INIT_THREAD, TEST_PRIORITY, Policy::Fifo)
+            sys::thread_set_priority(&init::THREAD, TEST_PRIORITY, Policy::Fifo)
                 .expect("init takes the priority of the tests");
         }
         match test() {
@@ -182,8 +298,14 @@ fn check(ok: bool, why: &'static str) -> Outcome {
     if ok { Ok(()) } else { Err(why) }
 }
 
-fn close(h: Handle) -> Outcome {
-    sys::handle_close(h).map_err(|_| "handle_close failed")
+fn close<K>(h: Handle<K>) -> Outcome {
+    h.close().map_err(|_| "handle_close failed")
+}
+
+/// The same handle with another kind in its type, for a call that must
+/// fail with WRONG_TYPE.
+fn retyped<K, L>(h: &Handle<K>) -> Handle<L> {
+    Handle::from_raw(h.raw())
 }
 
 /// x0-x9 filled with marks, for calls that must change x0 alone.
@@ -214,12 +336,12 @@ fn thread(
     arg: u64,
     priority: u8,
     policy: Policy,
-) -> Result<Handle, &'static str> {
+) -> Result<Handle<Thread>, &'static str> {
     // SAFETY: each test lets its threads end before the next test uses the
     // slot, so the stack is the thread's alone.
     let t = unsafe {
         sys::thread_create(
-            INIT_PROCESS,
+            &init::PROCESS,
             entry,
             STACKS[slot].top(),
             arg,
@@ -238,31 +360,31 @@ fn spawn(
     arg: u64,
     priority: u8,
     policy: Policy,
-) -> Result<Handle, &'static str> {
+) -> Result<Handle<Thread>, &'static str> {
     let t = thread(slot, entry, arg, priority, policy)?;
-    sys::thread_start(t).map_err(|_| "thread_start failed")?;
+    sys::thread_start(&t).map_err(|_| "thread_start failed")?;
     Ok(t)
 }
 
 /// Lets every thread below init run until it ends: init lowers itself to
 /// 1 and, once it runs again, takes TEST_PRIORITY back.
 fn let_run() -> Outcome {
-    sys::thread_set_priority(INIT_THREAD, 1, Policy::Fifo)
+    sys::thread_set_priority(&init::THREAD, 1, Policy::Fifo)
         .map_err(|_| "init could not lower itself")?;
-    sys::thread_set_priority(INIT_THREAD, TEST_PRIORITY, Policy::Fifo)
+    sys::thread_set_priority(&init::THREAD, TEST_PRIORITY, Policy::Fifo)
         .map_err(|_| "init could not take its priority back")
 }
 
 /// A child with no code, CHILD_QUOTA, room for 16 handles and ceiling
 /// `ceiling`.
-fn child(ceiling: u8) -> Result<Handle, &'static str> {
+fn child(ceiling: u8) -> Result<Handle<Process>, &'static str> {
     sys::process_create(CHILD_QUOTA, 16, ceiling).map_err(|_| "process_create failed")
 }
 
 /// A stopped thread of `process` at CHILD_ENTRY, FIFO at `priority`.
-fn child_thread(process: Handle, priority: u8) -> Result<Handle, Error> {
+fn child_thread(process: &Handle<Process>, priority: u8) -> Result<Handle<Thread>, Error> {
     let mut x = [0; 10];
-    x[0] = process.0;
+    x[0] = process.raw().0;
     x[1] = CHILD_ENTRY;
     x[4] = priority.into();
     x[5] = Policy::Fifo as u64;
@@ -271,7 +393,7 @@ fn child_thread(process: Handle, priority: u8) -> Result<Handle, Error> {
     // init's.
     let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
     match Error::from_code(after[0]) {
-        None => Ok(Handle(after[1])),
+        None => Ok(Handle::from_raw(abi::Handle(after[1]))),
         Some(e) => Err(e),
     }
 }
@@ -323,23 +445,23 @@ fn init_prints_from_el0() -> Outcome {
 /// Init's first handles name what spec 13.3 gives it.
 fn init_handles_have_their_fixed_values() -> Outcome {
     check(
-        sys::process_state(INIT_PROCESS) == Ok(ProcessState::Alive),
+        sys::process_state(&init::PROCESS) == Ok(ProcessState::Alive),
         "INIT_PROCESS is not a live process",
     )?;
     check(
-        sys::debug_write(INIT_RESOURCE, b"") == Ok(0),
+        sys::debug_write(&init::RESOURCE, b"") == Ok(0),
         "INIT_RESOURCE does not write to the console",
     )?;
     check(
-        sys::process_state(INIT_RESOURCE) == Err(Error::WrongType),
+        sys::process_state(&retyped(&init::RESOURCE)) == Err(Error::WrongType),
         "INIT_RESOURCE is not the system resource",
     )?;
     check(
-        sys::thread_set_priority(INIT_THREAD, TEST_PRIORITY, Policy::Fifo).is_ok(),
+        sys::thread_set_priority(&init::THREAD, TEST_PRIORITY, Policy::Fifo).is_ok(),
         "INIT_THREAD is not a thread with MANAGE",
     )?;
     check(
-        sys::process_state(INIT_THREAD) == Err(Error::WrongType),
+        sys::process_state(&retyped(&init::THREAD)) == Err(Error::WrongType),
         "INIT_THREAD is a process",
     )
 }
@@ -347,11 +469,11 @@ fn init_handles_have_their_fixed_values() -> Outcome {
 /// Until milestone 1.3 the boot image's handle is bad (spec 13.3).
 fn boot_image_handle_is_reserved() -> Outcome {
     check(
-        sys::process_state(INIT_BOOT_IMAGE) == Err(Error::BadHandle),
+        sys::process_state(&Handle::from_raw(INIT_BOOT_IMAGE)) == Err(Error::BadHandle),
         "object_info took INIT_BOOT_IMAGE",
     )?;
     check(
-        sys::handle_close(INIT_BOOT_IMAGE) == Err(Error::BadHandle),
+        Handle::<Resource>::from_raw(INIT_BOOT_IMAGE).close() == Err(Error::BadHandle),
         "handle_close took INIT_BOOT_IMAGE",
     )
 }
@@ -362,7 +484,7 @@ fn init_has_its_message_buffer() -> Outcome {
     // SAFETY: as in `thread`; slot 0 is free.
     let taken = unsafe {
         sys::thread_create(
-            INIT_PROCESS,
+            &init::PROCESS,
             add_mark,
             STACKS[0].top(),
             0,
@@ -371,13 +493,11 @@ fn init_has_its_message_buffer() -> Outcome {
             abi::INIT_MSGBUF as usize,
         )
     };
+    let refused = taken == Err(Error::InvalidArgs);
     if let Ok(t) = taken {
         close(t)?;
     }
-    check(
-        taken == Err(Error::InvalidArgs),
-        "the page of init's message buffer is free",
-    )?;
+    check(refused, "the page of init's message buffer is free")?;
     let word = abi::INIT_MSGBUF as *mut u64;
     // SAFETY: the page is the buffer of init's own thread, which nothing
     // else uses in milestone 1.2c.
@@ -392,7 +512,7 @@ fn init_has_its_message_buffer() -> Outcome {
 /// system resource and writes only the bytes of its length (spec 11).
 fn debug_write_checks_its_arguments() -> Outcome {
     let mut x = marked();
-    x[0] = INIT_RESOURCE.0;
+    x[0] = init::RESOURCE.raw().0;
     x[1] = abi::INLINE_MAX as u64 + 1;
     // SAFETY: debug_write only reads its registers.
     let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
@@ -401,19 +521,20 @@ fn debug_write_checks_its_arguments() -> Outcome {
         "65 bytes did not fail with INVALID_ARGS alone",
     )?;
     check(
-        sys::debug_write(INIT_PROCESS, b"x") == Err(Error::WrongType),
+        sys::debug_write(&retyped(&init::PROCESS), b"x") == Err(Error::WrongType),
         "a process handle wrote",
     )?;
     let c = child(LOW)?;
+    let gone = retyped(&c);
     close(c)?;
     check(
-        sys::debug_write(c, b"x") == Err(Error::BadHandle),
+        sys::debug_write(&gone, b"x") == Err(Error::BadHandle),
         "a closed handle wrote",
     )?;
     let mut bytes = [b'#'; abi::INLINE_MAX];
     bytes[..STOPS.len()].copy_from_slice(STOPS);
     let mut x = [0; 10];
-    x[0] = INIT_RESOURCE.0;
+    x[0] = init::RESOURCE.raw().0;
     x[1] = STOPS.len() as u64;
     x[2..].copy_from_slice(&abi::inline_words(&bytes));
     // SAFETY: as above.
@@ -423,7 +544,7 @@ fn debug_write_checks_its_arguments() -> Outcome {
         "debug_write did not write the bytes of its length",
     )?;
     check(
-        sys::debug_write(INIT_RESOURCE, b"\n") == Ok(1),
+        sys::debug_write(&init::RESOURCE, b"\n") == Ok(1),
         "debug_write did not write a newline",
     )
 }
@@ -454,14 +575,14 @@ fn unknown<const N: u16>() -> Outcome {
 fn priority_ceilings_hold() -> Outcome {
     for priority in [0, abi::PRIORITY_LEVELS] {
         check(
-            sys::thread_set_priority(INIT_THREAD, priority, Policy::Fifo)
+            sys::thread_set_priority(&init::THREAD, priority, Policy::Fifo)
                 == Err(Error::InvalidArgs),
             "priority 0 or 64 was taken",
         )?;
     }
     let set_priority = |priority: u64, policy: u64| {
         let mut x = marked();
-        x[0] = INIT_THREAD.0;
+        x[0] = init::THREAD.raw().0;
         x[1] = priority;
         x[2] = policy;
         // SAFETY: thread_set_priority only reads its registers.
@@ -482,17 +603,15 @@ fn priority_ceilings_hold() -> Outcome {
         "ceiling 64 was taken",
     )?;
     let c = child(LEVEL)?;
-    let above = child_thread(c, LEVEL + 1);
-    let at = child_thread(c, LEVEL);
+    let above = child_thread(&c, LEVEL + 1);
+    let at = child_thread(&c, LEVEL);
+    let (refused, made) = (above == Err(Error::AccessDenied), at.is_ok());
     close(c)?;
     for t in [above, at].into_iter().flatten() {
         close(t)?;
     }
-    check(
-        above == Err(Error::AccessDenied),
-        "a thread above its process's ceiling was made",
-    )?;
-    check(at.is_ok(), "a thread at its process's ceiling was not made")
+    check(refused, "a thread above its process's ceiling was made")?;
+    check(made, "a thread at its process's ceiling was not made")
 }
 
 /// Calls on a thread or a process in the wrong state fail with BAD_STATE:
@@ -501,13 +620,14 @@ fn priority_ceilings_hold() -> Outcome {
 fn thread_states() -> Outcome {
     reset_marks();
     let t = spawn(0, add_mark, 0, LOW, Policy::Fifo)?;
-    let second = sys::thread_start(t);
+    let second = sys::thread_start(&t);
     let_run()?;
-    let ended = sys::thread_set_priority(t, LOW, Policy::Fifo);
+    let ended = sys::thread_set_priority(&t, LOW, Policy::Fifo);
     close(t)?;
     let c = child(LOW)?;
-    let killed = sys::process_kill(c);
-    let late = child_thread(c, LOW);
+    let killed = sys::process_kill(&c);
+    let late = child_thread(&c, LOW);
+    let refused = late == Err(Error::BadState);
     close(c)?;
     if let Ok(t) = late {
         close(t)?;
@@ -518,7 +638,7 @@ fn thread_states() -> Outcome {
         "a thread that ended took a new priority",
     )?;
     check(
-        killed.is_ok() && late == Err(Error::BadState),
+        killed.is_ok() && refused,
         "a process that ended took a new thread",
     )
 }
@@ -526,12 +646,12 @@ fn thread_states() -> Outcome {
 /// A stopped thread of init's process that runs add_mark(0) on the stack
 /// of slot 0, at `priority`, with its message buffer on page `page` above
 /// init's own.
-fn marker(page: usize, priority: u8) -> Result<Handle, Error> {
+fn marker(page: usize, priority: u8) -> Result<Handle<Thread>, Error> {
     // SAFETY: of the threads that share the stack of slot 0 at a time, at
     // most one runs, and it ends before the next test.
     unsafe {
         sys::thread_create(
-            INIT_PROCESS,
+            &init::PROCESS,
             add_mark,
             STACKS[0].top(),
             0,
@@ -548,35 +668,34 @@ fn marker(page: usize, priority: u8) -> Result<Handle, Error> {
 /// its handle keeps its shell.
 fn thread_limit_is_64() -> Outcome {
     reset_marks();
-    let mut made = [None; abi::MAX_THREADS as usize - 1];
+    let mut made: [Option<Handle<Thread>>; abi::MAX_THREADS as usize - 1] =
+        [const { None }; abi::MAX_THREADS as usize - 1];
     for (page, slot) in made.iter_mut().enumerate() {
         *slot = marker(page, HIGH).ok();
     }
     let past = marker(made.len(), HIGH);
     // Above init, it runs and exits before thread_start returns.
-    let started = made[0].map(sys::thread_start);
+    let started = made[0].as_ref().map(sys::thread_start);
     let again = marker(made.len(), HIGH);
     let all = made.iter().all(Option::is_some);
+    let (refused, remade) = (past == Err(Error::LimitReached), again.is_ok());
     for h in made.into_iter().flatten().chain(past).chain(again) {
         close(h)?;
     }
     check(all, "63 threads next to init's did not fit")?;
-    check(past == Err(Error::LimitReached), "a 65th thread was made")?;
+    check(refused, "a 65th thread was made")?;
     check(
         started == Some(Ok(())) && mark(0) == 1,
         "a thread of the full process did not run to its exit",
     )?;
-    check(
-        again.is_ok(),
-        "the exit of a thread did not make room for another",
-    )
+    check(remade, "the exit of a thread did not make room for another")
 }
 
 /// A thread started above init runs before thread_start returns.
 fn higher_priority_start_preempts_at_once() -> Outcome {
     reset_marks();
     let t = thread(0, add_mark, 0, HIGH, Policy::Fifo)?;
-    let started = sys::thread_start(t);
+    let started = sys::thread_start(&t);
     let ran = mark(0);
     close(t)?;
     check(started.is_ok(), "thread_start failed")?;
@@ -730,16 +849,22 @@ extern "C" fn spin_then_yield(ticks: u64) -> ! {
 
 /// Spec 15.2 (faults): a child with no code gets a thread above init whose
 /// entry maps nothing. The thread runs at once and faults, which ends the
-/// child; object_info tells init why, and the kernel prints the fault,
-/// which xtask reads whole.
+/// child; init hears of the end on the child's exit channel (spec 7.9),
+/// object_info tells it why, and the kernel prints the fault, which xtask
+/// reads whole.
 fn child_fault_reason_reaches_the_parent() -> Outcome {
-    let c = child(HIGH)?;
-    let t = child_thread(c, HIGH).map_err(|_| "thread_create in the child failed")?;
-    let started = sys::thread_start(t);
-    let state = sys::process_state(c);
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, HIGH)?;
+    let t = child_thread(&c, HIGH).map_err(|_| "thread_create in the child failed")?;
+    let started = sys::thread_start(&t);
+    let heard = wait_exit(&exits, CHILD);
+    let state = sys::process_state(&c);
     close(t)?;
     close(c)?;
+    close(exits)?;
+    close(name)?;
     check(started.is_ok(), "thread_start failed")?;
+    heard?;
     let fault = ProcessState::Fault {
         esr: CHILD_FAULT_ESR,
         far: CHILD_ENTRY,
@@ -758,13 +883,13 @@ fn child_fault_reason_reaches_the_parent() -> Outcome {
 /// second kill of the dead child succeeds.
 fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
     let c = child(LOW)?;
-    let t = child_thread(c, LOW).map_err(|_| "thread_create in the child failed")?;
-    let started = sys::thread_start(t);
-    let killed = sys::process_kill(c);
+    let t = child_thread(&c, LOW).map_err(|_| "thread_create in the child failed")?;
+    let started = sys::thread_start(&t);
+    let killed = sys::process_kill(&c);
     // A thread left on the queue would run now, above init at 1.
     let_run()?;
-    let state = sys::process_state(c);
-    let again = sys::process_kill(c);
+    let state = sys::process_state(&c);
+    let again = sys::process_kill(&c);
     close(t)?;
     close(c)?;
     check(
@@ -779,13 +904,19 @@ fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
 }
 
 /// A child's quota comes off init's (spec 7.5): more than init has free
-/// fails with NO_MEMORY and changes x0 alone, and so does a quota too
+/// fails with NO_MEMORY and changes x0 alone, and so does a page, too
 /// small for the child's own objects; a child that was not made gave
-/// init's quota back before the call returned, also one that failed only
-/// at its entry 0. In a child with the least quota a thread does not fit:
-/// NO_MEMORY again.
+/// init's quota back before the call returned, although it failed only
+/// at its entry 0. A child with the least quota, 8 KiB, is made; a thread
+/// does not fit in it: NO_MEMORY again. A child made and closed first
+/// leaves a free place in init's pool of shells, so that no call below
+/// charges init a page of that pool.
 fn quota_is_enforced() -> Outcome {
-    let own = sys::process_memory(INIT_PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    close(
+        sys::process_create(LEAST_QUOTA, 16, LOW)
+            .map_err(|_| "a child with the least quota was not made")?,
+    )?;
+    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
     let over = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
     let mut x = marked();
     x[..6].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0]);
@@ -795,46 +926,44 @@ fn quota_is_enforced() -> Outcome {
         after[0] == Error::NoMemory.code() && after[1..] == x[1..],
         "a quota above init's did not fail with NO_MEMORY alone",
     )?;
-    for short in [PAGE as u64, LEAST_QUOTA - PAGE as u64] {
-        check(
-            sys::process_create(short, 16, LOW) == Err(Error::NoMemory),
-            "a child took a quota below the least",
-        )?;
-        check(
-            sys::process_memory(INIT_PROCESS).map(|m| m.used) == Ok(own.used),
-            "a child that was not made kept init's quota after the call",
-        )?;
-    }
+    check(
+        sys::process_create(PAGE as u64, 16, LOW) == Err(Error::NoMemory),
+        "a child took a quota below the least",
+    )?;
+    check(
+        sys::process_memory(&init::PROCESS).map(|m| m.used) == Ok(own.used),
+        "a child that was not made kept init's quota after the call",
+    )?;
     let c = sys::process_create(LEAST_QUOTA, 16, LOW)
         .map_err(|_| "a child with the least quota was not made")?;
-    let t = child_thread(c, LOW);
+    let t = child_thread(&c, LOW);
+    let refused = t == Err(Error::NoMemory);
     close(c)?;
     if let Ok(t) = t {
         close(t)?;
     }
-    check(
-        t == Err(Error::NoMemory),
-        "a thread fit in a child with the least quota",
-    )
+    check(refused, "a thread fit in a child with the least quota")
 }
 
 /// object_info's PROCESS_MEMORY and PROCESS_HANDLES (spec 11): a new child
-/// has the quota init gave it, pays for its own objects from it, less than
-/// the least quota, and returned nothing; its table is empty, entry 0 went
-/// back, and its limit is the one init set. A thread makes the child pay
-/// for the thread, its buffer and the tables over it. Init's table counts
-/// the handles to both, and init's quota, every frame free when it was
-/// made, covers what it uses.
+/// has the quota init gave it, pays for its own objects from it, the least
+/// quota by the page, and returned nothing; its table is empty, entry 0
+/// went back, and its limit is the one init set. A thread makes the child
+/// pay for the page of its pool of threads, the buffer and the three
+/// tables over it. Init's table counts the handles to both. Init's quota
+/// is every frame free when it was made (spec 7.5): the frames free are
+/// exactly the parts of the quotas of init and its child nobody used.
 fn process_info_kinds() -> Outcome {
-    let before = sys::process_handles(INIT_PROCESS);
+    let before = sys::process_handles(&init::PROCESS);
     let c = child(LOW)?;
-    let made = sys::process_memory(c);
-    let table = sys::process_handles(c);
-    let t = child_thread(c, LOW);
-    let with_thread = sys::process_memory(c);
-    let after = sys::process_handles(INIT_PROCESS);
-    let own = sys::process_memory(INIT_PROCESS);
-    let stats = sys::kernel_stats(INIT_RESOURCE);
+    let made = sys::process_memory(&c);
+    let table = sys::process_handles(&c);
+    let t = child_thread(&c, LOW);
+    let with_thread = sys::process_memory(&c);
+    let after = sys::process_handles(&init::PROCESS);
+    let own = sys::process_memory(&init::PROCESS);
+    let stats = sys::kernel_stats(&init::RESOURCE);
+    let threaded = t.is_ok();
     close(c)?;
     if let Ok(t) = t {
         close(t)?;
@@ -843,11 +972,8 @@ fn process_info_kinds() -> Outcome {
         return Err("PROCESS_MEMORY of the child failed");
     };
     check(
-        made.quota == CHILD_QUOTA
-            && made.used > 0
-            && made.used <= LEAST_QUOTA
-            && made.returned == 0,
-        "a new child does not pay for its own objects from the quota init gave it",
+        made.quota == CHILD_QUOTA && made.used == LEAST_QUOTA && made.returned == 0,
+        "a new child does not pay for its root table and its page of blocks from the quota init gave it",
     )?;
     check(
         table
@@ -859,8 +985,8 @@ fn process_info_kinds() -> Outcome {
         "a new child's table is not empty with the limit init set",
     )?;
     check(
-        t.is_ok() && with_thread.is_ok_and(|m| m.used > made.used + 4 * PAGE as u64),
-        "the child did not pay for its thread, the buffer and three tables",
+        threaded && with_thread.is_ok_and(|m| m.used == made.used + 5 * PAGE as u64),
+        "the child did not pay for the page of its threads, the buffer and three tables",
     )?;
     let (Ok(before), Ok(after)) = (before, after) else {
         return Err("PROCESS_HANDLES of init failed");
@@ -870,33 +996,46 @@ fn process_info_kinds() -> Outcome {
             && (after.retired, after.limit) == (before.retired, before.limit),
         "init's table did not count the handles to the child and its thread",
     )?;
+    let (Ok(own), Ok(stats)) = (own, stats) else {
+        return Err("PROCESS_MEMORY of init or KERNEL_STATS failed");
+    };
+    let free = stats.free_frames * PAGE as u64;
     check(
-        own.is_ok_and(|m| m.used + m.returned < m.quota && m.returned == 0)
-            && stats.is_ok_and(|s| own.is_ok_and(|m| m.quota > s.free_frames * PAGE as u64)),
+        own.used + own.returned < own.quota
+            && own.returned == 0
+            && own.quota > free
+            && with_thread.is_ok_and(|m| own.quota - own.used + (m.quota - m.used) == free),
         "init's quota is not the frames that were free when it was made",
     )
 }
 
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
-/// is WRONG_TYPE; init's resource gets the counts in x1-x7 and changes
+/// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
+/// though it writes; init's resource gets the counts in x1-x8 and changes
 /// nothing past them. Nothing waits in the cleanup queue while init runs,
-/// and the frames and pool pages are there. A copy of the resource without
-/// KSTATS, which ACCESS_DENIED needs, comes with handle_duplicate
-/// (milestone 1.3b).
+/// and the frames and pool pages are there.
 fn kernel_stats_need_kstats() -> Outcome {
     check(
-        sys::kernel_stats(INIT_PROCESS) == Err(Error::WrongType),
+        sys::kernel_stats(&retyped(&init::PROCESS)) == Err(Error::WrongType),
         "a process handle gave the kernel's counts",
     )?;
+    let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let denied = sys::kernel_stats(&debug);
+    let written = sys::debug_write(&debug, b"");
+    close(debug)?;
+    check(
+        denied == Err(Error::AccessDenied) && written == Ok(0),
+        "a copy of the resource without KSTATS gave the kernel's counts, or did not write",
+    )?;
     let mut x = marked();
-    x[..3].copy_from_slice(&[INIT_RESOURCE.0, abi::INFO_KERNEL_STATS, 0]);
+    x[..3].copy_from_slice(&[init::RESOURCE.raw().0, abi::INFO_KERNEL_STATS, 0]);
     // SAFETY: object_info only reads its registers.
     let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
     check(
-        after[0] == 0 && after[8..] == x[8..],
-        "KERNEL_STATS failed or changed registers past x7",
+        after[0] == 0 && after[9..] == x[9..],
+        "KERNEL_STATS failed or changed registers past x8",
     )?;
-    let stats = abi::KernelStats::from_words(after[1..8].try_into().expect("x1-x7"));
+    let stats = abi::KernelStats::from_words(after[1..9].try_into().expect("x1-x8"));
     check(
         stats.cleanup_queue == 0 && stats.free_frames > 0 && stats.pool_pages > 0,
         "the queue is not empty, or no frame or pool page is counted",
@@ -905,29 +1044,37 @@ fn kernel_stats_need_kstats() -> Outcome {
 
 /// Init at TEST_PRIORITY kills a child with a thread: the cleanup runs at
 /// init's level before the call returns (spec 7.7), so right afterwards
-/// the queue is empty and the child gave back all but the shells init's
-/// handles keep.
+/// the queue is empty, the exit notification is there (spec 7.9), and the
+/// child gave back all but the pages of its pools of threads and blocks,
+/// which go with its shell (spec 7.8): the shell of its thread, which
+/// init's handle keeps, lies in one of them.
 fn process_kill_returns_after_the_teardown() -> Outcome {
-    let c = child(LOW)?;
-    let t = child_thread(c, LOW);
-    let killed = sys::process_kill(c);
-    let stats = sys::kernel_stats(INIT_RESOURCE);
-    let memory = sys::process_memory(c);
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, LOW)?;
+    let t = child_thread(&c, LOW);
+    let killed = sys::process_kill(&c);
+    let stats = sys::kernel_stats(&init::RESOURCE);
+    let memory = sys::process_memory(&c);
+    let heard = take_one(&exits);
+    let made = t.is_ok() && killed.is_ok();
     close(c)?;
     if let Ok(t) = t {
         close(t)?;
     }
+    close(exits)?;
+    close(name)?;
+    check(made, "thread_create or process_kill failed")?;
     check(
-        t.is_ok() && killed.is_ok(),
-        "thread_create or process_kill failed",
+        heard == Ok(exit_notice(CHILD)),
+        "the exit notification was not there when process_kill returned",
     )?;
     check(
         stats.is_ok_and(|s| s.cleanup_queue == 0),
         "the cleanup queue was not empty when process_kill returned",
     )?;
     check(
-        memory.is_ok_and(|m| m.returned > 0 && m.used + m.returned == m.quota),
-        "the child's quota was not back when process_kill returned",
+        memory.is_ok_and(|m| m.used == 2 * PAGE as u64 && m.used + m.returned == m.quota),
+        "the child's quota was not back but for its two pages of pools when process_kill returned",
     )
 }
 
@@ -936,24 +1083,22 @@ fn process_kill_returns_after_the_teardown() -> Outcome {
 /// thread hold, which init's handles keep; the rest once init closes the
 /// handles. Then init uses what it used before the child.
 fn child_quota_comes_back() -> Outcome {
-    let used = || sys::process_memory(INIT_PROCESS).map(|m| m.used);
+    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
     let before = used();
     let c = child(LOW)?;
     let made = used();
-    let t = child_thread(c, LOW);
-    let killed = sys::process_kill(c);
+    let t = child_thread(&c, LOW);
+    let killed = sys::process_kill(&c);
     let after_kill = used();
-    let child_memory = sys::process_memory(c);
+    let child_memory = sys::process_memory(&c);
+    let ended = t.is_ok() && killed.is_ok();
     if let Ok(t) = t {
         close(t)?;
     }
     let after_thread = used();
     close(c)?;
     let after = used();
-    check(
-        t.is_ok() && killed.is_ok(),
-        "thread_create or process_kill failed",
-    )?;
+    check(ended, "thread_create or process_kill failed")?;
     let (Ok(before), Ok(made), Ok(after_kill), Ok(child_memory)) =
         (before, made, after_kill, child_memory)
     else {
@@ -983,17 +1128,26 @@ fn child_quota_comes_back() -> Outcome {
     )
 }
 
-/// CYCLES rounds of a child with a ready thread, killed and closed, leave
-/// init's used memory, the free frames and the pages of kernel pools as
-/// they were (spec 7.5, 7.8): each child gives back every frame and pool
-/// slot it took, and the kill takes the kernel's reference to the thread
-/// along. One round runs first, so that the pools have the pages a round
-/// needs.
+/// CYCLES rounds of a child with a ready thread, killed and closed, and
+/// of its exit notification leave init's used memory, the free frames and
+/// the pages of kernel pools as they were, exactly (spec 7.5, 7.8): each
+/// child gives back every frame it took and the pages of its pools with
+/// its shell, which goes once init took the notification, and the kill
+/// takes the kernel's reference to the thread along. One round runs
+/// first: the page of init's pool of shells that it takes stays init's.
 fn create_kill_cycles_leak_nothing() -> Outcome {
-    cycle()?;
+    let (exits, name) = exit_channel()?;
+    let result = cycles(&exits, &name);
+    close(exits)?;
+    close(name)?;
+    result
+}
+
+fn cycles(exits: &Handle<Channel>, name: &Handle<Channel>) -> Outcome {
+    cycle(exits, name)?;
     let before = counts()?;
     for _ in 0..CYCLES {
-        cycle()?;
+        cycle(exits, name)?;
     }
     let after = counts()?;
     check(
@@ -1004,13 +1158,14 @@ fn create_kill_cycles_leak_nothing() -> Outcome {
     check(after.2 == before.2, "the pools took pages over the rounds")
 }
 
-/// A child with a started thread that init kills and forgets. The thread
-/// is ready below init and never runs: the kill takes it off the queue.
-fn cycle() -> Outcome {
-    let c = child(LOW)?;
-    let t = child_thread(c, LOW);
-    let started = t.and_then(sys::thread_start);
-    let killed = sys::process_kill(c);
+/// A child with a started thread that init kills and forgets, and whose
+/// exit notification init takes. The thread is ready below init and never
+/// runs: the kill takes it off the queue.
+fn cycle(exits: &Handle<Channel>, name: &Handle<Channel>) -> Outcome {
+    let c = heard_child(name, QUIET, LOW)?;
+    let t = child_thread(&c, LOW);
+    let started = t.as_ref().map_err(|&e| e).and_then(sys::thread_start);
+    let killed = sys::process_kill(&c);
     close(c)?;
     if let Ok(t) = t {
         close(t)?;
@@ -1018,12 +1173,1336 @@ fn cycle() -> Outcome {
     check(
         started.is_ok() && killed.is_ok(),
         "a round of create and kill failed",
-    )
+    )?;
+    wait_exit(exits, CHILD)
 }
 
 /// Init's used memory, the free frames and the pages of kernel pools.
 fn counts() -> Result<(u64, u64, u64), &'static str> {
-    let used = sys::process_memory(INIT_PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
-    let stats = sys::kernel_stats(INIT_RESOURCE).map_err(|_| "KERNEL_STATS failed")?;
+    let used = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let stats = sys::kernel_stats(&init::RESOURCE).map_err(|_| "KERNEL_STATS failed")?;
     Ok((used.used, stats.free_frames, stats.pool_pages))
+}
+
+/// A channel with its slot of label 0 at `priority`.
+fn channel(priority: u8) -> Result<Handle<Channel>, &'static str> {
+    sys::channel_create(priority).map_err(|_| "channel_create failed")
+}
+
+/// notify with raw registers.
+fn raw_notify(x: Regs) -> Regs {
+    // SAFETY: notify only reads its registers.
+    unsafe { sys::raw::<{ Call::Notify.number() }>(x) }
+}
+
+/// receive with raw registers, for calls that must fail and change x0
+/// alone.
+fn raw_receive(x: Regs) -> Regs {
+    // SAFETY: receive only reads its registers, and writes x10 and x11,
+    // which `raw` gives up, only when it takes something.
+    unsafe { sys::raw::<{ Call::Receive.number() }>(x) }
+}
+
+/// A notification of the slot of label 0.
+fn unlabeled(bits: u64, count: u32) -> Received {
+    Received::Notification {
+        source: Source::Unlabeled,
+        label: 0,
+        bits,
+        count,
+    }
+}
+
+/// What `c` has, taken without waiting; then a second receive, which
+/// finds nothing, ends the boost the first one gave init (spec 6.6).
+fn take_one(c: &Handle<Channel>) -> Result<Received, &'static str> {
+    let got = sys::try_receive(c);
+    let rest = sys::try_receive(c);
+    check(
+        rest == Err(Error::WouldBlock),
+        "a second receive found something",
+    )?;
+    got.map_err(|_| "receive found nothing")
+}
+
+/// channel_create takes a priority of 1-63 with no bits above its byte
+/// (spec 11): anything else fails with INVALID_ARGS and changes x0 alone.
+/// Init may take any priority under its ceiling of 63; the handle carries
+/// NOTIFY and RECEIVE, and a notification goes through it and comes back.
+/// ACCESS_DENIED for a priority above the caller's ceiling is a kernel
+/// test: init's ceiling is the highest level.
+fn channel_create_checks_its_priority() -> Outcome {
+    for priority in [0, abi::PRIORITY_LEVELS.into(), 0x100 | u64::from(LEVEL)] {
+        let mut x = marked();
+        x[0] = priority;
+        // SAFETY: channel_create only reads its registers.
+        let after = unsafe { sys::raw::<{ Call::CreateChannel.number() }>(x) };
+        check(
+            after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
+            "a priority outside 1-63 did not fail with INVALID_ARGS alone",
+        )?;
+    }
+    close(channel(abi::PRIORITY_LEVELS - 1)?)?;
+    let c = channel(QUIET)?;
+    let posted = sys::notify(&c, 1);
+    let got = take_one(&c);
+    close(c)?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)),
+        "a new channel did not carry a notification",
+    )
+}
+
+/// notify and receive take a channel (spec 11): a process is WRONG_TYPE,
+/// a closed handle BAD_HANDLE, and x0 alone changes. A copy of the channel
+/// with RECEIVE alone does not notify, and one with NOTIFY alone does not
+/// receive: ACCESS_DENIED, and x0 alone changes.
+fn notify_and_receive_need_their_rights() -> Outcome {
+    let c = channel(QUIET)?;
+    let gone = c.raw();
+    close(c)?;
+    for (h, error) in [
+        (init::PROCESS.raw(), Error::WrongType),
+        (gone, Error::BadHandle),
+    ] {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[h.0, 1]);
+        let after = raw_notify(x);
+        check(
+            after[0] == error.code() && after[1..] == x[1..],
+            "notify took a handle that is not a live channel",
+        )?;
+        x[1] = abi::NO_WAIT;
+        let after = raw_receive(x);
+        check(
+            after[0] == error.code() && after[1..] == x[1..],
+            "receive took a handle that is not a live channel",
+        )?;
+    }
+    let c = channel(QUIET)?;
+    let (notify_only, receive_only) = (copy(&c, Rights::NOTIFY)?, copy(&c, Rights::RECEIVE)?);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[receive_only.raw().0, 1]);
+    let notified = raw_notify(x);
+    let mut y = marked();
+    y[..2].copy_from_slice(&[notify_only.raw().0, abi::NO_WAIT]);
+    let received = raw_receive(y);
+    close(notify_only)?;
+    close(receive_only)?;
+    close(c)?;
+    check(
+        notified[0] == Error::AccessDenied.code() && notified[1..] == x[1..],
+        "a copy without NOTIFY notified",
+    )?;
+    check(
+        received[0] == Error::AccessDenied.code() && received[1..] == y[1..],
+        "a copy without RECEIVE received",
+    )
+}
+
+/// Spec 15.2 (notifications): three notify calls with different bits before
+/// a receive come as one notification of the slot of label 0: the bits
+/// ORed, the count 3. The slot is empty afterwards.
+fn notifications_merge_bits_and_count() -> Outcome {
+    let c = channel(QUIET)?;
+    let posted = [0b001, 0b100, 0b100 | 1 << 40]
+        .into_iter()
+        .try_for_each(|bits| sys::notify(&c, bits));
+    let got = take_one(&c);
+    close(c)?;
+    check(posted.is_ok(), "notify failed")?;
+    check(
+        got == Ok(unlabeled(0b101 | 1 << 40, 3)),
+        "the bits did not merge, or the count is not 3",
+    )
+}
+
+/// Bit 63 is CLIENT_GONE, which only the kernel posts (spec 5.3, 6.5):
+/// notify with it fails with INVALID_ARGS before the handle is looked at,
+/// changes x0 alone and posts nothing. notify with no bits counts.
+fn notify_refuses_bit_63() -> Outcome {
+    let c = channel(QUIET)?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[c.raw().0, 1 << 63 | 1]);
+    let after = raw_notify(x);
+    let mut bad = x;
+    bad[0] = 0;
+    let first = raw_notify(bad)[0];
+    let nothing = sys::try_receive(&c);
+    let posted = sys::notify(&c, 0);
+    let got = take_one(&c);
+    close(c)?;
+    check(
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
+        "bit 63 did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        first == Error::InvalidArgs.code(),
+        "the handle was looked at before the bits",
+    )?;
+    check(
+        nothing == Err(Error::WouldBlock),
+        "a notify that failed posted",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(0, 1)),
+        "a notify with no bits did not count",
+    )
+}
+
+/// Spec 15.2 (refusals): receive with NO_WAIT on an empty channel fails
+/// with WOULD_BLOCK and changes x0 alone; flags other than NO_WAIT are
+/// INVALID_ARGS, before the handle is looked at.
+fn receive_without_waiting_is_would_block() -> Outcome {
+    let c = channel(QUIET)?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[c.raw().0, abi::NO_WAIT]);
+    let after = raw_receive(x);
+    let odd: [Regs; 3] = [abi::NO_WAIT | 1, 1 << 17, 1 << 63].map(|flags| {
+        let mut y = x;
+        y[..2].copy_from_slice(&[0, flags]);
+        raw_receive(y)
+    });
+    let typed = sys::try_receive(&c);
+    close(c)?;
+    check(
+        after[0] == Error::WouldBlock.code() && after[1..] == x[1..],
+        "receive with NO_WAIT on an empty channel did not fail with WOULD_BLOCK alone",
+    )?;
+    check(
+        odd.iter().all(|r| r[0] == Error::InvalidArgs.code()),
+        "a flag other than NO_WAIT was taken",
+    )?;
+    check(
+        typed == Err(Error::WouldBlock),
+        "try_receive did not fail with WOULD_BLOCK",
+    )
+}
+
+/// A thread of init that waits in receive on the channel `h`, takes one
+/// thing and leaves in mark 0 the result's error code, or 1 and in mark 2
+/// what mark 1 held then; then asks again without waiting and leaves 1 in
+/// mark 3 when that found nothing (WOULD_BLOCK). Ends afterwards.
+extern "C" fn receive_twice(h: u64) -> ! {
+    let c = Handle::<Channel>::from_raw(abi::Handle(h));
+    match sys::receive(&c) {
+        Ok(_) => {
+            MARKS[2].store(mark(1), Relaxed);
+            MARKS[0].store(1, Relaxed);
+        }
+        Err(e) => MARKS[0].store(e.code(), Relaxed),
+    }
+    if sys::try_receive(&c) == Err(Error::WouldBlock) {
+        MARKS[3].store(1, Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// A receiver of init at LOW waiting on a new channel whose slot of label
+/// 0 has `priority`: init lets it run until it waits.
+fn waiting_receiver(priority: u8) -> Result<(Handle<Channel>, Handle<Thread>), &'static str> {
+    reset_marks();
+    let c = channel(priority)?;
+    let r = spawn(0, receive_twice, c.raw().0, LOW, Policy::Fifo)?;
+    let_run()?;
+    Ok((c, r))
+}
+
+/// Spec 15.2 (notifications): a receiver at base priority 5 waits, and a
+/// thread at init's level 20 is ready behind init. A notification of
+/// priority 25 wakes the receiver at 25 (spec 6.6): it runs before notify
+/// returns, ahead of the ready thread, which has not run by then.
+fn notification_runs_at_its_priority() -> Outcome {
+    let (c, r) = waiting_receiver(NOTICE)?;
+    let peer = spawn(1, add_mark, 1, TEST_PRIORITY, Policy::Fifo)?;
+    let waited = mark(0);
+    let posted = sys::notify(&c, 1);
+    let (ran, peer_before) = (mark(0), mark(2));
+    let_run()?;
+    let peer_after = mark(1);
+    close(peer)?;
+    close(r)?;
+    close(c)?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        posted.is_ok() && ran == 1,
+        "the receiver did not run at the notification's priority before notify returned",
+    )?;
+    check(
+        peer_before == 0 && peer_after == 1,
+        "the thread at init's level ran before the notified receiver",
+    )
+}
+
+/// The boost lasts until the receiver's next receive (spec 6.6): woken at
+/// 25 as above, the receiver asks again at once without waiting, which
+/// drops it to its base of 5, below init: init runs again before the
+/// receiver gets past that receive.
+fn boost_ends_at_the_next_receive() -> Outcome {
+    let (c, r) = waiting_receiver(NOTICE)?;
+    let posted = sys::notify(&c, 1);
+    let (first, second) = (mark(0), mark(3));
+    let_run()?;
+    let later = mark(3);
+    close(r)?;
+    close(c)?;
+    check(
+        posted.is_ok() && first == 1,
+        "the notification did not wake the receiver above init",
+    )?;
+    check(
+        second == 0,
+        "the receiver kept the notification's priority past its next receive",
+    )?;
+    check(
+        later == 1,
+        "the receiver's second receive did not find the channel empty",
+    )
+}
+
+/// Spec 15.2 (refusals): a receiver waits; init closes the only handle with
+/// RECEIVE, which closes the channel (spec 6.8): the receiver wakes with
+/// PEER_CLOSED.
+fn waiting_receiver_gets_peer_closed() -> Outcome {
+    let (c, r) = waiting_receiver(LEVEL)?;
+    let waited = mark(0);
+    close(c)?;
+    let_run()?;
+    close(r)?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        mark(0) == Error::PeerClosed.code(),
+        "the waiting receiver did not get PEER_CLOSED",
+    )
+}
+
+/// A copy of `h` with `rights` and no new label.
+fn copy<K>(h: &Handle<K>, rights: Rights) -> Result<Handle<K>, &'static str> {
+    sys::handle_duplicate(h, rights).map_err(|_| "handle_duplicate failed")
+}
+
+/// A copy of the channel handle `c` with `rights` and the new label
+/// `label`: a session whose slot has `priority`.
+fn session(
+    c: &Handle<Channel>,
+    rights: Rights,
+    label: u64,
+    priority: u8,
+) -> Result<Handle<Channel>, &'static str> {
+    sys::handle_label(c, rights, label, priority).map_err(|_| "a label did not go on a copy")
+}
+
+/// handle_duplicate with raw registers.
+fn raw_duplicate(x: Regs) -> Regs {
+    // SAFETY: handle_duplicate only reads its registers.
+    unsafe { sys::raw::<{ Call::HandleDuplicate.number() }>(x) }
+}
+
+/// x0-x9 for handle_duplicate of `h` with `rights`, `label` and
+/// `priority`, the rest marked.
+fn duplicate_regs(h: abi::Handle, rights: Rights, label: u64, priority: u64) -> Regs {
+    let mut x = marked();
+    x[..4].copy_from_slice(&[h.0, rights.0.into(), label, priority]);
+    x
+}
+
+/// A notification of the session with `label`.
+fn labelled(label: u64, bits: u64, count: u32) -> Received {
+    Received::Notification {
+        source: Source::Session,
+        label,
+        bits,
+        count,
+    }
+}
+
+/// handle_duplicate copies a handle of any kind with a subset of its
+/// rights (spec 5.2, 11) and changes x0 and x1 alone: a copy of a channel
+/// with NOTIFY alone notifies, does not receive (ACCESS_DENIED) and, with
+/// no DUPLICATE, is copied no further. A right the original lacks fails
+/// with ACCESS_DENIED, bits no right has with INVALID_ARGS before the
+/// handle is looked at, and both change x0 alone. A copy of init's process
+/// with no rights names it still.
+fn duplicate_narrows_rights() -> Outcome {
+    let c = channel(QUIET)?;
+    let x = duplicate_regs(c.raw(), Rights::NOTIFY, 0, 0);
+    let after = raw_duplicate(x);
+    let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
+    let n = Handle::<Channel>::from_raw(abi::Handle(after[1]));
+    let posted = sys::notify(&n, 1);
+    let refused = sys::try_receive(&n);
+    let further = sys::handle_duplicate(&n, Rights::NOTIFY);
+    let got = take_one(&c);
+    let y = duplicate_regs(c.raw(), CHANNEL_RIGHTS | Rights::MANAGE, 0, 0);
+    let wider = raw_duplicate(y);
+    let odd = [1 << 12, 1 << 32].map(|rights| {
+        let mut z = x;
+        z[..2].copy_from_slice(&[0, rights]);
+        let after = raw_duplicate(z);
+        after[0] == Error::InvalidArgs.code() && after[1..] == z[1..]
+    });
+    let own = copy(&init::PROCESS, Rights::NONE)?;
+    let state = sys::process_state(&own);
+    close(own)?;
+    close(n)?;
+    close(c)?;
+    check(made, "the copy did not come in x1 alone")?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)),
+        "the copy with NOTIFY did not notify",
+    )?;
+    check(
+        refused == Err(Error::AccessDenied),
+        "the copy with NOTIFY alone received",
+    )?;
+    check(
+        further == Err(Error::AccessDenied),
+        "a copy without DUPLICATE was copied",
+    )?;
+    check(
+        wider[0] == Error::AccessDenied.code() && wider[1..] == y[1..],
+        "a copy took a right the original lacks",
+    )?;
+    check(
+        odd.iter().all(|&ok| ok),
+        "bits no right has did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        state == Ok(ProcessState::Alive),
+        "a copy of init's process with no rights does not name it",
+    )
+}
+
+/// A label goes on a channel handle once (spec 5.3): a new label on a
+/// handle that carries one fails with BAD_STATE and changes x0 alone, and
+/// a copy with label 0 carries the same label. A label on a handle that is
+/// no channel fails with WRONG_TYPE.
+fn label_cannot_change() -> Outcome {
+    let c = channel(QUIET)?;
+    let first = session(&c, Rights::NOTIFY | Rights::DUPLICATE, 7, QUIET)?;
+    let x = duplicate_regs(first.raw(), Rights::NOTIFY, 8, QUIET.into());
+    let after = raw_duplicate(x);
+    let same = copy(&first, Rights::NOTIFY)?;
+    let posted = sys::notify(&same, 1);
+    let got = take_one(&c);
+    let process = sys::handle_label(&retyped(&init::PROCESS), Rights::NONE, 9, QUIET);
+    close(c)?;
+    close(same)?;
+    close(first)?;
+    check(
+        after[0] == Error::BadState.code() && after[1..] == x[1..],
+        "a handle with a label took a new one",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(labelled(7, 1, 1)),
+        "a copy with label 0 did not keep the label",
+    )?;
+    check(
+        process == Err(Error::WrongType),
+        "a handle to a process took a label",
+    )
+}
+
+/// The priority of a session's slot (spec 5.3, 6.5): with a label 1-63,
+/// 63, init's ceiling, included; without one exactly 0; anything else
+/// fails with INVALID_ARGS and changes x0 alone. A receiver at LOW waits
+/// on a channel whose slot of label 0 has LEVEL, below init; notify
+/// through a session of priority NOTICE wakes it above init (spec 6.6), so
+/// it runs before notify returns. ACCESS_DENIED for a priority above the
+/// caller's ceiling is a kernel test: init's ceiling is the highest level.
+fn session_priority_under_the_ceiling() -> Outcome {
+    let (c, r) = waiting_receiver(LEVEL)?;
+    let refused = [
+        (9, 0),
+        (0, u64::from(QUIET)),
+        (9, abi::PRIORITY_LEVELS.into()),
+        (9, 0x100 | u64::from(QUIET)),
+    ]
+    .map(|(label, priority)| {
+        let x = duplicate_regs(c.raw(), Rights::NOTIFY, label, priority);
+        let after = raw_duplicate(x);
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..]
+    });
+    let top = session(&c, Rights::NOTIFY, 63, abi::PRIORITY_LEVELS - 1)?;
+    let s = session(&c, Rights::NOTIFY, 25, NOTICE)?;
+    let waited = mark(0);
+    let posted = sys::notify(&s, 1);
+    let ran = mark(0);
+    let_run()?;
+    close(r)?;
+    close(c)?;
+    close(s)?;
+    close(top)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "a priority outside 1-63 with a label, or one without a label, was taken",
+    )?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        posted.is_ok() && ran == 1,
+        "the receiver did not run at the session's priority before notify returned",
+    )
+}
+
+/// Spec 15.2 (notifications): notify through a handle with a label goes
+/// into its session's slot (spec 5.3, 6.5), and receive gives the source
+/// «session», the label, the bits and the count; notify through the handle
+/// with no label still goes into the slot of label 0. At one level they
+/// come in the order they came. Bit 63 fails through a session too.
+fn session_notice_carries_its_label() -> Outcome {
+    let c = channel(QUIET)?;
+    let s = session(&c, Rights::NOTIFY, 0x5E55, QUIET)?;
+    let posted = [
+        sys::notify(&s, 0b01),
+        sys::notify(&s, 0b10),
+        sys::notify(&c, 0b100),
+    ];
+    let bit_63 = sys::notify(&s, CLIENT_GONE);
+    let first = sys::try_receive(&c);
+    let second = take_one(&c);
+    close(c)?;
+    close(s)?;
+    check(posted.iter().all(Result::is_ok), "notify failed")?;
+    check(
+        bit_63 == Err(Error::InvalidArgs),
+        "bit 63 went through a session",
+    )?;
+    check(
+        first == Ok(labelled(0x5E55, 0b11, 2)),
+        "the session's notification did not carry its label, bits and count",
+    )?;
+    check(
+        second == Ok(unlabeled(0b100, 1)),
+        "the slot of label 0 did not come after the session's",
+    )
+}
+
+/// Spec 15.2 (refusals): two handles carry one label, the second a copy of
+/// the first. Closing the first posts nothing; closing the last posts
+/// CLIENT_GONE, bit 63, into the session's slot with the label (spec 5.3),
+/// and the bits the client posted before it left come in the same receive.
+fn client_gone_after_the_last_copy() -> Outcome {
+    let c = channel(QUIET)?;
+    let first = session(&c, Rights::NOTIFY | Rights::DUPLICATE, 0xC1, QUIET)?;
+    let last = copy(&first, Rights::NOTIFY)?;
+    close(first)?;
+    check(
+        sys::try_receive(&c) == Err(Error::WouldBlock),
+        "closing one of two copies posted into the session's slot",
+    )?;
+    let posted = sys::notify(&last, 0b10);
+    close(last)?;
+    let got = take_one(&c);
+    close(c)?;
+    check(
+        posted.is_ok() && got == Ok(labelled(0xC1, 0b10 | CLIENT_GONE, 2)),
+        "the last copy did not leave CLIENT_GONE with the label and the client's bits",
+    )
+}
+
+/// Spec 15.2 (notifications): slots come by priority, and in the order they
+/// came within a level (spec 6.3). The slot of label 0 at LEVEL is posted
+/// first, then two sessions at HIGH: receive takes the first session, the
+/// second, then the slot of label 0.
+fn higher_notification_comes_first() -> Outcome {
+    let c = channel(LEVEL)?;
+    let a = session(&c, Rights::NOTIFY, 0xA, HIGH)?;
+    let b = session(&c, Rights::NOTIFY, 0xB, HIGH)?;
+    let posted = [sys::notify(&c, 1), sys::notify(&a, 2), sys::notify(&b, 4)];
+    let got = [(); 4].map(|()| sys::try_receive(&c));
+    close(c)?;
+    close(a)?;
+    close(b)?;
+    check(posted.iter().all(Result::is_ok), "notify failed")?;
+    check(
+        got == [
+            Ok(labelled(0xA, 2, 1)),
+            Ok(labelled(0xB, 4, 1)),
+            Ok(unlabeled(1, 1)),
+            Err(Error::WouldBlock),
+        ],
+        "the slots did not come by priority and within a level in their order",
+    )
+}
+
+/// Spec 15.2 (refusals): when the last handle with RECEIVE goes, the
+/// channel closes (spec 6.5, 6.8): notify through a copy with NOTIFY and
+/// through a session fails with PEER_CLOSED and changes x0 alone, and so
+/// does a new label; a copy with label 0 is still made.
+fn notify_after_close_is_peer_closed() -> Outcome {
+    let c = channel(QUIET)?;
+    let left = copy(&c, Rights::NOTIFY | Rights::DUPLICATE)?;
+    let s = session(&c, Rights::NOTIFY, 0xDEAD, QUIET)?;
+    let posted = sys::notify(&s, 1);
+    close(c)?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[left.raw().0, 1]);
+    let mut y = marked();
+    y[..2].copy_from_slice(&[s.raw().0, 1]);
+    let z = duplicate_regs(left.raw(), Rights::NOTIFY, 0xBEEF, QUIET.into());
+    let after = [raw_notify(x), raw_notify(y), raw_duplicate(z)];
+    let plain = copy(&left, Rights::NOTIFY);
+    let copied = plain.is_ok();
+    if let Ok(h) = plain {
+        close(h)?;
+    }
+    close(left)?;
+    close(s)?;
+    check(posted.is_ok(), "notify through a session failed")?;
+    check(
+        after
+            .iter()
+            .zip([x, y, z])
+            .all(|(a, x)| a[0] == Error::PeerClosed.code() && a[1..] == x[1..]),
+        "notify or a new label on a closed channel did not fail with PEER_CLOSED alone",
+    )?;
+    check(
+        copied,
+        "a copy of a closed channel with label 0 was not made",
+    )
+}
+
+/// Spec 15.2 (notifications): a channel has abi::MAX_SLOTS slots, its slot
+/// of label 0 among them (spec 6.5). Init makes 1023 sessions and closes
+/// each at once, and CLIENT_GONE keeps each in the channel's queue. The
+/// next label fails with LIMIT_REACHED and changes x0 alone, and so does a
+/// child with the channel as its exit channel, even with a quota init has
+/// not: the slot comes before the quota (spec 11). Once receive took the
+/// first CLIENT_GONE, that session went, and a new label fits. Every
+/// session leaves with CLIENT_GONE, in the order they left.
+fn slot_limit_is_1024() -> Outcome {
+    let c = channel(QUIET)?;
+    let last = u64::from(abi::MAX_SLOTS) - 1;
+    for label in 1..=last {
+        close(session(&c, Rights::NONE, label, QUIET)?)?;
+    }
+    let x = duplicate_regs(c.raw(), Rights::NONE, last + 1, QUIET.into());
+    let after = raw_duplicate(x);
+    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let mut y = create_regs(c.raw(), QUIET.into(), abi::Handle::INVALID);
+    y[0] = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
+    let exit = raw_create(y);
+    let first = sys::try_receive(&c);
+    let again = sys::handle_label(&c, Rights::NONE, last + 1, QUIET);
+    let remade = again.is_ok();
+    if let Ok(h) = again {
+        close(h)?;
+    }
+    let order =
+        (2..=last + 1).all(|label| sys::try_receive(&c) == Ok(labelled(label, CLIENT_GONE, 1)));
+    let rest = sys::try_receive(&c);
+    close(c)?;
+    check(
+        after[0] == Error::LimitReached.code() && after[1..] == x[1..],
+        "a session past 1023 and the slot of label 0 was made",
+    )?;
+    check(
+        failed(exit, y, Error::LimitReached),
+        "an exit channel with no slot left did not fail with LIMIT_REACHED before the quota",
+    )?;
+    check(
+        first == Ok(labelled(1, CLIENT_GONE, 1)),
+        "the first session did not leave with CLIENT_GONE",
+    )?;
+    check(remade, "no new session fit once one went")?;
+    check(
+        order && rest == Err(Error::WouldBlock),
+        "the sessions did not leave with CLIENT_GONE in their order",
+    )
+}
+
+/// A test's exit channel, at QUIET, and a copy of it with NOTIFY and the
+/// label CHILD that names the test's children as their x3. Closing the
+/// channel first lets the copy's session go without CLIENT_GONE.
+fn exit_channel() -> Result<(Handle<Channel>, Handle<Channel>), &'static str> {
+    let exits = channel(QUIET)?;
+    let name = session(&exits, Rights::NOTIFY, CHILD, QUIET)?;
+    Ok((exits, name))
+}
+
+/// A child with no code like `child`, whose end the channel of `name`
+/// hears of at `priority` (process_create x3, x4; spec 7.9).
+fn heard_child(
+    name: &Handle<Channel>,
+    priority: u8,
+    ceiling: u8,
+) -> Result<Handle<Process>, &'static str> {
+    sys::process_create_with(CHILD_QUOTA, 16, ceiling, Some((name, priority)), None)
+        .map_err(|_| "process_create with an exit channel failed")
+}
+
+/// The exit notification of a child whose exit channel carried `label`:
+/// bit 0, once (spec 7.9).
+fn exit_notice(label: u64) -> Received {
+    Received::Notification {
+        source: Source::Exit,
+        label,
+        bits: 1,
+        count: 1,
+    }
+}
+
+/// Waits in receive on `exits` for the exit notification of the child
+/// whose exit channel carried `label` (spec 7.9); then a receive without
+/// waiting ends its boost and finds nothing more.
+fn wait_exit(exits: &Handle<Channel>, label: u64) -> Outcome {
+    let got = sys::receive(exits);
+    let rest = sys::try_receive(exits);
+    check(
+        got == Ok(exit_notice(label)),
+        "the exit notification did not come with the child's label",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "something came after the exit notification",
+    )
+}
+
+/// x0-x9 for process_create of a child with CHILD_QUOTA, 16 handles and
+/// ceiling LOW, and `x3`, `x4` and `x5`, the rest marked.
+fn create_regs(x3: abi::Handle, x4: u64, x5: abi::Handle) -> Regs {
+    let mut x = marked();
+    x[..6].copy_from_slice(&[CHILD_QUOTA, 16, LOW.into(), x3.0, x4, x5.0]);
+    x
+}
+
+/// process_create with raw registers.
+fn raw_create(x: Regs) -> Regs {
+    // SAFETY: process_create only reads its registers.
+    unsafe { sys::raw::<{ Call::ProcessCreate.number() }>(x) }
+}
+
+/// The call failed with `error` and changed x0 alone.
+fn failed(after: Regs, x: Regs, error: Error) -> bool {
+    after[0] == error.code() && after[1..] == x[1..]
+}
+
+/// Spec 7.9: the parent hears of a child's end once the child gave back
+/// the free part of its quota. A thread of init above init waits on the
+/// exit channel; init kills the child, whose teardown runs at init's
+/// level, and the notification wakes the thread in the middle of it:
+/// PROCESS_MEMORY of the child shows then that the child returned its
+/// quota but what it still uses.
+fn exit_notice_comes_after_the_quota() -> Outcome {
+    reset_marks();
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, LOW)?;
+    MARKS[1].store(c.raw().0, Relaxed);
+    let w = spawn(0, watch_exit, exits.raw().0, HIGH, Policy::Fifo)?;
+    let killed = sys::process_kill(&c);
+    let (heard, returned, free) = (mark(0), mark(2), mark(3));
+    close(w)?;
+    close(c)?;
+    close(exits)?;
+    close(name)?;
+    check(killed.is_ok(), "process_kill failed")?;
+    check(
+        heard == 1,
+        "the waiting thread did not get the exit notification",
+    )?;
+    check(
+        returned > 0 && returned == free,
+        "the exit notification came before the child's quota went back",
+    )
+}
+
+/// A thread of init that waits in receive on the channel `h` for the exit
+/// notification of the child whose handle mark 1 holds and reads the
+/// child's memory at once: 1 in mark 0 when the notification came, what
+/// the child returned in mark 2 and its quota but what it uses in mark 3.
+/// Ends afterwards.
+extern "C" fn watch_exit(h: u64) -> ! {
+    let exits = Handle::<Channel>::from_raw(abi::Handle(h));
+    let got = sys::receive(&exits);
+    let child = Handle::<Process>::from_raw(abi::Handle(mark(1)));
+    if let Ok(m) = sys::process_memory(&child) {
+        MARKS[2].store(m.returned, Relaxed);
+        MARKS[3].store(m.quota - m.used, Relaxed);
+    }
+    MARKS[0].store(u64::from(got == Ok(exit_notice(CHILD))), Relaxed);
+    sys::thread_exit()
+}
+
+/// The exit notification carries the label of the handle process_create
+/// took as x3 (spec 7.9): a copy with a label gives it, the channel's
+/// handle with none gives 0; the source is «exit», bit 0, count 1.
+fn exit_notice_carries_the_label() -> Outcome {
+    let (exits, name) = exit_channel()?;
+    let labelled = heard_child(&name, QUIET, LOW)?;
+    let plain = heard_child(&exits, QUIET, LOW)?;
+    let killed = [sys::process_kill(&labelled), sys::process_kill(&plain)];
+    let first = sys::try_receive(&exits);
+    let second = take_one(&exits);
+    close(labelled)?;
+    close(plain)?;
+    close(exits)?;
+    close(name)?;
+    check(killed.iter().all(Result::is_ok), "process_kill failed")?;
+    check(
+        first == Ok(exit_notice(CHILD)),
+        "the exit notification did not carry the label of x3",
+    )?;
+    check(
+        second == Ok(exit_notice(0)),
+        "the exit notification through a handle with no label did not carry 0",
+    )
+}
+
+/// x3 of process_create is a channel with NOTIFY (spec 11, 13.3): a copy
+/// without NOTIFY fails with ACCESS_DENIED, a process with WRONG_TYPE, a
+/// closed handle with BAD_HANDLE, a channel that closed with PEER_CLOSED;
+/// each changes x0 alone, and no child is made.
+fn exit_channel_needs_notify() -> Outcome {
+    let c = channel(QUIET)?;
+    let receive_only = copy(&c, Rights::RECEIVE)?;
+    let shut = channel(QUIET)?;
+    let left = copy(&shut, Rights::NOTIFY)?;
+    let gone = shut.raw();
+    close(shut)?;
+    let before = sys::process_handles(&init::PROCESS);
+    let refused = [
+        (receive_only.raw(), Error::AccessDenied),
+        (init::PROCESS.raw(), Error::WrongType),
+        (gone, Error::BadHandle),
+        (left.raw(), Error::PeerClosed),
+    ]
+    .map(|(h, error)| {
+        let x = create_regs(h, QUIET.into(), abi::Handle::INVALID);
+        failed(raw_create(x), x, error)
+    });
+    let after = sys::process_handles(&init::PROCESS);
+    close(receive_only)?;
+    close(left)?;
+    close(c)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "x3 that is no open channel with NOTIFY did not fail alone",
+    )?;
+    check(
+        before.is_ok() && after == before,
+        "a child of a call that failed has a handle",
+    )
+}
+
+/// x4 of process_create, the priority of the exit notification (spec 7.9,
+/// 11): 1-63 with an exit channel, 63, init's ceiling, included, and
+/// exactly 0 without one; anything else fails with INVALID_ARGS and
+/// changes x0 alone. A receiver at LOW waits on the exit channel; the
+/// end of a child that init kills comes at NOTICE and wakes it above init
+/// before process_kill returns. ACCESS_DENIED above the caller's ceiling
+/// is a kernel test: init's ceiling is the highest level.
+fn exit_priority_under_the_ceiling() -> Outcome {
+    let (c, r) = waiting_receiver(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let n = name.raw();
+    let refused = [
+        (n, 0),
+        (abi::Handle::INVALID, u64::from(QUIET)),
+        (n, abi::PRIORITY_LEVELS.into()),
+        (n, 0x100 | u64::from(QUIET)),
+    ]
+    .map(|(x3, x4)| {
+        let x = create_regs(x3, x4, abi::Handle::INVALID);
+        failed(raw_create(x), x, Error::InvalidArgs)
+    });
+    let top = heard_child(&name, abi::PRIORITY_LEVELS - 1, LOW);
+    let heard = heard_child(&name, NOTICE, LOW)?;
+    let waited = mark(0);
+    let killed = sys::process_kill(&heard);
+    let ran = mark(0);
+    let_run()?;
+    close(r)?;
+    close(c)?;
+    close(heard)?;
+    let highest = top.is_ok();
+    if let Ok(top) = top {
+        close(top)?;
+    }
+    close(name)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "a priority outside 1-63 with x3, or one without x3, was taken",
+    )?;
+    check(
+        highest,
+        "the exit priority 63 under init's ceiling was refused",
+    )?;
+    check(waited == 0, "the receiver did not wait")?;
+    check(
+        killed.is_ok() && ran == 1,
+        "the receiver did not run at the exit notification's priority before process_kill returned",
+    )
+}
+
+/// A child that fails leaves the start channel with init (spec 13.3): a
+/// quota of a page falls short at entry 0 of the child's table, NO_MEMORY,
+/// and x0 alone changes; the handle x5 named still works, and init has its
+/// quota back. The exit channel of the failed call gets its slot back: the
+/// channel goes afterwards with no source left.
+fn failed_create_keeps_the_start_handle() -> Outcome {
+    let c = channel(QUIET)?;
+    let exit = copy(&c, Rights::NOTIFY)?;
+    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let before = used();
+    let mut x = create_regs(exit.raw(), QUIET.into(), c.raw());
+    x[0] = PAGE as u64;
+    let after = raw_create(x);
+    let back = used();
+    let posted = sys::notify(&c, 1);
+    let got = take_one(&c);
+    let kept = c.close();
+    // The channel goes now: it holds no source but its slot of label 0.
+    close(exit)?;
+    check(
+        failed(after, x, Error::NoMemory),
+        "a child with a quota of a page did not fail with NO_MEMORY alone",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)) && kept.is_ok(),
+        "init lost the start channel of a child that failed",
+    )?;
+    check(
+        before.is_ok() && back == before,
+        "a child that failed kept init's quota",
+    )
+}
+
+/// x5 of process_create moves a channel handle with TRANSFER into entry 0
+/// of the child's table (spec 13.3): init's handle is gone (BAD_HANDLE),
+/// the child's table holds one live handle, and the channel lives on with
+/// it, since it carried RECEIVE: a copy of init with NOTIFY notifies. The
+/// child's end lets that handle go, and the channel closes: notify then
+/// fails with PEER_CLOSED. The child's exit channel closes before its end
+/// with nothing queued; the notification is lost, and the child's shell
+/// goes once init closes its handle.
+fn start_channel_moves_into_the_child() -> Outcome {
+    let c = channel(QUIET)?;
+    let n = copy(&c, Rights::NOTIFY)?;
+    let (exits, name) = exit_channel()?;
+    let moved = c.raw();
+    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let before = used();
+    let made = sys::process_create_with(CHILD_QUOTA, 16, LOW, Some((&name, QUIET)), Some(c));
+    let Ok(child) = made else {
+        close(n)?;
+        close(exits)?;
+        close(name)?;
+        return Err("process_create with a start channel failed");
+    };
+    // The exit channel closes with nothing queued: the stage Close has
+    // nothing to take, and the exit notification finds it closed.
+    close(exits)?;
+    let gone = Handle::<Channel>::from_raw(moved).close();
+    let table = sys::process_handles(&child);
+    let open = sys::notify(&n, 1);
+    let killed = sys::process_kill(&child);
+    let shut = sys::notify(&n, 1);
+    close(child)?;
+    let back = used();
+    close(n)?;
+    close(name)?;
+    check(
+        before.is_ok() && back == before,
+        "the child's shell stayed after its exit notification met a closed channel",
+    )?;
+    check(gone == Err(Error::BadHandle), "init kept the start channel")?;
+    check(
+        table.is_ok_and(|t| t.live == 1),
+        "the child's table does not hold the start channel",
+    )?;
+    check(
+        open.is_ok() && killed.is_ok() && shut == Err(Error::PeerClosed),
+        "the channel did not live with the child's handle and close with it",
+    )
+}
+
+/// x5 needs TRANSFER (spec 11): a copy without it fails with ACCESS_DENIED
+/// and changes x0 alone, and the handle stays init's.
+fn start_channel_needs_transfer() -> Outcome {
+    let c = channel(QUIET)?;
+    let kept = copy(&c, Rights::NOTIFY | Rights::RECEIVE)?;
+    let x = create_regs(abi::Handle::INVALID, 0, kept.raw());
+    let after = raw_create(x);
+    let posted = sys::notify(&kept, 1);
+    let got = take_one(&kept);
+    close(kept)?;
+    close(c)?;
+    check(
+        failed(after, x, Error::AccessDenied),
+        "x5 without TRANSFER did not fail with ACCESS_DENIED alone",
+    )?;
+    check(
+        posted.is_ok() && got == Ok(unlabeled(1, 1)),
+        "the handle without TRANSFER did not stay init's",
+    )
+}
+
+/// x5 names a channel (spec 11, 13.3): a process fails with WRONG_TYPE, a
+/// closed handle with BAD_HANDLE, and x3 is looked at first.
+fn start_handle_must_be_a_channel() -> Outcome {
+    let c = channel(QUIET)?;
+    let gone = c.raw();
+    close(c)?;
+    let own = init::PROCESS.raw();
+    let refused = [
+        (abi::Handle::INVALID, 0, own, Error::WrongType),
+        (abi::Handle::INVALID, 0, gone, Error::BadHandle),
+        (gone, u64::from(QUIET), own, Error::BadHandle),
+    ]
+    .map(|(x3, x4, x5, error)| {
+        let x = create_regs(x3, x4, x5);
+        failed(raw_create(x), x, error)
+    });
+    check(
+        refused.iter().all(|&ok| ok),
+        "x5 that is no live channel did not fail alone, or came before x3",
+    )
+}
+
+/// Spec 15.2 (refusals): one handle, a copy with a label, NOTIFY and
+/// TRANSFER, is both x3 and x5 (spec 13.3): it moves into the child, and
+/// its label names the child's end. When init kills the child, the
+/// child's table lets the copy go, which posts CLIENT_GONE with the label
+/// (spec 5.3), and after the child's stage Quota the exit notification
+/// comes with the same label.
+fn client_gone_when_the_child_dies() -> Outcome {
+    let exits = channel(QUIET)?;
+    let name = session(&exits, Rights::NOTIFY | Rights::TRANSFER, CHILD, QUIET)?;
+    let x = create_regs(name.raw(), QUIET.into(), name.raw());
+    let after = raw_create(x);
+    let made = after[0] == 0 && after[2..] == x[2..];
+    let moved = name.close();
+    let child = Handle::<Process>::from_raw(abi::Handle(after[1]));
+    let killed = sys::process_kill(&child);
+    let got = [(); 3].map(|()| sys::try_receive(&exits));
+    if made {
+        close(child)?;
+    }
+    close(exits)?;
+    check(made, "process_create with one handle as x3 and x5 failed")?;
+    check(
+        moved == Err(Error::BadHandle),
+        "the copy did not move into the child",
+    )?;
+    check(
+        killed.is_ok()
+            && got
+                == [
+                    Ok(labelled(CHILD, CLIENT_GONE, 1)),
+                    Ok(exit_notice(CHILD)),
+                    Err(Error::WouldBlock),
+                ],
+        "the child's end did not post CLIENT_GONE and then the exit notification with the label",
+    )
+}
+
+/// A timer on `c` at QUIET, whose notifications never lift init above its
+/// threads (spec 6.6).
+fn timer(c: &Handle<Channel>) -> Result<Handle<Timer>, &'static str> {
+    sys::timer_create(c, QUIET).map_err(|_| "timer_create failed")
+}
+
+/// timer_create with raw registers.
+fn raw_timer_create(x: Regs) -> Regs {
+    // SAFETY: timer_create only reads its registers.
+    unsafe { sys::raw::<{ Call::TimerCreate.number() }>(x) }
+}
+
+fn clock_now() -> Result<u64, &'static str> {
+    sys::clock_now().map_err(|_| "clock_now failed")
+}
+
+fn arm(t: &Handle<Timer>, deadline: u64) -> Outcome {
+    sys::timer_set(t, deadline).map_err(|_| "timer_set failed")
+}
+
+/// Spins until the counter, in nanoseconds, passed `ns`.
+fn spin_past(ns: u64) {
+    while time::ticks_to_ns(time::now()) <= ns {}
+}
+
+/// `count` expiries of a timer made through a handle with `label`: bit 0.
+fn expiry(label: u64, count: u32) -> Received {
+    Received::Notification {
+        source: Source::Timer,
+        label,
+        bits: 1,
+        count,
+    }
+}
+
+/// Spec 15.2 (time): a program reads the counter itself (CNTVCT_EL0,
+/// spec 10), and clock_now between two such readings returns nanoseconds
+/// between theirs, rounded down as rt::time converts them; it changes x0
+/// and x1 alone.
+fn clock_now_follows_the_counter() -> Outcome {
+    let x = marked();
+    let before = time::now();
+    // SAFETY: clock_now reads no register.
+    let after = unsafe { sys::raw::<{ Call::ClockNow.number() }>(x) };
+    let later = time::now();
+    let typed = sys::clock_now();
+    check(
+        after[0] == 0 && after[2..] == x[2..],
+        "clock_now failed or changed registers past x1",
+    )?;
+    check(
+        (time::ticks_to_ns(before)..=time::ticks_to_ns(later)).contains(&after[1]),
+        "clock_now is not between two readings of the counter",
+    )?;
+    check(typed.is_ok_and(|ns| ns >= after[1]), "clock_now went back")
+}
+
+/// timer_create takes a channel with RECEIVE (spec 6.5, 10): a timer is a
+/// bound on its creator's own wait, and the slots of the channel and the
+/// priorities that lift its receivers are the receiver's. A priority
+/// outside 1-63 fails with INVALID_ARGS before the handle is looked at, a
+/// bad handle with BAD_HANDLE, a handle to another kind with WRONG_TYPE, a
+/// copy with NOTIFY alone with ACCESS_DENIED; each changes x0 alone. A copy
+/// with RECEIVE and a label makes a timer whose expiries carry the label.
+fn timer_needs_receive() -> Outcome {
+    let c = channel(QUIET)?;
+    let notify = copy(&c, Rights::NOTIFY)?;
+    let labelled = session(&c, Rights::RECEIVE, TIMED, QUIET)?;
+    let cases = [
+        (abi::Handle::INVALID, 0, Error::InvalidArgs),
+        (c.raw(), 64, Error::InvalidArgs),
+        (c.raw(), 0x100 | u64::from(QUIET), Error::InvalidArgs),
+        (abi::Handle::INVALID, QUIET.into(), Error::BadHandle),
+        (init::PROCESS.raw(), QUIET.into(), Error::WrongType),
+        (notify.raw(), QUIET.into(), Error::AccessDenied),
+    ];
+    let refused = cases.map(|(h, priority, error)| {
+        let mut x = marked();
+        x[..2].copy_from_slice(&[h.0, priority]);
+        failed(raw_timer_create(x), x, error)
+    });
+    let t = sys::timer_create(&labelled, QUIET);
+    let fired = t
+        .as_ref()
+        .map_err(|&e| e)
+        .and_then(|t| sys::timer_set(t, 0));
+    let got = sys::try_receive(&c);
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    close(labelled)?;
+    close(notify)?;
+    close(c)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "timer_create took a channel without RECEIVE or a bad argument, or changed more than x0",
+    )?;
+    check(
+        fired.is_ok() && got == Ok(expiry(TIMED, 1)),
+        "a timer made through a labelled copy did not carry the label",
+    )
+}
+
+/// Spec 15.2 (time): a timer on a channel and receive make a wait with a
+/// bound (spec 6.1, 10). Init waits on an empty channel whose timer fires
+/// 1 ms from now and wakes with the timer's notification, bit 0 once, not
+/// before the deadline; nothing else comes.
+fn timer_bounds_a_wait() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let deadline = clock_now()? + 1_000_000;
+    let set = arm(&t, deadline);
+    let got = sys::receive(&c);
+    let woke = clock_now();
+    let rest = sys::try_receive(&c);
+    close(t)?;
+    close(c)?;
+    set?;
+    check(
+        got == Ok(expiry(0, 1)),
+        "the wait did not end with the timer's notification",
+    )?;
+    check(
+        woke.is_ok_and(|ns| ns >= deadline),
+        "the wait ended before the timer's deadline",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "something came after the timer",
+    )
+}
+
+/// Spec 15.2 (time): what comes before the bound ends the wait first. A
+/// thread of init below it notifies the channel as soon as init waits,
+/// long before the timer's deadline: init wakes with that notification,
+/// cancels the timer, and once the deadline passed nothing more comes.
+fn notification_before_the_timer_comes_first() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let deadline = clock_now()? + 2_000_000;
+    let set = arm(&t, deadline);
+    let n = spawn(0, notify_once, c.raw().0, LOW, Policy::Fifo)?;
+    let got = sys::receive(&c);
+    let cancelled = sys::timer_cancel(&t);
+    spin_past(deadline);
+    let rest = sys::try_receive(&c);
+    let_run()?;
+    close(n)?;
+    close(t)?;
+    close(c)?;
+    set?;
+    check(cancelled.is_ok(), "timer_cancel failed")?;
+    check(
+        got == Ok(unlabeled(NOTIFIED, 1)),
+        "the notification before the deadline did not come first",
+    )?;
+    check(rest == Err(Error::WouldBlock), "the cancelled timer fired")
+}
+
+/// Notifies the channel `h` with NOTIFIED and ends.
+extern "C" fn notify_once(h: u64) -> ! {
+    let c = Handle::<Channel>::from_raw(abi::Handle(h));
+    let _ = sys::notify(&c, NOTIFIED);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (time): a deadline that passed fires in timer_set itself
+/// (spec 10). Right after timer_set with 0, with the time clock_now gave,
+/// and with a past deadline for an armed timer, the timer's notification
+/// is there, bit 0 once each time.
+fn timer_in_the_past_fires_at_once() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let result = past_deadlines(&c, &t);
+    close(t)?;
+    close(c)?;
+    result
+}
+
+fn past_deadlines(c: &Handle<Channel>, t: &Handle<Timer>) -> Outcome {
+    let now = clock_now()?;
+    for (armed, past) in [(false, 0), (false, now), (true, now)] {
+        if armed {
+            arm(t, now + 1_000_000_000)?;
+        }
+        arm(t, past)?;
+        check(
+            sys::try_receive(c) == Ok(expiry(0, 1)),
+            "a deadline in the past did not fire at once",
+        )?;
+    }
+    check(
+        sys::try_receive(c) == Err(Error::WouldBlock),
+        "a timer set into the past fired once more",
+    )
+}
+
+/// timer_set of an armed timer moves it (spec 10): armed a second away and
+/// then 1 ms away, it fires at the nearer deadline, long before the far
+/// one; armed 10 ms away and then a second away, it does not fire at the
+/// nearer one, which a stall of the host cannot pass before the call.
+fn timer_set_moves_the_deadline() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let result = moves(&c, &t);
+    close(t)?;
+    close(c)?;
+    result
+}
+
+fn moves(c: &Handle<Channel>, t: &Handle<Timer>) -> Outcome {
+    let now = clock_now()?;
+    let (near, far) = (now + 1_000_000, now + 1_000_000_000);
+    arm(t, far)?;
+    arm(t, near)?;
+    let got = sys::receive(c);
+    let at = clock_now()?;
+    check(
+        got == Ok(expiry(0, 1)) && (near..far).contains(&at),
+        "the timer did not move to the nearer deadline",
+    )?;
+    let now = clock_now()?;
+    let (near, far) = (now + 10_000_000, now + 1_000_000_000);
+    arm(t, near)?;
+    arm(t, far)?;
+    spin_past(near + 1_000_000);
+    let rest = sys::try_receive(c);
+    sys::timer_cancel(t).map_err(|_| "timer_cancel failed")?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "the timer fired at the deadline it moved away from",
+    )
+}
+
+/// timer_cancel leaves what the timer posted (spec 10): a timer that fired
+/// in timer_set and is cancelled afterwards still has its notification
+/// waiting; cancelling a timer that is not armed is no error.
+fn cancel_keeps_posted_bits() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let fired = arm(&t, 0);
+    let cancelled = sys::timer_cancel(&t);
+    let got = sys::try_receive(&c);
+    let again = sys::timer_cancel(&t);
+    close(t)?;
+    close(c)?;
+    fired?;
+    check(cancelled.is_ok() && again.is_ok(), "timer_cancel failed")?;
+    check(
+        got == Ok(expiry(0, 1)),
+        "timer_cancel took back what the timer posted",
+    )
+}
+
+/// Spec 15.2 (time): a timer never fires before its deadline (spec 10).
+/// For deadlines 200 µs away at 16 offsets a nanosecond apart, on the
+/// ticks of the counter and between them, init wakes with the timer's
+/// notification at a time clock_now gives no earlier than the deadline.
+fn timer_never_fires_early() -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let result = (0..16).try_for_each(|offset| {
+        let deadline = clock_now()? + 200_000 + offset;
+        arm(&t, deadline)?;
+        let got = sys::receive(&c);
+        let woke = clock_now()?;
+        check(
+            got == Ok(expiry(0, 1)) && woke >= deadline,
+            "a timer fired before its deadline",
+        )
+    });
+    close(t)?;
+    close(c)?;
+    result
+}
+
+/// Spec 15.2 (notifications): a process pays for abi::MAX_TIMERS timers at
+/// most (spec 10). With 64 made, the next timer_create fails with
+/// LIMIT_REACHED and changes x0 alone; once one of them went, another
+/// fits.
+fn timer_limit_is_64() -> Outcome {
+    let c = channel(QUIET)?;
+    let mut timers = [const { None }; abi::MAX_TIMERS as usize];
+    let made = timers.iter_mut().try_for_each(|slot| {
+        *slot = Some(timer(&c)?);
+        Ok(())
+    });
+    let mut x = marked();
+    x[..2].copy_from_slice(&[c.raw().0, QUIET.into()]);
+    let after = raw_timer_create(x);
+    let freed = timers[0].take().map(close);
+    let again = sys::timer_create(&c, QUIET);
+    let remade = again.is_ok();
+    if let Ok(t) = again {
+        close(t)?;
+    }
+    for t in timers.into_iter().flatten() {
+        close(t)?;
+    }
+    close(c)?;
+    made?;
+    check(
+        failed(after, x, Error::LimitReached),
+        "a timer past 64 was made, or the call changed more than x0",
+    )?;
+    check(
+        freed == Some(Ok(())) && remade,
+        "no new timer fit once one went",
+    )
 }

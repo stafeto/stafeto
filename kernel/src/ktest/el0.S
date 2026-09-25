@@ -12,6 +12,8 @@
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
+.equ CALL_RECEIVE, 5                    // abi::Call::Receive
+.equ CALL_NOTIFY, 7                     // abi::Call::Notify
 .equ CALL_PROCESS_CREATE, 12            // abi::Call::ProcessCreate
 .equ CALL_PROCESS_KILL, 13              // abi::Call::ProcessKill
 .equ CALL_PROCESS_EXIT, 14              // abi::Call::ProcessExit
@@ -31,6 +33,7 @@
 .equ DATA_VA, 0x800000                  // ktest::el0::DATA_VA
 .equ INFO_PROCESS_STATE, 1              // abi::INFO_PROCESS_STATE
 .equ FIFO, 1                            // abi::Policy::Fifo
+.equ NO_WAIT, 0x10000                   // abi::NO_WAIT
 
 .arch_extension fp
 .arch_extension simd
@@ -117,6 +120,15 @@ el0_pattern_loop:
     LOAD_PATTERN
 el0_wait_loop:
     b       el0_wait_loop
+    svc     #SVC_DONE
+
+// Fills every register from a pattern whose x0 and x1 hold a channel and
+// flags, and waits in receive: the kernel checks that the wait changed
+// x0-x11 alone.
+.global el0_pattern_receive
+el0_pattern_receive:
+    LOAD_PATTERN
+    svc     #CALL_RECEIVE
     svc     #SVC_DONE
 
 // Fills every register and yields to the test's other thread, a FIFO
@@ -386,5 +398,75 @@ el0_start_then_close:
     mov     x0, x20
     svc     #CALL_HANDLE_CLOSE
 1:  svc     #SVC_DONE
+
+// Channel tests (ktest::el0).
+
+// receive(x0 channel, x1 flags); the kernel judges its result.
+.global el0_receive
+el0_receive:
+    svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
+// notify(x0 channel, x1 bits); the kernel judges its result.
+.global el0_notify
+el0_notify:
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
+// receive(x0 channel, x1 flags), then thread_exit: the result stays in
+// the thread's registers for the test.
+.global el0_receive_then_exit
+el0_receive_then_exit:
+    svc     #CALL_RECEIVE
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// process_kill(x0 process), notify(x1 channel, x2 bits), then receive(x1,
+// NO_WAIT). Ends with the kill's x0 in x19, notify's in x20 and the
+// result of receive in x0-x11.
+.global el0_kill_notify_receive
+el0_kill_notify_receive:
+    mov     x21, x1
+    mov     x22, x2
+    svc     #CALL_PROCESS_KILL
+    mov     x19, x0
+    mov     x0, x21
+    mov     x1, x22
+    svc     #CALL_NOTIFY
+    mov     x20, x0
+    mov     x0, x21
+    mov     x1, #NO_WAIT
+    svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 thread, x1 priority, x2 policy), then notify(x3
+// channel, x4 bits). Ends with the first call's x0 in x19 and notify's in
+// x0.
+.global el0_raise_then_notify
+el0_raise_then_notify:
+    mov     x21, x3
+    mov     x22, x4
+    svc     #CALL_THREAD_SET_PRIORITY
+    mov     x19, x0
+    mov     x0, x21
+    mov     x1, x22
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
+// The test's alarm: waits in receive(x0 channel, x1 flags) until a timer
+// on the channel fires, then goes on at the program x2 with x3-x5 in
+// x0-x2 and the result of receive in x23. receive changes x0-x11 alone.
+.global el0_alarm_then
+el0_alarm_then:
+    mov     x19, x2
+    mov     x20, x3
+    mov     x21, x4
+    mov     x22, x5
+    svc     #CALL_RECEIVE
+    mov     x23, x0
+    mov     x0, x20
+    mov     x1, x21
+    mov     x2, x22
+    br      x19
 
 el0_programs_end:

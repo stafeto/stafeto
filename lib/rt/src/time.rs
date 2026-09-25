@@ -35,3 +35,10 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
     let ticks = (u128::from(ns) * u128::from(frequency())).div_ceil(NANOS_PER_SEC);
     u64::try_from(ticks).unwrap_or(u64::MAX)
 }
+
+/// Nanoseconds in `ticks`, rounded down as `clock_now` rounds them
+/// (kcore::time::Clock::ticks_to_ns); saturates at u64::MAX.
+pub fn ticks_to_ns(ticks: u64) -> u64 {
+    let ns = u128::from(ticks) * NANOS_PER_SEC / u128::from(frequency());
+    u64::try_from(ns).unwrap_or(u64::MAX)
+}

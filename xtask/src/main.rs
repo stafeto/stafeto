@@ -17,8 +17,13 @@ const PROGRAM_TARGET: &str = "aarch64-unknown-none";
 /// The stack of init's first thread, in bytes, which init's program asks
 /// the kernel for (lib/bootimg); the size is ours.
 const INIT_STACK_SIZE: u32 = 64 * 1024;
-/// Spec 3.4: the kernel image file stays under 200 KB.
+/// Spec 3.4: the kernel image file stays under 200 KB: the build that
+/// ships and the probes built from it.
 const KERNEL_LIMIT: u64 = 200 * 1024;
+/// The builds with the kernel tests carry the tests' programs, fixtures
+/// and judges besides the kernel, and spec 3.4 does not bound them; a
+/// limit of their own still catches a runaway growth.
+const TEST_KERNEL_LIMIT: u64 = 512 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
@@ -95,7 +100,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 23;
+const INIT_TESTS: u32 = 57;
 /// A data segment bigger than the 4 MiB one block of frames holds.
 const BIG_DATA: u64 = 8 << 20;
 
@@ -126,6 +131,16 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+        }
+    }
+
+    /// The limit of its image file, and where the limit comes from.
+    fn limit(self) -> (u64, &'static str) {
+        match self {
+            Variant::Normal | Variant::FaultProbe | Variant::OverflowProbe => {
+                (KERNEL_LIMIT, "spec 3.4")
+            }
+            Variant::Test | Variant::TestIcount => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -260,10 +275,11 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     )?;
     let bytes = std::fs::read(&image).map_err(|e| format!("{}: {e}", image.display()))?;
     image::check_header(&bytes)?;
-    image::check_size(bytes.len() as u64, KERNEL_LIMIT)?;
+    let (limit, source) = variant.limit();
+    image::check_size(bytes.len() as u64, limit)?;
     let boot_image = build_boot_image("init", "boot.img")?;
     println!(
-        "kernel image {} ({} bytes, limit {KERNEL_LIMIT})",
+        "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),
         bytes.len()
     );
@@ -820,19 +836,23 @@ mod tests {
         assert_eq!(Variant::Normal.feature(), None);
     }
 
-    /// The kernel keeps the FP and SIMD registers for programs and saves
-    /// them only when threads switch (spec 8), so FP or SIMD anywhere else
-    /// in the kernel would change a program's registers without a word.
-    /// Only the thread switch and the EL0 test programs may assemble them.
-    /// Every crate linked into the kernel is searched: the kernel itself,
-    /// kcore, abi and bootimg.
+    /// The build that ships and its probes keep the limit of spec 3.4; the
+    /// builds with the kernel tests have one of their own.
     #[test]
-    fn only_the_thread_switch_uses_fp() {
+    fn test_builds_have_a_limit_of_their_own() {
+        for variant in [Variant::Normal, Variant::FaultProbe, Variant::OverflowProbe] {
+            assert_eq!(variant.limit(), (204_800, "spec 3.4"));
+        }
+        for variant in [Variant::Test, Variant::TestIcount] {
+            assert_eq!(variant.limit(), (524_288, "test builds"));
+        }
+    }
+
+    /// The text of every file under `dirs` of the workspace that reads as
+    /// UTF-8, with its path from the workspace's root.
+    fn texts(dirs: &[&str]) -> Vec<(String, String)> {
         let mut found = Vec::new();
-        let mut paths: Vec<_> = ["kernel", "kcore", "lib/abi", "lib/bootimg"]
-            .iter()
-            .map(|dir| root().join(dir))
-            .collect();
+        let mut paths: Vec<_> = dirs.iter().map(|dir| root().join(dir)).collect();
         while let Some(path) = paths.pop() {
             if path.is_dir() {
                 let entries = std::fs::read_dir(&path).expect("a readable directory");
@@ -842,20 +862,51 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let fp = text.lines().any(|l| {
-                (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
-                    || ((l.contains("target_feature") || l.contains("target-feature"))
-                        && (l.contains("neon") || l.contains("fp-armv8")))
-            });
-            if fp {
-                let name = path.strip_prefix(root()).expect("a path in the workspace");
-                found.push(name.to_string_lossy().into_owned());
-            }
+            let name = path.strip_prefix(root()).expect("a path in the workspace");
+            found.push((name.to_string_lossy().into_owned(), text));
         }
+        found
+    }
+
+    /// The kernel keeps the FP and SIMD registers for programs and saves
+    /// them only when threads switch (spec 8), so FP or SIMD anywhere else
+    /// in the kernel would change a program's registers without a word.
+    /// Only the thread switch and the EL0 test programs may assemble them.
+    /// Every crate linked into the kernel is searched: the kernel itself,
+    /// kcore, abi and bootimg.
+    #[test]
+    fn only_the_thread_switch_uses_fp() {
+        let mut found: Vec<_> = texts(&["kernel", "kcore", "lib/abi", "lib/bootimg"])
+            .into_iter()
+            .filter(|(_, text)| {
+                text.lines().any(|l| {
+                    (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
+                        || ((l.contains("target_feature") || l.contains("target-feature"))
+                            && (l.contains("neon") || l.contains("fp-armv8")))
+                })
+            })
+            .map(|(name, _)| name)
+            .collect();
         found.sort();
         assert_eq!(
             found,
             ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
         );
+    }
+
+    /// The kernel tests wake their threads through timers of programs
+    /// (spec 10): the test builds keep no deadline of their own for the
+    /// kernel's timer to serve besides the programs' timers.
+    #[test]
+    fn kernel_tests_keep_no_deadline_of_their_own() {
+        let found: Vec<_> = texts(&["kernel/src"])
+            .into_iter()
+            .filter(|(name, text)| {
+                text.contains("el0::deadline")
+                    || (name.starts_with("kernel/src/ktest") && text.contains("fn deadline("))
+            })
+            .map(|(name, _)| name)
+            .collect();
+        assert!(found.is_empty(), "a test deadline in {found:?}");
     }
 }

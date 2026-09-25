@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The runtime of stafeto programs, as small as milestone 1.2c needs it
-//! (spec 13.2): the entry point, typed wrappers of the system calls the
-//! kernel has and a raw call for any other (`sys`), output through
-//! `debug_write` (`console`, `print!`, `println!`), the counter read
-//! without a call (`time`), stacks for threads in static memory, and the
-//! panic handler. The heap, the start protocol, the ELF loader and the
-//! service loop come in milestone 1.4.
+//! The runtime of stafeto programs, as small as milestone 1.3b needs it
+//! (spec 13.2): the entry point, handles typed by the kind of their object
+//! (`handle`, `init`), typed wrappers of the system calls the kernel has
+//! and a raw call for any other (`sys`), output through `debug_write`
+//! (`console`, `print!`, `println!`), the counter read without a call
+//! (`time`), stacks for threads in static memory, and the panic handler.
+//! The heap, the start protocol, the ELF loader and the service loop come
+//! in milestone 1.4.
 //!
 //! A program names its main function with `rt::entry!`; `_start` calls it
 //! with the x0 the kernel set and ends the process with the code it
@@ -16,6 +17,7 @@
 #![no_std]
 
 pub mod console;
+pub mod handle;
 pub mod sys;
 pub mod time;
 
@@ -23,6 +25,28 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub use abi;
+pub use handle::Handle;
+
+/// Init's first handles (spec 13.3), typed. Each mention of a constant
+/// gives a new value: a program that closed one of these handles stops
+/// naming it itself.
+pub mod init {
+    use crate::handle::{Handle, Process, Resource, Thread};
+
+    /// The system resource with DEVICE, DEBUG, KSTATS, DUPLICATE and
+    /// TRANSFER (abi::INIT_RESOURCE_RIGHTS).
+    pub const RESOURCE: Handle<Resource> = Handle::from_raw(abi::INIT_RESOURCE);
+    /// Init's own process, with the owner's rights.
+    pub const PROCESS: Handle<Process> = Handle::from_raw(abi::INIT_PROCESS);
+    /// Init's first thread, with the owner's rights.
+    pub const THREAD: Handle<Thread> = Handle::from_raw(abi::INIT_THREAD);
+}
+
+/// The first handle of a process that process_create made (spec 13.3):
+/// entry 0 of its table, where the start channel goes. As with `init`,
+/// each mention gives a new value, and a program that closed the handle
+/// stops naming it itself.
+pub const START_CHANNEL: Handle<handle::Channel> = Handle::from_raw(abi::START_CHANNEL);
 
 /// Names the program's main function, a `fn(u64) -> u64`: `_start` calls
 /// it with the x0 the program started with (0 for init, spec 13.3) and

@@ -17,7 +17,7 @@
 
 use crate::arch::timer;
 use crate::object::Object;
-use crate::{process, thread};
+use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::sync::Lock;
@@ -169,6 +169,9 @@ pub fn portion() {
         match object {
             Object::Process(p) => process::clean(p, level),
             Object::Thread(t) => thread::clean(t, level),
+            Object::Channel(c) => channel::clean(c, level),
+            Object::Session(s) => session::clean(s, level),
+            Object::Timer(t) => crate::timer::clean(t, level),
             Object::Resource => unreachable!("the system resource is never queued"),
         }
     }

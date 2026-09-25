@@ -14,6 +14,7 @@
 mod console;
 mod arch;
 mod boot;
+mod channel;
 mod cleanup;
 #[cfg(not(feature = "ktest"))]
 mod init;
@@ -26,8 +27,10 @@ mod panicking;
 mod process;
 mod psci;
 mod sched;
+mod session;
 mod syscall;
 mod thread;
+mod timer;
 
 use boot::Boot;
 use bootimg::Program;

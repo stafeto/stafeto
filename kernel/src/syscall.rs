@@ -16,19 +16,24 @@
 //! is given: addresses are only numbers to check. A call that ends its
 //! caller (thread_exit, process_exit, process_kill of its own process)
 //! never returns: it leaves through sched::resume, and the caller's
-//! registers keep the arguments. Test builds also know numbers of their
-//! own, in abi::TEST_CALLS.
+//! registers keep the arguments. `receive` writes x10 and x11 as well when
+//! it takes something, and a thread that waits in it gets its result when
+//! the wait ends (spec 11). Test builds also know numbers of their own, in
+//! abi::TEST_CALLS.
 
+use crate::arch::timer as clock;
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Thread};
-use crate::{cleanup, sched};
+use crate::{channel, cleanup, sched, session, timer};
 use abi::{
-    Call, Error, Handle, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState,
-    Rights,
+    CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, Notification, OWNER_RIGHTS, ProcessHandles,
+    ProcessMemory, ProcessState, Rights,
 };
 use core::ptr::NonNull;
+use kcore::handles::rights_arg;
+use kcore::notify::{bits_arg, wait_arg};
 use kcore::process::{handle_limit_arg, quota_arg};
 use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
 use kcore::thread::{check_buffer, check_start};
@@ -73,6 +78,10 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     args.copy_from_slice(&unsafe { thread.as_ref() }.regs.x[..10]);
     let result = match Call::from_number(number) {
         Some(Call::HandleClose) => handle_close(thread, &args),
+        Some(Call::HandleDuplicate) => handle_duplicate(thread, &args),
+        Some(Call::CreateChannel) => channel_create(thread, &args),
+        Some(Call::Receive) => return receive(thread, &args),
+        Some(Call::Notify) => notify(thread, &args),
         Some(Call::ProcessCreate) => process_create(thread, &args),
         Some(Call::ProcessKill) => process_kill(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args),
@@ -81,6 +90,10 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::Yield) => yield_now(),
+        Some(Call::ClockNow) => clock_now(),
+        Some(Call::TimerCreate) => timer_create(thread, &args),
+        Some(Call::TimerSet) => timer_set(thread, &args),
+        Some(Call::TimerCancel) => timer_cancel(thread, &args),
         Some(Call::ObjectInfo) => object_info(thread, &args),
         Some(Call::DebugWrite) => debug_write(thread, &args),
         // Numbers no call has, and those of calls that come later.
@@ -101,6 +114,17 @@ pub fn set_result(mut thread: NonNull<Thread>, result: Result<Values, Error>) {
         }
         Err(e) => x[0] = e.code(),
     }
+}
+
+/// Writes what `receive` took into the thread's registers: 0 in x0 and the
+/// notification in x1-x11 (abi::Notification::to_words). x10 and x11 lie
+/// past the values of `Values`: only `receive` writes them (spec 11).
+pub fn set_notification(mut thread: NonNull<Thread>, n: Notification) {
+    // SAFETY: the thread is alive, and nothing else refers to its
+    // registers now.
+    let x = &mut unsafe { thread.as_mut() }.regs.x;
+    x[0] = 0;
+    x[1..=11].copy_from_slice(&n.to_words());
 }
 
 /// The process of the thread that made the call.
@@ -135,10 +159,121 @@ fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// handle_duplicate(x0 handle with DUPLICATE, x1 rights, x2 label, x3
+/// priority): a copy of the handle with the rights, a subset of the
+/// handle's own, in x1 (spec 5.2, 5.3). With label 0 and priority 0 the
+/// copy names the same object, whatever its kind; a copy of a handle with
+/// a label carries that label and counts as one more copy of its session.
+/// A label that is not 0 goes on a copy of a channel handle that has none:
+/// the copy names a new session of the channel with the label and a slot
+/// of the priority, 1-63, which the caller's pool of sessions holds and its
+/// quota pays for. The checks in the order of spec 11: bits no right has, a
+/// priority without a label or a label without a priority 1-63
+/// (INVALID_ARGS); the handle (BAD_HANDLE), a label on what is no channel
+/// (WRONG_TYPE), no DUPLICATE or a right the handle lacks (ACCESS_DENIED);
+/// the priority above the caller's ceiling (ACCESS_DENIED); a label on a
+/// handle with one (BAD_STATE) or on a closed channel (PEER_CLOSED); then
+/// the resources in the order the call takes them: room in the caller's
+/// table (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED, spec 6.5),
+/// a page of the caller's pool of sessions and a block of its table
+/// (NO_MEMORY). A session whose handle did not go in goes again.
+fn handle_duplicate(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let rights = rights_arg(a[1])?;
+    let label = a[2];
+    let priority = notify_priority_arg(a[3], label != 0)?;
+    let needed = Rights::DUPLICATE | rights;
+    if label == 0 {
+        let object = lookup(thread, a[0], needed, |o| Some(*o))?;
+        let h = process::insert_handle(caller(thread), object, rights)?;
+        return Ok(Values::new(&[h.0]));
+    }
+    let (c, labelled) = lookup(thread, a[0], needed, |o| {
+        Some((o.channel()?, o.session().is_some()))
+    })?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    if labelled {
+        return Err(Error::BadState);
+    }
+    if channel::is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    process::handle_room(caller(thread))?;
+    let s = session::create(caller(thread), c, label, priority)?;
+    let h = process::insert_handle(caller(thread), Object::Session(s), rights);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the session, and without it the session goes.
+    unsafe { session::unref(s, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
 /// The priority ceiling of the caller's process.
 fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
     // SAFETY: the calling thread holds its process.
     unsafe { caller(thread).as_ref() }.ceiling()
+}
+
+/// channel_create(x0 priority): a channel whose slot of label 0 has the
+/// priority (spec 6.5); x1 returns a handle to it with SEND, NOTIFY,
+/// RECEIVE, DUPLICATE and TRANSFER (abi::CHANNEL_RIGHTS). The priority is
+/// 1-63 (INVALID_ARGS) and no higher than the caller's ceiling
+/// (ACCESS_DENIED). Resources come last, in the order the call occupies
+/// them (spec 11): the caller's table has room for the handle
+/// (LIMIT_REACHED), then the caller's quota pays for a page of its pool of
+/// channels when the pool grows and for a block of its table (NO_MEMORY).
+/// A channel whose handle did not go in goes again.
+fn channel_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let priority = priority_arg(a[0])?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    process::handle_room(caller(thread))?;
+    let c = channel::create(caller(thread), priority)?;
+    let h = process::insert_handle(caller(thread), Object::Channel(c), CHANNEL_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// notify(x0 channel with NOTIFY, x1 bits): the bits first, since bit 63,
+/// CLIENT_GONE, is the kernel's (INVALID_ARGS); then the handle, and
+/// PEER_CLOSED once no handle with RECEIVE is left (spec 6.5, 6.8). The
+/// bits go into the channel's slot of label 0, or through a handle with a
+/// label into its session's slot (spec 5.3), ORed with those not yet
+/// received, and the slot to the top receiver that waits or into the
+/// queue of slots. A receiver woken above the caller runs before the call
+/// returns. No memory is taken, and nothing waits.
+fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let bits = bits_arg(a[1])?;
+    let (c, s) = lookup(thread, a[0], Rights::NOTIFY, |o| {
+        Some((o.channel()?, o.session()))
+    })?;
+    match s {
+        Some(s) => session::notify(s, bits, cause(thread))?,
+        None => channel::notify(c, bits, cause(thread))?,
+    }
+    Ok(Values::NONE)
+}
+
+/// receive(x0 channel with RECEIVE, x1 flags): the flags first, bit 16
+/// NO_WAIT and no other (INVALID_ARGS), then the handle. A call that passed
+/// its checks ends the caller's boost by its last notification (spec
+/// 6.6). What the queue of slots has comes at once: x1-x11 as
+/// abi::Notification::to_words puts them, and the caller works at the
+/// slot's priority, under its ceiling, until its next receive. With
+/// nothing queued, WOULD_BLOCK under NO_WAIT; otherwise the caller waits
+/// in the channel (spec 6.1), and the end of the wait writes its result:
+/// a notification, or PEER_CLOSED in x0 alone once the last handle with
+/// RECEIVE went. The call writes its own result: x0-x11 are its.
+fn receive(thread: NonNull<Thread>, a: &Args) {
+    let taken = wait_arg(a[1]).and_then(|wait| {
+        let c = lookup(thread, a[0], Rights::RECEIVE, Object::channel)?;
+        channel::receive(thread, c, wait)
+    });
+    match taken {
+        Ok(Some(n)) => set_notification(thread, n),
+        // The thread waits: the end of the wait writes its registers.
+        Ok(None) => {}
+        Err(e) => set_result(thread, Err(e)),
+    }
 }
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
@@ -147,66 +282,138 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 /// handle to it with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS),
 /// the first two for milestone 1.3, so that the set never changes. The
 /// quota is whole pages, at least one; the limit 1-16384; the ceiling 1-63
-/// and no higher than the caller's (ACCESS_DENIED). Exit channels come in
-/// milestone 1.3b: x3 is 0, and x4 with it; any other x3 is looked up as a
-/// channel and fails (BAD_HANDLE, WRONG_TYPE). The start channel, a
-/// channel with TRANSFER, moves into entry 0 of the child's table from
-/// milestone 1.3c (spec 13.3): x5 is 0, and any other value is looked up
-/// after x3 and fails the same way. Entry 0 then holds a stub that goes at
-/// once (process::reserve_start). The child is the caller's process's
-/// (spec 4): it ends when its parent does. Resources come last and in the
-/// order the call occupies them, a limit that needs no allocation first
-/// (spec 11): the caller's own table has room for the new handle
-/// (LIMIT_REACHED), then the quota comes off the caller's (spec 7.5), and
-/// the child pays from it for its shell, its root table and the chunk with
-/// entry 0 (NO_MEMORY when either quota falls short). A full caller table
-/// fails before the child is built, so nothing is made and torn down for
-/// it. The quota comes back to the caller in full once the child and
-/// whatever holds its shell went.
+/// and no higher than the caller's (ACCESS_DENIED). x3, a channel handle
+/// with NOTIFY, with a label or none, or 0, hears of the child's end once
+/// the child gave its quota back (spec 7.9): a notification of priority
+/// x4, 1-63 and no higher than the caller's ceiling, exactly 0 without x3,
+/// bit 0, with the label of the handle; the child's teardown runs at x4 at
+/// least (spec 7.7). x5, a channel handle with TRANSFER or 0, moves into
+/// entry 0 of the child's table with its rights (spec 13.3): the child
+/// takes it first, and the caller's handle goes once the child is made;
+/// without x5 entry 0 holds a stub that goes at once
+/// (process::reserve_start). x3 and x5 may be one handle: the label is
+/// read before the move. The child is the caller's process's (spec 4): it
+/// ends when its parent does. The checks in the order of spec 11: the
+/// values; x3, then x5 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED); the
+/// ceilings; x3 on a channel that closed (PEER_CLOSED); then the resources
+/// in the order the call occupies them, a limit that needs no allocation
+/// first: the caller's own table has room for the new handle
+/// (LIMIT_REACHED), the channel of x3 a slot for the exit notification
+/// (LIMIT_REACHED, spec 6.5), then the quota comes off the caller's
+/// (spec 7.5), the child pays from it for its root table, the caller for a
+/// page of its pool of shells when the pool grows (spec 7.8), and the
+/// child for the page of its pool of blocks with the chunk of entry 0
+/// (NO_MEMORY when either quota falls short): the least quota is 8 KiB. A
+/// full caller table fails before the child is built, so nothing is made
+/// and torn down for it; a child that fails later goes again, hears of
+/// nothing and leaves x5 with the caller. The quota comes back to the
+/// caller in full once the child and whatever holds its shell went; the
+/// page of shells stays the caller's.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
     let ceiling = priority_arg(a[2])?;
-    let channel = a[3] != 0;
-    let notify = notify_priority_arg(a[4], channel)?;
-    // No object is a channel before milestone 1.3b.
-    if channel {
-        lookup(thread, a[3], Rights::NOTIFY, |_| None::<()>)?;
-    }
-    if a[5] != 0 {
-        lookup(thread, a[5], Rights::TRANSFER, |_| None::<()>)?;
-    }
+    let notify = notify_priority_arg(a[4], a[3] != 0)?;
+    let exit = match a[3] {
+        0 => None,
+        h => Some(lookup(thread, h, Rights::NOTIFY, |o| {
+            Some((o.channel()?, o.session().map_or(0, session::label)))
+        })?),
+    };
+    let start = match a[5] {
+        0 => None,
+        h => {
+            // SAFETY: the calling thread holds its process.
+            let table = unsafe { caller(thread).as_ref() };
+            let (object, rights) = table
+                .lookup_with_rights(Handle(h), Rights::TRANSFER, |o| o.channel().map(|_| *o))?;
+            Some((Handle(h), object, rights))
+        }
+    };
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
+    if let Some((c, _)) = exit
+        && channel::is_closed(c)
+    {
+        return Err(Error::PeerClosed);
+    }
     // The caller's table first: it needs no allocation, and the call would
     // insert the child's handle there last (spec 11).
     process::handle_room(caller(thread))?;
+    if let Some((c, _)) = exit {
+        channel::add_source(c)?;
+    }
+    let made = new_child(thread, quota, limit, ceiling, start.map(|(_, o, r)| (o, r)));
+    match made {
+        Ok((child, _)) => {
+            if let Some((c, label)) = exit {
+                process::set_exit(child, c, label, notify);
+            }
+            if let Some((moved, _, _)) = start {
+                // The child holds the channel now; the caller's handle goes.
+                let closed = process::close_handle(caller(thread), moved, cause(thread));
+                assert!(closed.is_ok(), "the start channel's handle went on the way");
+            }
+            // SAFETY: the reference `create` handed out goes; the handle
+            // holds the child.
+            unsafe { process::release(child, cause(thread)) };
+        }
+        Err(_) => {
+            if let Some((c, _)) = exit {
+                channel::remove_source(c);
+            }
+        }
+    }
+    Ok(Values::new(&[made?.1.0]))
+}
+
+/// A child of the caller's process for process_create, with entry 0 of its
+/// table, the start channel `start` or a stub, and a handle to it in the
+/// caller's table; the reference `create` handed out comes along. A child
+/// that fails on the way goes again, and the caller keeps its handles.
+fn new_child(
+    thread: NonNull<Thread>,
+    quota: u64,
+    limit: u32,
+    ceiling: u8,
+    start: Option<(Object, Rights)>,
+) -> Result<(NonNull<Process>, Handle), Error> {
     let child = process::create_child(caller(thread), quota, limit, ceiling)?;
-    let h = process::reserve_start(child).and_then(|()| {
-        process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
-    });
-    // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the child.
-    unsafe { process::release(child, cause(thread)) };
-    Ok(Values::new(&[h?.0]))
+    match start {
+        Some((object, rights)) => process::move_start(child, object, rights),
+        None => process::reserve_start(child),
+    }
+    .and_then(|()| process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS))
+    .map(|h| (child, h))
+    .inspect_err(|_| {
+        // SAFETY: the reference `create` handed out goes, and nothing else
+        // holds the child, which goes again.
+        unsafe { process::release(child, cause(thread)) }
+    })
 }
 
 /// process_kill(x0 process with MANAGE): the process ends, reason
-/// «killed» (spec 11): its threads stop in whatever state they are, and
-/// the cleanup queue takes what it holds apart at the caller's priority,
-/// before the caller runs again. A process that ended already: 0, and its
-/// teardown keeps the level of the end that began it. Killing the caller's
-/// own process never returns.
+/// «killed» (spec 11): its threads stop in whatever state they are, its
+/// descendants stop in a wave at its ceiling, and the cleanup queue takes
+/// what it holds apart at the caller's priority, before the caller runs
+/// again. A process that ended already: 0, and its teardown is raised to
+/// the caller's priority (process::hasten), so that the call returns after
+/// it as well. Killing the caller's own process never returns.
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
     let own = target == caller(thread);
     // SAFETY: the handle holds the process; the end takes its own
     // reference before the table that holds the handle may go.
-    unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
+    let ended = unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
     if own {
         // The caller ended with its process and may be gone.
         sched::resume()
+    }
+    if !ended {
+        // SAFETY: the handle holds the process, which ended before; no
+        // portion runs during a call.
+        unsafe { process::hasten(target, cause(thread)) };
     }
     Ok(Values::NONE)
 }
@@ -307,12 +514,71 @@ fn yield_now() -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// clock_now(): x1 returns the counter in nanoseconds, rounded down
+/// (spec 10): the scale of the deadlines of timer_set.
+fn clock_now() -> Result<Values, Error> {
+    Ok(Values::new(&[clock::clock().ticks_to_ns(clock::now())]))
+}
+
+/// timer_create(x0 channel with RECEIVE, x1 priority): a timer on the
+/// channel, not armed, whose notifications have the priority and the
+/// label of the handle (spec 10); x1 returns a handle to it with
+/// DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS). The channel is the
+/// caller's own to receive from: its slots and the priorities that lift
+/// its receivers are the receiver's. The checks in the order of spec 11:
+/// the priority, 1-63 (INVALID_ARGS); the handle (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without RECEIVE); the priority above the caller's ceiling
+/// (ACCESS_DENIED); then the resources in the order the call takes them:
+/// room in the caller's table (LIMIT_REACHED), abi::MAX_TIMERS timers the
+/// caller pays for (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED,
+/// spec 6.5), a page of the caller's pool of timers and a block of its
+/// table (NO_MEMORY). A channel with a handle with RECEIVE is open. A
+/// timer whose handle did not go in goes again.
+fn timer_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let priority = priority_arg(a[1])?;
+    let (c, label) = lookup(thread, a[0], Rights::RECEIVE, |o| {
+        Some((o.channel()?, o.session().map_or(0, session::label)))
+    })?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    process::handle_room(caller(thread))?;
+    let t = timer::create(caller(thread), c, label, priority)?;
+    let h = process::insert_handle(caller(thread), Object::Timer(t), OWNER_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the timer, and without it the timer goes.
+    unsafe { timer::release(t, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// timer_set(x0 timer with MANAGE, x1 deadline): the timer fires at the
+/// deadline, nanoseconds on the scale of clock_now, rounded up to counter
+/// ticks so that it never fires early (spec 10). A deadline the counter
+/// reached fires in the call: bit 0 into the timer's slot, which goes to
+/// the top receiver that waits or into the channel's queue, as notify
+/// puts it; any other arms the timer, and an armed one moves. PEER_CLOSED
+/// once the channel closed, and the timer stays as it was. No memory is
+/// taken.
+fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
+    let deadline = clock::clock().ns_to_ticks(a[1]);
+    timer::set(t, deadline, cause(thread))?;
+    Ok(Values::NONE)
+}
+
+/// timer_cancel(x0 timer with MANAGE): the timer is armed no more; bits it
+/// posted stay in its slot until receive takes them (spec 10). A timer
+/// that is not armed is left as it is: 0.
+fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
+    timer::cancel(t);
+    Ok(Values::NONE)
+}
+
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any
 /// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
 /// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
-/// resource with KSTATS and returns abi::KernelStats in x1-x7 (spec 16).
+/// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if a[2] != 0 {
         return Err(Error::InvalidArgs);
@@ -352,8 +618,9 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 }
 
 /// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
-/// idle time and latencies, the cleanup queue, the frames and the pages of
-/// the pools.
+/// idle time and latencies, the cleanup queue, the frames, the pages of
+/// the pools and of the page logs of their payers, and the longest batch
+/// of expired timers.
 fn kernel_stats() -> KernelStats {
     let s = sched::stats();
     KernelStats {
@@ -364,6 +631,7 @@ fn kernel_stats() -> KernelStats {
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
+        longest_batch: timer::longest_batch(),
     }
 }
 

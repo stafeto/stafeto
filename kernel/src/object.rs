@@ -2,25 +2,35 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
-//! reference to its process or thread, and the last reference queues the
-//! object for cleanup (spec 7.7). The system resource is one for the whole
-//! system and is not counted: what a handle to it allows is in the
-//! handle's rights.
+//! reference to its process, thread, channel, session or timer, and the
+//! last reference queues the object for cleanup (spec 7.7); a channel counts its
+//! handles with RECEIVE too, since the last of them closes it (spec 6.8).
+//! A channel handle with a label names the label's session, which names
+//! the channel (spec 5.3) and counts its handles as its copies. The system
+//! resource is one for the whole system and is not counted: what a handle
+//! to it allows is in the handle's rights.
 
+use crate::channel::{self, Channel};
 use crate::mm::pages::KernelPages;
 use crate::process::{self, Process};
+use crate::session::{self, Session};
 use crate::thread::{self, Thread};
-use core::mem::MaybeUninit;
+use crate::timer::{self, Timer};
+use abi::Rights;
+use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
 use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
-use kcore::quota::Account;
-use kcore::slab::Pool;
-use kcore::sync::Lock;
+use kcore::slab::{PaidPages, Pool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Object {
     Process(NonNull<Process>),
     Thread(NonNull<Thread>),
+    Channel(NonNull<Channel>),
+    /// A channel handle with a label (spec 5.3).
+    Session(NonNull<Session>),
+    /// A timer of a program (spec 10).
+    Timer(NonNull<Timer>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -50,93 +60,130 @@ impl Object {
         }
     }
 
+    /// The channel, for a lookup that needs one: a handle with a label
+    /// names one through its session.
+    pub fn channel(&self) -> Option<NonNull<Channel>> {
+        match *self {
+            Object::Channel(c) => Some(c),
+            Object::Session(s) => Some(session::channel(s)),
+            _ => None,
+        }
+    }
+
+    /// The session of a channel handle with a label.
+    pub fn session(&self) -> Option<NonNull<Session>> {
+        match *self {
+            Object::Session(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The timer, for a lookup that needs one.
+    pub fn timer(&self) -> Option<NonNull<Timer>> {
+        match *self {
+            Object::Timer(t) => Some(t),
+            _ => None,
+        }
+    }
+
     /// Some for the system resource, for a lookup that needs it.
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
     }
 }
 
-/// Adds the reference a new handle holds.
-pub fn retain(object: Object) {
+/// Adds the reference a new handle with `rights` holds.
+pub fn retain(object: Object, rights: Rights) {
     match object {
         Object::Process(p) => process::retain(p),
         Object::Thread(t) => thread::retain(t),
+        Object::Channel(c) => channel::retain(c, rights),
+        Object::Session(s) => session::retain(s, rights),
+        Object::Timer(t) => timer::retain(t),
         Object::Resource => {}
     }
 }
 
-/// Drops the reference a handle held; the last one queues the object for
-/// cleanup at `cause` (1-63): the effective priority of the thread whose
-/// call let the reference go, or the level of the object whose portion
-/// did (spec 7.7). Nothing is taken apart here.
+/// Drops the reference a handle with `rights` held; the last one queues
+/// the object for cleanup at `cause` (1-63): the effective priority of the
+/// thread whose call let the reference go, or the level of the object
+/// whose portion did (spec 7.7). The last handle with RECEIVE to a channel
+/// closes it, and the last copy of a session posts CLIENT_GONE (spec 5.3).
+/// Nothing is taken apart here.
 ///
 /// # Safety
 /// The reference was the handle's, and the handle is gone.
-pub unsafe fn release(object: Object, cause: u8) {
+pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
     // SAFETY: the caller hands over the handle's reference.
     unsafe {
         match object {
             Object::Process(p) => process::release(p, cause),
             Object::Thread(t) => thread::release(t, cause),
+            Object::Channel(c) => channel::release(c, rights, cause),
+            Object::Session(s) => session::release(s, rights, cause),
+            Object::Timer(t) => timer::release(t, cause),
             Object::Resource => {}
         }
     }
 }
 
-/// Memory for the chunks and directories of handle tables, each from a
-/// pool of its own: two chunks or two directories to a pool page. A
-/// pool's lock is taken for each chunk or directory alone, so a table
-/// that releases its objects may release other tables meanwhile. Each
-/// chunk and directory costs the quota of the table's owner its slot
-/// (spec 7.5), whoever put the handle there: a table that does not fit
-/// there has no memory.
-pub struct Chunks<'a>(pub &'a mut Account);
+/// A chunk or the directory of a handle table: both take 2048 bytes, so
+/// one pool of the table's owner holds both, two to a page (spec 7.8).
+pub type Block = MaybeUninit<Chunk<Object>>;
 
-type ChunkPool = Pool<MaybeUninit<Chunk<Object>>>;
-type DirectoryPool = Pool<MaybeUninit<Directory<Object>>>;
+const _: () = assert!(
+    size_of::<Directory<Object>>() <= size_of::<Block>()
+        && align_of::<Directory<Object>>() <= align_of::<Block>()
+        && size_of::<Block>() == 2048
+);
 
-static CHUNKS: Lock<ChunkPool> = Lock::new(Pool::new());
-static DIRECTORIES: Lock<DirectoryPool> = Lock::new(Pool::new());
+/// Memory for the chunks and directories of a handle table: the pool of
+/// blocks of the table's owner, whose pages are charged to the owner's
+/// quota as the pool grows (spec 7.5, 7.8), whoever put the handle there.
+/// A block that goes back stays in the pool and refunds nothing.
+pub struct Chunks<'a> {
+    pub blocks: &'a mut Pool<Block>,
+    pub pages: PaidPages<'a, KernelPages>,
+}
 
-/// What a chunk of a handle table costs its owner's quota.
-pub const CHUNK_COST: u64 = ChunkPool::SLOT as u64;
-/// What the directory of a handle table costs its owner's quota.
-pub const DIRECTORY_COST: u64 = DirectoryPool::SLOT as u64;
+impl Chunks<'_> {
+    /// A block of the owner's pool; None when its quota falls short.
+    fn alloc(&mut self) -> Option<NonNull<Block>> {
+        self.blocks
+            .alloc(&mut self.pages, MaybeUninit::uninit())
+            .ok()
+    }
 
-// SAFETY: a chunk or a directory is a free slot of its pool, sized and
-// aligned for it; the pool hands it to no one else until it comes back.
+    /// Gives a block back to the pool.
+    ///
+    /// # Safety
+    /// `block` came from `alloc` of this owner, and nothing uses it
+    /// afterwards.
+    unsafe fn free(&mut self, block: NonNull<Block>) {
+        // SAFETY: the caller's promise; MaybeUninit drops nothing.
+        unsafe { self.blocks.free(block) }
+    }
+}
+
+// SAFETY: a chunk or a directory is a free slot of the owner's pool,
+// sized and aligned for either; the pool hands it to no one else until it
+// comes back.
 unsafe impl ChunkSource<Object> for Chunks<'_> {
     fn alloc_chunk(&mut self) -> Option<NonNull<Chunk<Object>>> {
-        self.0.charge(CHUNK_COST).ok()?;
-        let Ok(slot) = CHUNKS.lock().alloc(&mut KernelPages, MaybeUninit::uninit()) else {
-            self.0.refund(CHUNK_COST);
-            return None;
-        };
-        Some(slot.cast())
+        self.alloc().map(NonNull::cast)
     }
 
     unsafe fn free_chunk(&mut self, chunk: NonNull<Chunk<Object>>) {
-        // SAFETY: the chunk came from alloc_chunk; MaybeUninit drops nothing.
-        unsafe { CHUNKS.lock().free(chunk.cast()) };
-        self.0.refund(CHUNK_COST);
+        // SAFETY: the chunk came from alloc_chunk.
+        unsafe { self.free(chunk.cast()) }
     }
 
     fn alloc_directory(&mut self) -> Option<NonNull<Directory<Object>>> {
-        self.0.charge(DIRECTORY_COST).ok()?;
-        let Ok(slot) = DIRECTORIES
-            .lock()
-            .alloc(&mut KernelPages, MaybeUninit::uninit())
-        else {
-            self.0.refund(DIRECTORY_COST);
-            return None;
-        };
-        Some(slot.cast())
+        self.alloc().map(NonNull::cast)
     }
 
     unsafe fn free_directory(&mut self, directory: NonNull<Directory<Object>>) {
-        // SAFETY: the directory came from alloc_directory; MaybeUninit
-        // drops nothing.
-        unsafe { DIRECTORIES.lock().free(directory.cast()) };
-        self.0.refund(DIRECTORY_COST);
+        // SAFETY: the directory came from alloc_directory.
+        unsafe { self.free(directory.cast()) }
     }
 }

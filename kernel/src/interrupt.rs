@@ -21,8 +21,10 @@ pub fn handle(ack: Ack) {
     // a disarm: without the timer's condition the interrupt is spurious.
     if timer::fired() {
         // The line is level-triggered and has to be quiet before the EOI:
-        // the scheduler turns the timer off and ends a quantum that is
-        // over, and arms the timer for its next deadline on the way out.
+        // the scheduler turns the timer off, ends a quantum that is over
+        // and fires the expired timers of programs, at most a batch of
+        // them (spec 10), and arms the timer for its next deadline on the
+        // way out.
         sched::timer_fired();
         #[cfg(feature = "ktest")]
         crate::ktest::el0::timer_fired();
