@@ -53,7 +53,8 @@ pub struct Thread {
     /// it waits in `receive`, its request while it waits in `send`, and its
     /// place in the queue of accepted requests of the process that took
     /// the request, at the level of its effective priority when it began
-    /// to wait. Only the channel changes it, under the scheduler's lock.
+    /// to wait, and at each thread_set_priority since (channel::requeue,
+    /// spec 6.3). Only the channel changes it, under the scheduler's lock.
     slot: Slot<Owner>,
     /// The handles of its request or reply on their way (spec 6.1): out of
     /// its process's table, until the meeting puts them into the table of
