@@ -2200,10 +2200,11 @@ pub fn thread_limit_of_the_system(_: &Boot) -> Result<(), &'static str> {
     })
 }
 
-/// Numbers go back to the table with their threads' portions (spec 6.1,
-/// 7.7): a thread that cannot be made for want of quota takes none, and
-/// 1000 threads made, started and ended one after another, then 1000 made
-/// and let go without a start, leave as many numbers free as there were.
+/// Numbers go back to the table as their threads end, and with the
+/// portion of a thread that never started (spec 6.1, 7.7): a thread that
+/// cannot be made for want of quota takes none, and 1000 threads made,
+/// started and ended one after another, then 1000 made and let go without
+/// a start, leave as many numbers free as there were.
 pub fn thread_numbers_come_back(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let before = sched::locked(|k| k.tokens.available());

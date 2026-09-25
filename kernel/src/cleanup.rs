@@ -101,13 +101,35 @@ pub unsafe fn requeue(item: NonNull<Item>, object: Object, level: u8) {
 /// # Safety
 /// `item` is the object's own, and the object is queued and alive.
 pub unsafe fn raise(item: NonNull<Item>, level: u8) {
+    // SAFETY: the caller's promise.
+    unsafe { lift(item, level, true) }
+}
+
+/// Moves a queued object to the head of `level` when that is above its
+/// own, and leaves it in its place otherwise: a waiter of its stage Close
+/// or Replies rose (thread_set_priority, spec 7.7).
+///
+/// # Safety
+/// As for `raise`.
+pub unsafe fn raise_above(item: NonNull<Item>, level: u8) {
+    // SAFETY: the caller's promise.
+    unsafe { lift(item, level, false) }
+}
+
+/// `raise` with `level_too`, `raise_above` without it: whether an object
+/// at `level` moves to its head as well.
+///
+/// # Safety
+/// As for `raise`.
+unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
     let mut q = QUEUE.lock();
     // SAFETY: the caller's promise; the link is touched only while the
     // item is out of the queue.
     unsafe {
         let link = &raw mut (*item.as_ptr()).link;
         assert!((*link).is_queued(), "an item is raised while not queued");
-        if (*link).level() <= level {
+        let own = (*link).level();
+        if own < level || level_too && own == level {
             q.items.remove(item);
             (*link).set_level(level);
             q.items.push_head(item);

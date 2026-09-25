@@ -11,11 +11,11 @@
 //! are left: handles, the one `create` hands out, and the kernel's while
 //! the scheduler holds the thread, from its start until its end, while it
 //! waits in `send` or `receive` too (spec 8.1); it holds a reference to its
-//! process. A thread that ended stays as a shell without its buffer until
-//! its last reference goes, which queues it for cleanup (spec 7.7); its
-//! number goes back with its portion. Its process pays from its quota for
-//! the pages of its pool of threads (spec 7.8) and for the buffer while it
-//! lasts (spec 7.5).
+//! process. A thread that ended stays as a shell without its buffer and its
+//! number until its last reference goes, which queues it for cleanup (spec
+//! 7.7): its number goes back as it ends, or with its portion when it never
+//! started. Its process pays from its quota for the pages of its pool of
+//! threads (spec 7.8) and for the buffer while it lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::channel::{Owner, Wait};
@@ -23,7 +23,7 @@ use crate::cleanup::{self, Item};
 use crate::mm::phys::FRAMES;
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::sched;
+use crate::sched::{self, Tokens};
 use abi::{Error, Policy};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -56,8 +56,10 @@ pub struct Thread {
     /// to wait. Only the channel changes it, under the scheduler's lock.
     slot: Slot<Owner>,
     /// Its number in the system table (spec 6.1, 7.8), from `create` until
-    /// its portion of cleanup: the tokens of its requests carry it.
-    index: u16,
+    /// it ends (sched::exit) or, when it never started, until its portion
+    /// of cleanup: the tokens of its requests carry it. None once it went
+    /// back (`give_number`), so a taken number always names a live thread.
+    index: Option<u16>,
     /// The token of the request whose client boosts it (spec 6.6): a reply
     /// with it ends the boost. 0 when a notification boosts it, or nothing.
     pub boost_token: u64,
@@ -99,8 +101,8 @@ const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
 unsafe impl Send for Thread {}
 
 /// Threads the system has at most (spec 8): the entries of the table of
-/// thread numbers, which thread_create takes and the thread's portion of
-/// cleanup gives back.
+/// thread numbers, which thread_create takes and a thread gives back as it
+/// ends, or with its portion of cleanup when it never started.
 pub const THREADS: usize = 1024;
 
 // SAFETY: the node is a field of the thread and lives as long as it does.
@@ -167,7 +169,7 @@ pub fn create(
         waits: None,
         // The owner is the thread's own place, known once it has one.
         slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
-        index: 0,
+        index: None,
         boost_token: 0,
         siblings: None,
         buffer: None,
@@ -181,7 +183,7 @@ pub fn create(
     // slot is in no queue.
     unsafe {
         (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
-        (*thread.as_ptr()).index = index;
+        (*thread.as_ptr()).index = Some(index);
     }
     #[cfg(feature = "ktest")]
     LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -197,10 +199,24 @@ pub fn slot(t: NonNull<Thread>) -> NonNull<Slot<Owner>> {
     unsafe { NonNull::new_unchecked(&raw mut (*t.as_ptr()).slot) }
 }
 
-/// The number of `t` in the system table (spec 6.1).
+/// The number of `t` in the system table (spec 6.1), which a thread that
+/// has not ended holds.
 pub fn index(t: NonNull<Thread>) -> u16 {
     // SAFETY: the caller holds the thread; only the field is read.
-    unsafe { (*t.as_ptr()).index }
+    unsafe { (*t.as_ptr()).index }.expect("a thread that has not ended holds its number")
+}
+
+/// Gives the number of `t` back to the table of thread numbers `tokens`,
+/// unless it went back before (spec 6.1, 7.7): as the thread ends
+/// (sched::exit), or with the portion of a thread that never started.
+///
+/// # Safety
+/// `t` is alive; `tokens` is the locked table (sched::locked).
+pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
+    // SAFETY: the caller's promise; only the field is touched.
+    if let Some(index) = unsafe { (*t.as_ptr()).index.take() } {
+        tokens.free(index);
+    }
 }
 
 /// Gives `t` its message buffer (spec 11): a fresh zeroed frame mapped
@@ -355,12 +371,12 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     }
 }
 
-/// The portion of a thread nobody refers to (cleanup): its buffer goes,
-/// its number goes back to the system table with its count (spec 6.1),
-/// it leaves its process's list if it is still there, its slot goes back
-/// to its process's pool, and then its reference to its process, queued
-/// at `level` if it was the last. When the thread ran last, no thread ran
-/// after it.
+/// The portion of a thread nobody refers to (cleanup): its buffer goes, its
+/// number goes back to the system table with its count if it never started
+/// (spec 6.1), it leaves its process's list if it is still there, its slot
+/// goes back to its process's pool, and then its reference to its process,
+/// queued at `level` if it was the last. When the thread ran last, no
+/// thread ran after it.
 ///
 /// # Safety
 /// No reference to `thread` is left, and it is in no queue.
@@ -374,7 +390,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
     // process's list before its slot goes.
     unsafe {
         drop_buffer(thread);
-        sched::locked(|k| k.tokens.free(index(thread)));
+        sched::locked(|k| give_number(thread, k.tokens));
         process::remove_thread(process, thread);
         process::free_thread_slot(process, thread);
         // Test builds poison the slot past the pool's link, as for

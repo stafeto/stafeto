@@ -627,14 +627,14 @@ impl<T: Schedulable> Scheduler<T> {
         Ok(())
     }
 
-    /// `receive` hands `t` a notification slot of `level` (spec 6.6): the
-    /// effective priority becomes the higher of the base and `level`, but
-    /// never above `ceiling`, the priority ceiling of the thread's process
-    /// (spec 8). A boost only raises: one below the thread's boost leaves
-    /// it as it is. The thread moves as a raised one: running, it keeps
-    /// the CPU and its quantum; ready, it goes to the tail of its new level
-    /// with a new quantum; waiting and out of every queue, it takes the
-    /// level, and `wake` puts it there.
+    /// `receive` hands `t` a notification slot or a request of `level`
+    /// (spec 6.6): the effective priority becomes the higher of the base
+    /// and `level`, but never above `ceiling`, the priority ceiling of the
+    /// thread's process (spec 8). A boost only raises: one below the
+    /// thread's boost leaves it as it is. The thread moves as a raised one:
+    /// running, it keeps the CPU and its quantum; ready, it goes to the
+    /// tail of its new level with a new quantum; waiting and out of every
+    /// queue, it takes the level, and `wake` puts it there.
     ///
     /// # Safety
     /// As for `set_priority`; a waiting `t` stands in no queue.
@@ -649,11 +649,11 @@ impl<T: Schedulable> Scheduler<T> {
         unsafe { self.relevel(t, level) };
     }
 
-    /// The boost ends (the thread's next `receive`): the effective priority
-    /// falls back to the base. A running thread keeps the CPU and its
-    /// quantum and gives the CPU up at the next `pick` to a ready thread
-    /// above its base; a ready one goes to the head of its base's level
-    /// with the rest of its quantum.
+    /// The boost ends (the thread's next `receive`, or its reply with the
+    /// token of the boost): the effective priority falls back to the base.
+    /// A running thread keeps the CPU and its quantum and gives the CPU up
+    /// at the next `pick` to a ready thread above its base; a ready one
+    /// goes to the head of its base's level with the rest of its quantum.
     ///
     /// # Safety
     /// As for `boost`.

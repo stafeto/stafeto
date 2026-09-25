@@ -28,7 +28,8 @@
 //! its shell, in portions. A child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
 //! rest with its shell. The requests its threads accepted wait in it for
-//! their replies (spec 4, 6.8).
+//! their replies (spec 4, 6.8); once it ended, its stage Replies wakes
+//! their clients with PEER_CLOSED.
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
@@ -59,7 +60,7 @@ pub use table::{
     close_handle, handle_counts, handle_room, insert_handle, install_init_handles, move_start,
     reserve_start,
 };
-pub use teardown::{Stage, clean, exit_label, hasten, set_exit};
+pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
 use teardown::{begin, queue_shell};
 
 /// Blocks of frames one process may own.
@@ -142,7 +143,9 @@ pub struct Process {
     /// 6.8): the own slots of their clients, which wait for the replies, at
     /// the levels the clients had. Any thread of the process may answer.
     /// A request holds no reference to its client: while it stands here the
-    /// client lives. Reached only with the scheduler locked (`accepted`).
+    /// client lives, and a client that ends takes its slot out
+    /// (channel::cancel). Reached only with the scheduler locked
+    /// (`accepted`).
     accepted: ReadyQueue<Slot<Owner>>,
     /// How far its teardown came.
     stage: Stage,
@@ -978,7 +981,7 @@ pub fn translate(process: NonNull<Process>, va: usize) -> Option<(u64, u64)> {
 static EARLY_QUOTA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(feature = "ktest")]
-pub use test_access::{in_use, parent, progress, take_early_quota};
+pub use test_access::{has_accepted, in_use, parent, progress, take_early_quota};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -1001,6 +1004,14 @@ mod test_access {
         // SAFETY: the test holds a reference to the process; only the field is
         // read.
         unsafe { (*process.as_ptr()).parent }
+    }
+
+    /// Whether requests the threads of `process`, which the test holds,
+    /// accepted wait for their replies.
+    pub fn has_accepted(process: NonNull<Process>) -> bool {
+        // SAFETY: the test holds a reference to the process; only the mask
+        // of the queue is read.
+        sched::locked(|k| unsafe { !accepted(process, k.s).is_empty() })
     }
 
     /// How far the teardown of `process` came: its stage, the handles left in

@@ -7,9 +7,14 @@
 
 use super::table::table;
 use super::*;
+use crate::syscall;
 
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7).
 const SHELL_PORTION: usize = 64;
+
+/// Clients of one level a portion of the stage Replies wakes, at most
+/// (spec 7.7).
+const REPLIES_PORTION: usize = 32;
 
 /// The bits of an exit notification (spec 6.5, 7.9): bit 0, once.
 const EXIT_BITS: u64 = 1;
@@ -17,12 +22,13 @@ const EXIT_BITS: u64 = 1;
 /// Where the teardown of a process stands (spec 7.7). A process is whole
 /// until it ends; then the cleanup queue holds it, with a reference of its
 /// own, and each portion takes one step of its stage, in the order of
-/// STAGES, with how far it came kept in the process. Stop, Children,
-/// Handles, Space and Shell take as many portions as their steps; the
-/// others one. The stage Stop runs at S, the higher of the process's
-/// ceiling and R (`level`); the others at R, but for Shell, which runs at
-/// the level of the last reference. After the stage Notify the queue lets
-/// its reference go.
+/// STAGES, with how far it came kept in the process. Stop, Replies,
+/// Children, Handles, Space and Shell take as many portions as their
+/// steps; the others one. The stage Stop runs at S, the higher of the
+/// process's ceiling and R (`level`); Replies at the higher of R and its
+/// top client; the others at R, but for Shell, which runs at the level of
+/// the last reference. After the stage Notify the queue lets its reference
+/// go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// No teardown began: the process lives.
@@ -34,6 +40,12 @@ pub enum Stage {
     /// priority above its process's ceiling, and no ceiling of a
     /// descendant is above this one's (spec 4, 8).
     Stop,
+    /// Up to REPLIES_PORTION clients of the top level of the queue of
+    /// requests its threads accepted (`accepted`) a portion: each wakes
+    /// with PEER_CLOSED (spec 6.8). Its threads are dead, so no request
+    /// joins the queue, and a client that ends leaves it itself
+    /// (channel::cancel). One portion when the queue is empty.
+    Replies,
     /// A child a portion: the first child in the list, which the stage
     /// Stop ended, goes right in front of the process in the queue
     /// (`hasten`); the process waits behind it until the child leaves the
@@ -73,8 +85,9 @@ pub enum Stage {
 }
 
 /// The stages of a teardown in the order they run (spec 7.7).
-const STAGES: [Stage; 9] = [
+const STAGES: [Stage; 10] = [
     Stage::Stop,
+    Stage::Replies,
     Stage::Children,
     Stage::Handles,
     Stage::Space,
@@ -114,7 +127,8 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
 /// The teardown of a process that just ended begins at `cause` (spec
 /// 7.7): R grows to it, and the cleanup queue takes a reference of its
 /// own and queues the process for its first stage: Stop at S for a
-/// process with children, Children at R otherwise.
+/// process with children, Replies otherwise (`stage_level`). It takes the
+/// scheduler's lock.
 ///
 /// # Safety
 /// `process` is alive, whole, and in no queue.
@@ -131,28 +145,54 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
         (*p).stage = if (*p).children.is_some() {
             Stage::Stop
         } else {
-            Stage::Children
+            Stage::Replies
         };
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
         let refs = refs(process);
         *refs = refs.checked_add(1).expect("process references overflow");
         let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-        cleanup::enqueue(item, Object::Process(process), stage_level(p));
+        cleanup::enqueue(item, Object::Process(process), stage_level(process));
     }
 }
 
-/// The level the stage of `p` runs at: S, the higher of its ceiling and
-/// R, at the stage Stop, R at the others (spec 7.7).
+/// The level the stage of `process` runs at (spec 7.7): S, the higher of
+/// its ceiling and R, at the stage Stop; the higher of R and the top level
+/// of its accepted requests at the stage Replies, read under the
+/// scheduler's lock; R at the others. O(1).
 ///
 /// # Safety
-/// `p` is alive; only the fields are read.
-unsafe fn stage_level(p: *const Process) -> u8 {
+/// `process` is alive; only the fields are read.
+unsafe fn stage_level(process: NonNull<Process>) -> u8 {
+    let p = process.as_ptr();
     // SAFETY: the caller's promise.
     unsafe {
         match (*p).stage {
             Stage::Stop => (*p).ceiling.max((*p).level),
+            Stage::Replies => {
+                let top = sched::locked(|k| accepted(process, k.s).top());
+                top.map_or((*p).level, |top| top.max((*p).level))
+            }
             _ => (*p).level,
+        }
+    }
+}
+
+/// thread_set_priority moved a client in the queue of accepted requests of
+/// `process` (channel::raise): at the stage Replies the process goes up in
+/// the cleanup queue to the level of its top client when that is higher
+/// (spec 7.7). Nothing at other stages. It takes the scheduler's lock.
+///
+/// # Safety
+/// `process` is alive: a client waits for its reply.
+pub unsafe fn raise_replies(process: NonNull<Process>) {
+    let p = process.as_ptr();
+    // SAFETY: the caller's promise; a process at its stage Replies stands
+    // in the cleanup queue between its portions.
+    unsafe {
+        if (*p).stage == Stage::Replies {
+            let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+            cleanup::raise_above(item, stage_level(process));
         }
     }
 }
@@ -179,7 +219,7 @@ pub unsafe fn hasten(process: NonNull<Process>, level: u8) {
             Stage::Shell => {}
             _ => {
                 let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-                cleanup::raise(item, stage_level(p));
+                cleanup::raise(item, stage_level(process));
             }
         }
     }
@@ -208,6 +248,8 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         Stage::Whole => unreachable!("a whole process in the cleanup queue"),
         // SAFETY: the process is alive, and its children in the list too.
         Stage::Stop => unsafe { stop_child(process, r) },
+        // SAFETY: the process is alive; its clients wait.
+        Stage::Replies => unsafe { wake_clients(process, level) },
         Stage::Children => {
             // SAFETY: the process is alive; only the field is read.
             first = unsafe { (*p).children };
@@ -254,7 +296,7 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             release(process, r);
         } else {
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
-            cleanup::requeue(item, Object::Process(process), stage_level(p));
+            cleanup::requeue(item, Object::Process(process), stage_level(process));
         }
         if let Some(child) = first {
             wait_for_child(child, r);
@@ -281,6 +323,42 @@ unsafe fn stop_child(process: NonNull<Process>, level: u8) -> bool {
         }
         (*p).stop_next.is_none()
     }
+}
+
+/// The stage Replies, taken at `level`: up to REPLIES_PORTION clients at
+/// the top level of the queue of accepted requests of `process` leave it,
+/// each woken with PEER_CLOSED in x0 alone at the tail of its level with a
+/// new quantum (spec 6.8), under one hold of the scheduler's lock. True
+/// once the queue is empty; a process that took no request passes at once.
+///
+/// # Safety
+/// `process` is alive and at its stage Replies.
+unsafe fn wake_clients(process: NonNull<Process>, level: u8) -> bool {
+    let taken = sched::locked(|k| {
+        // SAFETY: the caller's promise; a client in the queue is alive.
+        unsafe {
+            let top = accepted(process, k.s).top()?;
+            let mut heads = 0;
+            while heads < REPLIES_PORTION
+                && let Some(slot) = accepted(process, k.s).first(top)
+            {
+                accepted(process, k.s).remove(slot);
+                let Owner::Thread(t) = (*slot.as_ptr()).owner() else {
+                    unreachable!("an accepted request of no thread");
+                };
+                (*t.as_ptr()).waits = None;
+                syscall::set_result(t, Err(Error::PeerClosed));
+                k.s.wake(t);
+                heads += 1;
+            }
+            Some((heads, !accepted(process, k.s).is_empty()))
+        }
+    });
+    let Some((heads, left)) = taken else {
+        return true;
+    };
+    crate::testpoint::heads_taken(level, heads);
+    !left
 }
 
 /// The stage Children, after the parent went back to the head of its level

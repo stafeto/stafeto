@@ -1760,9 +1760,11 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
         process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (1, Some(level)),
         "the last reference did more than queue the process at the level of its cause",
     )?;
-    // The stage Children, with no child, then the stage Handles.
-    cleanup::portion();
-    cleanup::portion();
+    // The stages Replies and Children, with no request and no child, then
+    // the stage Handles.
+    for _ in 0..3 {
+        cleanup::portion();
+    }
     check(
         process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (2, Some(level)),
         "a portion did not queue the next process at its own level",
@@ -1789,14 +1791,14 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
     )
 }
 
-/// A process ends and goes in stages, one step a portion, and each
-/// portion goes on where the one before stopped (spec 7.7): with no
-/// children, the stage Children takes one portion; the table a chunk a
-/// portion; the space first loses TTBR0 and its ASID, and no call reaches
-/// its tables from then on, then a table a portion; the buffers of the
-/// threads the end stopped in one portion, the process's frames and the
-/// stage Quota in one more each. Then the shell stays for the test's
-/// reference.
+/// A process ends and goes in stages, one step a portion, and each portion
+/// goes on where the one before stopped (spec 7.7): with no request taken
+/// and no children, the stages Replies and Children take a portion each;
+/// the table a chunk a portion; the space first loses TTBR0 and its ASID,
+/// and no call reaches its tables from then on, then a table a portion; the
+/// buffers of the threads the end stopped in one portion, the process's
+/// frames and the stage Quota in one more each. Then the shell stays for
+/// the test's reference.
 fn teardown_resumes_where_it_stopped(boot: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 9;
     cleanup::drain();
@@ -1868,8 +1870,13 @@ fn check_stages(
     )?;
     check(
         (cleanup::len(), cleanup::top()) == (1, Some(level))
-            && process::progress(p) == (Stage::Children, 3 * CHUNK as u32, 0),
+            && process::progress(p) == (Stage::Replies, 3 * CHUNK as u32, 0),
         "the end did more than queue the process",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p) == (Stage::Children, 3 * CHUNK as u32, 0),
+        "the stage Replies of a process that took no request took more than a portion",
     )?;
     cleanup::portion();
     check(

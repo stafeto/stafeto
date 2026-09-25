@@ -83,6 +83,14 @@ unsafe extern "C" {
     static el0_serve_after_notice: u8;
     static el0_reply_then_notify: u8;
     static el0_raise_then_send: u8;
+    static el0_send_then_exit: u8;
+    static el0_take_then_exit: u8;
+    static el0_take_then_wait: u8;
+    static el0_take_notify_reply: u8;
+    static el0_reply_after_notice: u8;
+    static el0_check_after_notice: u8;
+    static el0_kill_close_notify: u8;
+    static el0_raise_then_kill: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -147,8 +155,9 @@ const BIG_BASE: usize = 1 << 30;
 const BIG_PAGES: usize = 512;
 /// The bits of the notifications of the channel tests.
 const BITS: u64 = 0b1010;
-/// Threads that wait in one channel in `closing_a_channel_wakes_waiters_in_portions`:
-/// two processes full of them.
+/// Threads that wait in one channel in `closing_a_channel_wakes_waiters_in_portions`,
+/// or send to one service in `replies_stage_goes_in_portions`: two
+/// processes full of them.
 const CROWD: usize = 2 * MAX_THREADS as usize;
 /// The ceiling of the waiters' process in `set_priority_moves_a_waiting_thread`.
 const CAPPED: u8 = PRIORITY + 3;
@@ -368,6 +377,71 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_capped_boost,
     },
     El0Test {
+        name: "client_of_a_dead_server_gets_peer_closed",
+        start: start_dead_server,
+        done: done_dead_server,
+    },
+    El0Test {
+        name: "replies_stage_goes_in_portions",
+        start: start_replies_portions,
+        done: done_replies_portions,
+    },
+    El0Test {
+        name: "replies_stage_runs_at_the_top_client",
+        start: start_replies_level,
+        done: done_replies_level,
+    },
+    El0Test {
+        name: "dead_client_frees_its_memory_before_the_reply",
+        start: start_dead_client_memory,
+        done: done_dead_client_memory,
+    },
+    El0Test {
+        name: "reply_to_a_dead_client_is_peer_closed",
+        start: start_dead_client,
+        done: done_dead_client,
+    },
+    El0Test {
+        name: "kill_takes_a_sender_off_the_channel",
+        start: start_kill_sender,
+        done: done_kill_sender,
+    },
+    El0Test {
+        name: "kill_in_every_wait_state",
+        start: start_kill_states,
+        done: done_kill_states,
+    },
+    El0Test {
+        name: "close_portion_keeps_to_one_level",
+        start: start_level_portions,
+        done: done_level_portions,
+    },
+    El0Test {
+        name: "raised_waiter_raises_the_close",
+        start: start_raised_close,
+        done: done_raised_close,
+    },
+    El0Test {
+        name: "raised_client_raises_the_replies",
+        start: start_raised_replies,
+        done: done_raised_replies,
+    },
+    El0Test {
+        name: "close_keeps_a_higher_cause",
+        start: start_close_above,
+        done: done_close_above,
+    },
+    El0Test {
+        name: "same_priority_keeps_the_close_in_place",
+        start: start_close_in_place,
+        done: done_close_in_place,
+    },
+    El0Test {
+        name: "a_call_cycle_ends_with_the_kill",
+        start: start_call_cycle,
+        done: done_call_cycle,
+    },
+    El0Test {
         name: "quantum_ends_with_a_far_timer_set",
         start: start_far_timer,
         done: done_far_timer,
@@ -525,6 +599,10 @@ struct Fixture {
     live_threads: usize,
     /// Timers the test holds besides its alarm; the teardown lets them go.
     timers: [Option<NonNull<Timer>>; BATCHED],
+    /// Portions of the stage Close of a channel or of the stage Replies of
+    /// a process since the test began, the most heads one took, and the
+    /// levels they ran at, a bit each (`heads_taken`).
+    taken: (u32, usize, u64),
 }
 
 // SAFETY: the fixture's objects are reached only under the kernel's rules
@@ -565,6 +643,7 @@ impl Fixture {
             crowd: [None; CROWD],
             live_threads: 0,
             timers: [None; BATCHED],
+            taken: (0, 0, 0),
         }
     }
 
@@ -781,6 +860,15 @@ pub fn portion_done() {
     }
     timer::arm(now);
     while !arch::irq_pending() {}
+}
+
+/// After a portion of the stage Close or Replies (testpoint::heads_taken):
+/// the test counts it, with the most heads one took and the level it ran
+/// at.
+pub fn heads_taken(level: u8, heads: usize) {
+    let mut f = FIXTURE.lock();
+    let (portions, most, levels) = f.taken;
+    f.taken = (portions + 1, most.max(heads), levels | 1 << level);
 }
 
 /// A thread's `svc #SVC_DONE`: the test judges it. Once every thread of
@@ -2706,11 +2794,22 @@ fn done_requeue(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// Threads of two processes wait in receive on one channel, a process
 /// full of them each, each process with a handle with RECEIVE. The closer
 /// below them closes both handles, and the last one closes the channel
-/// (spec 6.8): the stage Close wakes the waiters with PEER_CLOSED, 64 a
-/// portion, in two portions at the closer's level (spec 7.7); an interrupt
-/// comes after every portion, and none begins while one is pending. The
-/// judge below the closer finds every waiter ended with PEER_CLOSED.
+/// (spec 6.8): the stage Close wakes the waiters with PEER_CLOSED, 32 a
+/// portion, in four portions at their level, above the closer's (spec
+/// 7.7); an interrupt comes after every portion, and none begins while one
+/// is pending. The judge below the closer finds every waiter ended with
+/// PEER_CLOSED.
 fn start_close_portions(f: &mut Fixture) -> Result<(), &'static str> {
+    let n = MAX_THREADS as usize;
+    close_crowd(f, [(PRIORITY, n), (PRIORITY, n)])
+}
+
+/// The closer in slot 0 and the judge in slot 1, below it, of a process of
+/// their own, and a channel the crowd waits in: a process in slot 1 and
+/// one in slot 2 with a handle with RECEIVE each, and threads of the level
+/// and number `crowds` gives for each. An interrupt comes after every
+/// portion.
+fn close_crowd(f: &mut Fixture, crowds: [(u8, usize); 2]) -> Result<(), &'static str> {
     let own = new_process(f, 0)?;
     let entry = user_address(&raw const el0_done_at_once);
     for (slot, priority) in [(0, JUDGE), (1, JUDGE - 1)] {
@@ -2718,29 +2817,49 @@ fn start_close_portions(f: &mut Fixture) -> Result<(), &'static str> {
         f.threads[slot] = Some(t);
     }
     let c = channel::create(own, PRIORITY).map_err(|_| "no channel")?;
-    let made = (1..=2).try_for_each(|slot| crowd_of(f, slot, c));
+    let made = (1..=2).try_for_each(|slot| {
+        let (priority, n) = crowds[slot - 1];
+        crowd_of(f, slot, c, Rights::RECEIVE, priority, n)
+    });
     // SAFETY: the reference `create` handed out goes; the handles that went
     // in hold the channel.
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
     made?;
-    let _ = channel::take_close_portions();
     cleanup::take_late();
     f.interrupt_every = Some(1);
     Ok(())
 }
 
-/// A process in slot `slot` with a handle with RECEIVE to `c`, which the
-/// test keeps, and abi::MAX_THREADS threads of it, started, that will wait
-/// in receive on the channel, in the crowd.
-fn crowd_of(f: &mut Fixture, slot: usize, c: NonNull<Channel>) -> Result<(), &'static str> {
+/// A process in slot `slot` with a handle with `rights` to `c`, which the
+/// test keeps, and `n` threads of it at `priority`, started, in the crowd
+/// after those there: with RECEIVE they wait in receive on the channel,
+/// with SEND they send a request of REQUEST_LEN bytes through it; they
+/// exit once the call comes back.
+fn crowd_of(
+    f: &mut Fixture,
+    slot: usize,
+    c: NonNull<Channel>,
+    rights: Rights,
+    priority: u8,
+    n: usize,
+) -> Result<(), &'static str> {
     let p = new_process(f, slot)?;
-    let h = process::insert_handle(p, Object::Channel(c), Rights::RECEIVE)
+    let h = process::insert_handle(p, Object::Channel(c), rights)
         .map_err(|_| "a handle did not go in")?;
     f.handles[slot - 1] = Some((p, h));
-    let entry = user_address(&raw const el0_receive_then_exit);
-    let n = MAX_THREADS as usize;
-    for i in (slot - 1) * n..slot * n {
-        let t = thread::create(p, entry, 0, h.0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+    let (entry, args) = if rights.contains(Rights::RECEIVE) {
+        (&raw const el0_receive_then_exit, [h.0, 0, 0])
+    } else {
+        (
+            &raw const el0_send_then_exit,
+            [h.0, REQUEST_LEN, REQUEST_WORD],
+        )
+    };
+    let first = f.crowd.iter().position(Option::is_none).unwrap_or(CROWD);
+    for i in first..first + n {
+        let t = thread::create(p, user_address(entry), 0, 0, priority, FIFO)
+            .map_err(|_| "no thread")?;
+        set_args(t, &args);
         f.crowd[i] = Some(t);
         thread::start(t).map_err(|_| "a thread did not start")?;
     }
@@ -2748,12 +2867,30 @@ fn crowd_of(f: &mut Fixture, slot: usize, c: NonNull<Channel>) -> Result<(), &'s
 }
 
 fn done_close_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    closed_crowd(f, t, (4, 32, 1 << PRIORITY))
+}
+
+/// The closer in slot 0 closes the crowd's handles, the last ones with
+/// RECEIVE; the judge in slot 1 finds every thread of the crowd ended with
+/// PEER_CLOSED, `taken` as the portions of the stage Close, and an
+/// interrupt after each of them.
+fn closed_crowd(f: &Fixture, t: &Thread, taken: (u32, usize, u64)) -> Result<(), &'static str> {
+    closed_crowd_at(f, t, JUDGE, taken)
+}
+
+/// `closed_crowd` with the handles closed as a thread at `cause` would.
+fn closed_crowd_at(
+    f: &Fixture,
+    t: &Thread,
+    cause: u8,
+    taken: (u32, usize, u64),
+) -> Result<(), &'static str> {
     // SAFETY: the test holds a reference to each thread of the crowd.
     let crowd = || f.crowd.iter().flatten().map(|w| unsafe { w.as_ref() });
     if f.slot(t) == 0 {
         let waiting = crowd().all(|w| w.sched.state() == State::Waiting);
         for &(p, h) in f.handles.iter().flatten() {
-            process::close_handle(p, h, JUDGE).map_err(|_| "a handle did not close")?;
+            process::close_handle(p, h, cause).map_err(|_| "a handle did not close")?;
         }
         return check(waiting, "a thread of the crowd did not wait");
     }
@@ -2762,11 +2899,11 @@ fn done_close_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "a thread that waited did not end with PEER_CLOSED",
     )?;
     check(
-        channel::take_close_portions() == (2, 64, 1 << JUDGE),
-        "the stage Close did not wake the waiters 64 a portion at the closer's level",
+        f.taken == taken,
+        "the stage Close did not wake the waiters 32 of one level a portion at the level expected",
     )?;
     check(
-        !cleanup::take_late() && f.interrupts >= 2,
+        !cleanup::take_late() && f.interrupts >= taken.0,
         "a portion began while an interrupt was pending",
     )
 }
@@ -3092,5 +3229,640 @@ fn done_capped_boost(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
             slot_thread(f, 1).sched.state() == State::Waiting,
             "the service answered before the ready thread above its ceiling ran",
         ),
+    }
+}
+
+// The departure of a side (spec 6.8, 7.7): the stage Replies of a service
+// that ends wakes the clients of the requests it took with PEER_CLOSED, at
+// the level of the top one; a client that ends leaves the queue its
+// request stands in at once, and a reply to it is PEER_CLOSED; the stage
+// Close takes heads of one level a portion, at the level of the top
+// waiter.
+
+/// A channel that `p` pays for, with a handle with `rights` in its table:
+/// the handle's value.
+fn own_channel(p: NonNull<Process>, rights: Rights) -> Result<u64, &'static str> {
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), rights);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    h
+}
+
+/// A channel that `p` pays for, with a handle with `mine` in `p`'s table
+/// and one with `theirs` in `q`'s: the values of the two handles.
+fn shared_channel(
+    p: NonNull<Process>,
+    mine: Rights,
+    q: NonNull<Process>,
+    theirs: Rights,
+) -> Result<[u64; 2], &'static str> {
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let handles = [
+        give(p, Object::Channel(c), mine),
+        give(q, Object::Channel(c), theirs),
+    ];
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let [a, b] = handles;
+    Ok([a?, b?])
+}
+
+/// The exit of `p` goes as a notification with EXIT_LABEL at PRIORITY into
+/// a new channel of `q` (spec 7.9): the value of the handle with RECEIVE
+/// to it in `q`'s table.
+fn exit_channel_of(q: NonNull<Process>, p: NonNull<Process>) -> Result<u64, &'static str> {
+    let c = channel::create(q, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(q, Object::Channel(c), Rights::RECEIVE);
+    let source = channel::add_source(c);
+    if source.is_ok() {
+        process::set_exit(p, c, EXIT_LABEL, PRIORITY);
+    }
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel, and so does the exit of `p`.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    source.map_err(|_| "no slot for the exit")?;
+    h
+}
+
+/// Spec 15.2 (refusals): a service takes the request of a client of
+/// another process and ends its process without a reply (spec 6.8): the
+/// stage Replies of the teardown wakes the client with PEER_CLOSED in x0
+/// alone, before the judge below both runs.
+fn start_dead_server(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_take_then_exit, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no priority")?;
+    judge(f, 2)?;
+    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    set_args(server, &[requests, 1]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    f.ends[0] = true;
+    Ok(())
+}
+
+fn done_dead_server(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        1 => check(
+            t.regs.x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD]
+                && state(f, 0) == ProcessState::Exited { code: 0 },
+            "the client of the service that ended did not get PEER_CLOSED in x0 alone",
+        ),
+        2 => check(
+            f.passed[1],
+            "the client of the service that ended still waits",
+        ),
+        _ => Err("the service came back from process_exit"),
+    }
+}
+
+/// A service takes the requests of two processes of clients, 127 of them,
+/// and ends its process without a reply: the stage Replies wakes them with
+/// PEER_CLOSED, 32 a portion, in four portions at the service's level
+/// (spec 6.8, 7.7); an interrupt comes after every portion, and none
+/// begins while one is pending. The judge below, the last thread of the
+/// second process, finds every client ended with PEER_CLOSED.
+fn start_replies_portions(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_take_then_exit, 0)?;
+    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no priority")?;
+    let p = f.processes[0].expect("the service's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let requests = give(p, Object::Channel(c), Rights::RECEIVE);
+    let n = MAX_THREADS as usize;
+    let made = [(1, n), (2, n - 1)]
+        .into_iter()
+        .try_for_each(|(slot, n)| crowd_of(f, slot, c, Rights::SEND, PRIORITY, n));
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    made?;
+    let q = f.processes[2].expect("the second process of clients");
+    let entry = user_address(&raw const el0_done_at_once);
+    let judge = thread::create(q, entry, 0, 0, JUDGE, FIFO).map_err(|_| "no judge")?;
+    f.threads[1] = Some(judge);
+    set_args(server, &[requests?, CROWD as u64 - 1]);
+    f.ends[0] = true;
+    cleanup::take_late();
+    f.interrupt_every = Some(1);
+    Ok(())
+}
+
+fn done_replies_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 1, "the service came back from process_exit")?;
+    // SAFETY: the test holds a reference to each thread of the crowd.
+    let mut crowd = f.crowd.iter().flatten().map(|w| unsafe { w.as_ref() });
+    check(
+        crowd.all(|w| w.sched.state() == State::Dead && w.regs.x[0] == Error::PeerClosed.code()),
+        "a client of the service that ended did not end with PEER_CLOSED",
+    )?;
+    check(
+        f.taken == (4, 32, 1 << (PRIORITY + 1)),
+        "the stage Replies did not wake the clients 32 a portion at the service's level",
+    )?;
+    check(
+        !cleanup::take_late() && f.interrupts >= 4,
+        "a portion began while an interrupt was pending",
+    )
+}
+
+/// The stage Replies runs at the level of its top client (spec 7.7), and
+/// a client that moved in the queue of accepted requests wakes at its new
+/// level (spec 6.3): a service at 13 takes the requests of two clients at
+/// 12 and waits in receive on a channel where nothing comes. A killer at 5
+/// raises one client to 40 and ends the service's process: the stage
+/// Replies wakes the raised client at 40, then the other at 12, a portion
+/// each.
+fn start_replies_level(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_take_then_wait, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    let killer = spawn(f, 2, &raw const el0_raise_then_kill, 0)?;
+    for (t, priority) in [(server, 13), (client, 12), (killer, JUDGE)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    let nothing = own_channel(p, Rights::RECEIVE)?;
+    let entry = user_address(&raw const el0_send_then_exit);
+    let raised = thread::create(q, entry, 0, 0, 12, FIFO).map_err(|_| "no thread")?;
+    set_args(raised, &[send, REQUEST_LEN, REQUEST_WORD]);
+    let handles = [
+        give(r, Object::Thread(raised), Rights::MANAGE),
+        give(r, Object::Process(p), Rights::MANAGE),
+    ];
+    let started = thread::start(raised);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the thread, and the kernel's holds it once started.
+    unsafe { thread::release(raised, CAUSE) };
+    started.map_err(|_| "the raised client did not start")?;
+    let [raise, target] = handles;
+    set_args(server, &[requests, 2, nothing]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    set_args(killer, &[raise?, 40, target?]);
+    f.ends[0] = true;
+    Ok(())
+}
+
+fn done_replies_level(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        1 => check(
+            x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD]
+                && f.taken == (2, 1, 1 << 40 | 1 << 12),
+            "the stage Replies did not wake the raised client at 40 and then the other at 12",
+        ),
+        2 => check(
+            x[19] == 0 && x[0] == 0,
+            "thread_set_priority or process_kill failed",
+        ),
+        _ => Err("the service came back from its receive"),
+    }
+}
+
+/// A reply to a client that ended while it waited for it is PEER_CLOSED,
+/// and still ends the boost by that client (spec 6.6, 6.8): a service at
+/// 10 takes the request of a client at 30 and works at 30; it wakes a
+/// killer at 40, which ends the client's process. The service answers
+/// twice: PEER_CLOSED both times, since the reply leaves the mark of the
+/// dead client (Table::mark_dead), and it works at 10 again.
+fn start_dead_client(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_take_notify_reply, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    let killer = spawn(f, 2, &raw const el0_alarm_then, 0)?;
+    for (t, priority) in [(client, 30), (killer, 40)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    let [wake, notify] = shared_channel(r, Rights::RECEIVE, p, Rights::NOTIFY)?;
+    let target = give(r, Object::Process(q), Rights::MANAGE)?;
+    let kill = user_address(&raw const el0_kill) as u64;
+    set_args(server, &[requests, notify, BITS]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    set_args(killer, &[wake, 0, kill, target]);
+    f.ends[1] = true;
+    Ok(())
+}
+
+fn done_dead_client(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => {
+            check(
+                x[20] == Error::PeerClosed.code() && x[0] == Error::PeerClosed.code(),
+                "a reply to the client that ended was not PEER_CLOSED, twice",
+            )?;
+            check(
+                t.sched.priority() == PRIORITY,
+                "the reply to the client that ended did not end its boost",
+            )
+        }
+        1 => Err("the client that ended came back from send"),
+        _ => check(x[23] == 0 && x[0] == 0, "receive or process_kill failed"),
+    }
+}
+
+/// A client that ends while it waits for its reply gives its memory back
+/// before the service answers (spec 6.8, 7.5): its request holds no
+/// reference to it, and the end takes the request out of the service's
+/// queue at once. A service at 13 takes the request of a thread at 12 of a
+/// child of the killer's process, which nothing but the kernel holds, and
+/// waits for a notice; the killer at 11 ends the child, closes its handle
+/// to it and notifies the service. When the service answers, PEER_CLOSED,
+/// the client's thread went back to its pool, the child's quota came back
+/// to the killer's process, and the service's process holds no accepted
+/// request.
+fn start_dead_client_memory(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_reply_after_notice, 0)?;
+    let killer = spawn(f, 1, &raw const el0_kill_close_notify, 0)?;
+    for (t, priority) in [(server, 13), (killer, 11)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, r] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let child =
+        process::create_child(r, CHILD_QUOTA, HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    // The fixture holds the child only while its programs are mapped: then
+    // the killer's handle holds it.
+    let mapped = with_programs(f, 2, child);
+    f.processes[2] = None;
+    let made = mapped.and_then(|child| client_of(p, r, child));
+    // SAFETY: the test's reference goes; the killer's handle, if it went
+    // in, holds the child.
+    unsafe { process::release(child, CAUSE) };
+    let [requests, notices, target, notify] = made?;
+    set_args(server, &[requests, notices]);
+    set_args(killer, &[target, notify, BITS]);
+    f.kept = [process::quota(r).used(), 0];
+    f.live_threads = thread::in_use();
+    Ok(())
+}
+
+/// A thread of `child` at 12 that sends to the service of `p` and that only
+/// the kernel holds, the service's channels and a handle to the child in
+/// `r`'s table: the values of the service's handles to its requests and
+/// its notices, of the handle to the child and of `r`'s handle to the
+/// notices.
+fn client_of(
+    p: NonNull<Process>,
+    r: NonNull<Process>,
+    child: NonNull<Process>,
+) -> Result<[u64; 4], &'static str> {
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, child, Rights::SEND)?;
+    let [notices, notify] = shared_channel(p, Rights::RECEIVE, r, Rights::NOTIFY)?;
+    let entry = user_address(&raw const el0_send);
+    let client = thread::create(child, entry, 0, 0, 12, FIFO).map_err(|_| "no thread")?;
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    let started = thread::start(client);
+    // SAFETY: the reference `create` handed out goes; the kernel's holds
+    // the thread once it started.
+    unsafe { thread::release(client, CAUSE) };
+    started.map_err(|_| "the client did not start")?;
+    let target = give(r, Object::Process(child), Rights::MANAGE)?;
+    Ok([requests, notices, target, notify])
+}
+
+fn done_dead_client_memory(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) == 1 {
+        return check(
+            x[19] == 0 && x[20] == 0 && x[0] == 0,
+            "process_kill, handle_close or notify failed",
+        );
+    }
+    check(
+        x[20] == Error::PeerClosed.code() && x[0] == Error::PeerClosed.code(),
+        "a reply to the client that ended was not PEER_CLOSED",
+    )?;
+    let r = f.processes[1].expect("the killer's process");
+    check(
+        thread::in_use() == f.live_threads - 1
+            && process::quota(r).used() == f.kept[0] - CHILD_QUOTA,
+        "the memory of the client that ended waited for the reply",
+    )?;
+    let p = f.processes[0].expect("the service's process");
+    check(
+        !process::has_accepted(p),
+        "the request of the client that ended stayed in the service's queue",
+    )
+}
+
+/// A thread waits in send, its request in the queue of a channel. A killer
+/// below it, which holds the channel with RECEIVE, kills its process,
+/// notifies the channel and takes the notification back at once: the kill
+/// took the sender off the channel (spec 7.7) before the sender went, so
+/// the queue holds nothing of it. Nothing but the kernel holds the
+/// sender, whose place is poisoned once it went (test builds).
+fn start_kill_sender(f: &mut Fixture) -> Result<(), &'static str> {
+    let p = new_process(f, 0)?;
+    let killer = spawn(f, 1, &raw const el0_kill_notify_receive, 0)?;
+    sched::set_priority(killer, JUDGE, FIFO).map_err(|_| "no killer")?;
+    let q = f.processes[1].expect("the killer's process");
+    let [own, send] = shared_channel(q, Rights::NOTIFY | Rights::RECEIVE, p, Rights::SEND)?;
+    let target = give(q, Object::Process(p), Rights::MANAGE)?;
+    let entry = user_address(&raw const el0_send);
+    let sender = thread::create(p, entry, 0, 0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+    set_args(sender, &[send, REQUEST_LEN, REQUEST_WORD]);
+    let started = thread::start(sender);
+    // SAFETY: the reference `create` handed out goes; the kernel's holds
+    // the thread once it started.
+    unsafe { thread::release(sender, CAUSE) };
+    started.map_err(|_| "the sender did not start")?;
+    set_args(killer, &[target, own, BITS]);
+    f.live_threads = thread::in_use();
+    Ok(())
+}
+
+fn done_kill_sender(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(x[19] == 0 && x[20] == 0, "process_kill or notify failed")?;
+    check(
+        x[0] == 0 && x[1..12] == notice(BITS),
+        "the notification did not stay in the channel for the killer",
+    )?;
+    check(
+        thread::in_use() == f.live_threads - 1,
+        "the killed sender did not go",
+    )
+}
+
+/// The kill of a process ends each of its threads whatever it does (spec
+/// 7.7): one waits in receive, one's request waits in a channel's queue,
+/// one's request was taken and it waits for the reply, the one that runs
+/// kills its own process, one is ready below it and one never started.
+/// Only the kernel holds the first four, and their places are poisoned
+/// once they went (test builds). The service of the taken request hears of
+/// the end through its exit channel: its reply is PEER_CLOSED, its queue of
+/// accepted requests is empty, the queue of the sender's channel too, and a
+/// notification of the receiver's channel stays there for the service; the
+/// ready thread never ran.
+fn start_kill_states(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_check_after_notice, 0)?;
+    sched::set_priority(server, 16, FIFO).map_err(|_| "no priority")?;
+    let q = f.processes[0].expect("the service's process");
+    let p = new_process(f, 1)?;
+    let [requests, send] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
+    let [queue, queued] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
+    let [notified, waiting] =
+        shared_channel(q, Rights::NOTIFY | Rights::RECEIVE, p, Rights::RECEIVE)?;
+    let exits = exit_channel_of(q, p)?;
+    let own = give(p, Object::Process(p), Rights::MANAGE)?;
+    let threads = [
+        (&raw const el0_receive, 15, [waiting, 0, 0]),
+        (&raw const el0_send, 14, [queued, REQUEST_LEN, REQUEST_WORD]),
+        (&raw const el0_send, 13, [send, REQUEST_LEN, REQUEST_WORD]),
+        (&raw const el0_kill, 12, [own, 0, 0]),
+    ];
+    for (entry, priority, args) in threads {
+        let t = thread::create(p, user_address(entry), 0, 0, priority, FIFO)
+            .map_err(|_| "no thread")?;
+        set_args(t, &args);
+        let started = thread::start(t);
+        // SAFETY: the reference `create` handed out goes; the kernel's
+        // holds the thread once it started.
+        unsafe { thread::release(t, CAUSE) };
+        started.map_err(|_| "a thread did not start")?;
+    }
+    // The ready thread and the one that never starts, which the test holds.
+    for i in 0..2 {
+        let entry = user_address(&raw const el0_mark);
+        let t = thread::create(p, entry, 0, 0, 11, FIFO).map_err(|_| "no thread")?;
+        f.crowd[i] = Some(t);
+    }
+    thread::start(f.crowd[0].expect("the ready thread")).map_err(|_| "no ready thread")?;
+    set_args(server, &[requests, exits, queue, notified, BITS]);
+    Ok(())
+}
+
+fn done_kill_states(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(
+        x[20] == Error::PeerClosed.code(),
+        "the reply to the killed client was not PEER_CLOSED",
+    )?;
+    check(
+        x[21] == Error::WouldBlock.code(),
+        "the request of the killed sender stayed in its channel",
+    )?;
+    check(
+        x[22] == 0 && x[0] == 0 && x[1..12] == notice(BITS),
+        "the notification did not stay in the killed receiver's channel",
+    )?;
+    let q = f.processes[0].expect("the service's process");
+    check(
+        !process::has_accepted(q),
+        "the request of the killed client stayed in the service's queue",
+    )?;
+    // SAFETY: the test holds a reference to the two threads.
+    let [ready, stopped] = [0, 1].map(|i| unsafe { f.crowd[i].expect("a thread").as_ref() });
+    check(
+        ready.sched.state() == State::Dead
+            && stopped.sched.state() == State::Dead
+            && ready.regs.elr == user_address(&raw const el0_mark) as u64,
+        "the ready thread ran, or a thread outlived the kill",
+    )
+}
+
+/// A portion of the stage Close takes heads of one level (spec 7.7): 48
+/// threads at 40 and 48 at 10 wait in receive on one channel, and the
+/// closer below them closes its last handles with RECEIVE. The stage runs
+/// at 40 while threads there wait, 32 and then 16 heads, and then at 10,
+/// 32 and 16 more: four portions; a portion that took heads of both levels
+/// would leave three.
+fn start_level_portions(f: &mut Fixture) -> Result<(), &'static str> {
+    close_crowd(f, [(40, 48), (PRIORITY, 48)])
+}
+
+fn done_level_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    closed_crowd(f, t, (4, 32, 1 << 40 | 1 << PRIORITY))
+}
+
+/// A thread whose priority rises while the channel it waits in closes
+/// raises the stage Close to its new level (spec 7.7): a thread at 10
+/// waits in receive. The closer at 5 raises a thread at 1 to 15, closes the
+/// waiter's handle, the last with RECEIVE, which queues the stage Close at
+/// 10, and raises the waiter to 20. The stage runs at 20, and the waiter
+/// wakes with PEER_CLOSED before the thread at 15 runs.
+fn start_raised_close(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    sched_thread(f, 0, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    let waiter = sched_thread(f, 1, &raw const el0_receive, PRIORITY, FIFO)?;
+    sched_thread(f, 2, &raw const el0_done_at_once, 1, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    let h = own_channel(p, Rights::RECEIVE)?;
+    f.handles[0] = Some((p, Handle(h)));
+    set_args(waiter, &[h, 0]);
+    Ok(())
+}
+
+fn done_raised_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let [waiter, ready] = [1, 2].map(|i| f.threads[i].expect("a thread of the test"));
+    match f.slot(t) {
+        0 => {
+            let (p, h) = f.handles[0].expect("the waiter's handle");
+            sched::set_priority(ready, 15, FIFO).map_err(|_| "no priority")?;
+            process::close_handle(p, h, JUDGE).map_err(|_| "the handle did not close")?;
+            sched::set_priority(waiter, 20, FIFO).map_err(|_| "no priority")
+        }
+        1 => check(
+            t.regs.x[0] == Error::PeerClosed.code()
+                && f.taken == (1, 1, 1 << 20)
+                && slot_thread(f, 2).sched.state() == State::Ready,
+            "the stage Close did not follow the raised waiter to 20",
+        ),
+        // SAFETY: the test holds a reference to the waiter.
+        _ => check(
+            unsafe { waiter.as_ref() }.sched.state() == State::Dead,
+            "the ready thread at 15 ran before the raised waiter",
+        ),
+    }
+}
+
+/// A client whose priority rises while it waits for the reply of a service
+/// whose process ended raises the stage Replies to its new level (spec
+/// 7.7): a service at 13 takes the request of a client at 12 of another
+/// process and waits in receive on a channel where nothing comes. The
+/// judge at 5 raises a thread at 1 to 15, ends the service's process, whose
+/// stage Replies queues at 12, and raises the client to 20. The stage runs
+/// at 20, and the client wakes with PEER_CLOSED before the thread at 15
+/// runs.
+fn start_raised_replies(f: &mut Fixture) -> Result<(), &'static str> {
+    let judge = spawn(f, 0, &raw const el0_done_at_once, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    for (t, priority) in [(judge, JUDGE), (client, 12)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [r, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let entry = user_address(&raw const el0_done_at_once);
+    let ready = thread::create(r, entry, 0, 0, 1, FIFO).map_err(|_| "no thread")?;
+    f.threads[2] = Some(ready);
+    let p = new_process(f, 2)?;
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    let nothing = own_channel(p, Rights::RECEIVE)?;
+    let entry = user_address(&raw const el0_take_then_wait);
+    let server = thread::create(p, entry, 0, 0, 13, FIFO).map_err(|_| "no service")?;
+    set_args(server, &[requests, 1, nothing]);
+    let started = thread::start(server);
+    // SAFETY: the reference `create` handed out goes; the kernel's holds
+    // the service once it started.
+    unsafe { thread::release(server, CAUSE) };
+    started.map_err(|_| "the service did not start")?;
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    Ok(())
+}
+
+fn done_raised_replies(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let [client, ready] = [1, 2].map(|i| f.threads[i].expect("a thread of the test"));
+    match f.slot(t) {
+        0 => {
+            let p = f.processes[2].expect("the service's process");
+            sched::set_priority(ready, 15, FIFO).map_err(|_| "no priority")?;
+            // SAFETY: the test holds a reference to the process.
+            let ended = unsafe { process::end(p, ProcessState::Killed, JUDGE) };
+            check(ended, "the service's process did not end")?;
+            sched::set_priority(client, 20, FIFO).map_err(|_| "no priority")
+        }
+        1 => check(
+            t.regs.x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD]
+                && f.taken == (1, 1, 1 << 20)
+                && slot_thread(f, 2).sched.state() == State::Ready,
+            "the stage Replies did not follow the raised client to 20",
+        ),
+        // SAFETY: the test holds a reference to the client.
+        _ => check(
+            unsafe { client.as_ref() }.sched.state() == State::Dead,
+            "the ready thread at 15 ran before the raised client",
+        ),
+    }
+}
+
+/// After a portion, the stage Close goes back to the head of the higher of
+/// its cause and the top level of its queue (spec 7.7): 64 threads at 10
+/// wait in receive on one channel, and the closer closes its last handles
+/// with RECEIVE as a thread at 40 would. Both portions run at 40, 32 heads
+/// each; a stage that went back at its waiters' level would run the second
+/// at 10.
+fn start_close_above(f: &mut Fixture) -> Result<(), &'static str> {
+    close_crowd(f, [(PRIORITY, 32), (PRIORITY, 32)])
+}
+
+fn done_close_above(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    closed_crowd_at(f, t, 40, (2, 32, 1 << 40))
+}
+
+/// thread_set_priority that leaves a waiter at its level leaves the stage
+/// Close of its channel in its place in the cleanup queue (spec 7.7): a
+/// thread at 10 waits in receive on each of two channels. The closer at 5
+/// closes the first channel and then the second, whose stages Close queue
+/// at 10 in that order, and sets the second waiter's priority to 10 again.
+/// The first channel's portion still runs first: its waiter wakes first
+/// and runs before the other.
+fn start_close_in_place(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    sched_thread(f, 0, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    for slot in 1..3 {
+        let waiter = sched_thread(f, slot, &raw const el0_receive, PRIORITY, FIFO)?;
+        let h = own_channel(p, Rights::RECEIVE)?;
+        f.handles[slot - 1] = Some((p, Handle(h)));
+        set_args(waiter, &[h, 0]);
+    }
+    Ok(())
+}
+
+fn done_close_in_place(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => {
+            for &(p, h) in f.handles.iter().flatten() {
+                process::close_handle(p, h, JUDGE).map_err(|_| "a handle did not close")?;
+            }
+            let second = f.threads[2].expect("the second waiter");
+            sched::set_priority(second, PRIORITY, FIFO).map_err(|_| "no priority")
+        }
+        1 => check(
+            t.regs.x[0] == Error::PeerClosed.code()
+                && slot_thread(f, 2).sched.state() == State::Ready,
+            "the stage Close of the second channel ran before the first",
+        ),
+        _ => check(
+            t.regs.x[0] == Error::PeerClosed.code()
+                && slot_thread(f, 1).sched.state() == State::Dead,
+            "the waiter of the second channel ran before the first",
+        ),
+    }
+}
+
+/// A cycle of requests ends only with a kill (spec 6.7): threads of two
+/// processes send to each other's channel and wait, nobody receiving. A
+/// killer below them ends the first process, whose channel closes with its
+/// handles: the other thread gets PEER_CLOSED.
+fn start_call_cycle(f: &mut Fixture) -> Result<(), &'static str> {
+    let first = spawn(f, 0, &raw const el0_send, 0)?;
+    let second = spawn(f, 1, &raw const el0_send, 0)?;
+    let killer = spawn(f, 2, &raw const el0_kill, 0)?;
+    for (t, priority) in [(first, 11), (second, 12), (killer, JUDGE)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let [_, to_p] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    let [_, to_q] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
+    let target = give(r, Object::Process(p), Rights::MANAGE)?;
+    set_args(first, &[to_q, REQUEST_LEN, REQUEST_WORD]);
+    set_args(second, &[to_p, REQUEST_LEN, REQUEST_WORD]);
+    set_args(killer, &[target]);
+    f.ends[0] = true;
+    Ok(())
+}
+
+fn done_call_cycle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        1 => check(
+            x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD],
+            "the thread whose peer was killed did not get PEER_CLOSED",
+        ),
+        2 => check(x[0] == 0, "process_kill failed"),
+        _ => Err("the killed thread came back from send"),
     }
 }

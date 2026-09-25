@@ -578,4 +578,153 @@ el0_raise_then_send:
     svc     #CALL_SEND
     svc     #SVC_DONE
 
+// The departure of a side (ktest::el0).
+
+// send(x0 channel, x1 description, x2-x9), then thread_exit: the reply
+// stays in the thread's registers for the test.
+.global el0_send_then_exit
+el0_send_then_exit:
+    svc     #CALL_SEND
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// A service that takes x1 requests, at least 1, with receive(x0 channel,
+// 0) and answers none; then process_exit(0).
+.global el0_take_then_exit
+el0_take_then_exit:
+    mov     x19, x0
+    mov     x20, x1
+1:  mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    subs    x20, x20, #1
+    b.ne    1b
+    mov     x0, #0
+    svc     #CALL_PROCESS_EXIT
+    svc     #SVC_DONE
+
+// As el0_take_then_exit, but instead of the exit receive(x2 another
+// channel, 0), where nothing comes: the service waits until it is killed.
+.global el0_take_then_wait
+el0_take_then_wait:
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x2
+1:  mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    subs    x20, x20, #1
+    b.ne    1b
+    mov     x0, x21
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
+// A service that outlives its client: receive(x0 channel, 0), the token
+// kept in x19; notify(x1 channel, x2 bits); then reply(x19, 0) twice. Ends
+// with the first reply's x0 in x20 and the second's in x0.
+.global el0_take_notify_reply
+el0_take_notify_reply:
+    mov     x21, x1
+    mov     x22, x2
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    mov     x19, x11
+    mov     x0, x21
+    mov     x1, x22
+    svc     #CALL_NOTIFY
+    mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_REPLY
+    mov     x20, x0
+    mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_REPLY
+    svc     #SVC_DONE
+
+// A service that holds a request until a notice: receive(x0 channel, 0),
+// the token kept in x19; receive(x1 another channel, 0); then reply(x19,
+// 0) twice. Ends with the first reply's x0 in x20 and the second's in x0.
+.global el0_reply_after_notice
+el0_reply_after_notice:
+    mov     x21, x1
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    mov     x19, x11
+    mov     x0, x21
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_REPLY
+    mov     x20, x0
+    mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_REPLY
+    svc     #SVC_DONE
+
+// A service that looks at its channels once the threads it knew are
+// gone: receive(x0 channel, 0), the token kept in x19; receive(x1 another
+// channel, 0), a notice; reply(x19, 0) into x20; receive(x2 a third
+// channel, NO_WAIT) into x21; notify(x3 a fourth channel, x4 bits) into
+// x22, and receive(x3, NO_WAIT), whose result stays in x0-x11.
+.global el0_check_after_notice
+el0_check_after_notice:
+    mov     x21, x1
+    mov     x22, x2
+    mov     x23, x3
+    mov     x24, x4
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    mov     x19, x11
+    mov     x0, x21
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_REPLY
+    mov     x20, x0
+    mov     x0, x22
+    mov     x1, #NO_WAIT
+    svc     #CALL_RECEIVE
+    mov     x21, x0
+    mov     x0, x23
+    mov     x1, x24
+    svc     #CALL_NOTIFY
+    mov     x22, x0
+    mov     x0, x23
+    mov     x1, #NO_WAIT
+    svc     #CALL_RECEIVE
+    svc     #SVC_DONE
+
+// process_kill(x0 process), handle_close(x0), then notify(x1 channel, x2
+// bits). Ends with the kill's x0 in x19, the close's in x20 and notify's
+// in x0.
+.global el0_kill_close_notify
+el0_kill_close_notify:
+    mov     x21, x0
+    mov     x22, x1
+    mov     x23, x2
+    svc     #CALL_PROCESS_KILL
+    mov     x19, x0
+    mov     x0, x21
+    svc     #CALL_HANDLE_CLOSE
+    mov     x20, x0
+    mov     x0, x22
+    mov     x1, x23
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 thread, x1 priority, FIFO), then process_kill(x2
+// process). Ends with the first call's x0 in x19 and the kill's in x0.
+.global el0_raise_then_kill
+el0_raise_then_kill:
+    mov     x21, x2
+    mov     x2, #FIFO
+    svc     #CALL_THREAD_SET_PRIORITY
+    mov     x19, x0
+    mov     x0, x21
+    svc     #CALL_PROCESS_KILL
+    svc     #SVC_DONE
+
 el0_programs_end:

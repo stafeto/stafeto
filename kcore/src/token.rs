@@ -9,11 +9,14 @@
 //! the number goes on from it. A token names one accepted request: the
 //! number in bits 0-15 and the count in bits 16-63, as a handle carries its
 //! generation (spec 5.1). So a token is given out at most once in the life
-//! of the system, and since the first count is 1, no token is 0. An entry
-//! whose count reached MAX_COUNT retires when its thread goes. Numbers
-//! never handed out come first, in order, then those given back, in the
-//! order they came back. Every operation takes constant time, nothing
-//! allocates, and a new table is all zeros (spec 7.8).
+//! of the system, and since the first count is 1, no token is 0. A thread
+//! that ends while it waits for a reply marks its entry: the token of that
+//! request gets PEER_CLOSED from then on, until the number goes to another
+//! thread (spec 6.8). An entry whose count reached MAX_COUNT retires when
+//! its thread goes. Numbers never handed out come first, in order, then
+//! those given back, in the order they came back. Every operation takes
+//! constant time, nothing allocates, and a new table is all zeros (spec
+//! 7.8).
 
 use abi::Error;
 use core::ptr::NonNull;
@@ -26,6 +29,9 @@ pub const MAX_COUNT: u64 = (1 << (u64::BITS - INDEX_BITS)) - 1;
 
 /// The bit of an entry's word that says it names a thread.
 const TAKEN: u64 = 1 << 63;
+/// The bit of an entry's word that says its thread ended while it waited
+/// for the reply to its last accepted request.
+const DEAD: u64 = 1 << 62;
 /// The end of the list of numbers given back, which names number i as
 /// i + 1.
 const NONE: usize = 0;
@@ -47,7 +53,7 @@ impl<T> Clone for Holder<T> {
 impl<T> Copy for Holder<T> {}
 
 /// An entry of the table, 16 bytes: its holder, and a word with the count
-/// in bits 0-47 and TAKEN.
+/// in bits 0-47, DEAD and TAKEN.
 struct Entry<T> {
     holder: Holder<T>,
     word: u64,
@@ -113,8 +119,8 @@ impl<T, const N: usize> Table<T, N> {
     }
 
     /// A number for `thread` (thread_create, spec 8, 11): the lowest never
-    /// handed out, or else the number given back first. LIMIT_REACHED when
-    /// no number is free.
+    /// handed out, or else the number given back first, whose mark of a
+    /// dead thread goes. LIMIT_REACHED when no number is free.
     pub fn alloc(&mut self, thread: NonNull<T>) -> Result<u16, Error> {
         let index = if self.used < N {
             self.used += 1;
@@ -136,7 +142,7 @@ impl<T, const N: usize> Table<T, N> {
         };
         let e = &mut self.entries[index];
         e.holder = Holder { thread };
-        e.word |= TAKEN;
+        e.word = e.word & MAX_COUNT | TAKEN;
         self.taken += 1;
         Ok(index as u16)
     }
@@ -149,8 +155,8 @@ impl<T, const N: usize> Table<T, N> {
     }
 
     /// Number `index` comes back as its thread goes (spec 7.7), with its
-    /// count: at the end of the list of numbers given back, or, with the
-    /// count at MAX_COUNT, retired for good.
+    /// count and its mark of a dead thread: at the end of the list of
+    /// numbers given back, or, with the count at MAX_COUNT, retired for good.
     pub fn free(&mut self, index: u16) {
         self.taken(index);
         let i = usize::from(index);
@@ -190,14 +196,31 @@ impl<T, const N: usize> Table<T, N> {
         (e.word & MAX_COUNT) << INDEX_BITS | u64::from(index)
     }
 
+    /// The thread on `index` ended while it waited for the reply to its
+    /// last accepted request (sched::exit, spec 6.8): the entry keeps a
+    /// mark until `alloc` hands the number out again.
+    pub fn mark_dead(&mut self, index: u16) {
+        self.taken(index);
+        self.entries[usize::from(index)].word |= DEAD;
+    }
+
     /// The thread whose accepted request `token` names (reply, spec 6.1):
-    /// BAD_STATE for a number outside the table or free, for count 0, and
-    /// for a count other than the last its entry gave.
+    /// BAD_STATE for a number outside the table, for count 0, and for a
+    /// count other than the last its entry gave; PEER_CLOSED for the last
+    /// count of an entry whose thread ended while it waited for this reply
+    /// (`mark_dead`), however often it is asked; BAD_STATE for a free
+    /// number otherwise.
     pub fn check(&self, token: u64) -> Result<NonNull<T>, Error> {
         let index = (token & ((1 << INDEX_BITS) - 1)) as usize;
         let count = token >> INDEX_BITS;
         let e = self.entries.get(index).ok_or(Error::BadState)?;
-        if e.word & TAKEN == 0 || count == 0 || e.word & MAX_COUNT != count {
+        if count == 0 || e.word & MAX_COUNT != count {
+            return Err(Error::BadState);
+        }
+        if e.word & DEAD != 0 {
+            return Err(Error::PeerClosed);
+        }
+        if e.word & TAKEN == 0 {
             return Err(Error::BadState);
         }
         // SAFETY: a taken entry holds its thread.
@@ -271,6 +294,33 @@ mod tests {
         assert_eq!(token >> INDEX_BITS, 4);
         assert_eq!(t.check(token), Ok(thread(1)));
         assert!(old.iter().all(|&o| t.check(o) == Err(Error::BadState)));
+    }
+
+    /// A thread that ends while it waits for its reply marks its number
+    /// (spec 6.8): the token of that request gets PEER_CLOSED, however often
+    /// it is tried, before and after the number comes back, and older
+    /// tokens stay BAD_STATE. The next thread on the number clears the
+    /// mark: until its first accepted request the token names it, a thread
+    /// that waits for no reply, and then it is BAD_STATE.
+    #[test]
+    fn dead_mark_holds_until_the_index_is_reused() {
+        let mut t: Table<u8, 1> = Table::new();
+        assert_eq!(t.alloc(thread(0)), Ok(0));
+        let old = t.accept(0);
+        let last = t.accept(0);
+        t.mark_dead(0);
+        for _ in 0..2 {
+            assert_eq!(t.check(last), Err(Error::PeerClosed));
+        }
+        assert_eq!(t.check(old), Err(Error::BadState));
+        t.free(0);
+        assert_eq!(t.check(last), Err(Error::PeerClosed));
+        assert_eq!(t.check(old), Err(Error::BadState));
+        assert_eq!(t.alloc(thread(1)), Ok(0));
+        assert_eq!(t.check(last), Ok(thread(1)));
+        let next = t.accept(0);
+        assert_eq!(t.check(last), Err(Error::BadState));
+        assert_eq!(t.check(next), Ok(thread(1)));
     }
 
     /// At MAX_COUNT the thread gets BAD_STATE for another request, its last

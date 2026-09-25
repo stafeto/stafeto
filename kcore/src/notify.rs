@@ -147,6 +147,12 @@ impl<O: Copy> Queue<O> {
         self.receivers && !self.items.is_empty()
     }
 
+    /// The top level of what waits or is queued: the level a portion of
+    /// the stage Close takes its heads from (spec 7.7); None when empty.
+    pub fn top(&self) -> Option<u8> {
+        self.items.top()
+    }
+
     /// A post of `bits` into `slot`, one of this channel's (spec 6.5): the
     /// bits merge into the slot; a slot that stood in no queue goes to the
     /// top waiter, or else to the tail of its level.
@@ -507,8 +513,9 @@ mod tests {
             assert_eq!(q.send(b), None);
             assert!(matches!(q.post(s, 2), Post::Merged));
         }
+        assert_eq!(q.top(), Some(30));
         assert_eq!(received(&mut q), [('s', 3, 2), ('b', 0, 0), ('a', 0, 0)]);
-        assert!(q.is_empty());
+        assert!(q.is_empty() && q.top().is_none());
     }
 
     /// A request finds the top receiver that waits and goes to it at once

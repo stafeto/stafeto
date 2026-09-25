@@ -315,12 +315,13 @@ fn send(thread: NonNull<Thread>, a: &Args) {
 /// reply(x0 token, x1 description, x2-x9 bytes 0-63 of the reply): the
 /// reply to the request the token names, which a thread of the caller's
 /// process accepted (spec 6.1). The description first (NO_WAIT is
-/// INVALID_ARGS: reply never waits), then the token: BAD_STATE for one
-/// that names no request waiting for this process's reply, a used one
-/// among them; x0 alone changes then. Handles do not travel yet: a count of
-/// them other than 0 is INVALID_ARGS. Otherwise x0 is 0, the client gets
-/// the reply, and a reply with the token of the caller's boost ends the
-/// boost (channel::reply).
+/// INVALID_ARGS: reply never waits); a reply with the token of the
+/// caller's boost ends the boost, whatever comes of it (spec 6.6); then the
+/// token: BAD_STATE for one that names no request waiting for this
+/// process's reply, a used one among them, and PEER_CLOSED for one whose
+/// client ended while it waited (spec 6.8); x0 alone changes then. Handles
+/// do not travel yet: a count of them other than 0 is INVALID_ARGS.
+/// Otherwise x0 is 0, and the client gets the reply (channel::reply).
 fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let desc = Desc::from_reply(a[1])?;
     if desc.handles > 0 {

@@ -219,11 +219,12 @@ impl<T> HandleTable<T> {
         Ok(())
     }
 
-    /// Makes room for the `n` inserts of a transfer, n at most CHUNK
-    /// (spec 6.1): LIMIT_REACHED when the table has room for fewer, and
-    /// NO_MEMORY when they need a chunk, or the directory with it, that
-    /// `src` does not give; the table is as it was then. After Ok the next
-    /// `n` inserts cannot fail. It adds at most one chunk (spec 5.1).
+    /// Makes room for the `n` inserts of a transfer, n at most CHUNK (spec
+    /// 6.1): LIMIT_REACHED when the table has room for fewer, and NO_MEMORY
+    /// when they need a chunk, or the directory with it, that `src` does
+    /// not give; no entry changes then, and a directory that came without
+    /// its chunk stays (`grow`). After Ok the next `n` inserts cannot fail.
+    /// It adds at most one chunk (spec 5.1).
     pub fn reserve(&mut self, src: &mut impl ChunkSource<T>, n: u32) -> Result<(), Error> {
         assert!(n as usize <= CHUNK, "a transfer of more than a chunk");
         if self.room() < n {

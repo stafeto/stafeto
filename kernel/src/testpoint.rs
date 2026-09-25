@@ -20,6 +20,12 @@ mod points {
     #[inline(always)]
     pub fn portion_done() {}
 
+    /// After a portion of the stage Close of a channel or of the stage
+    /// Replies of a process (channel::clean, process::clean): the level it
+    /// ran at and the heads it took.
+    #[inline(always)]
+    pub fn heads_taken(_: u8, _: usize) {}
+
     /// After the scheduler's part of the timer's interrupt
     /// (interrupt::handle).
     #[inline(always)]
@@ -66,6 +72,10 @@ mod points {
 
     pub fn portion_done() {
         el0::portion_done();
+    }
+
+    pub fn heads_taken(level: u8, heads: usize) {
+        el0::heads_taken(level, heads);
     }
 
     pub fn timer_fired() {
