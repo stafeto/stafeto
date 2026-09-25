@@ -1,0 +1,8 @@
+[alias]
+xtask = "run --package xtask --"
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "force-frame-pointers=yes",
+    "-C", "link-arg=--fix-cortex-a53-843419",
+]

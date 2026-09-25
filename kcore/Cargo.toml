@@ -1,0 +1,11 @@
+[package]
+name = "kcore"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Hardware-independent kernel logic of stafeto, tested on the host"
+
+[lib]
+bench = false

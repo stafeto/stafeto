@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+/dts-v1/;
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	chosen {
+	};
+};

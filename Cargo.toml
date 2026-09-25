@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["kcore", "kernel", "xtask"]
+default-members = ["kcore", "xtask"]
+
+[workspace.package]
+edition = "2024"
+authors = ["Sergey Subbotin <ssubbotin@gmail.com>"]
+repository = "https://github.com/stafeto/stafeto"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.dev]
+panic = "abort"
