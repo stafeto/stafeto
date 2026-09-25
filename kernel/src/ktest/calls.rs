@@ -10,14 +10,16 @@
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::boot::Boot;
 use crate::cleanup;
-use crate::mm::phys;
+use crate::mm::{pages, phys};
 use crate::object::{self, Object};
 use crate::process::{self, Process};
 use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
 use abi::{
-    Call, Error, Handle, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
-    INIT_RESOURCE_RIGHTS, INIT_THREAD, OWNER_RIGHTS, ProcessState, Rights, START_CHANNEL,
+    Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY,
+    INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE, INIT_RESOURCE_RIGHTS,
+    INIT_THREAD, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState, Rights,
+    START_CHANNEL,
 };
 use core::ptr::NonNull;
 use kcore::frames::PAGE_SIZE;
@@ -211,7 +213,7 @@ fn debug_write_cases(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static st
 }
 
 /// PROCESS_STATE of a live process: four zeros in x1-x4, whatever rights
-/// the handle carries. Other kinds, a nonzero x2 and handles to other
+/// the handle carries. Unknown kinds, a nonzero x2 and handles to other
 /// objects fail.
 pub fn object_info_reports_a_live_process(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
@@ -230,7 +232,7 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
     let n = Call::ObjectInfo.number();
     let state = INFO_PROCESS_STATE;
     c.fails(n, &[own, 0, 0], Error::InvalidArgs)?;
-    c.fails(n, &[own, 2, 0], Error::InvalidArgs)?;
+    c.fails(n, &[own, INFO_KERNEL_STATS + 1, 0], Error::InvalidArgs)?;
     c.fails(n, &[own, state | 1 << 32, 0], Error::InvalidArgs)?;
     c.fails(n, &[own, state, 8], Error::InvalidArgs)?;
     c.fails(n, &[0, 0, 0], Error::InvalidArgs)?;
@@ -238,6 +240,70 @@ fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static st
     c.fails(n, &[resource, state, 0], Error::WrongType)?;
     c.fails(n, &[thread, state, 0], Error::WrongType)?;
     c.succeeds(n, &[own, state, 0], &ProcessState::Alive.to_words())
+}
+
+/// PROCESS_MEMORY and PROCESS_HANDLES take a process handle with any
+/// rights and return its quota and its table in x1-x3; KERNEL_STATS takes
+/// the system resource with KSTATS and returns what the kernel counts in
+/// x1-x7 (spec 11, 16). The kind and x2 come before the handle, a wrong
+/// type before a missing right, and x8 and x9 keep their marks.
+pub fn object_info_reports_memory_handles_and_statistics(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), Rights::NONE)?;
+        let stats = c.insert(Object::Resource, Rights::KSTATS)?;
+        let debug = c.insert(Object::Resource, Rights::DEBUG)?;
+        let result = info_kinds_cases(c, [own, stats, debug]);
+        c.close(own)?;
+        result
+    })
+}
+
+fn info_kinds_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str> {
+    let [own, stats, debug] = handles.map(|h| h.0);
+    let n = Call::ObjectInfo.number();
+    let (memory, table, kernel) = (INFO_PROCESS_MEMORY, INFO_PROCESS_HANDLES, INFO_KERNEL_STATS);
+    for kind in [memory, table, kernel] {
+        c.fails(n, &[own, kind, 1], Error::InvalidArgs)?;
+        c.fails(n, &[0, kind, 1], Error::InvalidArgs)?;
+        c.fails(n, &[0, kind, 0], Error::BadHandle)?;
+    }
+    c.fails(n, &[stats, memory, 0], Error::WrongType)?;
+    c.fails(n, &[stats, table, 0], Error::WrongType)?;
+    c.fails(n, &[own, kernel, 0], Error::WrongType)?;
+    c.fails(n, &[debug, kernel, 0], Error::AccessDenied)?;
+    let q = process::quota(c.process);
+    let quota = ProcessMemory {
+        quota: q.limit(),
+        used: q.used(),
+        returned: q.returned(),
+    };
+    check(
+        quota.quota == QUOTA && quota.used > 0 && quota.returned == 0,
+        "the caller's quota is not what it was given, or nothing is charged to it",
+    )?;
+    c.succeeds(n, &[own, memory, 0], &quota.to_words())?;
+    let table_now = ProcessHandles {
+        live: 3,
+        retired: 0,
+        limit: LIMIT.into(),
+    };
+    c.succeeds(n, &[own, table, 0], &table_now.to_words())?;
+    cleanup::drain();
+    let s = sched::stats();
+    let counted = KernelStats {
+        idle: s.idle,
+        idle_latency: s.idle_latency,
+        irq_latency: s.irq_latency,
+        cleanup_queue: 0,
+        longest_portion: cleanup::longest(),
+        free_frames: phys::free_frames(),
+        pool_pages: pages::taken() as u64,
+    };
+    check(
+        counted.longest_portion > 0 && counted.free_frames > 0 && counted.pool_pages > 0,
+        "the kernel counted no portion, frame or pool page",
+    )?;
+    c.succeeds(n, &[stats, kernel, 0], &counted.to_words())
 }
 
 /// A handle holds its object: the last close queues a thread and a

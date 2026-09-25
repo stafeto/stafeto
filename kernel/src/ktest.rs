@@ -192,6 +192,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_info_reports_a_live_process,
     ),
     (
+        "object_info_reports_memory_handles_and_statistics",
+        calls::object_info_reports_memory_handles_and_statistics,
+    ),
+    (
         "closing_a_handle_releases_its_object",
         calls::closing_a_handle_releases_its_object,
     ),

@@ -161,6 +161,12 @@ impl<T> HandleTable<T> {
         self.retired
     }
 
+    /// The most entries the table holds, retired ones included: what `new`
+    /// took, for the table's whole life.
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
     /// How many inserts succeed before `LimitReached`, whatever the chunk
     /// source can give; lets a transfer check the receiver first. None
     /// while the table is being released.
@@ -698,6 +704,19 @@ mod tests {
         assert_eq!(t.len(), 2);
         t.release(&mut src);
         assert_eq!((t.retired(), t.room()), (0, 3));
+    }
+
+    #[test]
+    fn limit_is_what_the_table_was_made_with() {
+        let mut src = boxes(1);
+        let mut t = HandleTable::with_first_generation(3, LAST);
+        assert_eq!(t.limit(), 3);
+        let a = t.insert(&mut src, 1, RW).unwrap();
+        t.remove(a).unwrap();
+        // A retired entry takes room, and the limit stays.
+        assert_eq!((t.len(), t.retired(), t.room(), t.limit()), (0, 1, 2, 3));
+        t.release(&mut src);
+        assert_eq!(t.limit(), 3);
     }
 
     /// Random inserts, duplicates and removes against a model: every value

@@ -29,13 +29,6 @@ unsafe impl PageSource for KernelPages {
 /// Pages the pools of kernel objects hold: KSTATS reports them (spec 11),
 /// and together with the free frames they stay the same over the life of
 /// objects that give back all they took.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "object_info's KERNEL_STATS reads it (milestone 1.3a)"
-    )
-)]
 pub fn taken() -> usize {
     TAKEN.load(Ordering::Relaxed)
 }

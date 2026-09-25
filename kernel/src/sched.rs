@@ -54,13 +54,6 @@ static SCHED: Lock<Sched> = Lock::new(Sched {
 });
 
 /// What the scheduler counts for KSTATS (spec 16), in counter ticks.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "object_info's KERNEL_STATS reads it (milestone 1.3a)"
-    )
-)]
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
     /// Asleep in `wfi`.
@@ -74,13 +67,6 @@ pub struct Stats {
 }
 
 /// The scheduler's counters for KSTATS.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "object_info's KERNEL_STATS reads it (milestone 1.3a)"
-    )
-)]
 pub fn stats() -> Stats {
     let g = SCHED.lock();
     Stats {

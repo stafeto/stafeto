@@ -399,14 +399,8 @@ pub fn refund(process: NonNull<Process>, bytes: u64) {
     unsafe { (*process.as_ptr()).quota.refund(bytes) }
 }
 
-/// The quota of `process`, which the caller holds.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "object_info's PROCESS_MEMORY reads it (milestone 1.3a)"
-    )
-)]
+/// The quota of `process`, which the caller holds: object_info's
+/// PROCESS_MEMORY.
 pub fn quota(process: NonNull<Process>) -> Account {
     // SAFETY: the caller holds a reference to the process; only the field
     // is read.
@@ -1107,6 +1101,16 @@ pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
     );
     // The system resource is never queued: any level will do.
     close_handle(child, stub, 1)
+}
+
+/// The handles of `process`, which the caller holds, for object_info's
+/// PROCESS_HANDLES: live, retired at their last generation, and the limit.
+/// A process whose stage Handles is over has an empty table.
+pub fn handle_counts(process: NonNull<Process>) -> (u32, u32, u32) {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is read.
+    let handles = unsafe { &(*process.as_ptr()).handles };
+    (handles.len(), handles.retired(), handles.limit())
 }
 
 /// Objects the process pool holds now.

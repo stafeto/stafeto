@@ -7,9 +7,9 @@
 //! x0-x9, so that a later kernel may return more values; the kernel keeps
 //! every other register. `raw` makes any call with any registers, for
 //! tests that hand the kernel bad ones; the functions after it are the
-//! typed calls of milestone 1.2c.
+//! typed calls of milestones 1.2c and 1.3a.
 
-use abi::{Call, Error, Handle, Policy, ProcessState};
+use abi::{Call, Error, Handle, KernelStats, Policy, ProcessHandles, ProcessMemory, ProcessState};
 use core::arch::asm;
 
 /// x0-x9 as a call takes and leaves them.
@@ -169,6 +169,32 @@ pub fn process_state(process: Handle) -> Result<ProcessState, Error> {
     let args = [process.0, abi::INFO_PROCESS_STATE, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(ProcessState::from_words([x[1], x[2], x[3], x[4]]))
+}
+
+/// object_info(PROCESS_MEMORY): the process's quota, what is charged to it
+/// and what went back to its parent, in bytes.
+pub fn process_memory(process: Handle) -> Result<ProcessMemory, Error> {
+    let args = [process.0, abi::INFO_PROCESS_MEMORY, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(ProcessMemory::from_words([x[1], x[2], x[3]]))
+}
+
+/// object_info(PROCESS_HANDLES): the process's live handles, its retired
+/// entries and its limit.
+pub fn process_handles(process: Handle) -> Result<ProcessHandles, Error> {
+    let args = [process.0, abi::INFO_PROCESS_HANDLES, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(ProcessHandles::from_words([x[1], x[2], x[3]]))
+}
+
+/// object_info(KERNEL_STATS) through the system resource with KSTATS: what
+/// the kernel counts about itself, times in counter ticks.
+pub fn kernel_stats(resource: Handle) -> Result<KernelStats, Error> {
+    let args = [resource.0, abi::INFO_KERNEL_STATS, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(KernelStats::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7],
+    ]))
 }
 
 /// debug_write: up to abi::INLINE_MAX bytes to the console through the

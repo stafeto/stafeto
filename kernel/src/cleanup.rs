@@ -180,25 +180,11 @@ pub fn portion() {
 }
 
 /// Items queued now, for KSTATS (spec 16).
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "object_info's KERNEL_STATS reads it (milestone 1.3a)"
-    )
-)]
 pub fn len() -> u64 {
     QUEUE.lock().len
 }
 
 /// The longest portion so far in counter ticks, for KSTATS.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "object_info's KERNEL_STATS reads it (milestone 1.3a)"
-    )
-)]
 pub fn longest() -> u64 {
     QUEUE.lock().longest
 }

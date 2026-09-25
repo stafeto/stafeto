@@ -18,11 +18,15 @@
 //! keep the arguments. Test builds also know numbers of their own, in
 //! abi::TEST_CALLS.
 
+use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::sched;
 use crate::thread::{self, Thread};
-use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
+use crate::{cleanup, sched};
+use abi::{
+    Call, Error, Handle, KernelStats, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState,
+    Rights,
+};
 use core::ptr::NonNull;
 use kcore::process::{handle_limit_arg, quota_arg};
 use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
@@ -288,17 +292,64 @@ fn yield_now() -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
-/// object_info(x0 handle, x1 kind, x2 reserved and 0). One kind so far:
-/// PROCESS_STATE, for a process handle with any rights, returns
-/// abi::ProcessState::to_words in x1-x4.
+/// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
+/// first (INVALID_ARGS), then the handle. For a process handle with any
+/// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
+/// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
+/// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
+/// resource with KSTATS and returns abi::KernelStats in x1-x7 (spec 16).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    if a[1] != abi::INFO_PROCESS_STATE || a[2] != 0 {
+    if a[2] != 0 {
         return Err(Error::InvalidArgs);
     }
-    let p = lookup(thread, a[0], Rights::NONE, Object::process)?;
-    // SAFETY: the handle holds the process.
-    let state = unsafe { p.as_ref() }.state();
-    Ok(Values::new(&state.to_words()))
+    let target = || lookup(thread, a[0], Rights::NONE, Object::process);
+    match a[1] {
+        abi::INFO_PROCESS_STATE => {
+            let p = target()?;
+            // SAFETY: the handle holds the process.
+            let state = unsafe { p.as_ref() }.state();
+            Ok(Values::new(&state.to_words()))
+        }
+        abi::INFO_PROCESS_MEMORY => {
+            let q = process::quota(target()?);
+            let memory = ProcessMemory {
+                quota: q.limit(),
+                used: q.used(),
+                returned: q.returned(),
+            };
+            Ok(Values::new(&memory.to_words()))
+        }
+        abi::INFO_PROCESS_HANDLES => {
+            let (live, retired, limit) = process::handle_counts(target()?);
+            let handles = ProcessHandles {
+                live: live.into(),
+                retired: retired.into(),
+                limit: limit.into(),
+            };
+            Ok(Values::new(&handles.to_words()))
+        }
+        abi::INFO_KERNEL_STATS => {
+            lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+            Ok(Values::new(&kernel_stats().to_words()))
+        }
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
+/// idle time and latencies, the cleanup queue, the frames and the pages of
+/// the pools.
+fn kernel_stats() -> KernelStats {
+    let s = sched::stats();
+    KernelStats {
+        idle: s.idle,
+        idle_latency: s.idle_latency,
+        irq_latency: s.irq_latency,
+        cleanup_queue: cleanup::len(),
+        longest_portion: cleanup::longest(),
+        free_frames: phys::free_frames(),
+        pool_pages: pages::taken() as u64,
+    }
 }
 
 /// debug_write(x0 system resource with DEBUG, x1 length up to 64, x2-x9
