@@ -15,36 +15,65 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Subproject 1, stage 1.2 (kernel: memory, threads, scheduler) is done. The
-kernel, in arm64 Image format, boots in QEMU, verifies the boot image, and
-starts `init` from it at EL0. Programs use the first system calls
-(`debug_write`, `yield`, `thread_*`, `process_*`, `handle_close`,
-`object_info`). A scheduler with 64 priority levels, a round-robin queue
-with a 4 ms quantum, and FIFO preempts threads on a timer with no periodic
-tick. Each process has its own address space with an ASID; registers and
-FP/SIMD state are saved on every switch. A program fault terminates only
-its own process, and the parent reads the cause. Below the kernel: its own
-page tables with W^X, a buddy allocator, object pools, 64-bit handles with
-rights, a GICv2, and a virtual timer. `cargo xtask run` shows `init` saying
-hello from EL0 and its two threads taking turns. Part 1.3a (teardown and
-quotas) is done: kernel objects go through a cleanup queue in chunks with
-interrupt polling, processes form a tree, and a process's death terminates
-its descendants; each process's kernel memory is charged against its quota
-and returned to the parent precisely.
+stafeto boots in QEMU and runs programs at EL0. What works today:
 
-Part 1.3b (channels, sessions, notifications, and timers) is done. A
-channel takes notifications that merge their bits and count them, each
-source in a slot of its own at its own priority, and a receiver works at
-the priority of what it took, under its process's ceiling. A label on a
-copy of a channel handle makes a session, which posts `CLIENT_GONE` when
-its last copy goes. A parent hears of a child's end through the child's
-exit channel once the child gave its quota back, and a start channel moves
-into the child. Timers of programs stand in one heap for the whole system
-and bound a wait in `receive`; the kernel's timer serves the nearer of the
-end of a quantum and the earliest timer, and its interrupt fires at most 64
-timers at once. The kernel objects of a process lie in pools its quota pays
-for by the page, and a dying tree stops above its cause before it is taken
-apart. The next part, 1.3c, brings requests and replies.
+- **Boot:** arm64 Image, drop from EL2, MMU on, device tree, checked boot
+  image.
+- **Memory:** the kernel's own page tables with W^X, a buddy frame
+  allocator, object pools, an address space with an ASID per process; every
+  process pays for its kernel memory from its quota.
+- **Execution:** threads at EL0 with registers and FP/SIMD saved on every
+  switch; a scheduler with 64 priority levels (round robin with a 4 ms
+  quantum, and FIFO) and tickless timer preemption.
+- **Objects and calls:** 64-bit handles with rights; processes, threads,
+  channels, sessions and program timers; the first system calls
+  (`debug_write`, `yield`, `thread_*`, `process_*`, `channel_create`,
+  `notify`, `receive`, `timer_*`, `object_info`).
+- **Faults:** a program fault ends only its own process, and the parent
+  learns why through its exit channel.
+
+`cargo xtask run` shows `init` saying hello from EL0 and two of its threads
+taking turns.
+
+## Roadmap
+
+The work is split into subprojects; subproject 1 is split into stages and
+parts. Each finished part is merged through a pull request.
+
+✅ done · 🚧 in progress · ⬜ planned
+
+### Subproject 1: kernel and minimal userland
+
+| Stage | Part | What it brings | State |
+|---|---|---|---|
+| 1.1 Boot | | boot in QEMU, MMU, device tree, exceptions, in-kernel tests | ✅ [#2](https://github.com/stafeto/stafeto/pull/2) |
+| 1.2 Kernel | 1.2a Memory | page tables with W^X, buddy allocator, object pools, handles | ✅ [#3](https://github.com/stafeto/stafeto/pull/3) |
+| | 1.2b Threads and interrupts | GICv2, virtual timer, address spaces with ASIDs, EL0 threads with FP/SIMD | ✅ [#4](https://github.com/stafeto/stafeto/pull/4) |
+| | 1.2c System calls and scheduler | first system calls, 64-level scheduler, `init` from the boot image | ✅ [#5](https://github.com/stafeto/stafeto/pull/5) |
+| 1.3 Messages and objects | 1.3a Teardown and quotas | cleanup queue in bounded portions, process tree, quotas | ✅ [#6](https://github.com/stafeto/stafeto/pull/6) |
+| | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
+| | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | 🚧 |
+| | 1.3d Memory objects | `mem_create`, `mem_map`, lazy pages, child processes with code | ⬜ |
+| | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ⬜ |
+| 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ⬜ |
+
+Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
+`crash uart` shows the driver restart and the shell reconnecting, and the
+kernel image stays under 200 KB.
+
+### Later subprojects
+
+| # | Subproject | State |
+|---|---|---|
+| 2 | Name space and services: in-memory file system, virtio disk, programs from disk, a libc-like library, partial POSIX | ⬜ |
+| 3 | Graphics and input: virtio-gpu, touch input, compositor | ⬜ |
+| 4 | Phone shell: home screen, notifications, settings, UI toolkit | ⬜ |
+| 5 | Packages: package format, signatures, installing from any source, app sandbox | ⬜ |
+| 6 | Network: virtio-net, a TCP/IP stack | ⬜ |
+| 7 | PinePhone port: boot through U-Boot, Allwinner A64 drivers | ⬜ |
+
+Multi-core support is a separate subproject; its place in the order will be
+decided after subproject 3.
 
 ## Build and run
 
