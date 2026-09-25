@@ -1,8 +1,8 @@
-# Отладка
+# Debugging
 
-## Ядро молчит или падает
+## The kernel is silent or crashes
 
-1. Запустить QEMU с журналом исключений:
+1. Run QEMU with an exception log:
 
    ```
    qemu-system-aarch64 -M virt,gic-version=2 -cpu cortex-a72 -m 512M -nographic \
@@ -10,86 +10,94 @@
      -d int,cpu_reset,guest_errors -D qemu.log
    ```
 
-2. В `qemu.log` найти первое `Taking exception`. Рядом стоят ESR, FAR и ELR.
-   Класс исключения: `(ESR >> 26) & 0x3f` (биты выше 31 на новых процессорах заняты другим). Частые значения:
+2. Find the first `Taking exception` in `qemu.log`. ESR, FAR, and ELR are
+   next to it. The exception class is `(ESR >> 26) & 0x3f` (bits above 31
+   are used for something else on newer processors). Common values:
 
-   | Класс | Что случилось |
+   | Class | What happened |
    |---|---|
-   | `0x00` | неизвестная инструкция |
-   | `0x15` | вызов `svc` из EL0 |
-   | `0x20`, `0x24` | ошибка выборки команды или данных на EL0 |
-   | `0x21`, `0x25` | то же на EL1, то есть в ядре |
-   | `0x26` | стек не выровнен на 16 байт |
-   | `0x3c` | инструкция `brk` |
+   | `0x00` | unknown instruction |
+   | `0x15` | `svc` call from EL0 |
+   | `0x20`, `0x24` | instruction or data fetch error at EL0 |
+   | `0x21`, `0x25` | the same at EL1, i.e. in the kernel |
+   | `0x26` | stack not aligned to 16 bytes |
+   | `0x3c` | `brk` instruction |
 
-   Ядро само печатает то же при исключении в ядре: регистры x0..x30, класс
-   исключения словами, для ошибок доступа вид ошибки и уровень таблицы
-   страниц, затем стек вызовов. В стеке сначала идут функции обработки
-   паники и `handle_exception`, за ними адрес прерванной инструкции (он
-   равен ELR) и функции, которые к ней привели.
+   The kernel prints the same thing itself on an exception in the kernel:
+   registers x0..x30, the exception class in words, for access faults the
+   fault kind and page table level, then a call stack. In the stack, the
+   panic-handling functions and `handle_exception` come first, followed by
+   the address of the interrupted instruction (equal to ELR) and the
+   functions that led to it.
 
-3. Переполнение своего стека ядро распознаёт само: вход в исключение видит,
-   что кадр не помещается на стек, переходит на аварийный стек и печатает
-   строку `kernel stack overflow` с указателем стека, затем обычный отчёт с
-   настоящим ELR. Стек вызовов идёт с аварийного стека дальше в стек ядра,
-   поэтому в нём видна функция, которая переполнила стек.
+3. The kernel detects an overflow of its own stack by itself: the
+   exception entry sees that the frame does not fit on the stack, switches
+   to the emergency stack, and prints the line `kernel stack overflow`
+   with the stack pointer, followed by the usual report with the real ELR.
+   The call stack runs from the emergency stack on into the kernel stack,
+   so it shows the function that overflowed the stack.
 
-4. Сбой программы на EL0 завершает только её процесс, машина работает
-   дальше. Ядро печатает одну строку
-   `process fault: <класс> (EC 0x..) ESR=0x... FAR=0x... ELR=0x...`; ту же
-   причину родитель читает через `object_info`. `FAR` в ней взят у
-   процессора только там, где он действителен: ошибки выборки команды и
-   данных и невыровненный счётчик команд (спецификация 7.9); в остальных
-   случаях там 0. Адреса в `ELR` и `FAR` здесь адреса программы.
+4. A program fault at EL0 terminates only that process; the machine keeps
+   running. The kernel prints a single line
+   `process fault: <class> (EC 0x..) ESR=0x... FAR=0x... ELR=0x...`; the
+   parent reads the same cause through `object_info`. `FAR` in it is taken
+   from the processor only where it is valid: instruction and data fetch
+   faults and a misaligned program counter (spec 7.9); it is 0 in other
+   cases. The addresses in `ELR` and `FAR` here are addresses in the
+   program.
 
-   Конец `init` останавливает машину. При сбое `init` за строкой
-   `process fault` идут регистры программы (x0..x30, `sp_el0`, `elr`,
-   `spsr`, `tpidr_el0`), затем паника
-   `init terminated by a fault: ESR=0x... FAR=0x... ELR=0x...`; её стек
-   вызовов показывает только функции ядра. Убийство `init` вызовом
-   `process_kill` даёт панику `init terminated: Killed`. Обычный выход
-   `init` печатает `init exited with code N` и выключает машину.
+   `init` exiting stops the machine. When `init` faults, the
+   `process fault` line is followed by the program's registers (x0..x30,
+   `sp_el0`, `elr`, `spsr`, `tpidr_el0`), then the panic
+   `init terminated by a fault: ESR=0x... FAR=0x... ELR=0x...`; its call
+   stack shows only kernel functions. Killing `init` with `process_kill`
+   produces the panic `init terminated: Killed`. A normal `init` exit
+   prints `init exited with code N` and shuts the machine down.
 
-   SError или FIQ, принятые на EL0, останавливают машину. Отчёт начинается
-   строкой `system error at EL0, thread 0x...`, за ней идут регистры
-   программы и паника с именем входа: это ошибка системы (например, внешняя
-   ошибка записи ядра в устройство), программа к ней непричастна. В сборке
-   с тестами ядра сбой, которого идущий тест не ждёт, так же останавливает
-   машину отчётом со строкой `program fault at EL0, thread 0x...`: ошибка в
-   тестовой программе видна сразу.
+   An SError or FIQ taken at EL0 stops the machine. The report starts with
+   the line `system error at EL0, thread 0x...`, followed by the
+   program's registers and a panic naming the entry point: this is a
+   system error (for example, an external error while the kernel writes
+   to a device), and the program is not at fault. In a build with kernel
+   tests, a fault that the running test does not expect likewise stops
+   the machine, with a report starting with the line
+   `program fault at EL0, thread 0x...`: an error in the test program is
+   immediately visible.
 
-5. Если ELR и FAR всё же повторяются по кругу, исключение случается внутри
-   обработчика до того, как он что-то напечатал.
+5. If ELR and FAR keep repeating in a loop, the exception is happening
+   inside the handler before it has printed anything.
 
-6. Если PC около нуля или мусорный, значит, `VBAR_EL1` ещё не задан.
+6. If PC is near zero or garbage, `VBAR_EL1` has not been set yet.
 
-## Адрес из паники
+## Address from a panic
 
-Паника печатает стек вызовов адресами. Имя функции и строку по адресу даёт lldb:
+A panic prints the call stack as addresses. lldb gives the function name
+and line for an address:
 
 ```
 lldb -b -o 'image lookup -a 0xffffffffc0001234' target/stafeto.elf
 ```
 
-xtask кладёт ELF рядом с образом: `target/stafeto.elf` для обычной сборки,
-`target/stafeto-ktest.elf` для сборки с тестами ядра,
-`target/stafeto-ktest-icount.elf` для сборки с тестами ядра под `-icount`
-(к обычным тестам ядра добавлены те, которым нужно время в инструкциях),
-`target/stafeto-probe.elf` и `target/stafeto-overflow.elf` для пробников
-сбоя (неизвестная инструкция и переполнение стека) из `cargo xtask test`. Нужный файл называет сама строка
-`backtrace (look up: ...)` в выводе паники.
+xtask places the ELF next to the image: `target/stafeto.elf` for a normal
+build, `target/stafeto-ktest.elf` for a build with kernel tests,
+`target/stafeto-ktest-icount.elf` for a build with kernel tests under
+`-icount` (adds to the regular kernel tests the ones that need
+instruction-counted time), and `target/stafeto-probe.elf` and
+`target/stafeto-overflow.elf` for the fault probes (unknown instruction
+and stack overflow) from `cargo xtask test`. The right file is named by
+the `backtrace (look up: ...)` line itself in the panic output.
 
-## Отладчик
+## Debugger
 
-`cargo xtask gdb` запускает QEMU, остановленный до старта ядра: сначала
-работает маленький загрузчик QEMU в начале памяти, первая инструкция ядра
-лежит по адресу `0x40200000`. Затем в другом терминале:
+`cargo xtask gdb` starts QEMU stopped before the kernel starts: first a
+small QEMU loader runs at the start of memory, and the kernel's first
+instruction sits at address `0x40200000`. Then, in another terminal:
 
 ```
 lldb target/stafeto.elf -o 'gdb-remote 1234'
 ```
 
-Пока MMU выключен, код исполняется по физическим адресам (образ стоит с
-`0x40200000`), а символы в ELF записаны по виртуальным (с
-`0xffffffffc0000000`). Точку останова до включения MMU ставить по физическому
-адресу: `breakpoint set -a 0x40200000`.
+While the MMU is off, code executes at physical addresses (the image is
+placed at `0x40200000`), while symbols in the ELF are recorded at virtual
+addresses (starting at `0xffffffffc0000000`). Set a breakpoint before the
+MMU is enabled at the physical address: `breakpoint set -a 0x40200000`.
