@@ -10,13 +10,14 @@
 //! WRONG_TYPE, then ACCESS_DENIED for missing rights); priority ceilings
 //! (ACCESS_DENIED); the state of objects (BAD_STATE); values checked
 //! against an object, such as a page that is mapped already
-//! (INVALID_ARGS); resources (NO_MEMORY, LIMIT_REACHED). The kernel never
-//! reads or writes memory of a program through an address it is given:
-//! addresses are only numbers to check. A call that ends its caller
-//! (thread_exit, process_exit, process_kill of its own process) never
-//! returns: it leaves through sched::resume, and the caller's registers
-//! keep the arguments. Test builds also know numbers of their own, in
-//! abi::TEST_CALLS.
+//! (INVALID_ARGS); resources (NO_MEMORY, LIMIT_REACHED), in the order the
+//! call occupies them and a limit that needs no allocation first. The
+//! kernel never reads or writes memory of a program through an address it
+//! is given: addresses are only numbers to check. A call that ends its
+//! caller (thread_exit, process_exit, process_kill of its own process)
+//! never returns: it leaves through sched::resume, and the caller's
+//! registers keep the arguments. Test builds also know numbers of their
+//! own, in abi::TEST_CALLS.
 
 use crate::mm::{pages, phys};
 use crate::object::Object;
@@ -153,11 +154,15 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 /// milestone 1.3c (spec 13.3): x5 is 0, and any other value is looked up
 /// after x3 and fails the same way. Entry 0 then holds a stub that goes at
 /// once (process::reserve_start). The child is the caller's process's
-/// (spec 4): it ends when its parent does. The quota comes off the
-/// caller's (spec 7.5), and the child pays from it for its shell, its root
-/// table and the chunk with entry 0: NO_MEMORY when either quota falls
-/// short, a resource checked last. The quota comes back to the caller in
-/// full once the child and whatever holds its shell went.
+/// (spec 4): it ends when its parent does. Resources come last and in the
+/// order the call occupies them, a limit that needs no allocation first
+/// (spec 11): the caller's own table has room for the new handle
+/// (LIMIT_REACHED), then the quota comes off the caller's (spec 7.5), and
+/// the child pays from it for its shell, its root table and the chunk with
+/// entry 0 (NO_MEMORY when either quota falls short). A full caller table
+/// fails before the child is built, so nothing is made and torn down for
+/// it. The quota comes back to the caller in full once the child and
+/// whatever holds its shell went.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
@@ -174,6 +179,9 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let own = caller_ceiling(thread);
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
+    // The caller's table first: it needs no allocation, and the call would
+    // insert the child's handle there last (spec 11).
+    process::handle_room(caller(thread))?;
     let child = process::create_child(caller(thread), quota, limit, ceiling)?;
     let h = process::reserve_start(child).and_then(|()| {
         process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
@@ -221,8 +229,12 @@ fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
 /// aligned, the buffer a whole page there (INVALID_ARGS); the priority no
 /// higher than the ceiling of the process nor than the caller's
 /// (ACCESS_DENIED); the process has not ended (BAD_STATE); the buffer's
-/// page is free there (INVALID_ARGS); the process has fewer than
-/// abi::MAX_THREADS threads that have not ended (LIMIT_REACHED).
+/// page is free there (INVALID_ARGS). Resources come last and in the order
+/// the call occupies them, a limit that needs no allocation first (spec 11):
+/// the caller's own table has room for the new handle (LIMIT_REACHED),
+/// then the target has fewer than abi::MAX_THREADS threads that have not
+/// ended (LIMIT_REACHED, checked inside thread::create before it charges
+/// anything), then the target's quota (NO_MEMORY).
 fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
     let policy = policy_arg(a[5])?;
@@ -237,6 +249,9 @@ fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if process::translate(target, buffer).is_some() {
         return Err(Error::InvalidArgs);
     }
+    // The caller's table first: it needs no allocation, and the call would
+    // insert the new thread's handle there last (spec 11).
+    process::handle_room(caller(thread))?;
     let t = thread::create(target, a[1] as usize, a[2] as usize, a[3], priority, policy)?;
     let h = thread::give_buffer(t, buffer)
         .and_then(|()| process::insert_handle(caller(thread), Object::Thread(t), OWNER_RIGHTS));

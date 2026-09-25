@@ -1020,6 +1020,20 @@ pub fn translate(process: NonNull<Process>, va: usize) -> Option<(u64, u64)> {
     space.as_ref()?.translate(va)
 }
 
+/// LIMIT_REACHED when the handle table of `process` has no room for one
+/// more entry (spec 11): a call that would insert a handle checks this
+/// before it allocates anything for the call, so a full table costs
+/// nothing beyond the checks that come before it in the fixed order.
+pub fn handle_room(process: NonNull<Process>) -> Result<(), Error> {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is read.
+    if unsafe { (*process.as_ptr()).handles.room() } > 0 {
+        Ok(())
+    } else {
+        Err(Error::LimitReached)
+    }
+}
+
 /// Puts `object` in the handle table of `process` with `rights`; the new
 /// handle holds a reference to it. A new chunk or directory of the table
 /// is charged to `process`, whoever the handle comes from. LIMIT_REACHED

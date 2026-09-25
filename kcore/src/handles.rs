@@ -168,8 +168,9 @@ impl<T> HandleTable<T> {
     }
 
     /// How many inserts succeed before `LimitReached`, whatever the chunk
-    /// source can give; lets a transfer check the receiver first. None
-    /// while the table is being released.
+    /// source can give; lets a transfer check the receiver first, or a
+    /// syscall check the caller's own table before it allocates anything
+    /// for the call (spec 11). 0 while the table is being released.
     pub fn room(&self) -> u32 {
         if self.closing {
             return 0;

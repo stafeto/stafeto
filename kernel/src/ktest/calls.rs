@@ -599,7 +599,7 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
         )?;
     }
     let least = c.created(n, &[least, 16, 30, 0, 0, 0])?;
-    let result = full_child_cases(c, least);
+    let result = full_child_cases(c, least).and_then(|()| full_table_thread_quota_cases(c, least));
     c.close(least)?;
     cleanup::drain();
     result?;
@@ -624,6 +624,16 @@ fn full_child_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
         process::quota(p).used() == used,
         "a thread that did not fit kept the child's quota",
     )
+}
+
+/// thread_create into `child`, whose quota has no room for the thread
+/// either, with the caller's table full too: LIMIT_REACHED, checked before
+/// the quota (spec 11), even though the quota alone already fails the
+/// call (`full_child_cases`).
+fn full_table_thread_quota_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
+    let n = Call::ThreadCreate.number();
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
+    with_full_table(c, n, &args)
 }
 
 /// Every process pays for the directory and chunks of its own table,
@@ -707,10 +717,16 @@ fn start_entry_cases(c: &Caller, child: Handle) -> Result<(), &'static str> {
 }
 
 /// A full table of the caller: LIMIT_REACHED, and the new process goes.
+/// LIMIT_REACHED even when the quota would not have covered the child
+/// either (spec 11): the table has no room, a limit that needs no
+/// allocation, and the call checks it before it ever charges the quota.
 fn full_table_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     cleanup::drain();
     let processes = process::in_use();
     with_full_table(c, n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
+    let q = process::quota(c.process);
+    let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(PAGE_SIZE);
+    with_full_table(c, n, &[over, 16, 30, 0, 0, 0])?;
     cleanup::drain();
     check(
         process::in_use() == processes,
