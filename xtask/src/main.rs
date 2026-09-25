@@ -77,6 +77,18 @@ const ADR_X1_NEXT_PAGE: u32 = 0x1000_8001;
 const STR_X0_X1: u32 = 0xF900_0020;
 /// `b .+0x1000`: a branch to the page after the code.
 const B_NEXT_PAGE: u32 = 0x1400_0400;
+/// init kills its own process: x0 = abi::INIT_PROCESS, then process_kill,
+/// which does not return; if it did, the load through x0 would fault.
+const KILL_ITSELF: [u32; 4] = [
+    movz_x0(abi::INIT_PROCESS.0 as u16),
+    movk_x0_lsl16((abi::INIT_PROCESS.0 >> 16) as u16),
+    svc(abi::Call::ProcessKill.number()),
+    LDR_X0_X0,
+];
+const _: () = assert!(
+    abi::INIT_PROCESS.0 >> 32 == 0,
+    "INIT_PROCESS takes two moves"
+);
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
 const INIT_TESTS: u32 = 16;
@@ -298,6 +310,21 @@ fn init_entry(path: &Path) -> Result<u64, String> {
     Ok(init.entry)
 }
 
+/// `movz x0, #imm`.
+const fn movz_x0(imm: u16) -> u32 {
+    0xD280_0000 | (imm as u32) << 5
+}
+
+/// `movk x0, #imm, lsl #16`.
+const fn movk_x0_lsl16(imm: u16) -> u32 {
+    0xF2A0_0000 | (imm as u32) << 5
+}
+
+/// `svc #n`.
+const fn svc(n: u16) -> u32 {
+    0xD400_0001 | (n as u32) << 5
+}
+
 /// A boot image whose init xtask writes itself, with no ELF: `code` at
 /// RAW_INIT_ENTRY, which is its entry; with `rodata`, a read-only page of
 /// zeros on the next page; unless `data_size` is 0, a data segment of
@@ -497,14 +524,24 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
     Ok(())
 }
 
-/// An init that faults stops the machine (spec 7.9): the kernel prints the
-/// fault and init's registers, panics with the fault, and the machine
-/// powers off. The cases: a load through a null pointer; a store to init's
-/// read-only data and a branch into it, which its protection forbids
-/// (spec 3.3).
+/// An init that faults or is killed stops the machine (spec 7.9). At a
+/// fault the kernel prints the fault and init's registers, panics with
+/// the fault, and the machine powers off. The cases: a load through a
+/// null pointer; a store to init's read-only data and a branch into it,
+/// which its protection forbids (spec 3.3). An init that kills its own
+/// process makes the kernel panic with «killed», and no fault is printed.
 fn init_fault_stops_the_machine() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let path = root().join("target").join("fault-init.img");
+    let run = |image: Vec<u8>| {
+        std::fs::write(&path, image).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
+        cmd.args(qemu::HEADLESS);
+        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        qemu::expect_powered_off(&o)?;
+        qemu::expect_marker(&o, "KERNEL PANIC")?;
+        Ok::<_, String>(o)
+    };
     let cases: [(&[u32], bool, &str, &str, u64); 3] = [
         (
             &[LDR_X0_X0],
@@ -529,16 +566,15 @@ fn init_fault_stops_the_machine() -> Result<(), String> {
         ),
     ];
     for (code, rodata, class, fault, elr) in cases {
-        let image = raw_init(code, rodata, 0)?;
-        std::fs::write(&path, image).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
-        cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-        qemu::expect_powered_off(&o)?;
+        let o = run(raw_init(code, rodata, 0)?)?;
         qemu::expect_line(&o, &format!("process fault: {class} {fault}"))?;
         qemu::expect_line(&o, &init_registers(elr))?;
-        qemu::expect_marker(&o, "KERNEL PANIC")?;
         qemu::expect_line(&o, &format!("init terminated by a fault: {fault}"))?;
+    }
+    let o = run(raw_init(&KILL_ITSELF, false, 0)?)?;
+    qemu::expect_line(&o, "init terminated: Killed")?;
+    if let Some(l) = o.lines.iter().find(|l| l.starts_with("process fault")) {
+        return Err(format!("an init that killed itself faulted: {l}"));
     }
     Ok(())
 }
@@ -758,6 +794,15 @@ fn ci() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_itself_is_what_an_assembler_makes() {
+        // movz x0, #0x1; movk x0, #0x1, lsl #16; svc #13; ldr x0, [x0]
+        assert_eq!(
+            KILL_ITSELF,
+            [0xD280_0020, 0xF2A0_0020, 0xD400_01A1, 0xF940_0000]
+        );
+    }
 
     #[test]
     fn variants_have_their_own_artifacts_and_features() {
