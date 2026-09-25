@@ -44,7 +44,7 @@ use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
 use kcore::notify::Slot;
-use kcore::paging::{Attrs, MapError};
+use kcore::paging::Attrs;
 use kcore::process::Life;
 use kcore::quota::Account;
 use kcore::slab::{PageLog, PaidPages, Pool};
@@ -369,12 +369,7 @@ impl Process {
         // mapped, and the frames must stay until the tables go.
         self.frames.0[slot] = Some((pa, order));
         let space = self.space.as_mut().expect("frames map into a space");
-        space
-            .map(va, pa, size, attrs, &mut self.quota)
-            .map_err(|e| match e {
-                MapError::NoMemory => Error::NoMemory,
-                _ => Error::InvalidArgs,
-            })?;
+        space.map(va, pa, size, attrs, &mut self.quota)?;
         Ok(pa)
     }
 
@@ -397,7 +392,7 @@ impl Process {
         rights: Rights,
         kind: impl FnOnce(&Object) -> Option<U>,
     ) -> Result<U, Error> {
-        self.handles.get_as(h, rights, kind).map_err(Error::from)
+        self.handles.get_as(h, rights, kind)
     }
 
     /// As `lookup`, with every right of the handle as well: what a handle
@@ -409,7 +404,7 @@ impl Process {
         kind: impl FnOnce(&Object) -> Option<U>,
     ) -> Result<(U, Rights), Error> {
         let found = self.lookup(h, rights, kind)?;
-        let (_, all) = self.handles.get(h).map_err(Error::from)?;
+        let (_, all) = self.handles.get(h)?;
         Ok((found, all))
     }
 }
@@ -433,7 +428,7 @@ fn create(
 ) -> Result<NonNull<Process>, Error> {
     let ceiling = kcore::sched::priority_arg(u64::from(ceiling))?;
     kcore::process::handle_limit_arg(u64::from(handle_limit))?;
-    let handles = Handles::new(handle_limit).map_err(Error::from)?;
+    let handles = Handles::new(handle_limit)?;
     let mut quota = Account::new(quota);
     let space = AddressSpace::new(&mut quota).map_err(|_| Error::NoMemory)?;
     let process = Process {
@@ -1453,12 +1448,7 @@ pub fn map_page(process: NonNull<Process>, va: usize, pa: u64, attrs: Attrs) -> 
         (&mut (*p).space, &mut (*p).quota)
     };
     let space = space.as_mut().ok_or(Error::BadState)?;
-    space
-        .map(va, pa, PAGE_SIZE, attrs, quota)
-        .map_err(|e| match e {
-            MapError::NoMemory => Error::NoMemory,
-            _ => Error::InvalidArgs,
-        })
+    Ok(space.map(va, pa, PAGE_SIZE, attrs, quota)?)
 }
 
 /// Unmaps page `va` of the process and drops its TLB entry; returns the
@@ -1510,9 +1500,7 @@ pub fn insert_handle(
     );
     // SAFETY: the caller holds a reference to the process.
     let (handles, mut chunks) = unsafe { table(process) };
-    let h = handles
-        .insert(&mut chunks, object, rights)
-        .map_err(Error::from)?;
+    let h = handles.insert(&mut chunks, object, rights)?;
     object::retain(object, rights);
     Ok(h)
 }
@@ -1523,10 +1511,7 @@ pub fn insert_handle(
 pub fn close_handle(mut process: NonNull<Process>, h: Handle, cause: u8) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the process other than the
     // handle, so the process outlives the release below.
-    let (object, rights) = unsafe { process.as_mut() }
-        .handles
-        .remove(h)
-        .map_err(Error::from)?;
+    let (object, rights) = unsafe { process.as_mut() }.handles.remove(h)?;
     // SAFETY: the handle is gone, and its reference with it.
     unsafe { object::release(object, rights, cause) };
     Ok(())

@@ -8,6 +8,7 @@
 
 use crate::PAGE_SIZE;
 use crate::layout::USER_END;
+use abi::Error;
 
 pub const BLOCK_2M: u64 = 2 << 20;
 /// Output address bits [47:12] of a descriptor.
@@ -170,6 +171,17 @@ pub enum MapError {
     /// A user mapping with kernel attributes, or at addresses TTBR0 does
     /// not translate.
     NotUser,
+}
+
+/// A refused mapping as a system call reports it (spec 11): NO_MEMORY when
+/// the quota or the frames ran out for a table, INVALID_ARGS for the rest.
+impl From<MapError> for Error {
+    fn from(e: MapError) -> Error {
+        match e {
+            MapError::NoMemory => Error::NoMemory,
+            _ => Error::InvalidArgs,
+        }
+    }
 }
 
 fn index(va: u64, level: u32) -> u64 {
