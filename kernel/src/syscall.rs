@@ -32,11 +32,10 @@ use abi::{
     ProcessMemory, ProcessState, Rights,
 };
 use core::ptr::NonNull;
-use kcore::handles::rights_arg;
-use kcore::notify::{bits_arg, wait_arg};
-use kcore::process::{handle_limit_arg, quota_arg};
-use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
-use kcore::thread::{check_buffer, check_start};
+use kcore::args::{
+    bits_arg, check_buffer, check_start, handle_limit_arg, notify_priority_arg, policy_arg,
+    priority_arg, quota_arg, rights_arg, under_ceilings, wait_arg,
+};
 
 /// A call's arguments: x0-x9 of the thread that made it.
 type Args = [u64; 10];

@@ -116,8 +116,7 @@ pub struct Node<T> {
 
 impl<T> Node<T> {
     /// A stopped thread's node with the base priority `priority` and no
-    /// boost. The priority is checked by the caller (priority_arg,
-    /// kcore::thread::check_start).
+    /// boost. The priority is checked by the caller (kcore::args).
     pub const fn new(priority: u8, policy: Policy) -> Node<T> {
         Node {
             policy,
@@ -556,7 +555,7 @@ impl<T: Schedulable> Scheduler<T> {
     /// next `pick`. A stopped thread only takes the values; so does a
     /// waiting one, and when it stands in the queue of what it waits for,
     /// `requeue` moves it there right after. BAD_STATE for a thread that
-    /// ended. `priority` is 1-63, as priority_arg checks.
+    /// ended. `priority` is 1-63, as args::priority_arg checks.
     ///
     /// # Safety
     /// `t` is alive; the scheduler's threads are alive.
@@ -819,47 +818,6 @@ impl Armed {
 impl Default for Armed {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// A priority from a register, as `thread_create` and
-/// `thread_set_priority` take it: 1-63. INVALID_ARGS for 0, 64 and up, and
-/// bits set above the byte.
-pub fn priority_arg(raw: u64) -> Result<u8, Error> {
-    match u8::try_from(raw) {
-        Ok(p) if (1..PRIORITY_LEVELS).contains(&p) => Ok(p),
-        _ => Err(Error::InvalidArgs),
-    }
-}
-
-/// A policy from a register: INVALID_ARGS for a value abi::Policy lacks.
-pub fn policy_arg(raw: u64) -> Result<Policy, Error> {
-    Policy::from_raw(raw).ok_or(Error::InvalidArgs)
-}
-
-/// The priority of a source's slot (spec 6.5) from a register: in
-/// `process_create` 0 exactly when there is no exit channel, in
-/// `handle_duplicate` exactly when there is no new label (`channel` false),
-/// otherwise a priority. INVALID_ARGS for anything else.
-pub fn notify_priority_arg(raw: u64, channel: bool) -> Result<u8, Error> {
-    match (channel, raw) {
-        (false, 0) => Ok(0),
-        (true, _) => priority_arg(raw),
-        (false, _) => Err(Error::InvalidArgs),
-    }
-}
-
-/// ACCESS_DENIED when `priority` is above any of `ceilings` (spec 8):
-/// for `thread_create` and `thread_set_priority` the ceilings of the
-/// thread's process and of the caller's, for the ceiling of a child and a
-/// notification priority the caller's. A priority is authority too: a
-/// handle to another process's thread does not lift the thread above the
-/// caller's own ceiling.
-pub fn under_ceilings(priority: u8, ceilings: &[u8]) -> Result<(), Error> {
-    if ceilings.iter().all(|&c| priority <= c) {
-        Ok(())
-    } else {
-        Err(Error::AccessDenied)
     }
 }
 
@@ -1940,40 +1898,5 @@ mod tests {
         // SAFETY: the item stays alive and in place while queued.
         unsafe { q.push_tail(i) };
         item.link.set_level(4);
-    }
-
-    #[test]
-    fn priority_arguments() {
-        assert_eq!(priority_arg(1), Ok(1));
-        assert_eq!(priority_arg(63), Ok(63));
-        for raw in [0, 64, 255, 1 << 8 | 10, 1 << 32 | 10, u64::MAX] {
-            assert_eq!(priority_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
-        }
-        assert_eq!(policy_arg(0), Ok(RR));
-        assert_eq!(policy_arg(1), Ok(FIFO));
-        for raw in [2, 1 << 32, u64::MAX] {
-            assert_eq!(policy_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
-        }
-    }
-
-    #[test]
-    fn priority_ceilings() {
-        // thread_create and thread_set_priority: the thread's process and
-        // the caller's, whichever is lower.
-        assert_eq!(under_ceilings(40, &[40, 63]), Ok(()));
-        assert_eq!(under_ceilings(41, &[40, 63]), Err(Error::AccessDenied));
-        assert_eq!(under_ceilings(41, &[63, 40]), Err(Error::AccessDenied));
-        assert_eq!(under_ceilings(1, &[1, 1]), Ok(()));
-        // process_create: a child's ceiling is at most its parent's.
-        assert_eq!(under_ceilings(30, &[30]), Ok(()));
-        assert_eq!(under_ceilings(31, &[30]), Err(Error::AccessDenied));
-        // The notification priority: 0 without an exit channel, and only
-        // then; with one, a priority at most the caller's ceiling.
-        assert_eq!(notify_priority_arg(0, false), Ok(0));
-        assert_eq!(notify_priority_arg(5, false), Err(Error::InvalidArgs));
-        assert_eq!(notify_priority_arg(0, true), Err(Error::InvalidArgs));
-        assert_eq!(notify_priority_arg(64, true), Err(Error::InvalidArgs));
-        assert_eq!(notify_priority_arg(5, true), Ok(5));
-        assert_eq!(under_ceilings(5, &[4]), Err(Error::AccessDenied));
     }
 }

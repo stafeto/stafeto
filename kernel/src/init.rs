@@ -15,7 +15,8 @@
 
 use crate::arch::cache;
 use crate::process::{self, Process};
-use crate::thread::{self, Policy};
+use crate::thread;
+use abi::Policy;
 use bootimg::{Part, Program};
 use core::fmt;
 use core::ptr::NonNull;

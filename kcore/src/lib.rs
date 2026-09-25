@@ -11,6 +11,7 @@
 pub const PAGE_SHIFT: u32 = 12;
 pub const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
+pub mod args;
 pub mod asid;
 pub mod backtrace;
 pub mod bootinfo;
@@ -29,7 +30,6 @@ pub mod sched;
 pub mod slab;
 pub mod sync;
 pub mod sysreg;
-pub mod thread;
 pub mod time;
 pub mod timer;
 pub mod tlb;

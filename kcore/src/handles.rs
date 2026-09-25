@@ -20,15 +20,6 @@ const NO_ENTRY: u32 = u32::MAX;
 
 const _: () = assert!(MAX_HANDLES <= 1 << Handle::INDEX_BITS);
 
-/// The rights of a copy from a register (spec 5.2, 11): INVALID_ARGS for
-/// a bit that is no right.
-pub fn rights_arg(raw: u64) -> Result<Rights, Error> {
-    match u32::try_from(raw) {
-        Ok(bits) if Rights::ALL.contains(Rights(bits)) => Ok(Rights(bits)),
-        _ => Err(Error::InvalidArgs),
-    }
-}
-
 struct Entry<T> {
     object: Option<T>,
     rights: Rights,
@@ -901,16 +892,6 @@ mod tests {
             Err(Error::AccessDenied)
         );
         t.release(&mut src);
-    }
-
-    #[test]
-    fn rights_arg_takes_the_known_rights_only() {
-        assert_eq!(rights_arg(0), Ok(Rights::NONE));
-        assert_eq!(rights_arg(Rights::ALL.0.into()), Ok(Rights::ALL));
-        assert_eq!(rights_arg(0b1001), Ok(Rights::DUPLICATE | Rights::NOTIFY));
-        for raw in [1 << 12, 1 << 31, 1 << 32, u64::MAX] {
-            assert_eq!(rights_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
-        }
     }
 
     #[test]

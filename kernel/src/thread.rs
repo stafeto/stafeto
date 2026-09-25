@@ -23,13 +23,12 @@ use crate::mm::phys::FRAMES;
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::sched;
-use abi::Error;
+use abi::{Error, Policy};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
-pub use kcore::thread::Policy;
 
 #[repr(C)]
 pub struct Thread {
@@ -128,7 +127,7 @@ pub fn create(
     priority: u8,
     policy: Policy,
 ) -> Result<NonNull<Thread>, Error> {
-    kcore::thread::check_start(entry as u64, stack as u64, priority)?;
+    kcore::args::check_start(entry as u64, stack as u64, priority)?;
     // SAFETY: the caller holds a reference to the process.
     let ceiling = unsafe { process.as_ref() }.ceiling();
     assert!(

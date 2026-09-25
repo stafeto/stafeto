@@ -20,9 +20,9 @@
 //! held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
-use crate::thread::{self, Policy, Thread};
+use crate::thread::{self, Thread};
 use crate::{channel, cleanup};
-use abi::{Error, Rights};
+use abi::{Error, Policy, Rights};
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
 use kcore::sync::Lock;

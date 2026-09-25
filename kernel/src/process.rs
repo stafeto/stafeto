@@ -426,8 +426,8 @@ fn create(
     ceiling: u8,
     payer: Option<NonNull<Process>>,
 ) -> Result<NonNull<Process>, Error> {
-    let ceiling = kcore::sched::priority_arg(u64::from(ceiling))?;
-    kcore::process::handle_limit_arg(u64::from(handle_limit))?;
+    let ceiling = kcore::args::priority_arg(u64::from(ceiling))?;
+    kcore::args::handle_limit_arg(u64::from(handle_limit))?;
     let handles = Handles::new(handle_limit)?;
     let mut quota = Account::new(quota);
     let space = AddressSpace::new(&mut quota).map_err(|_| Error::NoMemory)?;
