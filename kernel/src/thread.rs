@@ -3,28 +3,29 @@
 
 //! Threads (spec 4, 8, 8.1): a program's registers, FP and SIMD included,
 //! its scheduling parameters, its message buffer, its own slot of a
-//! channel's queue, its number in the system table and its process, in
-//! objects from the pool of threads of their process. The registers come
-//! first, so TPIDR_EL1, which points at the running thread, points at them
-//! too (vectors.S). The running thread is the one TPIDR_EL1 names; the
-//! kernel stack holds nothing of it. A thread lives while references to it
-//! are left: handles, the one `create` hands out, and the kernel's while
-//! the scheduler holds the thread, from its start until its end, while it
-//! waits in `send` or `receive` too (spec 8.1); it holds a reference to its
-//! process. A thread that ended stays as a shell without its buffer and its
-//! number until its last reference goes, which queues it for cleanup (spec
-//! 7.7): its number goes back as it ends, or with its portion when it never
-//! started. Its process pays from its quota for the pages of its pool of
-//! threads (spec 7.8) and for the buffer while it lasts (spec 7.5).
+//! channel's queue, the handles of its request on their way, its number in
+//! the system table and its process, in objects from the pool of threads of
+//! their process. The registers come first, so TPIDR_EL1, which points at
+//! the running thread, points at them too (vectors.S). The running thread
+//! is the one TPIDR_EL1 names; the kernel stack holds nothing of it. A
+//! thread lives while references to it are left: handles, the one `create`
+//! hands out, and the kernel's while the scheduler holds the thread, from
+//! its start until its end, while it waits in `send` or `receive` too (spec
+//! 8.1); it holds a reference to its process. A thread that ended stays as
+//! a shell without its buffer and its number until its last reference goes,
+//! which queues it for cleanup (spec 7.7): its number goes back as it ends,
+//! or with its portion when it never started. Its process pays from its
+//! quota for the pages of its pool of threads (spec 7.8) and for the buffer
+//! while it lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::channel::{Owner, Wait};
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame};
-use crate::object::Object;
+use crate::object::{self, Moving, Object};
 use crate::process::{self, Process};
 use crate::sched::{self, Tokens};
-use abi::{Error, Policy};
+use abi::{Error, MESSAGE_HANDLES, Policy, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
 use kcore::notify::Slot;
@@ -54,6 +55,14 @@ pub struct Thread {
     /// the request, at the level of its effective priority when it began
     /// to wait. Only the channel changes it, under the scheduler's lock.
     slot: Slot<Owner>,
+    /// The handles of its request or reply on their way (spec 6.1): out of
+    /// its process's table, until the meeting puts them into the table of
+    /// the receiver, which it does at once for a reply or when a receiver
+    /// waits. A request that waits in the queue of a channel keeps them;
+    /// they go with PEER_CLOSED at the stage Close, with the buffer when the
+    /// thread ends, and when the meeting finds no room for them
+    /// (`drop_transit`). Only the channel changes it.
+    pub transit: Moving,
     /// Its number in the system table (spec 6.1, 7.8), from `create` until
     /// it ends (sched::exit) or, when it never started, until its portion
     /// of cleanup: the tokens of its requests carry it. None once it went
@@ -93,6 +102,9 @@ struct Buffer {
 }
 
 const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
+
+// Three threads to a page of a pool (spec 7.8).
+const _: () = assert!(kcore::slab::Pool::<Thread>::PER_PAGE >= 3);
 
 // SAFETY: threads are reached under the kernel's rules (spec 8.1): one
 // CPU, interrupts masked inside the kernel.
@@ -167,6 +179,7 @@ pub fn create(
         waits: None,
         // The owner is the thread's own place, known once it has one.
         slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
+        transit: [None; MESSAGE_HANDLES],
         index: None,
         boost_token: 0,
         siblings: None,
@@ -247,14 +260,19 @@ pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
 /// Gives the message buffer's frame back, if the thread has one, and
 /// refunds it to the process (phys::free): its page is unmapped first, with
 /// its TLB entry, while the process's space lives; otherwise the page went
-/// with the space.
+/// with the space. The handles of a request the thread made go with it,
+/// each released at `cause` (`drop_transit`, spec 6.1, 7.7).
 ///
 /// # Safety
-/// `t` is alive and does not run at EL0 again with its buffer.
-pub unsafe fn drop_buffer(t: NonNull<Thread>) {
+/// `t` is alive, waits in no queue, and does not run at EL0 again with its
+/// buffer.
+pub unsafe fn drop_buffer(t: NonNull<Thread>, cause: u8) {
     // SAFETY: the caller's promise; only the fields are touched, since the
     // thread may be released from its process's table meanwhile.
-    let (buffer, p) = unsafe { ((*t.as_ptr()).buffer.take(), (*t.as_ptr()).process) };
+    let (buffer, p) = unsafe {
+        drop_transit(t, cause);
+        ((*t.as_ptr()).buffer.take(), (*t.as_ptr()).process)
+    };
     let Some(Buffer { va, frame }) = buffer else {
         return;
     };
@@ -287,6 +305,58 @@ pub unsafe fn copy_message(to: NonNull<Thread>, from: NonNull<Thread>, range: Ra
     to.frame.copy_from(&from.frame, range);
 }
 
+/// The handles on their way in `t` (Thread::transit), which no table took,
+/// go, each released at `cause` as a closed handle is (spec 6.1): returns
+/// how many. O(1): at most abi::MESSAGE_HANDLES.
+///
+/// # Safety
+/// `t` is alive, waits in no queue, and does not run meanwhile.
+pub unsafe fn drop_transit(t: NonNull<Thread>, cause: u8) -> usize {
+    // SAFETY: the caller's promise; only the field is touched.
+    let transit = unsafe { &mut (*t.as_ptr()).transit };
+    if transit[0].is_none() {
+        return 0;
+    }
+    let moving = core::mem::replace(transit, [None; MESSAGE_HANDLES]);
+    let n = moving.iter().flatten().count();
+    // SAFETY: the references were the handles', which left the table.
+    unsafe { object::release_moving(moving, cause) };
+    n
+}
+
+/// The values of the `n` handles a message of `t` carries, which its
+/// program put in its message buffer (abi::msgbuf::HANDLES, spec 6.2): read
+/// once, before any check. A thread that sends or answers with handles has
+/// its buffer until it ends.
+pub fn handle_values(t: NonNull<Thread>, n: usize) -> [u64; MESSAGE_HANDLES] {
+    // SAFETY: the caller holds the thread; only the field is borrowed.
+    let Some(buffer) = (unsafe { &(*t.as_ptr()).buffer }) else {
+        unreachable!("a thread that takes part in a message has its buffer");
+    };
+    let mut values = [0; MESSAGE_HANDLES];
+    for (i, v) in values.iter_mut().enumerate().take(n) {
+        *v = buffer.frame.word(msgbuf::HANDLES + 8 * i);
+    }
+    values
+}
+
+/// Writes the handles a message brought to `t`, their values and info
+/// words (process::put_handles), into its message buffer at
+/// abi::msgbuf::HANDLES and INFO (spec 6.2); the rest of both stays.
+///
+/// # Safety
+/// `t` is alive, and nothing else borrows its buffer.
+pub unsafe fn write_handles(t: NonNull<Thread>, handles: &[(u64, u64)]) {
+    // SAFETY: the caller's promise.
+    let Some(buffer) = (unsafe { &mut (*t.as_ptr()).buffer }) else {
+        unreachable!("a thread that takes part in a message has its buffer");
+    };
+    for (i, &(value, info)) in handles.iter().enumerate() {
+        buffer.frame.set_word(msgbuf::HANDLES + 8 * i, value);
+        buffer.frame.set_word(msgbuf::INFO + 8 * i, info);
+    }
+}
+
 /// A stopped thread becomes ready (thread_start, and the kernel for
 /// init's first thread): the tail of its level with a new quantum, and a
 /// started thread of its process from now on. BAD_STATE when its process
@@ -317,7 +387,7 @@ pub unsafe fn exit(t: NonNull<Thread>) {
     // SAFETY: the thread never runs at EL0 again, and the caller hands it
     // over; the process lives until the release below.
     unsafe {
-        drop_buffer(t);
+        drop_buffer(t, cause);
         sched::exit(t, cause);
         process::remove_thread(p, t);
         process::thread_exited(p, cause);
@@ -379,9 +449,10 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     }
 }
 
-/// The portion of a thread nobody refers to (cleanup): its buffer goes, its
-/// number goes back to the system table with its count if it never started
-/// (spec 6.1), it leaves its process's list if it is still there, its slot
+/// The portion of a thread nobody refers to (cleanup): its buffer goes with
+/// the handles of a request it made, released at `level`, its number goes
+/// back to the system table with its count if it never started (spec 6.1),
+/// it leaves its process's list if it is still there, its slot
 /// goes back to its process's pool, and then its reference to its process,
 /// queued at `level` if it was the last. When the thread ran last, no
 /// thread ran after it.
@@ -397,7 +468,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
     // SAFETY: nothing uses the thread afterwards, and it leaves its
     // process's list before its slot goes.
     unsafe {
-        drop_buffer(thread);
+        drop_buffer(thread, level);
         sched::locked(|k| give_number(thread, k.tokens));
         process::remove_thread(process, thread);
         process::free_thread_slot(process, thread);

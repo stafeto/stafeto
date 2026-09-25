@@ -12,39 +12,44 @@
 //! slot, which is its request in `send`; a request a receiver took waits
 //! for its reply in the queue of accepted requests of the receiver's
 //! process (process::accepted), and a token of the table of thread numbers
-//! names it (spec 6.1). The queues change together with the states of the
-//! threads in them, so every change to them happens under the scheduler's
-//! lock (sched::locked). A channel lives while references to it are left:
-//! handles with any rights, threads that wait in it, the sources of
-//! notifications that have a slot there (sessions, exits of processes and
-//! timers), and the cleanup queue's while it closes; the last one queues
-//! its shell (spec 7.7). Every source holds one of its abi::MAX_SLOTS
-//! slots, the slot of label 0 among them, from its creation until it goes,
-//! and a slot that stands in the queue holds its owner until receive or the
-//! stage Close takes it (spec 6.5). The last handle with RECEIVE closes it
-//! in the call itself: `notify` and `send` fail with PEER_CLOSED from then
-//! on, nothing new waits or is queued, and the stage Close wakes the
-//! threads that wait with PEER_CLOSED or empties the queued slots, letting
-//! their owners go, CLOSE_PORTION heads of one level a portion, at the
-//! level of its top waiter when that is above the cause (spec 7.7). A
-//! request a receiver took lives on without the channel.
+//! names it (spec 6.1). The handles of a message move from the sender's
+//! table into the receiver's with their references; a request that waits
+//! in a queue carries them (Thread::transit). The queues change together
+//! with the states of the threads in them, so every change to them happens
+//! under the scheduler's lock (sched::locked). A channel lives while
+//! references to it are left: handles with any rights, threads that wait
+//! in it, the sources of notifications that have a slot there (sessions,
+//! exits of processes and timers), and the cleanup queue's while it
+//! closes; the last one queues its shell (spec 7.7). Every source holds
+//! one of its abi::MAX_SLOTS slots, the slot of label 0 among them, from
+//! its creation until it goes, and a slot that stands in the queue holds
+//! its owner until receive or the stage Close takes it (spec 6.5). The
+//! last handle with RECEIVE closes it in the call itself: `notify` and
+//! `send` fail with PEER_CLOSED from then on, nothing new waits or is
+//! queued, and the stage Close wakes the threads that wait with
+//! PEER_CLOSED or empties the queued slots, letting their owners go,
+//! CLOSE_PORTION heads of one level a portion, at the level of its top
+//! waiter when that is above the cause (spec 7.7). A request a receiver
+//! took lives on without the channel.
 
 use crate::cleanup::{self, Item};
-use crate::object::Object;
+use crate::object::{self, Moving, Object};
 use crate::process::{self, Process};
 use crate::sched::{self, Locked};
 use crate::session::{self, Session};
 use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
-use abi::{Error, INLINE_MAX, MAX_SLOTS, Notification, Rights, Source};
+use abi::{Error, INLINE_MAX, MAX_SLOTS, MESSAGE_HANDLES, Notification, Rights, Source};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
 use kcore::notify::{Post, Queue, Slot};
 use kcore::sched::Scheduler;
 
-/// Heads of one level a portion of the stage Close takes, at most: threads
-/// that wait, or queued slots (spec 7.7).
+/// The work a portion of the stage Close does, at most (spec 7.7): each
+/// head of one level, a thread that waits or a queued slot, is a unit, and
+/// each handle a sender's request carries one more; the head that reaches
+/// it is the portion's last.
 const CLOSE_PORTION: usize = 32;
 
 /// Whose slot it is (spec 6.5), which gives the source and the label that
@@ -502,8 +507,44 @@ enum Taken {
     /// A notification slot, which held its owner.
     Slot(Owner),
     /// A thread that waited, which held what it went through (receive and
-    /// the stage Close) or the channel (the stage Close).
-    Request(Via),
+    /// the stage Close) or the channel (the stage Close), and the sender
+    /// whose handles no table took, a meeting that failed or the stage
+    /// Close, which go after the lock too (thread::drop_transit).
+    Request(Via, Option<NonNull<Thread>>),
+}
+
+/// No handles.
+const NO_HANDLES: Moving = [None; MESSAGE_HANDLES];
+
+/// What the first look of receive at a channel's queue came to.
+enum Looked {
+    /// What it took under the scheduler's lock, if anything.
+    Done(Option<Taken>),
+    /// The request at the head, of this client, whose handles need room in
+    /// the receiver's table first.
+    Handles(NonNull<Thread>),
+}
+
+/// The description of the request of `client`, which waits in `send`: its
+/// own x1, which the call checked.
+///
+/// # Safety
+/// `client` is alive.
+unsafe fn sent(client: NonNull<Thread>) -> Desc {
+    // SAFETY: the caller's promise; only the register is read.
+    Desc::from_send(unsafe { (*client.as_ptr()).regs.x[1] })
+        .expect("a request's description was checked")
+}
+
+/// The handles `values` of a message of `t`, the running thread, go where
+/// no table takes them (spec 6.1): out of its process's table, each
+/// released at `t`'s priority.
+fn drop_handles(t: NonNull<Thread>, values: &[u64]) {
+    // SAFETY: the running thread is alive and holds its process.
+    let (p, cause) = unsafe { (t.as_ref().process(), t.as_ref().priority()) };
+    let moving = process::take_handles(p, values);
+    // SAFETY: the references were the handles', which left the table.
+    unsafe { object::release_moving(moving, cause) };
 }
 
 /// receive (spec 6.1, 6.5, 6.6) for `t`, the running thread, on `c`, to
@@ -513,35 +554,42 @@ enum Taken {
 /// slot, emptied into x0-x11, after which `t` works at the slot's priority
 /// under its ceiling until its next receive, and the slot lets its owner
 /// go at that priority after the scheduler's lock; or a request, which `t`
-/// takes (`accept`), and the reference of its sender's wait goes after
-/// the lock. With nothing queued, WOULD_BLOCK when `wait` is false;
+/// takes (`accept`) once its handles have room in the table of `t`'s
+/// process (process::reserve_handles), the reference of its sender's wait
+/// going after the lock. A request whose handles find no room fails its
+/// sender with that error, LIMIT_REACHED or NO_MEMORY, and its handles go at
+/// `t`'s priority; the call then starts over at its `svc` with its
+/// registers as they were (syscall::restart), and takes the next head
+/// (spec 6.1). With nothing queued, WOULD_BLOCK when `wait` is false;
 /// otherwise `t` waits through its own slot at the tail of its level,
 /// holding a reference to `c`, and gets its result when the wait ends
 /// (`post`, `send`, `clean`). O(1).
 pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<(), Error> {
     let ceiling = ceiling(t);
-    let taken = sched::locked(|k| {
+    let looked = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
         // holds, are alive; the sender of a queued request waits, so it is
         // alive, and its wait holds what it went through.
         unsafe {
             k.s.unboost(t);
             (*t.as_ptr()).boost_token = 0;
-            if let Some(slot) = queue(c, k.s).take_slot() {
+            let q = queue(c, k.s);
+            if !q.has_receivers()
+                && let Some(slot) = q.head()
+            {
                 let owner = (*slot.as_ptr()).owner();
                 if let Owner::Thread(client) = owner {
-                    let Some(Wait::Send(via)) = (*client.as_ptr()).waits else {
-                        unreachable!("a request whose thread does not send");
-                    };
-                    let desc = Desc::from_send((*client.as_ptr()).regs.x[1])
-                        .expect("a request's description was checked");
-                    accept(k, t, client, via, desc);
-                    return Ok(Some(Taken::Request(via)));
+                    if sent(client).handles > 0 {
+                        // Its handles need room first, which may take a page.
+                        return Ok(Looked::Handles(client));
+                    }
+                    return Ok(Looked::Done(Some(take_request(k, t, c, client, Ok(())))));
                 }
+                q.take_slot();
                 let (n, priority) = notice(slot);
                 syscall::set_notification(t, n);
                 k.s.boost(t, priority, ceiling);
-                return Ok(Some(Taken::Slot(owner)));
+                return Ok(Looked::Done(Some(Taken::Slot(owner))));
             }
             if !wait {
                 return Err(Error::WouldBlock);
@@ -554,46 +602,137 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
             (*t.as_ptr()).waits = Some(Wait::Receive(c));
         }
         retain(c, Rights::NONE);
-        Ok(None)
+        Ok(Looked::Done(None))
     })?;
+    let taken = match looked {
+        Looked::Done(taken) => taken,
+        Looked::Handles(client) => {
+            // SAFETY: the running thread holds its process; the client
+            // waits, so it is alive.
+            let n = unsafe { sent(client) }.handles;
+            let fit = process::reserve_handles(unsafe { t.as_ref() }.process(), n);
+            // SAFETY: nothing changed the queue meanwhile: one CPU, and
+            // interrupts are masked in the kernel (spec 8.1).
+            Some(sched::locked(|k| unsafe {
+                take_request(k, t, c, client, fit)
+            }))
+        }
+    };
     // SAFETY: the running thread is alive; the reference of the slot or of
-    // the sender's wait goes, and nothing uses it afterwards.
+    // the sender's wait goes, and so do the handles no table took; nothing
+    // uses them afterwards.
     unsafe {
         let cause = t.as_ref().priority();
         match taken {
             Some(Taken::Slot(owner)) => owner.let_go(cause),
-            Some(Taken::Request(via)) => via.let_go(cause),
+            Some(Taken::Request(via, sender)) => {
+                if let Some(sender) = sender {
+                    thread::drop_transit(sender, cause);
+                }
+                via.let_go(cause);
+            }
             None => {}
         }
     }
     Ok(())
 }
 
+/// The request of `client`, the head of the queue of `c`, leaves it for
+/// `t`'s receive (spec 6.1): with room for its handles (`fit`), `t` takes
+/// it (`accept`); otherwise its sender wakes with that error in x0 alone,
+/// at the tail of its level with a new quantum, and `t`'s call starts over
+/// (syscall::restart). Returns what the request's wait held, and the
+/// sender whose handles no table took, for after the lock. O(1).
+///
+/// # Safety
+/// `t` runs; `c` is alive, and `client` waits in send at the head of its
+/// queue; `k` is the locked scheduler.
+unsafe fn take_request(
+    k: &mut Locked<'_>,
+    t: NonNull<Thread>,
+    c: NonNull<Channel>,
+    client: NonNull<Thread>,
+    fit: Result<(), Error>,
+) -> Taken {
+    // SAFETY: the caller's promise; the client's wait holds what it went
+    // through, and its handles lie in it.
+    unsafe {
+        let taken = queue(c, k.s).take_slot();
+        assert!(
+            taken == Some(thread::slot(client)),
+            "the head of a channel's queue moved while its receiver made room"
+        );
+        let Some(Wait::Send(via)) = (*client.as_ptr()).waits else {
+            unreachable!("a request whose thread does not send");
+        };
+        if let Err(e) = fit {
+            (*client.as_ptr()).waits = None;
+            syscall::set_result(client, Err(e));
+            k.s.wake(client);
+            syscall::restart(t);
+            return Taken::Request(via, Some(client));
+        }
+        accept(k, t, client, via, sent(client));
+        Taken::Request(via, None)
+    }
+}
+
 /// send (spec 6.1, 6.3) for `t`, the running thread, through `via`, to
-/// which it holds a handle with SEND, with the description `desc`, checked;
-/// the request is `t`'s own x1-x9. The checks of state in the order of
-/// spec 11: BAD_STATE when `t` has no count of requests left (spec 6.1),
-/// PEER_CLOSED once the channel closed, WOULD_BLOCK with NO_WAIT when no
-/// receiver waits; nothing happens then. Otherwise `t` waits for the reply
-/// (Ok), its own slot at the level of its effective priority: the top
-/// receiver that waits takes the request at once (`accept`) and becomes
-/// ready at the tail of its level with a new quantum, the reference of its
-/// wait going after the scheduler's lock; or else the slot goes to the
-/// tail of its level in the channel's queue (spec 6.3) and holds `via`
-/// until a receive takes it. O(1).
-pub fn send(t: NonNull<Thread>, via: Via, desc: Desc) -> Result<(), Error> {
+/// which it holds a handle with SEND, with the description `desc` and the
+/// handles `values` of its process, all checked; the request is `t`'s own
+/// x1-x9. The checks of state in the order of spec 11: BAD_STATE when `t`
+/// has no count of requests left (spec 6.1); PEER_CLOSED once the channel
+/// closed, and the handles go then, released at `t`'s priority;
+/// WOULD_BLOCK with NO_WAIT when no receiver waits. Otherwise the top
+/// receiver that waits takes the request at once (`accept`) once its
+/// handles have room in the receiver's table (process::reserve_handles):
+/// LIMIT_REACHED or NO_MEMORY otherwise, the handles go and the receiver
+/// waits on. With the request taken or no receiver waiting, `t` waits for
+/// the reply (Ok), its own slot at the level of its effective priority and
+/// its handles out of its process's table (process::take_handles): the
+/// receiver becomes ready at the tail of its level with a new quantum, the
+/// reference of its wait going after the scheduler's lock; or else the
+/// slot goes to the tail of its level in the channel's queue (spec 6.3),
+/// holding `via` and the handles (Thread::transit) until a receive takes
+/// it. O(1).
+pub fn send(t: NonNull<Thread>, via: Via, desc: Desc, values: &[u64]) -> Result<(), Error> {
     let c = via.channel();
     sched::locked(|k| k.tokens.check_count(thread::index(t)))?;
     if is_closed(c) {
+        drop_handles(t, values);
         return Err(Error::PeerClosed);
+    }
+    let receiver = sched::locked(|k| {
+        // SAFETY: the channel, which the sender's handle holds, is alive; a
+        // thread that waits in receive is alive, and its slot lies in it.
+        unsafe {
+            let q = queue(c, k.s);
+            q.has_receivers()
+                .then(|| thread_of(q.head().expect("a receiver")))
+        }
+    });
+    if desc.no_wait && receiver.is_none() {
+        return Err(Error::WouldBlock);
+    }
+    if let Some(r) = receiver
+        && !values.is_empty()
+        // SAFETY: a thread that waits is alive and holds its process.
+        && let Err(e) = process::reserve_handles(unsafe { r.as_ref() }.process(), values.len())
+    {
+        drop_handles(t, values);
+        return Err(e);
+    }
+    if !values.is_empty() {
+        // SAFETY: the running thread holds its process, and its handles on
+        // their way are its own.
+        unsafe { (*t.as_ptr()).transit = process::take_handles(t.as_ref().process(), values) };
     }
     let took = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
-        // holds, are alive; a thread that waits in receive is alive.
+        // holds, are alive; a thread that waits in receive is alive, and
+        // nothing changed the queue since it was looked at: one CPU, and
+        // interrupts are masked in the kernel (spec 8.1).
         unsafe {
-            if desc.no_wait && !queue(c, k.s).has_receivers() {
-                return Err(Error::WouldBlock);
-            }
             let running = k.s.block();
             assert!(running == t, "a thread that does not run sends");
             let slot = thread::slot(t);
@@ -601,15 +740,16 @@ pub fn send(t: NonNull<Thread>, via: Via, desc: Desc) -> Result<(), Error> {
             let Some(r) = queue(c, k.s).send(slot) else {
                 (*t.as_ptr()).waits = Some(Wait::Send(via));
                 via.hold();
-                return Ok(false);
+                return false;
             };
             let r = thread_of(r);
+            assert!(Some(r) == receiver, "the receiver of a request changed");
             (*r.as_ptr()).waits = None;
             accept(k, r, t, via, desc);
             k.s.wake(r);
-            Ok(true)
+            true
         }
-    })?;
+    });
     if took {
         // SAFETY: the reference was the receiver's wait's; the sender's
         // handle keeps the channel, and the sender is alive.
@@ -622,11 +762,15 @@ pub fn send(t: NonNull<Thread>, via: Via, desc: Desc) -> Result<(), Error> {
 /// comes to (spec 6.1, 6.2, 11): x0 0, x1 the description, x2-x9 bytes
 /// 0-63 from the sender's registers, zero past the length; bytes 64 up to
 /// the length go from the sender's message buffer into the receiver's, at
-/// the same offsets (thread::copy_message). O(1): at most 960 bytes.
+/// the same offsets (thread::copy_message); the handles on their way in
+/// `from` (Thread::transit) go into the table of `to`'s process, which
+/// made room for them, and their values and info words into `to`'s buffer
+/// (process::put_handles, thread::write_handles). O(1): at most 960 bytes
+/// and four handles.
 ///
 /// # Safety
 /// `to` and `from` are alive and differ; nothing else borrows their
-/// registers or buffers.
+/// registers or buffers; `from` carries `desc.handles` handles.
 unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
     // SAFETY: the caller's promise; the two threads are two objects.
     unsafe {
@@ -638,6 +782,11 @@ unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
         if desc.len > INLINE_MAX {
             thread::copy_message(to, from, INLINE_MAX..desc.len);
         }
+        if desc.handles > 0 {
+            let moving = core::mem::replace(&mut (*from.as_ptr()).transit, NO_HANDLES);
+            let put = process::put_handles(to.as_ref().process(), moving);
+            thread::write_handles(to, &put[..desc.handles]);
+        }
     }
 }
 
@@ -645,13 +794,15 @@ unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
 /// 6.1, 6.6): the client's count grows by 1 and the token names the
 /// request; the client's own slot goes to the tail of its level in the
 /// queue of accepted requests of `r`'s process, where the client waits for
-/// the reply; x0-x11 of `r` get the message (`deliver`), the label of
-/// `via` and the token; and `r` works at the client's level, under its own
-/// ceiling, until its reply with this token or its next receive. O(1).
+/// the reply; x0-x11 of `r` get the message (`deliver`) with its handles,
+/// the label of `via` and the token; and `r` works at the client's level,
+/// under its own ceiling, until its reply with this token or its next
+/// receive. O(1).
 ///
 /// # Safety
 /// `r` and `client` are alive and differ; `client` waits in send through
-/// `via` with the description `desc`, its slot in no queue; `r` has no
+/// `via` with the description `desc` and carries its handles, its slot in
+/// no queue; the table of `r`'s process has room for them; `r` has no
 /// boost.
 unsafe fn accept(
     k: &mut Locked<'_>,
@@ -677,40 +828,80 @@ unsafe fn accept(
     }
 }
 
-/// reply (spec 6.1, 6.6) of `t`, the running thread, with its x1-x9 and
-/// the description `desc`, checked, to the request `token` names. A reply
-/// with the token of `t`'s boost ends the boost first, whatever comes of it
-/// (spec 6.6). Then BAD_STATE when the token names no request that waits
-/// for a reply from `t`'s process: a number outside the table, a count
-/// other than the number's last, or a client that waits for no reply or
-/// for one from another process; PEER_CLOSED when its client ended while
-/// it waited (Table::mark_dead, spec 6.8), each time it is tried; nothing
-/// else happens then. Otherwise the token is used up: the client leaves the
-/// queue of accepted requests and becomes ready at the tail of its level
-/// with a new quantum, its registers holding the message (`deliver`).
-/// Never waits. O(1).
-pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc) -> Result<(), Error> {
-    sched::locked(|k| {
+/// reply (spec 6.1, 6.6) of `t`, the running thread, with its x1-x9, the
+/// description `desc` and the handles `values` of its process, all
+/// checked, to the request `token` names. A reply with the token of `t`'s
+/// boost ends the boost first, whatever comes of it (spec 6.6). Then
+/// BAD_STATE when the token names no request that waits for a reply from
+/// `t`'s process: a number outside the table, a count other than the
+/// number's last, or a client that waits for no reply or for one from
+/// another process; nothing else happens then. PEER_CLOSED when its client
+/// ended while it waited (Table::mark_dead, spec 6.8), each time it is
+/// tried, and the handles go. Otherwise the token is used up: the client
+/// leaves the queue of accepted requests and becomes ready at the tail of
+/// its level with a new quantum, its registers holding the message with
+/// its handles (`deliver`) once they have room in the client's table
+/// (process::reserve_handles); with no room the reply and the client's
+/// send both fail with LIMIT_REACHED or NO_MEMORY, in x0 alone, and the
+/// handles go. Handles that go are released at `t`'s priority. Never
+/// waits. O(1).
+pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Result<(), Error> {
+    let client = sched::locked(|k| {
         // SAFETY: the running thread is alive; so is a thread whose number
-        // is taken (it gives the number back as it ends), and the process
-        // it waits for holds its slot; a client that waits is not `t`.
+        // is taken (it gives the number back as it ends); a client that
+        // waits is not `t`.
         unsafe {
             if token != 0 && (*t.as_ptr()).boost_token == token {
                 k.s.unboost(t);
                 (*t.as_ptr()).boost_token = 0;
             }
             let client = k.tokens.check(token)?;
-            let p = t.as_ref().process();
-            if (*client.as_ptr()).waits != Some(Wait::Reply(p)) {
+            if (*client.as_ptr()).waits != Some(Wait::Reply(t.as_ref().process())) {
                 return Err(Error::BadState);
             }
+            Ok(client)
+        }
+    });
+    let client = match client {
+        Err(Error::PeerClosed) => {
+            drop_handles(t, values);
+            return Err(Error::PeerClosed);
+        }
+        client => client?,
+    };
+    // SAFETY: the running thread and the client that waits for its reply
+    // are alive and hold their processes; the running thread's handles on
+    // their way are its own.
+    let fit = unsafe {
+        if values.is_empty() {
+            Ok(())
+        } else {
+            let fit = process::reserve_handles(client.as_ref().process(), values.len());
+            (*t.as_ptr()).transit = process::take_handles(t.as_ref().process(), values);
+            fit
+        }
+    };
+    sched::locked(|k| {
+        // SAFETY: as above; the process that took the request holds the
+        // client's slot, and nothing changed since the check: one CPU, and
+        // interrupts are masked in the kernel (spec 8.1).
+        unsafe {
+            let p = t.as_ref().process();
             process::accepted(p, k.s).remove(thread::slot(client));
             (*client.as_ptr()).waits = None;
-            deliver(client, t, desc);
+            match fit {
+                Ok(()) => deliver(client, t, desc),
+                Err(e) => syscall::set_result(client, Err(e)),
+            }
             k.s.wake(client);
         }
-        Ok(())
-    })
+    });
+    if fit.is_err() {
+        // SAFETY: the running thread is alive, and no table took its
+        // handles.
+        unsafe { thread::drop_transit(t, t.as_ref().priority()) };
+    }
+    fit
 }
 
 /// The end of `t` while it waits (sched::exit, spec 6.8, 7.7): its slot
@@ -719,8 +910,9 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc) -> Result<(), Error> {
 /// and then its number keeps the mark of a thread that died waiting for
 /// its reply (Table::mark_dead). What the wait held, a channel or a
 /// session, goes to the caller, which lets it go once the scheduler has
-/// let the thread go (`Via::let_go`). None for a thread that waits for
-/// nothing, or for a reply. O(1).
+/// let the thread go (`Via::let_go`); the handles of a request stay in the
+/// thread until its buffer goes (thread::drop_buffer). None for a thread
+/// that waits for nothing, or for a reply. O(1).
 ///
 /// # Safety
 /// `t` is alive; `k` is the locked scheduler.
@@ -800,18 +992,19 @@ pub unsafe fn raise(w: Wait) {
 }
 
 /// One portion of a channel in the cleanup queue (cleanup::portion), taken
-/// at `level`. At the stage Close, while the queue's reference holds it: up
-/// to CLOSE_PORTION heads of the top level leave the queue: threads that
-/// wait in receive or in send, each woken with PEER_CLOSED at the tail of
-/// its level with a new quantum (spec 6.1, 6.8), its wait letting go what
-/// it held at the cause of the close; or slots, emptied, each letting its
-/// owner go at that cause (a session whose copies went goes, as after
-/// receive); a head a time under the scheduler's lock, what it held after
-/// it. With heads left the channel goes back to the head of the higher of
-/// the cause and their top level (spec 7.7), and otherwise the queue's
-/// reference goes, which queues the shell at the cause when it was the
-/// last. With no reference left, the shell's portion: the slot goes back to
-/// the payer's pool, and then the reference to the payer's shell.
+/// at `level`. At the stage Close, while the queue's reference holds it:
+/// heads of the top level leave the queue, CLOSE_PORTION units of work at
+/// most: threads that wait in receive or in send, each woken with
+/// PEER_CLOSED at the tail of its level with a new quantum (spec 6.1, 6.8),
+/// its wait letting go what it held and a sender's handles going, up to
+/// abi::MESSAGE_HANDLES, at the cause of the close; or slots, emptied, each
+/// letting its owner go at that cause (a session whose copies went goes, as
+/// after receive); a head a time under the scheduler's lock, what it held
+/// after it. With heads left the channel goes back to the head of the
+/// higher of the cause and their top level (spec 7.7), and otherwise the
+/// queue's reference goes, which queues the shell at the cause when it was
+/// the last. With no reference left, the shell's portion: the slot goes
+/// back to the payer's pool, and then the reference to the payer's shell.
 ///
 /// # Safety
 /// The channel was just taken from the queue.
@@ -829,7 +1022,8 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
     let top = sched::locked(|k| unsafe { queue(c, k.s).top() });
     let mut woken = 0u32;
     let mut heads = 0;
-    while heads < CLOSE_PORTION {
+    let mut work = 0;
+    while work < CLOSE_PORTION {
         let head = sched::locked(|k| {
             // SAFETY: the channel is alive; a thread that waits is alive,
             // and a queued slot holds its owner, in which it lies.
@@ -844,27 +1038,38 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
                     (*slot.as_ptr()).take();
                     return Some(Taken::Slot(owner));
                 };
-                let via = match (*t.as_ptr()).waits.take() {
-                    Some(Wait::Receive(_)) => Via::Channel(c),
-                    Some(Wait::Send(via)) => via,
+                let (via, sender) = match (*t.as_ptr()).waits.take() {
+                    Some(Wait::Receive(_)) => (Via::Channel(c), None),
+                    Some(Wait::Send(via)) => (via, Some(t)),
                     _ => unreachable!("a thread in a channel's queue waits for no channel"),
                 };
                 syscall::set_result(t, Err(Error::PeerClosed));
                 k.s.wake(t);
-                Some(Taken::Request(via))
+                Some(Taken::Request(via, sender))
             }
         });
         match head {
             None => break,
-            // The references to the channel itself go below.
-            Some(Taken::Request(Via::Channel(_))) => woken += 1,
-            // SAFETY: the thread's wait held the session.
-            Some(Taken::Request(via)) => unsafe { via.let_go(cause) },
+            Some(Taken::Request(via, sender)) => {
+                if let Some(sender) = sender {
+                    // SAFETY: the sender is alive, since the kernel's
+                    // reference keeps a ready thread, and it does not run
+                    // before the portion ends.
+                    work += unsafe { thread::drop_transit(sender, cause) };
+                }
+                match via {
+                    // The references to the channel itself go below.
+                    Via::Channel(_) => woken += 1,
+                    // SAFETY: the thread's wait held the session.
+                    via => unsafe { via.let_go(cause) },
+                }
+            }
             // SAFETY: the slot left the queue, whose reference to its
             // owner goes.
             Some(Taken::Slot(owner)) => unsafe { owner.let_go(cause) },
         }
         heads += 1;
+        work += 1;
     }
     // SAFETY: as above.
     let left = sched::locked(|k| unsafe { queue(c, k.s).top() });

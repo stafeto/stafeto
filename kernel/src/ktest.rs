@@ -178,6 +178,14 @@ const TESTS: &[(&str, TestFn)] = &[
         teardown_resumes_where_it_stopped,
     ),
     (
+        "buffers_stage_counts_the_handles",
+        buffers_stage_counts_the_handles,
+    ),
+    (
+        "thread_portion_lets_its_handles_go",
+        thread_portion_lets_its_handles_go,
+    ),
+    (
         "parent_quota_stage_sees_children_done",
         parent_quota_stage_sees_children_done,
     ),
@@ -1827,6 +1835,132 @@ fn teardown_resumes_where_it_stopped(boot: &Boot) -> Result<(), &'static str> {
     check(
         process::in_use() == processes && thread::in_use() == threads,
         "the process or its threads stayed in their pools",
+    )
+}
+
+/// Threads of `buffers_stage_counts_the_handles`.
+const CARRIERS: usize = 16;
+
+/// The stage Buffers counts the handles of the threads' requests as work
+/// (spec 7.7): CARRIERS threads of a process that never ran, each with a
+/// buffer and four handles on their way (Thread::transit), as a request
+/// that waited in a queue leaves them. The first portion of the stage gives
+/// 13 buffers back, whose 13 units of five reach its 64, and the second
+/// the other 3; the handles go with them, and their channel then too.
+fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 9;
+    cleanup::drain();
+    let (processes, threads, channels) = (process::in_use(), thread::in_use(), channel::in_use());
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let payer = process::create_root(QUOTA, 16, 63);
+    let c = payer.map_err(|_| "no process").and_then(|payer| {
+        let c = channel::create(payer, 10).map_err(|_| "no channel");
+        // SAFETY: the test's reference goes; the channel holds the shell.
+        unsafe { process::release(payer, CAUSE) };
+        c
+    });
+    let mut carriers = [None; CARRIERS];
+    let result = c
+        .and_then(|c| give_carriers(p, c, &mut carriers))
+        .and_then(|()| check_buffer_portions(p, LEVEL));
+    // SAFETY: the test's references go, and nothing uses them afterwards.
+    unsafe {
+        if let Ok(c) = c {
+            channel::release(c, Rights::NONE, CAUSE);
+        }
+        for t in carriers.into_iter().flatten() {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+        process::release(p, CAUSE);
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use(), channel::in_use()) == (processes, threads, channels),
+        "the process, its threads or the channel of their handles stayed",
+    )
+}
+
+/// A thread's own portion lets the handles on its way go (spec 6.1, 7.7):
+/// CARRIERS threads of a live process that never ran, each with a buffer
+/// and four handles to a channel on their way (Thread::transit), as a
+/// request that waited in a queue leaves them. Once their last references
+/// go, their portions give the buffers back and release the handles, and
+/// the channel goes with them.
+fn thread_portion_lets_its_handles_go(_: &Boot) -> Result<(), &'static str> {
+    cleanup::drain();
+    let (processes, threads, channels) = (process::in_use(), thread::in_use(), channel::in_use());
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let c = channel::create(p, 10).map_err(|_| "no channel");
+    let mut carriers = [None; CARRIERS];
+    let result = c.and_then(|c| give_carriers(p, c, &mut carriers));
+    // SAFETY: the test's references go, and nothing uses them afterwards;
+    // the threads never ran, so each goes with its own portion.
+    unsafe {
+        if let Ok(c) = c {
+            channel::release(c, Rights::NONE, CAUSE);
+        }
+        for t in carriers.into_iter().flatten() {
+            thread::release(t, CAUSE);
+        }
+    }
+    cleanup::drain();
+    let gone = (thread::in_use(), channel::in_use()) == (threads, channels);
+    // SAFETY: as above.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        gone && process::in_use() == processes,
+        "the handles on their way stayed with the threads' portions",
+    )
+}
+
+/// CARRIERS threads of `p` in `carriers`, each with a buffer and four
+/// handles to `c` on their way.
+fn give_carriers(
+    p: NonNull<process::Process>,
+    c: NonNull<channel::Channel>,
+    carriers: &mut [Option<NonNull<thread::Thread>>; CARRIERS],
+) -> Result<(), &'static str> {
+    for (i, slot) in carriers.iter_mut().enumerate() {
+        let t =
+            thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+        *slot = Some(t);
+        thread::give_buffer(t, USER_VA + (i + 1) * PAGE).map_err(|_| "no buffer")?;
+        let mut values = [0; 4];
+        for v in &mut values {
+            *v = process::insert_handle(p, Object::Channel(c), Rights::NONE)
+                .map_err(|_| "a handle did not go in")?
+                .0;
+        }
+        // SAFETY: the thread never runs, and its handles on their way are
+        // the test's to set.
+        unsafe { (*t.as_ptr()).transit = process::take_handles(p, &values) };
+    }
+    Ok(())
+}
+
+fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), &'static str> {
+    // SAFETY: the test holds a reference to the process.
+    unsafe { process::end(p, ProcessState::Killed, level) };
+    for _ in 0..64 {
+        if process::progress(p).0 == Stage::Buffers {
+            break;
+        }
+        cleanup::portion();
+    }
+    let frames = phys::free_frames();
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 13,
+        "the first portion of the stage Buffers did not stop at 13 buffers",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 16,
+        "the second portion of the stage Buffers did not give the other 3 back",
     )
 }
 

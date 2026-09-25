@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The handle table of a process (spec 5.1, 11, 13.3): lookups, inserts
-//! and closes, init's first handles and the start entry of a child.
+//! and closes, the handles of messages, init's first handles and the start
+//! entry of a child.
 
 use super::*;
 
@@ -98,6 +99,57 @@ pub fn close_handle(mut process: NonNull<Process>, h: Handle, cause: u8) -> Resu
     // SAFETY: the handle is gone, and its reference with it.
     unsafe { object::release(object, rights, cause) };
     Ok(())
+}
+
+/// Room in the table of `process` for the `n` handles of a message, at
+/// most abi::MESSAGE_HANDLES (spec 6.1, 11; HandleTable::reserve):
+/// LIMIT_REACHED when it has room for fewer, NO_MEMORY when their chunk
+/// does not fit in the quota of `process`, which pays for it. After Ok the
+/// next `put_handles` cannot fail. It adds at most one chunk.
+pub fn reserve_handles(process: NonNull<Process>, n: usize) -> Result<(), Error> {
+    // SAFETY: the caller holds a reference to the process.
+    let (handles, mut chunks) = unsafe { table(process) };
+    handles.reserve(&mut chunks, n as u32)
+}
+
+/// Takes the handles `values` of a message out of the table of `process`
+/// (spec 6.1): each keeps its rights and the reference it held, and no
+/// count of the object changes (spec 5.3). The call checked each of them
+/// (BAD_HANDLE, ACCESS_DENIED), and the table did not change since.
+pub fn take_handles(mut process: NonNull<Process>, values: &[u64]) -> Moving {
+    let mut moving = [None; abi::MESSAGE_HANDLES];
+    for (m, &v) in moving.iter_mut().zip(values) {
+        // SAFETY: the caller holds a reference to the process other than
+        // the handles.
+        let taken = unsafe { process.as_mut() }.handles.remove(Handle(v));
+        *m = Some(taken.expect("the handles of a message were checked"));
+    }
+    moving
+}
+
+/// Puts the handles of a message into the table of `process`, which lives,
+/// once `reserve_handles` made room for them (spec 6.1): each keeps its
+/// rights and brings its reference. Returns the values of the new handles
+/// and their info words (abi::msgbuf::info), in the order of the message.
+pub fn put_handles(
+    process: NonNull<Process>,
+    moving: Moving,
+) -> [(u64, u64); abi::MESSAGE_HANDLES] {
+    assert!(
+        check_alive(process).is_ok(),
+        "a handle went into the table of a process that ended"
+    );
+    // SAFETY: the caller holds a reference to the process.
+    let (handles, mut chunks) = unsafe { table(process) };
+    let mut put = [(0, 0); abi::MESSAGE_HANDLES];
+    for (p, (object, rights)) in put.iter_mut().zip(moving.into_iter().flatten()) {
+        let h = handles.insert(&mut chunks, object, rights);
+        *p = (
+            h.expect("the room for a message's handles was made").0,
+            abi::msgbuf::info(object.kind(), rights),
+        );
+    }
+    put
 }
 
 /// Puts init's first handles in the fresh table of `init` (spec 13.3): the

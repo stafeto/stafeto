@@ -16,7 +16,7 @@ use crate::process::{self, Process};
 use crate::session::{self, Session};
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
-use abi::Rights;
+use abi::{MESSAGE_HANDLES, ObjectKind, Rights};
 use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
 use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
@@ -90,7 +90,24 @@ impl Object {
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
     }
+
+    /// The kind a message reports for a handle to the object (spec 6.2):
+    /// a handle with a label names a channel.
+    pub fn kind(&self) -> ObjectKind {
+        match self {
+            Object::Process(_) => ObjectKind::Process,
+            Object::Thread(_) => ObjectKind::Thread,
+            Object::Channel(_) | Object::Session(_) => ObjectKind::Channel,
+            Object::Timer(_) => ObjectKind::Timer,
+            Object::Resource => ObjectKind::Resource,
+        }
+    }
 }
+
+/// The handles of a message on their way (spec 6.1): out of the sender's
+/// table, with their rights and the references they held, in the order the
+/// message lists them.
+pub type Moving = [Option<(Object, Rights)>; MESSAGE_HANDLES];
 
 /// Adds the reference a new handle with `rights` holds.
 pub fn retain(object: Object, rights: Rights) {
@@ -124,6 +141,18 @@ pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
             Object::Timer(t) => timer::release(t, cause),
             Object::Resource => {}
         }
+    }
+}
+
+/// The handles of a message go, where no table takes them (spec 6.1, 7.7):
+/// each releases its reference at `cause`, as a closed handle does.
+///
+/// # Safety
+/// The references are the caller's, and nothing uses them afterwards.
+pub unsafe fn release_moving(moving: Moving, cause: u8) {
+    for (object, rights) in moving.into_iter().flatten() {
+        // SAFETY: the caller's promise.
+        unsafe { release(object, rights, cause) };
     }
 }
 

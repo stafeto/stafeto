@@ -26,8 +26,8 @@ use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, session};
 use abi::{
-    Call, Error, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT, Notification, Policy,
-    ProcessState, Rights, START_CHANNEL, Source,
+    CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT,
+    Notification, Policy, ProcessState, Rights, START_CHANNEL, Source, msgbuf,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -91,6 +91,9 @@ unsafe extern "C" {
     static el0_check_after_notice: u8;
     static el0_kill_close_notify: u8;
     static el0_raise_then_kill: u8;
+    static el0_close: u8;
+    static el0_send_close: u8;
+    static el0_notice_then_take: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -417,6 +420,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_level_portions,
     },
     El0Test {
+        name: "close_portion_counts_the_handles",
+        start: start_close_handles,
+        done: done_close_handles,
+    },
+    El0Test {
         name: "raised_waiter_raises_the_close",
         start: start_raised_close,
         done: done_raised_close,
@@ -440,6 +448,21 @@ const EL0_TESTS: &[El0Test] = &[
         name: "a_call_cycle_ends_with_the_kill",
         start: start_call_cycle,
         done: done_call_cycle,
+    },
+    El0Test {
+        name: "reply_to_a_dead_client_closes_the_handles",
+        start: start_dead_client_handles,
+        done: done_dead_client_handles,
+    },
+    El0Test {
+        name: "killed_sender_lets_its_handles_go",
+        start: start_killed_sender,
+        done: done_killed_sender,
+    },
+    El0Test {
+        name: "close_lets_a_labelled_sender_go",
+        start: start_labelled_close,
+        done: done_labelled_close,
     },
     El0Test {
         name: "quantum_ends_with_a_far_timer_set",
@@ -3428,6 +3451,12 @@ fn done_replies_level(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// twice: PEER_CLOSED both times, since the reply leaves the mark of the
 /// dead client (Table::mark_dead), and it works at 10 again.
 fn start_dead_client(f: &mut Fixture) -> Result<(), &'static str> {
+    dead_client(f, 0)
+}
+
+/// The threads of `reply_to_a_dead_client_is_peer_closed`, whose service
+/// answers with the description `reply`.
+fn dead_client(f: &mut Fixture, reply: u64) -> Result<(), &'static str> {
     let server = spawn(f, 0, &raw const el0_take_notify_reply, 0)?;
     let client = spawn(f, 1, &raw const el0_send, 0)?;
     let killer = spawn(f, 2, &raw const el0_alarm_then, 0)?;
@@ -3439,7 +3468,7 @@ fn start_dead_client(f: &mut Fixture) -> Result<(), &'static str> {
     let [wake, notify] = shared_channel(r, Rights::RECEIVE, p, Rights::NOTIFY)?;
     let target = give(r, Object::Process(q), Rights::MANAGE)?;
     let kill = user_address(&raw const el0_kill) as u64;
-    set_args(server, &[requests, notify, BITS]);
+    set_args(server, &[requests, notify, BITS, reply]);
     set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
     set_args(killer, &[wake, 0, kill, target]);
     f.ends[1] = true;
@@ -3865,4 +3894,292 @@ fn done_call_cycle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         2 => check(x[0] == 0, "process_kill failed"),
         _ => Err("the killed thread came back from send"),
     }
+}
+
+// Handles in messages (spec 6.1, 7.7): the handles of a request or a
+// reply that no table takes go, as a closed handle does: with a reply to a
+// client that ended, with the buffer of a sender that ended, and at the
+// stage Close of the channel a sender waits in.
+
+/// A message buffer for `t`, a thread of `p`, at BUFFER_VA, whose values
+/// of a message's handles (abi::msgbuf::HANDLES) are `values`.
+fn buffer_with(
+    t: NonNull<Thread>,
+    p: NonNull<Process>,
+    values: &[u64],
+) -> Result<(), &'static str> {
+    buffer_with_at(t, p, BUFFER_VA, values)
+}
+
+/// `buffer_with` at page `va` of `p`.
+fn buffer_with_at(
+    t: NonNull<Thread>,
+    p: NonNull<Process>,
+    va: usize,
+    values: &[u64],
+) -> Result<(), &'static str> {
+    thread::give_buffer(t, va).map_err(|_| "no message buffer")?;
+    let (pa, _) = process::translate(p, va).ok_or("no message buffer")?;
+    let at = (LINEAR_BASE + pa as usize + msgbuf::HANDLES) as *mut u64;
+    for (i, &v) in values.iter().enumerate() {
+        // SAFETY: the frame is the thread's new buffer, which the linear
+        // map reaches, and the words lie in it.
+        unsafe { at.add(i).write(v) };
+    }
+    Ok(())
+}
+
+/// A reply to a client that ended takes its handles along (spec 6.1,
+/// 6.8): as in `reply_to_a_dead_client_is_peer_closed`, but the service
+/// answers with two handles of its table, the only ones to a channel of
+/// its own. The first reply is PEER_CLOSED, the handles leave the table,
+/// and the channel goes; the second is BAD_HANDLE: its buffer names
+/// handles that went.
+fn start_dead_client_handles(f: &mut Fixture) -> Result<(), &'static str> {
+    dead_client(f, 2 << HANDLES_SHIFT)?;
+    let server = f.threads[0].expect("the service");
+    let p = f.processes[0].expect("the service's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let rights = Rights::NOTIFY | Rights::TRANSFER;
+    let handles = [
+        give(p, Object::Channel(c), rights),
+        give(p, Object::Channel(c), rights),
+    ];
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let [a, b] = handles;
+    buffer_with(server, p, &[a?, b?])?;
+    f.kept = [channel::in_use() as u64, process::handle_counts(p).0.into()];
+    Ok(())
+}
+
+fn done_dead_client_handles(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 0 {
+        return done_dead_client(f, t);
+    }
+    let x = &t.regs.x;
+    check(
+        x[20] == Error::PeerClosed.code() && x[0] == Error::BadHandle.code(),
+        "a reply with handles to the client that ended was not PEER_CLOSED, then BAD_HANDLE",
+    )?;
+    let p = f.processes[0].expect("the service's process");
+    check(
+        channel::in_use() as u64 == f.kept[0] - 1
+            && u64::from(process::handle_counts(p).0) == f.kept[1] - 2,
+        "the handles of the reply to the client that ended stayed",
+    )
+}
+
+/// The labels of the sessions of `killed_sender_lets_its_handles_go` and
+/// `close_lets_a_labelled_sender_go`: the one a request goes through, and
+/// the one it carries.
+const VIA_LABEL: u64 = 0x1ABE2;
+const MOVED_LABEL: u64 = 0x1ABE3;
+
+/// A session of `c` with `label` that `payer` pays for, and a handle with
+/// `rights` to it in the table of `p`, its only copy: the handle's value.
+fn session_in(
+    payer: NonNull<Process>,
+    c: NonNull<Channel>,
+    label: u64,
+    p: NonNull<Process>,
+    rights: Rights,
+) -> Result<u64, &'static str> {
+    let s = session::create(payer, c, label, PRIORITY).map_err(|_| "no session")?;
+    let h = give(p, Object::Session(s), rights);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the session.
+    unsafe { session::unref(s, CAUSE) };
+    h
+}
+
+/// A sender that ends lets the handles of its request go, and the copy of
+/// the session its request went through (spec 5.3, 6.1, 7.7): a thread of
+/// a process the test holds sends through the only copy with a label of a
+/// service's channel, carrying the only copy with another label, and waits
+/// in the channel's queue; the service waits on the exit channel of the
+/// sender's process. A killer below them ends that process: the teardown
+/// lets the copy through which the request went go, and then the handle of
+/// the request with the sender's buffer. The service, told of the end,
+/// finds CLIENT_GONE of the one label, then of the other, and nothing
+/// else; the killer finds the sender and the sessions gone.
+fn start_killed_sender(f: &mut Fixture) -> Result<(), &'static str> {
+    let p = new_process(f, 0)?;
+    let server = spawn(f, 1, &raw const el0_notice_then_take, 0)?;
+    let killer = spawn(f, 2, &raw const el0_kill, 0)?;
+    for (t, priority) in [(server, 12), (killer, JUDGE)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [q, r] = [1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    f.kept[0] = session::in_use() as u64;
+    let c = channel::create(q, PRIORITY).map_err(|_| "no channel")?;
+    let requests = give(q, Object::Channel(c), Rights::RECEIVE);
+    let sessions = session_in(q, c, VIA_LABEL, p, Rights::SEND).and_then(|via| {
+        let moved = session_in(q, c, MOVED_LABEL, p, Rights::NOTIFY | Rights::TRANSFER)?;
+        Ok([via, moved])
+    });
+    // SAFETY: the reference `create` handed out goes; the handle and the
+    // sessions, if they were made, hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let [via, moved] = sessions?;
+    let exits = exit_channel_of(q, p)?;
+    let target = give(r, Object::Process(p), Rights::MANAGE)?;
+    let entry = user_address(&raw const el0_send);
+    let sender = thread::create(p, entry, 0, 0, 11, FIFO).map_err(|_| "no thread")?;
+    let ready = buffer_with(sender, p, &[moved]).and_then(|()| {
+        set_args(
+            sender,
+            &[via, REQUEST_LEN | 1 << HANDLES_SHIFT, REQUEST_WORD],
+        );
+        thread::start(sender).map_err(|_| "the sender did not start")
+    });
+    // SAFETY: the reference `create` handed out goes; the kernel's holds
+    // the thread once it started.
+    unsafe { thread::release(sender, CAUSE) };
+    ready?;
+    set_args(server, &[exits, requests?]);
+    set_args(killer, &[target]);
+    f.live_threads = thread::in_use();
+    Ok(())
+}
+
+fn done_killed_sender(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) == 1 {
+        check(x[19] == 0, "the service heard of no end")?;
+        return check(
+            x[20..24] == [CLIENT_GONE, VIA_LABEL, CLIENT_GONE, MOVED_LABEL]
+                && x[0] == Error::WouldBlock.code(),
+            "the ended sender's labels did not come as CLIENT_GONE, in order",
+        );
+    }
+    check(
+        x[0] == 0 && f.passed[1],
+        "process_kill failed, or the service did not pass",
+    )?;
+    check(
+        thread::in_use() == f.live_threads - 1 && session::in_use() as u64 == f.kept[0],
+        "the ended sender or its sessions stayed",
+    )
+}
+
+/// The stage Close lets the handles of a waiting request go, and the copy
+/// of the session it went through (spec 5.3, 6.1, 7.7): a service waits on
+/// a channel of its own; a thread sends through the only copy with a label
+/// of another channel, carrying the only copy with a label of the
+/// service's channel, and waits in the queue. A closer below them closes
+/// the last handle with RECEIVE: the service gets CLIENT_GONE of the
+/// carried label, the sender PEER_CLOSED; the sender closes its copy, and
+/// the closer finds both sessions gone.
+fn start_labelled_close(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_receive, 0)?;
+    let sender = spawn(f, 1, &raw const el0_send_close, 0)?;
+    let closer = spawn(f, 2, &raw const el0_close, 0)?;
+    for (t, priority) in [(server, 13), (sender, 12), (closer, JUDGE)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [q, p, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    f.kept[0] = session::in_use() as u64;
+    let e = channel::create(q, PRIORITY).map_err(|_| "no channel")?;
+    let c = channel::create(q, PRIORITY);
+    let made = c.map_err(|_| "no channel").and_then(|c| {
+        let notices = give(q, Object::Channel(e), Rights::RECEIVE)?;
+        let via = session_in(q, c, VIA_LABEL, p, Rights::SEND)?;
+        let moved = session_in(q, e, MOVED_LABEL, p, Rights::NOTIFY | Rights::TRANSFER)?;
+        let last = give(r, Object::Channel(c), Rights::RECEIVE)?;
+        Ok([notices, via, moved, last])
+    });
+    // SAFETY: the references `create` handed out go; the handles and the
+    // sessions that were made hold the channels.
+    unsafe {
+        channel::release(e, Rights::NONE, CAUSE);
+        if let Ok(c) = c {
+            channel::release(c, Rights::NONE, CAUSE);
+        }
+    }
+    let [notices, via, moved, last] = made?;
+    buffer_with(sender, p, &[moved])?;
+    set_args(server, &[notices, 0]);
+    set_args(
+        sender,
+        &[via, REQUEST_LEN | 1 << HANDLES_SHIFT, REQUEST_WORD],
+    );
+    set_args(closer, &[last]);
+    Ok(())
+}
+
+fn done_labelled_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => check(
+            x[0] == 0 && x[1..12] == labelled_notice(MOVED_LABEL, CLIENT_GONE),
+            "the carried label did not come as CLIENT_GONE",
+        ),
+        1 => check(
+            x[19] == Error::PeerClosed.code() && x[0] == 0,
+            "the sender did not get PEER_CLOSED, or its copy did not close",
+        ),
+        _ => {
+            check(
+                x[0] == 0 && f.passed[0] && f.passed[1],
+                "a thread did not pass",
+            )?;
+            check(
+                session::in_use() as u64 == f.kept[0],
+                "a session of the closed request stayed",
+            )
+        }
+    }
+}
+
+/// x1-x11 of a receive that took a notification of the session with
+/// `label` of `bits`, once.
+fn labelled_notice(label: u64, bits: u64) -> [u64; 11] {
+    Notification {
+        source: Source::Session,
+        label,
+        bits,
+        count: 1,
+    }
+    .to_words()
+}
+
+/// Senders of `close_portion_counts_the_handles`.
+const CARRIERS: usize = 8;
+
+/// A portion of the stage Close counts the handles of the senders'
+/// requests as work (spec 7.7): CARRIERS threads at 10 of a process wait
+/// in send on one channel, each with four handles on their way, and the
+/// closer below them closes the last handle with RECEIVE. The stage takes 7
+/// heads in its first portion, whose 7 units of five reach its 32, and the
+/// last one in its second, both at the senders' level; the judge below the
+/// closer finds every sender ended with PEER_CLOSED.
+fn start_close_handles(f: &mut Fixture) -> Result<(), &'static str> {
+    let own = new_process(f, 0)?;
+    let entry = user_address(&raw const el0_done_at_once);
+    for (slot, priority) in [(0, JUDGE), (1, JUDGE - 1)] {
+        let t = thread::create(own, entry, 0, 0, priority, FIFO).map_err(|_| "no thread")?;
+        f.threads[slot] = Some(t);
+    }
+    let root = process::create_root(QUOTA, 64, CEILING).map_err(|_| "no process")?;
+    let p = with_programs(f, 1, root)?;
+    let [receive, send] = shared_channel(own, Rights::RECEIVE, p, Rights::SEND)?;
+    f.handles[0] = Some((own, Handle(receive)));
+    let entry = user_address(&raw const el0_send_then_exit);
+    for i in 0..CARRIERS {
+        let t = thread::create(p, entry, 0, 0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+        f.crowd[i] = Some(t);
+        let [a, b, c, d] = [(); 4].map(|()| give(p, Object::Resource, Rights::TRANSFER));
+        buffer_with_at(t, p, BUFFER_VA + i * PAGE, &[a?, b?, c?, d?])?;
+        set_args(t, &[send, REQUEST_LEN | 4 << HANDLES_SHIFT, REQUEST_WORD]);
+        thread::start(t).map_err(|_| "a thread did not start")?;
+    }
+    cleanup::take_late();
+    f.interrupt_every = Some(1);
+    Ok(())
+}
+
+fn done_close_handles(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    closed_crowd(f, t, (2, 7, 1 << PRIORITY))
 }

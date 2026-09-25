@@ -35,7 +35,7 @@ use abi::{
 };
 use core::ptr::NonNull;
 use kcore::args::{
-    Desc, bits_arg, check_buffer, check_start, handle_limit_arg, inline_len_arg,
+    Desc, bits_arg, check_buffer, check_start, handle_limit_arg, handle_values_arg, inline_len_arg,
     notify_priority_arg, policy_arg, priority_arg, quota_arg, reserved_arg, rights_arg,
     under_ceilings, wait_arg,
 };
@@ -129,6 +129,15 @@ pub fn set_notification(mut thread: NonNull<Thread>, n: Notification) {
     let x = &mut unsafe { thread.as_mut() }.regs.x;
     x[0] = 0;
     n.write_words((&mut x[1..12]).try_into().expect("x1-x11"));
+}
+
+/// Makes the call of `thread` start over (spec 6.1): its program counter
+/// goes back to its `svc`, and its registers stay as they were, so it
+/// makes the call again when it next runs.
+pub fn restart(mut thread: NonNull<Thread>) {
+    // SAFETY: the thread is alive, and nothing else refers to its
+    // registers now.
+    unsafe { thread.as_mut() }.regs.elr -= 4;
 }
 
 /// The process of the thread that made the call.
@@ -282,31 +291,63 @@ fn receive(thread: NonNull<Thread>, a: &Args) {
     }
 }
 
+/// The values of the handles of the message the caller sends or answers
+/// with (spec 6.1, 6.2), read once from its message buffer before any
+/// check: INVALID_ARGS for a value listed twice or equal to `channel`, x0
+/// of send.
+fn message_handles(
+    thread: NonNull<Thread>,
+    desc: Desc,
+    channel: Option<u64>,
+) -> Result<[u64; abi::MESSAGE_HANDLES], Error> {
+    if desc.handles == 0 {
+        return Ok([0; abi::MESSAGE_HANDLES]);
+    }
+    let values = thread::handle_values(thread, desc.handles);
+    handle_values_arg(&values[..desc.handles], channel)?;
+    Ok(values)
+}
+
+/// The handles of a message in the order it lists them (spec 6.1, 11):
+/// BAD_HANDLE, then ACCESS_DENIED without TRANSFER; a handle to an object
+/// of any kind travels.
+fn check_handles(thread: NonNull<Thread>, values: &[u64]) -> Result<(), Error> {
+    values
+        .iter()
+        .try_for_each(|&h| lookup(thread, h, Rights::TRANSFER, |_| Some(())))
+}
+
 /// send(x0 channel with SEND, x1 description, x2-x9 bytes 0-63 of the
 /// request): a request and the wait for its reply (spec 6.1). The checks in
 /// the order of spec 11: the description (abi::MESSAGE_MAX bytes and
-/// abi::MESSAGE_HANDLES handles at most, NO_WAIT, no other bit), then the
-/// handle, a channel or a labelled one (BAD_HANDLE, WRONG_TYPE,
-/// ACCESS_DENIED without SEND), then the state (BAD_STATE when the
-/// caller's count of requests ran out, PEER_CLOSED once the channel
-/// closed, WOULD_BLOCK under NO_WAIT when no receiver waits): nothing
-/// happens on an error, and x0 alone changes. Handles do not travel yet:
-/// a count of them other than 0 is INVALID_ARGS. Otherwise the caller
-/// waits, its request queued by its effective priority or taken by the top
-/// receiver that waits at once, until the reply writes x0-x9: 0, the
-/// description and the data. Bytes 64 up to the length of the request and
-/// of the reply go between the message buffers (spec 6.2; channel::send).
+/// abi::MESSAGE_HANDLES handles at most, NO_WAIT, no other bit) and the
+/// values of its handles, which the message buffer holds
+/// (`message_handles`); then x0, a channel or a labelled one (BAD_HANDLE,
+/// WRONG_TYPE, ACCESS_DENIED without SEND), and the handles
+/// (`check_handles`); then the state (BAD_STATE when the caller's count of
+/// requests ran out, PEER_CLOSED once the channel closed, WOULD_BLOCK
+/// under NO_WAIT when no receiver waits); then the room for the handles in
+/// the table of a receiver that waits (LIMIT_REACHED, NO_MEMORY). x0 alone
+/// changes on an error; the handles stay with the caller, but for
+/// PEER_CLOSED, LIMIT_REACHED and NO_MEMORY, when they go. Otherwise the
+/// handles leave the caller's table and the caller waits, its request
+/// queued by its effective priority or taken by the top receiver that
+/// waits at once, until the reply writes x0-x9: 0, the description and the
+/// data, or an error of the reply's handles in x0 alone. Bytes 64 up to
+/// the length of the request and of the reply go between the message
+/// buffers, and the values and info words of the handles into them (spec
+/// 6.2; channel::send).
 fn send(thread: NonNull<Thread>, a: &Args) {
     let sent = Desc::from_send(a[1]).and_then(|desc| {
-        if desc.handles > 0 {
-            return Err(Error::InvalidArgs);
-        }
+        let values = message_handles(thread, desc, Some(a[0]))?;
         let via = lookup(thread, a[0], Rights::SEND, |o| match *o {
             Object::Channel(c) => Some(Via::Channel(c)),
             Object::Session(s) => Some(Via::Session(s)),
             _ => None,
         })?;
-        channel::send(thread, via, desc)
+        let values = &values[..desc.handles];
+        check_handles(thread, values)?;
+        channel::send(thread, via, desc, values)
     });
     if let Err(e) = sent {
         set_result(thread, Err(e));
@@ -316,20 +357,24 @@ fn send(thread: NonNull<Thread>, a: &Args) {
 /// reply(x0 token, x1 description, x2-x9 bytes 0-63 of the reply): the
 /// reply to the request the token names, which a thread of the caller's
 /// process accepted (spec 6.1). The description first (NO_WAIT is
-/// INVALID_ARGS: reply never waits); a reply with the token of the
-/// caller's boost ends the boost, whatever comes of it (spec 6.6); then the
-/// token: BAD_STATE for one that names no request waiting for this
-/// process's reply, a used one among them, and PEER_CLOSED for one whose
-/// client ended while it waited (spec 6.8); x0 alone changes then. Handles
-/// do not travel yet: a count of them other than 0 is INVALID_ARGS.
-/// Otherwise x0 is 0, and the client gets the reply, bytes 64 up to its
-/// length through the message buffers (spec 6.2; channel::reply).
+/// INVALID_ARGS: reply never waits) and the values of its handles
+/// (`message_handles`), then the handles (`check_handles`); a reply with the
+/// token of the caller's boost ends the boost, whatever comes of it (spec
+/// 6.6); then the token: BAD_STATE for one that names no request waiting
+/// for this process's reply, a used one among them, and PEER_CLOSED for one
+/// whose client ended while it waited (spec 6.8); then the room for the
+/// handles in the client's table (LIMIT_REACHED, NO_MEMORY), which fails
+/// the client's send too and uses the token up. x0 alone changes on an
+/// error; the handles stay with the caller, but for PEER_CLOSED,
+/// LIMIT_REACHED and NO_MEMORY, when they go. Otherwise x0 is 0, and the
+/// client gets the reply, bytes 64 up to its length through the message
+/// buffers and the handles in its table (spec 6.2; channel::reply).
 fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let desc = Desc::from_reply(a[1])?;
-    if desc.handles > 0 {
-        return Err(Error::InvalidArgs);
-    }
-    channel::reply(thread, a[0], desc)?;
+    let values = message_handles(thread, desc, None)?;
+    let values = &values[..desc.handles];
+    check_handles(thread, values)?;
+    channel::reply(thread, a[0], desc, values)?;
     Ok(Values::NONE)
 }
 

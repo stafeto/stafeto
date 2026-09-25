@@ -36,7 +36,7 @@ use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys::{self, Frame};
-use crate::object::{self, Block, Chunks, Handles, Object};
+use crate::object::{self, Block, Chunks, Handles, Moving, Object};
 use crate::sched;
 use crate::session::Session;
 use crate::thread::{self, Siblings, Thread};
@@ -57,7 +57,7 @@ mod teardown;
 
 pub use table::{
     close_handle, handle_counts, handle_room, insert_handle, install_init_handles, move_start,
-    reserve_start,
+    put_handles, reserve_handles, reserve_start, take_handles,
 };
 pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
 use teardown::{begin, queue_shell};

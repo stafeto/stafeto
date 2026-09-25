@@ -15,8 +15,9 @@
 use crate::handle::{Channel, Handle, Process, Resource, Thread, Timer};
 use crate::msgbuf;
 use abi::{
-    Call, Error, INLINE_MAX, KernelStats, MESSAGE_MAX, Message, Notification, Policy,
-    ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source,
+    Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX, Message,
+    Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT,
+    Source,
 };
 use core::arch::asm;
 
@@ -305,7 +306,8 @@ pub fn notify(channel: &Handle<Channel>, bits: u64) -> Result<(), Error> {
 
 /// What `receive` took (spec 6.1, 6.5): a notification, or a request with
 /// its bytes 0-63 and the token that answers it. A request of more than
-/// 64 bytes lies whole in the thread's message buffer (`msgbuf`).
+/// 64 bytes lies whole in the thread's message buffer (`msgbuf`), and so
+/// do the handles it brought (msgbuf::handle).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Received {
     Notification {
@@ -359,7 +361,18 @@ impl Token {
     /// when its client ended while it waited. More bytes fail with
     /// INVALID_ARGS, as the kernel would fail them.
     pub fn reply(self, bytes: &[u8]) -> Result<(), Error> {
-        let args = message_regs(self.0, bytes, 0)?;
+        self.reply_handles(bytes, &[])
+    }
+
+    /// reply with `handles` as well, at most abi::MESSAGE_HANDLES, each
+    /// with TRANSFER: they move into the client's table with their rights
+    /// and labels (spec 6.1). They leave the caller's table when the call
+    /// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
+    /// NO_MEMORY; with the last two the table of the client had no room
+    /// for them, and its send fails the same way. On any other error they
+    /// stay.
+    pub fn reply_handles(self, bytes: &[u8], handles: &[abi::Handle]) -> Result<(), Error> {
+        let args = message_regs(self.0, bytes, handles, 0)?;
         call::<{ Call::Reply.number() }>(&args).map(drop)
     }
 }
@@ -367,7 +380,8 @@ impl Token {
 /// What `send` returns (spec 6.1): the reply's length, the count of
 /// handles it brought, and its bytes 0-63 as abi::inline_words packs them,
 /// zero past `len`. A reply of more than 64 bytes lies whole in the
-/// thread's message buffer (`msgbuf`).
+/// thread's message buffer (`msgbuf`), and so do its handles
+/// (msgbuf::handle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reply {
     pub len: usize,
@@ -375,19 +389,26 @@ pub struct Reply {
     pub words: [u64; 8],
 }
 
-/// x0-x9 of a message of `bytes` through `target`, a channel or a token,
-/// with `flags` in its description: bytes 0-63 in x2-x9, and the rest,
-/// written into the message buffer at their offsets. INVALID_ARGS for
-/// more than abi::MESSAGE_MAX bytes.
-fn message_regs(target: u64, bytes: &[u8], flags: u64) -> Result<Regs, Error> {
-    if bytes.len() > MESSAGE_MAX {
+/// x0-x9 of a message of `bytes` and `handles` through `target`, a channel
+/// or a token, with `flags` in its description: bytes 0-63 in x2-x9, and
+/// the rest, written into the message buffer at their offsets, with the
+/// values of the handles (msgbuf::put_handles). INVALID_ARGS for more than
+/// abi::MESSAGE_MAX bytes or abi::MESSAGE_HANDLES handles.
+fn message_regs(
+    target: u64,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+    flags: u64,
+) -> Result<Regs, Error> {
+    if bytes.len() > MESSAGE_MAX || handles.len() > MESSAGE_HANDLES {
         return Err(Error::InvalidArgs);
     }
     let (inline, rest) = bytes.split_at(bytes.len().min(INLINE_MAX));
     msgbuf::write(INLINE_MAX, rest);
+    msgbuf::put_handles(handles);
     let mut x = [0; 10];
     x[0] = target;
-    x[1] = bytes.len() as u64 | flags;
+    x[1] = bytes.len() as u64 | (handles.len() as u64) << HANDLES_SHIFT | flags;
     x[2..].copy_from_slice(&abi::inline_words(inline));
     Ok(x)
 }
@@ -410,18 +431,38 @@ fn keep_whole(len: usize, words: &[u64; 8]) {
 /// its reply, BAD_STATE when the thread's count of requests ran out; more
 /// bytes fail with INVALID_ARGS.
 pub fn send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error> {
-    send_with(channel, bytes, 0)
+    send_with(channel, bytes, &[], 0)
 }
 
 /// send with abi::NO_WAIT: WOULD_BLOCK when no thread waits in receive on
 /// the channel. A request a receiver took waits for its reply all the
 /// same.
 pub fn try_send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error> {
-    send_with(channel, bytes, abi::NO_WAIT)
+    send_with(channel, bytes, &[], abi::NO_WAIT)
 }
 
-fn send_with(channel: &Handle<Channel>, bytes: &[u8], flags: u64) -> Result<Reply, Error> {
-    let args = message_regs(channel.raw().0, bytes, flags)?;
+/// send with `handles` as well, at most abi::MESSAGE_HANDLES, each with
+/// TRANSFER, none of them `channel`: they move into the receiver's table
+/// with their rights and labels (spec 6.1), and the reply may bring handles
+/// back (msgbuf::handle). They leave the caller's table when the call
+/// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
+/// NO_MEMORY, the last two when the receiver's table or the reply's had no
+/// room for them; on any other error they stay.
+pub fn send_handles(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+) -> Result<Reply, Error> {
+    send_with(channel, bytes, handles, 0)
+}
+
+fn send_with(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: &[abi::Handle],
+    flags: u64,
+) -> Result<Reply, Error> {
+    let args = message_regs(channel.raw().0, bytes, handles, flags)?;
     let x = call::<{ Call::Send.number() }>(&args)?;
     let mut words = [0; 11];
     words[..9].copy_from_slice(&x[1..]);

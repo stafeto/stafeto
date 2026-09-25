@@ -16,6 +16,12 @@ const SHELL_PORTION: usize = 64;
 /// (spec 7.7).
 const REPLIES_PORTION: usize = 32;
 
+/// The work a portion of the stage Buffers does, at most (spec 7.7): the
+/// buffer of each thread is a unit, and each handle of a request it made
+/// one more; the thread that reaches it is the portion's last. The buffers
+/// of abi::MAX_THREADS threads with no handles take one portion.
+const BUFFERS_PORTION: usize = 64;
+
 /// The bits of an exit notification (spec 6.5, 7.9): bit 0, once.
 const EXIT_BITS: u64 = 1;
 
@@ -61,8 +67,10 @@ pub enum Stage {
     /// table a portion (SpaceRelease::step).
     Space,
     /// The message buffers of the threads the end stopped, at most
-    /// abi::MAX_THREADS, and the threads leave the list. After Space, so
-    /// that no TLB entry maps a frame that goes.
+    /// abi::MAX_THREADS, with the handles of the requests they made, up to
+    /// abi::MESSAGE_HANDLES each, BUFFERS_PORTION units of work a portion,
+    /// and the threads leave the list. After Space, so that no TLB entry
+    /// maps a frame that goes.
     Buffers,
     /// The blocks of frames the process owned, at most MAX_BLOCKS.
     Frames,
@@ -261,7 +269,7 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         // SAFETY: as above.
         Stage::Space => unsafe { release_space(p) },
         // SAFETY: as above.
-        Stage::Buffers => unsafe { release_buffers(process) },
+        Stage::Buffers => unsafe { release_buffers(process, r) },
         // SAFETY: as above; the stage Space is over, so no TLB entry
         // maps the frames.
         Stage::Frames => unsafe {
@@ -415,21 +423,28 @@ unsafe fn release_space(p: *mut Process) -> bool {
 }
 
 /// The stage Buffers: the message buffers of the threads the end stopped
-/// go, and the threads leave the list. The ASID went at the stage Space,
-/// so the frames go back without unmapping. One portion: true.
+/// go, with the handles of the requests they made, released at `level`
+/// (R), and the threads leave the list, BUFFERS_PORTION units of work a
+/// portion. The ASID went at the stage Space, so the frames go back without
+/// unmapping. True once the list is empty.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
-unsafe fn release_buffers(process: NonNull<Process>) -> bool {
+unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
+    let mut work = 0;
     // SAFETY: the caller's promise; the threads of the list are alive,
-    // since each is either held or queued for cleanup behind this portion.
+    // since each is either held or queued for cleanup behind this portion,
+    // and none waits in a queue any more.
     unsafe {
-        while let Some(t) = (*process.as_ptr()).threads {
-            thread::drop_buffer(t);
+        while work < BUFFERS_PORTION
+            && let Some(t) = (*process.as_ptr()).threads
+        {
+            work += 1 + thread::drop_transit(t, level);
+            thread::drop_buffer(t, level);
             remove_thread(process, t);
         }
+        (*process.as_ptr()).threads.is_none()
     }
-    true
 }
 
 /// The stage Quota: the free part of the quota goes back to the parent

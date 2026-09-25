@@ -621,12 +621,14 @@ el0_take_then_wait:
     svc     #SVC_DONE
 
 // A service that outlives its client: receive(x0 channel, 0), the token
-// kept in x19; notify(x1 channel, x2 bits); then reply(x19, 0) twice. Ends
-// with the first reply's x0 in x20 and the second's in x0.
+// kept in x19; notify(x1 channel, x2 bits); then reply(x19, x3) twice, x3
+// the description of both replies. Ends with the first reply's x0 in x20
+// and the second's in x0.
 .global el0_take_notify_reply
 el0_take_notify_reply:
     mov     x21, x1
     mov     x22, x2
+    mov     x23, x3
     mov     x1, #0
     svc     #CALL_RECEIVE
     mov     x19, x11
@@ -634,11 +636,11 @@ el0_take_notify_reply:
     mov     x1, x22
     svc     #CALL_NOTIFY
     mov     x0, x19
-    mov     x1, #0
+    mov     x1, x23
     svc     #CALL_REPLY
     mov     x20, x0
     mov     x0, x19
-    mov     x1, #0
+    mov     x1, x23
     svc     #CALL_REPLY
     svc     #SVC_DONE
 
@@ -725,6 +727,50 @@ el0_raise_then_kill:
     mov     x19, x0
     mov     x0, x21
     svc     #CALL_PROCESS_KILL
+    svc     #SVC_DONE
+
+// Handles in messages (ktest::el0).
+
+// handle_close(x0); the kernel judges its result.
+.global el0_close
+el0_close:
+    svc     #CALL_HANDLE_CLOSE
+    svc     #SVC_DONE
+
+// send(x0 channel, x1 description, x2-x9), then handle_close(x0). Ends
+// with send's x0 in x19 and the close's in x0.
+.global el0_send_close
+el0_send_close:
+    mov     x20, x0
+    svc     #CALL_SEND
+    mov     x19, x0
+    mov     x0, x20
+    svc     #CALL_HANDLE_CLOSE
+    svc     #SVC_DONE
+
+// A service that looks at a channel once a notice came: receive(x0
+// channel, 0) into x19; then receive(x1 another channel, NO_WAIT) twice,
+// the bits and the label of each notification kept in x20, x21 and x22,
+// x23; then once more, whose result stays in x0-x11.
+.global el0_notice_then_take
+el0_notice_then_take:
+    mov     x24, x1
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    mov     x19, x0
+    mov     x0, x24
+    mov     x1, #NO_WAIT
+    svc     #CALL_RECEIVE
+    mov     x20, x2
+    mov     x21, x10
+    mov     x0, x24
+    mov     x1, #NO_WAIT
+    svc     #CALL_RECEIVE
+    mov     x22, x2
+    mov     x23, x10
+    mov     x0, x24
+    mov     x1, #NO_WAIT
+    svc     #CALL_RECEIVE
     svc     #SVC_DONE
 
 el0_programs_end:

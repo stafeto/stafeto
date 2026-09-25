@@ -153,6 +153,14 @@ impl<O: Copy> Queue<O> {
         self.items.top()
     }
 
+    /// The head of the top level, left in the queue: the receiver that
+    /// `send` would hand a request to, or what `receive` would take. A
+    /// meeting looks at it before it makes room for the handles of the
+    /// message (spec 6.1). None when empty.
+    pub fn head(&self) -> Option<NonNull<Slot<O>>> {
+        self.items.first(self.items.top()?)
+    }
+
     /// A post of `bits` into `slot`, one of this channel's (spec 6.5): the
     /// bits merge into the slot; a slot that stood in no queue goes to the
     /// top waiter, or else to the tail of its level.
@@ -513,7 +521,7 @@ mod tests {
             assert_eq!(q.send(b), None);
             assert!(matches!(q.post(s, 2), Post::Merged));
         }
-        assert_eq!(q.top(), Some(30));
+        assert_eq!((q.top(), q.head().map(name)), (Some(30), Some('s')));
         assert_eq!(received(&mut q), [('s', 3, 2), ('b', 0, 0), ('a', 0, 0)]);
         assert!(q.is_empty() && q.top().is_none());
     }
@@ -530,6 +538,7 @@ mod tests {
         unsafe {
             q.wait(low.1);
             q.wait(high.1);
+            assert_eq!(q.head().map(name), Some('h'));
             assert_eq!(q.send(a.1).map(name), Some('h'));
             assert!(!(*a.1.as_ptr()).is_queued() && !(*high.1.as_ptr()).is_queued());
             assert!(q.has_receivers());

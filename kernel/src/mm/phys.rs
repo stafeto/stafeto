@@ -84,6 +84,31 @@ impl Frame {
         (PAGE_SIZE as usize) << self.order
     }
 
+    /// The word at byte `offset` of the block (spec 6.2): the value of a
+    /// handle a message carries. Panics for an offset that is not a
+    /// multiple of 8 or lies past the block.
+    pub fn word(&self, offset: usize) -> u64 {
+        assert!(
+            offset.is_multiple_of(8) && offset < self.len(),
+            "a word past a block of frames"
+        );
+        // SAFETY: the block is RAM the linear map covers, its holder owns
+        // it (`from_raw`), and the aligned word lies in it.
+        unsafe { self.base().add(offset).cast::<u64>().read() }
+    }
+
+    /// Writes `value` into the word at byte `offset` of the block (spec
+    /// 6.2): the value or the info word of a handle that came. Panics as
+    /// `word` does.
+    pub fn set_word(&mut self, offset: usize, value: u64) {
+        assert!(
+            offset.is_multiple_of(8) && offset < self.len(),
+            "a word past a block of frames"
+        );
+        // SAFETY: as in `word`.
+        unsafe { self.base().add(offset).cast::<u64>().write(value) }
+    }
+
     /// Copies the bytes `range` of `src` to the same offsets of this block
     /// (spec 6.2): a part of a message from its sender's buffer. Panics for
     /// a range past either block.

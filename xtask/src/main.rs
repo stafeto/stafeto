@@ -100,7 +100,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 85;
+const INIT_TESTS: u32 = 99;
 /// A data segment bigger than the 4 MiB one block of frames holds.
 const BIG_DATA: u64 = 8 << 20;
 
