@@ -12,10 +12,11 @@
 //! the last one goes, through handle_close or with the table of a process
 //! that ended, CLIENT_GONE goes into its slot while the channel is open
 //! (spec 5.3, 6.8). A session lives while references to it are left: its
-//! copies, the one `create` hands out, and its slot's while the slot stands
-//! in the channel's queue (spec 6.5), which receive and the channel's
-//! stage Close let go when they take the slot; the last one queues it, and
-//! its portion lets the channel and the payer's shell go.
+//! copies, the one `create` hands out, its slot's while the slot stands in
+//! the channel's queue (spec 6.5), which receive and the channel's stage
+//! Close let go when they take the slot, and that of each request through
+//! one of its copies while the request waits in the queue; the last one
+//! queues it, and its portion lets the channel and the payer's shell go.
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
@@ -174,9 +175,11 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
     }
 }
 
-/// The slot of `s` just went into its channel's queue (channel::post),
-/// which holds the session from now on (spec 6.5): until receive or the
-/// stage Close takes the slot and lets the reference go (`unref`).
+/// The slot of `s` just went into its channel's queue (channel::post), or
+/// a request through a handle with its label did (channel::send), and that
+/// holds the session from now on (spec 6.1, 6.5): until receive or the
+/// stage Close takes it, or the request's thread ends, and lets the
+/// reference go (`unref`).
 pub fn hold(s: NonNull<Session>) {
     // SAFETY: the channel's caller holds a reference to the session; only
     // the count is touched.

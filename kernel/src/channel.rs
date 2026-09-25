@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Channels (spec 4, 6.1, 6.3, 6.5, 6.8) as milestone 1.3b has them:
-//! notifications and the threads that wait for them in `receive`; requests
-//! come in milestone 1.3c. A channel lies in the pool of channels of the
-//! process that made it, which pays for it by the page (spec 7.8), and
-//! holds that process's shell until its slot goes back. It has the slot of
-//! label 0, whose priority channel_create gave, and the queue of
-//! kcore::notify: slots with something posted, or receivers that wait
-//! through their threads' own slots, by priority and in the order they
-//! came. The queue changes together with the states of the threads in it,
-//! so every change to it happens under the scheduler's lock
-//! (sched::locked). A channel lives while references to it are left:
+//! Channels (spec 4, 6.1, 6.3, 6.5, 6.8): notifications, requests and
+//! their replies, and the threads that wait for them. A channel lies in the
+//! pool of channels of the process that made it, which pays for it by the
+//! page (spec 7.8), and holds that process's shell until its slot goes
+//! back. It has the slot of label 0, whose priority channel_create gave,
+//! and the queue of kcore::notify: slots with something posted and the
+//! requests of threads that wait in `send`, or receivers that wait, by
+//! priority and in the order they came. A thread waits through its own
+//! slot, which is its request in `send`; a request a receiver took waits
+//! for its reply in the queue of accepted requests of the receiver's
+//! process (process::accepted), and a token of the table of thread numbers
+//! names it (spec 6.1). The queues change together with the states of the
+//! threads in them, so every change to them happens under the scheduler's
+//! lock (sched::locked). A channel lives while references to it are left:
 //! handles with any rights, threads that wait in it, the sources of
 //! notifications that have a slot there (sessions, exits of processes and
 //! timers), and the cleanup queue's while it closes; the last one queues
@@ -19,20 +22,23 @@
 //! slots, the slot of label 0 among them, from its creation until it goes,
 //! and a slot that stands in the queue holds its owner until receive or the
 //! stage Close takes it (spec 6.5). The last handle with RECEIVE closes it
-//! in the call itself: `notify` fails with PEER_CLOSED from then on,
-//! nothing new waits or is queued, and the stage Close wakes the receivers
-//! that wait with PEER_CLOSED or empties the queued slots, letting their
-//! owners go, CLOSE_PORTION a portion.
+//! in the call itself: `notify` and `send` fail with PEER_CLOSED from then
+//! on, nothing new waits or is queued, and the stage Close wakes the
+//! threads that wait with PEER_CLOSED or empties the queued slots, letting
+//! their owners go, CLOSE_PORTION a portion. A request a receiver took
+//! lives on without the channel.
 
 use crate::cleanup::{self, Item};
 use crate::object::Object;
 use crate::process::{self, Process};
+use crate::sched::{self, Locked};
 use crate::session::{self, Session};
+use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
-use crate::{sched, syscall};
 use abi::{Error, MAX_SLOTS, Notification, Rights, Source};
 use core::ptr::NonNull;
+use kcore::args::{Desc, mask_tail};
 use kcore::notify::{Post, Queue, Slot};
 use kcore::sched::Scheduler;
 
@@ -55,7 +61,8 @@ pub enum Owner {
     /// A timer (spec 10).
     Timer(NonNull<Timer>),
     /// A thread's own slot (spec 6.1), which lies in it: its place while
-    /// it waits in receive. It carries no notification and holds nothing.
+    /// it waits in receive, its request while it waits in send. It carries
+    /// no notification, and its thread's wait holds what it needs.
     Thread(NonNull<Thread>),
 }
 
@@ -111,17 +118,86 @@ impl Owner {
     }
 }
 
+/// What a request went through (spec 5.3, 6.1): a handle to the channel
+/// with no label, or one with a label, which names a session of the
+/// channel; the receiver gets the label with the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    Channel(NonNull<Channel>),
+    Session(NonNull<Session>),
+}
+
+impl Via {
+    /// The channel the request goes into.
+    pub fn channel(self) -> NonNull<Channel> {
+        match self {
+            Via::Channel(c) => c,
+            Via::Session(s) => session::channel(s),
+        }
+    }
+
+    /// The label the receiver gets: the session's, or 0.
+    fn label(self) -> u64 {
+        match self {
+            Via::Channel(_) => 0,
+            Via::Session(s) => session::label(s),
+        }
+    }
+
+    /// A request that waits in the queue holds what it went through from
+    /// now on (spec 6.1). Only counts, so it runs under the scheduler's
+    /// lock.
+    fn hold(self) {
+        match self {
+            Via::Channel(c) => retain(c, Rights::NONE),
+            Via::Session(s) => session::hold(s),
+        }
+    }
+
+    /// The reference a wait held goes at `cause`, which may queue what it
+    /// held (spec 7.7).
+    ///
+    /// # Safety
+    /// The reference is the caller's: `hold` took it, or a wait in receive
+    /// holds the channel.
+    pub unsafe fn let_go(self, cause: u8) {
+        match self {
+            // SAFETY: the caller's promise.
+            Via::Channel(c) => unsafe { release(c, Rights::NONE, cause) },
+            // SAFETY: as above.
+            Via::Session(s) => unsafe { session::unref(s, cause) },
+        }
+    }
+}
+
+/// What a thread waits for, and where its own slot stands meanwhile (spec
+/// 6.1, 8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// In receive on the channel, its slot in the channel's queue; the wait
+    /// holds a reference to the channel.
+    Receive(NonNull<Channel>),
+    /// In send, its slot, its request, in the queue of the channel it went
+    /// through; the wait holds that (`Via::hold`).
+    Send(Via),
+    /// Its request accepted by a thread of the process, its slot in the
+    /// process's queue of accepted requests: it waits for the reply and
+    /// holds nothing.
+    Reply(NonNull<Process>),
+}
+
 pub struct Channel {
     /// The slot of label 0.
     slot: Slot<Owner>,
-    /// Slots with something posted, or receivers that wait; reached only
-    /// with the scheduler locked (`queue`).
+    /// Slots with something posted and requests, or receivers that wait;
+    /// reached only with the scheduler locked (`queue`).
     queue: Queue<Owner>,
     /// Handles to it with RECEIVE; the last one to go closes it.
     receivers: u32,
-    /// Handles to it, threads that wait in it, the sources that have a
-    /// slot in it, and the cleanup queue's while it is at its stage Close:
-    /// the references that keep it.
+    /// Handles to it, threads that wait in it (in receive, or in send
+    /// through a handle with no label), the sources that have a slot in it,
+    /// and the cleanup queue's while it is at its stage Close: the
+    /// references that keep it.
     refs: u32,
     /// Sources with a slot in it, the slot of label 0 among them: at most
     /// abi::MAX_SLOTS (spec 6.5).
@@ -306,7 +382,7 @@ unsafe fn close(c: NonNull<Channel>, cause: u8) {
     // fields are touched.
     unsafe {
         (*p).closed = true;
-        if sched::locked(|s| queue(c, s).is_empty()) {
+        if sched::locked(|k| queue(c, k.s).is_empty()) {
             return;
         }
         let refs = refs(c);
@@ -388,9 +464,9 @@ pub unsafe fn post(
     if is_closed(c) {
         return Err(Error::PeerClosed);
     }
-    let woke = sched::locked(|s| {
+    let woke = sched::locked(|k| {
         // SAFETY: the caller's promise; the slot stays in place.
-        let t = match unsafe { queue(c, s).post(slot, bits) } {
+        let t = match unsafe { queue(c, k.s).post(slot, bits) } {
             Post::Merged => return false,
             Post::Queued => {
                 // SAFETY: as above.
@@ -406,8 +482,8 @@ pub unsafe fn post(
             let (n, priority) = notice(slot);
             (*t.as_ptr()).waits = None;
             syscall::set_notification(t, n);
-            s.boost(t, priority, ceiling(t));
-            s.wake(t);
+            k.s.boost(t, priority, ceiling(t));
+            k.s.wake(t);
         }
         true
     });
@@ -419,97 +495,268 @@ pub unsafe fn post(
     Ok(())
 }
 
+/// What receive or the stage Close took from a channel's queue, which it
+/// lets go after the scheduler's lock.
+enum Taken {
+    /// A notification slot, which held its owner.
+    Slot(Owner),
+    /// A thread that waited, which held what it went through (receive and
+    /// the stage Close) or the channel (the stage Close).
+    Request(Via),
+}
+
 /// receive (spec 6.1, 6.5, 6.6) for `t`, the running thread, on `c`, to
-/// which it holds a handle with RECEIVE, so the channel is open. First the
-/// boost of `t`'s last notification ends. Then the head of the top level of
-/// the queue of slots leaves the queue, emptied, and `t` works at the
-/// slot's priority under its ceiling until its next receive; the slot lets
-/// its owner go at that priority, after the scheduler's lock: Some. With no
-/// slot queued, WOULD_BLOCK when `wait` is false; otherwise `t` waits
-/// through its own slot at the tail of its level, holding a reference to
-/// `c`, and gets its result when the wait ends (`post`, `clean`): None.
-/// O(1).
-pub fn receive(
-    t: NonNull<Thread>,
-    c: NonNull<Channel>,
-    wait: bool,
-) -> Result<Option<Notification>, Error> {
+/// which it holds a handle with RECEIVE, so the channel is open; it writes
+/// `t`'s result itself. First the boost of `t`'s last notification or
+/// request ends. Then the head of the top level of the queue leaves it: a
+/// slot, emptied into x0-x11, after which `t` works at the slot's priority
+/// under its ceiling until its next receive, and the slot lets its owner
+/// go at that priority after the scheduler's lock; or a request, which `t`
+/// takes (`accept`), and the reference of its sender's wait goes after
+/// the lock. With nothing queued, WOULD_BLOCK when `wait` is false;
+/// otherwise `t` waits through its own slot at the tail of its level,
+/// holding a reference to `c`, and gets its result when the wait ends
+/// (`post`, `send`, `clean`). O(1).
+pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<(), Error> {
     let ceiling = ceiling(t);
-    let taken = sched::locked(|s| {
+    let taken = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
-        // holds, are alive.
+        // holds, are alive; the sender of a queued request waits, so it is
+        // alive, and its wait holds what it went through.
         unsafe {
-            s.unboost(t);
-            if let Some(slot) = queue(c, s).take_slot() {
+            k.s.unboost(t);
+            (*t.as_ptr()).boost_token = 0;
+            if let Some(slot) = queue(c, k.s).take_slot() {
+                let owner = (*slot.as_ptr()).owner();
+                if let Owner::Thread(client) = owner {
+                    let Some(Wait::Send(via)) = (*client.as_ptr()).waits else {
+                        unreachable!("a request whose thread does not send");
+                    };
+                    let desc = Desc::from_send((*client.as_ptr()).regs.x[1])
+                        .expect("a request's description was checked");
+                    accept(k, t, client, via, desc);
+                    return Ok(Some(Taken::Request(via)));
+                }
                 let (n, priority) = notice(slot);
-                s.boost(t, priority, ceiling);
-                return Ok(Some((n, (*slot.as_ptr()).owner())));
+                syscall::set_notification(t, n);
+                k.s.boost(t, priority, ceiling);
+                return Ok(Some(Taken::Slot(owner)));
             }
             if !wait {
                 return Err(Error::WouldBlock);
             }
-            let running = s.block();
+            let running = k.s.block();
             assert!(running == t, "a thread that does not run waits");
             let slot = thread::slot(t);
             (*slot.as_ptr()).set_priority(t.as_ref().priority());
-            queue(c, s).wait(slot);
-            (*t.as_ptr()).waits = Some(c);
+            queue(c, k.s).wait(slot);
+            (*t.as_ptr()).waits = Some(Wait::Receive(c));
         }
         retain(c, Rights::NONE);
         Ok(None)
     })?;
-    let Some((n, owner)) = taken else {
-        return Ok(None);
-    };
-    // SAFETY: the slot left the queue, whose reference to its owner goes;
-    // the running thread is alive.
-    unsafe { owner.let_go(t.as_ref().priority()) };
-    Ok(Some(n))
+    // SAFETY: the running thread is alive; the reference of the slot or of
+    // the sender's wait goes, and nothing uses it afterwards.
+    unsafe {
+        let cause = t.as_ref().priority();
+        match taken {
+            Some(Taken::Slot(owner)) => owner.let_go(cause),
+            Some(Taken::Request(via)) => via.let_go(cause),
+            None => {}
+        }
+    }
+    Ok(())
 }
 
-/// The end of `t` while it waits in a channel (sched::exit, spec 7.7): its
-/// slot leaves the channel's queue, wherever it stands there, and the
-/// reference of its wait goes to the caller, which lets it go once the
-/// scheduler has let the thread go. None for a thread that waits nowhere.
-/// O(1).
+/// send (spec 6.1, 6.3) for `t`, the running thread, through `via`, to
+/// which it holds a handle with SEND, with the description `desc`, checked;
+/// the request is `t`'s own x1-x9. The checks of state in the order of
+/// spec 11: BAD_STATE when `t` has no count of requests left (spec 6.1),
+/// PEER_CLOSED once the channel closed, WOULD_BLOCK with NO_WAIT when no
+/// receiver waits; nothing happens then. Otherwise `t` waits for the reply
+/// (Ok), its own slot at the level of its effective priority: the top
+/// receiver that waits takes the request at once (`accept`) and becomes
+/// ready at the tail of its level with a new quantum, the reference of its
+/// wait going after the scheduler's lock; or else the slot goes to the
+/// tail of its level in the channel's queue (spec 6.3) and holds `via`
+/// until a receive takes it. O(1).
+pub fn send(t: NonNull<Thread>, via: Via, desc: Desc) -> Result<(), Error> {
+    let c = via.channel();
+    sched::locked(|k| k.tokens.check_count(thread::index(t)))?;
+    if is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    let took = sched::locked(|k| {
+        // SAFETY: the running thread and the channel, which its handle
+        // holds, are alive; a thread that waits in receive is alive.
+        unsafe {
+            if desc.no_wait && !queue(c, k.s).has_receivers() {
+                return Err(Error::WouldBlock);
+            }
+            let running = k.s.block();
+            assert!(running == t, "a thread that does not run sends");
+            let slot = thread::slot(t);
+            (*slot.as_ptr()).set_priority(t.as_ref().priority());
+            let Some(r) = queue(c, k.s).send(slot) else {
+                (*t.as_ptr()).waits = Some(Wait::Send(via));
+                via.hold();
+                return Ok(false);
+            };
+            let r = thread_of(r);
+            (*r.as_ptr()).waits = None;
+            accept(k, r, t, via, desc);
+            k.s.wake(r);
+            Ok(true)
+        }
+    })?;
+    if took {
+        // SAFETY: the reference was the receiver's wait's; the sender's
+        // handle keeps the channel, and the sender is alive.
+        unsafe { release(c, Rights::NONE, t.as_ref().priority()) };
+    }
+    Ok(())
+}
+
+/// Writes a message into `to`, the registers of the thread it comes to
+/// (spec 6.1, 11): x0 0, x1 the description, x2-x9 bytes 0-63 from `from`,
+/// the sender's registers, zero past the length.
+fn deliver(to: &mut [u64], from: &[u64], desc: Desc) {
+    to[0] = 0;
+    to[1] = desc.result();
+    to[2..10].copy_from_slice(&from[2..10]);
+    mask_tail(&mut to[2..10], desc.len);
+}
+
+/// The request of `client` goes to `r`, the receiver, in its receive (spec
+/// 6.1, 6.6): the client's count grows by 1 and the token names the
+/// request; the client's own slot goes to the tail of its level in the
+/// queue of accepted requests of `r`'s process, where the client waits for
+/// the reply; x0-x11 of `r` get the message (`deliver`), the label of
+/// `via` and the token; and `r` works at the client's level, under its own
+/// ceiling, until its reply with this token or its next receive. O(1).
+///
+/// # Safety
+/// `r` and `client` are alive and differ; `client` waits in send through
+/// `via` with the description `desc`, its slot in no queue; `r` has no
+/// boost.
+unsafe fn accept(
+    k: &mut Locked<'_>,
+    r: NonNull<Thread>,
+    client: NonNull<Thread>,
+    via: Via,
+    desc: Desc,
+) {
+    let token = k.tokens.accept(thread::index(client));
+    // SAFETY: the caller's promise; the two threads' registers are two
+    // objects.
+    unsafe {
+        let p = r.as_ref().process();
+        let slot = thread::slot(client);
+        process::accepted(p, k.s).push_tail(slot);
+        (*client.as_ptr()).waits = Some(Wait::Reply(p));
+        let to = &mut (*r.as_ptr()).regs.x;
+        deliver(to, &(*client.as_ptr()).regs.x, desc);
+        to[10] = via.label();
+        to[11] = token;
+        k.s.boost(r, (*slot.as_ptr()).priority(), ceiling(r));
+        (*r.as_ptr()).boost_token = token;
+    }
+}
+
+/// reply (spec 6.1, 6.6) of `t`, the running thread, with its x1-x9 and
+/// the description `desc`, checked, to the request `token` names:
+/// BAD_STATE when it names no request that waits for a reply from `t`'s
+/// process: a number that is free or outside the table, a count other than
+/// the number's last, or a client that waits for no reply or for one from
+/// another process; nothing happens then. Otherwise the token is used up:
+/// the client leaves the queue of accepted requests and becomes ready at
+/// the tail of its level with a new quantum, its registers holding the
+/// message (`deliver`). A reply with the token of `t`'s boost ends the
+/// boost (spec 6.6). Never waits. O(1).
+pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc) -> Result<(), Error> {
+    sched::locked(|k| {
+        let client = k.tokens.check(token)?;
+        // SAFETY: the running thread is alive; so is a thread whose number
+        // is taken (its portion gives the number back), and the process it
+        // waits for holds its slot; a client that waits is not `t`.
+        unsafe {
+            let p = t.as_ref().process();
+            if (*client.as_ptr()).waits != Some(Wait::Reply(p)) {
+                return Err(Error::BadState);
+            }
+            process::accepted(p, k.s).remove(thread::slot(client));
+            (*client.as_ptr()).waits = None;
+            deliver(&mut (*client.as_ptr()).regs.x, &(*t.as_ptr()).regs.x, desc);
+            k.s.wake(client);
+            if (*t.as_ptr()).boost_token == token {
+                k.s.unboost(t);
+                (*t.as_ptr()).boost_token = 0;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The end of `t` while it waits (sched::exit, spec 7.7): its slot leaves
+/// the queue it stands in, wherever it stands there: a channel's, or the
+/// queue of accepted requests of the process that took its request. What
+/// the wait held, a channel or a session, goes to the caller, which lets it
+/// go once the scheduler has let the thread go (`Via::let_go`). None for a
+/// thread that waits for nothing, or for a reply. O(1).
 ///
 /// # Safety
 /// `t` is alive; `locked` is the locked scheduler.
-pub unsafe fn cancel(
-    t: NonNull<Thread>,
-    locked: &mut Scheduler<Thread>,
-) -> Option<NonNull<Channel>> {
-    // SAFETY: the caller's promise; a thread that waits holds its channel.
+pub unsafe fn cancel(t: NonNull<Thread>, locked: &mut Scheduler<Thread>) -> Option<Via> {
+    let slot = thread::slot(t);
+    // SAFETY: the caller's promise; a wait holds its channel or session,
+    // and the process that accepted the request holds the slot.
     unsafe {
-        let c = (*t.as_ptr()).waits.take()?;
-        queue(c, locked).cancel(thread::slot(t));
-        Some(c)
+        match (*t.as_ptr()).waits.take()? {
+            Wait::Receive(c) => {
+                queue(c, locked).cancel(slot);
+                Some(Via::Channel(c))
+            }
+            Wait::Send(via) => {
+                queue(via.channel(), locked).cancel(slot);
+                Some(via)
+            }
+            Wait::Reply(p) => {
+                process::accepted(p, locked).remove(slot);
+                None
+            }
+        }
     }
 }
 
 /// thread_set_priority of `t` (sched::set_priority): the slot of a thread
-/// that waits in a channel moves in its queue to the level the thread's
-/// new effective priority makes (spec 6.1). O(1).
+/// that waits moves in its queue, a channel's or that of accepted
+/// requests, to the level of the thread's new effective priority, by the
+/// rules of the ready queue (spec 6.1, 6.3). O(1).
 ///
 /// # Safety
 /// As for `cancel`.
 pub unsafe fn requeue(t: NonNull<Thread>, locked: &mut Scheduler<Thread>) {
-    // SAFETY: the caller's promise; a thread that waits holds its channel.
+    let slot = thread::slot(t);
+    // SAFETY: the caller's promise, as in `cancel`.
     unsafe {
-        if let Some(c) = (*t.as_ptr()).waits {
-            queue(c, locked).move_to(thread::slot(t), t.as_ref().priority());
+        let level = t.as_ref().priority();
+        match (*t.as_ptr()).waits {
+            Some(Wait::Receive(c)) => queue(c, locked).move_to(slot, level),
+            Some(Wait::Send(via)) => queue(via.channel(), locked).move_to(slot, level),
+            Some(Wait::Reply(p)) => process::accepted(p, locked).move_to(slot, level),
+            None => {}
         }
     }
 }
 
 /// One portion of a channel in the cleanup queue (cleanup::portion), taken
 /// at `level`. At the stage Close, while the queue's reference holds it: up
-/// to CLOSE_PORTION heads leave the queue: receivers that wait, each woken
-/// with PEER_CLOSED at the tail of its level with a new quantum (spec 6.1,
-/// 6.8) and without the reference of its wait, or slots, emptied, each
-/// letting its owner go at `level` (a session whose copies went goes, as
-/// after receive); a head a time under the scheduler's lock, its owner
-/// after it. With heads left the channel goes back to the head of `level`,
+/// to CLOSE_PORTION heads leave the queue: threads that wait in receive or
+/// in send, each woken with PEER_CLOSED at the tail of its level with a new
+/// quantum (spec 6.1, 6.8), its wait letting go what it held at `level`;
+/// or slots, emptied, each letting its owner go at `level` (a session
+/// whose copies went goes, as after receive); a head a time under the
+/// scheduler's lock, what it held after it. With heads left the channel goes back to the head of `level`,
 /// and otherwise the queue's reference goes, which queues the shell when it
 /// was the last. With no reference left, the shell's portion: the slot goes
 /// back to the payer's pool, and then the reference to the payer's shell.
@@ -527,34 +774,42 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
     let mut woken = 0u32;
     let mut heads = 0u32;
     for _ in 0..CLOSE_PORTION {
-        let head = sched::locked(|s| {
+        let head = sched::locked(|k| {
             // SAFETY: the channel is alive; a thread that waits is alive,
             // and a queued slot holds its owner, in which it lies.
             unsafe {
-                if let Some(r) = queue(c, s).take_waiter() {
-                    let t = thread_of(r);
-                    (*t.as_ptr()).waits = None;
-                    syscall::set_result(t, Err(Error::PeerClosed));
-                    s.wake(t);
-                    return Some(None);
-                }
-                queue(c, s).take_slot().map(|slot| {
+                let slot = queue(c, k.s)
+                    .take_waiter()
+                    .or_else(|| queue(c, k.s).take_slot())?;
+                let owner = (*slot.as_ptr()).owner();
+                let Owner::Thread(t) = owner else {
                     (*slot.as_ptr()).take();
-                    Some((*slot.as_ptr()).owner())
-                })
+                    return Some(Taken::Slot(owner));
+                };
+                let via = match (*t.as_ptr()).waits.take() {
+                    Some(Wait::Receive(_)) => Via::Channel(c),
+                    Some(Wait::Send(via)) => via,
+                    _ => unreachable!("a thread in a channel's queue waits for no channel"),
+                };
+                syscall::set_result(t, Err(Error::PeerClosed));
+                k.s.wake(t);
+                Some(Taken::Request(via))
             }
         });
         match head {
             None => break,
-            Some(None) => woken += 1,
+            // The references to the channel itself go below.
+            Some(Taken::Request(Via::Channel(_))) => woken += 1,
+            // SAFETY: the thread's wait held the session.
+            Some(Taken::Request(via)) => unsafe { via.let_go(level) },
             // SAFETY: the slot left the queue, whose reference to its
             // owner goes.
-            Some(Some(owner)) => unsafe { owner.let_go(level) },
+            Some(Taken::Slot(owner)) => unsafe { owner.let_go(level) },
         }
         heads += 1;
     }
     // SAFETY: as above.
-    let left = sched::locked(|s| unsafe { !queue(c, s).is_empty() });
+    let left = sched::locked(|k| unsafe { !queue(c, k.s).is_empty() });
     #[cfg(feature = "ktest")]
     {
         use core::sync::atomic::Ordering::Relaxed;
@@ -594,7 +849,7 @@ unsafe fn free(c: NonNull<Channel>, level: u8) {
     let (payer, sources) = unsafe { ((*c.as_ptr()).payer, (*c.as_ptr()).sources) };
     assert!(
         // SAFETY: as above.
-        sources == 1 && sched::locked(|s| unsafe { queue(c, s).is_empty() }),
+        sources == 1 && sched::locked(|k| unsafe { queue(c, k.s).is_empty() }),
         "a channel goes with a source or something in its queues"
     );
     // SAFETY: nothing uses the channel afterwards; the payer's pool is

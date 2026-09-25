@@ -78,6 +78,11 @@ unsafe extern "C" {
     static el0_raise_then_notify: u8;
     static el0_pattern_receive: u8;
     static el0_alarm_then: u8;
+    static el0_send: u8;
+    static el0_serve: u8;
+    static el0_serve_after_notice: u8;
+    static el0_reply_then_notify: u8;
+    static el0_raise_then_send: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -91,7 +96,9 @@ const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_DONE <= *abi::T
 // el0.S makes these calls by number and knows these values.
 const _: () = assert!(
     Call::HandleClose.number() == 1
+        && Call::Send.number() == 4
         && Call::Receive.number() == 5
+        && Call::Reply.number() == 6
         && Call::Notify.number() == 7
         && Call::ProcessCreate.number() == 12
         && Call::ProcessKill.number() == 13
@@ -344,6 +351,21 @@ const EL0_TESTS: &[El0Test] = &[
         name: "closing_a_channel_wakes_waiters_in_portions",
         start: start_close_portions,
         done: done_close_portions,
+    },
+    El0Test {
+        name: "request_through_the_start_channel",
+        start: start_start_request,
+        done: done_start_request,
+    },
+    El0Test {
+        name: "reply_from_another_process_is_bad_state",
+        start: start_foreign_reply,
+        done: done_foreign_reply,
+    },
+    El0Test {
+        name: "boost_is_capped_by_the_server_ceiling",
+        start: start_capped_boost,
+        done: done_capped_boost,
     },
     El0Test {
         name: "quantum_ends_with_a_far_timer_set",
@@ -2897,4 +2919,178 @@ fn done_batches(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         timers::longest_batch() > 0,
         "the batch of expired timers was not measured",
     )
+}
+
+// Requests (spec 6.1, 6.6): a client and a service in processes of their
+// own.
+
+/// The label of the session of `request_through_the_start_channel`.
+const REQUEST_LABEL: u64 = 0x1ABE1;
+/// The description of the tests' requests: 8 bytes, no handles.
+const REQUEST_LEN: u64 = 8;
+/// Those 8 bytes, in x2.
+const REQUEST_WORD: u64 = 0x5EED_C11E;
+/// A count the tests move a client's count to, so that they know its next
+/// token ahead: above any count the tests reach otherwise.
+const TOKEN_COUNT: u64 = 1 << 40;
+/// The ceiling of the service's process in `boost_is_capped_by_the_server_ceiling`.
+const SERVICE_CEILING: u8 = 20;
+
+/// Spec 15.2 (messages): a child sends a request through its start
+/// channel, a copy of the parent's channel with a label and SEND that
+/// process_create moved into entry 0 (spec 13.3). The parent's service,
+/// which waits in receive, takes it with the label, the description, the
+/// data and a token, and answers; the child gets its request back.
+fn start_start_request(f: &mut Fixture) -> Result<(), &'static str> {
+    let parent = new_process(f, 1)?;
+    let server = new_thread(f, 1, parent, DATA_VA, &raw const el0_serve, 0)?;
+    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no service")?;
+    let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(parent, Object::Channel(c), Rights::RECEIVE);
+    let s = session::create(parent, c, REQUEST_LABEL, PRIORITY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel, and so does the session.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let s = s.map_err(|_| "no session")?;
+    let child = process::create_child(parent, CHILD_QUOTA, HANDLE_LIMIT, CEILING);
+    let moved =
+        child.and_then(|child| process::move_start(child, Object::Session(s), Rights::SEND));
+    // SAFETY: the reference `create` handed out goes; entry 0 of the
+    // child, if the move went, holds the session.
+    unsafe { session::unref(s, CAUSE) };
+    let child = child.map_err(|_| "no child")?;
+    let child = with_programs(f, 0, child)?;
+    let client = new_thread(f, 0, child, DATA_VA, &raw const el0_send, 0)?;
+    moved.map_err(|_| "the start channel did not move")?;
+    set_args(client, &[START_CHANNEL.0, REQUEST_LEN, REQUEST_WORD]);
+    set_args(server, &[h?, 0]);
+    Ok(())
+}
+
+fn done_start_request(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) == 0 {
+        return check(
+            x[..3] == [0, REQUEST_LEN, REQUEST_WORD] && x[3..10].iter().all(|&w| w == 0),
+            "the child did not get its request back",
+        );
+    }
+    check(
+        x[0] == 0
+            && x[19..21] == [REQUEST_LEN, REQUEST_WORD]
+            && x[28] == REQUEST_LABEL
+            && x[29] != 0,
+        "the parent did not take the child's request with its label and a token",
+    )
+}
+
+/// A token names a request for the process that accepted it (spec 6.1): a
+/// service takes a request of a client of another process and holds it
+/// until a notification comes; meanwhile a thread of a third process
+/// replies with the service's token, which the test knows ahead: BAD_STATE,
+/// and the client does not wake. It notifies the service, which answers;
+/// the client gets its request back.
+fn start_foreign_reply(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_serve_after_notice, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    let other = spawn(f, 2, &raw const el0_reply_then_notify, 0)?;
+    for (t, priority) in [(server, 3), (client, 2), (other, 1)] {
+        sched::set_priority(t, PRIORITY + priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let d = channel::create(p, PRIORITY);
+    let handles = d.map(|d| {
+        [
+            give(p, Object::Channel(c), Rights::RECEIVE),
+            give(p, Object::Channel(d), Rights::RECEIVE),
+            give(q, Object::Channel(c), Rights::SEND),
+            give(r, Object::Channel(d), Rights::NOTIFY),
+        ]
+    });
+    // SAFETY: the references `create` handed out go; the handles that went
+    // in hold the channels.
+    unsafe {
+        channel::release(c, Rights::NONE, CAUSE);
+        if let Ok(d) = d {
+            channel::release(d, Rights::NONE, CAUSE);
+        }
+    }
+    let [requests, notices, send, notify] = handles.map_err(|_| "no channel")?;
+    let index = thread::index(client);
+    sched::locked(|k| k.tokens.skip_to(index, TOKEN_COUNT));
+    let token = (TOKEN_COUNT + 1) << 16 | u64::from(index);
+    set_args(server, &[requests?, 0, notices?]);
+    set_args(client, &[send?, REQUEST_LEN, REQUEST_WORD]);
+    set_args(other, &[token, 0, notify?, BITS]);
+    f.kept = [token, 0];
+    Ok(())
+}
+
+fn done_foreign_reply(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => check(
+            x[0] == 0 && x[19..21] == [REQUEST_LEN, REQUEST_WORD] && x[28..30] == [0, f.kept[0]],
+            "the service did not take the request with the token the test knew, or its reply failed",
+        ),
+        1 => check(
+            x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
+            "the client did not get the service's reply",
+        ),
+        _ => check(
+            x[19] == Error::BadState.code() && x[0] == 0,
+            "a thread of another process answered the request",
+        ),
+    }
+}
+
+/// The boost by a client stops at the ceiling of the service's process
+/// (spec 6.6, 8): a service at base 10 in a process with ceiling 20 waits
+/// in receive; a client of another process raises itself to 30, a ready
+/// thread of a third process to 25, and sends. The service works at 20,
+/// so the thread at 25 ends while the client still waits for the reply;
+/// at 30 the service would answer first.
+fn start_capped_boost(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process_under(f, SERVICE_CEILING)?;
+    let server = sched_thread(f, 0, &raw const el0_serve, PRIORITY, FIFO)?;
+    let client = spawn(f, 1, &raw const el0_raise_then_send, 0)?;
+    let ready = spawn(f, 2, &raw const el0_done_at_once, 0)?;
+    for (t, priority) in [(client, PRIORITY - 5), (ready, 1)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let handles = [
+        give(p, Object::Channel(c), Rights::RECEIVE),
+        give(q, Object::Channel(c), Rights::SEND),
+        give(q, Object::Thread(ready), Rights::MANAGE),
+    ];
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let [receive, send, raised] = handles;
+    // A handle to the client's own thread in its process: the teardown
+    // closes it first.
+    let own = process::insert_handle(q, Object::Thread(client), Rights::MANAGE)
+        .map_err(|_| "a handle did not go in")?;
+    f.handles[0] = Some((q, own));
+    set_args(server, &[receive?, 0]);
+    set_args(client, &[own.0, 30, raised?, 25, send?]);
+    Ok(())
+}
+
+fn done_capped_boost(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => check(x[0] == 0, "the service's reply failed"),
+        1 => check(
+            x[19] == 0 && x[20] == 0 && x[0] == 0,
+            "thread_set_priority or send failed",
+        ),
+        _ => check(
+            slot_thread(f, 1).sched.state() == State::Waiting,
+            "the service answered before the ready thread above its ceiling ran",
+        ),
+    }
 }

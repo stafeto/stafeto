@@ -307,6 +307,15 @@ const TESTS: &[(&str, TestFn)] = &[
         "dying_timer_does_not_fire",
         calls::dying_timer_does_not_fire,
     ),
+    (
+        "call_counter_runs_out_as_bad_state",
+        calls::call_counter_runs_out_as_bad_state,
+    ),
+    (
+        "thread_limit_of_the_system",
+        calls::thread_limit_of_the_system,
+    ),
+    ("thread_numbers_come_back", calls::thread_numbers_come_back),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.

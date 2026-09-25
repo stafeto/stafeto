@@ -14,19 +14,27 @@
 //! interrupts the kernel does at most one portion, and it begins one only
 //! with no interrupt pending. The kernel holds a reference to every thread
 //! the scheduler holds, from `start` until `exit`, a thread that waits in
-//! `receive` too. The queues of channels change together with the states
-//! of the threads that wait in them, so the code that changes them runs
-//! under the scheduler's lock (`locked`). The lock of the heap of timers is
-//! never held with it (crate::timer).
+//! `send` or `receive` too. The queues of channels and of accepted
+//! requests change together with the states of the threads that wait in
+//! them, and so does the table of thread numbers (spec 6.1, 7.8), which
+//! lies here, in memory the kernel takes at boot: the code that changes
+//! them runs under the scheduler's lock (`locked`). The lock of the heap of
+//! timers is never held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
-use crate::thread::{self, Thread};
+use crate::thread::{self, THREADS, Thread};
 use crate::{channel, cleanup};
-use abi::{Error, Policy, Rights};
+use abi::{Error, Policy};
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use kcore::sched::{Armed, Decision, Scheduler, State, Timer};
 use kcore::sync::Lock;
 use kcore::time::Clock;
+use kcore::token::Table;
+
+/// The table of thread numbers (spec 6.1, 7.8): THREADS entries of 16
+/// bytes.
+pub type Tokens = Table<Thread, THREADS>;
 
 struct Sched {
     s: Scheduler<Thread>,
@@ -57,6 +65,18 @@ static SCHED: Lock<Sched> = Lock::new(Sched {
     idle_latency: 0,
     irq_latency: 0,
 });
+
+/// The table of thread numbers, which the scheduler's lock guards: only
+/// `locked` reaches it, while it holds that lock. Zeroed at boot (spec
+/// 7.8).
+static TOKENS: Guarded<Tokens> = Guarded(UnsafeCell::new(Table::new()));
+
+/// A value the scheduler's lock guards, apart from SCHED.
+struct Guarded<T>(UnsafeCell<T>);
+
+// SAFETY: only `locked` reaches the value, while it holds the scheduler's
+// lock, which makes the access exclusive.
+unsafe impl<T: Send> Sync for Guarded<T> {}
 
 /// What the scheduler counts for KSTATS (spec 16), in counter ticks.
 #[derive(Debug, Clone, Copy)]
@@ -119,10 +139,11 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 
 /// Ends `t` for the scheduler, whatever its state: it never runs again,
 /// and the reference the kernel took at `start` goes, with `cause` for the
-/// cleanup its last reference starts. A thread that waits in `receive`
-/// leaves its channel's queue first, and the reference of its wait goes
-/// too (spec 7.7). When `t` was the running thread, `resume` decides who
-/// runs next. A thread that ended before stays as it is. O(1).
+/// cleanup its last reference starts. A thread that waits in `send` or
+/// `receive` first leaves the queue its slot stands in (channel::cancel),
+/// and the reference of its wait goes too (spec 7.7). When `t` was the
+/// running thread, `resume` decides who runs next. A thread that ended
+/// before stays as it is. O(1).
 ///
 /// # Safety
 /// `t` is alive. When the kernel's reference is its last, `t` is queued
@@ -139,9 +160,9 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
         unsafe { g.s.exit(t) };
         (!matches!(state, State::Stopped | State::Dead), waited)
     };
-    if let Some(c) = waited {
+    if let Some(via) = waited {
         // SAFETY: the reference was the wait's.
-        unsafe { channel::release(c, Rights::NONE, cause) };
+        unsafe { via.let_go(cause) };
     }
     if held {
         // SAFETY: the reference `start` took ends with the thread.
@@ -158,10 +179,10 @@ pub fn yield_running() {
 }
 
 /// thread_set_priority: `priority` (1-63) becomes the base priority of
-/// `t`, and the effective one follows unless the boost of a notification
-/// keeps it higher (spec 6.6); the thread moves by the rules of
-/// `pthread_setschedprio` (kcore::sched), and one that waits in `receive`
-/// moves in its channel's queue by the same rules (spec 6.1). The next
+/// `t`, and the effective one follows unless a boost keeps it higher (spec
+/// 6.6); the thread moves by the rules of `pthread_setschedprio`
+/// (kcore::sched), and the slot of one that waits moves in its queue by
+/// the same rules (spec 6.1, 6.3; channel::requeue). The next
 /// `resume` runs a thread raised above the running one, or another one
 /// when the running thread lowered itself below it. BAD_STATE for a
 /// thread that ended.
@@ -177,11 +198,27 @@ pub fn set_priority(t: NonNull<Thread>, priority: u8, policy: Policy) -> Result<
     Ok(())
 }
 
-/// Runs `f` with the scheduler locked. The queues of channels hold the
-/// slots of threads that wait (kcore::notify::Queue), so the code that
-/// changes them, with the threads' states, runs here.
-pub fn locked<R>(f: impl FnOnce(&mut Scheduler<Thread>) -> R) -> R {
-    f(&mut SCHED.lock().s)
+/// What the scheduler's lock guards for the rest of the kernel: the
+/// scheduler, and the table of thread numbers.
+pub struct Locked<'a> {
+    pub s: &'a mut Scheduler<Thread>,
+    pub tokens: &'a mut Tokens,
+}
+
+/// Runs `f` with the scheduler locked. The queues of channels and of
+/// accepted requests hold the slots of threads that wait
+/// (kcore::notify::Queue), and requests take tokens from the table of
+/// thread numbers, so the code that changes them, with the threads'
+/// states, runs here.
+pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
+    let mut g = SCHED.lock();
+    // SAFETY: the guard of the scheduler's lock lives until `f` returns,
+    // so this is the only reference to the table (TOKENS).
+    let tokens = unsafe { &mut *TOKENS.0.get() };
+    f(&mut Locked {
+        s: &mut g.s,
+        tokens,
+    })
 }
 
 /// The timer's interrupt, before its EOI: the timer goes off, since its

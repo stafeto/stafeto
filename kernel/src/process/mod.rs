@@ -27,7 +27,8 @@
 //! frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
-//! rest with its shell.
+//! rest with its shell. The requests its threads accepted wait in it for
+//! their replies (spec 4, 6.8).
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
@@ -47,6 +48,7 @@ use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::process::Life;
 use kcore::quota::Account;
+use kcore::sched::{ReadyQueue, Scheduler};
 use kcore::slab::{PageLog, PaidPages, Pool};
 use kcore::sync::Lock;
 
@@ -136,6 +138,12 @@ pub struct Process {
     /// At the stage Stop, the child it stops next; a child that leaves
     /// the list moves it on (`leave_parent`).
     stop_next: Option<NonNull<Process>>,
+    /// The requests its threads accepted and have not answered (spec 6.1,
+    /// 6.8): the own slots of their clients, which wait for the replies, at
+    /// the levels the clients had. Any thread of the process may answer.
+    /// A request holds no reference to its client: while it stands here the
+    /// client lives. Reached only with the scheduler locked (`accepted`).
+    accepted: ReadyQueue<Slot<Owner>>,
     /// How far its teardown came.
     stage: Stage,
     /// Its place in the cleanup queue: on its stages, and as a shell once
@@ -359,6 +367,7 @@ fn create(
         level: 0,
         exit: None,
         stop_next: None,
+        accepted: ReadyQueue::new(),
         stage: Stage::Whole,
         cleanup: Item::new(),
     };
@@ -904,6 +913,20 @@ pub unsafe fn free_timer_slot(process: NonNull<Process>, t: NonNull<Timer>) {
         (*p).pools.timers.free(t);
         (*p).timer_count -= 1;
     }
+}
+
+/// The queue of the requests `process` accepted (Process::accepted), which
+/// changes together with the states of the clients in it: reached only
+/// with the scheduler locked, which `_locked` shows (sched::locked).
+///
+/// # Safety
+/// `process` is alive.
+pub unsafe fn accepted(
+    process: NonNull<Process>,
+    _locked: &mut Scheduler<Thread>,
+) -> &mut ReadyQueue<Slot<Owner>> {
+    // SAFETY: the caller's promise; only the field is borrowed.
+    unsafe { &mut (*process.as_ptr()).accepted }
 }
 
 /// The links of `t`, a thread in its process's list.

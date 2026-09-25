@@ -2,22 +2,23 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Threads (spec 4, 8, 8.1): a program's registers, FP and SIMD included,
-//! its scheduling parameters, its message buffer and its process, in
+//! its scheduling parameters, its message buffer, its own slot of a
+//! channel's queue, its number in the system table and its process, in
 //! objects from the pool of threads of their process. The registers come
 //! first, so TPIDR_EL1, which points at the running thread, points at them
-//! too (vectors.S). The
-//! running thread is the one TPIDR_EL1 names; the kernel stack holds
-//! nothing of it. A thread lives while references to it are left: handles,
-//! the one `create` hands out, and the kernel's while the scheduler holds
-//! the thread, from its start until its end, while it waits in `receive`
-//! too (spec 8.1); it holds a reference to its process. A thread that ended
-//! stays as a shell without its buffer until its last reference goes,
-//! which queues it for cleanup (spec 7.7). Its process pays from its quota
-//! for the pages of its pool of threads (spec 7.8) and for the buffer
-//! while it lasts (spec 7.5).
+//! too (vectors.S). The running thread is the one TPIDR_EL1 names; the
+//! kernel stack holds nothing of it. A thread lives while references to it
+//! are left: handles, the one `create` hands out, and the kernel's while
+//! the scheduler holds the thread, from its start until its end, while it
+//! waits in `send` or `receive` too (spec 8.1); it holds a reference to its
+//! process. A thread that ended stays as a shell without its buffer until
+//! its last reference goes, which queues it for cleanup (spec 7.7); its
+//! number goes back with its portion. Its process pays from its quota for
+//! the pages of its pool of threads (spec 7.8) and for the buffer while it
+//! lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
-use crate::channel::{Channel, Owner};
+use crate::channel::{Owner, Wait};
 use crate::cleanup::{self, Item};
 use crate::mm::phys::FRAMES;
 use crate::object::Object;
@@ -38,19 +39,28 @@ pub struct Thread {
     /// Saved while the thread does not run.
     pub fp: FpRegs,
     /// What the scheduler keeps in the thread: the base priority, which
-    /// `create` or thread_set_priority gave, the boost of a notification
-    /// (spec 6.6) and the effective priority they make, the policy, the
-    /// state, the rest of a quantum and the links of the ready list. Only
-    /// the scheduler changes it (sched), and the channel under the
-    /// scheduler's lock.
+    /// `create` or thread_set_priority gave, the boost of a notification or
+    /// of a request's client (spec 6.6) and the effective priority they
+    /// make, the policy, the state, the rest of a quantum and the links of
+    /// the ready list. Only the scheduler changes it (sched), and the
+    /// channel under the scheduler's lock.
     pub sched: Node<Thread>,
-    /// The channel it waits in, in `receive`; it holds a reference to it
-    /// meanwhile (channel::receive).
-    pub waits: Option<NonNull<Channel>>,
+    /// What it waits for in `send` or `receive`, and where its slot stands
+    /// meanwhile (channel::Wait); only the channel changes it, under the
+    /// scheduler's lock.
+    pub waits: Option<Wait>,
     /// Its own slot of a channel's queue (spec 6.1): its place there while
-    /// it waits in `receive`, at the level of its effective priority. Only
-    /// the channel changes it, under the scheduler's lock.
+    /// it waits in `receive`, its request while it waits in `send`, and its
+    /// place in the queue of accepted requests of the process that took
+    /// the request, at the level of its effective priority when it began
+    /// to wait. Only the channel changes it, under the scheduler's lock.
     slot: Slot<Owner>,
+    /// Its number in the system table (spec 6.1, 7.8), from `create` until
+    /// its portion of cleanup: the tokens of its requests carry it.
+    index: u16,
+    /// The token of the request whose client boosts it (spec 6.6): a reply
+    /// with it ends the boost. 0 when a notification boosts it, or nothing.
+    pub boost_token: u64,
     /// Links in the list of its process's threads that have not ended,
     /// which process::end walks; None once the thread left it. Only
     /// process::{add_thread, remove_thread} change them.
@@ -88,6 +98,11 @@ const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
 // CPU, interrupts masked inside the kernel.
 unsafe impl Send for Thread {}
 
+/// Threads the system has at most (spec 8): the entries of the table of
+/// thread numbers, which thread_create takes and the thread's portion of
+/// cleanup gives back.
+pub const THREADS: usize = 1024;
+
 // SAFETY: the node is a field of the thread and lives as long as it does.
 unsafe impl Schedulable for Thread {
     fn node(this: NonNull<Thread>) -> NonNull<Node<Thread>> {
@@ -117,13 +132,15 @@ impl Thread {
 /// pointer `stack` and `arg` in x0, at `priority` under `policy`, once
 /// `start` makes it ready. It has no message buffer until `give_buffer`.
 /// The caller gets the first reference; the thread holds one to `process`
-/// and joins its threads, and its slot is in the pool of threads of
-/// `process`, whose quota pays for a page when the pool grows. INVALID_ARGS
-/// for a start outside the lower half, a misaligned one or priority 0,
-/// LIMIT_REACHED when the process has abi::MAX_THREADS threads that have
-/// not ended, NO_MEMORY when the quota falls short for a page. The limit
-/// comes first: a thread past it takes nothing. `priority` is at most the
-/// ceiling of `process`: the call checked it.
+/// and joins its threads, it takes a number of the system table (spec
+/// 6.1, 7.8), and its slot is in the pool of threads of `process`, whose
+/// quota pays for a page when the pool grows. INVALID_ARGS for a start
+/// outside the lower half, a misaligned one or priority 0, LIMIT_REACHED
+/// when the process has abi::MAX_THREADS threads that have not ended and
+/// then when the system has THREADS threads, NO_MEMORY when the quota
+/// falls short for a page. The limits come first: a thread past them takes
+/// nothing (spec 8, 11). `priority` is at most the ceiling of `process`:
+/// the call checked it.
 pub fn create(
     process: NonNull<Process>,
     entry: usize,
@@ -140,6 +157,9 @@ pub fn create(
         "a thread above the ceiling of its process; the call checks it first"
     );
     process::thread_room(process)?;
+    if sched::locked(|k| k.tokens.available()) == 0 {
+        return Err(Error::LimitReached);
+    }
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
@@ -147,6 +167,8 @@ pub fn create(
         waits: None,
         // The owner is the thread's own place, known once it has one.
         slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
+        index: 0,
+        boost_token: 0,
         siblings: None,
         buffer: None,
         process,
@@ -154,9 +176,13 @@ pub fn create(
         cleanup: Item::new(),
     };
     let thread = process::thread_slot(process, thread)?;
+    let index = sched::locked(|k| k.tokens.alloc(thread)).expect("a free thread number went");
     // SAFETY: the thread was just made, nothing else refers to it, and its
     // slot is in no queue.
-    unsafe { (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread)) };
+    unsafe {
+        (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
+        (*thread.as_ptr()).index = index;
+    }
     #[cfg(feature = "ktest")]
     LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     process::retain(process);
@@ -169,6 +195,12 @@ pub fn slot(t: NonNull<Thread>) -> NonNull<Slot<Owner>> {
     // SAFETY: the caller holds the thread; only the field's address is
     // taken.
     unsafe { NonNull::new_unchecked(&raw mut (*t.as_ptr()).slot) }
+}
+
+/// The number of `t` in the system table (spec 6.1).
+pub fn index(t: NonNull<Thread>) -> u16 {
+    // SAFETY: the caller holds the thread; only the field is read.
+    unsafe { (*t.as_ptr()).index }
 }
 
 /// Gives `t` its message buffer (spec 11): a fresh zeroed frame mapped
@@ -324,6 +356,7 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
 }
 
 /// The portion of a thread nobody refers to (cleanup): its buffer goes,
+/// its number goes back to the system table with its count (spec 6.1),
 /// it leaves its process's list if it is still there, its slot goes back
 /// to its process's pool, and then its reference to its process, queued
 /// at `level` if it was the last. When the thread ran last, no thread ran
@@ -341,6 +374,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
     // process's list before its slot goes.
     unsafe {
         drop_buffer(thread);
+        sched::locked(|k| k.tokens.free(index(thread)));
         process::remove_thread(process, thread);
         process::free_thread_slot(process, thread);
         // Test builds poison the slot past the pool's link, as for

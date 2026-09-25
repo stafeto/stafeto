@@ -454,6 +454,10 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
             );
             e.channel
         });
+        assert!(
+            (*p).accepted.is_empty(),
+            "a shell goes with requests its threads accepted"
+        );
         ((*p).parent, (*p).quota.return_rest(), exit)
     };
     // SAFETY: the caller's promise; every stage gave its memory back, and

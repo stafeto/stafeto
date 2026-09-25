@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The runtime of stafeto programs, as small as milestone 1.3b needs it
+//! The runtime of stafeto programs, as small as milestone 1.3c needs it
 //! (spec 13.2): the entry point, handles typed by the kind of their object
-//! (`handle`, `init`), typed wrappers of the system calls the kernel has
-//! and a raw call for any other (`sys`), output through `debug_write`
+//! (`handle`, `init`), typed wrappers of the system calls the kernel has,
+//! requests and their tokens among them, and a raw call for any other
+//! (`sys`), output through `debug_write`
 //! (`console`, `print!`, `println!`), the counter read without a call
 //! (`time`), stacks for threads in static memory, and the panic handler.
 //! The heap, the start protocol, the ELF loader and the service loop come

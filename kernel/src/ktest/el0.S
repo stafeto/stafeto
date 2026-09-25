@@ -12,7 +12,9 @@
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
+.equ CALL_SEND, 4                       // abi::Call::Send
 .equ CALL_RECEIVE, 5                    // abi::Call::Receive
+.equ CALL_REPLY, 6                      // abi::Call::Reply
 .equ CALL_NOTIFY, 7                     // abi::Call::Notify
 .equ CALL_PROCESS_CREATE, 12            // abi::Call::ProcessCreate
 .equ CALL_PROCESS_KILL, 13              // abi::Call::ProcessKill
@@ -468,5 +470,112 @@ el0_alarm_then:
     mov     x1, x21
     mov     x2, x22
     br      x19
+
+// Requests (ktest::el0).
+
+// send(x0 channel, x1 description, x2-x9); the kernel judges the reply
+// in x0-x9.
+.global el0_send
+el0_send:
+    svc     #CALL_SEND
+    svc     #SVC_DONE
+
+// A service of one request: receive(x0 channel, 0), the message kept in
+// x19-x29 (x1-x11 of the result: the description, the data, the label
+// and the token), then reply with the token, the request's description
+// and its data: the client gets its request back. Ends with the last
+// call's x0.
+.global el0_serve
+el0_serve:
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    cbnz    x0, 1f
+    mov     x19, x1
+    mov     x20, x2
+    mov     x21, x3
+    mov     x22, x4
+    mov     x23, x5
+    mov     x24, x6
+    mov     x25, x7
+    mov     x26, x8
+    mov     x27, x9
+    mov     x28, x10
+    mov     x29, x11
+    mov     x0, x29
+    mov     x1, x19
+    svc     #CALL_REPLY
+1:  svc     #SVC_DONE
+
+// As el0_serve, with receive(x2 another channel, 0) between the request
+// and the reply: the service holds the request until a peer notifies it.
+// Ends with the last call's x0.
+.global el0_serve_after_notice
+el0_serve_after_notice:
+    mov     x12, x2
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    cbnz    x0, 1f
+    mov     x19, x1
+    mov     x20, x2
+    mov     x21, x3
+    mov     x22, x4
+    mov     x23, x5
+    mov     x24, x6
+    mov     x25, x7
+    mov     x26, x8
+    mov     x27, x9
+    mov     x28, x10
+    mov     x29, x11
+    mov     x0, x12
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    cbnz    x0, 1f
+    mov     x0, x29
+    mov     x1, x19
+    mov     x2, x20
+    mov     x3, x21
+    mov     x4, x22
+    mov     x5, x23
+    mov     x6, x24
+    mov     x7, x25
+    mov     x8, x26
+    mov     x9, x27
+    svc     #CALL_REPLY
+1:  svc     #SVC_DONE
+
+// reply(x0 token, x1 description), then notify(x2 channel, x3 bits).
+// Ends with reply's x0 in x19 and notify's in x0.
+.global el0_reply_then_notify
+el0_reply_then_notify:
+    mov     x20, x2
+    mov     x21, x3
+    svc     #CALL_REPLY
+    mov     x19, x0
+    mov     x0, x20
+    mov     x1, x21
+    svc     #CALL_NOTIFY
+    svc     #SVC_DONE
+
+// thread_set_priority(x0 own thread, x1 priority, FIFO), then
+// thread_set_priority(x2 another thread, x3 priority, FIFO), then
+// send(x4 channel, an empty request). Ends with the first call's x0 in
+// x19, the second's in x20 and the reply in x0-x9.
+.global el0_raise_then_send
+el0_raise_then_send:
+    mov     x21, x2
+    mov     x22, x3
+    mov     x23, x4
+    mov     x2, #FIFO
+    svc     #CALL_THREAD_SET_PRIORITY
+    mov     x19, x0
+    mov     x0, x21
+    mov     x1, x22
+    mov     x2, #FIFO
+    svc     #CALL_THREAD_SET_PRIORITY
+    mov     x20, x0
+    mov     x0, x23
+    mov     x1, #0
+    svc     #CALL_SEND
+    svc     #SVC_DONE
 
 el0_programs_end:
