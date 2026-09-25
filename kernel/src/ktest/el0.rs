@@ -276,6 +276,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_orphan,
     },
     El0Test {
+        name: "grandchildren_die_with_their_parent",
+        start: start_grandchild,
+        done: done_grandchild,
+    },
+    El0Test {
         name: "cleanup_yields_to_a_pending_interrupt",
         start: start_cleanup,
         done: done_cleanup_yields,
@@ -1506,6 +1511,10 @@ const CHILD_ENTRY: u64 = 0x1000;
 const CHILD_BUFFER: u64 = 0x2000;
 /// The exit code of `process_exit_ends_the_process_with_its_code`.
 const EXIT_CODE: u64 = 0x5EED_C0DE;
+/// The words of its data page, past the pattern, that the grandchild's
+/// thread counts in and waits on (el0_count_until).
+const COUNT_WORD: usize = DATA_VA + 0x800;
+const STOP_WORD: usize = DATA_VA + 0x808;
 
 /// The judge: a thread of its own process in slot `slot` that ends at
 /// once, below the test's other threads.
@@ -2099,4 +2108,47 @@ fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
             )
         }
     }
+}
+
+/// The killer in slot 0, woken 1 ms after the start, kills its child C;
+/// C's child, the grandchild in slot 1, has a thread below the killer that
+/// counts meanwhile. The end of C ends the grandchild and stops its thread
+/// (spec 4), and the teardown of both runs at the killer's level, before
+/// the kill returns.
+fn start_grandchild(f: &mut Fixture) -> Result<(), &'static str> {
+    let killer = spawn(f, 0, &raw const el0_kill, 0)?;
+    let counter = spawn(f, 1, &raw const el0_count_until, 0)?;
+    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
+    sched::set_priority(counter, PRIORITY - 2, FIFO).map_err(|_| "no counter")?;
+    let killers = f.processes[0].expect("the killer's process");
+    let grandchild = f.processes[1].expect("the grandchild");
+    let child = process::create(HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    process::adopt(killers, child);
+    process::adopt(child, grandchild);
+    let h = give_kept(f, Object::Process(child));
+    // SAFETY: the test's reference goes; the handle, if it went in, holds
+    // the child.
+    unsafe { process::release(child, CAUSE) };
+    set_args(killer, &[h?]);
+    f.ends[1] = true;
+    f.wake = Some(timer::clock().deadline_after(timer::now(), 1_000_000));
+    Ok(())
+}
+
+fn done_grandchild(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(t.regs.x[0] == 0, "process_kill failed")?;
+    check(
+        state(f, 1) == ProcessState::Killed,
+        "the grandchild outlived its parent",
+    )?;
+    let counter = slot_thread(f, 1);
+    check(
+        counter.sched.state() == State::Dead && counter.regs.x[2] > 0,
+        "the grandchild's thread did not run, or did not stop",
+    )?;
+    let grandchild = f.processes[1].expect("the grandchild");
+    check(
+        cleanup::len() == 0 && process::translate(grandchild, DATA_VA).is_none(),
+        "the grandchild's teardown did not end before the kill returned",
+    )
 }

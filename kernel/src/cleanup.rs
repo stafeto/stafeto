@@ -94,6 +94,27 @@ pub unsafe fn requeue(item: NonNull<Item>, object: Object, level: u8) {
     unsafe { push(item, object, level, true) }
 }
 
+/// Moves a queued object to the head of `level`, unless it stands higher:
+/// the object whose portion calls it waits for this one, right behind it
+/// (the stage Children of a process, spec 7.7).
+///
+/// # Safety
+/// `item` is the object's own, and the object is queued and alive.
+pub unsafe fn raise(item: NonNull<Item>, level: u8) {
+    let mut q = QUEUE.lock();
+    // SAFETY: the caller's promise; the link is touched only while the
+    // item is out of the queue.
+    unsafe {
+        let link = &raw mut (*item.as_ptr()).link;
+        assert!((*link).is_queued(), "an item is raised while not queued");
+        if (*link).level() <= level {
+            q.items.remove(item);
+            (*link).set_level(level);
+            q.items.push_head(item);
+        }
+    }
+}
+
 /// # Safety
 /// As for `enqueue`.
 unsafe fn push(item: NonNull<Item>, object: Object, level: u8, head: bool) {

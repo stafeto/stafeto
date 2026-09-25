@@ -167,6 +167,14 @@ const TESTS: &[(&str, TestFn)] = &[
         teardown_resumes_where_it_stopped,
     ),
     (
+        "parent_quota_stage_sees_children_done",
+        parent_quota_stage_sees_children_done,
+    ),
+    (
+        "children_do_not_keep_their_parent_alive",
+        children_do_not_keep_their_parent_alive,
+    ),
+    (
         "unknown_system_calls_fail_with_invalid_args",
         calls::unknown_system_calls_fail_with_invalid_args,
     ),
@@ -1242,9 +1250,9 @@ fn process_round() -> Result<(), &'static str> {
 
 /// A chain of processes, each holding the only handle to the next: the
 /// last reference to the first only queues it, at the level of its cause.
-/// Its first portion lets the next one's last reference go, which queues
-/// the next at the same level and takes nothing apart inside the portion
-/// (spec 7.7). Every later portion frees at most one process, and the
+/// Its portion of the stage Handles lets the next one's last reference go,
+/// which queues the next at the same level and takes nothing apart inside
+/// the portion (spec 7.7). Every later portion frees at most one process, and the
 /// queue stays as short as it was: one teardown ends before the next
 /// begins. A thread's portion lets the last reference to its process go
 /// at the thread's level as well.
@@ -1307,6 +1315,8 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
         process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (1, Some(level)),
         "the last reference did more than queue the process at the level of its cause",
     )?;
+    // The stage Children, with no child, then the stage Handles.
+    cleanup::portion();
     cleanup::portion();
     check(
         process::in_use() == base + chain && (cleanup::len(), cleanup::top()) == (2, Some(level)),
@@ -1335,11 +1345,13 @@ fn portions_one_by_one(base: usize, chain: usize, level: u8) -> Result<(), &'sta
 }
 
 /// A process ends and goes in stages, one step a portion, and each
-/// portion goes on where the one before stopped (spec 7.7): the table a
-/// chunk a portion; the space first loses TTBR0 and its ASID, and no call
-/// reaches its tables from then on, then a table a portion; the buffers
-/// of the threads the end stopped in one portion, and the process's frames
-/// in one more. Then the shell stays for the test's reference.
+/// portion goes on where the one before stopped (spec 7.7): with no
+/// children, the stage Children takes one portion; the table a chunk a
+/// portion; the space first loses TTBR0 and its ASID, and no call reaches
+/// its tables from then on, then a table a portion; the buffers of the
+/// threads the end stopped in one portion, the process's frames and the
+/// stage Quota in one more each. Then the shell stays for the test's
+/// reference.
 fn teardown_resumes_where_it_stopped(boot: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 9;
     cleanup::drain();
@@ -1411,8 +1423,13 @@ fn check_stages(
     )?;
     check(
         (cleanup::len(), cleanup::top()) == (1, Some(level))
-            && process::progress(p) == (Stage::Handles, 3 * CHUNK as u32, 0),
+            && process::progress(p) == (Stage::Children, 3 * CHUNK as u32, 0),
         "the end did more than queue the process",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p) == (Stage::Handles, 3 * CHUNK as u32, 0),
+        "the stage Children of a process with no child took more than a portion",
     )?;
     for left in [2, 1, 0] {
         cleanup::portion();
@@ -1447,10 +1464,129 @@ fn check_stages(
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Shell
-            && phys::free_frames() == frames + 6 + 2 + 2
-            && cleanup::len() == 0,
-        "the stage Frames did not give the frames back, or the shell was queued",
+        process::progress(p).0 == Stage::Quota && phys::free_frames() == frames + 6 + 2 + 2,
+        "the stage Frames did not give the frames back",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Shell && cleanup::len() == 0,
+        "the stage Quota took more than a portion, or the shell was queued",
+    )
+}
+
+/// The end of a process ends its descendants, which go depth first
+/// (spec 4, 7.7): two children, one with a child of its own whose thread
+/// is ready, each child and grandchild held only by a handle in its
+/// parent's table. Each process passes its stage Quota only after its
+/// children passed theirs, the ready thread leaves the scheduler, the
+/// whole teardown runs at the level of the end, and the tree goes.
+fn parent_quota_stage_sees_children_done(_: &Boot) -> Result<(), &'static str> {
+    const LEVEL: u8 = 12;
+    cleanup::drain();
+    process::take_early_quota();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let root = process::create(16, 63).map_err(|_| "no process")?;
+    let built = child_of(root).and_then(|a| {
+        child_of(root)?;
+        let grandchild = child_of(a)?;
+        ready_thread(grandchild)
+    });
+    let result = built.and_then(|t| check_tree_end(root, t, LEVEL));
+    if result == Err(STUCK) {
+        // A drain would never end: the failure is named instead, and the
+        // tree stays in the pools.
+        return result;
+    }
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "a process or a thread of the tree stayed in its pool",
+    )
+}
+
+/// A parent holds handles to its child, which holds its parent's shell,
+/// and the child holds one to a grandchild: the last reference to the
+/// parent ends it all the same (spec 4, 7.5), since a child's reference
+/// keeps the shell and never the process, and the whole tree goes.
+fn children_do_not_keep_their_parent_alive(_: &Boot) -> Result<(), &'static str> {
+    cleanup::drain();
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let root = process::create(16, 63).map_err(|_| "no process")?;
+    let built = child_of(root).and_then(child_of);
+    // SAFETY: the test's reference, the root's last, goes, and nothing
+    // uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    built?;
+    check(
+        process::in_use() == processes && thread::in_use() == threads,
+        "the children kept their parent alive, and the tree stayed",
+    )
+}
+
+/// A child of `parent` that only a handle in `parent`'s table holds.
+fn child_of(parent: NonNull<process::Process>) -> Result<NonNull<process::Process>, &'static str> {
+    let child = process::create(16, 63).map_err(|_| "no child")?;
+    process::adopt(parent, child);
+    let held = process::insert_handle(parent, Object::Process(child), Rights::NONE);
+    // SAFETY: the test's reference goes; the handle, if it went in, holds
+    // the child.
+    unsafe { process::release(child, CAUSE) };
+    held.map(|_| child).map_err(|_| "a handle did not go in")
+}
+
+/// A ready thread of `p` that only a handle in `p`'s table and the
+/// scheduler hold.
+fn ready_thread(p: NonNull<process::Process>) -> Result<NonNull<thread::Thread>, &'static str> {
+    let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+    let held = process::insert_handle(p, Object::Thread(t), Rights::NONE)
+        .map_err(|_| "a handle did not go in")
+        .and_then(|_| thread::start(t).map_err(|_| "the thread did not start"));
+    // SAFETY: the test's reference goes; the handle, if it went in, holds
+    // the thread.
+    unsafe { thread::release(t, CAUSE) };
+    held.map(|()| t)
+}
+
+/// What `check_tree_end` says when the queue still holds work after its
+/// portions: an object that goes back in front of the one it waits for.
+const STUCK: &str = "the tree's teardown made no progress";
+
+/// Ends `root` and runs the queue a portion at a time: every portion runs
+/// at `level`, the whole tree goes in a bounded number of portions, the
+/// grandchild's thread leaves the scheduler, and no process comes to its
+/// stage Quota before its children.
+fn check_tree_end(
+    root: NonNull<process::Process>,
+    t: NonNull<thread::Thread>,
+    level: u8,
+) -> Result<(), &'static str> {
+    // SAFETY: the test holds a reference to the root.
+    unsafe { process::end(root, ProcessState::Killed, level) };
+    for _ in 0..256 {
+        if cleanup::top().is_none() {
+            break;
+        }
+        check(
+            cleanup::top() == Some(level),
+            "the tree's teardown ran at another level",
+        )?;
+        cleanup::portion();
+    }
+    let ready = sched::first(10) == Some(t);
+    if ready {
+        // A thread left ready would run in the tests at EL0.
+        // SAFETY: a ready thread is alive; the scheduler's reference goes.
+        unsafe { sched::exit(t, CAUSE) };
+    }
+    check(cleanup::top().is_none(), STUCK)?;
+    check(!ready, "the grandchild's thread is still ready")?;
+    check(
+        process::take_early_quota() == 0,
+        "a process came to its stage Quota before its children passed theirs",
     )
 }
 

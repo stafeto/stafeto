@@ -148,7 +148,8 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 /// WRONG_TYPE). The start channel, a channel with TRANSFER, moves into
 /// entry 0 of the child's table from milestone 1.3c (spec 13.3): x5 is 0,
 /// and any other value is looked up after x3 and fails the same way. Entry
-/// 0 then holds a stub that goes at once (process::reserve_start).
+/// 0 then holds a stub that goes at once (process::reserve_start). The
+/// child is the caller's process's (spec 4): it ends when its parent does.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
@@ -166,6 +167,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     under_ceilings(ceiling, &[own])?;
     under_ceilings(notify, &[own])?;
     let child = process::create(limit, ceiling)?;
+    process::adopt(caller(thread), child);
     let h = process::reserve_start(child).and_then(|()| {
         process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS)
     });

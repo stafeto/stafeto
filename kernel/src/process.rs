@@ -3,16 +3,18 @@
 
 //! Processes (spec 4, 8): an address space, the frames the process owns
 //! there, its handle table, its priority ceiling, its threads that have
-//! not ended and how it lives, in objects from a kernel pool. A process
-//! lives while references to it are left: handles to it, its threads, and
-//! the one `create` hands out. It ends (`end`) through process_exit,
-//! process_kill, a fault at EL0 or the exit of its last started thread,
-//! and when its last reference goes while it lives. The end itself only
-//! stops its threads, at most abi::MAX_THREADS, and queues the process for
-//! cleanup; the queue takes it apart in stages, a portion at a time, with
-//! how far it came kept in the process (`Stage`, spec 7.7). A shell with
-//! the reason stays for object_info until the last reference queues it
-//! once more. Every release names the level of its cause, which the
+//! not ended, its parent and children, and how it lives, in objects from a
+//! kernel pool. A process lives while references to it are left: handles
+//! to it, its threads, and the one `create` hands out; its children hold
+//! only its shell. It ends (`end`) through process_exit, process_kill, a
+//! fault at EL0 or the exit of its last started thread, when its last
+//! reference goes while it lives, and when its parent ends. The end itself
+//! only stops its threads,
+//! at most abi::MAX_THREADS, and queues the process for cleanup; the queue
+//! takes it apart in stages, a portion at a time, with how far it came
+//! kept in the process (`Stage`, spec 7.7), its descendants first. A shell
+//! with the reason stays for object_info until the last reference queues
+//! it once more. Every release names the level of its cause, which the
 //! cleanup it may start takes. Quotas come with the calls that need them.
 
 use crate::cleanup::{self, Item};
@@ -49,8 +51,15 @@ pub struct Process {
     /// other objects.
     handles: Handles,
     /// Handles to the process, its threads, the reference `create` hands
-    /// out, and the cleanup queue's while the process is on its stages.
+    /// out, and the cleanup queue's while the process is on its stages:
+    /// the references that keep it alive.
     refs: u32,
+    /// References that keep the object but not the process: each child's
+    /// to its parent, until the child's shell goes, when the rest of the
+    /// child's quota comes back (spec 7.5). A ring of a parent that holds a
+    /// handle to its child and a child that holds its parent does not keep
+    /// the parent alive.
+    shell_refs: u32,
     /// No thread of the process gets a base priority above it (spec 8).
     ceiling: u8,
     /// The threads it started and whether it ended, and why. A process
@@ -63,6 +72,17 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
+    /// The process that made it (process_create), whose shell it holds
+    /// until its own shell goes (`shell_refs`); None for init and for the
+    /// processes of kernel tests.
+    parent: Option<NonNull<Process>>,
+    /// Its children that have not passed their stage Quota, linked through
+    /// `child_siblings`: a child joins when it is made (`adopt`) and leaves
+    /// at that stage. A child in the list is alive as an object, since its
+    /// shell goes only after the stage.
+    children: Option<NonNull<Process>>,
+    /// Its links in its parent's `children`; None outside the list.
+    child_siblings: Option<ChildLinks>,
     /// Init's end ends the run (spec 7.9).
     init: bool,
     /// How far its teardown came.
@@ -72,16 +92,29 @@ pub struct Process {
     cleanup: Item,
 }
 
+/// Neighbours in the list of a parent's children.
+#[derive(Clone, Copy)]
+struct ChildLinks {
+    prev: Option<NonNull<Process>>,
+    next: Option<NonNull<Process>>,
+}
+
 /// Where the teardown of a process stands (spec 7.7). A process is whole
 /// until it ends; then the cleanup queue holds it, with a reference of its
-/// own, and each portion takes one step of its stage, in the order below,
-/// with how far it came kept in the process. Handles and Space take as
-/// many portions as their steps; the others one. After the last stage the
-/// queue lets its reference go.
+/// own, and each portion takes one step of its stage, in the order of
+/// STAGES, with how far it came kept in the process. Children, Handles and
+/// Space take as many portions as their steps; the others one. After the
+/// stage Quota the queue lets its reference go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// No teardown began: the process lives.
     Whole,
+    /// A child a portion: the first child in the list ends, killed, if it
+    /// lives, and goes right in front of the process in the queue; the
+    /// process waits behind it until the child leaves the list at its own
+    /// stage Quota. Descendants go depth first, and the kernel stack does
+    /// not grow with the depth of the tree (spec 4).
+    Children,
     /// A chunk of the handle table a portion, up to 64 handles, each
     /// releasing its object; the chunk directory with the last chunk
     /// (HandleTable::release_step).
@@ -96,9 +129,34 @@ pub enum Stage {
     Buffers,
     /// The blocks of frames the process owned, at most MAX_BLOCKS.
     Frames,
+    /// The process leaves its parent's list of children: by now its
+    /// descendants passed their own stage Quota. Once quotas count
+    /// (spec 7.5), the free part of its quota goes back to the parent here.
+    Quota,
     /// Nothing but the object and the reason are left: the last reference
-    /// queues the shell, and its portion gives the slot back.
+    /// queues the shell, and its portion gives the slot back and lets the
+    /// reference to the parent's shell go.
     Shell,
+}
+
+/// The stages of a teardown in the order they run (spec 7.7).
+const STAGES: [Stage; 7] = [
+    Stage::Children,
+    Stage::Handles,
+    Stage::Space,
+    Stage::Buffers,
+    Stage::Frames,
+    Stage::Quota,
+    Stage::Shell,
+];
+
+/// The stage after `stage`, which is one of STAGES but the last.
+fn after(stage: Stage) -> Stage {
+    let i = STAGES
+        .iter()
+        .position(|&s| s == stage)
+        .expect("a stage of a teardown");
+    STAGES[i + 1]
 }
 
 /// Blocks of frames, as (physical address, order), that `release` gives
@@ -241,10 +299,14 @@ pub fn create(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error>
         frames: OwnedFrames([None; MAX_BLOCKS]),
         handles,
         refs: 1,
+        shell_refs: 0,
         ceiling,
         life: Life::new(),
         threads: None,
         thread_count: 0,
+        parent: None,
+        children: None,
+        child_siblings: None,
         init: false,
         stage: Stage::Whole,
         cleanup: Item::new(),
@@ -286,9 +348,10 @@ pub fn retain(process: NonNull<Process>) {
 
 /// Drops a reference; the last one queues the process for cleanup at
 /// `cause`, the level of the cleanup this release starts (spec 7.7): a
-/// process that lives ends, killed, and its teardown begins; a shell goes.
-/// No other process can lose its last reference: the queue holds one to a
-/// process on its stages.
+/// process that lives ends, killed, and its teardown begins; a shell goes
+/// once no child holds it either (`release_shell`). No other process can
+/// lose its last reference: the queue holds one to a process on its
+/// stages.
 ///
 /// # Safety
 /// The reference is the caller's, and the caller does not use it afterwards.
@@ -314,11 +377,47 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
                 assert!(ended, "a whole process that ended");
                 begin(process, cause);
             }
-            Stage::Shell => {
-                let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
-                cleanup::enqueue(item, Object::Process(process), cause);
-            }
+            Stage::Shell => queue_shell(process, cause),
             _ => unreachable!("the cleanup queue holds a process on its stages"),
+        }
+    }
+}
+
+/// Drops a child's reference to its parent's shell, at the child's shell
+/// portion (`free`); the last reference of either kind queues the shell
+/// at `cause`.
+///
+/// # Safety
+/// The reference is the caller's, and the caller does not use it afterwards.
+unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
+    // SAFETY: the caller's reference keeps the object alive until here;
+    // only the fields are touched, the count through `refs`.
+    unsafe {
+        let refs = *refs(process);
+        let p = process.as_ptr();
+        (*p).shell_refs = (*p)
+            .shell_refs
+            .checked_sub(1)
+            .expect("a shell is released once too often");
+        if (*p).shell_refs == 0 && refs == 0 && (*p).stage == Stage::Shell {
+            queue_shell(process, cause);
+        }
+    }
+}
+
+/// Queues the shell of a process for its last portion unless a child
+/// still holds it.
+///
+/// # Safety
+/// No reference that keeps the process alive is left, and its stages are
+/// over.
+unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
+    // SAFETY: the caller's promise: nothing but children reach the shell,
+    // and the pool keeps it in place.
+    unsafe {
+        if (*process.as_ptr()).shell_refs == 0 {
+            let item = NonNull::new_unchecked(&raw mut (*process.as_ptr()).cleanup);
+            cleanup::enqueue(item, Object::Process(process), cause);
         }
     }
 }
@@ -337,7 +436,7 @@ unsafe fn begin(process: NonNull<Process>, level: u8) {
             (*p).stage == Stage::Whole,
             "the teardown of a process begins twice"
         );
-        (*p).stage = Stage::Handles;
+        (*p).stage = STAGES[0];
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
         let refs = refs(process);
@@ -350,9 +449,10 @@ unsafe fn begin(process: NonNull<Process>, level: u8) {
 /// One portion of a process in the cleanup queue (cleanup::portion): one
 /// step of its stage (`Stage`); what the step releases is queued at
 /// `level`. With work left the process goes back to the head of `level`,
-/// so the next portion there goes on with it; after the stage Frames the
-/// queue lets its reference go, which queues the shell when it was the
-/// last. A shell's portion gives the slot back.
+/// so the next portion there goes on with it, and at the stage Children
+/// its first child goes in front of it; after the stage Quota the queue
+/// lets its reference go, which queues the shell when it was the last. A
+/// shell's portion gives the slot back.
 ///
 /// # Safety
 /// The process was just taken from the queue: it is on its stages, with
@@ -361,8 +461,15 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     let p = process.as_ptr();
     // SAFETY: the caller's promise; only the field is read.
     let stage = unsafe { (*p).stage };
+    // The child that goes in front of the process at the stage Children.
+    let mut first = None;
     let done = match stage {
         Stage::Whole => unreachable!("a whole process in the cleanup queue"),
+        Stage::Children => {
+            // SAFETY: the process is alive; only the field is read.
+            first = unsafe { (*p).children };
+            first.is_none()
+        }
         // SAFETY: the process is alive, and the step borrows only the
         // field it works on.
         Stage::Handles => unsafe { release_handles(process, level) },
@@ -376,22 +483,18 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             (*p).frames.release();
             true
         },
+        // SAFETY: as above.
+        Stage::Quota => unsafe { leave_parent(process) },
         Stage::Shell => {
             // SAFETY: nothing refers to the shell.
-            unsafe { free(process) };
+            unsafe { free(process, level) };
             return;
         }
     };
-    let next = match (stage, done) {
-        (_, false) => stage,
-        (Stage::Handles, true) => Stage::Space,
-        (Stage::Space, true) => Stage::Buffers,
-        (Stage::Buffers, true) => Stage::Frames,
-        // After Frames only the shell is left.
-        _ => Stage::Shell,
-    };
+    let next = if done { after(stage) } else { stage };
     // SAFETY: the process is alive; the queue's reference goes last, and
-    // nothing uses the process afterwards.
+    // nothing uses the process afterwards; the child is alive while it is
+    // in the list.
     unsafe {
         (*p).stage = next;
         if next == Stage::Shell {
@@ -400,6 +503,27 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
             cleanup::requeue(item, Object::Process(process), level);
         }
+        if let Some(child) = first {
+            end_child(child, level);
+        }
+    }
+}
+
+/// The stage Children, after the parent went back to the head of `level`:
+/// the parent's first child ends, killed, if it lives, which stops its
+/// threads and queues it (`end`), and goes to the head of `level` unless
+/// it stands higher, right in front of the parent.
+///
+/// # Safety
+/// `child` is in its parent's list, so it is alive; the parent is queued.
+unsafe fn end_child(child: NonNull<Process>, level: u8) {
+    // SAFETY: the caller's promise; only the fields are touched.
+    unsafe {
+        if (*child.as_ptr()).stage == Stage::Whole {
+            end(child, ProcessState::Killed, level);
+        }
+        let item = NonNull::new_unchecked(&raw mut (*child.as_ptr()).cleanup);
+        cleanup::raise(item, level);
     }
 }
 
@@ -457,11 +581,82 @@ unsafe fn release_buffers(process: NonNull<Process>) -> bool {
     true
 }
 
-/// A shell's portion: the slot goes back to the pool.
+/// The stage Quota: the process leaves its parent's list of children.
+/// True: one portion.
+///
+/// # Safety
+/// `process` is alive and on its stages.
+unsafe fn leave_parent(process: NonNull<Process>) -> bool {
+    let p = process.as_ptr();
+    // SAFETY: the caller's promise; the parent's object is there, since the
+    // process holds its shell, and so are the neighbours in its list.
+    unsafe {
+        #[cfg(feature = "ktest")]
+        if (*p).children.is_some() {
+            EARLY_QUOTA.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let (Some(parent), Some(ChildLinks { prev, next })) =
+            ((*p).parent, (*p).child_siblings.take())
+        else {
+            return true;
+        };
+        match prev {
+            Some(q) => child_links(q).next = next,
+            None => (*parent.as_ptr()).children = next,
+        }
+        if let Some(n) = next {
+            child_links(n).prev = prev;
+        }
+    }
+    true
+}
+
+/// The links of `child`, a process in its parent's list.
+///
+/// # Safety
+/// `child` is alive and in the list; nothing else borrows its links.
+unsafe fn child_links<'a>(child: NonNull<Process>) -> &'a mut ChildLinks {
+    // SAFETY: the caller's promise.
+    unsafe { (*child.as_ptr()).child_siblings.as_mut() }.expect("a child in the list")
+}
+
+/// Makes `child`, a process `create` just made, a child of `parent`, which
+/// lives (spec 4): the child holds a reference to its parent's shell until
+/// its own shell goes, and stands at the head of its parent's list of
+/// children until its stage Quota. process_create comes here; init and the
+/// processes of kernel tests have no parent.
+pub fn adopt(parent: NonNull<Process>, child: NonNull<Process>) {
+    // SAFETY: the caller holds references to both; only the fields of the
+    // tree are touched.
+    unsafe {
+        let (p, c) = (parent.as_ptr(), child.as_ptr());
+        assert!(
+            (*p).stage == Stage::Whole && (*c).parent.is_none(),
+            "a child of a process that ended, or with a parent already"
+        );
+        (*p).shell_refs = (*p).shell_refs.checked_add(1).expect("children overflow");
+        (*c).parent = Some(parent);
+        let old = (*p).children;
+        (*c).child_siblings = Some(ChildLinks {
+            prev: None,
+            next: old,
+        });
+        if let Some(o) = old {
+            child_links(o).prev = Some(child);
+        }
+        (*p).children = Some(child);
+    }
+}
+
+/// A shell's portion: the slot goes back to the pool, and then the
+/// reference to the parent's shell, which queues that shell at `level`
+/// if it was the last.
 ///
 /// # Safety
 /// Nothing refers to the shell, and it is in no queue.
-unsafe fn free(process: NonNull<Process>) {
+unsafe fn free(process: NonNull<Process>, level: u8) {
+    // SAFETY: the caller's promise; only the field is read.
+    let parent = unsafe { (*process.as_ptr()).parent };
     // SAFETY: the caller's promise; every stage gave its memory back.
     unsafe { PROCESSES.lock().free(process) };
     // Test builds poison the slot past the pool's link: a use after free
@@ -475,6 +670,10 @@ unsafe fn free(process: NonNull<Process>) {
             core::mem::size_of::<Process>() - 8,
         )
     };
+    if let Some(parent) = parent {
+        // SAFETY: the shell's reference to its parent goes with it.
+        unsafe { release_shell(parent, level) };
+    }
 }
 
 /// What test builds fill a gone process with, past the pool's link.
@@ -794,6 +993,26 @@ pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
 #[cfg(feature = "ktest")]
 pub fn in_use() -> usize {
     PROCESSES.lock().in_use()
+}
+
+/// Processes that came to their stage Quota with children still in their
+/// list: none may, since the stage Children waits for each (test builds).
+#[cfg(feature = "ktest")]
+static EARLY_QUOTA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// How many processes came to their stage Quota before their children
+/// passed theirs, since the last call.
+#[cfg(feature = "ktest")]
+pub fn take_early_quota() -> u32 {
+    EARLY_QUOTA.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// The parent of `process`, which the test holds.
+#[cfg(feature = "ktest")]
+pub fn parent(process: NonNull<Process>) -> Option<NonNull<Process>> {
+    // SAFETY: the test holds a reference to the process; only the field is
+    // read.
+    unsafe { (*process.as_ptr()).parent }
 }
 
 /// How far the teardown of `process` came: its stage, the handles left in

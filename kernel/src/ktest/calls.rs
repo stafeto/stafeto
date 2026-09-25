@@ -429,9 +429,9 @@ fn set_priority_cases(
 /// process_create checks the values first, then the exit channel and the
 /// start channel, then the ceiling against the caller's (spec 11); a good
 /// call returns a handle with the owner's rights to a live process with
-/// the ceiling given. With the caller's table full it fails with
-/// LIMIT_REACHED, and the new process goes again. The caller's ceiling is
-/// 30.
+/// the ceiling given, a child of the caller's process (spec 4). With the
+/// caller's table full it fails with LIMIT_REACHED, and the new process
+/// goes again. The caller's ceiling is 30.
 pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;
@@ -489,12 +489,15 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     let found = unsafe { c.process.as_ref() }.lookup(child, OWNER_RIGHTS, Object::process);
     // SAFETY: the handle holds the child.
     let good = found.is_ok_and(|p| unsafe {
-        p != c.process && p.as_ref().ceiling() == 30 && p.as_ref().state() == ProcessState::Alive
+        p != c.process
+            && p.as_ref().ceiling() == 30
+            && p.as_ref().state() == ProcessState::Alive
+            && process::parent(p) == Some(c.process)
     });
     c.close(child)?;
     check(
         good,
-        "the handle does not name a live child with the owner's rights and its ceiling",
+        "the handle does not name a live child of the caller with the owner's rights and its ceiling",
     )?;
     full_table_cases(c, n)
 }
