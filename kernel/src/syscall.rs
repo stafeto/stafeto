@@ -336,7 +336,8 @@ fn check_handles(thread: NonNull<Thread>, values: &[u64]) -> Result<(), Error> {
 /// data, or an error of the reply's handles in x0 alone. Bytes 64 up to
 /// the length of the request and of the reply go between the message
 /// buffers, and the values and info words of the handles into them (spec
-/// 6.2; channel::send).
+/// 6.2; channel::send). A receiver that takes the request on the fast path
+/// runs at once (spec 6.4).
 fn send(thread: NonNull<Thread>, a: &Args) {
     let sent = Desc::from_send(a[1]).and_then(|desc| {
         let values = message_handles(thread, desc, Some(a[0]))?;
@@ -349,8 +350,10 @@ fn send(thread: NonNull<Thread>, a: &Args) {
         check_handles(thread, values)?;
         channel::send(thread, via, desc, values)
     });
-    if let Err(e) = sent {
-        set_result(thread, Err(e));
+    match sent {
+        Ok(Some(receiver)) => thread::run(receiver),
+        Ok(None) => {}
+        Err(e) => set_result(thread, Err(e)),
     }
 }
 

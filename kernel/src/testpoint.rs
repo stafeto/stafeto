@@ -54,6 +54,13 @@ mod points {
     #[inline(always)]
     pub fn init_ended() {}
 
+    /// Whether send takes its fast path, whose conditions hold
+    /// (channel::send, spec 6.4): always.
+    #[inline(always)]
+    pub fn fast_path() -> bool {
+        true
+    }
+
     /// Whether a BRK with immediate `imm` in kernel code is a test's marker
     /// to step over (exceptions::handle_exception): never, so every BRK
     /// stops the kernel.
@@ -102,5 +109,10 @@ mod points {
 
     pub fn skip_brk(imm: u16) -> bool {
         ktest::brk(imm)
+    }
+
+    /// The tests count the fast path's hits and may turn it off.
+    pub fn fast_path() -> bool {
+        el0::fast_path()
     }
 }

@@ -28,7 +28,12 @@ stafeto boots in QEMU and runs programs at EL0. What works today:
 - **Objects and calls:** 64-bit handles with rights; processes, threads,
   channels, sessions and program timers; the first system calls
   (`debug_write`, `yield`, `thread_*`, `process_*`, `channel_create`,
-  `notify`, `receive`, `timer_*`, `object_info`).
+  `notify`, `send`, `receive`, `reply`, `timer_*`, `object_info`).
+- **Messages:** synchronous requests and replies of up to 1 KB, the first
+  64 bytes in registers and the rest through a per-thread message buffer;
+  up to four handles move with a message, keeping their rights and labels;
+  a service works at its client's priority under its own ceiling until it
+  replies; a fast path hands the CPU straight to a waiting service.
 - **Faults:** a program fault ends only its own process, and the parent
   learns why through its exit channel.
 

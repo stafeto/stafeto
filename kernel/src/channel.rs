@@ -40,6 +40,7 @@ use crate::session::{self, Session};
 use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
+use crate::{arch, testpoint};
 use abi::{Error, INLINE_MAX, MAX_SLOTS, MESSAGE_HANDLES, Notification, Rights, Source};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
@@ -694,13 +695,25 @@ unsafe fn take_request(
 /// reference of its wait going after the scheduler's lock; or else the
 /// slot goes to the tail of its level in the channel's queue (spec 6.3),
 /// holding `via` and the handles (Thread::transit) until a receive takes
-/// it. O(1).
-pub fn send(t: NonNull<Thread>, via: Via, desc: Desc, values: &[u64]) -> Result<(), Error> {
+/// it. A message of registers alone may take the fast path (`fast_send`),
+/// and Ok names the receiver then, which the caller runs at once. O(1).
+pub fn send(
+    t: NonNull<Thread>,
+    via: Via,
+    desc: Desc,
+    values: &[u64],
+) -> Result<Option<NonNull<Thread>>, Error> {
     let c = via.channel();
     sched::locked(|k| k.tokens.check_count(thread::index(t)))?;
     if is_closed(c) {
         drop_handles(t, values);
         return Err(Error::PeerClosed);
+    }
+    if desc.len <= INLINE_MAX
+        && values.is_empty()
+        && let Some(r) = fast_send(t, via, desc)
+    {
+        return Ok(Some(r));
     }
     let receiver = sched::locked(|k| {
         // SAFETY: the channel, which the sender's handle holds, is alive; a
@@ -755,7 +768,62 @@ pub fn send(t: NonNull<Thread>, via: Via, desc: Desc, values: &[u64]) -> Result<
         // handle keeps the channel, and the sender is alive.
         unsafe { release(c, Rights::NONE, t.as_ref().priority()) };
     }
-    Ok(())
+    Ok(None)
+}
+
+/// The fast path of send (spec 6.4) for `t`, the running thread, through
+/// `via`, with `desc`, a message of registers alone: the top receiver that
+/// waits in the channel takes the request (`accept`) and runs at once in
+/// place of `t` (sched::hand_off), when the top level of the cleanup queue
+/// is below the receiver's effective priority after the boost the request
+/// gives it, no interrupt is pending, and that priority is above every
+/// ready thread's. The state is the one the slow path leaves. The
+/// reference of the receiver's wait goes after the scheduler's lock.
+/// Returns the receiver, which the caller runs; None, with nothing changed,
+/// when a condition fails. O(1).
+fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>> {
+    let c = via.channel();
+    // Read before the scheduler's lock: the locks do not nest.
+    let cleanup = cleanup::top();
+    let next_timer = timer::first();
+    let r = sched::hand_off(next_timer, |k| {
+        // SAFETY: the running thread and the channel, which its handle
+        // holds, are alive; a thread that waits in receive is alive, and
+        // its slot lies in it.
+        unsafe {
+            let q = queue(c, k.s);
+            if !q.has_receivers() {
+                return None;
+            }
+            let r = thread_of(q.head()?);
+            let n = &r.as_ref().sched;
+            let boost = n.boost().max(t.as_ref().priority().min(ceiling(r)));
+            let level = n.base().max(boost);
+            if cleanup.is_some_and(|l| l >= level)
+                || arch::irq_pending()
+                || k.s.ready().top().is_some_and(|top| top >= level)
+                || !testpoint::fast_path()
+            {
+                return None;
+            }
+            let running = k.s.block();
+            assert!(running == t, "a thread that does not run sends");
+            let slot = thread::slot(t);
+            (*slot.as_ptr()).set_priority(t.as_ref().priority());
+            let taken = queue(c, k.s).send(slot);
+            assert!(
+                taken == Some(thread::slot(r)),
+                "the receiver of a request changed"
+            );
+            (*r.as_ptr()).waits = None;
+            accept(k, r, t, via, desc);
+            Some(r)
+        }
+    })?;
+    // SAFETY: the reference was the receiver's wait's; the sender's handle
+    // keeps the channel, and the sender is alive.
+    unsafe { release(c, Rights::NONE, t.as_ref().priority()) };
+    Some(r)
 }
 
 /// Writes a message from `from`, its sender, into `to`, the thread it

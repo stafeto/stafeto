@@ -153,6 +153,9 @@ pub struct Process {
     cleanup: Item,
 }
 
+// Two shells to a page of a pool (spec 7.8).
+const _: () = assert!(Pool::<Process>::PER_PAGE >= 2);
+
 /// The pools of what a process pays for by the page (spec 7.5, 7.8): a
 /// page is charged when a pool grows, a slot that goes back refunds
 /// nothing, and the pages go back only with the process's shell. Every

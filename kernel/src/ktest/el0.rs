@@ -30,6 +30,7 @@ use abi::{
     Notification, Policy, ProcessState, Rights, START_CHANNEL, Source, msgbuf,
 };
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use kcore::PAGE_SIZE;
 use kcore::esr;
 use kcore::gic::PRIORITY_MASK;
@@ -94,15 +95,29 @@ unsafe extern "C" {
     static el0_close: u8;
     static el0_send_close: u8;
     static el0_notice_then_take: u8;
+    static el0_serve_snap: u8;
+    static el0_send_twice: u8;
+    static el0_release_then_send: u8;
+    static el0_pending_send: u8;
+    static el0_measure: u8;
+    static el0_serve_loop: u8;
+    static el0_yield_loop: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
 /// builds only (el0.S uses them too). NOP returns 0 in x0; DONE ends the
-/// program.
+/// program. SNAP notes the scheduler's state (`Snap`), SLOW turns the fast
+/// path of send off for the rest of the test, RELEASE lets thread x0 of
+/// the crowd go at level x1, each returning 0 in x0; PENDING makes send
+/// with its registers once an interrupt is pending.
 pub const SVC_NOP: u16 = 0xFF00;
 pub const SVC_DONE: u16 = 0xFF01;
+const SVC_SNAP: u16 = 0xFF02;
+const SVC_SLOW: u16 = 0xFF03;
+const SVC_RELEASE: u16 = 0xFF04;
+const SVC_PENDING: u16 = 0xFF05;
 
-const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_DONE <= *abi::TEST_CALLS.end());
+const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PENDING <= *abi::TEST_CALLS.end());
 
 // el0.S makes these calls by number and knows these values.
 const _: () = assert!(
@@ -164,6 +179,8 @@ const BITS: u64 = 0b1010;
 const CROWD: usize = 2 * MAX_THREADS as usize;
 /// The ceiling of the waiters' process in `set_priority_moves_a_waiting_thread`.
 const CAPPED: u8 = PRIORITY + 3;
+/// Rounds of each row of `ipc_round_trip_is_measured`.
+const ROUNDS: u64 = 1000;
 /// Timers of `expired_timers_fire_in_batches` on one deadline: more than
 /// one interrupt takes (timers::BATCH), and more than one process pays for
 /// (abi::MAX_TIMERS).
@@ -465,6 +482,36 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_labelled_close,
     },
     El0Test {
+        name: "fast_path_is_taken",
+        start: start_fast_hit,
+        done: done_fast_hit,
+    },
+    El0Test {
+        name: "fast_path_leaves_the_slow_path_state",
+        start: start_same_state,
+        done: done_same_state,
+    },
+    El0Test {
+        name: "fast_path_waits_for_the_cleanup",
+        start: start_cleanup_first,
+        done: done_cleanup_first,
+    },
+    El0Test {
+        name: "fast_path_yields_to_an_equal_ready_level",
+        start: start_equal_ready,
+        done: done_equal_ready,
+    },
+    El0Test {
+        name: "fast_path_skips_a_pending_interrupt",
+        start: start_pending_interrupt,
+        done: done_pending_interrupt,
+    },
+    El0Test {
+        name: "fast_path_arms_the_timer",
+        start: start_armed,
+        done: done_armed,
+    },
+    El0Test {
         name: "quantum_ends_with_a_far_timer_set",
         start: start_far_timer,
         done: done_far_timer,
@@ -532,6 +579,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "teardown_yields_to_a_pending_interrupt",
         start: start_big_teardown,
         done: done_big_teardown,
+    },
+    El0Test {
+        name: "ipc_round_trip_is_measured",
+        start: start_round_trips,
+        done: done_round_trips,
     },
 ];
 
@@ -626,6 +678,37 @@ struct Fixture {
     /// a process since the test began, the most heads one took, and the
     /// levels they ran at, a bit each (`heads_taken`).
     taken: (u32, usize, u64),
+    /// What the first two calls `svc #SVC_SNAP` noted, and how long after
+    /// the first the test's alarm fires, if that call arms it.
+    snaps: [Option<Snap>; 2],
+    alarm_at_snap: Option<u64>,
+    /// The thread that ran last when the first timer interrupt of the test
+    /// came.
+    interrupted: Option<NonNull<Thread>>,
+}
+
+/// The scheduler's state that `svc #SVC_SNAP` notes, right after the
+/// caller's receive took a request (the fast path tests, spec 6.4).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Snap {
+    /// Whether the caller runs, and the first ready thread of the top
+    /// level.
+    runs: bool,
+    ready: Option<NonNull<Thread>>,
+    /// The caller's effective priority and its x0-x10; x11, the token,
+    /// grows from request to request.
+    priority: u8,
+    regs: [u64; 11],
+    /// The states of the test's threads, in the order of their slots.
+    states: [Option<State>; SLOTS],
+    /// The end of the caller's quantum when it is round robin, the deadline
+    /// the timer holds, and the counter at the call.
+    slice_end: Option<u64>,
+    armed: Option<u64>,
+    now: u64,
+    /// The top level of the cleanup queue, and the fast path's hits so far.
+    cleanup: Option<u8>,
+    hits: u64,
 }
 
 // SAFETY: the fixture's objects are reached only under the kernel's rules
@@ -667,6 +750,9 @@ impl Fixture {
             live_threads: 0,
             timers: [None; BATCHED],
             taken: (0, 0, 0),
+            snaps: [None; 2],
+            alarm_at_snap: None,
+            interrupted: None,
         }
     }
 
@@ -680,6 +766,21 @@ impl Fixture {
 }
 
 static FIXTURE: Lock<Fixture> = Lock::new(Fixture::new(0));
+
+/// The fast path of send is off for the rest of the test (`svc #SVC_SLOW`).
+static FAST_PATH_OFF: AtomicBool = AtomicBool::new(false);
+/// Sends that took the fast path since the test began.
+static FAST_PATH_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether send takes its fast path, whose conditions hold
+/// (testpoint::fast_path): not once a test turned it off; a hit counts.
+pub fn fast_path() -> bool {
+    if FAST_PATH_OFF.load(Relaxed) {
+        return false;
+    }
+    FAST_PATH_HITS.fetch_add(1, Relaxed);
+    true
+}
 
 /// Runs the EL0 tests and ends the run.
 pub fn run() -> ! {
@@ -700,6 +801,8 @@ pub fn count() -> usize {
 fn start(first: usize) -> ! {
     for (i, test) in tests().enumerate().skip(first) {
         cleanup::drain();
+        FAST_PATH_OFF.store(false, Relaxed);
+        FAST_PATH_HITS.store(0, Relaxed);
         let started = {
             let mut f = FIXTURE.lock();
             *f = Fixture::new(i);
@@ -783,11 +886,77 @@ fn teardown() {
 pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
     note_stack();
     match number {
-        SVC_NOP => syscall::set_result(thread, Ok(Values::NONE)),
+        SVC_NOP => {}
         SVC_DONE => done(thread),
+        SVC_SNAP => snap(thread),
+        SVC_SLOW => FAST_PATH_OFF.store(true, Relaxed),
+        SVC_RELEASE => release_crowd(thread),
+        SVC_PENDING => {
+            // The timer fires at once, and its interrupt is pending when
+            // send looks.
+            timer::arm(timer::now());
+            while !arch::irq_pending() {}
+            syscall::dispatch(thread, Call::Send.number());
+            return true;
+        }
         _ => return false,
     }
+    syscall::set_result(thread, Ok(Values::NONE));
     true
+}
+
+/// `svc #SVC_SNAP` of `thread`: the scheduler's state goes into the next
+/// free place of `Fixture::snaps`. The first call arms the test's alarm
+/// `Fixture::alarm_at_snap` ticks later, when the test says so.
+fn snap(thread: NonNull<Thread>) {
+    let view = sched::view();
+    let arm = {
+        let mut f = FIXTURE.lock();
+        // SAFETY: the running thread is alive, and so are the test's
+        // threads, which it holds.
+        let (t, states) = unsafe {
+            let states = f.threads.map(|t| t.map(|t| t.as_ref().sched.state()));
+            (thread.as_ref(), states)
+        };
+        let now = timer::now();
+        let snap = Snap {
+            runs: view.running == Some(thread),
+            ready: view.ready,
+            priority: t.priority(),
+            regs: t.regs.x[..11].try_into().expect("x0-x10"),
+            states,
+            slice_end: view.slice_end,
+            armed: view.armed,
+            now,
+            cleanup: cleanup::top(),
+            hits: FAST_PATH_HITS.load(Relaxed),
+        };
+        let first = f.snaps[0].is_none();
+        if let Some(free) = f.snaps.iter_mut().find(|s| s.is_none()) {
+            *free = Some(snap);
+        }
+        let delay = f.alarm_at_snap.filter(|_| first);
+        f.alarm.zip(delay).map(|(alarm, delay)| {
+            f.kept[0] = now + delay;
+            (alarm, now + delay)
+        })
+    };
+    if let Some((alarm, at)) = arm {
+        timers::set(alarm, at, CAUSE).expect("the alarm's channel is open");
+    }
+}
+
+/// `svc #SVC_RELEASE` of `thread`: the test lets thread x0 of its crowd go
+/// at level x1, as a call at that level would; the thread never started,
+/// so its portion of cleanup waits in the queue at that level.
+fn release_crowd(thread: NonNull<Thread>) {
+    // SAFETY: the running thread is alive.
+    let x = unsafe { thread.as_ref() }.regs.x;
+    let t = FIXTURE.lock().crowd[x[0] as usize].take();
+    if let Some(t) = t {
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { thread::release(t, x[1] as u8) };
+    }
 }
 
 /// The timer's interrupt, after the scheduler's part, which fired the
@@ -813,6 +982,9 @@ pub fn timer_fired() {
     }
     let mut f = FIXTURE.lock();
     f.interrupts += 1;
+    if f.interrupts == 1 {
+        f.interrupted = thread::current();
+    }
     if let Some(mut thread) = thread::current() {
         // SAFETY: the thread is alive, and nothing else refers to it now.
         let regs = unsafe { &mut thread.as_mut().regs };
@@ -4182,4 +4354,350 @@ fn start_close_handles(f: &mut Fixture) -> Result<(), &'static str> {
 
 fn done_close_handles(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     closed_crowd(f, t, (2, 7, 1 << PRIORITY))
+}
+
+// The fast path of send (spec 6.4): a request of registers alone goes to a
+// receiver that waits and runs it at once, when nothing the next decision
+// would run first is there; it leaves the state the slow path leaves.
+
+/// A service in slot 0 that answers `rounds` requests on a new channel of
+/// its process at `priority` under `policy`, noting the scheduler's state
+/// at each (el0_serve_snap), and a client in slot 1 at 10, FIFO, that
+/// sends twice through it (el0_send_twice), turning the fast path off in
+/// between when `slow`; each in a process of its own.
+fn snap_pair(
+    f: &mut Fixture,
+    priority: u8,
+    policy: Policy,
+    slow: bool,
+) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_serve_snap, 0)?;
+    let client = spawn(f, 1, &raw const el0_send_twice, 0)?;
+    sched::set_priority(server, priority, policy).map_err(|_| "no priority")?;
+    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    set_args(server, &[requests, 2]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD, u64::from(slow)]);
+    Ok(())
+}
+
+/// The fast path takes a request of registers alone to a service that
+/// waits above its client (spec 6.4): the client of one process sends to
+/// the service of another, which answers; the fast path counts one hit, and
+/// the client gets its request back.
+fn start_fast_hit(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_serve, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    sched::set_priority(server, PRIORITY + 2, FIFO).map_err(|_| "no priority")?;
+    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    set_args(server, &[requests, 0]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    Ok(())
+}
+
+fn done_fast_hit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    if f.slot(t) == 0 {
+        return check(x[0] == 0, "the service's reply failed");
+    }
+    check(
+        x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
+        "the client did not get its request back",
+    )?;
+    check(
+        FAST_PATH_HITS.load(Relaxed) == 1,
+        "the request did not take the fast path",
+    )
+}
+
+/// Whether the switch that `s` saw, at `slice_end` less a quantum, came
+/// between `sent`, the counter the client read right before its send, and
+/// the moment `s` was noted.
+fn switched_between(s: &Snap, sent: u64) -> bool {
+    s.slice_end
+        .is_some_and(|end| (sent..=s.now).contains(&(end - quantum())))
+}
+
+/// The fast path leaves the state the slow path leaves (spec 6.4): a
+/// round-robin service at 12 in one process waits; a client at 10 of
+/// another sends twice, the second time with the fast path off, and a
+/// thread at 9 of the client's process is ready below both. Right after
+/// each receive the service notes the scheduler: the same running thread,
+/// ready thread, states, priority and registers, the timer armed for the
+/// end of the service's new quantum, which began after the client's send;
+/// one hit of the fast path.
+fn start_same_state(f: &mut Fixture) -> Result<(), &'static str> {
+    snap_pair(f, PRIORITY + 2, RR, true)?;
+    let q = f.processes[1].expect("the client's process");
+    let entry = &raw const el0_done_at_once;
+    let ready = new_thread(f, 2, q, DATA_VA + PAGE, entry, 0)?;
+    sched::set_priority(ready, PRIORITY - 1, FIFO).map_err(|_| "no priority")
+}
+
+fn done_same_state(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => {
+            let [Some(fast), Some(slow)] = f.snaps else {
+                return Err("the service noted no state twice");
+            };
+            let alike = |s: &Snap| (s.runs, s.ready, s.priority, s.regs, s.states);
+            check(
+                alike(&fast) == alike(&slow) && fast.runs && fast.ready == f.threads[2],
+                "the fast path left another scheduler or other registers",
+            )?;
+            check(
+                [fast, slow]
+                    .iter()
+                    .all(|s| s.armed.is_some() && s.armed == s.slice_end),
+                "the timer did not hold the end of the service's quantum",
+            )?;
+            let client = slot_thread(f, 1);
+            check(
+                switched_between(&fast, client.regs.x[20])
+                    && switched_between(&slow, client.regs.x[21]),
+                "the service's quantum did not begin at the switch",
+            )?;
+            check(
+                (fast.hits, slow.hits) == (1, 1),
+                "the first request did not take the fast path, or the second did",
+            )
+        }
+        1 => check(
+            x[22] == 0 && x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
+            "the client did not get its requests back",
+        ),
+        _ => check(f.passed[0] && f.passed[1], "the ready thread ran first"),
+    }
+}
+
+/// The fast path arms the timer as the next decision would (spec 6.4, 8,
+/// 10): a round-robin service at 12 takes a request of a client at 10 of
+/// another process; the timer holds the end of the service's quantum. The
+/// first note arms the test's alarm half a quantum later, and the second
+/// request, on the fast path too, finds the timer armed for the alarm.
+fn start_armed(f: &mut Fixture) -> Result<(), &'static str> {
+    snap_pair(f, PRIORITY + 2, RR, false)?;
+    let p = f.processes[0].expect("the service's process");
+    alarm(f, p, None)?;
+    f.alarm_at_snap = Some(quantum() / 2);
+    Ok(())
+}
+
+fn done_armed(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 0 {
+        return check(
+            t.regs.x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
+            "the client did not get its requests back",
+        );
+    }
+    let [Some(first), Some(second)] = f.snaps else {
+        return Err("the service noted no state twice");
+    };
+    check(
+        first.armed.is_some() && first.armed == first.slice_end && first.hits == 1,
+        "the fast path did not arm the timer for the end of the service's quantum",
+    )?;
+    check(
+        second.armed == Some(f.kept[0])
+            && second.slice_end.is_some_and(|end| f.kept[0] < end)
+            && second.hits == 2,
+        "the fast path did not arm the timer for a nearer timer of a program",
+    )
+}
+
+/// The fast path waits for cleanup at or above the receiver's level (spec
+/// 6.4, 7.7): a service at 12 in a process with ceiling 12 waits. A client
+/// at 11 lets a thread go at 5, below the service, and sends: the fast
+/// path takes it, and the service notes the portion still queued. A client
+/// at 20, woken by the alarm, lets a thread go at 12, the service's level,
+/// and sends: the service works at its ceiling, 12, level with the
+/// cleanup, which runs first, on the slow path.
+fn start_cleanup_first(f: &mut Fixture) -> Result<(), &'static str> {
+    let root = process::create_root(QUOTA, HANDLE_LIMIT, 12).map_err(|_| "no process")?;
+    let s = with_programs(f, 1, root)?;
+    let server = new_thread(f, 1, s, DATA_VA, &raw const el0_serve_snap, 0)?;
+    let late = spawn(f, 0, &raw const el0_alarm_then, 0)?;
+    let early = spawn(f, 2, &raw const el0_release_then_send, 0)?;
+    for (t, priority) in [(server, 12), (late, 20), (early, 11)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q] = [0, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let entry = user_address(&raw const el0_mark);
+    for i in 0..2 {
+        let t = thread::create(q, entry, 0, 0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+        f.crowd[i] = Some(t);
+    }
+    let [requests, from_p] = shared_channel(s, Rights::RECEIVE, p, Rights::SEND)?;
+    let from_q = give(q, Object::Channel(channel_of(s, requests)?), Rights::SEND)?;
+    let wake = timer::clock().deadline_after(timer::now(), 1_000_000);
+    let alarmed = alarm(f, p, Some(wake))?;
+    let then = user_address(&raw const el0_release_then_send) as u64;
+    set_args(server, &[requests, 2]);
+    set_args(late, &[alarmed, 0, then, 0, 12, from_p]);
+    set_args(early, &[1, 5, from_q]);
+    Ok(())
+}
+
+/// The channel handle `h` of `p` names.
+fn channel_of(p: NonNull<Process>, h: u64) -> Result<NonNull<Channel>, &'static str> {
+    // SAFETY: the test holds its process.
+    unsafe { p.as_ref() }
+        .lookup(Handle(h), Rights::NONE, Object::channel)
+        .map_err(|_| "no channel")
+}
+
+fn done_cleanup_first(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 1 {
+        return check(t.regs.x[0] == 0, "a client did not get its reply");
+    }
+    let [Some(below), Some(above)] = f.snaps else {
+        return Err("the service noted no state twice");
+    };
+    check(
+        below.cleanup == Some(5) && below.hits == 1,
+        "the fast path did not pass cleanup below the service",
+    )?;
+    check(
+        above.cleanup.is_none_or(|l| l < 12) && above.hits == 1,
+        "the service ran before cleanup at its level or above",
+    )
+}
+
+/// The fast path yields to a ready thread at the receiver's level (spec
+/// 6.4, 8): a service, a client and a thread of one process at 12 start in
+/// that order; the service waits, and the client's request goes on the
+/// slow path: the woken service is at the tail of 12, behind the thread,
+/// which runs first and leaves its mark.
+fn start_equal_ready(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let level = PRIORITY + 2;
+    let server = sched_thread(f, 0, &raw const el0_receive, level, FIFO)?;
+    let client = sched_thread(f, 1, &raw const el0_send, level, FIFO)?;
+    let ready = sched_thread(f, 2, &raw const el0_mark, level, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    let h = own_channel(p, Rights::SEND | Rights::RECEIVE)?;
+    set_args(server, &[h, 0]);
+    set_args(client, &[h, REQUEST_LEN, REQUEST_WORD]);
+    set_args(ready, &[word(0)]);
+    f.ends[1] = true;
+    Ok(())
+}
+
+fn done_equal_ready(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    match f.slot(t) {
+        0 => {
+            check(
+                x[0] == 0 && x[1..3] == [REQUEST_LEN, REQUEST_WORD],
+                "the service did not take the request",
+            )?;
+            check(
+                shared(f, 0) == 1 && FAST_PATH_HITS.load(Relaxed) == 0,
+                "the woken service ran before the ready thread of its level",
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The fast path gives way to a pending interrupt (spec 6.4, 8.1): a
+/// service at 12 waits; a client at 10 of another process sends once the
+/// timer's interrupt is pending (`svc #SVC_PENDING`). The kernel handles
+/// the interrupt on its way out of the client's call, before the service
+/// runs: the thread that ran last at the interrupt is the client.
+fn start_pending_interrupt(f: &mut Fixture) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_receive, 0)?;
+    let client = spawn(f, 1, &raw const el0_pending_send, 0)?;
+    sched::set_priority(server, PRIORITY + 2, FIFO).map_err(|_| "no priority")?;
+    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    set_args(server, &[requests, 0]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    f.ends[1] = true;
+    Ok(())
+}
+
+fn done_pending_interrupt(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(
+        x[0] == 0 && x[1..3] == [REQUEST_LEN, REQUEST_WORD],
+        "the service did not take the request",
+    )?;
+    check(
+        f.interrupted == f.threads[1] && FAST_PATH_HITS.load(Relaxed) == 0,
+        "the service ran before the pending interrupt was handled",
+    )
+}
+
+/// Where the measuring program leaves its times: on its data page, past
+/// the pattern.
+const TIMES_VA: usize = DATA_VA + 0x900;
+
+/// Spec 15.3: the round trip of a request is measured in counter ticks,
+/// under -icount one instruction each. A client at 10 of one process times
+/// ROUNDS rounds of each row: an empty call; a yield to a thread of a third
+/// process at its level and back, two switches; and, once it killed that
+/// process, a request of 8 bytes that a service at 11 of a second process
+/// answers in kind: on the fast path, with the fast path off, of 1024
+/// bytes, and with four handles each way. The judge prints the average of
+/// each row less an empty round, a switch as half a yield, and the longest
+/// round of each; the numbers fail nothing, but each round of the fast row
+/// took the fast path.
+fn start_round_trips(f: &mut Fixture) -> Result<(), &'static str> {
+    let client = spawn(f, 0, &raw const el0_measure, 0)?;
+    let server = spawn(f, 1, &raw const el0_serve_loop, 0)?;
+    spawn(f, 2, &raw const el0_yield_loop, 0)?;
+    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no priority")?;
+    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let moved = [(); 4].map(|()| give(p, Object::Channel(c), Rights::TRANSFER));
+    // SAFETY: the reference `create` handed out goes; the handles that went
+    // in hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    let [a, b, d, e] = moved;
+    buffer_with(client, p, &[a?, b?, d?, e?])?;
+    thread::give_buffer(server, BUFFER_VA).map_err(|_| "no message buffer")?;
+    let partner = give(p, Object::Process(r), Rights::MANAGE)?;
+    let handles = REQUEST_LEN | 4 << HANDLES_SHIFT;
+    set_args(client, &[send, partner, ROUNDS, TIMES_VA as u64, handles]);
+    set_args(server, &[requests]);
+    f.data = process::translate(p, DATA_VA).ok_or("no data page")?.0;
+    f.ends = [false, true, true];
+    Ok(())
+}
+
+fn done_round_trips(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(t.regs.x[0] == 0, "a call of the measurement failed")?;
+    let first = (TIMES_VA - DATA_VA) / 8;
+    let word = |i: usize| shared(f, first + i);
+    // Rows: an empty round, null, a yield both ways, fast, slow, buffer,
+    // handles; each a sum and the longest round.
+    let empty = word(0) / ROUNDS;
+    let average = |row: usize| (word(2 * row) / ROUNDS).saturating_sub(empty);
+    let longest = |row: usize| word(2 * row + 1).saturating_sub(empty);
+    kprintln!(
+        "ipc round trip ticks: null={} switch={} fast={} slow={} buffer={} handles={}",
+        average(1),
+        average(2) / 2,
+        average(3),
+        average(4),
+        average(5),
+        average(6)
+    );
+    kprintln!(
+        "ipc round trip longest ticks: null={} switch={} fast={} slow={} buffer={} handles={}",
+        longest(1),
+        longest(2) / 2,
+        longest(3),
+        longest(4),
+        longest(5),
+        longest(6)
+    );
+    check(
+        FAST_PATH_HITS.load(Relaxed) == ROUNDS,
+        "a round of the fast row did not take the fast path",
+    )
 }

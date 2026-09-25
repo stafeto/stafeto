@@ -10,6 +10,10 @@
 
 .equ SVC_NOP, 0xFF00                    // ktest::el0::SVC_NOP
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
+.equ SVC_SNAP, 0xFF02                   // ktest::el0::SVC_SNAP
+.equ SVC_SLOW, 0xFF03                   // ktest::el0::SVC_SLOW
+.equ SVC_RELEASE, 0xFF04                // ktest::el0::SVC_RELEASE
+.equ SVC_PENDING, 0xFF05                // ktest::el0::SVC_PENDING
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
 .equ CALL_SEND, 4                       // abi::Call::Send
@@ -772,5 +776,161 @@ el0_notice_then_take:
     mov     x1, #NO_WAIT
     svc     #CALL_RECEIVE
     svc     #SVC_DONE
+
+// The fast path of send and the round trip (ktest::el0).
+
+// A service of x1 requests, at least 1, on channel x0: it takes each in
+// receive, notes the scheduler's state (svc #SVC_SNAP), and answers with
+// the request itself. Ends with the last call's x0.
+.global el0_serve_snap
+el0_serve_snap:
+    mov     x19, x0
+    mov     x20, x1
+1:  mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    cbnz    x0, 2f
+    svc     #SVC_SNAP
+    mov     x0, x11
+    svc     #CALL_REPLY
+    subs    x20, x20, #1
+    b.ne    1b
+2:  svc     #SVC_DONE
+
+// send(x0 channel, x1 description, x2 data) twice, with the fast path off
+// (svc #SVC_SLOW) for the second when x3 is not 0; the counter read right
+// before each send goes to x20 and x21. Ends with the first send's x0 in
+// x22 and the second's result in x0-x9.
+.global el0_send_twice
+el0_send_twice:
+    mov     x24, x0
+    mov     x25, x1
+    mov     x26, x2
+    mov     x27, x3
+    isb
+    mrs     x20, cntvct_el0
+    svc     #CALL_SEND
+    mov     x22, x0
+    cbz     x27, 1f
+    svc     #SVC_SLOW
+1:  mov     x0, x24
+    mov     x1, x25
+    mov     x2, x26
+    isb
+    mrs     x21, cntvct_el0
+    svc     #CALL_SEND
+    svc     #SVC_DONE
+
+// svc #SVC_RELEASE of thread x0 of the test's crowd at level x1, then
+// send(x2 channel, 8 bytes of zeros); the kernel judges the reply.
+.global el0_release_then_send
+el0_release_then_send:
+    mov     x19, x2
+    svc     #SVC_RELEASE
+    mov     x0, x19
+    mov     x1, #8
+    mov     x2, #0
+    svc     #CALL_SEND
+    svc     #SVC_DONE
+
+// send(x0 channel, x1 description, x2-x9) made once an interrupt is
+// pending (svc #SVC_PENDING); the kernel judges the reply.
+.global el0_pending_send
+el0_pending_send:
+    svc     #SVC_PENDING
+    svc     #SVC_DONE
+
+// A service that answers every request on channel x0 with the request
+// itself, for ever: receive, then reply with its token, description and
+// data, then receive again. Ends at an error with its x0.
+.global el0_serve_loop
+el0_serve_loop:
+    mov     x19, x0
+1:  mov     x0, x19
+    mov     x1, #0
+    svc     #CALL_RECEIVE
+    cbnz    x0, 2f
+    mov     x0, x11
+    svc     #CALL_REPLY
+    b       1b
+2:  svc     #SVC_DONE
+
+// Yields for ever.
+.global el0_yield_loop
+el0_yield_loop:
+    svc     #CALL_YIELD
+    b       el0_yield_loop
+
+// The round trips of ipc_round_trip_is_measured. x0: a channel whose
+// service answers every request; x1: the process of a thread that yields
+// for ever at this thread's level; x2: rounds; x3: where the times go; x4:
+// the description of a request with four handles, whose values the buffer
+// holds. Each row times x2 rounds of a call, each between two readings of
+// the counter, and stores the sum and the longest at x3 and on: an empty
+// round, svc #0, a yield to the other thread and back, then, once
+// process_kill ended that thread, send of 8 bytes on the fast path, of 8
+// bytes with the fast path off (svc #SVC_SLOW), of 1024 bytes, and of 8
+// bytes with four handles. Ends with 0 in x0, or with the first error.
+.global el0_measure
+el0_measure:
+    mov     x24, x0
+    mov     x25, x1
+    mov     x26, x2
+    mov     x27, x3
+    mov     x28, x4
+    adr     x23, 5f
+    bl      6f
+    adr     x23, 7f
+    bl      6f
+    adr     x23, 8f
+    bl      6f
+    mov     x0, x25
+    svc     #CALL_PROCESS_KILL
+    cbnz    x0, 4f
+    adr     x23, 9f
+    mov     x25, #8
+    bl      6f
+    svc     #SVC_SLOW
+    bl      6f
+    mov     x25, #1024
+    bl      6f
+    mov     x25, x28
+    bl      6f
+    mov     x0, #0
+4:  svc     #SVC_DONE
+// x26 rounds of the call at x23, each between two readings of the
+// counter; the sum and the longest go to x27, which moves on. A call that
+// fails ends the program with its x0.
+6:  mov     x22, x30
+    mov     x19, x26
+    mov     x20, #0
+    mov     x21, #0
+1:  isb
+    mrs     x12, cntvct_el0
+    blr     x23
+    isb
+    mrs     x13, cntvct_el0
+    cbnz    x0, 4b
+    sub     x13, x13, x12
+    add     x20, x20, x13
+    cmp     x13, x21
+    csel    x21, x13, x21, hi
+    subs    x19, x19, #1
+    b.ne    1b
+    stp     x20, x21, [x27], #16
+    ret     x22
+// The calls: none, svc #0, a yield, send of x25 as its description
+// through x24.
+5:  mov     x0, #0
+    ret
+7:  svc     #0
+    mov     x0, #0
+    ret
+8:  svc     #CALL_YIELD
+    ret
+9:  mov     x0, x24
+    mov     x1, x25
+    svc     #CALL_SEND
+    ret
 
 el0_programs_end:

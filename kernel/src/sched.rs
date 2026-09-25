@@ -231,6 +231,40 @@ pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
     })
 }
 
+/// The fast path of send (spec 6.4): `meet` runs with the scheduler locked,
+/// as under `locked`, and either makes the meeting and returns the
+/// receiver, or returns None and changes nothing. The receiver then runs at
+/// once in place of the caller, which waits (Scheduler::hand_off), with a
+/// new quantum from now, and the timer is armed for the deadline it needs:
+/// the nearer of the end of that quantum when the receiver is round robin
+/// and `next_timer`, the earliest timer of a program, which the caller read
+/// before the lock (spec 8, 10). The state is the one `wake` and the next
+/// decision would leave; the caller runs the receiver (thread::run). O(1).
+pub fn hand_off(
+    next_timer: Option<u64>,
+    meet: impl FnOnce(&mut Locked<'_>) -> Option<NonNull<Thread>>,
+) -> Option<NonNull<Thread>> {
+    let now = timer::now();
+    let mut g = SCHED.lock();
+    let g = &mut *g;
+    // The decision that ran the caller took the deadline that fired, and
+    // no interrupt came since: its latency needs no more.
+    #[cfg(feature = "ktest")]
+    assert!(g.fired.is_none(), "a fired deadline waits at the fast path");
+    // SAFETY: as in `locked`.
+    let tokens = unsafe { &mut *TOKENS.0.get() };
+    let r = meet(&mut Locked {
+        s: &mut g.s,
+        tokens,
+    })?;
+    // SAFETY: the receiver is alive, and `meet` made it the meeting's: it
+    // waits in no queue, above every ready thread and the cleanup.
+    unsafe { g.s.hand_off(r, now) };
+    let deadline = g.s.deadline(next_timer);
+    g.armed.set(&mut VirtualTimer, deadline);
+    Some(r)
+}
+
 /// The timer's interrupt, before its EOI: the timer goes off, since its
 /// line is level-triggered and must be quiet by the EOI, and a round-robin
 /// thread whose quantum is over goes to the tail of its level; an
@@ -347,6 +381,31 @@ fn sleep() {
 #[cfg(feature = "ktest")]
 pub fn first(level: u8) -> Option<NonNull<Thread>> {
     SCHED.lock().s.ready().first(level)
+}
+
+/// What the scheduler holds now (test builds).
+#[cfg(feature = "ktest")]
+pub struct View {
+    /// The running thread, and the first ready thread of the top level.
+    pub running: Option<NonNull<Thread>>,
+    pub ready: Option<NonNull<Thread>>,
+    /// The deadline the scheduler needs with no timer of a program: the end
+    /// of the running thread's quantum when it is round robin.
+    pub slice_end: Option<u64>,
+    /// The deadline the timer holds.
+    pub armed: Option<u64>,
+}
+
+/// The scheduler's `View` now (test builds).
+#[cfg(feature = "ktest")]
+pub fn view() -> View {
+    let g = SCHED.lock();
+    View {
+        running: g.s.running(),
+        ready: g.s.ready().top().and_then(|l| g.s.ready().first(l)),
+        slice_end: g.s.deadline(None),
+        armed: g.armed.get(),
+    }
 }
 
 /// Forgets the longest latencies, so that a test measures its own.
