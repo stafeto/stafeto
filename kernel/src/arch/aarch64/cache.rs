@@ -14,7 +14,10 @@ const L1IP_PIPT: u64 = 0b11;
 /// line by line, then invalidates the instruction cache line by line, with
 /// the line sizes from CTR_EL0. A VIPT instruction cache (the A53's) may
 /// hold the code under the address the program runs it at, which differs
-/// from `va`, so there the whole instruction cache goes instead.
+/// from `va`, so there the whole instruction cache goes instead. A loader
+/// syncs every page it maps executable, whole, and not only the bytes it
+/// copied: the rest of the page was zeroed through the data side, and a
+/// PIPT instruction cache may still hold the frame's previous code there.
 #[cfg_attr(
     not(feature = "ktest"),
     expect(

@@ -359,7 +359,9 @@ fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'stati
     // SAFETY: the programs lie in the kernel image, and the frame is new,
     // one page, and reached through the linear map.
     unsafe { core::ptr::copy_nonoverlapping(start as *const u8, text_va as *mut u8, len) };
-    cache::sync_icache(text_va, len);
+    // The whole page, its zeroed tail included: the frame may have held
+    // other code, which the instruction cache may still hold.
+    cache::sync_icache(text_va, PAGE);
     Ok(p)
 }
 
