@@ -3,20 +3,20 @@
 
 //! Threads (spec 4, 8, 8.1): a program's registers, FP and SIMD included,
 //! its scheduling parameters, its message buffer and its process, in
-//! objects from a kernel pool. The registers come first, so TPIDR_EL1,
-//! which points at the running thread, points at them too (vectors.S). The
+//! objects from the pool of threads of their process. The registers come
+//! first, so TPIDR_EL1, which points at the running thread, points at them
+//! too (vectors.S). The
 //! running thread is the one TPIDR_EL1 names; the kernel stack holds
 //! nothing of it. A thread lives while references to it are left: handles,
 //! the one `create` hands out, and the kernel's while the scheduler holds
 //! the thread; it holds a reference to its process. A thread that ended
 //! stays as a shell without its buffer until its last reference goes,
 //! which queues it for cleanup (spec 7.7). Its process pays from its quota
-//! for the thread's slot until the shell goes and for the buffer while it
-//! lasts (spec 7.5).
+//! for the pages of its pool of threads (spec 7.8) and for the buffer
+//! while it lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::cleanup::{self, Item};
-use crate::mm::pages::KernelPages;
 use crate::mm::phys::FRAMES;
 use crate::object::Object;
 use crate::process::{self, Process};
@@ -27,8 +27,6 @@ use kcore::frames::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
-use kcore::slab::Pool;
-use kcore::sync::Lock;
 pub use kcore::thread::Policy;
 
 #[repr(C)]
@@ -79,7 +77,7 @@ struct Buffer {
 const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
 
 // SAFETY: threads are reached under the kernel's rules (spec 8.1): one
-// CPU, interrupts masked inside the kernel, the pool behind a lock.
+// CPU, interrupts masked inside the kernel.
 unsafe impl Send for Thread {}
 
 // SAFETY: the node is a field of the thread and lives as long as it does.
@@ -90,10 +88,9 @@ unsafe impl Schedulable for Thread {
     }
 }
 
-static THREADS: Lock<Pool<Thread>> = Lock::new(Pool::new());
-
-/// What a thread costs its process's quota: its slot in the pool.
-pub const SHELL_COST: u64 = Pool::<Thread>::SLOT as u64;
+/// Threads whose slots have not gone back (test builds).
+#[cfg(feature = "ktest")]
+static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl Thread {
     /// The thread's process, which the thread holds a reference to.
@@ -112,13 +109,13 @@ impl Thread {
 /// pointer `stack` and `arg` in x0, at `priority` under `policy`, once
 /// `start` makes it ready. It has no message buffer until `give_buffer`.
 /// The caller gets the first reference; the thread holds one to `process`
-/// and joins its threads, and its slot is charged to the quota of
-/// `process`. INVALID_ARGS for a start outside the lower half, a
-/// misaligned one or priority 0, LIMIT_REACHED when the process has
-/// abi::MAX_THREADS threads that have not ended, NO_MEMORY when the quota
-/// does not cover the slot or the pool gets no page. The limit comes first:
-/// a thread past it takes nothing. `priority` is at most the ceiling of
-/// `process`: the call checked it.
+/// and joins its threads, and its slot is in the pool of threads of
+/// `process`, whose quota pays for a page when the pool grows. INVALID_ARGS
+/// for a start outside the lower half, a misaligned one or priority 0,
+/// LIMIT_REACHED when the process has abi::MAX_THREADS threads that have
+/// not ended, NO_MEMORY when the quota falls short for a page. The limit
+/// comes first: a thread past it takes nothing. `priority` is at most the
+/// ceiling of `process`: the call checked it.
 pub fn create(
     process: NonNull<Process>,
     entry: usize,
@@ -135,7 +132,6 @@ pub fn create(
         "a thread above the ceiling of its process; the call checks it first"
     );
     process::thread_room(process)?;
-    process::charge(process, SHELL_COST)?;
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
@@ -147,10 +143,9 @@ pub fn create(
         refs: 1,
         cleanup: Item::new(),
     };
-    let Ok(thread) = THREADS.lock().alloc(&mut KernelPages, thread) else {
-        process::refund(process, SHELL_COST);
-        return Err(Error::NoMemory);
-    };
+    let thread = process::thread_slot(process, thread)?;
+    #[cfg(feature = "ktest")]
+    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     process::retain(process);
     process::add_thread(process, thread);
     Ok(thread)
@@ -160,17 +155,20 @@ pub fn create(
 /// at page `va` of its process, readable and writable, never executable.
 /// The frame is the thread's and goes when the thread ends; the quota of
 /// the process pays for it and for the tables. INVALID_ARGS for a page
-/// that is mapped already, NO_MEMORY when the quota, frames or table
-/// memory run out; the thread has no buffer then.
+/// that is mapped already, NO_MEMORY when the quota runs out; the thread
+/// has no buffer then. A charge that passed always finds its frame (spec
+/// 7.8).
 pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the thread, which holds its
     // process.
     let p = unsafe { t.as_ref() }.process;
     process::charge(p, PAGE_SIZE)?;
-    let Some(pa) = FRAMES.lock().as_mut().expect("frame allocator").alloc(0) else {
-        process::refund(p, PAGE_SIZE);
-        return Err(Error::NoMemory);
-    };
+    let pa = FRAMES
+        .lock()
+        .as_mut()
+        .expect("frame allocator")
+        .alloc(0)
+        .expect("a charge that passed found no frame (spec 7.8)");
     // SAFETY: the frame was just allocated and lies in the linear map; no
     // program sees it before it is zeroed.
     unsafe {
@@ -307,9 +305,9 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
 
 /// The portion of a thread nobody refers to (cleanup): its buffer goes,
 /// it leaves its process's list if it is still there, its slot goes back
-/// to the pool and to its process's quota, and then its reference to its
-/// process, queued at `level` if it was the last. When the thread ran
-/// last, no thread ran after it.
+/// to its process's pool, and then its reference to its process, queued
+/// at `level` if it was the last. When the thread ran last, no thread ran
+/// after it.
 ///
 /// # Safety
 /// No reference to `thread` is left, and it is in no queue.
@@ -324,7 +322,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
     unsafe {
         drop_buffer(thread);
         process::remove_thread(process, thread);
-        THREADS.lock().free(thread);
+        process::free_thread_slot(process, thread);
         // Test builds poison the slot past the pool's link, as for
         // processes: `refs` stops a use after free.
         #[cfg(feature = "ktest")]
@@ -334,7 +332,8 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
             core::mem::size_of::<Thread>() - 8,
         );
     }
-    process::refund(process, SHELL_COST);
+    #[cfg(feature = "ktest")]
+    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: the thread's reference to its process goes with it.
     unsafe { process::release(process, level) };
 }
@@ -376,8 +375,8 @@ pub fn run(next: NonNull<Thread>) -> ! {
     }
 }
 
-/// Objects the thread pool holds now.
+/// Threads whose slots have not gone back.
 #[cfg(feature = "ktest")]
 pub fn in_use() -> usize {
-    THREADS.lock().in_use()
+    LIVE.load(core::sync::atomic::Ordering::Relaxed)
 }

@@ -157,12 +157,15 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 /// (spec 4): it ends when its parent does. Resources come last and in the
 /// order the call occupies them, a limit that needs no allocation first
 /// (spec 11): the caller's own table has room for the new handle
-/// (LIMIT_REACHED), then the quota comes off the caller's (spec 7.5), and
-/// the child pays from it for its shell, its root table and the chunk with
-/// entry 0 (NO_MEMORY when either quota falls short). A full caller table
-/// fails before the child is built, so nothing is made and torn down for
-/// it. The quota comes back to the caller in full once the child and
-/// whatever holds its shell went.
+/// (LIMIT_REACHED), then the quota comes off the caller's (spec 7.5), the
+/// child pays from it for its root table, the caller for a page of its
+/// pool of shells when the pool grows (spec 7.8), and the child for the
+/// page of its pool of blocks with the chunk of entry 0 (NO_MEMORY when
+/// either quota falls short): the least quota is 8 KiB. A full caller
+/// table fails before the child is built, so nothing is made and torn
+/// down for it. The quota comes back to the caller in full once the child
+/// and whatever holds its shell went; the page of shells stays the
+/// caller's.
 fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let quota = quota_arg(a[0])?;
     let limit = handle_limit_arg(a[1])?;
@@ -353,7 +356,7 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 
 /// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
 /// idle time and latencies, the cleanup queue, the frames and the pages of
-/// the pools.
+/// the pools and of the page logs of their payers.
 fn kernel_stats() -> KernelStats {
     let s = sched::stats();
     KernelStats {

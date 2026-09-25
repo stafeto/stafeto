@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Starting init (spec 3.3, 13.3) from the program in the boot
-//! image: its process, with every free frame as its quota (spec 7.5),
+//! image: its process, with every frame free after its shell as its quota
+//! (spec 7.5),
 //! each segment on fresh frames with the protection
 //! its place in the program gives it, the stack right under
 //! abi::INIT_STACK_TOP with an unmapped guard page below, the first
@@ -13,7 +14,6 @@
 //! that names it.
 
 use crate::arch::cache;
-use crate::mm::phys;
 use crate::process::{self, Process};
 use crate::thread::{self, Policy};
 use bootimg::{Part, Program};
@@ -27,12 +27,12 @@ use kcore::paging::Attrs;
 const PRIORITY: u8 = 63;
 
 /// Makes init from `program` and leaves the kernel for it. Init's end
-/// ends the run (process::set_init). Its quota is every frame free when it
-/// is made, and its own structures are charged to it as to any process;
-/// it has no parent to give the quota back to.
+/// ends the run (process::set_init). Its shell takes the page the kernel
+/// keeps outside every quota; its quota is every frame free after that
+/// (process::create_init), and everything else of it is charged to it as
+/// to any process; it has no parent to give the quota back to.
 pub fn start(program: &Program<'_>) -> ! {
-    let quota = phys::free_frames() * PAGE_SIZE;
-    let p = process::create_init(quota, kcore::handles::MAX_HANDLES, PRIORITY)
+    let p = process::create_init(kcore::handles::MAX_HANDLES, PRIORITY)
         .unwrap_or_else(|e| panic!("init: no process: {e:?}"));
     process::set_init(p);
     for part in Part::ALL {

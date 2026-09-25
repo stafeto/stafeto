@@ -3,30 +3,32 @@
 
 //! Processes (spec 4, 8): an address space, the frames the process owns
 //! there, its handle table, its priority ceiling, its threads that have
-//! not ended, its parent and children, and how it lives, in objects from a
-//! kernel pool. A process lives while references to it are left: handles
-//! to it, its threads, and the one `create` hands out; its children hold
-//! only its shell. It ends (`end`) through process_exit, process_kill, a
-//! fault at EL0 or the exit of its last started thread, when its last
-//! reference goes while it lives, and when its parent ends. The end itself
-//! only stops its threads,
-//! at most abi::MAX_THREADS, and queues the process for cleanup; the queue
+//! not ended, its parent and children, and how it lives, in an object in
+//! its parent's pool of shells. A process lives while references to it
+//! are left: handles to it, its threads, and the one `create` hands out;
+//! its children hold only its shell. It ends (`end`) through
+//! process_exit, process_kill, a fault at EL0 or the exit of its last
+//! started thread, when its last reference goes while it lives, and when
+//! its parent ends. The end itself only stops its threads, at most
+//! abi::MAX_THREADS, and queues the process for cleanup; the queue
 //! takes it apart in stages, a portion at a time, with how far it came
 //! kept in the process (`Stage`, spec 7.7), its descendants first. A shell
 //! with the reason stays for object_info until the last reference queues
 //! it once more. Every release names the level of its cause, which the
 //! cleanup it may start takes. A process pays from its quota for what goes
-//! with it (spec 7.5): its shell, the chunks and directory of its handle
-//! table, the tables of its space, its threads and their message buffers,
-//! and the frames of `map_frames`. A child's quota comes off its parent's
-//! and goes back in two parts: what is free at the child's stage Quota,
-//! and the rest with its shell.
+//! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
+//! threads, the blocks of its handle table and the shells of its children;
+//! and for the tables of its space, the message buffers of its threads and
+//! the frames of `map_frames`. The pages of its pools go back only with
+//! its shell, in portions. A child's quota comes off its parent's and goes
+//! back in two parts: what is free at the child's stage Quota, and the
+//! rest with its shell.
 
 use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
-use crate::mm::pages::KernelPages;
+use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys::FRAMES;
-use crate::object::{self, Chunks, Handles, Object};
+use crate::object::{self, Block, Chunks, Handles, Object};
 use crate::sched;
 use crate::thread::{self, Siblings, Thread};
 use abi::{Error, Handle, MAX_THREADS, ProcessState, Rights};
@@ -36,11 +38,14 @@ use kcore::layout::LINEAR_BASE;
 use kcore::paging::{Attrs, MapError};
 use kcore::process::Life;
 use kcore::quota::Account;
-use kcore::slab::Pool;
+use kcore::slab::{PageLog, PaidPages, Pool};
 use kcore::sync::Lock;
 
 /// Blocks of frames one process may own.
 const MAX_BLOCKS: usize = 8;
+
+/// Pages a portion of the stage Shell gives back, at most (spec 7.7).
+const SHELL_PORTION: usize = 64;
 
 pub struct Process {
     /// From `create` until the first portion of the stage Space takes it:
@@ -69,6 +74,11 @@ pub struct Process {
     /// Its memory quota: the limit its parent gave, what is charged to
     /// it, and what went back to the parent (spec 7.5).
     quota: Account,
+    /// The pages of `pools` and the list pages that name them, each
+    /// charged to `quota`: they go back at the stage Shell (spec 7.8).
+    pages: PageLog,
+    /// What the process pays for by the page.
+    pools: Pools,
     /// No thread of the process gets a base priority above it (spec 8).
     ceiling: u8,
     /// The threads it started and whether it ended, and why. A process
@@ -102,6 +112,20 @@ pub struct Process {
     cleanup: Item,
 }
 
+/// The pools of what a process pays for by the page (spec 7.5, 7.8): a
+/// page is charged when a pool grows, a slot that goes back refunds
+/// nothing, and the pages go back only with the process's shell. Every
+/// object in them holds a reference to the process or to its shell, so by
+/// then they hold nothing.
+struct Pools {
+    /// Its threads, whoever made them.
+    threads: Pool<Thread>,
+    /// The chunks and the directory of its handle table.
+    blocks: Pool<Block>,
+    /// The shells of its children.
+    children: Pool<Process>,
+}
+
 /// Neighbours in the list of a parent's children.
 #[derive(Clone, Copy)]
 struct ChildLinks {
@@ -112,9 +136,9 @@ struct ChildLinks {
 /// Where the teardown of a process stands (spec 7.7). A process is whole
 /// until it ends; then the cleanup queue holds it, with a reference of its
 /// own, and each portion takes one step of its stage, in the order of
-/// STAGES, with how far it came kept in the process. Children, Handles and
-/// Space take as many portions as their steps; the others one. After the
-/// stage Quota the queue lets its reference go.
+/// STAGES, with how far it came kept in the process. Children, Handles,
+/// Space and Shell take as many portions as their steps; the others one.
+/// After the stage Quota the queue lets its reference go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// No teardown began: the process lives.
@@ -144,9 +168,10 @@ pub enum Stage {
     /// descendants passed their own stage Quota (spec 7.5).
     Quota,
     /// Nothing but the object and the reason are left: the last reference
-    /// queues the shell, and its portion gives the slot back, the rest of
-    /// the quota to the parent and then the reference to the parent's
-    /// shell.
+    /// queues the shell. Each portion gives up to SHELL_PORTION pages of
+    /// its pools back to the frame allocator; the last one gives the slot
+    /// back to its parent's pool, the rest of the quota to the parent and
+    /// then the reference to the parent's shell.
     Shell,
 }
 
@@ -169,9 +194,6 @@ fn after(stage: Stage) -> Stage {
         .expect("a stage of a teardown");
     STAGES[i + 1]
 }
-
-/// What the shell of a process costs its quota: its slot in the pool.
-pub const SHELL_COST: u64 = Pool::<Process>::SLOT as u64;
 
 /// Blocks of frames, as (physical address, order), that `release` gives
 /// back to the allocator when their owner goes.
@@ -201,11 +223,18 @@ impl Drop for OwnedFrames {
 }
 
 // SAFETY: processes and their threads are reached under the kernel's
-// rules (spec 8.1): one CPU, interrupts masked inside the kernel, the
-// pools behind locks.
+// rules (spec 8.1): one CPU, interrupts masked inside the kernel, ROOTS
+// behind a lock.
 unsafe impl Send for Process {}
 
-static PROCESSES: Lock<Pool<Process>> = Lock::new(Pool::new());
+/// The shells of processes with no parent: at boot the reserve, a page
+/// for init's shell taken before init's quota is counted (spec 7.5);
+/// in test builds the kernel tests' processes. Its pages stay.
+static ROOTS: Lock<Pool<Process>> = Lock::new(Pool::new());
+
+/// Processes whose shells have not gone (test builds).
+#[cfg(feature = "ktest")]
+static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 impl Process {
     fn space(&mut self) -> &mut AddressSpace {
@@ -259,6 +288,9 @@ impl Process {
             .expect("frame allocator")
             .alloc(order)
         else {
+            // A block may miss while its frames are free apart; a single
+            // frame may not (spec 7.8).
+            assert!(order > 0, "a charge that passed found no frame (spec 7.8)");
             self.quota.refund(PAGE_SIZE << order);
             return Err(Error::NoMemory);
         };
@@ -309,19 +341,25 @@ impl Process {
 
 /// A process with a quota of `quota` bytes, an empty address space, an
 /// empty handle table for up to `handle_limit` handles and priority
-/// ceiling `ceiling`, and no parent; the caller gets its first reference.
-/// Its shell and root table are charged to its quota at once.
-/// INVALID_ARGS for a limit outside 1-kcore::handles::MAX_HANDLES or a
-/// ceiling outside 1-63, NO_MEMORY when the quota does not cover the shell
-/// and the root table, or no frame is left for the table or the pool.
-/// Only children (`create_child`), init (`create_init`) and the kernel
-/// tests' processes (`create_root`) come from here.
-fn create(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error> {
+/// ceiling `ceiling`, and no parent yet; the caller gets its first
+/// reference. Its root table is charged to its quota at once. Its shell
+/// takes a slot in the pool of `payer`, whose quota pays for a page when
+/// the pool grows (spec 7.5), or with no payer in ROOTS. INVALID_ARGS for
+/// a limit outside 1-kcore::handles::MAX_HANDLES or a ceiling outside
+/// 1-63, NO_MEMORY when the quota does not cover the root table or the
+/// payer's does not cover a new page of its pool. Only children
+/// (`create_child`), init (`create_init`) and the kernel tests' processes
+/// (`create_root`) come from here.
+fn create(
+    quota: u64,
+    handle_limit: u32,
+    ceiling: u8,
+    payer: Option<NonNull<Process>>,
+) -> Result<NonNull<Process>, Error> {
     let ceiling = kcore::sched::priority_arg(u64::from(ceiling))?;
     kcore::process::handle_limit_arg(u64::from(handle_limit))?;
     let handles = Handles::new(handle_limit).map_err(Error::from)?;
     let mut quota = Account::new(quota);
-    quota.charge(SHELL_COST)?;
     let space = AddressSpace::new(&mut quota).map_err(|_| Error::NoMemory)?;
     let process = Process {
         space: Some(space),
@@ -331,6 +369,12 @@ fn create(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>
         refs: 1,
         shell_refs: 0,
         quota,
+        pages: PageLog::new(),
+        pools: Pools {
+            threads: Pool::new(),
+            blocks: Pool::new(),
+            children: Pool::new(),
+        },
         ceiling,
         life: Life::new(),
         threads: None,
@@ -342,36 +386,69 @@ fn create(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>
         stage: Stage::Whole,
         cleanup: Item::new(),
     };
-    let allocated = PROCESSES.lock().alloc(&mut KernelPages, process);
-    allocated.map_err(|mut process| {
+    let allocated = match payer {
+        // SAFETY: the caller holds a reference to the payer; the new
+        // process is no field of it.
+        Some(payer) => unsafe { paid_slot(payer, |pools| &mut pools.children, process) },
+        None => ROOTS.lock().alloc(&mut KernelPages, process),
+    };
+    let process = allocated.map_err(|mut process| {
         // No object for it: its space goes, with the pool's lock released.
         process.destroy_space();
         Error::NoMemory
-    })
+    })?;
+    #[cfg(feature = "ktest")]
+    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    Ok(process)
+}
+
+/// Puts `value` in a slot of the pool `pool` picks among those of `payer`,
+/// whose quota pays for a page when the pool grows (spec 7.8); gives the
+/// value back when the quota falls short.
+///
+/// # Safety
+/// `payer` is alive, and nothing else borrows its pools, its quota or its
+/// page log meanwhile.
+unsafe fn paid_slot<T>(
+    payer: NonNull<Process>,
+    pool: impl FnOnce(&mut Pools) -> &mut Pool<T>,
+    value: T,
+) -> Result<NonNull<T>, T> {
+    let p = payer.as_ptr();
+    // SAFETY: the caller's promise; only these fields are borrowed.
+    let (pools, quota, log) = unsafe { (&mut (*p).pools, &mut (*p).quota, &mut (*p).pages) };
+    pool(pools).alloc(&mut PaidPages::new(KernelPages, quota, log), value)
 }
 
 /// Init's process, as `create` makes one (spec 7.5, 13.3): outside the
-/// kernel tests the only process with no parent, whose quota nobody paid.
-/// Test builds have no init.
+/// kernel tests the only process with no parent. Its shell takes the
+/// reserve, a page of ROOTS taken before its quota is counted; the quota
+/// is every frame free then, so each frame taken from then on is charged
+/// to init or to a process below it. Test builds have no init.
 #[cfg(not(feature = "ktest"))]
-pub fn create_init(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error> {
-    create(quota, handle_limit, ceiling)
+pub fn create_init(handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error> {
+    if !ROOTS.lock().reserve(&mut KernelPages) {
+        return Err(Error::NoMemory);
+    }
+    let quota = crate::mm::phys::free_frames() * PAGE_SIZE;
+    create(quota, handle_limit, ceiling, None)
 }
 
 /// A process with no parent for the kernel tests, as `create` makes one:
-/// its quota comes from nowhere, and its count is checked all the same
-/// when its shell goes (Account::return_rest).
+/// its shell comes from ROOTS and its quota from nowhere, and its count is
+/// checked all the same when its shell goes (Account::return_rest).
 #[cfg(feature = "ktest")]
 pub fn create_root(quota: u64, handle_limit: u32, ceiling: u8) -> Result<NonNull<Process>, Error> {
-    create(quota, handle_limit, ceiling)
+    create(quota, handle_limit, ceiling, None)
 }
 
 /// A child of `parent`, which lives (spec 4, 7.5): `quota` comes off the
 /// parent's quota first, NO_MEMORY when it does not fit there; then the
-/// child is made with it as `create` makes a process, and joins its
-/// parent (`adopt`). The quota goes back to the parent in two parts: at
-/// once when the child is not made, and otherwise what is free at the
-/// child's stage Quota and the rest when its shell goes.
+/// child is made with it as `create` makes a process, its shell in the
+/// parent's pool, and joins its parent (`adopt`). The quota goes back to
+/// the parent in two parts: at once when the child is not made, and
+/// otherwise what is free at the child's stage Quota and the rest when
+/// its shell goes. The page of the pool stays the parent's.
 pub fn create_child(
     parent: NonNull<Process>,
     quota: u64,
@@ -379,7 +456,8 @@ pub fn create_child(
     ceiling: u8,
 ) -> Result<NonNull<Process>, Error> {
     charge(parent, quota)?;
-    let child = create(quota, handle_limit, ceiling).inspect_err(|_| refund(parent, quota))?;
+    let child = create(quota, handle_limit, ceiling, Some(parent))
+        .inspect_err(|_| refund(parent, quota))?;
     adopt(parent, child);
     Ok(child)
 }
@@ -540,7 +618,8 @@ unsafe fn begin(process: NonNull<Process>, level: u8) {
 /// so the next portion there goes on with it, and at the stage Children
 /// its first child goes in front of it; after the stage Quota the queue
 /// lets its reference go, which queues the shell when it was the last. A
-/// shell's portion gives the slot back.
+/// shell's portion gives pages of its pools back, and the last one the
+/// slot.
 ///
 /// # Safety
 /// The process was just taken from the queue: it is on its stages, with
@@ -574,8 +653,16 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         // SAFETY: as above.
         Stage::Quota => unsafe { leave_parent(process) },
         Stage::Shell => {
-            // SAFETY: nothing refers to the shell.
-            unsafe { free(process, level) };
+            // SAFETY: nothing refers to the shell, so nothing lives in its
+            // pools; the shell stays in place until its last portion.
+            unsafe {
+                if release_pages(p) {
+                    free(process, level);
+                } else {
+                    let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
+                    cleanup::requeue(item, Object::Process(process), level);
+                }
+            }
             return;
         }
     };
@@ -621,17 +708,32 @@ unsafe fn end_child(child: NonNull<Process>, level: u8) {
 /// # Safety
 /// `process` is alive and on its stages.
 unsafe fn release_handles(process: NonNull<Process>, level: u8) -> bool {
-    // SAFETY: only the table and the quota its chunks go back to are
-    // borrowed: releasing its objects reaches no other field but `refs`,
+    // SAFETY: releasing its objects reaches no other field but `refs`,
     // through raw pointers, since a release only counts and queues.
-    let (handles, quota) = unsafe {
-        let p = process.as_ptr();
-        (&mut (*p).handles, &mut (*p).quota)
-    };
-    handles.release_step(&mut Chunks(quota), |object| {
+    let (handles, mut chunks) = unsafe { table(process) };
+    handles.release_step(&mut chunks, |object| {
         // SAFETY: the table let the handle go, and its reference with it.
         unsafe { object::release(object, level) }
     })
+}
+
+/// The handle table of `process` and the memory for its blocks: the
+/// process's pool of blocks, which its quota pays for by the page
+/// (spec 7.5, 7.8).
+///
+/// # Safety
+/// `process` is alive, and nothing else borrows its table, its pools, its
+/// quota or its page log meanwhile.
+unsafe fn table<'a>(process: NonNull<Process>) -> (&'a mut Handles, Chunks<'a>) {
+    let p = process.as_ptr();
+    // SAFETY: the caller's promise; only these fields are borrowed.
+    unsafe {
+        let chunks = Chunks {
+            blocks: &mut (*p).pools.blocks,
+            pages: PaidPages::new(KernelPages, &mut (*p).quota, &mut (*p).pages),
+        };
+        (&mut (*p).handles, chunks)
+    }
 }
 
 /// The stage Space: the first portion takes the space and retires it,
@@ -746,23 +848,47 @@ fn adopt(parent: NonNull<Process>, child: NonNull<Process>) {
     }
 }
 
-/// A shell's portion: the slot goes back to the pool, the rest of the
-/// quota to the parent (Account::return_rest: nothing else is charged by
-/// now, since whatever held the shell went), and then the reference to
-/// the parent's shell, which queues that shell at `level` if it was the
-/// last.
+/// The stage Shell: up to SHELL_PORTION pages of the process's pools and
+/// of its page log go back to the frame allocator, each refunded to its
+/// quota (spec 7.8). True once none is left.
 ///
 /// # Safety
-/// Nothing refers to the shell, and it is in no queue.
+/// Nothing refers to the shell: no object lives in its pools.
+unsafe fn release_pages(p: *mut Process) -> bool {
+    // SAFETY: the caller's promise; only the fields are borrowed.
+    let (log, quota) = unsafe { (&mut (*p).pages, &mut (*p).quota) };
+    log.release_step(SHELL_PORTION, |page| {
+        // SAFETY: the page came from KernelPages through the pools, and no
+        // object lives there any more.
+        unsafe { pages::give_back(page) };
+        quota.refund(PAGE_SIZE);
+    })
+}
+
+/// A shell's last portion, once its pages went: the slot goes back to the
+/// pool it came from, its parent's or ROOTS, the rest of the quota to the
+/// parent (Account::return_rest: nothing is charged by now, since
+/// whatever held the shell went), and then the reference to the parent's
+/// shell, which queues that shell at `level` if it was the last.
+///
+/// # Safety
+/// Nothing refers to the shell, its pages went, and it is in no queue.
 unsafe fn free(process: NonNull<Process>, level: u8) {
     // SAFETY: the caller's promise; only the fields are touched.
     let (parent, rest) = unsafe {
         let p = process.as_ptr();
-        (*p).quota.refund(SHELL_COST);
         ((*p).parent, (*p).quota.return_rest())
     };
-    // SAFETY: the caller's promise; every stage gave its memory back.
-    unsafe { PROCESSES.lock().free(process) };
+    // SAFETY: the caller's promise; every stage gave its memory back, and
+    // the parent's pool is there, since the shell holds the parent's.
+    unsafe {
+        match parent {
+            Some(parent) => (*parent.as_ptr()).pools.children.free(process),
+            None => ROOTS.lock().free(process),
+        }
+    }
+    #[cfg(feature = "ktest")]
+    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     // Test builds poison the slot past the pool's link: a use after free
     // then reads garbage instead of the old fields, and `life` stops it.
     #[cfg(feature = "ktest")]
@@ -972,6 +1098,27 @@ pub unsafe fn remove_thread(process: NonNull<Process>, t: NonNull<Thread>) {
     }
 }
 
+/// A slot for `thread`, a new thread of `process` (thread::create), in the
+/// process's pool of threads, whose quota pays for a page when the pool
+/// grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
+pub fn thread_slot(process: NonNull<Process>, thread: Thread) -> Result<NonNull<Thread>, Error> {
+    // SAFETY: the caller holds a reference to the process; the thread is
+    // no field of it.
+    unsafe { paid_slot(process, |pools| &mut pools.threads, thread) }.map_err(|_| Error::NoMemory)
+}
+
+/// Gives the slot of `t`, a thread of `process` that goes (thread::clean),
+/// back to the process's pool of threads, where its page stays paid until
+/// the process's shell goes.
+///
+/// # Safety
+/// `t` came from `thread_slot` of `process`, which is alive, and nothing
+/// uses it afterwards.
+pub unsafe fn free_thread_slot(process: NonNull<Process>, t: NonNull<Thread>) {
+    // SAFETY: the caller's promise; only the pool is touched.
+    unsafe { (*process.as_ptr()).pools.threads.free(t) }
+}
+
 /// The links of `t`, a thread in its process's list.
 ///
 /// # Safety
@@ -1036,11 +1183,12 @@ pub fn handle_room(process: NonNull<Process>) -> Result<(), Error> {
 
 /// Puts `object` in the handle table of `process` with `rights`; the new
 /// handle holds a reference to it. A new chunk or directory of the table
-/// is charged to `process`, whoever the handle comes from. LIMIT_REACHED
-/// at the table's limit, NO_MEMORY when the quota or the pool runs out for
-/// a chunk. The process lives: the table of one that ended stays empty.
+/// comes from the pool of blocks of `process`, whose quota pays for a page
+/// when the pool grows, whoever the handle comes from. LIMIT_REACHED at
+/// the table's limit, NO_MEMORY when the quota falls short for a page.
+/// The process lives: the table of one that ended stays empty.
 pub fn insert_handle(
-    mut process: NonNull<Process>,
+    process: NonNull<Process>,
     object: Object,
     rights: Rights,
 ) -> Result<Handle, Error> {
@@ -1049,10 +1197,9 @@ pub fn insert_handle(
         "a handle went into the table of a process that ended"
     );
     // SAFETY: the caller holds a reference to the process.
-    let p = unsafe { process.as_mut() };
-    let h = p
-        .handles
-        .insert(&mut Chunks(&mut p.quota), object, rights)
+    let (handles, mut chunks) = unsafe { table(process) };
+    let h = handles
+        .insert(&mut chunks, object, rights)
         .map_err(Error::from)?;
     object::retain(object);
     Ok(h)
@@ -1104,8 +1251,9 @@ pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> R
 /// Entry 0 of the fresh table of a child that process_create made
 /// (spec 13.3): with no start channel, a stub goes in and out at once, so
 /// abi::START_CHANNEL stays bad there for good, even for a channel the
-/// child makes itself. The directory and the first chunk of the table are
-/// charged to the child: NO_MEMORY when its quota or the pool runs out.
+/// child makes itself. The directory and the first chunk of the table
+/// share the first page of the child's pool of blocks, which the child
+/// pays for: NO_MEMORY when its quota falls short.
 pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
     let stub = insert_handle(child, Object::Resource, Rights::NONE)?;
     assert_eq!(
@@ -1127,10 +1275,10 @@ pub fn handle_counts(process: NonNull<Process>) -> (u32, u32, u32) {
     (handles.len(), handles.retired(), handles.limit())
 }
 
-/// Objects the process pool holds now.
+/// Processes whose shells have not gone.
 #[cfg(feature = "ktest")]
 pub fn in_use() -> usize {
-    PROCESSES.lock().in_use()
+    LIVE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Processes that came to their stage Quota with children still in their

@@ -327,8 +327,9 @@ pub struct KernelStats {
     pub longest_portion: u64,
     /// Free frames of the frame allocator.
     pub free_frames: u64,
-    /// Pages the pools of kernel objects hold, which they never give back
-    /// (spec 7.8).
+    /// Pages the pools of kernel objects hold, and the list pages that name
+    /// them: a pool takes a page as it grows, and the pages of a payer's
+    /// pools go back with its shell (spec 7.8).
     pub pool_pages: u64,
 }
 

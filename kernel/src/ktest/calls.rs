@@ -11,7 +11,7 @@ use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::boot::Boot;
 use crate::cleanup;
 use crate::mm::{pages, phys};
-use crate::object::{self, Object};
+use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Policy, Thread};
 use crate::{sched, syscall};
@@ -572,39 +572,32 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
 
 /// The child's quota comes off the caller's (spec 7.5): more than is left
 /// there is NO_MEMORY, after the ceiling. The least quota covers the
-/// child's shell, its root table, its directory and the chunk with entry
-/// 0, 12 KiB; less is NO_MEMORY, whether the shell and the root table do
-/// not fit or the chunk does not, and the caller gets the quota back
-/// whole. A thread does not fit in the least child: NO_MEMORY, and what
-/// the call took goes back.
+/// child's root table and the page of its pool of blocks, which holds its
+/// directory and the chunk with entry 0: 8 KiB. A page is NO_MEMORY at
+/// entry 0, and the caller gets the quota back whole; the page of its pool
+/// of shells, which the child took, stays the caller's (spec 7.8). A
+/// thread does not fit in the least child: NO_MEMORY, and what the call
+/// took goes back.
 fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     let page = PAGE_SIZE;
     let q = process::quota(c.process);
     let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(page);
     c.fails(n, &[over, 16, 31, 0, 0, 0], Error::AccessDenied)?;
     c.fails(n, &[over, 16, 30, 0, 0, 0], Error::NoMemory)?;
-    let least = (process::SHELL_COST + page + object::DIRECTORY_COST + object::CHUNK_COST)
-        .next_multiple_of(page);
-    check(
-        least == 3 * page,
-        "the least quota of a child is not 12 KiB",
-    )?;
     let before = q.used();
-    for short in [page, least - page] {
-        c.fails(n, &[short, 16, 30, 0, 0, 0], Error::NoMemory)?;
-        cleanup::drain();
-        check(
-            process::quota(c.process).used() == before,
-            "a child that was not made kept the caller's quota",
-        )?;
-    }
-    let least = c.created(n, &[least, 16, 30, 0, 0, 0])?;
+    c.fails(n, &[page, 16, 30, 0, 0, 0], Error::NoMemory)?;
+    cleanup::drain();
+    check(
+        process::quota(c.process).used() == before + page,
+        "a child that was not made kept the caller's quota beyond the page of its shells",
+    )?;
+    let least = c.created(n, &[2 * page, 16, 30, 0, 0, 0])?;
     let result = full_child_cases(c, least).and_then(|()| full_table_thread_quota_cases(c, least));
     c.close(least)?;
     cleanup::drain();
     result?;
     check(
-        process::quota(c.process).used() == before,
+        process::quota(c.process).used() == before + page,
         "the least child's quota did not come back",
     )
 }
@@ -637,12 +630,13 @@ fn full_table_thread_quota_cases(c: &Caller, child: Handle) -> Result<(), &'stat
 }
 
 /// Every process pays for the directory and chunks of its own table,
-/// whoever puts the handle there (spec 7.5): process_create charges the
-/// caller the child's quota alone, and the child pays from it for its
-/// shell, its root table, its directory and the chunk with entry 0. A
-/// handle the kernel puts in the child's table past its first chunk
-/// takes a second one, which the child pays for too. Once the child goes,
-/// the caller has its quota back whole.
+/// whoever puts the handle there (spec 7.5, 7.8): process_create charges
+/// the caller the child's quota and the page of its pool of shells, and
+/// the child pays from its quota for its root table and the page of its
+/// pool of blocks with its directory and the chunk with entry 0. A handle
+/// the kernel puts in the child's table past its first chunk takes a
+/// second page of blocks, which the child pays for too. Once the child
+/// goes, the caller has its quota back and keeps the page of its shells.
 pub fn table_chunks_are_paid_by_the_owner(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         // The caller's table has its directory and first chunk from here on.
@@ -656,7 +650,7 @@ pub fn table_chunks_are_paid_by_the_owner(_: &Boot) -> Result<(), &'static str> 
         c.close(first)?;
         result?;
         check(
-            process::quota(c.process).used() == before,
+            process::quota(c.process).used() == before + PAGE_SIZE,
             "the child's quota did not come back whole",
         )
     })
@@ -667,14 +661,14 @@ fn owner_pays(c: &Caller, child: Handle, before: u64) -> Result<(), &'static str
     let p = unsafe { c.process.as_ref() }
         .lookup(child, Rights::NONE, Object::process)
         .map_err(|_| "the handle does not name the child")?;
-    let own = process::SHELL_COST + PAGE_SIZE + object::DIRECTORY_COST + object::CHUNK_COST;
+    let own = 2 * PAGE_SIZE;
     check(
-        process::quota(c.process).used() == before + CHILD_QUOTA,
-        "the caller paid for more than the child's quota",
+        process::quota(c.process).used() == before + CHILD_QUOTA + PAGE_SIZE,
+        "the caller paid for more than the child's quota and the page of its shells",
     )?;
     check(
         process::quota(p).used() == own,
-        "the child did not pay for its shell, root table, directory and first chunk",
+        "the child did not pay for its root table and the page of its directory and first chunk",
     )?;
     // Entry 0 and 63 more fill the first chunk; the next takes a second.
     for _ in 0..=CHUNK {
@@ -682,9 +676,56 @@ fn owner_pays(c: &Caller, child: Handle, before: u64) -> Result<(), &'static str
             .map_err(|_| "a handle did not go into the child")?;
     }
     check(
-        process::quota(p).used() == own + object::CHUNK_COST
-            && process::quota(c.process).used() == before + CHILD_QUOTA,
+        process::quota(p).used() == own + PAGE_SIZE
+            && process::quota(c.process).used() == before + CHILD_QUOTA + PAGE_SIZE,
         "the child's second chunk was not charged to the child",
+    )
+}
+
+/// The shell of a child that process_create made lies in the caller's pool
+/// of shells (spec 7.5, 7.8): the least quota, 8 KiB, pays for the child's
+/// root table and its first page of blocks alone, and the caller pays one
+/// page for the shells of two children. The page stays the caller's when
+/// the children go.
+pub fn child_shell_is_paid_by_the_parent(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::ProcessCreate.number();
+        let least = 2 * PAGE_SIZE;
+        // The caller's table has its page of blocks from here on.
+        let first = c.insert(Object::Resource, Rights::NONE)?;
+        c.close(first)?;
+        let before = process::quota(c.process).used();
+        let children = [0, 1].map(|_| c.created(n, &[least, 16, 20, 0, 0, 0]));
+        let result = match children {
+            [Ok(a), Ok(b)] => shells_cases(c, [a, b], before),
+            _ => Err("a child with the least quota was not made"),
+        };
+        for h in children.into_iter().flatten() {
+            c.close(h)?;
+        }
+        cleanup::drain();
+        result?;
+        check(
+            process::quota(c.process).used() == before + PAGE_SIZE,
+            "the page of the caller's shells did not stay, or the children's quotas did",
+        )
+    })
+}
+
+fn shells_cases(c: &Caller, children: [Handle; 2], before: u64) -> Result<(), &'static str> {
+    for h in children {
+        // SAFETY: the caller's process is the test's.
+        let p = unsafe { c.process.as_ref() }
+            .lookup(h, Rights::NONE, Object::process)
+            .map_err(|_| "the handle does not name the child")?;
+        check(
+            process::quota(p).used() == 2 * PAGE_SIZE,
+            "a child paid for more than its root table and its first page of blocks",
+        )?;
+    }
+    check(
+        process::quota(c.process).used() == before + 2 * 2 * PAGE_SIZE + PAGE_SIZE,
+        "the caller did not pay one page for the shells of its two children",
     )
 }
 

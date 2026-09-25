@@ -14,7 +14,7 @@ use crate::arch::{self, exceptions, gic, registers, semihosting, timer};
 use crate::boot::Boot;
 use crate::cleanup;
 use crate::mm::aspace::{self, AddressSpace};
-use crate::mm::pages::KernelPages;
+use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
 use crate::object::Object;
@@ -26,9 +26,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 use kcore::bootinfo::PsciConduit;
 use kcore::esr::TEST_BRK;
-use kcore::frames::{PAGE_SIZE, PhysMem};
+use kcore::frames::{MAX_ORDER, PAGE_SIZE, PhysMem};
 use kcore::gic::{Ack, DEFAULT_PRIORITY};
-use kcore::handles::CHUNK;
+use kcore::handles::{CHUNK, MAX_HANDLES};
 use kcore::layout::{
     GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, USER_END, frame_fits, image_pa,
 };
@@ -156,6 +156,15 @@ const TESTS: &[(&str, TestFn)] = &[
         kernel_memory_is_closed_to_el0,
     ),
     (
+        "pool_churn_stays_under_the_quota",
+        pool_churn_stays_under_the_quota,
+    ),
+    ("shell_goes_in_portions", shell_goes_in_portions),
+    (
+        "paid_charge_always_finds_a_frame",
+        paid_charge_always_finds_a_frame,
+    ),
+    (
         "processes_and_threads_return_their_memory",
         processes_and_threads_return_their_memory,
     ),
@@ -218,6 +227,10 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "table_chunks_are_paid_by_the_owner",
         calls::table_chunks_are_paid_by_the_owner,
+    ),
+    (
+        "child_shell_is_paid_by_the_parent",
+        calls::child_shell_is_paid_by_the_parent,
     ),
     (
         "thread_create_checks_its_arguments",
@@ -1244,6 +1257,268 @@ fn kernel_memory_is_closed_to_el0(boot: &Boot) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A payer's pool pages stay its own (spec 7.8): a child with a quota of
+/// eight pages fills its pool of threads until NO_MEMORY and lets every
+/// thread go; the first block of its handle table then gets NO_MEMORY at
+/// once, since the pages of the threads' pool keep its quota. Over the run
+/// the pools take at most a page per page of the quota and one more, and
+/// once the child goes the pages and the free frames are back. A first
+/// child with nothing in it gives the root's pool of shells and its table
+/// their pages.
+fn pool_churn_stays_under_the_quota(_: &Boot) -> Result<(), &'static str> {
+    const Q: u64 = 8 * PAGE_SIZE;
+    cleanup::drain();
+    let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let first = child_with(root, Q, 16).and_then(|(_, h)| {
+        process::close_handle(root, h, CAUSE).map_err(|_| "the child's handle did not close")
+    });
+    cleanup::drain();
+    // A child whose quota does not add up would stop the kernel at its
+    // stage Shell: on a failure the tree stays, and the failure is named.
+    first.and_then(|()| churn(root, Q))?;
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(root, CAUSE) };
+    cleanup::drain();
+    Ok(())
+}
+
+/// A child of `root` with quota `q` that only a handle in the root's table
+/// holds fills its threads, lets them go and asks for a block of its
+/// table; it is judged, then killed, and its handle closed. A child that
+/// fails the judgement stays.
+fn churn(root: NonNull<process::Process>, q: u64) -> Result<(), &'static str> {
+    let (taken, frames) = (pages::taken(), phys::free_frames());
+    let (child, held) = child_with(root, q, 16)?;
+    let mut threads = [None; abi::MAX_THREADS as usize];
+    let mut last = Ok(());
+    for slot in &mut threads {
+        match thread::create(child, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
+            Ok(t) => *slot = Some(t),
+            Err(e) => {
+                last = Err(e);
+                break;
+            }
+        }
+    }
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's reference goes; the thread never started.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    cleanup::drain();
+    let grew = pages::taken() - taken;
+    let block = process::insert_handle(child, Object::Resource, Rights::NONE);
+    check(
+        last == Err(Error::NoMemory),
+        "the threads of the child did not end with NO_MEMORY",
+    )?;
+    check(
+        block.is_err_and(|e| e == Error::NoMemory),
+        "a block of the child's table found room in the quota its threads' pages hold",
+    )?;
+    check(
+        grew as u64 <= q / PAGE_SIZE + 1,
+        "the pools took more pages than the child's quota and one",
+    )?;
+    // SAFETY: the root's handle holds the child.
+    unsafe { process::end(child, ProcessState::Killed, CAUSE) };
+    process::close_handle(root, held, CAUSE).map_err(|_| "the child's handle did not close")?;
+    cleanup::drain();
+    check(
+        pages::taken() == taken && phys::free_frames() == frames,
+        "the pages of the child's pools or its frames did not come back",
+    )
+}
+
+/// The pages of a process's pools go back with its shell, a portion at a
+/// time (spec 7.7, 7.8): a root with 130 chunks of handles holds 66 pages
+/// of blocks and a list page. Its handles go at the stage Handles and
+/// leave the pages in the pool; the shell gives them back at most 64 a
+/// portion, in two portions, and the last one gives the slot back.
+fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
+    const CHUNKS: usize = 130;
+    cleanup::drain();
+    let processes = process::in_use();
+    let p = process::create_root(QUOTA, (CHUNKS * CHUNK) as u32, 63).map_err(|_| "no process")?;
+    let taken = pages::taken();
+    let filled = (0..CHUNKS * CHUNK)
+        .try_for_each(|_| process::insert_handle(p, Object::Resource, Rights::NONE).map(|_| ()));
+    let held = pages::taken() - taken;
+    // SAFETY: the test's reference, the last, goes; nothing uses it
+    // afterwards.
+    unsafe { process::release(p, CAUSE) };
+    let mut portions = [0; 4];
+    let mut n = 0;
+    // Only the stage Shell gives pages of pools back.
+    while cleanup::top().is_some() {
+        let before = pages::taken();
+        cleanup::portion();
+        let back = before - pages::taken();
+        if back > 0 && n < portions.len() {
+            portions[n] = back;
+            n += 1;
+        }
+    }
+    filled.map_err(|_| "a handle did not go in")?;
+    check(
+        held == (CHUNKS + 1).div_ceil(2) + 1,
+        "the blocks of the table did not take a page for two of them and a list page",
+    )?;
+    check(
+        portions[..n] == [64, held - 64],
+        "the pages of a shell did not go back 64 a portion",
+    )?;
+    check(
+        pages::taken() == taken && process::in_use() == processes,
+        "the shell or pages of its pools stayed",
+    )
+}
+
+/// A charge that passed always finds a frame (spec 7.8): with the free
+/// frames cut down to what a root's quota leaves, the root and its three
+/// children fill every kind they pay for by the page, one after another,
+/// until their quotas run out: threads with their buffers and the tables
+/// over them, handles, and children with a page of quota. After every
+/// kind the free frames are exactly the part of the quotas of the tree
+/// nobody used: no page was taken without its charge, and none that
+/// passed its charge missed its frame.
+fn paid_charge_always_finds_a_frame(_: &Boot) -> Result<(), &'static str> {
+    const PAGES: u64 = 160;
+    cleanup::drain();
+    let root =
+        process::create_root(PAGES * PAGE_SIZE, MAX_HANDLES, 63).map_err(|_| "no process")?;
+    let spare = PAGES - process::quota(root).used() / PAGE_SIZE;
+    let held = hold_frames_but(spare);
+    let result = fill_the_tree(root);
+    give_frames_back(held);
+    // SAFETY: the test's reference goes, and nothing uses it afterwards;
+    // the root's threads would keep it alive, so it ends first.
+    unsafe {
+        process::end(root, ProcessState::Killed, CAUSE);
+        process::release(root, CAUSE);
+    }
+    cleanup::drain();
+    result
+}
+
+/// What a process pays for by the page, and fills in `fill_kind`.
+#[derive(Clone, Copy)]
+enum Kind {
+    Threads,
+    Handles,
+    Children,
+}
+
+const KINDS: [Kind; 3] = [Kind::Threads, Kind::Handles, Kind::Children];
+
+/// Three children of `root`, each filling the kinds in another order, and
+/// then the root itself; the free frames are checked after each kind.
+fn fill_the_tree(root: NonNull<process::Process>) -> Result<(), &'static str> {
+    let mut tree = [Some(root), None, None, None];
+    for i in 1..tree.len() {
+        tree[i] = Some(child_with(root, 24 * PAGE_SIZE, MAX_HANDLES)?.0);
+        for k in 0..KINDS.len() {
+            fill_kind(tree[i].expect("the child"), KINDS[(i + k) % KINDS.len()])?;
+            frames_match_the_quotas(&tree)?;
+        }
+    }
+    for kind in KINDS {
+        fill_kind(root, kind)?;
+        frames_match_the_quotas(&tree)?;
+    }
+    check(
+        phys::free_frames() < 8 * tree.len() as u64,
+        "the tree did not use up its quotas",
+    )
+}
+
+/// Objects of `kind` for `p` until its quota runs out: the only error the
+/// kind may end with is NO_MEMORY, but for threads past abi::MAX_THREADS.
+/// Handles in the table of `p` hold them.
+fn fill_kind(p: NonNull<process::Process>, kind: Kind) -> Result<(), &'static str> {
+    let buffers = USER_VA + 16 * PAGE;
+    for i in 0.. {
+        let made = match kind {
+            Kind::Handles => process::insert_handle(p, Object::Resource, Rights::NONE).map(|_| ()),
+            Kind::Threads => {
+                thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).and_then(|t| {
+                    let held = thread::give_buffer(t, buffers + i * PAGE)
+                        .and_then(|()| process::insert_handle(p, Object::Thread(t), Rights::NONE));
+                    // SAFETY: the test's reference goes; the handle, if it went
+                    // in, holds the thread.
+                    unsafe { thread::release(t, CAUSE) };
+                    held.map(|_| ())
+                })
+            }
+            Kind::Children => process::create_child(p, PAGE_SIZE, 16, 63).and_then(|c| {
+                let held = process::insert_handle(p, Object::Process(c), Rights::NONE);
+                // SAFETY: as above.
+                unsafe { process::release(c, CAUSE) };
+                held.map(|_| ())
+            }),
+        };
+        match made {
+            Ok(()) => {}
+            Err(Error::NoMemory) => break,
+            Err(Error::LimitReached) if matches!(kind, Kind::Threads) => break,
+            Err(_) => return Err("a kind ended with another error than NO_MEMORY"),
+        }
+    }
+    cleanup::drain();
+    Ok(())
+}
+
+/// The free frames are the part of the quotas of `tree` that nobody used:
+/// each process's grandchildren had a page of quota, which their root
+/// tables took whole.
+fn frames_match_the_quotas(tree: &[Option<NonNull<process::Process>>]) -> Result<(), &'static str> {
+    let unused: u64 = tree
+        .iter()
+        .flatten()
+        .map(|&p| process::quota(p))
+        .map(|q| q.limit() - q.used())
+        .sum();
+    check(
+        phys::free_frames() * PAGE_SIZE == unused,
+        "the free frames are not the part of the quotas nobody used",
+    )
+}
+
+/// Takes free frames, in the biggest blocks the allocator gives, until
+/// only `left` are free; the blocks are linked through their first two
+/// words (the next block and its order). Returns the first block.
+fn hold_frames_but(left: u64) -> u64 {
+    let mut guard = phys::FRAMES.lock();
+    let frames = guard.as_mut().expect("frame allocator");
+    // SAFETY: the blocks are the test's from their allocation to
+    // `give_frames_back`.
+    let mut mem = unsafe { LinearMem::new() };
+    let mut first = u64::MAX;
+    for order in (0..=MAX_ORDER).rev() {
+        while frames.free_frames() >= left + (1 << order) {
+            let Some(pa) = frames.alloc(order) else {
+                break;
+            };
+            mem.write(pa, first);
+            mem.write(pa + 8, u64::from(order));
+            first = pa;
+        }
+    }
+    first
+}
+
+/// Gives back the blocks `hold_frames_but` took.
+fn give_frames_back(mut block: u64) {
+    let mut guard = phys::FRAMES.lock();
+    let frames = guard.as_mut().expect("frame allocator");
+    // SAFETY: as in `hold_frames_but`.
+    let mem = unsafe { LinearMem::new() };
+    while block != u64::MAX {
+        let (next, order) = (mem.read(block), mem.read(block + 8) as u8);
+        frames.free(block, order);
+        block = next;
+    }
+}
+
 /// A process with a thread and mapped frames gives every frame back when
 /// both go. The pools keep the page each takes for its first object, so
 /// one round runs before the count.
@@ -1562,12 +1837,23 @@ fn child_of(
     parent: NonNull<process::Process>,
     quota: u64,
 ) -> Result<NonNull<process::Process>, &'static str> {
-    let child = process::create_child(parent, quota, 16, 63).map_err(|_| "no child")?;
+    child_with(parent, quota, 16).map(|(child, _)| child)
+}
+
+/// A child of `parent` with `quota` and room for `limit` handles that only
+/// the handle returned, in `parent`'s table, holds.
+fn child_with(
+    parent: NonNull<process::Process>,
+    quota: u64,
+    limit: u32,
+) -> Result<(NonNull<process::Process>, abi::Handle), &'static str> {
+    let child = process::create_child(parent, quota, limit, 63).map_err(|_| "no child")?;
     let held = process::insert_handle(parent, Object::Process(child), Rights::NONE);
     // SAFETY: the test's reference goes; the handle, if it went in, holds
     // the child.
     unsafe { process::release(child, CAUSE) };
-    held.map(|_| child).map_err(|_| "a handle did not go in")
+    held.map(|h| (child, h))
+        .map_err(|_| "a handle did not go in")
 }
 
 /// A ready thread of `p` that only a handle in `p`'s table and the
@@ -1585,10 +1871,11 @@ fn ready_thread(p: NonNull<process::Process>) -> Result<NonNull<thread::Thread>,
 
 /// A child's quota comes back to its parent in two parts that add up to
 /// it (spec 7.5). The end of the child gives back at its stage Quota
-/// everything but the shells that still hold the quota: its own, which the
-/// parent's handle keeps, and the shell of its thread, which a handle in
-/// the parent's table keeps. The rest comes back when the child's shell
-/// goes, after the thread's.
+/// everything but the page of its pool of threads, where the shell of its
+/// thread, which a handle in the parent's table keeps, lies; its own shell
+/// is in the parent's pool (spec 7.8). The thread's shell going back
+/// refunds nothing; the rest comes back when the child's shell goes, with
+/// the page.
 fn child_quota_comes_back_in_two_parts(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 11;
     cleanup::drain();
@@ -1628,10 +1915,10 @@ fn check_two_parts(
     unsafe { process::end(child, ProcessState::Killed, level) };
     cleanup::drain();
     let q = process::quota(child);
-    let rest = process::SHELL_COST + thread::SHELL_COST;
+    let rest = PAGE_SIZE;
     check(
         q.limit() == CHILD_QUOTA && q.used() == rest && q.returned() == CHILD_QUOTA - rest,
-        "the stage Quota did not give back all but the two shells",
+        "the stage Quota did not give back all but the page of the child's threads",
     )?;
     check(
         process::quota(root).used() == before - q.returned(),
@@ -1640,9 +1927,9 @@ fn check_two_parts(
     process::close_handle(root, held, CAUSE).map_err(|_| "the thread's handle did not close")?;
     cleanup::drain();
     check(
-        process::quota(child).used() == process::SHELL_COST
+        process::quota(child).used() == rest
             && process::quota(root).used() == before - q.returned(),
-        "the thread's shell did not go back to the child alone",
+        "the thread's shell refunded its slot, or went back to the parent",
     )?;
     // The root's handle to the child is the first handle of its table.
     let first = abi::Handle::new(0, 1);

@@ -50,7 +50,8 @@ fn with_tables<R>(f: impl FnOnce(&mut FrameTables<'_>) -> R) -> R {
 }
 
 /// Tables from the frame allocator, each charged to `quota`: a table that
-/// does not fit there is no memory, as one the allocator lacks.
+/// does not fit there is no memory. A charge that passed always finds its
+/// frame (spec 7.8).
 struct Charged<'a> {
     tables: FrameTables<'a>,
     quota: &'a mut Account,
@@ -62,10 +63,7 @@ unsafe impl TableMemory for Charged<'_> {
     fn alloc_table(&mut self) -> Option<u64> {
         self.quota.charge(PAGE_SIZE).ok()?;
         let table = self.tables.alloc_table();
-        if table.is_none() {
-            self.quota.refund(PAGE_SIZE);
-        }
-        table
+        Some(table.expect("a charge that passed found no frame (spec 7.8)"))
     }
 
     fn free_table(&mut self, pa: u64) {
