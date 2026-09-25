@@ -243,7 +243,9 @@ fn decide() -> Decision<Thread> {
         // part of its latency.
         g.fired = None;
     }
-    let deadline = g.s.deadline();
+    // Programs have no timers yet (spec 10): the heap's earliest deadline
+    // (kcore::timer::Heap::first) comes here with them.
+    let deadline = g.s.deadline(None);
     #[cfg(feature = "ktest")]
     let deadline = deadline.into_iter().chain(test).min();
     g.armed.set(&mut VirtualTimer, deadline);

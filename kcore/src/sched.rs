@@ -10,7 +10,15 @@
 //! decision. The running thread is in no list (Benno scheduling). The same
 //! queue of 64 levels holds the kernel's cleanup work (spec 7.7), which
 //! the decision treats as one more thread: a portion runs when its level
-//! is at least the running thread's and every ready one's.
+//! is at least the running thread's and every ready one's. A thread that
+//! waits in `receive` (spec 8.1) is in no ready list either: it stands in
+//! the queue of what it waits for, a queue of 64 levels of its own through
+//! the same link, by the same rules (`requeue`).
+//!
+//! A thread has a base priority, which thread_create and
+//! thread_set_priority set, and a boost by the notification slot it took
+//! in `receive` (spec 6.6), never above the ceiling of its process; the
+//! effective priority, the higher of the two, picks its level.
 //!
 //! Where a thread goes; into a tail always with a new quantum, into a head
 //! always with the rest of its quantum:
@@ -20,10 +28,10 @@
 //! | preempted by a higher level | head of its level | keeps the rest; none left counts as the end |
 //! | its quantum ended (the timer's interrupt only) | tail of its level | new |
 //! | `yield` | tail of its level | new |
-//! | became ready (`thread_start`; from 1.3 the end of a wait) | tail of its level | new |
-//! | priority raised | tail of the new level | new; a running thread keeps its rest |
+//! | became ready (`thread_start`, the end of a wait) | tail of its level | new |
+//! | effective priority raised (base or boost) | tail of the new level | new; a running thread keeps its rest |
 //! | priority unchanged | stays | kept; new when FIFO becomes round robin |
-//! | priority lowered | head of the new level | keeps the rest |
+//! | effective priority lowered (base, the end of a boost) | head of the new level | keeps the rest |
 
 use abi::{Error, PRIORITY_LEVELS, Policy};
 use core::ptr::NonNull;
@@ -38,6 +46,9 @@ pub enum State {
     Ready,
     /// On the CPU, in no list.
     Running,
+    /// Waits in `receive` (spec 8.1): off the CPU and in no ready list; it
+    /// may stand in the queue of what it waits for.
+    Waiting,
     /// Ended; it never runs again.
     Dead,
 }
@@ -94,18 +105,26 @@ pub struct Node<T> {
     state: State,
     /// Ticks left of a round-robin quantum while the thread is ready.
     slice_left: u64,
+    /// The base priority.
+    base: u8,
+    /// The boost by a notification slot (spec 6.6), already cut down to
+    /// the ceiling of the thread's process; 0 for none.
+    boost: u8,
     /// The level is the effective priority.
     link: Link<T>,
 }
 
 impl<T> Node<T> {
-    /// A stopped thread's node. The priority is checked by the caller
-    /// (priority_arg, kcore::thread::check_start).
+    /// A stopped thread's node with the base priority `priority` and no
+    /// boost. The priority is checked by the caller (priority_arg,
+    /// kcore::thread::check_start).
     pub const fn new(priority: u8, policy: Policy) -> Node<T> {
         Node {
             policy,
             state: State::Stopped,
             slice_left: 0,
+            base: priority,
+            boost: 0,
             link: Link::new(priority),
         }
     }
@@ -113,6 +132,23 @@ impl<T> Node<T> {
     /// The effective priority, which picks the thread's level.
     pub fn priority(&self) -> u8 {
         self.link.level
+    }
+
+    /// The base priority, which thread_set_priority sets.
+    pub fn base(&self) -> u8 {
+        self.base
+    }
+
+    /// The boost by a notification slot; 0 when there is none.
+    pub fn boost(&self) -> u8 {
+        self.boost
+    }
+
+    /// The level the base and the boost make. It differs from `priority`
+    /// only for a waiting thread between thread_set_priority and
+    /// `requeue`.
+    fn effective(&self) -> u8 {
+        self.base.max(self.boost)
     }
 
     pub fn policy(&self) -> Policy {
@@ -354,14 +390,20 @@ impl<T: Schedulable> Scheduler<T> {
         self.running
     }
 
-    /// The deadline the timer needs: the end of the running thread's
-    /// quantum when it is round robin; None for a FIFO thread and while
-    /// idle. From milestone 1.3 the nearest timer of a program joins it.
-    pub fn deadline(&self) -> Option<u64> {
-        let r = self.running?;
-        // SAFETY: the running thread is alive (the contract of `start`).
-        let policy = unsafe { node(r) }.policy;
-        (policy == Policy::RoundRobin).then_some(self.slice_end)
+    /// The deadline the timer needs (spec 8): the nearer of the end of the
+    /// running thread's quantum, when it is round robin, and `next_timer`,
+    /// the earliest timer of a program (timer::Heap::first). For a FIFO
+    /// thread and while idle only `next_timer` counts.
+    pub fn deadline(&self, next_timer: Option<u64>) -> Option<u64> {
+        let slice = self.running.and_then(|r| {
+            // SAFETY: the running thread is alive (the contract of `start`).
+            let policy = unsafe { node(r) }.policy;
+            (policy == Policy::RoundRobin).then_some(self.slice_end)
+        });
+        match (slice, next_timer) {
+            (Some(s), Some(t)) => Some(s.min(t)),
+            (s, t) => s.or(t),
+        }
     }
 
     /// A stopped thread becomes ready: the tail of its level with a new
@@ -502,15 +544,19 @@ impl<T: Schedulable> Scheduler<T> {
         }
     }
 
-    /// thread_set_priority, by the rules of `pthread_setschedprio`: a ready
-    /// thread raised goes to the tail of its new level with a new quantum,
-    /// lowered to the head with the rest of its quantum, unchanged stays
-    /// where it is. A thread that turns from FIFO to round robin gets a new
-    /// quantum, running from `now` when it runs. A running thread stays on
-    /// the CPU and keeps its quantum; lowered below a ready thread, it
-    /// gives the CPU up at the next `pick`. A stopped thread only takes the
-    /// values. BAD_STATE for a thread that ended. `priority` is 1-63, as
-    /// priority_arg checks.
+    /// thread_set_priority, by the rules of `pthread_setschedprio`:
+    /// `priority` becomes the base priority, and the effective one, the
+    /// higher of the base and the boost, moves the thread. A ready thread
+    /// raised goes to the tail of its new level with a new quantum, lowered
+    /// to the head with the rest of its quantum, unchanged stays where it
+    /// is; a boost above the new base keeps it where it is. A thread that
+    /// turns from FIFO to round robin gets a new quantum, running from
+    /// `now` when it runs. A running thread stays on the CPU and keeps its
+    /// quantum; lowered below a ready thread, it gives the CPU up at the
+    /// next `pick`. A stopped thread only takes the values; so does a
+    /// waiting one, and when it stands in the queue of what it waits for,
+    /// `requeue` moves it there right after. BAD_STATE for a thread that
+    /// ended. `priority` is 1-63, as priority_arg checks.
     ///
     /// # Safety
     /// `t` is alive; the scheduler's threads are alive.
@@ -523,49 +569,163 @@ impl<T: Schedulable> Scheduler<T> {
     ) -> Result<(), Error> {
         assert!((1..PRIORITY_LEVELS).contains(&priority));
         // SAFETY: the caller's promise.
-        let (state, old, to_round_robin) = unsafe {
+        let (state, to_round_robin) = unsafe {
             let n = node(t);
-            let to_round_robin = n.policy == Policy::Fifo && policy == Policy::RoundRobin;
-            (n.state, n.priority(), to_round_robin)
+            (
+                n.state,
+                n.policy == Policy::Fifo && policy == Policy::RoundRobin,
+            )
         };
-        let moves = state == State::Ready && priority != old;
         match state {
             State::Dead => return Err(Error::BadState),
-            // SAFETY: a ready thread is in the queue.
-            _ if moves => unsafe { self.ready.remove(t) },
+            // SAFETY: the caller's promise.
+            State::Ready if to_round_robin => unsafe { node(t) }.slice_left = self.quantum,
             State::Running if to_round_robin => {
                 self.slice_end = now.saturating_add(self.quantum);
             }
             _ => {}
         }
-        // SAFETY: the caller's promise; the thread is in no list if it moves.
-        unsafe {
+        // SAFETY: the caller's promise; the borrow ends before the move.
+        let level = unsafe {
             let n = node(t);
-            if priority != old {
-                n.link.set_level(priority);
-            }
             n.policy = policy;
-            if state == State::Ready && (priority > old || to_round_robin) {
-                n.slice_left = self.quantum;
-            }
-            if moves && priority > old {
-                self.ready.push_tail(t);
-            } else if moves {
-                self.ready.push_head(t);
-            }
-        }
+            n.base = priority;
+            n.effective()
+        };
+        // SAFETY: the caller's promise.
+        unsafe { self.relevel(t, level) };
         Ok(())
     }
 
-    /// The thread ends (thread_exit, process_kill, a fault), whatever its
-    /// state: it leaves its list and never runs again. When it was the
-    /// running one, nothing runs until `pick`.
+    /// `receive` hands `t` a notification slot of `level` (spec 6.6): the
+    /// effective priority becomes the higher of the base and `level`, but
+    /// never above `ceiling`, the priority ceiling of the thread's process
+    /// (spec 8). A boost only raises: one below the thread's boost leaves
+    /// it as it is. The thread moves as a raised one: running, it keeps
+    /// the CPU and its quantum; ready, it goes to the tail of its new level
+    /// with a new quantum; waiting and out of every queue, it takes the
+    /// level, and `wake` puts it there.
+    ///
+    /// # Safety
+    /// As for `set_priority`; a waiting `t` stands in no queue.
+    pub unsafe fn boost(&mut self, t: NonNull<T>, level: u8, ceiling: u8) {
+        // SAFETY: the caller's promise; the borrow ends before the move.
+        let level = unsafe {
+            let n = node(t);
+            n.boost = n.boost.max(level.min(ceiling));
+            n.effective()
+        };
+        // SAFETY: the caller's promise.
+        unsafe { self.relevel(t, level) };
+    }
+
+    /// The boost ends (the thread's next `receive`): the effective priority
+    /// falls back to the base. A running thread keeps the CPU and its
+    /// quantum and gives the CPU up at the next `pick` to a ready thread
+    /// above its base; a ready one goes to the head of its base's level
+    /// with the rest of its quantum.
+    ///
+    /// # Safety
+    /// As for `boost`.
+    pub unsafe fn unboost(&mut self, t: NonNull<T>) {
+        // SAFETY: the caller's promise; the borrow ends before the move.
+        let level = unsafe {
+            let n = node(t);
+            n.boost = 0;
+            n.effective()
+        };
+        // SAFETY: the caller's promise.
+        unsafe { self.relevel(t, level) };
+    }
+
+    /// Moves `t` to `level` by the rules of the table above; only a ready
+    /// thread changes its list and quantum. A waiting thread that stands
+    /// in a queue keeps its level until the caller's `requeue`.
+    ///
+    /// # Safety
+    /// As for `set_priority`.
+    unsafe fn relevel(&mut self, t: NonNull<T>, level: u8) {
+        // SAFETY: the caller's promise; every borrow of the node ends
+        // before a list takes the thread.
+        unsafe {
+            let (state, old, queued) = {
+                let n = node(t);
+                (n.state, n.link.level, n.link.queued)
+            };
+            if level == old {
+                return;
+            }
+            match state {
+                State::Ready => {
+                    self.ready.remove(t);
+                    node(t).link.set_level(level);
+                    if level > old {
+                        node(t).slice_left = self.quantum;
+                        self.ready.push_tail(t);
+                    } else {
+                        self.ready.push_head(t);
+                    }
+                }
+                State::Waiting if queued => {}
+                _ => node(t).link.set_level(level),
+            }
+        }
+    }
+
+    /// `receive` with nothing to take (spec 8.1): the running thread waits.
+    /// It leaves the CPU for no list; the caller puts it in the queue it
+    /// waits in. Nothing runs until `pick`. The rest of its quantum is
+    /// gone: the end of the wait gives it a new one.
+    ///
+    /// # Safety
+    /// As for `pick`.
+    pub unsafe fn block(&mut self) -> NonNull<T> {
+        let r = self.running.take().expect("no thread runs to wait");
+        // SAFETY: the running thread is alive.
+        unsafe { node(r) }.state = State::Waiting;
+        r
+    }
+
+    /// The end of a wait (spec 8): `t`, out of the queue it waited in,
+    /// becomes ready at the tail of its level with a new quantum. It runs
+    /// at the next `pick` only when its level is above the running
+    /// thread's.
+    ///
+    /// # Safety
+    /// `t` is alive and in no queue; the scheduler's threads are alive.
+    pub unsafe fn wake(&mut self, t: NonNull<T>) {
+        // SAFETY: the caller's promise; the borrow ends before the list
+        // takes the thread.
+        unsafe {
+            let n = node(t);
+            assert!(
+                n.state == State::Waiting,
+                "a thread that does not wait wakes"
+            );
+            assert!(
+                n.link.level == n.effective(),
+                "a thread wakes at a stale level"
+            );
+            n.state = State::Ready;
+            n.slice_left = self.quantum;
+            self.ready.push_tail(t);
+        }
+    }
+
+    /// The thread ends (thread_exit, process_kill, a fault, the stop
+    /// wave), whatever its state: it leaves its list and never runs again.
+    /// When it was the running one, nothing runs until `pick`. A waiting
+    /// thread leaves the queue it waited in first (the caller's).
     ///
     /// # Safety
     /// `t` is alive; after this the scheduler no longer refers to it.
     pub unsafe fn exit(&mut self, t: NonNull<T>) {
         // SAFETY: the caller's promise.
-        match unsafe { node(t) }.state {
+        let (state, queued) = unsafe {
+            let n = node(t);
+            (n.state, n.link.queued)
+        };
+        match state {
             State::Running => {
                 assert!(
                     self.running == Some(t),
@@ -575,10 +735,43 @@ impl<T: Schedulable> Scheduler<T> {
             }
             // SAFETY: a ready thread is in the queue.
             State::Ready => unsafe { self.ready.remove(t) },
+            State::Waiting => assert!(!queued, "a waiting thread ends in a queue"),
             State::Stopped | State::Dead => {}
         }
         // SAFETY: the caller's promise.
         unsafe { node(t) }.state = State::Dead;
+    }
+}
+
+/// thread_set_priority of `t`, which waits in `queue` (spec 6.3, 8): it
+/// moves to the level its base and boost make, by the rules of the ready
+/// queue. Raised, it goes to the tail of its new level; lowered, to the
+/// head; unchanged, it stays.
+///
+/// # Safety
+/// `t` is alive, waits, and stands in `queue`.
+pub unsafe fn requeue<T: Schedulable>(queue: &mut ReadyQueue<T>, t: NonNull<T>) {
+    // SAFETY: the caller's promise; every borrow of the node ends before
+    // the queue takes the thread.
+    unsafe {
+        let (state, old, level) = {
+            let n = node(t);
+            (n.state, n.link.level, n.effective())
+        };
+        assert!(
+            state == State::Waiting,
+            "a thread that does not wait moves in a queue of waiters"
+        );
+        if level == old {
+            return;
+        }
+        queue.remove(t);
+        node(t).link.set_level(level);
+        if level > old {
+            queue.push_tail(t);
+        } else {
+            queue.push_head(t);
+        }
     }
 }
 
@@ -778,16 +971,42 @@ mod tests {
             unsafe { self.s.exit(t) };
         }
 
-        /// The names on `level`, head first.
-        fn level(&self, level: u8) -> String {
-            let mut names = String::new();
-            let mut t = self.s.ready().first(level);
-            while let Some(next) = t {
-                names.push(name(next));
-                t = node(next).link.next;
-            }
-            names
+        /// The running thread waits, as in `receive` with nothing to take.
+        fn block(&mut self) -> NonNull<Fake> {
+            // SAFETY: as above.
+            unsafe { self.s.block() }
         }
+
+        fn wake(&mut self, t: NonNull<Fake>) {
+            // SAFETY: as above; the tests wake threads that are in no queue.
+            unsafe { self.s.wake(t) };
+        }
+
+        fn boost(&mut self, t: NonNull<Fake>, level: u8, ceiling: u8) {
+            // SAFETY: as above.
+            unsafe { self.s.boost(t, level, ceiling) };
+        }
+
+        fn unboost(&mut self, t: NonNull<Fake>) {
+            // SAFETY: as above.
+            unsafe { self.s.unboost(t) };
+        }
+
+        /// The names on `level` of the ready queue, head first.
+        fn level(&self, level: u8) -> String {
+            queued(self.s.ready(), level)
+        }
+    }
+
+    /// The names on `level` of `q`, head first.
+    fn queued(q: &ReadyQueue<Fake>, level: u8) -> String {
+        let mut names = String::new();
+        let mut t = q.first(level);
+        while let Some(next) = t {
+            names.push(name(next));
+            t = node(next).link.next;
+        }
+        names
     }
 
     fn name(t: NonNull<Fake>) -> char {
@@ -819,7 +1038,7 @@ mod tests {
         unsafe {
             s.start(t).unwrap();
             assert!(matches!(s.pick(MS, None), Decision::Run(r) if r == t));
-            assert_eq!(s.deadline(), Some(5 * MS));
+            assert_eq!(s.deadline(None), Some(5 * MS));
             s.exit(t);
         }
     }
@@ -928,7 +1147,7 @@ mod tests {
         let a = w.started('a', 10, RR);
         w.started('b', 10, RR);
         assert_eq!(w.pick(0), 'a');
-        assert_eq!(w.s.deadline(), Some(4 * MS));
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
         // At 1 ms a higher thread starts and runs for 2 ms.
         let h = w.started('h', 20, RR);
         assert_eq!(w.pick(MS), 'h');
@@ -937,9 +1156,9 @@ mod tests {
         w.exit(h);
         // A goes on before B, with the 3 ms it had left.
         assert_eq!(w.pick(3 * MS), 'a');
-        assert_eq!(w.s.deadline(), Some(6 * MS));
+        assert_eq!(w.s.deadline(None), Some(6 * MS));
         assert_eq!(w.tick(6 * MS), 'b');
-        assert_eq!(w.s.deadline(), Some(10 * MS));
+        assert_eq!(w.s.deadline(None), Some(10 * MS));
     }
 
     #[test]
@@ -963,7 +1182,7 @@ mod tests {
         let mut now = 0;
         let mut trace = vec![(now, w.pick(now))];
         for _ in 0..4 {
-            now = w.s.deadline().expect("a round-robin thread runs");
+            now = w.s.deadline(None).expect("a round-robin thread runs");
             trace.push((now, w.tick(now)));
         }
         assert_eq!(
@@ -986,7 +1205,7 @@ mod tests {
         assert_eq!(w.pick(0), 'a');
         // The interrupt comes 1 ms late: B's quantum runs from then.
         assert_eq!(w.tick(5 * MS), 'b');
-        assert_eq!(w.s.deadline(), Some(9 * MS));
+        assert_eq!(w.s.deadline(None), Some(9 * MS));
     }
 
     #[test]
@@ -996,7 +1215,7 @@ mod tests {
         w.started('b', 10, RR);
         assert_eq!(w.pick(0), 'a');
         assert_eq!(w.tick(4 * MS - 1), 'a');
-        assert_eq!(w.s.deadline(), Some(4 * MS));
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
         assert_eq!(w.level(10), "b");
     }
 
@@ -1008,9 +1227,9 @@ mod tests {
         assert_eq!(w.pick(0), 'a');
         assert_eq!(w.tick(4 * MS), 'a');
         assert_eq!(w.s.running(), Some(a));
-        assert_eq!(w.s.deadline(), Some(8 * MS));
+        assert_eq!(w.s.deadline(None), Some(8 * MS));
         assert_eq!(w.tick(8 * MS), 'a');
-        assert_eq!(w.s.deadline(), Some(12 * MS));
+        assert_eq!(w.s.deadline(None), Some(12 * MS));
     }
 
     #[test]
@@ -1019,7 +1238,7 @@ mod tests {
         w.started('a', 10, FIFO);
         w.started('b', 10, FIFO);
         assert_eq!(w.pick(0), 'a');
-        assert_eq!(w.s.deadline(), None);
+        assert_eq!(w.s.deadline(None), None);
         for now in [4 * MS, 100 * MS, 1000 * MS] {
             assert_eq!(w.tick(now), 'a');
         }
@@ -1038,7 +1257,7 @@ mod tests {
         assert_eq!(w.yield_at(MS), 'b');
         assert_eq!(w.level(10), "ca");
         assert_eq!(node(a).slice_left(), Q);
-        assert_eq!(w.s.deadline(), Some(5 * MS));
+        assert_eq!(w.s.deadline(None), Some(5 * MS));
     }
 
     #[test]
@@ -1048,7 +1267,7 @@ mod tests {
         w.started('l', 5, RR);
         assert_eq!(w.pick(0), 'x');
         assert_eq!(w.yield_at(MS), 'x');
-        assert_eq!(w.s.deadline(), Some(5 * MS));
+        assert_eq!(w.s.deadline(None), Some(5 * MS));
         w.set(x, 20, FIFO, 2 * MS);
         assert_eq!(w.yield_at(3 * MS), 'x');
         assert_eq!(w.level(5), "l");
@@ -1082,7 +1301,7 @@ mod tests {
         assert_eq!(w.pick(MS), 'r');
         // The running thread raised keeps its quantum.
         w.set(r, 40, RR, 2 * MS);
-        assert_eq!(w.s.deadline(), Some(4 * MS));
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
         assert_eq!(w.pick(2 * MS), 'r');
         // Lowered below a ready thread: it is preempted with its rest and
         // waits at the head of its new level.
@@ -1127,7 +1346,7 @@ mod tests {
         assert_eq!(w.tick(6 * MS), 'b');
         assert_eq!(node(a).slice_left(), Q);
         assert_eq!(w.tick(10 * MS), 'a');
-        assert_eq!(w.s.deadline(), Some(14 * MS));
+        assert_eq!(w.s.deadline(None), Some(14 * MS));
         // yield after a preemption: a whole new quantum as well.
         preempt_after(&mut w, 10 * MS, MS);
         assert_eq!(w.pick(12 * MS), 'a');
@@ -1158,13 +1377,13 @@ mod tests {
         let mut w = World::new();
         let r = w.started('r', 10, FIFO);
         assert_eq!(w.pick(0), 'r');
-        assert_eq!(w.s.deadline(), None);
+        assert_eq!(w.s.deadline(None), None);
         // To round robin: a quantum from now.
         w.set(r, 10, RR, 3 * MS);
-        assert_eq!(w.s.deadline(), Some(7 * MS));
+        assert_eq!(w.s.deadline(None), Some(7 * MS));
         // Back to FIFO: no deadline.
         w.set(r, 10, FIFO, 4 * MS);
-        assert_eq!(w.s.deadline(), None);
+        assert_eq!(w.s.deadline(None), None);
     }
 
     #[test]
@@ -1192,7 +1411,7 @@ mod tests {
         let b = w.thread('b', 10, RR);
         w.start(b);
         assert_eq!(w.pick(4 * MS - 1), 'a');
-        assert_eq!(w.s.deadline(), Some(4 * MS));
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
         // Even past the end of the quantum, only the timer ends it.
         assert_eq!(w.pick(5 * MS), 'a');
         assert_eq!(w.tick(5 * MS), 'b');
@@ -1224,9 +1443,247 @@ mod tests {
             w.exit(t);
         }
         assert_eq!(w.pick(MS), '-');
-        assert_eq!(w.s.deadline(), None);
+        assert_eq!(w.s.deadline(None), None);
         // SAFETY: the world keeps its threads alive.
         assert_eq!(unsafe { w.s.start(stopped) }, Err(Error::BadState));
+    }
+
+    #[test]
+    fn waiting_thread_leaves_the_cpu() {
+        let mut w = World::new();
+        let a = w.started('a', 20, RR);
+        let b = w.started('b', 10, RR);
+        assert_eq!(w.pick(0), 'a');
+        assert_eq!(w.block(), a);
+        assert_eq!(node(a).state(), State::Waiting);
+        assert_eq!((w.s.running(), w.s.deadline(None)), (None, None));
+        assert!(!node(a).link.is_queued() && w.level(20).is_empty());
+        // Nothing of A's level is left: a lower thread runs.
+        assert_eq!(w.pick(MS), 'b');
+        assert_eq!(w.block(), b);
+        assert_eq!(w.pick(2 * MS), '-');
+    }
+
+    #[test]
+    fn woken_thread_goes_to_the_tail_with_a_new_quantum() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        w.started('b', 10, RR);
+        w.started('c', 10, RR);
+        assert_eq!(w.pick(0), 'a');
+        // A waits 1 ms into its quantum; B runs from then.
+        w.block();
+        assert_eq!(w.pick(MS), 'b');
+        // Woken at 2 ms: behind C, with a whole quantum; B goes on.
+        w.wake(a);
+        assert_eq!(node(a).state(), State::Ready);
+        assert_eq!(w.level(10), "ca");
+        assert_eq!(node(a).slice_left(), Q);
+        assert_eq!(w.pick(2 * MS), 'b');
+        assert_eq!(w.s.deadline(None), Some(5 * MS));
+        assert_eq!(w.tick(5 * MS), 'c');
+        assert_eq!(w.tick(9 * MS), 'a');
+        assert_eq!(w.s.deadline(None), Some(13 * MS));
+        // Woken above the running thread, it runs at the next decision.
+        let h = w.started('h', 20, FIFO);
+        assert_eq!(w.pick(10 * MS), 'h');
+        w.block();
+        assert_eq!(w.pick(11 * MS), 'a');
+        w.wake(h);
+        assert_eq!(w.pick(12 * MS), 'h');
+        assert_eq!(w.level(10), "abc");
+    }
+
+    #[test]
+    fn waiting_thread_ends_without_a_list() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        let b = w.started('b', 10, RR);
+        w.started('c', 10, RR);
+        assert_eq!(w.pick(0), 'a');
+        w.block();
+        assert_eq!(w.pick(MS), 'b');
+        // The stop wave or a kill ends A while it waits.
+        w.exit(a);
+        assert_eq!(node(a).state(), State::Dead);
+        assert_eq!((w.level(10), w.s.running()), ("c".into(), Some(b)));
+        // SAFETY: the world keeps its threads alive.
+        assert_eq!(unsafe { w.s.start(a) }, Err(Error::BadState));
+    }
+
+    #[test]
+    #[should_panic(expected = "a waiting thread ends in a queue")]
+    fn a_waiting_thread_ends_out_of_its_queue() {
+        let mut w = World::new();
+        let a = w.started('a', 10, RR);
+        assert_eq!(w.pick(0), 'a');
+        w.block();
+        let mut q = ReadyQueue::new();
+        // SAFETY: the world keeps its threads alive.
+        unsafe { q.push_tail(a) };
+        w.exit(a);
+    }
+
+    #[test]
+    fn waiting_thread_moves_in_its_queue_on_a_new_priority() {
+        let mut w = World::new();
+        let mut q = ReadyQueue::new();
+        // A, B and C wait in `q`, in the order they came.
+        let [a, b, c] = [('a', 10), ('b', 10), ('c', 20)].map(|(name, level)| {
+            w.started(name, level, RR);
+            assert_eq!(w.pick(0), name);
+            let t = w.block();
+            // SAFETY: the world keeps its threads alive.
+            unsafe { q.push_tail(t) };
+            t
+        });
+        // Raised: the tail of its new level.
+        w.set(a, 20, RR, MS);
+        // SAFETY: A waits in `q`.
+        unsafe { requeue(&mut q, a) };
+        assert_eq!((queued(&q, 20), queued(&q, 10)), ("ca".into(), "b".into()));
+        // Lowered: the head of its new level.
+        w.set(c, 10, RR, MS);
+        // SAFETY: C waits in `q`.
+        unsafe { requeue(&mut q, c) };
+        assert_eq!((queued(&q, 20), queued(&q, 10)), ("a".into(), "cb".into()));
+        // Unchanged: it stays, at the head too.
+        w.set(c, 10, FIFO, MS);
+        // SAFETY: C waits in `q`.
+        unsafe { requeue(&mut q, c) };
+        assert_eq!(queued(&q, 10), "cb");
+        assert_eq!(
+            [a, b, c].map(|t| (node(t).priority(), node(t).state())),
+            [
+                (20, State::Waiting),
+                (10, State::Waiting),
+                (10, State::Waiting)
+            ]
+        );
+        // They wait: neither the ready queue nor the CPU holds them.
+        assert!(w.s.ready().is_empty() && w.s.running().is_none());
+        // Through the channel's queue: the raised waiter takes the post.
+        let mut ch: crate::notify::Queue<char, Fake> = crate::notify::Queue::new();
+        let [d, _e] = [('d', 10), ('e', 20)].map(|(name, level)| {
+            w.started(name, level, RR);
+            assert_eq!(w.pick(2 * MS), name);
+            let t = w.block();
+            // SAFETY: the world keeps its threads alive.
+            unsafe { ch.wait(t) };
+            t
+        });
+        w.set(d, 30, RR, 2 * MS);
+        // SAFETY: D waits in `ch`.
+        unsafe { ch.requeue(d) };
+        let mut s = crate::notify::Slot::new(5, 's');
+        // SAFETY: the slot outlives the queue's use of it.
+        let crate::notify::Post::Deliver(t) = (unsafe { ch.post(NonNull::from(&mut s), 1) }) else {
+            panic!("no delivery");
+        };
+        assert_eq!(t, d);
+    }
+
+    #[test]
+    fn boost_raises_until_it_ends() {
+        let mut w = World::new();
+        let r = w.started('r', 5, RR);
+        assert_eq!(w.pick(0), 'r');
+        // `receive` hands R a slot of level 25: it goes on at 25 with the
+        // quantum it has.
+        w.boost(r, 25, 63);
+        assert_eq!(
+            (node(r).priority(), node(r).base(), node(r).boost()),
+            (25, 5, 25)
+        );
+        // A boost only raises: a lower slot leaves it at 25.
+        w.boost(r, 10, 63);
+        assert_eq!(node(r).priority(), 25);
+        let m = w.started('m', 20, RR);
+        assert_eq!(w.pick(MS), 'r');
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
+        // Its next `receive` ends the boost: M, above its base, takes the
+        // CPU, and R waits at the head of its base level with the rest.
+        w.unboost(r);
+        assert_eq!((node(r).priority(), node(r).boost()), (5, 0));
+        assert_eq!(w.pick(2 * MS), 'm');
+        assert_eq!(w.level(5), "r");
+        assert_eq!(node(r).slice_left(), 2 * MS);
+        // M waits; a slot of level 30 raises it out of the queue, and it
+        // wakes at the tail of 30 with a new quantum.
+        w.block();
+        assert_eq!(w.pick(3 * MS), 'r');
+        w.boost(m, 30, 63);
+        w.wake(m);
+        assert_eq!((w.level(30), node(m).slice_left()), ("m".into(), Q));
+        assert_eq!(w.pick(3 * MS), 'm');
+        assert_eq!(w.level(5), "r");
+    }
+
+    #[test]
+    fn boost_is_capped_by_the_ceiling() {
+        let mut w = World::new();
+        let r = w.started('r', 10, FIFO);
+        assert_eq!(w.pick(0), 'r');
+        // A slot of level 40 for a thread whose process has the ceiling 30.
+        w.boost(r, 40, 30);
+        assert_eq!((node(r).priority(), node(r).boost()), (30, 30));
+        // A thread of level 35 runs first.
+        w.started('h', 35, FIFO);
+        assert_eq!(w.pick(MS), 'h');
+        assert_eq!(w.level(30), "r");
+        // Under the ceiling the slot's level counts.
+        w.unboost(r);
+        w.boost(r, 25, 30);
+        assert_eq!((node(r).priority(), w.level(25)), (25, "r".into()));
+    }
+
+    #[test]
+    fn base_change_keeps_a_higher_boost() {
+        let mut w = World::new();
+        let r = w.started('r', 5, RR);
+        w.started('b', 7, RR);
+        assert_eq!(w.pick(0), 'b');
+        // A ready thread boosted: the tail of its new level.
+        w.boost(r, 25, 63);
+        assert_eq!(w.level(25), "r");
+        // A new base under the boost: it stays where it is.
+        w.set(r, 10, RR, MS);
+        assert_eq!(
+            (node(r).priority(), node(r).base(), w.level(25)),
+            (25, 10, "r".into())
+        );
+        // A new base above the boost: the base counts.
+        w.set(r, 30, RR, MS);
+        assert_eq!((node(r).priority(), w.level(30)), (30, "r".into()));
+        // The boost ends: the new base stays.
+        w.unboost(r);
+        assert_eq!((node(r).priority(), node(r).boost()), (30, 0));
+        // Its end under a lower base: the head of the base's level.
+        w.set(r, 7, RR, MS);
+        w.boost(r, 25, 63);
+        w.unboost(r);
+        assert_eq!((node(r).priority(), w.level(7)), (7, "r".into()));
+        assert_eq!(w.pick(MS), 'b');
+    }
+
+    #[test]
+    fn lowered_running_thread_goes_on_until_a_higher_one() {
+        let mut w = World::new();
+        let r = w.started('r', 5, RR);
+        assert_eq!(w.pick(0), 'r');
+        w.boost(r, 25, 63);
+        w.started('b', 5, RR);
+        w.unboost(r);
+        // Nothing above its base: it keeps the CPU and its quantum, ahead of
+        // B of its own level.
+        assert_eq!(w.pick(MS), 'r');
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
+        // A thread above it comes: R leaves for the head of its level with
+        // the rest.
+        w.started('h', 6, RR);
+        assert_eq!(w.pick(2 * MS), 'h');
+        assert_eq!(w.level(5), "rb");
+        assert_eq!(node(r).slice_left(), 2 * MS);
     }
 
     /// Counts what the scheduler writes to the timer.
@@ -1255,34 +1712,57 @@ mod tests {
         let mut armed = Armed::new();
         // Idle: no deadline, and the timer is off already.
         assert_eq!(w.pick(0), '-');
-        armed.set(&mut timer, w.s.deadline());
+        armed.set(&mut timer, w.s.deadline(None));
         assert_eq!((timer.armed, timer.writes), (None, 0));
         // A round-robin thread: the end of its quantum.
         w.started('a', 10, RR);
         w.started('b', 10, RR);
         assert_eq!(w.pick(MS), 'a');
-        armed.set(&mut timer, w.s.deadline());
+        armed.set(&mut timer, w.s.deadline(None));
         assert_eq!((timer.armed, timer.writes), (Some(5 * MS), 1));
         // Back to the same thread after a call: nothing written.
         assert_eq!(w.pick(2 * MS), 'a');
-        armed.set(&mut timer, w.s.deadline());
+        armed.set(&mut timer, w.s.deadline(None));
         assert_eq!(timer.writes, 1);
         // The next quantum: one write.
         assert_eq!(w.tick(5 * MS), 'b');
-        armed.set(&mut timer, w.s.deadline());
+        armed.set(&mut timer, w.s.deadline(None));
         assert_eq!((timer.armed, timer.writes), (Some(9 * MS), 2));
         // A FIFO thread: the timer goes off.
         let f = w.started('f', 20, FIFO);
         assert_eq!(w.pick(6 * MS), 'f');
-        armed.set(&mut timer, w.s.deadline());
+        armed.set(&mut timer, w.s.deadline(None));
         assert_eq!((timer.armed, timer.writes), (None, 3));
         assert_eq!(armed.get(), None);
         // B goes on with the 3 ms it had left.
         w.exit(f);
         assert_eq!(w.pick(7 * MS), 'b');
-        armed.set(&mut timer, w.s.deadline());
+        armed.set(&mut timer, w.s.deadline(None));
         assert_eq!((timer.armed, timer.writes), (Some(10 * MS), 4));
         assert_eq!(armed.get(), Some(10 * MS));
+    }
+
+    #[test]
+    fn deadline_is_the_nearer_of_quantum_and_timer() {
+        let mut w = World::new();
+        // Idle: only the timer of a program.
+        assert_eq!(w.pick(0), '-');
+        assert_eq!(w.s.deadline(None), None);
+        assert_eq!(w.s.deadline(Some(7 * MS)), Some(7 * MS));
+        // A round-robin thread from 1 ms: its quantum ends at 5 ms.
+        w.started('a', 10, RR);
+        w.started('b', 10, RR);
+        assert_eq!(w.pick(MS), 'a');
+        assert_eq!(w.s.deadline(Some(9 * MS)), Some(5 * MS));
+        assert_eq!(w.s.deadline(Some(3 * MS)), Some(3 * MS));
+        // The interrupt of the nearer timer does not end the quantum.
+        assert_eq!(w.tick(3 * MS), 'a');
+        assert_eq!(w.s.deadline(None), Some(5 * MS));
+        // A FIFO thread: only the timer.
+        w.started('f', 20, FIFO);
+        assert_eq!(w.pick(4 * MS), 'f');
+        assert_eq!(w.s.deadline(None), None);
+        assert_eq!(w.s.deadline(Some(9 * MS)), Some(9 * MS));
     }
 
     #[test]
@@ -1294,7 +1774,7 @@ mod tests {
         // Nothing runs while the cleanup works; the thread waits at the
         // head of its level.
         assert_eq!(w.s.running(), None);
-        assert_eq!(w.s.deadline(), None);
+        assert_eq!(w.s.deadline(None), None);
         assert_eq!(w.level(10), "a");
         assert_eq!(w.decide(MS, None), 'a');
         // A running thread gives the CPU up to cleanup above it.
@@ -1330,14 +1810,14 @@ mod tests {
         let a = w.started('a', 10, RR);
         let b = w.started('b', 10, RR);
         assert_eq!(w.pick(0), 'a');
-        assert_eq!(w.s.deadline(), Some(4 * MS));
+        assert_eq!(w.s.deadline(None), Some(4 * MS));
         // 1 ms in, cleanup at the same level takes 2 ms.
         assert_eq!(w.decide(MS, Some(10)), '*');
         assert_eq!(node(a).slice_left(), 3 * MS);
         assert_eq!(w.decide(2 * MS, Some(10)), '*');
         // A goes on before B, with the 3 ms it had left.
         assert_eq!(w.decide(3 * MS, None), 'a');
-        assert_eq!(w.s.deadline(), Some(6 * MS));
+        assert_eq!(w.s.deadline(None), Some(6 * MS));
         assert_eq!(w.tick(6 * MS), 'b');
         // A quantum that ended under the cleanup starts anew at the tail.
         assert_eq!(w.decide(10 * MS, Some(10)), '*');
