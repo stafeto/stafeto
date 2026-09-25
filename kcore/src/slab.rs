@@ -17,9 +17,9 @@ use core::ptr::NonNull;
 /// Source of 4 KiB pages, as virtual addresses.
 ///
 /// # Safety
-/// `alloc_page` returns a pointer to PAGE_SIZE bytes, aligned to
-/// PAGE_SIZE, valid for reads and writes, that nothing else uses until the
-/// one who took it gives it back: a pool writes its objects there, and only a page log
+/// `alloc_page` returns a pointer to PAGE_SIZE bytes, aligned to PAGE_SIZE,
+/// valid for reads and writes, that nothing else uses until the one who took
+/// it gives it back: a pool writes its objects there, and only a page log
 /// gives its pages back.
 pub unsafe trait PageSource {
     fn alloc_page(&mut self) -> Option<NonNull<u8>>;
@@ -303,12 +303,12 @@ impl Drop for PageLog {
 
 /// Pages a payer pays for (spec 7.5, 7.8): each costs its quota PAGE_SIZE
 /// bytes before `frames` gives it, and goes into its page log, a list page
-/// first when the log needs one. A page is charged once, when a pool grows, and
-/// refunded when the log gives it back; slots cost nothing. A charge that
+/// first when the log needs one. A page is charged once, when a pool grows,
+/// and refunded when the log gives it back; slots cost nothing. A charge that
 /// passed always finds a frame: every frame taken after boot is charged to
-/// someone, and the quotas add up to the frames free at boot, so a source
-/// that fails after a charge stops the kernel, as a count that does not
-/// add up does (Account::return_rest).
+/// someone, and the quotas add up to the frames free at boot, so a source that
+/// fails after a charge stops the kernel, as a count that does not add up does
+/// (Account::return_rest).
 pub struct PaidPages<'a, F: PageSource> {
     frames: F,
     quota: &'a mut Account,
