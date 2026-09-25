@@ -17,6 +17,7 @@ pub mod handles;
 pub mod layout;
 pub mod memmap;
 pub mod paging;
+pub mod sched;
 pub mod slab;
 pub mod sync;
 pub mod sysreg;
