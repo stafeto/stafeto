@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The stafeto kernel. Milestone 1.2a: boot, read the device tree, set up
-//! the kernel's memory, report and power off.
+//! The stafeto kernel. Milestone 1.2b: boot, read the device tree, set up
+//! the kernel's memory, the interrupt controller and the timer, report and
+//! power off. Threads of processes run at EL0 in the kernel tests only,
+//! until init comes in milestone 1.2c.
 
 #![no_std]
 #![no_main]
@@ -11,14 +13,20 @@
 mod console;
 mod arch;
 mod boot;
+mod interrupt;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod mm;
 mod panicking;
+mod process;
 mod psci;
+mod syscall;
+mod thread;
 
 use boot::Boot;
+use kcore::frames::PAGE_SIZE;
 use kcore::layout::KERNEL_VIRT;
+use kcore::time::Clock;
 
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
@@ -30,13 +38,19 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // Until the kernel's own tables are built, the allocator sees only the
     // RAM in the GiBs the boot page tables map; the kernel tables are built
     // from that RAM, and the rest of RAM joins the allocator once they are live.
-    let rest = mm::phys::init(&boot);
-    mm::kmap::switch_to_kernel_tables(&boot);
+    let rest = mm::phys::init(boot);
+    mm::kmap::switch_to_kernel_tables(boot);
+    arch::user::init();
     mm::phys::add(rest.as_slice());
-    report(&boot);
+    mm::aspace::init(boot);
+    arch::gic::init(&boot.info);
+    let clock = arch::timer::init();
+    report(boot, clock);
     #[cfg(feature = "fault-probe")]
     arch::probe::undefined_instruction();
-    finish(&boot)
+    #[cfg(feature = "overflow-probe")]
+    arch::probe::recurse(0);
+    finish(boot)
 }
 
 #[cfg(not(feature = "ktest"))]
@@ -50,7 +64,7 @@ fn finish(boot: &Boot) -> ! {
     ktest::run(boot)
 }
 
-fn report(boot: &Boot) {
+fn report(boot: &Boot, clock: Clock) {
     let info = &boot.info;
     for r in info.memory.as_slice() {
         kprintln!("memory     {:#x}..{:#x}", r.base, r.end());
@@ -79,6 +93,7 @@ fn report(boot: &Boot) {
         );
     }
     kprintln!("psci       {:?}", info.psci);
+    kprintln!("timer      {} Hz", clock.hz());
     for r in boot.usable.as_slice() {
         kprintln!("usable     {:#x}..{:#x}", r.base, r.end());
     }
@@ -86,6 +101,6 @@ fn report(boot: &Boot) {
     kprintln!("usable     {} MiB in total", total >> 20);
     kprintln!(
         "frames     {} MiB free",
-        (mm::phys::free_frames() * 4096) >> 20
+        (mm::phys::free_frames() * PAGE_SIZE) >> 20
     );
 }

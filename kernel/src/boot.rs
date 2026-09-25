@@ -9,6 +9,7 @@ use kcore::bootinfo::{self, BootInfo, Region, RegionList};
 use kcore::fdt::{self, Fdt};
 use kcore::layout::{LINEAR_BASE, dtb_gib_is_mappable, fits_in_one_gib};
 use kcore::memmap;
+use kcore::sync::SetOnce;
 
 pub struct Boot {
     pub info: BootInfo,
@@ -21,7 +22,13 @@ pub struct Boot {
     pub usable: RegionList<32>,
 }
 
-pub fn collect(dtb_pa: usize, kernel_pa: usize) -> Boot {
+/// What `collect` found. Static: every entry from EL0 starts over at the top
+/// of the kernel stack, so after the first one nothing is left of
+/// `kernel_main`'s frame (spec 8.1).
+static BOOT: SetOnce<Boot> = SetOnce::new();
+
+/// Reads the device tree and works out the usable RAM, once.
+pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
     if dtb_pa == 0 {
         panic!("no device tree in x0: boot the arm64 Image, not the ELF");
     }
@@ -40,8 +47,8 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> Boot {
         panic!("device tree at {dtb_pa:#x} crosses a GiB boundary; only its first GiB is mapped");
     }
     // SAFETY: the whole blob lies in the mapped GiB, and nothing writes to it.
-    let fdt = unsafe { Fdt::from_ptr(dtb) }
-        .unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
+    let blob = unsafe { core::slice::from_raw_parts(dtb, total) };
+    let fdt = Fdt::new(blob).unwrap_or_else(|e| panic!("device tree at {dtb_pa:#x}: {e:?}"));
     let info = bootinfo::parse(&fdt).unwrap_or_else(|e| panic!("device tree: {e:?}"));
 
     let image = symbols::image();
@@ -66,11 +73,13 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> Boot {
     }
     let usable = memmap::usable(info.memory.as_slice(), taken.as_slice())
         .unwrap_or_else(|e| panic!("memory map: {e:?}"));
-    Boot {
+    let boot = Boot {
         info,
         kernel_pa: kernel_pa as u64,
         kernel_image,
         dtb,
         usable,
-    }
+    };
+    BOOT.set(boot)
+        .unwrap_or_else(|_| panic!("boot::collect runs once"))
 }

@@ -6,14 +6,20 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod asid;
 pub mod backtrace;
 pub mod bootinfo;
 pub mod esr;
 pub mod fdt;
 pub mod frames;
+pub mod gic;
 pub mod handles;
 pub mod layout;
 pub mod memmap;
 pub mod paging;
 pub mod slab;
 pub mod sync;
+pub mod sysreg;
+pub mod thread;
+pub mod time;
+pub mod tlb;

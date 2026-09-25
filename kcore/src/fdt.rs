@@ -84,11 +84,8 @@ pub fn total_size_from_header(header: &[u8]) -> Result<usize, FdtError> {
 
 impl<'a> Fdt<'a> {
     pub fn new(data: &'a [u8]) -> Result<Self, FdtError> {
-        if be32(data, 0)? != MAGIC {
-            return Err(FdtError::BadMagic);
-        }
-        let total = be32(data, 4)? as usize;
-        if total < HEADER_SIZE || total > data.len() {
+        let total = total_size_from_header(data)?;
+        if total > data.len() {
             return Err(FdtError::Truncated);
         }
         let data = &data[..total];
@@ -117,19 +114,6 @@ impl<'a> Fdt<'a> {
             size_strings,
             off_rsvmap,
         })
-    }
-
-    /// Reads a device tree in place.
-    ///
-    /// # Safety
-    /// `ptr` must point to a device tree whose `totalsize` bytes are readable
-    /// for the rest of the program and never written.
-    pub unsafe fn from_ptr(ptr: *const u8) -> Result<Fdt<'static>, FdtError> {
-        // SAFETY: the caller guarantees the header is readable.
-        let header = unsafe { core::slice::from_raw_parts(ptr, HEADER_SIZE) };
-        let total = total_size_from_header(header)?;
-        // SAFETY: the caller guarantees `totalsize` bytes are readable.
-        Fdt::new(unsafe { core::slice::from_raw_parts(ptr, total) })
     }
 
     pub fn total_size(&self) -> usize {

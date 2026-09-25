@@ -28,6 +28,12 @@
 		framebuffer@7e000000 {
 			reg = <0x7e000000 0x1000000>;
 		};
+
+		ramoops@7f000000 {
+			reg = <0x7f000000 0x100000>;
+			no-map;
+			status = "disabled";
+		};
 	};
 
 	chosen {

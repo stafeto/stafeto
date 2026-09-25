@@ -12,7 +12,9 @@ use kcore::slab::PageSource;
 #[cfg_attr(not(feature = "ktest"), allow(dead_code))]
 pub struct KernelPages;
 
-impl PageSource for KernelPages {
+// SAFETY: every page is a frame just taken from the allocator, 4 KiB
+// aligned, reached through the linear map, and never handed out again.
+unsafe impl PageSource for KernelPages {
     fn alloc_page(&mut self) -> Option<NonNull<u8>> {
         let pa = FRAMES.lock().as_mut()?.alloc(0)?;
         NonNull::new((LINEAR_BASE + pa as usize) as *mut u8)

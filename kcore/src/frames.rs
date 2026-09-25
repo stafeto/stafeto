@@ -21,7 +21,14 @@ const NOT_FREE: u8 = 0;
 const ALLOCATED: u8 = 0x80;
 
 /// Word access to the physical memory the allocator manages.
-pub trait PhysMem {
+///
+/// # Safety
+/// For every 8-byte-aligned physical address inside the frames handed to the
+/// allocator, `write` stores the word there and `read` returns the last
+/// word stored, and neither touches any other memory. The allocator keeps
+/// its free lists in free frames through these calls: while a frame is free
+/// it belongs to the allocator, and nothing else may use it.
+pub unsafe trait PhysMem {
     fn read(&self, pa: u64) -> u64;
     fn write(&mut self, pa: u64, value: u64);
 }
@@ -61,7 +68,8 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
         self.free_frames
     }
 
-    /// Hands every whole frame of `[base, end)` to the allocator.
+    /// Hands every whole frame of `[base, end)` to the allocator; none of
+    /// them may be free or allocated already.
     pub fn add_region(&mut self, base: u64, end: u64) {
         let first = base.div_ceil(PAGE_SIZE);
         let last = end >> PAGE_SHIFT;
@@ -78,6 +86,10 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
             while order > 0 && (!pfn.is_multiple_of(1 << order) || pfn + (1 << order) > last) {
                 order -= 1;
             }
+            assert!(
+                !self.overlaps_a_block(pfn, order),
+                "region {base:#x}..{end:#x} overlaps frames already added"
+            );
             self.free_block(pfn, order);
             pfn += 1 << order;
         }
@@ -159,6 +171,24 @@ impl<'m, M: PhysMem> FrameAllocator<'m, M> {
         })
     }
 
+    /// True when a free or allocated block shares a frame with the aligned
+    /// block of 2^order frames at `pfn`. Blocks are aligned to their size, so
+    /// such a block either covers `pfn` or starts inside the range.
+    fn overlaps_a_block(&self, pfn: u64, order: u8) -> bool {
+        let covers_pfn = (0..=MAX_ORDER).any(|o| {
+            let head = pfn & !((1u64 << o) - 1);
+            head >= self.base_pfn && {
+                let m = self.meta_at(head);
+                m == o + 1 || m == (ALLOCATED | o)
+            }
+        });
+        let start = (pfn - self.base_pfn) as usize;
+        covers_pfn
+            || self.meta[start..start + (1 << order)]
+                .iter()
+                .any(|&m| m != NOT_FREE)
+    }
+
     fn in_range(&self, pfn: u64, order: u8) -> bool {
         pfn >= self.base_pfn && pfn + (1 << order) <= self.base_pfn + self.meta.len() as u64
     }
@@ -207,7 +237,8 @@ mod tests {
     #[derive(Default)]
     struct Mem(HashMap<u64, u64>);
 
-    impl PhysMem for Mem {
+    // SAFETY: a map of words; `read` returns the last `write`.
+    unsafe impl PhysMem for Mem {
         fn read(&self, pa: u64) -> u64 {
             *self.0.get(&pa).unwrap_or(&0)
         }
@@ -403,5 +434,61 @@ mod tests {
         a.add_region(BASE, BASE + (1 << 20));
         a.add_region(BASE + (2 << 20), BASE + (3 << 20));
         a.free(BASE + (1 << 20), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "misaligned")]
+    fn freeing_a_misaligned_block_panics() {
+        let mut meta = vec![0; FRAMES];
+        full(&mut meta).free(BASE + PAGE_SIZE, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "above")]
+    fn freeing_an_order_above_max_panics() {
+        let mut meta = vec![0; FRAMES];
+        full(&mut meta).free(BASE, MAX_ORDER + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the allocator's span")]
+    fn adding_a_region_past_the_span_panics() {
+        let mut meta = vec![0; FRAMES];
+        let end = BASE + FRAMES as u64 * PAGE_SIZE;
+        allocator(&mut meta).add_region(end - PAGE_SIZE, end + PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the allocator's span")]
+    fn adding_a_region_below_the_span_panics() {
+        let mut meta = vec![0; FRAMES];
+        allocator(&mut meta).add_region(BASE - PAGE_SIZE, BASE + PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "already added")]
+    fn adding_a_region_twice_panics() {
+        let mut meta = vec![0; FRAMES];
+        full(&mut meta).add_region(BASE, BASE + PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "already added")]
+    fn adding_a_region_over_a_smaller_free_one_panics() {
+        // The second frame is free, the first is not: a check of the block's
+        // first frame alone misses it.
+        let mut meta = vec![0; FRAMES];
+        let mut a = allocator(&mut meta);
+        a.add_region(BASE + PAGE_SIZE, BASE + 2 * PAGE_SIZE);
+        a.add_region(BASE, BASE + 2 * PAGE_SIZE);
+    }
+
+    #[test]
+    #[should_panic(expected = "already added")]
+    fn adding_a_region_over_an_allocated_block_panics() {
+        let mut meta = vec![0; FRAMES];
+        let mut a = full(&mut meta);
+        let pa = a.alloc(0).unwrap();
+        a.add_region(pa, pa + PAGE_SIZE);
     }
 }

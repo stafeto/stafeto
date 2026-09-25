@@ -43,19 +43,6 @@ SECTIONS
         __bss_end = .;
     }
 
-    /* One page that the kernel page tables leave unmapped: a stack overflow
-     * faults here first. Exception entry then pushes its own trap frame
-     * below the already-overflowed SP, past this page, so the fault is
-     * caught but its report has no usable call stack; milestone 1.2b adds
-     * a dedicated stack for exception entry. */
-    . = ALIGN(4096);
-    __stack_guard = .;
-    . += 4096;
-
-    .boot_stack (NOLOAD) : AT(ADDR(.boot_stack) - KOFF) {
-        *(.boot_stack)
-    }
-
     . = ALIGN(4096);
     .boot_pt (NOLOAD) : AT(ADDR(.boot_pt) - KOFF) {
         __boot_pt_start = .;
@@ -63,6 +50,30 @@ SECTIONS
         __boot_pt_end = .;
     }
 
+    /* The boot stack is aligned to twice its size (vectors.S tests one
+     * address bit to spot an SP below it). Right below it lies one page that
+     * the kernel page tables leave unmapped, so a stack overflow faults
+     * there first, and below that the emergency stack, where exception
+     * entry reports such a fault. */
+    . = ALIGN(. + 0x3000, 0x20000) - 0x3000;
+    .emergency_stack (NOLOAD) : AT(ADDR(.emergency_stack) - KOFF) {
+        *(.emergency_stack)
+    }
+
+    __stack_guard = .;
+    . += 4096;
+
+    .boot_stack (NOLOAD) : AT(ADDR(.boot_stack) - KOFF) {
+        *(.boot_stack)
+    }
+    ASSERT(boot_stack % 0x20000 == 0 && boot_stack_top - boot_stack == 0x10000,
+           "the boot stack must be 64 KiB aligned to 128 KiB")
+    ASSERT(boot_stack_top - boot_stack == (1 << vectors_stack_shift),
+           "vectors.S tests another stack size")
+    ASSERT(__stack_guard == boot_stack - 0x1000 && emergency_stack_top == __stack_guard,
+           "the guard page and the emergency stack must lie right below the boot stack")
+
+    . = ALIGN(4096);
     __image_end = .;
     __image_size = __image_end - __image_start;
 

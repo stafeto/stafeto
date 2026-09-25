@@ -3,32 +3,39 @@
 
 //! The stafeto kernel interface shared by the kernel and programs (spec 5,
 //! 12): handle layout, rights and error codes. System call numbers join it
-//! with the first system calls.
+//! with the first system calls; the numbers kept for tests are here already.
 
 #![cfg_attr(not(test), no_std)]
 
-/// A process's name for a kernel object: a 24-bit index into its handle
-/// table and an 8-bit generation (spec 5.1). Generations start at 1, so no
-/// handle is zero.
+/// A process's name for a kernel object (spec 5.1): the low 16 bits index
+/// its handle table, the high 48 bits carry the entry's generation. The
+/// layout belongs to the kernel; programs treat the value as opaque.
+/// Generations start at 1, so no handle is zero.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Handle(pub u32);
+pub struct Handle(pub u64);
 
 impl Handle {
-    pub const INDEX_BITS: u32 = 24;
+    pub const INDEX_BITS: u32 = 16;
+    pub const GENERATION_BITS: u32 = u64::BITS - Self::INDEX_BITS;
     pub const MAX_INDEX: u32 = (1 << Self::INDEX_BITS) - 1;
+    /// An entry freed at this generation is retired, never reused.
+    pub const MAX_GENERATION: u64 = (1 << Self::GENERATION_BITS) - 1;
     pub const INVALID: Handle = Handle(0);
 
-    pub const fn new(index: u32, generation: u8) -> Handle {
-        Handle(((generation as u32) << Self::INDEX_BITS) | (index & Self::MAX_INDEX))
+    pub const fn new(index: u32, generation: u64) -> Handle {
+        Handle(
+            ((generation & Self::MAX_GENERATION) << Self::INDEX_BITS)
+                | (index & Self::MAX_INDEX) as u64,
+        )
     }
 
     pub const fn index(self) -> u32 {
-        self.0 & Self::MAX_INDEX
+        (self.0 & Self::MAX_INDEX as u64) as u32
     }
 
-    pub const fn generation(self) -> u8 {
-        (self.0 >> Self::INDEX_BITS) as u8
+    pub const fn generation(self) -> u64 {
+        self.0 >> Self::INDEX_BITS
     }
 }
 
@@ -68,6 +75,10 @@ impl core::ops::BitOr for Rights {
     }
 }
 
+/// System call numbers that belong to the kernel's test builds (spec 11):
+/// no real system call gets one.
+pub const TEST_CALLS: core::ops::RangeInclusive<u16> = 0xFF00..=0xFFFF;
+
 /// Error codes of system calls (spec 12); zero means success.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,9 +100,26 @@ mod tests {
 
     #[test]
     fn handle_packs_index_and_generation() {
-        let h = Handle::new(0x12_3456, 7);
-        assert_eq!((h.index(), h.generation()), (0x12_3456, 7));
-        assert_eq!(h.0, 0x0712_3456);
+        let h = Handle::new(0xBEEF, 0x1234_5678_9ABC);
+        assert_eq!(h.0, 0x1234_5678_9ABC_BEEF);
+        assert_eq!((h.index(), h.generation()), (0xBEEF, 0x1234_5678_9ABC));
+    }
+
+    #[test]
+    fn max_generation_keeps_the_index() {
+        assert_eq!(Handle::GENERATION_BITS, 48);
+        assert_eq!(Handle::MAX_GENERATION, (1 << 48) - 1);
+        let h = Handle::new(Handle::MAX_INDEX, Handle::MAX_GENERATION);
+        assert_eq!(h, Handle(u64::MAX));
+        assert_eq!(
+            (h.index(), h.generation()),
+            (Handle::MAX_INDEX, Handle::MAX_GENERATION)
+        );
+    }
+
+    #[test]
+    fn handle_is_eight_bytes() {
+        assert_eq!(core::mem::size_of::<Handle>(), 8);
     }
 
     #[test]

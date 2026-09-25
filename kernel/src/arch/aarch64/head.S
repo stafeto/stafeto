@@ -68,6 +68,25 @@ primary_entry:
     msr     cptr_el2, x1
     msr     hstr_el2, xzr
     msr     vttbr_el2, xzr
+    // MDCR_EL2, whose fields may hold anything after a warm reset: no debug
+    // or PMU traps to EL2 (TDE, TDA, TDOSA, TDRA, TPM, TPMCR clear), so the
+    // kernel's writes to MDSCR_EL1 and PMUSERENR_EL0 stay at EL1; there are
+    // no EL2 vectors to take them. HPMN leaves EL1 all PMCR_EL0.N event
+    // counters (HPMN = 0 is CONSTRAINED UNPREDICTABLE on v8.0). Without a
+    // PMU, or with an IMPLEMENTATION DEFINED one (PMUVer 0 or 0xF, the rule
+    // of kcore::sysreg::has_pmu), PMCR_EL0 is not read and HPMN is 0, as in
+    // Linux's EL2 setup. The profiling and trace buffers (v8.2 and later)
+    // stay with EL2: the kernel uses neither.
+    mov     x2, xzr
+    mrs     x1, id_aa64dfr0_el1
+    ubfx    x1, x1, #8, #4          // ID_AA64DFR0_EL1.PMUVer
+    cbz     x1, .Lset_mdcr
+    cmp     x1, #0xf
+    b.eq    .Lset_mdcr
+    mrs     x2, pmcr_el0
+    ubfx    x2, x2, #11, #5         // PMCR_EL0.N
+.Lset_mdcr:
+    msr     mdcr_el2, x2
     mrs     x1, midr_el1            // EL1 reads VPIDR/VMPIDR as MIDR/MPIDR
     msr     vpidr_el2, x1
     mrs     x1, mpidr_el1
@@ -231,11 +250,9 @@ l0_identity:    .skip 4096
 l1_identity:    .skip 4096
 boot_empty_l0:  .skip 4096
 
-// The boot stack, the kernel stack of CPU 0, in its own page-aligned
-// section: the linker script leaves an unmapped guard page below it. A
-// stack overflow faults on that page, but exception entry shares this
-// stack and pushes its own trap frame lower still, so the report may have
-// no usable call stack; see kernel.ld.
+// The boot stack, the kernel stack of CPU 0, in its own section: the
+// linker script aligns it to 128 KiB and puts an unmapped guard page and the
+// emergency stack below it. Its size is kcore::layout::KERNEL_STACK_SIZE.
 .section .boot_stack, "aw", %nobits
 .balign 4096
 .global boot_stack, boot_stack_top

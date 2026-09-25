@@ -11,8 +11,13 @@ use core::ptr::NonNull;
 
 pub const PAGE: usize = 4096;
 
-/// Source of 4 KiB pages aligned to 4 KiB, as virtual addresses.
-pub trait PageSource {
+/// Source of 4 KiB pages, as virtual addresses.
+///
+/// # Safety
+/// `alloc_page` returns a pointer to PAGE bytes, aligned to PAGE, valid for
+/// reads and writes, that nothing else uses from then on: a pool writes its
+/// objects there and never gives the page back.
+pub unsafe trait PageSource {
     fn alloc_page(&mut self) -> Option<NonNull<u8>>;
 }
 
@@ -44,16 +49,23 @@ impl<T> Pool<T> {
         };
         size.div_ceil(Self::ALIGN) * Self::ALIGN
     };
-    /// Objects per page.
-    pub const PER_PAGE: usize = PAGE / Self::SLOT;
+    /// Objects per page. Naming it for a type that does not fit a page
+    /// fails the build:
+    ///
+    /// ```compile_fail,E0080
+    /// assert_eq!(kcore::slab::Pool::<[u8; 5000]>::PER_PAGE, 0);
+    /// ```
+    pub const PER_PAGE: usize = {
+        assert!(
+            Self::SLOT <= PAGE && Self::ALIGN <= PAGE,
+            "objects of this type do not fit a pool page"
+        );
+        PAGE / Self::SLOT
+    };
 
     pub const fn new() -> Self {
-        const {
-            assert!(
-                Self::SLOT <= PAGE && Self::ALIGN <= PAGE,
-                "objects of this type do not fit a pool page"
-            )
-        };
+        // Evaluating PER_PAGE checks that T fits a page.
+        const { assert!(Self::PER_PAGE > 0) };
         Self {
             free: None,
             in_use: 0,
@@ -129,7 +141,8 @@ mod tests {
         left: usize,
     }
 
-    impl PageSource for Pages {
+    // SAFETY: each page is a fresh 4 KiB-aligned allocation, leaked on purpose.
+    unsafe impl PageSource for Pages {
         fn alloc_page(&mut self) -> Option<NonNull<u8>> {
             if self.left == 0 {
                 return None;

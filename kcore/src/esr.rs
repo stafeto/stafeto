@@ -24,6 +24,12 @@ pub fn brk_immediate(esr: u64) -> Option<u16> {
     (ec(esr) == EC_BRK64).then_some((esr & 0xFFFF) as u16)
 }
 
+/// The system call number (spec 11), the immediate of `svc #number` in
+/// ISS[15:0], when the exception is an SVC from AArch64.
+pub fn svc_immediate(esr: u64) -> Option<u16> {
+    (ec(esr) == EC_SVC64).then_some((esr & 0xFFFF) as u16)
+}
+
 pub fn class_name(ec: u8) -> &'static str {
     match ec {
         0x00 => "unknown or undefined instruction",
@@ -98,6 +104,13 @@ mod tests {
     fn brk_immediate_reads_iss_of_a_brk_only() {
         assert_eq!(brk_immediate((0x3C << 26) | IL | 0x51), Some(0x51));
         assert_eq!(brk_immediate((0x25 << 26) | IL | 0x51), None);
+    }
+
+    #[test]
+    fn svc_immediate_reads_iss_of_an_svc_only() {
+        assert_eq!(svc_immediate((0x15 << 26) | IL | 0xFF01), Some(0xFF01));
+        assert_eq!(svc_immediate((1 << 32) | (0x15 << 26) | IL | 7), Some(7));
+        assert_eq!(svc_immediate((0x3C << 26) | IL | 0xFF01), None);
     }
 
     #[test]

@@ -29,11 +29,11 @@ fn park() -> ! {
 }
 
 #[cfg(not(feature = "ktest"))]
-fn stop() -> ! {
+pub(crate) fn stop() -> ! {
     crate::psci::system_off()
 }
 
 #[cfg(feature = "ktest")]
-fn stop() -> ! {
+pub(crate) fn stop() -> ! {
     crate::arch::semihosting::exit(1)
 }

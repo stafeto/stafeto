@@ -15,6 +15,8 @@ const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
 const KERNEL_LIMIT: u64 = 200 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The overflow probe's recursive function, as `llvm-nm -C` names it.
+const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,14 +24,23 @@ enum Variant {
     Normal,
     Test,
     FaultProbe,
+    OverflowProbe,
 }
 
 impl Variant {
+    const ALL: [Variant; 4] = [
+        Variant::Normal,
+        Variant::Test,
+        Variant::FaultProbe,
+        Variant::OverflowProbe,
+    ];
+
     fn feature(self) -> Option<&'static str> {
         match self {
             Variant::Normal => None,
             Variant::Test => Some("ktest"),
             Variant::FaultProbe => Some("fault-probe"),
+            Variant::OverflowProbe => Some("overflow-probe"),
         }
     }
 
@@ -38,6 +49,7 @@ impl Variant {
             Variant::Normal => "stafeto",
             Variant::Test => "stafeto-ktest",
             Variant::FaultProbe => "stafeto-probe",
+            Variant::OverflowProbe => "stafeto-overflow",
         }
     }
 }
@@ -190,7 +202,9 @@ fn test() -> Result<(), String> {
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     fault_report()?;
-    kernel_tests()?;
+    stack_overflow_report()?;
+    kernel_tests(&qemu::VIRT)?;
+    kernel_tests(&qemu::VIRT_2G)?;
     println!("all checks passed");
     Ok(())
 }
@@ -207,13 +221,18 @@ fn host_tests() -> Result<(), String> {
     ]))
 }
 
-/// A normal build boots, prints its report and powers the machine off.
+/// A normal build boots, prints its report with the timer frequency and
+/// powers the machine off.
 fn boot_smoke() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    qemu::expect_clean_exit_with(&o, "boot complete")
+    qemu::expect_clean_exit_with(&o, "boot complete")?;
+    match qemu::number_after(&o.lines, "timer ") {
+        Some(hz) if hz > 0 => Ok(()),
+        _ => Err("the kernel printed no `timer N Hz` line".into()),
+    }
 }
 
 /// The same build entered at EL2, as the PinePhone's loader does: head.S
@@ -272,15 +291,40 @@ fn fault_report() -> Result<(), String> {
     qemu::backtrace_names_the_fault(&o.lines)
 }
 
-/// Kernel built with `ktest`: runs its tests and exits QEMU through semihosting.
-fn kernel_tests() -> Result<(), String> {
-    let a = build(Variant::Test)?;
+/// A kernel that recurses without end must report the overflow from the
+/// emergency stack and power off: the report names the real ELR inside the
+/// recursive function, and its backtrace goes on into the recursion on the
+/// kernel stack. The function's address range comes from the ELF's symbols.
+fn stack_overflow_report() -> Result<(), String> {
+    let a = build(Variant::OverflowProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    qemu::expect_powered_off(&o)?;
+    for marker in ["kernel stack overflow", "backtrace ("] {
+        qemu::expect_marker(&o, marker)?;
+    }
+    let nm = stdout_of(
+        Command::new(llvm_tool("llvm-nm")?)
+            .args(["-C", "--print-size", "--defined-only"])
+            .arg(&a.elf),
+    )?;
+    let f = qemu::symbol_range(&nm, OVERFLOW_PROBE_FN)
+        .ok_or_else(|| format!("{OVERFLOW_PROBE_FN} is not in {}", a.elf.display()))?;
+    qemu::overflow_report_names(&o.lines, f)
+}
+
+/// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
+/// through semihosting. On 2 GiB the tests also cover RAM the boot page
+/// tables did not map.
+fn kernel_tests(m: &qemu::Machine) -> Result<(), String> {
+    let a = build(Variant::Test)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS).arg("-semihosting");
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
     qemu::verdict(&o, &r)?;
-    println!("kernel tests: {} passed", r.passed.len());
+    println!("kernel tests on {}: {} passed", m.memory, r.passed.len());
     Ok(())
 }
 
@@ -322,43 +366,21 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--package",
-        "kernel",
-        "--release",
-        "--target",
-        KERNEL_TARGET,
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--package",
-        "kernel",
-        "--release",
-        "--target",
-        KERNEL_TARGET,
-        "--features",
-        "ktest",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--package",
-        "kernel",
-        "--release",
-        "--target",
-        KERNEL_TARGET,
-        "--features",
-        "fault-probe",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
+    for variant in Variant::ALL {
+        let mut cmd = cargo();
+        cmd.args([
+            "clippy",
+            "--package",
+            "kernel",
+            "--release",
+            "--target",
+            KERNEL_TARGET,
+        ]);
+        if let Some(feature) = variant.feature() {
+            cmd.args(["--features", feature]);
+        }
+        run_cmd(cmd.args(["--", "-D", "warnings"]))?;
+    }
     test()
 }
 
@@ -368,7 +390,7 @@ mod tests {
 
     #[test]
     fn variants_have_their_own_artifacts_and_features() {
-        let all = [Variant::Normal, Variant::Test, Variant::FaultProbe];
+        let all = Variant::ALL;
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.stem(), b.stem());
@@ -376,5 +398,44 @@ mod tests {
             }
         }
         assert_eq!(Variant::Normal.feature(), None);
+    }
+
+    /// The kernel keeps the FP and SIMD registers for programs and saves
+    /// them only when threads switch (spec 8), so FP or SIMD anywhere else
+    /// in the kernel would change a program's registers without a word.
+    /// Only the thread switch and the EL0 test programs may assemble them.
+    /// Every crate linked into the kernel is searched: the kernel itself,
+    /// kcore and abi.
+    #[test]
+    fn only_the_thread_switch_uses_fp() {
+        let mut found = Vec::new();
+        let mut paths: Vec<_> = ["kernel", "kcore", "lib/abi"]
+            .iter()
+            .map(|dir| root().join(dir))
+            .collect();
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                let entries = std::fs::read_dir(&path).expect("a readable directory");
+                paths.extend(entries.map(|e| e.expect("a directory entry").path()));
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let fp = text.lines().any(|l| {
+                (l.contains(".arch_extension") && (l.contains("fp") || l.contains("simd")))
+                    || ((l.contains("target_feature") || l.contains("target-feature"))
+                        && (l.contains("neon") || l.contains("fp-armv8")))
+            });
+            if fp {
+                let name = path.strip_prefix(root()).expect("a path in the workspace");
+                found.push(name.to_string_lossy().into_owned());
+            }
+        }
+        found.sort();
+        assert_eq!(
+            found,
+            ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
+        );
     }
 }
