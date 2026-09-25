@@ -20,14 +20,13 @@
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::channel::{Owner, Wait};
 use crate::cleanup::{self, Item};
-use crate::mm::phys::FRAMES;
+use crate::mm::phys::{self, Frame};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::sched::{self, Tokens};
 use abi::{Error, Policy};
+use core::ops::Range;
 use core::ptr::NonNull;
-use kcore::PAGE_SIZE;
-use kcore::layout::LINEAR_BASE;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::sched::{Node, Schedulable, State};
@@ -67,9 +66,9 @@ pub struct Thread {
     /// which process::end walks; None once the thread left it. Only
     /// process::{add_thread, remove_thread} change them.
     pub siblings: Option<Siblings>,
-    /// The page `give_buffer` mapped for messages; it goes when the thread
-    /// exits (`exit`), at the stage Buffers of its process, or when the
-    /// thread goes.
+    /// The page `give_buffer` mapped for messages (spec 6.2); it goes when
+    /// the thread exits (`exit`), at the stage Buffers of its process, or
+    /// when the thread goes.
     buffer: Option<Buffer>,
     process: NonNull<Process>,
     /// Handles to the thread, the reference `create` hands out and the
@@ -86,12 +85,11 @@ pub struct Siblings {
     pub next: Option<NonNull<Thread>>,
 }
 
-/// A thread's message buffer: page `va` of its process, backed by the
-/// frame at `pa`, which belongs to the thread (spec 11).
-#[derive(Clone, Copy)]
+/// A thread's message buffer: page `va` of its process, backed by `frame`,
+/// which belongs to the thread (spec 6.2, 11).
 struct Buffer {
     va: usize,
-    pa: u64,
+    frame: Frame,
 }
 
 const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
@@ -219,47 +217,37 @@ pub unsafe fn give_number(t: NonNull<Thread>, tokens: &mut Tokens) {
     }
 }
 
-/// Gives `t` its message buffer (spec 11): a fresh zeroed frame mapped
-/// at page `va` of its process, readable and writable, never executable.
+/// Gives `t` its message buffer (spec 6.2, 11): a fresh zeroed frame
+/// mapped at page `va` of its process, readable and writable, never
+/// executable, whose address TPIDRRO_EL0 of the thread holds from now on.
 /// The frame is the thread's and goes when the thread ends; the quota of
-/// the process pays for it and for the tables. INVALID_ARGS for a page
-/// that is mapped already, NO_MEMORY when the quota runs out; the thread
-/// has no buffer then. A charge that passed always finds its frame (spec
-/// 7.8).
+/// the process pays for it and for the tables (phys::alloc_zeroed).
+/// INVALID_ARGS for a page that is mapped already, NO_MEMORY when the
+/// quota runs out; the thread has no buffer then.
 pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the thread, which holds its
     // process.
     let p = unsafe { t.as_ref() }.process;
-    process::charge(p, PAGE_SIZE)?;
-    let pa = FRAMES
-        .lock()
-        .as_mut()
-        .expect("frame allocator")
-        .alloc(0)
-        .expect("a charge that passed found no frame (spec 7.8)");
-    // SAFETY: the frame was just allocated and lies in the linear map; no
-    // program sees it before it is zeroed.
-    unsafe {
-        core::ptr::write_bytes(
-            (LINEAR_BASE + pa as usize) as *mut u8,
-            0,
-            PAGE_SIZE as usize,
-        )
-    };
-    if let Err(e) = process::map_page(p, va, pa, Attrs::USER_DATA) {
-        FRAMES.lock().as_mut().expect("frame allocator").free(pa, 0);
-        process::refund(p, PAGE_SIZE);
+    // SAFETY: the thread's reference keeps the process, which lives: its
+    // stage Quota is far.
+    let frame = phys::alloc_zeroed(0, unsafe { process::account(p) })?;
+    if let Err(e) = process::map_page(p, va, frame.pa(), Attrs::USER_DATA) {
+        // SAFETY: as above; no table maps the frame, since the map failed.
+        unsafe { phys::free(frame, process::account(p)) };
         return Err(e);
     }
-    // SAFETY: as above; only the field is written.
-    unsafe { (*t.as_ptr()).buffer = Some(Buffer { va, pa }) };
+    // SAFETY: as above; only the fields are written.
+    unsafe {
+        (*t.as_ptr()).buffer = Some(Buffer { va, frame });
+        (*t.as_ptr()).regs.tpidrro = va as u64;
+    }
     Ok(())
 }
 
 /// Gives the message buffer's frame back, if the thread has one, and
-/// refunds it to the process: its page is unmapped first, with its TLB
-/// entry, while the process's space lives; otherwise the page went with
-/// the space.
+/// refunds it to the process (phys::free): its page is unmapped first, with
+/// its TLB entry, while the process's space lives; otherwise the page went
+/// with the space.
 ///
 /// # Safety
 /// `t` is alive and does not run at EL0 again with its buffer.
@@ -267,16 +255,36 @@ pub unsafe fn drop_buffer(t: NonNull<Thread>) {
     // SAFETY: the caller's promise; only the fields are touched, since the
     // thread may be released from its process's table meanwhile.
     let (buffer, p) = unsafe { ((*t.as_ptr()).buffer.take(), (*t.as_ptr()).process) };
-    let Some(Buffer { va, pa }) = buffer else {
+    let Some(Buffer { va, frame }) = buffer else {
         return;
     };
     let unmapped = process::unmap_page(p, va);
     assert!(
-        unmapped.is_none_or(|frame| frame == pa),
+        unmapped.is_none_or(|pa| pa == frame.pa()),
         "a message buffer's page mapped another frame"
     );
-    FRAMES.lock().as_mut().expect("frame allocator").free(pa, 0);
-    process::refund(p, PAGE_SIZE);
+    // SAFETY: the thread holds its process, whose buffers go no later than
+    // its stage Buffers, before its stage Quota; the page and its TLB
+    // entry went just now, or with the space and its ASID.
+    unsafe { phys::free(frame, process::account(p)) };
+}
+
+/// Copies bytes `range` of the message buffer of `from` to the same
+/// offsets of that of `to` (spec 6.2): bytes 64 up to the length of a
+/// message, at most 960, frame to frame through the linear map; the kernel
+/// reads no table of a program. A thread that sends, receives or answers
+/// has its buffer until it ends.
+///
+/// # Safety
+/// `to` and `from` are alive and differ, and nothing else borrows their
+/// buffers.
+pub unsafe fn copy_message(to: NonNull<Thread>, from: NonNull<Thread>, range: Range<usize>) {
+    // SAFETY: the caller's promise; the two buffers are two objects.
+    let (to, from) = unsafe { (&mut (*to.as_ptr()).buffer, &(*from.as_ptr()).buffer) };
+    let (Some(to), Some(from)) = (to.as_mut(), from.as_ref()) else {
+        unreachable!("a thread that takes part in a message has its buffer");
+    };
+    to.frame.copy_from(&from.frame, range);
 }
 
 /// A stopped thread becomes ready (thread_start, and the kernel for

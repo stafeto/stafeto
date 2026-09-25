@@ -993,6 +993,28 @@ fn new_thread_cases(c: &Caller, low: NonNull<Process>, h: Handle) -> Result<(), 
     check(zero, "the buffer is not zeroed")
 }
 
+/// thread_create whose quota covers the frame of the new thread's buffer
+/// but no table to map it: NO_MEMORY, and the frame goes back to the
+/// allocator and to the quota, with the thread (spec 7.5, 7.8, 11).
+pub fn buffer_that_does_not_map_goes_back(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let args = thread_args(own.0, USER_VA as u64, 0x80_1000, 10, FIFO, BUFFER);
+        let before = (process::quota(c.process).used(), phys::free_frames());
+        let result = with_quota_left(c, PAGE_SIZE, || {
+            c.fails(Call::ThreadCreate.number(), &args, Error::NoMemory)
+        });
+        cleanup::drain();
+        c.close(own)?;
+        result?;
+        check(
+            (process::quota(c.process).used(), phys::free_frames()) == before
+                && process::translate(c.process, BUFFER as usize).is_none(),
+            "the frame of a buffer that did not map stayed taken",
+        )
+    })
+}
+
 /// process_kill ends a process whatever state its threads are in: a ready
 /// thread leaves the queue, a stopped one ends where it is (spec 11), both
 /// in the call. The process's space and its threads' buffers go with the
@@ -1197,8 +1219,18 @@ fn with_used_quota(
     c: &Caller,
     body: impl FnOnce() -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
+    with_quota_left(c, 0, body)
+}
+
+/// Runs `body` with all but `left` bytes of the caller's quota charged,
+/// and refunds the charge afterwards.
+fn with_quota_left(
+    c: &Caller,
+    left: u64,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
     let q = process::quota(c.process);
-    let rest = q.limit() - q.returned() - q.used();
+    let rest = q.limit() - q.returned() - q.used() - left;
     process::charge(c.process, rest).map_err(|_| "the rest of the quota did not charge")?;
     let result = body();
     process::refund(c.process, rest);

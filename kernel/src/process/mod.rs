@@ -35,7 +35,7 @@ use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
-use crate::mm::phys::FRAMES;
+use crate::mm::phys::{self, Frame};
 use crate::object::{self, Block, Chunks, Handles, Object};
 use crate::sched;
 use crate::session::Session;
@@ -44,7 +44,6 @@ use crate::timer::Timer;
 use abi::{Error, Handle, MAX_THREADS, MAX_TIMERS, ProcessState, Rights};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
-use kcore::layout::LINEAR_BASE;
 use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::process::Life;
@@ -192,19 +191,21 @@ struct ChildLinks {
     next: Option<NonNull<Process>>,
 }
 
-/// Blocks of frames, as (physical address, order), that `release` gives
-/// back to the allocator when their owner goes.
-struct OwnedFrames([Option<(u64, u8)>; MAX_BLOCKS]);
+/// Blocks of frames that `release` gives back to the allocator when their
+/// owner goes.
+struct OwnedFrames([Option<Frame>; MAX_BLOCKS]);
 
 impl OwnedFrames {
     /// Gives every block back to the frame allocator and refunds it to
-    /// `quota`.
-    fn release(&mut self, quota: &mut Account) {
-        let mut guard = FRAMES.lock();
-        let frames = guard.as_mut().expect("frame allocator");
-        for (pa, order) in self.0.iter_mut().filter_map(Option::take) {
-            frames.free(pa, order);
-            quota.refund(PAGE_SIZE << order);
+    /// `quota` (phys::free, spec 7.7).
+    ///
+    /// # Safety
+    /// No table of a program maps the blocks any more, and the TLB entries
+    /// of such mappings went.
+    unsafe fn release(&mut self, quota: &mut Account) {
+        for frame in self.0.iter_mut().filter_map(Option::take) {
+            // SAFETY: the caller's promise.
+            unsafe { phys::free(frame, quota) };
         }
     }
 }
@@ -278,31 +279,11 @@ impl Process {
             .position(Option::is_none)
             .ok_or(Error::NoMemory)?;
         let order = (size / PAGE_SIZE).next_power_of_two().trailing_zeros() as u8;
-        self.quota.charge(PAGE_SIZE << order)?;
-        let Some(pa) = FRAMES
-            .lock()
-            .as_mut()
-            .expect("frame allocator")
-            .alloc(order)
-        else {
-            // A block may miss while its frames are free apart; a single
-            // frame may not (spec 7.8).
-            assert!(order > 0, "a charge that passed found no frame (spec 7.8)");
-            self.quota.refund(PAGE_SIZE << order);
-            return Err(Error::NoMemory);
-        };
-        // SAFETY: the block was just allocated and lies in the linear map;
-        // no program sees it before it is zeroed.
-        unsafe {
-            core::ptr::write_bytes(
-                (LINEAR_BASE + pa as usize) as *mut u8,
-                0,
-                (PAGE_SIZE << order) as usize,
-            )
-        };
+        let frame = phys::alloc_zeroed(order, &mut self.quota)?;
+        let pa = frame.pa();
         // Owned before it is mapped: on an error part of the range may be
         // mapped, and the frames must stay until the tables go.
-        self.frames.0[slot] = Some((pa, order));
+        self.frames.0[slot] = Some(frame);
         let space = self.space.as_mut().expect("frames map into a space");
         space.map(va, pa, size, attrs, &mut self.quota)?;
         Ok(pa)
@@ -344,7 +325,7 @@ fn create(
     let process = Process {
         space: Some(space),
         retired: None,
-        frames: OwnedFrames([None; MAX_BLOCKS]),
+        frames: OwnedFrames([const { None }; MAX_BLOCKS]),
         handles,
         refs: 1,
         shell_refs: 0,
@@ -463,6 +444,19 @@ pub fn charge(process: NonNull<Process>, bytes: u64) -> Result<(), Error> {
 pub fn refund(process: NonNull<Process>, bytes: u64) {
     // SAFETY: as in `charge`.
     unsafe { (*process.as_ptr()).quota.refund(bytes) }
+}
+
+/// The quota of `process`, which pays for the frames it owns
+/// (phys::alloc_zeroed, phys::free, spec 7.5): the message buffers of its
+/// threads. Only the field is borrowed (see `refs`).
+///
+/// # Safety
+/// The caller holds a reference to `process`, which has not passed its
+/// stage Quota, and nothing else borrows its quota while the caller holds
+/// the borrow.
+pub unsafe fn account<'a>(process: NonNull<Process>) -> &'a mut Account {
+    // SAFETY: the caller's promise.
+    unsafe { &mut (*process.as_ptr()).quota }
 }
 
 /// The quota of `process`, which the caller holds: object_info's

@@ -5,7 +5,8 @@
 //! (spec 13.2): the entry point, handles typed by the kind of their object
 //! (`handle`, `init`), typed wrappers of the system calls the kernel has,
 //! requests and their tokens among them, and a raw call for any other
-//! (`sys`), output through `debug_write`
+//! (`sys`), the thread's message buffer (`msgbuf`), output through
+//! `debug_write`
 //! (`console`, `print!`, `println!`), the counter read without a call
 //! (`time`), stacks for threads in static memory, and the panic handler.
 //! The heap, the start protocol, the ELF loader and the service loop come
@@ -19,6 +20,7 @@
 
 pub mod console;
 pub mod handle;
+pub mod msgbuf;
 pub mod sys;
 pub mod time;
 

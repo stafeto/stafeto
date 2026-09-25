@@ -3,8 +3,9 @@
 
 //! The stafeto kernel interface shared by the kernel and programs (spec 5,
 //! 6, 8, 11, 12, 13.3): handle layout, rights, system call numbers and
-//! where their arguments and results go, what `receive` returns, init's
-//! first handles, scheduling policies and error codes.
+//! where their arguments and results go, what `receive` returns, the
+//! layout of a thread's message buffer, init's first handles, scheduling
+//! policies and error codes.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -272,6 +273,100 @@ pub const MESSAGE_HANDLES: usize = 4;
 /// of `send`, `reply` and of the results that carry a message (spec 11):
 /// bits 12-14. The length takes bits 0-10.
 pub const HANDLES_SHIFT: u32 = 12;
+
+/// The kind of the object a handle names, as the info words of a message
+/// buffer give it for each handle that came (spec 4, 6.2); a handle with a
+/// label names a channel. Memory objects come with milestone 1.3d,
+/// interrupts and device windows with 1.3e: their codes are fixed already.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectKind {
+    Process,
+    Thread,
+    Channel,
+    Timer,
+    Resource,
+    /// A memory object (milestone 1.3d).
+    Memory,
+    /// An interrupt line (milestone 1.3e).
+    Interrupt,
+    /// A window on the registers of a device (milestone 1.3e).
+    DeviceWindow,
+    /// A kind this abi does not know, which a later kernel may give: its
+    /// code.
+    Unknown(u8),
+}
+
+impl ObjectKind {
+    /// The code in bits 32-39 of an info word.
+    pub const fn code(self) -> u8 {
+        match self {
+            ObjectKind::Process => 1,
+            ObjectKind::Thread => 2,
+            ObjectKind::Channel => 3,
+            ObjectKind::Timer => 4,
+            ObjectKind::Resource => 5,
+            ObjectKind::Memory => 6,
+            ObjectKind::Interrupt => 7,
+            ObjectKind::DeviceWindow => 8,
+            ObjectKind::Unknown(code) => code,
+        }
+    }
+
+    /// The kind with this code; `Unknown` for a code this abi does not
+    /// know.
+    pub const fn from_code(code: u8) -> ObjectKind {
+        match code {
+            1 => ObjectKind::Process,
+            2 => ObjectKind::Thread,
+            3 => ObjectKind::Channel,
+            4 => ObjectKind::Timer,
+            5 => ObjectKind::Resource,
+            6 => ObjectKind::Memory,
+            7 => ObjectKind::Interrupt,
+            8 => ObjectKind::DeviceWindow,
+            _ => ObjectKind::Unknown(code),
+        }
+    }
+}
+
+/// The layout of a thread's message buffer (spec 6.2): one page, which
+/// the kernel maps for each thread and whose address TPIDRRO_EL0 holds.
+/// Bytes 0-63 of a message travel in x2-x9, and the kernel neither reads
+/// nor writes them here; it copies bytes 64 up to the length from the
+/// sender's buffer into the receiver's, at the same offsets.
+pub mod msgbuf {
+    use crate::{INLINE_MAX, MESSAGE_HANDLES, MESSAGE_MAX, ObjectKind, Rights};
+
+    /// The data of a message: MESSAGE_MAX bytes from the start.
+    pub const DATA: usize = 0;
+    /// The first byte of the data the kernel copies.
+    pub const COPIED: usize = INLINE_MAX;
+    /// The values of the handles of a message, MESSAGE_HANDLES words: the
+    /// sender puts the first n there, and delivery writes the first n.
+    pub const HANDLES: usize = DATA + MESSAGE_MAX;
+    /// An info word for each handle that came (`info`), MESSAGE_HANDLES
+    /// words, written by the kernel at delivery.
+    pub const INFO: usize = HANDLES + 8 * MESSAGE_HANDLES;
+    /// The kernel's reserve, to the end of the page: no program uses it.
+    pub const RESERVED: usize = INFO + 8 * MESSAGE_HANDLES;
+    /// The size of the buffer, one page.
+    pub const SIZE: usize = 4096;
+
+    /// The info word of a handle to an object of `kind` with `rights`:
+    /// bits 0-31 the rights, bits 32-39 the kind.
+    pub fn info(kind: ObjectKind, rights: Rights) -> u64 {
+        u64::from(rights.0) | u64::from(kind.code()) << 32
+    }
+
+    /// The kind and the rights of info word `word`; a kind this abi does
+    /// not know comes as ObjectKind::Unknown, with its rights.
+    pub fn parse_info(word: u64) -> (ObjectKind, Rights) {
+        (
+            ObjectKind::from_code((word >> 32) as u8),
+            Rights(word as u32),
+        )
+    }
+}
 
 /// Where the kind of what `receive` took starts in its x1: bits 24-27.
 pub const SOURCE_SHIFT: u32 = 24;
@@ -864,6 +959,32 @@ mod tests {
         assert_eq!(Source::Unknown(15).code(), 15);
         assert_eq!((NO_WAIT, SOURCE_SHIFT), (1 << 16, 24));
         assert_eq!((MESSAGE_MAX, MESSAGE_HANDLES, HANDLES_SHIFT), (1024, 4, 12));
+    }
+
+    #[test]
+    fn message_buffer_has_its_layout() {
+        use msgbuf::*;
+        assert_eq!(
+            (DATA, COPIED, HANDLES, INFO, RESERVED, SIZE),
+            (0, 64, 1024, 1056, 1088, 4096)
+        );
+        let word = info(ObjectKind::Channel, Rights::SEND | Rights::TRANSFER);
+        assert_eq!(word, 3 << 32 | 0b110);
+        assert_eq!(
+            parse_info(word),
+            (ObjectKind::Channel, Rights::SEND | Rights::TRANSFER)
+        );
+        for code in 1..=8 {
+            let kind = ObjectKind::from_code(code);
+            assert_ne!(kind, ObjectKind::Unknown(code));
+            assert_eq!(kind.code(), code);
+            assert_eq!(parse_info(info(kind, Rights::NONE)), (kind, Rights::NONE));
+        }
+        assert_eq!(ObjectKind::from_code(0), ObjectKind::Unknown(0));
+        assert_eq!(
+            parse_info(9 << 32 | 0b100),
+            (ObjectKind::Unknown(9), Rights::SEND)
+        );
     }
 
     #[test]

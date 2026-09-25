@@ -247,6 +247,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::thread_create_checks_its_arguments,
     ),
     (
+        "buffer_that_does_not_map_goes_back",
+        calls::buffer_that_does_not_map_goes_back,
+    ),
+    (
         "process_kill_ends_threads_in_every_state",
         calls::process_kill_ends_threads_in_every_state,
     ),

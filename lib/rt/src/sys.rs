@@ -13,9 +13,10 @@
 //! (`Token`).
 
 use crate::handle::{Channel, Handle, Process, Resource, Thread, Timer};
+use crate::msgbuf;
 use abi::{
-    Call, Error, KernelStats, Message, Notification, Policy, ProcessHandles, ProcessMemory,
-    ProcessState, Rights, SOURCE_SHIFT, Source,
+    Call, Error, INLINE_MAX, KernelStats, MESSAGE_MAX, Message, Notification, Policy,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source,
 };
 use core::arch::asm;
 
@@ -303,7 +304,8 @@ pub fn notify(channel: &Handle<Channel>, bits: u64) -> Result<(), Error> {
 }
 
 /// What `receive` took (spec 6.1, 6.5): a notification, or a request with
-/// its bytes 0-63 and the token that answers it.
+/// its bytes 0-63 and the token that answers it. A request of more than
+/// 64 bytes lies whole in the thread's message buffer (`msgbuf`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Received {
     Notification {
@@ -350,10 +352,12 @@ impl Token {
         self.0
     }
 
-    /// reply: `bytes`, up to abi::INLINE_MAX in x2-x9, go to the client,
-    /// whose send returns them (spec 6.1); the call never waits. BAD_STATE
-    /// when the token names no request that waits for this process's reply.
-    /// More bytes fail with INVALID_ARGS, as the kernel would fail them.
+    /// reply: `bytes`, up to abi::MESSAGE_MAX, go to the client, whose
+    /// send returns them (spec 6.1): bytes 0-63 in x2-x9, the rest through
+    /// the message buffers. The call never waits. BAD_STATE when the token
+    /// names no request that waits for this process's reply, PEER_CLOSED
+    /// when its client ended while it waited. More bytes fail with
+    /// INVALID_ARGS, as the kernel would fail them.
     pub fn reply(self, bytes: &[u8]) -> Result<(), Error> {
         let args = message_regs(self.0, bytes, 0)?;
         call::<{ Call::Reply.number() }>(&args).map(drop)
@@ -362,7 +366,8 @@ impl Token {
 
 /// What `send` returns (spec 6.1): the reply's length, the count of
 /// handles it brought, and its bytes 0-63 as abi::inline_words packs them,
-/// zero past `len`.
+/// zero past `len`. A reply of more than 64 bytes lies whole in the
+/// thread's message buffer (`msgbuf`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reply {
     pub len: usize,
@@ -371,25 +376,39 @@ pub struct Reply {
 }
 
 /// x0-x9 of a message of `bytes` through `target`, a channel or a token,
-/// with `flags` in its description; INVALID_ARGS for more than
-/// abi::INLINE_MAX bytes.
+/// with `flags` in its description: bytes 0-63 in x2-x9, and the rest,
+/// written into the message buffer at their offsets. INVALID_ARGS for
+/// more than abi::MESSAGE_MAX bytes.
 fn message_regs(target: u64, bytes: &[u8], flags: u64) -> Result<Regs, Error> {
-    if bytes.len() > abi::INLINE_MAX {
+    if bytes.len() > MESSAGE_MAX {
         return Err(Error::InvalidArgs);
     }
+    let (inline, rest) = bytes.split_at(bytes.len().min(INLINE_MAX));
+    msgbuf::write(INLINE_MAX, rest);
     let mut x = [0; 10];
     x[0] = target;
     x[1] = bytes.len() as u64 | flags;
-    x[2..].copy_from_slice(&abi::inline_words(bytes));
+    x[2..].copy_from_slice(&abi::inline_words(inline));
     Ok(x)
 }
 
-/// send: the request `bytes`, up to abi::INLINE_MAX, through `channel`, a
-/// handle with SEND, with or without a label, and the wait for its reply
-/// (spec 6.1). The request waits by the caller's effective priority, and
-/// the receiver works at that priority until it answers (spec 6.6).
-/// PEER_CLOSED once the channel closed, BAD_STATE when the thread's count
-/// of requests ran out; more bytes fail with INVALID_ARGS.
+/// After a message of `len` bytes came in x2-x9 as `words`: one of more
+/// than 64 bytes gets its bytes 0-63 into the message buffer too, where
+/// the kernel put the rest (spec 6.2).
+fn keep_whole(len: usize, words: &[u64; 8]) {
+    if len > INLINE_MAX {
+        msgbuf::write(0, &abi::inline_bytes(words));
+    }
+}
+
+/// send: the request `bytes`, up to abi::MESSAGE_MAX, through `channel`,
+/// a handle with SEND, with or without a label, and the wait for its reply
+/// (spec 6.1): bytes 0-63 go in x2-x9, the rest through the message
+/// buffers. The request waits by the caller's effective priority, and the
+/// receiver works at that priority until it answers (spec 6.6).
+/// PEER_CLOSED once the channel closed or when the service ended before
+/// its reply, BAD_STATE when the thread's count of requests ran out; more
+/// bytes fail with INVALID_ARGS.
 pub fn send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error> {
     send_with(channel, bytes, 0)
 }
@@ -407,6 +426,7 @@ fn send_with(channel: &Handle<Channel>, bytes: &[u8], flags: u64) -> Result<Repl
     let mut words = [0; 11];
     words[..9].copy_from_slice(&x[1..]);
     let m = Message::from_words(words);
+    keep_whole(m.len, &m.words);
     Ok(Reply {
         len: m.len,
         handles: m.handles,
@@ -459,6 +479,7 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
     let words: [u64; 11] = x[1..].try_into().expect("x1-x11");
     if Source::from_code((words[0] >> SOURCE_SHIFT) & 0xF) == Source::Message {
         let m = Message::from_words(words);
+        keep_whole(m.len, &m.words);
         return Ok(Received::Message {
             label: m.label,
             len: m.len,

@@ -37,7 +37,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 79] = [
+const TESTS: [Test; 85] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -257,6 +257,18 @@ const TESTS: [Test; 79] = [
         "exited_threads_hold_no_numbers",
         exited_threads_hold_no_numbers,
     ),
+    ("buffer_address_is_in_tpidrro", buffer_address_is_in_tpidrro),
+    ("long_request_arrives_whole", long_request_arrives_whole),
+    ("long_reply_arrives_whole", long_reply_arrives_whole),
+    (
+        "short_message_leaves_the_buffers_alone",
+        short_message_leaves_the_buffers_alone,
+    ),
+    (
+        "kernel_leaves_bytes_0_to_63_of_the_buffer",
+        kernel_leaves_bytes_0_to_63_of_the_buffer,
+    ),
+    ("bytes_past_the_length_stay", bytes_past_the_length_stay),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -2721,8 +2733,8 @@ extern "C" fn server(slot: u64) -> ! {
 /// reply fail with INVALID_ARGS before the handle or the token is looked
 /// at; then the handle of send: BAD_HANDLE, WRONG_TYPE for a process,
 /// ACCESS_DENIED for a copy without SEND, and PEER_CLOSED once the channel
-/// closed. Each changes x0 alone. rt refuses more than 64 bytes in
-/// registers itself.
+/// closed. Each changes x0 alone. rt refuses more than 1024 bytes
+/// itself.
 fn send_checks_its_arguments() -> Outcome {
     let c = channel(QUIET)?;
     let notify_only = copy(&c, Rights::NOTIFY)?;
@@ -2753,7 +2765,7 @@ fn send_checks_its_arguments() -> Outcome {
             x[..2].copy_from_slice(&[token, desc]);
             failed(raw_reply(x), x, Error::InvalidArgs)
         });
-    let typed = sys::send(&c, &[0; abi::INLINE_MAX + 1]);
+    let typed = sys::send(&c, &[0; abi::MESSAGE_MAX + 1]);
     close(notify_only)?;
     close(left)?;
     close(c)?;
@@ -2767,7 +2779,7 @@ fn send_checks_its_arguments() -> Outcome {
     )?;
     check(
         typed == Err(Error::InvalidArgs),
-        "rt sent more than 64 bytes in registers",
+        "rt sent more than 1024 bytes",
     )
 }
 
@@ -3646,5 +3658,244 @@ fn exited_threads_hold_no_numbers() -> Outcome {
     check(
         made.is_ok() && mark(0) == PAST_NUMBERS as u64,
         "a thread that exited kept its number: thread_create failed",
+    )
+}
+
+// The message buffer (spec 6.2): TPIDRRO_EL0 holds its address; bytes 64
+// and up of a message go from the sender's buffer into the receiver's, at
+// their offsets, and the kernel leaves bytes 0-63 and the bytes past the
+// length alone.
+
+/// The seeds of the patterns of the buffer tests: init's buffer, a
+/// client's buffer, and the bytes of a message.
+const INIT_SEED: u8 = 0x11;
+const CLIENT_SEED: u8 = 0x5B;
+const MESSAGE_SEED: u8 = 0xC3;
+
+/// MESSAGE_MAX bytes that differ from those of another seed at each
+/// offset.
+fn pattern(seed: u8) -> [u8; abi::MESSAGE_MAX] {
+    core::array::from_fn(|i| (i as u8).wrapping_mul(31) ^ (i >> 8) as u8 ^ seed)
+}
+
+/// Fills the data of the calling thread's message buffer with
+/// pattern(seed).
+fn fill_buffer(seed: u8) {
+    rt::msgbuf::write(0, &pattern(seed));
+}
+
+/// The data of the calling thread's message buffer.
+fn buffer_data() -> [u8; abi::MESSAGE_MAX] {
+    let mut data = [0; abi::MESSAGE_MAX];
+    rt::msgbuf::read(0, &mut data);
+    data
+}
+
+/// Leaves the address of its message buffer in mark `i` and ends.
+extern "C" fn note_buffer(i: u64) -> ! {
+    MARKS[i as usize].store(rt::msgbuf::address() as u64, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 6.2: TPIDRRO_EL0 holds the address of the thread's message buffer:
+/// abi::INIT_MSGBUF for init's first thread, and for a thread
+/// thread_create made, the page it named.
+fn buffer_address_is_in_tpidrro() -> Outcome {
+    reset_marks();
+    let own = rt::msgbuf::address();
+    let t = spawn(0, note_buffer, 0, HIGH, Policy::Fifo)?;
+    close(t)?;
+    check(
+        own == abi::INIT_MSGBUF as usize,
+        "init's TPIDRRO_EL0 does not hold its message buffer",
+    )?;
+    check(
+        mark(0) == buffer(0) as u64,
+        "a new thread's TPIDRRO_EL0 does not hold its message buffer",
+    )
+}
+
+/// A client in slot 0 that fills its buffer with pattern(CLIENT_SEED),
+/// sends the first `len` bytes of pattern(MESSAGE_SEED) through the
+/// channel HANDLES holds for it, and leaves the code and the length of
+/// the reply in `result`; ends.
+extern "C" fn pattern_client(len: u64) -> ! {
+    fill_buffer(CLIENT_SEED);
+    match sys::send(&handle(0), &pattern(MESSAGE_SEED)[..len as usize]) {
+        Ok(reply) => record(0, &[0, reply.len as u64]),
+        Err(e) => record(0, &[e.code()]),
+    }
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (messages): a request of 1024 bytes arrives whole (spec 6.1,
+/// 6.2): a client above init sends pattern bytes, and init takes the
+/// request without waiting: its buffer holds all of them.
+fn long_request_arrives_whole() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let max = abi::MESSAGE_MAX;
+    let t = spawn(0, pattern_client, max as u64, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let whole = matches!(got, Ok(Received::Message { len, .. }) if len == max)
+        && buffer_data() == pattern(MESSAGE_SEED);
+    let replied = answer_all([got]);
+    close(t)?;
+    close(c)?;
+    check(whole, "the request of 1024 bytes did not arrive whole")?;
+    check(
+        replied && ended(0) && result(0)[..2] == [0, 0],
+        "the client did not get the reply",
+    )
+}
+
+/// A client in slot 0 that sends request(0) through the channel HANDLES
+/// holds for it and, once the reply came, leaves in `result` the code, the
+/// length of the reply and 1 when its buffer holds pattern(MESSAGE_SEED);
+/// ends.
+extern "C" fn client_looks(_: u64) -> ! {
+    match sys::send(&handle(0), &request(0)) {
+        Ok(reply) => {
+            let whole = buffer_data() == pattern(MESSAGE_SEED);
+            record(0, &[0, reply.len as u64, u64::from(whole)]);
+        }
+        Err(e) => record(0, &[e.code()]),
+    }
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (messages): a reply of 1024 bytes arrives whole: a client
+/// above init sends 16 bytes, init answers with pattern bytes, and the
+/// client's buffer holds all of them when its send returns.
+fn long_reply_arrives_whole() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let t = spawn(0, client_looks, 0, HIGH, Policy::Fifo)?;
+    let replied = take_token(&c).map(|token| token.reply(&pattern(MESSAGE_SEED)));
+    close(t)?;
+    close(c)?;
+    check(
+        replied == Ok(Ok(())) && ended(0),
+        "the reply failed or did not reach the client",
+    )?;
+    check(
+        result(0)[..3] == [0, abi::MESSAGE_MAX as u64, 1],
+        "the reply of 1024 bytes did not arrive whole",
+    )
+}
+
+/// A client in slot 0 that fills its buffer with pattern(CLIENT_SEED),
+/// sends 64 bytes through the channel HANDLES holds for it and leaves in
+/// `result` the code and 1 when its buffer still holds the pattern after
+/// the reply; ends.
+extern "C" fn short_client(_: u64) -> ! {
+    fill_buffer(CLIENT_SEED);
+    match sys::send(&handle(0), &[0xC5; abi::INLINE_MAX]) {
+        Ok(_) => record(0, &[0, u64::from(buffer_data() == pattern(CLIENT_SEED))]),
+        Err(e) => record(0, &[e.code()]),
+    }
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Messages of 64 bytes leave the buffers alone (spec 6.2): they travel in
+/// x2-x9 only. Init's buffer and a client's hold patterns; the client
+/// sends 64 bytes, init takes them and answers with 64: both buffers keep
+/// their patterns.
+fn short_message_leaves_the_buffers_alone() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    fill_buffer(INIT_SEED);
+    let t = spawn(0, short_client, 0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c);
+    let kept = buffer_data() == pattern(INIT_SEED);
+    let replied = token.map(|token| token.reply(&[0x3C; abi::INLINE_MAX]));
+    close(t)?;
+    close(c)?;
+    check(kept, "a request of 64 bytes changed the receiver's buffer")?;
+    check(
+        replied == Ok(Ok(())) && ended(0) && result(0)[..2] == [0, 1],
+        "a reply of 64 bytes changed the client's buffer",
+    )
+}
+
+/// A client in slot 0 that fills its buffer with pattern(CLIENT_SEED) and
+/// sends 8 bytes with raw registers through the channel HANDLES holds for
+/// it; then leaves in `result` x0-x2 of the call and 1 when its buffer
+/// holds bytes 64-127 of pattern(INIT_SEED) and its own pattern elsewhere;
+/// ends.
+extern "C" fn raw_looker(_: u64) -> ! {
+    fill_buffer(CLIENT_SEED);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[HANDLES[0].load(Relaxed), 8]);
+    let after = raw_send(x);
+    let mut want = pattern(CLIENT_SEED);
+    want[64..128].copy_from_slice(&pattern(INIT_SEED)[64..128]);
+    let seen = u64::from(buffer_data() == want);
+    record(0, &[after[0], after[1], after[2], seen]);
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// The kernel leaves bytes 0-63 of the buffers alone (spec 6.2): they
+/// travel in x2-x9. A client fills its buffer with a pattern and sends;
+/// init fills its own with another and answers with 128 bytes through raw
+/// registers, every bit of x2-x9 set. The client gets init's registers in
+/// x2-x9 and bytes 64-127 of init's buffer; its own bytes 0-63 and past
+/// 127 stay.
+fn kernel_leaves_bytes_0_to_63_of_the_buffer() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let t = spawn(0, raw_looker, 0, HIGH, Policy::Fifo)?;
+    fill_buffer(INIT_SEED);
+    let mut x = [u64::MAX; 10];
+    x[1] = 128;
+    let after = take_token(&c).map(|token| {
+        x[0] = token.raw();
+        raw_reply(x)
+    });
+    close(t)?;
+    close(c)?;
+    check(
+        after.is_ok_and(|a| a[0] == 0) && ended(0),
+        "the reply failed or did not reach the client",
+    )?;
+    check(
+        result(0)[..4] == [0, 128, u64::MAX, 1],
+        "the kernel touched bytes 0-63 or past the length of a buffer",
+    )
+}
+
+/// The receiver's buffer past the length stays as it was (spec 6.2): init's
+/// buffer holds a pattern; a client, its buffer full of another, sends 100
+/// bytes, and init takes them: its buffer holds the 100 bytes and its own
+/// pattern after them.
+fn bytes_past_the_length_stay() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    fill_buffer(INIT_SEED);
+    let t = spawn(0, pattern_client, 100, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let came = matches!(got, Ok(Received::Message { len: 100, .. }));
+    let data = buffer_data();
+    let replied = answer_all([got]);
+    close(t)?;
+    close(c)?;
+    let mut want = pattern(INIT_SEED);
+    want[..100].copy_from_slice(&pattern(MESSAGE_SEED)[..100]);
+    check(
+        came && data == want,
+        "a request of 100 bytes changed the receiver's buffer past its length",
+    )?;
+    check(
+        replied && ended(0) && result(0)[..2] == [0, 0],
+        "the client did not get the reply",
     )
 }

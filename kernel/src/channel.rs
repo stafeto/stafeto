@@ -37,7 +37,7 @@ use crate::session::{self, Session};
 use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
-use abi::{Error, MAX_SLOTS, Notification, Rights, Source};
+use abi::{Error, INLINE_MAX, MAX_SLOTS, Notification, Rights, Source};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
 use kcore::notify::{Post, Queue, Slot};
@@ -618,14 +618,27 @@ pub fn send(t: NonNull<Thread>, via: Via, desc: Desc) -> Result<(), Error> {
     Ok(())
 }
 
-/// Writes a message into `to`, the registers of the thread it comes to
-/// (spec 6.1, 11): x0 0, x1 the description, x2-x9 bytes 0-63 from `from`,
-/// the sender's registers, zero past the length.
-fn deliver(to: &mut [u64], from: &[u64], desc: Desc) {
-    to[0] = 0;
-    to[1] = desc.result();
-    to[2..10].copy_from_slice(&from[2..10]);
-    mask_tail(&mut to[2..10], desc.len);
+/// Writes a message from `from`, its sender, into `to`, the thread it
+/// comes to (spec 6.1, 6.2, 11): x0 0, x1 the description, x2-x9 bytes
+/// 0-63 from the sender's registers, zero past the length; bytes 64 up to
+/// the length go from the sender's message buffer into the receiver's, at
+/// the same offsets (thread::copy_message). O(1): at most 960 bytes.
+///
+/// # Safety
+/// `to` and `from` are alive and differ; nothing else borrows their
+/// registers or buffers.
+unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
+    // SAFETY: the caller's promise; the two threads are two objects.
+    unsafe {
+        let x = &mut (*to.as_ptr()).regs.x;
+        x[0] = 0;
+        x[1] = desc.result();
+        x[2..10].copy_from_slice(&from.as_ref().regs.x[2..10]);
+        mask_tail(&mut x[2..10], desc.len);
+        if desc.len > INLINE_MAX {
+            thread::copy_message(to, from, INLINE_MAX..desc.len);
+        }
+    }
 }
 
 /// The request of `client` goes to `r`, the receiver, in its receive (spec
@@ -655,8 +668,8 @@ unsafe fn accept(
         let slot = thread::slot(client);
         process::accepted(p, k.s).push_tail(slot);
         (*client.as_ptr()).waits = Some(Wait::Reply(p));
+        deliver(r, client, desc);
         let to = &mut (*r.as_ptr()).regs.x;
-        deliver(to, &(*client.as_ptr()).regs.x, desc);
         to[10] = via.label();
         to[11] = token;
         k.s.boost(r, (*slot.as_ptr()).priority(), ceiling(r));
@@ -693,7 +706,7 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc) -> Result<(), Error> {
             }
             process::accepted(p, k.s).remove(thread::slot(client));
             (*client.as_ptr()).waits = None;
-            deliver(&mut (*client.as_ptr()).regs.x, &(*t.as_ptr()).regs.x, desc);
+            deliver(client, t, desc);
             k.s.wake(client);
         }
         Ok(())

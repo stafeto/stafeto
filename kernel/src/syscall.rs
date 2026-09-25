@@ -294,7 +294,8 @@ fn receive(thread: NonNull<Thread>, a: &Args) {
 /// a count of them other than 0 is INVALID_ARGS. Otherwise the caller
 /// waits, its request queued by its effective priority or taken by the top
 /// receiver that waits at once, until the reply writes x0-x9: 0, the
-/// description and the data (channel::send).
+/// description and the data. Bytes 64 up to the length of the request and
+/// of the reply go between the message buffers (spec 6.2; channel::send).
 fn send(thread: NonNull<Thread>, a: &Args) {
     let sent = Desc::from_send(a[1]).and_then(|desc| {
         if desc.handles > 0 {
@@ -321,7 +322,8 @@ fn send(thread: NonNull<Thread>, a: &Args) {
 /// process's reply, a used one among them, and PEER_CLOSED for one whose
 /// client ended while it waited (spec 6.8); x0 alone changes then. Handles
 /// do not travel yet: a count of them other than 0 is INVALID_ARGS.
-/// Otherwise x0 is 0, and the client gets the reply (channel::reply).
+/// Otherwise x0 is 0, and the client gets the reply, bytes 64 up to its
+/// length through the message buffers (spec 6.2; channel::reply).
 fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let desc = Desc::from_reply(a[1])?;
     if desc.handles > 0 {
@@ -485,19 +487,19 @@ fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
 
 /// thread_create(x0 process with MANAGE, x1 entry, x2 stack, x3 argument,
 /// x4 priority, x5 policy, x6 message buffer address): a stopped thread in
-/// the process with its message buffer mapped at x6; x1 returns a handle
-/// to it with DUPLICATE, TRANSFER and MANAGE. The entry is in the lower
-/// half and 4-byte aligned, the stack no higher than its top and 16-byte
-/// aligned, the buffer a whole page there (INVALID_ARGS); the priority no
-/// higher than the ceiling of the process nor than the caller's
-/// (ACCESS_DENIED); the process has not ended (BAD_STATE); the buffer's
-/// page is free there (INVALID_ARGS). Resources come last and in the order
-/// the call occupies them, a limit that needs no allocation first (spec 11):
-/// the caller's own table has room for the new handle (LIMIT_REACHED),
-/// then the target has fewer than abi::MAX_THREADS threads that have not
-/// ended and the system a free thread number (LIMIT_REACHED, checked
-/// inside thread::create before it charges anything), then the target's
-/// quota (NO_MEMORY).
+/// the process with its message buffer mapped at x6, whose address its
+/// TPIDRRO_EL0 holds (spec 6.2); x1 returns a handle to it with DUPLICATE,
+/// TRANSFER and MANAGE. The entry is in the lower half and 4-byte aligned,
+/// the stack no higher than its top and 16-byte aligned, the buffer a whole
+/// page there (INVALID_ARGS); the priority no higher than the ceiling of
+/// the process nor than the caller's (ACCESS_DENIED); the process has not
+/// ended (BAD_STATE); the buffer's page is free there (INVALID_ARGS).
+/// Resources come last and in the order the call occupies them, a limit
+/// that needs no allocation first (spec 11): the caller's own table has
+/// room for the new handle (LIMIT_REACHED), then the target has fewer than
+/// abi::MAX_THREADS threads that have not ended and the system a free
+/// thread number (LIMIT_REACHED, checked inside thread::create before it
+/// charges anything), then the target's quota (NO_MEMORY).
 fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
     let policy = policy_arg(a[5])?;
