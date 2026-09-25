@@ -111,13 +111,6 @@ pub struct AddressSpace {
 
 impl AddressSpace {
     /// An empty address space: one root table, no ASID until it first runs.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "processes create address spaces; so far only the kernel tests do"
-        )
-    )]
     pub fn new() -> Result<AddressSpace, MapError> {
         Ok(AddressSpace {
             tables: with_tables(|mem| PageTable::new(mem))?,
@@ -131,13 +124,6 @@ impl AddressSpace {
     /// kernel wrote into the frames needs the instruction cache made
     /// coherent (arch::cache::sync_icache) before a mapping with
     /// `Attrs::USER_TEXT` runs it.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "processes map their frames; so far only the kernel tests do"
-        )
-    )]
     pub fn map(&mut self, va: usize, pa: u64, size: u64, attrs: Attrs) -> Result<(), MapError> {
         let result = with_tables(|mem| self.tables.map_user(mem, va as u64, pa, size, attrs));
         // An entry that turns valid needs no TLB maintenance: the stores
@@ -150,13 +136,6 @@ impl AddressSpace {
     /// it mapped. The cleared descriptor reaches the table walker before
     /// this returns, also when the space has no ASID and so no TLB entry
     /// (kcore::tlb::forget_page): the frame may go elsewhere right after.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "memory objects (milestone 1.3) unmap pages; so far only the kernel tests do"
-        )
-    )]
     pub fn unmap(&mut self, va: usize) -> Result<u64, MapError> {
         let pa = with_tables(|mem| self.tables.unmap_page(mem, va as u64))?;
         with_asids(|a| tlb::forget_page(a, &self.tag, va as u64, &mut Cpu));
@@ -164,13 +143,6 @@ impl AddressSpace {
     }
 
     /// Physical address and leaf descriptor that `va` translates to.
-    #[cfg_attr(
-        not(feature = "ktest"),
-        expect(
-            dead_code,
-            reason = "system calls (milestone 1.2c) check user addresses; so far only the kernel tests do"
-        )
-    )]
     pub fn translate(&self, va: usize) -> Option<(u64, u64)> {
         with_tables(|mem| self.tables.translate(mem, va as u64))
     }

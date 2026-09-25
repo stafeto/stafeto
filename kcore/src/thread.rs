@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Threads (spec 4, 8): scheduling parameters, whose values abi fixes, and
-//! the checks on where a new thread starts.
+//! the checks on where a new thread starts and where its message buffer
+//! goes.
 
+use crate::frames::PAGE_SIZE;
 use crate::layout::USER_END;
 use abi::Error;
 pub use abi::{PRIORITY_LEVELS, Policy};
@@ -16,6 +18,17 @@ pub fn check_start(entry: u64, stack: u64, priority: u8) -> Result<(), Error> {
     let stack_ok = stack <= USER_END as u64 && stack.is_multiple_of(16);
     let priority_ok = (1..PRIORITY_LEVELS).contains(&priority);
     if entry_ok && stack_ok && priority_ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgs)
+    }
+}
+
+/// Checks where a thread's message buffer goes (report 4.1): a whole page
+/// in the lower half, other than page 0, which stays unmapped so that a
+/// null pointer faults.
+pub fn check_buffer(va: u64) -> Result<(), Error> {
+    if va != 0 && va.is_multiple_of(PAGE_SIZE) && va < USER_END as u64 {
         Ok(())
     } else {
         Err(Error::InvalidArgs)
@@ -74,5 +87,15 @@ mod tests {
             check_start(0x40_0000, 0x80_1000, PRIORITY_LEVELS),
             Err(Error::InvalidArgs)
         );
+    }
+
+    #[test]
+    fn message_buffer_is_a_page_in_the_lower_half() {
+        for va in [PAGE_SIZE, 0x100_0000, TOP - PAGE_SIZE] {
+            assert_eq!(check_buffer(va), Ok(()));
+        }
+        for va in [0, 8, 0x100_0800, TOP, TOP + PAGE_SIZE, !(PAGE_SIZE - 1)] {
+            assert_eq!(check_buffer(va), Err(Error::InvalidArgs));
+        }
     }
 }

@@ -7,9 +7,10 @@
 //! sched::resume; since every entry from EL0 starts over at the top of
 //! the kernel stack, the kernel never comes back to the test's frame. A
 //! program ends with `svc #SVC_DONE`: the test judges the thread, which
-//! leaves the scheduler; once every thread of the test has passed, or one
-//! has failed, the test prints its line and the next one starts. After
-//! the last one the run ends. The programs are in el0.S.
+//! leaves the scheduler; once every thread of the test has passed or
+//! ended as the test expects (`Fixture::ends`), or one has failed, the
+//! test prints its line and the next one starts. After the last one the
+//! run ends. The programs are in el0.S.
 
 use super::{check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
@@ -25,6 +26,7 @@ use kcore::esr;
 use kcore::frames::PAGE_SIZE;
 use kcore::layout::LINEAR_BASE;
 use kcore::paging::Attrs;
+use kcore::sched::State;
 use kcore::sync::Lock;
 use kcore::sysreg::SPSR_NZCV;
 
@@ -50,6 +52,15 @@ unsafe extern "C" {
     static el0_pattern_close: u8;
     static el0_pattern_object_info: u8;
     static el0_pattern_debug_write: u8;
+    static el0_wfi: u8;
+    static el0_kill: u8;
+    static el0_exit_process: u8;
+    static el0_create_then_exit: u8;
+    static el0_info_then_exit: u8;
+    static el0_start_and_close: u8;
+    static el0_buffer_mark: u8;
+    static el0_child_fault: u8;
+    static el0_start_then_close: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -60,14 +71,21 @@ pub const SVC_DONE: u16 = 0xFF01;
 
 const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_DONE <= *abi::TEST_CALLS.end());
 
-// el0.S makes these calls by number.
+// el0.S makes these calls by number and knows these values.
 const _: () = assert!(
     Call::HandleClose.number() == 1
+        && Call::ProcessCreate.number() == 12
+        && Call::ProcessKill.number() == 13
+        && Call::ProcessExit.number() == 14
+        && Call::ThreadCreate.number() == 15
+        && Call::ThreadStart.number() == 16
+        && Call::ThreadExit.number() == 17
         && Call::ThreadSetPriority.number() == 18
         && Call::Yield.number() == 19
         && Call::ObjectInfo.number() == 27
         && Call::DebugWrite.number() == 28
 );
+const _: () = assert!(DATA_VA == 0x80_0000 && INFO_PROCESS_STATE == 1 && Policy::Fifo as u8 == 1);
 
 /// The line `debug_write_from_el0` prints; xtask looks for it in the output.
 const EL0_LINE: &[u8] = b"debug_write from EL0 reaches the console\n";
@@ -112,9 +130,14 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_unknown,
     },
     El0Test {
-        name: "el0_load_from_kernel_memory_faults",
-        start: start_kernel_load,
-        done: done_kernel_load,
+        name: "el0_fault_ends_only_the_process",
+        start: start_fault,
+        done: done_fault,
+    },
+    El0Test {
+        name: "wfi_at_el0_is_a_fault",
+        start: start_wfi,
+        done: done_wfi,
     },
     El0Test {
         name: "registers_survive_a_timer_interrupt",
@@ -191,6 +214,56 @@ const EL0_TESTS: &[El0Test] = &[
         start: start_alternate,
         done: done_alternate,
     },
+    El0Test {
+        name: "child_fault_reason_reaches_the_parent",
+        start: start_child_fault,
+        done: done_child_fault,
+    },
+    El0Test {
+        name: "last_thread_exit_ends_the_process",
+        start: start_last_exit,
+        done: done_last_exit,
+    },
+    El0Test {
+        name: "process_exit_ends_the_process_with_its_code",
+        start: start_process_exit,
+        done: done_process_exit,
+    },
+    El0Test {
+        name: "process_kills_itself",
+        start: start_self_kill,
+        done: done_self_kill,
+    },
+    El0Test {
+        name: "closing_a_thread_handle_does_not_stop_it",
+        start: start_close_started,
+        done: done_close_started,
+    },
+    El0Test {
+        name: "exited_thread_gives_its_buffer_back",
+        start: start_keep_started,
+        done: done_keep_started,
+    },
+    El0Test {
+        name: "orphan_exit_frees_the_process",
+        start: start_orphan_exit,
+        done: done_orphan,
+    },
+    El0Test {
+        name: "orphan_fault_frees_the_process",
+        start: start_orphan_fault,
+        done: done_orphan,
+    },
+    El0Test {
+        name: "init_fault_stops_the_machine",
+        start: start_init_fault,
+        done: done_init_fault,
+    },
+    El0Test {
+        name: "init_exit_ends_the_run",
+        start: start_init_exit,
+        done: done_init_exit,
+    },
 ];
 
 /// Tests whose outcome depends on how much of a quantum is left when
@@ -233,10 +306,13 @@ struct Fixture {
     threads: [Option<NonNull<Thread>>; SLOTS],
     /// Threads that passed their `svc #SVC_DONE`.
     passed: [bool; SLOTS],
+    /// Threads that end without `svc #SVC_DONE` as the test expects: by a
+    /// fault, thread_exit, process_exit or a kill.
+    ends: [bool; SLOTS],
     patterns: [Pattern; SLOTS],
-    /// Handles to threads the test put in its processes' tables. A handle
-    /// to a thread of its own process would keep both alive; the teardown
-    /// closes them first.
+    /// Handles the test put in its process's table. A handle to the
+    /// process itself or one of its threads would keep both alive; the
+    /// teardown closes them first.
     handles: [Option<(NonNull<Process>, Handle)>; SLOTS],
     /// The physical address of the page whose words the threads of a
     /// scheduling test share (sched_process).
@@ -252,8 +328,9 @@ struct Fixture {
     idle_depth: Option<usize>,
     /// The counter before the thread started.
     counter: u64,
-    /// A kernel address the program loads from and must fault on.
-    fault_at: Option<u64>,
+    /// Whether the test expects a fault at EL0, which then ends the
+    /// faulting process as in a build without tests.
+    faults: bool,
     /// SP in the first test system call, and whether every later one had
     /// the same, near the top of the kernel stack.
     stack: Option<usize>,
@@ -275,6 +352,7 @@ impl Fixture {
             processes: [None; SLOTS],
             threads: [None; SLOTS],
             passed: [false; SLOTS],
+            ends: [false; SLOTS],
             patterns: [Pattern::ZERO; SLOTS],
             handles: [None; SLOTS],
             data: 0,
@@ -283,7 +361,7 @@ impl Fixture {
             idle: 0,
             idle_depth: None,
             counter: 0,
-            fault_at: None,
+            faults: false,
             stack: None,
             stack_ok: true,
             interrupts: 0,
@@ -328,7 +406,7 @@ fn start(first: usize) -> ! {
         match started {
             Ok((threads, wake)) => {
                 for t in threads.into_iter().skip(usize::from(wake)).flatten() {
-                    sched::start(t).expect("a new thread starts");
+                    thread::start(t).expect("a new thread starts");
                 }
                 sched::resume()
             }
@@ -424,7 +502,7 @@ pub fn timer_fired() {
         }
     };
     if let Some(t) = wake {
-        sched::start(t).expect("the waking thread starts");
+        thread::start(t).expect("the waking thread starts");
     }
 }
 
@@ -474,7 +552,7 @@ fn done(thread: NonNull<Thread>) -> ! {
         .and_then(|()| (test(f.test).done)(&f, t));
         let slot = f.slot(t);
         f.passed[slot] = result.is_ok();
-        let all = (0..SLOTS).all(|i| f.threads[i].is_none() || f.passed[i]);
+        let all = (0..SLOTS).all(|i| f.threads[i].is_none() || f.passed[i] || f.ends[i]);
         (result, all)
     };
     match result {
@@ -487,31 +565,23 @@ fn done(thread: NonNull<Thread>) -> ! {
     }
 }
 
-/// A fault at EL0: when the running test expects it, the test ends here;
-/// otherwise this returns and the kernel reports the fault.
-pub fn user_fault(thread: NonNull<Thread>, syndrome: u64, far: u64) {
-    let Some(target) = FIXTURE.lock().fault_at else {
-        return;
+/// Whether the running test expects a fault at EL0
+/// (exceptions::user_fault); any other stops the machine with its report.
+pub fn expects_fault() -> bool {
+    FIXTURE.lock().faults
+}
+
+/// Init's end (process::init_ended): the test judges the thread in slot 0,
+/// whose process is init, and ends. A build without tests stops the
+/// machine instead. An end of init through thread_exit is not tested: the
+/// reference thread::exit holds would stay.
+pub fn init_ended() -> ! {
+    let result = {
+        let f = FIXTURE.lock();
+        let t = f.threads[0].expect("init's thread in slot 0");
+        // SAFETY: the test holds a reference to its thread, which ended.
+        (test(f.test).done)(&f, unsafe { t.as_ref() })
     };
-    // SAFETY: the running thread is alive.
-    let elr = unsafe { thread.as_ref() }.regs.elr;
-    let result = check(
-        esr::ec(syndrome) == esr::EC_DABT_LOWER,
-        "the fault is not a data abort from EL0",
-    )
-    .and_then(|()| {
-        check(
-            esr::fault_status_name(syndrome) == "permission fault",
-            "the fault is not a permission fault",
-        )
-    })
-    .and_then(|()| check(far == target, "FAR is not the kernel address"))
-    .and_then(|()| {
-        check(
-            elr == user_address(&raw const el0_load) as u64,
-            "ELR is not the load",
-        )
-    });
     end(result)
 }
 
@@ -729,16 +799,70 @@ fn done_unknown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check_pattern(&t.regs, &f.patterns[0], &[Error::InvalidArgs as u64])
 }
 
-/// The program loads from FIXTURE itself, a kernel variable.
-fn start_kernel_load(f: &mut Fixture) -> Result<(), &'static str> {
-    let target = &raw const FIXTURE as u64;
-    f.fault_at = Some(target);
-    spawn(f, 0, &raw const el0_load, target)?;
-    Ok(())
+/// The program loads from FIXTURE itself, a kernel variable: the
+/// permission fault ends its process, with the fault as the reason, and
+/// nothing else. The judge, in a process of its own, runs afterwards.
+fn start_fault(f: &mut Fixture) -> Result<(), &'static str> {
+    f.faults = true;
+    spawn(f, 0, &raw const el0_load, &raw const FIXTURE as u64)?;
+    f.ends[0] = true;
+    judge(f, 1)
 }
 
-fn done_kernel_load(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
-    Err("a load from kernel memory at EL0 did not fault")
+fn done_fault(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        f.slot(t) == 1,
+        "a load from kernel memory at EL0 did not fault",
+    )?;
+    let ProcessState::Fault { esr, far, elr } = state(f, 0) else {
+        return Err("the process did not end with the fault");
+    };
+    check(
+        esr::ec(esr) == esr::EC_DABT_LOWER,
+        "the fault is not a data abort from EL0",
+    )?;
+    check(
+        esr::fault_status_name(esr) == "permission fault",
+        "the fault is not a permission fault",
+    )?;
+    check(
+        far == &raw const FIXTURE as u64,
+        "FAR is not the kernel address",
+    )?;
+    check(
+        elr == user_address(&raw const el0_load) as u64,
+        "ELR is not the load",
+    )?;
+    check(
+        slot_thread(f, 0).sched.state() == State::Dead,
+        "the faulting thread did not end",
+    )
+}
+
+/// WFI at EL0 traps (SCTLR_EL1.nTWI is clear) and is the program's fault.
+/// FAR_EL1 still holds the kernel address of the test before; the reason
+/// has FAR 0.
+fn start_wfi(f: &mut Fixture) -> Result<(), &'static str> {
+    f.faults = true;
+    spawn(f, 0, &raw const el0_wfi, 0)?;
+    f.ends[0] = true;
+    judge(f, 1)
+}
+
+fn done_wfi(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 1, "WFI at EL0 did not trap")?;
+    let ProcessState::Fault { esr, far, elr } = state(f, 0) else {
+        return Err("WFI did not end the process with a fault");
+    };
+    check(
+        esr::ec(esr) == esr::EC_WFX,
+        "the fault is not a trapped WFI",
+    )?;
+    check(far == 0, "a stale FAR went into the reason")?;
+    check(
+        elr == user_address(&raw const el0_wfi) as u64,
+        "ELR is not the WFI",
+    )
 }
 
 /// The end of the thread's quantum brings the timer's interrupt while the
@@ -965,9 +1089,22 @@ fn set_args(mut t: NonNull<Thread>, args: &[u64]) {
 /// A handle with MANAGE to thread `t` in the test's process; the teardown
 /// closes it.
 fn give_thread(f: &mut Fixture, t: NonNull<Thread>) -> Result<u64, &'static str> {
+    give_kept(f, Object::Thread(t))
+}
+
+/// A handle with MANAGE to the test's process in its own table; the
+/// teardown closes it.
+fn give_own(f: &mut Fixture) -> Result<u64, &'static str> {
     let p = f.processes[0].expect("the test's process");
-    let h = process::insert_handle(p, Object::Thread(t), Rights::MANAGE)
-        .map_err(|_| "a handle did not go in")?;
+    give_kept(f, Object::Process(p))
+}
+
+/// A handle with MANAGE to `object` in the table of the test's process,
+/// which the teardown closes.
+fn give_kept(f: &mut Fixture, object: Object) -> Result<u64, &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let h =
+        process::insert_handle(p, object, Rights::MANAGE).map_err(|_| "a handle did not go in")?;
     let slot = f
         .handles
         .iter()
@@ -1234,4 +1371,374 @@ fn done_rest(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         ),
         _ => check(shared(f, 1) == 1, "the peer ended before it was let"),
     }
+}
+
+// Process and thread tests. A thread that ends without `svc #SVC_DONE` is
+// marked in `Fixture::ends`; a judge below the test's other threads, in a
+// process of its own, runs once they are done.
+
+/// The judge's priority, below every other thread of a test.
+const JUDGE: u8 = PRIORITY - 5;
+/// Where the message buffer of a thread that a test program makes goes.
+const BUFFER_VA: usize = 0x100_0000;
+/// The entry of the child's thread in `child_fault_reason_reaches_the_parent`:
+/// no page of the child maps it.
+const CHILD_ENTRY: u64 = 0x1000;
+/// That thread's message buffer.
+const CHILD_BUFFER: u64 = 0x2000;
+/// The exit code of `process_exit_ends_the_process_with_its_code`.
+const EXIT_CODE: u64 = 0x5EED_C0DE;
+
+/// The judge: a thread of its own process in slot `slot` that ends at
+/// once, below the test's other threads.
+fn judge(f: &mut Fixture, slot: usize) -> Result<(), &'static str> {
+    let t = spawn(f, slot, &raw const el0_done_at_once, 0)?;
+    sched::set_priority(t, JUDGE, FIFO).map_err(|_| "no judge")
+}
+
+/// How the process in slot `slot` lives, or why it ended.
+fn state(f: &Fixture, slot: usize) -> ProcessState {
+    let p = f.processes[slot].expect("a process of the test");
+    // SAFETY: the test holds a reference to its process.
+    unsafe { p.as_ref() }.state()
+}
+
+/// The thread in slot `slot`, which does not run now.
+fn slot_thread(f: &Fixture, slot: usize) -> &Thread {
+    let t = f.threads[slot].expect("a thread of the test");
+    // SAFETY: the test holds a reference to its thread.
+    unsafe { t.as_ref() }
+}
+
+/// The ready thread in slot `slot` ended with its process and never ran:
+/// it is still at el0_mark's first instruction.
+fn never_ran(f: &Fixture, slot: usize) -> Result<(), &'static str> {
+    let t = slot_thread(f, slot);
+    check(
+        t.sched.state() == State::Dead && t.regs.elr == user_address(&raw const el0_mark) as u64,
+        "a ready thread of the ended process ran",
+    )
+}
+
+/// The parent, a program, makes an empty child process and a thread in it
+/// above itself whose entry maps nothing, and starts it: the thread runs at
+/// once and faults, which ends the child, and object_info tells the parent
+/// why (spec 15.2, «Сбои»).
+fn start_child_fault(f: &mut Fixture) -> Result<(), &'static str> {
+    f.faults = true;
+    let parent = spawn(f, 0, &raw const el0_child_fault, 0)?;
+    set_args(
+        parent,
+        &[30, CHILD_ENTRY, u64::from(PRIORITY + 10), CHILD_BUFFER],
+    );
+    Ok(())
+}
+
+fn done_child_fault(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let x = &t.regs.x;
+    check(x[0] == 0, "a call of the parent failed")?;
+    let Some(ProcessState::Fault { esr, far, elr }) =
+        ProcessState::from_words([x[1], x[2], x[3], x[4]])
+    else {
+        return Err("object_info does not report the child's fault");
+    };
+    check(
+        esr::ec(esr) == esr::EC_IABT_LOWER && esr::fault_status_name(esr) == "translation fault",
+        "the child's fault is not a translation fault of an instruction fetch",
+    )?;
+    check(
+        far == CHILD_ENTRY && elr == CHILD_ENTRY,
+        "FAR and ELR are not the entry of the child's thread",
+    )?;
+    let p = f.processes[0].expect("the parent's process");
+    // SAFETY: the test holds a reference to the parent's process.
+    let parent = unsafe { p.as_ref() };
+    let (Ok(child), Ok(thread)) = (
+        parent.lookup(Handle(x[23]), Rights::NONE, Object::process),
+        parent.lookup(Handle(x[24]), Rights::NONE, Object::thread),
+    ) else {
+        return Err("the parent's handles do not name the child and its thread");
+    };
+    // SAFETY: the parent's handle holds the thread.
+    let ended = unsafe { thread.as_ref() }.sched.state() == State::Dead;
+    check(ended, "the child's thread did not end")?;
+    check(
+        process::translate(child, CHILD_BUFFER as usize).is_none(),
+        "the child's address space outlived it",
+    )
+}
+
+/// Two started threads of one process exit, and the process ends with
+/// code 0 at the second. A third, which the first makes and never starts,
+/// does not keep it alive and goes with it. The second asks for the
+/// process's state before it exits: the process lived.
+fn start_last_exit(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let first = sched_thread(f, 0, &raw const el0_create_then_exit, PRIORITY + 2, FIFO)?;
+    let second = sched_thread(f, 1, &raw const el0_info_then_exit, PRIORITY + 1, FIFO)?;
+    let own = give_own(f)?;
+    let entry = user_address(&raw const el0_done_at_once) as u64;
+    let stack = (DATA_VA + PAGE) as u64;
+    let priority = u64::from(PRIORITY);
+    set_args(
+        first,
+        &[
+            own,
+            entry,
+            stack,
+            0,
+            priority,
+            FIFO as u64,
+            BUFFER_VA as u64,
+        ],
+    );
+    set_args(second, &[own, INFO_PROCESS_STATE, 0]);
+    f.ends = [true, true, false];
+    judge(f, 2)
+}
+
+fn done_last_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 2, "thread_exit returned")?;
+    check(
+        state(f, 0) == ProcessState::Exited { code: 0 },
+        "the last thread's exit did not end the process with code 0",
+    )?;
+    check(slot_thread(f, 0).regs.x[0] == 0, "thread_create failed")?;
+    check(
+        slot_thread(f, 1).regs.x[..5] == [0, 0, 0, 0, 0],
+        "the process ended before its last started thread",
+    )?;
+    check(
+        thread::in_use() == SLOTS,
+        "the stopped thread outlived its process",
+    )
+}
+
+/// A thread ends its process with a code; a ready thread of the process
+/// below it never runs.
+fn start_process_exit(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let exit = sched_thread(f, 0, &raw const el0_exit_process, PRIORITY + 1, FIFO)?;
+    let ready = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    set_args(exit, &[EXIT_CODE]);
+    set_args(ready, &[word(0)]);
+    f.ends = [true, true, false];
+    judge(f, 2)
+}
+
+fn done_process_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 2, "a thread of the ended process ran on")?;
+    check(
+        state(f, 0) == ProcessState::Exited { code: EXIT_CODE },
+        "the process did not end with its code",
+    )?;
+    never_ran(f, 1)
+}
+
+/// A thread kills its own process: the call never returns, and its x0
+/// keeps the handle. A ready thread of the process below it never runs.
+fn start_self_kill(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let kill = sched_thread(f, 0, &raw const el0_kill, PRIORITY + 1, FIFO)?;
+    let ready = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
+    let own = give_own(f)?;
+    set_args(kill, &[own]);
+    set_args(ready, &[word(0)]);
+    f.ends = [true, true, false];
+    judge(f, 2)
+}
+
+fn done_self_kill(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 2, "process_kill of its own process returned")?;
+    check(
+        state(f, 0) == ProcessState::Killed,
+        "the process did not end killed",
+    )?;
+    let own = f.handles[0].map(|(_, h)| h.0);
+    check(
+        Some(slot_thread(f, 0).regs.x[0]) == own,
+        "process_kill of its own process wrote a result",
+    )?;
+    never_ran(f, 1)
+}
+
+/// A program makes a thread below itself in its own process, starts it
+/// and closes the only handle to it. The thread runs all the same once the
+/// program is done, finds its message buffer zeroed and writable, and
+/// exits: it goes with the kernel's reference, and its buffer's page with
+/// it. The process lives on; the judge is a thread of it.
+fn start_close_started(f: &mut Fixture) -> Result<(), &'static str> {
+    start_maker(f, true)
+}
+
+fn done_close_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 0 {
+        return check(
+            t.regs.x[0] == 0,
+            "thread_create, thread_start or handle_close failed",
+        );
+    }
+    check(
+        thread::in_use() == 2,
+        "the thread outlived its exit and its last handle",
+    )?;
+    made_thread_exited(f)
+}
+
+/// The same with the handle kept: the thread that exited stays as a shell,
+/// and its buffer's page goes at its exit. The judge closes the handle
+/// afterwards: a process's handle to its own thread keeps both until the
+/// process ends.
+fn start_keep_started(f: &mut Fixture) -> Result<(), &'static str> {
+    start_maker(f, false)
+}
+
+fn done_keep_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 0 {
+        return check(t.regs.x[0] == 0, "thread_create or thread_start failed");
+    }
+    let p = f.processes[0].expect("the test's process");
+    let h = Handle(slot_thread(f, 0).regs.x[19]);
+    // SAFETY: the test holds a reference to its process.
+    let made = unsafe { p.as_ref() }.lookup(h, Rights::NONE, Object::thread);
+    // SAFETY: the handle holds the thread.
+    let ended = made.is_ok_and(|m| unsafe { m.as_ref() }.sched.state() == State::Dead);
+    let result = check(ended, "the handle does not keep the thread that exited")
+        .and_then(|()| made_thread_exited(f));
+    let closed = process::close_handle(p, h);
+    result?;
+    check(closed.is_ok(), "the handle to the thread did not close")
+}
+
+/// The maker in slot 0 of the test's process and the judge in slot 1. The
+/// maker makes a thread below itself that runs el0_buffer_mark with its
+/// buffer at BUFFER_VA, starts it, and closes its handle when `close`.
+fn start_maker(f: &mut Fixture, close: bool) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let maker = sched_thread(f, 0, &raw const el0_start_and_close, PRIORITY, FIFO)?;
+    sched_thread(f, 1, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    let own = give_own(f)?;
+    let entry = user_address(&raw const el0_buffer_mark) as u64;
+    let stack = (DATA_VA + PAGE) as u64;
+    let buffer = BUFFER_VA as u64;
+    let priority = u64::from(PRIORITY - 2);
+    let fifo = FIFO as u64;
+    set_args(
+        maker,
+        &[
+            own,
+            entry,
+            stack,
+            buffer,
+            priority,
+            fifo,
+            buffer,
+            u64::from(close),
+        ],
+    );
+    Ok(())
+}
+
+/// The maker's thread ran, found its buffer zeroed and writable, and
+/// exited: its buffer's page is gone, and the process lives on.
+fn made_thread_exited(f: &Fixture) -> Result<(), &'static str> {
+    check(
+        shared(f, 0) == 1,
+        "the thread did not run, or its buffer was not a fresh page",
+    )?;
+    let p = f.processes[0].expect("the test's process");
+    check(
+        process::translate(p, BUFFER_VA).is_none(),
+        "the thread's buffer outlived its exit",
+    )?;
+    check(
+        state(f, 0) == ProcessState::Alive,
+        "the exit of one thread ended its process",
+    )
+}
+
+/// A fault of init stops the machine (spec 7.9). In test builds the end
+/// comes to the test (init_ended), which judges init's thread in slot 0;
+/// the judge in slot 1 runs only when that does not happen.
+fn start_init_fault(f: &mut Fixture) -> Result<(), &'static str> {
+    f.faults = true;
+    spawn(f, 0, &raw const el0_wfi, 0)?;
+    f.ends[0] = true;
+    judge(f, 1)?;
+    process::set_init(f.processes[0].expect("init's process"));
+    Ok(())
+}
+
+fn done_init_fault(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 0, "init's fault did not stop the machine")?;
+    let ProcessState::Fault { esr, .. } = state(f, 0) else {
+        return Err("init did not end with its fault");
+    };
+    check(esr::ec(esr) == esr::EC_WFX, "init's fault is not the WFI")
+}
+
+/// Init's exit ends the run (spec 7.9), with its code.
+fn start_init_exit(f: &mut Fixture) -> Result<(), &'static str> {
+    let t = spawn(f, 0, &raw const el0_exit_process, 0)?;
+    set_args(t, &[7]);
+    f.ends[0] = true;
+    judge(f, 1)?;
+    process::set_init(f.processes[0].expect("init's process"));
+    Ok(())
+}
+
+fn done_init_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 0, "init's exit did not end the run")?;
+    check(
+        state(f, 0) == ProcessState::Exited { code: 7 },
+        "init did not exit with its code",
+    )
+}
+
+/// A child process that only its one started thread holds: the maker in
+/// slot 0 starts the thread and closes both handles; the thread exits or
+/// faults, and the child's last reference goes inside its own end.
+fn start_orphan(f: &mut Fixture, entry: u64) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let maker = sched_thread(f, 0, &raw const el0_start_then_close, PRIORITY, FIFO)?;
+    sched_thread(f, 1, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    new_process(f, 2)?;
+    let child = f.processes[2].take().expect("the child");
+    let t = thread::create(child, entry as usize, 0, 0, PRIORITY - 1, FIFO);
+    let p = f.processes[0].expect("the test's process");
+    let handles = t.ok().map(|t| {
+        let ht = process::insert_handle(p, Object::Thread(t), Rights::MANAGE);
+        // SAFETY: the reference `create` handed out goes.
+        unsafe { thread::release(t) };
+        ht
+    });
+    let hc = process::insert_handle(p, Object::Process(child), Rights::MANAGE);
+    // SAFETY: as above.
+    unsafe { process::release(child) };
+    match (handles, hc) {
+        (Some(Ok(ht)), Ok(hc)) => {
+            set_args(maker, &[ht.0, hc.0]);
+            Ok(())
+        }
+        _ => Err("no child"),
+    }
+}
+
+fn start_orphan_exit(f: &mut Fixture) -> Result<(), &'static str> {
+    start_orphan(f, user_address(&raw const el0_create_then_exit) as u64)
+}
+
+fn start_orphan_fault(f: &mut Fixture) -> Result<(), &'static str> {
+    f.faults = true;
+    start_orphan(f, CHILD_ENTRY)
+}
+
+fn done_orphan(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 0 {
+        return check(t.regs.x[0] == 0, "thread_start or handle_close failed");
+    }
+    check(
+        process::in_use() == 1 && thread::in_use() == 2,
+        "the orphan process or its thread stayed, or went twice",
+    )
 }

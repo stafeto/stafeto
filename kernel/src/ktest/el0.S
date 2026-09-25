@@ -12,6 +12,12 @@
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
 .equ SVC_UNKNOWN, 0xFFFF                // no build knows this number
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
+.equ CALL_PROCESS_CREATE, 12            // abi::Call::ProcessCreate
+.equ CALL_PROCESS_KILL, 13              // abi::Call::ProcessKill
+.equ CALL_PROCESS_EXIT, 14              // abi::Call::ProcessExit
+.equ CALL_THREAD_CREATE, 15             // abi::Call::ThreadCreate
+.equ CALL_THREAD_START, 16              // abi::Call::ThreadStart
+.equ CALL_THREAD_EXIT, 17               // abi::Call::ThreadExit
 .equ CALL_THREAD_SET_PRIORITY, 18       // abi::Call::ThreadSetPriority
 .equ CALL_YIELD, 19                     // abi::Call::Yield
 .equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
@@ -22,6 +28,9 @@
 .equ P_FPCR, 272
 .equ P_FPSR, 280
 .equ P_V, 288
+.equ DATA_VA, 0x800000                  // ktest::el0::DATA_VA
+.equ INFO_PROCESS_STATE, 1              // abi::INFO_PROCESS_STATE
+.equ FIFO, 1                            // abi::Policy::Fifo
 
 .arch_extension fp
 .arch_extension simd
@@ -257,5 +266,125 @@ el0_alternate:
     cmp     x9, x2
     b.lo    1b
     svc     #SVC_DONE
+
+// Process and thread tests (ktest::el0). A call that must not return is
+// followed by `svc #SVC_DONE`, where the kernel fails the test.
+
+// WFI traps at EL0 (SCTLR_EL1.nTWI is clear): the program's fault.
+.global el0_wfi
+el0_wfi:
+    wfi
+    svc     #SVC_DONE
+
+// process_kill with the handle in x0.
+.global el0_kill
+el0_kill:
+    svc     #CALL_PROCESS_KILL
+    svc     #SVC_DONE
+
+// process_exit with the code in x0.
+.global el0_exit_process
+el0_exit_process:
+    svc     #CALL_PROCESS_EXIT
+    svc     #SVC_DONE
+
+// thread_create with the arguments in x0-x6, then thread_exit: the new
+// thread stays stopped.
+.global el0_create_then_exit
+el0_create_then_exit:
+    svc     #CALL_THREAD_CREATE
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// object_info with the arguments in x0-x2, then thread_exit.
+.global el0_info_then_exit
+el0_info_then_exit:
+    svc     #CALL_OBJECT_INFO
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// thread_create with the arguments in x0-x6 and thread_start of the new
+// thread; then, when x7 is not 0, handle_close of its handle. Ends with
+// the last call's x0 and the handle in x19.
+.global el0_start_and_close
+el0_start_and_close:
+    svc     #CALL_THREAD_CREATE
+    cbnz    x0, 1f
+    mov     x19, x1
+    mov     x0, x19
+    svc     #CALL_THREAD_START
+    cbnz    x0, 1f
+    cbz     x7, 1f
+    mov     x0, x19
+    svc     #CALL_HANDLE_CLOSE
+1:  svc     #SVC_DONE
+
+// The thread el0_start_and_close makes: adds 1 to the first word of its
+// message buffer, at x0, and stores the word in word 0 of the shared page,
+// so that word holds 1 when the buffer read as zero and took the write;
+// then exits.
+.global el0_buffer_mark
+el0_buffer_mark:
+    ldr     x1, [x0]
+    add     x1, x1, #1
+    str     x1, [x0]
+    ldr     x1, [x0]
+    mov     x2, #DATA_VA
+    str     x1, [x2]
+    svc     #CALL_THREAD_EXIT
+
+// A parent. x0: the child's priority ceiling; x1: the entry of the
+// child's thread; x2: that thread's priority; x3: its message buffer.
+// process_create(4096, 16, x0, 0, 0), thread_create(child, x1, 0, 0, x2,
+// FIFO, x3), thread_start, then object_info(child, PROCESS_STATE). Ends
+// with the last call's x0-x4, the child's handle in x23 and its thread's
+// in x24.
+.global el0_child_fault
+el0_child_fault:
+    mov     x19, x0
+    mov     x20, x1
+    mov     x21, x2
+    mov     x22, x3
+    mov     x0, #4096
+    mov     x1, #16
+    mov     x2, x19
+    mov     x3, #0
+    mov     x4, #0
+    svc     #CALL_PROCESS_CREATE
+    cbnz    x0, 1f
+    mov     x23, x1
+    mov     x0, x23
+    mov     x1, x20
+    mov     x2, #0
+    mov     x3, #0
+    mov     x4, x21
+    mov     x5, #FIFO
+    mov     x6, x22
+    svc     #CALL_THREAD_CREATE
+    cbnz    x0, 1f
+    mov     x24, x1
+    mov     x0, x24
+    svc     #CALL_THREAD_START
+    cbnz    x0, 1f
+    mov     x0, x23
+    mov     x1, #INFO_PROCESS_STATE
+    mov     x2, #0
+    svc     #CALL_OBJECT_INFO
+1:  svc     #SVC_DONE
+
+// thread_start of the thread in x0, then handle_close of x0 and of x1.
+// Ends with the last call's x0.
+.global el0_start_then_close
+el0_start_then_close:
+    mov     x19, x0
+    mov     x20, x1
+    svc     #CALL_THREAD_START
+    cbnz    x0, 1f
+    mov     x0, x19
+    svc     #CALL_HANDLE_CLOSE
+    cbnz    x0, 1f
+    mov     x0, x20
+    svc     #CALL_HANDLE_CLOSE
+1:  svc     #SVC_DONE
 
 el0_programs_end:

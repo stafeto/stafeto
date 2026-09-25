@@ -177,6 +177,18 @@ const TESTS: &[(&str, TestFn)] = &[
         "thread_set_priority_checks_its_arguments",
         calls::thread_set_priority_checks_its_arguments,
     ),
+    (
+        "process_create_checks_its_arguments",
+        calls::process_create_checks_its_arguments,
+    ),
+    (
+        "thread_create_checks_its_arguments",
+        calls::thread_create_checks_its_arguments,
+    ),
+    (
+        "process_kill_ends_threads_in_every_state",
+        calls::process_kill_ends_threads_in_every_state,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.

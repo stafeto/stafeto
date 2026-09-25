@@ -55,13 +55,6 @@ impl Object {
 }
 
 /// Adds the reference a new handle holds.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "init's handles and thread_create (milestone 1.2c) make handles; so far only the kernel tests do"
-    )
-)]
 pub fn retain(object: Object) {
     match object {
         Object::Process(p) => process::retain(p),

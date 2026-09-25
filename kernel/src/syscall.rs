@@ -8,19 +8,25 @@
 //! bad arguments fails the same way each time: values that need no lookup
 //! (INVALID_ARGS); handles in the order of the arguments (BAD_HANDLE, then
 //! WRONG_TYPE, then ACCESS_DENIED for missing rights); priority ceilings
-//! (ACCESS_DENIED); the state of objects (BAD_STATE); resources
-//! (NO_MEMORY, LIMIT_REACHED). The kernel never reads or writes memory of
-//! a program through an address it is given: addresses are only numbers
-//! to check. Test builds also know numbers of their own, in
+//! (ACCESS_DENIED); the state of objects (BAD_STATE); values checked
+//! against an object, such as a page that is mapped already
+//! (INVALID_ARGS); resources (NO_MEMORY, LIMIT_REACHED). The kernel never
+//! reads or writes memory of a program through an address it is given:
+//! addresses are only numbers to check. A call that ends its caller
+//! (thread_exit, process_exit, process_kill of its own process) never
+//! returns: it leaves through sched::resume, and the caller's registers
+//! keep the arguments. Test builds also know numbers of their own, in
 //! abi::TEST_CALLS.
 
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::sched;
-use crate::thread::Thread;
-use abi::{Call, Error, Handle, Rights};
+use crate::thread::{self, Thread};
+use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
 use core::ptr::NonNull;
-use kcore::sched::{policy_arg, priority_arg, under_ceilings};
+use kcore::process::{handle_limit_arg, quota_arg};
+use kcore::sched::{notify_priority_arg, policy_arg, priority_arg, under_ceilings};
+use kcore::thread::{check_buffer, check_start};
 
 /// A call's arguments: x0-x9 of the thread that made it.
 type Args = [u64; 10];
@@ -62,6 +68,12 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     args.copy_from_slice(&unsafe { thread.as_ref() }.regs.x[..10]);
     let result = match Call::from_number(number) {
         Some(Call::HandleClose) => handle_close(thread, &args),
+        Some(Call::ProcessCreate) => process_create(thread, &args),
+        Some(Call::ProcessKill) => process_kill(thread, &args),
+        Some(Call::ProcessExit) => process_exit(thread, &args),
+        Some(Call::ThreadCreate) => thread_create(thread, &args),
+        Some(Call::ThreadStart) => thread_start(thread, &args),
+        Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::Yield) => yield_now(),
         Some(Call::ObjectInfo) => object_info(thread, &args),
@@ -111,6 +123,118 @@ fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// The priority ceiling of the caller's process.
+fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
+    // SAFETY: the calling thread holds its process.
+    unsafe { caller(thread).as_ref() }.ceiling()
+}
+
+/// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
+/// x3 exit channel, x4 notification priority): a new process with an empty
+/// address space and handle table; x1 returns a handle to it with
+/// DUPLICATE, TRANSFER and MANAGE (report 4.1). The quota is whole pages,
+/// at least one, and counts from milestone 1.3; the limit 1-16384; the
+/// ceiling 1-63 and no higher than the caller's (ACCESS_DENIED). Exit
+/// channels come in milestone 1.3: x3 is 0, and x4 with it; any other x3
+/// is looked up as a channel and fails (BAD_HANDLE, WRONG_TYPE).
+fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    quota_arg(a[0])?;
+    let limit = handle_limit_arg(a[1])?;
+    let ceiling = priority_arg(a[2])?;
+    let channel = a[3] != 0;
+    let notify = notify_priority_arg(a[4], channel)?;
+    if channel {
+        // No object is a channel before milestone 1.3.
+        lookup(thread, a[3], Rights::NOTIFY, |_| None::<()>)?;
+    }
+    let own = caller_ceiling(thread);
+    under_ceilings(ceiling, &[own])?;
+    under_ceilings(notify, &[own])?;
+    let child = process::create(limit, ceiling)?;
+    let h = process::insert_handle(caller(thread), Object::Process(child), OWNER_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the child.
+    unsafe { process::release(child) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// process_kill(x0 process with MANAGE): the process ends, reason
+/// «killed» (report 3.2, 3.4): its threads stop in whatever state they
+/// are, and what it holds goes. A process that ended already: 0. Killing
+/// the caller's own process never returns.
+fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
+    let own = target == caller(thread);
+    // SAFETY: the handle holds the process; the end takes its own
+    // reference before the table that holds the handle may go.
+    unsafe { process::end(target, ProcessState::Killed) };
+    if own {
+        // The caller ended with its process and may be gone.
+        sched::resume()
+    }
+    Ok(Values::NONE)
+}
+
+/// process_exit(x0 code): the caller's process ends with `code`. Never
+/// returns.
+fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
+    // SAFETY: the calling thread holds its process until the end takes
+    // its own reference.
+    unsafe { process::end(caller(thread), ProcessState::Exited { code: a[0] }) };
+    sched::resume()
+}
+
+/// thread_create(x0 process with MANAGE, x1 entry, x2 stack, x3 argument,
+/// x4 priority, x5 policy, x6 message buffer address): a stopped thread in
+/// the process with its message buffer mapped at x6; x1 returns a handle
+/// to it with DUPLICATE, TRANSFER and MANAGE. The entry is in the lower
+/// half and 4-byte aligned, the stack no higher than its top and 16-byte
+/// aligned, the buffer a whole page there (INVALID_ARGS); the priority no
+/// higher than the ceiling of the process nor than the caller's
+/// (ACCESS_DENIED); the process has not ended (BAD_STATE); the buffer's
+/// page is free there (INVALID_ARGS).
+fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let priority = priority_arg(a[4])?;
+    let policy = policy_arg(a[5])?;
+    check_start(a[1], a[2], priority)?;
+    check_buffer(a[6])?;
+    let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
+    // SAFETY: the handle holds the target process.
+    let target_ceiling = unsafe { target.as_ref() }.ceiling();
+    under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
+    process::check_alive(target)?;
+    let buffer = a[6] as usize;
+    if process::translate(target, buffer).is_some() {
+        return Err(Error::InvalidArgs);
+    }
+    let t = thread::create(target, a[1] as usize, a[2] as usize, a[3], priority, policy)?;
+    let h = thread::give_buffer(t, buffer)
+        .and_then(|()| process::insert_handle(caller(thread), Object::Thread(t), OWNER_RIGHTS));
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the thread, and without it the thread goes with its
+    // buffer.
+    unsafe { thread::release(t) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// thread_start(x0 thread with MANAGE): the stopped thread becomes ready
+/// at the tail of its level; above the caller, it runs before the call
+/// returns. BAD_STATE for a thread that started before or whose process
+/// has ended.
+fn thread_start(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let t = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
+    thread::start(t)?;
+    Ok(Values::NONE)
+}
+
+/// thread_exit(): the caller ends; the last started thread of a process
+/// ends the process with code 0. Never returns.
+fn thread_exit(thread: NonNull<Thread>) -> ! {
+    // SAFETY: the running thread made the call and is not used afterwards.
+    unsafe { thread::exit(thread) };
+    sched::resume()
+}
+
 /// thread_set_priority(x0 thread with MANAGE, x1 priority 1-63, x2
 /// policy): the thread's base priority and policy change. The priority is
 /// no higher than the ceiling of the thread's process nor than the
@@ -123,15 +247,9 @@ fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     let priority = priority_arg(a[1])?;
     let policy = policy_arg(a[2])?;
     let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
-    // SAFETY: the handle holds the target thread, which holds its process;
-    // the calling thread holds its own.
-    let ceilings = unsafe {
-        [
-            target.as_ref().process().as_ref().ceiling(),
-            caller(thread).as_ref().ceiling(),
-        ]
-    };
-    under_ceilings(priority, &ceilings)?;
+    // SAFETY: the handle holds the target thread, which holds its process.
+    let target_ceiling = unsafe { target.as_ref().process().as_ref() }.ceiling();
+    under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
     sched::set_priority(target, priority, policy)?;
     Ok(Values::NONE)
 }

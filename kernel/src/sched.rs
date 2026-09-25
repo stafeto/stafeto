@@ -60,14 +60,8 @@ pub fn init(clock: Clock) {
 
 /// A stopped thread becomes ready: the tail of its level with a new
 /// quantum. The kernel takes a reference to it, which `exit` drops.
-/// BAD_STATE for a thread that started before.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "thread_start and init (milestone 1.2c) start threads; so far only the kernel tests do"
-    )
-)]
+/// BAD_STATE for a thread that started before. thread::start comes here,
+/// once it knows the thread's process lives.
 pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to `t`; the one taken below keeps
     // it alive, and a pool object never moves, until `exit`.
@@ -84,13 +78,6 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 /// # Safety
 /// `t` is alive. When the kernel's reference is its last, `t` goes here,
 /// and the caller does not use it afterwards.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "thread_exit and process_kill (milestone 1.2c) end threads; so far only the kernel tests do"
-    )
-)]
 pub unsafe fn exit(t: NonNull<Thread>) {
     let held = {
         let mut g = SCHED.lock();

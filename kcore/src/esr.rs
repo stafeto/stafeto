@@ -4,12 +4,17 @@
 //! Decoding of ESR_EL1, the exception syndrome register.
 
 pub const EC_UNKNOWN: u8 = 0x00;
+pub const EC_WFX: u8 = 0x01;
 pub const EC_SVC64: u8 = 0x15;
 pub const EC_IABT_LOWER: u8 = 0x20;
 pub const EC_IABT_SAME: u8 = 0x21;
+pub const EC_PC_ALIGN: u8 = 0x22;
 pub const EC_DABT_LOWER: u8 = 0x24;
 pub const EC_DABT_SAME: u8 = 0x25;
 pub const EC_BRK64: u8 = 0x3C;
+
+/// FnV, ISS bit 10 of an abort: FAR_EL1 is not valid.
+pub const ISS_FNV: u64 = 1 << 10;
 
 /// Immediate of the BRK that kernel tests use to prove the exception return path.
 pub const TEST_BRK: u16 = 0x51;
@@ -49,6 +54,18 @@ pub fn class_name(ec: u8) -> &'static str {
         0x2F => "SError",
         0x3C => "BRK",
         _ => "other",
+    }
+}
+
+/// FAR_EL1 as the reason of a fault at EL0 keeps it (spec 7.9): the
+/// faulting address of an instruction or data abort from EL0 whose FnV is
+/// clear, and of a misaligned PC; 0 for every other class, whose FAR is
+/// left over from an earlier fault, maybe of another process [G22].
+pub fn fault_address(esr: u64, far: u64) -> u64 {
+    match ec(esr) {
+        EC_IABT_LOWER | EC_DABT_LOWER if esr & ISS_FNV == 0 => far,
+        EC_PC_ALIGN => far,
+        _ => 0,
     }
 }
 
@@ -142,6 +159,24 @@ mod tests {
     fn normal_build_never_skips_brk() {
         assert_eq!(kernel_brk_action(TEST_BRK, false), BrkAction::Panic);
         assert_eq!(kernel_brk_action(1, false), BrkAction::Panic);
+    }
+
+    #[test]
+    fn far_is_kept_only_where_it_is_valid() {
+        let far = 0xFFFF_0000_4000_1000;
+        // Data abort from EL0, permission fault at level 3.
+        let dabt = (0x24 << 26) | IL | 0x0F;
+        assert_eq!(fault_address(dabt, far), far);
+        assert_eq!(fault_address(dabt | ISS_FNV, far), 0);
+        // Instruction abort from EL0, translation fault at level 0.
+        let iabt = (0x20 << 26) | IL | 0x04;
+        assert_eq!(fault_address(iabt, far), far);
+        assert_eq!(fault_address(iabt | ISS_FNV, far), 0);
+        assert_eq!(fault_address((0x22 << 26) | IL, far), far);
+        // WFI, an undefined instruction, SP alignment, a BRK: FAR is stale.
+        for class in [0x01, 0x00, 0x26, 0x3C, 0x15] {
+            assert_eq!(fault_address((class << 26) | IL, far), 0);
+        }
     }
 
     #[test]
