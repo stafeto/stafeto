@@ -638,7 +638,7 @@ fn new_thread_cases(c: &Caller, low: NonNull<Process>, h: Handle) -> Result<(), 
 }
 
 /// process_kill ends a process whatever state its threads are in: a ready
-/// thread leaves the queue, a stopped one ends where it is (report 3.2).
+/// thread leaves the queue, a stopped one ends where it is (spec 11).
 /// The process's space and its threads' buffers go at once; handles keep
 /// the shells, and object_info reports «killed». Killing it again
 /// succeeds; thread_start, thread_create and thread_set_priority find it

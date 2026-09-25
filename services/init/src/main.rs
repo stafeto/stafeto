@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! init, the first program (spec 13.4), as milestone 1.2c has it (report
-//! 5.3): it prints from EL0, starts two round-robin threads at one level,
-//! which take turns as their quanta end, waits for them and exits; its exit
+//! init, the first program (spec 13.4), as milestone 1.2c has it: it
+//! prints from EL0, starts two round-robin threads at one level, which
+//! take turns as their quanta end, waits for them and exits; its exit
 //! turns the machine off. Nothing to wait on exists in 1.2c, so init waits
 //! by priority: it lowers itself below the threads and runs again only
 //! once both have ended.

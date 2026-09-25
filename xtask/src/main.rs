@@ -14,7 +14,8 @@ use std::time::Duration;
 const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
 /// Spec 14: programs, which run at EL0, are built for this target.
 const PROGRAM_TARGET: &str = "aarch64-unknown-none";
-/// The stack of init's first thread, in bytes (report 5.2; the size is ours).
+/// The stack of init's first thread, in bytes, which init's program asks
+/// the kernel for (lib/bootimg); the size is ours.
 const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// Spec 3.4: the kernel image file stays under 200 KB.
 const KERNEL_LIMIT: u64 = 200 * 1024;
@@ -500,7 +501,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
 /// fault and init's registers, panics with the fault, and the machine
 /// powers off. The cases: a load through a null pointer; a store to init's
 /// read-only data and a branch into it, which its protection forbids
-/// (report 5.2).
+/// (spec 3.3).
 fn init_fault_stops_the_machine() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let path = root().join("target").join("fault-init.img");

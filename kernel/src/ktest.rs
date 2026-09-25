@@ -656,7 +656,7 @@ fn past_deadline_fires_at_once(_: &Boot) -> Result<(), &'static str> {
     timer::disarm();
     gic::end(ack);
     // An upper bound on time holds only where time counts instructions:
-    // elsewhere a stall of the host could take longer (report 7.1).
+    // elsewhere a stall of the host could take longer.
     if cfg!(feature = "icount") {
         check(
             waited < 1_000_000,

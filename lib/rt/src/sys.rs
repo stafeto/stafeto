@@ -5,9 +5,9 @@
 //! arguments in x0-x9; on success x0 is 0 and the values follow from x1,
 //! on an error x0 alone holds the code. Every call is said to change
 //! x0-x9, so that a later kernel may return more values; the kernel keeps
-//! every other register (report 6.1). `raw` makes any call with any
-//! registers, for tests that hand the kernel bad ones; the functions after
-//! it are the typed calls of milestone 1.2c.
+//! every other register. `raw` makes any call with any registers, for
+//! tests that hand the kernel bad ones; the functions after it are the
+//! typed calls of milestone 1.2c.
 
 use abi::{Call, Error, Handle, Policy, ProcessState};
 use core::arch::asm;

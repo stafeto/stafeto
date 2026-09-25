@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Output through debug_write (report 6.2). A program sets its handle to
+//! Output through debug_write (spec 11). A program sets its handle to
 //! the system resource with DEBUG once (`set`); `write`, `write_fmt`,
 //! `print!` and `println!` then send what they get in pieces of at most
 //! abi::INLINE_MAX bytes, one call per piece. A line of up to 64 bytes,

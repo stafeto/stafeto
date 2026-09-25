@@ -24,7 +24,7 @@ pub fn check_start(entry: u64, stack: u64, priority: u8) -> Result<(), Error> {
     }
 }
 
-/// Checks where a thread's message buffer goes (report 4.1): a whole page
+/// Checks where a thread's message buffer goes (spec 11): a whole page
 /// in the lower half, other than page 0, which stays unmapped so that a
 /// null pointer faults.
 pub fn check_buffer(va: u64) -> Result<(), Error> {

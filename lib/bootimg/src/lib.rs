@@ -318,8 +318,8 @@ impl<'a> Program<'a> {
             let offset = u64_at(bytes, at + 16);
             let file_size = u64_at(bytes, at + 24);
             if mem_size == 0 && file_size == 0 {
-                // An absent segment's other fields stay 0: a value there
-                // may get a meaning later (report 4.1).
+                // An absent segment's other fields stay 0, so that a value
+                // there may get a meaning later without breaking old images.
                 if vaddr != 0 || offset != 0 {
                     return Err(Error::EmptyNotZero(part));
                 }

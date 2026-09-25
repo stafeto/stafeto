@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Starting init (spec 13.3, report 5.2) from the program in the boot
+//! Starting init (spec 3.3, 13.3) from the program in the boot
 //! image: its process, each segment on fresh frames with the protection
 //! its place in the program gives it, the stack right under
 //! abi::INIT_STACK_TOP with an unmapped guard page below, the first

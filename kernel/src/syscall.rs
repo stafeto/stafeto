@@ -132,7 +132,8 @@ fn caller_ceiling(thread: NonNull<Thread>) -> u8 {
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
 /// x3 exit channel, x4 notification priority): a new process with an empty
 /// address space and handle table; x1 returns a handle to it with
-/// DUPLICATE, TRANSFER and MANAGE (report 4.1). The quota is whole pages,
+/// DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS), the first two for
+/// milestone 1.3, so that the set never changes. The quota is whole pages,
 /// at least one, and counts from milestone 1.3; the limit 1-16384; the
 /// ceiling 1-63 and no higher than the caller's (ACCESS_DENIED). Exit
 /// channels come in milestone 1.3: x3 is 0, and x4 with it; any other x3
@@ -159,7 +160,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 }
 
 /// process_kill(x0 process with MANAGE): the process ends, reason
-/// «killed» (report 3.2, 3.4): its threads stop in whatever state they
+/// «killed» (spec 11): its threads stop in whatever state they
 /// are, and what it holds goes. A process that ended already: 0. Killing
 /// the caller's own process never returns.
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {

@@ -8,7 +8,8 @@
 //! out; the last `release` destroys it. A process ends earlier (`end`):
 //! process_exit, process_kill, a fault at EL0 or the exit of its last
 //! started thread stop its threads and give back what it holds, and a
-//! shell with the reason stays until the last reference (report 3.4).
+//! shell with the reason stays for object_info until the last reference
+//! (spec 4, 7.9).
 //! Quotas come with the calls that need them.
 
 use crate::mm::aspace::AddressSpace;
@@ -302,9 +303,8 @@ unsafe fn release_contents(process: NonNull<Process>) {
     }
 }
 
-/// Ends `process` with `reason` (report 3.4) unless it ended before, when
-/// the first reason stays: process_exit, process_kill and a fault at EL0
-/// come here. Every thread of the process leaves the scheduler for good;
+/// Ends `process` with `reason` unless it ended before, when the first
+/// reason stays: process_exit, process_kill and a fault at EL0 come here. Every thread of the process leaves the scheduler for good;
 /// the handle table, the address space, the threads' message buffers and
 /// the frames go; a shell with the reason stays for `object_info` until
 /// the last reference. The running thread may be one of the process's: it
@@ -323,8 +323,8 @@ pub unsafe fn end(process: NonNull<Process>, reason: ProcessState) {
 }
 
 /// A started thread of `process` ended through thread_exit; the last one
-/// ends the process with code 0 (report 3.1). Threads that never started
-/// do not count.
+/// ends the process with code 0. Threads that never started do not
+/// count.
 ///
 /// # Safety
 /// As for `end`.
@@ -369,8 +369,8 @@ unsafe fn life(process: NonNull<Process>) -> *mut Life {
     unsafe { &raw mut (*process.as_ptr()).life }
 }
 
-/// The rest of an end whose reason was just recorded (report 3.4): the
-/// threads stop, then what the process holds goes (`release_contents`).
+/// The rest of an end whose reason was just recorded: the threads stop,
+/// then what the process holds goes (`release_contents`).
 /// A reference taken for the while keeps the process through its threads'
 /// and its table's releases, which may drop every other one. From
 /// milestone 1.3 the quota goes back to the parent and the exit channel

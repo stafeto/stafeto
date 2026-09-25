@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The test init (report 5.3, 7.4). It runs in place of init on the normal
+//! The test init (spec 15.2). It runs in place of init on the normal
 //! build of the kernel, the one that ships, and tests the system calls
 //! from EL0, in its own process and in children with no code. It prints
 //! `TEST <name> ok` or `TEST <name> FAIL <why>` for each test, then
@@ -323,7 +323,7 @@ fn init_handles_have_their_fixed_values() -> Outcome {
     )
 }
 
-/// Until milestone 1.3 the boot image's handle is bad (report 5.1).
+/// Until milestone 1.3 the boot image's handle is bad (spec 13.3).
 fn boot_image_handle_is_reserved() -> Outcome {
     check(
         sys::process_state(INIT_BOOT_IMAGE) == Err(Error::BadHandle),
@@ -335,8 +335,8 @@ fn boot_image_handle_is_reserved() -> Outcome {
     )
 }
 
-/// The kernel mapped the first thread's message buffer at abi::INIT_MSGBUF
-/// (report 5.2): no new thread gets the page, and init reads and writes it.
+/// The kernel mapped the first thread's message buffer at abi::INIT_MSGBUF:
+/// no new thread gets the page, and init reads and writes it.
 fn init_has_its_message_buffer() -> Outcome {
     // SAFETY: as in `thread`; slot 0 is free.
     let taken = unsafe {
@@ -368,7 +368,7 @@ fn init_has_its_message_buffer() -> Outcome {
 }
 
 /// debug_write takes up to 64 bytes through a handle with DEBUG to the
-/// system resource and writes only the bytes of its length (report 6.2).
+/// system resource and writes only the bytes of its length (spec 11).
 fn debug_write_checks_its_arguments() -> Outcome {
     let mut x = marked();
     x[0] = INIT_RESOURCE.0;
@@ -407,8 +407,8 @@ fn debug_write_checks_its_arguments() -> Outcome {
     )
 }
 
-/// Numbers no call has fail with INVALID_ARGS and change x0 alone (report
-/// 6.4, 6.5), those of the kernel's test builds too.
+/// Numbers no call has fail with INVALID_ARGS and change x0 alone
+/// (spec 11), those of the kernel's test builds too.
 fn unknown_system_calls_fail() -> Outcome {
     unknown::<0>()?;
     unknown::<29>()?;
@@ -564,7 +564,7 @@ static TURNS: [Turns; 2] = [const {
     }
 }; 2];
 
-/// Two round-robin threads at one level spin without a call (report 7.4).
+/// Two round-robin threads at one level spin without a call (spec 8).
 /// Each sees the other run SWITCHES times between two turns of its loop,
 /// and each such stretch, which holds the other's whole run, lasts at
 /// least a quantum by the counter: the timer never fires before its

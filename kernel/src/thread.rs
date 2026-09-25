@@ -60,7 +60,7 @@ pub struct Siblings {
 }
 
 /// A thread's message buffer: page `va` of its process, backed by the
-/// frame at `pa`, which belongs to the thread (report 4.1).
+/// frame at `pa`, which belongs to the thread (spec 11).
 #[derive(Clone, Copy)]
 struct Buffer {
     va: usize,
@@ -134,7 +134,7 @@ pub fn create(
     Ok(thread)
 }
 
-/// Gives `t` its message buffer (report 4.1): a fresh zeroed frame mapped
+/// Gives `t` its message buffer (spec 11): a fresh zeroed frame mapped
 /// at page `va` of its process, readable and writable, never executable.
 /// The frame is the thread's and goes when the thread ends. INVALID_ARGS
 /// for a page that is mapped already, NO_MEMORY when frames or table
@@ -203,8 +203,8 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 
 /// thread_exit: the running thread `t` ends. Its buffer goes, it leaves
 /// the scheduler, with the kernel's reference, and as the last started
-/// thread of its process it ends the process (report 3.1). The caller
-/// leaves through sched::resume: `t` may be gone.
+/// thread of its process it ends the process. The caller leaves through
+/// sched::resume: `t` may be gone.
 ///
 /// # Safety
 /// `t` is the running thread, and the caller does not use it afterwards.

@@ -60,7 +60,7 @@ pub fn class_name(ec: u8) -> &'static str {
 /// FAR_EL1 as the reason of a fault at EL0 keeps it (spec 7.9): the
 /// faulting address of an instruction or data abort from EL0 whose FnV is
 /// clear, and of a misaligned PC; 0 for every other class, whose FAR is
-/// left over from an earlier fault, maybe of another process [G22].
+/// left over from an earlier fault, maybe of another process.
 pub fn fault_address(esr: u64, far: u64) -> u64 {
     match ec(esr) {
         EC_IABT_LOWER | EC_DABT_LOWER if esr & ISS_FNV == 0 => far,
