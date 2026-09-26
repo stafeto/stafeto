@@ -120,8 +120,8 @@ const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round
 const SERVICES_STARTED: &str = "init: services started";
 /// The names of the records of init's test table (services/init, feature
 /// `table-test`), which the init that ships does not carry.
-const TEST_TABLE_NAMES: [&str; 7] = [
-    "echo", "slow", "device", "crash", "checker", "private", "hog",
+const TEST_TABLE_NAMES: [&str; 10] = [
+    "sink", "echo", "slow", "device", "crash", "silent", "mute", "checker", "private", "hog",
 ];
 /// The start of the line init prints when the client `checker` of its
 /// test table ends, and the whole line: its policy is never (spec 13.4).
@@ -137,6 +137,18 @@ const CRASH_DECISIONS: [&str; 5] = [
     "restarts in 400 ms",
     "restarts in 800 ms",
     "broken: 5 failures in 60 s",
+];
+/// The lines init prints when its watchdog finds a service silent (spec
+/// 13.4, 16.2), in their order: `mute`, which never registers, killed from
+/// one above its ceiling of 30 four times and then broken, and `silent`,
+/// killed from one above its ceiling of 32 and restarted.
+const SILENT_KILLED: [&str; 6] = [
+    "init: mute went silent, killed from level 31; restarts in 100 ms",
+    "init: mute went silent, killed from level 31; restarts in 200 ms",
+    "init: mute went silent, killed from level 31; restarts in 400 ms",
+    "init: mute went silent, killed from level 31; restarts in 800 ms",
+    "init: mute went silent, killed from level 31; broken: 5 failures in 60 s",
+    "init: silent went silent, killed from level 33; restarts in 100 ms",
 ];
 /// Where RAM starts on QEMU's `virt`.
 const VIRT_RAM: u64 = 0x4000_0000;
@@ -198,7 +210,7 @@ const _: () = assert!(
 /// could drop a test with the line.
 const INIT_TESTS: u32 = 216;
 /// Tests the client `checker` of init's test table has (tests/svc).
-const SVC_TESTS: u32 = 18;
+const SVC_TESTS: u32 = 24;
 /// What init prints for each table it refuses (services/init, features
 /// `table-cycle` and `table-ceiling`), each line whole.
 const REFUSED: [(&str, &[ImageProgram], &str); 2] = [
@@ -1271,6 +1283,7 @@ fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
     failure_lines_name_the_reason_and_the_pause(&o.lines)?;
+    the_watchdog_names_the_level_it_kills_from(&o.lines)?;
     a_client_that_ends_is_not_restarted(&o)?;
     if r.total != Some(SVC_TESTS) {
         return Err(format!(
@@ -1325,6 +1338,24 @@ fn failure_lines_name_the_reason_and_the_pause(lines: &[String]) -> Result<(), S
         (_, Some(line)) => Err(format!("the wait of hog for quota failed it: {line}")),
         (n, None) => Err(format!("{n} lines of hog's wait for quota, one expected")),
     }
+}
+
+/// Spec 13.4, 16.2: init names the level its worker kills a silent
+/// service from, one above the service's ceiling, and its decision: every
+/// line of a silent service whole, in its order, and no other
+/// (SILENT_KILLED).
+fn the_watchdog_names_the_level_it_kills_from(lines: &[String]) -> Result<(), String> {
+    let got: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.contains(" went silent, "))
+        .collect();
+    if got != SILENT_KILLED {
+        return Err(format!(
+            "the lines of silent services are {got:?}, {SILENT_KILLED:?} expected"
+        ));
+    }
+    Ok(())
 }
 
 /// Spec 13.4: the client `checker`, whose policy is never, ends with code

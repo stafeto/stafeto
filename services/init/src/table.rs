@@ -1044,7 +1044,8 @@ mod tests {
         assert_eq!(
             order_of(test::TABLE),
             [
-                "echo", "slow", "device", "crash", "checker", "private", "hog"
+                "sink", "echo", "slow", "device", "crash", "silent", "mute", "checker", "private",
+                "hog"
             ]
         );
         assert_eq!(

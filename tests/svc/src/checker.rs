@@ -7,9 +7,12 @@
 //! START past LAST, PING and HEARTBEAT, REGISTER from a client, CONNECT
 //! to services that registered, to one that registers later and past four
 //! waiting requests, and to names the table does not give it, what the
-//! REGISTER of `device` brought, the restarts of `crash` until it is
-//! broken, the wait of `hog` for quota, LIST and STATS. LIST and STATS
-//! come once `crash` is broken, when no record starts again. It prints
+//! REGISTER of `device` brought, the restarts of `crash` and `mute` until
+//! they are broken, the wait of `hog` for quota, LIST and STATS, and the
+//! watchdog: `silent` restarted after it hangs, the level init kills it at,
+//! the client reconnecting, and the starved and the healthy left alone.
+//! LIST and STATS come once `crash` and `mute` are broken, when no record
+//! but `silent` starts again. It prints
 //! `TEST <name> ok` or `TEST <name> FAIL <why>` for each test in turn,
 //! then `TESTS DONE total=<n> failed=<m>`, and ends with code 0; xtask
 //! reads the lines, and init's line of its end.
@@ -22,7 +25,8 @@ use abi::{
 };
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use proto_init::{
-    Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, ServiceArgs, State, Stats,
+    Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, ServiceArgs, State,
+    Stats, Work,
 };
 use proto_wire::{Header, Name, Reader, Status, Writer};
 use rt::handle::{Channel, Resource, Thread};
@@ -40,7 +44,7 @@ type Test = (&'static str, fn(&Checker) -> Outcome);
 /// `a_fifth_waiting_connect_gets_limit_reached` wait for `slow`, which
 /// registers once the checker opens the gate of `echo`, and
 /// `connect_waits_for_registration` opens it and collects them.
-const TESTS: [Test; 18] = [
+const TESTS: [Test; 24] = [
     (
         "start_data_brings_the_service_args",
         start_data_brings_the_service_args,
@@ -95,6 +99,10 @@ const TESTS: [Test; 18] = [
         a_record_without_quota_waits_and_is_not_broken,
     ),
     (
+        "a_service_that_never_registers_is_killed",
+        a_service_that_never_registers_is_killed,
+    ),
+    (
         "list_names_every_record_in_its_state",
         list_names_every_record_in_its_state,
     ),
@@ -109,6 +117,26 @@ const TESTS: [Test; 18] = [
     (
         "stats_bring_the_kernel_the_worker_and_the_quota",
         stats_bring_the_kernel_the_worker_and_the_quota,
+    ),
+    (
+        "silent_service_is_restarted_by_the_watchdog",
+        silent_service_is_restarted_by_the_watchdog,
+    ),
+    (
+        "kill_runs_above_the_victim_and_below_its_clients",
+        kill_runs_above_the_victim_and_below_its_clients,
+    ),
+    (
+        "client_reconnects_after_a_restart",
+        client_reconnects_after_a_restart,
+    ),
+    (
+        "a_starved_service_is_not_taken_for_silent",
+        a_starved_service_is_not_taken_for_silent,
+    ),
+    (
+        "healthy_services_are_never_restarted",
+        healthy_services_are_never_restarted,
     ),
 ];
 
@@ -126,20 +154,29 @@ const HELLO: &[u8] = b"hello";
 /// The records LIST gives: init, then the records of init's test table in
 /// its order, each with its priority, its ceiling and whether it is a
 /// client.
-const RECORDS: [(&str, u8, u8, bool); 8] = [
+const RECORDS: [(&str, u8, u8, bool); 11] = [
     ("init", 63, 63, false),
+    ("sink", 40, 40, false),
     ("echo", 40, 40, false),
     ("slow", 40, 40, false),
     ("device", 40, 40, false),
     ("crash", 35, 35, false),
+    ("silent", 30, 32, false),
+    ("mute", 30, 30, false),
     ("checker", 30, 30, true),
     ("private", 20, 20, false),
     ("hog", 20, 20, false),
 ];
 /// The records that do not run with no failure once `crash` is broken:
 /// their state, their failures within 60 s and their restarts.
-const NOT_RUNNING: [(&str, State, u8, u32); 2] =
-    [("crash", State::Broken, 5, 4), ("hog", State::Quota, 0, 0)];
+const NOT_RUNNING: [(&str, State, u8, u32); 3] = [
+    ("crash", State::Broken, 5, 4),
+    ("mute", State::Broken, 5, 4),
+    ("hog", State::Quota, 0, 0),
+];
+/// The place of `silent` in init's table (RECORDS index 6, table place 5):
+/// STATS names the record init's worker kills by its place.
+const SILENT_PLACE: u8 = 5;
 /// The level of init's worker thread with no job.
 const WORKER_IDLE: u8 = 1;
 const PAGE: u64 = 4096;
@@ -156,6 +193,9 @@ static ECHOED: [AtomicBool; HELPERS] = [const { AtomicBool::new(false) }; HELPER
 /// they are done, bit i for helper i.
 static THREADS: [AtomicU64; HELPERS] = [const { AtomicU64::new(0) }; HELPERS];
 static DONE: AtomicU64 = AtomicU64::new(0);
+/// The stack of the thread that hangs `silent`, and its handle.
+static HANG_STACK: Stack<8192> = Stack::new();
+static HANG_THREAD: AtomicU64 = AtomicU64::new(0);
 
 /// What the tests share: the checker's start data, when it started and
 /// the failures of `crash` then (LIST).
@@ -539,25 +579,32 @@ fn named(got: &Listed, name: &str) -> bool {
 /// those of NOT_RUNNING, each in its state with its failures and restarts.
 fn list_names_every_record_in_its_state(c: &Checker) -> Outcome {
     settle(c)?;
-    let page = list(c, 0)?;
+    let total = list(c, 0)?.total;
     check(
-        usize::from(page.total) == RECORDS.len() && page.len() == RECORDS.len(),
+        usize::from(total) == RECORDS.len(),
         "LIST does not count init and the records of the table",
     )?;
-    for (got, &(name, priority, ceiling, client)) in page.records().zip(&RECORDS) {
-        check(named(got, name), "LIST names another record")?;
-        check(
-            (got.priority, got.ceiling, got.client) == (priority, ceiling, client),
-            "LIST gives a record other levels or another kind",
-        )?;
-        let expected = NOT_RUNNING
-            .iter()
-            .find(|r| r.0 == name)
-            .map_or((State::Running, 0, 0), |&(_, s, f, r)| (s, f, r));
-        check(
-            (got.state, got.failures, got.restarts) == expected,
-            "a record has another state, other failures or other restarts",
-        )?;
+    let mut n = 0usize;
+    while n < RECORDS.len() {
+        let page = list(c, n as u16)?;
+        check(!page.is_empty(), "LIST paged short of its records")?;
+        for got in page.records() {
+            let (name, priority, ceiling, client) = RECORDS[n];
+            check(named(got, name), "LIST names another record")?;
+            check(
+                (got.priority, got.ceiling, got.client) == (priority, ceiling, client),
+                "LIST gives a record other levels or another kind",
+            )?;
+            let expected = NOT_RUNNING
+                .iter()
+                .find(|r| r.0 == name)
+                .map_or((State::Running, 0, 0), |&(_, s, f, r)| (s, f, r));
+            check(
+                (got.state, got.failures, got.restarts) == expected,
+                "a record has another state, other failures or other restarts",
+            )?;
+            n += 1;
+        }
     }
     Ok(())
 }
@@ -595,14 +642,12 @@ fn own_counts(c: &Checker) -> Option<(ProcessHandles, ProcessMemory)> {
 /// checker's own record shows what the checker sees of itself.
 fn list_counts_the_handles_and_memory_of_an_instance(c: &Checker) -> Outcome {
     let before = own_counts(c);
-    let page = list(c, 0)?;
+    let got = record(c, "checker")?;
     check(
         before == own_counts(c),
         "the checker's counts changed during LIST",
     )?;
     let (h, m) = before.ok_or("PROCESS_HANDLES or PROCESS_MEMORY failed")?;
-    let got = page.records().find(|r| named(r, "checker"));
-    let got = got.ok_or("LIST has no record checker")?;
     let handles = [h.live, h.retired, h.limit].map(|n| n as u32);
     check(
         [got.live, got.retired, got.limit] == handles,
@@ -665,11 +710,22 @@ fn stats_bring_the_kernel_the_worker_and_the_quota(c: &Checker) -> Outcome {
     check(second.labels > first.labels, "a CONNECT gave no label")
 }
 
-/// The record `name` in the first page of LIST.
+/// The record `name`, from the page of LIST that holds it.
 fn record(c: &Checker, name: &str) -> Result<Listed, &'static str> {
-    let page = list(c, 0)?;
-    let found = page.records().find(|r| named(r, name)).copied();
-    found.ok_or("LIST has no such record")
+    let total = list(c, 0)?.total;
+    let mut first = 0;
+    while first < total {
+        let page = list(c, first)?;
+        if let Some(got) = page.records().find(|r| named(r, name)) {
+            return Ok(*got);
+        }
+        let len = page.len() as u16;
+        if len == 0 {
+            break;
+        }
+        first += len;
+    }
+    Err("LIST has no such record")
 }
 
 /// CONNECT to `crash`, which faults right after each start, waits while
@@ -722,4 +778,155 @@ fn a_record_without_quota_waits_and_is_not_broken(c: &Checker) -> Outcome {
         "the wait of hog counted as a failure",
     )?;
     check(hog.live == 0 && hog.quota_pages == 0, "hog has an instance")
+}
+
+/// A helper thread that hangs `silent`: it connects to it and sends HANG,
+/// which never comes back until init kills silent, and then exits.
+extern "C" fn hang(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(abi::START_CHANNEL);
+    if let Ok(silent) = rt::service::connect(&parent, "silent") {
+        let mut w = Writer::new();
+        let _ = Header::new(method::HANG, VERSION).write(&mut w);
+        let _ = sys::send(&silent, w.as_bytes());
+    }
+    sys::thread_exit()
+}
+
+/// A session with `silent` works, then a helper hangs it: its heartbeat
+/// stops, init's watchdog kills it from above its ceiling, and it starts
+/// again; its restart loads above the checker's level, before the checker
+/// lets anyone below it run. The checker at 30 is starved while silent
+/// spins at 32, so it runs on to see the restart only once init killed
+/// it; a bound on the guest's clock guards a silent that never dies.
+fn silent_service_is_restarted_by_the_watchdog(c: &Checker) -> Outcome {
+    let session = c.connect("silent").map_err(|_| "no session with silent")?;
+    check(echoes(&session), "ECHO did not work through silent")?;
+    let buffer = abi::INIT_MSGBUF as usize + (HELPERS + 1) * 4096;
+    // SAFETY: HANG_STACK is the helper's alone.
+    let t = unsafe {
+        sys::thread_create(
+            &c.s.process,
+            hang,
+            HANG_STACK.top(),
+            0,
+            base(&c.s),
+            Policy::Fifo,
+            buffer,
+        )
+    }
+    .map_err(|_| "thread_create failed")?;
+    sys::thread_start(&t).map_err(|_| "thread_start failed")?;
+    HANG_THREAD.store(t.into_raw().0, Relaxed);
+    // While silent spins at 32 the checker cannot run: settle blocks until
+    // init kills silent.
+    let deadline = now_ns() + BOUND_NS;
+    while record(c, "silent")?.restarts == 0 {
+        settle(c)?;
+        if now_ns() > deadline {
+            return Err("the watchdog did not kill silent");
+        }
+    }
+    // The kill is done and the pause runs. The checker polls at its level
+    // and lets nothing below it run: the restart loads only if init's
+    // worker takes it above 30.
+    loop {
+        let silent = record(c, "silent")?;
+        if matches!(silent.state, State::Starting | State::Running) {
+            break;
+        }
+        if now_ns() > deadline {
+            return Err("the restart of silent did not load above the checker");
+        }
+    }
+    while record(c, "silent")?.state != State::Running {
+        settle(c)?;
+        if now_ns() > deadline {
+            return Err("the new silent did not register");
+        }
+    }
+    check(
+        !echoes(&session),
+        "the old session with silent still works after its restart",
+    )
+}
+
+/// The STATS the sink kept when the session of `silent` went (the kill
+/// closed it): init's worker was killing silent, its record by its place,
+/// at level 33, one above silent's ceiling and below sink at 40, with the
+/// teardown in the cleanup queue.
+fn kill_runs_above_the_victim_and_below_its_clients(c: &Checker) -> Outcome {
+    let sink = c.connect("sink").map_err(|_| "no session with sink")?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut w = Writer::new();
+    let _ = Header::new(method::SEEN, VERSION).write(&mut w);
+    let bytes = call(&sink, w.as_bytes(), &mut buffer).map_err(|_| "SEEN was refused")?;
+    let stats = Stats::read(bytes).map_err(|_| "SEEN gave no STATS")?;
+    check(
+        stats.job == Some((Work::Kill, SILENT_PLACE)),
+        "the worker was not killing silent when its session went",
+    )?;
+    check(
+        (stats.worker_priority, stats.worker_effective) == (33, 33),
+        "the kill did not run one level above silent's ceiling",
+    )?;
+    check(
+        stats.kernel.cleanup_queue >= 1,
+        "the kill left nothing in the cleanup queue",
+    )
+}
+
+/// After the restart the client connects to silent again and the new
+/// session works.
+fn client_reconnects_after_a_restart(c: &Checker) -> Outcome {
+    let t = HANG_THREAD.swap(0, Relaxed);
+    if t != 0 {
+        drop(Handle::<Thread>::from_raw(abi::Handle(t)));
+    }
+    let session = c
+        .connect("silent")
+        .map_err(|_| "no new session with silent")?;
+    check(echoes(&session), "ECHO did not work through the new silent")
+}
+
+/// `private` at 20 is starved while silent spins at 32, above its ceiling:
+/// its watchdog timer at slot 20 does not fire, so init does not take it
+/// for silent. It runs with no failure and no restart.
+fn a_starved_service_is_not_taken_for_silent(c: &Checker) -> Outcome {
+    settle(c)?;
+    let private = record(c, "private")?;
+    check(private.state == State::Running, "private does not run")?;
+    check(
+        private.failures == 0 && private.restarts == 0,
+        "private was taken for silent while it was starved",
+    )
+}
+
+/// `mute` never registers: init's watchdog from its start kills it, and
+/// after five failures it is broken. A CONNECT to it gets PEER_CLOSED once
+/// it is broken; the request waits until then.
+fn a_service_that_never_registers_is_killed(c: &Checker) -> Outcome {
+    let got = c.connect("mute").err();
+    check(
+        got == Some(Status::Kernel(Error::PeerClosed)),
+        "CONNECT to mute did not get PEER_CLOSED",
+    )?;
+    let mute = record(c, "mute")?;
+    check(
+        (mute.state, mute.failures, mute.restarts) == (State::Broken, 5, 4),
+        "LIST does not show mute broken after five failures",
+    )
+}
+
+/// The services that neither crash, hang nor go without quota keep running
+/// with no failure and no restart to the end of the run.
+fn healthy_services_are_never_restarted(c: &Checker) -> Outcome {
+    settle(c)?;
+    for name in ["sink", "echo", "slow", "device", "private"] {
+        let r = record(c, name)?;
+        check(
+            r.state == State::Running && r.failures == 0 && r.restarts == 0,
+            "a healthy service failed or was restarted",
+        )?;
+    }
+    Ok(())
 }

@@ -9,29 +9,34 @@
 //! the channel of a service and gives it its windows and bindings; CONNECT
 //! gives a copy of a registered channel with SEND, TRANSFER and a label of
 //! its own, or holds the request until the service registers; HEARTBEAT
-//! answers a registered service; LIST gives a page of the records, init
-//! first; STATS what the kernel, the worker and init's quota show; PING
-//! anyone. The notification of the worker thread brings the outcome of
-//! its job: the main thread starts the thread of the instance it loaded,
-//! and gives the worker the next job of the queue at the level
-//! init::work::worker_level sets. The notification of the end of an
-//! instance is a failure of its record: init prints its reason and what it
-//! decided (init::restart), the worker tears the instance down, and the
-//! record's timer, whose slot is at the record's ceiling, ends the pause
-//! before its restart; each start waits while init's quota falls short of
-//! what the instance needs (init::quota). Each handler is bounded by the
-//! records of the table; the main thread loads, maps and kills nothing
-//! itself, and lets go of no last handle of an instance (worker.rs).
+//! answers a registered service and moves its watchdog deadline; LIST gives
+//! a page of the records, init first; STATS what the kernel, the worker and
+//! init's quota show; PING anyone. The notification of the worker thread
+//! brings the outcome of its job: the main thread starts the thread of the
+//! instance it loaded, and gives the worker the next job of the queue at
+//! the level init::work::worker_level sets. The notification of the end of
+//! an instance is a failure of its record: init prints its reason and what
+//! it decided (init::restart), the worker tears the instance down, and the
+//! record's timer, whose slot is at the record's ceiling and whose expiries
+//! carry a label of its own, ends the pause before its restart; a service
+//! whose watchdog finds it silent twice in a row is killed by the worker
+//! from above its ceiling, which is a failure too (init::watch); each start
+//! waits while init's quota falls short of what the instance needs
+//! (init::quota). Each handler is bounded by the records of the table; the
+//! main thread loads, maps and kills nothing itself, and lets go of no last
+//! handle of an instance (worker.rs).
 
-use crate::worker::{Gone, Loaded, Worker};
+use crate::worker::{Loaded, Worker};
 use abi::{Error, ObjectKind, ProcessState, Rights, Source};
 use bootimg::Program;
 use core::fmt;
+use core::mem;
 use init::PAGE;
 use init::labels::Labels;
 use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::table::{self, MAX_RECORDS, Record, Restart, TABLE};
+use init::watch::{Action, Watched};
 use init::work::{Job, Queue, WORKER_IDLE, worker_level};
 use proto_init::{
     Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
@@ -55,22 +60,67 @@ const S: u64 = 1_000 * MS;
 /// An instance of a record: what the worker loaded (its process and first
 /// thread, the label of its start channel, what is left of its start
 /// data), the channel a service registered, and when its thread started,
-/// in nanoseconds on the one scale of the system.
-struct Instance {
+/// in nanoseconds on the one scale of the system. Its handles close in the
+/// worker thread: the main thread lets go of no Instance (spec 7.7).
+pub struct Instance {
     spawned: Spawned,
     channel: Option<Handle<Channel>>,
     started: u64,
 }
 
 impl Instance {
-    /// What the worker tears down of the instance once it ended: what is
-    /// left of its start data closes here, copies of objects whose own
-    /// handles go to the worker.
-    fn gone(self) -> Gone {
-        Gone {
-            process: self.spawned.process,
-            thread: self.spawned.thread,
-            channel: self.channel,
+    /// The instance's process, which the worker kills before it tears the
+    /// instance down (worker.rs).
+    pub fn process(&self) -> &Handle<Process> {
+        &self.spawned.process
+    }
+}
+
+/// What a record holds: no instance, the one that runs, or the one that
+/// ended and waits for the worker to take it for its teardown or kill.
+/// Only one instance's storage, never two at once (the load of a record
+/// comes after the teardown of its instance).
+enum Held {
+    Empty,
+    Running(Instance),
+    Gone(Instance),
+}
+
+impl Held {
+    /// The instance that runs, if any.
+    fn running(&self) -> Option<&Instance> {
+        match self {
+            Held::Running(instance) => Some(instance),
+            _ => None,
+        }
+    }
+
+    fn running_mut(&mut self) -> Option<&mut Instance> {
+        match self {
+            Held::Running(instance) => Some(instance),
+            _ => None,
+        }
+    }
+
+    /// Takes the instance that runs out, leaving the record with none.
+    fn take_running(&mut self) -> Option<Instance> {
+        match mem::replace(self, Held::Empty) {
+            Held::Running(instance) => Some(instance),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+
+    /// Takes the instance that waits for its teardown or kill out.
+    fn take_gone(&mut self) -> Option<Instance> {
+        match mem::replace(self, Held::Empty) {
+            Held::Gone(instance) => Some(instance),
+            other => {
+                *self = other;
+                None
+            }
         }
     }
 }
@@ -82,13 +132,21 @@ impl Instance {
 /// (init::restart).
 struct Entry {
     state: State,
-    instance: Option<Instance>,
-    gone: Option<Gone>,
+    held: Held,
+    /// The watchdog of the current instance of a service: its deadline and
+    /// its mark of suspicion (init::watch). None for a client, and between
+    /// instances.
+    watch: Option<Watched>,
     waiting: [Option<(Pending, u8)>; WAITING_MAX],
     /// The record's timer on init's channel, its slot at the record's
-    /// ceiling, and its deadline: the end of the pause before a restart
-    /// (STOPPING, PAUSED) or of a wait for quota (QUOTA).
+    /// ceiling, and its deadline: the watchdog deadline (STARTING,
+    /// RUNNING), the end of the pause before a restart (STOPPING, PAUSED)
+    /// or the end of a wait for quota (QUOTA). The timer is made through
+    /// `timer_view`, a copy of init's channel with RECEIVE and
+    /// `timer_label`, a label of init's count, which its expiries carry.
     timer: Option<Handle<Timer>>,
+    timer_view: Option<Handle<Channel>>,
+    timer_label: u64,
     deadline: Option<u64>,
     failures: Failures,
     restarts: u32,
@@ -105,10 +163,12 @@ struct Entry {
 impl Entry {
     const NEW: Entry = Entry {
         state: State::Loading,
-        instance: None,
-        gone: None,
+        held: Held::Empty,
+        watch: None,
         waiting: [const { None }; WAITING_MAX],
         timer: None,
+        timer_view: None,
+        timer_label: 0,
         deadline: None,
         failures: Failures::new(),
         restarts: 0,
@@ -181,15 +241,22 @@ impl Init {
     }
 
     /// Starts the records of the table in `order` (table::check): the
-    /// timer of each on `channel`, init's channel, through its handle
-    /// without a label, with its slot at the record's ceiling; a job to
-    /// load each, which the queue gives the worker by the ceiling of its
-    /// record, and in the order of the table within a level. With an empty
-    /// table the services started at once.
+    /// timer of each on `channel`, init's channel, through a copy of it
+    /// with a label of its own, with its slot at the record's ceiling; a
+    /// job to load each, which the queue gives the worker by the ceiling of
+    /// its record, and in the order of the table within a level. With an
+    /// empty table the services started at once.
     pub fn start(&mut self, channel: &Handle<Channel>, order: &table::Order) {
-        for (entry, record) in self.entries.iter_mut().zip(TABLE) {
-            let timer = sys::timer_create(channel, record.ceiling);
-            entry.timer = Some(timer.expect("init makes the timer of each record"));
+        for (place, entry) in self.entries.iter_mut().enumerate().take(TABLE.len()) {
+            let ceiling = TABLE[place].ceiling;
+            let label = self.labels.next().expect("init gave every label");
+            let view = sys::handle_label(channel, Rights::RECEIVE, label, ceiling)
+                .expect("init labels a channel view for each timer");
+            let timer =
+                sys::timer_create(&view, ceiling).expect("init makes the timer of each record");
+            entry.timer = Some(timer);
+            entry.timer_view = Some(view);
+            entry.timer_label = label;
         }
         for &place in order.as_slice() {
             self.launch(place);
@@ -234,7 +301,7 @@ impl Init {
             let gone = match job.work {
                 Work::Load if !self.quota_fits(place) => continue,
                 Work::Load => None,
-                _ => match self.entries[place].gone.take() {
+                _ => match self.entries[place].held.take_gone() {
                     Some(gone) => Some(gone),
                     None => continue,
                 },
@@ -244,14 +311,17 @@ impl Init {
                 .worker
                 .set_level(worker_level(self.current, &self.queue));
             // The worker's channel lives as long as init.
-            let _ = match gone {
-                Some(gone) => self.worker.teardown(gone),
-                None => {
+            let _ = match job.work {
+                Work::Load => {
                     let label = self.labels.next().expect("init gave every label");
                     let program =
                         self.programs[place].expect("init found each program at its start");
                     self.worker.load(place, label, program)
                 }
+                Work::Teardown => self
+                    .worker
+                    .teardown(gone.expect("a teardown carries its instance")),
+                Work::Kill => self.worker.kill(gone.expect("a kill carries its instance")),
             };
             return;
         }
@@ -342,19 +412,31 @@ impl Init {
                 if let Err(e) = spawned.start() {
                     println!("init: {} did not start: {e:?}", record.name);
                 }
+                let started = now();
+                // The watchdog of a service counts from its start until its
+                // REGISTER (spec 13.4); a client has none.
+                let watch = record.watch().map(|w| w.arm(started));
+                let deadline = watch.map(|w| w.deadline());
                 let entry = &mut self.entries[place];
-                entry.instance = Some(Instance {
+                entry.held = Held::Running(Instance {
                     spawned,
                     channel: None,
-                    started: now(),
+                    started,
                 });
+                entry.watch = watch;
                 entry.state = if record.is_client() {
                     State::Running
                 } else {
                     State::Starting
                 };
+                if let Some(at) = deadline {
+                    self.set_deadline(place, at);
+                }
             }
-            Err(e) => self.failed(place, None, 0, format_args!("did not load: {e:?}")),
+            Err(e) => {
+                let what = format_args!("did not load: {e:?}");
+                self.failed(place, None, 0, what, Work::Teardown)
+            }
         }
         self.begin(place);
     }
@@ -363,61 +445,109 @@ impl Init {
     /// notification): a failure of its record, with the reason of
     /// PROCESS_STATE.
     fn ended(&mut self, label: u64) {
+        // An instance the watchdog took to kill is no current one: its later
+        // exit notification stops at `caller`.
         let Some(place) = self.caller(label) else {
             return;
         };
-        let Some(instance) = self.entries[place].instance.take() else {
+        let Some(instance) = self.entries[place].held.take_running() else {
             return;
         };
         let lived = now().saturating_sub(instance.started);
-        let end = End(sys::process_state(&instance.spawned.process));
-        self.failed(
-            place,
-            Some(instance.gone()),
-            lived,
-            format_args!("ended: {end}"),
-        );
+        let end = End(sys::process_state(instance.process()));
+        let what = format_args!("ended: {end}");
+        self.failed(place, Some(instance), lived, what, Work::Teardown);
+    }
+
+    /// The watchdog of the service at `place` found it silent (init::watch):
+    /// a failure (`failed`) whose line names the level the worker kills its
+    /// instance from, above its ceiling and below its clients (init::work).
+    /// Its later exit notification is skipped (`ended`).
+    fn silent(&mut self, place: usize) {
+        let job = Job::new(Work::Kill, place, &TABLE[place]);
+        let level = worker_level(Some(job), &self.queue);
+        let Some(instance) = self.entries[place].held.take_running() else {
+            return;
+        };
+        let lived = now().saturating_sub(instance.started);
+        let what = format_args!("went silent, killed from level {level}");
+        self.failed(place, Some(instance), lived, what, Work::Kill);
     }
 
     /// A failure of the record at `place` (spec 13.4, 16.2): `gone`, what
     /// is left of its instance that lived `lived` ns, if any, goes to the
-    /// worker for its teardown; `what` says what happened. Init prints one
-    /// line with it and its decision: a record whose policy is never ends,
-    /// one that failed BREAK_AFTER times within WINDOW_NS is broken, and
-    /// the CONNECT requests that wait for either get PEER_CLOSED; any other
-    /// starts again after the pause of init::restart, on its timer, and
-    /// once its teardown is done.
-    fn failed(&mut self, place: usize, gone: Option<Gone>, lived: u64, what: fmt::Arguments) {
-        let record = &TABLE[place];
+    /// worker for `work`, its teardown or kill; `what` says what happened.
+    /// Init prints one line with it and its decision: a record whose
+    /// policy is never ends, one that failed BREAK_AFTER times within
+    /// WINDOW_NS is broken, and the CONNECT requests that wait for either
+    /// get PEER_CLOSED; any other starts again after the pause of
+    /// init::restart, on its timer, and once its teardown or kill is done.
+    fn failed(
+        &mut self,
+        place: usize,
+        gone: Option<Instance>,
+        lived: u64,
+        what: fmt::Arguments,
+        work: Work,
+    ) {
+        let name = TABLE[place].name;
         let now = now();
+        let verdict = self.accrue(place, now, lived);
+        match verdict {
+            None => println!("init: {name} {what}, not restarted"),
+            Some(Verdict::Broken) => println!(
+                "init: {name} {what}; broken: {BREAK_AFTER} failures in {} s",
+                WINDOW_NS / S
+            ),
+            Some(Verdict::Restart { pause_ns }) => {
+                println!("init: {name} {what}; restarts in {} ms", pause_ns / MS)
+            }
+        }
+        self.settle(place, gone, verdict, work);
+    }
+
+    /// Records a failure of the record at `place` at `now`, of an instance
+    /// that lived `lived` ns: a verdict for a record that restarts, None
+    /// for one whose policy is never (init::restart).
+    fn accrue(&mut self, place: usize, now: u64, lived: u64) -> Option<Verdict> {
+        match TABLE[place].restart {
+            Restart::Always => Some(self.entries[place].failures.failed(now, lived)),
+            Restart::Never => None,
+        }
+    }
+
+    /// Settles a failure of the record at `place`: `gone`, its instance if
+    /// any, waits for the worker's `work` (teardown or kill); the record
+    /// ends or is marked broken, its waiting CONNECT requests getting
+    /// PEER_CLOSED, or it starts again after `verdict`'s pause on its timer,
+    /// once the work is done (`torn_down`).
+    fn settle(
+        &mut self,
+        place: usize,
+        gone: Option<Instance>,
+        verdict: Option<Verdict>,
+        work: Work,
+    ) {
+        let now = now();
+        let record = &TABLE[place];
         let entry = &mut self.entries[place];
         let teardown = gone.is_some();
-        entry.gone = gone;
-        let verdict = match record.restart {
-            Restart::Always => Some(entry.failures.failed(now, lived)),
-            Restart::Never => None,
-        };
-        match verdict {
+        if let Some(instance) = gone {
+            entry.held = Held::Gone(instance);
+        }
+        entry.watch = None;
+        let deadline = match verdict {
             None => {
-                println!("init: {} {what}, not restarted", record.name);
                 entry.state = State::Ended;
                 entry.waiting = [const { None }; WAITING_MAX];
+                None
             }
             Some(Verdict::Broken) => {
-                println!(
-                    "init: {} {what}; broken: {BREAK_AFTER} failures in {} s",
-                    record.name,
-                    WINDOW_NS / S
-                );
                 entry.state = State::Broken;
                 entry.waiting = [const { None }; WAITING_MAX];
+                None
             }
             Some(Verdict::Restart { pause_ns }) => {
-                println!(
-                    "init: {} {what}; restarts in {} ms",
-                    record.name,
-                    pause_ns / MS
-                );
                 entry.restarts = entry.restarts.saturating_add(1);
                 entry.waited = pause_ns;
                 entry.state = if teardown {
@@ -425,11 +555,14 @@ impl Init {
                 } else {
                     State::Paused
                 };
-                self.set_deadline(place, now.saturating_add(pause_ns));
+                Some(now.saturating_add(pause_ns))
             }
+        };
+        if let Some(at) = deadline {
+            self.set_deadline(place, at);
         }
         if teardown {
-            self.push(Job::new(Work::Teardown, place, record));
+            self.push(Job::new(work, place, record));
         }
     }
 
@@ -449,27 +582,44 @@ impl Init {
         }
     }
 
-    /// An expiry of a timer of the records: each record whose deadline the
-    /// counter reached (rt::time::reached) and which waits for its pause or
-    /// for quota starts; the other expiries are stale (spec 10).
-    fn expired(&mut self) {
-        for place in 0..TABLE.len() {
-            let entry = &mut self.entries[place];
-            let due = entry.deadline.is_some_and(time::reached);
-            if due && matches!(entry.state, State::Paused | State::Quota) {
+    /// An expiry of the timer of the record at `place` (its label names it,
+    /// `timed`): a record that waits for its pause or its quota starts; a
+    /// service whose watchdog deadline came is marked suspect, then silent
+    /// one period later (init::watch). An expiry before the deadline is
+    /// stale (spec 10). Init acts on this record alone: a record whose
+    /// timer is masked by a higher service does not come here until that
+    /// service lets the processor down to its slot.
+    fn expired(&mut self, place: usize) {
+        let now = now();
+        let entry = &mut self.entries[place];
+        if !entry.deadline.is_some_and(time::reached) {
+            return;
+        }
+        match entry.state {
+            State::Paused | State::Quota => {
                 entry.deadline = None;
                 self.launch(place);
             }
+            State::Starting | State::Running => {
+                match entry.watch.as_mut().map(|w| w.expired(now)) {
+                    Some(Action::Suspect { deadline }) => self.set_deadline(place, deadline),
+                    Some(Action::Silent) => self.silent(place),
+                    _ => {}
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// The place of the record whose timer carries `label` (spec 13.4).
+    fn timed(&self, label: u64) -> Option<usize> {
+        let timed = |e: &Entry| e.timer_label == label;
+        self.entries[..TABLE.len()].iter().position(timed)
     }
 
     /// The place of the record whose instance has `label`.
     fn caller(&self, label: u64) -> Option<usize> {
-        let named = |e: &Entry| {
-            e.instance
-                .as_ref()
-                .is_some_and(|i| i.spawned.label == label)
-        };
+        let named = |e: &Entry| e.held.running().is_some_and(|i| i.spawned.label == label);
         self.entries[..TABLE.len()].iter().position(named)
     }
 
@@ -477,7 +627,7 @@ impl Init {
     /// A reply that failed changes nothing here: the end of the instance
     /// comes as its exit notification.
     fn start_data(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
-        let instance = self.entries[place].instance.as_mut();
+        let instance = self.entries[place].held.running_mut();
         if let (Some(instance), Some(token)) = (instance, r.token()) {
             // A request of this method: Giver never gives it back.
             let _ = instance.spawned.giver.answer(r.bytes(), token);
@@ -528,10 +678,19 @@ impl Init {
                 Err(e) => p.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new()),
             };
         }
-        if let Some(instance) = entry.instance.as_mut() {
+        if let Some(instance) = entry.held.running_mut() {
             instance.channel = Some(channel);
         }
         entry.state = State::Running;
+        // From REGISTER on, the watchdog counts the heartbeats (spec 13.4).
+        let deadline = record.watch().map(|w| {
+            let armed = w.arm(now());
+            entry.watch = Some(armed);
+            armed.deadline()
+        });
+        if let Some(at) = deadline {
+            self.set_deadline(place, at);
+        }
         Answer::Reply(handles)
     }
 
@@ -619,17 +778,21 @@ impl Init {
     }
 
     /// HEARTBEAT from the instance at `place`: 0 for a service that
-    /// registered, BAD_STATE for any other (spec 13.4).
-    fn heartbeat(&self, place: usize, r: &Request<'_>) -> Answer {
+    /// registered, its watchdog deadline moving to now plus its record's
+    /// deadline; BAD_STATE for any other (spec 13.4).
+    fn heartbeat(&mut self, place: usize, r: &Request<'_>) -> Answer {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        let registered = !TABLE[place].is_client() && self.entries[place].state == State::Running;
-        if registered {
-            Answer::Status(Status::Ok)
-        } else {
-            refuse(Error::BadState)
+        let entry = &mut self.entries[place];
+        let registered = !TABLE[place].is_client() && entry.state == State::Running;
+        if !registered {
+            return refuse(Error::BadState);
         }
+        if let Some(at) = entry.watch.as_mut().map(|w| w.beat(now())) {
+            self.set_deadline(place, at);
+        }
+        Answer::Status(Status::Ok)
     }
 
     /// LIST (spec 13.4): BAD_SIZE for a request out of its layout; the
@@ -664,7 +827,7 @@ impl Init {
             Some(place) => {
                 let (record, entry) = (&TABLE[place], &self.entries[place]);
                 (failures, restarts) = (entry.failures.recent(now()), entry.restarts);
-                let process = entry.instance.as_ref().map(|i| &i.spawned.process);
+                let process = entry.held.running().map(Instance::process);
                 let (p, c) = (record.priority, record.ceiling);
                 (record.name, entry.state, p, c, record.is_client(), process)
             }
@@ -725,7 +888,7 @@ impl Init {
 /// init heard of the end of its service counts as none, and the request
 /// waits for the next instance.
 fn open(entry: &Entry) -> Option<&Handle<Channel>> {
-    let channel = entry.instance.as_ref()?.channel.as_ref()?;
+    let channel = entry.held.running()?.channel.as_ref()?;
     matches!(sys::channel_info(channel), Ok(info) if !info.closed).then_some(channel)
 }
 
@@ -777,13 +940,32 @@ impl Service<1> for Init {
         }
     }
 
+    /// The client of `s` went (CLIENT_GONE): its waiting CONNECT requests
+    /// leave the records they wait in (spec 13.4). Its instance, if it was
+    /// a service, ends through its exit notification (`ended`).
+    fn gone(&mut self, s: &mut Session<(), 1>) {
+        let label = s.label();
+        for entry in &mut self.entries {
+            for slot in &mut entry.waiting {
+                if slot.as_ref().is_some_and(|(p, _)| p.label() == label) {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
     /// The worker's notification: the outcome of its job; the end of an
-    /// instance (`ended`); an expiry of a timer of the records (`expired`).
+    /// instance (`ended`); an expiry of the timer of a record, which its
+    /// label names (`expired`).
     fn notification(&mut self, n: Notice) {
         match n.source {
             Source::Session if n.label == self.worker.label => self.accept(),
             Source::Exit => self.ended(n.label),
-            Source::Timer if n.label == 0 => self.expired(),
+            Source::Timer => {
+                if let Some(place) = self.timed(n.label) {
+                    self.expired(place);
+                }
+            }
             _ => {}
         }
     }

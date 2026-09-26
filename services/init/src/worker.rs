@@ -2,16 +2,19 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Init's worker thread (spec 8, 13.4): it loads the instances of the
-//! records of the table (rt::loader::spawn) and closes init's handles of
-//! those that ended, one job at a time, so that init's main thread at 63
-//! never waits for work that grows with the size of a service, and never
-//! lets go of the last handles of an instance. The main thread puts a job
-//! into the cell (`Worker::load`, `Worker::teardown`), sets the worker's
-//! level (init::work::worker_level) and wakes it through the worker's
-//! channel; the worker does the job, leaves its outcome in the cell and
-//! tells the main thread through its copy of init's channel with NOTIFY and
-//! a label of its own, whose slot is at WORKER_MAX.
+//! records of the table (rt::loader::spawn), tears down those that ended
+//! and kills those that went silent, one job at a time, so that init's
+//! main thread at 63 never waits for work that grows with the size of a
+//! service, and never lets go of the last handles of an instance. The main
+//! thread puts a job into the cell (`Worker::load`, `Worker::teardown`,
+//! `Worker::kill`), sets the worker's level (init::work::worker_level) and
+//! wakes it through the worker's channel; the worker does the job, leaves
+//! its outcome in the cell and tells the main thread through its copy of
+//! init's channel with NOTIFY and a label of its own, whose slot is at
+//! WORKER_MAX. An instance's handles close here, so the cleanup of their
+//! objects runs at the worker's level, below init (spec 7.7).
 
+use crate::serve::Instance;
 use abi::{Error, Policy, Rights};
 use bootimg::Program;
 use core::cell::UnsafeCell;
@@ -34,15 +37,6 @@ const STACK_SIZE: usize = 32 * 1024;
 
 static STACK: Stack<STACK_SIZE> = Stack::new();
 
-/// What is left of an instance that ended, whose handles the worker
-/// closes (`Worker::teardown`): its process, its first thread and the
-/// channel it registered, which may be the last handles of their objects.
-pub struct Gone {
-    pub process: Handle<Process>,
-    pub thread: Handle<Thread>,
-    pub channel: Option<Handle<Channel>>,
-}
-
 /// A job the main thread gives the worker.
 enum Order {
     /// Load an instance of the record at `place` of the table from
@@ -52,8 +46,11 @@ enum Order {
         label: u64,
         program: Program<'static>,
     },
-    /// Close init's handles of the instance in the cell's `gone`.
+    /// Close the handles of the instance in the cell's `gone`.
     Teardown,
+    /// Kill the process of the instance in the cell's `gone`, then close
+    /// its handles.
+    Kill,
 }
 
 /// What a load leaves the main thread: the instance, its thread not
@@ -74,7 +71,7 @@ const DONE: u8 = 2;
 struct Cell {
     state: AtomicU8,
     order: UnsafeCell<Option<Order>>,
-    gone: UnsafeCell<Option<Gone>>,
+    gone: UnsafeCell<Option<Instance>>,
     loaded: UnsafeCell<Option<Loaded>>,
 }
 
@@ -178,14 +175,20 @@ impl Worker {
 
     /// Gives the worker the teardown of `gone`, an instance that ended:
     /// its handles close in the worker (`give`).
-    pub fn teardown(&self, gone: Gone) -> Result<(), Error> {
+    pub fn teardown(&self, gone: Instance) -> Result<(), Error> {
         self.give(Order::Teardown, Some(gone))
+    }
+
+    /// Gives the worker the kill of `gone`, an instance that went silent:
+    /// the worker kills its process, then its handles close (`give`).
+    pub fn kill(&self, gone: Instance) -> Result<(), Error> {
+        self.give(Order::Kill, Some(gone))
     }
 
     /// Puts `order` and `gone` into the cell and wakes the worker. The
     /// main thread gives a job only once it took the outcome of the one
     /// before (`take`).
-    fn give(&self, order: Order, gone: Option<Gone>) -> Result<(), Error> {
+    fn give(&self, order: Order, gone: Option<Instance>) -> Result<(), Error> {
         assert_eq!(
             CELL.state.load(Ordering::Acquire),
             FREE,
@@ -226,6 +229,8 @@ extern "C" fn work(_: u64) -> ! {
         let Some(order) = (unsafe { (*CELL.order.get()).take() }) else {
             continue;
         };
+        // SAFETY: still GIVEN: the cell is the worker's.
+        let gone = unsafe { (*CELL.gone.get()).take() };
         let loaded = match order {
             Order::Load {
                 place,
@@ -233,9 +238,15 @@ extern "C" fn work(_: u64) -> ! {
                 program,
             } => Some(load(&TABLE[place], label, &program)),
             Order::Teardown => {
-                // SAFETY: still GIVEN: the cell is the worker's.
-                if let Some(gone) = unsafe { (*CELL.gone.get()).take() } {
-                    teardown(gone);
+                // The handles close here, the cleanup at the worker's level.
+                drop(gone);
+                None
+            }
+            Order::Kill => {
+                if let Some(gone) = gone {
+                    // The process goes, then its handles (spec 7.7).
+                    let _ = sys::process_kill(gone.process());
+                    drop(gone);
                 }
                 None
             }
@@ -246,18 +257,6 @@ extern "C" fn work(_: u64) -> ! {
         // The main thread lives as long as init's channel.
         let _ = sys::notify(&tell, 1);
     }
-}
-
-/// Closes init's handles of an instance that ended (spec 7.7): the
-/// channel it registered, its thread and its process; the cleanup of an
-/// object whose last handle goes runs at the worker's level. A close that
-/// fails changes nothing: the handle went.
-fn teardown(gone: Gone) {
-    if let Some(channel) = gone.channel {
-        let _ = channel.close();
-    }
-    let _ = gone.thread.close();
-    let _ = gone.process.close();
 }
 
 /// Loads an instance of `record` from `program` with the label `label` on

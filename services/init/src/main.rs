@@ -32,6 +32,9 @@ rt::entry!(main);
 
 // The arguments init gives a record fit the start data of rt (spec 13.3).
 const _: () = assert!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX <= rt::startup::ARGS_MAX);
+// Init lives on the stack of the main thread (64 KiB, INIT_STACK_SIZE of
+// xtask), twice while `Init::new` builds it.
+const _: () = assert!(core::mem::size_of::<serve::Init>() <= 20 * 1024);
 
 /// Where init maps the boot image, read-only, for as long as it lives: the
 /// programs it loads are read from there.

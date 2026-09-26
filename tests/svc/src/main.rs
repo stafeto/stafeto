@@ -7,9 +7,11 @@
 //! table `table-test` of services/init): `e` a service that answers ECHO,
 //! LABEL, ARGS, GATE and OPEN (echo.rs), `d` a service with a window and
 //! a binding (device.rs), `x` a service that faults right after its start
-//! (`crash`), `c` the client that runs the tests of init as a service
-//! manager (checker.rs). A service registers its channel with init
-//! (rt::service::register) and serves it with its heartbeat
+//! (`crash`), `s` a service that hangs on HANG (silent.rs), `k` a service
+//! that keeps init's STATS from a kill (sink.rs), `m` a service that never
+//! registers (`mute`), `c` the client that runs the tests of init as a
+//! service manager (checker.rs). A service registers its channel with
+//! init (rt::service::register) and serves it with its heartbeat
 //! (rt::service::run). The program ends with the code of its role, or
 //! FAILED when its start data did not come.
 
@@ -19,12 +21,17 @@
 mod checker;
 mod device;
 mod echo;
+mod silent;
+mod sink;
 
-use proto_init::{SERVICE_ARGS_FIXED, ServiceArgs};
+use abi::{Error, MESSAGE_MAX};
+use proto_init::{Method, SERVICE_ARGS_FIXED, ServiceArgs};
+use proto_wire::{Reader, Status};
 use rt::handle::Channel;
 use rt::service::{self, Config, Heartbeat, Service};
 use rt::startup::Startup;
-use rt::{Handle, sys};
+use rt::wait::Waiter;
+use rt::{Handle, sys, time};
 
 rt::entry!(main);
 
@@ -32,10 +39,15 @@ rt::entry!(main);
 const ECHO: u8 = b'e';
 const DEVICE: u8 = b'd';
 const CRASH: u8 = b'x';
+const SILENT: u8 = b's';
+const SINK: u8 = b'k';
+const MUTE: u8 = b'm';
 const CHECKER: u8 = b'c';
 
 /// The code of a role that could not do its part.
 const FAILED: u64 = 1;
+/// The code of `mute` when init took a HEARTBEAT before its REGISTER.
+const BEAT_TAKEN: u64 = 2;
 
 /// The version of the protocol of the test services.
 const VERSION: u16 = 1;
@@ -45,7 +57,9 @@ const VERSION: u16 = 1;
 /// and the label of the caller's session. ARGS: the status, 4 zero bytes
 /// and the start arguments of the service. REPORT, of `device`: what its
 /// REGISTER brought (device::Report). GATE, of an echo: the status once
-/// OPEN came to that echo; OPEN: the status.
+/// OPEN came to that echo; OPEN: the status. HELLO, of `sink`: marks the
+/// session; SEEN, of `sink`: the STATS it kept. HANG, of `silent`: raises
+/// the service to its ceiling and spins, and never replies.
 mod method {
     pub const ECHO: u16 = 1;
     pub const LABEL: u16 = 2;
@@ -53,6 +67,9 @@ mod method {
     pub const REPORT: u16 = 4;
     pub const GATE: u16 = 5;
     pub const OPEN: u16 = 6;
+    pub const HELLO: u16 = 7;
+    pub const SEEN: u16 = 8;
+    pub const HANG: u16 = 9;
 }
 
 /// The sessions of a test service.
@@ -66,8 +83,40 @@ fn main(_: u64) -> u64 {
         Some(&ECHO) => echo::run(s),
         Some(&DEVICE) => device::run(s),
         Some(&CRASH) => crash(),
+        Some(&SILENT) => silent::run(s),
+        Some(&SINK) => sink::run(s),
+        Some(&MUTE) => mute(&s),
         Some(&CHECKER) => checker::run(s),
         _ => FAILED,
+    }
+}
+
+/// The role `mute`: a service that never registers and never ends, so
+/// init's watchdog from its start restarts it until it is broken (spec
+/// 13.4). It sends HEARTBEAT every period of its arguments, which init
+/// refuses with BAD_STATE before REGISTER; any other status ends it with
+/// BEAT_TAKEN.
+fn mute(s: &Startup) -> u64 {
+    let period_ns = ServiceArgs::read(s.args()).map_or(0, |a| a.period_ns);
+    let Ok(channel) = sys::channel_create(base(s)) else {
+        return FAILED;
+    };
+    let Ok(waiter) = Waiter::new(&channel, 0, base(s)) else {
+        return FAILED;
+    };
+    let beat = Method::Heartbeat.header().bytes();
+    let refused = Status::Kernel(Error::BadState).code();
+    let mut at = time::ticks_to_ns(time::now());
+    loop {
+        let got = sys::send(&s.parent, &beat).map(|reply| {
+            let mut buffer = [0; MESSAGE_MAX];
+            Reader::new(reply.bytes(&mut buffer)).u32()
+        });
+        if got != Ok(Ok(refused)) {
+            return BEAT_TAKEN;
+        }
+        at += period_ns;
+        let _ = waiter.receive_until(&channel, at);
     }
 }
 

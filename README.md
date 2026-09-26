@@ -73,6 +73,13 @@ and on Apple silicon under HVF. What works today:
   when a client goes, and sends its heartbeat at absolute deadlines from
   the thread that serves requests. One ELF reader, `bootimg::elf`, builds
   the boot image, whose reader refuses two files with one name.
+- **Services:** `init` starts the services of its table in the order of
+  their dependencies and refuses a table with a cycle or a broken
+  ceiling; it hands out sessions by name (`connect`), restarts a service
+  that ends or goes silent after a growing pause, marks it broken after
+  five failures in 60 s, and loads, kills and tears services down on a
+  worker thread just above the service's ceiling. An image of a test
+  table checks all of it.
 
 `cargo xtask run` boots to `init`, which checks its table of services,
 empty for now, and says that the services started. `cargo xtask test`
@@ -102,7 +109,8 @@ parts. Each finished part is merged through a pull request.
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | 🚧 |
 | | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
 | | 1.4b Runtime and protocols | handles that own their entries, strict test builds, one time scale, `proto/wire` and `proto/init`, start protocol, service loop with sessions and a heartbeat, ELF reader in `bootimg` | ✅ [#17](https://github.com/stafeto/stafeto/pull/17) |
-| | 1.4c init services | `init` starts services from its table, refuses a table with a cycle or a broken ceiling, serves names through `connect`, restarts crashed and silent services and marks broken ones | 🚧 |
+| | 1.4c init services | `init` starts services from its table, refuses a table with a cycle or a broken ceiling, serves names through `connect`, restarts crashed and silent services and marks broken ones | ✅ #PR |
+| | 1.4d UART driver and shell | the PL011 driver and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | 🚧 |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the
