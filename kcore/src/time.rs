@@ -2,41 +2,43 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Time on the generic timer's counter (spec 10): counter ticks to
-//! nanoseconds and back, and compare values for deadlines.
+//! nanoseconds and back on the scale of the system (abi::time::Scale),
+//! and compare values for deadlines.
 
-pub const NANOS_PER_SEC: u64 = 1_000_000_000;
+pub use abi::time::NANOS_PER_SEC;
+use abi::time::Scale;
 
-/// The counter's frequency (CNTFRQ_EL0), which fixes how ticks and
-/// nanoseconds convert.
+/// The counter's frequency (CNTFRQ_EL0) and the scale it fixes, which the
+/// kernel works out once at boot (arch::timer::init).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Clock {
-    hz: u64,
+    scale: Scale,
 }
 
 impl Clock {
     /// None for a zero frequency: the firmware left CNTFRQ_EL0 unset.
     pub const fn new(hz: u64) -> Option<Clock> {
-        if hz == 0 { None } else { Some(Clock { hz }) }
+        match Scale::new(hz) {
+            Some(scale) => Some(Clock { scale }),
+            None => None,
+        }
     }
 
     pub const fn hz(self) -> u64 {
-        self.hz
+        self.scale.hz()
     }
 
-    /// Nanoseconds in `ticks`, rounded down; saturates at u64::MAX.
+    /// Nanoseconds in `ticks` on the scale, rounded down; saturates at
+    /// u64::MAX.
     pub fn ticks_to_ns(self, ticks: u64) -> u64 {
-        saturate(u128::from(ticks) * u128::from(NANOS_PER_SEC) / u128::from(self.hz))
+        self.scale.ticks_to_ns(ticks)
     }
 
-    /// Ticks in `ns`, rounded up so that a timer never fires early;
-    /// saturates at u64::MAX.
+    /// The least tick at which `ticks_to_ns` reaches `ns`, so that a timer
+    /// never fires early; saturates at u64::MAX.
     pub fn ns_to_ticks(self, ns: u64) -> u64 {
-        saturate((u128::from(ns) * u128::from(self.hz)).div_ceil(u128::from(NANOS_PER_SEC)))
+        self.scale.ns_to_ticks(ns)
     }
-}
-
-fn saturate(v: u128) -> u64 {
-    u64::try_from(v).unwrap_or(u64::MAX)
 }
 
 /// For the kernel tests, which set deadlines of their own and measure
@@ -105,14 +107,17 @@ mod tests {
 
     #[test]
     fn ticks_and_nanoseconds_at_24_mhz() {
+        // 10^9 / 24 MHz is no whole number: the scale is at most 1 ns
+        // under the exact division (abi::time::Scale), and a deadline on
+        // a tick of the exact division takes the tick after it.
         let c = clock(A64_HZ);
         assert_eq!(c.ticks_to_ns(1), 41);
-        assert_eq!(c.ticks_to_ns(3), 125);
-        assert_eq!(c.ticks_to_ns(A64_HZ), NANOS_PER_SEC);
+        assert_eq!(c.ticks_to_ns(3), 124);
+        assert_eq!(c.ticks_to_ns(A64_HZ), NANOS_PER_SEC - 1);
         assert_eq!(c.ns_to_ticks(1), 1);
-        assert_eq!(c.ns_to_ticks(125), 3);
-        assert_eq!(c.ns_to_ticks(126), 4);
-        assert_eq!(c.ns_to_ticks(1_000), 24);
+        assert_eq!(c.ns_to_ticks(124), 3);
+        assert_eq!(c.ns_to_ticks(125), 4);
+        assert_eq!(c.ns_to_ticks(1_000), 25);
     }
 
     #[test]

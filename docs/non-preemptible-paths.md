@@ -188,7 +188,7 @@ bounds in time come from hardware (spec 15.3). An empty cell is a path not
 measured yet. Counts marked "test build" come from the kernel's own tests
 under -icount, whose hooks change the shape of the code. The build that
 ships is measured by the test init under -icount, which prints
-`normal build ticks: null=250 clock=316 yield=360 notify=848
+`normal build ticks: null=250 clock=293 yield=360 notify=848
 round_trip=1773`: call 0, `clock_now`, `yield` with no other thread at
 the caller's level, `notify` with the `try_receive` that takes the slot
 back, and a round trip of 8 bytes to a thread of the same process. Both

@@ -2,18 +2,20 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Tests of the runtime, lib/rt, on top of the calls (spec 5.4, 6.1,
-//! 13.2): handles that own their entry of the table, the handles of a
-//! message, init's first handles, and the strict build of the test
-//! images, where BAD_HANDLE from a typed call panics.
+//! 10, 13.2): handles that own their entry of the table, the handles of a
+//! message, init's first handles, the strict build of the test images,
+//! where BAD_HANDLE from a typed call panics, and waits with a bound.
 
 use crate::channels::{take_one, unlabeled};
 use crate::harness::*;
 use crate::messages::answer_all;
 use crate::processes::{Gift, ran};
+use crate::timers::timer_at;
 use crate::transfers::{close_raw, copy_raw, give, handle_client};
+use rt::wait::{Waited, Waiter};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 10] = [
+pub(crate) const TESTS: [Test; 14] = [
     ("dropped_handle_closes", dropped_handle_closes),
     ("into_raw_keeps_the_handle", into_raw_keeps_the_handle),
     ("borrowed_handle_stays_open", borrowed_handle_stays_open),
@@ -39,6 +41,16 @@ pub(crate) const TESTS: [Test; 10] = [
         "raw_call_returns_bad_handle_in_a_strict_build",
         raw_call_returns_bad_handle_in_a_strict_build,
     ),
+    ("wait_ends_at_its_deadline", wait_ends_at_its_deadline),
+    (
+        "wait_returns_an_early_message",
+        wait_returns_an_early_message,
+    ),
+    (
+        "stale_expiry_does_not_end_a_wait",
+        stale_expiry_does_not_end_a_wait,
+    ),
+    ("wait_leaves_no_timer_armed", wait_leaves_no_timer_armed),
 ];
 
 /// Init's live handles (PROCESS_HANDLES).
@@ -289,5 +301,158 @@ fn raw_call_returns_bad_handle_in_a_strict_build() -> Outcome {
     check(
         x0_alone::<N>(&[gone], Error::BadHandle.code()),
         "a raw call with a closed handle did not return BAD_HANDLE in x0 alone",
+    )
+}
+
+/// The bound of a wait that something else ends first: a thread switch or
+/// a message already there takes far less; the bound only ends a test
+/// that failed.
+const BOUND_NS: u64 = 100_000_000;
+
+/// A waiter on `c`, a channel handle without a label, at init's level.
+fn waiter(c: &Handle<Channel>) -> Result<Waiter, &'static str> {
+    Waiter::new(c, 0, TEST_PRIORITY).map_err(|_| "Waiter::new failed")
+}
+
+/// Waits in receive on a timer of a channel of its own until `deadline`
+/// passed; the receive that finds nothing afterwards ends the boost of
+/// the expiry (spec 6.6).
+fn wait_past(deadline: u64) -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer_at(&c, QUIET)?;
+    let waited = arm(&t, deadline).map(|()| sys::receive(&c));
+    let _ = sys::try_receive(&c);
+    close(t)?;
+    close(c)?;
+    check(
+        matches!(waited, Ok(Ok(Received::Notification { .. }))),
+        "the wait past a deadline did not end at its timer",
+    )
+}
+
+/// Spec 10, 15.2 (time): a wait with nothing to take ends with Expired,
+/// and the counter has reached the deadline: in nanoseconds of the scale
+/// and at the tick where the kernel fires it.
+fn wait_ends_at_its_deadline() -> Outcome {
+    let c = channel(QUIET)?;
+    let w = waiter(&c)?;
+    let deadline = clock_now()? + 2_000_000;
+    let waited = w.receive_until(&c, deadline);
+    let now = time::now();
+    let rest = sys::try_receive(&c);
+    drop(w);
+    close(c)?;
+    check(
+        waited == Ok(Waited::Expired),
+        "the wait did not end at its deadline",
+    )?;
+    check(
+        now >= time::ns_to_ticks(deadline) && time::ticks_to_ns(now) >= deadline,
+        "the wait ended before its deadline",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "something came after the expiry",
+    )
+}
+
+/// Notifies the channel whose handle HANDLES holds for `slot`, then ends:
+/// a thread below init runs once init waits.
+extern "C" fn notify_then_end(slot: u64) -> ! {
+    let _ = sys::notify(&handle(slot as usize), NOTIFIED);
+    ENDED[slot as usize].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 6.1, 10: what comes before the deadline ends the wait with Got. A
+/// thread below init, which runs once init waits, notifies the channel:
+/// the notification comes, and once the deadline passed the channel is
+/// still empty, since the wait cancelled its timer.
+fn wait_returns_an_early_message() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let w = waiter(&c)?;
+    let t = spawn(0, notify_then_end, 0, LEVEL, Policy::Fifo)?;
+    let deadline = clock_now()? + BOUND_NS;
+    let waited = w.receive_until(&c, deadline);
+    let passed = wait_past(deadline + 1_000_000);
+    let info = sys::channel_info(&c);
+    let rest = sys::try_receive(&c);
+    close(t)?;
+    drop(w);
+    close(c)?;
+    passed?;
+    check(
+        waited == Ok(Waited::Got(unlabeled(NOTIFIED, 1))) && ended(0),
+        "the notification before the deadline did not end the wait",
+    )?;
+    check(
+        info.is_ok_and(|i| i.queued == 0) && rest == Err(Error::WouldBlock),
+        "the timer of a wait that ended early fired",
+    )
+}
+
+/// Spec 10: an expiry of an earlier wait does not end the next one. The
+/// first wait has a deadline that passed and a notification of a slot
+/// above the timer's waiting: timer_set fires at once, the notification
+/// comes first and ends the wait, and the expiry stays in the slot. The
+/// second wait takes that expiry before its own deadline, goes on, and
+/// ends at its deadline, STALE_MARGIN_NS on: a host that holds the run up
+/// for less between timer_set and receive keeps the stale expiry apart
+/// from the deadline.
+fn stale_expiry_does_not_end_a_wait() -> Outcome {
+    const STALE_MARGIN_NS: u64 = 20_000_000;
+    let c = channel(NOTICE)?;
+    let w = waiter(&c)?;
+    let notified = sys::notify(&c, NOTIFIED);
+    let first = w.receive_until(&c, clock_now()?);
+    let deadline = clock_now()? + STALE_MARGIN_NS;
+    let second = w.receive_until(&c, deadline);
+    let now = time::now();
+    let rest = sys::try_receive(&c);
+    drop(w);
+    close(c)?;
+    check(
+        notified.is_ok() && first == Ok(Waited::Got(unlabeled(NOTIFIED, 1))),
+        "the notification did not end the first wait",
+    )?;
+    check(
+        second == Ok(Waited::Expired) && time::ticks_to_ns(now) >= deadline,
+        "a stale expiry ended the second wait before its deadline",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "something came after the expiry",
+    )
+}
+
+/// Spec 10: a wait leaves no timer armed, whether it ended at its deadline
+/// or with a message: after an expiry and then a wait that a notification
+/// already there ends, nothing comes into the channel until a third
+/// deadline after the second.
+fn wait_leaves_no_timer_armed() -> Outcome {
+    let c = channel(NOTICE)?;
+    let w = waiter(&c)?;
+    let expired = w.receive_until(&c, clock_now()? + 1_000_000);
+    let notified = sys::notify(&c, NOTIFIED);
+    let second = clock_now()? + BOUND_NS;
+    let got = w.receive_until(&c, second);
+    let passed = wait_past(second + 1_000_000);
+    let rest = sys::try_receive(&c);
+    drop(w);
+    close(c)?;
+    passed?;
+    check(
+        expired == Ok(Waited::Expired),
+        "the first wait did not expire",
+    )?;
+    check(
+        notified.is_ok() && got == Ok(Waited::Got(unlabeled(NOTIFIED, 1))),
+        "the notification did not end the second wait",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "a timer stayed armed after a wait",
     )
 }

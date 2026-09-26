@@ -7,10 +7,11 @@
 //! wrappers of the system calls the kernel has, requests and their tokens
 //! among them, and a raw call for any other (`sys`), the thread's message
 //! buffer (`msgbuf`), output through `debug_write` (`console`, `print!`,
-//! `println!`), the counter read without a call (`time`), the loader of
-//! programs of the boot image (`loader`), stacks for threads in static
-//! memory, and the panic handler. The start protocol and the service loop
-//! come later in milestone 1.4.
+//! `println!`), the counter and the time scale of the system without a
+//! call (`time`), waits with a bound (`wait`), the loader of programs of
+//! the boot image (`loader`), stacks for threads in static memory, and the
+//! panic handler. The start protocol and the service loop come later in
+//! milestone 1.4.
 //!
 //! A program names its main function with `rt::entry!`; `_start` calls it
 //! with the x0 the kernel set and ends the process with the code it
@@ -25,6 +26,7 @@ pub mod mmio;
 pub mod msgbuf;
 pub mod sys;
 pub mod time;
+pub mod wait;
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -117,6 +119,7 @@ extern "C" fn start(arg: u64) -> ! {
         /// The program's main function (`entry!`).
         fn __rt_main(arg: u64) -> u64;
     }
+    time::init();
     // SAFETY: `entry!` defines the function with this signature.
     let code = unsafe { __rt_main(arg) };
     sys::process_exit(code)

@@ -174,7 +174,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 189;
+const INIT_TESTS: u32 = 193;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -587,6 +587,7 @@ fn test() -> Result<(), String> {
     stack_overflow_report()?;
     test_build_carries_test_symbols()?;
     strict_panic_only_in_checked_programs()?;
+    no_u128_division_is_linked()?;
     init_tests(&qemu::VIRT, false)?;
     init_tests(&qemu::VIRT_2G, false)?;
     init_tests(&qemu::VIRT, true)?;
@@ -936,6 +937,46 @@ fn strict_panic_only_in_checked_programs() -> Result<(), String> {
         "the panic on BAD_HANDLE in the checked programs alone, {} ELF files",
         elfs.len()
     );
+    Ok(())
+}
+
+/// The library calls of a 128-bit division, unsigned and signed, which
+/// the time scale leaves out of the kernel and the programs (spec 10,
+/// abi::time::Scale).
+const U128_DIVISION: [&str; 4] = ["__udivti3", "__umodti3", "__divti3", "__modti3"];
+
+/// Which of U128_DIVISION the symbols `nm` listed define.
+fn u128_division(nm: &str) -> Vec<&'static str> {
+    U128_DIVISION
+        .into_iter()
+        .filter(|name| {
+            nm.lines()
+                .any(|l| l.split_whitespace().last() == Some(name))
+        })
+        .collect()
+}
+
+/// Spec 10: ticks and nanoseconds convert by a multiply and a shift, so
+/// neither the ELF of the normal kernel nor any program of the two boot
+/// images, each of its own profile (program_elfs), links a 128-bit
+/// division.
+fn no_u128_division_is_linked() -> Result<(), String> {
+    let programs = program_elfs()?.into_iter().map(|(elf, _)| elf);
+    let elfs: Vec<_> = [build(Variant::Normal)?.elf]
+        .into_iter()
+        .chain(programs)
+        .collect();
+    for elf in &elfs {
+        let found = u128_division(&nm_defined(elf)?);
+        if !found.is_empty() {
+            return Err(format!(
+                "{} links a 128-bit division: {}",
+                elf.display(),
+                found.join(", ")
+            ));
+        }
+    }
+    println!("no 128-bit division in {} ELF files", elfs.len());
     Ok(())
 }
 
@@ -1401,6 +1442,19 @@ mod tests {
                 .any(|l| l.starts_with("debug-assertions")),
             "[profile.release] sets debug-assertions"
         );
+    }
+
+    /// `u128_division` finds the symbols of a 128-bit division in the
+    /// lines `llvm-nm -C --defined-only` prints, and nothing in others.
+    #[test]
+    fn u128_division_is_found_by_its_symbols() {
+        let nm = "ffffffffc001d3b8 t __udivti3\n0000000000201000 T _start\n";
+        assert_eq!(u128_division(nm), ["__udivti3"]);
+        assert!(u128_division("0000000000201000 T __umodti3_like\n").is_empty());
+        let both = "1 T __umodti3\n2 t __udivti3\n";
+        assert_eq!(u128_division(both), ["__udivti3", "__umodti3"]);
+        let signed = "1 T __modti3\n2 t __divti3\n";
+        assert_eq!(u128_division(signed), ["__divti3", "__modti3"]);
     }
 
     /// `once` calls `make` at most once for a key: a second call with the

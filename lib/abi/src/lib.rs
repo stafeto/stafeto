@@ -5,9 +5,12 @@
 //! 6, 8, 11, 12, 13.3): handle layout, rights, system call numbers and
 //! where their arguments and results go, what `receive` returns, the
 //! layout of a thread's message buffer, init's first handles, scheduling
-//! policies and error codes.
+//! policies and error codes; and the time scale of the kernel and the
+//! programs (`time`).
 
 #![cfg_attr(not(test), no_std)]
+
+pub mod time;
 
 /// A process's name for a kernel object (spec 5.1): the low 16 bits index
 /// its handle table, the high 48 bits carry the entry's generation. The
