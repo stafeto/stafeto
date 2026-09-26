@@ -15,6 +15,7 @@ pub const GICD_ISACTIVER: usize = 0x300;
 pub const GICD_ICACTIVER: usize = 0x380;
 pub const GICD_IPRIORITYR: usize = 0x400;
 pub const GICD_ITARGETSR: usize = 0x800;
+pub const GICD_ICFGR: usize = 0xC00;
 
 // CPU interface registers, offsets from its base.
 pub const GICC_CTLR: usize = 0x000;
@@ -42,6 +43,10 @@ pub const FIRST_SPI: u32 = 32;
 /// The EL1 virtual timer: PPI 11.
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
 
+/// The line of the kernel's console, the PL011 of QEMU `virt` (SPI 1):
+/// no program binds it until milestone 1.4 (spec 9).
+pub const CONSOLE_INTID: u32 = 33;
+
 /// GICC_IAR reads 1020..=1023 when there is nothing to acknowledge.
 pub const FIRST_SPURIOUS: u32 = 1020;
 
@@ -62,6 +67,16 @@ pub fn bit(bank: usize, intid: u32) -> (usize, u32) {
 /// one-byte-per-line registers (IPRIORITYR, ITARGETSR), and the byte's shift.
 pub fn byte(bank: usize, intid: u32) -> (usize, u32) {
     (bank + (intid & !3) as usize, 8 * (intid % 4))
+}
+
+/// Offset and mask of the bit of GICD_ICFGR that makes `intid` edge-triggered
+/// when set and level-triggered when clear: bit 2·(n % 16) + 1 of the
+/// register at 0xC00 + 4·(n / 16) [G25].
+pub fn cfg(intid: u32) -> (usize, u32) {
+    (
+        GICD_ICFGR + 4 * (intid / 16) as usize,
+        1 << (2 * (intid % 16) + 1),
+    )
 }
 
 /// An acknowledged interrupt: the GICC_IAR value, which goes back to
@@ -109,6 +124,14 @@ mod tests {
         assert_eq!(byte(GICD_IPRIORITYR, 27), (0x418, 24));
         assert_eq!(byte(GICD_IPRIORITYR, 32), (0x420, 0));
         assert_eq!(byte(GICD_ITARGETSR, 33), (0x820, 8));
+    }
+
+    #[test]
+    fn trigger_bit_is_2n_plus_1() {
+        assert_eq!(cfg(32), (0xC08, 1 << 1));
+        assert_eq!(cfg(47), (0xC08, 1 << 31));
+        assert_eq!(cfg(48), (0xC0C, 1 << 1));
+        assert_eq!(cfg(1019), (0xC00 + 4 * 63, 1 << 23));
     }
 
     #[test]

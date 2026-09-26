@@ -511,9 +511,8 @@ unsafe fn notify_exit(process: NonNull<Process>, level: u8) -> bool {
     unsafe {
         let exit = &raw mut (*process.as_ptr()).exit;
         if let Some(e) = (*exit).as_mut() {
-            let slot = NonNull::new_unchecked(&raw mut e.slot);
             // PEER_CLOSED: nothing is posted (spec 6.5).
-            let _ = channel::post(e.channel, slot, EXIT_BITS, level);
+            let _ = Source::post(NonNull::from(e), EXIT_BITS, level);
         }
     }
     true
@@ -536,31 +535,28 @@ unsafe fn release_pages(p: *mut Process) -> bool {
     })
 }
 
-/// A shell's last portion, once its pages went: the slot goes back to the
-/// pool it came from, its parent's or ROOTS, then the exit channel gets
-/// its slot and its reference back, the rest of the quota goes to the
-/// parent (Account::return_rest: nothing is charged by now, since
-/// whatever held the shell went), and then the reference to the parent's
-/// shell, which queues that shell at `level` if it was the last.
+/// A shell's last portion, once its pages went: the exit channel gets its
+/// slot and its reference back (Source::detach), the slot of the shell goes
+/// back to the pool it came from, its parent's or ROOTS, the rest of the
+/// quota goes to the parent (Account::return_rest: nothing is charged by
+/// now, since whatever held the shell went), and then the reference to the
+/// parent's shell, which queues that shell at `level` if it was the last.
 ///
 /// # Safety
 /// Nothing refers to the shell, its pages went, and it is in no queue.
 unsafe fn free(process: NonNull<Process>, level: u8) {
-    // SAFETY: the caller's promise; only the fields are touched.
-    let (parent, rest, exit) = unsafe {
+    // SAFETY: the caller's promise; only the fields are touched, and the
+    // exit source goes with the shell.
+    let (parent, rest) = unsafe {
         let p = process.as_ptr();
-        let exit = (*p).exit.as_ref().map(|e| {
-            assert!(
-                !e.slot.is_queued(),
-                "a shell goes while its exit slot is queued"
-            );
-            e.channel
-        });
         assert!(
             (*p).accepted.is_empty(),
             "a shell goes with requests its threads accepted"
         );
-        ((*p).parent, (*p).quota.return_rest(), exit)
+        if let Some(e) = (*p).exit.as_mut() {
+            e.detach(level);
+        }
+        ((*p).parent, (*p).quota.return_rest())
     };
     // SAFETY: the caller's promise; every stage gave its memory back, and
     // the parent's pool is there, since the shell holds the parent's.
@@ -571,11 +567,6 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
         }
         LIVE.gone(process);
     }
-    if let Some(c) = exit {
-        channel::remove_source(c);
-        // SAFETY: the shell's reference to its exit channel goes with it.
-        unsafe { channel::release(c, Rights::NONE, level) };
-    }
     if let Some(parent) = parent {
         refund(parent, rest);
         // SAFETY: the shell's reference to its parent goes with it.
@@ -584,12 +575,12 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
 }
 
 /// The end of `child`, which process_create just made, goes as a
-/// notification into `c` (spec 7.9): a slot of `priority` in the child's
-/// shell with `label`, the label of the caller's handle, which took one of
-/// the channel's slots already (channel::add_source). The shell holds the
-/// channel until it goes. R, the level of the child's teardown, is at
-/// least `priority` from now on (spec 7.7). Nothing can end the child
-/// before: it has no thread, and only the caller holds it.
+/// notification into `c` (spec 7.9): a source in the child's shell whose
+/// slot has `priority` and `label`, the label of the caller's handle, and
+/// took one of the channel's slots already (channel::reserve_source). The
+/// shell holds the channel until it goes. R, the level of the child's
+/// teardown, is at least `priority` from now on (spec 7.7). Nothing can end
+/// the child before: it has no thread, and only the caller holds it.
 pub fn set_exit(child: NonNull<Process>, c: NonNull<Channel>, label: u64, priority: u8) {
     // SAFETY: the caller holds a reference to the child, which is whole;
     // only the fields are touched.
@@ -599,14 +590,10 @@ pub fn set_exit(child: NonNull<Process>, c: NonNull<Channel>, label: u64, priori
             (*p).stage == Stage::Whole && (*p).exit.is_none(),
             "an exit channel for a process that ended, or has one"
         );
-        (*p).exit = Some(Exit {
-            slot: Slot::new(priority, Owner::Exit(child)),
-            label,
-            channel: c,
-        });
+        let exit = (*p).exit.insert(Source::new(c));
+        exit.attach(Owner::Exit(child), priority, label);
         (*p).level = (*p).level.max(priority);
     }
-    channel::retain(c, Rights::NONE);
 }
 
 /// The label of the exit notification of `process`, which receive reports
@@ -620,6 +607,6 @@ pub fn exit_label(process: NonNull<Process>) -> u64 {
             .exit
             .as_ref()
             .expect("an exit slot")
-            .label
+            .label()
     }
 }

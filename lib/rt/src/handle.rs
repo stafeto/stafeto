@@ -12,7 +12,7 @@ use core::fmt;
 use core::marker::PhantomData;
 
 /// A handle to an object of kind `K`: `Channel`, `Timer`, `Process`,
-/// `Thread`, `Resource` or `Memory`.
+/// `Thread`, `Resource`, `Memory` or `Interrupt`.
 #[repr(transparent)]
 pub struct Handle<K> {
     raw: abi::Handle,
@@ -31,6 +31,8 @@ pub enum Thread {}
 pub enum Resource {}
 /// A memory object (spec 7.3).
 pub enum Memory {}
+/// An interrupt binding (spec 9).
+pub enum Interrupt {}
 
 impl<K> Handle<K> {
     /// The handle with the value `raw`; the kernel checks the kind at each

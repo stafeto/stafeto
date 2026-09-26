@@ -1,40 +1,41 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Processes (spec 4, 8): an address space, the table of its mappings,
-//! its handle table, its priority ceiling, its threads that have not ended,
-//! its parent and children, and how it lives, in an object in its parent's
-//! pool of shells. A process lives while references to it are left:
-//! handles to it, its threads, and the one `create` hands out; its
-//! children hold only its shell. It ends (`end`) through
-//! process_exit, process_kill, a fault at EL0 or the exit of its last
-//! started thread, when its last reference goes while it lives, and when
-//! its parent ends. The end itself only stops its threads, at most
-//! abi::MAX_THREADS, and queues the process for cleanup; the queue
-//! takes it apart in stages, a portion at a time, with how far it came
-//! kept in the process (`Stage`, spec 7.7): first a wave that stops its
-//! descendants above the cause, at its priority ceiling, then the
-//! teardown at the level of the cause, its descendants first. Once it gave
-//! its quota back, its exit channel hears of the end (spec 7.9), through a
-//! slot in its shell. A shell with the reason stays for object_info until
-//! the last reference queues it once more. Every release names the level of its cause, which the
-//! cleanup it may start takes. A process pays from its quota for what goes
-//! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
-//! threads, the blocks of its handle table, the shells of its children, the
-//! channels it made, the sessions of the labels it gave (spec 5.3), its
-//! timers, at most abi::MAX_TIMERS (spec 10), the memory objects it made
-//! and the table of its mappings, whoever maps into it (`maps`); at once,
-//! for the pages of those objects (spec 7.3); and for the tables of its
-//! space, up front for a mapping, and the message buffers of its threads.
-//! The pages of its pools go back only with its shell, in portions. A
-//! child's quota comes off its parent's and goes
-//! back in two parts: what is free at the child's stage Quota, and the
-//! rest with its shell. The requests its threads accepted wait in it for
-//! their replies (spec 4, 6.8); once it ended, its stage Replies wakes
-//! their clients with PEER_CLOSED.
+//! Processes (spec 4, 8): an address space, the table of its mappings, its
+//! handle table, its priority ceiling, its threads that have not ended, its
+//! parent and children, and how it lives, in an object in its parent's pool
+//! of shells. A process lives while references to it are left: handles to
+//! it, its threads, and the one `create` hands out; its children hold only
+//! its shell. It ends (`end`) through process_exit, process_kill, a fault
+//! at EL0 or the exit of its last started thread, when its last reference
+//! goes while it lives, and when its parent ends. The end itself only stops
+//! its threads, at most abi::MAX_THREADS, and queues the process for
+//! cleanup; the queue takes it apart in stages, a portion at a time, with
+//! how far it came kept in the process (`Stage`, spec 7.7): first a wave
+//! that stops its descendants above the cause, at its priority ceiling,
+//! then the teardown at the level of the cause, its descendants first. Once
+//! it gave its quota back, its exit channel hears of the end (spec 7.9),
+//! through a slot in its shell. A shell with the reason stays for
+//! object_info until the last reference queues it once more. Every release
+//! names the level of its cause, which the cleanup it may start takes. A
+//! process pays from its quota for what goes with it (spec 7.5, 7.8): a
+//! page at a time as its pools grow, for its threads, the blocks of its
+//! handle table, the shells of its children, the channels it made, the
+//! sessions of the labels it gave (spec 5.3), its timers, at most
+//! abi::MAX_TIMERS (spec 10), the memory objects and the interrupt bindings
+//! it made, and the table of its mappings, whoever maps into it (`maps`);
+//! at once, for the pages of those objects (spec 7.3); and for the tables
+//! of its space, up front for a mapping, and the message buffers of its
+//! threads. The pages of its pools go back only with its shell, in
+//! portions. A child's quota comes off its parent's and goes back in two
+//! parts: what is free at the child's stage Quota, and the rest with its
+//! shell. The requests its threads accepted wait in it for their replies
+//! (spec 4, 6.8); once it ended, its stage Replies wakes their clients with
+//! PEER_CLOSED.
 
-use crate::channel::{self, Channel, Owner};
+use crate::channel::{Channel, Owner, Source};
 use crate::cleanup::{self, Item};
+use crate::irq::Irq;
 use crate::memory::Memory;
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
@@ -63,8 +64,8 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, add_mapping, begin_change, check_free, find_mapping, finish_change,
-    in_mapping, map_whole, step_change,
+    Change, abandon_change, add_mapping, begin_change, check_free, device_windows, find_mapping,
+    finish_change, in_mapping, map_whole, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
@@ -142,9 +143,12 @@ pub struct Process {
     /// its end and those of the calls that hastened it (`hasten`). It only
     /// grows.
     level: u8,
-    /// Where its end goes as a notification (process_create x3, spec 7.9):
-    /// set once, before anything can end the process.
-    exit: Option<Exit>,
+    /// The source of its exit notification (process_create x3, spec 6.5,
+    /// 7.9): its slot lies in the shell and holds the shell while it stands
+    /// in the channel's queue, with the label of the handle process_create
+    /// took as x3; the shell holds the channel, with one of its slots,
+    /// until the shell goes. Set once, before anything can end the process.
+    exit: Option<Source>,
     /// At the stage Stop, the child it stops next; a child that leaves
     /// the list moves it on (`leave_parent`).
     stop_next: Option<NonNull<Process>>,
@@ -187,17 +191,8 @@ pub struct Pools {
     timers: Pool<Timer>,
     /// The memory objects it made (spec 7.3).
     memories: Pool<Memory>,
-}
-
-/// The source of a process's exit notification (spec 6.5, 7.9): its slot,
-/// which lies in the shell and holds the shell while it stands in the
-/// channel's queue, the label of the handle process_create took as x3,
-/// and the channel, which the shell holds, with one of its slots, until
-/// the shell goes.
-struct Exit {
-    slot: Slot<Owner>,
-    label: u64,
-    channel: NonNull<Channel>,
+    /// The interrupt bindings it made (spec 9).
+    irqs: Pool<Irq>,
 }
 
 /// Neighbours in the list of a parent's children.
@@ -295,6 +290,7 @@ fn create(
             sessions: Pool::new(),
             timers: Pool::new(),
             memories: Pool::new(),
+            irqs: Pool::new(),
         },
         ceiling,
         life: Life::new(),
@@ -383,10 +379,17 @@ impl Paid for Memory {
     }
 }
 
+impl Paid for Irq {
+    fn pool(pools: &mut Pools) -> &mut Pool<Irq> {
+        &mut pools.irqs
+    }
+}
+
 /// A place for `value`, an object that `payer` makes (thread::create,
-/// channel::create, session::create, timer::create, memory::create), in
-/// the payer's pool of its kind, whose quota pays for a page when the pool
-/// grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
+/// channel::create, session::create, timer::create, memory::create,
+/// irq::bind), in the payer's pool of its kind, whose quota pays for a
+/// page when the pool grows (spec 7.5, 7.8). NO_MEMORY when the quota
+/// falls short.
 pub fn paid_alloc<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<T>, Error> {
     // SAFETY: the caller holds a reference to the payer; the value is no
     // field of it.

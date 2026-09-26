@@ -14,6 +14,10 @@
 //! cleanup never delays work above its cause and never starves: in idle
 //! every level runs. Neither the interrupt code nor the cleanup takes a
 //! level from thread::current(), which names the last thread that ran.
+//! Besides objects, the queue holds the firings of timers: an item for
+//! each level of 1-63, which the timer interrupt queues at its level
+//! (crate::timer::expire), and whose portion fires expired timers of that
+//! level (spec 10).
 
 use crate::arch::timer;
 use crate::object::Object;
@@ -22,12 +26,26 @@ use core::ptr::NonNull;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::sync::Lock;
 
-/// What an object keeps for the cleanup queue: its link there and, while
-/// it is queued, the object itself. An object has one item: it is queued
-/// again only after its first portion took it out.
+/// What an item stands in the queue for.
+pub enum Work {
+    /// An object to take apart.
+    Object(Object),
+    /// The firing of the timers of the item's level (crate::timer::fire).
+    Timers,
+}
+
+impl From<Object> for Work {
+    fn from(object: Object) -> Work {
+        Work::Object(object)
+    }
+}
+
+/// What an object keeps for the cleanup queue, or the timers keep for a
+/// level: its link there and, while it is queued, its work. An object has
+/// one item: it is queued again only after its first portion took it out.
 pub struct Item {
     link: Link<Item>,
-    object: Option<Object>,
+    work: Option<Work>,
 }
 
 impl Item {
@@ -35,7 +53,7 @@ impl Item {
     pub const fn new() -> Item {
         Item {
             link: Link::new(1),
-            object: None,
+            work: None,
         }
     }
 }
@@ -72,27 +90,29 @@ static QUEUE: Lock<Queue> = Lock::new(Queue {
     late: false,
 });
 
-/// Queues `object` at the tail of `level` (1-63): its last reference just
-/// went, or its teardown begins (process::end).
+/// Queues `work` at the tail of `level` (1-63): the last reference of its
+/// object just went, or its teardown begins (process::end), or timers of
+/// the level expired.
 ///
 /// # Safety
-/// `item` is the object's own and in no queue; the object stays alive and
-/// in place, and nothing else takes it apart, until its portion.
-pub unsafe fn enqueue(item: NonNull<Item>, object: Object, level: u8) {
+/// `item` is the object's own, or the level's for its timers, and in no
+/// queue; the object stays alive and in place, and nothing else takes it
+/// apart, until its portion.
+pub unsafe fn enqueue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
     // SAFETY: the caller's promise.
-    unsafe { push(item, object, level, false) }
+    unsafe { push(item, work.into(), level, false) }
 }
 
-/// Queues `object` again at the head of `level` after its portion left
+/// Queues `work` again at the head of `level` after its portion left
 /// work for the next one: the next portion at that level goes on with it,
 /// as a preempted thread goes on first at its level (spec 8), so one
 /// teardown ends before the next begins.
 ///
 /// # Safety
 /// As for `enqueue`.
-pub unsafe fn requeue(item: NonNull<Item>, object: Object, level: u8) {
+pub unsafe fn requeue(item: NonNull<Item>, work: impl Into<Work>, level: u8) {
     // SAFETY: the caller's promise.
-    unsafe { push(item, object, level, true) }
+    unsafe { push(item, work.into(), level, true) }
 }
 
 /// Moves a queued object to the head of `level`, unless it stands higher:
@@ -140,12 +160,12 @@ unsafe fn lift(item: NonNull<Item>, level: u8, level_too: bool) {
 
 /// # Safety
 /// As for `enqueue`.
-unsafe fn push(item: NonNull<Item>, object: Object, level: u8, head: bool) {
+unsafe fn push(item: NonNull<Item>, work: Work, level: u8, head: bool) {
     let mut q = QUEUE.lock();
     // SAFETY: the caller's promise.
     unsafe {
         let i = &mut *item.as_ptr();
-        i.object = Some(object);
+        i.work = Some(work);
         i.link.set_level(level);
         if head {
             q.items.push_head(item);
@@ -162,9 +182,10 @@ pub fn top() -> Option<u8> {
 }
 
 /// One portion (sched::resume): the item at the head of the top level
-/// leaves the queue, and its object's portion runs; what that releases is
-/// queued at the same level, and an object with work left queues itself
-/// again (`requeue`). Nothing happens when the queue is empty.
+/// leaves the queue, and its object's portion runs, or the firing of the
+/// timers of that level; what that releases is queued at the same level,
+/// and work left queues itself again (`requeue`). Nothing happens when the
+/// queue is empty.
 pub fn portion() {
     #[cfg(feature = "ktest")]
     if crate::arch::irq_pending() {
@@ -186,17 +207,21 @@ pub fn portion() {
     };
     // SAFETY: the item's object stays alive until its portion, which is
     // this one; the item is not used afterwards.
-    let object = unsafe { (*item.as_ptr()).object.take() }.expect("a queued object");
+    let work = unsafe { (*item.as_ptr()).work.take() }.expect("queued work");
     // SAFETY: nothing refers to the object any more.
     unsafe {
-        match object {
-            Object::Process(p) => process::clean(p, level),
-            Object::Thread(t) => thread::clean(t, level),
-            Object::Channel(c) => channel::clean(c, level),
-            Object::Session(s) => session::clean(s, level),
-            Object::Timer(t) => crate::timer::clean(t, level),
-            Object::Memory(m) => crate::memory::clean(m, level),
-            Object::Resource => unreachable!("the system resource is never queued"),
+        match work {
+            Work::Object(Object::Process(p)) => process::clean(p, level),
+            Work::Object(Object::Thread(t)) => thread::clean(t, level),
+            Work::Object(Object::Channel(c)) => channel::clean(c, level),
+            Work::Object(Object::Session(s)) => session::clean(s, level),
+            Work::Object(Object::Timer(t)) => crate::timer::clean(t, level),
+            Work::Object(Object::Memory(m)) => crate::memory::clean(m, level),
+            Work::Object(Object::Irq(b)) => crate::irq::clean(b, level),
+            Work::Object(Object::Resource) => {
+                unreachable!("the system resource is never queued")
+            }
+            Work::Timers => crate::timer::fire(level),
         }
     }
     let took = timer::now().saturating_sub(start);

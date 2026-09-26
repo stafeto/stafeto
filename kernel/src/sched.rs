@@ -6,19 +6,20 @@
 //! entry into the kernel ends in `resume`, the one way out: a loop on the
 //! empty kernel stack that handles a pending interrupt, decides, arms the
 //! timer for the deadline that decision needs, the nearer of the end of a
-//! quantum and the earliest timer of a program (spec 8, 10), writing the
-//! timer only when the deadline changes, and then runs the chosen thread,
-//! does one portion of cleanup (spec 7.7) or sleeps in `wfi` with
-//! interrupts masked. Idle is that loop with nothing ready: no thread
-//! object, and cleanup of every level runs there. Between two polls for
-//! interrupts the kernel does at most one portion, and it begins one only
-//! with no interrupt pending. The kernel holds a reference to every thread
+//! quantum and the nearest timer of a program whose level's firing is not
+//! queued (spec 8, 10), writing the timer only when the deadline changes,
+//! and then runs the chosen thread, does one portion of cleanup (spec 7.7)
+//! or sleeps in `wfi` with interrupts masked. Idle is that loop with
+//! nothing ready: no thread object, and cleanup of every level runs there,
+//! the firings of timers included. Between two polls for interrupts the
+//! kernel does at most one portion, and it begins one only with no
+//! interrupt pending. The kernel holds a reference to every thread
 //! the scheduler holds, from `start` until `exit`, a thread that waits in
 //! `send` or `receive` too. The queues of channels and of accepted
 //! requests change together with the states of the threads that wait in
 //! them, and so does the table of thread numbers (spec 6.1, 7.8), which
 //! lies here, in memory the kernel takes at boot: the code that changes
-//! them runs under the scheduler's lock (`locked`). The lock of the heap of
+//! them runs under the scheduler's lock (`locked`). The lock of the
 //! timers is never held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
@@ -237,9 +238,10 @@ pub fn locked<R>(f: impl FnOnce(&mut Locked<'_>) -> R) -> R {
 /// once in place of the caller, which waits (Scheduler::hand_off), with a
 /// new quantum from now, and the timer is armed for the deadline it needs:
 /// the nearer of the end of that quantum when the receiver is round robin
-/// and `next_timer`, the earliest timer of a program, which the caller read
-/// before the lock (spec 8, 10). The state is the one `wake` and the next
-/// decision would leave; the caller runs the receiver (thread::run). O(1).
+/// and `next_timer`, the nearest timer of a program (timer::first), which
+/// the caller read before the lock (spec 8, 10). The state is the one
+/// `wake` and the next decision would leave; the caller runs the receiver
+/// (thread::run). O(1).
 pub fn hand_off(
     next_timer: Option<u64>,
     meet: impl FnOnce(&mut Locked<'_>) -> Option<NonNull<Thread>>,
@@ -268,11 +270,12 @@ pub fn hand_off(
 /// The timer's interrupt, before its EOI: the timer goes off, since its
 /// line is level-triggered and must be quiet by the EOI, and a round-robin
 /// thread whose quantum is over goes to the tail of its level; an
-/// interrupt that came for a timer of a program ends no quantum. Then the
-/// timers of programs that expired post their notifications, up to
-/// timer::BATCH of them, after the scheduler's lock (spec 10). `resume`
-/// arms the timer again. The deadline that fired, CNTV_CVAL_EL0, waits
-/// for the next thread to run, which measures the latency for KSTATS.
+/// interrupt that came for a timer of a program ends no quantum. Then each
+/// level of timers of programs whose top expired queues its firing in the
+/// cleanup queue at that level, after the scheduler's lock (spec 10).
+/// `resume` arms the timer again. The deadline that fired, CNTV_CVAL_EL0,
+/// waits for the next thread to run, which measures the latency for
+/// KSTATS.
 pub fn timer_fired() {
     let now = timer::now();
     {
@@ -326,10 +329,10 @@ extern "C" fn exit_loop() -> ! {
 
 /// Decides what the kernel does from now on and arms the timer for the
 /// deadline that needs: the nearer of the end of a round-robin thread's
-/// quantum and the earliest timer of a program; only the timer for a FIFO
-/// thread, for cleanup or while idle (spec 8, 10). The heap's lock goes
-/// before the scheduler's is taken. A thread chosen after a timer's
-/// interrupt ends that interrupt's latency.
+/// quantum and the nearest timer of a program (timer::first); only the
+/// timer for a FIFO thread, for cleanup or while idle (spec 8, 10). The
+/// lock of the timers goes before the scheduler's is taken. A thread chosen
+/// after a timer's interrupt ends that interrupt's latency.
 fn decide() -> Decision<Thread> {
     let cleanup = cleanup::top();
     let next_timer = crate::timer::first();

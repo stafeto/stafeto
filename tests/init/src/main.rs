@@ -31,13 +31,14 @@
 #![no_main]
 
 use abi::{
-    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, MemoryInfo, Policy,
-    ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, ChannelInfo, Error, INIT_BOOT_IMAGE, IrqInfo,
+    MemoryInfo, OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
+    TRIGGER_EDGE, ThreadInfo, ThreadState, WINDOW_RIGHTS,
 };
 use bootimg::{Part, Program};
 use child::{Checked, Role};
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Memory, Process, Thread, Timer};
+use rt::handle::{Channel, Interrupt, Memory, Process, Thread, Timer};
 use rt::sys::{self, Received, Regs, Reply, Token};
 use rt::{Handle, Stack, init, loader, println, time};
 
@@ -47,7 +48,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 157] = [
+const TESTS: [Test; 178] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -119,6 +120,14 @@ const TESTS: [Test; 157] = [
         object_info_checks_its_arguments,
     ),
     (
+        "thread_info_reports_state_and_priorities",
+        thread_info_reports_state_and_priorities,
+    ),
+    (
+        "channel_info_reports_queue_slots_and_receivers",
+        channel_info_reports_queue_slots_and_receivers,
+    ),
+    (
         "process_kill_returns_after_the_teardown",
         process_kill_returns_after_the_teardown,
     ),
@@ -180,6 +189,10 @@ const TESTS: [Test; 157] = [
     ),
     ("slot_limit_is_1024", slot_limit_is_1024),
     (
+        "sources_give_their_slots_back",
+        sources_give_their_slots_back,
+    ),
+    (
         "exit_notice_comes_after_the_quota",
         exit_notice_comes_after_the_quota,
     ),
@@ -227,6 +240,10 @@ const TESTS: [Test; 157] = [
     ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
     ("timer_never_fires_early", timer_never_fires_early),
     ("timer_limit_is_64", timer_limit_is_64),
+    (
+        "timer_fires_at_its_slot_priority",
+        timer_fires_at_its_slot_priority,
+    ),
     (
         "mem_create_checks_its_arguments",
         mem_create_checks_its_arguments,
@@ -518,6 +535,62 @@ const TESTS: [Test; 157] = [
         narrowed_memory_handle_maps_read_only,
     ),
     ("shared_pages_show_both_sides", shared_pages_show_both_sides),
+    (
+        "irq_bind_checks_its_arguments",
+        irq_bind_checks_its_arguments,
+    ),
+    ("irq_ack_checks_its_handle", irq_ack_checks_its_handle),
+    ("a_line_takes_one_binding", a_line_takes_one_binding),
+    (
+        "binding_goes_with_its_last_handle",
+        binding_goes_with_its_last_handle,
+    ),
+    (
+        "irq_info_reports_line_mask_and_trigger",
+        irq_info_reports_line_mask_and_trigger,
+    ),
+    (
+        "device_window_create_checks_its_arguments",
+        device_window_create_checks_its_arguments,
+    ),
+    (
+        "window_is_checked_by_whole_pages",
+        window_is_checked_by_whole_pages,
+    ),
+    (
+        "window_handle_is_a_device_window",
+        window_handle_is_a_device_window,
+    ),
+    (
+        "window_maps_read_write_but_never_exec",
+        window_maps_read_write_but_never_exec,
+    ),
+    ("window_reads_its_device", window_reads_its_device),
+    (
+        "window_info_counts_its_mappings",
+        window_info_counts_its_mappings,
+    ),
+    (
+        "window_over_a_hole_faults_only_its_process",
+        window_over_a_hole_faults_only_its_process,
+    ),
+    (
+        "rtc_alarm_comes_as_a_notification",
+        rtc_alarm_comes_as_a_notification,
+    ),
+    (
+        "line_stays_masked_until_irq_ack",
+        line_stays_masked_until_irq_ack,
+    ),
+    (
+        "level_line_fires_again_until_its_source_is_cleared",
+        level_line_fires_again_until_its_source_is_cleared,
+    ),
+    ("dead_driver_frees_its_line", dead_driver_frees_its_line),
+    (
+        "driver_dying_with_a_queued_alarm_frees_its_line",
+        driver_dying_with_a_queued_alarm_frees_its_line,
+    ),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -1721,25 +1794,33 @@ fn kernel_stats_need_kstats() -> Outcome {
 
 /// object_info(x0 handle, x1 kind, x2 0) checks the kind and x2 first,
 /// then the handle, its type and its rights (spec 11, 16), and changes x0
-/// alone on an error: kind 0, a kind past MEMORY or with bits past its
-/// word and a nonzero x2 fail with INVALID_ARGS, for handle 0 too;
-/// handle 0 with a good kind fails with BAD_HANDLE. The kinds of a process
-/// take a process handle with any rights, and the system resource or a
-/// thread is WRONG_TYPE; KERNEL_STATS takes the system resource with
-/// KSTATS, and a process is WRONG_TYPE, a copy without KSTATS
-/// ACCESS_DENIED. A good call writes nothing past its words:
-/// PROCESS_STATE, «alive» here, x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
+/// alone on an error: kind 0, a kind past IRQ or with bits past its word
+/// and a nonzero x2 fail with INVALID_ARGS, for handle 0 too; handle 0
+/// with a good kind fails with BAD_HANDLE. The kinds of a process take a
+/// process handle with any rights, and the system resource or a thread is
+/// WRONG_TYPE; THREAD_STATE takes a thread, CHANNEL a channel and IRQ a
+/// binding, each with any rights, and a process or the system resource is
+/// WRONG_TYPE; KERNEL_STATS takes the system resource with KSTATS, and a
+/// process is WRONG_TYPE, a copy without KSTATS ACCESS_DENIED. A good call
+/// writes nothing past its words: PROCESS_STATE, «alive» here,
+/// THREAD_STATE and CHANNEL x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
 /// x1-x3.
 fn object_info_checks_its_arguments() -> Outcome {
     let own = copy(&init::PROCESS, Rights::NONE)?;
     let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
-    let result = object_info_cases(own.raw().0, debug.raw().0);
+    let thread = copy(&init::THREAD, Rights::NONE)?;
+    let c = channel(QUIET)?;
+    let seen = copy(&c, Rights::NONE)?;
+    let result = object_info_cases(own.raw().0, debug.raw().0, thread.raw().0, seen.raw().0);
     close(own)?;
     close(debug)?;
+    close(thread)?;
+    close(seen)?;
+    close(c)?;
     result
 }
 
-fn object_info_cases(own: u64, debug: u64) -> Outcome {
+fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     const N: u16 = Call::ObjectInfo.number();
     let (state, memory, table, stats) = (
         abi::INFO_PROCESS_STATE,
@@ -1747,19 +1828,29 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
         abi::INFO_PROCESS_HANDLES,
         abi::INFO_KERNEL_STATS,
     );
-    let (resource, thread) = (init::RESOURCE.raw().0, init::THREAD.raw().0);
+    let (thread_state, channel_kind, irq) =
+        (abi::INFO_THREAD_STATE, abi::INFO_CHANNEL, abi::INFO_IRQ);
+    let resource = init::RESOURCE.raw().0;
     let kinds = [
         [own, 0, 0],
-        [own, abi::INFO_MEMORY + 1, 0],
+        [own, irq + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
     ]
     .into_iter()
     .chain(
-        [memory, table, stats, abi::INFO_MEMORY]
-            .into_iter()
-            .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
+        [
+            memory,
+            table,
+            stats,
+            abi::INFO_MEMORY,
+            thread_state,
+            channel_kind,
+            irq,
+        ]
+        .into_iter()
+        .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
     )
     .all(|args| x0_alone::<N>(&args, Error::InvalidArgs.code()));
     let handles = [
@@ -1767,18 +1858,34 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
         (0, memory, Error::BadHandle),
         (0, table, Error::BadHandle),
         (0, stats, Error::BadHandle),
+        (0, thread_state, Error::BadHandle),
+        (0, channel_kind, Error::BadHandle),
+        (0, irq, Error::BadHandle),
         (resource, state, Error::WrongType),
         (thread, state, Error::WrongType),
         (resource, memory, Error::WrongType),
         (resource, table, Error::WrongType),
         (own, stats, Error::WrongType),
         (debug, stats, Error::AccessDenied),
+        (own, thread_state, Error::WrongType),
+        (seen, thread_state, Error::WrongType),
+        (own, channel_kind, Error::WrongType),
+        (thread, channel_kind, Error::WrongType),
+        (resource, irq, Error::WrongType),
+        (seen, irq, Error::WrongType),
     ]
     .into_iter()
     .all(|(h, kind, error)| x0_alone::<N>(&[h, kind, 0], error.code()));
-    let written = [(state, 5), (memory, 4), (table, 4)].map(|(kind, past)| {
+    let written = [
+        (own, state, 5),
+        (own, memory, 4),
+        (own, table, 4),
+        (thread, thread_state, 5),
+        (seen, channel_kind, 5),
+    ]
+    .map(|(h, kind, past)| {
         let mut x = marked();
-        x[..3].copy_from_slice(&[own, kind, 0]);
+        x[..3].copy_from_slice(&[h, kind, 0]);
         // SAFETY: object_info only reads its registers.
         let after = unsafe { sys::raw::<N>(x) };
         (after[0] == 0 && after[past..] == x[past..]).then_some(after)
@@ -1798,6 +1905,180 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
     check(
         written[0].is_some_and(|after| after[1..5] == ProcessState::Alive.to_words()),
         "PROCESS_STATE of init's process through a copy with no rights is not «alive»",
+    )
+}
+
+/// What THREAD_STATE says of the thread `t`.
+fn thread_info(t: &Handle<Thread>) -> Result<ThreadInfo, Error> {
+    sys::thread_info(t)
+}
+
+/// A thread with `state`, `base` and effective `priority`, FIFO.
+fn fifo(state: ThreadState, base: u8, priority: u8) -> Result<ThreadInfo, Error> {
+    Ok(ThreadInfo {
+        state,
+        base,
+        priority,
+        policy: Some(Policy::Fifo),
+    })
+}
+
+/// Spec 8, 6.6, 11: THREAD_STATE of a thread, through a handle with no
+/// rights, says what it does and at which priorities. Init runs FIFO at
+/// TEST_PRIORITY; a new thread at LOW, round robin, is stopped, then
+/// ready behind init, then ended. A thread at LOW waits in receive; a
+/// notification of priority NOTICE wakes it at NOTICE, above init, and it
+/// waits in send at once, still boosted, then for the reply once init
+/// took its request, and ends with the reply.
+fn thread_info_reports_state_and_priorities() -> Outcome {
+    reset_results();
+    let own = thread_info(&init::THREAD);
+    let t = thread(1, add_mark, 1, LOW, Policy::RoundRobin)?;
+    let seen = copy(&t, Rights::NONE)?;
+    let stopped = thread_info(&seen);
+    sys::thread_start(&t).map_err(|_| "thread_start failed")?;
+    let ready = thread_info(&seen);
+    let c = channel(NOTICE)?;
+    let d = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[1].store(d.raw().0, Relaxed);
+    let w = spawn(0, wake_then_send, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let ended = thread_info(&seen);
+    let receiving = thread_info(&w);
+    let posted = sys::notify(&c, 1);
+    let sending = thread_info(&w);
+    let token = take_token(&d);
+    let awaiting = thread_info(&w);
+    let replied = token.map(|t| t.reply(&[]));
+    let gone = thread_info(&w).map(|i| i.state);
+    let_run()?;
+    for h in [w, seen, t] {
+        close(h)?;
+    }
+    close(d)?;
+    close(c)?;
+    check(
+        own == fifo(ThreadState::Running, TEST_PRIORITY, TEST_PRIORITY),
+        "init is not running FIFO at its priority",
+    )?;
+    let round = |state| {
+        Ok(ThreadInfo {
+            state,
+            base: LOW,
+            priority: LOW,
+            policy: Some(Policy::RoundRobin),
+        })
+    };
+    check(
+        stopped == round(ThreadState::Stopped)
+            && ready == round(ThreadState::Ready)
+            && ended == round(ThreadState::Ended),
+        "a new thread was not stopped, then ready, then ended",
+    )?;
+    check(
+        receiving == fifo(ThreadState::Receiving, LOW, LOW),
+        "a thread waiting in receive was not seen so",
+    )?;
+    check(
+        posted.is_ok() && sending == fifo(ThreadState::Sending, LOW, NOTICE),
+        "a thread woken at NOTICE was not seen in send at its boost",
+    )?;
+    check(
+        awaiting == fifo(ThreadState::AwaitingReply, LOW, NOTICE),
+        "a thread whose request was taken did not await its reply",
+    )?;
+    check(
+        replied == Ok(Ok(())) && gone == Ok(ThreadState::Ended),
+        "the thread did not end with its reply",
+    )
+}
+
+/// Waits in receive on the channel HANDLES holds for slot 0, then sends
+/// request(0) through the one it holds for slot 1, and ends with the reply.
+extern "C" fn wake_then_send(_: u64) -> ! {
+    let _ = sys::receive(&handle(0));
+    let _ = sys::send(&handle(1), &request(0));
+    sys::thread_exit()
+}
+
+/// What CHANNEL says of a channel with `queued`, `receivers` and
+/// `sources`, open.
+fn open_channel(queued: u64, receivers: u64, sources: u64) -> Result<ChannelInfo, Error> {
+    Ok(ChannelInfo {
+        queued,
+        receivers,
+        sources,
+        closed: false,
+    })
+}
+
+/// Spec 6.3, 6.5, 11: CHANNEL of a channel, through its handle and
+/// through a labelled copy with no rights, counts the slots in its queue,
+/// merged posts once, the receivers that wait there, and its sources, the
+/// slot of label 0 among them; once its last handle with RECEIVE went,
+/// it is closed and its receivers woke.
+fn channel_info_reports_queue_slots_and_receivers() -> Outcome {
+    reset_marks();
+    reset_results();
+    let c = channel(QUIET)?;
+    let fresh = sys::channel_info(&c);
+    let one = session(&c, Rights::NOTIFY, 1, QUIET)?;
+    let two = session(&c, Rights::NOTIFY, 2, QUIET)?;
+    let seen = session(&c, Rights::NONE, 3, QUIET)?;
+    let posted = [
+        sys::notify(&c, 1),
+        sys::notify(&one, 1),
+        sys::notify(&two, 1),
+        sys::notify(&c, 2),
+    ];
+    let queued = (sys::channel_info(&c), sys::channel_info(&seen));
+    let taken = [0; 3].map(|_| sys::try_receive(&c).is_ok());
+    let empty = sys::try_receive(&c) == Err(Error::WouldBlock);
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let r = [
+        spawn(0, mark_at_notice, 0, HIGH, Policy::Fifo)?,
+        spawn(1, mark_at_notice, 0, HIGH, Policy::Fifo)?,
+    ];
+    let waiting = sys::channel_info(&seen);
+    let woke = sys::notify(&c, 1).map(|()| mark(1));
+    let left = sys::channel_info(&seen);
+    close(c)?;
+    let closed = sys::channel_info(&seen);
+    let_run()?;
+    for h in r {
+        close(h)?;
+    }
+    for h in [seen, two, one] {
+        close(h)?;
+    }
+    check(
+        fresh == open_channel(0, 0, 1),
+        "a new channel is not empty with one source",
+    )?;
+    check(
+        posted.iter().all(Result::is_ok)
+            && queued == (open_channel(3, 0, 4), open_channel(3, 0, 4)),
+        "three slots, one merged twice, and four sources were not counted alike through both handles",
+    )?;
+    check(taken == [true; 3] && empty, "the three slots did not come")?;
+    check(
+        waiting == open_channel(0, 2, 4),
+        "two waiting receivers were not counted",
+    )?;
+    check(
+        woke == Ok(1) && left == open_channel(0, 1, 4),
+        "a woken receiver was still counted",
+    )?;
+    check(
+        closed
+            == Ok(ChannelInfo {
+                queued: 0,
+                receivers: 0,
+                sources: 4,
+                closed: true,
+            }),
+        "the closed channel is not closed with no receiver",
     )
 }
 
@@ -2671,6 +2952,44 @@ fn slot_limit_is_1024() -> Outcome {
     )
 }
 
+/// Spec 15.2 (notifications): a source of notifications gives its slot of
+/// the channel back as it goes (spec 6.5). On one channel, a thousand
+/// times, a session leaves with CLIENT_GONE, a timer goes, and a child
+/// whose exit channel it is ends; then 1023 sessions still fit beside the
+/// slot of label 0, and the next one fails with LIMIT_REACHED.
+fn sources_give_their_slots_back() -> Outcome {
+    const ROUNDS: u64 = 1000;
+    let c = channel(QUIET)?;
+    let churned = (1..=ROUNDS).try_for_each(|label| {
+        close(session(&c, Rights::NONE, label, QUIET)?)?;
+        let gone = sys::try_receive(&c);
+        close(timer(&c)?)?;
+        let child = sys::process_create_with(LEAST_QUOTA, 16, LOW, Some((&c, QUIET)), None);
+        close(child.map_err(|_| "process_create with an exit channel failed")?)?;
+        let ended = sys::try_receive(&c);
+        check(
+            gone == Ok(labelled(label, CLIENT_GONE, 1)) && ended == Ok(exit_notice(0)),
+            "a session or a child did not leave with its notification",
+        )
+    });
+    let last = u64::from(abi::MAX_SLOTS) - 1;
+    let filled = churned.and_then(|()| {
+        (1..=last).try_for_each(|label| close(session(&c, Rights::NONE, label, QUIET)?))
+    });
+    let past = sys::handle_label(&c, Rights::NONE, last + 1, QUIET);
+    let refused = past.as_ref().err() == Some(&Error::LimitReached);
+    if let Ok(h) = past {
+        close(h)?;
+    }
+    while sys::try_receive(&c).is_ok() {}
+    close(c)?;
+    filled?;
+    check(
+        refused,
+        "a session past 1023 and the slot of label 0 was made",
+    )
+}
+
 /// A test's exit channel, at QUIET, and a copy of it with NOTIFY and the
 /// label CHILD that names the test's children as their x3. Closing the
 /// channel first lets the copy's session go without CLIENT_GONE.
@@ -3072,7 +3391,14 @@ fn client_gone_when_the_child_dies() -> Outcome {
 /// A timer on `c` at QUIET, whose notifications never lift init above its
 /// threads (spec 6.6).
 fn timer(c: &Handle<Channel>) -> Result<Handle<Timer>, &'static str> {
-    sys::timer_create(c, QUIET).map_err(|_| "timer_create failed")
+    timer_at(c, QUIET)
+}
+
+/// A timer on `c` whose slot has `priority`: it fires at that level, ahead
+/// of the threads below it and after those above (spec 10), so a thread
+/// whose wait it bounds gives it its own level at least.
+fn timer_at(c: &Handle<Channel>, priority: u8) -> Result<Handle<Timer>, &'static str> {
+    sys::timer_create(c, priority).map_err(|_| "timer_create failed")
 }
 
 /// timer_create with raw registers.
@@ -3387,6 +3713,66 @@ fn timer_never_fires_early() -> Outcome {
     close(t)?;
     close(c)?;
     result
+}
+
+/// Spec 15.2 (priorities, time): a timer fires at the priority of its slot
+/// (spec 10). W at init's level waits on a channel of that level whose
+/// timer's slot has LEVEL, H at HIGH on one of its level whose timer's
+/// slot has HIGH, both timers for one deadline; S, FIFO at SPIN between
+/// them, spins until H came back from its wait and notes whether W did.
+/// Init lets them run: the firing of HIGH comes ahead of S and wakes H,
+/// the firing of LEVEL waits until S ends, and only then W, whose level is
+/// above S, gets its expiry. Only the priorities order them; a second on
+/// the counter only keeps S from spinning forever.
+fn timer_fires_at_its_slot_priority() -> Outcome {
+    const SPIN: u8 = 15;
+    reset_results();
+    let low = channel(TEST_PRIORITY)?;
+    let high = channel(HIGH)?;
+    let timers = [timer_at(&low, LEVEL)?, timer_at(&high, HIGH)?];
+    HANDLES[0].store(low.raw().0, Relaxed);
+    HANDLES[1].store(high.raw().0, Relaxed);
+    let h = spawn(1, receive_then_look, 1, HIGH, Policy::Fifo)?;
+    let w = spawn(0, receive_then_look, 0, TEST_PRIORITY, Policy::Fifo)?;
+    // W, behind init at its level, waits once init yields to it.
+    let yielded = sys::yield_now();
+    let s = spawn(2, look_once_ended, 1, SPIN, Policy::Fifo)?;
+    let armed = clock_now().and_then(|now| {
+        let at = now + 1_000_000;
+        timers.iter().try_for_each(|t| arm(t, at))
+    });
+    let ran = armed.and_then(|()| let_run());
+    for t in [h, w, s] {
+        close(t)?;
+    }
+    for t in timers {
+        close(t)?;
+    }
+    close(low)?;
+    close(high)?;
+    ran?;
+    check(yielded.is_ok(), "yield failed")?;
+    check(
+        ended(0) && ended(1) && result(0)[0] == 0 && result(1)[0] == 0,
+        "a timer's expiry did not come",
+    )?;
+    check(
+        result(2)[..2] == [1, 0],
+        "the timer of W fired above its slot's priority, or that of H below",
+    )
+}
+
+/// Spins until the thread in `slot` came back from its call, or a second
+/// passed, and leaves in `result` of slot 2 whether it did and whether the
+/// thread in slot 0 did by then; ends.
+extern "C" fn look_once_ended(slot: u64) -> ! {
+    let end = time::now() + time::ns_to_ticks(1_000_000_000);
+    while !ended(slot as usize) && time::now() < end {}
+    record(
+        2,
+        &[ENDED[slot as usize].load(Relaxed), ENDED[0].load(Relaxed)],
+    );
+    sys::thread_exit()
 }
 
 /// Spec 15.2 (notifications): a process pays for abi::MAX_TIMERS timers at
@@ -4060,7 +4446,7 @@ fn during_a_long_map(probe: extern "C" fn(u64) -> !) -> Outcome {
     reset_marks();
     let m = memory_object(BIG / PAGE as u64)?;
     let c = channel(QUIET)?;
-    let t = timer(&c)?;
+    let t = timer_at(&c, HIGH)?;
     PROBE_TIMER.store(t.raw().0, Relaxed);
     let prober = spawn(1, probe, c.raw().0, HIGH, Policy::Fifo)?;
     let mapper = spawn(0, map_big, m.raw().0, LEVEL, Policy::Fifo)?;
@@ -4282,7 +4668,7 @@ extern "C" fn probe_long_calls(c: u64) -> ! {
 fn long_calls_let_a_timer_in() -> Outcome {
     reset_marks();
     let c = channel(QUIET)?;
-    let t = timer(&c)?;
+    let t = timer_at(&c, HIGH)?;
     PROBE_TIMER.store(t.raw().0, Relaxed);
     let prober = spawn(1, probe_long_calls, c.raw().0, HIGH, Policy::Fifo)?;
     let caller = spawn(0, long_calls, 0, LEVEL, Policy::Fifo)?;
@@ -4550,12 +4936,15 @@ fn reset_kid_marks() {
     }
 }
 
-/// Waits `ns` nanoseconds in receive on a timer of a channel of its own:
-/// threads below init run meanwhile.
+/// Waits `ns` nanoseconds in receive on a timer of a channel of its own,
+/// at init's level: threads below init run meanwhile, and the timer fires
+/// ahead of them. The boost of its expiry ends with a receive that finds
+/// nothing (spec 6.6).
 fn sleep(ns: u64) -> Outcome {
     let c = channel(QUIET)?;
-    let t = timer(&c)?;
+    let t = timer_at(&c, TEST_PRIORITY)?;
     let waited = arm(&t, clock_now()? + ns).map(|()| sys::receive(&c));
+    let _ = sys::try_receive(&c);
     close(t)?;
     close(c)?;
     check(
@@ -8010,4 +8399,856 @@ fn shared_pages_show_both_sides() -> Outcome {
     )?;
     check(reply[6] == INIT_WORD, "the service did not see init's word")?;
     check(seen == CHILD_WORD, "init did not see the service's word")
+}
+
+/// The lines of the GIC of QEMU `virt` (GICD_TYPER): INTID 288 is past
+/// the last one.
+const GIC_LINES: u64 = 288;
+/// A shared line with no device behind it in the tests' machine, the
+/// first of `virtio-mmio`, which the tests bind edge-triggered.
+const EDGE_LINE: u32 = 48;
+/// The line of the PL031 of QEMU `virt`, level-triggered.
+const RTC_LINE: u32 = 34;
+
+/// A binding of `line` to `c` through the system resource, the slot at
+/// QUIET, edge-triggered when `edge`.
+fn bound(line: u32, c: &Handle<Channel>, edge: bool) -> Result<Handle<Interrupt>, &'static str> {
+    sys::irq_bind(&init::RESOURCE, line, c, QUIET, edge).map_err(|_| "irq_bind failed")
+}
+
+/// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
+/// NOTIFY, x3 priority, x4 flags) checks the values first, then the
+/// handles in their order, then the state (spec 9, 11), and changes x0
+/// alone on an error: a line outside 32-287, the lines of QEMU's GIC, or
+/// the kernel's console line 33, a flag other than TRIGGER_EDGE and a
+/// priority outside 1-63 fail with INVALID_ARGS, through closed handles
+/// too; x0 closed, a channel or a copy of the resource without DEVICE
+/// with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or
+/// a copy of the channel without NOTIFY the same; a closed channel with
+/// PEER_CLOSED. A copy with NOTIFY alone makes a binding, x0 and x1 alone
+/// changed, whose handle carries abi::OWNER_RIGHTS and no more.
+fn irq_bind_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::IrqBind.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let notify = copy(&c, Rights::NOTIFY)?;
+    let receive = copy(&c, Rights::RECEIVE)?;
+    let no_device = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let (resource, line) = (init::RESOURCE.raw().0, u64::from(EDGE_LINE));
+    let good = [resource, line, notify.raw().0, QUIET.into(), TRIGGER_EDGE];
+    let with = |i: usize, value: u64| {
+        let mut x = good;
+        x[i] = value;
+        x
+    };
+    let invalid = [27, 31, 33, 1020, GIC_LINES, 1 << 32 | line]
+        .map(|l| with(1, l))
+        .into_iter()
+        .chain([with(4, 2), with(3, 0), with(3, 64), with(3, 0x100 | 1)])
+        .chain([[gone, 31, gone, 0, 2]])
+        .all(|x| x0_alone::<N>(&x, Error::InvalidArgs.code()));
+    let refused = [
+        (with(0, gone), Error::BadHandle),
+        (with(0, c.raw().0), Error::WrongType),
+        (with(0, no_device.raw().0), Error::AccessDenied),
+        (with(2, gone), Error::BadHandle),
+        (with(2, init::PROCESS.raw().0), Error::WrongType),
+        (with(2, receive.raw().0), Error::AccessDenied),
+    ]
+    .iter()
+    .all(|(x, e)| x0_alone::<N>(x, e.code()));
+    let mut x = marked();
+    x[..5].copy_from_slice(&good);
+    // SAFETY: irq_bind only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
+    let b: Handle<Interrupt> = Handle::from_raw(abi::Handle(after[1]));
+    let all = sys::handle_duplicate(&b, OWNER_RIGHTS).map(close);
+    let more = sys::handle_duplicate(&b, OWNER_RIGHTS | Rights::NOTIFY).map(close);
+    if made {
+        close(b)?;
+    }
+    close(receive)?;
+    close(c)?;
+    let closed = x0_alone::<N>(&good, Error::PeerClosed.code());
+    close(notify)?;
+    close(no_device)?;
+    check(
+        invalid,
+        "a bad line, flag or priority did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        refused,
+        "a bad resource or channel handle did not fail alone in its order",
+    )?;
+    check(made, "a good irq_bind failed or changed registers past x1")?;
+    check(
+        all == Ok(Ok(())) && more == Err(Error::AccessDenied),
+        "the handle of irq_bind does not carry OWNER_RIGHTS and no more",
+    )?;
+    check(
+        closed,
+        "irq_bind of a closed channel did not fail with PEER_CLOSED alone",
+    )
+}
+
+/// irq_ack(x0 binding with MANAGE) checks its handle (spec 9, 11) and
+/// changes x0 alone: a closed handle fails with BAD_HANDLE, a channel with
+/// WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. On a line that
+/// is open it returns 0; once the binding's channel closed, PEER_CLOSED.
+fn irq_ack_checks_its_handle() -> Outcome {
+    const N: u16 = Call::IrqAck.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let b = bound(EDGE_LINE, &c, true)?;
+    let seen = copy(&b, Rights::DUPLICATE)?;
+    let refused = [
+        (gone, Error::BadHandle),
+        (c.raw().0, Error::WrongType),
+        (seen.raw().0, Error::AccessDenied),
+    ]
+    .iter()
+    .all(|&(h, e)| x0_alone::<N>(&[h], e.code()));
+    let open = x0_alone::<N>(&[b.raw().0], 0);
+    close(c)?;
+    let closed = x0_alone::<N>(&[b.raw().0], Error::PeerClosed.code());
+    close(seen)?;
+    close(b)?;
+    check(
+        refused,
+        "a closed handle, a channel or a copy without MANAGE did not fail alone",
+    )?;
+    check(open, "irq_ack of an open line did not return 0 alone")?;
+    check(
+        closed,
+        "irq_ack after the channel closed did not fail with PEER_CLOSED alone",
+    )
+}
+
+/// One binding a line (spec 9): a second irq_bind of a bound line fails
+/// with BAD_STATE and changes x0 alone, through another channel too, and
+/// before the state of the channel: a closed one does not change it.
+fn a_line_takes_one_binding() -> Outcome {
+    const N: u16 = Call::IrqBind.number();
+    let c = channel(QUIET)?;
+    let other = channel(QUIET)?;
+    let shut = channel(QUIET)?;
+    let notify = copy(&shut, Rights::NOTIFY)?;
+    close(shut)?;
+    let b = bound(EDGE_LINE, &c, true)?;
+    let args = |h: &Handle<Channel>| {
+        [
+            init::RESOURCE.raw().0,
+            EDGE_LINE.into(),
+            h.raw().0,
+            QUIET.into(),
+            TRIGGER_EDGE,
+        ]
+    };
+    let refused = [&c, &other, &notify]
+        .iter()
+        .all(|h| x0_alone::<N>(&args(h), Error::BadState.code()));
+    close(b)?;
+    close(notify)?;
+    close(other)?;
+    close(c)?;
+    check(refused, "a bound line took a second binding")
+}
+
+/// A binding lives while a handle to it is left (spec 4, 9): with a copy
+/// left the line stays bound after the first handle closed; once the last
+/// one closed, a new irq_bind of the line succeeds at once.
+fn binding_goes_with_its_last_handle() -> Outcome {
+    let c = channel(QUIET)?;
+    let b = bound(EDGE_LINE, &c, true)?;
+    let kept = copy(&b, OWNER_RIGHTS)?;
+    close(b)?;
+    let held = sys::irq_bind(&init::RESOURCE, EDGE_LINE, &c, QUIET, true).err();
+    close(kept)?;
+    let again = bound(EDGE_LINE, &c, false);
+    let made = again.is_ok();
+    if let Ok(b) = again {
+        close(b)?;
+    }
+    close(c)?;
+    check(
+        held == Some(Error::BadState),
+        "the line was free while a copy of its binding was left",
+    )?;
+    check(made, "the line stayed bound after its last handle closed")
+}
+
+/// object_info(IRQ) of a binding, with no right needed (spec 11): its
+/// line, whether it is masked, and its kind of trigger. Right after
+/// irq_bind a line is open, edge-triggered with TRIGGER_EDGE and
+/// level-triggered without.
+fn irq_info_reports_line_mask_and_trigger() -> Outcome {
+    let c = channel(QUIET)?;
+    let edge = bound(EDGE_LINE, &c, true)?;
+    let level = bound(RTC_LINE, &c, false)?;
+    let seen = copy(&level, Rights::NONE)?;
+    let infos = (sys::irq_info(&edge), sys::irq_info(&seen));
+    close(seen)?;
+    close(level)?;
+    close(edge)?;
+    close(c)?;
+    check(
+        infos
+            == (
+                Ok(IrqInfo {
+                    line: EDGE_LINE.into(),
+                    masked: false,
+                    edge: true,
+                }),
+                Ok(IrqInfo {
+                    line: RTC_LINE.into(),
+                    masked: false,
+                    edge: false,
+                }),
+            ),
+        "IRQ does not report the line, the open mask and the trigger of a new binding",
+    )
+}
+
+/// The page of the PL031 of QEMU `virt`, the tests' device window: its
+/// first register, at offset 0, holds the count of seconds (RTCDR).
+const RTC: u64 = 0x0901_0000;
+/// A page of QEMU `virt` with no device behind it: a load there is a
+/// synchronous external abort.
+const HOLE: u64 = 0x0904_0000;
+/// The fault status of a synchronous external abort that is not on a
+/// table walk, bits 5:0 of ESR ([G22]); an abort from EL0 gives ESR
+/// 0x92000010 whole.
+const EXTERNAL: u64 = 0b01_0000;
+
+/// A device window over `len` bytes from `addr` through the system
+/// resource.
+fn device_window(addr: u64, len: u64) -> Result<Handle<Memory>, &'static str> {
+    sys::device_window_create(&init::RESOURCE, addr, len).map_err(|_| "device_window_create failed")
+}
+
+/// device_window_create(x0 system resource with DEVICE, x1 address, x2
+/// length) checks the values first, then the handle, then the range
+/// against RAM and the kernel's devices (spec 9, 11), and changes x0 alone
+/// on an error: a length of 0, more than abi::MAX_MEMORY, a range that
+/// wraps around or ends past 2^48 fail with INVALID_ARGS through a closed
+/// handle too; a closed handle, a channel and a copy of the resource
+/// without DEVICE with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED, over RAM
+/// too; a page of RAM, of the GIC's distributor or CPU interface or of the
+/// PL011 with INVALID_ARGS. A window on the PL031 changes x0 and x1 alone,
+/// and its handle carries abi::WINDOW_RIGHTS and no MAP_EXEC.
+fn device_window_create_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::DeviceWindowCreate.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let no_device = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let (resource, page) = (init::RESOURCE.raw().0, PAGE as u64);
+    let invalid = [
+        (RTC, 0),
+        (RTC, abi::MAX_MEMORY + page),
+        (u64::MAX - 0x10, 0x20),
+        (LOWER_END - page, 2 * page),
+    ]
+    .iter()
+    .all(|&(addr, len)| x0_alone::<N>(&[gone, addr, len], Error::InvalidArgs.code()));
+    let refused = [
+        (gone, Error::BadHandle),
+        (c.raw().0, Error::WrongType),
+        (no_device.raw().0, Error::AccessDenied),
+    ]
+    .iter()
+    .all(|&(h, e)| x0_alone::<N>(&[h, 0x4000_0000, page], e.code()));
+    let kernel = [0x4000_0000, 0x0800_0000, 0x0801_0000, 0x0900_0000]
+        .iter()
+        .all(|&addr| x0_alone::<N>(&[resource, addr, page], Error::InvalidArgs.code()));
+    let mut x = marked();
+    x[..3].copy_from_slice(&[resource, RTC, page]);
+    // SAFETY: device_window_create only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
+    let w: Handle<Memory> = Handle::from_raw(abi::Handle(after[1]));
+    let all = sys::handle_duplicate(&w, WINDOW_RIGHTS).map(close);
+    let more = sys::handle_duplicate(&w, WINDOW_RIGHTS | Rights::MAP_EXEC).map(close);
+    if made {
+        close(w)?;
+    }
+    close(no_device)?;
+    close(c)?;
+    check(
+        invalid,
+        "a bad length or range did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        refused,
+        "a bad resource handle did not fail alone before the range",
+    )?;
+    check(
+        kernel,
+        "a window over RAM or a device of the kernel was made",
+    )?;
+    check(
+        made,
+        "a good device_window_create failed or changed registers past x1",
+    )?;
+    check(
+        all == Ok(Ok(())) && more == Err(Error::AccessDenied),
+        "the handle of a window does not carry WINDOW_RIGHTS and no more",
+    )
+}
+
+/// A window is checked by whole pages (spec 9): 32 bytes across the end of
+/// the PL011's page touch it and fail with INVALID_ARGS; the same bytes
+/// across the end of the PL031's page make a window of two pages.
+fn window_is_checked_by_whole_pages() -> Outcome {
+    let over = sys::device_window_create(&init::RESOURCE, 0x0900_0FF0, 0x20).err();
+    let w = device_window(RTC + 0xFF0, 0x20)?;
+    let size = sys::memory_info(&w).map(|i| i.size);
+    close(w)?;
+    check(
+        over == Some(Error::InvalidArgs),
+        "a window that shares the page of the PL011 was made",
+    )?;
+    check(
+        size == Ok(2 * PAGE as u64),
+        "a window was not rounded out to whole pages",
+    )
+}
+
+/// A window is a device window (spec 4, 6.2): a copy of its handle with
+/// WINDOW_RIGHTS that a client sends comes with the kind DeviceWindow and
+/// those rights in its info word.
+fn window_handle_is_a_device_window() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let w = device_window(RTC, PAGE as u64)?;
+    give(&[copy_raw(&w, WINDOW_RIGHTS)?]);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let (h, info) = rt::msgbuf::handle(0);
+    let replied = answer_all([got]);
+    let closed = close_raw(h);
+    close(t)?;
+    close(c)?;
+    close(w)?;
+    check(
+        info == (abi::ObjectKind::DeviceWindow, WINDOW_RIGHTS),
+        "the window's handle came with another kind or other rights",
+    )?;
+    check(
+        replied && ended(0) && closed.is_ok(),
+        "the client did not get the reply",
+    )
+}
+
+/// Spec 15.2 (memory, devices): a window maps R and RW, never RX (spec
+/// 7.4): mem_map with RX and mem_protect of the RW mapping to RX fail with
+/// ACCESS_DENIED, since the handle has no MAP_EXEC.
+fn window_maps_read_write_but_never_exec() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(RTC, page)?;
+    let r = sys::mem_map(&init::PROCESS, &w, 0, page, WINDOW, Access::Read);
+    let rw = sys::mem_map(
+        &init::PROCESS,
+        &w,
+        0,
+        page,
+        WINDOW + PAGE,
+        Access::ReadWrite,
+    );
+    let rx = sys::mem_map(
+        &init::PROCESS,
+        &w,
+        0,
+        page,
+        WINDOW + 2 * PAGE,
+        Access::ReadExec,
+    );
+    // SAFETY: the mapping is the test's window, which nothing runs.
+    let protected =
+        unsafe { sys::mem_protect(&init::PROCESS, WINDOW + PAGE, page, Access::ReadExec) };
+    for (mapped, at) in [(r, WINDOW), (rw, WINDOW + PAGE)] {
+        if mapped.is_ok() {
+            unmap(at, page)?;
+        }
+    }
+    close(w)?;
+    check(r.is_ok() && rw.is_ok(), "a window did not map R or RW")?;
+    check(
+        rx == Err(Error::AccessDenied) && protected == Err(Error::AccessDenied),
+        "a window mapped RX or became RX",
+    )
+}
+
+/// A window shows its device (spec 9): the count of seconds of the PL031,
+/// read twice through a window mapped R with volatile loads of 32 bits
+/// ([G34]), is not 0 and does not go back.
+fn window_reads_its_device() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(RTC, page)?;
+    map(&w, 0, page, WINDOW, Access::Read)?;
+    let dr = WINDOW as *const u32;
+    // SAFETY: the page is the PL031's registers, mapped R as device memory;
+    // RTCDR is a 32-bit register at offset 0.
+    let (first, second) = unsafe { (dr.read_volatile(), dr.read_volatile()) };
+    unmap(WINDOW, page)?;
+    close(w)?;
+    check(
+        first != 0 && second >= first,
+        "the PL031's count through the window is 0 or went back",
+    )
+}
+
+/// MEMORY of a window (spec 11): its size, no page of frames it owns, and
+/// its mappings now, two, then one.
+fn window_info_counts_its_mappings() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(RTC, page)?;
+    let info = |mappings| {
+        Ok(MemoryInfo {
+            size: page,
+            pages: 0,
+            mappings,
+        })
+    };
+    let before = sys::memory_info(&w);
+    map(&w, 0, page, WINDOW, Access::Read)?;
+    map(&w, 0, page, WINDOW + PAGE, Access::Read)?;
+    let two = sys::memory_info(&w);
+    unmap(WINDOW + PAGE, page)?;
+    let one = sys::memory_info(&w);
+    unmap(WINDOW, page)?;
+    close(w)?;
+    check(
+        before == info(0) && two == info(2) && one == info(1),
+        "MEMORY of a window does not count its mappings or counts pages",
+    )
+}
+
+/// Spec 15.2 (faults), 7.9: a load through a window where no device
+/// answers is a synchronous external abort of the process that made it,
+/// and ends only that process. Init maps a window on a hole into a child
+/// with code, which loads from it (Role::Load): the child ends with a data
+/// abort from EL0 whose fault is external, FAR at the load; init lives on.
+fn window_over_a_hole_faults_only_its_process() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(HOLE, page)?;
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let at = child::SHARED;
+    let state = sys::mem_map(&kid.process, &w, 0, page, at, Access::Read)
+        .map_err(|_| "the window did not map into the child")
+        .and_then(|()| kid.start())
+        .and_then(|()| kid.serve(Role::Load, &[at as u64], &[]))
+        .and_then(|()| kid.end());
+    kid.close()?;
+    let_run()?;
+    close(w)?;
+    match state? {
+        ProcessState::Fault { esr, far, .. } => check(
+            (esr >> 26 & 0x3F, esr & 0x3F, far) == (DATA_ABORT, EXTERNAL, at as u64),
+            "the child's fault is no external abort at the load",
+        ),
+        _ => Err("the child did not end with a fault"),
+    }
+}
+
+/// The registers of the PL031 the driver uses, 32 bits each, by their
+/// offsets in its page: the count of seconds (RTCDR), the match (RTCMR),
+/// the mask of its interrupt (RTCIMSC), the raw status of the alarm
+/// (RTCRIS) and its clear (RTCICR).
+const RTC_DR: usize = 0x00;
+const RTC_MR: usize = 0x04;
+const RTC_IMSC: usize = 0x10;
+const RTC_RIS: usize = 0x14;
+const RTC_ICR: usize = 0x1C;
+/// The alarm bit of RTCIMSC, RTCRIS and RTCICR.
+const ALARM: u32 = 1;
+/// The priority of the slot of init's binding of the PL031: above init.
+const DRIVER: u8 = 50;
+/// Writes of the match that `Rtc::raise` tries: the count turns once a
+/// second, between the read of the count and the write at most once.
+const RAISE_TRIES: u32 = 3;
+/// The rights of the binding a driver gets (spec 13.4): irq_ack, and the
+/// move in a message, which the handle needs to reach the driver; no copy
+/// of it outlives the driver without init.
+const DRIVER_RIGHTS: Rights = Rights::MANAGE.union(Rights::TRANSFER);
+/// A child that runs Role::Rtc: a page of its pool of channels more.
+const RTC_QUOTA: u64 = LEAF_QUOTA + PAGE as u64;
+
+/// Init as the driver of the PL031 (spec 13.5): a device window on its
+/// page, mapped RW at WINDOW, a channel for the binding of RTC_LINE, and a
+/// timer on the channel that bounds each wait. The alarm rises at once:
+/// the match written with the count the driver read raises it (the
+/// device's rule), so no test waits for time to pass.
+struct Rtc {
+    window: Handle<Memory>,
+    channel: Handle<Channel>,
+    guard: Handle<Timer>,
+}
+
+impl Rtc {
+    /// The driver's window, channel and timer, with the alarm masked and
+    /// cleared in the device.
+    fn open() -> Result<Rtc, &'static str> {
+        let window = device_window(RTC, PAGE as u64)?;
+        map(&window, 0, PAGE as u64, WINDOW, Access::ReadWrite)?;
+        let channel = channel(QUIET)?;
+        let guard = timer(&channel)?;
+        let rtc = Rtc {
+            window,
+            channel,
+            guard,
+        };
+        rtc.write(RTC_IMSC, 0);
+        rtc.write(RTC_ICR, ALARM);
+        Ok(rtc)
+    }
+
+    fn read(&self, reg: usize) -> u32 {
+        // SAFETY: the window maps the PL031's page at WINDOW, RW, as device
+        // memory; each register is 32 bits at its offset ([G34]).
+        unsafe { ((WINDOW + reg) as *const u32).read_volatile() }
+    }
+
+    fn write(&self, reg: usize, value: u32) {
+        // SAFETY: as in `read`.
+        unsafe { ((WINDOW + reg) as *mut u32).write_volatile(value) }
+    }
+
+    /// The binding of RTC_LINE, level-triggered, to the channel at DRIVER.
+    fn bind(&self) -> Result<Handle<Interrupt>, &'static str> {
+        sys::irq_bind(&init::RESOURCE, RTC_LINE, &self.channel, DRIVER, false)
+            .map_err(|_| "irq_bind of the PL031's line failed")
+    }
+
+    /// Raises the alarm: unmasks it in the device and writes the count it
+    /// reads into the match; when the count turned in between, the raw
+    /// status stays 0 and it tries again.
+    fn raise(&self) -> Outcome {
+        self.write(RTC_IMSC, ALARM);
+        for _ in 0..RAISE_TRIES {
+            let count = self.read(RTC_DR);
+            self.write(RTC_MR, count);
+            if self.read(RTC_RIS) & ALARM != 0 {
+                return Ok(());
+            }
+        }
+        Err("the PL031's alarm did not rise at its count")
+    }
+
+    /// Clears the alarm and reads its status back, as a driver does before
+    /// irq_ack (spec 13.5).
+    fn clear(&self) -> Outcome {
+        self.write(RTC_ICR, ALARM);
+        check(
+            self.read(RTC_RIS) & ALARM == 0,
+            "the PL031's alarm did not clear",
+        )
+    }
+
+    /// What the channel takes next, within KID_WAIT_NS; the timer's
+    /// expiry is a failure.
+    fn wait(&self) -> Result<Received, &'static str> {
+        arm(&self.guard, clock_now()? + KID_WAIT_NS)?;
+        let got = sys::receive(&self.channel);
+        let cancelled = sys::timer_cancel(&self.guard);
+        match got {
+            _ if cancelled.is_err() => Err("timer_cancel failed"),
+            Ok(Received::Notification {
+                source: Source::Timer,
+                ..
+            }) => Err("no interrupt came in time"),
+            Ok(got) => Ok(got),
+            Err(_) => Err("receive on the driver's channel failed"),
+        }
+    }
+
+    /// What the channel holds now; WOULD_BLOCK when nothing.
+    fn now(&self) -> Result<Received, Error> {
+        sys::try_receive(&self.channel)
+    }
+
+    /// Masks and clears the alarm, unmaps the window and closes the
+    /// handles.
+    fn close(self) -> Outcome {
+        self.write(RTC_IMSC, 0);
+        self.write(RTC_ICR, ALARM);
+        unmap(WINDOW, PAGE as u64)?;
+        let closed = [
+            self.guard.close(),
+            self.channel.close(),
+            self.window.close(),
+        ];
+        check(
+            closed.iter().all(Result::is_ok),
+            "a handle of the driver did not close",
+        )
+    }
+}
+
+/// An interrupt through a handle with no label, merged `count` times.
+fn interrupt(count: u32) -> Received {
+    Received::Notification {
+        source: Source::Interrupt,
+        label: 0,
+        bits: 1,
+        count,
+    }
+}
+
+/// What IRQ says of init's binding of the PL031.
+fn rtc_line(masked: bool) -> Result<IrqInfo, Error> {
+    Ok(IrqInfo {
+        line: RTC_LINE.into(),
+        masked,
+        edge: false,
+    })
+}
+
+/// Spec 15.2 (devices), 9, 13.5: the PL031's alarm comes as a notification
+/// of an interrupt, label 0, bit 0, one delivery, and the line is masked
+/// meanwhile; the driver clears the alarm, reads the status back and
+/// calls irq_ack, which opens the line, and nothing more comes.
+fn rtc_alarm_comes_as_a_notification() -> Outcome {
+    let rtc = Rtc::open()?;
+    let b = rtc.bind()?;
+    let got = rtc.raise().and_then(|()| rtc.wait());
+    let masked = sys::irq_info(&b);
+    let cleared = rtc.clear();
+    let acked = sys::irq_ack(&b);
+    let rest = rtc.now();
+    let open = sys::irq_info(&b);
+    close(b)?;
+    rtc.close()?;
+    check(
+        got? == interrupt(1),
+        "the alarm did not come as one notification of an interrupt",
+    )?;
+    check(
+        masked == rtc_line(true),
+        "the line was not masked after its notification",
+    )?;
+    cleared?;
+    check(
+        acked.is_ok() && rest == Err(Error::WouldBlock),
+        "a cleared alarm came again after irq_ack",
+    )?;
+    check(open == rtc_line(false), "irq_ack did not open the line")
+}
+
+/// Spec 15.2 (devices), 9: a line stays masked until irq_ack. The driver
+/// clears the first alarm and raises it again without irq_ack: nothing
+/// comes; irq_ack opens the line, and the alarm comes before the call
+/// returns.
+fn line_stays_masked_until_irq_ack() -> Outcome {
+    let rtc = Rtc::open()?;
+    let b = rtc.bind()?;
+    let first = rtc.raise().and_then(|()| rtc.wait());
+    let again = rtc.clear().and_then(|()| rtc.raise());
+    let held = rtc.now();
+    let acked = sys::irq_ack(&b);
+    let second = rtc.now();
+    let last = rtc.clear().map(|()| sys::irq_ack(&b));
+    let rest = rtc.now();
+    close(b)?;
+    rtc.close()?;
+    check(first? == interrupt(1), "the first alarm did not come")?;
+    again?;
+    check(
+        held == Err(Error::WouldBlock),
+        "an alarm came while the line was masked",
+    )?;
+    check(
+        acked.is_ok() && second == Ok(interrupt(1)),
+        "the alarm raised under the mask did not come at irq_ack",
+    )?;
+    check(
+        last == Ok(Ok(())) && rest == Err(Error::WouldBlock),
+        "a cleared alarm came again",
+    )
+}
+
+/// Spec 9, 13.5: a level-triggered line stays up until the driver clears
+/// its source. irq_ack without the clear gives a second notification at
+/// once; after the clear, the read back and irq_ack, no third comes.
+fn level_line_fires_again_until_its_source_is_cleared() -> Outcome {
+    let rtc = Rtc::open()?;
+    let b = rtc.bind()?;
+    let first = rtc.raise().and_then(|()| rtc.wait());
+    let acked = sys::irq_ack(&b);
+    let second = rtc.now();
+    let cleared = rtc.clear();
+    let last = sys::irq_ack(&b);
+    let third = rtc.now();
+    close(b)?;
+    rtc.close()?;
+    check(first? == interrupt(1), "the first alarm did not come")?;
+    check(
+        acked.is_ok() && second == Ok(interrupt(1)),
+        "a line still up gave no second notification after irq_ack",
+    )?;
+    cleared?;
+    check(
+        last.is_ok() && third == Err(Error::WouldBlock),
+        "a cleared line gave a third notification",
+    )
+}
+
+/// Spec 15.2 (devices), 9, 13.4: a driver that dies frees its line. A child
+/// (Role::Rtc) sends init a copy of its channel with NOTIFY; init binds the
+/// PL031's line through it and answers with a copy of the binding with
+/// MANAGE and TRANSFER alone, which moves to the child. Init raises the
+/// alarm, the child reports the notification and never calls irq_ack. Once
+/// init killed it and heard of its end, init binds the line to its own
+/// channel, and the alarm, never cleared, comes before irq_bind returns and
+/// masks the line.
+fn dead_driver_frees_its_line() -> Outcome {
+    let rtc = Rtc::open()?;
+    let kid = Kid::load(RTC_QUOTA, 16, LEVEL)?;
+    let heard = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Rtc, &[], &[]))
+        .and_then(|()| bind_for(&kid, false).map(drop))
+        .and_then(|()| rtc.raise())
+        .and_then(|()| kid.ear.next());
+    let killed = sys::process_kill(&kid.process);
+    let state = kid.end();
+    kid.close()?;
+    let_run()?;
+    let again = rtc.bind();
+    let got = rtc.now();
+    let info = again.as_ref().ok().map(sys::irq_info);
+    let cleared = rtc.clear();
+    let rest = again.as_ref().ok().map(|b| (sys::irq_ack(b), rtc.now()));
+    if let Ok(b) = again {
+        close(b)?;
+    }
+    rtc.close()?;
+    let binding = abi::msgbuf::info(abi::ObjectKind::Interrupt, DRIVER_RIGHTS);
+    match heard? {
+        Received::Message {
+            label: START,
+            len: 40,
+            words,
+            ..
+        } => check(
+            words[..5] == [binding, Source::Interrupt.code(), 0, 1, 1],
+            "the child's binding or notification was not as sent",
+        )?,
+        _ => return Err("the child did not report its notification"),
+    }
+    check(
+        killed.is_ok() && state? == ProcessState::Killed,
+        "the child did not end killed",
+    )?;
+    check(
+        info == Some(rtc_line(true)) && got == Ok(interrupt(1)),
+        "the line of a dead driver did not bind again and deliver at once",
+    )?;
+    cleared?;
+    check(
+        rest == Some((Ok(()), Err(Error::WouldBlock))),
+        "the alarm came again once cleared",
+    )
+}
+
+/// Spec 15.2 (devices), 9, 13.4: a driver that dies with a notification
+/// in its channel's queue frees its line at once. The child (Role::Rtc,
+/// word 1) sends init besides a copy of its channel with RECEIVE and
+/// TRANSFER, and waits in a request once it holds the binding, taking
+/// nothing. Init raises the alarm, which the way out of the kernel
+/// delivers before init runs again: CHANNEL of the copy shows one
+/// notification queued. Init's copy keeps the channel open, and the
+/// notification in its queue, after the child's end; irq_bind of the line
+/// succeeds all the same, and the alarm, never cleared, comes before it
+/// returns. The old notification still waits in the child's channel.
+fn driver_dying_with_a_queued_alarm_frees_its_line() -> Outcome {
+    let rtc = Rtc::open()?;
+    let kid = Kid::load(RTC_QUOTA, 16, LEVEL)?;
+    let seen = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Rtc, &[1], &[]))
+        .and_then(|()| bind_for(&kid, true));
+    let queued = match &seen {
+        Ok(Some(s)) => kid
+            .ear
+            .next()
+            .and_then(|_| rtc.raise())
+            .and_then(|()| let_run())
+            .map(|()| sys::channel_info(s).map(|i| i.queued)),
+        Ok(None) => Err("the child sent no second copy of its channel"),
+        Err(e) => Err(*e),
+    };
+    let killed = sys::process_kill(&kid.process);
+    let state = kid.end();
+    kid.close()?;
+    let again = rtc.bind();
+    let got = rtc.now();
+    let cleared = rtc.clear();
+    let rest = again.as_ref().ok().map(|b| (sys::irq_ack(b), rtc.now()));
+    if let Ok(b) = again {
+        close(b)?;
+    }
+    let left = match seen {
+        Ok(Some(s)) => {
+            let left = sys::channel_info(&s).map(|i| i.queued);
+            close(s)?;
+            left
+        }
+        _ => Err(Error::BadHandle),
+    };
+    rtc.close()?;
+    check(
+        queued? == Ok(1) && left == Ok(1),
+        "the alarm did not wait in the child's channel",
+    )?;
+    check(
+        killed.is_ok() && state? == ProcessState::Killed,
+        "the child did not end killed",
+    )?;
+    check(
+        rest.is_some() && got == Ok(interrupt(1)),
+        "the line of a driver that died with a notification queued did not bind again at once",
+    )?;
+    cleared?;
+    check(
+        rest == Some((Ok(()), Err(Error::WouldBlock))),
+        "the alarm came again once cleared",
+    )
+}
+
+/// Takes the child's request BIND with a copy of its channel with NOTIFY,
+/// and when `seen` a second copy with RECEIVE and TRANSFER, which init
+/// keeps and returns; binds RTC_LINE through the first at LEVEL, closes it, and
+/// answers with a copy of the binding with DRIVER_RIGHTS, which moves to
+/// the child; init's own handle goes (spec 13.4).
+fn bind_for(kid: &Kid, seen: bool) -> Result<Option<Handle<Channel>>, &'static str> {
+    let Received::Message {
+        label: START,
+        len: 8,
+        handles,
+        token,
+        words,
+    } = kid.ear.next()?
+    else {
+        return Err("the child did not send its channel");
+    };
+    let copy_of =
+        |i: usize| (i < handles).then(|| Handle::<Channel>::from_raw(rt::msgbuf::handle(i).0));
+    let (c, kept) = (copy_of(0), copy_of(1));
+    check(
+        handles == 1 + usize::from(seen),
+        "the child sent another count of handles",
+    )?;
+    let c = c.ok_or("the child did not send its channel")?;
+    let b = sys::irq_bind(&init::RESOURCE, RTC_LINE, &c, LEVEL, false);
+    close(c)?;
+    check(words[0] == child::BIND, "the child's request is not BIND")?;
+    let b = b.map_err(|_| "irq_bind through the child's channel failed")?;
+    let given = copy(&b, DRIVER_RIGHTS);
+    close(b)?;
+    token
+        .reply_handles(&[], &[given?.raw()])
+        .map_err(|_| "the reply with the binding failed")?;
+    Ok(kept)
 }

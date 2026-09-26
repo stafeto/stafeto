@@ -2,16 +2,18 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
-//! reference to its process, thread, channel, session, timer or memory
-//! object, and the last reference queues the object for cleanup (spec 7.7); a channel counts its
-//! handles with RECEIVE too, since the last of them closes it (spec 6.8).
-//! A channel handle with a label names the label's session, which names
-//! the channel (spec 5.3) and counts its handles as its copies. The system
-//! resource is one for the whole system and is not counted: what a handle
-//! to it allows is in the handle's rights. Every kind of object keeps its
-//! count in a `Refs` and its number in a `Live`.
+//! reference to its process, thread, channel, session, timer, memory
+//! object or interrupt binding, and the last reference queues the object
+//! for cleanup (spec 7.7); a channel counts its handles with RECEIVE too,
+//! since the last of them closes it (spec 6.8). A channel handle with a
+//! label names the label's session, which names the channel (spec 5.3)
+//! and counts its handles as its copies. The system resource is one for
+//! the whole system and is not counted: what a handle to it allows is in
+//! the handle's rights. Every kind of object keeps its count in a `Refs`
+//! and its number in a `Live`.
 
 use crate::channel::{self, Channel};
+use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
 use crate::mm::pages::KernelPages;
 #[cfg(feature = "ktest")]
@@ -37,8 +39,10 @@ pub enum Object {
     Session(NonNull<Session>),
     /// A timer of a program (spec 10).
     Timer(NonNull<Timer>),
-    /// A memory object (spec 7.3).
+    /// A memory object (spec 7.3), a device window among them (spec 9).
     Memory(NonNull<Memory>),
+    /// An interrupt binding (spec 9).
+    Irq(NonNull<Irq>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -102,20 +106,31 @@ impl Object {
         }
     }
 
+    /// The interrupt binding, for a lookup that needs one.
+    pub fn irq(&self) -> Option<NonNull<Irq>> {
+        match *self {
+            Object::Irq(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Some for the system resource, for a lookup that needs it.
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
     }
 
     /// The kind a message reports for a handle to the object (spec 6.2):
-    /// a handle with a label names a channel.
+    /// a handle with a label names a channel, and a memory object over
+    /// device registers is a device window.
     pub fn kind(&self) -> ObjectKind {
         match self {
             Object::Process(_) => ObjectKind::Process,
             Object::Thread(_) => ObjectKind::Thread,
             Object::Channel(_) | Object::Session(_) => ObjectKind::Channel,
             Object::Timer(_) => ObjectKind::Timer,
+            Object::Memory(m) if memory::is_window(*m) => ObjectKind::DeviceWindow,
             Object::Memory(_) => ObjectKind::Memory,
+            Object::Irq(_) => ObjectKind::Interrupt,
             Object::Resource => ObjectKind::Resource,
         }
     }
@@ -254,6 +269,7 @@ pub fn retain(object: Object, rights: Rights) {
         Object::Session(s) => session::retain(s, rights),
         Object::Timer(t) => timer::retain(t),
         Object::Memory(m) => memory::retain(m),
+        Object::Irq(b) => irq::retain_handle(b),
         Object::Resource => {}
     }
 }
@@ -277,6 +293,7 @@ pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
             Object::Session(s) => session::release(s, rights, cause),
             Object::Timer(t) => timer::release(t, cause),
             Object::Memory(m) => memory::release(m, cause),
+            Object::Irq(b) => irq::release_handle(b, cause),
             Object::Resource => {}
         }
     }

@@ -101,6 +101,19 @@ impl Attrs {
         }
     }
 
+    /// The attributes of the pages of a device window with `access` (spec
+    /// 7.4, [G6], [G9]): Device-nGnRE (AttrIndx 1), EL0 access, read-only
+    /// for R, and never executable at either level, whatever `access` says.
+    pub const fn user_device(access: Access) -> Attrs {
+        Attrs {
+            memory: Memory::Device,
+            write: matches!(access, Access::ReadWrite),
+            kernel_exec: false,
+            user: true,
+            user_exec: false,
+        }
+    }
+
     /// W^X, no executable device memory, EL0 execution only on EL0 pages,
     /// and the kernel never executes a user page.
     pub fn is_valid(&self) -> bool {
@@ -654,6 +667,20 @@ mod tests {
         let d = page_descriptor(0x5000_0000, user_data);
         assert_ne!(d & (1 << 11), 0, "nG");
         assert_ne!(d & (1 << 6), 0, "AP[1]");
+    }
+
+    #[test]
+    fn user_device_attrs_never_execute() {
+        for access in [Access::Read, Access::ReadWrite, Access::ReadExec] {
+            let attrs = Attrs::user_device(access);
+            assert!(attrs.is_valid());
+            let d = page_descriptor(0x0901_0000, attrs);
+            assert_eq!(attr_index(d), MAIR_DEVICE);
+            assert_eq!(d & (PXN | UXN | NG | AP_EL0), PXN | UXN | NG | AP_EL0);
+            assert_eq!(d & SH_INNER, 0);
+            let read_only = d & AP_READ_ONLY != 0;
+            assert_eq!(read_only, access != Access::ReadWrite);
+        }
     }
 
     #[test]

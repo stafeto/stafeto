@@ -196,14 +196,16 @@ pub fn begin_change(target: NonNull<Process>, index: u32) -> Change {
 }
 
 /// One portion of `long`, a mem_map, mem_unmap or mem_protect (spec 7.4,
-/// 7.7): BAD_STATE when its process ended, and nothing is touched; else
-/// up to PORTION pages of the entry, EXEC_PORTION when they become
-/// executable, from where the call stopped: mem_map maps them to the
-/// frames of the object, with tables from what it paid for up front;
-/// mem_unmap unmaps them; mem_protect gives them the new access. Pages
-/// that become executable have the instruction cache made coherent first
-/// ([G18]); the TLB entries of pages unmapped or changed go before the
-/// portion ends ([G13]). True once every page of the entry is done.
+/// 7.7): BAD_STATE when its process ended, and nothing is touched; else up
+/// to PORTION pages of the entry, EXEC_PORTION when they become executable,
+/// from where the call stopped: mem_map maps them to the frames of the
+/// object, with tables from what it paid for up front; mem_unmap unmaps
+/// them; mem_protect gives them the new access, the attributes of the
+/// object's pages (memory::attrs: Device-nGnRE and never executable for a
+/// device window). Pages that become executable have the instruction cache
+/// made coherent first ([G18]); the TLB entries of pages unmapped or
+/// changed go before the portion ends ([G13]). True once every page of the
+/// entry is done.
 pub fn step_change(long: &mut Long) -> Result<bool, Error> {
     let (on, access) = match *long {
         Long::Map { on, access, .. } | Long::Protect { on, access } => (on, Some(access)),
@@ -213,7 +215,10 @@ pub fn step_change(long: &mut Long) -> Result<bool, Error> {
     check_alive(on.target)?;
     // SAFETY: the process lives, and the entry is the call's.
     let (m, space) = unsafe { (entry(&on), space(on.target)) };
-    let exec = access == Some(Access::ReadExec);
+    // A device window carries no MAP_EXEC right (abi::WINDOW_RIGHTS, spec
+    // 5.2, 9), so this excludes it on its own; the check stands so that
+    // cache::sync_icache_frames never walks a page outside the linear map.
+    let exec = access == Some(Access::ReadExec) && !memory::is_window(m.object);
     let n = if exec { EXEC_PORTION } else { PORTION }.min(m.pages - on.done);
     let va = page_address(&m, on.done);
     let mut frames = [0; PORTION as usize];
@@ -226,7 +231,7 @@ pub fn step_change(long: &mut Long) -> Result<bool, Error> {
     if exec {
         cache::sync_icache_frames(frames);
     }
-    match (long, access.map(Attrs::user)) {
+    match (long, access.map(|a| memory::attrs(m.object, a))) {
         (Long::Map { prepaid, on, .. }, Some(attrs)) => {
             space.map_pages(va, frames, attrs, prepaid);
             on.done += n;
@@ -352,6 +357,17 @@ pub unsafe fn abandon_change(long: Long, cause: u8) {
     if let Long::Map { prepaid, .. } = long {
         refund(on.target, prepaid);
     }
+}
+
+/// The device windows among the mappings of `process`, which the caller
+/// holds (spec 7.9): the report of an SError names them. Up to
+/// abi::MAX_MAPPINGS entries, each O(1).
+pub fn device_windows(process: NonNull<Process>) -> usize {
+    // SAFETY: the caller holds a reference to the process; only the table
+    // is read.
+    unsafe { table(process) }.map_or(0, |t| {
+        t.iter().filter(|m| memory::is_window(m.object)).count()
+    })
 }
 
 /// The stage Mappings (spec 7.7): every entry of the table, busy or not,

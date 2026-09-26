@@ -14,6 +14,7 @@
 .equ SVC_SLOW, 0xFF03                   // ktest::el0::SVC_SLOW
 .equ SVC_RELEASE, 0xFF04                // ktest::el0::SVC_RELEASE
 .equ SVC_PENDING, 0xFF05                // ktest::el0::SVC_PENDING
+.equ SVC_PEND, 0xFF06                   // ktest::el0::SVC_PEND
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
 .equ CALL_SEND, 4                       // abi::Call::Send
 .equ CALL_RECEIVE, 5                    // abi::Call::Receive
@@ -732,6 +733,23 @@ el0_long_calls:
     mov     x0, x27
     svc     #CALL_HANDLE_CLOSE
     mov     x24, x0
+    svc     #SVC_DONE
+
+// Interrupt tests (ktest::el0).
+
+// A driver: receive(x0 channel, x1 flags), then the counter into x12, the
+// first thing it does once an interrupt woke it.
+.global el0_receive_then_count
+el0_receive_then_count:
+    svc     #CALL_RECEIVE
+    isb
+    mrs     x12, cntvct_el0
+    svc     #SVC_DONE
+
+// Makes line x0 pending (svc #SVC_PEND) and ends.
+.global el0_pend
+el0_pend:
+    svc     #SVC_PEND
     svc     #SVC_DONE
 
 el0_programs_end:

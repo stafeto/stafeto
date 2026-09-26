@@ -471,6 +471,7 @@ impl<T: Schedulable> Scheduler<T> {
     ///
     /// # Safety
     /// Every thread the scheduler holds is alive.
+    #[inline(always)]
     pub unsafe fn pick(&mut self, now: u64, cleanup: Option<u8>) -> Decision<T> {
         if let Some(r) = self.running {
             // SAFETY: the running thread is alive.

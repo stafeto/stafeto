@@ -20,18 +20,26 @@
 //! kcore::pagelist::RELEASE_STEP a portion, and then its place and its
 //! budget. The object over the boot image (`create_boot`, spec 13.1) owns
 //! no frame: it names the image's, which the frame allocator never gets,
-//! has a budget of 0, and gives back only its place.
+//! has a budget of 0, and gives back only its place. So does a device
+//! window (`create_window`, spec 9): an object over a physical range of
+//! device registers, whole pages that touch no RAM and no device of the
+//! kernel (kcore::window), which programs map as Device-nGnRE and never
+//! execute (`attrs`, spec 7.4).
 
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame, LinearMem};
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
-use abi::{Error, MemoryInfo};
+use abi::{Access, Error, MemoryInfo};
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
+use kcore::bootinfo::BootInfo;
 use kcore::frames::PhysMem;
 use kcore::pagelist::{self, ListMemory, PageList};
+use kcore::paging::Attrs;
 use kcore::quota::Account;
+use kcore::sync::SetOnce;
+use kcore::window::{self, Forbidden};
 
 /// Pages one portion of mem_create takes and zeroes, at most (spec 7.7).
 pub const CREATE_PORTION: usize = 8;
@@ -66,6 +74,9 @@ enum Backing {
     /// The `pages` frames from `base`, the boot image's, which stay for
     /// good (spec 13.1).
     Boot { base: u64, pages: usize },
+    /// The `pages` pages of device registers from `base`: a device window
+    /// (spec 9), which no frame allocator knows.
+    Device { base: u64, pages: usize },
 }
 
 // SAFETY: memory objects are reached under the kernel's rules (spec 8.1):
@@ -74,6 +85,10 @@ unsafe impl Send for Memory {}
 
 /// Memory objects whose places have not gone back.
 static LIVE: Live = Live::new();
+
+/// What device windows may not touch: the RAM and the kernel's devices of
+/// the device tree, written once at boot (`forbid`).
+static FORBIDDEN: SetOnce<Forbidden> = SetOnce::new();
 
 /// Frames of a memory object from the frame allocator, each charged to the
 /// object's budget (phys::alloc_zeroed, phys::free), and the words of the
@@ -148,7 +163,7 @@ pub fn fill(m: NonNull<Memory>) -> bool {
     let (backing, budget) = unsafe { (&mut (*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
     match backing {
         Backing::Owned(list) => list.fill(&mut Budget(budget), CREATE_PORTION),
-        Backing::Boot { .. } => true,
+        Backing::Boot { .. } | Backing::Device { .. } => true,
     }
 }
 
@@ -179,8 +194,47 @@ pub fn create_boot(
     base: u64,
     pages: usize,
 ) -> Result<NonNull<Memory>, Error> {
+    create_over(payer, Backing::Boot { base, pages })
+}
+
+/// What device windows may not touch on the machine `info` describes
+/// (kcore::window::forbidden), once at boot, before init starts.
+pub fn forbid(info: &BootInfo) {
+    if FORBIDDEN.set(window::forbidden(info)).is_err() {
+        panic!("memory::forbid runs once");
+    }
+}
+
+/// INVALID_ARGS when the `pages` pages from `base`, a range
+/// kcore::window::round_out gave, touch RAM or a device of the kernel
+/// (spec 9): device_window_create checks its range against the objects
+/// the kernel keeps. O(11).
+pub fn check_window(base: u64, pages: u64) -> Result<(), Error> {
+    let forbidden = FORBIDDEN.get().expect("memory::forbid ran at boot");
+    window::check(base, pages, forbidden.as_slice())
+}
+
+/// A device window (spec 9): an object over the `pages` pages of device
+/// registers from `base`, a range `check_window` let through, which
+/// `payer`, the process of the thread that makes it, pays a place in its
+/// pool of memory objects for, as `create_boot` does (NO_MEMORY). Its
+/// budget is 0, and it holds the payer's shell. The caller gets the first
+/// reference.
+pub fn create_window(
+    payer: NonNull<Process>,
+    base: u64,
+    pages: usize,
+) -> Result<NonNull<Memory>, Error> {
+    create_over(payer, Backing::Device { base, pages })
+}
+
+/// An object over frames or registers it does not own, `backing`, with a
+/// budget of 0, in the pool of `payer`, whose quota pays for a page when
+/// the pool grows (NO_MEMORY when it falls short). It holds the payer's
+/// shell; the caller gets the first reference.
+fn create_over(payer: NonNull<Process>, backing: Backing) -> Result<NonNull<Memory>, Error> {
     let memory = Memory {
-        backing: Backing::Boot { base, pages },
+        backing,
         budget: Account::new(0),
         refs: Refs::one(),
         mappings: 0,
@@ -199,7 +253,26 @@ pub fn pages(m: NonNull<Memory>) -> usize {
     // read.
     match unsafe { &(*m.as_ptr()).backing } {
         Backing::Owned(list) => list.pages(),
-        Backing::Boot { pages, .. } => *pages,
+        Backing::Boot { pages, .. } | Backing::Device { pages, .. } => *pages,
+    }
+}
+
+/// Whether `m`, which the caller holds, is a device window: its handle's
+/// kind is abi::ObjectKind::DeviceWindow (spec 4).
+pub fn is_window(m: NonNull<Memory>) -> bool {
+    // SAFETY: the caller holds a reference to the object; only the field is
+    // read.
+    matches!(unsafe { &(*m.as_ptr()).backing }, Backing::Device { .. })
+}
+
+/// The attributes of the pages of `m`, which the caller holds, mapped with
+/// `access` (spec 7.4): Device-nGnRE and never executable for a device
+/// window, the attributes of a program's pages otherwise.
+pub fn attrs(m: NonNull<Memory>, access: Access) -> Attrs {
+    if is_window(m) {
+        Attrs::user_device(access)
+    } else {
+        Attrs::user(access)
     }
 }
 
@@ -212,20 +285,20 @@ pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
     let (backing, budget) = unsafe { (&(*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
     match backing {
         Backing::Owned(list) => list.frame(&Budget(budget), i),
-        Backing::Boot { base, .. } => base + i as u64 * PAGE_SIZE,
+        Backing::Boot { base, .. } | Backing::Device { base, .. } => base + i as u64 * PAGE_SIZE,
     }
 }
 
 /// object_info MEMORY of `m`, which the caller holds (spec 11): its size in
 /// bytes, the pages whose frames it owns, every page once it is whole and
-/// none over the boot image, and its mappings.
+/// none over the boot image or of a device window, and its mappings.
 pub fn info(m: NonNull<Memory>) -> MemoryInfo {
     // SAFETY: the caller holds a reference to the object; only the fields
     // are read.
     let (backing, mappings) = unsafe { (&(*m.as_ptr()).backing, (*m.as_ptr()).mappings) };
     let owned = match backing {
         Backing::Owned(list) => list.filled(),
-        Backing::Boot { .. } => 0,
+        Backing::Boot { .. } | Backing::Device { .. } => 0,
     };
     MemoryInfo {
         size: pages(m) as u64 * PAGE_SIZE,
@@ -295,10 +368,11 @@ pub unsafe fn release(m: NonNull<Memory>, cause: u8) {
 /// (spec 7.7): up to kcore::pagelist::RELEASE_STEP of its frames, pages and
 /// then nodes, go back to the frame allocator, each refunded to its
 /// budget, and with frames left the object goes back to the head of
-/// `level`. Once none is left, at once over the boot image, whose frames
-/// stay, its place goes back to the payer's pool, its budget to the payer's
-/// quota, and its reference to the payer's shell goes, which may queue the
-/// shell at `level`. O(1): at most RELEASE_STEP frames.
+/// `level`. Once none is left, at once over the boot image and for a
+/// device window, whose frames stay, its place goes back to the payer's
+/// pool, its budget to the payer's quota, and its reference to the
+/// payer's shell goes, which may queue the shell at `level`. O(1): at most
+/// RELEASE_STEP frames.
 ///
 /// # Safety
 /// Nothing refers to the object, and it is in no queue.
@@ -308,7 +382,7 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
     let (backing, budget) = unsafe { (&mut (*p).backing, &mut (*p).budget) };
     let done = match backing {
         Backing::Owned(list) => list.release_step(&mut Budget(budget)),
-        Backing::Boot { .. } => true,
+        Backing::Boot { .. } | Backing::Device { .. } => true,
     };
     if !done {
         // SAFETY: the object stays alive and in place until its next

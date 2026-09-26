@@ -301,6 +301,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::dying_timer_does_not_fire,
     ),
     (
+        "a_level_finishes_its_firing_first",
+        calls::a_level_finishes_its_firing_first,
+    ),
+    (
         "call_counter_runs_out_as_bad_state",
         calls::call_counter_runs_out_as_bad_state,
     ),
@@ -379,6 +383,48 @@ const TESTS: &[(&str, TestFn)] = &[
         "init_load_maps_each_part_with_its_access",
         calls::init_load_maps_each_part_with_its_access,
     ),
+    (
+        "delivery_masks_posts_and_ends",
+        calls::delivery_masks_posts_and_ends,
+    ),
+    ("irq_ack_unmasks_the_line", calls::irq_ack_unmasks_the_line),
+    (
+        "masked_line_waits_for_irq_ack",
+        calls::masked_line_waits_for_irq_ack,
+    ),
+    (
+        "closed_channel_keeps_the_line_masked",
+        calls::closed_channel_keeps_the_line_masked,
+    ),
+    (
+        "released_binding_masks_and_frees_its_line",
+        calls::released_binding_masks_and_frees_its_line,
+    ),
+    (
+        "queued_notice_does_not_hold_the_line",
+        calls::queued_notice_does_not_hold_the_line,
+    ),
+    (
+        "stray_line_is_masked_and_ended",
+        calls::stray_line_is_masked_and_ended,
+    ),
+    (
+        "edge_flag_sets_the_trigger",
+        calls::edge_flag_sets_the_trigger,
+    ),
+    (
+        "irq_bind_checks_the_callers_limits",
+        calls::irq_bind_checks_the_callers_limits,
+    ),
+    (
+        "window_maps_as_device_memory",
+        calls::window_maps_as_device_memory,
+    ),
+    ("window_frames_never_go", calls::window_frames_never_go),
+    (
+        "windows_of_the_running_process_are_counted",
+        calls::windows_of_the_running_process_are_counted,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
@@ -395,10 +441,10 @@ pub const QUOTA: u64 = 16 << 20;
 pub const CHILD_QUOTA: u64 = 64 << 10;
 
 /// Tests of the icount build besides TESTS and the EL0 tests: the first
-/// checks that the run is under -icount, the second measures the portions
-/// of the long calls of memory objects, whose counts mean instructions only
-/// there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 2 } else { 0 };
+/// checks that the run is under -icount, the others measure the portions
+/// of the long calls of memory objects, the timers of programs and device
+/// windows, whose counts mean instructions only there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 4 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -413,6 +459,16 @@ pub fn run(boot: &Boot) -> ! {
     report(
         "memory_portions_are_measured",
         calls::memory_portions_are_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "timer_firing_is_measured",
+        calls::timer_firing_is_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "device_windows_are_measured",
+        calls::device_windows_are_measured(boot),
     );
     el0::run()
 }

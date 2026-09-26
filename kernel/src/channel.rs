@@ -1,38 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Channels (spec 4, 6.1, 6.3, 6.5, 6.8): notifications, requests and
-//! their replies, and the threads that wait for them. A channel lies in the
-//! pool of channels of the process that made it, which pays for it by the
-//! page (spec 7.8), and holds that process's shell until its slot goes
-//! back. It has the slot of label 0, whose priority channel_create gave,
-//! and the queue of kcore::notify: slots with something posted and the
-//! requests of threads that wait in `send`, or receivers that wait, by
-//! priority and in the order they came. A thread waits through its own
-//! slot, which is its request in `send`; a request a receiver took waits
-//! for its reply in the queue of accepted requests of the receiver's
-//! process (process::accepted), and a token of the table of thread numbers
-//! names it (spec 6.1). The handles of a message move from the sender's
-//! table into the receiver's with their references; a request that waits
-//! in a queue carries them (Thread::transit). The queues change together
-//! with the states of the threads in them, so every change to them happens
-//! under the scheduler's lock (sched::locked). A channel lives while
-//! references to it are left: handles with any rights, threads that wait
-//! in it, the sources of notifications that have a slot there (sessions,
-//! exits of processes and timers), and the cleanup queue's while it
-//! closes; the last one queues its shell (spec 7.7). Every source holds
-//! one of its abi::MAX_SLOTS slots, the slot of label 0 among them, from
-//! its creation until it goes, and a slot that stands in the queue holds
-//! its owner until receive or the stage Close takes it (spec 6.5). The
-//! last handle with RECEIVE closes it in the call itself: `notify` and
-//! `send` fail with PEER_CLOSED from then on, nothing new waits or is
-//! queued, and the stage Close wakes the threads that wait with
-//! PEER_CLOSED or empties the queued slots, letting their owners go,
+//! Channels (spec 4, 6.1, 6.3, 6.5, 6.8): notifications, requests and their
+//! replies, and the threads that wait for them. A channel lies in the pool
+//! of channels of the process that made it, which pays for it by the page
+//! (spec 7.8), and holds that process's shell until its slot goes back. It
+//! has the slot of label 0, whose priority channel_create gave, and the
+//! queue of kcore::notify: slots with something posted and the requests of
+//! threads that wait in `send`, or receivers that wait, by priority and in
+//! the order they came. A thread waits through its own slot, which is its
+//! request in `send`; a request a receiver took waits for its reply in the
+//! queue of accepted requests of the receiver's process
+//! (process::accepted), and a token of the table of thread numbers names it
+//! (spec 6.1). The handles of a message move from the sender's table into
+//! the receiver's with their references; a request that waits in a queue
+//! carries them (Thread::transit). The queues change together with the
+//! states of the threads in them, so every change to them happens under the
+//! scheduler's lock (sched::locked). A channel lives while references to it
+//! are left: handles with any rights, threads that wait in it, the sources
+//! of notifications that have a slot there (sessions, exits of processes,
+//! timers and interrupt bindings, each through its `Source`), and the
+//! cleanup queue's while it closes; the last one queues its shell (spec
+//! 7.7). Every source holds one of its abi::MAX_SLOTS slots, the slot of
+//! label 0 among them, from its creation until it goes, and a slot that
+//! stands in the queue holds its owner until receive or the stage Close
+//! takes it (spec 6.5). The last handle with RECEIVE closes it in the call
+//! itself: `notify` and `send` fail with PEER_CLOSED from then on, nothing
+//! new waits or is queued, and the stage Close wakes the threads that wait
+//! with PEER_CLOSED or empties the queued slots, letting their owners go,
 //! CLOSE_PORTION heads of one level a portion, at the level of its top
 //! waiter when that is above the cause (spec 7.7). A request a receiver
 //! took lives on without the channel.
 
 use crate::cleanup::{self, Item};
+use crate::irq::{self, Irq};
 use crate::object::{self, Live, Object, Refs};
 use crate::process::{self, Process};
 use crate::sched::{self, Locked};
@@ -41,7 +42,7 @@ use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
 use crate::{arch, testpoint};
-use abi::{Error, INLINE_MAX, MAX_SLOTS, Notification, Rights, Source};
+use abi::{ChannelInfo, Error, INLINE_MAX, MAX_SLOTS, Notification, Rights};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
 use kcore::notify::{Post, Queue, Slot};
@@ -67,6 +68,8 @@ pub enum Owner {
     Exit(NonNull<Process>),
     /// A timer (spec 10).
     Timer(NonNull<Timer>),
+    /// An interrupt binding (spec 9).
+    Irq(NonNull<Irq>),
     /// A thread's own slot (spec 6.1), which lies in it: its place while
     /// it waits in receive, its request while it waits in send. It carries
     /// no notification, and its thread's wait holds what it needs.
@@ -74,12 +77,13 @@ pub enum Owner {
 }
 
 impl Owner {
-    fn source(self) -> Source {
+    fn source(self) -> abi::Source {
         match self {
-            Owner::Channel => Source::Unlabeled,
-            Owner::Session(_) => Source::Session,
-            Owner::Exit(_) => Source::Exit,
-            Owner::Timer(_) => Source::Timer,
+            Owner::Channel => abi::Source::Unlabeled,
+            Owner::Session(_) => abi::Source::Session,
+            Owner::Exit(_) => abi::Source::Exit,
+            Owner::Timer(_) => abi::Source::Timer,
+            Owner::Irq(_) => abi::Source::Interrupt,
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
         }
     }
@@ -90,6 +94,7 @@ impl Owner {
             Owner::Session(s) => session::label(s),
             Owner::Exit(p) => process::exit_label(p),
             Owner::Timer(t) => timer::label(t),
+            Owner::Irq(b) => irq::label(b),
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
         }
     }
@@ -103,6 +108,7 @@ impl Owner {
             Owner::Session(s) => session::hold(s),
             Owner::Exit(p) => process::retain_shell(p),
             Owner::Timer(t) => timer::retain(t),
+            Owner::Irq(b) => irq::retain(b),
             Owner::Thread(_) => unreachable!("a thread's slot is posted"),
         }
     }
@@ -121,7 +127,99 @@ impl Owner {
             Owner::Exit(p) => unsafe { process::release_shell(p, cause) },
             // SAFETY: as above.
             Owner::Timer(t) => unsafe { timer::release(t, cause) },
+            // SAFETY: as above.
+            Owner::Irq(b) => unsafe { irq::release(b, cause) },
         }
+    }
+}
+
+/// A source of notifications on a channel (spec 6.5): a session, a timer,
+/// the end of a process or an interrupt binding, which it lies in. It holds
+/// one of the channel's slots from channel::reserve_source until `detach`,
+/// and the channel with a counted reference from `attach` until then; its
+/// own slot, whose owner is the object it lies in, and the label receive
+/// reports with it, come with `attach`, once the object has its place.
+pub struct Source {
+    slot: Option<Slot<Owner>>,
+    label: u64,
+    channel: NonNull<Channel>,
+}
+
+impl Source {
+    /// A source on `c`, whose slot reserve_source took, for an object that
+    /// has no place yet: it has no slot of its own and holds nothing until
+    /// `attach`.
+    pub const fn new(c: NonNull<Channel>) -> Source {
+        Source {
+            slot: None,
+            label: 0,
+            channel: c,
+        }
+    }
+
+    /// The object the source lies in has its place, which `owner` names:
+    /// the source gets its slot of `priority` with `label`, and holds the
+    /// channel from now on.
+    pub fn attach(&mut self, owner: Owner, priority: u8, label: u64) {
+        assert!(self.slot.is_none(), "a source is attached twice");
+        self.slot = Some(Slot::new(priority, owner));
+        self.label = label;
+        retain(self.channel, Rights::NONE);
+    }
+
+    /// The channel, which the source holds.
+    pub fn channel(&self) -> NonNull<Channel> {
+        self.channel
+    }
+
+    /// The label receive reports with the source's slot (spec 5.3).
+    pub fn label(&self) -> u64 {
+        self.label
+    }
+
+    fn own_slot(&self) -> &Slot<Owner> {
+        self.slot.as_ref().expect("an attached source")
+    }
+
+    /// The priority of the source's slot.
+    pub fn priority(&self) -> u8 {
+        self.own_slot().priority()
+    }
+
+    /// Whether the source's slot stands in the channel's queue.
+    pub fn is_queued(&self) -> bool {
+        self.own_slot().is_queued()
+    }
+
+    /// Posts `bits` into the slot of the source `this` points at, at
+    /// `cause`, as `post` does: PEER_CLOSED once the channel closed. O(1).
+    ///
+    /// # Safety
+    /// The source is attached, and its object lives until the post
+    /// returns: the caller holds it, or its slot does.
+    pub unsafe fn post(this: NonNull<Source>, bits: u64, cause: u8) -> Result<(), Error> {
+        // SAFETY: the caller's promise; the borrows end before the post,
+        // and the slot stays in place with its object.
+        unsafe {
+            let c = (*this.as_ptr()).channel;
+            let slot = NonNull::from((*this.as_ptr()).slot.as_mut().expect("an attached source"));
+            post(c, slot, bits, cause)
+        }
+    }
+
+    /// The source goes with its object (the object's portion, spec 7.7):
+    /// its slot of the channel goes back, and then its reference to the
+    /// channel at `level`, which may queue the channel. Its own slot is in
+    /// no queue: a queued slot holds the object. O(1).
+    ///
+    /// # Safety
+    /// The source is attached, nothing refers to its object, and it is not
+    /// used afterwards.
+    pub unsafe fn detach(&mut self, level: u8) {
+        assert!(!self.is_queued(), "a source goes while its slot is queued");
+        remove_source(self.channel);
+        // SAFETY: the reference `attach` took goes.
+        unsafe { release(self.channel, Rights::NONE, level) };
     }
 }
 
@@ -335,11 +433,29 @@ pub fn is_closed(c: NonNull<Channel>) -> bool {
     unsafe { (*c.as_ptr()).closed }
 }
 
+/// object_info CHANNEL of `c`, which the caller holds (spec 11): the slots
+/// and requests in its queue and the receivers that wait there, read with
+/// the scheduler locked, its sources, the slot of label 0 among them, and
+/// whether it is closed. O(1).
+pub fn info(c: NonNull<Channel>) -> ChannelInfo {
+    // SAFETY: the caller holds a reference to the channel.
+    let (queued, receivers) = sched::locked(|k| unsafe { queue(c, k.s) }.counts());
+    // SAFETY: as above; only the fields are read.
+    let (sources, closed) = unsafe { ((*c.as_ptr()).sources, (*c.as_ptr()).closed) };
+    ChannelInfo {
+        queued: queued.into(),
+        receivers: receivers.into(),
+        sources: sources.into(),
+        closed,
+    }
+}
+
 /// A new source of notifications takes one of the slots of `c`, which the
-/// caller holds (spec 6.5): LIMIT_REACHED when abi::MAX_SLOTS are taken,
-/// the slot of label 0 among them. The source gives it back as it goes
-/// (`remove_source`).
-pub fn add_source(c: NonNull<Channel>) -> Result<(), Error> {
+/// caller holds (spec 6.5), before its object has a place: LIMIT_REACHED
+/// when abi::MAX_SLOTS are taken, the slot of label 0 among them, and
+/// nothing changes. The source gives it back as it goes (Source::detach),
+/// or at once when its object is not made (`remove_source`).
+pub fn reserve_source(c: NonNull<Channel>) -> Result<(), Error> {
     // SAFETY: the caller holds a reference to the channel; only the field
     // is touched.
     let sources = unsafe { &mut (*c.as_ptr()).sources };
@@ -1167,7 +1283,7 @@ unsafe fn free(c: NonNull<Channel>, level: u8) {
 const _: () = assert!(core::mem::offset_of!(Channel, refs) >= 8);
 
 #[cfg(feature = "ktest")]
-pub use test_access::{in_use, payer};
+pub use test_access::{in_use, payer, sources};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -1184,5 +1300,12 @@ mod test_access {
         // SAFETY: the test holds a reference to the channel; only the field is
         // read.
         unsafe { (*c.as_ptr()).payer }
+    }
+
+    /// The sources with a slot in `c`, which the test holds, the slot of
+    /// label 0 among them.
+    pub fn sources(c: NonNull<Channel>) -> u32 {
+        // SAFETY: as above.
+        unsafe { (*c.as_ptr()).sources }
     }
 }

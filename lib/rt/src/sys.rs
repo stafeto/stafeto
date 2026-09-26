@@ -7,17 +7,17 @@
 //! x0-x9, so that a later kernel may return more values, and `receive`
 //! x0-x11; the kernel keeps every other register. `raw` makes any call
 //! with any registers, for tests that hand the kernel bad ones; the
-//! functions after it are the typed calls of milestones 1.2c to 1.3d,
+//! functions after it are the typed calls of milestones 1.2c to 1.3e,
 //! which take and return handles typed by the kind of their object
 //! (`Handle`), and the token of a request, which answers it once
 //! (`Token`).
 
-use crate::handle::{Channel, Handle, Memory, Process, Resource, Thread, Timer};
+use crate::handle::{Channel, Handle, Interrupt, Memory, Process, Resource, Thread, Timer};
 use crate::msgbuf;
 use abi::{
-    Access, Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX,
-    MemoryInfo, Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
-    SOURCE_SHIFT, Source,
+    Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats,
+    MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo, Message, Notification, Policy, ProcessHandles,
+    ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source, TRIGGER_EDGE, ThreadInfo,
 };
 use core::arch::asm;
 
@@ -280,6 +280,79 @@ pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {
     let args = [memory.raw().0, abi::INFO_MEMORY, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(MemoryInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// object_info(THREAD_STATE): what the thread does now, with what it waits
+/// for, its base and effective priorities and its policy.
+pub fn thread_info(thread: &Handle<Thread>) -> Result<ThreadInfo, Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_STATE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(ThreadInfo::from_words([x[1], x[2], x[3], x[4]]))
+}
+
+/// object_info(CHANNEL) through a channel handle, a labelled copy too: the
+/// slots and requests in its queue, the receivers that wait there, its
+/// sources and whether it is closed.
+pub fn channel_info(channel: &Handle<Channel>) -> Result<ChannelInfo, Error> {
+    let args = [channel.raw().0, abi::INFO_CHANNEL, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(ChannelInfo::from_words([x[1], x[2], x[3], x[4]]))
+}
+
+/// object_info(IRQ): the binding's line, whether it is masked until
+/// `irq_ack`, and whether it is edge-triggered.
+pub fn irq_info(irq: &Handle<Interrupt>) -> Result<IrqInfo, Error> {
+    let args = [irq.raw().0, abi::INFO_IRQ, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(IrqInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// device_window_create through the system resource with DEVICE: a device
+/// window over the physical range of `len` bytes from `addr`, rounded out
+/// to whole pages, a memory object that touches no RAM and no device of
+/// the kernel (spec 9). `mem_map` shows it R or RW as Device-nGnRE; the
+/// handle carries abi::WINDOW_RIGHTS, without MAP_EXEC. Registers are read
+/// and written with volatile accesses of their width.
+pub fn device_window_create(
+    resource: &Handle<Resource>,
+    addr: u64,
+    len: u64,
+) -> Result<Handle<Memory>, Error> {
+    let x = call::<{ Call::DeviceWindowCreate.number() }>(&[resource.raw().0, addr, len])?;
+    Ok(returned(&x))
+}
+
+/// irq_bind through the system resource with DEVICE: the interrupts of
+/// `line`, a shared line (spec 9), come as notifications of `channel`, a
+/// handle with NOTIFY, bit 0 into a slot of `priority` with the label of
+/// the handle, edge-triggered when `edge`, level-triggered otherwise. Each
+/// one masks the line until `irq_ack`; the line is open at once. One
+/// binding a line (BAD_STATE); the caller's quota pays for it. The handle
+/// carries DUPLICATE, TRANSFER and MANAGE.
+pub fn irq_bind(
+    resource: &Handle<Resource>,
+    line: u32,
+    channel: &Handle<Channel>,
+    priority: u8,
+    edge: bool,
+) -> Result<Handle<Interrupt>, Error> {
+    let flags = if edge { TRIGGER_EDGE } else { 0 };
+    let args = [
+        resource.raw().0,
+        line.into(),
+        channel.raw().0,
+        priority.into(),
+        flags,
+    ];
+    let x = call::<{ Call::IrqBind.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
+/// irq_ack: the line an interrupt masked opens again, once the driver
+/// served the device, cleared its source and read a register back (spec
+/// 9, 13.5). PEER_CLOSED once the binding's channel closed.
+pub fn irq_ack(irq: &Handle<Interrupt>) -> Result<(), Error> {
+    call::<{ Call::IrqAck.number() }>(&[irq.raw().0]).map(drop)
 }
 
 /// mem_create: a memory object of `size` bytes, whole pages up to

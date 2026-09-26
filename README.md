@@ -31,10 +31,14 @@ stafeto boots in QEMU and runs programs at EL0. What works today:
   switch; a scheduler with 64 priority levels (round robin with a 4 ms
   quantum, and FIFO) and tickless timer preemption.
 - **Objects and calls:** 64-bit handles with rights; processes, threads,
-  channels, sessions, program timers and memory objects; the first system
-  calls (`debug_write`, `yield`, `thread_*`, `process_*`, `channel_create`,
-  `notify`, `send`, `receive`, `reply`, `timer_*`, `mem_create`,
-  `mem_map`, `mem_unmap`, `mem_protect`, `object_info`).
+  channels, sessions, program timers, memory objects, device windows and
+  interrupt bindings; the system calls of the kernel (`debug_write`,
+  `yield`, `thread_*`, `process_*`, `channel_create`, `notify`, `send`,
+  `receive`, `reply`, `timer_*`, `mem_create`, `mem_map`, `mem_unmap`,
+  `mem_protect`, `irq_bind`, `irq_ack`, `device_window_create`,
+  `object_info`), whose `object_info` reports the state of processes,
+  threads, channels, memory objects, device windows and interrupt
+  bindings.
 - **Messages:** synchronous requests and replies of up to 1 KB, the first
   64 bytes in registers and the rest through a per-thread message buffer;
   up to four handles move with a message, keeping their rights and labels;
@@ -42,6 +46,15 @@ stafeto boots in QEMU and runs programs at EL0. What works today:
   both sides map; a service works at its client's priority under its own
   ceiling until it replies; a fast path hands the CPU straight to a waiting
   service.
+- **Devices:** an interrupt of a device line comes to its driver as a
+  notification of a channel, and the line stays masked until the driver
+  calls `irq_ack`; a device window maps the registers of a device into a
+  driver as device memory, never executable; a driver that dies frees its
+  line at once. The tests drive the PL031 real-time clock of QEMU from
+  EL0.
+- **Real time:** program timers fire at the priority of their slots, in
+  bounded portions after the timer's interrupt, which takes no timer off
+  itself.
 - **Faults:** a program fault ends only its own process, and the parent
   learns why through its exit channel; the tests check it on child
   processes with code that `init` loads from the boot image.
@@ -68,8 +81,8 @@ parts. Each finished part is merged through a pull request.
 | | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
 | | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | ✅ [#11](https://github.com/stafeto/stafeto/pull/11) |
 | | 1.3d Memory objects | `mem_create`, `mem_map`, memory objects in messages, child processes with code | ✅ [#13](https://github.com/stafeto/stafeto/pull/13) |
-| | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | 🚧 |
-| 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ⬜ |
+| | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ✅ [#14](https://github.com/stafeto/stafeto/pull/14) |
+| 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | 🚧 |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the

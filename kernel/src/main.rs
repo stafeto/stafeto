@@ -18,6 +18,7 @@ mod channel;
 mod cleanup;
 mod init;
 mod interrupt;
+mod irq;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod memory;
@@ -56,6 +57,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     mm::phys::add(rest.as_slice());
     mm::aspace::init(boot);
     arch::gic::init(&boot.info);
+    memory::forbid(&boot.info);
     let clock = arch::timer::init();
     sched::init(clock);
     report(boot, clock, &init);

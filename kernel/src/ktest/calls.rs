@@ -25,6 +25,7 @@ use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel::{self, Channel};
 use crate::cleanup;
+use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
@@ -34,16 +35,17 @@ use crate::thread::{self, Long, THREADS, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
-    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS,
-    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS,
-    MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy, ProcessHandles,
-    ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_IRQ, INFO_KERNEL_STATS,
+    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, IrqInfo, KernelStats,
+    MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source, TRIGGER_EDGE,
+    WINDOW_RIGHTS,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
 use kcore::layout::{GIB, LINEAR_BASE};
-use kcore::paging::{Attrs, page_descriptor};
+use kcore::paging::{Attrs, MAIR_DEVICE, PXN, UXN, attr_index, page_descriptor};
 use kcore::sched::State;
 use kcore::sync::Lock;
 use kcore::token::MAX_COUNT;
@@ -69,7 +71,13 @@ impl Caller {
     /// A caller whose process has priority ceiling `ceiling`; its thread
     /// is FIFO at 10.
     fn with_ceiling(ceiling: u8) -> Result<Caller, &'static str> {
-        let process = process::create_root(QUOTA, LIMIT, ceiling).map_err(|_| "no process")?;
+        Caller::with_limit(LIMIT, ceiling)
+    }
+
+    /// A caller whose process has a table of `limit` handles and priority
+    /// ceiling `ceiling`; its thread is FIFO at 10.
+    fn with_limit(limit: u32, ceiling: u8) -> Result<Caller, &'static str> {
+        let process = process::create_root(QUOTA, limit, ceiling).map_err(|_| "no process")?;
         match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(thread) => Ok(Caller { process, thread }),
             Err(_) => {
@@ -231,7 +239,7 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
-        longest_batch: crate::timer::longest_batch(),
+        longest_firing: crate::timer::longest_firing(),
     };
     check(
         counted.longest_portion > 0 && counted.free_frames > 0 && counted.pool_pages > 0,
@@ -1592,7 +1600,8 @@ fn with_timer(
 /// timer_create stops at the caller's limits (spec 7.8, 10, 11): with the
 /// caller's table full it fails with LIMIT_REACHED, and with its quota
 /// spent with NO_MEMORY for a page of its pool of timers, with nothing
-/// made. A good call returns a handle with
+/// made; with every slot of the channel taken, LIMIT_REACHED comes before
+/// the quota (spec 6.5). A good call returns a handle with
 /// abi::OWNER_RIGHTS to a timer the caller pays for, not armed; timer_set
 /// arms it at its deadline in ticks and timer_cancel takes it off the
 /// heap, and timer_set on a closed channel fails with PEER_CLOSED and
@@ -1612,6 +1621,13 @@ pub fn timer_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static s
 
 fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::TimerCreate.number();
+    // First, while the caller's pool of timers has no page.
+    let full = c.created(Call::CreateChannel.number(), &[10])?;
+    let refused = fill_slots(c, full)
+        .and_then(|()| with_used_quota(c, || c.fails(n, &[full.0, 30], Error::LimitReached)));
+    c.close(full)?;
+    cleanup::drain();
+    refused?;
     let h = c.created(Call::CreateChannel.number(), &[10])?;
     let result = (|| {
         let timers = timers::in_use();
@@ -1632,6 +1648,17 @@ fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     // The case of the closed channel closed it already.
     let _ = process::close_handle(c.process, h, CAUSE);
     result
+}
+
+/// Takes every slot of the caller's channel `h` but the slot of label 0
+/// with sessions whose handles the caller closes: CLIENT_GONE keeps each
+/// in the channel's queue (spec 5.3, 6.5).
+fn fill_slots(c: &Caller, h: Handle) -> Result<(), &'static str> {
+    for label in 1..u64::from(MAX_SLOTS) {
+        let s = c.created(Call::HandleDuplicate.number(), &[h.0, 0, label, 10])?;
+        c.close(s)?;
+    }
+    Ok(())
 }
 
 fn timer_set_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
@@ -1721,9 +1748,10 @@ pub fn past_deadline_fires_within_timer_set(_: &Boot) -> Result<(), &'static str
 }
 
 /// A timer whose last handle went is dying (spec 7.7): the cleanup queue
-/// holds it, and the heap still does until its portion. The kernel's timer
-/// interrupt at its deadline takes it off the heap and posts nothing; its
-/// portion then lets it go.
+/// holds it at CAUSE, and the heap of its level still does until its
+/// portion. The firing of its level, 10, at its deadline, a second away,
+/// takes it off the heap and posts nothing; its own portion then lets it
+/// go.
 pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
     let timers = timers::in_use();
     with_caller(|c| {
@@ -1732,7 +1760,7 @@ pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
             let at = timers::deadline(tm).ok_or("the timer is not armed")?;
             c.close(t)?;
             let queued = cleanup::len();
-            timers::expire(at);
+            timers::fire_at(10, at);
             let (posted, armed) = (timers::posted(tm), timers::deadline(tm).is_some());
             c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
             cleanup::drain();
@@ -1744,6 +1772,67 @@ pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
         })
     })?;
     check(timers::in_use() == timers, "the dying timer stayed")
+}
+
+/// Timers the test of the firing of a level arms: more than two portions.
+const FIRST_FIRINGS: usize = 40;
+
+/// A level ends its firing before what came to it later (spec 7.7, 10):
+/// with FIRST_FIRINGS timers of level 10 expired at their deadline, a
+/// second away, and a channel whose last reference went at 10 queued
+/// behind, the first portion of the firing, which the test runs at that
+/// deadline, posts FIRE_PORTION of them and puts the level's item back at
+/// the head of level 10. The next portion is the firing's again, and the
+/// channel is still there after it.
+pub fn a_level_finishes_its_firing_first(_: &Boot) -> Result<(), &'static str> {
+    let counts = (timers::in_use(), channel::in_use());
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let mut made = [None; FIRST_FIRINGS];
+        let result = channel_of(c, h).and_then(|ch| {
+            let at = timer::now() + timer::clock().ns_to_ticks(1_000_000_000);
+            for (n, t) in made.iter_mut().enumerate() {
+                let tm = timers::create(c.process, ch, 0, 10).map_err(|_| "no timer")?;
+                *t = Some(tm);
+                timers::set(tm, at + n as u64, CAUSE).map_err(|_| "a timer was not armed")?;
+            }
+            let later = channel::create(c.process, 10).map_err(|_| "no channel")?;
+            // SAFETY: the reference `create` handed out goes, the last one:
+            // the channel is queued at 10.
+            unsafe { channel::release(later, Rights::NONE, 10) };
+            let alive = channel::in_use();
+            let last = at + FIRST_FIRINGS as u64;
+            timers::fire_at(10, last);
+            let first = posted_of(&made);
+            cleanup::portion();
+            let (second, kept) = (posted_of(&made), channel::in_use() == alive);
+            cleanup::drain();
+            check(
+                first == kcore::timer::FIRE_PORTION && second == first,
+                "the first portion of the firing did not post its portion",
+            )?;
+            check(kept, "a channel queued later came before the firing")
+        });
+        for t in made.into_iter().flatten() {
+            // SAFETY: the test's reference goes.
+            unsafe { timers::release(t, CAUSE) };
+        }
+        let _ = process::close_handle(c.process, h, CAUSE);
+        cleanup::drain();
+        result
+    })?;
+    check(
+        (timers::in_use(), channel::in_use()) == counts,
+        "a timer or a channel of the test stayed",
+    )
+}
+
+/// How many of `made` posted.
+fn posted_of(made: &[Option<NonNull<Timer>>]) -> usize {
+    made.iter()
+        .flatten()
+        .filter(|&&t| timers::posted(t))
+        .count()
 }
 
 /// A thread whose count of requests reached its end gets BAD_STATE from
@@ -2954,6 +3043,516 @@ fn loaded_parts(p: NonNull<Process>, program: &bootimg::Program<'_>) -> Result<(
     )
 }
 
+// Interrupt bindings (spec 9). The tests make lines pending at the
+// distributor by hand and take them as the way out of the kernel does:
+// the lines they bind have no device behind them in QEMU `virt`.
+
+/// The line most tests bind, and a second one.
+const LINE: u32 = 40;
+const OTHER_LINE: u32 = 41;
+/// A line the tests bind edge-triggered, and one they bind
+/// level-triggered, the PL031's.
+const EDGE_LINE: u32 = 48;
+const LEVEL_LINE: u32 = 34;
+/// The label of the copy of the channel a binding goes through.
+const IRQ_LABEL: u64 = 0x1A7;
+
+/// Takes the interrupt of `line`, which the test made pending, and handles
+/// it as the way out of the kernel does (interrupt::handle): the handler
+/// ends it.
+fn take_line(line: u32) -> Result<(), &'static str> {
+    let ack = (0..1000)
+        .find_map(|_| gic::acknowledge())
+        .ok_or("the line's interrupt did not arrive")?;
+    if ack.intid() != line {
+        gic::end(ack);
+        return Err("an interrupt of another line arrived");
+    }
+    crate::interrupt::handle(ack);
+    Ok(())
+}
+
+/// The notification of an interrupt of a binding made through a handle
+/// with `label`: bit 0, `count` deliveries.
+fn interrupt_notice(label: u64, count: u32) -> [u64; 9] {
+    let n = Notification {
+        source: Source::Interrupt,
+        label,
+        bits: 1,
+        count,
+    };
+    n.to_words()[..9].try_into().expect("x1-x9")
+}
+
+/// The binding behind the caller's handle `h`.
+fn irq_of(c: &Caller, h: Handle) -> Result<NonNull<Irq>, &'static str> {
+    // SAFETY: the caller's process is the test's.
+    unsafe { c.process.as_ref() }
+        .lookup(h, Rights::NONE, Object::irq)
+        .map_err(|_| "the handle does not name a binding")
+}
+
+/// What IRQ reports for the caller's binding `b`.
+fn irq_info_of(c: &Caller, b: Handle) -> Result<IrqInfo, &'static str> {
+    let x = c.call(Call::ObjectInfo.number(), &[b.0, INFO_IRQ, 0]);
+    if x[0] != 0 {
+        return Err("object_info IRQ failed");
+    }
+    Ok(IrqInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// Runs `body` with a caller that holds the system resource with DEVICE,
+/// a channel at 10 with a copy of it with NOTIFY and IRQ_LABEL, and a
+/// binding of `line` through the copy, whose slot has priority 20; closes
+/// the handles afterwards and runs the cleanup queue dry. The live
+/// bindings are as many as before.
+fn with_binding(
+    line: u32,
+    edge: bool,
+    body: impl FnOnce(&Caller, Handle, Handle) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let bindings = irq::in_use();
+    with_caller(|c| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let copy = c.created(
+            Call::HandleDuplicate.number(),
+            &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
+        )?;
+        let flags = if edge { TRIGGER_EDGE } else { 0 };
+        let made = c.created(
+            Call::IrqBind.number(),
+            &[r.0, line.into(), copy.0, 20, flags],
+        );
+        let result = made.and_then(|b| {
+            let result = body(c, h, b);
+            // A test may close the binding itself.
+            let _ = process::close_handle(c.process, b, CAUSE);
+            result
+        });
+        for handle in [copy, h, r] {
+            // The test may have closed the channel.
+            let _ = process::close_handle(c.process, handle, CAUSE);
+        }
+        cleanup::drain();
+        result
+    })?;
+    check(
+        irq::in_use() == bindings,
+        "a binding of the test stayed in its pool",
+    )
+}
+
+/// An interrupt of a bound line (spec 9): the handler masks the line at the
+/// distributor (GICD_ICENABLER), posts bit 0 into the binding's slot and
+/// ends the interrupt, so the line is neither enabled nor active
+/// afterwards; receive takes one notification of an interrupt with the
+/// label of the handle the binding went through, bit 0, one delivery, and
+/// IRQ reports the line masked.
+pub fn delivery_masks_posts_and_ends(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        check(gic::is_enabled(LINE), "a new binding left its line masked")?;
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        check(
+            !gic::is_enabled(LINE) && !gic::is_active(LINE),
+            "the delivery left the line enabled or active",
+        )?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )?;
+        check(label_of(c) == IRQ_LABEL, "the notification lacks the label")?;
+        check(
+            irq_info_of(c, b)?.masked,
+            "IRQ does not report the line masked",
+        )?;
+        nothing_pending("an interrupt is pending after the delivery")
+    })
+}
+
+/// irq_ack opens a line a delivery masked (spec 9): the line is enabled
+/// again and IRQ reports it open; irq_ack of an open line returns 0 and
+/// leaves it open.
+pub fn irq_ack_unmasks_the_line(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        check(gic::is_enabled(LINE), "irq_ack left the line masked")?;
+        check(
+            !irq_info_of(c, b)?.masked,
+            "IRQ reports the line masked after irq_ack",
+        )?;
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        check(gic::is_enabled(LINE), "irq_ack of an open line masked it")?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )
+    })
+}
+
+/// A masked line waits for irq_ack (spec 9): with the line masked, a new
+/// interrupt stays pending at the distributor and reaches no CPU; one that
+/// reached the handler before the mask did, which the test makes by
+/// opening the line by hand, posts nothing. Receive then takes one
+/// delivery. After irq_ack the interrupt that waited comes: a second
+/// notification.
+pub fn masked_line_waits_for_irq_ack(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, true, |c, h, b| {
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        gic::set_pending(LINE);
+        nothing_pending("a masked line reached the CPU")?;
+        gic::unmask(LINE);
+        let late = take_line(LINE);
+        gic::mask(LINE);
+        late?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )?;
+        gic::set_pending(LINE);
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        take_line(LINE)?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )
+    })
+}
+
+/// A closed channel keeps its binding's line masked (spec 9): the
+/// delivery posts nothing and masks the line, irq_ack fails with
+/// PEER_CLOSED, and the line stays masked.
+pub fn closed_channel_keeps_the_line_masked(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        // The last handle with RECEIVE goes: the channel closes (spec 6.8).
+        c.close(h)?;
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        check(
+            !gic::is_enabled(LINE),
+            "a delivery into a closed channel left the line open",
+        )?;
+        c.fails(Call::IrqAck.number(), &[b.0], Error::PeerClosed)?;
+        check(
+            !gic::is_enabled(LINE) && irq_info_of(c, b)?.masked,
+            "irq_ack on a closed channel opened the line",
+        )
+    })
+}
+
+/// The last handle to a binding masks its line and frees it at once (spec
+/// 7.7, 9): before the cleanup queue runs, the line is masked, no binding
+/// holds it and irq_bind of it succeeds; the portion gives the channel's
+/// slot back.
+pub fn released_binding_masks_and_frees_its_line(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        let ch = channel_of(c, h)?;
+        let sources = channel::sources(ch);
+        c.close(b)?;
+        check(
+            !gic::is_enabled(LINE) && irq::bound(LINE).is_none(),
+            "the last handle left the line open or bound",
+        )?;
+        check(
+            channel::sources(ch) == sources,
+            "the binding gave its slot back before its portion",
+        )?;
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0]);
+        if let Ok(again) = again {
+            c.close(again)?;
+        }
+        c.close(r)?;
+        again?;
+        cleanup::drain();
+        check(
+            channel::sources(ch) == sources - 1,
+            "the portion of the binding did not give the channel's slot back",
+        )
+    })
+}
+
+/// A notification in the channel's queue does not hold the line (spec
+/// 9, 13.4): with the slot of a delivery queued, the last handle to the
+/// binding masks the line and frees it, and irq_bind of it succeeds while
+/// the slot still holds the binding; receive then takes the notification,
+/// and the binding goes.
+pub fn queued_notice_does_not_hold_the_line(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        let bindings = irq::in_use();
+        c.close(b)?;
+        check(
+            !gic::is_enabled(LINE) && irq::bound(LINE).is_none(),
+            "a queued notification kept the line open or bound",
+        )?;
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0]);
+        if let Ok(again) = again {
+            c.close(again)?;
+        }
+        c.close(r)?;
+        again?;
+        check(
+            irq::in_use() == bindings + 1,
+            "the binding went while its slot was queued",
+        )?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )
+    })
+}
+
+/// An interrupt of a line no binding holds is masked and ended (spec 9):
+/// the kernel stays up, and the line is neither enabled nor active.
+pub fn stray_line_is_masked_and_ended(_: &Boot) -> Result<(), &'static str> {
+    check(irq::bound(OTHER_LINE).is_none(), "the line has a binding")?;
+    gic::unmask(OTHER_LINE);
+    gic::set_pending(OTHER_LINE);
+    take_line(OTHER_LINE)?;
+    check(
+        !gic::is_enabled(OTHER_LINE) && !gic::is_active(OTHER_LINE),
+        "a stray line stayed enabled or active",
+    )?;
+    nothing_pending("an interrupt is pending after the stray one")
+}
+
+/// irq_bind writes the kind of trigger to GICD_ICFGR each time (spec 9):
+/// bit 2n + 1 of the line is set for TRIGGER_EDGE and clear without it,
+/// also when the line was edge-triggered before.
+pub fn edge_flag_sets_the_trigger(_: &Boot) -> Result<(), &'static str> {
+    with_binding(EDGE_LINE, true, |_, _, _| {
+        check(
+            gic::is_edge(EDGE_LINE),
+            "an edge-triggered binding left the line level-triggered",
+        )
+    })?;
+    with_binding(EDGE_LINE, false, |_, _, _| {
+        check(
+            !gic::is_edge(EDGE_LINE),
+            "a level-triggered binding left the line edge-triggered",
+        )
+    })?;
+    with_binding(LEVEL_LINE, false, |_, _, _| {
+        check(
+            !gic::is_edge(LEVEL_LINE),
+            "a level-triggered binding made the line edge-triggered",
+        )
+    })
+}
+
+/// irq_bind stops at the caller's limits (spec 7.8, 9, 11): with every
+/// slot of the channel taken it fails with LIMIT_REACHED before the quota,
+/// with the caller's quota spent with NO_MEMORY for a page of its pool of
+/// bindings, and with its table full with LIMIT_REACHED, nothing made; a
+/// priority above the caller's ceiling fails with ACCESS_DENIED. A good
+/// call makes a binding the caller pays for, through a channel of another
+/// process. A binding made whose handle then finds no page for a new chunk
+/// of the table fails with NO_MEMORY, and its line is masked and free
+/// again at once.
+pub fn irq_bind_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
+    let bindings = irq::in_use();
+    let c = Caller::with_ceiling(30)?;
+    let result = irq_bind_cases(&c);
+    c.release();
+    result?;
+    let c = Caller::with_limit(2 * CHUNK as u32, 30)?;
+    let result = bind_without_its_handle(&c);
+    c.release();
+    result?;
+    check(
+        irq::in_use() == bindings,
+        "a binding of the test stayed in its pool",
+    )
+}
+
+fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::IrqBind.number();
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    // First, while the caller's pool of bindings has no page.
+    let full = c.created(Call::CreateChannel.number(), &[10])?;
+    let refused = fill_slots(c, full).and_then(|()| {
+        with_used_quota(c, || {
+            c.fails(n, &[r.0, LINE.into(), full.0, 20, 0], Error::LimitReached)
+        })
+    });
+    c.close(full)?;
+    cleanup::drain();
+    refused?;
+    let owner = Caller::new()?;
+    let result = (|| {
+        let theirs = owner.created(Call::CreateChannel.number(), &[10])?;
+        let ch = channel_of(&owner, theirs)?;
+        let h = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
+        let args = [r.0, LINE.into(), h.0, 20, 0];
+        c.fails(n, &[r.0, LINE.into(), h.0, 31, 0], Error::AccessDenied)?;
+        let bindings = irq::in_use();
+        with_used_quota(c, || {
+            c.fails(n, &args, Error::NoMemory)?;
+            with_full_table(c, n, &args)
+        })?;
+        check(
+            irq::in_use() == bindings && irq::bound(LINE).is_none(),
+            "a binding that did not fit stayed",
+        )?;
+        let used = process::quota(c.process).used();
+        let b = c.created(n, &[r.0, LINE.into(), h.0, 30, 0])?;
+        let paid = irq_of(c, b).map(|i| {
+            irq::payer(i) == c.process && process::quota(c.process).used() == used + PAGE_SIZE
+        });
+        c.close(b)?;
+        c.close(h)?;
+        check(
+            paid?,
+            "the caller did not pay a page of its pool for the binding",
+        )
+    })();
+    owner.release();
+    result
+}
+
+/// irq_bind whose binding is made, and whose handle then takes a new
+/// chunk of the caller's table with no quota left for its page.
+fn bind_without_its_handle(c: &Caller) -> Result<(), &'static str> {
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    // The first chunk of the table fills: the next handle takes a page.
+    for _ in 2..CHUNK {
+        c.insert(Object::Resource, Rights::NONE)?;
+    }
+    let args = [r.0, LINE.into(), h.0, 20, 0];
+    with_quota_left(c, PAGE_SIZE, || {
+        c.fails(Call::IrqBind.number(), &args, Error::NoMemory)
+    })?;
+    check(
+        !gic::is_enabled(LINE) && irq::bound(LINE).is_none(),
+        "a binding whose handle did not go in left its line open or bound",
+    )
+}
+
+// Device windows (spec 7.4, 9).
+
+/// The page of the PL031 of QEMU `virt`, which the tests' windows show.
+const RTC: u64 = 0x0901_0000;
+
+/// A window of the caller over `pages` pages from `addr`, through a copy of
+/// the system resource with DEVICE that goes afterwards.
+fn window_of(c: &Caller, addr: u64, pages: u64) -> Result<(Handle, NonNull<Memory>), &'static str> {
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let made = c.created(
+        Call::DeviceWindowCreate.number(),
+        &[r.0, addr, pages * PAGE_SIZE],
+    );
+    c.close(r)?;
+    let h = made?;
+    // SAFETY: the caller's process is the test's.
+    let m = unsafe { c.process.as_ref() }.lookup(h, WINDOW_RIGHTS, Object::memory);
+    Ok((
+        h,
+        m.map_err(|_| "the handle of a window lacks WINDOW_RIGHTS")?,
+    ))
+}
+
+/// mem_map shows a window as device memory (spec 7.4, [G6], [G9]): the
+/// leaf descriptor of its page maps the PL031's frame with AttrIndx 1,
+/// Device-nGnRE, and UXN and PXN, R or RW.
+pub fn window_maps_as_device_memory(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = window_of(c, RTC, 1)?;
+        let (t, th) = target_of(c)?;
+        let result = [Access::Read, Access::ReadWrite]
+            .into_iter()
+            .try_for_each(|access| {
+                map_whole(c, th, h, 1, USER_VA, access)?;
+                let seen = process::translate(t, USER_VA);
+                unmap_whole(c, th, 1, USER_VA)?;
+                let (pa, desc) = seen.ok_or("the window's page does not translate")?;
+                check(
+                    pa == RTC && attr_index(desc) == MAIR_DEVICE && desc & (UXN | PXN) == UXN | PXN,
+                    "the window's page is not device memory that never runs",
+                )
+            });
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result
+    })
+}
+
+/// A window owns no frame (spec 9): made, mapped into the caller, unmapped
+/// and gone, a second time after a first that took the tables and the
+/// place in the pool, it leaves the free frames and the objects in their
+/// pool as they were; MEMORY counts its size and no page of frames.
+pub fn window_frames_never_go(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let round = || {
+            let (w, m) = window_of(c, RTC, 1)?;
+            let info = memory::info(m);
+            let mapped = map_whole(c, own, w, 1, USER_VA, Access::ReadWrite)
+                .and_then(|()| unmap_whole(c, own, 1, USER_VA));
+            c.close(w)?;
+            cleanup::drain();
+            mapped?;
+            check(
+                info.pages == 0 && info.size == PAGE_SIZE,
+                "a window owns frames or has another size",
+            )
+        };
+        let first = round();
+        let (free, objects) = (phys::free_frames(), memory::in_use());
+        let second = round();
+        let after = (phys::free_frames(), memory::in_use());
+        c.close(own)?;
+        first?;
+        second?;
+        check(
+            after == (free, objects),
+            "a window's frames or its place went back to the kernel",
+        )
+    })
+}
+
+/// The report of an SError counts the device windows of the running process
+/// (spec 7.9, process::device_windows): none with a page of a memory
+/// object mapped, two with a window mapped twice besides, one after one
+/// of them went.
+pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (m, _) = make_memory(c, 1)?;
+        let (w, _) = window_of(c, RTC, 1)?;
+        let (t, th) = target_of(c)?;
+        let counts = (|| {
+            map_whole(c, th, m, 1, USER_VA, Access::ReadWrite)?;
+            let none = process::device_windows(t);
+            map_whole(c, th, w, 1, USER_VA + PAGE, Access::Read)?;
+            map_whole(c, th, w, 1, USER_VA + 2 * PAGE, Access::ReadWrite)?;
+            let two = process::device_windows(t);
+            unmap_whole(c, th, 1, USER_VA + PAGE)?;
+            Ok((none, two, process::device_windows(t)))
+        })();
+        c.close(th)?;
+        c.close(w)?;
+        c.close(m)?;
+        release_target(t);
+        check(
+            counts? == (0, 2, 1),
+            "the windows of a process are not counted, or its memory objects are",
+        )
+    })
+}
+
 // The longest portions of the long calls of memory objects (spec 7.7,
 // 15.3), in their worst cases, under -icount.
 
@@ -3311,4 +3910,263 @@ fn release_ticks(c: &Caller) -> Result<u64, &'static str> {
     });
     apart.rejoin();
     ticks
+}
+
+/// Device windows in their worst cases, under -icount (spec 15.3): the
+/// first entry of device_window_create, whose pool of memory objects takes
+/// a page; the longest entry of mem_map of 64 pages of a window, a portion
+/// of 32 pages each with an interrupt pending all along, whose frames the
+/// window gives without a read; and the portion of a window that goes.
+/// The test prints `device window ticks: create=... map=... release=...`,
+/// which xtask shows; no number fails it.
+#[cfg(feature = "icount")]
+pub fn device_windows_are_measured(_: &Boot) -> Result<(), &'static str> {
+    /// 64 pages of the `virtio-mmio` transports of QEMU `virt`, which
+    /// nothing reads.
+    const WIDE: u64 = 0x0A00_0000;
+    let objects = memory::in_use();
+    let ticks = with_caller(|c| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let start = timer::now();
+        let got = c.call(
+            Call::DeviceWindowCreate.number(),
+            &[r.0, WIDE, 64 * PAGE_SIZE],
+        );
+        let create = timer::now() - start;
+        c.close(r)?;
+        check(got[0] == 0, "device_window_create failed")?;
+        let w = Handle(got[1]);
+        let (t, th) = target_of(c)?;
+        let args = [
+            th.0,
+            w.0,
+            0,
+            64 * PAGE_SIZE,
+            USER_VA as u64,
+            Access::ReadWrite.raw(),
+        ];
+        let map = timed_entries(c, Call::MemMap.number(), &args)
+            .map(|(first, rest, _)| first.max(rest))
+            .and_then(|map| unmap_whole(c, th, 64, USER_VA).map(|()| map));
+        c.close(th)?;
+        release_target(t);
+        c.close(w)?;
+        let start = timer::now();
+        cleanup::portion();
+        let release = timer::now() - start;
+        cleanup::drain();
+        Ok([create, map?, release])
+    })?;
+    let [create, map, release] = ticks;
+    kprintln!("device window ticks: create={create} map={map} release={release}");
+    check(
+        memory::in_use() == objects,
+        "a window of the measurements stayed",
+    )
+}
+
+/// The level of the heap of `timer_firing_is_measured`, its payers, and
+/// the receivers its firing wakes, one a timer.
+#[cfg(feature = "icount")]
+const FIRE_LEVEL: u8 = 10;
+#[cfg(feature = "icount")]
+const FIRE_PAYERS: usize = 64;
+#[cfg(feature = "icount")]
+const WOKEN: usize = kcore::timer::FIRE_PORTION;
+
+/// The timers of programs in their worst cases under -icount (spec 10,
+/// 15.3), in ticks:
+/// - interrupt: the timers' part of the kernel's timer interrupt
+///   (timer::expire) with the top of every level of 1-63 expired, which
+///   queues 63 firings;
+/// - fire: the portion of cleanup of the firing of FIRE_LEVEL, whose heap
+///   holds 4 096 timers of FIRE_PAYERS payers: it takes FIRE_PORTION
+///   expired ones off a heap of depth 12, and each wakes a receiver that
+///   waits in a channel of its own;
+/// - set: timer_set of the top of that heap, among 63 levels with timers
+///   and none pending, to a deadline before every other: it leaves the
+///   root, the walk of the levels follows, and it climbs back to the root.
+///
+/// The test prints them in one line, `timer portions ticks: interrupt=...
+/// fire=... set=...`, which xtask shows; no number fails it (spec 15.3).
+#[cfg(feature = "icount")]
+pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
+    let counts = (
+        timers::in_use(),
+        channel::in_use(),
+        thread::in_use(),
+        process::in_use(),
+    );
+    let ticks = with_caller(|c| {
+        let owner = process::create_root(QUOTA, 128, CEILING).map_err(|_| "no process");
+        let ticks = owner.and_then(|owner| {
+            let ticks = firing_ticks(c, owner);
+            // SAFETY: the test's reference goes; the handles went with it.
+            unsafe { process::release(owner, CAUSE) };
+            ticks
+        });
+        cleanup::drain();
+        ticks
+    })?;
+    let [interrupt, fire, set] = ticks;
+    kprintln!("timer portions ticks: interrupt={interrupt} fire={fire} set={set}");
+    check(
+        (
+            timers::in_use(),
+            channel::in_use(),
+            thread::in_use(),
+            process::in_use(),
+        ) == counts,
+        "a timer, a channel, a thread or a process of the measurements stayed",
+    )
+}
+
+/// The three counts of `timer_firing_is_measured`: `owner` holds the
+/// channels, their receivers and the timers of levels 1-63, with the
+/// handles that keep them; each payer holds its timers.
+#[cfg(feature = "icount")]
+fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 3], &'static str> {
+    let mut receivers = [None; WOKEN];
+    let mut payers = [None; FIRE_PAYERS];
+    let ticks = heap_ticks(c, owner, &mut receivers, &mut payers);
+    for t in receivers.into_iter().flatten() {
+        // SAFETY: the test's reference goes, and the kernel's first: the
+        // thread leaves the scheduler.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for p in payers.into_iter().flatten() {
+        // SAFETY: the test's reference goes; its handles hold its timers.
+        unsafe { process::release(p, CAUSE) };
+    }
+    ticks
+}
+
+/// A channel of `owner` at FIRE_LEVEL with a handle with RECEIVE in its
+/// table, which holds it.
+#[cfg(feature = "icount")]
+fn owned_channel(owner: NonNull<Process>) -> Result<NonNull<Channel>, &'static str> {
+    let c = channel::create(owner, FIRE_LEVEL).map_err(|_| "no channel")?;
+    let h = process::insert_handle(owner, Object::Channel(c), Rights::RECEIVE);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    h.map(|_| c).map_err(|_| "a handle did not go in")
+}
+
+/// A timer of `payer` on `ch` at `level`, armed for `deadline` in ticks,
+/// with a handle in the table of `payer`, which holds it.
+#[cfg(feature = "icount")]
+fn held_timer(
+    payer: NonNull<Process>,
+    ch: NonNull<Channel>,
+    level: u8,
+    deadline: u64,
+) -> Result<NonNull<Timer>, &'static str> {
+    let t = timers::create(payer, ch, 0, level).map_err(|_| "no timer")?;
+    let armed = timers::set(t, deadline, CAUSE);
+    let h = process::insert_handle(payer, Object::Timer(t), OWNER_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the timer.
+    unsafe { timers::release(t, CAUSE) };
+    armed.map_err(|_| "a timer was not armed")?;
+    h.map(|_| t).map_err(|_| "a handle did not go in")
+}
+
+/// A new thread of `owner` waits in receive on `ch`: it starts, runs as
+/// far as the scheduler knows, and its receive finds nothing.
+#[cfg(feature = "icount")]
+fn waiting(owner: NonNull<Process>, ch: NonNull<Channel>) -> Result<NonNull<Thread>, &'static str> {
+    let t = thread::create(owner, USER_VA, USER_VA, 0, 5, Policy::Fifo).map_err(|_| "no thread")?;
+    thread::start(t).map_err(|_| "a thread did not start")?;
+    // SAFETY: the scheduler's threads are alive.
+    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+    check(
+        matches!(picked, kcore::sched::Decision::Run(r) if r == t),
+        "the new thread did not run",
+    )?;
+    channel::receive(t, ch, true).map_err(|_| "the receiver did not wait")?;
+    Ok(t)
+}
+
+/// Builds what `timer_firing_is_measured` measures and measures it; the
+/// receivers and the payers go into `receivers` and `payers` for the
+/// caller to let go.
+#[cfg(feature = "icount")]
+fn heap_ticks(
+    c: &Caller,
+    owner: NonNull<Process>,
+    receivers: &mut [Option<NonNull<Thread>>; WOKEN],
+    payers: &mut [Option<NonNull<Process>>; FIRE_PAYERS],
+) -> Result<[u64; 3], &'static str> {
+    let mut channels = [None; WOKEN];
+    for (ch, r) in channels.iter_mut().zip(receivers.iter_mut()) {
+        let made = owned_channel(owner)?;
+        *ch = Some(made);
+        *r = Some(waiting(owner, made)?);
+    }
+    let channels = channels.map(|ch| ch.expect("a channel"));
+    // The later timers of the heap by the order they go in, so that a
+    // timer that leaves the root takes the last node down to a leaf.
+    let far = timer::now() + 1_000_000_000;
+    let mut early = [None; WOKEN];
+    let mut top = None;
+    for (i, payer) in payers.iter_mut().enumerate() {
+        let p = process::create_root(QUOTA, 128, CEILING).map_err(|_| "no payer")?;
+        *payer = Some(p);
+        for j in 0..abi::MAX_TIMERS as usize {
+            let n = i * abi::MAX_TIMERS as usize + j;
+            let t = held_timer(p, channels[n % WOKEN], FIRE_LEVEL, far + n as u64)?;
+            match n {
+                n if n < WOKEN => early[n] = Some(t),
+                n if n == WOKEN => top = Some(t),
+                _ => {}
+            }
+        }
+    }
+    let lc = owned_channel(owner)?;
+    let mut levels = [None; kcore::timer::LEVELS];
+    for (l, t) in levels.iter_mut().enumerate() {
+        *t = Some(held_timer(owner, lc, l as u8 + 1, 2 * far + l as u64)?);
+    }
+    let top = top.expect("the top of the heap");
+    let h = c.insert(Object::Timer(top), OWNER_RIGHTS)?;
+    let before = timer::clock().ticks_to_ns(far / 2);
+    let start = timer::now();
+    c.succeeds(Call::TimerSet.number(), &[h.0, before], &[])?;
+    let set = timer::now() - start;
+    c.close(h)?;
+    // Every level expires, and the heap's receivers' timers first of all.
+    let at = timer::now() + 2_000_000;
+    for (n, t) in early.into_iter().flatten().enumerate() {
+        timers::set(t, at + n as u64, CAUSE).map_err(|_| "a timer was not armed")?;
+    }
+    for (l, t) in levels.into_iter().flatten().enumerate() {
+        timers::set(t, at + 100 + l as u64, CAUSE).map_err(|_| "a timer was not armed")?;
+    }
+    while timer::now() <= at + 200 {}
+    let queued = cleanup::len();
+    let start = timer::now();
+    timers::expire(timer::now());
+    let interrupt = timer::now() - start;
+    check(
+        cleanup::len() == queued + kcore::timer::LEVELS as u64,
+        "the interrupt did not queue the firing of every level",
+    )?;
+    while cleanup::top().is_some_and(|l| l > FIRE_LEVEL) {
+        cleanup::portion();
+    }
+    let start = timer::now();
+    cleanup::portion();
+    let fire = timer::now() - start;
+    // SAFETY: the receivers are alive; only their states are read.
+    let woke = receivers
+        .iter()
+        .flatten()
+        .all(|t| unsafe { t.as_ref() }.sched.state() == State::Ready);
+    cleanup::drain();
+    check(woke, "a receiver of the heap's timers did not wake")?;
+    Ok([interrupt, fire, set])
 }

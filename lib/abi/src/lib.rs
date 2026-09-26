@@ -80,9 +80,9 @@ impl core::ops::BitOr for Rights {
     }
 }
 
-/// Rights of the handle that `process_create`, `thread_create` or
-/// `timer_create` returns, and of init's handles to its own process and
-/// first thread.
+/// Rights of the handle that `process_create`, `thread_create`,
+/// `timer_create` or `irq_bind` returns, and of init's handles to its own
+/// process and first thread.
 pub const OWNER_RIGHTS: Rights =
     Rights(Rights::DUPLICATE.0 | Rights::TRANSFER.0 | Rights::MANAGE.0);
 
@@ -106,6 +106,12 @@ pub const MEMORY_RIGHTS: Rights = Rights(
         | Rights::DUPLICATE.0
         | Rights::TRANSFER.0,
 );
+
+/// Rights of the handle that `device_window_create` returns (spec 5.2,
+/// 7.4): a window maps R or RW and travels; the registers of a device are
+/// never run.
+pub const WINDOW_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
 
 /// Rights of init's handle to the boot image (spec 13.1, 13.3): a memory
 /// object that maps read-only and travels, never written or run in place.
@@ -608,9 +614,23 @@ pub const INFO_PROCESS_HANDLES: u64 = 3;
 /// KERNEL_STATS takes the system resource with KSTATS and returns
 /// `KernelStats::to_words` in x1-x8.
 pub const INFO_KERNEL_STATS: u64 = 4;
-/// MEMORY takes a memory object's handle, with no right needed, and
-/// returns `MemoryInfo::to_words` in x1-x3.
+/// MEMORY takes a memory object's handle, a device window's too, with no
+/// right needed, and returns `MemoryInfo::to_words` in x1-x3.
 pub const INFO_MEMORY: u64 = 5;
+/// THREAD_STATE takes a thread handle, with no right needed, and returns
+/// `ThreadInfo::to_words` in x1-x4.
+pub const INFO_THREAD_STATE: u64 = 6;
+/// CHANNEL takes a channel handle, a labelled copy too, with no right
+/// needed, and returns `ChannelInfo::to_words` in x1-x4.
+pub const INFO_CHANNEL: u64 = 7;
+/// IRQ takes an interrupt binding's handle, with no right needed, and
+/// returns `IrqInfo::to_words` in x1-x3.
+pub const INFO_IRQ: u64 = 8;
+
+/// Bit 0 of the flags of `irq_bind` (spec 9, 11): the line is
+/// edge-triggered; without it, level-triggered. The other bits are
+/// reserved.
+pub const TRIGGER_EDGE: u64 = 1;
 
 /// A process's memory quota (spec 7.5), in bytes: the limit its parent
 /// gave it, what is charged to it now, and what went back to the parent.
@@ -641,8 +661,8 @@ impl ProcessMemory {
 }
 
 /// A memory object (spec 7.3, 11): its size in bytes, the pages whose
-/// frames it owns, every page of an object `mem_create` made, and the
-/// mappings of it now.
+/// frames it owns, every page of an object `mem_create` made and none of a
+/// device window, and the mappings of it now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryInfo {
     pub size: u64,
@@ -662,6 +682,157 @@ impl MemoryInfo {
             size: words[0],
             pages: words[1],
             mappings: words[2],
+        }
+    }
+}
+
+/// An interrupt binding (spec 9, 11): its line, whether the line is masked
+/// until `irq_ack`, and whether it is edge-triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqInfo {
+    pub line: u64,
+    pub masked: bool,
+    pub edge: bool,
+}
+
+impl IrqInfo {
+    /// The words `object_info` returns in x1-x3: the line, 1 when masked,
+    /// 1 when edge-triggered.
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.line, self.masked as u64, self.edge as u64]
+    }
+
+    /// The binding from x1-x3 of `object_info`.
+    pub const fn from_words(words: [u64; 3]) -> IrqInfo {
+        IrqInfo {
+            line: words[0],
+            masked: words[1] != 0,
+            edge: words[2] != 0,
+        }
+    }
+}
+
+/// What a thread does now (spec 8, 8.1): its state, and for a thread
+/// that waits what it waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadState {
+    /// Made, not started yet.
+    Stopped,
+    /// Ready to run.
+    Ready,
+    /// On the CPU.
+    Running,
+    /// Waits in `receive`.
+    Receiving,
+    /// Waits in `send`, its request in the channel's queue.
+    Sending,
+    /// Waits for the reply to a request a receiver took.
+    AwaitingReply,
+    /// Ended; it never runs again.
+    Ended,
+    /// A state this abi does not know, which a later kernel may return:
+    /// its code. The kernel this abi comes with never returns one.
+    Unknown(u64),
+}
+
+impl ThreadState {
+    /// The code in x1 of `object_info`: 0 to 6 in the order above.
+    pub const fn code(self) -> u64 {
+        match self {
+            ThreadState::Stopped => 0,
+            ThreadState::Ready => 1,
+            ThreadState::Running => 2,
+            ThreadState::Receiving => 3,
+            ThreadState::Sending => 4,
+            ThreadState::AwaitingReply => 5,
+            ThreadState::Ended => 6,
+            ThreadState::Unknown(code) => code,
+        }
+    }
+
+    /// The state with this code; `Unknown` for a code this abi does not
+    /// know.
+    pub const fn from_code(code: u64) -> ThreadState {
+        match code {
+            0 => ThreadState::Stopped,
+            1 => ThreadState::Ready,
+            2 => ThreadState::Running,
+            3 => ThreadState::Receiving,
+            4 => ThreadState::Sending,
+            5 => ThreadState::AwaitingReply,
+            6 => ThreadState::Ended,
+            _ => ThreadState::Unknown(code),
+        }
+    }
+}
+
+/// A thread (spec 8, 11): its state, its base priority, its effective
+/// priority, which a boost lifts (spec 6.6), and its policy; `None` for a
+/// policy this abi does not know, which `to_words` gives as u64::MAX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreadInfo {
+    pub state: ThreadState,
+    pub base: u8,
+    pub priority: u8,
+    pub policy: Option<Policy>,
+}
+
+impl ThreadInfo {
+    /// The words `object_info` returns in x1-x4.
+    pub const fn to_words(self) -> [u64; 4] {
+        let policy = match self.policy {
+            Some(p) => p as u64,
+            None => u64::MAX,
+        };
+        [
+            self.state.code(),
+            self.base as u64,
+            self.priority as u64,
+            policy,
+        ]
+    }
+
+    /// The thread from x1-x4 of `object_info`.
+    pub const fn from_words(words: [u64; 4]) -> ThreadInfo {
+        ThreadInfo {
+            state: ThreadState::from_code(words[0]),
+            base: words[1] as u8,
+            priority: words[2] as u8,
+            policy: Policy::from_raw(words[3]),
+        }
+    }
+}
+
+/// A channel (spec 6.3, 6.5, 11): the slots and requests in its queue, the
+/// receivers that wait in it (one of the two is 0), its sources, each of
+/// which holds one of its abi::MAX_SLOTS slots, the slot of label 0 among
+/// them, and whether its last handle with RECEIVE went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelInfo {
+    pub queued: u64,
+    pub receivers: u64,
+    pub sources: u64,
+    pub closed: bool,
+}
+
+impl ChannelInfo {
+    /// The words `object_info` returns in x1-x4.
+    pub const fn to_words(self) -> [u64; 4] {
+        [
+            self.queued,
+            self.receivers,
+            self.sources,
+            self.closed as u64,
+        ]
+    }
+
+    /// The channel from x1-x4 of `object_info`.
+    pub const fn from_words(words: [u64; 4]) -> ChannelInfo {
+        ChannelInfo {
+            queued: words[0],
+            receivers: words[1],
+            sources: words[2],
+            closed: words[3] != 0,
         }
     }
 }
@@ -716,10 +887,10 @@ pub struct KernelStats {
     /// them: a pool takes a page as it grows, and the pages of a payer's
     /// pools go back with its shell (spec 7.8).
     pub pool_pages: u64,
-    /// The longest batch of expired timers one timer interrupt took, in
-    /// ticks: what the timers of programs add to the blocking of any
-    /// thread (spec 10).
-    pub longest_batch: u64,
+    /// The longest portion of firings of timers so far, in ticks: up to
+    /// 16 expired timers of one level, which the cleanup queue runs at that
+    /// level (spec 7.7, 10).
+    pub longest_firing: u64,
 }
 
 impl KernelStats {
@@ -733,7 +904,7 @@ impl KernelStats {
             self.longest_portion,
             self.free_frames,
             self.pool_pages,
-            self.longest_batch,
+            self.longest_firing,
         ]
     }
 
@@ -747,7 +918,7 @@ impl KernelStats {
             longest_portion: words[4],
             free_frames: words[5],
             pool_pages: words[6],
-            longest_batch: words[7],
+            longest_firing: words[7],
         }
     }
 }
@@ -1042,6 +1213,10 @@ mod tests {
             INIT_BOOT_IMAGE_RIGHTS,
             Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER
         );
+        assert_eq!(
+            WINDOW_RIGHTS,
+            Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER
+        );
     }
 
     #[test]
@@ -1217,6 +1392,74 @@ mod tests {
     }
 
     #[test]
+    fn irq_info_round_trips() {
+        assert_eq!((INFO_IRQ, TRIGGER_EDGE), (8, 1));
+        let info = IrqInfo {
+            line: 48,
+            masked: true,
+            edge: false,
+        };
+        assert_eq!(info.to_words(), [48, 1, 0]);
+        assert_eq!(IrqInfo::from_words(info.to_words()), info);
+        let edge = IrqInfo {
+            line: 34,
+            masked: false,
+            edge: true,
+        };
+        assert_eq!(IrqInfo::from_words(edge.to_words()), edge);
+    }
+
+    #[test]
+    fn thread_info_round_trips() {
+        assert_eq!(INFO_THREAD_STATE, 6);
+        let states = [
+            ThreadState::Stopped,
+            ThreadState::Ready,
+            ThreadState::Running,
+            ThreadState::Receiving,
+            ThreadState::Sending,
+            ThreadState::AwaitingReply,
+            ThreadState::Ended,
+        ];
+        for (code, state) in states.into_iter().enumerate() {
+            assert_eq!(state.code(), code as u64);
+            assert_eq!(ThreadState::from_code(code as u64), state);
+        }
+        assert_eq!(ThreadState::from_code(7), ThreadState::Unknown(7));
+        let info = ThreadInfo {
+            state: ThreadState::Sending,
+            base: 5,
+            priority: 25,
+            policy: Some(Policy::Fifo),
+        };
+        assert_eq!(info.to_words(), [4, 5, 25, 1]);
+        assert_eq!(ThreadInfo::from_words(info.to_words()), info);
+        let odd = ThreadInfo::from_words([9, 1, 1, 2]);
+        assert_eq!((odd.state, odd.policy), (ThreadState::Unknown(9), None));
+        assert_eq!(odd.to_words(), [9, 1, 1, u64::MAX]);
+    }
+
+    #[test]
+    fn channel_info_round_trips() {
+        assert_eq!(INFO_CHANNEL, 7);
+        let info = ChannelInfo {
+            queued: 3,
+            receivers: 0,
+            sources: 4,
+            closed: true,
+        };
+        assert_eq!(info.to_words(), [3, 0, 4, 1]);
+        assert_eq!(ChannelInfo::from_words(info.to_words()), info);
+        let waited = ChannelInfo {
+            queued: 0,
+            receivers: 2,
+            sources: 1,
+            closed: false,
+        };
+        assert_eq!(ChannelInfo::from_words(waited.to_words()), waited);
+    }
+
+    #[test]
     fn kernel_stats_travel_in_eight_words() {
         assert_eq!(INFO_KERNEL_STATS, 4);
         let words = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -1229,7 +1472,7 @@ mod tests {
             (stats.idle_latency, stats.irq_latency, stats.longest_portion),
             (2, 3, 5)
         );
-        assert_eq!((stats.free_frames, stats.longest_batch), (6, 8));
+        assert_eq!((stats.free_frames, stats.longest_firing), (6, 8));
         assert_eq!(stats.to_words(), words);
     }
 

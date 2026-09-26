@@ -33,17 +33,17 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Long, Thread};
-use crate::{arch, cleanup, sched, session, timer};
+use crate::{arch, cleanup, irq, sched, session, timer};
 use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
-    ProcessHandles, ProcessMemory, ProcessState, Rights,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::args::{
     Desc, access_arg, bits_arg, check_buffer, check_start, handle_limit_arg, handle_values_arg,
-    inline_len_arg, memory_size_arg, notify_priority_arg, policy_arg, priority_arg, quota_arg,
-    range_arg, reserved_arg, rights_arg, under_ceilings, wait_arg,
+    inline_len_arg, line_arg, memory_size_arg, notify_priority_arg, policy_arg, priority_arg,
+    quota_arg, range_arg, reserved_arg, rights_arg, trigger_arg, under_ceilings, wait_arg,
 };
 use kcore::maps::Mapping;
 
@@ -108,6 +108,9 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::Yield) => yield_now(),
+        Some(Call::DeviceWindowCreate) => device_window_create(thread, &args),
+        Some(Call::IrqBind) => irq_bind(thread, &args),
+        Some(Call::IrqAck) => irq_ack(thread, &args),
         Some(Call::ClockNow) => clock_now(),
         Some(Call::TimerCreate) => timer_create(thread, &args),
         Some(Call::TimerSet) => timer_set(thread, &args),
@@ -708,7 +711,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     // insert the child's handle there last (spec 11).
     process::handle_room(caller(thread))?;
     if let Some((c, _)) = exit {
-        channel::add_source(c)?;
+        channel::reserve_source(c)?;
     }
     let made = new_child(thread, quota, limit, ceiling, start.map(|(_, o, r)| (o, r)));
     match made {
@@ -941,14 +944,95 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// device_window_create(x0 system resource with DEVICE, x1 address, x2
+/// length): a device window, a memory object over the physical range
+/// rounded out to whole pages (spec 9); x1 returns a handle to it with
+/// abi::WINDOW_RIGHTS, which mem_map shows as Device-nGnRE, never
+/// executable (spec 7.4). The checks in the order of spec 11: a length of
+/// 0, a range that wraps around, ends past 2^48 or holds more than
+/// abi::MAX_MEMORY (INVALID_ARGS, kcore::window::round_out); x0
+/// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without DEVICE); a page of the
+/// range shared with RAM or a device of the kernel (INVALID_ARGS,
+/// memory::check_window); then the resources in the order the call takes
+/// them: room in the caller's table (LIMIT_REACHED), a page of the caller's
+/// pool of memory objects and a block of its table (NO_MEMORY). A window
+/// whose handle did not go in goes again.
+fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let (base, pages) = kcore::window::round_out(a[1], a[2])?;
+    lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
+    memory::check_window(base, pages)?;
+    process::handle_room(caller(thread))?;
+    let m = memory::create_window(caller(thread), base, pages as usize)?;
+    let h = process::insert_handle(caller(thread), Object::Memory(m), WINDOW_RIGHTS);
+    // SAFETY: the reference `create_window` handed out goes; the handle, if
+    // it went in, holds the window, and without it the window goes.
+    unsafe { memory::release(m, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
+/// NOTIFY, x3 priority, x4 flags): the line's interrupts come as
+/// notifications of the channel (spec 9), bit 0 into a slot of the
+/// priority with the label of the handle; x1 returns a handle to the
+/// binding with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS). The
+/// channel may be a registration handle a service gave init: NOTIFY is
+/// the right to post into it. The line is edge-triggered with
+/// abi::TRIGGER_EDGE in the flags, level-triggered without, and open at
+/// once. The checks in the order of spec 11: a line outside the shared
+/// ones or the kernel's console line, a priority outside 1-63 and a flag
+/// other than TRIGGER_EDGE (INVALID_ARGS); x0 (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without DEVICE), x2 (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without NOTIFY); the priority above the caller's ceiling
+/// (ACCESS_DENIED); a line with a binding (BAD_STATE), a closed channel
+/// (PEER_CLOSED); then the resources in the order the call takes them:
+/// room in the caller's table (LIMIT_REACHED), a slot of the channel
+/// (LIMIT_REACHED, spec 6.5), a page of the caller's pool of bindings and
+/// a block of its table (NO_MEMORY). A binding whose handle did not go in
+/// goes again, and its line with it.
+fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let line = line_arg(a[1], arch::gic::lines())?;
+    let priority = priority_arg(a[3])?;
+    let edge = trigger_arg(a[4])?;
+    lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
+    let (c, label) = lookup(thread, a[2], Rights::NOTIFY, |o| {
+        Some((o.channel()?, o.session().map_or(0, session::label)))
+    })?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    if irq::is_bound(line) {
+        return Err(Error::BadState);
+    }
+    if channel::is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    process::handle_room(caller(thread))?;
+    let b = irq::bind(caller(thread), c, label, line, priority, edge)?;
+    let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
+    // SAFETY: the reference `bind` handed out goes; the handle, if it went
+    // in, holds the binding, and without it the binding and its line go.
+    unsafe { irq::release_handle(b, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// irq_ack(x0 binding with MANAGE): the line an interrupt masked opens
+/// again (spec 9); an open line stays open, 0 all the same. PEER_CLOSED once
+/// the binding's channel closed, and the line stays masked.
+fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
+    irq::ack(b)?;
+    Ok(Values::NONE)
+}
+
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any
 /// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
 /// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
 /// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
-/// MEMORY takes a memory object's handle with any rights and returns
-/// abi::MemoryInfo in x1-x3.
+/// MEMORY takes a memory object's handle, a device window's too, with any
+/// rights and returns abi::MemoryInfo in x1-x3; THREAD_STATE a thread's and
+/// returns abi::ThreadInfo in x1-x4; CHANNEL a channel's, a labelled copy
+/// too, and returns abi::ChannelInfo in x1-x4; IRQ an interrupt binding's
+/// and returns abi::IrqInfo in x1-x3.
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
@@ -985,14 +1069,26 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
             let m = lookup(thread, a[0], Rights::NONE, Object::memory)?;
             Ok(Values::new(&memory::info(m).to_words()))
         }
+        abi::INFO_THREAD_STATE => {
+            let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;
+            Ok(Values::new(&thread::info(t).to_words()))
+        }
+        abi::INFO_CHANNEL => {
+            let c = lookup(thread, a[0], Rights::NONE, Object::channel)?;
+            Ok(Values::new(&channel::info(c).to_words()))
+        }
+        abi::INFO_IRQ => {
+            let b = lookup(thread, a[0], Rights::NONE, Object::irq)?;
+            Ok(Values::new(&irq::info(b).to_words()))
+        }
         _ => Err(Error::InvalidArgs),
     }
 }
 
 /// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
 /// idle time and latencies, the cleanup queue, the frames, the pages of
-/// the pools and of the page logs of their payers, and the longest batch
-/// of expired timers.
+/// the pools and of the page logs of their payers, and the longest portion
+/// of firings of timers.
 fn kernel_stats() -> KernelStats {
     let s = sched::stats();
     KernelStats {
@@ -1003,7 +1099,7 @@ fn kernel_stats() -> KernelStats {
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
-        longest_batch: timer::longest_batch(),
+        longest_firing: timer::longest_firing(),
     }
 }
 
