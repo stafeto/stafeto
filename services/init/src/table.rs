@@ -8,7 +8,9 @@
 //! test program `checker`). `check` refuses a table init could not keep
 //! its promises with, and gives the order to start the records in:
 //! services before their clients, among those ready the highest ceiling
-//! first, then the order of the table.
+//! first, then the order of the table. `TABLE` is the table init starts:
+//! the one that ships, or a table of the test images, which a feature of
+//! the build names (`table-test`, `table-cycle`, `table-ceiling`).
 
 use crate::PAGE;
 use crate::watch::Watch;
@@ -518,6 +520,34 @@ fn order(table: &[Record]) -> Order {
     order
 }
 
+pub mod ceiling;
+pub mod cycle;
+pub mod normal;
+pub mod test;
+
+#[cfg(any(
+    all(feature = "table-test", feature = "table-cycle"),
+    all(feature = "table-test", feature = "table-ceiling"),
+    all(feature = "table-cycle", feature = "table-ceiling"),
+))]
+compile_error!("init builds with one table: table-test, table-cycle or table-ceiling");
+
+/// The table init starts (spec 13.4): the one of the build's feature, or
+/// the one that ships. The tables are constants, so a build carries only
+/// the one it starts.
+#[cfg(not(any(
+    feature = "table-test",
+    feature = "table-cycle",
+    feature = "table-ceiling"
+)))]
+pub const TABLE: &[Record] = normal::TABLE;
+#[cfg(feature = "table-test")]
+pub const TABLE: &[Record] = test::TABLE;
+#[cfg(feature = "table-cycle")]
+pub const TABLE: &[Record] = cycle::TABLE;
+#[cfg(feature = "table-ceiling")]
+pub const TABLE: &[Record] = ceiling::TABLE;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,5 +1033,25 @@ mod tests {
         for bad in [MIN_QUOTA - PAGE, MIN_QUOTA + 1, 0] {
             assert!(matches!(with(quota(bad)), Err(TableError::Quota { .. })));
         }
+    }
+
+    /// The tables of the images (spec 15.2): the one that ships and the
+    /// test table pass, in the order of their dependencies; the two bad
+    /// tables are refused with the reasons xtask looks for in their runs.
+    #[test]
+    fn the_tables_of_the_images_pass_or_are_refused() {
+        assert_eq!(order_of(normal::TABLE), [""; 0]);
+        assert_eq!(
+            order_of(test::TABLE),
+            ["echo", "slow", "device", "checker", "private"]
+        );
+        assert_eq!(
+            refused(cycle::TABLE),
+            "the connections make a cycle: a -> b -> a"
+        );
+        assert_eq!(
+            refused(ceiling::TABLE),
+            "low at priority 40 is below the ceiling 50 of its client high"
+        );
     }
 }

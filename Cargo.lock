@@ -88,6 +88,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-svc"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "xtask"
 version = "0.1.0"
 dependencies = [

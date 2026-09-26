@@ -72,14 +72,17 @@
 
 6. If PC is near zero or garbage, `VBAR_EL1` has not been set yet.
 
-7. Every build ends a run with PSCI `SYSTEM_OFF`, and QEMU exits with
-   status 0: at a panic, `init`'s end among them, and at the end of the
-   kernel tests, which print `TESTS DONE total=N failed=M` first. xtask
-   judges a run of tests by that line and fails a run with a
-   `KERNEL PANIC` line anywhere, except the one panic of `init`'s exit
-   that ends a run of the test init. A panic before the kernel has read
-   the PSCI conduit from the device tree parks the processor instead, and
-   the run ends at xtask's deadline.
+7. A run ends with PSCI `SYSTEM_OFF`, and QEMU exits with status 0, at a
+   panic, `init`'s end among them, and at the end of the kernel tests,
+   which print `TESTS DONE total=N failed=M` first. The normal build does
+   not end: `init` lives on, and xtask stops QEMU on its line
+   `init: services started`; it stops a run of the image of `init`'s test
+   table on the `TESTS DONE` line of the test client there. xtask judges a
+   run of tests by that line and fails a run with a `KERNEL PANIC` line
+   anywhere, except the one panic of `init`'s exit that ends a run of the
+   test init. A panic before the kernel has read the PSCI conduit from
+   the device tree parks the processor instead, and the run ends at
+   xtask's deadline.
 
 ## Address from a panic
 

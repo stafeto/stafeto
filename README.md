@@ -74,10 +74,10 @@ and on Apple silicon under HVF. What works today:
   the thread that serves requests. One ELF reader, `bootimg::elf`, builds
   the boot image, whose reader refuses two files with one name.
 
-`cargo xtask run` shows `init` saying hello from EL0 and two of its threads
-taking turns. `cargo xtask test` runs the tests on QEMU's GICv2 and GICv3;
-`cargo xtask hvf` runs them on a Mac with Apple silicon, on Apple's GICv3
-and on QEMU's GICv2.
+`cargo xtask run` boots to `init`, which checks its table of services,
+empty for now, and says that the services started. `cargo xtask test`
+runs the tests on QEMU's GICv2 and GICv3; `cargo xtask hvf` runs them on
+a Mac with Apple silicon, on Apple's GICv3 and on QEMU's GICv2.
 
 ## Roadmap
 
@@ -135,7 +135,7 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask test` | host tests, boot in QEMU, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |
-| `cargo xtask hvf` | on a Mac with Apple silicon: boot, the test `init` and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
+| `cargo xtask hvf` | on a Mac with Apple silicon: boot, the test `init`, the tests of init's service table and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 

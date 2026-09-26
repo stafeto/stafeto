@@ -16,6 +16,13 @@ name = "init"
 test = false
 bench = false
 
+# The table init starts (init::table::TABLE): the one that ships without
+# a feature; each test image builds with one of these, never two.
+[features]
+table-test = []
+table-cycle = []
+table-ceiling = []
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }

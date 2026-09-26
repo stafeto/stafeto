@@ -270,23 +270,19 @@ fn tail(lines: &[String]) -> &[String] {
     &lines[lines.len().saturating_sub(10)..]
 }
 
-/// The machine must print `line` and then power off by itself with status 0.
-pub fn expect_clean_exit_with(o: &Outcome, line: &str) -> Result<(), String> {
-    if o.timed_out {
+/// A run xtask stopped on its last line, which is `line` whole
+/// (run_until): the machine still ran, so the run has no exit status. No
+/// line has KERNEL PANIC.
+pub fn expect_stopped_on(o: &Outcome, line: &str) -> Result<(), String> {
+    if !o.stopped_on_marker || o.lines.last().is_none_or(|l| l != line) {
         return Err(format!(
-            "QEMU did not finish in time; last lines: {:?}",
+            "QEMU was not stopped on {line:?}; last lines: {:?}",
             tail(&o.lines)
         ));
     }
-    if !o.lines.iter().any(|l| l == line) {
-        return Err(format!(
-            "kernel never printed {line:?}; last lines: {:?}",
-            tail(&o.lines)
-        ));
-    }
-    match o.status {
-        Some(s) if s.success() => Ok(()),
-        other => Err(format!("QEMU exit status {other:?}")),
+    match o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
+        Some(panic) => Err(format!("the kernel panicked: {panic}")),
+        None => Ok(()),
     }
 }
 
@@ -523,13 +519,14 @@ pub fn expect_init_exit(o: &Outcome, after: &str, code: u64) -> Result<(), Strin
     }
 }
 
-/// A run of tests in QEMU finished in time with status 0, some tests
-/// passed, none failed, and the run said so in its `TESTS DONE` line. A
-/// panic powers the machine off with status 0 as well (spec 14), so with
-/// no `exit` any line with KERNEL PANIC fails the run; a run of the test
-/// init ends with the panic of init's exit, and `exit` is its expected
-/// code (expect_init_exit after `TESTS DONE`). Failed tests are named
-/// first: the test init exits with their count.
+/// A run of tests in QEMU finished in time with status 0, or xtask
+/// stopped it on a line (run_until), some tests passed, none failed, and
+/// the run said so in its `TESTS DONE` line. A panic powers the machine
+/// off with status 0 as well (spec 14), so with no `exit` any line with
+/// KERNEL PANIC fails the run; a run of the test init ends with the panic
+/// of init's exit, and `exit` is its expected code (expect_init_exit after
+/// `TESTS DONE`). Failed tests are named first: the test init exits with
+/// their count.
 pub fn verdict(o: &Outcome, r: &TestReport, exit: Option<u64>) -> Result<(), String> {
     if o.timed_out {
         return Err(format!(
@@ -563,6 +560,7 @@ pub fn verdict(o: &Outcome, r: &TestReport, exit: Option<u64>) -> Result<(), Str
     }
     match o.status {
         Some(s) if s.success() => Ok(()),
+        None if o.stopped_on_marker => Ok(()),
         other => Err(format!("QEMU exit status {other:?}")),
     }
 }
@@ -992,7 +990,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         .unwrap();
         assert!(o.timed_out);
         assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(expect_clean_exit_with(&o, "started").is_err());
+        assert!(expect_stopped_on(&o, "started").is_err());
     }
 
     #[test]
@@ -1009,25 +1007,49 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         assert!(expect_marker(&o, "no device tree").is_ok());
     }
 
+    /// Spec 13.4, 15.2: init lives on, so a run of the normal build and
+    /// of init's test table ends when xtask stops QEMU on its line; such a
+    /// run has no exit status. A run that was not stopped, stopped on
+    /// another line or with a panic in it fails.
     #[test]
-    fn clean_exit_needs_the_line_and_status_zero() {
-        let ok = Outcome {
-            lines: vec!["boot complete".into()],
-            status: Some(ExitStatus::from_raw(0)),
+    fn a_run_stopped_on_its_line_needs_no_exit_status() {
+        let stopped = |l: &[&str]| Outcome {
+            lines: lines(l),
+            status: None,
             timed_out: false,
+            stopped_on_marker: true,
+        };
+        let started = stopped(&["boot complete", "init: services started"]);
+        assert_eq!(
+            expect_stopped_on(&started, "init: services started"),
+            Ok(())
+        );
+        assert!(expect_stopped_on(&started, "services started").is_err());
+        assert!(expect_stopped_on(&started, "boot complete").is_err());
+        let off = Outcome {
+            status: Some(ExitStatus::from_raw(0)),
             stopped_on_marker: false,
+            ..started.clone()
         };
-        assert!(expect_clean_exit_with(&ok, "boot complete").is_ok());
-        let missing = Outcome {
-            lines: vec!["booting".into()],
-            ..ok.clone()
+        assert!(expect_stopped_on(&off, "init: services started").is_err());
+        let panicked = stopped(&["KERNEL PANIC: boom", "init: services started"]);
+        assert!(expect_stopped_on(&panicked, "init: services started").is_err());
+        let judge = |o: &Outcome| counted_verdict(o, &parse_report(&o.lines), None);
+        let done = stopped(&["TEST a ok", "TESTS DONE total=1 failed=0"]);
+        assert_eq!(judge(&done), Ok(()));
+        let failed = stopped(&["TEST a FAIL x", "TESTS DONE total=1 failed=1"]);
+        assert!(judge(&failed).is_err());
+        let crashed = stopped(&[
+            "TEST a ok",
+            "KERNEL PANIC: boom",
+            "TESTS DONE total=1 failed=0",
+        ]);
+        assert!(judge(&crashed).is_err());
+        let exit = Outcome {
+            stopped_on_marker: false,
+            ..done.clone()
         };
-        assert!(expect_clean_exit_with(&missing, "boot complete").is_err());
-        let failed = Outcome {
-            status: Some(ExitStatus::from_raw(1 << 8)),
-            ..ok.clone()
-        };
-        assert!(expect_clean_exit_with(&failed, "boot complete").is_err());
+        assert!(judge(&exit).is_err());
     }
 
     #[test]

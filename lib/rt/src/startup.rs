@@ -12,9 +12,8 @@
 //! `init_handles`.
 
 use crate::handle::{Any, Channel, Handle, Kind, Outgoing, Process, Thread};
-use crate::msgbuf;
 use crate::sys::{self, Reply, Token};
-use abi::{Error, INLINE_MAX, MESSAGE_HANDLES, MESSAGE_MAX, ObjectKind, START_CHANNEL};
+use abi::{Error, MESSAGE_HANDLES, MESSAGE_MAX, ObjectKind, START_CHANNEL};
 use proto_init::{Method, START_NAMES, StartReply, VERSION};
 use proto_wire::{Header, Name, Reader, Status, Writer};
 
@@ -192,7 +191,7 @@ impl Collected {
     /// Takes in one reply: true for the one with LAST.
     fn add(&mut self, reply: &mut Reply) -> Result<bool, StartError> {
         let mut buffer = [0; MESSAGE_MAX];
-        let bytes = bytes_of(reply, &mut buffer);
+        let bytes = reply.bytes(&mut buffer);
         match Reader::new(bytes).u32().map(Status::from_code) {
             Ok(Status::Ok) => {}
             Ok(status) => return Err(StartError::Refused(status)),
@@ -261,18 +260,6 @@ impl Collected {
             named: self.named,
         })
     }
-}
-
-/// The bytes of `reply`: from x2-x9, or from the message buffer when they
-/// are more than 64 (sys::keep_whole put them all there).
-fn bytes_of<'a>(reply: &Reply, buffer: &'a mut [u8; MESSAGE_MAX]) -> &'a [u8] {
-    let bytes = &mut buffer[..reply.len.min(MESSAGE_MAX)];
-    if reply.len <= INLINE_MAX {
-        bytes.copy_from_slice(&abi::inline_bytes(&reply.words)[..reply.len]);
-    } else {
-        msgbuf::read(0, bytes);
-    }
-    bytes
 }
 
 /// How `Giver::answer` answered a request.
