@@ -215,7 +215,10 @@ pub fn step_change(long: &mut Long) -> Result<bool, Error> {
     check_alive(on.target)?;
     // SAFETY: the process lives, and the entry is the call's.
     let (m, space) = unsafe { (entry(&on), space(on.target)) };
-    let exec = access == Some(Access::ReadExec);
+    // A device window carries no MAP_EXEC right (abi::WINDOW_RIGHTS, spec
+    // 5.2, 9), so this excludes it on its own; the check stands so that
+    // cache::sync_icache_frames never walks a page outside the linear map.
+    let exec = access == Some(Access::ReadExec) && !memory::is_window(m.object);
     let n = if exec { EXEC_PORTION } else { PORTION }.min(m.pages - on.done);
     let va = page_address(&m, on.done);
     let mut frames = [0; PORTION as usize];
