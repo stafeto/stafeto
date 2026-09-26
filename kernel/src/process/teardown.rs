@@ -69,11 +69,16 @@ pub enum Stage {
     Space,
     /// The message buffers of the threads the end stopped, at most
     /// abi::MAX_THREADS, with the handles of the requests they made, up to
-    /// abi::MESSAGE_HANDLES each, and the objects of the long calls they
-    /// were making (thread::drop_long), BUFFERS_PORTION units of work a
-    /// portion, and the threads leave the list. After Space, so that no TLB
-    /// entry maps a frame that goes.
+    /// abi::MESSAGE_HANDLES each, and what the long calls they were making
+    /// held (thread::drop_long), BUFFERS_PORTION units of work a portion,
+    /// and the threads leave the list. After Space, so that no TLB entry
+    /// maps a frame that goes.
     Buffers,
+    /// The entries of the table of its mappings, at most abi::MAX_MAPPINGS,
+    /// each letting its memory object go, and the block of the table
+    /// (maps::release_all). One portion. After Space, so that no TLB entry
+    /// maps a frame of an object that goes.
+    Mappings,
     /// The blocks of frames the process owned, at most MAX_BLOCKS.
     Frames,
     /// The free part of its quota goes back to the parent, and the
@@ -95,13 +100,14 @@ pub enum Stage {
 }
 
 /// The stages of a teardown in the order they run (spec 7.7).
-const STAGES: [Stage; 10] = [
+const STAGES: [Stage; 11] = [
     Stage::Stop,
     Stage::Replies,
     Stage::Children,
     Stage::Handles,
     Stage::Space,
     Stage::Buffers,
+    Stage::Mappings,
     Stage::Frames,
     Stage::Quota,
     Stage::Notify,
@@ -271,6 +277,8 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         Stage::Space => unsafe { release_space(p) },
         // SAFETY: as above.
         Stage::Buffers => unsafe { release_buffers(process, r) },
+        // SAFETY: as above.
+        Stage::Mappings => unsafe { super::maps::release_all(process, r) },
         // SAFETY: as above; the stage Space is over, so no TLB entry
         // maps the frames.
         Stage::Frames => unsafe {

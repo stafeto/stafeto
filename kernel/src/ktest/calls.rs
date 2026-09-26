@@ -17,7 +17,10 @@
 //! reach: a ceiling below 63, while children have no code yet (spec 15.2);
 //! a full table; a spent quota; who pays; and counts of live objects.
 
-use super::{CAUSE, CHILD_QUOTA, QUOTA, check, nothing_pending, wait_for_timer};
+use super::{
+    CAUSE, CHILD_QUOTA, PAGE, QUOTA, check, nothing_pending, read_user, registers, translates,
+    wait_for_timer,
+};
 use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel::{self, Channel};
@@ -25,23 +28,24 @@ use crate::cleanup;
 use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
-use crate::process::{self, Process};
+use crate::process::{self, Process, Stage};
 use crate::session::{self, Session};
 use crate::thread::{self, Long, THREADS, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
-    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
-    INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo,
-    NO_WAIT, Notification, OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState,
-    Rights, START_CHANNEL, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS,
+    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS,
+    MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy, ProcessHandles,
+    ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
-use kcore::layout::LINEAR_BASE;
+use kcore::layout::{GIB, LINEAR_BASE};
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
+use kcore::sync::Lock;
 use kcore::token::MAX_COUNT;
 
 const LIMIT: u32 = 16;
@@ -1004,11 +1008,21 @@ fn with_quota_left(
     left: u64,
     body: impl FnOnce() -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
-    let q = process::quota(c.process);
+    with_left(c.process, left, body)
+}
+
+/// Runs `body` with all but `left` bytes of the quota of `p` charged, and
+/// refunds the charge afterwards.
+fn with_left(
+    p: NonNull<Process>,
+    left: u64,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let q = process::quota(p);
     let rest = q.limit() - q.returned() - q.used() - left;
-    process::charge(c.process, rest).map_err(|_| "the rest of the quota did not charge")?;
+    process::charge(p, rest).map_err(|_| "the rest of the quota did not charge")?;
     let result = body();
-    process::refund(c.process, rest);
+    process::refund(p, rest);
     result
 }
 
@@ -2259,4 +2273,608 @@ pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str>
         memory::in_use() == objects,
         "the object of the call given up stayed",
     )
+}
+
+/// Pages of the objects of the tests of long changes of a mapping: four
+/// portions of process::PORTION.
+const LONG_PAGES: u64 = 128;
+
+/// A process with no thread for `c` to map into, the target of a change,
+/// and `c`'s handle to it with abi::OWNER_RIGHTS; the test keeps its own
+/// reference.
+fn target_of(c: &Caller) -> Result<(NonNull<Process>, Handle), &'static str> {
+    let t = process::create_root(QUOTA, LIMIT, CEILING).map_err(|_| "no process")?;
+    match c.insert(Object::Process(t), OWNER_RIGHTS) {
+        Ok(h) => Ok((t, h)),
+        Err(e) => {
+            // SAFETY: the process is the test's, and nothing uses it afterwards.
+            unsafe { process::release(t, CAUSE) };
+            Err(e)
+        }
+    }
+}
+
+/// Lets the test's reference to a target go; its teardown runs.
+fn release_target(t: NonNull<Process>) {
+    // SAFETY: the reference is the test's, and nothing uses it afterwards.
+    unsafe { process::release(t, CAUSE) };
+    cleanup::drain();
+}
+
+/// mem_map by `c` of `pages` pages of object `m` from page 0 at `va` of
+/// the process behind `target`, with `access`: 0 in x0 alone, however
+/// many entries it takes.
+fn map_whole(
+    c: &Caller,
+    target: Handle,
+    m: Handle,
+    pages: u64,
+    va: usize,
+    access: Access,
+) -> Result<(), &'static str> {
+    let n = Call::MemMap.number();
+    let args = [target.0, m.0, 0, pages * PAGE_SIZE, va as u64, access.raw()];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    if got == want {
+        return Ok(());
+    }
+    kprintln!("mem_map with {args:x?}: x0-x9 are {got:x?}");
+    Err("mem_map failed")
+}
+
+/// mem_unmap by `c` of the mapping of `pages` pages at `va` of the process
+/// behind `target`: 0 in x0 alone, however many entries it takes.
+fn unmap_whole(c: &Caller, target: Handle, pages: u64, va: usize) -> Result<(), &'static str> {
+    let n = Call::MemUnmap.number();
+    let args = [target.0, va as u64, pages * PAGE_SIZE];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    check(got == want, "mem_unmap failed")
+}
+
+/// Whether page `va` of `p` translates.
+fn mapped(p: NonNull<Process>, va: usize) -> bool {
+    process::translate(p, va).is_some()
+}
+
+/// A mapping's tables are the target's to pay for, whoever maps (spec
+/// 7.5): a caller maps 4 pages of its object into a new process, and every
+/// frame the call took, the tables and the page of the pool that holds the
+/// table of mappings, is charged to that process; the caller's quota does
+/// not move.
+pub fn mapping_tables_are_paid_by_the_target(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 4)?;
+        let (t, th) = target_of(c)?;
+        let (own, used, free) = (
+            process::quota(c.process).used(),
+            process::quota(t).used(),
+            phys::free_frames(),
+        );
+        let result = map_whole(c, th, h, 4, USER_VA, Access::ReadWrite);
+        let taken = free - phys::free_frames();
+        let charged = process::quota(t).used() - used;
+        let paid = process::quota(c.process).used() - own;
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result?;
+        check(
+            taken >= 4 && charged == taken * PAGE_SIZE,
+            "the tables and the table of mappings were not charged to the target",
+        )?;
+        check(paid == 0, "the caller paid for the target's mapping")
+    })
+}
+
+/// A mapping whose tables do not fit in the target's quota maps nothing
+/// (spec 7.5, 11): with a page less than the most tables a page may take,
+/// 3, left in the quota of the target, mem_map of a page in a region of
+/// 512 GiB with no table yet fails with NO_MEMORY in x0 alone, the page
+/// does not translate, the quota is what it was, and no entry stays; with
+/// the three pages left it maps and takes all three. Then 63 more
+/// mappings of the page in that region, whose tables are there, fill the
+/// table of mappings, and with two pages left a 65th fails with
+/// LIMIT_REACHED in x0 alone: the place in the table comes before the
+/// charge for tables (spec 11). A mapping made and unmapped first leaves
+/// the table of mappings.
+pub fn map_that_does_not_fit_maps_nothing(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, m) = make_memory(c, 1)?;
+        let (t, th) = target_of(c)?;
+        let far = USER_VA + 512 * GIB as usize;
+        let result = map_whole(c, th, h, 1, USER_VA, Access::Read)
+            .and_then(|()| unmap_whole(c, th, 1, USER_VA))
+            .and_then(|()| no_room_cases(c, t, th, h, m, far));
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result
+    })
+}
+
+fn no_room_cases(
+    c: &Caller,
+    t: NonNull<Process>,
+    th: Handle,
+    h: Handle,
+    m: NonNull<Memory>,
+    far: usize,
+) -> Result<(), &'static str> {
+    let n = Call::MemMap.number();
+    let args = [th.0, h.0, 0, PAGE_SIZE, far as u64, Access::Read.raw()];
+    let used = process::quota(t).used();
+    with_left(t, 2 * PAGE_SIZE, || c.fails(n, &args, Error::NoMemory))?;
+    check(
+        !mapped(t, far)
+            && process::quota(t).used() == used
+            && process::mappings(t) == 0
+            && memory::info(m).mappings == 0,
+        "a mapping that did not fit left a page, a charge or an entry",
+    )?;
+    with_left(t, 3 * PAGE_SIZE, || c.succeeds(n, &args, &[]))?;
+    check(mapped(t, far), "a mapping whose tables fit did not map")?;
+    let at = |i: usize| far + i * PAGE;
+    let full = (1..abi::MAX_MAPPINGS as usize)
+        .try_for_each(|i| map_whole(c, th, h, 1, at(i), Access::Read));
+    let beyond = [
+        th.0,
+        h.0,
+        0,
+        PAGE_SIZE,
+        at(abi::MAX_MAPPINGS as usize) as u64,
+        Access::Read.raw(),
+    ];
+    let limit = full.and_then(|()| {
+        with_left(t, 2 * PAGE_SIZE, || {
+            c.fails(n, &beyond, Error::LimitReached)
+        })
+    });
+    for i in 0..abi::MAX_MAPPINGS as usize {
+        if process::mapping(t, at(i), 1).is_some() {
+            unmap_whole(c, th, 1, at(i))?;
+        }
+    }
+    limit
+}
+
+/// A mapping gives back what it paid for tables and did not take (spec
+/// 7.5): the first page in a new region takes three tables and the table
+/// of mappings, and the target is charged for exactly what the call took;
+/// the next page of the region, whose bound is three tables too, takes
+/// none and leaves the quota of the target as it was.
+pub fn prepaid_tables_come_back(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 2)?;
+        let (t, th) = target_of(c)?;
+        let (used, free) = (process::quota(t).used(), phys::free_frames());
+        let first = map_whole(c, th, h, 1, USER_VA, Access::Read);
+        let (taken, charged) = (free - phys::free_frames(), process::quota(t).used() - used);
+        let (used, free) = (process::quota(t).used(), phys::free_frames());
+        let second = first.and_then(|()| map_whole(c, th, h, 1, USER_VA + PAGE, Access::Read));
+        let again = (free - phys::free_frames(), process::quota(t).used() - used);
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        second?;
+        check(
+            taken >= 4 && charged == taken * PAGE_SIZE,
+            "the target was not charged for exactly what its first mapping took",
+        )?;
+        check(
+            again == (0, 0),
+            "a mapping that took no table kept a charge for tables",
+        )
+    })
+}
+
+/// A mem_map whose caller's process ends between two portions keeps the
+/// pages it mapped (spec 7.7): with an interrupt pending all along, two
+/// entries map two portions of an object of LONG_PAGES pages into a
+/// target whose tables exist, each counting toward the longest portion
+/// (KERNEL_STATS x5); once the caller's process went, the target has a
+/// mapping of those pages alone, idle, which holds the object, the rest
+/// does not translate, and what the call paid for tables came back.
+pub fn abandoned_map_keeps_its_prefix(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let c = Caller::new()?;
+    let result = abandoned_map(&c);
+    c.release();
+    result?;
+    check(
+        memory::in_use() == objects,
+        "the object stayed after its mapping went",
+    )
+}
+
+fn abandoned_map(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let done = 2 * u64::from(process::PORTION);
+    let n = Call::MemMap.number();
+    let args = [
+        th.0,
+        h.0,
+        0,
+        LONG_PAGES * PAGE_SIZE,
+        USER_VA as u64,
+        Access::ReadWrite.raw(),
+    ];
+    let result = map_whole(c, th, h, 1, USER_VA, Access::Read)
+        .and_then(|()| unmap_whole(c, th, 1, USER_VA))
+        .and_then(|()| {
+            let used = process::quota(t).used();
+            let mut counted = 0;
+            with_interrupt_pending(|| {
+                cleanup::take_longest();
+                c.call(n, &args);
+                c.again(n);
+                counted = cleanup::longest();
+                Ok(())
+            })?;
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+            cleanup::drain();
+            check(
+                counted > 0,
+                "the portions of mem_map did not count toward the longest portion",
+            )?;
+            let kept = process::mapping(t, USER_VA, done);
+            check(
+                kept.is_some_and(|k| !k.is_busy() && k.object == m && k.offset == 0),
+                "the mapping did not keep its mapped pages alone, idle",
+            )?;
+            check(
+                mapped(t, USER_VA + (done as usize - 1) * PAGE)
+                    && !mapped(t, USER_VA + done as usize * PAGE)
+                    && memory::info(m).mappings == 1,
+                "the pages of the mapping do not translate as it says",
+            )?;
+            check(
+                process::quota(t).used() == used,
+                "what the call paid for tables did not come back",
+            )
+        });
+    release_target(t);
+    result
+}
+
+/// A mem_unmap whose caller's process ends between two portions keeps the
+/// pages it did not unmap (spec 7.7): with an interrupt pending all along,
+/// two entries unmap two portions of a mapping of LONG_PAGES pages; once
+/// the caller's process went, the mapping starts past them with the rest
+/// of the pages and their offset in the object, idle, and only those
+/// translate.
+pub fn abandoned_unmap_keeps_the_rest(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let result = abandoned_unmap(&c);
+    c.release();
+    result
+}
+
+fn abandoned_unmap(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let done = 2 * u64::from(process::PORTION);
+    let rest = USER_VA + done as usize * PAGE;
+    let n = Call::MemUnmap.number();
+    let args = [th.0, USER_VA as u64, LONG_PAGES * PAGE_SIZE];
+    let result = map_whole(c, th, h, LONG_PAGES, USER_VA, Access::ReadWrite).and_then(|()| {
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            c.again(n);
+            Ok(())
+        })?;
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
+        let kept = process::mapping(t, rest, LONG_PAGES - done);
+        check(
+            kept.is_some_and(|k| !k.is_busy() && k.object == m && u64::from(k.offset) == done),
+            "the mapping did not keep the pages the call did not unmap, idle",
+        )?;
+        check(
+            !mapped(t, USER_VA) && !mapped(t, rest - PAGE) && mapped(t, rest),
+            "the pages of the mapping do not translate as it says",
+        )
+    });
+    release_target(t);
+    result
+}
+
+/// A mem_protect whose caller's process ends between two portions leaves
+/// its mapping idle (spec 7.7): with an interrupt pending all along, two
+/// entries give two portions of a mapping of LONG_PAGES pages, RW, access
+/// R; once the caller's process went, the mapping is whole and idle, and
+/// the pages of those portions show R and the rest RW.
+pub fn abandoned_protect_goes_idle(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let result = abandoned_protect(&c);
+    c.release();
+    result
+}
+
+fn abandoned_protect(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let done = 2 * u64::from(process::PORTION);
+    let n = Call::MemProtect.number();
+    let args = [
+        th.0,
+        USER_VA as u64,
+        LONG_PAGES * PAGE_SIZE,
+        Access::Read.raw(),
+    ];
+    let result = map_whole(c, th, h, LONG_PAGES, USER_VA, Access::ReadWrite).and_then(|()| {
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            c.again(n);
+            Ok(())
+        })?;
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
+        let kept = process::mapping(t, USER_VA, LONG_PAGES);
+        check(
+            kept.is_some_and(|k| !k.is_busy() && k.object == m),
+            "the mapping of an abandoned mem_protect did not go idle",
+        )?;
+        let shows = |page: u64, attrs: Attrs| {
+            process::translate(t, USER_VA + page as usize * PAGE)
+                .is_some_and(|(pa, d)| d == page_descriptor(pa, attrs))
+        };
+        check(
+            shows(0, Attrs::USER_RODATA)
+                && shows(done - 1, Attrs::USER_RODATA)
+                && shows(done, Attrs::USER_DATA)
+                && shows(LONG_PAGES - 1, Attrs::USER_DATA),
+            "the pages of an abandoned mem_protect do not show the access its portions gave",
+        )
+    });
+    release_target(t);
+    result
+}
+
+/// A target that ends between two portions of a mem_map ends the call
+/// (spec 7.7): its teardown takes the busy entry with the rest, and the
+/// next entry of the call fails with BAD_STATE in x0 alone, with no long
+/// call left. The mapping starts a portion below a bound of 2 MiB, so that
+/// the first portion takes three tables and leaves a page of what the
+/// call paid for tables: what the call paid and did not take goes back to
+/// the target, whose shell goes with its quota whole, and the object and
+/// the target leave their pools.
+pub fn dying_target_ends_the_map(_: &Boot) -> Result<(), &'static str> {
+    let (objects, processes) = (memory::in_use(), process::in_use());
+    with_caller(|c| {
+        let (h, m) = make_memory(c, LONG_PAGES)?;
+        let (t, th) = target_of(c)?;
+        let n = Call::MemMap.number();
+        let args = [
+            th.0,
+            h.0,
+            0,
+            LONG_PAGES * PAGE_SIZE,
+            (USER_VA + (2 << 20) - process::PORTION as usize * PAGE) as u64,
+            Access::ReadWrite.raw(),
+        ];
+        let mut last = [0; 10];
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(t, ProcessState::Killed, CAUSE) };
+            cleanup::drain();
+            last = c.again(n);
+            Ok(())
+        })?;
+        let mappings = memory::info(m).mappings;
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        let mut want = with_marks(&args);
+        want[0] = Error::BadState.code();
+        check(
+            last == want && thread::long(c.thread).is_none(),
+            "the call did not end with BAD_STATE alone",
+        )?;
+        check(mappings == 0, "the teardown of the target kept the entry")
+    })?;
+    check(
+        memory::in_use() == objects && process::in_use() == processes,
+        "the object or the target stayed",
+    )
+}
+
+/// What `exec_mapping_syncs_the_instruction_cache` watches through the
+/// test points code_synced and code_mapped (arch::cache,
+/// process::maps): the frames made coherent so far, the frames whose
+/// executable pages were mapped after that and before, and the calls that
+/// made frames coherent, one a portion.
+struct CodeWatch {
+    on: bool,
+    synced: [u64; 16],
+    count: usize,
+    mapped: usize,
+    early: usize,
+    calls: usize,
+}
+
+static CODE: Lock<CodeWatch> = Lock::new(CodeWatch {
+    on: false,
+    synced: [0; 16],
+    count: 0,
+    mapped: 0,
+    early: 0,
+    calls: 0,
+});
+
+/// The instruction cache was made coherent for `frames`
+/// (testpoint::code_synced).
+pub fn code_synced(frames: &[u64]) {
+    let mut w = CODE.lock();
+    if w.on {
+        w.calls += 1;
+        for &f in frames {
+            if w.count < w.synced.len() {
+                let i = w.count;
+                w.synced[i] = f;
+                w.count += 1;
+            }
+        }
+    }
+}
+
+/// Descriptors that let a program execute `frames` were written
+/// (testpoint::code_mapped): each frame counts as mapped after its
+/// coherence or before it.
+pub fn code_mapped(frames: &[u64]) {
+    let mut w = CODE.lock();
+    if w.on {
+        for f in frames {
+            if w.synced[..w.count].contains(f) {
+                w.mapped += 1;
+            } else {
+                w.early += 1;
+            }
+        }
+    }
+}
+
+/// Code runs from a page only after the instruction cache is coherent for
+/// its frame (spec 7.4, [G18]): mem_map RX of an object of 12 pages, a
+/// portion of process::EXEC_PORTION and one of 4, and mem_protect to RX of
+/// a mapping of another object of 3 pages, one portion, make each frame
+/// coherent before the descriptor of its page is written, once a portion.
+/// QEMU has no caches, so only the test points show the order.
+pub fn exec_mapping_syncs_the_instruction_cache(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (code, _) = make_memory(c, 12)?;
+        let (data, _) = make_memory(c, 3)?;
+        let protect = Call::MemProtect.number();
+        let data_va = USER_VA + 16 * PAGE;
+        *CODE.lock() = CodeWatch {
+            on: true,
+            synced: [0; 16],
+            count: 0,
+            mapped: 0,
+            early: 0,
+            calls: 0,
+        };
+        let result = map_whole(c, own, code, 12, USER_VA, Access::ReadExec)
+            .and_then(|()| map_whole(c, own, data, 3, data_va, Access::ReadWrite))
+            .and_then(|()| {
+                let args = [own.0, data_va as u64, 3 * PAGE_SIZE, Access::ReadExec.raw()];
+                c.succeeds(protect, &args, &[])
+            });
+        let watch = {
+            let mut w = CODE.lock();
+            w.on = false;
+            (w.count, w.mapped, w.early, w.calls)
+        };
+        for h in [own, code, data] {
+            c.close(h)?;
+        }
+        result?;
+        check(
+            watch == (15, 15, 0, 3),
+            "a page became executable before its frame was coherent, or not a portion at a time",
+        )
+    })
+}
+
+/// The mappings of a process go after its ASID (spec 7.7): a process with
+/// one mapping ends, and its portions run one at a time; its entry leaves
+/// the table only once its space went with the ASID at the stage Space,
+/// and at the stage Mappings.
+pub fn mappings_go_after_the_asid(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, m) = make_memory(c, 1)?;
+        let (t, th) = target_of(c)?;
+        let result = map_whole(c, th, h, 1, USER_VA, Access::Read).and_then(|()| {
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(t, ProcessState::Killed, CAUSE) };
+            let mut order = Ok(());
+            for _ in 0..64 {
+                let stage = process::progress(t).0;
+                cleanup::portion();
+                if process::mappings(t) == 0 {
+                    order = check(
+                        stage == Stage::Mappings && !mapped(t, USER_VA),
+                        "the mappings went before the space and its ASID",
+                    );
+                    break;
+                }
+            }
+            order.and(check(
+                memory::info(m).mappings == 0,
+                "the teardown kept the mapping",
+            ))
+        });
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result
+    })
+}
+
+/// An unmapped page no longer translates (spec 7.4): a page of an object
+/// mapped RW into the caller's process, whose space runs in TTBR0, reads
+/// its pattern, which puts it in the TLB; mem_unmap takes it, neither EL0
+/// nor the kernel translates it, the tables hold nothing there, and a
+/// second mem_unmap fails with INVALID_ARGS alone. A page of another
+/// object mapped at the same address shows through at once: a TLB entry
+/// the unmap left would still show the first one, since QEMU keeps its
+/// translations until a TLBI.
+pub fn unmapped_page_no_longer_translates(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (first, a) = make_memory(c, 1)?;
+        let (second, b) = make_memory(c, 1)?;
+        for (m, pattern) in [(a, 0xC3), (b, 0xE5)] {
+            let pa = memory::frame(m, 0);
+            for i in 0..PAGE_SIZE / 8 {
+                // SAFETY: the frame is the object's, which the test holds,
+                // and the linear map reaches it.
+                unsafe { ((LINEAR_BASE + (pa + i * 8) as usize) as *mut u64).write(pattern) };
+            }
+        }
+        let result = map_whole(c, own, first, 1, USER_VA, Access::ReadWrite)
+            .and_then(|()| check_unmap(c, own, second));
+        for h in [own, first, second] {
+            c.close(h)?;
+        }
+        result
+    })
+}
+
+fn check_unmap(c: &Caller, own: Handle, second: Handle) -> Result<(), &'static str> {
+    // SAFETY: the process is the test's, and nothing runs it.
+    unsafe { (*c.process.as_ptr()).activate() };
+    // The read brings the page into the TLB, which the unmap must drop.
+    check(read_user(USER_VA) == 0xC3, "the page misses its contents")?;
+    unmap_whole(c, own, 1, USER_VA)?;
+    check(
+        !translates(registers::at_s1e0r(USER_VA)) && !translates(registers::at_s1e1r(USER_VA)),
+        "an unmapped page still translates",
+    )?;
+    check(
+        !mapped(c.process, USER_VA),
+        "the tables still hold an unmapped page",
+    )?;
+    let args = [own.0, USER_VA as u64, PAGE_SIZE];
+    c.fails(Call::MemUnmap.number(), &args, Error::InvalidArgs)?;
+    // Another frame at the same address shows through at once.
+    map_whole(c, own, second, 1, USER_VA, Access::ReadWrite)?;
+    let seen = read_user(USER_VA);
+    unmap_whole(c, own, 1, USER_VA)?;
+    check(seen == 0xE5, "the TLB still holds the unmapped page")
 }

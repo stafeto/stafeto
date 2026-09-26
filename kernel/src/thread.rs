@@ -24,9 +24,9 @@ use crate::cleanup::{self, Item};
 use crate::memory::{self, Memory};
 use crate::mm::phys::{self, Frame};
 use crate::object::{self, Live, Moving, Object, Refs};
-use crate::process::{self, Process};
+use crate::process::{self, Change, Process};
 use crate::sched::{self, Tokens};
-use abi::{Call, Error, MESSAGE_HANDLES, Policy, msgbuf};
+use abi::{Access, Call, Error, MESSAGE_HANDLES, Policy, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
 use kcore::notify::Slot;
@@ -68,8 +68,8 @@ pub struct Thread {
     transit: Moving,
     /// The long call it is making (spec 7.7), from the first entry of its
     /// `svc` to its last portion; a thread that ends midway lets it go with
-    /// its buffer (`drop_long`). Only `begin_long`, `end_long` and
-    /// `drop_long` change it.
+    /// its buffer (`drop_long`). Only `begin_long`, `update_long`,
+    /// `end_long` and `drop_long` change it.
     long: Option<Long>,
     /// Its number in the system table (spec 6.1, 7.8), from `create` until
     /// it ends (sched::exit) or, when it never started, until its portion
@@ -103,6 +103,18 @@ pub enum Long {
     /// mem_create: the object being made, whose only reference this is
     /// until the object is whole and a handle takes its place.
     Create(NonNull<Memory>),
+    /// mem_map: the new entry, busy, whose pages it maps with `access`;
+    /// `prepaid` bytes of the quota of the target are charged for tables
+    /// and not spent yet (process::maps).
+    Map {
+        on: Change,
+        access: Access,
+        prepaid: u64,
+    },
+    /// mem_unmap: the entry, busy, whose pages it unmaps.
+    Unmap { on: Change },
+    /// mem_protect: the entry, busy, whose pages it gives `access`.
+    Protect { on: Change, access: Access },
 }
 
 impl Long {
@@ -110,6 +122,9 @@ impl Long {
     pub fn call(self) -> Call {
         match self {
             Long::Create(_) => Call::MemCreate,
+            Long::Map { .. } => Call::MemMap,
+            Long::Unmap { .. } => Call::MemUnmap,
+            Long::Protect { .. } => Call::MemProtect,
         }
     }
 }
@@ -315,6 +330,13 @@ pub unsafe fn drop_buffer(t: NonNull<Thread>, cause: u8) {
     unsafe { phys::free(frame, process::account(p)) };
 }
 
+/// The page of the message buffer of `t`, which the caller holds, while
+/// the thread has one (spec 6.2).
+pub fn buffer_page(t: NonNull<Thread>) -> Option<usize> {
+    // SAFETY: the caller holds the thread; only the field is read.
+    unsafe { (*t.as_ptr()).buffer.as_ref() }.map(|b| b.va)
+}
+
 /// Copies bytes `range` of the message buffer of `from` to the same
 /// offsets of that of `to` (spec 6.2): bytes 64 up to the length of a
 /// message, at most 960, frame to frame through the linear map; the kernel
@@ -398,6 +420,15 @@ pub fn begin_long(t: NonNull<Thread>, long: Long) {
     *field = Some(long);
 }
 
+/// The long call of `t`, the running thread, came one portion further:
+/// `long` takes the place of what the thread held (`begin_long`).
+pub fn update_long(t: NonNull<Thread>, long: Long) {
+    // SAFETY: the running thread is alive; only the field is touched.
+    let field = unsafe { &mut (*t.as_ptr()).long };
+    assert!(field.is_some(), "a thread goes on with no long call");
+    *field = Some(long);
+}
+
 /// The long call of `t`, the running thread, ended in its last portion:
 /// what it held is the caller's (spec 7.7).
 pub fn end_long(t: NonNull<Thread>) -> Option<Long> {
@@ -405,9 +436,11 @@ pub fn end_long(t: NonNull<Thread>) -> Option<Long> {
     unsafe { (*t.as_ptr()).long.take() }
 }
 
-/// The long call of `t` stops for good (spec 7.7): what it held goes, the
-/// object of a mem_create released at `cause`. Returns the units of work
-/// it took: 1 with a call, 0 without. O(1).
+/// The long call of `t` stops for good (spec 7.7): what it held goes at
+/// `cause`, the object of a mem_create, or what a change of a mapping did
+/// so far stays in its entry and the rest of its prepaid tables goes back
+/// (process::abandon_change), and then its reference to the target process.
+/// Returns the units of work it took: 1 with a call, 0 without. O(1).
 ///
 /// # Safety
 /// `t` is alive, and nothing uses what its call held afterwards.
@@ -417,6 +450,15 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) -> usize {
         Some(Long::Create(m)) => {
             // SAFETY: the call held the object's reference, which goes.
             unsafe { memory::release(m, cause) };
+            1
+        }
+        Some(long @ (Long::Map { on, .. } | Long::Unmap { on } | Long::Protect { on, .. })) => {
+            // SAFETY: nothing uses the call afterwards, and its reference to
+            // the process goes last.
+            unsafe {
+                process::abandon_change(long, cause);
+                process::release(on.target, cause);
+            }
             1
         }
         None => 0,

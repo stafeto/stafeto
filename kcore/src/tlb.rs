@@ -17,13 +17,9 @@ pub trait Mmu {
     fn ttbr0(&self) -> u64;
     /// `msr ttbr0_el1; isb`
     fn set_ttbr0(&mut self, ttbr: u64);
-    /// `dsb ishst; isb`: earlier table stores reach the table walker.
-    fn tables_written(&mut self);
     /// `dsb nshst; tlbi vmalle1; dsb nsh; isb`: every EL1&0 entry of this
     /// CPU, after earlier table stores reach its walker.
     fn flush_all(&mut self);
-    /// `dsb ishst; tlbi vale1is; dsb ish; isb`; `operand` from `tlbi_page`.
-    fn invalidate_page(&mut self, operand: u64);
     /// `dsb ishst; tlbi aside1is; dsb ish; isb`, walk-cache entries
     /// included; `operand` from `tlbi_asid`.
     fn invalidate_asid(&mut self, operand: u64);
@@ -59,27 +55,16 @@ pub fn switch_to(
     mmu.set_ttbr0(ttbr0(root, act.asid));
 }
 
-/// Drops the TLB entry of the page at `va` once the tables of the space
-/// with `tag` no longer map it, and makes the store that cleared its
-/// descriptor reach the table walker before this returns. Without an ASID
-/// of this generation the TLB holds nothing of the space (the flush that
-/// began the generation dropped it), so only the barrier is left: the next
-/// activation may put the tables into TTBR0 with no barrier of its own.
-pub fn forget_page(asids: &AsidAllocator, tag: &AsidTag, va: u64, mmu: &mut impl Mmu) {
-    match asids.current(tag) {
-        Some(asid) => mmu.invalidate_page(tlbi_page(va, asid)),
-        None => mmu.tables_written(),
-    }
-}
-
 /// Drops the TLB entries of the `pages` pages from `start` once the tables
 /// of the space with `tag` no longer map them, or map them with other
-/// rights (spec 7.4, 7.7): one `dsb ishst` for the stores, a `tlbi
-/// vale1is` a page, and one `dsb ish` after the last, with no `isb`
-/// ([G13], [G15]). Without an ASID of this generation the TLB holds
-/// nothing of the space, and only the barrier is left, as in
-/// `forget_page`. O(pages): the caller keeps `pages` within a portion
-/// (spec 7.7).
+/// rights (spec 7.4, 7.7), and makes the stores that changed their
+/// descriptors reach the table walker before this returns: one `dsb
+/// ishst` for the stores, a `tlbi vale1is` a page, and one `dsb ish` after
+/// the last, with no `isb` ([G13], [G15]). Without an ASID of this
+/// generation the TLB holds nothing of the space (the flush that began the
+/// generation dropped it), so only the barrier is left: the next
+/// activation may put the tables into TTBR0 with no barrier of its own.
+/// O(pages): the caller keeps `pages` within a portion (spec 7.7).
 pub fn forget_range(
     asids: &AsidAllocator,
     tag: &AsidTag,
@@ -125,9 +110,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum Op {
         SetTtbr0(u64),
-        TablesWritten,
         FlushAll,
-        InvalidatePage(u64),
         InvalidateAsid(u64),
         UserTablesWritten,
         InvalidateUserPage(u64),
@@ -149,14 +132,8 @@ mod tests {
             self.ttbr0 = ttbr;
             self.ops.push(Op::SetTtbr0(ttbr));
         }
-        fn tables_written(&mut self) {
-            self.ops.push(Op::TablesWritten);
-        }
         fn flush_all(&mut self) {
             self.ops.push(Op::FlushAll);
-        }
-        fn invalidate_page(&mut self, operand: u64) {
-            self.ops.push(Op::InvalidatePage(operand));
         }
         fn invalidate_asid(&mut self, operand: u64) {
             self.ops.push(Op::InvalidateAsid(operand));
@@ -210,33 +187,12 @@ mod tests {
         retire(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
         assert_eq!(log.ops, [Op::InvalidateAsid(tlbi_asid(1))]);
         log.ops.clear();
-        forget_page(&asids, &other, PAGES[0], &mut log);
+        forget_range(&asids, &other, PAGES[0], 1, &mut log);
         retire(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
         assert_eq!(
             log.ops,
-            [Op::TablesWritten],
+            [Op::UserTablesWritten],
             "a retired space touched the TLB"
-        );
-    }
-
-    /// An unmap ends with a barrier whether or not the space has an ASID
-    /// of this generation: with one the barrier leads the TLBI, without one
-    /// it stands alone.
-    #[test]
-    fn forget_page_always_ends_the_table_store() {
-        let mut asids = AsidAllocator::new(8);
-        let mut log = Log::default();
-        let (mut ran, never_ran) = (AsidTag::default(), AsidTag::default());
-        switch_to(&mut asids, &mut ran, 0x5000, EMPTY, &mut log);
-        log.ops.clear();
-        forget_page(&asids, &ran, PAGES[0], &mut log);
-        forget_page(&asids, &never_ran, PAGES[0], &mut log);
-        assert_eq!(
-            log.ops,
-            [
-                Op::InvalidatePage(tlbi_page(PAGES[0], 1)),
-                Op::TablesWritten
-            ]
         );
     }
 
@@ -361,24 +317,11 @@ mod tests {
             self.ttbr0 = ttbr;
             self.walk();
         }
-        fn tables_written(&mut self) {
-            self.walk();
-            self.stale.clear();
-            self.walk();
-        }
         // Each TLBI below begins with a barrier for the table stores.
         fn flush_all(&mut self) {
             self.walk();
             self.stale.clear();
             self.tlb.clear();
-            self.walk();
-        }
-        fn invalidate_page(&mut self, operand: u64) {
-            self.walk();
-            self.stale.clear();
-            let asid = (operand >> 48) as u16;
-            let page = operand & ((1 << 44) - 1);
-            self.tlb.retain(|&(a, _, va)| a != asid || va >> 12 != page);
             self.walk();
         }
         fn invalidate_asid(&mut self, operand: u64) {
@@ -389,7 +332,9 @@ mod tests {
             self.walk();
         }
         fn user_tables_written(&mut self) {
-            self.tables_written();
+            self.walk();
+            self.stale.clear();
+            self.walk();
         }
         fn invalidate_user_page(&mut self, operand: u64) {
             self.walk();
@@ -418,7 +363,7 @@ mod tests {
         m.tables.insert(0x5000, (1, PAGES.into_iter().collect()));
         let mut tag = AsidTag::default();
         assert!(m.unmap(0x5000, PAGES[0]));
-        forget_page(&asids, &tag, PAGES[0], &mut m);
+        forget_range(&asids, &tag, PAGES[0], 1, &mut m);
         switch_to(&mut asids, &mut tag, 0x5000, EMPTY, &mut m);
         m.check(0);
     }
@@ -464,10 +409,10 @@ mod tests {
                 0 => {
                     let va = PAGES[(x >> 32) as usize % PAGES.len()];
                     if m.unmap(s.root, va) {
-                        forget_page(&asids, &s.tag, va, &mut m);
+                        forget_range(&asids, &s.tag, va, 1, &mut m);
                         assert!(
-                            m.stale.is_empty(),
-                            "step {step}: the walker may still see page {va:#x} after forget_page"
+                            m.stale.is_empty() && m.pending.is_empty(),
+                            "step {step}: the walker or a TLBI may still keep page {va:#x} after forget_range"
                         );
                     }
                 }

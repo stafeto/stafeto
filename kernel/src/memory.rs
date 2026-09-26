@@ -13,10 +13,12 @@
 //! with interrupts polled between them (spec 7.7): meanwhile the reference
 //! `create` hands out, which the thread that makes the object holds
 //! (thread::Long::Create), is its only one, and no handle names it. An
-//! object lives while references to it are left: its handles and that
-//! one. The last one queues it for cleanup, whose portions give its frames
-//! back, up to kcore::pagelist::RELEASE_STEP a portion, and then its place
-//! and its budget.
+//! object lives while references to it are left: its handles, that one,
+//! and each of its mappings (process::maps), which shows its frames to a
+//! program and counts in object_info MEMORY. The last one queues it for
+//! cleanup, whose portions give its frames back, up to
+//! kcore::pagelist::RELEASE_STEP a portion, and then its place and its
+//! budget.
 
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame, LinearMem};
@@ -44,7 +46,8 @@ pub struct Memory {
     /// Its handles, and the reference `create` hands out while the object
     /// is made: the references that keep it.
     refs: Refs,
-    /// Its mappings now (object_info MEMORY).
+    /// Its mappings now (object_info MEMORY): only `retain_mapping` and
+    /// `release_mapping` change it.
     mappings: u32,
     /// The process whose pool holds it and whose quota paid its budget; the
     /// object holds its shell until the place goes back.
@@ -143,6 +146,25 @@ pub fn fill(m: NonNull<Memory>) -> bool {
     }
 }
 
+/// The pages of `m`, which the caller holds: its size in pages (spec 7.3).
+pub fn pages(m: NonNull<Memory>) -> usize {
+    // SAFETY: the caller holds a reference to the object; only the field is
+    // read.
+    let Backing::Owned(list) = unsafe { &(*m.as_ptr()).backing };
+    list.pages()
+}
+
+/// The frame of page `i` of `m`, a whole object that the caller holds
+/// (spec 7.4): mem_map shows it at a page of a program. At most two reads
+/// of the nodes of its list, through the linear map.
+pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
+    // SAFETY: the caller holds a reference to the object; the list only
+    // reads its nodes, and the budget is borrowed for its type alone.
+    let (backing, budget) = unsafe { (&(*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
+    let Backing::Owned(list) = backing;
+    list.frame(&Budget(budget), i)
+}
+
 /// object_info MEMORY of `m`, which the caller holds (spec 11): its size in
 /// bytes, the pages whose frames it owns, every page once it is whole, and
 /// its mappings.
@@ -173,6 +195,29 @@ pub fn retain(m: NonNull<Memory>) {
     // SAFETY: the caller holds a reference to the object; only the count is
     // touched.
     unsafe { refs(m) }.retain();
+}
+
+/// Adds the reference of a new mapping of `m` (process::maps), which the
+/// caller holds: the object lives while it is mapped anywhere, and
+/// object_info MEMORY counts its mappings (spec 4, 11).
+pub fn retain_mapping(m: NonNull<Memory>) {
+    retain(m);
+    // SAFETY: the caller holds a reference to the object; only the field is
+    // touched.
+    unsafe { (*m.as_ptr()).mappings += 1 };
+}
+
+/// Drops the reference of a mapping of `m` that went, as `release` does.
+///
+/// # Safety
+/// As for `release`: the mapping held the reference.
+pub unsafe fn release_mapping(m: NonNull<Memory>, cause: u8) {
+    // SAFETY: the mapping's reference keeps the object alive until the
+    // release; only the field is touched.
+    unsafe {
+        (*m.as_ptr()).mappings -= 1;
+        release(m, cause);
+    }
 }
 
 /// Drops a reference to `m`; the last one queues the object for cleanup at
@@ -240,7 +285,7 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
 const _: () = assert!(core::mem::offset_of!(Memory, refs) >= 8);
 
 #[cfg(feature = "ktest")]
-pub use test_access::{filled, frame, in_use, payer};
+pub use test_access::{filled, in_use, payer};
 
 /// What the kernel tests read here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -257,16 +302,6 @@ mod test_access {
         // SAFETY: the test knows the object alive; only the field is read.
         let Backing::Owned(list) = unsafe { &(*m.as_ptr()).backing };
         list.filled()
-    }
-
-    /// The frame of page `i` of `m`, which the test holds, and which has
-    /// the frame.
-    pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
-        // SAFETY: as in `filled`; the list reads its nodes through the
-        // linear map.
-        let (backing, budget) = unsafe { (&(*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
-        let Backing::Owned(list) = backing;
-        list.frame(&Budget(budget), i)
     }
 
     /// The process that pays for `m`, which the test holds.

@@ -35,7 +35,7 @@ use kcore::layout::{
 };
 use kcore::memmap;
 use kcore::paging::{
-    Attrs, MAIR_DEVICE, MapError, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
+    Attrs, MAIR_DEVICE, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
 };
 use kcore::quota::Account;
 use kcore::sched::State;
@@ -130,10 +130,6 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "switching_spaces_switches_translations",
         switching_spaces_switches_translations,
-    ),
-    (
-        "unmapped_page_no_longer_translates",
-        unmapped_page_no_longer_translates,
     ),
     (
         "asid_rollover_hides_old_mappings",
@@ -335,6 +331,43 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "another_call_gives_the_long_call_up",
         calls::another_call_gives_the_long_call_up,
+    ),
+    (
+        "map_that_does_not_fit_maps_nothing",
+        calls::map_that_does_not_fit_maps_nothing,
+    ),
+    ("prepaid_tables_come_back", calls::prepaid_tables_come_back),
+    (
+        "mapping_tables_are_paid_by_the_target",
+        calls::mapping_tables_are_paid_by_the_target,
+    ),
+    (
+        "abandoned_map_keeps_its_prefix",
+        calls::abandoned_map_keeps_its_prefix,
+    ),
+    (
+        "abandoned_unmap_keeps_the_rest",
+        calls::abandoned_unmap_keeps_the_rest,
+    ),
+    (
+        "abandoned_protect_goes_idle",
+        calls::abandoned_protect_goes_idle,
+    ),
+    (
+        "dying_target_ends_the_map",
+        calls::dying_target_ends_the_map,
+    ),
+    (
+        "exec_mapping_syncs_the_instruction_cache",
+        calls::exec_mapping_syncs_the_instruction_cache,
+    ),
+    (
+        "mappings_go_after_the_asid",
+        calls::mappings_go_after_the_asid,
+    ),
+    (
+        "unmapped_page_no_longer_translates",
+        calls::unmapped_page_no_longer_translates,
     ),
 ];
 
@@ -1097,46 +1130,6 @@ fn check_two_spaces(first: u64, second: u64) -> Result<(), &'static str> {
     check(
         x.is_some() && y.is_some() && x != y && x != Some(0) && y != Some(0),
         "two live spaces share an ASID or run with the kernel's",
-    )
-}
-
-fn unmapped_page_no_longer_translates(_: &Boot) -> Result<(), &'static str> {
-    let frame = frame_with(0xC3)?;
-    let other = frame_with(0xE5)?;
-    let result = check_unmap(frame, other);
-    free_frame(frame);
-    free_frame(other);
-    result
-}
-
-fn check_unmap(frame: u64, other: u64) -> Result<(), &'static str> {
-    let mut space = new_space()?;
-    map(&mut space, USER_VA, frame, Attrs::USER_DATA)?;
-    space.activate();
-    // The read brings the page into the TLB, which the unmap must drop.
-    check(read_user(USER_VA) == 0xC3, "the page misses its contents")?;
-    check(
-        space.unmap(USER_VA) == Ok(frame),
-        "unmap did not return the page's frame",
-    )?;
-    check(
-        !translates(registers::at_s1e0r(USER_VA)) && !translates(registers::at_s1e1r(USER_VA)),
-        "an unmapped page still translates",
-    )?;
-    check(
-        space.translate(USER_VA).is_none(),
-        "the tables still hold an unmapped page",
-    )?;
-    check(
-        space.unmap(USER_VA) == Err(MapError::NotMapped),
-        "a page was unmapped twice",
-    )?;
-    // Another frame at the same address shows through at once; a TLB entry
-    // that the unmap left behind would still show the old one.
-    map(&mut space, USER_VA, other, Attrs::USER_DATA)?;
-    check(
-        read_user(USER_VA) == 0xE5,
-        "the TLB still holds the unmapped page",
     )
 }
 
@@ -1967,7 +1960,7 @@ fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), 
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 16,
+        process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 16,
         "the second portion of the stage Buffers did not give the other 3 back",
     )
 }
@@ -2057,8 +2050,13 @@ fn check_stages(
     check_space_steps(p, frames)?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 6 + 2,
+        process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 6 + 2,
         "the stage Buffers did not give the buffers back in one portion",
+    )?;
+    cleanup::portion();
+    check(
+        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 6 + 2,
+        "the stage Mappings of a process with no mapping took more than a portion",
     )?;
     cleanup::portion();
     check(

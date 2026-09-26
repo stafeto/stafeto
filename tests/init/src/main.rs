@@ -28,8 +28,8 @@
 #![no_main]
 
 use abi::{
-    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, MemoryInfo, Policy, ProcessHandles,
-    ProcessMemory, ProcessState, Rights, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, MemoryInfo, Policy,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Resource, Thread, Timer};
@@ -42,7 +42,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 110] = [
+const TESTS: [Test; 124] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -237,6 +237,50 @@ const TESTS: [Test; 110] = [
     (
         "memory_info_reports_size_pages_and_mappings",
         memory_info_reports_size_pages_and_mappings,
+    ),
+    ("mem_map_checks_its_arguments", mem_map_checks_its_arguments),
+    ("map_access_is_r_rw_or_rx", map_access_is_r_rw_or_rx),
+    (
+        "map_needs_the_rights_of_its_access",
+        map_needs_the_rights_of_its_access,
+    ),
+    (
+        "two_mappings_show_the_same_pages",
+        two_mappings_show_the_same_pages,
+    ),
+    (
+        "mem_unmap_takes_whole_mappings",
+        mem_unmap_takes_whole_mappings,
+    ),
+    (
+        "mem_protect_takes_whole_mappings_within_their_rights",
+        mem_protect_takes_whole_mappings_within_their_rights,
+    ),
+    ("mapping_limit_is_64", mapping_limit_is_64),
+    (
+        "buffer_page_cannot_be_mapped_over",
+        buffer_page_cannot_be_mapped_over,
+    ),
+    (
+        "buffer_page_cannot_be_unmapped",
+        buffer_page_cannot_be_unmapped,
+    ),
+    (
+        "buffer_page_cannot_be_protected",
+        buffer_page_cannot_be_protected,
+    ),
+    ("busy_mapping_is_bad_state", busy_mapping_is_bad_state),
+    (
+        "thread_buffer_cannot_land_in_a_mapping",
+        thread_buffer_cannot_land_in_a_mapping,
+    ),
+    (
+        "mapped_object_outlives_its_last_handle",
+        mapped_object_outlives_its_last_handle,
+    ),
+    (
+        "protect_to_exec_runs_new_code",
+        protect_to_exec_runs_new_code,
     ),
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
@@ -3370,6 +3414,690 @@ fn memory_info_cases(bare: u64, gone: u64) -> Outcome {
         wrong,
         "a handle of another kind or a closed one did not fail alone",
     )
+}
+
+// Mappings (spec 6.2, 7.4, 7.7).
+
+/// Where the tests of mappings show their objects: a gigabyte of init's
+/// space far from its program, its stack and its buffers.
+const WINDOW: usize = 0x40_0000_0000;
+/// The object of the tests of busy mappings: 64 MiB, whose mapping takes
+/// 512 portions, and the period of the timer that wakes a thread until it
+/// finds the mapping in the middle of them: long enough for the mapping to
+/// go on between two wakes under -icount.
+const BIG: u64 = 64 << 20;
+const PROBE_PERIOD_NS: u64 = 200_000;
+/// The timer of the tests of busy mappings, for the thread it wakes.
+static PROBE_TIMER: AtomicU64 = AtomicU64::new(0);
+/// `mov x0, #42` and `ret`: a function that returns 42.
+const RETURN_42: [u32; 2] = [0xD280_0540, 0xD65F_03C0];
+
+/// mem_map of `len` bytes of `m` from `offset` at `addr` of init.
+fn map(m: &Handle<Memory>, offset: u64, len: u64, addr: usize, access: Access) -> Outcome {
+    sys::mem_map(&init::PROCESS, m, offset, len, addr, access).map_err(|_| "mem_map failed")
+}
+
+/// mem_unmap of the mapping of init that is `len` bytes from `addr`.
+fn unmap(addr: usize, len: u64) -> Outcome {
+    // SAFETY: the tests unmap only their own windows, which nothing else
+    // uses.
+    unsafe { sys::mem_unmap(&init::PROCESS, addr, len) }.map_err(|_| "mem_unmap failed")
+}
+
+/// The tables and the table of mappings a page at `addr` needs are made:
+/// a page of an object is mapped there and unmapped, and the object goes.
+/// Tables stay until the space goes (spec 7.5), so a test that counts
+/// memory afterwards sees none of them come.
+fn warm(addr: usize) -> Outcome {
+    let m = memory_object(1)?;
+    map(&m, 0, PAGE as u64, addr, Access::Read)?;
+    unmap(addr, PAGE as u64)?;
+    close(m)
+}
+
+/// A child that ended, killed.
+fn ended_child() -> Result<Handle<Process>, &'static str> {
+    let c = child(LEVEL)?;
+    sys::process_kill(&c).map_err(|_| "process_kill failed")?;
+    Ok(c)
+}
+
+/// mem_map(x0 process with MANAGE, x1 memory object, x2 offset, x3 length,
+/// x4 address, x5 access) checks in the order of spec 11 and changes x0
+/// alone on an error: an offset, a length or an address off whole pages, a
+/// length of 0, a range past the lower half and an access other than R, RW
+/// or RX fail with INVALID_ARGS, through closed handles too; then x0 (a
+/// closed handle BAD_HANDLE, a memory object WRONG_TYPE, a copy without
+/// MANAGE ACCESS_DENIED), then x1 (BAD_HANDLE, a process WRONG_TYPE, a
+/// copy without MAP_READ ACCESS_DENIED); a process that ended fails with
+/// BAD_STATE before its range is looked at; a range past the object and
+/// one over a mapping fail with INVALID_ARGS. A good call changes x0
+/// alone. The limit of mappings is mapping_limit_is_64; the quota of the
+/// process, which pays for the tables, is a kernel test
+/// (map_that_does_not_fit_maps_nothing).
+fn mem_map_checks_its_arguments() -> Outcome {
+    let m = memory_object(4)?;
+    let no_read = copy(&m, Rights::MAP_WRITE | Rights::MAP_EXEC)?;
+    let no_manage = copy(&init::PROCESS, Rights::NONE)?;
+    let ended = ended_child()?;
+    let gone = closed_handle()?;
+    let result = map_cases(&m, no_read.raw().0, no_manage.raw().0, ended.raw().0, gone);
+    close(no_read)?;
+    close(no_manage)?;
+    close(ended)?;
+    let unmapped = unmap(WINDOW, PAGE as u64);
+    close(m)?;
+    result.and(unmapped)
+}
+
+fn map_cases(m: &Handle<Memory>, no_read: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let (own, mem) = (init::PROCESS.raw().0, m.raw().0);
+    let (page, at, r) = (PAGE as u64, WINDOW as u64, Access::Read.raw());
+    let cases = [
+        ([own, mem, 8, page, at, r], Error::InvalidArgs),
+        ([own, mem, 0, 0, at, r], Error::InvalidArgs),
+        ([own, mem, 0, page + 8, at, r], Error::InvalidArgs),
+        ([own, mem, 0, page, at + 8, r], Error::InvalidArgs),
+        (
+            [own, mem, 0, 2 * page, LOWER_END - page, r],
+            Error::InvalidArgs,
+        ),
+        ([own, mem, 0, page, at, 6], Error::InvalidArgs),
+        ([gone, gone, 8, page, at, r], Error::InvalidArgs),
+        ([gone, mem, 0, page, at, r], Error::BadHandle),
+        ([mem, mem, 0, page, at, r], Error::WrongType),
+        ([no_manage, gone, 0, page, at, r], Error::AccessDenied),
+        ([own, gone, 0, page, at, r], Error::BadHandle),
+        ([own, own, 0, page, at, r], Error::WrongType),
+        ([own, no_read, 0, page, at, r], Error::AccessDenied),
+        ([ended, mem, 3 * page, 2 * page, at, r], Error::BadState),
+        ([own, mem, 3 * page, 2 * page, at, r], Error::InvalidArgs),
+        (
+            [own, mem, u64::MAX - page + 1, page, at, r],
+            Error::InvalidArgs,
+        ),
+    ]
+    .into_iter()
+    .all(|(args, error)| x0_alone::<N>(&args, error.code()));
+    check(
+        cases,
+        "a bad mem_map did not fail alone as spec 11 orders it",
+    )?;
+    check(
+        x0_alone::<N>(&[own, mem, 3 * page, page, at, r], 0),
+        "a good mem_map failed or changed registers past x0",
+    )?;
+    check(
+        x0_alone::<N>(&[own, mem, 0, page, at, r], Error::InvalidArgs.code()),
+        "a mapping over another did not fail with INVALID_ARGS alone",
+    )
+}
+
+/// W^X in one mapping (spec 7.4): of the access values only R (1), RW (3)
+/// and RX (5) map; 0, W alone, X alone, W with X, the three together and
+/// the bits past them fail with INVALID_ARGS alone.
+fn map_access_is_r_rw_or_rx() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let m = memory_object(1)?;
+    let (own, mem, page, at) = (init::PROCESS.raw().0, m.raw().0, PAGE as u64, WINDOW as u64);
+    let refused = [0, 2, 4, 6, 7, 8, 9, 1 << 32 | 1]
+        .into_iter()
+        .all(|access| x0_alone::<N>(&[own, mem, 0, page, at, access], Error::InvalidArgs.code()));
+    let mut mapped = true;
+    for access in [Access::Read, Access::ReadWrite, Access::ReadExec] {
+        mapped &= map(&m, 0, page, WINDOW, access).is_ok() && unmap(WINDOW, page).is_ok();
+    }
+    close(m)?;
+    check(
+        refused,
+        "an access other than R, RW or RX was not refused alone",
+    )?;
+    check(mapped, "R, RW or RX did not map")
+}
+
+/// Each access needs its rights of the object's handle (spec 5.2, 7.4): a
+/// copy with MAP_READ alone maps R and fails RW and RX with ACCESS_DENIED
+/// alone; one without MAP_EXEC maps RW, one without MAP_WRITE maps RX.
+fn map_needs_the_rights_of_its_access() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let m = memory_object(1)?;
+    let (read, read_write, read_exec) = (
+        copy(&m, Rights::MAP_READ)?,
+        copy(&m, Rights::MAP_READ | Rights::MAP_WRITE)?,
+        copy(&m, Rights::MAP_READ | Rights::MAP_EXEC)?,
+    );
+    let (own, page, at) = (init::PROCESS.raw().0, PAGE as u64, WINDOW as u64);
+    let denied = [
+        (&read, Access::ReadWrite),
+        (&read, Access::ReadExec),
+        (&read_write, Access::ReadExec),
+        (&read_exec, Access::ReadWrite),
+    ]
+    .into_iter()
+    .all(|(h, access)| {
+        let args = [own, h.raw().0, 0, page, at, access.raw()];
+        x0_alone::<N>(&args, Error::AccessDenied.code())
+    });
+    let mut mapped = true;
+    for (h, access) in [
+        (&read, Access::Read),
+        (&read_write, Access::ReadWrite),
+        (&read_exec, Access::ReadExec),
+    ] {
+        mapped &= map(h, 0, page, WINDOW, access).is_ok() && unmap(WINDOW, page).is_ok();
+    }
+    for h in [read, read_write, read_exec, m] {
+        close(h)?;
+    }
+    check(
+        denied,
+        "an access past the rights of the handle was not refused alone",
+    )?;
+    check(
+        mapped,
+        "a handle with the rights of an access did not map it",
+    )
+}
+
+/// Two mappings of one object show the same frames (spec 7.4): a word
+/// written through one reads back through the other, and object_info
+/// MEMORY counts both, then none once they went.
+fn two_mappings_show_the_same_pages() -> Outcome {
+    let m = memory_object(2)?;
+    let (first, second) = (WINDOW, WINDOW + 16 * PAGE);
+    map(&m, 0, 2 * PAGE as u64, first, Access::ReadWrite)?;
+    map(&m, PAGE as u64, PAGE as u64, second, Access::ReadWrite)?;
+    // SAFETY: both pages are init's mappings of the object, read and write.
+    let seen = unsafe {
+        ((first + PAGE + 8) as *mut u64).write_volatile(0x5EE5_BAC4);
+        ((second + 8) as *const u64).read_volatile()
+    };
+    let info = sys::memory_info(&m);
+    unmap(first, 2 * PAGE as u64)?;
+    unmap(second, PAGE as u64)?;
+    let after = sys::memory_info(&m);
+    close(m)?;
+    check(seen == 0x5EE5_BAC4, "the second mapping shows other frames")?;
+    check(
+        info.is_ok_and(|i| i.mappings == 2) && after.is_ok_and(|i| i.mappings == 0),
+        "MEMORY did not count the mappings",
+    )
+}
+
+/// mem_unmap(x0 process with MANAGE, x1 address, x2 length) takes exactly
+/// one whole mapping (spec 7.4) and changes x0 alone on an error: an
+/// address or a length off whole pages, a length of 0 and a range past the
+/// lower half fail with INVALID_ARGS, through a closed handle too; then x0
+/// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without MANAGE); a process that
+/// ended fails with BAD_STATE; a part of a mapping, more than it, and a
+/// range that starts inside it fail with INVALID_ARGS and unmap nothing.
+/// The whole mapping goes with 0 in x0 alone, and a second time fails.
+fn mem_unmap_takes_whole_mappings() -> Outcome {
+    let m = memory_object(4)?;
+    let no_manage = copy(&init::PROCESS, Rights::NONE)?;
+    let ended = ended_child()?;
+    let gone = closed_handle()?;
+    map(&m, 0, 4 * PAGE as u64, WINDOW, Access::ReadWrite)?;
+    let result = unmap_cases(m.raw().0, no_manage.raw().0, ended.raw().0, gone);
+    close(no_manage)?;
+    close(ended)?;
+    close(m)?;
+    result
+}
+
+fn unmap_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
+    const N: u16 = Call::MemUnmap.number();
+    let (own, page, at) = (init::PROCESS.raw().0, PAGE as u64, WINDOW as u64);
+    let cases = [
+        ([own, at + 8, 4 * page], Error::InvalidArgs),
+        ([own, at, 4 * page + 8], Error::InvalidArgs),
+        ([own, at, 0], Error::InvalidArgs),
+        ([own, LOWER_END - page, 2 * page], Error::InvalidArgs),
+        ([gone, at, 0], Error::InvalidArgs),
+        ([gone, at, 4 * page], Error::BadHandle),
+        ([mem, at, 4 * page], Error::WrongType),
+        ([no_manage, at, 4 * page], Error::AccessDenied),
+        ([ended, at, 4 * page], Error::BadState),
+        ([own, at, page], Error::InvalidArgs),
+        ([own, at, 8 * page], Error::InvalidArgs),
+        ([own, at + page, 3 * page], Error::InvalidArgs),
+    ]
+    .into_iter()
+    .all(|(args, error)| x0_alone::<N>(&args, error.code()));
+    // SAFETY: the page is init's mapping, which the refused calls kept.
+    let kept = unsafe { ((WINDOW + 3 * PAGE) as *const u64).read_volatile() } == 0;
+    check(
+        cases,
+        "a bad mem_unmap did not fail alone as spec 11 orders it",
+    )?;
+    check(kept, "a refused mem_unmap took the mapping")?;
+    check(
+        x0_alone::<N>(&[own, at, 4 * page], 0),
+        "the whole mapping did not go with 0 alone",
+    )?;
+    check(
+        x0_alone::<N>(&[own, at, 4 * page], Error::InvalidArgs.code()),
+        "a mapping went twice",
+    )
+}
+
+/// mem_protect(x0 process with MANAGE, x1 address, x2 length, x3 access)
+/// takes exactly one whole mapping within the rights it was mapped with
+/// (spec 5.2, 7.4), and changes x0 alone on an error: the range as
+/// mem_unmap checks it and an access other than R, RW or RX fail with
+/// INVALID_ARGS, through a closed handle too; then x0 (BAD_HANDLE,
+/// WRONG_TYPE, ACCESS_DENIED without MANAGE); a process that ended fails
+/// with BAD_STATE; a part of a mapping fails with INVALID_ARGS; RX of a
+/// mapping made through a copy without MAP_EXEC fails with ACCESS_DENIED.
+/// R and then RW again change the access with 0 alone, and the pages keep
+/// their contents.
+fn mem_protect_takes_whole_mappings_within_their_rights() -> Outcome {
+    let m = memory_object(2)?;
+    let read_write = copy(&m, Rights::MAP_READ | Rights::MAP_WRITE)?;
+    let no_manage = copy(&init::PROCESS, Rights::NONE)?;
+    let ended = ended_child()?;
+    let gone = closed_handle()?;
+    map(&read_write, 0, 2 * PAGE as u64, WINDOW, Access::ReadWrite)?;
+    // SAFETY: the page is init's mapping, read and write.
+    unsafe { ((WINDOW + 8) as *mut u64).write_volatile(0x7E57) };
+    let result = protect_cases(m.raw().0, no_manage.raw().0, ended.raw().0, gone);
+    let unmapped = unmap(WINDOW, 2 * PAGE as u64);
+    close(read_write)?;
+    close(no_manage)?;
+    close(ended)?;
+    close(m)?;
+    result.and(unmapped)
+}
+
+fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
+    const N: u16 = Call::MemProtect.number();
+    let (own, page, at) = (init::PROCESS.raw().0, PAGE as u64, WINDOW as u64);
+    let (r, rw, rx) = (
+        Access::Read.raw(),
+        Access::ReadWrite.raw(),
+        Access::ReadExec.raw(),
+    );
+    let cases = [
+        ([own, at + 8, 2 * page, r], Error::InvalidArgs),
+        ([own, at, 0, r], Error::InvalidArgs),
+        ([own, at, 2 * page, 6], Error::InvalidArgs),
+        ([gone, at, 2 * page, 7], Error::InvalidArgs),
+        ([gone, at, 2 * page, r], Error::BadHandle),
+        ([mem, at, 2 * page, r], Error::WrongType),
+        ([no_manage, at, 2 * page, r], Error::AccessDenied),
+        ([ended, at, 2 * page, r], Error::BadState),
+        ([own, at, page, r], Error::InvalidArgs),
+        ([own, at + page, page, r], Error::InvalidArgs),
+        ([own, at, 2 * page, rx], Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(args, error)| x0_alone::<N>(&args, error.code()));
+    check(
+        cases,
+        "a bad mem_protect did not fail alone as spec 11 orders it",
+    )?;
+    check(
+        x0_alone::<N>(&[own, at, 2 * page, r], 0),
+        "R within the rights failed or changed registers past x0",
+    )?;
+    // SAFETY: the page is init's mapping, readable in any access.
+    let read = unsafe { ((WINDOW + 8) as *const u64).read_volatile() };
+    check(
+        x0_alone::<N>(&[own, at, 2 * page, rw], 0),
+        "RW within the rights failed or changed registers past x0",
+    )?;
+    // SAFETY: as above, writable again.
+    let written = unsafe {
+        ((WINDOW + 16) as *mut u64).write_volatile(0x7E58);
+        ((WINDOW + 16) as *const u64).read_volatile()
+    };
+    check(
+        read == 0x7E57 && written == 0x7E58,
+        "the pages lost their contents or their access",
+    )
+}
+
+/// A process has 64 mappings at most (spec 7.4): the 65th fails with
+/// LIMIT_REACHED alone, and once one went the next one maps. Init has no
+/// mapping of its own before.
+fn mapping_limit_is_64() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let m = memory_object(1)?;
+    let (own, mem, page) = (init::PROCESS.raw().0, m.raw().0, PAGE as u64);
+    let mut made = 0;
+    while made <= abi::MAX_MAPPINGS as usize
+        && map(&m, 0, page, WINDOW + made * PAGE, Access::Read).is_ok()
+    {
+        made += 1;
+    }
+    let next = (WINDOW + made * PAGE) as u64;
+    let refused = x0_alone::<N>(
+        &[own, mem, 0, page, next, Access::Read.raw()],
+        Error::LimitReached.code(),
+    );
+    let freed = unmap(WINDOW, page).is_ok();
+    let again = map(&m, 0, page, WINDOW, Access::Read).is_ok();
+    let mut unmapped = true;
+    for i in 0..made {
+        unmapped &= unmap(WINDOW + i * PAGE, page).is_ok();
+    }
+    close(m)?;
+    check(
+        made == abi::MAX_MAPPINGS as usize && refused,
+        "the 65th mapping did not fail with LIMIT_REACHED alone",
+    )?;
+    check(freed && again && unmapped, "no mapping fit once one went")
+}
+
+/// A page of a message buffer is no page to map (spec 6.2): mem_map of a
+/// range that takes init's buffer or the buffer of a new thread of init
+/// fails with INVALID_ARGS alone, and the page next to them maps.
+fn buffer_page_cannot_be_mapped_over() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let m = memory_object(2)?;
+    let t = thread(0, add_mark, 0, LOW, Policy::Fifo)?;
+    let (own, mem, page, r) = (
+        init::PROCESS.raw().0,
+        m.raw().0,
+        PAGE as u64,
+        Access::Read.raw(),
+    );
+    let refused = [
+        abi::INIT_MSGBUF - page,
+        abi::INIT_MSGBUF,
+        buffer(0) as u64 - page,
+    ]
+    .into_iter()
+    .all(|at| x0_alone::<N>(&[own, mem, 0, 2 * page, at, r], Error::InvalidArgs.code()));
+    let next = buffer(0) + PAGE;
+    let mapped = map(&m, 0, page, next, Access::Read).and_then(|()| unmap(next, page));
+    close(t)?;
+    close(m)?;
+    check(
+        refused,
+        "a range over a message buffer was not refused alone",
+    )?;
+    mapped
+}
+
+/// A page of a message buffer is no mapping (spec 6.2): mem_unmap of
+/// init's fails with INVALID_ARGS alone, and the buffer keeps its words.
+fn buffer_page_cannot_be_unmapped() -> Outcome {
+    const N: u16 = Call::MemUnmap.number();
+    let word = (abi::INIT_MSGBUF + 8) as *mut u64;
+    // SAFETY: the page is init's message buffer, which nothing else uses
+    // now.
+    unsafe { word.write_volatile(0xB0FF) };
+    let refused = x0_alone::<N>(
+        &[init::PROCESS.raw().0, abi::INIT_MSGBUF, PAGE as u64],
+        Error::InvalidArgs.code(),
+    );
+    // SAFETY: as above.
+    let kept = unsafe { word.read_volatile() } == 0xB0FF;
+    check(
+        refused,
+        "mem_unmap of the message buffer was not refused alone",
+    )?;
+    check(kept, "the message buffer lost its words")
+}
+
+/// A page of a message buffer is no mapping (spec 6.2): mem_protect of
+/// init's to R fails with INVALID_ARGS alone, and the buffer stays
+/// writable.
+fn buffer_page_cannot_be_protected() -> Outcome {
+    const N: u16 = Call::MemProtect.number();
+    let args = [
+        init::PROCESS.raw().0,
+        abi::INIT_MSGBUF,
+        PAGE as u64,
+        Access::Read.raw(),
+    ];
+    let refused = x0_alone::<N>(&args, Error::InvalidArgs.code());
+    let word = (abi::INIT_MSGBUF + 16) as *mut u64;
+    // SAFETY: the page is init's message buffer, which nothing else uses
+    // now.
+    let written = unsafe {
+        word.write_volatile(0xB0FE);
+        word.read_volatile()
+    };
+    check(
+        refused,
+        "mem_protect of the message buffer was not refused alone",
+    )?;
+    check(written == 0xB0FE, "the message buffer is not writable")
+}
+
+/// Maps BIG bytes of the object whose handle is `m` at WINDOW of init, RW,
+/// and unmaps them, again and again, until a probe caught the mapping busy
+/// (mark 3) or ROUNDS rounds went; mark 2 names the call it makes, and
+/// mark 0 notes 1 once every call passed.
+extern "C" fn map_big(m: u64) -> ! {
+    const ROUNDS: u32 = 1000;
+    let m = Handle::<Memory>::from_raw(abi::Handle(m));
+    let mut passed = true;
+    for _ in 0..ROUNDS {
+        if mark(3) != 0 || !passed {
+            break;
+        }
+        MARKS[2].store(Call::MemMap.number().into(), Relaxed);
+        passed &= sys::mem_map(&init::PROCESS, &m, 0, BIG, WINDOW, Access::ReadWrite).is_ok();
+        MARKS[2].store(Call::MemUnmap.number().into(), Relaxed);
+        // SAFETY: the window is the test's, and nothing else uses it.
+        passed &= unsafe { sys::mem_unmap(&init::PROCESS, WINDOW, BIG) }.is_ok();
+    }
+    MARKS[0].store(passed.into(), Relaxed);
+    sys::thread_exit()
+}
+
+/// Maps and unmaps BIG bytes of a new object at WINDOW of init in a thread
+/// at LEVEL (`map_big`), in portions, while a thread at HIGH,
+/// `probe(channel)`, waits on a channel whose timer wakes it every
+/// PROBE_PERIOD_NS until it finds the mapping in the middle of the portions
+/// of a mem_map (`caught_busy`). Once both ended, nothing is mapped there.
+fn during_a_long_map(probe: extern "C" fn(u64) -> !) -> Outcome {
+    reset_marks();
+    let m = memory_object(BIG / PAGE as u64)?;
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    PROBE_TIMER.store(t.raw().0, Relaxed);
+    let prober = spawn(1, probe, c.raw().0, HIGH, Policy::Fifo)?;
+    let mapper = spawn(0, map_big, m.raw().0, LEVEL, Policy::Fifo)?;
+    let armed = clock_now().and_then(|now| arm(&t, now + PROBE_PERIOD_NS));
+    let ran = armed.and_then(|()| let_run());
+    for h in [prober, mapper] {
+        close(h)?;
+    }
+    close(t)?;
+    close(c)?;
+    close(m)?;
+    ran?;
+    check(
+        mark(0) == 1,
+        "a mem_map or a mem_unmap of the window failed",
+    )?;
+    check(
+        mark(3) == 1,
+        "no probe came in the middle of a long mem_map",
+    )
+}
+
+/// Waits on channel `c` for the timer of `during_a_long_map`, again and
+/// again, until mem_protect RW of the mapping of `map_big`, which changes
+/// nothing, says that a long call works on it (BAD_STATE) while `map_big`
+/// makes its mem_map, and marks 3; the timer comes again PROBE_PERIOD_NS
+/// later otherwise. False once the channel closed.
+fn caught_busy(c: u64) -> bool {
+    let c = Handle::<Channel>::from_raw(abi::Handle(c));
+    let t = Handle::<Timer>::from_raw(abi::Handle(PROBE_TIMER.load(Relaxed)));
+    let map = u64::from(Call::MemMap.number());
+    while sys::receive(&c).is_ok() {
+        // SAFETY: RW is the access of the mapping; nothing changes.
+        let probed = unsafe { sys::mem_protect(&init::PROCESS, WINDOW, BIG, Access::ReadWrite) };
+        if probed == Err(Error::BadState) && mark(2) == map {
+            MARKS[3].store(1, Relaxed);
+            return true;
+        }
+        let now = sys::clock_now().unwrap_or(0);
+        let _ = sys::timer_set(&t, now + PROBE_PERIOD_NS);
+    }
+    false
+}
+
+/// Once a mem_map of `map_big` is busy (`caught_busy` on channel `c`),
+/// calls mem_unmap and mem_protect on its mapping: mark 1 notes 1 when both
+/// fail with BAD_STATE.
+extern "C" fn probe_busy(c: u64) -> ! {
+    if caught_busy(c) {
+        // SAFETY: the calls must fail and change nothing.
+        let (unmapped, protected) = unsafe {
+            (
+                sys::mem_unmap(&init::PROCESS, WINDOW, BIG),
+                sys::mem_protect(&init::PROCESS, WINDOW, BIG, Access::Read),
+            )
+        };
+        let busy = unmapped == Err(Error::BadState) && protected == Err(Error::BadState);
+        MARKS[1].store(busy.into(), Relaxed);
+    }
+    sys::thread_exit()
+}
+
+/// A mapping that a long call works on is busy (spec 7.7): mem_unmap and
+/// mem_protect of it from a thread that runs in the middle of the portions
+/// of its mem_map fail with BAD_STATE; once no call works on a mapping
+/// both pass.
+fn busy_mapping_is_bad_state() -> Outcome {
+    during_a_long_map(probe_busy)?;
+    let m = memory_object(1)?;
+    let mapped = map(&m, 0, PAGE as u64, WINDOW, Access::ReadWrite);
+    // SAFETY: the mapping is the test's window, which nothing else uses.
+    let protected = unsafe { sys::mem_protect(&init::PROCESS, WINDOW, PAGE as u64, Access::Read) };
+    let unmapped = unmap(WINDOW, PAGE as u64);
+    close(m)?;
+    check(
+        mark(1) == 1,
+        "a busy mapping did not refuse mem_unmap and mem_protect with BAD_STATE",
+    )?;
+    check(
+        mapped.is_ok() && protected.is_ok() && unmapped.is_ok(),
+        "mem_protect or mem_unmap failed once no call worked on the mapping",
+    )
+}
+
+/// Once a mem_map of `map_big` is busy (`caught_busy` on channel `c`), asks
+/// for a thread of init whose buffer is the last page of its mapping,
+/// which is not mapped yet: mark 1 notes 1 for INVALID_ARGS. A thread made
+/// all the same goes at once, with its buffer.
+extern "C" fn probe_buffer(c: u64) -> ! {
+    if caught_busy(c) {
+        let last = WINDOW + BIG as usize - PAGE;
+        // SAFETY: the thread never runs.
+        let made = unsafe {
+            sys::thread_create(
+                &init::PROCESS,
+                add_mark,
+                STACKS[2].top(),
+                3,
+                LOW,
+                Policy::Fifo,
+                last,
+            )
+        };
+        MARKS[1].store((made == Err(Error::InvalidArgs)).into(), Relaxed);
+        if let Ok(t) = made {
+            let _ = t.close();
+        }
+    }
+    sys::thread_exit()
+}
+
+/// A message buffer lands in no mapping (spec 6.2): thread_create with its
+/// buffer on a page of a mapping that a long mem_map has not mapped yet
+/// fails with INVALID_ARGS, and so does one on a page of a whole mapping.
+fn thread_buffer_cannot_land_in_a_mapping() -> Outcome {
+    during_a_long_map(probe_buffer)?;
+    let m = memory_object(1)?;
+    map(&m, 0, PAGE as u64, WINDOW, Access::ReadWrite)?;
+    // SAFETY: the thread is refused, and would never run.
+    let made = unsafe {
+        sys::thread_create(
+            &init::PROCESS,
+            add_mark,
+            STACKS[2].top(),
+            3,
+            LOW,
+            Policy::Fifo,
+            WINDOW,
+        )
+    };
+    let refused = made == Err(Error::InvalidArgs);
+    if let Ok(t) = made {
+        close(t)?;
+    }
+    unmap(WINDOW, PAGE as u64)?;
+    close(m)?;
+    check(
+        mark(1) == 1,
+        "a buffer went on a page of a mapping not mapped yet",
+    )?;
+    check(refused, "a buffer went on a page of a mapping")
+}
+
+/// A mapping keeps its object (spec 4, 7.4): once the only handle to an
+/// object of 4 pages closes, its mapping still shows what init wrote, and
+/// a new object of 4 pages takes none of its frames; once the mapping
+/// goes, init's used memory, the free frames and the pages of kernel pools
+/// are what they were before the object.
+fn mapped_object_outlives_its_last_handle() -> Outcome {
+    const PAGES: usize = 4;
+    warm(WINDOW)?;
+    close(memory_object(PAGES as u64)?)?;
+    let before = counts()?;
+    let m = memory_object(PAGES as u64)?;
+    map(&m, 0, (PAGES * PAGE) as u64, WINDOW, Access::ReadWrite)?;
+    let word = |i: usize| (WINDOW + i * PAGE + 8) as *mut u64;
+    for i in 0..PAGES {
+        // SAFETY: the page is init's mapping, read and write.
+        unsafe { word(i).write_volatile(0xA11E_0000 + i as u64) };
+    }
+    close(m)?;
+    let other = memory_object(PAGES as u64)?;
+    // SAFETY: as above; the mapping holds the object.
+    let kept = (0..PAGES).all(|i| unsafe { word(i).read_volatile() } == 0xA11E_0000 + i as u64);
+    close(other)?;
+    // A mapping that lost its object stays: taking it would free the
+    // object twice.
+    check(kept, "the mapping lost its object with the last handle")?;
+    unmap(WINDOW, (PAGES * PAGE) as u64)?;
+    check(
+        counts()? == before,
+        "the object did not go with its mapping",
+    )
+}
+
+/// mem_protect to RX makes code init wrote runnable (spec 7.4): a page of
+/// an object, RW, gets a function that returns 42; once the page is RX,
+/// the function runs and returns 42.
+fn protect_to_exec_runs_new_code() -> Outcome {
+    let m = memory_object(1)?;
+    map(&m, 0, PAGE as u64, WINDOW, Access::ReadWrite)?;
+    let code = WINDOW as *mut u32;
+    for (i, &insn) in RETURN_42.iter().enumerate() {
+        // SAFETY: the page is init's mapping, read and write.
+        unsafe { code.add(i).write_volatile(insn) };
+    }
+    // SAFETY: the page holds code init wrote, and nothing else uses it.
+    let protected =
+        unsafe { sys::mem_protect(&init::PROCESS, WINDOW, PAGE as u64, Access::ReadExec) };
+    let got = protected.map(|()| {
+        // SAFETY: the page is RX and holds a function that takes nothing
+        // and returns a word.
+        let f: extern "C" fn() -> u64 = unsafe { core::mem::transmute(WINDOW) };
+        f()
+    });
+    unmap(WINDOW, PAGE as u64)?;
+    close(m)?;
+    check(got == Ok(42), "the code written into the page did not run")
 }
 
 // Requests and replies (spec 6.1, 6.6): init and threads of its own

@@ -22,10 +22,11 @@
 //! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
 //! threads, the blocks of its handle table, the shells of its children, the
 //! channels it made, the sessions of the labels it gave (spec 5.3), its
-//! timers, at most abi::MAX_TIMERS (spec 10), and the memory objects it
-//! made; at once, for the pages of those objects (spec 7.3); and
-//! for the tables of its space, the message buffers of its threads and the
-//! frames of `map_frames`. The pages of its pools go back only with
+//! timers, at most abi::MAX_TIMERS (spec 10), the memory objects it made
+//! and the table of its mappings, whoever maps into it (`maps`); at once,
+//! for the pages of those objects (spec 7.3); and for the tables of its
+//! space, up front for a mapping, the message buffers of its threads and
+//! the frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
 //! rest with its shell. The requests its threads accepted wait in it for
@@ -54,9 +55,16 @@ use kcore::sched::{ReadyQueue, Scheduler};
 use kcore::slab::{PageLog, PaidPages, Pool};
 use kcore::sync::Lock;
 
+mod maps;
 mod table;
 mod teardown;
 
+#[cfg(feature = "ktest")]
+pub use maps::PORTION;
+pub use maps::{
+    Change, abandon_change, add_mapping, begin_change, check_free, find_mapping, finish_change,
+    in_mapping, step_change,
+};
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
 pub use table::{
@@ -80,6 +88,9 @@ pub struct Process {
     /// buffers, which the tables mapped.
     retired: Option<SpaceRelease>,
     frames: OwnedFrames,
+    /// The table of its mappings, in a block of its pool of blocks, from
+    /// its first mapping until the stage Mappings (spec 7.4).
+    maps: Option<NonNull<maps::Table>>,
     /// Released at the stage Handles: its handles hold references to
     /// other objects.
     handles: Handles,
@@ -199,8 +210,8 @@ struct ChildLinks {
 }
 
 /// Blocks of frames that `release` gives back to the allocator when their
-/// owner goes.
-struct OwnedFrames([Option<Frame>; MAX_BLOCKS]);
+/// owner goes, each with the range of pages it maps.
+struct OwnedFrames([Option<(Frame, u64, u64)>; MAX_BLOCKS]);
 
 impl OwnedFrames {
     /// Gives every block back to the frame allocator and refunds it to
@@ -210,10 +221,18 @@ impl OwnedFrames {
     /// No table of a program maps the blocks any more, and the TLB entries
     /// of such mappings went.
     unsafe fn release(&mut self, quota: &mut Account) {
-        for frame in self.0.iter_mut().filter_map(Option::take) {
+        for (frame, _, _) in self.0.iter_mut().filter_map(Option::take) {
             // SAFETY: the caller's promise.
             unsafe { phys::free(frame, quota) };
         }
+    }
+
+    /// Whether a block maps a page of `[start, end)`.
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .any(|&(_, va, size)| va < end && start < va + size)
     }
 }
 
@@ -289,7 +308,7 @@ impl Process {
         let pa = frame.pa();
         // Owned before it is mapped: on an error part of the range may be
         // mapped, and the frames must stay until the tables go.
-        self.frames.0[slot] = Some(frame);
+        self.frames.0[slot] = Some((frame, va as u64, size));
         let space = self.space.as_mut().expect("frames map into a space");
         space.map(va, pa, size, attrs, &mut self.quota)?;
         Ok(pa)
@@ -332,6 +351,7 @@ fn create(
         space: Some(space),
         retired: None,
         frames: OwnedFrames([const { None }; MAX_BLOCKS]),
+        maps: None,
         handles,
         refs: Refs::one(),
         shell_refs: 0,
@@ -921,7 +941,9 @@ pub fn translate(process: NonNull<Process>, va: usize) -> Option<(u64, u64)> {
 static EARLY_QUOTA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[cfg(feature = "ktest")]
-pub use test_access::{has_accepted, in_use, parent, progress, take_early_quota};
+pub use test_access::{
+    has_accepted, in_use, mapping, mappings, parent, progress, take_early_quota,
+};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -952,6 +974,26 @@ mod test_access {
         // SAFETY: the test holds a reference to the process; only the mask
         // of the queue is read.
         sched::locked(|k| unsafe { !accepted(process, k.s).is_empty() })
+    }
+
+    /// The mappings of `process`, which the test holds.
+    pub fn mappings(process: NonNull<Process>) -> usize {
+        // SAFETY: the test holds a reference to the process; only the table
+        // is read.
+        unsafe { maps::table(process) }.map_or(0, |t| t.len())
+    }
+
+    /// The mapping of exactly `pages` pages from `va` of `process`, which
+    /// the test holds.
+    pub fn mapping(
+        process: NonNull<Process>,
+        va: usize,
+        pages: u64,
+    ) -> Option<kcore::maps::Mapping<NonNull<Memory>>> {
+        // SAFETY: as in `mappings`.
+        let table = unsafe { maps::table(process) }?;
+        let index = table.find(va as u64, pages).ok()?;
+        Some(*table.get(index))
     }
 
     /// How far the teardown of `process` came: its stage, the handles left in

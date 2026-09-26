@@ -60,15 +60,6 @@ pub fn tables_written() {
     unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
 }
 
-/// Drops the TLB entry of one user page; `operand` comes from
-/// kcore::asid::tlbi_page.
-pub fn invalidate_page(operand: u64) {
-    // SAFETY: TLB maintenance only drops cached translations.
-    unsafe {
-        asm!("dsb ishst", "tlbi vale1is, {}", "dsb ish", "isb", in(reg) operand, options(nostack, preserves_flags))
-    };
-}
-
 /// Lets the table walker see earlier stores to the tables of a program:
 /// `dsb ishst` with no `isb` (spec 7.4; [G13], [G14], [G15]).
 pub fn user_tables_written() {
@@ -95,7 +86,7 @@ pub fn user_pages_invalidated() {
 /// Drops every TLB entry of one ASID, walk-cache entries included; `operand`
 /// comes from kcore::asid::tlbi_asid.
 pub fn invalidate_asid(operand: u64) {
-    // SAFETY: as in `invalidate_page`.
+    // SAFETY: TLB maintenance only drops cached translations.
     unsafe {
         asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb", in(reg) operand, options(nostack, preserves_flags))
     };
@@ -105,7 +96,7 @@ pub fn invalidate_asid(operand: u64) {
 /// reach its walker, so that no walk between the stores and the TLBI brings
 /// an old descriptor back (Linux's local_flush_tlb_all).
 pub fn flush_tlb() {
-    // SAFETY: as in `invalidate_page`.
+    // SAFETY: as in `invalidate_asid`.
     unsafe {
         asm!(
             "dsb nshst",

@@ -15,8 +15,8 @@
 use crate::handle::{Channel, Handle, Memory, Process, Resource, Thread, Timer};
 use crate::msgbuf;
 use abi::{
-    Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo,
-    Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
+    Access, Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX,
+    MemoryInfo, Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
     SOURCE_SHIFT, Source,
 };
 use core::arch::asm;
@@ -66,7 +66,8 @@ fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let mut x = [0; 10];
     x[..args.len()].copy_from_slice(args);
     // SAFETY: the calls made through here run no code of the program and
-    // use none of its memory; thread_create, which can, is unsafe itself.
+    // use none of its memory; thread_create, mem_unmap and mem_protect,
+    // which can, are unsafe themselves.
     let x = unsafe { raw::<N>(x) };
     match Error::from_code(x[0]) {
         None => Ok(x),
@@ -289,6 +290,59 @@ pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {
 pub fn mem_create(size: u64) -> Result<Handle<Memory>, Error> {
     let x = call::<{ Call::MemCreate.number() }>(&[size, 0])?;
     Ok(returned(&x))
+}
+
+/// mem_map: shows `len` bytes of `memory` from byte `offset` at `addr` of
+/// `process`, a handle with MANAGE, with `access` (spec 7.4): R needs
+/// MAP_READ, RW MAP_WRITE as well, RX MAP_EXEC as well. The pages of the
+/// range must be free there: no mapping and no message buffer of a thread.
+/// The process pays for the table of its mappings and for the tables of
+/// its space, whoever maps into it; the mapping keeps the object alive
+/// until it goes.
+pub fn mem_map(
+    process: &Handle<Process>,
+    memory: &Handle<Memory>,
+    offset: u64,
+    len: u64,
+    addr: usize,
+    access: Access,
+) -> Result<(), Error> {
+    let args = [
+        process.raw().0,
+        memory.raw().0,
+        offset,
+        len,
+        addr as u64,
+        access.raw(),
+    ];
+    call::<{ Call::MemMap.number() }>(&args).map(drop)
+}
+
+/// mem_unmap: the mapping of `process` that is exactly `len` bytes from
+/// `addr` goes (spec 7.4).
+///
+/// # Safety
+/// Nothing the caller uses lies in the mapping, when it is the caller's
+/// own.
+pub unsafe fn mem_unmap(process: &Handle<Process>, addr: usize, len: u64) -> Result<(), Error> {
+    call::<{ Call::MemUnmap.number() }>(&[process.raw().0, addr as u64, len]).map(drop)
+}
+
+/// mem_protect: the pages of the mapping of `process` that is exactly
+/// `len` bytes from `addr` get `access`, within the rights the object was
+/// mapped with (spec 7.4).
+///
+/// # Safety
+/// Nothing the caller uses in the mapping needs an access `access` takes
+/// away, when it is the caller's own.
+pub unsafe fn mem_protect(
+    process: &Handle<Process>,
+    addr: usize,
+    len: u64,
+    access: Access,
+) -> Result<(), Error> {
+    let args = [process.raw().0, addr as u64, len, access.raw()];
+    call::<{ Call::MemProtect.number() }>(&args).map(drop)
 }
 
 /// debug_write: up to abi::INLINE_MAX bytes to the console through the

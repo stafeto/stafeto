@@ -6,7 +6,12 @@
 //! and an ASID that tags its TLB entries, so a switch between processes
 //! flushes nothing. Outside processes TTBR0 holds head.S's empty table with
 //! ASID 0, the kernel's. Each table costs the quota of the space's process
-//! a page (spec 7.5): the calls that take or give back tables name it.
+//! a page (spec 7.5): the calls that take or give back tables name it, or
+//! a mapping paid for them up front. The kernel reaches no page of a
+//! program through these tables, and the way back to EL0 synchronizes the
+//! context, so a change of them ends with `dsb ishst`, or with the TLBIs
+//! of its pages between `dsb ishst` and `dsb ish`, and no `isb` ([G13],
+//! [G14], [G15]).
 
 use super::kmap::FrameTables;
 use super::phys::FRAMES;
@@ -91,6 +96,52 @@ fn with_charged<R>(quota: &mut Account, f: impl FnOnce(&mut Charged<'_>) -> R) -
     })
 }
 
+/// Tables from the frame allocator that a mapping paid for up front (spec
+/// 7.5): `left` bytes of the quota are charged and not spent yet, and each
+/// table spends a page of them. A table past them stops the kernel: the
+/// charge covered the most tables the range can take
+/// (kcore::paging::tables_bound).
+struct Prepaid<'a> {
+    tables: FrameTables<'a>,
+    left: &'a mut u64,
+}
+
+// SAFETY: the tables are FrameTables', which keep that contract; the
+// prepaid charge changes only the count.
+unsafe impl TableMemory for Prepaid<'_> {
+    fn alloc_table(&mut self) -> Option<u64> {
+        *self.left = self
+            .left
+            .checked_sub(PAGE_SIZE)
+            .expect("a mapping takes more tables than it paid for");
+        let table = self.tables.alloc_table();
+        Some(table.expect("a charge that passed found no frame (spec 7.8)"))
+    }
+
+    fn free_table(&mut self, _: u64) {
+        unreachable!("a mapping gives no table back");
+    }
+
+    fn read(&self, pa: u64) -> u64 {
+        self.tables.read(pa)
+    }
+
+    fn write(&mut self, pa: u64, value: u64) {
+        self.tables.write(pa, value)
+    }
+}
+
+/// `with_tables` with every table taken spending a page of `left`.
+fn with_prepaid<R>(left: &mut u64, f: impl FnOnce(&mut Prepaid<'_>) -> R) -> R {
+    let mut guard = FRAMES.lock();
+    f(&mut Prepaid {
+        tables: FrameTables {
+            frames: guard.as_mut().expect("frame allocator"),
+        },
+        left,
+    })
+}
+
 fn empty_root() -> u64 {
     let empty = EMPTY_ROOT.load(Ordering::Relaxed);
     assert!(empty != 0, "address spaces are used before aspace::init");
@@ -114,16 +165,8 @@ impl Mmu for Cpu {
         unsafe { mmu::set_ttbr0(ttbr) }
     }
 
-    fn tables_written(&mut self) {
-        mmu::tables_written()
-    }
-
     fn flush_all(&mut self) {
         mmu::flush_tlb()
-    }
-
-    fn invalidate_page(&mut self, operand: u64) {
-        mmu::invalidate_page(operand)
     }
 
     fn invalidate_asid(&mut self, operand: u64) {
@@ -184,18 +227,66 @@ impl AddressSpace {
             self.tables.map_user(mem, va as u64, pa, size, attrs)
         });
         // An entry that turns valid needs no TLB maintenance: the stores
-        // only have to reach the table walker.
-        mmu::tables_written();
+        // only have to reach the table walker ([G14]).
+        mmu::user_tables_written();
         result
+    }
+
+    /// Maps page i of `frames` at `va` + i pages with `attrs`, a program's
+    /// (spec 7.4): the pages are free, and the tables they take come from
+    /// `prepaid`, bytes of the quota a mapping charged up front (`Prepaid`);
+    /// a page that is mapped already stops the kernel, since the call
+    /// checked the range. The stores reach the table walker with one `dsb
+    /// ishst`: a descriptor that turns valid needs no TLBI ([G14]).
+    pub fn map_pages(&mut self, va: u64, frames: &[u64], attrs: Attrs, prepaid: &mut u64) {
+        with_prepaid(prepaid, |mem| {
+            for (i, &pa) in frames.iter().enumerate() {
+                let at = va + i as u64 * PAGE_SIZE;
+                self.tables
+                    .map_user(mem, at, pa, PAGE_SIZE, attrs)
+                    .expect("a page of a checked range maps");
+            }
+        });
+        mmu::user_tables_written();
+    }
+
+    /// Unmaps the `pages` pages from `va`, each of which a page maps, and
+    /// drops their TLB entries (spec 7.4, 7.7): `dsb ishst`, a `tlbi
+    /// vale1is` a page and one `dsb ish` (kcore::tlb::forget_range). The
+    /// frames may go elsewhere right after. The tables stay.
+    pub fn unmap_pages(&mut self, va: u64, pages: u64) {
+        with_tables(|mem| {
+            for i in 0..pages {
+                self.tables
+                    .unmap_page(mem, va + i * PAGE_SIZE)
+                    .expect("a page of a whole mapping is mapped");
+            }
+        });
+        with_asids(|a| tlb::forget_range(a, &self.tag, va, pages, &mut Cpu));
+    }
+
+    /// Gives the `pages` pages from `va`, each of which a page maps, the
+    /// access of `attrs`, a program's that keep W^X, and drops their TLB
+    /// entries as `unmap_pages` does: only the permissions change, so the
+    /// new descriptor goes over the old one with no break ([G14]).
+    pub fn protect_pages(&mut self, va: u64, pages: u64, attrs: Attrs) {
+        with_tables(|mem| {
+            for i in 0..pages {
+                self.tables
+                    .protect_page(mem, va + i * PAGE_SIZE, attrs)
+                    .expect("a page of a whole mapping is mapped");
+            }
+        });
+        with_asids(|a| tlb::forget_range(a, &self.tag, va, pages, &mut Cpu));
     }
 
     /// Unmaps the page at `va`, drops its TLB entry and returns the frame
     /// it mapped. The cleared descriptor reaches the table walker before
     /// this returns, also when the space has no ASID and so no TLB entry
-    /// (kcore::tlb::forget_page): the frame may go elsewhere right after.
+    /// (kcore::tlb::forget_range): the frame may go elsewhere right after.
     pub fn unmap(&mut self, va: usize) -> Result<u64, MapError> {
         let pa = with_tables(|mem| self.tables.unmap_page(mem, va as u64))?;
-        with_asids(|a| tlb::forget_page(a, &self.tag, va as u64, &mut Cpu));
+        with_asids(|a| tlb::forget_range(a, &self.tag, va as u64, 1, &mut Cpu));
         Ok(pa)
     }
 
