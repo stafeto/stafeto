@@ -118,12 +118,12 @@ From the same part on, `device_window_create` makes a device window: a
 memory object over a physical range of device registers, rounded out to
 whole pages, which touches no page of RAM, of any region of the GIC's
 node or of the kernel's PL011; the list of those ranges comes from the
-device tree at boot, 17 regions at most. A window owns no frame: its pages come from its base
-without a read of a list, and its chunk only gives its place back.
-`mem_map` shows it as `Device-nGnRE`, R or RW, never executable, in the
-chunks of any memory object. An SError taken at EL0 still stops the
-machine; its report walks the running process's 64 mappings at most for
-the windows among them.
+device tree at boot, 17 regions at most. A window owns no frame: its
+pages come from its base without a read of a list, and its chunk only
+gives its place back. `mem_map` shows it as `Device-nGnRE`, R or RW,
+never executable, in the chunks of any memory object. An SError taken at
+EL0 still stops the machine; its report walks the running process's 64
+mappings at most for the windows among them.
 
 From part 1.3d on, a memory object takes all its frames when it is made,
 up to 8 pages a chunk of `mem_create`: after a chunk that leaves pages and

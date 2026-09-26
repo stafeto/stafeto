@@ -696,6 +696,7 @@ mod tests {
             assert!(run(&["TEST a ok", &other, "TESTS DONE total=2 failed=1"]).is_err());
         }
         assert!(run(&["TEST a FAIL x", &hole, "TESTS DONE total=2 failed=2"]).is_err());
+        assert!(run(&["TEST a ok", &hole, "TESTS DONE total=2 failed=2"]).is_err());
         let hole_passes = format!("TEST {HOLE_TEST} ok");
         assert!(run(&["TEST a ok", &hole_passes, "TESTS DONE total=2 failed=0"]).is_err());
         assert!(run(&["TEST a ok", &hole, "TESTS DONE total=3 failed=1"]).is_err());

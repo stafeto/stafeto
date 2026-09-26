@@ -171,7 +171,7 @@ const INIT_TESTS: u32 = 179;
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
 
-/// Kernel builds xtask makes; each keeps its own ELF and image under target/.
+/// Kernel builds xtask makes; each keeps its own ELF and image under target_dir().
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Variant {
     Normal,
@@ -352,8 +352,11 @@ struct Artifacts {
 
 /// The kernel builds of this run of xtask, one per variant.
 static BUILDS: Mutex<Vec<(Variant, Artifacts)>> = Mutex::new(Vec::new());
-/// The boot images of this run of xtask, one per name.
-static BOOT_IMAGES: Mutex<Vec<(&str, PathBuf)>> = Mutex::new(Vec::new());
+/// A boot image name with the programs it names: the name stands for its
+/// programs, so a cache keyed on both never returns another list's image.
+type BootImageKey = (&'static str, &'static [(&'static str, &'static str, u32)]);
+/// The boot images of this run of xtask, one per name and program list.
+static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new());
 
 /// The kernel image of `variant` and the boot image of the normal build,
 /// each built once in a run of xtask, whatever number of checks takes
@@ -409,9 +412,15 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
 
 /// Builds `programs` for EL0 and, under target_dir, a boot image `name`
 /// whose files they are, in their order, each with its name and the stack
-/// size its header asks for (spec 3.3, 13.1); once in a run of xtask.
-fn build_boot_image(name: &'static str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
-    once(&BOOT_IMAGES, name, || write_boot_image(name, programs))
+/// size its header asks for (spec 3.3, 13.1); once in a run of xtask for
+/// this `(name, programs)` pair.
+fn build_boot_image(
+    name: &'static str,
+    programs: &'static [(&'static str, &'static str, u32)],
+) -> Result<PathBuf, String> {
+    once(&BOOT_IMAGES, (name, programs), || {
+        write_boot_image(name, programs)
+    })
 }
 
 fn write_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
@@ -1252,6 +1261,31 @@ mod tests {
             ),
             Path::new("/t/aarch64-unknown-none-softfloat/release/kernel")
         );
+    }
+
+    /// `once` calls `make` at most once for a key: a second call with the
+    /// same key returns the cached value with no further call, a call with
+    /// another key builds its own, and a `make` that fails is not cached.
+    #[test]
+    fn once_builds_a_key_only_once() {
+        let made: Mutex<Vec<(&str, u32)>> = Mutex::new(Vec::new());
+        let calls = Mutex::new(0u32);
+        let make = |calls: &Mutex<u32>| {
+            *calls.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+            Ok(*calls.lock().unwrap_or_else(PoisonError::into_inner))
+        };
+        assert_eq!(once(&made, "a", || make(&calls)), Ok(1));
+        assert_eq!(once(&made, "a", || make(&calls)), Ok(1));
+        assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 1);
+        assert_eq!(once(&made, "b", || make(&calls)), Ok(2));
+        assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 2);
+
+        let failing: Mutex<Vec<(&str, u32)>> = Mutex::new(Vec::new());
+        assert_eq!(
+            once(&failing, "x", || Err::<u32, _>("no".into())),
+            Err("no".into())
+        );
+        assert_eq!(once(&failing, "x", || Ok(1)), Ok(1));
     }
 
     /// The boot report passes with each of its lines whole, and fails
