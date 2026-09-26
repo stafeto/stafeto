@@ -22,7 +22,7 @@
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
-use crate::object::Object;
+use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{CLIENT_GONE, Error, Rights};
 use core::ptr::NonNull;
@@ -34,7 +34,7 @@ pub struct Session {
     slot: Slot<Owner>,
     /// Its copies, the reference `create` hands out, and its slot's while
     /// the slot is queued: the references that keep it.
-    refs: u32,
+    refs: Refs,
     /// Handles that name it and requests through them that wait in the
     /// channel's queue (spec 5.3).
     copies: u32,
@@ -52,9 +52,8 @@ pub struct Session {
 // CPU, interrupts masked inside the kernel.
 unsafe impl Send for Session {}
 
-/// Sessions whose slots have not gone back (test builds).
-#[cfg(feature = "ktest")]
-static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Sessions whose places have not gone back.
+static LIVE: Live = Live::new();
 
 /// A session of `c`, an open channel, with `label`, not 0, and a slot of
 /// `priority`, 1-63 under the payer's ceiling, as handle_duplicate checked
@@ -74,38 +73,31 @@ pub fn create(
     let session = Session {
         // The owner is the session's own place, known once it has one.
         slot: Slot::new(priority, Owner::Session(NonNull::dangling())),
-        refs: 1,
+        refs: Refs::one(),
         copies: 0,
         label,
         channel: c,
         payer,
         cleanup: Item::new(),
     };
-    let s = process::session_slot(payer, session).inspect_err(|_| channel::remove_source(c))?;
+    let s = process::paid_alloc(payer, session).inspect_err(|_| channel::remove_source(c))?;
     // SAFETY: the session was just made, nothing else refers to it, and its
     // slot is in no queue.
     unsafe { (*s.as_ptr()).slot = Slot::new(priority, Owner::Session(s)) };
     channel::retain(c, Rights::NONE);
     process::retain_shell(payer);
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LIVE.made();
     Ok(s)
 }
 
-/// The count of references to `s`, through the raw pointer. Test builds
-/// stop a session that went: the poison of its place reaches the count.
+/// The count of references to `s`, through the raw pointer.
 ///
 /// # Safety
 /// `s` is alive, and nothing else borrows the count.
-unsafe fn refs<'a>(s: NonNull<Session>) -> &'a mut u32 {
+#[must_use]
+unsafe fn refs<'a>(s: NonNull<Session>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
-    let refs = unsafe { &mut (*s.as_ptr()).refs };
-    #[cfg(feature = "ktest")]
-    assert!(
-        *refs != u32::from_ne_bytes([POISON; 4]),
-        "a session is used after it went"
-    );
-    refs
+    unsafe { &mut (*s.as_ptr()).refs }
 }
 
 /// The slot of `s`, which lives as long as the session.
@@ -137,9 +129,7 @@ pub fn retain(s: NonNull<Session>, rights: Rights) {
     // SAFETY: the caller holds a reference, so the session is alive; only
     // the fields are touched.
     unsafe {
-        let refs = refs(s);
-        assert!(*refs > 0, "a session nobody refers to is retained");
-        *refs = refs.checked_add(1).expect("session references overflow");
+        refs(s).retain();
         let p = s.as_ptr();
         (*p).copies = (*p).copies.checked_add(1).expect("session copies overflow");
         if rights.contains(Rights::RECEIVE) {
@@ -162,7 +152,7 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
     // SAFETY: the handle's reference keeps the session alive until its
     // `unref`; only the fields are touched.
     unsafe {
-        refs(s);
+        refs(s).check();
         let p = s.as_ptr();
         let c = (*p).channel;
         if rights.contains(Rights::RECEIVE) {
@@ -186,8 +176,7 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
 pub fn hold(s: NonNull<Session>) {
     // SAFETY: the channel's caller holds a reference to the session; only
     // the count is touched.
-    let refs = unsafe { refs(s) };
-    *refs = refs.checked_add(1).expect("session references overflow");
+    unsafe { refs(s) }.take();
 }
 
 /// Drops a reference to `s` that no handle held: the one `create` handed
@@ -201,11 +190,7 @@ pub unsafe fn unref(s: NonNull<Session>, cause: u8) {
     // SAFETY: the caller's reference keeps the session alive until here;
     // the pool keeps it in place until its portion.
     unsafe {
-        let refs = refs(s);
-        *refs = refs
-            .checked_sub(1)
-            .expect("a session is released once too often");
-        if *refs == 0 {
+        if refs(s).release() {
             let item = NonNull::new_unchecked(&raw mut (*s.as_ptr()).cleanup);
             cleanup::enqueue(item, Object::Session(s), cause);
         }
@@ -235,20 +220,10 @@ pub unsafe fn clean(s: NonNull<Session>, level: u8) {
     channel::remove_source(c);
     // SAFETY: nothing uses the session afterwards; the payer's pool is
     // there, since the session holds the payer's shell.
-    unsafe { process::free_session_slot(payer, s) };
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    // Test builds poison the place past the pool's link, as for channels:
-    // `refs` stops a use after free.
-    #[cfg(feature = "ktest")]
-    // SAFETY: the place is the pool's again; its first word is the link.
     unsafe {
-        core::ptr::write_bytes(
-            s.cast::<u8>().as_ptr().add(8),
-            POISON,
-            core::mem::size_of::<Session>() - 8,
-        )
-    };
+        process::paid_free(payer, s);
+        LIVE.gone(s);
+    }
     // SAFETY: the session's references to its channel and to its payer's
     // shell go with it.
     unsafe {
@@ -257,12 +232,7 @@ pub unsafe fn clean(s: NonNull<Session>, level: u8) {
     }
 }
 
-/// What test builds fill a gone session with, past the pool's link.
-#[cfg(feature = "ktest")]
-const POISON: u8 = 0xA5;
-
-// The poison reaches `refs`, which `refs` checks.
-#[cfg(feature = "ktest")]
+// The poison of a session that went (Live::gone) reaches its count.
 const _: () = assert!(core::mem::offset_of!(Session, refs) >= 8);
 
 #[cfg(feature = "ktest")]
@@ -275,7 +245,7 @@ mod test_access {
 
     /// Sessions whose places have not gone back.
     pub fn in_use() -> usize {
-        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+        LIVE.count()
     }
 
     /// The priority of the slot of `s`, which the test holds.

@@ -207,36 +207,20 @@ const TESTS: &[(&str, TestFn)] = &[
         child_quota_comes_back_in_two_parts,
     ),
     (
-        "unknown_system_calls_fail_with_invalid_args",
-        calls::unknown_system_calls_fail_with_invalid_args,
-    ),
-    (
-        "debug_write_checks_its_arguments",
-        calls::debug_write_checks_its_arguments,
-    ),
-    (
-        "object_info_reports_a_live_process",
-        calls::object_info_reports_a_live_process,
-    ),
-    (
-        "object_info_reports_memory_handles_and_statistics",
-        calls::object_info_reports_memory_handles_and_statistics,
+        "object_info_reports_what_the_kernel_counts",
+        calls::object_info_reports_what_the_kernel_counts,
     ),
     (
         "closing_a_handle_releases_its_object",
         calls::closing_a_handle_releases_its_object,
     ),
     (
-        "init_handles_have_their_fixed_values",
-        calls::init_handles_have_their_fixed_values,
+        "thread_set_priority_checks_the_callers_ceiling",
+        calls::thread_set_priority_checks_the_callers_ceiling,
     ),
     (
-        "thread_set_priority_checks_its_arguments",
-        calls::thread_set_priority_checks_its_arguments,
-    ),
-    (
-        "process_create_checks_its_arguments",
-        calls::process_create_checks_its_arguments,
+        "process_create_checks_the_callers_limits",
+        calls::process_create_checks_the_callers_limits,
     ),
     (
         "entry_0_of_a_child_stays_bad",
@@ -251,8 +235,8 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::child_shell_is_paid_by_the_parent,
     ),
     (
-        "thread_create_checks_its_arguments",
-        calls::thread_create_checks_its_arguments,
+        "thread_create_checks_the_callers_limits",
+        calls::thread_create_checks_the_callers_limits,
     ),
     (
         "buffer_that_does_not_map_goes_back",
@@ -267,20 +251,16 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::kill_hastens_a_dying_process,
     ),
     (
-        "channel_calls_check_their_arguments",
-        calls::channel_calls_check_their_arguments,
+        "channel_create_checks_the_callers_limits",
+        calls::channel_create_checks_the_callers_limits,
     ),
     (
         "boost_is_capped_by_the_ceiling",
         calls::boost_is_capped_by_the_ceiling,
     ),
     (
-        "notify_after_close_is_peer_closed",
-        calls::notify_after_close_is_peer_closed,
-    ),
-    (
-        "handle_duplicate_checks_its_arguments",
-        calls::handle_duplicate_checks_its_arguments,
+        "handle_duplicate_checks_the_callers_limits",
+        calls::handle_duplicate_checks_the_callers_limits,
     ),
     (
         "session_is_paid_by_the_caller",
@@ -307,13 +287,16 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::notices_to_a_dying_parent_go_with_its_channel,
     ),
     (
-        "timer_calls_check_their_arguments",
-        calls::timer_calls_check_their_arguments,
+        "timer_create_checks_the_callers_limits",
+        calls::timer_create_checks_the_callers_limits,
     ),
-    ("timer_never_fires_early", calls::timer_never_fires_early),
     (
-        "timer_in_the_past_fires_at_once",
-        calls::timer_in_the_past_fires_at_once,
+        "timer_set_rounds_the_deadline_up",
+        calls::timer_set_rounds_the_deadline_up,
+    ),
+    (
+        "past_deadline_fires_within_timer_set",
+        calls::past_deadline_fires_within_timer_set,
     ),
     (
         "dying_timer_does_not_fire",

@@ -8,10 +8,13 @@
 //! A channel handle with a label names the label's session, which names
 //! the channel (spec 5.3) and counts its handles as its copies. The system
 //! resource is one for the whole system and is not counted: what a handle
-//! to it allows is in the handle's rights.
+//! to it allows is in the handle's rights. Every kind of object keeps its
+//! count in a `Refs` and its number in a `Live`.
 
 use crate::channel::{self, Channel};
 use crate::mm::pages::KernelPages;
+#[cfg(feature = "ktest")]
+use crate::mm::pages::POISON;
 use crate::process::{self, Process};
 use crate::session::{self, Session};
 use crate::thread::{self, Thread};
@@ -19,6 +22,8 @@ use crate::timer::{self, Timer};
 use abi::{MESSAGE_HANDLES, ObjectKind, Rights};
 use core::mem::{MaybeUninit, align_of, size_of};
 use core::ptr::NonNull;
+#[cfg(feature = "ktest")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kcore::handles::{Chunk, ChunkSource, Directory, HandleTable};
 use kcore::slab::{PaidPages, Pool};
 
@@ -101,6 +106,125 @@ impl Object {
             Object::Timer(_) => ObjectKind::Timer,
             Object::Resource => ObjectKind::Resource,
         }
+    }
+}
+
+/// The count of references that keep a kernel object (spec 4, 7.7): which
+/// ones each kind names. The last one to go queues the object for cleanup.
+/// Test builds poison an object whose place went back to its pool
+/// (`Live::gone`), and every use of the count stops on the poison.
+pub struct Refs(u32);
+
+impl Refs {
+    /// The first reference, which the object's `create` hands out.
+    pub const fn one() -> Refs {
+        Refs(1)
+    }
+
+    /// Stops test builds on an object that went: the poison of its place
+    /// reached the count. Nothing in the build that ships.
+    #[track_caller]
+    pub fn check(&self) {
+        #[cfg(feature = "ktest")]
+        assert!(
+            self.0 != u32::from_ne_bytes([POISON; 4]),
+            "an object is used after it went"
+        );
+    }
+
+    /// Adds a reference to an object someone refers to. An object nobody
+    /// refers to waits for its portion of cleanup, and taking it back from
+    /// the queue would free it twice.
+    #[track_caller]
+    pub fn retain(&mut self) {
+        self.check();
+        assert!(self.0 > 0, "an object nobody refers to is retained");
+        self.0 = self.0.checked_add(1).expect("references overflow");
+    }
+
+    /// Adds a reference with no check of the count: the cleanup queue's
+    /// own, which it takes when the last reference just went, or one that
+    /// a reference of the caller keeps.
+    #[track_caller]
+    pub fn take(&mut self) {
+        self.check();
+        self.0 = self.0.checked_add(1).expect("references overflow");
+    }
+
+    /// Drops a reference; true when it was the last.
+    #[track_caller]
+    pub fn release(&mut self) -> bool {
+        self.check();
+        self.0 = self
+            .0
+            .checked_sub(1)
+            .expect("an object is released once too often");
+        self.0 == 0
+    }
+
+    /// Drops `n` references, none of them the last.
+    #[track_caller]
+    pub fn release_many(&mut self, n: u32) {
+        self.check();
+        self.0 = self
+            .0
+            .checked_sub(n)
+            .filter(|&left| left > 0)
+            .expect("the last reference went with others");
+    }
+
+    /// The count.
+    #[track_caller]
+    pub fn get(&self) -> u32 {
+        self.check();
+        self.0
+    }
+}
+
+/// The objects of one kind whose places have not gone back to their pool,
+/// counted in test builds (crate::ktest); nothing in the build that ships.
+pub struct Live(#[cfg(feature = "ktest")] AtomicUsize);
+
+impl Live {
+    pub const fn new() -> Live {
+        Live(
+            #[cfg(feature = "ktest")]
+            AtomicUsize::new(0),
+        )
+    }
+
+    /// One more object of the kind.
+    pub fn made(&self) {
+        #[cfg(feature = "ktest")]
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The place of `object` just went back to its pool: one object fewer,
+    /// and test builds poison the place past the pool's link, so that its
+    /// `Refs` stops a use after free.
+    ///
+    /// # Safety
+    /// The place is the pool's again, its first 8 bytes the pool's link, and
+    /// nothing uses the object afterwards.
+    pub unsafe fn gone<T>(&self, _object: NonNull<T>) {
+        #[cfg(feature = "ktest")]
+        {
+            self.0.fetch_sub(1, Ordering::Relaxed);
+            // SAFETY: the caller's promise; the link stays.
+            unsafe {
+                core::ptr::write_bytes(
+                    _object.cast::<u8>().as_ptr().add(8),
+                    POISON,
+                    size_of::<T>() - 8,
+                )
+            };
+        }
+    }
+
+    /// The objects of the kind now.
+    #[cfg(feature = "ktest")]
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
     }
 }
 

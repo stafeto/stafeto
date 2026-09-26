@@ -33,7 +33,7 @@
 //! took lives on without the channel.
 
 use crate::cleanup::{self, Item};
-use crate::object::{self, Object};
+use crate::object::{self, Live, Object, Refs};
 use crate::process::{self, Process};
 use crate::sched::{self, Locked};
 use crate::session::{self, Session};
@@ -208,7 +208,7 @@ pub struct Channel {
     /// through a handle with no label), the sources that have a slot in it,
     /// and the cleanup queue's while it is at its stage Close: the
     /// references that keep it.
-    refs: u32,
+    refs: Refs,
     /// Sources with a slot in it, the slot of label 0 among them: at most
     /// abi::MAX_SLOTS (spec 6.5).
     sources: u32,
@@ -232,9 +232,8 @@ unsafe impl Send for Channel {}
 // Six channels to a page of a pool (spec 7.8).
 const _: () = assert!(core::mem::size_of::<Channel>() <= 1024);
 
-/// Channels whose slots have not gone back (test builds).
-#[cfg(feature = "ktest")]
-static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Channels whose slots have not gone back.
+static LIVE: Live = Live::new();
 
 /// A channel of `payer`, the process of the thread that makes it, whose
 /// slot of label 0 has `priority`: 1-63 and no higher than the payer's
@@ -247,34 +246,27 @@ pub fn create(payer: NonNull<Process>, priority: u8) -> Result<NonNull<Channel>,
         slot: Slot::new(priority, Owner::Channel),
         queue: Queue::new(),
         receivers: 0,
-        refs: 1,
+        refs: Refs::one(),
         sources: 1,
         closed: false,
         cause: 0,
         payer,
         cleanup: Item::new(),
     };
-    let c = process::channel_slot(payer, channel)?;
+    let c = process::paid_alloc(payer, channel)?;
     process::retain_shell(payer);
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LIVE.made();
     Ok(c)
 }
 
-/// The count of references to `c`, through the raw pointer. Test builds
-/// stop a channel that went: the poison of its slot reaches the count.
+/// The count of references to `c`, through the raw pointer.
 ///
 /// # Safety
 /// `c` is alive, and nothing else borrows the count.
-unsafe fn refs<'a>(c: NonNull<Channel>) -> &'a mut u32 {
+#[must_use]
+unsafe fn refs<'a>(c: NonNull<Channel>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
-    let refs = unsafe { &mut (*c.as_ptr()).refs };
-    #[cfg(feature = "ktest")]
-    assert!(
-        *refs != u32::from_ne_bytes([POISON; 4]),
-        "a channel is used after it went"
-    );
-    refs
+    unsafe { &mut (*c.as_ptr()).refs }
 }
 
 /// The queue of `c`, which changes together with the states of the
@@ -295,9 +287,7 @@ pub fn retain(c: NonNull<Channel>, rights: Rights) {
     // SAFETY: the caller holds a reference, so the channel is alive; only
     // the fields are touched.
     unsafe {
-        let refs = refs(c);
-        assert!(*refs > 0, "a channel nobody refers to is retained");
-        *refs = refs.checked_add(1).expect("channel references overflow");
+        refs(c).retain();
         if rights.contains(Rights::RECEIVE) {
             let p = c.as_ptr();
             assert!(!(*p).closed, "a handle with RECEIVE to a closed channel");
@@ -330,11 +320,7 @@ pub unsafe fn release(c: NonNull<Channel>, rights: Rights, cause: u8) {
                 close(c, cause);
             }
         }
-        let refs = refs(c);
-        *refs = refs
-            .checked_sub(1)
-            .expect("a channel is released once too often");
-        if *refs == 0 {
+        if refs(c).release() {
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
             cleanup::enqueue(item, Object::Channel(c), cause);
         }
@@ -392,8 +378,7 @@ unsafe fn close(c: NonNull<Channel>, cause: u8) {
             return;
         };
         (*p).cause = cause;
-        let refs = refs(c);
-        *refs = refs.checked_add(1).expect("channel references overflow");
+        refs(c).take();
         let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
         cleanup::enqueue(item, Object::Channel(c), top.max(cause));
     }
@@ -1075,7 +1060,7 @@ pub unsafe fn raise(w: Wait) {
 pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
     // SAFETY: the caller's promise: the queue's reference keeps the channel
     // at its stage Close, and nothing refers to a shell.
-    if unsafe { *refs(c) } == 0 {
+    if unsafe { refs(c) }.get() == 0 {
         // SAFETY: as above.
         unsafe { free(c, level) };
         return;
@@ -1141,11 +1126,7 @@ pub unsafe fn clean(c: NonNull<Channel>, level: u8) {
     // SAFETY: the references of the waits go; the queue's keeps the
     // channel, and then goes itself once nothing is left.
     unsafe {
-        let refs = refs(c);
-        *refs = refs
-            .checked_sub(woken)
-            .filter(|&n| n > 0)
-            .expect("the queue's reference to a closing channel went");
+        refs(c).release_many(woken);
         match left {
             Some(top) => {
                 let item = NonNull::new_unchecked(&raw mut (*c.as_ptr()).cleanup);
@@ -1174,30 +1155,15 @@ unsafe fn free(c: NonNull<Channel>, level: u8) {
     );
     // SAFETY: nothing uses the channel afterwards; the payer's pool is
     // there, since the channel holds the payer's shell.
-    unsafe { process::free_channel_slot(payer, c) };
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    // Test builds poison the slot past the pool's link, as for threads:
-    // `refs` stops a use after free.
-    #[cfg(feature = "ktest")]
-    // SAFETY: the slot is the pool's again; its first word is the link.
     unsafe {
-        core::ptr::write_bytes(
-            c.cast::<u8>().as_ptr().add(8),
-            POISON,
-            core::mem::size_of::<Channel>() - 8,
-        )
-    };
+        process::paid_free(payer, c);
+        LIVE.gone(c);
+    }
     // SAFETY: the channel's reference to its payer's shell goes with it.
     unsafe { process::release_shell(payer, level) };
 }
 
-/// What test builds fill a gone channel with, past the pool's link.
-#[cfg(feature = "ktest")]
-const POISON: u8 = 0xA5;
-
-// The poison reaches `refs`, which `refs` checks.
-#[cfg(feature = "ktest")]
+// The poison of a channel that went (Live::gone) reaches its count.
 const _: () = assert!(core::mem::offset_of!(Channel, refs) >= 8);
 
 #[cfg(feature = "ktest")]
@@ -1210,7 +1176,7 @@ mod test_access {
 
     /// Channels whose slots have not gone back.
     pub fn in_use() -> usize {
-        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+        LIVE.count()
     }
 
     /// The process that pays for `c`, which the test holds.

@@ -3,10 +3,15 @@
 
 //! The test init (spec 15.2). It runs in place of init on the normal
 //! build of the kernel, the one that ships, and tests the system calls
-//! from EL0, in its own process and in children with no code. It prints
-//! `TEST <name> ok` or `TEST <name> FAIL <why>` for each test, then
-//! `TESTS DONE total=<n> failed=<m>`, and exits with the number of
-//! failures, which turns the machine off; xtask reads the lines.
+//! from EL0, in its own process and in children with no code. The
+//! contract of the calls is checked here and only here: the order of
+//! their checks, their rights, and that on an error x0 alone changes
+//! (spec 11); the kernel tests keep what a program cannot see or reach,
+//! such as a caller below the highest ceiling or the kernel's own state
+//! after a call. It prints `TEST <name> ok` or `TEST <name> FAIL <why>`
+//! for each test, then `TESTS DONE total=<n> failed=<m>`, and exits with
+//! the number of failures, which turns the machine off; xtask reads the
+//! lines.
 //!
 //! Its first line gives the counter ticks of a counted loop, which xtask
 //! checks in the runs under -icount. The first test runs with the
@@ -37,7 +42,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 99] = [
+const TESTS: [Test; 106] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -55,6 +60,18 @@ const TESTS: [Test; 99] = [
     ),
     ("unknown_system_calls_fail", unknown_system_calls_fail),
     ("priority_ceilings_hold", priority_ceilings_hold),
+    (
+        "thread_set_priority_checks_its_arguments",
+        thread_set_priority_checks_its_arguments,
+    ),
+    (
+        "thread_create_checks_its_arguments",
+        thread_create_checks_its_arguments,
+    ),
+    (
+        "thread_start_and_process_kill_check_their_handles",
+        thread_start_and_process_kill_check_their_handles,
+    ),
     ("thread_states", thread_states),
     ("thread_limit_is_64", thread_limit_is_64),
     (
@@ -85,9 +102,17 @@ const TESTS: [Test; 99] = [
         "kill_takes_a_ready_thread_off_the_queue",
         kill_takes_a_ready_thread_off_the_queue,
     ),
+    (
+        "process_create_checks_its_arguments",
+        process_create_checks_its_arguments,
+    ),
     ("quota_is_enforced", quota_is_enforced),
     ("process_info_kinds", process_info_kinds),
     ("kernel_stats_need_kstats", kernel_stats_need_kstats),
+    (
+        "object_info_checks_its_arguments",
+        object_info_checks_its_arguments,
+    ),
     (
         "process_kill_returns_after_the_teardown",
         process_kill_returns_after_the_teardown,
@@ -123,6 +148,10 @@ const TESTS: [Test; 99] = [
         waiting_receiver_gets_peer_closed,
     ),
     ("duplicate_narrows_rights", duplicate_narrows_rights),
+    (
+        "handle_duplicate_checks_its_arguments",
+        handle_duplicate_checks_its_arguments,
+    ),
     (
         "client_gone_after_the_last_copy",
         client_gone_after_the_last_copy,
@@ -176,6 +205,10 @@ const TESTS: [Test; 99] = [
         clock_now_follows_the_counter,
     ),
     ("timer_needs_receive", timer_needs_receive),
+    (
+        "timer_set_and_cancel_check_their_handles",
+        timer_set_and_cancel_check_their_handles,
+    ),
     ("timer_bounds_a_wait", timer_bounds_a_wait),
     (
         "notification_before_the_timer_comes_first",
@@ -370,6 +403,8 @@ const CHILD_FAULT_ESR: u64 = 0x8200_0007;
 
 /// A line debug_write prints with bytes other than zero past its length.
 const STOPS: &[u8] = b"debug_write stops at its length";
+/// A line debug_write prints with all 64 bytes of x2-x9.
+const LINE: &[u8; 64] = b"test init: debug_write prints all 64 bytes of x2 to x9 in order\n";
 
 fn main(_: u64) -> u64 {
     rt::console::set(&init::RESOURCE);
@@ -564,7 +599,9 @@ fn init_prints_from_el0() -> Outcome {
     check(printed.is_ok(), "debug_write failed")
 }
 
-/// Init's first handles name what spec 13.3 gives it.
+/// Init's first handles name what spec 13.3 gives it, with the rights
+/// abi gives them: copies with abi::INIT_RESOURCE_RIGHTS and
+/// abi::OWNER_RIGHTS are made.
 fn init_handles_have_their_fixed_values() -> Outcome {
     check(
         sys::process_state(&init::PROCESS) == Ok(ProcessState::Alive),
@@ -585,6 +622,15 @@ fn init_handles_have_their_fixed_values() -> Outcome {
     check(
         sys::process_state(&retyped(&init::THREAD)) == Err(Error::WrongType),
         "INIT_THREAD is a process",
+    )?;
+    let copies = [
+        sys::handle_duplicate(&init::RESOURCE, abi::INIT_RESOURCE_RIGHTS).map(close),
+        sys::handle_duplicate(&init::PROCESS, abi::OWNER_RIGHTS).map(close),
+        sys::handle_duplicate(&init::THREAD, abi::OWNER_RIGHTS).map(close),
+    ];
+    check(
+        copies.iter().all(|c| matches!(c, Ok(Ok(())))),
+        "init's first handles do not carry every right abi gives them",
     )
 }
 
@@ -630,45 +676,71 @@ fn init_has_its_message_buffer() -> Outcome {
     check(read == 0x5354_4146, "init's message buffer lost a word")
 }
 
-/// debug_write takes up to 64 bytes through a handle with DEBUG to the
-/// system resource and writes only the bytes of its length (spec 11).
+/// debug_write(x0 resource with DEBUG, x1 length, x2-x9 bytes) checks the
+/// length first, then the handle, its type and its rights (spec 11), and
+/// changes x0 alone on an error: a length past 64 fails with INVALID_ARGS,
+/// through a closed handle too; a closed handle and handle 0 fail with
+/// BAD_HANDLE, a process with WRONG_TYPE, a copy of the resource without
+/// DEBUG with ACCESS_DENIED. A good call writes the bytes of its length and
+/// returns their count in x1 alone: all 64 bytes of x2-x9 in order, and
+/// only those of a shorter length; xtask finds both lines whole.
 fn debug_write_checks_its_arguments() -> Outcome {
-    let mut x = marked();
-    x[0] = init::RESOURCE.raw().0;
-    x[1] = abi::INLINE_MAX as u64 + 1;
-    // SAFETY: debug_write only reads its registers.
-    let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
+    let gone = closed_handle()?;
+    let stats = copy(&init::RESOURCE, Rights::KSTATS)?;
+    let result = debug_write_cases(gone, stats.raw().0);
+    close(stats)?;
+    result
+}
+
+fn debug_write_cases(gone: u64, no_debug: u64) -> Outcome {
+    const N: u16 = Call::DebugWrite.number();
+    let resource = init::RESOURCE.raw().0;
+    let past = abi::INLINE_MAX as u64 + 1;
+    let lengths = [
+        (resource, past),
+        (resource, u64::MAX),
+        (resource, 1 << 32),
+        (gone, past),
+    ]
+    .into_iter()
+    .all(|(h, len)| x0_alone::<N>(&[h, len], Error::InvalidArgs.code()));
+    let handles = [
+        (gone, Error::BadHandle),
+        (0, Error::BadHandle),
+        (init::PROCESS.raw().0, Error::WrongType),
+        (no_debug, Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(h, error)| x0_alone::<N>(&[h, 1], error.code()));
     check(
-        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
-        "65 bytes did not fail with INVALID_ARGS alone",
+        lengths,
+        "a length past 64 did not fail with INVALID_ARGS alone before the handle",
     )?;
     check(
-        sys::debug_write(&retyped(&init::PROCESS), b"x") == Err(Error::WrongType),
-        "a process handle wrote",
+        handles,
+        "a closed handle, handle 0, a process or a copy without DEBUG did not fail alone",
     )?;
-    let c = child(LOW)?;
-    let gone = retyped(&c);
-    close(c)?;
     check(
-        sys::debug_write(&gone, b"x") == Err(Error::BadHandle),
-        "a closed handle wrote",
-    )?;
-    let mut bytes = [b'#'; abi::INLINE_MAX];
-    bytes[..STOPS.len()].copy_from_slice(STOPS);
-    let mut x = [0; 10];
-    x[0] = init::RESOURCE.raw().0;
-    x[1] = STOPS.len() as u64;
-    x[2..].copy_from_slice(&abi::inline_words(&bytes));
-    // SAFETY: as above.
-    let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
-    check(
-        after[..2] == [0, STOPS.len() as u64],
-        "debug_write did not write the bytes of its length",
+        written(LINE) && written(STOPS),
+        "debug_write did not write the bytes of its length and return their count alone",
     )?;
     check(
         sys::debug_write(&init::RESOURCE, b"\n") == Ok(1),
         "debug_write did not write a newline",
     )
+}
+
+/// debug_write of `line` with `#` past it in x2-x9 returns the length of
+/// `line` in x1 and changes nothing past it.
+fn written(line: &[u8]) -> bool {
+    let mut bytes = [b'#'; abi::INLINE_MAX];
+    bytes[..line.len()].copy_from_slice(line);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[init::RESOURCE.raw().0, line.len() as u64]);
+    x[2..].copy_from_slice(&abi::inline_words(&bytes));
+    // SAFETY: debug_write only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
+    after[..2] == [0, line.len() as u64] && after[2..] == x[2..]
 }
 
 /// Numbers no call has fail with INVALID_ARGS and change x0 alone
@@ -734,6 +806,226 @@ fn priority_ceilings_hold() -> Outcome {
     }
     check(refused, "a thread above its process's ceiling was made")?;
     check(made, "a thread at its process's ceiling was not made")
+}
+
+/// The end of the lower half, where the addresses of programs lie
+/// (spec 7.2).
+const LOWER_END: u64 = 1 << 48;
+
+/// The value of a copy of the system resource that init closed: BAD_HANDLE
+/// from then on (spec 5.1).
+fn closed_handle() -> Result<u64, &'static str> {
+    let h = copy(&init::RESOURCE, Rights::NONE)?;
+    let value = h.raw().0;
+    close(h)?;
+    Ok(value)
+}
+
+/// Call `N` with `args` in x0 and up and marks in the rest of x0-x9: true
+/// when x0 comes back as `x0`, 0 or the code of an error, and no other
+/// register changed (spec 11).
+fn x0_alone<const N: u16>(args: &[u64], x0: u64) -> bool {
+    let mut x = marked();
+    x[..args.len()].copy_from_slice(args);
+    // SAFETY: the tests pass arguments the call refuses, or make a call
+    // that returns nothing; none of them runs code of init or uses its
+    // memory.
+    let after = unsafe { sys::raw::<N>(x) };
+    after[0] == x0 && after[1..] == x[1..]
+}
+
+/// thread_set_priority(x0 thread with MANAGE, x1 priority, x2 policy)
+/// checks its values first, then the handle, then the ceilings, then the
+/// thread's state (spec 8, 11), and changes x0 alone on an error: a
+/// priority outside 1-63 or with bits past its byte and a policy other
+/// than round robin and FIFO fail with INVALID_ARGS, through a closed
+/// handle too; a closed handle fails with BAD_HANDLE, the system resource
+/// with WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. A priority
+/// above the ceiling of the thread's process, 20 here, fails with
+/// ACCESS_DENIED, and still does once the process ended, before
+/// BAD_STATE. The ceiling of the caller's own process is a kernel test:
+/// init's is the highest level.
+fn thread_set_priority_checks_its_arguments() -> Outcome {
+    let gone = closed_handle()?;
+    let c = child(20)?;
+    let t = child_thread(&c, LEVEL);
+    let result = match &t {
+        Ok(t) => set_priority_cases(&c, t, gone),
+        Err(_) => Err("thread_create in the child failed"),
+    };
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    result
+}
+
+fn set_priority_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Outcome {
+    const N: u16 = Call::ThreadSetPriority.number();
+    let (rr, fifo) = (Policy::RoundRobin as u64, Policy::Fifo as u64);
+    let weak = copy(t, Rights::DUPLICATE)?;
+    let h = t.raw().0;
+    let values = [(0, rr), (64, rr), (0x100 | 10, rr), (10, 2), (10, 1 << 32)]
+        .into_iter()
+        .all(|(priority, policy)| {
+            [h, gone]
+                .into_iter()
+                .all(|h| x0_alone::<N>(&[h, priority, policy], Error::InvalidArgs.code()))
+        });
+    let handles = [
+        (gone, Error::BadHandle),
+        (init::RESOURCE.raw().0, Error::WrongType),
+        (weak.raw().0, Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(h, error)| x0_alone::<N>(&[h, 10, rr], error.code()));
+    let ceiling =
+        x0_alone::<N>(&[h, 21, rr], Error::AccessDenied.code()) && x0_alone::<N>(&[h, 20, rr], 0);
+    let killed = sys::process_kill(c);
+    let ended = x0_alone::<N>(&[h, 21, fifo], Error::AccessDenied.code())
+        && x0_alone::<N>(&[h, 20, fifo], Error::BadState.code());
+    close(weak)?;
+    check(
+        values,
+        "a bad priority or policy did not fail with INVALID_ARGS alone before the handle",
+    )?;
+    check(
+        handles,
+        "a closed handle, the resource or a copy without MANAGE did not fail alone",
+    )?;
+    check(
+        ceiling,
+        "the ceiling of the thread's process did not hold, or its level was refused",
+    )?;
+    check(
+        killed.is_ok() && ended,
+        "a thread whose process ended did not fail with ACCESS_DENIED above the ceiling and BAD_STATE under it",
+    )
+}
+
+/// thread_create(x0 process with MANAGE, x1 entry, x2 stack, x3 argument,
+/// x4 priority, x5 policy, x6 buffer) checks its values first, then the
+/// handle, then the ceilings, then whether the buffer's page is free in
+/// the process (spec 8, 11), and changes x0 alone on an error: an entry
+/// past the lower half or off a whole instruction, a stack past it or off
+/// 16 bytes, a priority outside 1-63, an unknown policy and a buffer at
+/// page 0, off a whole page or past the lower half fail with INVALID_ARGS,
+/// through a closed handle too; a closed handle fails with BAD_HANDLE, a
+/// thread with WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. The
+/// page of another thread's buffer fails with INVALID_ARGS, after the
+/// ceiling of the process, 20 here. The caller's own ceiling is a kernel
+/// test: init's is the highest level.
+fn thread_create_checks_its_arguments() -> Outcome {
+    let gone = closed_handle()?;
+    let c = child(20)?;
+    let t = child_thread(&c, LEVEL);
+    let result = match &t {
+        Ok(t) => thread_create_cases(&c, t, gone),
+        Err(_) => Err("thread_create in the child failed"),
+    };
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    result
+}
+
+fn thread_create_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Outcome {
+    const N: u16 = Call::ThreadCreate.number();
+    let weak = copy(c, Rights::DUPLICATE)?;
+    let fifo = Policy::Fifo as u64;
+    // The page after the child's thread's buffer is free.
+    let (entry, stack, free) = (CHILD_ENTRY, 0x80_1000, CHILD_BUFFER + PAGE as u64);
+    let args =
+        |h, entry, stack, priority, policy, buffer| [h, entry, stack, 7, priority, policy, buffer];
+    let values = [c.raw().0, gone].into_iter().all(|h| {
+        [
+            args(h, LOWER_END, stack, 10, fifo, free),
+            args(h, entry + 2, stack, 10, fifo, free),
+            args(h, entry, stack - 8, 10, fifo, free),
+            args(h, entry, LOWER_END + 16, 10, fifo, free),
+            args(h, entry, stack, 0, fifo, free),
+            args(h, entry, stack, 64, fifo, free),
+            args(h, entry, stack, 10, 2, free),
+            args(h, entry, stack, 10, fifo, free + 8),
+            args(h, entry, stack, 10, fifo, LOWER_END),
+            args(h, entry, stack, 10, fifo, 0),
+        ]
+        .iter()
+        .all(|a| x0_alone::<N>(a, Error::InvalidArgs.code()))
+    });
+    let handles = [
+        (gone, Error::BadHandle),
+        (t.raw().0, Error::WrongType),
+        (weak.raw().0, Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(h, error)| x0_alone::<N>(&args(h, entry, stack, 10, fifo, free), error.code()));
+    let taken = x0_alone::<N>(
+        &args(c.raw().0, entry, stack, 10, fifo, CHILD_BUFFER),
+        Error::InvalidArgs.code(),
+    ) && x0_alone::<N>(
+        &args(c.raw().0, entry, stack, 21, fifo, CHILD_BUFFER),
+        Error::AccessDenied.code(),
+    );
+    close(weak)?;
+    check(
+        values,
+        "a bad entry, stack, priority, policy or buffer did not fail with INVALID_ARGS alone before the handle",
+    )?;
+    check(
+        handles,
+        "a closed handle, a thread or a copy without MANAGE did not fail alone",
+    )?;
+    check(
+        taken,
+        "a buffer on a taken page did not fail with INVALID_ARGS after the ceiling",
+    )
+}
+
+/// thread_start(x0 thread with MANAGE) and process_kill(x0 process with
+/// MANAGE) check their handle (spec 11) and change x0 alone on an error:
+/// handle 0 fails with BAD_HANDLE, a handle of the other kind with
+/// WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. A stopped thread
+/// of a process that ended does not start: BAD_STATE.
+fn thread_start_and_process_kill_check_their_handles() -> Outcome {
+    let c = child(LOW)?;
+    let t = child_thread(&c, LOW);
+    let result = match &t {
+        Ok(t) => start_and_kill_cases(&c, t),
+        Err(_) => Err("thread_create in the child failed"),
+    };
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    result
+}
+
+fn start_and_kill_cases(c: &Handle<Process>, t: &Handle<Thread>) -> Outcome {
+    const START: u16 = Call::ThreadStart.number();
+    const KILL: u16 = Call::ProcessKill.number();
+    let (weak_c, weak_t) = (copy(c, Rights::DUPLICATE)?, copy(t, Rights::DUPLICATE)?);
+    let refused = [
+        x0_alone::<START>(&[0], Error::BadHandle.code()),
+        x0_alone::<START>(&[c.raw().0], Error::WrongType.code()),
+        x0_alone::<START>(&[weak_t.raw().0], Error::AccessDenied.code()),
+        x0_alone::<KILL>(&[0], Error::BadHandle.code()),
+        x0_alone::<KILL>(&[t.raw().0], Error::WrongType.code()),
+        x0_alone::<KILL>(&[weak_c.raw().0], Error::AccessDenied.code()),
+    ];
+    let killed = sys::process_kill(c);
+    let late = x0_alone::<START>(&[t.raw().0], Error::BadState.code());
+    close(weak_c)?;
+    close(weak_t)?;
+    check(
+        refused.iter().all(|&ok| ok),
+        "handle 0, a handle of the other kind or a copy without MANAGE did not fail alone",
+    )?;
+    check(
+        killed.is_ok() && late,
+        "a stopped thread of a process that ended did not fail with BAD_STATE alone",
+    )
 }
 
 /// Calls on a thread or a process in the wrong state fail with BAD_STATE:
@@ -1025,6 +1317,55 @@ fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
     check(again.is_ok(), "a second kill of the dead child failed")
 }
 
+/// process_create(x0 quota, x1 table limit, x2 ceiling, x3 exit channel,
+/// x4 its priority, x5 start channel) checks its values before its
+/// handles (spec 7.5, 11) and changes x0 alone on an error: a quota of 0
+/// or off whole pages, a limit outside 1-16384 or with bits past its word
+/// and a ceiling outside 1-63 or with bits past its byte fail with
+/// INVALID_ARGS, with closed handles in x3 and x5 too; so do a priority in
+/// x4 without an exit channel and an exit channel without one, whatever
+/// x3 holds. What x3 and x5 name is exit_channel_needs_notify and
+/// start_handle_must_be_a_channel; the caller's own ceiling is a kernel
+/// test: init's is the highest level.
+fn process_create_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::ProcessCreate.number();
+    let gone = closed_handle()?;
+    let page = PAGE as u64;
+    let values = [
+        [0, 16, 20],
+        [page - 1, 16, 20],
+        [page + 8, 16, 20],
+        [page, 0, 20],
+        [page, 16_385, 20],
+        [page, 1 << 32 | 16, 20],
+        [page, 16, 0],
+        [page, 16, 64],
+        [page, 16, 0x100 | 20],
+    ]
+    .into_iter()
+    .all(|[quota, limit, ceiling]| {
+        [[0, 0, 0], [gone, 5, gone]]
+            .into_iter()
+            .all(|[x3, x4, x5]| {
+                x0_alone::<N>(
+                    &[quota, limit, ceiling, x3, x4, x5],
+                    Error::InvalidArgs.code(),
+                )
+            })
+    });
+    let pairs = [[0, 5], [gone, 0]]
+        .into_iter()
+        .all(|[x3, x4]| x0_alone::<N>(&[page, 16, 20, x3, x4, 0], Error::InvalidArgs.code()));
+    check(
+        values,
+        "a bad quota, limit or ceiling did not fail with INVALID_ARGS alone before the handles",
+    )?;
+    check(
+        pairs,
+        "x4 without x3 or x3 without x4 did not fail with INVALID_ARGS alone",
+    )
+}
+
 /// A child's quota comes off init's (spec 7.5): more than init has free
 /// fails with NO_MEMORY and changes x0 alone, and so does a page, too
 /// small for the child's own objects; a child that was not made gave
@@ -1161,6 +1502,88 @@ fn kernel_stats_need_kstats() -> Outcome {
     check(
         stats.cleanup_queue == 0 && stats.free_frames > 0 && stats.pool_pages > 0,
         "the queue is not empty, or no frame or pool page is counted",
+    )
+}
+
+/// object_info(x0 handle, x1 kind, x2 0) checks the kind and x2 first,
+/// then the handle, its type and its rights (spec 11, 16), and changes x0
+/// alone on an error: kind 0, a kind past KERNEL_STATS or with bits past
+/// its word and a nonzero x2 fail with INVALID_ARGS, for handle 0 too;
+/// handle 0 with a good kind fails with BAD_HANDLE. The kinds of a process
+/// take a process handle with any rights, and the system resource or a
+/// thread is WRONG_TYPE; KERNEL_STATS takes the system resource with
+/// KSTATS, and a process is WRONG_TYPE, a copy without KSTATS
+/// ACCESS_DENIED. A good call writes nothing past its words:
+/// PROCESS_STATE, «alive» here, x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
+/// x1-x3.
+fn object_info_checks_its_arguments() -> Outcome {
+    let own = copy(&init::PROCESS, Rights::NONE)?;
+    let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let result = object_info_cases(own.raw().0, debug.raw().0);
+    close(own)?;
+    close(debug)?;
+    result
+}
+
+fn object_info_cases(own: u64, debug: u64) -> Outcome {
+    const N: u16 = Call::ObjectInfo.number();
+    let (state, memory, table, stats) = (
+        abi::INFO_PROCESS_STATE,
+        abi::INFO_PROCESS_MEMORY,
+        abi::INFO_PROCESS_HANDLES,
+        abi::INFO_KERNEL_STATS,
+    );
+    let (resource, thread) = (init::RESOURCE.raw().0, init::THREAD.raw().0);
+    let kinds = [
+        [own, 0, 0],
+        [own, stats + 1, 0],
+        [own, state | 1 << 32, 0],
+        [own, state, 8],
+        [0, 0, 0],
+    ]
+    .into_iter()
+    .chain(
+        [memory, table, stats]
+            .into_iter()
+            .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
+    )
+    .all(|args| x0_alone::<N>(&args, Error::InvalidArgs.code()));
+    let handles = [
+        (0, state, Error::BadHandle),
+        (0, memory, Error::BadHandle),
+        (0, table, Error::BadHandle),
+        (0, stats, Error::BadHandle),
+        (resource, state, Error::WrongType),
+        (thread, state, Error::WrongType),
+        (resource, memory, Error::WrongType),
+        (resource, table, Error::WrongType),
+        (own, stats, Error::WrongType),
+        (debug, stats, Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(h, kind, error)| x0_alone::<N>(&[h, kind, 0], error.code()));
+    let written = [(state, 5), (memory, 4), (table, 4)].map(|(kind, past)| {
+        let mut x = marked();
+        x[..3].copy_from_slice(&[own, kind, 0]);
+        // SAFETY: object_info only reads its registers.
+        let after = unsafe { sys::raw::<N>(x) };
+        (after[0] == 0 && after[past..] == x[past..]).then_some(after)
+    });
+    check(
+        kinds,
+        "a bad kind or x2 did not fail with INVALID_ARGS alone before the handle",
+    )?;
+    check(
+        handles,
+        "handle 0, a handle of another kind or one without KSTATS did not fail alone",
+    )?;
+    check(
+        written.iter().all(Option::is_some),
+        "a good object_info failed or wrote past its words",
+    )?;
+    check(
+        written[0].is_some_and(|after| after[1..5] == ProcessState::Alive.to_words()),
+        "PROCESS_STATE of init's process through a copy with no rights is not «alive»",
     )
 }
 
@@ -1424,19 +1847,62 @@ fn notify_and_receive_need_their_rights() -> Outcome {
 
 /// Spec 15.2 (notifications): three notify calls with different bits before
 /// a receive come as one notification of the slot of label 0: the bits
-/// ORed, the count 3. The slot is empty afterwards.
+/// ORed, the count 3, and receive writes 0 as the label and the token in
+/// x10 and x11, whatever they held (spec 11). The slot is empty
+/// afterwards.
 fn notifications_merge_bits_and_count() -> Outcome {
     let c = channel(QUIET)?;
     let posted = [0b001, 0b100, 0b100 | 1 << 40]
         .into_iter()
         .try_for_each(|bits| sys::notify(&c, bits));
-    let got = take_one(&c);
+    let got = receive_x0_to_x11(c.raw(), 0x5A, 0x5B);
+    let rest = sys::try_receive(&c);
     close(c)?;
     check(posted.is_ok(), "notify failed")?;
+    let merged = abi::Notification {
+        source: Source::Unlabeled,
+        label: 0,
+        bits: 0b101 | 1 << 40,
+        count: 3,
+    };
     check(
-        got == Ok(unlabeled(0b101 | 1 << 40, 3)),
-        "the bits did not merge, or the count is not 3",
+        got[0] == 0 && got[1..] == merged.to_words(),
+        "the bits did not merge, the count is not 3, or x10 and x11 are not 0",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock),
+        "a second receive found something",
     )
+}
+
+/// receive with NO_WAIT through `h`, with `x10` and `x11` in x10 and x11:
+/// x0-x11 as the kernel left them (spec 11).
+fn receive_x0_to_x11(h: abi::Handle, x10: u64, x11: u64) -> [u64; 12] {
+    let mut x = [0; 12];
+    x[..2].copy_from_slice(&[h.0, abi::NO_WAIT]);
+    x[10..].copy_from_slice(&[x10, x11]);
+    // SAFETY: receive uses no memory of the program and changes x0-x11
+    // only.
+    unsafe {
+        core::arch::asm!(
+            "svc #{n}",
+            n = const Call::Receive.number(),
+            inout("x0") x[0],
+            inout("x1") x[1],
+            inout("x2") x[2],
+            inout("x3") x[3],
+            inout("x4") x[4],
+            inout("x5") x[5],
+            inout("x6") x[6],
+            inout("x7") x[7],
+            inout("x8") x[8],
+            inout("x9") x[9],
+            inout("x10") x[10],
+            inout("x11") x[11],
+            options(nostack),
+        )
+    };
+    x
 }
 
 /// Bit 63 is CLIENT_GONE, which only the kernel posts (spec 5.3, 6.5):
@@ -1692,6 +2158,61 @@ fn duplicate_narrows_rights() -> Outcome {
     check(
         state == Ok(ProcessState::Alive),
         "a copy of init's process with no rights does not name it",
+    )
+}
+
+/// handle_duplicate(x0 handle, x1 rights, x2 label, x3 priority) checks
+/// its values first, then the handle, whether a label goes on it, then its
+/// rights (spec 5.3, 11), and changes x0 alone on an error: a priority
+/// without a label, a label without a priority and a priority outside
+/// 1-63 or with bits past its byte fail with INVALID_ARGS through a closed
+/// handle too; a closed handle and handle 0 fail with BAD_HANDLE; a label
+/// on what is no channel fails with WRONG_TYPE, a copy without DUPLICATE
+/// of init's process too; a label on a channel copy without DUPLICATE
+/// fails with ACCESS_DENIED. Rights no right has and rights the original
+/// lacks are duplicate_narrows_rights; the caller's own ceiling is a
+/// kernel test: init's is the highest level.
+fn handle_duplicate_checks_its_arguments() -> Outcome {
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let notify_only = copy(&c, Rights::NOTIFY)?;
+    let own = copy(&init::PROCESS, Rights::NONE)?;
+    let result = duplicate_cases(gone, notify_only.raw().0, own.raw().0);
+    close(own)?;
+    close(notify_only)?;
+    close(c)?;
+    result
+}
+
+fn duplicate_cases(gone: u64, notify_only: u64, own: u64) -> Outcome {
+    const N: u16 = Call::HandleDuplicate.number();
+    let notify = u64::from(Rights::NOTIFY.0);
+    let values = [[0, 0, 5], [0, 7, 0], [0, 7, 64], [0, 7, 0x100 | 5]]
+        .into_iter()
+        .all(|[rights, label, priority]| {
+            x0_alone::<N>(&[gone, rights, label, priority], Error::InvalidArgs.code())
+        });
+    let handles = x0_alone::<N>(&[gone, 0, 0, 0], Error::BadHandle.code())
+        && x0_alone::<N>(&[0, 0, 7, 5], Error::BadHandle.code());
+    let kinds = [init::RESOURCE.raw().0, own]
+        .into_iter()
+        .all(|h| x0_alone::<N>(&[h, 0, 7, 5], Error::WrongType.code()));
+    let right = x0_alone::<N>(&[notify_only, notify, 7, 5], Error::AccessDenied.code());
+    check(
+        values,
+        "a bad label or priority did not fail with INVALID_ARGS alone before the handle",
+    )?;
+    check(
+        handles,
+        "a closed handle or handle 0 did not fail with BAD_HANDLE alone",
+    )?;
+    check(
+        kinds,
+        "a label on what is no channel did not fail with WRONG_TYPE alone before the rights",
+    )?;
+    check(
+        right,
+        "a label on a copy without DUPLICATE did not fail with ACCESS_DENIED alone",
     )
 }
 
@@ -2429,6 +2950,53 @@ fn timer_needs_receive() -> Outcome {
         fired.is_ok() && got == Ok(expiry(TIMED, 1)),
         "a timer made through a labelled copy did not carry the label",
     )
+}
+
+/// timer_set(x0 timer with MANAGE, x1 deadline) and timer_cancel(x0 timer
+/// with MANAGE) check their handle (spec 10, 11) and change x0 alone on
+/// an error: a closed handle fails with BAD_HANDLE, a handle to another
+/// kind with WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED.
+/// timer_set on a timer whose channel closed fails with PEER_CLOSED and
+/// changes x0 alone as well; timer_cancel still takes the timer.
+fn timer_set_and_cancel_check_their_handles() -> Outcome {
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let seen = copy(&t, Rights::DUPLICATE)?;
+    let refused = timer_handle_cases(gone, c.raw().0, seen.raw().0);
+    close(seen)?;
+    let armed = clock_now().and_then(|now| arm(&t, now + 1_000_000_000));
+    // The last handle with RECEIVE goes: the channel closes (spec 6.8).
+    close(c)?;
+    let closed = x0_alone::<{ Call::TimerSet.number() }>(&[t.raw().0, 0], Error::PeerClosed.code());
+    let cancelled = sys::timer_cancel(&t);
+    close(t)?;
+    armed?;
+    check(
+        refused,
+        "a closed handle, a handle to another kind or a copy without MANAGE did not fail alone",
+    )?;
+    check(
+        closed,
+        "timer_set on a closed channel did not fail with PEER_CLOSED alone",
+    )?;
+    check(cancelled.is_ok(), "timer_cancel on a closed channel failed")
+}
+
+fn timer_handle_cases(gone: u64, channel: u64, seen: u64) -> bool {
+    const SET: u16 = Call::TimerSet.number();
+    const CANCEL: u16 = Call::TimerCancel.number();
+    let resource = init::RESOURCE.raw().0;
+    [
+        x0_alone::<SET>(&[gone, 0], Error::BadHandle.code()),
+        x0_alone::<CANCEL>(&[gone], Error::BadHandle.code()),
+        x0_alone::<SET>(&[resource, 0], Error::WrongType.code()),
+        x0_alone::<CANCEL>(&[channel], Error::WrongType.code()),
+        x0_alone::<SET>(&[seen, 0], Error::AccessDenied.code()),
+        x0_alone::<CANCEL>(&[seen], Error::AccessDenied.code()),
+    ]
+    .iter()
+    .all(|&ok| ok)
 }
 
 /// Spec 15.2 (time): a timer on a channel and receive make a wait with a

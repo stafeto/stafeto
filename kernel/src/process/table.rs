@@ -157,7 +157,8 @@ pub fn put_handles(
 /// thread, and an entry for the boot image that goes at once, so that
 /// INIT_BOOT_IMAGE stays bad (until milestone 1.3 brings the boot image as
 /// a memory object). The values follow from the order in a fresh table and
-/// are those abi fixes.
+/// are those abi fixes. Test builds have no init.
+#[cfg(not(feature = "ktest"))]
 pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> Result<(), Error> {
     let handles = [
         insert_handle(init, Object::Resource, abi::INIT_RESOURCE_RIGHTS)?,

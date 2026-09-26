@@ -45,7 +45,8 @@ pub unsafe fn give_back(page: NonNull<u8>) {
     TAKEN.fetch_sub(1, Ordering::Relaxed);
 }
 
-/// What test builds fill a page that went back with.
+/// What test builds fill a page that went back with, and an object whose
+/// place went back to its pool past the pool's link (object::Live::gone).
 #[cfg(feature = "ktest")]
 pub const POISON: u8 = 0xA5;
 
