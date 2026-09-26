@@ -40,18 +40,19 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// Tests only the `icount` build has: the first checks that the run is
-/// under -icount; the second measures the portions of the long calls of
-/// memory objects, which only -icount counts in instructions (spec 15.3);
-/// the next two depend on how much of a quantum is left, which only
-/// -icount makes repeatable; the fifth takes a big process apart in
-/// hundreds of portions with interrupts between them, where virtual time
-/// counts instructions and a stall of the host changes nothing; the sixth
-/// measures the round trip of a request; in the last a timer fires in the
-/// middle of each long call of memory objects at the same place on every
-/// run.
-const ICOUNT_TESTS: [&str; 7] = [
+/// under -icount; the second and the third measure the portions of the
+/// long calls of memory objects and of the timers of programs, which only
+/// -icount counts in instructions (spec 15.3); the next two depend on how
+/// much of a quantum is left, which only -icount makes repeatable; the
+/// sixth takes a big process apart in hundreds of portions with interrupts
+/// between them, where virtual time counts instructions and a stall of the
+/// host changes nothing; the seventh measures the round trip of a request;
+/// in the last a timer fires in the middle of each long call of memory
+/// objects at the same place on every run.
+const ICOUNT_TESTS: [&str; 8] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
+    "timer_firing_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "teardown_yields_to_a_pending_interrupt",
@@ -73,6 +74,9 @@ const MEMORY_PORTION_ROWS: [&str; 8] = [
     "release",
     "first_map",
 ];
+/// The rows of the line of `timer_firing_is_measured`, in its order (spec
+/// 15.3).
+const TIMER_PORTION_ROWS: [&str; 3] = ["interrupt", "fire", "set"];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
 /// checked.
@@ -136,7 +140,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 157;
+const INIT_TESTS: u32 = 158;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -776,6 +780,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
         for (what, rows) in [
             ("ipc round trip", &ROUND_TRIP_ROWS[..]),
             ("memory portions", &MEMORY_PORTION_ROWS[..]),
+            ("timer portions", &TIMER_PORTION_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             let rows: Vec<_> = rows

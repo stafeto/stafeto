@@ -161,9 +161,9 @@ const CROWD: usize = 2 * MAX_THREADS as usize;
 const CAPPED: u8 = PRIORITY + 3;
 /// Rounds of each row of `ipc_round_trip_is_measured`.
 const ROUNDS: u64 = 1000;
-/// Timers of `expired_timers_fire_in_batches` on one deadline: more than
-/// one interrupt takes (timers::BATCH), and more than one process pays for
-/// (abi::MAX_TIMERS).
+/// Timers of `expired_timers_fire_in_portions_of_their_level` on one
+/// deadline: 7 portions of firings (kcore::timer::FIRE_PORTION), and more
+/// than one process pays for them (abi::MAX_TIMERS).
 const BATCHED: usize = 100;
 /// Pages of the memory object of `memory_object_goes_in_portions`: 64 MiB.
 const BIG_OBJECT: usize = 16384;
@@ -391,9 +391,9 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_timer_latency,
     },
     El0Test {
-        name: "expired_timers_fire_in_batches",
-        start: start_batches,
-        done: done_batches,
+        name: "expired_timers_fire_in_portions_of_their_level",
+        start: start_firing,
+        done: done_firing,
     },
     El0Test {
         name: "cleanup_yields_to_a_pending_interrupt",
@@ -2595,22 +2595,20 @@ fn done_timer_latency(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-/// BATCHED timers of programs on one channel, which two processes pay for,
-/// all for one deadline 1 ms from the start, while a FIFO thread in slot 1
-/// spins at EL0 for 2 ms. The first interrupt fires timers::BATCH of them
-/// and ends the process in slot 0 at the spinner's level, whose teardown
-/// comes before the spinner (spec 7.7); the rest waits in the heap, and the
-/// next decision arms the kernel's timer for the deadline already past, so
-/// the second interrupt fires the rest before any portion of that
-/// teardown begins (spec 10). The judge in slot 2 finds every timer's slot
-/// queued in the channel, two interrupts, no portion begun with one
-/// pending, and the batch measured for KSTATS.
-fn start_batches(f: &mut Fixture) -> Result<(), &'static str> {
-    let victim = new_process(f, 0)?;
-    let own = new_process(f, 1)?;
+/// BATCHED timers of programs of level PRIORITY on one channel, which two
+/// processes pay for, all for one deadline 1 ms from the start, while a
+/// FIFO thread in slot 0 spins at EL0 for 2 ms at that level. The one
+/// interrupt takes no timer off: it queues the firing of the level, which
+/// comes before the spinner of its level and takes FIRE_PORTION timers a
+/// portion, 7 portions in a row, with no other interrupt, and none pending
+/// when a portion begins (spec 7.7, 10). The judge in slot 1 finds every
+/// timer's slot queued in the channel, the one interrupt and the 7
+/// portions, and the portions measured for KSTATS.
+fn start_firing(f: &mut Fixture) -> Result<(), &'static str> {
+    let own = new_process(f, 0)?;
     let spin = new_thread(
         f,
-        1,
+        0,
         own,
         DATA_VA,
         &raw const el0_spin_then_yield,
@@ -2620,8 +2618,8 @@ fn start_batches(f: &mut Fixture) -> Result<(), &'static str> {
         spin,
         &[DATA_VA as u64, timer::clock().ns_to_ticks(2_000_000)],
     );
-    judge(f, 2)?;
-    let payers = [own, f.processes[2].expect("the judge's process")];
+    judge(f, 1)?;
+    let payers = [own, f.processes[1].expect("the judge's process")];
     let c = channel::create(own, PRIORITY).map_err(|_| "no channel")?;
     let h = give(own, Object::Channel(c), Rights::RECEIVE);
     let made = (0..BATCHED).try_for_each(|i| {
@@ -2642,14 +2640,13 @@ fn start_batches(f: &mut Fixture) -> Result<(), &'static str> {
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
     h?;
     made.map_err(|_| "a timer was not made or armed")?;
-    f.exit_at_interrupt = Some((victim, PRIORITY));
     cleanup::take_late();
-    timers::reset_longest_batch();
+    timers::reset_longest_firing();
     Ok(())
 }
 
-fn done_batches(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    if f.slot(t) != 2 {
+fn done_firing(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) != 1 {
         return Ok(());
     }
     check(
@@ -2657,16 +2654,20 @@ fn done_batches(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "an expired timer did not post into its slot",
     )?;
     check(
-        f.interrupts == 2,
-        "the expired timers did not take two interrupts, a batch and the rest",
+        f.interrupts == 1,
+        "the expired timers took more than the one interrupt",
+    )?;
+    check(
+        f.portions == BATCHED.div_ceil(kcore::timer::FIRE_PORTION) as u32,
+        "the expired timers did not fire in 7 portions",
     )?;
     check(
         !cleanup::take_late(),
-        "a portion began while the rest of the timers waited for their interrupt",
+        "a portion of firings began while an interrupt was pending",
     )?;
     check(
-        timers::longest_batch() > 0,
-        "the batch of expired timers was not measured",
+        timers::longest_firing() > 0,
+        "the portions of firings were not measured",
     )
 }
 

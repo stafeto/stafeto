@@ -991,8 +991,8 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 
 /// What the kernel counts about itself, for KERNEL_STATS: the scheduler's
 /// idle time and latencies, the cleanup queue, the frames, the pages of
-/// the pools and of the page logs of their payers, and the longest batch
-/// of expired timers.
+/// the pools and of the page logs of their payers, and the longest portion
+/// of firings of timers.
 fn kernel_stats() -> KernelStats {
     let s = sched::stats();
     KernelStats {
@@ -1003,7 +1003,7 @@ fn kernel_stats() -> KernelStats {
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
-        longest_batch: timer::longest_batch(),
+        longest_firing: timer::longest_firing(),
     }
 }
 

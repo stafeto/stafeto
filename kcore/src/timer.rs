@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The timers of programs (spec 10) in one binary heap for the whole
-//! system, the nodes inside the timer objects: arming a timer never
-//! allocates. The earliest deadline is at the root, found in O(1); a timer
-//! goes in or out, wherever it stands, in O(log n). Positions count from 1
-//! at the root, the children of k at 2k and 2k + 1; the path to position
-//! k follows the bits of k below its highest one, 0 to the left and 1 to
-//! the right. The last node is at position n, the place for a new one at
-//! n + 1.
+//! The timers of programs (spec 10): a binary heap for each level of 1-63,
+//! the priority of a timer's slot, the nodes inside the timer objects:
+//! arming a timer never allocates. The earliest deadline is at the root,
+//! found in O(1); a timer goes in or out, wherever it stands, in
+//! O(log n). Positions count from 1 at the root, the children of k at 2k
+//! and 2k + 1; the path to position k follows the bits of k below its
+//! highest one, 0 to the left and 1 to the right. The last node is at
+//! position n, the place for a new one at n + 1. `Levels` keeps the heaps
+//! with the nearest deadline of the levels whose firing is not queued
+//! yet, and `Firing` takes one portion of a level's expired timers.
 
 use core::ptr::NonNull;
 
@@ -230,8 +232,7 @@ impl<T: HeapNode> Heap<T> {
     }
 
     /// The timer at the root when its deadline is not after `now`, out of
-    /// the heap; None when nothing expired. The kernel takes up to 64 a
-    /// timer interrupt (spec 10).
+    /// the heap; None when nothing expired.
     pub fn pop_expired(&mut self, now: u64) -> Option<NonNull<T>> {
         let root = self.root?;
         // SAFETY: a timer in the heap is alive (`insert`).
@@ -355,6 +356,219 @@ impl<T: HeapNode> Heap<T> {
 impl<T: HeapNode> Default for Heap<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The levels of timers: the priorities of their slots, 1-63 (spec 10).
+pub const LEVELS: usize = 63;
+
+/// Expired timers of one level a portion takes, at most (spec 7.7, 10).
+pub const FIRE_PORTION: usize = 16;
+
+/// The bit of `level` in the masks of `Levels`.
+fn bit(level: u8) -> u64 {
+    assert!(
+        (1..=LEVELS as u8).contains(&level),
+        "a timer's level is out of 1-63"
+    );
+    1 << level
+}
+
+/// The timers of programs by level (spec 10): a heap for each level, the
+/// levels that have timers, the levels whose firing stands in the kernel's
+/// cleanup queue (pending), and the nearest deadline of the levels that
+/// have timers and are not pending, kept ready. It changes only when the
+/// top of a heap or the mask of pending levels does, by a walk of up to 63
+/// levels.
+pub struct Levels<T> {
+    heaps: [Heap<T>; LEVELS],
+    nonempty: u64,
+    pending: u64,
+    nearest: Option<u64>,
+}
+
+impl<T: HeapNode> Levels<T> {
+    pub const fn new() -> Self {
+        Levels {
+            heaps: [const { Heap::new() }; LEVELS],
+            nonempty: 0,
+            pending: 0,
+            nearest: None,
+        }
+    }
+
+    fn heap(&mut self, level: u8) -> &mut Heap<T> {
+        let _ = bit(level);
+        &mut self.heaps[usize::from(level) - 1]
+    }
+
+    /// The nearest deadline of the levels that are not pending, in O(1):
+    /// what the kernel's timer needs (spec 8, 10).
+    pub fn nearest(&self) -> Option<u64> {
+        self.nearest
+    }
+
+    /// Whether the firing of `level` is queued: from `expired` until
+    /// `settle`.
+    #[cfg(test)]
+    pub fn is_pending(&self, level: u8) -> bool {
+        self.pending & bit(level) != 0
+    }
+
+    /// Timers armed at `level`.
+    #[cfg(test)]
+    pub fn len(&self, level: u8) -> usize {
+        let _ = bit(level);
+        self.heaps[usize::from(level) - 1].len()
+    }
+
+    /// Walks the levels that have timers and are not pending for the
+    /// nearest deadline: up to 63 comparisons.
+    fn renew(&mut self) {
+        let mut levels = self.nonempty & !self.pending;
+        let mut nearest: Option<u64> = None;
+        while levels != 0 {
+            let level = levels.trailing_zeros() as usize;
+            levels &= levels - 1;
+            let first = self.heaps[level - 1].first();
+            nearest = match (nearest, first) {
+                (Some(n), Some(f)) => Some(n.min(f)),
+                (n, f) => n.or(f),
+            };
+        }
+        self.nearest = nearest;
+    }
+
+    /// Puts `t` in at `level` for `deadline`: O(log n), and the nearest
+    /// deadline follows unless the level is pending.
+    ///
+    /// # Safety
+    /// As for Heap::insert.
+    pub unsafe fn insert(&mut self, level: u8, t: NonNull<T>, deadline: u64) {
+        // SAFETY: the caller's promise.
+        unsafe { self.heap(level).insert(t, deadline) };
+        self.nonempty |= bit(level);
+        if self.pending & bit(level) == 0 {
+            self.nearest = Some(self.nearest.map_or(deadline, |n| n.min(deadline)));
+        }
+    }
+
+    /// Takes `t` out of `level` wherever it stands: O(log n), and the walk
+    /// of the levels when the top of a level that is not pending changed.
+    ///
+    /// # Safety
+    /// `t` is in the heap of `level`.
+    pub unsafe fn remove(&mut self, level: u8, t: NonNull<T>) {
+        let heap = self.heap(level);
+        let top = heap.first();
+        // SAFETY: the caller's promise.
+        unsafe { heap.remove(t) };
+        let after = heap.first();
+        self.left(level, top != after);
+    }
+
+    /// After a timer left `level`: its bit goes with its last timer, and
+    /// the nearest deadline is walked again when its top `moved`.
+    fn left(&mut self, level: u8, moved: bool) {
+        if self.heap(level).is_empty() {
+            self.nonempty &= !bit(level);
+        }
+        if moved && self.pending & bit(level) == 0 {
+            self.renew();
+        }
+    }
+
+    /// The timer interrupt at `now`: the levels that are not pending and
+    /// whose top the counter reached become pending, and come back as a
+    /// mask, a bit for each; the nearest deadline leaves them out, in the
+    /// same walk. Nothing leaves a heap. Up to 63 levels.
+    pub fn expired(&mut self, now: u64) -> u64 {
+        let mut levels = self.nonempty & !self.pending;
+        let mut due = 0;
+        let mut nearest: Option<u64> = None;
+        while levels != 0 {
+            let level = levels.trailing_zeros() as usize;
+            levels &= levels - 1;
+            match self.heaps[level - 1].first() {
+                Some(d) if d <= now => due |= 1 << level,
+                Some(d) => nearest = Some(nearest.map_or(d, |n| n.min(d))),
+                None => {}
+            }
+        }
+        if due != 0 {
+            self.pending |= due;
+            self.nearest = nearest;
+        }
+        due
+    }
+
+    /// Whether the top of `level` expired by `now`.
+    pub fn has_expired(&self, level: u8, now: u64) -> bool {
+        let _ = bit(level);
+        self.heaps[usize::from(level) - 1]
+            .first()
+            .is_some_and(|d| d <= now)
+    }
+
+    /// The top of `level` when its deadline is not after `now`, out of the
+    /// heap: O(log n).
+    pub fn pop_expired(&mut self, level: u8, now: u64) -> Option<NonNull<T>> {
+        let t = self.heap(level).pop_expired(now)?;
+        self.left(level, true);
+        Some(t)
+    }
+
+    /// The firing of `level` is over: the level is not pending any more,
+    /// and its top counts toward the nearest deadline again.
+    pub fn settle(&mut self, level: u8) {
+        self.pending &= !bit(level);
+        self.renew();
+    }
+}
+
+impl<T: HeapNode> Default for Levels<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One portion of the firing of a level (spec 7.7, 10): up to FIRE_PORTION
+/// expired timers, one `next` at a time, so that the caller lets the lock
+/// of the levels go before it posts each; then `finish`.
+pub struct Firing {
+    level: u8,
+    left: usize,
+}
+
+impl Firing {
+    pub fn new(level: u8) -> Firing {
+        let _ = bit(level);
+        Firing {
+            level,
+            left: FIRE_PORTION,
+        }
+    }
+
+    /// The next expired timer of the level by `now`, out of its heap; None
+    /// once the portion took FIRE_PORTION of them or nothing more expired.
+    pub fn next<T: HeapNode>(&mut self, levels: &mut Levels<T>, now: u64) -> Option<NonNull<T>> {
+        if self.left == 0 {
+            return None;
+        }
+        let t = levels.pop_expired(self.level, now)?;
+        self.left -= 1;
+        Some(t)
+    }
+
+    /// The end of the portion at `now`: true when the level has expired
+    /// timers left, and its firing goes on in the next portion; otherwise
+    /// the level settles.
+    pub fn finish<T: HeapNode>(self, levels: &mut Levels<T>, now: u64) -> bool {
+        if levels.has_expired(self.level, now) {
+            return true;
+        }
+        levels.settle(self.level);
+        false
     }
 }
 
@@ -575,5 +789,196 @@ mod tests {
         unsafe { h.insert(ps[12], 100) };
         assert_eq!((h.at(12), link(ps[5]).left), (Some(ps[12]), Some(ps[12])));
         check(&h);
+    }
+
+    /// The deadline of `t`, a timer of the tests.
+    fn deadline_of(t: NonNull<Timer>) -> u64 {
+        link(t).deadline
+    }
+
+    /// The level of timer `id` in the tests of `Levels`: all 63 in turn.
+    fn level_of(id: usize) -> u8 {
+        (id % LEVELS) as u8 + 1
+    }
+
+    #[test]
+    fn levels_match_a_model() {
+        const TIMERS: usize = 200;
+        let (_ts, ps) = timers(TIMERS);
+        let mut l = Levels::new();
+        // Each level's (deadline, id), sorted, and the pending levels.
+        let mut model: Vec<Vec<(u64, usize)>> = vec![Vec::new(); LEVELS + 1];
+        let mut pending = [false; LEVELS + 1];
+        let mut rng = Rng(0x1e7e_15c0_ffee_0042);
+        for step in 0..100_000 {
+            let id = rng.below(TIMERS as u64) as usize;
+            let level = level_of(id);
+            let lv = usize::from(level);
+            let armed = model[lv].iter().position(|&(_, i)| i == id);
+            match rng.below(5) {
+                // Armed, or set again.
+                0 | 1 => {
+                    if let Some(k) = armed {
+                        // SAFETY: the timer is in the heap of its level.
+                        unsafe { l.remove(level, ps[id]) };
+                        model[lv].remove(k);
+                    }
+                    let d = rng.below(1000);
+                    // SAFETY: the timer is alive and out of the heaps.
+                    unsafe { l.insert(level, ps[id], d) };
+                    let at = model[lv].partition_point(|&e| e < (d, id));
+                    model[lv].insert(at, (d, id));
+                }
+                // Cancelled.
+                2 => {
+                    if let Some(k) = armed {
+                        // SAFETY: the timer is in the heap of its level.
+                        unsafe { l.remove(level, ps[id]) };
+                        model[lv].remove(k);
+                    }
+                }
+                // The interrupt at a random time: the levels whose top
+                // expired and that were not pending come, once.
+                3 => {
+                    let now = rng.below(1000);
+                    let due = l.expired(now);
+                    for k in 1..=LEVELS {
+                        let top = model[k].first().map(|e| e.0);
+                        let expect = !pending[k] && top.is_some_and(|d| d <= now);
+                        assert_eq!(due & 1 << k != 0, expect, "step {step}, level {k}");
+                        pending[k] |= expect;
+                    }
+                }
+                // A portion of a pending level, the first from a random
+                // one on, at a random time.
+                _ => {
+                    let from = rng.below(LEVELS as u64) as usize;
+                    let mut levels = (0..LEVELS).map(|j| (from + j) % LEVELS + 1);
+                    let Some(k) = levels.find(|&k| pending[k]) else {
+                        continue;
+                    };
+                    let now = rng.below(1000);
+                    let mut firing = Firing::new(k as u8);
+                    while let Some(t) = firing.next(&mut l, now) {
+                        let d = deadline_of(t);
+                        assert_eq!(Some(d), model[k].first().map(|e| e.0), "step {step}");
+                        assert!(d <= now, "step {step}: a timer fired early");
+                        model[k].remove(0);
+                    }
+                    let more = firing.finish(&mut l, now);
+                    assert_eq!(more, model[k].first().is_some_and(|e| e.0 <= now));
+                    pending[k] = more;
+                }
+            }
+            let nearest = (1..=LEVELS)
+                .filter(|&k| !pending[k])
+                .filter_map(|k| model[k].first().map(|e| e.0))
+                .min();
+            assert_eq!(l.nearest(), nearest, "step {step}");
+            for k in 1..=LEVELS {
+                assert_eq!(l.len(k as u8), model[k].len(), "step {step}");
+                assert_eq!(l.is_pending(k as u8), pending[k], "step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_level_pops_only_its_own() {
+        let (_ts, ps) = timers(6);
+        let mut l = Levels::new();
+        // Level 5 holds the earliest deadlines, level 40 the rest.
+        for (i, &t) in ps.iter().enumerate() {
+            let level = if i < 3 { 5 } else { 40 };
+            // SAFETY: the timers are alive and out of the heaps.
+            unsafe { l.insert(level, t, 10 + i as u64) };
+        }
+        assert_eq!(l.expired(100), 1 << 5 | 1 << 40);
+        let mut high = Vec::new();
+        while let Some(t) = l.pop_expired(40, 100) {
+            high.push(deadline_of(t));
+        }
+        assert_eq!(high, [13, 14, 15], "level 40 gave another level's timers");
+        assert_eq!((l.len(5), l.len(40)), (3, 0));
+    }
+
+    #[test]
+    fn nearest_skips_pending_levels() {
+        let (_ts, ps) = timers(4);
+        let mut l = Levels::new();
+        // SAFETY: the timers are alive and out of the heaps.
+        unsafe {
+            l.insert(10, ps[0], 100);
+            l.insert(10, ps[1], 300);
+            l.insert(20, ps[2], 200);
+        }
+        assert_eq!(l.nearest(), Some(100));
+        assert_eq!(l.expired(150), 1 << 10);
+        assert_eq!(l.nearest(), Some(200), "a pending level still counts");
+        // SAFETY: the timer is alive and out of the heaps.
+        unsafe { l.insert(10, ps[3], 50) };
+        assert_eq!(l.nearest(), Some(200), "a timer of a pending level counts");
+    }
+
+    #[test]
+    fn expired_levels_come_once_until_settled() {
+        let (_ts, ps) = timers(2);
+        let mut l = Levels::new();
+        // SAFETY: the timers are alive and out of the heaps.
+        unsafe {
+            l.insert(63, ps[0], 5);
+            l.insert(1, ps[1], 7);
+        }
+        assert_eq!(l.expired(4), 0, "a level came before its deadline");
+        assert_eq!(l.expired(10), 1 << 63 | 1 << 1);
+        assert_eq!(l.expired(20), 0, "a pending level came again");
+        assert_eq!(l.len(63), 1, "the interrupt took a timer off");
+        l.settle(63);
+        assert_eq!(l.expired(20), 1 << 63, "a settled level did not come again");
+    }
+
+    #[test]
+    fn settle_brings_a_later_top_back() {
+        let (_ts, ps) = timers(2);
+        let mut l = Levels::new();
+        // SAFETY: the timers are alive and out of the heaps.
+        unsafe {
+            l.insert(30, ps[0], 10);
+            l.insert(30, ps[1], 500);
+        }
+        assert_eq!(l.expired(20), 1 << 30);
+        assert_eq!(l.nearest(), None);
+        let mut firing = Firing::new(30);
+        assert_eq!(firing.next(&mut l, 20), Some(ps[0]));
+        assert_eq!(firing.next(&mut l, 20), None);
+        assert!(!firing.finish(&mut l, 20), "the level has nothing expired");
+        assert!(!l.is_pending(30));
+        assert_eq!(l.nearest(), Some(500), "the later top did not come back");
+    }
+
+    #[test]
+    fn a_firing_step_takes_at_most_its_portion() {
+        const EXPIRED: usize = 2 * FIRE_PORTION + 3;
+        let (_ts, ps) = timers(EXPIRED);
+        let mut l = Levels::new();
+        for (i, &t) in ps.iter().enumerate() {
+            // SAFETY: the timers are alive and out of the heaps.
+            unsafe { l.insert(7, t, i as u64) };
+        }
+        assert_eq!(l.expired(1000), 1 << 7);
+        let mut taken = Vec::new();
+        loop {
+            let mut firing = Firing::new(7);
+            let mut n = 0;
+            while firing.next(&mut l, 1000).is_some() {
+                n += 1;
+            }
+            taken.push(n);
+            if !firing.finish(&mut l, 1000) {
+                break;
+            }
+            assert!(l.is_pending(7), "a level with work left settled");
+        }
+        assert_eq!(taken, [FIRE_PORTION, FIRE_PORTION, 3]);
+        assert!(!l.is_pending(7) && l.len(7) == 0);
     }
 }

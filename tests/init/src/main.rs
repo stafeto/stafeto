@@ -47,7 +47,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 157] = [
+const TESTS: [Test; 158] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -227,6 +227,10 @@ const TESTS: [Test; 157] = [
     ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
     ("timer_never_fires_early", timer_never_fires_early),
     ("timer_limit_is_64", timer_limit_is_64),
+    (
+        "timer_fires_at_its_slot_priority",
+        timer_fires_at_its_slot_priority,
+    ),
     (
         "mem_create_checks_its_arguments",
         mem_create_checks_its_arguments,
@@ -3072,7 +3076,14 @@ fn client_gone_when_the_child_dies() -> Outcome {
 /// A timer on `c` at QUIET, whose notifications never lift init above its
 /// threads (spec 6.6).
 fn timer(c: &Handle<Channel>) -> Result<Handle<Timer>, &'static str> {
-    sys::timer_create(c, QUIET).map_err(|_| "timer_create failed")
+    timer_at(c, QUIET)
+}
+
+/// A timer on `c` whose slot has `priority`: it fires at that level, ahead
+/// of the threads below it and after those above (spec 10), so a thread
+/// whose wait it bounds gives it its own level at least.
+fn timer_at(c: &Handle<Channel>, priority: u8) -> Result<Handle<Timer>, &'static str> {
+    sys::timer_create(c, priority).map_err(|_| "timer_create failed")
 }
 
 /// timer_create with raw registers.
@@ -3387,6 +3398,66 @@ fn timer_never_fires_early() -> Outcome {
     close(t)?;
     close(c)?;
     result
+}
+
+/// Spec 15.2 (priorities, time): a timer fires at the priority of its slot
+/// (spec 10). W at init's level waits on a channel of that level whose
+/// timer's slot has LEVEL, H at HIGH on one of its level whose timer's
+/// slot has HIGH, both timers for one deadline; S, FIFO at SPIN between
+/// them, spins until H came back from its wait and notes whether W did.
+/// Init lets them run: the firing of HIGH comes ahead of S and wakes H,
+/// the firing of LEVEL waits until S ends, and only then W, whose level is
+/// above S, gets its expiry. Only the priorities order them; a second on
+/// the counter only keeps S from spinning forever.
+fn timer_fires_at_its_slot_priority() -> Outcome {
+    const SPIN: u8 = 15;
+    reset_results();
+    let low = channel(TEST_PRIORITY)?;
+    let high = channel(HIGH)?;
+    let timers = [timer_at(&low, LEVEL)?, timer_at(&high, HIGH)?];
+    HANDLES[0].store(low.raw().0, Relaxed);
+    HANDLES[1].store(high.raw().0, Relaxed);
+    let h = spawn(1, receive_then_look, 1, HIGH, Policy::Fifo)?;
+    let w = spawn(0, receive_then_look, 0, TEST_PRIORITY, Policy::Fifo)?;
+    // W, behind init at its level, waits once init yields to it.
+    let yielded = sys::yield_now();
+    let s = spawn(2, look_once_ended, 1, SPIN, Policy::Fifo)?;
+    let armed = clock_now().and_then(|now| {
+        let at = now + 1_000_000;
+        timers.iter().try_for_each(|t| arm(t, at))
+    });
+    let ran = armed.and_then(|()| let_run());
+    for t in [h, w, s] {
+        close(t)?;
+    }
+    for t in timers {
+        close(t)?;
+    }
+    close(low)?;
+    close(high)?;
+    ran?;
+    check(yielded.is_ok(), "yield failed")?;
+    check(
+        ended(0) && ended(1) && result(0)[0] == 0 && result(1)[0] == 0,
+        "a timer's expiry did not come",
+    )?;
+    check(
+        result(2)[..2] == [1, 0],
+        "the timer of W fired above its slot's priority, or that of H below",
+    )
+}
+
+/// Spins until the thread in `slot` came back from its call, or a second
+/// passed, and leaves in `result` of slot 2 whether it did and whether the
+/// thread in slot 0 did by then; ends.
+extern "C" fn look_once_ended(slot: u64) -> ! {
+    let end = time::now() + time::ns_to_ticks(1_000_000_000);
+    while !ended(slot as usize) && time::now() < end {}
+    record(
+        2,
+        &[ENDED[slot as usize].load(Relaxed), ENDED[0].load(Relaxed)],
+    );
+    sys::thread_exit()
 }
 
 /// Spec 15.2 (notifications): a process pays for abi::MAX_TIMERS timers at
@@ -4060,7 +4131,7 @@ fn during_a_long_map(probe: extern "C" fn(u64) -> !) -> Outcome {
     reset_marks();
     let m = memory_object(BIG / PAGE as u64)?;
     let c = channel(QUIET)?;
-    let t = timer(&c)?;
+    let t = timer_at(&c, HIGH)?;
     PROBE_TIMER.store(t.raw().0, Relaxed);
     let prober = spawn(1, probe, c.raw().0, HIGH, Policy::Fifo)?;
     let mapper = spawn(0, map_big, m.raw().0, LEVEL, Policy::Fifo)?;
@@ -4282,7 +4353,7 @@ extern "C" fn probe_long_calls(c: u64) -> ! {
 fn long_calls_let_a_timer_in() -> Outcome {
     reset_marks();
     let c = channel(QUIET)?;
-    let t = timer(&c)?;
+    let t = timer_at(&c, HIGH)?;
     PROBE_TIMER.store(t.raw().0, Relaxed);
     let prober = spawn(1, probe_long_calls, c.raw().0, HIGH, Policy::Fifo)?;
     let caller = spawn(0, long_calls, 0, LEVEL, Policy::Fifo)?;
@@ -4550,12 +4621,15 @@ fn reset_kid_marks() {
     }
 }
 
-/// Waits `ns` nanoseconds in receive on a timer of a channel of its own:
-/// threads below init run meanwhile.
+/// Waits `ns` nanoseconds in receive on a timer of a channel of its own,
+/// at init's level: threads below init run meanwhile, and the timer fires
+/// ahead of them. The boost of its expiry ends with a receive that finds
+/// nothing (spec 6.6).
 fn sleep(ns: u64) -> Outcome {
     let c = channel(QUIET)?;
-    let t = timer(&c)?;
+    let t = timer_at(&c, TEST_PRIORITY)?;
     let waited = arm(&t, clock_now()? + ns).map(|()| sys::receive(&c));
+    let _ = sys::try_receive(&c);
     close(t)?;
     close(c)?;
     check(

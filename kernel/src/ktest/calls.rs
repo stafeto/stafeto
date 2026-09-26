@@ -231,7 +231,7 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
         longest_portion: cleanup::longest(),
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
-        longest_batch: crate::timer::longest_batch(),
+        longest_firing: crate::timer::longest_firing(),
     };
     check(
         counted.longest_portion > 0 && counted.free_frames > 0 && counted.pool_pages > 0,
@@ -1721,9 +1721,10 @@ pub fn past_deadline_fires_within_timer_set(_: &Boot) -> Result<(), &'static str
 }
 
 /// A timer whose last handle went is dying (spec 7.7): the cleanup queue
-/// holds it, and the heap still does until its portion. The kernel's timer
-/// interrupt at its deadline takes it off the heap and posts nothing; its
-/// portion then lets it go.
+/// holds it at CAUSE, and the heap of its level still does until its
+/// portion. The firing of its level, 10, at its deadline, a second away,
+/// takes it off the heap and posts nothing; its own portion then lets it
+/// go.
 pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
     let timers = timers::in_use();
     with_caller(|c| {
@@ -1732,7 +1733,7 @@ pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
             let at = timers::deadline(tm).ok_or("the timer is not armed")?;
             c.close(t)?;
             let queued = cleanup::len();
-            timers::expire(at);
+            timers::fire_at(10, at);
             let (posted, armed) = (timers::posted(tm), timers::deadline(tm).is_some());
             c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
             cleanup::drain();
@@ -1744,6 +1745,67 @@ pub fn dying_timer_does_not_fire(_: &Boot) -> Result<(), &'static str> {
         })
     })?;
     check(timers::in_use() == timers, "the dying timer stayed")
+}
+
+/// Timers the test of the firing of a level arms: more than two portions.
+const FIRST_FIRINGS: usize = 40;
+
+/// A level ends its firing before what came to it later (spec 7.7, 10):
+/// with FIRST_FIRINGS timers of level 10 expired at their deadline, a
+/// second away, and a channel whose last reference went at 10 queued
+/// behind, the first portion of the firing, which the test runs at that
+/// deadline, posts FIRE_PORTION of them and puts the level's item back at
+/// the head of level 10. The next portion is the firing's again, and the
+/// channel is still there after it.
+pub fn a_level_finishes_its_firing_first(_: &Boot) -> Result<(), &'static str> {
+    let counts = (timers::in_use(), channel::in_use());
+    with_caller(|c| {
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let mut made = [None; FIRST_FIRINGS];
+        let result = channel_of(c, h).and_then(|ch| {
+            let at = timer::now() + timer::clock().ns_to_ticks(1_000_000_000);
+            for (n, t) in made.iter_mut().enumerate() {
+                let tm = timers::create(c.process, ch, 0, 10).map_err(|_| "no timer")?;
+                *t = Some(tm);
+                timers::set(tm, at + n as u64, CAUSE).map_err(|_| "a timer was not armed")?;
+            }
+            let later = channel::create(c.process, 10).map_err(|_| "no channel")?;
+            // SAFETY: the reference `create` handed out goes, the last one:
+            // the channel is queued at 10.
+            unsafe { channel::release(later, Rights::NONE, 10) };
+            let alive = channel::in_use();
+            let last = at + FIRST_FIRINGS as u64;
+            timers::fire_at(10, last);
+            let first = posted_of(&made);
+            cleanup::portion();
+            let (second, kept) = (posted_of(&made), channel::in_use() == alive);
+            cleanup::drain();
+            check(
+                first == kcore::timer::FIRE_PORTION && second == first,
+                "the first portion of the firing did not post its portion",
+            )?;
+            check(kept, "a channel queued later came before the firing")
+        });
+        for t in made.into_iter().flatten() {
+            // SAFETY: the test's reference goes.
+            unsafe { timers::release(t, CAUSE) };
+        }
+        let _ = process::close_handle(c.process, h, CAUSE);
+        cleanup::drain();
+        result
+    })?;
+    check(
+        (timers::in_use(), channel::in_use()) == counts,
+        "a timer or a channel of the test stayed",
+    )
+}
+
+/// How many of `made` posted.
+fn posted_of(made: &[Option<NonNull<Timer>>]) -> usize {
+    made.iter()
+        .flatten()
+        .filter(|&&t| timers::posted(t))
+        .count()
 }
 
 /// A thread whose count of requests reached its end gets BAD_STATE from
@@ -3311,4 +3373,210 @@ fn release_ticks(c: &Caller) -> Result<u64, &'static str> {
     });
     apart.rejoin();
     ticks
+}
+
+/// The level of the heap of `timer_firing_is_measured`, its payers, and
+/// the receivers its firing wakes, one a timer.
+#[cfg(feature = "icount")]
+const FIRE_LEVEL: u8 = 10;
+#[cfg(feature = "icount")]
+const FIRE_PAYERS: usize = 64;
+#[cfg(feature = "icount")]
+const WOKEN: usize = kcore::timer::FIRE_PORTION;
+
+/// The timers of programs in their worst cases under -icount (spec 10,
+/// 15.3), in ticks:
+/// - interrupt: the timers' part of the kernel's timer interrupt
+///   (timer::expire) with the top of every level of 1-63 expired, which
+///   queues 63 firings;
+/// - fire: the portion of cleanup of the firing of FIRE_LEVEL, whose heap
+///   holds 4 096 timers of FIRE_PAYERS payers: it takes FIRE_PORTION
+///   expired ones off a heap of depth 12, and each wakes a receiver that
+///   waits in a channel of its own;
+/// - set: timer_set of the top of that heap, among 63 levels with timers
+///   and none pending, to a deadline before every other: it leaves the
+///   root, the walk of the levels follows, and it climbs back to the root.
+///
+/// The test prints them in one line, `timer portions ticks: interrupt=...
+/// fire=... set=...`, which xtask shows; no number fails it (spec 15.3).
+#[cfg(feature = "icount")]
+pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
+    let counts = (
+        timers::in_use(),
+        channel::in_use(),
+        thread::in_use(),
+        process::in_use(),
+    );
+    let ticks = with_caller(|c| {
+        let owner = process::create_root(QUOTA, 128, CEILING).map_err(|_| "no process");
+        let ticks = owner.and_then(|owner| {
+            let ticks = firing_ticks(c, owner);
+            // SAFETY: the test's reference goes; the handles went with it.
+            unsafe { process::release(owner, CAUSE) };
+            ticks
+        });
+        cleanup::drain();
+        ticks
+    })?;
+    let [interrupt, fire, set] = ticks;
+    kprintln!("timer portions ticks: interrupt={interrupt} fire={fire} set={set}");
+    check(
+        (
+            timers::in_use(),
+            channel::in_use(),
+            thread::in_use(),
+            process::in_use(),
+        ) == counts,
+        "a timer, a channel, a thread or a process of the measurements stayed",
+    )
+}
+
+/// The three counts of `timer_firing_is_measured`: `owner` holds the
+/// channels, their receivers and the timers of levels 1-63, with the
+/// handles that keep them; each payer holds its timers.
+#[cfg(feature = "icount")]
+fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 3], &'static str> {
+    let mut receivers = [None; WOKEN];
+    let mut payers = [None; FIRE_PAYERS];
+    let ticks = heap_ticks(c, owner, &mut receivers, &mut payers);
+    for t in receivers.into_iter().flatten() {
+        // SAFETY: the test's reference goes, and the kernel's first: the
+        // thread leaves the scheduler.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for p in payers.into_iter().flatten() {
+        // SAFETY: the test's reference goes; its handles hold its timers.
+        unsafe { process::release(p, CAUSE) };
+    }
+    ticks
+}
+
+/// A channel of `owner` at FIRE_LEVEL with a handle with RECEIVE in its
+/// table, which holds it.
+#[cfg(feature = "icount")]
+fn owned_channel(owner: NonNull<Process>) -> Result<NonNull<Channel>, &'static str> {
+    let c = channel::create(owner, FIRE_LEVEL).map_err(|_| "no channel")?;
+    let h = process::insert_handle(owner, Object::Channel(c), Rights::RECEIVE);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    h.map(|_| c).map_err(|_| "a handle did not go in")
+}
+
+/// A timer of `payer` on `ch` at `level`, armed for `deadline` in ticks,
+/// with a handle in the table of `payer`, which holds it.
+#[cfg(feature = "icount")]
+fn held_timer(
+    payer: NonNull<Process>,
+    ch: NonNull<Channel>,
+    level: u8,
+    deadline: u64,
+) -> Result<NonNull<Timer>, &'static str> {
+    let t = timers::create(payer, ch, 0, level).map_err(|_| "no timer")?;
+    let armed = timers::set(t, deadline, CAUSE);
+    let h = process::insert_handle(payer, Object::Timer(t), OWNER_RIGHTS);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the timer.
+    unsafe { timers::release(t, CAUSE) };
+    armed.map_err(|_| "a timer was not armed")?;
+    h.map(|_| t).map_err(|_| "a handle did not go in")
+}
+
+/// A new thread of `owner` waits in receive on `ch`: it starts, runs as
+/// far as the scheduler knows, and its receive finds nothing.
+#[cfg(feature = "icount")]
+fn waiting(owner: NonNull<Process>, ch: NonNull<Channel>) -> Result<NonNull<Thread>, &'static str> {
+    let t = thread::create(owner, USER_VA, USER_VA, 0, 5, Policy::Fifo).map_err(|_| "no thread")?;
+    thread::start(t).map_err(|_| "a thread did not start")?;
+    // SAFETY: the scheduler's threads are alive.
+    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+    check(
+        matches!(picked, kcore::sched::Decision::Run(r) if r == t),
+        "the new thread did not run",
+    )?;
+    channel::receive(t, ch, true).map_err(|_| "the receiver did not wait")?;
+    Ok(t)
+}
+
+/// Builds what `timer_firing_is_measured` measures and measures it; the
+/// receivers and the payers go into `receivers` and `payers` for the
+/// caller to let go.
+#[cfg(feature = "icount")]
+fn heap_ticks(
+    c: &Caller,
+    owner: NonNull<Process>,
+    receivers: &mut [Option<NonNull<Thread>>; WOKEN],
+    payers: &mut [Option<NonNull<Process>>; FIRE_PAYERS],
+) -> Result<[u64; 3], &'static str> {
+    let mut channels = [None; WOKEN];
+    for (ch, r) in channels.iter_mut().zip(receivers.iter_mut()) {
+        let made = owned_channel(owner)?;
+        *ch = Some(made);
+        *r = Some(waiting(owner, made)?);
+    }
+    let channels = channels.map(|ch| ch.expect("a channel"));
+    // The later timers of the heap by the order they go in, so that a
+    // timer that leaves the root takes the last node down to a leaf.
+    let far = timer::now() + 1_000_000_000;
+    let mut early = [None; WOKEN];
+    let mut top = None;
+    for (i, payer) in payers.iter_mut().enumerate() {
+        let p = process::create_root(QUOTA, 128, CEILING).map_err(|_| "no payer")?;
+        *payer = Some(p);
+        for j in 0..abi::MAX_TIMERS as usize {
+            let n = i * abi::MAX_TIMERS as usize + j;
+            let t = held_timer(p, channels[n % WOKEN], FIRE_LEVEL, far + n as u64)?;
+            match n {
+                n if n < WOKEN => early[n] = Some(t),
+                n if n == WOKEN => top = Some(t),
+                _ => {}
+            }
+        }
+    }
+    let lc = owned_channel(owner)?;
+    let mut levels = [None; kcore::timer::LEVELS];
+    for (l, t) in levels.iter_mut().enumerate() {
+        *t = Some(held_timer(owner, lc, l as u8 + 1, 2 * far + l as u64)?);
+    }
+    let top = top.expect("the top of the heap");
+    let h = c.insert(Object::Timer(top), OWNER_RIGHTS)?;
+    let before = timer::clock().ticks_to_ns(far / 2);
+    let start = timer::now();
+    c.succeeds(Call::TimerSet.number(), &[h.0, before], &[])?;
+    let set = timer::now() - start;
+    c.close(h)?;
+    // Every level expires, and the heap's receivers' timers first of all.
+    let at = timer::now() + 2_000_000;
+    for (n, t) in early.into_iter().flatten().enumerate() {
+        timers::set(t, at + n as u64, CAUSE).map_err(|_| "a timer was not armed")?;
+    }
+    for (l, t) in levels.into_iter().flatten().enumerate() {
+        timers::set(t, at + 100 + l as u64, CAUSE).map_err(|_| "a timer was not armed")?;
+    }
+    while timer::now() <= at + 200 {}
+    let queued = cleanup::len();
+    let start = timer::now();
+    timers::expire(timer::now());
+    let interrupt = timer::now() - start;
+    check(
+        cleanup::len() == queued + kcore::timer::LEVELS as u64,
+        "the interrupt did not queue the firing of every level",
+    )?;
+    while cleanup::top().is_some_and(|l| l > FIRE_LEVEL) {
+        cleanup::portion();
+    }
+    let start = timer::now();
+    cleanup::portion();
+    let fire = timer::now() - start;
+    // SAFETY: the receivers are alive; only their states are read.
+    let woke = receivers
+        .iter()
+        .flatten()
+        .all(|t| unsafe { t.as_ref() }.sched.state() == State::Ready);
+    cleanup::drain();
+    check(woke, "a receiver of the heap's timers did not wake")?;
+    Ok([interrupt, fire, set])
 }

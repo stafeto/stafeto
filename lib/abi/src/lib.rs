@@ -716,10 +716,10 @@ pub struct KernelStats {
     /// them: a pool takes a page as it grows, and the pages of a payer's
     /// pools go back with its shell (spec 7.8).
     pub pool_pages: u64,
-    /// The longest batch of expired timers one timer interrupt took, in
-    /// ticks: what the timers of programs add to the blocking of any
-    /// thread (spec 10).
-    pub longest_batch: u64,
+    /// The longest portion of firings of timers so far, in ticks: up to
+    /// 16 expired timers of one level, which the cleanup queue runs at that
+    /// level (spec 7.7, 10).
+    pub longest_firing: u64,
 }
 
 impl KernelStats {
@@ -733,7 +733,7 @@ impl KernelStats {
             self.longest_portion,
             self.free_frames,
             self.pool_pages,
-            self.longest_batch,
+            self.longest_firing,
         ]
     }
 
@@ -747,7 +747,7 @@ impl KernelStats {
             longest_portion: words[4],
             free_frames: words[5],
             pool_pages: words[6],
-            longest_batch: words[7],
+            longest_firing: words[7],
         }
     }
 }
@@ -1229,7 +1229,7 @@ mod tests {
             (stats.idle_latency, stats.irq_latency, stats.longest_portion),
             (2, 3, 5)
         );
-        assert_eq!((stats.free_frames, stats.longest_batch), (6, 8));
+        assert_eq!((stats.free_frames, stats.longest_firing), (6, 8));
         assert_eq!(stats.to_words(), words);
     }
 

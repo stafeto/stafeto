@@ -22,9 +22,9 @@ pub fn handle(ack: Ack) {
     if timer::fired() {
         // The line is level-triggered and has to be quiet before the EOI:
         // the scheduler turns the timer off, ends a quantum that is over
-        // and fires the expired timers of programs, at most a batch of
-        // them (spec 10), and arms the timer for its next deadline on the
-        // way out.
+        // and queues the firing of each level whose timers of programs
+        // expired (spec 10), and arms the timer for its next deadline on
+        // the way out.
         sched::timer_fired();
         crate::testpoint::timer_fired();
     }

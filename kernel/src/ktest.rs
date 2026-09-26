@@ -301,6 +301,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::dying_timer_does_not_fire,
     ),
     (
+        "a_level_finishes_its_firing_first",
+        calls::a_level_finishes_its_firing_first,
+    ),
+    (
         "call_counter_runs_out_as_bad_state",
         calls::call_counter_runs_out_as_bad_state,
     ),
@@ -395,10 +399,10 @@ pub const QUOTA: u64 = 16 << 20;
 pub const CHILD_QUOTA: u64 = 64 << 10;
 
 /// Tests of the icount build besides TESTS and the EL0 tests: the first
-/// checks that the run is under -icount, the second measures the portions
-/// of the long calls of memory objects, whose counts mean instructions only
-/// there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 2 } else { 0 };
+/// checks that the run is under -icount, the others measure the portions
+/// of the long calls of memory objects and the timers of programs, whose
+/// counts mean instructions only there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 3 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -413,6 +417,11 @@ pub fn run(boot: &Boot) -> ! {
     report(
         "memory_portions_are_measured",
         calls::memory_portions_are_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "timer_firing_is_measured",
+        calls::timer_firing_is_measured(boot),
     );
     el0::run()
 }
