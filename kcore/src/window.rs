@@ -9,15 +9,19 @@
 //! window reaches a register of the kernel's devices.
 
 use crate::PAGE_SIZE;
-use crate::bootinfo::{BootInfo, Region, RegionList};
+use crate::bootinfo::{BootInfo, MEMORY_REGIONS, Region, RegionList};
 use abi::{Error, MAX_MEMORY};
 
 /// The end of the output addresses a descriptor holds (OA[47:12], [G8]).
 pub const OUTPUT_END: u64 = 1 << 48;
 
-/// What a window may not touch: the RAM regions of the device tree, at most
-/// 8, the GIC's two blocks and the PL011.
-pub type Forbidden = RegionList<11>;
+/// The kernel's own devices a window may not touch: the GIC's distributor
+/// and CPU interface, and the PL011.
+const KERNEL_DEVICES: usize = 3;
+
+/// What a window may not touch: the RAM regions of the device tree
+/// (MEMORY_REGIONS, at most) and KERNEL_DEVICES devices of the kernel.
+pub type Forbidden = RegionList<{ MEMORY_REGIONS + KERNEL_DEVICES }>;
 
 /// The range of `len` bytes from `addr` rounded out to whole pages: its
 /// first page and its count of pages. INVALID_ARGS for a length of 0, a
@@ -52,7 +56,7 @@ pub fn forbidden(info: &BootInfo) -> Forbidden {
         .chain(devices.into_iter().flatten())
     {
         list.push(r)
-            .expect("room for 8 regions of RAM and 3 devices");
+            .expect("room for MEMORY_REGIONS and KERNEL_DEVICES");
     }
     list
 }

@@ -7,14 +7,13 @@
 //! empty kernel stack that handles a pending interrupt, decides, arms the
 //! timer for the deadline that decision needs, the nearer of the end of a
 //! quantum and the nearest timer of a program whose level's firing is not
-//! queued (spec 8, 10), writing the
-//! timer only when the deadline changes, and then runs the chosen thread,
-//! does one portion of cleanup (spec 7.7) or sleeps in `wfi` with
-//! interrupts masked. Idle is that loop with nothing ready: no thread
-//! object, and cleanup of every level runs there, the firings of timers
-//! included. Between two polls for
-//! interrupts the kernel does at most one portion, and it begins one only
-//! with no interrupt pending. The kernel holds a reference to every thread
+//! queued (spec 8, 10), writing the timer only when the deadline changes,
+//! and then runs the chosen thread, does one portion of cleanup (spec 7.7)
+//! or sleeps in `wfi` with interrupts masked. Idle is that loop with
+//! nothing ready: no thread object, and cleanup of every level runs there,
+//! the firings of timers included. Between two polls for interrupts the
+//! kernel does at most one portion, and it begins one only with no
+//! interrupt pending. The kernel holds a reference to every thread
 //! the scheduler holds, from `start` until `exit`, a thread that waits in
 //! `send` or `receive` too. The queues of channels and of accepted
 //! requests change together with the states of the threads that wait in

@@ -4,13 +4,13 @@
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
 //! reference to its process, thread, channel, session, timer, memory
 //! object or interrupt binding, and the last reference queues the object
-//! for cleanup (spec 7.7); a channel counts its
-//! handles with RECEIVE too, since the last of them closes it (spec 6.8).
-//! A channel handle with a label names the label's session, which names
-//! the channel (spec 5.3) and counts its handles as its copies. The system
-//! resource is one for the whole system and is not counted: what a handle
-//! to it allows is in the handle's rights. Every kind of object keeps its
-//! count in a `Refs` and its number in a `Live`.
+//! for cleanup (spec 7.7); a channel counts its handles with RECEIVE too,
+//! since the last of them closes it (spec 6.8). A channel handle with a
+//! label names the label's session, which names the channel (spec 5.3)
+//! and counts its handles as its copies. The system resource is one for
+//! the whole system and is not counted: what a handle to it allows is in
+//! the handle's rights. Every kind of object keeps its count in a `Refs`
+//! and its number in a `Live`.
 
 use crate::channel::{self, Channel};
 use crate::irq::{self, Irq};

@@ -77,9 +77,13 @@ impl<const N: usize> Default for RegionList<N> {
     }
 }
 
+/// The RAM regions a device tree names, at most (`BootInfo::memory`,
+/// `kcore::window::Forbidden`).
+pub const MEMORY_REGIONS: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootInfo {
-    pub memory: RegionList<8>,
+    pub memory: RegionList<MEMORY_REGIONS>,
     pub reserved: RegionList<16>,
     /// Reserved regions marked `no-map`: never allocated and never mapped.
     pub no_map: RegionList<8>,

@@ -387,9 +387,9 @@ impl Paid for Irq {
 
 /// A place for `value`, an object that `payer` makes (thread::create,
 /// channel::create, session::create, timer::create, memory::create,
-/// irq::bind), in
-/// the payer's pool of its kind, whose quota pays for a page when the pool
-/// grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
+/// irq::bind), in the payer's pool of its kind, whose quota pays for a
+/// page when the pool grows (spec 7.5, 7.8). NO_MEMORY when the quota
+/// falls short.
 pub fn paid_alloc<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<T>, Error> {
     // SAFETY: the caller holds a reference to the payer; the value is no
     // field of it.

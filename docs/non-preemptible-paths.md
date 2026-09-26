@@ -106,13 +106,13 @@ binding's slot at the slot's priority, as `notify` does, and ends the
 interrupt; the line stays masked until `irq_ack`, and a closed channel
 keeps it masked. An interrupt of a line no binding holds is masked and
 ended. The kind of trigger goes into `GICD_ICFGR` at each `irq_bind`,
-while the line is masked. The last handle to a binding masks its line
-and frees its entry in O(1), even while a notification of it still waits
-in the channel's queue, and a chunk of its own, after its last reference,
-gives the channel's slot back. No work of an interrupt is deferred. The latency of an
-interrupt of a device is the entry, the blocking time B, the timers' part
-of a timer interrupt pending at the same time (the timers' row), and the
-path of the delivery to the driver's first instruction.
+while the line is masked. The last handle to a binding masks its line and
+frees its entry in O(1), even while a notification of it still waits in
+the channel's queue, and a chunk of its own, after its last reference,
+gives the channel's slot back. No work of an interrupt is deferred. The
+latency of an interrupt of a device is the entry, the blocking time B, the
+timers' part of a timer interrupt pending at the same time (the timers'
+row), and the path of the delivery to the driver's first instruction.
 
 From the same part on, `device_window_create` makes a device window: a
 memory object over a physical range of device registers, rounded out to
