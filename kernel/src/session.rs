@@ -94,6 +94,7 @@ pub fn create(
 ///
 /// # Safety
 /// `s` is alive, and nothing else borrows the count.
+#[must_use]
 unsafe fn refs<'a>(s: NonNull<Session>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
     unsafe { &mut (*s.as_ptr()).refs }

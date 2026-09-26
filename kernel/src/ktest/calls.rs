@@ -10,6 +10,12 @@
 //! kernel that ships. The kernel makes each call here for a thread that
 //! never runs, as if the thread had made it, and checks every register the
 //! call may write.
+//!
+//! Names tell the two sides apart: `<call>_checks_its_arguments` is the
+//! test init's, one contract test per call (spec 11, 12); the kernel keeps
+//! `<call>_checks_the_callers_limits` for what a caller at EL0 cannot
+//! reach: a ceiling below 63, while children have no code yet (spec 15.2);
+//! a full table; a spent quota; who pays; and counts of live objects.
 
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::arch::timer;
@@ -288,13 +294,13 @@ fn close_cases(
     c.fails(n, &[resource.0], Error::BadHandle)
 }
 
-/// thread_set_priority stops at the ceiling of the caller's process as
-/// well as at that of the thread's (spec 8, 11): a caller under ceiling 30
-/// gives a thread of a process under 63 no more than 30, ACCESS_DENIED at
-/// 31. A stopped thread only takes the new values. The caller's process
-/// has ceiling 30; the target threads' processes 20 and 63. The rest of
-/// the call's checks are the test
-/// init's (thread_set_priority_checks_its_arguments).
+/// thread_set_priority stops at the ceiling of the caller's process as well
+/// as at that of the thread's (spec 8, 11): a caller under ceiling 30 gives
+/// a thread of a process under 63 no more than 30, ACCESS_DENIED at 31. A
+/// stopped thread only takes the new values. The caller's process has
+/// ceiling 30; the target threads' processes 20 and 63. The rest of the
+/// call's checks are the test init's
+/// (thread_set_priority_checks_its_arguments).
 pub fn thread_set_priority_checks_the_callers_ceiling(_: &Boot) -> Result<(), &'static str> {
     let callers = [30, 20, 63].map(Caller::with_ceiling);
     let result = match &callers {
@@ -339,14 +345,14 @@ fn set_priority_cases(
 }
 
 /// process_create stops at the caller's limits (spec 7.5, 11): a ceiling
-/// above the caller's, 30 here, fails with ACCESS_DENIED after the
-/// handles and before the quota; with the caller's table full the call
-/// fails with LIMIT_REACHED, and the new process goes again. A good call
-/// returns a handle with the owner's rights to a live process with the
-/// ceiling given, a child of the caller's process (spec 4). Channels in
-/// x3 and x5 have cases of their own (`exit_and_start_cases`). The rest of
-/// the call's checks are the test
-/// init's (process_create_checks_its_arguments and its neighbours).
+/// above the caller's, 30 here, fails with ACCESS_DENIED after the handles
+/// and before the quota; with the caller's table full the call fails with
+/// LIMIT_REACHED, and the new process goes again. A good call returns a
+/// handle with the owner's rights to a live process with the ceiling given,
+/// a child of the caller's process (spec 4). Channels in x3 and x5 have
+/// cases of their own (`exit_and_start_cases`). The rest of the call's
+/// checks are the test init's (process_create_checks_its_arguments and its
+/// neighbours).
 pub fn process_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;

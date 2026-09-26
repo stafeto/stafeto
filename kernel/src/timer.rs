@@ -129,6 +129,7 @@ pub fn create(
 ///
 /// # Safety
 /// `t` is alive, and nothing else borrows the count.
+#[must_use]
 unsafe fn refs<'a>(t: NonNull<Timer>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
     unsafe { &mut (*t.as_ptr()).refs }

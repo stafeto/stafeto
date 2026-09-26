@@ -263,6 +263,7 @@ pub fn create(payer: NonNull<Process>, priority: u8) -> Result<NonNull<Channel>,
 ///
 /// # Safety
 /// `c` is alive, and nothing else borrows the count.
+#[must_use]
 unsafe fn refs<'a>(c: NonNull<Channel>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
     unsafe { &mut (*c.as_ptr()).refs }

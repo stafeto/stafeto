@@ -429,6 +429,7 @@ pub unsafe fn exit(t: NonNull<Thread>) {
 ///
 /// # Safety
 /// `thread` is alive, and nothing else borrows the count.
+#[must_use]
 unsafe fn refs<'a>(thread: NonNull<Thread>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
     unsafe { &mut (*thread.as_ptr()).refs }

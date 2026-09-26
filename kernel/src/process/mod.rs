@@ -529,6 +529,7 @@ pub fn quota(process: NonNull<Process>) -> Account {
 ///
 /// # Safety
 /// `process` is alive, and nothing else borrows the count.
+#[must_use]
 unsafe fn refs<'a>(process: NonNull<Process>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
     unsafe { &mut (*process.as_ptr()).refs }
@@ -708,13 +709,13 @@ pub fn check_alive(process: NonNull<Process>) -> Result<(), Error> {
 }
 
 /// The process's life, as a raw pointer to its field (see `refs`). Test
-/// builds stop a process that went, as `refs` does.
+/// builds stop a process that went, as `Refs::check` does.
 ///
 /// # Safety
 /// `process` is alive.
 unsafe fn life(process: NonNull<Process>) -> *mut Life {
     // SAFETY: the caller's promise; the count is only checked.
-    unsafe { refs(process) };
+    unsafe { refs(process) }.check();
     // SAFETY: the caller's promise.
     unsafe { &raw mut (*process.as_ptr()).life }
 }
