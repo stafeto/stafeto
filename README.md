@@ -81,8 +81,8 @@ parts. Each finished part is merged through a pull request.
 | | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
 | | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | ✅ [#11](https://github.com/stafeto/stafeto/pull/11) |
 | | 1.3d Memory objects | `mem_create`, `mem_map`, memory objects in messages, child processes with code | ✅ [#13](https://github.com/stafeto/stafeto/pull/13) |
-| | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | 🚧 |
-| 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ⬜ |
+| | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ✅ [#14](https://github.com/stafeto/stafeto/pull/14) |
+| 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | 🚧 |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the
