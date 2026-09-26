@@ -157,8 +157,7 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
         };
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
-        let refs = refs(process);
-        *refs = refs.checked_add(1).expect("process references overflow");
+        refs(process).take();
         let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
         cleanup::enqueue(item, Object::Process(process), stage_level(process));
     }
@@ -220,7 +219,7 @@ pub unsafe fn hasten(process: NonNull<Process>, level: u8) {
     // outside its own portions, since the queue holds it.
     unsafe {
         let p = process.as_ptr();
-        refs(process);
+        refs(process).check();
         (*p).level = (*p).level.max(level);
         match (*p).stage {
             Stage::Whole => unreachable!("a process that lives is hastened"),
@@ -560,20 +559,8 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
             Some(parent) => (*parent.as_ptr()).pools.children.free(process),
             None => ROOTS.lock().free(process),
         }
+        LIVE.gone(process);
     }
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    // Test builds poison the slot past the pool's link: a use after free
-    // then reads garbage instead of the old fields, and `life` stops it.
-    #[cfg(feature = "ktest")]
-    // SAFETY: the slot is the pool's again; its first word is the link.
-    unsafe {
-        core::ptr::write_bytes(
-            process.cast::<u8>().as_ptr().add(8),
-            POISON,
-            core::mem::size_of::<Process>() - 8,
-        )
-    };
     if let Some(c) = exit {
         channel::remove_source(c);
         // SAFETY: the shell's reference to its exit channel goes with it.
@@ -618,7 +605,7 @@ pub fn exit_label(process: NonNull<Process>) -> u64 {
     // SAFETY: the exit slot is being taken, and it holds the shell; only
     // the field is read, and `refs` checks the object.
     unsafe {
-        refs(process);
+        refs(process).check();
         (*process.as_ptr())
             .exit
             .as_ref()

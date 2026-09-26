@@ -36,7 +36,7 @@ use crate::cleanup::{self, Item};
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys::{self, Frame};
-use crate::object::{self, Block, Chunks, Handles, Moving, Object};
+use crate::object::{self, Block, Chunks, Handles, Live, Moving, Object, Refs};
 use crate::sched;
 use crate::session::Session;
 use crate::thread::{self, Siblings, Thread};
@@ -82,7 +82,7 @@ pub struct Process {
     /// Handles to the process, its threads, the reference `create` hands
     /// out, and the cleanup queue's while the process is on its stages:
     /// the references that keep it alive.
-    refs: u32,
+    refs: Refs,
     /// References that keep the object but not the process: each child's
     /// to its parent, until the child's shell goes, when the rest of the
     /// child's quota comes back (spec 7.5), and each channel's and each
@@ -233,9 +233,8 @@ unsafe impl Send for Process {}
 /// in test builds the kernel tests' processes. Its pages stay.
 static ROOTS: Lock<Pool<Process>> = Lock::new(Pool::new());
 
-/// Processes whose shells have not gone (test builds).
-#[cfg(feature = "ktest")]
-static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Processes whose shells have not gone.
+static LIVE: Live = Live::new();
 
 impl Process {
     fn space(&mut self) -> &mut AddressSpace {
@@ -330,7 +329,7 @@ fn create(
         retired: None,
         frames: OwnedFrames([const { None }; MAX_BLOCKS]),
         handles,
-        refs: 1,
+        refs: Refs::one(),
         shell_refs: 0,
         quota,
         pages: PageLog::new(),
@@ -369,8 +368,7 @@ fn create(
         process.destroy_space();
         Error::NoMemory
     })?;
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LIVE.made();
     Ok(process)
 }
 
@@ -472,29 +470,19 @@ pub fn quota(process: NonNull<Process>) -> Account {
 
 /// The count of references to `process`. Only the count is borrowed,
 /// through the raw pointer: the process's own table may be in the middle
-/// of `release_step` meanwhile (`release_handles`). Test builds stop a
-/// process that went: the poison of its slot reaches the count.
+/// of `release_step` meanwhile (`release_handles`).
 ///
 /// # Safety
 /// `process` is alive, and nothing else borrows the count.
-unsafe fn refs<'a>(process: NonNull<Process>) -> &'a mut u32 {
+unsafe fn refs<'a>(process: NonNull<Process>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
-    let refs = unsafe { &mut (*process.as_ptr()).refs };
-    #[cfg(feature = "ktest")]
-    assert!(
-        *refs != u32::from_ne_bytes([POISON; 4]),
-        "a process is used after it went"
-    );
-    refs
+    unsafe { &mut (*process.as_ptr()).refs }
 }
 
-/// Adds a reference to a live process. A process nobody refers to waits
-/// for its portion, and taking it back from the queue would free it twice.
+/// Adds a reference to a live process (Refs::retain).
 pub fn retain(process: NonNull<Process>) {
     // SAFETY: the caller holds a reference, so the process is alive.
-    let refs = unsafe { refs(process) };
-    assert!(*refs > 0, "a process nobody refers to is retained");
-    *refs = refs.checked_add(1).expect("process references overflow");
+    unsafe { refs(process) }.retain();
 }
 
 /// Drops a reference; the last one queues the process for cleanup at
@@ -508,14 +496,7 @@ pub fn retain(process: NonNull<Process>) {
 /// The reference is the caller's, and the caller does not use it afterwards.
 pub unsafe fn release(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's reference keeps the process alive until here.
-    let last = unsafe {
-        let refs = refs(process);
-        *refs = refs
-            .checked_sub(1)
-            .expect("a process is released once too often");
-        *refs == 0
-    };
-    if !last {
+    if !unsafe { refs(process) }.release() {
         return;
     }
     // SAFETY: that was the last reference: nothing else reaches the
@@ -542,7 +523,7 @@ pub fn retain_shell(process: NonNull<Process>) {
     // SAFETY: the caller holds a reference to the process; only the field
     // is touched, and `refs` checks the object.
     unsafe {
-        refs(process);
+        refs(process).check();
         let p = process.as_ptr();
         (*p).shell_refs = (*p)
             .shell_refs
@@ -562,7 +543,7 @@ pub unsafe fn release_shell(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's reference keeps the object alive until here;
     // only the fields are touched, the count through `refs`.
     unsafe {
-        let refs = *refs(process);
+        let refs = refs(process).get();
         let p = process.as_ptr();
         (*p).shell_refs = (*p)
             .shell_refs
@@ -612,12 +593,7 @@ fn adopt(parent: NonNull<Process>, child: NonNull<Process>) {
     }
 }
 
-/// What test builds fill a gone process with, past the pool's link.
-#[cfg(feature = "ktest")]
-const POISON: u8 = 0xA5;
-
-// The poison reaches `refs`, which `refs` checks.
-#[cfg(feature = "ktest")]
+// The poison of a shell that went (Live::gone) reaches its count.
 const _: () = assert!(core::mem::offset_of!(Process, refs) >= 8);
 
 /// Ends `process` with `reason` unless it ended before, when the first
@@ -987,7 +963,7 @@ mod test_access {
 
     /// Processes whose shells have not gone.
     pub fn in_use() -> usize {
-        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+        LIVE.count()
     }
 
     /// How many processes came to their stage Quota before their children

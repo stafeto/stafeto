@@ -25,7 +25,7 @@
 use crate::arch::timer as clock;
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
-use crate::object::Object;
+use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{Error, Rights};
 use core::ptr::NonNull;
@@ -47,7 +47,7 @@ pub struct Timer {
     slot: Slot<Owner>,
     /// Its handles, the reference `create` hands out, and its slot's while
     /// the slot is queued: the references that keep it.
-    refs: u32,
+    refs: Refs,
     /// The label of the handle it was made through (spec 5.3).
     label: u64,
     /// The channel, which it holds with a counted reference.
@@ -86,9 +86,8 @@ static TIMERS: Lock<Timers> = Lock::new(Timers {
     longest_batch: 0,
 });
 
-/// Timers whose places have not gone back (test builds).
-#[cfg(feature = "ktest")]
-static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Timers whose places have not gone back.
+static LIVE: Live = Live::new();
 
 /// A timer of `payer`, the process of the thread that makes it, on `c`,
 /// an open channel, whose slot has `priority` and `label`, as timer_create
@@ -109,7 +108,7 @@ pub fn create(
         node: HeapLink::new(),
         // The owner is the timer's own place, known once it has one.
         slot: Slot::new(priority, Owner::Timer(NonNull::dangling())),
-        refs: 1,
+        refs: Refs::one(),
         label,
         channel: c,
         payer,
@@ -122,25 +121,17 @@ pub fn create(
     unsafe { (*t.as_ptr()).slot = Slot::new(priority, Owner::Timer(t)) };
     channel::retain(c, Rights::NONE);
     process::retain_shell(payer);
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LIVE.made();
     Ok(t)
 }
 
-/// The count of references to `t`, through the raw pointer. Test builds
-/// stop a timer that went: the poison of its place reaches the count.
+/// The count of references to `t`, through the raw pointer.
 ///
 /// # Safety
 /// `t` is alive, and nothing else borrows the count.
-unsafe fn refs<'a>(t: NonNull<Timer>) -> &'a mut u32 {
+unsafe fn refs<'a>(t: NonNull<Timer>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
-    let refs = unsafe { &mut (*t.as_ptr()).refs };
-    #[cfg(feature = "ktest")]
-    assert!(
-        *refs != u32::from_ne_bytes([POISON; 4]),
-        "a timer is used after it went"
-    );
-    refs
+    unsafe { &mut (*t.as_ptr()).refs }
 }
 
 /// The slot of `t`, which lives as long as the timer.
@@ -163,9 +154,7 @@ pub fn label(t: NonNull<Timer>) -> u64 {
 pub fn retain(t: NonNull<Timer>) {
     // SAFETY: the caller holds a reference to the timer; only the count is
     // touched.
-    let refs = unsafe { refs(t) };
-    assert!(*refs > 0, "a timer nobody refers to is retained");
-    *refs = refs.checked_add(1).expect("timer references overflow");
+    unsafe { refs(t) }.retain();
 }
 
 /// Drops a reference to `t`. The last one marks the timer dying, so that
@@ -179,11 +168,7 @@ pub unsafe fn release(t: NonNull<Timer>, cause: u8) {
     // SAFETY: the caller's reference keeps the timer alive until here; the
     // pool keeps it in place until its portion.
     unsafe {
-        let refs = refs(t);
-        *refs = refs
-            .checked_sub(1)
-            .expect("a timer is released once too often");
-        if *refs == 0 {
+        if refs(t).release() {
             let p = t.as_ptr();
             (*p).dying = true;
             let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
@@ -314,20 +299,10 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
     channel::remove_source(c);
     // SAFETY: nothing uses the timer afterwards; the payer's pool is there,
     // since the timer holds the payer's shell.
-    unsafe { process::free_timer_slot(payer, t) };
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
-    // Test builds poison the place past the pool's link, as for sessions:
-    // `refs` stops a use after free.
-    #[cfg(feature = "ktest")]
-    // SAFETY: the place is the pool's again; its first word is the link.
     unsafe {
-        core::ptr::write_bytes(
-            t.cast::<u8>().as_ptr().add(8),
-            POISON,
-            core::mem::size_of::<Timer>() - 8,
-        )
-    };
+        process::free_timer_slot(payer, t);
+        LIVE.gone(t);
+    }
     // SAFETY: the timer's references to its channel and to its payer's
     // shell go with it.
     unsafe {
@@ -336,12 +311,7 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
     }
 }
 
-/// What test builds fill a gone timer with, past the pool's link.
-#[cfg(feature = "ktest")]
-const POISON: u8 = 0xA5;
-
-// The poison reaches `refs`, which `refs` checks.
-#[cfg(feature = "ktest")]
+// The poison of a timer that went (Live::gone) reaches its count.
 const _: () = assert!(core::mem::offset_of!(Timer, refs) >= 8);
 
 #[cfg(feature = "ktest")]
@@ -354,7 +324,7 @@ mod test_access {
 
     /// Timers whose places have not gone back.
     pub fn in_use() -> usize {
-        LIVE.load(core::sync::atomic::Ordering::Relaxed)
+        LIVE.count()
     }
 
     /// The deadline of `t`, which the test knows alive, in ticks while it is

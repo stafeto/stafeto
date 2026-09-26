@@ -22,7 +22,7 @@ use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::channel::{Owner, Wait};
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame};
-use crate::object::{self, Moving, Object};
+use crate::object::{self, Live, Moving, Object, Refs};
 use crate::process::{self, Process};
 use crate::sched::{self, Tokens};
 use abi::{Error, MESSAGE_HANDLES, Policy, msgbuf};
@@ -84,7 +84,7 @@ pub struct Thread {
     process: NonNull<Process>,
     /// Handles to the thread, the reference `create` hands out and the
     /// kernel's from `start` to the end.
-    refs: u32,
+    refs: Refs,
     /// Its place in the cleanup queue once its last reference goes.
     cleanup: Item,
 }
@@ -125,9 +125,8 @@ unsafe impl Schedulable for Thread {
     }
 }
 
-/// Threads whose slots have not gone back (test builds).
-#[cfg(feature = "ktest")]
-static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Threads whose slots have not gone back.
+static LIVE: Live = Live::new();
 
 impl Thread {
     /// The thread's process, which the thread holds a reference to.
@@ -187,7 +186,7 @@ pub fn create(
         siblings: None,
         buffer: None,
         process,
-        refs: 1,
+        refs: Refs::one(),
         cleanup: Item::new(),
     };
     let thread = process::thread_slot(process, thread)?;
@@ -198,8 +197,7 @@ pub fn create(
         (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
         (*thread.as_ptr()).index = Some(index);
     }
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    LIVE.made();
     process::retain(process);
     process::add_thread(process, thread);
     Ok(thread)
@@ -427,30 +425,19 @@ pub unsafe fn exit(t: NonNull<Thread>) {
     }
 }
 
-/// The count of references to `thread`, through the raw pointer. Test
-/// builds stop a thread that went: the poison of its slot reaches the
-/// count (`clean`).
+/// The count of references to `thread`, through the raw pointer.
 ///
 /// # Safety
 /// `thread` is alive, and nothing else borrows the count.
-unsafe fn refs<'a>(thread: NonNull<Thread>) -> &'a mut u32 {
+unsafe fn refs<'a>(thread: NonNull<Thread>) -> &'a mut Refs {
     // SAFETY: the caller's promise; only the field is borrowed.
-    let refs = unsafe { &mut (*thread.as_ptr()).refs };
-    #[cfg(feature = "ktest")]
-    assert!(
-        *refs != u32::from_ne_bytes([POISON; 4]),
-        "a thread is used after it went"
-    );
-    refs
+    unsafe { &mut (*thread.as_ptr()).refs }
 }
 
-/// Adds a reference to a live thread. A thread nobody refers to waits for
-/// its portion, and taking it back from the queue would free it twice.
+/// Adds a reference to a live thread (Refs::retain).
 pub fn retain(thread: NonNull<Thread>) {
     // SAFETY: the caller holds a reference, so the thread is alive.
-    let refs = unsafe { refs(thread) };
-    assert!(*refs > 0, "a thread nobody refers to is retained");
-    *refs = refs.checked_add(1).expect("thread references overflow");
+    unsafe { refs(thread) }.retain();
 }
 
 /// Drops a reference; the last one queues the thread for cleanup at
@@ -460,11 +447,7 @@ pub fn retain(thread: NonNull<Thread>) {
 /// The reference is the caller's, and the caller does not use it afterwards.
 pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
     // SAFETY: the caller's reference keeps the thread alive until here.
-    let refs = unsafe { refs(thread) };
-    *refs = refs
-        .checked_sub(1)
-        .expect("a thread is released once too often");
-    if *refs > 0 {
+    if !unsafe { refs(thread) }.release() {
         return;
     }
     // SAFETY: as above; only the scheduler's part is read.
@@ -504,27 +487,13 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
         sched::locked(|k| give_number(thread, k.tokens));
         process::remove_thread(process, thread);
         process::free_thread_slot(process, thread);
-        // Test builds poison the slot past the pool's link, as for
-        // processes: `refs` stops a use after free.
-        #[cfg(feature = "ktest")]
-        core::ptr::write_bytes(
-            thread.cast::<u8>().as_ptr().add(8),
-            POISON,
-            core::mem::size_of::<Thread>() - 8,
-        );
+        LIVE.gone(thread);
     }
-    #[cfg(feature = "ktest")]
-    LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: the thread's reference to its process goes with it.
     unsafe { process::release(process, level) };
 }
 
-/// What test builds fill a gone thread with, past the pool's link.
-#[cfg(feature = "ktest")]
-const POISON: u8 = 0xA5;
-
-// The poison reaches `refs`, which `refs` checks.
-#[cfg(feature = "ktest")]
+// The poison of a thread that went (Live::gone) reaches its count.
 const _: () = assert!(core::mem::offset_of!(Thread, refs) >= 8);
 
 /// The thread whose registers, FP registers and address space are live:
@@ -559,5 +528,5 @@ pub fn run(next: NonNull<Thread>) -> ! {
 /// Threads whose slots have not gone back.
 #[cfg(feature = "ktest")]
 pub fn in_use() -> usize {
-    LIVE.load(core::sync::atomic::Ordering::Relaxed)
+    LIVE.count()
 }
