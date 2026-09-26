@@ -107,6 +107,12 @@ pub const MEMORY_RIGHTS: Rights = Rights(
         | Rights::TRANSFER.0,
 );
 
+/// Rights of the handle that `device_window_create` returns (spec 5.2,
+/// 7.4): a window maps R or RW and travels; the registers of a device are
+/// never run.
+pub const WINDOW_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+
 /// Rights of init's handle to the boot image (spec 13.1, 13.3): a memory
 /// object that maps read-only and travels, never written or run in place.
 pub const INIT_BOOT_IMAGE_RIGHTS: Rights =
@@ -608,8 +614,8 @@ pub const INFO_PROCESS_HANDLES: u64 = 3;
 /// KERNEL_STATS takes the system resource with KSTATS and returns
 /// `KernelStats::to_words` in x1-x8.
 pub const INFO_KERNEL_STATS: u64 = 4;
-/// MEMORY takes a memory object's handle, with no right needed, and
-/// returns `MemoryInfo::to_words` in x1-x3.
+/// MEMORY takes a memory object's handle, a device window's too, with no
+/// right needed, and returns `MemoryInfo::to_words` in x1-x3.
 pub const INFO_MEMORY: u64 = 5;
 
 /// IRQ takes an interrupt binding's handle, with no right needed, and
@@ -650,8 +656,8 @@ impl ProcessMemory {
 }
 
 /// A memory object (spec 7.3, 11): its size in bytes, the pages whose
-/// frames it owns, every page of an object `mem_create` made, and the
-/// mappings of it now.
+/// frames it owns, every page of an object `mem_create` made and none of a
+/// device window, and the mappings of it now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryInfo {
     pub size: u64,
@@ -1076,6 +1082,10 @@ mod tests {
         assert_eq!(
             INIT_BOOT_IMAGE_RIGHTS,
             Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER
+        );
+        assert_eq!(
+            WINDOW_RIGHTS,
+            Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER
         );
     }
 

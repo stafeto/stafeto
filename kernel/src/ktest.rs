@@ -416,6 +416,15 @@ const TESTS: &[(&str, TestFn)] = &[
         "irq_bind_checks_the_callers_limits",
         calls::irq_bind_checks_the_callers_limits,
     ),
+    (
+        "window_maps_as_device_memory",
+        calls::window_maps_as_device_memory,
+    ),
+    ("window_frames_never_go", calls::window_frames_never_go),
+    (
+        "windows_of_the_running_process_are_counted",
+        calls::windows_of_the_running_process_are_counted,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
@@ -433,9 +442,9 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 
 /// Tests of the icount build besides TESTS and the EL0 tests: the first
 /// checks that the run is under -icount, the others measure the portions
-/// of the long calls of memory objects and the timers of programs, whose
-/// counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 3 } else { 0 };
+/// of the long calls of memory objects, the timers of programs and device
+/// windows, whose counts mean instructions only there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 4 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -455,6 +464,11 @@ pub fn run(boot: &Boot) -> ! {
     report(
         "timer_firing_is_measured",
         calls::timer_firing_is_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "device_windows_are_measured",
+        calls::device_windows_are_measured(boot),
     );
     el0::run()
 }

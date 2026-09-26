@@ -33,7 +33,7 @@
 use abi::{
     Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, IrqInfo, MemoryInfo,
     OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
-    TRIGGER_EDGE,
+    TRIGGER_EDGE, WINDOW_RIGHTS,
 };
 use bootimg::{Part, Program};
 use child::{Checked, Role};
@@ -48,7 +48,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 164] = [
+const TESTS: [Test; 171] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -540,6 +540,31 @@ const TESTS: [Test; 164] = [
     (
         "irq_info_reports_line_mask_and_trigger",
         irq_info_reports_line_mask_and_trigger,
+    ),
+    (
+        "device_window_create_checks_its_arguments",
+        device_window_create_checks_its_arguments,
+    ),
+    (
+        "window_is_checked_by_whole_pages",
+        window_is_checked_by_whole_pages,
+    ),
+    (
+        "window_handle_is_a_device_window",
+        window_handle_is_a_device_window,
+    ),
+    (
+        "window_maps_read_write_but_never_exec",
+        window_maps_read_write_but_never_exec,
+    ),
+    ("window_reads_its_device", window_reads_its_device),
+    (
+        "window_info_counts_its_mappings",
+        window_info_counts_its_mappings,
+    ),
+    (
+        "window_over_a_hole_faults_only_its_process",
+        window_over_a_hole_faults_only_its_process,
     ),
     (
         "create_kill_cycles_leak_nothing",
@@ -8350,4 +8375,246 @@ fn irq_info_reports_line_mask_and_trigger() -> Outcome {
             ),
         "IRQ does not report the line, the open mask and the trigger of a new binding",
     )
+}
+
+/// The page of the PL031 of QEMU `virt`, the tests' device window: its
+/// first register, at offset 0, holds the count of seconds (RTCDR).
+const RTC: u64 = 0x0901_0000;
+/// A page of QEMU `virt` with no device behind it: a load there is a
+/// synchronous external abort.
+const HOLE: u64 = 0x0904_0000;
+/// The fault status of a synchronous external abort that is not on a
+/// table walk, bits 5:0 of ESR ([G22]); an abort from EL0 gives ESR
+/// 0x92000010 whole.
+const EXTERNAL: u64 = 0b01_0000;
+
+/// A device window over `len` bytes from `addr` through the system
+/// resource.
+fn device_window(addr: u64, len: u64) -> Result<Handle<Memory>, &'static str> {
+    sys::device_window_create(&init::RESOURCE, addr, len).map_err(|_| "device_window_create failed")
+}
+
+/// device_window_create(x0 system resource with DEVICE, x1 address, x2
+/// length) checks the values first, then the handle, then the range
+/// against RAM and the kernel's devices (spec 9, 11), and changes x0 alone
+/// on an error: a length of 0, more than abi::MAX_MEMORY, a range that
+/// wraps around or ends past 2^48 fail with INVALID_ARGS through a closed
+/// handle too; a closed handle, a channel and a copy of the resource
+/// without DEVICE with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED, over RAM
+/// too; a page of RAM, of the GIC's distributor or CPU interface or of the
+/// PL011 with INVALID_ARGS. A window on the PL031 changes x0 and x1 alone,
+/// and its handle carries abi::WINDOW_RIGHTS and no MAP_EXEC.
+fn device_window_create_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::DeviceWindowCreate.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let no_device = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let (resource, page) = (init::RESOURCE.raw().0, PAGE as u64);
+    let invalid = [
+        (RTC, 0),
+        (RTC, abi::MAX_MEMORY + page),
+        (u64::MAX - 0x10, 0x20),
+        (LOWER_END - page, 2 * page),
+    ]
+    .iter()
+    .all(|&(addr, len)| x0_alone::<N>(&[gone, addr, len], Error::InvalidArgs.code()));
+    let refused = [
+        (gone, Error::BadHandle),
+        (c.raw().0, Error::WrongType),
+        (no_device.raw().0, Error::AccessDenied),
+    ]
+    .iter()
+    .all(|&(h, e)| x0_alone::<N>(&[h, 0x4000_0000, page], e.code()));
+    let kernel = [0x4000_0000, 0x0800_0000, 0x0801_0000, 0x0900_0000]
+        .iter()
+        .all(|&addr| x0_alone::<N>(&[resource, addr, page], Error::InvalidArgs.code()));
+    let mut x = marked();
+    x[..3].copy_from_slice(&[resource, RTC, page]);
+    // SAFETY: device_window_create only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
+    let w: Handle<Memory> = Handle::from_raw(abi::Handle(after[1]));
+    let all = sys::handle_duplicate(&w, WINDOW_RIGHTS).map(close);
+    let more = sys::handle_duplicate(&w, WINDOW_RIGHTS | Rights::MAP_EXEC).map(close);
+    if made {
+        close(w)?;
+    }
+    close(no_device)?;
+    close(c)?;
+    check(
+        invalid,
+        "a bad length or range did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        refused,
+        "a bad resource handle did not fail alone before the range",
+    )?;
+    check(
+        kernel,
+        "a window over RAM or a device of the kernel was made",
+    )?;
+    check(
+        made,
+        "a good device_window_create failed or changed registers past x1",
+    )?;
+    check(
+        all == Ok(Ok(())) && more == Err(Error::AccessDenied),
+        "the handle of a window does not carry WINDOW_RIGHTS and no more",
+    )
+}
+
+/// A window is checked by whole pages (spec 9): 32 bytes across the end of
+/// the PL011's page touch it and fail with INVALID_ARGS; the same bytes
+/// across the end of the PL031's page make a window of two pages.
+fn window_is_checked_by_whole_pages() -> Outcome {
+    let over = sys::device_window_create(&init::RESOURCE, 0x0900_0FF0, 0x20).err();
+    let w = device_window(RTC + 0xFF0, 0x20)?;
+    let size = sys::memory_info(&w).map(|i| i.size);
+    close(w)?;
+    check(
+        over == Some(Error::InvalidArgs),
+        "a window that shares the page of the PL011 was made",
+    )?;
+    check(
+        size == Ok(2 * PAGE as u64),
+        "a window was not rounded out to whole pages",
+    )
+}
+
+/// A window is a device window (spec 4, 6.2): a copy of its handle with
+/// WINDOW_RIGHTS that a client sends comes with the kind DeviceWindow and
+/// those rights in its info word.
+fn window_handle_is_a_device_window() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let w = device_window(RTC, PAGE as u64)?;
+    give(&[copy_raw(&w, WINDOW_RIGHTS)?]);
+    let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
+    let got = sys::try_receive(&c);
+    let (h, info) = rt::msgbuf::handle(0);
+    let replied = answer_all([got]);
+    let closed = close_raw(h);
+    close(t)?;
+    close(c)?;
+    close(w)?;
+    check(
+        info == (abi::ObjectKind::DeviceWindow, WINDOW_RIGHTS),
+        "the window's handle came with another kind or other rights",
+    )?;
+    check(
+        replied && ended(0) && closed.is_ok(),
+        "the client did not get the reply",
+    )
+}
+
+/// Spec 15.2 (memory, devices): a window maps R and RW, never RX (spec
+/// 7.4): mem_map with RX and mem_protect of the RW mapping to RX fail with
+/// ACCESS_DENIED, since the handle has no MAP_EXEC.
+fn window_maps_read_write_but_never_exec() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(RTC, page)?;
+    let r = sys::mem_map(&init::PROCESS, &w, 0, page, WINDOW, Access::Read);
+    let rw = sys::mem_map(
+        &init::PROCESS,
+        &w,
+        0,
+        page,
+        WINDOW + PAGE,
+        Access::ReadWrite,
+    );
+    let rx = sys::mem_map(
+        &init::PROCESS,
+        &w,
+        0,
+        page,
+        WINDOW + 2 * PAGE,
+        Access::ReadExec,
+    );
+    // SAFETY: the mapping is the test's window, which nothing runs.
+    let protected =
+        unsafe { sys::mem_protect(&init::PROCESS, WINDOW + PAGE, page, Access::ReadExec) };
+    for (mapped, at) in [(r, WINDOW), (rw, WINDOW + PAGE)] {
+        if mapped.is_ok() {
+            unmap(at, page)?;
+        }
+    }
+    close(w)?;
+    check(r.is_ok() && rw.is_ok(), "a window did not map R or RW")?;
+    check(
+        rx == Err(Error::AccessDenied) && protected == Err(Error::AccessDenied),
+        "a window mapped RX or became RX",
+    )
+}
+
+/// A window shows its device (spec 9): the count of seconds of the PL031,
+/// read twice through a window mapped R with volatile loads of 32 bits
+/// ([G34]), is not 0 and does not go back.
+fn window_reads_its_device() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(RTC, page)?;
+    map(&w, 0, page, WINDOW, Access::Read)?;
+    let dr = WINDOW as *const u32;
+    // SAFETY: the page is the PL031's registers, mapped R as device memory;
+    // RTCDR is a 32-bit register at offset 0.
+    let (first, second) = unsafe { (dr.read_volatile(), dr.read_volatile()) };
+    unmap(WINDOW, page)?;
+    close(w)?;
+    check(
+        first != 0 && second >= first,
+        "the PL031's count through the window is 0 or went back",
+    )
+}
+
+/// MEMORY of a window (spec 11): its size, no page of frames it owns, and
+/// its mappings now, two, then one.
+fn window_info_counts_its_mappings() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(RTC, page)?;
+    let info = |mappings| {
+        Ok(MemoryInfo {
+            size: page,
+            pages: 0,
+            mappings,
+        })
+    };
+    let before = sys::memory_info(&w);
+    map(&w, 0, page, WINDOW, Access::Read)?;
+    map(&w, 0, page, WINDOW + PAGE, Access::Read)?;
+    let two = sys::memory_info(&w);
+    unmap(WINDOW + PAGE, page)?;
+    let one = sys::memory_info(&w);
+    unmap(WINDOW, page)?;
+    close(w)?;
+    check(
+        before == info(0) && two == info(2) && one == info(1),
+        "MEMORY of a window does not count its mappings or counts pages",
+    )
+}
+
+/// Spec 15.2 (faults), 7.9: a load through a window where no device
+/// answers is a synchronous external abort of the process that made it,
+/// and ends only that process. Init maps a window on a hole into a child
+/// with code, which loads from it (Role::Load): the child ends with a data
+/// abort from EL0 whose fault is external, FAR at the load; init lives on.
+fn window_over_a_hole_faults_only_its_process() -> Outcome {
+    let page = PAGE as u64;
+    let w = device_window(HOLE, page)?;
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let at = child::SHARED;
+    let state = sys::mem_map(&kid.process, &w, 0, page, at, Access::Read)
+        .map_err(|_| "the window did not map into the child")
+        .and_then(|()| kid.start())
+        .and_then(|()| kid.serve(Role::Load, &[at as u64], &[]))
+        .and_then(|()| kid.end());
+    kid.close()?;
+    let_run()?;
+    close(w)?;
+    match state? {
+        ProcessState::Fault { esr, far, .. } => check(
+            (esr >> 26 & 0x3F, esr & 0x3F, far) == (DATA_ABORT, EXTERNAL, at as u64),
+            "the child's fault is no external abort at the load",
+        ),
+        _ => Err("the child did not end with a fault"),
+    }
 }

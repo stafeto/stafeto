@@ -85,6 +85,11 @@ impl<T: Copy> Maps<T> {
         self.entries.iter().all(Option::is_none)
     }
 
+    /// The mappings in the table, busy or not, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = &Mapping<T>> {
+        self.entries.iter().flatten()
+    }
+
     /// INVALID_ARGS when `pages` pages from `start` share a page with a
     /// mapping, busy or not (spec 7.4, 11).
     pub fn check_free(&self, start: u64, pages: u64) -> Result<(), Error> {
@@ -308,6 +313,8 @@ mod tests {
         assert_eq!(maps.insert(next), Err(Error::LimitReached));
         let i = maps.find(7 * PAGE, 1).unwrap();
         maps.remove(i);
+        assert_eq!(maps.iter().count(), 63);
+        assert!(maps.iter().all(|m| m.object != 7));
         assert_eq!(maps.insert(next), Ok(i));
         let mut drained = 0;
         maps.drain(|_| drained += 1);

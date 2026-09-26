@@ -36,7 +36,7 @@ use crate::thread::{self, Long, Thread};
 use crate::{arch, cleanup, irq, sched, session, timer};
 use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
-    ProcessHandles, ProcessMemory, ProcessState, Rights,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -108,6 +108,7 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::Yield) => yield_now(),
+        Some(Call::DeviceWindowCreate) => device_window_create(thread, &args),
         Some(Call::IrqBind) => irq_bind(thread, &args),
         Some(Call::IrqAck) => irq_ack(thread, &args),
         Some(Call::ClockNow) => clock_now(),
@@ -943,6 +944,32 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// device_window_create(x0 system resource with DEVICE, x1 address, x2
+/// length): a device window, a memory object over the physical range
+/// rounded out to whole pages (spec 9); x1 returns a handle to it with
+/// abi::WINDOW_RIGHTS, which mem_map shows as Device-nGnRE, never
+/// executable (spec 7.4). The checks in the order of spec 11: a length of
+/// 0, a range that wraps around, ends past 2^48 or holds more than
+/// abi::MAX_MEMORY (INVALID_ARGS, kcore::window::round_out); x0
+/// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without DEVICE); a page of the
+/// range shared with RAM or a device of the kernel (INVALID_ARGS,
+/// memory::check_window); then the resources in the order the call takes
+/// them: room in the caller's table (LIMIT_REACHED), a page of the caller's
+/// pool of memory objects and a block of its table (NO_MEMORY). A window
+/// whose handle did not go in goes again.
+fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let (base, pages) = kcore::window::round_out(a[1], a[2])?;
+    lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
+    memory::check_window(base, pages)?;
+    process::handle_room(caller(thread))?;
+    let m = memory::create_window(caller(thread), base, pages as usize)?;
+    let h = process::insert_handle(caller(thread), Object::Memory(m), WINDOW_RIGHTS);
+    // SAFETY: the reference `create_window` handed out goes; the handle, if
+    // it went in, holds the window, and without it the window goes.
+    unsafe { memory::release(m, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
 /// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
 /// NOTIFY, x3 priority, x4 flags): the line's interrupts come as
 /// notifications of the channel (spec 9), bit 0 into a slot of the
@@ -1001,9 +1028,9 @@ fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
 /// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
-/// MEMORY takes a memory object's handle with any rights and returns
-/// abi::MemoryInfo in x1-x3; IRQ an interrupt binding's and returns
-/// abi::IrqInfo in x1-x3.
+/// MEMORY takes a memory object's handle, a device window's too, with any
+/// rights and returns abi::MemoryInfo in x1-x3; IRQ an interrupt binding's
+/// and returns abi::IrqInfo in x1-x3.
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);

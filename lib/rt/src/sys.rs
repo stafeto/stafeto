@@ -290,6 +290,21 @@ pub fn irq_info(irq: &Handle<Interrupt>) -> Result<IrqInfo, Error> {
     Ok(IrqInfo::from_words([x[1], x[2], x[3]]))
 }
 
+/// device_window_create through the system resource with DEVICE: a device
+/// window over the physical range of `len` bytes from `addr`, rounded out
+/// to whole pages, a memory object that touches no RAM and no device of
+/// the kernel (spec 9). `mem_map` shows it R or RW as Device-nGnRE; the
+/// handle carries abi::WINDOW_RIGHTS, without MAP_EXEC. Registers are read
+/// and written with volatile accesses of their width.
+pub fn device_window_create(
+    resource: &Handle<Resource>,
+    addr: u64,
+    len: u64,
+) -> Result<Handle<Memory>, Error> {
+    let x = call::<{ Call::DeviceWindowCreate.number() }>(&[resource.raw().0, addr, len])?;
+    Ok(returned(&x))
+}
+
 /// irq_bind through the system resource with DEVICE: the interrupts of
 /// `line`, a shared line (spec 9), come as notifications of `channel`, a
 /// handle with NOTIFY, bit 0 into a slot of `priority` with the label of

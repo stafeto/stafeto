@@ -39,12 +39,13 @@ use abi::{
     INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, IrqInfo, KernelStats,
     MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy,
     ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source, TRIGGER_EDGE,
+    WINDOW_RIGHTS,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
 use kcore::layout::{GIB, LINEAR_BASE};
-use kcore::paging::{Attrs, page_descriptor};
+use kcore::paging::{Attrs, MAIR_DEVICE, PXN, UXN, attr_index, page_descriptor};
 use kcore::sched::State;
 use kcore::sync::Lock;
 use kcore::token::MAX_COUNT;
@@ -3440,6 +3441,118 @@ fn bind_without_its_handle(c: &Caller) -> Result<(), &'static str> {
     )
 }
 
+// Device windows (spec 7.4, 9).
+
+/// The page of the PL031 of QEMU `virt`, which the tests' windows show.
+const RTC: u64 = 0x0901_0000;
+
+/// A window of the caller over `pages` pages from `addr`, through a copy of
+/// the system resource with DEVICE that goes afterwards.
+fn window_of(c: &Caller, addr: u64, pages: u64) -> Result<(Handle, NonNull<Memory>), &'static str> {
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let made = c.created(
+        Call::DeviceWindowCreate.number(),
+        &[r.0, addr, pages * PAGE_SIZE],
+    );
+    c.close(r)?;
+    let h = made?;
+    // SAFETY: the caller's process is the test's.
+    let m = unsafe { c.process.as_ref() }.lookup(h, WINDOW_RIGHTS, Object::memory);
+    Ok((
+        h,
+        m.map_err(|_| "the handle of a window lacks WINDOW_RIGHTS")?,
+    ))
+}
+
+/// mem_map shows a window as device memory (spec 7.4, [G6], [G9]): the
+/// leaf descriptor of its page maps the PL031's frame with AttrIndx 1,
+/// Device-nGnRE, and UXN and PXN, R or RW.
+pub fn window_maps_as_device_memory(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = window_of(c, RTC, 1)?;
+        let (t, th) = target_of(c)?;
+        let result = [Access::Read, Access::ReadWrite]
+            .into_iter()
+            .try_for_each(|access| {
+                map_whole(c, th, h, 1, USER_VA, access)?;
+                let seen = process::translate(t, USER_VA);
+                unmap_whole(c, th, 1, USER_VA)?;
+                let (pa, desc) = seen.ok_or("the window's page does not translate")?;
+                check(
+                    pa == RTC && attr_index(desc) == MAIR_DEVICE && desc & (UXN | PXN) == UXN | PXN,
+                    "the window's page is not device memory that never runs",
+                )
+            });
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result
+    })
+}
+
+/// A window owns no frame (spec 9): made, mapped into the caller, unmapped
+/// and gone, a second time after a first that took the tables and the
+/// place in the pool, it leaves the free frames and the objects in their
+/// pool as they were; MEMORY counts its size and no page of frames.
+pub fn window_frames_never_go(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let round = || {
+            let (w, m) = window_of(c, RTC, 1)?;
+            let info = memory::info(m);
+            let mapped = map_whole(c, own, w, 1, USER_VA, Access::ReadWrite)
+                .and_then(|()| unmap_whole(c, own, 1, USER_VA));
+            c.close(w)?;
+            cleanup::drain();
+            mapped?;
+            check(
+                info.pages == 0 && info.size == PAGE_SIZE,
+                "a window owns frames or has another size",
+            )
+        };
+        let first = round();
+        let (free, objects) = (phys::free_frames(), memory::in_use());
+        let second = round();
+        let after = (phys::free_frames(), memory::in_use());
+        c.close(own)?;
+        first?;
+        second?;
+        check(
+            after == (free, objects),
+            "a window's frames or its place went back to the kernel",
+        )
+    })
+}
+
+/// The report of an SError counts the device windows of the running process
+/// (spec 7.9, process::device_windows): none with a page of a memory
+/// object mapped, two with a window mapped twice besides, one after one
+/// of them went.
+pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (m, _) = make_memory(c, 1)?;
+        let (w, _) = window_of(c, RTC, 1)?;
+        let (t, th) = target_of(c)?;
+        let counts = (|| {
+            map_whole(c, th, m, 1, USER_VA, Access::ReadWrite)?;
+            let none = process::device_windows(t);
+            map_whole(c, th, w, 1, USER_VA + PAGE, Access::Read)?;
+            map_whole(c, th, w, 1, USER_VA + 2 * PAGE, Access::ReadWrite)?;
+            let two = process::device_windows(t);
+            unmap_whole(c, th, 1, USER_VA + PAGE)?;
+            Ok((none, two, process::device_windows(t)))
+        })();
+        c.close(th)?;
+        c.close(w)?;
+        c.close(m)?;
+        release_target(t);
+        check(
+            counts? == (0, 2, 1),
+            "the windows of a process are not counted, or its memory objects are",
+        )
+    })
+}
+
 // The longest portions of the long calls of memory objects (spec 7.7,
 // 15.3), in their worst cases, under -icount.
 
@@ -3797,6 +3910,59 @@ fn release_ticks(c: &Caller) -> Result<u64, &'static str> {
     });
     apart.rejoin();
     ticks
+}
+
+/// Device windows in their worst cases, under -icount (spec 15.3): the
+/// first entry of device_window_create, whose pool of memory objects takes
+/// a page; the longest entry of mem_map of 64 pages of a window, a portion
+/// of 32 pages each with an interrupt pending all along, whose frames the
+/// window gives without a read; and the portion of a window that goes.
+/// The test prints `device window ticks: create=... map=... release=...`,
+/// which xtask shows; no number fails it.
+#[cfg(feature = "icount")]
+pub fn device_windows_are_measured(_: &Boot) -> Result<(), &'static str> {
+    /// 64 pages of the `virtio-mmio` transports of QEMU `virt`, which
+    /// nothing reads.
+    const WIDE: u64 = 0x0A00_0000;
+    let objects = memory::in_use();
+    let ticks = with_caller(|c| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let start = timer::now();
+        let got = c.call(
+            Call::DeviceWindowCreate.number(),
+            &[r.0, WIDE, 64 * PAGE_SIZE],
+        );
+        let create = timer::now() - start;
+        c.close(r)?;
+        check(got[0] == 0, "device_window_create failed")?;
+        let w = Handle(got[1]);
+        let (t, th) = target_of(c)?;
+        let args = [
+            th.0,
+            w.0,
+            0,
+            64 * PAGE_SIZE,
+            USER_VA as u64,
+            Access::ReadWrite.raw(),
+        ];
+        let map = timed_entries(c, Call::MemMap.number(), &args)
+            .map(|(first, rest, _)| first.max(rest))
+            .and_then(|map| unmap_whole(c, th, 64, USER_VA).map(|()| map));
+        c.close(th)?;
+        release_target(t);
+        c.close(w)?;
+        let start = timer::now();
+        cleanup::portion();
+        let release = timer::now() - start;
+        cleanup::drain();
+        Ok([create, map?, release])
+    })?;
+    let [create, map, release] = ticks;
+    kprintln!("device window ticks: create={create} map={map} release={release}");
+    check(
+        memory::in_use() == objects,
+        "a window of the measurements stayed",
+    )
 }
 
 /// The level of the heap of `timer_firing_is_measured`, its payers, and

@@ -39,7 +39,7 @@ pub enum Object {
     Session(NonNull<Session>),
     /// A timer of a program (spec 10).
     Timer(NonNull<Timer>),
-    /// A memory object (spec 7.3).
+    /// A memory object (spec 7.3), a device window among them (spec 9).
     Memory(NonNull<Memory>),
     /// An interrupt binding (spec 9).
     Irq(NonNull<Irq>),
@@ -120,13 +120,15 @@ impl Object {
     }
 
     /// The kind a message reports for a handle to the object (spec 6.2):
-    /// a handle with a label names a channel.
+    /// a handle with a label names a channel, and a memory object over
+    /// device registers is a device window.
     pub fn kind(&self) -> ObjectKind {
         match self {
             Object::Process(_) => ObjectKind::Process,
             Object::Thread(_) => ObjectKind::Thread,
             Object::Channel(_) | Object::Session(_) => ObjectKind::Channel,
             Object::Timer(_) => ObjectKind::Timer,
+            Object::Memory(m) if memory::is_window(*m) => ObjectKind::DeviceWindow,
             Object::Memory(_) => ObjectKind::Memory,
             Object::Irq(_) => ObjectKind::Interrupt,
             Object::Resource => ObjectKind::Resource,

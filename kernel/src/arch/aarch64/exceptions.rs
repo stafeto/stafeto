@@ -189,9 +189,17 @@ fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
 
 /// An asynchronous exception at EL0 that no handler takes: an error of the
 /// system, such as an SError from a write of the kernel, which the running
-/// program did not cause. The report shows that program all the same, and
-/// the machine stops.
+/// program did not cause. The report shows that program all the same, with
+/// the count of device windows it maps (spec 7.9): a write to
+/// Device-nGnRE memory is acknowledged early, and its error may come after
+/// a switch, so the count is a hint and names no culprit. The machine
+/// stops.
 fn system_error(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
+    // SAFETY: the running thread is alive and holds its process.
+    let windows = process::device_windows(unsafe { thread.as_ref() }.process());
+    kprintln!(
+        "device windows mapped in the running process: {windows}; the error is asynchronous and may come from an earlier access"
+    );
     report_el0(
         thread,
         "system error",
