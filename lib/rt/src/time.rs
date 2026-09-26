@@ -63,6 +63,14 @@ pub fn ns_to_ticks(ns: u64) -> u64 {
     scale().ns_to_ticks(ns)
 }
 
+/// Whether the counter reached the deadline `ns`: the tick where the
+/// kernel fires a timer with that deadline (`ns_to_ticks`). An expiry that
+/// comes before is stale, one of an earlier deadline that timer_cancel or
+/// timer_set left in the timer's slot (spec 10).
+pub fn reached(ns: u64) -> bool {
+    now() >= ns_to_ticks(ns)
+}
+
 /// Nanoseconds in `ticks` on the scale, rounded down, as clock_now gives
 /// them; saturates at u64::MAX.
 pub fn ticks_to_ns(ticks: u64) -> u64 {

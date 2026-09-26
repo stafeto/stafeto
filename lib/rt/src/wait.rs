@@ -56,15 +56,13 @@ impl Waiter {
     /// Waits in receive on `channel`, the one the timer is on, until
     /// something comes or the deadline, nanoseconds on the scale of
     /// clock_now, passes (spec 10). An expiry of this timer counts once
-    /// the counter reached the deadline's tick (time::ns_to_ticks), where
-    /// the kernel fires it, never earlier; one that comes before is stale,
-    /// an earlier wait's that timer_cancel left in the slot, and the wait
-    /// goes on. Anything else ends the wait and cancels the timer. The
+    /// the counter reached the deadline (time::reached), where the kernel
+    /// fires it, never earlier; one that comes before is stale, an earlier
+    /// wait's that timer_cancel left in the slot, and the wait goes on. Anything else ends the wait and cancels the timer. The
     /// errors are timer_set's and receive's; a wait that failed in receive
     /// leaves the timer cancelled.
     pub fn receive_until(&self, channel: &Handle<Channel>, deadline: u64) -> Result<Waited, Error> {
         sys::timer_set(&self.timer, deadline)?;
-        let at = time::ns_to_ticks(deadline);
         let got = loop {
             match sys::receive(channel) {
                 Ok(Received::Notification {
@@ -72,7 +70,7 @@ impl Waiter {
                     label,
                     ..
                 }) if label == self.label => {
-                    if time::now() >= at {
+                    if time::reached(deadline) {
                         return Ok(Waited::Expired);
                     }
                 }

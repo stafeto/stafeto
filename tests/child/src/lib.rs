@@ -103,6 +103,41 @@ pub const FAULT_AT: usize = 6;
 /// saw (Role::LastThread, Role::BufferBack): 1 for what it looked for.
 pub const HELPER: usize = 7;
 pub const SEEN: usize = 8;
+/// The marks of Role::Server and Role::Busy: the counter in nanoseconds
+/// (rt::time) just before the service loop starts, from which its
+/// heartbeat counts its periods; and 1 added each time the handler of
+/// server::BUSY starts to spin.
+pub const SERVED_AT: usize = 9;
+pub const SPINS: usize = 10;
+
+/// The protocol of the test service, Role::Server and Role::Busy
+/// (rt::service): a request is the header of a method alone
+/// (proto_wire), and a reply is its status alone but for SESSIONS.
+pub mod server {
+    /// The version of the protocol.
+    pub const VERSION: u16 = 1;
+    /// Keeps the handle the request brings in the client's session:
+    /// LIMIT_REACHED past HELD.
+    pub const KEEP: u16 = 1;
+    /// Counts an object as given to the client (rt::service::Session::
+    /// issue): LIMIT_REACHED past ISSUED.
+    pub const ISSUE: u16 = 2;
+    /// One object the client had comes back.
+    pub const RETURN: u16 = 3;
+    /// The reply waits in the client's session until the client goes.
+    pub const DEFER: u16 = 4;
+    /// Status 0, then as u32 the number of clients with a session.
+    pub const SESSIONS: u16 = 5;
+    /// Role::Busy: the handler spins until a notification comes to handle
+    /// 1, then answers; Role::Server answers BAD_STATE.
+    pub const BUSY: u16 = 6;
+    pub const METHODS: [u16; 6] = [KEEP, ISSUE, RETURN, DEFER, SESSIONS, BUSY];
+    /// The sessions of the service, the handles and deferred replies a
+    /// session holds, and the objects it gets, at most.
+    pub const SESSIONS_MAX: usize = 2;
+    pub const HELD: usize = 2;
+    pub const ISSUED: u32 = 2;
+}
 
 /// What a child does once it has its start data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,10 +294,19 @@ pub enum Role {
     /// being i as a byte. Ends with 0, or with the number of the first
     /// check that failed.
     Spans = 31,
+    /// The test service (`server`, rt::service): serves handle 0, a
+    /// channel with RECEIVE, with a heartbeat through its start channel
+    /// every argument 0 nanoseconds (none for 0), the slot of its timer at
+    /// argument 1, the child's priority; marks SERVED_AT first. Ends with
+    /// the code of the error of the loop.
+    Server = 32,
+    /// Role::Server, whose handler of server::BUSY spins, yielding, until
+    /// a notification comes to handle 1, a channel with RECEIVE.
+    Busy = 33,
 }
 
 impl Role {
-    pub const ALL: [Role; 31] = [
+    pub const ALL: [Role; 33] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -294,6 +338,8 @@ impl Role {
         Role::Named,
         Role::Once,
         Role::Spans,
+        Role::Server,
+        Role::Busy,
     ];
 
     /// The role whose code is `code`.

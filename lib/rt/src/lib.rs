@@ -9,10 +9,10 @@
 //! buffer (`msgbuf`), output through `debug_write` (`console`, `print!`,
 //! `println!`), the counter and the time scale of the system without a
 //! call (`time`), waits with a bound (`wait`), the start protocol on both
-//! sides (`startup`), the loader of programs of the boot image, which
+//! sides (`startup`), the loop of a service with its sessions and its
+//! heartbeat (`service`), the loader of programs of the boot image, which
 //! starts them with their start data (`loader`), stacks for threads in
-//! static memory, and the panic handler. The service loop comes later in
-//! milestone 1.4.
+//! static memory, and the panic handler.
 //!
 //! A program names its main function with `rt::entry!`; `_start` keeps
 //! the x0 the kernel set, which tells init (0) from a program started with
@@ -26,6 +26,7 @@ pub mod handle;
 pub mod loader;
 pub mod mmio;
 pub mod msgbuf;
+pub mod service;
 pub mod startup;
 pub mod sys;
 pub mod time;

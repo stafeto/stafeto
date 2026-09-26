@@ -5,21 +5,24 @@
 //! 10, 13.2, 13.3): handles that own their entry of the table, the handles
 //! of a message, init's first handles, the strict build of the test
 //! images, where BAD_HANDLE from a typed call panics, waits with a bound,
-//! and the start protocol.
+//! the start protocol, and the loop of a service with its sessions and its
+//! heartbeat.
 
 use crate::channels::{take_one, unlabeled};
 use crate::harness::*;
-use crate::messages::answer_all;
-use crate::processes::{Gift, Kid, LEAF_QUOTA, START, ran, spawn_under};
+use crate::messages::{answer_all, record};
+use crate::processes::{Gift, Kid, LEAF_QUOTA, START, kid_mark, ran, reset_kid_marks, spawn_under};
 use crate::timers::timer_at;
 use crate::transfers::{close_raw, copy_raw, give, handle_client};
+use abi::time::next_release;
+use child::server;
 use proto_init::{Method, StartReply, VERSION};
 use proto_wire::{Header, Name, Status, Writer};
 use rt::startup::{Answered, Giver, StartError};
 use rt::wait::{Waited, Waiter};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 24] = [
+pub(crate) const TESTS: [Test; 33] = [
     ("dropped_handle_closes", dropped_handle_closes),
     ("into_raw_keeps_the_handle", into_raw_keeps_the_handle),
     ("borrowed_handle_stays_open", borrowed_handle_stays_open),
@@ -88,6 +91,42 @@ pub(crate) const TESTS: [Test; 24] = [
     (
         "failed_spawn_leaves_no_handles",
         failed_spawn_leaves_no_handles,
+    ),
+    (
+        "service_frees_a_session_on_client_gone",
+        service_frees_a_session_on_client_gone,
+    ),
+    (
+        "service_refuses_past_its_handle_limit_and_goes_on",
+        service_refuses_past_its_handle_limit_and_goes_on,
+    ),
+    (
+        "service_refuses_past_its_table_and_goes_on",
+        service_refuses_past_its_table_and_goes_on,
+    ),
+    (
+        "issued_objects_are_limited_per_session",
+        issued_objects_are_limited_per_session,
+    ),
+    (
+        "service_answers_an_unknown_method",
+        service_answers_an_unknown_method,
+    ),
+    (
+        "service_refuses_a_short_request",
+        service_refuses_a_short_request,
+    ),
+    (
+        "deferred_reply_is_answered_when_its_session_goes",
+        deferred_reply_is_answered_when_its_session_goes,
+    ),
+    (
+        "heartbeats_keep_their_absolute_period",
+        heartbeats_keep_their_absolute_period,
+    ),
+    (
+        "busy_handler_stops_the_heartbeat",
+        busy_handler_stops_the_heartbeat,
     ),
 ];
 
@@ -907,5 +946,409 @@ fn failed_spawn_leaves_no_handles() -> Outcome {
     check(
         gone == Ok(labelled(START, CLIENT_GONE, 1)) && rest == Err(Error::WouldBlock),
         "a copy of the channel of a spawn that failed stayed",
+    )
+}
+
+/// The quota of a child that runs the test service (Role::Server,
+/// Role::Busy): a page of its pool of timers more, for the timer of its
+/// heartbeat.
+const SERVER_QUOTA: u64 = LEAF_QUOTA + PAGE as u64;
+/// The period of the heartbeats of the tests: QEMU without -icount wakes
+/// a thread 1 to 3 ms after its deadline on a quiet host, which a quarter
+/// of a period of 20 ms leaves room for.
+const PERIOD_NS: u64 = 20_000_000;
+/// The status of a refusal past a limit.
+const LIMIT: Status = Status::Kernel(Error::LimitReached);
+
+/// A child at LEVEL that runs `role` (child::server) on a new channel,
+/// with a heartbeat every `period` nanoseconds (0 for none) and `more`
+/// after the channel in its start data; `with` gets the child and a
+/// handle to the channel with SEND and DUPLICATE, which makes the
+/// sessions of the clients. The child has the channel's only handle with
+/// RECEIVE, so each send fails with PEER_CLOSED once the service ended.
+/// The child is killed after `with`.
+fn serving(
+    role: Role,
+    period: u64,
+    more: Option<Gift>,
+    with: impl FnOnce(&Kid, &Handle<Channel>) -> Outcome,
+) -> Outcome {
+    let c = channel(QUIET)?;
+    let maker = copy(&c, Rights::SEND | Rights::DUPLICATE)?;
+    let kid = Kid::load(SERVER_QUOTA, 16, LEVEL)?;
+    let first = Gift::Given(c.into_raw());
+    let gifts = [first, more.unwrap_or(first)];
+    let gifts = &gifts[..1 + usize::from(more.is_some())];
+    let served = kid
+        .start()
+        .and_then(|()| kid.serve(role, &[period, LEVEL.into()], gifts))
+        .and_then(|()| with(&kid, &maker));
+    kid.close()?;
+    close(maker)?;
+    let_run()?;
+    served
+}
+
+/// A client of the test service: a copy of `maker` with SEND and the
+/// label of client `i`.
+fn client(maker: &Handle<Channel>, i: u64) -> Result<Handle<Channel>, &'static str> {
+    session(maker, Rights::SEND, 0x5E51 + i, QUIET)
+}
+
+/// The status in bytes 0..4 of `word`, the first word of a reply, and the
+/// u32 after it.
+fn status_of(word: u64) -> (Status, u32) {
+    (Status::from_code(word as u32), (word >> 32) as u32)
+}
+
+/// The reply to `bytes` through `s` with `handles`: its status and the
+/// u32 after it.
+fn asked(
+    s: &Handle<Channel>,
+    bytes: &[u8],
+    handles: impl Into<Outgoing>,
+) -> Result<(Status, u32), &'static str> {
+    let reply =
+        sys::send_handles(s, bytes, handles).map_err(|_| "a request to the service failed")?;
+    Ok(status_of(reply.words[0]))
+}
+
+/// The reply to a request of `method` of the test service, its header
+/// alone, through `s`: its status and the u32 after it.
+fn ask(s: &Handle<Channel>, method: u16) -> Result<(Status, u32), &'static str> {
+    ask_with(s, method, Outgoing::new())
+}
+
+/// `ask` with `handles`.
+fn ask_with(
+    s: &Handle<Channel>,
+    method: u16,
+    handles: impl Into<Outgoing>,
+) -> Result<(Status, u32), &'static str> {
+    asked(s, &Header::new(method, server::VERSION).bytes(), handles)
+}
+
+/// Spec 5.3, 5.4: CLIENT_GONE ends a session: the handle the service kept
+/// for the client closes, and the place of the session is free. The
+/// service keeps a copy with a label of a channel of init for the first
+/// client, which then closes its only handle: the copy's CLIENT_GONE
+/// comes to init, and two more clients fill the table of two.
+fn service_frees_a_session_on_client_gone() -> Outcome {
+    const KEPT: u64 = 0x6E97;
+    serving(Role::Server, 0, None, |_, maker| {
+        let e = channel(QUIET)?;
+        let w = waiter(&e)?;
+        let first = client(maker, 0)?;
+        let kept = session(&e, Rights::NOTIFY | Rights::TRANSFER, KEPT, QUIET)?;
+        let keep = ask_with(&first, server::KEEP, [kept.erase()])?;
+        close(first)?;
+        let heard = w.receive_until(&e, clock_now()? + BOUND_NS);
+        let after = [
+            ask(&client(maker, 1)?, server::SESSIONS)?,
+            ask(&client(maker, 2)?, server::SESSIONS)?,
+        ];
+        check(keep.0 == Status::Ok, "the service did not keep the handle")?;
+        check(
+            heard == Ok(Waited::Got(labelled(KEPT, CLIENT_GONE, 1))),
+            "the handle the service kept stayed open after its client went",
+        )?;
+        check(
+            after == [(Status::Ok, 1), (Status::Ok, 2)],
+            "the session of the client that went kept its place",
+        )
+    })
+}
+
+/// Spec 5.4: a session holds at most HELD handles: past them the client
+/// gets LIMIT_REACHED, and the service goes on. The test service keeps
+/// two copies of the system resource, the third gets LIMIT_REACHED, and
+/// the next request is answered.
+fn service_refuses_past_its_handle_limit_and_goes_on() -> Outcome {
+    serving(Role::Server, 0, None, |_, maker| {
+        let c = client(maker, 0)?;
+        let mut kept = [Status::Ok; server::HELD + 1];
+        for k in &mut kept {
+            let h = copy(&resource(), Rights::TRANSFER)?;
+            *k = ask_with(&c, server::KEEP, [h.erase()])?.0;
+        }
+        let after = ask(&c, server::SESSIONS);
+        check(
+            kept == [Status::Ok, Status::Ok, LIMIT],
+            "the limit of handles of a session did not hold",
+        )?;
+        check(
+            after == Ok((Status::Ok, 1)),
+            "the service did not go on after a refusal",
+        )
+    })
+}
+
+/// Spec 5.4: the table of sessions has a fixed size: a client past it
+/// gets LIMIT_REACHED, the service goes on, and no session gives its
+/// place. The test service has two; the third client is refused, and
+/// the first is still served in its session.
+fn service_refuses_past_its_table_and_goes_on() -> Outcome {
+    serving(Role::Server, 0, None, |_, maker| {
+        let clients = [client(maker, 0)?, client(maker, 1)?, client(maker, 2)?];
+        let asked = [0, 1, 2, 0].map(|i| ask(&clients[i], server::SESSIONS));
+        check(
+            asked[..2] == [Ok((Status::Ok, 1)), Ok((Status::Ok, 2))],
+            "two clients did not get a session each",
+        )?;
+        check(
+            matches!(asked[2], Ok((LIMIT, _))),
+            "a client past the table got a session",
+        )?;
+        check(
+            asked[3] == Ok((Status::Ok, 2)),
+            "the service did not go on, or a session gave its place",
+        )
+    })
+}
+
+/// Spec 5.4: a session gets at most ISSUED objects, and one that comes
+/// back makes room: the third ISSUE of a client gets LIMIT_REACHED, the
+/// next after RETURN passes, and another client has a count of its own.
+fn issued_objects_are_limited_per_session() -> Outcome {
+    use server::{ISSUE, RETURN};
+    serving(Role::Server, 0, None, |_, maker| {
+        let (first, second) = (client(maker, 0)?, client(maker, 1)?);
+        let asked = [ISSUE, ISSUE, ISSUE, RETURN, ISSUE].map(|m| ask(&first, m).map(|a| a.0));
+        let other = ask(&second, ISSUE);
+        check(
+            asked
+                == [
+                    Ok(Status::Ok),
+                    Ok(Status::Ok),
+                    Ok(LIMIT),
+                    Ok(Status::Ok),
+                    Ok(Status::Ok),
+                ],
+            "the objects given to a session were not limited",
+        )?;
+        check(
+            other == Ok((Status::Ok, 0)),
+            "a client got the count of another",
+        )
+    })
+}
+
+/// Spec 13.8: a request of a method the service does not have gets
+/// UNKNOWN_METHOD, one of another version BAD_VERSION, and the service
+/// goes on.
+fn service_answers_an_unknown_method() -> Outcome {
+    serving(Role::Server, 0, None, |_, maker| {
+        let c = client(maker, 0)?;
+        let unknown = Header::new(99, server::VERSION).bytes();
+        let other = Header::new(server::SESSIONS, server::VERSION + 1).bytes();
+        let refused = [unknown, other].map(|b| asked(&c, &b, Outgoing::new()).map(|a| a.0));
+        let after = ask(&c, server::SESSIONS);
+        check(
+            refused == [Ok(Status::UnknownMethod), Ok(Status::BadVersion)],
+            "an unknown method or another version was not refused",
+        )?;
+        check(
+            after == Ok((Status::Ok, 1)),
+            "the service did not go on after a refusal",
+        )
+    })
+}
+
+/// Spec 13.8: a request shorter than its header, one whose header has
+/// bytes 4..8 other than zero, and one longer than its method takes get
+/// BAD_SIZE, and the service goes on.
+fn service_refuses_a_short_request() -> Outcome {
+    serving(Role::Server, 0, None, |_, maker| {
+        let c = client(maker, 0)?;
+        let header = Header::new(server::SESSIONS, server::VERSION).bytes();
+        let mut dirty = header;
+        dirty[7] = 1;
+        let mut long = [0; 12];
+        long[..8].copy_from_slice(&header);
+        let sizes =
+            [&header[..4], &dirty, &long].map(|b| asked(&c, b, Outgoing::new()).map(|a| a.0));
+        let after = ask(&c, server::SESSIONS);
+        check(
+            sizes == [Ok(Status::BadSize); 3],
+            "a request of the wrong size was not refused with BAD_SIZE",
+        )?;
+        check(
+            after == Ok((Status::Ok, 1)),
+            "the service did not go on after a refusal",
+        )
+    })
+}
+
+/// The method a `service_client` asks for.
+static ASKED: AtomicU64 = AtomicU64::new(0);
+
+/// A client of the test service in `slot`: sends the header of the
+/// method in ASKED through the handle HANDLES holds for `slot`; `result`
+/// gives the code of the send, 0 when it passed, and the reply's first
+/// word. Then notifies the channel HANDLES holds for the next slot, if it
+/// holds one, and ends.
+extern "C" fn service_client(slot: u64) -> ! {
+    let s = slot as usize;
+    let header = Header::new(ASKED.load(Relaxed) as u16, server::VERSION).bytes();
+    match sys::send(&handle(s), &header) {
+        Ok(reply) => record(s, &[0, reply.words[0]]),
+        Err(e) => record(s, &[e.code()]),
+    }
+    ENDED[s].store(1, Relaxed);
+    if HANDLES[s + 1].load(Relaxed) != 0 {
+        let _ = sys::notify(&handle(s + 1), NOTIFIED);
+    }
+    sys::thread_exit()
+}
+
+/// Spec 6.8, 13.2: a reply the service deferred gets PEER_CLOSED when its
+/// session goes. A thread of init above the child sends DEFER through the
+/// only handle of a client, which init then closes: the request the
+/// service took holds no copy, its CLIENT_GONE comes after the request,
+/// and the reply the session held tells the thread PEER_CLOSED.
+fn deferred_reply_is_answered_when_its_session_goes() -> Outcome {
+    reset_results();
+    let done = channel(QUIET)?;
+    let served = serving(Role::Server, 0, None, |_, maker| {
+        let c = client(maker, 0)?;
+        HANDLES[0].store(c.raw().0, Relaxed);
+        HANDLES[1].store(done.raw().0, Relaxed);
+        ASKED.store(server::DEFER.into(), Relaxed);
+        let w = waiter(&done)?;
+        let t = spawn(0, service_client, 0, HIGH, Policy::Fifo)?;
+        close(c)?;
+        let heard = w.receive_until(&done, clock_now()? + BOUND_NS);
+        close(t)?;
+        check(
+            heard == Ok(Waited::Got(unlabeled(NOTIFIED, 1))) && ended(0),
+            "the deferred request was not answered when its session went",
+        )?;
+        let [code, word, ..] = result(0);
+        check(
+            code == 0 && status_of(word) == (Status::Kernel(Error::PeerClosed), 0),
+            "the deferred request was not answered with PEER_CLOSED",
+        )
+    });
+    close(done)?;
+    served
+}
+
+/// The next request of `kid`, which must be HEARTBEAT (proto_init): the
+/// clock when it came, and its token.
+fn heartbeat(kid: &Kid) -> Result<(u64, Token), &'static str> {
+    let beat = Method::Heartbeat.header().bytes();
+    match kid.ear.next()? {
+        Received::Message {
+            label: START,
+            len,
+            token,
+            words,
+            ..
+        } if abi::inline_bytes(&words)[..len.min(64)] == beat[..] => Ok((clock_now()?, token)),
+        _ => Err("the service sent no HEARTBEAT"),
+    }
+}
+
+/// Answers a HEARTBEAT.
+fn beat_back(token: Token) -> Outcome {
+    token
+        .reply(&proto_wire::reply(Status::Ok))
+        .map_err(|_| "the reply to HEARTBEAT failed")
+}
+
+/// The HEARTBEAT that waits on the channel of `kid` now, past the
+/// CLIENT_GONE of copies and the late expiries of its `Ear`: its token.
+fn heartbeat_now(kid: &Kid) -> Result<Token, &'static str> {
+    let beat = Method::Heartbeat.header().bytes();
+    loop {
+        match kid.ear.now() {
+            Ok(Received::Notification {
+                source: Source::Timer,
+                ..
+            }) => continue,
+            Ok(Received::Message {
+                label: START,
+                len,
+                token,
+                words,
+                ..
+            }) if abi::inline_bytes(&words)[..len.min(64)] == beat[..] => return Ok(token),
+            _ => return Err("a heartbeat did not come by its absolute deadline"),
+        }
+    }
+}
+
+/// Spec 10, 13.4: the heartbeat keeps its absolute period, t0 + k·T with
+/// t0 the clock the child marked before its loop, and the check goes by
+/// the order of events alone. Init answers each HEARTBEAT three quarters
+/// of a period past the last deadline, then waits until half a period
+/// past the deadline after its reply (next_release) and takes the next
+/// HEARTBEAT, which must be there. Init waits on a timer whose slot is at
+/// 1, below the child: when the host holds the run up and both deadlines
+/// pass at once, the child still sends first, so a late host fails
+/// nothing. A heartbeat armed from the reply (now + T) would come a
+/// quarter of a period after that check.
+fn heartbeats_keep_their_absolute_period() -> Outcome {
+    const BEATS: usize = 8;
+    serving(Role::Server, PERIOD_NS, None, |kid, _| {
+        let pause = channel(QUIET)?;
+        let w = Waiter::new(&pause, 0, 1).map_err(|_| "Waiter::new failed")?;
+        let wait_until = |at: u64| match w.receive_until(&pause, at) {
+            Ok(Waited::Expired) => Ok(()),
+            _ => Err("a pause of the test did not end at its deadline"),
+        };
+        let (_, mut token) = heartbeat(kid)?;
+        let t0 = kid_mark(child::SERVED_AT);
+        for _ in 0..BEATS {
+            let last = next_release(t0, PERIOD_NS, clock_now()?) - PERIOD_NS;
+            wait_until(last + PERIOD_NS * 3 / 4)?;
+            beat_back(token)?;
+            let due = next_release(t0, PERIOD_NS, clock_now()?);
+            wait_until(due + PERIOD_NS / 2)?;
+            token = heartbeat_now(kid)?;
+        }
+        beat_back(token)
+    })
+}
+
+/// Spec 13.4: the heartbeat goes from the thread that serves requests, so
+/// a handler that hangs stops it. A thread of init below the child sends
+/// BUSY once init waits: while the handler spins, no HEARTBEAT comes for
+/// three periods; once a notification lets the handler end, the
+/// heartbeat comes back. Init waits on a timer at its own level, which
+/// wakes it above the handler that spins.
+fn busy_handler_stops_the_heartbeat() -> Outcome {
+    reset_results();
+    reset_kid_marks();
+    let spin = channel(QUIET)?;
+    let gift = Gift::Given(copy_raw(&spin, Rights::RECEIVE | Rights::TRANSFER)?);
+    let served = serving(Role::Busy, PERIOD_NS, Some(gift), |kid, maker| {
+        beat_back(heartbeat(kid)?.1)?;
+        let c = client(maker, 0)?;
+        HANDLES[0].store(c.raw().0, Relaxed);
+        ASKED.store(server::BUSY.into(), Relaxed);
+        let pause = channel(QUIET)?;
+        let w = waiter(&pause)?;
+        let t = spawn(0, service_client, 0, LOW, Policy::Fifo)?;
+        let paused = w.receive_until(&pause, clock_now()? + 3 * PERIOD_NS);
+        let silent = kid.ear.now() == Err(Error::WouldBlock);
+        let spinning = kid_mark(child::SPINS);
+        let notified = sys::notify(&spin, 1);
+        let back = heartbeat(kid).and_then(|(_, token)| beat_back(token));
+        close(t)?;
+        check(
+            paused == Ok(Waited::Expired) && silent && spinning == 1,
+            "a heartbeat came while the handler was busy",
+        )?;
+        check(
+            notified.is_ok() && back.is_ok(),
+            "the heartbeat did not come back after the handler",
+        )
+    });
+    close(spin)?;
+    served?;
+    check(
+        ended(0) && result(0)[..2] == [0, 0],
+        "the busy handler did not answer",
     )
 }

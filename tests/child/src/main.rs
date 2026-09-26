@@ -16,15 +16,17 @@
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
     ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELPER, IMAGE, MADE, MARKS, MOST_USED,
-    NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED,
-    STARTED, WINDOW, marked, x0_alone,
+    NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SERVED_AT,
+    SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use rt::handle::{Any, Channel, Memory, Process, Resource, Thread, Timer};
+use proto_wire::Status;
+use rt::handle::{Any, Channel, Memory, Outgoing, Process, Resource, Thread, Timer};
+use rt::service::{self, Answer, Config, Heartbeat, Request, Service, Session};
 use rt::startup::{ARGS_MAX, Giver, StartError, Startup, TakeError};
 use rt::sys::{self, Received};
-use rt::{Handle, Stack, loader, msgbuf};
+use rt::{Handle, Stack, loader, msgbuf, time};
 
 rt::entry!(main);
 
@@ -322,6 +324,8 @@ fn run(s: &Start) -> u64 {
             };
             strict.unwrap_or(FAILED)
         }
+        Role::Server => serve_sessions(s, false),
+        Role::Busy => serve_sessions(s, true),
         // `begin` runs them.
         Role::Named | Role::Once | Role::Spans => FAILED,
     }
@@ -836,4 +840,100 @@ fn double_close() -> Result<u64, Error> {
     c.close()?;
     drop(twin);
     Ok(0)
+}
+
+/// Role::Server and Role::Busy: the code of the error the loop ended with.
+fn serve_sessions(s: &Start, busy: bool) -> u64 {
+    let c = Handle::<Channel>::borrowed(s.handles[0]);
+    let to = parent();
+    let heartbeat = (s.args[0] != 0).then(|| Heartbeat {
+        to: &to,
+        period_ns: s.args[0],
+        priority: s.args[1] as u8,
+    });
+    let mut server = Server {
+        clients: 0,
+        spin: busy.then(|| Handle::borrowed(s.handles[1])),
+    };
+    let config = Config {
+        issued: server::ISSUED,
+        heartbeat,
+    };
+    mark(SERVED_AT).store(time::ticks_to_ns(time::now()), Relaxed);
+    service::run::<_, { server::SESSIONS_MAX }, { server::HELD }>(&c, &mut server, config).code()
+}
+
+/// The test service (child::server): the clients with a session, and for
+/// Role::Busy the channel its handler of BUSY spins on.
+struct Server {
+    clients: u32,
+    spin: Option<ManuallyDrop<Handle<Channel>>>,
+}
+
+/// What the test service keeps for a client: whether it counts in
+/// `Server::clients`.
+#[derive(Default)]
+struct Client {
+    counted: bool,
+}
+
+impl Service<{ server::HELD }> for Server {
+    const VERSION: u16 = server::VERSION;
+    const METHODS: &'static [u16] = &server::METHODS;
+    type Data = Client;
+
+    fn request(
+        &mut self,
+        s: &mut Session<Client, { server::HELD }>,
+        r: &mut Request<'_>,
+    ) -> Answer {
+        if !s.data.counted {
+            s.data.counted = true;
+            self.clients += 1;
+        }
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        match r.method() {
+            server::KEEP => match r.handles.take_any(0) {
+                Ok(h) => s.keep(h).map(drop).into(),
+                Err(_) => Answer::Status(Status::BadSize),
+            },
+            server::ISSUE => s.issue().into(),
+            server::RETURN => {
+                s.release();
+                Answer::Status(Status::Ok)
+            }
+            server::DEFER => {
+                if let Some(p) = r.defer() {
+                    // A full session answers LIMIT_REACHED itself.
+                    let _ = s.hold(p);
+                }
+                Answer::Deferred
+            }
+            server::SESSIONS => {
+                let w = r.reply();
+                // Eight bytes fit.
+                let _ = w.u32(Status::Ok.code()).and(w.u32(self.clients));
+                Answer::Reply(Outgoing::new())
+            }
+            server::BUSY => match &self.spin {
+                Some(spin) => {
+                    mark(SPINS).fetch_add(1, Relaxed);
+                    while sys::try_receive(spin) == Err(Error::WouldBlock) {
+                        let _ = sys::yield_now();
+                    }
+                    Answer::Status(Status::Ok)
+                }
+                None => Answer::Status(Status::Kernel(Error::BadState)),
+            },
+            _ => Answer::Status(Status::UnknownMethod),
+        }
+    }
+
+    fn gone(&mut self, s: &mut Session<Client, { server::HELD }>) {
+        if s.data.counted {
+            self.clients -= 1;
+        }
+    }
 }
