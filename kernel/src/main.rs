@@ -16,11 +16,11 @@ mod arch;
 mod boot;
 mod channel;
 mod cleanup;
-#[cfg(not(feature = "ktest"))]
 mod init;
 mod interrupt;
 #[cfg(feature = "ktest")]
 mod ktest;
+mod memory;
 mod mm;
 mod object;
 mod panicking;
@@ -69,9 +69,10 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
 /// The kernel leaves for init (spec 13.3); init's exit turns the machine
 /// off, and its fault or kill stops it (process::init_ended).
 #[cfg(not(feature = "ktest"))]
-fn finish(_boot: &Boot, program: &Program) -> ! {
+fn finish(boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");
-    init::start(program)
+    let image = boot.info.initrd.expect("init came from the boot image");
+    init::start(program, image)
 }
 
 #[cfg(feature = "ktest")]

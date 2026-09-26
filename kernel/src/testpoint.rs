@@ -68,6 +68,16 @@ mod points {
     pub fn skip_brk(_: u16) -> bool {
         false
     }
+
+    /// After the instruction cache was made coherent for the code in
+    /// `frames` (arch::cache::sync_icache_frames).
+    #[inline(always)]
+    pub fn code_synced(_: &[u64]) {}
+
+    /// After the descriptors that let a program execute the pages of
+    /// `frames` were written (process::maps).
+    #[inline(always)]
+    pub fn code_mapped(_: &[u64]) {}
 }
 
 /// The test build: each point goes to the tests.
@@ -114,5 +124,14 @@ mod points {
     /// The tests count the fast path's hits and may turn it off.
     pub fn fast_path() -> bool {
         el0::fast_path()
+    }
+
+    /// A test watches the order of the two (ktest::calls).
+    pub fn code_synced(frames: &[u64]) {
+        ktest::calls::code_synced(frames);
+    }
+
+    pub fn code_mapped(frames: &[u64]) {
+        ktest::calls::code_mapped(frames);
     }
 }

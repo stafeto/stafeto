@@ -6,12 +6,13 @@
 //! error the spec names for it. The data structures of kcore take values
 //! already checked here.
 
-use crate::PAGE_SIZE;
 use crate::handles::MAX_HANDLES;
 use crate::layout::USER_END;
+use crate::pagelist::MAX_PAGES;
+use crate::{PAGE_SHIFT, PAGE_SIZE};
 use abi::{
-    CLIENT_GONE, Error, HANDLES_SHIFT, MESSAGE_HANDLES, MESSAGE_MAX, NO_WAIT, PRIORITY_LEVELS,
-    Policy, Rights,
+    Access, CLIENT_GONE, Error, HANDLES_SHIFT, MESSAGE_HANDLES, MESSAGE_MAX, NO_WAIT,
+    PRIORITY_LEVELS, Policy, Rights,
 };
 
 /// A priority from a register, as `thread_create` and
@@ -106,7 +107,8 @@ pub fn handle_limit_arg(raw: u64) -> Result<u32, Error> {
 }
 
 /// A reserved register that must be 0: INVALID_ARGS otherwise. `object_info`
-/// takes x2 this way, kept clear for a use the spec has not named yet.
+/// takes x2 this way, kept clear for a use the spec has not named yet, and
+/// `mem_create` its flags, of which none is known (spec 7.3).
 pub fn reserved_arg(raw: u64) -> Result<(), Error> {
     if raw == 0 {
         Ok(())
@@ -202,6 +204,43 @@ pub fn mask_tail(words: &mut [u64], len: usize) {
         if kept < 8 {
             *w &= (1u64 << (8 * kept)).wrapping_sub(1);
         }
+    }
+}
+
+// The largest memory object is the largest list of pages.
+const _: () = assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
+
+/// The access of a mapping from a register (spec 7.4): R, RW or RX
+/// (abi::Access). INVALID_ARGS for any other value, write and execute
+/// together among them.
+pub fn access_arg(raw: u64) -> Result<Access, Error> {
+    Access::from_raw(raw).ok_or(Error::InvalidArgs)
+}
+
+/// The size of a memory object, x0 of `mem_create` (spec 7.3): whole
+/// pages, from one page to MAX_PAGES, abi::MAX_MEMORY bytes. Returns the
+/// pages; INVALID_ARGS otherwise.
+pub fn memory_size_arg(raw: u64) -> Result<usize, Error> {
+    let pages = raw >> PAGE_SHIFT;
+    if raw.is_multiple_of(PAGE_SIZE) && (1..=MAX_PAGES as u64).contains(&pages) {
+        Ok(pages as usize)
+    } else {
+        Err(Error::InvalidArgs)
+    }
+}
+
+/// A range of a program's address space from two registers, its start and
+/// its length in bytes (spec 7.4, 11): both whole pages, the length not 0,
+/// and the range in the lower half. Returns its pages; INVALID_ARGS
+/// otherwise.
+pub fn range_arg(start: u64, len: u64) -> Result<u64, Error> {
+    let inside = start
+        .checked_add(len)
+        .is_some_and(|end| end <= USER_END as u64);
+    if start.is_multiple_of(PAGE_SIZE) && len.is_multiple_of(PAGE_SIZE) && len > 0 && inside {
+        Ok(len >> PAGE_SHIFT)
+    } else {
+        Err(Error::InvalidArgs)
     }
 }
 
@@ -406,6 +445,62 @@ mod tests {
             let mut words = full;
             mask_tail(&mut words, len);
             assert_eq!(words, want, "length {len}");
+        }
+    }
+
+    /// W^X in one mapping (spec 7.4): R, RW and RX, and nothing else, in
+    /// the whole register.
+    #[test]
+    fn access_is_r_rw_or_rx() {
+        assert_eq!(access_arg(1), Ok(Access::Read));
+        assert_eq!(access_arg(3), Ok(Access::ReadWrite));
+        assert_eq!(access_arg(5), Ok(Access::ReadExec));
+        for raw in [0, 2, 4, 6, 7, 8, 9, 1 << 32 | 1, u64::MAX] {
+            assert_eq!(access_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+    }
+
+    #[test]
+    fn memory_size_is_whole_pages_up_to_1_gib() {
+        assert_eq!(memory_size_arg(PAGE_SIZE), Ok(1));
+        assert_eq!(memory_size_arg(64 << 20), Ok(16384));
+        assert_eq!(memory_size_arg(1 << 30), Ok(MAX_PAGES));
+        assert_eq!(MAX_PAGES, 1 << 18);
+        for raw in [
+            0,
+            1,
+            PAGE_SIZE - 1,
+            PAGE_SIZE + 8,
+            (1 << 30) + PAGE_SIZE,
+            1 << 40,
+            u64::MAX - PAGE_SIZE + 1,
+            u64::MAX,
+        ] {
+            assert_eq!(memory_size_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+    }
+
+    #[test]
+    fn range_stays_in_the_lower_half() {
+        assert_eq!(range_arg(0, PAGE_SIZE), Ok(1));
+        assert_eq!(range_arg(0x40_0000, 0x20_0000), Ok(512));
+        assert_eq!(range_arg(TOP - PAGE_SIZE, PAGE_SIZE), Ok(1));
+        assert_eq!(range_arg(0, TOP), Ok(TOP >> PAGE_SHIFT));
+        for (start, len) in [
+            (0x40_0000, 0),
+            (0x40_0800, PAGE_SIZE),
+            (0x40_0000, PAGE_SIZE + 8),
+            (TOP, PAGE_SIZE),
+            (TOP - PAGE_SIZE, 2 * PAGE_SIZE),
+            (PAGE_SIZE, TOP),
+            (u64::MAX - PAGE_SIZE + 1, PAGE_SIZE),
+            (PAGE_SIZE, u64::MAX - PAGE_SIZE + 1),
+        ] {
+            assert_eq!(
+                range_arg(start, len),
+                Err(Error::InvalidArgs),
+                "{start:#x}, {len:#x}"
+            );
         }
     }
 

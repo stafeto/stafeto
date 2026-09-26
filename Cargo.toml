@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kcore", "kernel", "lib/abi", "lib/bootimg", "lib/rt", "services/init", "tests/init", "xtask"]
+members = ["kcore", "kernel", "lib/abi", "lib/bootimg", "lib/rt", "services/init", "tests/child", "tests/init", "xtask"]
 default-members = ["kcore", "lib/abi", "lib/bootimg", "xtask"]
 
 [workspace.package]

@@ -60,19 +60,33 @@ pub fn tables_written() {
     unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
 }
 
-/// Drops the TLB entry of one user page; `operand` comes from
+/// Lets the table walker see earlier stores to the tables of a program:
+/// `dsb ishst` with no `isb` (spec 7.4; [G13], [G14], [G15]).
+pub fn user_tables_written() {
+    // SAFETY: a barrier has no other effect.
+    unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
+}
+
+/// Drops the TLB entry of one page of a program with `tlbi vale1is` and no
+/// barrier: a batch of them stands between `user_tables_written` and
+/// `user_pages_invalidated` ([G13]); `operand` comes from
 /// kcore::asid::tlbi_page.
-pub fn invalidate_page(operand: u64) {
+pub fn invalidate_user_page(operand: u64) {
     // SAFETY: TLB maintenance only drops cached translations.
-    unsafe {
-        asm!("dsb ishst", "tlbi vale1is, {}", "dsb ish", "isb", in(reg) operand, options(nostack, preserves_flags))
-    };
+    unsafe { asm!("tlbi vale1is, {}", in(reg) operand, options(nostack, preserves_flags)) };
+}
+
+/// Completes the TLB invalidations before it on every CPU: `dsb ish` with
+/// no `isb` (spec 7.4; [G13], [G15]).
+pub fn user_pages_invalidated() {
+    // SAFETY: a barrier has no other effect.
+    unsafe { asm!("dsb ish", options(nostack, preserves_flags)) };
 }
 
 /// Drops every TLB entry of one ASID, walk-cache entries included; `operand`
 /// comes from kcore::asid::tlbi_asid.
 pub fn invalidate_asid(operand: u64) {
-    // SAFETY: as in `invalidate_page`.
+    // SAFETY: TLB maintenance only drops cached translations.
     unsafe {
         asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb", in(reg) operand, options(nostack, preserves_flags))
     };
@@ -82,7 +96,7 @@ pub fn invalidate_asid(operand: u64) {
 /// reach its walker, so that no walk between the stores and the TLBI brings
 /// an old descriptor back (Linux's local_flush_tlb_all).
 pub fn flush_tlb() {
-    // SAFETY: as in `invalidate_page`.
+    // SAFETY: as in `invalidate_asid`.
     unsafe {
         asm!(
             "dsb nshst",

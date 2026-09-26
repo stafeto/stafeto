@@ -50,11 +50,12 @@ unsafe impl PhysMem for LinearMem {
 pub type Frames = FrameAllocator<'static, LinearMem>;
 
 /// A block of 2^order frames that its holder owns: a message buffer, or a
-/// block `map_frames` gave a process (spec 6.2, 7.8). The kernel reaches it
-/// through the linear map only, never through the tables of a program, and
-/// through raw pointers only: a program may write the block through its own
-/// mapping. Neither Copy nor Clone: `free` takes it back, and a block
-/// dropped otherwise stops the kernel.
+/// page of a memory object, whose list keeps the address `into_raw` gave
+/// until `from_raw` makes it a block again (spec 6.2, 7.3, 7.8). The
+/// kernel reaches it through the linear map only, never through the tables
+/// of a program, and through raw pointers only: a program may write the
+/// block through its own mapping. Neither Copy nor Clone: `free` takes it
+/// back, and a block dropped otherwise stops the kernel.
 pub struct Frame {
     pa: u64,
     order: u8,
@@ -64,9 +65,20 @@ impl Frame {
     /// The block at `pa` of 2^`order` frames.
     ///
     /// # Safety
-    /// The allocator handed the block out, and nothing else owns it.
-    unsafe fn from_raw(pa: u64, order: u8) -> Frame {
+    /// The allocator handed the block out, and nothing else owns it: the
+    /// caller took it back from `into_raw` with its order.
+    pub unsafe fn from_raw(pa: u64, order: u8) -> Frame {
         Frame { pa, order }
+    }
+
+    /// The block as its physical address, for a holder that keeps its
+    /// frames by their addresses (the list of pages of a memory object,
+    /// kcore::pagelist): the holder owns the block from then on, and
+    /// `from_raw` makes it a block again for `free`.
+    pub fn into_raw(self) -> u64 {
+        let pa = self.pa;
+        core::mem::forget(self);
+        pa
     }
 
     /// The physical address of the block.

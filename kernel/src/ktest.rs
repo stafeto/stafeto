@@ -15,14 +15,16 @@ use crate::arch::{self, gic, semihosting, timer};
 use crate::boot::Boot;
 use crate::channel;
 use crate::cleanup;
+use crate::memory;
 use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys;
 use crate::mm::phys::LinearMem;
 use crate::object::Object;
 use crate::process::Stage;
+use crate::thread::Long;
 use crate::{process, sched, session, thread, timer as timers};
-use abi::{Error, Policy, ProcessState, Rights};
+use abi::{Access, Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
@@ -35,7 +37,7 @@ use kcore::layout::{
 };
 use kcore::memmap;
 use kcore::paging::{
-    Attrs, MAIR_DEVICE, MapError, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
+    Attrs, MAIR_DEVICE, NG, PXN, PageTable, TTBR_ROOT_MASK, TableMemory, UXN, attr_index,
 };
 use kcore::quota::Account;
 use kcore::sched::State;
@@ -132,10 +134,6 @@ const TESTS: &[(&str, TestFn)] = &[
         switching_spaces_switches_translations,
     ),
     (
-        "unmapped_page_no_longer_translates",
-        unmapped_page_no_longer_translates,
-    ),
-    (
         "asid_rollover_hides_old_mappings",
         asid_rollover_hides_old_mappings,
     ),
@@ -215,8 +213,8 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::closing_a_handle_releases_its_object,
     ),
     (
-        "thread_set_priority_checks_the_callers_ceiling",
-        calls::thread_set_priority_checks_the_callers_ceiling,
+        "stopped_thread_takes_its_new_priority",
+        calls::stopped_thread_takes_its_new_priority,
     ),
     (
         "process_create_checks_the_callers_limits",
@@ -311,6 +309,76 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::thread_limit_of_the_system,
     ),
     ("thread_numbers_come_back", calls::thread_numbers_come_back),
+    (
+        "object_pays_its_budget_back_to_the_payer",
+        calls::object_pays_its_budget_back_to_the_payer,
+    ),
+    (
+        "mem_create_over_the_quota_is_no_memory",
+        calls::mem_create_over_the_quota_is_no_memory,
+    ),
+    ("new_object_is_zeroed", calls::new_object_is_zeroed),
+    (
+        "create_resumes_where_it_stopped",
+        calls::create_resumes_where_it_stopped,
+    ),
+    (
+        "killed_creator_lets_the_object_go",
+        calls::killed_creator_lets_the_object_go,
+    ),
+    (
+        "full_table_at_the_end_lets_the_object_go",
+        calls::full_table_at_the_end_lets_the_object_go,
+    ),
+    (
+        "another_call_gives_the_long_call_up",
+        calls::another_call_gives_the_long_call_up,
+    ),
+    (
+        "map_that_does_not_fit_maps_nothing",
+        calls::map_that_does_not_fit_maps_nothing,
+    ),
+    ("prepaid_tables_come_back", calls::prepaid_tables_come_back),
+    (
+        "mapping_tables_are_paid_by_the_target",
+        calls::mapping_tables_are_paid_by_the_target,
+    ),
+    (
+        "abandoned_map_keeps_its_prefix",
+        calls::abandoned_map_keeps_its_prefix,
+    ),
+    (
+        "abandoned_unmap_keeps_the_rest",
+        calls::abandoned_unmap_keeps_the_rest,
+    ),
+    (
+        "abandoned_protect_goes_idle",
+        calls::abandoned_protect_goes_idle,
+    ),
+    (
+        "dying_target_ends_the_map",
+        calls::dying_target_ends_the_map,
+    ),
+    (
+        "exec_mapping_syncs_the_instruction_cache",
+        calls::exec_mapping_syncs_the_instruction_cache,
+    ),
+    (
+        "mappings_go_after_the_asid",
+        calls::mappings_go_after_the_asid,
+    ),
+    (
+        "unmapped_page_no_longer_translates",
+        calls::unmapped_page_no_longer_translates,
+    ),
+    (
+        "boot_image_frames_never_go",
+        calls::boot_image_frames_never_go,
+    ),
+    (
+        "init_load_maps_each_part_with_its_access",
+        calls::init_load_maps_each_part_with_its_access,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.
@@ -326,6 +394,12 @@ pub const QUOTA: u64 = 16 << 20;
 /// The quota of a child with a thread or two (spec 7.5).
 pub const CHILD_QUOTA: u64 = 64 << 10;
 
+/// Tests of the icount build besides TESTS and the EL0 tests: the first
+/// checks that the run is under -icount, the second measures the portions
+/// of the long calls of memory objects, whose counts mean instructions only
+/// there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 2 } else { 0 };
+
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
     report(
@@ -335,6 +409,11 @@ pub fn run(boot: &Boot) -> ! {
     for (name, test) in TESTS {
         report(name, test(boot));
     }
+    #[cfg(feature = "icount")]
+    report(
+        "memory_portions_are_measured",
+        calls::memory_portions_are_measured(boot),
+    );
     el0::run()
 }
 
@@ -352,7 +431,7 @@ fn report(name: &str, result: Result<(), &'static str>) {
 /// build, so that xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
-    let total = usize::from(cfg!(feature = "icount")) + TESTS.len() + el0::count();
+    let total = ICOUNT_ONLY + TESTS.len() + el0::count();
     kprintln!("TESTS DONE total={total} failed={failed}");
     semihosting::exit(if failed == 0 { 0 } else { 1 })
 }
@@ -1075,46 +1154,6 @@ fn check_two_spaces(first: u64, second: u64) -> Result<(), &'static str> {
     )
 }
 
-fn unmapped_page_no_longer_translates(_: &Boot) -> Result<(), &'static str> {
-    let frame = frame_with(0xC3)?;
-    let other = frame_with(0xE5)?;
-    let result = check_unmap(frame, other);
-    free_frame(frame);
-    free_frame(other);
-    result
-}
-
-fn check_unmap(frame: u64, other: u64) -> Result<(), &'static str> {
-    let mut space = new_space()?;
-    map(&mut space, USER_VA, frame, Attrs::USER_DATA)?;
-    space.activate();
-    // The read brings the page into the TLB, which the unmap must drop.
-    check(read_user(USER_VA) == 0xC3, "the page misses its contents")?;
-    check(
-        space.unmap(USER_VA) == Ok(frame),
-        "unmap did not return the page's frame",
-    )?;
-    check(
-        !translates(registers::at_s1e0r(USER_VA)) && !translates(registers::at_s1e1r(USER_VA)),
-        "an unmapped page still translates",
-    )?;
-    check(
-        space.translate(USER_VA).is_none(),
-        "the tables still hold an unmapped page",
-    )?;
-    check(
-        space.unmap(USER_VA) == Err(MapError::NotMapped),
-        "a page was unmapped twice",
-    )?;
-    // Another frame at the same address shows through at once; a TLB entry
-    // that the unmap left behind would still show the old one.
-    map(&mut space, USER_VA, other, Attrs::USER_DATA)?;
-    check(
-        read_user(USER_VA) == 0xE5,
-        "the TLB still holds the unmapped page",
-    )
-}
-
 /// Two spaces map one address to different frames and run, one after the
 /// other, with the same ASID of two generations: the TLB entry the first
 /// one left must not show through in the second.
@@ -1420,8 +1459,8 @@ fn churn(root: NonNull<process::Process>, q: u64) -> Result<(), &'static str> {
 /// The pages of a process's pools go back with its shell, a portion at a
 /// time (spec 7.7, 7.8): a root with 130 chunks of handles holds 66 pages
 /// of blocks and a list page. Its handles go at the stage Handles and
-/// leave the pages in the pool; the shell gives them back at most 64 a
-/// portion, in two portions, and the last one gives the slot back.
+/// leave the pages in the pool; the shell gives them back at most 32 a
+/// portion, in three portions, and the last one gives the slot back.
 fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
     const CHUNKS: usize = 130;
     cleanup::drain();
@@ -1452,8 +1491,8 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
         "the blocks of the table did not take a page for two of them and a list page",
     )?;
     check(
-        portions[..n] == [64, held - 64],
-        "the pages of a shell did not go back 64 a portion",
+        portions[..n] == [32, 32, held - 64],
+        "the pages of a shell did not go back 32 a portion",
     )?;
     check(
         pages::taken() == taken && process::in_use() == processes,
@@ -1655,9 +1694,9 @@ fn give_frames_back(mut block: u64) {
     }
 }
 
-/// A process with a thread and mapped frames gives every frame back when
-/// both go. The pools keep the page each takes for its first object, so
-/// one round runs before the count.
+/// A process with a thread and a mapped memory object gives every frame
+/// back when they go. The pools keep the page each takes for its first
+/// object, so one round runs before the count.
 fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static str> {
     process_round()?;
     let before = phys::free_frames();
@@ -1673,13 +1712,20 @@ fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static st
 }
 
 fn process_round() -> Result<(), &'static str> {
-    let mut p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
     let before = (phys::free_frames(), process::quota(p).used());
-    // SAFETY: the process was just created, and only this test uses it.
-    let mapped = unsafe { p.as_mut() }.map_frames(USER_VA, 3 * PAGE_SIZE, Attrs::USER_DATA);
-    let result = match mapped {
-        Ok(pa) => check_fresh_frames(p, pa, before).and_then(|()| check_thread_start(p)),
-        Err(_) => Err("three pages did not map"),
+    let result = match memory::create_whole(p, 3) {
+        Ok(m) => {
+            let mapped = process::map_whole(p, m, USER_VA, Access::ReadWrite);
+            let checked = mapped
+                .map_err(|_| "three pages did not map")
+                .and_then(|()| check_fresh_frames(p, m, before));
+            // SAFETY: the reference `create_whole` handed out goes; the
+            // mapping, if it went in, holds the object.
+            unsafe { memory::release(m, CAUSE) };
+            checked.and_then(|()| check_thread_start(p))
+        }
+        Err(_) => Err("no memory object of three pages"),
     };
     // SAFETY: the process's threads went, the test's reference is the last,
     // and nothing uses it afterwards.
@@ -1828,8 +1874,9 @@ const CARRIERS: usize = 16;
 /// (spec 7.7): CARRIERS threads of a process that never ran, each with a
 /// buffer and four handles on their way (Thread::transit), as a request
 /// that waited in a queue leaves them. The first portion of the stage gives
-/// 13 buffers back, whose 13 units of five reach its 64, and the second
-/// the other 3; the handles go with them, and their channel then too.
+/// 10 buffers back, whose units of six, a frame two and a handle one, fill
+/// 60 of its 64, where the six of the next do not fit, and the second the
+/// other 6; the handles go with them, and their channel then too.
 fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 9;
     cleanup::drain();
@@ -1862,6 +1909,103 @@ fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
     check(
         (process::in_use(), thread::in_use(), channel::in_use()) == (processes, threads, channels),
         "the process, its threads or the channel of their handles stayed",
+    )?;
+    bare_buffers_take_two_units(LEVEL)?;
+    long_calls_take_a_unit_more(LEVEL)
+}
+
+/// Threads with a buffer and no handle on their way, one more than a
+/// portion of the stage Buffers takes: two units of work each.
+const BARE: usize = BUFFERS_PER_PORTION + 1;
+const BUFFERS_PER_PORTION: usize = 32;
+/// Threads in the middle of a long call, with a buffer and no handle on
+/// their way, one more than a portion of the stage Buffers takes: three
+/// units of work each, the frame two and the call one.
+const CALLERS: usize = CALLERS_PER_PORTION + 1;
+const CALLERS_PER_PORTION: usize = 21;
+
+/// The first portion of the stage Buffers of BARE threads with no handles
+/// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 64,
+/// and the second the last one (spec 7.7).
+fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
+    buffers_in_two_portions(level, BARE, BUFFERS_PER_PORTION, false)
+}
+
+/// The first portion of the stage Buffers of CALLERS threads, each in the
+/// middle of a mem_create, gives back CALLERS_PER_PORTION buffers, a frame
+/// two units of its 64 and the call one, and the second the last one; the
+/// objects the calls held go with them (spec 7.7).
+fn long_calls_take_a_unit_more(level: u8) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    buffers_in_two_portions(level, CALLERS, CALLERS_PER_PORTION, true)?;
+    check(
+        memory::in_use() == objects,
+        "the objects of the long calls stayed",
+    )
+}
+
+/// `count` threads of a process, at most BARE, each with a buffer and no
+/// handle on its way, and with `long` each in the middle of a mem_create
+/// of 2 * memory::CREATE_PORTION pages, as its first portion leaves it:
+/// the first portion of the stage Buffers of the process's end gives back
+/// `first` buffers, and the second the last one.
+fn buffers_in_two_portions(
+    level: u8,
+    count: usize,
+    first: usize,
+    long: bool,
+) -> Result<(), &'static str> {
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let mut made = [None; BARE];
+    let result = made[..count]
+        .iter_mut()
+        .enumerate()
+        .try_for_each(|(i, slot)| {
+            let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            *slot = Some(t);
+            thread::give_buffer(t, USER_VA + (i + 1) * PAGE).map_err(|_| "no buffer")?;
+            if long {
+                let m = memory::create(p, 2 * memory::CREATE_PORTION)
+                    .map_err(|_| "no memory object")?;
+                thread::begin_long(t, Long::Create(m));
+                check(!memory::fill(m), "a portion of mem_create made 16 pages")?;
+            }
+            Ok(())
+        })
+        .and_then(|()| {
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(p, ProcessState::Killed, level) };
+            for _ in 0..64 {
+                if process::progress(p).0 == Stage::Buffers {
+                    break;
+                }
+                cleanup::portion();
+            }
+            let frames = phys::free_frames();
+            cleanup::portion();
+            let given = phys::free_frames() - frames;
+            cleanup::portion();
+            let then = phys::free_frames() - frames - given;
+            check(
+                given == first as u64 && then == 1,
+                "a portion of the stage Buffers did not give back the buffers whose units fit",
+            )
+        });
+    // SAFETY: the test's references go, and nothing uses them afterwards.
+    unsafe {
+        for t in made.into_iter().flatten() {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+        process::release(p, CAUSE);
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use()) == (processes, threads),
+        "the process or its threads stayed",
     )
 }
 
@@ -1937,19 +2081,19 @@ fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), 
     let frames = phys::free_frames();
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 13,
-        "the first portion of the stage Buffers did not stop at 13 buffers",
+        process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 10,
+        "the first portion of the stage Buffers did not stop at 10 buffers",
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 16,
-        "the second portion of the stage Buffers did not give the other 3 back",
+        process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 16,
+        "the second portion of the stage Buffers did not give the other 6 back",
     )
 }
 
-/// Three full chunks of handles; a page in each of two gigabytes of the
-/// space, so that six tables map them; buffers for both threads, one of
-/// which is ready; and the space in TTBR0 with an ASID.
+/// Three full chunks of handles; a page of a memory object in each of two
+/// gigabytes of the space, so that six tables map them; buffers for both
+/// threads, one of which is ready; and the space in TTBR0 with an ASID.
 fn fill_for_teardown(
     mut p: NonNull<process::Process>,
     ready: NonNull<thread::Thread>,
@@ -1960,10 +2104,12 @@ fn fill_for_teardown(
             .map_err(|_| "a handle did not go in")?;
     }
     for va in [USER_VA, USER_VA + GIB as usize] {
-        // SAFETY: the process is the test's, and nothing runs it.
-        unsafe { p.as_mut() }
-            .map_frames(va, PAGE_SIZE, Attrs::USER_DATA)
-            .map_err(|_| "a page did not map")?;
+        let m = memory::create_whole(p, 1).map_err(|_| "no memory object")?;
+        let mapped = process::map_whole(p, m, va, Access::ReadWrite);
+        // SAFETY: the reference `create_whole` handed out goes; the
+        // mapping, if it went in, holds the object.
+        unsafe { memory::release(m, CAUSE) };
+        mapped.map_err(|_| "a page did not map")?;
     }
     for (t, page) in [(ready, 2), (stopped, 3)] {
         thread::give_buffer(t, USER_VA + page * PAGE).map_err(|_| "no buffer")?;
@@ -2032,23 +2178,30 @@ fn check_stages(
     check_space_steps(p, frames)?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 6 + 2,
+        process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 6 + 2,
         "the stage Buffers did not give the buffers back in one portion",
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Quota && phys::free_frames() == frames + 6 + 2 + 2,
-        "the stage Frames did not give the frames back",
+        process::progress(p).0 == Stage::Quota
+            && cleanup::len() == 3
+            && phys::free_frames() == frames + 6 + 2,
+        "the stage Mappings did not let the two objects go in one portion",
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Notify && cleanup::len() == 1,
+        process::progress(p).0 == Stage::Notify && cleanup::len() == 3,
         "the stage Quota took more than a portion",
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Shell && cleanup::len() == 0,
+        process::progress(p).0 == Stage::Shell && cleanup::len() == 2,
         "the stage Notify took more than a portion, or the shell was queued",
+    )?;
+    cleanup::drain();
+    check(
+        phys::free_frames() == frames + 6 + 2 + 2,
+        "the objects of the mappings did not give their frames back",
     )
 }
 
@@ -2478,27 +2631,34 @@ fn check_space_steps(p: NonNull<process::Process>, frames: u64) -> Result<(), &'
     Err("the stage Space did not end")
 }
 
-/// Three pages take a zeroed block of four frames and three tables over
-/// it, and the process pays for all seven (spec 7.5).
+/// Three pages of a memory object mapped into the process translate to
+/// the object's zeroed frames, and every frame the object and the mapping
+/// took, three pages, the node of their list, three tables and the pages
+/// of the pools, is charged to the process (spec 7.5).
 fn check_fresh_frames(
     p: NonNull<process::Process>,
-    pa: u64,
+    m: NonNull<crate::memory::Memory>,
     (frames, used): (u64, u64),
 ) -> Result<(), &'static str> {
+    let taken = frames - phys::free_frames();
     check(
-        phys::free_frames() == frames - 7,
-        "three pages did not take a block of four frames and three tables",
+        taken >= 3 + 1 + 3 && process::quota(p).used() == used + taken * PAGE_SIZE,
+        "the object, its mapping and their tables were not charged to the process",
     )?;
-    check(
-        process::quota(p).used() == used + 7 * PAGE_SIZE,
-        "the block of map_frames and its tables were not charged to the process",
-    )?;
-    // SAFETY: the block belongs to the test's process, which nothing runs.
+    // SAFETY: the frames belong to the test's object, which nothing runs.
     let mem = unsafe { LinearMem::new() };
-    check(
-        (0..4 * PAGE_SIZE / 8).all(|i| mem.read(pa + i * 8) == 0),
-        "the frames of a process are not zeroed",
-    )
+    for i in 0..3 {
+        let pa = memory::frame(m, i);
+        check(
+            process::translate(p, USER_VA + i * PAGE).map(|(f, _)| f) == Some(pa),
+            "a page does not show its frame of the object",
+        )?;
+        check(
+            (0..PAGE_SIZE / 8).all(|w| mem.read(pa + w * 8) == 0),
+            "the frames of a memory object are not zeroed",
+        )?;
+    }
+    Ok(())
 }
 
 /// A new thread starts with the registers it was given and nothing else;

@@ -2,45 +2,50 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel tests of the system calls (spec 11, 12) for what a program does
-//! not see or cannot reach: a caller whose ceiling is below 63, a caller
-//! whose table is full or whose quota is spent, who pays for what, and the
-//! kernel's own state after a call. The contract of the calls, the order
-//! of their checks, their rights and that on an error only x0 changes, is
-//! the test init's (tests/init), which makes the calls from EL0 on the
-//! kernel that ships. The kernel makes each call here for a thread that
-//! never runs, as if the thread had made it, and checks every register the
-//! call may write.
+//! not see or cannot reach: a caller whose table is full or whose quota is
+//! spent, who pays for what, and the kernel's own state after a call. The
+//! contract of the calls, the order of their checks, their rights and that
+//! on an error only x0 changes, is the test init's (tests/init), which
+//! makes the calls from EL0 on the kernel that ships. The kernel makes each
+//! call here for a thread that never runs, as if the thread had made it,
+//! and checks every register the call may write.
 //!
 //! Names tell the two sides apart: `<call>_checks_its_arguments` is the
 //! test init's, one contract test per call (spec 11, 12); the kernel keeps
 //! `<call>_checks_the_callers_limits` for what a caller at EL0 cannot
-//! reach: a ceiling below 63, while children have no code yet (spec 15.2);
-//! a full table; a spent quota; who pays; and counts of live objects.
+//! reach: a full table; a spent quota; who pays; and counts of live
+//! objects. A caller whose own ceiling is below 63 is a child with code of
+//! the test init (spec 15.2).
 
-use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
-use crate::arch::timer;
+use super::{
+    CAUSE, CHILD_QUOTA, PAGE, QUOTA, check, nothing_pending, read_user, registers, translates,
+    wait_for_timer,
+};
+use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel::{self, Channel};
 use crate::cleanup;
+use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
-use crate::process::{self, Process};
+use crate::process::{self, Process, Stage};
 use crate::session::{self, Session};
-use crate::thread::{self, THREADS, Thread};
+use crate::thread::{self, Long, THREADS, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
-    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
-    INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS, NO_WAIT, Notification,
-    OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL,
-    Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS,
+    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS,
+    MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy, ProcessHandles,
+    ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
-use kcore::layout::LINEAR_BASE;
+use kcore::layout::{GIB, LINEAR_BASE};
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
+use kcore::sync::Lock;
 use kcore::token::MAX_COUNT;
 
 const LIMIT: u32 = 16;
@@ -108,6 +113,21 @@ impl Caller {
         after
     }
 
+    /// The next entry of a call that started over at its `svc`
+    /// (syscall::restart): ELR goes past the `svc` again, as the entry from
+    /// EL0 sets it, and the call runs on the registers it left; returns
+    /// x0-x9 afterwards.
+    fn again(&self, number: u16) -> [u64; 10] {
+        let mut t = self.thread;
+        // SAFETY: the thread is the test's and never runs.
+        unsafe { t.as_mut() }.regs.elr += 4;
+        syscall::dispatch(t, number);
+        let mut after = [0; 10];
+        // SAFETY: as above.
+        after.copy_from_slice(&unsafe { t.as_ref() }.regs.x[..10]);
+        after
+    }
+
     /// The call fails with `error` and changes x0 alone.
     fn fails(&self, number: u16, args: &[u64], error: Error) -> Result<(), &'static str> {
         let mut want = with_marks(args);
@@ -155,7 +175,9 @@ fn with_marks(args: &[u64]) -> [u64; 10] {
 }
 
 /// Runs `body` with a fresh caller and releases the caller afterwards.
-fn with_caller(body: impl FnOnce(&Caller) -> Result<(), &'static str>) -> Result<(), &'static str> {
+fn with_caller<T>(
+    body: impl FnOnce(&Caller) -> Result<T, &'static str>,
+) -> Result<T, &'static str> {
     let caller = Caller::new()?;
     let result = body(&caller);
     caller.release();
@@ -294,17 +316,15 @@ fn close_cases(
     c.fails(n, &[resource.0], Error::BadHandle)
 }
 
-/// thread_set_priority stops at the ceiling of the caller's process as well
-/// as at that of the thread's (spec 8, 11): a caller under ceiling 30 gives
-/// a thread of a process under 63 no more than 30, ACCESS_DENIED at 31. A
-/// stopped thread only takes the new values. The caller's process has
-/// ceiling 30; the target threads' processes 20 and 63. The rest of the
-/// call's checks are the test init's
+/// thread_set_priority on a stopped thread only takes the new values
+/// (spec 8, 11): its base and effective priority and its policy change,
+/// and it stays stopped. The thread's process has ceiling 20. The checks
+/// of the call are the test init's
 /// (thread_set_priority_checks_its_arguments).
-pub fn thread_set_priority_checks_the_callers_ceiling(_: &Boot) -> Result<(), &'static str> {
-    let callers = [30, 20, 63].map(Caller::with_ceiling);
+pub fn stopped_thread_takes_its_new_priority(_: &Boot) -> Result<(), &'static str> {
+    let callers = [63, 20].map(Caller::with_ceiling);
     let result = match &callers {
-        [Ok(c), Ok(low), Ok(high)] => set_priority_handles(c, low, high),
+        [Ok(c), Ok(low)] => set_priority_handles(c, low),
         _ => Err("no process or thread"),
     };
     for caller in callers.into_iter().flatten() {
@@ -313,26 +333,15 @@ pub fn thread_set_priority_checks_the_callers_ceiling(_: &Boot) -> Result<(), &'
     result
 }
 
-fn set_priority_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), &'static str> {
-    let handles = [
-        c.insert(Object::Thread(low.thread), Rights::MANAGE)?,
-        c.insert(Object::Thread(high.thread), Rights::MANAGE)?,
-    ];
-    set_priority_cases(c, low.thread, handles)
+fn set_priority_handles(c: &Caller, low: &Caller) -> Result<(), &'static str> {
+    let h = c.insert(Object::Thread(low.thread), Rights::MANAGE)?;
+    set_priority_cases(c, low.thread, h)
 }
 
-fn set_priority_cases(
-    c: &Caller,
-    low: NonNull<Thread>,
-    handles: [Handle; 2],
-) -> Result<(), &'static str> {
-    let [to_low, to_high] = handles.map(|h| h.0);
+fn set_priority_cases(c: &Caller, low: NonNull<Thread>, h: Handle) -> Result<(), &'static str> {
     let n = Call::ThreadSetPriority.number();
     let rr = Policy::RoundRobin as u64;
-    // Under the ceiling of the target's process, 63, above the caller's.
-    c.fails(n, &[to_high, 31, rr], Error::AccessDenied)?;
-    c.succeeds(n, &[to_high, 30, rr], &[])?;
-    c.succeeds(n, &[to_low, 20, rr], &[])?;
+    c.succeeds(n, &[h.0, 20, rr], &[])?;
     // SAFETY: the thread is the test's and never runs.
     let t = unsafe { low.as_ref() };
     check(
@@ -344,18 +353,17 @@ fn set_priority_cases(
     )
 }
 
-/// process_create stops at the caller's limits (spec 7.5, 11): a ceiling
-/// above the caller's, 30 here, fails with ACCESS_DENIED after the handles
-/// and before the quota; with the caller's table full the call fails with
-/// LIMIT_REACHED, and the new process goes again. A good call returns a
-/// handle with the owner's rights to a live process with the ceiling given,
-/// a child of the caller's process (spec 4). Channels in x3 and x5 have
-/// cases of their own (`exit_and_start_cases`). The rest of the call's
-/// checks are the test init's (process_create_checks_its_arguments and its
-/// neighbours).
+/// process_create stops at the caller's limits (spec 7.5, 11): with the
+/// caller's table full the call fails with LIMIT_REACHED, and the new
+/// process goes again. A good call returns a handle with the owner's
+/// rights to a live process with the ceiling given, a child of the
+/// caller's process (spec 4). Channels in x3 and x5 have cases of their
+/// own (`exit_and_start_cases`). The rest of the call's checks, the
+/// caller's own ceiling among them, are the test init's
+/// (process_create_checks_its_arguments and its neighbours).
 pub fn process_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
-    let c = Caller::with_ceiling(30)?;
+    let c = Caller::new()?;
     let result = process_create_cases(&c).and_then(|()| exit_and_start_cases(&c));
     c.release();
     result?;
@@ -367,14 +375,9 @@ pub fn process_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static
 
 fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
-    let page = PAGE_SIZE;
-    let closed = c.insert(Object::Resource, Rights::DEBUG)?;
-    c.close(closed)?;
-    let closed = closed.0;
-    // Handles come before the ceiling.
-    c.fails(n, &[page, 16, 31, closed, 5, 0], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 31, 0, 0, closed], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 31, 0, 0, 0], Error::AccessDenied)?;
+    // The caller's table has its page of blocks from here on.
+    let first = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(first)?;
     quota_cases(c, n)?;
     let child = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
@@ -395,7 +398,7 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
 }
 
 /// The child's quota comes off the caller's (spec 7.5): more than is left
-/// there is NO_MEMORY, after the ceiling. The least quota covers the
+/// there is NO_MEMORY. The least quota covers the
 /// child's root table and the page of its pool of blocks, which holds its
 /// directory and the chunk with entry 0: 8 KiB. A page is NO_MEMORY at
 /// entry 0, and the caller gets the quota back whole; the page of its pool
@@ -406,7 +409,6 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     let page = PAGE_SIZE;
     let q = process::quota(c.process);
     let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(page);
-    c.fails(n, &[over, 16, 31, 0, 0, 0], Error::AccessDenied)?;
     c.fails(n, &[over, 16, 30, 0, 0, 0], Error::NoMemory)?;
     let before = q.used();
     c.fails(n, &[page, 16, 30, 0, 0, 0], Error::NoMemory)?;
@@ -426,34 +428,16 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     )
 }
 
-/// Channels in x3 and x5 of process_create, where a caller below the
-/// highest ceiling matters; the test init checks the rest from EL0
-/// (spec 11, 13.3). x4 above the caller's ceiling fails with ACCESS_DENIED
-/// after the handles, and x3 on a channel that closed with PEER_CLOSED
-/// only after the ceilings; the caller's full table comes before the
-/// channel's slots and the quota (LIMIT_REACHED). A good call moves x5
-/// into entry 0 of the child's table with its rights, and the caller's
-/// handle goes.
+/// Channels in x3 and x5 of process_create, for what a program cannot see
+/// (spec 11, 13.3): the caller's full table comes before the channel's
+/// slots and the quota (LIMIT_REACHED), and a good call moves x5 into
+/// entry 0 of the child's table with its rights, and the caller's handle
+/// goes. The test init checks the rest from EL0.
 fn exit_and_start_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
     let q = CHILD_QUOTA;
-    let closed = c.insert(Object::Resource, Rights::NONE)?;
-    c.close(closed)?;
     let h = c.created(Call::CreateChannel.number(), &[10])?;
-    let shut = c.created(Call::CreateChannel.number(), &[10])?;
-    let result = channel_of(c, shut)
-        .and_then(|s| c.insert(Object::Channel(s), Rights::NOTIFY))
-        .and_then(|left| {
-            c.close(shut)?;
-            let (h, left) = (h.0, left.0);
-            c.fails(n, &[q, 16, 20, closed.0, 31, h], Error::BadHandle)?;
-            c.fails(n, &[q, 16, 20, h, 31, closed.0], Error::BadHandle)?;
-            c.fails(n, &[q, 16, 20, h, 31, 0], Error::AccessDenied)?;
-            c.fails(n, &[q, 16, 20, left, 31, 0], Error::AccessDenied)?;
-            c.fails(n, &[q, 16, 20, left, 30, 0], Error::PeerClosed)?;
-            c.close(Handle(left))?;
-            with_full_table(c, n, &[q, 16, 20, h, 5, 0])
-        })
+    let result = with_full_table(c, n, &[q, 16, 20, h.0, 5, 0])
         .and_then(|()| channel_of(c, h))
         .and_then(|ch| moved_start(c, h, ch));
     c.close(h)?;
@@ -673,19 +657,18 @@ fn with_full_table(c: &Caller, n: u16, args: &[u64]) -> Result<(), &'static str>
     result
 }
 
-/// thread_create stops at the caller's limits (spec 8, 11): a priority
-/// above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED for a process under 63; with the caller's table full the
-/// call fails with LIMIT_REACHED, and the new thread and its page go
-/// again. A good call makes a stopped thread whose buffer is a zeroed
-/// page, readable and writable, never executable, and returns a handle
-/// with the owner's rights; the page goes with the thread. The target
-/// processes have ceilings 20 and 63. The rest of the call's checks are
-/// the test init's (thread_create_checks_its_arguments).
+/// thread_create stops at the caller's limits (spec 8, 11): with the
+/// caller's table full the call fails with LIMIT_REACHED, and the new
+/// thread and its page go again. A good call makes a stopped thread whose
+/// buffer is a zeroed page, readable and writable, never executable, and
+/// returns a handle with the owner's rights; the page goes with the
+/// thread. The target process has ceiling 20. The rest of the call's
+/// checks, the caller's own ceiling among them, are the test init's
+/// (thread_create_checks_its_arguments).
 pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
-    let callers = [30, 20, 63].map(Caller::with_ceiling);
+    let callers = [63, 20].map(Caller::with_ceiling);
     let result = match &callers {
-        [Ok(c), Ok(low), Ok(high)] => thread_create_handles(c, low, high),
+        [Ok(c), Ok(low)] => thread_create_handles(c, low),
         _ => Err("no process or thread"),
     };
     for caller in callers.into_iter().flatten() {
@@ -694,12 +677,9 @@ pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static 
     result
 }
 
-fn thread_create_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), &'static str> {
-    let handles = [
-        c.insert(Object::Process(low.process), Rights::MANAGE)?,
-        c.insert(Object::Process(high.process), Rights::MANAGE)?,
-    ];
-    thread_create_cases(c, low.process, handles)
+fn thread_create_handles(c: &Caller, low: &Caller) -> Result<(), &'static str> {
+    let h = c.insert(Object::Process(low.process), Rights::MANAGE)?;
+    thread_create_cases(c, low.process, h)
 }
 
 /// thread_create's arguments: the process, entry, stack, argument 7,
@@ -718,13 +698,11 @@ fn thread_args(
 fn thread_create_cases(
     c: &Caller,
     low: NonNull<Process>,
-    handles: [Handle; 2],
+    to_low: Handle,
 ) -> Result<(), &'static str> {
-    let [to_low, to_high] = handles.map(|h| h.0);
+    let to_low = to_low.0;
     let n = Call::ThreadCreate.number();
     let good = |h, priority| thread_args(h, USER_VA as u64, 0x80_1000, priority, FIFO, BUFFER);
-    // Above the caller's ceiling, 30, under the target's.
-    c.fails(n, &good(to_high, 31), Error::AccessDenied)?;
     let h = c.created(n, &good(to_low, 20))?;
     let result = new_thread_cases(c, low, h);
     c.close(h)?;
@@ -807,8 +785,8 @@ pub fn buffer_that_does_not_map_goes_back(_: &Boot) -> Result<(), &'static str> 
 /// cleanup at the caller's level, which runs before the caller does again:
 /// here the test runs the queue itself. Until then thread_create finds the
 /// process ended (BAD_STATE) and makes nothing. A running thread's case is
-/// `process_kills_itself` at EL0; the reason and the handles of the calls
-/// are the test init's.
+/// the test init's `process_kills_itself`, and so are the reason and the
+/// handles of the calls.
 pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(kill_cases)?;
@@ -988,24 +966,34 @@ fn with_quota_left(
     left: u64,
     body: impl FnOnce() -> Result<(), &'static str>,
 ) -> Result<(), &'static str> {
-    let q = process::quota(c.process);
+    with_left(c.process, left, body)
+}
+
+/// Runs `body` with all but `left` bytes of the quota of `p` charged, and
+/// refunds the charge afterwards.
+fn with_left(
+    p: NonNull<Process>,
+    left: u64,
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let q = process::quota(p);
     let rest = q.limit() - q.returned() - q.used() - left;
-    process::charge(c.process, rest).map_err(|_| "the rest of the quota did not charge")?;
+    process::charge(p, rest).map_err(|_| "the rest of the quota did not charge")?;
     let result = body();
-    process::refund(c.process, rest);
+    process::refund(p, rest);
     result
 }
 
-/// channel_create stops at the caller's limits (spec 7.8, 11): a priority
-/// above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED; with the caller's table full it fails with
-/// LIMIT_REACHED, and with its quota spent with NO_MEMORY for a page of
-/// its pool of channels, with nothing made. A good call returns a handle
-/// with abi::CHANNEL_RIGHTS to a channel the caller pays for. The rest of
-/// the checks of channel_create, notify and receive are the test init's.
+/// channel_create stops at the caller's limits (spec 7.8, 11): with the
+/// caller's table full it fails with LIMIT_REACHED, and with its quota
+/// spent with NO_MEMORY for a page of its pool of channels, with nothing
+/// made. A good call returns a handle with abi::CHANNEL_RIGHTS to a
+/// channel the caller pays for. The rest of the checks of channel_create,
+/// notify and receive, the caller's own ceiling among them, are the test
+/// init's.
 pub fn channel_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let channels = channel::in_use();
-    let c = Caller::with_ceiling(30)?;
+    let c = Caller::new()?;
     let result = channel_create_cases(&c);
     c.release();
     result?;
@@ -1017,7 +1005,6 @@ pub fn channel_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static
 
 fn channel_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::CreateChannel.number();
-    c.fails(n, &[31], Error::AccessDenied)?;
     // The table's first page of blocks, so that the page below is the
     // pool's.
     let resource = c.insert(Object::Resource, Rights::NONE)?;
@@ -1129,22 +1116,20 @@ fn session_of(c: &Caller, h: Handle) -> Result<NonNull<Session>, &'static str> {
         .map_err(|_| "the handle does not name a session")
 }
 
-/// handle_duplicate stops at the caller's limits (spec 5.3, 11): a
-/// priority above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED after the handle and before the state (a new label on a
-/// handle with one, BAD_STATE); then the resources in the order the call
-/// takes them: the caller's table (LIMIT_REACHED), the channel's slots
+/// handle_duplicate stops at the caller's limits (spec 5.3, 11), the
+/// resources in the order the call takes them: the caller's table
+/// (LIMIT_REACHED), the channel's slots
 /// (LIMIT_REACHED, abi::MAX_SLOTS with the slot of label 0), the caller's
 /// quota for a page of its pool of sessions (NO_MEMORY); nothing is made
 /// then. A good call returns the copy in x1 alone: with label 0 it names
 /// the same object, a session's copy the same session; a label makes a
 /// session of the channel at the priority, which the caller pays for. A
 /// copy with a label and RECEIVE keeps the channel open. The rest of the
-/// call's checks are the test init's (handle_duplicate_checks_its_arguments
-/// and its neighbours).
+/// call's checks, the caller's own ceiling among them, are the test
+/// init's (handle_duplicate_checks_its_arguments and its neighbours).
 pub fn handle_duplicate_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let (sessions, channels) = (session::in_use(), channel::in_use());
-    let callers = [30, 63].map(Caller::with_ceiling);
+    let callers = [63, 63].map(Caller::with_ceiling);
     let result = match &callers {
         [Ok(c), Ok(other)] => duplicate_cases(c, other),
         _ => Err("no process or thread"),
@@ -1163,8 +1148,7 @@ fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
     let h = c.created(Call::CreateChannel.number(), &[10])?;
     let result = (|| {
         let resource = c.insert(Object::Resource, Rights::DEBUG | Rights::DUPLICATE)?;
-        let result = duplicate_ceiling(c, h)
-            .and_then(|()| duplicate_resources(c, h))
+        let result = duplicate_resources(c, h)
             .and_then(|()| duplicate_results(c, [h, resource]))
             .and_then(|()| slots_come_before_the_quota(c, other));
         c.close(resource)?;
@@ -1173,17 +1157,6 @@ fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
     // Closed already when the cases went through.
     let _ = process::close_handle(c.process, h, super::CAUSE);
     result
-}
-
-/// A label at a priority above the caller's ceiling: a closed handle
-/// comes first (BAD_HANDLE), then the ceiling (ACCESS_DENIED).
-fn duplicate_ceiling(c: &Caller, h: Handle) -> Result<(), &'static str> {
-    let n = Call::HandleDuplicate.number();
-    let closed = c.insert(Object::Resource, Rights::NONE)?;
-    c.close(closed)?;
-    let notify = u64::from(Rights::NOTIFY.0);
-    c.fails(n, &[closed.0, notify, 7, 31], Error::BadHandle)?;
-    c.fails(n, &[h.0, notify, 7, 31], Error::AccessDenied)
 }
 
 /// The resources of a label, none of which makes a session: the caller's
@@ -1206,8 +1179,8 @@ fn duplicate_resources(c: &Caller, h: Handle) -> Result<(), &'static str> {
 }
 
 /// Good calls: copies with label 0 of the resource and of a session, a
-/// session of the channel, a new label on a session (BAD_STATE, after the
-/// ceiling), and a copy with a label and RECEIVE that keeps the channel
+/// session of the channel, a new label on a session (BAD_STATE), and a
+/// copy with a label and RECEIVE that keeps the channel
 /// open once its handle with no label went; its close closes the channel,
 /// and a new label on it fails with PEER_CLOSED.
 fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
@@ -1232,7 +1205,6 @@ fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static st
         && session::priority(s) == 30
         && Some(session::channel(s)) == channel_of(c, h).ok()
         && session::payer(s) == c.process;
-    c.fails(n, &[first.0, notify, 8, 31], Error::AccessDenied)?;
     c.fails(n, &[first.0, notify, 8, 30], Error::BadState)?;
     let left = c.created(n, &[h.0, duplicate, 0, 0])?;
     let receiver = c.created(n, &[h.0, receive, 9, 10])?;
@@ -1617,19 +1589,18 @@ fn with_timer(
     result
 }
 
-/// timer_create stops at the caller's limits (spec 7.8, 10, 11): a
-/// priority above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED; with the caller's table full it fails with
-/// LIMIT_REACHED, and with its quota spent with NO_MEMORY for a page of its
-/// pool of timers, with nothing made. A good call returns a handle with
+/// timer_create stops at the caller's limits (spec 7.8, 10, 11): with the
+/// caller's table full it fails with LIMIT_REACHED, and with its quota
+/// spent with NO_MEMORY for a page of its pool of timers, with nothing
+/// made. A good call returns a handle with
 /// abi::OWNER_RIGHTS to a timer the caller pays for, not armed; timer_set
 /// arms it at its deadline in ticks and timer_cancel takes it off the
 /// heap, and timer_set on a closed channel fails with PEER_CLOSED and
-/// leaves the timer armed as it was. The checks of the calls are the test
-/// init's.
+/// leaves the timer armed as it was. The checks of the calls, the
+/// caller's own ceiling among them, are the test init's.
 pub fn timer_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let timers = timers::in_use();
-    let c = Caller::with_ceiling(30)?;
+    let c = Caller::new()?;
     let result = timer_create_cases(&c);
     c.release();
     result?;
@@ -1643,7 +1614,6 @@ fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::TimerCreate.number();
     let h = c.created(Call::CreateChannel.number(), &[10])?;
     let result = (|| {
-        c.fails(n, &[h.0, 31], Error::AccessDenied)?;
         let timers = timers::in_use();
         with_used_quota(c, || {
             c.fails(n, &[h.0, 30], Error::NoMemory)?;
@@ -1909,4 +1879,1436 @@ fn no_quota_takes_no_number(c: &Caller) -> Result<(), &'static str> {
     }
     cleanup::drain();
     result
+}
+
+/// A memory object of `pages` pages that `c` makes with mem_create, entry
+/// after entry until the call ends (`Caller::again`), and its handle: x0
+/// is 0, x1 the handle, with abi::MEMORY_RIGHTS, and nothing else changes.
+fn make_memory(c: &Caller, pages: u64) -> Result<(Handle, NonNull<Memory>), &'static str> {
+    let n = Call::MemCreate.number();
+    let args = [pages * PAGE_SIZE, 0];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    want[1] = got[1];
+    if got != want || got[1] == 0 {
+        kprintln!("mem_create with {args:x?}: x0-x9 are {got:x?}");
+        return Err("mem_create failed");
+    }
+    let h = Handle(got[1]);
+    // SAFETY: the caller's process is the test's.
+    let m = unsafe { c.process.as_ref() }.lookup(h, MEMORY_RIGHTS, Object::memory);
+    Ok((
+        h,
+        m.map_err(|_| "the handle of mem_create lacks MEMORY_RIGHTS")?,
+    ))
+}
+
+/// The kernel's timer fires at once, and its interrupt stays pending while
+/// `body` runs; then it is taken and the timer is off.
+fn with_interrupt_pending(
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    nothing_pending("an interrupt was pending before the test")?;
+    timer::arm(timer::now());
+    while !arch::irq_pending() {}
+    let result = body();
+    let ack = wait_for_timer();
+    timer::disarm();
+    gic::end(ack?);
+    result
+}
+
+/// mem_create stops at the caller's resources (spec 7.3, 11): with its
+/// quota spent it fails with NO_MEMORY for a page of its pool of memory
+/// objects, and with LIMIT_REACHED first when its table is full; with a
+/// free place in the pool, one page short of the object's budget, 16 pages
+/// and the node of their list, it fails with NO_MEMORY, and with the whole
+/// budget left it makes the object. A call that fails makes nothing,
+/// changes x0 alone and keeps no charge. The rest of the checks are the
+/// test init's (mem_create_checks_its_arguments).
+pub fn mem_create_over_the_quota_is_no_memory(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let args = [16 * PAGE_SIZE, 0];
+        // The table's first chunk, so that no call below takes one.
+        let resource = c.insert(Object::Resource, Rights::NONE)?;
+        let used = process::quota(c.process).used();
+        with_used_quota(c, || {
+            c.fails(n, &args, Error::NoMemory)?;
+            with_full_table(c, n, &args)
+        })?;
+        check(
+            process::quota(c.process).used() == used && memory::in_use() == objects,
+            "a mem_create that failed kept an object or a charge",
+        )?;
+        // A free place in the pool.
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        with_quota_left(c, 16 * PAGE_SIZE, || c.fails(n, &args, Error::NoMemory))?;
+        with_quota_left(c, 17 * PAGE_SIZE, || {
+            let (h, _) = make_memory(c, 16)?;
+            c.close(h)
+        })?;
+        cleanup::drain();
+        c.close(resource)
+    })?;
+    check(
+        memory::in_use() == objects,
+        "an object of the test stayed in its pool",
+    )
+}
+
+/// A memory object pays for itself from its payer's quota at once and
+/// gives it all back with its place (spec 7.3, 7.5): an object of 600
+/// pages, whose list takes a node of two nodes, charges the caller, its
+/// payer, 603 pages and takes as many frames, and its object_info counts
+/// every page; once its handle closes and its portions ran, the caller's
+/// used quota and the free frames are what they were. An object made and
+/// closed first leaves a free place in the caller's pool.
+pub fn object_pays_its_budget_back_to_the_payer(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let (used, free) = (process::quota(c.process).used(), phys::free_frames());
+        let (h, m) = make_memory(c, 600)?;
+        let charged = process::quota(c.process).used() - used;
+        let taken = free - phys::free_frames();
+        let (info, payer) = (memory::info(m), memory::payer(m));
+        c.close(h)?;
+        cleanup::drain();
+        check(
+            charged == 603 * PAGE_SIZE && taken == 603,
+            "the object did not charge its pages and nodes to its payer at once",
+        )?;
+        check(
+            payer == c.process
+                && info
+                    == MemoryInfo {
+                        size: 600 * PAGE_SIZE,
+                        pages: 600,
+                        mappings: 0,
+                    },
+            "the caller does not pay for the object, or it is not whole",
+        )?;
+        check(
+            process::quota(c.process).used() == used && phys::free_frames() == free,
+            "the object did not give its budget back to its payer",
+        )
+    })
+}
+
+/// The frames of a new object read as zero, though the object before it
+/// left a pattern in them (spec 7.6): an object of 64 pages gets the
+/// pattern in every word of its frames through the linear map and goes;
+/// the next object of 64 pages takes some of those frames again, and every
+/// word of each of its frames reads 0.
+pub fn new_object_is_zeroed(_: &Boot) -> Result<(), &'static str> {
+    const PAGES: usize = 64;
+    let word = |pa: u64, i: usize| (LINEAR_BASE + pa as usize + 8 * i) as *mut u64;
+    with_caller(|c| {
+        let (h, m) = make_memory(c, PAGES as u64)?;
+        let used: [u64; PAGES] = core::array::from_fn(|i| memory::frame(m, i));
+        for pa in used {
+            for i in 0..512 {
+                // SAFETY: the frame is the object's, which the test holds,
+                // and the linear map reaches it.
+                unsafe { word(pa, i).write_volatile(0x5A5A_5A5A_5A5A_5A5A) };
+            }
+        }
+        c.close(h)?;
+        cleanup::drain();
+        let (h, m) = make_memory(c, PAGES as u64)?;
+        let again: [u64; PAGES] = core::array::from_fn(|i| memory::frame(m, i));
+        let reused = again.iter().filter(|pa| used.contains(pa)).count();
+        // SAFETY: as above, for the new object.
+        let zero = again
+            .iter()
+            .all(|&pa| (0..512).all(|i| unsafe { word(pa, i).read_volatile() } == 0));
+        c.close(h)?;
+        check(
+            reused > 0,
+            "the new object took none of the frames of the one before",
+        )?;
+        check(zero, "a frame of a new object holds what was there before")
+    })
+}
+
+/// mem_create goes in portions of memory::CREATE_PORTION pages and starts
+/// over at its `svc` when an interrupt is pending after a portion (spec
+/// 7.7): with the kernel's timer pending all along, each entry of a call
+/// for 20 pages takes one portion, leaves x0-x9 as they were and ELR on
+/// the `svc`, and the object the thread's long call holds has 8 and then
+/// 16 pages; the third entry takes the rest, ends the call and returns the
+/// handle of a whole object. The portions count toward the longest portion
+/// (KERNEL_STATS x5).
+pub fn create_resumes_where_it_stopped(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| with_interrupt_pending(|| resumed_cases(c)))
+}
+
+fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::MemCreate.number();
+    let args = [20 * PAGE_SIZE, 0];
+    // SAFETY: the thread is the test's and never runs.
+    let elr = || unsafe { c.thread.as_ref() }.regs.elr;
+    let at_svc = elr() - 4;
+    cleanup::take_longest();
+    let mut got = c.call(n, &args);
+    let mut filled = [0; 2];
+    for f in &mut filled {
+        let Some(Long::Create(m)) = thread::long(c.thread) else {
+            return Err("mem_create did not stop after a portion");
+        };
+        check(
+            got == with_marks(&args) && elr() == at_svc,
+            "a call that starts over changed its registers or left its svc",
+        )?;
+        *f = memory::filled(m);
+        got = c.again(n);
+    }
+    check(
+        filled == [8, 16],
+        "the object did not grow a portion an entry",
+    )?;
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    want[1] = got[1];
+    check(
+        thread::long(c.thread).is_none() && got == want,
+        "the third entry did not end the call with the handle",
+    )?;
+    check(
+        cleanup::longest() > 0,
+        "the portions of mem_create did not count toward the longest portion",
+    )?;
+    let h = Handle(got[1]);
+    // SAFETY: the caller's process is the test's.
+    let m = unsafe { c.process.as_ref() }.lookup(h, MEMORY_RIGHTS, Object::memory);
+    let whole = m.is_ok_and(|m| memory::info(m).pages == 20);
+    c.close(h)?;
+    check(whole, "the handle does not name a whole object of 20 pages")
+}
+
+/// A mem_create whose caller's process ends between two portions (spec
+/// 7.7): the object, which only the thread's long call holds, goes with
+/// the thread's buffer at the stage Buffers, and its frames and its place
+/// come back.
+pub fn killed_creator_lets_the_object_go(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let memory = phys::free_frames() + pages::taken() as u64;
+    let c = Caller::new()?;
+    let mut stopped = false;
+    let pending = with_interrupt_pending(|| {
+        c.call(Call::MemCreate.number(), &[64 * PAGE_SIZE, 0]);
+        stopped = matches!(thread::long(c.thread), Some(Long::Create(m)) if memory::filled(m) == 8);
+        Ok(())
+    });
+    // SAFETY: the test holds a reference to the process.
+    let ended = unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+    cleanup::drain();
+    let went = memory::in_use() == objects;
+    c.release();
+    pending?;
+    check(stopped && ended, "mem_create did not stop after a portion")?;
+    check(went, "the object did not go with the teardown of its maker")?;
+    check(
+        phys::free_frames() + pages::taken() as u64 == memory,
+        "the object's frames or its place did not come back",
+    )
+}
+
+/// The room for the handle of mem_create is made on its first entry, and
+/// other threads of the caller's process may take it between two portions
+/// (spec 7.3): the call then fails with LIMIT_REACHED at its end, x0
+/// alone, and the object, whole by then, is queued at the caller's level
+/// and goes with its frames and its place.
+pub fn full_table_at_the_end_lets_the_object_go(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let memory = phys::free_frames() + pages::taken() as u64;
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let args = [64 * PAGE_SIZE, 0];
+        let mut first = [0; 10];
+        with_interrupt_pending(|| {
+            first = c.call(n, &args);
+            Ok(())
+        })?;
+        let mut filler = [None; LIMIT as usize];
+        for slot in &mut filler {
+            match process::insert_handle(c.process, Object::Resource, Rights::NONE) {
+                Ok(h) => *slot = Some(h),
+                Err(_) => break,
+            }
+        }
+        let last = c.again(n);
+        let queued = cleanup::top();
+        cleanup::drain();
+        for h in filler.into_iter().flatten() {
+            c.close(h)?;
+        }
+        let mut want = with_marks(&args);
+        check(first == want, "mem_create did not stop after a portion")?;
+        want[0] = Error::LimitReached.code();
+        check(
+            last == want && thread::long(c.thread).is_none(),
+            "a full table at the end did not fail mem_create with LIMIT_REACHED alone",
+        )?;
+        check(
+            queued == Some(10),
+            "the object was not queued at the caller's level",
+        )
+    })?;
+    check(
+        memory::in_use() == objects && phys::free_frames() + pages::taken() as u64 == memory,
+        "the object that found no room stayed",
+    )
+}
+
+/// A thread whose next entry makes another call than its long call gives
+/// the long call up (spec 7.7): mem_create stops after a portion, and the
+/// next entry, handle_close on the registers mem_create left, gives the
+/// call up in a stretch of its own, which counts toward the longest
+/// portion (KERNEL_STATS x5); with the kernel's timer pending that entry
+/// starts over at its `svc`, x0-x9 as they were, and the entry after it
+/// runs handle_close, which fails with BAD_HANDLE in x0 alone. The object,
+/// which only the long call held, is queued at the thread's level and
+/// goes with its frames and its budget.
+pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let (used, free) = (process::quota(c.process).used(), phys::free_frames());
+        let args = [64 * PAGE_SIZE, 0];
+        // SAFETY: the thread is the test's and never runs.
+        let elr = || unsafe { c.thread.as_ref() }.regs.elr;
+        let at_svc = elr() - 4;
+        let (mut stopped, mut given_up, mut counted) = (false, false, false);
+        with_interrupt_pending(|| {
+            c.call(Call::MemCreate.number(), &args);
+            stopped = thread::long(c.thread).is_some();
+            cleanup::take_longest();
+            let got = c.again(Call::HandleClose.number());
+            counted = cleanup::longest() > 0;
+            given_up =
+                got == with_marks(&args) && elr() == at_svc && thread::long(c.thread).is_none();
+            Ok(())
+        })?;
+        let got = c.again(Call::HandleClose.number());
+        let queued = cleanup::top();
+        cleanup::drain();
+        let mut want = with_marks(&args);
+        want[0] = Error::BadHandle.code();
+        check(stopped, "mem_create did not stop after a portion")?;
+        check(
+            given_up,
+            "the entry that gave the call up did not start over at its svc as it was",
+        )?;
+        check(
+            counted,
+            "giving the call up did not count toward the longest portion",
+        )?;
+        check(
+            got == want && thread::long(c.thread).is_none(),
+            "another call did not run as itself or kept the long call",
+        )?;
+        check(
+            queued == Some(10),
+            "the object did not go at the thread's level",
+        )?;
+        check(
+            process::quota(c.process).used() == used && phys::free_frames() == free,
+            "the object of the call given up kept its frames or its budget",
+        )
+    })?;
+    check(
+        memory::in_use() == objects,
+        "the object of the call given up stayed",
+    )
+}
+
+/// Pages of the objects of the tests of long changes of a mapping: four
+/// portions of process::PORTION.
+const LONG_PAGES: u64 = 128;
+
+/// A process with no thread for `c` to map into, the target of a change,
+/// and `c`'s handle to it with abi::OWNER_RIGHTS; the test keeps its own
+/// reference.
+fn target_of(c: &Caller) -> Result<(NonNull<Process>, Handle), &'static str> {
+    let t = process::create_root(QUOTA, LIMIT, CEILING).map_err(|_| "no process")?;
+    match c.insert(Object::Process(t), OWNER_RIGHTS) {
+        Ok(h) => Ok((t, h)),
+        Err(e) => {
+            // SAFETY: the process is the test's, and nothing uses it afterwards.
+            unsafe { process::release(t, CAUSE) };
+            Err(e)
+        }
+    }
+}
+
+/// Lets the test's reference to a target go; its teardown runs.
+fn release_target(t: NonNull<Process>) {
+    // SAFETY: the reference is the test's, and nothing uses it afterwards.
+    unsafe { process::release(t, CAUSE) };
+    cleanup::drain();
+}
+
+/// mem_map by `c` of `pages` pages of object `m` from page 0 at `va` of
+/// the process behind `target`, with `access`: 0 in x0 alone, however
+/// many entries it takes.
+fn map_whole(
+    c: &Caller,
+    target: Handle,
+    m: Handle,
+    pages: u64,
+    va: usize,
+    access: Access,
+) -> Result<(), &'static str> {
+    let n = Call::MemMap.number();
+    let args = [target.0, m.0, 0, pages * PAGE_SIZE, va as u64, access.raw()];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    if got == want {
+        return Ok(());
+    }
+    kprintln!("mem_map with {args:x?}: x0-x9 are {got:x?}");
+    Err("mem_map failed")
+}
+
+/// mem_unmap by `c` of the mapping of `pages` pages at `va` of the process
+/// behind `target`: 0 in x0 alone, however many entries it takes.
+fn unmap_whole(c: &Caller, target: Handle, pages: u64, va: usize) -> Result<(), &'static str> {
+    let n = Call::MemUnmap.number();
+    let args = [target.0, va as u64, pages * PAGE_SIZE];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    check(got == want, "mem_unmap failed")
+}
+
+/// Whether page `va` of `p` translates.
+fn mapped(p: NonNull<Process>, va: usize) -> bool {
+    process::translate(p, va).is_some()
+}
+
+/// A mapping's tables are the target's to pay for, whoever maps (spec
+/// 7.5): a caller maps 4 pages of its object into a new process, and every
+/// frame the call took, the tables and the page of the pool that holds the
+/// table of mappings, is charged to that process; the caller's quota does
+/// not move.
+pub fn mapping_tables_are_paid_by_the_target(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 4)?;
+        let (t, th) = target_of(c)?;
+        let (own, used, free) = (
+            process::quota(c.process).used(),
+            process::quota(t).used(),
+            phys::free_frames(),
+        );
+        let result = map_whole(c, th, h, 4, USER_VA, Access::ReadWrite);
+        let taken = free - phys::free_frames();
+        let charged = process::quota(t).used() - used;
+        let paid = process::quota(c.process).used() - own;
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result?;
+        check(
+            taken >= 4 && charged == taken * PAGE_SIZE,
+            "the tables and the table of mappings were not charged to the target",
+        )?;
+        check(paid == 0, "the caller paid for the target's mapping")
+    })
+}
+
+/// A mapping whose tables do not fit in the target's quota maps nothing
+/// (spec 7.5, 11): with a page less than the most tables a page may take,
+/// 3, left in the quota of the target, mem_map of a page in a region of
+/// 512 GiB with no table yet fails with NO_MEMORY in x0 alone, the page
+/// does not translate, the quota is what it was, and no entry stays; with
+/// the three pages left it maps and takes all three. Then 63 more
+/// mappings of the page in that region, whose tables are there, fill the
+/// table of mappings, and with two pages left a 65th fails with
+/// LIMIT_REACHED in x0 alone: the place in the table comes before the
+/// charge for tables (spec 11). A mapping made and unmapped first leaves
+/// the table of mappings.
+pub fn map_that_does_not_fit_maps_nothing(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, m) = make_memory(c, 1)?;
+        let (t, th) = target_of(c)?;
+        let far = USER_VA + 512 * GIB as usize;
+        let result = map_whole(c, th, h, 1, USER_VA, Access::Read)
+            .and_then(|()| unmap_whole(c, th, 1, USER_VA))
+            .and_then(|()| no_room_cases(c, t, th, h, m, far));
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result
+    })
+}
+
+fn no_room_cases(
+    c: &Caller,
+    t: NonNull<Process>,
+    th: Handle,
+    h: Handle,
+    m: NonNull<Memory>,
+    far: usize,
+) -> Result<(), &'static str> {
+    let n = Call::MemMap.number();
+    let args = [th.0, h.0, 0, PAGE_SIZE, far as u64, Access::Read.raw()];
+    let used = process::quota(t).used();
+    with_left(t, 2 * PAGE_SIZE, || c.fails(n, &args, Error::NoMemory))?;
+    check(
+        !mapped(t, far)
+            && process::quota(t).used() == used
+            && process::mappings(t) == 0
+            && memory::info(m).mappings == 0,
+        "a mapping that did not fit left a page, a charge or an entry",
+    )?;
+    with_left(t, 3 * PAGE_SIZE, || c.succeeds(n, &args, &[]))?;
+    check(mapped(t, far), "a mapping whose tables fit did not map")?;
+    let at = |i: usize| far + i * PAGE;
+    let full = (1..abi::MAX_MAPPINGS as usize)
+        .try_for_each(|i| map_whole(c, th, h, 1, at(i), Access::Read));
+    let beyond = [
+        th.0,
+        h.0,
+        0,
+        PAGE_SIZE,
+        at(abi::MAX_MAPPINGS as usize) as u64,
+        Access::Read.raw(),
+    ];
+    let limit = full.and_then(|()| {
+        with_left(t, 2 * PAGE_SIZE, || {
+            c.fails(n, &beyond, Error::LimitReached)
+        })
+    });
+    for i in 0..abi::MAX_MAPPINGS as usize {
+        if process::mapping(t, at(i), 1).is_some() {
+            unmap_whole(c, th, 1, at(i))?;
+        }
+    }
+    limit
+}
+
+/// A mapping gives back what it paid for tables and did not take (spec
+/// 7.5): the first page in a new region takes three tables and the table
+/// of mappings, and the target is charged for exactly what the call took;
+/// the next page of the region, whose bound is three tables too, takes
+/// none and leaves the quota of the target as it was.
+pub fn prepaid_tables_come_back(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 2)?;
+        let (t, th) = target_of(c)?;
+        let (used, free) = (process::quota(t).used(), phys::free_frames());
+        let first = map_whole(c, th, h, 1, USER_VA, Access::Read);
+        let (taken, charged) = (free - phys::free_frames(), process::quota(t).used() - used);
+        let (used, free) = (process::quota(t).used(), phys::free_frames());
+        let second = first.and_then(|()| map_whole(c, th, h, 1, USER_VA + PAGE, Access::Read));
+        let again = (free - phys::free_frames(), process::quota(t).used() - used);
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        second?;
+        check(
+            taken >= 4 && charged == taken * PAGE_SIZE,
+            "the target was not charged for exactly what its first mapping took",
+        )?;
+        check(
+            again == (0, 0),
+            "a mapping that took no table kept a charge for tables",
+        )
+    })
+}
+
+/// A mem_map whose caller's process ends between two portions keeps the
+/// pages it mapped (spec 7.7): with an interrupt pending all along, two
+/// entries map two portions of an object of LONG_PAGES pages into a
+/// target whose tables exist, each counting toward the longest portion
+/// (KERNEL_STATS x5); once the caller's process went, the target has a
+/// mapping of those pages alone, idle, which holds the object, the rest
+/// does not translate, and what the call paid for tables came back.
+pub fn abandoned_map_keeps_its_prefix(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let c = Caller::new()?;
+    let result = abandoned_map(&c);
+    c.release();
+    result?;
+    check(
+        memory::in_use() == objects,
+        "the object stayed after its mapping went",
+    )
+}
+
+fn abandoned_map(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let done = 2 * u64::from(process::PORTION);
+    let n = Call::MemMap.number();
+    let args = [
+        th.0,
+        h.0,
+        0,
+        LONG_PAGES * PAGE_SIZE,
+        USER_VA as u64,
+        Access::ReadWrite.raw(),
+    ];
+    let result = map_whole(c, th, h, 1, USER_VA, Access::Read)
+        .and_then(|()| unmap_whole(c, th, 1, USER_VA))
+        .and_then(|()| {
+            let used = process::quota(t).used();
+            let mut counted = 0;
+            with_interrupt_pending(|| {
+                cleanup::take_longest();
+                c.call(n, &args);
+                c.again(n);
+                counted = cleanup::longest();
+                Ok(())
+            })?;
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+            cleanup::drain();
+            check(
+                counted > 0,
+                "the portions of mem_map did not count toward the longest portion",
+            )?;
+            let kept = process::mapping(t, USER_VA, done);
+            check(
+                kept.is_some_and(|k| !k.is_busy() && k.object == m && k.offset == 0),
+                "the mapping did not keep its mapped pages alone, idle",
+            )?;
+            check(
+                mapped(t, USER_VA + (done as usize - 1) * PAGE)
+                    && !mapped(t, USER_VA + done as usize * PAGE)
+                    && memory::info(m).mappings == 1,
+                "the pages of the mapping do not translate as it says",
+            )?;
+            check(
+                process::quota(t).used() == used,
+                "what the call paid for tables did not come back",
+            )
+        });
+    release_target(t);
+    result
+}
+
+/// A mem_unmap whose caller's process ends between two portions keeps the
+/// pages it did not unmap (spec 7.7): with an interrupt pending all along,
+/// two entries unmap two portions of a mapping of LONG_PAGES pages; once
+/// the caller's process went, the mapping starts past them with the rest
+/// of the pages and their offset in the object, idle, and only those
+/// translate.
+pub fn abandoned_unmap_keeps_the_rest(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let result = abandoned_unmap(&c);
+    c.release();
+    result
+}
+
+fn abandoned_unmap(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let done = 2 * u64::from(process::PORTION);
+    let rest = USER_VA + done as usize * PAGE;
+    let n = Call::MemUnmap.number();
+    let args = [th.0, USER_VA as u64, LONG_PAGES * PAGE_SIZE];
+    let result = map_whole(c, th, h, LONG_PAGES, USER_VA, Access::ReadWrite).and_then(|()| {
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            c.again(n);
+            Ok(())
+        })?;
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
+        let kept = process::mapping(t, rest, LONG_PAGES - done);
+        check(
+            kept.is_some_and(|k| !k.is_busy() && k.object == m && u64::from(k.offset) == done),
+            "the mapping did not keep the pages the call did not unmap, idle",
+        )?;
+        check(
+            !mapped(t, USER_VA) && !mapped(t, rest - PAGE) && mapped(t, rest),
+            "the pages of the mapping do not translate as it says",
+        )
+    });
+    release_target(t);
+    result
+}
+
+/// A mem_protect whose caller's process ends between two portions leaves
+/// its mapping idle (spec 7.7): with an interrupt pending all along, two
+/// entries give two portions of a mapping of LONG_PAGES pages, RW, access
+/// R; once the caller's process went, the mapping is whole and idle, and
+/// the pages of those portions show R and the rest RW.
+pub fn abandoned_protect_goes_idle(_: &Boot) -> Result<(), &'static str> {
+    let c = Caller::new()?;
+    let result = abandoned_protect(&c);
+    c.release();
+    result
+}
+
+fn abandoned_protect(c: &Caller) -> Result<(), &'static str> {
+    let (h, m) = make_memory(c, LONG_PAGES)?;
+    let (t, th) = target_of(c)?;
+    let done = 2 * u64::from(process::PORTION);
+    let n = Call::MemProtect.number();
+    let args = [
+        th.0,
+        USER_VA as u64,
+        LONG_PAGES * PAGE_SIZE,
+        Access::Read.raw(),
+    ];
+    let result = map_whole(c, th, h, LONG_PAGES, USER_VA, Access::ReadWrite).and_then(|()| {
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            c.again(n);
+            Ok(())
+        })?;
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+        cleanup::drain();
+        let kept = process::mapping(t, USER_VA, LONG_PAGES);
+        check(
+            kept.is_some_and(|k| !k.is_busy() && k.object == m),
+            "the mapping of an abandoned mem_protect did not go idle",
+        )?;
+        let shows = |page: u64, attrs: Attrs| {
+            process::translate(t, USER_VA + page as usize * PAGE)
+                .is_some_and(|(pa, d)| d == page_descriptor(pa, attrs))
+        };
+        check(
+            shows(0, Attrs::USER_RODATA)
+                && shows(done - 1, Attrs::USER_RODATA)
+                && shows(done, Attrs::USER_DATA)
+                && shows(LONG_PAGES - 1, Attrs::USER_DATA),
+            "the pages of an abandoned mem_protect do not show the access its portions gave",
+        )
+    });
+    release_target(t);
+    result
+}
+
+/// A target that ends between two portions of a mem_map ends the call
+/// (spec 7.7): its teardown takes the busy entry with the rest, and the
+/// next entry of the call fails with BAD_STATE in x0 alone, with no long
+/// call left. The mapping starts a portion below a bound of 2 MiB, so that
+/// the first portion takes three tables and leaves a page of what the
+/// call paid for tables: what the call paid and did not take goes back to
+/// the target, whose shell goes with its quota whole, and the object and
+/// the target leave their pools.
+pub fn dying_target_ends_the_map(_: &Boot) -> Result<(), &'static str> {
+    let (objects, processes) = (memory::in_use(), process::in_use());
+    with_caller(|c| {
+        let (h, m) = make_memory(c, LONG_PAGES)?;
+        let (t, th) = target_of(c)?;
+        let n = Call::MemMap.number();
+        let args = [
+            th.0,
+            h.0,
+            0,
+            LONG_PAGES * PAGE_SIZE,
+            (USER_VA + (2 << 20) - process::PORTION as usize * PAGE) as u64,
+            Access::ReadWrite.raw(),
+        ];
+        let mut last = [0; 10];
+        with_interrupt_pending(|| {
+            c.call(n, &args);
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(t, ProcessState::Killed, CAUSE) };
+            cleanup::drain();
+            last = c.again(n);
+            Ok(())
+        })?;
+        let mappings = memory::info(m).mappings;
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        let mut want = with_marks(&args);
+        want[0] = Error::BadState.code();
+        check(
+            last == want && thread::long(c.thread).is_none(),
+            "the call did not end with BAD_STATE alone",
+        )?;
+        check(mappings == 0, "the teardown of the target kept the entry")
+    })?;
+    check(
+        memory::in_use() == objects && process::in_use() == processes,
+        "the object or the target stayed",
+    )
+}
+
+/// What `exec_mapping_syncs_the_instruction_cache` watches through the
+/// test points code_synced and code_mapped (arch::cache,
+/// process::maps): the frames made coherent so far, the frames whose
+/// executable pages were mapped after that and before, and the calls that
+/// made frames coherent, one a portion.
+struct CodeWatch {
+    on: bool,
+    synced: [u64; 16],
+    count: usize,
+    mapped: usize,
+    early: usize,
+    calls: usize,
+}
+
+static CODE: Lock<CodeWatch> = Lock::new(CodeWatch {
+    on: false,
+    synced: [0; 16],
+    count: 0,
+    mapped: 0,
+    early: 0,
+    calls: 0,
+});
+
+/// The instruction cache was made coherent for `frames`
+/// (testpoint::code_synced).
+pub fn code_synced(frames: &[u64]) {
+    let mut w = CODE.lock();
+    if w.on {
+        w.calls += 1;
+        for &f in frames {
+            if w.count < w.synced.len() {
+                let i = w.count;
+                w.synced[i] = f;
+                w.count += 1;
+            }
+        }
+    }
+}
+
+/// Descriptors that let a program execute `frames` were written
+/// (testpoint::code_mapped): each frame counts as mapped after its
+/// coherence or before it.
+pub fn code_mapped(frames: &[u64]) {
+    let mut w = CODE.lock();
+    if w.on {
+        for f in frames {
+            if w.synced[..w.count].contains(f) {
+                w.mapped += 1;
+            } else {
+                w.early += 1;
+            }
+        }
+    }
+}
+
+/// Code runs from a page only after the instruction cache is coherent for
+/// its frame (spec 7.4, [G18]): mem_map RX of an object of 12 pages, a
+/// portion of process::EXEC_PORTION and one of 4, and mem_protect to RX of
+/// a mapping of another object of 3 pages, one portion, make each frame
+/// coherent before the descriptor of its page is written, once a portion.
+/// QEMU has no caches, so only the test points show the order.
+pub fn exec_mapping_syncs_the_instruction_cache(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (code, _) = make_memory(c, 12)?;
+        let (data, _) = make_memory(c, 3)?;
+        let protect = Call::MemProtect.number();
+        let data_va = USER_VA + 16 * PAGE;
+        *CODE.lock() = CodeWatch {
+            on: true,
+            synced: [0; 16],
+            count: 0,
+            mapped: 0,
+            early: 0,
+            calls: 0,
+        };
+        let result = map_whole(c, own, code, 12, USER_VA, Access::ReadExec)
+            .and_then(|()| map_whole(c, own, data, 3, data_va, Access::ReadWrite))
+            .and_then(|()| {
+                let args = [own.0, data_va as u64, 3 * PAGE_SIZE, Access::ReadExec.raw()];
+                c.succeeds(protect, &args, &[])
+            });
+        let watch = {
+            let mut w = CODE.lock();
+            w.on = false;
+            (w.count, w.mapped, w.early, w.calls)
+        };
+        for h in [own, code, data] {
+            c.close(h)?;
+        }
+        result?;
+        check(
+            watch == (15, 15, 0, 3),
+            "a page became executable before its frame was coherent, or not a portion at a time",
+        )
+    })
+}
+
+/// The mappings of a process go after its ASID (spec 7.7): a process with
+/// one mapping ends, and its portions run one at a time; its entry leaves
+/// the table only once its space went with the ASID at the stage Space,
+/// and at the stage Mappings.
+pub fn mappings_go_after_the_asid(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, m) = make_memory(c, 1)?;
+        let (t, th) = target_of(c)?;
+        let result = map_whole(c, th, h, 1, USER_VA, Access::Read).and_then(|()| {
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(t, ProcessState::Killed, CAUSE) };
+            let mut order = Ok(());
+            for _ in 0..64 {
+                let stage = process::progress(t).0;
+                cleanup::portion();
+                if process::mappings(t) == 0 {
+                    order = check(
+                        stage == Stage::Mappings && !mapped(t, USER_VA),
+                        "the mappings went before the space and its ASID",
+                    );
+                    break;
+                }
+            }
+            order.and(check(
+                memory::info(m).mappings == 0,
+                "the teardown kept the mapping",
+            ))
+        });
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        result
+    })
+}
+
+/// An unmapped page no longer translates (spec 7.4): a page of an object
+/// mapped RW into the caller's process, whose space runs in TTBR0, reads
+/// its pattern, which puts it in the TLB; mem_unmap takes it, neither EL0
+/// nor the kernel translates it, and the tables hold nothing there. A page
+/// of another object mapped at the same address shows through at once: a
+/// TLB entry the unmap left would still show the first one, since QEMU
+/// keeps its translations until a TLBI.
+pub fn unmapped_page_no_longer_translates(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
+        let (first, a) = make_memory(c, 1)?;
+        let (second, b) = make_memory(c, 1)?;
+        for (m, pattern) in [(a, 0xC3), (b, 0xE5)] {
+            let pa = memory::frame(m, 0);
+            for i in 0..PAGE_SIZE / 8 {
+                // SAFETY: the frame is the object's, which the test holds,
+                // and the linear map reaches it.
+                unsafe { ((LINEAR_BASE + (pa + i * 8) as usize) as *mut u64).write(pattern) };
+            }
+        }
+        let result = map_whole(c, own, first, 1, USER_VA, Access::ReadWrite)
+            .and_then(|()| check_unmap(c, own, second));
+        for h in [own, first, second] {
+            c.close(h)?;
+        }
+        result
+    })
+}
+
+fn check_unmap(c: &Caller, own: Handle, second: Handle) -> Result<(), &'static str> {
+    // SAFETY: the process is the test's, and nothing runs it.
+    unsafe { (*c.process.as_ptr()).activate() };
+    // The read brings the page into the TLB, which the unmap must drop.
+    check(read_user(USER_VA) == 0xC3, "the page misses its contents")?;
+    unmap_whole(c, own, 1, USER_VA)?;
+    check(
+        !translates(registers::at_s1e0r(USER_VA)) && !translates(registers::at_s1e1r(USER_VA)),
+        "an unmapped page still translates",
+    )?;
+    check(
+        !mapped(c.process, USER_VA),
+        "the tables still hold an unmapped page",
+    )?;
+    // Another frame at the same address shows through at once.
+    map_whole(c, own, second, 1, USER_VA, Access::ReadWrite)?;
+    let seen = read_user(USER_VA);
+    unmap_whole(c, own, 1, USER_VA)?;
+    check(seen == 0xE5, "the TLB still holds the unmapped page")
+}
+
+/// The object over the boot image owns none of its frames (spec 13.1): an
+/// object over the image that a caller pays for reports the image's size,
+/// no page it owns and no mapping; once its handle closes and its portion
+/// ran, the free frames, the caller's used memory and the objects in pools
+/// are what they were, and the image still holds its bytes. An object made
+/// and closed first leaves a free place in the caller's pool.
+pub fn boot_image_frames_never_go(boot: &Boot) -> Result<(), &'static str> {
+    let image = boot.info.initrd.ok_or("no boot image")?;
+    let pages = (image.size / PAGE_SIZE) as usize;
+    let words = |base: u64| {
+        let mut sum = 0u64;
+        for i in 0..image.size as usize / 8 {
+            // SAFETY: the boot image lies in RAM the linear map covers, and
+            // nothing writes to it.
+            let w =
+                unsafe { ((LINEAR_BASE + base as usize + 8 * i) as *const u64).read_volatile() };
+            sum = sum.rotate_left(5) ^ w;
+        }
+        sum
+    };
+    let before = words(image.base);
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let objects = memory::in_use();
+        let (free, used) = (phys::free_frames(), process::quota(c.process).used());
+        let m = memory::create_boot(c.process, image.base, pages)
+            .map_err(|_| "no object over the boot image")?;
+        let h = c.insert(Object::Memory(m), abi::INIT_BOOT_IMAGE_RIGHTS);
+        let info = memory::info(m);
+        // SAFETY: the reference `create_boot` handed out goes; the handle,
+        // if it went in, holds the object.
+        unsafe { memory::release(m, CAUSE) };
+        c.close(h?)?;
+        cleanup::drain();
+        check(
+            info == MemoryInfo {
+                size: image.size,
+                pages: 0,
+                mappings: 0,
+            },
+            "the object over the boot image does not report the image",
+        )?;
+        check(
+            phys::free_frames() == free
+                && process::quota(c.process).used() == used
+                && memory::in_use() == objects,
+            "the object over the boot image gave frames back or kept its place",
+        )?;
+        check(words(image.base) == before, "the boot image lost its bytes")
+    })
+}
+
+/// Init's loader maps each part with its access (spec 13.3): the program
+/// of the boot image, loaded into a new process, shows its code RX, its
+/// read-only data R and its data RW, each page on a frame of a memory
+/// object of its own, and a stack RW right under abi::INIT_STACK_TOP with
+/// an unmapped guard page below; each part takes one mapping.
+pub fn init_load_maps_each_part_with_its_access(boot: &Boot) -> Result<(), &'static str> {
+    let program = crate::boot::init_program(boot);
+    let p = process::create_root(QUOTA, LIMIT, CEILING).map_err(|_| "no process")?;
+    let result = match crate::init::load(p, &program) {
+        Ok(()) => loaded_parts(p, &program),
+        Err(f) => {
+            kprintln!(
+                "{} of {:#x} bytes: {:?}, object made: {}",
+                f.what,
+                f.size,
+                f.error,
+                f.made
+            );
+            Err("init's program did not load")
+        }
+    };
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    result
+}
+
+fn loaded_parts(p: NonNull<Process>, program: &bootimg::Program<'_>) -> Result<(), &'static str> {
+    let shows = |va: u64, attrs: Attrs| {
+        process::translate(p, va as usize).is_some_and(|(pa, d)| d == page_descriptor(pa, attrs))
+    };
+    let mut parts = 1;
+    for (part, attrs) in [
+        (bootimg::Part::Code, Attrs::USER_TEXT),
+        (bootimg::Part::Rodata, Attrs::USER_RODATA),
+        (bootimg::Part::Data, Attrs::USER_DATA),
+    ] {
+        let segment = &program.segments[part as usize];
+        if segment.mem_size == 0 {
+            continue;
+        }
+        parts += 1;
+        check(
+            segment.pages().step_by(PAGE).all(|va| shows(va, attrs)),
+            "a segment of init does not show with the access of its part",
+        )?;
+    }
+    let top = abi::INIT_STACK_TOP;
+    let bottom = top - u64::from(program.stack_size);
+    check(
+        (bottom..top)
+            .step_by(PAGE)
+            .all(|va| shows(va, Attrs::USER_DATA)),
+        "init's stack is not RW",
+    )?;
+    check(
+        process::translate(p, (bottom - PAGE_SIZE) as usize).is_none(),
+        "init's stack has no guard page",
+    )?;
+    check(
+        process::mappings(p) == parts,
+        "a part of init did not take one mapping",
+    )
+}
+
+// The longest portions of the long calls of memory objects (spec 7.7,
+// 15.3), in their worst cases, under -icount.
+
+/// Pages of the objects whose first entry of mem_create takes the node of
+/// nodes of their list besides a leaf (kcore::pagelist): more than a leaf
+/// holds.
+#[cfg(feature = "icount")]
+const DEEP_PAGES: u64 = 520;
+
+/// The span of a table of level 1: a range across a bound of it with no
+/// table on either side takes a table of each level on both (spec 7.5,
+/// kcore::paging::tables_bound).
+#[cfg(feature = "icount")]
+const REGION: usize = 512 * GIB as usize;
+
+/// A block of kcore::frames::MAX_ORDER frames: a frame alone in a free one
+/// merges MAX_ORDER times as it goes back.
+#[cfg(feature = "icount")]
+const BLOCK: u64 = PAGE_SIZE << kcore::frames::MAX_ORDER;
+
+/// The blocks `Apart` sets apart: one for each frame of the memory object
+/// whose last portion `release_ticks` measures, its pages and the node of
+/// their list.
+#[cfg(feature = "icount")]
+const APART: usize = kcore::pagelist::RELEASE_STEP;
+
+/// The frame allocator taken apart for the costliest frees (spec 7.7):
+/// every free block goes to the test, in a chain through the first words
+/// of the blocks, but APART blocks of MAX_ORDER, which the allocator gets
+/// back frame by frame; the first frame of each is then the allocator's
+/// only free frame, so that the next APART frames taken are alone in
+/// their blocks once `spread` gives the rest back.
+#[cfg(feature = "icount")]
+struct Apart {
+    chain: u64,
+    blocks: [u64; APART],
+}
+
+#[cfg(feature = "icount")]
+impl Apart {
+    fn take() -> Result<Apart, &'static str> {
+        let mut apart = Apart {
+            chain: 0,
+            blocks: [0; APART],
+        };
+        let mut kept = 0;
+        for order in (0..=kcore::frames::MAX_ORDER).rev() {
+            while let Some(pa) = frames_alloc(order) {
+                if order == kcore::frames::MAX_ORDER && kept < APART {
+                    apart.blocks[kept] = pa;
+                    kept += 1;
+                } else {
+                    apart.link(pa, order);
+                }
+            }
+        }
+        for &b in &apart.blocks[..kept] {
+            frames_free(b, kcore::frames::MAX_ORDER);
+        }
+        if kept < APART {
+            apart.rejoin();
+            return Err("too few free blocks of the highest order");
+        }
+        for b in &mut apart.blocks {
+            let first = frames_alloc(0).ok_or("a frame of a block went missing")?;
+            *b = first;
+            let whole = first.is_multiple_of(BLOCK)
+                && (1..BLOCK / PAGE_SIZE).all(|k| frames_alloc(0) == Some(first + k * PAGE_SIZE));
+            if !whole {
+                return Err("a block did not give its frames in order");
+            }
+        }
+        for &b in &apart.blocks {
+            frames_free(b, 0);
+        }
+        Ok(apart)
+    }
+
+    /// Puts block `pa` of `order` at the head of the chain.
+    fn link(&mut self, pa: u64, order: u8) {
+        let word = (LINEAR_BASE + pa as usize) as *mut u64;
+        // SAFETY: the block is the test's, taken from the allocator, and
+        // the linear map reaches it.
+        unsafe {
+            word.write_volatile(self.chain);
+            word.add(1).write_volatile(order.into());
+        }
+        self.chain = pa;
+    }
+
+    /// Gives the frames of the blocks but their first back.
+    fn spread(&self) {
+        for &b in &self.blocks {
+            for k in 1..BLOCK / PAGE_SIZE {
+                frames_free(b + k * PAGE_SIZE, 0);
+            }
+        }
+    }
+
+    /// Gives every block of the chain back.
+    fn rejoin(self) {
+        let mut next = self.chain;
+        while next != 0 {
+            let word = (LINEAR_BASE + next as usize) as *const u64;
+            // SAFETY: as in `link`.
+            let (after, order) = unsafe { (word.read_volatile(), word.add(1).read_volatile()) };
+            frames_free(next, order as u8);
+            next = after;
+        }
+    }
+}
+
+/// A block of `order` from the frame allocator, if there is one (spec
+/// 7.1).
+#[cfg(feature = "icount")]
+fn frames_alloc(order: u8) -> Option<u64> {
+    phys::FRAMES.lock().as_mut().expect("frames").alloc(order)
+}
+
+/// Gives block `pa` of `order` back to the frame allocator (spec 7.1).
+#[cfg(feature = "icount")]
+fn frames_free(pa: u64, order: u8) {
+    phys::FRAMES
+        .lock()
+        .as_mut()
+        .expect("frames")
+        .free(pa, order)
+}
+
+/// The portions of the long calls of memory objects in their worst cases,
+/// in counter ticks, which count instructions under -icount (spec 7.7,
+/// 15.3). With an interrupt pending all along each entry of a call takes
+/// one portion, and an entry counts from the kernel's dispatch of the call
+/// to its end:
+/// - create: the entries of mem_create of DEEP_PAGES pages in a new
+///   process, the first with a chunk of its table, a page of its pool of
+///   memory objects and the node of nodes;
+/// - map, map_exec: the entries of mem_map but the first, RW and RX, whose
+///   portion crosses a bound of REGION and takes three tables;
+/// - protect, protect_exec, unmap: the entries of mem_protect to R and to
+///   RX and of mem_unmap of a mapping of 64 pages, among 64 mappings of a
+///   process with 64 threads and an ASID, which takes a TLBI a page;
+/// - release: the portion of cleanup of a memory object that gives back its
+///   last pages, the node of their list and the object's place and budget,
+///   whose frames are each alone in their free block of MAX_ORDER frames,
+///   and merge up to it as they go back (`Apart`);
+/// - first_map: the first entry of mem_map RX of 8 pages across a bound of
+///   REGION with no table on either side, six tables: the 64th mapping of
+///   that process, and the first one of a new process, with the block of
+///   its table.
+///
+/// The test prints them in one line, `memory portions ticks: create=...
+/// map=... map_exec=... unmap=... protect=... protect_exec=... release=...
+/// first_map=...`, which xtask shows; no number fails it (spec 15.3).
+#[cfg(feature = "icount")]
+pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let memory = phys::free_frames() + pages::taken() as u64;
+    let create = [0, CHUNK].into_iter().try_fold(0, |most, fill| {
+        create_ticks(fill).map(|ticks| most.max(ticks))
+    })?;
+    let mut changes = [0; 6];
+    with_caller(|c| changes_ticks(c, &mut changes))?;
+    let fresh = with_caller(|c| {
+        let (h, _) = make_memory(c, u64::from(process::EXEC_PORTION))?;
+        let (t, th) = target_of(c)?;
+        let ticks = first_exec_ticks(c, th, h);
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        ticks
+    })?;
+    let release = with_caller(release_ticks)?;
+    let [map, map_exec, unmap, protect, protect_exec, crowded] = changes;
+    kprintln!(
+        "memory portions ticks: create={create} map={map} map_exec={map_exec} unmap={unmap} protect={protect} protect_exec={protect_exec} release={release} first_map={}",
+        crowded.max(fresh)
+    );
+    check(
+        memory::in_use() == objects && phys::free_frames() + pages::taken() as u64 == memory,
+        "an object or a frame of the measurements stayed",
+    )
+}
+
+/// The longest entry of mem_create of DEEP_PAGES pages by a new process
+/// whose table holds `fill` handles: its first entry makes a chunk of the
+/// table, whose page the pool of blocks takes, and a page of the pool of
+/// memory objects, before its portion takes the node of nodes, a leaf and
+/// memory::CREATE_PORTION frames.
+#[cfg(feature = "icount")]
+fn create_ticks(fill: usize) -> Result<u64, &'static str> {
+    let process = process::create_root(QUOTA, 2 * CHUNK as u32, CEILING);
+    let process = process.map_err(|_| "no process")?;
+    let c = match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
+        Ok(thread) => Caller { process, thread },
+        Err(_) => {
+            // SAFETY: the process is the test's, and nothing uses it afterwards.
+            unsafe { process::release(process, CAUSE) };
+            return Err("no thread");
+        }
+    };
+    let ticks = (0..fill)
+        .try_for_each(|_| c.insert(Object::Resource, Rights::NONE).map(|_| ()))
+        .and_then(|()| {
+            let n = Call::MemCreate.number();
+            let (first, rest, got) = timed_entries(&c, n, &[DEEP_PAGES * PAGE_SIZE, 0])?;
+            c.close(Handle(got[1]))?;
+            Ok(first.max(rest))
+        });
+    c.release();
+    ticks
+}
+
+/// Makes call `number` with `args`, then its next entries until it ends,
+/// with an interrupt pending all along: the ticks of the first entry and
+/// of the longest of the others, and x0-x9 at the end.
+#[cfg(feature = "icount")]
+fn timed_entries(
+    c: &Caller,
+    number: u16,
+    args: &[u64],
+) -> Result<(u64, u64, [u64; 10]), &'static str> {
+    let (mut first, mut rest, mut got) = (0, 0, [0; 10]);
+    with_interrupt_pending(|| {
+        let start = timer::now();
+        got = c.call(number, args);
+        first = timer::now() - start;
+        while thread::long(c.thread).is_some() {
+            let start = timer::now();
+            got = c.again(number);
+            rest = rest.max(timer::now() - start);
+        }
+        Ok(())
+    })?;
+    check(got[0] == 0, "a measured call failed")?;
+    Ok((first, rest, got))
+}
+
+/// The first entry of mem_map by `c` of object `h`, of process::EXEC_PORTION
+/// pages, RX, across the first bound of REGION of the process behind
+/// `target`, which has no table there; the mapping goes again.
+#[cfg(feature = "icount")]
+fn first_exec_ticks(c: &Caller, target: Handle, h: Handle) -> Result<u64, &'static str> {
+    let pages = u64::from(process::EXEC_PORTION);
+    let va = REGION - (pages / 2) as usize * PAGE;
+    let args = [
+        target.0,
+        h.0,
+        0,
+        pages * PAGE_SIZE,
+        va as u64,
+        Access::ReadExec.raw(),
+    ];
+    let (first, _, _) = timed_entries(c, Call::MemMap.number(), &args)?;
+    unmap_whole(c, target, pages, va)?;
+    Ok(first)
+}
+
+/// Into `ticks`, for a process with abi::MAX_THREADS threads with their
+/// buffers, 63 mappings and an ASID: map, map_exec, unmap, protect,
+/// protect_exec, and the first entry of its 64th mapping (`first_exec_ticks`).
+/// Its threads, its mappings and its own tables lie past 4 REGIONs, so the
+/// regions below them have no table.
+#[cfg(feature = "icount")]
+fn changes_ticks(c: &Caller, ticks: &mut [u64; 6]) -> Result<(), &'static str> {
+    let (h, _) = make_memory(c, 64)?;
+    let (t, th) = target_of(c)?;
+    let mut threads = [None; abi::MAX_THREADS as usize];
+    let crowded = crowd(t, &mut threads).and_then(|()| {
+        // SAFETY: the process is the test's, and nothing runs it.
+        unsafe { (*t.as_ptr()).activate() };
+        ticks[5] = first_exec_ticks(c, th, h)?;
+        let map = |pages: u64, va: usize, access: Access| {
+            let args = [th.0, h.0, 0, pages * PAGE_SIZE, va as u64, access.raw()];
+            timed_entries(c, Call::MemMap.number(), &args).map(|(_, rest, _)| rest)
+        };
+        let change = |n: Call, va: usize, access: u64| {
+            let args = [th.0, va as u64, 64 * PAGE_SIZE, access];
+            timed_entries(c, n.number(), &args).map(|(first, rest, _)| first.max(rest))
+        };
+        // Its second portion of 8 pages crosses the bound of 2 REGIONs.
+        let exec = 2 * REGION - 12 * PAGE;
+        ticks[1] = map(24, exec, Access::ReadExec)?;
+        unmap_whole(c, th, 24, exec)?;
+        // Its second portion of 32 pages crosses the bound of 3 REGIONs.
+        let va = 3 * REGION - 48 * PAGE;
+        ticks[0] = map(64, va, Access::ReadWrite)?;
+        ticks[3] = change(Call::MemProtect, va, Access::Read.raw())?;
+        ticks[4] = change(Call::MemProtect, va, Access::ReadExec.raw())?;
+        ticks[2] = change(Call::MemUnmap, va, 0)?;
+        Ok(())
+    });
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's reference goes; the thread never ran.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    c.close(th)?;
+    c.close(h)?;
+    release_target(t);
+    crowded
+}
+
+/// abi::MAX_THREADS threads of `t` with their buffers, which `threads`
+/// holds, and 63 mappings of a page of an object `t` pays for, all past 4
+/// REGIONs.
+#[cfg(feature = "icount")]
+fn crowd(
+    t: NonNull<Process>,
+    threads: &mut [Option<NonNull<Thread>>; abi::MAX_THREADS as usize],
+) -> Result<(), &'static str> {
+    let far = 4 * REGION;
+    for (i, slot) in threads.iter_mut().enumerate() {
+        let made = thread::create(t, USER_VA, USER_VA, 0, 10, Policy::Fifo);
+        *slot = Some(made.map_err(|_| "no thread")?);
+        let buffer = thread::give_buffer(slot.expect("the thread"), far + i * PAGE);
+        buffer.map_err(|_| "no buffer")?;
+    }
+    let single = memory::create_whole(t, 1).map_err(|_| "no memory object");
+    single.and_then(|one| {
+        let mapped = (0..abi::MAX_MAPPINGS as usize - 1).try_for_each(|i| {
+            let va = far + (1 << 20) + i * PAGE;
+            process::map_whole(t, one, va, Access::Read).map_err(|_| "a page did not map")
+        });
+        // SAFETY: the reference `create_whole` handed out goes; the
+        // mappings hold the object.
+        unsafe { memory::release(one, CAUSE) };
+        mapped
+    })
+}
+
+/// The portion of cleanup of a memory object of RELEASE_STEP - 1 pages,
+/// which gives back the last pages, the node of their list and the
+/// object's place and budget, whose frames each merge up to MAX_ORDER as
+/// they go back (`Apart`), in ticks. An object made and closed first
+/// leaves a free place in the pool of `c`, which then takes no frame for
+/// it.
+#[cfg(feature = "icount")]
+fn release_ticks(c: &Caller) -> Result<u64, &'static str> {
+    let (h, _) = make_memory(c, 1)?;
+    c.close(h)?;
+    cleanup::drain();
+    let apart = Apart::take()?;
+    let pages = kcore::pagelist::RELEASE_STEP - 1;
+    let made = make_memory(c, pages as u64);
+    apart.spread();
+    let ticks = made.and_then(|(h, m)| {
+        let alone = (0..pages).all(|i| memory::frame(m, i).is_multiple_of(BLOCK));
+        c.close(h)?;
+        let start = timer::now();
+        cleanup::portion();
+        let ticks = timer::now() - start;
+        cleanup::drain();
+        check(alone, "a frame of the object is not alone in its block")?;
+        Ok(ticks)
+    });
+    apart.rejoin();
+    ticks
 }

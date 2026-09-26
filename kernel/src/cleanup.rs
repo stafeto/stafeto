@@ -52,7 +52,8 @@ struct Queue {
     items: ReadyQueue<Item>,
     /// Items queued now.
     len: u64,
-    /// The longest portion so far, in counter ticks.
+    /// The longest portion so far, of cleanup or of a long call
+    /// (`count_portion`), in counter ticks.
     longest: u64,
     /// A portion began while an interrupt was pending.
     #[cfg(feature = "ktest")]
@@ -194,6 +195,7 @@ pub fn portion() {
             Object::Channel(c) => channel::clean(c, level),
             Object::Session(s) => session::clean(s, level),
             Object::Timer(t) => crate::timer::clean(t, level),
+            Object::Memory(m) => crate::memory::clean(m, level),
             Object::Resource => unreachable!("the system resource is never queued"),
         }
     }
@@ -208,9 +210,26 @@ pub fn len() -> u64 {
     QUEUE.lock().len
 }
 
-/// The longest portion so far in counter ticks, for KSTATS.
+/// A portion of a long call (spec 7.7) that began at `start`, in counter
+/// ticks, counts toward the longest portion as one of cleanup does: both
+/// add to the blocking of any thread (KSTATS x5).
+pub fn count_portion(start: u64) {
+    let took = timer::now().saturating_sub(start);
+    let mut q = QUEUE.lock();
+    q.longest = q.longest.max(took);
+}
+
+/// The longest portion so far, of cleanup or of a long call, in counter
+/// ticks, for KSTATS.
 pub fn longest() -> u64 {
     QUEUE.lock().longest
+}
+
+/// The longest portion so far, which goes back to 0: a test that checks
+/// what a call counts takes it first (KSTATS x5).
+#[cfg(feature = "ktest")]
+pub fn take_longest() -> u64 {
+    core::mem::take(&mut QUEUE.lock().longest)
 }
 
 /// Runs portions until the queue is empty: tests that count the objects

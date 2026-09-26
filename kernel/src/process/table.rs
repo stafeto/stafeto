@@ -154,20 +154,21 @@ pub fn put_handles(
 
 /// Puts init's first handles in the fresh table of `init` (spec 13.3): the
 /// system resource with every right, init's process and its `first`
-/// thread, and an entry for the boot image that goes at once, so that
-/// INIT_BOOT_IMAGE stays bad (until milestone 1.3 brings the boot image as
-/// a memory object). The values follow from the order in a fresh table and
-/// are those abi fixes. Test builds have no init.
+/// thread, and the memory object over the boot image, `boot`, with
+/// abi::INIT_BOOT_IMAGE_RIGHTS. The values follow from the order in a
+/// fresh table and are those abi fixes. Test builds have no init.
 #[cfg(not(feature = "ktest"))]
-pub fn install_init_handles(init: NonNull<Process>, first: NonNull<Thread>) -> Result<(), Error> {
+pub fn install_init_handles(
+    init: NonNull<Process>,
+    first: NonNull<Thread>,
+    boot: NonNull<Memory>,
+) -> Result<(), Error> {
     let handles = [
         insert_handle(init, Object::Resource, abi::INIT_RESOURCE_RIGHTS)?,
         insert_handle(init, Object::Process(init), abi::OWNER_RIGHTS)?,
         insert_handle(init, Object::Thread(first), abi::OWNER_RIGHTS)?,
-        insert_handle(init, Object::Resource, Rights::NONE)?,
+        insert_handle(init, Object::Memory(boot), abi::INIT_BOOT_IMAGE_RIGHTS)?,
     ];
-    // The system resource is never queued: any level will do.
-    close_handle(init, handles[3], 1)?;
     assert_eq!(
         handles,
         [

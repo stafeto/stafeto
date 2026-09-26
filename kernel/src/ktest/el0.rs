@@ -15,9 +15,10 @@
 
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
-use crate::arch::{self, cache, gic, symbols, timer};
+use crate::arch::{self, gic, symbols, timer};
 use crate::channel::{self, Channel};
 use crate::cleanup;
+use crate::memory;
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
@@ -26,8 +27,8 @@ use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, session};
 use abi::{
-    CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT,
-    Notification, Policy, ProcessState, Rights, START_CHANNEL, Source, msgbuf,
+    Access, CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, MAX_THREADS, MEMORY_RIGHTS, NO_WAIT,
+    Notification, Policy, ProcessState, Rights, Source, msgbuf,
 };
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -36,6 +37,7 @@ use kcore::esr;
 use kcore::gic::PRIORITY_MASK;
 use kcore::handles::{MAX_CHUNKS, MAX_HANDLES};
 use kcore::layout::LINEAR_BASE;
+use kcore::pagelist::RELEASE_STEP;
 use kcore::paging::{Attrs, BLOCK_2M};
 use kcore::sched::State;
 use kcore::sync::Lock;
@@ -56,21 +58,13 @@ unsafe extern "C" {
     static el0_spin_then_yield: u8;
     static el0_set_priority: u8;
     static el0_set_priority_after_peer: u8;
-    static el0_load: u8;
     static el0_done_at_once: u8;
     static el0_pattern_close: u8;
-    static el0_pattern_object_info: u8;
-    static el0_pattern_debug_write: u8;
     static el0_wfi: u8;
     static el0_kill: u8;
     static el0_exit_process: u8;
-    static el0_create_then_exit: u8;
     static el0_info_then_exit: u8;
-    static el0_create_and_start: u8;
-    static el0_buffer_mark: u8;
-    static el0_start_then_close: u8;
     static el0_receive: u8;
-    static el0_notify: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
     static el0_raise_then_notify: u8;
@@ -78,9 +72,6 @@ unsafe extern "C" {
     static el0_alarm_then: u8;
     static el0_send: u8;
     static el0_serve: u8;
-    static el0_serve_after_notice: u8;
-    static el0_reply_then_notify: u8;
-    static el0_raise_then_send: u8;
     static el0_send_then_exit: u8;
     static el0_take_then_exit: u8;
     static el0_take_then_wait: u8;
@@ -99,6 +90,7 @@ unsafe extern "C" {
     static el0_measure: u8;
     static el0_serve_loop: u8;
     static el0_yield_loop: u8;
+    static el0_long_calls: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -123,20 +115,19 @@ const _: () = assert!(
         && Call::Receive.number() == 5
         && Call::Reply.number() == 6
         && Call::Notify.number() == 7
+        && Call::MemCreate.number() == 8
+        && Call::MemMap.number() == 9
+        && Call::MemUnmap.number() == 10
+        && Call::MemProtect.number() == 11
         && Call::ProcessKill.number() == 13
         && Call::ProcessExit.number() == 14
-        && Call::ThreadCreate.number() == 15
-        && Call::ThreadStart.number() == 16
         && Call::ThreadExit.number() == 17
         && Call::ThreadSetPriority.number() == 18
         && Call::Yield.number() == 19
         && Call::ObjectInfo.number() == 27
-        && Call::DebugWrite.number() == 28
 );
-const _: () = assert!(DATA_VA == 0x80_0000 && Policy::Fifo as u8 == 1 && NO_WAIT == 0x10000);
-
-/// The line `debug_write_from_el0` prints; xtask looks for it in the output.
-const EL0_LINE: &[u8] = b"debug_write from EL0 reaches the console\n";
+const _: () = assert!(Policy::Fifo as u8 == 1 && NO_WAIT == 0x10000);
+const _: () = assert!(Access::Read.raw() == 1 && Access::ReadWrite.raw() == 3);
 
 /// Where the test processes see their pages: the programs at TEXT_VA, and
 /// one page of data at DATA_VA with the register pattern at its start and
@@ -174,6 +165,15 @@ const ROUNDS: u64 = 1000;
 /// one interrupt takes (timers::BATCH), and more than one process pays for
 /// (abi::MAX_TIMERS).
 const BATCHED: usize = 100;
+/// Pages of the memory object of `memory_object_goes_in_portions`: 64 MiB.
+const BIG_OBJECT: usize = 16384;
+/// Pages of the memory object of `long_call_yields_to_a_pending_interrupt`,
+/// 16 MiB, where its program maps them, and the period of the test's alarm
+/// meanwhile: shorter than the shortest of the calls, longer than their
+/// longest portion.
+const LONG_PAGES: usize = 4096;
+const LONG_VA: usize = 1 << 30;
+const LONG_PERIOD_NS: u64 = 500_000;
 
 struct El0Test {
     name: &'static str,
@@ -196,16 +196,6 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_nop,
     },
     El0Test {
-        name: "el0_fault_ends_only_the_process",
-        start: start_fault,
-        done: done_fault,
-    },
-    El0Test {
-        name: "wfi_at_el0_is_a_fault",
-        start: start_wfi,
-        done: done_wfi,
-    },
-    El0Test {
         name: "registers_survive_a_timer_interrupt",
         start: start_interrupt,
         done: done_interrupt,
@@ -224,16 +214,6 @@ const EL0_TESTS: &[El0Test] = &[
         name: "a_new_thread_starts_with_clear_fp",
         start: start_clear_fp,
         done: done_clear_fp,
-    },
-    El0Test {
-        name: "debug_write_from_el0",
-        start: start_debug_write,
-        done: done_debug_write,
-    },
-    El0Test {
-        name: "object_info_from_el0",
-        start: start_object_info,
-        done: done_object_info,
     },
     El0Test {
         name: "failed_call_from_el0_changes_x0_only",
@@ -276,49 +256,9 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_head,
     },
     El0Test {
-        name: "last_thread_exit_ends_the_process",
-        start: start_last_exit,
-        done: done_last_exit,
-    },
-    El0Test {
-        name: "process_exit_ends_the_process_with_its_code",
-        start: start_process_exit,
-        done: done_process_exit,
-    },
-    El0Test {
-        name: "process_kills_itself",
-        start: start_self_kill,
-        done: done_self_kill,
-    },
-    El0Test {
-        name: "exited_thread_gives_its_buffer_back",
-        start: start_keep_started,
-        done: done_keep_started,
-    },
-    El0Test {
-        name: "orphan_exit_frees_the_process",
-        start: start_orphan_exit,
-        done: done_orphan,
-    },
-    El0Test {
-        name: "orphan_fault_frees_the_process",
-        start: start_orphan_fault,
-        done: done_orphan,
-    },
-    El0Test {
-        name: "grandchildren_die_with_their_parent",
-        start: start_grandchild,
-        done: done_grandchild,
-    },
-    El0Test {
         name: "descendants_stop_above_the_cause",
         start: start_descendants,
         done: done_descendants,
-    },
-    El0Test {
-        name: "child_notifies_through_its_start_channel",
-        start: start_start_channel,
-        done: done_start_channel,
     },
     El0Test {
         name: "kill_takes_a_waiting_thread_off_the_channel",
@@ -341,26 +281,6 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_close_portions,
     },
     El0Test {
-        name: "request_through_the_start_channel",
-        start: start_start_request,
-        done: done_start_request,
-    },
-    El0Test {
-        name: "reply_from_another_process_is_bad_state",
-        start: start_foreign_reply,
-        done: done_foreign_reply,
-    },
-    El0Test {
-        name: "boost_is_capped_by_the_server_ceiling",
-        start: start_capped_boost,
-        done: done_capped_boost,
-    },
-    El0Test {
-        name: "client_of_a_dead_server_gets_peer_closed",
-        start: start_dead_server,
-        done: done_dead_server,
-    },
-    El0Test {
         name: "replies_stage_goes_in_portions",
         start: start_replies_portions,
         done: done_replies_portions,
@@ -374,11 +294,6 @@ const EL0_TESTS: &[El0Test] = &[
         name: "dead_client_frees_its_memory_before_the_reply",
         start: start_dead_client_memory,
         done: done_dead_client_memory,
-    },
-    El0Test {
-        name: "reply_to_a_dead_client_is_peer_closed",
-        start: start_dead_client,
-        done: done_dead_client,
     },
     El0Test {
         name: "kill_takes_a_sender_off_the_channel",
@@ -419,11 +334,6 @@ const EL0_TESTS: &[El0Test] = &[
         name: "same_priority_keeps_the_close_in_place",
         start: start_close_in_place,
         done: done_close_in_place,
-    },
-    El0Test {
-        name: "a_call_cycle_ends_with_the_kill",
-        start: start_call_cycle,
-        done: done_call_cycle,
     },
     El0Test {
         name: "reply_to_a_dead_client_closes_the_handles",
@@ -496,6 +406,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_cleanup_level,
     },
     El0Test {
+        name: "memory_object_goes_in_portions",
+        start: start_memory_portions,
+        done: done_memory_portions,
+    },
+    El0Test {
         name: "fault_cleanup_runs_at_the_priority_of_the_fault",
         start: start_fault_cleanup,
         done: done_own_cleanup,
@@ -504,6 +419,11 @@ const EL0_TESTS: &[El0Test] = &[
         name: "exit_cleanup_runs_at_the_priority_of_the_exit",
         start: start_exit_cleanup,
         done: done_own_cleanup,
+    },
+    El0Test {
+        name: "own_kill_writes_no_result",
+        start: start_own_kill,
+        done: done_own_kill,
     },
     El0Test {
         name: "init_fault_stops_the_machine",
@@ -543,6 +463,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "ipc_round_trip_is_measured",
         start: start_round_trips,
         done: done_round_trips,
+    },
+    El0Test {
+        name: "long_call_yields_to_a_pending_interrupt",
+        start: start_long_calls,
+        done: done_long_calls,
     },
 ];
 
@@ -599,6 +524,9 @@ struct Fixture {
     /// Free frames and the pages of kernel pools together when the test
     /// began: the same once what the test made gave back what it took.
     memory: u64,
+    /// Memory objects in their pool then: those of the pages of the test's
+    /// own processes.
+    objects: usize,
     /// Items in the cleanup queue when the first timer interrupt came.
     queued_at_wake: Option<u64>,
     /// The counter before the thread started.
@@ -644,6 +572,14 @@ struct Fixture {
     /// The thread that ran last when the first timer interrupt of the test
     /// came.
     interrupted: Option<NonNull<Thread>>,
+    /// How many counter ticks after each of its timer interrupts the test's
+    /// alarm fires again, if it does; then the long calls of the thread in
+    /// slot 0 that such an interrupt found between two of their portions,
+    /// a bit for each call's number, and the most ticks an interrupt came
+    /// past its deadline.
+    rearm: Option<u64>,
+    cut: u32,
+    waited: u64,
 }
 
 /// The scheduler's state that `svc #SVC_SNAP` notes, right after the
@@ -694,6 +630,7 @@ impl Fixture {
             interrupt_after: None,
             interrupt_every: None,
             memory: 0,
+            objects: 0,
             queued_at_wake: None,
             counter: 0,
             faults: false,
@@ -712,6 +649,9 @@ impl Fixture {
             snaps: [None; 2],
             alarm_at_snap: None,
             interrupted: None,
+            rearm: None,
+            cut: 0,
+            waited: 0,
         }
     }
 
@@ -755,8 +695,8 @@ pub fn count() -> usize {
 /// Starts the tests from `first` on: the scheduler starts each test's
 /// threads and runs them. A test that cannot start fails, and the next one
 /// starts. Each test finds the cleanup queue empty. After the last test the
-/// pools hold no process, thread, channel, session or timer: the kernel's
-/// references and the tests' own went.
+/// pools hold no process, thread, channel, session, timer or memory
+/// object: the kernel's references and the tests' own went.
 fn start(first: usize) -> ! {
     for (i, test) in tests().enumerate().skip(first) {
         cleanup::drain();
@@ -788,8 +728,9 @@ fn start(first: usize) -> ! {
                 && thread::in_use() == 0
                 && channel::in_use() == 0
                 && session::in_use() == 0
-                && timers::in_use() == 0,
-            "a process, a thread, a channel, a session or a timer of the EL0 tests stayed in its pool",
+                && timers::in_use() == 0
+                && memory::in_use() == 0,
+            "a process, a thread, a channel, a session, a timer or a memory object of the EL0 tests stayed in its pool",
         ),
     );
     finish()
@@ -956,6 +897,21 @@ pub fn timer_fired() {
         f.fired_at = Some(timer::cval());
         f.queued_at_wake = Some(cleanup::len());
     }
+    let now = timer::now();
+    let again = f.rearm.zip(f.alarm).map(|(period, alarm)| {
+        f.waited = f.waited.max(now.saturating_sub(timer::cval()));
+        let long = f.threads[0]
+            .filter(|&t| thread::current() == Some(t))
+            .and_then(thread::long);
+        if let Some(long) = long {
+            f.cut |= 1 << long.call().number();
+        }
+        (alarm, now + period)
+    });
+    drop(f);
+    if let Some((alarm, at)) = again {
+        timers::set(alarm, at, CAUSE).expect("the alarm's channel is open");
+    }
 }
 
 /// Every entry from EL0 starts at the top of the kernel stack (spec 8.1),
@@ -1099,28 +1055,44 @@ fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'stati
     with_programs(f, slot, p)
 }
 
+/// A page of a new memory object that `p` pays for, mapped at `va` of
+/// `p` with `access` (process::map_whole), after `fill` wrote the frame
+/// through the linear map; returns the frame. The mapping holds the
+/// object, which goes with the process's stage Mappings.
+fn page_of(
+    p: NonNull<Process>,
+    va: usize,
+    access: Access,
+    fill: impl FnOnce(usize),
+) -> Result<u64, &'static str> {
+    let m = memory::create_whole(p, 1).map_err(|_| "no memory object for a page")?;
+    let pa = memory::frame(m, 0);
+    fill(LINEAR_BASE + pa as usize);
+    let mapped = process::map_whole(p, m, va, access);
+    // SAFETY: the reference `create_whole` handed out goes; the mapping,
+    // if it went in, holds the object.
+    unsafe { memory::release(m, CAUSE) };
+    mapped.map_err(|_| "a page of a memory object did not map")?;
+    Ok(pa)
+}
+
 /// Puts `p`, a new process whose first reference the fixture takes, in
-/// slot `slot` and maps the programs at TEXT_VA there.
+/// slot `slot` and maps the programs at TEXT_VA there, RX: the mapping
+/// makes the instruction cache coherent for its page.
 fn with_programs(
     f: &mut Fixture,
     slot: usize,
-    mut p: NonNull<Process>,
+    p: NonNull<Process>,
 ) -> Result<NonNull<Process>, &'static str> {
     f.processes[slot] = Some(p);
-    // SAFETY: the process was just created, and only this test uses it.
-    let text = unsafe { p.as_mut() }
-        .map_frames(TEXT_VA, PAGE_SIZE, Attrs::USER_TEXT)
-        .map_err(|_| "the programs did not map")?;
     let start = &raw const el0_programs as usize;
     let len = &raw const el0_programs_end as usize - start;
     assert!(len <= PAGE, "the EL0 programs outgrew their page");
-    let text_va = LINEAR_BASE + text as usize;
-    // SAFETY: the programs lie in the kernel image, and the frame is new,
-    // one page, and reached through the linear map.
-    unsafe { core::ptr::copy_nonoverlapping(start as *const u8, text_va as *mut u8, len) };
-    // The whole page, its zeroed tail included: the frame may have held
-    // other code, which the instruction cache may still hold.
-    cache::sync_icache(text_va, PAGE);
+    page_of(p, TEXT_VA, Access::ReadExec, |text| {
+        // SAFETY: the programs lie in the kernel image, and the frame is
+        // new, one page, and reached through the linear map.
+        unsafe { core::ptr::copy_nonoverlapping(start as *const u8, text as *mut u8, len) };
+    })?;
     Ok(p)
 }
 
@@ -1132,18 +1104,17 @@ fn with_programs(
 fn new_thread(
     f: &mut Fixture,
     slot: usize,
-    mut p: NonNull<Process>,
+    p: NonNull<Process>,
     data_va: usize,
     entry: *const u8,
     arg: u64,
 ) -> Result<NonNull<Thread>, &'static str> {
-    // SAFETY: the process belongs to this test, and nothing else uses it.
-    let data = unsafe { p.as_mut() }
-        .map_frames(data_va, PAGE_SIZE, Attrs::USER_DATA)
-        .map_err(|_| "the data page did not map")?;
-    // SAFETY: the frame is new, one page, aligned for the pattern, and
-    // reached through the linear map.
-    unsafe { ((LINEAR_BASE + data as usize) as *mut Pattern).write(f.patterns[slot].clone()) };
+    let pattern = f.patterns[slot].clone();
+    page_of(p, data_va, Access::ReadWrite, |data| {
+        // SAFETY: the frame is new, one page, aligned for the pattern, and
+        // reached through the linear map.
+        unsafe { (data as *mut Pattern).write(pattern) };
+    })?;
     let t = thread::create(
         p,
         user_address(entry),
@@ -1289,72 +1260,6 @@ fn done_nop(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check_pattern(&t.regs, &f.patterns[0], &[0])
 }
 
-/// The program loads from FIXTURE itself, a kernel variable: the
-/// permission fault ends its process, with the fault as the reason, and
-/// nothing else. The judge, in a process of its own, runs afterwards.
-fn start_fault(f: &mut Fixture) -> Result<(), &'static str> {
-    f.faults = true;
-    spawn(f, 0, &raw const el0_load, &raw const FIXTURE as u64)?;
-    f.ends[0] = true;
-    judge(f, 1)
-}
-
-fn done_fault(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(
-        f.slot(t) == 1,
-        "a load from kernel memory at EL0 did not fault",
-    )?;
-    let ProcessState::Fault { esr, far, elr } = state(f, 0) else {
-        return Err("the process did not end with the fault");
-    };
-    check(
-        esr::ec(esr) == esr::EC_DABT_LOWER,
-        "the fault is not a data abort from EL0",
-    )?;
-    check(
-        esr::fault_status_name(esr) == "permission fault",
-        "the fault is not a permission fault",
-    )?;
-    check(
-        far == &raw const FIXTURE as u64,
-        "FAR is not the kernel address",
-    )?;
-    check(
-        elr == user_address(&raw const el0_load) as u64,
-        "ELR is not the load",
-    )?;
-    check(
-        slot_thread(f, 0).sched.state() == State::Dead,
-        "the faulting thread did not end",
-    )
-}
-
-/// WFI at EL0 traps (SCTLR_EL1.nTWI is clear) and is the program's fault.
-/// FAR_EL1 still holds the kernel address of the test before; the reason
-/// has FAR 0.
-fn start_wfi(f: &mut Fixture) -> Result<(), &'static str> {
-    f.faults = true;
-    spawn(f, 0, &raw const el0_wfi, 0)?;
-    f.ends[0] = true;
-    judge(f, 1)
-}
-
-fn done_wfi(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(f.slot(t) == 1, "WFI at EL0 did not trap")?;
-    let ProcessState::Fault { esr, far, elr } = state(f, 0) else {
-        return Err("WFI did not end the process with a fault");
-    };
-    check(
-        esr::ec(esr) == esr::EC_WFX,
-        "the fault is not a trapped WFI",
-    )?;
-    check(far == 0, "a stale FAR went into the reason")?;
-    check(
-        elr == user_address(&raw const el0_wfi) as u64,
-        "ELR is not the WFI",
-    )
-}
-
 /// The end of the thread's quantum brings the timer's interrupt while the
 /// program loops at EL0: the thread is round robin, alone at its level.
 fn start_interrupt(f: &mut Fixture) -> Result<(), &'static str> {
@@ -1449,53 +1354,6 @@ fn give(p: NonNull<Process>, object: Object, rights: Rights) -> Result<u64, &'st
         .map_err(|_| "a handle did not go in")
 }
 
-/// The program writes EL0_LINE through a handle to the system resource.
-fn start_debug_write(f: &mut Fixture) -> Result<(), &'static str> {
-    let p = new_process(f, 0)?;
-    let h = give(p, Object::Resource, Rights::DEBUG)?;
-    let mut args = [0; 10];
-    args[0] = h;
-    args[1] = EL0_LINE.len() as u64;
-    args[2..].copy_from_slice(&abi::inline_words(EL0_LINE));
-    call_pattern(f, &args);
-    new_thread(
-        f,
-        0,
-        p,
-        DATA_VA,
-        &raw const el0_pattern_debug_write,
-        DATA_VA as u64,
-    )?;
-    Ok(())
-}
-
-fn done_debug_write(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[0], &[0, EL0_LINE.len() as u64])
-}
-
-/// The program asks for the state of another process, which lives: four
-/// values in x1-x4.
-fn start_object_info(f: &mut Fixture) -> Result<(), &'static str> {
-    let p = new_process(f, 0)?;
-    let other = new_process(f, 1)?;
-    let h = give(p, Object::Process(other), Rights::NONE)?;
-    call_pattern(f, &[h, INFO_PROCESS_STATE, 0]);
-    new_thread(
-        f,
-        0,
-        p,
-        DATA_VA,
-        &raw const el0_pattern_object_info,
-        DATA_VA as u64,
-    )?;
-    Ok(())
-}
-
-fn done_object_info(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let [w1, w2, w3, w4] = ProcessState::Alive.to_words();
-    check_pattern(&t.regs, &f.patterns[0], &[0, w1, w2, w3, w4])
-}
-
 /// The program closes a handle that is closed already: BAD_HANDLE in x0,
 /// every other register as the pattern left it.
 fn start_closed_handle(f: &mut Fixture) -> Result<(), &'static str> {
@@ -1555,11 +1413,8 @@ fn sched_process(f: &mut Fixture) -> Result<(), &'static str> {
 /// `sched_process` with priority ceiling `ceiling`.
 fn sched_process_under(f: &mut Fixture, ceiling: u8) -> Result<(), &'static str> {
     let p = process::create_root(QUOTA, HANDLE_LIMIT, ceiling).map_err(|_| "no process")?;
-    let mut p = with_programs(f, 0, p)?;
-    // SAFETY: the process belongs to this test, and nothing else uses it.
-    f.data = unsafe { p.as_mut() }
-        .map_frames(DATA_VA, PAGE_SIZE, Attrs::USER_DATA)
-        .map_err(|_| "the shared page did not map")?;
+    let p = with_programs(f, 0, p)?;
+    f.data = page_of(p, DATA_VA, Access::ReadWrite, |_| {})?;
     Ok(())
 }
 
@@ -1590,13 +1445,6 @@ fn set_args(mut t: NonNull<Thread>, args: &[u64]) {
 /// closes it.
 fn give_thread(f: &mut Fixture, t: NonNull<Thread>) -> Result<u64, &'static str> {
     give_kept(f, Object::Thread(t))
-}
-
-/// A handle with MANAGE to the test's process in its own table; the
-/// teardown closes it.
-fn give_own(f: &mut Fixture) -> Result<u64, &'static str> {
-    let p = f.processes[0].expect("the test's process");
-    give_kept(f, Object::Process(p))
 }
 
 /// A handle with MANAGE to `object` in the table of the test's process,
@@ -1878,11 +1726,12 @@ fn done_rest(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 
 /// The judge's priority, below every other thread of a test.
 const JUDGE: u8 = PRIORITY - 5;
-/// Where the message buffer of a thread that a test program makes goes.
+/// Where a test gives a thread a message buffer of its own (`buffer_with`).
 const BUFFER_VA: usize = 0x100_0000;
 /// An entry no page of a test's child maps: a thread there faults at once.
 const CHILD_ENTRY: u64 = 0x1000;
-/// The exit code of `process_exit_ends_the_process_with_its_code`.
+/// The code of the exit the first timer interrupt of a test makes
+/// (`Fixture::exit_at_interrupt`).
 const EXIT_CODE: u64 = 0x5EED_C0DE;
 /// The words of its data page, past the pattern, that the grandchild's
 /// thread counts in and waits on (el0_count_until).
@@ -1910,163 +1759,27 @@ fn slot_thread(f: &Fixture, slot: usize) -> &Thread {
     unsafe { t.as_ref() }
 }
 
-/// The ready thread in slot `slot` ended with its process and never ran:
-/// it is still at el0_mark's first instruction.
-fn never_ran(f: &Fixture, slot: usize) -> Result<(), &'static str> {
-    let t = slot_thread(f, slot);
-    check(
-        t.sched.state() == State::Dead && t.regs.elr == user_address(&raw const el0_mark) as u64,
-        "a ready thread of the ended process ran",
-    )
-}
-
-/// Two started threads of one process exit, and the process ends with
-/// code 0 at the second. A third, which the first makes and never starts,
-/// does not keep it alive and goes with it. The second asks for the
-/// process's state before it exits: the process lived.
-fn start_last_exit(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let first = sched_thread(f, 0, &raw const el0_create_then_exit, PRIORITY + 2, FIFO)?;
-    let second = sched_thread(f, 1, &raw const el0_info_then_exit, PRIORITY + 1, FIFO)?;
-    let own = give_own(f)?;
-    let entry = user_address(&raw const el0_done_at_once) as u64;
-    let stack = (DATA_VA + PAGE) as u64;
-    let priority = u64::from(PRIORITY);
-    set_args(
-        first,
-        &[
-            own,
-            entry,
-            stack,
-            0,
-            priority,
-            FIFO as u64,
-            BUFFER_VA as u64,
-        ],
-    );
-    set_args(second, &[own, INFO_PROCESS_STATE, 0]);
-    f.ends = [true, true, false];
-    judge(f, 2)
-}
-
-fn done_last_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(f.slot(t) == 2, "thread_exit returned")?;
-    check(
-        state(f, 0) == ProcessState::Exited { code: 0 },
-        "the last thread's exit did not end the process with code 0",
-    )?;
-    check(slot_thread(f, 0).regs.x[0] == 0, "thread_create failed")?;
-    check(
-        slot_thread(f, 1).regs.x[..5] == [0, 0, 0, 0, 0],
-        "the process ended before its last started thread",
-    )?;
-    check(
-        thread::in_use() == SLOTS,
-        "the stopped thread outlived its process",
-    )
-}
-
-/// A thread ends its process with a code; a ready thread of the process
-/// below it never runs.
-fn start_process_exit(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let exit = sched_thread(f, 0, &raw const el0_exit_process, PRIORITY + 1, FIFO)?;
-    let ready = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
-    set_args(exit, &[EXIT_CODE]);
-    set_args(ready, &[word(0)]);
-    f.ends = [true, true, false];
-    judge(f, 2)
-}
-
-fn done_process_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(f.slot(t) == 2, "a thread of the ended process ran on")?;
-    check(
-        state(f, 0) == ProcessState::Exited { code: EXIT_CODE },
-        "the process did not end with its code",
-    )?;
-    never_ran(f, 1)
-}
-
-/// A thread kills its own process: the call never returns, and its x0
-/// keeps the handle. A ready thread of the process below it never runs.
-fn start_self_kill(f: &mut Fixture) -> Result<(), &'static str> {
+/// A thread that kills its own process leaves through the scheduler (spec
+/// 11): the call never returns and writes no result into the thread's
+/// registers, whose x0 keeps the handle; the judge in slot 1, below it,
+/// runs afterwards. The end as a program sees it is the test init's
+/// `process_kills_itself`.
+fn start_own_kill(f: &mut Fixture) -> Result<(), &'static str> {
     sched_process(f)?;
     let kill = sched_thread(f, 0, &raw const el0_kill, PRIORITY + 1, FIFO)?;
-    let ready = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
-    let own = give_own(f)?;
+    let p = f.processes[0].expect("the test's process");
+    let own = give_kept(f, Object::Process(p))?;
     set_args(kill, &[own]);
-    set_args(ready, &[word(0)]);
-    f.ends = [true, true, false];
-    judge(f, 2)
+    f.ends[0] = true;
+    judge(f, 1)
 }
 
-fn done_self_kill(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(f.slot(t) == 2, "process_kill of its own process returned")?;
-    check(
-        state(f, 0) == ProcessState::Killed,
-        "the process did not end killed",
-    )?;
+fn done_own_kill(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(f.slot(t) == 1, "process_kill of its own process returned")?;
     let own = f.handles[0].map(|(_, h)| h.0);
     check(
         Some(slot_thread(f, 0).regs.x[0]) == own,
         "process_kill of its own process wrote a result",
-    )?;
-    never_ran(f, 1)
-}
-
-/// A program, the maker in slot 0, makes a thread below itself in its own
-/// process, starts it and keeps its handle. The thread runs once the
-/// program is done, finds its message buffer zeroed and writable, and
-/// exits: its buffer's page goes at its exit, and it stays as a shell,
-/// which the handle keeps. The judge in slot 1 closes the handle
-/// afterwards: a process's handle to its own thread keeps both until the
-/// process ends.
-fn start_keep_started(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let maker = sched_thread(f, 0, &raw const el0_create_and_start, PRIORITY, FIFO)?;
-    sched_thread(f, 1, &raw const el0_done_at_once, JUDGE, FIFO)?;
-    let own = give_own(f)?;
-    let entry = user_address(&raw const el0_buffer_mark) as u64;
-    let stack = (DATA_VA + PAGE) as u64;
-    let buffer = BUFFER_VA as u64;
-    let priority = u64::from(PRIORITY - 2);
-    let fifo = FIFO as u64;
-    set_args(maker, &[own, entry, stack, buffer, priority, fifo, buffer]);
-    Ok(())
-}
-
-fn done_keep_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    if f.slot(t) == 0 {
-        return check(t.regs.x[0] == 0, "thread_create or thread_start failed");
-    }
-    let p = f.processes[0].expect("the test's process");
-    let h = Handle(slot_thread(f, 0).regs.x[19]);
-    // SAFETY: the test holds a reference to its process.
-    let made = unsafe { p.as_ref() }.lookup(h, Rights::NONE, Object::thread);
-    // SAFETY: the handle holds the thread.
-    let ended = made.is_ok_and(|m| unsafe { m.as_ref() }.sched.state() == State::Dead);
-    let result = check(ended, "the handle does not keep the thread that exited")
-        .and_then(|()| made_thread_exited(f));
-    let closed = process::close_handle(p, h, CAUSE);
-    result?;
-    check(closed.is_ok(), "the handle to the thread did not close")
-}
-
-/// The maker's thread ran, found its buffer zeroed and writable, and
-/// exited: its buffer's page is gone, and the process lives on.
-fn made_thread_exited(f: &Fixture) -> Result<(), &'static str> {
-    check(
-        shared(f, 0) == 1,
-        "the thread did not run, or its buffer was not a fresh page",
-    )?;
-    let p = f.processes[0].expect("the test's process");
-    check(
-        process::translate(p, BUFFER_VA).is_none(),
-        "the thread's buffer outlived its exit",
-    )?;
-    check(
-        state(f, 0) == ProcessState::Alive,
-        "the exit of one thread ended its process",
     )
 }
 
@@ -2108,54 +1821,6 @@ fn done_init_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-/// A child process that only its one started thread holds: the maker in
-/// slot 0 starts the thread and closes both handles; the thread exits or
-/// faults, and the child's last reference goes inside its own end.
-fn start_orphan(f: &mut Fixture, entry: u64) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let maker = sched_thread(f, 0, &raw const el0_start_then_close, PRIORITY, FIFO)?;
-    sched_thread(f, 1, &raw const el0_done_at_once, JUDGE, FIFO)?;
-    new_process(f, 2)?;
-    let child = f.processes[2].take().expect("the child");
-    let t = thread::create(child, entry as usize, 0, 0, PRIORITY - 1, FIFO);
-    let p = f.processes[0].expect("the test's process");
-    let handles = t.ok().map(|t| {
-        let ht = process::insert_handle(p, Object::Thread(t), Rights::MANAGE);
-        // SAFETY: the reference `create` handed out goes.
-        unsafe { thread::release(t, CAUSE) };
-        ht
-    });
-    let hc = process::insert_handle(p, Object::Process(child), Rights::MANAGE);
-    // SAFETY: as above.
-    unsafe { process::release(child, CAUSE) };
-    match (handles, hc) {
-        (Some(Ok(ht)), Ok(hc)) => {
-            set_args(maker, &[ht.0, hc.0]);
-            Ok(())
-        }
-        _ => Err("no child"),
-    }
-}
-
-fn start_orphan_exit(f: &mut Fixture) -> Result<(), &'static str> {
-    start_orphan(f, user_address(&raw const el0_create_then_exit) as u64)
-}
-
-fn start_orphan_fault(f: &mut Fixture) -> Result<(), &'static str> {
-    f.faults = true;
-    start_orphan(f, CHILD_ENTRY)
-}
-
-fn done_orphan(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    if f.slot(t) == 0 {
-        return check(t.regs.x[0] == 0, "thread_start or handle_close failed");
-    }
-    check(
-        process::in_use() == 1 && thread::in_use() == 2,
-        "the orphan process or its thread stayed, or went twice",
-    )
-}
-
 // Cleanup (spec 7.7). The thread in slot 1 kills a child whose table holds
 // the only handles to its CHILD_THREADS stopped threads: each thread's
 // last reference goes, and each takes one portion of cleanup at the
@@ -2182,6 +1847,7 @@ fn killer_and_child(
     let killer = sched_thread(f, 1, &raw const el0_kill, PRIORITY, FIFO)?;
     sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
     f.memory = phys::free_frames() + pages::taken() as u64;
+    f.objects = memory::in_use();
     let child = make()?;
     let h = give_kept(f, Object::Process(child));
     // SAFETY: the test's reference goes; the handle, if it went in, holds
@@ -2353,8 +2019,72 @@ fn start_big_teardown(f: &mut Fixture) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The big teardown's child: one frame of its own, mapped at every
-/// 2 MiB of the gigabyte from BIG_BASE, and a full table.
+/// A memory object of BIG_OBJECT pages, 64 MiB, that only the table of a
+/// killed child holds goes with the child's teardown in portions of at
+/// most RELEASE_STEP frames (spec 7.7): at least BIG_OBJECT / RELEASE_STEP
+/// portions, with an interrupt every INTERRUPT_EVERY of them. None of them
+/// waits for the next portion: every portion begins with no interrupt
+/// pending, and the thread the first one wakes runs while work is left.
+/// Afterwards the object's frames, its place and the child are back.
+fn start_memory_portions(f: &mut Fixture) -> Result<(), &'static str> {
+    killer_and_child(f, memory_child)?;
+    f.interrupt_after = Some(INTERRUPT_EVERY);
+    f.interrupt_every = Some(INTERRUPT_EVERY);
+    Ok(())
+}
+
+/// A child with a handle to a whole memory object of BIG_OBJECT pages,
+/// which the child pays for, in its own table.
+fn memory_child() -> Result<NonNull<Process>, &'static str> {
+    let quota = QUOTA + (BIG_OBJECT * PAGE) as u64;
+    let child = process::create_root(quota, HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    let made = memory::create(child, BIG_OBJECT).and_then(|m| {
+        while !memory::fill(m) {}
+        let h = process::insert_handle(child, Object::Memory(m), MEMORY_RIGHTS);
+        // SAFETY: the reference `create` handed out goes; the handle, if it
+        // went in, holds the object.
+        unsafe { memory::release(m, CAUSE) };
+        h
+    });
+    if made.is_err() {
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { process::release(child, CAUSE) };
+        return Err("no memory object in the child");
+    }
+    Ok(child)
+}
+
+fn done_memory_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            cleanup::len() > 0,
+            "the interrupt waited for the object to go",
+        ),
+        1 => check(t.regs.x[0] == 0, "process_kill failed"),
+        _ => {
+            check(
+                f.portions as usize >= BIG_OBJECT / RELEASE_STEP,
+                "the object did not go RELEASE_STEP frames a portion",
+            )?;
+            check(
+                !cleanup::take_late() && f.interrupts >= f.portions / INTERRUPT_EVERY,
+                "a portion began while an interrupt was pending",
+            )?;
+            check(
+                memory::in_use() == f.objects
+                    && phys::free_frames() + pages::taken() as u64 == f.memory,
+                "the object's frames or its place did not come back",
+            )?;
+            cleanup_done()
+        }
+    }
+}
+
+/// The big teardown's child: a page of a memory object mapped at BIG_BASE,
+/// its frame mapped at every other 2 MiB of the gigabyte from there with
+/// no mapping of its own (process::map_page, which only tests do), and a
+/// full table. The frame stays until the stage Mappings, which comes after
+/// the stage Space took the ASID and every table.
 fn big_child() -> Result<NonNull<Process>, &'static str> {
     let child = process::create_root(QUOTA, MAX_HANDLES, CEILING).map_err(|_| "no child")?;
     let filled = fill_big_child(child);
@@ -2365,11 +2095,8 @@ fn big_child() -> Result<NonNull<Process>, &'static str> {
     filled.map(|()| child)
 }
 
-fn fill_big_child(mut child: NonNull<Process>) -> Result<(), &'static str> {
-    // SAFETY: the child was just created, and only this test uses it.
-    let pa = unsafe { child.as_mut() }
-        .map_frames(BIG_BASE, PAGE_SIZE, Attrs::USER_DATA)
-        .map_err(|_| "the child's page did not map")?;
+fn fill_big_child(child: NonNull<Process>) -> Result<(), &'static str> {
+    let pa = page_of(child, BIG_BASE, Access::ReadWrite, |_| {})?;
     for i in 1..BIG_PAGES {
         let va = BIG_BASE + i * BLOCK_2M as usize;
         process::map_page(child, va, pa, Attrs::USER_DATA)
@@ -2494,59 +2221,6 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-/// The killer in slot 0, woken by its alarm 1 ms after the start, kills
-/// its child C; C's child, the grandchild in slot 1, has a thread below
-/// the killer that counts meanwhile. The end of C ends the grandchild and
-/// stops its thread (spec 4), and the teardown of both runs at the
-/// killer's level, before the kill returns. Each child's quota comes off
-/// its parent's.
-fn start_grandchild(f: &mut Fixture) -> Result<(), &'static str> {
-    let killer = spawn(f, 0, &raw const el0_alarm_then, 0)?;
-    let killers = f.processes[0].expect("the killer's process");
-    let wake = timer::clock().deadline_after(timer::now(), 1_000_000);
-    let a = alarm(f, killers, Some(wake))?;
-    let child = process::create_child(killers, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING)
-        .map_err(|_| "no child")?;
-    let h = give_kept(f, Object::Process(child));
-    let counter = process::create_child(child, CHILD_QUOTA, HANDLE_LIMIT, CEILING)
-        .map_err(|_| "no grandchild")
-        .and_then(|grandchild| {
-            let p = with_programs(f, 1, grandchild)?;
-            new_thread(f, 1, p, DATA_VA, &raw const el0_count_until, 0)
-        });
-    // SAFETY: the test's reference goes; the handle, if it went in, holds
-    // the child.
-    unsafe { process::release(child, CAUSE) };
-    let counter = counter?;
-    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
-    sched::set_priority(counter, PRIORITY - 2, FIFO).map_err(|_| "no counter")?;
-    let kill = user_address(&raw const el0_kill) as u64;
-    set_args(killer, &[a, 0, kill, h?]);
-    f.ends[1] = true;
-    Ok(())
-}
-
-fn done_grandchild(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(
-        t.regs.x[23] == 0 && t.regs.x[0] == 0,
-        "the killer's alarm or process_kill failed",
-    )?;
-    check(
-        state(f, 1) == ProcessState::Killed,
-        "the grandchild outlived its parent",
-    )?;
-    let counter = slot_thread(f, 1);
-    check(
-        counter.sched.state() == State::Dead && counter.regs.x[2] > 0,
-        "the grandchild's thread did not run, or did not stop",
-    )?;
-    let grandchild = f.processes[1].expect("the grandchild");
-    check(
-        cleanup::len() == 0 && process::translate(grandchild, DATA_VA).is_none(),
-        "the grandchild's teardown did not end before the kill returned",
-    )
-}
-
 // Channels (spec 6.1, 6.8, 7.7): threads that wait in receive.
 
 /// The label of the exit channel and of the start channel of the tests'
@@ -2563,54 +2237,6 @@ fn exit_notice(label: u64) -> [u64; 11] {
         count: 1,
     }
     .to_words()
-}
-
-/// A child with the programs, in slot 0, whose entry 0 holds its start
-/// channel: a copy of its parent's channel with a label and NOTIFY (spec
-/// 13.3). Its thread notifies through abi::START_CHANNEL; the parent's
-/// thread in slot 1, below it, takes the notification with the label
-/// without waiting.
-fn start_start_channel(f: &mut Fixture) -> Result<(), &'static str> {
-    let parent = new_process(f, 1)?;
-    let receiver = new_thread(f, 1, parent, DATA_VA, &raw const el0_receive, 0)?;
-    sched::set_priority(receiver, JUDGE, FIFO).map_err(|_| "no receiver")?;
-    let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
-    let h = give(parent, Object::Channel(c), Rights::RECEIVE);
-    let s = session::create(parent, c, EXIT_LABEL, PRIORITY);
-    // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the channel, and so does the session.
-    unsafe { channel::release(c, Rights::NONE, CAUSE) };
-    let s = s.map_err(|_| "no session")?;
-    let child = process::create_child(parent, CHILD_QUOTA, HANDLE_LIMIT, CEILING);
-    let moved =
-        child.and_then(|child| process::move_start(child, Object::Session(s), Rights::NOTIFY));
-    // SAFETY: the reference `create` handed out goes; entry 0 of the
-    // child, if the move went, holds the session.
-    unsafe { session::unref(s, CAUSE) };
-    let child = child.map_err(|_| "no child")?;
-    let child = with_programs(f, 0, child)?;
-    let notifier = new_thread(f, 0, child, DATA_VA, &raw const el0_notify, 0)?;
-    moved.map_err(|_| "the start channel did not move")?;
-    set_args(notifier, &[START_CHANNEL.0, BITS]);
-    set_args(receiver, &[h?, NO_WAIT]);
-    Ok(())
-}
-
-fn done_start_channel(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    if f.slot(t) == 0 {
-        return check(x[0] == 0, "notify through START_CHANNEL failed");
-    }
-    let session = Notification {
-        source: Source::Session,
-        label: EXIT_LABEL,
-        bits: BITS,
-        count: 1,
-    };
-    check(
-        x[0] == 0 && x[1..12] == session.to_words(),
-        "the parent did not get the child's notification with its label",
-    )
 }
 
 /// x1-x11 of a receive that took one post of `bits` from the slot of label
@@ -3044,186 +2670,17 @@ fn done_batches(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-// Requests (spec 6.1, 6.6): a client and a service in processes of their
-// own.
-
-/// The label of the session of `request_through_the_start_channel`.
-const REQUEST_LABEL: u64 = 0x1ABE1;
-/// The description of the tests' requests: 8 bytes, no handles.
-const REQUEST_LEN: u64 = 8;
-/// Those 8 bytes, in x2.
-const REQUEST_WORD: u64 = 0x5EED_C11E;
-/// A count the tests move a client's count to, so that they know its next
-/// token ahead: above any count the tests reach otherwise.
-const TOKEN_COUNT: u64 = 1 << 40;
-/// The ceiling of the service's process in `boost_is_capped_by_the_server_ceiling`.
-const SERVICE_CEILING: u8 = 20;
-
-/// Spec 15.2 (messages): a child sends a request through its start
-/// channel, a copy of the parent's channel with a label and SEND that
-/// process_create moved into entry 0 (spec 13.3). The parent's service,
-/// which waits in receive, takes it with the label, the description, the
-/// data and a token, and answers; the child gets its request back.
-fn start_start_request(f: &mut Fixture) -> Result<(), &'static str> {
-    let parent = new_process(f, 1)?;
-    let server = new_thread(f, 1, parent, DATA_VA, &raw const el0_serve, 0)?;
-    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no service")?;
-    let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
-    let h = give(parent, Object::Channel(c), Rights::RECEIVE);
-    let s = session::create(parent, c, REQUEST_LABEL, PRIORITY);
-    // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the channel, and so does the session.
-    unsafe { channel::release(c, Rights::NONE, CAUSE) };
-    let s = s.map_err(|_| "no session")?;
-    let child = process::create_child(parent, CHILD_QUOTA, HANDLE_LIMIT, CEILING);
-    let moved =
-        child.and_then(|child| process::move_start(child, Object::Session(s), Rights::SEND));
-    // SAFETY: the reference `create` handed out goes; entry 0 of the
-    // child, if the move went, holds the session.
-    unsafe { session::unref(s, CAUSE) };
-    let child = child.map_err(|_| "no child")?;
-    let child = with_programs(f, 0, child)?;
-    let client = new_thread(f, 0, child, DATA_VA, &raw const el0_send, 0)?;
-    moved.map_err(|_| "the start channel did not move")?;
-    set_args(client, &[START_CHANNEL.0, REQUEST_LEN, REQUEST_WORD]);
-    set_args(server, &[h?, 0]);
-    Ok(())
-}
-
-fn done_start_request(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    if f.slot(t) == 0 {
-        return check(
-            x[..3] == [0, REQUEST_LEN, REQUEST_WORD] && x[3..10].iter().all(|&w| w == 0),
-            "the child did not get its request back",
-        );
-    }
-    check(
-        x[0] == 0
-            && x[19..21] == [REQUEST_LEN, REQUEST_WORD]
-            && x[28] == REQUEST_LABEL
-            && x[29] != 0,
-        "the parent did not take the child's request with its label and a token",
-    )
-}
-
-/// A token names a request for the process that accepted it (spec 6.1): a
-/// service takes a request of a client of another process and holds it
-/// until a notification comes; meanwhile a thread of a third process
-/// replies with the service's token, which the test knows ahead: BAD_STATE,
-/// and the client does not wake. It notifies the service, which answers;
-/// the client gets its request back.
-fn start_foreign_reply(f: &mut Fixture) -> Result<(), &'static str> {
-    let server = spawn(f, 0, &raw const el0_serve_after_notice, 0)?;
-    let client = spawn(f, 1, &raw const el0_send, 0)?;
-    let other = spawn(f, 2, &raw const el0_reply_then_notify, 0)?;
-    for (t, priority) in [(server, 3), (client, 2), (other, 1)] {
-        sched::set_priority(t, PRIORITY + priority, FIFO).map_err(|_| "no priority")?;
-    }
-    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
-    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
-    let d = channel::create(p, PRIORITY);
-    let handles = d.map(|d| {
-        [
-            give(p, Object::Channel(c), Rights::RECEIVE),
-            give(p, Object::Channel(d), Rights::RECEIVE),
-            give(q, Object::Channel(c), Rights::SEND),
-            give(r, Object::Channel(d), Rights::NOTIFY),
-        ]
-    });
-    // SAFETY: the references `create` handed out go; the handles that went
-    // in hold the channels.
-    unsafe {
-        channel::release(c, Rights::NONE, CAUSE);
-        if let Ok(d) = d {
-            channel::release(d, Rights::NONE, CAUSE);
-        }
-    }
-    let [requests, notices, send, notify] = handles.map_err(|_| "no channel")?;
-    let index = thread::index(client);
-    sched::locked(|k| k.tokens.skip_to(index, TOKEN_COUNT));
-    let token = (TOKEN_COUNT + 1) << 16 | u64::from(index);
-    set_args(server, &[requests?, 0, notices?]);
-    set_args(client, &[send?, REQUEST_LEN, REQUEST_WORD]);
-    set_args(other, &[token, 0, notify?, BITS]);
-    f.kept = [token, 0];
-    Ok(())
-}
-
-fn done_foreign_reply(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    match f.slot(t) {
-        0 => check(
-            x[0] == 0 && x[19..21] == [REQUEST_LEN, REQUEST_WORD] && x[28..30] == [0, f.kept[0]],
-            "the service did not take the request with the token the test knew, or its reply failed",
-        ),
-        1 => check(
-            x[..3] == [0, REQUEST_LEN, REQUEST_WORD],
-            "the client did not get the service's reply",
-        ),
-        _ => check(
-            x[19] == Error::BadState.code() && x[0] == 0,
-            "a thread of another process answered the request",
-        ),
-    }
-}
-
-/// The boost by a client stops at the ceiling of the service's process
-/// (spec 6.6, 8): a service at base 10 in a process with ceiling 20 waits
-/// in receive; a client of another process raises itself to 30, a ready
-/// thread of a third process to 25, and sends. The service works at 20,
-/// so the thread at 25 ends while the client still waits for the reply;
-/// at 30 the service would answer first.
-fn start_capped_boost(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process_under(f, SERVICE_CEILING)?;
-    let server = sched_thread(f, 0, &raw const el0_serve, PRIORITY, FIFO)?;
-    let client = spawn(f, 1, &raw const el0_raise_then_send, 0)?;
-    let ready = spawn(f, 2, &raw const el0_done_at_once, 0)?;
-    for (t, priority) in [(client, PRIORITY - 5), (ready, 1)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
-    }
-    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
-    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
-    let handles = [
-        give(p, Object::Channel(c), Rights::RECEIVE),
-        give(q, Object::Channel(c), Rights::SEND),
-        give(q, Object::Thread(ready), Rights::MANAGE),
-    ];
-    // SAFETY: the reference `create` handed out goes; the handles that went
-    // in hold the channel.
-    unsafe { channel::release(c, Rights::NONE, CAUSE) };
-    let [receive, send, raised] = handles;
-    // A handle to the client's own thread in its process: the teardown
-    // closes it first.
-    let own = process::insert_handle(q, Object::Thread(client), Rights::MANAGE)
-        .map_err(|_| "a handle did not go in")?;
-    f.handles[0] = Some((q, own));
-    set_args(server, &[receive?, 0]);
-    set_args(client, &[own.0, 30, raised?, 25, send?]);
-    Ok(())
-}
-
-fn done_capped_boost(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    match f.slot(t) {
-        0 => check(x[0] == 0, "the service's reply failed"),
-        1 => check(
-            x[19] == 0 && x[20] == 0 && x[0] == 0,
-            "thread_set_priority or send failed",
-        ),
-        _ => check(
-            slot_thread(f, 1).sched.state() == State::Waiting,
-            "the service answered before the ready thread above its ceiling ran",
-        ),
-    }
-}
-
 // The departure of a side (spec 6.8, 7.7): the stage Replies of a service
 // that ends wakes the clients of the requests it took with PEER_CLOSED, at
 // the level of the top one; a client that ends leaves the queue its
 // request stands in at once, and a reply to it is PEER_CLOSED; the stage
 // Close takes heads of one level a portion, at the level of the top
-// waiter.
+// waiter. A client and a service live in processes of their own.
+
+/// The description of the tests' requests: 8 bytes, no handles.
+const REQUEST_LEN: u64 = 8;
+/// Those 8 bytes, in x2.
+const REQUEST_WORD: u64 = 0x5EED_C11E;
 
 /// A channel that `p` pays for, with a handle with `rights` in its table:
 /// the handle's value.
@@ -3271,38 +2728,6 @@ fn exit_channel_of(q: NonNull<Process>, p: NonNull<Process>) -> Result<u64, &'st
     unsafe { channel::release(c, Rights::NONE, CAUSE) };
     source.map_err(|_| "no slot for the exit")?;
     h
-}
-
-/// Spec 15.2 (refusals): a service takes the request of a client of
-/// another process and ends its process without a reply (spec 6.8): the
-/// stage Replies of the teardown wakes the client with PEER_CLOSED in x0
-/// alone, before the judge below both runs.
-fn start_dead_server(f: &mut Fixture) -> Result<(), &'static str> {
-    let server = spawn(f, 0, &raw const el0_take_then_exit, 0)?;
-    let client = spawn(f, 1, &raw const el0_send, 0)?;
-    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no priority")?;
-    judge(f, 2)?;
-    let [p, q] = [0, 1].map(|i| f.processes[i].expect("a process of the test"));
-    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
-    set_args(server, &[requests, 1]);
-    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
-    f.ends[0] = true;
-    Ok(())
-}
-
-fn done_dead_server(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    match f.slot(t) {
-        1 => check(
-            t.regs.x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD]
-                && state(f, 0) == ProcessState::Exited { code: 0 },
-            "the client of the service that ended did not get PEER_CLOSED in x0 alone",
-        ),
-        2 => check(
-            f.passed[1],
-            "the client of the service that ended still waits",
-        ),
-        _ => Err("the service came back from process_exit"),
-    }
 }
 
 /// A service takes the requests of two processes of clients, 127 of them,
@@ -3404,55 +2829,6 @@ fn done_replies_level(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
             "thread_set_priority or process_kill failed",
         ),
         _ => Err("the service came back from its receive"),
-    }
-}
-
-/// A reply to a client that ended while it waited for it is PEER_CLOSED,
-/// and still ends the boost by that client (spec 6.6, 6.8): a service at
-/// 10 takes the request of a client at 30 and works at 30; it wakes a
-/// killer at 40, which ends the client's process. The service answers
-/// twice: PEER_CLOSED both times, since the reply leaves the mark of the
-/// dead client (Table::mark_dead), and it works at 10 again.
-fn start_dead_client(f: &mut Fixture) -> Result<(), &'static str> {
-    dead_client(f, 0)
-}
-
-/// The threads of `reply_to_a_dead_client_is_peer_closed`, whose service
-/// answers with the description `reply`.
-fn dead_client(f: &mut Fixture, reply: u64) -> Result<(), &'static str> {
-    let server = spawn(f, 0, &raw const el0_take_notify_reply, 0)?;
-    let client = spawn(f, 1, &raw const el0_send, 0)?;
-    let killer = spawn(f, 2, &raw const el0_alarm_then, 0)?;
-    for (t, priority) in [(client, 30), (killer, 40)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
-    }
-    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
-    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
-    let [wake, notify] = shared_channel(r, Rights::RECEIVE, p, Rights::NOTIFY)?;
-    let target = give(r, Object::Process(q), Rights::MANAGE)?;
-    let kill = user_address(&raw const el0_kill) as u64;
-    set_args(server, &[requests, notify, BITS, reply]);
-    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
-    set_args(killer, &[wake, 0, kill, target]);
-    f.ends[1] = true;
-    Ok(())
-}
-
-fn done_dead_client(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    match f.slot(t) {
-        0 => {
-            check(
-                x[20] == Error::PeerClosed.code() && x[0] == Error::PeerClosed.code(),
-                "a reply to the client that ended was not PEER_CLOSED, twice",
-            )?;
-            check(
-                t.sched.priority() == PRIORITY,
-                "the reply to the client that ended did not end its boost",
-            )
-        }
-        1 => Err("the client that ended came back from send"),
-        _ => check(x[23] == 0 && x[0] == 0, "receive or process_kill failed"),
     }
 }
 
@@ -3825,40 +3201,6 @@ fn done_close_in_place(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     }
 }
 
-/// A cycle of requests ends only with a kill (spec 6.7): threads of two
-/// processes send to each other's channel and wait, nobody receiving. A
-/// killer below them ends the first process, whose channel closes with its
-/// handles: the other thread gets PEER_CLOSED.
-fn start_call_cycle(f: &mut Fixture) -> Result<(), &'static str> {
-    let first = spawn(f, 0, &raw const el0_send, 0)?;
-    let second = spawn(f, 1, &raw const el0_send, 0)?;
-    let killer = spawn(f, 2, &raw const el0_kill, 0)?;
-    for (t, priority) in [(first, 11), (second, 12), (killer, JUDGE)] {
-        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
-    }
-    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
-    let [_, to_p] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
-    let [_, to_q] = shared_channel(q, Rights::RECEIVE, p, Rights::SEND)?;
-    let target = give(r, Object::Process(p), Rights::MANAGE)?;
-    set_args(first, &[to_q, REQUEST_LEN, REQUEST_WORD]);
-    set_args(second, &[to_p, REQUEST_LEN, REQUEST_WORD]);
-    set_args(killer, &[target]);
-    f.ends[0] = true;
-    Ok(())
-}
-
-fn done_call_cycle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    match f.slot(t) {
-        1 => check(
-            x[..3] == [Error::PeerClosed.code(), REQUEST_LEN, REQUEST_WORD],
-            "the thread whose peer was killed did not get PEER_CLOSED",
-        ),
-        2 => check(x[0] == 0, "process_kill failed"),
-        _ => Err("the killed thread came back from send"),
-    }
-}
-
 // Handles in messages (spec 6.1, 7.7): the handles of a request or a
 // reply that no table takes go, as a closed handle does: with a reply to a
 // client that ended, with the buffer of a sender that ended, and at the
@@ -3892,12 +3234,36 @@ fn buffer_with_at(
     Ok(())
 }
 
+/// The threads of `reply_to_a_dead_client_closes_the_handles`: a service
+/// in slot 0 at 10 takes the request of a client in slot 1 at 30, of
+/// another process, and wakes a killer in slot 2 at 40, which ends the
+/// client's process; the service then answers twice with the description
+/// `reply` (el0_take_notify_reply).
+fn dead_client(f: &mut Fixture, reply: u64) -> Result<(), &'static str> {
+    let server = spawn(f, 0, &raw const el0_take_notify_reply, 0)?;
+    let client = spawn(f, 1, &raw const el0_send, 0)?;
+    let killer = spawn(f, 2, &raw const el0_alarm_then, 0)?;
+    for (t, priority) in [(client, 30), (killer, 40)] {
+        sched::set_priority(t, priority, FIFO).map_err(|_| "no priority")?;
+    }
+    let [p, q, r] = [0, 1, 2].map(|i| f.processes[i].expect("a process of the test"));
+    let [requests, send] = shared_channel(p, Rights::RECEIVE, q, Rights::SEND)?;
+    let [wake, notify] = shared_channel(r, Rights::RECEIVE, p, Rights::NOTIFY)?;
+    let target = give(r, Object::Process(q), Rights::MANAGE)?;
+    let kill = user_address(&raw const el0_kill) as u64;
+    set_args(server, &[requests, notify, BITS, reply]);
+    set_args(client, &[send, REQUEST_LEN, REQUEST_WORD]);
+    set_args(killer, &[wake, 0, kill, target]);
+    f.ends[1] = true;
+    Ok(())
+}
+
 /// A reply to a client that ended takes its handles along (spec 6.1,
-/// 6.8): as in `reply_to_a_dead_client_is_peer_closed`, but the service
-/// answers with two handles of its table, the only ones to a channel of
-/// its own. The first reply is PEER_CLOSED, the handles leave the table,
-/// and the channel goes; the second is BAD_HANDLE: its buffer names
-/// handles that went.
+/// 6.8): a service answers a client that a killer ended (`dead_client`)
+/// with two handles of its table, the only ones to a channel of its own.
+/// The first reply is PEER_CLOSED, the handles leave the table, and the
+/// channel goes; the second is BAD_HANDLE: its buffer names handles that
+/// went.
 fn start_dead_client_handles(f: &mut Fixture) -> Result<(), &'static str> {
     dead_client(f, 2 << HANDLES_SHIFT)?;
     let server = f.threads[0].expect("the service");
@@ -3918,10 +3284,12 @@ fn start_dead_client_handles(f: &mut Fixture) -> Result<(), &'static str> {
 }
 
 fn done_dead_client_handles(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    if f.slot(t) != 0 {
-        return done_dead_client(f, t);
-    }
     let x = &t.regs.x;
+    match f.slot(t) {
+        0 => {}
+        1 => return Err("the client that ended came back from send"),
+        _ => return check(x[23] == 0 && x[0] == 0, "receive or process_kill failed"),
+    }
     check(
         x[20] == Error::PeerClosed.code() && x[0] == Error::BadHandle.code(),
         "a reply with handles to the client that ended was not PEER_CLOSED, then BAD_HANDLE",
@@ -4490,5 +3858,51 @@ fn done_round_trips(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         FAST_PATH_HITS.load(Relaxed) == ROUNDS,
         "a round of the fast row did not take the fast path",
+    )
+}
+
+/// A long call yields to an interrupt that comes in the middle of its
+/// portions (spec 7.7): a thread at EL0 makes mem_create of LONG_PAGES
+/// pages, mem_map of them RW into its own process, mem_protect to R and
+/// mem_unmap (el0_long_calls), while the test's alarm fires every
+/// LONG_PERIOD_NS. Each of the four calls lets a timer interrupt in between
+/// two of its portions, which finds the call's progress in the thread
+/// (thread::long), and no interrupt waits as long as a period for the
+/// portion it came in. Only -icount makes the moments the alarm fires fall
+/// in the same places of the calls on every run.
+fn start_long_calls(f: &mut Fixture) -> Result<(), &'static str> {
+    let quota = QUOTA + (LONG_PAGES * PAGE) as u64;
+    let p = process::create_root(quota, HANDLE_LIMIT, CEILING).map_err(|_| "no process")?;
+    let p = with_programs(f, 0, p)?;
+    let t = new_thread(f, 0, p, DATA_VA, &raw const el0_long_calls, 0)?;
+    let own = give_kept(f, Object::Process(p))?;
+    set_args(t, &[(LONG_PAGES * PAGE) as u64, own, LONG_VA as u64]);
+    let period = timer::clock().ns_to_ticks(LONG_PERIOD_NS);
+    let first = timer::now() + period;
+    alarm(f, p, Some(first))?;
+    f.rearm = Some(period);
+    Ok(())
+}
+
+/// The four calls of el0_long_calls passed, each let an interrupt in
+/// between its portions, and none waited a period (spec 7.7).
+fn done_long_calls(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        t.regs.x[20..25] == [0; 5],
+        "a long call of the program failed",
+    )?;
+    let calls = [
+        Call::MemCreate,
+        Call::MemMap,
+        Call::MemProtect,
+        Call::MemUnmap,
+    ];
+    check(
+        calls.iter().all(|c| f.cut & 1 << c.number() != 0),
+        "a long call let no interrupt in between its portions",
+    )?;
+    check(
+        f.rearm.is_some_and(|period| f.waited < period),
+        "an interrupt waited as long as a period for a long call",
     )
 }

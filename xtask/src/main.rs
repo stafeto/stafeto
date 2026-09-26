@@ -17,6 +17,17 @@ const PROGRAM_TARGET: &str = "aarch64-unknown-none";
 /// The stack of init's first thread, in bytes, which init's program asks
 /// the kernel for (lib/bootimg); the size is ours.
 const INIT_STACK_SIZE: u32 = 64 * 1024;
+/// The stack of a child of the test init (tests/child), which its loader
+/// maps (rt::loader).
+const CHILD_STACK_SIZE: u32 = 16 * 1024;
+/// The programs of the boot image of the normal build and of the test
+/// init's runs: each file's name in the image, the package that builds it
+/// for EL0 and the size of its stack. Init comes first (spec 13.1).
+const BOOT_PROGRAMS: [(&str, &str, u32); 1] = [("init", "init", INIT_STACK_SIZE)];
+const TEST_PROGRAMS: [(&str, &str, u32); 2] = [
+    ("init", "test-init", INIT_STACK_SIZE),
+    ("child", "test-child", CHILD_STACK_SIZE),
+];
 /// Spec 3.4: the kernel image file stays under 200 KB: the build that
 /// ships and the probes built from it.
 const KERNEL_LIMIT: u64 = 200 * 1024;
@@ -28,26 +39,40 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
-/// The line the kernel tests write through `debug_write` from EL0
-/// (ktest::el0::EL0_LINE), whole.
-const DEBUG_WRITE_LINES: [&str; 1] = ["debug_write from EL0 reaches the console"];
 /// Tests only the `icount` build has: the first checks that the run is
-/// under -icount; the next two depend on how much of a quantum is left,
-/// which only -icount makes repeatable; the fourth takes a big process
-/// apart in hundreds of portions with interrupts between them, where
-/// virtual time counts instructions and a stall of the host changes
-/// nothing; the last measures the round trip of a request, which only
-/// -icount counts in instructions (spec 15.3).
-const ICOUNT_TESTS: [&str; 5] = [
+/// under -icount; the second measures the portions of the long calls of
+/// memory objects, which only -icount counts in instructions (spec 15.3);
+/// the next two depend on how much of a quantum is left, which only
+/// -icount makes repeatable; the fifth takes a big process apart in
+/// hundreds of portions with interrupts between them, where virtual time
+/// counts instructions and a stall of the host changes nothing; the sixth
+/// measures the round trip of a request; in the last a timer fires in the
+/// middle of each long call of memory objects at the same place on every
+/// run.
+const ICOUNT_TESTS: [&str; 7] = [
     "virtual_time_counts_instructions",
+    "memory_portions_are_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "teardown_yields_to_a_pending_interrupt",
     "ipc_round_trip_is_measured",
+    "long_call_yields_to_a_pending_interrupt",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
 const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
+/// The rows of the line of `memory_portions_are_measured`, in its order
+/// (spec 15.3).
+const MEMORY_PORTION_ROWS: [&str; 8] = [
+    "create",
+    "map",
+    "map_exec",
+    "unmap",
+    "protect",
+    "protect_exec",
+    "release",
+    "first_map",
+];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
 /// checked.
@@ -67,13 +92,24 @@ const INIT_EXIT: &str = "init exited with code 0";
 /// Lines of a run of the test init (tests/init) besides its TEST lines,
 /// each whole: a formatted line longer than one debug_write, all 64 bytes
 /// of x2-x9 in one debug_write, the bytes of a debug_write's length and no
-/// more, and the kernel's line for the fault of a child (spec 7.9, 15.2).
+/// more, and the kernel's line for the fault of a child with no code (spec
+/// 7.9, 15.2).
 const TEST_INIT_LINES: [&str; 4] = [
     "init prints from EL0 in pieces of at most 64 bytes: this line takes 2 of them",
     "test init: debug_write prints all 64 bytes of x2 to x9 in order",
     "debug_write stops at its length",
     "process fault: instruction abort from EL0 (EC 0x20) ESR=0x82000007 FAR=0x1000 ELR=0x1000",
 ];
+/// The children of the test init that fault, each with a line of the
+/// kernel (spec 7.9): the child with no code of
+/// `child_fault_reason_reaches_the_parent` and the children with code of
+/// the tests of faults, of `wfi` with the fault before it and of an orphan
+/// that faults.
+const CHILD_FAULTS: usize = 12;
+/// The panic of a child (tests/child, Role::Panic): rt prints where it
+/// panicked, then this message on a line of its own (spec 13.2).
+const CHILD_PANIC_AT: &str = "panic: panicked at tests/child/src/main.rs:";
+const CHILD_PANIC: &str = "the child panics on purpose";
 /// Where xtask's own programs (`raw_init`) start: lld's first address.
 const RAW_INIT_ENTRY: u64 = 0x20_0000;
 /// `ldr x0, [x0]`: init starts with x0 = 0, so this loads from page 0,
@@ -100,9 +136,10 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 106;
-/// A data segment bigger than the 4 MiB one block of frames holds.
-const BIG_DATA: u64 = 8 << 20;
+const INIT_TESTS: u32 = 157;
+/// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
+/// by a page.
+const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,7 +314,7 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let (limit, source) = variant.limit();
     image::check_size(bytes.len() as u64, limit)?;
-    let boot_image = build_boot_image("init", "boot.img")?;
+    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS)?;
     println!(
         "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),
@@ -290,31 +327,39 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     })
 }
 
-/// Builds program `package` for EL0 and, under target/, a boot image
-/// `name` whose only file is that program as init (spec 3.3, 13.1).
-fn build_boot_image(package: &str, name: &str) -> Result<PathBuf, String> {
-    run_cmd(cargo().args([
-        "build",
-        "--package",
-        package,
-        "--release",
-        "--target",
-        PROGRAM_TARGET,
-    ]))?;
+/// Builds `programs` for EL0 and, under target/, a boot image `name` whose
+/// files they are, in their order, each with its name and the stack size
+/// its header asks for (spec 3.3, 13.1).
+fn build_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
+    let mut cmd = cargo();
+    cmd.args(["build", "--release", "--target", PROGRAM_TARGET]);
+    for (_, package, _) in programs {
+        cmd.args(["--package", package]);
+    }
+    run_cmd(&mut cmd)?;
     let target = root().join("target");
-    let elf = target.join(PROGRAM_TARGET).join("release").join(package);
-    let why = |e: String| format!("{}: {e}", elf.display());
-    let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
-    let program = elf::program(&bytes, INIT_STACK_SIZE).map_err(why)?;
-    let init = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
-    let image = bootimg::write::image(&[("init", &init)]).map_err(|e| why(e.to_string()))?;
+    let mut files = Vec::new();
+    for &(file, package, stack) in programs {
+        let elf = target.join(PROGRAM_TARGET).join("release").join(package);
+        let why = |e: String| format!("{}: {e}", elf.display());
+        let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
+        let program = elf::program(&bytes, stack).map_err(why)?;
+        let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
+        files.push((file, written, elf));
+    }
+    let list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+    let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
     std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
+    let from: Vec<_> = files
+        .iter()
+        .map(|(f, _, elf)| format!("{f} from {}", elf.display()))
+        .collect();
     println!(
-        "boot image {} ({} bytes): init from {}",
+        "boot image {} ({} bytes): {}",
         path.display(),
         image.len(),
-        elf.display()
+        from.join(", ")
     );
     Ok(path)
 }
@@ -499,37 +544,41 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     Ok(())
 }
 
-/// A boot image that is missing, cut short or damaged stops the boot with
-/// a panic that says what is wrong (spec 3.3, 13.1). The cases: no boot
-/// image; the image without its last byte; the image's signature spoiled;
-/// init's signature spoiled; an init whose data segment is bigger than
-/// one block of frames, which the kernel cannot load.
+/// A boot image that is missing, cut short, damaged or not whole pages
+/// stops the boot with a panic that says what is wrong (spec 3.3, 13.1).
+/// The cases: no boot image; the image without the last byte of init; the
+/// image's signature spoiled; init's signature spoiled; the image with a
+/// byte past its whole pages; an init whose data segment is
+/// bigger than a memory object can be, which the kernel cannot load.
 fn bad_boot_images_stop_the_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let good =
         std::fs::read(&a.boot_image).map_err(|e| format!("{}: {e}", a.boot_image.display()))?;
-    let init_at = bootimg::BootImage::parse(&good)
+    let init = bootimg::BootImage::parse(&good)
         .map_err(|e| e.to_string())?
         .files()
         .next()
-        .ok_or("the boot image has no files")?
-        .offset as usize;
+        .ok_or("the boot image has no files")?;
+    let (init_at, init_end) = (init.offset as usize, init.offset as usize + init.data.len());
+    let mut odd = good.clone();
+    odd.push(0);
     let mut unsigned = good.clone();
     unsigned[0] = b's';
     let mut bad_init = good.clone();
     bad_init[init_at] = b's';
-    let big = raw_init(&[LDR_X0_X0], false, BIG_DATA)?;
+    let huge = raw_init(&[LDR_X0_X0], false, HUGE_DATA)?;
     let cases = [
         (None, "no boot image"),
-        (Some(&good[..good.len() - 1]), "boot image: cut short"),
+        (Some(&good[..init_end - 1]), "boot image: cut short"),
         (Some(&unsigned[..]), "boot image: no STAFBOOT signature"),
         (
             Some(&bad_init[..]),
             "boot image: init: no STAFPROG signature",
         ),
+        (Some(&odd[..]), "boot image: not whole pages"),
         (
-            Some(&big[..]),
-            "init: no frames for its data segment of 0x800000 bytes",
+            Some(&huge[..]),
+            "init: no memory object for its data segment",
         ),
     ];
     let path = root().join("target").join("bad-boot.img");
@@ -694,8 +743,7 @@ fn stack_overflow_report() -> Result<(), String> {
 
 /// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
 /// through semihosting. On 2 GiB the tests also cover RAM the boot page
-/// tables did not map. Every test the kernel counts passes once, and what
-/// the tests wrote through `debug_write` reaches the console whole. The
+/// tables did not map. Every test the kernel counts passes once. The
 /// `icount` build runs under qemu::ICOUNT, where virtual time counts
 /// instructions: the tests that depend on how much of a quantum is left
 /// run only there. A hang, such as a quantum that never ends, fails at
@@ -711,9 +759,6 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r)?;
-    for line in DEBUG_WRITE_LINES {
-        qemu::expect_line(&o, line)?;
-    }
     for name in ICOUNT_TESTS {
         if r.passed.iter().any(|p| p == name) != icount {
             return Err(format!(
@@ -728,49 +773,58 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
         r.passed.len()
     );
     if icount {
-        let ticks = round_trip_ticks(&o.lines)?;
-        let rows: Vec<_> = ROUND_TRIP_ROWS
-            .iter()
-            .zip(ticks)
-            .map(|(row, n)| format!("{row}={n}"))
-            .collect();
-        println!("ipc round trip ticks on {}: {}", m.memory, rows.join(" "));
+        for (what, rows) in [
+            ("ipc round trip", &ROUND_TRIP_ROWS[..]),
+            ("memory portions", &MEMORY_PORTION_ROWS[..]),
+        ] {
+            let ticks = ticks_of(&o.lines, what, rows)?;
+            let rows: Vec<_> = rows
+                .iter()
+                .zip(ticks)
+                .map(|(row, n)| format!("{row}={n}"))
+                .collect();
+            println!("{what} ticks on {}: {}", m.memory, rows.join(" "));
+        }
     }
     Ok(())
 }
 
-/// The numbers of the line `ipc round trip ticks: null=... handles=...`
-/// that `ipc_round_trip_is_measured` prints, one for each of
-/// ROUND_TRIP_ROWS in that order: an error when no line has them all.
-fn round_trip_ticks(lines: &[String]) -> Result<[u64; 6], String> {
+/// The numbers of the line `<what> ticks: <row>=<n> ...` that a measuring
+/// test prints (`ipc round trip`, `memory portions`), one for each of
+/// `rows` in that order: an error when no line has them all.
+fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, String> {
+    let prefix = format!("{what} ticks: ");
     let line = lines
         .iter()
-        .find_map(|l| l.strip_prefix("ipc round trip ticks: "))
-        .ok_or("the kernel printed no round trip")?;
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .ok_or_else(|| format!("the kernel printed no {what} ticks"))?;
     let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.len() != ROUND_TRIP_ROWS.len() {
-        return Err(format!("the round trip has other rows: {line:?}"));
+    if fields.len() != rows.len() {
+        return Err(format!("the {what} line has other rows: {line:?}"));
     }
-    let mut ticks = [0; 6];
-    for ((t, row), field) in ticks.iter_mut().zip(ROUND_TRIP_ROWS).zip(fields) {
-        *t = field
-            .strip_prefix(row)
-            .and_then(|f| f.strip_prefix('='))
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(|| format!("{field:?} is no {row} row of the round trip"))?;
-    }
-    Ok(ticks)
+    rows.iter()
+        .zip(fields)
+        .map(|(row, field)| {
+            field
+                .strip_prefix(row)
+                .and_then(|f| f.strip_prefix('='))
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| format!("{field:?} is no {row} row of the {what} line"))
+        })
+        .collect()
 }
 
 /// The test init (tests/init) as init of the normal build, the kernel that
-/// ships, on machine `m`, under qemu::ICOUNT when `icount`: each of its
-/// INIT_TESTS tests passes once, the lines it and the kernel print for the
-/// tests come whole, one child faults, and it exits with 0, which turns
-/// the machine off. Its first line says how long a counted loop took,
-/// which under -icount must be the loop's instructions.
+/// ships, on machine `m`, under qemu::ICOUNT when `icount`, with its child
+/// program (tests/child) as the second file of the boot image: each of its
+/// INIT_TESTS tests passes once, the lines it, its children and the kernel
+/// print for the tests come whole, CHILD_FAULTS children fault, and it
+/// exits with 0, which turns the machine off. Its first line says how long
+/// a counted loop took, which under -icount must be the loop's
+/// instructions.
 fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     let a = build(Variant::Normal)?;
-    let image = build_boot_image("test-init", "boot-test.img")?;
+    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     if icount {
@@ -788,14 +842,15 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     for line in TEST_INIT_LINES.into_iter().chain([INIT_EXIT]) {
         qemu::expect_line(&o, line)?;
     }
+    child_panic_comes_whole(&o.lines)?;
     let faults = o
         .lines
         .iter()
         .filter(|l| l.starts_with("process fault: "))
         .count();
-    if faults != 1 {
+    if faults != CHILD_FAULTS {
         return Err(format!(
-            "{faults} process fault lines; the test init makes one"
+            "{faults} process fault lines; the test init makes {CHILD_FAULTS}"
         ));
     }
     let ticks = qemu::number_after(&o.lines, "counter ticks of 10000 turns: ")
@@ -812,6 +867,24 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         r.passed.len()
     );
     Ok(())
+}
+
+/// The panic of a child comes whole (spec 13.2): a line with where it
+/// panicked, CHILD_PANIC_AT and the line and column, then CHILD_PANIC on
+/// the next line.
+fn child_panic_comes_whole(lines: &[String]) -> Result<(), String> {
+    let whole = lines.windows(2).any(|pair| {
+        let place = pair[0].strip_prefix(CHILD_PANIC_AT).and_then(|p| {
+            let (line, column) = p.strip_suffix(':')?.split_once(':')?;
+            line.parse::<u32>().ok().zip(column.parse::<u32>().ok())
+        });
+        place.is_some() && pair[1] == CHILD_PANIC
+    });
+    if whole {
+        Ok(())
+    } else {
+        Err("the child's panic did not come whole".into())
+    }
 }
 
 fn gdb() -> Result<(), String> {
@@ -864,6 +937,8 @@ fn ci() -> Result<(), String> {
         "init",
         "--package",
         "test-init",
+        "--package",
+        "test-child",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -975,18 +1050,61 @@ mod tests {
     /// passes for it.
     #[test]
     fn round_trip_line_gives_six_rows() {
+        let what = "ipc round trip";
         let line = "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6";
         let lines = ["TEST fast_path_is_taken ok", line].map(String::from);
-        assert_eq!(round_trip_ticks(&lines), Ok([1, 2, 3, 4, 5, 6]));
+        let ticks = ticks_of(&lines, what, &ROUND_TRIP_ROWS);
+        assert_eq!(ticks, Ok(vec![1, 2, 3, 4, 5, 6]));
         for bad in [
             "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5",
             "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 handles=5 buffer=6",
             "ipc round trip ticks: null=x switch=2 fast=3 slow=4 buffer=5 handles=6",
             "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6 more=7",
         ] {
-            assert!(round_trip_ticks(&[bad.to_string()]).is_err(), "{bad}");
+            let lines = [bad.to_string()];
+            assert!(ticks_of(&lines, what, &ROUND_TRIP_ROWS).is_err(), "{bad}");
         }
-        assert!(round_trip_ticks(&[]).is_err());
+        assert!(ticks_of(&[], what, &ROUND_TRIP_ROWS).is_err());
+    }
+
+    /// The line of the portions of memory objects gives its eight rows in
+    /// order, and the round trip's does not pass for it.
+    #[test]
+    fn memory_portions_line_gives_eight_rows() {
+        let what = "memory portions";
+        let line = "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 \
+                    protect_exec=6 release=7 first_map=8";
+        let lines = [line.to_string()];
+        let ticks = ticks_of(&lines, what, &MEMORY_PORTION_ROWS);
+        assert_eq!(ticks, Ok((1..=8).collect()));
+        for bad in [
+            "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7",
+            "memory portions ticks: map=2 create=1 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7 first_map=8",
+            "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6",
+        ] {
+            let lines = [bad.to_string()];
+            assert!(
+                ticks_of(&lines, what, &MEMORY_PORTION_ROWS).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A child's panic is its place and its message on two whole lines, and
+    /// nothing else passes for it.
+    #[test]
+    fn child_panic_is_two_whole_lines() {
+        let place = format!("{CHILD_PANIC_AT}42:5:");
+        let good = [place.clone(), CHILD_PANIC.to_string()];
+        assert_eq!(child_panic_comes_whole(&good), Ok(()));
+        for bad in [
+            [place.clone(), format!("{CHILD_PANIC} more")],
+            [format!("{CHILD_PANIC_AT}42:"), CHILD_PANIC.to_string()],
+            [format!("{CHILD_PANIC_AT}42:5"), CHILD_PANIC.to_string()],
+            [CHILD_PANIC.to_string(), place.clone()],
+        ] {
+            assert!(child_panic_comes_whole(&bad).is_err(), "{bad:?}");
+        }
     }
 
     /// The kernel tests wake their threads through timers of programs

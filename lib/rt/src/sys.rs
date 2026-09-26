@@ -7,17 +7,17 @@
 //! x0-x9, so that a later kernel may return more values, and `receive`
 //! x0-x11; the kernel keeps every other register. `raw` makes any call
 //! with any registers, for tests that hand the kernel bad ones; the
-//! functions after it are the typed calls of milestones 1.2c to 1.3c,
+//! functions after it are the typed calls of milestones 1.2c to 1.3d,
 //! which take and return handles typed by the kind of their object
 //! (`Handle`), and the token of a request, which answers it once
 //! (`Token`).
 
-use crate::handle::{Channel, Handle, Process, Resource, Thread, Timer};
+use crate::handle::{Channel, Handle, Memory, Process, Resource, Thread, Timer};
 use crate::msgbuf;
 use abi::{
-    Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX, Message,
-    Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT,
-    Source,
+    Access, Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX,
+    MemoryInfo, Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
+    SOURCE_SHIFT, Source,
 };
 use core::arch::asm;
 
@@ -66,7 +66,8 @@ fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let mut x = [0; 10];
     x[..args.len()].copy_from_slice(args);
     // SAFETY: the calls made through here run no code of the program and
-    // use none of its memory; thread_create, which can, is unsafe itself.
+    // use none of its memory; thread_create, mem_unmap and mem_protect,
+    // which can, are unsafe themselves.
     let x = unsafe { raw::<N>(x) };
     match Error::from_code(x[0]) {
         None => Ok(x),
@@ -271,6 +272,77 @@ pub fn kernel_stats(resource: &Handle<Resource>) -> Result<KernelStats, Error> {
     Ok(KernelStats::from_words([
         x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
     ]))
+}
+
+/// object_info(MEMORY): the object's size in bytes, the pages whose frames
+/// it owns and its mappings now.
+pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {
+    let args = [memory.raw().0, abi::INFO_MEMORY, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(MemoryInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// mem_create: a memory object of `size` bytes, whole pages up to
+/// abi::MAX_MEMORY, whose frames the kernel takes and zeroes before the
+/// call returns (spec 7.3); the caller's quota pays for them, for the
+/// nodes of their list and for the object's place. The handle carries
+/// abi::MEMORY_RIGHTS.
+pub fn mem_create(size: u64) -> Result<Handle<Memory>, Error> {
+    let x = call::<{ Call::MemCreate.number() }>(&[size, 0])?;
+    Ok(returned(&x))
+}
+
+/// mem_map: shows `len` bytes of `memory` from byte `offset` at `addr` of
+/// `process`, a handle with MANAGE, with `access` (spec 7.4): R needs
+/// MAP_READ, RW MAP_WRITE as well, RX MAP_EXEC as well. The pages of the
+/// range must be free there: no mapping and no message buffer of a thread.
+/// The process pays for the table of its mappings and for the tables of
+/// its space, whoever maps into it; the mapping keeps the object alive
+/// until it goes.
+pub fn mem_map(
+    process: &Handle<Process>,
+    memory: &Handle<Memory>,
+    offset: u64,
+    len: u64,
+    addr: usize,
+    access: Access,
+) -> Result<(), Error> {
+    let args = [
+        process.raw().0,
+        memory.raw().0,
+        offset,
+        len,
+        addr as u64,
+        access.raw(),
+    ];
+    call::<{ Call::MemMap.number() }>(&args).map(drop)
+}
+
+/// mem_unmap: the mapping of `process` that is exactly `len` bytes from
+/// `addr` goes (spec 7.4).
+///
+/// # Safety
+/// Nothing the caller uses lies in the mapping, when it is the caller's
+/// own.
+pub unsafe fn mem_unmap(process: &Handle<Process>, addr: usize, len: u64) -> Result<(), Error> {
+    call::<{ Call::MemUnmap.number() }>(&[process.raw().0, addr as u64, len]).map(drop)
+}
+
+/// mem_protect: the pages of the mapping of `process` that is exactly
+/// `len` bytes from `addr` get `access`, within the rights the object was
+/// mapped with (spec 7.4).
+///
+/// # Safety
+/// Nothing the caller uses in the mapping needs an access `access` takes
+/// away, when it is the caller's own.
+pub unsafe fn mem_protect(
+    process: &Handle<Process>,
+    addr: usize,
+    len: u64,
+    access: Access,
+) -> Result<(), Error> {
+    let args = [process.raw().0, addr as u64, len, access.raw()];
+    call::<{ Call::MemProtect.number() }>(&args).map(drop)
 }
 
 /// debug_write: up to abi::INLINE_MAX bytes to the console through the

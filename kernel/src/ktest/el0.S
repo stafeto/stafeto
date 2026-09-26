@@ -5,8 +5,8 @@
 // page-aligned section of the kernel image that the kernel never runs: a
 // test copies the section into a frame of its process and maps it there. On
 // entry x0 holds the test's argument: the address of a register pattern,
-// or an address to load from. A program ends with `svc #SVC_DONE`, where
-// the kernel judges its registers.
+// or the first of the program's arguments. A program ends with
+// `svc #SVC_DONE`, where the kernel judges its registers.
 
 .equ SVC_NOP, 0xFF00                    // ktest::el0::SVC_NOP
 .equ SVC_DONE, 0xFF01                   // ktest::el0::SVC_DONE
@@ -19,23 +19,25 @@
 .equ CALL_RECEIVE, 5                    // abi::Call::Receive
 .equ CALL_REPLY, 6                      // abi::Call::Reply
 .equ CALL_NOTIFY, 7                     // abi::Call::Notify
+.equ CALL_MEM_CREATE, 8                 // abi::Call::MemCreate
+.equ CALL_MEM_MAP, 9                    // abi::Call::MemMap
+.equ CALL_MEM_UNMAP, 10                 // abi::Call::MemUnmap
+.equ CALL_MEM_PROTECT, 11               // abi::Call::MemProtect
 .equ CALL_PROCESS_KILL, 13              // abi::Call::ProcessKill
 .equ CALL_PROCESS_EXIT, 14              // abi::Call::ProcessExit
-.equ CALL_THREAD_CREATE, 15             // abi::Call::ThreadCreate
-.equ CALL_THREAD_START, 16              // abi::Call::ThreadStart
 .equ CALL_THREAD_EXIT, 17               // abi::Call::ThreadExit
 .equ CALL_THREAD_SET_PRIORITY, 18       // abi::Call::ThreadSetPriority
 .equ CALL_YIELD, 19                     // abi::Call::Yield
 .equ CALL_OBJECT_INFO, 27               // abi::Call::ObjectInfo
-.equ CALL_DEBUG_WRITE, 28               // abi::Call::DebugWrite
 .equ P_SP, 248                          // offsets in ktest::el0::Pattern; x0-x30 come first
 .equ P_NZCV, 256
 .equ P_TPIDR, 264
 .equ P_FPCR, 272
 .equ P_FPSR, 280
 .equ P_V, 288
-.equ DATA_VA, 0x800000                  // ktest::el0::DATA_VA
 .equ FIFO, 1                            // abi::Policy::Fifo
+.equ READ, 1                            // abi::Access::Read
+.equ READ_WRITE, 3                      // abi::Access::ReadWrite
 .equ NO_WAIT, 0x10000                   // abi::NO_WAIT
 
 .arch_extension fp
@@ -135,12 +137,6 @@ el0_pattern_yield:
     svc     #CALL_YIELD
     svc     #SVC_DONE
 
-// Loads from the kernel address in x0, which must fault.
-.global el0_load
-el0_load:
-    ldr     x1, [x0]
-    svc     #SVC_DONE
-
 // Ends at once: the kernel checks the FP and SIMD registers a new thread
 // finds, after tests that left their patterns in them.
 .global el0_done_at_once
@@ -153,18 +149,6 @@ el0_done_at_once:
 el0_pattern_close:
     LOAD_PATTERN
     svc     #CALL_HANDLE_CLOSE
-    svc     #SVC_DONE
-
-.global el0_pattern_object_info
-el0_pattern_object_info:
-    LOAD_PATTERN
-    svc     #CALL_OBJECT_INFO
-    svc     #SVC_DONE
-
-.global el0_pattern_debug_write
-el0_pattern_debug_write:
-    LOAD_PATTERN
-    svc     #CALL_DEBUG_WRITE
     svc     #SVC_DONE
 
 // Scheduling tests (ktest::el0). The threads of a test share the words of
@@ -254,14 +238,6 @@ el0_exit_process:
     svc     #CALL_PROCESS_EXIT
     svc     #SVC_DONE
 
-// thread_create with the arguments in x0-x6, then thread_exit: the new
-// thread stays stopped.
-.global el0_create_then_exit
-el0_create_then_exit:
-    svc     #CALL_THREAD_CREATE
-    svc     #CALL_THREAD_EXIT
-    svc     #SVC_DONE
-
 // object_info with the arguments in x0-x2, then thread_exit.
 .global el0_info_then_exit
 el0_info_then_exit:
@@ -269,58 +245,12 @@ el0_info_then_exit:
     svc     #CALL_THREAD_EXIT
     svc     #SVC_DONE
 
-// thread_create with the arguments in x0-x6 and thread_start of the new
-// thread. Ends with the last call's x0 and the handle in x19.
-.global el0_create_and_start
-el0_create_and_start:
-    svc     #CALL_THREAD_CREATE
-    cbnz    x0, 1f
-    mov     x19, x1
-    mov     x0, x19
-    svc     #CALL_THREAD_START
-1:  svc     #SVC_DONE
-
-// The thread el0_create_and_start makes: adds 1 to the first word of its
-// message buffer, at x0, and stores the word in word 0 of the shared page,
-// so that word holds 1 when the buffer read as zero and took the write;
-// then exits.
-.global el0_buffer_mark
-el0_buffer_mark:
-    ldr     x1, [x0]
-    add     x1, x1, #1
-    str     x1, [x0]
-    ldr     x1, [x0]
-    mov     x2, #DATA_VA
-    str     x1, [x2]
-    svc     #CALL_THREAD_EXIT
-
-// thread_start of the thread in x0, then handle_close of x0 and of x1.
-// Ends with the last call's x0.
-.global el0_start_then_close
-el0_start_then_close:
-    mov     x19, x0
-    mov     x20, x1
-    svc     #CALL_THREAD_START
-    cbnz    x0, 1f
-    mov     x0, x19
-    svc     #CALL_HANDLE_CLOSE
-    cbnz    x0, 1f
-    mov     x0, x20
-    svc     #CALL_HANDLE_CLOSE
-1:  svc     #SVC_DONE
-
 // Channel tests (ktest::el0).
 
 // receive(x0 channel, x1 flags); the kernel judges its result.
 .global el0_receive
 el0_receive:
     svc     #CALL_RECEIVE
-    svc     #SVC_DONE
-
-// notify(x0 channel, x1 bits); the kernel judges its result.
-.global el0_notify
-el0_notify:
-    svc     #CALL_NOTIFY
     svc     #SVC_DONE
 
 // receive(x0 channel, x1 flags), then thread_exit: the result stays in
@@ -413,78 +343,6 @@ el0_serve:
     mov     x1, x19
     svc     #CALL_REPLY
 1:  svc     #SVC_DONE
-
-// As el0_serve, with receive(x2 another channel, 0) between the request
-// and the reply: the service holds the request until a peer notifies it.
-// Ends with the last call's x0.
-.global el0_serve_after_notice
-el0_serve_after_notice:
-    mov     x12, x2
-    mov     x1, #0
-    svc     #CALL_RECEIVE
-    cbnz    x0, 1f
-    mov     x19, x1
-    mov     x20, x2
-    mov     x21, x3
-    mov     x22, x4
-    mov     x23, x5
-    mov     x24, x6
-    mov     x25, x7
-    mov     x26, x8
-    mov     x27, x9
-    mov     x28, x10
-    mov     x29, x11
-    mov     x0, x12
-    mov     x1, #0
-    svc     #CALL_RECEIVE
-    cbnz    x0, 1f
-    mov     x0, x29
-    mov     x1, x19
-    mov     x2, x20
-    mov     x3, x21
-    mov     x4, x22
-    mov     x5, x23
-    mov     x6, x24
-    mov     x7, x25
-    mov     x8, x26
-    mov     x9, x27
-    svc     #CALL_REPLY
-1:  svc     #SVC_DONE
-
-// reply(x0 token, x1 description), then notify(x2 channel, x3 bits).
-// Ends with reply's x0 in x19 and notify's in x0.
-.global el0_reply_then_notify
-el0_reply_then_notify:
-    mov     x20, x2
-    mov     x21, x3
-    svc     #CALL_REPLY
-    mov     x19, x0
-    mov     x0, x20
-    mov     x1, x21
-    svc     #CALL_NOTIFY
-    svc     #SVC_DONE
-
-// thread_set_priority(x0 own thread, x1 priority, FIFO), then
-// thread_set_priority(x2 another thread, x3 priority, FIFO), then
-// send(x4 channel, an empty request). Ends with the first call's x0 in
-// x19, the second's in x20 and the reply in x0-x9.
-.global el0_raise_then_send
-el0_raise_then_send:
-    mov     x21, x2
-    mov     x22, x3
-    mov     x23, x4
-    mov     x2, #FIFO
-    svc     #CALL_THREAD_SET_PRIORITY
-    mov     x19, x0
-    mov     x0, x21
-    mov     x1, x22
-    mov     x2, #FIFO
-    svc     #CALL_THREAD_SET_PRIORITY
-    mov     x20, x0
-    mov     x0, x23
-    mov     x1, #0
-    svc     #CALL_SEND
-    svc     #SVC_DONE
 
 // The departure of a side (ktest::el0).
 
@@ -836,5 +694,44 @@ el0_measure:
     mov     x1, x25
     svc     #CALL_SEND
     ret
+
+// Long calls of memory objects (ktest::el0).
+
+// mem_create(x0 size, 0); with its handle, mem_map(x1 own process, the
+// object, 0, x0, x2 address, RW), mem_protect(x1, x2, x0, R),
+// mem_unmap(x1, x2, x0), then handle_close of the object. Ends with the
+// x0 of each call in x20-x24.
+.global el0_long_calls
+el0_long_calls:
+    mov     x19, x0
+    mov     x25, x1
+    mov     x26, x2
+    mov     x1, #0
+    svc     #CALL_MEM_CREATE
+    mov     x20, x0
+    mov     x27, x1
+    mov     x0, x25
+    mov     x1, x27
+    mov     x2, #0
+    mov     x3, x19
+    mov     x4, x26
+    mov     x5, #READ_WRITE
+    svc     #CALL_MEM_MAP
+    mov     x21, x0
+    mov     x0, x25
+    mov     x1, x26
+    mov     x2, x19
+    mov     x3, #READ
+    svc     #CALL_MEM_PROTECT
+    mov     x22, x0
+    mov     x0, x25
+    mov     x1, x26
+    mov     x2, x19
+    svc     #CALL_MEM_UNMAP
+    mov     x23, x0
+    mov     x0, x27
+    svc     #CALL_HANDLE_CLOSE
+    mov     x24, x0
+    svc     #SVC_DONE
 
 el0_programs_end:

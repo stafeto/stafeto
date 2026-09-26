@@ -47,9 +47,12 @@ unsafe impl TableMemory for FrameTables<'_> {
         unsafe { LinearMem::new() }.read(pa)
     }
 
+    /// One 64-bit store, which the compiler may neither split nor merge:
+    /// the table walker never sees half a descriptor (spec 7.2).
     fn write(&mut self, pa: u64, value: u64) {
-        // SAFETY: as in `read`.
-        unsafe { LinearMem::new() }.write(pa, value)
+        // SAFETY: as in `read`; the linear map holds all RAM, and the word
+        // is aligned.
+        unsafe { ((LINEAR_BASE + pa as usize) as *mut u64).write_volatile(value) }
     }
 }
 

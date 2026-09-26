@@ -96,6 +96,22 @@ pub const CHANNEL_RIGHTS: Rights = Rights(
         | Rights::TRANSFER.0,
 );
 
+/// Rights of the handle that `mem_create` returns (spec 5.2, 7.3): the
+/// three rights of mapping, DUPLICATE and TRANSFER. A memory object has no
+/// MANAGE: nothing is done with it but mappings and transfers.
+pub const MEMORY_RIGHTS: Rights = Rights(
+    Rights::MAP_READ.0
+        | Rights::MAP_WRITE.0
+        | Rights::MAP_EXEC.0
+        | Rights::DUPLICATE.0
+        | Rights::TRANSFER.0,
+);
+
+/// Rights of init's handle to the boot image (spec 13.1, 13.3): a memory
+/// object that maps read-only and travels, never written or run in place.
+pub const INIT_BOOT_IMAGE_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+
 /// Rights of init's handle to the system resource (spec 13.3).
 pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
     Rights::DEVICE.0
@@ -110,9 +126,8 @@ pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
 pub const INIT_RESOURCE: Handle = Handle::new(0, 1);
 pub const INIT_PROCESS: Handle = Handle::new(1, 1);
 pub const INIT_THREAD: Handle = Handle::new(2, 1);
-/// Kept for the boot image, a memory object from milestone 1.3 on. Until
-/// then the entry is freed at once: the value is BAD_HANDLE and never
-/// names another object.
+/// The boot image as a memory object over its frames, whole pages, with
+/// INIT_BOOT_IMAGE_RIGHTS.
 pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 
 /// The first handle of a process that `process_create` made (spec 13.3):
@@ -128,6 +143,53 @@ pub const MAX_THREADS: u32 = 64;
 /// Timers one process pays for, at most (spec 10): `timer_create` past it
 /// fails with LIMIT_REACHED.
 pub const MAX_TIMERS: u32 = 64;
+
+/// Mappings of one process, at most (spec 7.4): `mem_map` past it fails
+/// with LIMIT_REACHED.
+pub const MAX_MAPPINGS: u32 = 64;
+
+/// Bytes of the largest memory object (spec 7.3): `mem_create` takes whole
+/// pages from one page to this, 1 GiB.
+pub const MAX_MEMORY: u64 = 1 << 30;
+
+/// What a mapping lets a program do with its pages (spec 7.4): read, read
+/// and write, or read and execute. A register holds the sum of the bits
+/// R = 1, W = 2 and X = 4; write and execute together (W^X) and every
+/// other value are refused with INVALID_ARGS.
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Read = 1,
+    ReadWrite = 3,
+    ReadExec = 5,
+}
+
+impl Access {
+    /// The access a register holds; None for any other value.
+    pub const fn from_raw(raw: u64) -> Option<Access> {
+        match raw {
+            1 => Some(Access::Read),
+            3 => Some(Access::ReadWrite),
+            5 => Some(Access::ReadExec),
+            _ => None,
+        }
+    }
+
+    /// The value for a register.
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+
+    /// The rights of a memory object's handle a mapping with this access
+    /// needs (spec 5.2): MAP_READ, with MAP_WRITE for W and MAP_EXEC for X.
+    pub const fn rights(self) -> Rights {
+        match self {
+            Access::Read => Rights::MAP_READ,
+            Access::ReadWrite => Rights::MAP_READ.union(Rights::MAP_WRITE),
+            Access::ReadExec => Rights::MAP_READ.union(Rights::MAP_EXEC),
+        }
+    }
+}
 
 /// Top of the stack of init's first thread (spec 13.3). The kernel maps the
 /// stack the boot image asks for right under it, with an unmapped guard
@@ -546,6 +608,9 @@ pub const INFO_PROCESS_HANDLES: u64 = 3;
 /// KERNEL_STATS takes the system resource with KSTATS and returns
 /// `KernelStats::to_words` in x1-x8.
 pub const INFO_KERNEL_STATS: u64 = 4;
+/// MEMORY takes a memory object's handle, with no right needed, and
+/// returns `MemoryInfo::to_words` in x1-x3.
+pub const INFO_MEMORY: u64 = 5;
 
 /// A process's memory quota (spec 7.5), in bytes: the limit its parent
 /// gave it, what is charged to it now, and what went back to the parent.
@@ -571,6 +636,32 @@ impl ProcessMemory {
             quota: words[0],
             used: words[1],
             returned: words[2],
+        }
+    }
+}
+
+/// A memory object (spec 7.3, 11): its size in bytes, the pages whose
+/// frames it owns, every page of an object `mem_create` made, and the
+/// mappings of it now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryInfo {
+    pub size: u64,
+    pub pages: u64,
+    pub mappings: u64,
+}
+
+impl MemoryInfo {
+    /// The words `object_info` returns in x1-x3.
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.size, self.pages, self.mappings]
+    }
+
+    /// The object from x1-x3 of `object_info`.
+    pub const fn from_words(words: [u64; 3]) -> MemoryInfo {
+        MemoryInfo {
+            size: words[0],
+            pages: words[1],
+            mappings: words[2],
         }
     }
 }
@@ -616,8 +707,8 @@ pub struct KernelStats {
     pub irq_latency: u64,
     /// Objects in the cleanup queue now.
     pub cleanup_queue: u64,
-    /// The longest portion of cleanup so far, in ticks: what one portion
-    /// adds to the blocking of any thread (spec 7.7).
+    /// The longest portion of cleanup or of a long call so far, in ticks:
+    /// what one portion adds to the blocking of any thread (spec 7.7).
     pub longest_portion: u64,
     /// Free frames of the frame allocator.
     pub free_frames: u64,
@@ -939,6 +1030,18 @@ mod tests {
             CHANNEL_RIGHTS,
             Rights::SEND | Rights::NOTIFY | Rights::RECEIVE | Rights::DUPLICATE | Rights::TRANSFER
         );
+        assert_eq!(
+            MEMORY_RIGHTS,
+            Rights::MAP_READ
+                | Rights::MAP_WRITE
+                | Rights::MAP_EXEC
+                | Rights::DUPLICATE
+                | Rights::TRANSFER
+        );
+        assert_eq!(
+            INIT_BOOT_IMAGE_RIGHTS,
+            Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER
+        );
     }
 
     #[test]
@@ -996,6 +1099,23 @@ mod tests {
     #[test]
     fn timers_have_a_fixed_bound() {
         assert_eq!(MAX_TIMERS, 64);
+    }
+
+    #[test]
+    fn mappings_have_a_fixed_bound_and_three_accesses() {
+        assert_eq!(MAX_MAPPINGS, 64);
+        let accesses = [
+            (Access::Read, 1, Rights::MAP_READ),
+            (Access::ReadWrite, 3, Rights::MAP_READ | Rights::MAP_WRITE),
+            (Access::ReadExec, 5, Rights::MAP_READ | Rights::MAP_EXEC),
+        ];
+        for (access, raw, rights) in accesses {
+            assert_eq!((access.raw(), access.rights()), (raw, rights));
+            assert_eq!(Access::from_raw(raw), Some(access));
+        }
+        for raw in [0, 2, 4, 6, 7, 8, 1 << 32 | 1, u64::MAX] {
+            assert_eq!(Access::from_raw(raw), None, "{raw:#x}");
+        }
     }
 
     #[test]
@@ -1082,6 +1202,18 @@ mod tests {
         };
         assert_eq!(handles.to_words(), [5, 1, 16]);
         assert_eq!(ProcessHandles::from_words(handles.to_words()), handles);
+    }
+
+    #[test]
+    fn memory_info_travels_in_three_words() {
+        assert_eq!((INFO_MEMORY, MAX_MEMORY), (5, 1 << 30));
+        let info = MemoryInfo {
+            size: 3 << 12,
+            pages: 3,
+            mappings: 1,
+        };
+        assert_eq!(info.to_words(), [3 << 12, 3, 1]);
+        assert_eq!(MemoryInfo::from_words(info.to_words()), info);
     }
 
     #[test]
