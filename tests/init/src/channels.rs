@@ -6,6 +6,7 @@
 
 use crate::harness::*;
 use crate::processes::caller_ceiling;
+use crate::transfers::close_raw;
 
 /// The tests of this module, in the order they run.
 pub(crate) const TESTS: [Test; 26] = [
@@ -216,7 +217,7 @@ fn notifications_merge_bits_and_count() -> Outcome {
     let posted = [0b001, 0b100, 0b100 | 1 << 40]
         .into_iter()
         .try_for_each(|bits| sys::notify(&c, bits));
-    let got = receive_x0_to_x11(c.raw(), 0x5A, 0x5B);
+    let got = receive_x0_to_x11(c.raw(), abi::NO_WAIT, 0x5A, 0x5B);
     let rest = sys::try_receive(&c);
     close(c)?;
     check(posted.is_ok(), "notify failed")?;
@@ -236,12 +237,11 @@ fn notifications_merge_bits_and_count() -> Outcome {
     )
 }
 
-/// receive with NO_WAIT through `h`, with `x10` and `x11` in x10 and x11:
-/// x0-x11 as the kernel left them (spec 11).
-fn receive_x0_to_x11(h: abi::Handle, x10: u64, x11: u64) -> [u64; 12] {
-    let mut x = [0; 12];
-    x[..2].copy_from_slice(&[h.0, abi::NO_WAIT]);
-    x[10..].copy_from_slice(&[x10, x11]);
+/// receive with `flags` through `h`, with `x10` and `x11` in x10 and x11:
+/// x0-x11 as the kernel left them (spec 11), with no check of rt.
+#[inline(always)]
+pub(crate) fn receive_x0_to_x11(h: abi::Handle, flags: u64, x10: u64, x11: u64) -> [u64; 12] {
+    let mut x = [h.0, flags, 0, 0, 0, 0, 0, 0, 0, 0, x10, x11];
     // SAFETY: receive uses no memory of the program and changes x0-x11
     // only.
     unsafe {
@@ -341,7 +341,10 @@ extern "C" fn receive_twice(h: u64) -> ! {
         }
         Err(e) => MARKS[0].store(e.code(), Relaxed),
     }
-    if sys::try_receive(&c) == Err(Error::WouldBlock) {
+    // A raw call: once init closed the channel, BAD_HANDLE comes back.
+    let mut x = [0; 10];
+    x[..2].copy_from_slice(&[h, abi::NO_WAIT]);
+    if raw_receive(x)[0] == Error::WouldBlock.code() {
         MARKS[3].store(1, Relaxed);
     }
     sys::thread_exit()
@@ -1075,7 +1078,7 @@ fn start_channel_moves_into_the_child() -> Outcome {
     // The exit channel closes with nothing queued: the stage Close has
     // nothing to take, and the exit notification finds it closed.
     close(exits)?;
-    let gone = Handle::<Channel>::from_raw(moved).close();
+    let gone = close_raw(moved);
     let table = sys::process_handles(&child);
     let open = sys::notify(&n, 1);
     let killed = sys::process_kill(&child);
@@ -1154,7 +1157,7 @@ fn client_gone_when_the_child_dies() -> Outcome {
     let x = create_regs(name.raw(), QUIET.into(), name.raw());
     let after = raw_create(x);
     let made = after[0] == 0 && after[2..] == x[2..];
-    let moved = name.close();
+    let moved = close_raw(name.into_raw());
     let child = Handle::<Process>::from_raw(abi::Handle(after[1]));
     let killed = sys::process_kill(&child);
     let got = [(); 3].map(|()| sys::try_receive(&exits));

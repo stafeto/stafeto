@@ -112,7 +112,8 @@ impl<K> Handle<K> {
 }
 
 impl<K> Drop for Handle<K> {
-    /// handle_close; what it returns is not looked at.
+    /// handle_close; what it returns is not looked at, but BAD_HANDLE
+    /// panics in a strict build, as from any typed call (sys).
     fn drop(&mut self) {
         let _ = sys::close_raw(self.raw);
     }

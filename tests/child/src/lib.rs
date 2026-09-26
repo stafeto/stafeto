@@ -212,10 +212,22 @@ pub enum Role {
     /// RECEIVE and TRANSFER in BIND, and after the reply waits in a request that
     /// no reply answers without taking the notification.
     Rtc = 26,
+    /// Handle 0 the system resource with DEBUG, its console. Notifies
+    /// through the value of a channel it made and closed: in the strict
+    /// build of the test images BAD_HANDLE panics (spec 5.4), the panic
+    /// names the call, and the child ends with abi::PANIC_EXIT_CODE; it
+    /// ends with the code of the error otherwise.
+    BadHandle = 27,
+    /// Handle 0 the system resource with DEBUG, its console. Makes a
+    /// channel, takes its value a second time with Handle::from_raw,
+    /// closes the channel and drops the second handle: in the strict build
+    /// the drop's BAD_HANDLE panics and names handle_close; it ends with 0
+    /// otherwise.
+    DoubleClose = 28,
 }
 
 impl Role {
-    pub const ALL: [Role; 26] = [
+    pub const ALL: [Role; 28] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -242,6 +254,8 @@ impl Role {
         Role::Service,
         Role::Provider,
         Role::Rtc,
+        Role::BadHandle,
+        Role::DoubleClose,
     ];
 
     /// The role whose code is `code`.

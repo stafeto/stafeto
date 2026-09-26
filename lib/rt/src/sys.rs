@@ -12,7 +12,10 @@
 //! (`Handle`), and the token of a request, which answers it once
 //! (`Token`). A send or a reply with handles takes them, and gives them
 //! back when the kernel left them in the caller's table (`Refused`); the
-//! handles of a message that came wait in an `Incoming`.
+//! handles of a message that came wait in an `Incoming`. In a strict build
+//! (debug assertions, the profile `checked` of the test images) BAD_HANDLE
+//! from a typed call, the close of a dropped handle among them, is a bug
+//! of the program and panics (spec 5.4); `raw` returns it as it is.
 
 use crate::handle::{
     Any, Channel, Handle, Incoming, Interrupt, Memory, Process, Resource, Thread, Timer,
@@ -31,7 +34,8 @@ pub type Regs = [u64; 10];
 /// System call `N` with `x` in x0-x9; returns x0-x9 as the kernel left
 /// them. x10 and x11 count as changed, which `receive` does when it takes
 /// something (spec 11). No number is refused here: the kernel fails an
-/// unknown one with INVALID_ARGS.
+/// unknown one with INVALID_ARGS. An error comes back in x0 in every
+/// build, BAD_HANDLE too.
 ///
 /// # Safety
 /// A call can make the kernel run code or use memory of the program
@@ -65,7 +69,7 @@ pub unsafe fn raw<const N: u16>(x: Regs) -> Regs {
 
 /// Call `N` with `args` in x0 and up and zero in the rest: x0-x9 on
 /// success, the error otherwise, `Error::Unknown` for a code of a later
-/// kernel.
+/// kernel; BAD_HANDLE panics in a strict build (`strict`).
 fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let mut x = [0; 10];
     x[..args.len()].copy_from_slice(args);
@@ -75,7 +79,26 @@ fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let x = unsafe { raw::<N>(x) };
     match Error::from_code(x[0]) {
         None => Ok(x),
-        Some(e) => Err(e),
+        Some(e) => Err(strict::<N>(e)),
+    }
+}
+
+/// The error `e` of typed call `N`: with debug assertions BAD_HANDLE
+/// panics and names the call (spec 5.4); without them, and for any other
+/// error, `e` comes back.
+fn strict<const N: u16>(e: Error) -> Error {
+    if cfg!(debug_assertions) && e == Error::BadHandle {
+        bad_handle(N);
+    }
+    e
+}
+
+#[cold]
+#[inline(never)]
+fn bad_handle(number: u16) -> ! {
+    match Call::from_number(number) {
+        Some(call) => panic!("BAD_HANDLE from {call:?}"),
+        None => panic!("BAD_HANDLE from call {number}"),
     }
 }
 
@@ -729,7 +752,7 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
         )
     };
     if let Some(e) = Error::from_code(x[0]) {
-        return Err(e);
+        return Err(strict::<{ Call::Receive.number() }>(e));
     }
     let words: [u64; 11] = x[1..].try_into().expect("x1-x11");
     if Source::from_code((words[0] >> SOURCE_SHIFT) & 0xF) == Source::Message {

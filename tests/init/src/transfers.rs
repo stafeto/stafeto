@@ -422,9 +422,14 @@ pub(crate) extern "C" fn handle_client(slot: u64) -> ! {
     sys::thread_exit()
 }
 
-/// handle_close with the value `h`, for values that must be bad.
+/// handle_close with the value `h` through a raw call, for values that
+/// must be bad: BAD_HANDLE comes back in the strict build too.
 pub(crate) fn close_raw(h: abi::Handle) -> Result<(), Error> {
-    Handle::<Channel>::from_raw(h).close()
+    let mut x = [0; 10];
+    x[0] = h.0;
+    // SAFETY: handle_close only reads x0.
+    let after = unsafe { sys::raw::<{ Call::HandleClose.number() }>(x) };
+    Error::from_code(after[0]).map_or(Ok(()), Err)
 }
 
 /// Whether each of `handles` is gone: closing it is BAD_HANDLE.

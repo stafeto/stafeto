@@ -3,15 +3,17 @@
 
 //! Tests of the runtime, lib/rt, on top of the calls (spec 5.4, 6.1,
 //! 13.2): handles that own their entry of the table, the handles of a
-//! message, and init's first handles.
+//! message, init's first handles, and the strict build of the test
+//! images, where BAD_HANDLE from a typed call panics.
 
 use crate::channels::{take_one, unlabeled};
 use crate::harness::*;
 use crate::messages::answer_all;
+use crate::processes::{Gift, ran};
 use crate::transfers::{close_raw, copy_raw, give, handle_client};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 7] = [
+pub(crate) const TESTS: [Test; 10] = [
     ("dropped_handle_closes", dropped_handle_closes),
     ("into_raw_keeps_the_handle", into_raw_keeps_the_handle),
     ("borrowed_handle_stays_open", borrowed_handle_stays_open),
@@ -25,6 +27,18 @@ pub(crate) const TESTS: [Test; 7] = [
         refused_send_gives_the_handles_back,
     ),
     ("take_checks_the_kind", take_checks_the_kind),
+    (
+        "strict_child_panics_on_bad_handle",
+        strict_child_panics_on_bad_handle,
+    ),
+    (
+        "strict_child_panics_on_a_double_close",
+        strict_child_panics_on_a_double_close,
+    ),
+    (
+        "raw_call_returns_bad_handle_in_a_strict_build",
+        raw_call_returns_bad_handle_in_a_strict_build,
+    ),
 ];
 
 /// Init's live handles (PROCESS_HANDLES).
@@ -233,4 +247,47 @@ fn take_checks_the_kind() -> Outcome {
         "the channel was not there to take after the wrong kind",
     )?;
     check(replied && ended(0), "the client did not get the reply")
+}
+
+/// Why a child that panicked ended.
+const PANICKED: ProcessState = ProcessState::Exited {
+    code: abi::PANIC_EXIT_CODE,
+};
+
+/// Spec 5.4: in the strict build of the test images BAD_HANDLE from a
+/// typed call panics: a child that notifies through the value of a
+/// channel it closed ends with abi::PANIC_EXIT_CODE, and its panic, which
+/// xtask finds whole, names notify.
+fn strict_child_panics_on_bad_handle() -> Outcome {
+    check(
+        ran(Role::BadHandle, &[], &[Gift::Debug]) == Ok(PANICKED),
+        "a child of the strict build went on after BAD_HANDLE",
+    )
+}
+
+/// Spec 5.4: the close of a dropped handle panics on BAD_HANDLE as a
+/// typed call does: a child that closes a channel and then drops a second
+/// handle with its value ends with abi::PANIC_EXIT_CODE, and its panic
+/// names handle_close.
+fn strict_child_panics_on_a_double_close() -> Outcome {
+    check(
+        ran(Role::DoubleClose, &[], &[Gift::Debug]) == Ok(PANICKED),
+        "a child of the strict build closed a handle twice without a panic",
+    )
+}
+
+/// Spec 5.4: sys::raw returns BAD_HANDLE in the strict build too: the
+/// test init, a strict build itself, closes the value of a handle it
+/// closed through a raw call and gets the code in x0 alone.
+fn raw_call_returns_bad_handle_in_a_strict_build() -> Outcome {
+    const N: u16 = Call::HandleClose.number();
+    check(
+        cfg!(debug_assertions),
+        "the test init is not a strict build",
+    )?;
+    let gone = closed_handle()?;
+    check(
+        x0_alone::<N>(&[gone], Error::BadHandle.code()),
+        "a raw call with a closed handle did not return BAD_HANDLE in x0 alone",
+    )
 }

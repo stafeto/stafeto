@@ -253,6 +253,14 @@ fn run(s: &Start) -> u64 {
         Role::Service => service(s).unwrap_or(FAILED),
         Role::Provider => provide(s).unwrap_or(FAILED),
         Role::Rtc => drive(s).unwrap_or(FAILED),
+        Role::BadHandle | Role::DoubleClose => {
+            rt::console::set(Handle::<Resource>::from_raw(s.handles[0]));
+            let strict = match s.role {
+                Role::BadHandle => bad_handle(),
+                _ => double_close(),
+            };
+            strict.unwrap_or(FAILED)
+        }
     }
 }
 
@@ -725,4 +733,24 @@ fn drive(s: &Start) -> Result<u64, Error> {
     ];
     sys::send(&parent(), &abi::inline_bytes(&words)[..5 * 8])?;
     Ok(FAILED)
+}
+
+/// Role::BadHandle.
+fn bad_handle() -> Result<u64, Error> {
+    let gone = sys::channel_create(1)?;
+    let value = gone.raw();
+    gone.close()?;
+    match sys::notify(&Handle::<Channel>::borrowed(value), 1) {
+        Ok(()) => Ok(FAILED),
+        Err(e) => Ok(e.code()),
+    }
+}
+
+/// Role::DoubleClose.
+fn double_close() -> Result<u64, Error> {
+    let c = sys::channel_create(1)?;
+    let twin = Handle::<Channel>::from_raw(c.raw());
+    c.close()?;
+    drop(twin);
+    Ok(0)
 }

@@ -25,5 +25,13 @@ opt-level = 2
 [profile.release.package.kcore]
 opt-level = 2
 
+# Spec 5.4, 15.2: the programs of the test images build in the strict
+# build of rt, release with debug assertions, where BAD_HANDLE from a
+# typed call or a drop panics; the boot image that ships builds with
+# --release.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+
 [profile.dev]
 panic = "abort"

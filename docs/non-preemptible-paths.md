@@ -188,10 +188,12 @@ bounds in time come from hardware (spec 15.3). An empty cell is a path not
 measured yet. Counts marked "test build" come from the kernel's own tests
 under -icount, whose hooks change the shape of the code. The build that
 ships is measured by the test init under -icount, which prints
-`normal build ticks: null=250 clock=334 yield=374 notify=886
-round_trip=2122`: call 0, `clock_now`, `yield` with no other thread at
+`normal build ticks: null=250 clock=316 yield=360 notify=848
+round_trip=1773`: call 0, `clock_now`, `yield` with no other thread at
 the caller's level, `notify` with the `try_receive` that takes the slot
-back, and a round trip of 8 bytes to a thread of the same process. The
+back, and a round trip of 8 bytes to a thread of the same process. Both
+sides make raw calls, so the line counts the kernel and not the code of
+`rt` or the profile the test init builds with. The
 kernel test `ipc_round_trip_is_measured` prints the round trip of a
 request in the test build, `ipc round trip ticks: null=248 switch=452
 fast=1895 slow=2093 buffer=2993 handles=4295`: an empty call, one switch between

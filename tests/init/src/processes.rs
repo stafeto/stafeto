@@ -144,6 +144,9 @@ const THREADS_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
 /// A child that runs Role::Ceiling: pages of its pools of channels,
 /// sessions and shells more, and a page for its table.
 const CEILING_QUOTA: u64 = LEAF_QUOTA + 4 * PAGE as u64;
+/// A child that makes a channel of its own (Role::BadHandle,
+/// Role::DoubleClose): a page of its pool of channels more.
+const CHANNEL_QUOTA: u64 = LEAF_QUOTA + PAGE as u64;
 /// A child that runs Role::Service needs no more than a leaf: it maps the
 /// object that comes to it at child::SHARED, under the table of its
 /// program, and the 3 pages a mapping pays ahead for are a leaf's.
@@ -518,6 +521,7 @@ pub(crate) fn quota_of(role: Role) -> u64 {
         Role::Ceiling => CEILING_QUOTA,
         Role::Service => SERVICE_QUOTA,
         Role::Provider => PROVIDER_QUOTA,
+        Role::BadHandle | Role::DoubleClose => CHANNEL_QUOTA,
         _ => LEAF_QUOTA,
     }
 }

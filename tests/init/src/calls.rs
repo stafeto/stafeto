@@ -5,7 +5,9 @@
 //! creating and killing processes and of object information (spec 7.5,
 //! 8, 11, 13.3, 13.4).
 
-use crate::channels::{exit_channel, exit_notice, heard_child, take_one, wait_exit};
+use crate::channels::{
+    exit_channel, exit_notice, heard_child, receive_x0_to_x11, take_one, wait_exit,
+};
 use crate::harness::*;
 use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
@@ -1499,15 +1501,17 @@ const COST_BYTES: [u8; 8] = *b"measured";
 /// taken off: the call with number 0, which no call has (null),
 /// clock_now, yield with no other thread at init's level, notify and
 /// try_receive on a channel of init, and a round trip of send and reply
-/// with 8 bytes to a thread of init's own process above init. Under
-/// -icount, where a tick is an instruction, it prints them on one line
-/// for xtask; elsewhere the numbers mean little and it prints nothing.
-/// It fails only when a call fails, never on a number.
+/// with 8 bytes to a thread of init's own process above init. Both sides
+/// make raw calls (sys::raw), so the numbers are the kernel's alone,
+/// whatever the profile and the code of rt. Under -icount, where a tick
+/// is an instruction, it prints them on one line for xtask; elsewhere the
+/// numbers mean little and it prints nothing. It fails only when a call
+/// fails, never on a number.
 fn normal_build_costs() -> Outcome {
     let c = channel(QUIET)?;
     let s = channel(QUIET)?;
     let t = spawn(0, echo_until_empty, s.raw().0, HIGH, Policy::Fifo)?;
-    let costs = costs(&c, &s);
+    let costs = costs(c.raw(), s.raw());
     let stopped = sys::send(&s, &[]).is_ok();
     close(t)?;
     close(s)?;
@@ -1522,22 +1526,27 @@ fn normal_build_costs() -> Outcome {
     Ok(())
 }
 
-/// The rows of `normal_build_costs`, in the order of its line.
-fn costs(c: &Handle<Channel>, s: &Handle<Channel>) -> Result<[u64; 5], &'static str> {
+/// The rows of `normal_build_costs`, in the order of its line, through
+/// raw calls on channels `c` and `s`.
+fn costs(c: abi::Handle, s: abi::Handle) -> Result<[u64; 5], &'static str> {
+    let ok = |x: Regs| x[0] == 0;
+    let mut notify = [0; 10];
+    notify[..2].copy_from_slice(&[c.0, 1]);
+    let mut request = [0; 10];
+    request[..2].copy_from_slice(&[s.0, COST_BYTES.len() as u64]);
+    request[2..].copy_from_slice(&abi::inline_words(&COST_BYTES));
     let empty = least(&mut || true)?;
+    // SAFETY, for each raw call below: none of them runs code of the
+    // program or uses its memory; the kernel changes x0-x9 alone.
     let rows = [
+        least(&mut || unsafe { sys::raw::<0>([0; 10]) }[0] == Error::InvalidArgs.code()),
+        least(&mut || ok(unsafe { sys::raw::<{ Call::ClockNow.number() }>([0; 10]) })),
+        least(&mut || ok(unsafe { sys::raw::<{ Call::Yield.number() }>([0; 10]) })),
         least(&mut || {
-            // SAFETY: no call has number 0; the kernel changes x0 alone.
-            let after = unsafe { sys::raw::<0>([0; 10]) };
-            after[0] == Error::InvalidArgs.code()
+            ok(unsafe { sys::raw::<{ Call::Notify.number() }>(notify) })
+                && receive_x0_to_x11(c, abi::NO_WAIT, 0, 0)[0] == 0
         }),
-        least(&mut || sys::clock_now().is_ok()),
-        least(&mut || sys::yield_now().is_ok()),
-        least(&mut || {
-            sys::notify(c, 1).is_ok()
-                && matches!(sys::try_receive(c), Ok(Received::Notification { .. }))
-        }),
-        least(&mut || sys::send(s, &COST_BYTES).is_ok()),
+        least(&mut || ok(unsafe { sys::raw::<{ Call::Send.number() }>(request) })),
     ];
     let mut costs = [0; 5];
     for (cost, row) in costs.iter_mut().zip(rows) {
@@ -1561,12 +1570,20 @@ fn least(round: &mut dyn FnMut() -> bool) -> Result<u64, &'static str> {
 }
 
 /// Replies to each request on channel `h` with its bytes, until a request
-/// with none, and ends.
+/// with none, and ends; raw calls on both sides of the round trip. The
+/// reply takes the request's registers as they came: x1, its length with
+/// no handles, and its bytes in x2-x9, with the token from x11.
 extern "C" fn echo_until_empty(h: u64) -> ! {
-    let c = Handle::<Channel>::borrowed(abi::Handle(h));
-    while let Ok(Received::Message { token, len, .. }) = sys::receive(&c) {
-        let replied = token.reply(&COST_BYTES[..len.min(COST_BYTES.len())]);
-        if len == 0 || replied.is_err() {
+    loop {
+        let x = receive_x0_to_x11(abi::Handle(h), 0, 0, 0);
+        if x[0] != 0 {
+            break;
+        }
+        let reply = [x[11], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9]];
+        // SAFETY: reply runs no code of the program and uses none of its
+        // memory for a reply of at most 64 bytes.
+        let replied = unsafe { sys::raw::<{ Call::Reply.number() }>(reply) };
+        if x[1] == 0 || replied[0] != 0 {
             break;
         }
     }
