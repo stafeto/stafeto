@@ -3,10 +3,10 @@
 
 //! init, the first program (spec 13.4), as milestone 1.2c has it: it
 //! prints from EL0, starts two round-robin threads at one level, which
-//! take turns as their quanta end, waits for them and exits; its exit
-//! turns the machine off. Nothing to wait on exists in 1.2c, so init waits
-//! by priority: it lowers itself below the threads and runs again only
-//! once both have ended.
+//! take turns as their quanta end, waits for them and exits; the kernel
+//! ends its exit with a panic that names the code (spec 7.9). Nothing to
+//! wait on exists in 1.2c, so init waits by priority: it lowers itself
+//! below the threads and runs again only once both have ended.
 
 #![no_std]
 #![no_main]

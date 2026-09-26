@@ -115,11 +115,6 @@ const VIRT_RAM: u64 = 0x4000_0000;
 /// The kernel's lines of the GIC on QEMU's GICv2 and GICv3 (spec 9).
 const GIC_V2_LINE: &str = "gic        v2 distributor 0x8000000, cpu interface 0x8010000";
 const GIC_V3_LINE: &str = "gic        v3 distributor 0x8000000, redistributor 0x80a0000";
-/// The kernel's last line when init exits with 0 (spec 7.9).
-const INIT_EXIT: &str = "init exited with code 0";
-/// The test init's exit under HVF, where one of its tests fails
-/// (qemu::hvf_verdict): its code is its count of failures.
-const INIT_EXIT_HOLE: &str = "init exited with code 1";
 /// The frequency of the counter of Apple's processors (CNTFRQ_EL0), which
 /// HVF passes on.
 const HVF_HZ: u64 = 24_000_000;
@@ -173,7 +168,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 214;
+const INIT_TESTS: u32 = 216;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -619,18 +614,18 @@ fn host_tests() -> Result<(), String> {
     ]))
 }
 
-/// Init on the normal build prints its lines and exits, and the kernel
-/// turns the machine off (spec 7.9).
+/// Init on the normal build prints its lines and exits with 0, which
+/// the kernel ends with a panic that names the code (spec 7.9).
 fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
     for line in INIT_LINES {
         qemu::expect_line(o, line)?;
     }
-    qemu::expect_clean_exit_with(o, INIT_EXIT)
+    qemu::expect_init_exit(o, "init: both threads are done", 0)
 }
 
 /// A normal build boots on machine `m`, prints its report (boot_report)
 /// with the line of the GIC, `gic`, and init's entry point from the boot
-/// image, starts init, and powers the machine off when init exits. Gives
+/// image, starts init, and panics when init exits (expect_init_run). Gives
 /// the timer's frequency. On VIRT_EL2 and VIRT_EL2_V3 the kernel is
 /// entered at EL2, as the PinePhone's loader does: head.S must drop to
 /// EL1, with a GICv3 open its system registers to EL1 first, and power-off
@@ -1024,7 +1019,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     }
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
-    qemu::counted_verdict(&o, &r)?;
+    qemu::counted_verdict(&o, &r, None)?;
     for name in ICOUNT_TESTS {
         if r.passed.iter().any(|p| p == name) != icount {
             return Err(format!(
@@ -1093,8 +1088,9 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// program (tests/child) as the second file of the boot image: each of its
 /// INIT_TESTS tests passes once, the lines it, its children and the kernel
 /// print for the tests come whole, CHILD_FAULTS children fault, and it
-/// exits with 0, which turns the machine off. Its first line says how long
-/// a counted loop took, which under -icount must be the loop's
+/// exits with 0, which the kernel ends with a panic that names the code
+/// (qemu::expect_init_exit after `TESTS DONE`). Its first line says how
+/// long a counted loop took, which under -icount must be the loop's
 /// instructions; there it also prints the costs of the build that ships
 /// (NORMAL_BUILD_ROWS), which fail nothing by their numbers (spec 15.3).
 /// Under HVF qemu::hvf_verdict judges the run: the test of a window on a
@@ -1114,7 +1110,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     if hvf {
         qemu::hvf_verdict(&o, &r)?;
     } else {
-        qemu::counted_verdict(&o, &r)?;
+        qemu::counted_verdict(&o, &r, Some(0))?;
     }
     if r.total != Some(INIT_TESTS) {
         return Err(format!(
@@ -1122,8 +1118,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
             r.total
         ));
     }
-    let exit = if hvf { INIT_EXIT_HOLE } else { INIT_EXIT };
-    for line in TEST_INIT_LINES.into_iter().chain([exit]) {
+    for line in TEST_INIT_LINES {
         qemu::expect_line(&o, line)?;
     }
     child_panic_comes_whole(&o.lines)?;

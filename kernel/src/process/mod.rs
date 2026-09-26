@@ -713,17 +713,15 @@ unsafe fn stop(process: NonNull<Process>, cause: u8) {
     }
 }
 
-/// Init ended (spec 7.9): until milestone 1.4 an exit ends the run and
-/// turns the machine off, while a fault or a kill stops it with a report,
-/// as a panic does. In test builds the running test judges init's end
-/// instead, and the tests go on (testpoint::init_ended).
+/// Init ended (spec 7.9): init lives for good, and any end of it is a
+/// panic. An exit panics with the line «init exited with code N», which
+/// xtask takes as the end of a run of the test init; a fault or a kill
+/// panics with its report. In test builds the running test judges init's
+/// end instead, and the tests go on (testpoint::init_ended).
 fn init_ended(state: ProcessState) -> ! {
     crate::testpoint::init_ended();
     match state {
-        ProcessState::Exited { code } => {
-            kprintln!("init exited with code {code}");
-            crate::psci::system_off()
-        }
+        ProcessState::Exited { code } => panic!("init exited with code {code}"),
         ProcessState::Fault { esr, far, elr } => {
             panic!("init terminated by a fault: ESR={esr:#x} FAR={far:#x} ELR={elr:#x}")
         }

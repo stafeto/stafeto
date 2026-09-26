@@ -12,8 +12,9 @@
 //! or reach, such as a caller's full table or the kernel's own state after
 //! a call. It prints `TEST <name> ok` or `TEST <name> FAIL <why>`
 //! for each test, then `TESTS DONE total=<n> failed=<m>`, and exits with
-//! the number of failures, which turns the machine off; xtask reads the
-//! lines.
+//! the number of failures; the kernel ends the run with a panic that names
+//! that code (spec 7.9). xtask reads the lines and takes that one panic
+//! after `TESTS DONE`, with the code it expects, as the end of the run.
 //!
 //! Its first line gives the counter ticks of a counted loop, which xtask
 //! checks in the runs under -icount. The first test runs with the

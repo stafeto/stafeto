@@ -482,22 +482,71 @@ pub fn parse_report(lines: &[String]) -> TestReport {
     r
 }
 
+/// A run that ends with init's exit with `code` (spec 7.9, 15.2): the
+/// output has exactly one line with KERNEL PANIC, the line after it is
+/// exactly `init exited with code <code>`, both come after the first line
+/// that starts with `after`, and the machine powered itself off in time
+/// with status 0.
+pub fn expect_init_exit(o: &Outcome, after: &str, code: u64) -> Result<(), String> {
+    expect_powered_off(o)?;
+    let panics: Vec<usize> = o
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("KERNEL PANIC"))
+        .map(|(i, _)| i)
+        .collect();
+    let &[at] = &panics[..] else {
+        return Err(format!(
+            "{} lines with KERNEL PANIC, one expected; last lines: {:?}",
+            panics.len(),
+            tail(&o.lines)
+        ));
+    };
+    let exit = format!("init exited with code {code}");
+    match o.lines.get(at + 1) {
+        Some(line) if *line == exit => {}
+        other => {
+            return Err(format!(
+                "the kernel panicked with {other:?} after {:?}, {exit:?} expected",
+                o.lines[at]
+            ));
+        }
+    }
+    match o.lines.iter().position(|l| l.starts_with(after)) {
+        Some(start) if start < at => Ok(()),
+        Some(_) => Err(format!("the kernel panicked before {after:?}")),
+        None => Err(format!(
+            "no line starts with {after:?}; last lines: {:?}",
+            tail(&o.lines)
+        )),
+    }
+}
+
 /// A run of tests in QEMU finished in time with status 0, some tests
-/// passed, none failed, the run said so in its `TESTS DONE` line, and the
-/// kernel did not panic: a panic powers the machine off with status 0 as
-/// well (spec 14).
-pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
+/// passed, none failed, and the run said so in its `TESTS DONE` line. A
+/// panic powers the machine off with status 0 as well (spec 14), so with
+/// no `exit` any line with KERNEL PANIC fails the run; a run of the test
+/// init ends with the panic of init's exit, and `exit` is its expected
+/// code (expect_init_exit after `TESTS DONE`). Failed tests are named
+/// first: the test init exits with their count.
+pub fn verdict(o: &Outcome, r: &TestReport, exit: Option<u64>) -> Result<(), String> {
     if o.timed_out {
         return Err(format!(
             "QEMU did not finish in time; last lines: {:?}",
             tail(&o.lines)
         ));
     }
-    if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
-        return Err(format!("the kernel panicked: {panic}"));
-    }
     if !r.failed.is_empty() {
         return Err(format!("{} test(s) failed: {:?}", r.failed.len(), r.failed));
+    }
+    match exit {
+        Some(code) => expect_init_exit(o, "TESTS DONE ", code)?,
+        None => {
+            if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
+                return Err(format!("the kernel panicked: {panic}"));
+            }
+        }
     }
     match r.done {
         Some(0) => {}
@@ -521,8 +570,8 @@ pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
 /// As `verdict`, for a run that counts its tests: it prints
 /// `TESTS DONE total=<n> ...`, and each of the n passed once. A test line
 /// that went missing in the output fails the run.
-pub fn counted_verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
-    verdict(o, r)?;
+pub fn counted_verdict(o: &Outcome, r: &TestReport, exit: Option<u64>) -> Result<(), String> {
+    verdict(o, r, exit)?;
     let total = r.total.ok_or("the run never said how many tests it has")?;
     let mut names = r.passed.clone();
     names.sort();
@@ -549,9 +598,10 @@ pub const HOLE_READS_ZERO: &str = "the child read the hole and did not fault";
 
 /// As `counted_verdict`, for a run of the test init under HVF (spec
 /// 15.2): HOLE_TEST fails with HOLE_READS_ZERO, the run counts that one
-/// failure, and every other test passes once. Any other failure, another
-/// reason, or HOLE_TEST passing fails the run: a QEMU that starts to
-/// inject the abort shows up here.
+/// failure, every other test passes once, and init exits with 1, its
+/// count of failures. Any other failure, another reason, or HOLE_TEST
+/// passing fails the run: a QEMU that starts to inject the abort shows up
+/// here.
 pub fn hvf_verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     let hole = (HOLE_TEST.to_string(), HOLE_READS_ZERO.to_string());
     if r.failed != [hole] || r.done != Some(1) {
@@ -564,7 +614,7 @@ pub fn hvf_verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     all.passed.push(HOLE_TEST.to_string());
     all.failed.clear();
     all.done = Some(0);
-    counted_verdict(o, &all)
+    counted_verdict(o, &all, Some(1))
 }
 
 /// Why `cargo xtask hvf` cannot run here, if it cannot (spec 14): the host
@@ -683,7 +733,7 @@ mod tests {
     fn hvf_verdict_accepts_only_the_hole() {
         let hole = format!("TEST {HOLE_TEST} FAIL {HOLE_READS_ZERO}");
         let run = |l: &[&str]| {
-            let o = finished(l);
+            let o = finished(&[l, &exit_panic(1)[..]].concat());
             hvf_verdict(&o, &parse_report(&o.lines))
         };
         let with_hole = ["TEST a ok", &hole, "TESTS DONE total=2 failed=1"];
@@ -709,6 +759,8 @@ mod tests {
             ])
             .is_err()
         );
+        let exits_with_0 = finished(&[&with_hole[..], &exit_panic(0)[..]].concat());
+        assert!(hvf_verdict(&exits_with_0, &parse_report(&exits_with_0.lines)).is_err());
     }
 
     #[test]
@@ -1032,7 +1084,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             timed_out: false,
             stopped_on_marker: false,
         };
-        assert!(verdict(&o, &parse_report(&o.lines)).is_ok());
+        assert!(verdict(&o, &parse_report(&o.lines), None).is_ok());
     }
 
     #[test]
@@ -1048,30 +1100,30 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ..base.clone()
         };
         let failed = with(&["TEST a FAIL x", "TESTS DONE failed=1"]);
-        assert!(verdict(&failed, &parse_report(&failed.lines)).is_err());
+        assert!(verdict(&failed, &parse_report(&failed.lines), None).is_err());
         let hung = Outcome {
             timed_out: true,
             status: None,
             ..with(&["TEST a ok"])
         };
-        assert!(verdict(&hung, &parse_report(&hung.lines)).is_err());
+        assert!(verdict(&hung, &parse_report(&hung.lines), None).is_err());
         let crashed = with(&["TEST a ok", "KERNEL PANIC: boom"]);
-        assert!(verdict(&crashed, &parse_report(&crashed.lines)).is_err());
+        assert!(verdict(&crashed, &parse_report(&crashed.lines), None).is_err());
         let empty = with(&["TESTS DONE failed=0"]);
-        assert!(verdict(&empty, &parse_report(&empty.lines)).is_err());
+        assert!(verdict(&empty, &parse_report(&empty.lines), None).is_err());
         let bad_status = Outcome {
             status: Some(ExitStatus::from_raw(1 << 8)),
             ..with(&["TEST a ok", "TESTS DONE failed=0"])
         };
-        assert!(verdict(&bad_status, &parse_report(&bad_status.lines)).is_err());
+        assert!(verdict(&bad_status, &parse_report(&bad_status.lines), None).is_err());
     }
 
     #[test]
     fn verdict_needs_the_tests_done_line() {
         let cut = finished(&["TEST a ok", "TEST b ok"]);
-        assert!(verdict(&cut, &parse_report(&cut.lines)).is_err());
+        assert!(verdict(&cut, &parse_report(&cut.lines), None).is_err());
         let done = finished(&["TEST a ok", "TEST b ok", "TESTS DONE failed=0"]);
-        assert!(verdict(&done, &parse_report(&done.lines)).is_ok());
+        assert!(verdict(&done, &parse_report(&done.lines), None).is_ok());
     }
 
     /// A panic powers the machine off with status 0 (spec 14), so only its
@@ -1083,7 +1135,10 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             "KERNEL PANIC while panicking; parking",
         ] {
             let o = finished(&["TEST a ok", "TESTS DONE failed=0", "", panic]);
-            assert!(verdict(&o, &parse_report(&o.lines)).is_err(), "{panic}");
+            assert!(
+                verdict(&o, &parse_report(&o.lines), None).is_err(),
+                "{panic}"
+            );
         }
     }
 
@@ -1094,6 +1149,121 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             timed_out: false,
             stopped_on_marker: false,
         }
+    }
+
+    /// The lines the kernel prints when init exits with `code` (spec
+    /// 7.9): an empty line, the panic with its place, the message, and
+    /// the start of the backtrace.
+    fn exit_panic(code: u64) -> [&'static str; 4] {
+        let exit = match code {
+            0 => "init exited with code 0",
+            1 => "init exited with code 1",
+            2 => "init exited with code 2",
+            _ => panic!("no line for code {code}"),
+        };
+        [
+            "",
+            "KERNEL PANIC: panicked at kernel/src/process/mod.rs:724:42:",
+            exit,
+            "backtrace (look up: lldb -b -o 'image lookup -a ADDR' target/stafeto.elf):",
+        ]
+    }
+
+    /// A report of one passed test, then `after`.
+    fn run_of(after: &[&str]) -> Outcome {
+        finished(&[&["TEST a ok", "TESTS DONE total=1 failed=0"][..], after].concat())
+    }
+
+    /// Spec 7.9, 15.2: the test init ends its run with its exit, a panic
+    /// whose next line names the code, and a run with the code expected
+    /// passes; another code, a machine that did not power itself off, or
+    /// a hang fails it.
+    #[test]
+    fn init_exit_ends_a_run_with_its_code() {
+        let judge = |o: &Outcome, code| counted_verdict(o, &parse_report(&o.lines), Some(code));
+        let exits = run_of(&exit_panic(0));
+        assert_eq!(judge(&exits, 0), Ok(()));
+        assert!(judge(&exits, 1).is_err());
+        assert_eq!(judge(&run_of(&exit_panic(1)), 1), Ok(()));
+        assert!(judge(&run_of(&exit_panic(2)), 0).is_err());
+        let failing = Outcome {
+            status: Some(ExitStatus::from_raw(1 << 8)),
+            ..exits.clone()
+        };
+        assert!(judge(&failing, 0).is_err());
+        let hung = Outcome {
+            status: None,
+            timed_out: true,
+            ..exits.clone()
+        };
+        assert!(judge(&hung, 0).is_err());
+    }
+
+    /// Spec 7.9, 14: only the panic of init's exit ends a run. A panic of
+    /// another kind, a second panic after the exit, and a panic that ends
+    /// the kernel tests (no exit expected) each fail the run.
+    #[test]
+    fn another_panic_still_fails_a_run() {
+        let judge = |o: &Outcome, exit| counted_verdict(o, &parse_report(&o.lines), exit);
+        let other = run_of(&[
+            "",
+            "KERNEL PANIC: panicked at kernel/src/sched.rs:1:1:",
+            "no thread to run",
+        ]);
+        assert!(judge(&other, Some(0)).is_err());
+        let twice = run_of(
+            &[
+                &exit_panic(0)[..],
+                &["KERNEL PANIC while panicking; parking"],
+            ]
+            .concat(),
+        );
+        assert!(judge(&twice, Some(0)).is_err());
+        assert!(judge(&run_of(&exit_panic(0)), None).is_err());
+    }
+
+    /// Spec 7.9: a run with no report ends with init's exit after its
+    /// own line, and only a machine that powered itself off in time
+    /// passes.
+    #[test]
+    fn init_exit_is_judged_after_its_line() {
+        let refused = "init: table refused: the connections make a cycle: a -> b -> a";
+        let run = finished(&[&[refused][..], &exit_panic(2)].concat());
+        let after = "init: table refused: ";
+        assert_eq!(expect_init_exit(&run, after, 2), Ok(()));
+        assert!(expect_init_exit(&run, after, 0).is_err());
+        assert!(expect_init_exit(&run, "init: services started", 2).is_err());
+        let early = finished(&[&exit_panic(2)[..], &[refused]].concat());
+        assert!(expect_init_exit(&early, after, 2).is_err());
+        let failing = Outcome {
+            status: Some(ExitStatus::from_raw(1 << 8)),
+            ..run.clone()
+        };
+        assert!(expect_init_exit(&failing, after, 2).is_err());
+        let hung = Outcome {
+            status: None,
+            timed_out: true,
+            ..run.clone()
+        };
+        assert!(expect_init_exit(&hung, after, 2).is_err());
+    }
+
+    /// Spec 15.2: the exit ends a run only after the report; a panic
+    /// before `TESTS DONE`, or with no `TESTS DONE` at all, fails it.
+    #[test]
+    fn a_panic_before_tests_done_fails_the_run() {
+        let judge = |o: &Outcome| counted_verdict(o, &parse_report(&o.lines), Some(0));
+        let early = finished(
+            &[
+                &["TEST a ok"][..],
+                &exit_panic(0),
+                &["TESTS DONE total=1 failed=0"],
+            ]
+            .concat(),
+        );
+        assert!(judge(&early).is_err());
+        let cut = finished(&[&["TEST a ok"][..], &exit_panic(0)].concat());
+        assert!(judge(&cut).is_err());
     }
 
     #[test]
@@ -1107,15 +1277,15 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     #[test]
     fn counted_verdict_needs_every_test_once() {
         let clean = finished(&["TEST a ok", "TEST b ok", "TESTS DONE total=2 failed=0"]);
-        assert!(counted_verdict(&clean, &parse_report(&clean.lines)).is_ok());
+        assert!(counted_verdict(&clean, &parse_report(&clean.lines), None).is_ok());
         let lost = finished(&["TEST a ok", "TESTS DONE total=2 failed=0"]);
-        assert!(counted_verdict(&lost, &parse_report(&lost.lines)).is_err());
+        assert!(counted_verdict(&lost, &parse_report(&lost.lines), None).is_err());
         let twice = finished(&["TEST a ok", "TEST a ok", "TESTS DONE total=2 failed=0"]);
-        assert!(counted_verdict(&twice, &parse_report(&twice.lines)).is_err());
+        assert!(counted_verdict(&twice, &parse_report(&twice.lines), None).is_err());
         let uncounted = finished(&["TEST a ok", "TESTS DONE failed=0"]);
-        assert!(counted_verdict(&uncounted, &parse_report(&uncounted.lines)).is_err());
+        assert!(counted_verdict(&uncounted, &parse_report(&uncounted.lines), None).is_err());
         let failed = finished(&["TEST a ok", "TEST b FAIL x", "TESTS DONE total=2 failed=1"]);
-        assert!(counted_verdict(&failed, &parse_report(&failed.lines)).is_err());
+        assert!(counted_verdict(&failed, &parse_report(&failed.lines), None).is_err());
     }
 
     #[test]
