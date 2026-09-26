@@ -11,6 +11,9 @@ use crate::memory::memory_object;
 use crate::messages::{raw_client, raw_reply};
 use crate::timers::{expiry, timer_at};
 use crate::transfers::copy_raw;
+use core::cell::Cell;
+use proto_init::Method;
+use rt::startup::{Answered, Giver};
 
 /// The tests of this module, in the order they run.
 pub(crate) const TESTS: [Test; 27] = [
@@ -81,8 +84,8 @@ pub(crate) const TESTS: [Test; 27] = [
         orphan_fault_frees_the_process,
     ),
     (
-        "child_notifies_through_its_start_channel",
-        child_notifies_through_its_start_channel,
+        "start_channel_carries_no_notify",
+        start_channel_carries_no_notify,
     ),
     (
         "reply_from_another_process_is_bad_state",
@@ -117,8 +120,10 @@ const KID_MARKS: usize = 0x70_0000_0000;
 /// `prepare` sets before the tests run.
 static IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
 static KID_MARKS_OBJECT: AtomicU64 = AtomicU64::new(0);
-/// The label of a child's start channel (process_create x5), and that of
-/// the exit channel of a grandchild.
+/// The label init spawns each child with (rt::loader::spawn): the child's
+/// requests, the CLIENT_GONE of its start channel and its exit
+/// notification carry it; and the label of the exit channel of a
+/// grandchild.
 pub(crate) const START: u64 = 0x57A7;
 const GRANDCHILD: u64 = 0x6C1D;
 /// How long init waits for a child's request or its end.
@@ -261,33 +266,20 @@ pub(crate) enum Gift {
     Given(abi::Handle),
 }
 
-/// What init hears a child through: a channel that takes the child's
-/// start requests (label START), its end (label CHILD) and the expiries of
-/// a timer that bounds each wait (label 0), and the copy of the channel
-/// that is the child's exit channel.
+/// What init hears a child through (spec 7.9, 13.3): a channel that takes
+/// the child's requests, the CLIENT_GONE of its start channel and its end,
+/// all with the label START of its spawn and told apart by their source,
+/// and the expiries of a timer that bounds each wait (label 0).
 pub(crate) struct Ear {
     pub(crate) channel: Handle<Channel>,
-    pub(crate) exit: Handle<Channel>,
     pub(crate) timer: Handle<Timer>,
 }
 
 impl Ear {
-    /// A new ear, and the copy of its channel with SEND, NOTIFY, TRANSFER
-    /// and the label START that becomes the child's start channel.
-    pub(crate) fn new() -> Result<(Ear, Handle<Channel>), &'static str> {
+    pub(crate) fn new() -> Result<Ear, &'static str> {
         let channel = channel(QUIET)?;
-        let exit = session(&channel, Rights::NOTIFY, CHILD, QUIET)?;
         let timer = timer(&channel)?;
-        let rights = Rights::SEND | Rights::NOTIFY | Rights::TRANSFER;
-        let start = session(&channel, rights, START, QUIET)?;
-        Ok((
-            Ear {
-                channel,
-                exit,
-                timer,
-            },
-            start,
-        ))
+        Ok(Ear { channel, timer })
     }
 
     /// What the channel takes next, within KID_WAIT_NS: a request or a
@@ -341,40 +333,46 @@ impl Ear {
         }
     }
 
-    /// Waits for the child's start request (spec 13.3), child::HELLO, and
-    /// answers it with `role`, `args` and `handles`, which move to the
-    /// child.
-    pub(crate) fn answer(&self, role: Role, args: &[u64], given: &[abi::Handle]) -> Outcome {
-        let Received::Message {
-            label: START,
-            len: 8,
-            handles,
-            token,
-            words,
-        } = self.next()?
-        else {
-            return Err("the child did not ask for its start data");
-        };
-        check(
-            words[0] == child::HELLO && handles.is_empty(),
-            "the child's start request is not HELLO",
-        )?;
-        reply_values(token, &child::reply(role, args), given)
-            .map_err(|_| "the reply to the start request failed")
+    /// Waits for the child's next request, one with the label START and no
+    /// handles, as a START is (proto_init): its bytes 0-63, its length and
+    /// its token.
+    pub(crate) fn start_request(&self) -> Result<([u8; 64], usize, Token), &'static str> {
+        match self.next()? {
+            Received::Message {
+                label: START,
+                len,
+                handles,
+                token,
+                words,
+            } if handles.is_empty() => Ok((abi::inline_bytes(&words), len, token)),
+            _ => Err("the child did not ask for its start data"),
+        }
+    }
+
+    /// Answers the child's START requests from `giver` until the reply
+    /// with LAST (rt::startup::Giver): the number of replies.
+    pub(crate) fn give(&self, mut giver: Giver) -> Result<usize, &'static str> {
+        for replies in 1.. {
+            let (bytes, len, token) = self.start_request()?;
+            match giver.answer(&bytes[..len.min(64)], token) {
+                Ok(Answered::Last) => return Ok(replies),
+                Ok(Answered::Piece) => continue,
+                _ => return Err("the child's start request was refused"),
+            }
+        }
+        Err("the child asked for its start data without end")
     }
 
     /// Waits for the child's exit notification (spec 7.9).
     pub(crate) fn ended(&self) -> Outcome {
         check(
-            self.next()? == exit_notice(CHILD),
+            self.next()? == exit_notice(START),
             "the child's exit notification did not come",
         )
     }
 
-    /// Closes the handles; the channel goes before the copy that is the
-    /// exit channel, so that the copy goes without CLIENT_GONE.
     pub(crate) fn close(self) -> Outcome {
-        let closed = [self.timer.close(), self.channel.close(), self.exit.close()];
+        let closed = [self.timer.close(), self.channel.close()];
         check(
             closed.iter().all(Result::is_ok),
             "a handle of a child's ear did not close",
@@ -382,19 +380,49 @@ impl Ear {
     }
 }
 
-/// A child with code, its first thread, and its `Ear`.
+/// The child program spawned (rt::loader::spawn) with the label START on
+/// `channel`, `quota`, room for `limit` handles, ceiling `ceiling` and its
+/// thread at `priority`, which does not run yet; the error of the spawn,
+/// or why the program could not be read.
+pub(crate) fn spawn_under(
+    channel: &Handle<Channel>,
+    quota: u64,
+    limit: u32,
+    ceiling: u8,
+    priority: u8,
+) -> Result<Result<loader::Spawned, Error>, &'static str> {
+    let program = child_program()?;
+    let params = loader::SpawnParams {
+        channel,
+        label: START,
+        notice: QUIET,
+        quota,
+        handle_limit: limit,
+        ceiling,
+        priority,
+        policy: Policy::Fifo,
+    };
+    // SAFETY: only the loader maps and uses LOADER_WINDOW.
+    Ok(unsafe { loader::spawn(&own(), &program, LOADER_WINDOW, params) })
+}
+
+/// A child with code, its first thread, its `Ear`, and the start data
+/// rt::loader::spawn got ready, until `serve` or `giver` takes it.
 pub(crate) struct Kid {
     pub(crate) process: Handle<Process>,
     pub(crate) thread: Handle<Thread>,
     pub(crate) ear: Ear,
+    pub(crate) label: u64,
+    giver: Cell<Option<Giver>>,
 }
 
 impl Kid {
-    /// The child program loaded as a child of init (spec 13.2) with
-    /// `quota`, room for `limit` handles, ceiling and priority `level`, its
-    /// start channel and its exit channel, and the page of marks mapped at
-    /// child::MARKS through a copy with MAP_READ and MAP_WRITE
-    /// (loader::map_narrowed); its thread does not run yet.
+    /// The child program spawned as a child of init (rt::loader::spawn,
+    /// spec 13.2, 13.3) with `quota`, room for `limit` handles, ceiling
+    /// and priority `level`, the label START on the channel of its `Ear`,
+    /// and the page of marks mapped at child::MARKS through a copy with
+    /// MAP_READ and MAP_WRITE (loader::map_narrowed); its thread does not
+    /// run yet.
     pub(crate) fn load(quota: u64, limit: u32, level: u8) -> Result<Kid, &'static str> {
         Kid::load_under(quota, limit, level, level)
     }
@@ -410,34 +438,20 @@ impl Kid {
             Error::NoMemory => KID_NO_MEMORY,
             _ => "the child program did not load",
         };
-        let program = child_program()?;
-        let (ear, start) = Ear::new()?;
-        let params = loader::Params {
-            quota,
-            handle_limit: limit,
-            ceiling,
-            exit: Some((&ear.exit, QUIET)),
-            start: Some(start),
-            priority,
-            policy: Policy::Fifo,
-        };
-        // SAFETY: only the loader maps and uses LOADER_WINDOW.
-        let loaded = unsafe { loader::load(&own(), &program, LOADER_WINDOW, params) };
-        let child = match loaded {
-            Ok(child) => child,
-            Err((e, start)) => {
-                let (back, closed) = (start.map_or(Ok(()), Handle::close), ear.close());
-                check(
-                    back.is_ok() && closed.is_ok(),
-                    "a handle of a child that did not load did not close",
-                )?;
+        let ear = Ear::new()?;
+        let spawned = match spawn_under(&ear.channel, quota, limit, ceiling, priority)? {
+            Ok(spawned) => spawned,
+            Err(e) => {
+                ear.close()?;
                 return Err(short(e));
             }
         };
         let kid = Kid {
-            process: child.process,
-            thread: child.thread,
+            process: spawned.process,
+            thread: spawned.thread,
             ear,
+            label: spawned.label,
+            giver: Cell::new(Some(spawned.giver)),
         };
         let marks = Handle::<Memory>::borrowed(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
         let (page, at) = (PAGE as u64, child::MARKS);
@@ -454,14 +468,28 @@ impl Kid {
         sys::thread_start(&self.thread).map_err(|_| "thread_start of the child failed")
     }
 
-    /// Waits for the child's start request and answers it with `role`,
-    /// `args` and a copy of each of `gifts`.
+    /// The start data spawn got ready, with the child's process and thread.
+    pub(crate) fn giver(&self) -> Result<Giver, &'static str> {
+        self.giver
+            .take()
+            .ok_or("the child's start data went already")
+    }
+
+    /// Answers the child's START requests with its start data: `role` and
+    /// `args` (child::args), and a copy of each of `gifts` under the names
+    /// child::NAMES.
     pub(crate) fn serve(&self, role: Role, args: &[u64], gifts: &[Gift]) -> Outcome {
-        let mut given = [abi::Handle::INVALID; abi::MESSAGE_HANDLES];
-        for (h, &g) in given.iter_mut().zip(gifts) {
-            *h = self.gift(g)?;
+        let mut giver = self.giver()?;
+        for (&name, &g) in child::NAMES.iter().zip(gifts) {
+            let h = Handle::<Any>::from_raw(self.gift(g)?);
+            giver
+                .give(name, h)
+                .map_err(|_| "a gift did not go into the start data")?;
         }
-        self.ear.answer(role, args, &given[..gifts.len()])
+        giver
+            .set_args(&child::args(role, args))
+            .map_err(|_| "the arguments did not go into the start data")?;
+        self.ear.give(giver).map(drop)
     }
 
     pub(crate) fn gift(&self, g: Gift) -> Result<abi::Handle, &'static str> {
@@ -677,12 +705,13 @@ fn child_loads_in_its_least_quota() -> Outcome {
     )
 }
 
-/// Spec 15.2 (messages), 13.3: a child's start request comes through its
-/// start channel, a copy of init's channel with a label, SEND, NOTIFY and
+/// Spec 15.2 (messages), 13.3: a child's START comes through its start
+/// channel, a copy of init's channel with the label of its spawn, SEND and
 /// TRANSFER that process_create moved into the child's entry 0: init takes
-/// it with the label, 8 bytes, no handle and a token. The seven words of
-/// the reply reach the child whole: it sends them back in a second
-/// request, and the reply to that one is its exit code.
+/// it with the label, the 8 bytes of its header (proto_init), no handle
+/// and a token. The seven words of the role in the start data reach the
+/// child whole: it sends them back in a second request, and the reply to
+/// that one is its exit code.
 fn request_through_the_start_channel() -> Outcome {
     let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
     let result = kid.start().and_then(|()| echo_rounds(&kid));
@@ -693,23 +722,13 @@ fn request_through_the_start_channel() -> Outcome {
 fn echo_rounds(kid: &Kid) -> Outcome {
     const WORDS: [u64; child::ARGS] = [0x11, 0x2222, 0x33_3333, 4 << 32, 5 << 40, 6 << 48, 7 << 56];
     const ECHOED: u64 = 0xEC40;
-    let Received::Message {
-        label,
-        len,
-        handles,
-        token,
-        words,
-    } = kid.ear.next()?
-    else {
-        return Err("the child sent no request");
-    };
-    let hello = label == START
-        && (len, handles.len()) == (8, 0)
-        && words == [child::HELLO, 0, 0, 0, 0, 0, 0, 0]
-        && token.raw() != 0;
-    token
-        .reply(&child::reply(Role::Echo, &WORDS))
-        .map_err(|_| "the reply to the start request failed")?;
+    let (bytes, len, token) = kid.ear.start_request()?;
+    let hello = len == 8 && bytes[..8] == Method::Start.header().bytes() && token.raw() != 0;
+    let mut giver = kid.giver()?;
+    giver
+        .set_args(&child::args(Role::Echo, &WORDS))
+        .map_err(|_| "the arguments did not go into the start data")?;
+    let answered = giver.answer(&bytes[..len.min(64)], token);
     let Received::Message {
         label,
         len,
@@ -727,9 +746,13 @@ fn echo_rounds(kid: &Kid) -> Outcome {
     let state = kid.end()?;
     check(
         hello,
-        "the start request did not come with its label, its 8 bytes and a token",
+        "the START did not come with its label, its header and a token",
     )?;
-    check(back, "the reply's words did not reach the child whole")?;
+    check(
+        answered == Ok(Answered::Last),
+        "the start data did not go in one reply",
+    )?;
+    check(back, "the words of the role did not reach the child whole")?;
     check(
         state == ProcessState::Exited { code: ECHOED },
         "the child did not get the reply to its second request",
@@ -934,7 +957,7 @@ fn generations(kid: &Kid) -> Outcome {
         notices
             == [
                 Ok(exit_notice(GRANDCHILD)),
-                Ok(exit_notice(CHILD)),
+                Ok(exit_notice(START)),
                 Err(Error::WouldBlock),
             ],
         "the exit notifications of the grandchild and the child were not there when process_kill returned",
@@ -1145,17 +1168,26 @@ fn orphan_fault_frees_the_process() -> Outcome {
 
 fn orphan(role: Role, args: &[u64]) -> Outcome {
     let before = counts_at_rest()?;
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let giver = kid.giver();
     let Kid {
         process,
         thread,
         ear,
-    } = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+        ..
+    } = kid;
     let started = sys::thread_start(&thread);
     let closed = [thread.close(), process.close()];
     let ended = started
         .map_err(|_| "thread_start of the child failed")
-        .and_then(|()| ear.answer(role, args, &[]))
-        .and_then(|()| ear.ended());
+        .and_then(|()| {
+            let mut giver = giver?;
+            giver
+                .set_args(&child::args(role, args))
+                .map_err(|_| "the arguments did not go into the start data")?;
+            ear.give(giver)
+        })
+        .and_then(|_| ear.ended());
     ear.close()?;
     let after = counts_at_rest()?;
     check(
@@ -1166,25 +1198,24 @@ fn orphan(role: Role, args: &[u64]) -> Outcome {
     check(after == before, "the orphan stayed, or went twice")
 }
 
-/// Spec 13.3: a child's start channel, a copy of init's channel with a
-/// label and NOTIFY, carries a notification as well: init takes it with
-/// the label and the bits.
-fn child_notifies_through_its_start_channel() -> Outcome {
+/// Spec 13.3: a child's start channel, a copy of init's channel with the
+/// label of its spawn, carries SEND and TRANSFER alone
+/// (rt::loader::spawn): the child's notify through it fails with
+/// ACCESS_DENIED, and init hears nothing from it but its end.
+fn start_channel_carries_no_notify() -> Outcome {
     const BITS: u64 = 0b1010;
     let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
-    let got = kid
+    let state = kid
         .start()
         .and_then(|()| kid.serve(Role::Notify, &[BITS], &[]))
-        .and_then(|()| kid.ear.next());
-    let state = kid.end();
+        .and_then(|()| kid.end());
     kid.close()?;
     check(
-        got == Ok(labelled(START, BITS, 1)),
-        "init did not get the child's notification with its label",
-    )?;
-    check(
-        state == Ok(ProcessState::Exited { code: 0 }),
-        "notify through the start channel failed",
+        state
+            == Ok(ProcessState::Exited {
+                code: Error::AccessDenied.code(),
+            }),
+        "notify through the start channel did not fail with ACCESS_DENIED",
     )
 }
 

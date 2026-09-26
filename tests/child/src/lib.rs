@@ -3,18 +3,20 @@
 
 //! What the test init (tests/init) and its child program (src/main.rs,
 //! the second file of the test boot image) agree on (spec 13.3, 15.2): the
-//! child's start request, the roles its parent names in the reply, with
-//! their arguments and handles, and the places of the child's space the
-//! tests use.
+//! roles a parent names in the start data of its child (rt::startup), with
+//! their arguments and handles, the codes of a child whose start failed,
+//! and the places of the child's space the tests use.
 
 #![no_std]
 
-/// The 8 bytes of the start request a child sends through
-/// abi::START_CHANNEL as it starts (spec 13.3).
-pub const HELLO: u64 = u64::from_le_bytes(*b"child up");
+use rt::startup::StartError;
 
-/// Arguments of a role: the words of the reply after the role's code.
+/// Arguments of a role: the words of the start data's arguments after the
+/// role's code.
 pub const ARGS: usize = 7;
+/// The names the handles of a role come under in its start data, handle
+/// i under name i.
+pub const NAMES: [&str; 4] = ["0", "1", "2", "3"];
 
 /// Where the parent maps a page of marks into its child before the child's
 /// first thread starts: words the child writes and the parent reads. It
@@ -66,9 +68,26 @@ pub const BIND: u64 = u64::from_le_bytes(*b"bind rtc");
 
 /// The code a role ends with when the fault it exists for did not come.
 pub const NO_FAULT: u64 = 0xFA17;
-/// The code a child ends with when its start request failed or named no
-/// role, and when a call of its role failed.
+/// The code a child ends with when its start data named no role, and
+/// when a call of its role failed.
 pub const FAILED: u64 = 0xBAD;
+/// The codes a child ends with when rt::startup failed (`start_failed`).
+pub const START_FAILED: u64 = 0x57A7_0000;
+
+/// The code of a child whose rt::startup failed with `e`: START_FAILED
+/// plus 1 for Taken, 2 for Malformed, 3 for TooMuch, 4 for Missing, 0x100
+/// and the code of the kernel's error, 0x1000 and the status of a refusal.
+pub fn start_failed(e: StartError) -> u64 {
+    START_FAILED
+        + match e {
+            StartError::Taken => 1,
+            StartError::Malformed => 2,
+            StartError::TooMuch => 3,
+            StartError::Missing => 4,
+            StartError::Kernel(e) => 0x100 + e.code(),
+            StartError::Refused(status) => 0x1000 + u64::from(status.code()),
+        }
+}
 
 /// The marks of Role::Churn: copies made, rounds, rounds that ended with
 /// NO_MEMORY, the most the child used and its quota.
@@ -85,7 +104,7 @@ pub const FAULT_AT: usize = 6;
 pub const HELPER: usize = 7;
 pub const SEEN: usize = 8;
 
-/// What a child does once its start request has its answer.
+/// What a child does once it has its start data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Ends with the code in argument 0.
@@ -125,9 +144,9 @@ pub enum Role {
     /// child: quota argument 0, ceiling and priority argument 1, exit
     /// channel handle 2 at priority 1, marks mapped from handle 3, a
     /// memory object; handle 0 is its own process with MANAGE. It answers
-    /// the grandchild's start request with Spin on the word in argument
-    /// 2, then sends an empty request through its start channel and waits
-    /// for good.
+    /// the grandchild's START requests with its process, its thread and
+    /// Spin on the word in argument 2 (rt::startup::Giver), then sends an
+    /// empty request through its start channel and waits for good.
     Grandparent = 10,
     /// Adds 1 to the mark in argument 0 for ever.
     Spin = 11,
@@ -149,8 +168,9 @@ pub enum Role {
     /// Starts a helper thread at argument 0, below itself, which would
     /// mark HELPER, and kills its own process through handle 0.
     KillItself = 16,
-    /// Notifies its start channel with the bits in argument 0 and ends
-    /// with 0.
+    /// Notifies its start channel with the bits in argument 0, which
+    /// carries SEND and TRANSFER alone (rt::loader::spawn), and ends with
+    /// the code of the error, or 0.
     Notify = 17,
     /// Replies with 8 bytes to the token in argument 0 and ends with x0 of
     /// the call.
@@ -224,10 +244,25 @@ pub enum Role {
     /// the drop's BAD_HANDLE panics and names handle_close; it ends with 0
     /// otherwise.
     DoubleClose = 28,
+    /// Checks its start data (rt::startup): its process lives
+    /// (PROCESS_STATE), its thread answers THREAD_STATE, handle 0 taken as
+    /// a timer is WrongKind and stays, taken as the system resource it
+    /// comes, handle 1 comes as a memory object, no handle comes under
+    /// name 2, and name 0 is gone once taken. Ends with 0, or with the
+    /// number of the first check that failed.
+    Named = 29,
+    /// Asks for its start data a second time and for init's first handles:
+    /// ends with 0 when rt::startup gives Taken and rt::init_handles None.
+    Once = 30,
+    /// Checks that its start data brought handles under the names 0 to 5
+    /// and ARGS_MAX (256) bytes of arguments, byte i past the first 64
+    /// being i as a byte. Ends with 0, or with the number of the first
+    /// check that failed.
+    Spans = 31,
 }
 
 impl Role {
-    pub const ALL: [Role; 28] = [
+    pub const ALL: [Role; 31] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -256,6 +291,9 @@ impl Role {
         Role::Rtc,
         Role::BadHandle,
         Role::DoubleClose,
+        Role::Named,
+        Role::Once,
+        Role::Spans,
     ];
 
     /// The role whose code is `code`.
@@ -297,13 +335,23 @@ impl Checked {
     }
 }
 
-/// The bytes of the reply to a start request: the role's code, then `args`,
-/// at most ARGS words, then zeros.
-pub fn reply(role: Role, args: &[u64]) -> [u8; abi::INLINE_MAX] {
+/// The first 64 bytes of the arguments of a child's start data: the
+/// role's code, then `args`, at most ARGS words, then zeros.
+pub fn args(role: Role, args: &[u64]) -> [u8; abi::INLINE_MAX] {
     let mut words = [0; 8];
     words[0] = role as u64;
     words[1..=args.len()].copy_from_slice(args);
     abi::inline_bytes(&words)
+}
+
+/// The role and its words in the arguments of a child's start data; None
+/// when they are shorter than 64 bytes or name no role.
+pub fn role_of(args: &[u8]) -> Option<(Role, [u64; ARGS])> {
+    let words = abi::inline_words(args.get(..abi::INLINE_MAX)?);
+    let role = Role::from_code(words[0])?;
+    let mut rest = [0; ARGS];
+    rest.copy_from_slice(&words[1..]);
+    Some((role, rest))
 }
 
 /// x0-x9 filled with marks, for calls that must change x0 alone.

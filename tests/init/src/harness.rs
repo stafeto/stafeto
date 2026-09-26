@@ -17,7 +17,7 @@ pub(crate) use child::{Checked, Role, marked, x0_alone};
 pub(crate) use core::mem::ManuallyDrop;
 pub(crate) use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 pub(crate) use rt::handle::{
-    Any, Channel, Incoming, Interrupt, Memory, Process, Resource, Thread, Timer,
+    Any, Channel, Incoming, Interrupt, Memory, Outgoing, Process, Resource, Thread, Timer,
 };
 pub(crate) use rt::sys::{self, Received, Refused, Regs, Reply, Token};
 pub(crate) use rt::{Handle, Stack, loader, println, time};
@@ -410,16 +410,27 @@ pub(crate) extern "C" fn client(slot: u64) -> ! {
     sys::thread_exit()
 }
 
-/// `raw`, at most four values the caller holds, as handles that own them.
-fn owning<const N: usize>(raw: &[abi::Handle]) -> [Handle<Any>; N] {
-    core::array::from_fn(|i| Handle::from_raw(raw[i]))
+/// `raw`, at most four values the caller holds, as a set of handles that
+/// owns them; INVALID_ARGS for more.
+fn owning(raw: &[abi::Handle]) -> Result<Outgoing, Error> {
+    if raw.len() > abi::MESSAGE_HANDLES {
+        return Err(Error::InvalidArgs);
+    }
+    let mut set = Outgoing::new();
+    for &h in raw {
+        // At most four, as checked above.
+        let _ = set.push(Handle::from_raw(h));
+    }
+    Ok(set)
 }
 
 /// The error of a refused send or reply; the handles that came back are
 /// the caller's values again.
-fn kept_back<const N: usize>(refused: Refused<N>) -> Error {
-    if let Some(back) = refused.back {
-        let _ = back.map(Handle::into_raw);
+fn kept_back(refused: Refused) -> Error {
+    if let Some(mut back) = refused.back {
+        while let Some(h) = back.pop() {
+            h.into_raw();
+        }
     }
     refused.error
 }
@@ -432,26 +443,12 @@ pub(crate) fn send_values(
     bytes: &[u8],
     raw: &[abi::Handle],
 ) -> Result<Reply, Error> {
-    match raw.len() {
-        0 => sys::send_handles(c, bytes, owning::<0>(raw)).map_err(kept_back),
-        1 => sys::send_handles(c, bytes, owning::<1>(raw)).map_err(kept_back),
-        2 => sys::send_handles(c, bytes, owning::<2>(raw)).map_err(kept_back),
-        3 => sys::send_handles(c, bytes, owning::<3>(raw)).map_err(kept_back),
-        4 => sys::send_handles(c, bytes, owning::<4>(raw)).map_err(kept_back),
-        _ => Err(Error::InvalidArgs),
-    }
+    sys::send_handles(c, bytes, owning(raw)?).map_err(kept_back)
 }
 
 /// Token::reply_handles with the values `raw`, as `send_values`.
 pub(crate) fn reply_values(t: Token, bytes: &[u8], raw: &[abi::Handle]) -> Result<(), Error> {
-    match raw.len() {
-        0 => t.reply_handles(bytes, owning::<0>(raw)).map_err(kept_back),
-        1 => t.reply_handles(bytes, owning::<1>(raw)).map_err(kept_back),
-        2 => t.reply_handles(bytes, owning::<2>(raw)).map_err(kept_back),
-        3 => t.reply_handles(bytes, owning::<3>(raw)).map_err(kept_back),
-        4 => t.reply_handles(bytes, owning::<4>(raw)).map_err(kept_back),
-        _ => Err(Error::InvalidArgs),
-    }
+    t.reply_handles(bytes, owning(raw)?).map_err(kept_back)
 }
 
 /// The handles that came in `handles` as values the caller holds from now

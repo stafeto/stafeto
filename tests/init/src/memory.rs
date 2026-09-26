@@ -1036,6 +1036,7 @@ fn init_segments_are_taken() -> Outcome {
 // Children with code (spec 7.9, 13.2, 13.3, 15.2): init loads the child
 // program (tests/child), the boot image's file `child`, with rt::loader.
 // Each child asks for its start data through its start channel, a copy of
-// the channel of its `Kid` with the label START, and the reply names its
-// role (child::Role). Init waits for a child's requests and for its end
-// on that channel, and a timer bounds each wait (spec 10).
+// the channel of its `Kid` with the label START (rt::loader::spawn), and
+// the arguments name its role (child::Role). Init waits for a child's
+// requests and for its end on that channel, and a timer bounds each wait
+// (spec 10).

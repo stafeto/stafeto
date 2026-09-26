@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "MIT"
-description = "The runtime of stafeto programs: entry point, system calls, output, time and the program loader"
+description = "The runtime of stafeto programs: entry point, system calls, output, time, the start protocol and the program loader"
 
 # Programs only: the crate has its own panic handler and entry point, so no
 # test harness is built for it on the host.
@@ -16,3 +16,5 @@ bench = false
 [dependencies]
 abi = { path = "../abi" }
 bootimg = { path = "../bootimg" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }

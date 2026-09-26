@@ -15,5 +15,7 @@ bench = false
 [dependencies]
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
 rt = { path = "../../lib/rt" }
 test-child = { path = "../child" }

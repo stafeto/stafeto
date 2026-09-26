@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["kcore", "kernel", "lib/abi", "lib/bootimg", "lib/rt", "services/init", "tests/child", "tests/init", "xtask"]
-default-members = ["kcore", "lib/abi", "lib/bootimg", "xtask"]
+members = ["kcore", "kernel", "lib/abi", "lib/bootimg", "lib/rt", "proto/init", "proto/wire", "services/init", "tests/child", "tests/init", "xtask"]
+default-members = ["kcore", "lib/abi", "lib/bootimg", "proto/init", "proto/wire", "xtask"]
 
 [workspace.package]
 edition = "2024"

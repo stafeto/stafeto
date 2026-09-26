@@ -10,7 +10,8 @@
 //! so cannot use the value of a handle it closed or gave away (spec 5.4).
 //! `from_raw` takes the ownership of a value, `borrowed` gives a view of
 //! one that the program does not own; a stale value names no other object
-//! (spec 5.1). Handles that came in a message wait in an `Incoming`.
+//! (spec 5.1). Handles that came in a message wait in an `Incoming`, and
+//! those that go with one in an `Outgoing`.
 
 use crate::sys;
 use abi::{Error, MESSAGE_HANDLES, ObjectKind, Rights};
@@ -218,5 +219,101 @@ impl Drop for Incoming {
 impl fmt::Debug for Incoming {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(&self.values[..self.count]).finish()
+    }
+}
+
+/// The handles a message takes with it (spec 6.1), at most
+/// abi::MESSAGE_HANDLES, in their order: the mirror of `Incoming`, with a
+/// count known when the program runs. A send or a reply takes the set,
+/// and gives it back when the kernel left the handles in the caller's
+/// table (sys::Refused); those a set still holds close when it goes.
+#[derive(PartialEq, Eq)]
+pub struct Outgoing {
+    count: usize,
+    values: [abi::Handle; MESSAGE_HANDLES],
+}
+
+impl Outgoing {
+    /// No handles.
+    pub const fn new() -> Outgoing {
+        Outgoing {
+            count: 0,
+            values: [abi::Handle::INVALID; MESSAGE_HANDLES],
+        }
+    }
+
+    /// Adds `h` after the others; with abi::MESSAGE_HANDLES there already,
+    /// `h` comes back.
+    pub fn push(&mut self, h: Handle<Any>) -> Result<(), Handle<Any>> {
+        if self.count == MESSAGE_HANDLES {
+            return Err(h);
+        }
+        self.values[self.count] = h.into_raw();
+        self.count += 1;
+        Ok(())
+    }
+
+    /// The handle added last, which leaves the set; its place holds
+    /// abi::Handle::INVALID again, so that equal sets compare equal.
+    pub fn pop(&mut self) -> Option<Handle<Any>> {
+        self.count = self.count.checked_sub(1)?;
+        let value = core::mem::replace(&mut self.values[self.count], abi::Handle::INVALID);
+        Some(Handle::from_raw(value))
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The values, in their order, for the message.
+    pub(crate) fn values(&self) -> &[abi::Handle] {
+        &self.values[..self.count]
+    }
+
+    /// The handles went with the message: nothing closes them here.
+    pub(crate) fn sent(self) {
+        let _ = ManuallyDrop::new(self);
+    }
+}
+
+impl Default for Outgoing {
+    fn default() -> Outgoing {
+        Outgoing::new()
+    }
+}
+
+impl<const N: usize> From<[Handle<Any>; N]> for Outgoing {
+    /// The handles in their order; more than abi::MESSAGE_HANDLES do not
+    /// build.
+    fn from(handles: [Handle<Any>; N]) -> Outgoing {
+        const {
+            assert!(
+                N <= MESSAGE_HANDLES,
+                "a message carries four handles at most"
+            )
+        };
+        let mut set = Outgoing::new();
+        for h in handles {
+            // N fits, as the assertion says.
+            let _ = set.push(h);
+        }
+        set
+    }
+}
+
+impl Drop for Outgoing {
+    /// Closes the handles the set still holds.
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
+impl fmt::Debug for Outgoing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.values()).finish()
     }
 }

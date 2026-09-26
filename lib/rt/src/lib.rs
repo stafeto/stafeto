@@ -8,14 +8,16 @@
 //! among them, and a raw call for any other (`sys`), the thread's message
 //! buffer (`msgbuf`), output through `debug_write` (`console`, `print!`,
 //! `println!`), the counter and the time scale of the system without a
-//! call (`time`), waits with a bound (`wait`), the loader of programs of
-//! the boot image (`loader`), stacks for threads in static memory, and the
-//! panic handler. The start protocol and the service loop come later in
+//! call (`time`), waits with a bound (`wait`), the start protocol on both
+//! sides (`startup`), the loader of programs of the boot image, which
+//! starts them with their start data (`loader`), stacks for threads in
+//! static memory, and the panic handler. The service loop comes later in
 //! milestone 1.4.
 //!
-//! A program names its main function with `rt::entry!`; `_start` calls it
-//! with the x0 the kernel set and ends the process with the code it
-//! returns.
+//! A program names its main function with `rt::entry!`; `_start` keeps
+//! the x0 the kernel set, which tells init (0) from a program started with
+//! a start channel, calls `main` with it and ends the process with the
+//! code it returns.
 
 #![no_std]
 
@@ -24,15 +26,17 @@ pub mod handle;
 pub mod loader;
 pub mod mmio;
 pub mod msgbuf;
+pub mod startup;
 pub mod sys;
 pub mod time;
 pub mod wait;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use abi;
 pub use handle::Handle;
+pub use startup::startup;
 
 use handle::{Memory, Process, Resource, Thread};
 
@@ -49,12 +53,27 @@ pub struct InitHandles {
     pub boot_image: Handle<Memory>,
 }
 
+/// x0 of the program's first thread, which `_start` keeps (spec 13.3): 0
+/// in init, abi::START_CHANNEL in a program its parent started.
+static FIRST_X0: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the program's first handles went: init's (`init_handles`) or
+/// the start data of any other program (`startup`), one flag for both.
+static FIRST_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// True once, at the first call of the program's own kind: `init` true in
+/// init (x0 of the first thread 0), false in a program started with a
+/// start channel. A call of the other kind leaves the flag as it was.
+pub(crate) fn first_handles(init: bool) -> bool {
+    (FIRST_X0.load(Ordering::Relaxed) == 0) == init && !FIRST_TAKEN.swap(true, Ordering::Relaxed)
+}
+
 /// Init's first handles (spec 13.3) at the first call, None at every
-/// call after it: each has one owner. Only init has them; in another
-/// program the values name whatever its table holds there.
+/// call after it: each has one owner. Only init has them: in a program
+/// started with a start channel (x0 other than 0) the call gives None,
+/// and the program asks for its start data (`startup`) instead.
 pub fn init_handles() -> Option<InitHandles> {
-    static TAKEN: AtomicBool = AtomicBool::new(false);
-    if TAKEN.swap(true, Ordering::Relaxed) {
+    if !first_handles(true) {
         return None;
     }
     Some(InitHandles {
@@ -119,6 +138,7 @@ extern "C" fn start(arg: u64) -> ! {
         /// The program's main function (`entry!`).
         fn __rt_main(arg: u64) -> u64;
     }
+    FIRST_X0.store(arg, Ordering::Relaxed);
     time::init();
     // SAFETY: `entry!` defines the function with this signature.
     let code = unsafe { __rt_main(arg) };

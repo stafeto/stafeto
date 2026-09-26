@@ -18,7 +18,7 @@
 //! of the program and panics (spec 5.4); `raw` returns it as it is.
 
 use crate::handle::{
-    Any, Channel, Handle, Incoming, Interrupt, Memory, Process, Resource, Thread, Timer,
+    Channel, Handle, Incoming, Interrupt, Memory, Outgoing, Process, Resource, Thread, Timer,
 };
 use crate::msgbuf;
 use abi::{
@@ -549,47 +549,67 @@ impl Token {
     /// when its client ended while it waited. More bytes fail with
     /// INVALID_ARGS, as the kernel would fail them.
     pub fn reply(self, bytes: &[u8]) -> Result<(), Error> {
-        self.reply_handles(bytes, []).map_err(|r| r.error)
+        self.reply_handles(bytes, Outgoing::new())
+            .map_err(|r| r.error)
     }
 
-    /// reply with `handles` as well, at most abi::MESSAGE_HANDLES, each
-    /// with TRANSFER: they move into the client's table with their rights
-    /// and labels (spec 6.1). They leave the caller's table when the call
-    /// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
-    /// NO_MEMORY; with the last two the table of the client had no room
-    /// for them, and its send fails the same way. On any other error they
-    /// stay, and come back in `Refused::back`.
-    pub fn reply_handles<const N: usize>(
-        self,
-        bytes: &[u8],
-        handles: [Handle<Any>; N],
-    ) -> Result<(), Refused<N>> {
-        let raw = handles.map(Handle::into_raw);
-        let result = message_regs(self.0, bytes, &raw, 0)
+    /// reply with `handles` as well, an `Outgoing` or an array of at most
+    /// abi::MESSAGE_HANDLES, each with TRANSFER: they move into the
+    /// client's table with their rights and labels (spec 6.1). They leave
+    /// the caller's table when the call succeeds, and when it fails with
+    /// PEER_CLOSED, LIMIT_REACHED or NO_MEMORY; with the last two the table
+    /// of the client had no room for them, and its send fails the same
+    /// way. On any other error they stay, and come back in `Refused::back`;
+    /// but for BAD_STATE, the kernel refused the message before it reached
+    /// the request, which still waits, and the token comes back in
+    /// `Refused::token`.
+    pub fn reply_handles(self, bytes: &[u8], handles: impl Into<Outgoing>) -> Result<(), Refused> {
+        let handles = handles.into();
+        let result = message_regs(self.0, bytes, handles.values(), 0)
             .and_then(|args| call::<{ Call::Reply.number() }>(&args));
         match result {
-            Ok(_) => Ok(()),
-            Err(error) => Err(Refused::of(error, raw)),
+            Ok(_) => {
+                handles.sent();
+                Ok(())
+            }
+            Err(error) => {
+                let waits = error.keeps_handles() && error != Error::BadState;
+                let mut refused = Refused::of(error, handles);
+                refused.token = waits.then_some(self);
+                Err(refused)
+            }
         }
     }
 }
 
-/// A send or a reply with `N` handles that failed (spec 6.1): its error,
-/// and the handles when they stayed in the caller's table
+/// A send or a reply with handles that failed (spec 6.1): its error, and
+/// the handles when they stayed in the caller's table
 /// (abi::Error::keeps_handles). Handles that did not come back are gone.
+/// A reply the kernel refused before it reached the request gives its
+/// token back too: the client still waits, and the caller answers it
+/// another way.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Refused<const N: usize> {
+pub struct Refused {
     pub error: Error,
-    pub back: Option<[Handle<Any>; N]>,
+    pub back: Option<Outgoing>,
+    /// For a reply only: the token of the request that still waits.
+    pub token: Option<Token>,
 }
 
-impl<const N: usize> Refused<N> {
-    /// The refusal of a call that failed with `error` and had `raw` in
+impl Refused {
+    /// The refusal of a call that failed with `error` and had `handles` in
     /// its message.
-    fn of(error: Error, raw: [abi::Handle; N]) -> Refused<N> {
+    fn of(error: Error, handles: Outgoing) -> Refused {
+        let back = if error.keeps_handles() {
+            Some(handles)
+        } else {
+            handles.sent();
+            None
+        };
         Refused {
             error,
-            back: error.keeps_handles().then(|| raw.map(Handle::from_raw)),
+            back,
+            token: None,
         }
     }
 }
@@ -658,39 +678,45 @@ pub fn try_send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error>
     send_with(channel, bytes, &[], abi::NO_WAIT)
 }
 
-/// send with `handles` as well, at most abi::MESSAGE_HANDLES, each with
-/// TRANSFER, none of them `channel`: they move into the receiver's table
-/// with their rights and labels (spec 6.1), and the reply may bring handles
-/// back. They leave the caller's table when the call succeeds, and when it
-/// fails with PEER_CLOSED, LIMIT_REACHED or NO_MEMORY, the last two when
-/// the receiver's table or the reply's had no room for them; on any other
-/// error they stay, and come back in `Refused::back`.
-pub fn send_handles<const N: usize>(
+/// send with `handles` as well, an `Outgoing` or an array of at most
+/// abi::MESSAGE_HANDLES, each with TRANSFER, none of them `channel`: they
+/// move into the receiver's table with their rights and labels (spec
+/// 6.1), and the reply may bring handles back. They leave the caller's
+/// table when the call succeeds, and when it fails with PEER_CLOSED,
+/// LIMIT_REACHED or NO_MEMORY, the last two when the receiver's table or
+/// the reply's had no room for them; on any other error they stay, and
+/// come back in `Refused::back`.
+pub fn send_handles(
     channel: &Handle<Channel>,
     bytes: &[u8],
-    handles: [Handle<Any>; N],
-) -> Result<Reply, Refused<N>> {
-    send_moving(channel, bytes, handles, 0)
+    handles: impl Into<Outgoing>,
+) -> Result<Reply, Refused> {
+    send_moving(channel, bytes, handles.into(), 0)
 }
 
 /// send_handles with abi::NO_WAIT: WOULD_BLOCK, with the handles back,
 /// when no thread waits in receive on the channel.
-pub fn try_send_handles<const N: usize>(
+pub fn try_send_handles(
     channel: &Handle<Channel>,
     bytes: &[u8],
-    handles: [Handle<Any>; N],
-) -> Result<Reply, Refused<N>> {
-    send_moving(channel, bytes, handles, abi::NO_WAIT)
+    handles: impl Into<Outgoing>,
+) -> Result<Reply, Refused> {
+    send_moving(channel, bytes, handles.into(), abi::NO_WAIT)
 }
 
-fn send_moving<const N: usize>(
+fn send_moving(
     channel: &Handle<Channel>,
     bytes: &[u8],
-    handles: [Handle<Any>; N],
+    handles: Outgoing,
     flags: u64,
-) -> Result<Reply, Refused<N>> {
-    let raw = handles.map(Handle::into_raw);
-    send_with(channel, bytes, &raw, flags).map_err(|error| Refused::of(error, raw))
+) -> Result<Reply, Refused> {
+    match send_with(channel, bytes, handles.values(), flags) {
+        Ok(reply) => {
+            handles.sent();
+            Ok(reply)
+        }
+        Err(error) => Err(Refused::of(error, handles)),
+    }
 }
 
 fn send_with(

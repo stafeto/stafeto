@@ -174,7 +174,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 193;
+const INIT_TESTS: u32 = 203;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -611,6 +611,10 @@ fn host_tests() -> Result<(), String> {
         "bootimg",
         "--package",
         "kcore",
+        "--package",
+        "proto-init",
+        "--package",
+        "proto-wire",
         "--package",
         "xtask",
     ]))
@@ -1239,6 +1243,10 @@ fn ci() -> Result<(), String> {
         "--package",
         "kcore",
         "--package",
+        "proto-init",
+        "--package",
+        "proto-wire",
+        "--package",
         "xtask",
         "--all-targets",
         "--",
@@ -1261,6 +1269,10 @@ fn ci() -> Result<(), String> {
     ]))?;
     run_cmd(cargo().args([
         "clippy",
+        "--package",
+        "proto-init",
+        "--package",
+        "proto-wire",
         "--package",
         "rt",
         "--package",

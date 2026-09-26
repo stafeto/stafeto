@@ -4,23 +4,25 @@
 //! The child program of the test init (spec 15.2): the second file of the
 //! test boot image, which the test init loads with rt::loader. As it
 //! starts, a child adds 1 to its mark STARTED, in the page its parent
-//! mapped at child::MARKS, then asks for its start data through
-//! abi::START_CHANNEL (spec 13.3): the reply names its role, with up to
-//! seven arguments and four handles (lib.rs). The child ends with the code
-//! its role returns, or by the fault its role exists for.
+//! mapped at child::MARKS, then asks for its start data (rt::startup,
+//! spec 13.3): the arguments name its role, with up to seven words, and
+//! up to four handles come under the names child::NAMES (lib.rs). The
+//! child ends with the code its role returns, or by the fault its role
+//! exists for; with child::start_failed when rt::startup failed.
 
 #![no_std]
 #![no_main]
 
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS,
-    MOST_USED, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED,
+    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELPER, IMAGE, MADE, MARKS, MOST_USED,
+    NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED,
     STARTED, WINDOW, marked, x0_alone,
 };
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Memory, Process, Resource, Thread};
+use rt::handle::{Any, Channel, Memory, Process, Resource, Thread, Timer};
+use rt::startup::{ARGS_MAX, Giver, StartError, Startup, TakeError};
 use rt::sys::{self, Received};
 use rt::{Handle, Stack, loader, msgbuf};
 
@@ -41,8 +43,9 @@ static HELD: [AtomicU64; HELD_MAX] = [const { AtomicU64::new(0) }; HELD_MAX];
 /// The stacks of the helper threads of a role.
 static STACKS: [Stack<8192>; 2] = [const { Stack::new() }; 2];
 
-/// The reply to the start request. The child holds its handles until it
-/// ends; the roles view them (`Handle::borrowed`).
+/// The role of the start data with its words and the handles that came
+/// under child::NAMES. The child holds the handles until it ends; the
+/// roles view them (`Handle::borrowed`).
 struct Start {
     role: Role,
     args: [u64; ARGS],
@@ -57,9 +60,9 @@ fn parent() -> ManuallyDrop<Handle<Channel>> {
 
 fn main(_: u64) -> u64 {
     mark(STARTED).fetch_add(1, Relaxed);
-    match ask() {
+    match begin() {
         Ok(start) => run(&start),
-        Err(_) => FAILED,
+        Err(code) => code,
     }
 }
 
@@ -71,24 +74,82 @@ fn mark(i: usize) -> &'static AtomicU64 {
     unsafe { &*(MARKS as *const AtomicU64).add(i) }
 }
 
-/// The start request (spec 13.3): HELLO through START_CHANNEL; the reply
-/// holds the role's code, its arguments and its handles.
-fn ask() -> Result<Start, Error> {
-    let mut reply = sys::send(&parent(), &HELLO.to_le_bytes())?;
-    let role = Role::from_code(reply.words[0]).ok_or(Error::InvalidArgs)?;
-    let mut args = [0; ARGS];
-    args.copy_from_slice(&reply.words[1..]);
-    let handles = core::array::from_fn(|i| {
-        reply
-            .handles
-            .take_any(i)
+/// The start data (rt::startup, spec 13.3): the role, its words and the
+/// handles under child::NAMES. The start channel stays the child's, as
+/// entry 0 (`parent`); what else came, the copies of its process and
+/// thread among them, closes before the role runs. The roles that check
+/// the start data itself end here: the code to end with.
+fn begin() -> Result<Start, u64> {
+    let mut s = rt::startup().map_err(child::start_failed)?;
+    let (role, args) = child::role_of(s.args()).ok_or(FAILED)?;
+    match role {
+        Role::Named => return Err(named(&mut s)),
+        Role::Once => return Err(once()),
+        Role::Spans => return Err(spans(&mut s)),
+        _ => {}
+    }
+    let handles = NAMES.map(|name| {
+        s.take::<Any>(name)
             .map_or(abi::Handle::INVALID, Handle::into_raw)
     });
+    s.parent.into_raw();
     Ok(Start {
         role,
         args,
         handles,
     })
+}
+
+/// Role::Named: 0, or the number of the first check that failed.
+fn named(s: &mut Startup) -> u64 {
+    let wrong = s.take::<Timer>(NAMES[0]).map(drop);
+    let resource = s.take::<Resource>(NAMES[0]);
+    let memory = s.take::<Memory>(NAMES[1]);
+    let checks = [
+        sys::process_state(&s.process) == Ok(ProcessState::Alive),
+        sys::thread_info(&s.thread).is_ok(),
+        wrong == Err(TakeError::WrongKind),
+        resource.is_ok(),
+        memory.is_ok(),
+        s.take::<Any>(NAMES[2]).map(drop) == Err(TakeError::Missing),
+        s.take::<Any>(NAMES[0]).map(drop) == Err(TakeError::Missing),
+    ];
+    checks
+        .iter()
+        .position(|&ok| !ok)
+        .map_or(0, |i| i as u64 + 1)
+}
+
+/// Role::Once: 0 when neither the start data nor init's first handles
+/// come a second time.
+fn once() -> u64 {
+    let again = rt::startup();
+    let init = rt::init_handles();
+    let none = init.is_none();
+    // Were they there, init's values would name other handles of the
+    // child's table.
+    core::mem::forget(init);
+    match (again.err(), none) {
+        (Some(StartError::Taken), true) => 0,
+        _ => FAILED,
+    }
+}
+
+/// Role::Spans: 0, or the number of the first check that failed.
+fn spans(s: &mut Startup) -> u64 {
+    let args = s.args();
+    let pattern = (abi::INLINE_MAX..ARGS_MAX).all(|i| args[i] == i as u8);
+    let checks = [
+        args.len() == ARGS_MAX,
+        pattern,
+        ["0", "1", "2", "3", "4", "5"]
+            .iter()
+            .all(|&name| s.take::<Any>(name).is_ok()),
+    ];
+    checks
+        .iter()
+        .position(|&ok| !ok)
+        .map_or(0, |i| i as u64 + 1)
 }
 
 fn run(s: &Start) -> u64 {
@@ -261,6 +322,8 @@ fn run(s: &Start) -> u64 {
             };
             strict.unwrap_or(FAILED)
         }
+        // `begin` runs them.
+        Role::Named | Role::Once | Role::Spans => FAILED,
     }
 }
 
@@ -327,11 +390,31 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
     // SAFETY: only the loader uses WINDOW.
     let g = unsafe { loader::load(&own, &program, WINDOW, params) }.map_err(|(e, _)| e)?;
     sys::mem_map(&g.process, &marks, 0, PAGE, MARKS, Access::ReadWrite)?;
-    sys::thread_start(&g.thread)?;
-    let Received::Message { token, .. } = sys::receive(&requests)? else {
+    let mut giver = Giver::new();
+    let copy = Rights::MANAGE | Rights::TRANSFER;
+    let given = [
+        giver.give("process", sys::handle_duplicate(&g.process, copy)?.erase()),
+        giver.give("thread", sys::handle_duplicate(&g.thread, copy)?.erase()),
+    ];
+    if given.iter().any(Result::is_err) {
         return Ok(FAILED);
-    };
-    token.reply(&child::reply(Role::Spin, &[s.args[2]]))?;
+    }
+    giver.set_args(&child::args(Role::Spin, &[s.args[2]]))?;
+    sys::thread_start(&g.thread)?;
+    loop {
+        let Received::Message {
+            len, token, words, ..
+        } = sys::receive(&requests)?
+        else {
+            return Ok(FAILED);
+        };
+        let request = abi::inline_bytes(&words);
+        match giver.answer(&request[..len.min(abi::INLINE_MAX)], token)? {
+            rt::startup::Answered::Piece => continue,
+            rt::startup::Answered::Last => break,
+            _ => return Ok(FAILED),
+        }
+    }
     sys::send(&parent(), &[])?;
     Ok(FAILED)
 }
