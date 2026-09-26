@@ -217,6 +217,7 @@ pub fn portion() {
             Work::Object(Object::Session(s)) => session::clean(s, level),
             Work::Object(Object::Timer(t)) => crate::timer::clean(t, level),
             Work::Object(Object::Memory(m)) => crate::memory::clean(m, level),
+            Work::Object(Object::Irq(b)) => crate::irq::clean(b, level),
             Work::Object(Object::Resource) => {
                 unreachable!("the system resource is never queued")
             }

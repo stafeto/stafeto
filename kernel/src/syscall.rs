@@ -33,7 +33,7 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::thread::{self, Long, Thread};
-use crate::{arch, cleanup, sched, session, timer};
+use crate::{arch, cleanup, irq, sched, session, timer};
 use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
     ProcessHandles, ProcessMemory, ProcessState, Rights,
@@ -42,8 +42,8 @@ use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::args::{
     Desc, access_arg, bits_arg, check_buffer, check_start, handle_limit_arg, handle_values_arg,
-    inline_len_arg, memory_size_arg, notify_priority_arg, policy_arg, priority_arg, quota_arg,
-    range_arg, reserved_arg, rights_arg, under_ceilings, wait_arg,
+    inline_len_arg, line_arg, memory_size_arg, notify_priority_arg, policy_arg, priority_arg,
+    quota_arg, range_arg, reserved_arg, rights_arg, trigger_arg, under_ceilings, wait_arg,
 };
 use kcore::maps::Mapping;
 
@@ -108,6 +108,8 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::Yield) => yield_now(),
+        Some(Call::IrqBind) => irq_bind(thread, &args),
+        Some(Call::IrqAck) => irq_ack(thread, &args),
         Some(Call::ClockNow) => clock_now(),
         Some(Call::TimerCreate) => timer_create(thread, &args),
         Some(Call::TimerSet) => timer_set(thread, &args),
@@ -941,6 +943,58 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     Ok(Values::NONE)
 }
 
+/// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
+/// NOTIFY, x3 priority, x4 flags): the line's interrupts come as
+/// notifications of the channel (spec 9), bit 0 into a slot of the
+/// priority with the label of the handle; x1 returns a handle to the
+/// binding with DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS). The
+/// channel may be a registration handle a service gave init: NOTIFY is
+/// the right to post into it. The line is edge-triggered with
+/// abi::TRIGGER_EDGE in the flags, level-triggered without, and open at
+/// once. The checks in the order of spec 11: a line outside the shared
+/// ones or the kernel's console line, a priority outside 1-63 and a flag
+/// other than TRIGGER_EDGE (INVALID_ARGS); x0 (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without DEVICE), x2 (BAD_HANDLE, WRONG_TYPE,
+/// ACCESS_DENIED without NOTIFY); the priority above the caller's ceiling
+/// (ACCESS_DENIED); a line with a binding (BAD_STATE), a closed channel
+/// (PEER_CLOSED); then the resources in the order the call takes them:
+/// room in the caller's table (LIMIT_REACHED), a slot of the channel
+/// (LIMIT_REACHED, spec 6.5), a page of the caller's pool of bindings and
+/// a block of its table (NO_MEMORY). A binding whose handle did not go in
+/// goes again, and its line with it.
+fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let line = line_arg(a[1], arch::gic::lines())?;
+    let priority = priority_arg(a[3])?;
+    let edge = trigger_arg(a[4])?;
+    lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
+    let (c, label) = lookup(thread, a[2], Rights::NOTIFY, |o| {
+        Some((o.channel()?, o.session().map_or(0, session::label)))
+    })?;
+    under_ceilings(priority, &[caller_ceiling(thread)])?;
+    if irq::is_bound(line) {
+        return Err(Error::BadState);
+    }
+    if channel::is_closed(c) {
+        return Err(Error::PeerClosed);
+    }
+    process::handle_room(caller(thread))?;
+    let b = irq::bind(caller(thread), c, label, line, priority, edge)?;
+    let h = process::insert_handle(caller(thread), Object::Irq(b), OWNER_RIGHTS);
+    // SAFETY: the reference `bind` handed out goes; the handle, if it went
+    // in, holds the binding, and without it the binding and its line go.
+    unsafe { irq::release_handle(b, cause(thread)) };
+    Ok(Values::new(&[h?.0]))
+}
+
+/// irq_ack(x0 binding with MANAGE): the line an interrupt masked opens
+/// again (spec 9); an open line stays open, 0 all the same. PEER_CLOSED once
+/// the binding's channel closed, and the line stays masked.
+fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
+    irq::ack(b)?;
+    Ok(Values::NONE)
+}
+
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any
 /// rights: PROCESS_STATE returns abi::ProcessState::to_words in x1-x4,
@@ -948,7 +1002,8 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
 /// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
 /// MEMORY takes a memory object's handle with any rights and returns
-/// abi::MemoryInfo in x1-x3.
+/// abi::MemoryInfo in x1-x3; IRQ an interrupt binding's and returns
+/// abi::IrqInfo in x1-x3.
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
@@ -984,6 +1039,10 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         abi::INFO_MEMORY => {
             let m = lookup(thread, a[0], Rights::NONE, Object::memory)?;
             Ok(Values::new(&memory::info(m).to_words()))
+        }
+        abi::INFO_IRQ => {
+            let b = lookup(thread, a[0], Rights::NONE, Object::irq)?;
+            Ok(Values::new(&irq::info(b).to_words()))
         }
         _ => Err(Error::InvalidArgs),
     }

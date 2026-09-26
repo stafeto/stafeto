@@ -6,13 +6,14 @@
 //! error the spec names for it. The data structures of kcore take values
 //! already checked here.
 
+use crate::gic::{CONSOLE_INTID, FIRST_SPI};
 use crate::handles::MAX_HANDLES;
 use crate::layout::USER_END;
 use crate::pagelist::MAX_PAGES;
 use crate::{PAGE_SHIFT, PAGE_SIZE};
 use abi::{
     Access, CLIENT_GONE, Error, HANDLES_SHIFT, MESSAGE_HANDLES, MESSAGE_MAX, NO_WAIT,
-    PRIORITY_LEVELS, Policy, Rights,
+    PRIORITY_LEVELS, Policy, Rights, TRIGGER_EDGE,
 };
 
 /// A priority from a register, as `thread_create` and
@@ -21,6 +22,28 @@ use abi::{
 pub fn priority_arg(raw: u64) -> Result<u8, Error> {
     match u8::try_from(raw) {
         Ok(p) if (1..PRIORITY_LEVELS).contains(&p) => Ok(p),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// The line of `irq_bind` from a register (spec 9): a shared line, INTID
+/// 32 up to `lines`, the lines of the GIC (kcore::gic::lines, at most
+/// 1020), less one, and not the kernel's console line until milestone 1.4.
+/// INVALID_ARGS otherwise.
+pub fn line_arg(raw: u64, lines: u32) -> Result<u32, Error> {
+    match u32::try_from(raw) {
+        Ok(line) if (FIRST_SPI..lines).contains(&line) && line != CONSOLE_INTID => Ok(line),
+        _ => Err(Error::InvalidArgs),
+    }
+}
+
+/// The flags of `irq_bind` from a register (spec 9): true for
+/// abi::TRIGGER_EDGE, false for 0 (level-triggered). INVALID_ARGS for any
+/// other bit.
+pub fn trigger_arg(raw: u64) -> Result<bool, Error> {
+    match raw {
+        0 => Ok(false),
+        TRIGGER_EDGE => Ok(true),
         _ => Err(Error::InvalidArgs),
     }
 }
@@ -308,6 +331,23 @@ mod tests {
         assert_eq!(notify_priority_arg(64, true), Err(Error::InvalidArgs));
         assert_eq!(notify_priority_arg(5, true), Ok(5));
         assert_eq!(under_ceilings(5, &[4]), Err(Error::AccessDenied));
+    }
+
+    #[test]
+    fn lines_are_spis_outside_the_kernel() {
+        let lines = 288;
+        for good in [32, 34, 48, 287] {
+            assert_eq!(line_arg(good, lines), Ok(good as u32));
+        }
+        for bad in [0, 27, 31, 33, 288, 1019, 1020, 1 << 32 | 34, u64::MAX] {
+            assert_eq!(line_arg(bad, lines), Err(Error::InvalidArgs), "{bad}");
+        }
+        assert_eq!(line_arg(1019, 1020), Ok(1019));
+        assert_eq!(trigger_arg(0), Ok(false));
+        assert_eq!(trigger_arg(1), Ok(true));
+        for bad in [2, 3, 1 << 63] {
+            assert_eq!(trigger_arg(bad), Err(Error::InvalidArgs));
+        }
     }
 
     #[test]

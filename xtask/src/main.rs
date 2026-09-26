@@ -47,9 +47,10 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// sixth takes a big process apart in hundreds of portions with interrupts
 /// between them, where virtual time counts instructions and a stall of the
 /// host changes nothing; the seventh measures the round trip of a request;
-/// in the last a timer fires in the middle of each long call of memory
-/// objects at the same place on every run.
-const ICOUNT_TESTS: [&str; 8] = [
+/// in the eighth a timer fires in the middle of each long call of memory
+/// objects at the same place on every run; the last measures the path of
+/// an interrupt of a bound line to its driver.
+const ICOUNT_TESTS: [&str; 9] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "timer_firing_is_measured",
@@ -58,6 +59,7 @@ const ICOUNT_TESTS: [&str; 8] = [
     "teardown_yields_to_a_pending_interrupt",
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
+    "interrupt_path_is_measured",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
@@ -77,6 +79,9 @@ const MEMORY_PORTION_ROWS: [&str; 8] = [
 /// The rows of the line of `timer_firing_is_measured`, in its order (spec
 /// 15.3).
 const TIMER_PORTION_ROWS: [&str; 3] = ["interrupt", "fire", "set"];
+/// The rows of the line of `interrupt_path_is_measured`, in its order
+/// (spec 15.3).
+const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
 /// checked.
@@ -140,7 +145,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 159;
+const INIT_TESTS: u32 = 164;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -781,6 +786,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
             ("ipc round trip", &ROUND_TRIP_ROWS[..]),
             ("memory portions", &MEMORY_PORTION_ROWS[..]),
             ("timer portions", &TIMER_PORTION_ROWS[..]),
+            ("interrupt path", &INTERRUPT_PATH_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             let rows: Vec<_> = rows

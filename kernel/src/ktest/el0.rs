@@ -25,10 +25,10 @@ use crate::process::{self, Process, Stage};
 use crate::syscall::{self, Values};
 use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
-use crate::{sched, session};
+use crate::{irq, sched, session};
 use abi::{
     Access, CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, MAX_THREADS, MEMORY_RIGHTS, NO_WAIT,
-    Notification, Policy, ProcessState, Rights, Source, msgbuf,
+    Notification, OWNER_RIGHTS, Policy, ProcessState, Rights, Source, msgbuf,
 };
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -91,6 +91,8 @@ unsafe extern "C" {
     static el0_serve_loop: u8;
     static el0_yield_loop: u8;
     static el0_long_calls: u8;
+    static el0_receive_then_count: u8;
+    static el0_pend: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -98,15 +100,21 @@ unsafe extern "C" {
 /// program. SNAP notes the scheduler's state (`Snap`), SLOW turns the fast
 /// path of send off for the rest of the test, RELEASE lets thread x0 of
 /// the crowd go at level x1, each returning 0 in x0; PENDING makes send
-/// with its registers once an interrupt is pending.
+/// with its registers once an interrupt is pending; PEND does two things
+/// for interrupt_path_is_measured, returning 0 in x0: when the thread in
+/// the crowd's first place takes the slot of the binding the test left
+/// queued and the cleanup queue then holds that binding alone, it runs and
+/// measures the binding's portion; then it notes the counter and makes
+/// line x0 pending at the distributor.
 pub const SVC_NOP: u16 = 0xFF00;
 pub const SVC_DONE: u16 = 0xFF01;
 const SVC_SNAP: u16 = 0xFF02;
 const SVC_SLOW: u16 = 0xFF03;
 const SVC_RELEASE: u16 = 0xFF04;
 const SVC_PENDING: u16 = 0xFF05;
+const SVC_PEND: u16 = 0xFF06;
 
-const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PENDING <= *abi::TEST_CALLS.end());
+const _: () = assert!(*abi::TEST_CALLS.start() <= SVC_NOP && SVC_PEND <= *abi::TEST_CALLS.end());
 
 // el0.S makes these calls by number and knows these values.
 const _: () = assert!(
@@ -421,6 +429,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_own_cleanup,
     },
     El0Test {
+        name: "two_pending_lines_come_before_a_portion",
+        start: start_two_lines,
+        done: done_two_lines,
+    },
+    El0Test {
         name: "own_kill_writes_no_result",
         start: start_own_kill,
         done: done_own_kill,
@@ -468,6 +481,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "long_call_yields_to_a_pending_interrupt",
         start: start_long_calls,
         done: done_long_calls,
+    },
+    El0Test {
+        name: "interrupt_path_is_measured",
+        start: start_interrupt_path,
+        done: done_interrupt_path,
     },
 ];
 
@@ -580,6 +598,8 @@ struct Fixture {
     rearm: Option<u64>,
     cut: u32,
     waited: u64,
+    /// What the start of a measuring test measured, for its judge.
+    measured: [u64; 3],
 }
 
 /// The scheduler's state that `svc #SVC_SNAP` notes, right after the
@@ -652,6 +672,7 @@ impl Fixture {
             rearm: None,
             cut: 0,
             waited: 0,
+            measured: [0; 3],
         }
     }
 
@@ -729,8 +750,9 @@ fn start(first: usize) -> ! {
                 && channel::in_use() == 0
                 && session::in_use() == 0
                 && timers::in_use() == 0
-                && memory::in_use() == 0,
-            "a process, a thread, a channel, a session, a timer or a memory object of the EL0 tests stayed in its pool",
+                && memory::in_use() == 0
+                && irq::in_use() == 0,
+            "a process, a thread, a channel, a session, a timer, a memory object or a binding of the EL0 tests stayed in its pool",
         ),
     );
     finish()
@@ -791,6 +813,7 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
         SVC_SNAP => snap(thread),
         SVC_SLOW => FAST_PATH_OFF.store(true, Relaxed),
         SVC_RELEASE => release_crowd(thread),
+        SVC_PEND => pend(thread),
         SVC_PENDING => {
             // The timer fires at once, and its interrupt is pending when
             // send looks.
@@ -3906,4 +3929,194 @@ fn done_long_calls(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         f.rearm.is_some_and(|period| f.waited < period),
         "an interrupt waited as long as a period for a long call",
     )
+}
+
+// Interrupt bindings (spec 9).
+
+/// The lines the tests bind: shared lines with no device behind them in
+/// QEMU `virt`.
+const LINE: u32 = 40;
+const OTHER_LINE: u32 = 41;
+/// The priority of the slots of the tests' bindings.
+const DRIVER: u8 = 50;
+
+/// A handle to `object` with `rights` in the table of the test's process,
+/// which the teardown closes.
+fn keep(f: &mut Fixture, object: Object, rights: Rights) -> Result<u64, &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let h = process::insert_handle(p, object, rights).map_err(|_| "a handle did not go in")?;
+    let slot = f
+        .handles
+        .iter()
+        .position(Option::is_none)
+        .expect("room for a handle");
+    f.handles[slot] = Some((p, h));
+    Ok(h.0)
+}
+
+/// A channel of the test's process at PRIORITY and a handle to it with
+/// RECEIVE and NOTIFY, which the teardown closes.
+fn kept_channel(f: &mut Fixture) -> Result<(NonNull<Channel>, u64), &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = keep(f, Object::Channel(c), Rights::RECEIVE | Rights::NOTIFY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    Ok((c, h?))
+}
+
+/// A level-triggered binding of `line` to `c` that the test's process pays
+/// for, its slot at DRIVER, with a handle the teardown closes.
+fn kept_binding(f: &mut Fixture, c: NonNull<Channel>, line: u32) -> Result<(), &'static str> {
+    let p = f.processes[0].expect("the test's process");
+    let b = irq::bind(p, c, 0, line, DRIVER, false).map_err(|_| "no binding")?;
+    let h = keep(f, Object::Irq(b), OWNER_RIGHTS);
+    // SAFETY: the reference `bind` handed out goes; the handle, if it went
+    // in, holds the binding.
+    unsafe { irq::release_handle(b, CAUSE) };
+    h.map(drop)
+}
+
+/// A second line of the same priority reaches the CPU only after the EOI
+/// of the first (GICv2 running priority), so the way out of the kernel
+/// polls again before it begins a portion of cleanup (sched::exit_loop).
+/// With the teardown of a child with threads queued above the judge and
+/// two bound lines pending, both interrupts come before the first portion:
+/// none begins with an interrupt pending, and both lines are masked by the
+/// time the judge runs.
+fn start_two_lines(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    sched_thread(f, 0, &raw const el0_done_at_once, PRIORITY, FIFO)?;
+    let (c, _) = kept_channel(f)?;
+    kept_binding(f, c, LINE)?;
+    kept_binding(f, c, OTHER_LINE)?;
+    let child = child_with_threads()?;
+    // SAFETY: the test holds a reference to the child, which goes after
+    // the end took its own: the teardown waits in the queue above the
+    // judge.
+    unsafe {
+        process::end(child, ProcessState::Killed, PRIORITY + 10);
+        process::release(child, PRIORITY + 10);
+    }
+    gic::set_pending(LINE);
+    gic::set_pending(OTHER_LINE);
+    cleanup::take_late();
+    Ok(())
+}
+
+fn done_two_lines(_: &Fixture, _: &Thread) -> Result<(), &'static str> {
+    check(
+        !cleanup::take_late(),
+        "a portion began while the second line was pending",
+    )?;
+    check(
+        cleanup::len() == 0,
+        "the judge ran before the teardown ended",
+    )?;
+    let delivered = [LINE, OTHER_LINE]
+        .iter()
+        .all(|&l| !gic::is_enabled(l) && irq::bound(l).is_some_and(|b| irq::info(b).masked));
+    check(delivered, "a pending line was not delivered")
+}
+
+/// The path of an interrupt of a bound line to its driver (spec 15.3),
+/// under -icount: the driver in slot 0 waits in receive at DRIVER, a
+/// thread of another process in slot 1 below it makes the line pending,
+/// the kernel notes the counter there (svc #SVC_PEND), and the driver's
+/// first instruction after receive reads it again. No timer is armed. A
+/// thread of that process that never runs measures besides, each in its
+/// worst case: irq_bind with its checks, whose pool of bindings takes a
+/// page, and irq_ack of a masked line, here; the portion of a binding
+/// that goes, in svc #SVC_PEND (`pend`). The judge prints `interrupt path
+/// ticks: driver=… bind=… ack=… portion=…`.
+fn start_interrupt_path(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let driver = sched_thread(f, 0, &raw const el0_receive_then_count, DRIVER, FIFO)?;
+    let (c, h) = kept_channel(f)?;
+    kept_binding(f, c, LINE)?;
+    set_args(driver, &[h, 0]);
+    spawn(f, 1, &raw const el0_pend, u64::from(LINE))?;
+    let p = f.processes[1].expect("the process of slot 1");
+    let aux =
+        thread::create(p, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO).map_err(|_| "no thread")?;
+    f.crowd[0] = Some(aux);
+    let r = process::insert_handle(p, Object::Resource, Rights::DEVICE)
+        .map_err(|_| "a handle did not go in")?;
+    let other = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let ch = process::insert_handle(p, Object::Channel(other), Rights::RECEIVE | Rights::NOTIFY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(other, Rights::NONE, CAUSE) };
+    let ch = ch.map_err(|_| "a handle did not go in")?;
+    let bind = [r.0, OTHER_LINE.into(), ch.0, DRIVER.into(), 0];
+    let start = timer::now();
+    let made = call(aux, Call::IrqBind.number(), &bind);
+    f.measured[0] = timer::now() - start;
+    let b = Handle(made.map_err(|_| "irq_bind failed")?);
+    gic::set_pending(OTHER_LINE);
+    let ack = (0..1000)
+        .find_map(|_| gic::acknowledge())
+        .ok_or("the line's interrupt did not arrive")?;
+    crate::interrupt::handle(ack);
+    let start = timer::now();
+    let acked = call(aux, Call::IrqAck.number(), &[b.0]);
+    f.measured[1] = timer::now() - start;
+    acked.map_err(|_| "irq_ack failed")?;
+    // The binding's slot, queued in the channel, holds it from now on.
+    process::close_handle(p, b, CAUSE).map_err(|_| "the binding did not close")?;
+    f.kept[1] = ch.0;
+    Ok(())
+}
+
+/// svc #SVC_PEND of `thread`: the thread that measures in
+/// interrupt_path_is_measured takes the slot of the binding its start
+/// left queued, the binding's last reference, and the binding's portion
+/// runs, the only one queued; then the counter goes into `Fixture::kept`
+/// and line x0 becomes pending.
+fn pend(thread: NonNull<Thread>) {
+    let (aux, h) = {
+        let f = FIXTURE.lock();
+        (f.crowd[0], f.kept[1])
+    };
+    if let Some(aux) = aux {
+        let taken = call(aux, Call::Receive.number(), &[h, NO_WAIT]);
+        if taken.is_ok() && cleanup::len() == 1 {
+            let start = timer::now();
+            cleanup::portion();
+            let took = timer::now() - start;
+            FIXTURE.lock().measured[2] = took;
+        }
+    }
+    // SAFETY: the running thread is alive.
+    let line = unsafe { thread.as_ref() }.regs.x[0] as u32;
+    FIXTURE.lock().kept[0] = timer::now();
+    gic::set_pending(line);
+}
+
+/// Call `number` for `t`, which has not run, with `args` in x0 and up:
+/// x1 on success.
+fn call(t: NonNull<Thread>, number: u16, args: &[u64]) -> Result<u64, Error> {
+    set_args(t, args);
+    syscall::dispatch(t, number);
+    // SAFETY: the thread belongs to the test and does not run yet.
+    let x = unsafe { t.as_ref() }.regs.x;
+    match x[0] {
+        0 => Ok(x[1]),
+        code => Err(Error::from_code(code).unwrap_or(Error::InvalidArgs)),
+    }
+}
+
+fn done_interrupt_path(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    if f.slot(t) == 1 {
+        return check(t.regs.x[0] == 0, "svc #SVC_PEND failed");
+    }
+    let driver = t.regs.x[12].saturating_sub(f.kept[0]);
+    let [bind, ack, portion] = f.measured;
+    kprintln!("interrupt path ticks: driver={driver} bind={bind} ack={ack} portion={portion}");
+    check(
+        t.regs.x[0] == 0 && t.regs.x[1] >> abi::SOURCE_SHIFT == Source::Interrupt.code(),
+        "the driver did not take the interrupt's notification",
+    )?;
+    check(portion > 0, "the binding's portion was not measured")
 }

@@ -18,6 +18,7 @@ mod channel;
 mod cleanup;
 mod init;
 mod interrupt;
+mod irq;
 #[cfg(feature = "ktest")]
 mod ktest;
 mod memory;

@@ -383,6 +383,39 @@ const TESTS: &[(&str, TestFn)] = &[
         "init_load_maps_each_part_with_its_access",
         calls::init_load_maps_each_part_with_its_access,
     ),
+    (
+        "delivery_masks_posts_and_ends",
+        calls::delivery_masks_posts_and_ends,
+    ),
+    ("irq_ack_unmasks_the_line", calls::irq_ack_unmasks_the_line),
+    (
+        "masked_line_waits_for_irq_ack",
+        calls::masked_line_waits_for_irq_ack,
+    ),
+    (
+        "closed_channel_keeps_the_line_masked",
+        calls::closed_channel_keeps_the_line_masked,
+    ),
+    (
+        "released_binding_masks_and_frees_its_line",
+        calls::released_binding_masks_and_frees_its_line,
+    ),
+    (
+        "queued_notice_does_not_hold_the_line",
+        calls::queued_notice_does_not_hold_the_line,
+    ),
+    (
+        "stray_line_is_masked_and_ended",
+        calls::stray_line_is_masked_and_ended,
+    ),
+    (
+        "edge_flag_sets_the_trigger",
+        calls::edge_flag_sets_the_trigger,
+    ),
+    (
+        "irq_bind_checks_the_callers_limits",
+        calls::irq_bind_checks_the_callers_limits,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.

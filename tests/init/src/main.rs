@@ -31,13 +31,14 @@
 #![no_main]
 
 use abi::{
-    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, MemoryInfo, Policy,
-    ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, IrqInfo, MemoryInfo,
+    OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
+    TRIGGER_EDGE,
 };
 use bootimg::{Part, Program};
 use child::{Checked, Role};
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Memory, Process, Thread, Timer};
+use rt::handle::{Channel, Interrupt, Memory, Process, Thread, Timer};
 use rt::sys::{self, Received, Regs, Reply, Token};
 use rt::{Handle, Stack, init, loader, println, time};
 
@@ -47,7 +48,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 159] = [
+const TESTS: [Test; 164] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -526,6 +527,20 @@ const TESTS: [Test; 159] = [
         narrowed_memory_handle_maps_read_only,
     ),
     ("shared_pages_show_both_sides", shared_pages_show_both_sides),
+    (
+        "irq_bind_checks_its_arguments",
+        irq_bind_checks_its_arguments,
+    ),
+    ("irq_ack_checks_its_handle", irq_ack_checks_its_handle),
+    ("a_line_takes_one_binding", a_line_takes_one_binding),
+    (
+        "binding_goes_with_its_last_handle",
+        binding_goes_with_its_last_handle,
+    ),
+    (
+        "irq_info_reports_line_mask_and_trigger",
+        irq_info_reports_line_mask_and_trigger,
+    ),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -8126,4 +8141,213 @@ fn shared_pages_show_both_sides() -> Outcome {
     )?;
     check(reply[6] == INIT_WORD, "the service did not see init's word")?;
     check(seen == CHILD_WORD, "init did not see the service's word")
+}
+
+/// The lines of the GIC of QEMU `virt` (GICD_TYPER): INTID 288 is past
+/// the last one.
+const GIC_LINES: u64 = 288;
+/// A shared line with no device behind it in the tests' machine, the
+/// first of `virtio-mmio`, which the tests bind edge-triggered.
+const EDGE_LINE: u32 = 48;
+/// The line of the PL031 of QEMU `virt`, level-triggered.
+const RTC_LINE: u32 = 34;
+
+/// A binding of `line` to `c` through the system resource, the slot at
+/// QUIET, edge-triggered when `edge`.
+fn bound(line: u32, c: &Handle<Channel>, edge: bool) -> Result<Handle<Interrupt>, &'static str> {
+    sys::irq_bind(&init::RESOURCE, line, c, QUIET, edge).map_err(|_| "irq_bind failed")
+}
+
+/// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
+/// NOTIFY, x3 priority, x4 flags) checks the values first, then the
+/// handles in their order, then the state (spec 9, 11), and changes x0
+/// alone on an error: a line outside 32-287, the lines of QEMU's GIC, or
+/// the kernel's console line 33, a flag other than TRIGGER_EDGE and a
+/// priority outside 1-63 fail with INVALID_ARGS, through closed handles
+/// too; x0 closed, a channel or a copy of the resource without DEVICE
+/// with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or
+/// a copy of the channel without NOTIFY the same; a closed channel with
+/// PEER_CLOSED. A copy with NOTIFY alone makes a binding, x0 and x1 alone
+/// changed, whose handle carries abi::OWNER_RIGHTS and no more.
+fn irq_bind_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::IrqBind.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let notify = copy(&c, Rights::NOTIFY)?;
+    let receive = copy(&c, Rights::RECEIVE)?;
+    let no_device = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let (resource, line) = (init::RESOURCE.raw().0, u64::from(EDGE_LINE));
+    let good = [resource, line, notify.raw().0, QUIET.into(), TRIGGER_EDGE];
+    let with = |i: usize, value: u64| {
+        let mut x = good;
+        x[i] = value;
+        x
+    };
+    let invalid = [27, 31, 33, 1020, GIC_LINES, 1 << 32 | line]
+        .map(|l| with(1, l))
+        .into_iter()
+        .chain([with(4, 2), with(3, 0), with(3, 64), with(3, 0x100 | 1)])
+        .chain([[gone, 31, gone, 0, 2]])
+        .all(|x| x0_alone::<N>(&x, Error::InvalidArgs.code()));
+    let refused = [
+        (with(0, gone), Error::BadHandle),
+        (with(0, c.raw().0), Error::WrongType),
+        (with(0, no_device.raw().0), Error::AccessDenied),
+        (with(2, gone), Error::BadHandle),
+        (with(2, init::PROCESS.raw().0), Error::WrongType),
+        (with(2, receive.raw().0), Error::AccessDenied),
+    ]
+    .iter()
+    .all(|(x, e)| x0_alone::<N>(x, e.code()));
+    let mut x = marked();
+    x[..5].copy_from_slice(&good);
+    // SAFETY: irq_bind only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    let made = after[0] == 0 && after[1] != 0 && after[2..] == x[2..];
+    let b: Handle<Interrupt> = Handle::from_raw(abi::Handle(after[1]));
+    let all = sys::handle_duplicate(&b, OWNER_RIGHTS).map(close);
+    let more = sys::handle_duplicate(&b, OWNER_RIGHTS | Rights::NOTIFY).map(close);
+    if made {
+        close(b)?;
+    }
+    close(receive)?;
+    close(c)?;
+    let closed = x0_alone::<N>(&good, Error::PeerClosed.code());
+    close(notify)?;
+    close(no_device)?;
+    check(
+        invalid,
+        "a bad line, flag or priority did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        refused,
+        "a bad resource or channel handle did not fail alone in its order",
+    )?;
+    check(made, "a good irq_bind failed or changed registers past x1")?;
+    check(
+        all == Ok(Ok(())) && more == Err(Error::AccessDenied),
+        "the handle of irq_bind does not carry OWNER_RIGHTS and no more",
+    )?;
+    check(
+        closed,
+        "irq_bind of a closed channel did not fail with PEER_CLOSED alone",
+    )
+}
+
+/// irq_ack(x0 binding with MANAGE) checks its handle (spec 9, 11) and
+/// changes x0 alone: a closed handle fails with BAD_HANDLE, a channel with
+/// WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. On a line that
+/// is open it returns 0; once the binding's channel closed, PEER_CLOSED.
+fn irq_ack_checks_its_handle() -> Outcome {
+    const N: u16 = Call::IrqAck.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let b = bound(EDGE_LINE, &c, true)?;
+    let seen = copy(&b, Rights::DUPLICATE)?;
+    let refused = [
+        (gone, Error::BadHandle),
+        (c.raw().0, Error::WrongType),
+        (seen.raw().0, Error::AccessDenied),
+    ]
+    .iter()
+    .all(|&(h, e)| x0_alone::<N>(&[h], e.code()));
+    let open = x0_alone::<N>(&[b.raw().0], 0);
+    close(c)?;
+    let closed = x0_alone::<N>(&[b.raw().0], Error::PeerClosed.code());
+    close(seen)?;
+    close(b)?;
+    check(
+        refused,
+        "a closed handle, a channel or a copy without MANAGE did not fail alone",
+    )?;
+    check(open, "irq_ack of an open line did not return 0 alone")?;
+    check(
+        closed,
+        "irq_ack after the channel closed did not fail with PEER_CLOSED alone",
+    )
+}
+
+/// One binding a line (spec 9): a second irq_bind of a bound line fails
+/// with BAD_STATE and changes x0 alone, through another channel too, and
+/// before the state of the channel: a closed one does not change it.
+fn a_line_takes_one_binding() -> Outcome {
+    const N: u16 = Call::IrqBind.number();
+    let c = channel(QUIET)?;
+    let other = channel(QUIET)?;
+    let shut = channel(QUIET)?;
+    let notify = copy(&shut, Rights::NOTIFY)?;
+    close(shut)?;
+    let b = bound(EDGE_LINE, &c, true)?;
+    let args = |h: &Handle<Channel>| {
+        [
+            init::RESOURCE.raw().0,
+            EDGE_LINE.into(),
+            h.raw().0,
+            QUIET.into(),
+            TRIGGER_EDGE,
+        ]
+    };
+    let refused = [&c, &other, &notify]
+        .iter()
+        .all(|h| x0_alone::<N>(&args(h), Error::BadState.code()));
+    close(b)?;
+    close(notify)?;
+    close(other)?;
+    close(c)?;
+    check(refused, "a bound line took a second binding")
+}
+
+/// A binding lives while a handle to it is left (spec 4, 9): with a copy
+/// left the line stays bound after the first handle closed; once the last
+/// one closed, a new irq_bind of the line succeeds at once.
+fn binding_goes_with_its_last_handle() -> Outcome {
+    let c = channel(QUIET)?;
+    let b = bound(EDGE_LINE, &c, true)?;
+    let kept = copy(&b, OWNER_RIGHTS)?;
+    close(b)?;
+    let held = sys::irq_bind(&init::RESOURCE, EDGE_LINE, &c, QUIET, true).err();
+    close(kept)?;
+    let again = bound(EDGE_LINE, &c, false);
+    let made = again.is_ok();
+    if let Ok(b) = again {
+        close(b)?;
+    }
+    close(c)?;
+    check(
+        held == Some(Error::BadState),
+        "the line was free while a copy of its binding was left",
+    )?;
+    check(made, "the line stayed bound after its last handle closed")
+}
+
+/// object_info(IRQ) of a binding, with no right needed (spec 11): its
+/// line, whether it is masked, and its kind of trigger. Right after
+/// irq_bind a line is open, edge-triggered with TRIGGER_EDGE and
+/// level-triggered without.
+fn irq_info_reports_line_mask_and_trigger() -> Outcome {
+    let c = channel(QUIET)?;
+    let edge = bound(EDGE_LINE, &c, true)?;
+    let level = bound(RTC_LINE, &c, false)?;
+    let seen = copy(&level, Rights::NONE)?;
+    let infos = (sys::irq_info(&edge), sys::irq_info(&seen));
+    close(seen)?;
+    close(level)?;
+    close(edge)?;
+    close(c)?;
+    check(
+        infos
+            == (
+                Ok(IrqInfo {
+                    line: EDGE_LINE.into(),
+                    masked: false,
+                    edge: true,
+                }),
+                Ok(IrqInfo {
+                    line: RTC_LINE.into(),
+                    masked: false,
+                    edge: false,
+                }),
+            ),
+        "IRQ does not report the line, the open mask and the trigger of a new binding",
+    )
 }

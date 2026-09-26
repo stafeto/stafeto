@@ -80,9 +80,9 @@ impl core::ops::BitOr for Rights {
     }
 }
 
-/// Rights of the handle that `process_create`, `thread_create` or
-/// `timer_create` returns, and of init's handles to its own process and
-/// first thread.
+/// Rights of the handle that `process_create`, `thread_create`,
+/// `timer_create` or `irq_bind` returns, and of init's handles to its own
+/// process and first thread.
 pub const OWNER_RIGHTS: Rights =
     Rights(Rights::DUPLICATE.0 | Rights::TRANSFER.0 | Rights::MANAGE.0);
 
@@ -612,6 +612,15 @@ pub const INFO_KERNEL_STATS: u64 = 4;
 /// returns `MemoryInfo::to_words` in x1-x3.
 pub const INFO_MEMORY: u64 = 5;
 
+/// IRQ takes an interrupt binding's handle, with no right needed, and
+/// returns `IrqInfo::to_words` in x1-x3.
+pub const INFO_IRQ: u64 = 8;
+
+/// Bit 0 of the flags of `irq_bind` (spec 9, 11): the line is
+/// edge-triggered; without it, level-triggered. The other bits are
+/// reserved.
+pub const TRIGGER_EDGE: u64 = 1;
+
 /// A process's memory quota (spec 7.5), in bytes: the limit its parent
 /// gave it, what is charged to it now, and what went back to the parent.
 /// At its stage Quota the free part goes back, `returned` becomes `quota`
@@ -662,6 +671,32 @@ impl MemoryInfo {
             size: words[0],
             pages: words[1],
             mappings: words[2],
+        }
+    }
+}
+
+/// An interrupt binding (spec 9, 11): its line, whether the line is masked
+/// until `irq_ack`, and whether it is edge-triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IrqInfo {
+    pub line: u64,
+    pub masked: bool,
+    pub edge: bool,
+}
+
+impl IrqInfo {
+    /// The words `object_info` returns in x1-x3: the line, 1 when masked,
+    /// 1 when edge-triggered.
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.line, self.masked as u64, self.edge as u64]
+    }
+
+    /// The binding from x1-x3 of `object_info`.
+    pub const fn from_words(words: [u64; 3]) -> IrqInfo {
+        IrqInfo {
+            line: words[0],
+            masked: words[1] != 0,
+            edge: words[2] != 0,
         }
     }
 }
@@ -1214,6 +1249,24 @@ mod tests {
         };
         assert_eq!(info.to_words(), [3 << 12, 3, 1]);
         assert_eq!(MemoryInfo::from_words(info.to_words()), info);
+    }
+
+    #[test]
+    fn irq_info_round_trips() {
+        assert_eq!((INFO_IRQ, TRIGGER_EDGE), (8, 1));
+        let info = IrqInfo {
+            line: 48,
+            masked: true,
+            edge: false,
+        };
+        assert_eq!(info.to_words(), [48, 1, 0]);
+        assert_eq!(IrqInfo::from_words(info.to_words()), info);
+        let edge = IrqInfo {
+            line: 34,
+            masked: false,
+            edge: true,
+        };
+        assert_eq!(IrqInfo::from_words(edge.to_words()), edge);
     }
 
     #[test]

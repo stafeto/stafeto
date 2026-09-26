@@ -96,6 +96,22 @@ only once the lock of the timers is released. A timer whose last reference
 went is dying: it fires no more, and its own chunk takes it off its heap.
 Here n is the number of armed timers of one level, at most 64 per process.
 
+From part 1.3e on, `irq_bind` ties a shared line of the GIC to a channel,
+one binding a line (spec 9). A table of 988 entries in memory the kernel
+takes at boot names the binding of each line, so an interrupt finds it in
+O(1): the kernel masks the line at the distributor, posts bit 0 into the
+binding's slot at the slot's priority, as `notify` does, and ends the
+interrupt; the line stays masked until `irq_ack`, and a closed channel
+keeps it masked. An interrupt of a line no binding holds is masked and
+ended. The kind of trigger goes into `GICD_ICFGR` at each `irq_bind`,
+while the line is masked. The last handle to a binding masks its line
+and frees its entry in O(1), even while a notification of it still waits
+in the channel's queue, and a chunk of its own, after its last reference,
+gives the channel's slot back. No work of an interrupt is deferred. The latency of an
+interrupt of a device is the entry, the blocking time B, the timers' part
+of a timer interrupt pending at the same time (the timers' row), and the
+path of the delivery to the driver's first instruction.
+
 From part 1.3d on, a memory object takes all its frames when it is made,
 up to 8 pages a chunk of `mem_create`: after a chunk that leaves pages and
 finds an interrupt pending, the call starts over at its `svc`, with how
@@ -186,7 +202,14 @@ set=2241`: the timers' part of an interrupt that finds the tops of all 63
 levels expired, a chunk of firings that takes 16 timers off a heap of
 4,096 of one level, each waking a receiver of its own channel, and
 `timer_set` of the top of that heap to a deadline before every other,
-among 63 levels with timers.
+among 63 levels with timers. The kernel test
+`interrupt_path_is_measured` prints the paths of interrupt bindings there,
+`interrupt path ticks: driver=654 bind=853 ack=305 portion=250`: the
+delivery of an interrupt of a bound line to a driver of another process
+that waits in `receive`, from the `svc` of a thread below it that makes
+the line pending to the driver's first instruction, with no timer armed;
+the first entry of `irq_bind` whose pool of bindings takes a page;
+`irq_ack` of a masked line; and the chunk of a binding that goes.
 
 | Path | What it does | Estimate | Instructions under -icount |
 |---|---|---|---|
@@ -198,9 +221,9 @@ among 63 levels with timers.
 | `arch::cache::sync_icache_frames` | `dc cvau` and `ic ivau` over the cache lines of whole frames through the linear map, with one set of barriers; on a VIPT instruction cache (A53), a flush of the whole instruction cache (`ic ialluis`) instead of `ic ivau` | frames / line size; a chunk of an executable mapping: 8 pages |  |
 | FP/SIMD switch in `thread::run` | saves the outgoing thread's registers and loads the incoming thread's (528 bytes each) | constant: 1056 bytes |  |
 | `debug_write` | writes up to 64 bytes to the PL011 synchronously, waiting for room in the transmit queue; inserts a CR before every LF | up to 128 characters: on hardware at 115,200 baud and 10 bits per character, about 11 ms; instant in QEMU; in 1.2c only `init` holds the `DEBUG` right |  |
-| `object_info` | reads process fields (state, quota count, three handle-table numbers), a memory object's size, pages and mappings, or kernel counters for `KERNEL_STATS`: the scheduler's and frame allocator's under their locks, the queue length and the longest chunk under the queue lock taken twice, and the atomic pool page counter | constant: for `KERNEL_STATS`, four lock acquisitions, one at a time |  |
+| `object_info` | reads process fields (state, quota count, three handle-table numbers), a memory object's size, pages and mappings, a binding's line, mask and trigger, or kernel counters for `KERNEL_STATS`: the scheduler's and frame allocator's under their locks, the queue length and the longest chunk under the queue lock taken twice, and the atomic pool page counter | constant: for `KERNEL_STATS`, four lock acquisitions, one at a time |  |
 | the last reference to an object (`object::release`, `process::release`, `thread::release`, `memory::release`) | puts the object at the tail of the cleanup queue at the level of the cause: the effective priority of the thread whose call or fault released the reference, or the level of the object whose chunk released it; a live process is terminated in the process, as in the process termination row, without threads | constant: insertion at the tail of a level and a mask bit; no nested teardown |  |
-| pool growth (`kcore::slab::PaidPages`: the payer's pools of threads, blocks (the chunks and the directory of its handle table, and the table of its mappings), child shells, channels, sessions, timers, and memory objects) | only when the pool has no free slot: charges a page against the payer's quota, takes an order-0 frame, and lays the page out into slots; when the entries of the payer's page log have run out, first takes a list page the same way | constant: up to two charges and two order-0 frames (each at most `MAX_ORDER` = 10 splits in `FRAMES`) and laying a page out into slots; freeing a slot is O(1) and does not call the allocator |  |
+| pool growth (`kcore::slab::PaidPages`: the payer's pools of threads, blocks (the chunks and the directory of its handle table, and the table of its mappings), child shells, channels, sessions, timers, memory objects, and interrupt bindings) | only when the pool has no free slot: charges a page against the payer's quota, takes an order-0 frame, and lays the page out into slots; when the entries of the payer's page log have run out, first takes a list page the same way | constant: up to two charges and two order-0 frames (each at most `MAX_ORDER` = 10 splits in `FRAMES`) and laying a page out into slots; freeing a slot is O(1) and does not call the allocator |  |
 | a chunk of the Stop stage (`process::clean`, `stop_child`) | the child at the `stop_next` cursor: if it is alive, terminating it as killed at level R (the process termination row); the cursor moves on; the process goes to the head of level S, and after the last child moves on to the Replies stage | up to 64 of the child's threads at O(1) each and up to three O(1) queue operations beyond the enqueues done by the released thread references; no longer than the former Children chunk |  |
 | a chunk of the Replies stage (`process::clean`, `wake_clients`) | up to 32 clients of the top level of the queue of requests the process's threads accepted, under one hold of the scheduler's lock: each leaves the queue and gets `PEER_CLOSED` in `x0`, and goes to the tail of its level with a new quantum; with clients left, the process goes to the head of the higher of R and their new top level, otherwise on to the Children stage at the head of level R; with no client, one chunk that only moves on. The stage stands at the higher of R and the top client | up to 32 clients at O(1) each | 2,686 (test build): 32 clients |
 | a chunk of the Children stage (`process::clean`) | the first child in the list, terminated by the Stop stage: the process goes to the head of level R, and the child to the head of its stage's level right before it (`process::hasten`) | constant: an insertion at the head and a raise |  |
@@ -245,5 +268,12 @@ among 63 levels with timers.
 | `timer_cancel` | takes an armed timer off the heap of its level, and walks the levels when its top changed; bits it posted stay in its slot | O(log n) and a walk of 63 levels |  |
 | the last reference to a timer (`timer::release`: `handle_close`, the Handles stage, or `receive` or the Close stage that took its slot) | marks the timer dying and puts it at the tail of the cleanup queue at the level of the cause; it stays in the heap of its level until its chunk or a chunk of firings takes it off | constant |  |
 | a timer chunk (`timer::clean`) | takes the timer off the heap of its level if it is armed, returns its slot to the channel's limit and its place to its payer's pool of timers (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | O(log n) for the heap and a walk of 63 levels, the rest constant |  |
+| `irq_bind` | checks the line, the priority and the flags, the two handles, the caller's ceiling, the line's entry of the table of bindings and the channel's state, then the room in the caller's table (spec 11), takes one of the channel's 1024 slots and a place in the caller's pool of bindings (the pool growth row), writes the entry, the line's bit of `GICD_ICFGR` and its bit of `GICD_ISENABLER`, and inserts the handle | constant: at most one growth of the caller's pool of bindings and of its pool of blocks | 853 (test build): the first entry, the pool of bindings taking a page |
+| `irq_ack` | on a closed channel returns `PEER_CLOSED`; opens a line a delivery masked (`GICD_ISENABLER`) | constant | 305 (test build): a masked line |
+| an interrupt of a bound line (`interrupt::handle`, `irq::deliver`, before the EOI) | looks the line up in the table of bindings; a line masked already gets nothing more; otherwise masks the line (`GICD_ICENABLER`) and posts bit 0 into the binding's slot at the slot's priority, as `notify` does: the top waiting receiver gets it, or the slot goes into the channel's queue and holds the binding; a closed channel gets nothing | constant: a table read, a write to the distributor, as `notify` | 654 (test build): from the `svc` that makes the line pending to the first instruction of the driver it wakes, the acknowledgement, the post, the decision and the switch included |
+| an interrupt of a line no binding holds (`interrupt::handle`) | masks the line and ends the interrupt | constant: a table read and a write to the distributor |  |
+| the last handle to a binding (`irq::release_handle`: `handle_close`, the Handles stage, or a message dropped with it) | masks the line and frees its entry of the table of bindings, so that `irq_bind` of the line succeeds from then on, though a notification of the binding may still wait in the channel's queue | constant |  |
+| the last reference to a binding (`irq::release`: the last handle, or `receive` or the Close stage that took its slot) | puts the binding at the tail of the cleanup queue at the level of the cause | constant |  |
+| a binding chunk (`irq::clean`) | returns its slot to the channel's limit and its place to its payer's pool of bindings (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | constant | 250 (test build) |
 | a teardown that a thread at a high level starts (`process_kill`, the last handle to a big process or to a channel with many waiters) | runs at the level of its cause (spec 7.7), the Close and Replies stages at the higher of the cause and their top waiter: the chunks of the whole teardown follow one another at that level, with interrupt polls between them, and no thread at or below that level runs until they end | each chunk as in its row; in all, the sum of the object's chunks | 42,961: `process_kill` of a child with 64 threads that never ran, with its whole teardown; 75,124: closing a channel with 60 waiting receivers, with its two chunks at their level, and the 60 receivers that wake, run above the closer and exit |
 | B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 19,749 under -icount (test build), a chunk of the Buffers stage whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver, the longest of the rows measured, where printing costs nothing; then 19,354, a Buffers chunk of 32 frames, 19,318, a Handles chunk of the same kind, and 19,300, the first entry of `mem_create` with only blocks of the highest order free; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 12,773, stays below it |

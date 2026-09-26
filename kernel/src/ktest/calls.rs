@@ -25,6 +25,7 @@ use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel::{self, Channel};
 use crate::cleanup;
+use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
@@ -34,10 +35,10 @@ use crate::thread::{self, Long, THREADS, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
-    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS,
-    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS,
-    MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy, ProcessHandles,
-    ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_IRQ, INFO_KERNEL_STATS,
+    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, IrqInfo, KernelStats,
+    MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source, TRIGGER_EDGE,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -69,7 +70,13 @@ impl Caller {
     /// A caller whose process has priority ceiling `ceiling`; its thread
     /// is FIFO at 10.
     fn with_ceiling(ceiling: u8) -> Result<Caller, &'static str> {
-        let process = process::create_root(QUOTA, LIMIT, ceiling).map_err(|_| "no process")?;
+        Caller::with_limit(LIMIT, ceiling)
+    }
+
+    /// A caller whose process has a table of `limit` handles and priority
+    /// ceiling `ceiling`; its thread is FIFO at 10.
+    fn with_limit(limit: u32, ceiling: u8) -> Result<Caller, &'static str> {
+        let process = process::create_root(QUOTA, limit, ceiling).map_err(|_| "no process")?;
         match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
             Ok(thread) => Ok(Caller { process, thread }),
             Err(_) => {
@@ -3032,6 +3039,404 @@ fn loaded_parts(p: NonNull<Process>, program: &bootimg::Program<'_>) -> Result<(
     check(
         process::mappings(p) == parts,
         "a part of init did not take one mapping",
+    )
+}
+
+// Interrupt bindings (spec 9). The tests make lines pending at the
+// distributor by hand and take them as the way out of the kernel does:
+// the lines they bind have no device behind them in QEMU `virt`.
+
+/// The line most tests bind, and a second one.
+const LINE: u32 = 40;
+const OTHER_LINE: u32 = 41;
+/// A line the tests bind edge-triggered, and one they bind
+/// level-triggered, the PL031's.
+const EDGE_LINE: u32 = 48;
+const LEVEL_LINE: u32 = 34;
+/// The label of the copy of the channel a binding goes through.
+const IRQ_LABEL: u64 = 0x1A7;
+
+/// Takes the interrupt of `line`, which the test made pending, and handles
+/// it as the way out of the kernel does (interrupt::handle): the handler
+/// ends it.
+fn take_line(line: u32) -> Result<(), &'static str> {
+    let ack = (0..1000)
+        .find_map(|_| gic::acknowledge())
+        .ok_or("the line's interrupt did not arrive")?;
+    if ack.intid() != line {
+        gic::end(ack);
+        return Err("an interrupt of another line arrived");
+    }
+    crate::interrupt::handle(ack);
+    Ok(())
+}
+
+/// The notification of an interrupt of a binding made through a handle
+/// with `label`: bit 0, `count` deliveries.
+fn interrupt_notice(label: u64, count: u32) -> [u64; 9] {
+    let n = Notification {
+        source: Source::Interrupt,
+        label,
+        bits: 1,
+        count,
+    };
+    n.to_words()[..9].try_into().expect("x1-x9")
+}
+
+/// The binding behind the caller's handle `h`.
+fn irq_of(c: &Caller, h: Handle) -> Result<NonNull<Irq>, &'static str> {
+    // SAFETY: the caller's process is the test's.
+    unsafe { c.process.as_ref() }
+        .lookup(h, Rights::NONE, Object::irq)
+        .map_err(|_| "the handle does not name a binding")
+}
+
+/// What IRQ reports for the caller's binding `b`.
+fn irq_info_of(c: &Caller, b: Handle) -> Result<IrqInfo, &'static str> {
+    let x = c.call(Call::ObjectInfo.number(), &[b.0, INFO_IRQ, 0]);
+    if x[0] != 0 {
+        return Err("object_info IRQ failed");
+    }
+    Ok(IrqInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// Runs `body` with a caller that holds the system resource with DEVICE,
+/// a channel at 10 with a copy of it with NOTIFY and IRQ_LABEL, and a
+/// binding of `line` through the copy, whose slot has priority 20; closes
+/// the handles afterwards and runs the cleanup queue dry. The live
+/// bindings are as many as before.
+fn with_binding(
+    line: u32,
+    edge: bool,
+    body: impl FnOnce(&Caller, Handle, Handle) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let bindings = irq::in_use();
+    with_caller(|c| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let h = c.created(Call::CreateChannel.number(), &[10])?;
+        let copy = c.created(
+            Call::HandleDuplicate.number(),
+            &[h.0, Rights::NOTIFY.0.into(), IRQ_LABEL, 10],
+        )?;
+        let flags = if edge { TRIGGER_EDGE } else { 0 };
+        let made = c.created(
+            Call::IrqBind.number(),
+            &[r.0, line.into(), copy.0, 20, flags],
+        );
+        let result = made.and_then(|b| {
+            let result = body(c, h, b);
+            // A test may close the binding itself.
+            let _ = process::close_handle(c.process, b, CAUSE);
+            result
+        });
+        for handle in [copy, h, r] {
+            // The test may have closed the channel.
+            let _ = process::close_handle(c.process, handle, CAUSE);
+        }
+        cleanup::drain();
+        result
+    })?;
+    check(
+        irq::in_use() == bindings,
+        "a binding of the test stayed in its pool",
+    )
+}
+
+/// An interrupt of a bound line (spec 9): the handler masks the line at the
+/// distributor (GICD_ICENABLER), posts bit 0 into the binding's slot and
+/// ends the interrupt, so the line is neither enabled nor active
+/// afterwards; receive takes one notification of an interrupt with the
+/// label of the handle the binding went through, bit 0, one delivery, and
+/// IRQ reports the line masked.
+pub fn delivery_masks_posts_and_ends(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        check(gic::is_enabled(LINE), "a new binding left its line masked")?;
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        check(
+            !gic::is_enabled(LINE) && !gic::is_active(LINE),
+            "the delivery left the line enabled or active",
+        )?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )?;
+        check(label_of(c) == IRQ_LABEL, "the notification lacks the label")?;
+        check(
+            irq_info_of(c, b)?.masked,
+            "IRQ does not report the line masked",
+        )?;
+        nothing_pending("an interrupt is pending after the delivery")
+    })
+}
+
+/// irq_ack opens a line a delivery masked (spec 9): the line is enabled
+/// again and IRQ reports it open; irq_ack of an open line returns 0 and
+/// leaves it open.
+pub fn irq_ack_unmasks_the_line(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        check(gic::is_enabled(LINE), "irq_ack left the line masked")?;
+        check(
+            !irq_info_of(c, b)?.masked,
+            "IRQ reports the line masked after irq_ack",
+        )?;
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        check(gic::is_enabled(LINE), "irq_ack of an open line masked it")?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )
+    })
+}
+
+/// A masked line waits for irq_ack (spec 9): with the line masked, a new
+/// interrupt stays pending at the distributor and reaches no CPU; one that
+/// reached the handler before the mask did, which the test makes by
+/// opening the line by hand, posts nothing. Receive then takes one
+/// delivery. After irq_ack the interrupt that waited comes: a second
+/// notification.
+pub fn masked_line_waits_for_irq_ack(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, true, |c, h, b| {
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        gic::set_pending(LINE);
+        nothing_pending("a masked line reached the CPU")?;
+        gic::unmask(LINE);
+        let late = take_line(LINE);
+        gic::mask(LINE);
+        late?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )?;
+        gic::set_pending(LINE);
+        c.succeeds(Call::IrqAck.number(), &[b.0], &[])?;
+        take_line(LINE)?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )
+    })
+}
+
+/// A closed channel keeps its binding's line masked (spec 9): the
+/// delivery posts nothing and masks the line, irq_ack fails with
+/// PEER_CLOSED, and the line stays masked.
+pub fn closed_channel_keeps_the_line_masked(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        // The last handle with RECEIVE goes: the channel closes (spec 6.8).
+        c.close(h)?;
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        check(
+            !gic::is_enabled(LINE),
+            "a delivery into a closed channel left the line open",
+        )?;
+        c.fails(Call::IrqAck.number(), &[b.0], Error::PeerClosed)?;
+        check(
+            !gic::is_enabled(LINE) && irq_info_of(c, b)?.masked,
+            "irq_ack on a closed channel opened the line",
+        )
+    })
+}
+
+/// The last handle to a binding masks its line and frees it at once (spec
+/// 7.7, 9): before the cleanup queue runs, the line is masked, no binding
+/// holds it and irq_bind of it succeeds; the portion gives the channel's
+/// slot back.
+pub fn released_binding_masks_and_frees_its_line(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        let ch = channel_of(c, h)?;
+        let sources = channel::sources(ch);
+        c.close(b)?;
+        check(
+            !gic::is_enabled(LINE) && irq::bound(LINE).is_none(),
+            "the last handle left the line open or bound",
+        )?;
+        check(
+            channel::sources(ch) == sources,
+            "the binding gave its slot back before its portion",
+        )?;
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0]);
+        if let Ok(again) = again {
+            c.close(again)?;
+        }
+        c.close(r)?;
+        again?;
+        cleanup::drain();
+        check(
+            channel::sources(ch) == sources - 1,
+            "the portion of the binding did not give the channel's slot back",
+        )
+    })
+}
+
+/// A notification in the channel's queue does not hold the line (spec
+/// 9, 13.4): with the slot of a delivery queued, the last handle to the
+/// binding masks the line and frees it, and irq_bind of it succeeds while
+/// the slot still holds the binding; receive then takes the notification,
+/// and the binding goes.
+pub fn queued_notice_does_not_hold_the_line(_: &Boot) -> Result<(), &'static str> {
+    with_binding(LINE, false, |c, h, b| {
+        gic::set_pending(LINE);
+        take_line(LINE)?;
+        let bindings = irq::in_use();
+        c.close(b)?;
+        check(
+            !gic::is_enabled(LINE) && irq::bound(LINE).is_none(),
+            "a queued notification kept the line open or bound",
+        )?;
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let again = c.created(Call::IrqBind.number(), &[r.0, LINE.into(), h.0, 20, 0]);
+        if let Ok(again) = again {
+            c.close(again)?;
+        }
+        c.close(r)?;
+        again?;
+        check(
+            irq::in_use() == bindings + 1,
+            "the binding went while its slot was queued",
+        )?;
+        c.succeeds(
+            Call::Receive.number(),
+            &[h.0, NO_WAIT],
+            &interrupt_notice(IRQ_LABEL, 1),
+        )
+    })
+}
+
+/// An interrupt of a line no binding holds is masked and ended (spec 9):
+/// the kernel stays up, and the line is neither enabled nor active.
+pub fn stray_line_is_masked_and_ended(_: &Boot) -> Result<(), &'static str> {
+    check(irq::bound(OTHER_LINE).is_none(), "the line has a binding")?;
+    gic::unmask(OTHER_LINE);
+    gic::set_pending(OTHER_LINE);
+    take_line(OTHER_LINE)?;
+    check(
+        !gic::is_enabled(OTHER_LINE) && !gic::is_active(OTHER_LINE),
+        "a stray line stayed enabled or active",
+    )?;
+    nothing_pending("an interrupt is pending after the stray one")
+}
+
+/// irq_bind writes the kind of trigger to GICD_ICFGR each time (spec 9):
+/// bit 2n + 1 of the line is set for TRIGGER_EDGE and clear without it,
+/// also when the line was edge-triggered before.
+pub fn edge_flag_sets_the_trigger(_: &Boot) -> Result<(), &'static str> {
+    with_binding(EDGE_LINE, true, |_, _, _| {
+        check(
+            gic::is_edge(EDGE_LINE),
+            "an edge-triggered binding left the line level-triggered",
+        )
+    })?;
+    with_binding(EDGE_LINE, false, |_, _, _| {
+        check(
+            !gic::is_edge(EDGE_LINE),
+            "a level-triggered binding left the line edge-triggered",
+        )
+    })?;
+    with_binding(LEVEL_LINE, false, |_, _, _| {
+        check(
+            !gic::is_edge(LEVEL_LINE),
+            "a level-triggered binding made the line edge-triggered",
+        )
+    })
+}
+
+/// irq_bind stops at the caller's limits (spec 7.8, 9, 11): with every
+/// slot of the channel taken it fails with LIMIT_REACHED before the quota,
+/// with the caller's quota spent with NO_MEMORY for a page of its pool of
+/// bindings, and with its table full with LIMIT_REACHED, nothing made; a
+/// priority above the caller's ceiling fails with ACCESS_DENIED. A good
+/// call makes a binding the caller pays for, through a channel of another
+/// process. A binding made whose handle then finds no page for a new chunk
+/// of the table fails with NO_MEMORY, and its line is masked and free
+/// again at once.
+pub fn irq_bind_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
+    let bindings = irq::in_use();
+    let c = Caller::with_ceiling(30)?;
+    let result = irq_bind_cases(&c);
+    c.release();
+    result?;
+    let c = Caller::with_limit(2 * CHUNK as u32, 30)?;
+    let result = bind_without_its_handle(&c);
+    c.release();
+    result?;
+    check(
+        irq::in_use() == bindings,
+        "a binding of the test stayed in its pool",
+    )
+}
+
+fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::IrqBind.number();
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    // First, while the caller's pool of bindings has no page.
+    let full = c.created(Call::CreateChannel.number(), &[10])?;
+    let refused = fill_slots(c, full).and_then(|()| {
+        with_used_quota(c, || {
+            c.fails(n, &[r.0, LINE.into(), full.0, 20, 0], Error::LimitReached)
+        })
+    });
+    c.close(full)?;
+    cleanup::drain();
+    refused?;
+    let owner = Caller::new()?;
+    let result = (|| {
+        let theirs = owner.created(Call::CreateChannel.number(), &[10])?;
+        let ch = channel_of(&owner, theirs)?;
+        let h = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
+        let args = [r.0, LINE.into(), h.0, 20, 0];
+        c.fails(n, &[r.0, LINE.into(), h.0, 31, 0], Error::AccessDenied)?;
+        let bindings = irq::in_use();
+        with_used_quota(c, || {
+            c.fails(n, &args, Error::NoMemory)?;
+            with_full_table(c, n, &args)
+        })?;
+        check(
+            irq::in_use() == bindings && irq::bound(LINE).is_none(),
+            "a binding that did not fit stayed",
+        )?;
+        let used = process::quota(c.process).used();
+        let b = c.created(n, &[r.0, LINE.into(), h.0, 30, 0])?;
+        let paid = irq_of(c, b).map(|i| {
+            irq::payer(i) == c.process && process::quota(c.process).used() == used + PAGE_SIZE
+        });
+        c.close(b)?;
+        c.close(h)?;
+        check(
+            paid?,
+            "the caller did not pay a page of its pool for the binding",
+        )
+    })();
+    owner.release();
+    result
+}
+
+/// irq_bind whose binding is made, and whose handle then takes a new
+/// chunk of the caller's table with no quota left for its page.
+fn bind_without_its_handle(c: &Caller) -> Result<(), &'static str> {
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let h = c.created(Call::CreateChannel.number(), &[10])?;
+    // The first chunk of the table fills: the next handle takes a page.
+    for _ in 2..CHUNK {
+        c.insert(Object::Resource, Rights::NONE)?;
+    }
+    let args = [r.0, LINE.into(), h.0, 20, 0];
+    with_quota_left(c, PAGE_SIZE, || {
+        c.fails(Call::IrqBind.number(), &args, Error::NoMemory)
+    })?;
+    check(
+        !gic::is_enabled(LINE) && irq::bound(LINE).is_none(),
+        "a binding whose handle did not go in left its line open or bound",
     )
 }
 

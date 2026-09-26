@@ -7,7 +7,7 @@
 //! `wfi`, which a pending interrupt ends all the same, and acknowledges the
 //! interrupt itself through GICC_IAR.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use kcore::bootinfo::BootInfo;
 use kcore::gic::{
     self, Ack, CTLR_ENABLE, DEFAULT_PRIORITY, FIRST_SPI, GICC_CTLR, GICC_EOIR, GICC_IAR, GICC_PMR,
@@ -19,6 +19,8 @@ use kcore::layout::LINEAR_BASE;
 /// Virtual addresses of the distributor and the CPU interface; zero until `init`.
 static DIST: AtomicUsize = AtomicUsize::new(0);
 static CPU: AtomicUsize = AtomicUsize::new(0);
+/// The lines of the distributor, from GICD_TYPER at `init`.
+static LINE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn reg(base: &AtomicUsize, offset: usize) -> *mut u32 {
     let base = base.load(Ordering::Relaxed);
@@ -51,6 +53,7 @@ pub fn init(info: &BootInfo) {
     CPU.store(LINEAR_BASE + cpu.base as usize, Ordering::Relaxed);
     write(&DIST, GICD_CTLR, 0);
     let lines = gic::lines(read(&DIST, GICD_TYPER));
+    LINE_COUNT.store(lines, Ordering::Relaxed);
     for intid in (0..lines).step_by(32) {
         for bank in [GICD_ICENABLER, GICD_ICPENDR, GICD_ICACTIVER] {
             write(&DIST, gic::bit(bank, intid).0, u32::MAX);
@@ -86,16 +89,22 @@ pub fn unmask(intid: u32) {
 }
 
 /// Stops the line at the distributor; a pending interrupt stays pending.
-#[cfg_attr(
-    not(feature = "ktest"),
-    expect(
-        dead_code,
-        reason = "lines bound to channels (milestone 1.3) are masked; so far only the kernel tests do"
-    )
-)]
 pub fn mask(intid: u32) {
     let (offset, bit) = gic::bit(GICD_ICENABLER, intid);
     write(&DIST, offset, bit);
+}
+
+/// Makes the line edge-triggered, or level-triggered, in GICD_ICFGR
+/// [G25]; the line is masked meanwhile (spec 9).
+pub fn set_trigger(intid: u32, edge: bool) {
+    let (offset, bit) = gic::cfg(intid);
+    let old = read(&DIST, offset);
+    write(&DIST, offset, if edge { old | bit } else { old & !bit });
+}
+
+/// The lines of the distributor (kcore::gic::lines).
+pub fn lines() -> u32 {
+    LINE_COUNT.load(Ordering::Relaxed)
 }
 
 /// Reads GICC_IAR once. The interrupt becomes active until `end`; None for
@@ -123,7 +132,7 @@ pub fn wait() -> Option<Ack> {
 }
 
 #[cfg(feature = "ktest")]
-pub use test_access::{is_active, is_enabled, priority, priority_mask, set_pending};
+pub use test_access::{is_active, is_edge, is_enabled, priority, priority_mask, set_pending};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -141,6 +150,12 @@ mod test_access {
 
     pub fn is_enabled(intid: u32) -> bool {
         test_bit(GICD_ISENABLER, intid)
+    }
+
+    /// Whether GICD_ICFGR makes the line edge-triggered.
+    pub fn is_edge(intid: u32) -> bool {
+        let (offset, bit) = gic::cfg(intid);
+        read(&DIST, offset) & bit != 0
     }
 
     /// Makes the line pending at the distributor, as if its source had fired.

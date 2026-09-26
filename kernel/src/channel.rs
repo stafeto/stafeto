@@ -18,21 +18,22 @@
 //! states of the threads in them, so every change to them happens under the
 //! scheduler's lock (sched::locked). A channel lives while references to it
 //! are left: handles with any rights, threads that wait in it, the sources
-//! of notifications that have a slot there (sessions, exits of processes
-//! and timers, each through its `Source`), and the cleanup queue's while it
-//! closes; the last one queues its shell (spec 7.7). Every source holds one
-//! of its abi::MAX_SLOTS slots, the slot of label 0 among them, from its
-//! creation until it goes, and a slot that stands in the queue holds its
-//! owner until receive or the stage Close takes it (spec 6.5). The last
-//! handle with RECEIVE closes it in the call itself: `notify` and `send`
-//! fail with PEER_CLOSED from then on, nothing new waits or is queued, and
-//! the stage Close wakes the threads that wait with PEER_CLOSED or empties
-//! the queued slots, letting their owners go, CLOSE_PORTION heads of one
-//! level a portion, at the level of its top waiter when that is above the
-//! cause (spec 7.7). A request a receiver took lives on without the
-//! channel.
+//! of notifications that have a slot there (sessions, exits of processes,
+//! timers and interrupt bindings, each through its `Source`), and the
+//! cleanup queue's while it closes; the last one queues its shell (spec
+//! 7.7). Every source holds one of its abi::MAX_SLOTS slots, the slot of
+//! label 0 among them, from its creation until it goes, and a slot that
+//! stands in the queue holds its owner until receive or the stage Close
+//! takes it (spec 6.5). The last handle with RECEIVE closes it in the call
+//! itself: `notify` and `send` fail with PEER_CLOSED from then on, nothing
+//! new waits or is queued, and the stage Close wakes the threads that wait
+//! with PEER_CLOSED or empties the queued slots, letting their owners go,
+//! CLOSE_PORTION heads of one level a portion, at the level of its top
+//! waiter when that is above the cause (spec 7.7). A request a receiver
+//! took lives on without the channel.
 
 use crate::cleanup::{self, Item};
+use crate::irq::{self, Irq};
 use crate::object::{self, Live, Object, Refs};
 use crate::process::{self, Process};
 use crate::sched::{self, Locked};
@@ -67,6 +68,8 @@ pub enum Owner {
     Exit(NonNull<Process>),
     /// A timer (spec 10).
     Timer(NonNull<Timer>),
+    /// An interrupt binding (spec 9).
+    Irq(NonNull<Irq>),
     /// A thread's own slot (spec 6.1), which lies in it: its place while
     /// it waits in receive, its request while it waits in send. It carries
     /// no notification, and its thread's wait holds what it needs.
@@ -80,6 +83,7 @@ impl Owner {
             Owner::Session(_) => abi::Source::Session,
             Owner::Exit(_) => abi::Source::Exit,
             Owner::Timer(_) => abi::Source::Timer,
+            Owner::Irq(_) => abi::Source::Interrupt,
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
         }
     }
@@ -90,6 +94,7 @@ impl Owner {
             Owner::Session(s) => session::label(s),
             Owner::Exit(p) => process::exit_label(p),
             Owner::Timer(t) => timer::label(t),
+            Owner::Irq(b) => irq::label(b),
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
         }
     }
@@ -103,6 +108,7 @@ impl Owner {
             Owner::Session(s) => session::hold(s),
             Owner::Exit(p) => process::retain_shell(p),
             Owner::Timer(t) => timer::retain(t),
+            Owner::Irq(b) => irq::retain(b),
             Owner::Thread(_) => unreachable!("a thread's slot is posted"),
         }
     }
@@ -121,16 +127,18 @@ impl Owner {
             Owner::Exit(p) => unsafe { process::release_shell(p, cause) },
             // SAFETY: as above.
             Owner::Timer(t) => unsafe { timer::release(t, cause) },
+            // SAFETY: as above.
+            Owner::Irq(b) => unsafe { irq::release(b, cause) },
         }
     }
 }
 
-/// A source of notifications on a channel (spec 6.5): a session, a timer
-/// or the end of a process, which it lies in. It holds one of the
-/// channel's slots from channel::reserve_source until `detach`, and the
-/// channel with a counted reference from `attach` until then; its own slot,
-/// whose owner is the object it lies in, and the label receive reports
-/// with it, come with `attach`, once the object has its place.
+/// A source of notifications on a channel (spec 6.5): a session, a timer,
+/// the end of a process or an interrupt binding, which it lies in. It holds
+/// one of the channel's slots from channel::reserve_source until `detach`,
+/// and the channel with a counted reference from `attach` until then; its
+/// own slot, whose owner is the object it lies in, and the label receive
+/// reports with it, come with `attach`, once the object has its place.
 pub struct Source {
     slot: Option<Slot<Owner>>,
     label: u64,
@@ -1258,7 +1266,7 @@ unsafe fn free(c: NonNull<Channel>, level: u8) {
 const _: () = assert!(core::mem::offset_of!(Channel, refs) >= 8);
 
 #[cfg(feature = "ktest")]
-pub use test_access::{in_use, payer};
+pub use test_access::{in_use, payer, sources};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -1275,5 +1283,12 @@ mod test_access {
         // SAFETY: the test holds a reference to the channel; only the field is
         // read.
         unsafe { (*c.as_ptr()).payer }
+    }
+
+    /// The sources with a slot in `c`, which the test holds, the slot of
+    /// label 0 among them.
+    pub fn sources(c: NonNull<Channel>) -> u32 {
+        // SAFETY: as above.
+        unsafe { (*c.as_ptr()).sources }
     }
 }
