@@ -468,10 +468,7 @@ unsafe fn leave_parent(process: NonNull<Process>) -> bool {
     // SAFETY: the caller's promise; the parent's object is there, since the
     // process holds its shell, and so are the neighbours in its list.
     unsafe {
-        #[cfg(feature = "ktest")]
-        if (*p).children.is_some() {
-            EARLY_QUOTA.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
+        crate::testpoint::quota_stage((*p).children.is_some());
         let free = (*p).quota.return_free();
         let Some(parent) = (*p).parent else {
             return true;

@@ -97,8 +97,7 @@ struct Budget<'a>(&'a mut Account);
 
 // SAFETY: a frame comes zeroed from the allocator and is the list's until
 // `free_frame`, which gives it back once no table maps it: an object goes
-// only once nothing refers to it (spec 7.7). Words go through the linear
-// map, which covers all RAM, and the list touches only its own nodes.
+// only once nothing refers to it (spec 7.7).
 unsafe impl ListMemory for Budget<'_> {
     fn alloc_frame(&mut self) -> u64 {
         let frame = phys::alloc_zeroed(0, self.0);
@@ -112,7 +111,11 @@ unsafe impl ListMemory for Budget<'_> {
         // took.
         unsafe { phys::free(Frame::from_raw(pa, 0), self.0) }
     }
+}
 
+// SAFETY: words go through the linear map, which covers all RAM, and the
+// list touches only its own nodes.
+unsafe impl PhysMem for Budget<'_> {
     fn read(&self, pa: u64) -> u64 {
         // SAFETY: the list reads its own nodes.
         unsafe { LinearMem::new() }.read(pa)
@@ -280,11 +283,16 @@ pub fn attrs(m: NonNull<Memory>, access: Access) -> Attrs {
 /// (spec 7.4): mem_map shows it at a page of a program. At most two reads
 /// of the nodes of its list, through the linear map.
 pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
-    // SAFETY: the caller holds a reference to the object; the list only
-    // reads its nodes, and the budget is borrowed for its type alone.
-    let (backing, budget) = unsafe { (&(*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
+    // SAFETY: the caller holds a reference to the object; only the field
+    // is read.
+    let backing = unsafe { &(*m.as_ptr()).backing };
     match backing {
-        Backing::Owned(list) => list.frame(&Budget(budget), i),
+        Backing::Owned(list) => {
+            // SAFETY: the list reads only its own nodes, which the linear
+            // map covers.
+            let mem = unsafe { LinearMem::new() };
+            list.frame(&mem, i)
+        }
         Backing::Boot { base, .. } | Backing::Device { base, .. } => base + i as u64 * PAGE_SIZE,
     }
 }

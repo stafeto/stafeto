@@ -26,6 +26,11 @@ mod points {
     #[inline(always)]
     pub fn heads_taken(_: u8, _: usize) {}
 
+    /// A process at its stage Quota (process::teardown), and whether it
+    /// still has children, which the stage Children should have ended.
+    #[inline(always)]
+    pub fn quota_stage(_: bool) {}
+
     /// After the scheduler's part of the timer's interrupt
     /// (interrupt::handle).
     #[inline(always)]
@@ -89,6 +94,10 @@ mod points {
 
     pub fn portion_done() {
         el0::portion_done();
+    }
+
+    pub fn quota_stage(with_children: bool) {
+        ktest::quota_stage(with_children);
     }
 
     pub fn heads_taken(level: u8, heads: usize) {
