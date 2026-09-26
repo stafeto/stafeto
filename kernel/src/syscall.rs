@@ -1029,7 +1029,9 @@ fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
 /// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
 /// MEMORY takes a memory object's handle, a device window's too, with any
-/// rights and returns abi::MemoryInfo in x1-x3; IRQ an interrupt binding's
+/// rights and returns abi::MemoryInfo in x1-x3; THREAD_STATE a thread's and
+/// returns abi::ThreadInfo in x1-x4; CHANNEL a channel's, a labelled copy
+/// too, and returns abi::ChannelInfo in x1-x4; IRQ an interrupt binding's
 /// and returns abi::IrqInfo in x1-x3.
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
@@ -1066,6 +1068,14 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         abi::INFO_MEMORY => {
             let m = lookup(thread, a[0], Rights::NONE, Object::memory)?;
             Ok(Values::new(&memory::info(m).to_words()))
+        }
+        abi::INFO_THREAD_STATE => {
+            let t = lookup(thread, a[0], Rights::NONE, Object::thread)?;
+            Ok(Values::new(&thread::info(t).to_words()))
+        }
+        abi::INFO_CHANNEL => {
+            let c = lookup(thread, a[0], Rights::NONE, Object::channel)?;
+            Ok(Values::new(&channel::info(c).to_words()))
         }
         abi::INFO_IRQ => {
             let b = lookup(thread, a[0], Rights::NONE, Object::irq)?;

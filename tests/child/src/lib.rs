@@ -208,6 +208,9 @@ pub enum Role {
     /// info word of the binding's handle and the source, label, bits and
     /// count of the notification in a request that no reply answers. It
     /// never calls irq_ack: the line stays masked until the child dies.
+    /// With a word other than 0 it sends a second copy of its channel with
+    /// RECEIVE and TRANSFER in BIND, and after the reply waits in a request that
+    /// no reply answers without taking the notification.
     Rtc = 26,
 }
 

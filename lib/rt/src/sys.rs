@@ -15,9 +15,9 @@
 use crate::handle::{Channel, Handle, Interrupt, Memory, Process, Resource, Thread, Timer};
 use crate::msgbuf;
 use abi::{
-    Access, Call, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats, MESSAGE_HANDLES,
-    MESSAGE_MAX, MemoryInfo, Message, Notification, Policy, ProcessHandles, ProcessMemory,
-    ProcessState, Rights, SOURCE_SHIFT, Source, TRIGGER_EDGE,
+    Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats,
+    MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo, Message, Notification, Policy, ProcessHandles,
+    ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source, TRIGGER_EDGE, ThreadInfo,
 };
 use core::arch::asm;
 
@@ -280,6 +280,23 @@ pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {
     let args = [memory.raw().0, abi::INFO_MEMORY, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(MemoryInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// object_info(THREAD_STATE): what the thread does now, with what it waits
+/// for, its base and effective priorities and its policy.
+pub fn thread_info(thread: &Handle<Thread>) -> Result<ThreadInfo, Error> {
+    let args = [thread.raw().0, abi::INFO_THREAD_STATE, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(ThreadInfo::from_words([x[1], x[2], x[3], x[4]]))
+}
+
+/// object_info(CHANNEL) through a channel handle, a labelled copy too: the
+/// slots and requests in its queue, the receivers that wait there, its
+/// sources and whether it is closed.
+pub fn channel_info(channel: &Handle<Channel>) -> Result<ChannelInfo, Error> {
+    let args = [channel.raw().0, abi::INFO_CHANNEL, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(ChannelInfo::from_words([x[1], x[2], x[3], x[4]]))
 }
 
 /// object_info(IRQ): the binding's line, whether it is masked until

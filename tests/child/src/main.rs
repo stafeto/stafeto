@@ -245,7 +245,7 @@ fn run(s: &Start) -> u64 {
         },
         Role::Service => service(s).unwrap_or(FAILED),
         Role::Provider => provide(s).unwrap_or(FAILED),
-        Role::Rtc => drive().unwrap_or(FAILED),
+        Role::Rtc => drive(s).unwrap_or(FAILED),
     }
 }
 
@@ -691,12 +691,24 @@ fn provide(s: &Start) -> Result<u64, Error> {
 }
 
 /// Role::Rtc: the binding comes in the reply to BIND and stays with the
-/// child; the request after the interrupt waits until the child dies.
-fn drive() -> Result<u64, Error> {
+/// child; the request after the interrupt, or with word 0 other than 0 the
+/// one after the reply, waits until the child dies.
+fn drive(s: &Start) -> Result<u64, Error> {
     let c = sys::channel_create(1)?;
     let notify = sys::handle_duplicate(&c, Rights::NOTIFY | Rights::TRANSFER)?;
-    let reply = sys::send_handles(&rt::START_CHANNEL, &BIND.to_le_bytes(), &[notify.raw()])?;
+    let hold = s.args[0] != 0;
+    let reply = if hold {
+        let seen = sys::handle_duplicate(&c, Rights::RECEIVE | Rights::TRANSFER)?;
+        let handles = [notify.raw(), seen.raw()];
+        sys::send_handles(&rt::START_CHANNEL, &BIND.to_le_bytes(), &handles)?
+    } else {
+        sys::send_handles(&rt::START_CHANNEL, &BIND.to_le_bytes(), &[notify.raw()])?
+    };
     if reply.handles != 1 {
+        return Ok(FAILED);
+    }
+    if hold {
+        sys::send(&rt::START_CHANNEL, &BIND.to_le_bytes())?;
         return Ok(FAILED);
     }
     let (_, (kind, rights)) = msgbuf::handle(0);

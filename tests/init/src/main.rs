@@ -31,9 +31,9 @@
 #![no_main]
 
 use abi::{
-    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, IrqInfo, MemoryInfo,
-    OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
-    TRIGGER_EDGE, WINDOW_RIGHTS,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, ChannelInfo, Error, INIT_BOOT_IMAGE, IrqInfo,
+    MemoryInfo, OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
+    TRIGGER_EDGE, ThreadInfo, ThreadState, WINDOW_RIGHTS,
 };
 use bootimg::{Part, Program};
 use child::{Checked, Role};
@@ -48,7 +48,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 175] = [
+const TESTS: [Test; 178] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -118,6 +118,14 @@ const TESTS: [Test; 175] = [
     (
         "object_info_checks_its_arguments",
         object_info_checks_its_arguments,
+    ),
+    (
+        "thread_info_reports_state_and_priorities",
+        thread_info_reports_state_and_priorities,
+    ),
+    (
+        "channel_info_reports_queue_slots_and_receivers",
+        channel_info_reports_queue_slots_and_receivers,
     ),
     (
         "process_kill_returns_after_the_teardown",
@@ -579,6 +587,10 @@ const TESTS: [Test; 175] = [
         level_line_fires_again_until_its_source_is_cleared,
     ),
     ("dead_driver_frees_its_line", dead_driver_frees_its_line),
+    (
+        "driver_dying_with_a_queued_alarm_frees_its_line",
+        driver_dying_with_a_queued_alarm_frees_its_line,
+    ),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -1782,25 +1794,33 @@ fn kernel_stats_need_kstats() -> Outcome {
 
 /// object_info(x0 handle, x1 kind, x2 0) checks the kind and x2 first,
 /// then the handle, its type and its rights (spec 11, 16), and changes x0
-/// alone on an error: kind 0, a kind past MEMORY or with bits past its
-/// word and a nonzero x2 fail with INVALID_ARGS, for handle 0 too;
-/// handle 0 with a good kind fails with BAD_HANDLE. The kinds of a process
-/// take a process handle with any rights, and the system resource or a
-/// thread is WRONG_TYPE; KERNEL_STATS takes the system resource with
-/// KSTATS, and a process is WRONG_TYPE, a copy without KSTATS
-/// ACCESS_DENIED. A good call writes nothing past its words:
-/// PROCESS_STATE, «alive» here, x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
+/// alone on an error: kind 0, a kind past IRQ or with bits past its word
+/// and a nonzero x2 fail with INVALID_ARGS, for handle 0 too; handle 0
+/// with a good kind fails with BAD_HANDLE. The kinds of a process take a
+/// process handle with any rights, and the system resource or a thread is
+/// WRONG_TYPE; THREAD_STATE takes a thread, CHANNEL a channel and IRQ a
+/// binding, each with any rights, and a process or the system resource is
+/// WRONG_TYPE; KERNEL_STATS takes the system resource with KSTATS, and a
+/// process is WRONG_TYPE, a copy without KSTATS ACCESS_DENIED. A good call
+/// writes nothing past its words: PROCESS_STATE, «alive» here,
+/// THREAD_STATE and CHANNEL x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
 /// x1-x3.
 fn object_info_checks_its_arguments() -> Outcome {
     let own = copy(&init::PROCESS, Rights::NONE)?;
     let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
-    let result = object_info_cases(own.raw().0, debug.raw().0);
+    let thread = copy(&init::THREAD, Rights::NONE)?;
+    let c = channel(QUIET)?;
+    let seen = copy(&c, Rights::NONE)?;
+    let result = object_info_cases(own.raw().0, debug.raw().0, thread.raw().0, seen.raw().0);
     close(own)?;
     close(debug)?;
+    close(thread)?;
+    close(seen)?;
+    close(c)?;
     result
 }
 
-fn object_info_cases(own: u64, debug: u64) -> Outcome {
+fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     const N: u16 = Call::ObjectInfo.number();
     let (state, memory, table, stats) = (
         abi::INFO_PROCESS_STATE,
@@ -1808,19 +1828,29 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
         abi::INFO_PROCESS_HANDLES,
         abi::INFO_KERNEL_STATS,
     );
-    let (resource, thread) = (init::RESOURCE.raw().0, init::THREAD.raw().0);
+    let (thread_state, channel_kind, irq) =
+        (abi::INFO_THREAD_STATE, abi::INFO_CHANNEL, abi::INFO_IRQ);
+    let resource = init::RESOURCE.raw().0;
     let kinds = [
         [own, 0, 0],
-        [own, abi::INFO_MEMORY + 1, 0],
+        [own, irq + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
     ]
     .into_iter()
     .chain(
-        [memory, table, stats, abi::INFO_MEMORY]
-            .into_iter()
-            .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
+        [
+            memory,
+            table,
+            stats,
+            abi::INFO_MEMORY,
+            thread_state,
+            channel_kind,
+            irq,
+        ]
+        .into_iter()
+        .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
     )
     .all(|args| x0_alone::<N>(&args, Error::InvalidArgs.code()));
     let handles = [
@@ -1828,18 +1858,34 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
         (0, memory, Error::BadHandle),
         (0, table, Error::BadHandle),
         (0, stats, Error::BadHandle),
+        (0, thread_state, Error::BadHandle),
+        (0, channel_kind, Error::BadHandle),
+        (0, irq, Error::BadHandle),
         (resource, state, Error::WrongType),
         (thread, state, Error::WrongType),
         (resource, memory, Error::WrongType),
         (resource, table, Error::WrongType),
         (own, stats, Error::WrongType),
         (debug, stats, Error::AccessDenied),
+        (own, thread_state, Error::WrongType),
+        (seen, thread_state, Error::WrongType),
+        (own, channel_kind, Error::WrongType),
+        (thread, channel_kind, Error::WrongType),
+        (resource, irq, Error::WrongType),
+        (seen, irq, Error::WrongType),
     ]
     .into_iter()
     .all(|(h, kind, error)| x0_alone::<N>(&[h, kind, 0], error.code()));
-    let written = [(state, 5), (memory, 4), (table, 4)].map(|(kind, past)| {
+    let written = [
+        (own, state, 5),
+        (own, memory, 4),
+        (own, table, 4),
+        (thread, thread_state, 5),
+        (seen, channel_kind, 5),
+    ]
+    .map(|(h, kind, past)| {
         let mut x = marked();
-        x[..3].copy_from_slice(&[own, kind, 0]);
+        x[..3].copy_from_slice(&[h, kind, 0]);
         // SAFETY: object_info only reads its registers.
         let after = unsafe { sys::raw::<N>(x) };
         (after[0] == 0 && after[past..] == x[past..]).then_some(after)
@@ -1859,6 +1905,180 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
     check(
         written[0].is_some_and(|after| after[1..5] == ProcessState::Alive.to_words()),
         "PROCESS_STATE of init's process through a copy with no rights is not «alive»",
+    )
+}
+
+/// What THREAD_STATE says of the thread `t`.
+fn thread_info(t: &Handle<Thread>) -> Result<ThreadInfo, Error> {
+    sys::thread_info(t)
+}
+
+/// A thread with `state`, `base` and effective `priority`, FIFO.
+fn fifo(state: ThreadState, base: u8, priority: u8) -> Result<ThreadInfo, Error> {
+    Ok(ThreadInfo {
+        state,
+        base,
+        priority,
+        policy: Some(Policy::Fifo),
+    })
+}
+
+/// Spec 8, 6.6, 11: THREAD_STATE of a thread, through a handle with no
+/// rights, says what it does and at which priorities. Init runs FIFO at
+/// TEST_PRIORITY; a new thread at LOW, round robin, is stopped, then
+/// ready behind init, then ended. A thread at LOW waits in receive; a
+/// notification of priority NOTICE wakes it at NOTICE, above init, and it
+/// waits in send at once, still boosted, then for the reply once init
+/// took its request, and ends with the reply.
+fn thread_info_reports_state_and_priorities() -> Outcome {
+    reset_results();
+    let own = thread_info(&init::THREAD);
+    let t = thread(1, add_mark, 1, LOW, Policy::RoundRobin)?;
+    let seen = copy(&t, Rights::NONE)?;
+    let stopped = thread_info(&seen);
+    sys::thread_start(&t).map_err(|_| "thread_start failed")?;
+    let ready = thread_info(&seen);
+    let c = channel(NOTICE)?;
+    let d = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    HANDLES[1].store(d.raw().0, Relaxed);
+    let w = spawn(0, wake_then_send, 0, LOW, Policy::Fifo)?;
+    let_run()?;
+    let ended = thread_info(&seen);
+    let receiving = thread_info(&w);
+    let posted = sys::notify(&c, 1);
+    let sending = thread_info(&w);
+    let token = take_token(&d);
+    let awaiting = thread_info(&w);
+    let replied = token.map(|t| t.reply(&[]));
+    let gone = thread_info(&w).map(|i| i.state);
+    let_run()?;
+    for h in [w, seen, t] {
+        close(h)?;
+    }
+    close(d)?;
+    close(c)?;
+    check(
+        own == fifo(ThreadState::Running, TEST_PRIORITY, TEST_PRIORITY),
+        "init is not running FIFO at its priority",
+    )?;
+    let round = |state| {
+        Ok(ThreadInfo {
+            state,
+            base: LOW,
+            priority: LOW,
+            policy: Some(Policy::RoundRobin),
+        })
+    };
+    check(
+        stopped == round(ThreadState::Stopped)
+            && ready == round(ThreadState::Ready)
+            && ended == round(ThreadState::Ended),
+        "a new thread was not stopped, then ready, then ended",
+    )?;
+    check(
+        receiving == fifo(ThreadState::Receiving, LOW, LOW),
+        "a thread waiting in receive was not seen so",
+    )?;
+    check(
+        posted.is_ok() && sending == fifo(ThreadState::Sending, LOW, NOTICE),
+        "a thread woken at NOTICE was not seen in send at its boost",
+    )?;
+    check(
+        awaiting == fifo(ThreadState::AwaitingReply, LOW, NOTICE),
+        "a thread whose request was taken did not await its reply",
+    )?;
+    check(
+        replied == Ok(Ok(())) && gone == Ok(ThreadState::Ended),
+        "the thread did not end with its reply",
+    )
+}
+
+/// Waits in receive on the channel HANDLES holds for slot 0, then sends
+/// request(0) through the one it holds for slot 1, and ends with the reply.
+extern "C" fn wake_then_send(_: u64) -> ! {
+    let _ = sys::receive(&handle(0));
+    let _ = sys::send(&handle(1), &request(0));
+    sys::thread_exit()
+}
+
+/// What CHANNEL says of a channel with `queued`, `receivers` and
+/// `sources`, open.
+fn open_channel(queued: u64, receivers: u64, sources: u64) -> Result<ChannelInfo, Error> {
+    Ok(ChannelInfo {
+        queued,
+        receivers,
+        sources,
+        closed: false,
+    })
+}
+
+/// Spec 6.3, 6.5, 11: CHANNEL of a channel, through its handle and
+/// through a labelled copy with no rights, counts the slots in its queue,
+/// merged posts once, the receivers that wait there, and its sources, the
+/// slot of label 0 among them; once its last handle with RECEIVE went,
+/// it is closed and its receivers woke.
+fn channel_info_reports_queue_slots_and_receivers() -> Outcome {
+    reset_marks();
+    reset_results();
+    let c = channel(QUIET)?;
+    let fresh = sys::channel_info(&c);
+    let one = session(&c, Rights::NOTIFY, 1, QUIET)?;
+    let two = session(&c, Rights::NOTIFY, 2, QUIET)?;
+    let seen = session(&c, Rights::NONE, 3, QUIET)?;
+    let posted = [
+        sys::notify(&c, 1),
+        sys::notify(&one, 1),
+        sys::notify(&two, 1),
+        sys::notify(&c, 2),
+    ];
+    let queued = (sys::channel_info(&c), sys::channel_info(&seen));
+    let taken = [0; 3].map(|_| sys::try_receive(&c).is_ok());
+    let empty = sys::try_receive(&c) == Err(Error::WouldBlock);
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let r = [
+        spawn(0, mark_at_notice, 0, HIGH, Policy::Fifo)?,
+        spawn(1, mark_at_notice, 0, HIGH, Policy::Fifo)?,
+    ];
+    let waiting = sys::channel_info(&seen);
+    let woke = sys::notify(&c, 1).map(|()| mark(1));
+    let left = sys::channel_info(&seen);
+    close(c)?;
+    let closed = sys::channel_info(&seen);
+    let_run()?;
+    for h in r {
+        close(h)?;
+    }
+    for h in [seen, two, one] {
+        close(h)?;
+    }
+    check(
+        fresh == open_channel(0, 0, 1),
+        "a new channel is not empty with one source",
+    )?;
+    check(
+        posted.iter().all(Result::is_ok)
+            && queued == (open_channel(3, 0, 4), open_channel(3, 0, 4)),
+        "three slots, one merged twice, and four sources were not counted alike through both handles",
+    )?;
+    check(taken == [true; 3] && empty, "the three slots did not come")?;
+    check(
+        waiting == open_channel(0, 2, 4),
+        "two waiting receivers were not counted",
+    )?;
+    check(
+        woke == Ok(1) && left == open_channel(0, 1, 4),
+        "a woken receiver was still counted",
+    )?;
+    check(
+        closed
+            == Ok(ChannelInfo {
+                queued: 0,
+                receivers: 0,
+                sources: 4,
+                closed: true,
+            }),
+        "the closed channel is not closed with no receiver",
     )
 }
 
@@ -8888,7 +9108,7 @@ fn dead_driver_frees_its_line() -> Outcome {
     let heard = kid
         .start()
         .and_then(|()| kid.serve(Role::Rtc, &[], &[]))
-        .and_then(|()| bind_for(&kid))
+        .and_then(|()| bind_for(&kid, false).map(drop))
         .and_then(|()| rtc.raise())
         .and_then(|()| kid.ear.next());
     let killed = sys::process_kill(&kid.process);
@@ -8932,22 +9152,95 @@ fn dead_driver_frees_its_line() -> Outcome {
     )
 }
 
+/// Spec 15.2 (devices), 9, 13.4: a driver that dies with a notification
+/// in its channel's queue frees its line at once. The child (Role::Rtc,
+/// word 1) sends init besides a copy of its channel with RECEIVE and
+/// TRANSFER, and waits in a request once it holds the binding, taking
+/// nothing. Init raises the alarm, which the way out of the kernel
+/// delivers before init runs again: CHANNEL of the copy shows one
+/// notification queued. Init's copy keeps the channel open, and the
+/// notification in its queue, after the child's end; irq_bind of the line
+/// succeeds all the same, and the alarm, never cleared, comes before it
+/// returns. The old notification still waits in the child's channel.
+fn driver_dying_with_a_queued_alarm_frees_its_line() -> Outcome {
+    let rtc = Rtc::open()?;
+    let kid = Kid::load(RTC_QUOTA, 16, LEVEL)?;
+    let seen = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Rtc, &[1], &[]))
+        .and_then(|()| bind_for(&kid, true));
+    let queued = match &seen {
+        Ok(Some(s)) => kid
+            .ear
+            .next()
+            .and_then(|_| rtc.raise())
+            .and_then(|()| let_run())
+            .map(|()| sys::channel_info(s).map(|i| i.queued)),
+        Ok(None) => Err("the child sent no second copy of its channel"),
+        Err(e) => Err(*e),
+    };
+    let killed = sys::process_kill(&kid.process);
+    let state = kid.end();
+    kid.close()?;
+    let again = rtc.bind();
+    let got = rtc.now();
+    let cleared = rtc.clear();
+    let rest = again.as_ref().ok().map(|b| (sys::irq_ack(b), rtc.now()));
+    if let Ok(b) = again {
+        close(b)?;
+    }
+    let left = match seen {
+        Ok(Some(s)) => {
+            let left = sys::channel_info(&s).map(|i| i.queued);
+            close(s)?;
+            left
+        }
+        _ => Err(Error::BadHandle),
+    };
+    rtc.close()?;
+    check(
+        queued? == Ok(1) && left == Ok(1),
+        "the alarm did not wait in the child's channel",
+    )?;
+    check(
+        killed.is_ok() && state? == ProcessState::Killed,
+        "the child did not end killed",
+    )?;
+    check(
+        rest.is_some() && got == Ok(interrupt(1)),
+        "the line of a driver that died with a notification queued did not bind again at once",
+    )?;
+    cleared?;
+    check(
+        rest == Some((Ok(()), Err(Error::WouldBlock))),
+        "the alarm came again once cleared",
+    )
+}
+
 /// Takes the child's request BIND with a copy of its channel with NOTIFY,
-/// binds RTC_LINE through it at LEVEL, closes the copy, and answers with
-/// a copy of the binding with DRIVER_RIGHTS, which moves to the child;
-/// init's own handle goes (spec 13.4).
-fn bind_for(kid: &Kid) -> Outcome {
+/// and when `seen` a second copy with RECEIVE and TRANSFER, which init
+/// keeps and returns; binds RTC_LINE through the first at LEVEL, closes it, and
+/// answers with a copy of the binding with DRIVER_RIGHTS, which moves to
+/// the child; init's own handle goes (spec 13.4).
+fn bind_for(kid: &Kid, seen: bool) -> Result<Option<Handle<Channel>>, &'static str> {
     let Received::Message {
         label: START,
         len: 8,
-        handles: 1,
+        handles,
         token,
         words,
     } = kid.ear.next()?
     else {
         return Err("the child did not send its channel");
     };
-    let c: Handle<Channel> = Handle::from_raw(rt::msgbuf::handle(0).0);
+    let copy_of =
+        |i: usize| (i < handles).then(|| Handle::<Channel>::from_raw(rt::msgbuf::handle(i).0));
+    let (c, kept) = (copy_of(0), copy_of(1));
+    check(
+        handles == 1 + usize::from(seen),
+        "the child sent another count of handles",
+    )?;
+    let c = c.ok_or("the child did not send its channel")?;
     let b = sys::irq_bind(&init::RESOURCE, RTC_LINE, &c, LEVEL, false);
     close(c)?;
     check(words[0] == child::BIND, "the child's request is not BIND")?;
@@ -8956,5 +9249,6 @@ fn bind_for(kid: &Kid) -> Outcome {
     close(b)?;
     token
         .reply_handles(&[], &[given?.raw()])
-        .map_err(|_| "the reply with the binding failed")
+        .map_err(|_| "the reply with the binding failed")?;
+    Ok(kept)
 }

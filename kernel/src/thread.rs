@@ -26,7 +26,7 @@ use crate::mm::phys::{self, Frame};
 use crate::object::{self, Live, Moving, Object, Refs};
 use crate::process::{self, Change, Process};
 use crate::sched::{self, Tokens};
-use abi::{Access, Call, Error, MESSAGE_HANDLES, Policy, msgbuf};
+use abi::{Access, Call, Error, MESSAGE_HANDLES, Policy, ThreadInfo, ThreadState, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
 use kcore::notify::Slot;
@@ -581,6 +581,35 @@ pub unsafe fn release(thread: NonNull<Thread>, cause: u8) {
         let item = NonNull::new_unchecked(&raw mut (*thread.as_ptr()).cleanup);
         cleanup::enqueue(item, Object::Thread(thread), cause);
     }
+}
+
+/// object_info THREAD_STATE of `thread`, which the caller holds (spec 11):
+/// its state, with what it waits for, its base and effective priorities
+/// and its policy, read with the scheduler locked, since the scheduler and
+/// the channels change them there. O(1).
+pub fn info(thread: NonNull<Thread>) -> ThreadInfo {
+    sched::locked(|_| {
+        // SAFETY: the caller holds a reference to the thread; only its
+        // fields are read.
+        let t = unsafe { thread.as_ref() };
+        let state = match t.sched.state() {
+            State::Stopped => ThreadState::Stopped,
+            State::Ready => ThreadState::Ready,
+            State::Running => ThreadState::Running,
+            State::Waiting => match t.waits.expect("a waiting thread waits for something") {
+                Wait::Receive(_) => ThreadState::Receiving,
+                Wait::Send(_) => ThreadState::Sending,
+                Wait::Reply(_) => ThreadState::AwaitingReply,
+            },
+            State::Dead => ThreadState::Ended,
+        };
+        ThreadInfo {
+            state,
+            base: t.sched.base(),
+            priority: t.sched.priority(),
+            policy: Some(t.sched.policy()),
+        }
+    })
 }
 
 /// The portion of a thread nobody refers to (cleanup): its buffer goes with

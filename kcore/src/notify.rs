@@ -127,6 +127,9 @@ pub struct Queue<O> {
     items: ReadyQueue<Slot<O>>,
     /// The items are receivers that wait, not slots and requests.
     receivers: bool,
+    /// The items in the queue: one more at each insert, one less at each
+    /// removal (object_info CHANNEL, spec 11).
+    len: u32,
 }
 
 impl<O: Copy> Queue<O> {
@@ -134,6 +137,17 @@ impl<O: Copy> Queue<O> {
         Queue {
             items: ReadyQueue::new(),
             receivers: false,
+            len: 0,
+        }
+    }
+
+    /// The slots and requests queued, and the receivers that wait: one of
+    /// the two is 0. O(1).
+    pub fn counts(&self) -> (u32, u32) {
+        if self.receivers {
+            (0, self.len)
+        } else {
+            (self.len, 0)
         }
     }
 
@@ -206,6 +220,7 @@ impl<O: Copy> Queue<O> {
     /// As for `post`.
     unsafe fn enqueue(&mut self, item: NonNull<Slot<O>>) {
         self.receivers = false;
+        self.len += 1;
         // SAFETY: the caller's promise.
         unsafe { self.items.push_tail(item) };
     }
@@ -232,6 +247,7 @@ impl<O: Copy> Queue<O> {
             "a receiver waits while a slot or a request is queued"
         );
         self.receivers = true;
+        self.len += 1;
         // SAFETY: the caller's promise.
         unsafe { self.items.push_tail(receiver) };
     }
@@ -250,6 +266,7 @@ impl<O: Copy> Queue<O> {
     fn take_head(&mut self) -> Option<NonNull<Slot<O>>> {
         let top = self.items.top()?;
         let item = self.items.first(top).expect("a level with its bit set");
+        self.len -= 1;
         // SAFETY: the item is in this queue, and a queued item is alive
         // (`post`, `send`, `wait`).
         unsafe { self.items.remove(item) };
@@ -262,6 +279,7 @@ impl<O: Copy> Queue<O> {
     /// # Safety
     /// `item` is alive and stands in this queue.
     pub unsafe fn cancel(&mut self, item: NonNull<Slot<O>>) {
+        self.len -= 1;
         // SAFETY: the caller's promise.
         unsafe { self.items.remove(item) };
     }
@@ -524,6 +542,47 @@ mod tests {
         assert_eq!((q.top(), q.head().map(name)), (Some(30), Some('s')));
         assert_eq!(received(&mut q), [('s', 3, 2), ('b', 0, 0), ('a', 0, 0)]);
         assert!(q.is_empty() && q.top().is_none());
+    }
+
+    /// object_info CHANNEL (spec 11): the queue counts its slots and
+    /// requests, or its receivers, as they come and go by every path: a
+    /// post, a merge, a request, a receive, a wait, a delivery to a waiter,
+    /// a thread that leaves and a move to another level.
+    #[test]
+    fn queue_counts_its_items() {
+        let mut q = Queue::new();
+        let [s, t, a, r1, r2, r3] = [
+            ('s', 30),
+            ('t', 10),
+            ('a', 20),
+            ('1', 10),
+            ('2', 10),
+            ('3', 20),
+        ]
+        .map(|(n, l)| slot(l, n));
+        assert_eq!(q.counts(), (0, 0));
+        // SAFETY: the test keeps its slots alive.
+        unsafe {
+            q.post(s.1, 1);
+            q.post(t.1, 1);
+            q.post(s.1, 2);
+            assert_eq!(q.send(a.1), None);
+            assert_eq!(q.counts(), (3, 0));
+            q.move_to(a.1, 40);
+            q.cancel(a.1);
+            assert_eq!(q.counts(), (2, 0));
+            assert_eq!(taken(&mut q), "st");
+            assert_eq!(q.counts(), (0, 0));
+            q.wait(r1.1);
+            q.wait(r2.1);
+            q.wait(r3.1);
+            assert_eq!(q.counts(), (0, 3));
+            assert!(matches!(q.post(s.1, 4), Post::Deliver(_)));
+            q.cancel(r2.1);
+            assert_eq!(q.counts(), (0, 1));
+            assert_eq!(q.take_waiter().map(name), Some('1'));
+            assert_eq!(q.counts(), (0, 0));
+        }
     }
 
     /// A request finds the top receiver that waits and goes to it at once

@@ -42,7 +42,7 @@ use crate::syscall;
 use crate::thread::{self, Thread};
 use crate::timer::{self, Timer};
 use crate::{arch, testpoint};
-use abi::{Error, INLINE_MAX, MAX_SLOTS, Notification, Rights};
+use abi::{ChannelInfo, Error, INLINE_MAX, MAX_SLOTS, Notification, Rights};
 use core::ptr::NonNull;
 use kcore::args::{Desc, mask_tail};
 use kcore::notify::{Post, Queue, Slot};
@@ -431,6 +431,23 @@ pub fn is_closed(c: NonNull<Channel>) -> bool {
     // SAFETY: the caller holds a reference to the channel; only the field
     // is read.
     unsafe { (*c.as_ptr()).closed }
+}
+
+/// object_info CHANNEL of `c`, which the caller holds (spec 11): the slots
+/// and requests in its queue and the receivers that wait there, read with
+/// the scheduler locked, its sources, the slot of label 0 among them, and
+/// whether it is closed. O(1).
+pub fn info(c: NonNull<Channel>) -> ChannelInfo {
+    // SAFETY: the caller holds a reference to the channel.
+    let (queued, receivers) = sched::locked(|k| unsafe { queue(c, k.s) }.counts());
+    // SAFETY: as above; only the fields are read.
+    let (sources, closed) = unsafe { ((*c.as_ptr()).sources, (*c.as_ptr()).closed) };
+    ChannelInfo {
+        queued: queued.into(),
+        receivers: receivers.into(),
+        sources: sources.into(),
+        closed,
+    }
 }
 
 /// A new source of notifications takes one of the slots of `c`, which the
