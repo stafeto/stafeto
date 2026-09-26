@@ -145,29 +145,29 @@ fn init_prints_from_el0() -> Outcome {
 /// abi::OWNER_RIGHTS are made.
 fn init_handles_have_their_fixed_values() -> Outcome {
     check(
-        sys::process_state(&init::PROCESS) == Ok(ProcessState::Alive),
+        sys::process_state(&own()) == Ok(ProcessState::Alive),
         "INIT_PROCESS is not a live process",
     )?;
     check(
-        sys::debug_write(&init::RESOURCE, b"") == Ok(0),
+        sys::debug_write(&resource(), b"") == Ok(0),
         "INIT_RESOURCE does not write to the console",
     )?;
     check(
-        sys::process_state(&retyped(&init::RESOURCE)) == Err(Error::WrongType),
+        sys::process_state(&retyped(&resource())) == Err(Error::WrongType),
         "INIT_RESOURCE is not the system resource",
     )?;
     check(
-        sys::thread_set_priority(&init::THREAD, TEST_PRIORITY, Policy::Fifo).is_ok(),
+        sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo).is_ok(),
         "INIT_THREAD is not a thread with MANAGE",
     )?;
     check(
-        sys::process_state(&retyped(&init::THREAD)) == Err(Error::WrongType),
+        sys::process_state(&retyped(&me())) == Err(Error::WrongType),
         "INIT_THREAD is a process",
     )?;
     let copies = [
-        sys::handle_duplicate(&init::RESOURCE, abi::INIT_RESOURCE_RIGHTS).map(close),
-        sys::handle_duplicate(&init::PROCESS, abi::OWNER_RIGHTS).map(close),
-        sys::handle_duplicate(&init::THREAD, abi::OWNER_RIGHTS).map(close),
+        sys::handle_duplicate(&resource(), abi::INIT_RESOURCE_RIGHTS).map(close),
+        sys::handle_duplicate(&own(), abi::OWNER_RIGHTS).map(close),
+        sys::handle_duplicate(&me(), abi::OWNER_RIGHTS).map(close),
     ];
     check(
         copies.iter().all(|c| matches!(c, Ok(Ok(())))),
@@ -182,7 +182,7 @@ fn init_handles_have_their_fixed_values() -> Outcome {
 /// alone; a copy with TRANSFER is made, and its close gives no frame back.
 fn boot_image_is_a_read_only_memory_object() -> Outcome {
     const N: u16 = Call::MemMap.number();
-    let image: Handle<Memory> = Handle::from_raw(INIT_BOOT_IMAGE);
+    let image = image();
     let info = sys::memory_info(&image).map_err(|_| "MEMORY of INIT_BOOT_IMAGE failed")?;
     check(
         info.size > 0 && info.size.is_multiple_of(PAGE as u64) && info.pages == 0,
@@ -192,8 +192,8 @@ fn boot_image_is_a_read_only_memory_object() -> Outcome {
         .into_iter()
         .all(|access| {
             let args = [
-                init::PROCESS.raw().0,
-                INIT_BOOT_IMAGE.0,
+                own().raw().0,
+                image.raw().0,
                 0,
                 info.size,
                 WINDOW as u64,
@@ -226,7 +226,7 @@ fn init_has_its_message_buffer() -> Outcome {
     // SAFETY: as in `thread`; slot 0 is free.
     let taken = unsafe {
         sys::thread_create(
-            &init::PROCESS,
+            &own(),
             add_mark,
             STACKS[0].top(),
             0,
@@ -260,7 +260,7 @@ fn init_has_its_message_buffer() -> Outcome {
 /// only those of a shorter length; xtask finds both lines whole.
 fn debug_write_checks_its_arguments() -> Outcome {
     let gone = closed_handle()?;
-    let stats = copy(&init::RESOURCE, Rights::KSTATS)?;
+    let stats = copy(&resource(), Rights::KSTATS)?;
     let result = debug_write_cases(gone, stats.raw().0);
     close(stats)?;
     result
@@ -268,7 +268,7 @@ fn debug_write_checks_its_arguments() -> Outcome {
 
 fn debug_write_cases(gone: u64, no_debug: u64) -> Outcome {
     const N: u16 = Call::DebugWrite.number();
-    let resource = init::RESOURCE.raw().0;
+    let resource = resource().raw().0;
     let past = abi::INLINE_MAX as u64 + 1;
     let lengths = [
         (resource, past),
@@ -281,7 +281,7 @@ fn debug_write_cases(gone: u64, no_debug: u64) -> Outcome {
     let handles = [
         (gone, Error::BadHandle),
         (0, Error::BadHandle),
-        (init::PROCESS.raw().0, Error::WrongType),
+        (own().raw().0, Error::WrongType),
         (no_debug, Error::AccessDenied),
     ]
     .into_iter()
@@ -299,7 +299,7 @@ fn debug_write_cases(gone: u64, no_debug: u64) -> Outcome {
         "debug_write did not write the bytes of its length and return their count alone",
     )?;
     check(
-        sys::debug_write(&init::RESOURCE, b"\n") == Ok(1),
+        sys::debug_write(&crate::harness::resource(), b"\n") == Ok(1),
         "debug_write did not write a newline",
     )
 }
@@ -310,7 +310,7 @@ pub(crate) fn written(line: &[u8]) -> bool {
     let mut bytes = [b'#'; abi::INLINE_MAX];
     bytes[..line.len()].copy_from_slice(line);
     let mut x = marked();
-    x[..2].copy_from_slice(&[init::RESOURCE.raw().0, line.len() as u64]);
+    x[..2].copy_from_slice(&[resource().raw().0, line.len() as u64]);
     x[2..].copy_from_slice(&abi::inline_words(&bytes));
     // SAFETY: debug_write only reads its registers.
     let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
@@ -343,14 +343,13 @@ fn unknown<const N: u16>() -> Outcome {
 fn priority_ceilings_hold() -> Outcome {
     for priority in [0, abi::PRIORITY_LEVELS] {
         check(
-            sys::thread_set_priority(&init::THREAD, priority, Policy::Fifo)
-                == Err(Error::InvalidArgs),
+            sys::thread_set_priority(&me(), priority, Policy::Fifo) == Err(Error::InvalidArgs),
             "priority 0 or 64 was taken",
         )?;
     }
     let set_priority = |priority: u64, policy: u64| {
         let mut x = marked();
-        x[0] = init::THREAD.raw().0;
+        x[0] = me().raw().0;
         x[1] = priority;
         x[2] = policy;
         // SAFETY: thread_set_priority only reads its registers.
@@ -427,7 +426,7 @@ fn set_priority_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Out
         });
     let handles = [
         (gone, Error::BadHandle),
-        (init::RESOURCE.raw().0, Error::WrongType),
+        (resource().raw().0, Error::WrongType),
         (weak.raw().0, Error::AccessDenied),
     ]
     .into_iter()
@@ -619,7 +618,7 @@ fn marker(page: usize, priority: u8) -> Result<Handle<Thread>, Error> {
     // most one runs, and it ends before the next test.
     unsafe {
         sys::thread_create(
-            &init::PROCESS,
+            &own(),
             add_mark,
             STACKS[0].top(),
             0,
@@ -939,7 +938,7 @@ fn quota_is_enforced() -> Outcome {
         sys::process_create(LEAST_QUOTA, 16, LOW)
             .map_err(|_| "a child with the least quota was not made")?,
     )?;
-    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let own = sys::process_memory(&own()).map_err(|_| "PROCESS_MEMORY of init failed")?;
     let over = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
     let mut x = marked();
     x[..6].copy_from_slice(&[over, 16, LOW.into(), 0, 0, 0]);
@@ -954,7 +953,7 @@ fn quota_is_enforced() -> Outcome {
         "a child took a quota below the least",
     )?;
     check(
-        sys::process_memory(&init::PROCESS).map(|m| m.used) == Ok(own.used),
+        sys::process_memory(&crate::harness::own()).map(|m| m.used) == Ok(own.used),
         "a child that was not made kept init's quota after the call",
     )?;
     let c = sys::process_create(LEAST_QUOTA, 16, LOW)
@@ -977,15 +976,15 @@ fn quota_is_enforced() -> Outcome {
 /// is every frame free when it was made (spec 7.5): the frames free are
 /// exactly the parts of the quotas of init and its child nobody used.
 fn process_info_kinds() -> Outcome {
-    let before = sys::process_handles(&init::PROCESS);
+    let before = sys::process_handles(&own());
     let c = child(LOW)?;
     let made = sys::process_memory(&c);
     let table = sys::process_handles(&c);
     let t = child_thread(&c, LOW);
     let with_thread = sys::process_memory(&c);
-    let after = sys::process_handles(&init::PROCESS);
-    let own = sys::process_memory(&init::PROCESS);
-    let stats = sys::kernel_stats(&init::RESOURCE);
+    let after = sys::process_handles(&own());
+    let own = sys::process_memory(&own());
+    let stats = sys::kernel_stats(&resource());
     let threaded = t.is_ok();
     close(c)?;
     if let Ok(t) = t {
@@ -1039,10 +1038,10 @@ fn process_info_kinds() -> Outcome {
 /// and the frames and pool pages are there.
 fn kernel_stats_need_kstats() -> Outcome {
     check(
-        sys::kernel_stats(&retyped(&init::PROCESS)) == Err(Error::WrongType),
+        sys::kernel_stats(&retyped(&own())) == Err(Error::WrongType),
         "a process handle gave the kernel's counts",
     )?;
-    let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
+    let debug = copy(&resource(), Rights::DEBUG)?;
     let denied = sys::kernel_stats(&debug);
     let written = sys::debug_write(&debug, b"");
     close(debug)?;
@@ -1051,7 +1050,7 @@ fn kernel_stats_need_kstats() -> Outcome {
         "a copy of the resource without KSTATS gave the kernel's counts, or did not write",
     )?;
     let mut x = marked();
-    x[..3].copy_from_slice(&[init::RESOURCE.raw().0, abi::INFO_KERNEL_STATS, 0]);
+    x[..3].copy_from_slice(&[resource().raw().0, abi::INFO_KERNEL_STATS, 0]);
     // SAFETY: object_info only reads its registers.
     let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
     check(
@@ -1079,9 +1078,9 @@ fn kernel_stats_need_kstats() -> Outcome {
 /// THREAD_STATE and CHANNEL x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
 /// x1-x3.
 fn object_info_checks_its_arguments() -> Outcome {
-    let own = copy(&init::PROCESS, Rights::NONE)?;
-    let debug = copy(&init::RESOURCE, Rights::DEBUG)?;
-    let thread = copy(&init::THREAD, Rights::NONE)?;
+    let own = copy(&own(), Rights::NONE)?;
+    let debug = copy(&resource(), Rights::DEBUG)?;
+    let thread = copy(&me(), Rights::NONE)?;
     let c = channel(QUIET)?;
     let seen = copy(&c, Rights::NONE)?;
     let result = object_info_cases(own.raw().0, debug.raw().0, thread.raw().0, seen.raw().0);
@@ -1103,7 +1102,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     );
     let (thread_state, channel_kind, irq) =
         (abi::INFO_THREAD_STATE, abi::INFO_CHANNEL, abi::INFO_IRQ);
-    let resource = init::RESOURCE.raw().0;
+    let resource = resource().raw().0;
     let kinds = [
         [own, 0, 0],
         [own, irq + 1, 0],
@@ -1205,7 +1204,7 @@ fn fifo(state: ThreadState, base: u8, priority: u8) -> Result<ThreadInfo, Error>
 /// took its request, and ends with the reply.
 fn thread_info_reports_state_and_priorities() -> Outcome {
     reset_results();
-    let own = thread_info(&init::THREAD);
+    let own = thread_info(&me());
     let t = thread(1, add_mark, 1, LOW, Policy::RoundRobin)?;
     let seen = copy(&t, Rights::NONE)?;
     let stopped = thread_info(&seen);
@@ -1366,7 +1365,7 @@ fn process_kill_returns_after_the_teardown() -> Outcome {
     let c = heard_child(&name, QUIET, LOW)?;
     let t = child_thread(&c, LOW);
     let killed = sys::process_kill(&c);
-    let stats = sys::kernel_stats(&init::RESOURCE);
+    let stats = sys::kernel_stats(&resource());
     let memory = sys::process_memory(&c);
     let heard = take_one(&exits);
     let made = t.is_ok() && killed.is_ok();
@@ -1396,7 +1395,7 @@ fn process_kill_returns_after_the_teardown() -> Outcome {
 /// thread hold, which init's handles keep; the rest once init closes the
 /// handles. Then init uses what it used before the child.
 fn child_quota_comes_back() -> Outcome {
-    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let used = || sys::process_memory(&own()).map(|m| m.used);
     let before = used();
     let c = child(LOW)?;
     let made = used();
@@ -1564,7 +1563,7 @@ fn least(round: &mut dyn FnMut() -> bool) -> Result<u64, &'static str> {
 /// Replies to each request on channel `h` with its bytes, until a request
 /// with none, and ends.
 extern "C" fn echo_until_empty(h: u64) -> ! {
-    let c = Handle::<Channel>::from_raw(abi::Handle(h));
+    let c = Handle::<Channel>::borrowed(abi::Handle(h));
     while let Ok(Received::Message { token, len, .. }) = sys::receive(&c) {
         let replied = token.reply(&COST_BYTES[..len.min(COST_BYTES.len())]);
         if len == 0 || replied.is_err() {

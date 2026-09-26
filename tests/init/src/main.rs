@@ -37,16 +37,17 @@ mod harness;
 mod memory;
 mod messages;
 mod processes;
+mod runtime;
 mod timers;
 mod transfers;
 
-use harness::{LOOP_TICKS, Policy, Relaxed, TEST_PRIORITY, Test, init, println, sys};
+use harness::{LOOP_TICKS, Policy, Relaxed, TEST_PRIORITY, Test, keep, me, println, sys};
 use processes::prepare;
 
 rt::entry!(main);
 
 /// The tests of each module, in the order they run.
-const MODULES: [&[Test]; 8] = [
+const MODULES: [&[Test]; 9] = [
     &calls::TESTS,
     &channels::TESTS,
     &timers::TESTS,
@@ -55,10 +56,11 @@ const MODULES: [&[Test]; 8] = [
     &messages::TESTS,
     &transfers::TESTS,
     &devices::TESTS,
+    &runtime::TESTS,
 ];
 
 fn main(_: u64) -> u64 {
-    rt::console::set(&init::RESOURCE);
+    keep(rt::init_handles().expect("init's first handles come once"));
     let ticks = loop_ticks();
     LOOP_TICKS.store(ticks, Relaxed);
     println!("counter ticks of 10000 turns: {ticks}");
@@ -69,7 +71,7 @@ fn main(_: u64) -> u64 {
     let tests = MODULES.into_iter().flatten();
     for (i, &(name, test)) in tests.enumerate() {
         if i == 1 {
-            sys::thread_set_priority(&init::THREAD, TEST_PRIORITY, Policy::Fifo)
+            sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
                 .expect("init takes the priority of the tests");
         }
         match test() {

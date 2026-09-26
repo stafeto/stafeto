@@ -79,7 +79,7 @@ const RTC_LINE: u32 = 34;
 /// A binding of `line` to `c` through the system resource, the slot at
 /// QUIET, edge-triggered when `edge`.
 fn bound(line: u32, c: &Handle<Channel>, edge: bool) -> Result<Handle<Interrupt>, &'static str> {
-    sys::irq_bind(&init::RESOURCE, line, c, QUIET, edge).map_err(|_| "irq_bind failed")
+    sys::irq_bind(&resource(), line, c, QUIET, edge).map_err(|_| "irq_bind failed")
 }
 
 /// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
@@ -101,8 +101,8 @@ fn irq_bind_checks_its_arguments() -> Outcome {
     let c = channel(QUIET)?;
     let notify = copy(&c, Rights::NOTIFY)?;
     let receive = copy(&c, Rights::RECEIVE)?;
-    let no_device = copy(&init::RESOURCE, Rights::DEBUG)?;
-    let (resource, line) = (init::RESOURCE.raw().0, u64::from(EDGE_LINE));
+    let no_device = copy(&resource(), Rights::DEBUG)?;
+    let (resource, line) = (resource().raw().0, u64::from(EDGE_LINE));
     let good = [resource, line, notify.raw().0, QUIET.into(), TRIGGER_EDGE];
     let with = |i: usize, value: u64| {
         let mut x = good;
@@ -120,7 +120,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
         (with(0, c.raw().0), Error::WrongType),
         (with(0, no_device.raw().0), Error::AccessDenied),
         (with(2, gone), Error::BadHandle),
-        (with(2, init::PROCESS.raw().0), Error::WrongType),
+        (with(2, own().raw().0), Error::WrongType),
         (with(2, receive.raw().0), Error::AccessDenied),
     ]
     .iter()
@@ -206,7 +206,7 @@ fn a_line_takes_one_binding() -> Outcome {
     let b = bound(EDGE_LINE, &c, true)?;
     let args = |h: &Handle<Channel>| {
         [
-            init::RESOURCE.raw().0,
+            resource().raw().0,
             EDGE_LINE.into(),
             h.raw().0,
             QUIET.into(),
@@ -231,7 +231,7 @@ fn binding_goes_with_its_last_handle() -> Outcome {
     let b = bound(EDGE_LINE, &c, true)?;
     let kept = copy(&b, OWNER_RIGHTS)?;
     close(b)?;
-    let held = sys::irq_bind(&init::RESOURCE, EDGE_LINE, &c, QUIET, true).err();
+    let held = sys::irq_bind(&resource(), EDGE_LINE, &c, QUIET, true).err();
     close(kept)?;
     let again = bound(EDGE_LINE, &c, false);
     let made = again.is_ok();
@@ -292,7 +292,7 @@ const EXTERNAL: u64 = 0b01_0000;
 /// A device window over `len` bytes from `addr` through the system
 /// resource.
 fn device_window(addr: u64, len: u64) -> Result<Handle<Memory>, &'static str> {
-    sys::device_window_create(&init::RESOURCE, addr, len).map_err(|_| "device_window_create failed")
+    sys::device_window_create(&resource(), addr, len).map_err(|_| "device_window_create failed")
 }
 
 /// device_window_create(x0 system resource with DEVICE, x1 address, x2
@@ -311,8 +311,8 @@ fn device_window_create_checks_its_arguments() -> Outcome {
     const N: u16 = Call::DeviceWindowCreate.number();
     let gone = closed_handle()?;
     let c = channel(QUIET)?;
-    let no_device = copy(&init::RESOURCE, Rights::DEBUG)?;
-    let (resource, page) = (init::RESOURCE.raw().0, PAGE as u64);
+    let no_device = copy(&resource(), Rights::DEBUG)?;
+    let (resource, page) = (resource().raw().0, PAGE as u64);
     let invalid = [
         (RTC, 0),
         (RTC, abi::MAX_MEMORY + page),
@@ -370,7 +370,7 @@ fn device_window_create_checks_its_arguments() -> Outcome {
 /// the PL011's page touch it and fail with INVALID_ARGS; the same bytes
 /// across the end of the PL031's page make a window of two pages.
 fn window_is_checked_by_whole_pages() -> Outcome {
-    let over = sys::device_window_create(&init::RESOURCE, 0x0900_0FF0, 0x20).err();
+    let over = sys::device_window_create(&resource(), 0x0900_0FF0, 0x20).err();
     let w = device_window(RTC + 0xFF0, 0x20)?;
     let size = sys::memory_info(&w).map(|i| i.size);
     close(w)?;
@@ -394,8 +394,8 @@ fn window_handle_is_a_device_window() -> Outcome {
     let w = device_window(RTC, PAGE as u64)?;
     give(&[copy_raw(&w, WINDOW_RIGHTS)?]);
     let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
-    let got = sys::try_receive(&c);
-    let (h, info) = rt::msgbuf::handle(0);
+    let mut got = sys::try_receive(&c);
+    let (h, info) = came(&mut got)[0];
     let replied = answer_all([got]);
     let closed = close_raw(h);
     close(t)?;
@@ -417,26 +417,11 @@ fn window_handle_is_a_device_window() -> Outcome {
 fn window_maps_read_write_but_never_exec() -> Outcome {
     let page = PAGE as u64;
     let w = device_window(RTC, page)?;
-    let r = sys::mem_map(&init::PROCESS, &w, 0, page, WINDOW, Access::Read);
-    let rw = sys::mem_map(
-        &init::PROCESS,
-        &w,
-        0,
-        page,
-        WINDOW + PAGE,
-        Access::ReadWrite,
-    );
-    let rx = sys::mem_map(
-        &init::PROCESS,
-        &w,
-        0,
-        page,
-        WINDOW + 2 * PAGE,
-        Access::ReadExec,
-    );
+    let r = sys::mem_map(&own(), &w, 0, page, WINDOW, Access::Read);
+    let rw = sys::mem_map(&own(), &w, 0, page, WINDOW + PAGE, Access::ReadWrite);
+    let rx = sys::mem_map(&own(), &w, 0, page, WINDOW + 2 * PAGE, Access::ReadExec);
     // SAFETY: the mapping is the test's window, which nothing runs.
-    let protected =
-        unsafe { sys::mem_protect(&init::PROCESS, WINDOW + PAGE, page, Access::ReadExec) };
+    let protected = unsafe { sys::mem_protect(&own(), WINDOW + PAGE, page, Access::ReadExec) };
     for (mapped, at) in [(r, WINDOW), (rw, WINDOW + PAGE)] {
         if mapped.is_ok() {
             unmap(at, page)?;
@@ -589,7 +574,7 @@ impl Rtc {
 
     /// The binding of RTC_LINE, level-triggered, to the channel at DRIVER.
     fn bind(&self) -> Result<Handle<Interrupt>, &'static str> {
-        sys::irq_bind(&init::RESOURCE, RTC_LINE, &self.channel, DRIVER, false)
+        sys::irq_bind(&resource(), RTC_LINE, &self.channel, DRIVER, false)
             .map_err(|_| "irq_bind of the PL031's line failed")
     }
 
@@ -898,29 +883,27 @@ fn bind_for(kid: &Kid, seen: bool) -> Result<Option<Handle<Channel>>, &'static s
     let Received::Message {
         label: START,
         len: 8,
-        handles,
+        mut handles,
         token,
         words,
     } = kid.ear.next()?
     else {
         return Err("the child did not send its channel");
     };
-    let copy_of =
-        |i: usize| (i < handles).then(|| Handle::<Channel>::from_raw(rt::msgbuf::handle(i).0));
-    let (c, kept) = (copy_of(0), copy_of(1));
+    let (c, kept) = (handles.take::<Channel>(0).ok(), handles.take(1).ok());
     check(
-        handles == 1 + usize::from(seen),
+        handles.len() == 1 + usize::from(seen),
         "the child sent another count of handles",
     )?;
     let c = c.ok_or("the child did not send its channel")?;
-    let b = sys::irq_bind(&init::RESOURCE, RTC_LINE, &c, LEVEL, false);
+    let b = sys::irq_bind(&resource(), RTC_LINE, &c, LEVEL, false);
     close(c)?;
     check(words[0] == child::BIND, "the child's request is not BIND")?;
     let b = b.map_err(|_| "irq_bind through the child's channel failed")?;
     let given = copy(&b, DRIVER_RIGHTS);
     close(b)?;
     token
-        .reply_handles(&[], &[given?.raw()])
+        .reply_handles(&[], [given?.erase()])
         .map_err(|_| "the reply with the binding failed")?;
     Ok(kept)
 }

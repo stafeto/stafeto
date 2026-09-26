@@ -174,7 +174,7 @@ const PERMISSION: u64 = 0b0011;
 /// Maps the boot image at IMAGE, read-only, and a new page of marks at
 /// KID_MARKS, for the tests of children with code.
 pub(crate) fn prepare() -> Outcome {
-    let image: Handle<Memory> = Handle::from_raw(INIT_BOOT_IMAGE);
+    let image = image();
     let size = sys::memory_info(&image)
         .map_err(|_| "MEMORY of the boot image failed")?
         .size;
@@ -182,7 +182,7 @@ pub(crate) fn prepare() -> Outcome {
     IMAGE_SIZE.store(size, Relaxed);
     let marks = memory_object(1)?;
     map(&marks, 0, PAGE as u64, KID_MARKS, Access::ReadWrite)?;
-    KID_MARKS_OBJECT.store(marks.raw().0, Relaxed);
+    KID_MARKS_OBJECT.store(marks.into_raw().0, Relaxed);
     Ok(())
 }
 
@@ -341,11 +341,11 @@ impl Ear {
     /// Waits for the child's start request (spec 13.3), child::HELLO, and
     /// answers it with `role`, `args` and `handles`, which move to the
     /// child.
-    pub(crate) fn answer(&self, role: Role, args: &[u64], handles: &[abi::Handle]) -> Outcome {
+    pub(crate) fn answer(&self, role: Role, args: &[u64], given: &[abi::Handle]) -> Outcome {
         let Received::Message {
             label: START,
             len: 8,
-            handles: 0,
+            handles,
             token,
             words,
         } = self.next()?
@@ -353,11 +353,10 @@ impl Ear {
             return Err("the child did not ask for its start data");
         };
         check(
-            words[0] == child::HELLO,
+            words[0] == child::HELLO && handles.is_empty(),
             "the child's start request is not HELLO",
         )?;
-        token
-            .reply_handles(&child::reply(role, args), handles)
+        reply_values(token, &child::reply(role, args), given)
             .map_err(|_| "the reply to the start request failed")
     }
 
@@ -420,7 +419,7 @@ impl Kid {
             policy: Policy::Fifo,
         };
         // SAFETY: only the loader maps and uses LOADER_WINDOW.
-        let loaded = unsafe { loader::load(&init::PROCESS, &program, LOADER_WINDOW, params) };
+        let loaded = unsafe { loader::load(&own(), &program, LOADER_WINDOW, params) };
         let child = match loaded {
             Ok(child) => child,
             Err((e, start)) => {
@@ -437,7 +436,7 @@ impl Kid {
             thread: child.thread,
             ear,
         };
-        let marks = Handle::<Memory>::from_raw(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
+        let marks = Handle::<Memory>::borrowed(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
         let (page, at) = (PAGE as u64, child::MARKS);
         match loader::map_narrowed(&kid.process, &marks, 0, page, at, Access::ReadWrite) {
             Ok(()) => Ok(kid),
@@ -463,18 +462,15 @@ impl Kid {
     }
 
     pub(crate) fn gift(&self, g: Gift) -> Result<abi::Handle, &'static str> {
-        let marks = Handle::<Memory>::from_raw(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
+        let marks = Handle::<Memory>::borrowed(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
         match g {
             Gift::Own => copy_raw(
                 &self.process,
                 Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER,
             ),
             Gift::Thread => copy_raw(&self.thread, Rights::MANAGE | Rights::TRANSFER),
-            Gift::Debug => copy_raw(&init::RESOURCE, Rights::DEBUG | Rights::TRANSFER),
-            Gift::Image => copy_raw(
-                &Handle::<Memory>::from_raw(INIT_BOOT_IMAGE),
-                Rights::MAP_READ | Rights::TRANSFER,
-            ),
+            Gift::Debug => copy_raw(&resource(), Rights::DEBUG | Rights::TRANSFER),
+            Gift::Image => copy_raw(&image(), Rights::MAP_READ | Rights::TRANSFER),
             Gift::Marks => copy_raw(
                 &marks,
                 Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
@@ -485,7 +481,7 @@ impl Kid {
                 GRANDCHILD,
                 QUIET,
             )
-            .map(|h| h.raw()),
+            .map(Handle::into_raw),
             Gift::Given(h) => Ok(h),
         }
     }
@@ -704,7 +700,7 @@ fn echo_rounds(kid: &Kid) -> Outcome {
         return Err("the child sent no request");
     };
     let hello = label == START
-        && (len, handles) == (8, 0)
+        && (len, handles.len()) == (8, 0)
         && words == [child::HELLO, 0, 0, 0, 0, 0, 0, 0]
         && token.raw() != 0;
     token
@@ -919,7 +915,7 @@ fn generations(kid: &Kid) -> Outcome {
         }
     }
     let killed = sys::process_kill(&kid.process);
-    let queue = sys::kernel_stats(&init::RESOURCE).map(|s| s.cleanup_queue);
+    let queue = sys::kernel_stats(&resource()).map(|s| s.cleanup_queue);
     let stopped = kid_mark(COUNT);
     let notices = [(); 3].map(|()| kid.ear.now());
     sleep(PAUSE_NS)?;
@@ -1012,7 +1008,7 @@ fn el0_fault_ends_only_the_process() -> Outcome {
     let neighbour = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
     let waits = neighbour
         .start()
-        .and_then(|()| neighbour.serve(Role::Serve, &[1], &[Gift::Given(c.raw())]))
+        .and_then(|()| neighbour.serve(Role::Serve, &[1], &[Gift::Given(c.into_raw())]))
         .and_then(|()| let_run());
     let fault = waits.and_then(|()| fault_of(Role::Load, &[child::KERNEL], &[]));
     let answer = sys::try_send(&send, &FAULT_WORD.to_le_bytes());
@@ -1238,7 +1234,7 @@ fn boost_is_capped_by_the_server_ceiling() -> Outcome {
     let kid = Kid::load_under(LEAF_QUOTA, 16, 20, LEVEL)?;
     let served = kid
         .start()
-        .and_then(|()| kid.serve(Role::Serve, &[1], &[Gift::Given(c.raw())]))
+        .and_then(|()| kid.serve(Role::Serve, &[1], &[Gift::Given(c.into_raw())]))
         .and_then(|()| let_run());
     HANDLES[0].store(send.raw().0, Relaxed);
     let raced = served.and_then(|()| {
@@ -1280,7 +1276,7 @@ fn client_of_a_dead_server_gets_peer_closed() -> Outcome {
     let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
     let waits = kid
         .start()
-        .and_then(|()| kid.serve(Role::TakeThenExit, &[], &[Gift::Given(c.raw())]))
+        .and_then(|()| kid.serve(Role::TakeThenExit, &[], &[Gift::Given(c.into_raw())]))
         .and_then(|()| let_run());
     let mut x = marked();
     x[..3].copy_from_slice(&[send.raw().0, 8, WORD]);

@@ -106,7 +106,7 @@ fn timer_needs_receive() -> Outcome {
         (c.raw(), 64, Error::InvalidArgs),
         (c.raw(), 0x100 | u64::from(QUIET), Error::InvalidArgs),
         (abi::Handle::INVALID, QUIET.into(), Error::BadHandle),
-        (init::PROCESS.raw(), QUIET.into(), Error::WrongType),
+        (own().raw(), QUIET.into(), Error::WrongType),
         (notify.raw(), QUIET.into(), Error::AccessDenied),
     ];
     let refused = cases.map(|(h, priority, error)| {
@@ -171,7 +171,7 @@ fn timer_set_and_cancel_check_their_handles() -> Outcome {
 fn timer_handle_cases(gone: u64, channel: u64, seen: u64) -> bool {
     const SET: u16 = Call::TimerSet.number();
     const CANCEL: u16 = Call::TimerCancel.number();
-    let resource = init::RESOURCE.raw().0;
+    let resource = resource().raw().0;
     [
         x0_alone::<SET>(&[gone, 0], Error::BadHandle.code()),
         x0_alone::<CANCEL>(&[gone], Error::BadHandle.code()),

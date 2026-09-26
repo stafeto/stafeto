@@ -165,7 +165,7 @@ fn send_checks_its_arguments() -> Outcome {
         (c.raw(), 1 << 63, Error::InvalidArgs),
         (gone, 1025, Error::InvalidArgs),
         (gone, 8, Error::BadHandle),
-        (init::PROCESS.raw(), 8, Error::WrongType),
+        (own().raw(), 8, Error::WrongType),
         (notify_only.raw(), 8, Error::AccessDenied),
         (left.raw(), 8, Error::PeerClosed),
     ];
@@ -221,7 +221,7 @@ fn request_carries_registers_and_label() -> Outcome {
                     token,
                     words: w,
                 }) => {
-                    let whole = (l, len, handles, w) == (label, 16, 0, words(&request(0)));
+                    let whole = (l, len, handles.len(), w) == (label, 16, 0, words(&request(0)));
                     let named = token.raw() != 0;
                     token.reply(&[]).is_ok() && whole && named
                 }
@@ -420,11 +420,7 @@ fn send_without_waiting_to_a_waiting_server_gets_the_reply() -> Outcome {
     close(s)?;
     close(c)?;
     check(
-        got == Ok(Reply {
-            len: 16,
-            handles: 0,
-            words: words(&bytes),
-        }),
+        got.map(|r| (r.len, r.handles.len(), r.words)) == Ok((16, 0, words(&bytes))),
         "send with NO_WAIT to a waiting service did not get the reply",
     )?;
     check(
@@ -904,7 +900,7 @@ pub(crate) extern "C" fn mark_at_notice(slot: u64) -> ! {
 /// code of the call in `result`, and ends.
 extern "C" fn kill_child(slot: u64) -> ! {
     let s = slot as usize;
-    let child = Handle::<Process>::from_raw(abi::Handle(HANDLES[s].load(Relaxed)));
+    let child = Handle::<Process>::borrowed(abi::Handle(HANDLES[s].load(Relaxed)));
     let code = sys::process_kill(&child).map_or_else(|e| e.code(), |()| 0);
     record(s, &[code]);
     sys::thread_exit()

@@ -166,7 +166,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 179;
+const INIT_TESTS: u32 = 186;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;

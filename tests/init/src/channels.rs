@@ -170,10 +170,7 @@ fn notify_and_receive_need_their_rights() -> Outcome {
     let c = channel(QUIET)?;
     let gone = c.raw();
     close(c)?;
-    for (h, error) in [
-        (init::PROCESS.raw(), Error::WrongType),
-        (gone, Error::BadHandle),
-    ] {
+    for (h, error) in [(own().raw(), Error::WrongType), (gone, Error::BadHandle)] {
         let mut x = marked();
         x[..2].copy_from_slice(&[h.0, 1]);
         let after = raw_notify(x);
@@ -336,7 +333,7 @@ fn receive_without_waiting_is_would_block() -> Outcome {
 /// what mark 1 held then; then asks again without waiting and leaves 1 in
 /// mark 3 when that found nothing (WOULD_BLOCK). Ends afterwards.
 extern "C" fn receive_twice(h: u64) -> ! {
-    let c = Handle::<Channel>::from_raw(abi::Handle(h));
+    let c = Handle::<Channel>::borrowed(abi::Handle(h));
     match sys::receive(&c) {
         Ok(_) => {
             MARKS[2].store(mark(1), Relaxed);
@@ -467,7 +464,7 @@ fn duplicate_narrows_rights() -> Outcome {
         let after = raw_duplicate(z);
         after[0] == Error::InvalidArgs.code() && after[1..] == z[1..]
     });
-    let own = copy(&init::PROCESS, Rights::NONE)?;
+    let own = copy(&own(), Rights::NONE)?;
     let state = sys::process_state(&own);
     close(own)?;
     close(n)?;
@@ -516,7 +513,7 @@ fn handle_duplicate_checks_its_arguments() -> Outcome {
     let gone = closed_handle()?;
     let c = channel(QUIET)?;
     let notify_only = copy(&c, Rights::NOTIFY)?;
-    let own = copy(&init::PROCESS, Rights::NONE)?;
+    let own = copy(&own(), Rights::NONE)?;
     let result = duplicate_cases(gone, notify_only.raw().0, own.raw().0);
     close(own)?;
     close(notify_only)?;
@@ -534,7 +531,7 @@ fn duplicate_cases(gone: u64, notify_only: u64, own: u64) -> Outcome {
         });
     let handles = x0_alone::<N>(&[gone, 0, 0, 0], Error::BadHandle.code())
         && x0_alone::<N>(&[0, 0, 7, 5], Error::BadHandle.code());
-    let kinds = [init::RESOURCE.raw().0, own]
+    let kinds = [resource().raw().0, own]
         .into_iter()
         .all(|h| x0_alone::<N>(&[h, 0, 7, 5], Error::WrongType.code()));
     let right = x0_alone::<N>(&[notify_only, notify, 7, 5], Error::AccessDenied.code());
@@ -568,7 +565,7 @@ fn label_cannot_change() -> Outcome {
     let same = copy(&first, Rights::NOTIFY)?;
     let posted = sys::notify(&same, 1);
     let got = take_one(&c);
-    let process = sys::handle_label(&retyped(&init::PROCESS), Rights::NONE, 9, QUIET);
+    let process = sys::handle_label(&retyped(&own()), Rights::NONE, 9, QUIET);
     close(c)?;
     close(same)?;
     close(first)?;
@@ -761,7 +758,7 @@ fn slot_limit_is_1024() -> Outcome {
     }
     let x = duplicate_regs(c.raw(), Rights::NONE, last + 1, QUIET.into());
     let after = raw_duplicate(x);
-    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let own = sys::process_memory(&own()).map_err(|_| "PROCESS_MEMORY of init failed")?;
     let mut y = create_regs(c.raw(), QUIET.into(), abi::Handle::INVALID);
     y[0] = (own.quota - own.returned - own.used + 1).next_multiple_of(PAGE as u64);
     let exit = raw_create(y);
@@ -928,9 +925,9 @@ fn exit_notice_comes_after_the_quota() -> Outcome {
 /// the child returned in mark 2 and its quota but what it uses in mark 3.
 /// Ends afterwards.
 extern "C" fn watch_exit(h: u64) -> ! {
-    let exits = Handle::<Channel>::from_raw(abi::Handle(h));
+    let exits = Handle::<Channel>::borrowed(abi::Handle(h));
     let got = sys::receive(&exits);
-    let child = Handle::<Process>::from_raw(abi::Handle(mark(1)));
+    let child = Handle::<Process>::borrowed(abi::Handle(mark(1)));
     if let Ok(m) = sys::process_memory(&child) {
         MARKS[2].store(m.returned, Relaxed);
         MARKS[3].store(m.quota - m.used, Relaxed);
@@ -975,10 +972,10 @@ fn exit_channel_needs_notify() -> Outcome {
     let left = copy(&shut, Rights::NOTIFY)?;
     let gone = shut.raw();
     close(shut)?;
-    let before = sys::process_handles(&init::PROCESS);
+    let before = sys::process_handles(&own());
     let refused = [
         (receive_only.raw(), Error::AccessDenied),
-        (init::PROCESS.raw(), Error::WrongType),
+        (own().raw(), Error::WrongType),
         (gone, Error::BadHandle),
         (left.raw(), Error::PeerClosed),
     ]
@@ -986,7 +983,7 @@ fn exit_channel_needs_notify() -> Outcome {
         let x = create_regs(h, QUIET.into(), abi::Handle::INVALID);
         failed(raw_create(x), x, error)
     });
-    let after = sys::process_handles(&init::PROCESS);
+    let after = sys::process_handles(&own());
     close(receive_only)?;
     close(left)?;
     close(c)?;
@@ -1066,7 +1063,7 @@ fn start_channel_moves_into_the_child() -> Outcome {
     let n = copy(&c, Rights::NOTIFY)?;
     let (exits, name) = exit_channel()?;
     let moved = c.raw();
-    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let used = || sys::process_memory(&own()).map(|m| m.used);
     let before = used();
     let made = sys::process_create_with(CHILD_QUOTA, 16, LOW, Some((&name, QUIET)), Some(c));
     let Ok(child) = made else {
@@ -1129,7 +1126,7 @@ fn start_handle_must_be_a_channel() -> Outcome {
     let c = channel(QUIET)?;
     let gone = c.raw();
     close(c)?;
-    let own = init::PROCESS.raw();
+    let own = own().raw();
     let refused = [
         (abi::Handle::INVALID, 0, own, Error::WrongType),
         (abi::Handle::INVALID, 0, gone, Error::BadHandle),

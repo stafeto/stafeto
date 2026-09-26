@@ -202,8 +202,8 @@ fn memory_info_cases(bare: u64, gone: u64) -> Outcome {
         mappings: 0,
     };
     let wrong = [
-        (init::PROCESS.raw().0, memory, Error::WrongType),
-        (init::RESOURCE.raw().0, memory, Error::WrongType),
+        (own().raw().0, memory, Error::WrongType),
+        (resource().raw().0, memory, Error::WrongType),
         (bare, abi::INFO_PROCESS_STATE, Error::WrongType),
         (bare, abi::INFO_PROCESS_MEMORY, Error::WrongType),
         (bare, abi::INFO_KERNEL_STATS, Error::WrongType),
@@ -257,7 +257,7 @@ fn ended_child() -> Result<Handle<Process>, &'static str> {
 fn mem_map_checks_its_arguments() -> Outcome {
     let m = memory_object(4)?;
     let no_read = copy(&m, Rights::MAP_WRITE | Rights::MAP_EXEC)?;
-    let no_manage = copy(&init::PROCESS, Rights::NONE)?;
+    let no_manage = copy(&own(), Rights::NONE)?;
     let ended = ended_child()?;
     let gone = closed_handle()?;
     let result = map_cases(&m, no_read.raw().0, no_manage.raw().0, ended.raw().0, gone);
@@ -271,7 +271,7 @@ fn mem_map_checks_its_arguments() -> Outcome {
 
 fn map_cases(m: &Handle<Memory>, no_read: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     const N: u16 = Call::MemMap.number();
-    let (own, mem) = (init::PROCESS.raw().0, m.raw().0);
+    let (own, mem) = (own().raw().0, m.raw().0);
     let (page, at, r) = (PAGE as u64, WINDOW as u64, Access::Read.raw());
     let cases = [
         ([own, mem, 8, page, at, r], Error::InvalidArgs),
@@ -319,7 +319,7 @@ fn map_cases(m: &Handle<Memory>, no_read: u64, no_manage: u64, ended: u64, gone:
 fn map_access_is_r_rw_or_rx() -> Outcome {
     const N: u16 = Call::MemMap.number();
     let m = memory_object(1)?;
-    let (own, mem, page, at) = (init::PROCESS.raw().0, m.raw().0, PAGE as u64, WINDOW as u64);
+    let (own, mem, page, at) = (own().raw().0, m.raw().0, PAGE as u64, WINDOW as u64);
     let refused = [0, 2, 4, 6, 7, 8, 9, 1 << 32 | 1]
         .into_iter()
         .all(|access| x0_alone::<N>(&[own, mem, 0, page, at, access], Error::InvalidArgs.code()));
@@ -346,7 +346,7 @@ fn map_needs_the_rights_of_its_access() -> Outcome {
         copy(&m, Rights::MAP_READ | Rights::MAP_WRITE)?,
         copy(&m, Rights::MAP_READ | Rights::MAP_EXEC)?,
     );
-    let (own, page, at) = (init::PROCESS.raw().0, PAGE as u64, WINDOW as u64);
+    let (own, page, at) = (own().raw().0, PAGE as u64, WINDOW as u64);
     let denied = [
         (&read, Access::ReadWrite),
         (&read, Access::ReadExec),
@@ -414,7 +414,7 @@ fn two_mappings_show_the_same_pages() -> Outcome {
 /// The whole mapping goes with 0 in x0 alone, and a second time fails.
 fn mem_unmap_takes_whole_mappings() -> Outcome {
     let m = memory_object(4)?;
-    let no_manage = copy(&init::PROCESS, Rights::NONE)?;
+    let no_manage = copy(&own(), Rights::NONE)?;
     let ended = ended_child()?;
     let gone = closed_handle()?;
     map(&m, 0, 4 * PAGE as u64, WINDOW, Access::ReadWrite)?;
@@ -427,7 +427,7 @@ fn mem_unmap_takes_whole_mappings() -> Outcome {
 
 fn unmap_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     const N: u16 = Call::MemUnmap.number();
-    let (own, page, at) = (init::PROCESS.raw().0, PAGE as u64, WINDOW as u64);
+    let (own, page, at) = (own().raw().0, PAGE as u64, WINDOW as u64);
     let cases = [
         ([own, at + 8, 4 * page], Error::InvalidArgs),
         ([own, at, 4 * page + 8], Error::InvalidArgs),
@@ -474,7 +474,7 @@ fn unmap_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
 fn mem_protect_takes_whole_mappings_within_their_rights() -> Outcome {
     let m = memory_object(2)?;
     let read_write = copy(&m, Rights::MAP_READ | Rights::MAP_WRITE)?;
-    let no_manage = copy(&init::PROCESS, Rights::NONE)?;
+    let no_manage = copy(&own(), Rights::NONE)?;
     let ended = ended_child()?;
     let gone = closed_handle()?;
     map(&read_write, 0, 2 * PAGE as u64, WINDOW, Access::ReadWrite)?;
@@ -491,7 +491,7 @@ fn mem_protect_takes_whole_mappings_within_their_rights() -> Outcome {
 
 fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     const N: u16 = Call::MemProtect.number();
-    let (own, page, at) = (init::PROCESS.raw().0, PAGE as u64, WINDOW as u64);
+    let (own, page, at) = (own().raw().0, PAGE as u64, WINDOW as u64);
     let (r, rw, rx) = (
         Access::Read.raw(),
         Access::ReadWrite.raw(),
@@ -543,7 +543,7 @@ fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
 fn mapping_limit_is_64() -> Outcome {
     const N: u16 = Call::MemMap.number();
     let m = memory_object(1)?;
-    let (own, mem, page) = (init::PROCESS.raw().0, m.raw().0, PAGE as u64);
+    let (own, mem, page) = (own().raw().0, m.raw().0, PAGE as u64);
     let mut made = 0;
     while made <= abi::MAX_MAPPINGS as usize
         && map(&m, 0, page, WINDOW + made * PAGE, Access::Read).is_ok()
@@ -576,12 +576,7 @@ fn buffer_page_cannot_be_mapped_over() -> Outcome {
     const N: u16 = Call::MemMap.number();
     let m = memory_object(2)?;
     let t = thread(0, add_mark, 0, LOW, Policy::Fifo)?;
-    let (own, mem, page, r) = (
-        init::PROCESS.raw().0,
-        m.raw().0,
-        PAGE as u64,
-        Access::Read.raw(),
-    );
+    let (own, mem, page, r) = (own().raw().0, m.raw().0, PAGE as u64, Access::Read.raw());
     let refused = [
         abi::INIT_MSGBUF - page,
         abi::INIT_MSGBUF,
@@ -609,7 +604,7 @@ fn buffer_page_cannot_be_unmapped() -> Outcome {
     // now.
     unsafe { word.write_volatile(0xB0FF) };
     let refused = x0_alone::<N>(
-        &[init::PROCESS.raw().0, abi::INIT_MSGBUF, PAGE as u64],
+        &[own().raw().0, abi::INIT_MSGBUF, PAGE as u64],
         Error::InvalidArgs.code(),
     );
     // SAFETY: as above.
@@ -627,7 +622,7 @@ fn buffer_page_cannot_be_unmapped() -> Outcome {
 fn buffer_page_cannot_be_protected() -> Outcome {
     const N: u16 = Call::MemProtect.number();
     let args = [
-        init::PROCESS.raw().0,
+        own().raw().0,
         abi::INIT_MSGBUF,
         PAGE as u64,
         Access::Read.raw(),
@@ -653,17 +648,17 @@ fn buffer_page_cannot_be_protected() -> Outcome {
 /// mark 0 notes 1 once every call passed.
 extern "C" fn map_big(m: u64) -> ! {
     const ROUNDS: u32 = 1000;
-    let m = Handle::<Memory>::from_raw(abi::Handle(m));
+    let m = Handle::<Memory>::borrowed(abi::Handle(m));
     let mut passed = true;
     for _ in 0..ROUNDS {
         if mark(3) != 0 || !passed {
             break;
         }
         MARKS[2].store(Call::MemMap.number().into(), Relaxed);
-        passed &= sys::mem_map(&init::PROCESS, &m, 0, BIG, WINDOW, Access::ReadWrite).is_ok();
+        passed &= sys::mem_map(&own(), &m, 0, BIG, WINDOW, Access::ReadWrite).is_ok();
         MARKS[2].store(Call::MemUnmap.number().into(), Relaxed);
         // SAFETY: the window is the test's, and nothing else uses it.
-        passed &= unsafe { sys::mem_unmap(&init::PROCESS, WINDOW, BIG) }.is_ok();
+        passed &= unsafe { sys::mem_unmap(&own(), WINDOW, BIG) }.is_ok();
     }
     MARKS[0].store(passed.into(), Relaxed);
     sys::thread_exit()
@@ -707,12 +702,12 @@ fn during_a_long_map(probe: extern "C" fn(u64) -> !) -> Outcome {
 /// makes its mem_map, and marks 3; the timer comes again PROBE_PERIOD_NS
 /// later otherwise. False once the channel closed.
 fn caught_busy(c: u64) -> bool {
-    let c = Handle::<Channel>::from_raw(abi::Handle(c));
-    let t = Handle::<Timer>::from_raw(abi::Handle(PROBE_TIMER.load(Relaxed)));
+    let c = Handle::<Channel>::borrowed(abi::Handle(c));
+    let t = Handle::<Timer>::borrowed(abi::Handle(PROBE_TIMER.load(Relaxed)));
     let map = u64::from(Call::MemMap.number());
     while sys::receive(&c).is_ok() {
         // SAFETY: RW is the access of the mapping; nothing changes.
-        let probed = unsafe { sys::mem_protect(&init::PROCESS, WINDOW, BIG, Access::ReadWrite) };
+        let probed = unsafe { sys::mem_protect(&own(), WINDOW, BIG, Access::ReadWrite) };
         if probed == Err(Error::BadState) && mark(2) == map {
             MARKS[3].store(1, Relaxed);
             return true;
@@ -731,8 +726,8 @@ extern "C" fn probe_busy(c: u64) -> ! {
         // SAFETY: the calls must fail and change nothing.
         let (unmapped, protected) = unsafe {
             (
-                sys::mem_unmap(&init::PROCESS, WINDOW, BIG),
-                sys::mem_protect(&init::PROCESS, WINDOW, BIG, Access::Read),
+                sys::mem_unmap(&own(), WINDOW, BIG),
+                sys::mem_protect(&own(), WINDOW, BIG, Access::Read),
             )
         };
         let busy = unmapped == Err(Error::BadState) && protected == Err(Error::BadState);
@@ -750,7 +745,7 @@ fn busy_mapping_is_bad_state() -> Outcome {
     let m = memory_object(1)?;
     let mapped = map(&m, 0, PAGE as u64, WINDOW, Access::ReadWrite);
     // SAFETY: the mapping is the test's window, which nothing else uses.
-    let protected = unsafe { sys::mem_protect(&init::PROCESS, WINDOW, PAGE as u64, Access::Read) };
+    let protected = unsafe { sys::mem_protect(&own(), WINDOW, PAGE as u64, Access::Read) };
     let unmapped = unmap(WINDOW, PAGE as u64);
     close(m)?;
     check(
@@ -773,7 +768,7 @@ extern "C" fn probe_buffer(c: u64) -> ! {
         // SAFETY: the thread never runs.
         let made = unsafe {
             sys::thread_create(
-                &init::PROCESS,
+                &own(),
                 add_mark,
                 STACKS[2].top(),
                 3,
@@ -810,7 +805,7 @@ fn call_bit(call: Call) -> u64 {
 
 /// Free frames now (KERNEL_STATS).
 fn free_frames() -> u64 {
-    sys::kernel_stats(&init::RESOURCE).map_or(0, |s| s.free_frames)
+    sys::kernel_stats(&resource()).map_or(0, |s| s.free_frames)
 }
 
 /// Makes mem_create of BIG bytes, mem_map of them RX at WINDOW of init,
@@ -833,13 +828,13 @@ extern "C" fn long_calls(_: u64) -> ! {
             break;
         };
         now(Call::MemMap);
-        passed &= sys::mem_map(&init::PROCESS, &m, 0, BIG, WINDOW, Access::ReadExec).is_ok();
+        passed &= sys::mem_map(&own(), &m, 0, BIG, WINDOW, Access::ReadExec).is_ok();
         // SAFETY: the window is the test's, and nothing else uses it.
         unsafe {
             now(Call::MemProtect);
-            passed &= sys::mem_protect(&init::PROCESS, WINDOW, BIG, Access::Read).is_ok();
+            passed &= sys::mem_protect(&own(), WINDOW, BIG, Access::Read).is_ok();
             now(Call::MemUnmap);
-            passed &= sys::mem_unmap(&init::PROCESS, WINDOW, BIG).is_ok();
+            passed &= sys::mem_unmap(&own(), WINDOW, BIG).is_ok();
         }
         MARKS[2].store(0, Relaxed);
         passed &= m.close().is_ok();
@@ -858,8 +853,8 @@ extern "C" fn long_calls(_: u64) -> ! {
 /// BAD_STATE. It marks the call in mark 3, and the timer comes again
 /// PROBE_PERIOD_NS later.
 extern "C" fn probe_long_calls(c: u64) -> ! {
-    let c = Handle::<Channel>::from_raw(abi::Handle(c));
-    let t = Handle::<Timer>::from_raw(abi::Handle(PROBE_TIMER.load(Relaxed)));
+    let c = Handle::<Channel>::borrowed(abi::Handle(c));
+    let t = Handle::<Timer>::borrowed(abi::Handle(PROBE_TIMER.load(Relaxed)));
     while mark(1) == 0 && sys::receive(&c).is_ok() {
         let call = LONG_CALLS
             .into_iter()
@@ -877,7 +872,7 @@ extern "C" fn probe_long_calls(c: u64) -> ! {
                 };
                 // SAFETY: an idle mapping at the window has this access
                 // already, so the call changes nothing.
-                let probed = unsafe { sys::mem_protect(&init::PROCESS, WINDOW, BIG, access) };
+                let probed = unsafe { sys::mem_protect(&own(), WINDOW, BIG, access) };
                 probed == Err(Error::BadState)
             }
             None => false,
@@ -929,7 +924,7 @@ fn thread_buffer_cannot_land_in_a_mapping() -> Outcome {
     // SAFETY: the thread is refused, and would never run.
     let made = unsafe {
         sys::thread_create(
-            &init::PROCESS,
+            &own(),
             add_mark,
             STACKS[2].top(),
             3,
@@ -995,8 +990,7 @@ fn protect_to_exec_runs_new_code() -> Outcome {
         unsafe { code.add(i).write_volatile(insn) };
     }
     // SAFETY: the page holds code init wrote, and nothing else uses it.
-    let protected =
-        unsafe { sys::mem_protect(&init::PROCESS, WINDOW, PAGE as u64, Access::ReadExec) };
+    let protected = unsafe { sys::mem_protect(&own(), WINDOW, PAGE as u64, Access::ReadExec) };
     let got = protected.map(|()| {
         // SAFETY: the page is RX and holds a function that takes nothing
         // and returns a word.
@@ -1023,7 +1017,7 @@ fn init_segments_are_taken() -> Outcome {
     .into_iter()
     .all(|at| {
         let args = [
-            init::PROCESS.raw().0,
+            own().raw().0,
             m.raw().0,
             0,
             PAGE as u64,

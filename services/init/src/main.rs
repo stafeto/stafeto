@@ -13,7 +13,8 @@
 
 use abi::{Error, Policy};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use rt::{Stack, init, println, sys};
+use rt::handle::Process;
+use rt::{Handle, Stack, println, sys};
 
 rt::entry!(main);
 
@@ -40,25 +41,27 @@ static PROGRESS: [Progress; 2] = [const {
 static STACKS: [Stack<STACK_SIZE>; 2] = [const { Stack::new() }; 2];
 
 fn main(_: u64) -> u64 {
-    rt::console::set(&init::RESOURCE);
+    let init = rt::init_handles().expect("init's first handles come once");
+    rt::console::set(init.resource);
     println!("init: hello from EL0");
     println!("init: threads 1 and 2 take turns at priority {LEVEL}, round robin");
     for i in 0..2 {
-        start(i).expect("init starts its threads");
+        start(&init.process, i).expect("init starts its threads");
     }
     // Both threads are above init now; the call returns once both ended.
-    sys::thread_set_priority(&init::THREAD, 1, Policy::Fifo).expect("init lowers itself");
+    sys::thread_set_priority(&init.thread, 1, Policy::Fifo).expect("init lowers itself");
     println!("init: both threads are done");
     0
 }
 
-/// Starts thread `i` of the two; its message buffer lies above init's own.
-fn start(i: usize) -> Result<(), Error> {
+/// Starts thread `i` of the two in init's process `own`; its message
+/// buffer lies above init's own.
+fn start(own: &Handle<Process>, i: usize) -> Result<(), Error> {
     let buffer = abi::INIT_MSGBUF as usize + (i + 1) * PAGE;
     // SAFETY: the stack is the thread's alone.
     let t = unsafe {
         sys::thread_create(
-            &init::PROCESS,
+            own,
             turns,
             STACKS[i].top(),
             i as u64,
