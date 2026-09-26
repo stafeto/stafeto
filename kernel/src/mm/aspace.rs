@@ -173,8 +173,8 @@ impl Mmu for Cpu {
         mmu::invalidate_asid(operand)
     }
 
-    fn user_tables_written(&mut self) {
-        mmu::user_tables_written()
+    fn tables_written(&mut self) {
+        mmu::tables_written()
     }
 
     fn invalidate_user_page(&mut self, operand: u64) {
@@ -228,7 +228,7 @@ impl AddressSpace {
         });
         // An entry that turns valid needs no TLB maintenance: the stores
         // only have to reach the table walker ([G14]).
-        mmu::user_tables_written();
+        mmu::tables_written();
         result
     }
 
@@ -247,7 +247,7 @@ impl AddressSpace {
                     .expect("a page of a checked range maps");
             }
         });
-        mmu::user_tables_written();
+        mmu::tables_written();
     }
 
     /// Unmaps the `pages` pages from `va`, each of which a page maps, and

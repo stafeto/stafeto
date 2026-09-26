@@ -173,9 +173,25 @@ pub fn alloc_zeroed(order: u8, quota: &mut Account) -> Result<Frame, Error> {
     // SAFETY: the allocator just handed the block out; no program sees it
     // before it is zeroed.
     let frame = unsafe { Frame::from_raw(pa, order) };
-    // SAFETY: as above; the block is RAM the linear map covers.
-    unsafe { core::ptr::write_bytes(frame.base(), 0, frame.len()) };
+    // SAFETY: as above.
+    unsafe { zero(pa, order) };
     Ok(frame)
+}
+
+/// Zeroes the block of 2^`order` frames at `pa` through the linear map,
+/// the one place that zeroes frames for the kernel (spec 7.3, 7.4). A
+/// loop of word stores, which the compiler makes a loop of `stp` pairs:
+/// the call of `memset` that `write_bytes` becomes costs three times as
+/// many instructions for a frame.
+///
+/// # Safety
+/// The block is RAM the caller owns, and nothing else reaches it meanwhile.
+pub unsafe fn zero(pa: u64, order: u8) {
+    let start = LINEAR_BASE + pa as usize;
+    for word in (start..start + (PAGE_SIZE << order) as usize).step_by(8) {
+        // SAFETY: the caller's promise; the linear map covers all RAM.
+        unsafe { (word as *mut u64).write(0) };
+    }
 }
 
 /// Gives `frame` back to the allocator and refunds it to `quota`, which

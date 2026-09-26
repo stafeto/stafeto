@@ -20,12 +20,12 @@ pub trait Mmu {
     /// `dsb nshst; tlbi vmalle1; dsb nsh; isb`: every EL1&0 entry of this
     /// CPU, after earlier table stores reach its walker.
     fn flush_all(&mut self);
-    /// `dsb ishst; tlbi aside1is; dsb ish; isb`, walk-cache entries
-    /// included; `operand` from `tlbi_asid`.
+    /// `dsb ishst; tlbi aside1is; dsb ish`, walk-cache entries included;
+    /// `operand` from `tlbi_asid`.
     fn invalidate_asid(&mut self, operand: u64);
-    /// `dsb ishst` with no `isb`: earlier stores to the tables of a
-    /// program reach the table walker (spec 7.4; [G13], [G14], [G15]).
-    fn user_tables_written(&mut self);
+    /// `dsb ishst` with no `isb`: earlier table stores reach the table
+    /// walker (spec 7.4; [G13], [G14], [G15]).
+    fn tables_written(&mut self);
     /// `tlbi vale1is` alone, for a page of a program; `operand` from
     /// `tlbi_page`. The barriers around a batch are `forget_range`'s
     /// ([G13]).
@@ -72,7 +72,7 @@ pub fn forget_range(
     pages: u64,
     mmu: &mut impl Mmu,
 ) {
-    mmu.user_tables_written();
+    mmu.tables_written();
     if let Some(asid) = asids.current(tag) {
         for i in 0..pages {
             mmu.invalidate_user_page(tlbi_page(start + (i << 12), asid));
@@ -112,7 +112,7 @@ mod tests {
         SetTtbr0(u64),
         FlushAll,
         InvalidateAsid(u64),
-        UserTablesWritten,
+        TablesWritten,
         InvalidateUserPage(u64),
         UserPagesInvalidated,
     }
@@ -138,8 +138,8 @@ mod tests {
         fn invalidate_asid(&mut self, operand: u64) {
             self.ops.push(Op::InvalidateAsid(operand));
         }
-        fn user_tables_written(&mut self) {
-            self.ops.push(Op::UserTablesWritten);
+        fn tables_written(&mut self) {
+            self.ops.push(Op::TablesWritten);
         }
         fn invalidate_user_page(&mut self, operand: u64) {
             self.ops.push(Op::InvalidateUserPage(operand));
@@ -191,7 +191,7 @@ mod tests {
         retire(&mut asids, &mut other, 0x5000, EMPTY, &mut log);
         assert_eq!(
             log.ops,
-            [Op::UserTablesWritten],
+            [Op::TablesWritten],
             "a retired space touched the TLB"
         );
     }
@@ -211,7 +211,7 @@ mod tests {
         assert_eq!(
             log.ops,
             [
-                Op::UserTablesWritten,
+                Op::TablesWritten,
                 Op::InvalidateUserPage(tlbi_page(0x40_0000, 1)),
                 Op::InvalidateUserPage(tlbi_page(0x40_1000, 1)),
                 Op::InvalidateUserPage(tlbi_page(0x40_2000, 1)),
@@ -220,7 +220,7 @@ mod tests {
         );
         log.ops.clear();
         forget_range(&asids, &never_ran, 0x40_0000, 3, &mut log);
-        assert_eq!(log.ops, [Op::UserTablesWritten]);
+        assert_eq!(log.ops, [Op::TablesWritten]);
     }
 
     /// A cached translation: the ASID that tags it, the space whose tables
@@ -331,7 +331,7 @@ mod tests {
             self.tlb.retain(|&(a, _, _)| a != asid);
             self.walk();
         }
-        fn user_tables_written(&mut self) {
+        fn tables_written(&mut self) {
             self.walk();
             self.stale.clear();
             self.walk();
