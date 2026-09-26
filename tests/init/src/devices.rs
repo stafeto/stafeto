@@ -70,9 +70,6 @@ pub(crate) const TESTS: [Test; 17] = [
     ),
 ];
 
-/// The lines of the GIC of QEMU `virt` (GICD_TYPER): INTID 288 is past
-/// the last one.
-const GIC_LINES: u64 = 288;
 /// A shared line with no device behind it in the tests' machine, the
 /// first of `virtio-mmio`, which the tests bind edge-triggered.
 const EDGE_LINE: u32 = 48;
@@ -88,14 +85,16 @@ fn bound(line: u32, c: &Handle<Channel>, edge: bool) -> Result<Handle<Interrupt>
 /// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
 /// NOTIFY, x3 priority, x4 flags) checks the values first, then the
 /// handles in their order, then the state (spec 9, 11), and changes x0
-/// alone on an error: a line outside 32-287, the lines of QEMU's GIC, or
-/// the kernel's console line 33, a flag other than TRIGGER_EDGE and a
-/// priority outside 1-63 fail with INVALID_ARGS, through closed handles
-/// too; x0 closed, a channel or a copy of the resource without DEVICE
-/// with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or
-/// a copy of the channel without NOTIFY the same; a closed channel with
-/// PEER_CLOSED. A copy with NOTIFY alone makes a binding, x0 and x1 alone
-/// changed, whose handle carries abi::OWNER_RIGHTS and no more.
+/// alone on an error: a line outside 32-1019, the most lines a GIC has
+/// (the end of this machine's lines is the kernel test
+/// irq_bind_refuses_lines_past_the_distributor), or the kernel's console
+/// line 33, a flag other than TRIGGER_EDGE and a priority outside 1-63
+/// fail with INVALID_ARGS, through closed handles too; x0 closed, a
+/// channel or a copy of the resource without DEVICE with BAD_HANDLE,
+/// WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or a copy of the
+/// channel without NOTIFY the same; a closed channel with PEER_CLOSED. A
+/// copy with NOTIFY alone makes a binding, x0 and x1 alone changed, whose
+/// handle carries abi::OWNER_RIGHTS and no more.
 fn irq_bind_checks_its_arguments() -> Outcome {
     const N: u16 = Call::IrqBind.number();
     let gone = closed_handle()?;
@@ -110,7 +109,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
         x[i] = value;
         x
     };
-    let invalid = [27, 31, 33, 1020, GIC_LINES, 1 << 32 | line]
+    let invalid = [27, 31, 33, 1020, 1 << 32 | line]
         .map(|l| with(1, l))
         .into_iter()
         .chain([with(4, 2), with(3, 0), with(3, 64), with(3, 0x100 | 1)])
@@ -518,6 +517,9 @@ fn window_over_a_hole_faults_only_its_process() -> Outcome {
             (esr >> 26 & 0x3F, esr & 0x3F, far) == (DATA_ABORT, EXTERNAL, at as u64),
             "the child's fault is no external abort at the load",
         ),
+        ProcessState::Exited { code } if code == child::NO_FAULT => {
+            Err("the child read the hole and did not fault")
+        }
         _ => Err("the child did not end with a fault"),
     }
 }

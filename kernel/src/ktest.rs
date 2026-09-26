@@ -432,6 +432,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::irq_bind_checks_the_callers_limits,
     ),
     (
+        "irq_bind_refuses_lines_past_the_distributor",
+        calls::irq_bind_refuses_lines_past_the_distributor,
+    ),
+    (
         "window_maps_as_device_memory",
         calls::window_maps_as_device_memory,
     ),
@@ -977,10 +981,13 @@ fn pools_take_pages_from_the_frame_allocator(_: &Boot) -> Result<(), &'static st
     )
 }
 
+/// CNTFRQ_EL0 is the frequency of a machine xtask runs (spec 10): 62.5
+/// MHz of QEMU's cortex-a72 and cortex-a53 under TCG, or 24 MHz of Apple's
+/// processor under HVF; and the counter moves.
 fn virtual_counter_runs_at_the_reported_frequency(_: &Boot) -> Result<(), &'static str> {
     check(
-        timer::frequency() == 62_500_000,
-        "CNTFRQ_EL0 is not the 62.5 MHz of QEMU's cortex-a72 and cortex-a53",
+        matches!(timer::frequency(), 62_500_000 | 24_000_000),
+        "CNTFRQ_EL0 is neither the 62.5 MHz of QEMU's TCG nor the 24 MHz of HVF",
     )?;
     let start = timer::now();
     check(

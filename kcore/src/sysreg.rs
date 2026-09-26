@@ -12,6 +12,8 @@ pub const SCTLR_A: u64 = 1 << 1;
 pub const SCTLR_C: u64 = 1 << 2;
 pub const SCTLR_SA: u64 = 1 << 3;
 pub const SCTLR_SA0: u64 = 1 << 4;
+pub const SCTLR_ITD: u64 = 1 << 7;
+pub const SCTLR_SED: u64 = 1 << 8;
 pub const SCTLR_UMA: u64 = 1 << 9;
 pub const SCTLR_I: u64 = 1 << 12;
 pub const SCTLR_DZE: u64 = 1 << 14;
@@ -34,13 +36,23 @@ pub const SCTLR_EL1_BOOT: u64 = SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_SA | SCTL
 ///   address; code bound for another process is synchronized by the
 ///   kernel when it maps the page executable;
 /// - DZE: EL0 zeroes cache lines with DC ZVA;
-/// - nTWE: WFE at EL0, a spin-wait hint, does not trap.
+/// - nTWE: WFE at EL0, a spin-wait hint, does not trap;
+/// - ITD and SED: the AArch32 IT and SETEND instructions at EL0 are
+///   disabled. The kernel runs no AArch32 program; a processor without
+///   AArch32 at EL0, such as Apple's under HVF, holds the bits at 1, and
+///   the value then reads back the same on every machine.
 ///
 /// nTWI stays clear, so WFI at EL0 traps: only the kernel puts the
 /// processor to sleep. UMA stays clear: EL0 cannot mask interrupts.
 /// Alignment checks (A) stay off, and EL0 data stays little-endian (E0E).
-pub const SCTLR_EL1: u64 =
-    SCTLR_EL1_BOOT | SCTLR_WXN | SCTLR_UCT | SCTLR_UCI | SCTLR_DZE | SCTLR_NTWE;
+pub const SCTLR_EL1: u64 = SCTLR_EL1_BOOT
+    | SCTLR_WXN
+    | SCTLR_UCT
+    | SCTLR_UCI
+    | SCTLR_DZE
+    | SCTLR_NTWE
+    | SCTLR_ITD
+    | SCTLR_SED;
 
 /// CPACR_EL1.FPEN = 0b11: FP and SIMD instructions do not trap at EL0 or
 /// EL1. The kernel is built without FP; only the thread switch touches
@@ -91,7 +103,13 @@ mod tests {
         for bit in [SCTLR_NTWI, SCTLR_A, SCTLR_E0E, SCTLR_UMA] {
             assert_eq!(SCTLR_EL1 & bit, 0);
         }
-        assert_eq!(SCTLR_EL1, 0x34DC_D81D);
+        assert_eq!(SCTLR_EL1, 0x34DC_D99D);
+    }
+
+    #[test]
+    fn sctlr_keeps_aarch32_el0_instructions_off() {
+        assert_eq!((SCTLR_ITD, SCTLR_SED), (0x80, 0x100));
+        assert_eq!(SCTLR_EL1 & (SCTLR_ITD | SCTLR_SED), SCTLR_ITD | SCTLR_SED);
     }
 
     #[test]

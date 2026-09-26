@@ -109,6 +109,12 @@ const GIC_V2_LINE: &str = "gic        v2 distributor 0x8000000, cpu interface 0x
 const GIC_V3_LINE: &str = "gic        v3 distributor 0x8000000, redistributor 0x80a0000";
 /// The kernel's last line when init exits with 0 (spec 7.9).
 const INIT_EXIT: &str = "init exited with code 0";
+/// The test init's exit under HVF, where one of its tests fails
+/// (qemu::hvf_verdict): its code is its count of failures.
+const INIT_EXIT_HOLE: &str = "init exited with code 1";
+/// The frequency of the counter of Apple's processors (CNTFRQ_EL0), which
+/// HVF passes on.
+const HVF_HZ: u64 = 24_000_000;
 /// Lines of a run of the test init (tests/init) besides its TEST lines,
 /// each whole: a formatted line longer than one debug_write, all 64 bytes
 /// of x2-x9 in one debug_write, the bytes of a debug_write's length and no
@@ -220,6 +226,8 @@ commands:
   test      host tests, then boot checks, init tests and kernel tests in QEMU
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci        formatting, clippy, then everything `test` does
+  hvf       boot checks, init tests and kernel tests under HVF on a Mac with
+            Apple silicon, on Apple's GICv3 and QEMU's GICv2; skips elsewhere
   help      this text";
 
 fn main() {
@@ -230,6 +238,7 @@ fn main() {
         Some("test") => test(),
         Some("gdb") => gdb(),
         Some("ci") => ci(),
+        Some("hvf") => hvf(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -508,10 +517,10 @@ fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
 /// A normal build boots on machine `m`, prints its report with the line of
 /// the GIC, `gic`, the timer frequency and init's entry point from the
 /// boot image, starts init, and powers the machine off when init exits.
-/// The image also carries none of the kernel's own tests (spec 3.4):
-/// `no_test_symbols` checks it here so every normal build, not just the
-/// one that ships, is covered.
-fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<(), String> {
+/// Gives the frequency. The image also carries none of the kernel's own
+/// tests (spec 3.4): `no_test_symbols` checks it here so every normal
+/// build, not just the one that ships, is covered.
+fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let a = build(Variant::Normal)?;
     no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
@@ -523,7 +532,7 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<(), String> {
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     match qemu::number_after(&o.lines, "timer ") {
-        Some(hz) if hz > 0 => Ok(()),
+        Some(hz) if hz > 0 => Ok(hz),
         _ => Err("the kernel printed no `timer N Hz` line".into()),
     }
 }
@@ -774,8 +783,9 @@ fn stack_overflow_report() -> Result<(), String> {
 /// test the kernel counts passes once. The `icount` build runs under
 /// qemu::ICOUNT, where virtual time counts instructions: the tests that
 /// depend on how much of a quantum is left run only there. A hang, such
-/// as a quantum that never ends, fails at TEST_TIMEOUT.
-fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
+/// as a quantum that never ends, fails at TEST_TIMEOUT. Gives the number
+/// of tests that passed.
+fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     let a = build(variant)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
@@ -811,7 +821,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
     }
-    Ok(())
+    Ok(r.passed.len())
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -858,7 +868,10 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// a counted loop took, which under -icount must be the loop's
 /// instructions; there it also prints the costs of the build that ships
 /// (NORMAL_BUILD_ROWS), which fail nothing by their numbers (spec 15.3).
-fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
+/// Under HVF qemu::hvf_verdict judges the run: the test of a window on a
+/// hole fails, one child fewer faults, and init exits with 1. Gives the
+/// number of tests that passed.
+fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     let a = build(Variant::Normal)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
@@ -868,14 +881,20 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     }
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
-    qemu::counted_verdict(&o, &r)?;
+    let hvf = m.is_hvf();
+    if hvf {
+        qemu::hvf_verdict(&o, &r)?;
+    } else {
+        qemu::counted_verdict(&o, &r)?;
+    }
     if r.total != Some(INIT_TESTS) {
         return Err(format!(
             "the test init has {:?} tests, {INIT_TESTS} expected",
             r.total
         ));
     }
-    for line in TEST_INIT_LINES.into_iter().chain([INIT_EXIT]) {
+    let exit = if hvf { INIT_EXIT_HOLE } else { INIT_EXIT };
+    for line in TEST_INIT_LINES.into_iter().chain([exit]) {
         qemu::expect_line(&o, line)?;
     }
     child_panic_comes_whole(&o.lines)?;
@@ -884,9 +903,10 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         .iter()
         .filter(|l| l.starts_with("process fault: "))
         .count();
-    if faults != CHILD_FAULTS {
+    let made = CHILD_FAULTS - usize::from(hvf);
+    if faults != made {
         return Err(format!(
-            "{faults} process fault lines; the test init makes {CHILD_FAULTS}"
+            "{faults} process fault lines; the test init makes {made}"
         ));
     }
     let ticks = qemu::number_after(&o.lines, "counter ticks of 10000 turns: ")
@@ -906,7 +926,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
     }
-    Ok(())
+    Ok(r.passed.len())
 }
 
 /// The panic of a child comes whole (spec 13.2): a line with where it
@@ -935,6 +955,50 @@ fn gdb() -> Result<(), String> {
     );
     run_cmd(
         qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image)).args(["-nographic", "-s", "-S"]),
+    )
+}
+
+/// `cargo xtask hvf` (spec 14, 15.2): on a Mac with Apple silicon, for
+/// HVF_V3 and then HVF_V2, the boot of the normal build with the counter
+/// at HVF_HZ, the test init under qemu::hvf_verdict and the kernel tests,
+/// with a line of results for each machine. Elsewhere it prints why it
+/// skips and succeeds: `ci` does not run it.
+fn hvf() -> Result<(), String> {
+    if let Err(why) = hvf_host() {
+        println!(
+            "hvf: skipped: needs macOS on Apple Silicon with the Hypervisor framework ({why})"
+        );
+        return Ok(());
+    }
+    for (m, gic) in [(&qemu::HVF_V3, GIC_V3_LINE), (&qemu::HVF_V2, GIC_V2_LINE)] {
+        let hz = boot_smoke(m, gic)?;
+        if hz != HVF_HZ {
+            return Err(format!("the counter runs at {hz} Hz on {}", m.name));
+        }
+        let init = init_tests(m, false)?;
+        let kernel = kernel_tests(m, Variant::Test)?;
+        println!(
+            "hvf on {}: boot ok, init tests {init} passed (hole reads zero), kernel tests {kernel} passed",
+            m.name
+        );
+    }
+    Ok(())
+}
+
+/// qemu::hvf_host on this host: its OS and processor, `sysctl -n
+/// kern.hv_support` and `qemu-system-aarch64 -accel help`; a command that
+/// does not run gives no output.
+fn hvf_host() -> Result<(), String> {
+    let output = |cmd: &mut Command| {
+        cmd.output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    qemu::hvf_host(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        &output(Command::new("sysctl").args(["-n", "kern.hv_support"])),
+        &output(Command::new("qemu-system-aarch64").args(["-accel", "help"])),
     )
 }
 
