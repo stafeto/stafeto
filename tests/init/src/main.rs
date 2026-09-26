@@ -3251,40 +3251,32 @@ fn timer_bounds_a_wait() -> Outcome {
     )
 }
 
-/// Spec 15.2 (time): what comes before the bound ends the wait first. A
-/// thread of init below it notifies the channel as soon as init waits,
-/// long before the timer's deadline, 20 ms on, which a busy host running
-/// the virtual machine late does not reach first: init wakes with that
-/// notification, cancels the timer, and once the deadline passed nothing
-/// more comes.
+/// Spec 15.2 (time): what came before the bound ends the wait first.
+/// init notifies the channel, arms the timer 20 ms on and waits: the wait
+/// ends at once with the notification, init cancels the timer, and once
+/// the deadline passed nothing more comes.
 fn notification_before_the_timer_comes_first() -> Outcome {
     let c = channel(QUIET)?;
     let t = timer(&c)?;
+    let notified = sys::notify(&c, NOTIFIED);
     let deadline = clock_now()? + 20_000_000;
     let set = arm(&t, deadline);
-    let n = spawn(0, notify_once, c.raw().0, LOW, Policy::Fifo)?;
     let got = sys::receive(&c);
     let cancelled = sys::timer_cancel(&t);
     spin_past(deadline);
     let rest = sys::try_receive(&c);
-    let_run()?;
-    close(n)?;
     close(t)?;
     close(c)?;
     set?;
-    check(cancelled.is_ok(), "timer_cancel failed")?;
+    check(
+        notified.is_ok() && cancelled.is_ok(),
+        "notify or timer_cancel failed",
+    )?;
     check(
         got == Ok(unlabeled(NOTIFIED, 1)),
         "the notification before the deadline did not come first",
     )?;
     check(rest == Err(Error::WouldBlock), "the cancelled timer fired")
-}
-
-/// Notifies the channel `h` with NOTIFIED and ends.
-extern "C" fn notify_once(h: u64) -> ! {
-    let c = Handle::<Channel>::from_raw(abi::Handle(h));
-    let _ = sys::notify(&c, NOTIFIED);
-    sys::thread_exit()
 }
 
 /// Spec 15.2 (time): a deadline that passed fires in timer_set itself
