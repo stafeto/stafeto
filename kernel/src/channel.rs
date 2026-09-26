@@ -840,25 +840,17 @@ pub fn send(
     }
     let took = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
-        // holds, are alive; a thread that waits in receive is alive, and
-        // nothing changed the queue since it was looked at: one CPU, and
-        // interrupts are masked in the kernel (spec 8.1).
+        // holds, are alive; its handles are on their way, with room for
+        // them in the table of the receiver's process; nothing changed the
+        // queue since it was looked at: one CPU, and interrupts are masked
+        // in the kernel (spec 8.1). The receiver it returns is alive.
         unsafe {
-            let running = k.s.block();
-            assert!(running == t, "a thread that does not run sends");
-            let slot = thread::slot(t);
-            (*slot.as_ptr()).set_priority(t.as_ref().priority());
-            let Some(r) = queue(c, k.s).send(slot) else {
-                (*t.as_ptr()).waits = Some(Wait::Send(via));
-                via.hold();
-                return false;
-            };
-            let r = thread_of(r);
-            assert!(Some(r) == receiver, "the receiver of a request changed");
-            (*r.as_ptr()).waits = None;
-            accept(k, r, t, via, desc);
-            k.s.wake(r);
-            true
+            let r = meet(k, t, via, desc);
+            assert!(r == receiver, "the receiver of a request changed");
+            if let Some(r) = r {
+                k.s.wake(r);
+            }
+            r.is_some()
         }
     });
     if took {
@@ -904,17 +896,8 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
             {
                 return None;
             }
-            let running = k.s.block();
-            assert!(running == t, "a thread that does not run sends");
-            let slot = thread::slot(t);
-            (*slot.as_ptr()).set_priority(t.as_ref().priority());
-            let taken = queue(c, k.s).send(slot);
-            assert!(
-                taken == Some(thread::slot(r)),
-                "the receiver of a request changed"
-            );
-            (*r.as_ptr()).waits = None;
-            accept(k, r, t, via, desc);
+            let taken = meet(k, t, via, desc);
+            assert!(taken == Some(r), "the receiver of a request changed");
             Some(r)
         }
     })?;
@@ -922,6 +905,46 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
     // keeps the channel, and the sender is alive.
     unsafe { release(c, Rights::NONE, t.as_ref().priority()) };
     Some(r)
+}
+
+/// The meeting of a request with a receiver, on both paths of send (spec
+/// 6.1, 6.3, 6.4): `t`, the running thread, stops running, and its slot
+/// goes into the queue of `via`'s channel at `t`'s effective priority. The
+/// top receiver that waits there takes the request (`accept`), its wait
+/// ended, and is returned; the caller wakes it or runs it. With no
+/// receiver waiting, `t` waits in the queue instead, and `via` holds the
+/// channel for the wait: None. O(1).
+///
+/// # Safety
+/// Under the scheduler's lock `k`: `t` runs and sends through `via`, whose
+/// channel is alive, with `desc`; its handles are on their way, and a
+/// receiver that waits has room for them in its process's table.
+/// Inlined into both paths: a call of its own costs each of them about 30
+/// instructions.
+#[inline(always)]
+unsafe fn meet(
+    k: &mut Locked<'_>,
+    t: NonNull<Thread>,
+    via: Via,
+    desc: Desc,
+) -> Option<NonNull<Thread>> {
+    // SAFETY: the caller's promise; a thread that waits in receive is
+    // alive, and its slot lies in it.
+    unsafe {
+        let running = k.s.block();
+        assert!(running == t, "a thread that does not run sends");
+        let slot = thread::slot(t);
+        (*slot.as_ptr()).set_priority(t.as_ref().priority());
+        let Some(r) = queue(via.channel(), k.s).send(slot) else {
+            (*t.as_ptr()).waits = Some(Wait::Send(via));
+            via.hold();
+            return None;
+        };
+        let r = thread_of(r);
+        (*r.as_ptr()).waits = None;
+        accept(k, r, t, via, desc);
+        Some(r)
+    }
 }
 
 /// Writes a message from `from`, its sender, into `to`, the thread it
@@ -943,7 +966,10 @@ unsafe fn deliver(to: NonNull<Thread>, from: NonNull<Thread>, desc: Desc) {
         let x = &mut (*to.as_ptr()).regs.x;
         x[0] = 0;
         x[1] = desc.result();
-        x[2..10].copy_from_slice(&from.as_ref().regs.x[2..10]);
+        // Word by word: a copy of the slice would be a call of `memcpy`.
+        let f = &from.as_ref().regs.x;
+        [x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9]] =
+            [f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9]];
         mask_tail(&mut x[2..10], desc.len);
         if desc.len > INLINE_MAX {
             thread::copy_message(to, from, INLINE_MAX..desc.len);

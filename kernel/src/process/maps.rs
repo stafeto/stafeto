@@ -19,8 +19,7 @@
 use super::*;
 use crate::arch::cache;
 use crate::memory;
-use crate::thread::Long;
-use abi::Access;
+use abi::{Access, Call};
 use core::mem::{MaybeUninit, align_of, size_of};
 use kcore::maps::{Mapping, Maps};
 
@@ -40,16 +39,40 @@ pub const PORTION: u32 = 32;
 /// of them first (spec 7.4, 7.7).
 pub const EXEC_PORTION: u32 = 8;
 
+/// What a long call does to its entry (spec 7.4, 7.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// mem_map: the pages get `access`; `prepaid` bytes of the quota of
+    /// the target are charged for tables and not spent yet.
+    Map { access: Access, prepaid: u64 },
+    /// mem_unmap.
+    Unmap,
+    /// mem_protect: the pages get `access`.
+    Protect { access: Access },
+}
+
 /// The entry of the table of `target` that a long call changes (spec 7.7),
-/// by its index, which stays while the entry is busy, and its pages the
-/// call is done with, from its start. The call holds a reference to
-/// `target`, so its quota is there to refund, though the process may end
-/// meanwhile.
+/// by its index, which stays while the entry is busy, its pages the call
+/// is done with, from its start, and what the call does. The call holds a
+/// reference to `target`, so its quota is there to refund, though the
+/// process may end meanwhile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Change {
     pub target: NonNull<Process>,
     index: u32,
     done: u32,
+    op: Op,
+}
+
+impl Change {
+    /// The call that makes the change.
+    pub fn call(&self) -> Call {
+        match self.op {
+            Op::Map { .. } => Call::MemMap,
+            Op::Unmap => Call::MemUnmap,
+            Op::Protect { .. } => Call::MemProtect,
+        }
+    }
 }
 
 /// The mapping table of `process`, if it has one.
@@ -131,7 +154,8 @@ pub fn in_mapping(process: NonNull<Process>, va: usize) -> bool {
 pub fn add_mapping(
     target: NonNull<Process>,
     mapping: Mapping<NonNull<Memory>>,
-) -> Result<(Change, u64), Error> {
+    access: Access,
+) -> Result<Change, Error> {
     let p = target.as_ptr();
     // SAFETY: the caller's promise; only these fields are borrowed.
     unsafe {
@@ -161,12 +185,12 @@ pub fn add_mapping(
         .expect("a table with room takes a checked entry");
     table.set_busy(index, true);
     memory::retain_mapping(mapping.object);
-    let on = Change {
+    Ok(Change {
         target,
         index: index as u32,
         done: 0,
-    };
-    Ok((on, prepaid))
+        op: Op::Map { access, prepaid },
+    })
 }
 
 /// The entry of exactly `pages` pages from `va` in the table of `target`,
@@ -183,8 +207,9 @@ pub fn find_mapping(target: NonNull<Process>, va: u64, pages: u64) -> Result<(u3
 }
 
 /// Marks entry `index` of the table of `target`, which `find_mapping`
-/// found, busy for a long call, and returns the change it begins.
-pub fn begin_change(target: NonNull<Process>, index: u32) -> Change {
+/// found, busy for a long call that does `op`, and returns the change it
+/// begins.
+pub fn begin_change(target: NonNull<Process>, index: u32, op: Op) -> Change {
     // SAFETY: the caller holds a reference to the process, which lives.
     let table = unsafe { table(target) }.expect("a table with the entry");
     table.set_busy(index as usize, true);
@@ -192,10 +217,11 @@ pub fn begin_change(target: NonNull<Process>, index: u32) -> Change {
         target,
         index,
         done: 0,
+        op,
     }
 }
 
-/// One portion of `long`, a mem_map, mem_unmap or mem_protect (spec 7.4,
+/// One portion of `on`, a mem_map, mem_unmap or mem_protect (spec 7.4,
 /// 7.7): BAD_STATE when its process ended, and nothing is touched; else up
 /// to PORTION pages of the entry, EXEC_PORTION when they become executable,
 /// from where the call stopped: mem_map maps them to the frames of the
@@ -206,15 +232,14 @@ pub fn begin_change(target: NonNull<Process>, index: u32) -> Change {
 /// made coherent first ([G18]); the TLB entries of pages unmapped or
 /// changed go before the portion ends ([G13]). True once every page of the
 /// entry is done.
-pub fn step_change(long: &mut Long) -> Result<bool, Error> {
-    let (on, access) = match *long {
-        Long::Map { on, access, .. } | Long::Protect { on, access } => (on, Some(access)),
-        Long::Unmap { on } => (on, None),
-        Long::Create(_) => unreachable!("mem_create changes no mapping"),
-    };
+pub fn step_change(on: &mut Change) -> Result<bool, Error> {
     check_alive(on.target)?;
     // SAFETY: the process lives, and the entry is the call's.
-    let (m, space) = unsafe { (entry(&on), space(on.target)) };
+    let (m, space) = unsafe { (entry(on), space(on.target)) };
+    let access = match on.op {
+        Op::Map { access, .. } | Op::Protect { access } => Some(access),
+        Op::Unmap => None,
+    };
     // A device window carries no MAP_EXEC right (abi::WINDOW_RIGHTS, spec
     // 5.2, 9), so this excludes it on its own; the check stands so that
     // cache::sync_icache_frames never walks a page outside the linear map.
@@ -223,7 +248,7 @@ pub fn step_change(long: &mut Long) -> Result<bool, Error> {
     let va = page_address(&m, on.done);
     let mut frames = [0; PORTION as usize];
     let frames = &mut frames[..n as usize];
-    if exec || matches!(long, Long::Map { .. }) {
+    if exec || matches!(on.op, Op::Map { .. }) {
         for (i, f) in frames.iter_mut().enumerate() {
             *f = memory::frame(m.object, (m.offset + on.done) as usize + i);
         }
@@ -231,59 +256,45 @@ pub fn step_change(long: &mut Long) -> Result<bool, Error> {
     if exec {
         cache::sync_icache_frames(frames);
     }
-    match (long, access.map(|a| memory::attrs(m.object, a))) {
-        (Long::Map { prepaid, on, .. }, Some(attrs)) => {
-            space.map_pages(va, frames, attrs, prepaid);
-            on.done += n;
+    match &mut on.op {
+        Op::Map { access, prepaid } => {
+            space.map_pages(va, frames, memory::attrs(m.object, *access), prepaid)
         }
-        (Long::Protect { on, .. }, Some(attrs)) => {
-            space.protect_pages(va, n.into(), attrs);
-            on.done += n;
+        Op::Protect { access } => {
+            space.protect_pages(va, n.into(), memory::attrs(m.object, *access))
         }
-        (Long::Unmap { on }, None) => {
-            space.unmap_pages(va, n.into());
-            on.done += n;
-        }
-        _ => unreachable!("a change of a mapping has its access"),
+        Op::Unmap => space.unmap_pages(va, n.into()),
     }
+    on.done += n;
     if exec {
         crate::testpoint::code_mapped(frames);
     }
-    Ok(on.done + n == m.pages)
+    Ok(on.done == m.pages)
 }
 
-/// The end of `long` after its last portion (spec 7.4, 7.7): the entry of
+/// The end of `on` after its last portion (spec 7.4, 7.7): the entry of
 /// mem_map or mem_protect goes idle, and what mem_map did not spend on
 /// tables goes back to the quota of the process; the entry of mem_unmap
 /// leaves the table, and its reference to the object goes at `cause`.
 ///
 /// # Safety
-/// `long` ended with its last portion, its process lives, and nothing uses
+/// `on` ended with its last portion, its process lives, and nothing uses
 /// it afterwards.
-pub unsafe fn finish_change(long: Long, cause: u8) {
-    match long {
-        Long::Map { on, prepaid, .. } => {
-            // SAFETY: the caller's promise.
-            unsafe { table(on.target) }
-                .expect("a table with a busy entry")
-                .set_busy(on.index as usize, false);
+pub unsafe fn finish_change(on: Change, cause: u8) {
+    // SAFETY: the caller's promise.
+    let table = unsafe { table(on.target) }.expect("a table with a busy entry");
+    let index = on.index as usize;
+    match on.op {
+        Op::Map { prepaid, .. } => {
+            table.set_busy(index, false);
             refund(on.target, prepaid);
         }
-        Long::Protect { on, .. } => {
-            // SAFETY: as above.
-            unsafe { table(on.target) }
-                .expect("a table with a busy entry")
-                .set_busy(on.index as usize, false);
-        }
-        Long::Unmap { on } => {
-            // SAFETY: as above.
-            let m = unsafe { table(on.target) }
-                .expect("a table with a busy entry")
-                .remove(on.index as usize);
+        Op::Protect { .. } => table.set_busy(index, false),
+        Op::Unmap => {
+            let m = table.remove(index);
             // SAFETY: the entry went, and its reference with it.
             unsafe { memory::release_mapping(m.object, cause) };
         }
-        Long::Create(_) => unreachable!("mem_create changes no mapping"),
     }
 }
 
@@ -306,20 +317,15 @@ pub fn map_whole(
     let pages = memory::pages(m) as u32;
     check_free(target, va as u64, pages.into())?;
     let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
-    let (on, prepaid) = add_mapping(target, mapping)?;
-    let mut long = Long::Map {
-        on,
-        access,
-        prepaid,
-    };
-    while !step_change(&mut long).expect("a process that lives takes every portion") {}
+    let mut on = add_mapping(target, mapping, access)?;
+    while !step_change(&mut on).expect("a process that lives takes every portion") {}
     // SAFETY: the change ended with its last portion, the process lives,
     // and a mem_map releases nothing at the end, whatever the level.
-    unsafe { finish_change(long, 1) };
+    unsafe { finish_change(on, 1) };
     Ok(())
 }
 
-/// `long` stops for good midway (spec 7.7): its thread ended with its
+/// `on` stops for good midway (spec 7.7): its thread ended with its
 /// process, or its `svc` changed, or its process ended. While the process
 /// lives, its entry keeps what the portions did, in O(1): mem_map's keeps
 /// the pages it mapped, and leaves the table without one; mem_unmap's
@@ -331,20 +337,16 @@ pub fn map_whole(
 /// What mem_map did not spend on tables goes back to the quota either way.
 ///
 /// # Safety
-/// Nothing uses `long` afterwards.
-pub unsafe fn abandon_change(long: Long, cause: u8) {
-    let on = match long {
-        Long::Map { on, .. } | Long::Protect { on, .. } | Long::Unmap { on } => on,
-        Long::Create(_) => unreachable!("mem_create changes no mapping"),
-    };
+/// Nothing uses `on` afterwards.
+pub unsafe fn abandon_change(on: Change, cause: u8) {
     if check_alive(on.target).is_ok() {
         // SAFETY: the process lives, and the entry is the call's.
         let table = unsafe { table(on.target) }.expect("a table with a busy entry");
         let index = on.index as usize;
-        let gone = match long {
-            Long::Map { .. } => table.shrink_to(index, on.done),
-            Long::Unmap { .. } => table.drop_prefix(index, on.done),
-            _ => {
+        let gone = match on.op {
+            Op::Map { .. } => table.shrink_to(index, on.done),
+            Op::Unmap => table.drop_prefix(index, on.done),
+            Op::Protect { .. } => {
                 table.set_busy(index, false);
                 None
             }
@@ -354,7 +356,7 @@ pub unsafe fn abandon_change(long: Long, cause: u8) {
             unsafe { memory::release_mapping(object, cause) };
         }
     }
-    if let Long::Map { prepaid, .. } = long {
+    if let Op::Map { prepaid, .. } = on.op {
         refund(on.target, prepaid);
     }
 }

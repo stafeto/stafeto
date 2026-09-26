@@ -169,14 +169,14 @@ pub fn install_init_handles(
         insert_handle(init, Object::Thread(first), abi::OWNER_RIGHTS)?,
         insert_handle(init, Object::Memory(boot), abi::INIT_BOOT_IMAGE_RIGHTS)?,
     ];
-    assert_eq!(
-        handles,
-        [
-            abi::INIT_RESOURCE,
-            abi::INIT_PROCESS,
-            abi::INIT_THREAD,
-            abi::INIT_BOOT_IMAGE
-        ],
+    assert!(
+        handles
+            == [
+                abi::INIT_RESOURCE,
+                abi::INIT_PROCESS,
+                abi::INIT_THREAD,
+                abi::INIT_BOOT_IMAGE
+            ],
         "init's handles went into a table that was not fresh"
     );
     Ok(())
@@ -190,9 +190,8 @@ pub fn install_init_handles(
 /// pays for: NO_MEMORY when its quota falls short.
 pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
     let stub = insert_handle(child, Object::Resource, Rights::NONE)?;
-    assert_eq!(
-        stub,
-        abi::START_CHANNEL,
+    assert!(
+        stub == abi::START_CHANNEL,
         "the start entry went into a table that was not fresh"
     );
     // The system resource is never queued: any level will do.
@@ -210,9 +209,8 @@ pub fn reserve_start(child: NonNull<Process>) -> Result<(), Error> {
 /// short.
 pub fn move_start(child: NonNull<Process>, object: Object, rights: Rights) -> Result<(), Error> {
     let h = insert_handle(child, object, rights)?;
-    assert_eq!(
-        h,
-        abi::START_CHANNEL,
+    assert!(
+        h == abi::START_CHANNEL,
         "the start entry went into a table that was not fresh"
     );
     Ok(())

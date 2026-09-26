@@ -64,8 +64,8 @@ pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
-    Change, abandon_change, add_mapping, begin_change, check_free, device_windows, find_mapping,
-    finish_change, in_mapping, map_whole, step_change,
+    Change, Op, abandon_change, add_mapping, begin_change, check_free, device_windows,
+    find_mapping, finish_change, in_mapping, map_whole, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
@@ -167,8 +167,8 @@ pub struct Process {
     cleanup: Item,
 }
 
-// Two shells to a page of a pool (spec 7.8).
-const _: () = assert!(Pool::<Process>::PER_PAGE >= 2);
+// Three shells to a page of a pool (spec 7.8).
+const _: () = assert!(Pool::<Process>::PER_PAGE >= 3);
 
 /// The pools of what a process pays for by the page (spec 7.5, 7.8): a
 /// page is charged when a pool grows, a slot that goes back refunds
@@ -868,15 +868,8 @@ pub fn translate(process: NonNull<Process>, va: usize) -> Option<(u64, u64)> {
     space.as_ref()?.translate(va)
 }
 
-/// Processes that came to their stage Quota with children still in their
-/// list: none may, since the stage Children waits for each (test builds).
 #[cfg(feature = "ktest")]
-static EARLY_QUOTA: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-#[cfg(feature = "ktest")]
-pub use test_access::{
-    has_accepted, in_use, mapping, mappings, parent, progress, take_early_quota,
-};
+pub use test_access::{has_accepted, in_use, mapping, mappings, parent, progress};
 
 /// What the kernel tests read and steer here (crate::ktest).
 #[cfg(feature = "ktest")]
@@ -886,12 +879,6 @@ mod test_access {
     /// Processes whose shells have not gone.
     pub fn in_use() -> usize {
         LIVE.count()
-    }
-
-    /// How many processes came to their stage Quota before their children
-    /// passed theirs, since the last call.
-    pub fn take_early_quota() -> u32 {
-        EARLY_QUOTA.swap(0, core::sync::atomic::Ordering::Relaxed)
     }
 
     /// The parent of `process`, which the test holds.

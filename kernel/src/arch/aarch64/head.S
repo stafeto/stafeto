@@ -105,6 +105,12 @@ at_el1:
     msr     sctlr_el1, x1
     isb
 
+    // Drop any cache lines over the boot page tables first: the stores
+    // below go to memory, and a dirty line the loader left there, evicted
+    // later, would overwrite them ([G10]; Linux does the same).
+    ADR_L   x0, __boot_pt_start
+    ADR_L   x1, __boot_pt_end
+    bl      inval_boot_pt
     // Zero the boot page tables. The MMU is off: aligned stores only.
     ADR_L   x0, __boot_pt_start
     ADR_L   x1, __boot_pt_end
@@ -167,18 +173,13 @@ at_el1:
     and     x10, x10, #0x1ff
     str     x11, [x7, x10, lsl #3]
 
-    // The tables were written with the MMU off: drop stale cache lines over them.
+    // The tables were written with the MMU off: drop stale cache lines over
+    // them [G10]. DC IVAC is ordered after the Device stores above only by
+    // a barrier.
+    dmb     sy
     ADR_L   x0, __boot_pt_start
     ADR_L   x1, __boot_pt_end
-    mrs     x2, ctr_el0
-    ubfx    x2, x2, #16, #4
-    mov     x3, #4
-    lsl     x3, x3, x2              // smallest data cache line in bytes
-5:  dc      ivac, x0
-    add     x0, x0, x3
-    cmp     x0, x1
-    b.lo    5b
-    dsb     sy
+    bl      inval_boot_pt
 
     ADR_L   x21, boot_empty_l0      // physical address, installed after the jump
 
@@ -236,6 +237,20 @@ upper_half:
 park:
     wfe
     b       park
+
+// DC IVAC over [x0, x1) by the smallest data cache line of CTR_EL0, then
+// DSB SY [G10]. Clobbers x0, x2 and x3.
+inval_boot_pt:
+    mrs     x2, ctr_el0
+    ubfx    x2, x2, #16, #4
+    mov     x3, #4
+    lsl     x3, x3, x2              // smallest data cache line in bytes
+5:  dc      ivac, x0
+    add     x0, x0, x3
+    cmp     x0, x1
+    b.lo    5b
+    dsb     sy
+    ret
 
 .ltorg
 

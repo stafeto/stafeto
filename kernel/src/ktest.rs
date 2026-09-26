@@ -2261,6 +2261,22 @@ fn check_stages(
     )
 }
 
+/// Processes that came to their stage Quota with children still in their
+/// list, since the last `take_early_quota`: none may, since the stage
+/// Children waits for each.
+static EARLY_QUOTA: AtomicU32 = AtomicU32::new(0);
+
+/// The test point of the stage Quota (testpoint::quota_stage).
+pub fn quota_stage(with_children: bool) {
+    if with_children {
+        EARLY_QUOTA.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn take_early_quota() -> u32 {
+    EARLY_QUOTA.swap(0, Ordering::Relaxed)
+}
+
 /// The end of a process ends its descendants, which go depth first
 /// (spec 4, 7.7): two children, one with a child of its own whose thread
 /// is ready, each child and grandchild held only by a handle in its
@@ -2270,7 +2286,7 @@ fn check_stages(
 fn parent_quota_stage_sees_children_done(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 12;
     cleanup::drain();
-    process::take_early_quota();
+    take_early_quota();
     let (processes, threads) = (process::in_use(), thread::in_use());
     let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
     let built = child_of(root, 4 * CHILD_QUOTA).and_then(|a| {
@@ -2657,7 +2673,7 @@ fn check_tree_end(
     check(cleanup::top().is_none(), STUCK)?;
     check(!ready, "the grandchild's thread is still ready")?;
     check(
-        process::take_early_quota() == 0,
+        take_early_quota() == 0,
         "a process came to its stage Quota before its children passed theirs",
     )
 }

@@ -87,6 +87,9 @@ const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
 /// The rows of the line of `device_windows_are_measured`, in its order
 /// (spec 15.3).
 const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
+/// The rows of the line of the test init's `normal_build_costs`, in its
+/// order: the costs of the build that ships (spec 15.3).
+const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
 /// checked.
@@ -150,7 +153,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 178;
+const INIT_TESTS: u32 = 179;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -795,15 +798,20 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
             ("device window", &WINDOW_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
-            let rows: Vec<_> = rows
-                .iter()
-                .zip(ticks)
-                .map(|(row, n)| format!("{row}={n}"))
-                .collect();
-            println!("{what} ticks on {}: {}", m.memory, rows.join(" "));
+            println!("{what} ticks on {}: {}", m.memory, rows_of(rows, &ticks));
         }
     }
     Ok(())
+}
+
+/// `rows` with their `ticks`, as `<row>=<n> ...`.
+fn rows_of(rows: &[&str], ticks: &[u64]) -> String {
+    let rows: Vec<_> = rows
+        .iter()
+        .zip(ticks)
+        .map(|(row, n)| format!("{row}={n}"))
+        .collect();
+    rows.join(" ")
 }
 
 /// The numbers of the line `<what> ticks: <row>=<n> ...` that a measuring
@@ -838,7 +846,8 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// print for the tests come whole, CHILD_FAULTS children fault, and it
 /// exits with 0, which turns the machine off. Its first line says how long
 /// a counted loop took, which under -icount must be the loop's
-/// instructions.
+/// instructions; there it also prints the costs of the build that ships
+/// (NORMAL_BUILD_ROWS), which fail nothing by their numbers (spec 15.3).
 fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS)?;
@@ -883,6 +892,14 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         m.memory,
         r.passed.len()
     );
+    if icount {
+        let ticks = ticks_of(&o.lines, "normal build", &NORMAL_BUILD_ROWS)?;
+        println!(
+            "normal build ticks on {}: {}",
+            m.memory,
+            rows_of(&NORMAL_BUILD_ROWS, &ticks)
+        );
+    }
     Ok(())
 }
 

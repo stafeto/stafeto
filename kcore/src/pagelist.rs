@@ -13,6 +13,7 @@
 //! reads at most two words.
 
 use crate::PAGE_SIZE;
+use crate::frames::PhysMem;
 
 /// Words of a node: the frames of its pages, or the nodes below it.
 pub const ENTRIES: usize = PAGE_SIZE as usize / 8;
@@ -23,22 +24,19 @@ pub const MAX_PAGES: usize = ENTRIES * ENTRIES;
 /// two units of work of a portion (spec 7.7).
 pub const RELEASE_STEP: usize = 32;
 
-/// Frames for the pages and nodes of a list.
+/// Frames for the pages and nodes of a list, whose words the list reads
+/// and writes through PhysMem. Reading a page's frame needs PhysMem alone
+/// (`PageList::frame`).
 ///
 /// # Safety
 /// `alloc_frame` returns the physical address of a zeroed 4 KiB frame,
 /// aligned to 4 KiB, that belongs to the list from then on and that
 /// nothing else uses; `free_frame` takes back only such a frame, once the
-/// list no longer refers to it. `read` and `write` access the 8-byte word
-/// at a physical address inside a node of the list, and nothing else;
-/// `read` returns the last word written. The kernel's frames come from a
-/// budget the creator paid for whole (spec 7.5), so `alloc_frame` does not
-/// fail.
-pub unsafe trait ListMemory {
+/// list no longer refers to it. The kernel's frames come from a budget the
+/// creator paid for whole (spec 7.5), so `alloc_frame` does not fail.
+pub unsafe trait ListMemory: PhysMem {
     fn alloc_frame(&mut self) -> u64;
     fn free_frame(&mut self, pa: u64);
-    fn read(&self, pa: u64) -> u64;
-    fn write(&mut self, pa: u64, value: u64);
 }
 
 /// Levels of nodes a list of `pages` pages has: 0 for one page, 1 up to
@@ -145,13 +143,13 @@ impl PageList {
     }
 
     /// The frame of page `i`, which the list holds: at most two reads.
-    pub fn frame(&self, mem: &impl ListMemory, i: usize) -> u64 {
+    pub fn frame(&self, mem: &impl PhysMem, i: usize) -> u64 {
         assert!(!self.going, "a page list is read after its release began");
         assert!(i < self.filled, "a page the list does not hold");
         self.find(mem, i)
     }
 
-    fn find(&self, mem: &impl ListMemory, i: usize) -> u64 {
+    fn find(&self, mem: &impl PhysMem, i: usize) -> u64 {
         match depth(self.pages) {
             0 => self.root,
             1 => mem.read(self.root + 8 * i as u64),
@@ -244,8 +242,7 @@ mod tests {
         }
     }
 
-    // SAFETY: frames are distinct and owned by the test; absent words
-    // read as 0; `read` returns the last `write`.
+    // SAFETY: frames are distinct and owned by the test.
     unsafe impl ListMemory for Mem {
         fn alloc_frame(&mut self) -> u64 {
             let pa = BASE + self.taken.len() as u64 * PAGE_SIZE;
@@ -260,6 +257,11 @@ mod tests {
             *taken = false;
             self.freed.push(pa);
         }
+    }
+
+    // SAFETY: absent words read as 0; `read` returns the last `write`, and
+    // the words of a frame that went are never touched.
+    unsafe impl PhysMem for Mem {
         fn read(&self, pa: u64) -> u64 {
             let i = Mem::index(pa);
             assert!(self.taken[i], "a read of a frame that went");

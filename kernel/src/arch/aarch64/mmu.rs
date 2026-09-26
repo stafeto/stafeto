@@ -52,23 +52,19 @@ pub unsafe fn set_ttbr0(ttbr: u64) {
     unsafe { asm!("msr ttbr0_el1, {}", "isb", in(reg) ttbr, options(nostack, preserves_flags)) };
 }
 
-/// Lets the table walker see earlier table stores, and the kernel touch the
-/// pages they map right away. An entry that goes from invalid to valid
-/// needs nothing more: the TLB never holds invalid entries.
+/// Lets the table walker see earlier table stores: `dsb ishst` with no
+/// `isb` (spec 7.4; [G13], [G14], [G15]). An entry that goes from invalid
+/// to valid needs nothing more, as the TLB never holds invalid entries.
+/// No `isb` is needed either: the tables of a program become live through
+/// `eret`, which synchronizes, and the kernel's own tree goes live in
+/// `switch_ttbr1`, which has barriers of its own.
 pub fn tables_written() {
-    // SAFETY: barriers have no other effect.
-    unsafe { asm!("dsb ishst", "isb", options(nostack, preserves_flags)) };
-}
-
-/// Lets the table walker see earlier stores to the tables of a program:
-/// `dsb ishst` with no `isb` (spec 7.4; [G13], [G14], [G15]).
-pub fn user_tables_written() {
     // SAFETY: a barrier has no other effect.
     unsafe { asm!("dsb ishst", options(nostack, preserves_flags)) };
 }
 
 /// Drops the TLB entry of one page of a program with `tlbi vale1is` and no
-/// barrier: a batch of them stands between `user_tables_written` and
+/// barrier: a batch of them stands between `tables_written` and
 /// `user_pages_invalidated` ([G13]); `operand` comes from
 /// kcore::asid::tlbi_page.
 pub fn invalidate_user_page(operand: u64) {
@@ -84,11 +80,12 @@ pub fn user_pages_invalidated() {
 }
 
 /// Drops every TLB entry of one ASID, walk-cache entries included; `operand`
-/// comes from kcore::asid::tlbi_asid.
+/// comes from kcore::asid::tlbi_asid. No `isb`: an ASID of a program maps
+/// no page of the kernel, and the way back to EL0 synchronizes ([G13]).
 pub fn invalidate_asid(operand: u64) {
     // SAFETY: TLB maintenance only drops cached translations.
     unsafe {
-        asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", "isb", in(reg) operand, options(nostack, preserves_flags))
+        asm!("dsb ishst", "tlbi aside1is, {}", "dsb ish", in(reg) operand, options(nostack, preserves_flags))
     };
 }
 

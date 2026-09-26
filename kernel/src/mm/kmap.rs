@@ -27,13 +27,13 @@ unsafe impl TableMemory for FrameTables<'_> {
     fn alloc_table(&mut self) -> Option<u64> {
         let pa = self.frames.alloc(0)?;
         // SAFETY: the frame was just taken from the allocator.
-        let mut mem = unsafe { LinearMem::new() };
-        for i in 0..512 {
-            mem.write(pa + i * 8, 0);
-        }
+        unsafe { phys::zero(pa, 0) };
         // The zeroes reach the table walker before a parent entry links
-        // this table into a live tree; the asm block also keeps the
-        // compiler from moving the stores.
+        // this table into a live tree ([G14]); the asm block also keeps the
+        // compiler from moving the stores. The kernel tree only grows here,
+        // before it goes live through `switch_ttbr1`, so no `isb` is needed
+        // for this store to be seen; a change to a tree already live would
+        // need one ([G14]).
         mmu::tables_written();
         Some(pa)
     }

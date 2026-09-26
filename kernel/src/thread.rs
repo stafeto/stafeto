@@ -26,7 +26,7 @@ use crate::mm::phys::{self, Frame};
 use crate::object::{self, Live, Moving, Object, Refs};
 use crate::process::{self, Change, Process};
 use crate::sched::{self, Tokens};
-use abi::{Access, Call, Error, MESSAGE_HANDLES, Policy, ThreadInfo, ThreadState, msgbuf};
+use abi::{Call, Error, MESSAGE_HANDLES, Policy, ThreadInfo, ThreadState, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
 use kcore::notify::Slot;
@@ -103,18 +103,9 @@ pub enum Long {
     /// mem_create: the object being made, whose only reference this is
     /// until the object is whole and a handle takes its place.
     Create(NonNull<Memory>),
-    /// mem_map: the new entry, busy, whose pages it maps with `access`;
-    /// `prepaid` bytes of the quota of the target are charged for tables
-    /// and not spent yet (process::maps).
-    Map {
-        on: Change,
-        access: Access,
-        prepaid: u64,
-    },
-    /// mem_unmap: the entry, busy, whose pages it unmaps.
-    Unmap { on: Change },
-    /// mem_protect: the entry, busy, whose pages it gives `access`.
-    Protect { on: Change, access: Access },
+    /// mem_map, mem_unmap or mem_protect: the busy entry it changes
+    /// (process::maps).
+    Change(Change),
 }
 
 impl Long {
@@ -122,9 +113,7 @@ impl Long {
     pub fn call(self) -> Call {
         match self {
             Long::Create(_) => Call::MemCreate,
-            Long::Map { .. } => Call::MemMap,
-            Long::Unmap { .. } => Call::MemUnmap,
-            Long::Protect { .. } => Call::MemProtect,
+            Long::Change(on) => on.call(),
         }
     }
 }
@@ -460,11 +449,11 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) {
             // SAFETY: the call held the object's reference, which goes.
             unsafe { memory::release(m, cause) };
         }
-        Some(long @ (Long::Map { on, .. } | Long::Unmap { on } | Long::Protect { on, .. })) => {
+        Some(Long::Change(on)) => {
             // SAFETY: nothing uses the call afterwards, and its reference to
             // the process goes last.
             unsafe {
-                process::abandon_change(long, cause);
+                process::abandon_change(on, cause);
                 process::release(on.target, cause);
             }
         }
@@ -528,18 +517,16 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 /// # Safety
 /// `t` is the running thread, and the caller does not use it afterwards.
 pub unsafe fn exit(t: NonNull<Thread>) {
-    // SAFETY: the running thread is alive and holds its process; the
-    // reference taken here keeps the process when the thread goes.
+    // SAFETY: the running thread is alive and holds its process until its
+    // portion of cleanup, which comes after this call.
     let (p, cause) = unsafe { (t.as_ref().process, t.as_ref().priority()) };
-    process::retain(p);
     // SAFETY: the thread never runs at EL0 again, and the caller hands it
-    // over; the process lives until the release below.
+    // over; its reference keeps the process.
     unsafe {
         drop_buffer(t, cause);
         sched::exit(t, cause);
         process::remove_thread(p, t);
         process::thread_exited(p, cause);
-        process::release(p, cause);
     }
 }
 
