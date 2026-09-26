@@ -129,6 +129,49 @@ pub const MAX_THREADS: u32 = 64;
 /// fails with LIMIT_REACHED.
 pub const MAX_TIMERS: u32 = 64;
 
+/// Mappings of one process, at most (spec 7.4): `mem_map` past it fails
+/// with LIMIT_REACHED.
+pub const MAX_MAPPINGS: u32 = 64;
+
+/// What a mapping lets a program do with its pages (spec 7.4): read, read
+/// and write, or read and execute. A register holds the sum of the bits
+/// R = 1, W = 2 and X = 4; write and execute together (W^X) and every
+/// other value are refused with INVALID_ARGS.
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Read = 1,
+    ReadWrite = 3,
+    ReadExec = 5,
+}
+
+impl Access {
+    /// The access a register holds; None for any other value.
+    pub const fn from_raw(raw: u64) -> Option<Access> {
+        match raw {
+            1 => Some(Access::Read),
+            3 => Some(Access::ReadWrite),
+            5 => Some(Access::ReadExec),
+            _ => None,
+        }
+    }
+
+    /// The value for a register.
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+
+    /// The rights of a memory object's handle a mapping with this access
+    /// needs (spec 5.2): MAP_READ, with MAP_WRITE for W and MAP_EXEC for X.
+    pub const fn rights(self) -> Rights {
+        match self {
+            Access::Read => Rights::MAP_READ,
+            Access::ReadWrite => Rights::MAP_READ.union(Rights::MAP_WRITE),
+            Access::ReadExec => Rights::MAP_READ.union(Rights::MAP_EXEC),
+        }
+    }
+}
+
 /// Top of the stack of init's first thread (spec 13.3). The kernel maps the
 /// stack the boot image asks for right under it, with an unmapped guard
 /// page below; init's program lies under that guard page.
@@ -996,6 +1039,23 @@ mod tests {
     #[test]
     fn timers_have_a_fixed_bound() {
         assert_eq!(MAX_TIMERS, 64);
+    }
+
+    #[test]
+    fn mappings_have_a_fixed_bound_and_three_accesses() {
+        assert_eq!(MAX_MAPPINGS, 64);
+        let accesses = [
+            (Access::Read, 1, Rights::MAP_READ),
+            (Access::ReadWrite, 3, Rights::MAP_READ | Rights::MAP_WRITE),
+            (Access::ReadExec, 5, Rights::MAP_READ | Rights::MAP_EXEC),
+        ];
+        for (access, raw, rights) in accesses {
+            assert_eq!((access.raw(), access.rights()), (raw, rights));
+            assert_eq!(Access::from_raw(raw), Some(access));
+        }
+        for raw in [0, 2, 4, 6, 7, 8, 1 << 32 | 1, u64::MAX] {
+            assert_eq!(Access::from_raw(raw), None, "{raw:#x}");
+        }
     }
 
     #[test]

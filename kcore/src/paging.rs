@@ -8,7 +8,7 @@
 
 use crate::PAGE_SIZE;
 use crate::layout::USER_END;
-use abi::Error;
+use abi::{Access, Error};
 
 pub const BLOCK_2M: u64 = 2 << 20;
 /// Output address bits [47:12] of a descriptor.
@@ -18,6 +18,8 @@ const VALID: u64 = 1;
 const TABLE_OR_PAGE: u64 = 1 << 1;
 const AP_EL0: u64 = 1 << 6;
 const AP_READ_ONLY: u64 = 1 << 7;
+/// The bits a change of access rewrites: AP[2:1], PXN and UXN.
+const PERMISSIONS: u64 = AP_EL0 | AP_READ_ONLY | PXN | UXN;
 const SH_INNER: u64 = 0b11 << 8;
 const AF: u64 = 1 << 10;
 /// Not global: the TLB entry belongs to one ASID.
@@ -88,6 +90,16 @@ impl Attrs {
         write: true,
         ..Attrs::USER_RODATA
     };
+
+    /// The attributes of a program's pages with `access` (spec 7.4, [G9]):
+    /// R as USER_RODATA, RW as USER_DATA, RX as USER_TEXT.
+    pub const fn user(access: Access) -> Attrs {
+        match access {
+            Access::Read => Attrs::USER_RODATA,
+            Access::ReadWrite => Attrs::USER_DATA,
+            Access::ReadExec => Attrs::USER_TEXT,
+        }
+    }
 
     /// W^X, no executable device memory, EL0 execution only on EL0 pages,
     /// and the kernel never executes a user page.
@@ -181,6 +193,19 @@ impl From<MapError> for Error {
 
 fn index(va: u64, level: u32) -> u64 {
     (va >> (39 - 9 * level)) & 0x1FF
+}
+
+/// The most tables that mapping `pages` pages from `va` adds to a tree,
+/// the root aside (spec 7.5, 7.7): one for each 2 MiB, 1 GiB and 512 GiB
+/// region the range touches, at levels 3, 2 and 1. Three for one page, at
+/// most 517 for 1 GiB. `pages` is not 0, and the range lies in the lower
+/// half.
+pub fn tables_bound(va: u64, pages: u64) -> u64 {
+    let last = va + (pages << 12) - 1;
+    [21, 30, 39]
+        .into_iter()
+        .map(|shift| (last >> shift) - (va >> shift) + 1)
+        .sum()
 }
 
 /// A valid descriptor with bit 1 set: a table at levels 0-2, a page at level 3.
@@ -349,6 +374,46 @@ impl PageTable {
         }
         mem.write(slot, 0);
         Ok(d & OA_MASK)
+    }
+
+    /// Changes the access of the 4 KiB page that maps `va` to that of
+    /// `attrs`, user attributes that keep W^X, and returns the old
+    /// descriptor: only AP, PXN and UXN change; the frame, the memory type
+    /// and the rest of the descriptor stay (spec 7.4, [G14]). NotMapped
+    /// when no page maps `va`, Misaligned for an address inside a page,
+    /// NotUser for attributes that are not a program's, WriteAndExecute
+    /// for W^X. The caller drops the TLB entry of the page afterwards
+    /// ([G13]).
+    pub fn protect_page(
+        &mut self,
+        mem: &mut impl TableMemory,
+        va: u64,
+        attrs: Attrs,
+    ) -> Result<u64, MapError> {
+        if !attrs.is_valid() {
+            return Err(MapError::WriteAndExecute);
+        }
+        if !attrs.user {
+            return Err(MapError::NotUser);
+        }
+        if !va.is_multiple_of(PAGE_SIZE) {
+            return Err(MapError::Misaligned);
+        }
+        let mut table = self.root;
+        for level in 0..3 {
+            let d = mem.read(table + index(va, level) * 8);
+            if !is_table_or_page(d) {
+                return Err(MapError::NotMapped);
+            }
+            table = d & OA_MASK;
+        }
+        let slot = table + index(va, 3) * 8;
+        let old = mem.read(slot);
+        if !is_table_or_page(old) {
+            return Err(MapError::NotMapped);
+        }
+        mem.write(slot, (old & !PERMISSIONS) | (attrs.bits() & PERMISSIONS));
+        Ok(old)
     }
 
     /// Frees every table of the tree, the root last, and returns how many
@@ -991,6 +1056,127 @@ mod tests {
         // Root and L1: a step to enter and one to free; L2: one per leaf
         // and one to free itself.
         assert_eq!((steps, release.freed()), (2 + 2 + 513, 515));
+    }
+
+    /// A program's pages by their access (spec 7.4, [G9]): AP 11 for R and
+    /// RX, 01 for RW; UXN clear for RX alone; PXN, nG and AF always; normal
+    /// memory at MAIR index 0.
+    #[test]
+    fn user_attrs_follow_the_access() {
+        assert_eq!(Attrs::user(Access::Read), Attrs::USER_RODATA);
+        assert_eq!(Attrs::user(Access::ReadWrite), Attrs::USER_DATA);
+        assert_eq!(Attrs::user(Access::ReadExec), Attrs::USER_TEXT);
+        for (access, ap, user_exec) in [
+            (Access::Read, 0b11, false),
+            (Access::ReadWrite, 0b01, false),
+            (Access::ReadExec, 0b11, true),
+        ] {
+            let d = page_descriptor(0x4567_8000, Attrs::user(access));
+            assert_eq!((d >> 6) & 0b11, ap, "{access:?}");
+            assert_eq!(d & UXN == 0, user_exec, "{access:?}");
+            assert!(d & PXN != 0 && d & NG != 0 && d & AF != 0, "{access:?}");
+            assert_eq!(attr_index(d), MAIR_NORMAL);
+        }
+    }
+
+    /// A change of access rewrites AP, PXN and UXN of one page and nothing
+    /// else: the frame, the memory type, nG, AF and the neighbours stay,
+    /// and no table is taken.
+    #[test]
+    fn protect_changes_permissions_only() {
+        let mut t = tables(8);
+        let mut pt = PageTable::new(&mut t).unwrap();
+        let (va, pa) = (0x40_0000, 0x4567_8000);
+        pt.map_user(&mut t, va, pa, 2 * PAGE_SIZE, Attrs::USER_DATA)
+            .unwrap();
+        let tables_before = t.allocated();
+        let before = pt.translate(&t, va).unwrap().1;
+        for access in [Access::ReadExec, Access::Read, Access::ReadWrite] {
+            let attrs = Attrs::user(access);
+            let old = pt.protect_page(&mut t, va, attrs).unwrap();
+            assert_eq!(old & !PERMISSIONS, before & !PERMISSIONS);
+            let (frame, d) = pt.translate(&t, va).unwrap();
+            assert_eq!((frame, d), (pa, page_descriptor(pa, attrs)), "{access:?}");
+            assert_eq!(d & !PERMISSIONS, before & !PERMISSIONS);
+        }
+        let neighbour = pt.translate(&t, va + PAGE_SIZE).unwrap().1;
+        assert_eq!(neighbour, page_descriptor(pa + PAGE_SIZE, Attrs::USER_DATA));
+        let rx = Attrs::USER_TEXT;
+        let wx = Attrs { write: true, ..rx };
+        for (at, attrs, error) in [
+            (va + 2 * PAGE_SIZE, rx, MapError::NotMapped),
+            (0x8000_0000, rx, MapError::NotMapped),
+            (va + 8, rx, MapError::Misaligned),
+            (va, Attrs::KERNEL_DATA, MapError::NotUser),
+            (va, wx, MapError::WriteAndExecute),
+        ] {
+            assert_eq!(pt.protect_page(&mut t, at, attrs), Err(error), "{at:#x}");
+        }
+        assert_eq!(
+            pt.translate(&t, va).unwrap().1,
+            page_descriptor(pa, Attrs::USER_DATA)
+        );
+        assert_eq!(
+            t.allocated(),
+            tables_before,
+            "a change of access took a table"
+        );
+    }
+
+    /// The bound of new tables (spec 7.7): 3 for a page, 514 for an aligned
+    /// gigabyte, 517 for one that crosses 1 GiB and 512 GiB. Then 10 000
+    /// random ranges with a fixed seed, which start near a boundary of 2
+    /// MiB, 1 GiB or 512 GiB: on a tree with only its root the mapping
+    /// takes exactly the bound, and on a tree some pages near the range
+    /// fill already no more.
+    #[test]
+    fn tables_bound_covers_every_range() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(tables_bound(0x1000, 1), 3);
+        assert_eq!(tables_bound(GIB, 1 << 18), 512 + 1 + 1);
+        assert_eq!(tables_bound(GIB + PAGE_SIZE, 1 << 18), 513 + 2 + 1);
+        assert_eq!(tables_bound((512 * GIB) - PAGE_SIZE, 1 << 18), 513 + 2 + 2);
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for step in 0..10_000 {
+            let region = [BLOCK_2M, GIB, 512 * GIB][(next() % 3) as usize];
+            let boundary = region * (4 + next() % 8);
+            let pages = if next() % 4 == 0 {
+                1 + next() % 1100
+            } else {
+                1 + next() % 64
+            };
+            let va = boundary - (next() % (pages + 1)) * PAGE_SIZE;
+            let mut t = tables(usize::MAX);
+            let mut pt = PageTable::new(&mut t).unwrap();
+            let filled = step % 2 == 1;
+            if filled {
+                for _ in 0..3 {
+                    let away = (1 + next() % 256) * PAGE_SIZE;
+                    let at = if next() % 2 == 0 {
+                        va - away
+                    } else {
+                        va + pages * PAGE_SIZE + away - PAGE_SIZE
+                    };
+                    let _ = pt.map_user(&mut t, at, 0x5000_0000, PAGE_SIZE, Attrs::USER_DATA);
+                }
+            }
+            let before = t.allocated().len();
+            pt.map_user(&mut t, va, 0x5000_0000, pages * PAGE_SIZE, Attrs::USER_DATA)
+                .unwrap();
+            let new = (t.allocated().len() - before) as u64;
+            let bound = tables_bound(va, pages);
+            if filled {
+                assert!(new <= bound, "step {step}: {new} tables, bound {bound}");
+            } else {
+                assert_eq!(new, bound, "step {step}: {pages} pages from {va:#x}");
+            }
+        }
     }
 
     #[test]

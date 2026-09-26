@@ -129,6 +129,18 @@ impl Mmu for Cpu {
     fn invalidate_asid(&mut self, operand: u64) {
         mmu::invalidate_asid(operand)
     }
+
+    fn user_tables_written(&mut self) {
+        mmu::user_tables_written()
+    }
+
+    fn invalidate_user_page(&mut self, operand: u64) {
+        mmu::invalidate_user_page(operand)
+    }
+
+    fn user_pages_invalidated(&mut self) {
+        mmu::user_pages_invalidated()
+    }
 }
 
 /// The lower half of one process. `retire` consumes the space, and its
