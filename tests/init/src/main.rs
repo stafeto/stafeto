@@ -403,6 +403,8 @@ const CHILD_FAULT_ESR: u64 = 0x8200_0007;
 
 /// A line debug_write prints with bytes other than zero past its length.
 const STOPS: &[u8] = b"debug_write stops at its length";
+/// A line debug_write prints with all 64 bytes of x2-x9.
+const LINE: &[u8; 64] = b"test init: debug_write prints all 64 bytes of x2 to x9 in order\n";
 
 fn main(_: u64) -> u64 {
     rt::console::set(&init::RESOURCE);
@@ -597,7 +599,9 @@ fn init_prints_from_el0() -> Outcome {
     check(printed.is_ok(), "debug_write failed")
 }
 
-/// Init's first handles name what spec 13.3 gives it.
+/// Init's first handles name what spec 13.3 gives it, with the rights
+/// abi gives them: copies with abi::INIT_RESOURCE_RIGHTS and
+/// abi::OWNER_RIGHTS are made.
 fn init_handles_have_their_fixed_values() -> Outcome {
     check(
         sys::process_state(&init::PROCESS) == Ok(ProcessState::Alive),
@@ -618,6 +622,15 @@ fn init_handles_have_their_fixed_values() -> Outcome {
     check(
         sys::process_state(&retyped(&init::THREAD)) == Err(Error::WrongType),
         "INIT_THREAD is a process",
+    )?;
+    let copies = [
+        sys::handle_duplicate(&init::RESOURCE, abi::INIT_RESOURCE_RIGHTS).map(close),
+        sys::handle_duplicate(&init::PROCESS, abi::OWNER_RIGHTS).map(close),
+        sys::handle_duplicate(&init::THREAD, abi::OWNER_RIGHTS).map(close),
+    ];
+    check(
+        copies.iter().all(|c| matches!(c, Ok(Ok(())))),
+        "init's first handles do not carry every right abi gives them",
     )
 }
 
@@ -663,45 +676,71 @@ fn init_has_its_message_buffer() -> Outcome {
     check(read == 0x5354_4146, "init's message buffer lost a word")
 }
 
-/// debug_write takes up to 64 bytes through a handle with DEBUG to the
-/// system resource and writes only the bytes of its length (spec 11).
+/// debug_write(x0 resource with DEBUG, x1 length, x2-x9 bytes) checks the
+/// length first, then the handle, its type and its rights (spec 11), and
+/// changes x0 alone on an error: a length past 64 fails with INVALID_ARGS,
+/// through a closed handle too; a closed handle and handle 0 fail with
+/// BAD_HANDLE, a process with WRONG_TYPE, a copy of the resource without
+/// DEBUG with ACCESS_DENIED. A good call writes the bytes of its length and
+/// returns their count in x1 alone: all 64 bytes of x2-x9 in order, and
+/// only those of a shorter length; xtask finds both lines whole.
 fn debug_write_checks_its_arguments() -> Outcome {
-    let mut x = marked();
-    x[0] = init::RESOURCE.raw().0;
-    x[1] = abi::INLINE_MAX as u64 + 1;
-    // SAFETY: debug_write only reads its registers.
-    let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
+    let gone = closed_handle()?;
+    let stats = copy(&init::RESOURCE, Rights::KSTATS)?;
+    let result = debug_write_cases(gone, stats.raw().0);
+    close(stats)?;
+    result
+}
+
+fn debug_write_cases(gone: u64, no_debug: u64) -> Outcome {
+    const N: u16 = Call::DebugWrite.number();
+    let resource = init::RESOURCE.raw().0;
+    let past = abi::INLINE_MAX as u64 + 1;
+    let lengths = [
+        (resource, past),
+        (resource, u64::MAX),
+        (resource, 1 << 32),
+        (gone, past),
+    ]
+    .into_iter()
+    .all(|(h, len)| x0_alone::<N>(&[h, len], Error::InvalidArgs.code()));
+    let handles = [
+        (gone, Error::BadHandle),
+        (0, Error::BadHandle),
+        (init::PROCESS.raw().0, Error::WrongType),
+        (no_debug, Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(h, error)| x0_alone::<N>(&[h, 1], error.code()));
     check(
-        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
-        "65 bytes did not fail with INVALID_ARGS alone",
+        lengths,
+        "a length past 64 did not fail with INVALID_ARGS alone before the handle",
     )?;
     check(
-        sys::debug_write(&retyped(&init::PROCESS), b"x") == Err(Error::WrongType),
-        "a process handle wrote",
+        handles,
+        "a closed handle, handle 0, a process or a copy without DEBUG did not fail alone",
     )?;
-    let c = child(LOW)?;
-    let gone = retyped(&c);
-    close(c)?;
     check(
-        sys::debug_write(&gone, b"x") == Err(Error::BadHandle),
-        "a closed handle wrote",
-    )?;
-    let mut bytes = [b'#'; abi::INLINE_MAX];
-    bytes[..STOPS.len()].copy_from_slice(STOPS);
-    let mut x = [0; 10];
-    x[0] = init::RESOURCE.raw().0;
-    x[1] = STOPS.len() as u64;
-    x[2..].copy_from_slice(&abi::inline_words(&bytes));
-    // SAFETY: as above.
-    let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
-    check(
-        after[..2] == [0, STOPS.len() as u64],
-        "debug_write did not write the bytes of its length",
+        written(LINE) && written(STOPS),
+        "debug_write did not write the bytes of its length and return their count alone",
     )?;
     check(
         sys::debug_write(&init::RESOURCE, b"\n") == Ok(1),
         "debug_write did not write a newline",
     )
+}
+
+/// debug_write of `line` with `#` past it in x2-x9 returns the length of
+/// `line` in x1 and changes nothing past it.
+fn written(line: &[u8]) -> bool {
+    let mut bytes = [b'#'; abi::INLINE_MAX];
+    bytes[..line.len()].copy_from_slice(line);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[init::RESOURCE.raw().0, line.len() as u64]);
+    x[2..].copy_from_slice(&abi::inline_words(&bytes));
+    // SAFETY: debug_write only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::DebugWrite.number() }>(x) };
+    after[..2] == [0, line.len() as u64] && after[2..] == x[2..]
 }
 
 /// Numbers no call has fail with INVALID_ARGS and change x0 alone

@@ -28,15 +28,9 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
-/// Lines the kernel tests write through `debug_write`, each whole: from
-/// the kernel, all of x2-x9 (ktest::calls::LINE) and the bytes of a
-/// length with other bytes past it (ktest::calls::STOPS), and from EL0
-/// (ktest::el0::EL0_LINE).
-const DEBUG_WRITE_LINES: [&str; 3] = [
-    "kernel test: debug_write prints all 64 bytes of x2-x9 in order.",
-    "debug_write stops at its length",
-    "debug_write from EL0 reaches the console",
-];
+/// The line the kernel tests write through `debug_write` from EL0
+/// (ktest::el0::EL0_LINE), whole.
+const DEBUG_WRITE_LINES: [&str; 1] = ["debug_write from EL0 reaches the console"];
 /// Tests only the `icount` build has: the first checks that the run is
 /// under -icount; the next two depend on how much of a quantum is left,
 /// which only -icount makes repeatable; the fourth takes a big process
@@ -71,11 +65,12 @@ const INIT_LINES: [&str; 9] = [
 /// The kernel's last line when init exits with 0 (spec 7.9).
 const INIT_EXIT: &str = "init exited with code 0";
 /// Lines of a run of the test init (tests/init) besides its TEST lines,
-/// each whole: a formatted line longer than one debug_write, the bytes of
-/// a debug_write's length and no more, and the kernel's line for the
-/// fault of a child (spec 7.9, 15.2).
-const TEST_INIT_LINES: [&str; 3] = [
+/// each whole: a formatted line longer than one debug_write, all 64 bytes
+/// of x2-x9 in one debug_write, the bytes of a debug_write's length and no
+/// more, and the kernel's line for the fault of a child (spec 7.9, 15.2).
+const TEST_INIT_LINES: [&str; 4] = [
     "init prints from EL0 in pieces of at most 64 bytes: this line takes 2 of them",
+    "test init: debug_write prints all 64 bytes of x2 to x9 in order",
     "debug_write stops at its length",
     "process fault: instruction abort from EL0 (EC 0x20) ESR=0x82000007 FAR=0x1000 ELR=0x1000",
 ];

@@ -48,7 +48,6 @@ unsafe extern "C" {
     static el0_programs_end: u8;
     static el0_read_counter: u8;
     static el0_pattern_nop: u8;
-    static el0_pattern_unknown: u8;
     static el0_pattern_loop: u8;
     static el0_wait_loop: u8;
     static el0_pattern_yield: u8;
@@ -57,7 +56,6 @@ unsafe extern "C" {
     static el0_spin_then_yield: u8;
     static el0_set_priority: u8;
     static el0_set_priority_after_peer: u8;
-    static el0_alternate: u8;
     static el0_load: u8;
     static el0_done_at_once: u8;
     static el0_pattern_close: u8;
@@ -68,9 +66,8 @@ unsafe extern "C" {
     static el0_exit_process: u8;
     static el0_create_then_exit: u8;
     static el0_info_then_exit: u8;
-    static el0_start_and_close: u8;
+    static el0_create_and_start: u8;
     static el0_buffer_mark: u8;
-    static el0_child_fault: u8;
     static el0_start_then_close: u8;
     static el0_receive: u8;
     static el0_notify: u8;
@@ -126,7 +123,6 @@ const _: () = assert!(
         && Call::Receive.number() == 5
         && Call::Reply.number() == 6
         && Call::Notify.number() == 7
-        && Call::ProcessCreate.number() == 12
         && Call::ProcessKill.number() == 13
         && Call::ProcessExit.number() == 14
         && Call::ThreadCreate.number() == 15
@@ -137,12 +133,7 @@ const _: () = assert!(
         && Call::ObjectInfo.number() == 27
         && Call::DebugWrite.number() == 28
 );
-const _: () = assert!(
-    DATA_VA == 0x80_0000
-        && INFO_PROCESS_STATE == 1
-        && Policy::Fifo as u8 == 1
-        && NO_WAIT == 0x10000
-);
+const _: () = assert!(DATA_VA == 0x80_0000 && Policy::Fifo as u8 == 1 && NO_WAIT == 0x10000);
 
 /// The line `debug_write_from_el0` prints; xtask looks for it in the output.
 const EL0_LINE: &[u8] = b"debug_write from EL0 reaches the console\n";
@@ -158,8 +149,6 @@ const HANDLE_LIMIT: u32 = 16;
 const CEILING: u8 = 63;
 /// Threads a test may have.
 const SLOTS: usize = 3;
-/// Switches each thread of `rr_threads_alternate_by_quantum` waits for.
-const SWITCHES: u64 = 3;
 /// Threads of the child whose kill the cleanup tests queue: a portion each.
 const CHILD_THREADS: usize = 8;
 /// The portion of cleanup after which the cleanup tests' interrupt comes.
@@ -205,11 +194,6 @@ const EL0_TESTS: &[El0Test] = &[
         name: "registers_survive_a_system_call",
         start: start_nop,
         done: done_nop,
-    },
-    El0Test {
-        name: "unknown_system_call_fails_with_invalid_args",
-        start: start_unknown,
-        done: done_unknown,
     },
     El0Test {
         name: "el0_fault_ends_only_the_process",
@@ -277,16 +261,6 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_timer_off,
     },
     El0Test {
-        name: "fifo_threads_do_not_alternate",
-        start: start_fifo_pair,
-        done: done_fifo_pair,
-    },
-    El0Test {
-        name: "yield_does_not_let_lower_levels_run",
-        start: start_yield_alone,
-        done: done_yield_alone,
-    },
-    El0Test {
         name: "lowering_itself_lets_higher_threads_run",
         start: start_lowering,
         done: done_lowering,
@@ -302,16 +276,6 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_head,
     },
     El0Test {
-        name: "rr_threads_alternate_by_quantum",
-        start: start_alternate,
-        done: done_alternate,
-    },
-    El0Test {
-        name: "child_fault_reason_reaches_the_parent",
-        start: start_child_fault,
-        done: done_child_fault,
-    },
-    El0Test {
         name: "last_thread_exit_ends_the_process",
         start: start_last_exit,
         done: done_last_exit,
@@ -325,11 +289,6 @@ const EL0_TESTS: &[El0Test] = &[
         name: "process_kills_itself",
         start: start_self_kill,
         done: done_self_kill,
-    },
-    El0Test {
-        name: "closing_a_thread_handle_does_not_stop_it",
-        start: start_close_started,
-        done: done_close_started,
     },
     El0Test {
         name: "exited_thread_gives_its_buffer_back",
@@ -1330,16 +1289,6 @@ fn done_nop(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check_pattern(&t.regs, &f.patterns[0], &[0])
 }
 
-fn start_unknown(f: &mut Fixture) -> Result<(), &'static str> {
-    f.patterns[0] = Pattern::new(1);
-    spawn(f, 0, &raw const el0_pattern_unknown, DATA_VA as u64)?;
-    Ok(())
-}
-
-fn done_unknown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check_pattern(&t.regs, &f.patterns[0], &[Error::InvalidArgs.code()])
-}
-
 /// The program loads from FIXTURE itself, a kernel variable: the
 /// permission fault ends its process, with the fault as the reason, and
 /// nothing else. The judge, in a process of its own, runs afterwards.
@@ -1783,49 +1732,6 @@ fn done_timer_off(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(t.regs.x[0] == 0, "yield failed")
 }
 
-/// Two FIFO threads at one level. The first spins for three quanta while
-/// the second, ready all along, does not run; then the first yields, and
-/// the second runs before the yield returns.
-fn start_fifo_pair(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let spin = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, FIFO)?;
-    let mark = sched_thread(f, 1, &raw const el0_mark, PRIORITY, FIFO)?;
-    set_args(spin, &[word(0), 3 * quantum()]);
-    set_args(mark, &[word(0)]);
-    Ok(())
-}
-
-fn done_fifo_pair(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    if f.slot(t) != 0 {
-        return Ok(());
-    }
-    check(x[3] == 0, "a FIFO thread let its peer run without yield")?;
-    check(
-        x[0] == 0 && x[4] == 1,
-        "the peer did not run when the FIFO thread yielded",
-    )
-}
-
-/// A thread alone at its level yields while a thread below it is ready:
-/// the yield returns at once, and the lower thread does not run.
-fn start_yield_alone(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let spin = sched_thread(f, 0, &raw const el0_spin_then_yield, PRIORITY, FIFO)?;
-    let low = sched_thread(f, 1, &raw const el0_mark, PRIORITY - 5, FIFO)?;
-    set_args(spin, &[word(0), 0]);
-    set_args(low, &[word(0)]);
-    Ok(())
-}
-
-fn done_yield_alone(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    check(
-        f.slot(t) != 0 || (x[0] == 0 && x[3] == 0 && x[4] == 0),
-        "yield let a lower thread run",
-    )
-}
-
 /// A thread lowers itself below a ready thread: that thread runs before
 /// the call returns, and the caller keeps its new priority.
 fn start_lowering(f: &mut Fixture) -> Result<(), &'static str> {
@@ -1908,32 +1814,6 @@ fn done_head(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     }
 }
 
-/// Two round-robin threads at one level spin without a system call. Each
-/// sees the other run three times between two turns of its loop, and each
-/// time the stretch between those turns, which holds the other's whole
-/// run, is at least a quantum long: the timer does not fire before its
-/// compare value.
-fn start_alternate(f: &mut Fixture) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let a = sched_thread(f, 0, &raw const el0_alternate, PRIORITY, RR)?;
-    let b = sched_thread(f, 1, &raw const el0_alternate, PRIORITY, RR)?;
-    set_args(a, &[word(0), word(2), SWITCHES]);
-    set_args(b, &[word(2), word(0), SWITCHES]);
-    Ok(())
-}
-
-fn done_alternate(_: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    check(
-        x[4] == SWITCHES,
-        "a round-robin thread did not see its peer run",
-    )?;
-    check(
-        x[3] >= quantum(),
-        "a round-robin thread ran for less than a quantum",
-    )
-}
-
 /// A round-robin thread alone at its level spins for three quanta: at
 /// least two quanta end, each gives the thread a new one, and the FIFO
 /// thread below it never runs.
@@ -2000,11 +1880,8 @@ fn done_rest(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 const JUDGE: u8 = PRIORITY - 5;
 /// Where the message buffer of a thread that a test program makes goes.
 const BUFFER_VA: usize = 0x100_0000;
-/// The entry of the child's thread in `child_fault_reason_reaches_the_parent`:
-/// no page of the child maps it.
+/// An entry no page of a test's child maps: a thread there faults at once.
 const CHILD_ENTRY: u64 = 0x1000;
-/// That thread's message buffer.
-const CHILD_BUFFER: u64 = 0x2000;
 /// The exit code of `process_exit_ends_the_process_with_its_code`.
 const EXIT_CODE: u64 = 0x5EED_C0DE;
 /// The words of its data page, past the pattern, that the grandchild's
@@ -2040,53 +1917,6 @@ fn never_ran(f: &Fixture, slot: usize) -> Result<(), &'static str> {
     check(
         t.sched.state() == State::Dead && t.regs.elr == user_address(&raw const el0_mark) as u64,
         "a ready thread of the ended process ran",
-    )
-}
-
-/// The parent, a program, makes an empty child process and a thread in it
-/// above itself whose entry maps nothing, and starts it: the thread runs at
-/// once and faults, which ends the child, and object_info tells the parent
-/// why (spec 15.2 (faults)).
-fn start_child_fault(f: &mut Fixture) -> Result<(), &'static str> {
-    f.faults = true;
-    let parent = spawn(f, 0, &raw const el0_child_fault, 0)?;
-    set_args(
-        parent,
-        &[30, CHILD_ENTRY, u64::from(PRIORITY + 10), CHILD_BUFFER],
-    );
-    Ok(())
-}
-
-fn done_child_fault(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    check(x[0] == 0, "a call of the parent failed")?;
-    let ProcessState::Fault { esr, far, elr } = ProcessState::from_words([x[1], x[2], x[3], x[4]])
-    else {
-        return Err("object_info does not report the child's fault");
-    };
-    check(
-        esr::ec(esr) == esr::EC_IABT_LOWER && esr::fault_status_name(esr) == "translation fault",
-        "the child's fault is not a translation fault of an instruction fetch",
-    )?;
-    check(
-        far == CHILD_ENTRY && elr == CHILD_ENTRY,
-        "FAR and ELR are not the entry of the child's thread",
-    )?;
-    let p = f.processes[0].expect("the parent's process");
-    // SAFETY: the test holds a reference to the parent's process.
-    let parent = unsafe { p.as_ref() };
-    let (Ok(child), Ok(thread)) = (
-        parent.lookup(Handle(x[23]), Rights::NONE, Object::process),
-        parent.lookup(Handle(x[24]), Rights::NONE, Object::thread),
-    ) else {
-        return Err("the parent's handles do not name the child and its thread");
-    };
-    // SAFETY: the parent's handle holds the thread.
-    let ended = unsafe { thread.as_ref() }.sched.state() == State::Dead;
-    check(ended, "the child's thread did not end")?;
-    check(
-        process::translate(child, CHILD_BUFFER as usize).is_none(),
-        "the child's address space outlived it",
     )
 }
 
@@ -2184,35 +2014,25 @@ fn done_self_kill(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     never_ran(f, 1)
 }
 
-/// A program makes a thread below itself in its own process, starts it
-/// and closes the only handle to it. The thread runs all the same once the
+/// A program, the maker in slot 0, makes a thread below itself in its own
+/// process, starts it and keeps its handle. The thread runs once the
 /// program is done, finds its message buffer zeroed and writable, and
-/// exits: it goes with the kernel's reference, and its buffer's page with
-/// it. The process lives on; the judge is a thread of it.
-fn start_close_started(f: &mut Fixture) -> Result<(), &'static str> {
-    start_maker(f, true)
-}
-
-fn done_close_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    if f.slot(t) == 0 {
-        return check(
-            t.regs.x[0] == 0,
-            "thread_create, thread_start or handle_close failed",
-        );
-    }
-    check(
-        thread::in_use() == 2,
-        "the thread outlived its exit and its last handle",
-    )?;
-    made_thread_exited(f)
-}
-
-/// The same with the handle kept: the thread that exited stays as a shell,
-/// and its buffer's page goes at its exit. The judge closes the handle
+/// exits: its buffer's page goes at its exit, and it stays as a shell,
+/// which the handle keeps. The judge in slot 1 closes the handle
 /// afterwards: a process's handle to its own thread keeps both until the
 /// process ends.
 fn start_keep_started(f: &mut Fixture) -> Result<(), &'static str> {
-    start_maker(f, false)
+    sched_process(f)?;
+    let maker = sched_thread(f, 0, &raw const el0_create_and_start, PRIORITY, FIFO)?;
+    sched_thread(f, 1, &raw const el0_done_at_once, JUDGE, FIFO)?;
+    let own = give_own(f)?;
+    let entry = user_address(&raw const el0_buffer_mark) as u64;
+    let stack = (DATA_VA + PAGE) as u64;
+    let buffer = BUFFER_VA as u64;
+    let priority = u64::from(PRIORITY - 2);
+    let fifo = FIFO as u64;
+    set_args(maker, &[own, entry, stack, buffer, priority, fifo, buffer]);
+    Ok(())
 }
 
 fn done_keep_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
@@ -2230,35 +2050,6 @@ fn done_keep_started(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let closed = process::close_handle(p, h, CAUSE);
     result?;
     check(closed.is_ok(), "the handle to the thread did not close")
-}
-
-/// The maker in slot 0 of the test's process and the judge in slot 1. The
-/// maker makes a thread below itself that runs el0_buffer_mark with its
-/// buffer at BUFFER_VA, starts it, and closes its handle when `close`.
-fn start_maker(f: &mut Fixture, close: bool) -> Result<(), &'static str> {
-    sched_process(f)?;
-    let maker = sched_thread(f, 0, &raw const el0_start_and_close, PRIORITY, FIFO)?;
-    sched_thread(f, 1, &raw const el0_done_at_once, JUDGE, FIFO)?;
-    let own = give_own(f)?;
-    let entry = user_address(&raw const el0_buffer_mark) as u64;
-    let stack = (DATA_VA + PAGE) as u64;
-    let buffer = BUFFER_VA as u64;
-    let priority = u64::from(PRIORITY - 2);
-    let fifo = FIFO as u64;
-    set_args(
-        maker,
-        &[
-            own,
-            entry,
-            stack,
-            buffer,
-            priority,
-            fifo,
-            buffer,
-            u64::from(close),
-        ],
-    );
-    Ok(())
 }
 
 /// The maker's thread ran, found its buffer zeroed and writable, and

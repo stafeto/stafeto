@@ -207,24 +207,12 @@ const TESTS: &[(&str, TestFn)] = &[
         child_quota_comes_back_in_two_parts,
     ),
     (
-        "unknown_system_calls_fail_with_invalid_args",
-        calls::unknown_system_calls_fail_with_invalid_args,
-    ),
-    (
-        "debug_write_checks_its_arguments",
-        calls::debug_write_checks_its_arguments,
-    ),
-    (
         "object_info_reports_what_the_kernel_counts",
         calls::object_info_reports_what_the_kernel_counts,
     ),
     (
         "closing_a_handle_releases_its_object",
         calls::closing_a_handle_releases_its_object,
-    ),
-    (
-        "init_handles_have_their_fixed_values",
-        calls::init_handles_have_their_fixed_values,
     ),
     (
         "thread_set_priority_checks_the_callers_ceiling",
@@ -271,10 +259,6 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::boost_is_capped_by_the_ceiling,
     ),
     (
-        "notify_after_close_is_peer_closed",
-        calls::notify_after_close_is_peer_closed,
-    ),
-    (
         "handle_duplicate_checks_the_callers_limits",
         calls::handle_duplicate_checks_the_callers_limits,
     ),
@@ -306,10 +290,13 @@ const TESTS: &[(&str, TestFn)] = &[
         "timer_create_checks_the_callers_limits",
         calls::timer_create_checks_the_callers_limits,
     ),
-    ("timer_never_fires_early", calls::timer_never_fires_early),
     (
-        "timer_in_the_past_fires_at_once",
-        calls::timer_in_the_past_fires_at_once,
+        "timer_set_rounds_the_deadline_up",
+        calls::timer_set_rounds_the_deadline_up,
+    ),
+    (
+        "past_deadline_fires_within_timer_set",
+        calls::past_deadline_fires_within_timer_set,
     ),
     (
         "dying_timer_does_not_fire",

@@ -25,9 +25,9 @@ use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
     CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
-    INFO_PROCESS_MEMORY, INFO_PROCESS_STATE, INIT_BOOT_IMAGE, INIT_PROCESS, INIT_RESOURCE,
-    INIT_RESOURCE_RIGHTS, INIT_THREAD, KernelStats, MAX_SLOTS, NO_WAIT, Notification, OWNER_RIGHTS,
-    Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source,
+    INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS, NO_WAIT, Notification,
+    OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL,
+    Source,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -36,13 +36,6 @@ use kcore::layout::LINEAR_BASE;
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
 use kcore::token::MAX_COUNT;
-
-/// The line `debug_write_checks_its_arguments` prints: 64 bytes, all of
-/// x2-x9. xtask looks for it in the output.
-const LINE: &[u8; 64] = b"kernel test: debug_write prints all 64 bytes of x2-x9 in order.\n";
-/// A line the same test prints with `#` past its length in x2-x9, then a
-/// newline; xtask wants it whole.
-const STOPS: &[u8] = b"debug_write stops at its length";
 
 const LIMIT: u32 = 16;
 const CEILING: u8 = 63;
@@ -161,64 +154,6 @@ fn with_caller(body: impl FnOnce(&Caller) -> Result<(), &'static str>) -> Result
     let result = body(&caller);
     caller.release();
     result
-}
-
-/// Numbers no call has fail and change x0 alone. Numbers kept for calls
-/// of later milestones behave the same, but tests leave them alone: they
-/// stop failing when their calls come.
-pub fn unknown_system_calls_fail_with_invalid_args(_: &Boot) -> Result<(), &'static str> {
-    with_caller(|c| {
-        let args: [u64; 10] = core::array::from_fn(|i| i as u64 + 1);
-        for number in [0, 29, 0xFEFF] {
-            c.fails(number, &args, Error::InvalidArgs)?;
-        }
-        Ok(())
-    })
-}
-
-/// Values come before handles, a bad handle before a wrong type, a wrong
-/// type before a missing right (spec 11); a good call prints its bytes and
-/// returns their count in x1.
-pub fn debug_write_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
-    with_caller(|c| {
-        let debug = c.insert(Object::Resource, Rights::DEBUG)?;
-        let plain = c.insert(Object::Resource, Rights::DEVICE | Rights::KSTATS)?;
-        let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
-        let closed = c.insert(Object::Resource, Rights::DEBUG)?;
-        c.close(closed)?;
-        let result = debug_write_cases(c, [debug, plain, own, closed]);
-        // The handle to its own process would keep the process alive.
-        c.close(own)?;
-        result
-    })
-}
-
-fn debug_write_cases(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static str> {
-    let [debug, plain, own, closed] = handles.map(|h| h.0);
-    let n = Call::DebugWrite.number();
-    c.fails(n, &[debug, 65], Error::InvalidArgs)?;
-    c.fails(n, &[debug, u64::MAX], Error::InvalidArgs)?;
-    c.fails(n, &[debug, 1 << 32], Error::InvalidArgs)?;
-    c.fails(n, &[closed, 65], Error::InvalidArgs)?;
-    c.fails(n, &[closed, 1], Error::BadHandle)?;
-    c.fails(n, &[0, 1], Error::BadHandle)?;
-    c.fails(n, &[own, 1], Error::WrongType)?;
-    c.fails(n, &[plain, 1], Error::AccessDenied)?;
-    c.succeeds(n, &[debug, 0], &[0])?;
-    let mut args = [0; 10];
-    args[0] = debug;
-    args[1] = LINE.len() as u64;
-    args[2..].copy_from_slice(&abi::inline_words(LINE));
-    c.succeeds(n, &args, &[64])?;
-    // Only the bytes of the length go out.
-    let mut bytes = [b'#'; abi::INLINE_MAX];
-    bytes[..STOPS.len()].copy_from_slice(STOPS);
-    args[1] = STOPS.len() as u64;
-    args[2..].copy_from_slice(&abi::inline_words(&bytes));
-    c.succeeds(n, &args, &[STOPS.len() as u64])?;
-    args[1] = 1;
-    args[2..].copy_from_slice(&abi::inline_words(b"\n"));
-    c.succeeds(n, &args, &[1])
 }
 
 /// object_info reports what the kernel counts (spec 11, 16): PROCESS_MEMORY
@@ -351,50 +286,6 @@ fn close_cases(
     let resource = c.insert(Object::Resource, INIT_RESOURCE_RIGHTS)?;
     c.succeeds(n, &[resource.0], &[])?;
     c.fails(n, &[resource.0], Error::BadHandle)
-}
-
-/// Init's first handles get the values abi fixes: the system resource,
-/// init's process and thread, and a freed entry for the boot image whose
-/// value stays bad.
-pub fn init_handles_have_their_fixed_values(_: &Boot) -> Result<(), &'static str> {
-    with_caller(|c| {
-        process::install_init_handles(c.process, c.thread).map_err(|_| "no init handles")?;
-        let result = init_handle_cases(c);
-        c.close(INIT_PROCESS)?;
-        c.close(INIT_THREAD)?;
-        c.close(INIT_RESOURCE)?;
-        result
-    })
-}
-
-fn init_handle_cases(c: &Caller) -> Result<(), &'static str> {
-    // SAFETY: the process is the test's, and nothing changes it meanwhile.
-    let p = unsafe { c.process.as_ref() };
-    check(
-        p.lookup(INIT_RESOURCE, INIT_RESOURCE_RIGHTS, Object::resource)
-            .is_ok(),
-        "INIT_RESOURCE is not the system resource with all its rights",
-    )?;
-    check(
-        p.lookup(INIT_PROCESS, OWNER_RIGHTS, Object::process) == Ok(c.process),
-        "INIT_PROCESS is not init's process",
-    )?;
-    check(
-        p.lookup(INIT_THREAD, OWNER_RIGHTS, Object::thread) == Ok(c.thread),
-        "INIT_THREAD is not init's first thread",
-    )?;
-    let n = Call::HandleClose.number();
-    c.fails(n, &[INIT_BOOT_IMAGE.0], Error::BadHandle)?;
-    c.fails(
-        Call::ObjectInfo.number(),
-        &[INIT_BOOT_IMAGE.0, INFO_PROCESS_STATE, 0],
-        Error::BadHandle,
-    )?;
-    // The freed entry comes back with its next generation.
-    let next = c.insert(Object::Resource, Rights::NONE)?;
-    let fresh = next == Handle::new(INIT_BOOT_IMAGE.index(), 2);
-    c.close(next)?;
-    check(fresh, "the boot image's entry came back at another value")
 }
 
 /// thread_set_priority stops at the ceiling of the caller's process as
@@ -1206,39 +1097,6 @@ fn boost_levels(owner: &Caller, low: &Caller, h: Handle, r: Handle) -> Result<()
     )
 }
 
-/// Spec 15.2 (refusals): when the last handle with RECEIVE goes, the
-/// channel closes (spec 6.5, 6.8), and the slot queued in it goes at the
-/// stage Close. notify through a handle that is left, which a program gets
-/// with handle_duplicate (spec 5.2, 5.3) and the kernel puts in here, fails
-/// with PEER_CLOSED after its own checks, and changes x0 alone. Its last
-/// handle lets the channel go.
-pub fn notify_after_close_is_peer_closed(_: &Boot) -> Result<(), &'static str> {
-    let channels = channel::in_use();
-    with_caller(|c| {
-        let n = Call::Notify.number();
-        let h = c.created(Call::CreateChannel.number(), &[10])?;
-        let left = channel_of(c, h).and_then(|ch| c.insert(Object::Channel(ch), Rights::NOTIFY));
-        c.succeeds(n, &[h.0, 1], &[])?;
-        c.close(h)?;
-        let left = left?;
-        let queued = cleanup::len();
-        cleanup::drain();
-        let result = c
-            .fails(n, &[left.0, 1 << 63], Error::InvalidArgs)
-            .and_then(|()| c.fails(n, &[left.0, 1], Error::PeerClosed));
-        c.close(left)?;
-        result?;
-        check(
-            queued == 1,
-            "the closed channel did not go to its stage Close with its slot queued",
-        )
-    })?;
-    check(
-        channel::in_use() == channels,
-        "the channel stayed after its last handle",
-    )
-}
-
 /// x1-x9 of a receive that took `count` posts of `bits` from the slot of
 /// the session with `label`, which x10 holds (`label_of`).
 fn labelled(label: u64, bits: u64, count: u32) -> [u64; 9] {
@@ -1838,7 +1696,9 @@ fn timer_set_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str>
 /// deadline of a stretch of 64 ns a second away, on the ticks and between
 /// them, the timer stands in the heap at the first tick whose time, as
 /// clock_now counts it, is not before the deadline; the tick before it is.
-pub fn timer_never_fires_early(_: &Boot) -> Result<(), &'static str> {
+/// Only the heap shows a deadline a tick early: what a program sees is the
+/// test init's timer_never_fires_early.
+pub fn timer_set_rounds_the_deadline_up(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         with_timer(c, |_, t, tm| {
             let clock = timer::clock();
@@ -1860,8 +1720,10 @@ pub fn timer_never_fires_early(_: &Boot) -> Result<(), &'static str> {
 /// right after the call, with no interrupt in between, the timer's slot
 /// stands in the channel's queue and the timer is in no heap. So it goes
 /// for 0, for the time clock_now would give, and for an armed timer set
-/// back into the past; each time receive takes one expiry, bit 0 once.
-pub fn timer_in_the_past_fires_at_once(_: &Boot) -> Result<(), &'static str> {
+/// back into the past; each time receive takes one expiry, bit 0 once. Only
+/// the kernel sees the post before an interrupt could make it: what a
+/// program sees is the test init's timer_in_the_past_fires_at_once.
+pub fn past_deadline_fires_within_timer_set(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         with_timer(c, |h, t, tm| {
             let (set, receive) = (Call::TimerSet.number(), Call::Receive.number());
