@@ -89,7 +89,7 @@ parts. Each finished part is merged through a pull request.
 | | 1.3d Memory objects | `mem_create`, `mem_map`, memory objects in messages, child processes with code | ✅ [#13](https://github.com/stafeto/stafeto/pull/13) |
 | | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ✅ [#14](https://github.com/stafeto/stafeto/pull/14) |
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | 🚧 |
-| | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | 🚧 |
+| | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the
