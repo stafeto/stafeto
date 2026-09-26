@@ -30,7 +30,10 @@ unsafe impl TableMemory for FrameTables<'_> {
         unsafe { phys::zero(pa, 0) };
         // The zeroes reach the table walker before a parent entry links
         // this table into a live tree ([G14]); the asm block also keeps the
-        // compiler from moving the stores.
+        // compiler from moving the stores. The kernel tree only grows here,
+        // before it goes live through `switch_ttbr1`, so no `isb` is needed
+        // for this store to be seen; a change to a tree already live would
+        // need one ([G14]).
         mmu::tables_written();
         Some(pa)
     }

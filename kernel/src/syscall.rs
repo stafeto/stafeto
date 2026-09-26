@@ -74,8 +74,12 @@ impl Values {
         }
     }
 
-    /// At most abi::RESULT_VALUES values, for x1 and up.
+    /// At most abi::RESULT_VALUES values, for x1 and up. Every call site
+    /// passes an array of known length, so a longer slice is a bug there,
+    /// not a case to handle; it stops the kernel instead of silently
+    /// dropping values while `len` still claims the full count.
     pub fn new(values: &[u64]) -> Values {
+        assert!(values.len() <= abi::RESULT_VALUES);
         let mut x = [MaybeUninit::uninit(); abi::RESULT_VALUES];
         for (to, &value) in x.iter_mut().zip(values) {
             to.write(value);
