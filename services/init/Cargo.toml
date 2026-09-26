@@ -7,6 +7,10 @@ repository.workspace = true
 license = "GPL-3.0-or-later"
 description = "The first program of stafeto"
 
+# What init decides, apart from the calls it makes: tested on the host.
+[lib]
+bench = false
+
 [[bin]]
 name = "init"
 test = false
@@ -14,4 +18,11 @@ bench = false
 
 [dependencies]
 abi = { path = "../../lib/abi" }
+bootimg = { path = "../../lib/bootimg" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }

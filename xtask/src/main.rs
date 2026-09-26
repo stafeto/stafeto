@@ -604,6 +604,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "bootimg",
         "--package",
+        "init",
+        "--package",
         "kcore",
         "--package",
         "proto-init",
@@ -1243,6 +1245,18 @@ fn ci() -> Result<(), String> {
         "--package",
         "xtask",
         "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    // init's library and its tests on the host; its program builds for
+    // stafeto alone, below.
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "init",
+        "--lib",
+        "--tests",
         "--",
         "-D",
         "warnings",
