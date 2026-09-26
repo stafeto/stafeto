@@ -399,16 +399,23 @@ fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// The next entry of the long call `long` of `thread` (spec 7.7), which
 /// started over after an interrupt. An entry with the call's number goes
 /// on where the call stopped, wherever its `svc` stands, with no check made
-/// again, and its portions count from this entry; an entry with another
+/// again, and its portions count from this entry. An entry with another
 /// number gives the long call up as the caller's leaving does, what the
-/// call held goes at the thread's priority (thread::drop_long), and call
-/// `number` runs the usual way.
+/// call held going at the thread's priority (thread::drop_long): a stretch
+/// of its own, which counts toward the longest portion (KERNEL_STATS x5).
+/// With an interrupt pending the entry then starts over at its `svc`
+/// (`restart`), and call `number` runs the usual way on the next entry;
+/// otherwise it runs at once.
 fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     let entry = clock::now();
     if number != long.call().number() {
         // SAFETY: the running thread is alive, and nothing uses what its
         // call held afterwards.
         unsafe { thread::drop_long(thread, cause(thread)) };
+        cleanup::count_portion(entry);
+        if arch::irq_pending() {
+            return restart(thread);
+        }
         return dispatch(thread, number);
     }
     match long {

@@ -2172,10 +2172,13 @@ pub fn full_table_at_the_end_lets_the_object_go(_: &Boot) -> Result<(), &'static
 
 /// A thread whose next entry makes another call than its long call gives
 /// the long call up (spec 7.7): mem_create stops after a portion, and the
-/// next entry is handle_close on the registers mem_create left, which
-/// fails with BAD_HANDLE in x0 alone; the object, which only the long call
-/// held, is queued at the thread's level and goes with its frames and its
-/// budget.
+/// next entry, handle_close on the registers mem_create left, gives the
+/// call up in a stretch of its own, which counts toward the longest
+/// portion (KERNEL_STATS x5); with the kernel's timer pending that entry
+/// starts over at its `svc`, x0-x9 as they were, and the entry after it
+/// runs handle_close, which fails with BAD_HANDLE in x0 alone. The object,
+/// which only the long call held, is queued at the thread's level and
+/// goes with its frames and its budget.
 pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str> {
     let objects = memory::in_use();
     with_caller(|c| {
@@ -2184,10 +2187,18 @@ pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str>
         cleanup::drain();
         let (used, free) = (process::quota(c.process).used(), phys::free_frames());
         let args = [64 * PAGE_SIZE, 0];
-        let mut stopped = false;
+        // SAFETY: the thread is the test's and never runs.
+        let elr = || unsafe { c.thread.as_ref() }.regs.elr;
+        let at_svc = elr() - 4;
+        let (mut stopped, mut given_up, mut counted) = (false, false, false);
         with_interrupt_pending(|| {
             c.call(Call::MemCreate.number(), &args);
             stopped = thread::long(c.thread).is_some();
+            cleanup::take_longest();
+            let got = c.again(Call::HandleClose.number());
+            counted = cleanup::longest() > 0;
+            given_up =
+                got == with_marks(&args) && elr() == at_svc && thread::long(c.thread).is_none();
             Ok(())
         })?;
         let got = c.again(Call::HandleClose.number());
@@ -2196,6 +2207,14 @@ pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str>
         let mut want = with_marks(&args);
         want[0] = Error::BadHandle.code();
         check(stopped, "mem_create did not stop after a portion")?;
+        check(
+            given_up,
+            "the entry that gave the call up did not start over at its svc as it was",
+        )?;
+        check(
+            counted,
+            "giving the call up did not count toward the longest portion",
+        )?;
         check(
             got == want && thread::long(c.thread).is_none(),
             "another call did not run as itself or kept the long call",

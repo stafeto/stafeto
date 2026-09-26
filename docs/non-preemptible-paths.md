@@ -100,7 +100,12 @@ which goes back whole with the object. A memory object goes back to the
 allocator 32 frames a chunk, two units of work each. The chunks of long calls count toward the
 longest chunk (`x5` of `KERNEL_STATS`) as the chunks of cleanup do, each
 from one poll for interrupts to the next, the checks of the first entry
-and the end of the call included. `mem_map`, `mem_unmap` and
+and the end of the call included. An entry of the thread with another
+call gives the long call up first, as the thread's end does, in a stretch
+of its own that counts the same way: with an interrupt pending the entry
+starts over at its `svc`, and the other call runs on the next entry, so
+giving up and the first entry of a new long call are never one stretch.
+`mem_map`, `mem_unmap` and
 `mem_protect` change one mapping of a process, up to 32 pages a chunk, 8
 when the pages become executable, with how far they came kept in the
 calling thread and the mapping marked busy meanwhile, so that other calls
