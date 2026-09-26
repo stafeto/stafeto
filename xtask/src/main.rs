@@ -17,6 +17,17 @@ const PROGRAM_TARGET: &str = "aarch64-unknown-none";
 /// The stack of init's first thread, in bytes, which init's program asks
 /// the kernel for (lib/bootimg); the size is ours.
 const INIT_STACK_SIZE: u32 = 64 * 1024;
+/// The stack of a child of the test init (tests/child), which its loader
+/// maps (rt::loader).
+const CHILD_STACK_SIZE: u32 = 16 * 1024;
+/// The programs of the boot image of the normal build and of the test
+/// init's runs: each file's name in the image, the package that builds it
+/// for EL0 and the size of its stack. Init comes first (spec 13.1).
+const BOOT_PROGRAMS: [(&str, &str, u32); 1] = [("init", "init", INIT_STACK_SIZE)];
+const TEST_PROGRAMS: [(&str, &str, u32); 2] = [
+    ("init", "test-init", INIT_STACK_SIZE),
+    ("child", "test-child", CHILD_STACK_SIZE),
+];
 /// Spec 3.4: the kernel image file stays under 200 KB: the build that
 /// ships and the probes built from it.
 const KERNEL_LIMIT: u64 = 200 * 1024;
@@ -67,13 +78,23 @@ const INIT_EXIT: &str = "init exited with code 0";
 /// Lines of a run of the test init (tests/init) besides its TEST lines,
 /// each whole: a formatted line longer than one debug_write, all 64 bytes
 /// of x2-x9 in one debug_write, the bytes of a debug_write's length and no
-/// more, and the kernel's line for the fault of a child (spec 7.9, 15.2).
+/// more, and the kernel's line for the fault of a child with no code (spec
+/// 7.9, 15.2).
 const TEST_INIT_LINES: [&str; 4] = [
     "init prints from EL0 in pieces of at most 64 bytes: this line takes 2 of them",
     "test init: debug_write prints all 64 bytes of x2 to x9 in order",
     "debug_write stops at its length",
     "process fault: instruction abort from EL0 (EC 0x20) ESR=0x82000007 FAR=0x1000 ELR=0x1000",
 ];
+/// The children of the test init that fault, each with a line of the
+/// kernel (spec 7.9): the child with no code of
+/// `child_fault_reason_reaches_the_parent` and the children with code of
+/// the tests of faults.
+const CHILD_FAULTS: usize = 7;
+/// The panic of a child (tests/child, Role::Panic): rt prints where it
+/// panicked, then this message on a line of its own (spec 13.2).
+const CHILD_PANIC_AT: &str = "panic: panicked at tests/child/src/main.rs:";
+const CHILD_PANIC: &str = "the child panics on purpose";
 /// Where xtask's own programs (`raw_init`) start: lld's first address.
 const RAW_INIT_ENTRY: u64 = 0x20_0000;
 /// `ldr x0, [x0]`: init starts with x0 = 0, so this loads from page 0,
@@ -100,7 +121,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 125;
+const INIT_TESTS: u32 = 137;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -278,7 +299,7 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let (limit, source) = variant.limit();
     image::check_size(bytes.len() as u64, limit)?;
-    let boot_image = build_boot_image("init", "boot.img")?;
+    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS)?;
     println!(
         "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),
@@ -291,31 +312,39 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     })
 }
 
-/// Builds program `package` for EL0 and, under target/, a boot image
-/// `name` whose only file is that program as init (spec 3.3, 13.1).
-fn build_boot_image(package: &str, name: &str) -> Result<PathBuf, String> {
-    run_cmd(cargo().args([
-        "build",
-        "--package",
-        package,
-        "--release",
-        "--target",
-        PROGRAM_TARGET,
-    ]))?;
+/// Builds `programs` for EL0 and, under target/, a boot image `name` whose
+/// files they are, in their order, each with its name and the stack size
+/// its header asks for (spec 3.3, 13.1).
+fn build_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
+    let mut cmd = cargo();
+    cmd.args(["build", "--release", "--target", PROGRAM_TARGET]);
+    for (_, package, _) in programs {
+        cmd.args(["--package", package]);
+    }
+    run_cmd(&mut cmd)?;
     let target = root().join("target");
-    let elf = target.join(PROGRAM_TARGET).join("release").join(package);
-    let why = |e: String| format!("{}: {e}", elf.display());
-    let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
-    let program = elf::program(&bytes, INIT_STACK_SIZE).map_err(why)?;
-    let init = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
-    let image = bootimg::write::image(&[("init", &init)]).map_err(|e| why(e.to_string()))?;
+    let mut files = Vec::new();
+    for &(file, package, stack) in programs {
+        let elf = target.join(PROGRAM_TARGET).join("release").join(package);
+        let why = |e: String| format!("{}: {e}", elf.display());
+        let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
+        let program = elf::program(&bytes, stack).map_err(why)?;
+        let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
+        files.push((file, written, elf));
+    }
+    let list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+    let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
     std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
+    let from: Vec<_> = files
+        .iter()
+        .map(|(f, _, elf)| format!("{f} from {}", elf.display()))
+        .collect();
     println!(
-        "boot image {} ({} bytes): init from {}",
+        "boot image {} ({} bytes): {}",
         path.display(),
         image.len(),
-        elf.display()
+        from.join(", ")
     );
     Ok(path)
 }
@@ -768,14 +797,16 @@ fn round_trip_ticks(lines: &[String]) -> Result<[u64; 6], String> {
 }
 
 /// The test init (tests/init) as init of the normal build, the kernel that
-/// ships, on machine `m`, under qemu::ICOUNT when `icount`: each of its
-/// INIT_TESTS tests passes once, the lines it and the kernel print for the
-/// tests come whole, one child faults, and it exits with 0, which turns
-/// the machine off. Its first line says how long a counted loop took,
-/// which under -icount must be the loop's instructions.
+/// ships, on machine `m`, under qemu::ICOUNT when `icount`, with its child
+/// program (tests/child) as the second file of the boot image: each of its
+/// INIT_TESTS tests passes once, the lines it, its children and the kernel
+/// print for the tests come whole, CHILD_FAULTS children fault, and it
+/// exits with 0, which turns the machine off. Its first line says how long
+/// a counted loop took, which under -icount must be the loop's
+/// instructions.
 fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     let a = build(Variant::Normal)?;
-    let image = build_boot_image("test-init", "boot-test.img")?;
+    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     if icount {
@@ -793,14 +824,15 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     for line in TEST_INIT_LINES.into_iter().chain([INIT_EXIT]) {
         qemu::expect_line(&o, line)?;
     }
+    child_panic_comes_whole(&o.lines)?;
     let faults = o
         .lines
         .iter()
         .filter(|l| l.starts_with("process fault: "))
         .count();
-    if faults != 1 {
+    if faults != CHILD_FAULTS {
         return Err(format!(
-            "{faults} process fault lines; the test init makes one"
+            "{faults} process fault lines; the test init makes {CHILD_FAULTS}"
         ));
     }
     let ticks = qemu::number_after(&o.lines, "counter ticks of 10000 turns: ")
@@ -817,6 +849,24 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         r.passed.len()
     );
     Ok(())
+}
+
+/// The panic of a child comes whole (spec 13.2): a line with where it
+/// panicked, CHILD_PANIC_AT and the line and column, then CHILD_PANIC on
+/// the next line.
+fn child_panic_comes_whole(lines: &[String]) -> Result<(), String> {
+    let whole = lines.windows(2).any(|pair| {
+        let place = pair[0].strip_prefix(CHILD_PANIC_AT).and_then(|p| {
+            let (line, column) = p.strip_suffix(':')?.split_once(':')?;
+            line.parse::<u32>().ok().zip(column.parse::<u32>().ok())
+        });
+        place.is_some() && pair[1] == CHILD_PANIC
+    });
+    if whole {
+        Ok(())
+    } else {
+        Err("the child's panic did not come whole".into())
+    }
 }
 
 fn gdb() -> Result<(), String> {
@@ -869,6 +919,8 @@ fn ci() -> Result<(), String> {
         "init",
         "--package",
         "test-init",
+        "--package",
+        "test-child",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -992,6 +1044,23 @@ mod tests {
             assert!(round_trip_ticks(&[bad.to_string()]).is_err(), "{bad}");
         }
         assert!(round_trip_ticks(&[]).is_err());
+    }
+
+    /// A child's panic is its place and its message on two whole lines, and
+    /// nothing else passes for it.
+    #[test]
+    fn child_panic_is_two_whole_lines() {
+        let place = format!("{CHILD_PANIC_AT}42:5:");
+        let good = [place.clone(), CHILD_PANIC.to_string()];
+        assert_eq!(child_panic_comes_whole(&good), Ok(()));
+        for bad in [
+            [place.clone(), format!("{CHILD_PANIC} more")],
+            [format!("{CHILD_PANIC_AT}42:"), CHILD_PANIC.to_string()],
+            [format!("{CHILD_PANIC_AT}42:5"), CHILD_PANIC.to_string()],
+            [CHILD_PANIC.to_string(), place.clone()],
+        ] {
+            assert!(child_panic_comes_whole(&bad).is_err(), "{bad:?}");
+        }
     }
 
     /// The kernel tests wake their threads through timers of programs

@@ -3,7 +3,8 @@
 
 //! The test init (spec 15.2). It runs in place of init on the normal
 //! build of the kernel, the one that ships, and tests the system calls
-//! from EL0, in its own process and in children with no code. The
+//! from EL0, in its own process, in children with no code and in children
+//! it loads from the boot image, the child program (tests/child). The
 //! contract of the calls is checked here and only here: the order of
 //! their checks, their rights, and that on an error x0 alone changes
 //! (spec 11); the kernel tests keep what a program cannot see or reach,
@@ -19,7 +20,8 @@
 //! A thread above it runs at once; threads below it run when init lowers
 //! itself to 1 (`let_run`), and init runs again once they all have ended
 //! or wait: the order of priorities joins threads. Init hears of the end
-//! of a child through the child's exit channel (`wait_exit`, spec 7.9).
+//! of a child through the child's exit channel (`wait_exit`, `Kid::end`,
+//! spec 7.9).
 //! Notifications that init takes in its own thread have priority 1
 //! (QUIET), and init asks once more afterwards: their boost never lifts
 //! init above its threads (spec 6.6).
@@ -31,10 +33,12 @@ use abi::{
     Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, MemoryInfo, Policy,
     ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
 };
+use bootimg::{Part, Program};
+use child::Role;
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Thread, Timer};
 use rt::sys::{self, Received, Regs, Reply, Token};
-use rt::{Handle, Stack, init, println, time};
+use rt::{Handle, Stack, init, loader, println, time};
 
 rt::entry!(main);
 
@@ -42,7 +46,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 125] = [
+const TESTS: [Test; 137] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -283,6 +287,42 @@ const TESTS: [Test; 125] = [
         protect_to_exec_runs_new_code,
     ),
     ("init_segments_are_taken", init_segments_are_taken),
+    (
+        "child_with_code_runs_and_exits",
+        child_with_code_runs_and_exits,
+    ),
+    (
+        "child_loads_in_its_least_quota",
+        child_loads_in_its_least_quota,
+    ),
+    (
+        "request_through_the_start_channel",
+        request_through_the_start_channel,
+    ),
+    (
+        "child_bad_address_ends_it_with_the_reason",
+        child_bad_address_ends_it_with_the_reason,
+    ),
+    ("child_cannot_write_its_code", child_cannot_write_its_code),
+    ("child_cannot_run_its_data", child_cannot_run_its_data),
+    ("child_stack_has_a_guard_page", child_stack_has_a_guard_page),
+    (
+        "child_read_only_mapping_refuses_a_write",
+        child_read_only_mapping_refuses_a_write,
+    ),
+    (
+        "child_access_after_unmap_faults",
+        child_access_after_unmap_faults,
+    ),
+    ("child_panic_exits_with_101", child_panic_exits_with_101),
+    (
+        "grandchildren_die_with_their_parent",
+        grandchildren_die_with_their_parent,
+    ),
+    (
+        "child_table_churn_stays_under_its_quota",
+        child_table_churn_stays_under_its_quota,
+    ),
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
         "request_carries_registers_and_label",
@@ -470,6 +510,9 @@ const LINE: &[u8; 64] = b"test init: debug_write prints all 64 bytes of x2 to x9
 fn main(_: u64) -> u64 {
     rt::console::set(&init::RESOURCE);
     println!("counter ticks of 10000 turns: {}", loop_ticks());
+    if let Err(why) = prepare() {
+        println!("test init: no children with code: {why}");
+    }
     let mut failed = 0;
     for (i, (name, test)) in TESTS.into_iter().enumerate() {
         if i == 1 {
@@ -696,10 +739,10 @@ fn init_handles_have_their_fixed_values() -> Outcome {
 }
 
 /// The boot image is a read-only memory object (spec 13.1, 13.3):
-/// INIT_BOOT_IMAGE reports its size in whole pages, no page of its own and
-/// no mapping; mapped R it shows `STAFBOOT` at its start, and RW and RX
-/// fail with ACCESS_DENIED alone; a copy with TRANSFER is made, and its
-/// close gives no frame back.
+/// INIT_BOOT_IMAGE reports its size in whole pages and no page of its own;
+/// mapped R at WINDOW, besides the mapping at IMAGE the run keeps, it
+/// shows `STAFBOOT` at its start, and RW and RX fail with ACCESS_DENIED
+/// alone; a copy with TRANSFER is made, and its close gives no frame back.
 fn boot_image_is_a_read_only_memory_object() -> Outcome {
     const N: u16 = Call::MemMap.number();
     let image: Handle<Memory> = Handle::from_raw(INIT_BOOT_IMAGE);
@@ -728,7 +771,7 @@ fn boot_image_is_a_read_only_memory_object() -> Outcome {
     unmap(WINDOW, info.size)?;
     check(denied, "the boot image mapped RW or RX")?;
     check(
-        mapped == Ok(1) && signature == *b"STAFBOOT",
+        mapped == Ok(2) && signature == *b"STAFBOOT",
         "the mapping of the boot image does not show its signature",
     )?;
     let travel = copy(&image, Rights::MAP_READ | Rights::TRANSFER)?;
@@ -1385,27 +1428,31 @@ fn child_fault_reason_reaches_the_parent() -> Outcome {
 }
 
 /// A child's thread below init is ready and has never run when init kills
-/// the child: the reason is «killed», where a run would have left a
-/// fault. Init then lets the threads below it run: a thread left in the
-/// queue would fault there, and xtask would see a second fault line. A
-/// second kill of the dead child succeeds.
+/// the child (spec 7.7): the kill takes it off the queue, so when init
+/// lets the threads below it run, the child, whose first act would mark
+/// its start in the page of marks, marks nothing, and the reason is
+/// «killed». A second kill of the dead child succeeds.
 fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
-    let c = child(LOW)?;
-    let t = child_thread(&c, LOW).map_err(|_| "thread_create in the child failed")?;
-    let started = sys::thread_start(&t);
-    let killed = sys::process_kill(&c);
+    reset_kid_marks();
+    let kid = Kid::load(LEAF_QUOTA, 16, LOW)?;
+    let started = kid.start();
+    let killed = sys::process_kill(&kid.process);
     // A thread left on the queue would run now, above init at 1.
     let_run()?;
-    let state = sys::process_state(&c);
-    let again = sys::process_kill(&c);
-    close(t)?;
-    close(c)?;
+    let state = sys::process_state(&kid.process);
+    let again = sys::process_kill(&kid.process);
+    let ended = kid.end();
+    kid.close()?;
     check(
         started.is_ok() && killed.is_ok(),
         "thread_start or process_kill failed",
     )?;
     check(
-        state == Ok(ProcessState::Killed),
+        kid_mark(child::STARTED) == 0,
+        "the child's thread ran after the kill",
+    )?;
+    check(
+        state == Ok(ProcessState::Killed) && ended == Ok(ProcessState::Killed),
         "the child did not end as killed",
     )?;
     check(again.is_ok(), "a second kill of the dead child failed")
@@ -3463,9 +3510,10 @@ const BIG: u64 = 64 << 20;
 const PROBE_PERIOD_NS: u64 = 200_000;
 /// The timer of the tests of busy mappings, for the thread it wakes.
 static PROBE_TIMER: AtomicU64 = AtomicU64::new(0);
-/// Init's own mappings, which the kernel made (spec 13.3): its code, its
-/// read-only data, its data and its stack.
-const INIT_MAPPINGS: usize = 4;
+/// Init's own mappings: its code, its read-only data, its data and its
+/// stack, which the kernel made (spec 13.3), and the boot image and the
+/// page of marks of its children (`prepare`).
+const INIT_MAPPINGS: usize = 6;
 /// `mov x0, #42` and `ret`: a function that returns 42.
 const RETURN_42: [u32; 2] = [0xD280_0540, 0xD65F_03C0];
 
@@ -4166,6 +4214,801 @@ fn init_segments_are_taken() -> Outcome {
         taken,
         "a page of init's code, data or stack was not refused alone",
     )
+}
+
+// Children with code (spec 7.9, 13.2, 13.3, 15.2): init loads the child
+// program (tests/child), the boot image's file `child`, with rt::loader.
+// Each child asks for its start data through its start channel, a copy of
+// the channel of its `Kid` with the label START, and the reply names its
+// role (child::Role). Init waits for a child's requests and for its end
+// on that channel, and a timer bounds each wait (spec 10).
+
+/// Where init maps the boot image for the whole run, the window its loader
+/// copies segments through, and where it sees the page of marks it maps
+/// into each child at child::MARKS: gigabytes of their own, far from its
+/// program, its stack, its buffers and WINDOW.
+const IMAGE: usize = 0x50_0000_0000;
+const LOADER_WINDOW: usize = 0x60_0000_0000;
+const KID_MARKS: usize = 0x70_0000_0000;
+/// The size of the boot image and the handle of the page of marks, which
+/// `prepare` sets before the tests run.
+static IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+static KID_MARKS_OBJECT: AtomicU64 = AtomicU64::new(0);
+/// The label of a child's start channel (process_create x5), and that of
+/// the exit channel of a grandchild.
+const START: u64 = 0x57A7;
+const GRANDCHILD: u64 = 0x6C1D;
+/// How long init waits for a child's request or its end.
+const KID_WAIT_NS: u64 = 1_000_000_000;
+/// The pause of init between two looks at a child that counts.
+const PAUSE_NS: u64 = 1_000_000;
+/// The quota of a child that owns no object (spec 7.5): the root of its
+/// tables, two pages of its pool of blocks (the directory with the first
+/// chunk of its table, then the table of its mappings), seven tables (one
+/// of level 1; one of level 2 and one of level 3 each for the program, the
+/// stack and the message buffer), the page of its pool of threads and its
+/// buffer: 12 pages, and 3 more, which a mapping pays ahead for its tables
+/// until it ends: the last mapping, of the page of marks, needs them.
+const LEAF_QUOTA: u64 = 15 * PAGE as u64;
+/// A child that maps a page of an object of its own: the page and a page
+/// of its pool of memory objects more.
+const SCRATCH_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
+/// A child that loads a child of its own: its 12 pages as a leaf, tables
+/// for the boot image and for the loader's window, pages of its pools of
+/// memory objects, shells, channels and sessions, the grandchild's
+/// objects, under 20 pages, the grandchild's LEAF_QUOTA, and 3 pages paid
+/// ahead: an upper bound with room, not measured.
+const GRANDPARENT_QUOTA: u64 = 64 * PAGE as u64;
+/// What `Kid::load` says when the child's quota fell short.
+const KID_NO_MEMORY: &str = "the child's quota fell short of its loading";
+/// The parts of a fault's ESR the tests compare (spec 7.9, [G22]): the
+/// exception class, bits 31:26 (data abort, instruction abort from EL0);
+/// the fault's class, bits 5:2 of the fault status (translation,
+/// permission; bits 1:0, the level, depend on the tables the child has);
+/// WnR, bit 6.
+const DATA_ABORT: u64 = 0x24;
+const INSTRUCTION_ABORT: u64 = 0x20;
+const TRANSLATION: u64 = 0b0001;
+const PERMISSION: u64 = 0b0011;
+
+/// Maps the boot image at IMAGE, read-only, and a new page of marks at
+/// KID_MARKS, for the tests of children with code.
+fn prepare() -> Outcome {
+    let image: Handle<Memory> = Handle::from_raw(INIT_BOOT_IMAGE);
+    let size = sys::memory_info(&image)
+        .map_err(|_| "MEMORY of the boot image failed")?
+        .size;
+    map(&image, 0, size, IMAGE, Access::Read)?;
+    IMAGE_SIZE.store(size, Relaxed);
+    let marks = memory_object(1)?;
+    map(&marks, 0, PAGE as u64, KID_MARKS, Access::ReadWrite)?;
+    KID_MARKS_OBJECT.store(marks.raw().0, Relaxed);
+    Ok(())
+}
+
+/// The child program, the boot image's file `child` (tests/child).
+fn child_program() -> Result<Program<'static>, &'static str> {
+    let size = IMAGE_SIZE.load(Relaxed) as usize;
+    // SAFETY: `prepare` mapped the boot image at IMAGE for the whole run,
+    // read-only; before it, the slice is empty.
+    let bytes = unsafe { core::slice::from_raw_parts(IMAGE as *const u8, size) };
+    bootimg::BootImage::parse(bytes)
+        .ok()
+        .and_then(|image| image.files().find(|f| f.name == "child"))
+        .and_then(|file| Program::parse(file.data).ok())
+        .ok_or("the boot image has no child program")
+}
+
+/// The addresses of `part` of the child program.
+fn part_of(part: Part) -> Result<core::ops::Range<u64>, &'static str> {
+    let s = child_program()?.segments[part as usize];
+    Ok(s.vaddr..s.vaddr + s.mem_size)
+}
+
+/// `counts` once the threads and the cleanup below init ran (`let_run`):
+/// the objects of a child that ended go back at the level of its end
+/// (spec 7.7).
+fn counts_at_rest() -> Result<(u64, u64, u64), &'static str> {
+    let_run()?;
+    counts()
+}
+
+/// Mark `i` of the page children share with init.
+fn kid_mark(i: usize) -> u64 {
+    // SAFETY: `prepare` mapped the page at KID_MARKS, readable and
+    // writable, for the whole run; children write it too, so each word is
+    // reached as an atomic.
+    unsafe { &*(KID_MARKS as *const AtomicU64).add(i) }.load(Relaxed)
+}
+
+fn reset_kid_marks() {
+    for i in 0..PAGE / 8 {
+        // SAFETY: as in `kid_mark`.
+        unsafe { &*(KID_MARKS as *const AtomicU64).add(i) }.store(0, Relaxed);
+    }
+}
+
+/// Waits `ns` nanoseconds in receive on a timer of a channel of its own:
+/// threads below init run meanwhile.
+fn sleep(ns: u64) -> Outcome {
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    let waited = arm(&t, clock_now()? + ns).map(|()| sys::receive(&c));
+    close(t)?;
+    close(c)?;
+    check(
+        waited == Ok(Ok(expiry(0, 1))),
+        "the pause did not end at its timer",
+    )
+}
+
+/// A handle a child gets in the reply to its start request, a copy with
+/// TRANSFER of: its own process with MANAGE and DUPLICATE, the system
+/// resource with DEBUG, the boot image with MAP_READ, the page of marks
+/// with MAP_READ and MAP_WRITE, or the channel of its `Ear` with NOTIFY
+/// and the label GRANDCHILD.
+#[derive(Clone, Copy)]
+enum Gift {
+    Own,
+    Debug,
+    Image,
+    Marks,
+    GrandchildExit,
+}
+
+/// What init hears a child through: a channel that takes the child's
+/// start requests (label START), its end (label CHILD) and the expiries of
+/// a timer that bounds each wait (label 0), and the copy of the channel
+/// that is the child's exit channel.
+struct Ear {
+    channel: Handle<Channel>,
+    exit: Handle<Channel>,
+    timer: Handle<Timer>,
+}
+
+impl Ear {
+    /// A new ear, and the copy of its channel with SEND, NOTIFY, TRANSFER
+    /// and the label START that becomes the child's start channel.
+    fn new() -> Result<(Ear, Handle<Channel>), &'static str> {
+        let channel = channel(QUIET)?;
+        let exit = session(&channel, Rights::NOTIFY, CHILD, QUIET)?;
+        let timer = timer(&channel)?;
+        let rights = Rights::SEND | Rights::NOTIFY | Rights::TRANSFER;
+        let start = session(&channel, rights, START, QUIET)?;
+        Ok((
+            Ear {
+                channel,
+                exit,
+                timer,
+            },
+            start,
+        ))
+    }
+
+    /// What the channel takes next, within KID_WAIT_NS: a request or a
+    /// notification. The CLIENT_GONE of a copy that went, the start
+    /// channel of a child that ended or the exit channel a grandparent
+    /// held, does not count, nor does an expiry before the deadline: one of
+    /// an earlier wait that came after its answer, since timer_cancel
+    /// leaves the bits that were set and a timer never fires early (spec
+    /// 10).
+    fn next(&self) -> Result<Received, &'static str> {
+        let deadline = clock_now()? + KID_WAIT_NS;
+        arm(&self.timer, deadline)?;
+        let got = loop {
+            match sys::receive(&self.channel) {
+                Ok(Received::Notification {
+                    source: Source::Session,
+                    bits: CLIENT_GONE,
+                    ..
+                }) => continue,
+                Ok(Received::Notification {
+                    source: Source::Timer,
+                    ..
+                }) if clock_now().is_ok_and(|now| now < deadline) => continue,
+                other => break other,
+            }
+        };
+        let cancelled = sys::timer_cancel(&self.timer);
+        match got {
+            _ if cancelled.is_err() => Err("timer_cancel failed"),
+            Ok(Received::Notification {
+                source: Source::Timer,
+                ..
+            }) => Err("the child neither asked nor ended in time"),
+            Ok(got) => Ok(got),
+            Err(_) => Err("receive on the child's channel failed"),
+        }
+    }
+
+    /// What the channel holds now, past the CLIENT_GONE of copies that
+    /// went.
+    fn now(&self) -> Result<Received, Error> {
+        loop {
+            match sys::try_receive(&self.channel) {
+                Ok(Received::Notification {
+                    source: Source::Session,
+                    bits: CLIENT_GONE,
+                    ..
+                }) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// Waits for the child's start request (spec 13.3), child::HELLO, and
+    /// answers it with `role`, `args` and `handles`, which move to the
+    /// child.
+    fn answer(&self, role: Role, args: &[u64], handles: &[abi::Handle]) -> Outcome {
+        let Received::Message {
+            label: START,
+            len: 8,
+            handles: 0,
+            token,
+            words,
+        } = self.next()?
+        else {
+            return Err("the child did not ask for its start data");
+        };
+        check(
+            words[0] == child::HELLO,
+            "the child's start request is not HELLO",
+        )?;
+        token
+            .reply_handles(&child::reply(role, args), handles)
+            .map_err(|_| "the reply to the start request failed")
+    }
+
+    /// Waits for the child's exit notification (spec 7.9).
+    fn ended(&self) -> Outcome {
+        check(
+            self.next()? == exit_notice(CHILD),
+            "the child's exit notification did not come",
+        )
+    }
+
+    /// Closes the handles; the channel goes before the copy that is the
+    /// exit channel, so that the copy goes without CLIENT_GONE.
+    fn close(self) -> Outcome {
+        let closed = [self.timer.close(), self.channel.close(), self.exit.close()];
+        check(
+            closed.iter().all(Result::is_ok),
+            "a handle of a child's ear did not close",
+        )
+    }
+}
+
+/// A child with code, its first thread, and its `Ear`.
+struct Kid {
+    process: Handle<Process>,
+    thread: Handle<Thread>,
+    ear: Ear,
+}
+
+impl Kid {
+    /// The child program loaded as a child of init (spec 13.2) with
+    /// `quota`, room for `limit` handles, ceiling and priority `level`, its
+    /// start channel and its exit channel, and the page of marks mapped at
+    /// child::MARKS through a copy with MAP_READ and MAP_WRITE
+    /// (loader::map_narrowed); its thread does not run yet.
+    fn load(quota: u64, limit: u32, level: u8) -> Result<Kid, &'static str> {
+        let short = |e| match e {
+            Error::NoMemory => KID_NO_MEMORY,
+            _ => "the child program did not load",
+        };
+        let program = child_program()?;
+        let (ear, start) = Ear::new()?;
+        let params = loader::Params {
+            quota,
+            handle_limit: limit,
+            ceiling: level,
+            exit: Some((&ear.exit, QUIET)),
+            start: Some(start),
+            priority: level,
+            policy: Policy::Fifo,
+        };
+        // SAFETY: only the loader maps and uses LOADER_WINDOW.
+        let loaded = unsafe { loader::load(&init::PROCESS, &program, LOADER_WINDOW, params) };
+        let child = match loaded {
+            Ok(child) => child,
+            Err((e, start)) => {
+                let (back, closed) = (start.map_or(Ok(()), Handle::close), ear.close());
+                check(
+                    back.is_ok() && closed.is_ok(),
+                    "a handle of a child that did not load did not close",
+                )?;
+                return Err(short(e));
+            }
+        };
+        let kid = Kid {
+            process: child.process,
+            thread: child.thread,
+            ear,
+        };
+        let marks = Handle::<Memory>::from_raw(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
+        let (page, at) = (PAGE as u64, child::MARKS);
+        match loader::map_narrowed(&kid.process, &marks, 0, page, at, Access::ReadWrite) {
+            Ok(()) => Ok(kid),
+            Err(e) => {
+                kid.close()?;
+                Err(short(e))
+            }
+        }
+    }
+
+    fn start(&self) -> Outcome {
+        sys::thread_start(&self.thread).map_err(|_| "thread_start of the child failed")
+    }
+
+    /// Waits for the child's start request and answers it with `role`,
+    /// `args` and a copy of each of `gifts`.
+    fn serve(&self, role: Role, args: &[u64], gifts: &[Gift]) -> Outcome {
+        let mut given = [abi::Handle::INVALID; abi::MESSAGE_HANDLES];
+        for (h, &g) in given.iter_mut().zip(gifts) {
+            *h = self.gift(g)?;
+        }
+        self.ear.answer(role, args, &given[..gifts.len()])
+    }
+
+    fn gift(&self, g: Gift) -> Result<abi::Handle, &'static str> {
+        let marks = Handle::<Memory>::from_raw(abi::Handle(KID_MARKS_OBJECT.load(Relaxed)));
+        match g {
+            Gift::Own => copy_raw(
+                &self.process,
+                Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER,
+            ),
+            Gift::Debug => copy_raw(&init::RESOURCE, Rights::DEBUG | Rights::TRANSFER),
+            Gift::Image => copy_raw(
+                &Handle::<Memory>::from_raw(INIT_BOOT_IMAGE),
+                Rights::MAP_READ | Rights::TRANSFER,
+            ),
+            Gift::Marks => copy_raw(
+                &marks,
+                Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER,
+            ),
+            Gift::GrandchildExit => session(
+                &self.ear.channel,
+                Rights::NOTIFY | Rights::TRANSFER,
+                GRANDCHILD,
+                QUIET,
+            )
+            .map(|h| h.raw()),
+        }
+    }
+
+    /// Waits for the child's end (spec 7.9): its exit notification, then
+    /// why it ended.
+    fn end(&self) -> Result<ProcessState, &'static str> {
+        self.ear.ended()?;
+        sys::process_state(&self.process).map_err(|_| "PROCESS_STATE of the child failed")
+    }
+
+    /// Ends the child, if it lives, and closes init's handles.
+    fn close(self) -> Outcome {
+        let closed = [
+            sys::process_kill(&self.process),
+            self.thread.close(),
+            self.process.close(),
+        ];
+        let ear = self.ear.close();
+        check(
+            closed.iter().all(Result::is_ok),
+            "a handle of the child did not close",
+        )?;
+        ear
+    }
+}
+
+/// The quota of a child with `role`.
+fn quota_of(role: Role) -> u64 {
+    match role {
+        Role::WriteReadOnly | Role::ReadUnmapped => SCRATCH_QUOTA,
+        Role::Grandparent => GRANDPARENT_QUOTA,
+        _ => LEAF_QUOTA,
+    }
+}
+
+/// A child at LEVEL with the quota of `role` that runs `role` with `args`
+/// and `gifts`: why it ended.
+fn ran(role: Role, args: &[u64], gifts: &[Gift]) -> Result<ProcessState, &'static str> {
+    let kid = Kid::load(quota_of(role), 16, LEVEL)?;
+    let state = kid
+        .start()
+        .and_then(|()| kid.serve(role, args, gifts))
+        .and_then(|()| kid.end());
+    kid.close()?;
+    state
+}
+
+/// The fault of a child that ran `role` with `args` and `gifts` (spec
+/// 7.9); a child that ended otherwise is a failure.
+fn fault_of(role: Role, args: &[u64], gifts: &[Gift]) -> Result<Fault, &'static str> {
+    match ran(role, args, gifts)? {
+        ProcessState::Fault { esr, far, elr } => Ok(Fault {
+            class: esr >> 26 & 0x3F,
+            status: esr >> 2 & 0xF,
+            write: esr >> 6 & 1,
+            far,
+            elr,
+        }),
+        _ => Err("the child did not end with a fault"),
+    }
+}
+
+/// What the tests of faults compare of a child's reason: the exception
+/// class, the fault's class and WnR of its ESR (DATA_ABORT and the other
+/// constants above), its FAR and its ELR.
+struct Fault {
+    class: u64,
+    status: u64,
+    write: u64,
+    far: u64,
+    elr: u64,
+}
+
+/// A child with code runs and ends (spec 13.2, 13.3, 7.9): the loader puts
+/// the child program into a new process, whose thread marks its start,
+/// asks for its start data and ends with the code the reply named; the exit
+/// notification comes, PROCESS_STATE gives the code, and once init closed
+/// its handles, its used memory, the free frames and the pages of kernel
+/// pools are what they were. A child that ran first leaves places in
+/// init's pools, so that the second takes no page of them.
+fn child_with_code_runs_and_exits() -> Outcome {
+    const CODE: u64 = 0x5EED_C0DE;
+    ran(Role::Exit, &[0], &[])?;
+    reset_kid_marks();
+    let before = counts_at_rest()?;
+    let state = ran(Role::Exit, &[CODE], &[])?;
+    let after = counts_at_rest()?;
+    check(
+        state == ProcessState::Exited { code: CODE },
+        "the child did not end with the code of its role",
+    )?;
+    check(
+        kid_mark(child::STARTED) == 1,
+        "the child did not mark its start",
+    )?;
+    check(after == before, "the child left memory taken")
+}
+
+/// A child that owns no object loads and runs with LEAF_QUOTA, all it
+/// needs (spec 7.5): once loaded it keeps all of it but the 3 pages a
+/// mapping pays ahead for, and its thread asks for its start data and
+/// ends. With a page less the last mapping, of the page of marks, fails
+/// with NO_MEMORY, and init has back what it used.
+fn child_loads_in_its_least_quota() -> Outcome {
+    let used = || counts_at_rest().map(|c| c.0);
+    let before = used();
+    let short = Kid::load(LEAF_QUOTA - PAGE as u64, 16, LEVEL);
+    let refused = matches!(short, Err(KID_NO_MEMORY));
+    if let Ok(kid) = short {
+        kid.close()?;
+    }
+    let back = used();
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let kept = sys::process_memory(&kid.process);
+    let state = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Exit, &[0], &[]))
+        .and_then(|()| kid.end());
+    kid.close()?;
+    check(
+        refused,
+        "a child with a page less than its least quota loaded",
+    )?;
+    check(
+        before.is_ok() && back == before,
+        "the child that did not load kept init's memory",
+    )?;
+    check(
+        kept.is_ok_and(|m| m.used == LEAF_QUOTA - 3 * PAGE as u64),
+        "the loaded child does not keep all of its quota but the 3 pages paid ahead",
+    )?;
+    check(
+        state == Ok(ProcessState::Exited { code: 0 }),
+        "the child with its least quota did not run",
+    )
+}
+
+/// Spec 15.2 (messages), 13.3: a child's start request comes through its
+/// start channel, a copy of init's channel with a label, SEND, NOTIFY and
+/// TRANSFER that process_create moved into the child's entry 0: init takes
+/// it with the label, 8 bytes, no handle and a token. The seven words of
+/// the reply reach the child whole: it sends them back in a second
+/// request, and the reply to that one is its exit code.
+fn request_through_the_start_channel() -> Outcome {
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let result = kid.start().and_then(|()| echo_rounds(&kid));
+    kid.close()?;
+    result
+}
+
+fn echo_rounds(kid: &Kid) -> Outcome {
+    const WORDS: [u64; child::ARGS] = [0x11, 0x2222, 0x33_3333, 4 << 32, 5 << 40, 6 << 48, 7 << 56];
+    const ECHOED: u64 = 0xEC40;
+    let Received::Message {
+        label,
+        len,
+        handles,
+        token,
+        words,
+    } = kid.ear.next()?
+    else {
+        return Err("the child sent no request");
+    };
+    let hello = label == START
+        && (len, handles) == (8, 0)
+        && words == [child::HELLO, 0, 0, 0, 0, 0, 0, 0]
+        && token.raw() != 0;
+    token
+        .reply(&child::reply(Role::Echo, &WORDS))
+        .map_err(|_| "the reply to the start request failed")?;
+    let Received::Message {
+        label,
+        len,
+        token,
+        words,
+        ..
+    } = kid.ear.next()?
+    else {
+        return Err("the child did not send the words back");
+    };
+    let back = label == START && len == 8 * child::ARGS && words[..child::ARGS] == WORDS;
+    token
+        .reply(&ECHOED.to_le_bytes())
+        .map_err(|_| "the reply to the second request failed")?;
+    let state = kid.end()?;
+    check(
+        hello,
+        "the start request did not come with its label, its 8 bytes and a token",
+    )?;
+    check(back, "the reply's words did not reach the child whole")?;
+    check(
+        state == ProcessState::Exited { code: ECHOED },
+        "the child did not get the reply to its second request",
+    )
+}
+
+/// Spec 15.2 (faults), 7.9: a child that loads from address 0x10, which
+/// nothing maps, ends with a data abort from EL0, a translation fault of a
+/// read; FAR is the address, ELR the load, whose address the child marked
+/// (child::FAULT_AT), and the kernel prints the fault.
+fn child_bad_address_ends_it_with_the_reason() -> Outcome {
+    const BAD: u64 = 0x10;
+    reset_kid_marks();
+    let f = fault_of(Role::Load, &[BAD], &[])?;
+    check(
+        (f.class, f.status, f.write) == (DATA_ABORT, TRANSLATION, 0),
+        "the fault is not a translation fault of a read from EL0",
+    )?;
+    check(
+        f.far == BAD && f.elr == kid_mark(child::FAULT_AT),
+        "FAR is not the address, or ELR is not the load",
+    )
+}
+
+/// Spec 7.4, 3.3 (W^X): the loader maps a child's code through a copy of
+/// the object's handle with MAP_READ and MAP_EXEC alone, so mem_protect of
+/// it to RW through the child's own process fails with ACCESS_DENIED; a
+/// child that then writes a word of its code ends with a data abort from
+/// EL0, a permission fault of a write, at that word.
+fn child_cannot_write_its_code() -> Outcome {
+    let code = part_of(Part::Code)?;
+    let pages = code.start..code.end.next_multiple_of(PAGE as u64);
+    let args = [pages.start, pages.end - pages.start];
+    let f = fault_of(Role::WriteCode, &args, &[Gift::Own])?;
+    check(
+        (f.class, f.status, f.write) == (DATA_ABORT, PERMISSION, 1),
+        "the fault is not a permission fault of a write from EL0",
+    )?;
+    check(
+        code.contains(&f.far) && code.contains(&f.elr),
+        "FAR or ELR is not in the child's code",
+    )
+}
+
+/// Spec 7.4, 3.3 (W^X): mem_protect of a child's data, its stack and its
+/// page of marks to RX through its own process fails with ACCESS_DENIED,
+/// since they are mapped through copies with MAP_READ and MAP_WRITE alone;
+/// a child that then branches to a word of its data, mapped RW, ends with
+/// an instruction abort from EL0, a permission fault, with FAR and ELR at
+/// that word.
+fn child_cannot_run_its_data() -> Outcome {
+    let data = part_of(Part::Data)?;
+    let stack = u64::from(child_program()?.stack_size);
+    let args = [
+        data.start,
+        data.end.next_multiple_of(PAGE as u64) - data.start,
+        abi::INIT_STACK_TOP - stack,
+        stack,
+    ];
+    let f = fault_of(Role::RunData, &args, &[Gift::Own])?;
+    check(
+        (f.class, f.status) == (INSTRUCTION_ABORT, PERMISSION),
+        "the fault is not a permission fault of an instruction fetch from EL0",
+    )?;
+    check(
+        f.far == f.elr && part_of(Part::Data)?.contains(&f.far),
+        "FAR and ELR are not the word in the child's data",
+    )
+}
+
+/// Spec 13.2, 13.3: the loader leaves the page under a child's stack
+/// unmapped: a child that recurses without end ends with a data abort from
+/// EL0, a translation fault in that page.
+fn child_stack_has_a_guard_page() -> Outcome {
+    let f = fault_of(Role::Recurse, &[], &[])?;
+    let bottom = abi::INIT_STACK_TOP - u64::from(child_program()?.stack_size);
+    check(
+        (f.class, f.status) == (DATA_ABORT, TRANSLATION),
+        "the fault is not a translation fault of a data access from EL0",
+    )?;
+    check(
+        (bottom - PAGE as u64..bottom).contains(&f.far),
+        "the fault is not in the page under the stack",
+    )
+}
+
+/// Spec 7.4: a child maps a page of its own object RW and writes to it, so
+/// the TLB may hold the page writable, then makes the mapping R with
+/// mem_protect, which forgets the page in the TLB within the call: its
+/// next write ends it with a data abort from EL0, a permission fault of a
+/// write at that page.
+fn child_read_only_mapping_refuses_a_write() -> Outcome {
+    let f = fault_of(Role::WriteReadOnly, &[], &[Gift::Own])?;
+    check(
+        (f.class, f.status, f.write) == (DATA_ABORT, PERMISSION, 1),
+        "the fault is not a permission fault of a write from EL0",
+    )?;
+    check(
+        f.far == child::SCRATCH as u64,
+        "FAR is not the page mapped R",
+    )
+}
+
+/// Spec 7.4: a child maps a page of its own object RW, writes and reads
+/// it, so the TLB may hold the page, and unmaps it: its next read there
+/// ends it with a data abort from EL0, a translation fault of a read,
+/// since mem_unmap took the page out of its tables and of the TLB.
+fn child_access_after_unmap_faults() -> Outcome {
+    let f = fault_of(Role::ReadUnmapped, &[], &[Gift::Own])?;
+    check(
+        (f.class, f.status, f.write) == (DATA_ABORT, TRANSLATION, 0),
+        "the fault is not a translation fault of a read from EL0",
+    )?;
+    check(
+        f.far == child::SCRATCH as u64,
+        "FAR is not the page that went",
+    )
+}
+
+/// Spec 13.2: a child's panic prints its message through the resource the
+/// child got with DEBUG, which xtask finds whole, and ends the child with
+/// abi::PANIC_EXIT_CODE.
+fn child_panic_exits_with_101() -> Outcome {
+    let state = ran(Role::Panic, &[], &[Gift::Debug])?;
+    check(
+        state
+            == ProcessState::Exited {
+                code: abi::PANIC_EXIT_CODE,
+            },
+        "the child's panic did not end it with 101",
+    )
+}
+
+/// Spec 4, 7.7, 7.9: a child loads a grandchild itself, the child program
+/// again, which counts in a mark below both. Once the grandchild counted,
+/// init kills the child: the kill ends the grandchild with it, and before
+/// process_kill returns the teardown of both ran: the cleanup queue is
+/// empty, the exit notifications of both wait in init's channel, the
+/// grandchild's through the copy of that channel its parent got, and the
+/// count stays where it was. The request the child waited in gets
+/// PEER_CLOSED. Once init closed its handles, its used memory, the free
+/// frames and the pages of kernel pools are what they were.
+fn grandchildren_die_with_their_parent() -> Outcome {
+    reset_kid_marks();
+    let before = counts_at_rest()?;
+    let kid = Kid::load(GRANDPARENT_QUOTA, 16, LEVEL)?;
+    let result = kid.start().and_then(|()| generations(&kid));
+    kid.close()?;
+    result?;
+    check(
+        counts_at_rest()? == before,
+        "the child or the grandchild left memory taken",
+    )
+}
+
+fn generations(kid: &Kid) -> Outcome {
+    const COUNT: usize = 1;
+    let args = [LEAF_QUOTA, LOW.into(), COUNT as u64];
+    let gifts = [Gift::Own, Gift::Image, Gift::GrandchildExit, Gift::Marks];
+    kid.serve(Role::Grandparent, &args, &gifts)?;
+    let Received::Message { token, .. } = kid.ear.next()? else {
+        return Err("the child did not say that its child runs");
+    };
+    let mut counted = 0;
+    for _ in 0..KID_WAIT_NS / PAUSE_NS {
+        sleep(PAUSE_NS)?;
+        counted = kid_mark(COUNT);
+        if counted > 0 {
+            break;
+        }
+    }
+    let killed = sys::process_kill(&kid.process);
+    let queue = sys::kernel_stats(&init::RESOURCE).map(|s| s.cleanup_queue);
+    let stopped = kid_mark(COUNT);
+    let notices = [(); 3].map(|()| kid.ear.now());
+    sleep(PAUSE_NS)?;
+    let later = kid_mark(COUNT);
+    let answered = token.reply(&[]);
+    check(counted > 0, "the grandchild did not count")?;
+    check(
+        killed.is_ok() && queue == Ok(0),
+        "process_kill failed, or returned before the teardown",
+    )?;
+    check(
+        notices
+            == [
+                Ok(exit_notice(GRANDCHILD)),
+                Ok(exit_notice(CHILD)),
+                Err(Error::WouldBlock),
+            ],
+        "the exit notifications of the grandchild and the child were not there when process_kill returned",
+    )?;
+    check(
+        later == stopped,
+        "the grandchild counted after its parent's end",
+    )?;
+    check(
+        answered == Err(Error::PeerClosed),
+        "the reply to the killed child was not PEER_CLOSED",
+    )
+}
+
+/// Spec 7.5, 7.8: a child with LEAF_QUOTA and room for 1024 handles
+/// copies a handle until a call fails, closes the copies and starts over,
+/// until it made 1000 copies: the chunks of its table come out of its own
+/// quota, so each round ends with NO_MEMORY, the most it used is within
+/// its quota, and the pools take at most a page per page of its quota and
+/// one more. Once init closed its handles, its used memory, the free
+/// frames and the pages of kernel pools are what they were.
+fn child_table_churn_stays_under_its_quota() -> Outcome {
+    const COPIES: u64 = 1000;
+    reset_kid_marks();
+    let before = counts_at_rest()?;
+    let kid = Kid::load(LEAF_QUOTA, 1024, LEVEL)?;
+    let state = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Churn, &[COPIES], &[Gift::Own]))
+        .and_then(|()| kid.end());
+    let pools = counts().map(|c| c.2);
+    kid.close()?;
+    let after = counts_at_rest()?;
+    let [made, rounds, full, most, quota] = [
+        child::MADE,
+        child::ROUNDS,
+        child::FULL,
+        child::MOST_USED,
+        child::QUOTA,
+    ]
+    .map(kid_mark);
+    check(
+        state == Ok(ProcessState::Exited { code: 0 }),
+        "the child's copies failed",
+    )?;
+    check(
+        made >= COPIES && rounds > 1 && full == rounds,
+        "a round of copies did not end with NO_MEMORY",
+    )?;
+    check(
+        quota == LEAF_QUOTA && most <= quota,
+        "the child used more than its quota",
+    )?;
+    check(
+        pools.is_ok_and(|p| p.saturating_sub(before.2) <= LEAF_QUOTA / PAGE as u64 + 1),
+        "the pools took more pages than the child's quota and one",
+    )?;
+    check(after == before, "the child left memory taken")
 }
 
 // Requests and replies (spec 6.1, 6.6): init and threads of its own

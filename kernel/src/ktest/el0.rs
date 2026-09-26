@@ -311,11 +311,6 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_orphan,
     },
     El0Test {
-        name: "grandchildren_die_with_their_parent",
-        start: start_grandchild,
-        done: done_grandchild,
-    },
-    El0Test {
         name: "descendants_stop_above_the_cause",
         start: start_descendants,
         done: done_descendants,
@@ -344,11 +339,6 @@ const EL0_TESTS: &[El0Test] = &[
         name: "closing_a_channel_wakes_waiters_in_portions",
         start: start_close_portions,
         done: done_close_portions,
-    },
-    El0Test {
-        name: "request_through_the_start_channel",
-        start: start_start_request,
-        done: done_start_request,
     },
     El0Test {
         name: "reply_from_another_process_is_bad_state",
@@ -2583,59 +2573,6 @@ fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     )
 }
 
-/// The killer in slot 0, woken by its alarm 1 ms after the start, kills
-/// its child C; C's child, the grandchild in slot 1, has a thread below
-/// the killer that counts meanwhile. The end of C ends the grandchild and
-/// stops its thread (spec 4), and the teardown of both runs at the
-/// killer's level, before the kill returns. Each child's quota comes off
-/// its parent's.
-fn start_grandchild(f: &mut Fixture) -> Result<(), &'static str> {
-    let killer = spawn(f, 0, &raw const el0_alarm_then, 0)?;
-    let killers = f.processes[0].expect("the killer's process");
-    let wake = timer::clock().deadline_after(timer::now(), 1_000_000);
-    let a = alarm(f, killers, Some(wake))?;
-    let child = process::create_child(killers, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING)
-        .map_err(|_| "no child")?;
-    let h = give_kept(f, Object::Process(child));
-    let counter = process::create_child(child, CHILD_QUOTA, HANDLE_LIMIT, CEILING)
-        .map_err(|_| "no grandchild")
-        .and_then(|grandchild| {
-            let p = with_programs(f, 1, grandchild)?;
-            new_thread(f, 1, p, DATA_VA, &raw const el0_count_until, 0)
-        });
-    // SAFETY: the test's reference goes; the handle, if it went in, holds
-    // the child.
-    unsafe { process::release(child, CAUSE) };
-    let counter = counter?;
-    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
-    sched::set_priority(counter, PRIORITY - 2, FIFO).map_err(|_| "no counter")?;
-    let kill = user_address(&raw const el0_kill) as u64;
-    set_args(killer, &[a, 0, kill, h?]);
-    f.ends[1] = true;
-    Ok(())
-}
-
-fn done_grandchild(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    check(
-        t.regs.x[23] == 0 && t.regs.x[0] == 0,
-        "the killer's alarm or process_kill failed",
-    )?;
-    check(
-        state(f, 1) == ProcessState::Killed,
-        "the grandchild outlived its parent",
-    )?;
-    let counter = slot_thread(f, 1);
-    check(
-        counter.sched.state() == State::Dead && counter.regs.x[2] > 0,
-        "the grandchild's thread did not run, or did not stop",
-    )?;
-    let grandchild = f.processes[1].expect("the grandchild");
-    check(
-        cleanup::len() == 0 && process::translate(grandchild, DATA_VA).is_none(),
-        "the grandchild's teardown did not end before the kill returned",
-    )
-}
-
 // Channels (spec 6.1, 6.8, 7.7): threads that wait in receive.
 
 /// The label of the exit channel and of the start channel of the tests'
@@ -3136,8 +3073,6 @@ fn done_batches(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 // Requests (spec 6.1, 6.6): a client and a service in processes of their
 // own.
 
-/// The label of the session of `request_through_the_start_channel`.
-const REQUEST_LABEL: u64 = 0x1ABE1;
 /// The description of the tests' requests: 8 bytes, no handles.
 const REQUEST_LEN: u64 = 8;
 /// Those 8 bytes, in x2.
@@ -3147,54 +3082,6 @@ const REQUEST_WORD: u64 = 0x5EED_C11E;
 const TOKEN_COUNT: u64 = 1 << 40;
 /// The ceiling of the service's process in `boost_is_capped_by_the_server_ceiling`.
 const SERVICE_CEILING: u8 = 20;
-
-/// Spec 15.2 (messages): a child sends a request through its start
-/// channel, a copy of the parent's channel with a label and SEND that
-/// process_create moved into entry 0 (spec 13.3). The parent's service,
-/// which waits in receive, takes it with the label, the description, the
-/// data and a token, and answers; the child gets its request back.
-fn start_start_request(f: &mut Fixture) -> Result<(), &'static str> {
-    let parent = new_process(f, 1)?;
-    let server = new_thread(f, 1, parent, DATA_VA, &raw const el0_serve, 0)?;
-    sched::set_priority(server, PRIORITY + 1, FIFO).map_err(|_| "no service")?;
-    let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
-    let h = give(parent, Object::Channel(c), Rights::RECEIVE);
-    let s = session::create(parent, c, REQUEST_LABEL, PRIORITY);
-    // SAFETY: the reference `create` handed out goes; the handle, if it
-    // went in, holds the channel, and so does the session.
-    unsafe { channel::release(c, Rights::NONE, CAUSE) };
-    let s = s.map_err(|_| "no session")?;
-    let child = process::create_child(parent, CHILD_QUOTA, HANDLE_LIMIT, CEILING);
-    let moved =
-        child.and_then(|child| process::move_start(child, Object::Session(s), Rights::SEND));
-    // SAFETY: the reference `create` handed out goes; entry 0 of the
-    // child, if the move went, holds the session.
-    unsafe { session::unref(s, CAUSE) };
-    let child = child.map_err(|_| "no child")?;
-    let child = with_programs(f, 0, child)?;
-    let client = new_thread(f, 0, child, DATA_VA, &raw const el0_send, 0)?;
-    moved.map_err(|_| "the start channel did not move")?;
-    set_args(client, &[START_CHANNEL.0, REQUEST_LEN, REQUEST_WORD]);
-    set_args(server, &[h?, 0]);
-    Ok(())
-}
-
-fn done_start_request(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    let x = &t.regs.x;
-    if f.slot(t) == 0 {
-        return check(
-            x[..3] == [0, REQUEST_LEN, REQUEST_WORD] && x[3..10].iter().all(|&w| w == 0),
-            "the child did not get its request back",
-        );
-    }
-    check(
-        x[0] == 0
-            && x[19..21] == [REQUEST_LEN, REQUEST_WORD]
-            && x[28] == REQUEST_LABEL
-            && x[29] != 0,
-        "the parent did not take the child's request with its label and a token",
-    )
-}
 
 /// A token names a request for the process that accepted it (spec 6.1): a
 /// service takes a request of a client of another process and holds it

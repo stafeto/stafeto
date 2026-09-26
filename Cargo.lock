@@ -42,6 +42,16 @@ name = "rt"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
+]
+
+[[package]]
+name = "test-child"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "bootimg",
+ "rt",
 ]
 
 [[package]]
@@ -49,7 +59,9 @@ name = "test-init"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
  "rt",
+ "test-child",
 ]
 
 [[package]]

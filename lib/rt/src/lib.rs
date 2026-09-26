@@ -8,9 +8,10 @@
 //! (`sys`), the thread's message buffer (`msgbuf`), output through
 //! `debug_write`
 //! (`console`, `print!`, `println!`), the counter read without a call
-//! (`time`), stacks for threads in static memory, and the panic handler.
-//! The heap, the start protocol, the ELF loader and the service loop come
-//! in milestone 1.4.
+//! (`time`), the loader of programs of the boot image (`loader`), stacks
+//! for threads in static memory, and the panic handler. The heap, the
+//! start protocol and the service loop come in milestone 1.4, the ELF
+//! loader in milestone 4.
 //!
 //! A program names its main function with `rt::entry!`; `_start` calls it
 //! with the x0 the kernel set and ends the process with the code it
@@ -20,6 +21,7 @@
 
 pub mod console;
 pub mod handle;
+pub mod loader;
 pub mod msgbuf;
 pub mod sys;
 pub mod time;

@@ -1,14 +1,20 @@
 [package]
-name = "test-init"
+name = "test-child"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "Tests of the system calls from EL0, run as init on the normal build of the kernel"
+description = "The child program of the test init: one program whose role its parent names at its start"
+
+# What the test init and the program agree on.
+[lib]
+name = "child"
+test = false
+bench = false
 
 [[bin]]
-name = "test-init"
+name = "test-child"
 test = false
 bench = false
 
@@ -16,4 +22,3 @@ bench = false
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 rt = { path = "../../lib/rt" }
-test-child = { path = "../child" }
