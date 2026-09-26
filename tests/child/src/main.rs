@@ -14,9 +14,9 @@
 
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS, MOST_USED,
-    NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED, STARTED,
-    WINDOW,
+    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS,
+    MOST_USED, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED,
+    STARTED, WINDOW,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Resource, Thread};
@@ -245,6 +245,7 @@ fn run(s: &Start) -> u64 {
         },
         Role::Service => service(s).unwrap_or(FAILED),
         Role::Provider => provide(s).unwrap_or(FAILED),
+        Role::Rtc => drive().unwrap_or(FAILED),
     }
 }
 
@@ -687,4 +688,37 @@ fn provide(s: &Start) -> Result<u64, Error> {
     m.close()?;
     token.reply_handles(&used.to_le_bytes(), &[copy.raw()])?;
     Ok(0)
+}
+
+/// Role::Rtc: the binding comes in the reply to BIND and stays with the
+/// child; the request after the interrupt waits until the child dies.
+fn drive() -> Result<u64, Error> {
+    let c = sys::channel_create(1)?;
+    let notify = sys::handle_duplicate(&c, Rights::NOTIFY | Rights::TRANSFER)?;
+    let reply = sys::send_handles(&rt::START_CHANNEL, &BIND.to_le_bytes(), &[notify.raw()])?;
+    if reply.handles != 1 {
+        return Ok(FAILED);
+    }
+    let (_, (kind, rights)) = msgbuf::handle(0);
+    let Received::Notification {
+        source,
+        label,
+        bits,
+        count,
+    } = sys::receive(&c)?
+    else {
+        return Ok(FAILED);
+    };
+    let words = [
+        abi::msgbuf::info(kind, rights),
+        source.code(),
+        label,
+        bits,
+        count.into(),
+        0,
+        0,
+        0,
+    ];
+    sys::send(&rt::START_CHANNEL, &abi::inline_bytes(&words)[..5 * 8])?;
+    Ok(FAILED)
 }

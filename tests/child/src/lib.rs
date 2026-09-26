@@ -60,6 +60,10 @@ pub const KERNEL: u64 = 0xFFFF_FFFF_C000_0000;
 /// The ceiling of a child that runs Role::Ceiling.
 pub const CEILING: u8 = 30;
 
+/// The 8 bytes of the request of Role::Rtc that brings its channel for a
+/// binding.
+pub const BIND: u64 = u64::from_le_bytes(*b"bind rtc");
+
 /// The code a role ends with when the fault it exists for did not come.
 pub const NO_FAULT: u64 = 0xFA17;
 /// The code a child ends with when its start request failed or named no
@@ -197,10 +201,18 @@ pub enum Role {
     /// the object's handle with MAP_READ and TRANSFER alone, the only one
     /// left once it closed its own. Ends with 0.
     Provider = 25,
+    /// A driver of the PL031 (spec 13.4, 13.5): makes a channel, sends a
+    /// copy of it with NOTIFY and TRANSFER through its start channel in a
+    /// request of BIND, whose reply brings the binding of the PL031's line
+    /// to the channel; waits in receive for an interrupt, then sends the
+    /// info word of the binding's handle and the source, label, bits and
+    /// count of the notification in a request that no reply answers. It
+    /// never calls irq_ack: the line stays masked until the child dies.
+    Rtc = 26,
 }
 
 impl Role {
-    pub const ALL: [Role; 25] = [
+    pub const ALL: [Role; 26] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -226,6 +238,7 @@ impl Role {
         Role::Ceiling,
         Role::Service,
         Role::Provider,
+        Role::Rtc,
     ];
 
     /// The role whose code is `code`.

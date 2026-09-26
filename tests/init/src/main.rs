@@ -48,7 +48,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 171] = [
+const TESTS: [Test; 175] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -566,6 +566,19 @@ const TESTS: [Test; 171] = [
         "window_over_a_hole_faults_only_its_process",
         window_over_a_hole_faults_only_its_process,
     ),
+    (
+        "rtc_alarm_comes_as_a_notification",
+        rtc_alarm_comes_as_a_notification,
+    ),
+    (
+        "line_stays_masked_until_irq_ack",
+        line_stays_masked_until_irq_ack,
+    ),
+    (
+        "level_line_fires_again_until_its_source_is_cleared",
+        level_line_fires_again_until_its_source_is_cleared,
+    ),
+    ("dead_driver_frees_its_line", dead_driver_frees_its_line),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -8617,4 +8630,331 @@ fn window_over_a_hole_faults_only_its_process() -> Outcome {
         ),
         _ => Err("the child did not end with a fault"),
     }
+}
+
+/// The registers of the PL031 the driver uses, 32 bits each, by their
+/// offsets in its page: the count of seconds (RTCDR), the match (RTCMR),
+/// the mask of its interrupt (RTCIMSC), the raw status of the alarm
+/// (RTCRIS) and its clear (RTCICR).
+const RTC_DR: usize = 0x00;
+const RTC_MR: usize = 0x04;
+const RTC_IMSC: usize = 0x10;
+const RTC_RIS: usize = 0x14;
+const RTC_ICR: usize = 0x1C;
+/// The alarm bit of RTCIMSC, RTCRIS and RTCICR.
+const ALARM: u32 = 1;
+/// The priority of the slot of init's binding of the PL031: above init.
+const DRIVER: u8 = 50;
+/// Writes of the match that `Rtc::raise` tries: the count turns once a
+/// second, between the read of the count and the write at most once.
+const RAISE_TRIES: u32 = 3;
+/// The rights of the binding a driver gets (spec 13.4): irq_ack, and the
+/// move in a message, which the handle needs to reach the driver; no copy
+/// of it outlives the driver without init.
+const DRIVER_RIGHTS: Rights = Rights::MANAGE.union(Rights::TRANSFER);
+/// A child that runs Role::Rtc: a page of its pool of channels more.
+const RTC_QUOTA: u64 = LEAF_QUOTA + PAGE as u64;
+
+/// Init as the driver of the PL031 (spec 13.5): a device window on its
+/// page, mapped RW at WINDOW, a channel for the binding of RTC_LINE, and a
+/// timer on the channel that bounds each wait. The alarm rises at once:
+/// the match written with the count the driver read raises it (the
+/// device's rule), so no test waits for time to pass.
+struct Rtc {
+    window: Handle<Memory>,
+    channel: Handle<Channel>,
+    guard: Handle<Timer>,
+}
+
+impl Rtc {
+    /// The driver's window, channel and timer, with the alarm masked and
+    /// cleared in the device.
+    fn open() -> Result<Rtc, &'static str> {
+        let window = device_window(RTC, PAGE as u64)?;
+        map(&window, 0, PAGE as u64, WINDOW, Access::ReadWrite)?;
+        let channel = channel(QUIET)?;
+        let guard = timer(&channel)?;
+        let rtc = Rtc {
+            window,
+            channel,
+            guard,
+        };
+        rtc.write(RTC_IMSC, 0);
+        rtc.write(RTC_ICR, ALARM);
+        Ok(rtc)
+    }
+
+    fn read(&self, reg: usize) -> u32 {
+        // SAFETY: the window maps the PL031's page at WINDOW, RW, as device
+        // memory; each register is 32 bits at its offset ([G34]).
+        unsafe { ((WINDOW + reg) as *const u32).read_volatile() }
+    }
+
+    fn write(&self, reg: usize, value: u32) {
+        // SAFETY: as in `read`.
+        unsafe { ((WINDOW + reg) as *mut u32).write_volatile(value) }
+    }
+
+    /// The binding of RTC_LINE, level-triggered, to the channel at DRIVER.
+    fn bind(&self) -> Result<Handle<Interrupt>, &'static str> {
+        sys::irq_bind(&init::RESOURCE, RTC_LINE, &self.channel, DRIVER, false)
+            .map_err(|_| "irq_bind of the PL031's line failed")
+    }
+
+    /// Raises the alarm: unmasks it in the device and writes the count it
+    /// reads into the match; when the count turned in between, the raw
+    /// status stays 0 and it tries again.
+    fn raise(&self) -> Outcome {
+        self.write(RTC_IMSC, ALARM);
+        for _ in 0..RAISE_TRIES {
+            let count = self.read(RTC_DR);
+            self.write(RTC_MR, count);
+            if self.read(RTC_RIS) & ALARM != 0 {
+                return Ok(());
+            }
+        }
+        Err("the PL031's alarm did not rise at its count")
+    }
+
+    /// Clears the alarm and reads its status back, as a driver does before
+    /// irq_ack (spec 13.5).
+    fn clear(&self) -> Outcome {
+        self.write(RTC_ICR, ALARM);
+        check(
+            self.read(RTC_RIS) & ALARM == 0,
+            "the PL031's alarm did not clear",
+        )
+    }
+
+    /// What the channel takes next, within KID_WAIT_NS; the timer's
+    /// expiry is a failure.
+    fn wait(&self) -> Result<Received, &'static str> {
+        arm(&self.guard, clock_now()? + KID_WAIT_NS)?;
+        let got = sys::receive(&self.channel);
+        let cancelled = sys::timer_cancel(&self.guard);
+        match got {
+            _ if cancelled.is_err() => Err("timer_cancel failed"),
+            Ok(Received::Notification {
+                source: Source::Timer,
+                ..
+            }) => Err("no interrupt came in time"),
+            Ok(got) => Ok(got),
+            Err(_) => Err("receive on the driver's channel failed"),
+        }
+    }
+
+    /// What the channel holds now; WOULD_BLOCK when nothing.
+    fn now(&self) -> Result<Received, Error> {
+        sys::try_receive(&self.channel)
+    }
+
+    /// Masks and clears the alarm, unmaps the window and closes the
+    /// handles.
+    fn close(self) -> Outcome {
+        self.write(RTC_IMSC, 0);
+        self.write(RTC_ICR, ALARM);
+        unmap(WINDOW, PAGE as u64)?;
+        let closed = [
+            self.guard.close(),
+            self.channel.close(),
+            self.window.close(),
+        ];
+        check(
+            closed.iter().all(Result::is_ok),
+            "a handle of the driver did not close",
+        )
+    }
+}
+
+/// An interrupt through a handle with no label, merged `count` times.
+fn interrupt(count: u32) -> Received {
+    Received::Notification {
+        source: Source::Interrupt,
+        label: 0,
+        bits: 1,
+        count,
+    }
+}
+
+/// What IRQ says of init's binding of the PL031.
+fn rtc_line(masked: bool) -> Result<IrqInfo, Error> {
+    Ok(IrqInfo {
+        line: RTC_LINE.into(),
+        masked,
+        edge: false,
+    })
+}
+
+/// Spec 15.2 (devices), 9, 13.5: the PL031's alarm comes as a notification
+/// of an interrupt, label 0, bit 0, one delivery, and the line is masked
+/// meanwhile; the driver clears the alarm, reads the status back and
+/// calls irq_ack, which opens the line, and nothing more comes.
+fn rtc_alarm_comes_as_a_notification() -> Outcome {
+    let rtc = Rtc::open()?;
+    let b = rtc.bind()?;
+    let got = rtc.raise().and_then(|()| rtc.wait());
+    let masked = sys::irq_info(&b);
+    let cleared = rtc.clear();
+    let acked = sys::irq_ack(&b);
+    let rest = rtc.now();
+    let open = sys::irq_info(&b);
+    close(b)?;
+    rtc.close()?;
+    check(
+        got? == interrupt(1),
+        "the alarm did not come as one notification of an interrupt",
+    )?;
+    check(
+        masked == rtc_line(true),
+        "the line was not masked after its notification",
+    )?;
+    cleared?;
+    check(
+        acked.is_ok() && rest == Err(Error::WouldBlock),
+        "a cleared alarm came again after irq_ack",
+    )?;
+    check(open == rtc_line(false), "irq_ack did not open the line")
+}
+
+/// Spec 15.2 (devices), 9: a line stays masked until irq_ack. The driver
+/// clears the first alarm and raises it again without irq_ack: nothing
+/// comes; irq_ack opens the line, and the alarm comes before the call
+/// returns.
+fn line_stays_masked_until_irq_ack() -> Outcome {
+    let rtc = Rtc::open()?;
+    let b = rtc.bind()?;
+    let first = rtc.raise().and_then(|()| rtc.wait());
+    let again = rtc.clear().and_then(|()| rtc.raise());
+    let held = rtc.now();
+    let acked = sys::irq_ack(&b);
+    let second = rtc.now();
+    let last = rtc.clear().map(|()| sys::irq_ack(&b));
+    let rest = rtc.now();
+    close(b)?;
+    rtc.close()?;
+    check(first? == interrupt(1), "the first alarm did not come")?;
+    again?;
+    check(
+        held == Err(Error::WouldBlock),
+        "an alarm came while the line was masked",
+    )?;
+    check(
+        acked.is_ok() && second == Ok(interrupt(1)),
+        "the alarm raised under the mask did not come at irq_ack",
+    )?;
+    check(
+        last == Ok(Ok(())) && rest == Err(Error::WouldBlock),
+        "a cleared alarm came again",
+    )
+}
+
+/// Spec 9, 13.5: a level-triggered line stays up until the driver clears
+/// its source. irq_ack without the clear gives a second notification at
+/// once; after the clear, the read back and irq_ack, no third comes.
+fn level_line_fires_again_until_its_source_is_cleared() -> Outcome {
+    let rtc = Rtc::open()?;
+    let b = rtc.bind()?;
+    let first = rtc.raise().and_then(|()| rtc.wait());
+    let acked = sys::irq_ack(&b);
+    let second = rtc.now();
+    let cleared = rtc.clear();
+    let last = sys::irq_ack(&b);
+    let third = rtc.now();
+    close(b)?;
+    rtc.close()?;
+    check(first? == interrupt(1), "the first alarm did not come")?;
+    check(
+        acked.is_ok() && second == Ok(interrupt(1)),
+        "a line still up gave no second notification after irq_ack",
+    )?;
+    cleared?;
+    check(
+        last.is_ok() && third == Err(Error::WouldBlock),
+        "a cleared line gave a third notification",
+    )
+}
+
+/// Spec 15.2 (devices), 9, 13.4: a driver that dies frees its line. A child
+/// (Role::Rtc) sends init a copy of its channel with NOTIFY; init binds the
+/// PL031's line through it and answers with a copy of the binding with
+/// MANAGE and TRANSFER alone, which moves to the child. Init raises the
+/// alarm, the child reports the notification and never calls irq_ack. Once
+/// init killed it and heard of its end, init binds the line to its own
+/// channel, and the alarm, never cleared, comes before irq_bind returns and
+/// masks the line.
+fn dead_driver_frees_its_line() -> Outcome {
+    let rtc = Rtc::open()?;
+    let kid = Kid::load(RTC_QUOTA, 16, LEVEL)?;
+    let heard = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Rtc, &[], &[]))
+        .and_then(|()| bind_for(&kid))
+        .and_then(|()| rtc.raise())
+        .and_then(|()| kid.ear.next());
+    let killed = sys::process_kill(&kid.process);
+    let state = kid.end();
+    kid.close()?;
+    let_run()?;
+    let again = rtc.bind();
+    let got = rtc.now();
+    let info = again.as_ref().ok().map(sys::irq_info);
+    let cleared = rtc.clear();
+    let rest = again.as_ref().ok().map(|b| (sys::irq_ack(b), rtc.now()));
+    if let Ok(b) = again {
+        close(b)?;
+    }
+    rtc.close()?;
+    let binding = abi::msgbuf::info(abi::ObjectKind::Interrupt, DRIVER_RIGHTS);
+    match heard? {
+        Received::Message {
+            label: START,
+            len: 40,
+            words,
+            ..
+        } => check(
+            words[..5] == [binding, Source::Interrupt.code(), 0, 1, 1],
+            "the child's binding or notification was not as sent",
+        )?,
+        _ => return Err("the child did not report its notification"),
+    }
+    check(
+        killed.is_ok() && state? == ProcessState::Killed,
+        "the child did not end killed",
+    )?;
+    check(
+        info == Some(rtc_line(true)) && got == Ok(interrupt(1)),
+        "the line of a dead driver did not bind again and deliver at once",
+    )?;
+    cleared?;
+    check(
+        rest == Some((Ok(()), Err(Error::WouldBlock))),
+        "the alarm came again once cleared",
+    )
+}
+
+/// Takes the child's request BIND with a copy of its channel with NOTIFY,
+/// binds RTC_LINE through it at LEVEL, closes the copy, and answers with
+/// a copy of the binding with DRIVER_RIGHTS, which moves to the child;
+/// init's own handle goes (spec 13.4).
+fn bind_for(kid: &Kid) -> Outcome {
+    let Received::Message {
+        label: START,
+        len: 8,
+        handles: 1,
+        token,
+        words,
+    } = kid.ear.next()?
+    else {
+        return Err("the child did not send its channel");
+    };
+    let c: Handle<Channel> = Handle::from_raw(rt::msgbuf::handle(0).0);
+    let b = sys::irq_bind(&init::RESOURCE, RTC_LINE, &c, LEVEL, false);
+    close(c)?;
+    check(words[0] == child::BIND, "the child's request is not BIND")?;
+    let b = b.map_err(|_| "irq_bind through the child's channel failed")?;
+    let given = copy(&b, DRIVER_RIGHTS);
+    close(b)?;
+    token
+        .reply_handles(&[], &[given?.raw()])
+        .map_err(|_| "the reply with the binding failed")
 }
