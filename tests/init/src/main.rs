@@ -40,7 +40,7 @@ mod processes;
 mod timers;
 mod transfers;
 
-use harness::{Policy, TEST_PRIORITY, Test, init, println, sys};
+use harness::{LOOP_TICKS, Policy, Relaxed, TEST_PRIORITY, Test, init, println, sys};
 use processes::prepare;
 
 rt::entry!(main);
@@ -59,7 +59,9 @@ const MODULES: [&[Test]; 8] = [
 
 fn main(_: u64) -> u64 {
     rt::console::set(&init::RESOURCE);
-    println!("counter ticks of 10000 turns: {}", loop_ticks());
+    let ticks = loop_ticks();
+    LOOP_TICKS.store(ticks, Relaxed);
+    println!("counter ticks of 10000 turns: {ticks}");
     if let Err(why) = prepare() {
         println!("test init: no children with code: {why}");
     }

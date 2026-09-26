@@ -11,7 +11,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 30] = [
+pub(crate) const TESTS: [Test; 31] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -99,6 +99,7 @@ pub(crate) const TESTS: [Test; 30] = [
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
     ),
+    ("normal_build_costs", normal_build_costs),
 ];
 
 /// Init's first thread is FIFO at 63 under ceiling 63 (spec 13.3): a
@@ -1487,4 +1488,88 @@ fn cycle(exits: &Handle<Channel>, name: &Handle<Channel>) -> Outcome {
         "a round of create and kill failed",
     )?;
     wait_exit(exits, CHILD)
+}
+
+/// Rounds of each measurement of `normal_build_costs`.
+const COST_ROUNDS: usize = 1000;
+/// The bytes of the requests and replies of `normal_build_costs`.
+const COST_BYTES: [u8; 8] = *b"measured";
+
+/// Spec 15.3: what the calls of the kernel that ships cost, the least
+/// counter ticks of COST_ROUNDS rounds with the least of an empty round
+/// taken off: the call with number 0, which no call has (null),
+/// clock_now, yield with no other thread at init's level, notify and
+/// try_receive on a channel of init, and a round trip of send and reply
+/// with 8 bytes to a thread of init's own process above init. Under
+/// -icount, where a tick is an instruction, it prints them on one line
+/// for xtask; elsewhere the numbers mean little and it prints nothing.
+/// It fails only when a call fails, never on a number.
+fn normal_build_costs() -> Outcome {
+    let c = channel(QUIET)?;
+    let s = channel(QUIET)?;
+    let t = spawn(0, echo_until_empty, s.raw().0, HIGH, Policy::Fifo)?;
+    let costs = costs(&c, &s);
+    let stopped = sys::send(&s, &[]).is_ok();
+    close(t)?;
+    close(s)?;
+    close(c)?;
+    let [null, clock, yielded, notify, round_trip] = costs?;
+    check(stopped, "the thread that replies did not stop")?;
+    if under_icount() {
+        println!(
+            "normal build ticks: null={null} clock={clock} yield={yielded} notify={notify} round_trip={round_trip}"
+        );
+    }
+    Ok(())
+}
+
+/// The rows of `normal_build_costs`, in the order of its line.
+fn costs(c: &Handle<Channel>, s: &Handle<Channel>) -> Result<[u64; 5], &'static str> {
+    let empty = least(&mut || true)?;
+    let rows = [
+        least(&mut || {
+            // SAFETY: no call has number 0; the kernel changes x0 alone.
+            let after = unsafe { sys::raw::<0>([0; 10]) };
+            after[0] == Error::InvalidArgs.code()
+        }),
+        least(&mut || sys::clock_now().is_ok()),
+        least(&mut || sys::yield_now().is_ok()),
+        least(&mut || {
+            sys::notify(c, 1).is_ok()
+                && matches!(sys::try_receive(c), Ok(Received::Notification { .. }))
+        }),
+        least(&mut || sys::send(s, &COST_BYTES).is_ok()),
+    ];
+    let mut costs = [0; 5];
+    for (cost, row) in costs.iter_mut().zip(rows) {
+        *cost = row?.saturating_sub(empty);
+    }
+    Ok(costs)
+}
+
+/// The least counter ticks of COST_ROUNDS rounds of `round`, which says
+/// whether its calls did as they must.
+fn least(round: &mut dyn FnMut() -> bool) -> Result<u64, &'static str> {
+    let mut least = u64::MAX;
+    for _ in 0..COST_ROUNDS {
+        let start = time::now();
+        let ok = round();
+        let took = time::now() - start;
+        check(ok, "a call of the measured rounds failed")?;
+        least = least.min(took);
+    }
+    Ok(least)
+}
+
+/// Replies to each request on channel `h` with its bytes, until a request
+/// with none, and ends.
+extern "C" fn echo_until_empty(h: u64) -> ! {
+    let c = Handle::<Channel>::from_raw(abi::Handle(h));
+    while let Ok(Received::Message { token, len, .. }) = sys::receive(&c) {
+        let replied = token.reply(&COST_BYTES[..len.min(COST_BYTES.len())]);
+        if len == 0 || replied.is_err() {
+            break;
+        }
+    }
+    sys::thread_exit()
 }

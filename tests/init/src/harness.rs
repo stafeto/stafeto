@@ -22,6 +22,16 @@ pub(crate) type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 pub(crate) type Test = (&'static str, fn() -> Outcome);
 
+/// Counter ticks of the counted loop the run starts with (main.rs,
+/// `loop_ticks`).
+pub(crate) static LOOP_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the run is under -icount: the loop took 20 000 ticks and a
+/// few more, one instruction each (xtask checks the same range).
+pub(crate) fn under_icount() -> bool {
+    (20_000..=20_100).contains(&LOOP_TICKS.load(Relaxed))
+}
+
 /// Init's priority while the tests run.
 pub(crate) const TEST_PRIORITY: u8 = 20;
 /// Levels below init, for threads that run when init lets them, and one
