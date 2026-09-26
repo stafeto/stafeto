@@ -107,6 +107,11 @@ pub const MEMORY_RIGHTS: Rights = Rights(
         | Rights::TRANSFER.0,
 );
 
+/// Rights of init's handle to the boot image (spec 13.1, 13.3): a memory
+/// object that maps read-only and travels, never written or run in place.
+pub const INIT_BOOT_IMAGE_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+
 /// Rights of init's handle to the system resource (spec 13.3).
 pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
     Rights::DEVICE.0
@@ -121,9 +126,8 @@ pub const INIT_RESOURCE_RIGHTS: Rights = Rights(
 pub const INIT_RESOURCE: Handle = Handle::new(0, 1);
 pub const INIT_PROCESS: Handle = Handle::new(1, 1);
 pub const INIT_THREAD: Handle = Handle::new(2, 1);
-/// Kept for the boot image, a memory object from milestone 1.3 on. Until
-/// then the entry is freed at once: the value is BAD_HANDLE and never
-/// names another object.
+/// The boot image as a memory object over its frames, whole pages, with
+/// INIT_BOOT_IMAGE_RIGHTS.
 pub const INIT_BOOT_IMAGE: Handle = Handle::new(3, 1);
 
 /// The first handle of a process that `process_create` made (spec 13.3):
@@ -1033,6 +1037,10 @@ mod tests {
                 | Rights::MAP_EXEC
                 | Rights::DUPLICATE
                 | Rights::TRANSFER
+        );
+        assert_eq!(
+            INIT_BOOT_IMAGE_RIGHTS,
+            Rights::MAP_READ | Rights::DUPLICATE | Rights::TRANSFER
         );
     }
 

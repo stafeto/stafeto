@@ -18,7 +18,9 @@
 //! program and counts in object_info MEMORY. The last one queues it for
 //! cleanup, whose portions give its frames back, up to
 //! kcore::pagelist::RELEASE_STEP a portion, and then its place and its
-//! budget.
+//! budget. The object over the boot image (`create_boot`, spec 13.1) owns
+//! no frame: it names the image's, which the frame allocator never gets,
+//! has a budget of 0, and gives back only its place.
 
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame, LinearMem};
@@ -61,6 +63,9 @@ enum Backing {
     /// Frames of its own, in a list that fills while the object is made
     /// and goes back in portions once nothing refers to it.
     Owned(PageList),
+    /// The `pages` frames from `base`, the boot image's, which stay for
+    /// good (spec 13.1).
+    Boot { base: u64, pages: usize },
 }
 
 // SAFETY: memory objects are reached under the kernel's rules (spec 8.1):
@@ -143,15 +148,59 @@ pub fn fill(m: NonNull<Memory>) -> bool {
     let (backing, budget) = unsafe { (&mut (*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
     match backing {
         Backing::Owned(list) => list.fill(&mut Budget(budget), CREATE_PORTION),
+        Backing::Boot { .. } => true,
     }
+}
+
+/// A whole object of `pages` pages that `payer` pays for, as `create` and
+/// every portion of `fill` in a row make it: the frames of all its pages
+/// are taken and zeroed before this returns, with interrupts masked, so
+/// only the kernel's loading of init at boot and the tests make one this
+/// way (spec 13.3). INVALID_ARGS for 0 pages or more than
+/// kcore::pagelist::MAX_PAGES, NO_MEMORY as for `create`. The caller gets
+/// the only reference.
+pub fn create_whole(payer: NonNull<Process>, pages: usize) -> Result<NonNull<Memory>, Error> {
+    if !(1..=pagelist::MAX_PAGES).contains(&pages) {
+        return Err(Error::InvalidArgs);
+    }
+    let m = create(payer, pages)?;
+    while !fill(m) {}
+    Ok(m)
+}
+
+/// The object over the boot image (spec 13.1, 13.3): the `pages` frames
+/// from `base`, which the frame allocator never gets and which stay for
+/// good. It takes a place in the pool of memory objects of `payer`, init,
+/// whose quota pays for a page when the pool grows (NO_MEMORY when it
+/// falls short); its budget is 0, and it holds the payer's shell. The
+/// caller gets the first reference.
+pub fn create_boot(
+    payer: NonNull<Process>,
+    base: u64,
+    pages: usize,
+) -> Result<NonNull<Memory>, Error> {
+    let memory = Memory {
+        backing: Backing::Boot { base, pages },
+        budget: Account::new(0),
+        refs: Refs::one(),
+        mappings: 0,
+        payer,
+        cleanup: Item::new(),
+    };
+    let m = process::paid_alloc(payer, memory)?;
+    process::retain_shell(payer);
+    LIVE.made();
+    Ok(m)
 }
 
 /// The pages of `m`, which the caller holds: its size in pages (spec 7.3).
 pub fn pages(m: NonNull<Memory>) -> usize {
     // SAFETY: the caller holds a reference to the object; only the field is
     // read.
-    let Backing::Owned(list) = unsafe { &(*m.as_ptr()).backing };
-    list.pages()
+    match unsafe { &(*m.as_ptr()).backing } {
+        Backing::Owned(list) => list.pages(),
+        Backing::Boot { pages, .. } => *pages,
+    }
 }
 
 /// The frame of page `i` of `m`, a whole object that the caller holds
@@ -161,21 +210,26 @@ pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
     // SAFETY: the caller holds a reference to the object; the list only
     // reads its nodes, and the budget is borrowed for its type alone.
     let (backing, budget) = unsafe { (&(*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
-    let Backing::Owned(list) = backing;
-    list.frame(&Budget(budget), i)
+    match backing {
+        Backing::Owned(list) => list.frame(&Budget(budget), i),
+        Backing::Boot { base, .. } => base + i as u64 * PAGE_SIZE,
+    }
 }
 
 /// object_info MEMORY of `m`, which the caller holds (spec 11): its size in
-/// bytes, the pages whose frames it owns, every page once it is whole, and
-/// its mappings.
+/// bytes, the pages whose frames it owns, every page once it is whole and
+/// none over the boot image, and its mappings.
 pub fn info(m: NonNull<Memory>) -> MemoryInfo {
     // SAFETY: the caller holds a reference to the object; only the fields
     // are read.
     let (backing, mappings) = unsafe { (&(*m.as_ptr()).backing, (*m.as_ptr()).mappings) };
-    let Backing::Owned(list) = backing;
+    let owned = match backing {
+        Backing::Owned(list) => list.filled(),
+        Backing::Boot { .. } => 0,
+    };
     MemoryInfo {
-        size: list.pages() as u64 * PAGE_SIZE,
-        pages: list.filled() as u64,
+        size: pages(m) as u64 * PAGE_SIZE,
+        pages: owned as u64,
         mappings: mappings.into(),
     }
 }
@@ -241,10 +295,10 @@ pub unsafe fn release(m: NonNull<Memory>, cause: u8) {
 /// (spec 7.7): up to kcore::pagelist::RELEASE_STEP of its frames, pages and
 /// then nodes, go back to the frame allocator, each refunded to its
 /// budget, and with frames left the object goes back to the head of
-/// `level`. Once none is left its place goes back to the payer's pool, its
-/// budget to the payer's quota, and its reference to the payer's shell
-/// goes, which may queue the shell at `level`. O(1): at most RELEASE_STEP
-/// frames.
+/// `level`. Once none is left, at once over the boot image, whose frames
+/// stay, its place goes back to the payer's pool, its budget to the payer's
+/// quota, and its reference to the payer's shell goes, which may queue the
+/// shell at `level`. O(1): at most RELEASE_STEP frames.
 ///
 /// # Safety
 /// Nothing refers to the object, and it is in no queue.
@@ -254,6 +308,7 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
     let (backing, budget) = unsafe { (&mut (*p).backing, &mut (*p).budget) };
     let done = match backing {
         Backing::Owned(list) => list.release_step(&mut Budget(budget)),
+        Backing::Boot { .. } => true,
     };
     if !done {
         // SAFETY: the object stays alive and in place until its next
@@ -299,9 +354,7 @@ mod test_access {
 
     /// The pages of `m`, which the test knows alive, that have their frames.
     pub fn filled(m: NonNull<Memory>) -> usize {
-        // SAFETY: the test knows the object alive; only the field is read.
-        let Backing::Owned(list) = unsafe { &(*m.as_ptr()).backing };
-        list.filled()
+        info(m).pages as usize
     }
 
     /// The process that pays for `m`, which the test holds.

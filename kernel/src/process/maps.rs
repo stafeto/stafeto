@@ -89,18 +89,15 @@ fn page_address(m: &Mapping<NonNull<Memory>>, page: u32) -> u64 {
 /// INVALID_ARGS when `pages` pages from `va` touch a page of `process`
 /// that a mapping or the message buffer of one of its threads holds (spec
 /// 6.2, 7.4): step (5) of mem_map. The threads are those that have not
-/// ended, at most abi::MAX_THREADS; the blocks of `map_frames`, at most
-/// MAX_BLOCKS, count too. The caller holds a reference to the process.
+/// ended, at most abi::MAX_THREADS. The caller holds a reference to the
+/// process.
 pub fn check_free(process: NonNull<Process>, va: u64, pages: u64) -> Result<(), Error> {
     let end = va + (pages << kcore::PAGE_SHIFT);
-    // SAFETY: the caller holds a reference to the process; only the table,
-    // the blocks and the list of threads are read.
+    // SAFETY: the caller holds a reference to the process; only the table
+    // and the list of threads are read.
     unsafe {
         if let Some(table) = table(process) {
             table.check_free(va, pages)?;
-        }
-        if (*process.as_ptr()).frames.overlaps(va, end) {
-            return Err(Error::InvalidArgs);
         }
         let mut next = (*process.as_ptr()).threads;
         while let Some(t) = next {
@@ -283,6 +280,38 @@ pub unsafe fn finish_change(long: Long, cause: u8) {
         }
         Long::Create(_) => unreachable!("mem_create changes no mapping"),
     }
+}
+
+/// Maps the whole of `m`, which the caller holds, at `va` of `target`, a
+/// process that lives, with `access` (spec 13.3), as mem_map maps it: its
+/// range checked against the mappings and the message buffers of the
+/// process (`check_free`), then its resources, its entry with a reference
+/// to the object and the rights of `access` alone, and every portion in a
+/// row, with interrupts masked, so that nothing ends the process
+/// meanwhile: only the kernel's loading of init at boot and the tests map
+/// this way. Executable pages have the instruction cache made coherent
+/// first. INVALID_ARGS, LIMIT_REACHED and NO_MEMORY as for mem_map, and
+/// nothing is mapped then.
+pub fn map_whole(
+    target: NonNull<Process>,
+    m: NonNull<Memory>,
+    va: usize,
+    access: Access,
+) -> Result<(), Error> {
+    let pages = memory::pages(m) as u32;
+    check_free(target, va as u64, pages.into())?;
+    let mapping = Mapping::new(va as u64, pages, 0, m, access.rights());
+    let (on, prepaid) = add_mapping(target, mapping)?;
+    let mut long = Long::Map {
+        on,
+        access,
+        prepaid,
+    };
+    while !step_change(&mut long).expect("a process that lives takes every portion") {}
+    // SAFETY: the change ended with its last portion, the process lives,
+    // and a mem_map releases nothing at the end, whatever the level.
+    unsafe { finish_change(long, 1) };
+    Ok(())
 }
 
 /// `long` stops for good midway (spec 7.7): its thread ended with its

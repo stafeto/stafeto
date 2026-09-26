@@ -2878,3 +2878,122 @@ fn check_unmap(c: &Caller, own: Handle, second: Handle) -> Result<(), &'static s
     unmap_whole(c, own, 1, USER_VA)?;
     check(seen == 0xE5, "the TLB still holds the unmapped page")
 }
+
+/// The object over the boot image owns none of its frames (spec 13.1): an
+/// object over the image that a caller pays for reports the image's size,
+/// no page it owns and no mapping; once its handle closes and its portion
+/// ran, the free frames, the caller's used memory and the objects in pools
+/// are what they were, and the image still holds its bytes. An object made
+/// and closed first leaves a free place in the caller's pool.
+pub fn boot_image_frames_never_go(boot: &Boot) -> Result<(), &'static str> {
+    let image = boot.info.initrd.ok_or("no boot image")?;
+    let pages = (image.size / PAGE_SIZE) as usize;
+    let words = |base: u64| {
+        let mut sum = 0u64;
+        for i in 0..image.size as usize / 8 {
+            // SAFETY: the boot image lies in RAM the linear map covers, and
+            // nothing writes to it.
+            let w =
+                unsafe { ((LINEAR_BASE + base as usize + 8 * i) as *const u64).read_volatile() };
+            sum = sum.rotate_left(5) ^ w;
+        }
+        sum
+    };
+    let before = words(image.base);
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let objects = memory::in_use();
+        let (free, used) = (phys::free_frames(), process::quota(c.process).used());
+        let m = memory::create_boot(c.process, image.base, pages)
+            .map_err(|_| "no object over the boot image")?;
+        let h = c.insert(Object::Memory(m), abi::INIT_BOOT_IMAGE_RIGHTS);
+        let info = memory::info(m);
+        // SAFETY: the reference `create_boot` handed out goes; the handle,
+        // if it went in, holds the object.
+        unsafe { memory::release(m, CAUSE) };
+        c.close(h?)?;
+        cleanup::drain();
+        check(
+            info == MemoryInfo {
+                size: image.size,
+                pages: 0,
+                mappings: 0,
+            },
+            "the object over the boot image does not report the image",
+        )?;
+        check(
+            phys::free_frames() == free
+                && process::quota(c.process).used() == used
+                && memory::in_use() == objects,
+            "the object over the boot image gave frames back or kept its place",
+        )?;
+        check(words(image.base) == before, "the boot image lost its bytes")
+    })
+}
+
+/// Init's loader maps each part with its access (spec 13.3): the program
+/// of the boot image, loaded into a new process, shows its code RX, its
+/// read-only data R and its data RW, each page on a frame of a memory
+/// object of its own, and a stack RW right under abi::INIT_STACK_TOP with
+/// an unmapped guard page below; each part takes one mapping.
+pub fn init_load_maps_each_part_with_its_access(boot: &Boot) -> Result<(), &'static str> {
+    let program = crate::boot::init_program(boot);
+    let p = process::create_root(QUOTA, LIMIT, CEILING).map_err(|_| "no process")?;
+    let result = match crate::init::load(p, &program) {
+        Ok(()) => loaded_parts(p, &program),
+        Err(f) => {
+            kprintln!(
+                "{} of {:#x} bytes: {:?}, object made: {}",
+                f.what,
+                f.size,
+                f.error,
+                f.made
+            );
+            Err("init's program did not load")
+        }
+    };
+    // SAFETY: the test's reference goes, and nothing uses it afterwards.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    result
+}
+
+fn loaded_parts(p: NonNull<Process>, program: &bootimg::Program<'_>) -> Result<(), &'static str> {
+    let shows = |va: u64, attrs: Attrs| {
+        process::translate(p, va as usize).is_some_and(|(pa, d)| d == page_descriptor(pa, attrs))
+    };
+    let mut parts = 1;
+    for (part, attrs) in [
+        (bootimg::Part::Code, Attrs::USER_TEXT),
+        (bootimg::Part::Rodata, Attrs::USER_RODATA),
+        (bootimg::Part::Data, Attrs::USER_DATA),
+    ] {
+        let segment = &program.segments[part as usize];
+        if segment.mem_size == 0 {
+            continue;
+        }
+        parts += 1;
+        check(
+            segment.pages().step_by(PAGE).all(|va| shows(va, attrs)),
+            "a segment of init does not show with the access of its part",
+        )?;
+    }
+    let top = abi::INIT_STACK_TOP;
+    let bottom = top - u64::from(program.stack_size);
+    check(
+        (bottom..top)
+            .step_by(PAGE)
+            .all(|va| shows(va, Attrs::USER_DATA)),
+        "init's stack is not RW",
+    )?;
+    check(
+        process::translate(p, (bottom - PAGE_SIZE) as usize).is_none(),
+        "init's stack has no guard page",
+    )?;
+    check(
+        process::mappings(p) == parts,
+        "a part of init did not take one mapping",
+    )
+}

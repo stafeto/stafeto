@@ -32,7 +32,7 @@ use abi::{
     ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Memory, Process, Resource, Thread, Timer};
+use rt::handle::{Channel, Memory, Process, Thread, Timer};
 use rt::sys::{self, Received, Regs, Reply, Token};
 use rt::{Handle, Stack, init, println, time};
 
@@ -42,7 +42,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 124] = [
+const TESTS: [Test; 125] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -50,8 +50,8 @@ const TESTS: [Test; 124] = [
         init_handles_have_their_fixed_values,
     ),
     (
-        "boot_image_handle_is_reserved",
-        boot_image_handle_is_reserved,
+        "boot_image_is_a_read_only_memory_object",
+        boot_image_is_a_read_only_memory_object,
     ),
     ("init_has_its_message_buffer", init_has_its_message_buffer),
     (
@@ -282,6 +282,7 @@ const TESTS: [Test; 124] = [
         "protect_to_exec_runs_new_code",
         protect_to_exec_runs_new_code,
     ),
+    ("init_segments_are_taken", init_segments_are_taken),
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
         "request_carries_registers_and_label",
@@ -694,15 +695,48 @@ fn init_handles_have_their_fixed_values() -> Outcome {
     )
 }
 
-/// Until milestone 1.3 the boot image's handle is bad (spec 13.3).
-fn boot_image_handle_is_reserved() -> Outcome {
+/// The boot image is a read-only memory object (spec 13.1, 13.3):
+/// INIT_BOOT_IMAGE reports its size in whole pages, no page of its own and
+/// no mapping; mapped R it shows `STAFBOOT` at its start, and RW and RX
+/// fail with ACCESS_DENIED alone; a copy with TRANSFER is made, and its
+/// close gives no frame back.
+fn boot_image_is_a_read_only_memory_object() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let image: Handle<Memory> = Handle::from_raw(INIT_BOOT_IMAGE);
+    let info = sys::memory_info(&image).map_err(|_| "MEMORY of INIT_BOOT_IMAGE failed")?;
     check(
-        sys::process_state(&Handle::from_raw(INIT_BOOT_IMAGE)) == Err(Error::BadHandle),
-        "object_info took INIT_BOOT_IMAGE",
+        info.size > 0 && info.size.is_multiple_of(PAGE as u64) && info.pages == 0,
+        "the boot image is not whole pages of frames it does not own",
     )?;
+    let denied = [Access::ReadWrite, Access::ReadExec]
+        .into_iter()
+        .all(|access| {
+            let args = [
+                init::PROCESS.raw().0,
+                INIT_BOOT_IMAGE.0,
+                0,
+                info.size,
+                WINDOW as u64,
+                access.raw(),
+            ];
+            x0_alone::<N>(&args, Error::AccessDenied.code())
+        });
+    map(&image, 0, info.size, WINDOW, Access::Read)?;
+    let mapped = sys::memory_info(&image).map(|i| i.mappings);
+    // SAFETY: the window maps the boot image, read-only.
+    let signature = unsafe { (WINDOW as *const [u8; 8]).read_volatile() };
+    unmap(WINDOW, info.size)?;
+    check(denied, "the boot image mapped RW or RX")?;
     check(
-        Handle::<Resource>::from_raw(INIT_BOOT_IMAGE).close() == Err(Error::BadHandle),
-        "handle_close took INIT_BOOT_IMAGE",
+        mapped == Ok(1) && signature == *b"STAFBOOT",
+        "the mapping of the boot image does not show its signature",
+    )?;
+    let travel = copy(&image, Rights::MAP_READ | Rights::TRANSFER)?;
+    let before = counts()?;
+    close(travel)?;
+    check(
+        counts()? == before,
+        "the close of a copy of the boot image gave frames back",
     )
 }
 
@@ -3429,6 +3463,9 @@ const BIG: u64 = 64 << 20;
 const PROBE_PERIOD_NS: u64 = 200_000;
 /// The timer of the tests of busy mappings, for the thread it wakes.
 static PROBE_TIMER: AtomicU64 = AtomicU64::new(0);
+/// Init's own mappings, which the kernel made (spec 13.3): its code, its
+/// read-only data, its data and its stack.
+const INIT_MAPPINGS: usize = 4;
 /// `mov x0, #42` and `ret`: a function that returns 42.
 const RETURN_42: [u32; 2] = [0xD280_0540, 0xD65F_03C0];
 
@@ -3759,8 +3796,8 @@ fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
 }
 
 /// A process has 64 mappings at most (spec 7.4): the 65th fails with
-/// LIMIT_REACHED alone, and once one went the next one maps. Init has no
-/// mapping of its own before.
+/// LIMIT_REACHED alone, and once one went the next one maps. Init has
+/// INIT_MAPPINGS of its own.
 fn mapping_limit_is_64() -> Outcome {
     const N: u16 = Call::MemMap.number();
     let m = memory_object(1)?;
@@ -3784,7 +3821,7 @@ fn mapping_limit_is_64() -> Outcome {
     }
     close(m)?;
     check(
-        made == abi::MAX_MAPPINGS as usize && refused,
+        made + INIT_MAPPINGS == abi::MAX_MAPPINGS as usize && refused,
         "the 65th mapping did not fail with LIMIT_REACHED alone",
     )?;
     check(freed && again && unmapped, "no mapping fit once one went")
@@ -4098,6 +4135,37 @@ fn protect_to_exec_runs_new_code() -> Outcome {
     unmap(WINDOW, PAGE as u64)?;
     close(m)?;
     check(got == Ok(42), "the code written into the page did not run")
+}
+
+/// Init's own pages are mappings (spec 13.3): mem_map over the page of its
+/// code, of its data and of its stack fails with INVALID_ARGS alone.
+fn init_segments_are_taken() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    let m = memory_object(1)?;
+    let page = |at: usize| (at & !(PAGE - 1)) as u64;
+    let local = 0u64;
+    let taken = [
+        page(init_segments_are_taken as *const () as usize),
+        page(&raw const MARKS as usize),
+        page(&raw const local as usize),
+    ]
+    .into_iter()
+    .all(|at| {
+        let args = [
+            init::PROCESS.raw().0,
+            m.raw().0,
+            0,
+            PAGE as u64,
+            at,
+            Access::Read.raw(),
+        ];
+        x0_alone::<N>(&args, Error::InvalidArgs.code())
+    });
+    close(m)?;
+    check(
+        taken,
+        "a page of init's code, data or stack was not refused alone",
+    )
 }
 
 // Requests and replies (spec 6.1, 6.6): init and threads of its own

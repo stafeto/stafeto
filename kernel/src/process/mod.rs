@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Processes (spec 4, 8): an address space, the frames the process owns
-//! there, its handle table, its priority ceiling, its threads that have
-//! not ended, its parent and children, and how it lives, in an object in
-//! its parent's pool of shells. A process lives while references to it
-//! are left: handles to it, its threads, and the one `create` hands out;
-//! its children hold only its shell. It ends (`end`) through
+//! Processes (spec 4, 8): an address space, the table of its mappings,
+//! its handle table, its priority ceiling, its threads that have not ended,
+//! its parent and children, and how it lives, in an object in its parent's
+//! pool of shells. A process lives while references to it are left:
+//! handles to it, its threads, and the one `create` hands out; its
+//! children hold only its shell. It ends (`end`) through
 //! process_exit, process_kill, a fault at EL0 or the exit of its last
 //! started thread, when its last reference goes while it lives, and when
 //! its parent ends. The end itself only stops its threads, at most
@@ -25,9 +25,9 @@
 //! timers, at most abi::MAX_TIMERS (spec 10), the memory objects it made
 //! and the table of its mappings, whoever maps into it (`maps`); at once,
 //! for the pages of those objects (spec 7.3); and for the tables of its
-//! space, up front for a mapping, the message buffers of its threads and
-//! the frames of `map_frames`. The pages of its pools go back only with
-//! its shell, in portions. A child's quota comes off its parent's and goes
+//! space, up front for a mapping, and the message buffers of its threads.
+//! The pages of its pools go back only with its shell, in portions. A
+//! child's quota comes off its parent's and goes
 //! back in two parts: what is free at the child's stage Quota, and the
 //! rest with its shell. The requests its threads accepted wait in it for
 //! their replies (spec 4, 6.8); once it ended, its stage Replies wakes
@@ -38,7 +38,6 @@ use crate::cleanup::{self, Item};
 use crate::memory::Memory;
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
-use crate::mm::phys::{self, Frame};
 use crate::object::{self, Block, Chunks, Handles, Live, Moving, Object, Refs};
 use crate::sched;
 use crate::session::Session;
@@ -63,7 +62,7 @@ mod teardown;
 pub use maps::PORTION;
 pub use maps::{
     Change, abandon_change, add_mapping, begin_change, check_free, find_mapping, finish_change,
-    in_mapping, step_change,
+    in_mapping, map_whole, step_change,
 };
 #[cfg(not(feature = "ktest"))]
 pub use table::install_init_handles;
@@ -74,9 +73,6 @@ pub use table::{
 pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
 use teardown::{begin, queue_shell};
 
-/// Blocks of frames one process may own.
-const MAX_BLOCKS: usize = 8;
-
 pub struct Process {
     /// From `create` until the first portion of the stage Space takes it:
     /// from then on no call reaches its tables (`map_page` fails,
@@ -84,10 +80,9 @@ pub struct Process {
     space: Option<AddressSpace>,
     /// The tables of the space on their way back, from that first portion
     /// until the root went: TTBR0 left them and their TLB entries went
-    /// first, so the tables go before `frames` and the threads' message
-    /// buffers, which the tables mapped.
+    /// first, so the tables go before the threads' message buffers and the
+    /// objects of the mappings, whose frames the tables mapped.
     retired: Option<SpaceRelease>,
-    frames: OwnedFrames,
     /// The table of its mappings, in a block of its pool of blocks, from
     /// its first mapping until the stage Mappings (spec 7.4).
     maps: Option<NonNull<maps::Table>>,
@@ -209,43 +204,6 @@ struct ChildLinks {
     next: Option<NonNull<Process>>,
 }
 
-/// Blocks of frames that `release` gives back to the allocator when their
-/// owner goes, each with the range of pages it maps.
-struct OwnedFrames([Option<(Frame, u64, u64)>; MAX_BLOCKS]);
-
-impl OwnedFrames {
-    /// Gives every block back to the frame allocator and refunds it to
-    /// `quota` (phys::free, spec 7.7).
-    ///
-    /// # Safety
-    /// No table of a program maps the blocks any more, and the TLB entries
-    /// of such mappings went.
-    unsafe fn release(&mut self, quota: &mut Account) {
-        for (frame, _, _) in self.0.iter_mut().filter_map(Option::take) {
-            // SAFETY: the caller's promise.
-            unsafe { phys::free(frame, quota) };
-        }
-    }
-
-    /// Whether a block maps a page of `[start, end)`.
-    fn overlaps(&self, start: u64, end: u64) -> bool {
-        self.0
-            .iter()
-            .flatten()
-            .any(|&(_, va, size)| va < end && start < va + size)
-    }
-}
-
-impl Drop for OwnedFrames {
-    fn drop(&mut self) {
-        // Only a check, as for AddressSpace: the work is `release`'s.
-        assert!(
-            self.0.iter().all(Option::is_none),
-            "frames dropped without release"
-        );
-    }
-}
-
 // SAFETY: processes and their threads are reached under the kernel's
 // rules (spec 8.1): one CPU, interrupts masked inside the kernel, ROOTS
 // behind a lock.
@@ -284,36 +242,6 @@ impl Process {
         }
     }
 
-    /// Maps `size` bytes of fresh zeroed frames at `va` with `attrs` and
-    /// returns their physical address, through which the kernel fills them
-    /// (the linear map). The frames belong to the process until it goes,
-    /// and its quota pays for them and for the tables. INVALID_ARGS for a
-    /// range that is not whole pages or cannot be mapped, NO_MEMORY when
-    /// the quota, frames or table memory run out or the process owns
-    /// MAX_BLOCKS blocks already. O(size) with interrupts masked: for tests
-    /// and for loading init at boot; calls from programs map memory objects
-    /// in portions (spec 7.7).
-    pub fn map_frames(&mut self, va: usize, size: u64, attrs: Attrs) -> Result<u64, Error> {
-        if size == 0 || !size.is_multiple_of(PAGE_SIZE) || !(va as u64).is_multiple_of(PAGE_SIZE) {
-            return Err(Error::InvalidArgs);
-        }
-        let slot = self
-            .frames
-            .0
-            .iter()
-            .position(Option::is_none)
-            .ok_or(Error::NoMemory)?;
-        let order = (size / PAGE_SIZE).next_power_of_two().trailing_zeros() as u8;
-        let frame = phys::alloc_zeroed(order, &mut self.quota)?;
-        let pa = frame.pa();
-        // Owned before it is mapped: on an error part of the range may be
-        // mapped, and the frames must stay until the tables go.
-        self.frames.0[slot] = Some((frame, va as u64, size));
-        let space = self.space.as_mut().expect("frames map into a space");
-        space.map(va, pa, size, attrs, &mut self.quota)?;
-        Ok(pa)
-    }
-
     /// Whether the process lives and, if not, why it ended.
     pub fn state(&self) -> ProcessState {
         self.life.state()
@@ -350,7 +278,6 @@ fn create(
     let process = Process {
         space: Some(space),
         retired: None,
-        frames: OwnedFrames([const { None }; MAX_BLOCKS]),
         maps: None,
         handles,
         refs: Refs::one(),

@@ -15,7 +15,7 @@
 
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check, finish, report};
 use crate::arch::user::{self, FpRegs, UserRegs};
-use crate::arch::{self, cache, gic, symbols, timer};
+use crate::arch::{self, gic, symbols, timer};
 use crate::channel::{self, Channel};
 use crate::cleanup;
 use crate::memory;
@@ -27,7 +27,7 @@ use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, session};
 use abi::{
-    CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, INFO_PROCESS_STATE, MAX_THREADS,
+    Access, CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, INFO_PROCESS_STATE, MAX_THREADS,
     MEMORY_RIGHTS, NO_WAIT, Notification, Policy, ProcessState, Rights, START_CHANNEL, Source,
     msgbuf,
 };
@@ -609,6 +609,9 @@ struct Fixture {
     /// Free frames and the pages of kernel pools together when the test
     /// began: the same once what the test made gave back what it took.
     memory: u64,
+    /// Memory objects in their pool then: those of the pages of the test's
+    /// own processes.
+    objects: usize,
     /// Items in the cleanup queue when the first timer interrupt came.
     queued_at_wake: Option<u64>,
     /// The counter before the thread started.
@@ -704,6 +707,7 @@ impl Fixture {
             interrupt_after: None,
             interrupt_every: None,
             memory: 0,
+            objects: 0,
             queued_at_wake: None,
             counter: 0,
             faults: false,
@@ -1110,28 +1114,44 @@ fn new_process(f: &mut Fixture, slot: usize) -> Result<NonNull<Process>, &'stati
     with_programs(f, slot, p)
 }
 
+/// A page of a new memory object that `p` pays for, mapped at `va` of
+/// `p` with `access` (process::map_whole), after `fill` wrote the frame
+/// through the linear map; returns the frame. The mapping holds the
+/// object, which goes with the process's stage Mappings.
+fn page_of(
+    p: NonNull<Process>,
+    va: usize,
+    access: Access,
+    fill: impl FnOnce(usize),
+) -> Result<u64, &'static str> {
+    let m = memory::create_whole(p, 1).map_err(|_| "no memory object for a page")?;
+    let pa = memory::frame(m, 0);
+    fill(LINEAR_BASE + pa as usize);
+    let mapped = process::map_whole(p, m, va, access);
+    // SAFETY: the reference `create_whole` handed out goes; the mapping,
+    // if it went in, holds the object.
+    unsafe { memory::release(m, CAUSE) };
+    mapped.map_err(|_| "a page of a memory object did not map")?;
+    Ok(pa)
+}
+
 /// Puts `p`, a new process whose first reference the fixture takes, in
-/// slot `slot` and maps the programs at TEXT_VA there.
+/// slot `slot` and maps the programs at TEXT_VA there, RX: the mapping
+/// makes the instruction cache coherent for its page.
 fn with_programs(
     f: &mut Fixture,
     slot: usize,
-    mut p: NonNull<Process>,
+    p: NonNull<Process>,
 ) -> Result<NonNull<Process>, &'static str> {
     f.processes[slot] = Some(p);
-    // SAFETY: the process was just created, and only this test uses it.
-    let text = unsafe { p.as_mut() }
-        .map_frames(TEXT_VA, PAGE_SIZE, Attrs::USER_TEXT)
-        .map_err(|_| "the programs did not map")?;
     let start = &raw const el0_programs as usize;
     let len = &raw const el0_programs_end as usize - start;
     assert!(len <= PAGE, "the EL0 programs outgrew their page");
-    let text_va = LINEAR_BASE + text as usize;
-    // SAFETY: the programs lie in the kernel image, and the frame is new,
-    // one page, and reached through the linear map.
-    unsafe { core::ptr::copy_nonoverlapping(start as *const u8, text_va as *mut u8, len) };
-    // The whole page, its zeroed tail included: the frame may have held
-    // other code, which the instruction cache may still hold.
-    cache::sync_icache(text_va, PAGE);
+    page_of(p, TEXT_VA, Access::ReadExec, |text| {
+        // SAFETY: the programs lie in the kernel image, and the frame is
+        // new, one page, and reached through the linear map.
+        unsafe { core::ptr::copy_nonoverlapping(start as *const u8, text as *mut u8, len) };
+    })?;
     Ok(p)
 }
 
@@ -1143,18 +1163,17 @@ fn with_programs(
 fn new_thread(
     f: &mut Fixture,
     slot: usize,
-    mut p: NonNull<Process>,
+    p: NonNull<Process>,
     data_va: usize,
     entry: *const u8,
     arg: u64,
 ) -> Result<NonNull<Thread>, &'static str> {
-    // SAFETY: the process belongs to this test, and nothing else uses it.
-    let data = unsafe { p.as_mut() }
-        .map_frames(data_va, PAGE_SIZE, Attrs::USER_DATA)
-        .map_err(|_| "the data page did not map")?;
-    // SAFETY: the frame is new, one page, aligned for the pattern, and
-    // reached through the linear map.
-    unsafe { ((LINEAR_BASE + data as usize) as *mut Pattern).write(f.patterns[slot].clone()) };
+    let pattern = f.patterns[slot].clone();
+    page_of(p, data_va, Access::ReadWrite, |data| {
+        // SAFETY: the frame is new, one page, aligned for the pattern, and
+        // reached through the linear map.
+        unsafe { (data as *mut Pattern).write(pattern) };
+    })?;
     let t = thread::create(
         p,
         user_address(entry),
@@ -1566,11 +1585,8 @@ fn sched_process(f: &mut Fixture) -> Result<(), &'static str> {
 /// `sched_process` with priority ceiling `ceiling`.
 fn sched_process_under(f: &mut Fixture, ceiling: u8) -> Result<(), &'static str> {
     let p = process::create_root(QUOTA, HANDLE_LIMIT, ceiling).map_err(|_| "no process")?;
-    let mut p = with_programs(f, 0, p)?;
-    // SAFETY: the process belongs to this test, and nothing else uses it.
-    f.data = unsafe { p.as_mut() }
-        .map_frames(DATA_VA, PAGE_SIZE, Attrs::USER_DATA)
-        .map_err(|_| "the shared page did not map")?;
+    let p = with_programs(f, 0, p)?;
+    f.data = page_of(p, DATA_VA, Access::ReadWrite, |_| {})?;
     Ok(())
 }
 
@@ -2193,6 +2209,7 @@ fn killer_and_child(
     let killer = sched_thread(f, 1, &raw const el0_kill, PRIORITY, FIFO)?;
     sched_thread(f, 2, &raw const el0_done_at_once, JUDGE, FIFO)?;
     f.memory = phys::free_frames() + pages::taken() as u64;
+    f.objects = memory::in_use();
     let child = make()?;
     let h = give_kept(f, Object::Process(child));
     // SAFETY: the test's reference goes; the handle, if it went in, holds
@@ -2416,7 +2433,8 @@ fn done_memory_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
                 "a portion began while an interrupt was pending",
             )?;
             check(
-                memory::in_use() == 0 && phys::free_frames() + pages::taken() as u64 == f.memory,
+                memory::in_use() == f.objects
+                    && phys::free_frames() + pages::taken() as u64 == f.memory,
                 "the object's frames or its place did not come back",
             )?;
             cleanup_done()
@@ -2424,8 +2442,11 @@ fn done_memory_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     }
 }
 
-/// The big teardown's child: one frame of its own, mapped at every
-/// 2 MiB of the gigabyte from BIG_BASE, and a full table.
+/// The big teardown's child: a page of a memory object mapped at BIG_BASE,
+/// its frame mapped at every other 2 MiB of the gigabyte from there with
+/// no mapping of its own (process::map_page, which only tests do), and a
+/// full table. The frame stays until the stage Mappings, which comes after
+/// the stage Space took the ASID and every table.
 fn big_child() -> Result<NonNull<Process>, &'static str> {
     let child = process::create_root(QUOTA, MAX_HANDLES, CEILING).map_err(|_| "no child")?;
     let filled = fill_big_child(child);
@@ -2436,11 +2457,8 @@ fn big_child() -> Result<NonNull<Process>, &'static str> {
     filled.map(|()| child)
 }
 
-fn fill_big_child(mut child: NonNull<Process>) -> Result<(), &'static str> {
-    // SAFETY: the child was just created, and only this test uses it.
-    let pa = unsafe { child.as_mut() }
-        .map_frames(BIG_BASE, PAGE_SIZE, Attrs::USER_DATA)
-        .map_err(|_| "the child's page did not map")?;
+fn fill_big_child(child: NonNull<Process>) -> Result<(), &'static str> {
+    let pa = page_of(child, BIG_BASE, Access::ReadWrite, |_| {})?;
     for i in 1..BIG_PAGES {
         let va = BIG_BASE + i * BLOCK_2M as usize;
         process::map_page(child, va, pa, Attrs::USER_DATA)

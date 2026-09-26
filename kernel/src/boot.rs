@@ -87,12 +87,13 @@ pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
 }
 
 /// Init from the boot image (spec 3.3, 13.1), checked in full: where the
-/// image lies (memmap::check_boot_image), its header and table, then
-/// init's program. The kernel reads the image
-/// through the linear map, so only once its own tables map all RAM; the
-/// allocator never gets the image's frames, so the bytes stay for good. A
-/// boot image that is missing, damaged or cut short stops the boot here
-/// with a panic that says what is wrong.
+/// image lies (memmap::check_boot_image), its header and table, that it
+/// is whole pages, which init maps as a memory object, then init's
+/// program. The kernel reads the image through the linear map, so only
+/// once its own tables map all RAM; the allocator never gets the image's
+/// frames, so the bytes stay for good. A boot image that is missing,
+/// damaged, cut short or not whole pages stops the boot here with a panic
+/// that says what is wrong.
 pub fn init_program(boot: &Boot) -> Program<'static> {
     let Some(r) = boot.info.initrd else {
         panic!("no boot image: QEMU takes it with -initrd, U-Boot's booti as its ramdisk");
@@ -114,8 +115,10 @@ pub fn init_program(boot: &Boot) -> Program<'static> {
             r.size as usize,
         )
     };
-    let init = BootImage::parse(bytes)
-        .and_then(BootImage::init)
-        .unwrap_or_else(|e| panic!("boot image: {e}"));
+    let image = BootImage::parse(bytes).unwrap_or_else(|e| panic!("boot image: {e}"));
+    if !r.size.is_multiple_of(kcore::PAGE_SIZE) {
+        panic!("boot image: not whole pages");
+    }
+    let init = image.init().unwrap_or_else(|e| panic!("boot image: {e}"));
     Program::parse(init).unwrap_or_else(|e| panic!("boot image: init: {e}"))
 }

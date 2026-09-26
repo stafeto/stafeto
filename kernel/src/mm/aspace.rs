@@ -211,10 +211,10 @@ impl AddressSpace {
     /// Maps `[va, va + size)` to the frames at `[pa, pa + size)`, page by
     /// page, with user attributes (EL0 access, nG, never executable by the
     /// kernel); the tables it takes are charged to `quota`. On error part
-    /// of the range may already be mapped. Code the kernel wrote into the
-    /// frames needs the instruction cache made coherent
-    /// (arch::cache::sync_icache) before a mapping with `Attrs::USER_TEXT`
-    /// runs it.
+    /// of the range may already be mapped. Code written into the frames
+    /// needs the instruction cache made coherent
+    /// (arch::cache::sync_icache_frames) before a mapping with
+    /// `Attrs::USER_TEXT` runs it.
     pub fn map(
         &mut self,
         va: usize,

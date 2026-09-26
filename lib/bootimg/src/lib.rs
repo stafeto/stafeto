@@ -11,7 +11,8 @@
 //! a table with a 48-byte entry per file (the name, 1 to 32 bytes of UTF-8
 //! padded with zeros; the offset of the file from the start of the image
 //! and its size, both u64), then the files at 4 KiB boundaries in the order
-//! of the table. The first file is init.
+//! of the table, and zeros to the end of the last page: the image is whole
+//! pages, which the kernel maps as they are. The first file is init.
 //!
 //! A program: a 120-byte header (the signature `STAFPROG`, the version as
 //! u32, the stack size in bytes as u32, the entry point as u64, then three
@@ -438,7 +439,8 @@ pub mod write {
     }
 
     /// The header, the table, then the files, each at the next 4 KiB
-    /// boundary, in the order given.
+    /// boundary, in the order given, and zeros up to the next boundary: the
+    /// image is whole pages (spec 13.1).
     pub fn image(files: &[(&str, &[u8])]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
@@ -461,6 +463,7 @@ pub mod write {
             pad(&mut out);
             out.extend_from_slice(data);
         }
+        pad(&mut out);
         BootImage::parse(&out)?;
         Ok(out)
     }
@@ -545,8 +548,25 @@ mod tests {
             (files[1].name, files[1].offset, files[1].data),
             ("hello", hello_at, &b"hello"[..])
         );
-        assert_eq!(bytes.len() as u64, hello_at + 5);
+        assert_eq!(bytes.len() as u64, hello_at + PAGE_SIZE);
         assert_eq!(image.init(), Ok(&init[..]));
+    }
+
+    /// The image ends at a page boundary, whatever its files hold, with
+    /// zeros after the last file (spec 13.1).
+    #[test]
+    fn image_is_whole_pages() {
+        for size in [0, 1, 5, 0xFFF, 0x1000, 0x1001, 0x2FFF] {
+            let data = alloc::vec![0xA5; size];
+            let bytes = write::image(&[("init", &data)]).unwrap();
+            assert_eq!(bytes.len() as u64 % PAGE_SIZE, 0, "{size:#x}");
+            let file = BootImage::parse(&bytes).unwrap().files().next().unwrap();
+            let end = file.offset as usize + size;
+            assert_eq!(file.data, &data[..], "{size:#x}");
+            assert!(bytes[end..].iter().all(|&b| b == 0), "{size:#x}");
+            assert!(bytes.len() - end < PAGE_SIZE as usize, "{size:#x}");
+        }
+        assert_eq!(write::image(&[]).unwrap().len() as u64, PAGE_SIZE);
     }
 
     #[test]
@@ -566,7 +586,9 @@ mod tests {
     #[test]
     fn every_cut_of_an_image_is_truncated() {
         let bytes = image();
-        for len in 0..bytes.len() {
+        let files: Vec<File> = BootImage::parse(&bytes).unwrap().files().collect();
+        let last = files.last().unwrap();
+        for len in 0..last.offset as usize + last.data.len() {
             let got = BootImage::parse(&bytes[..len]).err();
             let cut = matches!(got, Some(Error::Truncated { need, len: l })
                 if l == len as u64 && need > l);
@@ -666,7 +688,7 @@ mod tests {
         let bytes = write::image(&[("shell", b"x"), ("init", b"y")]).unwrap();
         assert_eq!(BootImage::parse(&bytes).unwrap().init(), Err(Error::NoInit));
         let bytes = write::image(&[]).unwrap();
-        assert_eq!(bytes.len(), 16);
+        assert_eq!(&bytes[12..16], &[0; 4]);
         assert_eq!(BootImage::parse(&bytes).unwrap().init(), Err(Error::NoInit));
     }
 

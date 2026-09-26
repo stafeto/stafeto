@@ -15,6 +15,7 @@ use crate::arch::{self, gic, semihosting, timer};
 use crate::boot::Boot;
 use crate::channel;
 use crate::cleanup;
+use crate::memory;
 use crate::mm::aspace::{self, AddressSpace};
 use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys;
@@ -22,7 +23,7 @@ use crate::mm::phys::LinearMem;
 use crate::object::Object;
 use crate::process::Stage;
 use crate::{process, sched, session, thread, timer as timers};
-use abi::{Error, Policy, ProcessState, Rights};
+use abi::{Access, Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
@@ -368,6 +369,14 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "unmapped_page_no_longer_translates",
         calls::unmapped_page_no_longer_translates,
+    ),
+    (
+        "boot_image_frames_never_go",
+        calls::boot_image_frames_never_go,
+    ),
+    (
+        "init_load_maps_each_part_with_its_access",
+        calls::init_load_maps_each_part_with_its_access,
     ),
 ];
 
@@ -1673,9 +1682,9 @@ fn give_frames_back(mut block: u64) {
     }
 }
 
-/// A process with a thread and mapped frames gives every frame back when
-/// both go. The pools keep the page each takes for its first object, so
-/// one round runs before the count.
+/// A process with a thread and a mapped memory object gives every frame
+/// back when they go. The pools keep the page each takes for its first
+/// object, so one round runs before the count.
 fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static str> {
     process_round()?;
     let before = phys::free_frames();
@@ -1691,13 +1700,20 @@ fn processes_and_threads_return_their_memory(_: &Boot) -> Result<(), &'static st
 }
 
 fn process_round() -> Result<(), &'static str> {
-    let mut p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
     let before = (phys::free_frames(), process::quota(p).used());
-    // SAFETY: the process was just created, and only this test uses it.
-    let mapped = unsafe { p.as_mut() }.map_frames(USER_VA, 3 * PAGE_SIZE, Attrs::USER_DATA);
-    let result = match mapped {
-        Ok(pa) => check_fresh_frames(p, pa, before).and_then(|()| check_thread_start(p)),
-        Err(_) => Err("three pages did not map"),
+    let result = match memory::create_whole(p, 3) {
+        Ok(m) => {
+            let mapped = process::map_whole(p, m, USER_VA, Access::ReadWrite);
+            let checked = mapped
+                .map_err(|_| "three pages did not map")
+                .and_then(|()| check_fresh_frames(p, m, before));
+            // SAFETY: the reference `create_whole` handed out goes; the
+            // mapping, if it went in, holds the object.
+            unsafe { memory::release(m, CAUSE) };
+            checked.and_then(|()| check_thread_start(p))
+        }
+        Err(_) => Err("no memory object of three pages"),
     };
     // SAFETY: the process's threads went, the test's reference is the last,
     // and nothing uses it afterwards.
@@ -1965,9 +1981,9 @@ fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), 
     )
 }
 
-/// Three full chunks of handles; a page in each of two gigabytes of the
-/// space, so that six tables map them; buffers for both threads, one of
-/// which is ready; and the space in TTBR0 with an ASID.
+/// Three full chunks of handles; a page of a memory object in each of two
+/// gigabytes of the space, so that six tables map them; buffers for both
+/// threads, one of which is ready; and the space in TTBR0 with an ASID.
 fn fill_for_teardown(
     mut p: NonNull<process::Process>,
     ready: NonNull<thread::Thread>,
@@ -1978,10 +1994,12 @@ fn fill_for_teardown(
             .map_err(|_| "a handle did not go in")?;
     }
     for va in [USER_VA, USER_VA + GIB as usize] {
-        // SAFETY: the process is the test's, and nothing runs it.
-        unsafe { p.as_mut() }
-            .map_frames(va, PAGE_SIZE, Attrs::USER_DATA)
-            .map_err(|_| "a page did not map")?;
+        let m = memory::create_whole(p, 1).map_err(|_| "no memory object")?;
+        let mapped = process::map_whole(p, m, va, Access::ReadWrite);
+        // SAFETY: the reference `create_whole` handed out goes; the
+        // mapping, if it went in, holds the object.
+        unsafe { memory::release(m, CAUSE) };
+        mapped.map_err(|_| "a page did not map")?;
     }
     for (t, page) in [(ready, 2), (stopped, 3)] {
         thread::give_buffer(t, USER_VA + page * PAGE).map_err(|_| "no buffer")?;
@@ -2055,23 +2073,25 @@ fn check_stages(
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Frames && phys::free_frames() == frames + 6 + 2,
-        "the stage Mappings of a process with no mapping took more than a portion",
+        process::progress(p).0 == Stage::Quota
+            && cleanup::len() == 3
+            && phys::free_frames() == frames + 6 + 2,
+        "the stage Mappings did not let the two objects go in one portion",
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Quota && phys::free_frames() == frames + 6 + 2 + 2,
-        "the stage Frames did not give the frames back",
-    )?;
-    cleanup::portion();
-    check(
-        process::progress(p).0 == Stage::Notify && cleanup::len() == 1,
+        process::progress(p).0 == Stage::Notify && cleanup::len() == 3,
         "the stage Quota took more than a portion",
     )?;
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Shell && cleanup::len() == 0,
+        process::progress(p).0 == Stage::Shell && cleanup::len() == 2,
         "the stage Notify took more than a portion, or the shell was queued",
+    )?;
+    cleanup::drain();
+    check(
+        phys::free_frames() == frames + 6 + 2 + 2,
+        "the objects of the mappings did not give their frames back",
     )
 }
 
@@ -2501,27 +2521,34 @@ fn check_space_steps(p: NonNull<process::Process>, frames: u64) -> Result<(), &'
     Err("the stage Space did not end")
 }
 
-/// Three pages take a zeroed block of four frames and three tables over
-/// it, and the process pays for all seven (spec 7.5).
+/// Three pages of a memory object mapped into the process translate to
+/// the object's zeroed frames, and every frame the object and the mapping
+/// took, three pages, the node of their list, three tables and the pages
+/// of the pools, is charged to the process (spec 7.5).
 fn check_fresh_frames(
     p: NonNull<process::Process>,
-    pa: u64,
+    m: NonNull<crate::memory::Memory>,
     (frames, used): (u64, u64),
 ) -> Result<(), &'static str> {
+    let taken = frames - phys::free_frames();
     check(
-        phys::free_frames() == frames - 7,
-        "three pages did not take a block of four frames and three tables",
+        taken >= 3 + 1 + 3 && process::quota(p).used() == used + taken * PAGE_SIZE,
+        "the object, its mapping and their tables were not charged to the process",
     )?;
-    check(
-        process::quota(p).used() == used + 7 * PAGE_SIZE,
-        "the block of map_frames and its tables were not charged to the process",
-    )?;
-    // SAFETY: the block belongs to the test's process, which nothing runs.
+    // SAFETY: the frames belong to the test's object, which nothing runs.
     let mem = unsafe { LinearMem::new() };
-    check(
-        (0..4 * PAGE_SIZE / 8).all(|i| mem.read(pa + i * 8) == 0),
-        "the frames of a process are not zeroed",
-    )
+    for i in 0..3 {
+        let pa = memory::frame(m, i);
+        check(
+            process::translate(p, USER_VA + i * PAGE).map(|(f, _)| f) == Some(pa),
+            "a page does not show its frame of the object",
+        )?;
+        check(
+            (0..PAGE_SIZE / 8).all(|w| mem.read(pa + w * 8) == 0),
+            "the frames of a memory object are not zeroed",
+        )?;
+    }
+    Ok(())
 }
 
 /// A new thread starts with the registers it was given and nothing else;

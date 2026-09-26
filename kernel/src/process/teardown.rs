@@ -79,8 +79,6 @@ pub enum Stage {
     /// (maps::release_all). One portion. After Space, so that no TLB entry
     /// maps a frame of an object that goes.
     Mappings,
-    /// The blocks of frames the process owned, at most MAX_BLOCKS.
-    Frames,
     /// The free part of its quota goes back to the parent, and the
     /// process leaves its parent's list of children: by now its
     /// descendants passed their own stage Quota (spec 7.5).
@@ -100,7 +98,7 @@ pub enum Stage {
 }
 
 /// The stages of a teardown in the order they run (spec 7.7).
-const STAGES: [Stage; 11] = [
+const STAGES: [Stage; 10] = [
     Stage::Stop,
     Stage::Replies,
     Stage::Children,
@@ -108,7 +106,6 @@ const STAGES: [Stage; 11] = [
     Stage::Space,
     Stage::Buffers,
     Stage::Mappings,
-    Stage::Frames,
     Stage::Quota,
     Stage::Notify,
     Stage::Shell,
@@ -279,12 +276,6 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         Stage::Buffers => unsafe { release_buffers(process, r) },
         // SAFETY: as above.
         Stage::Mappings => unsafe { super::maps::release_all(process, r) },
-        // SAFETY: as above; the stage Space is over, so no TLB entry
-        // maps the frames.
-        Stage::Frames => unsafe {
-            (*p).frames.release(&mut (*p).quota);
-            true
-        },
         // SAFETY: as above.
         Stage::Quota => unsafe { leave_parent(process) },
         // SAFETY: as above; the queue's reference keeps the shell.

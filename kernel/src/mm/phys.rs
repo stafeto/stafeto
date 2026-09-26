@@ -49,14 +49,13 @@ unsafe impl PhysMem for LinearMem {
 
 pub type Frames = FrameAllocator<'static, LinearMem>;
 
-/// A block of 2^order frames that its holder owns: a message buffer, a
-/// block `map_frames` gave a process, or a page of a memory object, whose
-/// list keeps the address `into_raw` gave until `from_raw` makes it a
-/// block again (spec 6.2, 7.3, 7.8). The kernel reaches it through the
-/// linear map only, never through the tables of a program, and through raw
-/// pointers only: a program may write the block through its own mapping.
-/// Neither Copy nor Clone: `free` takes it back, and a block dropped
-/// otherwise stops the kernel.
+/// A block of 2^order frames that its holder owns: a message buffer, or a
+/// page of a memory object, whose list keeps the address `into_raw` gave
+/// until `from_raw` makes it a block again (spec 6.2, 7.3, 7.8). The
+/// kernel reaches it through the linear map only, never through the tables
+/// of a program, and through raw pointers only: a program may write the
+/// block through its own mapping. Neither Copy nor Clone: `free` takes it
+/// back, and a block dropped otherwise stops the kernel.
 pub struct Frame {
     pa: u64,
     order: u8,

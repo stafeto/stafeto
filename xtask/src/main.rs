@@ -100,9 +100,10 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 124;
-/// A data segment bigger than the 4 MiB one block of frames holds.
-const BIG_DATA: u64 = 8 << 20;
+const INIT_TESTS: u32 = 125;
+/// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
+/// by a page.
+const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target/.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -499,37 +500,41 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     Ok(())
 }
 
-/// A boot image that is missing, cut short or damaged stops the boot with
-/// a panic that says what is wrong (spec 3.3, 13.1). The cases: no boot
-/// image; the image without its last byte; the image's signature spoiled;
-/// init's signature spoiled; an init whose data segment is bigger than
-/// one block of frames, which the kernel cannot load.
+/// A boot image that is missing, cut short, damaged or not whole pages
+/// stops the boot with a panic that says what is wrong (spec 3.3, 13.1).
+/// The cases: no boot image; the image without the last byte of init; the
+/// image's signature spoiled; init's signature spoiled; the image with a
+/// byte past its whole pages; an init whose data segment is
+/// bigger than a memory object can be, which the kernel cannot load.
 fn bad_boot_images_stop_the_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let good =
         std::fs::read(&a.boot_image).map_err(|e| format!("{}: {e}", a.boot_image.display()))?;
-    let init_at = bootimg::BootImage::parse(&good)
+    let init = bootimg::BootImage::parse(&good)
         .map_err(|e| e.to_string())?
         .files()
         .next()
-        .ok_or("the boot image has no files")?
-        .offset as usize;
+        .ok_or("the boot image has no files")?;
+    let (init_at, init_end) = (init.offset as usize, init.offset as usize + init.data.len());
+    let mut odd = good.clone();
+    odd.push(0);
     let mut unsigned = good.clone();
     unsigned[0] = b's';
     let mut bad_init = good.clone();
     bad_init[init_at] = b's';
-    let big = raw_init(&[LDR_X0_X0], false, BIG_DATA)?;
+    let huge = raw_init(&[LDR_X0_X0], false, HUGE_DATA)?;
     let cases = [
         (None, "no boot image"),
-        (Some(&good[..good.len() - 1]), "boot image: cut short"),
+        (Some(&good[..init_end - 1]), "boot image: cut short"),
         (Some(&unsigned[..]), "boot image: no STAFBOOT signature"),
         (
             Some(&bad_init[..]),
             "boot image: init: no STAFPROG signature",
         ),
+        (Some(&odd[..]), "boot image: not whole pages"),
         (
-            Some(&big[..]),
-            "init: no frames for its data segment of 0x800000 bytes",
+            Some(&huge[..]),
+            "init: no memory object for its data segment",
         ),
     ];
     let path = root().join("target").join("bad-boot.img");
