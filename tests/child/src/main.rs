@@ -15,7 +15,8 @@
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
     ARGS, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS, MOST_USED,
-    NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SEEN, SHARED, STARTED, WINDOW,
+    NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED, STARTED,
+    WINDOW,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Resource, Thread};
@@ -25,6 +26,8 @@ use rt::{Handle, Stack, loader, msgbuf};
 rt::entry!(main);
 
 const PAGE: u64 = 4096;
+/// The bytes of the scratch mapping (child::SCRATCH).
+const SCRATCH_LEN: u64 = SCRATCH_PAGES as u64 * PAGE;
 /// Copies of handles Role::Churn holds at a time: more than the table of
 /// a child its parent made for it takes.
 const HELD_MAX: usize = 1024;
@@ -141,12 +144,15 @@ fn run(s: &Start) -> u64 {
             f();
             NO_FAULT
         }
-        Role::WriteReadOnly => with_scratch(s, |own, at| {
-            // SAFETY: the page is the child's own, readable and writable
+        Role::WriteProtected => with_scratch(s, |own, at| {
+            let Some(access) = Access::from_raw(a[0]) else {
+                return FAILED;
+            };
+            // SAFETY: the pages are the child's own, readable and writable
             // until mem_protect, which nothing but this role uses.
             let protected = unsafe {
                 at.write_volatile(1);
-                sys::mem_protect(own, SCRATCH, PAGE, Access::Read)
+                sys::mem_protect(own, SCRATCH, SCRATCH_LEN, access)
             };
             if protected.is_err() {
                 return FAILED;
@@ -161,8 +167,8 @@ fn run(s: &Start) -> u64 {
                 at.write_volatile(1);
                 at.read_volatile()
             };
-            // SAFETY: nothing but this role uses the page.
-            if seen != 1 || unsafe { sys::mem_unmap(own, SCRATCH, PAGE) }.is_err() {
+            // SAFETY: nothing but this role uses the pages.
+            if seen != 1 || unsafe { sys::mem_unmap(own, SCRATCH, SCRATCH_LEN) }.is_err() {
                 return FAILED;
             }
             // SAFETY: the load is the fault the role exists for.
@@ -263,17 +269,18 @@ fn deeper(depth: u64) -> u64 {
     deeper(depth + 1).wrapping_add(frame[1])
 }
 
-/// A page of a new object mapped at SCRATCH, RW, through handle 0, the
-/// child's own process; `then` gets that handle and the page's first word.
+/// SCRATCH_PAGES pages of a new object mapped at SCRATCH, RW, through
+/// handle 0, the child's own process; `then` gets that handle and the
+/// first word of SCRATCH_LAST.
 fn with_scratch(s: &Start, then: impl FnOnce(&Handle<Process>, *mut u64) -> u64) -> u64 {
     let own = Handle::<Process>::from_raw(s.handles[0]);
-    let Ok(m) = sys::mem_create(PAGE) else {
+    let Ok(m) = sys::mem_create(SCRATCH_LEN) else {
         return FAILED;
     };
-    if sys::mem_map(&own, &m, 0, PAGE, SCRATCH, Access::ReadWrite).is_err() {
+    if sys::mem_map(&own, &m, 0, SCRATCH_LEN, SCRATCH, Access::ReadWrite).is_err() {
         return FAILED;
     }
-    then(&own, SCRATCH as *mut u64)
+    then(&own, SCRATCH_LAST as *mut u64)
 }
 
 /// Role::Grandparent: the grandchild runs Spin below the child, which then

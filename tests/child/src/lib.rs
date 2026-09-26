@@ -24,15 +24,28 @@ pub const MARKS: usize = 0x3F_F000;
 /// The mark each child adds 1 to as it starts, before its start request.
 pub const STARTED: usize = 0;
 
-/// Where a child maps a page of its own (WriteReadOnly, ReadUnmapped),
-/// under the same table as its marks.
-pub const SCRATCH: usize = 0x3F_E000;
+/// Where a child maps SCRATCH_PAGES pages of an object of its own
+/// (WriteProtected, ReadUnmapped), below SHARED, under the same table as
+/// its marks.
+pub const SCRATCH: usize = 0x3B_E000;
+/// Two pages more than a portion of mem_protect and mem_unmap, 32 pages,
+/// or 8 when they become executable (spec 7.7): the last page is the
+/// second of the last portion of each of these changes, past the first
+/// page of any portion.
+pub const SCRATCH_PAGES: usize = 34;
+/// The page of the scratch mapping that the roles write, read and fault
+/// at: its last.
+pub const SCRATCH_LAST: usize = SCRATCH + (SCRATCH_PAGES - 1) * 0x1000;
 /// Where a child maps a memory object that a message brought or that it
 /// made to send (Role::Service, Role::Provider), and the pages there,
-/// below SCRATCH: under the same table as its marks, so the mapping takes
-/// no new table.
+/// between the scratch mapping and its marks: under the same table as its
+/// marks, so the mapping takes no new table.
 pub const SHARED: usize = 0x3E_0000;
 pub const SHARED_PAGES: usize = 16;
+const _: () = assert!(
+    SCRATCH + SCRATCH_PAGES * 0x1000 <= SHARED && SHARED + SHARED_PAGES * 0x1000 <= MARKS,
+    "the places of a child's own mappings overlap"
+);
 /// Where a grandparent maps the boot image, and the window of its loader
 /// (rt::loader): above its message buffer, under the table of the second
 /// level that the buffer took.
@@ -95,12 +108,14 @@ pub enum Role {
     /// fail with ACCESS_DENIED each: they are mapped through copies with
     /// MAP_READ and MAP_WRITE alone. Then branches to a word of its data.
     RunData = 7,
-    /// Maps a page of a new object at SCRATCH, RW, through handle 0, its
-    /// own process with MANAGE, writes to it, makes it R with mem_protect
-    /// and writes to it again.
-    WriteReadOnly = 8,
-    /// Maps a page of a new object at SCRATCH, RW, through handle 0,
-    /// writes and reads it, unmaps it and reads it again.
+    /// Maps SCRATCH_PAGES pages of a new object at SCRATCH, RW, through
+    /// handle 0, its own process with MANAGE, writes to SCRATCH_LAST, gives
+    /// the mapping the access in argument 0 (abi::Access, R or RX) with
+    /// mem_protect and writes to that page again.
+    WriteProtected = 8,
+    /// Maps SCRATCH_PAGES pages of a new object at SCRATCH, RW, through
+    /// handle 0, writes and reads SCRATCH_LAST, unmaps the mapping and
+    /// reads that page again.
     ReadUnmapped = 9,
     /// Loads the child program of the boot image, handle 1, as its own
     /// child: quota argument 0, ceiling and priority argument 1, exit
@@ -193,7 +208,7 @@ impl Role {
         Role::Load,
         Role::WriteCode,
         Role::RunData,
-        Role::WriteReadOnly,
+        Role::WriteProtected,
         Role::ReadUnmapped,
         Role::Grandparent,
         Role::Spin,

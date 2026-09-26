@@ -105,7 +105,7 @@ const TEST_INIT_LINES: [&str; 4] = [
 /// `child_fault_reason_reaches_the_parent` and the children with code of
 /// the tests of faults, of `wfi` with the fault before it and of an orphan
 /// that faults.
-const CHILD_FAULTS: usize = 11;
+const CHILD_FAULTS: usize = 12;
 /// The panic of a child (tests/child, Role::Panic): rt prints where it
 /// panicked, then this message on a line of its own (spec 13.2).
 const CHILD_PANIC_AT: &str = "panic: panicked at tests/child/src/main.rs:";
@@ -136,7 +136,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 156;
+const INIT_TESTS: u32 = 157;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;

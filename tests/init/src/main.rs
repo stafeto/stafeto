@@ -47,7 +47,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 156] = [
+const TESTS: [Test; 157] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -311,6 +311,10 @@ const TESTS: [Test; 156] = [
     (
         "child_read_only_mapping_refuses_a_write",
         child_read_only_mapping_refuses_a_write,
+    ),
+    (
+        "child_executable_mapping_refuses_a_write",
+        child_executable_mapping_refuses_a_write,
     ),
     (
         "child_access_after_unmap_faults",
@@ -4459,9 +4463,11 @@ const PAUSE_NS: u64 = 1_000_000;
 /// buffer: 12 pages, and 3 more, which a mapping pays ahead for its tables
 /// until it ends: the last mapping, of the page of marks, needs them.
 const LEAF_QUOTA: u64 = 15 * PAGE as u64;
-/// A child that maps a page of an object of its own: the page and a page
-/// of its pool of memory objects more.
-const SCRATCH_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
+/// A child that maps child::SCRATCH_PAGES pages of an object of its own:
+/// the pages, the node of their list and a page of its pool of memory
+/// objects more; the mapping, under the table of its marks, takes no
+/// table.
+const SCRATCH_QUOTA: u64 = LEAF_QUOTA + (child::SCRATCH_PAGES as u64 + 2) * PAGE as u64;
 /// A child with two threads besides its first: their message buffers
 /// more, under the table of its first thread's buffer.
 const THREADS_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
@@ -4836,7 +4842,7 @@ impl Kid {
 /// The quota of a child with `role`.
 fn quota_of(role: Role) -> u64 {
     match role {
-        Role::WriteReadOnly | Role::ReadUnmapped => SCRATCH_QUOTA,
+        Role::WriteProtected | Role::ReadUnmapped => SCRATCH_QUOTA,
         Role::Grandparent => GRANDPARENT_QUOTA,
         Role::LastThread | Role::ExitProcess | Role::KillItself | Role::BufferBack => THREADS_QUOTA,
         Role::Ceiling => CEILING_QUOTA,
@@ -5102,27 +5108,44 @@ fn child_stack_has_a_guard_page() -> Outcome {
     )
 }
 
-/// Spec 7.4: a child maps a page of its own object RW and writes to it, so
-/// the TLB may hold the page writable, then makes the mapping R with
-/// mem_protect, which forgets the page in the TLB within the call: its
-/// next write ends it with a data abort from EL0, a permission fault of a
-/// write at that page.
+/// Spec 7.4, 7.7: a child maps child::SCRATCH_PAGES pages of its own
+/// object RW and writes to the last, so the TLB may hold it writable, then
+/// makes the mapping R with mem_protect, whose portions of 32 pages forget
+/// each of their pages in the TLB within the call, the last page the
+/// second of the second portion: the child's next write there ends it
+/// with a data abort from EL0, a permission fault of a write at that page.
 fn child_read_only_mapping_refuses_a_write() -> Outcome {
-    let f = fault_of(Role::WriteReadOnly, &[], &[Gift::Own])?;
+    write_protected(Access::Read)
+}
+
+/// Spec 7.4, 7.7, 3.3 (W^X): as `child_read_only_mapping_refuses_a_write`,
+/// with the mapping made RX in portions of 8 pages, the last page the
+/// second of the fifth: a page that became executable is no longer
+/// writable once mem_protect returns.
+fn child_executable_mapping_refuses_a_write() -> Outcome {
+    write_protected(Access::ReadExec)
+}
+
+/// A child that ran Role::WriteProtected with `access` ended with a
+/// permission fault of a write from EL0 at child::SCRATCH_LAST.
+fn write_protected(access: Access) -> Outcome {
+    let f = fault_of(Role::WriteProtected, &[access.raw()], &[Gift::Own])?;
     check(
         (f.class, f.status, f.write) == (DATA_ABORT, PERMISSION, 1),
         "the fault is not a permission fault of a write from EL0",
     )?;
     check(
-        f.far == child::SCRATCH as u64,
-        "FAR is not the page mapped R",
+        f.far == child::SCRATCH_LAST as u64,
+        "FAR is not the page whose access changed",
     )
 }
 
-/// Spec 7.4: a child maps a page of its own object RW, writes and reads
-/// it, so the TLB may hold the page, and unmaps it: its next read there
-/// ends it with a data abort from EL0, a translation fault of a read,
-/// since mem_unmap took the page out of its tables and of the TLB.
+/// Spec 7.4, 7.7: a child maps child::SCRATCH_PAGES pages of its own
+/// object RW, writes and reads the last, so the TLB may hold it, and
+/// unmaps the mapping, whose portions of 32 pages take each of their pages
+/// out of its tables and of the TLB, the last page the second of the
+/// second portion: its next read there ends it with a data abort from
+/// EL0, a translation fault of a read at that page.
 fn child_access_after_unmap_faults() -> Outcome {
     let f = fault_of(Role::ReadUnmapped, &[], &[Gift::Own])?;
     check(
@@ -5130,7 +5153,7 @@ fn child_access_after_unmap_faults() -> Outcome {
         "the fault is not a translation fault of a read from EL0",
     )?;
     check(
-        f.far == child::SCRATCH as u64,
+        f.far == child::SCRATCH_LAST as u64,
         "FAR is not the page that went",
     )
 }
