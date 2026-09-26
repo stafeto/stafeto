@@ -1080,6 +1080,64 @@ mod tests {
         );
     }
 
+    /// The drivers of the kernel's devices and the test init's driver of
+    /// the PL031 reach registers through arch::mmio and rt::mmio only (spec
+    /// 9): one `ldr` or `str` with the address in a register, which a
+    /// hypervisor emulates from the syndrome [G34]. `read_volatile` and
+    /// `write_volatile` may compile to a pair or a writeback, which stops
+    /// QEMU under HVF.
+    #[test]
+    fn device_registers_go_through_mmio() {
+        // Every file that reaches device registers is listed here.
+        let files = [
+            "kernel/src/arch/aarch64/gic.rs",
+            "kernel/src/console.rs",
+            "tests/init/src/devices.rs",
+        ];
+        for file in files {
+            let text = std::fs::read_to_string(root().join(file)).expect("a device file");
+            assert!(
+                !text.contains("read_volatile") && !text.contains("write_volatile"),
+                "{file} reaches a register without mmio"
+            );
+        }
+    }
+
+    /// Each access of arch::mmio and rt::mmio is one plain `ldr` or `str`
+    /// (or a byte of it) with the address in a register, with no writeback
+    /// and no pair, or the `dmb oshst` of `wmb` [G34]: a hypervisor
+    /// emulates only such an access from the syndrome.
+    #[test]
+    fn mmio_is_one_plain_load_or_store() {
+        let allowed = [
+            "ldr {v:w}, [{a}]",
+            "str {v:w}, [{a}]",
+            "ldrb {v:w}, [{a}]",
+            "strb {v:w}, [{a}]",
+            "ldr {v}, [{a}]",
+            "str {v}, [{a}]",
+            "dmb oshst",
+        ];
+        for file in ["kernel/src/arch/aarch64/mmio.rs", "lib/rt/src/mmio.rs"] {
+            let text = std::fs::read_to_string(root().join(file)).expect("an mmio file");
+            let mut accesses = 0;
+            for line in text.lines().filter(|line| line.contains("asm!(")) {
+                // The template, and no second template after it.
+                let template = line
+                    .split_once("asm!(\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .filter(|(_, rest)| !rest.starts_with(", \""))
+                    .map(|(template, _)| template);
+                assert!(
+                    template.is_some_and(|t| allowed.contains(&t)),
+                    "{file}: {line}"
+                );
+                accesses += 1;
+            }
+            assert!(accesses > 0, "{file} has no access");
+        }
+    }
+
     /// The round trip's line gives its six rows in order, and nothing else
     /// passes for it.
     #[test]

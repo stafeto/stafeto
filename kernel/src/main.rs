@@ -112,7 +112,8 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
     if let Some(r) = info.uart_pl011 {
         kprintln!("pl011      {:#x}", r.base);
     }
-    if let (Some(d), Some(c)) = (info.gic_distributor, info.gic_cpu_interface) {
+    if let Some(gic) = &info.gic {
+        let [d, c] = gic.mapped();
         kprintln!(
             "gic        distributor {:#x}, cpu interface {:#x}",
             d.base,

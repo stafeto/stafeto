@@ -7,8 +7,9 @@
 //! `wfi`, which a pending interrupt ends all the same, and acknowledges the
 //! interrupt itself through GICC_IAR.
 
+use super::mmio;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use kcore::bootinfo::BootInfo;
+use kcore::bootinfo::{BootInfo, GicVersion};
 use kcore::gic::{
     self, Ack, CTLR_ENABLE, DEFAULT_PRIORITY, FIRST_SPI, GICC_CTLR, GICC_EOIR, GICC_IAR, GICC_PMR,
     GICD_CTLR, GICD_ICACTIVER, GICD_ICENABLER, GICD_ICPENDR, GICD_IPRIORITYR, GICD_ISENABLER,
@@ -22,33 +23,30 @@ static CPU: AtomicUsize = AtomicUsize::new(0);
 /// The lines of the distributor, from GICD_TYPER at `init`.
 static LINE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-fn reg(base: &AtomicUsize, offset: usize) -> *mut u32 {
+fn reg(base: &AtomicUsize, offset: usize) -> usize {
     let base = base.load(Ordering::Relaxed);
     assert!(base != 0, "the GIC is used before gic::init");
-    (base + offset) as *mut u32
+    base + offset
 }
 
 fn read(base: &AtomicUsize, offset: usize) -> u32 {
     // SAFETY: `init` stored the base of a GIC block the kernel tables map as
     // device memory; the offsets are registers of that block.
-    unsafe { reg(base, offset).read_volatile() }
+    unsafe { mmio::read32(reg(base, offset)) }
 }
 
 fn write(base: &AtomicUsize, offset: usize, value: u32) {
     // SAFETY: as in `read`.
-    unsafe { reg(base, offset).write_volatile(value) }
+    unsafe { mmio::write32(reg(base, offset), value) }
 }
 
 /// Resets the distributor and this CPU's interface and turns both on: every
 /// line masked, not pending, not active, at DEFAULT_PRIORITY; shared lines
 /// go to CPU 0; the priority mask lets DEFAULT_PRIORITY through.
 pub fn init(info: &BootInfo) {
-    let dist = info
-        .gic_distributor
-        .expect("no GIC distributor in the device tree");
-    let cpu = info
-        .gic_cpu_interface
-        .expect("no GIC CPU interface in the device tree");
+    let gic = info.gic.expect("no GIC in the device tree");
+    assert!(gic.version == GicVersion::V2, "no driver for a GICv3");
+    let [dist, cpu] = gic.mapped();
     DIST.store(LINEAR_BASE + dist.base as usize, Ordering::Relaxed);
     CPU.store(LINEAR_BASE + cpu.base as usize, Ordering::Relaxed);
     write(&DIST, GICD_CTLR, 0);

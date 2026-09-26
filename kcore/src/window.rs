@@ -3,25 +3,22 @@
 
 //! Device windows (spec 7.3, 9): the physical range device_window_create
 //! gives a memory object, rounded out to whole pages, and the check that
-//! it touches no page the kernel keeps for itself: RAM, the GIC's
-//! distributor and CPU interface, and the PL011 of the kernel's console
-//! until milestone 1.4. A page shared with any of them is refused, so no
-//! window reaches a register of the kernel's devices.
+//! it touches no page the kernel keeps for itself: RAM, every region of
+//! the GIC's node, and the PL011 of the kernel's console until milestone
+//! 1.4. A page shared with any of them is refused, so no window reaches a
+//! register of the kernel's devices.
 
 use crate::PAGE_SIZE;
-use crate::bootinfo::{BootInfo, MEMORY_REGIONS, Region, RegionList};
+use crate::bootinfo::{BootInfo, GIC_REGIONS, MEMORY_REGIONS, Region, RegionList};
 use abi::{Error, MAX_MEMORY};
 
 /// The end of the output addresses a descriptor holds (OA[47:12], [G8]).
 pub const OUTPUT_END: u64 = 1 << 48;
 
-/// The kernel's own devices a window may not touch: the GIC's distributor
-/// and CPU interface, and the PL011.
-const KERNEL_DEVICES: usize = 3;
-
 /// What a window may not touch: the RAM regions of the device tree
-/// (MEMORY_REGIONS, at most) and KERNEL_DEVICES devices of the kernel.
-pub type Forbidden = RegionList<{ MEMORY_REGIONS + KERNEL_DEVICES }>;
+/// (MEMORY_REGIONS, at most), the regions of the GIC's node (GIC_REGIONS,
+/// at most) and the PL011.
+pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS + 1 }>;
 
 /// The range of `len` bytes from `addr` rounded out to whole pages: its
 /// first page and its count of pages. INVALID_ARGS for a length of 0, a
@@ -40,23 +37,15 @@ pub fn round_out(addr: u64, len: u64) -> Result<(u64, u64), Error> {
 }
 
 /// What windows may not touch on the machine `info` describes: its RAM,
-/// the GIC's blocks and the PL011.
+/// every region of the GIC's node, whole, and the PL011.
 pub fn forbidden(info: &BootInfo) -> Forbidden {
     let mut list = Forbidden::new();
-    let devices = [
-        info.gic_distributor,
-        info.gic_cpu_interface,
-        info.uart_pl011,
-    ];
-    for r in info
-        .memory
-        .as_slice()
-        .iter()
-        .copied()
-        .chain(devices.into_iter().flatten())
-    {
-        list.push(r)
-            .expect("room for MEMORY_REGIONS and KERNEL_DEVICES");
+    let gic = info.gic.as_ref().map_or(&[][..], |g| g.regs.as_slice());
+    for &r in info.memory.as_slice().iter().chain(gic) {
+        list.push(r).expect("room for the RAM and the GIC");
+    }
+    if let Some(r) = info.uart_pl011 {
+        list.push(r).expect("room for the PL011");
     }
     list
 }
@@ -84,20 +73,26 @@ mod tests {
     use crate::fdt::Fdt;
 
     const VIRT: &[u8] = include_bytes!("../tests/fixtures/virt.dtb");
+    const VIRT_GICV3: &[u8] = include_bytes!("../tests/fixtures/virt-gicv3.dtb");
+    const A64: &[u8] = include_bytes!("../tests/fixtures/a64-like.dtb");
 
-    /// What windows may not touch on QEMU `virt` (the fixture): RAM from
-    /// 0x4000_0000, the GIC at 0x0800_0000 and 0x0801_0000, the PL011 at
-    /// 0x0900_0000.
-    fn virt() -> Forbidden {
-        forbidden(&parse(&Fdt::new(VIRT).unwrap()).unwrap())
+    /// What windows may not touch on the machine of the fixture `blob`.
+    fn forbidden_on(blob: &[u8]) -> Forbidden {
+        forbidden(&parse(&Fdt::new(blob).unwrap()).unwrap())
     }
 
     /// `round_out` and `check` together, as device_window_create takes a
-    /// range.
-    fn window(addr: u64, len: u64) -> Result<(u64, u64), Error> {
+    /// range, on the machine of the fixture `blob`.
+    fn window_on(blob: &[u8], addr: u64, len: u64) -> Result<(u64, u64), Error> {
         let (base, pages) = round_out(addr, len)?;
-        check(base, pages, virt().as_slice())?;
+        check(base, pages, forbidden_on(blob).as_slice())?;
         Ok((base, pages))
+    }
+
+    /// A window on QEMU `virt` (the fixture): RAM from 0x4000_0000, the GIC
+    /// at 0x0800_0000 and 0x0801_0000, the PL011 at 0x0900_0000.
+    fn window(addr: u64, len: u64) -> Result<(u64, u64), Error> {
+        window_on(VIRT, addr, len)
     }
 
     #[test]
@@ -157,5 +152,62 @@ mod tests {
         assert_eq!(window(last, PAGE_SIZE + 1), Err(Error::InvalidArgs));
         assert_eq!(window(OUTPUT_END, 1), Err(Error::InvalidArgs));
         assert_eq!(window(u64::MAX, 1), Err(Error::InvalidArgs));
+    }
+
+    /// The A64's GIC-400 has four regions: the distributor, the CPU
+    /// interface, the virtual interface control and the virtual CPU
+    /// interface; the last two are refused as the first two are.
+    #[test]
+    fn window_over_gich_or_gicv_is_refused() {
+        assert_eq!(forbidden_on(A64).as_slice().len(), 5);
+        for addr in [
+            0x01c8_1000,
+            0x01c8_2000,
+            0x01c8_4000,
+            0x01c8_5000,
+            0x01c8_6000,
+            0x01c8_7000,
+        ] {
+            assert_eq!(
+                window_on(A64, addr, 0x1000),
+                Err(Error::InvalidArgs),
+                "{addr:#x}"
+            );
+        }
+        assert_eq!(window_on(A64, 0x01c8_8000, 0x1000), Ok((0x01c8_8000, 1)));
+        assert_eq!(window_on(A64, 0x01c8_0000, 0x1000), Ok((0x01c8_0000, 1)));
+    }
+
+    /// The redistributor region of QEMU's GICv3 is refused whole, past the
+    /// part the kernel maps (bootinfo::Gic::mapped).
+    #[test]
+    fn window_over_the_redistributors_is_refused() {
+        for addr in [
+            0x080A_0000,
+            0x080D_F000,
+            0x080E_0000,
+            0x0850_0000,
+            0x08FF_F000,
+        ] {
+            assert_eq!(
+                window_on(VIRT_GICV3, addr, 0x1000),
+                Err(Error::InvalidArgs),
+                "{addr:#x}"
+            );
+        }
+        assert_eq!(
+            window_on(VIRT_GICV3, 0x0801_0000, 0x1000),
+            Ok((0x0801_0000, 1))
+        );
+    }
+
+    /// The ITS of QEMU's GICv3 is a child node of the GIC: init may give it
+    /// out as it gives any device (spec 9).
+    #[test]
+    fn window_over_a_gic_child_is_allowed() {
+        assert_eq!(
+            window_on(VIRT_GICV3, 0x0808_0000, 0x2_0000),
+            Ok((0x0808_0000, 32))
+        );
     }
 }

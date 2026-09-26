@@ -22,6 +22,7 @@
 pub mod console;
 pub mod handle;
 pub mod loader;
+pub mod mmio;
 pub mod msgbuf;
 pub mod sys;
 pub mod time;

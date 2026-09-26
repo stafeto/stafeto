@@ -9,7 +9,7 @@ use super::phys::{self, Frames, LinearMem};
 use crate::arch::{mmu, symbols};
 use crate::boot::Boot;
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::Region;
+use kcore::bootinfo::{Gic, Region};
 use kcore::frames::PhysMem;
 use kcore::layout::{LINEAR_BASE, image_pa};
 use kcore::memmap;
@@ -140,14 +140,8 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
             );
         }
         let info = &boot.info;
-        for dev in [
-            info.uart_pl011,
-            info.gic_distributor,
-            info.gic_cpu_interface,
-        ]
-        .into_iter()
-        .flatten()
-        {
+        let gic = info.gic.as_ref().map(Gic::mapped).into_iter().flatten();
+        for dev in info.uart_pl011.into_iter().chain(gic) {
             let (base, size) = pages(dev);
             map(
                 &mut pt,

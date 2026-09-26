@@ -8,6 +8,7 @@ use crate::harness::*;
 use crate::messages::answer_all;
 use crate::processes::{DATA_ABORT, KID_WAIT_NS, Kid, LEAF_QUOTA, START};
 use crate::transfers::{close_raw, copy_raw, give, handle_client};
+use rt::mmio;
 
 /// The tests of this module, in the order they run.
 pub(crate) const TESTS: [Test; 17] = [
@@ -449,16 +450,15 @@ fn window_maps_read_write_but_never_exec() -> Outcome {
 }
 
 /// A window shows its device (spec 9): the count of seconds of the PL031,
-/// read twice through a window mapped R with volatile loads of 32 bits
-/// ([G34]), is not 0 and does not go back.
+/// read twice through a window mapped R with loads of 32 bits (rt::mmio),
+/// is not 0 and does not go back.
 fn window_reads_its_device() -> Outcome {
     let page = PAGE as u64;
     let w = device_window(RTC, page)?;
     map(&w, 0, page, WINDOW, Access::Read)?;
-    let dr = WINDOW as *const u32;
     // SAFETY: the page is the PL031's registers, mapped R as device memory;
     // RTCDR is a 32-bit register at offset 0.
-    let (first, second) = unsafe { (dr.read_volatile(), dr.read_volatile()) };
+    let (first, second) = unsafe { (mmio::read32(WINDOW), mmio::read32(WINDOW)) };
     unmap(WINDOW, page)?;
     close(w)?;
     check(
@@ -574,13 +574,13 @@ impl Rtc {
 
     fn read(&self, reg: usize) -> u32 {
         // SAFETY: the window maps the PL031's page at WINDOW, RW, as device
-        // memory; each register is 32 bits at its offset ([G34]).
-        unsafe { ((WINDOW + reg) as *const u32).read_volatile() }
+        // memory; each register is 32 bits at its offset.
+        unsafe { mmio::read32(WINDOW + reg) }
     }
 
     fn write(&self, reg: usize, value: u32) {
         // SAFETY: as in `read`.
-        unsafe { ((WINDOW + reg) as *mut u32).write_volatile(value) }
+        unsafe { mmio::write32(WINDOW + reg, value) }
     }
 
     /// The binding of RTC_LINE, level-triggered, to the channel at DRIVER.

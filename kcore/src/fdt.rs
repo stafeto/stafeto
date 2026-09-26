@@ -190,6 +190,9 @@ impl<'a> Fdt<'a> {
     }
 }
 
+/// The entries of the memory reservation block (`Fdt::reservations`):
+/// (address, size) pairs up to the pair of zeros that ends the block, or
+/// up to the end of the blob when a pair is cut short.
 pub struct Reservations<'a> {
     data: &'a [u8],
     off: usize,
@@ -206,6 +209,92 @@ impl Iterator for Reservations<'_> {
         }
         self.off += 16;
         Some((addr, size))
+    }
+}
+
+/// Writes blobs for tests: the tokens of a structure block in the order
+/// given, whether they nest or not, after a header of version 17 and an
+/// empty memory reservation block.
+#[cfg(test)]
+pub(crate) struct Builder {
+    structure: Vec<u8>,
+    strings: Vec<u8>,
+}
+
+#[cfg(test)]
+impl Builder {
+    pub(crate) fn new() -> Self {
+        Self {
+            structure: Vec::new(),
+            strings: Vec::new(),
+        }
+    }
+
+    fn token(mut self, token: u32) -> Self {
+        self.structure.extend(token.to_be_bytes());
+        self
+    }
+
+    fn pad(&mut self) {
+        self.structure.resize(align4(self.structure.len()), 0);
+    }
+
+    pub(crate) fn begin(mut self, name: &str) -> Self {
+        self = self.token(TOKEN_BEGIN_NODE);
+        self.structure.extend(name.as_bytes());
+        self.structure.push(0);
+        self.pad();
+        self
+    }
+
+    pub(crate) fn prop(mut self, name: &str, value: &[u8]) -> Self {
+        let nameoff = self.strings.len() as u32;
+        self.strings.extend(name.as_bytes());
+        self.strings.push(0);
+        self = self.token(TOKEN_PROP);
+        self.structure.extend((value.len() as u32).to_be_bytes());
+        self.structure.extend(nameoff.to_be_bytes());
+        self.structure.extend(value);
+        self.pad();
+        self
+    }
+
+    /// A property of big-endian 32-bit cells.
+    pub(crate) fn cells(self, name: &str, cells: &[u32]) -> Self {
+        let value: Vec<u8> = cells.iter().flat_map(|c| c.to_be_bytes()).collect();
+        self.prop(name, &value)
+    }
+
+    pub(crate) fn end(self) -> Self {
+        self.token(TOKEN_END_NODE)
+    }
+
+    /// The blob, with the END token after the tokens given.
+    pub(crate) fn finish(self) -> Vec<u8> {
+        let Builder { structure, strings } = self.token(TOKEN_END);
+        let rsvmap = HEADER_SIZE;
+        let off_struct = rsvmap + 16;
+        let off_strings = off_struct + structure.len();
+        let total = off_strings + strings.len();
+        let mut blob = Vec::new();
+        for word in [
+            MAGIC,
+            total as u32,
+            off_struct as u32,
+            off_strings as u32,
+            rsvmap as u32,
+            17,
+            16,
+            0,
+            strings.len() as u32,
+            structure.len() as u32,
+        ] {
+            blob.extend(word.to_be_bytes());
+        }
+        blob.resize(off_struct, 0);
+        blob.extend(structure);
+        blob.extend(strings);
+        blob
     }
 }
 
@@ -379,5 +468,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn too_deep_tree_is_an_error() {
+        let nested = |levels| {
+            let mut b = Builder::new();
+            for _ in 0..levels {
+                b = b.begin("n");
+            }
+            for _ in 0..levels {
+                b = b.end();
+            }
+            b.finish()
+        };
+        let deepest = nested(MAX_DEPTH);
+        assert_eq!(Fdt::new(&deepest).unwrap().walk(|_| {}), Ok(()));
+        let deeper = nested(MAX_DEPTH + 1);
+        assert_eq!(
+            Fdt::new(&deeper).unwrap().walk(|_| {}),
+            Err(FdtError::TooDeep)
+        );
+    }
+
+    #[test]
+    fn node_end_at_depth_zero_is_an_error() {
+        let blob = Builder::new().begin("").end().end().finish();
+        assert_eq!(
+            Fdt::new(&blob).unwrap().walk(|_| {}),
+            Err(FdtError::BadToken(TOKEN_END_NODE))
+        );
+    }
+
+    #[test]
+    fn block_end_inside_a_node_is_an_error() {
+        let blob = Builder::new().begin("").begin("child").end().finish();
+        assert_eq!(
+            Fdt::new(&blob).unwrap().walk(|_| {}),
+            Err(FdtError::Truncated)
+        );
     }
 }

@@ -5,6 +5,7 @@ pub mod backtrace;
 pub mod cache;
 pub mod exceptions;
 pub mod gic;
+pub mod mmio;
 pub mod mmu;
 #[cfg(any(feature = "fault-probe", feature = "overflow-probe"))]
 pub mod probe;

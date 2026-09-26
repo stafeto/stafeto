@@ -28,7 +28,7 @@ use abi::{Access, Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::PsciConduit;
+use kcore::bootinfo::{Gic, GicVersion, PsciConduit, Region};
 use kcore::frames::{MAX_ORDER, PhysMem};
 use kcore::gic::{Ack, DEFAULT_PRIORITY};
 use kcore::handles::{CHUNK, MAX_HANDLES};
@@ -515,12 +515,15 @@ fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
         info.uart_pl011.map(|r| r.base) == Some(0x0900_0000),
         "PL011 is not at 0x0900_0000",
     )?;
+    let gic = info.gic.ok_or("no GIC in the device tree")?;
+    let [dist, cpu] = gic.mapped();
+    check(gic.version == GicVersion::V2, "the GIC is not a GICv2")?;
     check(
-        info.gic_distributor.map(|r| r.base) == Some(0x0800_0000),
+        dist.base == 0x0800_0000,
         "GIC distributor is not at 0x0800_0000",
     )?;
     check(
-        info.gic_cpu_interface.map(|r| r.base) == Some(0x0801_0000),
+        cpu.base == 0x0801_0000,
         "GIC CPU interface is not at 0x0801_0000",
     )?;
     check(info.psci == PsciConduit::Hvc, "PSCI conduit is not HVC")?;
@@ -801,21 +804,23 @@ fn boot_stack_linear_map_and_devices_are_not_executable(boot: &Boot) -> Result<(
             "the linear map is unmapped or executable",
         )
     })?;
-    let info = &boot.info;
-    for dev in [
-        info.uart_pl011,
-        info.gic_distributor,
-        info.gic_cpu_interface,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for dev in devices(boot) {
         check(
             kernel_never_executes(LINEAR_BASE + dev.base as usize),
             "a device is unmapped or executable",
         )?;
     }
     Ok(())
+}
+
+/// The devices the kernel maps: the PL011 and the GIC's blocks
+/// (bootinfo::Gic::mapped).
+fn devices(boot: &Boot) -> impl Iterator<Item = Region> {
+    let gic = boot.info.gic.as_ref().map(Gic::mapped);
+    boot.info
+        .uart_pl011
+        .into_iter()
+        .chain(gic.into_iter().flatten())
 }
 
 fn console_is_device_memory(boot: &Boot) -> Result<(), &'static str> {
@@ -1423,15 +1428,7 @@ fn kernel_memory_is_closed_to_el0(boot: &Boot) -> Result<(), &'static str> {
             "EL0 reaches the linear map",
         )
     })?;
-    let info = &boot.info;
-    for dev in [
-        info.uart_pl011,
-        info.gic_distributor,
-        info.gic_cpu_interface,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for dev in devices(boot) {
         check(
             closed(LINEAR_BASE + dev.base as usize),
             "EL0 reaches a device",
