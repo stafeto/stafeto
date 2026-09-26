@@ -331,7 +331,9 @@ impl<T, const K: usize> Session<T, K> {
 /// the loop makes a timer on `channel` through that handle, so the service
 /// makes no other timer through a handle without a label there. Returns
 /// only on an error: receive's on `channel`, timer_create's or timer_set's
-/// for the heartbeat, INVALID_ARGS for a period of 0.
+/// for the heartbeat, INVALID_ARGS for a period of 0. The session of label
+/// 0, the clients through a handle without a label, gets no CLIENT_GONE
+/// and lasts as long as the loop.
 pub fn run<S: Service<K>, const N: usize, const K: usize>(
     channel: &Handle<Channel>,
     service: &mut S,
@@ -508,8 +510,8 @@ impl<'a> Beat<'a> {
         if h.period_ns == 0 {
             return Err(Error::InvalidArgs);
         }
-        let timer = sys::timer_create(channel, h.priority)?;
         let t0 = time::ticks_to_ns(time::now());
+        let timer = sys::timer_create(channel, h.priority)?;
         let mut beat = Beat {
             to: h.to,
             timer,

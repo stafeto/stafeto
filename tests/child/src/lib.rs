@@ -131,7 +131,10 @@ pub mod server {
     /// Role::Busy: the handler spins until a notification comes to handle
     /// 1, then answers; Role::Server answers BAD_STATE.
     pub const BUSY: u16 = 6;
-    pub const METHODS: [u16; 6] = [KEEP, ISSUE, RETURN, DEFER, SESSIONS, BUSY];
+    /// Replies status 0 and a copy of the service's channel without
+    /// TRANSFER, which the kernel refuses: the client gets ACCESS_DENIED.
+    pub const LEND: u16 = 7;
+    pub const METHODS: [u16; 7] = [KEEP, ISSUE, RETURN, DEFER, SESSIONS, BUSY, LEND];
     /// The sessions of the service, the handles and deferred replies a
     /// session holds, and the objects it gets, at most.
     pub const SESSIONS_MAX: usize = 2;

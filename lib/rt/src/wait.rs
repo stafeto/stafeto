@@ -58,9 +58,10 @@ impl Waiter {
     /// clock_now, passes (spec 10). An expiry of this timer counts once
     /// the counter reached the deadline (time::reached), where the kernel
     /// fires it, never earlier; one that comes before is stale, an earlier
-    /// wait's that timer_cancel left in the slot, and the wait goes on. Anything else ends the wait and cancels the timer. The
-    /// errors are timer_set's and receive's; a wait that failed in receive
-    /// leaves the timer cancelled.
+    /// wait's that timer_cancel left in the slot, and the wait goes on.
+    /// Anything else ends the wait and cancels the timer. The errors are
+    /// timer_set's and receive's; a wait that failed in receive leaves the
+    /// timer cancelled.
     pub fn receive_until(&self, channel: &Handle<Channel>, deadline: u64) -> Result<Waited, Error> {
         sys::timer_set(&self.timer, deadline)?;
         let got = loop {

@@ -22,7 +22,7 @@ use rt::startup::{Answered, Giver, StartError};
 use rt::wait::{Waited, Waiter};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 33] = [
+pub(crate) const TESTS: [Test; 35] = [
     ("dropped_handle_closes", dropped_handle_closes),
     ("into_raw_keeps_the_handle", into_raw_keeps_the_handle),
     ("borrowed_handle_stays_open", borrowed_handle_stays_open),
@@ -121,8 +121,16 @@ pub(crate) const TESTS: [Test; 33] = [
         deferred_reply_is_answered_when_its_session_goes,
     ),
     (
+        "service_answers_a_refused_reply_with_its_status",
+        service_answers_a_refused_reply_with_its_status,
+    ),
+    (
         "heartbeats_keep_their_absolute_period",
         heartbeats_keep_their_absolute_period,
+    ),
+    (
+        "missed_heartbeats_are_not_made_up",
+        missed_heartbeats_are_not_made_up,
     ),
     (
         "busy_handler_stops_the_heartbeat",
@@ -973,9 +981,21 @@ fn serving(
     more: Option<Gift>,
     with: impl FnOnce(&Kid, &Handle<Channel>) -> Outcome,
 ) -> Outcome {
+    serving_at(LEVEL, role, period, more, with)
+}
+
+/// `serving` with the child's thread at `priority`, up to LEVEL; its
+/// ceiling and the priority of its heartbeat's timer stay LEVEL.
+fn serving_at(
+    priority: u8,
+    role: Role,
+    period: u64,
+    more: Option<Gift>,
+    with: impl FnOnce(&Kid, &Handle<Channel>) -> Outcome,
+) -> Outcome {
     let c = channel(QUIET)?;
     let maker = copy(&c, Rights::SEND | Rights::DUPLICATE)?;
-    let kid = Kid::load(SERVER_QUOTA, 16, LEVEL)?;
+    let kid = Kid::load_under(SERVER_QUOTA, 16, LEVEL, priority)?;
     let first = Gift::Given(c.into_raw());
     let gifts = [first, more.unwrap_or(first)];
     let gifts = &gifts[..1 + usize::from(more.is_some())];
@@ -1059,28 +1079,67 @@ fn service_frees_a_session_on_client_gone() -> Outcome {
     })
 }
 
-/// Spec 5.4: a session holds at most HELD handles: past them the client
-/// gets LIMIT_REACHED, and the service goes on. The test service keeps
-/// two copies of the system resource, the third gets LIMIT_REACHED, and
-/// the next request is answered.
+/// Spec 5.4: a session holds at most HELD handles and deferred replies:
+/// past them the client gets LIMIT_REACHED, the service keeps nothing of
+/// the refused request, and it goes on. The test service keeps two copies
+/// of the system resource; the third gets LIMIT_REACHED and closes in the
+/// child, whose table ends as it was before. Then a DEFER of the same
+/// client gets LIMIT_REACHED at once: a thread of init above the child
+/// sends it, so a reply that never comes fails the test by its bound.
+/// The next request is answered.
 fn service_refuses_past_its_handle_limit_and_goes_on() -> Outcome {
-    serving(Role::Server, 0, None, |_, maker| {
+    reset_results();
+    let done = channel(QUIET)?;
+    let served = serving(Role::Server, 0, None, |kid, maker| {
         let c = client(maker, 0)?;
         let mut kept = [Status::Ok; server::HELD + 1];
-        for k in &mut kept {
+        let mut live = [0; 2];
+        for (i, k) in kept.iter_mut().enumerate() {
             let h = copy(&resource(), Rights::TRANSFER)?;
+            if i == server::HELD {
+                live[0] = kid_handles(kid)?;
+            }
             *k = ask_with(&c, server::KEEP, [h.erase()])?.0;
         }
+        live[1] = kid_handles(kid)?;
+        HANDLES[0].store(c.raw().0, Relaxed);
+        HANDLES[1].store(done.raw().0, Relaxed);
+        ASKED.store(server::DEFER.into(), Relaxed);
+        let w = waiter(&done)?;
+        let t = spawn(0, service_client, 0, HIGH, Policy::Fifo)?;
+        let heard = w.receive_until(&done, clock_now()? + BOUND_NS);
+        close(t)?;
         let after = ask(&c, server::SESSIONS);
         check(
             kept == [Status::Ok, Status::Ok, LIMIT],
             "the limit of handles of a session did not hold",
         )?;
         check(
+            live[1] == live[0],
+            "the service kept a handle it refused past its limit",
+        )?;
+        let [code, word, ..] = result(0);
+        check(
+            heard == Ok(Waited::Got(unlabeled(NOTIFIED, 1)))
+                && ended(0)
+                && code == 0
+                && status_of(word) == (LIMIT, 0),
+            "a deferred reply past the limit of a session was not refused",
+        )?;
+        check(
             after == Ok((Status::Ok, 1)),
             "the service did not go on after a refusal",
         )
-    })
+    });
+    close(done)?;
+    served
+}
+
+/// The live handles of the process of `kid`.
+fn kid_handles(kid: &Kid) -> Result<u64, &'static str> {
+    sys::process_handles(&kid.process)
+        .map(|t| t.live)
+        .map_err(|_| "object_info(PROCESS_HANDLES) of the child failed")
 }
 
 /// Spec 5.4: the table of sessions has a fixed size: a client past it
@@ -1133,30 +1192,38 @@ fn issued_objects_are_limited_per_session() -> Outcome {
     })
 }
 
-/// Spec 13.8: a request of a method the service does not have gets
-/// UNKNOWN_METHOD, one of another version BAD_VERSION, and the service
-/// goes on.
+/// Spec 13.2, 13.8: a request of a method the service does not have gets
+/// UNKNOWN_METHOD, one of another version BAD_VERSION, the refusals make
+/// no session, and the service goes on. Client 0 is refused twice; then
+/// clients 1 and 2 fill the table of two, and client 0 is past it.
 fn service_answers_an_unknown_method() -> Outcome {
     serving(Role::Server, 0, None, |_, maker| {
-        let c = client(maker, 0)?;
+        let clients = [client(maker, 0)?, client(maker, 1)?, client(maker, 2)?];
         let unknown = Header::new(99, server::VERSION).bytes();
         let other = Header::new(server::SESSIONS, server::VERSION + 1).bytes();
-        let refused = [unknown, other].map(|b| asked(&c, &b, Outgoing::new()).map(|a| a.0));
-        let after = ask(&c, server::SESSIONS);
+        let refused =
+            [unknown, other].map(|b| asked(&clients[0], &b, Outgoing::new()).map(|a| a.0));
+        let after = [1, 2, 0].map(|i| ask(&clients[i], server::SESSIONS));
         check(
             refused == [Ok(Status::UnknownMethod), Ok(Status::BadVersion)],
             "an unknown method or another version was not refused",
         )?;
         check(
-            after == Ok((Status::Ok, 1)),
+            after[..2] == [Ok((Status::Ok, 1)), Ok((Status::Ok, 2))],
+            "a request refused for its header made a session",
+        )?;
+        check(
+            matches!(after[2], Ok((LIMIT, _))),
             "the service did not go on after a refusal",
         )
     })
 }
 
 /// Spec 13.8: a request shorter than its header, one whose header has
-/// bytes 4..8 other than zero, and one longer than its method takes get
-/// BAD_SIZE, and the service goes on.
+/// bytes 4..8 other than zero, and ones longer than their method takes,
+/// in registers and past them in the message buffer, get BAD_SIZE, and
+/// the service goes on. The request of 72 bytes reaches the handler only
+/// when the loop reads its header from the buffer.
 fn service_refuses_a_short_request() -> Outcome {
     serving(Role::Server, 0, None, |_, maker| {
         let c = client(maker, 0)?;
@@ -1165,11 +1232,13 @@ fn service_refuses_a_short_request() -> Outcome {
         dirty[7] = 1;
         let mut long = [0; 12];
         long[..8].copy_from_slice(&header);
-        let sizes =
-            [&header[..4], &dirty, &long].map(|b| asked(&c, b, Outgoing::new()).map(|a| a.0));
+        let mut longer = [0; 72];
+        longer[..8].copy_from_slice(&header);
+        let sizes = [&header[..4], &dirty, &long, &longer]
+            .map(|b| asked(&c, b, Outgoing::new()).map(|a| a.0));
         let after = ask(&c, server::SESSIONS);
         check(
-            sizes == [Ok(Status::BadSize); 3],
+            sizes == [Ok(Status::BadSize); 4],
             "a request of the wrong size was not refused with BAD_SIZE",
         )?;
         check(
@@ -1227,6 +1296,42 @@ fn deferred_reply_is_answered_when_its_session_goes() -> Outcome {
         check(
             code == 0 && status_of(word) == (Status::Kernel(Error::PeerClosed), 0),
             "the deferred request was not answered with PEER_CLOSED",
+        )
+    });
+    close(done)?;
+    served
+}
+
+/// Spec 6.1, 13.2: a reply the kernel refuses for the service's own
+/// handles goes to the client as a status with the token that came back,
+/// and the service goes on. LEND replies a copy of the service's channel
+/// without TRANSFER; a thread of init above the child asks for it, so a
+/// reply that never comes fails the test by its bound.
+fn service_answers_a_refused_reply_with_its_status() -> Outcome {
+    reset_results();
+    let done = channel(QUIET)?;
+    let served = serving(Role::Server, 0, None, |_, maker| {
+        let c = client(maker, 0)?;
+        HANDLES[0].store(c.raw().0, Relaxed);
+        HANDLES[1].store(done.raw().0, Relaxed);
+        ASKED.store(server::LEND.into(), Relaxed);
+        let w = waiter(&done)?;
+        let t = spawn(0, service_client, 0, HIGH, Policy::Fifo)?;
+        let heard = w.receive_until(&done, clock_now()? + BOUND_NS);
+        close(t)?;
+        let after = ask(&c, server::SESSIONS);
+        let [code, word, ..] = result(0);
+        check(
+            heard == Ok(Waited::Got(unlabeled(NOTIFIED, 1))) && ended(0),
+            "the refused reply was not answered",
+        )?;
+        check(
+            code == 0 && status_of(word) == (Status::Kernel(Error::AccessDenied), 0),
+            "the refused reply was not answered with ACCESS_DENIED",
+        )?;
+        check(
+            after == Ok((Status::Ok, 1)),
+            "the service did not go on after a refused reply",
         )
     });
     close(done)?;
@@ -1308,6 +1413,58 @@ fn heartbeats_keep_their_absolute_period() -> Outcome {
             token = heartbeat_now(kid)?;
         }
         beat_back(token)
+    })
+}
+
+/// Whether the channel of `kid` holds nothing now but late expiries of
+/// its `Ear`.
+fn kid_silent(kid: &Kid) -> bool {
+    loop {
+        match kid.ear.now() {
+            Ok(Received::Notification {
+                source: Source::Timer,
+                ..
+            }) => continue,
+            other => return other == Err(Error::WouldBlock),
+        }
+    }
+}
+
+/// Spec 10, 13.4: deadlines of the heartbeat that passed while the
+/// service could not send are not made up in a burst, and the timer's
+/// slot has the priority the heartbeat names. The child runs at LOW, its
+/// heartbeat's timer at LEVEL: while init holds a HEARTBEAT, the child
+/// waits in send at LEVEL, the boost its timer's expiry gave it. Init
+/// holds the reply two and a quarter periods past the last deadline,
+/// answers, and lets the child run until it waits again: a timer armed at
+/// a deadline that passed fires at once, and its HEARTBEAT would be there
+/// by then; the first deadline after now is three quarters of a period
+/// ahead, and its HEARTBEAT comes by half a period past it.
+fn missed_heartbeats_are_not_made_up() -> Outcome {
+    serving_at(LOW, Role::Server, PERIOD_NS, None, |kid, _| {
+        let pause = channel(QUIET)?;
+        let w = Waiter::new(&pause, 0, 1).map_err(|_| "Waiter::new failed")?;
+        let wait_until = |at: u64| match w.receive_until(&pause, at) {
+            Ok(Waited::Expired) => Ok(()),
+            _ => Err("a pause of the test did not end at its deadline"),
+        };
+        let (_, token) = heartbeat(kid)?;
+        let priority = sys::thread_info(&kid.thread).map(|i| i.priority);
+        let t0 = kid_mark(child::SERVED_AT);
+        let last = next_release(t0, PERIOD_NS, clock_now()?) - PERIOD_NS;
+        wait_until(last + 2 * PERIOD_NS + PERIOD_NS / 4)?;
+        beat_back(token)?;
+        let_run()?;
+        let silent = kid_silent(kid);
+        let due = next_release(t0, PERIOD_NS, clock_now()?);
+        wait_until(due + PERIOD_NS / 2)?;
+        let next = heartbeat_now(kid).and_then(beat_back);
+        check(
+            priority == Ok(LEVEL),
+            "the timer of the heartbeat did not wake the loop at its priority",
+        )?;
+        check(silent, "missed heartbeats were made up in a burst")?;
+        next
     })
 }
 

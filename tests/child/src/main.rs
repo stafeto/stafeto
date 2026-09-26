@@ -853,6 +853,7 @@ fn serve_sessions(s: &Start, busy: bool) -> u64 {
     });
     let mut server = Server {
         clients: 0,
+        own: Handle::borrowed(s.handles[0]),
         spin: busy.then(|| Handle::borrowed(s.handles[1])),
     };
     let config = Config {
@@ -863,10 +864,12 @@ fn serve_sessions(s: &Start, busy: bool) -> u64 {
     service::run::<_, { server::SESSIONS_MAX }, { server::HELD }>(&c, &mut server, config).code()
 }
 
-/// The test service (child::server): the clients with a session, and for
-/// Role::Busy the channel its handler of BUSY spins on.
+/// The test service (child::server): the clients with a session, a view
+/// of its channel, and for Role::Busy the channel its handler of BUSY
+/// spins on.
 struct Server {
     clients: u32,
+    own: ManuallyDrop<Handle<Channel>>,
     spin: Option<ManuallyDrop<Handle<Channel>>>,
 }
 
@@ -926,6 +929,15 @@ impl Service<{ server::HELD }> for Server {
                     Answer::Status(Status::Ok)
                 }
                 None => Answer::Status(Status::Kernel(Error::BadState)),
+            },
+            server::LEND => match sys::handle_duplicate(&*self.own, Rights::SEND) {
+                Ok(copy) => {
+                    let w = r.reply();
+                    // Four bytes fit.
+                    let _ = w.u32(Status::Ok.code());
+                    Answer::Reply([copy.erase()].into())
+                }
+                Err(e) => Answer::Status(Status::Kernel(e)),
             },
             _ => Answer::Status(Status::UnknownMethod),
         }
