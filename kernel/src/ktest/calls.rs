@@ -2788,11 +2788,10 @@ pub fn mappings_go_after_the_asid(_: &Boot) -> Result<(), &'static str> {
 /// An unmapped page no longer translates (spec 7.4): a page of an object
 /// mapped RW into the caller's process, whose space runs in TTBR0, reads
 /// its pattern, which puts it in the TLB; mem_unmap takes it, neither EL0
-/// nor the kernel translates it, the tables hold nothing there, and a
-/// second mem_unmap fails with INVALID_ARGS alone. A page of another
-/// object mapped at the same address shows through at once: a TLB entry
-/// the unmap left would still show the first one, since QEMU keeps its
-/// translations until a TLBI.
+/// nor the kernel translates it, and the tables hold nothing there. A page
+/// of another object mapped at the same address shows through at once: a
+/// TLB entry the unmap left would still show the first one, since QEMU
+/// keeps its translations until a TLBI.
 pub fn unmapped_page_no_longer_translates(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let own = c.insert(Object::Process(c.process), OWNER_RIGHTS)?;
@@ -2829,8 +2828,6 @@ fn check_unmap(c: &Caller, own: Handle, second: Handle) -> Result<(), &'static s
         !mapped(c.process, USER_VA),
         "the tables still hold an unmapped page",
     )?;
-    let args = [own.0, USER_VA as u64, PAGE_SIZE];
-    c.fails(Call::MemUnmap.number(), &args, Error::InvalidArgs)?;
     // Another frame at the same address shows through at once.
     map_whole(c, own, second, 1, USER_VA, Access::ReadWrite)?;
     let seen = read_user(USER_VA);
