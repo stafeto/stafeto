@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Kernel tests of the system calls (spec 11, 12). The kernel makes each
-//! call for a thread that never runs, as if the thread had made it, and
-//! checks every register the call may write: on an error only x0 changes,
-//! on success x0 is 0 and the values follow in x1 and up. The same calls
-//! from EL0 are in `el0`.
+//! Kernel tests of the system calls (spec 11, 12) for what a program does
+//! not see or cannot reach: a caller whose ceiling is below 63, a caller
+//! whose table is full or whose quota is spent, who pays for what, and the
+//! kernel's own state after a call. The contract of the calls, the order
+//! of their checks, their rights and that on an error only x0 changes, is
+//! the test init's (tests/init), which makes the calls from EL0 on the
+//! kernel that ships. The kernel makes each call here for a thread that
+//! never runs, as if the thread had made it, and checks every register the
+//! call may write.
 
 use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
 use crate::arch::timer;
@@ -28,7 +32,7 @@ use abi::{
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::handles::CHUNK;
-use kcore::layout::{LINEAR_BASE, USER_END};
+use kcore::layout::LINEAR_BASE;
 use kcore::paging::{Attrs, page_descriptor};
 use kcore::sched::State;
 use kcore::token::MAX_COUNT;
@@ -217,65 +221,26 @@ fn debug_write_cases(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static st
     c.succeeds(n, &args, &[1])
 }
 
-/// PROCESS_STATE of a live process: four zeros in x1-x4, whatever rights
-/// the handle carries. Unknown kinds, a nonzero x2 and handles to other
-/// objects fail.
-pub fn object_info_reports_a_live_process(_: &Boot) -> Result<(), &'static str> {
-    with_caller(|c| {
-        let own = c.insert(Object::Process(c.process), Rights::NONE)?;
-        let resource = c.insert(Object::Resource, Rights::DEBUG)?;
-        let thread = c.insert(Object::Thread(c.thread), OWNER_RIGHTS)?;
-        let result = object_info_cases(c, [own, resource, thread]);
-        c.close(own)?;
-        c.close(thread)?;
-        result
-    })
-}
-
-fn object_info_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str> {
-    let [own, resource, thread] = handles.map(|h| h.0);
-    let n = Call::ObjectInfo.number();
-    let state = INFO_PROCESS_STATE;
-    c.fails(n, &[own, 0, 0], Error::InvalidArgs)?;
-    c.fails(n, &[own, INFO_KERNEL_STATS + 1, 0], Error::InvalidArgs)?;
-    c.fails(n, &[own, state | 1 << 32, 0], Error::InvalidArgs)?;
-    c.fails(n, &[own, state, 8], Error::InvalidArgs)?;
-    c.fails(n, &[0, 0, 0], Error::InvalidArgs)?;
-    c.fails(n, &[0, state, 0], Error::BadHandle)?;
-    c.fails(n, &[resource, state, 0], Error::WrongType)?;
-    c.fails(n, &[thread, state, 0], Error::WrongType)?;
-    c.succeeds(n, &[own, state, 0], &ProcessState::Alive.to_words())
-}
-
-/// PROCESS_MEMORY and PROCESS_HANDLES take a process handle with any
-/// rights and return its quota and its table in x1-x3; KERNEL_STATS takes
-/// the system resource with KSTATS and returns what the kernel counts in
-/// x1-x7 (spec 11, 16). The kind and x2 come before the handle, a wrong
-/// type before a missing right, and x8 and x9 keep their marks.
-pub fn object_info_reports_memory_handles_and_statistics(_: &Boot) -> Result<(), &'static str> {
+/// object_info reports what the kernel counts (spec 11, 16): PROCESS_MEMORY
+/// the quota of the caller's process as its account holds it,
+/// PROCESS_HANDLES its table, KERNEL_STATS in x1-x8 the counters of the
+/// scheduler, the cleanup queue, the frame allocator, the pools and the
+/// timers, each in its word. The order of the checks is the test init's
+/// (object_info_checks_its_arguments).
+pub fn object_info_reports_what_the_kernel_counts(_: &Boot) -> Result<(), &'static str> {
     with_caller(|c| {
         let own = c.insert(Object::Process(c.process), Rights::NONE)?;
         let stats = c.insert(Object::Resource, Rights::KSTATS)?;
-        let debug = c.insert(Object::Resource, Rights::DEBUG)?;
-        let result = info_kinds_cases(c, [own, stats, debug]);
+        let result = counted_cases(c, [own, stats]);
         c.close(own)?;
         result
     })
 }
 
-fn info_kinds_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str> {
-    let [own, stats, debug] = handles.map(|h| h.0);
+fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
+    let [own, stats] = handles.map(|h| h.0);
     let n = Call::ObjectInfo.number();
     let (memory, table, kernel) = (INFO_PROCESS_MEMORY, INFO_PROCESS_HANDLES, INFO_KERNEL_STATS);
-    for kind in [memory, table, kernel] {
-        c.fails(n, &[own, kind, 1], Error::InvalidArgs)?;
-        c.fails(n, &[0, kind, 1], Error::InvalidArgs)?;
-        c.fails(n, &[0, kind, 0], Error::BadHandle)?;
-    }
-    c.fails(n, &[stats, memory, 0], Error::WrongType)?;
-    c.fails(n, &[stats, table, 0], Error::WrongType)?;
-    c.fails(n, &[own, kernel, 0], Error::WrongType)?;
-    c.fails(n, &[debug, kernel, 0], Error::AccessDenied)?;
     let q = process::quota(c.process);
     let quota = ProcessMemory {
         quota: q.limit(),
@@ -288,7 +253,7 @@ fn info_kinds_cases(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str
     )?;
     c.succeeds(n, &[own, memory, 0], &quota.to_words())?;
     let table_now = ProcessHandles {
-        live: 3,
+        live: 2,
         retired: 0,
         limit: LIMIT.into(),
     };
@@ -432,12 +397,14 @@ fn init_handle_cases(c: &Caller) -> Result<(), &'static str> {
     check(fresh, "the boot image's entry came back at another value")
 }
 
-/// thread_set_priority checks the values first, then the handle, then the
-/// two ceilings, the target thread's process's and the caller's, then the
-/// thread's state (spec 11). A stopped thread only takes the new values.
-/// The caller's process has ceiling 30; the target threads' processes 20
-/// and 63.
-pub fn thread_set_priority_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+/// thread_set_priority stops at the ceiling of the caller's process as
+/// well as at that of the thread's (spec 8, 11): a caller under ceiling 30
+/// gives a thread of a process under 63 no more than 30, ACCESS_DENIED at
+/// 31. A stopped thread only takes the new values. The caller's process
+/// has ceiling 30; the target threads' processes 20 and 63. The rest of
+/// the call's checks are the test
+/// init's (thread_set_priority_checks_its_arguments).
+pub fn thread_set_priority_checks_the_callers_ceiling(_: &Boot) -> Result<(), &'static str> {
     let callers = [30, 20, 63].map(Caller::with_ceiling);
     let result = match &callers {
         [Ok(c), Ok(low), Ok(high)] => set_priority_handles(c, low, high),
@@ -453,31 +420,18 @@ fn set_priority_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), &
     let handles = [
         c.insert(Object::Thread(low.thread), Rights::MANAGE)?,
         c.insert(Object::Thread(high.thread), Rights::MANAGE)?,
-        c.insert(Object::Thread(low.thread), Rights::DUPLICATE)?,
-        c.insert(Object::Resource, Rights::DEBUG)?,
-        c.insert(Object::Resource, Rights::DEBUG)?,
     ];
-    c.close(handles[4])?;
     set_priority_cases(c, low.thread, handles)
 }
 
 fn set_priority_cases(
     c: &Caller,
     low: NonNull<Thread>,
-    handles: [Handle; 5],
+    handles: [Handle; 2],
 ) -> Result<(), &'static str> {
-    let [to_low, to_high, no_manage, resource, closed] = handles.map(|h| h.0);
+    let [to_low, to_high] = handles.map(|h| h.0);
     let n = Call::ThreadSetPriority.number();
-    let (rr, fifo) = (Policy::RoundRobin as u64, Policy::Fifo as u64);
-    for (priority, policy) in [(0, rr), (64, rr), (0x100 | 10, rr), (10, 2), (10, 1 << 32)] {
-        c.fails(n, &[to_low, priority, policy], Error::InvalidArgs)?;
-    }
-    c.fails(n, &[closed, 64, rr], Error::InvalidArgs)?;
-    c.fails(n, &[closed, 10, rr], Error::BadHandle)?;
-    c.fails(n, &[resource, 10, rr], Error::WrongType)?;
-    c.fails(n, &[no_manage, 10, rr], Error::AccessDenied)?;
-    // Above the ceiling of the target's process, 20, under the caller's.
-    c.fails(n, &[to_low, 21, rr], Error::AccessDenied)?;
+    let rr = Policy::RoundRobin as u64;
     // Under the ceiling of the target's process, 63, above the caller's.
     c.fails(n, &[to_high, 31, rr], Error::AccessDenied)?;
     c.succeeds(n, &[to_high, 30, rr], &[])?;
@@ -490,23 +444,19 @@ fn set_priority_cases(
             && t.sched.policy() == Policy::RoundRobin
             && t.sched.state() == State::Stopped,
         "a stopped thread did not take its new priority and policy",
-    )?;
-    // A thread that ended: BAD_STATE, which comes after the ceilings.
-    sched::start(low).map_err(|_| "the thread did not start")?;
-    // SAFETY: the test holds its own reference to the thread.
-    unsafe { sched::exit(low, CAUSE) };
-    c.fails(n, &[to_low, 21, fifo], Error::AccessDenied)?;
-    c.fails(n, &[to_low, 20, fifo], Error::BadState)
+    )
 }
 
-/// process_create checks the values first, then the exit channel and the
-/// start channel, then the ceiling against the caller's, then the quotas
-/// (spec 11); a good call returns a handle with the owner's rights to a
-/// live process with the ceiling given, a child of the caller's process
-/// (spec 4). With the caller's table full it fails with LIMIT_REACHED, and
-/// the new process goes again. The caller's ceiling is 30. Channels in x3
-/// and x5 have cases of their own (`exit_and_start_cases`).
-pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+/// process_create stops at the caller's limits (spec 7.5, 11): a ceiling
+/// above the caller's, 30 here, fails with ACCESS_DENIED after the
+/// handles and before the quota; with the caller's table full the call
+/// fails with LIMIT_REACHED, and the new process goes again. A good call
+/// returns a handle with the owner's rights to a live process with the
+/// ceiling given, a child of the caller's process (spec 4). Channels in
+/// x3 and x5 have cases of their own (`exit_and_start_cases`). The rest of
+/// the call's checks are the test
+/// init's (process_create_checks_its_arguments and its neighbours).
+pub fn process_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
     let c = Caller::with_ceiling(30)?;
     let result = process_create_cases(&c).and_then(|()| exit_and_start_cases(&c));
@@ -521,39 +471,9 @@ pub fn process_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str>
 fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
     let page = PAGE_SIZE;
-    let resource = c.insert(Object::Resource, Rights::DEBUG)?.0;
     let closed = c.insert(Object::Resource, Rights::DEBUG)?;
     c.close(closed)?;
     let closed = closed.0;
-    for [quota, limit, ceiling] in [
-        [0, 16, 20],
-        [page - 1, 16, 20],
-        [page + 8, 16, 20],
-        [page, 0, 20],
-        [page, 16_385, 20],
-        [page, 1 << 32 | 16, 20],
-        [page, 16, 0],
-        [page, 16, 64],
-        [page, 16, 0x100 | 20],
-    ] {
-        c.fails(n, &[quota, limit, ceiling, 0, 0, 0], Error::InvalidArgs)?;
-        // Values come before handles.
-        c.fails(
-            n,
-            &[quota, limit, ceiling, closed, 5, closed],
-            Error::InvalidArgs,
-        )?;
-    }
-    // A notification priority without a channel, a channel without one.
-    c.fails(n, &[page, 16, 20, 0, 5, 0], Error::InvalidArgs)?;
-    c.fails(n, &[page, 16, 20, closed, 0, 0], Error::InvalidArgs)?;
-    c.fails(n, &[page, 16, 20, closed, 5, 0], Error::BadHandle)?;
-    // The system resource is no channel.
-    c.fails(n, &[page, 16, 20, resource, 5, 0], Error::WrongType)?;
-    c.fails(n, &[page, 16, 20, 0, 0, closed], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 20, 0, 0, resource], Error::WrongType)?;
-    // The exit channel comes before the start channel.
-    c.fails(n, &[page, 16, 20, resource, 5, closed], Error::WrongType)?;
     // Handles come before the ceiling.
     c.fails(n, &[page, 16, 31, closed, 5, 0], Error::BadHandle)?;
     c.fails(n, &[page, 16, 31, 0, 0, closed], Error::BadHandle)?;
@@ -856,16 +776,16 @@ fn with_full_table(c: &Caller, n: u16, args: &[u64]) -> Result<(), &'static str>
     result
 }
 
-/// thread_create checks the values first (entry, stack, priority, policy,
-/// buffer), then the handle to the process, then the ceilings of that
-/// process and of the caller, then whether the buffer's page is free there
-/// (spec 11). A good call makes a stopped thread whose buffer is a zeroed
+/// thread_create stops at the caller's limits (spec 8, 11): a priority
+/// above the ceiling of the caller's process, 30 here, fails with
+/// ACCESS_DENIED for a process under 63; with the caller's table full the
+/// call fails with LIMIT_REACHED, and the new thread and its page go
+/// again. A good call makes a stopped thread whose buffer is a zeroed
 /// page, readable and writable, never executable, and returns a handle
-/// with the owner's rights; the page goes with the thread. With the
-/// caller's table full it fails with LIMIT_REACHED, and the new thread and
-/// its page go again. The caller's ceiling is 30; the target processes
-/// have 20 and 63.
-pub fn thread_create_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+/// with the owner's rights; the page goes with the thread. The target
+/// processes have ceilings 20 and 63. The rest of the call's checks are
+/// the test init's (thread_create_checks_its_arguments).
+pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let callers = [30, 20, 63].map(Caller::with_ceiling);
     let result = match &callers {
         [Ok(c), Ok(low), Ok(high)] => thread_create_handles(c, low, high),
@@ -881,11 +801,7 @@ fn thread_create_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), 
     let handles = [
         c.insert(Object::Process(low.process), Rights::MANAGE)?,
         c.insert(Object::Process(high.process), Rights::MANAGE)?,
-        c.insert(Object::Process(low.process), Rights::DUPLICATE)?,
-        c.insert(Object::Thread(low.thread), Rights::MANAGE)?,
-        c.insert(Object::Resource, Rights::DEBUG)?,
     ];
-    c.close(handles[4])?;
     thread_create_cases(c, low.process, handles)
 }
 
@@ -905,42 +821,15 @@ fn thread_args(
 fn thread_create_cases(
     c: &Caller,
     low: NonNull<Process>,
-    handles: [Handle; 5],
+    handles: [Handle; 2],
 ) -> Result<(), &'static str> {
-    let [to_low, to_high, no_manage, thread, closed] = handles.map(|h| h.0);
+    let [to_low, to_high] = handles.map(|h| h.0);
     let n = Call::ThreadCreate.number();
-    let (entry, stack, top) = (USER_VA as u64, 0x80_1000, USER_END as u64);
-    // Each bad value with a good handle and with a closed one: values
-    // come before handles.
-    for h in [to_low, closed] {
-        for args in [
-            thread_args(h, top, stack, 10, FIFO, BUFFER),
-            thread_args(h, entry + 2, stack, 10, FIFO, BUFFER),
-            thread_args(h, entry, stack - 8, 10, FIFO, BUFFER),
-            thread_args(h, entry, top + 16, 10, FIFO, BUFFER),
-            thread_args(h, entry, stack, 0, FIFO, BUFFER),
-            thread_args(h, entry, stack, 64, FIFO, BUFFER),
-            thread_args(h, entry, stack, 10, 2, BUFFER),
-            thread_args(h, entry, stack, 10, FIFO, BUFFER + 8),
-            thread_args(h, entry, stack, 10, FIFO, top),
-            thread_args(h, entry, stack, 10, FIFO, 0),
-        ] {
-            c.fails(n, &args, Error::InvalidArgs)?;
-        }
-    }
-    let good = |h, priority| thread_args(h, entry, stack, priority, FIFO, BUFFER);
-    c.fails(n, &good(closed, 10), Error::BadHandle)?;
-    c.fails(n, &good(thread, 10), Error::WrongType)?;
-    c.fails(n, &good(no_manage, 10), Error::AccessDenied)?;
-    // Above the target's ceiling, 20, under the caller's; then above the
-    // caller's, 30, under the target's.
-    c.fails(n, &good(to_low, 21), Error::AccessDenied)?;
+    let good = |h, priority| thread_args(h, USER_VA as u64, 0x80_1000, priority, FIFO, BUFFER);
+    // Above the caller's ceiling, 30, under the target's.
     c.fails(n, &good(to_high, 31), Error::AccessDenied)?;
     let h = c.created(n, &good(to_low, 20))?;
     let result = new_thread_cases(c, low, h);
-    // The page is taken: INVALID_ARGS, which comes after the ceilings.
-    c.fails(n, &good(to_low, 20), Error::InvalidArgs)?;
-    c.fails(n, &good(to_low, 21), Error::AccessDenied)?;
     c.close(h)?;
     result?;
     cleanup::drain();
@@ -1019,11 +908,10 @@ pub fn buffer_that_does_not_map_goes_back(_: &Boot) -> Result<(), &'static str> 
 /// thread leaves the queue, a stopped one ends where it is (spec 11), both
 /// in the call. The process's space and its threads' buffers go with the
 /// cleanup at the caller's level, which runs before the caller does again:
-/// here the test runs the queue itself. Handles keep the shells, and
-/// object_info reports «killed». Killing it again succeeds; thread_start,
-/// thread_create and thread_set_priority find it and its threads ended
-/// (BAD_STATE). thread_start and process_kill check their handles first.
-/// A running thread's case is `process_kills_itself` at EL0.
+/// here the test runs the queue itself. Until then thread_create finds the
+/// process ended (BAD_STATE) and makes nothing. A running thread's case is
+/// `process_kills_itself` at EL0; the reason and the handles of the calls
+/// are the test init's.
 pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(kill_cases)?;
@@ -1057,44 +945,26 @@ fn kill_objects(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str> {
     let [child, ready, stopped] = handles;
     // SAFETY: the caller's process is the test's.
     let p = unsafe { c.process.as_ref() };
-    let (Ok(cp), Ok(tr), Ok(ts)) = (
-        p.lookup(child, OWNER_RIGHTS, Object::process),
+    let (Ok(tr), Ok(ts)) = (
         p.lookup(ready, OWNER_RIGHTS, Object::thread),
         p.lookup(stopped, OWNER_RIGHTS, Object::thread),
     ) else {
-        return Err("the new handles do not name their objects");
+        return Err("the new handles do not name their threads");
     };
-    let weak = [
-        c.insert(Object::Process(cp), Rights::DUPLICATE)?,
-        c.insert(Object::Thread(tr), Rights::DUPLICATE)?,
-    ];
-    let result = kill_calls(c, handles, weak, [tr, ts]);
-    for h in weak {
-        c.close(h)?;
-    }
-    result
+    kill_calls(c, [child, ready], [tr, ts])
 }
 
 fn kill_calls(
     c: &Caller,
-    [child, ready, stopped]: [Handle; 3],
-    [weak_child, weak_thread]: [Handle; 2],
+    [child, ready]: [Handle; 2],
     [tr, ts]: [NonNull<Thread>; 2],
 ) -> Result<(), &'static str> {
-    let start = Call::ThreadStart.number();
-    c.fails(start, &[0], Error::BadHandle)?;
-    c.fails(start, &[child.0], Error::WrongType)?;
-    c.fails(start, &[weak_thread.0], Error::AccessDenied)?;
-    c.succeeds(start, &[ready.0], &[])?;
-    c.fails(start, &[ready.0], Error::BadState)?;
+    c.succeeds(Call::ThreadStart.number(), &[ready.0], &[])?;
     check(
         sched::first(10) == Some(tr),
         "a started thread is not ready",
     )?;
     let kill = Call::ProcessKill.number();
-    c.fails(kill, &[0], Error::BadHandle)?;
-    c.fails(kill, &[ready.0], Error::WrongType)?;
-    c.fails(kill, &[weak_child.0], Error::AccessDenied)?;
     let frames = phys::free_frames();
     c.succeeds(kill, &[child.0], &[])?;
     // SAFETY: the handles hold the threads.
@@ -1123,15 +993,7 @@ fn kill_calls(
     check(
         phys::free_frames() == frames + 6,
         "the killed process kept its tables or its threads' buffers",
-    )?;
-    let info = Call::ObjectInfo.number();
-    let killed = ProcessState::Killed.to_words();
-    c.succeeds(info, &[child.0, INFO_PROCESS_STATE, 0], &killed)?;
-    c.succeeds(kill, &[child.0], &[])?;
-    c.fails(start, &[stopped.0], Error::BadState)?;
-    c.fails(Call::ThreadCreate.number(), &args, Error::BadState)?;
-    let set = Call::ThreadSetPriority.number();
-    c.fails(set, &[ready.0, 10, FIFO], Error::BadState)
+    )
 }
 
 /// process_kill of a process that ended before hastens its teardown
@@ -1237,17 +1099,14 @@ fn with_quota_left(
     result
 }
 
-/// channel_create, notify and receive check in the order of spec 11 and
-/// change x0 alone on an error: values first (a priority outside 1-63, bit
-/// 63 of the bits, flags other than NO_WAIT), then the handle (BAD_HANDLE,
-/// WRONG_TYPE, ACCESS_DENIED without NOTIFY or RECEIVE), then the ceiling
-/// (a priority above the caller's 30), then the caller's table
-/// (LIMIT_REACHED) and its quota for a page of its pool of channels
-/// (NO_MEMORY), with nothing made. A good channel_create returns a handle
-/// with abi::CHANNEL_RIGHTS to a channel the caller pays for; notify
-/// returns nothing; receive with NO_WAIT on an empty channel fails with
-/// WOULD_BLOCK, and otherwise returns the notification in x1-x11.
-pub fn channel_calls_check_their_arguments(_: &Boot) -> Result<(), &'static str> {
+/// channel_create stops at the caller's limits (spec 7.8, 11): a priority
+/// above the ceiling of the caller's process, 30 here, fails with
+/// ACCESS_DENIED; with the caller's table full it fails with
+/// LIMIT_REACHED, and with its quota spent with NO_MEMORY for a page of
+/// its pool of channels, with nothing made. A good call returns a handle
+/// with abi::CHANNEL_RIGHTS to a channel the caller pays for. The rest of
+/// the checks of channel_create, notify and receive are the test init's.
+pub fn channel_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let channels = channel::in_use();
     let c = Caller::with_ceiling(30)?;
     let result = channel_create_cases(&c);
@@ -1261,9 +1120,6 @@ pub fn channel_calls_check_their_arguments(_: &Boot) -> Result<(), &'static str>
 
 fn channel_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::CreateChannel.number();
-    for priority in [0, 64, 0x100 | 10] {
-        c.fails(n, &[priority], Error::InvalidArgs)?;
-    }
     c.fails(n, &[31], Error::AccessDenied)?;
     // The table's first page of blocks, so that the page below is the
     // pool's.
@@ -1285,50 +1141,11 @@ fn channel_create_cases(c: &Caller) -> Result<(), &'static str> {
         check(
             rights.is_ok() && channel::payer(ch) == c.process,
             "the handle does not carry the channel's rights, or the caller does not pay",
-        )?;
-        let notify_only = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
-        let receive_only = c.insert(Object::Channel(ch), Rights::RECEIVE)?;
-        let result = notify_receive_cases(c, [h, notify_only, receive_only, resource]);
-        c.close(notify_only)?;
-        c.close(receive_only)?;
-        result
+        )
     });
     c.close(h)?;
     c.close(resource)?;
     result
-}
-
-fn notify_receive_cases(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static str> {
-    let [h, notify_only, receive_only, resource] = handles.map(|h| h.0);
-    let closed = c.insert(Object::Resource, Rights::NONE)?;
-    c.close(closed)?;
-    let closed = closed.0;
-    let (notify, receive) = (Call::Notify.number(), Call::Receive.number());
-    c.fails(notify, &[closed, 1 << 63], Error::InvalidArgs)?;
-    c.fails(notify, &[closed, 1], Error::BadHandle)?;
-    c.fails(notify, &[resource, 1], Error::WrongType)?;
-    c.fails(notify, &[receive_only, 1], Error::AccessDenied)?;
-    for flags in [1, NO_WAIT | 1 << 17, 1 << 63] {
-        c.fails(receive, &[closed, flags], Error::InvalidArgs)?;
-    }
-    c.fails(receive, &[closed, NO_WAIT], Error::BadHandle)?;
-    c.fails(receive, &[resource, NO_WAIT], Error::WrongType)?;
-    c.fails(receive, &[notify_only, NO_WAIT], Error::AccessDenied)?;
-    c.fails(receive, &[receive_only, NO_WAIT], Error::WouldBlock)?;
-    c.succeeds(notify, &[notify_only, 0b110], &[])?;
-    c.succeeds(notify, &[h, 1], &[])?;
-    let mut t = c.thread;
-    // SAFETY: the thread is the test's and never runs.
-    unsafe { t.as_mut() }.regs.x[10..12].copy_from_slice(&[0x5A, 0x5B]);
-    // A slot is queued: receive takes it and does not wait.
-    c.succeeds(receive, &[receive_only, 0], &unlabeled(0b111, 2))?;
-    // SAFETY: as above.
-    let (label, token) = unsafe { (t.as_ref().regs.x[10], t.as_ref().regs.x[11]) };
-    check(
-        (label, token) == (0, 0),
-        "receive did not write the label and the token in x10 and x11",
-    )?;
-    c.fails(receive, &[h, NO_WAIT], Error::WouldBlock)
 }
 
 /// (base, effective) priority of `t`, which never runs.
@@ -1448,23 +1265,20 @@ fn session_of(c: &Caller, h: Handle) -> Result<NonNull<Session>, &'static str> {
         .map_err(|_| "the handle does not name a session")
 }
 
-/// handle_duplicate(x0 handle, x1 rights, x2 label, x3 priority) checks in
-/// the order of spec 11 and changes x0 alone on an error: values first
-/// (bits no right has, a priority without a label, a label without one, a
-/// priority outside 1-63), then the handle (BAD_HANDLE; a label on a
-/// handle that is no channel, WRONG_TYPE; no DUPLICATE or a right the
-/// original lacks, ACCESS_DENIED), then the ceiling (a priority above the
-/// caller's 30), then the state (a new label on a handle with one,
-/// BAD_STATE; on a closed channel, PEER_CLOSED), then the resources in the
-/// order the call takes them: the caller's table (LIMIT_REACHED), the
-/// channel's slots (LIMIT_REACHED, abi::MAX_SLOTS with the slot of label
-/// 0), the caller's quota for a page of its pool of sessions (NO_MEMORY);
-/// nothing is made then. A good call returns the copy in x1 alone: with
-/// label 0 it names the same object, a session's copy the same session;
-/// a label makes a session of the channel at the priority, which the
-/// caller pays for. A copy with a label and RECEIVE keeps the channel
-/// open.
-pub fn handle_duplicate_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+/// handle_duplicate stops at the caller's limits (spec 5.3, 11): a
+/// priority above the ceiling of the caller's process, 30 here, fails with
+/// ACCESS_DENIED after the handle and before the state (a new label on a
+/// handle with one, BAD_STATE); then the resources in the order the call
+/// takes them: the caller's table (LIMIT_REACHED), the channel's slots
+/// (LIMIT_REACHED, abi::MAX_SLOTS with the slot of label 0), the caller's
+/// quota for a page of its pool of sessions (NO_MEMORY); nothing is made
+/// then. A good call returns the copy in x1 alone: with label 0 it names
+/// the same object, a session's copy the same session; a label makes a
+/// session of the channel at the priority, which the caller pays for. A
+/// copy with a label and RECEIVE keeps the channel open. The rest of the
+/// call's checks are the test init's (handle_duplicate_checks_its_arguments
+/// and its neighbours).
+pub fn handle_duplicate_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let (sessions, channels) = (session::in_use(), channel::in_use());
     let callers = [30, 63].map(Caller::with_ceiling);
     let result = match &callers {
@@ -1483,59 +1297,29 @@ pub fn handle_duplicate_checks_its_arguments(_: &Boot) -> Result<(), &'static st
 
 fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
     let h = c.created(Call::CreateChannel.number(), &[10])?;
-    let result = channel_of(c, h).and_then(|ch| {
+    let result = (|| {
         let resource = c.insert(Object::Resource, Rights::DEBUG | Rights::DUPLICATE)?;
-        let notify_only = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
-        let own = c.insert(Object::Process(c.process), Rights::NONE)?;
-        let result = duplicate_check_order(c, [h, resource, notify_only, own])
+        let result = duplicate_ceiling(c, h)
             .and_then(|()| duplicate_resources(c, h))
             .and_then(|()| duplicate_results(c, [h, resource]))
             .and_then(|()| slots_come_before_the_quota(c, other));
-        for handle in [resource, notify_only, own] {
-            c.close(handle)?;
-        }
+        c.close(resource)?;
         result
-    });
+    })();
     // Closed already when the cases went through.
     let _ = process::close_handle(c.process, h, super::CAUSE);
     result
 }
 
-fn duplicate_check_order(c: &Caller, handles: [Handle; 4]) -> Result<(), &'static str> {
+/// A label at a priority above the caller's ceiling: a closed handle
+/// comes first (BAD_HANDLE), then the ceiling (ACCESS_DENIED).
+fn duplicate_ceiling(c: &Caller, h: Handle) -> Result<(), &'static str> {
     let n = Call::HandleDuplicate.number();
-    let [h, resource, notify_only, own] = handles.map(|h| h.0);
     let closed = c.insert(Object::Resource, Rights::NONE)?;
     c.close(closed)?;
-    let closed = closed.0;
     let notify = u64::from(Rights::NOTIFY.0);
-    for [rights, label, priority] in [
-        [1 << 12, 0, 0],
-        [1 << 32, 0, 0],
-        [0, 0, 5],
-        [0, 7, 0],
-        [0, 7, 64],
-        [0, 7, 0x100 | 5],
-    ] {
-        c.fails(n, &[closed, rights, label, priority], Error::InvalidArgs)?;
-    }
-    c.fails(n, &[closed, 0, 0, 0], Error::BadHandle)?;
-    c.fails(n, &[0, 0, 7, 5], Error::BadHandle)?;
-    // A label on what is no channel, before the missing right.
-    c.fails(n, &[resource, 0, 7, 5], Error::WrongType)?;
-    c.fails(n, &[own, 0, 7, 5], Error::WrongType)?;
-    c.fails(n, &[own, 0, 0, 0], Error::AccessDenied)?;
-    c.fails(n, &[notify_only, notify, 0, 0], Error::AccessDenied)?;
-    c.fails(n, &[notify_only, notify, 7, 5], Error::AccessDenied)?;
-    let more = u64::from((Rights::DEBUG | Rights::KSTATS).0);
-    c.fails(n, &[resource, more, 0, 0], Error::AccessDenied)?;
-    c.fails(
-        n,
-        &[h, u64::from(Rights::MANAGE.0), 0, 0],
-        Error::AccessDenied,
-    )?;
-    // The ceiling comes after the handle.
-    c.fails(n, &[closed, notify, 7, 31], Error::BadHandle)?;
-    c.fails(n, &[h, notify, 7, 31], Error::AccessDenied)
+    c.fails(n, &[closed.0, notify, 7, 31], Error::BadHandle)?;
+    c.fails(n, &[h.0, notify, 7, 31], Error::AccessDenied)
 }
 
 /// The resources of a label, none of which makes a session: the caller's
@@ -1969,21 +1753,20 @@ fn with_timer(
     result
 }
 
-/// timer_create, timer_set, timer_cancel and clock_now check in the order
-/// of spec 11 and change x0 alone on an error: the priority first (outside
-/// 1-63), then the handle (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without
-/// RECEIVE or MANAGE), then the ceiling (a priority above the caller's
-/// 30), then the caller's table (LIMIT_REACHED) and its quota for a page
-/// of its pool of timers (NO_MEMORY), with nothing made. A good
-/// timer_create returns a handle with abi::OWNER_RIGHTS to a timer the
-/// caller pays for, not armed; timer_set and timer_cancel return nothing,
-/// and cancelling a timer that is not armed is no error. timer_set on a
-/// closed channel fails with PEER_CLOSED and leaves the timer armed as it
-/// was. clock_now returns the counter in nanoseconds in x1 alone.
-pub fn timer_calls_check_their_arguments(_: &Boot) -> Result<(), &'static str> {
+/// timer_create stops at the caller's limits (spec 7.8, 10, 11): a
+/// priority above the ceiling of the caller's process, 30 here, fails with
+/// ACCESS_DENIED; with the caller's table full it fails with
+/// LIMIT_REACHED, and with its quota spent with NO_MEMORY for a page of its
+/// pool of timers, with nothing made. A good call returns a handle with
+/// abi::OWNER_RIGHTS to a timer the caller pays for, not armed; timer_set
+/// arms it at its deadline in ticks and timer_cancel takes it off the
+/// heap, and timer_set on a closed channel fails with PEER_CLOSED and
+/// leaves the timer armed as it was. The checks of the calls are the test
+/// init's.
+pub fn timer_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let timers = timers::in_use();
     let c = Caller::with_ceiling(30)?;
-    let result = timer_create_cases(&c).and_then(|()| clock_now_case(&c));
+    let result = timer_create_cases(&c);
     c.release();
     result?;
     check(
@@ -1994,18 +1777,8 @@ pub fn timer_calls_check_their_arguments(_: &Boot) -> Result<(), &'static str> {
 
 fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::TimerCreate.number();
-    let resource = c.insert(Object::Resource, Rights::NONE)?;
-    let closed = c.insert(Object::Resource, Rights::NONE)?;
-    c.close(closed)?;
     let h = c.created(Call::CreateChannel.number(), &[10])?;
-    let result = channel_of(c, h).and_then(|ch| {
-        let notify_only = c.insert(Object::Channel(ch), Rights::NOTIFY)?;
-        for priority in [0, 64, 0x100 | 10] {
-            c.fails(n, &[closed.0, priority], Error::InvalidArgs)?;
-        }
-        c.fails(n, &[closed.0, 10], Error::BadHandle)?;
-        c.fails(n, &[resource.0, 10], Error::WrongType)?;
-        c.fails(n, &[notify_only.0, 10], Error::AccessDenied)?;
+    let result = (|| {
         c.fails(n, &[h.0, 31], Error::AccessDenied)?;
         let timers = timers::in_use();
         with_used_quota(c, || {
@@ -2018,19 +1791,17 @@ fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
             "a timer that did not fit stayed",
         )?;
         let t = c.created(n, &[h.0, 30])?;
-        let result = timer_set_cases(c, [h, t, notify_only, resource, closed]);
+        let result = timer_set_cases(c, [h, t]);
         c.close(t)?;
-        c.close(notify_only)?;
         result
-    });
+    })();
     // The case of the closed channel closed it already.
     let _ = process::close_handle(c.process, h, CAUSE);
-    c.close(resource)?;
     result
 }
 
-fn timer_set_cases(c: &Caller, handles: [Handle; 5]) -> Result<(), &'static str> {
-    let [h, t, notify_only, resource, closed] = handles;
+fn timer_set_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
+    let [h, t] = handles;
     let (set, cancel) = (Call::TimerSet.number(), Call::TimerCancel.number());
     let tm = timer_of(c, t)?;
     // SAFETY: the caller's process is the test's.
@@ -2039,15 +1810,6 @@ fn timer_set_cases(c: &Caller, handles: [Handle; 5]) -> Result<(), &'static str>
         rights.is_ok() && timers::payer(tm) == c.process && timers::deadline(tm).is_none(),
         "the handle does not carry the owner's rights, the caller does not pay, or the timer is armed",
     )?;
-    let seen = c.insert(Object::Timer(tm), Rights::DUPLICATE)?;
-    for (n, args) in [(set, &[closed.0, 0][..]), (cancel, &[closed.0][..])] {
-        c.fails(n, args, Error::BadHandle)?;
-    }
-    c.fails(set, &[resource.0, 0], Error::WrongType)?;
-    c.fails(cancel, &[h.0], Error::WrongType)?;
-    c.fails(set, &[seen.0, 0], Error::AccessDenied)?;
-    c.fails(cancel, &[seen.0], Error::AccessDenied)?;
-    c.close(seen)?;
     let far = a_second_away();
     let at = timer::clock().ns_to_ticks(far);
     c.succeeds(set, &[t.0, far], &[])?;
@@ -2065,30 +1827,11 @@ fn timer_set_cases(c: &Caller, handles: [Handle; 5]) -> Result<(), &'static str>
     // The last handle with RECEIVE goes: the channel closes (spec 6.8).
     c.close(h)?;
     c.fails(set, &[t.0, 0], Error::PeerClosed)?;
-    c.fails(
-        Call::Notify.number(),
-        &[notify_only.0, 1],
-        Error::PeerClosed,
-    )?;
     check(
         timers::deadline(tm) == Some(at) && !timers::posted(tm),
         "timer_set on a closed channel changed the timer",
     )?;
     c.succeeds(cancel, &[t.0], &[])
-}
-
-fn clock_now_case(c: &Caller) -> Result<(), &'static str> {
-    let clock = timer::clock();
-    let before = clock.ticks_to_ns(timer::now());
-    let got = c.call(Call::ClockNow.number(), &[]);
-    let after = clock.ticks_to_ns(timer::now());
-    let mut want = with_marks(&[]);
-    want[0] = 0;
-    want[1] = got[1];
-    check(
-        got == want && (before..=after).contains(&got[1]),
-        "clock_now did not return the counter in nanoseconds in x1 alone",
-    )
 }
 
 /// timer_set rounds its deadline up to counter ticks (spec 10): for every
