@@ -38,6 +38,7 @@ use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
     ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
 };
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::args::{
@@ -50,22 +51,35 @@ use kcore::maps::Mapping;
 /// A call's arguments: x0-x9 of the thread that made it.
 type Args = [u64; 10];
 
-/// Values a call returns in x1 and up on success.
+/// Values a call returns in x1 and up on success: the first `len` of `x`
+/// are written, the rest never read. The words past `len` stay unwritten,
+/// and every copy of a result is written word by word, so that no result
+/// on the path of a call becomes a call of `memset` or `memcpy` (spec
+/// 15.3).
 pub struct Values {
-    x: [u64; abi::RESULT_VALUES],
+    x: [MaybeUninit<u64>; abi::RESULT_VALUES],
     len: usize,
 }
 
 impl Values {
-    pub const NONE: Values = Values {
-        x: [0; abi::RESULT_VALUES],
-        len: 0,
-    };
+    /// No values: `len` alone is written. A constant would be written
+    /// whole, its unwritten words as zeros, by a call of `memset`.
+    #[inline(always)]
+    pub fn none() -> Values {
+        let mut v = MaybeUninit::<Values>::uninit();
+        // SAFETY: `x` may hold anything; `len` is written.
+        unsafe {
+            (&raw mut (*v.as_mut_ptr()).len).write(0);
+            v.assume_init()
+        }
+    }
 
     /// At most abi::RESULT_VALUES values, for x1 and up.
     pub fn new(values: &[u64]) -> Values {
-        let mut x = [0; abi::RESULT_VALUES];
-        x[..values.len()].copy_from_slice(values);
+        let mut x = [MaybeUninit::uninit(); abi::RESULT_VALUES];
+        for (to, &value) in x.iter_mut().zip(values) {
+            to.write(value);
+        }
         Values {
             x,
             len: values.len(),
@@ -85,9 +99,10 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     if let Some(long) = thread::long(thread) {
         return go_on(thread, long, number);
     }
-    let mut args: Args = [0; 10];
     // SAFETY: the thread that made the call is alive.
-    args.copy_from_slice(&unsafe { thread.as_ref() }.regs.x[..10]);
+    let r = &unsafe { thread.as_ref() }.regs.x;
+    // Word by word: a copy of the slice would be a call of `memcpy`.
+    let args: Args = [r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]];
     let result = match Call::from_number(number) {
         Some(Call::HandleClose) => handle_close(thread, &args),
         Some(Call::HandleDuplicate) => handle_duplicate(thread, &args),
@@ -124,14 +139,21 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
 }
 
 /// Writes a call's result into the thread's registers: 0 and the values
-/// from x1 up, or the error code in x0 alone.
+/// from x1 up, or the error code in x0 alone (spec 11). Inlined into each
+/// caller, where the number of values is often known.
+#[inline(always)]
 pub fn set_result(mut thread: NonNull<Thread>, result: Result<Values, Error>) {
     // SAFETY: the running thread is alive, and nothing else refers to it now.
     let x = &mut unsafe { thread.as_mut() }.regs.x;
     match result {
         Ok(v) => {
             x[0] = 0;
-            x[1..=v.len].copy_from_slice(&v.x[..v.len]);
+            for i in 0..abi::RESULT_VALUES {
+                if i < v.len {
+                    // SAFETY: Values::new wrote the first `len` words.
+                    x[1 + i] = unsafe { v.x[i].assume_init() };
+                }
+            }
         }
         Err(e) => x[0] = e.code(),
     }
@@ -187,7 +209,7 @@ fn lookup<U>(
 /// priority. Closing a handle to a thread or a process does not end it.
 fn handle_close(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     process::close_handle(caller(thread), Handle(a[0]), cause(thread))?;
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// handle_duplicate(x0 handle with DUPLICATE, x1 rights, x2 label, x3
@@ -281,7 +303,7 @@ fn notify(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         Some(s) => session::notify(s, bits, cause(thread))?,
         None => channel::notify(c, bits, cause(thread))?,
     }
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// receive(x0 channel with RECEIVE, x1 flags): the flags first, bit 16
@@ -396,7 +418,7 @@ fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let values = &values[..desc.handles];
     check_handles(thread, values)?;
     channel::reply(thread, a[0], desc, values)?;
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// The next entry of the long call `long` of `thread` (spec 7.7), which
@@ -624,7 +646,7 @@ fn portions(thread: NonNull<Thread>, mut long: Long, entry: u64) {
                 }
                 start = clock::now();
             }
-            Ok(true) => break Ok(Values::NONE),
+            Ok(true) => break Ok(Values::none()),
             Err(e) => break Err(e),
         }
     };
@@ -784,7 +806,7 @@ fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         // portion runs during a call.
         unsafe { process::hasten(target, cause(thread)) };
     }
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// process_exit(x0 code): the caller's process ends with `code`. Never
@@ -847,7 +869,7 @@ fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn thread_start(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     thread::start(t)?;
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// thread_exit(): the caller ends; the last started thread of a process
@@ -874,7 +896,7 @@ fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     let target_ceiling = unsafe { target.as_ref().process().as_ref() }.ceiling();
     under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
     sched::set_priority(target, priority, policy)?;
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// yield(): the caller goes to the tail of its level with a new quantum,
@@ -882,7 +904,7 @@ fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
 /// at once. Lower levels never run through yield.
 fn yield_now() -> Result<Values, Error> {
     sched::yield_running();
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// clock_now(): x1 returns the counter in nanoseconds, rounded down
@@ -932,7 +954,7 @@ fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
     let deadline = clock::clock().ns_to_ticks(a[1]);
     timer::set(t, deadline, cause(thread))?;
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// timer_cancel(x0 timer with MANAGE): the timer is armed no more; bits it
@@ -941,7 +963,7 @@ fn timer_set(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let t = lookup(thread, a[0], Rights::MANAGE, Object::timer)?;
     timer::cancel(t);
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// device_window_create(x0 system resource with DEVICE, x1 address, x2
@@ -1019,7 +1041,7 @@ fn irq_bind(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let b = lookup(thread, a[0], Rights::MANAGE, Object::irq)?;
     irq::ack(b)?;
-    Ok(Values::NONE)
+    Ok(Values::none())
 }
 
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2

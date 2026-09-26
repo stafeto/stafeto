@@ -824,7 +824,7 @@ pub fn syscall(thread: NonNull<Thread>, number: u16) -> bool {
         }
         _ => return false,
     }
-    syscall::set_result(thread, Ok(Values::NONE));
+    syscall::set_result(thread, Ok(Values::none()));
     true
 }
 
