@@ -430,10 +430,10 @@ unsafe fn release_space(p: *mut Process) -> bool {
 
 /// The stage Buffers: the message buffers of the threads the end stopped
 /// go, with the handles of the requests they made and what their long
-/// calls held, released at `level` (R), and the threads leave the list,
-/// BUFFERS_PORTION units of work a portion. The ASID went at the stage
-/// Space, so the frames go back without unmapping. True once the list is
-/// empty.
+/// calls held, released at `level` (R, thread::drop_buffer), and the
+/// threads leave the list, BUFFERS_PORTION units of work a portion. The
+/// ASID went at the stage Space, so the frames go back without unmapping.
+/// True once the list is empty.
 ///
 /// # Safety
 /// `process` is alive and on its stages.
@@ -449,8 +449,6 @@ unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
                 break;
             }
             work += units;
-            thread::drop_transit(t, level);
-            thread::drop_long(t, level);
             thread::drop_buffer(t, level);
             remove_thread(process, t);
         }

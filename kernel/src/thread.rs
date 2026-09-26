@@ -449,17 +449,16 @@ pub fn end_long(t: NonNull<Thread>) -> Option<Long> {
 /// `cause`, the object of a mem_create, or what a change of a mapping did
 /// so far stays in its entry and the rest of its prepaid tables goes back
 /// (process::abandon_change), and then its reference to the target process.
-/// Returns the units of work it took: 1 with a call, 0 without. O(1).
+/// O(1).
 ///
 /// # Safety
 /// `t` is alive, and nothing uses what its call held afterwards.
-pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) -> usize {
+pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) {
     // SAFETY: the caller's promise; only the field is touched.
     match unsafe { (*t.as_ptr()).long.take() } {
         Some(Long::Create(m)) => {
             // SAFETY: the call held the object's reference, which goes.
             unsafe { memory::release(m, cause) };
-            1
         }
         Some(long @ (Long::Map { on, .. } | Long::Unmap { on } | Long::Protect { on, .. })) => {
             // SAFETY: nothing uses the call afterwards, and its reference to
@@ -468,9 +467,8 @@ pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) -> usize {
                 process::abandon_change(long, cause);
                 process::release(on.target, cause);
             }
-            1
         }
-        None => 0,
+        None => {}
     }
 }
 
