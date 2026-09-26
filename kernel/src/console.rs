@@ -4,6 +4,7 @@
 //! Early console on the QEMU `virt` PL011 at PA 0x0900_0000, reached through
 //! the linear map. One CPU and interrupts masked in the kernel: no lock needed.
 
+use crate::arch::mmio;
 use core::fmt::{self, Write};
 use kcore::layout::LINEAR_BASE;
 
@@ -21,14 +22,14 @@ pub fn init() {
     // after the switch to the kernel tables: head.S maps the first GiB of
     // physical addresses as devices, mm::kmap maps the PL011 from the device
     // tree, and on QEMU virt it sits at PL011_PA.
-    unsafe { ((BASE + CR) as *mut u32).write_volatile(CR_ENABLE) }
+    unsafe { mmio::write32(BASE + CR, CR_ENABLE) }
 }
 
 fn putc(byte: u8) {
     // SAFETY: as in `init`.
     unsafe {
-        while ((BASE + FR) as *const u32).read_volatile() & FR_TXFF != 0 {}
-        ((BASE + DR) as *mut u32).write_volatile(u32::from(byte));
+        while mmio::read32(BASE + FR) & FR_TXFF != 0 {}
+        mmio::write32(BASE + DR, u32::from(byte));
     }
 }
 

@@ -8,6 +8,7 @@ use crate::harness::*;
 use crate::messages::answer_all;
 use crate::processes::{DATA_ABORT, KID_WAIT_NS, Kid, LEAF_QUOTA, START};
 use crate::transfers::{close_raw, copy_raw, give, handle_client};
+use rt::mmio;
 
 /// The tests of this module, in the order they run.
 pub(crate) const TESTS: [Test; 17] = [
@@ -69,9 +70,6 @@ pub(crate) const TESTS: [Test; 17] = [
     ),
 ];
 
-/// The lines of the GIC of QEMU `virt` (GICD_TYPER): INTID 288 is past
-/// the last one.
-const GIC_LINES: u64 = 288;
 /// A shared line with no device behind it in the tests' machine, the
 /// first of `virtio-mmio`, which the tests bind edge-triggered.
 const EDGE_LINE: u32 = 48;
@@ -87,14 +85,16 @@ fn bound(line: u32, c: &Handle<Channel>, edge: bool) -> Result<Handle<Interrupt>
 /// irq_bind(x0 system resource with DEVICE, x1 line, x2 channel with
 /// NOTIFY, x3 priority, x4 flags) checks the values first, then the
 /// handles in their order, then the state (spec 9, 11), and changes x0
-/// alone on an error: a line outside 32-287, the lines of QEMU's GIC, or
-/// the kernel's console line 33, a flag other than TRIGGER_EDGE and a
-/// priority outside 1-63 fail with INVALID_ARGS, through closed handles
-/// too; x0 closed, a channel or a copy of the resource without DEVICE
-/// with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or
-/// a copy of the channel without NOTIFY the same; a closed channel with
-/// PEER_CLOSED. A copy with NOTIFY alone makes a binding, x0 and x1 alone
-/// changed, whose handle carries abi::OWNER_RIGHTS and no more.
+/// alone on an error: a line outside 32-1019, the most lines a GIC has
+/// (the end of this machine's lines is the kernel test
+/// irq_bind_refuses_lines_past_the_distributor), or the kernel's console
+/// line 33, a flag other than TRIGGER_EDGE and a priority outside 1-63
+/// fail with INVALID_ARGS, through closed handles too; x0 closed, a
+/// channel or a copy of the resource without DEVICE with BAD_HANDLE,
+/// WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or a copy of the
+/// channel without NOTIFY the same; a closed channel with PEER_CLOSED. A
+/// copy with NOTIFY alone makes a binding, x0 and x1 alone changed, whose
+/// handle carries abi::OWNER_RIGHTS and no more.
 fn irq_bind_checks_its_arguments() -> Outcome {
     const N: u16 = Call::IrqBind.number();
     let gone = closed_handle()?;
@@ -109,7 +109,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
         x[i] = value;
         x
     };
-    let invalid = [27, 31, 33, 1020, GIC_LINES, 1 << 32 | line]
+    let invalid = [27, 31, 33, 1020, 1 << 32 | line]
         .map(|l| with(1, l))
         .into_iter()
         .chain([with(4, 2), with(3, 0), with(3, 64), with(3, 0x100 | 1)])
@@ -302,9 +302,11 @@ fn device_window(addr: u64, len: u64) -> Result<Handle<Memory>, &'static str> {
 /// wraps around or ends past 2^48 fail with INVALID_ARGS through a closed
 /// handle too; a closed handle, a channel and a copy of the resource
 /// without DEVICE with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED, over RAM
-/// too; a page of RAM, of the GIC's distributor or CPU interface or of the
-/// PL011 with INVALID_ARGS. A window on the PL031 changes x0 and x1 alone,
-/// and its handle carries abi::WINDOW_RIGHTS and no MAP_EXEC.
+/// too; a page of RAM, of the GIC's distributor or of the PL011 with
+/// INVALID_ARGS; the kernel test device_window_refuses_every_gic_page
+/// checks the other regions of the GIC, which differ between machines. A
+/// window on the PL031 changes x0 and x1 alone, and its handle carries
+/// abi::WINDOW_RIGHTS and no MAP_EXEC.
 fn device_window_create_checks_its_arguments() -> Outcome {
     const N: u16 = Call::DeviceWindowCreate.number();
     let gone = closed_handle()?;
@@ -326,7 +328,7 @@ fn device_window_create_checks_its_arguments() -> Outcome {
     ]
     .iter()
     .all(|&(h, e)| x0_alone::<N>(&[h, 0x4000_0000, page], e.code()));
-    let kernel = [0x4000_0000, 0x0800_0000, 0x0801_0000, 0x0900_0000]
+    let kernel = [0x4000_0000, 0x0800_0000, 0x0900_0000]
         .iter()
         .all(|&addr| x0_alone::<N>(&[resource, addr, page], Error::InvalidArgs.code()));
     let mut x = marked();
@@ -449,16 +451,15 @@ fn window_maps_read_write_but_never_exec() -> Outcome {
 }
 
 /// A window shows its device (spec 9): the count of seconds of the PL031,
-/// read twice through a window mapped R with volatile loads of 32 bits
-/// ([G34]), is not 0 and does not go back.
+/// read twice through a window mapped R with loads of 32 bits (rt::mmio),
+/// is not 0 and does not go back.
 fn window_reads_its_device() -> Outcome {
     let page = PAGE as u64;
     let w = device_window(RTC, page)?;
     map(&w, 0, page, WINDOW, Access::Read)?;
-    let dr = WINDOW as *const u32;
     // SAFETY: the page is the PL031's registers, mapped R as device memory;
     // RTCDR is a 32-bit register at offset 0.
-    let (first, second) = unsafe { (dr.read_volatile(), dr.read_volatile()) };
+    let (first, second) = unsafe { (mmio::read32(WINDOW), mmio::read32(WINDOW)) };
     unmap(WINDOW, page)?;
     close(w)?;
     check(
@@ -516,6 +517,9 @@ fn window_over_a_hole_faults_only_its_process() -> Outcome {
             (esr >> 26 & 0x3F, esr & 0x3F, far) == (DATA_ABORT, EXTERNAL, at as u64),
             "the child's fault is no external abort at the load",
         ),
+        ProcessState::Exited { code } if code == child::NO_FAULT => {
+            Err("the child read the hole and did not fault")
+        }
         _ => Err("the child did not end with a fault"),
     }
 }
@@ -574,13 +578,13 @@ impl Rtc {
 
     fn read(&self, reg: usize) -> u32 {
         // SAFETY: the window maps the PL031's page at WINDOW, RW, as device
-        // memory; each register is 32 bits at its offset ([G34]).
-        unsafe { ((WINDOW + reg) as *const u32).read_volatile() }
+        // memory; each register is 32 bits at its offset.
+        unsafe { mmio::read32(WINDOW + reg) }
     }
 
     fn write(&self, reg: usize, value: u32) {
         // SAFETY: as in `read`.
-        unsafe { ((WINDOW + reg) as *mut u32).write_volatile(value) }
+        unsafe { mmio::write32(WINDOW + reg, value) }
     }
 
     /// The binding of RTC_LINE, level-triggered, to the channel at DRIVER.

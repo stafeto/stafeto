@@ -15,10 +15,14 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-stafeto boots in QEMU and runs programs at EL0. What works today:
+stafeto boots in QEMU and runs programs at EL0, under QEMU's emulation
+and on Apple silicon under HVF. What works today:
 
 - **Boot:** arm64 Image, drop from EL2, MMU on, device tree, checked boot
   image.
+- **Interrupt controllers:** GICv2 and GICv3, chosen from the device tree;
+  drivers reach device registers with single loads and stores, which a
+  hypervisor can emulate.
 - **Memory:** the kernel's own page tables with W^X, a buddy frame
   allocator, object pools, an address space with an ASID per process; every
   process pays for its kernel memory from its quota. Memory objects take all
@@ -60,7 +64,9 @@ stafeto boots in QEMU and runs programs at EL0. What works today:
   processes with code that `init` loads from the boot image.
 
 `cargo xtask run` shows `init` saying hello from EL0 and two of its threads
-taking turns.
+taking turns. `cargo xtask test` runs the tests on QEMU's GICv2 and GICv3;
+`cargo xtask hvf` runs them on a Mac with Apple silicon, on Apple's GICv3
+and on QEMU's GICv2.
 
 ## Roadmap
 
@@ -83,6 +89,7 @@ parts. Each finished part is merged through a pull request.
 | | 1.3d Memory objects | `mem_create`, `mem_map`, memory objects in messages, child processes with code | ✅ [#13](https://github.com/stafeto/stafeto/pull/13) |
 | | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ✅ [#14](https://github.com/stafeto/stafeto/pull/14) |
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | 🚧 |
+| | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the
@@ -110,11 +117,12 @@ installs the Rust version, components, and targets itself from
 
 | Command | What it does |
 |---|---|
-| `cargo xtask build` | builds the kernel into `target/stafeto.img` and checks that the image is under 200 KB |
+| `cargo xtask build` | builds the kernel into `target/stafeto.img` (under `CARGO_TARGET_DIR` when it is set) and checks that the image is under 200 KB |
 | `cargo xtask run` | runs the system in QEMU; exit with Ctrl-A, then X |
 | `cargo xtask test` | host tests, boot in QEMU, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |
+| `cargo xtask hvf` | on a Mac with Apple silicon: boot, the test `init` and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 

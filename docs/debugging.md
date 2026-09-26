@@ -69,6 +69,14 @@
 
 6. If PC is near zero or garbage, `VBAR_EL1` has not been set yet.
 
+7. Every build ends a run with PSCI `SYSTEM_OFF`, and QEMU exits with
+   status 0: when `init` exits, at a panic, and at the end of the kernel
+   tests, which print `TESTS DONE total=N failed=M` first. xtask judges a
+   run of tests by that line and fails a run with a `KERNEL PANIC` line
+   anywhere. A panic before the kernel has read the PSCI conduit from the
+   device tree parks the processor instead, and the run ends at xtask's
+   deadline.
+
 ## Address from a panic
 
 A panic prints the call stack as addresses. lldb gives the function name
@@ -85,7 +93,48 @@ build, `target/stafeto-ktest.elf` for a build with kernel tests,
 instruction-counted time), and `target/stafeto-probe.elf` and
 `target/stafeto-overflow.elf` for the fault probes (unknown instruction
 and stack overflow) from `cargo xtask test`. The right file is named by
-the `backtrace (look up: ...)` line itself in the panic output.
+the `backtrace (look up: ...)` line itself in the panic output. With
+`CARGO_TARGET_DIR` set, the images, the ELFs and the boot images are
+there instead of under `target/`.
+
+## Under HVF
+
+`cargo xtask hvf` runs the boot checks, the test init and the kernel
+tests under HVF on a Mac with Apple silicon, on two machines:
+`-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on -cpu host`, with
+Apple's GICv3 in the macOS kernel, and
+`-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off -cpu host`,
+with QEMU's GICv2. On any other host it prints why it skips and succeeds;
+`cargo xtask ci` does not run it. To run one by hand, after
+`cargo xtask test` has built the images (under `target/`, or
+`CARGO_TARGET_DIR` when it is set):
+
+~~~
+qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf,kernel-irqchip=on \
+  -cpu host -m 512M -display none -serial stdio -monitor none \
+  -kernel target/stafeto-ktest.img -initrd target/boot.img
+~~~
+
+What differs from QEMU's own emulation:
+
+- The counter runs at 24 MHz. A fast round trip takes a few ticks, so
+  times under HVF mean something only as averages over many turns. The
+  PMU's cycle counter is emulated (`PMCCNTR_EL0` is `CNTVCT_EL0` times
+  128, and every read traps): measure with the counter instead.
+- An address with no device reads as 0, and a write to it vanishes: there
+  is no external abort. The test init's
+  `window_over_a_hole_faults_only_its_process` fails with
+  `the child read the hole and did not fault`; xtask accepts this one
+  failure and no other.
+- QEMU emulates a device register from the syndrome of the access. An
+  access that has none, a load or store pair or one with writeback,
+  stops QEMU with `Assertion failed: (isv)` and status 134. Device
+  registers are reached through `arch::mmio` and `rt::mmio`, one `ldr` or
+  `str` each.
+- `ID_AA64PFR0_EL1.GIC` reads 0 though the GICv3 system registers work;
+  the kernel takes the GIC's version from the device tree.
+- The processor has no AArch32 at EL0 and holds `SCTLR_EL1.ITD` and
+  `SED` at 1; the kernel writes them 1 on every machine.
 
 ## Debugger
 

@@ -57,6 +57,15 @@ impl Clock {
     }
 }
 
+/// The length in counter ticks of a stretch of work, such as a portion
+/// (spec 7.7), that began at the counter value `start` and ended at
+/// `now`, read as `now - start` and at least one: a stretch that happened
+/// within one tick still counts (KSTATS x5, spec 16). The count can be one
+/// tick short of the true length.
+pub fn stretch(start: u64, now: u64) -> u64 {
+    now.saturating_sub(start).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +75,16 @@ mod tests {
 
     fn clock(hz: u64) -> Clock {
         Clock::new(hz).unwrap()
+    }
+
+    #[test]
+    fn a_stretch_counts_at_least_one_tick() {
+        assert_eq!(stretch(100, 100), 1);
+        assert_eq!(stretch(100, 101), 1);
+        assert_eq!(stretch(100, 102), 2);
+        assert_eq!(stretch(100, 5_100), 5_000);
+        // A counter read before the start: still a stretch that happened.
+        assert_eq!(stretch(100, 99), 1);
     }
 
     #[test]

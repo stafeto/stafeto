@@ -3422,6 +3422,25 @@ fn irq_bind_cases(c: &Caller) -> Result<(), &'static str> {
     result
 }
 
+/// irq_bind takes the lines of the GIC and no more (spec 9): the last
+/// line GICD_TYPER gives, `gic::lines() - 1`, binds, and `gic::lines()`
+/// fails with INVALID_ARGS, whichever the machine: 288 lines on QEMU's
+/// GICv2 and GICv3, 1020 on Apple's GICv3 under HVF. The test init checks
+/// the lines that every machine refuses.
+pub fn irq_bind_refuses_lines_past_the_distributor(_: &Boot) -> Result<(), &'static str> {
+    let lines = gic::lines();
+    with_binding(lines - 1, false, |c, h, _| {
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let past = c.fails(
+            Call::IrqBind.number(),
+            &[r.0, lines.into(), h.0, 20, 0],
+            Error::InvalidArgs,
+        );
+        c.close(r)?;
+        past
+    })
+}
+
 /// irq_bind whose binding is made, and whose handle then takes a new
 /// chunk of the caller's table with no quota left for its page.
 fn bind_without_its_handle(c: &Caller) -> Result<(), &'static str> {

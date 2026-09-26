@@ -37,6 +37,7 @@ mod timer;
 use boot::Boot;
 use bootimg::Program;
 use kcore::PAGE_SIZE;
+use kcore::bootinfo::GicVersion;
 use kcore::layout::KERNEL_VIRT;
 use kcore::time::Clock;
 
@@ -112,12 +113,20 @@ fn report(boot: &Boot, clock: Clock, init: &Program) {
     if let Some(r) = info.uart_pl011 {
         kprintln!("pl011      {:#x}", r.base);
     }
-    if let (Some(d), Some(c)) = (info.gic_distributor, info.gic_cpu_interface) {
-        kprintln!(
-            "gic        distributor {:#x}, cpu interface {:#x}",
-            d.base,
-            c.base
-        );
+    if let Some(gic) = &info.gic {
+        let [d, c] = gic.mapped();
+        match gic.version {
+            GicVersion::V2 => kprintln!(
+                "gic        v2 distributor {:#x}, cpu interface {:#x}",
+                d.base,
+                c.base
+            ),
+            GicVersion::V3 => kprintln!(
+                "gic        v3 distributor {:#x}, redistributor {:#x}",
+                d.base,
+                c.base
+            ),
+        }
     }
     kprintln!("psci       {:?}", info.psci);
     kprintln!("timer      {} Hz", clock.hz());

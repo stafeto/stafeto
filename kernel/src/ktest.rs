@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! In-kernel tests for `cargo xtask test`. Each test prints one line in the
-//! format xtask parses; the run ends with a semihosting exit code. The tests
-//! at EL0 (`el0`) come last, as a chain that never returns here.
+//! format xtask parses; the run ends with the `TESTS DONE` line and PSCI
+//! SYSTEM_OFF (spec 14). The tests at EL0 (`el0`) come last, as a chain
+//! that never returns here.
 
 pub mod calls;
 pub mod el0;
@@ -11,7 +12,7 @@ mod registers;
 
 use crate::arch::symbols;
 use crate::arch::user::UserRegs;
-use crate::arch::{self, gic, semihosting, timer};
+use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel;
 use crate::cleanup;
@@ -28,9 +29,12 @@ use abi::{Access, Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use kcore::PAGE_SIZE;
-use kcore::bootinfo::PsciConduit;
+use kcore::bootinfo::{Gic, GicVersion, PsciConduit, Region};
 use kcore::frames::{MAX_ORDER, PhysMem};
-use kcore::gic::{Ack, DEFAULT_PRIORITY};
+use kcore::gic::{
+    Ack, DEFAULT_PRIORITY, FIRST_SPI, GICD_CTLR_V3, ICC_SRE_SRE, IROUTER_ANY, PRIORITY_MASK,
+    WAKER_CHILDREN_ASLEEP, WAKER_PROCESSOR_SLEEP,
+};
 use kcore::handles::{CHUNK, MAX_HANDLES};
 use kcore::layout::{
     GIB, KERNEL_STACK_SIZE, KERNEL_VIRT, LINEAR_BASE, USER_END, frame_fits, image_pa,
@@ -50,6 +54,17 @@ const TESTS: &[(&str, TestFn)] = &[
     (
         "device_tree_matches_qemu_virt",
         device_tree_matches_qemu_virt,
+    ),
+    ("gic_matches_the_device_tree", gic_matches_the_device_tree),
+    ("every_line_is_group_1", every_line_is_group_1),
+    (
+        "shared_lines_route_to_this_cpu",
+        shared_lines_route_to_this_cpu,
+    ),
+    ("redistributor_is_awake", redistributor_is_awake),
+    (
+        "device_window_refuses_every_gic_page",
+        device_window_refuses_every_gic_page,
     ),
     (
         "boot_image_is_readable_through_linear_map",
@@ -417,6 +432,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::irq_bind_checks_the_callers_limits,
     ),
     (
+        "irq_bind_refuses_lines_past_the_distributor",
+        calls::irq_bind_refuses_lines_past_the_distributor,
+    ),
+    (
         "window_maps_as_device_memory",
         calls::window_maps_as_device_memory,
     ),
@@ -483,13 +502,14 @@ fn report(name: &str, result: Result<(), &'static str>) {
     }
 }
 
-/// Prints the verdict and leaves QEMU. The line counts the tests of the
-/// build, so that xtask notices a TEST line lost in the output.
+/// Prints the verdict and powers the machine off (spec 14): xtask judges
+/// the run by this line. The line counts the tests of the build, so that
+/// xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
     kprintln!("TESTS DONE total={total} failed={failed}");
-    semihosting::exit(if failed == 0 { 0 } else { 1 })
+    crate::psci::system_off()
 }
 
 fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
@@ -515,16 +535,114 @@ fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
         info.uart_pl011.map(|r| r.base) == Some(0x0900_0000),
         "PL011 is not at 0x0900_0000",
     )?;
+    // xtask runs the tests on QEMU's GICv2 and GICv3.
+    let gic = info.gic.ok_or("no GIC in the device tree")?;
+    let [dist, cpu] = gic.mapped();
     check(
-        info.gic_distributor.map(|r| r.base) == Some(0x0800_0000),
+        dist.base == 0x0800_0000,
         "GIC distributor is not at 0x0800_0000",
     )?;
-    check(
-        info.gic_cpu_interface.map(|r| r.base) == Some(0x0801_0000),
-        "GIC CPU interface is not at 0x0801_0000",
-    )?;
+    match gic.version {
+        GicVersion::V2 => check(
+            cpu.base == 0x0801_0000,
+            "GIC CPU interface is not at 0x0801_0000",
+        )?,
+        GicVersion::V3 => check(
+            cpu.base == 0x080A_0000,
+            "GIC redistributors are not at 0x080A_0000",
+        )?,
+    }
     check(info.psci == PsciConduit::Hvc, "PSCI conduit is not HVC")?;
     check(info.initrd.is_some(), "no boot image in /chosen")
+}
+
+/// The GIC runs as the device tree names it (spec 9): the driver's version
+/// is the node's, and the priority mask lets DEFAULT_PRIORITY through; on
+/// a GICv3 the CPU interface is reached through system registers
+/// (ICC_SRE_EL1.SRE), Group 1 is on at the CPU interface
+/// (ICC_IGRPEN1_EL1) and at the distributor, with affinity routing
+/// (GICD_CTLR).
+fn gic_matches_the_device_tree(boot: &Boot) -> Result<(), &'static str> {
+    let gic = boot.info.gic.ok_or("no GIC in the device tree")?;
+    check(
+        gic::version() == gic.version,
+        "the GIC driver is not of the device tree's version",
+    )?;
+    check(
+        gic::priority_mask() == PRIORITY_MASK,
+        "the priority mask is not PRIORITY_MASK",
+    )?;
+    if gic.version == GicVersion::V2 {
+        return Ok(());
+    }
+    check(
+        registers::icc_sre_el1() & ICC_SRE_SRE != 0,
+        "ICC_SRE_EL1.SRE is clear",
+    )?;
+    check(
+        registers::icc_igrpen1_el1() & 1 != 0,
+        "ICC_IGRPEN1_EL1 leaves Group 1 off",
+    )?;
+    check(
+        gic::control() & GICD_CTLR_V3 == GICD_CTLR_V3,
+        "GICD_CTLR lacks affinity routing or Group 1",
+    )
+}
+
+/// On a GICv3 every line is in Group 1, which the CPU takes as IRQ; in
+/// Group 0 it would come as FIQ (spec 9). A GICv2's groups stay as the
+/// firmware left them.
+fn every_line_is_group_1(_: &Boot) -> Result<(), &'static str> {
+    check(
+        gic::version() == GicVersion::V2 || (0..gic::lines()).all(gic::is_group_1),
+        "a line is in Group 0",
+    )
+}
+
+/// Every shared line goes to this CPU (spec 9): GICD_ITARGETSR holds CPU
+/// interface 0 on a GICv2, or reads as zero where it has one CPU interface
+/// only (IHI 0048B 4.3.12, as QEMU's); GICD_IROUTER holds this CPU's
+/// affinity on a GICv3, and not IROUTER_ANY.
+fn shared_lines_route_to_this_cpu(_: &Boot) -> Result<(), &'static str> {
+    let here = match gic::version() {
+        GicVersion::V2 if gic::cpu_interfaces() == 1 => 0,
+        GicVersion::V2 => 1,
+        GicVersion::V3 => kcore::gic::irouter(registers::mpidr_el1()),
+    };
+    check(
+        (FIRST_SPI..gic::lines()).all(|line| gic::route(line) == here),
+        "a shared line goes to another CPU",
+    )?;
+    check(
+        gic::version() == GicVersion::V2 || here & IROUTER_ANY == 0,
+        "a shared line goes to any CPU",
+    )
+}
+
+/// On a GICv3 this CPU's redistributor is awake: GICR_WAKER has neither
+/// ProcessorSleep nor ChildrenAsleep.
+fn redistributor_is_awake(_: &Boot) -> Result<(), &'static str> {
+    check(
+        gic::version() == GicVersion::V2
+            || gic::waker() & (WAKER_PROCESSOR_SLEEP | WAKER_CHILDREN_ASLEEP) == 0,
+        "the redistributor sleeps",
+    )
+}
+
+/// No device window reaches a page of any region of the GIC's node (spec
+/// 9), the first or the last, whichever the version.
+fn device_window_refuses_every_gic_page(boot: &Boot) -> Result<(), &'static str> {
+    let gic = boot.info.gic.ok_or("no GIC in the device tree")?;
+    for r in gic.regs.as_slice() {
+        let last = (r.end() - 1) & !(PAGE_SIZE - 1);
+        for page in [r.base & !(PAGE_SIZE - 1), last] {
+            check(
+                memory::check_window(page, 1) == Err(Error::InvalidArgs),
+                "a window over a page of the GIC was allowed",
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn boot_image_is_readable_through_linear_map(boot: &Boot) -> Result<(), &'static str> {
@@ -801,21 +919,23 @@ fn boot_stack_linear_map_and_devices_are_not_executable(boot: &Boot) -> Result<(
             "the linear map is unmapped or executable",
         )
     })?;
-    let info = &boot.info;
-    for dev in [
-        info.uart_pl011,
-        info.gic_distributor,
-        info.gic_cpu_interface,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for dev in devices(boot) {
         check(
             kernel_never_executes(LINEAR_BASE + dev.base as usize),
             "a device is unmapped or executable",
         )?;
     }
     Ok(())
+}
+
+/// The devices the kernel maps: the PL011 and the GIC's blocks
+/// (bootinfo::Gic::mapped).
+fn devices(boot: &Boot) -> impl Iterator<Item = Region> {
+    let gic = boot.info.gic.as_ref().map(Gic::mapped);
+    boot.info
+        .uart_pl011
+        .into_iter()
+        .chain(gic.into_iter().flatten())
 }
 
 fn console_is_device_memory(boot: &Boot) -> Result<(), &'static str> {
@@ -861,10 +981,13 @@ fn pools_take_pages_from_the_frame_allocator(_: &Boot) -> Result<(), &'static st
     )
 }
 
+/// CNTFRQ_EL0 is the frequency of a machine xtask runs (spec 10): 62.5
+/// MHz of QEMU's cortex-a72 and cortex-a53 under TCG, or 24 MHz of Apple's
+/// processor under HVF; and the counter moves.
 fn virtual_counter_runs_at_the_reported_frequency(_: &Boot) -> Result<(), &'static str> {
     check(
-        timer::frequency() == 62_500_000,
-        "CNTFRQ_EL0 is not the 62.5 MHz of QEMU's cortex-a72 and cortex-a53",
+        matches!(timer::frequency(), 62_500_000 | 24_000_000),
+        "CNTFRQ_EL0 is neither the 62.5 MHz of QEMU's TCG nor the 24 MHz of HVF",
     )?;
     let start = timer::now();
     check(
@@ -1423,15 +1546,7 @@ fn kernel_memory_is_closed_to_el0(boot: &Boot) -> Result<(), &'static str> {
             "EL0 reaches the linear map",
         )
     })?;
-    let info = &boot.info;
-    for dev in [
-        info.uart_pl011,
-        info.gic_distributor,
-        info.gic_cpu_interface,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for dev in devices(boot) {
         check(
             closed(LINEAR_BASE + dev.base as usize),
             "EL0 reaches a device",

@@ -5,12 +5,11 @@ pub mod backtrace;
 pub mod cache;
 pub mod exceptions;
 pub mod gic;
+pub mod mmio;
 pub mod mmu;
 #[cfg(any(feature = "fault-probe", feature = "overflow-probe"))]
 pub mod probe;
 pub mod registers;
-#[cfg(feature = "ktest")]
-pub mod semihosting;
 pub mod symbols;
 pub mod timer;
 pub mod user;

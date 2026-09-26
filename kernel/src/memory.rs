@@ -211,7 +211,7 @@ pub fn forbid(info: &BootInfo) {
 /// INVALID_ARGS when the `pages` pages from `base`, a range
 /// kcore::window::round_out gave, touch RAM or a device of the kernel
 /// (spec 9): device_window_create checks its range against the objects
-/// the kernel keeps. O(11).
+/// the kernel keeps. O(17): kcore::window::Forbidden.
 pub fn check_window(base: u64, pages: u64) -> Result<(), Error> {
     let forbidden = FORBIDDEN.get().expect("memory::forbid ran at boot");
     window::check(base, pages, forbidden.as_slice())

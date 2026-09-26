@@ -25,6 +25,7 @@ use crate::{channel, process, session, thread};
 use core::ptr::NonNull;
 use kcore::sched::{Link, Linked, ReadyQueue};
 use kcore::sync::Lock;
+use kcore::time::stretch;
 
 /// What an item stands in the queue for.
 pub enum Work {
@@ -224,7 +225,7 @@ pub fn portion() {
             Work::Timers => crate::timer::fire(level),
         }
     }
-    let took = timer::now().saturating_sub(start);
+    let took = stretch(start, timer::now());
     crate::testpoint::portion_done();
     let mut q = QUEUE.lock();
     q.longest = q.longest.max(took);
@@ -239,7 +240,7 @@ pub fn len() -> u64 {
 /// ticks, counts toward the longest portion as one of cleanup does: both
 /// add to the blocking of any thread (KSTATS x5).
 pub fn count_portion(start: u64) {
-    let took = timer::now().saturating_sub(start);
+    let took = stretch(start, timer::now());
     let mut q = QUEUE.lock();
     q.longest = q.longest.max(took);
 }

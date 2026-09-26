@@ -20,26 +20,65 @@ pub const HEADLESS: &[&str] = &["-display", "none", "-serial", "stdio", "-monito
 /// no deadline stops time and hangs.
 pub const ICOUNT: &[&str] = &["-icount", "shift=4,sleep=off"];
 
-/// A QEMU machine type with its options, and a CPU model.
+/// A QEMU machine type with its options, a CPU model and an accelerator.
 pub struct Machine {
+    /// How xtask's lines of results name the machine.
+    pub name: &'static str,
     pub machine: &'static str,
     pub cpu: &'static str,
     pub memory: &'static str,
+    /// `-accel`: `tcg`, QEMU's own emulation, or `hvf` with its GIC
+    /// pinned (HVF_V3, HVF_V2).
+    pub accel: &'static str,
+}
+
+impl Machine {
+    /// Whether the machine runs under HVF, where an address with no device
+    /// reads as 0 (hvf_verdict).
+    pub fn is_hvf(&self) -> bool {
+        self.accel.starts_with("hvf")
+    }
+
+    /// How the kernel on this machine reaches PSCI, as its boot report
+    /// names it: through SMC when it is entered at EL2
+    /// (`virtualization=on`), through HVC otherwise.
+    pub fn psci(&self) -> &'static str {
+        if self.machine.contains("virtualization=on") {
+            "Smc"
+        } else {
+            "Hvc"
+        }
+    }
+
+    /// `memory` in bytes: a count of MiB with `M` or of GiB with `G`.
+    pub fn ram(&self) -> u64 {
+        let (count, unit) = self.memory.split_at(self.memory.len() - 1);
+        let count: u64 = count.parse().expect("a count of MiB or GiB");
+        match unit {
+            "M" => count << 20,
+            "G" => count << 30,
+            _ => panic!("{}: not in M or G", self.memory),
+        }
+    }
 }
 
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
 pub const VIRT: Machine = Machine {
+    name: "512M",
     machine: "virt,gic-version=2",
     cpu: "cortex-a72",
     memory: "512M",
+    accel: "tcg",
 };
 
 /// The kernel is entered at EL2, as on the PinePhone's Cortex-A53; PSCI then
 /// goes through SMC.
 pub const VIRT_EL2: Machine = Machine {
+    name: "EL2",
     machine: "virt,gic-version=2,virtualization=on",
     cpu: "cortex-a53",
     memory: "512M",
+    accel: "tcg",
 };
 
 /// The spec machine with 2 GiB and the PinePhone's Cortex-A53: RAM spans
@@ -48,14 +87,59 @@ pub const VIRT_EL2: Machine = Machine {
 /// the cache maintenance too; the kernel is entered at EL1 and PSCI goes
 /// through HVC, as on VIRT.
 pub const VIRT_2G: Machine = Machine {
+    name: "2G",
     machine: "virt,gic-version=2",
     cpu: "cortex-a53",
     memory: "2G",
+    accel: "tcg",
+};
+
+/// The spec machine with QEMU's GICv3 in place of the GICv2 (spec 9, 15.2):
+/// the kernel takes the version from the device tree.
+pub const VIRT_V3: Machine = Machine {
+    name: "GICv3",
+    machine: "virt,gic-version=3",
+    cpu: "cortex-a72",
+    memory: "512M",
+    accel: "tcg",
+};
+
+/// VIRT_EL2 with the GICv3: head.S opens the GICv3 system registers to EL1
+/// before it drops there.
+pub const VIRT_EL2_V3: Machine = Machine {
+    name: "EL2 GICv3",
+    machine: "virt,gic-version=3,virtualization=on",
+    cpu: "cortex-a53",
+    memory: "512M",
+    accel: "tcg",
+};
+
+/// The spec machine under HVF on Apple silicon (spec 14, 15.2) with
+/// Apple's GICv3 in the macOS kernel. kernel-irqchip is pinned: its
+/// default depends on the version of the `virt` machine. The kernel is
+/// entered at EL1; the entry at EL2 is the TCG machines' to check.
+pub const HVF_V3: Machine = Machine {
+    name: "HVF GICv3",
+    machine: "virt,gic-version=3",
+    cpu: "host",
+    memory: "512M",
+    accel: "hvf,kernel-irqchip=on",
+};
+
+/// The spec machine under HVF with QEMU's GICv2, which HVF allows only
+/// with kernel-irqchip off: the GICv2 driver on a real processor's caches
+/// and barriers, as the PinePhone's GIC-400 will have them.
+pub const HVF_V2: Machine = Machine {
+    name: "HVF GICv2",
+    machine: "virt,gic-version=2",
+    cpu: "host",
+    memory: "512M",
+    accel: "hvf,kernel-irqchip=off",
 };
 
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-machine", m.machine, "-cpu", m.cpu, "-m", m.memory, "-kernel",
+        "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory, "-kernel",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -355,7 +439,7 @@ pub fn expect_powered_off(o: &Outcome) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestReport {
     pub passed: Vec<String>,
     pub failed: Vec<(String, String)>,
@@ -399,13 +483,18 @@ pub fn parse_report(lines: &[String]) -> TestReport {
 }
 
 /// A run of tests in QEMU finished in time with status 0, some tests
-/// passed, none failed, and the run said so.
+/// passed, none failed, the run said so in its `TESTS DONE` line, and the
+/// kernel did not panic: a panic powers the machine off with status 0 as
+/// well (spec 14).
 pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     if o.timed_out {
         return Err(format!(
             "QEMU did not finish in time; last lines: {:?}",
             tail(&o.lines)
         ));
+    }
+    if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
+        return Err(format!("the kernel panicked: {panic}"));
     }
     if !r.failed.is_empty() {
         return Err(format!("{} test(s) failed: {:?}", r.failed.len(), r.failed));
@@ -451,6 +540,54 @@ pub fn counted_verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     Ok(())
 }
 
+/// The test of the test init that fails under HVF, and its reason: QEMU
+/// under HVF reads an address with no device as 0 and injects no
+/// external abort (spec 7.9), so the child reading a window on a hole does
+/// not fault.
+pub const HOLE_TEST: &str = "window_over_a_hole_faults_only_its_process";
+pub const HOLE_READS_ZERO: &str = "the child read the hole and did not fault";
+
+/// As `counted_verdict`, for a run of the test init under HVF (spec
+/// 15.2): HOLE_TEST fails with HOLE_READS_ZERO, the run counts that one
+/// failure, and every other test passes once. Any other failure, another
+/// reason, or HOLE_TEST passing fails the run: a QEMU that starts to
+/// inject the abort shows up here.
+pub fn hvf_verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
+    let hole = (HOLE_TEST.to_string(), HOLE_READS_ZERO.to_string());
+    if r.failed != [hole] || r.done != Some(1) {
+        return Err(format!(
+            "under HVF only {HOLE_TEST} fails, with {HOLE_READS_ZERO:?}; this run failed {:?}, counting {:?}",
+            r.failed, r.done
+        ));
+    }
+    let mut all = r.clone();
+    all.passed.push(HOLE_TEST.to_string());
+    all.failed.clear();
+    all.done = Some(0);
+    counted_verdict(o, &all)
+}
+
+/// Why `cargo xtask hvf` cannot run here, if it cannot (spec 14): the host
+/// must be macOS on Apple silicon (`os`, `arch` as std::env::consts gives
+/// them), `sysctl -n kern.hv_support` must print 1, which a Mac in a
+/// virtual machine without nested virtualization does not, and
+/// `qemu-system-aarch64 -accel help` must run and list hvf.
+pub fn hvf_host(os: &str, arch: &str, hv_support: &str, accels: &str) -> Result<(), String> {
+    if (os, arch) != ("macos", "aarch64") {
+        return Err(format!("this is {os} on {arch}"));
+    }
+    if hv_support.trim() != "1" {
+        return Err("kern.hv_support is not 1".into());
+    }
+    if accels.trim().is_empty() {
+        return Err("qemu-system-aarch64 did not run".into());
+    }
+    if !accels.lines().any(|l| l.trim() == "hvf") {
+        return Err("qemu-system-aarch64 -accel help lists no hvf".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +622,93 @@ mod tests {
         assert!(joined.contains("-m 2G"));
         assert!(joined.contains("-cpu cortex-a53"));
         assert!(!joined.contains("virtualization"));
+    }
+
+    #[test]
+    fn gicv3_machines_ask_for_gic_version_3() {
+        let joined = args(&VIRT_V3, Path::new("k.img"), None).join(" ");
+        assert!(joined.contains("-machine virt,gic-version=3 "));
+        assert!(joined.contains("-cpu cortex-a72"));
+        assert!(joined.contains("-m 512M"));
+        let joined = args(&VIRT_EL2_V3, Path::new("k.img"), None).join(" ");
+        assert!(joined.contains("-machine virt,gic-version=3,virtualization=on"));
+        assert!(joined.contains("-cpu cortex-a53"));
+    }
+
+    #[test]
+    fn hvf_machines_pin_the_irqchip() {
+        let v3 = args(&HVF_V3, Path::new("k.img"), None).join(" ");
+        assert!(v3.contains("-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on "));
+        let v2 = args(&HVF_V2, Path::new("k.img"), None).join(" ");
+        assert!(v2.contains("-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off "));
+        for m in [&HVF_V3, &HVF_V2] {
+            let a = args(m, Path::new("k.img"), None).join(" ");
+            assert!(m.is_hvf());
+            assert!(a.contains("-cpu host -m 512M"));
+            assert!(!a.contains("virtualization"));
+        }
+        for m in [&VIRT, &VIRT_EL2, &VIRT_2G, &VIRT_V3, &VIRT_EL2_V3] {
+            assert!(!m.is_hvf(), "{}", m.name);
+            assert!(
+                args(m, Path::new("k.img"), None)
+                    .join(" ")
+                    .contains("-accel tcg ")
+            );
+        }
+    }
+
+    #[test]
+    fn hvf_needs_macos_on_apple_silicon() {
+        let accels = "Accelerators supported in QEMU binary:\ntcg\nhvf\n";
+        assert_eq!(hvf_host("macos", "aarch64", "1\n", accels), Ok(()));
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("macos", "x86_64"),
+            ("linux", "x86_64"),
+        ] {
+            assert!(hvf_host(os, arch, "1\n", accels).is_err(), "{os} {arch}");
+        }
+        for hv in ["0\n", ""] {
+            assert!(hvf_host("macos", "aarch64", hv, accels).is_err(), "{hv:?}");
+        }
+        let tcg_only = "Accelerators supported in QEMU binary:\ntcg\n";
+        assert!(hvf_host("macos", "aarch64", "1\n", tcg_only).is_err());
+        assert_eq!(
+            hvf_host("macos", "aarch64", "1\n", ""),
+            Err("qemu-system-aarch64 did not run".into())
+        );
+    }
+
+    #[test]
+    fn hvf_verdict_accepts_only_the_hole() {
+        let hole = format!("TEST {HOLE_TEST} FAIL {HOLE_READS_ZERO}");
+        let run = |l: &[&str]| {
+            let o = finished(l);
+            hvf_verdict(&o, &parse_report(&o.lines))
+        };
+        let with_hole = ["TEST a ok", &hole, "TESTS DONE total=2 failed=1"];
+        assert_eq!(run(&with_hole), Ok(()));
+        for reason in [
+            "the child faulted twice",
+            "the child did not end with a fault",
+        ] {
+            let other = format!("TEST {HOLE_TEST} FAIL {reason}");
+            assert!(run(&["TEST a ok", &other, "TESTS DONE total=2 failed=1"]).is_err());
+        }
+        assert!(run(&["TEST a FAIL x", &hole, "TESTS DONE total=2 failed=2"]).is_err());
+        assert!(run(&["TEST a ok", &hole, "TESTS DONE total=2 failed=2"]).is_err());
+        let hole_passes = format!("TEST {HOLE_TEST} ok");
+        assert!(run(&["TEST a ok", &hole_passes, "TESTS DONE total=2 failed=0"]).is_err());
+        assert!(run(&["TEST a ok", &hole, "TESTS DONE total=3 failed=1"]).is_err());
+        assert!(
+            run(&[
+                "TEST a ok",
+                &hole,
+                "TESTS DONE total=2 failed=1",
+                "KERNEL PANIC: x"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -840,6 +1064,27 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ..with(&["TEST a ok", "TESTS DONE failed=0"])
         };
         assert!(verdict(&bad_status, &parse_report(&bad_status.lines)).is_err());
+    }
+
+    #[test]
+    fn verdict_needs_the_tests_done_line() {
+        let cut = finished(&["TEST a ok", "TEST b ok"]);
+        assert!(verdict(&cut, &parse_report(&cut.lines)).is_err());
+        let done = finished(&["TEST a ok", "TEST b ok", "TESTS DONE failed=0"]);
+        assert!(verdict(&done, &parse_report(&done.lines)).is_ok());
+    }
+
+    /// A panic powers the machine off with status 0 (spec 14), so only its
+    /// line tells it from a clean end.
+    #[test]
+    fn verdict_rejects_a_panic_after_the_report() {
+        for panic in [
+            "KERNEL PANIC: panicked at kernel/src/ktest.rs:1:1:",
+            "KERNEL PANIC while panicking; parking",
+        ] {
+            let o = finished(&["TEST a ok", "TESTS DONE failed=0", "", panic]);
+            assert!(verdict(&o, &parse_report(&o.lines)).is_err(), "{panic}");
+        }
     }
 
     fn finished(l: &[&str]) -> Outcome {

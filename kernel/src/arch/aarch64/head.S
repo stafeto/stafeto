@@ -93,6 +93,24 @@ primary_entry:
     msr     vmpidr_el2, x1
     ldr     x1, =SCTLR_MMU_OFF
     msr     sctlr_el1, x1
+    // A GICv3 CPU interface (ID_AA64PFR0_EL1.GIC not 0) is reached through
+    // system registers only once EL2 lets EL1 do so: ICC_SRE_EL2.SRE and
+    // Enable, without which EL1's access to ICC_SRE_EL1 goes to EL2, which
+    // has no vectors [G39]. ICH_HCR_EL2 = 0 keeps the virtual CPU
+    // interface off.
+    // A GICv2 CPU has no such registers: the field is 0 and this is skipped.
+    mrs     x1, id_aa64pfr0_el1
+    ubfx    x1, x1, #24, #4         // ID_AA64PFR0_EL1.GIC
+    cbz     x1, .Lgic_done
+    mrs     x1, icc_sre_el2
+    orr     x1, x1, #(1 << 0)       // SRE
+    orr     x1, x1, #(1 << 3)       // Enable: EL1 may reach ICC_SRE_EL1
+    msr     icc_sre_el2, x1
+    isb
+    mrs     x1, icc_sre_el2
+    tbz     x1, #0, .Lgic_done      // SRE did not stick: no GICv3 CPU interface
+    msr     ich_hcr_el2, xzr
+.Lgic_done:
     mov     x1, #0x3c5              // SPSR_EL2: EL1h with D, A, I, F masked
     msr     spsr_el2, x1
     adr     x1, at_el1

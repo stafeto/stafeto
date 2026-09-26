@@ -6,6 +6,7 @@
 //! the PSCI conduit.
 
 use crate::fdt::{Event, Fdt, FdtError, MAX_DEPTH, be32, be64};
+use crate::gic::REDISTRIBUTOR_WINDOW;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
@@ -81,6 +82,50 @@ impl<const N: usize> Default for RegionList<N> {
 /// `kcore::window::Forbidden`).
 pub const MEMORY_REGIONS: usize = 8;
 
+/// The regions of the interrupt controller's node, at most (`Gic::regs`,
+/// `kcore::window::Forbidden`).
+pub const GIC_REGIONS: usize = 8;
+
+/// The architecture of the interrupt controller, from its node's
+/// `compatible` (spec 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GicVersion {
+    /// `arm,cortex-a15-gic` or `arm,gic-400`.
+    V2,
+    /// `arm,gic-v3`.
+    V3,
+}
+
+/// The interrupt controller's node (spec 9): its version and every region
+/// of its `reg` in the node's order, at least two. A GICv2 has the
+/// distributor, the CPU interface, then maybe the virtual interface
+/// control and the virtual CPU interface; a GICv3 has the distributor,
+/// the redistributor regions, then maybe the GICv2 CPU interface, the
+/// virtual interface control and the virtual CPU interface. Child nodes
+/// (MSI frames, ITS) are other nodes and not part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gic {
+    pub version: GicVersion,
+    pub regs: RegionList<GIC_REGIONS>,
+}
+
+impl Gic {
+    /// The two blocks the kernel maps and drives: the distributor, and the
+    /// CPU interface of a GICv2 or the first REDISTRIBUTOR_WINDOW bytes of
+    /// the first redistributor region of a GICv3.
+    pub fn mapped(&self) -> [Region; 2] {
+        let [dist, second] = [self.regs.as_slice()[0], self.regs.as_slice()[1]];
+        let cpu = match self.version {
+            GicVersion::V2 => second,
+            GicVersion::V3 => Region {
+                base: second.base,
+                size: second.size.min(REDISTRIBUTOR_WINDOW),
+            },
+        };
+        [dist, cpu]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootInfo {
     pub memory: RegionList<MEMORY_REGIONS>,
@@ -89,8 +134,8 @@ pub struct BootInfo {
     pub no_map: RegionList<8>,
     pub initrd: Option<Region>,
     pub uart_pl011: Option<Region>,
-    pub gic_distributor: Option<Region>,
-    pub gic_cpu_interface: Option<Region>,
+    /// The first enabled node of an interrupt controller the kernel knows.
+    pub gic: Option<Gic>,
     pub psci: PsciConduit,
 }
 
@@ -145,6 +190,18 @@ impl<'a> Node<'a> {
         self.compatible
             .split(|&b| b == 0)
             .any(|s| s == wanted.as_bytes())
+    }
+
+    /// The version of a GIC node the kernel drives (spec 9); None for any
+    /// other node.
+    fn gic_version(&self) -> Option<GicVersion> {
+        if self.is_compatible("arm,cortex-a15-gic") || self.is_compatible("arm,gic-400") {
+            Some(GicVersion::V2)
+        } else if self.is_compatible("arm,gic-v3") {
+            Some(GicVersion::V3)
+        } else {
+            None
+        }
     }
 
     fn named(&self, base: &str) -> bool {
@@ -237,14 +294,15 @@ fn classify(
         }
     }
     if top && node.name == "chosen" {
+        // Only a start or only an end is no initrd, as Linux takes it; the
+        // kernel then stops with "no boot image" (spec 3.3).
         info.initrd = match (node.initrd_start, node.initrd_end) {
-            (None, None) => None,
-            (Some(s), Some(e)) if e == s => None,
             (Some(s), Some(e)) if e > s => Some(Region {
                 base: s,
                 size: e - s,
             }),
-            _ => return Err(BootInfoError::BadInitrd),
+            (Some(s), Some(e)) if e < s => return Err(BootInfoError::BadInitrd),
+            _ => None,
         };
     }
     if top && node.named("psci") {
@@ -260,10 +318,17 @@ fn classify(
     if info.uart_pl011.is_none() && node.is_compatible("arm,pl011") {
         info.uart_pl011 = RegIter::new(node.reg, cells)?.next().transpose()?;
     }
-    if node.is_compatible("arm,cortex-a15-gic") || node.is_compatible("arm,gic-400") {
-        let mut regs = RegIter::new(node.reg, cells)?;
-        info.gic_distributor = regs.next().transpose()?;
-        info.gic_cpu_interface = regs.next().transpose()?;
+    if info.gic.is_none()
+        && let Some(version) = node.gic_version()
+    {
+        let mut regs = RegionList::new();
+        for r in RegIter::new(node.reg, cells)? {
+            regs.push(r?)?;
+        }
+        if regs.as_slice().len() < 2 {
+            return Err(BootInfoError::BadReg);
+        }
+        info.gic = Some(Gic { version, regs });
     }
     Ok(())
 }
@@ -277,8 +342,7 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
         no_map: RegionList::new(),
         initrd: None,
         uart_pl011: None,
-        gic_distributor: None,
-        gic_cpu_interface: None,
+        gic: None,
         psci: PsciConduit::None,
     };
     let mut stack = [Node::new(""); MAX_DEPTH + 1];
@@ -296,8 +360,12 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
             Event::Prop { name, value } => {
                 let node = &mut stack[depth];
                 match name {
-                    "#address-cells" => node.child_cells.address = be32(value, 0).unwrap_or(2),
-                    "#size-cells" => node.child_cells.size = be32(value, 0).unwrap_or(1),
+                    "#address-cells" => {
+                        node.child_cells.address = be32(value, 0).unwrap_or(DEFAULT_CELLS.address)
+                    }
+                    "#size-cells" => {
+                        node.child_cells.size = be32(value, 0).unwrap_or(DEFAULT_CELLS.size)
+                    }
                     "compatible" => node.compatible = value,
                     "reg" => node.reg = value,
                     "device_type" => node.device_type = value,
@@ -337,12 +405,14 @@ pub fn parse(fdt: &Fdt<'_>) -> Result<BootInfo, BootInfoError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fdt::Builder;
 
     fn info(blob: &[u8]) -> Result<BootInfo, BootInfoError> {
         parse(&Fdt::new(blob).unwrap())
     }
 
     const VIRT: &[u8] = include_bytes!("../tests/fixtures/virt.dtb");
+    const VIRT_GICV3: &[u8] = include_bytes!("../tests/fixtures/virt-gicv3.dtb");
     const A64: &[u8] = include_bytes!("../tests/fixtures/a64-like.dtb");
     const NOCELLS: &[u8] = include_bytes!("../tests/fixtures/nocells.dtb");
     const NOMEM: &[u8] = include_bytes!("../tests/fixtures/nomem.dtb");
@@ -364,8 +434,16 @@ mod tests {
     fn virt_devices_skip_disabled_nodes() {
         let i = info(VIRT).unwrap();
         assert_eq!(i.uart_pl011, Some(region(0x0900_0000, 0x1000)));
-        assert_eq!(i.gic_distributor, Some(region(0x0800_0000, 0x1_0000)));
-        assert_eq!(i.gic_cpu_interface, Some(region(0x0801_0000, 0x1_0000)));
+        let gic = i.gic.unwrap();
+        assert_eq!(gic.version, GicVersion::V2);
+        assert_eq!(
+            gic.regs.as_slice(),
+            [region(0x0800_0000, 0x1_0000), region(0x0801_0000, 0x1_0000)]
+        );
+        assert_eq!(
+            gic.mapped(),
+            [gic.regs.as_slice()[0], gic.regs.as_slice()[1]]
+        );
     }
 
     #[test]
@@ -381,10 +459,119 @@ mod tests {
         let i = info(A64).unwrap();
         assert_eq!(i.memory.as_slice(), [region(0x4000_0000, 0x8000_0000)]);
         assert_eq!(i.initrd, Some(region(0x4ff0_0000, 0x1_0000)));
-        assert_eq!(i.gic_distributor, Some(region(0x01c8_1000, 0x1000)));
-        assert_eq!(i.gic_cpu_interface, Some(region(0x01c8_2000, 0x2000)));
         assert_eq!(i.psci, PsciConduit::Smc);
         assert_eq!(i.uart_pl011, None);
+    }
+
+    #[test]
+    fn gic_node_keeps_every_reg() {
+        let gic = info(A64).unwrap().gic.unwrap();
+        assert_eq!(gic.version, GicVersion::V2);
+        assert_eq!(
+            gic.regs.as_slice(),
+            [
+                region(0x01c8_1000, 0x1000),
+                region(0x01c8_2000, 0x2000),
+                region(0x01c8_4000, 0x2000),
+                region(0x01c8_6000, 0x2000)
+            ]
+        );
+        assert_eq!(
+            gic.mapped(),
+            [region(0x01c8_1000, 0x1000), region(0x01c8_2000, 0x2000)]
+        );
+    }
+
+    #[test]
+    fn gicv3_node_gives_distributor_and_redistributors() {
+        let i = info(VIRT_GICV3).unwrap();
+        let gic = i.gic.unwrap();
+        assert_eq!(gic.version, GicVersion::V3);
+        assert_eq!(
+            gic.regs.as_slice(),
+            [
+                region(0x0800_0000, 0x1_0000),
+                region(0x080A_0000, 0xF6_0000)
+            ]
+        );
+        assert_eq!(
+            gic.mapped(),
+            [
+                region(0x0800_0000, 0x1_0000),
+                region(0x080A_0000, REDISTRIBUTOR_WINDOW)
+            ]
+        );
+        assert_eq!(i.uart_pl011, Some(region(0x0900_0000, 0x1000)));
+        assert_eq!(i.psci, PsciConduit::Hvc);
+    }
+
+    /// A tree with 64 MiB of RAM and a GIC node of `compatible` with
+    /// `regs` (address and size cells of two words), which holds `child`,
+    /// a node of that `compatible` with one region, if any.
+    fn tree_with_gic(
+        compatible: &str,
+        regs: &[(u64, u64)],
+        child: Option<(&str, (u64, u64))>,
+    ) -> Vec<u8> {
+        let words =
+            |(base, size): (u64, u64)| [base, size].map(|w| [(w >> 32) as u32, w as u32]).concat();
+        let string = |s: &str| [s.as_bytes(), b"\0"].concat();
+        let mut b = Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("memory@40000000")
+            .prop("device_type", b"memory\0")
+            .cells("reg", &words((0x4000_0000, 0x400_0000)))
+            .end()
+            .begin("intc@8000000")
+            .prop("compatible", &string(compatible))
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .cells(
+                "reg",
+                &regs.iter().flat_map(|&r| words(r)).collect::<Vec<_>>(),
+            );
+        if let Some((compatible, reg)) = child {
+            b = b
+                .begin("frame")
+                .prop("compatible", &string(compatible))
+                .cells("reg", &words(reg))
+                .end();
+        }
+        b.end().end().finish()
+    }
+
+    #[test]
+    fn gic_children_are_not_taken() {
+        let its = info(VIRT_GICV3).unwrap().gic.unwrap();
+        assert_eq!(its.regs.as_slice().len(), 2);
+        assert!(its.regs.as_slice().iter().all(|r| r.base != 0x0808_0000));
+        let gic = [(0x0800_0000, 0x1_0000), (0x0801_0000, 0x1_0000)];
+        let v2m = Some(("arm,gic-v2m-frame", (0x0802_0000, 0x1000)));
+        let tree = tree_with_gic("arm,cortex-a15-gic", &gic, v2m);
+        let v2m = info(&tree).unwrap().gic.unwrap();
+        assert_eq!(v2m.regs.as_slice(), gic.map(|(b, s)| region(b, s)));
+    }
+
+    #[test]
+    fn gic_with_too_many_regs_is_an_error() {
+        let regs: Vec<_> = (0..GIC_REGIONS as u64 + 1)
+            .map(|i| (0x0800_0000 + i * 0x1_0000, 0x1_0000))
+            .collect();
+        let most = tree_with_gic("arm,gic-v3", &regs[..GIC_REGIONS], None);
+        assert_eq!(
+            info(&most).unwrap().gic.unwrap().regs.as_slice().len(),
+            GIC_REGIONS
+        );
+        let more = tree_with_gic("arm,gic-v3", &regs, None);
+        assert_eq!(info(&more).err(), Some(BootInfoError::TooManyRegions));
+    }
+
+    #[test]
+    fn gic_with_one_reg_is_an_error() {
+        let one = tree_with_gic("arm,gic-400", &[(0x0800_0000, 0x1000)], None);
+        assert_eq!(info(&one).err(), Some(BootInfoError::BadReg));
     }
 
     #[test]
@@ -403,6 +590,38 @@ mod tests {
     #[test]
     fn initrd_ending_before_it_starts_is_an_error() {
         assert_eq!(info(BADINITRD).err(), Some(BootInfoError::BadInitrd));
+    }
+
+    /// A tree with 64 MiB of RAM whose `chosen` node has `prop`, one of
+    /// the two properties of the initrd, and not the other.
+    fn tree_with_half_an_initrd(prop: &str) -> Vec<u8> {
+        Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("memory@40000000")
+            .prop("device_type", b"memory\0")
+            .cells("reg", &[0, 0x4000_0000, 0, 0x400_0000])
+            .end()
+            .begin("chosen")
+            .cells(prop, &[0, 0x4200_0000])
+            .end()
+            .end()
+            .finish()
+    }
+
+    #[test]
+    fn initrd_with_only_a_start_is_ignored() {
+        let i = info(&tree_with_half_an_initrd("linux,initrd-start")).unwrap();
+        assert_eq!(i.initrd, None);
+        assert_eq!(i.memory.as_slice(), [region(0x4000_0000, 0x400_0000)]);
+    }
+
+    #[test]
+    fn initrd_with_only_an_end_is_ignored() {
+        let i = info(&tree_with_half_an_initrd("linux,initrd-end")).unwrap();
+        assert_eq!(i.initrd, None);
+        assert_eq!(i.memory.as_slice(), [region(0x4000_0000, 0x400_0000)]);
     }
 
     #[test]
@@ -440,7 +659,7 @@ mod tests {
 
     #[test]
     fn never_panics_on_any_single_corrupted_byte() {
-        for blob in [VIRT, A64] {
+        for blob in [VIRT, VIRT_GICV3, A64] {
             for i in 0..blob.len() {
                 let mut b = blob.to_vec();
                 b[i] ^= 0x5a;

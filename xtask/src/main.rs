@@ -7,8 +7,10 @@ mod elf;
 mod image;
 mod qemu;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
@@ -104,8 +106,19 @@ const INIT_LINES: [&str; 9] = [
     "thread 2: turn 3",
     "init: both threads are done",
 ];
+/// Where RAM starts on QEMU's `virt`.
+const VIRT_RAM: u64 = 0x4000_0000;
+/// The kernel's lines of the GIC on QEMU's GICv2 and GICv3 (spec 9).
+const GIC_V2_LINE: &str = "gic        v2 distributor 0x8000000, cpu interface 0x8010000";
+const GIC_V3_LINE: &str = "gic        v3 distributor 0x8000000, redistributor 0x80a0000";
 /// The kernel's last line when init exits with 0 (spec 7.9).
 const INIT_EXIT: &str = "init exited with code 0";
+/// The test init's exit under HVF, where one of its tests fails
+/// (qemu::hvf_verdict): its code is its count of failures.
+const INIT_EXIT_HOLE: &str = "init exited with code 1";
+/// The frequency of the counter of Apple's processors (CNTFRQ_EL0), which
+/// HVF passes on.
+const HVF_HZ: u64 = 24_000_000;
 /// Lines of a run of the test init (tests/init) besides its TEST lines,
 /// each whole: a formatted line longer than one debug_write, all 64 bytes
 /// of x2-x9 in one debug_write, the bytes of a debug_write's length and no
@@ -158,7 +171,7 @@ const INIT_TESTS: u32 = 179;
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
 
-/// Kernel builds xtask makes; each keeps its own ELF and image under target/.
+/// Kernel builds xtask makes; each keeps its own ELF and image under target_dir().
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Variant {
     Normal,
@@ -217,6 +230,8 @@ commands:
   test      host tests, then boot checks, init tests and kernel tests in QEMU
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci        formatting, clippy, then everything `test` does
+  hvf       boot checks, init tests and kernel tests under HVF on a Mac with
+            Apple silicon, on Apple's GICv3 and QEMU's GICv2; skips elsewhere
   help      this text";
 
 fn main() {
@@ -227,6 +242,7 @@ fn main() {
         Some("test") => test(),
         Some("gdb") => gdb(),
         Some("ci") => ci(),
+        Some("hvf") => hvf(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -244,6 +260,40 @@ fn root() -> PathBuf {
         .parent()
         .expect("xtask lives in the workspace")
         .to_path_buf()
+}
+
+/// Where cargo writes its builds: CARGO_TARGET_DIR when it is set, else
+/// target/ of the workspace.
+fn target_dir() -> PathBuf {
+    target_dir_of(std::env::var_os("CARGO_TARGET_DIR"), &root())
+}
+
+/// target_dir with CARGO_TARGET_DIR as `var`: a relative directory is
+/// taken from `root`, where xtask runs cargo.
+fn target_dir_of(var: Option<OsString>, root: &Path) -> PathBuf {
+    root.join(var.unwrap_or_else(|| "target".into()))
+}
+
+/// The file cargo builds for `package` on `triple` with `--release`
+/// under the directory `target`.
+fn cargo_output(target: &Path, triple: &str, package: &str) -> PathBuf {
+    target.join(triple).join("release").join(package)
+}
+
+/// What `make` gives for `key`: made at the first call for `key` in this
+/// run of xtask and kept in `made` for the calls after it.
+fn once<K: PartialEq, T: Clone>(
+    made: &Mutex<Vec<(K, T)>>,
+    key: K,
+    make: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut made = made.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, t)) = made.iter().find(|(k, _)| *k == key) {
+        return Ok(t.clone());
+    }
+    let t = make()?;
+    made.push((key, t.clone()));
+    Ok(t)
 }
 
 fn cargo() -> Command {
@@ -293,13 +343,29 @@ fn llvm_tool(name: &str) -> Result<PathBuf, String> {
     }
 }
 
+#[derive(Clone)]
 struct Artifacts {
     elf: PathBuf,
     image: PathBuf,
     boot_image: PathBuf,
 }
 
+/// The kernel builds of this run of xtask, one per variant.
+static BUILDS: Mutex<Vec<(Variant, Artifacts)>> = Mutex::new(Vec::new());
+/// A boot image name with the programs it names: the name stands for its
+/// programs, so a cache keyed on both never returns another list's image.
+type BootImageKey = (&'static str, &'static [(&'static str, &'static str, u32)]);
+/// The boot images of this run of xtask, one per name and program list.
+static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new());
+
+/// The kernel image of `variant` and the boot image of the normal build,
+/// each built once in a run of xtask, whatever number of checks takes
+/// them.
 fn build(variant: Variant) -> Result<Artifacts, String> {
+    once(&BUILDS, variant, || build_kernel(variant))
+}
+
+fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     let mut cmd = cargo();
     cmd.args([
         "build",
@@ -313,12 +379,12 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
         cmd.args(["--features", feature]);
     }
     run_cmd(&mut cmd)?;
-    let target = root().join("target");
+    let target = target_dir();
     // Every variant writes the same cargo output path; a copy next to each image
     // keeps the symbols that match it.
     let elf = target.join(format!("{}.elf", variant.stem()));
     let image = target.join(format!("{}.img", variant.stem()));
-    let built = target.join(KERNEL_TARGET).join("release").join("kernel");
+    let built = cargo_output(&target, KERNEL_TARGET, "kernel");
     std::fs::copy(&built, &elf)
         .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
     run_cmd(
@@ -344,20 +410,30 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     })
 }
 
-/// Builds `programs` for EL0 and, under target/, a boot image `name` whose
-/// files they are, in their order, each with its name and the stack size
-/// its header asks for (spec 3.3, 13.1).
-fn build_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
+/// Builds `programs` for EL0 and, under target_dir, a boot image `name`
+/// whose files they are, in their order, each with its name and the stack
+/// size its header asks for (spec 3.3, 13.1); once in a run of xtask for
+/// this `(name, programs)` pair.
+fn build_boot_image(
+    name: &'static str,
+    programs: &'static [(&'static str, &'static str, u32)],
+) -> Result<PathBuf, String> {
+    once(&BOOT_IMAGES, (name, programs), || {
+        write_boot_image(name, programs)
+    })
+}
+
+fn write_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
     let mut cmd = cargo();
     cmd.args(["build", "--release", "--target", PROGRAM_TARGET]);
     for (_, package, _) in programs {
         cmd.args(["--package", package]);
     }
     run_cmd(&mut cmd)?;
-    let target = root().join("target");
+    let target = target_dir();
     let mut files = Vec::new();
     for &(file, package, stack) in programs {
-        let elf = target.join(PROGRAM_TARGET).join("release").join(package);
+        let elf = cargo_output(&target, PROGRAM_TARGET, package);
         let why = |e: String| format!("{}: {e}", elf.display());
         let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
         let program = elf::program(&bytes, stack).map_err(why)?;
@@ -454,8 +530,10 @@ fn run() -> Result<(), String> {
 
 fn test() -> Result<(), String> {
     host_tests()?;
-    boot_smoke()?;
-    el2_boot_smoke()?;
+    boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
+    boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
+    boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
+    boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
@@ -467,8 +545,10 @@ fn test() -> Result<(), String> {
     init_tests(&qemu::VIRT_2G, false)?;
     init_tests(&qemu::VIRT, true)?;
     init_tests(&qemu::VIRT_2G, true)?;
+    init_tests(&qemu::VIRT_V3, false)?;
     kernel_tests(&qemu::VIRT, Variant::Test)?;
     kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
+    kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
     kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
     kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
     println!("all checks passed");
@@ -498,37 +578,69 @@ fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
     qemu::expect_clean_exit_with(o, INIT_EXIT)
 }
 
-/// A normal build boots, prints its report with the timer frequency and
-/// init's entry point from the boot image, starts init, and powers the
-/// machine off when init exits. The image also carries none of the
-/// kernel's own tests (spec 3.4): `no_test_symbols` checks it here so
-/// every normal build, not just the one that ships, is covered.
-fn boot_smoke() -> Result<(), String> {
+/// A normal build boots on machine `m`, prints its report (boot_report)
+/// with the line of the GIC, `gic`, and init's entry point from the boot
+/// image, starts init, and powers the machine off when init exits. Gives
+/// the timer's frequency. On VIRT_EL2 and VIRT_EL2_V3 the kernel is
+/// entered at EL2, as the PinePhone's loader does: head.S must drop to
+/// EL1, with a GICv3 open its system registers to EL1 first, and power-off
+/// goes through SMC. The image also carries none of the kernel's own
+/// tests (spec 3.4): `no_test_symbols` checks it here so every normal
+/// build, not just the one that ships, is covered.
+fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let a = build(Variant::Normal)?;
     no_test_symbols(&a.elf)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")?;
     expect_init_run(&o)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
-    match qemu::number_after(&o.lines, "timer ") {
-        Some(hz) if hz > 0 => Ok(()),
-        _ => Err("the kernel printed no `timer N Hz` line".into()),
-    }
+    let size = std::fs::metadata(&a.boot_image)
+        .map_err(|e| format!("{}: {e}", a.boot_image.display()))?
+        .len();
+    boot_report(&o.lines, m, size, gic)
 }
 
-/// The same build entered at EL2, as the PinePhone's loader does: head.S
-/// must drop to EL1, and power-off goes through SMC. Not the ktest build: its
-/// device tree test expects HVC.
-fn el2_boot_smoke() -> Result<(), String> {
-    let a = build(Variant::Normal)?;
-    let mut cmd = qemu::command(&qemu::VIRT_EL2, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    qemu::expect_clean_exit_with(&o, "boot complete")?;
-    expect_init_run(&o)
+/// The kernel's boot report (spec 3.3) on machine `m` with a boot image of
+/// `boot_image` bytes and the line of the GIC `gic`: the lines of `m`'s
+/// RAM at VIRT_RAM, the boot image, the GIC, `m`'s PSCI conduit, the timer
+/// and `boot complete`, each whole. Gives the timer's frequency, which
+/// depends on the host.
+fn boot_report(
+    lines: &[String],
+    m: &qemu::Machine,
+    boot_image: u64,
+    gic: &str,
+) -> Result<u64, String> {
+    let memory = format!("memory     {VIRT_RAM:#x}..{:#x}", VIRT_RAM + m.ram());
+    let psci = format!("psci       {}", m.psci());
+    for line in [memory.as_str(), gic, psci.as_str(), "boot complete"] {
+        if !lines.iter().any(|l| l == line) {
+            return Err(format!("the boot report has no line {line:?}"));
+        }
+    }
+    let hex = |s: &str| u64::from_str_radix(s.strip_prefix("0x")?, 16).ok();
+    let image = lines.iter().find_map(|l| {
+        let (start, end) = l.strip_prefix("boot image ")?.split_once("..")?;
+        hex(end)?.checked_sub(hex(start)?)
+    });
+    if image != Some(boot_image) {
+        return Err(format!(
+            "the boot report has no line of a boot image of {boot_image} bytes"
+        ));
+    }
+    lines
+        .iter()
+        .find_map(|l| {
+            l.strip_prefix("timer      ")?
+                .strip_suffix(" Hz")?
+                .parse()
+                .ok()
+        })
+        .filter(|&hz| hz > 0)
+        .ok_or_else(|| "the boot report has no line `timer N Hz`".into())
 }
 
 /// With 2 GiB of RAM the second GiB is not mapped at boot: the allocator
@@ -598,7 +710,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
             "init: no memory object for its data segment",
         ),
     ];
-    let path = root().join("target").join("bad-boot.img");
+    let path = target_dir().join("bad-boot.img");
     for (bytes, marker) in cases {
         if let Some(b) = bytes {
             std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -622,7 +734,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
 /// process makes the kernel panic with «killed», and no fault is printed.
 fn init_fault_stops_the_machine() -> Result<(), String> {
     let a = build(Variant::Normal)?;
-    let path = root().join("target").join("fault-init.img");
+    let path = target_dir().join("fault-init.img");
     let run = |image: Vec<u8>| {
         std::fs::write(&path, image).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
@@ -758,17 +870,18 @@ fn stack_overflow_report() -> Result<(), String> {
     qemu::overflow_report_names(&o.lines, f)
 }
 
-/// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
-/// through semihosting. On 2 GiB the tests also cover RAM the boot page
-/// tables did not map. Every test the kernel counts passes once. The
-/// `icount` build runs under qemu::ICOUNT, where virtual time counts
-/// instructions: the tests that depend on how much of a quantum is left
-/// run only there. A hang, such as a quantum that never ends, fails at
-/// TEST_TIMEOUT.
-fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
+/// Kernel built with `ktest` on machine `m`: runs its tests, prints
+/// `TESTS DONE` and powers the machine off through PSCI (spec 14). On 2
+/// GiB the tests also cover RAM the boot page tables did not map. Every
+/// test the kernel counts passes once. The `icount` build runs under
+/// qemu::ICOUNT, where virtual time counts instructions: the tests that
+/// depend on how much of a quantum is left run only there. A hang, such
+/// as a quantum that never ends, fails at TEST_TIMEOUT. Gives the number
+/// of tests that passed.
+fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     let a = build(variant)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS).arg("-semihosting");
+    cmd.args(qemu::HEADLESS);
     let icount = variant == Variant::TestIcount;
     if icount {
         cmd.args(qemu::ICOUNT);
@@ -786,7 +899,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     let under = if icount { " under icount" } else { "" };
     println!(
         "kernel tests{under} on {}: {} passed",
-        m.memory,
+        m.name,
         r.passed.len()
     );
     if icount {
@@ -798,10 +911,10 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
             ("device window", &WINDOW_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
-            println!("{what} ticks on {}: {}", m.memory, rows_of(rows, &ticks));
+            println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
     }
-    Ok(())
+    Ok(r.passed.len())
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -848,7 +961,10 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// a counted loop took, which under -icount must be the loop's
 /// instructions; there it also prints the costs of the build that ships
 /// (NORMAL_BUILD_ROWS), which fail nothing by their numbers (spec 15.3).
-fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
+/// Under HVF qemu::hvf_verdict judges the run: the test of a window on a
+/// hole fails, one child fewer faults, and init exits with 1. Gives the
+/// number of tests that passed.
+fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     let a = build(Variant::Normal)?;
     let image = build_boot_image("boot-test.img", &TEST_PROGRAMS)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
@@ -858,14 +974,20 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
     }
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
-    qemu::counted_verdict(&o, &r)?;
+    let hvf = m.is_hvf();
+    if hvf {
+        qemu::hvf_verdict(&o, &r)?;
+    } else {
+        qemu::counted_verdict(&o, &r)?;
+    }
     if r.total != Some(INIT_TESTS) {
         return Err(format!(
             "the test init has {:?} tests, {INIT_TESTS} expected",
             r.total
         ));
     }
-    for line in TEST_INIT_LINES.into_iter().chain([INIT_EXIT]) {
+    let exit = if hvf { INIT_EXIT_HOLE } else { INIT_EXIT };
+    for line in TEST_INIT_LINES.into_iter().chain([exit]) {
         qemu::expect_line(&o, line)?;
     }
     child_panic_comes_whole(&o.lines)?;
@@ -874,9 +996,10 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         .iter()
         .filter(|l| l.starts_with("process fault: "))
         .count();
-    if faults != CHILD_FAULTS {
+    let made = CHILD_FAULTS - usize::from(hvf);
+    if faults != made {
         return Err(format!(
-            "{faults} process fault lines; the test init makes {CHILD_FAULTS}"
+            "{faults} process fault lines; the test init makes {made}"
         ));
     }
     let ticks = qemu::number_after(&o.lines, "counter ticks of 10000 turns: ")
@@ -887,20 +1010,16 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         ));
     }
     let under = if icount { " under icount" } else { "" };
-    println!(
-        "init tests{under} on {}: {} passed",
-        m.memory,
-        r.passed.len()
-    );
+    println!("init tests{under} on {}: {} passed", m.name, r.passed.len());
     if icount {
         let ticks = ticks_of(&o.lines, "normal build", &NORMAL_BUILD_ROWS)?;
         println!(
             "normal build ticks on {}: {}",
-            m.memory,
+            m.name,
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
     }
-    Ok(())
+    Ok(r.passed.len())
 }
 
 /// The panic of a child comes whole (spec 13.2): a line with where it
@@ -929,6 +1048,50 @@ fn gdb() -> Result<(), String> {
     );
     run_cmd(
         qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image)).args(["-nographic", "-s", "-S"]),
+    )
+}
+
+/// `cargo xtask hvf` (spec 14, 15.2): on a Mac with Apple silicon, for
+/// HVF_V3 and then HVF_V2, the boot of the normal build with the counter
+/// at HVF_HZ, the test init under qemu::hvf_verdict and the kernel tests,
+/// with a line of results for each machine. Elsewhere it prints why it
+/// skips and succeeds: `ci` does not run it.
+fn hvf() -> Result<(), String> {
+    if let Err(why) = hvf_host() {
+        println!(
+            "hvf: skipped: needs macOS on Apple Silicon with the Hypervisor framework ({why})"
+        );
+        return Ok(());
+    }
+    for (m, gic) in [(&qemu::HVF_V3, GIC_V3_LINE), (&qemu::HVF_V2, GIC_V2_LINE)] {
+        let hz = boot_smoke(m, gic)?;
+        if hz != HVF_HZ {
+            return Err(format!("the counter runs at {hz} Hz on {}", m.name));
+        }
+        let init = init_tests(m, false)?;
+        let kernel = kernel_tests(m, Variant::Test)?;
+        println!(
+            "hvf on {}: boot ok, init tests {init} passed (hole reads zero), kernel tests {kernel} passed",
+            m.name
+        );
+    }
+    Ok(())
+}
+
+/// qemu::hvf_host on this host: its OS and processor, `sysctl -n
+/// kern.hv_support` and `qemu-system-aarch64 -accel help`; a command that
+/// does not run gives no output.
+fn hvf_host() -> Result<(), String> {
+    let output = |cmd: &mut Command| {
+        cmd.output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    qemu::hvf_host(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        &output(Command::new("sysctl").args(["-n", "kern.hv_support"])),
+        &output(Command::new("qemu-system-aarch64").args(["-accel", "help"])),
     )
 }
 
@@ -1080,6 +1243,157 @@ mod tests {
         );
     }
 
+    /// Cargo writes under CARGO_TARGET_DIR when it is set, which cargo
+    /// takes from the directory it runs in, the workspace's root for
+    /// xtask's builds, and under target/ of the workspace otherwise; the
+    /// kernel's ELF and the programs are taken from there.
+    #[test]
+    fn artifacts_come_from_cargo_target_dir() {
+        let root = Path::new("/w");
+        assert_eq!(target_dir_of(None, root), Path::new("/w/target"));
+        assert_eq!(target_dir_of(Some("/t".into()), root), Path::new("/t"));
+        assert_eq!(target_dir_of(Some("out".into()), root), Path::new("/w/out"));
+        assert_eq!(
+            cargo_output(
+                &target_dir_of(Some("/t".into()), root),
+                KERNEL_TARGET,
+                "kernel"
+            ),
+            Path::new("/t/aarch64-unknown-none-softfloat/release/kernel")
+        );
+    }
+
+    /// `once` calls `make` at most once for a key: a second call with the
+    /// same key returns the cached value with no further call, a call with
+    /// another key builds its own, and a `make` that fails is not cached.
+    #[test]
+    fn once_builds_a_key_only_once() {
+        let made: Mutex<Vec<(&str, u32)>> = Mutex::new(Vec::new());
+        let calls = Mutex::new(0u32);
+        let make = |calls: &Mutex<u32>| {
+            *calls.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+            Ok(*calls.lock().unwrap_or_else(PoisonError::into_inner))
+        };
+        assert_eq!(once(&made, "a", || make(&calls)), Ok(1));
+        assert_eq!(once(&made, "a", || make(&calls)), Ok(1));
+        assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 1);
+        assert_eq!(once(&made, "b", || make(&calls)), Ok(2));
+        assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 2);
+
+        let failing: Mutex<Vec<(&str, u32)>> = Mutex::new(Vec::new());
+        assert_eq!(
+            once(&failing, "x", || Err::<u32, _>("no".into())),
+            Err("no".into())
+        );
+        assert_eq!(once(&failing, "x", || Ok(1)), Ok(1));
+    }
+
+    /// The boot report passes with each of its lines whole, and fails
+    /// without any one of them or with one that tells of another machine;
+    /// the RAM and the PSCI conduit come from the machine.
+    #[test]
+    fn boot_smoke_needs_every_report_line() {
+        assert_eq!(
+            (qemu::VIRT.ram(), qemu::VIRT_2G.ram()),
+            (512 << 20, 2 << 30)
+        );
+        assert_eq!(
+            (qemu::VIRT.psci(), qemu::VIRT_EL2_V3.psci()),
+            ("Hvc", "Smc")
+        );
+        let report = [
+            "memory     0x40000000..0x60000000",
+            "boot image 0x48000000..0x48005000",
+            GIC_V2_LINE,
+            "psci       Hvc",
+            "timer      62500000 Hz",
+            "boot complete",
+        ]
+        .map(String::from);
+        let check = |lines: &[String], m, gic| boot_report(lines, m, 0x5000, gic);
+        assert_eq!(check(&report, &qemu::VIRT, GIC_V2_LINE), Ok(62_500_000));
+        for i in 0..report.len() {
+            let mut cut = report.to_vec();
+            cut.remove(i);
+            let cut = check(&cut, &qemu::VIRT, GIC_V2_LINE);
+            assert!(cut.is_err(), "without {:?}", report[i]);
+        }
+        assert!(check(&report, &qemu::VIRT, GIC_V3_LINE).is_err());
+        assert!(check(&report, &qemu::VIRT_2G, GIC_V2_LINE).is_err());
+        assert!(check(&report, &qemu::VIRT_EL2, GIC_V2_LINE).is_err());
+        for (i, other) in [
+            (1, "boot image 0x48000000..0x48006000"),
+            (4, "timer      0 Hz"),
+        ] {
+            let mut changed = report.clone();
+            changed[i] = other.to_string();
+            let changed = check(&changed, &qemu::VIRT, GIC_V2_LINE);
+            assert!(changed.is_err(), "with {other:?}");
+        }
+        let mut el2 = report.clone();
+        el2[3] = "psci       Smc".to_string();
+        el2[4] = "timer      24000000 Hz".to_string();
+        assert_eq!(check(&el2, &qemu::VIRT_EL2, GIC_V2_LINE), Ok(24_000_000));
+    }
+
+    /// The drivers of the kernel's devices and the test init's driver of
+    /// the PL031 reach registers through arch::mmio and rt::mmio only (spec
+    /// 9): one `ldr` or `str` with the address in a register, which a
+    /// hypervisor emulates from the syndrome [G34]. `read_volatile` and
+    /// `write_volatile` may compile to a pair or a writeback, which stops
+    /// QEMU under HVF.
+    #[test]
+    fn device_registers_go_through_mmio() {
+        // Every file that reaches device registers is listed here.
+        let files = [
+            "kernel/src/arch/aarch64/gic.rs",
+            "kernel/src/console.rs",
+            "tests/init/src/devices.rs",
+        ];
+        for file in files {
+            let text = std::fs::read_to_string(root().join(file)).expect("a device file");
+            assert!(
+                !text.contains("read_volatile") && !text.contains("write_volatile"),
+                "{file} reaches a register without mmio"
+            );
+        }
+    }
+
+    /// Each access of arch::mmio and rt::mmio is one plain `ldr` or `str`
+    /// (or a byte of it) with the address in a register, with no writeback
+    /// and no pair, or the `dmb oshst` of `wmb` [G34]: a hypervisor
+    /// emulates only such an access from the syndrome.
+    #[test]
+    fn mmio_is_one_plain_load_or_store() {
+        let allowed = [
+            "ldr {v:w}, [{a}]",
+            "str {v:w}, [{a}]",
+            "ldrb {v:w}, [{a}]",
+            "strb {v:w}, [{a}]",
+            "ldr {v}, [{a}]",
+            "str {v}, [{a}]",
+            "dmb oshst",
+        ];
+        for file in ["kernel/src/arch/aarch64/mmio.rs", "lib/rt/src/mmio.rs"] {
+            let text = std::fs::read_to_string(root().join(file)).expect("an mmio file");
+            let mut accesses = 0;
+            for line in text.lines().filter(|line| line.contains("asm!(")) {
+                // The template, and no second template after it.
+                let template = line
+                    .split_once("asm!(\"")
+                    .and_then(|(_, rest)| rest.split_once('"'))
+                    .filter(|(_, rest)| !rest.starts_with(", \""))
+                    .map(|(template, _)| template);
+                assert!(
+                    template.is_some_and(|t| allowed.contains(&t)),
+                    "{file}: {line}"
+                );
+                accesses += 1;
+            }
+            assert!(accesses > 0, "{file} has no access");
+        }
+    }
+
     /// The round trip's line gives its six rows in order, and nothing else
     /// passes for it.
     #[test]
@@ -1139,6 +1453,35 @@ mod tests {
         ] {
             assert!(child_panic_comes_whole(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Runs end with PSCI SYSTEM_OFF on every machine (spec 14): the exit
+    /// through `hlt #0xf000`, an undefined instruction under HVF, is gone
+    /// from the kernel, the programs, xtask and the documents. The word is
+    /// built here so that this test finds neither its text nor its name.
+    #[test]
+    fn no_semihosting_left() {
+        let word = ["semi", "hosting"].concat();
+        let own_name = format!("fn no_{word}_left() {{");
+        let mut found: Vec<_> = texts(&[
+            "kernel",
+            "kcore",
+            "lib",
+            "services",
+            "tests",
+            "xtask",
+            "docs",
+            "README.md",
+        ])
+        .into_iter()
+        .filter(|(_, text)| {
+            text.lines()
+                .any(|l| l.to_lowercase().contains(&word) && l.trim() != own_name)
+        })
+        .map(|(name, _)| name)
+        .collect();
+        found.sort();
+        assert!(found.is_empty(), "{word} in {found:?}");
     }
 
     /// The kernel tests wake their threads through timers of programs
