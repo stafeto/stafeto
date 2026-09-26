@@ -73,7 +73,7 @@ fn main(_: u64) -> u64 {
     let label = labels.next().expect("the first label");
     let worker = worker::Worker::start(&init.process, &channel, &init.resource, label)
         .expect("init starts its worker thread");
-    let mut service = serve::Init::new(init.resource, worker, labels, programs);
+    let mut service = serve::Init::new(init.process, init.resource, worker, labels, programs);
     service.start(&order);
     let config = Config {
         issued: 0,

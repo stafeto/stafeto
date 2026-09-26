@@ -142,6 +142,11 @@ impl Worker {
         })
     }
 
+    /// The worker's thread, for its state (STATS).
+    pub fn thread(&self) -> &Handle<Thread> {
+        &self.thread
+    }
+
     /// Sets the worker's base priority to `level` (init::work).
     pub fn set_level(&self, level: u8) -> Result<(), Error> {
         sys::thread_set_priority(&self.thread, level, Policy::Fifo)

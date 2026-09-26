@@ -28,8 +28,8 @@ const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// package it builds with.
 type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
 /// The programs of the boot image of the normal build, of the test init's
-/// runs and of the runs of init's test table (spec 15.2). Init comes first
-/// (spec 13.1).
+/// runs, of the runs of init's test table and of the two tables init
+/// refuses (spec 15.2). Init comes first (spec 13.1).
 const BOOT_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &[])];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
@@ -37,6 +37,14 @@ const TEST_PROGRAMS: [ImageProgram; 2] = [
 ];
 const SVC_PROGRAMS: [ImageProgram; 2] = [
     ("init", "init", INIT_STACK_SIZE, &["table-test"]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+];
+const CYCLE_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-cycle"]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+];
+const CEILING_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-ceiling"]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 /// The profiles the programs of those boot images build with (spec 5.4,
@@ -173,7 +181,21 @@ const _: () = assert!(
 /// could drop a test with the line.
 const INIT_TESTS: u32 = 216;
 /// Tests the client `checker` of init's test table has (tests/svc).
-const SVC_TESTS: u32 = 11;
+const SVC_TESTS: u32 = 15;
+/// What init prints for each table it refuses (services/init, features
+/// `table-cycle` and `table-ceiling`), each line whole.
+const REFUSED: [(&str, &[ImageProgram], &str); 2] = [
+    (
+        "boot-cycle.img",
+        &CYCLE_PROGRAMS,
+        "init: table refused: the connections make a cycle: a -> b -> a",
+    ),
+    (
+        "boot-ceiling.img",
+        &CEILING_PROGRAMS,
+        "init: table refused: low at priority 40 is below the ceiling 50 of its client high",
+    ),
+];
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -609,6 +631,7 @@ fn test() -> Result<(), String> {
     init_tests(&qemu::VIRT_V3, false)?;
     svc_tests(&qemu::VIRT)?;
     svc_tests(&qemu::VIRT_V3)?;
+    bad_tables_are_refused()?;
     kernel_tests(&qemu::VIRT, Variant::Test)?;
     kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
     kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
@@ -916,6 +939,8 @@ fn program_elfs() -> Result<Vec<(PathBuf, Profile)>, String> {
         ("boot.img", &BOOT_PROGRAMS[..], BOOT_PROFILE),
         ("boot-test.img", &TEST_PROGRAMS[..], TEST_PROFILE),
         ("boot-svc.img", &SVC_PROGRAMS[..], TEST_PROFILE),
+        ("boot-cycle.img", &CYCLE_PROGRAMS[..], TEST_PROFILE),
+        ("boot-ceiling.img", &CEILING_PROGRAMS[..], TEST_PROFILE),
     ] {
         build_boot_image(name, programs, profile)?;
         for (_, package, _, _) in programs {
@@ -1232,6 +1257,24 @@ fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
     }
     println!("service tests on {}: {} passed", m.name, r.passed.len());
     Ok(r.passed.len())
+}
+
+/// Spec 13.4, 15.2: init refuses each table of REFUSED before it starts
+/// anything. Its image, on the normal build of the kernel on VIRT, prints
+/// the reason line whole and ends with init's exit with code 2, which the
+/// kernel ends with a panic after it (qemu::expect_init_exit).
+fn bad_tables_are_refused() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    for (name, programs, reason) in REFUSED {
+        let image = build_boot_image(name, programs, TEST_PROFILE)?;
+        let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        qemu::expect_line(&o, reason)?;
+        qemu::expect_init_exit(&o, "init: table refused: ", 2)?;
+    }
+    println!("bad tables refused: {} images", REFUSED.len());
+    Ok(())
 }
 
 /// The panic of a child comes whole (spec 13.2): a line with where it

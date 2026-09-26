@@ -6,16 +6,21 @@
 //! connection to init and the sessions CONNECT gives it: its start data,
 //! START past LAST, PING and HEARTBEAT, REGISTER from a client, CONNECT
 //! to services that registered, to one that registers later and past four
-//! waiting requests, and to names the table does not give it, and what the
-//! REGISTER of `device` brought. It prints `TEST <name> ok` or `TEST
-//! <name> FAIL <why>` for each test in turn, then `TESTS DONE total=<n>
-//! failed=<m>`, and ends with code 0; xtask reads the lines.
+//! waiting requests, and to names the table does not give it, what the
+//! REGISTER of `device` brought, LIST and STATS. It prints `TEST <name>
+//! ok` or `TEST <name> FAIL <why>` for each test in turn, then `TESTS DONE
+//! total=<n> failed=<m>`, and ends with code 0; xtask reads the lines.
 
 use crate::device::{BINDING, BINDING_COPIES, EDGE, Report, WINDOW, WINDOW_COPIES};
 use crate::{CHECKER, ECHO, VERSION, base, method};
-use abi::{Error, MESSAGE_MAX, ObjectKind, Policy, Rights, Source, ThreadState};
+use abi::{
+    Error, MESSAGE_MAX, ObjectKind, Policy, ProcessHandles, ProcessMemory, Rights, Source,
+    ThreadState,
+};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use proto_init::{Connect, Method, ServiceArgs};
+use proto_init::{
+    Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, ServiceArgs, State, Stats,
+};
 use proto_wire::{Header, Name, Reader, Status, Writer};
 use rt::handle::{Channel, Resource, Thread};
 use rt::startup::Startup;
@@ -32,7 +37,7 @@ type Test = (&'static str, fn(&Checker) -> Outcome);
 /// `a_fifth_waiting_connect_gets_limit_reached` wait for `slow`, which
 /// registers once the checker opens the gate of `echo`, and
 /// `connect_waits_for_registration` opens it and collects them.
-const TESTS: [Test; 11] = [
+const TESTS: [Test; 15] = [
     (
         "start_data_brings_the_service_args",
         start_data_brings_the_service_args,
@@ -74,6 +79,22 @@ const TESTS: [Test; 11] = [
         "connect_waits_for_registration",
         connect_waits_for_registration,
     ),
+    (
+        "list_names_every_record_in_its_state",
+        list_names_every_record_in_its_state,
+    ),
+    (
+        "list_pages_from_its_first_entry",
+        list_pages_from_its_first_entry,
+    ),
+    (
+        "list_counts_the_handles_and_memory_of_an_instance",
+        list_counts_the_handles_and_memory_of_an_instance,
+    ),
+    (
+        "stats_bring_the_kernel_the_worker_and_the_quota",
+        stats_bring_the_kernel_the_worker_and_the_quota,
+    ),
 ];
 
 const MS: u64 = 1_000_000;
@@ -87,6 +108,20 @@ const RTC_LINE: u32 = 34;
 const RTC_IDS: [u32; 2] = [0x31, 0x10];
 /// The bytes ECHO sends.
 const HELLO: &[u8] = b"hello";
+/// The records LIST gives: init, then the records of init's test table in
+/// its order, each with its priority, its ceiling and whether it is a
+/// client.
+const RECORDS: [(&str, u8, u8, bool); 6] = [
+    ("init", 63, 63, false),
+    ("echo", 40, 40, false),
+    ("slow", 40, 40, false),
+    ("device", 40, 40, false),
+    ("checker", 30, 30, true),
+    ("private", 20, 20, false),
+];
+/// The level of init's worker thread with no job.
+const WORKER_IDLE: u8 = 1;
+const PAGE: u64 = 4096;
 
 /// The helper threads of the checker, each with its stack and its message
 /// buffer above that of the first thread.
@@ -435,4 +470,154 @@ fn connect_waits_for_registration(c: &Checker) -> Outcome {
         ECHOED.iter().all(|e| e.load(Relaxed)),
         "ECHO did not go through a session with slow",
     )
+}
+
+/// The page of LIST from the record `first`.
+fn list(c: &Checker, first: u16) -> Result<ListReply, &'static str> {
+    let mut w = Writer::new();
+    let _ = ListRequest { first }.write(&mut w);
+    let mut buffer = [0; MESSAGE_MAX];
+    let bytes = call(&c.s.parent, w.as_bytes(), &mut buffer).map_err(|_| "LIST was refused")?;
+    ListReply::read(bytes).map_err(|_| "LIST gave no page")
+}
+
+/// Lowers the checker to level 1 and back to its base priority: it runs
+/// again once every thread above waits, so the worker of init has loaded
+/// every record and each service it started has registered. A receive
+/// with no wait drops the lift of the last notification first (spec 6.5).
+fn settle(c: &Checker) -> Outcome {
+    let (base, lowest) = (base(&c.s), 1);
+    let channel = sys::channel_create(lowest).map_err(|_| "channel_create failed")?;
+    let _ = sys::try_receive(&channel);
+    let lower = sys::thread_set_priority(&c.s.thread, lowest, Policy::Fifo);
+    lower.map_err(|_| "the checker could not lower itself")?;
+    let back = sys::thread_set_priority(&c.s.thread, base, Policy::Fifo);
+    back.map_err(|_| "the checker could not come back to its level")
+}
+
+/// Whether `got` names the record `name`.
+fn named(got: &Listed, name: &str) -> bool {
+    got.name.as_bytes() == name.as_bytes()
+}
+
+/// LIST gives init first, then every record of the table in its order,
+/// each with its priority, ceiling and kind, and all run with no failure.
+fn list_names_every_record_in_its_state(c: &Checker) -> Outcome {
+    settle(c)?;
+    let page = list(c, 0)?;
+    check(
+        usize::from(page.total) == RECORDS.len() && page.len() == RECORDS.len(),
+        "LIST does not count init and the records of the table",
+    )?;
+    for (got, &(name, priority, ceiling, client)) in page.records().zip(&RECORDS) {
+        check(named(got, name), "LIST names another record")?;
+        check(
+            (got.priority, got.ceiling, got.client) == (priority, ceiling, client),
+            "LIST gives a record other levels or another kind",
+        )?;
+        check(
+            got.state == State::Running && got.failures == 0 && got.restarts == 0,
+            "a record does not run, or it failed",
+        )?;
+    }
+    Ok(())
+}
+
+/// A page of LIST holds the records from its first on, at most
+/// LIST_PAGE, and the count of all; past the last record it is empty.
+fn list_pages_from_its_first_entry(c: &Checker) -> Outcome {
+    for first in [2, 5, 6, 9] {
+        let page = list(c, first)?;
+        let from = usize::from(first).min(RECORDS.len());
+        check(
+            page.len() == (RECORDS.len() - from).min(LIST_PAGE)
+                && usize::from(page.total) == RECORDS.len(),
+            "a page of LIST has another count",
+        )?;
+        let expected = RECORDS[from..].iter().map(|&(name, ..)| name);
+        check(
+            page.records()
+                .zip(expected)
+                .all(|(got, name)| named(got, name)),
+            "a page of LIST does not start at its first record",
+        )?;
+    }
+    Ok(())
+}
+
+/// The handles and the memory of the checker's process, as it sees them.
+fn own_counts(c: &Checker) -> Option<(ProcessHandles, ProcessMemory)> {
+    let handles = sys::process_handles(&c.s.process).ok()?;
+    Some((handles, sys::process_memory(&c.s.process).ok()?))
+}
+
+/// The record of an instance in LIST gives the live and retired handles,
+/// the room for handles and the quota and used pages of its process: the
+/// checker's own record shows what the checker sees of itself.
+fn list_counts_the_handles_and_memory_of_an_instance(c: &Checker) -> Outcome {
+    let before = own_counts(c);
+    let page = list(c, 0)?;
+    check(
+        before == own_counts(c),
+        "the checker's counts changed during LIST",
+    )?;
+    let (h, m) = before.ok_or("PROCESS_HANDLES or PROCESS_MEMORY failed")?;
+    let got = page.records().find(|r| named(r, "checker"));
+    let got = got.ok_or("LIST has no record checker")?;
+    let handles = [h.live, h.retired, h.limit].map(|n| n as u32);
+    check(
+        [got.live, got.retired, got.limit] == handles,
+        "LIST gives the checker other handles",
+    )?;
+    check(
+        [got.quota_pages, got.used_pages] == [m.quota / PAGE, m.used / PAGE].map(|n| n as u32),
+        "LIST gives the checker other memory",
+    )
+}
+
+/// The reply to STATS.
+fn stats(c: &Checker) -> Result<Stats, &'static str> {
+    let mut buffer = [0; MESSAGE_MAX];
+    let request = Method::Stats.header().bytes();
+    let bytes = call(&c.s.parent, &request, &mut buffer).map_err(|_| "STATS was refused")?;
+    Stats::read(bytes).map_err(|_| "STATS gave no counts")
+}
+
+/// STATS brings the counts of the kernel, the worker, init's free quota
+/// and the labels init gave: with every record started the worker waits at
+/// its idle level with no job, and one more CONNECT gives one more label.
+fn stats_bring_the_kernel_the_worker_and_the_quota(c: &Checker) -> Outcome {
+    let first = stats(c)?;
+    check(
+        first.kernel.free_frames > 0 && first.kernel.pool_pages > 0,
+        "STATS gives no counts of the kernel",
+    )?;
+    check(
+        first.job.is_none() && first.pending == 0,
+        "the worker has a job",
+    )?;
+    check(
+        (first.worker_priority, first.worker_effective) == (WORKER_IDLE, WORKER_IDLE)
+            && u64::from(first.worker_state) == ThreadState::Receiving.code(),
+        "the worker does not wait at its idle level",
+    )?;
+    check(first.free_pages > 0, "STATS gives init no free quota")?;
+    let own = list(c, 0)?
+        .records()
+        .next()
+        .map(|r| (r.quota_pages, r.used_pages));
+    let (quota, used) = own.ok_or("LIST has no record init")?;
+    check(
+        first.free_pages == u64::from(quota.saturating_sub(used)),
+        "STATS gives init another free quota than LIST",
+    )?;
+    // The worker's label and one for each instance: as many as LIST has
+    // records, and those of the sessions so far.
+    check(
+        first.labels >= RECORDS.len() as u64,
+        "STATS counts fewer labels than init gave",
+    )?;
+    let _echo = c.connect("echo").map_err(|_| "no session with echo")?;
+    let second = stats(c)?;
+    check(second.labels > first.labels, "a CONNECT gave no label")
 }

@@ -9,22 +9,28 @@
 //! the channel of a service and gives it its windows and bindings; CONNECT
 //! gives a copy of a registered channel with SEND, TRANSFER and a label of
 //! its own, or holds the request until the service registers; HEARTBEAT
-//! answers a registered service; PING anyone. The notification of the
-//! worker thread brings the outcome of its job: the main thread starts the
-//! thread of the instance it loaded, and gives the worker the next job of
-//! the queue at the level init::work::worker_level sets. Each handler is
-//! bounded by the records of the table; the main thread loads, maps and
-//! kills nothing itself (worker.rs).
+//! answers a registered service; LIST gives a page of the records, init
+//! first; STATS what the kernel, the worker and init's quota show; PING
+//! anyone. The notification of the worker thread brings the outcome of
+//! its job: the main thread starts the thread of the instance it loaded,
+//! and gives the worker the next job of the queue at the level
+//! init::work::worker_level sets. Each handler is bounded by the records
+//! of the table; the main thread loads, maps and kills nothing itself
+//! (worker.rs).
 
 use crate::worker::{Order, Outcome, Worker};
 use abi::{Error, ObjectKind, Rights, Source};
 use bootimg::Program;
+use init::PAGE;
 use init::labels::Labels;
 use init::table::{self, MAX_RECORDS, Record, TABLE};
 use init::work::{Job, Queue, WORKER_IDLE, worker_level};
-use proto_init::{Connect, Method, RegisterReply, START_NAMES, State, VERSION, Work};
+use proto_init::{
+    Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
+    START_NAMES, State, Stats, VERSION, Work,
+};
 use proto_wire::{Name, Status};
-use rt::handle::{Channel, Outgoing, Resource};
+use rt::handle::{Channel, Outgoing, Process, Resource};
 use rt::loader::Spawned;
 use rt::service::{Answer, Notice, Pending, Request, Service, Session};
 use rt::{Handle, println, sys};
@@ -33,6 +39,8 @@ use rt::{Handle, println, sys};
 pub const WAITING_MAX: usize = 4;
 /// The line init prints once the first start of each record is done.
 const STARTED: &str = "init: services started";
+/// The priority and the ceiling of init's main thread (spec 8, 13.3).
+const MAIN: u8 = 63;
 
 /// An instance of a record: what the worker loaded (its process and first
 /// thread, the label of its start channel, what is left of its start
@@ -61,6 +69,7 @@ impl Entry {
 
 /// Init as the service of its channel.
 pub struct Init {
+    own: Handle<Process>,
     resource: Handle<Resource>,
     worker: Worker,
     labels: Labels,
@@ -74,16 +83,18 @@ pub struct Init {
 }
 
 impl Init {
-    /// Init with the system resource, its worker, the count of labels the
-    /// worker's own came from, and the program of each record of the
-    /// table.
+    /// Init with its own process, the system resource, its worker, the
+    /// count of labels the worker's own came from, and the program of each
+    /// record of the table.
     pub fn new(
+        own: Handle<Process>,
         resource: Handle<Resource>,
         worker: Worker,
         labels: Labels,
         programs: [Option<Program<'static>>; MAX_RECORDS],
     ) -> Init {
         Init {
+            own,
             resource,
             worker,
             labels,
@@ -350,6 +361,90 @@ impl Init {
             refuse(Error::BadState)
         }
     }
+
+    /// LIST (spec 13.4): BAD_SIZE for a request out of its layout; the
+    /// records from `first` on, at most LIST_PAGE, of the records in all:
+    /// init itself, then the records of the table in its order. A first
+    /// record past them gives an empty page.
+    fn list(&self, r: &mut Request<'_>) -> Answer {
+        let Ok(ListRequest { first }) = ListRequest::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let total = TABLE.len() + 1;
+        let mut page = ListReply::new(total as u16);
+        let first = usize::from(first);
+        for n in first..total.min(first.saturating_add(LIST_PAGE)) {
+            // The page has room for LIST_PAGE records.
+            let _ = page.push(self.listed(n));
+        }
+        match page.write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// Record `n` of LIST: 0 is init, n the record at place n - 1 of the
+    /// table. The handles and the memory are those of the process of its
+    /// instance, and 0 without one.
+    fn listed(&self, n: usize) -> Listed {
+        let (name, state, priority, ceiling, client, process) = match n.checked_sub(1) {
+            None => ("init", State::Running, MAIN, MAIN, false, Some(&self.own)),
+            Some(place) => {
+                let (record, entry) = (&TABLE[place], &self.entries[place]);
+                let process = entry.instance.as_ref().map(|i| &i.spawned.process);
+                let (p, c) = (record.priority, record.ceiling);
+                (record.name, entry.state, p, c, record.is_client(), process)
+            }
+        };
+        let handles = process.and_then(|p| sys::process_handles(p).ok());
+        let memory = process.and_then(|p| sys::process_memory(p).ok());
+        let pages = |bytes: u64| u32::try_from(bytes / PAGE).unwrap_or(u32::MAX);
+        let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        Listed {
+            name: Name::new(name.as_bytes()).expect("a checked table has names"),
+            state,
+            priority,
+            ceiling,
+            client,
+            failures: 0,
+            restarts: 0,
+            live: handles.map_or(0, |h| count(h.live)),
+            retired: handles.map_or(0, |h| count(h.retired)),
+            limit: handles.map_or(0, |h| count(h.limit)),
+            quota_pages: memory.map_or(0, |m| pages(m.quota)),
+            used_pages: memory.map_or(0, |m| pages(m.used)),
+        }
+    }
+
+    /// STATS (spec 13.4): the counts of the kernel (KERNEL_STATS), the job
+    /// of the worker with the place of its record, the worker's priorities
+    /// and state (THREAD_STATE), the jobs that wait, the free pages of
+    /// init's quota and the labels init gave. The errors are those of the
+    /// calls.
+    fn stats(&self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let facts = sys::kernel_stats(&self.resource).and_then(|kernel| {
+            let worker = sys::thread_info(self.worker.thread())?;
+            let memory = sys::process_memory(&self.own)?;
+            Ok(Stats {
+                kernel,
+                job: self.current.map(|j| (j.work, j.record as u8)),
+                worker_priority: worker.base,
+                worker_effective: worker.priority,
+                worker_state: worker.state.code() as u8,
+                pending: self.queue.len() as u8,
+                free_pages: memory.quota.saturating_sub(memory.used) / PAGE,
+                labels: self.labels.given(),
+            })
+        });
+        match facts.map(|stats| stats.write(r.reply())) {
+            Ok(Ok(())) => Answer::Reply(Outgoing::new()),
+            Ok(Err(status)) => Answer::Status(status),
+            Err(e) => refuse(e),
+        }
+    }
 }
 
 /// The registered channel of the service of `entry`, when it is open:
@@ -386,6 +481,8 @@ impl Service<1> for Init {
         Method::Register.number(),
         Method::Connect.number(),
         Method::Heartbeat.number(),
+        Method::List.number(),
+        Method::Stats.number(),
         Method::Ping.number(),
     ];
     type Data = ();
@@ -399,6 +496,8 @@ impl Service<1> for Init {
             Some(Method::Register) => self.register(place, r),
             Some(Method::Connect) => self.connect(place, r),
             Some(Method::Heartbeat) => self.heartbeat(place, r),
+            Some(Method::List) => self.list(r),
+            Some(Method::Stats) => self.stats(r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),
