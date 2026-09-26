@@ -175,7 +175,9 @@ fn with_marks(args: &[u64]) -> [u64; 10] {
 }
 
 /// Runs `body` with a fresh caller and releases the caller afterwards.
-fn with_caller(body: impl FnOnce(&Caller) -> Result<(), &'static str>) -> Result<(), &'static str> {
+fn with_caller<T>(
+    body: impl FnOnce(&Caller) -> Result<T, &'static str>,
+) -> Result<T, &'static str> {
     let caller = Caller::new()?;
     let result = body(&caller);
     caller.release();
@@ -2934,4 +2936,363 @@ fn loaded_parts(p: NonNull<Process>, program: &bootimg::Program<'_>) -> Result<(
         process::mappings(p) == parts,
         "a part of init did not take one mapping",
     )
+}
+
+// The longest portions of the long calls of memory objects (spec 7.7,
+// 15.3), in their worst cases, under -icount.
+
+/// Pages of the objects whose first entry of mem_create takes the node of
+/// nodes of their list besides a leaf (kcore::pagelist): more than a leaf
+/// holds.
+#[cfg(feature = "icount")]
+const DEEP_PAGES: u64 = 520;
+
+/// The span of a table of level 1: a range across a bound of it with no
+/// table on either side takes a table of each level on both (spec 7.5,
+/// kcore::paging::tables_bound).
+#[cfg(feature = "icount")]
+const REGION: usize = 512 * GIB as usize;
+
+/// A block of kcore::frames::MAX_ORDER frames: a frame alone in a free one
+/// merges MAX_ORDER times as it goes back.
+#[cfg(feature = "icount")]
+const BLOCK: u64 = PAGE_SIZE << kcore::frames::MAX_ORDER;
+
+/// The blocks `Apart` sets apart: one for each frame of the memory object
+/// whose last portion `release_ticks` measures, its pages and the node of
+/// their list.
+#[cfg(feature = "icount")]
+const APART: usize = kcore::pagelist::RELEASE_STEP;
+
+/// The frame allocator taken apart for the costliest frees (spec 7.7):
+/// every free block goes to the test, in a chain through the first words
+/// of the blocks, but APART blocks of MAX_ORDER, which the allocator gets
+/// back frame by frame; the first frame of each is then the allocator's
+/// only free frame, so that the next APART frames taken are alone in
+/// their blocks once `spread` gives the rest back.
+#[cfg(feature = "icount")]
+struct Apart {
+    chain: u64,
+    blocks: [u64; APART],
+}
+
+#[cfg(feature = "icount")]
+impl Apart {
+    fn take() -> Result<Apart, &'static str> {
+        let mut apart = Apart {
+            chain: 0,
+            blocks: [0; APART],
+        };
+        let mut kept = 0;
+        for order in (0..=kcore::frames::MAX_ORDER).rev() {
+            while let Some(pa) = frames_alloc(order) {
+                if order == kcore::frames::MAX_ORDER && kept < APART {
+                    apart.blocks[kept] = pa;
+                    kept += 1;
+                } else {
+                    apart.link(pa, order);
+                }
+            }
+        }
+        for &b in &apart.blocks[..kept] {
+            frames_free(b, kcore::frames::MAX_ORDER);
+        }
+        if kept < APART {
+            apart.rejoin();
+            return Err("too few free blocks of the highest order");
+        }
+        for b in &mut apart.blocks {
+            let first = frames_alloc(0).ok_or("a frame of a block went missing")?;
+            *b = first;
+            let whole = first.is_multiple_of(BLOCK)
+                && (1..BLOCK / PAGE_SIZE).all(|k| frames_alloc(0) == Some(first + k * PAGE_SIZE));
+            if !whole {
+                return Err("a block did not give its frames in order");
+            }
+        }
+        for &b in &apart.blocks {
+            frames_free(b, 0);
+        }
+        Ok(apart)
+    }
+
+    /// Puts block `pa` of `order` at the head of the chain.
+    fn link(&mut self, pa: u64, order: u8) {
+        let word = (LINEAR_BASE + pa as usize) as *mut u64;
+        // SAFETY: the block is the test's, taken from the allocator, and
+        // the linear map reaches it.
+        unsafe {
+            word.write_volatile(self.chain);
+            word.add(1).write_volatile(order.into());
+        }
+        self.chain = pa;
+    }
+
+    /// Gives the frames of the blocks but their first back.
+    fn spread(&self) {
+        for &b in &self.blocks {
+            for k in 1..BLOCK / PAGE_SIZE {
+                frames_free(b + k * PAGE_SIZE, 0);
+            }
+        }
+    }
+
+    /// Gives every block of the chain back.
+    fn rejoin(self) {
+        let mut next = self.chain;
+        while next != 0 {
+            let word = (LINEAR_BASE + next as usize) as *const u64;
+            // SAFETY: as in `link`.
+            let (after, order) = unsafe { (word.read_volatile(), word.add(1).read_volatile()) };
+            frames_free(next, order as u8);
+            next = after;
+        }
+    }
+}
+
+/// A block of `order` from the frame allocator, if there is one (spec
+/// 7.1).
+#[cfg(feature = "icount")]
+fn frames_alloc(order: u8) -> Option<u64> {
+    phys::FRAMES.lock().as_mut().expect("frames").alloc(order)
+}
+
+/// Gives block `pa` of `order` back to the frame allocator (spec 7.1).
+#[cfg(feature = "icount")]
+fn frames_free(pa: u64, order: u8) {
+    phys::FRAMES
+        .lock()
+        .as_mut()
+        .expect("frames")
+        .free(pa, order)
+}
+
+/// The portions of the long calls of memory objects in their worst cases,
+/// in counter ticks, which count instructions under -icount (spec 7.7,
+/// 15.3). With an interrupt pending all along each entry of a call takes
+/// one portion, and an entry counts from the kernel's dispatch of the call
+/// to its end:
+/// - create: the entries of mem_create of DEEP_PAGES pages in a new
+///   process, the first with a chunk of its table, a page of its pool of
+///   memory objects and the node of nodes;
+/// - map, map_exec: the entries of mem_map but the first, RW and RX, whose
+///   portion crosses a bound of REGION and takes three tables;
+/// - protect, protect_exec, unmap: the entries of mem_protect to R and to
+///   RX and of mem_unmap of a mapping of 64 pages, among 64 mappings of a
+///   process with 64 threads and an ASID, which takes a TLBI a page;
+/// - release: the portion of cleanup of a memory object that gives back its
+///   last pages, the node of their list and the object's place and budget,
+///   whose frames are each alone in their free block of MAX_ORDER frames,
+///   and merge up to it as they go back (`Apart`);
+/// - first_map: the first entry of mem_map RX of 8 pages across a bound of
+///   REGION with no table on either side, six tables: the 64th mapping of
+///   that process, and the first one of a new process, with the block of
+///   its table.
+///
+/// The test prints them in one line, `memory portions ticks: create=...
+/// map=... map_exec=... unmap=... protect=... protect_exec=... release=...
+/// first_map=...`, which xtask shows; no number fails it (spec 15.3).
+#[cfg(feature = "icount")]
+pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let memory = phys::free_frames() + pages::taken() as u64;
+    let create = [0, CHUNK].into_iter().try_fold(0, |most, fill| {
+        create_ticks(fill).map(|ticks| most.max(ticks))
+    })?;
+    let mut changes = [0; 6];
+    with_caller(|c| changes_ticks(c, &mut changes))?;
+    let fresh = with_caller(|c| {
+        let (h, _) = make_memory(c, u64::from(process::EXEC_PORTION))?;
+        let (t, th) = target_of(c)?;
+        let ticks = first_exec_ticks(c, th, h);
+        c.close(th)?;
+        c.close(h)?;
+        release_target(t);
+        ticks
+    })?;
+    let release = with_caller(release_ticks)?;
+    let [map, map_exec, unmap, protect, protect_exec, crowded] = changes;
+    kprintln!(
+        "memory portions ticks: create={create} map={map} map_exec={map_exec} unmap={unmap} protect={protect} protect_exec={protect_exec} release={release} first_map={}",
+        crowded.max(fresh)
+    );
+    check(
+        memory::in_use() == objects && phys::free_frames() + pages::taken() as u64 == memory,
+        "an object or a frame of the measurements stayed",
+    )
+}
+
+/// The longest entry of mem_create of DEEP_PAGES pages by a new process
+/// whose table holds `fill` handles: its first entry makes a chunk of the
+/// table, whose page the pool of blocks takes, and a page of the pool of
+/// memory objects, before its portion takes the node of nodes, a leaf and
+/// memory::CREATE_PORTION frames.
+#[cfg(feature = "icount")]
+fn create_ticks(fill: usize) -> Result<u64, &'static str> {
+    let process = process::create_root(QUOTA, 2 * CHUNK as u32, CEILING);
+    let process = process.map_err(|_| "no process")?;
+    let c = match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
+        Ok(thread) => Caller { process, thread },
+        Err(_) => {
+            // SAFETY: the process is the test's, and nothing uses it afterwards.
+            unsafe { process::release(process, CAUSE) };
+            return Err("no thread");
+        }
+    };
+    let ticks = (0..fill)
+        .try_for_each(|_| c.insert(Object::Resource, Rights::NONE).map(|_| ()))
+        .and_then(|()| {
+            let n = Call::MemCreate.number();
+            let (first, rest, got) = timed_entries(&c, n, &[DEEP_PAGES * PAGE_SIZE, 0])?;
+            c.close(Handle(got[1]))?;
+            Ok(first.max(rest))
+        });
+    c.release();
+    ticks
+}
+
+/// Makes call `number` with `args`, then its next entries until it ends,
+/// with an interrupt pending all along: the ticks of the first entry and
+/// of the longest of the others, and x0-x9 at the end.
+#[cfg(feature = "icount")]
+fn timed_entries(
+    c: &Caller,
+    number: u16,
+    args: &[u64],
+) -> Result<(u64, u64, [u64; 10]), &'static str> {
+    let (mut first, mut rest, mut got) = (0, 0, [0; 10]);
+    with_interrupt_pending(|| {
+        let start = timer::now();
+        got = c.call(number, args);
+        first = timer::now() - start;
+        while thread::long(c.thread).is_some() {
+            let start = timer::now();
+            got = c.again(number);
+            rest = rest.max(timer::now() - start);
+        }
+        Ok(())
+    })?;
+    check(got[0] == 0, "a measured call failed")?;
+    Ok((first, rest, got))
+}
+
+/// The first entry of mem_map by `c` of object `h`, of process::EXEC_PORTION
+/// pages, RX, across the first bound of REGION of the process behind
+/// `target`, which has no table there; the mapping goes again.
+#[cfg(feature = "icount")]
+fn first_exec_ticks(c: &Caller, target: Handle, h: Handle) -> Result<u64, &'static str> {
+    let pages = u64::from(process::EXEC_PORTION);
+    let va = REGION - (pages / 2) as usize * PAGE;
+    let args = [
+        target.0,
+        h.0,
+        0,
+        pages * PAGE_SIZE,
+        va as u64,
+        Access::ReadExec.raw(),
+    ];
+    let (first, _, _) = timed_entries(c, Call::MemMap.number(), &args)?;
+    unmap_whole(c, target, pages, va)?;
+    Ok(first)
+}
+
+/// Into `ticks`, for a process with abi::MAX_THREADS threads with their
+/// buffers, 63 mappings and an ASID: map, map_exec, unmap, protect,
+/// protect_exec, and the first entry of its 64th mapping (`first_exec_ticks`).
+/// Its threads, its mappings and its own tables lie past 4 REGIONs, so the
+/// regions below them have no table.
+#[cfg(feature = "icount")]
+fn changes_ticks(c: &Caller, ticks: &mut [u64; 6]) -> Result<(), &'static str> {
+    let (h, _) = make_memory(c, 64)?;
+    let (t, th) = target_of(c)?;
+    let mut threads = [None; abi::MAX_THREADS as usize];
+    let crowded = crowd(t, &mut threads).and_then(|()| {
+        // SAFETY: the process is the test's, and nothing runs it.
+        unsafe { (*t.as_ptr()).activate() };
+        ticks[5] = first_exec_ticks(c, th, h)?;
+        let map = |pages: u64, va: usize, access: Access| {
+            let args = [th.0, h.0, 0, pages * PAGE_SIZE, va as u64, access.raw()];
+            timed_entries(c, Call::MemMap.number(), &args).map(|(_, rest, _)| rest)
+        };
+        let change = |n: Call, va: usize, access: u64| {
+            let args = [th.0, va as u64, 64 * PAGE_SIZE, access];
+            timed_entries(c, n.number(), &args).map(|(first, rest, _)| first.max(rest))
+        };
+        // Its second portion of 8 pages crosses the bound of 2 REGIONs.
+        let exec = 2 * REGION - 12 * PAGE;
+        ticks[1] = map(24, exec, Access::ReadExec)?;
+        unmap_whole(c, th, 24, exec)?;
+        // Its second portion of 32 pages crosses the bound of 3 REGIONs.
+        let va = 3 * REGION - 48 * PAGE;
+        ticks[0] = map(64, va, Access::ReadWrite)?;
+        ticks[3] = change(Call::MemProtect, va, Access::Read.raw())?;
+        ticks[4] = change(Call::MemProtect, va, Access::ReadExec.raw())?;
+        ticks[2] = change(Call::MemUnmap, va, 0)?;
+        Ok(())
+    });
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's reference goes; the thread never ran.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    c.close(th)?;
+    c.close(h)?;
+    release_target(t);
+    crowded
+}
+
+/// abi::MAX_THREADS threads of `t` with their buffers, which `threads`
+/// holds, and 63 mappings of a page of an object `t` pays for, all past 4
+/// REGIONs.
+#[cfg(feature = "icount")]
+fn crowd(
+    t: NonNull<Process>,
+    threads: &mut [Option<NonNull<Thread>>; abi::MAX_THREADS as usize],
+) -> Result<(), &'static str> {
+    let far = 4 * REGION;
+    for (i, slot) in threads.iter_mut().enumerate() {
+        let made = thread::create(t, USER_VA, USER_VA, 0, 10, Policy::Fifo);
+        *slot = Some(made.map_err(|_| "no thread")?);
+        let buffer = thread::give_buffer(slot.expect("the thread"), far + i * PAGE);
+        buffer.map_err(|_| "no buffer")?;
+    }
+    let single = memory::create_whole(t, 1).map_err(|_| "no memory object");
+    single.and_then(|one| {
+        let mapped = (0..abi::MAX_MAPPINGS as usize - 1).try_for_each(|i| {
+            let va = far + (1 << 20) + i * PAGE;
+            process::map_whole(t, one, va, Access::Read).map_err(|_| "a page did not map")
+        });
+        // SAFETY: the reference `create_whole` handed out goes; the
+        // mappings hold the object.
+        unsafe { memory::release(one, CAUSE) };
+        mapped
+    })
+}
+
+/// The portion of cleanup of a memory object of RELEASE_STEP - 1 pages,
+/// which gives back the last pages, the node of their list and the
+/// object's place and budget, whose frames each merge up to MAX_ORDER as
+/// they go back (`Apart`), in ticks. An object made and closed first
+/// leaves a free place in the pool of `c`, which then takes no frame for
+/// it.
+#[cfg(feature = "icount")]
+fn release_ticks(c: &Caller) -> Result<u64, &'static str> {
+    let (h, _) = make_memory(c, 1)?;
+    c.close(h)?;
+    cleanup::drain();
+    let apart = Apart::take()?;
+    let pages = kcore::pagelist::RELEASE_STEP - 1;
+    let made = make_memory(c, pages as u64);
+    apart.spread();
+    let ticks = made.and_then(|(h, m)| {
+        let alone = (0..pages).all(|i| memory::frame(m, i).is_multiple_of(BLOCK));
+        c.close(h)?;
+        let start = timer::now();
+        cleanup::portion();
+        let ticks = timer::now() - start;
+        cleanup::drain();
+        check(alone, "a frame of the object is not alone in its block")?;
+        Ok(ticks)
+    });
+    apart.rejoin();
+    ticks
 }

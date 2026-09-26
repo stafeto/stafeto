@@ -393,6 +393,12 @@ pub const QUOTA: u64 = 16 << 20;
 /// The quota of a child with a thread or two (spec 7.5).
 pub const CHILD_QUOTA: u64 = 64 << 10;
 
+/// Tests of the icount build besides TESTS and the EL0 tests: the first
+/// checks that the run is under -icount, the second measures the portions
+/// of the long calls of memory objects, whose counts mean instructions only
+/// there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 2 } else { 0 };
+
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
     report(
@@ -402,6 +408,11 @@ pub fn run(boot: &Boot) -> ! {
     for (name, test) in TESTS {
         report(name, test(boot));
     }
+    #[cfg(feature = "icount")]
+    report(
+        "memory_portions_are_measured",
+        calls::memory_portions_are_measured(boot),
+    );
     el0::run()
 }
 
@@ -419,7 +430,7 @@ fn report(name: &str, result: Result<(), &'static str>) {
 /// build, so that xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
-    let total = usize::from(cfg!(feature = "icount")) + TESTS.len() + el0::count();
+    let total = ICOUNT_ONLY + TESTS.len() + el0::count();
     kprintln!("TESTS DONE total={total} failed={failed}");
     semihosting::exit(if failed == 0 { 0 } else { 1 })
 }
@@ -1447,8 +1458,8 @@ fn churn(root: NonNull<process::Process>, q: u64) -> Result<(), &'static str> {
 /// The pages of a process's pools go back with its shell, a portion at a
 /// time (spec 7.7, 7.8): a root with 130 chunks of handles holds 66 pages
 /// of blocks and a list page. Its handles go at the stage Handles and
-/// leave the pages in the pool; the shell gives them back at most 64 a
-/// portion, in two portions, and the last one gives the slot back.
+/// leave the pages in the pool; the shell gives them back at most 32 a
+/// portion, in three portions, and the last one gives the slot back.
 fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
     const CHUNKS: usize = 130;
     cleanup::drain();
@@ -1479,8 +1490,8 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
         "the blocks of the table did not take a page for two of them and a list page",
     )?;
     check(
-        portions[..n] == [64, held - 64],
-        "the pages of a shell did not go back 64 a portion",
+        portions[..n] == [32, 32, held - 64],
+        "the pages of a shell did not go back 32 a portion",
     )?;
     check(
         pages::taken() == taken && process::in_use() == processes,
@@ -1862,8 +1873,9 @@ const CARRIERS: usize = 16;
 /// (spec 7.7): CARRIERS threads of a process that never ran, each with a
 /// buffer and four handles on their way (Thread::transit), as a request
 /// that waited in a queue leaves them. The first portion of the stage gives
-/// 13 buffers back, whose 13 units of five reach its 64, and the second
-/// the other 3; the handles go with them, and their channel then too.
+/// 10 buffers back, whose units of six, a frame two and a handle one, fill
+/// 60 of its 64, where the six of the next do not fit, and the second the
+/// other 6; the handles go with them, and their channel then too.
 fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
     const LEVEL: u8 = 9;
     cleanup::drain();
@@ -1896,6 +1908,60 @@ fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
     check(
         (process::in_use(), thread::in_use(), channel::in_use()) == (processes, threads, channels),
         "the process, its threads or the channel of their handles stayed",
+    )?;
+    bare_buffers_take_two_units(LEVEL)
+}
+
+/// Threads with a buffer and no handle on their way, one more than a
+/// portion of the stage Buffers takes: two units of work each.
+const BARE: usize = BUFFERS_PER_PORTION + 1;
+const BUFFERS_PER_PORTION: usize = 32;
+
+/// The first portion of the stage Buffers of BARE threads with no handles
+/// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 64,
+/// and the second the last one (spec 7.7).
+fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
+    let (processes, threads) = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
+    let mut bare = [None; BARE];
+    let made = bare.iter_mut().enumerate().try_for_each(|(i, slot)| {
+        let t =
+            thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+        *slot = Some(t);
+        thread::give_buffer(t, USER_VA + (i + 1) * PAGE).map_err(|_| "no buffer")
+    });
+    let result = made.and_then(|()| {
+        // SAFETY: the test holds a reference to the process.
+        unsafe { process::end(p, ProcessState::Killed, level) };
+        for _ in 0..64 {
+            if process::progress(p).0 == Stage::Buffers {
+                break;
+            }
+            cleanup::portion();
+        }
+        let frames = phys::free_frames();
+        cleanup::portion();
+        let first = phys::free_frames() - frames;
+        cleanup::portion();
+        let second = phys::free_frames() - frames - first;
+        check(
+            first == BUFFERS_PER_PORTION as u64 && second == 1,
+            "a portion of the stage Buffers did not give 32 buffers with no handles back",
+        )
+    });
+    // SAFETY: the test's references go, and nothing uses them afterwards.
+    unsafe {
+        for t in bare.into_iter().flatten() {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+        process::release(p, CAUSE);
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use()) == (processes, threads),
+        "the process or its threads stayed",
     )
 }
 
@@ -1971,13 +2037,13 @@ fn check_buffer_portions(p: NonNull<process::Process>, level: u8) -> Result<(), 
     let frames = phys::free_frames();
     cleanup::portion();
     check(
-        process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 13,
-        "the first portion of the stage Buffers did not stop at 13 buffers",
+        process::progress(p).0 == Stage::Buffers && phys::free_frames() == frames + 10,
+        "the first portion of the stage Buffers did not stop at 10 buffers",
     )?;
     cleanup::portion();
     check(
         process::progress(p).0 == Stage::Mappings && phys::free_frames() == frames + 16,
-        "the second portion of the stage Buffers did not give the other 3 back",
+        "the second portion of the stage Buffers did not give the other 6 back",
     )
 }
 

@@ -27,6 +27,12 @@ pub const STARTED: usize = 0;
 /// Where a child maps a page of its own (WriteReadOnly, ReadUnmapped),
 /// under the same table as its marks.
 pub const SCRATCH: usize = 0x3F_E000;
+/// Where a child maps a memory object that a message brought or that it
+/// made to send (Role::Service, Role::Provider), and the pages there,
+/// below SCRATCH: under the same table as its marks, so the mapping takes
+/// no new table.
+pub const SHARED: usize = 0x3E_0000;
+pub const SHARED_PAGES: usize = 16;
 /// Where a grandparent maps the boot image, and the window of its loader
 /// (rt::loader): above its message buffer, under the table of the second
 /// level that the buffer took.
@@ -154,10 +160,32 @@ pub enum Role {
     /// ends with 0 when each did as it must, else with the number of the
     /// first case that did not.
     Ceiling = 23,
+    /// A service of memory objects (spec 6.2): takes one request through
+    /// handle 0, a channel with RECEIVE, whose words give a length in
+    /// bytes and a word to write and which brings a memory object, and
+    /// maps the object at SHARED through handle 1, its own process with
+    /// MANAGE, RW; when that fails, it asks for RX, then maps it R and asks
+    /// mem_protect of that mapping to RW and to RX. It answers with seven
+    /// words: the info word of the object's handle, the sum of the object's
+    /// words, its first word, and x0 of the calls that map RW and RX and
+    /// change R to RW and RX (0 for those it did not make); a mapping RW
+    /// gets the word to write in its second word after the sum. A service
+    /// that goes by what the words say copies them to its own memory first;
+    /// this one only adds them up. Ends with 0.
+    Service = 24,
+    /// A provider of memory objects (spec 6.2): takes one request through
+    /// handle 0, a channel with RECEIVE, whose words give a count of pages
+    /// and a seed; makes an object of that many pages, which its quota
+    /// pays for, maps it at SHARED through handle 1, its own process with
+    /// MANAGE, RW, puts the seed plus i in its word i, unmaps it, and
+    /// answers with the memory it uses then (PROCESS_MEMORY) and a copy of
+    /// the object's handle with MAP_READ and TRANSFER alone, the only one
+    /// left once it closed its own. Ends with 0.
+    Provider = 25,
 }
 
 impl Role {
-    pub const ALL: [Role; 23] = [
+    pub const ALL: [Role; 25] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -181,6 +209,8 @@ impl Role {
         Role::BufferBack,
         Role::Serve,
         Role::Ceiling,
+        Role::Service,
+        Role::Provider,
     ];
 
     /// The role whose code is `code`.

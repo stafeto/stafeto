@@ -19,6 +19,10 @@
 .equ CALL_RECEIVE, 5                    // abi::Call::Receive
 .equ CALL_REPLY, 6                      // abi::Call::Reply
 .equ CALL_NOTIFY, 7                     // abi::Call::Notify
+.equ CALL_MEM_CREATE, 8                 // abi::Call::MemCreate
+.equ CALL_MEM_MAP, 9                    // abi::Call::MemMap
+.equ CALL_MEM_UNMAP, 10                 // abi::Call::MemUnmap
+.equ CALL_MEM_PROTECT, 11               // abi::Call::MemProtect
 .equ CALL_PROCESS_KILL, 13              // abi::Call::ProcessKill
 .equ CALL_PROCESS_EXIT, 14              // abi::Call::ProcessExit
 .equ CALL_THREAD_EXIT, 17               // abi::Call::ThreadExit
@@ -32,6 +36,8 @@
 .equ P_FPSR, 280
 .equ P_V, 288
 .equ FIFO, 1                            // abi::Policy::Fifo
+.equ READ, 1                            // abi::Access::Read
+.equ READ_WRITE, 3                      // abi::Access::ReadWrite
 .equ NO_WAIT, 0x10000                   // abi::NO_WAIT
 
 .arch_extension fp
@@ -688,5 +694,44 @@ el0_measure:
     mov     x1, x25
     svc     #CALL_SEND
     ret
+
+// Long calls of memory objects (ktest::el0).
+
+// mem_create(x0 size, 0); with its handle, mem_map(x1 own process, the
+// object, 0, x0, x2 address, RW), mem_protect(x1, x2, x0, R),
+// mem_unmap(x1, x2, x0), then handle_close of the object. Ends with the
+// x0 of each call in x20-x24.
+.global el0_long_calls
+el0_long_calls:
+    mov     x19, x0
+    mov     x25, x1
+    mov     x26, x2
+    mov     x1, #0
+    svc     #CALL_MEM_CREATE
+    mov     x20, x0
+    mov     x27, x1
+    mov     x0, x25
+    mov     x1, x27
+    mov     x2, #0
+    mov     x3, x19
+    mov     x4, x26
+    mov     x5, #READ_WRITE
+    svc     #CALL_MEM_MAP
+    mov     x21, x0
+    mov     x0, x25
+    mov     x1, x26
+    mov     x2, x19
+    mov     x3, #READ
+    svc     #CALL_MEM_PROTECT
+    mov     x22, x0
+    mov     x0, x25
+    mov     x1, x26
+    mov     x2, x19
+    svc     #CALL_MEM_UNMAP
+    mov     x23, x0
+    mov     x0, x27
+    svc     #CALL_HANDLE_CLOSE
+    mov     x24, x0
+    svc     #SVC_DONE
 
 el0_programs_end:

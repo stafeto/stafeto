@@ -90,6 +90,7 @@ unsafe extern "C" {
     static el0_measure: u8;
     static el0_serve_loop: u8;
     static el0_yield_loop: u8;
+    static el0_long_calls: u8;
 }
 
 /// Test system calls: the numbers lie in abi::TEST_CALLS and exist in test
@@ -114,6 +115,10 @@ const _: () = assert!(
         && Call::Receive.number() == 5
         && Call::Reply.number() == 6
         && Call::Notify.number() == 7
+        && Call::MemCreate.number() == 8
+        && Call::MemMap.number() == 9
+        && Call::MemUnmap.number() == 10
+        && Call::MemProtect.number() == 11
         && Call::ProcessKill.number() == 13
         && Call::ProcessExit.number() == 14
         && Call::ThreadExit.number() == 17
@@ -122,6 +127,7 @@ const _: () = assert!(
         && Call::ObjectInfo.number() == 27
 );
 const _: () = assert!(Policy::Fifo as u8 == 1 && NO_WAIT == 0x10000);
+const _: () = assert!(Access::Read.raw() == 1 && Access::ReadWrite.raw() == 3);
 
 /// Where the test processes see their pages: the programs at TEXT_VA, and
 /// one page of data at DATA_VA with the register pattern at its start and
@@ -161,6 +167,13 @@ const ROUNDS: u64 = 1000;
 const BATCHED: usize = 100;
 /// Pages of the memory object of `memory_object_goes_in_portions`: 64 MiB.
 const BIG_OBJECT: usize = 16384;
+/// Pages of the memory object of `long_call_yields_to_a_pending_interrupt`,
+/// 16 MiB, where its program maps them, and the period of the test's alarm
+/// meanwhile: shorter than the shortest of the calls, longer than their
+/// longest portion.
+const LONG_PAGES: usize = 4096;
+const LONG_VA: usize = 1 << 30;
+const LONG_PERIOD_NS: u64 = 500_000;
 
 struct El0Test {
     name: &'static str,
@@ -451,6 +464,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         start: start_round_trips,
         done: done_round_trips,
     },
+    El0Test {
+        name: "long_call_yields_to_a_pending_interrupt",
+        start: start_long_calls,
+        done: done_long_calls,
+    },
 ];
 
 /// The tests of this build, in the order they run.
@@ -554,6 +572,14 @@ struct Fixture {
     /// The thread that ran last when the first timer interrupt of the test
     /// came.
     interrupted: Option<NonNull<Thread>>,
+    /// How many counter ticks after each of its timer interrupts the test's
+    /// alarm fires again, if it does; then the long calls of the thread in
+    /// slot 0 that such an interrupt found between two of their portions,
+    /// a bit for each call's number, and the most ticks an interrupt came
+    /// past its deadline.
+    rearm: Option<u64>,
+    cut: u32,
+    waited: u64,
 }
 
 /// The scheduler's state that `svc #SVC_SNAP` notes, right after the
@@ -623,6 +649,9 @@ impl Fixture {
             snaps: [None; 2],
             alarm_at_snap: None,
             interrupted: None,
+            rearm: None,
+            cut: 0,
+            waited: 0,
         }
     }
 
@@ -867,6 +896,21 @@ pub fn timer_fired() {
     if f.fired_at.is_none() {
         f.fired_at = Some(timer::cval());
         f.queued_at_wake = Some(cleanup::len());
+    }
+    let now = timer::now();
+    let again = f.rearm.zip(f.alarm).map(|(period, alarm)| {
+        f.waited = f.waited.max(now.saturating_sub(timer::cval()));
+        let long = f.threads[0]
+            .filter(|&t| thread::current() == Some(t))
+            .and_then(thread::long);
+        if let Some(long) = long {
+            f.cut |= 1 << long.call().number();
+        }
+        (alarm, now + period)
+    });
+    drop(f);
+    if let Some((alarm, at)) = again {
+        timers::set(alarm, at, CAUSE).expect("the alarm's channel is open");
     }
 }
 
@@ -3814,5 +3858,51 @@ fn done_round_trips(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     check(
         FAST_PATH_HITS.load(Relaxed) == ROUNDS,
         "a round of the fast row did not take the fast path",
+    )
+}
+
+/// A long call yields to an interrupt that comes in the middle of its
+/// portions (spec 7.7): a thread at EL0 makes mem_create of LONG_PAGES
+/// pages, mem_map of them RW into its own process, mem_protect to R and
+/// mem_unmap (el0_long_calls), while the test's alarm fires every
+/// LONG_PERIOD_NS. Each of the four calls lets a timer interrupt in between
+/// two of its portions, which finds the call's progress in the thread
+/// (thread::long), and no interrupt waits as long as a period for the
+/// portion it came in. Only -icount makes the moments the alarm fires fall
+/// in the same places of the calls on every run.
+fn start_long_calls(f: &mut Fixture) -> Result<(), &'static str> {
+    let quota = QUOTA + (LONG_PAGES * PAGE) as u64;
+    let p = process::create_root(quota, HANDLE_LIMIT, CEILING).map_err(|_| "no process")?;
+    let p = with_programs(f, 0, p)?;
+    let t = new_thread(f, 0, p, DATA_VA, &raw const el0_long_calls, 0)?;
+    let own = give_kept(f, Object::Process(p))?;
+    set_args(t, &[(LONG_PAGES * PAGE) as u64, own, LONG_VA as u64]);
+    let period = timer::clock().ns_to_ticks(LONG_PERIOD_NS);
+    let first = timer::now() + period;
+    alarm(f, p, Some(first))?;
+    f.rearm = Some(period);
+    Ok(())
+}
+
+/// The four calls of el0_long_calls passed, each let an interrupt in
+/// between its portions, and none waited a period (spec 7.7).
+fn done_long_calls(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    check(
+        t.regs.x[20..25] == [0; 5],
+        "a long call of the program failed",
+    )?;
+    let calls = [
+        Call::MemCreate,
+        Call::MemMap,
+        Call::MemProtect,
+        Call::MemUnmap,
+    ];
+    check(
+        calls.iter().all(|c| f.cut & 1 << c.number() != 0),
+        "a long call let no interrupt in between its portions",
+    )?;
+    check(
+        f.rearm.is_some_and(|period| f.waited < period),
+        "an interrupt waited as long as a period for a long call",
     )
 }

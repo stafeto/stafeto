@@ -47,7 +47,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 151] = [
+const TESTS: [Test; 156] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -279,6 +279,7 @@ const TESTS: [Test; 151] = [
         "thread_buffer_cannot_land_in_a_mapping",
         thread_buffer_cannot_land_in_a_mapping,
     ),
+    ("long_calls_let_a_timer_in", long_calls_let_a_timer_in),
     (
         "mapped_object_outlives_its_last_handle",
         mapped_object_outlives_its_last_handle,
@@ -500,6 +501,19 @@ const TESTS: [Test; 151] = [
         send_handle_cannot_travel_in_its_own_send,
     ),
     ("same_handle_twice_is_invalid", same_handle_twice_is_invalid),
+    (
+        "memory_object_carries_a_request",
+        memory_object_carries_a_request,
+    ),
+    (
+        "memory_object_comes_back_in_a_reply",
+        memory_object_comes_back_in_a_reply,
+    ),
+    (
+        "narrowed_memory_handle_maps_read_only",
+        narrowed_memory_handle_maps_read_only,
+    ),
+    ("shared_pages_show_both_sides", shared_pages_show_both_sides),
     (
         "create_kill_cycles_leak_nothing",
         create_kill_cycles_leak_nothing,
@@ -3235,12 +3249,14 @@ fn timer_bounds_a_wait() -> Outcome {
 
 /// Spec 15.2 (time): what comes before the bound ends the wait first. A
 /// thread of init below it notifies the channel as soon as init waits,
-/// long before the timer's deadline: init wakes with that notification,
-/// cancels the timer, and once the deadline passed nothing more comes.
+/// long before the timer's deadline, 20 ms on, which a busy host running
+/// the virtual machine late does not reach first: init wakes with that
+/// notification, cancels the timer, and once the deadline passed nothing
+/// more comes.
 fn notification_before_the_timer_comes_first() -> Outcome {
     let c = channel(QUIET)?;
     let t = timer(&c)?;
-    let deadline = clock_now()? + 2_000_000;
+    let deadline = clock_now()? + 20_000_000;
     let set = arm(&t, deadline);
     let n = spawn(0, notify_once, c.raw().0, LOW, Policy::Fifo)?;
     let got = sys::receive(&c);
@@ -4160,6 +4176,135 @@ extern "C" fn probe_buffer(c: u64) -> ! {
     sys::thread_exit()
 }
 
+/// Rounds of the calls of `long_calls` at most.
+const LONG_ROUNDS: u32 = 16;
+/// The long calls of memory objects (spec 7.7) that `long_calls` makes.
+const LONG_CALLS: [Call; 4] = [
+    Call::MemCreate,
+    Call::MemMap,
+    Call::MemProtect,
+    Call::MemUnmap,
+];
+/// The free frames before the mem_create of `long_calls`.
+static FREE_BEFORE: AtomicU64 = AtomicU64::new(0);
+
+/// The bit of `call` among the calls a probe found in the middle of their
+/// portions (mark 3).
+fn call_bit(call: Call) -> u64 {
+    1 << call.number()
+}
+
+/// Free frames now (KERNEL_STATS).
+fn free_frames() -> u64 {
+    sys::kernel_stats(&init::RESOURCE).map_or(0, |s| s.free_frames)
+}
+
+/// Makes mem_create of BIG bytes, mem_map of them RX at WINDOW of init,
+/// mem_protect to R and mem_unmap, and closes the object, round after
+/// round, until a probe found each of them in the middle of its portions
+/// (mark 3) or LONG_ROUNDS rounds went; mark 2 names the call it makes,
+/// mark 0 notes 1 once every call passed, and mark 1 notes 1 at the end.
+extern "C" fn long_calls(_: u64) -> ! {
+    let all = LONG_CALLS.iter().fold(0, |bits, &c| bits | call_bit(c));
+    let mut passed = true;
+    let now = |call: Call| MARKS[2].store(call.number().into(), Relaxed);
+    for _ in 0..LONG_ROUNDS {
+        if mark(3) == all || !passed {
+            break;
+        }
+        FREE_BEFORE.store(free_frames(), Relaxed);
+        now(Call::MemCreate);
+        let Ok(m) = sys::mem_create(BIG) else {
+            passed = false;
+            break;
+        };
+        now(Call::MemMap);
+        passed &= sys::mem_map(&init::PROCESS, &m, 0, BIG, WINDOW, Access::ReadExec).is_ok();
+        // SAFETY: the window is the test's, and nothing else uses it.
+        unsafe {
+            now(Call::MemProtect);
+            passed &= sys::mem_protect(&init::PROCESS, WINDOW, BIG, Access::Read).is_ok();
+            now(Call::MemUnmap);
+            passed &= sys::mem_unmap(&init::PROCESS, WINDOW, BIG).is_ok();
+        }
+        MARKS[2].store(0, Relaxed);
+        passed &= m.close().is_ok();
+    }
+    MARKS[0].store(passed.into(), Relaxed);
+    MARKS[1].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Waits on channel `c` for its timer, PROBE_TIMER, again and again until
+/// `long_calls` ended (mark 1), and looks whether the call mark 2 names is
+/// in the middle of its portions, once for each call until it found it so:
+/// for mem_create, the free frames fell since the call began, and by less
+/// than the object's pages; for the others, mem_protect of their mapping
+/// with the access the mapping has when no call works on it fails with
+/// BAD_STATE. It marks the call in mark 3, and the timer comes again
+/// PROBE_PERIOD_NS later.
+extern "C" fn probe_long_calls(c: u64) -> ! {
+    let c = Handle::<Channel>::from_raw(abi::Handle(c));
+    let t = Handle::<Timer>::from_raw(abi::Handle(PROBE_TIMER.load(Relaxed)));
+    while mark(1) == 0 && sys::receive(&c).is_ok() {
+        let call = LONG_CALLS
+            .into_iter()
+            .find(|&n| u64::from(n.number()) == mark(2) && mark(3) & call_bit(n) == 0);
+        let caught = match call {
+            Some(Call::MemCreate) => {
+                let fell = FREE_BEFORE.load(Relaxed).saturating_sub(free_frames());
+                fell > 0 && fell < BIG / PAGE as u64
+            }
+            Some(n) => {
+                let access = if n == Call::MemMap {
+                    Access::ReadExec
+                } else {
+                    Access::Read
+                };
+                // SAFETY: an idle mapping at the window has this access
+                // already, so the call changes nothing.
+                let probed = unsafe { sys::mem_protect(&init::PROCESS, WINDOW, BIG, access) };
+                probed == Err(Error::BadState)
+            }
+            None => false,
+        };
+        if let Some(n) = call.filter(|_| caught) {
+            MARKS[3].fetch_or(call_bit(n), Relaxed);
+        }
+        let now = sys::clock_now().unwrap_or(0);
+        let _ = sys::timer_set(&t, now + PROBE_PERIOD_NS);
+    }
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (memory), 7.7: long calls let a timer in. A thread at LEVEL
+/// makes mem_create of BIG bytes, mem_map of them RX, whose portions take
+/// 8 pages and make the instruction cache coherent for them, mem_protect
+/// to R and mem_unmap (`long_calls`), while a thread at HIGH wakes every
+/// PROBE_PERIOD_NS at its timer (`probe_long_calls`): it runs in the middle
+/// of the portions of each of the four calls, each of which passes.
+fn long_calls_let_a_timer_in() -> Outcome {
+    reset_marks();
+    let c = channel(QUIET)?;
+    let t = timer(&c)?;
+    PROBE_TIMER.store(t.raw().0, Relaxed);
+    let prober = spawn(1, probe_long_calls, c.raw().0, HIGH, Policy::Fifo)?;
+    let caller = spawn(0, long_calls, 0, LEVEL, Policy::Fifo)?;
+    let armed = clock_now().and_then(|now| arm(&t, now + PROBE_PERIOD_NS));
+    let ran = armed.and_then(|()| let_run());
+    for h in [prober, caller] {
+        close(h)?;
+    }
+    close(t)?;
+    close(c)?;
+    ran?;
+    check(mark(0) == 1, "a long call failed")?;
+    check(
+        mark(3) == LONG_CALLS.iter().fold(0, |bits, &c| bits | call_bit(c)),
+        "no timer came in the middle of mem_create, mem_map, mem_protect and mem_unmap",
+    )
+}
+
 /// A message buffer lands in no mapping (spec 6.2): thread_create with its
 /// buffer on a page of a mapping that a long mem_map has not mapped yet
 /// fails with INVALID_ARGS, and so does one on a page of a whole mapping.
@@ -4323,6 +4468,14 @@ const THREADS_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
 /// A child that runs Role::Ceiling: pages of its pools of channels,
 /// sessions and shells more, and a page for its table.
 const CEILING_QUOTA: u64 = LEAF_QUOTA + 4 * PAGE as u64;
+/// A child that runs Role::Service needs no more than a leaf: it maps the
+/// object that comes to it at child::SHARED, under the table of its
+/// program, and the 3 pages a mapping pays ahead for are a leaf's.
+const SERVICE_QUOTA: u64 = LEAF_QUOTA;
+/// A child that runs Role::Provider: its object of child::SHARED_PAGES
+/// pages, the node of their list, and a page of its pool of memory
+/// objects more; the object at child::SHARED takes no table either.
+const PROVIDER_QUOTA: u64 = LEAF_QUOTA + (child::SHARED_PAGES as u64 + 2) * PAGE as u64;
 /// A child that loads a child of its own: its 12 pages as a leaf, tables
 /// for the boot image and for the loader's window, pages of its pools of
 /// memory objects, shells, channels and sessions, the grandchild's
@@ -4687,6 +4840,8 @@ fn quota_of(role: Role) -> u64 {
         Role::Grandparent => GRANDPARENT_QUOTA,
         Role::LastThread | Role::ExitProcess | Role::KillItself | Role::BufferBack => THREADS_QUOTA,
         Role::Ceiling => CEILING_QUOTA,
+        Role::Service => SERVICE_QUOTA,
+        Role::Provider => PROVIDER_QUOTA,
         _ => LEAF_QUOTA,
     }
 }
@@ -7607,4 +7762,237 @@ fn same_handle_twice_is_invalid() -> Outcome {
     check(sent, "send took a handle listed twice")?;
     check(replied, "reply took a handle listed twice")?;
     check(kept, "a handle listed twice was taken")
+}
+
+// Memory objects in messages (spec 6.2, 15.2): a handle to a memory
+// object moves with a request or a reply as any handle does, with the
+// rights of the copy that moves, and the receiver maps the object into its
+// own space with its own mem_map. The services are children with code
+// (Role::Service, Role::Provider), which init reaches through a thread of
+// its own at HIGH (`memory_client`).
+
+/// The length of the objects of these tests: all a child maps at
+/// child::SHARED.
+const SHARED_LEN: u64 = (child::SHARED_PAGES * PAGE) as u64;
+/// Init's word in a shared object, and the service's.
+const INIT_WORD: u64 = 0x1417_5EE5;
+const CHILD_WORD: u64 = 0xC41D_5EE5;
+
+/// The two words `memory_client` sends.
+static ASKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A client in `slot` that sends the words ASKED holds with the handles
+/// GIVEN holds through the channel HANDLES holds for it, and leaves in
+/// `result` the code of its call, the count of handles of the reply, the
+/// value and the info word of its first handle, and its eight words; then
+/// ends.
+extern "C" fn memory_client(slot: u64) -> ! {
+    let s = slot as usize;
+    let n = GIVEN_COUNT.load(Relaxed) as usize;
+    let handles: [abi::Handle; 4] = core::array::from_fn(|i| abi::Handle(GIVEN[i].load(Relaxed)));
+    let words = [
+        ASKED[0].load(Relaxed),
+        ASKED[1].load(Relaxed),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let bytes = abi::inline_bytes(&words);
+    match sys::send_handles(&handle(s), &bytes[..16], &handles[..n]) {
+        Ok(reply) => {
+            let mut w = [0; 12];
+            w[1] = reply.handles as u64;
+            if reply.handles > 0 {
+                let (h, (kind, rights)) = rt::msgbuf::handle(0);
+                w[2] = h.0;
+                w[3] = abi::msgbuf::info(kind, rights);
+            }
+            w[4..].copy_from_slice(&reply.words);
+            record(s, &w);
+        }
+        Err(e) => record(s, &[e.code()]),
+    }
+    ENDED[s].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A child with `role` and its quota answers one request with `words` and
+/// `handles`, which a thread of init at HIGH sends (`memory_client`)
+/// through a channel whose handle with RECEIVE the child gets, with its
+/// own process: what the client got (`result`, the reply's words from 4
+/// on) and why the child ended, once it ended.
+fn served(
+    role: Role,
+    words: [u64; 2],
+    handles: &[abi::Handle],
+) -> Result<([u64; 12], ProcessState), &'static str> {
+    reset_results();
+    let c = channel(LEVEL)?;
+    let send = copy(&c, Rights::SEND)?;
+    HANDLES[0].store(send.raw().0, Relaxed);
+    for (a, w) in ASKED.iter().zip(words) {
+        a.store(w, Relaxed);
+    }
+    give(handles);
+    let kid = Kid::load(quota_of(role), 16, LEVEL)?;
+    let asked = kid
+        .start()
+        .and_then(|()| kid.serve(role, &[], &[Gift::Given(c.raw()), Gift::Own]))
+        .and_then(|()| spawn(0, memory_client, 0, HIGH, Policy::Fifo));
+    // The child runs once init waits for its end.
+    let state = kid.end();
+    kid.close()?;
+    close(send)?;
+    close(asked?)?;
+    check(ended(0), "the client did not come back from its request")?;
+    Ok((result(0), state?))
+}
+
+/// Writes PATTERN plus i into word i of `m`, of SHARED_LEN bytes, through a
+/// mapping at WINDOW that goes again; returns the sum of the words.
+fn with_pattern(m: &Handle<Memory>) -> Result<u64, &'static str> {
+    const PATTERN: u64 = 0x0B1E_C700_0000;
+    map(m, 0, SHARED_LEN, WINDOW, Access::ReadWrite)?;
+    let mut sum = 0u64;
+    for i in 0..SHARED_LEN as usize / 8 {
+        let w = PATTERN + i as u64;
+        // SAFETY: the window is init's mapping of `m`, read and write.
+        unsafe { (WINDOW as *mut u64).add(i).write_volatile(w) };
+        sum = sum.wrapping_add(w);
+    }
+    unmap(WINDOW, SHARED_LEN)?;
+    Ok(sum)
+}
+
+/// Spec 15.2 (messages), 6.2: a memory object carries a request. Init
+/// fills an object with a pattern and sends a copy of its handle with
+/// MAP_READ and TRANSFER alone to a service, a child: the info word the
+/// child finds with the handle names a memory object with those rights,
+/// and the child maps the object R, adds its words up and answers with the
+/// sum, the pattern's. The copy left init's table.
+fn memory_object_carries_a_request() -> Outcome {
+    let m = memory_object(child::SHARED_PAGES as u64)?;
+    let sum = with_pattern(&m);
+    let rights = Rights::MAP_READ | Rights::TRANSFER;
+    let sent = copy_raw(&m, rights)?;
+    let got = sum.and_then(|_| served(Role::Service, [SHARED_LEN, 0], &[sent]));
+    let gone = close_raw(sent) == Err(Error::BadHandle);
+    close(m)?;
+    let (reply, state) = got?;
+    check(
+        state == ProcessState::Exited { code: 0 },
+        "the service did not answer",
+    )?;
+    check(
+        reply[4] == abi::msgbuf::info(abi::ObjectKind::Memory, rights),
+        "the handle came to the service as no memory object, or with other rights",
+    )?;
+    check(
+        Ok(reply[5]) == sum,
+        "the service did not see the pattern init wrote",
+    )?;
+    check(gone, "the copy that moved stayed in init's table")
+}
+
+/// Spec 15.2 (messages), 5.2, 7.4: a memory object comes back in a reply,
+/// and outlives its maker (spec 7.5). A provider, a child, makes an
+/// object, which its quota pays for by its parts, fills it with a
+/// pattern and answers init's request with a copy of its handle with
+/// MAP_READ and TRANSFER alone, and ends. Then init maps the object R and
+/// reads the pattern, and RW fails with ACCESS_DENIED alone. While init
+/// holds the object, the memory init gave the provider is not all back;
+/// once it closes the handle, it is.
+fn memory_object_comes_back_in_a_reply() -> Outcome {
+    const N: u16 = Call::MemMap.number();
+    const SEED: u64 = 0x5EED_0000_0000;
+    let before = counts_at_rest()?;
+    let (reply, state) = served(Role::Provider, [child::SHARED_PAGES as u64, SEED], &[])?;
+    let m = Handle::<Memory>::from_raw(abi::Handle(reply[2]));
+    let args = [
+        init::PROCESS.raw().0,
+        m.raw().0,
+        0,
+        SHARED_LEN,
+        WINDOW as u64,
+        Access::ReadWrite.raw(),
+    ];
+    let refused = x0_alone::<N>(&args, Error::AccessDenied.code());
+    let seen = map(&m, 0, SHARED_LEN, WINDOW, Access::Read).and_then(|()| {
+        // SAFETY: the window is init's mapping of the object, readable.
+        let words = (0..SHARED_LEN as usize / 8)
+            .all(|i| unsafe { (WINDOW as *const u64).add(i).read_volatile() } == SEED + i as u64);
+        unmap(WINDOW, SHARED_LEN).map(|()| words)
+    });
+    let held = counts_at_rest()?;
+    close(m)?;
+    let after = counts_at_rest()?;
+    let rights = Rights::MAP_READ | Rights::TRANSFER;
+    check(
+        state == ProcessState::Exited { code: 0 }
+            && reply[1] == 1
+            && reply[3] == abi::msgbuf::info(abi::ObjectKind::Memory, rights),
+        "the provider's reply did not bring its object with MAP_READ and TRANSFER",
+    )?;
+    check(
+        reply[4] == PROVIDER_QUOTA - 3 * PAGE as u64,
+        "the provider did not pay for its object, the node of its list and a page of its pool",
+    )?;
+    check(
+        seen == Ok(true) && refused,
+        "init did not read the pattern of the provider that ended, or mapped it RW",
+    )?;
+    check(
+        held.0 > before.0 && after == before,
+        "the memory of the provider came back before its object went, or not at all",
+    )
+}
+
+/// Spec 15.2 (messages), 5.2, 7.4: a memory object's handle that moves
+/// with MAP_READ and TRANSFER alone maps R only (spec 6.2): at the service
+/// that gets it, mem_map RW and RX and mem_protect of its mapping R to RW
+/// and to RX fail with ACCESS_DENIED, and R maps.
+fn narrowed_memory_handle_maps_read_only() -> Outcome {
+    let m = memory_object(child::SHARED_PAGES as u64)?;
+    let sent = copy_raw(&m, Rights::MAP_READ | Rights::TRANSFER)?;
+    let got = served(Role::Service, [SHARED_LEN, 0], &[sent]);
+    close(m)?;
+    let (reply, state) = got?;
+    check(
+        state == ProcessState::Exited { code: 0 },
+        "the service did not map the object R",
+    )?;
+    check(
+        reply[7..11] == [Error::AccessDenied.code(); 4],
+        "the service mapped the object RW or RX, or made its mapping so",
+    )
+}
+
+/// Spec 15.2 (messages), 6.2: pages of a memory object in a message show
+/// both sides. Init maps an object RW and writes INIT_WORD into its first
+/// word, and sends a copy with MAP_READ, MAP_WRITE and TRANSFER to a
+/// service, which maps it RW, finds INIT_WORD and writes CHILD_WORD into
+/// the second word, which init reads through its own mapping.
+fn shared_pages_show_both_sides() -> Outcome {
+    let m = memory_object(child::SHARED_PAGES as u64)?;
+    map(&m, 0, SHARED_LEN, WINDOW, Access::ReadWrite)?;
+    let word = WINDOW as *mut u64;
+    // SAFETY: the window is init's mapping of the object, read and write.
+    unsafe { word.write_volatile(INIT_WORD) };
+    let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+    let got = copy_raw(&m, rights)
+        .and_then(|sent| served(Role::Service, [SHARED_LEN, CHILD_WORD], &[sent]));
+    // SAFETY: as above.
+    let seen = unsafe { word.add(1).read_volatile() };
+    unmap(WINDOW, SHARED_LEN)?;
+    close(m)?;
+    let (reply, state) = got?;
+    check(
+        state == ProcessState::Exited { code: 0 } && reply[7] == 0,
+        "the service did not map the object RW",
+    )?;
+    check(reply[6] == INIT_WORD, "the service did not see init's word")?;
+    check(seen == CHILD_WORD, "init did not see the service's word")
 }

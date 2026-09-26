@@ -40,22 +40,39 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// Tests only the `icount` build has: the first checks that the run is
-/// under -icount; the next two depend on how much of a quantum is left,
-/// which only -icount makes repeatable; the fourth takes a big process
-/// apart in hundreds of portions with interrupts between them, where
-/// virtual time counts instructions and a stall of the host changes
-/// nothing; the last measures the round trip of a request, which only
-/// -icount counts in instructions (spec 15.3).
-const ICOUNT_TESTS: [&str; 5] = [
+/// under -icount; the second measures the portions of the long calls of
+/// memory objects, which only -icount counts in instructions (spec 15.3);
+/// the next two depend on how much of a quantum is left, which only
+/// -icount makes repeatable; the fifth takes a big process apart in
+/// hundreds of portions with interrupts between them, where virtual time
+/// counts instructions and a stall of the host changes nothing; the sixth
+/// measures the round trip of a request; in the last a timer fires in the
+/// middle of each long call of memory objects at the same place on every
+/// run.
+const ICOUNT_TESTS: [&str; 7] = [
     "virtual_time_counts_instructions",
+    "memory_portions_are_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "teardown_yields_to_a_pending_interrupt",
     "ipc_round_trip_is_measured",
+    "long_call_yields_to_a_pending_interrupt",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
 const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
+/// The rows of the line of `memory_portions_are_measured`, in its order
+/// (spec 15.3).
+const MEMORY_PORTION_ROWS: [&str; 8] = [
+    "create",
+    "map",
+    "map_exec",
+    "unmap",
+    "protect",
+    "protect_exec",
+    "release",
+    "first_map",
+];
 /// What init prints on the normal build (services/init), each line whole;
 /// the order of the threads' lines depends on the timer and is not
 /// checked.
@@ -119,7 +136,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 151;
+const INIT_TESTS: u32 = 156;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -756,38 +773,45 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
         r.passed.len()
     );
     if icount {
-        let ticks = round_trip_ticks(&o.lines)?;
-        let rows: Vec<_> = ROUND_TRIP_ROWS
-            .iter()
-            .zip(ticks)
-            .map(|(row, n)| format!("{row}={n}"))
-            .collect();
-        println!("ipc round trip ticks on {}: {}", m.memory, rows.join(" "));
+        for (what, rows) in [
+            ("ipc round trip", &ROUND_TRIP_ROWS[..]),
+            ("memory portions", &MEMORY_PORTION_ROWS[..]),
+        ] {
+            let ticks = ticks_of(&o.lines, what, rows)?;
+            let rows: Vec<_> = rows
+                .iter()
+                .zip(ticks)
+                .map(|(row, n)| format!("{row}={n}"))
+                .collect();
+            println!("{what} ticks on {}: {}", m.memory, rows.join(" "));
+        }
     }
     Ok(())
 }
 
-/// The numbers of the line `ipc round trip ticks: null=... handles=...`
-/// that `ipc_round_trip_is_measured` prints, one for each of
-/// ROUND_TRIP_ROWS in that order: an error when no line has them all.
-fn round_trip_ticks(lines: &[String]) -> Result<[u64; 6], String> {
+/// The numbers of the line `<what> ticks: <row>=<n> ...` that a measuring
+/// test prints (`ipc round trip`, `memory portions`), one for each of
+/// `rows` in that order: an error when no line has them all.
+fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, String> {
+    let prefix = format!("{what} ticks: ");
     let line = lines
         .iter()
-        .find_map(|l| l.strip_prefix("ipc round trip ticks: "))
-        .ok_or("the kernel printed no round trip")?;
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .ok_or_else(|| format!("the kernel printed no {what} ticks"))?;
     let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.len() != ROUND_TRIP_ROWS.len() {
-        return Err(format!("the round trip has other rows: {line:?}"));
+    if fields.len() != rows.len() {
+        return Err(format!("the {what} line has other rows: {line:?}"));
     }
-    let mut ticks = [0; 6];
-    for ((t, row), field) in ticks.iter_mut().zip(ROUND_TRIP_ROWS).zip(fields) {
-        *t = field
-            .strip_prefix(row)
-            .and_then(|f| f.strip_prefix('='))
-            .and_then(|n| n.parse().ok())
-            .ok_or_else(|| format!("{field:?} is no {row} row of the round trip"))?;
-    }
-    Ok(ticks)
+    rows.iter()
+        .zip(fields)
+        .map(|(row, field)| {
+            field
+                .strip_prefix(row)
+                .and_then(|f| f.strip_prefix('='))
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| format!("{field:?} is no {row} row of the {what} line"))
+        })
+        .collect()
 }
 
 /// The test init (tests/init) as init of the normal build, the kernel that
@@ -1026,18 +1050,44 @@ mod tests {
     /// passes for it.
     #[test]
     fn round_trip_line_gives_six_rows() {
+        let what = "ipc round trip";
         let line = "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6";
         let lines = ["TEST fast_path_is_taken ok", line].map(String::from);
-        assert_eq!(round_trip_ticks(&lines), Ok([1, 2, 3, 4, 5, 6]));
+        let ticks = ticks_of(&lines, what, &ROUND_TRIP_ROWS);
+        assert_eq!(ticks, Ok(vec![1, 2, 3, 4, 5, 6]));
         for bad in [
             "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5",
             "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 handles=5 buffer=6",
             "ipc round trip ticks: null=x switch=2 fast=3 slow=4 buffer=5 handles=6",
             "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6 more=7",
         ] {
-            assert!(round_trip_ticks(&[bad.to_string()]).is_err(), "{bad}");
+            let lines = [bad.to_string()];
+            assert!(ticks_of(&lines, what, &ROUND_TRIP_ROWS).is_err(), "{bad}");
         }
-        assert!(round_trip_ticks(&[]).is_err());
+        assert!(ticks_of(&[], what, &ROUND_TRIP_ROWS).is_err());
+    }
+
+    /// The line of the portions of memory objects gives its eight rows in
+    /// order, and the round trip's does not pass for it.
+    #[test]
+    fn memory_portions_line_gives_eight_rows() {
+        let what = "memory portions";
+        let line = "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 \
+                    protect_exec=6 release=7 first_map=8";
+        let lines = [line.to_string()];
+        let ticks = ticks_of(&lines, what, &MEMORY_PORTION_ROWS);
+        assert_eq!(ticks, Ok((1..=8).collect()));
+        for bad in [
+            "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7",
+            "memory portions ticks: map=2 create=1 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7 first_map=8",
+            "ipc round trip ticks: null=1 switch=2 fast=3 slow=4 buffer=5 handles=6",
+        ] {
+            let lines = [bad.to_string()];
+            assert!(
+                ticks_of(&lines, what, &MEMORY_PORTION_ROWS).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     /// A child's panic is its place and its message on two whole lines, and

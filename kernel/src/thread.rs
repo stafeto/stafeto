@@ -404,6 +404,15 @@ pub unsafe fn drop_transit(t: NonNull<Thread>, cause: u8) -> usize {
     n
 }
 
+/// The handles on their way with a request of `t` and the long call it
+/// is making, one each: the units of work they add to a portion of the
+/// stage Buffers (spec 7.7).
+pub fn held(t: NonNull<Thread>) -> usize {
+    // SAFETY: the caller holds the thread; only the fields are read.
+    let (transit, long) = unsafe { (&(*t.as_ptr()).transit, (*t.as_ptr()).long) };
+    transit.iter().flatten().count() + usize::from(long.is_some())
+}
+
 /// The long call `t` is making, if any (spec 7.7).
 pub fn long(t: NonNull<Thread>) -> Option<Long> {
     // SAFETY: the caller holds the thread; only the field is read.

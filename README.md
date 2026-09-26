@@ -21,21 +21,30 @@ stafeto boots in QEMU and runs programs at EL0. What works today:
   image.
 - **Memory:** the kernel's own page tables with W^X, a buddy frame
   allocator, object pools, an address space with an ASID per process; every
-  process pays for its kernel memory from its quota.
+  process pays for its kernel memory from its quota. Memory objects take all
+  their pages when they are made, and a process maps them R, RW or RX,
+  never writable and executable at once, into its own space or into a
+  process whose handle with `MANAGE` it holds; long calls go in bounded
+  portions that let interrupts in. The segments and the stack of `init`
+  are memory objects too.
 - **Execution:** threads at EL0 with registers and FP/SIMD saved on every
   switch; a scheduler with 64 priority levels (round robin with a 4 ms
   quantum, and FIFO) and tickless timer preemption.
 - **Objects and calls:** 64-bit handles with rights; processes, threads,
-  channels, sessions and program timers; the first system calls
-  (`debug_write`, `yield`, `thread_*`, `process_*`, `channel_create`,
-  `notify`, `send`, `receive`, `reply`, `timer_*`, `object_info`).
+  channels, sessions, program timers and memory objects; the first system
+  calls (`debug_write`, `yield`, `thread_*`, `process_*`, `channel_create`,
+  `notify`, `send`, `receive`, `reply`, `timer_*`, `mem_create`,
+  `mem_map`, `mem_unmap`, `mem_protect`, `object_info`).
 - **Messages:** synchronous requests and replies of up to 1 KB, the first
   64 bytes in registers and the rest through a per-thread message buffer;
   up to four handles move with a message, keeping their rights and labels;
-  a service works at its client's priority under its own ceiling until it
-  replies; a fast path hands the CPU straight to a waiting service.
+  a memory object moves the same way, so larger data goes through pages
+  both sides map; a service works at its client's priority under its own
+  ceiling until it replies; a fast path hands the CPU straight to a waiting
+  service.
 - **Faults:** a program fault ends only its own process, and the parent
-  learns why through its exit channel.
+  learns why through its exit channel; the tests check it on child
+  processes with code that `init` loads from the boot image.
 
 `cargo xtask run` shows `init` saying hello from EL0 and two of its threads
 taking turns.
@@ -58,7 +67,7 @@ parts. Each finished part is merged through a pull request.
 | 1.3 Messages and objects | 1.3a Teardown and quotas | cleanup queue in bounded portions, process tree, quotas | ✅ [#6](https://github.com/stafeto/stafeto/pull/6) |
 | | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
 | | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | ✅ [#11](https://github.com/stafeto/stafeto/pull/11) |
-| | 1.3d Memory objects | `mem_create`, `mem_map`, lazy pages, child processes with code | 🚧 |
+| | 1.3d Memory objects | `mem_create`, `mem_map`, memory objects in messages, child processes with code | 🚧 |
 | | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ⬜ |
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ⬜ |
 

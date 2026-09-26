@@ -15,7 +15,7 @@
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
     ARGS, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS, MOST_USED,
-    NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SEEN, STARTED, WINDOW,
+    NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SEEN, SHARED, STARTED, WINDOW,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Resource, Thread};
@@ -237,6 +237,8 @@ fn run(s: &Start) -> u64 {
             Some(checked) => ceiling(s, checked),
             None => FAILED,
         },
+        Role::Service => service(s).unwrap_or(FAILED),
+        Role::Provider => provide(s).unwrap_or(FAILED),
     }
 }
 
@@ -599,4 +601,83 @@ fn made() -> Result<(u64, Handle<Channel>, u64), Error> {
     let left = sys::handle_duplicate(&shut, Rights::NOTIFY)?;
     shut.close()?;
     Ok((closed, channel, left.raw().0))
+}
+
+/// x0 of a call that returns nothing else: 0, or the code of its error.
+fn code(result: Result<(), Error>) -> u64 {
+    result.map_or_else(Error::code, |()| 0)
+}
+
+/// Role::Service.
+fn service(s: &Start) -> Result<u64, Error> {
+    let requests = Handle::<Channel>::from_raw(s.handles[0]);
+    let own = Handle::<Process>::from_raw(s.handles[1]);
+    let Received::Message {
+        handles: 1,
+        token,
+        words,
+        ..
+    } = sys::receive(&requests)?
+    else {
+        return Ok(FAILED);
+    };
+    let (h, (kind, rights)) = msgbuf::handle(0);
+    let m = Handle::<Memory>::from_raw(h);
+    let (len, word) = (words[0], words[1]);
+    let mut answer = [0; 8];
+    answer[0] = abi::msgbuf::info(kind, rights);
+    let shared = sys::mem_map(&own, &m, 0, len, SHARED, Access::ReadWrite);
+    answer[3] = code(shared);
+    if shared.is_err() {
+        answer[4] = code(sys::mem_map(&own, &m, 0, len, SHARED, Access::ReadExec));
+        sys::mem_map(&own, &m, 0, len, SHARED, Access::Read)?;
+        // SAFETY: the calls must fail; had they passed, the pages would
+        // only have become writable or executable.
+        unsafe {
+            answer[5] = code(sys::mem_protect(&own, SHARED, len, Access::ReadWrite));
+            answer[6] = code(sys::mem_protect(&own, SHARED, len, Access::ReadExec));
+        }
+    }
+    let at = SHARED as *mut u64;
+    // SAFETY: the mapping shows `len` bytes at SHARED, readable, and
+    // writable when `shared` passed; nothing else uses them.
+    unsafe {
+        answer[2] = at.read_volatile();
+        answer[1] =
+            (0..len as usize / 8).fold(0u64, |sum, i| sum.wrapping_add(at.add(i).read_volatile()));
+        if shared.is_ok() {
+            at.add(1).write_volatile(word);
+        }
+        sys::mem_unmap(&own, SHARED, len)?;
+    }
+    m.close()?;
+    token.reply(&abi::inline_bytes(&answer)[..7 * 8])?;
+    Ok(0)
+}
+
+/// Role::Provider.
+fn provide(s: &Start) -> Result<u64, Error> {
+    let requests = Handle::<Channel>::from_raw(s.handles[0]);
+    let own = Handle::<Process>::from_raw(s.handles[1]);
+    let Received::Message { token, words, .. } = sys::receive(&requests)? else {
+        return Ok(FAILED);
+    };
+    let (pages, seed) = (words[0], words[1]);
+    let len = pages * PAGE;
+    let m = sys::mem_create(len)?;
+    sys::mem_map(&own, &m, 0, len, SHARED, Access::ReadWrite)?;
+    let at = SHARED as *mut u64;
+    // SAFETY: the mapping shows the object's `len` bytes at SHARED,
+    // readable and writable, and nothing else uses them.
+    unsafe {
+        for i in 0..len as usize / 8 {
+            at.add(i).write_volatile(seed + i as u64);
+        }
+        sys::mem_unmap(&own, SHARED, len)?;
+    }
+    let used = sys::process_memory(&own)?.used;
+    let copy = sys::handle_duplicate(&m, Rights::MAP_READ | Rights::TRANSFER)?;
+    m.close()?;
+    token.reply_handles(&used.to_le_bytes(), &[copy.raw()])?;
+    Ok(0)
 }

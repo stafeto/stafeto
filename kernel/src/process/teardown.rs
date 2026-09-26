@@ -9,19 +9,25 @@ use super::table::table;
 use super::*;
 use crate::syscall;
 
-/// Pages a portion of the stage Shell gives back, at most (spec 7.7).
-const SHELL_PORTION: usize = 64;
+/// Pages a portion of the stage Shell gives back, at most (spec 7.7):
+/// each goes back to the frame allocator, FRAME_UNITS units of work, 64 in
+/// all.
+const SHELL_PORTION: usize = 32;
 
 /// Clients of one level a portion of the stage Replies wakes, at most
 /// (spec 7.7).
 const REPLIES_PORTION: usize = 32;
 
 /// The work a portion of the stage Buffers does, at most (spec 7.7): the
-/// buffer of each thread is a unit, and each handle of a request it made
-/// and the long call it was making one more; the thread that reaches it is
-/// the portion's last. The buffers of abi::MAX_THREADS threads with no
-/// handles take one portion.
+/// buffer of each thread is FRAME_UNITS units, and each handle of a request
+/// it made and the long call it was making one more (thread::held); a
+/// thread goes into the portion only when its units fit. The buffers of 32
+/// threads with no handles take one portion.
 const BUFFERS_PORTION: usize = 64;
+
+/// The units of work of a frame that goes back to the frame allocator
+/// (spec 7.7): its free may merge blocks up to kcore::frames::MAX_ORDER.
+const FRAME_UNITS: usize = 2;
 
 /// The bits of an exit notification (spec 6.5, 7.9): bit 0, once.
 const EXIT_BITS: u64 = 1;
@@ -437,10 +443,14 @@ unsafe fn release_buffers(process: NonNull<Process>, level: u8) -> bool {
     // since each is either held or queued for cleanup behind this portion,
     // and none waits in a queue any more.
     unsafe {
-        while work < BUFFERS_PORTION
-            && let Some(t) = (*process.as_ptr()).threads
-        {
-            work += 1 + thread::drop_transit(t, level) + thread::drop_long(t, level);
+        while let Some(t) = (*process.as_ptr()).threads {
+            let units = FRAME_UNITS + thread::held(t);
+            if work + units > BUFFERS_PORTION {
+                break;
+            }
+            work += units;
+            thread::drop_transit(t, level);
+            thread::drop_long(t, level);
             thread::drop_buffer(t, level);
             remove_thread(process, t);
         }

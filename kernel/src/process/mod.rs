@@ -58,6 +58,8 @@ mod maps;
 mod table;
 mod teardown;
 
+#[cfg(feature = "icount")]
+pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
 pub use maps::PORTION;
 pub use maps::{
