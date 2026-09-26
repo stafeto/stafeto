@@ -12,15 +12,15 @@
 #![no_std]
 #![no_main]
 
-use abi::{Access, Error, Policy, Rights};
+use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, FAILED, FAULT_AT, FULL, HELLO, IMAGE, MADE, MARKS, MOST_USED, NO_FAULT, QUOTA, ROUNDS,
-    Role, SCRATCH, STARTED, WINDOW,
+    ARGS, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS, MOST_USED,
+    NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SEEN, STARTED, WINDOW,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Memory, Process, Resource};
-use rt::sys::{self, Received};
-use rt::{Handle, loader, msgbuf};
+use rt::handle::{Channel, Memory, Process, Resource, Thread};
+use rt::sys::{self, Received, Regs};
+use rt::{Handle, Stack, loader, msgbuf};
 
 rt::entry!(main);
 
@@ -34,6 +34,8 @@ const HELD_MAX: usize = 1024;
 static DATA: AtomicU32 = AtomicU32::new(0);
 /// The copies Role::Churn holds.
 static HELD: [AtomicU64; HELD_MAX] = [const { AtomicU64::new(0) }; HELD_MAX];
+/// The stacks of the helper threads of a role.
+static STACKS: [Stack<8192>; 2] = [const { Stack::new() }; 2];
 
 /// The reply to the start request.
 struct Start {
@@ -175,6 +177,66 @@ fn run(s: &Start) -> u64 {
             }
         }
         Role::Churn => churn(s, a[0]),
+        Role::Wfi => {
+            let at = mark(FAULT_AT).as_ptr();
+            // SAFETY: the instruction is the fault the role exists for; its
+            // address goes to mark FAULT_AT first.
+            unsafe {
+                core::arch::asm!(
+                    "adr {t}, 2f",
+                    "str {t}, [{at}]",
+                    "2: wfi",
+                    t = out(reg) _,
+                    at = in(reg) at,
+                    options(nostack),
+                )
+            };
+            NO_FAULT
+        }
+        Role::LastThread => last_thread(s),
+        Role::ExitProcess => match helper(s, 0, a[1] as u8, mark_helper) {
+            Ok(_) => sys::process_exit(a[0]),
+            Err(_) => FAILED,
+        },
+        Role::KillItself => {
+            let own = Handle::<Process>::from_raw(s.handles[0]);
+            match helper(s, 0, a[0] as u8, mark_helper) {
+                // A kill of its own process does not return.
+                Ok(_) => sys::process_kill(&own).map_or(FAILED, |()| FAILED),
+                Err(_) => FAILED,
+            }
+        }
+        Role::Notify => match sys::notify(&rt::START_CHANNEL, a[0]) {
+            Ok(()) => 0,
+            Err(e) => e.code(),
+        },
+        Role::Reply => {
+            let mut x = marked();
+            x[..3].copy_from_slice(&[a[0], 8, a[1]]);
+            // SAFETY: reply reads its registers and the caller's buffer.
+            let after = unsafe { sys::raw::<{ Call::Reply.number() }>(x) };
+            after[0]
+        }
+        Role::TakeThenExit => {
+            let c = Handle::<Channel>::from_raw(s.handles[0]);
+            match sys::receive(&c) {
+                Ok(Received::Message { .. }) => sys::process_exit(0),
+                _ => FAILED,
+            }
+        }
+        Role::Send => {
+            let c = Handle::<Channel>::from_raw(s.handles[0]);
+            match sys::send(&c, &a[0].to_le_bytes()) {
+                Ok(reply) => reply.words[0],
+                Err(e) => e.code(),
+            }
+        }
+        Role::BufferBack => buffer_back(s),
+        Role::Serve => serve(s, a[0]),
+        Role::Ceiling => match Checked::from_code(a[0]) {
+            Some(checked) => ceiling(s, checked),
+            None => FAILED,
+        },
     }
 }
 
@@ -295,4 +357,246 @@ fn churn(s: &Start, total: u64) -> u64 {
     mark(FULL).store(full, Relaxed);
     mark(MOST_USED).store(most, Relaxed);
     0
+}
+
+/// x0-x9 filled with marks, for calls that must change x0 alone.
+fn marked() -> Regs {
+    core::array::from_fn(|i| 0x5A5A_0000 + i as u64)
+}
+
+/// The page of the message buffer of helper thread `i`, from 1, above the
+/// first thread's (abi::INIT_MSGBUF).
+fn buffer(i: usize) -> usize {
+    abi::INIT_MSGBUF as usize + i * PAGE as usize
+}
+
+/// A helper thread of the child at `priority` on the stack of slot `slot`,
+/// started, that runs `entry` with handle 0 of the start data, the child's
+/// own process, as its argument.
+fn helper(
+    s: &Start,
+    slot: usize,
+    priority: u8,
+    entry: extern "C" fn(u64) -> !,
+) -> Result<Handle<Thread>, Error> {
+    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let top = STACKS[slot].top();
+    // SAFETY: each helper has a stack of its own, which nothing else uses.
+    let t = unsafe {
+        sys::thread_create(
+            &own,
+            entry,
+            top,
+            own.raw().0,
+            priority,
+            Policy::Fifo,
+            buffer(slot + 1),
+        )
+    }?;
+    sys::thread_start(&t)?;
+    Ok(t)
+}
+
+/// A helper that marks HELPER and ends.
+extern "C" fn mark_helper(_: u64) -> ! {
+    mark(HELPER).fetch_add(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A helper that marks SEEN when object_info of its process, `own`, says
+/// it lives, marks HELPER and ends.
+extern "C" fn alive_then_exit(own: u64) -> ! {
+    let state = sys::process_state(&Handle::<Process>::from_raw(abi::Handle(own)));
+    mark(SEEN).store(u64::from(state == Ok(ProcessState::Alive)), Relaxed);
+    mark(HELPER).fetch_add(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// A helper that marks SEEN when its message buffer reads zero and takes
+/// a write, marks HELPER and ends.
+extern "C" fn buffer_then_exit(_: u64) -> ! {
+    let word = msgbuf::address() as *mut u64;
+    // SAFETY: the buffer is the thread's own page, readable and writable
+    // while it lives (spec 6.2).
+    let fresh = unsafe {
+        let zero = word.read_volatile() == 0;
+        word.write_volatile(0x5EED);
+        zero && word.read_volatile() == 0x5EED
+    };
+    mark(SEEN).store(u64::from(fresh), Relaxed);
+    mark(HELPER).fetch_add(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Role::LastThread.
+fn last_thread(s: &Start) -> u64 {
+    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let level = s.args[0] as u8;
+    // SAFETY: the stack of slot 1 is the stopped thread's, which never
+    // runs.
+    let stopped = unsafe {
+        sys::thread_create(
+            &own,
+            mark_helper,
+            STACKS[1].top(),
+            0,
+            level,
+            Policy::Fifo,
+            buffer(2),
+        )
+    };
+    match (stopped, helper(s, 0, level, alive_then_exit)) {
+        (Ok(_), Ok(_)) => sys::thread_exit(),
+        _ => FAILED,
+    }
+}
+
+/// Role::BufferBack.
+fn buffer_back(s: &Start) -> u64 {
+    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let me = Handle::<Thread>::from_raw(s.handles[1]);
+    let level = s.args[0] as u8;
+    let used = || sys::process_memory(&own).map_or(0, |m| m.used);
+    let before = used();
+    let Ok(t) = helper(s, 0, level, buffer_then_exit) else {
+        return FAILED;
+    };
+    let charged = used();
+    // The helper runs, and ends, before the child does again.
+    if sys::thread_set_priority(&me, level - 1, Policy::Fifo).is_err() {
+        return FAILED;
+    }
+    let after = used();
+    let ended = sys::thread_set_priority(&t, level, Policy::Fifo);
+    let closed = t.close();
+    match () {
+        () if mark(SEEN).load(Relaxed) != 1 => 1,
+        () if before == 0 || charged <= before => 2,
+        () if after != before => 3,
+        () if ended != Err(Error::BadState) || closed.is_err() => 4,
+        () => 0,
+    }
+}
+
+/// Role::Serve.
+fn serve(s: &Start, requests: u64) -> u64 {
+    let c = Handle::<Channel>::from_raw(s.handles[0]);
+    for _ in 0..requests {
+        let Ok(Received::Message {
+            len, token, words, ..
+        }) = sys::receive(&c)
+        else {
+            return FAILED;
+        };
+        let bytes = abi::inline_bytes(&words);
+        if token.reply(&bytes[..len.min(abi::INLINE_MAX)]).is_err() {
+            return FAILED;
+        }
+    }
+    0
+}
+
+/// Call `N` with `args` in x0 and up and marks in the rest of x0-x9: true
+/// when x0 comes back as `x0` and no other register changed.
+fn x0_alone<const N: u16>(args: &[u64], x0: u64) -> bool {
+    let mut x = marked();
+    x[..args.len()].copy_from_slice(args);
+    // SAFETY: the cases hand the kernel arguments it refuses, or make a
+    // call that runs no code of the child and uses none of its memory.
+    let after = unsafe { sys::raw::<N>(x) };
+    after[0] == x0 && after[1..] == x[1..]
+}
+
+/// Role::Ceiling: 0 when each case of `checked` did as it must, else the
+/// number of the first that did not, from 1. Handles the child makes
+/// itself: one it closed, a channel, and a copy with NOTIFY of a channel
+/// that closed.
+fn ceiling(s: &Start, checked: Checked) -> u64 {
+    let [thread, process, ..] = s.handles.map(|h| h.0);
+    let (above, at) = (u64::from(CEILING) + 1, u64::from(CEILING));
+    let (rr, fifo) = (Policy::RoundRobin as u64, Policy::Fifo as u64);
+    let denied = Error::AccessDenied.code();
+    let (bad, closed_channel) = (Error::BadHandle.code(), Error::PeerClosed.code());
+    let Ok((closed, channel, left)) = made() else {
+        return FAILED;
+    };
+    let h = channel.raw().0;
+    let notify = u64::from(Rights::NOTIFY.0);
+    let first_wrong = |cases: &[bool]| cases.iter().position(|&ok| !ok).map_or(0, |i| i as u64 + 1);
+    match checked {
+        Checked::ThreadSetPriority => {
+            const N: u16 = Call::ThreadSetPriority.number();
+            first_wrong(&[
+                x0_alone::<N>(&[thread, above, rr], denied),
+                x0_alone::<N>(&[thread, at, rr], 0),
+            ])
+        }
+        Checked::ThreadCreate => {
+            const N: u16 = Call::ThreadCreate.number();
+            let args = [process, 0x1000, 0x80_1000, 7, above, fifo, 0x3000];
+            first_wrong(&[x0_alone::<N>(&args, denied)])
+        }
+        Checked::ProcessCreate => {
+            const N: u16 = Call::ProcessCreate.number();
+            let over = abi::MAX_MEMORY;
+            first_wrong(&[
+                x0_alone::<N>(&[PAGE, 16, above, closed, 5, 0], bad),
+                x0_alone::<N>(&[PAGE, 16, above, 0, 0, closed], bad),
+                x0_alone::<N>(&[PAGE, 16, above, 0, 0, 0], denied),
+                x0_alone::<N>(&[over, 16, above, 0, 0, 0], denied),
+                x0_alone::<N>(&[over, 16, at, 0, 0, 0], Error::NoMemory.code()),
+            ])
+        }
+        Checked::ExitChannel => {
+            const N: u16 = Call::ProcessCreate.number();
+            let q = 2 * PAGE;
+            first_wrong(&[
+                x0_alone::<N>(&[q, 16, 20, closed, above, h], bad),
+                x0_alone::<N>(&[q, 16, 20, h, above, closed], bad),
+                x0_alone::<N>(&[q, 16, 20, h, above, 0], denied),
+                x0_alone::<N>(&[q, 16, 20, left, above, 0], denied),
+                x0_alone::<N>(&[q, 16, 20, left, at, 0], closed_channel),
+            ])
+        }
+        Checked::CreateChannel => {
+            const N: u16 = Call::CreateChannel.number();
+            first_wrong(&[x0_alone::<N>(&[above], denied)])
+        }
+        Checked::Label => {
+            const N: u16 = Call::HandleDuplicate.number();
+            let refused = [
+                x0_alone::<N>(&[closed, notify, 7, above], bad),
+                x0_alone::<N>(&[h, notify, 7, above], denied),
+            ];
+            let Ok(first) =
+                sys::handle_label(&channel, Rights::NOTIFY | Rights::DUPLICATE, 7, CEILING)
+            else {
+                return FAILED;
+            };
+            let f = first.raw().0;
+            first_wrong(&[
+                refused[0],
+                refused[1],
+                x0_alone::<N>(&[f, notify, 8, above], denied),
+                x0_alone::<N>(&[f, notify, 8, at], Error::BadState.code()),
+            ])
+        }
+        Checked::TimerCreate => {
+            const N: u16 = Call::TimerCreate.number();
+            first_wrong(&[x0_alone::<N>(&[h, above], denied)])
+        }
+    }
+}
+
+/// A handle the child closed, a channel, and a copy with NOTIFY of a
+/// channel that closed with its last handle with RECEIVE.
+fn made() -> Result<(u64, Handle<Channel>, u64), Error> {
+    let gone = sys::channel_create(1)?;
+    let closed = gone.raw().0;
+    gone.close()?;
+    let channel = sys::channel_create(10)?;
+    let shut = sys::channel_create(10)?;
+    let left = sys::handle_duplicate(&shut, Rights::NOTIFY)?;
+    shut.close()?;
+    Ok((closed, channel, left.raw().0))
 }

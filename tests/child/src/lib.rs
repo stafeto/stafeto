@@ -35,6 +35,11 @@ pub const WINDOW: usize = 0x1_0040_0000;
 
 /// The message of the child's panic (Role::Panic).
 pub const PANIC: &str = "the child panics on purpose";
+/// The first byte of the kernel's image (kcore::layout::KERNEL_VIRT),
+/// which a program may not reach.
+pub const KERNEL: u64 = 0xFFFF_FFFF_C000_0000;
+/// The ceiling of a child that runs Role::Ceiling.
+pub const CEILING: u8 = 30;
 
 /// The code a role ends with when the fault it exists for did not come.
 pub const NO_FAULT: u64 = 0xFA17;
@@ -49,9 +54,13 @@ pub const ROUNDS: usize = 2;
 pub const FULL: usize = 3;
 pub const MOST_USED: usize = 4;
 pub const QUOTA: usize = 5;
-/// The address of the instruction Role::Load faults at, which the child
-/// marks before it.
+/// The address of the instruction Role::Load and Role::Wfi fault at, which
+/// the child marks before it.
 pub const FAULT_AT: usize = 6;
+/// The mark a helper thread of a role adds 1 to as it runs, and what it
+/// saw (Role::LastThread, Role::BufferBack): 1 for what it looked for.
+pub const HELPER: usize = 7;
+pub const SEEN: usize = 8;
 
 /// What a child does once its start request has its answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,10 +110,54 @@ pub enum Role {
     /// call fails, and closes them, round after round, until it made the
     /// number in argument 0; leaves its marks MADE to QUOTA.
     Churn = 12,
+    /// Waits for an interrupt with `wfi`, which traps at EL0 (spec 7.9),
+    /// with the address of the `wfi` in its mark FAULT_AT first.
+    Wfi = 13,
+    /// Starts a helper thread at argument 0, below itself, which marks
+    /// SEEN when object_info of handle 0, its own process, says it lives,
+    /// marks HELPER and ends; makes another thread it never starts; and
+    /// ends its own thread first.
+    LastThread = 14,
+    /// Starts a helper thread at argument 1, below itself, which would
+    /// mark HELPER, and ends its process with the code in argument 0.
+    ExitProcess = 15,
+    /// Starts a helper thread at argument 0, below itself, which would
+    /// mark HELPER, and kills its own process through handle 0.
+    KillItself = 16,
+    /// Notifies its start channel with the bits in argument 0 and ends
+    /// with 0.
+    Notify = 17,
+    /// Replies with 8 bytes to the token in argument 0 and ends with x0 of
+    /// the call.
+    Reply = 18,
+    /// Takes a request through handle 0, a channel with RECEIVE, and ends
+    /// its process with 0, answering nothing.
+    TakeThenExit = 19,
+    /// Sends argument 0 as 8 bytes through handle 0, a channel with SEND,
+    /// and ends with the first word of the reply or the code of the
+    /// error; it keeps handle 1.
+    Send = 20,
+    /// Through handle 0, its own process, and handle 1, its first thread:
+    /// starts a helper thread at argument 0, below itself, and lowers
+    /// itself below the helper, which marks SEEN when its message buffer
+    /// reads zero and takes a write, and ends. Ends with 0 when the buffer
+    /// was charged, its used memory is back as it was before the helper,
+    /// and the helper's handle still names a thread that ended
+    /// (BAD_STATE); else with a code that says what was wrong.
+    BufferBack = 21,
+    /// Answers the number of requests in argument 0 through handle 0, a
+    /// channel with RECEIVE, each with its own bytes, and ends with 0.
+    Serve = 22,
+    /// Under ceiling CEILING, makes the calls of Checked argument 0 with
+    /// priorities above and at its ceiling, through handle 0, a thread,
+    /// and handle 1, its process, both under ceiling 63 with MANAGE, and
+    /// ends with 0 when each did as it must, else with the number of the
+    /// first case that did not.
+    Ceiling = 23,
 }
 
 impl Role {
-    pub const ALL: [Role; 12] = [
+    pub const ALL: [Role; 23] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -117,11 +170,55 @@ impl Role {
         Role::Grandparent,
         Role::Spin,
         Role::Churn,
+        Role::Wfi,
+        Role::LastThread,
+        Role::ExitProcess,
+        Role::KillItself,
+        Role::Notify,
+        Role::Reply,
+        Role::TakeThenExit,
+        Role::Send,
+        Role::BufferBack,
+        Role::Serve,
+        Role::Ceiling,
     ];
 
     /// The role whose code is `code`.
     pub fn from_code(code: u64) -> Option<Role> {
         Role::ALL.into_iter().find(|&r| r as u64 == code)
+    }
+}
+
+/// The calls whose priority Role::Ceiling checks against its own ceiling
+/// (spec 8, 11): thread_set_priority and thread_create above the ceiling
+/// of the caller, under that of the target; process_create, its ceiling
+/// and, with an exit channel, the priority of the exit notification (x4);
+/// channel_create; handle_duplicate with a label; timer_create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Checked {
+    ThreadSetPriority = 1,
+    ThreadCreate = 2,
+    ProcessCreate = 3,
+    ExitChannel = 4,
+    CreateChannel = 5,
+    Label = 6,
+    TimerCreate = 7,
+}
+
+impl Checked {
+    pub const ALL: [Checked; 7] = [
+        Checked::ThreadSetPriority,
+        Checked::ThreadCreate,
+        Checked::ProcessCreate,
+        Checked::ExitChannel,
+        Checked::CreateChannel,
+        Checked::Label,
+        Checked::TimerCreate,
+    ];
+
+    /// The call whose code is `code`.
+    pub fn from_code(code: u64) -> Option<Checked> {
+        Checked::ALL.into_iter().find(|&c| c as u64 == code)
     }
 }
 

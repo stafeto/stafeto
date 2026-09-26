@@ -2,20 +2,20 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel tests of the system calls (spec 11, 12) for what a program does
-//! not see or cannot reach: a caller whose ceiling is below 63, a caller
-//! whose table is full or whose quota is spent, who pays for what, and the
-//! kernel's own state after a call. The contract of the calls, the order
-//! of their checks, their rights and that on an error only x0 changes, is
-//! the test init's (tests/init), which makes the calls from EL0 on the
-//! kernel that ships. The kernel makes each call here for a thread that
-//! never runs, as if the thread had made it, and checks every register the
-//! call may write.
+//! not see or cannot reach: a caller whose table is full or whose quota is
+//! spent, who pays for what, and the kernel's own state after a call. The
+//! contract of the calls, the order of their checks, their rights and that
+//! on an error only x0 changes, is the test init's (tests/init), which
+//! makes the calls from EL0 on the kernel that ships. The kernel makes each
+//! call here for a thread that never runs, as if the thread had made it,
+//! and checks every register the call may write.
 //!
 //! Names tell the two sides apart: `<call>_checks_its_arguments` is the
 //! test init's, one contract test per call (spec 11, 12); the kernel keeps
 //! `<call>_checks_the_callers_limits` for what a caller at EL0 cannot
-//! reach: a ceiling below 63, while children have no code yet (spec 15.2);
-//! a full table; a spent quota; who pays; and counts of live objects.
+//! reach: a full table; a spent quota; who pays; and counts of live
+//! objects. A caller whose own ceiling is below 63 is a child with code of
+//! the test init (spec 15.2).
 
 use super::{
     CAUSE, CHILD_QUOTA, PAGE, QUOTA, check, nothing_pending, read_user, registers, translates,
@@ -314,17 +314,15 @@ fn close_cases(
     c.fails(n, &[resource.0], Error::BadHandle)
 }
 
-/// thread_set_priority stops at the ceiling of the caller's process as well
-/// as at that of the thread's (spec 8, 11): a caller under ceiling 30 gives
-/// a thread of a process under 63 no more than 30, ACCESS_DENIED at 31. A
-/// stopped thread only takes the new values. The caller's process has
-/// ceiling 30; the target threads' processes 20 and 63. The rest of the
-/// call's checks are the test init's
+/// thread_set_priority on a stopped thread only takes the new values
+/// (spec 8, 11): its base and effective priority and its policy change,
+/// and it stays stopped. The thread's process has ceiling 20. The checks
+/// of the call are the test init's
 /// (thread_set_priority_checks_its_arguments).
-pub fn thread_set_priority_checks_the_callers_ceiling(_: &Boot) -> Result<(), &'static str> {
-    let callers = [30, 20, 63].map(Caller::with_ceiling);
+pub fn stopped_thread_takes_its_new_priority(_: &Boot) -> Result<(), &'static str> {
+    let callers = [63, 20].map(Caller::with_ceiling);
     let result = match &callers {
-        [Ok(c), Ok(low), Ok(high)] => set_priority_handles(c, low, high),
+        [Ok(c), Ok(low)] => set_priority_handles(c, low),
         _ => Err("no process or thread"),
     };
     for caller in callers.into_iter().flatten() {
@@ -333,26 +331,15 @@ pub fn thread_set_priority_checks_the_callers_ceiling(_: &Boot) -> Result<(), &'
     result
 }
 
-fn set_priority_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), &'static str> {
-    let handles = [
-        c.insert(Object::Thread(low.thread), Rights::MANAGE)?,
-        c.insert(Object::Thread(high.thread), Rights::MANAGE)?,
-    ];
-    set_priority_cases(c, low.thread, handles)
+fn set_priority_handles(c: &Caller, low: &Caller) -> Result<(), &'static str> {
+    let h = c.insert(Object::Thread(low.thread), Rights::MANAGE)?;
+    set_priority_cases(c, low.thread, h)
 }
 
-fn set_priority_cases(
-    c: &Caller,
-    low: NonNull<Thread>,
-    handles: [Handle; 2],
-) -> Result<(), &'static str> {
-    let [to_low, to_high] = handles.map(|h| h.0);
+fn set_priority_cases(c: &Caller, low: NonNull<Thread>, h: Handle) -> Result<(), &'static str> {
     let n = Call::ThreadSetPriority.number();
     let rr = Policy::RoundRobin as u64;
-    // Under the ceiling of the target's process, 63, above the caller's.
-    c.fails(n, &[to_high, 31, rr], Error::AccessDenied)?;
-    c.succeeds(n, &[to_high, 30, rr], &[])?;
-    c.succeeds(n, &[to_low, 20, rr], &[])?;
+    c.succeeds(n, &[h.0, 20, rr], &[])?;
     // SAFETY: the thread is the test's and never runs.
     let t = unsafe { low.as_ref() };
     check(
@@ -364,18 +351,17 @@ fn set_priority_cases(
     )
 }
 
-/// process_create stops at the caller's limits (spec 7.5, 11): a ceiling
-/// above the caller's, 30 here, fails with ACCESS_DENIED after the handles
-/// and before the quota; with the caller's table full the call fails with
-/// LIMIT_REACHED, and the new process goes again. A good call returns a
-/// handle with the owner's rights to a live process with the ceiling given,
-/// a child of the caller's process (spec 4). Channels in x3 and x5 have
-/// cases of their own (`exit_and_start_cases`). The rest of the call's
-/// checks are the test init's (process_create_checks_its_arguments and its
-/// neighbours).
+/// process_create stops at the caller's limits (spec 7.5, 11): with the
+/// caller's table full the call fails with LIMIT_REACHED, and the new
+/// process goes again. A good call returns a handle with the owner's
+/// rights to a live process with the ceiling given, a child of the
+/// caller's process (spec 4). Channels in x3 and x5 have cases of their
+/// own (`exit_and_start_cases`). The rest of the call's checks, the
+/// caller's own ceiling among them, are the test init's
+/// (process_create_checks_its_arguments and its neighbours).
 pub fn process_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let processes = process::in_use();
-    let c = Caller::with_ceiling(30)?;
+    let c = Caller::new()?;
     let result = process_create_cases(&c).and_then(|()| exit_and_start_cases(&c));
     c.release();
     result?;
@@ -387,14 +373,9 @@ pub fn process_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static
 
 fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
-    let page = PAGE_SIZE;
-    let closed = c.insert(Object::Resource, Rights::DEBUG)?;
-    c.close(closed)?;
-    let closed = closed.0;
-    // Handles come before the ceiling.
-    c.fails(n, &[page, 16, 31, closed, 5, 0], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 31, 0, 0, closed], Error::BadHandle)?;
-    c.fails(n, &[page, 16, 31, 0, 0, 0], Error::AccessDenied)?;
+    // The caller's table has its page of blocks from here on.
+    let first = c.insert(Object::Resource, Rights::NONE)?;
+    c.close(first)?;
     quota_cases(c, n)?;
     let child = c.created(n, &[CHILD_QUOTA, 16, 30, 0, 0, 0])?;
     // SAFETY: the caller's process is the test's.
@@ -415,7 +396,7 @@ fn process_create_cases(c: &Caller) -> Result<(), &'static str> {
 }
 
 /// The child's quota comes off the caller's (spec 7.5): more than is left
-/// there is NO_MEMORY, after the ceiling. The least quota covers the
+/// there is NO_MEMORY. The least quota covers the
 /// child's root table and the page of its pool of blocks, which holds its
 /// directory and the chunk with entry 0: 8 KiB. A page is NO_MEMORY at
 /// entry 0, and the caller gets the quota back whole; the page of its pool
@@ -426,7 +407,6 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     let page = PAGE_SIZE;
     let q = process::quota(c.process);
     let over = (q.limit() - q.returned() - q.used() + 1).next_multiple_of(page);
-    c.fails(n, &[over, 16, 31, 0, 0, 0], Error::AccessDenied)?;
     c.fails(n, &[over, 16, 30, 0, 0, 0], Error::NoMemory)?;
     let before = q.used();
     c.fails(n, &[page, 16, 30, 0, 0, 0], Error::NoMemory)?;
@@ -446,34 +426,16 @@ fn quota_cases(c: &Caller, n: u16) -> Result<(), &'static str> {
     )
 }
 
-/// Channels in x3 and x5 of process_create, where a caller below the
-/// highest ceiling matters; the test init checks the rest from EL0
-/// (spec 11, 13.3). x4 above the caller's ceiling fails with ACCESS_DENIED
-/// after the handles, and x3 on a channel that closed with PEER_CLOSED
-/// only after the ceilings; the caller's full table comes before the
-/// channel's slots and the quota (LIMIT_REACHED). A good call moves x5
-/// into entry 0 of the child's table with its rights, and the caller's
-/// handle goes.
+/// Channels in x3 and x5 of process_create, for what a program cannot see
+/// (spec 11, 13.3): the caller's full table comes before the channel's
+/// slots and the quota (LIMIT_REACHED), and a good call moves x5 into
+/// entry 0 of the child's table with its rights, and the caller's handle
+/// goes. The test init checks the rest from EL0.
 fn exit_and_start_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::ProcessCreate.number();
     let q = CHILD_QUOTA;
-    let closed = c.insert(Object::Resource, Rights::NONE)?;
-    c.close(closed)?;
     let h = c.created(Call::CreateChannel.number(), &[10])?;
-    let shut = c.created(Call::CreateChannel.number(), &[10])?;
-    let result = channel_of(c, shut)
-        .and_then(|s| c.insert(Object::Channel(s), Rights::NOTIFY))
-        .and_then(|left| {
-            c.close(shut)?;
-            let (h, left) = (h.0, left.0);
-            c.fails(n, &[q, 16, 20, closed.0, 31, h], Error::BadHandle)?;
-            c.fails(n, &[q, 16, 20, h, 31, closed.0], Error::BadHandle)?;
-            c.fails(n, &[q, 16, 20, h, 31, 0], Error::AccessDenied)?;
-            c.fails(n, &[q, 16, 20, left, 31, 0], Error::AccessDenied)?;
-            c.fails(n, &[q, 16, 20, left, 30, 0], Error::PeerClosed)?;
-            c.close(Handle(left))?;
-            with_full_table(c, n, &[q, 16, 20, h, 5, 0])
-        })
+    let result = with_full_table(c, n, &[q, 16, 20, h.0, 5, 0])
         .and_then(|()| channel_of(c, h))
         .and_then(|ch| moved_start(c, h, ch));
     c.close(h)?;
@@ -693,19 +655,18 @@ fn with_full_table(c: &Caller, n: u16, args: &[u64]) -> Result<(), &'static str>
     result
 }
 
-/// thread_create stops at the caller's limits (spec 8, 11): a priority
-/// above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED for a process under 63; with the caller's table full the
-/// call fails with LIMIT_REACHED, and the new thread and its page go
-/// again. A good call makes a stopped thread whose buffer is a zeroed
-/// page, readable and writable, never executable, and returns a handle
-/// with the owner's rights; the page goes with the thread. The target
-/// processes have ceilings 20 and 63. The rest of the call's checks are
-/// the test init's (thread_create_checks_its_arguments).
+/// thread_create stops at the caller's limits (spec 8, 11): with the
+/// caller's table full the call fails with LIMIT_REACHED, and the new
+/// thread and its page go again. A good call makes a stopped thread whose
+/// buffer is a zeroed page, readable and writable, never executable, and
+/// returns a handle with the owner's rights; the page goes with the
+/// thread. The target process has ceiling 20. The rest of the call's
+/// checks, the caller's own ceiling among them, are the test init's
+/// (thread_create_checks_its_arguments).
 pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
-    let callers = [30, 20, 63].map(Caller::with_ceiling);
+    let callers = [63, 20].map(Caller::with_ceiling);
     let result = match &callers {
-        [Ok(c), Ok(low), Ok(high)] => thread_create_handles(c, low, high),
+        [Ok(c), Ok(low)] => thread_create_handles(c, low),
         _ => Err("no process or thread"),
     };
     for caller in callers.into_iter().flatten() {
@@ -714,12 +675,9 @@ pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static 
     result
 }
 
-fn thread_create_handles(c: &Caller, low: &Caller, high: &Caller) -> Result<(), &'static str> {
-    let handles = [
-        c.insert(Object::Process(low.process), Rights::MANAGE)?,
-        c.insert(Object::Process(high.process), Rights::MANAGE)?,
-    ];
-    thread_create_cases(c, low.process, handles)
+fn thread_create_handles(c: &Caller, low: &Caller) -> Result<(), &'static str> {
+    let h = c.insert(Object::Process(low.process), Rights::MANAGE)?;
+    thread_create_cases(c, low.process, h)
 }
 
 /// thread_create's arguments: the process, entry, stack, argument 7,
@@ -738,13 +696,11 @@ fn thread_args(
 fn thread_create_cases(
     c: &Caller,
     low: NonNull<Process>,
-    handles: [Handle; 2],
+    to_low: Handle,
 ) -> Result<(), &'static str> {
-    let [to_low, to_high] = handles.map(|h| h.0);
+    let to_low = to_low.0;
     let n = Call::ThreadCreate.number();
     let good = |h, priority| thread_args(h, USER_VA as u64, 0x80_1000, priority, FIFO, BUFFER);
-    // Above the caller's ceiling, 30, under the target's.
-    c.fails(n, &good(to_high, 31), Error::AccessDenied)?;
     let h = c.created(n, &good(to_low, 20))?;
     let result = new_thread_cases(c, low, h);
     c.close(h)?;
@@ -827,8 +783,8 @@ pub fn buffer_that_does_not_map_goes_back(_: &Boot) -> Result<(), &'static str> 
 /// cleanup at the caller's level, which runs before the caller does again:
 /// here the test runs the queue itself. Until then thread_create finds the
 /// process ended (BAD_STATE) and makes nothing. A running thread's case is
-/// `process_kills_itself` at EL0; the reason and the handles of the calls
-/// are the test init's.
+/// the test init's `process_kills_itself`, and so are the reason and the
+/// handles of the calls.
 pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     with_caller(kill_cases)?;
@@ -1026,16 +982,16 @@ fn with_left(
     result
 }
 
-/// channel_create stops at the caller's limits (spec 7.8, 11): a priority
-/// above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED; with the caller's table full it fails with
-/// LIMIT_REACHED, and with its quota spent with NO_MEMORY for a page of
-/// its pool of channels, with nothing made. A good call returns a handle
-/// with abi::CHANNEL_RIGHTS to a channel the caller pays for. The rest of
-/// the checks of channel_create, notify and receive are the test init's.
+/// channel_create stops at the caller's limits (spec 7.8, 11): with the
+/// caller's table full it fails with LIMIT_REACHED, and with its quota
+/// spent with NO_MEMORY for a page of its pool of channels, with nothing
+/// made. A good call returns a handle with abi::CHANNEL_RIGHTS to a
+/// channel the caller pays for. The rest of the checks of channel_create,
+/// notify and receive, the caller's own ceiling among them, are the test
+/// init's.
 pub fn channel_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let channels = channel::in_use();
-    let c = Caller::with_ceiling(30)?;
+    let c = Caller::new()?;
     let result = channel_create_cases(&c);
     c.release();
     result?;
@@ -1047,7 +1003,6 @@ pub fn channel_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static
 
 fn channel_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::CreateChannel.number();
-    c.fails(n, &[31], Error::AccessDenied)?;
     // The table's first page of blocks, so that the page below is the
     // pool's.
     let resource = c.insert(Object::Resource, Rights::NONE)?;
@@ -1159,22 +1114,20 @@ fn session_of(c: &Caller, h: Handle) -> Result<NonNull<Session>, &'static str> {
         .map_err(|_| "the handle does not name a session")
 }
 
-/// handle_duplicate stops at the caller's limits (spec 5.3, 11): a
-/// priority above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED after the handle and before the state (a new label on a
-/// handle with one, BAD_STATE); then the resources in the order the call
-/// takes them: the caller's table (LIMIT_REACHED), the channel's slots
+/// handle_duplicate stops at the caller's limits (spec 5.3, 11), the
+/// resources in the order the call takes them: the caller's table
+/// (LIMIT_REACHED), the channel's slots
 /// (LIMIT_REACHED, abi::MAX_SLOTS with the slot of label 0), the caller's
 /// quota for a page of its pool of sessions (NO_MEMORY); nothing is made
 /// then. A good call returns the copy in x1 alone: with label 0 it names
 /// the same object, a session's copy the same session; a label makes a
 /// session of the channel at the priority, which the caller pays for. A
 /// copy with a label and RECEIVE keeps the channel open. The rest of the
-/// call's checks are the test init's (handle_duplicate_checks_its_arguments
-/// and its neighbours).
+/// call's checks, the caller's own ceiling among them, are the test
+/// init's (handle_duplicate_checks_its_arguments and its neighbours).
 pub fn handle_duplicate_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let (sessions, channels) = (session::in_use(), channel::in_use());
-    let callers = [30, 63].map(Caller::with_ceiling);
+    let callers = [63, 63].map(Caller::with_ceiling);
     let result = match &callers {
         [Ok(c), Ok(other)] => duplicate_cases(c, other),
         _ => Err("no process or thread"),
@@ -1193,8 +1146,7 @@ fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
     let h = c.created(Call::CreateChannel.number(), &[10])?;
     let result = (|| {
         let resource = c.insert(Object::Resource, Rights::DEBUG | Rights::DUPLICATE)?;
-        let result = duplicate_ceiling(c, h)
-            .and_then(|()| duplicate_resources(c, h))
+        let result = duplicate_resources(c, h)
             .and_then(|()| duplicate_results(c, [h, resource]))
             .and_then(|()| slots_come_before_the_quota(c, other));
         c.close(resource)?;
@@ -1203,17 +1155,6 @@ fn duplicate_cases(c: &Caller, other: &Caller) -> Result<(), &'static str> {
     // Closed already when the cases went through.
     let _ = process::close_handle(c.process, h, super::CAUSE);
     result
-}
-
-/// A label at a priority above the caller's ceiling: a closed handle
-/// comes first (BAD_HANDLE), then the ceiling (ACCESS_DENIED).
-fn duplicate_ceiling(c: &Caller, h: Handle) -> Result<(), &'static str> {
-    let n = Call::HandleDuplicate.number();
-    let closed = c.insert(Object::Resource, Rights::NONE)?;
-    c.close(closed)?;
-    let notify = u64::from(Rights::NOTIFY.0);
-    c.fails(n, &[closed.0, notify, 7, 31], Error::BadHandle)?;
-    c.fails(n, &[h.0, notify, 7, 31], Error::AccessDenied)
 }
 
 /// The resources of a label, none of which makes a session: the caller's
@@ -1236,8 +1177,8 @@ fn duplicate_resources(c: &Caller, h: Handle) -> Result<(), &'static str> {
 }
 
 /// Good calls: copies with label 0 of the resource and of a session, a
-/// session of the channel, a new label on a session (BAD_STATE, after the
-/// ceiling), and a copy with a label and RECEIVE that keeps the channel
+/// session of the channel, a new label on a session (BAD_STATE), and a
+/// copy with a label and RECEIVE that keeps the channel
 /// open once its handle with no label went; its close closes the channel,
 /// and a new label on it fails with PEER_CLOSED.
 fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
@@ -1262,7 +1203,6 @@ fn duplicate_results(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static st
         && session::priority(s) == 30
         && Some(session::channel(s)) == channel_of(c, h).ok()
         && session::payer(s) == c.process;
-    c.fails(n, &[first.0, notify, 8, 31], Error::AccessDenied)?;
     c.fails(n, &[first.0, notify, 8, 30], Error::BadState)?;
     let left = c.created(n, &[h.0, duplicate, 0, 0])?;
     let receiver = c.created(n, &[h.0, receive, 9, 10])?;
@@ -1647,19 +1587,18 @@ fn with_timer(
     result
 }
 
-/// timer_create stops at the caller's limits (spec 7.8, 10, 11): a
-/// priority above the ceiling of the caller's process, 30 here, fails with
-/// ACCESS_DENIED; with the caller's table full it fails with
-/// LIMIT_REACHED, and with its quota spent with NO_MEMORY for a page of its
-/// pool of timers, with nothing made. A good call returns a handle with
+/// timer_create stops at the caller's limits (spec 7.8, 10, 11): with the
+/// caller's table full it fails with LIMIT_REACHED, and with its quota
+/// spent with NO_MEMORY for a page of its pool of timers, with nothing
+/// made. A good call returns a handle with
 /// abi::OWNER_RIGHTS to a timer the caller pays for, not armed; timer_set
 /// arms it at its deadline in ticks and timer_cancel takes it off the
 /// heap, and timer_set on a closed channel fails with PEER_CLOSED and
-/// leaves the timer armed as it was. The checks of the calls are the test
-/// init's.
+/// leaves the timer armed as it was. The checks of the calls, the
+/// caller's own ceiling among them, are the test init's.
 pub fn timer_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static str> {
     let timers = timers::in_use();
-    let c = Caller::with_ceiling(30)?;
+    let c = Caller::new()?;
     let result = timer_create_cases(&c);
     c.release();
     result?;
@@ -1673,7 +1612,6 @@ fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::TimerCreate.number();
     let h = c.created(Call::CreateChannel.number(), &[10])?;
     let result = (|| {
-        c.fails(n, &[h.0, 31], Error::AccessDenied)?;
         let timers = timers::in_use();
         with_used_quota(c, || {
             c.fails(n, &[h.0, 30], Error::NoMemory)?;

@@ -7,9 +7,10 @@
 //! it loads from the boot image, the child program (tests/child). The
 //! contract of the calls is checked here and only here: the order of
 //! their checks, their rights, and that on an error x0 alone changes
-//! (spec 11); the kernel tests keep what a program cannot see or reach,
-//! such as a caller below the highest ceiling or the kernel's own state
-//! after a call. It prints `TEST <name> ok` or `TEST <name> FAIL <why>`
+//! (spec 11), the caller's own ceiling among them, which a child under a
+//! lower ceiling checks; the kernel tests keep what a program cannot see
+//! or reach, such as a caller's full table or the kernel's own state after
+//! a call. It prints `TEST <name> ok` or `TEST <name> FAIL <why>`
 //! for each test, then `TESTS DONE total=<n> failed=<m>`, and exits with
 //! the number of failures, which turns the machine off; xtask reads the
 //! lines.
@@ -34,7 +35,7 @@ use abi::{
     ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
 };
 use bootimg::{Part, Program};
-use child::Role;
+use child::{Checked, Role};
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Thread, Timer};
 use rt::sys::{self, Received, Regs, Reply, Token};
@@ -46,7 +47,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 137] = [
+const TESTS: [Test; 151] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -322,6 +323,56 @@ const TESTS: [Test; 137] = [
     (
         "child_table_churn_stays_under_its_quota",
         child_table_churn_stays_under_its_quota,
+    ),
+    (
+        "el0_fault_ends_only_the_process",
+        el0_fault_ends_only_the_process,
+    ),
+    ("wfi_at_el0_is_a_fault", wfi_at_el0_is_a_fault),
+    (
+        "last_thread_exit_ends_the_process",
+        last_thread_exit_ends_the_process,
+    ),
+    (
+        "process_exit_ends_the_process_with_its_code",
+        process_exit_ends_the_process_with_its_code,
+    ),
+    ("process_kills_itself", process_kills_itself),
+    (
+        "exited_thread_gives_its_buffer_back",
+        exited_thread_gives_its_buffer_back,
+    ),
+    (
+        "orphan_exit_frees_the_process",
+        orphan_exit_frees_the_process,
+    ),
+    (
+        "orphan_fault_frees_the_process",
+        orphan_fault_frees_the_process,
+    ),
+    (
+        "child_notifies_through_its_start_channel",
+        child_notifies_through_its_start_channel,
+    ),
+    (
+        "reply_from_another_process_is_bad_state",
+        reply_from_another_process_is_bad_state,
+    ),
+    (
+        "boost_is_capped_by_the_server_ceiling",
+        boost_is_capped_by_the_server_ceiling,
+    ),
+    (
+        "client_of_a_dead_server_gets_peer_closed",
+        client_of_a_dead_server_gets_peer_closed,
+    ),
+    (
+        "reply_to_a_dead_client_is_peer_closed",
+        reply_to_a_dead_client_is_peer_closed,
+    ),
+    (
+        "a_call_cycle_ends_with_the_kill",
+        a_call_cycle_ends_with_the_kill,
     ),
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
@@ -980,8 +1031,9 @@ fn x0_alone<const N: u16>(args: &[u64], x0: u64) -> bool {
 /// with WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. A priority
 /// above the ceiling of the thread's process, 20 here, fails with
 /// ACCESS_DENIED, and still does once the process ended, before
-/// BAD_STATE. The ceiling of the caller's own process is a kernel test:
-/// init's is the highest level.
+/// BAD_STATE. So does one above the ceiling of the caller's own process:
+/// a child under ceiling 30 gives a thread of a process under 63 30, and
+/// 31 fails (`caller_ceiling`).
 fn thread_set_priority_checks_its_arguments() -> Outcome {
     let gone = closed_handle()?;
     let c = child(20)?;
@@ -994,7 +1046,7 @@ fn thread_set_priority_checks_its_arguments() -> Outcome {
     if let Ok(t) = t {
         close(t)?;
     }
-    result
+    result.and_then(|()| caller_ceiling(Checked::ThreadSetPriority))
 }
 
 fn set_priority_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Outcome {
@@ -1050,8 +1102,9 @@ fn set_priority_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Out
 /// through a closed handle too; a closed handle fails with BAD_HANDLE, a
 /// thread with WRONG_TYPE, a copy without MANAGE with ACCESS_DENIED. The
 /// page of another thread's buffer fails with INVALID_ARGS, after the
-/// ceiling of the process, 20 here. The caller's own ceiling is a kernel
-/// test: init's is the highest level.
+/// ceiling of the process, 20 here. A priority above the caller's own
+/// ceiling fails with ACCESS_DENIED too: a child under ceiling 30 makes no
+/// thread at 31 in a process under 63 (`caller_ceiling`).
 fn thread_create_checks_its_arguments() -> Outcome {
     let gone = closed_handle()?;
     let c = child(20)?;
@@ -1064,7 +1117,7 @@ fn thread_create_checks_its_arguments() -> Outcome {
     if let Ok(t) = t {
         close(t)?;
     }
-    result
+    result.and_then(|()| caller_ceiling(Checked::ThreadCreate))
 }
 
 fn thread_create_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Outcome {
@@ -1466,8 +1519,9 @@ fn kill_takes_a_ready_thread_off_the_queue() -> Outcome {
 /// INVALID_ARGS, with closed handles in x3 and x5 too; so do a priority in
 /// x4 without an exit channel and an exit channel without one, whatever
 /// x3 holds. What x3 and x5 name is exit_channel_needs_notify and
-/// start_handle_must_be_a_channel; the caller's own ceiling is a kernel
-/// test: init's is the highest level.
+/// start_handle_must_be_a_channel. A ceiling above the caller's own fails
+/// with ACCESS_DENIED alone after the handles in x3 and x5 and before the
+/// quota: 31 in a child under ceiling 30 (`caller_ceiling`).
 fn process_create_checks_its_arguments() -> Outcome {
     const N: u16 = Call::ProcessCreate.number();
     let gone = closed_handle()?;
@@ -1504,7 +1558,8 @@ fn process_create_checks_its_arguments() -> Outcome {
     check(
         pairs,
         "x4 without x3 or x3 without x4 did not fail with INVALID_ARGS alone",
-    )
+    )?;
+    caller_ceiling(Checked::ProcessCreate)
 }
 
 /// A child's quota comes off init's (spec 7.5): more than init has free
@@ -1915,8 +1970,8 @@ fn take_one(c: &Handle<Channel>) -> Result<Received, &'static str> {
 /// (spec 11): anything else fails with INVALID_ARGS and changes x0 alone.
 /// Init may take any priority under its ceiling of 63; the handle carries
 /// NOTIFY and RECEIVE, and a notification goes through it and comes back.
-/// ACCESS_DENIED for a priority above the caller's ceiling is a kernel
-/// test: init's ceiling is the highest level.
+/// A priority above the caller's ceiling fails with ACCESS_DENIED alone:
+/// 31 in a child under ceiling 30 (`caller_ceiling`).
 fn channel_create_checks_its_priority() -> Outcome {
     for priority in [0, abi::PRIORITY_LEVELS.into(), 0x100 | u64::from(LEVEL)] {
         let mut x = marked();
@@ -1936,7 +1991,8 @@ fn channel_create_checks_its_priority() -> Outcome {
     check(
         posted.is_ok() && got == Ok(unlabeled(1, 1)),
         "a new channel did not carry a notification",
-    )
+    )?;
+    caller_ceiling(Checked::CreateChannel)
 }
 
 /// notify and receive take a channel (spec 11): a process is WRONG_TYPE,
@@ -2311,8 +2367,10 @@ fn duplicate_narrows_rights() -> Outcome {
 /// on what is no channel fails with WRONG_TYPE, a copy without DUPLICATE
 /// of init's process too; a label on a channel copy without DUPLICATE
 /// fails with ACCESS_DENIED. Rights no right has and rights the original
-/// lacks are duplicate_narrows_rights; the caller's own ceiling is a
-/// kernel test: init's is the highest level.
+/// lacks are duplicate_narrows_rights. The priority of a label above the
+/// caller's own ceiling fails with ACCESS_DENIED alone after the handle and
+/// before whether a label goes on it: 31 in a child under ceiling 30
+/// (`caller_ceiling`).
 fn handle_duplicate_checks_its_arguments() -> Outcome {
     let gone = closed_handle()?;
     let c = channel(QUIET)?;
@@ -2322,7 +2380,7 @@ fn handle_duplicate_checks_its_arguments() -> Outcome {
     close(own)?;
     close(notify_only)?;
     close(c)?;
-    result
+    result.and_then(|()| caller_ceiling(Checked::Label))
 }
 
 fn duplicate_cases(gone: u64, notify_only: u64, own: u64) -> Outcome {
@@ -2392,8 +2450,8 @@ fn label_cannot_change() -> Outcome {
 /// fails with INVALID_ARGS and changes x0 alone. A receiver at LOW waits
 /// on a channel whose slot of label 0 has LEVEL, below init; notify
 /// through a session of priority NOTICE wakes it above init (spec 6.6), so
-/// it runs before notify returns. ACCESS_DENIED for a priority above the
-/// caller's ceiling is a kernel test: init's ceiling is the highest level.
+/// it runs before notify returns. A priority above the caller's own
+/// ceiling is handle_duplicate_checks_its_arguments.
 fn session_priority_under_the_ceiling() -> Outcome {
     let (c, r) = waiting_receiver(LEVEL)?;
     let refused = [
@@ -2773,8 +2831,10 @@ fn exit_channel_needs_notify() -> Outcome {
 /// exactly 0 without one; anything else fails with INVALID_ARGS and
 /// changes x0 alone. A receiver at LOW waits on the exit channel; the
 /// end of a child that init kills comes at NOTICE and wakes it above init
-/// before process_kill returns. ACCESS_DENIED above the caller's ceiling
-/// is a kernel test: init's ceiling is the highest level.
+/// before process_kill returns. x4 above the caller's own ceiling fails
+/// with ACCESS_DENIED alone after the handles in x3 and x5, and x3 on a
+/// channel that closed fails with PEER_CLOSED only under that ceiling: 31
+/// and 30 in a child under ceiling 30 (`caller_ceiling`).
 fn exit_priority_under_the_ceiling() -> Outcome {
     let (c, r) = waiting_receiver(QUIET)?;
     let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
@@ -2815,7 +2875,8 @@ fn exit_priority_under_the_ceiling() -> Outcome {
     check(
         killed.is_ok() && ran == 1,
         "the receiver did not run at the exit notification's priority before process_kill returned",
-    )
+    )?;
+    caller_ceiling(Checked::ExitChannel)
 }
 
 /// A child that fails leaves the start channel with init (spec 13.3): a
@@ -3052,8 +3113,10 @@ fn clock_now_follows_the_counter() -> Outcome {
 /// priorities that lift its receivers are the receiver's. A priority
 /// outside 1-63 fails with INVALID_ARGS before the handle is looked at, a
 /// bad handle with BAD_HANDLE, a handle to another kind with WRONG_TYPE, a
-/// copy with NOTIFY alone with ACCESS_DENIED; each changes x0 alone. A copy
-/// with RECEIVE and a label makes a timer whose expiries carry the label.
+/// copy with NOTIFY alone with ACCESS_DENIED; each changes x0 alone, and so
+/// does a priority above the caller's own ceiling, ACCESS_DENIED: 31 in a
+/// child under ceiling 30 (`caller_ceiling`). A copy with RECEIVE and a
+/// label makes a timer whose expiries carry the label.
 fn timer_needs_receive() -> Outcome {
     let c = channel(QUIET)?;
     let notify = copy(&c, Rights::NOTIFY)?;
@@ -3090,7 +3153,8 @@ fn timer_needs_receive() -> Outcome {
     check(
         fired.is_ok() && got == Ok(expiry(TIMED, 1)),
         "a timer made through a labelled copy did not carry the label",
-    )
+    )?;
+    caller_ceiling(Checked::TimerCreate)
 }
 
 /// timer_set(x0 timer with MANAGE, x1 deadline) and timer_cancel(x0 timer
@@ -4253,6 +4317,12 @@ const LEAF_QUOTA: u64 = 15 * PAGE as u64;
 /// A child that maps a page of an object of its own: the page and a page
 /// of its pool of memory objects more.
 const SCRATCH_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
+/// A child with two threads besides its first: their message buffers
+/// more, under the table of its first thread's buffer.
+const THREADS_QUOTA: u64 = LEAF_QUOTA + 2 * PAGE as u64;
+/// A child that runs Role::Ceiling: pages of its pools of channels,
+/// sessions and shells more, and a page for its table.
+const CEILING_QUOTA: u64 = LEAF_QUOTA + 4 * PAGE as u64;
 /// A child that loads a child of its own: its 12 pages as a leaf, tables
 /// for the boot image and for the loader's window, pages of its pools of
 /// memory objects, shells, channels and sessions, the grandchild's
@@ -4268,6 +4338,7 @@ const KID_NO_MEMORY: &str = "the child's quota fell short of its loading";
 /// WnR, bit 6.
 const DATA_ABORT: u64 = 0x24;
 const INSTRUCTION_ABORT: u64 = 0x20;
+const WFX: u64 = 0x01;
 const TRANSLATION: u64 = 0b0001;
 const PERMISSION: u64 = 0b0011;
 
@@ -4343,17 +4414,20 @@ fn sleep(ns: u64) -> Outcome {
 }
 
 /// A handle a child gets in the reply to its start request, a copy with
-/// TRANSFER of: its own process with MANAGE and DUPLICATE, the system
-/// resource with DEBUG, the boot image with MAP_READ, the page of marks
-/// with MAP_READ and MAP_WRITE, or the channel of its `Ear` with NOTIFY
-/// and the label GRANDCHILD.
+/// TRANSFER of: its own process with MANAGE and DUPLICATE, its first
+/// thread with MANAGE, the system resource with DEBUG, the boot image with
+/// MAP_READ, the page of marks with MAP_READ and MAP_WRITE, or the channel
+/// of its `Ear` with NOTIFY and the label GRANDCHILD; or a handle of init
+/// with TRANSFER, which moves to the child.
 #[derive(Clone, Copy)]
 enum Gift {
     Own,
+    Thread,
     Debug,
     Image,
     Marks,
     GrandchildExit,
+    Given(abi::Handle),
 }
 
 /// What init hears a child through: a channel that takes the child's
@@ -4492,6 +4566,11 @@ impl Kid {
     /// child::MARKS through a copy with MAP_READ and MAP_WRITE
     /// (loader::map_narrowed); its thread does not run yet.
     fn load(quota: u64, limit: u32, level: u8) -> Result<Kid, &'static str> {
+        Kid::load_under(quota, limit, level, level)
+    }
+
+    /// `load` with ceiling `ceiling` and the thread at `priority`.
+    fn load_under(quota: u64, limit: u32, ceiling: u8, priority: u8) -> Result<Kid, &'static str> {
         let short = |e| match e {
             Error::NoMemory => KID_NO_MEMORY,
             _ => "the child program did not load",
@@ -4501,10 +4580,10 @@ impl Kid {
         let params = loader::Params {
             quota,
             handle_limit: limit,
-            ceiling: level,
+            ceiling,
             exit: Some((&ear.exit, QUIET)),
             start: Some(start),
-            priority: level,
+            priority,
             policy: Policy::Fifo,
         };
         // SAFETY: only the loader maps and uses LOADER_WINDOW.
@@ -4557,6 +4636,7 @@ impl Kid {
                 &self.process,
                 Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER,
             ),
+            Gift::Thread => copy_raw(&self.thread, Rights::MANAGE | Rights::TRANSFER),
             Gift::Debug => copy_raw(&init::RESOURCE, Rights::DEBUG | Rights::TRANSFER),
             Gift::Image => copy_raw(
                 &Handle::<Memory>::from_raw(INIT_BOOT_IMAGE),
@@ -4573,6 +4653,7 @@ impl Kid {
                 QUIET,
             )
             .map(|h| h.raw()),
+            Gift::Given(h) => Ok(h),
         }
     }
 
@@ -4604,19 +4685,36 @@ fn quota_of(role: Role) -> u64 {
     match role {
         Role::WriteReadOnly | Role::ReadUnmapped => SCRATCH_QUOTA,
         Role::Grandparent => GRANDPARENT_QUOTA,
+        Role::LastThread | Role::ExitProcess | Role::KillItself | Role::BufferBack => THREADS_QUOTA,
+        Role::Ceiling => CEILING_QUOTA,
         _ => LEAF_QUOTA,
     }
 }
 
 /// A child at LEVEL with the quota of `role` that runs `role` with `args`
-/// and `gifts`: why it ended.
+/// and `gifts`: why it ended. The cleanup of its end, at its level, ran
+/// before this returns (`let_run`): the next test finds the cleanup queue
+/// empty.
 fn ran(role: Role, args: &[u64], gifts: &[Gift]) -> Result<ProcessState, &'static str> {
-    let kid = Kid::load(quota_of(role), 16, LEVEL)?;
+    ran_under(role, quota_of(role), LEVEL, LEVEL, args, gifts)
+}
+
+/// `ran` with `quota`, ceiling `ceiling` and the thread at `priority`.
+fn ran_under(
+    role: Role,
+    quota: u64,
+    ceiling: u8,
+    priority: u8,
+    args: &[u64],
+    gifts: &[Gift],
+) -> Result<ProcessState, &'static str> {
+    let kid = Kid::load_under(quota, 16, ceiling, priority)?;
     let state = kid
         .start()
         .and_then(|()| kid.serve(role, args, gifts))
         .and_then(|()| kid.end());
     kid.close()?;
+    let_run()?;
     state
 }
 
@@ -5009,6 +5107,438 @@ fn child_table_churn_stays_under_its_quota() -> Outcome {
         "the pools took more pages than the child's quota and one",
     )?;
     check(after == before, "the child left memory taken")
+}
+
+/// A child under ceiling child::CEILING, 30, makes the calls of `checked`
+/// from EL0 (Role::Ceiling, spec 8, 11) against a thread and its process
+/// under ceiling 63 that init made, with no code: a priority above the
+/// caller's own ceiling fails with ACCESS_DENIED alone, in its place in
+/// the order of the call's checks, and one at the ceiling passes it.
+fn caller_ceiling(checked: Checked) -> Outcome {
+    let target = child(abi::PRIORITY_LEVELS - 1)?;
+    let t = child_thread(&target, LEVEL);
+    let state = match &t {
+        Ok(t) => copy_raw(t, Rights::MANAGE | Rights::TRANSFER).and_then(|thread| {
+            let process = copy_raw(&target, Rights::MANAGE | Rights::TRANSFER)?;
+            let gifts = [Gift::Given(thread), Gift::Given(process)];
+            let (quota, level) = (quota_of(Role::Ceiling), child::CEILING);
+            ran_under(
+                Role::Ceiling,
+                quota,
+                level,
+                LEVEL,
+                &[checked as u64],
+                &gifts,
+            )
+        }),
+        Err(_) => Err("thread_create in the target failed"),
+    };
+    close(target)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    check(
+        state? == ProcessState::Exited { code: 0 },
+        "a call above the caller's own ceiling did not fail as it must",
+    )
+}
+
+// The life and the end of processes (spec 4, 6.7, 6.8, 7.7, 7.9, 8):
+// children with code end in each way a process ends, and init looks at
+// what is left.
+
+/// Spec 7.9, 15.2 (faults): a child that loads from the kernel's image
+/// (child::KERNEL), which EL0 may not reach, ends with a data abort from
+/// EL0, a permission fault of a read at that address, and the fault ends
+/// it alone: a neighbour, another child that waits in receive meanwhile,
+/// takes init's request afterwards and answers it. ELR is the load, whose
+/// address the child marked (child::FAULT_AT).
+fn el0_fault_ends_only_the_process() -> Outcome {
+    reset_kid_marks();
+    let c = channel(LEVEL)?;
+    let send = copy(&c, Rights::SEND)?;
+    let neighbour = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let waits = neighbour
+        .start()
+        .and_then(|()| neighbour.serve(Role::Serve, &[1], &[Gift::Given(c.raw())]))
+        .and_then(|()| let_run());
+    let fault = waits.and_then(|()| fault_of(Role::Load, &[child::KERNEL], &[]));
+    let answer = sys::try_send(&send, &FAULT_WORD.to_le_bytes());
+    let state = neighbour.end();
+    neighbour.close()?;
+    close(send)?;
+    let f = fault?;
+    check(
+        (f.class, f.status, f.write) == (DATA_ABORT, PERMISSION, 0),
+        "the fault is not a permission fault of a read from EL0",
+    )?;
+    check(
+        f.far == child::KERNEL && f.elr == kid_mark(child::FAULT_AT),
+        "FAR is not the kernel's address, or ELR is not the load",
+    )?;
+    check(
+        answer.is_ok_and(|r| r.len == 8 && r.words[0] == FAULT_WORD)
+            && state == Ok(ProcessState::Exited { code: 0 }),
+        "the neighbour did not answer after the fault",
+    )
+}
+
+/// The request init sends to the neighbour of a fault.
+const FAULT_WORD: u64 = 0x4E16_4B0E;
+
+/// Spec 7.9: `wfi` at EL0 traps (SCTLR_EL1.nTWI is clear) and is the
+/// program's fault: the child ends with EC 0x01 at its `wfi`, whose
+/// address it marked (child::FAULT_AT). A child's fault at 0x10 leaves
+/// FAR_EL1 set first, and the reason has FAR 0.
+fn wfi_at_el0_is_a_fault() -> Outcome {
+    fault_of(Role::Load, &[0x10], &[])?;
+    reset_kid_marks();
+    let f = fault_of(Role::Wfi, &[], &[])?;
+    check(f.class == WFX, "the fault is not a trapped WFI")?;
+    check(f.far == 0, "a stale FAR went into the reason")?;
+    check(f.elr == kid_mark(child::FAULT_AT), "ELR is not the wfi")
+}
+
+/// Spec 8, 11: the exit of the last started thread of a process ends the
+/// process with code 0. A child starts a helper below itself, makes a
+/// third thread it never starts, and ends its own thread; the helper finds
+/// the process alive and ends too. The stopped thread does not keep the
+/// process: the exit notification comes, and once init closed its
+/// handles, its used memory, the free frames and the pages of kernel pools
+/// are what they were.
+fn last_thread_exit_ends_the_process() -> Outcome {
+    reset_kid_marks();
+    let before = counts_at_rest()?;
+    let state = ran(Role::LastThread, &[(LEVEL - 1).into()], &[Gift::Own])?;
+    let after = counts_at_rest()?;
+    check(
+        state == ProcessState::Exited { code: 0 },
+        "the last thread's exit did not end the process with code 0",
+    )?;
+    check(
+        kid_mark(child::HELPER) == 1 && kid_mark(child::SEEN) == 1,
+        "the process ended before its last started thread",
+    )?;
+    check(after == before, "the stopped thread outlived its process")
+}
+
+/// Spec 7.9, 11: process_exit ends the process with its code, whatever
+/// its other threads do: a helper the child started below itself never
+/// runs.
+fn process_exit_ends_the_process_with_its_code() -> Outcome {
+    const CODE: u64 = 0x5EED_C0DE;
+    reset_kid_marks();
+    let args = [CODE, (LEVEL - 1).into()];
+    let state = ran(Role::ExitProcess, &args, &[Gift::Own])?;
+    check(
+        state == ProcessState::Exited { code: CODE },
+        "the process did not end with its code",
+    )?;
+    check(
+        kid_mark(child::HELPER) == 0,
+        "a ready thread of the ended process ran",
+    )
+}
+
+/// Spec 11: process_kill of the caller's own process does not return: the
+/// child ends killed, and a helper it started below itself never runs.
+fn process_kills_itself() -> Outcome {
+    reset_kid_marks();
+    let state = ran(Role::KillItself, &[(LEVEL - 1).into()], &[Gift::Own])?;
+    check(
+        state == ProcessState::Killed,
+        "process_kill of its own process returned",
+    )?;
+    check(
+        kid_mark(child::HELPER) == 0,
+        "a ready thread of the ended process ran",
+    )
+}
+
+/// Spec 6.2, 8: a thread's message buffer goes at its exit, while a handle
+/// keeps the thread. A child starts a helper below itself and lowers
+/// itself below it; the helper finds its buffer zeroed and writable, and
+/// exits. The child then uses what it used before the helper, and
+/// thread_set_priority through its handle to the helper fails with
+/// BAD_STATE; the process lives on, and the child ends with 0.
+fn exited_thread_gives_its_buffer_back() -> Outcome {
+    reset_kid_marks();
+    let gifts = [Gift::Own, Gift::Thread];
+    let state = ran(Role::BufferBack, &[(LEVEL - 1).into()], &gifts)?;
+    check(
+        kid_mark(child::SEEN) == 1,
+        "the helper did not find its buffer zeroed and writable",
+    )?;
+    check(
+        state == ProcessState::Exited { code: 0 },
+        "the thread's buffer outlived its exit, or its handle lost the thread",
+    )
+}
+
+/// Spec 7.7, 7.9: a child that only its started thread holds: init starts
+/// the thread and closes its handles to the child and to the thread at
+/// once; the child then exits, its last reference goes within its own end,
+/// its exit notification comes, and init has its used memory, the free
+/// frames and the pages of kernel pools back as they were: the child
+/// went, and went once.
+fn orphan_exit_frees_the_process() -> Outcome {
+    orphan(Role::Exit, &[0])
+}
+
+/// As orphan_exit_frees_the_process, with a child that faults at a bad
+/// address.
+fn orphan_fault_frees_the_process() -> Outcome {
+    orphan(Role::Load, &[0x10])
+}
+
+fn orphan(role: Role, args: &[u64]) -> Outcome {
+    let before = counts_at_rest()?;
+    let Kid {
+        process,
+        thread,
+        ear,
+    } = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let started = sys::thread_start(&thread);
+    let closed = [thread.close(), process.close()];
+    let ended = started
+        .map_err(|_| "thread_start of the child failed")
+        .and_then(|()| ear.answer(role, args, &[]))
+        .and_then(|()| ear.ended());
+    ear.close()?;
+    let after = counts_at_rest()?;
+    check(
+        closed.iter().all(Result::is_ok),
+        "a handle of the child did not close",
+    )?;
+    ended?;
+    check(after == before, "the orphan stayed, or went twice")
+}
+
+/// Spec 13.3: a child's start channel, a copy of init's channel with a
+/// label and NOTIFY, carries a notification as well: init takes it with
+/// the label and the bits.
+fn child_notifies_through_its_start_channel() -> Outcome {
+    const BITS: u64 = 0b1010;
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let got = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Notify, &[BITS], &[]))
+        .and_then(|()| kid.ear.next());
+    let state = kid.end();
+    kid.close()?;
+    check(
+        got == Ok(labelled(START, BITS, 1)),
+        "init did not get the child's notification with its label",
+    )?;
+    check(
+        state == Ok(ProcessState::Exited { code: 0 }),
+        "notify through the start channel failed",
+    )
+}
+
+/// A token names a request for the process that took it (spec 6.1): init
+/// takes the request of a child and holds it; another child replies with
+/// init's token and gets BAD_STATE, and the first child still waits. Then
+/// init answers, and the child ends with the reply's first word.
+fn reply_from_another_process_is_bad_state() -> Outcome {
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let result = kid.start().and_then(|()| foreign_reply(&kid));
+    kid.close()?;
+    result
+}
+
+fn foreign_reply(kid: &Kid) -> Outcome {
+    const ANSWER: u64 = 0xA115;
+    kid.serve(Role::Echo, &[ANSWER; child::ARGS], &[])?;
+    let Received::Message { token, .. } = kid.ear.next()? else {
+        return Err("the child sent no request");
+    };
+    let other = ran(Role::Reply, &[token.raw(), ANSWER + 1], &[]);
+    let waits = kid.ear.now();
+    let answered = token.reply(&ANSWER.to_le_bytes());
+    let state = kid.end();
+    check(
+        other
+            == Ok(ProcessState::Exited {
+                code: Error::BadState.code(),
+            }),
+        "a child of another process answered init's request",
+    )?;
+    check(
+        waits == Err(Error::WouldBlock) && answered.is_ok(),
+        "the child did not wait for init's reply",
+    )?;
+    check(
+        state == Ok(ProcessState::Exited { code: ANSWER }),
+        "the child did not get init's reply",
+    )
+}
+
+/// The boost by a client stops at the ceiling of the service's process
+/// (spec 6.6, 8): a child under ceiling 20 serves, at base 10, the request
+/// of a thread of init at 30; it works at 20, so a thread of init at 25
+/// started right after the request runs before the reply; at 30 the
+/// service would answer first.
+fn boost_is_capped_by_the_server_ceiling() -> Outcome {
+    reset_results();
+    let c = channel(LEVEL)?;
+    let send = copy(&c, Rights::SEND)?;
+    let kid = Kid::load_under(LEAF_QUOTA, 16, 20, LEVEL)?;
+    let served = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Serve, &[1], &[Gift::Given(c.raw())]))
+        .and_then(|()| let_run());
+    HANDLES[0].store(send.raw().0, Relaxed);
+    let raced = served.and_then(|()| {
+        let sender = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+        let watcher = spawn(1, note_ended, 0, NOTICE, Policy::Fifo)?;
+        let_run()?;
+        close(sender)?;
+        close(watcher)
+    });
+    let state = kid.end();
+    kid.close()?;
+    close(send)?;
+    raced?;
+    check(
+        mark(0) == 1,
+        "the service answered before the thread at 25 ran, above its ceiling",
+    )?;
+    check(
+        ended(0) && result(0)[0] == 0 && state == Ok(ProcessState::Exited { code: 0 }),
+        "the client did not get the service's reply",
+    )
+}
+
+/// Leaves in mark 0 1 when the client in slot 0 still waits for its
+/// reply, 2 when it came back; ends.
+extern "C" fn note_ended(_: u64) -> ! {
+    MARKS[0].store(1 + u64::from(ended(0)), Relaxed);
+    sys::thread_exit()
+}
+
+/// Spec 15.2 (refusals), 6.8: a child takes the request of a thread of
+/// init above it and ends its process without a reply: the stage Replies
+/// of its teardown wakes the client with PEER_CLOSED in x0 alone.
+fn client_of_a_dead_server_gets_peer_closed() -> Outcome {
+    const WORD: u64 = 0xDEAD_5E4F;
+    reset_results();
+    let c = channel(LEVEL)?;
+    let send = copy(&c, Rights::SEND)?;
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let waits = kid
+        .start()
+        .and_then(|()| kid.serve(Role::TakeThenExit, &[], &[Gift::Given(c.raw())]))
+        .and_then(|()| let_run());
+    let mut x = marked();
+    x[..3].copy_from_slice(&[send.raw().0, 8, WORD]);
+    for (r, v) in RAW.iter().zip(x) {
+        r.store(v, Relaxed);
+    }
+    // The client sends at once and waits; the service takes its request
+    // and ends once init waits for its end.
+    let client = waits.and_then(|()| spawn(0, raw_client, 0, HIGH, Policy::Fifo));
+    let state = kid.end();
+    kid.close()?;
+    close(send)?;
+    close(client?)?;
+    let after = result(0);
+    check(
+        ended(0) && after[0] == Error::PeerClosed.code() && after[1..10] == x[1..],
+        "the client of the service that ended did not get PEER_CLOSED in x0 alone",
+    )?;
+    check(
+        state == Ok(ProcessState::Exited { code: 0 }),
+        "the service did not end with 0",
+    )
+}
+
+/// A reply to a client that ended while it waited for it is PEER_CLOSED,
+/// twice, and still ends the boost by that client (spec 6.6, 6.8): init
+/// takes the request of a child at 30 and works at 30; it kills the child,
+/// and its reply is PEER_CLOSED, a second one with the same token too,
+/// since the reply leaves the mark of the dead client. A thread of init at
+/// 25 started right after runs at once: init is back at its own level.
+fn reply_to_a_dead_client_is_peer_closed() -> Outcome {
+    reset_marks();
+    let kid = Kid::load(LEAF_QUOTA, 16, HIGH)?;
+    let result = kid.start().and_then(|()| dead_client(&kid));
+    kid.close()?;
+    result
+}
+
+fn dead_client(kid: &Kid) -> Outcome {
+    kid.serve(Role::Echo, &[1; child::ARGS], &[])?;
+    let Received::Message { token, .. } = kid.ear.next()? else {
+        return Err("the child sent no request");
+    };
+    let raw = token.raw();
+    let killed = sys::process_kill(&kid.process);
+    let first = token.reply(&[]);
+    let mut x = marked();
+    x[..2].copy_from_slice(&[raw, 0]);
+    let second = raw_reply(x)[0];
+    let t = spawn(0, add_mark, 0, NOTICE, Policy::Fifo)?;
+    let at_once = mark(0);
+    let_run()?;
+    close(t)?;
+    let state = kid.end();
+    check(
+        killed.is_ok() && first == Err(Error::PeerClosed) && second == Error::PeerClosed.code(),
+        "a reply to the client that ended was not PEER_CLOSED, twice",
+    )?;
+    check(
+        at_once == 1,
+        "the reply to the client that ended did not end its boost",
+    )?;
+    check(
+        state == Ok(ProcessState::Killed),
+        "the client did not end as killed",
+    )
+}
+
+/// A cycle of requests ends only with a kill (spec 6.7): two children send
+/// to each other's channel and wait, neither receiving; init kills the
+/// first, whose table held the only handle with RECEIVE of its channel:
+/// the channel closes, and the second child's request comes back with
+/// PEER_CLOSED, which the child ends with.
+fn a_call_cycle_ends_with_the_kill() -> Outcome {
+    const WORD: u64 = 0xC1C1E;
+    let (to_first, to_second) = (channel(LEVEL)?, channel(LEVEL)?);
+    let first = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let second = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let sent = [
+        (&first, &to_second, &to_first),
+        (&second, &to_first, &to_second),
+    ]
+    .map(|(kid, to, own)| {
+        let send = copy_raw(to, Rights::SEND | Rights::TRANSFER)?;
+        let keep = copy_raw(own, Rights::RECEIVE | Rights::TRANSFER)?;
+        kid.start()?;
+        kid.serve(Role::Send, &[WORD], &[Gift::Given(send), Gift::Given(keep)])
+    });
+    // The children's copies with RECEIVE are the channels' only ones.
+    close(to_first)?;
+    close(to_second)?;
+    let waiting = sent.iter().all(Result::is_ok) && let_run().is_ok();
+    let killed = sys::process_kill(&first.process);
+    let states = [first.end(), second.end()];
+    first.close()?;
+    second.close()?;
+    check(
+        waiting && killed.is_ok(),
+        "the children did not both wait in send, or process_kill failed",
+    )?;
+    check(
+        states
+            == [
+                Ok(ProcessState::Killed),
+                Ok(ProcessState::Exited {
+                    code: Error::PeerClosed.code(),
+                }),
+            ],
+        "the child whose peer was killed did not get PEER_CLOSED",
+    )
 }
 
 // Requests and replies (spec 6.1, 6.6): init and threads of its own

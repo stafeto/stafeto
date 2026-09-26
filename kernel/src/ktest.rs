@@ -212,8 +212,8 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::closing_a_handle_releases_its_object,
     ),
     (
-        "thread_set_priority_checks_the_callers_ceiling",
-        calls::thread_set_priority_checks_the_callers_ceiling,
+        "stopped_thread_takes_its_new_priority",
+        calls::stopped_thread_takes_its_new_priority,
     ),
     (
         "process_create_checks_the_callers_limits",

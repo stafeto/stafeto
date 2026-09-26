@@ -39,9 +39,6 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
-/// The line the kernel tests write through `debug_write` from EL0
-/// (ktest::el0::EL0_LINE), whole.
-const DEBUG_WRITE_LINES: [&str; 1] = ["debug_write from EL0 reaches the console"];
 /// Tests only the `icount` build has: the first checks that the run is
 /// under -icount; the next two depend on how much of a quantum is left,
 /// which only -icount makes repeatable; the fourth takes a big process
@@ -89,8 +86,9 @@ const TEST_INIT_LINES: [&str; 4] = [
 /// The children of the test init that fault, each with a line of the
 /// kernel (spec 7.9): the child with no code of
 /// `child_fault_reason_reaches_the_parent` and the children with code of
-/// the tests of faults.
-const CHILD_FAULTS: usize = 7;
+/// the tests of faults, of `wfi` with the fault before it and of an orphan
+/// that faults.
+const CHILD_FAULTS: usize = 11;
 /// The panic of a child (tests/child, Role::Panic): rt prints where it
 /// panicked, then this message on a line of its own (spec 13.2).
 const CHILD_PANIC_AT: &str = "panic: panicked at tests/child/src/main.rs:";
@@ -121,7 +119,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 137;
+const INIT_TESTS: u32 = 151;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -728,8 +726,7 @@ fn stack_overflow_report() -> Result<(), String> {
 
 /// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
 /// through semihosting. On 2 GiB the tests also cover RAM the boot page
-/// tables did not map. Every test the kernel counts passes once, and what
-/// the tests wrote through `debug_write` reaches the console whole. The
+/// tables did not map. Every test the kernel counts passes once. The
 /// `icount` build runs under qemu::ICOUNT, where virtual time counts
 /// instructions: the tests that depend on how much of a quantum is left
 /// run only there. A hang, such as a quantum that never ends, fails at
@@ -745,9 +742,6 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r)?;
-    for line in DEBUG_WRITE_LINES {
-        qemu::expect_line(&o, line)?;
-    }
     for name in ICOUNT_TESTS {
         if r.passed.iter().any(|p| p == name) != icount {
             return Err(format!(
