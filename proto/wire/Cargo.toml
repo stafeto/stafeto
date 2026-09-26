@@ -1,0 +1,14 @@
+[package]
+name = "proto-wire"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "What every stafeto protocol shares: the header of a request, the status of a reply, and fields read and written one by one"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }

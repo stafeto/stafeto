@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Output through debug_write (spec 11). A program sets its handle to
+//! Output through debug_write (spec 11). A program gives its handle to
 //! the system resource with DEBUG once (`set`); `write`, `write_fmt`,
 //! `print!` and `println!` then send what they get in pieces of at most
 //! abi::INLINE_MAX bytes, one call per piece. A line of up to 64 bytes,
@@ -11,22 +11,24 @@ use crate::handle::{Handle, Resource};
 use crate::sys;
 use abi::{Error, INLINE_MAX};
 use core::fmt;
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The handle output goes through; abi::Handle::INVALID until `set`.
 static CONSOLE: AtomicU64 = AtomicU64::new(abi::Handle::INVALID.0);
 
-/// Output goes through `resource` from now on; the program keeps the
-/// handle open meanwhile.
-pub fn set(resource: &Handle<Resource>) {
-    CONSOLE.store(resource.raw().0, Ordering::Relaxed);
+/// Output goes through `resource` from now on: the console owns it until
+/// the process ends, so a panic can print whatever the program closed. A
+/// handle an earlier call set stays open.
+pub fn set(resource: Handle<Resource>) {
+    CONSOLE.store(resource.into_raw().0, Ordering::Relaxed);
 }
 
-/// The handle `set` gave; BAD_HANDLE before it.
-fn resource() -> Result<Handle<Resource>, Error> {
+/// A view of the handle `set` gave; BAD_HANDLE before it.
+fn resource() -> Result<ManuallyDrop<Handle<Resource>>, Error> {
     match abi::Handle(CONSOLE.load(Ordering::Relaxed)) {
         abi::Handle::INVALID => Err(Error::BadHandle),
-        h => Ok(Handle::from_raw(h)),
+        h => Ok(Handle::borrowed(h)),
     }
 }
 
@@ -58,7 +60,7 @@ pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<(), Error> {
 
 /// Formatted bytes on their way out, a piece at a time.
 struct Pieces {
-    resource: Handle<Resource>,
+    resource: ManuallyDrop<Handle<Resource>>,
     buf: [u8; INLINE_MAX],
     len: usize,
     /// The first call that failed; nothing is written after it.

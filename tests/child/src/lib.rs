@@ -3,18 +3,20 @@
 
 //! What the test init (tests/init) and its child program (src/main.rs,
 //! the second file of the test boot image) agree on (spec 13.3, 15.2): the
-//! child's start request, the roles its parent names in the reply, with
-//! their arguments and handles, and the places of the child's space the
-//! tests use.
+//! roles a parent names in the start data of its child (rt::startup), with
+//! their arguments and handles, the codes of a child whose start failed,
+//! and the places of the child's space the tests use.
 
 #![no_std]
 
-/// The 8 bytes of the start request a child sends through
-/// abi::START_CHANNEL as it starts (spec 13.3).
-pub const HELLO: u64 = u64::from_le_bytes(*b"child up");
+use rt::startup::StartError;
 
-/// Arguments of a role: the words of the reply after the role's code.
+/// Arguments of a role: the words of the start data's arguments after the
+/// role's code.
 pub const ARGS: usize = 7;
+/// The names the handles of a role come under in its start data, handle
+/// i under name i.
+pub const NAMES: [&str; 4] = ["0", "1", "2", "3"];
 
 /// Where the parent maps a page of marks into its child before the child's
 /// first thread starts: words the child writes and the parent reads. It
@@ -66,9 +68,26 @@ pub const BIND: u64 = u64::from_le_bytes(*b"bind rtc");
 
 /// The code a role ends with when the fault it exists for did not come.
 pub const NO_FAULT: u64 = 0xFA17;
-/// The code a child ends with when its start request failed or named no
-/// role, and when a call of its role failed.
+/// The code a child ends with when its start data named no role, and
+/// when a call of its role failed.
 pub const FAILED: u64 = 0xBAD;
+/// The codes a child ends with when rt::startup failed (`start_failed`).
+pub const START_FAILED: u64 = 0x57A7_0000;
+
+/// The code of a child whose rt::startup failed with `e`: START_FAILED
+/// plus 1 for Taken, 2 for Malformed, 3 for TooMuch, 4 for Missing, 0x100
+/// and the code of the kernel's error, 0x1000 and the status of a refusal.
+pub fn start_failed(e: StartError) -> u64 {
+    START_FAILED
+        + match e {
+            StartError::Taken => 1,
+            StartError::Malformed => 2,
+            StartError::TooMuch => 3,
+            StartError::Missing => 4,
+            StartError::Kernel(e) => 0x100 + e.code(),
+            StartError::Refused(status) => 0x1000 + u64::from(status.code()),
+        }
+}
 
 /// The marks of Role::Churn: copies made, rounds, rounds that ended with
 /// NO_MEMORY, the most the child used and its quota.
@@ -84,8 +103,46 @@ pub const FAULT_AT: usize = 6;
 /// saw (Role::LastThread, Role::BufferBack): 1 for what it looked for.
 pub const HELPER: usize = 7;
 pub const SEEN: usize = 8;
+/// The marks of Role::Server and Role::Busy: the counter in nanoseconds
+/// (rt::time) just before the service loop starts, from which its
+/// heartbeat counts its periods; and 1 added each time the handler of
+/// server::BUSY starts to spin.
+pub const SERVED_AT: usize = 9;
+pub const SPINS: usize = 10;
 
-/// What a child does once its start request has its answer.
+/// The protocol of the test service, Role::Server and Role::Busy
+/// (rt::service): a request is the header of a method alone
+/// (proto_wire), and a reply is its status alone but for SESSIONS.
+pub mod server {
+    /// The version of the protocol.
+    pub const VERSION: u16 = 1;
+    /// Keeps the handle the request brings in the client's session:
+    /// LIMIT_REACHED past HELD.
+    pub const KEEP: u16 = 1;
+    /// Counts an object as given to the client (rt::service::Session::
+    /// issue): LIMIT_REACHED past ISSUED.
+    pub const ISSUE: u16 = 2;
+    /// One object the client had comes back.
+    pub const RETURN: u16 = 3;
+    /// The reply waits in the client's session until the client goes.
+    pub const DEFER: u16 = 4;
+    /// Status 0, then as u32 the number of clients with a session.
+    pub const SESSIONS: u16 = 5;
+    /// Role::Busy: the handler spins until a notification comes to handle
+    /// 1, then answers; Role::Server answers BAD_STATE.
+    pub const BUSY: u16 = 6;
+    /// Replies status 0 and a copy of the service's channel without
+    /// TRANSFER, which the kernel refuses: the client gets ACCESS_DENIED.
+    pub const LEND: u16 = 7;
+    pub const METHODS: [u16; 7] = [KEEP, ISSUE, RETURN, DEFER, SESSIONS, BUSY, LEND];
+    /// The sessions of the service, the handles and deferred replies a
+    /// session holds, and the objects it gets, at most.
+    pub const SESSIONS_MAX: usize = 2;
+    pub const HELD: usize = 2;
+    pub const ISSUED: u32 = 2;
+}
+
+/// What a child does once it has its start data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Ends with the code in argument 0.
@@ -125,9 +182,9 @@ pub enum Role {
     /// child: quota argument 0, ceiling and priority argument 1, exit
     /// channel handle 2 at priority 1, marks mapped from handle 3, a
     /// memory object; handle 0 is its own process with MANAGE. It answers
-    /// the grandchild's start request with Spin on the word in argument
-    /// 2, then sends an empty request through its start channel and waits
-    /// for good.
+    /// the grandchild's START requests with its process, its thread and
+    /// Spin on the word in argument 2 (rt::startup::Giver), then sends an
+    /// empty request through its start channel and waits for good.
     Grandparent = 10,
     /// Adds 1 to the mark in argument 0 for ever.
     Spin = 11,
@@ -149,8 +206,9 @@ pub enum Role {
     /// Starts a helper thread at argument 0, below itself, which would
     /// mark HELPER, and kills its own process through handle 0.
     KillItself = 16,
-    /// Notifies its start channel with the bits in argument 0 and ends
-    /// with 0.
+    /// Notifies its start channel with the bits in argument 0, which
+    /// carries SEND and TRANSFER alone (rt::loader::spawn), and ends with
+    /// the code of the error, or 0.
     Notify = 17,
     /// Replies with 8 bytes to the token in argument 0 and ends with x0 of
     /// the call.
@@ -212,10 +270,46 @@ pub enum Role {
     /// RECEIVE and TRANSFER in BIND, and after the reply waits in a request that
     /// no reply answers without taking the notification.
     Rtc = 26,
+    /// Handle 0 the system resource with DEBUG, its console. Notifies
+    /// through the value of a channel it made and closed: in the strict
+    /// build of the test images BAD_HANDLE panics (spec 5.4), the panic
+    /// names the call, and the child ends with abi::PANIC_EXIT_CODE; it
+    /// ends with the code of the error otherwise.
+    BadHandle = 27,
+    /// Handle 0 the system resource with DEBUG, its console. Makes a
+    /// channel, takes its value a second time with Handle::from_raw,
+    /// closes the channel and drops the second handle: in the strict build
+    /// the drop's BAD_HANDLE panics and names handle_close; it ends with 0
+    /// otherwise.
+    DoubleClose = 28,
+    /// Checks its start data (rt::startup): its process lives
+    /// (PROCESS_STATE), its thread answers THREAD_STATE, handle 0 taken as
+    /// a timer is WrongKind and stays, taken as the system resource it
+    /// comes, handle 1 comes as a memory object, no handle comes under
+    /// name 2, and name 0 is gone once taken. Ends with 0, or with the
+    /// number of the first check that failed.
+    Named = 29,
+    /// Asks for its start data a second time and for init's first handles:
+    /// ends with 0 when rt::startup gives Taken and rt::init_handles None.
+    Once = 30,
+    /// Checks that its start data brought handles under the names 0 to 5
+    /// and ARGS_MAX (256) bytes of arguments, byte i past the first 64
+    /// being i as a byte. Ends with 0, or with the number of the first
+    /// check that failed.
+    Spans = 31,
+    /// The test service (`server`, rt::service): serves handle 0, a
+    /// channel with RECEIVE, with a heartbeat through its start channel
+    /// every argument 0 nanoseconds (none for 0), the slot of its timer at
+    /// argument 1, the child's priority; marks SERVED_AT first. Ends with
+    /// the code of the error of the loop.
+    Server = 32,
+    /// Role::Server, whose handler of server::BUSY spins, yielding, until
+    /// a notification comes to handle 1, a channel with RECEIVE.
+    Busy = 33,
 }
 
 impl Role {
-    pub const ALL: [Role; 26] = [
+    pub const ALL: [Role; 33] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -242,6 +336,13 @@ impl Role {
         Role::Service,
         Role::Provider,
         Role::Rtc,
+        Role::BadHandle,
+        Role::DoubleClose,
+        Role::Named,
+        Role::Once,
+        Role::Spans,
+        Role::Server,
+        Role::Busy,
     ];
 
     /// The role whose code is `code`.
@@ -283,13 +384,23 @@ impl Checked {
     }
 }
 
-/// The bytes of the reply to a start request: the role's code, then `args`,
-/// at most ARGS words, then zeros.
-pub fn reply(role: Role, args: &[u64]) -> [u8; abi::INLINE_MAX] {
+/// The first 64 bytes of the arguments of a child's start data: the
+/// role's code, then `args`, at most ARGS words, then zeros.
+pub fn args(role: Role, args: &[u64]) -> [u8; abi::INLINE_MAX] {
     let mut words = [0; 8];
     words[0] = role as u64;
     words[1..=args.len()].copy_from_slice(args);
     abi::inline_bytes(&words)
+}
+
+/// The role and its words in the arguments of a child's start data; None
+/// when they are shorter than 64 bytes or name no role.
+pub fn role_of(args: &[u8]) -> Option<(Role, [u64; ARGS])> {
+    let words = abi::inline_words(args.get(..abi::INLINE_MAX)?);
+    let role = Role::from_code(words[0])?;
+    let mut rest = [0; ARGS];
+    rest.copy_from_slice(&words[1..]);
+    Some((role, rest))
 }
 
 /// x0-x9 filled with marks, for calls that must change x0 alone.

@@ -5,9 +5,12 @@
 //! 6, 8, 11, 12, 13.3): handle layout, rights, system call numbers and
 //! where their arguments and results go, what `receive` returns, the
 //! layout of a thread's message buffer, init's first handles, scheduling
-//! policies and error codes.
+//! policies and error codes; and the time scale of the kernel and the
+//! programs (`time`).
 
 #![cfg_attr(not(test), no_std)]
+
+pub mod time;
 
 /// A process's name for a kernel object (spec 5.1): the low 16 bits index
 /// its handle table, the high 48 bits carry the entry's generation. The
@@ -1060,6 +1063,25 @@ impl Error {
             _ => Some(Error::Unknown(code)),
         }
     }
+
+    /// Whether the handles of a send or a reply that failed with this
+    /// error stay in the caller's table (spec 6.1): they do when the call
+    /// refused the message before it moved them (INVALID_ARGS, BAD_HANDLE,
+    /// WRONG_TYPE, ACCESS_DENIED, BAD_STATE, WOULD_BLOCK), and they are gone
+    /// with PEER_CLOSED, LIMIT_REACHED and NO_MEMORY. A code of a later
+    /// kernel counts as gone: a value that stays names no other object
+    /// (spec 5.1), where one given back would be closed twice.
+    pub const fn keeps_handles(self) -> bool {
+        match self {
+            Error::InvalidArgs
+            | Error::BadHandle
+            | Error::WrongType
+            | Error::AccessDenied
+            | Error::BadState
+            | Error::WouldBlock => true,
+            Error::PeerClosed | Error::LimitReached | Error::NoMemory | Error::Unknown(_) => false,
+        }
+    }
 }
 
 /// The exit code of a program that panicked (lib/rt), the one Rust's own
@@ -1522,6 +1544,25 @@ mod tests {
             assert_eq!(Error::from_code(code), Some(Error::Unknown(code)));
             assert_eq!(Error::Unknown(code).code(), code);
         }
+    }
+
+    #[test]
+    fn kept_handles_follow_the_codes_of_6_1() {
+        let kept = [
+            Error::BadHandle,
+            Error::WrongType,
+            Error::AccessDenied,
+            Error::InvalidArgs,
+            Error::WouldBlock,
+            Error::BadState,
+        ];
+        for e in Error::KNOWN {
+            assert_eq!(e.keeps_handles(), kept.contains(&e), "{e:?}");
+        }
+        assert!(!Error::PeerClosed.keeps_handles());
+        assert!(!Error::LimitReached.keeps_handles());
+        assert!(!Error::NoMemory.keeps_handles());
+        assert!(!Error::Unknown(10).keeps_handles());
     }
 
     #[test]

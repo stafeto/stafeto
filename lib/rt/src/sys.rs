@@ -10,9 +10,16 @@
 //! functions after it are the typed calls of milestones 1.2c to 1.3e,
 //! which take and return handles typed by the kind of their object
 //! (`Handle`), and the token of a request, which answers it once
-//! (`Token`).
+//! (`Token`). A send or a reply with handles takes them, and gives them
+//! back when the kernel left them in the caller's table (`Refused`); the
+//! handles of a message that came wait in an `Incoming`. In a strict build
+//! (debug assertions, the profile `checked` of the test images) BAD_HANDLE
+//! from a typed call, the close of a dropped handle among them, is a bug
+//! of the program and panics (spec 5.4); `raw` returns it as it is.
 
-use crate::handle::{Channel, Handle, Interrupt, Memory, Process, Resource, Thread, Timer};
+use crate::handle::{
+    Channel, Handle, Incoming, Interrupt, Memory, Outgoing, Process, Resource, Thread, Timer,
+};
 use crate::msgbuf;
 use abi::{
     Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats,
@@ -27,7 +34,8 @@ pub type Regs = [u64; 10];
 /// System call `N` with `x` in x0-x9; returns x0-x9 as the kernel left
 /// them. x10 and x11 count as changed, which `receive` does when it takes
 /// something (spec 11). No number is refused here: the kernel fails an
-/// unknown one with INVALID_ARGS.
+/// unknown one with INVALID_ARGS. An error comes back in x0 in every
+/// build, BAD_HANDLE too.
 ///
 /// # Safety
 /// A call can make the kernel run code or use memory of the program
@@ -61,7 +69,7 @@ pub unsafe fn raw<const N: u16>(x: Regs) -> Regs {
 
 /// Call `N` with `args` in x0 and up and zero in the rest: x0-x9 on
 /// success, the error otherwise, `Error::Unknown` for a code of a later
-/// kernel.
+/// kernel; BAD_HANDLE panics in a strict build (`strict`).
 fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let mut x = [0; 10];
     x[..args.len()].copy_from_slice(args);
@@ -71,7 +79,26 @@ fn call<const N: u16>(args: &[u64]) -> Result<Regs, Error> {
     let x = unsafe { raw::<N>(x) };
     match Error::from_code(x[0]) {
         None => Ok(x),
-        Some(e) => Err(e),
+        Some(e) => Err(strict::<N>(e)),
+    }
+}
+
+/// The error `e` of typed call `N`: with debug assertions BAD_HANDLE
+/// panics and names the call (spec 5.4); without them, and for any other
+/// error, `e` comes back.
+fn strict<const N: u16>(e: Error) -> Error {
+    if cfg!(debug_assertions) && e == Error::BadHandle {
+        bad_handle(N);
+    }
+    e
+}
+
+#[cold]
+#[inline(never)]
+fn bad_handle(number: u16) -> ! {
+    match Call::from_number(number) {
+        Some(call) => panic!("BAD_HANDLE from {call:?}"),
+        None => panic!("BAD_HANDLE from call {number}"),
     }
 }
 
@@ -83,10 +110,15 @@ fn returned<K>(x: &Regs) -> Handle<K> {
 impl<K> Handle<K> {
     /// handle_close: the handle goes, and its object with its last
     /// reference. Closing a handle to a thread or a process does not end
-    /// it.
+    /// it. Dropping the handle does the same, without the result.
     pub fn close(self) -> Result<(), Error> {
-        call::<{ Call::HandleClose.number() }>(&[self.raw().0]).map(drop)
+        close_raw(self.into_raw())
     }
+}
+
+/// handle_close of the value `h`, for `Handle::close` and its drop.
+pub(crate) fn close_raw(h: abi::Handle) -> Result<(), Error> {
+    call::<{ Call::HandleClose.number() }>(&[h.0]).map(drop)
 }
 
 /// handle_duplicate with no new label (spec 5.2, 5.3): a copy of `h` with
@@ -148,7 +180,13 @@ pub fn process_create_with(
     let x5 = start.as_ref().map_or(0, |c| c.raw().0);
     let args = [quota, handle_limit.into(), ceiling.into(), x3, x4, x5];
     match call::<{ Call::ProcessCreate.number() }>(&args) {
-        Ok(x) => Ok(returned(&x)),
+        Ok(x) => {
+            if let Some(moved) = start {
+                // The start channel is the child's entry 0 now.
+                moved.into_raw();
+            }
+            Ok(returned(&x))
+        }
         Err(e) => Err((e, start)),
     }
 }
@@ -403,7 +441,11 @@ pub unsafe fn mem_unmap(process: &Handle<Process>, addr: usize, len: u64) -> Res
 
 /// mem_protect: the pages of the mapping of `process` that is exactly
 /// `len` bytes from `addr` get `access`, within the rights the object was
-/// mapped with (spec 7.4).
+/// mapped with (spec 7.4). A program that wrote code through another
+/// mapping, one with write access, calls it with RX on the mapping the
+/// code runs from, so that the instruction cache sees the code there
+/// (spec 7.4); its own `ic ivau` at the address of the write is not
+/// enough.
 ///
 /// # Safety
 /// Nothing the caller uses in the mapping needs an access `access` takes
@@ -450,9 +492,9 @@ pub fn notify(channel: &Handle<Channel>, bits: u64) -> Result<(), Error> {
 }
 
 /// What `receive` took (spec 6.1, 6.5): a notification, or a request with
-/// its bytes 0-63 and the token that answers it. A request of more than
-/// 64 bytes lies whole in the thread's message buffer (`msgbuf`), and so
-/// do the handles it brought (msgbuf::handle).
+/// its bytes 0-63, the handles it brought and the token that answers it. A
+/// request of more than 64 bytes lies whole in the thread's message buffer
+/// (`msgbuf`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Received {
     Notification {
@@ -465,7 +507,8 @@ pub enum Received {
         /// The label of the handle the request came through, 0 for none.
         label: u64,
         len: usize,
-        handles: usize,
+        /// The handles the request brought; those not taken close with it.
+        handles: Incoming,
         token: Token,
         /// Bytes 0-63 as abi::inline_words packs them, zero past `len`.
         words: [u64; 8],
@@ -506,31 +549,80 @@ impl Token {
     /// when its client ended while it waited. More bytes fail with
     /// INVALID_ARGS, as the kernel would fail them.
     pub fn reply(self, bytes: &[u8]) -> Result<(), Error> {
-        self.reply_handles(bytes, &[])
+        self.reply_handles(bytes, Outgoing::new())
+            .map_err(|r| r.error)
     }
 
-    /// reply with `handles` as well, at most abi::MESSAGE_HANDLES, each
-    /// with TRANSFER: they move into the client's table with their rights
-    /// and labels (spec 6.1). They leave the caller's table when the call
-    /// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
-    /// NO_MEMORY; with the last two the table of the client had no room
-    /// for them, and its send fails the same way. On any other error they
-    /// stay.
-    pub fn reply_handles(self, bytes: &[u8], handles: &[abi::Handle]) -> Result<(), Error> {
-        let args = message_regs(self.0, bytes, handles, 0)?;
-        call::<{ Call::Reply.number() }>(&args).map(drop)
+    /// reply with `handles` as well, an `Outgoing` or an array of at most
+    /// abi::MESSAGE_HANDLES, each with TRANSFER: they move into the
+    /// client's table with their rights and labels (spec 6.1). They leave
+    /// the caller's table when the call succeeds, and when it fails with
+    /// PEER_CLOSED, LIMIT_REACHED or NO_MEMORY; with the last two the table
+    /// of the client had no room for them, and its send fails the same
+    /// way. On any other error they stay, and come back in `Refused::back`;
+    /// but for BAD_STATE, the kernel refused the message before it reached
+    /// the request, which still waits, and the token comes back in
+    /// `Refused::token`.
+    pub fn reply_handles(self, bytes: &[u8], handles: impl Into<Outgoing>) -> Result<(), Refused> {
+        let handles = handles.into();
+        let result = message_regs(self.0, bytes, handles.values(), 0)
+            .and_then(|args| call::<{ Call::Reply.number() }>(&args));
+        match result {
+            Ok(_) => {
+                handles.sent();
+                Ok(())
+            }
+            Err(error) => {
+                let waits = error.keeps_handles() && error != Error::BadState;
+                let mut refused = Refused::of(error, handles);
+                refused.token = waits.then_some(self);
+                Err(refused)
+            }
+        }
     }
 }
 
-/// What `send` returns (spec 6.1): the reply's length, the count of
-/// handles it brought, and its bytes 0-63 as abi::inline_words packs them,
-/// zero past `len`. A reply of more than 64 bytes lies whole in the
-/// thread's message buffer (`msgbuf`), and so do its handles
-/// (msgbuf::handle).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A send or a reply with handles that failed (spec 6.1): its error, and
+/// the handles when they stayed in the caller's table
+/// (abi::Error::keeps_handles). Handles that did not come back are gone.
+/// A reply the kernel refused before it reached the request gives its
+/// token back too: the client still waits, and the caller answers it
+/// another way.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refused {
+    pub error: Error,
+    pub back: Option<Outgoing>,
+    /// For a reply only: the token of the request that still waits.
+    pub token: Option<Token>,
+}
+
+impl Refused {
+    /// The refusal of a call that failed with `error` and had `handles` in
+    /// its message.
+    fn of(error: Error, handles: Outgoing) -> Refused {
+        let back = if error.keeps_handles() {
+            Some(handles)
+        } else {
+            handles.sent();
+            None
+        };
+        Refused {
+            error,
+            back,
+            token: None,
+        }
+    }
+}
+
+/// What `send` returns (spec 6.1): the reply's length, the handles it
+/// brought, and its bytes 0-63 as abi::inline_words packs them, zero past
+/// `len`. A reply of more than 64 bytes lies whole in the thread's message
+/// buffer (`msgbuf`).
+#[derive(Debug, PartialEq, Eq)]
 pub struct Reply {
     pub len: usize,
-    pub handles: usize,
+    /// The handles the reply brought; those not taken close with it.
+    pub handles: Incoming,
     pub words: [u64; 8],
 }
 
@@ -586,19 +678,45 @@ pub fn try_send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error>
     send_with(channel, bytes, &[], abi::NO_WAIT)
 }
 
-/// send with `handles` as well, at most abi::MESSAGE_HANDLES, each with
-/// TRANSFER, none of them `channel`: they move into the receiver's table
-/// with their rights and labels (spec 6.1), and the reply may bring handles
-/// back (msgbuf::handle). They leave the caller's table when the call
-/// succeeds, and when it fails with PEER_CLOSED, LIMIT_REACHED or
-/// NO_MEMORY, the last two when the receiver's table or the reply's had no
-/// room for them; on any other error they stay.
+/// send with `handles` as well, an `Outgoing` or an array of at most
+/// abi::MESSAGE_HANDLES, each with TRANSFER, none of them `channel`: they
+/// move into the receiver's table with their rights and labels (spec
+/// 6.1), and the reply may bring handles back. They leave the caller's
+/// table when the call succeeds, and when it fails with PEER_CLOSED,
+/// LIMIT_REACHED or NO_MEMORY, the last two when the receiver's table or
+/// the reply's had no room for them; on any other error they stay, and
+/// come back in `Refused::back`.
 pub fn send_handles(
     channel: &Handle<Channel>,
     bytes: &[u8],
-    handles: &[abi::Handle],
-) -> Result<Reply, Error> {
-    send_with(channel, bytes, handles, 0)
+    handles: impl Into<Outgoing>,
+) -> Result<Reply, Refused> {
+    send_moving(channel, bytes, handles.into(), 0)
+}
+
+/// send_handles with abi::NO_WAIT: WOULD_BLOCK, with the handles back,
+/// when no thread waits in receive on the channel.
+pub fn try_send_handles(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: impl Into<Outgoing>,
+) -> Result<Reply, Refused> {
+    send_moving(channel, bytes, handles.into(), abi::NO_WAIT)
+}
+
+fn send_moving(
+    channel: &Handle<Channel>,
+    bytes: &[u8],
+    handles: Outgoing,
+    flags: u64,
+) -> Result<Reply, Refused> {
+    match send_with(channel, bytes, handles.values(), flags) {
+        Ok(reply) => {
+            handles.sent();
+            Ok(reply)
+        }
+        Err(error) => Err(Refused::of(error, handles)),
+    }
 }
 
 fn send_with(
@@ -615,7 +733,7 @@ fn send_with(
     keep_whole(m.len, &m.words);
     Ok(Reply {
         len: m.len,
-        handles: m.handles,
+        handles: Incoming::from_buffer(m.handles),
         words: m.words,
     })
 }
@@ -660,7 +778,7 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
         )
     };
     if let Some(e) = Error::from_code(x[0]) {
-        return Err(e);
+        return Err(strict::<{ Call::Receive.number() }>(e));
     }
     let words: [u64; 11] = x[1..].try_into().expect("x1-x11");
     if Source::from_code((words[0] >> SOURCE_SHIFT) & 0xF) == Source::Message {
@@ -669,7 +787,7 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
         return Ok(Received::Message {
             label: m.label,
             len: m.len,
-            handles: m.handles,
+            handles: Incoming::from_buffer(m.handles),
             token: Token(m.token),
             words: m.words,
         });

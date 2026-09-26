@@ -4,24 +4,29 @@
 //! The child program of the test init (spec 15.2): the second file of the
 //! test boot image, which the test init loads with rt::loader. As it
 //! starts, a child adds 1 to its mark STARTED, in the page its parent
-//! mapped at child::MARKS, then asks for its start data through
-//! abi::START_CHANNEL (spec 13.3): the reply names its role, with up to
-//! seven arguments and four handles (lib.rs). The child ends with the code
-//! its role returns, or by the fault its role exists for.
+//! mapped at child::MARKS, then asks for its start data (rt::startup,
+//! spec 13.3): the arguments name its role, with up to seven words, and
+//! up to four handles come under the names child::NAMES (lib.rs). The
+//! child ends with the code its role returns, or by the fault its role
+//! exists for; with child::start_failed when rt::startup failed.
 
 #![no_std]
 #![no_main]
 
 use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
-    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS,
-    MOST_USED, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED,
-    STARTED, WINDOW, marked, x0_alone,
+    ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELPER, IMAGE, MADE, MARKS, MOST_USED,
+    NAMES, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SERVED_AT,
+    SHARED, SPINS, STARTED, WINDOW, marked, server, x0_alone,
 };
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Memory, Process, Resource, Thread};
+use proto_wire::Status;
+use rt::handle::{Any, Channel, Memory, Outgoing, Process, Resource, Thread, Timer};
+use rt::service::{self, Answer, Config, Heartbeat, Request, Service, Session};
+use rt::startup::{ARGS_MAX, Giver, StartError, Startup, TakeError};
 use rt::sys::{self, Received};
-use rt::{Handle, Stack, loader, msgbuf};
+use rt::{Handle, Stack, loader, msgbuf, time};
 
 rt::entry!(main);
 
@@ -40,18 +45,26 @@ static HELD: [AtomicU64; HELD_MAX] = [const { AtomicU64::new(0) }; HELD_MAX];
 /// The stacks of the helper threads of a role.
 static STACKS: [Stack<8192>; 2] = [const { Stack::new() }; 2];
 
-/// The reply to the start request.
+/// The role of the start data with its words and the handles that came
+/// under child::NAMES. The child holds the handles until it ends; the
+/// roles view them (`Handle::borrowed`).
 struct Start {
     role: Role,
     args: [u64; ARGS],
     handles: [abi::Handle; abi::MESSAGE_HANDLES],
 }
 
+/// A view of the start channel, entry 0 of the child's table (spec 13.3),
+/// which the child holds until it ends.
+fn parent() -> ManuallyDrop<Handle<Channel>> {
+    Handle::borrowed(abi::START_CHANNEL)
+}
+
 fn main(_: u64) -> u64 {
     mark(STARTED).fetch_add(1, Relaxed);
-    match ask() {
+    match begin() {
         Ok(start) => run(&start),
-        Err(_) => FAILED,
+        Err(code) => code,
     }
 }
 
@@ -63,25 +76,82 @@ fn mark(i: usize) -> &'static AtomicU64 {
     unsafe { &*(MARKS as *const AtomicU64).add(i) }
 }
 
-/// The start request (spec 13.3): HELLO through START_CHANNEL; the reply
-/// holds the role's code, its arguments and its handles.
-fn ask() -> Result<Start, Error> {
-    let reply = sys::send(&rt::START_CHANNEL, &HELLO.to_le_bytes())?;
-    let role = Role::from_code(reply.words[0]).ok_or(Error::InvalidArgs)?;
-    let mut args = [0; ARGS];
-    args.copy_from_slice(&reply.words[1..]);
-    let handles = core::array::from_fn(|i| {
-        if i < reply.handles {
-            msgbuf::handle(i).0
-        } else {
-            abi::Handle::INVALID
-        }
+/// The start data (rt::startup, spec 13.3): the role, its words and the
+/// handles under child::NAMES. The start channel stays the child's, as
+/// entry 0 (`parent`); what else came, the copies of its process and
+/// thread among them, closes before the role runs. The roles that check
+/// the start data itself end here: the code to end with.
+fn begin() -> Result<Start, u64> {
+    let mut s = rt::startup().map_err(child::start_failed)?;
+    let (role, args) = child::role_of(s.args()).ok_or(FAILED)?;
+    match role {
+        Role::Named => return Err(named(&mut s)),
+        Role::Once => return Err(once()),
+        Role::Spans => return Err(spans(&mut s)),
+        _ => {}
+    }
+    let handles = NAMES.map(|name| {
+        s.take::<Any>(name)
+            .map_or(abi::Handle::INVALID, Handle::into_raw)
     });
+    s.parent.into_raw();
     Ok(Start {
         role,
         args,
         handles,
     })
+}
+
+/// Role::Named: 0, or the number of the first check that failed.
+fn named(s: &mut Startup) -> u64 {
+    let wrong = s.take::<Timer>(NAMES[0]).map(drop);
+    let resource = s.take::<Resource>(NAMES[0]);
+    let memory = s.take::<Memory>(NAMES[1]);
+    let checks = [
+        sys::process_state(&s.process) == Ok(ProcessState::Alive),
+        sys::thread_info(&s.thread).is_ok(),
+        wrong == Err(TakeError::WrongKind),
+        resource.is_ok(),
+        memory.is_ok(),
+        s.take::<Any>(NAMES[2]).map(drop) == Err(TakeError::Missing),
+        s.take::<Any>(NAMES[0]).map(drop) == Err(TakeError::Missing),
+    ];
+    checks
+        .iter()
+        .position(|&ok| !ok)
+        .map_or(0, |i| i as u64 + 1)
+}
+
+/// Role::Once: 0 when neither the start data nor init's first handles
+/// come a second time.
+fn once() -> u64 {
+    let again = rt::startup();
+    let init = rt::init_handles();
+    let none = init.is_none();
+    // Were they there, init's values would name other handles of the
+    // child's table.
+    core::mem::forget(init);
+    match (again.err(), none) {
+        (Some(StartError::Taken), true) => 0,
+        _ => FAILED,
+    }
+}
+
+/// Role::Spans: 0, or the number of the first check that failed.
+fn spans(s: &mut Startup) -> u64 {
+    let args = s.args();
+    let pattern = (abi::INLINE_MAX..ARGS_MAX).all(|i| args[i] == i as u8);
+    let checks = [
+        args.len() == ARGS_MAX,
+        pattern,
+        ["0", "1", "2", "3", "4", "5"]
+            .iter()
+            .all(|&name| s.take::<Any>(name).is_ok()),
+    ];
+    checks
+        .iter()
+        .position(|&ok| !ok)
+        .map_or(0, |i| i as u64 + 1)
 }
 
 fn run(s: &Start) -> u64 {
@@ -91,7 +161,7 @@ fn run(s: &Start) -> u64 {
         Role::Echo => echo(a),
         Role::Recurse => deeper(0),
         Role::Panic => {
-            rt::console::set(&Handle::<Resource>::from_raw(s.handles[0]));
+            rt::console::set(Handle::<Resource>::from_raw(s.handles[0]));
             panic!("{}", child::PANIC)
         }
         Role::Load => {
@@ -112,7 +182,7 @@ fn run(s: &Start) -> u64 {
             NO_FAULT
         }
         Role::WriteCode => {
-            let own = Handle::<Process>::from_raw(s.handles[0]);
+            let own = Handle::<Process>::borrowed(s.handles[0]);
             // SAFETY: the call must fail; had it passed, the code would
             // only have become writable.
             let protected =
@@ -126,7 +196,7 @@ fn run(s: &Start) -> u64 {
             NO_FAULT
         }
         Role::RunData => {
-            let own = Handle::<Process>::from_raw(s.handles[0]);
+            let own = Handle::<Process>::borrowed(s.handles[0]);
             let parts = [(a[0], a[1]), (a[2], a[3]), (MARKS as u64, PAGE)];
             let denied = parts.iter().all(|&(at, len)| {
                 // SAFETY: the call must fail; had it passed, the child
@@ -205,14 +275,14 @@ fn run(s: &Start) -> u64 {
             Err(_) => FAILED,
         },
         Role::KillItself => {
-            let own = Handle::<Process>::from_raw(s.handles[0]);
+            let own = Handle::<Process>::borrowed(s.handles[0]);
             match helper(s, 0, a[0] as u8, mark_helper) {
                 // A kill of its own process does not return.
                 Ok(_) => sys::process_kill(&own).map_or(FAILED, |()| FAILED),
                 Err(_) => FAILED,
             }
         }
-        Role::Notify => match sys::notify(&rt::START_CHANNEL, a[0]) {
+        Role::Notify => match sys::notify(&parent(), a[0]) {
             Ok(()) => 0,
             Err(e) => e.code(),
         },
@@ -224,14 +294,14 @@ fn run(s: &Start) -> u64 {
             after[0]
         }
         Role::TakeThenExit => {
-            let c = Handle::<Channel>::from_raw(s.handles[0]);
+            let c = Handle::<Channel>::borrowed(s.handles[0]);
             match sys::receive(&c) {
                 Ok(Received::Message { .. }) => sys::process_exit(0),
                 _ => FAILED,
             }
         }
         Role::Send => {
-            let c = Handle::<Channel>::from_raw(s.handles[0]);
+            let c = Handle::<Channel>::borrowed(s.handles[0]);
             match sys::send(&c, &a[0].to_le_bytes()) {
                 Ok(reply) => reply.words[0],
                 Err(e) => e.code(),
@@ -246,6 +316,18 @@ fn run(s: &Start) -> u64 {
         Role::Service => service(s).unwrap_or(FAILED),
         Role::Provider => provide(s).unwrap_or(FAILED),
         Role::Rtc => drive(s).unwrap_or(FAILED),
+        Role::BadHandle | Role::DoubleClose => {
+            rt::console::set(Handle::<Resource>::from_raw(s.handles[0]));
+            let strict = match s.role {
+                Role::BadHandle => bad_handle(),
+                _ => double_close(),
+            };
+            strict.unwrap_or(FAILED)
+        }
+        Role::Server => serve_sessions(s, false),
+        Role::Busy => serve_sessions(s, true),
+        // `begin` runs them.
+        Role::Named | Role::Once | Role::Spans => FAILED,
     }
 }
 
@@ -254,7 +336,7 @@ fn echo(args: &[u64; ARGS]) -> u64 {
     let mut words = [0; 8];
     words[..ARGS].copy_from_slice(args);
     let bytes = abi::inline_bytes(&words);
-    match sys::send(&rt::START_CHANNEL, &bytes[..8 * ARGS]) {
+    match sys::send(&parent(), &bytes[..8 * ARGS]) {
         Ok(reply) => reply.words[0],
         Err(_) => FAILED,
     }
@@ -274,7 +356,7 @@ fn deeper(depth: u64) -> u64 {
 /// handle 0, the child's own process; `then` gets that handle and the
 /// first word of SCRATCH_LAST.
 fn with_scratch(s: &Start, then: impl FnOnce(&Handle<Process>, *mut u64) -> u64) -> u64 {
-    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let own = Handle::<Process>::borrowed(s.handles[0]);
     let Ok(m) = sys::mem_create(SCRATCH_LEN) else {
         return FAILED;
     };
@@ -288,10 +370,10 @@ fn with_scratch(s: &Start, then: impl FnOnce(&Handle<Process>, *mut u64) -> u64)
 /// waits in a request to its parent until it is killed.
 fn grandparent(s: &Start) -> Result<u64, Error> {
     let [own, image, exit, marks] = s.handles;
-    let own = Handle::<Process>::from_raw(own);
-    let image = Handle::<Memory>::from_raw(image);
-    let exit = Handle::<Channel>::from_raw(exit);
-    let marks = Handle::<Memory>::from_raw(marks);
+    let own = Handle::<Process>::borrowed(own);
+    let image = Handle::<Memory>::borrowed(image);
+    let exit = Handle::<Channel>::borrowed(exit);
+    let marks = Handle::<Memory>::borrowed(marks);
     let size = sys::memory_info(&image)?.size;
     sys::mem_map(&own, &image, 0, size, IMAGE, Access::Read)?;
     // SAFETY: the mapping shows the boot image, read-only, and stays.
@@ -312,18 +394,38 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
     // SAFETY: only the loader uses WINDOW.
     let g = unsafe { loader::load(&own, &program, WINDOW, params) }.map_err(|(e, _)| e)?;
     sys::mem_map(&g.process, &marks, 0, PAGE, MARKS, Access::ReadWrite)?;
-    sys::thread_start(&g.thread)?;
-    let Received::Message { token, .. } = sys::receive(&requests)? else {
+    let mut giver = Giver::new();
+    let copy = Rights::MANAGE | Rights::TRANSFER;
+    let given = [
+        giver.give("process", sys::handle_duplicate(&g.process, copy)?.erase()),
+        giver.give("thread", sys::handle_duplicate(&g.thread, copy)?.erase()),
+    ];
+    if given.iter().any(Result::is_err) {
         return Ok(FAILED);
-    };
-    token.reply(&child::reply(Role::Spin, &[s.args[2]]))?;
-    sys::send(&rt::START_CHANNEL, &[])?;
+    }
+    giver.set_args(&child::args(Role::Spin, &[s.args[2]]))?;
+    sys::thread_start(&g.thread)?;
+    loop {
+        let Received::Message {
+            len, token, words, ..
+        } = sys::receive(&requests)?
+        else {
+            return Ok(FAILED);
+        };
+        let request = abi::inline_bytes(&words);
+        match giver.answer(&request[..len.min(abi::INLINE_MAX)], token)? {
+            rt::startup::Answered::Piece => continue,
+            rt::startup::Answered::Last => break,
+            _ => return Ok(FAILED),
+        }
+    }
+    sys::send(&parent(), &[])?;
     Ok(FAILED)
 }
 
 /// Role::Churn.
 fn churn(s: &Start, total: u64) -> u64 {
-    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let own = Handle::<Process>::borrowed(s.handles[0]);
     let (mut made, mut rounds, mut full, mut most) = (0, 0, 0, 0);
     while made < total {
         let mut n = 0;
@@ -333,7 +435,7 @@ fn churn(s: &Start, total: u64) -> u64 {
             }
             match sys::handle_duplicate(&own, Rights::NONE) {
                 Ok(h) => {
-                    HELD[n].store(h.raw().0, Relaxed);
+                    HELD[n].store(h.into_raw().0, Relaxed);
                     n += 1;
                 }
                 Err(e) => break e,
@@ -380,7 +482,7 @@ fn helper(
     priority: u8,
     entry: extern "C" fn(u64) -> !,
 ) -> Result<Handle<Thread>, Error> {
-    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let own = Handle::<Process>::borrowed(s.handles[0]);
     let top = STACKS[slot].top();
     // SAFETY: each helper has a stack of its own, which nothing else uses.
     let t = unsafe {
@@ -407,7 +509,7 @@ extern "C" fn mark_helper(_: u64) -> ! {
 /// A helper that marks SEEN when object_info of its process, `own`, says
 /// it lives, marks HELPER and ends.
 extern "C" fn alive_then_exit(own: u64) -> ! {
-    let state = sys::process_state(&Handle::<Process>::from_raw(abi::Handle(own)));
+    let state = sys::process_state(&Handle::<Process>::borrowed(abi::Handle(own)));
     mark(SEEN).store(u64::from(state == Ok(ProcessState::Alive)), Relaxed);
     mark(HELPER).fetch_add(1, Relaxed);
     sys::thread_exit()
@@ -431,7 +533,7 @@ extern "C" fn buffer_then_exit(_: u64) -> ! {
 
 /// Role::LastThread.
 fn last_thread(s: &Start) -> u64 {
-    let own = Handle::<Process>::from_raw(s.handles[0]);
+    let own = Handle::<Process>::borrowed(s.handles[0]);
     let level = s.args[0] as u8;
     // SAFETY: the stack of slot 1 is the stopped thread's, which never
     // runs.
@@ -454,8 +556,8 @@ fn last_thread(s: &Start) -> u64 {
 
 /// Role::BufferBack.
 fn buffer_back(s: &Start) -> u64 {
-    let own = Handle::<Process>::from_raw(s.handles[0]);
-    let me = Handle::<Thread>::from_raw(s.handles[1]);
+    let own = Handle::<Process>::borrowed(s.handles[0]);
+    let me = Handle::<Thread>::borrowed(s.handles[1]);
     let level = s.args[0] as u8;
     let used = || sys::process_memory(&own).map_or(0, |m| m.used);
     let before = used();
@@ -481,7 +583,7 @@ fn buffer_back(s: &Start) -> u64 {
 
 /// Role::Serve.
 fn serve(s: &Start, requests: u64) -> u64 {
-    let c = Handle::<Channel>::from_raw(s.handles[0]);
+    let c = Handle::<Channel>::borrowed(s.handles[0]);
     for _ in 0..requests {
         let Ok(Received::Message {
             len, token, words, ..
@@ -588,7 +690,7 @@ fn made() -> Result<(u64, Handle<Channel>, u64), Error> {
     let shut = sys::channel_create(10)?;
     let left = sys::handle_duplicate(&shut, Rights::NOTIFY)?;
     shut.close()?;
-    Ok((closed, channel, left.raw().0))
+    Ok((closed, channel, left.into_raw().0))
 }
 
 /// x0 of a call that returns nothing else: 0, or the code of its error.
@@ -598,10 +700,10 @@ fn code(result: Result<(), Error>) -> u64 {
 
 /// Role::Service.
 fn service(s: &Start) -> Result<u64, Error> {
-    let requests = Handle::<Channel>::from_raw(s.handles[0]);
-    let own = Handle::<Process>::from_raw(s.handles[1]);
+    let requests = Handle::<Channel>::borrowed(s.handles[0]);
+    let own = Handle::<Process>::borrowed(s.handles[1]);
     let Received::Message {
-        handles: 1,
+        mut handles,
         token,
         words,
         ..
@@ -609,8 +711,10 @@ fn service(s: &Start) -> Result<u64, Error> {
     else {
         return Ok(FAILED);
     };
-    let (h, (kind, rights)) = msgbuf::handle(0);
-    let m = Handle::<Memory>::from_raw(h);
+    let (Some((kind, rights)), 1) = (handles.info(0), handles.len()) else {
+        return Ok(FAILED);
+    };
+    let m = handles.take::<Memory>(0)?;
     let (len, word) = (words[0], words[1]);
     let mut answer = [0; 8];
     answer[0] = abi::msgbuf::info(kind, rights);
@@ -645,8 +749,8 @@ fn service(s: &Start) -> Result<u64, Error> {
 
 /// Role::Provider.
 fn provide(s: &Start) -> Result<u64, Error> {
-    let requests = Handle::<Channel>::from_raw(s.handles[0]);
-    let own = Handle::<Process>::from_raw(s.handles[1]);
+    let requests = Handle::<Channel>::borrowed(s.handles[0]);
+    let own = Handle::<Process>::borrowed(s.handles[1]);
     let Received::Message { token, words, .. } = sys::receive(&requests)? else {
         return Ok(FAILED);
     };
@@ -666,7 +770,9 @@ fn provide(s: &Start) -> Result<u64, Error> {
     let used = sys::process_memory(&own)?.used;
     let copy = sys::handle_duplicate(&m, Rights::MAP_READ | Rights::TRANSFER)?;
     m.close()?;
-    token.reply_handles(&used.to_le_bytes(), &[copy.raw()])?;
+    token
+        .reply_handles(&used.to_le_bytes(), [copy.erase()])
+        .map_err(|r| r.error)?;
     Ok(0)
 }
 
@@ -677,21 +783,22 @@ fn drive(s: &Start) -> Result<u64, Error> {
     let c = sys::channel_create(1)?;
     let notify = sys::handle_duplicate(&c, Rights::NOTIFY | Rights::TRANSFER)?;
     let hold = s.args[0] != 0;
-    let reply = if hold {
+    let mut reply = if hold {
         let seen = sys::handle_duplicate(&c, Rights::RECEIVE | Rights::TRANSFER)?;
-        let handles = [notify.raw(), seen.raw()];
-        sys::send_handles(&rt::START_CHANNEL, &BIND.to_le_bytes(), &handles)?
+        let handles = [notify.erase(), seen.erase()];
+        sys::send_handles(&parent(), &BIND.to_le_bytes(), handles).map_err(|r| r.error)?
     } else {
-        sys::send_handles(&rt::START_CHANNEL, &BIND.to_le_bytes(), &[notify.raw()])?
+        sys::send_handles(&parent(), &BIND.to_le_bytes(), [notify.erase()]).map_err(|r| r.error)?
     };
-    if reply.handles != 1 {
+    let (Some((kind, rights)), 1) = (reply.handles.info(0), reply.handles.len()) else {
         return Ok(FAILED);
-    }
+    };
+    // The binding stays with the child until it ends.
+    let _binding = reply.handles.take_any(0)?;
     if hold {
-        sys::send(&rt::START_CHANNEL, &BIND.to_le_bytes())?;
+        sys::send(&parent(), &BIND.to_le_bytes())?;
         return Ok(FAILED);
     }
-    let (_, (kind, rights)) = msgbuf::handle(0);
     let Received::Notification {
         source,
         label,
@@ -711,6 +818,134 @@ fn drive(s: &Start) -> Result<u64, Error> {
         0,
         0,
     ];
-    sys::send(&rt::START_CHANNEL, &abi::inline_bytes(&words)[..5 * 8])?;
+    sys::send(&parent(), &abi::inline_bytes(&words)[..5 * 8])?;
     Ok(FAILED)
+}
+
+/// Role::BadHandle.
+fn bad_handle() -> Result<u64, Error> {
+    let gone = sys::channel_create(1)?;
+    let value = gone.raw();
+    gone.close()?;
+    match sys::notify(&Handle::<Channel>::borrowed(value), 1) {
+        Ok(()) => Ok(FAILED),
+        Err(e) => Ok(e.code()),
+    }
+}
+
+/// Role::DoubleClose.
+fn double_close() -> Result<u64, Error> {
+    let c = sys::channel_create(1)?;
+    let twin = Handle::<Channel>::from_raw(c.raw());
+    c.close()?;
+    drop(twin);
+    Ok(0)
+}
+
+/// Role::Server and Role::Busy: the code of the error the loop ended with.
+fn serve_sessions(s: &Start, busy: bool) -> u64 {
+    let c = Handle::<Channel>::borrowed(s.handles[0]);
+    let to = parent();
+    let heartbeat = (s.args[0] != 0).then(|| Heartbeat {
+        to: &to,
+        period_ns: s.args[0],
+        priority: s.args[1] as u8,
+    });
+    let mut server = Server {
+        clients: 0,
+        own: Handle::borrowed(s.handles[0]),
+        spin: busy.then(|| Handle::borrowed(s.handles[1])),
+    };
+    let config = Config {
+        issued: server::ISSUED,
+        heartbeat,
+    };
+    mark(SERVED_AT).store(time::ticks_to_ns(time::now()), Relaxed);
+    service::run::<_, { server::SESSIONS_MAX }, { server::HELD }>(&c, &mut server, config).code()
+}
+
+/// The test service (child::server): the clients with a session, a view
+/// of its channel, and for Role::Busy the channel its handler of BUSY
+/// spins on.
+struct Server {
+    clients: u32,
+    own: ManuallyDrop<Handle<Channel>>,
+    spin: Option<ManuallyDrop<Handle<Channel>>>,
+}
+
+/// What the test service keeps for a client: whether it counts in
+/// `Server::clients`.
+#[derive(Default)]
+struct Client {
+    counted: bool,
+}
+
+impl Service<{ server::HELD }> for Server {
+    const VERSION: u16 = server::VERSION;
+    const METHODS: &'static [u16] = &server::METHODS;
+    type Data = Client;
+
+    fn request(
+        &mut self,
+        s: &mut Session<Client, { server::HELD }>,
+        r: &mut Request<'_>,
+    ) -> Answer {
+        if !s.data.counted {
+            s.data.counted = true;
+            self.clients += 1;
+        }
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        match r.method() {
+            server::KEEP => match r.handles.take_any(0) {
+                Ok(h) => s.keep(h).map(drop).into(),
+                Err(_) => Answer::Status(Status::BadSize),
+            },
+            server::ISSUE => s.issue().into(),
+            server::RETURN => {
+                s.release();
+                Answer::Status(Status::Ok)
+            }
+            server::DEFER => {
+                if let Some(p) = r.defer() {
+                    // A full session answers LIMIT_REACHED itself.
+                    let _ = s.hold(p);
+                }
+                Answer::Deferred
+            }
+            server::SESSIONS => {
+                let w = r.reply();
+                // Eight bytes fit.
+                let _ = w.u32(Status::Ok.code()).and(w.u32(self.clients));
+                Answer::Reply(Outgoing::new())
+            }
+            server::BUSY => match &self.spin {
+                Some(spin) => {
+                    mark(SPINS).fetch_add(1, Relaxed);
+                    while sys::try_receive(spin) == Err(Error::WouldBlock) {
+                        let _ = sys::yield_now();
+                    }
+                    Answer::Status(Status::Ok)
+                }
+                None => Answer::Status(Status::Kernel(Error::BadState)),
+            },
+            server::LEND => match sys::handle_duplicate(&*self.own, Rights::SEND) {
+                Ok(copy) => {
+                    let w = r.reply();
+                    // Four bytes fit.
+                    let _ = w.u32(Status::Ok.code());
+                    Answer::Reply([copy.erase()].into())
+                }
+                Err(e) => Answer::Status(Status::Kernel(e)),
+            },
+            _ => Answer::Status(Status::UnknownMethod),
+        }
+    }
+
+    fn gone(&mut self, s: &mut Session<Client, { server::HELD }>) {
+        if s.data.counted {
+            self.clients -= 1;
+        }
+    }
 }

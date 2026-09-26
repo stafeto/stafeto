@@ -106,7 +106,7 @@ fn exited_threads_hold_no_numbers() -> Outcome {
     for held in &HELD {
         let t = thread(0, add_mark, 0, HIGH, Policy::Fifo).and_then(|t| {
             let started = sys::thread_start(&t);
-            held.store(t.raw().0, Relaxed);
+            held.store(t.into_raw().0, Relaxed);
             started.map_err(|_| "thread_start failed")
         });
         if let Err(why) = t {
@@ -403,13 +403,14 @@ pub(crate) extern "C" fn handle_client(slot: u64) -> ! {
     let s = slot as usize;
     let n = GIVEN_COUNT.load(Relaxed) as usize;
     let handles: [abi::Handle; 4] = core::array::from_fn(|i| abi::Handle(GIVEN[i].load(Relaxed)));
-    match sys::send_handles(&handle(s), &request(s), &handles[..n]) {
-        Ok(reply) => {
+    match send_values(&handle(s), &request(s), &handles[..n]) {
+        Ok(mut reply) => {
             let mut w = [0; 11];
+            let count = reply.handles.len();
             w[1] = reply.len as u64;
-            w[2] = reply.handles as u64;
-            for i in 0..reply.handles {
-                let (h, (kind, rights)) = rt::msgbuf::handle(i);
+            w[2] = count as u64;
+            let came = values(&mut reply.handles);
+            for (i, &(h, (kind, rights))) in came[..count].iter().enumerate() {
                 w[3 + 2 * i] = h.0;
                 w[4 + 2 * i] = abi::msgbuf::info(kind, rights);
             }
@@ -421,9 +422,14 @@ pub(crate) extern "C" fn handle_client(slot: u64) -> ! {
     sys::thread_exit()
 }
 
-/// handle_close with the value `h`, for values that must be bad.
+/// handle_close with the value `h` through a raw call, for values that
+/// must be bad: BAD_HANDLE comes back in the strict build too.
 pub(crate) fn close_raw(h: abi::Handle) -> Result<(), Error> {
-    Handle::<Channel>::from_raw(h).close()
+    let mut x = [0; 10];
+    x[0] = h.0;
+    // SAFETY: handle_close only reads x0.
+    let after = unsafe { sys::raw::<{ Call::HandleClose.number() }>(x) };
+    Error::from_code(after[0]).map_or(Ok(()), Err)
 }
 
 /// Whether each of `handles` is gone: closing it is BAD_HANDLE.
@@ -436,7 +442,7 @@ fn all_gone(handles: &[abi::Handle]) -> bool {
 /// A copy of `h` with `rights` as a raw value, which the test hands the
 /// kernel in a message.
 pub(crate) fn copy_raw<K>(h: &Handle<K>, rights: Rights) -> Result<abi::Handle, &'static str> {
-    copy(h, rights).map(|c| c.raw())
+    copy(h, rights).map(Handle::into_raw)
 }
 
 /// x0-x9 of a raw send through `h` of 8 bytes and `handles`, whose values
@@ -457,8 +463,8 @@ fn handle_regs(h: abi::Handle, handles: &[abi::Handle], flags: u64) -> Regs {
 fn fill_table(room: usize) -> Result<usize, &'static str> {
     let mut n = 0;
     loop {
-        match sys::handle_duplicate(&init::RESOURCE, Rights::NONE) {
-            Ok(h) => FILLED[n].store(h.raw().0, Relaxed),
+        match sys::handle_duplicate(&resource(), Rights::NONE) {
+            Ok(h) => FILLED[n].store(h.into_raw().0, Relaxed),
             Err(Error::LimitReached) => break,
             Err(_) => return Err("handle_duplicate failed"),
         }
@@ -500,20 +506,20 @@ fn handles_move_with_a_request() -> Outcome {
     let sent = [
         copy_raw(&e, rights[0])?,
         copy_raw(&tm, rights[1])?,
-        copy_raw(&init::PROCESS, rights[2])?,
-        copy_raw(&init::RESOURCE, rights[3])?,
+        copy_raw(&own(), rights[2])?,
+        copy_raw(&resource(), rights[3])?,
     ];
     give(&sent);
     let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
-    let got = sys::try_receive(&c);
-    let came: [_; 4] = core::array::from_fn(rt::msgbuf::handle);
+    let mut got = sys::try_receive(&c);
+    let came = came(&mut got);
     let kinds = [
         abi::ObjectKind::Channel,
         abi::ObjectKind::Timer,
         abi::ObjectKind::Process,
         abi::ObjectKind::Resource,
     ];
-    let four = matches!(got, Ok(Received::Message { handles: 4, .. }));
+    let four = matches!(&got, Ok(Received::Message { handles, .. }) if handles.len() == 4);
     let told = (0..4).all(|i| came[i].1 == (kinds[i], rights[i]));
     let replied = answer_all([got]);
     let gone = all_gone(&sent);
@@ -553,7 +559,7 @@ fn handles_move_with_a_reply() -> Outcome {
     ];
     let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
     let sent = [copy_raw(&e, rights[0])?, copy_raw(&t, rights[1])?];
-    let replied = take_token(&c)?.reply_handles(&[], &sent);
+    let replied = reply_values(take_token(&c)?, &[], &sent);
     let got = result(0);
     let gone = all_gone(&sent);
     let live = [got[3], got[5]]
@@ -591,8 +597,8 @@ fn rights_stay_narrowed() -> Outcome {
     let narrow = Rights::SEND | Rights::TRANSFER;
     give(&[copy_raw(&c, narrow)?]);
     let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
-    let got = sys::try_receive(&c);
-    let (h, info) = rt::msgbuf::handle(0);
+    let mut got = sys::try_receive(&c);
+    let (h, info) = came(&mut got)[0];
     let came = Handle::<Channel>::from_raw(h);
     let refused = sys::try_receive(&came) == Err(Error::AccessDenied)
         && sys::handle_duplicate(&came, Rights::NONE) == Err(Error::AccessDenied);
@@ -619,10 +625,10 @@ fn label_travels_with_its_handle() -> Outcome {
     let e = channel(QUIET)?;
     HANDLES[0].store(c.raw().0, Relaxed);
     let named = session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?;
-    give(&[named.raw()]);
+    give(&[named.into_raw()]);
     let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
-    let got = sys::try_receive(&c);
-    let (h, info) = rt::msgbuf::handle(0);
+    let mut got = sys::try_receive(&c);
+    let (h, info) = came(&mut got)[0];
     let came = Handle::<Channel>::from_raw(h);
     let early = sys::try_receive(&e);
     let posted = sys::notify(&came, 1);
@@ -662,10 +668,10 @@ fn receive_right_moves_without_closing_the_channel() -> Outcome {
     let e = channel(QUIET)?;
     let n = copy(&e, Rights::NOTIFY)?;
     HANDLES[0].store(c.raw().0, Relaxed);
-    give(&[e.raw()]);
+    give(&[e.into_raw()]);
     let t = spawn(0, handle_client, 0, HIGH, Policy::Fifo)?;
-    let got = sys::try_receive(&c);
-    let came = Handle::<Channel>::from_raw(rt::msgbuf::handle(0).0);
+    let mut got = sys::try_receive(&c);
+    let came = Handle::<Channel>::from_raw(came(&mut got)[0].0);
     let open = sys::notify(&n, 1);
     let heard = take_one(&came);
     close(came)?;
@@ -702,7 +708,7 @@ fn a_failed_check_takes_no_handle() -> Outcome {
     let [a, b] = good;
     let cases = [
         (STALE, &[a, b][..], 0, Error::BadHandle),
-        (init::PROCESS.raw(), &[a, b], 0, Error::WrongType),
+        (own().raw(), &[a, b], 0, Error::WrongType),
         (notify_only.raw(), &[a, b], 0, Error::AccessDenied),
         (c.raw(), &[a, b, held], 0, Error::AccessDenied),
         (c.raw(), &[a, b, STALE], 0, Error::BadHandle),
@@ -765,10 +771,10 @@ fn full_waiting_receiver_fails_the_sender() -> Outcome {
     let w = spawn(0, server, 0, LOW, Policy::Fifo)?;
     let_run()?;
     let sent: [abi::Handle; 4] = [
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
     ];
     let n = fill_table(3)?;
     let x = handle_regs(c.raw(), &sent, 0);
@@ -807,15 +813,15 @@ fn receiver_quota_fails_the_sender() -> Outcome {
     let w = spawn(0, server, 0, LOW, Policy::Fifo)?;
     let_run()?;
     let sent: [abi::Handle; 4] = [
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
     ];
     // A free place in init's pool of shells for the child below.
     close(child(LOW)?)?;
     let n = fill_to_a_page()?;
-    let own = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let own = sys::process_memory(&own()).map_err(|_| "PROCESS_MEMORY of init failed")?;
     let rest = (own.quota - own.returned - own.used) / PAGE as u64 * PAGE as u64;
     let hog = sys::process_create(rest, 16, LOW);
     let x = handle_regs(c.raw(), &sent, 0);
@@ -856,7 +862,7 @@ fn receiver_quota_fails_the_sender() -> Outcome {
 fn failed_create_keeps_the_start_handle() -> Outcome {
     let c = channel(QUIET)?;
     let exit = copy(&c, Rights::NOTIFY)?;
-    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let used = || sys::process_memory(&own()).map(|m| m.used);
     let before = used();
     let mut x = create_regs(exit.raw(), QUIET.into(), c.raw());
     x[0] = PAGE as u64;
@@ -895,16 +901,16 @@ fn failed_create_keeps_the_start_handle() -> Outcome {
 /// 126 more fill it and the second but for its last entry. Returns the
 /// copies, which `empty_table` closes; it closes them itself on a failure.
 fn fill_to_a_page() -> Result<usize, &'static str> {
-    let used = || sys::process_memory(&init::PROCESS).map(|m| m.used);
+    let used = || sys::process_memory(&own()).map(|m| m.used);
     let mut n = 0;
     let mut left = None;
     while left != Some(0) {
         let before = used();
-        let Ok(h) = sys::handle_duplicate(&init::RESOURCE, Rights::NONE) else {
+        let Ok(h) = sys::handle_duplicate(&resource(), Rights::NONE) else {
             empty_table(n)?;
             return Err("handle_duplicate failed");
         };
-        FILLED[n].store(h.raw().0, Relaxed);
+        FILLED[n].store(h.into_raw().0, Relaxed);
         n += 1;
         left = match left {
             Some(k) => Some(k - 1),
@@ -933,10 +939,10 @@ fn queued_request_that_does_not_fit_fails_its_sender() -> Outcome {
     HANDLES[0].store(named.raw().0, Relaxed);
     HANDLES[1].store(c.raw().0, Relaxed);
     let sent: [abi::Handle; 4] = [
-        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.raw(),
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.into_raw(),
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
     ];
     give(&sent);
     let first = spawn(0, handle_client, 0, LOW, Policy::Fifo)?;
@@ -996,10 +1002,10 @@ fn reply_that_does_not_fit_fails_both() -> Outcome {
         h.store(c.raw().0, Relaxed);
     }
     let sent: [abi::Handle; 4] = [
-        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.raw(),
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
-        copy_raw(&init::RESOURCE, Rights::TRANSFER)?,
+        session(&e, Rights::NOTIFY | Rights::TRANSFER, CLIENT_LABEL, QUIET)?.into_raw(),
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
+        copy_raw(&resource(), Rights::TRANSFER)?,
     ];
     let t = spawn(0, client, 0, HIGH, Policy::Fifo)?;
     let token = take_token(&c)?.raw();
@@ -1015,7 +1021,7 @@ fn reply_that_does_not_fit_fails_both() -> Outcome {
     give(&[]);
     let next = spawn(1, handle_client, 1, HIGH, Policy::Fifo)?;
     let moved = copy_raw(&e, Rights::NOTIFY | Rights::TRANSFER)?;
-    let replied = take_token(&c)?.reply_handles(&[], &[moved]);
+    let replied = reply_values(take_token(&c)?, &[], &[moved]);
     let came = result(1);
     let live = close_raw(abi::Handle(came[3])).is_ok();
     close(t)?;
@@ -1053,11 +1059,11 @@ const TRANSFERS: u64 = 1000;
 /// ends.
 extern "C" fn transfers(slot: u64) -> ! {
     let s = slot as usize;
-    let object = Handle::<Channel>::from_raw(abi::Handle(GIVEN[0].load(Relaxed)));
+    let object = Handle::<Channel>::borrowed(abi::Handle(GIVEN[0].load(Relaxed)));
     let mut code = 0;
     for _ in 0..TRANSFERS {
         let sent = sys::handle_duplicate(&object, Rights::NOTIFY | Rights::TRANSFER)
-            .and_then(|h| sys::send_handles(&handle(s), &[], &[h.raw()]));
+            .and_then(|h| sys::send_handles(&handle(s), &[], [h.erase()]).map_err(|r| r.error));
         if let Err(e) = sent {
             code = e.code();
             break;
@@ -1083,9 +1089,9 @@ fn closed_handle_stays_bad_after_many_transfers() -> Outcome {
     let mut first = None;
     let mut bad = true;
     for round in 0..TRANSFERS {
-        let got = sys::try_receive(&c);
-        let (h, _) = rt::msgbuf::handle(0);
-        let came = matches!(got, Ok(Received::Message { handles: 1, .. }));
+        let mut got = sys::try_receive(&c);
+        let (h, _) = came(&mut got)[0];
+        let came = matches!(&got, Ok(Received::Message { handles, .. }) if handles.len() == 1);
         let first = *first.get_or_insert(h);
         bad &= came
             && (round == 0) == (h == first)
@@ -1196,12 +1202,12 @@ extern "C" fn memory_client(slot: u64) -> ! {
         0,
     ];
     let bytes = abi::inline_bytes(&words);
-    match sys::send_handles(&handle(s), &bytes[..16], &handles[..n]) {
-        Ok(reply) => {
+    match send_values(&handle(s), &bytes[..16], &handles[..n]) {
+        Ok(mut reply) => {
             let mut w = [0; 12];
-            w[1] = reply.handles as u64;
-            if reply.handles > 0 {
-                let (h, (kind, rights)) = rt::msgbuf::handle(0);
+            w[1] = reply.handles.len() as u64;
+            if !reply.handles.is_empty() {
+                let (h, (kind, rights)) = values(&mut reply.handles)[0];
                 w[2] = h.0;
                 w[3] = abi::msgbuf::info(kind, rights);
             }
@@ -1235,7 +1241,7 @@ pub(crate) fn served(
     let kid = Kid::load(quota_of(role), 16, LEVEL)?;
     let asked = kid
         .start()
-        .and_then(|()| kid.serve(role, &[], &[Gift::Given(c.raw()), Gift::Own]))
+        .and_then(|()| kid.serve(role, &[], &[Gift::Given(c.into_raw()), Gift::Own]))
         .and_then(|()| spawn(0, memory_client, 0, HIGH, Policy::Fifo));
     // The child runs once init waits for its end.
     let state = kid.end();
@@ -1307,7 +1313,7 @@ fn memory_object_comes_back_in_a_reply() -> Outcome {
     let (reply, state) = served(Role::Provider, [child::SHARED_PAGES as u64, SEED], &[])?;
     let m = Handle::<Memory>::from_raw(abi::Handle(reply[2]));
     let args = [
-        init::PROCESS.raw().0,
+        own().raw().0,
         m.raw().0,
         0,
         SHARED_LEN,

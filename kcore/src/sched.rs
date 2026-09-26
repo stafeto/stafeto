@@ -1026,8 +1026,10 @@ mod tests {
         let qemu = Clock::new(62_500_000).unwrap();
         assert_eq!(qemu.ns_to_ticks(RR_QUANTUM_NS), Q);
         assert_eq!(qemu.ns_to_ticks(RR_QUANTUM_NS), 250_000);
+        // At 24 MHz the scale is under the exact division (abi::time), and
+        // 4 ms is reached a tick after 96 000.
         let a64 = Clock::new(24_000_000).unwrap();
-        assert_eq!(a64.ns_to_ticks(RR_QUANTUM_NS), 96_000);
+        assert_eq!(a64.ns_to_ticks(RR_QUANTUM_NS), 96_001);
     }
 
     /// Runs the ready threads to the end, highest first: the name of each

@@ -1,21 +1,23 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The runtime of stafeto programs, as small as milestone 1.3d needs it
-//! (spec 13.2): the entry point, handles typed by the kind of their object
-//! (`handle`, `init`), typed wrappers of the system calls the kernel has,
-//! requests and their tokens among them, and a raw call for any other
-//! (`sys`), the thread's message buffer (`msgbuf`), output through
-//! `debug_write`
-//! (`console`, `print!`, `println!`), the counter read without a call
-//! (`time`), the loader of programs of the boot image (`loader`), stacks
-//! for threads in static memory, and the panic handler. The heap, the
-//! start protocol and the service loop come in milestone 1.4, the ELF
-//! loader in milestone 4.
+//! The runtime of stafeto programs (spec 13.2): the entry point, handles
+//! typed by the kind of their object that own their entry of the table
+//! (`handle`), init's first handles, given once (`init_handles`), typed
+//! wrappers of the system calls the kernel has, requests and their tokens
+//! among them, and a raw call for any other (`sys`), the thread's message
+//! buffer (`msgbuf`), output through `debug_write` (`console`, `print!`,
+//! `println!`), the counter and the time scale of the system without a
+//! call (`time`), waits with a bound (`wait`), the start protocol on both
+//! sides (`startup`), the loop of a service with its sessions and its
+//! heartbeat (`service`), the loader of programs of the boot image, which
+//! starts them with their start data (`loader`), stacks for threads in
+//! static memory, and the panic handler.
 //!
-//! A program names its main function with `rt::entry!`; `_start` calls it
-//! with the x0 the kernel set and ends the process with the code it
-//! returns.
+//! A program names its main function with `rt::entry!`; `_start` keeps
+//! the x0 the kernel set, which tells init (0) from a program started with
+//! a start channel, calls `main` with it and ends the process with the
+//! code it returns.
 
 #![no_std]
 
@@ -24,35 +26,64 @@ pub mod handle;
 pub mod loader;
 pub mod mmio;
 pub mod msgbuf;
+pub mod service;
+pub mod startup;
 pub mod sys;
 pub mod time;
+pub mod wait;
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use abi;
 pub use handle::Handle;
+pub use startup::startup;
 
-/// Init's first handles (spec 13.3), typed. Each mention of a constant
-/// gives a new value: a program that closed one of these handles stops
-/// naming it itself.
-pub mod init {
-    use crate::handle::{Handle, Process, Resource, Thread};
+use handle::{Memory, Process, Resource, Thread};
 
+/// Init's first handles (spec 13.3), typed, which `init_handles` gives.
+pub struct InitHandles {
     /// The system resource with DEVICE, DEBUG, KSTATS, DUPLICATE and
     /// TRANSFER (abi::INIT_RESOURCE_RIGHTS).
-    pub const RESOURCE: Handle<Resource> = Handle::from_raw(abi::INIT_RESOURCE);
+    pub resource: Handle<Resource>,
     /// Init's own process, with the owner's rights.
-    pub const PROCESS: Handle<Process> = Handle::from_raw(abi::INIT_PROCESS);
+    pub process: Handle<Process>,
     /// Init's first thread, with the owner's rights.
-    pub const THREAD: Handle<Thread> = Handle::from_raw(abi::INIT_THREAD);
+    pub thread: Handle<Thread>,
+    /// The boot image, a memory object with abi::INIT_BOOT_IMAGE_RIGHTS.
+    pub boot_image: Handle<Memory>,
 }
 
-/// The first handle of a process that process_create made (spec 13.3):
-/// entry 0 of its table, where the start channel goes. As with `init`,
-/// each mention gives a new value, and a program that closed the handle
-/// stops naming it itself.
-pub const START_CHANNEL: Handle<handle::Channel> = Handle::from_raw(abi::START_CHANNEL);
+/// x0 of the program's first thread, which `_start` keeps (spec 13.3): 0
+/// in init, abi::START_CHANNEL in a program its parent started.
+static FIRST_X0: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the program's first handles went: init's (`init_handles`) or
+/// the start data of any other program (`startup`), one flag for both.
+static FIRST_TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// True once, at the first call of the program's own kind: `init` true in
+/// init (x0 of the first thread 0), false in a program started with a
+/// start channel. A call of the other kind leaves the flag as it was.
+pub(crate) fn first_handles(init: bool) -> bool {
+    (FIRST_X0.load(Ordering::Relaxed) == 0) == init && !FIRST_TAKEN.swap(true, Ordering::Relaxed)
+}
+
+/// Init's first handles (spec 13.3) at the first call, None at every
+/// call after it: each has one owner. Only init has them: in a program
+/// started with a start channel (x0 other than 0) the call gives None,
+/// and the program asks for its start data (`startup`) instead.
+pub fn init_handles() -> Option<InitHandles> {
+    if !first_handles(true) {
+        return None;
+    }
+    Some(InitHandles {
+        resource: Handle::from_raw(abi::INIT_RESOURCE),
+        process: Handle::from_raw(abi::INIT_PROCESS),
+        thread: Handle::from_raw(abi::INIT_THREAD),
+        boot_image: Handle::from_raw(abi::INIT_BOOT_IMAGE),
+    })
+}
 
 /// Names the program's main function, a `fn(u64) -> u64`: `_start` calls
 /// it with the x0 the program started with (0 for init, spec 13.3) and
@@ -108,6 +139,8 @@ extern "C" fn start(arg: u64) -> ! {
         /// The program's main function (`entry!`).
         fn __rt_main(arg: u64) -> u64;
     }
+    FIRST_X0.store(arg, Ordering::Relaxed);
+    time::init();
     // SAFETY: `entry!` defines the function with this signature.
     let code = unsafe { __rt_main(arg) };
     sys::process_exit(code)

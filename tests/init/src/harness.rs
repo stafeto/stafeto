@@ -1,26 +1,71 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! What the tests of every module share: the imports, the priorities and
-//! quotas of the tests, init's own threads and the checks (spec 15.2).
+//! What the tests of every module share: the imports, init's first
+//! handles, the priorities and quotas of the tests, init's own threads and
+//! the checks (spec 15.2).
 
 use crate::messages::record;
 use crate::timers::timer_at;
 pub(crate) use abi::{
-    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, ChannelInfo, Error, INIT_BOOT_IMAGE, IrqInfo,
-    MemoryInfo, OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
+    Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, ChannelInfo, Error, IrqInfo, MemoryInfo,
+    OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, Source,
     TRIGGER_EDGE, ThreadInfo, ThreadState, WINDOW_RIGHTS,
 };
 pub(crate) use bootimg::{Part, Program};
 pub(crate) use child::{Checked, Role, marked, x0_alone};
+pub(crate) use core::mem::ManuallyDrop;
 pub(crate) use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-pub(crate) use rt::handle::{Channel, Interrupt, Memory, Process, Thread, Timer};
-pub(crate) use rt::sys::{self, Received, Regs, Reply, Token};
-pub(crate) use rt::{Handle, Stack, init, loader, println, time};
+pub(crate) use rt::handle::{
+    Any, Channel, Incoming, Interrupt, Memory, Outgoing, Process, Resource, Thread, Timer,
+};
+pub(crate) use rt::sys::{self, Received, Refused, Regs, Reply, Token};
+pub(crate) use rt::{Handle, Stack, loader, println, time};
 
 pub(crate) type Outcome = Result<(), &'static str>;
+
 /// A test's name and body.
 pub(crate) type Test = (&'static str, fn() -> Outcome);
+
+/// The values of init's first handles (rt::init_handles), which `main`
+/// keeps for the whole run: the system resource, which the console owns,
+/// init's process, its first thread and the boot image.
+static INIT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Keeps init's first handles for the whole run; the resource goes to the
+/// console, which owns it from then on.
+pub(crate) fn keep(init: rt::InitHandles) {
+    INIT[0].store(init.resource.raw().0, Relaxed);
+    INIT[1].store(init.process.into_raw().0, Relaxed);
+    INIT[2].store(init.thread.into_raw().0, Relaxed);
+    INIT[3].store(init.boot_image.into_raw().0, Relaxed);
+    rt::console::set(init.resource);
+}
+
+fn kept<K>(i: usize) -> ManuallyDrop<Handle<K>> {
+    Handle::borrowed(abi::Handle(INIT[i].load(Relaxed)))
+}
+
+/// A view of the system resource with DEVICE, DEBUG, KSTATS, DUPLICATE and
+/// TRANSFER.
+pub(crate) fn resource() -> ManuallyDrop<Handle<Resource>> {
+    kept(0)
+}
+
+/// A view of init's own process.
+pub(crate) fn own() -> ManuallyDrop<Handle<Process>> {
+    kept(1)
+}
+
+/// A view of init's first thread, the one the tests run in.
+pub(crate) fn me() -> ManuallyDrop<Handle<Thread>> {
+    kept(2)
+}
+
+/// A view of the boot image.
+pub(crate) fn image() -> ManuallyDrop<Handle<Memory>> {
+    kept(3)
+}
 
 /// Counter ticks of the counted loop the run starts with (main.rs,
 /// `loop_ticks`).
@@ -93,10 +138,10 @@ pub(crate) fn close<K>(h: Handle<K>) -> Outcome {
     h.close().map_err(|_| "handle_close failed")
 }
 
-/// The same handle with another kind in its type, for a call that must
-/// fail with WRONG_TYPE.
-pub(crate) fn retyped<K, L>(h: &Handle<K>) -> Handle<L> {
-    Handle::from_raw(h.raw())
+/// A view of the same handle with another kind in its type, for a call
+/// that must fail with WRONG_TYPE.
+pub(crate) fn retyped<K, L>(h: &Handle<K>) -> ManuallyDrop<Handle<L>> {
+    Handle::borrowed(h.raw())
 }
 
 pub(crate) fn reset_marks() {
@@ -127,7 +172,7 @@ pub(crate) fn thread(
     // slot, so the stack is the thread's alone.
     let t = unsafe {
         sys::thread_create(
-            &init::PROCESS,
+            &own(),
             entry,
             STACKS[slot].top(),
             arg,
@@ -155,9 +200,8 @@ pub(crate) fn spawn(
 /// Lets every thread below init run until it ends: init lowers itself to
 /// 1 and, once it runs again, takes TEST_PRIORITY back.
 pub(crate) fn let_run() -> Outcome {
-    sys::thread_set_priority(&init::THREAD, 1, Policy::Fifo)
-        .map_err(|_| "init could not lower itself")?;
-    sys::thread_set_priority(&init::THREAD, TEST_PRIORITY, Policy::Fifo)
+    sys::thread_set_priority(&me(), 1, Policy::Fifo).map_err(|_| "init could not lower itself")?;
+    sys::thread_set_priority(&me(), TEST_PRIORITY, Policy::Fifo)
         .map_err(|_| "init could not take its priority back")
 }
 
@@ -196,7 +240,7 @@ pub(crate) extern "C" fn add_mark(i: u64) -> ! {
 /// The value of a copy of the system resource that init closed: BAD_HANDLE
 /// from then on (spec 5.1).
 pub(crate) fn closed_handle() -> Result<u64, &'static str> {
-    let h = copy(&init::RESOURCE, Rights::NONE)?;
+    let h = copy(&resource(), Rights::NONE)?;
     let value = h.raw().0;
     close(h)?;
     Ok(value)
@@ -204,8 +248,8 @@ pub(crate) fn closed_handle() -> Result<u64, &'static str> {
 
 /// Init's used memory, the free frames and the pages of kernel pools.
 pub(crate) fn counts() -> Result<(u64, u64, u64), &'static str> {
-    let used = sys::process_memory(&init::PROCESS).map_err(|_| "PROCESS_MEMORY of init failed")?;
-    let stats = sys::kernel_stats(&init::RESOURCE).map_err(|_| "KERNEL_STATS failed")?;
+    let used = sys::process_memory(&own()).map_err(|_| "PROCESS_MEMORY of init failed")?;
+    let stats = sys::kernel_stats(&resource()).map_err(|_| "KERNEL_STATS failed")?;
     Ok((used.used, stats.free_frames, stats.pool_pages))
 }
 
@@ -285,14 +329,14 @@ pub(crate) fn map(
     addr: usize,
     access: Access,
 ) -> Outcome {
-    sys::mem_map(&init::PROCESS, m, offset, len, addr, access).map_err(|_| "mem_map failed")
+    sys::mem_map(&own(), m, offset, len, addr, access).map_err(|_| "mem_map failed")
 }
 
 /// mem_unmap of the mapping of init that is `len` bytes from `addr`.
 pub(crate) fn unmap(addr: usize, len: u64) -> Outcome {
     // SAFETY: the tests unmap only their own windows, which nothing else
     // uses.
-    unsafe { sys::mem_unmap(&init::PROCESS, addr, len) }.map_err(|_| "mem_unmap failed")
+    unsafe { sys::mem_unmap(&own(), addr, len) }.map_err(|_| "mem_unmap failed")
 }
 
 /// Per slot: the handle the thread there uses (`client`, `server`), and
@@ -333,9 +377,9 @@ pub(crate) fn ended(slot: usize) -> bool {
     ENDED[slot].load(Relaxed) == 1
 }
 
-/// The channel handle that HANDLES holds for `slot`.
-pub(crate) fn handle(slot: usize) -> Handle<Channel> {
-    Handle::from_raw(abi::Handle(HANDLES[slot].load(Relaxed)))
+/// A view of the channel handle that HANDLES holds for `slot`.
+pub(crate) fn handle(slot: usize) -> ManuallyDrop<Handle<Channel>> {
+    Handle::borrowed(abi::Handle(HANDLES[slot].load(Relaxed)))
 }
 
 /// The 16 bytes the client in `slot` sends.
@@ -364,4 +408,68 @@ pub(crate) extern "C" fn client(slot: u64) -> ! {
     }
     ENDED[s].store(1, Relaxed);
     sys::thread_exit()
+}
+
+/// `raw`, at most four values the caller holds, as a set of handles that
+/// owns them; INVALID_ARGS for more.
+fn owning(raw: &[abi::Handle]) -> Result<Outgoing, Error> {
+    if raw.len() > abi::MESSAGE_HANDLES {
+        return Err(Error::InvalidArgs);
+    }
+    let mut set = Outgoing::new();
+    for &h in raw {
+        // At most four, as checked above.
+        let _ = set.push(Handle::from_raw(h));
+    }
+    Ok(set)
+}
+
+/// The error of a refused send or reply; the handles that came back are
+/// the caller's values again.
+fn kept_back(refused: Refused) -> Error {
+    if let Some(mut back) = refused.back {
+        while let Some(h) = back.pop() {
+            h.into_raw();
+        }
+    }
+    refused.error
+}
+
+/// sys::send_handles with the values `raw`, at most four, which the caller
+/// holds; the values the kernel leaves (abi::Error::keeps_handles) stay the
+/// caller's. More than four fail with INVALID_ARGS.
+pub(crate) fn send_values(
+    c: &Handle<Channel>,
+    bytes: &[u8],
+    raw: &[abi::Handle],
+) -> Result<Reply, Error> {
+    sys::send_handles(c, bytes, owning(raw)?).map_err(kept_back)
+}
+
+/// Token::reply_handles with the values `raw`, as `send_values`.
+pub(crate) fn reply_values(t: Token, bytes: &[u8], raw: &[abi::Handle]) -> Result<(), Error> {
+    t.reply_handles(bytes, owning(raw)?).map_err(kept_back)
+}
+
+/// The handles that came in `handles` as values the caller holds from now
+/// on, each with the kind of its object and its rights, as msgbuf::handle
+/// gives them; abi::Handle::INVALID past their count.
+pub(crate) fn values(handles: &mut Incoming) -> [(abi::Handle, (abi::ObjectKind, Rights)); 4] {
+    core::array::from_fn(|i| match (handles.info(i), handles.take_any(i)) {
+        (Some(info), Ok(h)) => (h.into_raw(), info),
+        _ => (
+            abi::Handle::INVALID,
+            (abi::ObjectKind::Unknown(0), Rights::NONE),
+        ),
+    })
+}
+
+/// `values` of the handles of the message `got` took, if it took one.
+pub(crate) fn came(
+    got: &mut Result<Received, Error>,
+) -> [(abi::Handle, (abi::ObjectKind, Rights)); 4] {
+    match got {
+        Ok(Received::Message { handles, .. }) => values(handles),
+        _ => values(&mut Incoming::none()),
+    }
 }

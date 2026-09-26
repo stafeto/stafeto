@@ -3,7 +3,6 @@
 
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
-mod elf;
 mod image;
 mod qemu;
 
@@ -30,6 +29,11 @@ const TEST_PROGRAMS: [(&str, &str, u32); 2] = [
     ("init", "test-init", INIT_STACK_SIZE),
     ("child", "test-child", CHILD_STACK_SIZE),
 ];
+/// The profiles the programs of those boot images build with (spec 5.4,
+/// 15.2): the image that ships with `--release`, the test images with
+/// `checked`, the strict build of rt.
+const BOOT_PROFILE: Profile = Profile::Release;
+const TEST_PROFILE: Profile = Profile::Checked;
 /// Spec 3.4: the kernel image file stays under 200 KB: the build that
 /// ships and the probes built from it.
 const KERNEL_LIMIT: u64 = 200 * 1024;
@@ -123,12 +127,15 @@ const HVF_HZ: u64 = 24_000_000;
 /// each whole: a formatted line longer than one debug_write, all 64 bytes
 /// of x2-x9 in one debug_write, the bytes of a debug_write's length and no
 /// more, and the kernel's line for the fault of a child with no code (spec
-/// 7.9, 15.2).
-const TEST_INIT_LINES: [&str; 4] = [
+/// 7.9, 15.2), and the panics of the strict children on BAD_HANDLE, which
+/// name the call (spec 5.4).
+const TEST_INIT_LINES: [&str; 6] = [
     "init prints from EL0 in pieces of at most 64 bytes: this line takes 2 of them",
     "test init: debug_write prints all 64 bytes of x2 to x9 in order",
     "debug_write stops at its length",
     "process fault: instruction abort from EL0 (EC 0x20) ESR=0x82000007 FAR=0x1000 ELR=0x1000",
+    "BAD_HANDLE from Notify",
+    "BAD_HANDLE from HandleClose",
 ];
 /// The children of the test init that fault, each with a line of the
 /// kernel (spec 7.9): the child with no code of
@@ -166,10 +173,37 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 179;
+const INIT_TESTS: u32 = 214;
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
+
+/// A cargo profile of the programs of a boot image: `release`, or
+/// `checked`, release with debug assertions (Cargo.toml), where BAD_HANDLE
+/// from a typed call of rt or a drop panics (spec 5.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Profile {
+    Release,
+    Checked,
+}
+
+impl Profile {
+    /// The arguments of `cargo build` that pick the profile.
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Profile::Release => &["--release"],
+            Profile::Checked => &["--profile", "checked"],
+        }
+    }
+
+    /// The directory of its builds under target_dir() and a triple.
+    fn dir(self) -> &'static str {
+        match self {
+            Profile::Release => "release",
+            Profile::Checked => "checked",
+        }
+    }
+}
 
 /// Kernel builds xtask makes; each keeps its own ELF and image under target_dir().
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,10 +308,10 @@ fn target_dir_of(var: Option<OsString>, root: &Path) -> PathBuf {
     root.join(var.unwrap_or_else(|| "target".into()))
 }
 
-/// The file cargo builds for `package` on `triple` with `--release`
-/// under the directory `target`.
-fn cargo_output(target: &Path, triple: &str, package: &str) -> PathBuf {
-    target.join(triple).join("release").join(package)
+/// The file cargo builds for `package` on `triple` with `profile` under
+/// the directory `target`.
+fn cargo_output(target: &Path, triple: &str, profile: Profile, package: &str) -> PathBuf {
+    target.join(triple).join(profile.dir()).join(package)
 }
 
 /// What `make` gives for `key`: made at the first call for `key` in this
@@ -354,7 +388,11 @@ struct Artifacts {
 static BUILDS: Mutex<Vec<(Variant, Artifacts)>> = Mutex::new(Vec::new());
 /// A boot image name with the programs it names: the name stands for its
 /// programs, so a cache keyed on both never returns another list's image.
-type BootImageKey = (&'static str, &'static [(&'static str, &'static str, u32)]);
+type BootImageKey = (
+    &'static str,
+    &'static [(&'static str, &'static str, u32)],
+    Profile,
+);
 /// The boot images of this run of xtask, one per name and program list.
 static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new());
 
@@ -384,7 +422,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     // keeps the symbols that match it.
     let elf = target.join(format!("{}.elf", variant.stem()));
     let image = target.join(format!("{}.img", variant.stem()));
-    let built = cargo_output(&target, KERNEL_TARGET, "kernel");
+    let built = cargo_output(&target, KERNEL_TARGET, Profile::Release, "kernel");
     std::fs::copy(&built, &elf)
         .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
     run_cmd(
@@ -397,7 +435,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let (limit, source) = variant.limit();
     image::check_size(bytes.len() as u64, limit)?;
-    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS)?;
+    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?;
     println!(
         "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),
@@ -410,22 +448,28 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     })
 }
 
-/// Builds `programs` for EL0 and, under target_dir, a boot image `name`
-/// whose files they are, in their order, each with its name and the stack
-/// size its header asks for (spec 3.3, 13.1); once in a run of xtask for
-/// this `(name, programs)` pair.
+/// Builds `programs` for EL0 with `profile` and, under target_dir, a boot
+/// image `name` whose files they are, in their order, each with its name
+/// and the stack size its header asks for (spec 3.3, 13.1); once in a run
+/// of xtask for this `(name, programs, profile)`.
 fn build_boot_image(
     name: &'static str,
     programs: &'static [(&'static str, &'static str, u32)],
+    profile: Profile,
 ) -> Result<PathBuf, String> {
-    once(&BOOT_IMAGES, (name, programs), || {
-        write_boot_image(name, programs)
+    once(&BOOT_IMAGES, (name, programs, profile), || {
+        write_boot_image(name, programs, profile)
     })
 }
 
-fn write_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
+fn write_boot_image(
+    name: &str,
+    programs: &[(&str, &str, u32)],
+    profile: Profile,
+) -> Result<PathBuf, String> {
     let mut cmd = cargo();
-    cmd.args(["build", "--release", "--target", PROGRAM_TARGET]);
+    cmd.arg("build").args(profile.args());
+    cmd.args(["--target", PROGRAM_TARGET]);
     for (_, package, _) in programs {
         cmd.args(["--package", package]);
     }
@@ -433,10 +477,10 @@ fn write_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBu
     let target = target_dir();
     let mut files = Vec::new();
     for &(file, package, stack) in programs {
-        let elf = cargo_output(&target, PROGRAM_TARGET, package);
+        let elf = cargo_output(&target, PROGRAM_TARGET, profile, package);
         let why = |e: String| format!("{}: {e}", elf.display());
         let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
-        let program = elf::program(&bytes, stack).map_err(why)?;
+        let program = bootimg::elf::program(&bytes, stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
         files.push((file, written, elf));
     }
@@ -541,6 +585,8 @@ fn test() -> Result<(), String> {
     fault_report()?;
     stack_overflow_report()?;
     test_build_carries_test_symbols()?;
+    strict_panic_only_in_checked_programs()?;
+    no_u128_division_is_linked()?;
     init_tests(&qemu::VIRT, false)?;
     init_tests(&qemu::VIRT_2G, false)?;
     init_tests(&qemu::VIRT, true)?;
@@ -564,6 +610,10 @@ fn host_tests() -> Result<(), String> {
         "bootimg",
         "--package",
         "kcore",
+        "--package",
+        "proto-init",
+        "--package",
+        "proto-wire",
         "--package",
         "xtask",
     ]))
@@ -847,6 +897,92 @@ fn test_build_carries_test_symbols() -> Result<(), String> {
     }
 }
 
+/// The ELF files of the programs of the boot image that ships and of the
+/// test images, each with the profile of its image, built.
+fn program_elfs() -> Result<Vec<(PathBuf, Profile)>, String> {
+    let target = target_dir();
+    let mut elfs = Vec::new();
+    for (name, programs, profile) in [
+        ("boot.img", &BOOT_PROGRAMS[..], BOOT_PROFILE),
+        ("boot-test.img", &TEST_PROGRAMS[..], TEST_PROFILE),
+    ] {
+        build_boot_image(name, programs, profile)?;
+        for (_, package, _) in programs {
+            let elf = cargo_output(&target, PROGRAM_TARGET, profile, package);
+            elfs.push((elf, profile));
+        }
+    }
+    Ok(elfs)
+}
+
+/// The start of the panic of rt on BAD_HANDLE (rt::sys), which a program
+/// carries only when it links that panic.
+const STRICT_PANIC: &[u8] = b"BAD_HANDLE from";
+
+/// Spec 5.4: every program of the test images, built with `checked`,
+/// carries the panic on BAD_HANDLE, and no program of the boot image that
+/// ships, built with `--release`, does: there the code comes back.
+fn strict_panic_only_in_checked_programs() -> Result<(), String> {
+    let elfs = program_elfs()?;
+    for (elf, profile) in &elfs {
+        let bytes = std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+        let strict = bytes.windows(STRICT_PANIC.len()).any(|w| w == STRICT_PANIC);
+        if strict != (*profile == Profile::Checked) {
+            return Err(format!(
+                "{} of the profile {} {} the panic on BAD_HANDLE",
+                elf.display(),
+                profile.dir(),
+                if strict { "carries" } else { "lacks" }
+            ));
+        }
+    }
+    println!(
+        "the panic on BAD_HANDLE in the checked programs alone, {} ELF files",
+        elfs.len()
+    );
+    Ok(())
+}
+
+/// The library calls of a 128-bit division, unsigned and signed, which
+/// the time scale leaves out of the kernel and the programs (spec 10,
+/// abi::time::Scale).
+const U128_DIVISION: [&str; 4] = ["__udivti3", "__umodti3", "__divti3", "__modti3"];
+
+/// Which of U128_DIVISION the symbols `nm` listed define.
+fn u128_division(nm: &str) -> Vec<&'static str> {
+    U128_DIVISION
+        .into_iter()
+        .filter(|name| {
+            nm.lines()
+                .any(|l| l.split_whitespace().last() == Some(name))
+        })
+        .collect()
+}
+
+/// Spec 10: ticks and nanoseconds convert by a multiply and a shift, so
+/// neither the ELF of the normal kernel nor any program of the two boot
+/// images, each of its own profile (program_elfs), links a 128-bit
+/// division.
+fn no_u128_division_is_linked() -> Result<(), String> {
+    let programs = program_elfs()?.into_iter().map(|(elf, _)| elf);
+    let elfs: Vec<_> = [build(Variant::Normal)?.elf]
+        .into_iter()
+        .chain(programs)
+        .collect();
+    for elf in &elfs {
+        let found = u128_division(&nm_defined(elf)?);
+        if !found.is_empty() {
+            return Err(format!(
+                "{} links a 128-bit division: {}",
+                elf.display(),
+                found.join(", ")
+            ));
+        }
+    }
+    println!("no 128-bit division in {} ELF files", elfs.len());
+    Ok(())
+}
+
 /// A kernel that recurses without end must report the overflow from the
 /// emergency stack and power off: the report names the real ELR inside the
 /// recursive function, and its backtrace goes on into the recursion on the
@@ -966,7 +1102,7 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// number of tests that passed.
 fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     let a = build(Variant::Normal)?;
-    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS)?;
+    let image = build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     if icount {
@@ -1106,6 +1242,10 @@ fn ci() -> Result<(), String> {
         "--package",
         "kcore",
         "--package",
+        "proto-init",
+        "--package",
+        "proto-wire",
+        "--package",
         "xtask",
         "--all-targets",
         "--",
@@ -1128,6 +1268,10 @@ fn ci() -> Result<(), String> {
     ]))?;
     run_cmd(cargo().args([
         "clippy",
+        "--package",
+        "proto-init",
+        "--package",
+        "proto-wire",
         "--package",
         "rt",
         "--package",
@@ -1257,10 +1401,71 @@ mod tests {
             cargo_output(
                 &target_dir_of(Some("/t".into()), root),
                 KERNEL_TARGET,
+                Profile::Release,
                 "kernel"
             ),
             Path::new("/t/aarch64-unknown-none-softfloat/release/kernel")
         );
+    }
+
+    /// The lines of the section `[profile.NAME]` of the workspace's
+    /// Cargo.toml, up to the next section.
+    fn profile_section(name: &str) -> Vec<String> {
+        let toml = std::fs::read_to_string(root().join("Cargo.toml")).expect("Cargo.toml");
+        let head = format!("[profile.{name}]");
+        toml.lines()
+            .skip_while(|l| *l != head)
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Spec 5.4, 15.2: the programs of the test images build with the
+    /// profile `checked`, release with debug assertions, where rt is
+    /// strict; cargo writes them under checked/.
+    #[test]
+    fn test_images_build_with_the_checked_profile() {
+        assert_eq!(TEST_PROFILE.args(), ["--profile", "checked"]);
+        assert_eq!(
+            cargo_output(Path::new("/t"), PROGRAM_TARGET, TEST_PROFILE, "test-init"),
+            Path::new("/t/aarch64-unknown-none/checked/test-init")
+        );
+        let checked = profile_section("checked");
+        for line in ["inherits = \"release\"", "debug-assertions = true"] {
+            assert!(
+                checked.iter().any(|l| l == line),
+                "[profile.checked] has no line {line}"
+            );
+        }
+    }
+
+    /// Spec 5.4: the boot image that ships builds with `--release`, whose
+    /// profile keeps debug assertions off; that its programs carry no
+    /// panic on BAD_HANDLE, the step strict_panic_only_in_checked_programs
+    /// checks on the ELF files.
+    #[test]
+    fn normal_image_builds_without_checks() {
+        assert_eq!(BOOT_PROFILE.args(), ["--release"]);
+        assert!(
+            !profile_section("release")
+                .iter()
+                .any(|l| l.starts_with("debug-assertions")),
+            "[profile.release] sets debug-assertions"
+        );
+    }
+
+    /// `u128_division` finds the symbols of a 128-bit division in the
+    /// lines `llvm-nm -C --defined-only` prints, and nothing in others.
+    #[test]
+    fn u128_division_is_found_by_its_symbols() {
+        let nm = "ffffffffc001d3b8 t __udivti3\n0000000000201000 T _start\n";
+        assert_eq!(u128_division(nm), ["__udivti3"]);
+        assert!(u128_division("0000000000201000 T __umodti3_like\n").is_empty());
+        let both = "1 T __umodti3\n2 t __udivti3\n";
+        assert_eq!(u128_division(both), ["__udivti3", "__umodti3"]);
+        let signed = "1 T __modti3\n2 t __divti3\n";
+        assert_eq!(u128_division(signed), ["__divti3", "__modti3"]);
     }
 
     /// `once` calls `make` at most once for a key: a second call with the
