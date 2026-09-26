@@ -22,6 +22,7 @@ use crate::mm::phys;
 use crate::mm::phys::LinearMem;
 use crate::object::Object;
 use crate::process::Stage;
+use crate::thread::Long;
 use crate::{process, sched, session, thread, timer as timers};
 use abi::{Access, Error, Policy, ProcessState, Rights};
 use core::ptr::NonNull;
@@ -1909,49 +1910,92 @@ fn buffers_stage_counts_the_handles(_: &Boot) -> Result<(), &'static str> {
         (process::in_use(), thread::in_use(), channel::in_use()) == (processes, threads, channels),
         "the process, its threads or the channel of their handles stayed",
     )?;
-    bare_buffers_take_two_units(LEVEL)
+    bare_buffers_take_two_units(LEVEL)?;
+    long_calls_take_a_unit_more(LEVEL)
 }
 
 /// Threads with a buffer and no handle on their way, one more than a
 /// portion of the stage Buffers takes: two units of work each.
 const BARE: usize = BUFFERS_PER_PORTION + 1;
 const BUFFERS_PER_PORTION: usize = 32;
+/// Threads in the middle of a long call, with a buffer and no handle on
+/// their way, one more than a portion of the stage Buffers takes: three
+/// units of work each, the frame two and the call one.
+const CALLERS: usize = CALLERS_PER_PORTION + 1;
+const CALLERS_PER_PORTION: usize = 21;
 
 /// The first portion of the stage Buffers of BARE threads with no handles
 /// gives back BUFFERS_PER_PORTION buffers, a frame two units of its 64,
 /// and the second the last one (spec 7.7).
 fn bare_buffers_take_two_units(level: u8) -> Result<(), &'static str> {
+    buffers_in_two_portions(level, BARE, BUFFERS_PER_PORTION, false)
+}
+
+/// The first portion of the stage Buffers of CALLERS threads, each in the
+/// middle of a mem_create, gives back CALLERS_PER_PORTION buffers, a frame
+/// two units of its 64 and the call one, and the second the last one; the
+/// objects the calls held go with them (spec 7.7).
+fn long_calls_take_a_unit_more(level: u8) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    buffers_in_two_portions(level, CALLERS, CALLERS_PER_PORTION, true)?;
+    check(
+        memory::in_use() == objects,
+        "the objects of the long calls stayed",
+    )
+}
+
+/// `count` threads of a process, at most BARE, each with a buffer and no
+/// handle on its way, and with `long` each in the middle of a mem_create
+/// of 2 * memory::CREATE_PORTION pages, as its first portion leaves it:
+/// the first portion of the stage Buffers of the process's end gives back
+/// `first` buffers, and the second the last one.
+fn buffers_in_two_portions(
+    level: u8,
+    count: usize,
+    first: usize,
+    long: bool,
+) -> Result<(), &'static str> {
     let (processes, threads) = (process::in_use(), thread::in_use());
     let p = process::create_root(QUOTA, 16, 63).map_err(|_| "no process")?;
-    let mut bare = [None; BARE];
-    let made = bare.iter_mut().enumerate().try_for_each(|(i, slot)| {
-        let t =
-            thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
-        *slot = Some(t);
-        thread::give_buffer(t, USER_VA + (i + 1) * PAGE).map_err(|_| "no buffer")
-    });
-    let result = made.and_then(|()| {
-        // SAFETY: the test holds a reference to the process.
-        unsafe { process::end(p, ProcessState::Killed, level) };
-        for _ in 0..64 {
-            if process::progress(p).0 == Stage::Buffers {
-                break;
+    let mut made = [None; BARE];
+    let result = made[..count]
+        .iter_mut()
+        .enumerate()
+        .try_for_each(|(i, slot)| {
+            let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            *slot = Some(t);
+            thread::give_buffer(t, USER_VA + (i + 1) * PAGE).map_err(|_| "no buffer")?;
+            if long {
+                let m = memory::create(p, 2 * memory::CREATE_PORTION)
+                    .map_err(|_| "no memory object")?;
+                thread::begin_long(t, Long::Create(m));
+                check(!memory::fill(m), "a portion of mem_create made 16 pages")?;
             }
+            Ok(())
+        })
+        .and_then(|()| {
+            // SAFETY: the test holds a reference to the process.
+            unsafe { process::end(p, ProcessState::Killed, level) };
+            for _ in 0..64 {
+                if process::progress(p).0 == Stage::Buffers {
+                    break;
+                }
+                cleanup::portion();
+            }
+            let frames = phys::free_frames();
             cleanup::portion();
-        }
-        let frames = phys::free_frames();
-        cleanup::portion();
-        let first = phys::free_frames() - frames;
-        cleanup::portion();
-        let second = phys::free_frames() - frames - first;
-        check(
-            first == BUFFERS_PER_PORTION as u64 && second == 1,
-            "a portion of the stage Buffers did not give 32 buffers with no handles back",
-        )
-    });
+            let given = phys::free_frames() - frames;
+            cleanup::portion();
+            let then = phys::free_frames() - frames - given;
+            check(
+                given == first as u64 && then == 1,
+                "a portion of the stage Buffers did not give back the buffers whose units fit",
+            )
+        });
     // SAFETY: the test's references go, and nothing uses them afterwards.
     unsafe {
-        for t in bare.into_iter().flatten() {
+        for t in made.into_iter().flatten() {
             sched::exit(t, CAUSE);
             thread::release(t, CAUSE);
         }
