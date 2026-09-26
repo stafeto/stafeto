@@ -80,7 +80,7 @@ pub fn create(
         payer,
         cleanup: Item::new(),
     };
-    let s = process::session_slot(payer, session).inspect_err(|_| channel::remove_source(c))?;
+    let s = process::paid_alloc(payer, session).inspect_err(|_| channel::remove_source(c))?;
     // SAFETY: the session was just made, nothing else refers to it, and its
     // slot is in no queue.
     unsafe { (*s.as_ptr()).slot = Slot::new(priority, Owner::Session(s)) };
@@ -220,7 +220,7 @@ pub unsafe fn clean(s: NonNull<Session>, level: u8) {
     // SAFETY: nothing uses the session afterwards; the payer's pool is
     // there, since the session holds the payer's shell.
     unsafe {
-        process::free_session_slot(payer, s);
+        process::paid_free(payer, s);
         LIVE.gone(s);
     }
     // SAFETY: the session's references to its channel and to its payer's

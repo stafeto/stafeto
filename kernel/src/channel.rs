@@ -253,7 +253,7 @@ pub fn create(payer: NonNull<Process>, priority: u8) -> Result<NonNull<Channel>,
         payer,
         cleanup: Item::new(),
     };
-    let c = process::channel_slot(payer, channel)?;
+    let c = process::paid_alloc(payer, channel)?;
     process::retain_shell(payer);
     LIVE.made();
     Ok(c)
@@ -1155,7 +1155,7 @@ unsafe fn free(c: NonNull<Channel>, level: u8) {
     // SAFETY: nothing uses the channel afterwards; the payer's pool is
     // there, since the channel holds the payer's shell.
     unsafe {
-        process::free_channel_slot(payer, c);
+        process::paid_free(payer, c);
         LIVE.gone(c);
     }
     // SAFETY: the channel's reference to its payer's shell goes with it.

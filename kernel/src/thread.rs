@@ -189,7 +189,7 @@ pub fn create(
         refs: Refs::one(),
         cleanup: Item::new(),
     };
-    let thread = process::thread_slot(process, thread)?;
+    let thread = process::paid_alloc(process, thread)?;
     let index = sched::locked(|k| k.tokens.alloc(thread)).expect("a free thread number went");
     // SAFETY: the thread was just made, nothing else refers to it, and its
     // slot is in no queue.
@@ -486,7 +486,7 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
         drop_buffer(thread, level);
         sched::locked(|k| give_number(thread, k.tokens));
         process::remove_thread(process, thread);
-        process::free_thread_slot(process, thread);
+        process::paid_free(process, thread);
         LIVE.gone(thread);
     }
     // SAFETY: the thread's reference to its process goes with it.

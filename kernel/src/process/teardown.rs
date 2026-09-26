@@ -556,7 +556,7 @@ unsafe fn free(process: NonNull<Process>, level: u8) {
     // the parent's pool is there, since the shell holds the parent's.
     unsafe {
         match parent {
-            Some(parent) => (*parent.as_ptr()).pools.children.free(process),
+            Some(parent) => paid_free(parent, process),
             None => ROOTS.lock().free(process),
         }
         LIVE.gone(process);

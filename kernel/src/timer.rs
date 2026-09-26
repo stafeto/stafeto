@@ -115,7 +115,7 @@ pub fn create(
         dying: false,
         cleanup: Item::new(),
     };
-    let t = process::timer_slot(payer, timer).inspect_err(|_| channel::remove_source(c))?;
+    let t = process::paid_alloc(payer, timer).inspect_err(|_| channel::remove_source(c))?;
     // SAFETY: the timer was just made, nothing else refers to it, and its
     // slot is in no queue.
     unsafe { (*t.as_ptr()).slot = Slot::new(priority, Owner::Timer(t)) };
@@ -300,7 +300,7 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
     // SAFETY: nothing uses the timer afterwards; the payer's pool is there,
     // since the timer holds the payer's shell.
     unsafe {
-        process::free_timer_slot(payer, t);
+        process::paid_free(payer, t);
         LIVE.gone(t);
     }
     // SAFETY: the timer's references to its channel and to its payer's

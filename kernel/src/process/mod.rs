@@ -111,8 +111,6 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
-    /// Timers in its pool of timers, at most abi::MAX_TIMERS (spec 10).
-    timer_count: u32,
     /// The process that made it (process_create, `create_child`), whose
     /// shell it holds until its own shell goes (`shell_refs`) and which its
     /// quota came from; None for init and the other processes `create`
@@ -161,7 +159,7 @@ const _: () = assert!(Pool::<Process>::PER_PAGE >= 2);
 /// nothing, and the pages go back only with the process's shell. Every
 /// object in them holds a reference to the process or to its shell, so by
 /// then they hold nothing.
-struct Pools {
+pub struct Pools {
     /// Its threads, whoever made them.
     threads: Pool<Thread>,
     /// The chunks and the directory of its handle table.
@@ -172,7 +170,7 @@ struct Pools {
     channels: Pool<Channel>,
     /// The sessions of the labels it gave (handle_duplicate).
     sessions: Pool<Session>,
-    /// The timers it made.
+    /// The timers it made, at most abi::MAX_TIMERS (spec 10).
     timers: Pool<Timer>,
 }
 
@@ -345,7 +343,6 @@ fn create(
         life: Life::new(),
         threads: None,
         thread_count: 0,
-        timer_count: 0,
         parent: None,
         children: None,
         child_siblings: None,
@@ -360,7 +357,7 @@ fn create(
     let allocated = match payer {
         // SAFETY: the caller holds a reference to the payer; the new
         // process is no field of it.
-        Some(payer) => unsafe { paid_slot(payer, |pools| &mut pools.children, process) },
+        Some(payer) => unsafe { paid_slot(payer, process) },
         None => ROOTS.lock().alloc(&mut KernelPages, process),
     };
     let process = allocated.map_err(|mut process| {
@@ -372,22 +369,78 @@ fn create(
     Ok(process)
 }
 
-/// Puts `value` in a slot of the pool `pool` picks among those of `payer`,
+/// Puts `value` in a slot of the pool of its kind among those of `payer`,
 /// whose quota pays for a page when the pool grows (spec 7.8); gives the
 /// value back when the quota falls short.
 ///
 /// # Safety
 /// `payer` is alive, and nothing else borrows its pools, its quota or its
 /// page log meanwhile.
-unsafe fn paid_slot<T>(
-    payer: NonNull<Process>,
-    pool: impl FnOnce(&mut Pools) -> &mut Pool<T>,
-    value: T,
-) -> Result<NonNull<T>, T> {
+unsafe fn paid_slot<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<T>, T> {
     let p = payer.as_ptr();
     // SAFETY: the caller's promise; only these fields are borrowed.
     let (pools, quota, log) = unsafe { (&mut (*p).pools, &mut (*p).quota, &mut (*p).pages) };
-    pool(pools).alloc(&mut PaidPages::new(KernelPages, quota, log), value)
+    T::pool(pools).alloc(&mut PaidPages::new(KernelPages, quota, log), value)
+}
+
+/// A kind of object a process pays for by the page (spec 7.5, 7.8): it
+/// names its pool among the payer's. The pages go back with the payer's
+/// shell (Stage::Shell), so a kind needs no stage of its own.
+pub trait Paid: Sized {
+    fn pool(pools: &mut Pools) -> &mut Pool<Self>;
+}
+
+impl Paid for Thread {
+    fn pool(pools: &mut Pools) -> &mut Pool<Thread> {
+        &mut pools.threads
+    }
+}
+
+impl Paid for Process {
+    fn pool(pools: &mut Pools) -> &mut Pool<Process> {
+        &mut pools.children
+    }
+}
+
+impl Paid for Channel {
+    fn pool(pools: &mut Pools) -> &mut Pool<Channel> {
+        &mut pools.channels
+    }
+}
+
+impl Paid for Session {
+    fn pool(pools: &mut Pools) -> &mut Pool<Session> {
+        &mut pools.sessions
+    }
+}
+
+impl Paid for Timer {
+    fn pool(pools: &mut Pools) -> &mut Pool<Timer> {
+        &mut pools.timers
+    }
+}
+
+/// A place for `value`, an object that `payer` makes (thread::create,
+/// channel::create, session::create, timer::create), in the payer's pool
+/// of its kind, whose quota pays for a page when the pool grows (spec 7.5,
+/// 7.8). NO_MEMORY when the quota falls short.
+pub fn paid_alloc<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<T>, Error> {
+    // SAFETY: the caller holds a reference to the payer; the value is no
+    // field of it.
+    unsafe { paid_slot(payer, value) }.map_err(|_| Error::NoMemory)
+}
+
+/// Gives the place of `object`, which goes (its kind's `clean`, or the
+/// last portion of a child's shell), back to the payer's pool of its kind,
+/// where its page stays paid until the payer's shell goes.
+///
+/// # Safety
+/// `object` came from the pool of `payer` (`paid_alloc`, or `create` for a
+/// child's shell), and the payer is alive: the object holds the payer's
+/// shell, or it is a thread of the payer. Nothing uses it afterwards.
+pub unsafe fn paid_free<T: Paid>(payer: NonNull<Process>, object: NonNull<T>) {
+    // SAFETY: the caller's promise; only the pool is touched.
+    unsafe { T::pool(&mut (*payer.as_ptr()).pools).free(object) }
 }
 
 /// Init's process, as `create` makes one (spec 7.5, 13.3): outside the
@@ -779,115 +832,15 @@ pub unsafe fn remove_thread(process: NonNull<Process>, t: NonNull<Thread>) {
     }
 }
 
-/// A slot for `thread`, a new thread of `process` (thread::create), in the
-/// process's pool of threads, whose quota pays for a page when the pool
-/// grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
-pub fn thread_slot(process: NonNull<Process>, thread: Thread) -> Result<NonNull<Thread>, Error> {
-    // SAFETY: the caller holds a reference to the process; the thread is
-    // no field of it.
-    unsafe { paid_slot(process, |pools| &mut pools.threads, thread) }.map_err(|_| Error::NoMemory)
-}
-
-/// Gives the slot of `t`, a thread of `process` that goes (thread::clean),
-/// back to the process's pool of threads, where its page stays paid until
-/// the process's shell goes.
-///
-/// # Safety
-/// `t` came from `thread_slot` of `process`, which is alive, and nothing
-/// uses it afterwards.
-pub unsafe fn free_thread_slot(process: NonNull<Process>, t: NonNull<Thread>) {
-    // SAFETY: the caller's promise; only the pool is touched.
-    unsafe { (*process.as_ptr()).pools.threads.free(t) }
-}
-
-/// A slot for `channel`, a new channel of `process` (channel::create), in
-/// the process's pool of channels, whose quota pays for a page when the
-/// pool grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
-pub fn channel_slot(
-    process: NonNull<Process>,
-    channel: Channel,
-) -> Result<NonNull<Channel>, Error> {
-    // SAFETY: the caller holds a reference to the process; the channel is
-    // no field of it.
-    unsafe { paid_slot(process, |pools| &mut pools.channels, channel) }.map_err(|_| Error::NoMemory)
-}
-
-/// Gives the slot of `c`, a channel that `process` paid for and that goes
-/// (channel::clean), back to the process's pool of channels, where its
-/// page stays paid until the process's shell goes.
-///
-/// # Safety
-/// `c` came from `channel_slot` of `process`, whose shell it holds, and
-/// nothing uses it afterwards.
-pub unsafe fn free_channel_slot(process: NonNull<Process>, c: NonNull<Channel>) {
-    // SAFETY: the caller's promise; only the pool is touched.
-    unsafe { (*process.as_ptr()).pools.channels.free(c) }
-}
-
-/// A place for `session`, which `process` makes (session::create), in the
-/// process's pool of sessions, whose quota pays for a page when the pool
-/// grows (spec 5.3, 7.8). NO_MEMORY when the quota falls short.
-pub fn session_slot(
-    process: NonNull<Process>,
-    session: Session,
-) -> Result<NonNull<Session>, Error> {
-    // SAFETY: the caller holds a reference to the process; the session is
-    // no field of it.
-    unsafe { paid_slot(process, |pools| &mut pools.sessions, session) }.map_err(|_| Error::NoMemory)
-}
-
-/// Gives the place of `s`, a session that `process` paid for and that goes
-/// (session::clean), back to the process's pool of sessions, where its
-/// page stays paid until the process's shell goes.
-///
-/// # Safety
-/// `s` came from `session_slot` of `process`, whose shell it holds, and
-/// nothing uses it afterwards.
-pub unsafe fn free_session_slot(process: NonNull<Process>, s: NonNull<Session>) {
-    // SAFETY: the caller's promise; only the pool is touched.
-    unsafe { (*process.as_ptr()).pools.sessions.free(s) }
-}
-
 /// LIMIT_REACHED when `process` pays for abi::MAX_TIMERS timers (spec 10):
 /// timer::create asks before it takes a slot of the channel or of the pool.
 pub fn timer_room(process: NonNull<Process>) -> Result<(), Error> {
-    // SAFETY: the caller holds a reference to the process; only the field
+    // SAFETY: the caller holds a reference to the process; only the pool
     // is read.
-    if unsafe { (*process.as_ptr()).timer_count } < MAX_TIMERS {
+    if unsafe { (*process.as_ptr()).pools.timers.in_use() } < MAX_TIMERS as usize {
         Ok(())
     } else {
         Err(Error::LimitReached)
-    }
-}
-
-/// A place for `timer`, which `process` makes (timer::create) after
-/// `timer_room` let it, in the process's pool of timers, whose quota pays
-/// for a page when the pool grows (spec 7.8): one more timer of the
-/// process. NO_MEMORY when the quota falls short.
-pub fn timer_slot(process: NonNull<Process>, timer: Timer) -> Result<NonNull<Timer>, Error> {
-    // SAFETY: the caller holds a reference to the process; the timer is no
-    // field of it.
-    let t = unsafe { paid_slot(process, |pools| &mut pools.timers, timer) }
-        .map_err(|_| Error::NoMemory)?;
-    // SAFETY: as above; only the field is touched.
-    unsafe { (*process.as_ptr()).timer_count += 1 };
-    Ok(t)
-}
-
-/// Gives the place of `t`, a timer that `process` paid for and that goes
-/// (timer::clean), back to the process's pool of timers, where its page
-/// stays paid until the process's shell goes: one timer fewer.
-///
-/// # Safety
-/// `t` came from `timer_slot` of `process`, whose shell it holds, and
-/// nothing uses it afterwards.
-pub unsafe fn free_timer_slot(process: NonNull<Process>, t: NonNull<Timer>) {
-    // SAFETY: the caller's promise; only the pool and the count are
-    // touched.
-    unsafe {
-        let p = process.as_ptr();
-        (*p).pools.timers.free(t);
-        (*p).timer_count -= 1;
     }
 }
 
