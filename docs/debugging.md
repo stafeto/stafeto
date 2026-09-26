@@ -93,7 +93,9 @@ build, `target/stafeto-ktest.elf` for a build with kernel tests,
 instruction-counted time), and `target/stafeto-probe.elf` and
 `target/stafeto-overflow.elf` for the fault probes (unknown instruction
 and stack overflow) from `cargo xtask test`. The right file is named by
-the `backtrace (look up: ...)` line itself in the panic output.
+the `backtrace (look up: ...)` line itself in the panic output. With
+`CARGO_TARGET_DIR` set, the images, the ELFs and the boot images are
+there instead of under `target/`.
 
 ## Under HVF
 
@@ -104,7 +106,8 @@ Apple's GICv3 in the macOS kernel, and
 `-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off -cpu host`,
 with QEMU's GICv2. On any other host it prints why it skips and succeeds;
 `cargo xtask ci` does not run it. To run one by hand, after
-`cargo xtask test` has built the images:
+`cargo xtask test` has built the images (under `target/`, or
+`CARGO_TARGET_DIR` when it is set):
 
 ~~~
 qemu-system-aarch64 -machine virt,gic-version=3 -accel hvf,kernel-irqchip=on \

@@ -294,14 +294,15 @@ fn classify(
         }
     }
     if top && node.name == "chosen" {
+        // Only a start or only an end is no initrd, as Linux takes it; the
+        // kernel then stops with "no boot image" (spec 3.3).
         info.initrd = match (node.initrd_start, node.initrd_end) {
-            (None, None) => None,
-            (Some(s), Some(e)) if e == s => None,
             (Some(s), Some(e)) if e > s => Some(Region {
                 base: s,
                 size: e - s,
             }),
-            _ => return Err(BootInfoError::BadInitrd),
+            (Some(s), Some(e)) if e < s => return Err(BootInfoError::BadInitrd),
+            _ => None,
         };
     }
     if top && node.named("psci") {
@@ -589,6 +590,38 @@ mod tests {
     #[test]
     fn initrd_ending_before_it_starts_is_an_error() {
         assert_eq!(info(BADINITRD).err(), Some(BootInfoError::BadInitrd));
+    }
+
+    /// A tree with 64 MiB of RAM whose `chosen` node has `prop`, one of
+    /// the two properties of the initrd, and not the other.
+    fn tree_with_half_an_initrd(prop: &str) -> Vec<u8> {
+        Builder::new()
+            .begin("")
+            .cells("#address-cells", &[2])
+            .cells("#size-cells", &[2])
+            .begin("memory@40000000")
+            .prop("device_type", b"memory\0")
+            .cells("reg", &[0, 0x4000_0000, 0, 0x400_0000])
+            .end()
+            .begin("chosen")
+            .cells(prop, &[0, 0x4200_0000])
+            .end()
+            .end()
+            .finish()
+    }
+
+    #[test]
+    fn initrd_with_only_a_start_is_ignored() {
+        let i = info(&tree_with_half_an_initrd("linux,initrd-start")).unwrap();
+        assert_eq!(i.initrd, None);
+        assert_eq!(i.memory.as_slice(), [region(0x4000_0000, 0x400_0000)]);
+    }
+
+    #[test]
+    fn initrd_with_only_an_end_is_ignored() {
+        let i = info(&tree_with_half_an_initrd("linux,initrd-end")).unwrap();
+        assert_eq!(i.initrd, None);
+        assert_eq!(i.memory.as_slice(), [region(0x4000_0000, 0x400_0000)]);
     }
 
     #[test]

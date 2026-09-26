@@ -7,8 +7,10 @@ mod elf;
 mod image;
 mod qemu;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 const KERNEL_TARGET: &str = "aarch64-unknown-none-softfloat";
@@ -104,6 +106,8 @@ const INIT_LINES: [&str; 9] = [
     "thread 2: turn 3",
     "init: both threads are done",
 ];
+/// Where RAM starts on QEMU's `virt`.
+const VIRT_RAM: u64 = 0x4000_0000;
 /// The kernel's lines of the GIC on QEMU's GICv2 and GICv3 (spec 9).
 const GIC_V2_LINE: &str = "gic        v2 distributor 0x8000000, cpu interface 0x8010000";
 const GIC_V3_LINE: &str = "gic        v3 distributor 0x8000000, redistributor 0x80a0000";
@@ -258,6 +262,40 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Where cargo writes its builds: CARGO_TARGET_DIR when it is set, else
+/// target/ of the workspace.
+fn target_dir() -> PathBuf {
+    target_dir_of(std::env::var_os("CARGO_TARGET_DIR"), &root())
+}
+
+/// target_dir with CARGO_TARGET_DIR as `var`: a relative directory is
+/// taken from `root`, where xtask runs cargo.
+fn target_dir_of(var: Option<OsString>, root: &Path) -> PathBuf {
+    root.join(var.unwrap_or_else(|| "target".into()))
+}
+
+/// The file cargo builds for `package` on `triple` with `--release`
+/// under the directory `target`.
+fn cargo_output(target: &Path, triple: &str, package: &str) -> PathBuf {
+    target.join(triple).join("release").join(package)
+}
+
+/// What `make` gives for `key`: made at the first call for `key` in this
+/// run of xtask and kept in `made` for the calls after it.
+fn once<K: PartialEq, T: Clone>(
+    made: &Mutex<Vec<(K, T)>>,
+    key: K,
+    make: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut made = made.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, t)) = made.iter().find(|(k, _)| *k == key) {
+        return Ok(t.clone());
+    }
+    let t = make()?;
+    made.push((key, t.clone()));
+    Ok(t)
+}
+
 fn cargo() -> Command {
     let mut c = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     c.current_dir(root());
@@ -305,13 +343,26 @@ fn llvm_tool(name: &str) -> Result<PathBuf, String> {
     }
 }
 
+#[derive(Clone)]
 struct Artifacts {
     elf: PathBuf,
     image: PathBuf,
     boot_image: PathBuf,
 }
 
+/// The kernel builds of this run of xtask, one per variant.
+static BUILDS: Mutex<Vec<(Variant, Artifacts)>> = Mutex::new(Vec::new());
+/// The boot images of this run of xtask, one per name.
+static BOOT_IMAGES: Mutex<Vec<(&str, PathBuf)>> = Mutex::new(Vec::new());
+
+/// The kernel image of `variant` and the boot image of the normal build,
+/// each built once in a run of xtask, whatever number of checks takes
+/// them.
 fn build(variant: Variant) -> Result<Artifacts, String> {
+    once(&BUILDS, variant, || build_kernel(variant))
+}
+
+fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     let mut cmd = cargo();
     cmd.args([
         "build",
@@ -325,12 +376,12 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
         cmd.args(["--features", feature]);
     }
     run_cmd(&mut cmd)?;
-    let target = root().join("target");
+    let target = target_dir();
     // Every variant writes the same cargo output path; a copy next to each image
     // keeps the symbols that match it.
     let elf = target.join(format!("{}.elf", variant.stem()));
     let image = target.join(format!("{}.img", variant.stem()));
-    let built = target.join(KERNEL_TARGET).join("release").join("kernel");
+    let built = cargo_output(&target, KERNEL_TARGET, "kernel");
     std::fs::copy(&built, &elf)
         .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
     run_cmd(
@@ -356,20 +407,24 @@ fn build(variant: Variant) -> Result<Artifacts, String> {
     })
 }
 
-/// Builds `programs` for EL0 and, under target/, a boot image `name` whose
-/// files they are, in their order, each with its name and the stack size
-/// its header asks for (spec 3.3, 13.1).
-fn build_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
+/// Builds `programs` for EL0 and, under target_dir, a boot image `name`
+/// whose files they are, in their order, each with its name and the stack
+/// size its header asks for (spec 3.3, 13.1); once in a run of xtask.
+fn build_boot_image(name: &'static str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
+    once(&BOOT_IMAGES, name, || write_boot_image(name, programs))
+}
+
+fn write_boot_image(name: &str, programs: &[(&str, &str, u32)]) -> Result<PathBuf, String> {
     let mut cmd = cargo();
     cmd.args(["build", "--release", "--target", PROGRAM_TARGET]);
     for (_, package, _) in programs {
         cmd.args(["--package", package]);
     }
     run_cmd(&mut cmd)?;
-    let target = root().join("target");
+    let target = target_dir();
     let mut files = Vec::new();
     for &(file, package, stack) in programs {
-        let elf = target.join(PROGRAM_TARGET).join("release").join(package);
+        let elf = cargo_output(&target, PROGRAM_TARGET, package);
         let why = |e: String| format!("{}: {e}", elf.display());
         let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
         let program = elf::program(&bytes, stack).map_err(why)?;
@@ -468,8 +523,8 @@ fn test() -> Result<(), String> {
     host_tests()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
-    el2_boot_smoke(&qemu::VIRT_EL2)?;
-    el2_boot_smoke(&qemu::VIRT_EL2_V3)?;
+    boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
+    boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
@@ -514,10 +569,13 @@ fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
     qemu::expect_clean_exit_with(o, INIT_EXIT)
 }
 
-/// A normal build boots on machine `m`, prints its report with the line of
-/// the GIC, `gic`, the timer frequency and init's entry point from the
-/// boot image, starts init, and powers the machine off when init exits.
-/// Gives the frequency. The image also carries none of the kernel's own
+/// A normal build boots on machine `m`, prints its report (boot_report)
+/// with the line of the GIC, `gic`, and init's entry point from the boot
+/// image, starts init, and powers the machine off when init exits. Gives
+/// the timer's frequency. On VIRT_EL2 and VIRT_EL2_V3 the kernel is
+/// entered at EL2, as the PinePhone's loader does: head.S must drop to
+/// EL1, with a GICv3 open its system registers to EL1 first, and power-off
+/// goes through SMC. The image also carries none of the kernel's own
 /// tests (spec 3.4): `no_test_symbols` checks it here so every normal
 /// build, not just the one that ships, is covered.
 fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
@@ -528,26 +586,52 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")?;
     expect_init_run(&o)?;
-    qemu::expect_line(&o, gic)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
-    match qemu::number_after(&o.lines, "timer ") {
-        Some(hz) if hz > 0 => Ok(hz),
-        _ => Err("the kernel printed no `timer N Hz` line".into()),
-    }
+    let size = std::fs::metadata(&a.boot_image)
+        .map_err(|e| format!("{}: {e}", a.boot_image.display()))?
+        .len();
+    boot_report(&o.lines, m, size, gic)
 }
 
-/// The same build entered at EL2 on machine `m`, as the PinePhone's loader
-/// does: head.S must drop to EL1, with a GICv3 open its system registers to
-/// EL1 first, and power-off goes through SMC. Not the ktest build: its
-/// device tree test expects HVC.
-fn el2_boot_smoke(m: &qemu::Machine) -> Result<(), String> {
-    let a = build(Variant::Normal)?;
-    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    qemu::expect_clean_exit_with(&o, "boot complete")?;
-    expect_init_run(&o)
+/// The kernel's boot report (spec 3.3) on machine `m` with a boot image of
+/// `boot_image` bytes and the line of the GIC `gic`: the lines of `m`'s
+/// RAM at VIRT_RAM, the boot image, the GIC, `m`'s PSCI conduit, the timer
+/// and `boot complete`, each whole. Gives the timer's frequency, which
+/// depends on the host.
+fn boot_report(
+    lines: &[String],
+    m: &qemu::Machine,
+    boot_image: u64,
+    gic: &str,
+) -> Result<u64, String> {
+    let memory = format!("memory     {VIRT_RAM:#x}..{:#x}", VIRT_RAM + m.ram());
+    let psci = format!("psci       {}", m.psci());
+    for line in [memory.as_str(), gic, psci.as_str(), "boot complete"] {
+        if !lines.iter().any(|l| l == line) {
+            return Err(format!("the boot report has no line {line:?}"));
+        }
+    }
+    let hex = |s: &str| u64::from_str_radix(s.strip_prefix("0x")?, 16).ok();
+    let image = lines.iter().find_map(|l| {
+        let (start, end) = l.strip_prefix("boot image ")?.split_once("..")?;
+        hex(end)?.checked_sub(hex(start)?)
+    });
+    if image != Some(boot_image) {
+        return Err(format!(
+            "the boot report has no line of a boot image of {boot_image} bytes"
+        ));
+    }
+    lines
+        .iter()
+        .find_map(|l| {
+            l.strip_prefix("timer      ")?
+                .strip_suffix(" Hz")?
+                .parse()
+                .ok()
+        })
+        .filter(|&hz| hz > 0)
+        .ok_or_else(|| "the boot report has no line `timer N Hz`".into())
 }
 
 /// With 2 GiB of RAM the second GiB is not mapped at boot: the allocator
@@ -617,7 +701,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
             "init: no memory object for its data segment",
         ),
     ];
-    let path = root().join("target").join("bad-boot.img");
+    let path = target_dir().join("bad-boot.img");
     for (bytes, marker) in cases {
         if let Some(b) = bytes {
             std::fs::write(&path, b).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -641,7 +725,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
 /// process makes the kernel panic with «killed», and no fault is printed.
 fn init_fault_stops_the_machine() -> Result<(), String> {
     let a = build(Variant::Normal)?;
-    let path = root().join("target").join("fault-init.img");
+    let path = target_dir().join("fault-init.img");
     let run = |image: Vec<u8>| {
         std::fs::write(&path, image).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
@@ -1148,6 +1232,74 @@ mod tests {
             found,
             ["kernel/src/arch/aarch64/fpsimd.S", "kernel/src/ktest/el0.S"]
         );
+    }
+
+    /// Cargo writes under CARGO_TARGET_DIR when it is set, which cargo
+    /// takes from the directory it runs in, the workspace's root for
+    /// xtask's builds, and under target/ of the workspace otherwise; the
+    /// kernel's ELF and the programs are taken from there.
+    #[test]
+    fn artifacts_come_from_cargo_target_dir() {
+        let root = Path::new("/w");
+        assert_eq!(target_dir_of(None, root), Path::new("/w/target"));
+        assert_eq!(target_dir_of(Some("/t".into()), root), Path::new("/t"));
+        assert_eq!(target_dir_of(Some("out".into()), root), Path::new("/w/out"));
+        assert_eq!(
+            cargo_output(
+                &target_dir_of(Some("/t".into()), root),
+                KERNEL_TARGET,
+                "kernel"
+            ),
+            Path::new("/t/aarch64-unknown-none-softfloat/release/kernel")
+        );
+    }
+
+    /// The boot report passes with each of its lines whole, and fails
+    /// without any one of them or with one that tells of another machine;
+    /// the RAM and the PSCI conduit come from the machine.
+    #[test]
+    fn boot_smoke_needs_every_report_line() {
+        assert_eq!(
+            (qemu::VIRT.ram(), qemu::VIRT_2G.ram()),
+            (512 << 20, 2 << 30)
+        );
+        assert_eq!(
+            (qemu::VIRT.psci(), qemu::VIRT_EL2_V3.psci()),
+            ("Hvc", "Smc")
+        );
+        let report = [
+            "memory     0x40000000..0x60000000",
+            "boot image 0x48000000..0x48005000",
+            GIC_V2_LINE,
+            "psci       Hvc",
+            "timer      62500000 Hz",
+            "boot complete",
+        ]
+        .map(String::from);
+        let check = |lines: &[String], m, gic| boot_report(lines, m, 0x5000, gic);
+        assert_eq!(check(&report, &qemu::VIRT, GIC_V2_LINE), Ok(62_500_000));
+        for i in 0..report.len() {
+            let mut cut = report.to_vec();
+            cut.remove(i);
+            let cut = check(&cut, &qemu::VIRT, GIC_V2_LINE);
+            assert!(cut.is_err(), "without {:?}", report[i]);
+        }
+        assert!(check(&report, &qemu::VIRT, GIC_V3_LINE).is_err());
+        assert!(check(&report, &qemu::VIRT_2G, GIC_V2_LINE).is_err());
+        assert!(check(&report, &qemu::VIRT_EL2, GIC_V2_LINE).is_err());
+        for (i, other) in [
+            (1, "boot image 0x48000000..0x48006000"),
+            (4, "timer      0 Hz"),
+        ] {
+            let mut changed = report.clone();
+            changed[i] = other.to_string();
+            let changed = check(&changed, &qemu::VIRT, GIC_V2_LINE);
+            assert!(changed.is_err(), "with {other:?}");
+        }
+        let mut el2 = report.clone();
+        el2[3] = "psci       Smc".to_string();
+        el2[4] = "timer      24000000 Hz".to_string();
+        assert_eq!(check(&el2, &qemu::VIRT_EL2, GIC_V2_LINE), Ok(24_000_000));
     }
 
     /// The drivers of the kernel's devices and the test init's driver of

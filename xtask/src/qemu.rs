@@ -38,6 +38,28 @@ impl Machine {
     pub fn is_hvf(&self) -> bool {
         self.accel.starts_with("hvf")
     }
+
+    /// How the kernel on this machine reaches PSCI, as its boot report
+    /// names it: through SMC when it is entered at EL2
+    /// (`virtualization=on`), through HVC otherwise.
+    pub fn psci(&self) -> &'static str {
+        if self.machine.contains("virtualization=on") {
+            "Smc"
+        } else {
+            "Hvc"
+        }
+    }
+
+    /// `memory` in bytes: a count of MiB with `M` or of GiB with `G`.
+    pub fn ram(&self) -> u64 {
+        let (count, unit) = self.memory.split_at(self.memory.len() - 1);
+        let count: u64 = count.parse().expect("a count of MiB or GiB");
+        match unit {
+            "M" => count << 20,
+            "G" => count << 30,
+            _ => panic!("{}: not in M or G", self.memory),
+        }
+    }
 }
 
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
