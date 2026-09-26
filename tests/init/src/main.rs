@@ -28,11 +28,11 @@
 #![no_main]
 
 use abi::{
-    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, Policy, ProcessHandles,
+    CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, INIT_BOOT_IMAGE, MemoryInfo, Policy, ProcessHandles,
     ProcessMemory, ProcessState, Rights, Source,
 };
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use rt::handle::{Channel, Process, Resource, Thread, Timer};
+use rt::handle::{Channel, Memory, Process, Resource, Thread, Timer};
 use rt::sys::{self, Received, Regs, Reply, Token};
 use rt::{Handle, Stack, init, println, time};
 
@@ -42,7 +42,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 106] = [
+const TESTS: [Test; 110] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -222,6 +222,22 @@ const TESTS: [Test; 106] = [
     ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
     ("timer_never_fires_early", timer_never_fires_early),
     ("timer_limit_is_64", timer_limit_is_64),
+    (
+        "mem_create_checks_its_arguments",
+        mem_create_checks_its_arguments,
+    ),
+    (
+        "mem_create_takes_the_whole_object_at_once",
+        mem_create_takes_the_whole_object_at_once,
+    ),
+    (
+        "closed_object_gives_its_frames_back",
+        closed_object_gives_its_frames_back,
+    ),
+    (
+        "memory_info_reports_size_pages_and_mappings",
+        memory_info_reports_size_pages_and_mappings,
+    ),
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
         "request_carries_registers_and_label",
@@ -1507,8 +1523,8 @@ fn kernel_stats_need_kstats() -> Outcome {
 
 /// object_info(x0 handle, x1 kind, x2 0) checks the kind and x2 first,
 /// then the handle, its type and its rights (spec 11, 16), and changes x0
-/// alone on an error: kind 0, a kind past KERNEL_STATS or with bits past
-/// its word and a nonzero x2 fail with INVALID_ARGS, for handle 0 too;
+/// alone on an error: kind 0, a kind past MEMORY or with bits past its
+/// word and a nonzero x2 fail with INVALID_ARGS, for handle 0 too;
 /// handle 0 with a good kind fails with BAD_HANDLE. The kinds of a process
 /// take a process handle with any rights, and the system resource or a
 /// thread is WRONG_TYPE; KERNEL_STATS takes the system resource with
@@ -1536,14 +1552,14 @@ fn object_info_cases(own: u64, debug: u64) -> Outcome {
     let (resource, thread) = (init::RESOURCE.raw().0, init::THREAD.raw().0);
     let kinds = [
         [own, 0, 0],
-        [own, stats + 1, 0],
+        [own, abi::INFO_MEMORY + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
     ]
     .into_iter()
     .chain(
-        [memory, table, stats]
+        [memory, table, stats, abi::INFO_MEMORY]
             .into_iter()
             .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
     )
@@ -3204,6 +3220,155 @@ fn timer_limit_is_64() -> Outcome {
     check(
         freed == Some(Ok(())) && remade,
         "no new timer fit once one went",
+    )
+}
+
+// Memory objects (spec 7.3, 7.7).
+
+/// A memory object of `pages` pages.
+fn memory_object(pages: u64) -> Result<Handle<Memory>, &'static str> {
+    sys::mem_create(pages * PAGE as u64).map_err(|_| "mem_create failed")
+}
+
+/// mem_create(x0 size, x1 flags) checks its values, the size and then the
+/// flags, of which none is known (spec 7.3, 11), and changes x0 alone on an
+/// error: a size of 0, off whole pages, past abi::MAX_MEMORY or with bits
+/// past it, and any flag fail with INVALID_ARGS. A good call changes x0 and
+/// x1 alone: a handle with abi::MEMORY_RIGHTS, which a copy with all of
+/// them shows and one with MANAGE does not get. The caller's resources are
+/// kernel tests (mem_create_over_the_quota_is_no_memory).
+fn mem_create_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::MemCreate.number();
+    let page = PAGE as u64;
+    let values = [
+        (0, 0),
+        (1, 0),
+        (page - 1, 0),
+        (page + 8, 0),
+        (abi::MAX_MEMORY + page, 0),
+        (1 << 40, 0),
+        (u64::MAX, 0),
+        (page, 1),
+        (page, 1 << 63),
+        (0, 1),
+    ]
+    .into_iter()
+    .all(|(size, flags)| x0_alone::<N>(&[size, flags], Error::InvalidArgs.code()));
+    check(
+        values,
+        "a bad size or a flag did not fail with INVALID_ARGS alone",
+    )?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[2 * page, 0]);
+    // SAFETY: mem_create only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    check(
+        after[0] == 0 && after[1] != 0 && after[2..] == x[2..],
+        "a good mem_create failed or changed registers past x1",
+    )?;
+    let m: Handle<Memory> = Handle::from_raw(abi::Handle(after[1]));
+    let all = sys::handle_duplicate(&m, abi::MEMORY_RIGHTS).map(close);
+    let more = sys::handle_duplicate(&m, abi::MEMORY_RIGHTS | Rights::MANAGE).map(close);
+    close(m)?;
+    check(
+        all == Ok(Ok(())) && more == Err(Error::AccessDenied),
+        "the handle of mem_create does not carry MEMORY_RIGHTS and no more",
+    )
+}
+
+/// mem_create takes the whole object before it returns (spec 7.3): right
+/// afterwards MEMORY counts every page of an object of 600 pages as owned,
+/// init's used memory grew by the pages and the three nodes of their list
+/// and by nothing else, and the free frames fell by the pages at least.
+/// An object made and closed first leaves a free place in init's pool of
+/// memory objects, so that the call charges no page of the pool.
+fn mem_create_takes_the_whole_object_at_once() -> Outcome {
+    const PAGES: u64 = 600;
+    close(memory_object(1)?)?;
+    let before = counts()?;
+    let m = memory_object(PAGES)?;
+    let info = sys::memory_info(&m);
+    let after = counts()?;
+    check(
+        info == Ok(MemoryInfo {
+            size: PAGES * PAGE as u64,
+            pages: PAGES,
+            mappings: 0,
+        }),
+        "MEMORY does not count every page of a new object as owned",
+    )?;
+    check(
+        after.0 == before.0 + (PAGES + 3) * PAGE as u64,
+        "init's used memory did not grow by the pages and the nodes of the new object",
+    )?;
+    check(
+        before.1.saturating_sub(after.1) >= PAGES,
+        "the free frames did not fall by the pages of the new object",
+    )?;
+    close(m)
+}
+
+/// The cleanup of a memory object runs at init's level before its
+/// handle_close returns (spec 7.7): right after the close of an object of
+/// 256 pages, whose frames go back in portions, init's used memory, the
+/// free frames and the pages of kernel pools are what they were before
+/// mem_create. An object made and closed first leaves a free place in
+/// init's pool of memory objects.
+fn closed_object_gives_its_frames_back() -> Outcome {
+    close(memory_object(1)?)?;
+    let before = counts()?;
+    close(memory_object(256)?)?;
+    check(
+        counts()? == before,
+        "the frames of a closed object were not back when handle_close returned",
+    )
+}
+
+/// object_info(MEMORY) takes a memory object's handle with no right needed
+/// and returns its size in bytes, the pages whose frames it owns, all of a
+/// new object, and its mappings, none yet, in x1-x3, and nothing past them
+/// (spec 11). A process and the system resource are WRONG_TYPE for it, a
+/// memory object is WRONG_TYPE for the kinds of a process and for
+/// KERNEL_STATS, and a closed handle is BAD_HANDLE; x0 alone changes.
+fn memory_info_reports_size_pages_and_mappings() -> Outcome {
+    let m = memory_object(3)?;
+    let bare = copy(&m, Rights::NONE)?;
+    let gone = closed_handle()?;
+    let result = memory_info_cases(bare.raw().0, gone);
+    close(bare)?;
+    close(m)?;
+    result
+}
+
+fn memory_info_cases(bare: u64, gone: u64) -> Outcome {
+    const N: u16 = Call::ObjectInfo.number();
+    let memory = abi::INFO_MEMORY;
+    let mut x = marked();
+    x[..3].copy_from_slice(&[bare, memory, 0]);
+    // SAFETY: object_info only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    let three = MemoryInfo {
+        size: 3 * PAGE as u64,
+        pages: 3,
+        mappings: 0,
+    };
+    let wrong = [
+        (init::PROCESS.raw().0, memory, Error::WrongType),
+        (init::RESOURCE.raw().0, memory, Error::WrongType),
+        (bare, abi::INFO_PROCESS_STATE, Error::WrongType),
+        (bare, abi::INFO_PROCESS_MEMORY, Error::WrongType),
+        (bare, abi::INFO_KERNEL_STATS, Error::WrongType),
+        (gone, memory, Error::BadHandle),
+    ]
+    .into_iter()
+    .all(|(h, kind, error)| x0_alone::<N>(&[h, kind, 0], error.code()));
+    check(
+        after[0] == 0 && after[1..4] == three.to_words() && after[4..] == x[4..],
+        "MEMORY through a copy with no rights did not give the size, the pages and no mapping in x1-x3 alone",
+    )?;
+    check(
+        wrong,
+        "a handle of another kind or a closed one did not fail alone",
     )
 }
 

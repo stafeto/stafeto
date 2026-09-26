@@ -17,23 +17,24 @@
 //! reach: a ceiling below 63, while children have no code yet (spec 15.2);
 //! a full table; a spent quota; who pays; and counts of live objects.
 
-use super::{CAUSE, CHILD_QUOTA, QUOTA, check};
-use crate::arch::timer;
+use super::{CAUSE, CHILD_QUOTA, QUOTA, check, nothing_pending, wait_for_timer};
+use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel::{self, Channel};
 use crate::cleanup;
+use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
 use crate::session::{self, Session};
-use crate::thread::{self, THREADS, Thread};
+use crate::thread::{self, Long, THREADS, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
     CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_KERNEL_STATS, INFO_PROCESS_HANDLES,
-    INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS, NO_WAIT, Notification,
-    OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL,
-    Source,
+    INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, KernelStats, MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo,
+    NO_WAIT, Notification, OWNER_RIGHTS, Policy, ProcessHandles, ProcessMemory, ProcessState,
+    Rights, START_CHANNEL, Source,
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -101,6 +102,21 @@ impl Caller {
         let mut t = self.thread;
         // SAFETY: the thread is the test's and never runs.
         unsafe { t.as_mut() }.regs.x[..10].copy_from_slice(&with_marks(args));
+        syscall::dispatch(t, number);
+        let mut after = [0; 10];
+        // SAFETY: as above.
+        after.copy_from_slice(&unsafe { t.as_ref() }.regs.x[..10]);
+        after
+    }
+
+    /// The next entry of a call that started over at its `svc`
+    /// (syscall::restart): ELR goes past the `svc` again, as the entry from
+    /// EL0 sets it, and the call runs on the registers it left; returns
+    /// x0-x9 afterwards.
+    fn again(&self, number: u16) -> [u64; 10] {
+        let mut t = self.thread;
+        // SAFETY: the thread is the test's and never runs.
+        unsafe { t.as_mut() }.regs.elr += 4;
         syscall::dispatch(t, number);
         let mut after = [0; 10];
         // SAFETY: as above.
@@ -1909,4 +1925,338 @@ fn no_quota_takes_no_number(c: &Caller) -> Result<(), &'static str> {
     }
     cleanup::drain();
     result
+}
+
+/// A memory object of `pages` pages that `c` makes with mem_create, entry
+/// after entry until the call ends (`Caller::again`), and its handle: x0
+/// is 0, x1 the handle, with abi::MEMORY_RIGHTS, and nothing else changes.
+fn make_memory(c: &Caller, pages: u64) -> Result<(Handle, NonNull<Memory>), &'static str> {
+    let n = Call::MemCreate.number();
+    let args = [pages * PAGE_SIZE, 0];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    want[1] = got[1];
+    if got != want || got[1] == 0 {
+        kprintln!("mem_create with {args:x?}: x0-x9 are {got:x?}");
+        return Err("mem_create failed");
+    }
+    let h = Handle(got[1]);
+    // SAFETY: the caller's process is the test's.
+    let m = unsafe { c.process.as_ref() }.lookup(h, MEMORY_RIGHTS, Object::memory);
+    Ok((
+        h,
+        m.map_err(|_| "the handle of mem_create lacks MEMORY_RIGHTS")?,
+    ))
+}
+
+/// The kernel's timer fires at once, and its interrupt stays pending while
+/// `body` runs; then it is taken and the timer is off.
+fn with_interrupt_pending(
+    body: impl FnOnce() -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    nothing_pending("an interrupt was pending before the test")?;
+    timer::arm(timer::now());
+    while !arch::irq_pending() {}
+    let result = body();
+    let ack = wait_for_timer();
+    timer::disarm();
+    gic::end(ack?);
+    result
+}
+
+/// mem_create stops at the caller's resources (spec 7.3, 11): with its
+/// quota spent it fails with NO_MEMORY for a page of its pool of memory
+/// objects, and with LIMIT_REACHED first when its table is full; with a
+/// free place in the pool, one page short of the object's budget, 16 pages
+/// and the node of their list, it fails with NO_MEMORY, and with the whole
+/// budget left it makes the object. A call that fails makes nothing,
+/// changes x0 alone and keeps no charge. The rest of the checks are the
+/// test init's (mem_create_checks_its_arguments).
+pub fn mem_create_over_the_quota_is_no_memory(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let args = [16 * PAGE_SIZE, 0];
+        // The table's first chunk, so that no call below takes one.
+        let resource = c.insert(Object::Resource, Rights::NONE)?;
+        let used = process::quota(c.process).used();
+        with_used_quota(c, || {
+            c.fails(n, &args, Error::NoMemory)?;
+            with_full_table(c, n, &args)
+        })?;
+        check(
+            process::quota(c.process).used() == used && memory::in_use() == objects,
+            "a mem_create that failed kept an object or a charge",
+        )?;
+        // A free place in the pool.
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        with_quota_left(c, 16 * PAGE_SIZE, || c.fails(n, &args, Error::NoMemory))?;
+        with_quota_left(c, 17 * PAGE_SIZE, || {
+            let (h, _) = make_memory(c, 16)?;
+            c.close(h)
+        })?;
+        cleanup::drain();
+        c.close(resource)
+    })?;
+    check(
+        memory::in_use() == objects,
+        "an object of the test stayed in its pool",
+    )
+}
+
+/// A memory object pays for itself from its payer's quota at once and
+/// gives it all back with its place (spec 7.3, 7.5): an object of 600
+/// pages, whose list takes a node of two nodes, charges the caller, its
+/// payer, 603 pages and takes as many frames, and its object_info counts
+/// every page; once its handle closes and its portions ran, the caller's
+/// used quota and the free frames are what they were. An object made and
+/// closed first leaves a free place in the caller's pool.
+pub fn object_pays_its_budget_back_to_the_payer(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let (used, free) = (process::quota(c.process).used(), phys::free_frames());
+        let (h, m) = make_memory(c, 600)?;
+        let charged = process::quota(c.process).used() - used;
+        let taken = free - phys::free_frames();
+        let (info, payer) = (memory::info(m), memory::payer(m));
+        c.close(h)?;
+        cleanup::drain();
+        check(
+            charged == 603 * PAGE_SIZE && taken == 603,
+            "the object did not charge its pages and nodes to its payer at once",
+        )?;
+        check(
+            payer == c.process
+                && info
+                    == MemoryInfo {
+                        size: 600 * PAGE_SIZE,
+                        pages: 600,
+                        mappings: 0,
+                    },
+            "the caller does not pay for the object, or it is not whole",
+        )?;
+        check(
+            process::quota(c.process).used() == used && phys::free_frames() == free,
+            "the object did not give its budget back to its payer",
+        )
+    })
+}
+
+/// The frames of a new object read as zero, though the object before it
+/// left a pattern in them (spec 7.6): an object of 64 pages gets the
+/// pattern in every word of its frames through the linear map and goes;
+/// the next object of 64 pages takes some of those frames again, and every
+/// word of each of its frames reads 0.
+pub fn new_object_is_zeroed(_: &Boot) -> Result<(), &'static str> {
+    const PAGES: usize = 64;
+    let word = |pa: u64, i: usize| (LINEAR_BASE + pa as usize + 8 * i) as *mut u64;
+    with_caller(|c| {
+        let (h, m) = make_memory(c, PAGES as u64)?;
+        let used: [u64; PAGES] = core::array::from_fn(|i| memory::frame(m, i));
+        for pa in used {
+            for i in 0..512 {
+                // SAFETY: the frame is the object's, which the test holds,
+                // and the linear map reaches it.
+                unsafe { word(pa, i).write_volatile(0x5A5A_5A5A_5A5A_5A5A) };
+            }
+        }
+        c.close(h)?;
+        cleanup::drain();
+        let (h, m) = make_memory(c, PAGES as u64)?;
+        let again: [u64; PAGES] = core::array::from_fn(|i| memory::frame(m, i));
+        let reused = again.iter().filter(|pa| used.contains(pa)).count();
+        // SAFETY: as above, for the new object.
+        let zero = again
+            .iter()
+            .all(|&pa| (0..512).all(|i| unsafe { word(pa, i).read_volatile() } == 0));
+        c.close(h)?;
+        check(
+            reused > 0,
+            "the new object took none of the frames of the one before",
+        )?;
+        check(zero, "a frame of a new object holds what was there before")
+    })
+}
+
+/// mem_create goes in portions of memory::CREATE_PORTION pages and starts
+/// over at its `svc` when an interrupt is pending after a portion (spec
+/// 7.7): with the kernel's timer pending all along, each entry of a call
+/// for 20 pages takes one portion, leaves x0-x9 as they were and ELR on
+/// the `svc`, and the object the thread's long call holds has 8 and then
+/// 16 pages; the third entry takes the rest, ends the call and returns the
+/// handle of a whole object. The portions count toward the longest portion
+/// (KERNEL_STATS x5).
+pub fn create_resumes_where_it_stopped(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| with_interrupt_pending(|| resumed_cases(c)))
+}
+
+fn resumed_cases(c: &Caller) -> Result<(), &'static str> {
+    let n = Call::MemCreate.number();
+    let args = [20 * PAGE_SIZE, 0];
+    // SAFETY: the thread is the test's and never runs.
+    let elr = || unsafe { c.thread.as_ref() }.regs.elr;
+    let at_svc = elr() - 4;
+    cleanup::take_longest();
+    let mut got = c.call(n, &args);
+    let mut filled = [0; 2];
+    for f in &mut filled {
+        let Some(Long::Create(m)) = thread::long(c.thread) else {
+            return Err("mem_create did not stop after a portion");
+        };
+        check(
+            got == with_marks(&args) && elr() == at_svc,
+            "a call that starts over changed its registers or left its svc",
+        )?;
+        *f = memory::filled(m);
+        got = c.again(n);
+    }
+    check(
+        filled == [8, 16],
+        "the object did not grow a portion an entry",
+    )?;
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    want[1] = got[1];
+    check(
+        thread::long(c.thread).is_none() && got == want,
+        "the third entry did not end the call with the handle",
+    )?;
+    check(
+        cleanup::longest() > 0,
+        "the portions of mem_create did not count toward the longest portion",
+    )?;
+    let h = Handle(got[1]);
+    // SAFETY: the caller's process is the test's.
+    let m = unsafe { c.process.as_ref() }.lookup(h, MEMORY_RIGHTS, Object::memory);
+    let whole = m.is_ok_and(|m| memory::info(m).pages == 20);
+    c.close(h)?;
+    check(whole, "the handle does not name a whole object of 20 pages")
+}
+
+/// A mem_create whose caller's process ends between two portions (spec
+/// 7.7): the object, which only the thread's long call holds, goes with
+/// the thread's buffer at the stage Buffers, and its frames and its place
+/// come back.
+pub fn killed_creator_lets_the_object_go(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let memory = phys::free_frames() + pages::taken() as u64;
+    let c = Caller::new()?;
+    let mut stopped = false;
+    let pending = with_interrupt_pending(|| {
+        c.call(Call::MemCreate.number(), &[64 * PAGE_SIZE, 0]);
+        stopped = matches!(thread::long(c.thread), Some(Long::Create(m)) if memory::filled(m) == 8);
+        Ok(())
+    });
+    // SAFETY: the test holds a reference to the process.
+    let ended = unsafe { process::end(c.process, ProcessState::Killed, CAUSE) };
+    cleanup::drain();
+    let went = memory::in_use() == objects;
+    c.release();
+    pending?;
+    check(stopped && ended, "mem_create did not stop after a portion")?;
+    check(went, "the object did not go with the teardown of its maker")?;
+    check(
+        phys::free_frames() + pages::taken() as u64 == memory,
+        "the object's frames or its place did not come back",
+    )
+}
+
+/// The room for the handle of mem_create is made on its first entry, and
+/// other threads of the caller's process may take it between two portions
+/// (spec 7.3): the call then fails with LIMIT_REACHED at its end, x0
+/// alone, and the object, whole by then, is queued at the caller's level
+/// and goes with its frames and its place.
+pub fn full_table_at_the_end_lets_the_object_go(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    let memory = phys::free_frames() + pages::taken() as u64;
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let args = [64 * PAGE_SIZE, 0];
+        let mut first = [0; 10];
+        with_interrupt_pending(|| {
+            first = c.call(n, &args);
+            Ok(())
+        })?;
+        let mut filler = [None; LIMIT as usize];
+        for slot in &mut filler {
+            match process::insert_handle(c.process, Object::Resource, Rights::NONE) {
+                Ok(h) => *slot = Some(h),
+                Err(_) => break,
+            }
+        }
+        let last = c.again(n);
+        let queued = cleanup::top();
+        cleanup::drain();
+        for h in filler.into_iter().flatten() {
+            c.close(h)?;
+        }
+        let mut want = with_marks(&args);
+        check(first == want, "mem_create did not stop after a portion")?;
+        want[0] = Error::LimitReached.code();
+        check(
+            last == want && thread::long(c.thread).is_none(),
+            "a full table at the end did not fail mem_create with LIMIT_REACHED alone",
+        )?;
+        check(
+            queued == Some(10),
+            "the object was not queued at the caller's level",
+        )
+    })?;
+    check(
+        memory::in_use() == objects && phys::free_frames() + pages::taken() as u64 == memory,
+        "the object that found no room stayed",
+    )
+}
+
+/// A thread whose next entry makes another call than its long call gives
+/// the long call up (spec 7.7): mem_create stops after a portion, and the
+/// next entry is handle_close on the registers mem_create left, which
+/// fails with BAD_HANDLE in x0 alone; the object, which only the long call
+/// held, is queued at the thread's level and goes with its frames and its
+/// budget.
+pub fn another_call_gives_the_long_call_up(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let (used, free) = (process::quota(c.process).used(), phys::free_frames());
+        let args = [64 * PAGE_SIZE, 0];
+        let mut stopped = false;
+        with_interrupt_pending(|| {
+            c.call(Call::MemCreate.number(), &args);
+            stopped = thread::long(c.thread).is_some();
+            Ok(())
+        })?;
+        let got = c.again(Call::HandleClose.number());
+        let queued = cleanup::top();
+        cleanup::drain();
+        let mut want = with_marks(&args);
+        want[0] = Error::BadHandle.code();
+        check(stopped, "mem_create did not stop after a portion")?;
+        check(
+            got == want && thread::long(c.thread).is_none(),
+            "another call did not run as itself or kept the long call",
+        )?;
+        check(
+            queued == Some(10),
+            "the object did not go at the thread's level",
+        )?;
+        check(
+            process::quota(c.process).used() == used && phys::free_frames() == free,
+            "the object of the call given up kept its frames or its budget",
+        )
+    })?;
+    check(
+        memory::in_use() == objects,
+        "the object of the call given up stayed",
+    )
 }

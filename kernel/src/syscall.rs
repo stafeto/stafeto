@@ -19,25 +19,29 @@
 //! registers keep the arguments. `receive` writes x10 and x11 as well when
 //! it takes something, and a thread that waits in it or in `send` gets its
 //! result when the wait ends: `send` waits for the reply, whose message
-//! comes in x0-x9 (spec 11). Test builds also know numbers of their own, in
-//! abi::TEST_CALLS.
+//! comes in x0-x9 (spec 11). A long call, mem_create, goes in portions
+//! with interrupts polled between them: it starts over at its `svc` when
+//! one is pending, with how far it came kept in the calling thread
+//! (thread::Long), and the next entry goes on from there (spec 7.7). Test
+//! builds also know numbers of their own, in abi::TEST_CALLS.
 
 use crate::arch::timer as clock;
 use crate::channel::{self, Via};
+use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process};
-use crate::thread::{self, Thread};
-use crate::{cleanup, sched, session, timer};
+use crate::thread::{self, Long, Thread};
+use crate::{arch, cleanup, sched, session, timer};
 use abi::{
-    CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, Notification, OWNER_RIGHTS, ProcessHandles,
-    ProcessMemory, ProcessState, Rights,
+    CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
+    ProcessHandles, ProcessMemory, ProcessState, Rights,
 };
 use core::ptr::NonNull;
 use kcore::args::{
     Desc, bits_arg, check_buffer, check_start, handle_limit_arg, handle_values_arg, inline_len_arg,
-    notify_priority_arg, policy_arg, priority_arg, quota_arg, reserved_arg, rights_arg,
-    under_ceilings, wait_arg,
+    memory_size_arg, notify_priority_arg, policy_arg, priority_arg, quota_arg, reserved_arg,
+    rights_arg, under_ceilings, wait_arg,
 };
 
 /// A call's arguments: x0-x9 of the thread that made it.
@@ -69,10 +73,14 @@ impl Values {
 /// Carries out system call `number` for `thread`, the running thread that
 /// made it, and writes the result into its registers. The scheduler then
 /// decides who runs (sched::resume): a call that lets another thread run
-/// has written the caller's result first.
+/// has written the caller's result first. A thread in a long call goes on
+/// with it (`go_on`).
 pub fn dispatch(thread: NonNull<Thread>, number: u16) {
     if crate::testpoint::test_call(thread, number) {
         return;
+    }
+    if let Some(long) = thread::long(thread) {
+        return go_on(thread, long, number);
     }
     let mut args: Args = [0; 10];
     // SAFETY: the thread that made the call is alive.
@@ -85,6 +93,7 @@ pub fn dispatch(thread: NonNull<Thread>, number: u16) {
         Some(Call::Receive) => return receive(thread, &args),
         Some(Call::Reply) => reply(thread, &args),
         Some(Call::Notify) => notify(thread, &args),
+        Some(Call::MemCreate) => return mem_create(thread, &args),
         Some(Call::ProcessCreate) => process_create(thread, &args),
         Some(Call::ProcessKill) => process_kill(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args),
@@ -131,9 +140,9 @@ pub fn set_notification(mut thread: NonNull<Thread>, n: Notification) {
     n.write_words((&mut x[1..12]).try_into().expect("x1-x11"));
 }
 
-/// Makes the call of `thread` start over (spec 6.1): its program counter
-/// goes back to its `svc`, and its registers stay as they were, so it
-/// makes the call again when it next runs.
+/// Makes the call of `thread` start over (spec 6.1, 7.7): its program
+/// counter goes back to its `svc`, and its registers stay as they were, so
+/// it makes the call again when it next runs.
 pub fn restart(mut thread: NonNull<Thread>) {
     // SAFETY: the thread is alive, and nothing else refers to its
     // registers now.
@@ -379,6 +388,88 @@ fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     check_handles(thread, values)?;
     channel::reply(thread, a[0], desc, values)?;
     Ok(Values::NONE)
+}
+
+/// The next entry of the long call `long` of `thread` (spec 7.7), which
+/// started over after an interrupt. An entry with the call's number goes
+/// on where the call stopped, wherever its `svc` stands, with no check made
+/// again, and its portions count from this entry; an entry with another
+/// number gives the long call up as the caller's leaving does, what the
+/// call held goes at the thread's priority (thread::drop_long), and call
+/// `number` runs the usual way.
+fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
+    let entry = clock::now();
+    if number != long.call().number() {
+        // SAFETY: the running thread is alive, and nothing uses what its
+        // call held afterwards.
+        unsafe { thread::drop_long(thread, cause(thread)) };
+        return dispatch(thread, number);
+    }
+    match long {
+        Long::Create(m) => make(thread, m, entry),
+    }
+}
+
+/// mem_create(x0 size, x1 flags): a memory object of `size` bytes, whole
+/// pages from one page to abi::MAX_MEMORY, whose frames the kernel takes
+/// and zeroes at once, in portions (spec 7.3, 7.7); x1 returns a handle to
+/// it with abi::MEMORY_RIGHTS once it is whole. The checks in the order of
+/// spec 11: the size, then the flags, of which none is known
+/// (INVALID_ARGS); then the resources in the order the call takes them:
+/// room in the caller's table (LIMIT_REACHED) and a chunk for it
+/// (NO_MEMORY; process::reserve_handles), a place in the caller's pool of
+/// memory objects, whose page the caller's quota pays for when the pool
+/// grows, and the object's budget, its pages and the nodes of their list,
+/// from the caller's quota at once (NO_MEMORY; memory::create). A call
+/// that fails there changes nothing but a chunk of the table or a page of
+/// the pool, which stay the caller's. Then the portions (`make`); the call
+/// writes its own result.
+fn mem_create(thread: NonNull<Thread>, a: &Args) {
+    let entry = clock::now();
+    let made = memory_size_arg(a[0]).and_then(|pages| {
+        reserved_arg(a[1])?;
+        process::reserve_handles(caller(thread), 1)?;
+        memory::create(caller(thread), pages)
+    });
+    match made {
+        Ok(m) => {
+            thread::begin_long(thread, Long::Create(m));
+            make(thread, m, entry)
+        }
+        Err(e) => set_result(thread, Err(e)),
+    }
+}
+
+/// The portions of the mem_create of `thread` for `m`, which the thread's
+/// long call holds (spec 7.7), from `entry`, the counter when the kernel
+/// took the call: each takes up to memory::CREATE_PORTION pages. Each
+/// stretch between two polls for interrupts counts toward the longest
+/// portion (KERNEL_STATS x5): the first with the checks of its entry, the
+/// last with the handle and the end of the call. After a portion that
+/// leaves pages, with an interrupt pending the call starts over at its
+/// `svc` (`restart`), and its next entry comes back here; otherwise the
+/// next portion follows. Once the object is whole its handle goes into the
+/// caller's table, where the first entry made room; when other threads of
+/// the process took the room meanwhile, the call fails with LIMIT_REACHED
+/// or NO_MEMORY, the only error that comes late, and the object goes at
+/// the caller's priority.
+fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
+    let mut start = entry;
+    while !memory::fill(m) {
+        cleanup::count_portion(start);
+        if arch::irq_pending() {
+            return restart(thread);
+        }
+        start = clock::now();
+    }
+    thread::end_long(thread);
+    let h = process::insert_handle(caller(thread), Object::Memory(m), MEMORY_RIGHTS);
+    // SAFETY: the reference `create` handed out, which the long call held,
+    // goes; the handle, if it went in, holds the object, and without it
+    // the object goes.
+    unsafe { memory::release(m, cause(thread)) };
+    set_result(thread, h.map(|h| Values::new(&[h.0])));
+    cleanup::count_portion(start);
 }
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
@@ -685,6 +776,8 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// PROCESS_MEMORY the quota (abi::ProcessMemory) and PROCESS_HANDLES the
 /// table (abi::ProcessHandles) in x1-x3. KERNEL_STATS takes the system
 /// resource with KSTATS and returns abi::KernelStats in x1-x8 (spec 16).
+/// MEMORY takes a memory object's handle with any rights and returns
+/// abi::MemoryInfo in x1-x3.
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
@@ -716,6 +809,10 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         abi::INFO_KERNEL_STATS => {
             lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
             Ok(Values::new(&kernel_stats().to_words()))
+        }
+        abi::INFO_MEMORY => {
+            let m = lookup(thread, a[0], Rights::NONE, Object::memory)?;
+            Ok(Values::new(&memory::info(m).to_words()))
         }
         _ => Err(Error::InvalidArgs),
     }

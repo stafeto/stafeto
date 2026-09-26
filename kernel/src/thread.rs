@@ -3,29 +3,30 @@
 
 //! Threads (spec 4, 8, 8.1): a program's registers, FP and SIMD included,
 //! its scheduling parameters, its message buffer, its own slot of a
-//! channel's queue, the handles of its request on their way, its number in
-//! the system table and its process, in objects from the pool of threads of
-//! their process. The registers come first, so TPIDR_EL1, which points at
-//! the running thread, points at them too (vectors.S). The running thread
-//! is the one TPIDR_EL1 names; the kernel stack holds nothing of it. A
-//! thread lives while references to it are left: handles, the one `create`
-//! hands out, and the kernel's while the scheduler holds the thread, from
-//! its start until its end, while it waits in `send` or `receive` too (spec
-//! 8.1); it holds a reference to its process. A thread that ended stays as
-//! a shell without its buffer and its number until its last reference goes,
-//! which queues it for cleanup (spec 7.7): its number goes back as it ends,
-//! or with its portion when it never started. Its process pays from its
-//! quota for the pages of its pool of threads (spec 7.8) and for the buffer
-//! while it lasts (spec 7.5).
+//! channel's queue, the handles of its request on their way, the long call
+//! it is making, its number in the system table and its process, in objects
+//! from the pool of threads of their process. The registers come first, so
+//! TPIDR_EL1, which points at the running thread, points at them too
+//! (vectors.S). The running thread is the one TPIDR_EL1 names; the kernel
+//! stack holds nothing of it. A thread lives while references to it are
+//! left: handles, the one `create` hands out, and the kernel's while the
+//! scheduler holds the thread, from its start until its end, while it waits
+//! in `send` or `receive` too (spec 8.1); it holds a reference to its
+//! process. A thread that ended stays as a shell without its buffer and its
+//! number until its last reference goes, which queues it for cleanup (spec
+//! 7.7): its number goes back as it ends, or with its portion when it never
+//! started. Its process pays from its quota for the pages of its pool of
+//! threads (spec 7.8) and for the buffer while it lasts (spec 7.5).
 
 use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::channel::{Owner, Wait};
 use crate::cleanup::{self, Item};
+use crate::memory::{self, Memory};
 use crate::mm::phys::{self, Frame};
 use crate::object::{self, Live, Moving, Object, Refs};
 use crate::process::{self, Process};
 use crate::sched::{self, Tokens};
-use abi::{Error, MESSAGE_HANDLES, Policy, msgbuf};
+use abi::{Call, Error, MESSAGE_HANDLES, Policy, msgbuf};
 use core::ops::Range;
 use core::ptr::NonNull;
 use kcore::notify::Slot;
@@ -65,6 +66,11 @@ pub struct Thread {
     /// (`drop_transit`). Only `set_transit`, `take_transit` and
     /// `drop_transit` change it.
     transit: Moving,
+    /// The long call it is making (spec 7.7), from the first entry of its
+    /// `svc` to its last portion; a thread that ends midway lets it go with
+    /// its buffer (`drop_long`). Only `begin_long`, `end_long` and
+    /// `drop_long` change it.
+    long: Option<Long>,
     /// Its number in the system table (spec 6.1, 7.8), from `create` until
     /// it ends (sched::exit) or, when it never started, until its portion
     /// of cleanup: the tokens of its requests carry it. None once it went
@@ -87,6 +93,25 @@ pub struct Thread {
     refs: Refs,
     /// Its place in the cleanup queue once its last reference goes.
     cleanup: Item,
+}
+
+/// A long call a thread is making (spec 7.7): what the next entry of its
+/// `svc` goes on with, after the call started over for an interrupt
+/// (syscall::restart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Long {
+    /// mem_create: the object being made, whose only reference this is
+    /// until the object is whole and a handle takes its place.
+    Create(NonNull<Memory>),
+}
+
+impl Long {
+    /// The call that goes on.
+    pub fn call(self) -> Call {
+        match self {
+            Long::Create(_) => Call::MemCreate,
+        }
+    }
 }
 
 /// Neighbours in the list of a process's threads.
@@ -181,6 +206,7 @@ pub fn create(
         // The owner is the thread's own place, known once it has one.
         slot: Slot::new(priority, Owner::Thread(NonNull::dangling())),
         transit: [None; MESSAGE_HANDLES],
+        long: None,
         index: None,
         boost_token: 0,
         siblings: None,
@@ -261,7 +287,8 @@ pub fn give_buffer(t: NonNull<Thread>, va: usize) -> Result<(), Error> {
 /// refunds it to the process (phys::free): its page is unmapped first, with
 /// its TLB entry, while the process's space lives; otherwise the page went
 /// with the space. The handles of a request the thread made go with it,
-/// each released at `cause` (`drop_transit`, spec 6.1, 7.7).
+/// and what a long call it was making held, each released at `cause`
+/// (`drop_transit`, `drop_long`, spec 6.1, 7.7).
 ///
 /// # Safety
 /// `t` is alive, waits in no queue, and does not run at EL0 again with its
@@ -271,6 +298,7 @@ pub unsafe fn drop_buffer(t: NonNull<Thread>, cause: u8) {
     // thread may be released from its process's table meanwhile.
     let (buffer, p) = unsafe {
         drop_transit(t, cause);
+        drop_long(t, cause);
         ((*t.as_ptr()).buffer.take(), (*t.as_ptr()).process)
     };
     let Some(Buffer { va, frame }) = buffer else {
@@ -352,6 +380,47 @@ pub unsafe fn drop_transit(t: NonNull<Thread>, cause: u8) -> usize {
     // SAFETY: the references were the handles', which left the table.
     unsafe { object::release_moving(moving, cause) };
     n
+}
+
+/// The long call `t` is making, if any (spec 7.7).
+pub fn long(t: NonNull<Thread>) -> Option<Long> {
+    // SAFETY: the caller holds the thread; only the field is read.
+    unsafe { (*t.as_ptr()).long }
+}
+
+/// `t`, the running thread, which makes no long call, begins `long`: the
+/// next entries of its `svc` go on with it (syscall::dispatch) until
+/// `end_long` (spec 7.7).
+pub fn begin_long(t: NonNull<Thread>, long: Long) {
+    // SAFETY: the running thread is alive; only the field is touched.
+    let field = unsafe { &mut (*t.as_ptr()).long };
+    assert!(field.is_none(), "a thread begins a second long call");
+    *field = Some(long);
+}
+
+/// The long call of `t`, the running thread, ended in its last portion:
+/// what it held is the caller's (spec 7.7).
+pub fn end_long(t: NonNull<Thread>) -> Option<Long> {
+    // SAFETY: the running thread is alive; only the field is touched.
+    unsafe { (*t.as_ptr()).long.take() }
+}
+
+/// The long call of `t` stops for good (spec 7.7): what it held goes, the
+/// object of a mem_create released at `cause`. Returns the units of work
+/// it took: 1 with a call, 0 without. O(1).
+///
+/// # Safety
+/// `t` is alive, and nothing uses what its call held afterwards.
+pub unsafe fn drop_long(t: NonNull<Thread>, cause: u8) -> usize {
+    // SAFETY: the caller's promise; only the field is touched.
+    match unsafe { (*t.as_ptr()).long.take() } {
+        Some(Long::Create(m)) => {
+            // SAFETY: the call held the object's reference, which goes.
+            unsafe { memory::release(m, cause) };
+            1
+        }
+        None => 0,
+    }
 }
 
 /// The values of the `n` handles a message of `t` carries, which its

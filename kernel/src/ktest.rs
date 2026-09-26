@@ -311,6 +311,31 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::thread_limit_of_the_system,
     ),
     ("thread_numbers_come_back", calls::thread_numbers_come_back),
+    (
+        "object_pays_its_budget_back_to_the_payer",
+        calls::object_pays_its_budget_back_to_the_payer,
+    ),
+    (
+        "mem_create_over_the_quota_is_no_memory",
+        calls::mem_create_over_the_quota_is_no_memory,
+    ),
+    ("new_object_is_zeroed", calls::new_object_is_zeroed),
+    (
+        "create_resumes_where_it_stopped",
+        calls::create_resumes_where_it_stopped,
+    ),
+    (
+        "killed_creator_lets_the_object_go",
+        calls::killed_creator_lets_the_object_go,
+    ),
+    (
+        "full_table_at_the_end_lets_the_object_go",
+        calls::full_table_at_the_end_lets_the_object_go,
+    ),
+    (
+        "another_call_gives_the_long_call_up",
+        calls::another_call_gives_the_long_call_up,
+    ),
 ];
 
 /// Tests that failed so far, the EL0 tests' included.

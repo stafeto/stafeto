@@ -18,6 +18,7 @@ use crate::arch::user::{self, FpRegs, UserRegs};
 use crate::arch::{self, cache, gic, symbols, timer};
 use crate::channel::{self, Channel};
 use crate::cleanup;
+use crate::memory;
 use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process::{self, Process, Stage};
@@ -26,8 +27,9 @@ use crate::thread::{self, Thread};
 use crate::timer::{self as timers, Timer};
 use crate::{sched, session};
 use abi::{
-    CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, INFO_PROCESS_STATE, MAX_THREADS, NO_WAIT,
-    Notification, Policy, ProcessState, Rights, START_CHANNEL, Source, msgbuf,
+    CLIENT_GONE, Call, Error, HANDLES_SHIFT, Handle, INFO_PROCESS_STATE, MAX_THREADS,
+    MEMORY_RIGHTS, NO_WAIT, Notification, Policy, ProcessState, Rights, START_CHANNEL, Source,
+    msgbuf,
 };
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -36,6 +38,7 @@ use kcore::esr;
 use kcore::gic::PRIORITY_MASK;
 use kcore::handles::{MAX_CHUNKS, MAX_HANDLES};
 use kcore::layout::LINEAR_BASE;
+use kcore::pagelist::RELEASE_STEP;
 use kcore::paging::{Attrs, BLOCK_2M};
 use kcore::sched::State;
 use kcore::sync::Lock;
@@ -174,6 +177,8 @@ const ROUNDS: u64 = 1000;
 /// one interrupt takes (timers::BATCH), and more than one process pays for
 /// (abi::MAX_TIMERS).
 const BATCHED: usize = 100;
+/// Pages of the memory object of `memory_object_goes_in_portions`: 64 MiB.
+const BIG_OBJECT: usize = 16384;
 
 struct El0Test {
     name: &'static str,
@@ -496,6 +501,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_cleanup_level,
     },
     El0Test {
+        name: "memory_object_goes_in_portions",
+        start: start_memory_portions,
+        done: done_memory_portions,
+    },
+    El0Test {
         name: "fault_cleanup_runs_at_the_priority_of_the_fault",
         start: start_fault_cleanup,
         done: done_own_cleanup,
@@ -755,8 +765,8 @@ pub fn count() -> usize {
 /// Starts the tests from `first` on: the scheduler starts each test's
 /// threads and runs them. A test that cannot start fails, and the next one
 /// starts. Each test finds the cleanup queue empty. After the last test the
-/// pools hold no process, thread, channel, session or timer: the kernel's
-/// references and the tests' own went.
+/// pools hold no process, thread, channel, session, timer or memory
+/// object: the kernel's references and the tests' own went.
 fn start(first: usize) -> ! {
     for (i, test) in tests().enumerate().skip(first) {
         cleanup::drain();
@@ -788,8 +798,9 @@ fn start(first: usize) -> ! {
                 && thread::in_use() == 0
                 && channel::in_use() == 0
                 && session::in_use() == 0
-                && timers::in_use() == 0,
-            "a process, a thread, a channel, a session or a timer of the EL0 tests stayed in its pool",
+                && timers::in_use() == 0
+                && memory::in_use() == 0,
+            "a process, a thread, a channel, a session, a timer or a memory object of the EL0 tests stayed in its pool",
         ),
     );
     finish()
@@ -2351,6 +2362,66 @@ fn start_big_teardown(f: &mut Fixture) -> Result<(), &'static str> {
     f.interrupt_after = Some(INTERRUPT_EVERY);
     f.interrupt_every = Some(INTERRUPT_EVERY);
     Ok(())
+}
+
+/// A memory object of BIG_OBJECT pages, 64 MiB, that only the table of a
+/// killed child holds goes with the child's teardown in portions of at
+/// most RELEASE_STEP frames (spec 7.7): at least BIG_OBJECT / RELEASE_STEP
+/// portions, with an interrupt every INTERRUPT_EVERY of them. None of them
+/// waits for the next portion: every portion begins with no interrupt
+/// pending, and the thread the first one wakes runs while work is left.
+/// Afterwards the object's frames, its place and the child are back.
+fn start_memory_portions(f: &mut Fixture) -> Result<(), &'static str> {
+    killer_and_child(f, memory_child)?;
+    f.interrupt_after = Some(INTERRUPT_EVERY);
+    f.interrupt_every = Some(INTERRUPT_EVERY);
+    Ok(())
+}
+
+/// A child with a handle to a whole memory object of BIG_OBJECT pages,
+/// which the child pays for, in its own table.
+fn memory_child() -> Result<NonNull<Process>, &'static str> {
+    let quota = QUOTA + (BIG_OBJECT * PAGE) as u64;
+    let child = process::create_root(quota, HANDLE_LIMIT, CEILING).map_err(|_| "no child")?;
+    let made = memory::create(child, BIG_OBJECT).and_then(|m| {
+        while !memory::fill(m) {}
+        let h = process::insert_handle(child, Object::Memory(m), MEMORY_RIGHTS);
+        // SAFETY: the reference `create` handed out goes; the handle, if it
+        // went in, holds the object.
+        unsafe { memory::release(m, CAUSE) };
+        h
+    });
+    if made.is_err() {
+        // SAFETY: the test's reference goes, and nothing uses it afterwards.
+        unsafe { process::release(child, CAUSE) };
+        return Err("no memory object in the child");
+    }
+    Ok(child)
+}
+
+fn done_memory_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => check(
+            cleanup::len() > 0,
+            "the interrupt waited for the object to go",
+        ),
+        1 => check(t.regs.x[0] == 0, "process_kill failed"),
+        _ => {
+            check(
+                f.portions as usize >= BIG_OBJECT / RELEASE_STEP,
+                "the object did not go RELEASE_STEP frames a portion",
+            )?;
+            check(
+                !cleanup::take_late() && f.interrupts >= f.portions / INTERRUPT_EVERY,
+                "a portion began while an interrupt was pending",
+            )?;
+            check(
+                memory::in_use() == 0 && phys::free_frames() + pages::taken() as u64 == f.memory,
+                "the object's frames or its place did not come back",
+            )?;
+            cleanup_done()
+        }
+    }
 }
 
 /// The big teardown's child: one frame of its own, mapped at every

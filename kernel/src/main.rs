@@ -21,6 +21,7 @@ mod init;
 mod interrupt;
 #[cfg(feature = "ktest")]
 mod ktest;
+mod memory;
 mod mm;
 mod object;
 mod panicking;

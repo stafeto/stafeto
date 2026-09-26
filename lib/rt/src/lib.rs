@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The runtime of stafeto programs, as small as milestone 1.3c needs it
+//! The runtime of stafeto programs, as small as milestone 1.3d needs it
 //! (spec 13.2): the entry point, handles typed by the kind of their object
 //! (`handle`, `init`), typed wrappers of the system calls the kernel has,
 //! requests and their tokens among them, and a raw call for any other

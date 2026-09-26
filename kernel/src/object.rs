@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Kernel objects that handles name (spec 4, 5). A handle holds a counted
-//! reference to its process, thread, channel, session or timer, and the
-//! last reference queues the object for cleanup (spec 7.7); a channel counts its
+//! reference to its process, thread, channel, session, timer or memory
+//! object, and the last reference queues the object for cleanup (spec 7.7); a channel counts its
 //! handles with RECEIVE too, since the last of them closes it (spec 6.8).
 //! A channel handle with a label names the label's session, which names
 //! the channel (spec 5.3) and counts its handles as its copies. The system
@@ -12,6 +12,7 @@
 //! count in a `Refs` and its number in a `Live`.
 
 use crate::channel::{self, Channel};
+use crate::memory::{self, Memory};
 use crate::mm::pages::KernelPages;
 #[cfg(feature = "ktest")]
 use crate::mm::pages::POISON;
@@ -36,6 +37,8 @@ pub enum Object {
     Session(NonNull<Session>),
     /// A timer of a program (spec 10).
     Timer(NonNull<Timer>),
+    /// A memory object (spec 7.3).
+    Memory(NonNull<Memory>),
     /// Device windows, interrupts, the debug port and kernel statistics
     /// (spec 4): the rights DEVICE, DEBUG and KSTATS say which.
     Resource,
@@ -91,6 +94,14 @@ impl Object {
         }
     }
 
+    /// The memory object, for a lookup that needs one.
+    pub fn memory(&self) -> Option<NonNull<Memory>> {
+        match *self {
+            Object::Memory(m) => Some(m),
+            _ => None,
+        }
+    }
+
     /// Some for the system resource, for a lookup that needs it.
     pub fn resource(&self) -> Option<()> {
         matches!(self, Object::Resource).then_some(())
@@ -104,6 +115,7 @@ impl Object {
             Object::Thread(_) => ObjectKind::Thread,
             Object::Channel(_) | Object::Session(_) => ObjectKind::Channel,
             Object::Timer(_) => ObjectKind::Timer,
+            Object::Memory(_) => ObjectKind::Memory,
             Object::Resource => ObjectKind::Resource,
         }
     }
@@ -241,6 +253,7 @@ pub fn retain(object: Object, rights: Rights) {
         Object::Channel(c) => channel::retain(c, rights),
         Object::Session(s) => session::retain(s, rights),
         Object::Timer(t) => timer::retain(t),
+        Object::Memory(m) => memory::retain(m),
         Object::Resource => {}
     }
 }
@@ -263,6 +276,7 @@ pub unsafe fn release(object: Object, rights: Rights, cause: u8) {
             Object::Channel(c) => channel::release(c, rights, cause),
             Object::Session(s) => session::release(s, rights, cause),
             Object::Timer(t) => timer::release(t, cause),
+            Object::Memory(m) => memory::release(m, cause),
             Object::Resource => {}
         }
     }

@@ -21,8 +21,9 @@
 //! cleanup it may start takes. A process pays from its quota for what goes
 //! with it (spec 7.5, 7.8): a page at a time as its pools grow, for its
 //! threads, the blocks of its handle table, the shells of its children, the
-//! channels it made, the sessions of the labels it gave (spec 5.3) and its
-//! timers, at most abi::MAX_TIMERS (spec 10); and
+//! channels it made, the sessions of the labels it gave (spec 5.3), its
+//! timers, at most abi::MAX_TIMERS (spec 10), and the memory objects it
+//! made; at once, for the pages of those objects (spec 7.3); and
 //! for the tables of its space, the message buffers of its threads and the
 //! frames of `map_frames`. The pages of its pools go back only with
 //! its shell, in portions. A child's quota comes off its parent's and goes
@@ -33,6 +34,7 @@
 
 use crate::channel::{self, Channel, Owner};
 use crate::cleanup::{self, Item};
+use crate::memory::Memory;
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
 use crate::mm::pages::{self, KernelPages};
 use crate::mm::phys::{self, Frame};
@@ -174,6 +176,8 @@ pub struct Pools {
     sessions: Pool<Session>,
     /// The timers it made, at most abi::MAX_TIMERS (spec 10).
     timers: Pool<Timer>,
+    /// The memory objects it made (spec 7.3).
+    memories: Pool<Memory>,
 }
 
 /// The source of a process's exit notification (spec 6.5, 7.9): its slot,
@@ -340,6 +344,7 @@ fn create(
             channels: Pool::new(),
             sessions: Pool::new(),
             timers: Pool::new(),
+            memories: Pool::new(),
         },
         ceiling,
         life: Life::new(),
@@ -422,10 +427,16 @@ impl Paid for Timer {
     }
 }
 
+impl Paid for Memory {
+    fn pool(pools: &mut Pools) -> &mut Pool<Memory> {
+        &mut pools.memories
+    }
+}
+
 /// A place for `value`, an object that `payer` makes (thread::create,
-/// channel::create, session::create, timer::create), in the payer's pool
-/// of its kind, whose quota pays for a page when the pool grows (spec 7.5,
-/// 7.8). NO_MEMORY when the quota falls short.
+/// channel::create, session::create, timer::create, memory::create), in
+/// the payer's pool of its kind, whose quota pays for a page when the pool
+/// grows (spec 7.5, 7.8). NO_MEMORY when the quota falls short.
 pub fn paid_alloc<T: Paid>(payer: NonNull<Process>, value: T) -> Result<NonNull<T>, Error> {
     // SAFETY: the caller holds a reference to the payer; the value is no
     // field of it.

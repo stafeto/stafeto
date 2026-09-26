@@ -7,17 +7,17 @@
 //! x0-x9, so that a later kernel may return more values, and `receive`
 //! x0-x11; the kernel keeps every other register. `raw` makes any call
 //! with any registers, for tests that hand the kernel bad ones; the
-//! functions after it are the typed calls of milestones 1.2c to 1.3c,
+//! functions after it are the typed calls of milestones 1.2c to 1.3d,
 //! which take and return handles typed by the kind of their object
 //! (`Handle`), and the token of a request, which answers it once
 //! (`Token`).
 
-use crate::handle::{Channel, Handle, Process, Resource, Thread, Timer};
+use crate::handle::{Channel, Handle, Memory, Process, Resource, Thread, Timer};
 use crate::msgbuf;
 use abi::{
-    Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX, Message,
-    Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT,
-    Source,
+    Call, Error, HANDLES_SHIFT, INLINE_MAX, KernelStats, MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo,
+    Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
+    SOURCE_SHIFT, Source,
 };
 use core::arch::asm;
 
@@ -271,6 +271,24 @@ pub fn kernel_stats(resource: &Handle<Resource>) -> Result<KernelStats, Error> {
     Ok(KernelStats::from_words([
         x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
     ]))
+}
+
+/// object_info(MEMORY): the object's size in bytes, the pages whose frames
+/// it owns and its mappings now.
+pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {
+    let args = [memory.raw().0, abi::INFO_MEMORY, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(MemoryInfo::from_words([x[1], x[2], x[3]]))
+}
+
+/// mem_create: a memory object of `size` bytes, whole pages up to
+/// abi::MAX_MEMORY, whose frames the kernel takes and zeroes before the
+/// call returns (spec 7.3); the caller's quota pays for them, for the
+/// nodes of their list and for the object's place. The handle carries
+/// abi::MEMORY_RIGHTS.
+pub fn mem_create(size: u64) -> Result<Handle<Memory>, Error> {
+    let x = call::<{ Call::MemCreate.number() }>(&[size, 0])?;
+    Ok(returned(&x))
 }
 
 /// debug_write: up to abi::INLINE_MAX bytes to the console through the

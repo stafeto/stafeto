@@ -207,6 +207,9 @@ pub fn mask_tail(words: &mut [u64], len: usize) {
     }
 }
 
+// The largest memory object is the largest list of pages.
+const _: () = assert!(MAX_PAGES as u64 * PAGE_SIZE == abi::MAX_MEMORY);
+
 /// The access of a mapping from a register (spec 7.4): R, RW or RX
 /// (abi::Access). INVALID_ARGS for any other value, write and execute
 /// together among them.
@@ -215,8 +218,8 @@ pub fn access_arg(raw: u64) -> Result<Access, Error> {
 }
 
 /// The size of a memory object, x0 of `mem_create` (spec 7.3): whole
-/// pages, from one page to MAX_PAGES (1 GiB). Returns the pages;
-/// INVALID_ARGS otherwise.
+/// pages, from one page to MAX_PAGES, abi::MAX_MEMORY bytes. Returns the
+/// pages; INVALID_ARGS otherwise.
 pub fn memory_size_arg(raw: u64) -> Result<usize, Error> {
     let pages = raw >> PAGE_SHIFT;
     if raw.is_multiple_of(PAGE_SIZE) && (1..=MAX_PAGES as u64).contains(&pages) {
