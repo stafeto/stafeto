@@ -31,7 +31,7 @@ use crate::channel::{self, Via};
 use crate::memory::{self, Memory};
 use crate::mm::{pages, phys};
 use crate::object::Object;
-use crate::process::{self, Process};
+use crate::process::{self, Change, Op, Process};
 use crate::thread::{self, Long, Thread};
 use crate::{arch, cleanup, irq, sched, session, timer};
 use abi::{
@@ -430,7 +430,9 @@ fn reply(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// of its own, which counts toward the longest portion (KERNEL_STATS x5).
 /// With an interrupt pending the entry then starts over at its `svc`
 /// (`restart`), and call `number` runs the usual way on the next entry;
-/// otherwise it runs at once.
+/// otherwise it runs at once. Kept out of `dispatch`: inlined, its loop
+/// back into `dispatch` lengthens the entry of every call.
+#[inline(never)]
 fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     let entry = clock::now();
     if number != long.call().number() {
@@ -445,7 +447,7 @@ fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     }
     match long {
         Long::Create(m) => make(thread, m, entry),
-        _ => portions(thread, long, entry),
+        Long::Change(on) => portions(thread, on, entry),
     }
 }
 
@@ -493,14 +495,9 @@ fn mem_create(thread: NonNull<Thread>, a: &Args) {
 /// or NO_MEMORY, the only error that comes late, and the object goes at
 /// the caller's priority.
 fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
-    let mut start = entry;
-    while !memory::fill(m) {
-        cleanup::count_portion(start);
-        if arch::irq_pending() {
-            return restart(thread);
-        }
-        start = clock::now();
-    }
+    let Some((_, start)) = run_portions(thread, entry, || Ok(memory::fill(m))) else {
+        return;
+    };
     thread::end_long(thread);
     let h = process::insert_handle(caller(thread), Object::Memory(m), MEMORY_RIGHTS);
     // SAFETY: the reference `create` handed out, which the long call held,
@@ -509,6 +506,35 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
     unsafe { memory::release(m, cause(thread)) };
     set_result(thread, h.map(|h| Values::new(&[h.0])));
     cleanup::count_portion(start);
+}
+
+/// The portions of a long call of `thread` from `entry`, the counter when
+/// the kernel took the call (spec 7.7): `step` does one and says whether
+/// the call is done. Each stretch between two polls for interrupts counts
+/// toward the longest portion (KERNEL_STATS x5), the first with the checks
+/// of its entry. After a portion that leaves work, with an interrupt
+/// pending the call starts over at its `svc` (`restart`) and this returns
+/// None; otherwise the next portion follows. Returns the result of the last
+/// portion and when its stretch began, which the caller counts once the
+/// call ended.
+fn run_portions(
+    thread: NonNull<Thread>,
+    entry: u64,
+    mut step: impl FnMut() -> Result<bool, Error>,
+) -> Option<(Result<(), Error>, u64)> {
+    let mut start = entry;
+    loop {
+        match step() {
+            Ok(false) => {}
+            done => return Some((done.map(|_| ()), start)),
+        }
+        cleanup::count_portion(start);
+        if arch::irq_pending() {
+            restart(thread);
+            return None;
+        }
+        start = clock::now();
+    }
 }
 
 /// mem_map(x0 process with MANAGE, x1 memory object, x2 offset, x3 length,
@@ -528,7 +554,7 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
 /// that fails changes nothing but the block. Then the portions
 /// (`portions`), which never fail but for a process that ends meanwhile;
 /// the entry records the rights of x1 to map, which bound its mem_protect.
-fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
+fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let pages = range_arg(a[4], a[3])?;
     if !a[2].is_multiple_of(PAGE_SIZE) {
         return Err(Error::InvalidArgs);
@@ -550,13 +576,9 @@ fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
     let map = Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC;
     let offset = (a[2] / PAGE_SIZE) as u32;
     let mapping = Mapping::new(a[4], pages as u32, offset, m, Rights(rights.0 & map.0));
-    let (on, prepaid) = process::add_mapping(target, mapping)?;
+    let on = process::add_mapping(target, mapping, access)?;
     process::retain(target);
-    Ok(Long::Map {
-        on,
-        access,
-        prepaid,
-    })
+    Ok(on)
 }
 
 /// mem_unmap(x0 process with MANAGE, x1 address, x2 length): the mapping
@@ -569,15 +591,13 @@ fn mem_map(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
 /// message buffer is no mapping (INVALID_ARGS); no long call works on it
 /// (BAD_STATE). Then the portions; the mapping's reference to its object
 /// goes at the end.
-fn mem_unmap(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
+fn mem_unmap(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let pages = range_arg(a[1], a[2])?;
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
     process::check_alive(target)?;
     let (index, _) = process::find_mapping(target, a[1], pages)?;
     process::retain(target);
-    Ok(Long::Unmap {
-        on: process::begin_change(target, index),
-    })
+    Ok(process::begin_change(target, index, Op::Unmap))
 }
 
 /// mem_protect(x0 process with MANAGE, x1 address, x2 length, x3 access):
@@ -589,7 +609,7 @@ fn mem_unmap(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
 /// (INVALID_ARGS), no long call works on it (BAD_STATE), and the access
 /// needs no right the mapping was not made with (ACCESS_DENIED). Then the
 /// portions.
-fn mem_protect(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
+fn mem_protect(thread: NonNull<Thread>, a: &Args) -> Result<Change, Error> {
     let pages = range_arg(a[1], a[2])?;
     let access = access_arg(a[3])?;
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
@@ -599,10 +619,7 @@ fn mem_protect(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
         return Err(Error::AccessDenied);
     }
     process::retain(target);
-    Ok(Long::Protect {
-        on: process::begin_change(target, index),
-        access,
-    })
+    Ok(process::begin_change(target, index, Op::Protect { access }))
 }
 
 /// The first entry of mem_map, mem_unmap or mem_protect, whose checks and
@@ -611,13 +628,13 @@ fn mem_protect(thread: NonNull<Thread>, a: &Args) -> Result<Long, Error> {
 fn change(
     thread: NonNull<Thread>,
     a: &Args,
-    first: fn(NonNull<Thread>, &Args) -> Result<Long, Error>,
+    first: fn(NonNull<Thread>, &Args) -> Result<Change, Error>,
 ) {
     let entry = clock::now();
     match first(thread, a) {
-        Ok(long) => {
-            thread::begin_long(thread, long);
-            portions(thread, long, entry)
+        Ok(on) => {
+            thread::begin_long(thread, Long::Change(on));
+            portions(thread, on, entry)
         }
         Err(e) => set_result(thread, Err(e)),
     }
@@ -634,36 +651,27 @@ fn change(
 /// last one ends the call with 0 (process::finish_change); a process that
 /// ended meanwhile ends it with BAD_STATE (process::abandon_change). Either
 /// way the call's reference to the process goes, at the caller's priority.
-fn portions(thread: NonNull<Thread>, mut long: Long, entry: u64) {
-    let mut start = entry;
-    let result = loop {
-        match process::step_change(&mut long) {
-            Ok(false) => {
-                thread::update_long(thread, long);
-                cleanup::count_portion(start);
-                if arch::irq_pending() {
-                    return restart(thread);
-                }
-                start = clock::now();
-            }
-            Ok(true) => break Ok(Values::none()),
-            Err(e) => break Err(e),
+fn portions(thread: NonNull<Thread>, mut on: Change, entry: u64) {
+    let Some((result, start)) = run_portions(thread, entry, || {
+        let done = process::step_change(&mut on)?;
+        if !done {
+            thread::update_long(thread, Long::Change(on));
         }
+        Ok(done)
+    }) else {
+        return;
     };
     thread::end_long(thread);
-    let (Long::Map { on, .. } | Long::Unmap { on } | Long::Protect { on, .. }) = long else {
-        unreachable!("mem_create changes no mapping");
-    };
     // SAFETY: the call is over, and its reference to the process goes
     // last.
     unsafe {
         match result {
-            Ok(_) => process::finish_change(long, cause(thread)),
-            Err(_) => process::abandon_change(long, cause(thread)),
+            Ok(()) => process::finish_change(on, cause(thread)),
+            Err(_) => process::abandon_change(on, cause(thread)),
         }
         process::release(on.target, cause(thread));
     }
-    set_result(thread, result);
+    set_result(thread, result.map(|()| Values::none()));
     cleanup::count_portion(start);
 }
 
