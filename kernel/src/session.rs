@@ -3,9 +3,10 @@
 
 //! Sessions (spec 4, 5.3): what a channel handle with a label names. A
 //! label goes on a copy of a channel handle once, in handle_duplicate,
-//! which makes the session: it holds the channel with a counted reference,
-//! the label and a notification slot of the priority the call gave, and it
-//! takes one of the channel's slots (abi::MAX_SLOTS) until it goes. It lies
+//! which makes the session: a source of notifications of the channel
+//! (channel::Source), which holds the channel with a counted reference,
+//! the label and a notification slot of the priority the call gave, and
+//! one of the channel's slots (abi::MAX_SLOTS) until it goes. It lies
 //! in the pool of sessions of the process that made the call, which pays
 //! for it by the page (spec 7.8), and holds that process's shell until its
 //! slot goes back. It counts its copies: the handles that name it, and the
@@ -20,27 +21,23 @@
 //! let go when they take the slot; the last one queues it, and its portion
 //! lets the channel and the payer's shell go.
 
-use crate::channel::{self, Channel, Owner};
+use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item};
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
 use abi::{CLIENT_GONE, Error, Rights};
 use core::ptr::NonNull;
-use kcore::notify::Slot;
 
 pub struct Session {
-    /// The slot of its notifications: notify through its handles, and
-    /// CLIENT_GONE once they went.
-    slot: Slot<Owner>,
+    /// Its source of notifications, with its slot, its label and its
+    /// channel: notify through its handles, and CLIENT_GONE once they went.
+    source: Source,
     /// Its copies, the reference `create` hands out, and its slot's while
     /// the slot is queued: the references that keep it.
     refs: Refs,
     /// Handles that name it and requests through them that wait in the
     /// channel's queue (spec 5.3).
     copies: u32,
-    label: u64,
-    /// The channel, which it holds with a counted reference.
-    channel: NonNull<Channel>,
     /// The process whose pool of sessions holds it, and whose shell it
     /// holds.
     payer: NonNull<Process>,
@@ -69,22 +66,21 @@ pub fn create(
     label: u64,
     priority: u8,
 ) -> Result<NonNull<Session>, Error> {
-    channel::add_source(c)?;
+    channel::reserve_source(c)?;
     let session = Session {
-        // The owner is the session's own place, known once it has one.
-        slot: Slot::new(priority, Owner::Session(NonNull::dangling())),
+        source: Source::new(c),
         refs: Refs::one(),
         copies: 0,
-        label,
-        channel: c,
         payer,
         cleanup: Item::new(),
     };
     let s = process::paid_alloc(payer, session).inspect_err(|_| channel::remove_source(c))?;
-    // SAFETY: the session was just made, nothing else refers to it, and its
-    // slot is in no queue.
-    unsafe { (*s.as_ptr()).slot = Slot::new(priority, Owner::Session(s)) };
-    channel::retain(c, Rights::NONE);
+    // SAFETY: the session was just made, and nothing else refers to it.
+    unsafe {
+        (*s.as_ptr())
+            .source
+            .attach(Owner::Session(s), priority, label)
+    };
     process::retain_shell(payer);
     LIVE.made();
     Ok(s)
@@ -100,25 +96,25 @@ unsafe fn refs<'a>(s: NonNull<Session>) -> &'a mut Refs {
     unsafe { &mut (*s.as_ptr()).refs }
 }
 
-/// The slot of `s`, which lives as long as the session.
-fn slot(s: NonNull<Session>) -> NonNull<Slot<Owner>> {
+/// The source of `s`, which lives as long as the session.
+fn source(s: NonNull<Session>) -> NonNull<Source> {
     // SAFETY: the caller holds a reference to the session; only the
     // field's address is taken.
-    unsafe { NonNull::new_unchecked(&raw mut (*s.as_ptr()).slot) }
+    unsafe { NonNull::new_unchecked(&raw mut (*s.as_ptr()).source) }
 }
 
 /// The channel `s` names, which it holds.
 pub fn channel(s: NonNull<Session>) -> NonNull<Channel> {
     // SAFETY: the caller holds a reference to the session; only the field
     // is read.
-    unsafe { (*s.as_ptr()).channel }
+    unsafe { (*s.as_ptr()).source.channel() }
 }
 
 /// The label of `s`, which receive reports with its slot (spec 5.3).
 pub fn label(s: NonNull<Session>) -> u64 {
     // SAFETY: the caller holds a reference to the session, or its slot is
     // being taken; only the field is read.
-    unsafe { (*s.as_ptr()).label }
+    unsafe { (*s.as_ptr()).source.label() }
 }
 
 /// Adds a handle with `rights` that names `s`, or a request through one
@@ -133,7 +129,7 @@ pub fn retain(s: NonNull<Session>, rights: Rights) {
         let p = s.as_ptr();
         (*p).copies = (*p).copies.checked_add(1).expect("session copies overflow");
         if rights.contains(Rights::RECEIVE) {
-            channel::retain((*p).channel, Rights::RECEIVE);
+            channel::retain(channel(s), Rights::RECEIVE);
         }
     }
 }
@@ -154,9 +150,8 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
     unsafe {
         refs(s).check();
         let p = s.as_ptr();
-        let c = (*p).channel;
         if rights.contains(Rights::RECEIVE) {
-            channel::release(c, Rights::RECEIVE, cause);
+            channel::release(channel(s), Rights::RECEIVE, cause);
         }
         (*p).copies = (*p)
             .copies
@@ -164,7 +159,7 @@ pub unsafe fn release(s: NonNull<Session>, rights: Rights, cause: u8) {
             .expect("a session's handle is released once too often");
         if (*p).copies == 0 {
             // PEER_CLOSED: the session goes at once (spec 5.3).
-            let _ = channel::post(c, slot(s), CLIENT_GONE, cause);
+            let _ = Source::post(source(s), CLIENT_GONE, cause);
         }
         unref(s, cause);
     }
@@ -201,33 +196,29 @@ pub unsafe fn unref(s: NonNull<Session>, cause: u8) {
 /// the session's slot, as channel::notify posts into the slot of label 0.
 /// PEER_CLOSED once the channel closed. O(1).
 pub fn notify(s: NonNull<Session>, bits: u64, cause: u8) -> Result<(), Error> {
-    // SAFETY: the caller's handle holds the session, which holds the
-    // channel; the slot lives as long as the session.
-    unsafe { channel::post(channel(s), slot(s), bits, cause) }
+    // SAFETY: the caller's handle holds the session, which is attached;
+    // the slot lives as long as the session.
+    unsafe { Source::post(source(s), bits, cause) }
 }
 
 /// The portion of a session nothing refers to (cleanup::portion), at
-/// `level`: it gives its slot in the channel back, its place goes back to
-/// the payer's pool, and then the references to the channel and to the
-/// payer's shell go, each of which may queue what it held at `level`.
-/// Its slot is in no queue: a queued slot holds the session. O(1).
+/// `level`: its source goes, which gives its slot in the channel back and
+/// lets the channel go (Source::detach), its place goes back to the
+/// payer's pool, and then the reference to the payer's shell goes; each
+/// may queue what it held at `level`. Its slot is in no queue: a queued
+/// slot holds the session. O(1).
 ///
 /// # Safety
 /// Nothing refers to the session, and it is in no queue.
 pub unsafe fn clean(s: NonNull<Session>, level: u8) {
-    // SAFETY: the caller's promise; only the fields are read.
-    let (c, payer) = unsafe { ((*s.as_ptr()).channel, (*s.as_ptr()).payer) };
-    channel::remove_source(c);
-    // SAFETY: nothing uses the session afterwards; the payer's pool is
-    // there, since the session holds the payer's shell.
+    // SAFETY: the caller's promise; nothing uses the session afterwards;
+    // the payer's pool is there, since the session holds the payer's
+    // shell, whose reference goes last.
     unsafe {
+        let payer = (*s.as_ptr()).payer;
+        (*s.as_ptr()).source.detach(level);
         process::paid_free(payer, s);
         LIVE.gone(s);
-    }
-    // SAFETY: the session's references to its channel and to its payer's
-    // shell go with it.
-    unsafe {
-        channel::release(c, Rights::NONE, level);
         process::release_shell(payer, level);
     }
 }
@@ -252,7 +243,7 @@ mod test_access {
     pub fn priority(s: NonNull<Session>) -> u8 {
         // SAFETY: the test holds a reference to the session; only the slot is
         // read.
-        unsafe { (*s.as_ptr()).slot.priority() }
+        unsafe { (*s.as_ptr()).source.priority() }
     }
 
     /// The process that pays for `s`, which the test holds.

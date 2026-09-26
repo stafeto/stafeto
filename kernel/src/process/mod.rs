@@ -33,7 +33,7 @@
 //! their replies (spec 4, 6.8); once it ended, its stage Replies wakes
 //! their clients with PEER_CLOSED.
 
-use crate::channel::{self, Channel, Owner};
+use crate::channel::{Channel, Owner, Source};
 use crate::cleanup::{self, Item};
 use crate::memory::Memory;
 use crate::mm::aspace::{AddressSpace, SpaceRelease};
@@ -142,9 +142,12 @@ pub struct Process {
     /// its end and those of the calls that hastened it (`hasten`). It only
     /// grows.
     level: u8,
-    /// Where its end goes as a notification (process_create x3, spec 7.9):
-    /// set once, before anything can end the process.
-    exit: Option<Exit>,
+    /// The source of its exit notification (process_create x3, spec 6.5,
+    /// 7.9): its slot lies in the shell and holds the shell while it stands
+    /// in the channel's queue, with the label of the handle process_create
+    /// took as x3; the shell holds the channel, with one of its slots,
+    /// until the shell goes. Set once, before anything can end the process.
+    exit: Option<Source>,
     /// At the stage Stop, the child it stops next; a child that leaves
     /// the list moves it on (`leave_parent`).
     stop_next: Option<NonNull<Process>>,
@@ -187,17 +190,6 @@ pub struct Pools {
     timers: Pool<Timer>,
     /// The memory objects it made (spec 7.3).
     memories: Pool<Memory>,
-}
-
-/// The source of a process's exit notification (spec 6.5, 7.9): its slot,
-/// which lies in the shell and holds the shell while it stands in the
-/// channel's queue, the label of the handle process_create took as x3,
-/// and the channel, which the shell holds, with one of its slots, until
-/// the shell goes.
-struct Exit {
-    slot: Slot<Owner>,
-    label: u64,
-    channel: NonNull<Channel>,
 }
 
 /// Neighbours in the list of a parent's children.

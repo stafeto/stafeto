@@ -708,7 +708,7 @@ fn process_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     // insert the child's handle there last (spec 11).
     process::handle_room(caller(thread))?;
     if let Some((c, _)) = exit {
-        channel::add_source(c)?;
+        channel::reserve_source(c)?;
     }
     let made = new_child(thread, quota, limit, ceiling, start.map(|(_, o, r)| (o, r)));
     match made {

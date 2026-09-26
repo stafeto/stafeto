@@ -1592,7 +1592,8 @@ fn with_timer(
 /// timer_create stops at the caller's limits (spec 7.8, 10, 11): with the
 /// caller's table full it fails with LIMIT_REACHED, and with its quota
 /// spent with NO_MEMORY for a page of its pool of timers, with nothing
-/// made. A good call returns a handle with
+/// made; with every slot of the channel taken, LIMIT_REACHED comes before
+/// the quota (spec 6.5). A good call returns a handle with
 /// abi::OWNER_RIGHTS to a timer the caller pays for, not armed; timer_set
 /// arms it at its deadline in ticks and timer_cancel takes it off the
 /// heap, and timer_set on a closed channel fails with PEER_CLOSED and
@@ -1612,6 +1613,13 @@ pub fn timer_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static s
 
 fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     let n = Call::TimerCreate.number();
+    // First, while the caller's pool of timers has no page.
+    let full = c.created(Call::CreateChannel.number(), &[10])?;
+    let refused = fill_slots(c, full)
+        .and_then(|()| with_used_quota(c, || c.fails(n, &[full.0, 30], Error::LimitReached)));
+    c.close(full)?;
+    cleanup::drain();
+    refused?;
     let h = c.created(Call::CreateChannel.number(), &[10])?;
     let result = (|| {
         let timers = timers::in_use();
@@ -1632,6 +1640,17 @@ fn timer_create_cases(c: &Caller) -> Result<(), &'static str> {
     // The case of the closed channel closed it already.
     let _ = process::close_handle(c.process, h, CAUSE);
     result
+}
+
+/// Takes every slot of the caller's channel `h` but the slot of label 0
+/// with sessions whose handles the caller closes: CLIENT_GONE keeps each
+/// in the channel's queue (spec 5.3, 6.5).
+fn fill_slots(c: &Caller, h: Handle) -> Result<(), &'static str> {
+    for label in 1..u64::from(MAX_SLOTS) {
+        let s = c.created(Call::HandleDuplicate.number(), &[h.0, 0, label, 10])?;
+        c.close(s)?;
+    }
+    Ok(())
 }
 
 fn timer_set_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {

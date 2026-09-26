@@ -47,7 +47,7 @@ type Outcome = Result<(), &'static str>;
 /// A test's name and body.
 type Test = (&'static str, fn() -> Outcome);
 
-const TESTS: [Test; 158] = [
+const TESTS: [Test; 159] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -179,6 +179,10 @@ const TESTS: [Test; 158] = [
         notify_after_close_is_peer_closed,
     ),
     ("slot_limit_is_1024", slot_limit_is_1024),
+    (
+        "sources_give_their_slots_back",
+        sources_give_their_slots_back,
+    ),
     (
         "exit_notice_comes_after_the_quota",
         exit_notice_comes_after_the_quota,
@@ -2672,6 +2676,44 @@ fn slot_limit_is_1024() -> Outcome {
     check(
         order && rest == Err(Error::WouldBlock),
         "the sessions did not leave with CLIENT_GONE in their order",
+    )
+}
+
+/// Spec 15.2 (notifications): a source of notifications gives its slot of
+/// the channel back as it goes (spec 6.5). On one channel, a thousand
+/// times, a session leaves with CLIENT_GONE, a timer goes, and a child
+/// whose exit channel it is ends; then 1023 sessions still fit beside the
+/// slot of label 0, and the next one fails with LIMIT_REACHED.
+fn sources_give_their_slots_back() -> Outcome {
+    const ROUNDS: u64 = 1000;
+    let c = channel(QUIET)?;
+    let churned = (1..=ROUNDS).try_for_each(|label| {
+        close(session(&c, Rights::NONE, label, QUIET)?)?;
+        let gone = sys::try_receive(&c);
+        close(timer(&c)?)?;
+        let child = sys::process_create_with(LEAST_QUOTA, 16, LOW, Some((&c, QUIET)), None);
+        close(child.map_err(|_| "process_create with an exit channel failed")?)?;
+        let ended = sys::try_receive(&c);
+        check(
+            gone == Ok(labelled(label, CLIENT_GONE, 1)) && ended == Ok(exit_notice(0)),
+            "a session or a child did not leave with its notification",
+        )
+    });
+    let last = u64::from(abi::MAX_SLOTS) - 1;
+    let filled = churned.and_then(|()| {
+        (1..=last).try_for_each(|label| close(session(&c, Rights::NONE, label, QUIET)?))
+    });
+    let past = sys::handle_label(&c, Rights::NONE, last + 1, QUIET);
+    let refused = past.as_ref().err() == Some(&Error::LimitReached);
+    if let Ok(h) = past {
+        close(h)?;
+    }
+    while sys::try_receive(&c).is_ok() {}
+    close(c)?;
+    filled?;
+    check(
+        refused,
+        "a session past 1023 and the slot of label 0 was made",
     )
 }
 

@@ -2156,7 +2156,7 @@ fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
     let h = give(parent, Object::Channel(c), Rights::RECEIVE);
     let child = process::create_child(parent, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING);
     let heard = child.and_then(|child| {
-        channel::add_source(c)?;
+        channel::reserve_source(c)?;
         process::set_exit(child, c, EXIT_LABEL, PRIORITY - 5);
         Ok(child)
     });
@@ -2720,7 +2720,7 @@ fn shared_channel(
 fn exit_channel_of(q: NonNull<Process>, p: NonNull<Process>) -> Result<u64, &'static str> {
     let c = channel::create(q, PRIORITY).map_err(|_| "no channel")?;
     let h = give(q, Object::Channel(c), Rights::RECEIVE);
-    let source = channel::add_source(c);
+    let source = channel::reserve_source(c);
     if source.is_ok() {
         process::set_exit(p, c, EXIT_LABEL, PRIORITY);
     }

@@ -5,35 +5,35 @@
 //! timer is a source of notifications on a channel (spec 6.5): it lies in
 //! the pool of timers of the process that made it, which pays for it by the
 //! page (spec 7.8), counts it toward abi::MAX_TIMERS and holds its shell
-//! until the timer's place goes back. It holds its channel with a counted
-//! reference and one of the channel's slots, and its own slot of the
-//! priority timer_create gave, with the label of the handle it was made
-//! through. An armed timer stands in the heap of its level, the priority of
-//! its slot, its node inside the timer (kcore::timer::Levels): arming and
-//! cancelling take O(log n) and allocate nothing, and the nearest deadline
-//! of the levels whose firing is not queued, O(1), joins the end of a
-//! quantum in the kernel's timer (sched::decide). The kernel's timer
-//! interrupt takes no timer off: each level whose top expired queues its
-//! own item of the cleanup queue at that level (`expire`), and the item's
-//! portion takes up to FIRE_PORTION expired timers of the level, each
-//! posting bit 0 into its slot at that level (`fire`, spec 7.7, 10). A
-//! timer lives while references to it are left: its handles, the one
-//! `create` hands out, and its slot's while the slot stands in the
-//! channel's queue. The last one marks it dying and queues it (spec 7.7): a
-//! dying timer fires no more, and its portion takes it off its heap and
-//! lets the channel and the payer's shell go. The lock of the levels and
-//! the scheduler's are never held together: a post takes the scheduler's
-//! lock only once the lock of the levels went.
+//! until the timer's place goes back. It is a source of the channel
+//! (channel::Source): it holds the channel with a counted reference and one
+//! of the channel's slots, and its own slot of the priority timer_create
+//! gave, with the label of the handle it was made through. An armed timer
+//! stands in the heap of its level, the priority of its slot, its node
+//! inside the timer (kcore::timer::Levels): arming and cancelling take
+//! O(log n) and allocate nothing, and the nearest deadline of the levels
+//! whose firing is not queued, O(1), joins the end of a quantum in the
+//! kernel's timer (sched::decide). The kernel's timer interrupt takes no
+//! timer off: each level whose top expired queues its own item of the
+//! cleanup queue at that level (`expire`), and the item's portion takes up
+//! to FIRE_PORTION expired timers of the level, each posting bit 0 into its
+//! slot at that level (`fire`, spec 7.7, 10). A timer lives while
+//! references to it are left: its handles, the one `create` hands out, and
+//! its slot's while the slot stands in the channel's queue. The last one
+//! marks it dying and queues it (spec 7.7): a dying timer fires no more,
+//! and its portion takes it off its heap and lets the channel and the
+//! payer's shell go. The lock of the levels and the scheduler's are never
+//! held together: a post takes the scheduler's lock only once the lock of
+//! the levels went.
 
 use crate::arch::timer as clock;
-use crate::channel::{self, Channel, Owner};
+use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item, Work};
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
-use abi::{Error, Rights};
+use abi::Error;
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use kcore::notify::Slot;
 use kcore::sync::Lock;
 use kcore::timer::{Firing, HeapLink, HeapNode, LEVELS, Levels};
 
@@ -43,15 +43,12 @@ const TIMER_BITS: u64 = 1;
 pub struct Timer {
     /// Its node in the heap while it is armed, with the deadline in ticks.
     node: HeapLink<Timer>,
-    /// The slot of its expiries.
-    slot: Slot<Owner>,
+    /// Its source of notifications: the slot of its expiries, the label of
+    /// the handle it was made through (spec 5.3) and the channel.
+    source: Source,
     /// Its handles, the reference `create` hands out, and its slot's while
     /// the slot is queued: the references that keep it.
     refs: Refs,
-    /// The label of the handle it was made through (spec 5.3).
-    label: u64,
-    /// The channel, which it holds with a counted reference.
-    channel: NonNull<Channel>,
     /// The process whose pool of timers holds it, and whose shell it
     /// holds.
     payer: NonNull<Process>,
@@ -123,23 +120,22 @@ pub fn create(
     priority: u8,
 ) -> Result<NonNull<Timer>, Error> {
     process::timer_room(payer)?;
-    channel::add_source(c)?;
+    channel::reserve_source(c)?;
     let timer = Timer {
         node: HeapLink::new(),
-        // The owner is the timer's own place, known once it has one.
-        slot: Slot::new(priority, Owner::Timer(NonNull::dangling())),
+        source: Source::new(c),
         refs: Refs::one(),
-        label,
-        channel: c,
         payer,
         dying: false,
         cleanup: Item::new(),
     };
     let t = process::paid_alloc(payer, timer).inspect_err(|_| channel::remove_source(c))?;
-    // SAFETY: the timer was just made, nothing else refers to it, and its
-    // slot is in no queue.
-    unsafe { (*t.as_ptr()).slot = Slot::new(priority, Owner::Timer(t)) };
-    channel::retain(c, Rights::NONE);
+    // SAFETY: the timer was just made, and nothing else refers to it.
+    unsafe {
+        (*t.as_ptr())
+            .source
+            .attach(Owner::Timer(t), priority, label)
+    };
     process::retain_shell(payer);
     LIVE.made();
     Ok(t)
@@ -155,25 +151,25 @@ unsafe fn refs<'a>(t: NonNull<Timer>) -> &'a mut Refs {
     unsafe { &mut (*t.as_ptr()).refs }
 }
 
-/// The slot of `t`, which lives as long as the timer.
-fn slot(t: NonNull<Timer>) -> NonNull<Slot<Owner>> {
+/// The source of `t`, which lives as long as the timer.
+fn source(t: NonNull<Timer>) -> NonNull<Source> {
     // SAFETY: the caller holds a reference to the timer, or the heap does;
     // only the field's address is taken.
-    unsafe { NonNull::new_unchecked(&raw mut (*t.as_ptr()).slot) }
+    unsafe { NonNull::new_unchecked(&raw mut (*t.as_ptr()).source) }
 }
 
 /// The level of `t`: the priority of its slot, which never changes.
 fn level(t: NonNull<Timer>) -> u8 {
     // SAFETY: the caller holds a reference to the timer, or the heap does;
     // only the slot is read.
-    unsafe { (*t.as_ptr()).slot.priority() }
+    unsafe { (*t.as_ptr()).source.priority() }
 }
 
 /// The label of `t`, which receive reports with its slot.
 pub fn label(t: NonNull<Timer>) -> u64 {
     // SAFETY: the slot of the timer is being taken, and it holds the timer;
     // only the field is read.
-    unsafe { (*t.as_ptr()).label }
+    unsafe { (*t.as_ptr()).source.label() }
 }
 
 /// Adds a reference to `t`: a new handle, or its slot's when the slot just
@@ -215,7 +211,7 @@ pub unsafe fn release(t: NonNull<Timer>, cause: u8) {
 pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
     // SAFETY: the caller's handle holds the timer, which holds its channel;
     // only the field is read.
-    let c = unsafe { (*t.as_ptr()).channel };
+    let c = unsafe { (*t.as_ptr()).source.channel() };
     if channel::is_closed(c) {
         return Err(Error::PeerClosed);
     }
@@ -235,10 +231,10 @@ pub fn set(t: NonNull<Timer>, deadline: u64, cause: u8) -> Result<(), Error> {
             }
         }
     }
-    // SAFETY: the caller's handle holds the timer and so its channel; the
+    // SAFETY: the caller's handle holds the timer, which is attached; the
     // slot lives as long as the timer. The channel is open: a closed one
     // would only drop the post.
-    let _ = unsafe { channel::post(c, slot(t), TIMER_BITS, cause) };
+    let _ = unsafe { Source::post(source(t), TIMER_BITS, cause) };
     Ok(())
 }
 
@@ -312,7 +308,7 @@ pub fn fire_at(level: u8, now: u64) {
             if (*t.as_ptr()).dying {
                 continue;
             }
-            let _ = channel::post((*t.as_ptr()).channel, slot(t), TIMER_BITS, level);
+            let _ = Source::post(source(t), TIMER_BITS, level);
         }
     }
     let more = {
@@ -335,11 +331,12 @@ pub fn longest_firing() -> u64 {
 }
 
 /// The portion of a timer nothing refers to (cleanup::portion), at
-/// `level`: it leaves its heap, if it is armed, gives its slot in the
-/// channel back, its place goes back to the payer's pool, and then the
-/// references to the channel and to the payer's shell go, each of which
-/// may queue what it held at `level`. Its slot is in no queue: a queued
-/// slot holds the timer. O(log n).
+/// `level`: it leaves its heap, if it is armed, its source goes, which
+/// gives its slot in the channel back and lets the channel go
+/// (Source::detach), its place goes back to the payer's pool, and then the
+/// reference to the payer's shell goes; each may queue what it held at
+/// `level`. Its slot is in no queue: a queued slot holds the timer.
+/// O(log n).
 ///
 /// # Safety
 /// Nothing refers to the timer, and it is in no queue.
@@ -355,24 +352,14 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
             }
         }
     }
-    // SAFETY: as above; only the fields are read.
-    let (c, payer) = unsafe { ((*t.as_ptr()).channel, (*t.as_ptr()).payer) };
-    assert!(
-        // SAFETY: as above.
-        !unsafe { (*t.as_ptr()).slot.is_queued() },
-        "a timer goes while its slot is queued"
-    );
-    channel::remove_source(c);
-    // SAFETY: nothing uses the timer afterwards; the payer's pool is there,
-    // since the timer holds the payer's shell.
+    // SAFETY: as above; nothing uses the timer afterwards; the payer's
+    // pool is there, since the timer holds the payer's shell, whose
+    // reference goes last.
     unsafe {
+        let payer = (*t.as_ptr()).payer;
+        (*t.as_ptr()).source.detach(level);
         process::paid_free(payer, t);
         LIVE.gone(t);
-    }
-    // SAFETY: the timer's references to its channel and to its payer's
-    // shell go with it.
-    unsafe {
-        channel::release(c, Rights::NONE, level);
         process::release_shell(payer, level);
     }
 }
@@ -405,7 +392,7 @@ mod test_access {
     /// the timer posted, and nothing took the slot since.
     pub fn posted(t: NonNull<Timer>) -> bool {
         // SAFETY: the test knows the timer alive; only the slot is read.
-        unsafe { (*t.as_ptr()).slot.is_queued() }
+        unsafe { (*t.as_ptr()).source.is_queued() }
     }
 
     /// The process that pays for `t`, which the test holds.
