@@ -174,7 +174,8 @@ const _: () = assert!(Pool::<Process>::PER_PAGE >= 2);
 pub struct Pools {
     /// Its threads, whoever made them.
     threads: Pool<Thread>,
-    /// The chunks and the directory of its handle table.
+    /// The chunks and the directory of its handle table, and the table of
+    /// its mappings (`maps`).
     blocks: Pool<Block>,
     /// The shells of its children.
     children: Pool<Process>,
