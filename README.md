@@ -62,6 +62,17 @@ and on Apple silicon under HVF. What works today:
 - **Faults:** a program fault ends only its own process, and the parent
   learns why through its exit channel; the tests check it on child
   processes with code that `init` loads from the boot image.
+- **Runtime:** programs build on `lib/rt`. A handle owns its table entry
+  and closes it when dropped; a send or a reply the kernel refuses gives
+  back the handles it left. The test images are strict builds, where
+  `BAD_HANDLE` panics. The kernel and `rt` share one time scale, a
+  multiply and a shift, and `rt` waits with a bound through a timer. A
+  parent starts a child with named handles and arguments through the
+  start protocol (`proto/wire`, `proto/init`). A service loop keeps a
+  session per client label with its own limits, answers deferred replies
+  when a client goes, and sends its heartbeat at absolute deadlines from
+  the thread that serves requests. One ELF reader, `bootimg::elf`, builds
+  the boot image, whose reader refuses two files with one name.
 
 `cargo xtask run` shows `init` saying hello from EL0 and two of its threads
 taking turns. `cargo xtask test` runs the tests on QEMU's GICv2 and GICv3;
@@ -90,6 +101,7 @@ parts. Each finished part is merged through a pull request.
 | | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ✅ [#14](https://github.com/stafeto/stafeto/pull/14) |
 | 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | 🚧 |
 | | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
+| | 1.4b Runtime and protocols | handles that own their entries, strict test builds, one time scale, `proto/wire` and `proto/init`, start protocol, service loop with sessions and a heartbeat, ELF reader in `bootimg` | 🚧 |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the

@@ -4,7 +4,8 @@
 //! The boot image (spec 13.1) and the simple program format of its first
 //! file, init (spec 3.3). The kernel reads both in no_std; xtask writes
 //! them on the host (feature `write`), and the writer reads its result back
-//! with the same reader, so the two cannot disagree on the layout.
+//! with the same reader, so the two cannot disagree on the layout. The
+//! reader of a program's ELF file (`elf`) gives the same `Program`.
 //!
 //! Everything is little endian. The boot image: a 16-byte header (the
 //! signature `STAFBOOT`, the version as u32, the number of files as u32),
@@ -12,7 +13,8 @@
 //! padded with zeros; the offset of the file from the start of the image
 //! and its size, both u64), then the files at 4 KiB boundaries in the order
 //! of the table, and zeros to the end of the last page: the image is whole
-//! pages, which the kernel maps as they are. The first file is init.
+//! pages, which the kernel maps as they are. The first file is init, and
+//! no two files have one name.
 //!
 //! A program: a 120-byte header (the signature `STAFPROG`, the version as
 //! u32, the stack size in bytes as u32, the entry point as u64, then three
@@ -28,6 +30,8 @@
 
 #[cfg(any(test, feature = "write"))]
 extern crate alloc;
+
+pub mod elf;
 
 use abi::INIT_STACK_TOP;
 use core::fmt;
@@ -64,6 +68,8 @@ pub enum Error {
     /// File `n` does not start at a 4 KiB boundary at or after the end of
     /// the table and of the file before it.
     Misplaced(u32),
+    /// File `n` has the name of a file before it.
+    DuplicateName(u32),
     /// The image has no files, or its first file is not init.
     NoInit,
     /// The stack size is zero, not whole pages, or so large that the stack
@@ -103,6 +109,7 @@ impl fmt::Display for Error {
                 f,
                 "file {n} is not at a 4 KiB boundary after the table and the file before it"
             ),
+            Error::DuplicateName(n) => write!(f, "file {n} has the name of a file before it"),
             Error::NoInit => f.write_str("the first file is not init"),
             Error::BadStack(s) => write!(
                 f,
@@ -167,7 +174,8 @@ pub struct File<'a> {
 }
 
 /// A boot image whose header and whole table are checked: every file has
-/// a good name and lies inside the image, in order, at a 4 KiB boundary.
+/// a good name of its own and lies inside the image, in order, at a 4 KiB
+/// boundary.
 #[derive(Debug, Clone, Copy)]
 pub struct BootImage<'a> {
     bytes: &'a [u8],
@@ -207,6 +215,9 @@ impl<'a> BootImage<'a> {
             let file = image.file(n)?;
             if file.offset < end {
                 return Err(Error::Misplaced(n));
+            }
+            if image.files().take(n as usize).any(|f| f.name == file.name) {
+                return Err(Error::DuplicateName(n));
             }
             end = file.offset + file.data.len() as u64;
         }
@@ -660,6 +671,38 @@ mod tests {
         let mut bytes = image();
         bytes[entry_at(1)] = 0xFF; // "hello" is no longer UTF-8
         assert_eq!(BootImage::parse(&bytes).err(), Some(Error::BadName(1)));
+    }
+
+    #[test]
+    fn duplicate_names_are_refused() {
+        let init = write::program(&sample()).unwrap();
+        let good = write::image(&[("init", &init), ("child", b"a"), ("shell", b"b")]).unwrap();
+        for (n, name) in [(1, "init"), (2, "child")] {
+            let mut bytes = good.clone();
+            bytes[entry_at(n)..entry_at(n) + NAME_MAX].fill(0);
+            bytes[entry_at(n)..entry_at(n) + name.len()].copy_from_slice(name.as_bytes());
+            assert_eq!(
+                BootImage::parse(&bytes).err(),
+                Some(Error::DuplicateName(n as u32)),
+                "file {n}"
+            );
+        }
+        assert_eq!(
+            Error::DuplicateName(2).to_string(),
+            "file 2 has the name of a file before it"
+        );
+    }
+
+    #[test]
+    fn writer_refuses_duplicate_names() {
+        assert_eq!(
+            write::image(&[("init", b"x"), ("child", b"y"), ("child", b"z")]),
+            Err(Error::DuplicateName(2))
+        );
+        assert_eq!(
+            write::image(&[("init", b"x"), ("init", b"y")]),
+            Err(Error::DuplicateName(1))
+        );
     }
 
     #[test]

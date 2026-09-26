@@ -3,7 +3,6 @@
 
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
-mod elf;
 mod image;
 mod qemu;
 
@@ -481,7 +480,7 @@ fn write_boot_image(
         let elf = cargo_output(&target, PROGRAM_TARGET, profile, package);
         let why = |e: String| format!("{}: {e}", elf.display());
         let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
-        let program = elf::program(&bytes, stack).map_err(why)?;
+        let program = bootimg::elf::program(&bytes, stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
         files.push((file, written, elf));
     }

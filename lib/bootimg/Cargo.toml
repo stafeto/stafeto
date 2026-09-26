@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "MIT"
-description = "The stafeto boot image format: read in no_std, written on the host"
+description = "The stafeto boot image format and the reader of program ELF files: read in no_std, written on the host"
 
 [lib]
 bench = false
