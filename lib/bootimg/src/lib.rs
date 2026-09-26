@@ -703,6 +703,10 @@ mod tests {
             write::image(&[("init", b"x"), ("init", b"y")]),
             Err(Error::DuplicateName(1))
         );
+        assert_eq!(
+            write::image(&[("init", b"x"), ("child", b"y"), ("init", b"z")]),
+            Err(Error::DuplicateName(2))
+        );
     }
 
     #[test]

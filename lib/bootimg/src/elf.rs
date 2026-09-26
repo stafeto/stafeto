@@ -82,7 +82,8 @@ impl fmt::Display for ElfError {
 }
 
 /// The program in `elf`, with a stack of `stack_size` bytes; its segments
-/// borrow the file's bytes.
+/// borrow the file's bytes. The program is not checked here:
+/// Program::parse of the written program checks it.
 pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
     if elf.len() < 64 || elf[..4] != *b"\x7fELF" {
         return Err(ElfError::NotElf);
