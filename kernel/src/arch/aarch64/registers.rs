@@ -11,8 +11,8 @@ macro_rules! read_sysreg {
         v
     }};
 }
-/// The kernel tests read more registers with it (crate::ktest::registers).
-#[cfg(feature = "ktest")]
+/// The GIC driver and the kernel tests (crate::ktest::registers) read more
+/// registers with it.
 pub(crate) use read_sysreg;
 
 pub fn esr_el1() -> u64 {
@@ -25,6 +25,11 @@ pub fn far_el1() -> u64 {
 
 pub fn id_aa64dfr0_el1() -> u64 {
     read_sysreg!("id_aa64dfr0_el1")
+}
+
+/// This CPU's affinity (kcore::gic::irouter).
+pub fn mpidr_el1() -> u64 {
+    read_sysreg!("mpidr_el1")
 }
 
 pub fn ttbr0_el1() -> u64 {

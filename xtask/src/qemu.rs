@@ -22,6 +22,8 @@ pub const ICOUNT: &[&str] = &["-icount", "shift=4,sleep=off"];
 
 /// A QEMU machine type with its options, and a CPU model.
 pub struct Machine {
+    /// How xtask's lines of results name the machine.
+    pub name: &'static str,
     pub machine: &'static str,
     pub cpu: &'static str,
     pub memory: &'static str,
@@ -29,6 +31,7 @@ pub struct Machine {
 
 /// The machine of the spec: the kernel is entered at EL1, PSCI goes through HVC.
 pub const VIRT: Machine = Machine {
+    name: "512M",
     machine: "virt,gic-version=2",
     cpu: "cortex-a72",
     memory: "512M",
@@ -37,6 +40,7 @@ pub const VIRT: Machine = Machine {
 /// The kernel is entered at EL2, as on the PinePhone's Cortex-A53; PSCI then
 /// goes through SMC.
 pub const VIRT_EL2: Machine = Machine {
+    name: "EL2",
     machine: "virt,gic-version=2,virtualization=on",
     cpu: "cortex-a53",
     memory: "512M",
@@ -48,9 +52,28 @@ pub const VIRT_EL2: Machine = Machine {
 /// the cache maintenance too; the kernel is entered at EL1 and PSCI goes
 /// through HVC, as on VIRT.
 pub const VIRT_2G: Machine = Machine {
+    name: "2G",
     machine: "virt,gic-version=2",
     cpu: "cortex-a53",
     memory: "2G",
+};
+
+/// The spec machine with QEMU's GICv3 in place of the GICv2 (spec 9, 15.2):
+/// the kernel takes the version from the device tree.
+pub const VIRT_V3: Machine = Machine {
+    name: "GICv3",
+    machine: "virt,gic-version=3",
+    cpu: "cortex-a72",
+    memory: "512M",
+};
+
+/// VIRT_EL2 with the GICv3: head.S opens the GICv3 system registers to EL1
+/// before it drops there.
+pub const VIRT_EL2_V3: Machine = Machine {
+    name: "EL2 GICv3",
+    machine: "virt,gic-version=3,virtualization=on",
+    cpu: "cortex-a53",
+    memory: "512M",
 };
 
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
@@ -485,6 +508,17 @@ mod tests {
         assert!(joined.contains("-m 2G"));
         assert!(joined.contains("-cpu cortex-a53"));
         assert!(!joined.contains("virtualization"));
+    }
+
+    #[test]
+    fn gicv3_machines_ask_for_gic_version_3() {
+        let joined = args(&VIRT_V3, Path::new("k.img"), None).join(" ");
+        assert!(joined.contains("-machine virt,gic-version=3 "));
+        assert!(joined.contains("-cpu cortex-a72"));
+        assert!(joined.contains("-m 512M"));
+        let joined = args(&VIRT_EL2_V3, Path::new("k.img"), None).join(" ");
+        assert!(joined.contains("-machine virt,gic-version=3,virtualization=on"));
+        assert!(joined.contains("-cpu cortex-a53"));
     }
 
     #[test]

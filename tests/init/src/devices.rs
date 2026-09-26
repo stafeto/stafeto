@@ -303,9 +303,11 @@ fn device_window(addr: u64, len: u64) -> Result<Handle<Memory>, &'static str> {
 /// wraps around or ends past 2^48 fail with INVALID_ARGS through a closed
 /// handle too; a closed handle, a channel and a copy of the resource
 /// without DEVICE with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED, over RAM
-/// too; a page of RAM, of the GIC's distributor or CPU interface or of the
-/// PL011 with INVALID_ARGS. A window on the PL031 changes x0 and x1 alone,
-/// and its handle carries abi::WINDOW_RIGHTS and no MAP_EXEC.
+/// too; a page of RAM, of the GIC's distributor or of the PL011 with
+/// INVALID_ARGS; the kernel test device_window_refuses_every_gic_page
+/// checks the other regions of the GIC, which differ between machines. A
+/// window on the PL031 changes x0 and x1 alone, and its handle carries
+/// abi::WINDOW_RIGHTS and no MAP_EXEC.
 fn device_window_create_checks_its_arguments() -> Outcome {
     const N: u16 = Call::DeviceWindowCreate.number();
     let gone = closed_handle()?;
@@ -327,7 +329,7 @@ fn device_window_create_checks_its_arguments() -> Outcome {
     ]
     .iter()
     .all(|&(h, e)| x0_alone::<N>(&[h, 0x4000_0000, page], e.code()));
-    let kernel = [0x4000_0000, 0x0800_0000, 0x0801_0000, 0x0900_0000]
+    let kernel = [0x4000_0000, 0x0800_0000, 0x0900_0000]
         .iter()
         .all(|&addr| x0_alone::<N>(&[resource, addr, page], Error::InvalidArgs.code()));
     let mut x = marked();

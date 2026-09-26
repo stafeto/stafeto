@@ -104,6 +104,9 @@ const INIT_LINES: [&str; 9] = [
     "thread 2: turn 3",
     "init: both threads are done",
 ];
+/// The kernel's lines of the GIC on QEMU's GICv2 and GICv3 (spec 9).
+const GIC_V2_LINE: &str = "gic        v2 distributor 0x8000000, cpu interface 0x8010000";
+const GIC_V3_LINE: &str = "gic        v3 distributor 0x8000000, redistributor 0x80a0000";
 /// The kernel's last line when init exits with 0 (spec 7.9).
 const INIT_EXIT: &str = "init exited with code 0";
 /// Lines of a run of the test init (tests/init) besides its TEST lines,
@@ -454,8 +457,10 @@ fn run() -> Result<(), String> {
 
 fn test() -> Result<(), String> {
     host_tests()?;
-    boot_smoke()?;
-    el2_boot_smoke()?;
+    boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
+    boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
+    el2_boot_smoke(&qemu::VIRT_EL2)?;
+    el2_boot_smoke(&qemu::VIRT_EL2_V3)?;
     two_gib_boot()?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
@@ -467,8 +472,10 @@ fn test() -> Result<(), String> {
     init_tests(&qemu::VIRT_2G, false)?;
     init_tests(&qemu::VIRT, true)?;
     init_tests(&qemu::VIRT_2G, true)?;
+    init_tests(&qemu::VIRT_V3, false)?;
     kernel_tests(&qemu::VIRT, Variant::Test)?;
     kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
+    kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
     kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
     kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
     println!("all checks passed");
@@ -498,19 +505,21 @@ fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
     qemu::expect_clean_exit_with(o, INIT_EXIT)
 }
 
-/// A normal build boots, prints its report with the timer frequency and
-/// init's entry point from the boot image, starts init, and powers the
-/// machine off when init exits. The image also carries none of the
-/// kernel's own tests (spec 3.4): `no_test_symbols` checks it here so
-/// every normal build, not just the one that ships, is covered.
-fn boot_smoke() -> Result<(), String> {
+/// A normal build boots on machine `m`, prints its report with the line of
+/// the GIC, `gic`, the timer frequency and init's entry point from the
+/// boot image, starts init, and powers the machine off when init exits.
+/// The image also carries none of the kernel's own tests (spec 3.4):
+/// `no_test_symbols` checks it here so every normal build, not just the
+/// one that ships, is covered.
+fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<(), String> {
     let a = build(Variant::Normal)?;
     no_test_symbols(&a.elf)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")?;
     expect_init_run(&o)?;
+    qemu::expect_line(&o, gic)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     match qemu::number_after(&o.lines, "timer ") {
@@ -519,12 +528,13 @@ fn boot_smoke() -> Result<(), String> {
     }
 }
 
-/// The same build entered at EL2, as the PinePhone's loader does: head.S
-/// must drop to EL1, and power-off goes through SMC. Not the ktest build: its
+/// The same build entered at EL2 on machine `m`, as the PinePhone's loader
+/// does: head.S must drop to EL1, with a GICv3 open its system registers to
+/// EL1 first, and power-off goes through SMC. Not the ktest build: its
 /// device tree test expects HVC.
-fn el2_boot_smoke() -> Result<(), String> {
+fn el2_boot_smoke(m: &qemu::Machine) -> Result<(), String> {
     let a = build(Variant::Normal)?;
-    let mut cmd = qemu::command(&qemu::VIRT_EL2, &a.image, Some(&a.boot_image));
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
     let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
     qemu::expect_clean_exit_with(&o, "boot complete")?;
@@ -786,7 +796,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     let under = if icount { " under icount" } else { "" };
     println!(
         "kernel tests{under} on {}: {} passed",
-        m.memory,
+        m.name,
         r.passed.len()
     );
     if icount {
@@ -798,7 +808,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
             ("device window", &WINDOW_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
-            println!("{what} ticks on {}: {}", m.memory, rows_of(rows, &ticks));
+            println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
     }
     Ok(())
@@ -887,16 +897,12 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<(), String> {
         ));
     }
     let under = if icount { " under icount" } else { "" };
-    println!(
-        "init tests{under} on {}: {} passed",
-        m.memory,
-        r.passed.len()
-    );
+    println!("init tests{under} on {}: {} passed", m.name, r.passed.len());
     if icount {
         let ticks = ticks_of(&o.lines, "normal build", &NORMAL_BUILD_ROWS)?;
         println!(
             "normal build ticks on {}: {}",
-            m.memory,
+            m.name,
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
     }

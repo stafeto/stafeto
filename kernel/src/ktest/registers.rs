@@ -31,6 +31,17 @@ pub fn tcr_el1() -> u64 {
     read_sysreg!("tcr_el1")
 }
 
+/// On a GICv3 only: a CPU without its system registers takes the read as
+/// an undefined instruction.
+pub fn icc_sre_el1() -> u64 {
+    read_sysreg!("icc_sre_el1")
+}
+
+/// On a GICv3 only, as `icc_sre_el1`.
+pub fn icc_igrpen1_el1() -> u64 {
+    read_sysreg!("icc_igrpen1_el1")
+}
+
 pub fn current_el() -> u64 {
     (read_sysreg!("CurrentEL") >> 2) & 3
 }

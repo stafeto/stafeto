@@ -35,3 +35,30 @@ pub unsafe fn write32(addr: usize, value: u32) {
         asm!("str {v:w}, [{a}]", a = in(reg) addr, v = in(reg) value, options(nostack, preserves_flags))
     };
 }
+
+/// Reads the 64-bit register at `addr`.
+///
+/// # Safety
+///
+/// `addr` is an 8-byte aligned register of a device the kernel tables map
+/// as device memory.
+pub unsafe fn read64(addr: usize) -> u64 {
+    let value: u64;
+    // SAFETY: the caller's promise.
+    unsafe {
+        asm!("ldr {v}, [{a}]", a = in(reg) addr, v = out(reg) value, options(nostack, preserves_flags))
+    };
+    value
+}
+
+/// Writes the 64-bit register at `addr`.
+///
+/// # Safety
+///
+/// As for `read64`.
+pub unsafe fn write64(addr: usize, value: u64) {
+    // SAFETY: the caller's promise.
+    unsafe {
+        asm!("str {v}, [{a}]", a = in(reg) addr, v = in(reg) value, options(nostack, preserves_flags))
+    };
+}
