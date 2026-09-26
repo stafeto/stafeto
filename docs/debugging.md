@@ -69,6 +69,14 @@
 
 6. If PC is near zero or garbage, `VBAR_EL1` has not been set yet.
 
+7. Every build ends a run with PSCI `SYSTEM_OFF`, and QEMU exits with
+   status 0: when `init` exits, at a panic, and at the end of the kernel
+   tests, which print `TESTS DONE total=N failed=M` first. xtask judges a
+   run of tests by that line and fails a run with a `KERNEL PANIC` line
+   anywhere. A panic before the kernel has read the PSCI conduit from the
+   device tree parks the processor instead, and the run ends at xtask's
+   deadline.
+
 ## Address from a panic
 
 A panic prints the call stack as addresses. lldb gives the function name

@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! In-kernel tests for `cargo xtask test`. Each test prints one line in the
-//! format xtask parses; the run ends with a semihosting exit code. The tests
-//! at EL0 (`el0`) come last, as a chain that never returns here.
+//! format xtask parses; the run ends with the `TESTS DONE` line and PSCI
+//! SYSTEM_OFF (spec 14). The tests at EL0 (`el0`) come last, as a chain
+//! that never returns here.
 
 pub mod calls;
 pub mod el0;
@@ -11,7 +12,7 @@ mod registers;
 
 use crate::arch::symbols;
 use crate::arch::user::UserRegs;
-use crate::arch::{self, gic, semihosting, timer};
+use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel;
 use crate::cleanup;
@@ -497,13 +498,14 @@ fn report(name: &str, result: Result<(), &'static str>) {
     }
 }
 
-/// Prints the verdict and leaves QEMU. The line counts the tests of the
-/// build, so that xtask notices a TEST line lost in the output.
+/// Prints the verdict and powers the machine off (spec 14): xtask judges
+/// the run by this line. The line counts the tests of the build, so that
+/// xtask notices a TEST line lost in the output.
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
     kprintln!("TESTS DONE total={total} failed={failed}");
-    semihosting::exit(if failed == 0 { 0 } else { 1 })
+    crate::psci::system_off()
 }
 
 fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {

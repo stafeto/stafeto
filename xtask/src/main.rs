@@ -768,17 +768,17 @@ fn stack_overflow_report() -> Result<(), String> {
     qemu::overflow_report_names(&o.lines, f)
 }
 
-/// Kernel built with `ktest` on machine `m`: runs its tests and exits QEMU
-/// through semihosting. On 2 GiB the tests also cover RAM the boot page
-/// tables did not map. Every test the kernel counts passes once. The
-/// `icount` build runs under qemu::ICOUNT, where virtual time counts
-/// instructions: the tests that depend on how much of a quantum is left
-/// run only there. A hang, such as a quantum that never ends, fails at
-/// TEST_TIMEOUT.
+/// Kernel built with `ktest` on machine `m`: runs its tests, prints
+/// `TESTS DONE` and powers the machine off through PSCI (spec 14). On 2
+/// GiB the tests also cover RAM the boot page tables did not map. Every
+/// test the kernel counts passes once. The `icount` build runs under
+/// qemu::ICOUNT, where virtual time counts instructions: the tests that
+/// depend on how much of a quantum is left run only there. A hang, such
+/// as a quantum that never ends, fails at TEST_TIMEOUT.
 fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<(), String> {
     let a = build(variant)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
-    cmd.args(qemu::HEADLESS).arg("-semihosting");
+    cmd.args(qemu::HEADLESS);
     let icount = variant == Variant::TestIcount;
     if icount {
         cmd.args(qemu::ICOUNT);
@@ -1203,6 +1203,35 @@ mod tests {
         ] {
             assert!(child_panic_comes_whole(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Runs end with PSCI SYSTEM_OFF on every machine (spec 14): the exit
+    /// through `hlt #0xf000`, an undefined instruction under HVF, is gone
+    /// from the kernel, the programs, xtask and the documents. The word is
+    /// built here so that this test finds neither its text nor its name.
+    #[test]
+    fn no_semihosting_left() {
+        let word = ["semi", "hosting"].concat();
+        let own_name = format!("fn no_{word}_left() {{");
+        let mut found: Vec<_> = texts(&[
+            "kernel",
+            "kcore",
+            "lib",
+            "services",
+            "tests",
+            "xtask",
+            "docs",
+            "README.md",
+        ])
+        .into_iter()
+        .filter(|(_, text)| {
+            text.lines()
+                .any(|l| l.to_lowercase().contains(&word) && l.trim() != own_name)
+        })
+        .map(|(name, _)| name)
+        .collect();
+        found.sort();
+        assert!(found.is_empty(), "{word} in {found:?}");
     }
 
     /// The kernel tests wake their threads through timers of programs

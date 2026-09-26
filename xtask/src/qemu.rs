@@ -422,13 +422,18 @@ pub fn parse_report(lines: &[String]) -> TestReport {
 }
 
 /// A run of tests in QEMU finished in time with status 0, some tests
-/// passed, none failed, and the run said so.
+/// passed, none failed, the run said so in its `TESTS DONE` line, and the
+/// kernel did not panic: a panic powers the machine off with status 0 as
+/// well (spec 14).
 pub fn verdict(o: &Outcome, r: &TestReport) -> Result<(), String> {
     if o.timed_out {
         return Err(format!(
             "QEMU did not finish in time; last lines: {:?}",
             tail(&o.lines)
         ));
+    }
+    if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
+        return Err(format!("the kernel panicked: {panic}"));
     }
     if !r.failed.is_empty() {
         return Err(format!("{} test(s) failed: {:?}", r.failed.len(), r.failed));
@@ -874,6 +879,27 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ..with(&["TEST a ok", "TESTS DONE failed=0"])
         };
         assert!(verdict(&bad_status, &parse_report(&bad_status.lines)).is_err());
+    }
+
+    #[test]
+    fn verdict_needs_the_tests_done_line() {
+        let cut = finished(&["TEST a ok", "TEST b ok"]);
+        assert!(verdict(&cut, &parse_report(&cut.lines)).is_err());
+        let done = finished(&["TEST a ok", "TEST b ok", "TESTS DONE failed=0"]);
+        assert!(verdict(&done, &parse_report(&done.lines)).is_ok());
+    }
+
+    /// A panic powers the machine off with status 0 (spec 14), so only its
+    /// line tells it from a clean end.
+    #[test]
+    fn verdict_rejects_a_panic_after_the_report() {
+        for panic in [
+            "KERNEL PANIC: panicked at kernel/src/ktest.rs:1:1:",
+            "KERNEL PANIC while panicking; parking",
+        ] {
+            let o = finished(&["TEST a ok", "TESTS DONE failed=0", "", panic]);
+            assert!(verdict(&o, &parse_report(&o.lines)).is_err(), "{panic}");
+        }
     }
 
     fn finished(l: &[&str]) -> Outcome {
