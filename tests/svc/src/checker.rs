@@ -7,9 +7,12 @@
 //! START past LAST, PING and HEARTBEAT, REGISTER from a client, CONNECT
 //! to services that registered, to one that registers later and past four
 //! waiting requests, and to names the table does not give it, what the
-//! REGISTER of `device` brought, LIST and STATS. It prints `TEST <name>
-//! ok` or `TEST <name> FAIL <why>` for each test in turn, then `TESTS DONE
-//! total=<n> failed=<m>`, and ends with code 0; xtask reads the lines.
+//! REGISTER of `device` brought, the restarts of `crash` until it is
+//! broken, the wait of `hog` for quota, LIST and STATS. LIST and STATS
+//! come once `crash` is broken, when no record starts again. It prints
+//! `TEST <name> ok` or `TEST <name> FAIL <why>` for each test in turn,
+//! then `TESTS DONE total=<n> failed=<m>`, and ends with code 0; xtask
+//! reads the lines, and init's line of its end.
 
 use crate::device::{BINDING, BINDING_COPIES, EDGE, Report, WINDOW, WINDOW_COPIES};
 use crate::{CHECKER, ECHO, VERSION, base, method};
@@ -37,7 +40,7 @@ type Test = (&'static str, fn(&Checker) -> Outcome);
 /// `a_fifth_waiting_connect_gets_limit_reached` wait for `slow`, which
 /// registers once the checker opens the gate of `echo`, and
 /// `connect_waits_for_registration` opens it and collects them.
-const TESTS: [Test; 15] = [
+const TESTS: [Test; 18] = [
     (
         "start_data_brings_the_service_args",
         start_data_brings_the_service_args,
@@ -80,6 +83,18 @@ const TESTS: [Test; 15] = [
         connect_waits_for_registration,
     ),
     (
+        "crash_is_broken_after_five_failures",
+        crash_is_broken_after_five_failures,
+    ),
+    (
+        "connect_to_a_broken_service_is_peer_closed",
+        connect_to_a_broken_service_is_peer_closed,
+    ),
+    (
+        "a_record_without_quota_waits_and_is_not_broken",
+        a_record_without_quota_waits_and_is_not_broken,
+    ),
+    (
         "list_names_every_record_in_its_state",
         list_names_every_record_in_its_state,
     ),
@@ -111,14 +126,20 @@ const HELLO: &[u8] = b"hello";
 /// The records LIST gives: init, then the records of init's test table in
 /// its order, each with its priority, its ceiling and whether it is a
 /// client.
-const RECORDS: [(&str, u8, u8, bool); 6] = [
+const RECORDS: [(&str, u8, u8, bool); 8] = [
     ("init", 63, 63, false),
     ("echo", 40, 40, false),
     ("slow", 40, 40, false),
     ("device", 40, 40, false),
+    ("crash", 35, 35, false),
     ("checker", 30, 30, true),
     ("private", 20, 20, false),
+    ("hog", 20, 20, false),
 ];
+/// The records that do not run with no failure once `crash` is broken:
+/// their state, their failures within 60 s and their restarts.
+const NOT_RUNNING: [(&str, State, u8, u32); 2] =
+    [("crash", State::Broken, 5, 4), ("hog", State::Quota, 0, 0)];
 /// The level of init's worker thread with no job.
 const WORKER_IDLE: u8 = 1;
 const PAGE: u64 = 4096;
@@ -136,16 +157,29 @@ static ECHOED: [AtomicBool; HELPERS] = [const { AtomicBool::new(false) }; HELPER
 static THREADS: [AtomicU64; HELPERS] = [const { AtomicU64::new(0) }; HELPERS];
 static DONE: AtomicU64 = AtomicU64::new(0);
 
-/// What the tests share: the checker's start data.
+/// What the tests share: the checker's start data, when it started and
+/// the failures of `crash` then (LIST).
 pub struct Checker {
     s: Startup,
+    started_ns: u64,
+    crash_failures: u8,
 }
 
 pub fn run(mut s: Startup) -> u64 {
+    let started_ns = now_ns();
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let c = Checker { s };
+    let c = Checker {
+        s,
+        started_ns,
+        crash_failures: 0,
+    };
+    let crash_failures = record(&c, "crash").map_or(0, |r| r.failures);
+    let c = Checker {
+        crash_failures,
+        ..c
+    };
     let mut failed = 0;
     for (name, test) in TESTS {
         match test(&c) {
@@ -501,7 +535,8 @@ fn named(got: &Listed, name: &str) -> bool {
 }
 
 /// LIST gives init first, then every record of the table in its order,
-/// each with its priority, ceiling and kind, and all run with no failure.
+/// each with its priority, ceiling and kind; all run with no failure but
+/// those of NOT_RUNNING, each in its state with its failures and restarts.
 fn list_names_every_record_in_its_state(c: &Checker) -> Outcome {
     settle(c)?;
     let page = list(c, 0)?;
@@ -515,9 +550,13 @@ fn list_names_every_record_in_its_state(c: &Checker) -> Outcome {
             (got.priority, got.ceiling, got.client) == (priority, ceiling, client),
             "LIST gives a record other levels or another kind",
         )?;
+        let expected = NOT_RUNNING
+            .iter()
+            .find(|r| r.0 == name)
+            .map_or((State::Running, 0, 0), |&(_, s, f, r)| (s, f, r));
         check(
-            got.state == State::Running && got.failures == 0 && got.restarts == 0,
-            "a record does not run, or it failed",
+            (got.state, got.failures, got.restarts) == expected,
+            "a record has another state, other failures or other restarts",
         )?;
     }
     Ok(())
@@ -584,8 +623,11 @@ fn stats(c: &Checker) -> Result<Stats, &'static str> {
 }
 
 /// STATS brings the counts of the kernel, the worker, init's free quota
-/// and the labels init gave: with every record started the worker waits at
-/// its idle level with no job, and one more CONNECT gives one more label.
+/// and the labels init gave: with every record started or broken the
+/// worker has no job and waits at its idle level, in receive or on its way
+/// there (READY: init lowered it as soon as its last job was done, and
+/// the checker keeps the processor above it), and one more CONNECT gives
+/// one more label.
 fn stats_bring_the_kernel_the_worker_and_the_quota(c: &Checker) -> Outcome {
     let first = stats(c)?;
     check(
@@ -596,9 +638,10 @@ fn stats_bring_the_kernel_the_worker_and_the_quota(c: &Checker) -> Outcome {
         first.job.is_none() && first.pending == 0,
         "the worker has a job",
     )?;
+    let idle = [ThreadState::Receiving, ThreadState::Ready].map(|s| s.code());
     check(
         (first.worker_priority, first.worker_effective) == (WORKER_IDLE, WORKER_IDLE)
-            && u64::from(first.worker_state) == ThreadState::Receiving.code(),
+            && idle.contains(&u64::from(first.worker_state)),
         "the worker does not wait at its idle level",
     )?;
     check(first.free_pages > 0, "STATS gives init no free quota")?;
@@ -620,4 +663,63 @@ fn stats_bring_the_kernel_the_worker_and_the_quota(c: &Checker) -> Outcome {
     let _echo = c.connect("echo").map_err(|_| "no session with echo")?;
     let second = stats(c)?;
     check(second.labels > first.labels, "a CONNECT gave no label")
+}
+
+/// The record `name` in the first page of LIST.
+fn record(c: &Checker, name: &str) -> Result<Listed, &'static str> {
+    let page = list(c, 0)?;
+    let found = page.records().find(|r| named(r, name)).copied();
+    found.ok_or("LIST has no such record")
+}
+
+/// CONNECT to `crash`, which faults right after each start, waits while
+/// init restarts it after pauses of 100, 200, 400 and 800 ms, and gets
+/// PEER_CLOSED once its fifth failure marks it broken, no earlier than
+/// the pauses after the failures it had not had when the checker started.
+/// LIST shows it BROKEN with five failures and four restarts.
+fn crash_is_broken_after_five_failures(c: &Checker) -> Outcome {
+    let got = c.connect("crash").err();
+    check(
+        got == Some(Status::Kernel(Error::PeerClosed)),
+        "CONNECT to crash did not get PEER_CLOSED",
+    )?;
+    check(
+        c.crash_failures < 5,
+        "crash was broken before the checker started",
+    )?;
+    // The pauses after the failures still to come: 100 ms * 2^(k-1) after
+    // failure k, from the failures of crash when the checker started.
+    let pauses: u64 = (u32::from(c.crash_failures)..4)
+        .map(|k| (100 * MS) << k)
+        .sum();
+    check(
+        now_ns() >= c.started_ns + pauses,
+        "crash was broken before its pauses were over",
+    )?;
+    let crash = record(c, "crash")?;
+    check(
+        (crash.state, crash.failures, crash.restarts) == (State::Broken, 5, 4),
+        "LIST does not show crash broken after five failures",
+    )
+}
+
+/// A CONNECT to a broken service gets PEER_CLOSED at once.
+fn connect_to_a_broken_service_is_peer_closed(c: &Checker) -> Outcome {
+    let got = c.connect("crash").err();
+    check(
+        got == Some(Status::Kernel(Error::PeerClosed)),
+        "CONNECT to the broken crash did not get PEER_CLOSED",
+    )
+}
+
+/// `hog` needs more than init's quota: its start waits (QUOTA) with no
+/// failure, no restart and no instance.
+fn a_record_without_quota_waits_and_is_not_broken(c: &Checker) -> Outcome {
+    let hog = record(c, "hog")?;
+    check(hog.state == State::Quota, "hog does not wait for quota")?;
+    check(
+        hog.failures == 0 && hog.restarts == 0,
+        "the wait of hog counted as a failure",
+    )?;
+    check(hog.live == 0 && hog.quota_pages == 0, "hog has an instance")
 }

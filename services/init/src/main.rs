@@ -9,8 +9,9 @@
 //! kernel ends with a panic (spec 7.9). Then it maps the boot image, makes
 //! its channel, starts its worker thread (worker.rs), which loads the
 //! records of the table in the order of their dependencies, and serves the
-//! channel from its main thread at 63 (serve.rs). Once the first start of
-//! each record is done it prints `init: services started`.
+//! channel from its main thread at 63 (serve.rs), where it restarts the
+//! services that fail. Once the first start of each record is done, or
+//! waits for quota, it prints `init: services started`.
 
 #![no_std]
 #![no_main]
@@ -74,7 +75,7 @@ fn main(_: u64) -> u64 {
     let worker = worker::Worker::start(&init.process, &channel, &init.resource, label)
         .expect("init starts its worker thread");
     let mut service = serve::Init::new(init.process, init.resource, worker, labels, programs);
-    service.start(&order);
+    service.start(&channel, &order);
     let config = Config {
         issued: 0,
         heartbeat: None,

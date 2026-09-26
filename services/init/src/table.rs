@@ -1043,7 +1043,9 @@ mod tests {
         assert_eq!(order_of(normal::TABLE), [""; 0]);
         assert_eq!(
             order_of(test::TABLE),
-            ["echo", "slow", "device", "checker", "private"]
+            [
+                "echo", "slow", "device", "crash", "checker", "private", "hog"
+            ]
         );
         assert_eq!(
             refused(cycle::TABLE),

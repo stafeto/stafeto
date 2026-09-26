@@ -120,7 +120,24 @@ const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round
 const SERVICES_STARTED: &str = "init: services started";
 /// The names of the records of init's test table (services/init, feature
 /// `table-test`), which the init that ships does not carry.
-const TEST_TABLE_NAMES: [&str; 5] = ["echo", "slow", "device", "checker", "private"];
+const TEST_TABLE_NAMES: [&str; 7] = [
+    "echo", "slow", "device", "crash", "checker", "private", "hog",
+];
+/// The start of the line init prints when the client `checker` of its
+/// test table ends, and the whole line: its policy is never (spec 13.4).
+/// xtask stops QEMU on it.
+const CHECKER_END: &str = "init: checker ended: ";
+const CHECKER_ENDED: &str = "init: checker ended: exit code 0, not restarted";
+/// Init's decisions on the failures of `crash` of its test table, in
+/// their order (spec 13.4, 16.2): four restarts, each pause twice the one
+/// before, then the mark of a broken service.
+const CRASH_DECISIONS: [&str; 5] = [
+    "restarts in 100 ms",
+    "restarts in 200 ms",
+    "restarts in 400 ms",
+    "restarts in 800 ms",
+    "broken: 5 failures in 60 s",
+];
 /// Where RAM starts on QEMU's `virt`.
 const VIRT_RAM: u64 = 0x4000_0000;
 /// The kernel's lines of the GIC on QEMU's GICv2 and GICv3 (spec 9).
@@ -181,7 +198,7 @@ const _: () = assert!(
 /// could drop a test with the line.
 const INIT_TESTS: u32 = 216;
 /// Tests the client `checker` of init's test table has (tests/svc).
-const SVC_TESTS: u32 = 15;
+const SVC_TESTS: u32 = 18;
 /// What init prints for each table it refuses (services/init, features
 /// `table-cycle` and `table-ceiling`), each line whole.
 const REFUSED: [(&str, &[ImageProgram], &str); 2] = [
@@ -1238,17 +1255,23 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
 /// The image of init's test table (spec 15.2): init built with
 /// `table-test` and the test services (tests/svc), on the normal build of
 /// the kernel, on machine `m`. The client `checker` runs its tests: each
-/// of its SVC_TESTS passes once, and xtask stops QEMU on its `TESTS DONE`
-/// line (qemu::counted_verdict of a run stopped on its line, where no
-/// panic may come). Gives the number of tests that passed.
+/// of its SVC_TESTS passes once, then it ends, and xtask stops QEMU on
+/// init's line of its end (qemu::counted_verdict of a run stopped on its
+/// line, where no panic may come). Init's lines of the failures and of
+/// the end of the client come whole
+/// (`failure_lines_name_the_reason_and_the_pause`,
+/// `a_client_that_ends_is_not_restarted`). Gives the number of tests that
+/// passed.
 fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
     let a = build(Variant::Normal)?;
     let image = build_boot_image("boot-svc.img", &SVC_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, Some("TESTS DONE "))?;
+    let o = qemu::run_until(cmd, TEST_TIMEOUT, Some(CHECKER_END))?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
+    failure_lines_name_the_reason_and_the_pause(&o.lines)?;
+    a_client_that_ends_is_not_restarted(&o)?;
     if r.total != Some(SVC_TESTS) {
         return Err(format!(
             "the checker has {:?} tests, {SVC_TESTS} expected",
@@ -1257,6 +1280,58 @@ fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
     }
     println!("service tests on {}: {} passed", m.name, r.passed.len());
     Ok(r.passed.len())
+}
+
+/// Spec 13.4, 16.2: init prints one line for each failure of `crash` of
+/// its test table, with its reason, a fault at address 0 with the
+/// syndrome and the address of the load, and its decision, those of
+/// CRASH_DECISIONS in their order. The wait of `hog` for quota is no
+/// failure: one line says that it waits, none that it ended or did not
+/// load.
+fn failure_lines_name_the_reason_and_the_pause(lines: &[String]) -> Result<(), String> {
+    let crash: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("init: crash ended: "))
+        .collect();
+    if crash.len() != CRASH_DECISIONS.len() {
+        return Err(format!(
+            "{} lines of failures of crash, {} expected: {crash:?}",
+            crash.len(),
+            CRASH_DECISIONS.len()
+        ));
+    }
+    let hex = |s: &str| u64::from_str_radix(s, 16).is_ok();
+    for (line, decision) in crash.iter().zip(CRASH_DECISIONS) {
+        let (reason, got) = line.split_once("; ").unwrap_or((line, ""));
+        let fault = reason
+            .strip_prefix("fault ESR=0x")
+            .and_then(|r| r.split_once(" FAR=0x0 ELR=0x"))
+            .is_some_and(|(esr, elr)| hex(esr) && hex(elr));
+        if !fault || got != decision {
+            return Err(format!(
+                "init: crash ended: {line}: a fault at 0 and {decision:?} expected"
+            ));
+        }
+    }
+    let waits = lines
+        .iter()
+        .filter(|l| l.starts_with("init: hog waits for quota: needs "))
+        .count();
+    let failed = lines
+        .iter()
+        .find(|l| l.starts_with("init: hog ended") || l.starts_with("init: hog did not load"));
+    match (waits, failed) {
+        (1, None) => Ok(()),
+        (_, Some(line)) => Err(format!("the wait of hog for quota failed it: {line}")),
+        (n, None) => Err(format!("{n} lines of hog's wait for quota, one expected")),
+    }
+}
+
+/// Spec 13.4: the client `checker`, whose policy is never, ends with code
+/// 0 once its tests are done, and init does not start it again: the run
+/// stopped on CHECKER_ENDED, its last line, with no panic before it.
+fn a_client_that_ends_is_not_restarted(o: &qemu::Outcome) -> Result<(), String> {
+    qemu::expect_stopped_on(o, CHECKER_ENDED)
 }
 
 /// Spec 13.4, 15.2: init refuses each table of REFUSED before it starts

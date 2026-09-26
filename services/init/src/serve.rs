@@ -14,26 +14,34 @@
 //! anyone. The notification of the worker thread brings the outcome of
 //! its job: the main thread starts the thread of the instance it loaded,
 //! and gives the worker the next job of the queue at the level
-//! init::work::worker_level sets. Each handler is bounded by the records
-//! of the table; the main thread loads, maps and kills nothing itself
-//! (worker.rs).
+//! init::work::worker_level sets. The notification of the end of an
+//! instance is a failure of its record: init prints its reason and what it
+//! decided (init::restart), the worker tears the instance down, and the
+//! record's timer, whose slot is at the record's ceiling, ends the pause
+//! before its restart; each start waits while init's quota falls short of
+//! what the instance needs (init::quota). Each handler is bounded by the
+//! records of the table; the main thread loads, maps and kills nothing
+//! itself, and lets go of no last handle of an instance (worker.rs).
 
-use crate::worker::{Order, Outcome, Worker};
-use abi::{Error, ObjectKind, Rights, Source};
+use crate::worker::{Gone, Loaded, Worker};
+use abi::{Error, ObjectKind, ProcessState, Rights, Source};
 use bootimg::Program;
+use core::fmt;
 use init::PAGE;
 use init::labels::Labels;
-use init::table::{self, MAX_RECORDS, Record, TABLE};
+use init::quota::{self, Start};
+use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
+use init::table::{self, MAX_RECORDS, Record, Restart, TABLE};
 use init::work::{Job, Queue, WORKER_IDLE, worker_level};
 use proto_init::{
     Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
     START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
-use rt::handle::{Channel, Outgoing, Process, Resource};
+use rt::handle::{Channel, Outgoing, Process, Resource, Timer};
 use rt::loader::Spawned;
 use rt::service::{Answer, Notice, Pending, Request, Service, Session};
-use rt::{Handle, println, sys};
+use rt::{Handle, println, sys, time};
 
 /// The CONNECT requests that wait for one service at most.
 pub const WAITING_MAX: usize = 4;
@@ -41,30 +49,96 @@ pub const WAITING_MAX: usize = 4;
 const STARTED: &str = "init: services started";
 /// The priority and the ceiling of init's main thread (spec 8, 13.3).
 const MAIN: u8 = 63;
+const MS: u64 = 1_000_000;
+const S: u64 = 1_000 * MS;
 
 /// An instance of a record: what the worker loaded (its process and first
 /// thread, the label of its start channel, what is left of its start
-/// data), and the channel a service registered.
+/// data), the channel a service registered, and when its thread started,
+/// in nanoseconds on the one scale of the system.
 struct Instance {
     spawned: Spawned,
     channel: Option<Handle<Channel>>,
+    started: u64,
+}
+
+impl Instance {
+    /// What the worker tears down of the instance once it ended: what is
+    /// left of its start data closes here, copies of objects whose own
+    /// handles go to the worker.
+    fn gone(self) -> Gone {
+        Gone {
+            process: self.spawned.process,
+            thread: self.spawned.thread,
+            channel: self.channel,
+        }
+    }
 }
 
 /// What the main thread keeps for a record of the table: its state, its
-/// instance, and the CONNECT requests that wait for it to register, each
-/// with the base priority of its client.
+/// instance, what is left of the instance that ended until the worker
+/// takes it for its teardown, the CONNECT requests that wait for it to
+/// register, each with the base priority of its client, and its restarts
+/// (init::restart).
 struct Entry {
     state: State,
     instance: Option<Instance>,
+    gone: Option<Gone>,
     waiting: [Option<(Pending, u8)>; WAITING_MAX],
+    /// The record's timer on init's channel, its slot at the record's
+    /// ceiling, and its deadline: the end of the pause before a restart
+    /// (STOPPING, PAUSED) or of a wait for quota (QUOTA).
+    timer: Option<Handle<Timer>>,
+    deadline: Option<u64>,
+    failures: Failures,
+    restarts: u32,
+    /// The pause the record waited last, before a restart or for quota
+    /// (quota::start); 0 before its first start.
+    waited: u64,
+    /// Its start waits for quota since its last start: the line of the
+    /// wait comes once.
+    short: bool,
+    /// Its first start is done, or waits for quota.
+    begun: bool,
 }
 
 impl Entry {
     const NEW: Entry = Entry {
         state: State::Loading,
         instance: None,
+        gone: None,
         waiting: [const { None }; WAITING_MAX],
+        timer: None,
+        deadline: None,
+        failures: Failures::new(),
+        restarts: 0,
+        waited: 0,
+        short: false,
+        begun: false,
     };
+}
+
+/// How an instance ended (PROCESS_STATE), as the line of its failure says
+/// it (spec 16.2).
+struct End(Result<ProcessState, Error>);
+
+impl fmt::Display for End {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Ok(ProcessState::Exited { code }) => write!(f, "exit code {code}"),
+            Ok(ProcessState::Killed) => write!(f, "killed"),
+            Ok(ProcessState::Fault { esr, far, elr }) => {
+                write!(f, "fault ESR={esr:#x} FAR={far:#x} ELR={elr:#x}")
+            }
+            Ok(other) => write!(f, "{other:?}"),
+            Err(e) => write!(f, "no state ({e:?})"),
+        }
+    }
+}
+
+/// Now, in nanoseconds on the one scale of the system (spec 10).
+fn now() -> u64 {
+    time::ticks_to_ns(time::now())
 }
 
 /// Init as the service of its channel.
@@ -78,7 +152,7 @@ pub struct Init {
     queue: Queue,
     /// The job the worker does.
     current: Option<Job>,
-    /// The records whose first instance started.
+    /// The records whose first start is done or waits for quota.
     started: usize,
 }
 
@@ -106,74 +180,173 @@ impl Init {
         }
     }
 
-    /// Starts the records of the table in `order` (table::check): a job to
+    /// Starts the records of the table in `order` (table::check): the
+    /// timer of each on `channel`, init's channel, through its handle
+    /// without a label, with its slot at the record's ceiling; a job to
     /// load each, which the queue gives the worker by the ceiling of its
     /// record, and in the order of the table within a level. With an empty
     /// table the services started at once.
-    pub fn start(&mut self, order: &table::Order) {
+    pub fn start(&mut self, channel: &Handle<Channel>, order: &table::Order) {
+        for (entry, record) in self.entries.iter_mut().zip(TABLE) {
+            let timer = sys::timer_create(channel, record.ceiling);
+            entry.timer = Some(timer.expect("init makes the timer of each record"));
+        }
         for &place in order.as_slice() {
-            // The queue has a place for each record of a checked table.
-            let _ = self.queue.push(Job::new(Work::Load, place, &TABLE[place]));
+            self.launch(place);
         }
         if TABLE.is_empty() {
             println!("{STARTED}");
         }
-        self.next();
+    }
+
+    /// Puts the load of the record at `place` in the queue: LOADING.
+    fn launch(&mut self, place: usize) {
+        self.entries[place].state = State::Loading;
+        self.push(Job::new(Work::Load, place, &TABLE[place]));
+    }
+
+    /// Puts `job` in the queue. With the worker at a job, its level goes
+    /// up to that of the jobs that wait at once (init::work::worker_level);
+    /// an idle worker gets the next job.
+    fn push(&mut self, job: Job) {
+        // The queue has a place for each record, and a record has one job
+        // at a time: its load comes after the teardown of its instance.
+        let _ = self.queue.push(job);
+        if self.current.is_some() {
+            let _ = self
+                .worker
+                .set_level(worker_level(self.current, &self.queue));
+        } else {
+            self.next();
+        }
     }
 
     /// Gives the worker the next job of the queue, when it has none, at
     /// the level of that job and of those that wait; with no job left the
-    /// worker waits at WORKER_IDLE.
+    /// worker waits at WORKER_IDLE. A load for which init's quota falls
+    /// short waits (`quota_fits`), and the next job goes.
     fn next(&mut self) {
         if self.current.is_some() {
             return;
         }
-        let Some(job) = self.queue.pop() else {
-            let _ = self.worker.set_level(WORKER_IDLE);
+        while let Some(job) = self.queue.pop() {
+            let place = job.record;
+            let gone = match job.work {
+                Work::Load if !self.quota_fits(place) => continue,
+                Work::Load => None,
+                _ => match self.entries[place].gone.take() {
+                    Some(gone) => Some(gone),
+                    None => continue,
+                },
+            };
+            self.current = Some(job);
+            let _ = self
+                .worker
+                .set_level(worker_level(self.current, &self.queue));
+            // The worker's channel lives as long as init.
+            let _ = match gone {
+                Some(gone) => self.worker.teardown(gone),
+                None => {
+                    let label = self.labels.next().expect("init gave every label");
+                    let program =
+                        self.programs[place].expect("init found each program at its start");
+                    self.worker.load(place, label, program)
+                }
+            };
             return;
-        };
-        self.current = Some(job);
-        let _ = self
-            .worker
-            .set_level(worker_level(self.current, &self.queue));
-        let order = Order::Load {
-            place: job.record,
-            label: self.labels.next().expect("init gave every label"),
-            program: self.programs[job.record].expect("init found each program at its start"),
-        };
-        // The worker's channel lives as long as init.
-        let _ = self.worker.give(order);
+        }
+        let _ = self.worker.set_level(WORKER_IDLE);
     }
 
-    /// The outcome of the worker's job: an instance it loaded starts, and
-    /// the worker gets the next job.
+    /// Whether init's quota covers an instance of the record at `place`
+    /// (init::quota), which it then loads. Otherwise the start waits:
+    /// QUOTA, the record's timer at twice the pause it waited last, from
+    /// 100 ms up to 5 s, no failure; the first wait in a row prints a line.
+    fn quota_fits(&mut self, place: usize) -> bool {
+        let record = &TABLE[place];
+        let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(record.quota, &p));
+        let memory = sys::process_memory(&self.own);
+        let free = memory.map_or(0, |m| m.quota.saturating_sub(m.used) / PAGE);
+        let entry = &mut self.entries[place];
+        match quota::start(free, need, entry.waited) {
+            Start::Now => {
+                entry.short = false;
+                true
+            }
+            Start::Wait { pause_ns } => {
+                if !entry.short {
+                    println!(
+                        "init: {} waits for quota: needs {need} pages, {free} free",
+                        record.name
+                    );
+                }
+                entry.short = true;
+                entry.waited = pause_ns;
+                entry.state = State::Quota;
+                self.set_deadline(place, now().saturating_add(pause_ns));
+                self.begin(place);
+                false
+            }
+        }
+    }
+
+    /// Arms the timer of the record at `place` for `at`.
+    fn set_deadline(&mut self, place: usize, at: u64) {
+        let entry = &mut self.entries[place];
+        entry.deadline = Some(at);
+        if let Some(timer) = entry.timer.as_ref() {
+            // Init's own timer: timer_set has no error to give.
+            let _ = sys::timer_set(timer, at);
+        }
+    }
+
+    /// The first start of the record at `place` is done or waits for
+    /// quota; once that holds for each record, init says the services
+    /// started.
+    fn begin(&mut self, place: usize) {
+        let entry = &mut self.entries[place];
+        if entry.begun {
+            return;
+        }
+        entry.begun = true;
+        self.started += 1;
+        if self.started == TABLE.len() {
+            println!("{STARTED}");
+        }
+    }
+
+    /// The outcome of the worker's job: an instance it loaded starts, one
+    /// it tore down may start again, and the worker gets the next job.
     fn accept(&mut self) {
-        let Some(outcome) = self.worker.take() else {
+        let Some(loaded) = self.worker.take() else {
             return;
         };
         let Some(job) = self.current.take() else {
             return;
         };
-        match outcome {
-            Outcome::Loaded(result) => self.loaded(job.record, result),
+        match loaded {
+            Some(result) => self.loaded(job.record, result),
+            None => self.torn_down(job.record),
         }
         self.next();
     }
 
-    /// The first instance of the record at `place` loaded, or why not: its
-    /// thread starts here, once its start data wait in the entry. A client
-    /// runs from its start, a service is STARTING until it registers.
-    fn loaded(&mut self, place: usize, result: Result<Spawned, Error>) {
+    /// An instance of the record at `place` loaded, or why not, which is a
+    /// failure: its thread starts here, once its start data wait in the
+    /// entry. A client runs from its start, a service is STARTING until it
+    /// registers.
+    fn loaded(&mut self, place: usize, result: Loaded) {
         let record = &TABLE[place];
-        let entry = &mut self.entries[place];
         match result {
             Ok(spawned) => {
                 if let Err(e) = spawned.start() {
                     println!("init: {} did not start: {e:?}", record.name);
                 }
+                let entry = &mut self.entries[place];
                 entry.instance = Some(Instance {
                     spawned,
                     channel: None,
+                    started: now(),
                 });
                 entry.state = if record.is_client() {
                     State::Running
@@ -181,16 +354,112 @@ impl Init {
                     State::Starting
                 };
             }
-            Err(e) => {
-                println!("init: {} did not load: {e:?}", record.name);
+            Err(e) => self.failed(place, None, 0, format_args!("did not load: {e:?}")),
+        }
+        self.begin(place);
+    }
+
+    /// The end of the instance whose label is `label` (its exit
+    /// notification): a failure of its record, with the reason of
+    /// PROCESS_STATE.
+    fn ended(&mut self, label: u64) {
+        let Some(place) = self.caller(label) else {
+            return;
+        };
+        let Some(instance) = self.entries[place].instance.take() else {
+            return;
+        };
+        let lived = now().saturating_sub(instance.started);
+        let end = End(sys::process_state(&instance.spawned.process));
+        self.failed(
+            place,
+            Some(instance.gone()),
+            lived,
+            format_args!("ended: {end}"),
+        );
+    }
+
+    /// A failure of the record at `place` (spec 13.4, 16.2): `gone`, what
+    /// is left of its instance that lived `lived` ns, if any, goes to the
+    /// worker for its teardown; `what` says what happened. Init prints one
+    /// line with it and its decision: a record whose policy is never ends,
+    /// one that failed BREAK_AFTER times within WINDOW_NS is broken, and
+    /// the CONNECT requests that wait for either get PEER_CLOSED; any other
+    /// starts again after the pause of init::restart, on its timer, and
+    /// once its teardown is done.
+    fn failed(&mut self, place: usize, gone: Option<Gone>, lived: u64, what: fmt::Arguments) {
+        let record = &TABLE[place];
+        let now = now();
+        let entry = &mut self.entries[place];
+        let teardown = gone.is_some();
+        entry.gone = gone;
+        let verdict = match record.restart {
+            Restart::Always => Some(entry.failures.failed(now, lived)),
+            Restart::Never => None,
+        };
+        match verdict {
+            None => {
+                println!("init: {} {what}, not restarted", record.name);
                 entry.state = State::Ended;
-                // The requests that wait for it get PEER_CLOSED.
                 entry.waiting = [const { None }; WAITING_MAX];
             }
+            Some(Verdict::Broken) => {
+                println!(
+                    "init: {} {what}; broken: {BREAK_AFTER} failures in {} s",
+                    record.name,
+                    WINDOW_NS / S
+                );
+                entry.state = State::Broken;
+                entry.waiting = [const { None }; WAITING_MAX];
+            }
+            Some(Verdict::Restart { pause_ns }) => {
+                println!(
+                    "init: {} {what}; restarts in {} ms",
+                    record.name,
+                    pause_ns / MS
+                );
+                entry.restarts = entry.restarts.saturating_add(1);
+                entry.waited = pause_ns;
+                entry.state = if teardown {
+                    State::Stopping
+                } else {
+                    State::Paused
+                };
+                self.set_deadline(place, now.saturating_add(pause_ns));
+            }
         }
-        self.started += 1;
-        if self.started == TABLE.len() {
-            println!("{STARTED}");
+        if teardown {
+            self.push(Job::new(Work::Teardown, place, record));
+        }
+    }
+
+    /// The teardown of the instance of the record at `place` is done: a
+    /// record that restarts loads once its pause is over, and waits for it
+    /// otherwise.
+    fn torn_down(&mut self, place: usize) {
+        let entry = &mut self.entries[place];
+        if entry.state != State::Stopping {
+            return;
+        }
+        if entry.deadline.is_some_and(|at| !time::reached(at)) {
+            entry.state = State::Paused;
+        } else {
+            entry.deadline = None;
+            self.launch(place);
+        }
+    }
+
+    /// An expiry of a timer of the records: each record whose deadline the
+    /// counter reached (rt::time::reached) and which waits for its pause or
+    /// for quota starts; the other expiries are stale (spec 10).
+    fn expired(&mut self) {
+        for place in 0..TABLE.len() {
+            let entry = &mut self.entries[place];
+            let due = entry.deadline.is_some_and(time::reached);
+            if due && matches!(entry.state, State::Paused | State::Quota) {
+                entry.deadline = None;
+                self.launch(place);
+            }
         }
     }
 
@@ -304,10 +573,11 @@ impl Init {
 
     /// CONNECT from the instance at `place` (spec 13.4): BAD_SIZE for a
     /// request that is no name; ACCESS_DENIED for a name its record may not
-    /// connect to; PEER_CLOSED for a service that ended; a session with the
-    /// service when its registered channel is open (`session`); otherwise
-    /// the request waits for the service to register, at most WAITING_MAX
-    /// for one service, and LIMIT_REACHED past them.
+    /// connect to; PEER_CLOSED for a service that is broken or ended; a
+    /// session with the service when its registered channel is open
+    /// (`session`); otherwise the request waits for the service to
+    /// register, at most WAITING_MAX for one service, and LIMIT_REACHED
+    /// past them.
     fn connect(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
         let Ok(Connect { name }) = Connect::read(r.body()) else {
             return Answer::Status(Status::BadSize);
@@ -327,7 +597,7 @@ impl Init {
             entries, labels, ..
         } = self;
         let service = &mut entries[to];
-        if service.state == State::Ended {
+        if matches!(service.state, State::Broken | State::Ended) {
             return refuse(Error::PeerClosed);
         }
         if let Some(channel) = open(service) {
@@ -384,13 +654,16 @@ impl Init {
     }
 
     /// Record `n` of LIST: 0 is init, n the record at place n - 1 of the
-    /// table. The handles and the memory are those of the process of its
-    /// instance, and 0 without one.
+    /// table, with its failures within WINDOW_NS and its restarts. The
+    /// handles and the memory are those of the process of its instance, and
+    /// 0 without one.
     fn listed(&self, n: usize) -> Listed {
+        let (mut failures, mut restarts) = (0, 0);
         let (name, state, priority, ceiling, client, process) = match n.checked_sub(1) {
             None => ("init", State::Running, MAIN, MAIN, false, Some(&self.own)),
             Some(place) => {
                 let (record, entry) = (&TABLE[place], &self.entries[place]);
+                (failures, restarts) = (entry.failures.recent(now()), entry.restarts);
                 let process = entry.instance.as_ref().map(|i| &i.spawned.process);
                 let (p, c) = (record.priority, record.ceiling);
                 (record.name, entry.state, p, c, record.is_client(), process)
@@ -406,8 +679,8 @@ impl Init {
             priority,
             ceiling,
             client,
-            failures: 0,
-            restarts: 0,
+            failures,
+            restarts,
             live: handles.map_or(0, |h| count(h.live)),
             retired: handles.map_or(0, |h| count(h.retired)),
             limit: handles.map_or(0, |h| count(h.limit)),
@@ -504,10 +777,14 @@ impl Service<1> for Init {
         }
     }
 
-    /// The worker's notification: the outcome of its job.
+    /// The worker's notification: the outcome of its job; the end of an
+    /// instance (`ended`); an expiry of a timer of the records (`expired`).
     fn notification(&mut self, n: Notice) {
-        if n.source == Source::Session && n.label == self.worker.label {
-            self.accept();
+        match n.source {
+            Source::Session if n.label == self.worker.label => self.accept(),
+            Source::Exit => self.ended(n.label),
+            Source::Timer if n.label == 0 => self.expired(),
+            _ => {}
         }
     }
 }

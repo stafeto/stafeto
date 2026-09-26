@@ -3,11 +3,11 @@
 
 //! The table of the image of init's tests (feature `table-test`, spec
 //! 15.2): every record runs the program `svc` (tests/svc), whose role the
-//! first byte of its own arguments names: `e` echo, `d` device, `c`
-//! checker. Byte 1 of the arguments of an echo, `g`, makes it wait at the
-//! gate of `echo` before its REGISTER. Services send a heartbeat
-//! every 20 ms; the client `checker` runs the tests and prints their
-//! lines.
+//! first byte of its own arguments names: `e` echo, `d` device, `x`
+//! crash, `c` checker. Byte 1 of the arguments of an echo, `g`, makes it
+//! wait at the gate of `echo` before its REGISTER. Services send a
+//! heartbeat every 20 ms; the client `checker` runs the tests and prints
+//! their lines, and ends: its policy is never.
 
 use super::{Binding, Kind, Record, Restart, Window};
 use crate::PAGE;
@@ -70,15 +70,22 @@ pub const TABLE: &[Record] = &[
         }],
         ..echo("device", 40, WATCH, b"d")
     },
+    // Fails right after its start: broken after five failures.
+    echo("crash", 35, WATCH, b"x"),
     Record {
         kind: Kind::Client,
         restart: Restart::Never,
         console: true,
         quota: 64 * PAGE,
         handle_limit: 64,
-        connects: &["echo", "slow", "device"],
+        connects: &["echo", "slow", "device", "crash"],
         ..echo("checker", 30, WATCH, b"c")
     },
     // Known to the table, but not among the connections of `checker`.
     echo("private", 20, WATCH, b"e"),
+    // A quota of 1 TiB, more than init has: its start waits.
+    Record {
+        quota: 1 << 40,
+        ..echo("hog", 20, WATCH, b"e")
+    },
 ];

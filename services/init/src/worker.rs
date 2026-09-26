@@ -2,13 +2,15 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Init's worker thread (spec 8, 13.4): it loads the instances of the
-//! records of the table (rt::loader::spawn), one job at a time, so that
-//! init's main thread at 63 never waits for work that grows with the size
-//! of a service. The main thread puts a job into the cell (`Worker::give`),
-//! sets the worker's level (init::work::worker_level) and wakes it through
-//! the worker's channel; the worker does the job, leaves its outcome in
-//! the cell and tells the main thread through its copy of init's channel
-//! with NOTIFY and a label of its own, whose slot is at WORKER_MAX.
+//! records of the table (rt::loader::spawn) and closes init's handles of
+//! those that ended, one job at a time, so that init's main thread at 63
+//! never waits for work that grows with the size of a service, and never
+//! lets go of the last handles of an instance. The main thread puts a job
+//! into the cell (`Worker::load`, `Worker::teardown`), sets the worker's
+//! level (init::work::worker_level) and wakes it through the worker's
+//! channel; the worker does the job, leaves its outcome in the cell and
+//! tells the main thread through its copy of init's channel with NOTIFY and
+//! a label of its own, whose slot is at WORKER_MAX.
 
 use abi::{Error, Policy, Rights};
 use bootimg::Program;
@@ -32,8 +34,17 @@ const STACK_SIZE: usize = 32 * 1024;
 
 static STACK: Stack<STACK_SIZE> = Stack::new();
 
+/// What is left of an instance that ended, whose handles the worker
+/// closes (`Worker::teardown`): its process, its first thread and the
+/// channel it registered, which may be the last handles of their objects.
+pub struct Gone {
+    pub process: Handle<Process>,
+    pub thread: Handle<Thread>,
+    pub channel: Option<Handle<Channel>>,
+}
+
 /// A job the main thread gives the worker.
-pub enum Order {
+enum Order {
     /// Load an instance of the record at `place` of the table from
     /// `program`, named by `label` on init's channel.
     Load {
@@ -41,15 +52,14 @@ pub enum Order {
         label: u64,
         program: Program<'static>,
     },
+    /// Close init's handles of the instance in the cell's `gone`.
+    Teardown,
 }
 
-/// What the worker leaves the main thread.
-pub enum Outcome {
-    /// The instance, its thread not started yet: its start data hold its
-    /// process, its thread, the console when its record has one, and its
-    /// arguments.
-    Loaded(Result<Spawned, Error>),
-}
+/// What a load leaves the main thread: the instance, its thread not
+/// started yet, whose start data hold its process, its thread, the console
+/// when its record has one, and its arguments; or why not.
+pub type Loaded = Result<Spawned, Error>;
 
 /// The states of the cell: FREE, the main thread's to fill; GIVEN, the
 /// worker's; DONE, the main thread's to empty.
@@ -57,13 +67,15 @@ const FREE: u8 = 0;
 const GIVEN: u8 = 1;
 const DONE: u8 = 2;
 
-/// The cell of the one job between the two threads: its order and its
-/// outcome. Only the thread its state names reaches them; the store that
-/// hands them over has Release order, the load that takes them Acquire.
+/// The cell of the one job between the two threads: its order, the
+/// instance a teardown takes, and the outcome of a load. Only the thread
+/// its state names reaches them; the store that hands them over has
+/// Release order, the load that takes them Acquire.
 struct Cell {
     state: AtomicU8,
     order: UnsafeCell<Option<Order>>,
-    outcome: UnsafeCell<Option<Outcome>>,
+    gone: UnsafeCell<Option<Gone>>,
+    loaded: UnsafeCell<Option<Loaded>>,
 }
 
 // SAFETY: the state gives the cell to one thread at a time (`Cell`), and
@@ -76,7 +88,8 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 static CELL: Cell = Cell {
     state: AtomicU8::new(FREE),
     order: UnsafeCell::new(None),
-    outcome: UnsafeCell::new(None),
+    gone: UnsafeCell::new(None),
+    loaded: UnsafeCell::new(None),
 };
 
 /// The values of the handles the worker uses: init's process, init's
@@ -152,29 +165,51 @@ impl Worker {
         sys::thread_set_priority(&self.thread, level, Policy::Fifo)
     }
 
-    /// Gives the worker `order` and wakes it. The main thread gives a job
-    /// only once it took the outcome of the one before (`take`).
-    pub fn give(&self, order: Order) -> Result<(), Error> {
+    /// Gives the worker the load of an instance of the record at `place`
+    /// from `program`, named by `label` on init's channel (`give`).
+    pub fn load(&self, place: usize, label: u64, program: Program<'static>) -> Result<(), Error> {
+        let order = Order::Load {
+            place,
+            label,
+            program,
+        };
+        self.give(order, None)
+    }
+
+    /// Gives the worker the teardown of `gone`, an instance that ended:
+    /// its handles close in the worker (`give`).
+    pub fn teardown(&self, gone: Gone) -> Result<(), Error> {
+        self.give(Order::Teardown, Some(gone))
+    }
+
+    /// Puts `order` and `gone` into the cell and wakes the worker. The
+    /// main thread gives a job only once it took the outcome of the one
+    /// before (`take`).
+    fn give(&self, order: Order, gone: Option<Gone>) -> Result<(), Error> {
         assert_eq!(
             CELL.state.load(Ordering::Acquire),
             FREE,
             "one job at a time"
         );
         // SAFETY: FREE: the cell is the main thread's.
-        unsafe { *CELL.order.get() = Some(order) };
+        unsafe {
+            *CELL.order.get() = Some(order);
+            *CELL.gone.get() = gone;
+        }
         CELL.state.store(GIVEN, Ordering::Release);
         sys::notify(&self.wake, 1)
     }
 
-    /// The outcome of the job the worker did, once it is done.
-    pub fn take(&self) -> Option<Outcome> {
+    /// Once the worker did its job: the outcome of a load, None after a
+    /// teardown.
+    pub fn take(&self) -> Option<Option<Loaded>> {
         if CELL.state.load(Ordering::Acquire) != DONE {
             return None;
         }
         // SAFETY: DONE: the cell is the main thread's.
-        let outcome = unsafe { (*CELL.outcome.get()).take() };
+        let loaded = unsafe { (*CELL.loaded.get()).take() };
         CELL.state.store(FREE, Ordering::Release);
-        outcome
+        Some(loaded)
     }
 }
 
@@ -191,19 +226,38 @@ extern "C" fn work(_: u64) -> ! {
         let Some(order) = (unsafe { (*CELL.order.get()).take() }) else {
             continue;
         };
-        let outcome = match order {
+        let loaded = match order {
             Order::Load {
                 place,
                 label,
                 program,
-            } => Outcome::Loaded(load(&TABLE[place], label, &program)),
+            } => Some(load(&TABLE[place], label, &program)),
+            Order::Teardown => {
+                // SAFETY: still GIVEN: the cell is the worker's.
+                if let Some(gone) = unsafe { (*CELL.gone.get()).take() } {
+                    teardown(gone);
+                }
+                None
+            }
         };
         // SAFETY: still GIVEN: the cell is the worker's until the store.
-        unsafe { *CELL.outcome.get() = Some(outcome) };
+        unsafe { *CELL.loaded.get() = loaded };
         CELL.state.store(DONE, Ordering::Release);
         // The main thread lives as long as init's channel.
         let _ = sys::notify(&tell, 1);
     }
+}
+
+/// Closes init's handles of an instance that ended (spec 7.7): the
+/// channel it registered, its thread and its process; the cleanup of an
+/// object whose last handle goes runs at the worker's level. A close that
+/// fails changes nothing: the handle went.
+fn teardown(gone: Gone) {
+    if let Some(channel) = gone.channel {
+        let _ = channel.close();
+    }
+    let _ = gone.thread.close();
+    let _ = gone.process.close();
 }
 
 /// Loads an instance of `record` from `program` with the label `label` on

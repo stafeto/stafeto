@@ -6,8 +6,9 @@
 //! own arguments of its record names (proto_init::ServiceArgs, and the
 //! table `table-test` of services/init): `e` a service that answers ECHO,
 //! LABEL, ARGS, GATE and OPEN (echo.rs), `d` a service with a window and
-//! a binding (device.rs), `c` the client that runs the tests of init as a
-//! service manager (checker.rs). A service registers its channel with init
+//! a binding (device.rs), `x` a service that faults right after its start
+//! (`crash`), `c` the client that runs the tests of init as a service
+//! manager (checker.rs). A service registers its channel with init
 //! (rt::service::register) and serves it with its heartbeat
 //! (rt::service::run). The program ends with the code of its role, or
 //! FAILED when its start data did not come.
@@ -30,6 +31,7 @@ rt::entry!(main);
 /// The roles, by the first byte of the own arguments.
 const ECHO: u8 = b'e';
 const DEVICE: u8 = b'd';
+const CRASH: u8 = b'x';
 const CHECKER: u8 = b'c';
 
 /// The code of a role that could not do its part.
@@ -63,9 +65,25 @@ fn main(_: u64) -> u64 {
     match s.args().get(SERVICE_ARGS_FIXED) {
         Some(&ECHO) => echo::run(s),
         Some(&DEVICE) => device::run(s),
+        Some(&CRASH) => crash(),
         Some(&CHECKER) => checker::run(s),
         _ => FAILED,
     }
+}
+
+/// The role `crash`: a load from page 0, which nothing maps, ends the
+/// program with a fault before it registers (spec 7.9).
+fn crash() -> u64 {
+    // SAFETY: the load is the fault the role exists for.
+    unsafe {
+        core::arch::asm!(
+            "ldr {t}, [{a}]",
+            t = out(reg) _,
+            a = in(reg) 0_usize,
+            options(nostack, readonly),
+        )
+    };
+    FAILED
 }
 
 /// The base priority of the program's first thread.
