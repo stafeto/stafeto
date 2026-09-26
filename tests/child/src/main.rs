@@ -16,11 +16,11 @@ use abi::{Access, Call, Error, Policy, ProcessState, Rights};
 use child::{
     ARGS, BIND, CEILING, Checked, FAILED, FAULT_AT, FULL, HELLO, HELPER, IMAGE, MADE, MARKS,
     MOST_USED, NO_FAULT, QUOTA, ROUNDS, Role, SCRATCH, SCRATCH_LAST, SCRATCH_PAGES, SEEN, SHARED,
-    STARTED, WINDOW,
+    STARTED, WINDOW, marked, x0_alone,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use rt::handle::{Channel, Memory, Process, Resource, Thread};
-use rt::sys::{self, Received, Regs};
+use rt::sys::{self, Received};
 use rt::{Handle, Stack, loader, msgbuf};
 
 rt::entry!(main);
@@ -296,11 +296,7 @@ fn grandparent(s: &Start) -> Result<u64, Error> {
     sys::mem_map(&own, &image, 0, size, IMAGE, Access::Read)?;
     // SAFETY: the mapping shows the boot image, read-only, and stays.
     let bytes = unsafe { core::slice::from_raw_parts(IMAGE as *const u8, size as usize) };
-    let program = bootimg::BootImage::parse(bytes)
-        .ok()
-        .and_then(|image| image.files().find(|f| f.name == "child"))
-        .and_then(|file| bootimg::Program::parse(file.data).ok())
-        .ok_or(Error::InvalidArgs)?;
+    let program = child::program_in(bytes).ok_or(Error::InvalidArgs)?;
     let requests = sys::channel_create(1)?;
     let start = sys::handle_label(&requests, Rights::SEND | Rights::TRANSFER, 1, 1)?;
     let level = s.args[1] as u8;
@@ -367,11 +363,6 @@ fn churn(s: &Start, total: u64) -> u64 {
     mark(FULL).store(full, Relaxed);
     mark(MOST_USED).store(most, Relaxed);
     0
-}
-
-/// x0-x9 filled with marks, for calls that must change x0 alone.
-fn marked() -> Regs {
-    core::array::from_fn(|i| 0x5A5A_0000 + i as u64)
 }
 
 /// The page of the message buffer of helper thread `i`, from 1, above the
@@ -504,17 +495,6 @@ fn serve(s: &Start, requests: u64) -> u64 {
         }
     }
     0
-}
-
-/// Call `N` with `args` in x0 and up and marks in the rest of x0-x9: true
-/// when x0 comes back as `x0` and no other register changed.
-fn x0_alone<const N: u16>(args: &[u64], x0: u64) -> bool {
-    let mut x = marked();
-    x[..args.len()].copy_from_slice(args);
-    // SAFETY: the cases hand the kernel arguments it refuses, or make a
-    // call that runs no code of the child and uses none of its memory.
-    let after = unsafe { sys::raw::<N>(x) };
-    after[0] == x0 && after[1..] == x[1..]
 }
 
 /// Role::Ceiling: 0 when each case of `checked` did as it must, else the

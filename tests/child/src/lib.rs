@@ -291,3 +291,31 @@ pub fn reply(role: Role, args: &[u64]) -> [u8; abi::INLINE_MAX] {
     words[1..=args.len()].copy_from_slice(args);
     abi::inline_bytes(&words)
 }
+
+/// x0-x9 filled with marks, for calls that must change x0 alone.
+pub fn marked() -> rt::sys::Regs {
+    core::array::from_fn(|i| 0x5A5A_0000 + i as u64)
+}
+
+/// Call `N` with `args` in x0 and up and marks in the rest of x0-x9: true
+/// when x0 comes back as `x0`, 0 or the code of an error, and no other
+/// register changed (spec 11). The caller passes arguments the call
+/// refuses, or makes a call that returns nothing and runs no code of the
+/// caller's process.
+pub fn x0_alone<const N: u16>(args: &[u64], x0: u64) -> bool {
+    let mut x = marked();
+    x[..args.len()].copy_from_slice(args);
+    // SAFETY: by the contract above, the call runs no code of this process
+    // and uses none of its memory.
+    let after = unsafe { rt::sys::raw::<N>(x) };
+    after[0] == x0 && after[1..] == x[1..]
+}
+
+/// The child program, the file `child` of the boot image `image` (spec
+/// 13.1): None when the image or the program does not parse.
+pub fn program_in(image: &[u8]) -> Option<bootimg::Program<'_>> {
+    bootimg::BootImage::parse(image)
+        .ok()
+        .and_then(|image| image.files().find(|f| f.name == "child"))
+        .and_then(|file| bootimg::Program::parse(file.data).ok())
+}
