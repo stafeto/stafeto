@@ -77,8 +77,9 @@
    which print `TESTS DONE total=N failed=M` first. The normal build does
    not end: `init` lives on, and xtask stops QEMU on its line
    `init: services started`; it stops a run of the image of `init`'s test
-   table on the `TESTS DONE` line of the test client there. xtask judges a
-   run of tests by that line and fails a run with a `KERNEL PANIC` line
+   table on init's line of the end of the test client there,
+   `init: checker ended: ...`. xtask judges a run of tests by its
+   `TESTS DONE` line and fails a run with a `KERNEL PANIC` line
    anywhere, except the one panic of `init`'s exit that ends a run of the
    test init. A panic before the kernel has read the PSCI conduit from
    the device tree parks the processor instead, and the run ends at

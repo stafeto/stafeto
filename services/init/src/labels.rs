@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The labels init gives (spec 13.4): the label of each spawn, of each
-//! session CONNECT makes and of its worker thread, from one 64-bit count.
+//! session CONNECT makes, of the timer of each record and of its worker
+//! thread, from one 64-bit count.
 
 /// A count of labels from 1 that never gives one twice: 0 is no label,
 /// and once u64::MAX went the count stops.
