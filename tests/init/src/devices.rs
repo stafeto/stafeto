@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Tests of interrupt lines and device windows (spec 9).
+//! Tests of interrupt lines and device windows (spec 9), and of the
+//! kernel log, whose port a window takes (spec 3.2, 16.3).
 
 use crate::calls::LOWER_END;
 use crate::harness::*;
 use crate::messages::answer_all;
 use crate::processes::{DATA_ABORT, KID_WAIT_NS, Kid, LEAF_QUOTA, START};
 use crate::transfers::{close_raw, copy_raw, give, handle_client};
+use abi::{LOG_BATCH, LOG_KERNEL_KIND, LOG_RECORD, LOG_TEXT, LOG_TEXT_KIND, LogBatch};
+use core::fmt::{self, Write};
 use rt::mmio;
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 17] = [
+pub(crate) const TESTS: [Test; 21] = [
     (
         "irq_bind_checks_its_arguments",
         irq_bind_checks_its_arguments,
@@ -52,6 +55,19 @@ pub(crate) const TESTS: [Test; 17] = [
         window_over_a_hole_faults_only_its_process,
     ),
     (
+        "window_over_the_console_sends_debug_write_to_the_log",
+        window_over_the_console_sends_debug_write_to_the_log,
+    ),
+    ("log_counts_what_it_lost", log_counts_what_it_lost),
+    (
+        "a_kernel_line_fills_records_in_turn",
+        a_kernel_line_fills_records_in_turn,
+    ),
+    (
+        "object_info_log_checks_its_arguments",
+        object_info_log_checks_its_arguments,
+    ),
+    (
         "rtc_alarm_comes_as_a_notification",
         rtc_alarm_comes_as_a_notification,
     ),
@@ -75,6 +91,8 @@ pub(crate) const TESTS: [Test; 17] = [
 const EDGE_LINE: u32 = 48;
 /// The line of the PL031 of QEMU `virt`, level-triggered.
 const RTC_LINE: u32 = 34;
+/// The line of the PL011 of QEMU `virt`, the console's port.
+const CONSOLE_LINE: u32 = 33;
 
 /// A binding of `line` to `c` through the system resource, the slot at
 /// QUIET, edge-triggered when `edge`.
@@ -87,14 +105,15 @@ fn bound(line: u32, c: &Handle<Channel>, edge: bool) -> Result<Handle<Interrupt>
 /// handles in their order, then the state (spec 9, 11), and changes x0
 /// alone on an error: a line outside 32-1019, the most lines a GIC has
 /// (the end of this machine's lines is the kernel test
-/// irq_bind_refuses_lines_past_the_distributor), or the kernel's console
-/// line 33, a flag other than TRIGGER_EDGE and a priority outside 1-63
-/// fail with INVALID_ARGS, through closed handles too; x0 closed, a
-/// channel or a copy of the resource without DEVICE with BAD_HANDLE,
-/// WRONG_TYPE and ACCESS_DENIED; x2 closed, a process or a copy of the
-/// channel without NOTIFY the same; a closed channel with PEER_CLOSED. A
-/// copy with NOTIFY alone makes a binding, x0 and x1 alone changed, whose
-/// handle carries abi::OWNER_RIGHTS and no more.
+/// irq_bind_refuses_lines_past_the_distributor), a flag other than
+/// TRIGGER_EDGE and a priority outside 1-63 fail with INVALID_ARGS,
+/// through closed handles too; x0 closed, a channel or a copy of the
+/// resource without DEVICE with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED;
+/// x2 closed, a process or a copy of the channel without NOTIFY the same;
+/// a closed channel with PEER_CLOSED. A copy with NOTIFY alone makes a
+/// binding, x0 and x1 alone changed, whose handle carries
+/// abi::OWNER_RIGHTS and no more. The line of the console's PL011, 33,
+/// binds, level-triggered: its driver takes it (spec 13.5).
 fn irq_bind_checks_its_arguments() -> Outcome {
     const N: u16 = Call::IrqBind.number();
     let gone = closed_handle()?;
@@ -102,6 +121,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
     let notify = copy(&c, Rights::NOTIFY)?;
     let receive = copy(&c, Rights::RECEIVE)?;
     let no_device = copy(&resource(), Rights::DEBUG)?;
+    let console = sys::irq_bind(&resource(), CONSOLE_LINE, &notify, QUIET, false).map(close);
     let (resource, line) = (resource().raw().0, u64::from(EDGE_LINE));
     let good = [resource, line, notify.raw().0, QUIET.into(), TRIGGER_EDGE];
     let with = |i: usize, value: u64| {
@@ -109,7 +129,7 @@ fn irq_bind_checks_its_arguments() -> Outcome {
         x[i] = value;
         x
     };
-    let invalid = [27, 31, 33, 1020, 1 << 32 | line]
+    let invalid = [27, 31, 1020, 1 << 32 | line]
         .map(|l| with(1, l))
         .into_iter()
         .chain([with(4, 2), with(3, 0), with(3, 64), with(3, 0x100 | 1)])
@@ -144,6 +164,10 @@ fn irq_bind_checks_its_arguments() -> Outcome {
     check(
         invalid,
         "a bad line, flag or priority did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        console == Ok(Ok(())),
+        "the line of the console's PL011 did not bind",
     )?;
     check(
         refused,
@@ -302,10 +326,12 @@ fn device_window(addr: u64, len: u64) -> Result<Handle<Memory>, &'static str> {
 /// wraps around or ends past 2^48 fail with INVALID_ARGS through a closed
 /// handle too; a closed handle, a channel and a copy of the resource
 /// without DEVICE with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED, over RAM
-/// too; a page of RAM, of the GIC's distributor or of the PL011 with
-/// INVALID_ARGS; the kernel test device_window_refuses_every_gic_page
-/// checks the other regions of the GIC, which differ between machines. A
-/// window on the PL031 changes x0 and x1 alone, and its handle carries
+/// too; a page of RAM or of the GIC's distributor with INVALID_ARGS; the
+/// kernel test device_window_refuses_every_gic_page checks the other
+/// regions of the GIC, which differ between machines, and the page of the
+/// console's PL011 is open to windows
+/// (window_over_the_console_sends_debug_write_to_the_log). A window on
+/// the PL031 changes x0 and x1 alone, and its handle carries
 /// abi::WINDOW_RIGHTS and no MAP_EXEC.
 fn device_window_create_checks_its_arguments() -> Outcome {
     const N: u16 = Call::DeviceWindowCreate.number();
@@ -328,7 +354,7 @@ fn device_window_create_checks_its_arguments() -> Outcome {
     ]
     .iter()
     .all(|&(h, e)| x0_alone::<N>(&[h, 0x4000_0000, page], e.code()));
-    let kernel = [0x4000_0000, 0x0800_0000, 0x0900_0000]
+    let kernel = [0x4000_0000, 0x0800_0000]
         .iter()
         .all(|&addr| x0_alone::<N>(&[resource, addr, page], Error::InvalidArgs.code()));
     let mut x = marked();
@@ -366,17 +392,17 @@ fn device_window_create_checks_its_arguments() -> Outcome {
     )
 }
 
-/// A window is checked by whole pages (spec 9): 32 bytes across the end of
-/// the PL011's page touch it and fail with INVALID_ARGS; the same bytes
+/// A window is checked by whole pages (spec 9): 32 bytes across the start
+/// of RAM touch its first page and fail with INVALID_ARGS; the same bytes
 /// across the end of the PL031's page make a window of two pages.
 fn window_is_checked_by_whole_pages() -> Outcome {
-    let over = sys::device_window_create(&resource(), 0x0900_0FF0, 0x20).err();
+    let over = sys::device_window_create(&resource(), 0x3FFF_FFF0, 0x20).err();
     let w = device_window(RTC + 0xFF0, 0x20)?;
     let size = sys::memory_info(&w).map(|i| i.size);
     close(w)?;
     check(
         over == Some(Error::InvalidArgs),
-        "a window that shares the page of the PL011 was made",
+        "a window that shares the first page of RAM was made",
     )?;
     check(
         size == Ok(2 * PAGE as u64),
@@ -507,6 +533,346 @@ fn window_over_a_hole_faults_only_its_process() -> Outcome {
         }
         _ => Err("the child did not end with a fault"),
     }
+}
+
+/// The page of the PL011 of QEMU `virt`, the console's port: a window over
+/// it takes the port from the kernel while the window lives (spec 3.2).
+const CONSOLE: u64 = 0x0900_0000;
+/// The lines of window_over_the_console_sends_debug_write_to_the_log:
+/// xtask finds the second on the console, whole, and not the first.
+const BEHIND: &[u8] = b"log marker: behind the window\n";
+const IN_FRONT: &[u8] = b"log marker: in front of the window\n";
+
+/// The records of a batch of object_info LOG (rt::sys::log_take).
+type Records = [[u8; LOG_RECORD]; LOG_BATCH];
+
+/// The time, the kind and the text of a record of the kernel log, in the
+/// layout of abi::LOG_RECORD.
+fn parsed(r: &[u8; LOG_RECORD]) -> (u64, u8, &[u8]) {
+    let time = u64::from_le_bytes(r[..8].try_into().expect("8 bytes"));
+    let len = usize::from(r[abi::LOG_LEN_AT]).min(LOG_TEXT);
+    let text = &r[abi::LOG_TEXT_AT..abi::LOG_TEXT_AT + len];
+    (time, r[abi::LOG_KIND_AT], text)
+}
+
+/// A batch of the kernel log into `records` through the system resource.
+fn take(records: &mut Records) -> Result<LogBatch, &'static str> {
+    sys::log_take(&resource(), records).map_err(|_| "object_info LOG failed")
+}
+
+/// Takes what is left of the kernel log, batch after batch.
+fn drain_log(records: &mut Records) -> Outcome {
+    for _ in 0..16 {
+        let batch = take(records)?;
+        if batch.count == 0 && batch.left == 0 {
+            return Ok(());
+        }
+    }
+    Err("the kernel log did not run dry")
+}
+
+/// A window over the console's page: the port is the log's until it goes.
+fn console_window() -> Result<Handle<Memory>, &'static str> {
+    device_window(CONSOLE, PAGE as u64)
+}
+
+/// Closes a window over the console's page and lets its cleanup run, whose
+/// last portion gives the port back to the kernel (spec 3.2).
+fn give_back(w: Handle<Memory>) -> Outcome {
+    close(w)?;
+    let_run()
+}
+
+/// Spec 3.2, 16.3: while a window covers the console's page, debug_write
+/// goes into the kernel log alone; once the window went, the kernel
+/// writes to the port again and marks the record shown. Init takes what
+/// the log holds, makes the window, writes BEHIND, and LOG gives that one
+/// record, of kind abi::LOG_TEXT_KIND, at a time between two reads of the
+/// counter around the call, none lost and none left; init closes the
+/// window, writes IN_FRONT, and LOG gives nothing. xtask finds IN_FRONT on
+/// the console, whole, and BEHIND nowhere.
+fn window_over_the_console_sends_debug_write_to_the_log() -> Outcome {
+    let mut records: Records = [[0; LOG_RECORD]; LOG_BATCH];
+    drain_log(&mut records)?;
+    let w = console_window()?;
+    let before = time::now();
+    let written = sys::debug_write(&resource(), BEHIND);
+    let after = time::now();
+    let behind = take(&mut records);
+    let (at, kind, text) = parsed(&records[0]);
+    let alone = behind
+        == Ok(LogBatch {
+            count: 1,
+            lost: 0,
+            left: 0,
+        })
+        && kind == LOG_TEXT_KIND
+        && text == BEHIND;
+    let timed = (before..=after).contains(&at);
+    give_back(w)?;
+    let again = sys::debug_write(&resource(), IN_FRONT);
+    let in_front = take(&mut records);
+    check(
+        written == Ok(BEHIND.len()) && again == Ok(IN_FRONT.len()),
+        "debug_write did not write its bytes",
+    )?;
+    check(
+        alone,
+        "LOG did not give the one record of debug_write behind the window",
+    )?;
+    check(
+        timed,
+        "the record's time is not the time of its debug_write",
+    )?;
+    check(
+        in_front.is_ok_and(|b| b.count == 0 && b.left == 0),
+        "the record written with the port back was not shown",
+    )
+}
+
+/// A line with the number `n`, as log_counts_what_it_lost writes them.
+fn numbered(n: u8) -> [u8; 14] {
+    let mut line = *b"log record 00\n";
+    line[11] = b'0' + n / 10;
+    line[12] = b'0' + n % 10;
+    line
+}
+
+/// Spec 16.3: a full log writes over its oldest record and counts it
+/// lost. Behind a window over the console init writes 70 numbered lines
+/// with debug_write into the log of 64 records: the batches give 64
+/// records, numbers 7 to 70 in order, the first batch 6 lost and the
+/// others none. Then it measures the log (`log_costs`) and, under
+/// -icount, prints `log ticks: write=... take=...` once the port is back;
+/// no number fails the test (spec 15.3).
+fn log_counts_what_it_lost() -> Outcome {
+    let mut records: Records = [[0; LOG_RECORD]; LOG_BATCH];
+    drain_log(&mut records)?;
+    let w = console_window()?;
+    let written = (1..=70).all(|n| sys::debug_write(&resource(), &numbered(n)).is_ok());
+    let (mut next, mut lost, mut ordered) = (7, [u64::MAX; 8], true);
+    for batch_lost in &mut lost {
+        let Ok(batch) = take(&mut records) else {
+            ordered = false;
+            break;
+        };
+        *batch_lost = batch.lost;
+        for r in &records[..batch.count as usize] {
+            let (_, kind, text) = parsed(r);
+            ordered &= kind == LOG_TEXT_KIND && next <= 70 && text == numbered(next);
+            next += 1;
+        }
+        if batch.count == 0 {
+            break;
+        }
+    }
+    let costs = log_costs();
+    give_back(w)?;
+    check(written, "a numbered debug_write failed")?;
+    check(
+        ordered && next == 71,
+        "the batches did not give records 7 to 70 in order",
+    )?;
+    check(
+        lost[0] == 6 && lost[1..].iter().all(|&l| l == 0 || l == u64::MAX),
+        "the log did not count the 6 records it wrote over",
+    )?;
+    let (write, take) = costs?;
+    if under_icount() {
+        println!("log ticks: write={write} take={take}");
+    }
+    Ok(())
+}
+
+/// Rounds of each measurement of `log_costs`.
+const LOG_ROUNDS: usize = 1000;
+
+/// Spec 15.3: what the kernel log costs behind a window over the console,
+/// the least counter ticks of LOG_ROUNDS rounds with the least of an
+/// empty round taken off: a debug_write of 64 bytes, one record, and an
+/// object_info LOG that takes a full batch of abi::LOG_BATCH records,
+/// which that many debug_writes put there before it. Raw calls, as in
+/// `normal_build_costs`: the numbers are the kernel's alone.
+fn log_costs() -> Result<(u64, u64), &'static str> {
+    const WRITE: u16 = Call::DebugWrite.number();
+    const INFO: u16 = Call::ObjectInfo.number();
+    let r = resource().raw().0;
+    let mut write = [0; 10];
+    write[..2].copy_from_slice(&[r, 64]);
+    write[2..].copy_from_slice(&abi::inline_words(&[b'.'; 64]));
+    let mut info = [0; 10];
+    info[..3].copy_from_slice(&[r, abi::INFO_LOG, 0]);
+    let (mut empty, mut written, mut taken) = (u64::MAX, u64::MAX, u64::MAX);
+    // SAFETY, for each raw call below: debug_write and object_info run no
+    // code of the program and use none of its memory but the message
+    // buffer, which object_info LOG writes; the kernel changes x0-x9 alone.
+    for _ in 0..LOG_ROUNDS {
+        let start = time::now();
+        empty = empty.min(time::now() - start);
+        let start = time::now();
+        let x = unsafe { sys::raw::<WRITE>(write) };
+        written = written.min(time::now() - start);
+        check(x[0] == 0, "a measured debug_write failed")?;
+    }
+    let mut records: Records = [[0; LOG_RECORD]; LOG_BATCH];
+    drain_log(&mut records)?;
+    for _ in 0..LOG_ROUNDS {
+        for _ in 0..LOG_BATCH {
+            let x = unsafe { sys::raw::<WRITE>(write) };
+            check(x[0] == 0, "a debug_write before a measured LOG failed")?;
+        }
+        let start = time::now();
+        let x = unsafe { sys::raw::<INFO>(info) };
+        taken = taken.min(time::now() - start);
+        check(
+            x[0] == 0 && x[1] == LOG_BATCH as u64 && x[3] == 0,
+            "a measured LOG did not take a full batch",
+        )?;
+    }
+    Ok((written.saturating_sub(empty), taken.saturating_sub(empty)))
+}
+
+/// Bytes formatted into a buffer of `N`, what does not fit cut off.
+struct Text<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> Text<N> {
+    fn new() -> Self {
+        Text {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl<const N: usize> Write for Text<N> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len < N {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Spec 7.9, 16.3: the kernel's line for the fault of a program goes into
+/// the log as records of abi::LOG_KERNEL_KIND, 64 bytes each but the
+/// last. Behind a window over the console a child with code loads from
+/// address 0 (Role::Load): LOG gives two records of that kind, the first
+/// of 64 bytes, whose texts in a row are the line of its fault with its
+/// syndrome and addresses and a newline. The line does not reach the
+/// port, so xtask still counts CHILD_FAULTS lines of faults there.
+fn a_kernel_line_fills_records_in_turn() -> Outcome {
+    let mut records: Records = [[0; LOG_RECORD]; LOG_BATCH];
+    drain_log(&mut records)?;
+    let w = console_window()?;
+    let state = fault_at_zero();
+    let batch = take(&mut records);
+    let mut joined = Text::<{ 2 * LOG_TEXT }>::new();
+    let mut kinds = [0; 2];
+    for (kind, r) in kinds.iter_mut().zip(&records) {
+        let (_, k, text) = parsed(r);
+        *kind = k;
+        joined
+            .write_str(core::str::from_utf8(text).unwrap_or("?"))
+            .map_err(|_| "the text of a record did not fit")?;
+    }
+    let first = parsed(&records[0]).2.len();
+    give_back(w)?;
+    let ProcessState::Fault { esr, far, elr } = state? else {
+        return Err("the child that loads from 0 did not fault");
+    };
+    let mut line = Text::<{ 2 * LOG_TEXT }>::new();
+    let _ = writeln!(
+        line,
+        "process fault: data abort from EL0 (EC 0x24) ESR={esr:#x} FAR={far:#x} ELR={elr:#x}"
+    );
+    check(
+        batch
+            == Ok(LogBatch {
+                count: 2,
+                lost: 0,
+                left: 0,
+            }),
+        "LOG did not give two records for the line of the fault",
+    )?;
+    check(
+        kinds == [LOG_KERNEL_KIND; 2] && first == LOG_TEXT,
+        "the records of the line are not of the kernel's kind, 64 bytes first",
+    )?;
+    check(
+        joined.bytes() == line.bytes(),
+        "the records do not make the line of the fault",
+    )
+}
+
+/// A child with code that loads from address 0 (Role::Load) and faults;
+/// its state once it ended.
+fn fault_at_zero() -> Result<ProcessState, &'static str> {
+    let kid = Kid::load(LEAF_QUOTA, 16, LEVEL)?;
+    let state = kid
+        .start()
+        .and_then(|()| kid.serve(Role::Load, &[0], &[]))
+        .and_then(|()| kid.end());
+    kid.close()?;
+    let_run()?;
+    state
+}
+
+/// object_info(x0 handle, x1 LOG, x2 0) checks its values first, then the
+/// handle, then its right (spec 11, 16.3), and changes x0 alone on an
+/// error: kind 10 and a nonzero x2 fail with INVALID_ARGS, for a closed
+/// handle too; a closed handle with BAD_HANDLE, a channel with WRONG_TYPE
+/// and a copy of the system resource with DEBUG alone with ACCESS_DENIED.
+/// A good call changes x0-x3 alone.
+fn object_info_log_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::ObjectInfo.number();
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let debug = copy(&resource(), Rights::DEBUG)?;
+    let (r, log) = (resource().raw().0, abi::INFO_LOG);
+    let invalid = [
+        [r, log + 1, 0],
+        [r, log, 1],
+        [gone, log + 1, 0],
+        [gone, log, 1],
+    ]
+    .iter()
+    .all(|x| x0_alone::<N>(x, Error::InvalidArgs.code()));
+    let refused = [
+        (gone, Error::BadHandle),
+        (c.raw().0, Error::WrongType),
+        (debug.raw().0, Error::AccessDenied),
+    ]
+    .iter()
+    .all(|&(h, e)| x0_alone::<N>(&[h, log, 0], e.code()));
+    let mut x = marked();
+    x[..3].copy_from_slice(&[r, log, 0]);
+    // SAFETY: object_info runs no code of the program; LOG writes its
+    // message buffer alone.
+    let after = unsafe { sys::raw::<N>(x) };
+    close(debug)?;
+    close(c)?;
+    check(
+        invalid,
+        "kind 10 or a nonzero x2 did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        refused,
+        "a closed handle, a channel or a copy without KSTATS did not fail alone",
+    )?;
+    check(
+        after[0] == 0 && after[1] <= LOG_BATCH as u64 && after[4..] == x[4..],
+        "a good LOG failed or changed registers past x3",
+    )
 }
 
 /// The registers of the PL031 the driver uses, 32 bits each, by their

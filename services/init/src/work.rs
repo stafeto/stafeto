@@ -195,6 +195,7 @@ mod tests {
             handle_limit: 16,
             restart: Restart::Always,
             console: false,
+            log: false,
             windows: &[],
             bindings: &[],
             connects: &[],

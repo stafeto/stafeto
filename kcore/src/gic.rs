@@ -83,10 +83,6 @@ pub const FIRST_SPI: u32 = 32;
 /// The EL1 virtual timer: PPI 11.
 pub const VIRTUAL_TIMER_INTID: u32 = 27;
 
-/// The line of the kernel's console, the PL011 of QEMU `virt` (SPI 1):
-/// no program binds it until milestone 1.4 (spec 9).
-pub const CONSOLE_INTID: u32 = 33;
-
 /// The bytes at the start of the first redistributor region of a GICv3
 /// that the kernel maps and searches for the redistributor of its CPU
 /// (spec 9): two frames of 128 KiB, or one of 256 KiB with vLPIs. The
@@ -344,7 +340,7 @@ mod tests {
         for intid in [0, 16, VIRTUAL_TIMER_INTID, FIRST_SPI - 1] {
             assert_eq!(frame(intid), Frame::Sgi, "{intid}");
         }
-        for intid in [FIRST_SPI, CONSOLE_INTID, FIRST_SPURIOUS - 1] {
+        for intid in [FIRST_SPI, FIRST_SPI + 1, FIRST_SPURIOUS - 1] {
             assert_eq!(frame(intid), Frame::Distributor, "{intid}");
         }
         assert_eq!(bit(GICD_ISENABLER, VIRTUAL_TIMER_INTID).0, 0x100);

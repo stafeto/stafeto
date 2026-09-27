@@ -15,6 +15,7 @@ use super::{registers, symbols};
 use crate::process;
 use crate::thread::{self, Thread};
 use abi::ProcessState;
+use core::fmt::Write;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kcore::esr;
@@ -93,6 +94,7 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
         frame.elr += 4;
         return;
     }
+    crate::panicking::take_console();
     let far = registers::far_el1();
     let class = esr::ec(syndrome);
     let guard = symbols::image_layout().stack_guard as u64;
@@ -112,7 +114,7 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
     {
         kprintln!("kernel stack overflow: the guard page at {guard:#x} was hit");
     }
-    print_x(&frame.x);
+    print_x(&frame.x, &mut crate::console::writer());
     kprintln!(
         "\nsp  {:#018x}  sp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}",
         frame.sp,
@@ -151,11 +153,13 @@ extern "C" fn handle_user_exception(index: u64) -> ! {
 
 /// A fault of the program at EL0 ends its process (spec 7.9): the reason
 /// goes into the process, with FAR only where the fault sets it
-/// (kcore::esr::fault_address), and until milestone 1.4 the kernel prints
-/// it on one line; for init, whose end stops the machine, the program's
-/// registers follow. The thread never runs again. In test builds a fault
-/// the running test does not expect stops the machine with the full
-/// report instead, as before: a mistake in a test program shows at once.
+/// (kcore::esr::fault_address), and the kernel writes it on one line into
+/// its log, which shows it on the port while the kernel has the port
+/// (spec 3.2, 16.3); for init, whose end stops the machine, the program's
+/// registers follow there. The thread never runs again. In test builds a
+/// fault the running test does not expect stops the machine with the full
+/// report on the port instead, as before: a mistake in a test program
+/// shows at once.
 fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     let far = registers::far_el1();
     if !crate::testpoint::expects_fault() {
@@ -165,15 +169,17 @@ fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
     // SAFETY: the running thread is alive and holds its process.
     let (elr, p) = unsafe { (thread.as_ref().regs.elr, thread.as_ref().process()) };
     let class = esr::ec(syndrome);
-    kprintln!(
+    log_line!(
         "process fault: {} (EC {class:#x}) ESR={syndrome:#x} FAR={far:#x} ELR={elr:#x}",
         esr::class_name(class)
     );
     if process::is_init(p) {
         // Init's end stops the machine, and the panic shows only the
-        // kernel: the program's registers go out first.
+        // kernel: the program's registers go into the log first, and the
+        // panic shows them if nobody did.
         // SAFETY: the running thread is alive; nothing else refers to it now.
-        print_program(unsafe { &thread.as_ref().regs });
+        let regs = unsafe { &thread.as_ref().regs };
+        crate::log::kernel(|w| print_program(regs, w));
     }
     let reason = ProcessState::Fault {
         esr: syndrome,
@@ -195,6 +201,7 @@ fn user_fault(thread: NonNull<Thread>, syndrome: u64) {
 /// a switch, so the count is a hint and names no culprit. The machine
 /// stops.
 fn system_error(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
+    crate::panicking::take_console();
     // SAFETY: the running thread is alive and holds its process.
     let windows = process::device_windows(unsafe { thread.as_ref() }.process());
     kprintln!(
@@ -214,28 +221,27 @@ fn system_error(thread: NonNull<Thread>, index: u64, syndrome: u64) -> ! {
 fn report_el0(thread: NonNull<Thread>, what: &str, index: u64, syndrome: u64, far: u64) -> ! {
     // SAFETY: the running thread is alive; nothing else refers to it now.
     let regs: &UserRegs = unsafe { &thread.as_ref().regs };
+    crate::panicking::take_console();
     kprintln!("{what} at EL0, thread {:#x}", thread.as_ptr() as usize);
-    print_program(regs);
+    print_program(regs, &mut crate::console::writer());
     stop(index, syndrome, far, regs.elr)
 }
 
-/// A program's registers: x0-x30, then SP_EL0, ELR, SPSR and TPIDR_EL0 on
-/// a line of their own.
-fn print_program(regs: &UserRegs) {
-    print_x(&regs.x);
-    kprintln!(
+/// A program's registers to `out`: x0-x30, then SP_EL0, ELR, SPSR and
+/// TPIDR_EL0 on a line of their own.
+fn print_program(regs: &UserRegs, out: &mut dyn Write) {
+    print_x(&regs.x, out);
+    let _ = writeln!(
+        out,
         "\nsp_el0 {:#018x}  elr {:#018x}  spsr {:#018x}  tpidr_el0 {:#018x}",
-        regs.sp,
-        regs.elr,
-        regs.spsr,
-        regs.tpidr
+        regs.sp, regs.elr, regs.spsr, regs.tpidr
     );
 }
 
-fn print_x(x: &[u64; 31]) {
+fn print_x(x: &[u64; 31], out: &mut dyn Write) {
     for (i, v) in x.iter().enumerate() {
         let sep = if i % 4 == 3 { "\n" } else { "  " };
-        crate::console::print(format_args!("x{i:<2} {v:#018x}{sep}"));
+        let _ = write!(out, "x{i:<2} {v:#018x}{sep}");
     }
 }
 

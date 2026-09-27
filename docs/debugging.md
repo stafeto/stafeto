@@ -38,9 +38,12 @@
    so it shows the function that overflowed the stack.
 
 4. A program fault at EL0 terminates only that process; the machine keeps
-   running. The kernel prints a single line
-   `process fault: <class> (EC 0x..) ESR=0x... FAR=0x... ELR=0x...`; the
-   parent reads the same cause through `object_info`. `FAR` in it is taken
+   running. The kernel writes a single line
+   `process fault: <class> (EC 0x..) ESR=0x... FAR=0x... ELR=0x...` into
+   its log, which shows it on the console at once while no device window
+   covers the console's page, and otherwise leaves it to the console's
+   driver (spec 3.2, 16.3); the parent reads the same cause through
+   `object_info`. `FAR` in it is taken
    from the processor only where it is valid: instruction and data fetch
    faults and a misaligned program counter (spec 7.9); it is 0 in other
    cases. The addresses in `ELR` and `FAR` here are addresses in the
@@ -49,7 +52,7 @@
    Any end of `init` stops the machine with a panic: `init` lives for
    good. When `init` faults, the `process fault` line is followed by the
    program's registers (x0..x30, `sp_el0`, `elr`, `spsr`, `tpidr_el0`),
-   then the panic
+   both in the log as well, then the panic
    `init terminated by a fault: ESR=0x... FAR=0x... ELR=0x...`; its call
    stack shows only kernel functions. Killing `init` with `process_kill`
    produces the panic `init terminated: Killed`. A normal `init` exit
@@ -72,11 +75,22 @@
 
 6. If PC is near zero or garbage, `VBAR_EL1` has not been set yet.
 
-7. A run ends with PSCI `SYSTEM_OFF`, and QEMU exits with status 0, at a
-   panic, `init`'s end among them, and at the end of the kernel tests,
-   which print `TESTS DONE total=N failed=M` first. The normal build does
-   not end: `init` lives on, and xtask stops QEMU on its line
-   `init: services started`; it stops a run of the image of `init`'s test
+7. A panic, and each report of an exception that ends in one, takes the
+   console back from any driver and first prints the records of the
+   kernel log that nobody showed or took, once: the last lines of
+   programs and faults a driver did not get to show come before the
+   report and the line `KERNEL PANIC`. A run ends with PSCI `SYSTEM_OFF`, after up to
+   10 ms for the console's transmitter to go idle, and QEMU exits with
+   status 0, at a panic, `init`'s end among them, and at the end of the
+   kernel tests, which print `TESTS DONE total=N failed=M` first. The normal build does
+   not end: `init` lives on with the UART driver and the shell, and xtask
+   stops a boot on the shell's line
+   `shell: connected to uart; type help for the commands`, and talks to
+   the shell through a pipe on the console's input in its console
+   dialog, which ends with five `crash uart`: four restarts of the driver
+   and a broken one, after which the kernel prints the shell's line and
+   then what is left of the kernel log, which init's worker shows; it
+   stops a run of the image of `init`'s test
    table on init's line of the end of the test client there,
    `init: checker ended: ...`. xtask judges a run of tests by its
    `TESTS DONE` line and fails a run with a `KERNEL PANIC` line
@@ -107,13 +121,16 @@ there instead of under `target/`.
 
 ## Under HVF
 
-`cargo xtask hvf` runs the boot checks, the test init and the kernel
-tests under HVF on a Mac with Apple silicon, on two machines:
+`cargo xtask hvf` runs the boot checks, the console dialog with the
+shell, the test init and the kernel tests under HVF on a Mac with Apple
+silicon, on two machines:
 `-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on -cpu host`, with
 Apple's GICv3 in the macOS kernel, and
 `-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off -cpu host`,
 with QEMU's GICv2. On any other host it prints why it skips and succeeds;
-`cargo xtask ci` does not run it. To run one by hand, after
+`cargo xtask ci` does not run it. `cargo xtask run --hvf` boots the
+normal build on the first machine with the console on the terminal, and
+fails with the reason on any other host. To run one by hand, after
 `cargo xtask test` has built the images (under `target/`, or
 `CARGO_TARGET_DIR` when it is set):
 

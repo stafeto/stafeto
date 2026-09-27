@@ -22,6 +22,7 @@ dependencies = [
  "proto-init",
  "proto-wire",
  "rt",
+ "uart",
 ]
 
 [[package]]
@@ -49,6 +50,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-uart"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-wire"
 version = "0.1.0"
 dependencies = [
@@ -63,6 +72,17 @@ dependencies = [
  "bootimg",
  "proto-init",
  "proto-wire",
+]
+
+[[package]]
+name = "shell"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-uart",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]
@@ -93,6 +113,17 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "uart"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-uart",
  "proto-wire",
  "rt",
 ]

@@ -12,6 +12,8 @@
 
 #[macro_use]
 mod console;
+#[macro_use]
+mod log;
 mod arch;
 mod boot;
 mod channel;
@@ -53,6 +55,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
     mm::kmap::switch_to_kernel_tables(boot);
+    console::set_port(&boot.info);
     let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
@@ -63,7 +66,13 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     sched::init(clock);
     report(boot, clock, &init);
     #[cfg(feature = "fault-probe")]
-    arch::probe::undefined_instruction();
+    {
+        // A window over the console's page leaves a record nobody showed:
+        // the report of the fault shows it first, and once (spec 16.1).
+        console::window_made(0x0900_0000, 1);
+        log_line!("probe-log");
+        arch::probe::undefined_instruction();
+    }
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
     finish(boot, &init)

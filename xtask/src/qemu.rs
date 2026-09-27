@@ -3,11 +3,16 @@
 
 //! Running QEMU with a deadline and judging its console output.
 
-use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// Console on stdio, no window, no monitor: for runs whose output is parsed.
@@ -166,103 +171,368 @@ pub struct Outcome {
     pub stopped_on_marker: bool,
 }
 
-/// Runs `cmd`, echoing and collecting its stdout lines. Kills it when a line
-/// contains `stop_marker` or when `timeout` passes. The child gets /dev/null
-/// as stdin: with `-serial stdio` QEMU puts a terminal on stdin into raw mode
-/// and a killed QEMU cannot restore it.
+/// What a run's child reads on its stdin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// /dev/null: with `-serial stdio` QEMU puts a terminal on its stdin
+    /// into raw mode, and a killed QEMU cannot restore it.
+    Null,
+    /// A pipe that `Run::send` writes to: QEMU hands its bytes to the
+    /// PL011 as the FIFO has room, and the end of the pipe does not stop
+    /// it.
+    Pipe,
+}
+
+/// The bytes a run printed so far, as they came, and where the next
+/// search starts: a search looks only after the text the last one found,
+/// so an answer is not taken from the echo of its command or from what
+/// came before.
+#[derive(Clone, Debug)]
+pub struct Transcript {
+    bytes: Vec<u8>,
+    from: usize,
+}
+
+impl Transcript {
+    pub fn new(bytes: &[u8]) -> Transcript {
+        Transcript {
+            bytes: bytes.to_vec(),
+            from: 0,
+        }
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    /// Whether `what` comes after the last text found; the next search
+    /// starts after it. A prompt, which no newline ends, is found too.
+    pub fn find(&mut self, what: &str) -> bool {
+        let what = what.as_bytes();
+        let found = self.bytes[self.from..]
+            .windows(what.len().max(1))
+            .position(|w| w == what);
+        if let Some(at) = found {
+            self.from += at + what.len();
+        }
+        found.is_some()
+    }
+
+    /// The first whole line that `wanted` takes, a CR before its LF cut,
+    /// among those that start after the last text found; the next search
+    /// starts after its LF.
+    pub fn find_line(&mut self, wanted: impl Fn(&str) -> bool) -> Option<String> {
+        let mut start = self.from;
+        if start > 0 && self.bytes[start - 1] != b'\n' {
+            start += self.bytes[start..].iter().position(|&b| b == b'\n')? + 1;
+        }
+        while let Some(len) = self.bytes[start..].iter().position(|&b| b == b'\n') {
+            let bytes = &self.bytes[start..start + len];
+            let line = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(bytes));
+            start += len + 1;
+            if wanted(&line) {
+                self.from = start;
+                return Some(line.into_owned());
+            }
+        }
+        None
+    }
+
+    /// The lines so far, a CR before each LF cut; the last too, when no
+    /// LF ended it yet.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .bytes
+            .split(|&b| b == b'\n')
+            .map(|l| String::from_utf8_lossy(l.strip_suffix(b"\r").unwrap_or(l)).into_owned())
+            .collect();
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+}
+
+/// What came of a wait for output.
+enum Wait {
+    Came,
+    Deadline,
+    /// The reader ended: the child closed its stdout.
+    Ended,
+}
+
+/// How a run ended.
+enum End {
+    /// Its child exited, with this status.
+    Exited(ExitStatus),
+    TimedOut,
+    /// Stopped on the line of this place.
+    Marker(usize),
+    /// Stopped by the caller.
+    Stopped,
+}
+
+/// A running child, QEMU as a rule, whose stdout a thread reads in pieces
+/// of bytes as they come: `expect` waits for a text, a prompt with no
+/// newline among them, and `send` types a line; each line that ends is
+/// echoed with no CR; `stop` is the one way to end it (spec 14).
+pub struct Run {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    reader: Option<JoinHandle<()>>,
+    pieces: mpsc::Receiver<Vec<u8>>,
+    /// The reader sets it as it ends: the test of `stop` looks at it.
+    #[cfg(test)]
+    ended: Arc<AtomicBool>,
+    transcript: Transcript,
+    /// The lines that ended so far, a CR before the LF cut, and where the
+    /// line that has not ended starts.
+    lines: Vec<String>,
+    line_start: usize,
+    echo: Box<dyn FnMut(&str)>,
+}
+
+impl Run {
+    /// Starts `cmd` with `input` on its stdin; each line echoes on
+    /// xtask's stdout.
+    pub fn start(cmd: Command, input: Input) -> Result<Run, String> {
+        Run::start_with(cmd, input, Box::new(|line| println!("{line}")))
+    }
+
+    /// `start`, with each line echoed to `echo`.
+    fn start_with(
+        mut cmd: Command,
+        input: Input,
+        echo: Box<dyn FnMut(&str)>,
+    ) -> Result<Run, String> {
+        let stdin = match input {
+            Input::Null => Stdio::null(),
+            Input::Pipe => Stdio::piped(),
+        };
+        let mut child = cmd
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{cmd:?}: {e}"))?;
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let (tx, pieces) = mpsc::channel();
+        #[cfg(test)]
+        let ended = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let done = Arc::clone(&ended);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0; 4096];
+            // A read error ends the output as its end does.
+            while let Ok(n @ 1..) = stdout.read(&mut buf) {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            #[cfg(test)]
+            done.store(true, Ordering::Release);
+        });
+        Ok(Run {
+            stdin: child.stdin.take(),
+            child,
+            reader: Some(reader),
+            pieces,
+            #[cfg(test)]
+            ended,
+            transcript: Transcript::new(&[]),
+            lines: Vec::new(),
+            line_start: 0,
+            echo,
+        })
+    }
+
+    /// Takes in a piece of output: the lines it ends are kept and echoed.
+    fn take(&mut self, piece: &[u8]) {
+        self.transcript.extend(piece);
+        let bytes = &self.transcript.bytes;
+        while let Some(len) = bytes[self.line_start..].iter().position(|&b| b == b'\n') {
+            let raw = &bytes[self.line_start..self.line_start + len];
+            let line = String::from_utf8_lossy(raw.strip_suffix(b"\r").unwrap_or(raw));
+            (self.echo)(&line);
+            self.lines.push(line.into_owned());
+            self.line_start += len + 1;
+        }
+    }
+
+    /// The line that no LF ended yet, if there are bytes of it: it ends
+    /// with the output, and is kept and echoed.
+    fn end_line(&mut self) {
+        let bytes = &self.transcript.bytes;
+        if self.line_start < bytes.len() {
+            let raw = &bytes[self.line_start..];
+            let line = String::from_utf8_lossy(raw.strip_suffix(b"\r").unwrap_or(raw));
+            (self.echo)(&line);
+            self.lines.push(line.into_owned());
+            self.line_start = bytes.len();
+        }
+    }
+
+    /// Waits for the next piece of output until `deadline`.
+    fn wait(&mut self, deadline: Instant) -> Wait {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match self.pieces.recv_timeout(left) {
+            Ok(piece) => {
+                self.take(&piece);
+                Wait::Came
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Wait::Deadline,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Wait::Ended,
+        }
+    }
+
+    /// Waits up to `timeout` for `what` after the last text found
+    /// (Transcript::find): an error that names it and the last lines when
+    /// it did not come.
+    pub fn expect(&mut self, what: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while !self.transcript.find(what) {
+            self.wait_on(deadline, &format!("{what:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// Waits up to `timeout` for a whole line that `wanted` takes after the
+    /// last text found (Transcript::find_line), which `what` names in the
+    /// error when it did not come; gives the line.
+    pub fn expect_line(
+        &mut self,
+        what: &str,
+        wanted: impl Fn(&str) -> bool,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(line) = self.transcript.find_line(&wanted) {
+                return Ok(line);
+            }
+            self.wait_on(deadline, what)?;
+        }
+    }
+
+    /// One wait of `expect` or `expect_line` for `what`; an error shows
+    /// the last lines, the one no LF ended yet among them.
+    fn wait_on(&mut self, deadline: Instant, what: &str) -> Result<(), String> {
+        match self.wait(deadline) {
+            Wait::Came => Ok(()),
+            Wait::Deadline => Err(format!(
+                "timed out waiting for {what}; last lines: {:?}",
+                tail(&self.transcript.lines())
+            )),
+            Wait::Ended => Err(format!(
+                "the output ended before {what}; last lines: {:?}",
+                tail(&self.transcript.lines())
+            )),
+        }
+    }
+
+    /// The lines that ended so far, a CR before the LF cut.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Waits up to `timeout` for the whole line `line` anywhere in the
+    /// output, before the last text found too; the next search still
+    /// starts where it did.
+    pub fn expect_seen(&mut self, line: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while !self.lines.iter().any(|l| l == line) {
+            self.wait_on(deadline, &format!("{line:?} anywhere"))?;
+        }
+        Ok(())
+    }
+
+    /// Types `line` and a CR, as Enter sends it, into the pipe of the
+    /// child's stdin.
+    pub fn send(&mut self, line: &str) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or("the run has no pipe on its stdin")?;
+        stdin
+            .write_all(format!("{line}\r").as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(|e| format!("typing {line:?}: {e}"))
+    }
+
+    /// Stops the run: its child is killed unless it exited, and the reader
+    /// ends with the output and is joined; gives the lines.
+    pub fn stop(self) -> Outcome {
+        self.end(End::Stopped)
+    }
+
+    /// The one way a run ends: the child, unless it `Exited`, is killed and
+    /// waited for; its stdin closes; the reader ends with the child's
+    /// output and is joined; the output it read is taken in. A run stopped
+    /// on a marker keeps its lines up to the marker's.
+    fn end(mut self, end: End) -> Outcome {
+        let status = match end {
+            End::Exited(status) => Some(status),
+            _ => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                None
+            }
+        };
+        drop(self.stdin.take());
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        while let Ok(piece) = self.pieces.try_recv() {
+            self.take(&piece);
+        }
+        self.end_line();
+        let mut lines = self.transcript.lines();
+        if let End::Marker(at) = end {
+            lines.truncate(at + 1);
+        }
+        Outcome {
+            lines,
+            status,
+            timed_out: matches!(end, End::TimedOut),
+            stopped_on_marker: matches!(end, End::Marker(_)),
+        }
+    }
+}
+
+/// Runs `cmd` with /dev/null on its stdin (Input::Null), echoing and
+/// collecting its lines, until a line contains `stop_marker`, where the
+/// lines end, until the child exits, or until `timeout` passes (Run).
 pub fn run_until(
-    mut cmd: Command,
+    cmd: Command,
     timeout: Duration,
     stop_marker: Option<&str>,
 ) -> Result<Outcome, String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{cmd:?}: {e}"))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        // Read raw bytes and decode lossily: a stray non-UTF-8 byte in the
-        // child's output must not end the reader early (BufRead::lines()
-        // would return an Err for such a line and stop there).
-        let mut reader = BufReader::new(stdout);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if buf.last() == Some(&b'\n') {
-                        buf.pop();
-                    }
-                    let line = String::from_utf8_lossy(&buf).into_owned();
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let mut run = Run::start(cmd, Input::Null)?;
     let deadline = Instant::now() + timeout;
-    let mut lines = Vec::new();
+    let mut checked = 0;
     loop {
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(line) => {
-                println!("{line}");
-                let line = line.trim_end_matches('\r').to_string();
-                let hit = stop_marker.is_some_and(|m| line.contains(m));
-                lines.push(line);
-                if hit {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok(Outcome {
-                        lines,
-                        status: None,
-                        timed_out: false,
-                        stopped_on_marker: true,
-                    });
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // The reader thread exited (EOF or a read error), but the
-                // child process may still be running: poll instead of a
-                // blocking wait so the deadline still applies.
-                loop {
-                    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                        return Ok(Outcome {
-                            lines,
-                            status: Some(status),
-                            timed_out: false,
-                            stopped_on_marker: false,
-                        });
-                    }
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Ok(Outcome {
-                            lines,
-                            status: None,
-                            timed_out: true,
-                            stopped_on_marker: false,
-                        });
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
+        if let Some(marker) = stop_marker
+            && let Some(at) = run.lines[checked..].iter().position(|l| l.contains(marker))
+        {
+            return Ok(run.end(End::Marker(checked + at)));
+        }
+        checked = run.lines.len();
+        match run.wait(deadline) {
+            Wait::Came => {}
+            Wait::Deadline => return Ok(run.end(End::TimedOut)),
+            Wait::Ended if run.line_start < run.transcript.bytes.len() => run.end_line(),
+            Wait::Ended => break,
+        }
+    }
+    // The output ended, but the child may still run: its exit is polled
+    // so that the deadline still holds.
+    loop {
+        if let Some(status) = run.child.try_wait().map_err(|e| e.to_string())? {
+            return Ok(run.end(End::Exited(status)));
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(Outcome {
-                lines,
-                status: None,
-                timed_out: true,
-                stopped_on_marker: false,
-            });
+            return Ok(run.end(End::TimedOut));
         }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -414,13 +684,11 @@ pub fn overflow_report_names(lines: &[String], f: Range<u64>) -> Result<(), Stri
     Ok(())
 }
 
-/// QEMU must have finished before the deadline.
+/// QEMU must have finished before the deadline: the error says it timed
+/// out and gives the last lines.
 pub fn expect_not_timed_out(o: &Outcome) -> Result<(), String> {
     if o.timed_out {
-        Err(format!(
-            "QEMU did not finish in time; last lines: {:?}",
-            tail(&o.lines)
-        ))
+        Err(format!("QEMU timed out; last lines: {:?}", tail(&o.lines)))
     } else {
         Ok(())
     }
@@ -528,12 +796,7 @@ pub fn expect_init_exit(o: &Outcome, after: &str, code: u64) -> Result<(), Strin
 /// `TESTS DONE`). Failed tests are named first: the test init exits with
 /// their count.
 pub fn verdict(o: &Outcome, r: &TestReport, exit: Option<u64>) -> Result<(), String> {
-    if o.timed_out {
-        return Err(format!(
-            "QEMU did not finish in time; last lines: {:?}",
-            tail(&o.lines)
-        ));
-    }
+    expect_not_timed_out(o)?;
     if !r.failed.is_empty() {
         return Err(format!("{} test(s) failed: {:?}", r.failed.len(), r.failed));
     }
@@ -983,7 +1246,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     fn kills_a_process_that_outlives_the_deadline() {
         let start = Instant::now();
         let o = run_until(
-            sh("echo started; sleep 10"),
+            sh("echo started; exec sleep 10"),
             Duration::from_millis(300),
             None,
         )
@@ -997,7 +1260,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     fn stops_on_the_marker() {
         let start = Instant::now();
         let o = run_until(
-            sh("echo booting; echo 'KERNEL PANIC: no device tree'; sleep 10"),
+            sh("echo booting; echo 'KERNEL PANIC: no device tree'; exec sleep 10"),
             Duration::from_secs(20),
             Some("no device tree"),
         )
@@ -1056,7 +1319,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
     fn survives_non_utf8_output() {
         let start = Instant::now();
         let o = run_until(
-            sh("printf 'bad \\377 byte\\n'; echo after; sleep 10"),
+            sh("printf 'bad \\377 byte\\n'; echo after; exec sleep 10"),
             Duration::from_millis(300),
             None,
         )
@@ -1138,6 +1401,141 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
             ..with(&["TEST a ok", "TESTS DONE failed=0"])
         };
         assert!(verdict(&bad_status, &parse_report(&bad_status.lines), None).is_err());
+    }
+
+    /// Spec 14: a run that timed out fails with a text that says so and
+    /// gives its last lines, the ten last and no other.
+    #[test]
+    fn verdict_names_a_hang() {
+        let mut shown: Vec<String> = (1..=12).map(|i| format!("TEST t{i} ok")).collect();
+        shown.push("init: services started".into());
+        let hung = Outcome {
+            lines: shown.clone(),
+            status: None,
+            timed_out: true,
+            stopped_on_marker: false,
+        };
+        let why = verdict(&hung, &parse_report(&hung.lines), None).unwrap_err();
+        assert!(why.contains("timed out"), "{why}");
+        assert!(why.contains("init: services started"), "{why}");
+        assert!(
+            why.contains("TEST t4 ok") && !why.contains("TEST t3 ok"),
+            "{why}"
+        );
+    }
+
+    /// A run with failed tests fails with a text that names each of them
+    /// and its reason.
+    #[test]
+    fn verdict_names_the_failed_tests() {
+        let o = finished(&[
+            "TEST a ok",
+            "TEST window_is_checked FAIL the page was open",
+            "TEST b ok",
+            "TEST log_counts_what_it_lost FAIL 5 lost, 6 expected",
+            "TESTS DONE total=4 failed=2",
+        ]);
+        let why = verdict(&o, &parse_report(&o.lines), None).unwrap_err();
+        for named in [
+            "2 test(s) failed",
+            "window_is_checked",
+            "the page was open",
+            "log_counts_what_it_lost",
+            "5 lost, 6 expected",
+        ] {
+            assert!(why.contains(named), "{named:?} is not in {why}");
+        }
+        assert!(!why.contains("\"a\""), "{why}");
+    }
+
+    /// The output of a shell dialog: the prompt, a command's echo and its
+    /// answer, the next prompt.
+    const DIALOG: &[u8] =
+        b"boot complete\r\nstafeto> echo hello stafeto\r\nhello stafeto\r\nstafeto> ";
+
+    /// Spec 14: the answer to a command is looked for after the command
+    /// was typed, not in its echo or in what came before.
+    #[test]
+    fn an_answer_is_looked_for_after_its_command() {
+        let mut t = Transcript::new(DIALOG);
+        assert!(t.find("stafeto> "));
+        assert!(t.find("echo hello stafeto\r\n"));
+        assert_eq!(
+            t.find_line(|l| l == "hello stafeto"),
+            Some("hello stafeto".into())
+        );
+        assert!(t.find("stafeto> "));
+        // With no answer, the echo of the command does not pass for it.
+        let unanswered = b"stafeto> echo hello stafeto\r\nstafeto> ";
+        let mut t = Transcript::new(unanswered);
+        assert!(t.find("echo hello stafeto\r\n"));
+        assert!(!t.find("hello stafeto"));
+        assert_eq!(t.find_line(|l| l.ends_with("hello stafeto")), None);
+        // A line that starts before the text found is no whole line after
+        // it.
+        let mut t = Transcript::new(b"up 1.5 s\r\nup 2.0 s\r\n");
+        assert!(t.find("up 1"));
+        assert_eq!(
+            t.find_line(|l| l.starts_with("up ")),
+            Some("up 2.0 s".into())
+        );
+    }
+
+    /// Spec 14: the prompt comes with no newline after it and is found all
+    /// the same; the lines end with it.
+    #[test]
+    fn a_prompt_needs_no_newline() {
+        let mut t = Transcript::new(DIALOG);
+        assert!(t.find("hello stafeto\r\nstafeto> "));
+        assert!(!t.find("stafeto> "), "one prompt is found once");
+        assert_eq!(t.find_line(|_| true), None);
+        assert_eq!(
+            t.lines(),
+            [
+                "boot complete",
+                "stafeto> echo hello stafeto",
+                "hello stafeto",
+                "stafeto> "
+            ]
+        );
+    }
+
+    /// Each line of a run echoes as it ends, with no CR (spec 14); the
+    /// lines of the outcome have none either.
+    #[test]
+    fn echo_drops_the_carriage_return() {
+        let echoed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = std::rc::Rc::clone(&echoed);
+        let echo = Box::new(move |line: &str| sink.borrow_mut().push(line.to_string()));
+        let script = sh("printf 'one\\r\\ntwo\\r\\nprompt> '");
+        let mut run = Run::start_with(script, Input::Null, echo).unwrap();
+        run.expect("prompt> ", Duration::from_secs(5)).unwrap();
+        let o = run.stop();
+        assert_eq!(*echoed.borrow(), ["one", "two", "prompt> "]);
+        assert_eq!(o.lines, ["one", "two", "prompt> "]);
+    }
+
+    /// Spec 14: `stop` kills the child and joins the thread that reads
+    /// it, whose pipe the kill closed; a line typed into the pipe of its
+    /// stdin comes back from `cat`.
+    #[test]
+    fn stopping_a_run_joins_its_reader() {
+        let start = Instant::now();
+        let mut run = Run::start(sh("echo ready; exec cat"), Input::Pipe).unwrap();
+        run.expect("ready\n", Duration::from_secs(5)).unwrap();
+        run.send("ping").unwrap();
+        run.expect("ping\r", Duration::from_secs(5)).unwrap();
+        let ended = Arc::clone(&run.ended);
+        assert!(!ended.load(Ordering::Acquire), "cat still runs");
+        let o = run.stop();
+        assert!(ended.load(Ordering::Acquire), "the reader was not joined");
+        assert_eq!(o.lines, ["ready", "ping"]);
+        assert!(!o.timed_out && !o.stopped_on_marker && o.status.is_none());
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // A run with /dev/null on its stdin has nothing to type into.
+        let mut quiet = Run::start(sh("exec cat"), Input::Null).unwrap();
+        assert!(quiet.send("x").is_err());
+        let _ = quiet.stop();
     }
 
     #[test]

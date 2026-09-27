@@ -1,0 +1,29 @@
+[package]
+name = "shell"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The shell of stafeto"
+
+# What the shell decides, apart from the calls it makes: tested on the
+# host.
+[lib]
+bench = false
+
+[[bin]]
+name = "shell"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-init = { path = "../../proto/init" }
+proto-uart = { path = "../../proto/uart" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }

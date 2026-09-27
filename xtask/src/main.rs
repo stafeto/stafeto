@@ -23,14 +23,23 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
+/// The stacks of the UART driver (services/uart) and of the shell
+/// (apps/shell), which init's loader maps.
+const UART_STACK_SIZE: u32 = 16 * 1024;
+const SHELL_STACK_SIZE: u32 = 16 * 1024;
 /// A program of a boot image: its file's name in the image, the package
 /// that builds it for EL0, the size of its stack and the features of the
 /// package it builds with.
 type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
 /// The programs of the boot image of the normal build, of the test init's
 /// runs, of the runs of init's test table and of the two tables init
-/// refuses (spec 15.2). Init comes first (spec 13.1).
-const BOOT_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &[])];
+/// refuses (spec 15.2). Init comes first (spec 13.1). The driver of the
+/// image that ships has the method CRASH in subproject 1 (spec 13.5).
+const BOOT_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &[]),
+    ("uart", "uart", UART_STACK_SIZE, &["crash"]),
+    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -114,24 +123,63 @@ const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
 const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
-/// The line init prints once the first start of each record of its table
-/// is done (spec 13.4); init lives on after it, and xtask stops QEMU on
-/// it.
+/// The line the shell of the normal build says once it connected to the
+/// UART driver (spec 13.6): the driver registered, its output goes by
+/// interrupts, and the shell's session works. The system lives on after
+/// it, and xtask stops a boot on it.
+const SHELL_CONNECTED: &str = "shell: connected to uart; type help for the commands";
+/// Init's line once the first start of each record is done (spec 13.4).
 const SERVICES_STARTED: &str = "init: services started";
+/// The line of the UART driver at its start (spec 13.5).
+const UART_LINE: &str = "uart: pl011 at 0x9000000, line 33";
+/// The shell's prompt, with no newline after it.
+const PROMPT: &str = "stafeto> ";
+/// The lines of `crash uart` (spec 13.6): the shell's before its CRASH,
+/// its line once it connected to the new instance of the driver, and its
+/// line through debug_write once init marked the driver broken.
+const CRASHING: &str = "shell: crashing uart";
+const RECONNECTED: &str = "shell: uart restarted; connected again";
+const BROKEN: &str = "shell: uart is broken; no console left";
+/// The start of the kernel's line of a program fault (spec 7.9) for the
+/// load from address 0 of the driver's CRASH, and of init's line of the
+/// driver's end (spec 16.2).
+const DRIVER_FAULT: &str = "process fault: data abort from EL0 (EC 0x24) ESR=0x";
+const UART_ENDED: &str = "init: uart ended: ";
+/// The lines of the shell's `help`, each whole (spec 13.6).
+const HELP_LINES: [&str; 7] = [
+    "help        list the commands",
+    "echo WORDS  print the words",
+    "uptime      the time since boot",
+    "ps          the services and their state",
+    "mem         the memory of each process",
+    "bench       the round trip of a request and the latencies",
+    "crash uart  crash the UART driver; init restarts it",
+];
+/// The bytes of the line the console dialog types while `bench` runs:
+/// past the driver's ring of input (256 bytes), a READ (64) and the FIFO.
+const TYPED_AHEAD: usize = 400;
+/// How long a step of the console dialog waits for its answer; its first,
+/// the driver's line, waits BOOT_TIMEOUT.
+const DIALOG_STEP: Duration = Duration::from_secs(10);
 /// The names of the records of init's test table (services/init, feature
 /// `table-test`), which the init that ships does not carry.
 const TEST_TABLE_NAMES: [&str; 11] = [
     "sink", "echo", "slow", "device", "crash", "silent", "mute", "checker", "private", "hog",
     "oneshot",
 ];
+/// Names of TEST_TABLE_NAMES that are words of init's own lines too: a
+/// service that goes silent (`<name> went silent, killed from level ...`),
+/// which the init that ships carries since its table has a service.
+const INIT_WORDS: [&str; 1] = ["silent"];
 /// The start of the line init prints when the client `checker` of its
 /// test table ends, and the whole line: its policy is never (spec 13.4).
 /// xtask stops QEMU on it.
 const CHECKER_END: &str = "init: checker ended: ";
 const CHECKER_ENDED: &str = "init: checker ended: exit code 0, not restarted";
-/// Init's decisions on the failures of `crash` of its test table, in
-/// their order (spec 13.4, 16.2): four restarts, each pause twice the one
-/// before, then the mark of a broken service.
+/// Init's decisions on five failures in a row of a service that always
+/// restarts, in their order (spec 13.4, 16.2): four restarts, each pause
+/// twice the one before, then the mark of a broken service. `crash` of
+/// its test table fails so, and the UART driver under `crash uart`.
 const CRASH_DECISIONS: [&str; 5] = [
     "restarts in 100 ms",
     "restarts in 200 ms",
@@ -173,11 +221,13 @@ const TEST_INIT_LINES: [&str; 6] = [
     "BAD_HANDLE from Notify",
     "BAD_HANDLE from HandleClose",
 ];
-/// The children of the test init that fault, each with a line of the
-/// kernel (spec 7.9): the child with no code of
+/// The children of the test init that fault with a line of the kernel on
+/// the port (spec 7.9): the child with no code of
 /// `child_fault_reason_reaches_the_parent` and the children with code of
 /// the tests of faults, of `wfi` with the fault before it, of an orphan
-/// that faults and of a load through a device window on a hole.
+/// that faults and of a load through a device window on a hole. The child
+/// of `a_kernel_line_fills_records_in_turn` faults behind a window over
+/// the console's page, and its line stays in the kernel log (spec 3.2).
 const CHILD_FAULTS: usize = 13;
 /// The panic of a child (tests/child, Role::Panic): rt prints where it
 /// panicked, then this message on a line of its own (spec 13.2).
@@ -209,7 +259,20 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 216;
+const INIT_TESTS: u32 = 220;
+/// The lines of the test init's
+/// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
+/// first, written behind a window over the console's page, goes into the
+/// kernel log alone and never reaches the port; the second, written once
+/// the window went, comes whole.
+const LOG_BEHIND: &str = "log marker: behind the window";
+const LOG_IN_FRONT: &str = "log marker: in front of the window";
+/// The rows of the test init's line `log ticks:` under -icount (spec
+/// 15.3): a debug_write of 64 bytes into the kernel log and a read of a
+/// full batch of it.
+const LOG_ROWS: [&str; 2] = ["write", "take"];
+/// The page of the PL011 of QEMU `virt`, the console's port.
+const CONSOLE_PA: u64 = 0x0900_0000;
 /// Tests the client `checker` of init's test table has (tests/svc).
 const SVC_TESTS: u32 = 26;
 /// What init prints for each table it refuses (services/init, features
@@ -312,19 +375,22 @@ const USAGE: &str = "usage: cargo xtask <command>
 
 commands:
   build     build the kernel image and the boot image
-  run       build and boot in QEMU (Ctrl-A X quits)
-  test      host tests, then boot checks, init tests and kernel tests in QEMU
+  run       build and boot in QEMU to the shell (Ctrl-A X quits); with
+            --hvf under HVF on a Mac with Apple silicon
+  test      host tests, then boot checks, the console dialog, init tests
+            and kernel tests in QEMU
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci        formatting, clippy, then everything `test` does
-  hvf       boot checks, init tests and kernel tests under HVF on a Mac with
-            Apple silicon, on Apple's GICv3 and QEMU's GICv2; skips elsewhere
+  hvf       boot checks, the console dialog, init tests and kernel tests
+            under HVF on a Mac with Apple silicon, on Apple's GICv3 and
+            QEMU's GICv2; skips elsewhere
   help      this text";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
-        Some("run") => run(),
+        Some("run") => run(&args[1..]),
         Some("test") => test(),
         Some("gdb") => gdb(),
         Some("ci") => ci(),
@@ -578,14 +644,34 @@ fn init_entry(path: &Path) -> Result<u64, String> {
     Ok(init.entry)
 }
 
+/// `movz x<rd>, #imm, lsl #(16 * hw)`.
+const fn movz(rd: u32, imm: u16, hw: u32) -> u32 {
+    0xD280_0000 | hw << 21 | (imm as u32) << 5 | rd
+}
+
+/// `movk x<rd>, #imm, lsl #(16 * hw)`.
+const fn movk(rd: u32, imm: u16, hw: u32) -> u32 {
+    0xF280_0000 | hw << 21 | (imm as u32) << 5 | rd
+}
+
 /// `movz x0, #imm`.
 const fn movz_x0(imm: u16) -> u32 {
-    0xD280_0000 | (imm as u32) << 5
+    movz(0, imm, 0)
 }
 
 /// `movk x0, #imm, lsl #16`.
 const fn movk_x0_lsl16(imm: u16) -> u32 {
-    0xF2A0_0000 | (imm as u32) << 5
+    movk(0, imm, 1)
+}
+
+/// x<rd> = `value`: a `movz` of its low 16 bits, then a `movk` of each
+/// other 16 bits that are not 0.
+fn mov(rd: u32, value: u64) -> Vec<u32> {
+    let half = |hw: u32| (value >> (16 * hw)) as u16;
+    let rest = (1..4).filter(|&hw| half(hw) != 0);
+    std::iter::once(movz(rd, half(0), 0))
+        .chain(rest.map(|hw| movk(rd, half(hw), hw)))
+        .collect()
 }
 
 /// `svc #n`.
@@ -633,9 +719,29 @@ fn raw_init(code: &[u32], rodata: bool, data_size: u64) -> Result<Vec<u8>, Strin
     bootimg::write::image(&[("init", &init)]).map_err(|e| e.to_string())
 }
 
-fn run() -> Result<(), String> {
+/// `cargo xtask run` (spec 14): the normal build on the machine of
+/// run_machine, with the console on the terminal.
+fn run(args: &[String]) -> Result<(), String> {
+    let m = run_machine(args, hvf_host)?;
     let a = build(Variant::Normal)?;
-    run_cmd(qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image)).arg("-nographic"))
+    run_cmd(qemu::command(m, &a.image, Some(&a.boot_image)).arg("-nographic"))
+}
+
+/// The machine of `cargo xtask run` with `args` (spec 14): VIRT with
+/// none; HVF_V3 with `--hvf` when `host` says HVF runs here (hvf_host), an
+/// error with its reason otherwise, which a person asked for and should
+/// see; an error for any other arguments.
+fn run_machine(
+    args: &[String],
+    host: impl FnOnce() -> Result<(), String>,
+) -> Result<&'static qemu::Machine, String> {
+    match args {
+        [] => Ok(&qemu::VIRT),
+        [flag] if flag == "--hvf" => host().map(|()| &qemu::HVF_V3).map_err(|why| {
+            format!("run --hvf needs macOS on Apple Silicon with the Hypervisor framework: {why}")
+        }),
+        _ => Err(format!("unknown arguments of run: {args:?}\n\n{USAGE}")),
+    }
 }
 
 fn test() -> Result<(), String> {
@@ -645,9 +751,12 @@ fn test() -> Result<(), String> {
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
     two_gib_boot()?;
+    console_dialog(&qemu::VIRT)?;
+    console_dialog(&qemu::VIRT_V3)?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
     init_fault_stops_the_machine()?;
+    panic_prints_the_log_nobody_showed()?;
     fault_report()?;
     stack_overflow_report()?;
     test_build_carries_test_symbols()?;
@@ -685,7 +794,13 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-uart",
+        "--package",
         "proto-wire",
+        "--package",
+        "shell",
+        "--package",
+        "uart",
         "--package",
         "xtask",
     ]))
@@ -693,9 +808,10 @@ fn host_tests() -> Result<(), String> {
 
 /// A normal build boots on machine `m`, prints its report (boot_report)
 /// with the line of the GIC, `gic`, and init's entry point from the boot
-/// image, and starts init, which checks its table, starts its services
-/// and says so: xtask stops QEMU on SERVICES_STARTED, with no panic before
-/// it (qemu::expect_stopped_on). Gives the timer's frequency. On VIRT_EL2
+/// image, and starts init, which checks its table and starts the UART
+/// driver and the shell, which connects to it and says so: xtask stops
+/// QEMU on SHELL_CONNECTED, with no panic before it
+/// (qemu::expect_stopped_on). Gives the timer's frequency. On VIRT_EL2
 /// and VIRT_EL2_V3 the kernel is entered at EL2, as the PinePhone's loader
 /// does: head.S must drop to EL1, and with a GICv3 open its system
 /// registers to EL1 first. The image also carries none of the kernel's own
@@ -706,8 +822,8 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SERVICES_STARTED))?;
-    qemu::expect_stopped_on(&o, SERVICES_STARTED)?;
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     let size = std::fs::metadata(&a.boot_image)
@@ -757,19 +873,352 @@ fn boot_report(
 }
 
 /// With 2 GiB of RAM the second GiB is not mapped at boot: the allocator
-/// must receive it after the kernel page tables map all RAM.
+/// must receive it after the kernel page tables map all RAM. The boot
+/// goes on to the shell (SHELL_CONNECTED).
 fn two_gib_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT_2G, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SERVICES_STARTED))?;
-    qemu::expect_stopped_on(&o, SERVICES_STARTED)?;
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let free =
         qemu::number_after(&o.lines, "frames ").ok_or("the kernel printed no frames line")?;
     if free < 1900 {
         return Err(format!("only {free} MiB of frames free with 2 GiB of RAM"));
     }
     Ok(())
+}
+
+/// Spec 13.5, 13.6, 14, 15.2: the normal build on machine `m` with a pipe
+/// on the console's input (qemu::Run): the UART driver's line, the
+/// shell's line and its prompt; `help` gives HELP_LINES; `echo hello
+/// stafeto` comes back as its echo, the line typed, then the line `hello
+/// stafeto` after it; `uptime` gives seconds with milliseconds; `ps`
+/// gives its header whole and the rows of init, uart and shell, running
+/// at their levels, uart and shell never failed or restarted and with the
+/// limits of their records (ps_row); `mem` their pages, a total where a
+/// child's quota counts by what the child uses (spec 7.5), and the
+/// kernel's line; `bench` its line with its five numbers (bench_numbers),
+/// which fail nothing by their values (spec 15.3); a prompt after each
+/// answer. A line of TYPED_AHEAD bytes typed while `bench` runs, past the
+/// driver's ring of input, comes back as its first 128 bytes (spec 13.5,
+/// 13.6), and init's SERVICES_STARTED, which reaches the log after the
+/// driver's first read and only its timer shows, comes before the crash.
+/// Then `crash uart`: the driver restarts and the shell connects
+/// again (crash_uart); `ps` shows uart running at 60/60, failed and
+/// restarted once, and the shell running, never failed or restarted;
+/// `echo after the crash` comes back; and
+/// a_broken_driver_gives_the_port_back. The run has no KERNEL PANIC line.
+fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let talked = dialog(&mut run);
+    let o = run.stop();
+    let bench = talked.map_err(|e| format!("console dialog on {}: {e}", m.name))?;
+    if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
+        return Err(format!("console dialog on {}: {panic}", m.name));
+    }
+    println!("console dialog on {}: ok; {bench}", m.name);
+    Ok(())
+}
+
+/// The steps of `console_dialog`, each after the one before it; gives
+/// the line of `bench`.
+fn dialog(run: &mut qemu::Run) -> Result<String, String> {
+    let whole = |line: &'static str| move |l: &str| l == line;
+    run.expect_line(UART_LINE, whole(UART_LINE), BOOT_TIMEOUT)?;
+    run.expect_line(SHELL_CONNECTED, whole(SHELL_CONNECTED), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("help")?;
+    for line in HELP_LINES {
+        run.expect_line(line, whole(line), DIALOG_STEP)?;
+    }
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("echo hello stafeto")?;
+    run.expect("echo hello stafeto\r\n", DIALOG_STEP)?;
+    run.expect_line("hello stafeto", whole("hello stafeto"), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("uptime")?;
+    run.expect_line("the uptime", is_uptime, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("ps")?;
+    run.expect_line(PS_HEADER, whole(PS_HEADER), DIALOG_STEP)?;
+    // The records of the table that ships: running, never failed, with
+    // the levels, handle limit and quota of their records.
+    for (name, levels, limit) in [
+        ("init", "63/63", ""),
+        ("uart", "60/60", "32"),
+        ("shell", "30/30", "32"),
+    ] {
+        let row = |l: &str| {
+            ps_row(l, name).is_some_and(|c| {
+                c[1..3] == ["running", levels]
+                    && (limit.is_empty()
+                        || (c[3..5] == ["0", "0"]
+                            && c[5].rsplit('/').next() == Some(limit)
+                            && c[6].rsplit('/').next() == Some(limit)))
+            })
+        };
+        run.expect_line(&format!("the row of {name} in ps"), row, DIALOG_STEP)?;
+    }
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("mem")?;
+    let mut rows = Vec::new();
+    for name in ["init", "uart", "shell"] {
+        let row = run.expect_line(
+            &format!("the row of {name} in mem"),
+            |l| mem_row(l, name).is_some(),
+            DIALOG_STEP,
+        )?;
+        rows.push(mem_row(&row, name).unwrap_or_default());
+    }
+    // A child's quota counts whole in what init uses (spec 7.5).
+    let unused: u64 = rows[1..]
+        .iter()
+        .map(|(used, quota)| quota.saturating_sub(*used))
+        .sum();
+    let sum = (rows[0].0.saturating_sub(unused), rows[0].1);
+    let total = |l: &str| mem_row(l, "total") == Some(sum);
+    run.expect_line(&format!("a total of {sum:?} in mem"), total, DIALOG_STEP)?;
+    let kernel = "kernel: # frames free, # pages in pools; init: # pages of quota free";
+    run.expect_line(kernel, |l| numbers(l, kernel).is_some(), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("bench")?;
+    // Typed while bench keeps the shell busy: more than the driver's ring
+    // of input holds, which masks input until the shell reads again.
+    run.send(&format!("echo {}", "a".repeat(TYPED_AHEAD)))?;
+    let line = run.expect_line(
+        "the line of bench",
+        |l| bench_numbers(l).is_some(),
+        DIALOG_STEP,
+    )?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    let kept = "a".repeat(128 - "echo ".len());
+    run.expect_line("the line typed ahead", |l| l == kept, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    // Init writes its line into the kernel log once the shell started,
+    // after the driver's first read: only the driver's timer shows it.
+    run.expect_seen(SERVICES_STARTED, DIALOG_STEP)?;
+    crash_uart(run, CRASH_DECISIONS[0])?;
+    run.send("ps")?;
+    // The driver failed and restarted once; connecting again restarted
+    // no shell.
+    for (name, levels, counts) in [
+        ("uart", "60/60", ["1", "1"]),
+        ("shell", "30/30", ["0", "0"]),
+    ] {
+        let row = |l: &str| {
+            ps_row(l, name).is_some_and(|c| c[1..3] == ["running", levels] && c[3..5] == counts)
+        };
+        let what = format!(
+            "the row of {name} in ps with fails and restarts {} {}",
+            counts[0], counts[1]
+        );
+        run.expect_line(&what, row, DIALOG_STEP)?;
+    }
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("echo after the crash")?;
+    run.expect("echo after the crash\r\n", DIALOG_STEP)?;
+    run.expect_line("after the crash", whole("after the crash"), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    a_broken_driver_gives_the_port_back(run)?;
+    Ok(line)
+}
+
+/// `crash uart` with the driver restarting after init's `decision` (spec
+/// 13.5, 13.6, 16.2): the shell says so and connects again, and prompts
+/// (crash_lines).
+fn crash_uart(run: &mut qemu::Run, decision: &str) -> Result<(), String> {
+    let from = run.lines().len();
+    run.send("crash uart")?;
+    let whole = |l: &str| l == RECONNECTED;
+    run.expect_line(RECONNECTED, whole, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    crash_lines(&run.lines()[from..], decision).map_err(|e| format!("crash uart, {decision}: {e}"))
+}
+
+/// The lines from `crash uart` to the prompt after it, when the driver
+/// restarts after `decision` (spec 13.6, 16.2): the shell's CRASHING, then
+/// the kernel's line of the driver's fault at address 0, which went into
+/// the kernel log while the driver's window held the port and which the
+/// new instance shows, and init's line of the driver's end with that
+/// fault and `decision`, each exactly once, then the new driver's
+/// UART_LINE and the shell's RECONNECTED last, in this order. Other lines
+/// may come between: records of the log the dead instance did not show.
+fn crash_lines(lines: &[String], decision: &str) -> Result<(), String> {
+    let fault = |l: &str| driver_fault(l);
+    let ended = |l: &str| uart_ended(l, decision);
+    let once = |what: &str, wanted: &dyn Fn(&str) -> bool| one_line(lines, what, wanted);
+    let steps = [
+        once("the shell's crashing", &|l| l == CRASHING)?,
+        once("the driver's fault", &fault)?,
+        once("uart's end", &|l| l.starts_with(UART_ENDED))?,
+        once("the driver's start", &|l| l == UART_LINE)?,
+    ];
+    if !ended(&lines[steps[2]]) {
+        return Err(format!(
+            "{:?}: a fault at 0 and {decision:?} expected",
+            lines[steps[2]]
+        ));
+    }
+    if !steps.is_sorted() || lines.last().is_none_or(|l| l != RECONNECTED) {
+        return Err(format!(
+            "{CRASHING:?}, the fault, uart's end, {UART_LINE:?} and {RECONNECTED:?} expected in this order: {lines:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `l` is the kernel's line of the driver's fault at address 0
+/// (spec 7.9): DRIVER_FAULT, the syndrome, FAR 0 and the ELR.
+fn driver_fault(l: &str) -> bool {
+    l.strip_prefix(DRIVER_FAULT)
+        .and_then(|l| l.split_once(" FAR=0x0 ELR=0x"))
+        .is_some_and(|(esr, elr)| is_hex(esr) && is_hex(elr))
+}
+
+/// Whether `l` is init's line of the driver's end by that fault with
+/// `decision` (spec 16.2).
+fn uart_ended(l: &str, decision: &str) -> bool {
+    l.strip_prefix(UART_ENDED)
+        .and_then(|l| l.strip_prefix("fault ESR=0x"))
+        .and_then(|l| l.strip_suffix(decision)?.strip_suffix("; "))
+        .and_then(|l| l.split_once(" FAR=0x0 ELR=0x"))
+        .is_some_and(|(esr, elr)| is_hex(esr) && is_hex(elr))
+}
+
+/// Whether `s` is one hex digit or more.
+fn is_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The place of the one line of `lines` that `wanted` takes, which `what`
+/// names in the error when there is none or more.
+fn one_line(lines: &[String], what: &str, wanted: &dyn Fn(&str) -> bool) -> Result<usize, String> {
+    let at: Vec<usize> = (0..lines.len()).filter(|&i| wanted(&lines[i])).collect();
+    match at[..] {
+        [i] => Ok(i),
+        _ => Err(format!(
+            "{} lines of {what}, one expected: {lines:?}",
+            at.len()
+        )),
+    }
+}
+
+/// Spec 13.4, 13.6, 16.3: four more `crash uart` in a row, the driver
+/// restarting after the second to the fourth pause of CRASH_DECISIONS and
+/// the shell connecting again after each (crash_uart); the fifth failure
+/// in 60 s marks the driver broken, its window goes, the port is the
+/// kernel's again, the shell says BROKEN through debug_write, and init's
+/// worker shows what is left of the kernel log: the lines of that last
+/// end (broken_lines).
+fn a_broken_driver_gives_the_port_back(run: &mut qemu::Run) -> Result<(), String> {
+    for decision in &CRASH_DECISIONS[1..4] {
+        crash_uart(run, decision)?;
+    }
+    let from = run.lines().len();
+    run.send("crash uart")?;
+    let broken = CRASH_DECISIONS[4];
+    run.expect_line(BROKEN, |l| l == BROKEN, DIALOG_STEP)
+        .and_then(|_| run.expect_line(UART_ENDED, |l| uart_ended(l, broken), DIALOG_STEP))
+        .and_then(|_| broken_lines(&run.lines()[from..]))
+        .map(drop)
+        .map_err(|e| format!("a broken driver: {e}"))
+}
+
+/// The lines from the fifth `crash uart` to init's line of the driver's
+/// end (spec 13.4, 13.6, 16.3): the shell's CRASHING and BROKEN, then the
+/// kernel's line of the driver's fault and init's line of its end with the
+/// mark of a broken service, which init's worker shows from the kernel
+/// log once the port is the kernel's, each exactly once and in this order;
+/// no line of a new driver or of a reconnection.
+fn broken_lines(lines: &[String]) -> Result<(), String> {
+    let broken = CRASH_DECISIONS[4];
+    let once = |what: &str, wanted: &dyn Fn(&str) -> bool| one_line(lines, what, wanted);
+    let steps = [
+        once("the shell's crashing", &|l| l == CRASHING)?,
+        once("the shell's broken", &|l| l == BROKEN)?,
+        once("the driver's fault", &driver_fault)?,
+        once("uart's end", &|l| uart_ended(l, broken))?,
+    ];
+    if !steps.is_sorted() || lines.iter().any(|l| l == UART_LINE || l == RECONNECTED) {
+        return Err(format!(
+            "{CRASHING:?}, {BROKEN:?}, the fault and uart's end expected in this order, and no new driver: {lines:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The header of the shell's `ps`, whole.
+const PS_HEADER: &str = "name             state     prio fails restarts        handles       pages";
+
+/// The columns of `line` when it is the row of `name` in the shell's `ps`
+/// (spec 13.6): the name, a state, priority/ceiling, failures, restarts,
+/// handles live/retired/limit and pages used/quota.
+fn ps_row<'a>(line: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    let numbers = |col: &str, n: usize| {
+        let parts: Vec<&str> = col.split('/').collect();
+        parts.len() == n && parts.iter().all(|p| p.parse::<u64>().is_ok())
+    };
+    let row = cols.len() == 7
+        && cols[0] == name
+        && cols[1].bytes().all(|b| b.is_ascii_lowercase())
+        && numbers(cols[2], 2)
+        && numbers(cols[3], 1)
+        && numbers(cols[4], 1)
+        && numbers(cols[5], 3)
+        && numbers(cols[6], 2);
+    row.then_some(cols)
+}
+
+/// The pages used and the quota of `line` when it is the row of `name`
+/// in the shell's `mem`: `<name> <used> of <quota> pages`.
+fn mem_row(line: &str, name: &str) -> Option<(u64, u64)> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [n, used, "of", quota, "pages"] if n == name => {
+            Some((used.parse().ok()?, quota.parse().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// The five numbers of the line of the shell's `bench` (spec 13.6): the
+/// least, mean and most of 1000 round trips of PING and the longest
+/// latencies of a timer that woke the kernel from `wfi` (x2 of
+/// KERNEL_STATS) and of one that came while a thread or the kernel ran
+/// (x3), each in ns.
+fn bench_numbers(line: &str) -> Option<[u64; 5]> {
+    let template = "bench: ping round trip over 1000 rounds: min # ns, mean # ns, max # ns; \
+                    timer latency max # ns; interrupt latency max # ns";
+    numbers(line, template)?.try_into().ok()
+}
+
+/// The numbers of `line` when it is `template` word by word, with a
+/// number at each `#`.
+fn numbers(line: &str, template: &str) -> Option<Vec<u64>> {
+    let words = line.split_whitespace();
+    let mut numbers = Vec::new();
+    for (word, wanted) in words.clone().zip(template.split_whitespace()) {
+        match wanted.strip_prefix('#') {
+            Some(rest) => numbers.push(word.strip_suffix(rest)?.parse().ok()?),
+            None if word == wanted => {}
+            None => return None,
+        }
+    }
+    (words.count() == template.split_whitespace().count()).then_some(numbers)
+}
+
+/// Whether `line` is the shell's `uptime`: `up <seconds>.<ms> s`, with
+/// three digits of milliseconds.
+fn is_uptime(line: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    line.strip_prefix("up ")
+        .and_then(|l| l.strip_suffix(" s"))
+        .and_then(|l| l.split_once('.'))
+        .is_some_and(|(s, ms)| digits(s) && digits(ms) && ms.len() == 3)
 }
 
 /// Booting the ELF leaves x0 = 0; the kernel must say why it stops.
@@ -893,6 +1342,62 @@ fn init_fault_stops_the_machine() -> Result<(), String> {
     Ok(())
 }
 
+/// Spec 16.1: the panic shows the records of the kernel log that nobody
+/// showed or took, before its own report. An init of xtask's own
+/// (raw_init) makes a device window over the console's page through its
+/// system resource, which takes the port from the kernel (spec 3.2),
+/// writes `pan-log` with debug_write and loads from address 0: the kernel
+/// puts the line of the fault and init's registers into its log, and the
+/// panic shows `pan-log`, the line and the registers, in that order,
+/// before its line KERNEL PANIC and the line of its cause, every line
+/// whole; the machine powers off.
+fn panic_prints_the_log_nobody_showed() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let resource = abi::INIT_RESOURCE.0;
+    let mut code = Vec::new();
+    code.extend(mov(0, resource));
+    code.extend(mov(1, CONSOLE_PA));
+    code.extend(mov(2, bootimg::PAGE_SIZE));
+    code.push(svc(abi::Call::DeviceWindowCreate.number()));
+    code.extend(mov(0, resource));
+    code.extend(mov(1, 8));
+    code.extend(mov(2, u64::from_le_bytes(*b"pan-log\n")));
+    code.push(svc(abi::Call::DebugWrite.number()));
+    let elr = RAW_INIT_ENTRY + 4 * code.len() as u64;
+    // debug_write leaves 0 in x0: the load is from page 0.
+    code.push(LDR_X0_X0);
+    let path = target_dir().join("panic-log-init.img");
+    std::fs::write(&path, raw_init(&code, false, 0)?)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    qemu::expect_powered_off(&o)?;
+    let at = |what: &str, found: &dyn Fn(&str) -> bool| {
+        o.lines
+            .iter()
+            .position(|l| found(l))
+            .ok_or_else(|| format!("no line of {what}; the lines: {:?}", o.lines))
+    };
+    let fault = format!("ESR=0x92000006 FAR=0x0 ELR={elr:#x}");
+    let fault_line = format!("process fault: data abort from EL0 (EC 0x24) {fault}");
+    let cause = format!("init terminated by a fault: {fault}");
+    let order = [
+        at("pan-log", &|l| l == "pan-log")?,
+        at("the fault", &|l| l == fault_line)?,
+        at("x0", &|l| l.starts_with("x0  0x"))?,
+        at("init's registers", &|l| l == init_registers(elr))?,
+        at("the panic", &|l| l.starts_with("KERNEL PANIC: "))?,
+        at("its cause", &|l| l == cause)?,
+    ];
+    if !order.is_sorted() {
+        return Err(format!(
+            "the log did not come before the panic in its order: lines {order:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// The line of init's registers the kernel prints at its fault
 /// (exceptions::user_fault) for an init of raw_init faulting at `elr`: SP
 /// at abi::INIT_STACK_TOP, 0 in SPSR and TPIDR_EL0.
@@ -914,6 +1419,17 @@ fn fault_report() -> Result<(), String> {
     qemu::expect_not_timed_out(&o)?;
     for marker in ["unknown or undefined instruction", "x0  0x", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
+    }
+    // The probe's record behind its window comes once, before the report.
+    let logged: Vec<usize> = (0..o.lines.len())
+        .filter(|&i| o.lines[i] == "probe-log")
+        .collect();
+    let report = o.lines.iter().position(|l| l.starts_with("x0  0x"));
+    if !matches!((&logged[..], report), ([at], Some(r)) if *at < r) {
+        return Err(format!(
+            "the record nobody showed did not come once before the report: {:?}",
+            o.lines
+        ));
     }
     qemu::backtrace_names_the_fault(&o.lines)
 }
@@ -993,7 +1509,7 @@ fn init_program(path: &Path) -> Result<Vec<u8>, String> {
 /// Spec 13.4, 15.2: the init of the boot image that ships carries no
 /// record of init's test table, whose names the init of the image of that
 /// table carries: each of TEST_TABLE_NAMES is looked for in the bytes of
-/// both programs (`init_program`).
+/// both programs (`init_program`), those of INIT_WORDS only in the second.
 fn shipping_init_has_no_test_table() -> Result<(), String> {
     let shipping = init_program(&build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?)?;
     let testing = init_program(&build_boot_image(
@@ -1004,7 +1520,7 @@ fn shipping_init_has_no_test_table() -> Result<(), String> {
     let carries =
         |bytes: &[u8], name: &str| bytes.windows(name.len()).any(|w| w == name.as_bytes());
     for name in TEST_TABLE_NAMES {
-        if carries(&shipping, name) {
+        if carries(&shipping, name) && !INIT_WORDS.contains(&name) {
             return Err(format!(
                 "the init that ships carries the test record {name}"
             ));
@@ -1017,7 +1533,7 @@ fn shipping_init_has_no_test_table() -> Result<(), String> {
     }
     println!(
         "no record of the test table in the init that ships, {} names",
-        TEST_TABLE_NAMES.len()
+        TEST_TABLE_NAMES.len() - INIT_WORDS.len()
     );
     Ok(())
 }
@@ -1233,6 +1749,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     for line in TEST_INIT_LINES {
         qemu::expect_line(&o, line)?;
     }
+    log_markers(&o)?;
     child_panic_comes_whole(&o.lines)?;
     let faults = o
         .lines
@@ -1261,8 +1778,20 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
             m.name,
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
+        let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
+        println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
     Ok(r.passed.len())
+}
+
+/// Spec 3.2: the line the test init writes behind a window over the
+/// console's page reaches no line of the port, and the one it writes once
+/// the window went comes whole.
+fn log_markers(o: &qemu::Outcome) -> Result<(), String> {
+    if let Some(l) = o.lines.iter().find(|l| l.contains(LOG_BEHIND)) {
+        return Err(format!("a line behind the window reached the port: {l}"));
+    }
+    qemu::expect_line(o, LOG_IN_FRONT)
 }
 
 /// The image of init's test table (spec 15.2): init built with
@@ -1415,10 +1944,10 @@ fn gdb() -> Result<(), String> {
 
 /// `cargo xtask hvf` (spec 14, 15.2): on a Mac with Apple silicon, for
 /// HVF_V3 and then HVF_V2, the boot of the normal build with the counter
-/// at HVF_HZ, the test init under qemu::hvf_verdict, the image of init's
-/// test table and the kernel tests, with a line of results for each
-/// machine. Elsewhere it prints why it skips and succeeds: `ci` does not
-/// run it.
+/// at HVF_HZ, the console dialog, the test init under qemu::hvf_verdict,
+/// the image of init's test table and the kernel tests, with a line of
+/// results for each machine. Elsewhere it prints why it skips and
+/// succeeds: `ci` does not run it.
 fn hvf() -> Result<(), String> {
     if let Err(why) = hvf_host() {
         println!(
@@ -1431,11 +1960,12 @@ fn hvf() -> Result<(), String> {
         if hz != HVF_HZ {
             return Err(format!("the counter runs at {hz} Hz on {}", m.name));
         }
+        console_dialog(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let kernel = kernel_tests(m, Variant::Test)?;
         println!(
-            "hvf on {}: boot ok, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
+            "hvf on {}: boot ok, console dialog ok, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
@@ -1472,6 +2002,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-uart",
+        "--package",
         "proto-wire",
         "--package",
         "xtask",
@@ -1480,12 +2012,16 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
-    // init's library and its tests on the host; its program builds for
-    // stafeto alone, below.
+    // The libraries of init, of the UART driver and of the shell and their
+    // tests on the host; their programs build for stafeto alone, below.
     run_cmd(cargo().args([
         "clippy",
         "--package",
         "init",
+        "--package",
+        "shell",
+        "--package",
+        "uart",
         "--lib",
         "--tests",
         "--",
@@ -1511,11 +2047,19 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-uart",
+        "--package",
         "proto-wire",
         "--package",
         "rt",
         "--package",
         "init",
+        "--package",
+        "shell",
+        "--package",
+        "uart",
+        "--features",
+        "uart/crash",
         "--package",
         "test-init",
         "--package",
@@ -1783,26 +2327,169 @@ mod tests {
         assert_eq!(check(&el2, &qemu::VIRT_EL2, GIC_V2_LINE), Ok(24_000_000));
     }
 
-    /// The drivers of the kernel's devices and the test init's driver of
-    /// the PL031 reach registers through arch::mmio and rt::mmio only (spec
-    /// 9): one `ldr` or `str` with the address in a register, which a
+    /// `cargo xtask run` boots VIRT; with `--hvf` it boots HVF_V3 only
+    /// where HVF runs and names the reason otherwise; other arguments are
+    /// refused.
+    #[test]
+    fn run_takes_hvf_only_where_it_runs() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let here = || Ok(());
+        let elsewhere = || Err("this is linux on x86_64".to_string());
+        let name = |m: Result<&qemu::Machine, String>| m.map(|m| m.name);
+        assert_eq!(name(run_machine(&args(&[]), here)), Ok(qemu::VIRT.name));
+        assert_eq!(
+            name(run_machine(&args(&[]), elsewhere)),
+            Ok(qemu::VIRT.name)
+        );
+        assert_eq!(
+            name(run_machine(&args(&["--hvf"]), here)),
+            Ok(qemu::HVF_V3.name)
+        );
+        let why = run_machine(&args(&["--hvf"]), elsewhere).map(drop);
+        assert!(why.is_err_and(|e| e.contains("this is linux on x86_64")));
+        for other in [&["--hfv"][..], &["--hvf", "--hvf"], &["-nographic"]] {
+            assert!(run_machine(&args(other), here).is_err(), "{other:?}");
+        }
+    }
+
+    /// The lines of a `crash uart` as a run of the normal build shows them:
+    /// a record the dead instance did not show before the fault line.
+    fn crash_run(decision: &str) -> Vec<String> {
+        [
+            "stafeto> crash uart",
+            CRASHING,
+            "init: services started",
+            "process fault: data abort from EL0 (EC 0x24) ESR=0x92000006 FAR=0x0 ELR=0x202a34",
+            &format!("init: uart ended: fault ESR=0x92000006 FAR=0x0 ELR=0x202a34; {decision}"),
+            UART_LINE,
+            RECONNECTED,
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// Spec 13.6, 16.2: a `crash uart` passes with the kernel's line of the
+    /// fault and init's line with its decision, each once, and the lines
+    /// in their order; it fails with either line missing or twice, with
+    /// another decision or reason, or out of order.
+    #[test]
+    fn a_crash_shows_the_fault_and_the_restart_once() {
+        let run = crash_run("restarts in 200 ms");
+        assert_eq!(crash_lines(&run, "restarts in 200 ms"), Ok(()));
+        assert!(crash_lines(&run, "restarts in 100 ms").is_err());
+        for i in 1..run.len() {
+            let mut cut = run.clone();
+            cut.remove(i);
+            if i != 2 {
+                assert!(
+                    crash_lines(&cut, "restarts in 200 ms").is_err(),
+                    "without {i}"
+                );
+            }
+            let mut twice = run.clone();
+            twice.insert(i, run[i].clone());
+            if i != 2 && i != run.len() - 1 {
+                assert!(
+                    crash_lines(&twice, "restarts in 200 ms").is_err(),
+                    "{i} twice"
+                );
+            }
+        }
+        let mut swapped = run.clone();
+        swapped.swap(3, 4);
+        assert!(crash_lines(&swapped, "restarts in 200 ms").is_err());
+        let mut late = run.clone();
+        late.swap(5, 6);
+        assert!(crash_lines(&late, "restarts in 200 ms").is_err());
+        let mut exited = run.clone();
+        exited[4] = "init: uart ended: exit code 5; restarts in 200 ms".into();
+        assert!(crash_lines(&exited, "restarts in 200 ms").is_err());
+        let mut elsewhere = run.clone();
+        elsewhere[3] = elsewhere[3].replace("FAR=0x0", "FAR=0x8");
+        assert!(crash_lines(&elsewhere, "restarts in 200 ms").is_err());
+    }
+
+    /// Spec 13.4, 16.3: the fifth crash passes with the shell's lines, then
+    /// the fault and init's line with the mark of a broken service, each
+    /// once and in this order; it fails with either of the last missing or
+    /// before BROKEN, or with a new driver after it.
+    #[test]
+    fn a_broken_driver_shows_its_end_after_the_shell() {
+        let end = format!(
+            "init: uart ended: fault ESR=0x92000006 FAR=0x0 ELR=0x202a34; {}",
+            CRASH_DECISIONS[4]
+        );
+        let run: Vec<String> = [
+            "stafeto> crash uart",
+            CRASHING,
+            BROKEN,
+            "process fault: data abort from EL0 (EC 0x24) ESR=0x92000006 FAR=0x0 ELR=0x202a34",
+            &end,
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(broken_lines(&run), Ok(()));
+        for i in 1..run.len() {
+            let mut cut = run.clone();
+            cut.remove(i);
+            assert!(broken_lines(&cut).is_err(), "without {i}");
+        }
+        let mut early = run.clone();
+        early.swap(2, 3);
+        assert!(broken_lines(&early).is_err());
+        let mut restarted = run.clone();
+        restarted.push(UART_LINE.into());
+        assert!(broken_lines(&restarted).is_err());
+    }
+
+    /// The drivers reach registers through arch::mmio and rt::mmio only
+    /// (spec 9): one `ldr` or `str` with the address in a register, which a
     /// hypervisor emulates from the syndrome [G34]. `read_volatile` and
     /// `write_volatile` may compile to a pair or a writeback, which stops
-    /// QEMU under HVF.
+    /// QEMU under HVF. Every file of the services and the programs is
+    /// checked, a new driver with them; the kernel's drivers and those of
+    /// the tests are listed.
     #[test]
     fn device_registers_go_through_mmio() {
-        // Every file that reaches device registers is listed here.
-        let files = [
+        let listed = [
             "kernel/src/arch/aarch64/gic.rs",
             "kernel/src/console.rs",
             "tests/init/src/devices.rs",
+            "tests/svc/src/device.rs",
         ];
+        let mut files: Vec<PathBuf> = listed.iter().map(|f| root().join(f)).collect();
+        for dir in ["services", "apps"] {
+            rust_files(&root().join(dir), &mut files);
+        }
+        assert!(
+            files
+                .iter()
+                .any(|f| f.ends_with("services/uart/src/irq.rs")),
+            "the walk missed the UART driver"
+        );
         for file in files {
-            let text = std::fs::read_to_string(root().join(file)).expect("a device file");
+            let text = std::fs::read_to_string(&file).expect("a device file");
             assert!(
                 !text.contains("read_volatile") && !text.contains("write_volatile"),
-                "{file} reaches a register without mmio"
+                "{} reaches a register without mmio",
+                file.display()
             );
+        }
+    }
+
+    /// The `.rs` files under `dir`, at any depth, into `files`; none for a
+    /// directory that is not there.
+    fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
         }
     }
 

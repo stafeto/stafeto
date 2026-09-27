@@ -28,6 +28,9 @@ abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 proto-init = { path = "../../proto/init" }
 proto-wire = { path = "../../proto/wire" }
+# The text of a batch of the kernel log (uart::log), which the worker
+# shows once the console's driver ended for good.
+uart = { path = "../uart" }
 
 # The program alone runs on stafeto: the host tests of the library build
 # without rt.

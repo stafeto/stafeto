@@ -344,6 +344,19 @@ pub unsafe fn copy_message(to: NonNull<Thread>, from: NonNull<Thread>, range: Ra
     to.frame.copy_from(&from.frame, range);
 }
 
+/// Writes `words` into the message buffer of `t` from byte `offset` on
+/// (spec 6.2, 11): the records object_info LOG takes, through the linear
+/// map; the kernel reads no table of a program. A thread that makes calls
+/// has its buffer until it ends. Panics past the end of the buffer.
+pub fn write_words(t: NonNull<Thread>, offset: usize, words: &[u64]) {
+    // SAFETY: the caller holds the thread, which makes the call; only the
+    // field is borrowed.
+    let Some(buffer) = (unsafe { &mut (*t.as_ptr()).buffer }) else {
+        unreachable!("a thread that makes calls has its buffer");
+    };
+    buffer.frame.write_words(offset, words);
+}
+
 /// Puts `moving`, the handles of a message of `t` that just left its
 /// process's table (process::take_handles), on their way in `t`
 /// (Thread::transit, spec 6.1). The field is empty: the handles of the

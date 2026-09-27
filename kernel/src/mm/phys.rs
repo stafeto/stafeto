@@ -121,6 +121,25 @@ impl Frame {
         unsafe { self.base().add(offset).cast::<u64>().write(value) }
     }
 
+    /// Writes `words` into the block from byte `offset` on (spec 6.2, 11):
+    /// the records object_info LOG takes. Panics for a range past the
+    /// block or an offset that is no word's.
+    pub fn write_words(&mut self, offset: usize, words: &[u64]) {
+        let end = offset.checked_add(8 * words.len());
+        assert!(
+            offset.is_multiple_of(8) && end.is_some_and(|end| end <= self.len()),
+            "words past a block of frames"
+        );
+        // SAFETY: as in `word`; the aligned range lies in the block.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                self.base().add(offset).cast::<u64>(),
+                words.len(),
+            )
+        }
+    }
+
     /// Copies the bytes `range` of `src` to the same offsets of this block
     /// (spec 6.2): a part of a message from its sender's buffer. Panics for
     /// a range past either block.
