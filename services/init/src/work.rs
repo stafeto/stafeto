@@ -4,12 +4,12 @@
 //! The jobs of init's worker thread (spec 8, 13.4): it loads instances,
 //! tears down those that ended and kills those that went silent, one job
 //! at a time, while init's main thread at 63 serves its channel. The main
-//! thread keeps the queue of jobs and sets the worker's level: one above
+//! thread keeps the jobs (`Jobs`) and sets the worker's level: one above
 //! the highest ceiling among the service of the job it does and those of
 //! the jobs that wait, at most 62. Work that grows with the size of a
 //! service so runs above the service and below the more important ones,
-//! and a job that waits behind a less important one lifts the worker at
-//! once: it waits for no more than the rest of one job.
+//! and a job that comes while a less important one runs lifts the worker
+//! at once: it waits for no more than the rest of one job.
 
 use crate::table::{MAX_RECORDS, Record};
 use proto_init::Work;
@@ -106,6 +106,64 @@ impl Default for Queue {
     }
 }
 
+/// The worker's jobs (spec 13.4): the one it does and those that wait.
+#[derive(Debug, Default)]
+pub struct Jobs {
+    queue: Queue,
+    current: Option<Job>,
+}
+
+impl Jobs {
+    pub const fn new() -> Jobs {
+        Jobs {
+            queue: Queue::new(),
+            current: None,
+        }
+    }
+
+    /// The job the worker does.
+    pub fn current(&self) -> Option<Job> {
+        self.current
+    }
+
+    /// The jobs that wait.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// Puts `job` in the queue (Queue::push, whose refusal gives it back):
+    /// the level the worker goes to at once while it does a job, above the
+    /// job that came when its record is the higher; None for an idle
+    /// worker, which gets its next job through `pop` and `start`.
+    pub fn push(&mut self, job: Job) -> Result<Option<u8>, Job> {
+        self.queue.push(job)?;
+        let level = worker_level(self.current, &self.queue);
+        Ok(self.current.is_some().then_some(level))
+    }
+
+    /// Takes the next job out of the queue (Queue::pop) for an idle
+    /// worker, for `start` or to be dropped; None while the worker does a
+    /// job.
+    pub fn pop(&mut self) -> Option<Job> {
+        match self.current {
+            Some(_) => None,
+            None => self.queue.pop(),
+        }
+    }
+
+    /// `job`, taken out of the queue, is the worker's from now on: its
+    /// level with the jobs that wait (`worker_level`).
+    pub fn start(&mut self, job: Job) -> u8 {
+        self.current = Some(job);
+        worker_level(self.current, &self.queue)
+    }
+
+    /// The worker did its job: that job, None for an idle worker.
+    pub fn done(&mut self) -> Option<Job> {
+        self.current.take()
+    }
+}
+
 /// The level of the worker while it does `current` and `queue` waits: one
 /// above the highest ceiling among them, at most WORKER_MAX; WORKER_IDLE
 /// with no job at all.
@@ -198,6 +256,45 @@ mod tests {
         let last = q.pop().unwrap();
         assert_eq!(worker_level(Some(last), &q), 31);
         assert_eq!(worker_level(None, &q), WORKER_IDLE);
+    }
+
+    #[test]
+    fn a_job_that_comes_lifts_the_busy_worker() {
+        let table = [record(20, 20), record(40, 40), record(30, 30)];
+        let mut jobs = Jobs::new();
+        // An idle worker: the job waits for `start`, and the worker's level
+        // comes with it.
+        let load = Job::new(Work::Load, 0, &table[0]);
+        assert_eq!(jobs.push(load), Ok(None));
+        assert_eq!(jobs.current(), None);
+        assert_eq!(jobs.pop(), Some(load));
+        assert_eq!(jobs.start(load), 21);
+        assert_eq!(jobs.current(), Some(load));
+        // The teardown of a service above comes during the load: the worker
+        // goes above it at once, and one below leaves it there.
+        let teardown = Job::new(Work::Teardown, 1, &table[1]);
+        assert_eq!(jobs.push(teardown), Ok(Some(41)));
+        let kill = Job::new(Work::Kill, 2, &table[2]);
+        assert_eq!(jobs.push(kill), Ok(Some(41)));
+        // A second job of a record whose job waits comes back.
+        let again = Job::new(Work::Load, 1, &table[1]);
+        assert_eq!(jobs.push(again), Err(again));
+        // Nothing comes out of the queue while the worker does a job.
+        assert_eq!(jobs.pop(), None);
+        assert_eq!(jobs.queue().len(), 2);
+        // The load is done; the next job goes by its ceiling.
+        assert_eq!(jobs.done(), Some(load));
+        assert_eq!(jobs.done(), None);
+        assert_eq!(jobs.pop(), Some(teardown));
+        assert_eq!(jobs.start(teardown), 41);
+        // A load below comes during the teardown: the level stays.
+        assert_eq!(jobs.push(load), Ok(Some(41)));
+        assert_eq!(jobs.done(), Some(teardown));
+        assert_eq!(jobs.pop(), Some(kill));
+        assert_eq!(jobs.start(kill), 31);
+        assert_eq!(jobs.done(), Some(kill));
+        assert_eq!(jobs.pop(), Some(load));
+        assert!(jobs.queue().is_empty());
     }
 
     #[test]

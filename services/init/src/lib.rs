@@ -4,7 +4,7 @@
 //! What init decides (spec 13.4), apart from the calls it makes: its table
 //! of services and the checks of it, the order it starts them in, the
 //! labels it gives, the pause before a restart and the mark of a broken
-//! service, the watchdog, the quota an instance needs, and the queue of
+//! service, the watchdog, the quota an instance needs, and the jobs of
 //! its worker thread with the worker's level. The program only calls
 //! these functions; everything here builds for the host too, where
 //! `cargo test -p init` exercises it.

@@ -7,7 +7,7 @@
 //! main thread at 63 never waits for work that grows with the size of a
 //! service, and never lets go of the last handles of an instance. The main
 //! thread puts a job into the cell (`Worker::load`, `Worker::teardown`,
-//! `Worker::kill`), sets the worker's level (init::work::worker_level) and
+//! `Worker::kill`), sets the worker's level (init::work::Jobs) and
 //! wakes it through the worker's channel; the worker does the job, leaves
 //! its outcome in the cell and tells the main thread through its copy of
 //! init's channel with NOTIFY and a label of its own, whose slot is at

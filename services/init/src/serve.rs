@@ -14,7 +14,7 @@
 //! init's quota show; PING anyone. The notification of the worker thread
 //! brings the outcome of its job: the main thread starts the thread of the
 //! instance it loaded, and gives the worker the next job of the queue at
-//! the level init::work::worker_level sets. The notification of the end of
+//! the level init::work::Jobs sets. The notification of the end of
 //! an instance is a failure of its record: init prints its reason and what
 //! it decided (init::restart), the worker tears the instance down, and the
 //! record's timer, whose slot is at the record's ceiling and whose expiries
@@ -37,7 +37,7 @@ use init::quota::{self, Start};
 use init::restart::{BREAK_AFTER, Failures, Verdict, WINDOW_NS};
 use init::table::{self, MAX_RECORDS, Record, Restart, TABLE};
 use init::watch::{Action, Watched};
-use init::work::{Job, Queue, WORKER_IDLE, worker_level};
+use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
     Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
     START_NAMES, State, Stats, VERSION, Work,
@@ -209,9 +209,8 @@ pub struct Init {
     labels: Labels,
     programs: [Option<Program<'static>>; MAX_RECORDS],
     entries: [Entry; MAX_RECORDS],
-    queue: Queue,
-    /// The job the worker does.
-    current: Option<Job>,
+    /// The job the worker does and those that wait.
+    jobs: Jobs,
     /// The records whose first start is done or waits for quota.
     started: usize,
 }
@@ -234,8 +233,7 @@ impl Init {
             labels,
             programs,
             entries: [Entry::NEW; MAX_RECORDS],
-            queue: Queue::new(),
-            current: None,
+            jobs: Jobs::new(),
             started: 0,
         }
     }
@@ -273,18 +271,16 @@ impl Init {
     }
 
     /// Puts `job` in the queue. With the worker at a job, its level goes
-    /// up to that of the jobs that wait at once (init::work::worker_level);
+    /// up to that of the jobs that wait at once (init::work::Jobs::push);
     /// an idle worker gets the next job.
     fn push(&mut self, job: Job) {
         // The queue has a place for each record, and a record has one job
         // at a time: its load comes after the teardown of its instance.
-        let _ = self.queue.push(job);
-        if self.current.is_some() {
-            let _ = self
-                .worker
-                .set_level(worker_level(self.current, &self.queue));
-        } else {
-            self.next();
+        match self.jobs.push(job) {
+            Ok(Some(level)) => {
+                let _ = self.worker.set_level(level);
+            }
+            _ => self.next(),
         }
     }
 
@@ -293,10 +289,10 @@ impl Init {
     /// worker waits at WORKER_IDLE. A load for which init's quota falls
     /// short waits (`quota_fits`), and the next job goes.
     fn next(&mut self) {
-        if self.current.is_some() {
+        if self.jobs.current().is_some() {
             return;
         }
-        while let Some(job) = self.queue.pop() {
+        while let Some(job) = self.jobs.pop() {
             let place = job.record;
             let gone = match job.work {
                 Work::Load if !self.quota_fits(place) => continue,
@@ -306,10 +302,8 @@ impl Init {
                     None => continue,
                 },
             };
-            self.current = Some(job);
-            let _ = self
-                .worker
-                .set_level(worker_level(self.current, &self.queue));
+            let level = self.jobs.start(job);
+            let _ = self.worker.set_level(level);
             // The worker's channel lives as long as init.
             let _ = match job.work {
                 Work::Load => {
@@ -391,7 +385,7 @@ impl Init {
         let Some(loaded) = self.worker.take() else {
             return;
         };
-        let Some(job) = self.current.take() else {
+        let Some(job) = self.jobs.done() else {
             return;
         };
         match loaded {
@@ -465,7 +459,7 @@ impl Init {
     /// Its later exit notification is skipped (`ended`).
     fn silent(&mut self, place: usize) {
         let job = Job::new(Work::Kill, place, &TABLE[place]);
-        let level = worker_level(Some(job), &self.queue);
+        let level = worker_level(Some(job), self.jobs.queue());
         let Some(instance) = self.entries[place].held.take_running() else {
             return;
         };
@@ -866,11 +860,11 @@ impl Init {
             let memory = sys::process_memory(&self.own)?;
             Ok(Stats {
                 kernel,
-                job: self.current.map(|j| (j.work, j.record as u8)),
+                job: self.jobs.current().map(|j| (j.work, j.record as u8)),
                 worker_priority: worker.base,
                 worker_effective: worker.priority,
                 worker_state: worker.state.code() as u8,
-                pending: self.queue.len() as u8,
+                pending: self.jobs.queue().len() as u8,
                 begun: self.worker.begun(),
                 free_pages: memory.quota.saturating_sub(memory.used) / PAGE,
                 labels: self.labels.given(),
