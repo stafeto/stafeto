@@ -8,7 +8,7 @@ use std::process::Command;
 
 use crate::{Variant, build, root, run_cmd, target_dir};
 
-pub fn run() -> Result<(), String> {
+pub fn runner() -> Result<std::path::PathBuf, String> {
     if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         return Err("Virtualization.framework requires an Apple silicon Mac".into());
     }
@@ -26,6 +26,11 @@ pub fn run() -> Result<(), String> {
             .arg(root.join("tools/vz-entitlements.plist"))
             .arg(&binary),
     )?;
+    Ok(binary)
+}
+
+pub fn run() -> Result<(), String> {
+    let binary = runner()?;
     let artifacts = build(Variant::Vz)?;
     let status = Command::new(&binary)
         .arg(Path::new(&artifacts.image))

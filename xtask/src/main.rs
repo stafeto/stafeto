@@ -7,6 +7,7 @@ mod disasm;
 mod image;
 mod measure;
 mod qemu;
+mod rtbench;
 mod symbolize;
 mod vz;
 
@@ -48,6 +49,7 @@ const VZ_PROGRAMS: [ImageProgram; 2] = [
     ("init", "init", INIT_STACK_SIZE, &["vz"]),
     ("shell", "shell", SHELL_STACK_SIZE, &["vz"]),
 ];
+const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -413,7 +415,8 @@ commands:
   hvf       boot checks, the console dialog, init tests and kernel tests
             under HVF on a Mac with Apple silicon, on Apple's GICv3 and
             QEMU's GICv2; skips elsewhere
-  vz        run the Apple Virtualization.framework platform probe on Apple silicon
+  vz        boot the shell through Apple Virtualization.framework
+  rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
   help      this text";
 
 fn main() {
@@ -426,6 +429,7 @@ fn main() {
         Some("ci") => ci(),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
+        Some("rtbench") => rtbench::run(&args[1..]),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -2225,6 +2229,8 @@ fn ci() -> Result<(), String> {
         "test-child",
         "--package",
         "test-svc",
+        "--package",
+        "rtbench",
         "--target",
         PROGRAM_TARGET,
         "--",

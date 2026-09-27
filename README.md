@@ -161,10 +161,13 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask run` | runs the system in QEMU to the shell's prompt; exit with Ctrl-A, then X |
 | `cargo xtask run --hvf` | the same under HVF on a Mac with Apple silicon; elsewhere it fails and says why |
 | `cargo xtask vz` | on an Apple silicon Mac, boots the shell through Virtualization.framework without QEMU; exit with Ctrl-C |
+| `cargo xtask rtbench` | runs fixed-duration RTOS primitive and timer-wakeup workloads three times on QEMU TCG, and also HVF and VZ on Apple Silicon; `--repeats 1` is a quick smoke run |
 | `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |
 | `cargo xtask hvf` | on a Mac with Apple silicon: boot, the dialog with the shell, the test `init`, the tests of init's service table and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
+
+`rtbench` adapts six [Thread-Metric](https://github.com/zephyrproject-rtos/zephyr/blob/main/tests/benchmarks/thread_metric/thread_metric_readme.txt) workloads to stafeto's primitives: baseline arithmetic, cooperative yields, preemptive notifications, channel request/reply, self-notification, and memory-object allocation. It also follows [Zyclictest](https://docs.zephyrproject.org/latest/services/debugging/zyclictest.html) by measuring 1,000 periodic timer wakeups at 1 ms intervals, both while idle and with a lower-priority CPU load. It reports median operations per second across runs, timer p99 and worst observed latency, and missed periods. The guest prints only after each workload. These are adapted workloads, not official Thread-Metric results; the hardware-interrupt cases await a portable guest interrupt source. Virtual-machine measurements do not establish a physical worst-case latency.
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 

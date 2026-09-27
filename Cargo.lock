@@ -117,6 +117,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtbench"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "rt",
+]
+
+[[package]]
 name = "safe-mmio"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
