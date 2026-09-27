@@ -42,12 +42,7 @@ fn park() -> ! {
     }
 }
 
-/// Powers the machine off through PSCI SYSTEM_OFF in the usual builds. The
-/// Apple VZ probe parks on panic so its host runner can distinguish a panic
-/// from successful completion by its timeout.
+/// Powers the machine off through PSCI SYSTEM_OFF after reporting the panic.
 pub(crate) fn stop() -> ! {
-    #[cfg(feature = "vz")]
-    park();
-    #[cfg(not(feature = "vz"))]
     crate::psci::system_off()
 }

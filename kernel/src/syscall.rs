@@ -194,6 +194,8 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::TimerCancel) => timer_cancel(thread, &args),
         Some(Call::ObjectInfo) => object_info(thread, &args),
         Some(Call::DebugWrite) => debug_write(thread, &args),
+        #[cfg(feature = "vz")]
+        Some(Call::ConsolePoll) => console_poll(thread, &args),
         // Numbers no call has, and those of calls that come later.
         _ => Err(Error::InvalidArgs),
     };
@@ -1241,4 +1243,12 @@ fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let words: &[u64; 8] = a[2..].try_into().expect("x2-x9");
     crate::log::text(&abi::inline_bytes(words)[..len]);
     Ok(Values::new(&[a[1]]))
+}
+
+#[cfg(feature = "vz")]
+fn console_poll(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    lookup(thread, a[0], Rights::DEBUG, Object::resource)?;
+    let mut bytes = [0u8; 8];
+    let count = crate::vz_driver::poll_input(&mut bytes);
+    Ok(Values::new(&[count as u64, u64::from_le_bytes(bytes)]))
 }

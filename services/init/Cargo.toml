@@ -22,6 +22,7 @@ bench = false
 table-test = []
 table-cycle = []
 table-ceiling = []
+vz = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

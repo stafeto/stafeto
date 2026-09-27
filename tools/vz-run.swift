@@ -43,10 +43,6 @@ final class Delegate: NSObject, VZVirtualMachineDelegate {
 }
 let delegate = Delegate()
 machine.delegate = delegate
-DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-    fputs("platform probe timed out\n", stderr)
-    exit(2)
-}
 machine.start { result in
     switch result {
     case .success:

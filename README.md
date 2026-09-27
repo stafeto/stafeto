@@ -17,9 +17,9 @@ around messages that pass control from hand to hand.
 
 stafeto boots in QEMU and runs programs at EL0, under QEMU's emulation
 and on Apple silicon under HVF. The native Apple Virtualization.framework
-port has a boot probe that reaches device-tree parsing, GICv3 and timer
-initialization, then powers off through PSCI. Its Virtio PCI console and
-shell are still to be implemented. What works today:
+port boots `init` and the shell through a Virtio PCI console without QEMU.
+Console input currently uses polling; interrupt-driven input and a separate
+user-space console driver remain future work. What works today:
 
 - **Boot:** arm64 Image, drop from EL2, MMU on, device tree, checked boot
   image.
@@ -160,7 +160,7 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask build` | builds the kernel into `target/stafeto.img` (under `CARGO_TARGET_DIR` when it is set) and checks that the image is under 200 KB |
 | `cargo xtask run` | runs the system in QEMU to the shell's prompt; exit with Ctrl-A, then X |
 | `cargo xtask run --hvf` | the same under HVF on a Mac with Apple silicon; elsewhere it fails and says why |
-| `cargo xtask vz` | on an Apple silicon Mac, runs a native Virtualization.framework platform probe without QEMU; it ends after GICv3 and timer initialization, before the shell |
+| `cargo xtask vz` | on an Apple silicon Mac, boots the shell through Virtualization.framework without QEMU; exit with Ctrl-C |
 | `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |

@@ -44,6 +44,10 @@ const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("uart", "uart", UART_STACK_SIZE, &["crash"]),
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
+const VZ_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["vz"]),
+    ("shell", "shell", SHELL_STACK_SIZE, &["vz"]),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -587,7 +591,11 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let (limit, source) = variant.limit();
     image::check_size(bytes.len() as u64, limit)?;
-    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?;
+    let boot_image = if variant == Variant::Vz {
+        build_boot_image("boot-vz.img", &VZ_PROGRAMS, BOOT_PROFILE)?
+    } else {
+        build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?
+    };
     println!(
         "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),

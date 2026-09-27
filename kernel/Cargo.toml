@@ -16,6 +16,7 @@ bench = false
 abi = { path = "../lib/abi" }
 bootimg = { path = "../lib/bootimg" }
 kcore = { path = "../kcore" }
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"], optional = true }
 
 [features]
 ktest = []
@@ -29,4 +30,4 @@ locked-decide = []
 baseline = ["ktest", "atomic-locks", "locked-decide"]
 trace = []
 trace-test = ["ktest", "trace"]
-vz = []
+vz = ["dep:virtio-drivers"]

@@ -247,11 +247,13 @@ pub enum Call {
     TimerCancel = 26,
     ObjectInfo = 27,
     DebugWrite = 28,
+    /// Poll up to eight bytes from the native Virtio console.
+    ConsolePoll = 29,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 28] = [
+    pub const ALL: [Call; 29] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -280,6 +282,7 @@ impl Call {
         Call::TimerCancel,
         Call::ObjectInfo,
         Call::DebugWrite,
+        Call::ConsolePoll,
     ];
 
     pub const fn number(self) -> u16 {
@@ -289,7 +292,7 @@ impl Call {
     /// The call with this number, if any.
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
-            1..=28 => Some(Self::ALL[number as usize - 1]),
+            1..=29 => Some(Self::ALL[number as usize - 1]),
             _ => None,
         }
     }
@@ -1225,13 +1228,13 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one() {
-        assert_eq!(Call::ALL.len(), 28);
+        assert_eq!(Call::ALL.len(), 29);
         for (i, call) in Call::ALL.iter().enumerate() {
             assert_eq!(call.number(), i as u16 + 1);
             assert_eq!(Call::from_number(call.number()), Some(*call));
             assert!(!TEST_CALLS.contains(&call.number()));
         }
-        for n in [0, 29, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [0, 30, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
             assert_eq!(Call::from_number(n), None);
         }
     }
@@ -1246,6 +1249,7 @@ mod tests {
         assert_eq!(Call::ClockNow.number(), 23);
         assert_eq!(Call::ObjectInfo.number(), 27);
         assert_eq!(Call::DebugWrite.number(), 28);
+        assert_eq!(Call::ConsolePoll.number(), 29);
         assert_eq!(RESULT_VALUES, 9);
     }
 

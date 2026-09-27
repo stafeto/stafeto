@@ -35,6 +35,8 @@ mod syscall;
 mod testpoint;
 mod thread;
 mod timer;
+#[cfg(feature = "vz")]
+mod vz_driver;
 
 use boot::Boot;
 use bootimg::Program;
@@ -54,8 +56,12 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // RAM in the GiBs the boot page tables map; the kernel tables are built
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
+    #[cfg(feature = "vz")]
+    vz_driver::prepare_dma();
     mm::kmap::switch_to_kernel_tables(boot);
     console::set_port(&boot.info);
+    #[cfg(feature = "vz")]
+    vz_driver::init(boot.kernel_pa);
     let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
@@ -75,14 +81,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     }
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
-    if cfg!(feature = "vz") {
-        // The Apple VZ platform probe reaches the initialized GIC and timer.
-        // PSCI returns control to the host until a PCI Virtio console driver
-        // can make a user-space shell visible on this platform.
-        psci::system_off()
-    } else {
-        finish(boot, &init)
-    }
+    finish(boot, &init)
 }
 
 /// The kernel leaves for init (spec 13.3); any end of init, an exit
