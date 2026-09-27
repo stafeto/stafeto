@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-"""Build the pinned BusyBox echo/cat objects for the stafeto guest probe."""
+"""Build pinned BusyBox objects for the stafeto guest probes."""
 
 from hashlib import sha256
 from pathlib import Path
@@ -20,7 +20,7 @@ ARCHIVE = WORK / f"busybox-{VERSION}.tar.bz2"
 COMPAT = ROOT / "tools" / "busybox" / "compat"
 LOG = WORK / "build.log"
 STAMP = WORK / "config"
-CONFIG = f"{VERSION} {SHA256} echo cat picolibc-v1\n"
+PATCH = "echo cat ash picolibc-v5"
 OBJECTS = (
     "appletlib.o", "xfuncs_printf.o", "xfuncs.o", "full_write.o",
     "process_escape_sequence.o", "ptr_to_globals.o", "messages.o",
@@ -29,6 +29,10 @@ OBJECTS = (
     "bb_cat.o", "copyfd.o", "getopt32.o", "wfopen_input.o",
     "read.o", "safe_strncpy.o", "llist.o", "xatonum.o",
     "get_last_path_component.o",
+    "const_hack.o", "endofname.o", "bb_strtonum.o", "sysconf.o",
+    "parse_mode.o", "time.o", "signals.o", "read_printf.o",
+    "u_signal_names.o",
+    "safe_poll.o",
 )
 
 
@@ -59,9 +63,13 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
 
 
 def main() -> None:
-    if (STAMP.exists() and STAMP.read_text() == CONFIG
+    headers = sorted(COMPAT.rglob("*.h"))
+    compatibility = sha256(b"".join(path.read_bytes() for path in headers)).hexdigest()
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {compatibility}\n"
+    if (STAMP.exists() and STAMP.read_text() == config_stamp
             and (SOURCE / "libbb/lib.a").exists()
-            and (SOURCE / "coreutils/lib.a").exists()):
+            and (SOURCE / "coreutils/lib.a").exists()
+            and (SOURCE / "shell/lib.a").exists()):
         print(f"BusyBox objects ready: {SOURCE}")
         return
     WORK.mkdir(parents=True, exist_ok=True)
@@ -83,6 +91,8 @@ def main() -> None:
             '#undef HAVE_UNLOCKED_STDIO\n#undef HAVE_UNLOCKED_LINE_OPS\n#endif')
     replace(SOURCE / "include/libbb.h", "#include <stdlib.h>",
             "#include <stdlib.h>\n#define utoa bb_utoa\n#define itoa bb_itoa")
+    replace(SOURCE / "libbb/xfuncs_printf.c", "return fflush(NULL);",
+            "return fflush(stdout) | fflush(stderr);")
     kbuild = SOURCE / "libbb/Kbuild.src"
     lines = [line for line in kbuild.read_text().splitlines()
              if not line.startswith("lib-y +=")]
@@ -96,6 +106,8 @@ def main() -> None:
     config = SOURCE / ".config"
     replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
+    replace(config, "# CONFIG_ASH is not set", "CONFIG_ASH=y")
+    replace(config, "# CONFIG_ASH_ECHO is not set", "CONFIG_ASH_ECHO=y")
     replace(config, "# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
     replace(config, "CONFIG_SH_IS_ASH=y", "# CONFIG_SH_IS_ASH is not set")
     replace(config, "# CONFIG_SH_IS_NONE is not set", "CONFIG_SH_IS_NONE=y")
@@ -105,15 +117,16 @@ def main() -> None:
     include = ROOT / "target/picolibc/root/usr/include"
     if not include.exists():
         raise SystemExit("build Picolibc with tools/build-picolibc.py first")
-    run("make", "-j4", "libbb", "coreutils", f"CC={clang}", f"LD={lld}",
+    run("make", "-j4", "libbb", "coreutils", "shell", f"CC={clang}", f"LD={lld}",
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-none-elf", f"-I{COMPAT}",
             f"-I{include}", "-ffreestanding", "-fno-stack-protector",
             "-ffunction-sections", "-fdata-sections")), cwd=SOURCE)
-    for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a"]:
+    for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
+                    SOURCE / "shell/lib.a"]:
         if not archive.exists():
             raise SystemExit(f"BusyBox did not produce {archive}")
-    STAMP.write_text(CONFIG)
+    STAMP.write_text(config_stamp)
     print(f"BusyBox objects ready: {SOURCE}")
 
 

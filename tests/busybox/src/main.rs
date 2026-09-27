@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Invoke BusyBox's dispatcher and cat applet from the boot image.
+//! Invoke BusyBox's dispatcher from the boot image.
 
 #![no_std]
 #![no_main]
@@ -26,15 +26,24 @@ fn main(_: u64) -> u64 {
     if posix_bridge::init(&start.parent).is_err() {
         return 2;
     }
+    #[cfg(not(feature = "ash-probe"))]
     let argv = [
         c"busybox".as_ptr(),
         c"cat".as_ptr(),
         c"/etc/motd".as_ptr(),
         core::ptr::null(),
     ];
-    // SAFETY: BusyBox and Picolibc are statically linked; argv has three
-    // valid NUL-terminated strings and a final null pointer.
-    let code = unsafe { busybox_main(3, argv.as_ptr()) };
+    #[cfg(feature = "ash-probe")]
+    let argv = [
+        c"busybox".as_ptr(),
+        c"ash".as_ptr(),
+        c"-c".as_ptr(),
+        c"echo shell-ready; exit 0".as_ptr(),
+        core::ptr::null(),
+    ];
+    // SAFETY: BusyBox and Picolibc are statically linked; argv has
+    // NUL-terminated strings and a final null pointer.
+    let code = unsafe { busybox_main((argv.len() - 1) as c_int, argv.as_ptr()) };
     if code == 0 {
         rt::println!("busybox-probe: ok");
     } else {
