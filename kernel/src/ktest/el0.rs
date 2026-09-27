@@ -489,6 +489,12 @@ const ICOUNT_TESTS: &[El0Test] = &[
     },
 ];
 
+const ROUND_TRIP_TESTS: &[El0Test] = &[El0Test {
+    name: "ipc_round_trip_is_measured",
+    start: start_round_trips,
+    done: done_round_trips,
+}];
+
 /// The tests of this build, in the order they run.
 fn tests() -> impl Iterator<Item = &'static El0Test> {
     let icount: &[El0Test] = if cfg!(feature = "icount") {
@@ -496,7 +502,12 @@ fn tests() -> impl Iterator<Item = &'static El0Test> {
     } else {
         &[]
     };
-    EL0_TESTS.iter().chain(icount)
+    let round_trip = if cfg!(feature = "icount") {
+        &[][..]
+    } else {
+        ROUND_TRIP_TESTS
+    };
+    EL0_TESTS.iter().chain(round_trip).chain(icount)
 }
 
 fn test(i: usize) -> &'static El0Test {

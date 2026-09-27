@@ -508,6 +508,10 @@ fn report(name: &str, result: Result<(), &'static str>) {
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
+    #[cfg(feature = "measure")]
+    for (number, ticks) in crate::syscall::call_maxima().iter().enumerate().skip(1) {
+        kprintln!("call maximum ticks: {number}={ticks}");
+    }
     kprintln!("TESTS DONE total={total} failed={failed}");
     crate::psci::system_off()
 }

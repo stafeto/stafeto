@@ -4,6 +4,7 @@
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
 mod image;
+mod measure;
 mod qemu;
 
 use std::ffi::OsString;
@@ -776,6 +777,7 @@ fn test() -> Result<(), String> {
     kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
     kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
     kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
+    write_measures()?;
     println!("all checks passed");
     Ok(())
 }
@@ -829,7 +831,9 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let size = std::fs::metadata(&a.boot_image)
         .map_err(|e| format!("{}: {e}", a.boot_image.display()))?
         .len();
-    boot_report(&o.lines, m, size, gic)
+    let hz = boot_report(&o.lines, m, size, gic)?;
+    measure::record(m, &o.lines);
+    Ok(hz)
 }
 
 /// The kernel's boot report (spec 3.3) on machine `m` with a boot image of
@@ -1649,11 +1653,17 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
     for name in ICOUNT_TESTS {
+        if name == "ipc_round_trip_is_measured" {
+            continue;
+        }
         if r.passed.iter().any(|p| p == name) != icount {
             return Err(format!(
                 "{name} must pass in the icount build and only there"
             ));
         }
+    }
+    if !r.passed.iter().any(|p| p == "ipc_round_trip_is_measured") {
+        return Err("the round-trip measurement did not pass".into());
     }
     let under = if icount { " under icount" } else { "" };
     println!(
@@ -1673,6 +1683,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
     }
+    measure::record(m, &o.lines);
     Ok(r.passed.len())
 }
 
@@ -1781,6 +1792,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
         println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
+    measure::record(m, &o.lines);
     Ok(r.passed.len())
 }
 
@@ -1964,12 +1976,26 @@ fn hvf() -> Result<(), String> {
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let kernel = kernel_tests(m, Variant::Test)?;
+        for _ in 1..5 {
+            kernel_tests(m, Variant::Test)?;
+        }
+        write_measures()?;
         println!(
             "hvf on {}: boot ok, console dialog ok, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
     Ok(())
+}
+
+fn write_measures() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let size = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    };
+    measure::write_all(&target_dir(), size(&a.image)?, size(&a.boot_image)?)
 }
 
 /// qemu::hvf_host on this host: its OS and processor, `sysctl -n

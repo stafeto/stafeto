@@ -84,6 +84,20 @@ fn main(_: u64) -> u64 {
         }
     }
     let total: usize = MODULES.iter().map(|m| m.len()).sum();
+    if let Ok(stats) = sys::kernel_stats(&harness::resource()) {
+        println!(
+            "KERNEL_STATS: idle={} idle_latency={} irq_latency={} cleanup={} portion={} frames={} pools={} firing={} entry_to_poll={}",
+            stats.idle,
+            stats.idle_latency,
+            stats.irq_latency,
+            stats.cleanup_queue,
+            stats.longest_portion,
+            stats.free_frames,
+            stats.pool_pages,
+            stats.longest_firing,
+            stats.entry_to_poll
+        );
+    }
     println!("TESTS DONE total={total} failed={failed}");
     failed
 }
