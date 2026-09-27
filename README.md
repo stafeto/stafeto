@@ -149,6 +149,12 @@ kernel image stays under 200 KB.
 Multi-core support is a separate subproject; its place in the order will be
 decided after subproject 3.
 
+An integration target across subprojects 2 and 3 is to launch a separate
+Doomgeneric program from BusyBox `ash` with a Freedoom IWAD. The first
+playable QEMU check will open a level, accept keyboard input, and return
+to the shell on exit. It depends on program launch, file access, graphics,
+and input; sound, networking, and saved games can follow later.
+
 ## Build and run
 
 You need rustup, QEMU, and dtc (on macOS: `brew install qemu dtc`). rustup
