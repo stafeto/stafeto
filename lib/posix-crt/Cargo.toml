@@ -1,0 +1,19 @@
+[package]
+name = "posix-crt"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Startup and static library for Rust POSIX C programs"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+test = false
+bench = false
+
+[dependencies]
+proto-init = { path = "../../proto/init" }
+posix-abi = { path = "../posix-abi" }
+posix-fs = { path = "../posix-fs" }
+rt = { path = "../rt" }

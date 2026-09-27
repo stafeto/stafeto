@@ -56,6 +56,12 @@ const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
+const POSIX_ABI_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+];
+const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -466,6 +472,7 @@ commands:
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
+  posix-abi run a C main against Rust POSIX and verify thread-local errno
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -488,6 +495,7 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
+        Some("posix-abi") => posix_abi_probe(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -715,7 +723,7 @@ fn write_boot_image(
     }
     run_cmd(&mut cmd)?;
     let target = target_dir();
-    let mut files = Vec::new();
+    let mut sources = Vec::new();
     for &(file, package, stack, _) in programs {
         let built = cargo_output(&target, PROGRAM_TARGET, profile, package);
         let elf = image_elf(&target, name, package);
@@ -724,10 +732,20 @@ fn write_boot_image(
             std::fs::create_dir_all(dir).map_err(|e| why(e.to_string()))?;
         }
         std::fs::copy(&built, &elf).map_err(|e| format!("{}: {e}", built.display()))?;
-        let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
-        let program = bootimg::elf::program(&bytes, stack).map_err(|e| why(e.to_string()))?;
+        sources.push((file, elf, stack));
+    }
+    write_elf_image(name, &sources)
+}
+
+fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathBuf, String> {
+    let target = target_dir();
+    let mut files = Vec::new();
+    for (file, elf, stack) in sources {
+        let why = |e: String| format!("{}: {e}", elf.display());
+        let bytes = std::fs::read(elf).map_err(|e| why(e.to_string()))?;
+        let program = bootimg::elf::program(&bytes, *stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
-        files.push((file, written, elf));
+        files.push((*file, written, elf.clone()));
     }
     let list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
@@ -915,6 +933,61 @@ fn ramfs_probe() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some("ramfs-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "ramfs-probe: ok")?;
     println!("RAM file service guest probe passed");
+    Ok(())
+}
+
+fn posix_abi_probe() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-abi.img", &POSIX_ABI_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: posix-abi-probe ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_marker(&output, "posix-abi-probe: ok")?;
+    let output = Command::new("python3")
+        .arg(root().join("tools/build-posix-sysroot.py"))
+        .arg("--probe")
+        .output()
+        .map_err(|error| format!("POSIX sysroot tool: {error}"))?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err("POSIX standalone C link failed".into());
+    }
+    let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+    let linked = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Rust POSIX standalone probe: "))
+        .ok_or("missing standalone C program path")?;
+    let target = target_dir();
+    let image = write_elf_image(
+        "boot-posix-standalone.img",
+        &[
+            (
+                "init",
+                image_elf(&target, "boot-posix-abi.img", "init"),
+                INIT_STACK_SIZE,
+            ),
+            (
+                "ramfs",
+                image_elf(&target, "boot-posix-abi.img", "ramfs"),
+                SVC_STACK_SIZE,
+            ),
+            ("posix-abi-probe", PathBuf::from(linked), CHILD_STACK_SIZE),
+        ],
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_marker(&output, "posix-abi-probe: ok")?;
+    let image = build_boot_image("boot-posix-tls.img", &POSIX_TLS_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
+    println!("Rust POSIX C ABI and thread-local errno guest probes passed");
     Ok(())
 }
 
@@ -1119,6 +1192,7 @@ fn test() -> Result<(), String> {
     host_tests()?;
     ext4ro_probe()?;
     ramfs_probe()?;
+    posix_abi_probe()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
@@ -2530,6 +2604,14 @@ fn ci() -> Result<(), String> {
         "rt",
         "--package",
         "posix-fs",
+        "--package",
+        "posix-abi",
+        "--package",
+        "posix-crt",
+        "--package",
+        "posix-abi-probe",
+        "--package",
+        "posix-tls-probe",
         "--package",
         "ext4ro",
         "--package",

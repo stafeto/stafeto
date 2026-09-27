@@ -124,11 +124,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "posix-abi"
+version = "0.1.0"
+dependencies = [
+ "posix-fs",
+ "rt",
+]
+
+[[package]]
+name = "posix-abi-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-bridge"
 version = "0.1.0"
 dependencies = [
  "proto-fs",
  "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "posix-crt"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-fs",
+ "proto-init",
  "rt",
 ]
 
@@ -152,6 +177,14 @@ name = "posix-path"
 version = "0.1.0"
 dependencies = [
  "proto-fs",
+]
+
+[[package]]
+name = "posix-tls-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "rt",
 ]
 
 [[package]]

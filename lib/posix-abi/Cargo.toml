@@ -1,0 +1,16 @@
+[package]
+name = "posix-abi"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Initial C ABI and startup for the Rust stafeto POSIX layer"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+posix-fs = { path = "../posix-fs" }
+rt = { path = "../rt" }

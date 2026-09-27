@@ -534,6 +534,14 @@ pub mod test;
 pub mod vz;
 
 #[cfg(any(
+    all(feature = "table-posix-abi", feature = "vz"),
+    all(feature = "table-posix-abi", feature = "table-test"),
+    all(feature = "table-posix-abi", feature = "table-cycle"),
+    all(feature = "table-posix-abi", feature = "table-ceiling"),
+    all(feature = "table-posix-abi", feature = "table-ramfs"),
+    all(feature = "table-posix-abi", feature = "table-cprobe"),
+    all(feature = "table-posix-abi", feature = "table-busybox"),
+    all(feature = "table-posix-abi", feature = "table-busybox-dialog"),
     all(feature = "table-test", feature = "table-cycle"),
     all(feature = "table-test", feature = "table-ceiling"),
     all(feature = "table-cycle", feature = "table-ceiling"),
@@ -576,11 +584,14 @@ compile_error!("init builds with one table feature at a time");
     feature = "table-ramfs",
     feature = "table-cprobe",
     feature = "table-busybox",
-    feature = "table-busybox-dialog"
+    feature = "table-busybox-dialog",
+    feature = "table-posix-abi"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
 pub const TABLE: &[Record] = ramfs::TABLE;
+#[cfg(feature = "table-posix-abi")]
+pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
 #[cfg(feature = "table-cprobe")]
 pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
 #[cfg(feature = "table-busybox")]
