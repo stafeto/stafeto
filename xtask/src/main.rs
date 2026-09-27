@@ -66,6 +66,16 @@ const BUSYBOX_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("busybox-probe", "busybox-probe", CHILD_STACK_SIZE, &[]),
 ];
+const ASH_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "busybox-probe",
+        CHILD_STACK_SIZE,
+        &["ash-probe"],
+    ),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -437,6 +447,7 @@ commands:
   ramfs     exercise the RAM file service and descriptors in QEMU
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
+  ash       run a BusyBox ash builtin script in QEMU
   help      this text";
 
 fn main() {
@@ -454,6 +465,7 @@ fn main() {
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
         Some("busybox") => busybox_probe(),
+        Some("ash") => ash_probe(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -901,6 +913,21 @@ fn busybox_probe() -> Result<(), String> {
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "stafeto ramfs")?;
     println!("BusyBox cat guest probe passed");
+    Ok(())
+}
+
+fn ash_probe() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ash.img", &ASH_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_marker(&output, "shell-ready")?;
+    println!("BusyBox ash builtin guest probe passed");
     Ok(())
 }
 

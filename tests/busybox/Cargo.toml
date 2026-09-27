@@ -8,6 +8,9 @@ license = "GPL-2.0-only"
 description = "First BusyBox applet in a stafeto boot image"
 build = "build.rs"
 
+[features]
+ash-probe = []
+
 [[bin]]
 name = "busybox-probe"
 test = false
