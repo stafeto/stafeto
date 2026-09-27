@@ -162,6 +162,7 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask run --hvf` | the same under HVF on a Mac with Apple silicon; elsewhere it fails and says why |
 | `cargo xtask vz` | on an Apple silicon Mac, boots the shell through Virtualization.framework without QEMU; exit with Ctrl-C |
 | `cargo xtask rtbench` | runs fixed-duration RTOS primitive and timer-wakeup workloads three times on QEMU TCG, and also HVF and VZ on Apple Silicon; `--repeats 1` is a quick smoke run |
+| `cargo xtask ext4ro` | boots a QEMU guest that reads a checked-in ext4 image created by e2fsprogs; no block driver is involved yet |
 | `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |

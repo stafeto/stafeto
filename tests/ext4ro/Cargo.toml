@@ -1,0 +1,17 @@
+[package]
+name = "ext4ro-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Read-only ext4 guest probe"
+
+[[bin]]
+name = "ext4ro-probe"
+test = false
+bench = false
+
+[dependencies]
+ext4ro = { path = "../../lib/ext4ro" }
+rt = { path = "../../lib/rt" }
