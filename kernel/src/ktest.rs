@@ -11,7 +11,7 @@ pub mod el0;
 mod registers;
 
 use crate::arch::symbols;
-use crate::arch::user::UserRegs;
+use crate::arch::user::{FpRegs, UserRegs};
 use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel;
@@ -51,6 +51,7 @@ use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
 const TESTS: &[(&str, TestFn)] = &[
+    ("fp_switch_cost_is_measured", fp_switch_cost_is_measured),
     (
         "device_tree_matches_qemu_virt",
         device_tree_matches_qemu_virt,
@@ -523,6 +524,29 @@ fn finish() -> ! {
 
 fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
     if ok { Ok(()) } else { Err(why) }
+}
+
+/// Counter cost of a switch that keeps FP state in registers and one that
+/// stores and restores it. Both loops have the same count and counter reads.
+fn fp_switch_cost_is_measured(_: &Boot) -> Result<(), &'static str> {
+    const ROUNDS: usize = 1_000;
+    let mut regs = FpRegs::ZERO;
+    let start = timer::now();
+    for _ in 0..ROUNDS {
+        core::hint::black_box(&mut regs);
+    }
+    let no_fp = timer::now() - start;
+    let start = timer::now();
+    for _ in 0..ROUNDS {
+        crate::arch::user::save_fp(&mut regs);
+        crate::arch::user::load_fp(&regs);
+    }
+    let fp = timer::now() - start;
+    kprintln!("fp switch ticks: rounds={ROUNDS} no_fp={no_fp} fp={fp}");
+    check(
+        fp >= no_fp,
+        "FP save and load cost less than the control loop",
+    )
 }
 
 /// RAM of the machine as the device tree reports it.

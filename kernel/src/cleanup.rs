@@ -182,6 +182,15 @@ pub fn top() -> Option<u8> {
     QUEUE.lock().items.top()
 }
 
+/// The top level during the scheduler's decision. No kernel operation
+/// can change the queue between this read and the scheduler's lock on
+/// the single core with interrupts masked.
+pub fn top_for_decide() -> Option<u8> {
+    // SAFETY: exit_loop calls this with interrupts masked and no cleanup
+    // or call active on the single core.
+    unsafe { (*QUEUE.as_ptr()).items.top() }
+}
+
 /// One portion (sched::resume): the item at the head of the top level
 /// leaves the queue, and its object's portion runs, or the firing of the
 /// timers of that level; what that releases is queued at the same level,

@@ -259,6 +259,13 @@ pub fn first() -> Option<u64> {
     TIMERS.lock().levels.nearest()
 }
 
+/// The nearest deadline during the scheduler's decision, on the single
+/// core with interrupts masked and no timer update in progress.
+pub fn first_for_decide() -> Option<u64> {
+    // SAFETY: as above; the exit loop is between kernel operations.
+    unsafe { (*TIMERS.as_ptr()).levels.nearest() }
+}
+
 /// The kernel's timer interrupt at `now`, before its EOI
 /// (sched::timer_fired): each level whose top expired and whose firing is
 /// not queued yet queues its item at the tail of that level of the cleanup

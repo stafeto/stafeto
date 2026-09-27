@@ -47,6 +47,10 @@ fn measured_line(line: &str) -> bool {
 
 /// Keeps the lines of a run only after its existing verdict has passed.
 pub fn record(machine: &Machine, lines: &[String]) {
+    record_as(machine, lines, "");
+}
+
+pub fn record_as(machine: &Machine, lines: &[String], label: &str) {
     let mut all = reports().lock().unwrap_or_else(PoisonError::into_inner);
     let report = all.entry(machine.name.to_owned()).or_default();
     report.accel = machine.accel.to_owned();
@@ -56,7 +60,7 @@ pub fn record(machine: &Machine, lines: &[String]) {
             report.frequency = Some(hz.to_owned());
         }
         if measured_line(line) {
-            report.lines.push(line.clone());
+            report.lines.push(format!("{label}{line}"));
         }
     }
 }
@@ -80,10 +84,10 @@ fn file_name(name: &str) -> String {
         .to_lowercase()
 }
 
-fn series(lines: &[String], row: &str) -> Option<(usize, u64, u64, u64)> {
+fn series(lines: &[String], prefix: &str, row: &str) -> Option<(usize, u64, u64, u64)> {
     let mut values: Vec<u64> = lines
         .iter()
-        .filter_map(|line| line.strip_prefix("ipc round trip ticks: "))
+        .filter_map(|line| line.strip_prefix(prefix))
         .filter_map(|rows| {
             rows.split_whitespace().find_map(|item| {
                 item.strip_prefix(row)
@@ -119,11 +123,16 @@ fn content(
         report.runs,
     );
     if report.accel.starts_with("hvf") {
-        for row in ["fast", "slow"] {
-            if let Some((count, min, median, max)) = series(&report.lines, row) {
-                text.push_str(&format!(
-                    "{row} ticks: samples={count} min={min} median={median} max={max}\n"
-                ));
+        for (label, prefix) in [
+            ("", "ipc round trip ticks: "),
+            ("baseline ", "baseline ipc round trip ticks: "),
+        ] {
+            for row in ["fast", "slow"] {
+                if let Some((count, min, median, max)) = series(&report.lines, prefix, row) {
+                    text.push_str(&format!(
+                        "{label}{row} ticks: samples={count} min={min} median={median} max={max}\n"
+                    ));
+                }
             }
         }
     }
@@ -187,7 +196,13 @@ mod tests {
             "ipc round trip ticks: null=1 fast=20 slow=50",
         ]
         .map(str::to_owned);
-        assert_eq!(series(&lines, "fast"), Some((3, 10, 20, 30)));
-        assert_eq!(series(&lines, "slow"), Some((3, 40, 50, 60)));
+        assert_eq!(
+            series(&lines, "ipc round trip ticks: ", "fast"),
+            Some((3, 10, 20, 30))
+        );
+        assert_eq!(
+            series(&lines, "ipc round trip ticks: ", "slow"),
+            Some((3, 40, 50, 60))
+        );
     }
 }

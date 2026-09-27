@@ -12,3 +12,6 @@ bench = false
 
 [dependencies]
 abi = { path = "../lib/abi" }
+
+[features]
+atomic-locks = []

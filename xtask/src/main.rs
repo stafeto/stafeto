@@ -3,6 +3,7 @@
 
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
+mod disasm;
 mod image;
 mod measure;
 mod qemu;
@@ -329,6 +330,7 @@ impl Profile {
 enum Variant {
     Normal,
     Test,
+    Baseline,
     /// The kernel tests with those that need QEMU's `-icount` (qemu::ICOUNT).
     TestIcount,
     FaultProbe,
@@ -348,6 +350,7 @@ impl Variant {
         match self {
             Variant::Normal => None,
             Variant::Test => Some("ktest"),
+            Variant::Baseline => Some("baseline"),
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
@@ -360,7 +363,9 @@ impl Variant {
             Variant::Normal | Variant::FaultProbe | Variant::OverflowProbe => {
                 (KERNEL_LIMIT, "spec 3.4")
             }
-            Variant::Test | Variant::TestIcount => (TEST_KERNEL_LIMIT, "test builds"),
+            Variant::Test | Variant::Baseline | Variant::TestIcount => {
+                (TEST_KERNEL_LIMIT, "test builds")
+            }
         }
     }
 
@@ -368,6 +373,7 @@ impl Variant {
         match self {
             Variant::Normal => "stafeto",
             Variant::Test => "stafeto-ktest",
+            Variant::Baseline => "stafeto-baseline",
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
@@ -1686,7 +1692,11 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
     }
-    measure::record(m, &o.lines);
+    if variant == Variant::Baseline {
+        measure::record_as(m, &o.lines, "baseline ");
+    } else {
+        measure::record(m, &o.lines);
+    }
     Ok(r.passed.len())
 }
 
@@ -1978,9 +1988,19 @@ fn hvf() -> Result<(), String> {
         console_dialog(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
-        let kernel = kernel_tests(m, Variant::Test)?;
-        for _ in 1..5 {
-            kernel_tests(m, Variant::Test)?;
+        let mut kernel = 0;
+        for pair in 0..20 {
+            let variants = if pair % 2 == 0 {
+                [Variant::Test, Variant::Baseline]
+            } else {
+                [Variant::Baseline, Variant::Test]
+            };
+            for variant in variants {
+                let passed = kernel_tests(m, variant)?;
+                if variant == Variant::Test {
+                    kernel = passed;
+                }
+            }
         }
         write_measures()?;
         println!(
@@ -2116,7 +2136,9 @@ fn ci() -> Result<(), String> {
         }
         run_cmd(cmd.args(["--", "-D", "warnings"]))?;
     }
-    test()
+    test()?;
+    let a = build(Variant::Normal)?;
+    disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
 }
 
 #[cfg(test)]

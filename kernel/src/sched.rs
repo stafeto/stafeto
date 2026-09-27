@@ -367,8 +367,14 @@ extern "C" fn exit_loop() -> ! {
 /// lock of the timers goes before the scheduler's is taken. A thread chosen
 /// after a timer's interrupt ends that interrupt's latency.
 fn decide() -> Decision<Thread> {
+    #[cfg(feature = "locked-decide")]
     let cleanup = cleanup::top();
+    #[cfg(not(feature = "locked-decide"))]
+    let cleanup = cleanup::top_for_decide();
+    #[cfg(feature = "locked-decide")]
     let next_timer = crate::timer::first();
+    #[cfg(not(feature = "locked-decide"))]
+    let next_timer = crate::timer::first_for_decide();
     let now = timer::now();
     let mut g = SCHED.lock();
     let g = &mut *g;
