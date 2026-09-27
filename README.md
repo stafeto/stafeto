@@ -125,7 +125,7 @@ parts. Each finished part is merged through a pull request.
 | | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
 | | 1.4b Runtime and protocols | handles that own their entries, strict test builds, one time scale, `proto/wire` and `proto/init`, start protocol, service loop with sessions and a heartbeat, ELF reader in `bootimg` | ✅ [#17](https://github.com/stafeto/stafeto/pull/17) |
 | | 1.4c init services | `init` starts services from its table, refuses a table with a cycle or a broken ceiling, serves names through `connect`, restarts crashed and silent services and marks broken ones | ✅ [#18](https://github.com/stafeto/stafeto/pull/18) |
-| | 1.4d UART driver and shell | the kernel log, the PL011 driver on interrupts and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | ✅ [#PR](https://github.com/stafeto/stafeto/pull/PR) |
+| | 1.4d UART driver and shell | the kernel log, the PL011 driver on interrupts and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | ✅ [#19](https://github.com/stafeto/stafeto/pull/19) |
 | | 1.4e Measurements and diagnostics | a file of measurements for TCG and HVF, the longest times of the calls, a log of kernel events, panic addresses as function names | 🚧 |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
