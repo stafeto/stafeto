@@ -8,6 +8,7 @@ mod image;
 mod measure;
 mod qemu;
 mod symbolize;
+mod vz;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,10 @@ const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &[]),
     ("uart", "uart", UART_STACK_SIZE, &["crash"]),
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
+];
+const VZ_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["vz"]),
+    ("shell", "shell", SHELL_STACK_SIZE, &["vz"]),
 ];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
@@ -339,6 +344,7 @@ enum Variant {
     TestIcount,
     FaultProbe,
     OverflowProbe,
+    Vz,
 }
 
 impl Variant {
@@ -361,6 +367,7 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+            Variant::Vz => Some("vz"),
         }
     }
 
@@ -370,7 +377,8 @@ impl Variant {
             Variant::Normal
             | Variant::TraceNormal
             | Variant::FaultProbe
-            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::OverflowProbe
+            | Variant::Vz => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
                 (TEST_KERNEL_LIMIT, "test builds")
             }
@@ -387,6 +395,7 @@ impl Variant {
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
+            Variant::Vz => "stafeto-vz",
         }
     }
 }
@@ -404,6 +413,7 @@ commands:
   hvf       boot checks, the console dialog, init tests and kernel tests
             under HVF on a Mac with Apple silicon, on Apple's GICv3 and
             QEMU's GICv2; skips elsewhere
+  vz        run the Apple Virtualization.framework platform probe on Apple silicon
   help      this text";
 
 fn main() {
@@ -415,6 +425,7 @@ fn main() {
         Some("gdb") => gdb(),
         Some("ci") => ci(),
         Some("hvf") => hvf(),
+        Some("vz") => vz::run(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -580,7 +591,11 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let (limit, source) = variant.limit();
     image::check_size(bytes.len() as u64, limit)?;
-    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?;
+    let boot_image = if variant == Variant::Vz {
+        build_boot_image("boot-vz.img", &VZ_PROGRAMS, BOOT_PROFILE)?
+    } else {
+        build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?
+    };
     println!(
         "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),

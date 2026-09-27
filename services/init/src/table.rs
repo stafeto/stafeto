@@ -530,11 +530,15 @@ pub mod ceiling;
 pub mod cycle;
 pub mod normal;
 pub mod test;
+pub mod vz;
 
 #[cfg(any(
     all(feature = "table-test", feature = "table-cycle"),
     all(feature = "table-test", feature = "table-ceiling"),
     all(feature = "table-cycle", feature = "table-ceiling"),
+    all(feature = "vz", feature = "table-test"),
+    all(feature = "vz", feature = "table-cycle"),
+    all(feature = "vz", feature = "table-ceiling"),
 ))]
 compile_error!("init builds with one table: table-test, table-cycle or table-ceiling");
 
@@ -544,9 +548,12 @@ compile_error!("init builds with one table: table-test, table-cycle or table-cei
 #[cfg(not(any(
     feature = "table-test",
     feature = "table-cycle",
-    feature = "table-ceiling"
+    feature = "table-ceiling",
+    feature = "vz"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
+#[cfg(feature = "vz")]
+pub const TABLE: &[Record] = vz::TABLE;
 #[cfg(feature = "table-test")]
 pub const TABLE: &[Record] = test::TABLE;
 #[cfg(feature = "table-cycle")]

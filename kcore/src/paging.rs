@@ -30,10 +30,12 @@ pub const UXN: u64 = 1 << 54;
 /// Device-nGnRE at index 1.
 pub const MAIR_NORMAL: u64 = 0;
 pub const MAIR_DEVICE: u64 = 1;
+pub const MAIR_UNCACHED: u64 = 2;
 /// AttrIndx, descriptor bits [4:2], selects a MAIR_EL1 entry.
 const ATTR_SHIFT: u32 = 2;
 const ATTR_NORMAL: u64 = MAIR_NORMAL << ATTR_SHIFT;
 const ATTR_DEVICE: u64 = MAIR_DEVICE << ATTR_SHIFT;
+const ATTR_UNCACHED: u64 = MAIR_UNCACHED << ATTR_SHIFT;
 /// Root table address bits of TTBR0_EL1 and TTBR1_EL1; the ASID sits above
 /// them, CnP in bit 0.
 pub const TTBR_ROOT_MASK: u64 = OA_MASK;
@@ -41,6 +43,7 @@ pub const TTBR_ROOT_MASK: u64 = OA_MASK;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Memory {
     Normal,
+    Uncached,
     Device,
 }
 
@@ -72,6 +75,10 @@ impl Attrs {
     };
     pub const DEVICE: Attrs = Attrs {
         memory: Memory::Device,
+        ..Attrs::KERNEL_DATA
+    };
+    pub const KERNEL_UNCACHED: Attrs = Attrs {
+        memory: Memory::Uncached,
         ..Attrs::KERNEL_DATA
     };
     /// A program's code: EL0 reads and executes it.
@@ -130,6 +137,7 @@ impl Attrs {
         let mut d = AF;
         d |= match self.memory {
             Memory::Normal => ATTR_NORMAL | SH_INNER,
+            Memory::Uncached => ATTR_UNCACHED | SH_INNER,
             Memory::Device => ATTR_DEVICE,
         };
         if self.user {

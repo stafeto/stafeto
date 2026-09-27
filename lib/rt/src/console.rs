@@ -42,6 +42,12 @@ pub fn write(bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Polls native console input into `out`; returns zero when no byte arrived.
+pub fn poll(out: &mut [u8; 8]) -> Result<usize, Error> {
+    let resource = resource()?;
+    sys::console_poll(&resource, out)
+}
+
 /// Formats `args` into pieces of at most abi::INLINE_MAX bytes and writes
 /// each as it fills; stops writing at the first call that fails.
 pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<(), Error> {

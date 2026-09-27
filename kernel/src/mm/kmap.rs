@@ -72,6 +72,43 @@ fn map(
         .unwrap_or_else(|e| panic!("mapping {what} at {va:#x}: {e:?}"));
 }
 
+#[cfg(feature = "vz")]
+fn map_dma(
+    pt: &mut PageTable,
+    mem: &mut FrameTables<'_>,
+    va: usize,
+    pa: u64,
+    size: u64,
+    dma: Region,
+    what: &str,
+) {
+    let start = pa.max(dma.base);
+    let end = (pa + size).min(dma.end());
+    if start >= end {
+        map(pt, mem, va, pa, size, Attrs::KERNEL_DATA, what);
+        return;
+    }
+    map(pt, mem, va, pa, start - pa, Attrs::KERNEL_DATA, what);
+    map(
+        pt,
+        mem,
+        va + (start - pa) as usize,
+        start,
+        end - start,
+        Attrs::KERNEL_UNCACHED,
+        "DMA",
+    );
+    map(
+        pt,
+        mem,
+        va + (end - pa) as usize,
+        end,
+        pa + size - end,
+        Attrs::KERNEL_DATA,
+        what,
+    );
+}
+
 /// A device region widened to whole pages.
 fn pages(r: Region) -> (u64, u64) {
     let base = r.base / PAGE_SIZE * PAGE_SIZE;
@@ -115,7 +152,30 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
                 "boot stack",
             ),
         ];
-        for (start, end, attrs, what) in sections {
+        #[cfg(feature = "vz")]
+        let dma = {
+            let range = crate::vz_driver::dma_range();
+            Region {
+                base: pa(range.start),
+                size: (range.end - range.start) as u64,
+            }
+        };
+        for (index, (start, end, attrs, what)) in sections.into_iter().enumerate() {
+            #[cfg(feature = "vz")]
+            if index == 2 {
+                map_dma(
+                    &mut pt,
+                    &mut mem,
+                    start,
+                    pa(start),
+                    (end - start) as u64,
+                    dma,
+                    what,
+                );
+                continue;
+            }
+            #[cfg(not(feature = "vz"))]
+            let _ = index;
             map(
                 &mut pt,
                 &mut mem,
@@ -129,6 +189,20 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
         let ram = memmap::usable::<32>(boot.info.memory.as_slice(), boot.info.no_map.as_slice())
             .expect("linear map regions");
         for r in ram.as_slice() {
+            #[cfg(feature = "vz")]
+            {
+                map_dma(
+                    &mut pt,
+                    &mut mem,
+                    LINEAR_BASE + r.base as usize,
+                    r.base,
+                    r.size,
+                    dma,
+                    "RAM",
+                );
+                continue;
+            }
+            #[cfg(not(feature = "vz"))]
             map(
                 &mut pt,
                 &mut mem,
@@ -151,6 +225,28 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
                 size,
                 Attrs::DEVICE,
                 "device",
+            );
+        }
+        #[cfg(feature = "vz")]
+        for dev in [
+            Region {
+                base: 0x4000_0000,
+                size: 0x1000_0000,
+            },
+            Region {
+                base: 0x1_0000_0000,
+                size: 0x1_0000,
+            },
+        ] {
+            let (base, size) = pages(dev);
+            map(
+                &mut pt,
+                &mut mem,
+                LINEAR_BASE + base as usize,
+                base,
+                size,
+                Attrs::DEVICE,
+                "VZ PCI",
             );
         }
         pt.root()

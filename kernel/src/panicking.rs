@@ -42,9 +42,7 @@ fn park() -> ! {
     }
 }
 
-/// Powers the machine off through PSCI SYSTEM_OFF, in every build: a run
-/// of the kernel tests ends the same way, and xtask fails a run that
-/// printed a panic (spec 14).
+/// Powers the machine off through PSCI SYSTEM_OFF after reporting the panic.
 pub(crate) fn stop() -> ! {
     crate::psci::system_off()
 }

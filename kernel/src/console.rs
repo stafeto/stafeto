@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The kernel's console port (spec 3.2): the PL011 at the early address
-//! of QEMU `virt` until the kernel tables are live, then the one the
-//! device tree names (BootInfo::uart_pl011), or none, and the console
+//! of QEMU `virt` until the kernel tables are live (absent in the Apple VZ
+//! platform probe), then the one the device tree names
+//! (BootInfo::uart_pl011), or none, and the console
 //! stays silent. Reached through the linear map. A device window over a
 //! page of the port takes the port from the kernel while the window lives
 //! (spec 9): the kernel log (crate::log) then keeps what the kernel shows,
@@ -13,18 +14,27 @@
 //! and interrupts masked in the kernel: atomics with relaxed order stand
 //! for a lock.
 
-use crate::arch::{mmio, timer};
+use crate::arch::mmio;
+#[cfg(not(feature = "vz"))]
+use crate::arch::timer;
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use kcore::bootinfo::{BootInfo, Region};
-use kcore::console::{FR_TXFF, covers};
+#[cfg(not(feature = "vz"))]
+use kcore::console::FR_TXFF;
+use kcore::console::covers;
 use kcore::layout::LINEAR_BASE;
 
 /// The PL011 of QEMU `virt` [R25], the port until the kernel tables are
-/// live (`set_port`).
+/// live (`set_port`). The Apple VZ probe has no PL011.
+#[cfg(not(feature = "vz"))]
 const EARLY_PA: u64 = 0x0900_0000;
+#[cfg(feature = "vz")]
+const EARLY_PA: u64 = 0;
 /// Registers of the PL011 by their offsets [R12, G36].
+#[cfg(not(feature = "vz"))]
 const DR: usize = 0x000;
+#[cfg(not(feature = "vz"))]
 const FR: usize = 0x018;
 const CR: usize = 0x030;
 const IMSC: usize = 0x038;
@@ -33,7 +43,10 @@ const CR_ENABLE: u32 = 0x301;
 
 /// The port's physical address and size; a size of 0 when there is none.
 static PORT_BASE: AtomicU64 = AtomicU64::new(EARLY_PA);
+#[cfg(not(feature = "vz"))]
 static PORT_SIZE: AtomicU64 = AtomicU64::new(0x1000);
+#[cfg(feature = "vz")]
+static PORT_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The device windows alive now that cover a page of the port.
 static WINDOWS: AtomicU32 = AtomicU32::new(0);
 /// The last such window went: the next write sets the port up again.
@@ -65,6 +78,7 @@ fn write_reg(offset: usize, value: u32) {
 }
 
 /// Reads register `offset` of the port; 0 without one.
+#[cfg(not(feature = "vz"))]
 fn read_reg(offset: usize) -> u32 {
     // SAFETY: as in `write_reg`.
     reg(offset).map_or(0, |addr| unsafe { mmio::read32(addr) })
@@ -87,8 +101,14 @@ pub fn set_port(info: &BootInfo) {
 
 /// Whether the kernel has the port: there is one, and no device window
 /// covers it (spec 3.2).
+#[cfg(not(feature = "vz"))]
 pub fn is_kernels() -> bool {
     port().size > 0 && WINDOWS.load(Relaxed) == 0
+}
+
+#[cfg(feature = "vz")]
+pub fn is_kernels() -> bool {
+    crate::vz_driver::ready()
 }
 
 /// A device window over the `pages` pages from `base` was made
@@ -125,6 +145,7 @@ pub fn take_back() {
     set_up();
 }
 
+#[cfg(not(feature = "vz"))]
 fn putc(byte: u8) {
     let Some(dr) = reg(DR) else { return };
     while read_reg(FR) & FR_TXFF != 0 {}
@@ -135,6 +156,12 @@ fn putc(byte: u8) {
 /// Writes `bytes` to the port as they are, but for a CR before each LF,
 /// waiting for room in the transmit FIFO; the port is set up first when
 /// the last window over it went since the last write (spec 3.2).
+#[cfg(feature = "vz")]
+pub fn write_bytes(bytes: &[u8]) {
+    crate::vz_driver::write_bytes(bytes);
+}
+
+#[cfg(not(feature = "vz"))]
 pub fn write_bytes(bytes: &[u8]) {
     if RETURNED.swap(false, Relaxed) {
         set_up();
@@ -150,6 +177,10 @@ pub fn write_bytes(bytes: &[u8]) {
 /// Waits up to 10 ms of the counter for the port's transmitter to go idle
 /// (spec 16.1): what the FIFO holds goes out before the machine powers
 /// off. QEMU never shows the transmitter busy.
+#[cfg(feature = "vz")]
+pub fn drain() {}
+
+#[cfg(not(feature = "vz"))]
 pub fn drain() {
     let deadline = timer::now().saturating_add(timer::frequency() / 100);
     kcore::console::drain(|| read_reg(FR), || timer::now() >= deadline);

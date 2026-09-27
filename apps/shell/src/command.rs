@@ -20,6 +20,7 @@ pub enum Command<'a> {
     Mem,
     Bench,
     Trace,
+    #[cfg(not(feature = "vz"))]
     CrashUart,
     /// The line, without the spaces around it.
     Unknown(&'a [u8]),
@@ -36,7 +37,7 @@ impl<'a> Words<'a> {
 }
 
 /// The lines of `help`: each command and what it does.
-pub const HELP: [&str; 8] = [
+pub const HELP: &[&str] = &[
     "help        list the commands",
     "echo WORDS  print the words",
     "uptime      the time since boot",
@@ -44,6 +45,7 @@ pub const HELP: [&str; 8] = [
     "mem         the memory of each process",
     "bench       the round trip of a request and the latencies",
     "trace       show kernel events since the last trace",
+    #[cfg(not(feature = "vz"))]
     "crash uart  crash the UART driver; init restarts it",
 ];
 
@@ -64,6 +66,7 @@ pub fn parse(line: &[u8]) -> Command<'_> {
         b"mem" => Command::Mem,
         b"bench" => Command::Bench,
         b"trace" => Command::Trace,
+        #[cfg(not(feature = "vz"))]
         b"crash" if rest.iter().eq([&b"uart"[..]]) => Command::CrashUart,
         _ => Command::Unknown(line),
     }

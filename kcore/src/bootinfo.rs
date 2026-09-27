@@ -413,6 +413,8 @@ mod tests {
 
     const VIRT: &[u8] = include_bytes!("../tests/fixtures/virt.dtb");
     const VIRT_GICV3: &[u8] = include_bytes!("../tests/fixtures/virt-gicv3.dtb");
+    // Captured from an arm64 guest of Apple Virtualization.framework.
+    const APPLE_VZ: &[u8] = include_bytes!("../tests/fixtures/apple-vz.dtb");
     const A64: &[u8] = include_bytes!("../tests/fixtures/a64-like.dtb");
     const NOCELLS: &[u8] = include_bytes!("../tests/fixtures/nocells.dtb");
     const NOMEM: &[u8] = include_bytes!("../tests/fixtures/nomem.dtb");
@@ -503,6 +505,20 @@ mod tests {
         );
         assert_eq!(i.uart_pl011, Some(region(0x0900_0000, 0x1000)));
         assert_eq!(i.psci, PsciConduit::Hvc);
+    }
+
+    #[test]
+    fn apple_virtualization_tree_has_ram_gic_and_initrd() {
+        let i = info(APPLE_VZ).unwrap();
+        assert_eq!(i.memory.as_slice(), [region(0x7000_0000, 0x2000_0000)]);
+        assert_eq!(i.uart_pl011, None);
+        assert_eq!(i.psci, PsciConduit::Hvc);
+        assert_eq!(i.gic.unwrap().version, GicVersion::V3);
+        assert_eq!(
+            i.gic.unwrap().mapped(),
+            [region(0x1000_0000, 0x10000), region(0x1001_0000, 0x20000)]
+        );
+        assert_eq!(i.initrd, Some(region(0x724f_0000, 0x285_483a)));
     }
 
     /// A tree with 64 MiB of RAM and a GIC node of `compatible` with

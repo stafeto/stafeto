@@ -23,6 +23,9 @@ proto-init = { path = "../../proto/init" }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }
 
+[features]
+vz = []
+
 # The program alone runs on stafeto: the host tests of the library build
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
