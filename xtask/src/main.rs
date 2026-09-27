@@ -7,10 +7,11 @@ mod disasm;
 mod image;
 mod measure;
 mod qemu;
+mod symbolize;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::{Command, Stdio, exit};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -482,6 +483,17 @@ fn run_cmd(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
+fn run_until(
+    cmd: Command,
+    timeout: Duration,
+    stop_marker: Option<&str>,
+    elf: &Path,
+) -> Result<qemu::Outcome, String> {
+    let outcome = qemu::run_until(cmd, timeout, stop_marker)?;
+    symbolize::backtrace(&outcome.lines, elf);
+    Ok(outcome)
+}
+
 fn stdout_of(cmd: &mut Command) -> Result<String, String> {
     let out = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
@@ -743,7 +755,40 @@ fn raw_init(code: &[u32], rodata: bool, data_size: u64) -> Result<Vec<u8>, Strin
 fn run(args: &[String]) -> Result<(), String> {
     let m = run_machine(args, hvf_host)?;
     let a = build(Variant::Normal)?;
-    run_cmd(qemu::command(m, &a.image, Some(&a.boot_image)).arg("-nographic"))
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.arg("-nographic");
+    let mut child = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd:?}: {e}"))?;
+    let mut source = child.stdout.take().ok_or("QEMU has no stdout")?;
+    let mut output = Vec::new();
+    let mut bytes = [0u8; 4096];
+    loop {
+        let n = std::io::Read::read(&mut source, &mut bytes).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut std::io::stdout(), &bytes[..n])
+            .map_err(|e| e.to_string())?;
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+        output.extend_from_slice(&bytes[..n]);
+        if output.len() > 65_536 {
+            output.drain(..output.len() - 65_536);
+        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let lines: Vec<String> = String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    symbolize::backtrace(&lines, &a.elf);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("QEMU exited with {status}"))
+    }
 }
 
 /// The machine of `cargo xtask run` with `args` (spec 14): VIRT with
@@ -843,7 +888,7 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
     qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
@@ -902,7 +947,7 @@ fn two_gib_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT_2G, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
     qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let free =
         qemu::number_after(&o.lines, "frames ").ok_or("the kernel printed no frames line")?;
@@ -939,6 +984,7 @@ fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = dialog(&mut run);
     let o = run.stop();
+    symbolize::backtrace(&o.lines, &a.elf);
     let bench = talked.map_err(|e| format!("console dialog on {}: {e}", m.name))?;
     if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
         return Err(format!("console dialog on {}: {panic}", m.name));
@@ -973,6 +1019,7 @@ fn trace_dialog(m: &qemu::Machine) -> Result<(), String> {
         run.expect(PROMPT, DIALOG_STEP).map(|_| ())
     })();
     let o = run.stop();
+    symbolize::backtrace(&o.lines, &a.elf);
     talked.map_err(|e| format!("trace dialog on {}: {e}", m.name))?;
     if o.lines.iter().any(|line| line.contains("KERNEL PANIC")) {
         return Err(format!("trace dialog on {} panicked", m.name));
@@ -1283,7 +1330,7 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.elf, None);
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"))?;
+    let o = run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"), &a.elf)?;
     qemu::expect_marker(&o, "no device tree in x0")?;
     if !o.stopped_on_marker {
         return Err("QEMU was not stopped on the marker line".into());
@@ -1336,7 +1383,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
         let image = bytes.map(|_| path.as_path());
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, image);
         cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
         qemu::expect_powered_off(&o)?;
         qemu::expect_marker(&o, "KERNEL PANIC")?;
         qemu::expect_marker(&o, marker)?;
@@ -1357,7 +1404,7 @@ fn init_fault_stops_the_machine() -> Result<(), String> {
         std::fs::write(&path, image).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
         cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
         qemu::expect_powered_off(&o)?;
         qemu::expect_marker(&o, "KERNEL PANIC")?;
         Ok::<_, String>(o)
@@ -1428,7 +1475,7 @@ fn panic_prints_the_log_nobody_showed() -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
     qemu::expect_powered_off(&o)?;
     let at = |what: &str, found: &dyn Fn(&str) -> bool| {
         o.lines
@@ -1472,7 +1519,7 @@ fn fault_report() -> Result<(), String> {
     let a = build(Variant::FaultProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
     qemu::expect_not_timed_out(&o)?;
     for marker in ["unknown or undefined instruction", "x0  0x", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
@@ -1671,7 +1718,7 @@ fn stack_overflow_report() -> Result<(), String> {
     let a = build(Variant::OverflowProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
     qemu::expect_powered_off(&o)?;
     for marker in ["kernel stack overflow", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
@@ -1702,7 +1749,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     if icount {
         cmd.args(qemu::ICOUNT);
     }
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
+    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
     for name in ICOUNT_TESTS {
@@ -1800,7 +1847,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     if icount {
         cmd.args(qemu::ICOUNT);
     }
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
+    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     let hvf = m.is_hvf();
     if hvf {
@@ -1878,7 +1925,7 @@ fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
     let image = build_boot_image("boot-svc.img", &SVC_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, Some(CHECKER_END))?;
+    let o = run_until(cmd, TEST_TIMEOUT, Some(CHECKER_END), &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
     failure_lines_name_the_reason_and_the_pause(&o.lines)?;
@@ -1974,7 +2021,7 @@ fn bad_tables_are_refused() -> Result<(), String> {
         let image = build_boot_image(name, programs, TEST_PROFILE)?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&image));
         cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
         qemu::expect_line(&o, reason)?;
         qemu::expect_init_exit(&o, "init: table refused: ", 2)?;
     }

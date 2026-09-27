@@ -38,6 +38,8 @@ fn check(text: &str) -> Result<(), String> {
             seen_deliver_boundary = true;
         }
         let guarded = symbol == "kernel::syscall::dispatch"
+            || symbol == "kernel::syscall::dispatch_inner"
+            || symbol == "kernel::syscall::set_result"
             || symbol == "kernel::mm::phys::alloc_zeroed"
             || symbol.contains("::alloc_table")
             || symbol == "kernel::mm::kmap::map"
@@ -74,6 +76,12 @@ mod tests {
     #[test]
     fn catches_a_call_in_the_register_delivery_prefix() {
         let text = "1 <kernel::syscall::dispatch>:\n2 <kernel::mm::phys::alloc_zeroed>:\n3 <kernel::channel::deliver>:\n4:\tbl\t<memcpy>\n";
+        assert!(check(text).is_err());
+    }
+
+    #[test]
+    fn catches_a_call_in_the_inlined_result_path() {
+        let text = "1 <kernel::syscall::dispatch>:\n2 <kernel::syscall::dispatch_inner>:\n3:\tbl\t<memset>\n";
         assert!(check(text).is_err());
     }
 }
