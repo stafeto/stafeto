@@ -1,0 +1,18 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
+#ifndef STAFETO_UNISTD_H
+#define STAFETO_UNISTD_H
+#include <sys/types.h>
+#include <stafeto/abi.h>
+extern char **environ;
+int close(int fd);
+ssize_t read(int fd, void *buffer, size_t count);
+ssize_t write(int fd, const void *buffer, size_t count);
+off_t lseek(int fd, off_t offset, int origin);
+int dup(int fd);
+int dup2(int source, int target);
+int dup3(int source, int target, int flags);
+int chdir(const char *path);
+char *getcwd(char *buffer, size_t size);
+_Noreturn void _exit(int status);
+#endif

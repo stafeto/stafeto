@@ -1,0 +1,16 @@
+[package]
+name = "posix-tls-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "posix-tls-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi" }
+rt = { path = "../../lib/rt" }

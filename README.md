@@ -199,13 +199,21 @@ checks for successful calls, failures, and ABI layout.
 | Rust file client | Implement file metadata, relative file access, working-directory changes, and directory iteration in a GPL Rust package; verify through the RAM service in a guest. | ✅ [#30](https://github.com/stafeto/stafeto/pull/30) |
 | Rust file positioning | Add signed 64-bit `lseek`, all five POSIX.1-2024 origins, unchanged offsets on failure, and validated zero-length file I/O; verify on RAM files in the guest. | ✅ [#31](https://github.com/stafeto/stafeto/pull/31) |
 | Rust descriptor ownership | Own local descriptors, shared offsets, `dup`/`dup2`/`dup3`, descriptor flags, and standard-stream redirection; verify limits and lifetime in the guest. | ✅ [#32](https://github.com/stafeto/stafeto/pull/32) |
-| Rust library foundation | Define the C ABI, generated headers, `errno`, allocator, startup, thread-local storage, and a versioned sysroot; link a C probe without Picolibc. | ⬜ |
+| Initial Rust C ABI | Build ABI 1 headers, Rust startup and `libc.a`; boot a C main without Picolibc through both Cargo and standalone Clang linking; verify native-thread errno. | ✅ [#33](https://github.com/stafeto/stafeto/pull/33) |
+| Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
 | Shell I/O | Expose Rust descriptor duplication through the POSIX service and C ABI; add inherited descriptors and pipes, then verify `ash` pipelines and file output. | ⬜ |
 | Terminal input | Add a terminal service with line discipline, `termios`, window size, and BusyBox line editing; verify backspace, arrows, history, and Ctrl-C. | ⬜ |
 | Remaining interfaces | Add threads, signals, time, process control, sockets, permissions, and required utility behavior; publish a feature and option matrix. | ⬜ |
 | Conformance checks | Run API, shell, and utility suites on QEMU and Apple Virtualization.framework; record every remaining standard requirement and fix failures. | ⬜ |
+
+The initial Rust sysroot is experimental ABI 1 for AArch64 LP64.
+`python3 tools/build-posix-sysroot.py --probe` stages headers and `lib/libc.a`
+under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links the C probe.
+It currently covers file calls and startup with an empty environment;
+allocation, stdio, general ELF TLS and the remaining headers are pending.
+See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) for the boundary.
 
 `ls` is a BusyBox utility. Its current in-shell path uses BusyBox's
 single-process applet mode; other external programs still need the
@@ -236,6 +244,7 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask rtbench` | runs fixed-duration RTOS primitive and timer-wakeup workloads three times on QEMU TCG, and also HVF and VZ on Apple Silicon; `--repeats 1` is a quick smoke run |
 | `cargo xtask ext4ro` | boots a QEMU guest that reads a checked-in ext4 image created by e2fsprogs; no block driver is involved yet |
 | `cargo xtask ramfs` | boots a RAM file service and checks file descriptors, reads, writes, seeks, sizes, and standard output in QEMU |
+| `cargo xtask posix-abi` | boots C file-ABI probes linked with Rust startup through Cargo and standalone Clang, then checks errno isolation on native guest threads; no Picolibc |
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |
@@ -249,7 +258,7 @@ installs the Rust version, components, and targets itself from
 
 `rtbench` adapts six [Thread-Metric](https://github.com/zephyrproject-rtos/zephyr/blob/main/tests/benchmarks/thread_metric/thread_metric_readme.txt) workloads to stafeto's primitives: baseline arithmetic, cooperative yields, preemptive notifications, channel request/reply, self-notification, and memory-object allocation. It also follows [Zyclictest](https://docs.zephyrproject.org/latest/services/debugging/zyclictest.html) by measuring 1,000 periodic timer wakeups at 1 ms intervals, both while idle and with a lower-priority CPU load. It reports median operations per second across runs, timer p99 and worst observed latency, and missed periods. The guest prints only after each workload. These are adapted workloads, not official Thread-Metric results; the hardware-interrupt cases await a portable guest interrupt source. Virtual-machine measurements do not establish a physical worst-case latency.
 
-The C and BusyBox probes need Clang/LLVM, LLD, Meson, Ninja, Python 3, GNU Make and Git. On macOS, install them with `brew install llvm lld meson ninja make`. Picolibc and BusyBox sources and build output stay under `target/`. See [notes/m2-ram-posix.md](notes/m2-ram-posix.md) for the current BusyBox port boundary.
+The Rust POSIX probe included in `cargo xtask test` and `cargo xtask ci` needs Clang/LLVM, LLD and Python 3. The C and BusyBox probes need Clang/LLVM, LLD, Meson, Ninja, Python 3, GNU Make and Git. On macOS, install them with `brew install llvm lld meson ninja make`. Picolibc and BusyBox sources and build output stay under `target/`. See [notes/m2-ram-posix.md](notes/m2-ram-posix.md) for the current BusyBox port boundary.
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 

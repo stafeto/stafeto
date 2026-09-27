@@ -25,6 +25,7 @@ table-ceiling = []
 vz = []
 table-ramfs = []
 table-cprobe = []
+table-posix-abi = []
 table-busybox = []
 table-busybox-dialog = []
 
