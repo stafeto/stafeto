@@ -83,7 +83,8 @@
 //! | 75 | the worker's effective priority |
 //! | 76 | the worker's state (THREAD_STATE x1) |
 //! | 77 | the jobs that wait for the worker |
-//! | 78..80 | zero |
+//! | 78 | 1 once the worker took its work from init, 0 before and with no work |
+//! | 79 | zero |
 //! | 80..88 | free pages of init's quota |
 //! | 88..96 | labels init gave |
 //!
@@ -502,6 +503,9 @@ pub struct Stats {
     /// abi::ThreadInfo's state as THREAD_STATE gives it in x1.
     pub worker_state: u8,
     pub pending: u8,
+    /// The worker took its work from init and does it; false before and
+    /// with no work.
+    pub begun: bool,
     pub free_pages: u64,
     pub labels: u64,
 }
@@ -525,7 +529,7 @@ impl Stats {
             self.worker_effective,
             self.worker_state,
             self.pending,
-            0,
+            u8::from(self.begun && self.job.is_some()),
             0,
         ])?;
         w.u64(self.free_pages)?;
@@ -533,8 +537,8 @@ impl Stats {
     }
 
     /// The reply in `bytes`: BAD_SIZE unless it is STATS_LEN bytes with
-    /// status 0, the bytes that must be zero are, and the work and its
-    /// record are both there or both 0.
+    /// status 0, the bytes that must be zero are, the work and its record
+    /// are both there or both 0, and byte 78 is 0, or 1 with a work.
     pub fn read(bytes: &[u8]) -> Result<Stats, Status> {
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 || r.u32()? != 0 {
@@ -552,7 +556,7 @@ impl Stats {
             }
             _ => return Err(Status::BadSize),
         };
-        if b[6..] != [0; 2] {
+        if b[6] > u8::from(job.is_some()) || b[7] != 0 {
             return Err(Status::BadSize);
         }
         let stats = Stats {
@@ -562,6 +566,7 @@ impl Stats {
             worker_effective: b[3],
             worker_state: b[4],
             pending: b[5],
+            begun: b[6] == 1,
             free_pages: r.u64()?,
             labels: r.u64()?,
         };
@@ -871,6 +876,7 @@ mod tests {
             worker_effective: 34,
             worker_state: 1,
             pending: 2,
+            begun: true,
             free_pages: 0x1_0000_0001,
             labels: 77,
         };
@@ -881,18 +887,22 @@ mod tests {
         assert_eq!(bytes[..8], [0; 8]);
         assert_eq!(bytes[8..16], 1u64.to_le_bytes());
         assert_eq!(bytes[64..72], 8u64.to_le_bytes());
-        assert_eq!(bytes[72..80], [3, 6, 33, 34, 1, 2, 0, 0]);
+        assert_eq!(bytes[72..80], [3, 6, 33, 34, 1, 2, 1, 0]);
         assert_eq!(bytes[80..88], 0x1_0000_0001u64.to_le_bytes());
         assert_eq!(bytes[88..96], 77u64.to_le_bytes());
         assert_eq!(Stats::read(bytes), Ok(stats));
-        let idle = Stats { job: None, ..stats };
+        let idle = Stats {
+            job: None,
+            begun: false,
+            ..stats
+        };
         let mut w = Writer::new();
         idle.write(&mut w).unwrap();
         assert_eq!(w.as_bytes()[72..74], [0, 0]);
         assert_eq!(Stats::read(w.as_bytes()), Ok(idle));
         // A work without its record, a record without its work, a work
         // past the three, and a byte that must be zero.
-        for (at, byte) in [(73, 0), (72, 0), (72, 4), (78, 1), (4, 1)] {
+        for (at, byte) in [(73, 0), (72, 0), (72, 4), (78, 2), (79, 1), (4, 1)] {
             let mut bad = bytes.to_vec();
             bad[at] = byte;
             assert_eq!(Stats::read(&bad), Err(Status::BadSize), "byte {at}");

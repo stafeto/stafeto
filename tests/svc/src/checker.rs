@@ -8,16 +8,19 @@
 //! to services that registered, to one that registers later and past four
 //! waiting requests, and to names the table does not give it, what the
 //! REGISTER of `device` brought, the restarts of `crash` and `mute` until
-//! they are broken, the wait of `hog` for quota, LIST and STATS, and the
-//! watchdog: `silent` restarted after it hangs, the level init kills it at,
-//! the client reconnecting, and the starved and the healthy left alone.
+//! they are broken, CONNECT to `oneshot`, which ended, the wait of `hog` for
+//! quota, LIST and STATS, and the watchdog: `silent` restarted after it
+//! hangs, the level init kills it at, the client reconnecting, its waiting
+//! CONNECT gone with it, and the starved and the healthy left alone.
 //! LIST and STATS come once `crash` and `mute` are broken, when no record
 //! but `silent` starts again. It prints
 //! `TEST <name> ok` or `TEST <name> FAIL <why>` for each test in turn,
 //! then `TESTS DONE total=<n> failed=<m>`, and ends with code 0; xtask
 //! reads the lines, and init's line of its end.
 
-use crate::device::{BINDING, BINDING_COPIES, EDGE, Report, WINDOW, WINDOW_COPIES};
+use crate::device::{
+    BINDING, BINDING_ACKS, BINDING_COPIES, EDGE, Report, WINDOW, WINDOW_COPIES, WINDOW_WRITES,
+};
 use crate::{CHECKER, ECHO, VERSION, base, method};
 use abi::{
     Error, MESSAGE_MAX, ObjectKind, Policy, ProcessHandles, ProcessMemory, Rights, Source,
@@ -44,7 +47,7 @@ type Test = (&'static str, fn(&Checker) -> Outcome);
 /// `a_fifth_waiting_connect_gets_limit_reached` wait for `slow`, which
 /// registers once the checker opens the gate of `echo`, and
 /// `connect_waits_for_registration` opens it and collects them.
-const TESTS: [Test; 24] = [
+const TESTS: [Test; 26] = [
     (
         "start_data_brings_the_service_args",
         start_data_brings_the_service_args,
@@ -95,6 +98,10 @@ const TESTS: [Test; 24] = [
         connect_to_a_broken_service_is_peer_closed,
     ),
     (
+        "connect_to_an_ended_service_is_peer_closed",
+        connect_to_an_ended_service_is_peer_closed,
+    ),
+    (
         "a_record_without_quota_waits_and_is_not_broken",
         a_record_without_quota_waits_and_is_not_broken,
     ),
@@ -131,6 +138,10 @@ const TESTS: [Test; 24] = [
         client_reconnects_after_a_restart,
     ),
     (
+        "a_client_that_goes_leaves_its_waiting_connect",
+        a_client_that_goes_leaves_its_waiting_connect,
+    ),
+    (
         "a_starved_service_is_not_taken_for_silent",
         a_starved_service_is_not_taken_for_silent,
     ),
@@ -154,7 +165,7 @@ const HELLO: &[u8] = b"hello";
 /// The records LIST gives: init, then the records of init's test table in
 /// its order, each with its priority, its ceiling and whether it is a
 /// client.
-const RECORDS: [(&str, u8, u8, bool); 11] = [
+const RECORDS: [(&str, u8, u8, bool); 12] = [
     ("init", 63, 63, false),
     ("sink", 40, 40, false),
     ("echo", 40, 40, false),
@@ -165,14 +176,17 @@ const RECORDS: [(&str, u8, u8, bool); 11] = [
     ("mute", 30, 30, false),
     ("checker", 30, 30, true),
     ("private", 20, 20, false),
-    ("hog", 20, 20, false),
+    ("hog", 40, 40, false),
+    ("oneshot", 35, 35, false),
 ];
 /// The records that do not run with no failure once `crash` is broken:
-/// their state, their failures within 60 s and their restarts.
-const NOT_RUNNING: [(&str, State, u8, u32); 3] = [
+/// their state, their failures within 60 s and their restarts. The end of
+/// `oneshot`, whose policy is never, counts no failure.
+const NOT_RUNNING: [(&str, State, u8, u32); 4] = [
     ("crash", State::Broken, 5, 4),
     ("mute", State::Broken, 5, 4),
     ("hog", State::Quota, 0, 0),
+    ("oneshot", State::Ended, 0, 0),
 ];
 /// The place of `silent` in init's table (RECORDS index 6, table place 5):
 /// STATS names the record init's worker kills by its place.
@@ -193,6 +207,9 @@ static ECHOED: [AtomicBool; HELPERS] = [const { AtomicBool::new(false) }; HELPER
 /// they are done, bit i for helper i.
 static THREADS: [AtomicU64; HELPERS] = [const { AtomicU64::new(0) }; HELPERS];
 static DONE: AtomicU64 = AtomicU64::new(0);
+/// Whether the CONNECT of the helper to `oneshot` came back with
+/// PEER_CLOSED.
+static ONESHOT_CLOSED: AtomicBool = AtomicBool::new(false);
 /// The stack of the thread that hangs `silent`, and its handle.
 static HANG_STACK: Stack<8192> = Stack::new();
 static HANG_THREAD: AtomicU64 = AtomicU64::new(0);
@@ -353,29 +370,42 @@ fn register_from_a_client_is_refused(c: &Checker) -> Outcome {
     )
 }
 
+/// Starts helper `i` of the checker at `entry` with `i`, at the checker's
+/// level on STACKS[i] and with its own message buffer; THREADS[i] keeps
+/// its thread.
+///
+/// # Safety
+/// No thread uses STACKS[i]: the helper before on it is gone, or waits for
+/// good and never runs again.
+unsafe fn start_helper(c: &Checker, i: usize, entry: extern "C" fn(u64) -> !) -> Outcome {
+    let buffer = abi::INIT_MSGBUF as usize + (i + 1) * 4096;
+    // SAFETY: the caller's promise.
+    let t = unsafe {
+        sys::thread_create(
+            &c.s.process,
+            entry,
+            STACKS[i].top(),
+            i as u64,
+            base(&c.s),
+            Policy::Fifo,
+            buffer,
+        )
+    };
+    let t = t.map_err(|_| "thread_create failed")?;
+    sys::thread_start(&t).map_err(|_| "thread_start failed")?;
+    THREADS[i].store(t.into_raw().0, Relaxed);
+    Ok(())
+}
+
 /// Four helper threads ask for `slow`, which has not registered, and wait
 /// in their CONNECT; a fifth request gets LIMIT_REACHED at once. The
 /// helpers go on waiting (`connect_waits_for_registration`).
 fn a_fifth_waiting_connect_gets_limit_reached(c: &Checker) -> Outcome {
     let done = sys::channel_create(base(&c.s)).map_err(|_| "channel_create failed")?;
     DONE.store(done.into_raw().0, Relaxed);
-    for (i, stack) in STACKS.iter().enumerate() {
-        let buffer = abi::INIT_MSGBUF as usize + (i + 1) * 4096;
-        // SAFETY: the stack is the helper's alone.
-        let t = unsafe {
-            sys::thread_create(
-                &c.s.process,
-                helper,
-                stack.top(),
-                i as u64,
-                base(&c.s),
-                Policy::Fifo,
-                buffer,
-            )
-        };
-        let t = t.map_err(|_| "thread_create failed")?;
-        sys::thread_start(&t).map_err(|_| "thread_start failed")?;
-        THREADS[i].store(t.into_raw().0, Relaxed);
+    for i in 0..HELPERS {
+        // SAFETY: no helper started before.
+        unsafe { start_helper(c, i, helper) }?;
     }
     // The helpers run at the checker's level, each until its CONNECT
     // waits.
@@ -470,18 +500,23 @@ fn report(c: &Checker) -> Result<Report, &'static str> {
     Report::read(bytes).map_err(|_| "REPORT gave no report")
 }
 
-/// The reply to REGISTER brings the window `rtc`, which shows the PL031's
-/// PeriphID, and the binding `rtc-irq` of its line, level-triggered, each
-/// a handle that makes no copies.
+/// The reply to REGISTER brings the window `rtc`, which maps readable and
+/// writable and shows the PL031's PeriphID, and the binding `rtc-irq` of
+/// its line, level-triggered, which takes irq_ack, each a handle that
+/// makes no copies.
 fn register_brings_windows_and_bindings(c: &Checker) -> Outcome {
     let r = report(c)?;
     check(r.flags & WINDOW != 0, "no window rtc came")?;
+    check(r.flags & BINDING != 0, "no binding rtc-irq came")?;
     check(
         r.flags & (WINDOW_COPIES | BINDING_COPIES) == 0,
         "the window or the binding came with DUPLICATE",
     )?;
+    check(
+        r.flags & (WINDOW_WRITES | BINDING_ACKS) == WINDOW_WRITES | BINDING_ACKS,
+        "the window does not map writable, or the binding takes no irq_ack",
+    )?;
     check(r.ids == RTC_IDS, "the window rtc does not show the PL031")?;
-    check(r.flags & BINDING != 0, "no binding rtc-irq came")?;
     check(
         r.line == RTC_LINE && r.flags & EDGE == 0,
         "the binding is not of line 34, level-triggered",
@@ -521,22 +556,11 @@ fn connect_waits_for_registration(c: &Checker) -> Outcome {
         status(&echo, request(method::OPEN, &[]).as_bytes()) == Status::Ok,
         "echo did not open its gate",
     )?;
-    let done = Handle::<Channel>::borrowed(abi::Handle(done));
-    let waiter = Waiter::new(&done, 0, base(&c.s)).map_err(|_| "timer_create failed")?;
-    let deadline = now_ns() + BOUND_NS;
-    let mut seen = 0;
-    while seen != (1 << HELPERS) - 1 {
-        match waiter.receive_until(&done, deadline) {
-            Ok(Waited::Got(Received::Notification {
-                source: Source::Unlabeled,
-                bits,
-                ..
-            })) => seen |= bits,
-            Ok(Waited::Got(_)) => {}
-            Ok(Waited::Expired) => return Err("the requests for slow did not come back"),
-            Err(_) => return Err("the wait for the helpers failed"),
-        }
-    }
+    helpers_done(
+        c,
+        (1 << HELPERS) - 1,
+        "the requests for slow did not come back",
+    )?;
     for t in &THREADS {
         drop(Handle::<Thread>::from_raw(abi::Handle(t.swap(0, Relaxed))));
     }
@@ -544,6 +568,28 @@ fn connect_waits_for_registration(c: &Checker) -> Outcome {
         ECHOED.iter().all(|e| e.load(Relaxed)),
         "ECHO did not go through a session with slow",
     )
+}
+
+/// Waits until each helper of `want`, bit i for helper i, told the channel
+/// DONE that it is done, for BOUND_NS at most, and `late` past the bound.
+fn helpers_done(c: &Checker, want: u64, late: &'static str) -> Outcome {
+    let done = Handle::<Channel>::borrowed(abi::Handle(DONE.load(Relaxed)));
+    let waiter = Waiter::new(&done, 0, base(&c.s)).map_err(|_| "timer_create failed")?;
+    let deadline = now_ns() + BOUND_NS;
+    let mut seen = 0;
+    while seen & want != want {
+        match waiter.receive_until(&done, deadline) {
+            Ok(Waited::Got(Received::Notification {
+                source: Source::Unlabeled,
+                bits,
+                ..
+            })) => seen |= bits,
+            Ok(Waited::Got(_)) => {}
+            Ok(Waited::Expired) => return Err(late),
+            Err(_) => return Err("the wait for the helpers failed"),
+        }
+    }
+    Ok(())
 }
 
 /// The page of LIST from the record `first`.
@@ -768,6 +814,43 @@ fn connect_to_a_broken_service_is_peer_closed(c: &Checker) -> Outcome {
     )
 }
 
+/// Spec 13.4: a CONNECT to a service that ended gets PEER_CLOSED at once.
+/// `oneshot`, whose policy is never, faulted right after its start above the
+/// checker, so it ended before the checker ran: LIST shows it ENDED with no
+/// failure and no restart. The last helper sends the CONNECT and tells
+/// DONE once it came back, which a request that waits in init never does;
+/// the wait for it has a bound.
+fn connect_to_an_ended_service_is_peer_closed(c: &Checker) -> Outcome {
+    let oneshot = record(c, "oneshot")?;
+    check(
+        (oneshot.state, oneshot.failures, oneshot.restarts) == (State::Ended, 0, 0),
+        "LIST does not show oneshot ended with no failure and no restart",
+    )?;
+    let i = HELPERS - 1;
+    // SAFETY: the helper of slow on this stack is gone.
+    unsafe { start_helper(c, i, connect_to_oneshot) }?;
+    helpers_done(c, 1 << i, "CONNECT to the ended oneshot waits")?;
+    check(
+        ONESHOT_CLOSED.load(Relaxed),
+        "CONNECT to the ended oneshot did not get PEER_CLOSED",
+    )?;
+    drop(Handle::<Thread>::from_raw(abi::Handle(
+        THREADS[i].swap(0, Relaxed),
+    )));
+    Ok(())
+}
+
+/// Helper `i` of the checker: CONNECT to `oneshot`, whether it got
+/// PEER_CLOSED into ONESHOT_CLOSED, and bit i to the channel DONE.
+extern "C" fn connect_to_oneshot(i: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(abi::START_CHANNEL);
+    let got = rt::service::connect(&parent, "oneshot").err();
+    ONESHOT_CLOSED.store(got == Some(Status::Kernel(Error::PeerClosed)), Relaxed);
+    let done = Handle::<Channel>::borrowed(abi::Handle(DONE.load(Relaxed)));
+    let _ = sys::notify(&done, 1 << i);
+    sys::thread_exit()
+}
+
 /// `hog` needs more than init's quota: its start waits (QUOTA) with no
 /// failure, no restart and no instance.
 fn a_record_without_quota_waits_and_is_not_broken(c: &Checker) -> Outcome {
@@ -851,9 +934,10 @@ fn silent_service_is_restarted_by_the_watchdog(c: &Checker) -> Outcome {
 }
 
 /// The STATS the sink kept when the session of `silent` went (the kill
-/// closed it): init's worker was killing silent, its record by its place,
-/// at level 33, one above silent's ceiling and below sink at 40, with the
-/// teardown in the cleanup queue.
+/// closed it): init's worker had taken the kill of silent, its record by
+/// its place, and was doing it at level 33, one above silent's ceiling and
+/// below sink at 40, with the teardown in the cleanup queue. A kill in
+/// init's main thread would leave the worker's job not taken yet.
 fn kill_runs_above_the_victim_and_below_its_clients(c: &Checker) -> Outcome {
     let sink = c.connect("sink").map_err(|_| "no session with sink")?;
     let mut buffer = [0; MESSAGE_MAX];
@@ -862,7 +946,7 @@ fn kill_runs_above_the_victim_and_below_its_clients(c: &Checker) -> Outcome {
     let bytes = call(&sink, w.as_bytes(), &mut buffer).map_err(|_| "SEEN was refused")?;
     let stats = Stats::read(bytes).map_err(|_| "SEEN gave no STATS")?;
     check(
-        stats.job == Some((Work::Kill, SILENT_PLACE)),
+        stats.job == Some((Work::Kill, SILENT_PLACE)) && stats.begun,
         "the worker was not killing silent when its session went",
     )?;
     check(
@@ -886,6 +970,37 @@ fn client_reconnects_after_a_restart(c: &Checker) -> Outcome {
         .connect("silent")
         .map_err(|_| "no new session with silent")?;
     check(echoes(&session), "ECHO did not work through the new silent")
+}
+
+/// Spec 13.4: the CONNECT requests of a client that went leave the
+/// records they wait for. Each instance of `silent` leaves one request for
+/// `hog`, which never starts, waiting in init, and the kill of the first
+/// took its request away: of the four places of hog, the new silent holds
+/// one, three helpers of the checker wait in the others, and one more
+/// request gets LIMIT_REACHED.
+fn a_client_that_goes_leaves_its_waiting_connect(c: &Checker) -> Outcome {
+    settle(c)?;
+    for i in 0..HELPERS - 1 {
+        // SAFETY: the helpers of slow on these stacks are gone.
+        unsafe { start_helper(c, i, wait_for_hog) }?;
+    }
+    sys::yield_now().map_err(|_| "yield failed")?;
+    let waits = THREADS.iter().take(HELPERS - 1).all(|t| {
+        let t = Handle::<Thread>::borrowed(abi::Handle(t.load(Relaxed)));
+        sys::thread_info(&t).is_ok_and(|info| info.state == ThreadState::AwaitingReply)
+    });
+    check(waits, "the request of a silent that went kept its place")?;
+    check(
+        c.connect("hog").err() == Some(Status::Kernel(Error::LimitReached)),
+        "four requests for hog did not fill its places",
+    )
+}
+
+/// A helper of the checker: CONNECT to `hog`, which never comes back.
+extern "C" fn wait_for_hog(_: u64) -> ! {
+    let parent = Handle::<Channel>::borrowed(abi::START_CHANNEL);
+    let _ = rt::service::connect(&parent, "hog");
+    sys::thread_exit()
 }
 
 /// `private` at 20 is starved while silent spins at 32, above its ceiling:

@@ -79,6 +79,9 @@ struct Cell {
 // one worker uses it (`Worker::start`).
 unsafe impl Sync for Cell {}
 
+/// Whether the worker took the job in the cell and does it (STATS).
+static BEGUN: AtomicBool = AtomicBool::new(false);
+
 /// Whether the one worker started (`Worker::start`).
 static STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -199,8 +202,14 @@ impl Worker {
             *CELL.order.get() = Some(order);
             *CELL.gone.get() = gone;
         }
+        BEGUN.store(false, Ordering::Relaxed);
         CELL.state.store(GIVEN, Ordering::Release);
         sys::notify(&self.wake, 1)
+    }
+
+    /// Whether the worker took the job it was given and does it.
+    pub fn begun(&self) -> bool {
+        BEGUN.load(Ordering::Relaxed)
     }
 
     /// Once the worker did its job: the outcome of a load, None after a
@@ -231,6 +240,7 @@ extern "C" fn work(_: u64) -> ! {
         };
         // SAFETY: still GIVEN: the cell is the worker's.
         let gone = unsafe { (*CELL.gone.get()).take() };
+        BEGUN.store(true, Ordering::Relaxed);
         let loaded = match order {
             Order::Load {
                 place,

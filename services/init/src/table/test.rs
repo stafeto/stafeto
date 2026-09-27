@@ -76,15 +76,16 @@ pub const TABLE: &[Record] = &[
     },
     // Fails right after its start: broken after five failures.
     echo("crash", 35, WATCH, b"x"),
-    // Connects to sink; on HANG it raises itself to its ceiling (32) and
-    // spins, so its heartbeat stops and the watchdog restarts it.
+    // Connects to sink, and leaves a CONNECT to hog waiting; on HANG it
+    // raises itself to its ceiling (32) and spins, so its heartbeat stops
+    // and the watchdog restarts it.
     Record {
         ceiling: 32,
         kind: Kind::Service(Watch {
             period_ns: 20 * MS,
             deadline_ns: 300 * MS,
         }),
-        connects: &["sink"],
+        connects: &["sink", "hog"],
         ..echo("silent", 30, WATCH, b"s\x20")
     },
     // Never registers, and its HEARTBEAT gets BAD_STATE: the watchdog from
@@ -96,14 +97,23 @@ pub const TABLE: &[Record] = &[
         console: true,
         quota: 64 * PAGE,
         handle_limit: 64,
-        connects: &["sink", "echo", "slow", "device", "crash", "silent", "mute"],
+        connects: &[
+            "sink", "echo", "slow", "device", "crash", "silent", "mute", "hog", "oneshot",
+        ],
         ..echo("checker", 30, WATCH, b"c")
     },
     // Known to the table, but not among the connections of `checker`.
     echo("private", 20, WATCH, b"e"),
-    // A quota of 1 TiB, more than init has: its start waits.
+    // A quota of 1 TiB, more than init has: its start waits, and so do the
+    // CONNECT requests for it.
     Record {
         quota: 1 << 40,
-        ..echo("hog", 20, WATCH, b"e")
+        ..echo("hog", 40, WATCH, b"e")
+    },
+    // Fails right after its start, and its policy is never: it ends above
+    // the checker, before the checker runs.
+    Record {
+        restart: Restart::Never,
+        ..echo("oneshot", 35, WATCH, b"x")
     },
 ];

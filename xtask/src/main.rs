@@ -120,8 +120,9 @@ const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round
 const SERVICES_STARTED: &str = "init: services started";
 /// The names of the records of init's test table (services/init, feature
 /// `table-test`), which the init that ships does not carry.
-const TEST_TABLE_NAMES: [&str; 10] = [
+const TEST_TABLE_NAMES: [&str; 11] = [
     "sink", "echo", "slow", "device", "crash", "silent", "mute", "checker", "private", "hog",
+    "oneshot",
 ];
 /// The start of the line init prints when the client `checker` of its
 /// test table ends, and the whole line: its policy is never (spec 13.4).
@@ -210,7 +211,7 @@ const _: () = assert!(
 /// could drop a test with the line.
 const INIT_TESTS: u32 = 216;
 /// Tests the client `checker` of init's test table has (tests/svc).
-const SVC_TESTS: u32 = 24;
+const SVC_TESTS: u32 = 26;
 /// What init prints for each table it refuses (services/init, features
 /// `table-cycle` and `table-ceiling`), each line whole.
 const REFUSED: [(&str, &[ImageProgram], &str); 2] = [

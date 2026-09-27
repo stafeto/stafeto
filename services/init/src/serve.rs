@@ -853,10 +853,10 @@ impl Init {
     }
 
     /// STATS (spec 13.4): the counts of the kernel (KERNEL_STATS), the job
-    /// of the worker with the place of its record, the worker's priorities
-    /// and state (THREAD_STATE), the jobs that wait, the free pages of
-    /// init's quota and the labels init gave. The errors are those of the
-    /// calls.
+    /// of the worker with the place of its record and whether the worker
+    /// took it, the worker's priorities and state (THREAD_STATE), the jobs
+    /// that wait, the free pages of init's quota and the labels init gave.
+    /// The errors are those of the calls.
     fn stats(&self, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
@@ -871,6 +871,7 @@ impl Init {
                 worker_effective: worker.priority,
                 worker_state: worker.state.code() as u8,
                 pending: self.queue.len() as u8,
+                begun: self.worker.begun(),
                 free_pages: memory.quota.saturating_sub(memory.used) / PAGE,
                 labels: self.labels.given(),
             })

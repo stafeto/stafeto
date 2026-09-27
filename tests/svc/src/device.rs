@@ -7,9 +7,10 @@
 //! RECEIVE, then with one that lacks DUPLICATE, which init refuses with
 //! ACCESS_DENIED; then as a service does (rt::service::register); then
 //! once more, which init refuses with BAD_STATE. It maps the window that
-//! came, reads the PL031's PeriphID0 and PeriphID1 through rt::mmio
-//! [G34], looks at its binding (object_info IRQ), tries a copy of each,
-//! and gives what it saw on REPORT (`Report`).
+//! came readable and writable, reads the PL031's PeriphID0 and PeriphID1
+//! through rt::mmio [G34], acknowledges its binding (irq_ack) and looks at
+//! it (object_info IRQ), tries a copy of each, and gives what it saw on
+//! REPORT (`Report`).
 
 use crate::{FAILED, VERSION, base, method, serve};
 use abi::{Access, CHANNEL_RIGHTS, MESSAGE_MAX, Rights};
@@ -32,6 +33,10 @@ pub const BINDING: u32 = 2;
 pub const EDGE: u32 = 4;
 pub const WINDOW_COPIES: u32 = 8;
 pub const BINDING_COPIES: u32 = 16;
+/// The window mapped readable and writable, and the binding took irq_ack
+/// (MANAGE).
+pub const WINDOW_WRITES: u32 = 32;
+pub const BINDING_ACKS: u32 = 64;
 
 /// What the device saw, the reply to REPORT after its status and 4 zero
 /// bytes: the status of each of its REGISTER requests in turn, PeriphID0
@@ -113,19 +118,21 @@ fn with_rights(parent: &Handle<Channel>, channel: &Handle<Channel>, rights: Righ
 }
 
 /// Takes the window and the binding REGISTER brought into `report`:
-/// PeriphID through the window, the line and trigger of the binding. The
-/// device holds both until it ends.
+/// PeriphID through the window mapped readable and writable, irq_ack and
+/// the line and trigger of the binding. The device holds both until it
+/// ends.
 fn look(s: &Startup, got: &mut Registered, report: &mut Report) {
     if let Ok(window) = got.take::<Memory>("rtc") {
         report.flags |= WINDOW;
         if sys::handle_duplicate(&window, Rights::MAP_READ).is_ok() {
             report.flags |= WINDOW_COPIES;
         }
-        if sys::mem_map(&s.process, &window, 0, 4096, WINDOW_AT, Access::Read).is_ok() {
+        if sys::mem_map(&s.process, &window, 0, 4096, WINDOW_AT, Access::ReadWrite).is_ok() {
+            report.flags |= WINDOW_WRITES;
             for (id, offset) in report.ids.iter_mut().zip(PERIPH_ID) {
                 // SAFETY: the window maps the PL031's page at WINDOW_AT,
-                // readable, as device memory; the IDs are 32-bit
-                // registers.
+                // readable and writable, as device memory; the IDs are
+                // 32-bit registers.
                 *id = unsafe { mmio::read32(WINDOW_AT + offset) };
             }
         }
@@ -135,6 +142,9 @@ fn look(s: &Startup, got: &mut Registered, report: &mut Report) {
         report.flags |= BINDING;
         if sys::handle_duplicate(&binding, Rights::MANAGE).is_ok() {
             report.flags |= BINDING_COPIES;
+        }
+        if sys::irq_ack(&binding).is_ok() {
+            report.flags |= BINDING_ACKS;
         }
         if let Ok(info) = sys::irq_info(&binding) {
             report.line = info.line as u32;
