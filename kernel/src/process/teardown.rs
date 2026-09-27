@@ -12,7 +12,7 @@ use crate::syscall;
 /// Pages a portion of the stage Shell gives back, at most (spec 7.7):
 /// each goes back to the frame allocator, FRAME_UNITS units of work, 64 in
 /// all.
-const SHELL_PORTION: usize = 32;
+const SHELL_PORTION: usize = 8;
 
 /// Clients of one level a portion of the stage Replies wakes, at most
 /// (spec 7.7).

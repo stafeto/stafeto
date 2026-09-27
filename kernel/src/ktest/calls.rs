@@ -2727,7 +2727,11 @@ pub fn dying_target_ends_the_map(_: &Boot) -> Result<(), &'static str> {
             // SAFETY: the test holds a reference to the process.
             unsafe { process::end(t, ProcessState::Killed, CAUSE) };
             cleanup::drain();
+            #[cfg(feature = "icount")]
+            let start = timer::now();
             last = c.again(n);
+            #[cfg(feature = "icount")]
+            kprintln!("abandon change ticks: {}", timer::now() - start);
             Ok(())
         })?;
         let mappings = memory::info(m).mappings;
@@ -3582,6 +3586,111 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 // The longest portions of the long calls of memory objects (spec 7.7,
 // 15.3), in their worst cases, under -icount.
 
+/// Measures the teardown portions with a process that has 11 message
+/// buffers, 42 handles in transit, and 32 charged pool pages. The buffer
+/// work exactly fills its 64-unit portion; the shell's 32 pages take four
+/// or more portions. The handles use the permanent system resource so
+/// they add no unrelated object cleanup.
+#[cfg(feature = "icount")]
+pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
+    let before = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
+    let mut threads = [None; 11];
+    let setup = (|| {
+        process::fill_measurement_pages(p, 32).map_err(|_| "no shell pages")?;
+        for (i, slot) in threads.iter_mut().enumerate() {
+            let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            *slot = Some(t);
+            thread::give_buffer(t, BUFFER as usize + i * PAGE).map_err(|_| "no buffer")?;
+            let mut moving = [Some((Object::Resource, Rights::NONE)); 4];
+            if i >= 9 {
+                moving[3] = None;
+            }
+            // SAFETY: this stopped thread is held by the measurement and
+            // has no handles in transit yet.
+            unsafe { thread::set_transit(t, moving) };
+        }
+        Ok::<_, &'static str>(())
+    })();
+    if let Err(why) = setup {
+        for t in threads.into_iter().flatten() {
+            // SAFETY: the measurement owns the thread reference.
+            unsafe { thread::release(t, CAUSE) };
+        }
+        // SAFETY: the measurement owns the process reference.
+        unsafe { process::release(p, CAUSE) };
+        cleanup::drain();
+        return Err(why);
+    }
+    // SAFETY: the measurement owns the process reference.
+    unsafe { process::end(p, ProcessState::Killed, CAUSE) };
+    for _ in 0..128 {
+        if process::measurement_stage(p) == Stage::Buffers {
+            break;
+        }
+        cleanup::portion();
+    }
+    check(
+        process::measurement_stage(p) == Stage::Buffers,
+        "the teardown did not reach buffers",
+    )?;
+    let start = timer::now();
+    cleanup::portion();
+    let buffers = timer::now() - start;
+    check(
+        process::measurement_stage(p) == Stage::Mappings,
+        "eleven buffers and 42 handles did not fit one portion",
+    )?;
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the measurement owns the thread reference; the process
+        // has already taken each buffer and its transit handles.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    cleanup::drain();
+    check(
+        process::measurement_stage(p) == Stage::Shell,
+        "the teardown did not reach its shell",
+    )?;
+    // SAFETY: the measurement's last process reference queues the shell.
+    unsafe { process::release(p, CAUSE) };
+    let start = timer::now();
+    cleanup::portion();
+    let shell = timer::now() - start;
+    cleanup::drain();
+    let stop = stop_64_threads_ticks()?;
+    kprintln!("teardown portions ticks: buffers={buffers} shell={shell} stop_64={stop}");
+    check(
+        (process::in_use(), thread::in_use()) == before,
+        "the measured teardown kept a process or thread",
+    )
+}
+
+#[cfg(feature = "icount")]
+fn stop_64_threads_ticks() -> Result<u64, &'static str> {
+    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
+    let mut threads = [None; abi::MAX_THREADS as usize];
+    for slot in &mut threads {
+        let t =
+            thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+        *slot = Some(t);
+        thread::start(t).map_err(|_| "a thread did not start")?;
+    }
+    let start = timer::now();
+    // SAFETY: the test holds the process. Its ready threads do not run
+    // while the kernel measures the process's end.
+    unsafe { process::end(p, ProcessState::Killed, CAUSE) };
+    let took = timer::now() - start;
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the measurement owns the thread reference.
+        unsafe { thread::release(t, CAUSE) };
+    }
+    // SAFETY: the measurement owns the process reference.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    Ok(took)
+}
+
 /// Pages of the objects whose first entry of mem_create takes the node of
 /// nodes of their list besides a leaf (kcore::pagelist): more than a leaf
 /// holds.
@@ -3740,6 +3849,7 @@ pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     let create = [0, CHUNK].into_iter().try_fold(0, |most, fill| {
         create_ticks(fill).map(|ticks| most.max(ticks))
     })?;
+    let create_high = high_order_create_ticks()?;
     let mut changes = [0; 6];
     with_caller(|c| changes_ticks(c, &mut changes))?;
     let fresh = with_caller(|c| {
@@ -3754,7 +3864,7 @@ pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     let release = with_caller(release_ticks)?;
     let [map, map_exec, unmap, protect, protect_exec, crowded] = changes;
     kprintln!(
-        "memory portions ticks: create={create} map={map} map_exec={map_exec} unmap={unmap} protect={protect} protect_exec={protect_exec} release={release} first_map={}",
+        "memory portions ticks: create={create} create_high={create_high} map={map} map_exec={map_exec} unmap={unmap} protect={protect} protect_exec={protect_exec} release={release} first_map={}",
         crowded.max(fresh)
     );
     check(
@@ -3770,6 +3880,11 @@ pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
 /// memory::CREATE_PORTION frames.
 #[cfg(feature = "icount")]
 fn create_ticks(fill: usize) -> Result<u64, &'static str> {
+    create_ticks_with_first(fill).map(|(first, rest)| first.max(rest))
+}
+
+#[cfg(feature = "icount")]
+fn create_ticks_with_first(fill: usize) -> Result<(u64, u64), &'static str> {
     let process = process::create_root(QUOTA, 2 * CHUNK as u32, CEILING);
     let process = process.map_err(|_| "no process")?;
     let c = match thread::create(process, USER_VA, USER_VA, 0, 10, Policy::Fifo) {
@@ -3786,10 +3901,31 @@ fn create_ticks(fill: usize) -> Result<u64, &'static str> {
             let n = Call::MemCreate.number();
             let (first, rest, got) = timed_entries(&c, n, &[DEEP_PAGES * PAGE_SIZE, 0])?;
             c.close(Handle(got[1]))?;
-            Ok(first.max(rest))
+            Ok((first, rest))
         });
     c.release();
     ticks
+}
+
+/// Forces the first mem_create entry to take from a free block of the
+/// allocator's largest order. Other free blocks stay in the test's chain
+/// until the call and its cleanup end.
+#[cfg(feature = "icount")]
+fn high_order_create_ticks() -> Result<u64, &'static str> {
+    let high = frames_alloc(kcore::frames::MAX_ORDER).ok_or("no highest-order block")?;
+    let mut apart = Apart {
+        chain: 0,
+        blocks: [0; APART],
+    };
+    for order in (0..=kcore::frames::MAX_ORDER).rev() {
+        while let Some(pa) = frames_alloc(order) {
+            apart.link(pa, order);
+        }
+    }
+    frames_free(high, kcore::frames::MAX_ORDER);
+    let result = create_ticks_with_first(0).map(|(first, _)| first);
+    apart.rejoin();
+    result
 }
 
 /// Makes call `number` with `args`, then its next entries until it ends,

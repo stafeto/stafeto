@@ -507,6 +507,13 @@ impl<T: Schedulable> Scheduler<T> {
         Decision::Run(next)
     }
 
+    /// Whether a waiting receiver at `level` would be chosen before both
+    /// cleanup and ready threads after the sender blocks.
+    #[inline(always)]
+    pub fn can_hand_off(&self, level: u8, cleanup: Option<u8>) -> bool {
+        cleanup.is_none_or(|top| top < level) && self.ready.top().is_none_or(|top| top < level)
+    }
+
     /// The running thread `r` goes back to the head of its level with the
     /// rest of its quantum; with nothing left, to the tail with a new one,
     /// as at the end of a quantum.
@@ -751,7 +758,7 @@ impl<T: Schedulable> Scheduler<T> {
             "a thread that does not wait takes the CPU"
         );
         assert!(
-            self.ready.top().is_none_or(|top| top < n.priority()),
+            self.can_hand_off(n.priority(), None),
             "a hand-off passes a ready thread"
         );
         n.state = State::Running;
@@ -1709,6 +1716,7 @@ mod tests {
                 continue;
             };
             let (mut fast, r2, _, _) = fast_case(seed).expect("the same draw");
+            assert!(fast.s.can_hand_off(node(r2).priority(), cleanup));
             slow.wake(r);
             assert_eq!(slow.decide(now, cleanup), 'r', "seed {seed:#x}");
             // SAFETY: the world keeps its threads alive; R waits.
@@ -1720,6 +1728,20 @@ mod tests {
             cases > 2_000,
             "only {cases} worlds where the fast path applies"
         );
+    }
+
+    #[test]
+    fn hand_off_yields_to_cleanup_at_or_above_the_receiver() {
+        let mut w = World::new();
+        let receiver = w.started('r', 12, FIFO);
+        assert_eq!(w.pick(0), 'r');
+        w.block();
+        assert!(w.s.can_hand_off(12, Some(11)));
+        assert!(!w.s.can_hand_off(12, Some(12)));
+        assert!(!w.s.can_hand_off(12, Some(13)));
+        w.started('a', 12, FIFO);
+        assert!(!w.s.can_hand_off(12, Some(11)));
+        assert_eq!(node(receiver).state(), State::Waiting);
     }
 
     /// A thread handed the CPU runs with a new quantum from then: a

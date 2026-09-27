@@ -85,6 +85,13 @@ pub(crate) fn call_maxima() -> [u64; abi::KERNEL_CALL_SLOTS] {
     unsafe { (*CALL_TIMING.0.get()).1 }
 }
 
+#[cfg(feature = "icount")]
+pub(crate) fn clear_call_maximum(number: u16) {
+    // SAFETY: the single-core test runs with interrupts masked and no
+    // other dispatch reads this entry while it resets the measurement.
+    unsafe { (*CALL_TIMING.0.get()).1[number as usize] = 0 };
+}
+
 #[cfg(not(feature = "measure"))]
 fn call_maxima() -> [u64; abi::KERNEL_CALL_SLOTS] {
     [0; abi::KERNEL_CALL_SLOTS]

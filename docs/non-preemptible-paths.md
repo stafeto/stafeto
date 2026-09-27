@@ -168,13 +168,25 @@ gives back only its place. From the same part on, a frame that goes back
 to the allocator is two units of work of a chunk, since its free may merge
 free blocks up to the highest order and costs about two releases of a
 handle: the Buffers stage gives back the buffers of 32 threads with no
-handles a chunk, and the Shell stage 32 pages; a thread goes into a chunk
+handles a chunk, and the Shell stage eight pages; a thread goes into a chunk
 of the Buffers stage only when its units fit, so that a chunk does at
 most 64 units. The chunks that give frames back are measured with each
 frame alone in its free block of 4 MiB, which it merges back up to. The
 Buffers chunk is measured with the threads whose units fill it with the
 most handles: eleven threads, ten with four handles on their way and one
 with two, each handle the last copy of a session whose receiver waits.
+
+Part 1.4e adds in-tree `icount` cases for 11 buffers with 42 handles in
+transit, 32 charged shell pages, a 64-thread stop, a first `mem_create`
+from a highest-order free block, and `thread_exit` after closing the last
+channel handle. On 512 MB their measured costs are 5,116, 15,030, 8,368,
+11,368 and 1,032 ticks respectively. The buffer fixture uses resource
+handles; the earlier 20,069-tick bound includes sessions whose
+`CLIENT_GONE` wakes receivers, so it remains the bounding case. The
+shell's former 32-page chunk took 58,634 ticks with test-build poisoning;
+its eight-page chunk takes 15,030. The normal build's null call is 271
+ticks after adding entry-to-poll timing, while the `icount` build's null
+call is 277 ticks with per-call maxima enabled.
 
 The last column holds instruction counts of the kernel built at
 opt-level 2 (spec 14), measured after stage 1.3 (the lines xtask
@@ -191,21 +203,21 @@ bounds in time come from hardware (spec 15.3). An empty cell is a path not
 measured yet. Counts marked "test build" come from the kernel's own tests
 under -icount, whose hooks change the shape of the code. The build that
 ships is measured by the test init under -icount, which prints
-`normal build ticks: null=250 clock=293 yield=360 notify=848
-round_trip=1773`: call 0, `clock_now`, `yield` with no other thread at
+`normal build ticks: null=271 clock=314 yield=384 notify=890
+round_trip=1825`: call 0, `clock_now`, `yield` with no other thread at
 the caller's level, `notify` with the `try_receive` that takes the slot
 back, and a round trip of 8 bytes to a thread of the same process. Both
 sides make raw calls, so the line counts the kernel and not the code of
 `rt` or the profile the test init builds with. The
 kernel test `ipc_round_trip_is_measured` prints the round trip of a
-request in the test build, `ipc round trip ticks: null=248 switch=452
-fast=1895 slow=2093 buffer=2993 handles=4295`: an empty call, one switch between
+request in the test build, `ipc round trip ticks: null=277 switch=493
+fast=1990 slow=2216 buffer=3116 handles=4418`: an empty call, one switch between
 threads of two processes (half of a yield there and back), and a request
 answered by a service of another process that waits in `receive`: on the
 fast path, with the fast path off, with 1024 bytes each way, and with four
 handles each way. The lower bound of a round trip, two switches and one
-empty call, is 1152 there; the fast path saves 198, and the two copies of
-960 bytes cost 900. The chunks of the stages that release handles are
+empty call, is 1263 there; the fast path saves 226, and the two copies of
+960 bytes cost 1126. The chunks of the stages that release handles are
 measured at the costliest unit, where the last copy of a session wakes a
 receiver of its own channel with `CLIENT_GONE`. The kernel test
 `memory_portions_are_measured` prints the longest entries of the long
@@ -242,7 +254,7 @@ window that goes.
 
 | Path | What it does | Estimate | Instructions under -icount |
 |---|---|---|---|
-| entry and exit (`vectors.S`, `handle_exception`, `sched::resume`, `thread::run`) | saves the thread's registers, decodes ESR and the call number, writes the result, polls for pending interrupts, decides who runs, and returns to EL0; every entry pays it, an interrupt too | constant | 250: call 0 from EL0, which fails with `INVALID_ARGS` |
+| entry and exit (`vectors.S`, `handle_exception`, `sched::resume`, `thread::run`) | saves the thread's registers, decodes ESR and the call number, writes the result, polls for pending interrupts, decides who runs, and returns to EL0; every entry pays it, an interrupt too | constant | 271: call 0 from EL0, which fails with `INVALID_ARGS`, in the normal build |
 | `AddressSpace::retire` and `SpaceRelease::step` | `retire` moves `TTBR0` off the tables and drops their TLB entries together with the ASID (`tlbi aside1is`); a step reads up to 512 words of one level 0-2 table and returns at most one table to the allocator, the root last | constant: `retire`; a step: up to 512 reads and one table; `AddressSpace::destroy` (tests, and `process::create` that ran out of pool space, with a single root table) does all steps back to back |  |
 | issuing an ASID (`tlb::switch_to`, `AsidAllocator::activate`) | looks for a free number in the generation map; runs on every `thread::run` into a process whose space has no ASID of the current generation: the space's first run and the first run after a generation change | constant: up to 1024 map words with 16-bit ASIDs, up to 4 with 8-bit |  |
 | ASID generation change (`tlb::switch_to`) | when no free numbers are left: zeroes the number map (8 KB), flushes the TLB (`tlbi vmalle1`), then issues a number as in the row above | constant: zeroing 8 KB, a TLB flush, and issuing a number |  |
@@ -263,7 +275,7 @@ window that goes.
 | a chunk of the Mappings stage (`process::clean`, `maps::release_all`) | every mapping of the process's table, busy or not, leaves it and releases its memory object, whose last reference puts it on the cleanup queue; the block of the table goes back to the pool of blocks | up to 64 mappings at O(1) each | 4,221 (test build): 64 mappings, 62 of them the last references to their objects |
 | a chunk of the Quota stage (`process::clean`) | returns the free part of the quota to the parent (`Account::return_free`) and removes the process from the parent's list of children | constant |  |
 | a chunk of the Notify stage (`process::clean`, `notify_exit`) | if the process has an exit channel, posts bit 0 into the slot in its shell as `notify` does: delivery to a waiting receiver, or enqueuing in the channel's queue, where the slot holds the shell; a closed channel gets nothing | constant: as `notify` |  |
-| a chunk of the Shell stage (`process::clean`) | `PageLog::release_step`: up to 32 pages of the process's pools and of its log go back to the allocator, each returned to the quota (the test build first fills the page with poison); the last chunk returns the shell's slot to the parent's pool, the slot in the exit channel's limit and the reference to that channel, and the rest of the quota to the parent (`Account::return_rest`), and releases the reference to the parent's shell (the last one enqueues it) | up to 32 frames, each through merging free blocks in `FRAMES` up to the highest order; in the test build, also writing 4096 bytes of poison per frame; the rest is constant | 16,042 (test build without its poison): 32 pages, each merging up to the highest order |
+| a chunk of the Shell stage (`process::clean`) | `PageLog::release_step`: up to eight pages of the process's pools and of its log go back to the allocator, each returned to the quota (the test build first fills the page with poison); the last chunk returns the shell's slot to the parent's pool, the slot in the exit channel's limit and the reference to that channel, and the rest of the quota to the parent (`Account::return_rest`), and releases the reference to the parent's shell (the last one enqueues it) | up to eight frames, each through merging free blocks in `FRAMES` up to the highest order; in the test build, also writing 4096 bytes of poison per frame; the rest is constant | 15,030 (test build): eight pages with poison; the former 32-page chunk took 58,634 |
 | the last channel handle with `RECEIVE` (`channel::release`: `handle_close`, the Handles stage) | marks the channel closed; if threads wait in it or slots stand in it, puts the channel at the tail of the cleanup queue at the higher of the level of the cause and the top level of its queue, with the queue's reference (the Close stage) | constant: checking the queue's mask and one enqueue |  |
 | a chunk of the Close stage (`channel::clean`) | heads of the top level of the channel's queue, 32 units of work (below), each under its own hold of the scheduler's lock: the threads waiting in `receive` or in `send`, each of which gets `PEER_CLOSED` in `x0`, goes to the tail of its level with a new quantum, and lets go of what its wait held, the channel or a copy of a session (the last copy posts `CLIENT_GONE`, which a closed channel refuses), and a sender of the handles of its request, up to 4, each released as `handle_close` does; or the slots, each emptied and letting go of its owner after the lock (a session with no copies goes on the cleanup queue); what the heads held goes at the level of the cause; with heads left, the channel goes to the head of the higher of the cause and their new top level, otherwise the queue's reference goes | 32 units of work: a head one, and each handle of a sender's request one more, no costlier than `notify`; up to 32 heads at O(1) each and 34 holds of the lock, or fewer heads with their handles, up to 36 units | 3,844 (test build): the first of the two chunks of a channel with 60 waiting receivers; 10,166 (test build): 8 senders with 32 handles, each the last copy of a session whose `CLIENT_GONE` wakes a receiver; 5,581 when nobody waits, with the copies of the sessions the requests went through |
 | a chunk of the channel shell (`channel::clean`) | returns the channel's slot to the payer's pool of channels (nothing goes back to the quota) and releases the reference to the payer's shell | constant |  |

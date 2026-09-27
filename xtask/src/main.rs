@@ -85,13 +85,15 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// objects at the same place on every run; the ninth measures the path of
 /// an interrupt of a bound line to its driver, and the last the calls and
 /// portions of device windows.
-const ICOUNT_TESTS: [&str; 10] = [
+const ICOUNT_TESTS: [&str; 12] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
+    "teardown_portions_are_measured",
     "timer_firing_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "teardown_yields_to_a_pending_interrupt",
+    "thread_exit_after_channel_close_is_measured",
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
@@ -102,8 +104,9 @@ const ICOUNT_TESTS: [&str; 10] = [
 const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
 /// The rows of the line of `memory_portions_are_measured`, in its order
 /// (spec 15.3).
-const MEMORY_PORTION_ROWS: [&str; 8] = [
+const MEMORY_PORTION_ROWS: [&str; 9] = [
     "create",
+    "create_high",
     "map",
     "map_exec",
     "unmap",
@@ -2575,16 +2578,16 @@ mod tests {
         assert!(ticks_of(&[], what, &ROUND_TRIP_ROWS).is_err());
     }
 
-    /// The line of the portions of memory objects gives its eight rows in
+    /// The line of the portions of memory objects gives its nine rows in
     /// order, and the round trip's does not pass for it.
     #[test]
-    fn memory_portions_line_gives_eight_rows() {
+    fn memory_portions_line_gives_nine_rows() {
         let what = "memory portions";
-        let line = "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 \
-                    protect_exec=6 release=7 first_map=8";
+        let line = "memory portions ticks: create=1 create_high=2 map=3 map_exec=4 unmap=5 protect=6 \
+                    protect_exec=7 release=8 first_map=9";
         let lines = [line.to_string()];
         let ticks = ticks_of(&lines, what, &MEMORY_PORTION_ROWS);
-        assert_eq!(ticks, Ok((1..=8).collect()));
+        assert_eq!(ticks, Ok((1..=9).collect()));
         for bad in [
             "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7",
             "memory portions ticks: map=2 create=1 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7 first_map=8",
