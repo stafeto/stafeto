@@ -28,6 +28,7 @@ static int error(int64_t value) {
         case 300: errno = ENOENT; break;
         case 301: errno = EBADF; break;
         case 303: errno = ENOSPC; break;
+        case 307: errno = EMFILE; break;
         default: errno = EIO; break;
     }
     return -1;

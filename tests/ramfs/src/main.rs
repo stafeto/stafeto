@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use posix_fs::{FileKind, FsError, PosixFs, SeekFrom};
+use posix_fs::{DescriptorFlags, FileKind, FsError, OPEN_MAX, PosixFs, SeekFrom};
 use posix_path::{MAX_PATH, PathState};
 use proto_fs::{BAD_FD, NO_ENTRY, READ_ONLY, READ_WRITE};
 use proto_wire::Status;
@@ -100,6 +100,8 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     fs.close(fd).map_err(|_| "close scratch")?;
     check_posix(parent)?;
     check_seek(parent)?;
+    check_duplicates(parent)?;
+    check_descriptor_limit(parent)?;
     Ok(())
 }
 
@@ -167,7 +169,7 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
 }
 
 fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
-    let posix = PosixFs::connect(parent).map_err(|_| "connect seek")?;
+    let mut posix = PosixFs::connect(parent).map_err(|_| "connect seek")?;
     let fd = posix
         .open(b"/tmp/probe", READ_WRITE)
         .map_err(|_| "open seek")?;
@@ -224,5 +226,155 @@ fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static s
     }
     posix.close(read).map_err(|_| "close read only")?;
     posix.close(write).map_err(|_| "close write only")?;
+    Ok(())
+}
+
+fn check_duplicates(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
+    let mut fs = PosixFs::connect(parent).map_err(|_| "dup connect")?;
+    if fs.fstat(1).map_err(|_| "console stat")?.kind != FileKind::Character
+        || fs.lseek(1, 0, SeekFrom::Start) != Err(FsError::NotSeekable)
+        || fs.read(1, &mut []) != Err(FsError::BadFileDescriptor)
+        || fs.write(0, b"") != Err(FsError::BadFileDescriptor)
+    {
+        return Err("console descriptor semantics");
+    }
+    let original = fs.open(b"/etc/motd", READ_ONLY).map_err(|_| "dup open")?;
+    let flags = DescriptorFlags {
+        close_on_exec: true,
+        close_on_fork: true,
+    };
+    fs.set_descriptor_flags(original, flags)
+        .map_err(|_| "set descriptor flags")?;
+    let copy = fs.dup(original).map_err(|_| "dup")?;
+    let independent = fs
+        .open(b"/etc/motd", READ_ONLY)
+        .map_err(|_| "independent open")?;
+    if (original, copy, independent) != (3, 4, 5)
+        || fs.descriptor_flags(copy) != Ok(DescriptorFlags::default())
+        || fs.descriptor_flags(original) != Ok(flags)
+    {
+        return Err("descriptor allocation and flags");
+    }
+    if fs.write(copy, b"x") != Err(FsError::BadFileDescriptor) {
+        return Err("dup preserves read-only access mode");
+    }
+    let mut bytes = [0; 8];
+    if fs.read(original, &mut bytes[..3]) != Ok(3)
+        || &bytes[..3] != b"sta"
+        || fs.read(copy, &mut bytes[..4]) != Ok(4)
+        || &bytes[..4] != b"feto"
+        || fs.lseek(copy, 0, SeekFrom::Start) != Ok(0)
+        || fs.read(original, &mut bytes[..1]) != Ok(1)
+        || bytes[0] != b's'
+        || fs.read(independent, &mut bytes[..1]) != Ok(1)
+        || bytes[0] != b's'
+    {
+        return Err("dup shares offset; open has its own");
+    }
+    if fs.dup2(original, original) != Ok(original)
+        || fs.descriptor_flags(original) != Ok(flags)
+        || fs.dup3(original, original, flags) != Err(FsError::InvalidArgument)
+        || fs.dup2(99, independent) != Err(FsError::BadFileDescriptor)
+        || fs.read(independent, &mut bytes[..1]) != Ok(1)
+        || bytes[0] != b't'
+    {
+        return Err("dup2 invalid source and same descriptor");
+    }
+    if fs.dup3(original, independent, flags) != Ok(independent)
+        || fs.descriptor_flags(independent) != Ok(flags)
+        || fs.dup2(original, independent) != Ok(independent)
+        || fs.descriptor_flags(independent) != Ok(DescriptorFlags::default())
+    {
+        return Err("dup3 flags and dup2 clearing");
+    }
+    fs.close(original).map_err(|_| "close original")?;
+    if fs.read(original, &mut []) != Err(FsError::BadFileDescriptor)
+        || fs.read(copy, &mut bytes[..2]) != Ok(2)
+        || &bytes[..2] != b"ta"
+    {
+        return Err("duplicate survives source close");
+    }
+    fs.close(independent).map_err(|_| "close replacement")?;
+    fs.close(copy).map_err(|_| "close final copy")?;
+    // Repeated replacement must release the old service description each time.
+    let target = fs
+        .open(b"/etc/motd", READ_ONLY)
+        .map_err(|_| "open replacement target")?;
+    for _ in 0..64 {
+        let source = fs
+            .open(b"/etc/motd", READ_ONLY)
+            .map_err(|_| "replacement leaked backend")?;
+        fs.dup2(source, target).map_err(|_| "replace backend")?;
+        fs.close(source).map_err(|_| "close replacement source")?;
+    }
+    fs.close(target).map_err(|_| "close final target")?;
+    let saved = fs.dup(1).map_err(|_| "save stdout")?;
+    let file = fs
+        .open(b"/tmp/probe", READ_WRITE)
+        .map_err(|_| "open redirection")?;
+    fs.dup2(file, 1).map_err(|_| "redirect stdout")?;
+    fs.close(file).map_err(|_| "close redirection source")?;
+    if fs.write(1, b"redirect") != Ok(8) || fs.fstat(1).map_err(|_| "redirect stat")?.size != 8 {
+        return Err("redirected stdout writes file");
+    }
+    fs.lseek(1, 0, SeekFrom::Start)
+        .map_err(|_| "redirect rewind")?;
+    if fs.read(1, &mut bytes) != Ok(8) || &bytes != b"redirect" {
+        return Err("redirect contents");
+    }
+    fs.dup2(saved, 1).map_err(|_| "restore stdout")?;
+    fs.close(saved).map_err(|_| "close saved stdout")?;
+    let marker = b"ramfs-probe: restored stdout ok\n";
+    if fs.write(1, marker) != Ok(marker.len()) {
+        return Err("restored console output");
+    }
+    fs.close(0).map_err(|_| "close stdin")?;
+    let zero = fs
+        .open(b"/etc/motd", READ_ONLY)
+        .map_err(|_| "open descriptor zero")?;
+    if zero != 0 || fs.read(zero, &mut bytes[..1]) != Ok(1) || bytes[0] != b's' {
+        return Err("file at descriptor zero");
+    }
+    fs.close(zero).map_err(|_| "close descriptor zero")?;
+    Ok(())
+}
+
+fn check_descriptor_limit(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
+    let mut fs = PosixFs::connect(parent).map_err(|_| "limit connect")?;
+    let source = fs.open(b"/etc/motd", READ_ONLY).map_err(|_| "limit open")?;
+    for expected in 4..OPEN_MAX as u32 {
+        if fs.dup(source) != Ok(expected) {
+            return Err("dup limit allocation");
+        }
+    }
+    if fs.dup(source) != Err(FsError::TooManyOpenFiles)
+        || fs.open(b"/etc/motd", READ_ONLY) != Err(FsError::TooManyOpenFiles)
+        || fs.dup2(source, OPEN_MAX as u32) != Err(FsError::BadFileDescriptor)
+    {
+        return Err("descriptor exhaustion");
+    }
+    for fd in 4..OPEN_MAX as u32 {
+        fs.close(fd).map_err(|_| "close limit duplicate")?;
+    }
+    let fresh = fs
+        .open(b"/etc/motd", READ_ONLY)
+        .map_err(|_| "reuse descriptor")?;
+    if fresh != 4 || fs.read(source, &mut [0; 1]) != Ok(1) {
+        return Err("limit recovery preserves open description");
+    }
+    fs.close(fresh).map_err(|_| "close fresh")?;
+    fs.close(source).map_err(|_| "close limit source")?;
+    // The advertised local bound must also be reachable with distinct opens.
+    for expected in 3..OPEN_MAX as u32 {
+        if fs.open(b"/etc/motd", READ_ONLY) != Ok(expected) {
+            return Err("distinct open descriptions reach local bound");
+        }
+    }
+    if fs.open(b"/etc/motd", READ_ONLY) != Err(FsError::TooManyOpenFiles) {
+        return Err("distinct open descriptor exhaustion");
+    }
+    for fd in 3..OPEN_MAX as u32 {
+        fs.close(fd).map_err(|_| "close distinct description")?;
+    }
     Ok(())
 }

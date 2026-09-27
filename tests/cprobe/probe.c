@@ -22,6 +22,18 @@ int c_probe(void) {
     if (fstat(fd, &st) != 0 || st.st_size != 3 || !S_ISREG(st.st_mode)) return 6;
     if (lseek(fd, 0, SEEK_SET) != 0 || read(fd, text, 3) != 3 || memcmp(text, "aZc", 3) != 0) return 7;
     if (close(fd) != 0) return 8;
+    /* Check the RAM session's bounded description limit and errno mapping. */
+    int held[32];
+    for (size_t i = 0; i < 32; i++) {
+        held[i] = open("/etc/motd", O_RDONLY);
+        if (held[i] < 0) return 9;
+    }
+    if (open("/etc/motd", O_RDONLY) != -1 || errno != EMFILE) return 10;
+    for (size_t i = 0; i < 32; i++) {
+        if (close(held[i]) != 0) return 11;
+    }
+    fd = open("/etc/motd", O_RDONLY);
+    if (fd < 0 || close(fd) != 0) return 12;
     printf("cprobe: Picolibc file IO ok\n");
     fflush(stdout);
     return 0;
