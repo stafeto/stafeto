@@ -20,7 +20,7 @@ ARCHIVE = WORK / f"busybox-{VERSION}.tar.bz2"
 COMPAT = ROOT / "tools" / "busybox" / "compat"
 LOG = WORK / "build.log"
 STAMP = WORK / "config"
-PATCH = "echo cat ash picolibc-v5"
+PATCH = "echo cat ash ls-nofork picolibc-v12"
 OBJECTS = (
     "appletlib.o", "xfuncs_printf.o", "xfuncs.o", "full_write.o",
     "process_escape_sequence.o", "ptr_to_globals.o", "messages.o",
@@ -33,6 +33,10 @@ OBJECTS = (
     "parse_mode.o", "time.o", "signals.o", "read_printf.o",
     "u_signal_names.o",
     "safe_poll.o",
+    "common_bufsiz.o", "concat_path_file.o", "printable_string.o",
+    "xreadlink.o", "mode_string.o",
+    "last_char_is.o", "auto_string.o",
+    "vfork_daemon_rexec.o",
 )
 
 
@@ -87,12 +91,17 @@ def main() -> None:
             " || defined _NEWLIB_VERSION\n# include <features.h>",
             "\n# include <features.h>")
     replace(SOURCE / "include/libbb.h", '#include "platform.h"',
-            '#include "platform.h"\n#ifdef _NEWLIB_VERSION\n'
+            '#include "platform.h"\n#undef HAVE_PRINTF_PERCENTM\n#ifdef _NEWLIB_VERSION\n'
             '#undef HAVE_UNLOCKED_STDIO\n#undef HAVE_UNLOCKED_LINE_OPS\n#endif')
     replace(SOURCE / "include/libbb.h", "#include <stdlib.h>",
             "#include <stdlib.h>\n#define utoa bb_utoa\n#define itoa bb_itoa")
     replace(SOURCE / "libbb/xfuncs_printf.c", "return fflush(NULL);",
             "return fflush(stdout) | fflush(stderr);")
+    replace(SOURCE / "coreutils/ls.c",
+            "APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)",
+            "APPLET_NOFORK(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)")
+    replace(SOURCE / "shell/ash.c", '#include "NUM_APPLETS.h"',
+            '#include "NUM_APPLETS.h"\nextern int clearenv(void);')
     kbuild = SOURCE / "libbb/Kbuild.src"
     lines = [line for line in kbuild.read_text().splitlines()
              if not line.startswith("lib-y +=")]
@@ -106,8 +115,17 @@ def main() -> None:
     config = SOURCE / ".config"
     replace(config, "# CONFIG_ECHO is not set", "CONFIG_ECHO=y")
     replace(config, "# CONFIG_CAT is not set", "CONFIG_CAT=y")
+    replace(config, "# CONFIG_LS is not set", "CONFIG_LS=y")
+    replace(config, "# CONFIG_SHOW_USAGE is not set", "CONFIG_SHOW_USAGE=y")
+    replace(config, "# CONFIG_FEATURE_VERBOSE_USAGE is not set",
+            "CONFIG_FEATURE_VERBOSE_USAGE=y")
+    replace(config, "# CONFIG_FEATURE_CLEAN_UP is not set", "CONFIG_FEATURE_CLEAN_UP=y")
     replace(config, "# CONFIG_ASH is not set", "CONFIG_ASH=y")
     replace(config, "# CONFIG_ASH_ECHO is not set", "CONFIG_ASH_ECHO=y")
+    replace(config, "# CONFIG_FEATURE_SH_STANDALONE is not set",
+            "CONFIG_FEATURE_SH_STANDALONE=y")
+    replace(config, "# CONFIG_FEATURE_SH_NOFORK is not set",
+            "CONFIG_FEATURE_SH_NOFORK=y")
     replace(config, "# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
     replace(config, "CONFIG_SH_IS_ASH=y", "# CONFIG_SH_IS_ASH is not set")
     replace(config, "# CONFIG_SH_IS_NONE is not set", "CONFIG_SH_IS_NONE=y")

@@ -13,7 +13,9 @@ because the selected Picolibc build faults on `fflush(NULL)` after the
 script has already run.
 
 `tests/busybox/ash_os.c` supplies the limited single-process environment
-for this probe. The root directory and process credentials are fixed.
+for this probe. Process credentials are fixed. The POSIX bridge keeps a
+working directory for relative paths and supports `cd`, `pwd`, and `ls`
+over the RAM file service.
 Process creation, waiting, pipes, descriptor duplication, signals,
 terminal controls, globbing, and resource limits return an explicit
 unsupported error. The first image verifies parsing and execution of
@@ -29,3 +31,10 @@ wait for external commands.
 
 For a manual session, use `cargo xtask ash-shell`. Type `exit` to leave
 `ash`, then press Ctrl-A followed by X to quit QEMU.
+
+The pinned BusyBox build also exposes `ls` to `ash` as an in-process
+applet. `cargo xtask ash-dialog` checks `ls /`, `ls /etc`, `ls -la`,
+`ls --help`, `cd etc`, a missing path, and shell recovery after errors.
+This path runs without `fork`; launching a separate ELF program still
+needs a runtime process service. The UART input is byte-oriented, so
+arrow-key editing and terminal control remain future work.

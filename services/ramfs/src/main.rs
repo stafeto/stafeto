@@ -9,7 +9,7 @@
 use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION, valid_path};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use ramfs::{Fds, Ram};
+use ramfs::{Fds, Ram, directory_entry};
 use rt::handle::{Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
@@ -158,6 +158,29 @@ impl Service<0> for Fs {
                 }
                 match s.data.close(fd) {
                     Ok(()) => Answer::Status(Status::Ok),
+                    Err(code) => status(code),
+                }
+            }
+            Some(Method::ReadDir) => {
+                let Ok(index) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Ok(path) = body.bytes(body.left()).and_then(valid_path) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match directory_entry(path, index) {
+                    Ok(entry) => {
+                        let (name, kind) = entry.unwrap_or(("", 0));
+                        let w = r.reply();
+                        if w.u32(0)
+                            .and_then(|()| w.u32(kind))
+                            .and_then(|()| w.bytes(name.as_bytes()))
+                            .is_err()
+                        {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
                     Err(code) => status(code),
                 }
             }

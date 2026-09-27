@@ -199,6 +199,40 @@ impl Files {
         self.number(Method::Stat, fd, None)
     }
 
+    /// Read one directory entry by index. Kind 1 is a directory, 2 a file.
+    pub fn read_dir(
+        &self,
+        path: &str,
+        index: u32,
+        out: &mut [u8],
+    ) -> Result<Option<(usize, u32)>, Status> {
+        valid_path(path.as_bytes())?;
+        let mut w = Writer::new();
+        Method::ReadDir.header().write(&mut w)?;
+        w.u32(index)?;
+        w.bytes(path.as_bytes())?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let kind = r.u32()?;
+        let name = r.bytes(r.left())?;
+        if kind == 0 {
+            return if name.is_empty() {
+                Ok(None)
+            } else {
+                Err(Status::BadSize)
+            };
+        }
+        if !(1..=2).contains(&kind) || name.is_empty() || name.len() > out.len() {
+            return Err(Status::BadSize);
+        }
+        out[..name.len()].copy_from_slice(name);
+        Ok(Some((name.len(), kind)))
+    }
+
     pub fn close(&self, fd: u32) -> Result<(), Status> {
         let mut w = Writer::new();
         Method::Close.header().write(&mut w)?;

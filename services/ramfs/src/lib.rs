@@ -13,6 +13,19 @@ const FILE_CAPACITY: usize = 1024;
 const OPEN_MAX: usize = 8;
 const MOTD: &[u8] = b"stafeto ramfs\n";
 
+pub const DIR: u32 = 1;
+pub const REG: u32 = 2;
+
+pub fn directory_entry(path: &str, index: u32) -> Result<Option<(&'static str, u32)>, u32> {
+    let entries: &[(&str, u32)] = match path {
+        "/" => &[(".", DIR), ("..", DIR), ("etc", DIR), ("tmp", DIR)],
+        "/etc" => &[(".", DIR), ("..", DIR), ("motd", REG)],
+        "/tmp" => &[(".", DIR), ("..", DIR), ("probe", REG)],
+        _ => return Err(NO_ENTRY),
+    };
+    Ok(entries.get(index as usize).copied())
+}
+
 #[derive(Clone, Copy)]
 enum File {
     Motd,
@@ -149,6 +162,18 @@ impl Ram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_entries_match_files_and_end_cleanly() {
+        assert_eq!(directory_entry("/", 0), Ok(Some((".", DIR))));
+        assert_eq!(directory_entry("/", 1), Ok(Some(("..", DIR))));
+        assert_eq!(directory_entry("/", 2), Ok(Some(("etc", DIR))));
+        assert_eq!(directory_entry("/", 3), Ok(Some(("tmp", DIR))));
+        assert_eq!(directory_entry("/", 4), Ok(None));
+        assert_eq!(directory_entry("/etc", 2), Ok(Some(("motd", REG))));
+        assert_eq!(directory_entry("/tmp", 2), Ok(Some(("probe", REG))));
+        assert_eq!(directory_entry("/missing", 0), Err(NO_ENTRY));
+    }
 
     #[test]
     fn sessions_have_independent_offsets_and_close_invalidates_fd() {

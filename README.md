@@ -139,7 +139,7 @@ kernel image stays under 200 KB.
 
 | # | Subproject | State |
 |---|---|---|
-| 2 | Name space and services: in-memory file system, virtio disk, programs from disk, a libc-like library, partial POSIX | 🚧 |
+| 2 | Name space and services: in-memory file system, virtio disk, programs from disk, and a Rust POSIX library with a C ABI | 🚧 |
 | 3 | Graphics and input: virtio-gpu, touch input, compositor | ⬜ |
 | 4 | Phone shell: home screen, notifications, settings, UI toolkit | ⬜ |
 | 5 | Packages: package format, signatures, installing from any source, app sandbox | ⬜ |
@@ -153,7 +153,8 @@ kernel image stays under 200 KB.
 | Virtual console | Boot to the shell on Apple Silicon through Virtualization.framework with `cargo xtask vz`; QEMU and HVF remain test platforms. | ✅ [#21](https://github.com/stafeto/stafeto/pull/21) |
 | File groundwork | Read an e2fsprogs ext4 image in a guest with `cargo xtask ext4ro`; exercise RAM file descriptors and static Picolibc I/O with `cargo xtask ramfs` and `cargo xtask cprobe`. | ✅ [#23](https://github.com/stafeto/stafeto/pull/23), [#24](https://github.com/stafeto/stafeto/pull/24) |
 | BusyBox shell | Run `cat` and an `ash` builtin script from boot images, then type `echo` and `exit` at an interactive `ash` prompt through the UART service. | ✅ [#24](https://github.com/stafeto/stafeto/pull/24), [#26](https://github.com/stafeto/stafeto/pull/26), [#27](https://github.com/stafeto/stafeto/pull/27) |
-| First external utility | Add `ls` to the pinned BusyBox build, directory enumeration and file metadata to the file service, then let `ash` start and wait for a static ELF utility. | ⬜ |
+| Directory utility | Run BusyBox `ls` over RAM files, including `ls -la` and `ls --help` from the interactive `ash` prompt. | ✅ [#28](https://github.com/stafeto/stafeto/pull/28) |
+| External programs | Load a static ELF from a file service and let `ash` start it, pass arguments and descriptors, and wait for its exit status. | ⬜ |
 | Shell composition | Add descriptor duplication, redirection, pipes, and the signal behavior needed for pipelines and exit status. | ⬜ |
 | Persistent files | Read ext4 through a Virtio block service, then qualify writes with `e2fsck` after normal and interrupted runs. Keep RAM files available for tests. | ⬜ |
 | Integrated userland | Boot `ash` and a small set of BusyBox utilities from storage on QEMU and Apple Virtualization.framework; check commands, redirection, pipelines, and exit status. | ⬜ |
@@ -161,6 +162,47 @@ kernel image stays under 200 KB.
 Program launch and block storage can proceed independently after the
 interactive shell check. An ext4 implementation becomes writable only
 after the recovery checks pass.
+
+#### Userland layers
+
+The kernel supplies isolation, scheduling, memory, handles, and IPC. A
+process service should use the existing `rt` ELF loader to start programs
+after boot and report exits. File, namespace, and terminal services own
+paths, descriptors, and interactive I/O. The target is a Rust POSIX
+implementation exporting a stable C ABI above those services. The current
+Picolibc build and small C hooks bootstrap BusyBox while that Rust
+implementation is built.
+
+Build upstream packages against a versioned AArch64 stafeto sysroot with
+headers, the Rust C-ABI library, startup code, and port patches. Keep one pinned source
+and patch manifest in `tools/`, then stage selected binaries and data into
+a root image. The current Picolibc and BusyBox build scripts are the first
+two package recipes; Picolibc is retired when the Rust library supports
+their required interfaces. This lets more utilities share one build
+interface without copying their source into the kernel.
+
+#### Rust POSIX implementation
+
+The target is the full mandatory POSIX.1-2024 interface and its shell and
+utilities, implemented in Rust with C-compatible entry points. Track
+optional interface groups separately. The current Picolibc bridge covers
+basic file calls and standard streams only. Each step below needs guest
+checks for successful calls, failures, and ABI layout.
+
+| Step | Interface and guest check | State |
+|---|---|---|
+| Rust library foundation | Define the C ABI, generated headers, `errno`, allocator, startup, thread-local storage, and a versioned sysroot; link a C probe without Picolibc. | ⬜ |
+| Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
+| Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
+| Shell I/O | Add `dup`/`dup2`, inherited descriptors, pipes, and redirection; verify `ash` pipelines and file output. | ⬜ |
+| Terminal input | Add a terminal service with line discipline, `termios`, window size, and BusyBox line editing; verify backspace, arrows, history, and Ctrl-C. | ⬜ |
+| Remaining interfaces | Add threads, signals, time, process control, sockets, permissions, and required utility behavior; publish a feature and option matrix. | ⬜ |
+| Conformance checks | Run API, shell, and utility suites on QEMU and Apple Virtualization.framework; record every remaining standard requirement and fix failures. | ⬜ |
+
+`ls` is a BusyBox utility. Its current in-shell path uses BusyBox's
+single-process applet mode; other external programs still need the
+process service. A claim of full support follows the conformance matrix,
+not the first successful BusyBox build.
 
 Multi-core support is a separate subproject; its place in the order will be
 decided after subproject 3.
@@ -189,8 +231,9 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |
-| `cargo xtask ash-shell` | opens an interactive BusyBox `ash` on the QEMU UART; type `exit` to leave the shell, then Ctrl-A, X to quit QEMU |
-| `cargo xtask ash-dialog` | types `echo` and `exit` into BusyBox `ash` through the UART service in QEMU |
+| `cargo xtask ash-shell` | opens BusyBox `ash` on the QEMU UART; `ls /` and `ls -la` work, `exit` leaves the shell, and Ctrl-A, X quits QEMU |
+| `cargo xtask ash-dialog` | checks `echo`, `ls`, missing paths, and `exit` at the `ash` prompt in QEMU |
+| `cargo xtask ls` | runs BusyBox `ls` against the RAM file service in a separate QEMU image |
 | `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |

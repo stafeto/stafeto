@@ -6,8 +6,12 @@
 #![no_std]
 #![no_main]
 
-#[cfg(all(feature = "ash-probe", feature = "ash-interactive"))]
-compile_error!("choose one ash probe");
+#[cfg(any(
+    all(feature = "ash-probe", feature = "ash-interactive"),
+    all(feature = "ash-probe", feature = "ls-probe"),
+    all(feature = "ash-interactive", feature = "ls-probe")
+))]
+compile_error!("choose one BusyBox probe");
 
 use core::ffi::{c_char, c_int};
 use rt::handle::Resource;
@@ -33,14 +37,18 @@ fn main(_: u64) -> u64 {
     if connected.is_err() {
         return 2;
     }
-    #[cfg(not(any(feature = "ash-probe", feature = "ash-interactive")))]
+    #[cfg(not(any(
+        feature = "ash-probe",
+        feature = "ash-interactive",
+        feature = "ls-probe"
+    )))]
     let argv = [
         c"busybox".as_ptr(),
         c"cat".as_ptr(),
         c"/etc/motd".as_ptr(),
         core::ptr::null(),
     ];
-    #[cfg(all(feature = "ash-probe", not(feature = "ash-interactive")))]
+    #[cfg(feature = "ash-probe")]
     let argv = [
         c"busybox".as_ptr(),
         c"ash".as_ptr(),
@@ -53,6 +61,15 @@ fn main(_: u64) -> u64 {
         c"busybox".as_ptr(),
         c"ash".as_ptr(),
         c"-i".as_ptr(),
+        core::ptr::null(),
+    ];
+    #[cfg(feature = "ls-probe")]
+    let argv = [
+        c"busybox".as_ptr(),
+        c"ls".as_ptr(),
+        c"-1".as_ptr(),
+        c"/".as_ptr(),
+        c"/etc".as_ptr(),
         core::ptr::null(),
     ];
     // SAFETY: BusyBox and Picolibc are statically linked; argv has
