@@ -37,7 +37,7 @@ enum File {
 #[derive(Clone, Copy)]
 struct Open {
     file: File,
-    offset: usize,
+    offset: i64,
     flags: u32,
 }
 
@@ -99,7 +99,7 @@ impl Fds {
 
     pub fn seek(&mut self, fd: u32, offset: u32) -> Result<u32, u32> {
         let open = self.get_mut(fd)?;
-        open.offset = offset as usize;
+        open.offset = i64::from(offset);
         Ok(offset)
     }
 }
@@ -140,34 +140,75 @@ impl Ram {
         Ok(self.bytes(fds.get(fd)?.file).len() as u32)
     }
 
+    /// Reposition one open description without extending its file. RAM files
+    /// expose a single data extent and the required virtual hole at EOF.
+    pub fn seek_from(
+        &self,
+        fds: &mut Fds,
+        fd: u32,
+        offset: i64,
+        origin: proto_fs::SeekFrom,
+    ) -> Result<i64, u32> {
+        use proto_fs::{INVALID_ARGUMENT, NO_DATA, OFFSET_OVERFLOW, SeekFrom};
+        let open = fds.get_mut(fd)?;
+        let size = self.bytes(open.file).len() as i64;
+        let next = match origin {
+            SeekFrom::Start => offset,
+            SeekFrom::Current => open.offset.checked_add(offset).ok_or(OFFSET_OVERFLOW)?,
+            SeekFrom::End => size.checked_add(offset).ok_or(OFFSET_OVERFLOW)?,
+            SeekFrom::Data | SeekFrom::Hole => {
+                if offset < 0 {
+                    return Err(INVALID_ARGUMENT);
+                }
+                if offset >= size {
+                    return Err(NO_DATA);
+                }
+                if origin == SeekFrom::Data {
+                    offset
+                } else {
+                    size
+                }
+            }
+        };
+        if next < 0 {
+            return Err(INVALID_ARGUMENT);
+        }
+        open.offset = next;
+        Ok(next)
+    }
+
     pub fn read(&self, fds: &mut Fds, fd: u32, out: &mut [u8]) -> Result<usize, u32> {
         let open = fds.get_mut(fd)?;
         if open.flags == WRITE_ONLY {
-            return Err(proto_wire::BAD_SIZE);
+            return Err(BAD_FD);
         }
         let bytes = self.bytes(open.file);
-        let start = open.offset.min(bytes.len());
+        let start = open.offset.min(bytes.len() as i64) as usize;
         let n = out.len().min(bytes.len() - start);
         out[..n].copy_from_slice(&bytes[start..start + n]);
-        open.offset = open.offset.saturating_add(n);
+        open.offset += n as i64;
         Ok(n)
     }
 
     pub fn write(&mut self, fds: &mut Fds, fd: u32, bytes: &[u8]) -> Result<usize, u32> {
         let open = fds.get_mut(fd)?;
         if open.flags == READ_ONLY || matches!(open.file, File::Motd) {
-            return Err(proto_wire::BAD_SIZE);
+            return Err(BAD_FD);
         }
-        let end = open.offset.checked_add(bytes.len()).ok_or(NO_SPACE)?;
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let offset = usize::try_from(open.offset).map_err(|_| NO_SPACE)?;
+        let end = offset.checked_add(bytes.len()).ok_or(NO_SPACE)?;
         if end > FILE_CAPACITY {
             return Err(NO_SPACE);
         }
-        if open.offset > self.len {
-            self.scratch[self.len..open.offset].fill(0);
+        if offset > self.len {
+            self.scratch[self.len..offset].fill(0);
         }
-        self.scratch[open.offset..end].copy_from_slice(bytes);
+        self.scratch[offset..end].copy_from_slice(bytes);
         self.len = self.len.max(end);
-        open.offset = end;
+        open.offset = end as i64;
         Ok(bytes.len())
     }
 }
@@ -225,6 +266,81 @@ mod tests {
         assert_eq!(a.close(fa), Ok(()));
         assert_eq!(ram.read(&mut a, fa, &mut out), Err(BAD_FD));
         assert_eq!(ram.size(&b, fb), Ok(MOTD.len() as u32));
+    }
+
+    #[test]
+    fn seek_origins_and_failures_preserve_offset_and_size() {
+        use proto_fs::{INVALID_ARGUMENT, NO_DATA, OFFSET_OVERFLOW, SeekFrom::*};
+        let mut ram = Ram::default();
+        let mut fds = Fds::default();
+        let fd = fds.open("/tmp/probe", READ_WRITE).unwrap();
+        ram.write(&mut fds, fd, b"abc").unwrap();
+        assert_eq!(ram.seek_from(&mut fds, fd, -1, End), Ok(2));
+        assert_eq!(ram.seek_from(&mut fds, fd, -1, Current), Ok(1));
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, -2, Current),
+            Err(INVALID_ARGUMENT)
+        );
+        assert_eq!(ram.seek_from(&mut fds, fd, 0, Current), Ok(1));
+        assert_eq!(ram.seek_from(&mut fds, fd, 1, Data), Ok(1));
+        assert_eq!(ram.seek_from(&mut fds, fd, 1, Hole), Ok(3));
+        assert_eq!(ram.seek_from(&mut fds, fd, 3, Data), Err(NO_DATA));
+        assert_eq!(ram.seek_from(&mut fds, fd, 3, Hole), Err(NO_DATA));
+        assert_eq!(ram.seek_from(&mut fds, fd, -1, Hole), Err(INVALID_ARGUMENT));
+        assert_eq!(ram.seek_from(&mut fds, fd, 0, Current), Ok(3));
+        assert_eq!(ram.seek_from(&mut fds, fd, i64::MAX, Start), Ok(i64::MAX));
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, 1, Current),
+            Err(OFFSET_OVERFLOW)
+        );
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, i64::MAX, End),
+            Err(OFFSET_OVERFLOW)
+        );
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, -1, Start),
+            Err(INVALID_ARGUMENT)
+        );
+        assert_eq!(ram.seek_from(&mut fds, fd, 0, Current), Ok(i64::MAX));
+        assert_eq!(ram.size(&fds, fd), Ok(3));
+        assert_eq!(ram.read(&mut fds, fd, &mut [0; 1]), Ok(0));
+        assert_eq!(ram.write(&mut fds, fd, b"x"), Err(NO_SPACE));
+        assert_eq!(ram.write(&mut fds, fd, b""), Ok(0));
+        assert_eq!(ram.size(&fds, fd), Ok(3));
+        assert_eq!(ram.seek_from(&mut fds, fd, 7, Start), Ok(7));
+        assert_eq!(ram.write(&mut fds, fd, b"z"), Ok(1));
+        assert_eq!(ram.seek_from(&mut fds, fd, 0, Start), Ok(0));
+        let mut bytes = [0; 8];
+        assert_eq!(ram.read(&mut fds, fd, &mut bytes), Ok(8));
+        assert_eq!(&bytes, b"abc\0\0\0\0z");
+        // RAM reports a single data extent even when it contains zero bytes.
+        assert_eq!(ram.seek_from(&mut fds, fd, 4, Data), Ok(4));
+        assert_eq!(ram.seek_from(&mut fds, fd, 4, Hole), Ok(8));
+        fds.close(fd).unwrap();
+        assert_eq!(ram.seek_from(&mut fds, fd, 0, Start), Err(BAD_FD));
+    }
+
+    #[test]
+    fn zero_io_checks_access_without_modifying_files_or_offsets() {
+        let mut ram = Ram::default();
+        let mut fds = Fds::default();
+        let read = fds.open("/etc/motd", READ_ONLY).unwrap();
+        let write = fds.open("/tmp/probe", WRITE_ONLY).unwrap();
+        assert_eq!(ram.read(&mut fds, write, &mut []), Err(BAD_FD));
+        assert_eq!(ram.write(&mut fds, read, b""), Err(BAD_FD));
+        assert_eq!(ram.read(&mut fds, 99, &mut []), Err(BAD_FD));
+        assert_eq!(ram.write(&mut fds, 99, b""), Err(BAD_FD));
+        fds.seek(write, 100).unwrap();
+        assert_eq!(ram.write(&mut fds, write, b""), Ok(0));
+        assert_eq!(ram.size(&fds, write), Ok(0));
+        assert_eq!(
+            ram.seek_from(&mut fds, write, 0, proto_fs::SeekFrom::Current),
+            Ok(100)
+        );
+        assert_eq!(ram.read(&mut fds, read, &mut []), Ok(0));
+        let mut first = [0; 1];
+        assert_eq!(ram.read(&mut fds, read, &mut first), Ok(1));
+        assert_eq!(&first, b"s");
     }
 
     #[test]

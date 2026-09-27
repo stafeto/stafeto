@@ -6,7 +6,7 @@
 #![no_std]
 #![no_main]
 
-use posix_fs::{FileKind, FsError, PosixFs};
+use posix_fs::{FileKind, FsError, PosixFs, SeekFrom};
 use posix_path::{MAX_PATH, PathState};
 use proto_fs::{BAD_FD, NO_ENTRY, READ_ONLY, READ_WRITE};
 use proto_wire::Status;
@@ -99,6 +99,7 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     }
     fs.close(fd).map_err(|_| "close scratch")?;
     check_posix(parent)?;
+    check_seek(parent)?;
     Ok(())
 }
 
@@ -162,5 +163,66 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
     {
         return Err("POSIX directory rewind");
     }
+    Ok(())
+}
+
+fn check_seek(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
+    let posix = PosixFs::connect(parent).map_err(|_| "connect seek")?;
+    let fd = posix
+        .open(b"/tmp/probe", READ_WRITE)
+        .map_err(|_| "open seek")?;
+    if posix.lseek(fd, -1, SeekFrom::End) != Ok(2)
+        || posix.lseek(fd, -1, SeekFrom::Current) != Ok(1)
+        || posix.lseek(fd, -2, SeekFrom::Current) != Err(FsError::InvalidArgument)
+        || posix.lseek(fd, 0, SeekFrom::Current) != Ok(1)
+        || posix.lseek(fd, 1, SeekFrom::Data) != Ok(1)
+        || posix.lseek(fd, 1, SeekFrom::Hole) != Ok(3)
+        || posix.lseek(fd, 3, SeekFrom::Data) != Err(FsError::NoData)
+        || posix.lseek(fd, 3, SeekFrom::Hole) != Err(FsError::NoData)
+    {
+        return Err("seek origins or errors");
+    }
+    if posix.lseek(fd, i64::MAX, SeekFrom::Start) != Ok(i64::MAX)
+        || posix.lseek(fd, 1, SeekFrom::Current) != Err(FsError::OffsetOverflow)
+        || posix.lseek(fd, -1, SeekFrom::Start) != Err(FsError::InvalidArgument)
+        || posix.lseek(fd, 0, SeekFrom::Current) != Ok(i64::MAX)
+        || posix.read(fd, &mut [0; 1]) != Ok(0)
+        || posix.write(fd, b"x") != Err(FsError::NoSpace)
+        || posix.write(fd, b"") != Ok(0)
+        || posix.fstat(fd).map_err(|_| "seek stat")?.size != 3
+    {
+        return Err("wide seek preserves offset and size");
+    }
+    if posix.lseek(fd, 7, SeekFrom::Start) != Ok(7) || posix.write(fd, b"z") != Ok(1) {
+        return Err("write after seek beyond EOF");
+    }
+    posix
+        .lseek(fd, 0, SeekFrom::Start)
+        .map_err(|_| "rewind gap")?;
+    let mut bytes = [0; 8];
+    if posix.read(fd, &mut bytes) != Ok(8) || &bytes != b"aZc\0\0\0\0z" {
+        return Err("seek gap zero fill");
+    }
+    posix.close(fd).map_err(|_| "close seek")?;
+    if posix.lseek(fd, 0, SeekFrom::Start) != Err(FsError::BadFileDescriptor)
+        || posix.read(fd, &mut []) != Err(FsError::BadFileDescriptor)
+        || posix.write(fd, b"") != Err(FsError::BadFileDescriptor)
+    {
+        return Err("zero IO closed descriptor");
+    }
+    let read = posix
+        .open(b"/etc/motd", READ_ONLY)
+        .map_err(|_| "open read only")?;
+    let write = posix
+        .open(b"/tmp/probe", proto_fs::WRITE_ONLY)
+        .map_err(|_| "open write only")?;
+    if posix.write(read, b"") != Err(FsError::BadFileDescriptor)
+        || posix.read(write, &mut []) != Err(FsError::BadFileDescriptor)
+        || posix.read(write, &mut bytes) != Err(FsError::BadFileDescriptor)
+    {
+        return Err("zero IO access modes");
+    }
+    posix.close(read).map_err(|_| "close read only")?;
+    posix.close(write).map_err(|_| "close write only")?;
     Ok(())
 }

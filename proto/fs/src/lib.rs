@@ -12,6 +12,8 @@
 //! kind u32 (0 at end, 1 directory, 2 file), entry name bytes.
 //! LOOKUP: header, UTF-8 absolute path bytes. Reply: status, kind u32,
 //! size u32 (directories report zero until their metadata is available).
+//! SEEK_FROM: header, fd u32, signed offset i64, origin u32. Reply:
+//! status, resulting offset u64 (at most i64::MAX). Legacy SEEK is unchanged.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -31,6 +33,33 @@ pub const NO_ENTRY: u32 = 300;
 pub const BAD_FD: u32 = 301;
 pub const IS_DIRECTORY: u32 = 302;
 pub const NO_SPACE: u32 = 303;
+pub const INVALID_ARGUMENT: u32 = 304;
+pub const OFFSET_OVERFLOW: u32 = 305;
+pub const NO_DATA: u32 = 306;
+
+/// Origins for the signed 64-bit SEEK_FROM request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SeekFrom {
+    Start = 0,
+    Current = 1,
+    End = 2,
+    Data = 3,
+    Hole = 4,
+}
+
+impl SeekFrom {
+    pub fn from_number(number: u32) -> Option<Self> {
+        match number {
+            0 => Some(Self::Start),
+            1 => Some(Self::Current),
+            2 => Some(Self::End),
+            3 => Some(Self::Data),
+            4 => Some(Self::Hole),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Metadata {
@@ -48,6 +77,7 @@ pub enum Method {
     Close = 6,
     ReadDir = 7,
     Lookup = 8,
+    SeekFrom = 9,
 }
 
 impl Method {
@@ -65,12 +95,13 @@ impl Method {
             6 => Some(Self::Close),
             7 => Some(Self::ReadDir),
             8 => Some(Self::Lookup),
+            9 => Some(Self::SeekFrom),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
