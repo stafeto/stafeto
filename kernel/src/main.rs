@@ -75,7 +75,14 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     }
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
-    finish(boot, &init)
+    if cfg!(feature = "vz") {
+        // The Apple VZ platform probe reaches the initialized GIC and timer.
+        // PSCI returns control to the host until a PCI Virtio console driver
+        // can make a user-space shell visible on this platform.
+        psci::system_off()
+    } else {
+        finish(boot, &init)
+    }
 }
 
 /// The kernel leaves for init (spec 13.3); any end of init, an exit

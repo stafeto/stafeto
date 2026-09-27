@@ -42,9 +42,12 @@ fn park() -> ! {
     }
 }
 
-/// Powers the machine off through PSCI SYSTEM_OFF, in every build: a run
-/// of the kernel tests ends the same way, and xtask fails a run that
-/// printed a panic (spec 14).
+/// Powers the machine off through PSCI SYSTEM_OFF in the usual builds. The
+/// Apple VZ probe parks on panic so its host runner can distinguish a panic
+/// from successful completion by its timeout.
 pub(crate) fn stop() -> ! {
+    #[cfg(feature = "vz")]
+    park();
+    #[cfg(not(feature = "vz"))]
     crate::psci::system_off()
 }

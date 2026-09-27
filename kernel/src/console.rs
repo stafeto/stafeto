@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The kernel's console port (spec 3.2): the PL011 at the early address
-//! of QEMU `virt` until the kernel tables are live, then the one the
-//! device tree names (BootInfo::uart_pl011), or none, and the console
+//! of QEMU `virt` until the kernel tables are live (absent in the Apple VZ
+//! platform probe), then the one the device tree names
+//! (BootInfo::uart_pl011), or none, and the console
 //! stays silent. Reached through the linear map. A device window over a
 //! page of the port takes the port from the kernel while the window lives
 //! (spec 9): the kernel log (crate::log) then keeps what the kernel shows,
@@ -21,8 +22,11 @@ use kcore::console::{FR_TXFF, covers};
 use kcore::layout::LINEAR_BASE;
 
 /// The PL011 of QEMU `virt` [R25], the port until the kernel tables are
-/// live (`set_port`).
+/// live (`set_port`). The Apple VZ probe has no PL011.
+#[cfg(not(feature = "vz"))]
 const EARLY_PA: u64 = 0x0900_0000;
+#[cfg(feature = "vz")]
+const EARLY_PA: u64 = 0;
 /// Registers of the PL011 by their offsets [R12, G36].
 const DR: usize = 0x000;
 const FR: usize = 0x018;
@@ -33,7 +37,10 @@ const CR_ENABLE: u32 = 0x301;
 
 /// The port's physical address and size; a size of 0 when there is none.
 static PORT_BASE: AtomicU64 = AtomicU64::new(EARLY_PA);
+#[cfg(not(feature = "vz"))]
 static PORT_SIZE: AtomicU64 = AtomicU64::new(0x1000);
+#[cfg(feature = "vz")]
+static PORT_SIZE: AtomicU64 = AtomicU64::new(0);
 /// The device windows alive now that cover a page of the port.
 static WINDOWS: AtomicU32 = AtomicU32::new(0);
 /// The last such window went: the next write sets the port up again.

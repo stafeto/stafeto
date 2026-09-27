@@ -8,6 +8,7 @@ mod image;
 mod measure;
 mod qemu;
 mod symbolize;
+mod vz;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -339,6 +340,7 @@ enum Variant {
     TestIcount,
     FaultProbe,
     OverflowProbe,
+    Vz,
 }
 
 impl Variant {
@@ -361,6 +363,7 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
+            Variant::Vz => Some("vz"),
         }
     }
 
@@ -370,7 +373,8 @@ impl Variant {
             Variant::Normal
             | Variant::TraceNormal
             | Variant::FaultProbe
-            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::OverflowProbe
+            | Variant::Vz => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
                 (TEST_KERNEL_LIMIT, "test builds")
             }
@@ -387,6 +391,7 @@ impl Variant {
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
+            Variant::Vz => "stafeto-vz",
         }
     }
 }
@@ -404,6 +409,7 @@ commands:
   hvf       boot checks, the console dialog, init tests and kernel tests
             under HVF on a Mac with Apple silicon, on Apple's GICv3 and
             QEMU's GICv2; skips elsewhere
+  vz        run the Apple Virtualization.framework platform probe on Apple silicon
   help      this text";
 
 fn main() {
@@ -415,6 +421,7 @@ fn main() {
         Some("gdb") => gdb(),
         Some("ci") => ci(),
         Some("hvf") => hvf(),
+        Some("vz") => vz::run(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
