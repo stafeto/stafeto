@@ -10,6 +10,7 @@ build = "build.rs"
 
 [features]
 ash-probe = []
+ash-interactive = []
 
 [[bin]]
 name = "busybox-probe"

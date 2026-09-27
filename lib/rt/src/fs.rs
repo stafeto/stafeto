@@ -9,17 +9,31 @@ use crate::handle::{Channel, Handle};
 use crate::{console, service, sys};
 use abi::MESSAGE_MAX;
 use proto_fs::{MAX_READ, MAX_WRITE, Method, valid_path};
+use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
 use proto_wire::{Reader, Status, Writer};
 
 pub struct Files {
     channel: Handle<Channel>,
+    uart: Option<Handle<Channel>>,
 }
 
 impl Files {
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
         Ok(Self {
             channel: service::connect(parent, "ramfs")?,
+            uart: None,
         })
+    }
+
+    pub fn connect_with_uart(parent: &Handle<Channel>) -> Result<Self, Status> {
+        Ok(Self {
+            channel: service::connect(parent, "ramfs")?,
+            uart: Some(service::connect(parent, "uart")?),
+        })
+    }
+
+    pub fn has_uart(&self) -> bool {
+        self.uart.is_some()
     }
 
     fn call<'a>(
@@ -27,7 +41,15 @@ impl Files {
         request: &[u8],
         buffer: &'a mut [u8; MESSAGE_MAX],
     ) -> Result<&'a [u8], Status> {
-        let reply = sys::send(&self.channel, request).map_err(Status::Kernel)?;
+        Self::call_on(&self.channel, request, buffer)
+    }
+
+    fn call_on<'a>(
+        channel: &Handle<Channel>,
+        request: &[u8],
+        buffer: &'a mut [u8; MESSAGE_MAX],
+    ) -> Result<&'a [u8], Status> {
+        let reply = sys::send(channel, request).map_err(Status::Kernel)?;
         let bytes = reply.bytes(buffer);
         match Status::from_code(Reader::new(bytes).u32()?) {
             Status::Ok => Ok(bytes),
@@ -75,6 +97,34 @@ impl Files {
             return Ok(0);
         }
         if fd == 0 {
+            if let Some(uart) = &self.uart {
+                let max = out.len().min(proto_uart::READ_MAX) as u32;
+                let mut request = Writer::new();
+                ReadRequest { max }.write(&mut request)?;
+                let mut reply = [0; MESSAGE_MAX];
+                let bytes = Self::call_on(uart, request.as_bytes(), &mut reply)?;
+                let input = ReadReply::read(bytes, max)?.bytes;
+                let mut echo = [0; proto_uart::READ_MAX];
+                let mut echoed = 0;
+                for (dst, &src) in out.iter_mut().zip(input) {
+                    *dst = if src == b'\r' { b'\n' } else { src };
+                    let visible = if src == b'\r' {
+                        &b"\r\n"[..]
+                    } else {
+                        core::slice::from_ref(&src)
+                    };
+                    if echoed + visible.len() > echo.len() {
+                        self.write(1, &echo[..echoed])?;
+                        echoed = 0;
+                    }
+                    echo[echoed..echoed + visible.len()].copy_from_slice(visible);
+                    echoed += visible.len();
+                }
+                if echoed > 0 {
+                    self.write(1, &echo[..echoed])?;
+                }
+                return Ok(input.len());
+            }
             let mut chars = [0; 8];
             loop {
                 let n = console::poll(&mut chars).map_err(Status::Kernel)?;
@@ -110,6 +160,14 @@ impl Files {
             return Ok(0);
         }
         if fd == 1 || fd == 2 {
+            if let Some(uart) = &self.uart {
+                let chunk = &bytes[..bytes.len().min(proto_uart::WRITE_MAX)];
+                let mut request = Writer::new();
+                WriteRequest { bytes: chunk }.write(&mut request)?;
+                let mut reply = [0; MESSAGE_MAX];
+                let response = Self::call_on(uart, request.as_bytes(), &mut reply)?;
+                return Ok(WriteReply::read(response)?.written as usize);
+            }
             console::write(bytes).map_err(Status::Kernel)?;
             return Ok(bytes.len());
         }

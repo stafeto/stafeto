@@ -16,7 +16,16 @@ script has already run.
 for this probe. The root directory and process credentials are fixed.
 Process creation, waiting, pipes, descriptor duplication, signals,
 terminal controls, globbing, and resource limits return an explicit
-unsupported error. This image verifies parsing and execution of builtins;
-it does not offer an interactive prompt or external commands yet. The
-next slice should connect stdin and stdout to the shared console service,
-then design program spawn and wait for external commands.
+unsupported error. The first image verifies parsing and execution of
+builtins; it does not offer external commands yet.
+
+`cargo xtask ash-dialog` adds the UART driver to a separate boot image.
+The POSIX bridge connects standard descriptors to its service, echoes
+typed bytes, and converts carriage return to newline. The QEMU test
+waits for the `ash` prompt, types `echo interactive-ready` and `exit`,
+then checks the command's output and exit code 0. Terminal editing and
+job control are not implemented. The next slice is program spawn and
+wait for external commands.
+
+For a manual session, use `cargo xtask ash-shell`. Type `exit` to leave
+`ash`, then press Ctrl-A followed by X to quit QEMU.

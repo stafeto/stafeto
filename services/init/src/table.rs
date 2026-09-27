@@ -555,6 +555,13 @@ pub mod vz;
     all(feature = "table-busybox", feature = "table-ceiling"),
     all(feature = "table-busybox", feature = "table-ramfs"),
     all(feature = "table-busybox", feature = "table-cprobe"),
+    all(feature = "table-busybox-dialog", feature = "vz"),
+    all(feature = "table-busybox-dialog", feature = "table-test"),
+    all(feature = "table-busybox-dialog", feature = "table-cycle"),
+    all(feature = "table-busybox-dialog", feature = "table-ceiling"),
+    all(feature = "table-busybox-dialog", feature = "table-ramfs"),
+    all(feature = "table-busybox-dialog", feature = "table-cprobe"),
+    all(feature = "table-busybox-dialog", feature = "table-busybox"),
 ))]
 compile_error!("init builds with one table feature at a time");
 
@@ -568,7 +575,8 @@ compile_error!("init builds with one table feature at a time");
     feature = "vz",
     feature = "table-ramfs",
     feature = "table-cprobe",
-    feature = "table-busybox"
+    feature = "table-busybox",
+    feature = "table-busybox-dialog"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -577,6 +585,8 @@ pub const TABLE: &[Record] = ramfs::TABLE;
 pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
 #[cfg(feature = "table-busybox")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
+#[cfg(feature = "table-busybox-dialog")]
+pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "vz")]
 pub const TABLE: &[Record] = vz::TABLE;
 #[cfg(feature = "table-test")]

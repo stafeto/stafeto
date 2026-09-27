@@ -146,6 +146,21 @@ kernel image stays under 200 KB.
 | 6 | Network: virtio-net, a TCP/IP stack | ⬜ |
 | 7 | PinePhone port: boot through U-Boot, Allwinner A64 drivers | ⬜ |
 
+### Subproject 2: name space and services
+
+| Step | Deliverable and check | State |
+|---|---|---|
+| Virtual console | Boot to the shell on Apple Silicon through Virtualization.framework with `cargo xtask vz`; QEMU and HVF remain test platforms. | ✅ [#21](https://github.com/stafeto/stafeto/pull/21) |
+| File groundwork | Read an e2fsprogs ext4 image in a guest with `cargo xtask ext4ro`; exercise RAM file descriptors and static Picolibc I/O with `cargo xtask ramfs` and `cargo xtask cprobe`. | ✅ [#23](https://github.com/stafeto/stafeto/pull/23), [#24](https://github.com/stafeto/stafeto/pull/24) |
+| BusyBox shell | Run `cat` and an `ash` builtin script from boot images, then type `echo` and `exit` at an interactive `ash` prompt through the UART service. | 🚧 [#24](https://github.com/stafeto/stafeto/pull/24), [#26](https://github.com/stafeto/stafeto/pull/26) |
+| Programs and descriptors | Load static ELF programs from a file service; let `ash` start and wait for a BusyBox utility, then support descriptor duplication, pipes, and the needed signal behavior. | ⬜ |
+| Persistent files | Read ext4 through a Virtio block service, then qualify writes with `e2fsck` after normal and interrupted runs. Keep RAM files available for tests. | ⬜ |
+| Integrated userland | Boot `ash` and a small set of BusyBox utilities from storage on QEMU and Apple Virtualization.framework; check commands, redirection, pipelines, and exit status. | ⬜ |
+
+Program launch and block storage can proceed independently after the
+interactive shell check. An ext4 implementation becomes writable only
+after the recovery checks pass.
+
 Multi-core support is a separate subproject; its place in the order will be
 decided after subproject 3.
 
@@ -173,6 +188,8 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |
+| `cargo xtask ash-shell` | opens an interactive BusyBox `ash` on the QEMU UART; type `exit` to leave the shell, then Ctrl-A, X to quit QEMU |
+| `cargo xtask ash-dialog` | types `echo` and `exit` into BusyBox `ash` through the UART service in QEMU |
 | `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |

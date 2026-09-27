@@ -26,6 +26,7 @@ vz = []
 table-ramfs = []
 table-cprobe = []
 table-busybox = []
+table-busybox-dialog = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

@@ -76,6 +76,17 @@ const ASH_PROGRAMS: [ImageProgram; 3] = [
         &["ash-probe"],
     ),
 ];
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "busybox-probe",
+        CHILD_STACK_SIZE,
+        &["ash-interactive"],
+    ),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -448,6 +459,8 @@ commands:
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
+  ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits)
+  ash-dialog  check an interactive BusyBox ash dialog in QEMU
   help      this text";
 
 fn main() {
@@ -466,6 +479,8 @@ fn main() {
         Some("cprobe") => cprobe(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
+        Some("ash-shell") => ash_shell(),
+        Some("ash-dialog") => ash_dialog(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -810,7 +825,11 @@ fn raw_init(code: &[u32], rodata: bool, data_size: u64) -> Result<Vec<u8>, Strin
 fn run(args: &[String]) -> Result<(), String> {
     let m = run_machine(args, hvf_host)?;
     let a = build(Variant::Normal)?;
-    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    let cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    run_interactive_qemu(cmd, &a.elf)
+}
+
+fn run_interactive_qemu(mut cmd: Command, elf: &Path) -> Result<(), String> {
     cmd.arg("-nographic");
     let mut child = cmd
         .stdin(Stdio::inherit())
@@ -838,7 +857,7 @@ fn run(args: &[String]) -> Result<(), String> {
         .lines()
         .map(str::to_owned)
         .collect();
-    symbolize::backtrace(&lines, &a.elf);
+    symbolize::backtrace(&lines, elf);
     if status.success() {
         Ok(())
     } else {
@@ -929,6 +948,63 @@ fn ash_probe() -> Result<(), String> {
     qemu::expect_marker(&output, "shell-ready")?;
     println!("BusyBox ash builtin guest probe passed");
     Ok(())
+}
+
+fn ash_dialog() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-ash-dialog.img",
+        &ASH_INTERACTIVE_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let talked = (|| {
+        run.expect(SERVICES_STARTED, BOOT_TIMEOUT)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo interactive-ready")?;
+        run.expect("echo interactive-ready", DIALOG_STEP)?;
+        run.expect_line(
+            "interactive-ready",
+            |line| line == "interactive-ready",
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("exit")?;
+        run.expect("exit", DIALOG_STEP)?;
+        run.expect(
+            "init: busybox-probe ended: exit code 0, not restarted",
+            DIALOG_STEP,
+        )
+    })();
+    let output = run.stop();
+    symbolize::backtrace(&output.lines, &kernel.elf);
+    talked?;
+    if output
+        .lines
+        .iter()
+        .any(|line| line.contains("process fault:") || line.contains("KERNEL PANIC"))
+    {
+        return Err("ash dialog faulted".into());
+    }
+    println!("BusyBox ash interactive guest dialog passed");
+    Ok(())
+}
+
+fn ash_shell() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-ash-dialog.img",
+        &ASH_INTERACTIVE_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    run_interactive_qemu(cmd, &kernel.elf)
 }
 
 fn test() -> Result<(), String> {

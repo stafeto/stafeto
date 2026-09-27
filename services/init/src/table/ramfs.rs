@@ -68,3 +68,12 @@ pub const BUSYBOX_TABLE: &[Record] = &[
         ..TABLE[1]
     },
 ];
+
+pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TABLE[0],
+    Record {
+        connects: &["ramfs", "uart"],
+        ..BUSYBOX_TABLE[1]
+    },
+];
