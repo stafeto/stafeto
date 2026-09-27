@@ -196,6 +196,7 @@ checks for successful calls, failures, and ABI layout.
 | Step | Interface and guest check | State |
 |---|---|---|
 | Rust pathname state | Keep the working directory and byte-oriented path components in GPL-3.0-or-later Rust; verify on the host and in a RAM file guest probe without linking BusyBox. | ✅ [#29](https://github.com/stafeto/stafeto/pull/29) |
+| Rust file client | Implement file metadata, relative file access, working-directory changes, and directory iteration in a GPL Rust package; verify through the RAM service in a guest. | ✅ [#30](https://github.com/stafeto/stafeto/pull/30) |
 | Rust library foundation | Define the C ABI, generated headers, `errno`, allocator, startup, thread-local storage, and a versioned sysroot; link a C probe without Picolibc. | ⬜ |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |

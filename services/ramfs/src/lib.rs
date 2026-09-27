@@ -7,7 +7,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use proto_fs::{BAD_FD, NO_ENTRY, NO_SPACE, READ_ONLY, READ_WRITE, WRITE_ONLY};
+use proto_fs::{
+    BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, READ_ONLY, READ_WRITE, WRITE_ONLY,
+};
 
 const FILE_CAPACITY: usize = 1024;
 const OPEN_MAX: usize = 8;
@@ -57,6 +59,7 @@ impl Fds {
             return Err(proto_wire::BAD_SIZE);
         }
         let file = match path {
+            "/" | "/etc" | "/tmp" => return Err(IS_DIRECTORY),
             "/etc/motd" if flags == READ_ONLY => File::Motd,
             "/etc/motd" => return Err(proto_wire::BAD_SIZE),
             "/tmp/probe" => File::Scratch,
@@ -116,6 +119,16 @@ impl Default for Ram {
 }
 
 impl Ram {
+    pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
+        let (kind, size) = match path {
+            "/" | "/etc" | "/tmp" => (DIR, 0),
+            "/etc/motd" => (REG, MOTD.len() as u32),
+            "/tmp/probe" => (REG, self.len as u32),
+            _ => return Err(NO_ENTRY),
+        };
+        Ok(Metadata { kind, size })
+    }
+
     fn bytes(&self, file: File) -> &[u8] {
         match file {
             File::Motd => MOTD,
@@ -173,6 +186,28 @@ mod tests {
         assert_eq!(directory_entry("/etc", 2), Ok(Some(("motd", REG))));
         assert_eq!(directory_entry("/tmp", 2), Ok(Some(("probe", REG))));
         assert_eq!(directory_entry("/missing", 0), Err(NO_ENTRY));
+    }
+
+    #[test]
+    fn lookup_reports_directory_and_current_file_sizes() {
+        let mut ram = Ram::default();
+        assert_eq!(ram.lookup("/etc"), Ok(Metadata { kind: DIR, size: 0 }));
+        assert_eq!(
+            ram.lookup("/etc/motd"),
+            Ok(Metadata {
+                kind: REG,
+                size: 14
+            })
+        );
+        assert_eq!(ram.lookup("/missing"), Err(NO_ENTRY));
+        let mut fds = Fds::default();
+        assert_eq!(fds.open("/etc", READ_ONLY), Err(IS_DIRECTORY));
+        let fd = fds.open("/tmp/probe", READ_WRITE).unwrap();
+        assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
+        assert_eq!(
+            ram.lookup("/tmp/probe"),
+            Ok(Metadata { kind: REG, size: 3 })
+        );
     }
 
     #[test]

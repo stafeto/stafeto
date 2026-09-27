@@ -133,6 +133,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-fs"
+version = "0.1.0"
+dependencies = [
+ "posix-path",
+ "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "posix-path"
 version = "0.1.0"
 dependencies = [
@@ -203,6 +213,7 @@ dependencies = [
 name = "ramfs-probe"
 version = "0.1.0"
 dependencies = [
+ "posix-fs",
  "posix-path",
  "proto-fs",
  "proto-wire",

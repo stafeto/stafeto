@@ -184,6 +184,25 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::Lookup) => {
+                let Ok(path) = body.bytes(body.left()).and_then(valid_path) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.ram.lookup(path) {
+                    Ok(meta) => {
+                        let w = r.reply();
+                        if w.u32(0)
+                            .and_then(|()| w.u32(meta.kind))
+                            .and_then(|()| w.u32(meta.size))
+                            .is_err()
+                        {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
             None => Answer::Status(Status::UnknownMethod),
         }
     }

@@ -1,20 +1,18 @@
 [package]
-name = "ramfs-probe"
+name = "posix-fs"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "Guest probe of the RAM file service and descriptor client"
+description = "Rust POSIX file and directory client for stafeto"
 
-[[bin]]
-name = "ramfs-probe"
+[lib]
 test = false
 bench = false
 
 [dependencies]
-posix-fs = { path = "../../lib/posix-fs" }
-posix-path = { path = "../../lib/posix-path" }
+posix-path = { path = "../posix-path" }
 proto-fs = { path = "../../proto/fs" }
 proto-wire = { path = "../../proto/wire" }
-rt = { path = "../../lib/rt" }
+rt = { path = "../rt" }

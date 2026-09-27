@@ -24,13 +24,14 @@ def main() -> None:
         if package["name"].startswith("posix-") and package["name"] != "posix-bridge":
             if package["license"] != "GPL-3.0-or-later":
                 raise SystemExit(f"{package['name']} must be GPL-3.0-or-later")
+            for target in package["targets"]:
+                source = Path(target["src_path"])
+                if source.read_text().splitlines()[0] != (
+                    "// SPDX-License-Identifier: GPL-3.0-or-later"
+                ):
+                    raise SystemExit(f"{source} needs its GPL-3.0-or-later SPDX header")
     if named["posix-bridge"]["license"] != "MIT":
         raise SystemExit("the temporary BusyBox POSIX bridge must remain MIT")
-    if (ROOT / "lib/posix-path/src/lib.rs").read_text().splitlines()[0] != (
-        "// SPDX-License-Identifier: GPL-3.0-or-later"
-    ):
-        raise SystemExit("posix-path source needs its GPL-3.0-or-later SPDX header")
-
     pending = [named["busybox-probe"]["id"]]
     seen = set()
     while pending:

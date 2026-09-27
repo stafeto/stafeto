@@ -10,6 +10,8 @@
 //! CLOSE: header, fd u32. Reply: status alone.
 //! READ_DIR: header, index u32, UTF-8 absolute path bytes. Reply: status,
 //! kind u32 (0 at end, 1 directory, 2 file), entry name bytes.
+//! LOOKUP: header, UTF-8 absolute path bytes. Reply: status, kind u32,
+//! size u32 (directories report zero until their metadata is available).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -30,6 +32,12 @@ pub const BAD_FD: u32 = 301;
 pub const IS_DIRECTORY: u32 = 302;
 pub const NO_SPACE: u32 = 303;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Metadata {
+    pub kind: u32,
+    pub size: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Open = 1,
@@ -39,6 +47,7 @@ pub enum Method {
     Stat = 5,
     Close = 6,
     ReadDir = 7,
+    Lookup = 8,
 }
 
 impl Method {
@@ -55,12 +64,13 @@ impl Method {
             5 => Some(Self::Stat),
             6 => Some(Self::Close),
             7 => Some(Self::ReadDir),
+            8 => Some(Self::Lookup),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {

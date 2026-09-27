@@ -2525,6 +2525,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "rt",
         "--package",
+        "posix-fs",
+        "--package",
         "ext4ro",
         "--package",
         "init",

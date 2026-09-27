@@ -8,7 +8,7 @@
 use crate::handle::{Channel, Handle};
 use crate::{console, service, sys};
 use abi::MESSAGE_MAX;
-use proto_fs::{MAX_READ, MAX_WRITE, Method, valid_path};
+use proto_fs::{MAX_READ, MAX_WRITE, Metadata, Method, valid_path};
 use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
 use proto_wire::{Reader, Status, Writer};
 
@@ -231,6 +231,28 @@ impl Files {
         }
         out[..name.len()].copy_from_slice(name);
         Ok(Some((name.len(), kind)))
+    }
+
+    pub fn lookup(&self, path: &str) -> Result<Metadata, Status> {
+        valid_path(path.as_bytes())?;
+        let mut w = Writer::new();
+        Method::Lookup.header().write(&mut w)?;
+        w.bytes(path.as_bytes())?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let metadata = Metadata {
+            kind: r.u32()?,
+            size: r.u32()?,
+        };
+        if !(1..=2).contains(&metadata.kind) {
+            return Err(Status::BadSize);
+        }
+        r.finish()?;
+        Ok(metadata)
     }
 
     pub fn close(&self, fd: u32) -> Result<(), Status> {
