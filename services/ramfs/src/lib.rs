@@ -12,7 +12,7 @@ use proto_fs::{
 };
 
 const FILE_CAPACITY: usize = 1024;
-const OPEN_MAX: usize = 8;
+const OPEN_MAX: usize = 32;
 const MOTD: &[u8] = b"stafeto ramfs\n";
 
 pub const DIR: u32 = 1;
@@ -69,7 +69,7 @@ impl Fds {
             .open
             .iter_mut()
             .position(|fd| fd.is_none())
-            .ok_or(NO_SPACE)?;
+            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
         self.open[slot] = Some(Open {
             file,
             offset: 0,
@@ -216,6 +216,20 @@ impl Ram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_limit_reports_emfile_and_recovers_on_close() {
+        let mut fds = Fds::default();
+        for expected in 3..OPEN_MAX as u32 + 3 {
+            assert_eq!(fds.open("/etc/motd", READ_ONLY), Ok(expected));
+        }
+        assert_eq!(
+            fds.open("/etc/motd", READ_ONLY),
+            Err(proto_fs::TOO_MANY_OPEN_FILES)
+        );
+        fds.close(7).unwrap();
+        assert_eq!(fds.open("/etc/motd", READ_ONLY), Ok(7));
+    }
 
     #[test]
     fn directory_entries_match_files_and_end_cleanly() {

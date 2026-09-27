@@ -189,8 +189,8 @@ The target is the full mandatory POSIX.1-2024 interface, implemented in Rust
 with C-compatible entry points, plus a conforming shell and utilities. Track
 optional interface groups separately. The current Picolibc bridge covers
 basic file calls and standard streams only. The GPL-3.0-or-later
-`lib/posix-path` crate now keeps the working directory and resolves relative
-paths in Rust. Each step below needs guest
+Rust crates now keep local path state, own a descriptor table with
+duplication, and perform bounded file operations through the RAM service. Each step below needs guest
 checks for successful calls, failures, and ABI layout.
 
 | Step | Interface and guest check | State |
@@ -198,10 +198,11 @@ checks for successful calls, failures, and ABI layout.
 | Rust pathname state | Keep the working directory and byte-oriented path components in GPL-3.0-or-later Rust; verify on the host and in a RAM file guest probe without linking BusyBox. | ✅ [#29](https://github.com/stafeto/stafeto/pull/29) |
 | Rust file client | Implement file metadata, relative file access, working-directory changes, and directory iteration in a GPL Rust package; verify through the RAM service in a guest. | ✅ [#30](https://github.com/stafeto/stafeto/pull/30) |
 | Rust file positioning | Add signed 64-bit `lseek`, all five POSIX.1-2024 origins, unchanged offsets on failure, and validated zero-length file I/O; verify on RAM files in the guest. | ✅ [#31](https://github.com/stafeto/stafeto/pull/31) |
+| Rust descriptor ownership | Own local descriptors, shared offsets, `dup`/`dup2`/`dup3`, descriptor flags, and standard-stream redirection; verify limits and lifetime in the guest. | ✅ [#32](https://github.com/stafeto/stafeto/pull/32) |
 | Rust library foundation | Define the C ABI, generated headers, `errno`, allocator, startup, thread-local storage, and a versioned sysroot; link a C probe without Picolibc. | ⬜ |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
-| Shell I/O | Add `dup`/`dup2`, inherited descriptors, pipes, and redirection; verify `ash` pipelines and file output. | ⬜ |
+| Shell I/O | Expose Rust descriptor duplication through the POSIX service and C ABI; add inherited descriptors and pipes, then verify `ash` pipelines and file output. | ⬜ |
 | Terminal input | Add a terminal service with line discipline, `termios`, window size, and BusyBox line editing; verify backspace, arrows, history, and Ctrl-C. | ⬜ |
 | Remaining interfaces | Add threads, signals, time, process control, sockets, permissions, and required utility behavior; publish a feature and option matrix. | ⬜ |
 | Conformance checks | Run API, shell, and utility suites on QEMU and Apple Virtualization.framework; record every remaining standard requirement and fix failures. | ⬜ |

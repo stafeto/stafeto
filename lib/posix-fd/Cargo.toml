@@ -1,0 +1,8 @@
+[package]
+name = "posix-fd"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Bounded descriptor ownership for the Rust stafeto POSIX layer"

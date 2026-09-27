@@ -133,9 +133,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-fd"
+version = "0.1.0"
+
+[[package]]
 name = "posix-fs"
 version = "0.1.0"
 dependencies = [
+ "posix-fd",
  "posix-path",
  "proto-fs",
  "proto-wire",

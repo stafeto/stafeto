@@ -36,6 +36,7 @@ pub const NO_SPACE: u32 = 303;
 pub const INVALID_ARGUMENT: u32 = 304;
 pub const OFFSET_OVERFLOW: u32 = 305;
 pub const NO_DATA: u32 = 306;
+pub const TOO_MANY_OPEN_FILES: u32 = 307;
 
 /// Origins for the signed 64-bit SEEK_FROM request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
