@@ -137,6 +137,27 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::SeekFrom) => {
+                let (Ok(fd), Ok(offset), Ok(origin)) = (body.u32(), body.u64(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let Some(origin) = proto_fs::SeekFrom::from_number(origin) else {
+                    return status(proto_fs::INVALID_ARGUMENT);
+                };
+                match self.ram.seek_from(&mut s.data, fd, offset as i64, origin) {
+                    Ok(offset) => {
+                        let w = r.reply();
+                        if w.u32(0).and_then(|()| w.u64(offset as u64)).is_err() {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
             Some(Method::Stat) => {
                 let Ok(fd) = body.u32() else {
                     return Answer::Status(Status::BadSize);

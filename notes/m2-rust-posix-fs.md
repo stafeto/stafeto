@@ -4,7 +4,8 @@
 POSIX file operations. It owns a working directory, resolves relative
 paths through `posix-path`, maps file-service failures to `FsError`, and
 provides `open`, `close`, `read`, `write`, `seek_set`, `fstat`, `stat`,
-`chdir`, `opendir`, and `readdir`. The RAM service's `LOOKUP` request
+`chdir`, `opendir`, and `readdir`. A later seek milestone adds signed
+64-bit `lseek` with all five POSIX.1-2024 origins. The RAM service's `LOOKUP` request
 returns a node kind and current size without opening the file. Directory
 iteration keeps its cursor in the client; `Directory::rewind` resets it.
 
@@ -15,8 +16,8 @@ trailing slash on a regular file. `cargo xtask ci` checks the guest build
 with Clippy and verifies the license boundary.
 
 This API is an incremental POSIX layer. The file protocol still accepts
-UTF-8 paths, file metadata contains only kind and size, seeking is
-absolute, and directory descriptors cannot be opened as file descriptors.
+UTF-8 paths, file metadata contains only kind and size, metadata sizes are
+32-bit, and directory descriptors cannot be opened as file descriptors.
 Path components are currently normalized lexically because the RAM service
 has no symbolic links. The namespace service must resolve each component
 and enforce directory search permissions before this can meet full POSIX

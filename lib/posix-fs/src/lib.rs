@@ -2,11 +2,12 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! File and directory operations for the evolving Rust POSIX layer.
-//! The current RAM service uses UTF-8 paths and offers only absolute seeking.
+//! The current RAM service uses UTF-8 paths and bounded regular files.
 
 #![no_std]
 
 use posix_path::{MAX_PATH, PathError, PathState};
+pub use proto_fs::SeekFrom;
 use proto_wire::Status;
 use rt::Handle;
 use rt::fs::Files;
@@ -19,6 +20,8 @@ pub enum FsError {
     IsDirectory,
     NotDirectory,
     NoSpace,
+    OffsetOverflow,
+    NoData,
     NameTooLong,
     InvalidArgument,
     UnsupportedEncoding,
@@ -42,7 +45,9 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::BAD_FD) => Self::BadFileDescriptor,
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
-            Status::BadSize => Self::InvalidArgument,
+            Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
+            Status::Unknown(proto_fs::OFFSET_OVERFLOW) => Self::OffsetOverflow,
+            Status::Unknown(proto_fs::NO_DATA) => Self::NoData,
             _ => Self::Io,
         }
     }
@@ -141,6 +146,12 @@ impl PosixFs {
 
     pub fn seek_set(&self, fd: u32, offset: u32) -> Result<u32, FsError> {
         self.files.lseek(fd, offset).map_err(FsError::from)
+    }
+
+    pub fn lseek(&self, fd: u32, offset: i64, origin: SeekFrom) -> Result<i64, FsError> {
+        self.files
+            .seek_from(fd, offset, origin)
+            .map_err(FsError::from)
     }
 
     pub fn fstat(&self, fd: u32) -> Result<Metadata, FsError> {

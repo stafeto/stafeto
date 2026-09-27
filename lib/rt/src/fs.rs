@@ -93,7 +93,7 @@ impl Files {
     }
 
     pub fn read(&self, fd: u32, out: &mut [u8]) -> Result<usize, Status> {
-        if out.is_empty() {
+        if out.is_empty() && fd == 0 {
             return Ok(0);
         }
         if fd == 0 {
@@ -156,7 +156,7 @@ impl Files {
     }
 
     pub fn write(&self, fd: u32, bytes: &[u8]) -> Result<usize, Status> {
-        if bytes.is_empty() {
+        if bytes.is_empty() && (fd == 1 || fd == 2) {
             return Ok(0);
         }
         if fd == 1 || fd == 2 {
@@ -193,6 +193,29 @@ impl Files {
 
     pub fn lseek(&self, fd: u32, offset: u32) -> Result<u32, Status> {
         self.number(Method::Seek, fd, Some(offset))
+    }
+
+    /// Signed, 64-bit seek with an origin. The service owns the offset.
+    pub fn seek_from(
+        &self,
+        fd: u32,
+        offset: i64,
+        origin: proto_fs::SeekFrom,
+    ) -> Result<i64, Status> {
+        let mut w = Writer::new();
+        Method::SeekFrom.header().write(&mut w)?;
+        w.u32(fd)?;
+        w.u64(offset as u64)?;
+        w.u32(origin as u32)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let offset = i64::try_from(r.u64()?).map_err(|_| Status::BadSize)?;
+        r.finish()?;
+        Ok(offset)
     }
 
     pub fn fstat_size(&self, fd: u32) -> Result<u32, Status> {
