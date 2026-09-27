@@ -434,6 +434,17 @@ impl Run {
         &self.lines
     }
 
+    /// Waits up to `timeout` for the whole line `line` anywhere in the
+    /// output, before the last text found too; the next search still
+    /// starts where it did.
+    pub fn expect_seen(&mut self, line: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        while !self.lines.iter().any(|l| l == line) {
+            self.wait_on(deadline, &format!("{line:?} anywhere"))?;
+        }
+        Ok(())
+    }
+
     /// Types `line` and a CR, as Enter sends it, into the pipe of the
     /// child's stdin.
     pub fn send(&mut self, line: &str) -> Result<(), String> {

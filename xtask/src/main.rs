@@ -128,6 +128,8 @@ const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round
 /// interrupts, and the shell's session works. The system lives on after
 /// it, and xtask stops a boot on it.
 const SHELL_CONNECTED: &str = "shell: connected to uart; type help for the commands";
+/// Init's line once the first start of each record is done (spec 13.4).
+const SERVICES_STARTED: &str = "init: services started";
 /// The line of the UART driver at its start (spec 13.5).
 const UART_LINE: &str = "uart: pl011 at 0x9000000, line 33";
 /// The shell's prompt, with no newline after it.
@@ -153,6 +155,9 @@ const HELP_LINES: [&str; 7] = [
     "bench       the round trip of a request and the latencies",
     "crash uart  crash the UART driver; init restarts it",
 ];
+/// The bytes of the line the console dialog types while `bench` runs:
+/// past the driver's ring of input (256 bytes), a READ (64) and the FIFO.
+const TYPED_AHEAD: usize = 400;
 /// How long a step of the console dialog waits for its answer; its first,
 /// the driver's line, waits BOOT_TIMEOUT.
 const DIALOG_STEP: Duration = Duration::from_secs(10);
@@ -895,7 +900,11 @@ fn two_gib_boot() -> Result<(), String> {
 /// child's quota counts by what the child uses (spec 7.5), and the
 /// kernel's line; `bench` its line with its five numbers (bench_numbers),
 /// which fail nothing by their values (spec 15.3); a prompt after each
-/// answer. Then `crash uart`: the driver restarts and the shell connects
+/// answer. A line of TYPED_AHEAD bytes typed while `bench` runs, past the
+/// driver's ring of input, comes back as its first 128 bytes (spec 13.5,
+/// 13.6), and init's SERVICES_STARTED, which reaches the log after the
+/// driver's first read and only its timer shows, comes before the crash.
+/// Then `crash uart`: the driver restarts and the shell connects
 /// again (crash_uart); `ps` shows uart running at 60/60, failed and
 /// restarted once, and the shell running, never failed or restarted;
 /// `echo after the crash` comes back; and
@@ -977,12 +986,21 @@ fn dialog(run: &mut qemu::Run) -> Result<String, String> {
     run.expect_line(kernel, |l| numbers(l, kernel).is_some(), DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
     run.send("bench")?;
+    // Typed while bench keeps the shell busy: more than the driver's ring
+    // of input holds, which masks input until the shell reads again.
+    run.send(&format!("echo {}", "a".repeat(TYPED_AHEAD)))?;
     let line = run.expect_line(
         "the line of bench",
         |l| bench_numbers(l).is_some(),
         DIALOG_STEP,
     )?;
     run.expect(PROMPT, DIALOG_STEP)?;
+    let kept = "a".repeat(128 - "echo ".len());
+    run.expect_line("the line typed ahead", |l| l == kept, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    // Init writes its line into the kernel log once the shell started,
+    // after the driver's first read: only the driver's timer shows it.
+    run.expect_seen(SERVICES_STARTED, DIALOG_STEP)?;
     crash_uart(run, CRASH_DECISIONS[0])?;
     run.send("ps")?;
     // The driver failed and restarted once; connecting again restarted
@@ -1401,6 +1419,17 @@ fn fault_report() -> Result<(), String> {
     qemu::expect_not_timed_out(&o)?;
     for marker in ["unknown or undefined instruction", "x0  0x", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
+    }
+    // The probe's record behind its window comes once, before the report.
+    let logged: Vec<usize> = (0..o.lines.len())
+        .filter(|&i| o.lines[i] == "probe-log")
+        .collect();
+    let report = o.lines.iter().position(|l| l.starts_with("x0  0x"));
+    if !matches!((&logged[..], report), ([at], Some(r)) if *at < r) {
+        return Err(format!(
+            "the record nobody showed did not come once before the report: {:?}",
+            o.lines
+        ));
     }
     qemu::backtrace_names_the_fault(&o.lines)
 }

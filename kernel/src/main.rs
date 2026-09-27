@@ -66,7 +66,13 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     sched::init(clock);
     report(boot, clock, &init);
     #[cfg(feature = "fault-probe")]
-    arch::probe::undefined_instruction();
+    {
+        // A window over the console's page leaves a record nobody showed:
+        // the report of the fault shows it first, and once (spec 16.1).
+        console::window_made(0x0900_0000, 1);
+        log_line!("probe-log");
+        arch::probe::undefined_instruction();
+    }
     #[cfg(feature = "overflow-probe")]
     arch::probe::recurse(0);
     finish(boot, &init)

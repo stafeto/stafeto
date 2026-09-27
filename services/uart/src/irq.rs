@@ -73,9 +73,10 @@ impl Irq {
     }
 
     /// The end of a pass for `mis`, with the ring of input full or not and
-    /// the output idle or not: ICR clears the errors, and transmit once
-    /// the output is idle, never input; IMSC masks input while the ring is
-    /// full and lets transmit out only while output waits. An output that
+    /// the output idle or not: ICR clears transmit once the output is idle,
+    /// never input. Error interrupts stay masked; Input::push counts byte
+    /// errors from DR. IMSC masks input while the ring is full and lets
+    /// transmit out only while output waits. An output that
     /// was idle outside a pass the program starts itself (`start`).
     pub fn end(&mut self, mis: u32, ring_full: bool, idle: bool) -> End {
         let mut icr = mis & ERRORS;
