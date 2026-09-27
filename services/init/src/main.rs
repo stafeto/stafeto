@@ -1,95 +1,114 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! init, the first program (spec 13.4), as milestone 1.2c has it: it
-//! prints from EL0, starts two round-robin threads at one level, which
-//! take turns as their quanta end, waits for them and exits; its exit
-//! turns the machine off. Nothing to wait on exists in 1.2c, so init waits
-//! by priority: it lowers itself below the threads and runs again only
-//! once both have ended.
+//! init, the first program (spec 13.4), which from milestone 1.4c lives as
+//! long as the system. It checks its table of services
+//! (init::table::TABLE) before anything else, and refuses a table it could
+//! not keep its promises with, or one whose program the boot image lacks,
+//! with the line `init: table refused: <reason>` and the code 2, which the
+//! kernel ends with a panic (spec 7.9). Then it maps the boot image, makes
+//! its channel, starts its worker thread (worker.rs), which loads the
+//! records of the table in the order of their dependencies, and serves the
+//! channel from its main thread at 63 (serve.rs), where it restarts the
+//! services that fail. Once the first start of each record is done, or
+//! waits for quota, it prints `init: services started`.
 
 #![no_std]
 #![no_main]
 
-use abi::{Error, Policy};
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use rt::handle::Process;
-use rt::{Handle, Stack, println, sys};
+mod serve;
+mod worker;
+
+use abi::{Access, Rights};
+use bootimg::{BootImage, Program};
+use init::labels::Labels;
+use init::table::{self, MAX_RECORDS, Record, TABLE};
+use proto_init::{OWN_ARGS_MAX, SERVICE_ARGS_FIXED};
+use rt::handle::{Memory, Process};
+use rt::service::Config;
+use rt::{Handle, println, sys};
 
 rt::entry!(main);
 
-/// The threads' level, below init's 63.
-const LEVEL: u8 = 10;
-/// Lines each thread prints.
-const TURNS: u64 = 3;
-const STACK_SIZE: usize = 16 * 1024;
-const PAGE: usize = 4096;
+// The arguments init gives a record fit the start data of rt (spec 13.3).
+const _: () = assert!(SERVICE_ARGS_FIXED + OWN_ARGS_MAX <= rt::startup::ARGS_MAX);
+// Init lives on the stack of the main thread (64 KiB, INIT_STACK_SIZE of
+// xtask), twice while `Init::new` builds it.
+const _: () = assert!(core::mem::size_of::<serve::Init>() <= 20 * 1024);
 
-/// What a thread shows its peer: how far it has counted, and whether it
-/// is done.
-struct Progress {
-    count: AtomicU64,
-    done: AtomicBool,
-}
-
-static PROGRESS: [Progress; 2] = [const {
-    Progress {
-        count: AtomicU64::new(0),
-        done: AtomicBool::new(false),
-    }
-}; 2];
-static STACKS: [Stack<STACK_SIZE>; 2] = [const { Stack::new() }; 2];
+/// Where init maps the boot image, read-only, for as long as it lives: the
+/// programs it loads are read from there.
+const IMAGE: usize = 0x50_0000_0000;
+/// The priority of the slot of label 0 of init's channel: no handle
+/// without a label with SEND or NOTIFY ever leaves init.
+const CHANNEL_PRIORITY: u8 = 1;
+/// The sessions of init's channel: those of the instance of each record,
+/// and of the one before it until its CLIENT_GONE.
+const SESSIONS: usize = 2 * MAX_RECORDS;
+/// Init's code for a table it refuses.
+const REFUSED: u64 = 2;
 
 fn main(_: u64) -> u64 {
     let init = rt::init_handles().expect("init's first handles come once");
-    rt::console::set(init.resource);
-    println!("init: hello from EL0");
-    println!("init: threads 1 and 2 take turns at priority {LEVEL}, round robin");
-    for i in 0..2 {
-        start(&init.process, i).expect("init starts its threads");
+    // The console gets a copy with DEBUG alone; init keeps the resource
+    // for the windows, the bindings and the consoles it gives.
+    if let Ok(console) = sys::handle_duplicate(&init.resource, Rights::DEBUG) {
+        rt::console::set(console);
     }
-    // Both threads are above init now; the call returns once both ended.
-    sys::thread_set_priority(&init.thread, 1, Policy::Fifo).expect("init lowers itself");
-    println!("init: both threads are done");
-    0
-}
-
-/// Starts thread `i` of the two in init's process `own`; its message
-/// buffer lies above init's own.
-fn start(own: &Handle<Process>, i: usize) -> Result<(), Error> {
-    let buffer = abi::INIT_MSGBUF as usize + (i + 1) * PAGE;
-    // SAFETY: the stack is the thread's alone.
-    let t = unsafe {
-        sys::thread_create(
-            own,
-            turns,
-            STACKS[i].top(),
-            i as u64,
-            LEVEL,
-            Policy::RoundRobin,
-            buffer,
-        )
-    }?;
-    sys::thread_start(&t)?;
-    // The thread goes on without the handle.
-    t.close()
-}
-
-/// Thread `me` of the two (0 or 1) prints its turn, then counts, with no
-/// call, until its peer has run: that is when the thread's quantum ended
-/// and the peer's did too. A peer that is done lets the last turn go.
-extern "C" fn turns(me: u64) -> ! {
-    let me = me as usize;
-    let (mine, peer) = (&PROGRESS[me], &PROGRESS[1 - me]);
-    for turn in 1..=TURNS {
-        println!("thread {}: turn {turn}", me + 1);
-        if turn < TURNS {
-            let seen = peer.count.load(Relaxed);
-            while peer.count.load(Relaxed) == seen && !peer.done.load(Relaxed) {
-                mine.count.fetch_add(1, Relaxed);
-            }
+    let order = match table::check(TABLE) {
+        Ok(order) => order,
+        Err(e) => {
+            println!("init: table refused: {e}");
+            return REFUSED;
         }
+    };
+    let programs = match programs(&init.process, &init.boot_image) {
+        Ok(programs) => programs,
+        Err(r) => {
+            println!(
+                "init: table refused: {} has no program {} in the boot image",
+                r.name, r.program
+            );
+            return REFUSED;
+        }
+    };
+    let channel = sys::channel_create(CHANNEL_PRIORITY).expect("init makes its channel");
+    let mut labels = Labels::new();
+    let label = labels.next().expect("the first label");
+    let worker = worker::Worker::start(&init.process, &channel, &init.resource, label)
+        .expect("init starts its worker thread");
+    let mut service = serve::Init::new(init.process, init.resource, worker, labels, programs);
+    service.start(&channel, &order);
+    let config = Config {
+        issued: 0,
+        heartbeat: None,
+    };
+    let error = rt::service::run::<_, SESSIONS, 1>(&channel, &mut service, config);
+    panic!("init stopped serving its channel: {error:?}")
+}
+
+/// The program of each record of the table, by its place, from the boot
+/// image `image`, which init maps at IMAGE through its process `own`; the
+/// first record whose program is not in the image.
+fn programs(
+    own: &Handle<Process>,
+    image: &Handle<Memory>,
+) -> Result<[Option<Program<'static>>; MAX_RECORDS], &'static Record> {
+    let size = sys::memory_info(image).map_or(0, |info| info.size);
+    let mapped = sys::mem_map(own, image, 0, size, IMAGE, Access::Read).is_ok();
+    let bytes: &'static [u8] = if mapped {
+        // SAFETY: the boot image is mapped at IMAGE, read-only, for as long
+        // as init lives, and nothing maps anything else there.
+        unsafe { core::slice::from_raw_parts(IMAGE as *const u8, size as usize) }
+    } else {
+        &[]
+    };
+    let boot = BootImage::parse(bytes).ok();
+    let mut programs = [None; MAX_RECORDS];
+    for (place, r) in TABLE.iter().enumerate() {
+        let file = boot.and_then(|b| b.files().find(|f| f.name == r.program));
+        let program = file.and_then(|f| Program::parse(f.data).ok());
+        programs[place] = Some(program.ok_or(r)?);
     }
-    mine.done.store(true, Relaxed);
-    sys::thread_exit()
+    Ok(programs)
 }

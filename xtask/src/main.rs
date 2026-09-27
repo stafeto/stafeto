@@ -21,13 +21,31 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a child of the test init (tests/child), which its loader
 /// maps (rt::loader).
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
-/// The programs of the boot image of the normal build and of the test
-/// init's runs: each file's name in the image, the package that builds it
-/// for EL0 and the size of its stack. Init comes first (spec 13.1).
-const BOOT_PROGRAMS: [(&str, &str, u32); 1] = [("init", "init", INIT_STACK_SIZE)];
-const TEST_PROGRAMS: [(&str, &str, u32); 2] = [
-    ("init", "test-init", INIT_STACK_SIZE),
-    ("child", "test-child", CHILD_STACK_SIZE),
+/// The stack of a test service (tests/svc), which init's loader maps.
+const SVC_STACK_SIZE: u32 = 16 * 1024;
+/// A program of a boot image: its file's name in the image, the package
+/// that builds it for EL0, the size of its stack and the features of the
+/// package it builds with.
+type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
+/// The programs of the boot image of the normal build, of the test init's
+/// runs, of the runs of init's test table and of the two tables init
+/// refuses (spec 15.2). Init comes first (spec 13.1).
+const BOOT_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &[])];
+const TEST_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "test-init", INIT_STACK_SIZE, &[]),
+    ("child", "test-child", CHILD_STACK_SIZE, &[]),
+];
+const SVC_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-test"]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+];
+const CYCLE_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-cycle"]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+];
+const CEILING_PROGRAMS: [ImageProgram; 2] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-ceiling"]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 /// The profiles the programs of those boot images build with (spec 5.4,
 /// 15.2): the image that ships with `--release`, the test images with
@@ -96,30 +114,48 @@ const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
 const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
-/// What init prints on the normal build (services/init), each line whole;
-/// the order of the threads' lines depends on the timer and is not
-/// checked.
-const INIT_LINES: [&str; 9] = [
-    "init: hello from EL0",
-    "init: threads 1 and 2 take turns at priority 10, round robin",
-    "thread 1: turn 1",
-    "thread 2: turn 1",
-    "thread 1: turn 2",
-    "thread 2: turn 2",
-    "thread 1: turn 3",
-    "thread 2: turn 3",
-    "init: both threads are done",
+/// The line init prints once the first start of each record of its table
+/// is done (spec 13.4); init lives on after it, and xtask stops QEMU on
+/// it.
+const SERVICES_STARTED: &str = "init: services started";
+/// The names of the records of init's test table (services/init, feature
+/// `table-test`), which the init that ships does not carry.
+const TEST_TABLE_NAMES: [&str; 11] = [
+    "sink", "echo", "slow", "device", "crash", "silent", "mute", "checker", "private", "hog",
+    "oneshot",
+];
+/// The start of the line init prints when the client `checker` of its
+/// test table ends, and the whole line: its policy is never (spec 13.4).
+/// xtask stops QEMU on it.
+const CHECKER_END: &str = "init: checker ended: ";
+const CHECKER_ENDED: &str = "init: checker ended: exit code 0, not restarted";
+/// Init's decisions on the failures of `crash` of its test table, in
+/// their order (spec 13.4, 16.2): four restarts, each pause twice the one
+/// before, then the mark of a broken service.
+const CRASH_DECISIONS: [&str; 5] = [
+    "restarts in 100 ms",
+    "restarts in 200 ms",
+    "restarts in 400 ms",
+    "restarts in 800 ms",
+    "broken: 5 failures in 60 s",
+];
+/// The lines init prints when its watchdog finds a service silent (spec
+/// 13.4, 16.2), in their order: `mute`, which never registers, killed from
+/// one above its ceiling of 30 four times and then broken, and `silent`,
+/// killed from one above its ceiling of 32 and restarted.
+const SILENT_KILLED: [&str; 6] = [
+    "init: mute went silent, killed from level 31; restarts in 100 ms",
+    "init: mute went silent, killed from level 31; restarts in 200 ms",
+    "init: mute went silent, killed from level 31; restarts in 400 ms",
+    "init: mute went silent, killed from level 31; restarts in 800 ms",
+    "init: mute went silent, killed from level 31; broken: 5 failures in 60 s",
+    "init: silent went silent, killed from level 33; restarts in 100 ms",
 ];
 /// Where RAM starts on QEMU's `virt`.
 const VIRT_RAM: u64 = 0x4000_0000;
 /// The kernel's lines of the GIC on QEMU's GICv2 and GICv3 (spec 9).
 const GIC_V2_LINE: &str = "gic        v2 distributor 0x8000000, cpu interface 0x8010000";
 const GIC_V3_LINE: &str = "gic        v3 distributor 0x8000000, redistributor 0x80a0000";
-/// The kernel's last line when init exits with 0 (spec 7.9).
-const INIT_EXIT: &str = "init exited with code 0";
-/// The test init's exit under HVF, where one of its tests fails
-/// (qemu::hvf_verdict): its code is its count of failures.
-const INIT_EXIT_HOLE: &str = "init exited with code 1";
 /// The frequency of the counter of Apple's processors (CNTFRQ_EL0), which
 /// HVF passes on.
 const HVF_HZ: u64 = 24_000_000;
@@ -173,7 +209,23 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 214;
+const INIT_TESTS: u32 = 216;
+/// Tests the client `checker` of init's test table has (tests/svc).
+const SVC_TESTS: u32 = 26;
+/// What init prints for each table it refuses (services/init, features
+/// `table-cycle` and `table-ceiling`), each line whole.
+const REFUSED: [(&str, &[ImageProgram], &str); 2] = [
+    (
+        "boot-cycle.img",
+        &CYCLE_PROGRAMS,
+        "init: table refused: the connections make a cycle: a -> b -> a",
+    ),
+    (
+        "boot-ceiling.img",
+        &CEILING_PROGRAMS,
+        "init: table refused: low at priority 40 is below the ceiling 50 of its client high",
+    ),
+];
 /// A data segment bigger than the biggest memory object (abi::MAX_MEMORY)
 /// by a page.
 const HUGE_DATA: u64 = abi::MAX_MEMORY + bootimg::PAGE_SIZE;
@@ -388,11 +440,7 @@ struct Artifacts {
 static BUILDS: Mutex<Vec<(Variant, Artifacts)>> = Mutex::new(Vec::new());
 /// A boot image name with the programs it names: the name stands for its
 /// programs, so a cache keyed on both never returns another list's image.
-type BootImageKey = (
-    &'static str,
-    &'static [(&'static str, &'static str, u32)],
-    Profile,
-);
+type BootImageKey = (&'static str, &'static [ImageProgram], Profile);
 /// The boot images of this run of xtask, one per name and program list.
 static BOOT_IMAGES: Mutex<Vec<(BootImageKey, PathBuf)>> = Mutex::new(Vec::new());
 
@@ -448,13 +496,16 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     })
 }
 
-/// Builds `programs` for EL0 with `profile` and, under target_dir, a boot
-/// image `name` whose files they are, in their order, each with its name
-/// and the stack size its header asks for (spec 3.3, 13.1); once in a run
-/// of xtask for this `(name, programs, profile)`.
+/// Builds `programs` for EL0 with `profile` and their features and, under
+/// target_dir, a boot image `name` whose files they are, in their order,
+/// each with its name and the stack size its header asks for (spec 3.3,
+/// 13.1); once in a run of xtask for this `(name, programs, profile)`. The
+/// ELF file of each program is copied under target_dir right after the
+/// build (`image_elf`): cargo writes the builds of one package with other
+/// features to one path, and the checks of the ELF files take the copies.
 fn build_boot_image(
     name: &'static str,
-    programs: &'static [(&'static str, &'static str, u32)],
+    programs: &'static [ImageProgram],
     profile: Profile,
 ) -> Result<PathBuf, String> {
     once(&BOOT_IMAGES, (name, programs, profile), || {
@@ -462,23 +513,38 @@ fn build_boot_image(
     })
 }
 
+/// The copy of the ELF file of `package` that the boot image `image` was
+/// built from, under the directory `target`.
+fn image_elf(target: &Path, image: &str, package: &str) -> PathBuf {
+    let dir = image.strip_suffix(".img").unwrap_or(image);
+    target.join("images").join(dir).join(package)
+}
+
 fn write_boot_image(
     name: &str,
-    programs: &[(&str, &str, u32)],
+    programs: &[ImageProgram],
     profile: Profile,
 ) -> Result<PathBuf, String> {
     let mut cmd = cargo();
     cmd.arg("build").args(profile.args());
     cmd.args(["--target", PROGRAM_TARGET]);
-    for (_, package, _) in programs {
+    for (_, package, _, features) in programs {
         cmd.args(["--package", package]);
+        for feature in *features {
+            cmd.args(["--features", &format!("{package}/{feature}")]);
+        }
     }
     run_cmd(&mut cmd)?;
     let target = target_dir();
     let mut files = Vec::new();
-    for &(file, package, stack) in programs {
-        let elf = cargo_output(&target, PROGRAM_TARGET, profile, package);
+    for &(file, package, stack, _) in programs {
+        let built = cargo_output(&target, PROGRAM_TARGET, profile, package);
+        let elf = image_elf(&target, name, package);
         let why = |e: String| format!("{}: {e}", elf.display());
+        if let Some(dir) = elf.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| why(e.to_string()))?;
+        }
+        std::fs::copy(&built, &elf).map_err(|e| format!("{}: {e}", built.display()))?;
         let bytes = std::fs::read(&elf).map_err(|e| why(e.to_string()))?;
         let program = bootimg::elf::program(&bytes, stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
@@ -587,11 +653,15 @@ fn test() -> Result<(), String> {
     test_build_carries_test_symbols()?;
     strict_panic_only_in_checked_programs()?;
     no_u128_division_is_linked()?;
+    shipping_init_has_no_test_table()?;
     init_tests(&qemu::VIRT, false)?;
     init_tests(&qemu::VIRT_2G, false)?;
     init_tests(&qemu::VIRT, true)?;
     init_tests(&qemu::VIRT_2G, true)?;
     init_tests(&qemu::VIRT_V3, false)?;
+    svc_tests(&qemu::VIRT)?;
+    svc_tests(&qemu::VIRT_V3)?;
+    bad_tables_are_refused()?;
     kernel_tests(&qemu::VIRT, Variant::Test)?;
     kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
     kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
@@ -609,6 +679,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "bootimg",
         "--package",
+        "init",
+        "--package",
         "kcore",
         "--package",
         "proto-init",
@@ -619,22 +691,14 @@ fn host_tests() -> Result<(), String> {
     ]))
 }
 
-/// Init on the normal build prints its lines and exits, and the kernel
-/// turns the machine off (spec 7.9).
-fn expect_init_run(o: &qemu::Outcome) -> Result<(), String> {
-    for line in INIT_LINES {
-        qemu::expect_line(o, line)?;
-    }
-    qemu::expect_clean_exit_with(o, INIT_EXIT)
-}
-
 /// A normal build boots on machine `m`, prints its report (boot_report)
 /// with the line of the GIC, `gic`, and init's entry point from the boot
-/// image, starts init, and powers the machine off when init exits. Gives
-/// the timer's frequency. On VIRT_EL2 and VIRT_EL2_V3 the kernel is
-/// entered at EL2, as the PinePhone's loader does: head.S must drop to
-/// EL1, with a GICv3 open its system registers to EL1 first, and power-off
-/// goes through SMC. The image also carries none of the kernel's own
+/// image, and starts init, which checks its table, starts its services
+/// and says so: xtask stops QEMU on SERVICES_STARTED, with no panic before
+/// it (qemu::expect_stopped_on). Gives the timer's frequency. On VIRT_EL2
+/// and VIRT_EL2_V3 the kernel is entered at EL2, as the PinePhone's loader
+/// does: head.S must drop to EL1, and with a GICv3 open its system
+/// registers to EL1 first. The image also carries none of the kernel's own
 /// tests (spec 3.4): `no_test_symbols` checks it here so every normal
 /// build, not just the one that ships, is covered.
 fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
@@ -642,9 +706,8 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    qemu::expect_clean_exit_with(&o, "boot complete")?;
-    expect_init_run(&o)?;
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SERVICES_STARTED))?;
+    qemu::expect_stopped_on(&o, SERVICES_STARTED)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     let size = std::fs::metadata(&a.boot_image)
@@ -699,9 +762,8 @@ fn two_gib_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT_2G, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
-    qemu::expect_clean_exit_with(&o, "boot complete")?;
-    expect_init_run(&o)?;
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SERVICES_STARTED))?;
+    qemu::expect_stopped_on(&o, SERVICES_STARTED)?;
     let free =
         qemu::number_after(&o.lines, "frames ").ok_or("the kernel printed no frames line")?;
     if free < 1900 {
@@ -898,21 +960,66 @@ fn test_build_carries_test_symbols() -> Result<(), String> {
 }
 
 /// The ELF files of the programs of the boot image that ships and of the
-/// test images, each with the profile of its image, built.
+/// test images, each with the profile of its image: the copies their
+/// images were built from (`image_elf`).
 fn program_elfs() -> Result<Vec<(PathBuf, Profile)>, String> {
     let target = target_dir();
     let mut elfs = Vec::new();
     for (name, programs, profile) in [
         ("boot.img", &BOOT_PROGRAMS[..], BOOT_PROFILE),
         ("boot-test.img", &TEST_PROGRAMS[..], TEST_PROFILE),
+        ("boot-svc.img", &SVC_PROGRAMS[..], TEST_PROFILE),
+        ("boot-cycle.img", &CYCLE_PROGRAMS[..], TEST_PROFILE),
+        ("boot-ceiling.img", &CEILING_PROGRAMS[..], TEST_PROFILE),
     ] {
         build_boot_image(name, programs, profile)?;
-        for (_, package, _) in programs {
-            let elf = cargo_output(&target, PROGRAM_TARGET, profile, package);
-            elfs.push((elf, profile));
+        for (_, package, _, _) in programs {
+            elfs.push((image_elf(&target, name, package), profile));
         }
     }
     Ok(elfs)
+}
+
+/// Init's program as the boot image at `path` carries it: its header and
+/// segments, with no symbols and no debug information.
+fn init_program(path: &Path) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    bootimg::BootImage::parse(&bytes)
+        .and_then(bootimg::BootImage::init)
+        .map(<[u8]>::to_vec)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Spec 13.4, 15.2: the init of the boot image that ships carries no
+/// record of init's test table, whose names the init of the image of that
+/// table carries: each of TEST_TABLE_NAMES is looked for in the bytes of
+/// both programs (`init_program`).
+fn shipping_init_has_no_test_table() -> Result<(), String> {
+    let shipping = init_program(&build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?)?;
+    let testing = init_program(&build_boot_image(
+        "boot-svc.img",
+        &SVC_PROGRAMS,
+        TEST_PROFILE,
+    )?)?;
+    let carries =
+        |bytes: &[u8], name: &str| bytes.windows(name.len()).any(|w| w == name.as_bytes());
+    for name in TEST_TABLE_NAMES {
+        if carries(&shipping, name) {
+            return Err(format!(
+                "the init that ships carries the test record {name}"
+            ));
+        }
+        if !carries(&testing, name) {
+            return Err(format!(
+                "the init of the test table lacks its record {name}"
+            ));
+        }
+    }
+    println!(
+        "no record of the test table in the init that ships, {} names",
+        TEST_TABLE_NAMES.len()
+    );
+    Ok(())
 }
 
 /// The start of the panic of rt on BAD_HANDLE (rt::sys), which a program
@@ -1024,7 +1131,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     }
     let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
     let r = qemu::parse_report(&o.lines);
-    qemu::counted_verdict(&o, &r)?;
+    qemu::counted_verdict(&o, &r, None)?;
     for name in ICOUNT_TESTS {
         if r.passed.iter().any(|p| p == name) != icount {
             return Err(format!(
@@ -1093,8 +1200,9 @@ fn ticks_of(lines: &[String], what: &str, rows: &[&str]) -> Result<Vec<u64>, Str
 /// program (tests/child) as the second file of the boot image: each of its
 /// INIT_TESTS tests passes once, the lines it, its children and the kernel
 /// print for the tests come whole, CHILD_FAULTS children fault, and it
-/// exits with 0, which turns the machine off. Its first line says how long
-/// a counted loop took, which under -icount must be the loop's
+/// exits with 0, which the kernel ends with a panic that names the code
+/// (qemu::expect_init_exit after `TESTS DONE`). Its first line says how
+/// long a counted loop took, which under -icount must be the loop's
 /// instructions; there it also prints the costs of the build that ships
 /// (NORMAL_BUILD_ROWS), which fail nothing by their numbers (spec 15.3).
 /// Under HVF qemu::hvf_verdict judges the run: the test of a window on a
@@ -1114,7 +1222,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     if hvf {
         qemu::hvf_verdict(&o, &r)?;
     } else {
-        qemu::counted_verdict(&o, &r)?;
+        qemu::counted_verdict(&o, &r, Some(0))?;
     }
     if r.total != Some(INIT_TESTS) {
         return Err(format!(
@@ -1122,8 +1230,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
             r.total
         ));
     }
-    let exit = if hvf { INIT_EXIT_HOLE } else { INIT_EXIT };
-    for line in TEST_INIT_LINES.into_iter().chain([exit]) {
+    for line in TEST_INIT_LINES {
         qemu::expect_line(&o, line)?;
     }
     child_panic_comes_whole(&o.lines)?;
@@ -1158,6 +1265,125 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     Ok(r.passed.len())
 }
 
+/// The image of init's test table (spec 15.2): init built with
+/// `table-test` and the test services (tests/svc), on the normal build of
+/// the kernel, on machine `m`. The client `checker` runs its tests: each
+/// of its SVC_TESTS passes once, then it ends, and xtask stops QEMU on
+/// init's line of its end (qemu::counted_verdict of a run stopped on its
+/// line, where no panic may come). Init's lines of the failures and of
+/// the end of the client come whole
+/// (`failure_lines_name_the_reason_and_the_pause`,
+/// `a_client_that_ends_is_not_restarted`). Gives the number of tests that
+/// passed.
+fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
+    let a = build(Variant::Normal)?;
+    let image = build_boot_image("boot-svc.img", &SVC_PROGRAMS, TEST_PROFILE)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, TEST_TIMEOUT, Some(CHECKER_END))?;
+    let r = qemu::parse_report(&o.lines);
+    qemu::counted_verdict(&o, &r, None)?;
+    failure_lines_name_the_reason_and_the_pause(&o.lines)?;
+    the_watchdog_names_the_level_it_kills_from(&o.lines)?;
+    a_client_that_ends_is_not_restarted(&o)?;
+    if r.total != Some(SVC_TESTS) {
+        return Err(format!(
+            "the checker has {:?} tests, {SVC_TESTS} expected",
+            r.total
+        ));
+    }
+    println!("service tests on {}: {} passed", m.name, r.passed.len());
+    Ok(r.passed.len())
+}
+
+/// Spec 13.4, 16.2: init prints one line for each failure of `crash` of
+/// its test table, with its reason, a fault at address 0 with the
+/// syndrome and the address of the load, and its decision, those of
+/// CRASH_DECISIONS in their order. The wait of `hog` for quota is no
+/// failure: one line says that it waits, none that it ended or did not
+/// load.
+fn failure_lines_name_the_reason_and_the_pause(lines: &[String]) -> Result<(), String> {
+    let crash: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("init: crash ended: "))
+        .collect();
+    if crash.len() != CRASH_DECISIONS.len() {
+        return Err(format!(
+            "{} lines of failures of crash, {} expected: {crash:?}",
+            crash.len(),
+            CRASH_DECISIONS.len()
+        ));
+    }
+    let hex = |s: &str| u64::from_str_radix(s, 16).is_ok();
+    for (line, decision) in crash.iter().zip(CRASH_DECISIONS) {
+        let (reason, got) = line.split_once("; ").unwrap_or((line, ""));
+        let fault = reason
+            .strip_prefix("fault ESR=0x")
+            .and_then(|r| r.split_once(" FAR=0x0 ELR=0x"))
+            .is_some_and(|(esr, elr)| hex(esr) && hex(elr));
+        if !fault || got != decision {
+            return Err(format!(
+                "init: crash ended: {line}: a fault at 0 and {decision:?} expected"
+            ));
+        }
+    }
+    let waits = lines
+        .iter()
+        .filter(|l| l.starts_with("init: hog waits for quota: needs "))
+        .count();
+    let failed = lines
+        .iter()
+        .find(|l| l.starts_with("init: hog ended") || l.starts_with("init: hog did not load"));
+    match (waits, failed) {
+        (1, None) => Ok(()),
+        (_, Some(line)) => Err(format!("the wait of hog for quota failed it: {line}")),
+        (n, None) => Err(format!("{n} lines of hog's wait for quota, one expected")),
+    }
+}
+
+/// Spec 13.4, 16.2: init names the level its worker kills a silent
+/// service from, one above the service's ceiling, and its decision: every
+/// line of a silent service whole, in its order, and no other
+/// (SILENT_KILLED).
+fn the_watchdog_names_the_level_it_kills_from(lines: &[String]) -> Result<(), String> {
+    let got: Vec<&str> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|l| l.contains(" went silent, "))
+        .collect();
+    if got != SILENT_KILLED {
+        return Err(format!(
+            "the lines of silent services are {got:?}, {SILENT_KILLED:?} expected"
+        ));
+    }
+    Ok(())
+}
+
+/// Spec 13.4: the client `checker`, whose policy is never, ends with code
+/// 0 once its tests are done, and init does not start it again: the run
+/// stopped on CHECKER_ENDED, its last line, with no panic before it.
+fn a_client_that_ends_is_not_restarted(o: &qemu::Outcome) -> Result<(), String> {
+    qemu::expect_stopped_on(o, CHECKER_ENDED)
+}
+
+/// Spec 13.4, 15.2: init refuses each table of REFUSED before it starts
+/// anything. Its image, on the normal build of the kernel on VIRT, prints
+/// the reason line whole and ends with init's exit with code 2, which the
+/// kernel ends with a panic after it (qemu::expect_init_exit).
+fn bad_tables_are_refused() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    for (name, programs, reason) in REFUSED {
+        let image = build_boot_image(name, programs, TEST_PROFILE)?;
+        let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        qemu::expect_line(&o, reason)?;
+        qemu::expect_init_exit(&o, "init: table refused: ", 2)?;
+    }
+    println!("bad tables refused: {} images", REFUSED.len());
+    Ok(())
+}
+
 /// The panic of a child comes whole (spec 13.2): a line with where it
 /// panicked, CHILD_PANIC_AT and the line and column, then CHILD_PANIC on
 /// the next line.
@@ -1189,9 +1415,10 @@ fn gdb() -> Result<(), String> {
 
 /// `cargo xtask hvf` (spec 14, 15.2): on a Mac with Apple silicon, for
 /// HVF_V3 and then HVF_V2, the boot of the normal build with the counter
-/// at HVF_HZ, the test init under qemu::hvf_verdict and the kernel tests,
-/// with a line of results for each machine. Elsewhere it prints why it
-/// skips and succeeds: `ci` does not run it.
+/// at HVF_HZ, the test init under qemu::hvf_verdict, the image of init's
+/// test table and the kernel tests, with a line of results for each
+/// machine. Elsewhere it prints why it skips and succeeds: `ci` does not
+/// run it.
 fn hvf() -> Result<(), String> {
     if let Err(why) = hvf_host() {
         println!(
@@ -1205,9 +1432,10 @@ fn hvf() -> Result<(), String> {
             return Err(format!("the counter runs at {hz} Hz on {}", m.name));
         }
         let init = init_tests(m, false)?;
+        let svc = svc_tests(m)?;
         let kernel = kernel_tests(m, Variant::Test)?;
         println!(
-            "hvf on {}: boot ok, init tests {init} passed (hole reads zero), kernel tests {kernel} passed",
+            "hvf on {}: boot ok, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
@@ -1252,6 +1480,18 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
+    // init's library and its tests on the host; its program builds for
+    // stafeto alone, below.
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "init",
+        "--lib",
+        "--tests",
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     run_cmd(cargo().args([
         "clippy",
         "--package",
@@ -1280,6 +1520,8 @@ fn ci() -> Result<(), String> {
         "test-init",
         "--package",
         "test-child",
+        "--package",
+        "test-svc",
         "--target",
         PROGRAM_TARGET,
         "--",

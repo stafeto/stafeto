@@ -7,11 +7,29 @@ repository.workspace = true
 license = "GPL-3.0-or-later"
 description = "The first program of stafeto"
 
+# What init decides, apart from the calls it makes: tested on the host.
+[lib]
+bench = false
+
 [[bin]]
 name = "init"
 test = false
 bench = false
 
+# The table init starts (init::table::TABLE): the one that ships without
+# a feature; each test image builds with one of these, never two.
+[features]
+table-test = []
+table-cycle = []
+table-ceiling = []
+
 [dependencies]
 abi = { path = "../../lib/abi" }
+bootimg = { path = "../../lib/bootimg" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }

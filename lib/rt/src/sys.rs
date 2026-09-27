@@ -626,6 +626,21 @@ pub struct Reply {
     pub words: [u64; 8],
 }
 
+impl Reply {
+    /// The bytes of the reply in `buffer`: from x2-x9, or from the message
+    /// buffer when they are more than 64 (`send` put them all there). Read
+    /// them before the thread's next call that carries a message.
+    pub fn bytes<'a>(&self, buffer: &'a mut [u8; MESSAGE_MAX]) -> &'a [u8] {
+        let bytes = &mut buffer[..self.len.min(MESSAGE_MAX)];
+        if self.len <= INLINE_MAX {
+            bytes.copy_from_slice(&abi::inline_bytes(&self.words)[..self.len]);
+        } else {
+            msgbuf::read(0, bytes);
+        }
+        bytes
+    }
+}
+
 /// x0-x9 of a message of `bytes` and `handles` through `target`, a channel
 /// or a token, with `flags` in its description: bytes 0-63 in x2-x9, and
 /// the rest, written into the message buffer at their offsets, with the

@@ -18,6 +18,9 @@ name = "init"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
+ "proto-init",
+ "proto-wire",
  "rt",
 ]
 
@@ -82,6 +85,16 @@ dependencies = [
  "proto-wire",
  "rt",
  "test-child",
+]
+
+[[package]]
+name = "test-svc"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]

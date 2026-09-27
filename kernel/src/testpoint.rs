@@ -54,8 +54,7 @@ mod points {
         false
     }
 
-    /// Init ended (process::init_ended); the kernel then turns the machine
-    /// off or stops it.
+    /// Init ended (process::init_ended); the kernel then panics.
     #[inline(always)]
     pub fn init_ended() {}
 

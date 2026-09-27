@@ -22,7 +22,7 @@ use rt::startup::{Answered, Giver, StartError};
 use rt::wait::{Waited, Waiter};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 35] = [
+pub(crate) const TESTS: [Test; 37] = [
     ("dropped_handle_closes", dropped_handle_closes),
     ("into_raw_keeps_the_handle", into_raw_keeps_the_handle),
     ("borrowed_handle_stays_open", borrowed_handle_stays_open),
@@ -87,6 +87,14 @@ pub(crate) const TESTS: [Test; 35] = [
     (
         "giver_refuses_out_of_layout_and_after_last",
         giver_refuses_out_of_layout_and_after_last,
+    ),
+    (
+        "start_reply_to_a_dead_child_ends_the_giver",
+        start_reply_to_a_dead_child_ends_the_giver,
+    ),
+    (
+        "start_reply_past_the_handle_limit_ends_the_giver",
+        start_reply_past_the_handle_limit_ends_the_giver,
     ),
     (
         "failed_spawn_leaves_no_handles",
@@ -931,6 +939,133 @@ fn giver_refuses_out_of_layout_and_after_last() -> Outcome {
     check(
         ended(0) && result(0)[..5] == expected.map(u64::from),
         "the thread did not get the statuses of the Giver",
+    )
+}
+
+/// Sends one START through the channel HANDLES holds for slot 0;
+/// `result(0)` gets the status of its reply, or the error code of the
+/// send with bit 32, then the thread ends.
+extern "C" fn ask_start(_: u64) -> ! {
+    let start = Header::new(Method::Start.number(), VERSION).bytes();
+    let word = match sys::send(&handle(0), &start) {
+        Ok(reply) => u64::from(reply.words[0] as u32),
+        Err(e) => 1 << 32 | e.code(),
+    };
+    RESULTS[0][0].store(word, Relaxed);
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+/// Whether `giver` answers a START of a thread of init below it, sent
+/// through a channel of init, with BAD_STATE, and the thread gets that
+/// status.
+fn refuses_another_start(giver: &mut Giver) -> Result<bool, &'static str> {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let w = waiter(&c)?;
+    let t = spawn(0, ask_start, 0, LOW, Policy::Fifo)?;
+    let answered = match w.receive_until(&c, clock_now()? + BOUND_NS) {
+        Ok(Waited::Got(Received::Message {
+            len, token, words, ..
+        })) => Some(giver.answer(&abi::inline_bytes(&words)[..len.min(64)], token)),
+        _ => None,
+    };
+    let passed = let_run();
+    close(t)?;
+    drop(w);
+    close(c)?;
+    passed?;
+    let bad_state = Status::Kernel(Error::BadState);
+    Ok(answered == Some(Ok(Answered::Refused(bad_state)))
+        && ended(0)
+        && result(0)[0] == u64::from(bad_state.code()))
+}
+
+/// What came of the last reply of a Giver: its answer, how many of init's
+/// handles went with it, why the child ended, and whether the Giver then
+/// refused another START with BAD_STATE (`refuses_another_start`).
+struct LastReply {
+    answered: Result<Answered, Error>,
+    went: u64,
+    state: ProcessState,
+    refused: bool,
+}
+
+/// The reply to the START of a child at LEVEL with LEAF_QUOTA and room
+/// for `limit` handles, from the start data spawn got ready, which hold
+/// copies of its process and thread; init kills the child between its
+/// START and the reply when `kill`.
+fn last_reply(limit: u32, kill: bool) -> Result<LastReply, &'static str> {
+    let kid = Kid::load(LEAF_QUOTA, limit, LEVEL)?;
+    let last = kid.start().and_then(|()| {
+        let mut giver = with_args(kid.giver()?, &child::args(Role::Exit, &[0]))?;
+        let (bytes, len, token) = kid.ear.start_request()?;
+        if kill {
+            sys::process_kill(&kid.process).map_err(|_| "process_kill of the child failed")?;
+        }
+        let before = live()?;
+        let answered = giver.answer(&bytes[..len.min(64)], token);
+        let went = before.saturating_sub(live()?);
+        let state = kid.end()?;
+        let refused = refuses_another_start(&mut giver)?;
+        Ok(LastReply {
+            answered,
+            went,
+            state,
+            refused,
+        })
+    });
+    kid.close()?;
+    let_run()?;
+    last
+}
+
+/// Spec 6.1, 6.8, 13.3: a reply to START whose child died after it asked
+/// ends the Giver. Init takes the child's START, kills the child and only
+/// then answers: the reply fails with PEER_CLOSED, the copies of the
+/// child's process and thread in it went, and the next START, from a
+/// thread of init, gets BAD_STATE.
+fn start_reply_to_a_dead_child_ends_the_giver() -> Outcome {
+    let last = last_reply(16, true)?;
+    check(
+        last.answered == Err(Error::PeerClosed) && last.state == ProcessState::Killed,
+        "the reply to a killed child did not fail with PEER_CLOSED",
+    )?;
+    check(
+        last.went == 2,
+        "the copies of the process and the thread did not go with the reply",
+    )?;
+    check(
+        last.refused,
+        "the Giver answered a START after its reply to a dead child",
+    )
+}
+
+/// Spec 6.1, 13.3: a reply to START past the child's room for handles
+/// ends the Giver. The child has room for 2 handles, its start channel
+/// takes one, and the reply with its process and thread fails with
+/// LIMIT_REACHED: the copies went, the child ends with the code of
+/// Kernel(LIMIT_REACHED), and the next START, from a thread of init, gets
+/// BAD_STATE.
+fn start_reply_past_the_handle_limit_ends_the_giver() -> Outcome {
+    let last = last_reply(2, false)?;
+    let failed = StartError::Kernel(Error::LimitReached);
+    check(
+        last.answered == Err(Error::LimitReached),
+        "a reply past the child's room for handles did not fail with LIMIT_REACHED",
+    )?;
+    check(
+        last.state == exited(child::start_failed(failed)),
+        "the child did not end with the code of LIMIT_REACHED",
+    )?;
+    check(
+        last.went == 2,
+        "the copies of the process and the thread did not go with the reply",
+    )?;
+    check(
+        last.refused,
+        "the Giver answered a START after its reply past the limit",
     )
 }
 

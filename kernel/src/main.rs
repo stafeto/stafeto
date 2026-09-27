@@ -69,8 +69,8 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     finish(boot, &init)
 }
 
-/// The kernel leaves for init (spec 13.3); init's exit turns the machine
-/// off, and its fault or kill stops it (process::init_ended).
+/// The kernel leaves for init (spec 13.3); any end of init, an exit
+/// among them, is a panic (process::init_ended).
 #[cfg(not(feature = "ktest"))]
 fn finish(boot: &Boot, program: &Program) -> ! {
     kprintln!("boot complete");

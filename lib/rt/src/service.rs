@@ -12,16 +12,19 @@
 //! goes on. CLIENT_GONE of a label ends its session: what the session
 //! held closes, and its deferred replies get PEER_CLOSED. The heartbeat
 //! goes to init from the same thread, at absolute deadlines, so that a
-//! handler that hangs stops it too.
+//! handler that hangs stops it too. `register` gives init the service's
+//! channel and takes its windows and bindings, `connect` asks init for a
+//! session with a service by its name.
 
-use crate::handle::{Any, Channel, Handle, Incoming, Outgoing, Timer};
+use crate::handle::{Any, Channel, Handle, Incoming, Kind, Outgoing, Timer};
 use crate::msgbuf;
+use crate::startup::TakeError;
 use crate::sys::{self, Received, Refused, Token};
 use crate::time;
 use abi::time::next_release;
-use abi::{CLIENT_GONE, Error, INLINE_MAX, MESSAGE_MAX, Source};
-use proto_init::Method;
-use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
+use abi::{CLIENT_GONE, Error, INLINE_MAX, MESSAGE_MAX, Rights, Source};
+use proto_init::{Connect, Method, RegisterReply, START_NAMES};
+use proto_wire::{HEADER_LEN, Header, Name, Reader, Status, Writer};
 
 /// A service: the handlers `run` calls, with K handles and deferred
 /// replies at most in each session.
@@ -541,5 +544,80 @@ impl<'a> Beat<'a> {
         let _ = sys::send(self.to, &Method::Heartbeat.header().bytes());
         // The loop's own timer: timer_set has no error to give.
         let _ = self.arm();
+    }
+}
+
+/// The windows and bindings init gave a service in the reply to its
+/// REGISTER (spec 13.4), each under its name from init's table; those the
+/// service does not take close with it.
+pub struct Registered {
+    names: [Option<Name>; START_NAMES],
+    handles: Incoming,
+}
+
+impl Registered {
+    /// The handle that came under `name`, when its object is of kind `K`:
+    /// it leaves the reply. WrongKind leaves it there.
+    pub fn take<K: Kind>(&mut self, name: &str) -> Result<Handle<K>, TakeError> {
+        let i = self
+            .names
+            .iter()
+            .position(|n| n.is_some_and(|n| n.as_bytes() == name.as_bytes()))
+            .ok_or(TakeError::Missing)?;
+        match self.handles.take(i) {
+            Ok(h) => Ok(h),
+            Err(Error::WrongType) => Err(TakeError::WrongKind),
+            Err(_) => Err(TakeError::Missing),
+        }
+    }
+}
+
+/// REGISTER through `parent`, the service's connection to init
+/// (Startup::parent), with a copy of `channel`, a handle with no label, of
+/// SEND, NOTIFY, DUPLICATE and TRANSFER (spec 13.4): init keeps the copy,
+/// gives copies of it with SEND and TRANSFER to the clients that connect
+/// by the service's name, and answers with the windows and bindings of
+/// the service. A service registers before it connects to other services.
+/// The errors: the copy's handle_duplicate and send as the status, init's
+/// refusal (BAD_STATE for a client or a second REGISTER, ACCESS_DENIED for
+/// other rights), and BAD_SIZE for a reply out of the layout of
+/// proto_init::RegisterReply.
+pub fn register(parent: &Handle<Channel>, channel: &Handle<Channel>) -> Result<Registered, Status> {
+    let rights = Rights::SEND | Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER;
+    let copy = sys::handle_duplicate(channel, rights)?;
+    let request = Method::Register.header().bytes();
+    let reply = sys::send_handles(parent, &request, [copy.erase()])
+        .map_err(|refused| Status::Kernel(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let bytes = reply.bytes(&mut buffer);
+    match Status::from_code(Reader::new(bytes).u32()?) {
+        Status::Ok => {}
+        status => return Err(status),
+    }
+    let names = RegisterReply::read(bytes, reply.handles.len())?.names;
+    Ok(Registered {
+        names,
+        handles: reply.handles,
+    })
+}
+
+/// CONNECT through `parent`, the program's connection to init
+/// (Startup::parent): a session with the service `name` (spec 13.4), a
+/// handle with SEND, TRANSFER and a label of its own. Init answers once
+/// the service registered; a service that is starting again makes the
+/// call wait. The errors: BAD_SIZE for a name that is no name or a reply
+/// out of the layout, send's as the status, and init's refusal:
+/// ACCESS_DENIED for a name init's table does not give the caller,
+/// PEER_CLOSED for a service that broke or ended, LIMIT_REACHED when four
+/// requests wait for it.
+pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, Status> {
+    let name = Name::new(name.as_bytes())?;
+    let mut w = Writer::new();
+    Connect { name }.write(&mut w)?;
+    let mut reply = sys::send(parent, w.as_bytes())?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+        Status::Ok => reply.handles.take(0).map_err(|_| Status::BadSize),
+        status => Err(status),
     }
 }
