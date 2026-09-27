@@ -22,6 +22,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         handle_limit: 32,
         restart: Restart::Always,
         console: false,
+        log: false,
         windows: &[],
         bindings: &[],
         connects,

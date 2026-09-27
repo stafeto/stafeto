@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kcore", "kernel", "lib/abi", "lib/bootimg", "lib/rt", "proto/init", "proto/uart", "proto/wire", "services/init", "services/uart", "tests/child", "tests/init", "tests/svc", "xtask"]
+members = ["apps/shell", "kcore", "kernel", "lib/abi", "lib/bootimg", "lib/rt", "proto/init", "proto/uart", "proto/wire", "services/init", "services/uart", "tests/child", "tests/init", "tests/svc", "xtask"]
 default-members = ["kcore", "lib/abi", "lib/bootimg", "proto/init", "proto/uart", "proto/wire", "xtask"]
 
 [workspace.package]

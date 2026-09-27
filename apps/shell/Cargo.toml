@@ -1,31 +1,24 @@
 [package]
-name = "uart"
+name = "shell"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "The driver of the PL011 UART of stafeto"
+description = "The shell of stafeto"
 
-# What the driver decides, apart from the registers it reaches and the
-# calls it makes: tested on the host.
+# What the shell decides, apart from the calls it makes: tested on the
+# host.
 [lib]
 bench = false
 
 [[bin]]
-name = "uart"
+name = "shell"
 test = false
 bench = false
 
-# `crash`: the method CRASH of proto_uart, a load from address 0 that
-# shows a fault stays inside the driver (spec 13.5); xtask builds the
-# boot image of subproject 1 with it.
-[features]
-crash = []
-
 [dependencies]
 abi = { path = "../../lib/abi" }
-proto-init = { path = "../../proto/init" }
 proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }
 

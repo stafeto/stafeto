@@ -74,6 +74,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shell"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-uart",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "test-child"
 version = "0.1.0"
 dependencies = [
@@ -110,7 +120,10 @@ name = "uart"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-init",
  "proto-uart",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]

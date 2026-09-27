@@ -297,16 +297,22 @@ fn load(record: &Record, label: u64, program: &Program<'static>) -> Result<Spawn
 }
 
 /// The start data of an instance of `record` besides its process and
-/// thread (spec 13.3): a copy of the system resource with DEBUG and
-/// TRANSFER under the name `console` when the record has one, and the
-/// arguments, ServiceArgs with the heartbeat and watchdog of a service (0
-/// for a client) and the record's own arguments.
+/// thread (spec 13.3): copies of the system resource with DEBUG and
+/// TRANSFER under the name `console` and with KSTATS and TRANSFER under
+/// the name `log` when the record has them, and the arguments,
+/// ServiceArgs with the heartbeat and watchdog of a service (0 for a
+/// client) and the record's own arguments.
 fn start_data(record: &Record, spawned: &mut Spawned) -> Result<(), Error> {
-    if record.console {
-        let rights = Rights::DEBUG | Rights::TRANSFER;
-        let console = sys::handle_duplicate(&view::<Resource>(RESOURCE), rights)?;
-        // The third name of the start data fits.
-        let _ = spawned.giver.give("console", console.erase());
+    for (wanted, name, right) in [
+        (record.console, "console", Rights::DEBUG),
+        (record.log, "log", Rights::KSTATS),
+    ] {
+        if wanted {
+            let copy =
+                sys::handle_duplicate(&view::<Resource>(RESOURCE), right | Rights::TRANSFER)?;
+            // The third and fourth names of the start data fit.
+            let _ = spawned.giver.give(name, copy.erase());
+        }
     }
     let watch = record.watch();
     let args = ServiceArgs {

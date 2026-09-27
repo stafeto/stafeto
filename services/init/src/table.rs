@@ -89,6 +89,10 @@ pub struct Record {
     /// A copy of the system resource with DEBUG and TRANSFER in its start
     /// data, under the name `console`.
     pub console: bool,
+    /// A copy of the system resource with KSTATS and TRANSFER in its start
+    /// data, under the name `log`: the console's driver reads the kernel
+    /// log with it (spec 13.3, 16.3).
+    pub log: bool,
     pub windows: &'static [Window],
     pub bindings: &'static [Binding],
     /// The services it may connect to, by name.
@@ -570,6 +574,7 @@ mod tests {
             handle_limit: 16,
             restart: Restart::Always,
             console: false,
+            log: false,
             windows: &[],
             bindings: &[],
             connects: &[],
@@ -1040,7 +1045,7 @@ mod tests {
     /// tables are refused with the reasons xtask looks for in their runs.
     #[test]
     fn the_tables_of_the_images_pass_or_are_refused() {
-        assert_eq!(order_of(normal::TABLE), [""; 0]);
+        assert_eq!(order_of(normal::TABLE), ["uart", "shell"]);
         assert_eq!(
             order_of(test::TABLE),
             [

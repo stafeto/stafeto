@@ -83,8 +83,11 @@
    10 ms for the console's transmitter to go idle, and QEMU exits with
    status 0, at a panic, `init`'s end among them, and at the end of the
    kernel tests, which print `TESTS DONE total=N failed=M` first. The normal build does
-   not end: `init` lives on, and xtask stops QEMU on its line
-   `init: services started`; it stops a run of the image of `init`'s test
+   not end: `init` lives on with the UART driver and the shell, and xtask
+   stops a boot on the shell's line
+   `shell: connected to uart; type help for the commands`, and talks to
+   the shell through a pipe on the console's input in its console
+   dialog; it stops a run of the image of `init`'s test
    table on init's line of the end of the test client there,
    `init: checker ended: ...`. xtask judges a run of tests by its
    `TESTS DONE` line and fails a run with a `KERNEL PANIC` line

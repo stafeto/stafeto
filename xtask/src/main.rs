@@ -23,14 +23,23 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
+/// The stacks of the UART driver (services/uart) and of the shell
+/// (apps/shell), which init's loader maps.
+const UART_STACK_SIZE: u32 = 16 * 1024;
+const SHELL_STACK_SIZE: u32 = 16 * 1024;
 /// A program of a boot image: its file's name in the image, the package
 /// that builds it for EL0, the size of its stack and the features of the
 /// package it builds with.
 type ImageProgram = (&'static str, &'static str, u32, &'static [&'static str]);
 /// The programs of the boot image of the normal build, of the test init's
 /// runs, of the runs of init's test table and of the two tables init
-/// refuses (spec 15.2). Init comes first (spec 13.1).
-const BOOT_PROGRAMS: [ImageProgram; 1] = [("init", "init", INIT_STACK_SIZE, &[])];
+/// refuses (spec 15.2). Init comes first (spec 13.1). The driver of the
+/// image that ships has the method CRASH in subproject 1 (spec 13.5).
+const BOOT_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &[]),
+    ("uart", "uart", UART_STACK_SIZE, &["crash"]),
+    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -114,16 +123,38 @@ const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
 const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
-/// The line init prints once the first start of each record of its table
-/// is done (spec 13.4); init lives on after it, and xtask stops QEMU on
-/// it.
-const SERVICES_STARTED: &str = "init: services started";
+/// The line the shell of the normal build says once it connected to the
+/// UART driver (spec 13.6): the driver registered, its output goes by
+/// interrupts, and the shell's session works. The system lives on after
+/// it, and xtask stops a boot on it.
+const SHELL_CONNECTED: &str = "shell: connected to uart; type help for the commands";
+/// The line of the UART driver at its start (spec 13.5).
+const UART_LINE: &str = "uart: pl011 at 0x9000000, line 33";
+/// The shell's prompt, with no newline after it.
+const PROMPT: &str = "stafeto> ";
+/// The lines of the shell's `help`, each whole (spec 13.6).
+const HELP_LINES: [&str; 7] = [
+    "help        list the commands",
+    "echo WORDS  print the words",
+    "uptime      the time since boot",
+    "ps          the services and their state",
+    "mem         the memory of each process",
+    "bench       the round trip of a request and the latencies",
+    "crash uart  crash the UART driver; init restarts it",
+];
+/// How long a step of the console dialog waits for its answer; its first,
+/// the driver's line, waits BOOT_TIMEOUT.
+const DIALOG_STEP: Duration = Duration::from_secs(10);
 /// The names of the records of init's test table (services/init, feature
 /// `table-test`), which the init that ships does not carry.
 const TEST_TABLE_NAMES: [&str; 11] = [
     "sink", "echo", "slow", "device", "crash", "silent", "mute", "checker", "private", "hog",
     "oneshot",
 ];
+/// Names of TEST_TABLE_NAMES that are words of init's own lines too: a
+/// service that goes silent (`<name> went silent, killed from level ...`),
+/// which the init that ships carries since its table has a service.
+const INIT_WORDS: [&str; 1] = ["silent"];
 /// The start of the line init prints when the client `checker` of its
 /// test table ends, and the whole line: its policy is never (spec 13.4).
 /// xtask stops QEMU on it.
@@ -680,6 +711,8 @@ fn test() -> Result<(), String> {
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
     two_gib_boot()?;
+    console_dialog(&qemu::VIRT)?;
+    console_dialog(&qemu::VIRT_V3)?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
     init_fault_stops_the_machine()?;
@@ -725,6 +758,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-wire",
         "--package",
+        "shell",
+        "--package",
         "uart",
         "--package",
         "xtask",
@@ -733,9 +768,10 @@ fn host_tests() -> Result<(), String> {
 
 /// A normal build boots on machine `m`, prints its report (boot_report)
 /// with the line of the GIC, `gic`, and init's entry point from the boot
-/// image, and starts init, which checks its table, starts its services
-/// and says so: xtask stops QEMU on SERVICES_STARTED, with no panic before
-/// it (qemu::expect_stopped_on). Gives the timer's frequency. On VIRT_EL2
+/// image, and starts init, which checks its table and starts the UART
+/// driver and the shell, which connects to it and says so: xtask stops
+/// QEMU on SHELL_CONNECTED, with no panic before it
+/// (qemu::expect_stopped_on). Gives the timer's frequency. On VIRT_EL2
 /// and VIRT_EL2_V3 the kernel is entered at EL2, as the PinePhone's loader
 /// does: head.S must drop to EL1, and with a GICv3 open its system
 /// registers to EL1 first. The image also carries none of the kernel's own
@@ -746,8 +782,8 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SERVICES_STARTED))?;
-    qemu::expect_stopped_on(&o, SERVICES_STARTED)?;
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     let size = std::fs::metadata(&a.boot_image)
@@ -797,19 +833,71 @@ fn boot_report(
 }
 
 /// With 2 GiB of RAM the second GiB is not mapped at boot: the allocator
-/// must receive it after the kernel page tables map all RAM.
+/// must receive it after the kernel page tables map all RAM. The boot
+/// goes on to the shell (SHELL_CONNECTED).
 fn two_gib_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT_2G, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SERVICES_STARTED))?;
-    qemu::expect_stopped_on(&o, SERVICES_STARTED)?;
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let free =
         qemu::number_after(&o.lines, "frames ").ok_or("the kernel printed no frames line")?;
     if free < 1900 {
         return Err(format!("only {free} MiB of frames free with 2 GiB of RAM"));
     }
     Ok(())
+}
+
+/// Spec 13.5, 13.6, 14: the normal build on machine `m` with a pipe on
+/// the console's input (qemu::Run): the UART driver's line, the shell's
+/// line and its prompt; `help` gives HELP_LINES; `echo hello stafeto`
+/// comes back as its echo, the line typed, then the line `hello stafeto`
+/// after it; `uptime` gives seconds with milliseconds; a prompt after each
+/// answer. The run has no KERNEL PANIC line.
+fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let talked = dialog(&mut run);
+    let o = run.stop();
+    talked.map_err(|e| format!("console dialog on {}: {e}", m.name))?;
+    if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
+        return Err(format!("console dialog on {}: {panic}", m.name));
+    }
+    println!("console dialog on {}: ok", m.name);
+    Ok(())
+}
+
+/// The steps of `console_dialog`, each after the one before it.
+fn dialog(run: &mut qemu::Run) -> Result<(), String> {
+    let whole = |line: &'static str| move |l: &str| l == line;
+    run.expect_line(UART_LINE, whole(UART_LINE), BOOT_TIMEOUT)?;
+    run.expect_line(SHELL_CONNECTED, whole(SHELL_CONNECTED), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("help")?;
+    for line in HELP_LINES {
+        run.expect_line(line, whole(line), DIALOG_STEP)?;
+    }
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("echo hello stafeto")?;
+    run.expect("echo hello stafeto\r\n", DIALOG_STEP)?;
+    run.expect_line("hello stafeto", whole("hello stafeto"), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("uptime")?;
+    run.expect_line("the uptime", is_uptime, DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)
+}
+
+/// Whether `line` is the shell's `uptime`: `up <seconds>.<ms> s`, with
+/// three digits of milliseconds.
+fn is_uptime(line: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    line.strip_prefix("up ")
+        .and_then(|l| l.strip_suffix(" s"))
+        .and_then(|l| l.split_once('.'))
+        .is_some_and(|(s, ms)| digits(s) && digits(ms) && ms.len() == 3)
 }
 
 /// Booting the ELF leaves x0 = 0; the kernel must say why it stops.
@@ -1089,7 +1177,7 @@ fn init_program(path: &Path) -> Result<Vec<u8>, String> {
 /// Spec 13.4, 15.2: the init of the boot image that ships carries no
 /// record of init's test table, whose names the init of the image of that
 /// table carries: each of TEST_TABLE_NAMES is looked for in the bytes of
-/// both programs (`init_program`).
+/// both programs (`init_program`), those of INIT_WORDS only in the second.
 fn shipping_init_has_no_test_table() -> Result<(), String> {
     let shipping = init_program(&build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?)?;
     let testing = init_program(&build_boot_image(
@@ -1100,7 +1188,7 @@ fn shipping_init_has_no_test_table() -> Result<(), String> {
     let carries =
         |bytes: &[u8], name: &str| bytes.windows(name.len()).any(|w| w == name.as_bytes());
     for name in TEST_TABLE_NAMES {
-        if carries(&shipping, name) {
+        if carries(&shipping, name) && !INIT_WORDS.contains(&name) {
             return Err(format!(
                 "the init that ships carries the test record {name}"
             ));
@@ -1113,7 +1201,7 @@ fn shipping_init_has_no_test_table() -> Result<(), String> {
     }
     println!(
         "no record of the test table in the init that ships, {} names",
-        TEST_TABLE_NAMES.len()
+        TEST_TABLE_NAMES.len() - INIT_WORDS.len()
     );
     Ok(())
 }
@@ -1591,12 +1679,14 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
-    // The libraries of init and of the UART driver and their tests on the
-    // host; their programs build for stafeto alone, below.
+    // The libraries of init, of the UART driver and of the shell and their
+    // tests on the host; their programs build for stafeto alone, below.
     run_cmd(cargo().args([
         "clippy",
         "--package",
         "init",
+        "--package",
+        "shell",
         "--package",
         "uart",
         "--lib",
@@ -1632,7 +1722,11 @@ fn ci() -> Result<(), String> {
         "--package",
         "init",
         "--package",
+        "shell",
+        "--package",
         "uart",
+        "--features",
+        "uart/crash",
         "--package",
         "test-init",
         "--package",

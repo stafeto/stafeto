@@ -34,6 +34,7 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         handle_limit: 32,
         restart: Restart::Always,
         console: false,
+        log: false,
         windows: &[],
         bindings: &[],
         connects: &[],
