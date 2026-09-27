@@ -51,6 +51,21 @@ const VZ_PROGRAMS: [ImageProgram; 2] = [
 ];
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
+const RAMFS_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
+];
+const CPROBE_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("cprobe", "cprobe", CHILD_STACK_SIZE, &[]),
+];
+const BUSYBOX_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", CHILD_STACK_SIZE, &[]),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -419,6 +434,9 @@ commands:
   vz        boot the shell through Apple Virtualization.framework
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
+  ramfs     exercise the RAM file service and descriptors in QEMU
+  cprobe    run a statically linked Picolibc C program against ramfs
+  busybox   run BusyBox cat from the boot image against ramfs in QEMU
   help      this text";
 
 fn main() {
@@ -433,6 +451,9 @@ fn main() {
         Some("vz") => vz::run(),
         Some("rtbench") => rtbench::run(&args[1..]),
         Some("ext4ro") => ext4ro_probe(),
+        Some("ramfs") => ramfs_probe(),
+        Some("cprobe") => cprobe(),
+        Some("busybox") => busybox_probe(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -843,9 +864,50 @@ fn ext4ro_probe() -> Result<(), String> {
     Ok(())
 }
 
+fn ramfs_probe() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ramfs.img", &RAMFS_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, BOOT_TIMEOUT, Some("ramfs-probe: ok"), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, "ramfs-probe: ok")?;
+    println!("RAM file service guest probe passed");
+    Ok(())
+}
+
+fn cprobe() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-cprobe.img", &CPROBE_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, BOOT_TIMEOUT, Some("cprobe: ok"), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, "cprobe: ok")?;
+    println!("Picolibc C-program guest probe passed");
+    Ok(())
+}
+
+fn busybox_probe() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    if std::env::var_os("STAFETO_BUSYBOX_ROOT").is_none() {
+        run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    }
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-busybox.img", &BUSYBOX_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_marker(&output, "stafeto ramfs")?;
+    println!("BusyBox cat guest probe passed");
+    Ok(())
+}
+
 fn test() -> Result<(), String> {
     host_tests()?;
     ext4ro_probe()?;
+    ramfs_probe()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
@@ -898,11 +960,15 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-fs",
+        "--package",
         "proto-uart",
         "--package",
         "proto-wire",
         "--package",
         "shell",
+        "--package",
+        "ramfs",
         "--package",
         "uart",
         "--package",
@@ -2186,6 +2252,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-fs",
+        "--package",
         "proto-uart",
         "--package",
         "proto-wire",
@@ -2202,6 +2270,8 @@ fn ci() -> Result<(), String> {
         "clippy",
         "--package",
         "init",
+        "--package",
+        "ramfs",
         "--package",
         "shell",
         "--package",
@@ -2231,6 +2301,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-fs",
+        "--package",
         "proto-uart",
         "--package",
         "proto-wire",
@@ -2240,6 +2312,8 @@ fn ci() -> Result<(), String> {
         "ext4ro",
         "--package",
         "init",
+        "--package",
+        "ramfs",
         "--package",
         "shell",
         "--package",
@@ -2252,6 +2326,8 @@ fn ci() -> Result<(), String> {
         "test-child",
         "--package",
         "ext4ro-probe",
+        "--package",
+        "ramfs-probe",
         "--package",
         "test-svc",
         "--package",

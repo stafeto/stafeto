@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Invoke BusyBox's dispatcher and cat applet from the boot image.
+
+#![no_std]
+#![no_main]
+
+use core::ffi::{c_char, c_int};
+use rt::handle::Resource;
+
+rt::entry!(main);
+
+unsafe extern "C" {
+    #[link_name = "main"]
+    fn busybox_main(argc: c_int, argv: *const *const c_char) -> c_int;
+}
+
+fn main(_: u64) -> u64 {
+    let Ok(mut start) = rt::startup() else {
+        return 1;
+    };
+    if let Ok(console) = start.take::<Resource>("console") {
+        rt::console::set(console);
+    }
+    if posix_bridge::init(&start.parent).is_err() {
+        return 2;
+    }
+    let argv = [
+        c"busybox".as_ptr(),
+        c"cat".as_ptr(),
+        c"/etc/motd".as_ptr(),
+        core::ptr::null(),
+    ];
+    // SAFETY: BusyBox and Picolibc are statically linked; argv has three
+    // valid NUL-terminated strings and a final null pointer.
+    let code = unsafe { busybox_main(3, argv.as_ptr()) };
+    if code == 0 {
+        rt::println!("busybox-probe: ok");
+    } else {
+        rt::println!("busybox-probe: failed {code}");
+    }
+    code as u64
+}

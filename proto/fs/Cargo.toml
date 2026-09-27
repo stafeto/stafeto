@@ -1,0 +1,12 @@
+[package]
+name = "proto-fs"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "File service wire protocol for stafeto"
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-wire = { path = "../wire" }

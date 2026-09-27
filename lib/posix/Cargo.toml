@@ -1,0 +1,18 @@
+[package]
+name = "posix-bridge"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "Small Picolibc POSIX hooks for stafeto user programs"
+build = "build.rs"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+proto-fs = { path = "../../proto/fs" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../rt" }

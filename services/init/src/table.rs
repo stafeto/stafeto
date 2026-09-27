@@ -529,6 +529,7 @@ fn order(table: &[Record]) -> Order {
 pub mod ceiling;
 pub mod cycle;
 pub mod normal;
+pub mod ramfs;
 pub mod test;
 pub mod vz;
 
@@ -539,8 +540,23 @@ pub mod vz;
     all(feature = "vz", feature = "table-test"),
     all(feature = "vz", feature = "table-cycle"),
     all(feature = "vz", feature = "table-ceiling"),
+    all(feature = "table-ramfs", feature = "vz"),
+    all(feature = "table-ramfs", feature = "table-test"),
+    all(feature = "table-ramfs", feature = "table-cycle"),
+    all(feature = "table-ramfs", feature = "table-ceiling"),
+    all(feature = "table-cprobe", feature = "vz"),
+    all(feature = "table-cprobe", feature = "table-test"),
+    all(feature = "table-cprobe", feature = "table-cycle"),
+    all(feature = "table-cprobe", feature = "table-ceiling"),
+    all(feature = "table-cprobe", feature = "table-ramfs"),
+    all(feature = "table-busybox", feature = "vz"),
+    all(feature = "table-busybox", feature = "table-test"),
+    all(feature = "table-busybox", feature = "table-cycle"),
+    all(feature = "table-busybox", feature = "table-ceiling"),
+    all(feature = "table-busybox", feature = "table-ramfs"),
+    all(feature = "table-busybox", feature = "table-cprobe"),
 ))]
-compile_error!("init builds with one table: table-test, table-cycle or table-ceiling");
+compile_error!("init builds with one table feature at a time");
 
 /// The table init starts (spec 13.4): the one of the build's feature, or
 /// the one that ships. The tables are constants, so a build carries only
@@ -549,9 +565,18 @@ compile_error!("init builds with one table: table-test, table-cycle or table-cei
     feature = "table-test",
     feature = "table-cycle",
     feature = "table-ceiling",
-    feature = "vz"
+    feature = "vz",
+    feature = "table-ramfs",
+    feature = "table-cprobe",
+    feature = "table-busybox"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
+#[cfg(feature = "table-ramfs")]
+pub const TABLE: &[Record] = ramfs::TABLE;
+#[cfg(feature = "table-cprobe")]
+pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
+#[cfg(feature = "table-busybox")]
+pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "vz")]
 pub const TABLE: &[Record] = vz::TABLE;
 #[cfg(feature = "table-test")]
