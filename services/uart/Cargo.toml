@@ -1,0 +1,17 @@
+[package]
+name = "uart"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The driver of the PL011 UART of stafeto"
+
+# What the driver decides, apart from the registers it reaches and the
+# calls it makes: tested on the host.
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-uart = { path = "../../proto/uart" }

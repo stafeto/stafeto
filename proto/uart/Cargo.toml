@@ -1,0 +1,15 @@
+[package]
+name = "proto-uart"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the UART driver of stafeto: its method numbers and the bodies of its requests and replies"
+
+[lib]
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-wire = { path = "../wire" }

@@ -721,7 +721,11 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-uart",
+        "--package",
         "proto-wire",
+        "--package",
+        "uart",
         "--package",
         "xtask",
     ]))
@@ -1577,6 +1581,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-uart",
+        "--package",
         "proto-wire",
         "--package",
         "xtask",
@@ -1585,12 +1591,14 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
-    // init's library and its tests on the host; its program builds for
-    // stafeto alone, below.
+    // The libraries of init and of the UART driver and their tests on the
+    // host; their programs build for stafeto alone, below.
     run_cmd(cargo().args([
         "clippy",
         "--package",
         "init",
+        "--package",
+        "uart",
         "--lib",
         "--tests",
         "--",
@@ -1616,11 +1624,15 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-init",
         "--package",
+        "proto-uart",
+        "--package",
         "proto-wire",
         "--package",
         "rt",
         "--package",
         "init",
+        "--package",
+        "uart",
         "--package",
         "test-init",
         "--package",
@@ -1888,26 +1900,54 @@ mod tests {
         assert_eq!(check(&el2, &qemu::VIRT_EL2, GIC_V2_LINE), Ok(24_000_000));
     }
 
-    /// The drivers of the kernel's devices and the test init's driver of
-    /// the PL031 reach registers through arch::mmio and rt::mmio only (spec
-    /// 9): one `ldr` or `str` with the address in a register, which a
+    /// The drivers reach registers through arch::mmio and rt::mmio only
+    /// (spec 9): one `ldr` or `str` with the address in a register, which a
     /// hypervisor emulates from the syndrome [G34]. `read_volatile` and
     /// `write_volatile` may compile to a pair or a writeback, which stops
-    /// QEMU under HVF.
+    /// QEMU under HVF. Every file of the services and the programs is
+    /// checked, a new driver with them; the kernel's drivers and those of
+    /// the tests are listed.
     #[test]
     fn device_registers_go_through_mmio() {
-        // Every file that reaches device registers is listed here.
-        let files = [
+        let listed = [
             "kernel/src/arch/aarch64/gic.rs",
             "kernel/src/console.rs",
             "tests/init/src/devices.rs",
+            "tests/svc/src/device.rs",
         ];
+        let mut files: Vec<PathBuf> = listed.iter().map(|f| root().join(f)).collect();
+        for dir in ["services", "apps"] {
+            rust_files(&root().join(dir), &mut files);
+        }
+        assert!(
+            files
+                .iter()
+                .any(|f| f.ends_with("services/uart/src/irq.rs")),
+            "the walk missed the UART driver"
+        );
         for file in files {
-            let text = std::fs::read_to_string(root().join(file)).expect("a device file");
+            let text = std::fs::read_to_string(&file).expect("a device file");
             assert!(
                 !text.contains("read_volatile") && !text.contains("write_volatile"),
-                "{file} reaches a register without mmio"
+                "{} reaches a register without mmio",
+                file.display()
             );
+        }
+    }
+
+    /// The `.rs` files under `dir`, at any depth, into `files`; none for a
+    /// directory that is not there.
+    fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
         }
     }
 

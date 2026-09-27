@@ -49,6 +49,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-uart"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-wire"
 version = "0.1.0"
 dependencies = [
@@ -95,6 +103,14 @@ dependencies = [
  "proto-init",
  "proto-wire",
  "rt",
+]
+
+[[package]]
+name = "uart"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-uart",
 ]
 
 [[package]]
