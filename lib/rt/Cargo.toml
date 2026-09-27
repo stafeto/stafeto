@@ -18,4 +18,5 @@ abi = { path = "../abi" }
 bootimg = { path = "../bootimg" }
 proto-fs = { path = "../../proto/fs" }
 proto-init = { path = "../../proto/init" }
+proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }

@@ -209,6 +209,7 @@ dependencies = [
  "bootimg",
  "proto-fs",
  "proto-init",
+ "proto-uart",
  "proto-wire",
 ]
 

@@ -22,13 +22,18 @@
 #include <unistd.h>
 
 static int unsupported(void) { errno = ENOSYS; return -1; }
+extern int stafeto_tty_available(void);
 
 uid_t getuid(void) { return 0; }
 uid_t geteuid(void) { return 0; }
 gid_t getgid(void) { return 0; }
 gid_t getegid(void) { return 0; }
 pid_t getppid(void) { return 1; }
-int isatty(int fd) { (void)fd; errno = ENOTTY; return 0; }
+int isatty(int fd) {
+    if (fd >= 0 && fd <= 2 && stafeto_tty_available()) return 1;
+    errno = ENOTTY;
+    return 0;
+}
 
 char *getcwd(char *buf, size_t size) {
     if (buf == NULL) {

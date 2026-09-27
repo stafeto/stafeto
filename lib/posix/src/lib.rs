@@ -26,9 +26,22 @@ pub fn init(parent: &Handle<Channel>) -> Result<(), Status> {
     Ok(())
 }
 
+/// Connect the file service and the shared UART console for one process.
+pub fn init_with_uart(parent: &Handle<Channel>) -> Result<(), Status> {
+    let files = Files::connect_with_uart(parent)?;
+    // SAFETY: the caller initializes before invoking C on this thread.
+    unsafe { *FILES.0.get() = Some(files) };
+    Ok(())
+}
+
 fn files() -> &'static Files {
     // SAFETY: initialized before C runs, then accessed by one thread.
     unsafe { (*FILES.0.get()).as_ref().expect("files initialized") }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_tty_available() -> i32 {
+    i32::from(files().has_uart())
 }
 
 fn result(value: Result<u32, Status>) -> i64 {
