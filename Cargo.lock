@@ -78,6 +78,7 @@ name = "shell"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-init",
  "proto-uart",
  "proto-wire",
  "rt",

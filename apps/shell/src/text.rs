@@ -35,12 +35,23 @@ impl<const N: usize> Text<N> {
         &self.bytes[..self.len]
     }
 
+    /// The text, when it is UTF-8, as what `fmt::Write` put is; "?"
+    /// otherwise.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or("?")
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     pub fn clear(&mut self) {
         self.len = 0;
+    }
+
+    /// Keeps the first `len` bytes, all of them when there are fewer.
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
     }
 }
 

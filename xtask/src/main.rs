@@ -853,8 +853,14 @@ fn two_gib_boot() -> Result<(), String> {
 /// the console's input (qemu::Run): the UART driver's line, the shell's
 /// line and its prompt; `help` gives HELP_LINES; `echo hello stafeto`
 /// comes back as its echo, the line typed, then the line `hello stafeto`
-/// after it; `uptime` gives seconds with milliseconds; a prompt after each
-/// answer. The run has no KERNEL PANIC line.
+/// after it; `uptime` gives seconds with milliseconds; `ps` gives its
+/// header whole and the rows of init, uart and shell, running at their
+/// levels, uart and shell never failed or restarted and with the limits
+/// of their records (ps_row); `mem` their pages, a total where a child's
+/// quota counts by what the child uses (spec 7.5), and the kernel's line;
+/// `bench` its line with its five numbers (bench_numbers), which fail
+/// nothing by their values (spec 15.3); a prompt after each answer. The
+/// run has no KERNEL PANIC line.
 fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
@@ -862,16 +868,17 @@ fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = dialog(&mut run);
     let o = run.stop();
-    talked.map_err(|e| format!("console dialog on {}: {e}", m.name))?;
+    let bench = talked.map_err(|e| format!("console dialog on {}: {e}", m.name))?;
     if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
         return Err(format!("console dialog on {}: {panic}", m.name));
     }
-    println!("console dialog on {}: ok", m.name);
+    println!("console dialog on {}: ok; {bench}", m.name);
     Ok(())
 }
 
-/// The steps of `console_dialog`, each after the one before it.
-fn dialog(run: &mut qemu::Run) -> Result<(), String> {
+/// The steps of `console_dialog`, each after the one before it; gives
+/// the line of `bench`.
+fn dialog(run: &mut qemu::Run) -> Result<String, String> {
     let whole = |line: &'static str| move |l: &str| l == line;
     run.expect_line(UART_LINE, whole(UART_LINE), BOOT_TIMEOUT)?;
     run.expect_line(SHELL_CONNECTED, whole(SHELL_CONNECTED), DIALOG_STEP)?;
@@ -887,7 +894,117 @@ fn dialog(run: &mut qemu::Run) -> Result<(), String> {
     run.expect(PROMPT, DIALOG_STEP)?;
     run.send("uptime")?;
     run.expect_line("the uptime", is_uptime, DIALOG_STEP)?;
-    run.expect(PROMPT, DIALOG_STEP)
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("ps")?;
+    run.expect_line(PS_HEADER, whole(PS_HEADER), DIALOG_STEP)?;
+    // The records of the table that ships: running, never failed, with
+    // the levels, handle limit and quota of their records.
+    for (name, levels, limit) in [
+        ("init", "63/63", ""),
+        ("uart", "60/60", "32"),
+        ("shell", "30/30", "32"),
+    ] {
+        let row = |l: &str| {
+            ps_row(l, name).is_some_and(|c| {
+                c[1..3] == ["running", levels]
+                    && (limit.is_empty()
+                        || (c[3..5] == ["0", "0"]
+                            && c[5].rsplit('/').next() == Some(limit)
+                            && c[6].rsplit('/').next() == Some(limit)))
+            })
+        };
+        run.expect_line(&format!("the row of {name} in ps"), row, DIALOG_STEP)?;
+    }
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("mem")?;
+    let mut rows = Vec::new();
+    for name in ["init", "uart", "shell"] {
+        let row = run.expect_line(
+            &format!("the row of {name} in mem"),
+            |l| mem_row(l, name).is_some(),
+            DIALOG_STEP,
+        )?;
+        rows.push(mem_row(&row, name).unwrap_or_default());
+    }
+    // A child's quota counts whole in what init uses (spec 7.5).
+    let unused: u64 = rows[1..]
+        .iter()
+        .map(|(used, quota)| quota.saturating_sub(*used))
+        .sum();
+    let sum = (rows[0].0.saturating_sub(unused), rows[0].1);
+    let total = |l: &str| mem_row(l, "total") == Some(sum);
+    run.expect_line(&format!("a total of {sum:?} in mem"), total, DIALOG_STEP)?;
+    let kernel = "kernel: # frames free, # pages in pools; init: # pages of quota free";
+    run.expect_line(kernel, |l| numbers(l, kernel).is_some(), DIALOG_STEP)?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    run.send("bench")?;
+    let line = run.expect_line(
+        "the line of bench",
+        |l| bench_numbers(l).is_some(),
+        DIALOG_STEP,
+    )?;
+    run.expect(PROMPT, DIALOG_STEP)?;
+    Ok(line)
+}
+
+/// The header of the shell's `ps`, whole.
+const PS_HEADER: &str = "name             state     prio fails restarts        handles       pages";
+
+/// The columns of `line` when it is the row of `name` in the shell's `ps`
+/// (spec 13.6): the name, a state, priority/ceiling, failures, restarts,
+/// handles live/retired/limit and pages used/quota.
+fn ps_row<'a>(line: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    let numbers = |col: &str, n: usize| {
+        let parts: Vec<&str> = col.split('/').collect();
+        parts.len() == n && parts.iter().all(|p| p.parse::<u64>().is_ok())
+    };
+    let row = cols.len() == 7
+        && cols[0] == name
+        && cols[1].bytes().all(|b| b.is_ascii_lowercase())
+        && numbers(cols[2], 2)
+        && numbers(cols[3], 1)
+        && numbers(cols[4], 1)
+        && numbers(cols[5], 3)
+        && numbers(cols[6], 2);
+    row.then_some(cols)
+}
+
+/// The pages used and the quota of `line` when it is the row of `name`
+/// in the shell's `mem`: `<name> <used> of <quota> pages`.
+fn mem_row(line: &str, name: &str) -> Option<(u64, u64)> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [n, used, "of", quota, "pages"] if n == name => {
+            Some((used.parse().ok()?, quota.parse().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// The five numbers of the line of the shell's `bench` (spec 13.6): the
+/// least, mean and most of 1000 round trips of PING and the longest
+/// latencies of a timer that woke the kernel from `wfi` (x2 of
+/// KERNEL_STATS) and of one that came while a thread or the kernel ran
+/// (x3), each in ns.
+fn bench_numbers(line: &str) -> Option<[u64; 5]> {
+    let template = "bench: ping round trip over 1000 rounds: min # ns, mean # ns, max # ns; \
+                    timer latency max # ns; interrupt latency max # ns";
+    numbers(line, template)?.try_into().ok()
+}
+
+/// The numbers of `line` when it is `template` word by word, with a
+/// number at each `#`.
+fn numbers(line: &str, template: &str) -> Option<Vec<u64>> {
+    let words = line.split_whitespace();
+    let mut numbers = Vec::new();
+    for (word, wanted) in words.clone().zip(template.split_whitespace()) {
+        match wanted.strip_prefix('#') {
+            Some(rest) => numbers.push(word.strip_suffix(rest)?.parse().ok()?),
+            None if word == wanted => {}
+            None => return None,
+        }
+    }
+    (words.count() == template.split_whitespace().count()).then_some(numbers)
 }
 
 /// Whether `line` is the shell's `uptime`: `up <seconds>.<ms> s`, with
