@@ -35,6 +35,18 @@ fn main(_: u64) -> u64 {
 
 fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     let fs = Files::connect(parent).map_err(|_| "connect")?;
+    let mut name = [0; 32];
+    if fs.read_dir("/", 2, &mut name) != Ok(Some((3, 1))) || &name[..3] != b"etc" {
+        return Err("root entry");
+    }
+    if fs.read_dir("/", 4, &mut name) != Ok(None)
+        || fs.read_dir("/missing", 0, &mut name) != Err(Status::Unknown(NO_ENTRY))
+    {
+        return Err("directory end and error");
+    }
+    if fs.read_dir("/etc", 2, &mut name) != Ok(Some((4, 2))) || &name[..4] != b"motd" {
+        return Err("etc entry");
+    }
     let motd = fs.open("/etc/motd", READ_ONLY).map_err(|_| "open motd")?;
     if fs.fstat_size(motd) != Ok(14) {
         return Err("stat motd");

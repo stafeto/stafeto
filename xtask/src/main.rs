@@ -87,6 +87,16 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 4] = [
         &["ash-interactive"],
     ),
 ];
+const LS_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "busybox-probe",
+        CHILD_STACK_SIZE,
+        &["ls-probe"],
+    ),
+];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -461,6 +471,7 @@ commands:
   ash       run a BusyBox ash builtin script in QEMU
   ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits)
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
+  ls        run BusyBox ls against the RAM file service in QEMU
   help      this text";
 
 fn main() {
@@ -481,6 +492,7 @@ fn main() {
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
+        Some("ls") => ls_probe(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -973,6 +985,70 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
+        run.send("ls -1 /")?;
+        run.expect("ls -1 /", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls -1 /etc")?;
+        run.expect("ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls -la")?;
+        run.expect("ls -la", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls --help")?;
+        run.expect("ls --help", DIALOG_STEP)?;
+        run.expect("Usage: ls", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("le /?")?;
+        run.expect("le /?", DIALOG_STEP)?;
+        run.expect("ash: le: not found", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls /missing")?;
+        run.expect("ls /missing", DIALOG_STEP)?;
+        run.expect("No such file or directory", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect("echo $?", DIALOG_STEP)?;
+        run.expect_line("1", |line| line == "1", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo after-ls")?;
+        run.expect("echo after-ls", DIALOG_STEP)?;
+        run.expect_line("after-ls", |line| line == "after-ls", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("cd etc")?;
+        run.expect("cd etc", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("pwd")?;
+        run.expect("pwd", DIALOG_STEP)?;
+        run.expect_line("/etc", |line| line == "/etc", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls -la")?;
+        run.expect("ls -la", DIALOG_STEP)?;
+        run.expect("motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("cd ..")?;
+        run.expect("cd ..", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls tmp")?;
+        run.expect("ls tmp", DIALOG_STEP)?;
+        run.expect("probe", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("ls /etc")?;
+        run.expect("ls /etc", DIALOG_STEP)?;
+        run.expect("motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("cd /missing")?;
+        run.expect("cd /missing", DIALOG_STEP)?;
+        run.expect("No such file or directory", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo after-cd-error")?;
+        run.expect("echo after-cd-error", DIALOG_STEP)?;
+        run.expect_line(
+            "after-cd-error",
+            |line| line == "after-cd-error",
+            DIALOG_STEP,
+        )?;
+        run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
         run.expect(
@@ -983,12 +1059,27 @@ fn ash_dialog() -> Result<(), String> {
     let output = run.stop();
     symbolize::backtrace(&output.lines, &kernel.elf);
     talked?;
-    if output
-        .lines
-        .iter()
-        .any(|line| line.contains("process fault:") || line.contains("KERNEL PANIC"))
-    {
+    if output.lines.iter().any(|line| {
+        line.contains("process fault:")
+            || line.contains("KERNEL PANIC")
+            || line.contains("out of memory")
+            || line.contains("I/O error")
+    }) {
         return Err("ash dialog faulted".into());
+    }
+    if !["etc", "tmp"]
+        .iter()
+        .all(|entry| output.lines.iter().any(|line| line == entry))
+    {
+        return Err("ash root listing is incomplete".into());
+    }
+    if !["etc", "tmp"].iter().all(|entry| {
+        output
+            .lines
+            .iter()
+            .any(|line| line.starts_with('d') && line.ends_with(entry))
+    }) {
+        return Err("ash long listing is incomplete".into());
     }
     println!("BusyBox ash interactive guest dialog passed");
     Ok(())
@@ -1005,6 +1096,23 @@ fn ash_shell() -> Result<(), String> {
     )?;
     let cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     run_interactive_qemu(cmd, &kernel.elf)
+}
+
+fn ls_probe() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ls.img", &LS_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    for entry in ["etc", "tmp", "motd"] {
+        qemu::expect_line(&output, entry)?;
+    }
+    println!("BusyBox ls guest probe passed");
+    Ok(())
 }
 
 fn test() -> Result<(), String> {

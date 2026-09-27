@@ -8,6 +8,8 @@
 //! SEEK: header, fd u32, absolute offset u32. Reply: status, offset u32.
 //! STAT: header, fd u32. Reply: status, size u32.
 //! CLOSE: header, fd u32. Reply: status alone.
+//! READ_DIR: header, index u32, UTF-8 absolute path bytes. Reply: status,
+//! kind u32 (0 at end, 1 directory, 2 file), entry name bytes.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -36,6 +38,7 @@ pub enum Method {
     Seek = 4,
     Stat = 5,
     Close = 6,
+    ReadDir = 7,
 }
 
 impl Method {
@@ -51,15 +54,16 @@ impl Method {
             4 => Some(Self::Seek),
             5 => Some(Self::Stat),
             6 => Some(Self::Close),
+            7 => Some(Self::ReadDir),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
-    if path.len() < 2 || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
+    if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
         return Err(Status::BadSize);
     }
     core::str::from_utf8(path).map_err(|_| Status::BadSize)
@@ -75,5 +79,6 @@ mod tests {
             assert_eq!(valid_path(path), Err(Status::BadSize));
         }
         assert_eq!(valid_path(b"/tmp/a"), Ok("/tmp/a"));
+        assert_eq!(valid_path(b"/"), Ok("/"));
     }
 }

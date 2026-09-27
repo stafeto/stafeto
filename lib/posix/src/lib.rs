@@ -108,6 +108,37 @@ extern "C" fn stafeto_size(fd: u32) -> i64 {
     result(files().fstat_size(fd))
 }
 
+/// Return the entry name length, zero at end, or a negative protocol status.
+#[unsafe(no_mangle)]
+extern "C" fn stafeto_dir_read(
+    path: *const u8,
+    len: usize,
+    index: u32,
+    name: *mut u8,
+    capacity: usize,
+    kind: *mut u32,
+) -> i32 {
+    if path.is_null() || name.is_null() || kind.is_null() || len > proto_fs::MAX_PATH {
+        return -(proto_wire::BAD_SIZE as i32);
+    }
+    // SAFETY: C passes live input and output buffers for this call.
+    let bytes = unsafe { core::slice::from_raw_parts(path, len) };
+    let Ok(path) = core::str::from_utf8(bytes) else {
+        return -(proto_wire::BAD_SIZE as i32);
+    };
+    // SAFETY: C owns `capacity` writable name bytes and one kind word.
+    let out = unsafe { core::slice::from_raw_parts_mut(name, capacity) };
+    match files().read_dir(path, index, out) {
+        Ok(Some((length, entry_kind))) => {
+            // SAFETY: `kind` was checked for null and C passed one writable word.
+            unsafe { *kind = entry_kind };
+            length as i32
+        }
+        Ok(None) => 0,
+        Err(status) => -(status.code() as i32),
+    }
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn stafeto_exit(status: i32) -> ! {
     rt::sys::process_exit(status as u64)

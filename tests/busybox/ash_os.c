@@ -23,6 +23,13 @@
 
 static int unsupported(void) { errno = ENOSYS; return -1; }
 extern int stafeto_tty_available(void);
+extern char **environ;
+
+int clearenv(void) {
+    static char *empty[] = { NULL };
+    environ = empty;
+    return 0;
+}
 
 uid_t getuid(void) { return 0; }
 uid_t geteuid(void) { return 0; }
@@ -33,36 +40,6 @@ int isatty(int fd) {
     if (fd >= 0 && fd <= 2 && stafeto_tty_available()) return 1;
     errno = ENOTTY;
     return 0;
-}
-
-char *getcwd(char *buf, size_t size) {
-    if (buf == NULL) {
-        buf = malloc(2);
-        if (buf == NULL) return NULL;
-        size = 2;
-    }
-    if (size < 2) { errno = ERANGE; return NULL; }
-    memcpy(buf, "/", 2);
-    return buf;
-}
-
-int chdir(const char *path) {
-    if (strcmp(path, "/") == 0 || strcmp(path, ".") == 0) return 0;
-    errno = ENOENT;
-    return -1;
-}
-
-int stat(const char *path, struct stat *st) {
-    if (strcmp(path, "/") == 0 || strcmp(path, ".") == 0) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 0555;
-        return 0;
-    }
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    int result = fstat(fd, st);
-    close(fd);
-    return result;
 }
 
 mode_t umask(mode_t mask) {
@@ -123,8 +100,9 @@ int gettimeofday(struct timeval *time, void *zone) {
     return unsupported();
 }
 int glob(const char *pattern, int flags, int (*err)(const char *, int), glob_t *matches) {
-    (void)pattern; (void)flags; (void)err; (void)matches;
-    errno = ENOSYS;
-    return GLOB_ABEND;
+    (void)pattern; (void)flags; (void)err;
+    matches->gl_pathc = 0;
+    matches->gl_pathv = NULL;
+    return GLOB_NOMATCH;
 }
 void globfree(glob_t *matches) { (void)matches; }
