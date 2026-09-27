@@ -90,7 +90,7 @@ and on Apple silicon under HVF. What works today:
   on interrupts at priority 60; it shows the kernel log between whole
   lines of its clients, lets writes wait whole for room and gives input
   to one reader at a time (`proto/uart`).
-- **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench` and
+- **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
   driver is broken, the shell says so through the kernel, and `init`
@@ -126,7 +126,7 @@ parts. Each finished part is merged through a pull request.
 | | 1.4b Runtime and protocols | handles that own their entries, strict test builds, one time scale, `proto/wire` and `proto/init`, start protocol, service loop with sessions and a heartbeat, ELF reader in `bootimg` | ✅ [#17](https://github.com/stafeto/stafeto/pull/17) |
 | | 1.4c init services | `init` starts services from its table, refuses a table with a cycle or a broken ceiling, serves names through `connect`, restarts crashed and silent services and marks broken ones | ✅ [#18](https://github.com/stafeto/stafeto/pull/18) |
 | | 1.4d UART driver and shell | the kernel log, the PL011 driver on interrupts and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | ✅ [#19](https://github.com/stafeto/stafeto/pull/19) |
-| | 1.4e Measurements and diagnostics | a file of measurements for TCG and HVF, the longest times of the calls, a log of kernel events, panic addresses as function names | 🚧 |
+| | 1.4e Measurements and diagnostics | machine-specific TCG and HVF measurements, call maxima and entry timing, optional event trace, panic frame symbols | ✅ [#20](https://github.com/stafeto/stafeto/pull/20) |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the

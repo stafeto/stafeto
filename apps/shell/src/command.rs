@@ -19,6 +19,7 @@ pub enum Command<'a> {
     Ps,
     Mem,
     Bench,
+    Trace,
     CrashUart,
     /// The line, without the spaces around it.
     Unknown(&'a [u8]),
@@ -35,13 +36,14 @@ impl<'a> Words<'a> {
 }
 
 /// The lines of `help`: each command and what it does.
-pub const HELP: [&str; 7] = [
+pub const HELP: [&str; 8] = [
     "help        list the commands",
     "echo WORDS  print the words",
     "uptime      the time since boot",
     "ps          the services and their state",
     "mem         the memory of each process",
     "bench       the round trip of a request and the latencies",
+    "trace       show kernel events since the last trace",
     "crash uart  crash the UART driver; init restarts it",
 ];
 
@@ -61,6 +63,7 @@ pub fn parse(line: &[u8]) -> Command<'_> {
         b"ps" => Command::Ps,
         b"mem" => Command::Mem,
         b"bench" => Command::Bench,
+        b"trace" => Command::Trace,
         b"crash" if rest.iter().eq([&b"uart"[..]]) => Command::CrashUart,
         _ => Command::Unknown(line),
     }
@@ -109,6 +112,7 @@ mod tests {
             (b"ps", Command::Ps),
             (b"mem", Command::Mem),
             (b"bench", Command::Bench),
+            (b"trace", Command::Trace),
             (b"crash uart", Command::CrashUart),
             (b"crash   uart  ", Command::CrashUart),
             (b"", Command::Empty),

@@ -119,6 +119,11 @@ the `backtrace (look up: ...)` line itself in the panic output. With
 `CARGO_TARGET_DIR` set, the images, the ELFs and the boot images are
 there instead of under `target/`.
 
+`cargo xtask run`, `test` and `hvf` also pass each panic frame to
+`llvm-symbolizer` with that run's ELF and print its function and source
+line. When the tool is unavailable, the original addresses stay in the
+output and xtask prints how to enable symbolization.
+
 ## Under HVF
 
 `cargo xtask hvf` runs the boot checks, the console dialog with the

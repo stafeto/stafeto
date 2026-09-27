@@ -353,7 +353,7 @@ mod tests {
         let kernel = KernelStats {
             free_frames: 120_000,
             pool_pages: 45,
-            ..KernelStats::from_words([0; 8])
+            ..KernelStats::from_words([0; 9])
         };
         let lines = text(|t| mem(t, &three(), &stats(kernel)));
         assert_eq!(
@@ -377,7 +377,7 @@ mod tests {
         let kernel = KernelStats {
             idle_latency: 10,
             irq_latency: 20,
-            ..KernelStats::from_words([0; 8])
+            ..KernelStats::from_words([0; 9])
         };
         assert_eq!(
             text(|t| bench(t, &rounds, &stats(kernel), qemu())),

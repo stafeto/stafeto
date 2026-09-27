@@ -302,6 +302,9 @@ pub const TEST_CALLS: core::ops::RangeInclusive<u16> = 0xFF00..=0xFFFF;
 /// Registers a call returns values in on success: x1-x9.
 pub const RESULT_VALUES: usize = 9;
 
+/// Slot zero and one slot for each system call in the KERNEL_STATS buffer.
+pub const KERNEL_CALL_SLOTS: usize = Call::ALL.len() + 1;
+
 /// Bytes a call carries in registers x2-x9 (spec 11): `debug_write` and,
 /// from milestone 1.3, messages.
 pub const INLINE_MAX: usize = 64;
@@ -638,7 +641,7 @@ pub const INFO_LOG: u64 = 9;
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
 /// bytes 0-7 the counter ticks (CNTVCT_EL0) when it was written, byte 8
-/// its kind (LOG_TEXT_KIND, LOG_KERNEL_KIND; never 0), byte 9 the length
+/// its kind (text, kernel, or a trace event; never 0), byte 9 the length
 /// of its text (1 to LOG_TEXT), bytes 10-15 zeros, bytes 16-79 the text,
 /// zeros past its length. A text longer than LOG_TEXT takes several
 /// records in a row; a reader joins their texts into one stream of bytes.
@@ -657,6 +660,12 @@ pub const LOG_TEXT_KIND: u8 = 1;
 /// The kind of a record of a line of the kernel: the fault of a process
 /// and, for init, its registers (spec 7.9).
 pub const LOG_KERNEL_KIND: u8 = 2;
+/// A traced system-call entry; text names the call and thread.
+pub const LOG_SYSCALL_KIND: u8 = 3;
+/// A traced switch to a thread.
+pub const LOG_SWITCH_KIND: u8 = 4;
+/// A traced interrupt acknowledgement.
+pub const LOG_INTERRUPT_KIND: u8 = 5;
 
 const _: () = assert!(LOG_RECORD * LOG_BATCH <= MESSAGE_MAX);
 const _: () = assert!(LOG_TEXT_AT + LOG_TEXT == LOG_RECORD);
@@ -952,11 +961,14 @@ pub struct KernelStats {
     /// 16 expired timers of one level, which the cleanup queue runs at that
     /// level (spec 7.7, 10).
     pub longest_firing: u64,
+    /// The longest time from an EL0 entry to the first pending-interrupt
+    /// poll on the way out of the kernel.
+    pub entry_to_poll: u64,
 }
 
 impl KernelStats {
-    /// The words `object_info` returns in x1-x8.
-    pub const fn to_words(self) -> [u64; 8] {
+    /// The words `object_info` returns in x1-x9.
+    pub const fn to_words(self) -> [u64; 9] {
         [
             self.idle,
             self.idle_latency,
@@ -966,11 +978,12 @@ impl KernelStats {
             self.free_frames,
             self.pool_pages,
             self.longest_firing,
+            self.entry_to_poll,
         ]
     }
 
-    /// The counts from x1-x8 of `object_info`.
-    pub const fn from_words(words: [u64; 8]) -> KernelStats {
+    /// The counts from x1-x9 of `object_info`.
+    pub const fn from_words(words: [u64; 9]) -> KernelStats {
         KernelStats {
             idle: words[0],
             idle_latency: words[1],
@@ -980,6 +993,7 @@ impl KernelStats {
             free_frames: words[5],
             pool_pages: words[6],
             longest_firing: words[7],
+            entry_to_poll: words[8],
         }
     }
 }
@@ -1540,9 +1554,9 @@ mod tests {
     }
 
     #[test]
-    fn kernel_stats_travel_in_eight_words() {
+    fn kernel_stats_travel_in_nine_words() {
         assert_eq!(INFO_KERNEL_STATS, 4);
-        let words = [1, 2, 3, 4, 5, 6, 7, 8];
+        let words = [1, 2, 3, 4, 5, 6, 7, 8, 9];
         let stats = KernelStats::from_words(words);
         assert_eq!(
             (stats.idle, stats.cleanup_queue, stats.pool_pages),
@@ -1553,6 +1567,7 @@ mod tests {
             (2, 3, 5)
         );
         assert_eq!((stats.free_frames, stats.longest_firing), (6, 8));
+        assert_eq!(stats.entry_to_poll, 9);
         assert_eq!(stats.to_words(), words);
     }
 

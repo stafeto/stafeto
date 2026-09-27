@@ -10,27 +10,47 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+#[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 pub struct Lock<T> {
+    #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
     locked: AtomicBool,
+    #[cfg(all(target_os = "none", not(feature = "atomic-locks")))]
+    locked: UnsafeCell<bool>,
     value: UnsafeCell<T>,
 }
 
-// SAFETY: the value is reached only through a guard, and the flag makes the
-// guard exclusive.
+// SAFETY: host locks use an atomic flag. The target_os=none kernel runs on
+// one core with interrupts masked while it holds a lock; its flag also
+// rejects a second guard in that serial execution.
 unsafe impl<T: Send> Sync for Lock<T> {}
 
 impl<T> Lock<T> {
     pub const fn new(value: T) -> Self {
         Self {
+            #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
             locked: AtomicBool::new(false),
+            #[cfg(all(target_os = "none", not(feature = "atomic-locks")))]
+            locked: UnsafeCell::new(false),
             value: UnsafeCell::new(value),
         }
     }
 
     pub fn lock(&self) -> LockGuard<'_, T> {
-        if self.locked.swap(true, Ordering::Acquire) {
+        #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
+        let was_locked = self.locked.swap(true, Ordering::Acquire);
+        #[cfg(all(target_os = "none", not(feature = "atomic-locks")))]
+        let was_locked = unsafe {
+            // SAFETY: the single core and masked interrupts serialize this
+            // read and write, and no guard may be borrowed simultaneously.
+            let flag = &mut *self.locked.get();
+            let old = *flag;
+            *flag = true;
+            old
+        };
+        if was_locked {
             panic!("kernel lock re-entered");
         }
         LockGuard {
@@ -85,7 +105,13 @@ impl<T> DerefMut for LockGuard<'_, T> {
 
 impl<T> Drop for LockGuard<'_, T> {
     fn drop(&mut self) {
+        #[cfg(any(not(target_os = "none"), feature = "atomic-locks"))]
         self.lock.locked.store(false, Ordering::Release);
+        #[cfg(all(target_os = "none", not(feature = "atomic-locks")))]
+        unsafe {
+            // SAFETY: this guard is the only one on the single core.
+            *self.lock.locked.get() = false;
+        }
     }
 }
 

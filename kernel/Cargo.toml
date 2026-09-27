@@ -20,6 +20,12 @@ kcore = { path = "../kcore" }
 [features]
 ktest = []
 # The kernel tests with those that need `-icount` added (ktest::el0).
-icount = ["ktest"]
+icount = ["ktest", "measure"]
 fault-probe = []
 overflow-probe = []
+measure = []
+atomic-locks = ["kcore/atomic-locks"]
+locked-decide = []
+baseline = ["ktest", "atomic-locks", "locked-decide"]
+trace = []
+trace-test = ["ktest", "trace"]

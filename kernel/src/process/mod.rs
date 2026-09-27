@@ -76,6 +76,26 @@ pub use table::{
 pub use teardown::{Stage, clean, exit_label, hasten, raise_replies, set_exit};
 use teardown::{begin, queue_shell};
 
+#[cfg(feature = "icount")]
+pub fn measurement_stage(process: NonNull<Process>) -> Stage {
+    // SAFETY: the measurement holds a reference or the cleanup queue does.
+    unsafe { (*process.as_ptr()).stage }
+}
+
+#[cfg(feature = "icount")]
+pub fn fill_measurement_pages(process: NonNull<Process>, count: usize) -> Result<(), Error> {
+    use kcore::slab::PageSource;
+
+    // SAFETY: the measurement holds the process; no other code borrows
+    // its quota or page log while it fills the shell's release workload.
+    let p = unsafe { &mut *process.as_ptr() };
+    let mut source = PaidPages::new(KernelPages, &mut p.quota, &mut p.pages);
+    for _ in 0..count {
+        source.alloc_page().ok_or(Error::NoMemory)?;
+    }
+    Ok(())
+}
+
 pub struct Process {
     /// From `create` until the first portion of the stage Space takes it:
     /// from then on no call reaches its tables (`map_page` fails,

@@ -64,6 +64,8 @@ unsafe extern "C" {
     static el0_kill: u8;
     static el0_exit_process: u8;
     static el0_info_then_exit: u8;
+    #[cfg(feature = "icount")]
+    static el0_close_then_exit: u8;
     static el0_receive: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
@@ -472,6 +474,12 @@ const ICOUNT_TESTS: &[El0Test] = &[
         start: start_big_teardown,
         done: done_big_teardown,
     },
+    #[cfg(feature = "icount")]
+    El0Test {
+        name: "thread_exit_after_channel_close_is_measured",
+        start: start_exit_after_close,
+        done: done_exit_after_close,
+    },
     El0Test {
         name: "ipc_round_trip_is_measured",
         start: start_round_trips,
@@ -489,6 +497,12 @@ const ICOUNT_TESTS: &[El0Test] = &[
     },
 ];
 
+const ROUND_TRIP_TESTS: &[El0Test] = &[El0Test {
+    name: "ipc_round_trip_is_measured",
+    start: start_round_trips,
+    done: done_round_trips,
+}];
+
 /// The tests of this build, in the order they run.
 fn tests() -> impl Iterator<Item = &'static El0Test> {
     let icount: &[El0Test] = if cfg!(feature = "icount") {
@@ -496,7 +510,12 @@ fn tests() -> impl Iterator<Item = &'static El0Test> {
     } else {
         &[]
     };
-    EL0_TESTS.iter().chain(icount)
+    let round_trip = if cfg!(feature = "icount") {
+        &[][..]
+    } else {
+        ROUND_TRIP_TESTS
+    };
+    EL0_TESTS.iter().chain(round_trip).chain(icount)
 }
 
 fn test(i: usize) -> &'static El0Test {
@@ -1972,6 +1991,35 @@ fn start_fault_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
 /// The exit: the child's thread makes a call that fails and exits.
 fn start_exit_cleanup(f: &mut Fixture) -> Result<(), &'static str> {
     child_ends_itself(f, user_address(&raw const el0_info_then_exit))
+}
+
+#[cfg(feature = "icount")]
+fn start_exit_after_close(f: &mut Fixture) -> Result<(), &'static str> {
+    child_ends_itself(f, user_address(&raw const el0_close_then_exit))?;
+    let p = f.processes[1].expect("the child");
+    let t = f.threads[1].expect("the child's last thread");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = process::insert_handle(p, Object::Channel(c), Rights::NONE)
+        .map_err(|_| "no channel handle")?;
+    // SAFETY: the handle retains the channel; the creator's reference goes.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    set_args(t, &[h.0]);
+    syscall::clear_call_maximum(Call::ThreadExit.number());
+    Ok(())
+}
+
+#[cfg(feature = "icount")]
+fn done_exit_after_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    done_own_cleanup(f, t)?;
+    if f.slot(t) == 2 {
+        let ticks = syscall::call_maxima()[Call::ThreadExit.number() as usize];
+        kprintln!("thread exit after close ticks: {ticks}");
+        check(
+            ticks > 0,
+            "the thread exit after channel close was not timed",
+        )?;
+    }
+    Ok(())
 }
 
 /// The thread that waits for the alarm in slot 0 and the judge in slot 2,

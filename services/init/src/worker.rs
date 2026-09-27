@@ -320,6 +320,7 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<(), Error> {
     for (wanted, name, right) in [
         (record.console, "console", Rights::DEBUG),
         (record.log, "log", Rights::KSTATS),
+        (record.trace, "trace", Rights::KSTATS),
     ] {
         if wanted {
             let copy =

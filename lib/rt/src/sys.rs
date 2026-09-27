@@ -22,10 +22,10 @@ use crate::handle::{
 };
 use crate::msgbuf;
 use abi::{
-    Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats, LOG_BATCH,
-    LOG_RECORD, LogBatch, MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo, Message, Notification, Policy,
-    ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source, TRIGGER_EDGE,
-    ThreadInfo,
+    Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KERNEL_CALL_SLOTS,
+    KernelStats, LOG_BATCH, LOG_RECORD, LogBatch, MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo,
+    Message, Notification, Policy, ProcessHandles, ProcessMemory, ProcessState, Rights,
+    SOURCE_SHIFT, Source, TRIGGER_EDGE, ThreadInfo,
 };
 use core::arch::asm;
 
@@ -309,7 +309,25 @@ pub fn kernel_stats(resource: &Handle<Resource>) -> Result<KernelStats, Error> {
     let args = [resource.raw().0, abi::INFO_KERNEL_STATS, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(KernelStats::from_words([
-        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9],
+    ]))
+}
+
+/// Reads the longest handling time of each call into its numbered slot.
+/// Slot zero is reserved and always zero. Each value is in counter ticks.
+pub fn kernel_call_maxima(
+    resource: &Handle<Resource>,
+    maxima: &mut [u64; KERNEL_CALL_SLOTS],
+) -> Result<KernelStats, Error> {
+    let args = [resource.raw().0, abi::INFO_KERNEL_STATS, 1];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    for (i, value) in maxima.iter_mut().enumerate() {
+        let mut bytes = [0; 8];
+        msgbuf::read(i * 8, &mut bytes);
+        *value = u64::from_le_bytes(bytes);
+    }
+    Ok(KernelStats::from_words([
+        x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8], x[9],
     ]))
 }
 
@@ -331,6 +349,29 @@ pub fn log_take(
         msgbuf::read(i * LOG_RECORD, record);
     }
     Ok(batch)
+}
+
+/// Reads the log at `next` (sequence plus one) without advancing the
+/// console reader. The returned cursor is the next sequence plus one.
+pub fn log_peek(
+    resource: &Handle<Resource>,
+    next: u64,
+    records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
+) -> Result<(LogBatch, u64), Error> {
+    if next == 0 {
+        return Err(Error::InvalidArgs);
+    }
+    let args = [resource.raw().0, abi::INFO_LOG, next];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    let batch = LogBatch::from_words([x[1], x[2], x[3]]);
+    for (i, record) in records
+        .iter_mut()
+        .enumerate()
+        .take((batch.count as usize).min(LOG_BATCH))
+    {
+        msgbuf::read(i * LOG_RECORD, record);
+    }
+    Ok((batch, x[4]))
 }
 
 /// object_info(MEMORY): the object's size in bytes, the pages whose frames

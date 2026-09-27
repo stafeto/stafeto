@@ -3,12 +3,15 @@
 
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
+mod disasm;
 mod image;
+mod measure;
 mod qemu;
+mod symbolize;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::{Command, Stdio, exit};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -84,13 +87,15 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// objects at the same place on every run; the ninth measures the path of
 /// an interrupt of a bound line to its driver, and the last the calls and
 /// portions of device windows.
-const ICOUNT_TESTS: [&str; 10] = [
+const ICOUNT_TESTS: [&str; 12] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
+    "teardown_portions_are_measured",
     "timer_firing_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
     "teardown_yields_to_a_pending_interrupt",
+    "thread_exit_after_channel_close_is_measured",
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
@@ -101,8 +106,9 @@ const ICOUNT_TESTS: [&str; 10] = [
 const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
 /// The rows of the line of `memory_portions_are_measured`, in its order
 /// (spec 15.3).
-const MEMORY_PORTION_ROWS: [&str; 8] = [
+const MEMORY_PORTION_ROWS: [&str; 9] = [
     "create",
+    "create_high",
     "map",
     "map_exec",
     "unmap",
@@ -146,13 +152,14 @@ const BROKEN: &str = "shell: uart is broken; no console left";
 const DRIVER_FAULT: &str = "process fault: data abort from EL0 (EC 0x24) ESR=0x";
 const UART_ENDED: &str = "init: uart ended: ";
 /// The lines of the shell's `help`, each whole (spec 13.6).
-const HELP_LINES: [&str; 7] = [
+const HELP_LINES: [&str; 8] = [
     "help        list the commands",
     "echo WORDS  print the words",
     "uptime      the time since boot",
     "ps          the services and their state",
     "mem         the memory of each process",
     "bench       the round trip of a request and the latencies",
+    "trace       show kernel events since the last trace",
     "crash uart  crash the UART driver; init restarts it",
 ];
 /// The bytes of the line the console dialog types while `bench` runs:
@@ -259,7 +266,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 220;
+const INIT_TESTS: u32 = 221;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -325,6 +332,9 @@ impl Profile {
 enum Variant {
     Normal,
     Test,
+    Baseline,
+    Trace,
+    TraceNormal,
     /// The kernel tests with those that need QEMU's `-icount` (qemu::ICOUNT).
     TestIcount,
     FaultProbe,
@@ -332,8 +342,9 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 5] = [
+    const ALL: [Variant; 6] = [
         Variant::Normal,
+        Variant::TraceNormal,
         Variant::Test,
         Variant::TestIcount,
         Variant::FaultProbe,
@@ -344,6 +355,9 @@ impl Variant {
         match self {
             Variant::Normal => None,
             Variant::Test => Some("ktest"),
+            Variant::Baseline => Some("baseline"),
+            Variant::Trace => Some("trace-test"),
+            Variant::TraceNormal => Some("trace"),
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
@@ -353,10 +367,13 @@ impl Variant {
     /// The limit of its image file, and where the limit comes from.
     fn limit(self) -> (u64, &'static str) {
         match self {
-            Variant::Normal | Variant::FaultProbe | Variant::OverflowProbe => {
-                (KERNEL_LIMIT, "spec 3.4")
+            Variant::Normal
+            | Variant::TraceNormal
+            | Variant::FaultProbe
+            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
+                (TEST_KERNEL_LIMIT, "test builds")
             }
-            Variant::Test | Variant::TestIcount => (TEST_KERNEL_LIMIT, "test builds"),
         }
     }
 
@@ -364,6 +381,9 @@ impl Variant {
         match self {
             Variant::Normal => "stafeto",
             Variant::Test => "stafeto-ktest",
+            Variant::Baseline => "stafeto-baseline",
+            Variant::Trace => "stafeto-trace",
+            Variant::TraceNormal => "stafeto-trace-normal",
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
@@ -461,6 +481,17 @@ fn run_cmd(cmd: &mut Command) -> Result<(), String> {
     } else {
         Err(format!("{cmd:?} failed: {status}"))
     }
+}
+
+fn run_until(
+    cmd: Command,
+    timeout: Duration,
+    stop_marker: Option<&str>,
+    elf: &Path,
+) -> Result<qemu::Outcome, String> {
+    let outcome = qemu::run_until(cmd, timeout, stop_marker)?;
+    symbolize::backtrace(&outcome.lines, elf);
+    Ok(outcome)
 }
 
 fn stdout_of(cmd: &mut Command) -> Result<String, String> {
@@ -724,7 +755,40 @@ fn raw_init(code: &[u32], rodata: bool, data_size: u64) -> Result<Vec<u8>, Strin
 fn run(args: &[String]) -> Result<(), String> {
     let m = run_machine(args, hvf_host)?;
     let a = build(Variant::Normal)?;
-    run_cmd(qemu::command(m, &a.image, Some(&a.boot_image)).arg("-nographic"))
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.arg("-nographic");
+    let mut child = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{cmd:?}: {e}"))?;
+    let mut source = child.stdout.take().ok_or("QEMU has no stdout")?;
+    let mut output = Vec::new();
+    let mut bytes = [0u8; 4096];
+    loop {
+        let n = std::io::Read::read(&mut source, &mut bytes).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut std::io::stdout(), &bytes[..n])
+            .map_err(|e| e.to_string())?;
+        std::io::Write::flush(&mut std::io::stdout()).map_err(|e| e.to_string())?;
+        output.extend_from_slice(&bytes[..n]);
+        if output.len() > 65_536 {
+            output.drain(..output.len() - 65_536);
+        }
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let lines: Vec<String> = String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    symbolize::backtrace(&lines, &a.elf);
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("QEMU exited with {status}"))
+    }
 }
 
 /// The machine of `cargo xtask run` with `args` (spec 14): VIRT with
@@ -752,6 +816,7 @@ fn test() -> Result<(), String> {
     boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
     two_gib_boot()?;
     console_dialog(&qemu::VIRT)?;
+    trace_dialog(&qemu::VIRT)?;
     console_dialog(&qemu::VIRT_V3)?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
@@ -776,6 +841,7 @@ fn test() -> Result<(), String> {
     kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
     kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
     kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
+    write_measures()?;
     println!("all checks passed");
     Ok(())
 }
@@ -822,14 +888,16 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     no_test_symbols(&a.elf)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
     qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let entry = init_entry(&a.boot_image)?;
     qemu::expect_marker(&o, &format!("init       entry {entry:#x},"))?;
     let size = std::fs::metadata(&a.boot_image)
         .map_err(|e| format!("{}: {e}", a.boot_image.display()))?
         .len();
-    boot_report(&o.lines, m, size, gic)
+    let hz = boot_report(&o.lines, m, size, gic)?;
+    measure::record(m, &o.lines);
+    Ok(hz)
 }
 
 /// The kernel's boot report (spec 3.3) on machine `m` with a boot image of
@@ -879,7 +947,7 @@ fn two_gib_boot() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT_2G, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED))?;
+    let o = run_until(cmd, BOOT_TIMEOUT, Some(SHELL_CONNECTED), &a.elf)?;
     qemu::expect_stopped_on(&o, SHELL_CONNECTED)?;
     let free =
         qemu::number_after(&o.lines, "frames ").ok_or("the kernel printed no frames line")?;
@@ -916,11 +984,47 @@ fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let talked = dialog(&mut run);
     let o = run.stop();
+    symbolize::backtrace(&o.lines, &a.elf);
     let bench = talked.map_err(|e| format!("console dialog on {}: {e}", m.name))?;
     if let Some(panic) = o.lines.iter().find(|l| l.contains("KERNEL PANIC")) {
         return Err(format!("console dialog on {}: {panic}", m.name));
     }
     println!("console dialog on {}: ok; {bench}", m.name);
+    Ok(())
+}
+
+fn trace_dialog(m: &qemu::Machine) -> Result<(), String> {
+    let a = build(Variant::TraceNormal)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let talked = (|| {
+        run.expect_line(
+            SHELL_CONNECTED,
+            |line| line == SHELL_CONNECTED,
+            BOOT_TIMEOUT,
+        )?;
+        run.expect(PROMPT, DIALOG_STEP)?;
+        run.send("trace")?;
+        run.expect_line(
+            "trace event",
+            |line| {
+                line.starts_with("trace: ")
+                    && (line.contains(" syscall ")
+                        || line.contains(" switch ")
+                        || line.contains(" interrupt "))
+            },
+            DIALOG_STEP,
+        )?;
+        run.expect(PROMPT, DIALOG_STEP).map(|_| ())
+    })();
+    let o = run.stop();
+    symbolize::backtrace(&o.lines, &a.elf);
+    talked.map_err(|e| format!("trace dialog on {}: {e}", m.name))?;
+    if o.lines.iter().any(|line| line.contains("KERNEL PANIC")) {
+        return Err(format!("trace dialog on {} panicked", m.name));
+    }
+    println!("trace dialog on {}: ok", m.name);
     Ok(())
 }
 
@@ -1226,7 +1330,7 @@ fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     let a = build(Variant::Normal)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.elf, None);
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"))?;
+    let o = run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"), &a.elf)?;
     qemu::expect_marker(&o, "no device tree in x0")?;
     if !o.stopped_on_marker {
         return Err("QEMU was not stopped on the marker line".into());
@@ -1279,7 +1383,7 @@ fn bad_boot_images_stop_the_boot() -> Result<(), String> {
         let image = bytes.map(|_| path.as_path());
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, image);
         cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
         qemu::expect_powered_off(&o)?;
         qemu::expect_marker(&o, "KERNEL PANIC")?;
         qemu::expect_marker(&o, marker)?;
@@ -1300,7 +1404,7 @@ fn init_fault_stops_the_machine() -> Result<(), String> {
         std::fs::write(&path, image).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
         cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
         qemu::expect_powered_off(&o)?;
         qemu::expect_marker(&o, "KERNEL PANIC")?;
         Ok::<_, String>(o)
@@ -1371,7 +1475,7 @@ fn panic_prints_the_log_nobody_showed() -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
     qemu::expect_powered_off(&o)?;
     let at = |what: &str, found: &dyn Fn(&str) -> bool| {
         o.lines
@@ -1415,7 +1519,7 @@ fn fault_report() -> Result<(), String> {
     let a = build(Variant::FaultProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
     qemu::expect_not_timed_out(&o)?;
     for marker in ["unknown or undefined instruction", "x0  0x", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
@@ -1614,7 +1718,7 @@ fn stack_overflow_report() -> Result<(), String> {
     let a = build(Variant::OverflowProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
     qemu::expect_powered_off(&o)?;
     for marker in ["kernel stack overflow", "backtrace ("] {
         qemu::expect_marker(&o, marker)?;
@@ -1645,15 +1749,21 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     if icount {
         cmd.args(qemu::ICOUNT);
     }
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
+    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
     for name in ICOUNT_TESTS {
+        if name == "ipc_round_trip_is_measured" {
+            continue;
+        }
         if r.passed.iter().any(|p| p == name) != icount {
             return Err(format!(
                 "{name} must pass in the icount build and only there"
             ));
         }
+    }
+    if !r.passed.iter().any(|p| p == "ipc_round_trip_is_measured") {
+        return Err("the round-trip measurement did not pass".into());
     }
     let under = if icount { " under icount" } else { "" };
     println!(
@@ -1672,6 +1782,11 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             let ticks = ticks_of(&o.lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
+    }
+    match variant {
+        Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
+        Variant::Trace => measure::record_as(m, &o.lines, "trace "),
+        _ => measure::record(m, &o.lines),
     }
     Ok(r.passed.len())
 }
@@ -1732,7 +1847,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     if icount {
         cmd.args(qemu::ICOUNT);
     }
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, None)?;
+    let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     let hvf = m.is_hvf();
     if hvf {
@@ -1781,6 +1896,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
         println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
+    measure::record(m, &o.lines);
     Ok(r.passed.len())
 }
 
@@ -1809,7 +1925,7 @@ fn svc_tests(m: &qemu::Machine) -> Result<usize, String> {
     let image = build_boot_image("boot-svc.img", &SVC_PROGRAMS, TEST_PROFILE)?;
     let mut cmd = qemu::command(m, &a.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    let o = qemu::run_until(cmd, TEST_TIMEOUT, Some(CHECKER_END))?;
+    let o = run_until(cmd, TEST_TIMEOUT, Some(CHECKER_END), &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
     failure_lines_name_the_reason_and_the_pause(&o.lines)?;
@@ -1905,7 +2021,7 @@ fn bad_tables_are_refused() -> Result<(), String> {
         let image = build_boot_image(name, programs, TEST_PROFILE)?;
         let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&image));
         cmd.args(qemu::HEADLESS);
-        let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+        let o = run_until(cmd, BOOT_TIMEOUT, None, &a.elf)?;
         qemu::expect_line(&o, reason)?;
         qemu::expect_init_exit(&o, "init: table refused: ", 2)?;
     }
@@ -1961,15 +2077,43 @@ fn hvf() -> Result<(), String> {
             return Err(format!("the counter runs at {hz} Hz on {}", m.name));
         }
         console_dialog(m)?;
+        trace_dialog(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
-        let kernel = kernel_tests(m, Variant::Test)?;
+        let mut kernel = 0;
+        for pair in 0..20 {
+            let variants = if pair % 2 == 0 {
+                [Variant::Test, Variant::Baseline]
+            } else {
+                [Variant::Baseline, Variant::Test]
+            };
+            for variant in variants {
+                let passed = kernel_tests(m, variant)?;
+                if variant == Variant::Test {
+                    kernel = passed;
+                }
+            }
+        }
+        for _ in 0..20 {
+            kernel_tests(m, Variant::Trace)?;
+        }
+        write_measures()?;
         println!(
             "hvf on {}: boot ok, console dialog ok, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
     Ok(())
+}
+
+fn write_measures() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let size = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    };
+    measure::write_all(&target_dir(), size(&a.image)?, size(&a.boot_image)?)
 }
 
 /// qemu::hvf_host on this host: its OS and processor, `sysctl -n
@@ -2087,7 +2231,9 @@ fn ci() -> Result<(), String> {
         }
         run_cmd(cmd.args(["--", "-D", "warnings"]))?;
     }
-    test()
+    test()?;
+    let a = build(Variant::Normal)?;
+    disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
 }
 
 #[cfg(test)]
@@ -2549,16 +2695,16 @@ mod tests {
         assert!(ticks_of(&[], what, &ROUND_TRIP_ROWS).is_err());
     }
 
-    /// The line of the portions of memory objects gives its eight rows in
+    /// The line of the portions of memory objects gives its nine rows in
     /// order, and the round trip's does not pass for it.
     #[test]
-    fn memory_portions_line_gives_eight_rows() {
+    fn memory_portions_line_gives_nine_rows() {
         let what = "memory portions";
-        let line = "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 \
-                    protect_exec=6 release=7 first_map=8";
+        let line = "memory portions ticks: create=1 create_high=2 map=3 map_exec=4 unmap=5 protect=6 \
+                    protect_exec=7 release=8 first_map=9";
         let lines = [line.to_string()];
         let ticks = ticks_of(&lines, what, &MEMORY_PORTION_ROWS);
-        assert_eq!(ticks, Ok((1..=8).collect()));
+        assert_eq!(ticks, Ok((1..=9).collect()));
         for bad in [
             "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7",
             "memory portions ticks: map=2 create=1 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7 first_map=8",

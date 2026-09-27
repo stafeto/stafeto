@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 31] = [
+pub(crate) const TESTS: [Test; 32] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -80,6 +80,10 @@ pub(crate) const TESTS: [Test; 31] = [
     ("quota_is_enforced", quota_is_enforced),
     ("process_info_kinds", process_info_kinds),
     ("kernel_stats_need_kstats", kernel_stats_need_kstats),
+    (
+        "kernel_call_maxima_use_the_buffer",
+        kernel_call_maxima_use_the_buffer,
+    ),
     (
         "object_info_checks_its_arguments",
         object_info_checks_its_arguments,
@@ -1035,7 +1039,7 @@ fn process_info_kinds() -> Outcome {
 
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
 /// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
-/// though it writes; init's resource gets the counts in x1-x8 and changes
+/// though it writes; init's resource gets the counts in x1-x9 and changes
 /// nothing past them. Nothing waits in the cleanup queue while init runs,
 /// and the frames and pool pages are there.
 fn kernel_stats_need_kstats() -> Outcome {
@@ -1056,13 +1060,44 @@ fn kernel_stats_need_kstats() -> Outcome {
     // SAFETY: object_info only reads its registers.
     let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
     check(
-        after[0] == 0 && after[9..] == x[9..],
-        "KERNEL_STATS failed or changed registers past x8",
+        after[0] == 0 && after[10..] == x[10..],
+        "KERNEL_STATS failed or changed registers past x9",
     )?;
-    let stats = abi::KernelStats::from_words(after[1..9].try_into().expect("x1-x8"));
+    let stats = abi::KernelStats::from_words(after[1..10].try_into().expect("x1-x9"));
     check(
         stats.cleanup_queue == 0 && stats.free_frames > 0 && stats.pool_pages > 0,
         "the queue is not empty, or no frame or pool page is counted",
+    )
+}
+
+/// The optional KERNEL_STATS buffer preserves its contents with selector
+/// zero and on denied access, and selector one writes numbered call times.
+fn kernel_call_maxima_use_the_buffer() -> Outcome {
+    let marker = [0xa5; abi::KERNEL_CALL_SLOTS * 8];
+    rt::msgbuf::write(0, &marker);
+    let _ = sys::kernel_stats(&resource()).map_err(|_| "KERNEL_STATS failed")?;
+    let mut bytes = [0; abi::KERNEL_CALL_SLOTS * 8];
+    rt::msgbuf::read(0, &mut bytes);
+    check(bytes == marker, "selector zero changed the message buffer")?;
+
+    let debug = copy(&resource(), Rights::DEBUG)?;
+    let mut x = marked();
+    x[..3].copy_from_slice(&[debug.raw().0, abi::INFO_KERNEL_STATS, 1]);
+    // SAFETY: the bad call only checks rights and does not touch the buffer.
+    let denied = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+    close(debug)?;
+    rt::msgbuf::read(0, &mut bytes);
+    check(
+        denied[0] == Error::AccessDenied.code() && bytes == marker,
+        "KSTATS rights were not checked before the buffer write",
+    )?;
+
+    let mut maxima = [0; abi::KERNEL_CALL_SLOTS];
+    let stats = sys::kernel_call_maxima(&resource(), &mut maxima)
+        .map_err(|_| "KERNEL_STATS maxima failed")?;
+    check(
+        maxima[0] == 0 && stats.entry_to_poll > 0,
+        "numbered call slots or entry-to-poll time were not recorded",
     )
 }
 
@@ -1125,7 +1160,10 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
             irq,
         ]
         .into_iter()
-        .flat_map(|kind| [[own, kind, 1], [0, kind, 1]]),
+        .flat_map(|kind| {
+            let bad = if kind == stats { 2 } else { 1 };
+            [[own, kind, bad], [0, kind, bad]]
+        }),
     )
     .all(|args| x0_alone::<N>(&args, Error::InvalidArgs.code()));
     let handles = [

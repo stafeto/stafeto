@@ -134,6 +134,7 @@ extern "C" fn handle_exception(frame: &mut TrapFrame, index: u64) {
 /// (sched::resume).
 #[unsafe(no_mangle)]
 extern "C" fn handle_user_exception(index: u64) -> ! {
+    crate::sched::entry_started();
     let thread = thread::current().expect("an entry from EL0 with no thread running");
     let syndrome = registers::esr_el1();
     match index {

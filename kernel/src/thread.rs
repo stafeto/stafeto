@@ -658,6 +658,10 @@ pub fn current() -> Option<NonNull<Thread>> {
 /// holds none with a `Drop`: no lock guard, `AddressSpace` or the like.
 pub fn run(next: NonNull<Thread>) -> ! {
     let prev = current();
+    #[cfg(feature = "trace")]
+    if prev != Some(next) {
+        crate::log::switch(index(next));
+    }
     // SAFETY: the running thread and `next` are alive, and so are their
     // processes; the kernel touches them one at a time.
     unsafe {

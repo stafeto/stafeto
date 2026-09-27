@@ -21,7 +21,10 @@ use kcore::log::{Chunks, Ring};
 use kcore::sync::Lock;
 
 /// The records of the ring: 64 of 80 bytes, 5 120 bytes of .bss.
+#[cfg(not(feature = "trace"))]
 const LOG_RECORDS: usize = 64;
+#[cfg(feature = "trace")]
+const LOG_RECORDS: usize = 256;
 
 static RING: Lock<Ring<LOG_RECORDS>> = Lock::new(Ring::new());
 
@@ -71,6 +74,38 @@ pub fn line(args: fmt::Arguments<'_>) {
 pub fn take(t: NonNull<Thread>) -> LogBatch {
     RING.lock()
         .take(|i, r| thread::write_words(t, i * LOG_RECORD, &r.words()))
+}
+
+/// Non-destructive read from `first`, also returning the next sequence.
+pub fn peek(t: NonNull<Thread>, first: u64) -> (LogBatch, u64) {
+    RING.lock().peek(first, |i, r| {
+        thread::write_words(t, i * LOG_RECORD, &r.words())
+    })
+}
+
+#[cfg(feature = "trace")]
+fn event(kind: u8, args: fmt::Arguments<'_>) {
+    let mut chunks = Chunks::new(|piece: &[u8]| RING.lock().push(timer::now(), kind, piece, false));
+    let _ = chunks.write_fmt(args);
+    chunks.finish();
+}
+
+#[cfg(feature = "trace")]
+pub fn syscall(number: u16, thread: u16) {
+    event(
+        abi::LOG_SYSCALL_KIND,
+        format_args!("call={number} thread={thread}"),
+    );
+}
+
+#[cfg(feature = "trace")]
+pub fn switch(thread: u16) {
+    event(abi::LOG_SWITCH_KIND, format_args!("thread={thread}"));
+}
+
+#[cfg(feature = "trace")]
+pub fn interrupt(line: u32) {
+    event(abi::LOG_INTERRUPT_KIND, format_args!("line={line}"));
 }
 
 /// The panic shows what nobody showed or took, oldest first, on the port

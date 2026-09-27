@@ -70,23 +70,23 @@
 //! A record with no instance that lives has 0 in its handles and pages.
 //!
 //! STATS: what init and the kernel do (spec 13.4); the request is the
-//! header alone. The reply that is no refusal (`Stats`), 96 bytes:
+//! header alone. The reply that is no refusal (`Stats`), 104 bytes:
 //!
 //! | Bytes | Field |
 //! |---|---|
 //! | 0..4 | status 0 |
 //! | 4..8 | zero |
-//! | 8..72 | the eight words of KERNEL_STATS, x1 to x8 |
-//! | 72 | the work of init's worker thread: 0 none, 1 load, 2 teardown, 3 kill, 4 show the kernel log (`Work`) |
-//! | 73 | the record it works for, its number in LIST (its place in init's table plus 1); 0 with no work |
-//! | 74 | the worker's base priority |
-//! | 75 | the worker's effective priority |
-//! | 76 | the worker's state (THREAD_STATE x1) |
-//! | 77 | the jobs that wait for the worker |
-//! | 78 | 1 once the worker took its work from init, 0 before and with no work |
-//! | 79 | zero |
-//! | 80..88 | free pages of init's quota |
-//! | 88..96 | labels init gave |
+//! | 8..80 | the nine words of KERNEL_STATS, x1 to x9 |
+//! | 80 | the work of init's worker thread: 0 none, 1 load, 2 teardown, 3 kill, 4 show the kernel log (`Work`) |
+//! | 81 | the record it works for, its number in LIST (its place in init's table plus 1); 0 with no work |
+//! | 82 | the worker's base priority |
+//! | 83 | the worker's effective priority |
+//! | 84 | the worker's state (THREAD_STATE x1) |
+//! | 85 | the jobs that wait for the worker |
+//! | 86 | 1 once the worker took its work from init, 0 before and with no work |
+//! | 87 | zero |
+//! | 88..96 | free pages of init's quota |
+//! | 96..104 | labels init gave |
 //!
 //! HEARTBEAT: a service tells init that it lives (spec 13.4); PING: a round
 //! trip to init, for bench (spec 13.6). The request of each is the header
@@ -492,7 +492,7 @@ impl Work {
 }
 
 /// The bytes of a reply to STATS.
-pub const STATS_LEN: usize = 96;
+pub const STATS_LEN: usize = 104;
 
 /// A reply to STATS that is no refusal (the table above).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -541,13 +541,13 @@ impl Stats {
 
     /// The reply in `bytes`: BAD_SIZE unless it is STATS_LEN bytes with
     /// status 0, the bytes that must be zero are, the work and its record
-    /// are both there or both 0, and byte 78 is 0, or 1 with a work.
+    /// are both there or both 0, and byte 86 is 0, or 1 with a work.
     pub fn read(bytes: &[u8]) -> Result<Stats, Status> {
         let mut r = Reader::new(bytes);
         if r.u32()? != 0 || r.u32()? != 0 {
             return Err(Status::BadSize);
         }
-        let mut words = [0; 8];
+        let mut words = [0; 9];
         for word in &mut words {
             *word = r.u64()?;
         }
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn stats_reply_round_trips() {
         let stats = Stats {
-            kernel: KernelStats::from_words([1, 2, 3, 4, 5, 6, 7, 8]),
+            kernel: KernelStats::from_words([1, 2, 3, 4, 5, 6, 7, 8, 9]),
             job: Some((Work::Kill, 5)),
             worker_priority: 33,
             worker_effective: 34,
@@ -890,9 +890,10 @@ mod tests {
         assert_eq!(bytes[..8], [0; 8]);
         assert_eq!(bytes[8..16], 1u64.to_le_bytes());
         assert_eq!(bytes[64..72], 8u64.to_le_bytes());
-        assert_eq!(bytes[72..80], [3, 6, 33, 34, 1, 2, 1, 0]);
-        assert_eq!(bytes[80..88], 0x1_0000_0001u64.to_le_bytes());
-        assert_eq!(bytes[88..96], 77u64.to_le_bytes());
+        assert_eq!(bytes[72..80], 9u64.to_le_bytes());
+        assert_eq!(bytes[80..88], [3, 6, 33, 34, 1, 2, 1, 0]);
+        assert_eq!(bytes[88..96], 0x1_0000_0001u64.to_le_bytes());
+        assert_eq!(bytes[96..104], 77u64.to_le_bytes());
         assert_eq!(Stats::read(bytes), Ok(stats));
         let idle = Stats {
             job: None,
@@ -901,11 +902,11 @@ mod tests {
         };
         let mut w = Writer::new();
         idle.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes()[72..74], [0, 0]);
+        assert_eq!(w.as_bytes()[80..82], [0, 0]);
         assert_eq!(Stats::read(w.as_bytes()), Ok(idle));
         // A work without its record, a record without its work, a work
         // past the four, and a byte that must be zero.
-        for (at, byte) in [(73, 0), (72, 0), (72, 5), (78, 2), (79, 1), (4, 1)] {
+        for (at, byte) in [(81, 0), (80, 0), (80, 5), (86, 2), (87, 1), (4, 1)] {
             let mut bad = bytes.to_vec();
             bad[at] = byte;
             assert_eq!(Stats::read(&bad), Err(Status::BadSize), "byte {at}");

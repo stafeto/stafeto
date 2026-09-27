@@ -11,7 +11,7 @@ pub mod el0;
 mod registers;
 
 use crate::arch::symbols;
-use crate::arch::user::UserRegs;
+use crate::arch::user::{FpRegs, UserRegs};
 use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
 use crate::channel;
@@ -51,6 +51,7 @@ use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0
 type TestFn = fn(&Boot) -> Result<(), &'static str>;
 
 const TESTS: &[(&str, TestFn)] = &[
+    ("fp_switch_cost_is_measured", fp_switch_cost_is_measured),
     (
         "device_tree_matches_qemu_virt",
         device_tree_matches_qemu_virt,
@@ -463,7 +464,7 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// checks that the run is under -icount, the others measure the portions
 /// of the long calls of memory objects, the timers of programs and device
 /// windows, whose counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 4 } else { 0 };
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 5 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -478,6 +479,11 @@ pub fn run(boot: &Boot) -> ! {
     report(
         "memory_portions_are_measured",
         calls::memory_portions_are_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "teardown_portions_are_measured",
+        calls::teardown_portions_are_measured(boot),
     );
     #[cfg(feature = "icount")]
     report(
@@ -508,12 +514,39 @@ fn report(name: &str, result: Result<(), &'static str>) {
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
+    #[cfg(feature = "measure")]
+    for (number, ticks) in crate::syscall::call_maxima().iter().enumerate().skip(1) {
+        kprintln!("call maximum ticks: {number}={ticks}");
+    }
     kprintln!("TESTS DONE total={total} failed={failed}");
     crate::psci::system_off()
 }
 
 fn check(ok: bool, why: &'static str) -> Result<(), &'static str> {
     if ok { Ok(()) } else { Err(why) }
+}
+
+/// Counter cost of a switch that keeps FP state in registers and one that
+/// stores and restores it. Both loops have the same count and counter reads.
+fn fp_switch_cost_is_measured(_: &Boot) -> Result<(), &'static str> {
+    const ROUNDS: usize = 1_000;
+    let mut regs = FpRegs::ZERO;
+    let start = timer::now();
+    for _ in 0..ROUNDS {
+        core::hint::black_box(&mut regs);
+    }
+    let no_fp = timer::now() - start;
+    let start = timer::now();
+    for _ in 0..ROUNDS {
+        crate::arch::user::save_fp(&mut regs);
+        crate::arch::user::load_fp(&regs);
+    }
+    let fp = timer::now() - start;
+    kprintln!("fp switch ticks: rounds={ROUNDS} no_fp={no_fp} fp={fp}");
+    check(
+        fp >= no_fp,
+        "FP save and load cost less than the control loop",
+    )
 }
 
 /// RAM of the machine as the device tree reports it.
@@ -1630,8 +1663,8 @@ fn churn(root: NonNull<process::Process>, q: u64) -> Result<(), &'static str> {
 /// The pages of a process's pools go back with its shell, a portion at a
 /// time (spec 7.7, 7.8): a root with 130 chunks of handles holds 66 pages
 /// of blocks and a list page. Its handles go at the stage Handles and
-/// leave the pages in the pool; the shell gives them back at most 32 a
-/// portion, in three portions, and the last one gives the slot back.
+/// leave the pages in the pool; the shell gives them back at most eight a
+/// portion, in nine portions, and the last one gives the slot back.
 fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
     const CHUNKS: usize = 130;
     cleanup::drain();
@@ -1644,7 +1677,7 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
     // SAFETY: the test's reference, the last, goes; nothing uses it
     // afterwards.
     unsafe { process::release(p, CAUSE) };
-    let mut portions = [0; 4];
+    let mut portions = [0; 12];
     let mut n = 0;
     // Only the stage Shell gives pages of pools back.
     while cleanup::top().is_some() {
@@ -1662,8 +1695,10 @@ fn shell_goes_in_portions(_: &Boot) -> Result<(), &'static str> {
         "the blocks of the table did not take a page for two of them and a list page",
     )?;
     check(
-        portions[..n] == [32, 32, held - 64],
-        "the pages of a shell did not go back 32 a portion",
+        n == held.div_ceil(8)
+            && portions[..n - 1].iter().all(|&pages| pages == 8)
+            && portions[n - 1] == held - (n - 1) * 8,
+        "the pages of a shell did not go back eight a portion",
     )?;
     check(
         pages::taken() == taken && process::in_use() == processes,

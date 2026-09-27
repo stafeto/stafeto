@@ -889,11 +889,7 @@ fn fast_send(t: NonNull<Thread>, via: Via, desc: Desc) -> Option<NonNull<Thread>
             let n = &r.as_ref().sched;
             let boost = n.boost().max(t.as_ref().priority().min(ceiling(r)));
             let level = n.base().max(boost);
-            if cleanup.is_some_and(|l| l >= level)
-                || arch::irq_pending()
-                || k.s.ready().top().is_some_and(|top| top >= level)
-                || !testpoint::fast_path()
-            {
+            if !k.s.can_hand_off(level, cleanup) || arch::irq_pending() || !testpoint::fast_path() {
                 return None;
             }
             let taken = meet(k, t, via, desc);
