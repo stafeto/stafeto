@@ -1,0 +1,17 @@
+[package]
+name = "rtbench"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "EL0 RTOS throughput and timer wakeup benchmarks"
+
+[[bin]]
+name = "rtbench"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+rt = { path = "../../lib/rt" }
