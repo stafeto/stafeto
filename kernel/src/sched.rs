@@ -67,6 +67,38 @@ static SCHED: Lock<Sched> = Lock::new(Sched {
     irq_latency: 0,
 });
 
+/// EL0 entry timing on the single core. Interrupts stay masked from the
+/// exception vector through the first poll in `exit_loop`.
+struct EntryTiming(UnsafeCell<(u64, u64)>);
+
+// SAFETY: the kernel runs on one core, and the entry-to-poll interval has
+// interrupts masked. No other context can access this state concurrently.
+unsafe impl Sync for EntryTiming {}
+
+static ENTRY_TIMING: EntryTiming = EntryTiming(UnsafeCell::new((0, 0)));
+
+#[inline(always)]
+pub fn entry_started() {
+    // SAFETY: single core with interrupts masked, as above.
+    unsafe { (*ENTRY_TIMING.0.get()).0 = timer::now() };
+}
+
+#[inline(always)]
+fn entry_polled() {
+    // SAFETY: single core with interrupts masked, as above.
+    let timing = unsafe { &mut *ENTRY_TIMING.0.get() };
+    if timing.0 != 0 {
+        let elapsed = timer::now().wrapping_sub(timing.0);
+        timing.1 = timing.1.max(elapsed);
+        timing.0 = 0;
+    }
+}
+
+pub fn longest_entry_to_poll() -> u64 {
+    // SAFETY: single core with interrupts masked, as above.
+    unsafe { (*ENTRY_TIMING.0.get()).1 }
+}
+
 /// The table of thread numbers, which the scheduler's lock guards: only
 /// `locked` reaches it, while it holds that lock. Zeroed at boot (spec
 /// 7.8).
@@ -309,6 +341,7 @@ pub fn resume() -> ! {
 /// nothing. Leaves only through thread::run.
 extern "C" fn exit_loop() -> ! {
     loop {
+        entry_polled();
         if arch::irq_pending()
             && let Some(ack) = gic::acknowledge()
         {

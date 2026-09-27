@@ -38,6 +38,8 @@ use abi::{
     CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
     ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
 };
+#[cfg(feature = "measure")]
+use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
@@ -50,6 +52,43 @@ use kcore::maps::Mapping;
 
 /// A call's arguments: x0-x9 of the thread that made it.
 type Args = [u64; 10];
+
+/// Call times on the single core. EL0 entries keep interrupts masked until
+/// the scheduler polls them; kernel tests call dispatch serially too.
+#[cfg(feature = "measure")]
+struct CallTiming(UnsafeCell<(u64, [u64; abi::KERNEL_CALL_SLOTS])>);
+
+// SAFETY: dispatch and its exit paths run serially on the single core.
+#[cfg(feature = "measure")]
+unsafe impl Sync for CallTiming {}
+
+#[cfg(feature = "measure")]
+static CALL_TIMING: CallTiming = CallTiming(UnsafeCell::new((0, [0; abi::KERNEL_CALL_SLOTS])));
+
+#[cfg(feature = "measure")]
+fn record_call(number: u16) {
+    if (1..abi::KERNEL_CALL_SLOTS as u16).contains(&number) {
+        // SAFETY: the single-core dispatch owns this state until it exits.
+        let timing = unsafe { &mut *CALL_TIMING.0.get() };
+        let elapsed = clock::now().wrapping_sub(timing.0);
+        timing.1[number as usize] = timing.1[number as usize].max(elapsed);
+    }
+}
+
+#[cfg(not(feature = "measure"))]
+#[inline(always)]
+fn record_call(_: u16) {}
+
+#[cfg(feature = "measure")]
+pub(crate) fn call_maxima() -> [u64; abi::KERNEL_CALL_SLOTS] {
+    // SAFETY: the call is running with interrupts masked on the single core.
+    unsafe { (*CALL_TIMING.0.get()).1 }
+}
+
+#[cfg(not(feature = "measure"))]
+fn call_maxima() -> [u64; abi::KERNEL_CALL_SLOTS] {
+    [0; abi::KERNEL_CALL_SLOTS]
+}
 
 /// Values a call returns in x1 and up on success: the first `len` of `x`
 /// are written, the rest never read. The words past `len` stay unwritten,
@@ -97,6 +136,16 @@ impl Values {
 /// has written the caller's result first. A thread in a long call goes on
 /// with it (`go_on`).
 pub fn dispatch(thread: NonNull<Thread>, number: u16) {
+    #[cfg(feature = "measure")]
+    {
+        // SAFETY: the single-core dispatch owns this state until it exits.
+        unsafe { (*CALL_TIMING.0.get()).0 = clock::now() };
+    }
+    dispatch_inner(thread, number);
+    record_call(number);
+}
+
+fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
     if crate::testpoint::test_call(thread, number) {
         return;
     }
@@ -811,6 +860,7 @@ fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let ended = unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
     if own {
         // The caller ended with its process and may be gone.
+        record_call(Call::ProcessKill.number());
         sched::resume()
     }
     if !ended {
@@ -828,6 +878,7 @@ fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
     // SAFETY: the calling thread holds its process until the end takes
     // its own reference.
     unsafe { process::end(caller(thread), exited, cause(thread)) };
+    record_call(Call::ProcessExit.number());
     sched::resume()
 }
 
@@ -889,6 +940,7 @@ fn thread_start(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn thread_exit(thread: NonNull<Thread>) -> ! {
     // SAFETY: the running thread made the call and is not used afterwards.
     unsafe { thread::exit(thread) };
+    record_call(Call::ThreadExit.number());
     sched::resume()
 }
 
@@ -1073,7 +1125,13 @@ fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// start of the caller's message buffer and returns abi::LogBatch in
 /// x1-x3 (spec 16.3, crate::log::take).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    reserved_arg(a[2])?;
+    if a[1] == abi::INFO_KERNEL_STATS {
+        if a[2] > 1 {
+            return Err(Error::InvalidArgs);
+        }
+    } else {
+        reserved_arg(a[2])?;
+    }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
     match a[1] {
         abi::INFO_PROCESS_STATE => {
@@ -1102,6 +1160,16 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         }
         abi::INFO_KERNEL_STATS => {
             lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+            match a[2] {
+                0 => {}
+                1 => {
+                    if thread::buffer_page(thread).is_none() {
+                        return Err(Error::InvalidArgs);
+                    }
+                    thread::write_words(thread, 0, &call_maxima());
+                }
+                _ => return Err(Error::InvalidArgs),
+            }
             Ok(Values::new(&kernel_stats().to_words()))
         }
         abi::INFO_MEMORY => {
@@ -1143,6 +1211,7 @@ fn kernel_stats() -> KernelStats {
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
         longest_firing: timer::longest_firing(),
+        entry_to_poll: sched::longest_entry_to_poll(),
     }
 }
 

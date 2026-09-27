@@ -240,12 +240,19 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
         free_frames: phys::free_frames(),
         pool_pages: pages::taken() as u64,
         longest_firing: crate::timer::longest_firing(),
+        entry_to_poll: sched::longest_entry_to_poll(),
     };
     check(
         counted.longest_portion > 0 && counted.free_frames > 0 && counted.pool_pages > 0,
         "the kernel counted no portion, frame or pool page",
     )?;
-    c.succeeds(n, &[stats, kernel, 0], &counted.to_words())
+    c.succeeds(n, &[stats, kernel, 0], &counted.to_words())?;
+    #[cfg(feature = "measure")]
+    check(
+        syscall::call_maxima()[n as usize] > 0,
+        "the measured build did not record object_info",
+    )?;
+    Ok(())
 }
 
 /// A handle holds its object: the last close queues a thread and a
