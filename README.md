@@ -153,7 +153,7 @@ kernel image stays under 200 KB.
 | Virtual console | Boot to the shell on Apple Silicon through Virtualization.framework with `cargo xtask vz`; QEMU and HVF remain test platforms. | ✅ [#21](https://github.com/stafeto/stafeto/pull/21) |
 | File groundwork | Read an e2fsprogs ext4 image in a guest with `cargo xtask ext4ro`; exercise RAM file descriptors and static Picolibc I/O with `cargo xtask ramfs` and `cargo xtask cprobe`. | ✅ [#23](https://github.com/stafeto/stafeto/pull/23), [#24](https://github.com/stafeto/stafeto/pull/24) |
 | BusyBox shell | Run `cat` and an `ash` builtin script from boot images, then type `echo` and `exit` at an interactive `ash` prompt through the UART service. | ✅ [#24](https://github.com/stafeto/stafeto/pull/24), [#26](https://github.com/stafeto/stafeto/pull/26), [#27](https://github.com/stafeto/stafeto/pull/27) |
-| Directory utility | Run BusyBox `ls` over RAM files, including `ls -la` and `ls --help` from the interactive `ash` prompt. | 🚧 |
+| Directory utility | Run BusyBox `ls` over RAM files, including `ls -la` and `ls --help` from the interactive `ash` prompt. | ✅ [#28](https://github.com/stafeto/stafeto/pull/28) |
 | External programs | Load a static ELF from a file service and let `ash` start it, pass arguments and descriptors, and wait for its exit status. | ⬜ |
 | Shell composition | Add descriptor duplication, redirection, pipes, and the signal behavior needed for pipelines and exit status. | ⬜ |
 | Persistent files | Read ext4 through a Virtio block service, then qualify writes with `e2fsck` after normal and interrupted runs. Keep RAM files available for tests. | ⬜ |
