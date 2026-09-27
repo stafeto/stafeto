@@ -296,7 +296,7 @@ impl Init {
             let place = job.record;
             let gone = match job.work {
                 Work::Load if !self.quota_fits(place) => continue,
-                Work::Load => None,
+                Work::Load | Work::ShowLog => None,
                 _ => match self.entries[place].held.take_gone() {
                     Some(gone) => Some(gone),
                     None => continue,
@@ -316,6 +316,7 @@ impl Init {
                     .worker
                     .teardown(gone.expect("a teardown carries its instance")),
                 Work::Kill => self.worker.kill(gone.expect("a kill carries its instance")),
+                Work::ShowLog => self.worker.show_log(),
             };
             return;
         }
@@ -390,6 +391,8 @@ impl Init {
         };
         match loaded {
             Some(result) => self.loaded(job.record, result),
+            // The log it showed is the last job of its record.
+            None if job.work == Work::ShowLog => {}
             None => self.torn_down(job.record),
         }
         self.next();
@@ -562,9 +565,21 @@ impl Init {
 
     /// The teardown of the instance of the record at `place` is done: a
     /// record that restarts loads once its pause is over, and waits for it
-    /// otherwise.
+    /// otherwise; the console's driver, the record with `log`, that is
+    /// broken or ended gets what is left of the kernel log shown by the
+    /// worker at WORKER_IDLE (spec 13.4, 16.3).
     fn torn_down(&mut self, place: usize) {
         let entry = &mut self.entries[place];
+        if matches!(entry.state, State::Broken | State::Ended) && TABLE[place].log {
+            // Ceiling 0: the worker goes to WORKER_IDLE for it (init::work).
+            let job = Job {
+                work: Work::ShowLog,
+                record: place,
+                ceiling: 0,
+            };
+            self.push(job);
+            return;
+        }
         if entry.state != State::Stopping {
             return;
         }

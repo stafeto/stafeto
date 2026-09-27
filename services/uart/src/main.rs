@@ -5,13 +5,14 @@
 //! 60 in one thread (rt::service), which init gives `console` and `log`
 //! in its start data and the window `regs` over the port and the binding
 //! `irq` of its level-triggered line in the reply to its REGISTER. It sets
-//! the PL011 up, serves its interrupts, WRITE and READ of proto_uart, and
-//! shows the kernel log: at its start, on a timer of its own every
-//! LOG_PERIOD_NS, and at once again while the kernel says records are
-//! left. What it decides comes from the library (uart::irq, output,
-//! writes, input, log); here are the calls and the registers, which it
-//! reaches through rt::mmio alone [G34]. The program ends with a code of
-//! its own when its start fails; init restarts it.
+//! the PL011 up, serves its interrupts and WRITE and READ of proto_uart
+//! (CRASH too with the feature `crash`), and shows the kernel log: at its
+//! start, on a timer of its own every LOG_PERIOD_NS, and at once again
+//! while the kernel says records are left. What it decides comes from the
+//! library (uart::irq, output, writes, input, log); here are the calls and
+//! the registers, which it reaches through rt::mmio alone [G34]. The
+//! program ends with a code of its own when its start fails; init
+//! restarts it.
 
 #![no_std]
 #![no_main]
@@ -410,15 +411,28 @@ impl Uart {
     }
 }
 
+/// The methods of the driver: CRASH only with the feature `crash`, and
+/// the loop answers UNKNOWN_METHOD to it without (spec 13.5).
+#[cfg(feature = "crash")]
+const METHODS: &[u16] = &[
+    Method::Write.number(),
+    Method::Read.number(),
+    Method::Crash.number(),
+];
+#[cfg(not(feature = "crash"))]
+const METHODS: &[u16] = &[Method::Write.number(), Method::Read.number()];
+
 impl Service<HELD> for Uart {
     const VERSION: u16 = VERSION;
-    const METHODS: &'static [u16] = &[Method::Write.number(), Method::Read.number()];
+    const METHODS: &'static [u16] = METHODS;
     type Data = ();
 
     fn request(&mut self, _: &mut Session<(), HELD>, r: &mut Request<'_>) -> Answer {
         match Method::from_number(r.method()) {
             Some(Method::Write) => self.write(r),
             Some(Method::Read) => self.read(r),
+            #[cfg(feature = "crash")]
+            Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
@@ -444,6 +458,30 @@ impl Service<HELD> for Uart {
             _ => {}
         }
     }
+}
+
+/// CRASH (spec 13.5): BAD_SIZE for a request with a body; otherwise a
+/// load from page 0, which nothing maps, ends the driver with a fault
+/// while it holds the request: the kernel ends the process alone (spec
+/// 7.9), answers the client PEER_CLOSED (spec 6.8) and writes its line of
+/// the fault into its log, and init starts the driver again.
+#[cfg(feature = "crash")]
+fn crash(r: &Request<'_>) -> Answer {
+    if r.body().finish().is_err() {
+        return Answer::Status(Status::BadSize);
+    }
+    // SAFETY: the load is the fault the method exists for; the thread
+    // never runs after it.
+    unsafe {
+        core::arch::asm!(
+            "ldr {t}, [{a}]",
+            t = out(reg) _,
+            a = in(reg) 0_usize,
+            options(nostack, readonly),
+        )
+    };
+    // Never reached: the kernel ended the thread at the load.
+    Answer::Status(Status::Kernel(Error::BadState))
 }
 
 /// The reply to a WRITE of `n` bytes that all went into the ring.

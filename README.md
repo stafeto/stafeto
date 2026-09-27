@@ -55,7 +55,8 @@ and on Apple silicon under HVF. What works today:
   calls `irq_ack`; a device window maps the registers of a device into a
   driver as device memory, never executable; a driver that dies frees its
   line at once. The tests drive the PL031 real-time clock of QEMU from
-  EL0.
+  EL0; a device window over the console's page takes the console from
+  the kernel until the window goes.
 - **Real time:** program timers fire at the priority of their slots, in
   bounded portions after the timer's interrupt, which takes no timer off
   itself.
@@ -80,11 +81,25 @@ and on Apple silicon under HVF. What works today:
   five failures in 60 s, and loads, kills and tears services down on a
   worker thread just above the service's ceiling. An image of a test
   table checks all of it.
+- **Kernel log:** `debug_write` and the kernel's lines about processes go
+  into a ring of 64 records in the kernel, which the console's driver
+  reads and takes; the kernel prints a record itself only while no
+  driver holds the console, `init` shows what is left once the driver
+  is broken, and a panic prints what nobody showed.
+- **UART driver:** the PL011 driver (`services/uart`) serves the console
+  on interrupts at priority 60; it shows the kernel log between whole
+  lines of its clients, lets writes wait whole for room and gives input
+  to one reader at a time (`proto/uart`).
+- **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench` and
+  `crash uart`, which crashes the driver: `init` restarts it, and the
+  shell connects to the new instance; after five crashes in 60 s the
+  driver is broken, the shell says so through the kernel, and `init`
+  shows the driver's last fault and its own decision.
 
-`cargo xtask run` boots to `init`, which checks its table of services,
-empty for now, and says that the services started. `cargo xtask test`
-runs the tests on QEMU's GICv2 and GICv3; `cargo xtask hvf` runs them on
-a Mac with Apple silicon, on Apple's GICv3 and on QEMU's GICv2.
+`cargo xtask run` boots to the shell's prompt. `cargo xtask test` runs
+the tests on QEMU's GICv2 and GICv3, a dialog with the shell through the
+console among them; `cargo xtask hvf` runs them on a Mac with Apple
+silicon, on Apple's GICv3 and on QEMU's GICv2.
 
 ## Roadmap
 
@@ -110,7 +125,8 @@ parts. Each finished part is merged through a pull request.
 | | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
 | | 1.4b Runtime and protocols | handles that own their entries, strict test builds, one time scale, `proto/wire` and `proto/init`, start protocol, service loop with sessions and a heartbeat, ELF reader in `bootimg` | ✅ [#17](https://github.com/stafeto/stafeto/pull/17) |
 | | 1.4c init services | `init` starts services from its table, refuses a table with a cycle or a broken ceiling, serves names through `connect`, restarts crashed and silent services and marks broken ones | ✅ [#18](https://github.com/stafeto/stafeto/pull/18) |
-| | 1.4d UART driver and shell | the PL011 driver and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | 🚧 |
+| | 1.4d UART driver and shell | the kernel log, the PL011 driver on interrupts and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | ✅ [#PR](https://github.com/stafeto/stafeto/pull/PR) |
+| | 1.4e Measurements and diagnostics | a file of measurements for TCG and HVF, the longest times of the calls, a log of kernel events, panic addresses as function names | 🚧 |
 
 Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
 `crash uart` shows the driver restart and the shell reconnecting, and the
@@ -139,11 +155,12 @@ installs the Rust version, components, and targets itself from
 | Command | What it does |
 |---|---|
 | `cargo xtask build` | builds the kernel into `target/stafeto.img` (under `CARGO_TARGET_DIR` when it is set) and checks that the image is under 200 KB |
-| `cargo xtask run` | runs the system in QEMU; exit with Ctrl-A, then X |
-| `cargo xtask test` | host tests, boot in QEMU, and tests inside the kernel |
+| `cargo xtask run` | runs the system in QEMU to the shell's prompt; exit with Ctrl-A, then X |
+| `cargo xtask run --hvf` | the same under HVF on a Mac with Apple silicon; elsewhere it fails and says why |
+| `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
 | `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
 | `cargo xtask ci` | formatting, clippy, and all tests |
-| `cargo xtask hvf` | on a Mac with Apple silicon: boot, the test `init`, the tests of init's service table and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
+| `cargo xtask hvf` | on a Mac with Apple silicon: boot, the dialog with the shell, the test `init`, the tests of init's service table and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 

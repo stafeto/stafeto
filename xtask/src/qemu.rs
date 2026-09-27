@@ -429,6 +429,11 @@ impl Run {
         }
     }
 
+    /// The lines that ended so far, a CR before the LF cut.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
     /// Types `line` and a CR, as Enter sends it, into the pipe of the
     /// child's stdin.
     pub fn send(&mut self, line: &str) -> Result<(), String> {

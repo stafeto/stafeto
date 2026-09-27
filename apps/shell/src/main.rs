@@ -7,15 +7,19 @@
 //! time, shows its prompt, reads input with READ, echoes each byte with
 //! WRITE (shell::line), and runs the command the line names
 //! (shell::command). `ps`, `mem` and `bench` ask init (LIST, STATS, PING
-//! of proto_init); their lines come from shell::format. A command's
-//! output goes in whole lines, one WRITE while it fits. The program ends
-//! with a code of its own when a call to the driver fails; init starts it
-//! again.
+//! of proto_init); their lines come from shell::format; `crash uart`
+//! sends CRASH to the driver. A command's output goes in whole lines, one
+//! WRITE while it fits. PEER_CLOSED from the driver, to any call, means it
+//! died: the shell connects again, which waits in init for the new
+//! instance, and says so. Once init says the driver is broken, the shell
+//! says that through debug_write, the port being the kernel's again, and
+//! waits for good without spinning. The program ends with a code of its
+//! own when a call to the driver fails otherwise; init starts it again.
 
 #![no_std]
 #![no_main]
 
-use abi::MESSAGE_MAX;
+use abi::{Error, MESSAGE_MAX};
 use core::fmt::{self, Write};
 use proto_init::{ListReply, ListRequest, Method, Stats};
 use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
@@ -31,17 +35,25 @@ rt::entry!(main);
 
 /// The prompt, with no newline after it.
 const PROMPT: &[u8] = b"stafeto> ";
-/// The line the shell says once it connected.
+/// The line the shell says once it connected, and once it connected again
+/// after the driver died.
 const CONNECTED: &[u8] = b"shell: connected to uart; type help for the commands\n";
+const RECONNECTED: &[u8] = b"shell: uart restarted; connected again\n";
+/// The line of `crash uart` before its CRASH.
+const CRASHING: &[u8] = b"shell: crashing uart\n";
+/// The line through debug_write once init says the driver is broken.
+const BROKEN: &str = "shell: uart is broken; no console left";
 /// The bytes one READ asks for at most.
 const READ_BYTES: u32 = 64;
 /// The round trips of PING that `bench` times.
 const BENCH_ROUNDS: u32 = 1000;
 /// The codes of its end: no start data; no session with the driver; a
-/// call to the driver failed.
+/// call to the driver failed; no channel to wait on once the driver is
+/// broken.
 const NO_START_DATA: u64 = 1;
 const NO_UART: u64 = 2;
 const UART_FAILED: u64 = 3;
+const NO_WAIT: u64 = 4;
 
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
@@ -50,12 +62,9 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let uart = match rt::service::connect(&s.parent, "uart") {
+    let uart = match connect(&s.parent) {
         Ok(uart) => uart,
-        Err(status) => {
-            println!("shell: no session with uart: {status:?}");
-            return NO_UART;
-        }
+        Err(code) => return code,
     };
     let mut shell = Shell {
         parent: s.parent,
@@ -65,9 +74,58 @@ fn main(_: u64) -> u64 {
         at: 0,
         len: 0,
     };
-    match shell.serve() {
-        Ok(never) => match never {},
-        Err(_) => UART_FAILED,
+    let mut greeting = CONNECTED;
+    loop {
+        match shell.serve(greeting) {
+            Ok(never) => match never {},
+            Err(Status::Kernel(Error::PeerClosed)) => {}
+            Err(_) => return UART_FAILED,
+        }
+        // The driver died: output that did not reach it is not written
+        // again, and the line being typed goes.
+        shell.uart = match connect(&shell.parent) {
+            Ok(uart) => uart,
+            Err(code) => return code,
+        };
+        shell.line.clear();
+        shell.at = 0;
+        shell.len = 0;
+        greeting = RECONNECTED;
+    }
+}
+
+/// A session with the driver (spec 13.4, 13.6): CONNECT waits in init
+/// until an instance registers. PEER_CLOSED means the driver is broken:
+/// the shell says BROKEN through debug_write, which reaches the port since
+/// the driver's window went with it (spec 3.2), and waits for good
+/// (`wait_for_good`); another refusal gives NO_UART.
+fn connect(parent: &Handle<Channel>) -> Result<Handle<Channel>, u64> {
+    match rt::service::connect(parent, "uart") {
+        Ok(uart) => Ok(uart),
+        Err(Status::Kernel(Error::PeerClosed)) => {
+            println!("{BROKEN}");
+            Err(wait_for_good())
+        }
+        Err(status) => {
+            println!("shell: no session with uart: {status:?}");
+            Err(NO_UART)
+        }
+    }
+}
+
+/// Waits for good without spinning or a timer (spec 13.6): a receive on
+/// a channel of its own, whose one handle the shell keeps and which
+/// nothing notifies or sends to. Gives NO_WAIT when it has no such
+/// channel, or when a receive fails, which it never repeats.
+fn wait_for_good() -> u64 {
+    let Ok(channel) = sys::channel_create(1) else {
+        return NO_WAIT;
+    };
+    loop {
+        // Nothing comes; the handle with RECEIVE stays, so no PEER_CLOSED.
+        if sys::receive(&channel).is_err() {
+            return NO_WAIT;
+        }
     }
 }
 
@@ -83,10 +141,10 @@ struct Shell {
 }
 
 impl Shell {
-    /// Says that it connected, then shows the prompt, reads a line and
-    /// runs it, for as long as the driver answers.
-    fn serve(&mut self) -> Result<core::convert::Infallible, Status> {
-        self.write(CONNECTED)?;
+    /// Says `greeting`, that it connected, then shows the prompt, reads a
+    /// line and runs it, for as long as the driver answers.
+    fn serve(&mut self, greeting: &[u8]) -> Result<core::convert::Infallible, Status> {
+        self.write(greeting)?;
         loop {
             self.write(PROMPT)?;
             self.read_line()?;
@@ -166,9 +224,16 @@ impl Shell {
                 facts(&mut out, "bench", written);
             }
             Command::CrashUart => {
-                for piece in command::unknown(self.line.text()) {
-                    out.put(piece);
-                }
+                self.write(CRASHING)?;
+                let status = match self.crash() {
+                    Err(Status::Kernel(Error::PeerClosed)) => {
+                        return Err(Status::Kernel(Error::PeerClosed));
+                    }
+                    Err(status) => status,
+                    Ok(()) => Status::Ok,
+                };
+                // The driver lives, built without `crash`. The line fits.
+                let _ = writeln!(out, "shell: crash uart: {status:?}");
             }
             Command::Unknown(line) => {
                 for piece in command::unknown(line) {
@@ -229,6 +294,15 @@ impl Shell {
             rounds.add(time::now().wrapping_sub(start));
         }
         Ok(rounds)
+    }
+
+    /// CRASH: the driver faults while it holds the request, and the kernel
+    /// answers PEER_CLOSED; a driver built without the feature `crash`
+    /// answers UNKNOWN_METHOD (spec 13.5).
+    fn crash(&self) -> Result<(), Status> {
+        let request = proto_uart::Method::Crash.header().bytes();
+        let mut buffer = [0; MESSAGE_MAX];
+        call(&self.uart, &request, &mut buffer).map(drop)
     }
 
     /// READ of up to READ_BYTES: the reply waits for input, and its bytes

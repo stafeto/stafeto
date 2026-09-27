@@ -77,7 +77,7 @@
 //! | 0..4 | status 0 |
 //! | 4..8 | zero |
 //! | 8..72 | the eight words of KERNEL_STATS, x1 to x8 |
-//! | 72 | the work of init's worker thread: 0 none, 1 load, 2 teardown, 3 kill (`Work`) |
+//! | 72 | the work of init's worker thread: 0 none, 1 load, 2 teardown, 3 kill, 4 show the kernel log (`Work`) |
 //! | 73 | the record it works for, its number in LIST (its place in init's table plus 1); 0 with no work |
 //! | 74 | the worker's base priority |
 //! | 75 | the worker's effective priority |
@@ -474,6 +474,9 @@ pub enum Work {
     Teardown = 2,
     /// Kills an instance that went silent, then tears it down.
     Kill = 3,
+    /// Shows what is left of the kernel log once its reader, the
+    /// console's driver, ended for good.
+    ShowLog = 4,
 }
 
 impl Work {
@@ -482,7 +485,7 @@ impl Work {
     }
 
     pub fn from_byte(byte: u8) -> Option<Work> {
-        [Work::Load, Work::Teardown, Work::Kill]
+        [Work::Load, Work::Teardown, Work::Kill, Work::ShowLog]
             .into_iter()
             .find(|w| w.byte() == byte)
     }
@@ -901,8 +904,8 @@ mod tests {
         assert_eq!(w.as_bytes()[72..74], [0, 0]);
         assert_eq!(Stats::read(w.as_bytes()), Ok(idle));
         // A work without its record, a record without its work, a work
-        // past the three, and a byte that must be zero.
-        for (at, byte) in [(73, 0), (72, 0), (72, 4), (78, 2), (79, 1), (4, 1)] {
+        // past the four, and a byte that must be zero.
+        for (at, byte) in [(73, 0), (72, 0), (72, 5), (78, 2), (79, 1), (4, 1)] {
             let mut bad = bytes.to_vec();
             bad[at] = byte;
             assert_eq!(Stats::read(&bad), Err(Status::BadSize), "byte {at}");

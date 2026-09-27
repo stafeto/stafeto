@@ -5,9 +5,11 @@
 //! records of the table (rt::loader::spawn), tears down those that ended
 //! and kills those that went silent, one job at a time, so that init's
 //! main thread at 63 never waits for work that grows with the size of a
-//! service, and never lets go of the last handles of an instance. The main
-//! thread puts a job into the cell (`Worker::load`, `Worker::teardown`,
-//! `Worker::kill`), sets the worker's level (init::work::Jobs) and
+//! service, and never lets go of the last handles of an instance; once the
+//! console's driver ended for good, it shows what is left of the kernel
+//! log (`show_log`). The main thread puts a job into the cell
+//! (`Worker::load`, `Worker::teardown`, `Worker::kill`,
+//! `Worker::show_log`), sets the worker's level (init::work::Jobs) and
 //! wakes it through the worker's channel; the worker does the job, leaves
 //! its outcome in the cell and tells the main thread through its copy of
 //! init's channel with NOTIFY and a label of its own, whose slot is at
@@ -51,6 +53,8 @@ enum Order {
     /// Kill the process of the instance in the cell's `gone`, then close
     /// its handles.
     Kill,
+    /// Show what is left of the kernel log (`show_log`).
+    ShowLog,
 }
 
 /// What a load leaves the main thread: the instance, its thread not
@@ -188,6 +192,12 @@ impl Worker {
         self.give(Order::Kill, Some(gone))
     }
 
+    /// Gives the worker what is left of the kernel log to show, once the
+    /// console's driver ended for good (`give`, spec 13.4).
+    pub fn show_log(&self) -> Result<(), Error> {
+        self.give(Order::ShowLog, None)
+    }
+
     /// Puts `order` and `gone` into the cell and wakes the worker. The
     /// main thread gives a job only once it took the outcome of the one
     /// before (`take`).
@@ -250,6 +260,10 @@ extern "C" fn work(_: u64) -> ! {
             Order::Teardown => {
                 // The handles close here, the cleanup at the worker's level.
                 drop(gone);
+                None
+            }
+            Order::ShowLog => {
+                show_log();
                 None
             }
             Order::Kill => {
@@ -324,4 +338,27 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<(), Error> {
     // The checks of the table keep the own arguments within OWN_ARGS_MAX.
     args.write(&mut w).map_err(|_| Error::InvalidArgs)?;
     spawned.giver.set_args(w.as_bytes())
+}
+
+/// Shows what is left of the kernel log once its reader, the console's
+/// driver, ended for good (spec 13.4, 16.3): batches of LOG through the
+/// system resource, then the line of the records lost and the text of each
+/// record (uart::log::text) through debug_write, a call each, while the
+/// kernel says records are left, a ring's worth at most. The main thread
+/// gives it at WORKER_IDLE, below every cleanup of the driver's instance,
+/// so the port is the kernel's and the texts go out at once (spec 3.2).
+fn show_log() {
+    let resource = view::<Resource>(RESOURCE);
+    let mut records = [[0; abi::LOG_RECORD]; abi::LOG_BATCH];
+    for _ in 0..64 / abi::LOG_BATCH + 1 {
+        let Ok(batch) = sys::log_take(&resource, &mut records) else {
+            return;
+        };
+        uart::log::text(&records, batch, |bytes| {
+            let _ = sys::debug_write(&resource, bytes);
+        });
+        if batch.left == 0 {
+            return;
+        }
+    }
 }

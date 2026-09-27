@@ -87,7 +87,10 @@
    stops a boot on the shell's line
    `shell: connected to uart; type help for the commands`, and talks to
    the shell through a pipe on the console's input in its console
-   dialog; it stops a run of the image of `init`'s test
+   dialog, which ends with five `crash uart`: four restarts of the driver
+   and a broken one, after which the kernel prints the shell's line and
+   then what is left of the kernel log, which init's worker shows; it
+   stops a run of the image of `init`'s test
    table on init's line of the end of the test client there,
    `init: checker ended: ...`. xtask judges a run of tests by its
    `TESTS DONE` line and fails a run with a `KERNEL PANIC` line
@@ -118,13 +121,16 @@ there instead of under `target/`.
 
 ## Under HVF
 
-`cargo xtask hvf` runs the boot checks, the test init and the kernel
-tests under HVF on a Mac with Apple silicon, on two machines:
+`cargo xtask hvf` runs the boot checks, the console dialog with the
+shell, the test init and the kernel tests under HVF on a Mac with Apple
+silicon, on two machines:
 `-machine virt,gic-version=3 -accel hvf,kernel-irqchip=on -cpu host`, with
 Apple's GICv3 in the macOS kernel, and
 `-machine virt,gic-version=2 -accel hvf,kernel-irqchip=off -cpu host`,
 with QEMU's GICv2. On any other host it prints why it skips and succeeds;
-`cargo xtask ci` does not run it. To run one by hand, after
+`cargo xtask ci` does not run it. `cargo xtask run --hvf` boots the
+normal build on the first machine with the console on the terminal, and
+fails with the reason on any other host. To run one by hand, after
 `cargo xtask test` has built the images (under `target/`, or
 `CARGO_TARGET_DIR` when it is set):
 
