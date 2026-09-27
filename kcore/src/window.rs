@@ -3,10 +3,11 @@
 
 //! Device windows (spec 7.3, 9): the physical range device_window_create
 //! gives a memory object, rounded out to whole pages, and the check that
-//! it touches no page the kernel keeps for itself: RAM, every region of
-//! the GIC's node, and the PL011 of the kernel's console until milestone
-//! 1.4. A page shared with any of them is refused, so no window reaches a
-//! register of the kernel's devices.
+//! it touches no page the kernel keeps for itself: RAM and every region of
+//! the GIC's node. A page shared with any of them is refused, so no window
+//! reaches a register of the kernel's devices. The console's port is no
+//! such device: a window over its page takes the port from the kernel
+//! while it lives (spec 3.2, kcore::console::covers).
 
 use crate::PAGE_SIZE;
 use crate::bootinfo::{BootInfo, GIC_REGIONS, MEMORY_REGIONS, Region, RegionList};
@@ -16,9 +17,9 @@ use abi::{Error, MAX_MEMORY};
 pub const OUTPUT_END: u64 = 1 << 48;
 
 /// What a window may not touch: the RAM regions of the device tree
-/// (MEMORY_REGIONS, at most), the regions of the GIC's node (GIC_REGIONS,
-/// at most) and the PL011.
-pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS + 1 }>;
+/// (MEMORY_REGIONS, at most) and the regions of the GIC's node
+/// (GIC_REGIONS, at most).
+pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS }>;
 
 /// The range of `len` bytes from `addr` rounded out to whole pages: its
 /// first page and its count of pages. INVALID_ARGS for a length of 0, a
@@ -36,16 +37,13 @@ pub fn round_out(addr: u64, len: u64) -> Result<(u64, u64), Error> {
     }
 }
 
-/// What windows may not touch on the machine `info` describes: its RAM,
-/// every region of the GIC's node, whole, and the PL011.
+/// What windows may not touch on the machine `info` describes: its RAM
+/// and every region of the GIC's node, whole.
 pub fn forbidden(info: &BootInfo) -> Forbidden {
     let mut list = Forbidden::new();
     let gic = info.gic.as_ref().map_or(&[][..], |g| g.regs.as_slice());
     for &r in info.memory.as_slice().iter().chain(gic) {
         list.push(r).expect("room for the RAM and the GIC");
-    }
-    if let Some(r) = info.uart_pl011 {
-        list.push(r).expect("room for the PL011");
     }
     list
 }
@@ -90,7 +88,7 @@ mod tests {
     }
 
     /// A window on QEMU `virt` (the fixture): RAM from 0x4000_0000, the GIC
-    /// at 0x0800_0000 and 0x0801_0000, the PL011 at 0x0900_0000.
+    /// at 0x0800_0000 and 0x0801_0000.
     fn window(addr: u64, len: u64) -> Result<(u64, u64), Error> {
         window_on(VIRT, addr, len)
     }
@@ -128,12 +126,22 @@ mod tests {
             (0x0800_F000, 0x1000),
             (0x0801_0000, 0x1000),
             (0x0801_FFF0, 0x10),
-            (0x0900_0000, 0x1000),
-            (0x0900_0FF0, 0x20),
-            (0x08FF_FFF0, 0x20),
+            (0x0800_FFF0, 0x20),
         ] {
             assert_eq!(window(addr, len), Err(Error::InvalidArgs), "{addr:#x}");
         }
+    }
+
+    /// The PL011 of the kernel's console is open to windows (spec 3.2, 9):
+    /// its page is not forbidden, and a window over it takes the port.
+    #[test]
+    fn the_console_page_is_open_to_windows() {
+        let virt = forbidden_on(VIRT);
+        assert!(virt.as_slice().iter().all(|r| r.base != 0x0900_0000));
+        assert_eq!(virt.as_slice().len(), 3);
+        assert_eq!(window(0x0900_0000, 0x1000), Ok((0x0900_0000, 1)));
+        assert_eq!(window(0x0900_0FF0, 0x20), Ok((0x0900_0000, 2)));
+        assert_eq!(window(0x08FF_FFF0, 0x20), Ok((0x08FF_F000, 2)));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! x0-x9, so that a later kernel may return more values, and `receive`
 //! x0-x11; the kernel keeps every other register. `raw` makes any call
 //! with any registers, for tests that hand the kernel bad ones; the
-//! functions after it are the typed calls of milestones 1.2c to 1.3e,
+//! functions after it are the typed calls of milestones 1.2c to 1.4d,
 //! which take and return handles typed by the kind of their object
 //! (`Handle`), and the token of a request, which answers it once
 //! (`Token`). A send or a reply with handles takes them, and gives them
@@ -22,9 +22,10 @@ use crate::handle::{
 };
 use crate::msgbuf;
 use abi::{
-    Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats,
-    MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo, Message, Notification, Policy, ProcessHandles,
-    ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source, TRIGGER_EDGE, ThreadInfo,
+    Access, Call, ChannelInfo, Error, HANDLES_SHIFT, INLINE_MAX, IrqInfo, KernelStats, LOG_BATCH,
+    LOG_RECORD, LogBatch, MESSAGE_HANDLES, MESSAGE_MAX, MemoryInfo, Message, Notification, Policy,
+    ProcessHandles, ProcessMemory, ProcessState, Rights, SOURCE_SHIFT, Source, TRIGGER_EDGE,
+    ThreadInfo,
 };
 use core::arch::asm;
 
@@ -310,6 +311,26 @@ pub fn kernel_stats(resource: &Handle<Resource>) -> Result<KernelStats, Error> {
     Ok(KernelStats::from_words([
         x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8],
     ]))
+}
+
+/// object_info(LOG) through the system resource with KSTATS (spec 11,
+/// 16.3): takes up to abi::LOG_BATCH records of the kernel log that nobody
+/// showed or took, oldest first, into the first `count` of `records`, each
+/// in the layout of abi::LOG_RECORD; returns what it took, the records
+/// lost since the last read and those left. The kernel keeps the cursor:
+/// a record taken once is taken by nobody else.
+pub fn log_take(
+    resource: &Handle<Resource>,
+    records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
+) -> Result<LogBatch, Error> {
+    let args = [resource.raw().0, abi::INFO_LOG, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    let batch = LogBatch::from_words([x[1], x[2], x[3]]);
+    let count = (batch.count as usize).min(LOG_BATCH);
+    for (i, record) in records.iter_mut().enumerate().take(count) {
+        msgbuf::read(i * LOG_RECORD, record);
+    }
+    Ok(batch)
 }
 
 /// object_info(MEMORY): the object's size in bytes, the pages whose frames

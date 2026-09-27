@@ -173,11 +173,13 @@ const TEST_INIT_LINES: [&str; 6] = [
     "BAD_HANDLE from Notify",
     "BAD_HANDLE from HandleClose",
 ];
-/// The children of the test init that fault, each with a line of the
-/// kernel (spec 7.9): the child with no code of
+/// The children of the test init that fault with a line of the kernel on
+/// the port (spec 7.9): the child with no code of
 /// `child_fault_reason_reaches_the_parent` and the children with code of
 /// the tests of faults, of `wfi` with the fault before it, of an orphan
-/// that faults and of a load through a device window on a hole.
+/// that faults and of a load through a device window on a hole. The child
+/// of `a_kernel_line_fills_records_in_turn` faults behind a window over
+/// the console's page, and its line stays in the kernel log (spec 3.2).
 const CHILD_FAULTS: usize = 13;
 /// The panic of a child (tests/child, Role::Panic): rt prints where it
 /// panicked, then this message on a line of its own (spec 13.2).
@@ -209,7 +211,20 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 216;
+const INIT_TESTS: u32 = 220;
+/// The lines of the test init's
+/// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
+/// first, written behind a window over the console's page, goes into the
+/// kernel log alone and never reaches the port; the second, written once
+/// the window went, comes whole.
+const LOG_BEHIND: &str = "log marker: behind the window";
+const LOG_IN_FRONT: &str = "log marker: in front of the window";
+/// The rows of the test init's line `log ticks:` under -icount (spec
+/// 15.3): a debug_write of 64 bytes into the kernel log and a read of a
+/// full batch of it.
+const LOG_ROWS: [&str; 2] = ["write", "take"];
+/// The page of the PL011 of QEMU `virt`, the console's port.
+const CONSOLE_PA: u64 = 0x0900_0000;
 /// Tests the client `checker` of init's test table has (tests/svc).
 const SVC_TESTS: u32 = 26;
 /// What init prints for each table it refuses (services/init, features
@@ -578,14 +593,34 @@ fn init_entry(path: &Path) -> Result<u64, String> {
     Ok(init.entry)
 }
 
+/// `movz x<rd>, #imm, lsl #(16 * hw)`.
+const fn movz(rd: u32, imm: u16, hw: u32) -> u32 {
+    0xD280_0000 | hw << 21 | (imm as u32) << 5 | rd
+}
+
+/// `movk x<rd>, #imm, lsl #(16 * hw)`.
+const fn movk(rd: u32, imm: u16, hw: u32) -> u32 {
+    0xF280_0000 | hw << 21 | (imm as u32) << 5 | rd
+}
+
 /// `movz x0, #imm`.
 const fn movz_x0(imm: u16) -> u32 {
-    0xD280_0000 | (imm as u32) << 5
+    movz(0, imm, 0)
 }
 
 /// `movk x0, #imm, lsl #16`.
 const fn movk_x0_lsl16(imm: u16) -> u32 {
-    0xF2A0_0000 | (imm as u32) << 5
+    movk(0, imm, 1)
+}
+
+/// x<rd> = `value`: a `movz` of its low 16 bits, then a `movk` of each
+/// other 16 bits that are not 0.
+fn mov(rd: u32, value: u64) -> Vec<u32> {
+    let half = |hw: u32| (value >> (16 * hw)) as u16;
+    let rest = (1..4).filter(|&hw| half(hw) != 0);
+    std::iter::once(movz(rd, half(0), 0))
+        .chain(rest.map(|hw| movk(rd, half(hw), hw)))
+        .collect()
 }
 
 /// `svc #n`.
@@ -648,6 +683,7 @@ fn test() -> Result<(), String> {
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
     init_fault_stops_the_machine()?;
+    panic_prints_the_log_nobody_showed()?;
     fault_report()?;
     stack_overflow_report()?;
     test_build_carries_test_symbols()?;
@@ -889,6 +925,62 @@ fn init_fault_stops_the_machine() -> Result<(), String> {
     qemu::expect_line(&o, "init terminated: Killed")?;
     if let Some(l) = o.lines.iter().find(|l| l.starts_with("process fault")) {
         return Err(format!("an init that killed itself faulted: {l}"));
+    }
+    Ok(())
+}
+
+/// Spec 16.1: the panic shows the records of the kernel log that nobody
+/// showed or took, before its own report. An init of xtask's own
+/// (raw_init) makes a device window over the console's page through its
+/// system resource, which takes the port from the kernel (spec 3.2),
+/// writes `pan-log` with debug_write and loads from address 0: the kernel
+/// puts the line of the fault and init's registers into its log, and the
+/// panic shows `pan-log`, the line and the registers, in that order,
+/// before its line KERNEL PANIC and the line of its cause, every line
+/// whole; the machine powers off.
+fn panic_prints_the_log_nobody_showed() -> Result<(), String> {
+    let a = build(Variant::Normal)?;
+    let resource = abi::INIT_RESOURCE.0;
+    let mut code = Vec::new();
+    code.extend(mov(0, resource));
+    code.extend(mov(1, CONSOLE_PA));
+    code.extend(mov(2, bootimg::PAGE_SIZE));
+    code.push(svc(abi::Call::DeviceWindowCreate.number()));
+    code.extend(mov(0, resource));
+    code.extend(mov(1, 8));
+    code.extend(mov(2, u64::from_le_bytes(*b"pan-log\n")));
+    code.push(svc(abi::Call::DebugWrite.number()));
+    let elr = RAW_INIT_ENTRY + 4 * code.len() as u64;
+    // debug_write leaves 0 in x0: the load is from page 0.
+    code.push(LDR_X0_X0);
+    let path = target_dir().join("panic-log-init.img");
+    std::fs::write(&path, raw_init(&code, false, 0)?)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&path));
+    cmd.args(qemu::HEADLESS);
+    let o = qemu::run_until(cmd, BOOT_TIMEOUT, None)?;
+    qemu::expect_powered_off(&o)?;
+    let at = |what: &str, found: &dyn Fn(&str) -> bool| {
+        o.lines
+            .iter()
+            .position(|l| found(l))
+            .ok_or_else(|| format!("no line of {what}; the lines: {:?}", o.lines))
+    };
+    let fault = format!("ESR=0x92000006 FAR=0x0 ELR={elr:#x}");
+    let fault_line = format!("process fault: data abort from EL0 (EC 0x24) {fault}");
+    let cause = format!("init terminated by a fault: {fault}");
+    let order = [
+        at("pan-log", &|l| l == "pan-log")?,
+        at("the fault", &|l| l == fault_line)?,
+        at("x0", &|l| l.starts_with("x0  0x"))?,
+        at("init's registers", &|l| l == init_registers(elr))?,
+        at("the panic", &|l| l.starts_with("KERNEL PANIC: "))?,
+        at("its cause", &|l| l == cause)?,
+    ];
+    if !order.is_sorted() {
+        return Err(format!(
+            "the log did not come before the panic in its order: lines {order:?}"
+        ));
     }
     Ok(())
 }
@@ -1233,6 +1325,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
     for line in TEST_INIT_LINES {
         qemu::expect_line(&o, line)?;
     }
+    log_markers(&o)?;
     child_panic_comes_whole(&o.lines)?;
     let faults = o
         .lines
@@ -1261,8 +1354,20 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
             m.name,
             rows_of(&NORMAL_BUILD_ROWS, &ticks)
         );
+        let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
+        println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
     Ok(r.passed.len())
+}
+
+/// Spec 3.2: the line the test init writes behind a window over the
+/// console's page reaches no line of the port, and the one it writes once
+/// the window went comes whole.
+fn log_markers(o: &qemu::Outcome) -> Result<(), String> {
+    if let Some(l) = o.lines.iter().find(|l| l.contains(LOG_BEHIND)) {
+        return Err(format!("a line behind the window reached the port: {l}"));
+    }
+    qemu::expect_line(o, LOG_IN_FRONT)
 }
 
 /// The image of init's test table (spec 15.2): init built with

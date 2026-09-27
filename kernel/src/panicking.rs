@@ -8,6 +8,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// the MMU and caches are on, so the atomic swap is safe to use.
 static PANICKING: AtomicBool = AtomicBool::new(false);
 
+/// The kernel's panic (spec 16.1): it takes the console's port back,
+/// whoever has it, shows the records of the kernel log that nobody showed
+/// or took, then its report and the backtrace, and powers the machine
+/// off once the port's transmitter is idle (`stop`).
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
     if PANICKING.swap(true, Ordering::Relaxed) {
@@ -16,9 +20,19 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         kprintln!("\nKERNEL PANIC while panicking; parking");
         park()
     }
+    take_console();
     kprintln!("\nKERNEL PANIC: {info}");
     crate::arch::backtrace::print();
     stop()
+}
+
+/// The start of every report that ends in a panic (spec 16.1): the
+/// console's port comes back to the kernel, whoever has it, and the
+/// records of the kernel log that nobody showed or took go out first,
+/// once (crate::log::show_unshown).
+pub(crate) fn take_console() {
+    crate::console::take_back();
+    crate::log::show_unshown();
 }
 
 fn park() -> ! {

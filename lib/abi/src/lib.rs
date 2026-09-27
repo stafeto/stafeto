@@ -629,6 +629,64 @@ pub const INFO_CHANNEL: u64 = 7;
 /// IRQ takes an interrupt binding's handle, with no right needed, and
 /// returns `IrqInfo::to_words` in x1-x3.
 pub const INFO_IRQ: u64 = 8;
+/// LOG takes the system resource with KSTATS: it takes up to LOG_BATCH
+/// records of the kernel log that nobody showed or took, LOG_RECORD bytes
+/// each, into the start of the calling thread's message buffer, and
+/// returns `LogBatch::to_words` in x1-x3 (spec 11, 16.3).
+pub const INFO_LOG: u64 = 9;
+
+/// A record of the kernel log (spec 16.3), in the ring of the kernel and
+/// in the message buffer alike, numbers least significant byte first:
+/// bytes 0-7 the counter ticks (CNTVCT_EL0) when it was written, byte 8
+/// its kind (LOG_TEXT_KIND, LOG_KERNEL_KIND; never 0), byte 9 the length
+/// of its text (1 to LOG_TEXT), bytes 10-15 zeros, bytes 16-79 the text,
+/// zeros past its length. A text longer than LOG_TEXT takes several
+/// records in a row; a reader joins their texts into one stream of bytes.
+pub const LOG_RECORD: usize = 80;
+/// The bytes of text a record holds at most.
+pub const LOG_TEXT: usize = 64;
+/// The records one object_info(LOG) takes at most: 960 bytes of the
+/// message buffer.
+pub const LOG_BATCH: usize = 12;
+/// Where a record holds its kind, the length of its text and its text.
+pub const LOG_KIND_AT: usize = 8;
+pub const LOG_LEN_AT: usize = 9;
+pub const LOG_TEXT_AT: usize = 16;
+/// The kind of a record of debug_write's bytes.
+pub const LOG_TEXT_KIND: u8 = 1;
+/// The kind of a record of a line of the kernel: the fault of a process
+/// and, for init, its registers (spec 7.9).
+pub const LOG_KERNEL_KIND: u8 = 2;
+
+const _: () = assert!(LOG_RECORD * LOG_BATCH <= MESSAGE_MAX);
+const _: () = assert!(LOG_TEXT_AT + LOG_TEXT == LOG_RECORD);
+
+/// What one object_info(LOG) took (spec 11, 16.3): the records it put in
+/// the message buffer, 0 to LOG_BATCH; the records nobody showed or took
+/// that the ring wrote over since the last read; and the records nobody
+/// showed or took that are left after these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogBatch {
+    pub count: u64,
+    pub lost: u64,
+    pub left: u64,
+}
+
+impl LogBatch {
+    /// The words `object_info` returns in x1-x3.
+    pub const fn to_words(self) -> [u64; 3] {
+        [self.count, self.lost, self.left]
+    }
+
+    /// The batch from x1-x3 of `object_info`.
+    pub const fn from_words(words: [u64; 3]) -> LogBatch {
+        LogBatch {
+            count: words[0],
+            lost: words[1],
+            left: words[2],
+        }
+    }
+}
 
 /// Bit 0 of the flags of `irq_bind` (spec 9, 11): the line is
 /// edge-triggered; without it, level-triggered. The other bits are
@@ -1496,6 +1554,22 @@ mod tests {
         );
         assert_eq!((stats.free_frames, stats.longest_firing), (6, 8));
         assert_eq!(stats.to_words(), words);
+    }
+
+    #[test]
+    fn log_layout_is_fixed() {
+        assert_eq!(INFO_LOG, 9);
+        assert_eq!((LOG_RECORD, LOG_TEXT, LOG_BATCH), (80, 64, 12));
+        assert_eq!((LOG_KIND_AT, LOG_LEN_AT, LOG_TEXT_AT), (8, 9, 16));
+        assert_eq!((LOG_TEXT_KIND, LOG_KERNEL_KIND), (1, 2));
+        assert_eq!(LOG_RECORD * LOG_BATCH, 960);
+        let batch = LogBatch {
+            count: 12,
+            lost: 6,
+            left: 40,
+        };
+        assert_eq!(batch.to_words(), [12, 6, 40]);
+        assert_eq!(LogBatch::from_words(batch.to_words()), batch);
     }
 
     #[test]

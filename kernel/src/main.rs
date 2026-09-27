@@ -12,6 +12,8 @@
 
 #[macro_use]
 mod console;
+#[macro_use]
+mod log;
 mod arch;
 mod boot;
 mod channel;
@@ -53,6 +55,7 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
     mm::kmap::switch_to_kernel_tables(boot);
+    console::set_port(&boot.info);
     let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());

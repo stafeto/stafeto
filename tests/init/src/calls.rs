@@ -1068,7 +1068,7 @@ fn kernel_stats_need_kstats() -> Outcome {
 
 /// object_info(x0 handle, x1 kind, x2 0) checks the kind and x2 first,
 /// then the handle, its type and its rights (spec 11, 16), and changes x0
-/// alone on an error: kind 0, a kind past IRQ or with bits past its word
+/// alone on an error: kind 0, a kind past LOG or with bits past its word
 /// and a nonzero x2 fail with INVALID_ARGS, for handle 0 too; handle 0
 /// with a good kind fails with BAD_HANDLE. The kinds of a process take a
 /// process handle with any rights, and the system resource or a thread is
@@ -1078,7 +1078,8 @@ fn kernel_stats_need_kstats() -> Outcome {
 /// process is WRONG_TYPE, a copy without KSTATS ACCESS_DENIED. A good call
 /// writes nothing past its words: PROCESS_STATE, «alive» here,
 /// THREAD_STATE and CHANNEL x1-x4, PROCESS_MEMORY and PROCESS_HANDLES
-/// x1-x3.
+/// x1-x3. LOG has a test of its own
+/// (devices::object_info_log_checks_its_arguments).
 fn object_info_checks_its_arguments() -> Outcome {
     let own = copy(&own(), Rights::NONE)?;
     let debug = copy(&resource(), Rights::DEBUG)?;
@@ -1107,7 +1108,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     let resource = resource().raw().0;
     let kinds = [
         [own, 0, 0],
-        [own, irq + 1, 0],
+        [own, abi::INFO_LOG + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],

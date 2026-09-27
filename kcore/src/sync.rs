@@ -38,6 +38,13 @@ impl<T> Lock<T> {
             _not_auto: PhantomData,
         }
     }
+
+    /// The value's address, for the one reader that may not wait for the
+    /// lock: the kernel's panic, which reads what a holder it interrupted
+    /// may have left half written, and never returns to that holder.
+    pub fn as_ptr(&self) -> *const T {
+        self.value.get()
+    }
 }
 
 /// Access to a locked value; dropping the guard unlocks. A shared guard

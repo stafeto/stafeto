@@ -990,7 +990,9 @@ fn timer_cancel(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// memory::check_window); then the resources in the order the call takes
 /// them: room in the caller's table (LIMIT_REACHED), a page of the caller's
 /// pool of memory objects and a block of its table (NO_MEMORY). A window
-/// whose handle did not go in goes again.
+/// whose handle did not go in goes again. A window over a page of the
+/// console's port takes the port from the kernel while it lives (spec
+/// 3.2, memory::create_window).
 fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let (base, pages) = kcore::window::round_out(a[1], a[2])?;
     lookup(thread, a[0], Rights::DEVICE, Object::resource)?;
@@ -1013,7 +1015,7 @@ fn device_window_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Err
 /// the right to post into it. The line is edge-triggered with
 /// abi::TRIGGER_EDGE in the flags, level-triggered without, and open at
 /// once. The checks in the order of spec 11: a line outside the shared
-/// ones or the kernel's console line, a priority outside 1-63 and a flag
+/// ones, a priority outside 1-63 and a flag
 /// other than TRIGGER_EDGE (INVALID_ARGS); x0 (BAD_HANDLE, WRONG_TYPE,
 /// ACCESS_DENIED without DEVICE), x2 (BAD_HANDLE, WRONG_TYPE,
 /// ACCESS_DENIED without NOTIFY); the priority above the caller's ceiling
@@ -1066,7 +1068,10 @@ fn irq_ack(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 /// rights and returns abi::MemoryInfo in x1-x3; THREAD_STATE a thread's and
 /// returns abi::ThreadInfo in x1-x4; CHANNEL a channel's, a labelled copy
 /// too, and returns abi::ChannelInfo in x1-x4; IRQ an interrupt binding's
-/// and returns abi::IrqInfo in x1-x3.
+/// and returns abi::IrqInfo in x1-x3. LOG takes the system resource with
+/// KSTATS, takes up to abi::LOG_BATCH records of the kernel log into the
+/// start of the caller's message buffer and returns abi::LogBatch in
+/// x1-x3 (spec 16.3, crate::log::take).
 fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     reserved_arg(a[2])?;
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
@@ -1115,6 +1120,10 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
             let b = lookup(thread, a[0], Rights::NONE, Object::irq)?;
             Ok(Values::new(&irq::info(b).to_words()))
         }
+        abi::INFO_LOG => {
+            lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
+            Ok(Values::new(&crate::log::take(thread).to_words()))
+        }
         _ => Err(Error::InvalidArgs),
     }
 }
@@ -1138,12 +1147,14 @@ fn kernel_stats() -> KernelStats {
 }
 
 /// debug_write(x0 system resource with DEBUG, x1 length up to 64, x2-x9
-/// the bytes as abi::inline_words packs them): writes the bytes to the
-/// console at once, interrupts masked, and returns their count in x1.
+/// the bytes as abi::inline_words packs them): puts the bytes into the
+/// kernel log as one record, and while the kernel has the console's port
+/// writes them there at once, interrupts masked (spec 3.2, 16.3); returns
+/// their count in x1.
 fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let len = inline_len_arg(a[1])?;
     lookup(thread, a[0], Rights::DEBUG, Object::resource)?;
     let words: &[u64; 8] = a[2..].try_into().expect("x2-x9");
-    crate::console::write_bytes(&abi::inline_bytes(words)[..len]);
+    crate::log::text(&abi::inline_bytes(words)[..len]);
     Ok(Values::new(&[a[1]]))
 }

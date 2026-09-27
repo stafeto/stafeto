@@ -24,7 +24,9 @@
 //! window (`create_window`, spec 9): an object over a physical range of
 //! device registers, whole pages that touch no RAM and no device of the
 //! kernel (kcore::window), which programs map as Device-nGnRE and never
-//! execute (`attrs`, spec 7.4).
+//! execute (`attrs`, spec 7.4). A window over a page of the console's port
+//! takes the port from the kernel from its making to its last portion of
+//! cleanup (console::window_made, console::window_gone, spec 3.2).
 
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame, LinearMem};
@@ -211,7 +213,7 @@ pub fn forbid(info: &BootInfo) {
 /// INVALID_ARGS when the `pages` pages from `base`, a range
 /// kcore::window::round_out gave, touch RAM or a device of the kernel
 /// (spec 9): device_window_create checks its range against the objects
-/// the kernel keeps. O(17): kcore::window::Forbidden.
+/// the kernel keeps. O(16): kcore::window::Forbidden.
 pub fn check_window(base: u64, pages: u64) -> Result<(), Error> {
     let forbidden = FORBIDDEN.get().expect("memory::forbid ran at boot");
     window::check(base, pages, forbidden.as_slice())
@@ -221,14 +223,17 @@ pub fn check_window(base: u64, pages: u64) -> Result<(), Error> {
 /// registers from `base`, a range `check_window` let through, which
 /// `payer`, the process of the thread that makes it, pays a place in its
 /// pool of memory objects for, as `create_boot` does (NO_MEMORY). Its
-/// budget is 0, and it holds the payer's shell. The caller gets the first
-/// reference.
+/// budget is 0, and it holds the payer's shell. One over a page of the
+/// console's port takes the port from the kernel (console::window_made,
+/// spec 3.2). The caller gets the first reference.
 pub fn create_window(
     payer: NonNull<Process>,
     base: u64,
     pages: usize,
 ) -> Result<NonNull<Memory>, Error> {
-    create_over(payer, Backing::Device { base, pages })
+    let m = create_over(payer, Backing::Device { base, pages })?;
+    crate::console::window_made(base, pages as u64);
+    Ok(m)
 }
 
 /// An object over frames or registers it does not own, `backing`, with a
@@ -379,8 +384,10 @@ pub unsafe fn release(m: NonNull<Memory>, cause: u8) {
 /// `level`. Once none is left, at once over the boot image and for a
 /// device window, whose frames stay, its place goes back to the payer's
 /// pool, its budget to the payer's quota, and its reference to the
-/// payer's shell goes, which may queue the shell at `level`. O(1): at most
-/// RELEASE_STEP frames.
+/// payer's shell goes, which may queue the shell at `level`; a window
+/// over a page of the console's port gives the port back then, with no
+/// handle and no mapping of it left (console::window_gone, spec 3.2).
+/// O(1): at most RELEASE_STEP frames.
 ///
 /// # Safety
 /// Nothing refers to the object, and it is in no queue.
@@ -390,7 +397,11 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
     let (backing, budget) = unsafe { (&mut (*p).backing, &mut (*p).budget) };
     let done = match backing {
         Backing::Owned(list) => list.release_step(&mut Budget(budget)),
-        Backing::Boot { .. } | Backing::Device { .. } => true,
+        Backing::Boot { .. } => true,
+        Backing::Device { base, pages } => {
+            crate::console::window_gone(*base, *pages as u64);
+            true
+        }
     };
     if !done {
         // SAFETY: the object stays alive and in place until its next
