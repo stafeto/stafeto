@@ -1,0 +1,11 @@
+[package]
+name = "ext4ro"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Read-only ext4 access over a bounded block device"
+
+[dependencies]
+ext4-view = { version = "1.0.0", default-features = false }

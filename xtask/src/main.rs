@@ -50,6 +50,7 @@ const VZ_PROGRAMS: [ImageProgram; 2] = [
     ("shell", "shell", SHELL_STACK_SIZE, &["vz"]),
 ];
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
+const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const TEST_PROGRAMS: [ImageProgram; 2] = [
     ("init", "test-init", INIT_STACK_SIZE, &[]),
     ("child", "test-child", CHILD_STACK_SIZE, &[]),
@@ -417,6 +418,7 @@ commands:
             QEMU's GICv2; skips elsewhere
   vz        boot the shell through Apple Virtualization.framework
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
+  ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   help      this text";
 
 fn main() {
@@ -430,6 +432,7 @@ fn main() {
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
         Some("rtbench") => rtbench::run(&args[1..]),
+        Some("ext4ro") => ext4ro_probe(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -827,8 +830,22 @@ fn run_machine(
     }
 }
 
+/// First ext4 slice: the guest reads the checked-in e2fsprogs image
+/// through ext4-view. The image is embedded until a block service exists.
+fn ext4ro_probe() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-ext4ro.img", &EXT4RO_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let output = run_until(cmd, BOOT_TIMEOUT, None, &kernel.elf)?;
+    qemu::expect_init_exit(&output, "boot complete", 0)?;
+    println!("ext4 read-only guest probe passed");
+    Ok(())
+}
+
 fn test() -> Result<(), String> {
     host_tests()?;
+    ext4ro_probe()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
@@ -872,6 +889,8 @@ fn host_tests() -> Result<(), String> {
         "abi",
         "--package",
         "bootimg",
+        "--package",
+        "ext4ro",
         "--package",
         "init",
         "--package",
@@ -2161,6 +2180,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "bootimg",
         "--package",
+        "ext4ro",
+        "--package",
         "kcore",
         "--package",
         "proto-init",
@@ -2216,6 +2237,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "rt",
         "--package",
+        "ext4ro",
+        "--package",
         "init",
         "--package",
         "shell",
@@ -2227,6 +2250,8 @@ fn ci() -> Result<(), String> {
         "test-init",
         "--package",
         "test-child",
+        "--package",
+        "ext4ro-probe",
         "--package",
         "test-svc",
         "--package",
