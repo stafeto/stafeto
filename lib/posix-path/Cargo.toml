@@ -1,0 +1,11 @@
+[package]
+name = "posix-path"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Single-process path state for the stafeto Rust POSIX library"
+
+[dependencies]
+proto-fs = { path = "../../proto/fs" }

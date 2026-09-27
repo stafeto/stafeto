@@ -169,24 +169,28 @@ The kernel supplies isolation, scheduling, memory, handles, and IPC. A
 process service should use the existing `rt` ELF loader to start programs
 after boot and report exits. File, namespace, and terminal services own
 paths, descriptors, and interactive I/O. The target is a Rust POSIX
-implementation exporting a stable C ABI above those services. The current
+service with a stable C ABI library for compatible programs and a small MIT
+client for GPLv2-only BusyBox. The current
 Picolibc build and small C hooks bootstrap BusyBox while that Rust
 implementation is built.
 
 Build upstream packages against a versioned AArch64 stafeto sysroot with
-headers, the Rust C-ABI library, startup code, and port patches. Keep one pinned source
+headers, the appropriate C ABI client, startup code, and port patches. Keep one pinned source
 and patch manifest in `tools/`, then stage selected binaries and data into
 a root image. The current Picolibc and BusyBox build scripts are the first
-two package recipes; Picolibc is retired when the Rust library supports
-their required interfaces. This lets more utilities share one build
+two package recipes. GPLv2-only packages retain a compatible C runtime and
+call the Rust POSIX service through the MIT client; compatible programs can
+use the Rust library directly. This lets more utilities share one build
 interface without copying their source into the kernel.
 
 #### Rust POSIX implementation
 
-The target is the full mandatory POSIX.1-2024 interface and its shell and
-utilities, implemented in Rust with C-compatible entry points. Track
+The target is the full mandatory POSIX.1-2024 interface, implemented in Rust
+with C-compatible entry points, plus a conforming shell and utilities. Track
 optional interface groups separately. The current Picolibc bridge covers
-basic file calls and standard streams only. Each step below needs guest
+basic file calls and standard streams only. The GPL-3.0-or-later
+`lib/posix-path` crate now keeps the working directory and resolves relative
+paths in Rust. Each step below needs guest
 checks for successful calls, failures, and ABI layout.
 
 | Step | Interface and guest check | State |
@@ -247,8 +251,18 @@ How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 
 ## License
 
-The kernel, services, drivers, and tools are distributed under
-GPL-3.0-or-later ([LICENSE](LICENSE)). Libraries for programs (`lib/abi`,
-`lib/rt`, `lib/bootimg`, `proto/*`) are distributed under MIT
+The kernel, services, drivers, tools, and Rust POSIX implementation
+(beginning with `lib/posix-path`) are distributed under GPL-3.0-or-later
+([LICENSE](LICENSE)). Libraries for programs (`lib/abi`, `lib/rt`,
+`lib/bootimg`, `proto/*`) and the temporary Picolibc bridge (`lib/posix`)
+are distributed under MIT
 ([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can be released under
 any license.
+
+BusyBox is GPL-2.0-only and links statically with the temporary MIT bridge.
+The GPL-3.0-or-later Rust POSIX implementation will run in a separate service;
+a small MIT client can carry requests from BusyBox without linking that service
+into the BusyBox binary. Other programs can use a GPL-compatible Rust C ABI
+library directly. See the [BusyBox license](https://busybox.net/license.html).
+The [FSF compatibility table](https://www.gnu.org/licenses/gpl-faq.en.html)
+explains the linking restriction. `cargo xtask ci` checks this dependency boundary.
