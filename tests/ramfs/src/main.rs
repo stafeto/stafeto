@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Guest round trip through the RAM service and the descriptor client.
+
+#![no_std]
+#![no_main]
+
+use proto_fs::{BAD_FD, NO_ENTRY, READ_ONLY, READ_WRITE};
+use proto_wire::Status;
+use rt::fs::Files;
+use rt::handle::Resource;
+
+rt::entry!(main);
+
+fn main(_: u64) -> u64 {
+    let Ok(mut start) = rt::startup() else {
+        return 1;
+    };
+    if let Ok(console) = start.take::<Resource>("console") {
+        rt::console::set(console);
+    }
+    let result = check(&start.parent);
+    match result {
+        Ok(()) => {
+            rt::println!("ramfs-probe: ok");
+            0
+        }
+        Err(reason) => {
+            rt::println!("ramfs-probe: failed {reason}");
+            2
+        }
+    }
+}
+
+fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
+    let fs = Files::connect(parent).map_err(|_| "connect")?;
+    let motd = fs.open("/etc/motd", READ_ONLY).map_err(|_| "open motd")?;
+    if fs.fstat_size(motd) != Ok(14) {
+        return Err("stat motd");
+    }
+    let mut bytes = [0; 32];
+    let n = fs.read(motd, &mut bytes).map_err(|_| "read motd")?;
+    if &bytes[..n] != b"stafeto ramfs\n" {
+        return Err("motd data");
+    }
+    fs.close(motd).map_err(|_| "close motd")?;
+    if fs.read(motd, &mut bytes) != Err(Status::Unknown(BAD_FD)) {
+        return Err("closed fd");
+    }
+    if fs.open("/missing", READ_ONLY) != Err(Status::Unknown(NO_ENTRY)) {
+        return Err("missing path");
+    }
+    let fd = fs
+        .open("/tmp/probe", READ_WRITE)
+        .map_err(|_| "open scratch")?;
+    if fs.write(fd, b"abc") != Ok(3) {
+        return Err("write scratch");
+    }
+    if fs.lseek(fd, 1) != Ok(1) {
+        return Err("seek scratch");
+    }
+    if fs.write(fd, b"Z") != Ok(1) {
+        return Err("overwrite scratch");
+    }
+    if fs.fstat_size(fd) != Ok(3) {
+        return Err("stat scratch");
+    }
+    fs.lseek(fd, 0).map_err(|_| "rewind scratch")?;
+    if fs.read(fd, &mut bytes[..3]) != Ok(3) || &bytes[..3] != b"aZc" {
+        return Err("scratch data");
+    }
+    let line = b"ramfs-probe: stdout ok\n";
+    if fs.write(1, line) != Ok(line.len()) {
+        return Err("stdout");
+    }
+    fs.close(fd).map_err(|_| "close scratch")?;
+    Ok(())
+}

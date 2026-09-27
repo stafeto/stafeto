@@ -1,0 +1,18 @@
+[package]
+name = "busybox-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-2.0-only"
+description = "First BusyBox applet in a stafeto boot image"
+build = "build.rs"
+
+[[bin]]
+name = "busybox-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-bridge = { path = "../../lib/posix" }
+rt = { path = "../../lib/rt" }

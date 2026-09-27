@@ -2,3 +2,4 @@
 *.img
 /measurements/
 .DS_Store
+__pycache__/

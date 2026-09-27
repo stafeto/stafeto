@@ -20,6 +20,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "busybox-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-bridge",
+ "rt",
+]
+
+[[package]]
+name = "cprobe"
+version = "0.1.0"
+dependencies = [
+ "posix-bridge",
+ "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,12 +124,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "posix-bridge"
+version = "0.1.0"
+dependencies = [
+ "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proto-fs"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
 ]
 
 [[package]]
@@ -147,11 +182,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "ramfs"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-fs",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "ramfs-probe"
+version = "0.1.0"
+dependencies = [
+ "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "rt"
 version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "proto-fs",
  "proto-init",
  "proto-wire",
 ]

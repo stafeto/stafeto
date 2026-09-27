@@ -23,6 +23,9 @@ table-test = []
 table-cycle = []
 table-ceiling = []
 vz = []
+table-ramfs = []
+table-cprobe = []
+table-busybox = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

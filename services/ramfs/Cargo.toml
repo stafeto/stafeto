@@ -1,0 +1,25 @@
+[package]
+name = "ramfs"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Small writable RAM file service for early stafeto userspace"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "ramfs"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-fs = { path = "../../proto/fs" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }
