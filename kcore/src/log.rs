@@ -114,7 +114,11 @@ impl<const N: usize> Ring<N> {
         let len = text.len().min(LOG_TEXT);
         let place = (self.head % N as u64) as usize;
         let record = &mut self.records[place];
-        if self.head >= N as u64 && self.head - N as u64 >= self.taken && !record.shown {
+        if self.head >= N as u64
+            && self.head - N as u64 >= self.taken
+            && !record.shown
+            && matches!(record.kind, abi::LOG_TEXT_KIND | abi::LOG_KERNEL_KIND)
+        {
             self.lost += 1;
         }
         record.time = time;
@@ -151,6 +155,29 @@ impl<const N: usize> Ring<N> {
             lost: core::mem::take(&mut self.lost),
             left: left as u64,
         }
+    }
+
+    /// Reads from sequence `first` without moving the console reader's
+    /// cursor. Includes shown text and event records. Returns the next
+    /// sequence number and the count already overwritten before `first`.
+    pub fn peek(&self, first: u64, mut put: impl FnMut(usize, &Record)) -> (LogBatch, u64) {
+        let oldest = self.head.saturating_sub(N as u64);
+        let mut next = first.max(oldest).min(self.head);
+        let lost = oldest.saturating_sub(first);
+        let mut count = 0;
+        while next < self.head && count < LOG_BATCH {
+            put(count, self.at(next));
+            count += 1;
+            next += 1;
+        }
+        (
+            LogBatch {
+                count: count as u64,
+                lost,
+                left: self.head - next,
+            },
+            next,
+        )
     }
 
     /// The records nobody showed or took, oldest first: what the panic
@@ -374,6 +401,31 @@ mod tests {
         let mut got = Vec::new();
         ring.take(|_, r| got.push(number_of(r)));
         assert_eq!(got, [15]);
+    }
+
+    #[test]
+    fn peek_reports_overflow_and_keeps_the_text_cursor() {
+        let mut ring = Ring::<8>::new();
+        for n in 1..=12 {
+            ring.push(n, LOG_TEXT_KIND, &numbered(n), false);
+        }
+        let mut got = Vec::new();
+        let (batch, next) = ring.peek(0, |_, r| got.push(number_of(r)));
+        assert_eq!((batch.count, batch.lost, next), (8, 4, 12));
+        assert_eq!(got, (5..=12).collect::<Vec<_>>());
+        let (again, _) = ring.peek(0, |_, _| {});
+        assert_eq!(again.lost, 4);
+        assert_eq!(ring.take(|_, _| {}).count, 8);
+    }
+
+    #[test]
+    fn overwritten_events_do_not_report_lost_console_text() {
+        let mut ring = Ring::<8>::new();
+        for n in 1..=12 {
+            ring.push(n, abi::LOG_SWITCH_KIND, b"thread=1", false);
+        }
+        assert_eq!(ring.peek(0, |_, _| {}).0.lost, 4);
+        assert_eq!(ring.take(|_, _| {}).lost, 0);
     }
 
     #[test]

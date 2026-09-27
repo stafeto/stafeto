@@ -143,6 +143,8 @@ impl Values {
 /// has written the caller's result first. A thread in a long call goes on
 /// with it (`go_on`).
 pub fn dispatch(thread: NonNull<Thread>, number: u16) {
+    #[cfg(feature = "trace")]
+    crate::log::syscall(number, crate::thread::index(thread));
     #[cfg(feature = "measure")]
     {
         // SAFETY: the single-core dispatch owns this state until it exits.
@@ -1136,7 +1138,7 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         if a[2] > 1 {
             return Err(Error::InvalidArgs);
         }
-    } else {
+    } else if a[1] != abi::INFO_LOG {
         reserved_arg(a[2])?;
     }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
@@ -1197,7 +1199,13 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
         }
         abi::INFO_LOG => {
             lookup(thread, a[0], Rights::KSTATS, Object::resource)?;
-            Ok(Values::new(&crate::log::take(thread).to_words()))
+            if a[2] == 0 {
+                Ok(Values::new(&crate::log::take(thread).to_words()))
+            } else {
+                let (batch, next) = crate::log::peek(thread, a[2] - 1);
+                let [count, lost, left] = batch.to_words();
+                Ok(Values::new(&[count, lost, left, next + 1]))
+            }
         }
         _ => Err(Error::InvalidArgs),
     }

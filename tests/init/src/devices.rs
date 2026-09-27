@@ -829,24 +829,19 @@ fn fault_at_zero() -> Result<ProcessState, &'static str> {
 
 /// object_info(x0 handle, x1 LOG, x2 0) checks its values first, then the
 /// handle, then its right (spec 11, 16.3), and changes x0 alone on an
-/// error: kind 10 and a nonzero x2 fail with INVALID_ARGS, for a closed
-/// handle too; a closed handle with BAD_HANDLE, a channel with WRONG_TYPE
+/// error: kind 10 fails with INVALID_ARGS, for a closed handle too; a
+/// closed handle with BAD_HANDLE, a channel with WRONG_TYPE
 /// and a copy of the system resource with DEBUG alone with ACCESS_DENIED.
-/// A good call changes x0-x3 alone.
+/// A destructive call changes x0-x3 alone; sequence reads return x4 too.
 fn object_info_log_checks_its_arguments() -> Outcome {
     const N: u16 = Call::ObjectInfo.number();
     let gone = closed_handle()?;
     let c = channel(QUIET)?;
     let debug = copy(&resource(), Rights::DEBUG)?;
     let (r, log) = (resource().raw().0, abi::INFO_LOG);
-    let invalid = [
-        [r, log + 1, 0],
-        [r, log, 1],
-        [gone, log + 1, 0],
-        [gone, log, 1],
-    ]
-    .iter()
-    .all(|x| x0_alone::<N>(x, Error::InvalidArgs.code()));
+    let invalid = [[r, log + 1, 0], [gone, log + 1, 0]]
+        .iter()
+        .all(|x| x0_alone::<N>(x, Error::InvalidArgs.code()));
     let refused = [
         (gone, Error::BadHandle),
         (c.raw().0, Error::WrongType),
@@ -859,12 +854,13 @@ fn object_info_log_checks_its_arguments() -> Outcome {
     // SAFETY: object_info runs no code of the program; LOG writes its
     // message buffer alone.
     let after = unsafe { sys::raw::<N>(x) };
+    let mut peek = marked();
+    peek[..3].copy_from_slice(&[r, log, 1]);
+    // SAFETY: LOG reads the ring and writes only the message buffer.
+    let peek_after = unsafe { sys::raw::<N>(peek) };
     close(debug)?;
     close(c)?;
-    check(
-        invalid,
-        "kind 10 or a nonzero x2 did not fail with INVALID_ARGS alone",
-    )?;
+    check(invalid, "kind 10 did not fail with INVALID_ARGS alone")?;
     check(
         refused,
         "a closed handle, a channel or a copy without KSTATS did not fail alone",
@@ -872,6 +868,13 @@ fn object_info_log_checks_its_arguments() -> Outcome {
     check(
         after[0] == 0 && after[1] <= LOG_BATCH as u64 && after[4..] == x[4..],
         "a good LOG failed or changed registers past x3",
+    )?;
+    check(
+        peek_after[0] == 0
+            && peek_after[1] <= LOG_BATCH as u64
+            && peek_after[4] >= 1
+            && peek_after[5..] == peek[5..],
+        "a sequence LOG failed or changed registers past x4",
     )
 }
 

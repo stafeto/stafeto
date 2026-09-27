@@ -93,6 +93,8 @@ pub struct Record {
     /// data, under the name `log`: the console's driver reads the kernel
     /// log with it (spec 13.3, 16.3).
     pub log: bool,
+    /// Gives the shell a KSTATS resource for non-destructive tracing.
+    pub trace: bool,
     pub windows: &'static [Window],
     pub bindings: &'static [Binding],
     /// The services it may connect to, by name.
@@ -575,6 +577,7 @@ mod tests {
             restart: Restart::Always,
             console: false,
             log: false,
+            trace: false,
             windows: &[],
             bindings: &[],
             connects: &[],

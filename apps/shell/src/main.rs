@@ -7,7 +7,8 @@
 //! time, shows its prompt, reads input with READ, echoes each byte with
 //! WRITE (shell::line), and runs the command the line names
 //! (shell::command). `ps`, `mem` and `bench` ask init (LIST, STATS, PING
-//! of proto_init); their lines come from shell::format; `crash uart`
+//! of proto_init); their lines come from shell::format. `trace` reads
+//! the kernel event ring without moving the console cursor. `crash uart`
 //! sends CRASH to the driver. A command's output goes in whole lines, one
 //! WRITE while it fits. PEER_CLOSED from the driver, to any call, means it
 //! died: the shell connects again, which waits in init for the new
@@ -19,7 +20,10 @@
 #![no_std]
 #![no_main]
 
-use abi::{Error, MESSAGE_MAX};
+use abi::{
+    Error, LOG_BATCH, LOG_INTERRUPT_KIND, LOG_LEN_AT, LOG_RECORD, LOG_SWITCH_KIND,
+    LOG_SYSCALL_KIND, LOG_TEXT_AT, MESSAGE_MAX,
+};
 use core::fmt::{self, Write};
 use proto_init::{ListReply, ListRequest, Method, Stats};
 use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
@@ -62,12 +66,15 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = s.take::<Resource>("console") {
         rt::console::set(console);
     }
+    let trace = s.take::<Resource>("trace").ok();
     let uart = match connect(&s.parent) {
         Ok(uart) => uart,
         Err(code) => return code,
     };
     let mut shell = Shell {
         parent: s.parent,
+        trace,
+        trace_next: 1,
         uart,
         line: Line::new(),
         input: [0; READ_BYTES as usize],
@@ -133,6 +140,8 @@ fn wait_for_good() -> u64 {
 /// line it edits and the input it read and did not take yet.
 struct Shell {
     parent: Handle<Channel>,
+    trace: Option<Handle<Resource>>,
+    trace_next: u64,
     uart: Handle<Channel>,
     line: Line,
     input: [u8; READ_BYTES as usize],
@@ -223,6 +232,7 @@ impl Shell {
                 let written = asked.map(|(r, s)| format::bench(&mut out, &r, &s, time::scale()));
                 facts(&mut out, "bench", written);
             }
+            Command::Trace => return self.trace(),
             Command::CrashUart => {
                 self.write(CRASHING)?;
                 let status = match self.crash() {
@@ -242,6 +252,52 @@ impl Shell {
             }
         }
         self.write_lines(out.as_bytes())
+    }
+
+    /// Streams one snapshot of the ring, preserving the console cursor.
+    fn trace(&mut self) -> Result<(), Status> {
+        let Some(resource) = self.trace.as_ref() else {
+            return self.write(b"shell: trace resource unavailable\n");
+        };
+        let mut snapshot_end = None;
+        loop {
+            let mut records = [[0u8; LOG_RECORD]; LOG_BATCH];
+            let (batch, next) = match sys::log_peek(resource, self.trace_next, &mut records) {
+                Ok(result) => result,
+                Err(error) => {
+                    let mut out = Out::new();
+                    let _ = writeln!(out, "shell: trace: {error:?}");
+                    return self.write(out.as_bytes());
+                }
+            };
+            let end = *snapshot_end.get_or_insert(next.saturating_add(batch.left));
+            if batch.lost > 0 {
+                let mut out = Out::new();
+                let _ = writeln!(out, "trace: lost {} records", batch.lost);
+                self.write(out.as_bytes())?;
+            }
+            self.trace_next = next;
+            let first = next.saturating_sub(batch.count);
+            let count = batch.count.min(end.saturating_sub(first)) as usize;
+            for record in records.iter().take(count) {
+                let kind = match record[abi::LOG_KIND_AT] {
+                    LOG_SYSCALL_KIND => "syscall",
+                    LOG_SWITCH_KIND => "switch",
+                    LOG_INTERRUPT_KIND => "interrupt",
+                    _ => continue,
+                };
+                let time = u64::from_le_bytes(record[..8].try_into().unwrap());
+                let len = usize::from(record[LOG_LEN_AT]).min(abi::LOG_TEXT);
+                let text =
+                    core::str::from_utf8(&record[LOG_TEXT_AT..LOG_TEXT_AT + len]).unwrap_or("?");
+                let mut out = Out::new();
+                let _ = writeln!(out, "trace: {time} {kind} {text}");
+                self.write(out.as_bytes())?;
+            }
+            if next >= end || batch.count == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// WRITE of `bytes` in pieces of whole lines, WRITE_MAX bytes at most

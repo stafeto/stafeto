@@ -351,6 +351,29 @@ pub fn log_take(
     Ok(batch)
 }
 
+/// Reads the log at `next` (sequence plus one) without advancing the
+/// console reader. The returned cursor is the next sequence plus one.
+pub fn log_peek(
+    resource: &Handle<Resource>,
+    next: u64,
+    records: &mut [[u8; LOG_RECORD]; LOG_BATCH],
+) -> Result<(LogBatch, u64), Error> {
+    if next == 0 {
+        return Err(Error::InvalidArgs);
+    }
+    let args = [resource.raw().0, abi::INFO_LOG, next];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    let batch = LogBatch::from_words([x[1], x[2], x[3]]);
+    for (i, record) in records
+        .iter_mut()
+        .enumerate()
+        .take((batch.count as usize).min(LOG_BATCH))
+    {
+        msgbuf::read(i * LOG_RECORD, record);
+    }
+    Ok((batch, x[4]))
+}
+
 /// object_info(MEMORY): the object's size in bytes, the pages whose frames
 /// it owns and its mappings now.
 pub fn memory_info(memory: &Handle<Memory>) -> Result<MemoryInfo, Error> {

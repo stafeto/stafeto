@@ -17,6 +17,8 @@ use kcore::gic::Ack;
 /// serves it (spec 9). O(1) but for the timer's part.
 pub fn handle(ack: Ack) {
     let intid = ack.intid();
+    #[cfg(feature = "trace")]
+    crate::log::interrupt(intid);
     if intid == timer::INTID {
         // A level line may reach the GIC once more after the EOI that
         // followed a disarm: without the timer's condition the interrupt is

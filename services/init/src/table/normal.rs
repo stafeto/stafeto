@@ -32,6 +32,7 @@ pub const TABLE: &[Record] = &[
         restart: Restart::Always,
         console: true,
         log: true,
+        trace: false,
         windows: &[Window {
             name: "regs",
             base: PL011,
@@ -58,6 +59,7 @@ pub const TABLE: &[Record] = &[
         restart: Restart::Always,
         console: true,
         log: false,
+        trace: true,
         windows: &[],
         bindings: &[],
         connects: &["uart"],

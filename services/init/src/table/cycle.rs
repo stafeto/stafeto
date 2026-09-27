@@ -23,6 +23,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         restart: Restart::Always,
         console: false,
         log: false,
+        trace: false,
         windows: &[],
         bindings: &[],
         connects,

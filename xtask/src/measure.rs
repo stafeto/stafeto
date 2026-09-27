@@ -126,6 +126,7 @@ fn content(
         for (label, prefix) in [
             ("", "ipc round trip ticks: "),
             ("baseline ", "baseline ipc round trip ticks: "),
+            ("trace ", "trace ipc round trip ticks: "),
         ] {
             for row in ["fast", "slow"] {
                 if let Some((count, min, median, max)) = series(&report.lines, prefix, row) {

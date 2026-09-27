@@ -641,7 +641,7 @@ pub const INFO_LOG: u64 = 9;
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
 /// bytes 0-7 the counter ticks (CNTVCT_EL0) when it was written, byte 8
-/// its kind (LOG_TEXT_KIND, LOG_KERNEL_KIND; never 0), byte 9 the length
+/// its kind (text, kernel, or a trace event; never 0), byte 9 the length
 /// of its text (1 to LOG_TEXT), bytes 10-15 zeros, bytes 16-79 the text,
 /// zeros past its length. A text longer than LOG_TEXT takes several
 /// records in a row; a reader joins their texts into one stream of bytes.
@@ -660,6 +660,12 @@ pub const LOG_TEXT_KIND: u8 = 1;
 /// The kind of a record of a line of the kernel: the fault of a process
 /// and, for init, its registers (spec 7.9).
 pub const LOG_KERNEL_KIND: u8 = 2;
+/// A traced system-call entry; text names the call and thread.
+pub const LOG_SYSCALL_KIND: u8 = 3;
+/// A traced switch to a thread.
+pub const LOG_SWITCH_KIND: u8 = 4;
+/// A traced interrupt acknowledgement.
+pub const LOG_INTERRUPT_KIND: u8 = 5;
 
 const _: () = assert!(LOG_RECORD * LOG_BATCH <= MESSAGE_MAX);
 const _: () = assert!(LOG_TEXT_AT + LOG_TEXT == LOG_RECORD);

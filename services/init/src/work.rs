@@ -196,6 +196,7 @@ mod tests {
             restart: Restart::Always,
             console: false,
             log: false,
+            trace: false,
             windows: &[],
             bindings: &[],
             connects: &[],

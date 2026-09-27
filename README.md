@@ -90,7 +90,7 @@ and on Apple silicon under HVF. What works today:
   on interrupts at priority 60; it shows the kernel log between whole
   lines of its clients, lets writes wait whole for room and gives input
   to one reader at a time (`proto/uart`).
-- **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench` and
+- **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
   driver is broken, the shell says so through the kernel, and `init`

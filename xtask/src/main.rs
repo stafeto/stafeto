@@ -151,13 +151,14 @@ const BROKEN: &str = "shell: uart is broken; no console left";
 const DRIVER_FAULT: &str = "process fault: data abort from EL0 (EC 0x24) ESR=0x";
 const UART_ENDED: &str = "init: uart ended: ";
 /// The lines of the shell's `help`, each whole (spec 13.6).
-const HELP_LINES: [&str; 7] = [
+const HELP_LINES: [&str; 8] = [
     "help        list the commands",
     "echo WORDS  print the words",
     "uptime      the time since boot",
     "ps          the services and their state",
     "mem         the memory of each process",
     "bench       the round trip of a request and the latencies",
+    "trace       show kernel events since the last trace",
     "crash uart  crash the UART driver; init restarts it",
 ];
 /// The bytes of the line the console dialog types while `bench` runs:
@@ -331,6 +332,8 @@ enum Variant {
     Normal,
     Test,
     Baseline,
+    Trace,
+    TraceNormal,
     /// The kernel tests with those that need QEMU's `-icount` (qemu::ICOUNT).
     TestIcount,
     FaultProbe,
@@ -338,8 +341,9 @@ enum Variant {
 }
 
 impl Variant {
-    const ALL: [Variant; 5] = [
+    const ALL: [Variant; 6] = [
         Variant::Normal,
+        Variant::TraceNormal,
         Variant::Test,
         Variant::TestIcount,
         Variant::FaultProbe,
@@ -351,6 +355,8 @@ impl Variant {
             Variant::Normal => None,
             Variant::Test => Some("ktest"),
             Variant::Baseline => Some("baseline"),
+            Variant::Trace => Some("trace-test"),
+            Variant::TraceNormal => Some("trace"),
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
@@ -360,10 +366,11 @@ impl Variant {
     /// The limit of its image file, and where the limit comes from.
     fn limit(self) -> (u64, &'static str) {
         match self {
-            Variant::Normal | Variant::FaultProbe | Variant::OverflowProbe => {
-                (KERNEL_LIMIT, "spec 3.4")
-            }
-            Variant::Test | Variant::Baseline | Variant::TestIcount => {
+            Variant::Normal
+            | Variant::TraceNormal
+            | Variant::FaultProbe
+            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
+            Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
                 (TEST_KERNEL_LIMIT, "test builds")
             }
         }
@@ -374,6 +381,8 @@ impl Variant {
             Variant::Normal => "stafeto",
             Variant::Test => "stafeto-ktest",
             Variant::Baseline => "stafeto-baseline",
+            Variant::Trace => "stafeto-trace",
+            Variant::TraceNormal => "stafeto-trace-normal",
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
@@ -762,6 +771,7 @@ fn test() -> Result<(), String> {
     boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
     two_gib_boot()?;
     console_dialog(&qemu::VIRT)?;
+    trace_dialog(&qemu::VIRT)?;
     console_dialog(&qemu::VIRT_V3)?;
     elf_boot_reports_missing_device_tree()?;
     bad_boot_images_stop_the_boot()?;
@@ -934,6 +944,40 @@ fn console_dialog(m: &qemu::Machine) -> Result<(), String> {
         return Err(format!("console dialog on {}: {panic}", m.name));
     }
     println!("console dialog on {}: ok; {bench}", m.name);
+    Ok(())
+}
+
+fn trace_dialog(m: &qemu::Machine) -> Result<(), String> {
+    let a = build(Variant::TraceNormal)?;
+    let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let talked = (|| {
+        run.expect_line(
+            SHELL_CONNECTED,
+            |line| line == SHELL_CONNECTED,
+            BOOT_TIMEOUT,
+        )?;
+        run.expect(PROMPT, DIALOG_STEP)?;
+        run.send("trace")?;
+        run.expect_line(
+            "trace event",
+            |line| {
+                line.starts_with("trace: ")
+                    && (line.contains(" syscall ")
+                        || line.contains(" switch ")
+                        || line.contains(" interrupt "))
+            },
+            DIALOG_STEP,
+        )?;
+        run.expect(PROMPT, DIALOG_STEP).map(|_| ())
+    })();
+    let o = run.stop();
+    talked.map_err(|e| format!("trace dialog on {}: {e}", m.name))?;
+    if o.lines.iter().any(|line| line.contains("KERNEL PANIC")) {
+        return Err(format!("trace dialog on {} panicked", m.name));
+    }
+    println!("trace dialog on {}: ok", m.name);
     Ok(())
 }
 
@@ -1692,10 +1736,10 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
         }
     }
-    if variant == Variant::Baseline {
-        measure::record_as(m, &o.lines, "baseline ");
-    } else {
-        measure::record(m, &o.lines);
+    match variant {
+        Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
+        Variant::Trace => measure::record_as(m, &o.lines, "trace "),
+        _ => measure::record(m, &o.lines),
     }
     Ok(r.passed.len())
 }
@@ -1986,6 +2030,7 @@ fn hvf() -> Result<(), String> {
             return Err(format!("the counter runs at {hz} Hz on {}", m.name));
         }
         console_dialog(m)?;
+        trace_dialog(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -2001,6 +2046,9 @@ fn hvf() -> Result<(), String> {
                     kernel = passed;
                 }
             }
+        }
+        for _ in 0..20 {
+            kernel_tests(m, Variant::Trace)?;
         }
         write_measures()?;
         println!(
