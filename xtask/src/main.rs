@@ -1165,6 +1165,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "ext4ro",
         "--package",
+        "posix-path",
+        "--package",
         "init",
         "--package",
         "kcore",
@@ -2449,6 +2451,7 @@ fn hvf_host() -> Result<(), String> {
 }
 
 fn ci() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/check-posix-licenses.py")))?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(cargo().args([
         "clippy",
@@ -2458,6 +2461,8 @@ fn ci() -> Result<(), String> {
         "bootimg",
         "--package",
         "ext4ro",
+        "--package",
+        "posix-path",
         "--package",
         "kcore",
         "--package",

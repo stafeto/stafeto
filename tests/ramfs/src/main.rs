@@ -6,6 +6,7 @@
 #![no_std]
 #![no_main]
 
+use posix_path::{MAX_PATH, PathState};
 use proto_fs::{BAD_FD, NO_ENTRY, READ_ONLY, READ_WRITE};
 use proto_wire::Status;
 use rt::fs::Files;
@@ -47,6 +48,15 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     if fs.read_dir("/etc", 2, &mut name) != Ok(Some((4, 2))) || &name[..4] != b"motd" {
         return Err("etc entry");
     }
+    let mut paths = PathState::new();
+    paths.set_cwd(b"/etc").map_err(|_| "set cwd")?;
+    let mut path = [0; MAX_PATH + 1];
+    let length = paths
+        .resolve(b"./motd", &mut path)
+        .map_err(|_| "resolve relative")?;
+    let path = core::str::from_utf8(&path[..length]).map_err(|_| "ramfs path encoding")?;
+    let relative_motd = fs.open(path, READ_ONLY).map_err(|_| "open resolved motd")?;
+    fs.close(relative_motd).map_err(|_| "close resolved motd")?;
     let motd = fs.open("/etc/motd", READ_ONLY).map_err(|_| "open motd")?;
     if fs.fstat_size(motd) != Ok(14) {
         return Err("stat motd");
