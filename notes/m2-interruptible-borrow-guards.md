@@ -80,7 +80,12 @@ Host upcall tests and target Clippy passed. Seven mutations were caught:
 early native entry faults at its refused return, lost wakeup and omitted
 pending receive/send gates fail at 369, kept transfers at 342, changed mask
 at 345, and missing local protection at 351. Sources were restored.
-Full CI is run on the final implementation commit before merge.
+Full cargo xtask ci passed on 81af635: 400 kcore host tests, BusyBox,
+221 init checks, 165/176 kernel checks and shipping hot-path verification.
+Kernel images remain 154704/171072 bytes (normal/Apple VZ). Thread, C ABI
+and standalone boot images are 540672/442368/454656 bytes. Normal IPC
+round trip is 1761 ticks; test fast/slow/buffer/handles are 1936/2125/3034/4209.
+A new total non-preemptible bound was not measured.
 The POSIX implementation and probes remain GPL-3.0-or-later; rt and ABI
 retain MIT. Signal actions, signal sets, queues, restart policy, nonlocal
 exits and asynchronous cancellation remain library work. Full mandatory
