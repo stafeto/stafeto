@@ -73,7 +73,15 @@ Ten deliberate mutations were caught: real UID as privilege, lost saved
 UID, group mutation changing real GID, accepted reserved ID, re-enrollment
 reset, foreign child acceptance, overwritten child snapshot, cross-session
 ACK, leaked disconnected replies and accepted changed request body.
-Sources were restored before the final checks.
+Sources were restored before the final checks. Full cargo xtask ci passed
+on 686ddda: kcore 402, init 224, kernel 166/177, all POSIX/BusyBox probes,
+licenses and shipping hot paths. Separate Apple VZ completed exit 0.
+Normal/VZ kernels remain 154708/171076 bytes, below 204800.
+Thread/C/standalone images are 716800/573440/589824 bytes.
+Normal ticks remain 237/296/361/842/1761; icount IPC remains
+245/467/1936/2125/3034/4209. Driver is 673, bind 726/762, ack 205,
+portion 247. These kernel timings match #65. Credential service latency
+and a new global blocking bound were not measured.
 
 ## Remaining work
 
