@@ -254,11 +254,20 @@ pub enum Call {
     /// Interrupt the current IPC wait of x0, a thread with MANAGE.
     /// Wakes it with Interrupted; BadState if it is not waiting in IPC.
     ThreadInterrupt = 30,
+    /// Register the current thread's upcall entry (zero disables it).
+    ThreadUpcallBind = 31,
+    /// Current upcall control: 0 masks, 1 enables, 2 takes original PC/PSTATE.
+    /// x1 returns the previous mask; TAKE returns PC in x2 and PSTATE in x3.
+    ThreadUpcallControl = 32,
+    /// Request an upcall through a MANAGE thread handle.
+    ThreadUpcallRequest = 33,
+    /// Restore the current EL0 context from its reserved message-buffer area.
+    ThreadUpcallReturn = 34,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 30] = [
+    pub const ALL: [Call; 34] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -289,6 +298,10 @@ impl Call {
         Call::DebugWrite,
         Call::ConsolePoll,
         Call::ThreadInterrupt,
+        Call::ThreadUpcallBind,
+        Call::ThreadUpcallControl,
+        Call::ThreadUpcallRequest,
+        Call::ThreadUpcallReturn,
     ];
 
     pub const fn number(self) -> u16 {
@@ -298,7 +311,7 @@ impl Call {
     /// The call with this number, if any.
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
-            1..=30 => Some(Self::ALL[number as usize - 1]),
+            1..=34 => Some(Self::ALL[number as usize - 1]),
             _ => None,
         }
     }
@@ -313,6 +326,16 @@ pub const RESULT_VALUES: usize = 9;
 
 /// Slot zero and one slot for each system call in the KERNEL_STATS buffer.
 pub const KERNEL_CALL_SLOTS: usize = Call::ALL.len() + 1;
+
+/// Upcall context: 36 general/system words followed by 66 FP/SIMD words.
+/// Located after message data and handle metadata, aligned for SIMD registers.
+pub const UPCALL_CONTEXT_OFFSET: usize = 1120;
+pub const UPCALL_CONTEXT_SIZE: usize = 816;
+const _: () = {
+    assert!(UPCALL_CONTEXT_OFFSET >= msgbuf::RESERVED);
+    assert!(UPCALL_CONTEXT_OFFSET.is_multiple_of(16));
+    assert!(UPCALL_CONTEXT_OFFSET + UPCALL_CONTEXT_SIZE <= msgbuf::SIZE);
+};
 
 /// Bytes a call carries in registers x2-x9 (spec 11): `debug_write` and,
 /// from milestone 1.3, messages.
@@ -1242,13 +1265,13 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one() {
-        assert_eq!(Call::ALL.len(), 30);
+        assert_eq!(Call::ALL.len(), 34);
         for (i, call) in Call::ALL.iter().enumerate() {
             assert_eq!(call.number(), i as u16 + 1);
             assert_eq!(Call::from_number(call.number()), Some(*call));
             assert!(!TEST_CALLS.contains(&call.number()));
         }
-        for n in [0, 31, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [0, 35, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
             assert_eq!(Call::from_number(n), None);
         }
     }
@@ -1265,7 +1288,13 @@ mod tests {
         assert_eq!(Call::DebugWrite.number(), 28);
         assert_eq!(Call::ConsolePoll.number(), 29);
         assert_eq!(Call::ThreadInterrupt.number(), 30);
+        assert_eq!(Call::ThreadUpcallBind.number(), 31);
+        assert_eq!(Call::ThreadUpcallControl.number(), 32);
+        assert_eq!(Call::ThreadUpcallRequest.number(), 33);
+        assert_eq!(Call::ThreadUpcallReturn.number(), 34);
         assert_eq!(RESULT_VALUES, 9);
+        assert_eq!(UPCALL_CONTEXT_OFFSET, 1120);
+        assert_eq!(UPCALL_CONTEXT_SIZE, 36 * 8 + 32 * 16 + 2 * 8);
     }
 
     #[test]

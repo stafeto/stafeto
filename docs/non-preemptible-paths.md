@@ -91,6 +91,17 @@ queue bounded cleanup as described above. No queue is scanned and no memory
 is allocated. The next accepted request increments the token count and clears
 the abandoned-request mark, making old tokens stale without number reuse.
 
+ThreadUpcallRequest adds one coalesced pending bit and applies that same bounded
+interruption to an enabled IPC waiter. A ready target keeps its scheduling level.
+Before EL0 return, a constant state check selects the registered user entry;
+a pending entry waits for an existing long-call continuation to finish.
+ThreadUpcallReturn validates and copies a fixed 816-byte saved context from the
+held buffer mapping, and explicitly reloads 528 bytes of FP/SIMD state. No user
+pointer is dereferenced, no memory is allocated and no thread queue is scanned.
+The user trampoline saves/restores its stack and 1088-byte IPC area at EL0;
+that work can be preempted. Nesting consumes user stack, with entry masked during
+the fixed scratch-area copy. Upcall path latency has not been measured.
+
 From part 1.3b on, the timers of programs stand in binary heaps, their
 nodes inside the timer objects (spec 10), and from part 1.3e on in a heap
 for each level of 1-63, the priority of the timer's slot: arming, moving,
@@ -318,6 +329,9 @@ window that goes.
 | the last copy of a session goes (`session::release`: `handle_close`, the Handles stage) | with the channel open, posts the bit `CLIENT_GONE` into the session's slot as `notify` does (delivery to a waiter or enqueuing); then releases the copy's reference, and the last one puts the session on the cleanup queue | constant: as `notify`; takes no memory, the slot was allocated with the session |  |
 | a session chunk (`session::clean`) | returns the session's slot to the channel's limit and the object's slot to the payer's pool of sessions (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | constant |  |
 | `thread_interrupt` | checks a thread handle with MANAGE; removes its current send, receive or accepted-request wait, marks an accepted token abandoned and wakes the live thread with Interrupted under the scheduler lock; after the lock releases its wait reference and up to four queued transfer handles at the caller's effective priority | constant: one lookup, one queue removal, one token mark, one wake and at most four handle releases; closing a session can post CLIENT_GONE as above | not measured |
+| `thread_upcall_bind/control` | changes current-thread registration, mask or entry bookkeeping; checks the bound address and active-handler state | constant; no allocation or scan | not measured |
+| `thread_upcall_request` | checks MANAGE, target lifecycle and registration; sets pending; an enabled IPC waiter follows the thread_interrupt path | constant plus the same bounded wait/transit releases as thread_interrupt | not measured |
+| `thread_upcall_return` | validates mode/flags, PC/SP and the retained buffer pointer before restoring 31 GPRs, system state and 528 FP/SIMD bytes from a fixed reserved buffer area; retains original x0 | constant: 816 bytes, with no user pointer dereference or allocation | not measured |
 | `thread_exit` | unmaps the message-buffer page, flushing its TLB entry, and returns the frame (a running thread carries no handles of a request); gives the thread's number back; removes the thread from the process's list; the last running thread terminates the process, as in the process termination row | constant, except for process termination |  |
 | `clock_now` | reads the counter and turns ticks into nanoseconds, rounded down | constant: one 64-by-64-bit multiplication and a shift (`abi::time::Scale`) | 293 |
 | `timer_create` | checks the room in the caller's table (spec 11) and the caller's 64 timers, takes one of the channel's 1024 slots, then a slot in the caller's pool of timers (the pool growth row), and inserts the handle | constant: at most one growth of the caller's pool of timers and of its pool of blocks; the timer is not armed |  |
