@@ -701,6 +701,67 @@ static int once_initialization(void) {
     return 0;
 }
 
+_Static_assert(sizeof(pthread_mutex_t) == 32, "mutex ABI");
+_Static_assert(_Alignof(pthread_mutex_t) == 8, "mutex alignment");
+_Static_assert(sizeof(pthread_mutexattr_t) == 16, "mutex attribute ABI");
+_Static_assert(_Alignof(pthread_mutexattr_t) == 8, "mutex attribute alignment");
+static pthread_mutex_t static_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void *foreign_mutex(void *argument) {
+    pthread_mutex_t *mutex = argument;
+    errno = 777;
+    if (pthread_mutex_trylock(mutex) != EBUSY || pthread_mutex_unlock(mutex) != EPERM
+            || errno != 777) return (void *)1;
+    return NULL;
+}
+static int mutexes(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutex_t mutex;
+    int kind = 99;
+    errno = 123;
+    if (pthread_mutexattr_init(&attr) || pthread_mutexattr_gettype(&attr, &kind)
+            || kind != PTHREAD_MUTEX_DEFAULT || errno != 123) return 250;
+    if (pthread_mutexattr_settype(&attr, 99) != EINVAL
+            || pthread_mutexattr_gettype(&attr, &kind) || kind != PTHREAD_MUTEX_DEFAULT) return 251;
+    if (pthread_mutex_lock(&static_mutex) || pthread_mutex_trylock(&static_mutex) != EBUSY
+            || pthread_mutex_destroy(&static_mutex) != EBUSY
+            || pthread_mutex_unlock(&static_mutex) || pthread_mutex_destroy(&static_mutex)) return 252;
+    if (pthread_mutex_lock(&static_mutex) != EINVAL || pthread_mutex_destroy(&static_mutex) != EINVAL
+            || pthread_mutex_init(&static_mutex, NULL) || pthread_mutex_trylock(&static_mutex)
+            || pthread_mutex_unlock(&static_mutex) || pthread_mutex_destroy(&static_mutex)) return 253;
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK)
+            || pthread_mutex_init(&mutex, &attr) || pthread_mutex_lock(&mutex)
+            || pthread_mutex_lock(&mutex) != EDEADLK || pthread_mutex_trylock(&mutex) != EBUSY) return 254;
+    pthread_t child;
+    void *value = (void *)99;
+    if (pthread_create(&child, NULL, foreign_mutex, &mutex) || pthread_join(child, &value)
+            || value != NULL || pthread_mutex_unlock(&mutex)
+            || pthread_mutex_unlock(&mutex) != EPERM || pthread_mutex_destroy(&mutex)) return 255;
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE)
+            || pthread_mutex_init(&mutex, &attr) || pthread_mutex_lock(&mutex)
+            || pthread_mutex_trylock(&mutex) || pthread_mutex_lock(&mutex)
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_unlock(&mutex)
+            || pthread_mutex_destroy(&mutex) != EBUSY || pthread_mutex_unlock(&mutex)
+            || pthread_mutex_destroy(&mutex)) return 256;
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_NORMAL)
+            || pthread_mutexattr_gettype(&attr, &kind) || kind != PTHREAD_MUTEX_NORMAL
+            || pthread_mutex_init(&mutex, &attr) || pthread_mutex_trylock(&mutex)
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_destroy(&mutex)
+            || pthread_mutexattr_destroy(&attr) || pthread_mutexattr_gettype(&attr, &kind) != EINVAL
+            || pthread_mutex_init(&mutex, &attr) != EINVAL || errno != 123) return 257;
+    if (pthread_mutex_init(NULL, NULL) != EINVAL || pthread_mutex_lock(NULL) != EINVAL
+            || pthread_mutex_trylock(NULL) != EINVAL || pthread_mutex_unlock(NULL) != EINVAL
+            || pthread_mutex_destroy(NULL) != EINVAL || pthread_mutexattr_init(NULL) != EINVAL
+            || errno != 123) return 258;
+    pthread_mutex_t many[129];
+    for (unsigned int i = 0; i < 129; ++i) {
+        if (pthread_mutex_init(&many[i], NULL) || pthread_mutex_trylock(&many[i])) return 259;
+    }
+    for (unsigned int i = 0; i < 129; ++i) {
+        if (pthread_mutex_unlock(&many[i]) || pthread_mutex_destroy(&many[i])) return 260;
+    }
+    return errno == 123 ? 0 : 261;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -759,6 +820,8 @@ int main(int argc, char **argv) {
     if (specific_result) return specific_result;
     int once_result = once_initialization();
     if (once_result) return once_result;
+    int mutex_result = mutexes();
+    if (mutex_result) return mutex_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();

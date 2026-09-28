@@ -214,7 +214,9 @@ checks for successful calls, failures, and ABI layout.
 | Rust thread-specific data | Provide pthread keys with isolated bindings, safe key/thread slot reuse, and four destructor passes after cleanup; verify interrupted replies and join ordering on QEMU and Apple VZ. | ✅ [#45](https://github.com/stafeto/stafeto/pull/45) |
 | Rust once initialization | Serialize one initializer per control, block contenders through IPC, publish application writes, and retry after cancellation/exit; verify nested recovery and interrupted replies on QEMU and Apple VZ. | ✅ [#46](https://github.com/stafeto/stafeto/pull/46) |
 | Rust thread capacity | Support 64 simultaneously live application threads with independent data and errno, working heap/file owners, exact-limit failure, and joined resource recovery on QEMU and Apple VZ. | ✅ [#47](https://github.com/stafeto/stafeto/pull/47) |
-| Rust thread synchronization and attributes | Add mutexes, conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |
+| Rust mutex ownership | Add private stalled NORMAL, ERRORCHECK and RECURSIVE mutexes, static initialization and type attributes; verify live waiters, priority handoff, interrupted replies, ordinary writes and cancellation cleanup on QEMU and Apple VZ. | ✅ [#48](https://github.com/stafeto/stafeto/pull/48) |
+| Rust mutex completion | Add timed/clock acquisition, robust owner-death recovery and consistency, shared-process objects and priority protocols; verify deadlines, recovery, process lifetime and scheduling behavior. | 🚧 |
+| Rust thread synchronization and attributes | Add conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
@@ -246,7 +248,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-deferred-cancel.md](notes/m2-rust-posix-deferred-cancel.md) and
 [notes/m2-rust-posix-thread-data.md](notes/m2-rust-posix-thread-data.md) and
 [notes/m2-rust-posix-once.md](notes/m2-rust-posix-once.md) and
-[notes/m2-rust-posix-thread-capacity.md](notes/m2-rust-posix-thread-capacity.md)
+[notes/m2-rust-posix-thread-capacity.md](notes/m2-rust-posix-thread-capacity.md) and
+[notes/m2-rust-posix-mutex.md](notes/m2-rust-posix-mutex.md)
 for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery

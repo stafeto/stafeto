@@ -6,6 +6,7 @@
 //! attributes remain work.
 
 pub mod cancel;
+pub mod mutex;
 pub mod once;
 pub mod specific;
 
@@ -210,6 +211,7 @@ struct Entry {
     cached: Option<Cached>,
     woken_epoch: u64,
     once_waiting: Option<once::Waiting>,
+    mutex_waiting: Option<mutex::Waiting>,
 }
 impl Entry {
     fn new(
@@ -229,6 +231,7 @@ impl Entry {
             cached: None,
             woken_epoch: 0,
             once_waiting: None,
+            mutex_waiting: None,
         }
     }
 }
@@ -574,6 +577,11 @@ impl Registry {
                 let index = self.find(words[3])?;
                 Ok(self.entry(index).native.as_ref().ok_or(ESRCH)?.raw().0)
             }
+            #[cfg(feature = "transport-probe")]
+            22 => {
+                let index = self.find(words[3])?;
+                Ok(u64::from(self.entry(index).mutex_waiting.is_some()))
+            }
             _ => Err(EINVAL),
         }
     }
@@ -666,10 +674,14 @@ extern "C" fn owner(_: u64) -> ! {
             respond(token, answer);
         } else if words[0] == once::BEGIN {
             registry.once_begin(caller, words, token);
+        } else if matches!(words[0], mutex::LOCK | mutex::TRY) {
+            registry.mutex_lock(caller, words, token);
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
         } else {
-            let result = if matches!(words[0], once::FINISH | once::RESET) {
+            let result = if matches!(words[0], mutex::UNLOCK | mutex::DESTROY) {
+                registry.mutex_perform(words).map(|value| (value, 0))
+            } else if matches!(words[0], once::FINISH | once::RESET) {
                 registry.once_perform(words).map(|value| (value, 0))
             } else if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
                 registry.specific.perform(caller, words)

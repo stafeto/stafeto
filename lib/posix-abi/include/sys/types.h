@@ -14,6 +14,8 @@ typedef struct {
     int __detached;
     unsigned int __reserved;
 } pthread_attr_t;
+typedef struct { uint64_t __metadata, __owner, __count, __publication; } pthread_mutex_t;
+typedef struct { uint64_t __magic; int __kind; unsigned int __reserved; } pthread_mutexattr_t;
 typedef uint64_t dev_t;
 typedef uint64_t ino_t;
 typedef uint32_t mode_t;
