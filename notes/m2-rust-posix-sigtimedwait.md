@@ -68,7 +68,12 @@ were caught: validation before pending (C 180), wrong error (C 177),
 unarmed wake (396), reset on retry (465), truncated interval (464),
 late SEND accepted (474), missing cancellation finish (438), changed
 error output (C 168), and early expiration ACK (475). All sources
-were restored. Complete CI results are recorded after verification.
+were restored. Full cargo xtask ci passed on 921bbee: kcore 402, init
+222, kernel 166/177, all POSIX/BusyBox probes, licenses and hot paths.
+Separate Apple VZ passed with guest exit 0. Normal/VZ kernels remain
+154708/171076 bytes; thread/C/standalone images are 647168/524288/540672.
+Normal/icount IPC and IRQ paths match #63. A fresh global blocking bound
+and signal-owner/handler latency were not measured.
 
 ## Remaining work
 
