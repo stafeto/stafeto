@@ -9,7 +9,7 @@
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
-pub use proto_fs::{NodeInfo, SeekFrom};
+pub use proto_fs::{DIRECTORY_ONLY, NodeInfo, SeekFrom};
 use proto_wire::Status;
 use rt::Handle;
 use rt::fs::Files;
@@ -61,6 +61,7 @@ impl From<Status> for FsError {
             Status::Unknown(proto_fs::ACCESS_DENIED) => Self::PermissionDenied,
             Status::Unknown(proto_fs::BAD_FD) => Self::BadFileDescriptor,
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
+            Status::Unknown(proto_fs::NOT_DIRECTORY) => Self::NotDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
             Status::Unknown(proto_fs::TOO_MANY_OPEN_FILES) => Self::TooManyOpenFiles,
             Status::Unknown(proto_fs::INVALID_ARGUMENT) | Status::BadSize => Self::InvalidArgument,
@@ -95,20 +96,21 @@ pub struct Metadata {
     pub size: u32,
 }
 
+/// Owns a process descriptor until closedir. The caller must not close or
+/// replace it while this stream is live. Positions belong to the service.
 pub struct Directory {
-    path: [u8; MAX_PATH + 1],
-    length: usize,
-    next: u32,
+    fd: u32,
 }
 
 impl Directory {
-    pub fn rewind(&mut self) {
-        self.next = 0;
+    pub fn descriptor(&self) -> u32 {
+        self.fd
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirEntry {
+    pub inode: u64,
     pub kind: FileKind,
     pub name_len: usize,
 }
@@ -282,10 +284,16 @@ impl PosixFs {
 
     pub fn fstat(&self, fd: u32) -> Result<Metadata, FsError> {
         match self.descriptors.get(fd)? {
-            Backend::Ram(fd) => Ok(Metadata {
-                kind: FileKind::Regular,
-                size: self.files.fstat_size(fd).map_err(FsError::from)?,
-            }),
+            Backend::Ram(fd) => {
+                let info = self
+                    .files
+                    .descriptor_information(fd)
+                    .map_err(FsError::from)?;
+                Ok(Metadata {
+                    kind: FileKind::from_wire(info.kind)?,
+                    size: u32::try_from(info.size).map_err(|_| FsError::OffsetOverflow)?,
+                })
+            }
             _ => Ok(Metadata {
                 kind: FileKind::Character,
                 size: 0,
@@ -343,20 +351,44 @@ impl PosixFs {
         }
     }
 
-    pub fn opendir(&self, path: &[u8]) -> Result<Directory, FsError> {
-        let mut resolved = [0; MAX_PATH + 1];
-        let length = self.paths.resolve(path, &mut resolved)?;
-        let name =
-            core::str::from_utf8(&resolved[..length]).map_err(|_| FsError::UnsupportedEncoding)?;
-        let meta = self.files.lookup(name).map_err(FsError::from)?;
-        match FileKind::from_wire(meta.kind)? {
-            FileKind::Directory => Ok(Directory {
-                path: resolved,
-                length,
-                next: 0,
-            }),
-            FileKind::Regular | FileKind::Character => Err(FsError::NotDirectory),
+    pub fn opendir(&mut self, path: &[u8]) -> Result<Directory, FsError> {
+        if self.stat(path)?.kind != FileKind::Directory {
+            return Err(FsError::NotDirectory);
         }
+        let fd = self.open(path, proto_fs::READ_ONLY | proto_fs::DIRECTORY_ONLY)?;
+        self.set_descriptor_flags(
+            fd,
+            DescriptorFlags {
+                close_on_exec: true,
+                close_on_fork: false,
+            },
+        )?;
+        Ok(Directory { fd })
+    }
+
+    /// Transfer an existing readable directory descriptor to a stream. Flags
+    /// remain unchanged. Failure leaves ownership with the caller.
+    pub fn fdopendir(&self, fd: u32) -> Result<Directory, FsError> {
+        if self.fstat(fd)?.kind != FileKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(Directory { fd })
+    }
+
+    pub fn closedir(&mut self, dir: &Directory) -> Result<(), FsError> {
+        self.close(dir.fd)
+    }
+
+    pub fn directory_position(&self, dir: &Directory) -> Result<i64, FsError> {
+        self.lseek(dir.fd, 0, SeekFrom::Current)
+    }
+
+    pub fn seekdir(&self, dir: &Directory, position: i64) -> Result<(), FsError> {
+        self.lseek(dir.fd, position, SeekFrom::Start).map(|_| ())
+    }
+
+    pub fn rewinddir(&self, dir: &Directory) -> Result<(), FsError> {
+        self.seekdir(dir, 0)
     }
 
     pub fn readdir(
@@ -364,19 +396,20 @@ impl PosixFs {
         dir: &mut Directory,
         out: &mut [u8],
     ) -> Result<Option<DirEntry>, FsError> {
-        let path = core::str::from_utf8(&dir.path[..dir.length])
-            .map_err(|_| FsError::UnsupportedEncoding)?;
-        match self
-            .files
-            .read_dir(path, dir.next, out)
-            .map_err(FsError::from)?
-        {
-            Some((name_len, kind)) => {
-                dir.next = dir.next.checked_add(1).ok_or(FsError::Io)?;
-                let kind = FileKind::from_wire(kind)?;
-                Ok(Some(DirEntry { kind, name_len }))
-            }
-            None => Ok(None),
+        match self.descriptors.get(dir.fd)? {
+            Backend::Ram(fd) => self
+                .files
+                .read_dir_fd(fd, out)
+                .map_err(FsError::from)?
+                .map(|(name_len, kind, inode)| {
+                    Ok(DirEntry {
+                        inode,
+                        kind: FileKind::from_wire(kind)?,
+                        name_len,
+                    })
+                })
+                .transpose(),
+            _ => Err(FsError::NotDirectory),
         }
     }
 }

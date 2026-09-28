@@ -16,9 +16,14 @@
 //! status, resulting offset u64 (at most i64::MAX). Legacy SEEK is unchanged.
 //! INFO_FD: header, fd u32. INFO_PATH: header, absolute path bytes. Replies:
 //! status and NodeInfo fields (92 bytes), without C ABI padding.
+//! READ_DIR_FD: header, fd u32. Reply: status u32, kind u32, inode u64,
+//! name bytes. At end, kind/inode are zero and name is empty. The service
+//! advances the open-description position and updates directory access time.
 
 #![cfg_attr(not(test), no_std)]
 
+mod directory;
+pub use directory::DirectoryEntry;
 mod info;
 pub use info::NodeInfo;
 
@@ -33,6 +38,8 @@ pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
 pub const READ_ONLY: u32 = 0;
 pub const WRITE_ONLY: u32 = 1;
 pub const READ_WRITE: u32 = 2;
+/// Require a directory atomically when establishing the open description.
+pub const DIRECTORY_ONLY: u32 = 4;
 
 pub const NO_ENTRY: u32 = 300;
 pub const BAD_FD: u32 = 301;
@@ -43,6 +50,7 @@ pub const OFFSET_OVERFLOW: u32 = 305;
 pub const NO_DATA: u32 = 306;
 pub const TOO_MANY_OPEN_FILES: u32 = 307;
 pub const ACCESS_DENIED: u32 = 308;
+pub const NOT_DIRECTORY: u32 = 309;
 
 /// Origins for the signed 64-bit SEEK_FROM request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +95,7 @@ pub enum Method {
     SeekFrom = 9,
     InfoFd = 10,
     InfoPath = 11,
+    ReadDirFd = 12,
 }
 
 impl Method {
@@ -107,12 +116,13 @@ impl Method {
             9 => Some(Self::SeekFrom),
             10 => Some(Self::InfoFd),
             11 => Some(Self::InfoPath),
+            12 => Some(Self::ReadDirFd),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {

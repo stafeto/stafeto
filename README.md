@@ -201,6 +201,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust descriptor ownership | Own local descriptors, shared offsets, `dup`/`dup2`/`dup3`, descriptor flags, and standard-stream redirection; verify limits and lifetime in the guest. | ✅ [#32](https://github.com/stafeto/stafeto/pull/32) |
 | Initial Rust C ABI | Build ABI 1 headers, Rust startup and `libc.a`; boot a C main without Picolibc through both Cargo and standalone Clang linking; verify native-thread errno. | ✅ [#33](https://github.com/stafeto/stafeto/pull/33) |
 | Rust stat metadata | Export `stat`, `fstat` and `lstat` with a checked LP64 layout, stable RAM inode identity and timestamp updates; verify through Cargo and standalone C linking. | ✅ [#34](https://github.com/stafeto/stafeto/pull/34) |
+| Rust directory C ABI | Enumerate directories through owned descriptors with `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies; check inode identity, shared offsets and resource limits. | ✅ [#35](https://github.com/stafeto/stafeto/pull/35) |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -212,10 +213,12 @@ checks for successful calls, failures, and ABI layout.
 The initial Rust sysroot is experimental ABI 1 for AArch64 LP64.
 `python3 tools/build-posix-sysroot.py --probe` stages headers and `lib/libc.a`
 under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links the C probe.
-It currently covers file calls, stat metadata and startup with an empty environment;
+It currently covers file calls, stat metadata, directory streams and startup
+with an empty environment;
 allocation, stdio, general ELF TLS and the remaining headers are pending.
 See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
-[notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md) for the boundary.
+[notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
+[notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) for the boundary.
 File timestamps currently use the platform counter; epoch time, symbolic
 links, credential checks and terminal-owned metadata remain pending.
 

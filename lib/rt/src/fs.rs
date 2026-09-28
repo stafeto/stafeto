@@ -256,6 +256,31 @@ impl Files {
         Ok(Some((name.len(), kind)))
     }
 
+    /// Read one entry and advance the shared service-owned directory offset.
+    pub fn read_dir_fd(
+        &self,
+        fd: u32,
+        out: &mut [u8],
+    ) -> Result<Option<(usize, u32, u64)>, Status> {
+        let mut w = Writer::new();
+        Method::ReadDirFd.header().write(&mut w)?;
+        w.u32(fd)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let Some(entry) = proto_fs::DirectoryEntry::read(&mut r)? else {
+            return Ok(None);
+        };
+        if entry.name.len() > out.len() {
+            return Err(Status::BadSize);
+        }
+        out[..entry.name.len()].copy_from_slice(entry.name);
+        Ok(Some((entry.name.len(), entry.kind, entry.inode)))
+    }
+
     pub fn lookup(&self, path: &str) -> Result<Metadata, Status> {
         valid_path(path.as_bytes())?;
         let mut w = Writer::new();

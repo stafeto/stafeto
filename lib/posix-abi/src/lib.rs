@@ -8,6 +8,7 @@
 #![no_std]
 
 pub mod constants;
+pub mod directory;
 pub mod metadata;
 pub mod tls;
 
@@ -91,16 +92,23 @@ pub unsafe extern "C" fn __errno_location() -> *mut c_int {
 
 /// # Safety
 /// `name` is a live C string and this thread has an initialized file scope.
-/// The initial ABI accepts access mode and close-on-exec/fork flags only.
+/// The initial ABI accepts access mode, O_DIRECTORY and close-on-exec/fork flags.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open(name: *const c_char, flags: c_int) -> c_int {
     let result = (|| {
         let name = unsafe { path(name) }?;
-        if flags & !(O_ACCMODE | O_CLOEXEC | O_CLOFORK) != 0 || flags & O_ACCMODE == O_ACCMODE {
+        if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
+            || flags & O_ACCMODE == O_ACCMODE
+        {
             return Err(EINVAL);
         }
         file(|files| {
-            let fd = files.open(name, (flags & O_ACCMODE) as u32)?;
+            let directory = if flags & O_DIRECTORY != 0 {
+                posix_fs::DIRECTORY_ONLY
+            } else {
+                0
+            };
+            let fd = files.open(name, (flags & O_ACCMODE) as u32 | directory)?;
             files.set_descriptor_flags(fd, descriptor_flags(flags))?;
             Ok(fd)
         })

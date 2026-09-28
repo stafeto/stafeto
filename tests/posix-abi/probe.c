@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -19,6 +20,8 @@ _Static_assert(_Alignof(struct stat) == 8, "stat alignment");
 _Static_assert(offsetof(struct stat, st_size) == 48, "stat size offset");
 _Static_assert(offsetof(struct stat, st_atim) == 72, "stat timestamp offset");
 _Static_assert(sizeof(struct timespec) == 16, "timespec ABI");
+_Static_assert(sizeof(struct dirent) == STAFETO_DIRENT_SIZE, "dirent ABI");
+_Static_assert(offsetof(struct dirent, d_name) == 9, "dirent name offset");
 
 static int same(const char *a, const char *b, size_t count) {
     for (size_t i = 0; i < count; i++) if (a[i] != b[i]) return 0;
@@ -63,6 +66,57 @@ static int metadata(void) {
             || (copy.st_atim.tv_sec == value.st_atim.tv_sec
                 && copy.st_atim.tv_nsec < value.st_atim.tv_nsec)) return 56;
     if (close(fd) || fstat(fd, &copy) != -1 || errno != EBADF) return 57;
+    return 0;
+}
+
+static int directories(void) {
+    if (opendir("motd") != NULL || errno != ENOTDIR) return 60;
+    if (opendir("/absent") != NULL || errno != ENOENT) return 61;
+    if (opendir(NULL) != NULL || errno != EFAULT) return 62;
+    DIR *dir = opendir(".");
+    if (!dir || dirfd(dir) != 0 || telldir(dir) != 0) return 63;
+    struct stat info;
+    if (fstat(dirfd(dir), &info) || !S_ISDIR(info.st_mode) || info.st_ino != 2) return 64;
+    struct dirent *entry = readdir(dir);
+    if (!entry || !same(entry->d_name, ".", 2) || entry->d_ino != 2 || entry->d_type != DT_DIR) return 65;
+    long cookie = telldir(dir);
+    DIR *other = opendir("/tmp");
+    struct dirent *other_entry = readdir(other);
+    if (!other || !other_entry || other_entry == entry || other_entry->d_ino != 3
+            || entry->d_ino != 2 || !same(entry->d_name, ".", 2) || cookie != 1) return 66;
+    entry = readdir(dir);
+    if (!entry || !same(entry->d_name, "..", 3) || entry->d_ino != 1) return 67;
+    entry = readdir(dir);
+    if (!entry || !same(entry->d_name, "motd", 5) || entry->d_ino != 4 || entry->d_type != DT_REG) return 68;
+    errno = 123;
+    if (readdir(dir) != NULL || errno != 123 || telldir(dir) != 3) return 69;
+    seekdir(dir, cookie);
+    entry = readdir(dir);
+    if (!entry || !same(entry->d_name, "..", 3)) return 70;
+    rewinddir(dir);
+    if (telldir(dir) != 0 || !readdir(dir)) return 71;
+    int saved_fd = dirfd(dir), duplicate = dup(saved_fd);
+    if (closedir(other) || closedir(dir) || fstat(saved_fd, &info) != -1 || errno != EBADF) return 72;
+    if (fstat(duplicate, &info) || !S_ISDIR(info.st_mode)) return 73;
+    dir = fdopendir(duplicate);
+    if (!dir || dirfd(dir) != duplicate || telldir(dir) != 1) return 74;
+    entry = readdir(dir);
+    if (!entry || entry->d_ino != 1 || !same(entry->d_name, "..", 3) || closedir(dir)) return 75;
+    int fd = open("motd", O_RDONLY);
+    if (fdopendir(fd) != NULL || errno != ENOTDIR || fstat(fd, &info) || close(fd)) return 76;
+    if (fdopendir(-1) != NULL || errno != EBADF || readdir(NULL) != NULL || errno != EBADF) return 77;
+    if (dirfd(NULL) != -1 || errno != EBADF || closedir(NULL) != -1 || errno != EBADF) return 78;
+    if (open("motd", O_RDONLY | O_DIRECTORY) != -1 || errno != ENOTDIR) return 79;
+    fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (fd < 0 || (dir = fdopendir(fd)) == NULL || dirfd(dir) != fd || closedir(dir)) return 80;
+    DIR *held[30];
+    for (int i = 0; i < 30; i++) if ((held[i] = opendir("/")) == NULL) return 81;
+    if (opendir("/") != NULL || errno != EMFILE || open("motd", O_RDONLY) != -1 || errno != EMFILE) return 82;
+    saved_fd = dirfd(held[7]);
+    if (closedir(held[7]) || (held[7] = opendir("/tmp")) == NULL || dirfd(held[7]) != saved_fd) return 83;
+    for (int i = 0; i < 30; i++) if (closedir(held[i])) return 84;
+    fd = open("motd", O_RDONLY);
+    if (fd != 0 || close(fd)) return 85;
     return 0;
 }
 
@@ -114,6 +168,8 @@ int main(int argc, char **argv) {
     if (close(0) != 0 || close(0) != -1 || errno != EBADF) return 31;
     int metadata_result = metadata();
     if (metadata_result) return metadata_result;
+    int directory_result = directories();
+    if (directory_result) return directory_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

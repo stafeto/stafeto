@@ -30,6 +30,7 @@ static int error(int64_t value) {
         case 303: errno = ENOSPC; break;
         case 307: errno = EMFILE; break;
         case 308: errno = EACCES; break;
+        case 309: errno = ENOTDIR; break;
         default: errno = EIO; break;
     }
     return -1;

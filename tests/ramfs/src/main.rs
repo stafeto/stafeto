@@ -125,7 +125,7 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
         .size
         != 3
         || posix.open(b"/etc/motd/", READ_ONLY) != Err(FsError::NotDirectory)
-        || posix.open(b"/etc", READ_ONLY) != Err(FsError::IsDirectory)
+        || posix.open(b"/etc", proto_fs::WRITE_ONLY) != Err(FsError::IsDirectory)
     {
         return Err("POSIX metadata and open errors");
     }
@@ -142,6 +142,14 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
     }
     posix.close(fd).map_err(|_| "POSIX close")?;
     let mut dir = posix.opendir(b".").map_err(|_| "POSIX opendir")?;
+    if posix.descriptor_flags(dir.descriptor())
+        != Ok(DescriptorFlags {
+            close_on_exec: true,
+            close_on_fork: false,
+        })
+    {
+        return Err("opendir close-on-exec flag");
+    }
     let mut name = [0; 32];
     for expected in [b".".as_slice(), b"..".as_slice(), b"motd".as_slice()] {
         let entry = posix
@@ -157,7 +165,7 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
     {
         return Err("POSIX directory end or error");
     }
-    dir.rewind();
+    posix.rewinddir(&dir).map_err(|_| "POSIX rewind position")?;
     if posix
         .readdir(&mut dir, &mut name)
         .map_err(|_| "POSIX rewind")?
@@ -165,6 +173,50 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
     {
         return Err("POSIX directory rewind");
     }
+    posix.closedir(&dir).map_err(|_| "POSIX closedir")?;
+    let fd = posix
+        .open(b"/etc", READ_ONLY)
+        .map_err(|_| "directory open")?;
+    let flags = DescriptorFlags {
+        close_on_exec: false,
+        close_on_fork: true,
+    };
+    posix
+        .set_descriptor_flags(fd, flags)
+        .map_err(|_| "directory flags")?;
+    let dir = posix.fdopendir(fd).map_err(|_| "fdopendir")?;
+    if dir.descriptor() != fd || posix.descriptor_flags(fd) != Ok(flags) {
+        return Err("fdopendir flag retention");
+    }
+    posix.closedir(&dir).map_err(|_| "fdopendir close")?;
+    if posix.fstat(fd) != Err(FsError::BadFileDescriptor) {
+        return Err("closedir ownership");
+    }
+    let (owned, duplicate) = posix_abi::tls::with_files(&mut posix, || {
+        // SAFETY: this scope owns its file context and supplies a live C string.
+        unsafe {
+            let stream = posix_abi::directory::opendir(c"/etc".as_ptr());
+            if stream.is_null() {
+                return (-1, -1);
+            }
+            let owned = posix_abi::directory::dirfd(stream);
+            (owned, posix_abi::dup(owned))
+        }
+    });
+    if owned < 0
+        || duplicate < 0
+        || posix.fstat(owned as u32) != Err(FsError::BadFileDescriptor)
+        || posix
+            .fstat(duplicate as u32)
+            .map_err(|_| "scope duplicate")?
+            .kind
+            != FileKind::Directory
+    {
+        return Err("directory scope cleanup");
+    }
+    posix
+        .close(duplicate as u32)
+        .map_err(|_| "scope duplicate close")?;
     Ok(())
 }
 
