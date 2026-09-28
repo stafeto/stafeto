@@ -209,7 +209,8 @@ checks for successful calls, failures, and ABI layout.
 | Rust file request lifetime | Replace caller-stack jobs with checked value messages; reject malformed requests before heap startup and preserve full message payloads across nested RAM calls. | ✅ [#40](https://github.com/stafeto/stafeto/pull/40) |
 | Rust IPC wait interruption | Wake a live IPC client with Interrupted/EINTR, release queued transfers and wait references, preserve delivered handles and validate the next reply token; check UART and Virtio reads. | ✅ [#41](https://github.com/stafeto/stafeto/pull/41) |
 | Rust console cancellation recovery | Remove the tagged UART read before EINTR, restore input after a rejected reply, retry on the same thread/session, and retain delivered bytes when echo is interrupted; check UART and Virtio. | ✅ [#42](https://github.com/stafeto/stafeto/pull/42) |
-| Rust cancellation and signals | Add pthread lifecycle, cancellation state/type and cleanup handlers, cancellation of future blocking file requests, accepted-operation result cleanup, and signal delivery with documented restart behavior. | 🚧 |
+| Rust pthread lifecycle | Create, join, detach and exit native threads with independent errno, inherited FP state, owned stacks and retry-safe results; verify interrupted waits and last-thread process exit. | ✅ [#43](https://github.com/stafeto/stafeto/pull/43) |
+| Rust cancellation and signals | Add cancellation state/type and cleanup handlers, cancellation of future blocking file requests, accepted-operation result cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -223,7 +224,8 @@ The initial Rust sysroot is experimental ABI 1 for AArch64 LP64.
 under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links the C probe.
 It currently covers file calls, stat metadata, directory streams, process
 allocation, directory selection, sorting, the C/POSIX locale and startup
-with an empty environment. Console waits leave the shared file owner available;
+with an empty environment, plus initial pthread lifecycle and stack attributes.
+Console waits leave the shared file owner available;
 stdio, general ELF TLS, cancellation and the remaining headers are pending.
 See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
@@ -232,7 +234,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-scan.md](notes/m2-rust-posix-scan.md) and
 [notes/m2-rust-posix-shared.md](notes/m2-rust-posix-shared.md) and
 [notes/m2-rust-posix-input.md](notes/m2-rust-posix-input.md) and
-[notes/m2-rust-posix-messages.md](notes/m2-rust-posix-messages.md) for the boundary.
+[notes/m2-rust-posix-messages.md](notes/m2-rust-posix-messages.md) and
+[notes/m2-rust-posix-threads.md](notes/m2-rust-posix-threads.md) for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery
 still need implementation.

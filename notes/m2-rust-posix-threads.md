@@ -88,3 +88,8 @@ Skipping failed-create unmapping fails handle/quota recovery at stage 4.
 Reusing an ID fails the C probe with exit code 207.
 Dropping FP inheritance fails the C probe with exit code 204.
 All four mutations were restored before the final checks.
+
+Final cargo xtask ci passed on 749b925: init 221 on every guest machine,
+kernel 165 normally and 176 under icount. Normal kernel 154704 bytes;
+Apple VZ kernel 171072 bytes. The kernel implementation is unchanged.
+Implementation: [#43](https://github.com/stafeto/stafeto/pull/43).
