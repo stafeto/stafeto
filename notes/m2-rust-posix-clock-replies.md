@@ -78,7 +78,12 @@ early release at 142, no deallocation exhausting journal storage with FULL,
 no disconnect reclamation at 311, late SET/OBSERVE reservation at 307,
 and requiring a live watch for retained replay at 303. Sources were restored.
 Restored C ABI, standalone C, QEMU/VZ, Clippy and license checks passed.
-Full cargo xtask ci runs on the ready implementation commit.
+Full cargo xtask ci passed on 32af6cb: BusyBox, image size, shipping hot paths,
+221 init checks and 165/176 kernel checks. Shipping Clippy also passed after
+fixing the session argument that is used only with diagnostic features.
+Kernel images remain 154704 bytes (normal) and 171072 bytes (Apple VZ).
+Thread/C ABI/standalone boot images are 516096/438272/454656 bytes.
+No journal latency or new kernel non-preemption bound was measured.
 Kernel behavior is unchanged. Library allocation reentry, nonlocal exits,
 POSIX signal actions/masks/queues and restart policy remain separate work.
 This milestone does not claim full POSIX.1-2024 shell or utility conformance.
