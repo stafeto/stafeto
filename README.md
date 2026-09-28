@@ -203,6 +203,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust stat metadata | Export `stat`, `fstat` and `lstat` with a checked LP64 layout, stable RAM inode identity and timestamp updates; verify through Cargo and standalone C linking. | ✅ [#34](https://github.com/stafeto/stafeto/pull/34) |
 | Rust directory C ABI | Enumerate directories through owned descriptors with `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies; check inode identity, shared offsets and resource limits. | ✅ [#35](https://github.com/stafeto/stafeto/pull/35) |
 | Rust process allocation | Export malloc, calloc, realloc, reallocarray, free and aligned allocation over a shared process heap; verify overflow, quota failure, data preservation and cross-thread ownership. | ✅ [#36](https://github.com/stafeto/stafeto/pull/36) |
+| Rust directory selection and ordering | Add owned `scandir` results, C/POSIX `alphasort`, `strcoll`/`strxfrm`, locale selection and allocation-free `qsort`/`qsort_r`; check callback reentry and cleanup after partial allocation failure. | ✅ [#37](https://github.com/stafeto/stafeto/pull/37) |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -220,7 +221,8 @@ allocation, stdio, general ELF TLS and the remaining headers are pending.
 See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
 [notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) and
-[notes/m2-rust-posix-heap.md](notes/m2-rust-posix-heap.md) for the boundary.
+[notes/m2-rust-posix-heap.md](notes/m2-rust-posix-heap.md) and
+[notes/m2-rust-posix-scan.md](notes/m2-rust-posix-scan.md) for the boundary.
 File timestamps currently use the platform counter; epoch time, symbolic
 links, credential checks and terminal-owned metadata remain pending.
 
