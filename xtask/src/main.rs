@@ -426,7 +426,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 221;
+const INIT_TESTS: u32 = 222;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -563,6 +563,8 @@ commands:
             --hvf under HVF on a Mac with Apple silicon
   test      host tests, then boot checks, the console dialog, init tests
             and kernel tests in QEMU
+  kernel-test run only the kernel test image in QEMU
+  init-test run only the EL0 init test image in QEMU
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci        formatting, clippy, then everything `test` does
   hvf       boot checks, the console dialog, init tests and kernel tests
@@ -596,6 +598,8 @@ fn main() {
         Some("build") => build(Variant::Normal).map(|_| ()),
         Some("run") => run(&args[1..]),
         Some("test") => test(),
+        Some("kernel-test") => kernel_tests(&qemu::VIRT, Variant::Test).map(|_| ()),
+        Some("init-test") => init_tests(&qemu::VIRT, false).map(|_| ()),
         Some("gdb") => gdb(),
         Some("ci") => ci(),
         Some("hvf") => hvf(),

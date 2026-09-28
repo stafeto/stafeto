@@ -174,6 +174,10 @@ const TESTS: &[(&str, TestFn)] = &[
         "pool_churn_stays_under_the_quota",
         pool_churn_stays_under_the_quota,
     ),
+    (
+        "numeric_identity_follows_the_process_tree_and_shell",
+        numeric_identity_follows_the_process_tree_and_shell,
+    ),
     ("shell_goes_in_portions", shell_goes_in_portions),
     (
         "paid_charge_always_finds_a_frame",
@@ -1611,6 +1615,55 @@ fn pool_churn_stays_under_the_quota(_: &Boot) -> Result<(), &'static str> {
     unsafe { process::release(root, CAUSE) };
     cleanup::drain();
     Ok(())
+}
+
+/// Real parent links survive teardown until the last child shell is released.
+fn numeric_identity_follows_the_process_tree_and_shell(_: &Boot) -> Result<(), &'static str> {
+    cleanup::drain();
+    let baseline = process::in_use();
+    let root = process::create_root(QUOTA, 16, 63).map_err(|_| "no identity root")?;
+    let (child, _) = child_with(root, 32 * PAGE_SIZE, 16, 63)?;
+    let (grandchild, _) = child_with(child, 8 * PAGE_SIZE, 16, 63)?;
+    // Keep grandchild's ended shell and its parent links independently of the
+    // handle tables that root teardown is about to release.
+    process::retain(grandchild);
+    // SAFETY: creation and the retained child reference keep these objects live.
+    let identities = unsafe {
+        [
+            root.as_ref().identity(),
+            child.as_ref().identity(),
+            grandchild.as_ref().identity(),
+        ]
+    };
+    // SAFETY: the test owns root's creation reference; ending it is deliberate.
+    unsafe { process::end(root, ProcessState::Killed, CAUSE) };
+    cleanup::drain();
+    // SAFETY: root/grandchild references and grandchild's parent shell links live.
+    let after = unsafe {
+        [
+            root.as_ref().identity(),
+            child.as_ref().identity(),
+            grandchild.as_ref().identity(),
+        ]
+    };
+    let valid = identities[0].id > 0
+        && identities[0].parent == 0
+        && identities[0].id < identities[1].id
+        && identities[1].id < identities[2].id
+        && identities[2].id <= abi::PROCESS_ID_MAX
+        && identities[1].parent == identities[0].id
+        && identities[2].parent == identities[1].id
+        && after == identities;
+    // SAFETY: both test references go and no pointer is accessed afterwards.
+    unsafe {
+        process::release(grandchild, CAUSE);
+        process::release(root, CAUSE);
+    }
+    cleanup::drain();
+    check(
+        valid && process::in_use() == baseline,
+        "numeric process tree changed or retained shells leaked",
+    )
 }
 
 /// A child of `root` with quota `q` that only a handle in the root's table

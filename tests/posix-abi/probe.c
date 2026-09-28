@@ -34,6 +34,9 @@ _Static_assert(_Alignof(pthread_attr_t) == 8, "pthread attribute alignment");
 _Static_assert(_Generic(INT64_C(1), int64_t: 1, default: 0), "signed 64-bit constant ABI");
 _Static_assert(_Generic(UINT64_C(1), uint64_t: 1, default: 0), "unsigned 64-bit constant ABI");
 _Static_assert(sizeof(void *) == 8, "pointer ABI");
+_Static_assert(sizeof(pid_t) == 4, "signed process identity ABI");
+_Static_assert(_Generic(getpid(), pid_t: 1, default: 0), "getpid result ABI");
+_Static_assert(_Generic(getppid(), pid_t: 1, default: 0), "getppid result ABI");
 _Static_assert(sizeof(int) == 4, "int ABI");
 _Static_assert(sizeof(long) == 8, "long ABI");
 _Static_assert(sizeof(size_t) == 8, "size_t ABI");
@@ -56,6 +59,7 @@ static void signal_handler(int sig) {
     if (sig != SIGUSR1 || pthread_sigmask(-99, NULL, &mask)
             || !sigismember(&mask, SIGUSR1)) signal_bad = 1;
     signal_calls++;
+    if (getpid() <= 1 || getppid() != 1) signal_bad = 1;
     errno = 901;
 }
 static int signals(void) {
@@ -428,7 +432,7 @@ static void set_fp_environment(uint64_t environment) {
     uint64_t control = (uint32_t)environment, status = environment >> 32;
     __asm__ volatile ("msr fpcr, %0; msr fpsr, %1" : : "r"(control), "r"(status) : "memory");
 }
-struct thread_context { pthread_t parent, self; int fd; char byte; int failure; uint64_t floating; };
+struct thread_context { pthread_t parent, self; int fd; char byte; int failure; uint64_t floating; pid_t pid, ppid; };
 
 static void *thread_files(void *argument) {
     struct thread_context *context = argument;
@@ -440,6 +444,10 @@ static void *thread_files(void *argument) {
     if (fp_environment() != context->floating) { context->failure = 4; return NULL; }
     set_fp_environment(0);
     errno = 777;
+    if (getpid() != context->pid || getppid() != context->ppid || errno != 777) {
+        context->failure = 5;
+        return NULL;
+    }
     if (read(context->fd, &context->byte, 1) != 1 || context->byte != 's' || errno != 777) {
         context->failure = 2;
         return NULL;
@@ -469,6 +477,7 @@ static int threads(void) {
     int state = -1;
     void *value = (void *)(uintptr_t)1234;
     errno = 123;
+    if (getpid() <= 1 || getppid() != 1 || getpid() == getppid() || errno != 123) return 199;
     if (!main_thread || !pthread_equal(main_thread, main_thread)
             || pthread_join(main_thread, &value) != EDEADLK
             || value != (void *)(uintptr_t)1234 || errno != 123) return 200;
@@ -488,7 +497,7 @@ static int threads(void) {
     // Non-default rounding mode and exception status must be inherited.
     set_fp_environment((1ULL << 22) | (1ULL << 32));
     struct thread_context context = { .parent = main_thread, .fd = open("/etc/motd", O_RDONLY),
-        .floating = fp_environment() };
+        .floating = fp_environment(), .pid = getpid(), .ppid = getppid() };
     if (context.fd < 0 || pthread_create(&child, NULL, thread_files, &context)
             || pthread_join(child, &value) || context.failure || context.self != child
             || !value || ((char *)value)[0] != 'p' || ((char *)value)[31] != 't' || errno != 123

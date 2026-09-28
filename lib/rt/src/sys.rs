@@ -299,6 +299,13 @@ pub fn process_state(process: &Handle<Process>) -> Result<ProcessState, Error> {
     Ok(ProcessState::from_words([x[1], x[2], x[3], x[4]]))
 }
 
+/// Numeric identity independent of local handle values; readable after exit.
+pub fn process_identity(process: &Handle<Process>) -> Result<abi::ProcessIdentity, Error> {
+    let args = [process.raw().0, abi::INFO_PROCESS_IDENTITY, 0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(abi::ProcessIdentity::from_words([x[1], x[2]]))
+}
+
 /// object_info(PROCESS_MEMORY): the process's quota, what is charged to it
 /// and what went back to its parent, in bytes.
 pub fn process_memory(process: &Handle<Process>) -> Result<ProcessMemory, Error> {

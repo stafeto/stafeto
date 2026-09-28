@@ -829,7 +829,7 @@ fn fault_at_zero() -> Result<ProcessState, &'static str> {
 
 /// object_info(x0 handle, x1 LOG, x2 0) checks its values first, then the
 /// handle, then its right (spec 11, 16.3), and changes x0 alone on an
-/// error: kind 10 fails with INVALID_ARGS, for a closed handle too; a
+/// error: an unknown kind fails with INVALID_ARGS, for a closed handle too; a
 /// closed handle with BAD_HANDLE, a channel with WRONG_TYPE
 /// and a copy of the system resource with DEBUG alone with ACCESS_DENIED.
 /// A destructive call changes x0-x3 alone; sequence reads return x4 too.
@@ -839,7 +839,8 @@ fn object_info_log_checks_its_arguments() -> Outcome {
     let c = channel(QUIET)?;
     let debug = copy(&resource(), Rights::DEBUG)?;
     let (r, log) = (resource().raw().0, abi::INFO_LOG);
-    let invalid = [[r, log + 1, 0], [gone, log + 1, 0]]
+    let unknown = abi::INFO_PROCESS_IDENTITY + 1;
+    let invalid = [[r, unknown, 0], [gone, unknown, 0]]
         .iter()
         .all(|x| x0_alone::<N>(x, Error::InvalidArgs.code()));
     let refused = [
@@ -860,7 +861,10 @@ fn object_info_log_checks_its_arguments() -> Outcome {
     let peek_after = unsafe { sys::raw::<N>(peek) };
     close(debug)?;
     close(c)?;
-    check(invalid, "kind 10 did not fail with INVALID_ARGS alone")?;
+    check(
+        invalid,
+        "an unknown kind did not fail with INVALID_ARGS alone",
+    )?;
     check(
         refused,
         "a closed handle, a channel or a copy without KSTATS did not fail alone",

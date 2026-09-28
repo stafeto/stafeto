@@ -671,6 +671,30 @@ pub const INFO_IRQ: u64 = 8;
 /// each, into the start of the calling thread's message buffer, and
 /// returns `LogBatch::to_words` in x1-x3 (spec 11, 16.3).
 pub const INFO_LOG: u64 = 9;
+/// PROCESS_IDENTITY takes a process handle with no right needed and returns
+/// its boot-unique positive ID and parent's ID in x1-x2. A root's parent is 0.
+/// Ended process shells retain both values until the object is released.
+pub const INFO_PROCESS_IDENTITY: u64 = 10;
+/// Process IDs fit a positive signed 32-bit namespace. They are not handles,
+/// addresses or thread IDs, and are never reused during one kernel boot.
+pub const PROCESS_ID_MAX: u32 = i32::MAX as u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub id: u32,
+    pub parent: u32,
+}
+impl ProcessIdentity {
+    pub const fn to_words(self) -> [u64; 2] {
+        [self.id as u64, self.parent as u64]
+    }
+    pub const fn from_words(words: [u64; 2]) -> Self {
+        Self {
+            id: words[0] as u32,
+            parent: words[1] as u32,
+        }
+    }
+}
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -1297,6 +1321,25 @@ mod tests {
         assert_eq!(RESULT_VALUES, 9);
         assert_eq!(UPCALL_CONTEXT_OFFSET, 1120);
         assert_eq!(UPCALL_CONTEXT_SIZE, 36 * 8 + 32 * 16 + 2 * 8);
+    }
+
+    #[test]
+    fn process_identity_words_and_namespace_boundary_are_stable() {
+        assert_eq!(INFO_PROCESS_IDENTITY, 10);
+        assert_eq!(PROCESS_ID_MAX, 2_147_483_647);
+        for identity in [
+            ProcessIdentity { id: 1, parent: 0 },
+            ProcessIdentity {
+                id: PROCESS_ID_MAX,
+                parent: PROCESS_ID_MAX - 1,
+            },
+        ] {
+            assert_eq!(ProcessIdentity::from_words(identity.to_words()), identity);
+            assert_eq!(
+                identity.to_words(),
+                [u64::from(identity.id), u64::from(identity.parent)]
+            );
+        }
     }
 
     #[test]

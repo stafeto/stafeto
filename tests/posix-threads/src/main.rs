@@ -141,6 +141,20 @@ fn failed(stage: usize) -> bool {
 
 #[cfg(not(feature = "cancel-input"))]
 fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
+    let native =
+        Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let expected = sys::process_identity(&native).expect("native process identity");
+    let errno = unsafe { abi::__errno_location() };
+    unsafe { *errno = 123 };
+    if expected.id <= 1
+        || expected.parent != 1
+        || abi::process::getpid() != expected.id as i32
+        || abi::process::getppid() != expected.parent as i32
+        || unsafe { *errno } != 123
+    {
+        return failed(450);
+    }
+    rt::println!("process-identity-probe: Rust PID/PPID match native identity and preserve errno");
     let mut child = 0;
     let mut value = ptr::null_mut();
     let errno = unsafe { abi::__errno_location() };

@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 32] = [
+pub(crate) const TESTS: [Test; 33] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -79,6 +79,10 @@ pub(crate) const TESTS: [Test; 32] = [
     ),
     ("quota_is_enforced", quota_is_enforced),
     ("process_info_kinds", process_info_kinds),
+    (
+        "process_identity_survives_exit_and_recreation",
+        process_identity_survives_exit_and_recreation,
+    ),
     ("kernel_stats_need_kstats", kernel_stats_need_kstats),
     (
         "kernel_call_maxima_use_the_buffer",
@@ -1037,6 +1041,45 @@ fn process_info_kinds() -> Outcome {
     )
 }
 
+/// A numeric identity belongs to the object, independently of local handles.
+/// Ended shells retain it; recreation consumes a new positive identity.
+fn process_identity_survives_exit_and_recreation() -> Outcome {
+    let root = sys::process_identity(&own()).map_err(|_| "root identity failed")?;
+    check(
+        root.id == 1 && root.parent == 0,
+        "init numeric identity is not root 1",
+    )?;
+    let mut previous = root.id;
+    for _ in 0..6 {
+        let child = child(LOW)?;
+        let copied = copy(&child, Rights::NONE)?;
+        let before = sys::process_identity(&child);
+        let through_copy = sys::process_identity(&copied);
+        let killed = sys::process_kill(&child);
+        let after = sys::process_identity(&copied);
+        let state = sys::process_state(&child);
+        close(copied)?;
+        close(child)?;
+        let before = before.map_err(|_| "child identity failed")?;
+        check(
+            before.id > previous && before.id <= abi::PROCESS_ID_MAX && before.parent == root.id,
+            "child identity was reused, invalid or parent did not match",
+        )?;
+        check(
+            through_copy == Ok(before)
+                && killed.is_ok()
+                && after == Ok(before)
+                && state == Ok(ProcessState::Killed),
+            "copy or exit changed numeric identity",
+        )?;
+        previous = before.id;
+    }
+    check(
+        sys::process_identity(&own()) == Ok(root),
+        "children changed the root identity",
+    )
+}
+
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
 /// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
 /// though it writes; init's resource gets the counts in x1-x9 and changes
@@ -1143,7 +1186,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     let resource = resource().raw().0;
     let kinds = [
         [own, 0, 0],
-        [own, abi::INFO_LOG + 1, 0],
+        [own, abi::INFO_PROCESS_IDENTITY + 1, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
@@ -1158,6 +1201,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
             thread_state,
             channel_kind,
             irq,
+            abi::INFO_PROCESS_IDENTITY,
         ]
         .into_iter()
         .flat_map(|kind| {
@@ -1174,6 +1218,9 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (0, thread_state, Error::BadHandle),
         (0, channel_kind, Error::BadHandle),
         (0, irq, Error::BadHandle),
+        (0, abi::INFO_PROCESS_IDENTITY, Error::BadHandle),
+        (resource, abi::INFO_PROCESS_IDENTITY, Error::WrongType),
+        (thread, abi::INFO_PROCESS_IDENTITY, Error::WrongType),
         (resource, state, Error::WrongType),
         (thread, state, Error::WrongType),
         (resource, memory, Error::WrongType),
@@ -1195,6 +1242,7 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (own, table, 4),
         (thread, thread_state, 5),
         (seen, channel_kind, 5),
+        (own, abi::INFO_PROCESS_IDENTITY, 3),
     ]
     .map(|(h, kind, past)| {
         let mut x = marked();
