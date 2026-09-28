@@ -88,3 +88,6 @@ These probes end after file recovery and do not claim UART read recovery.
 No implicit cancellation point is introduced into allocation functions.
 
 Reference: [POSIX cancellation](https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html).
+
+UART request cleanup and read recovery were subsequently added in
+[m2-rust-posix-uart-cancel.md](m2-rust-posix-uart-cancel.md).

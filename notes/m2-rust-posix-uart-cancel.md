@@ -85,6 +85,9 @@ Returning PeerClosed to a live cancelled reader fails guest stage 97.
 Only the relevant interruption image runs for each mutation.
 Sources are restored before the final tests and full CI.
 
+Full cargo xtask ci passed on c15ab10: init 221, kernel 165, icount 176.
+Normal and VZ kernels remain 154704 and 171072 bytes, below 204800.
+
 ## Remaining requirements
 
 pthread cancellation state/type, pending cancellation, cleanup handlers,
