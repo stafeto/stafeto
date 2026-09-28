@@ -44,6 +44,8 @@ mod once;
 #[cfg(not(feature = "cancel-input"))]
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
+mod signals;
+#[cfg(not(feature = "cancel-input"))]
 mod sleep;
 #[cfg(not(feature = "cancel-input"))]
 mod specific;
@@ -87,13 +89,20 @@ unsafe extern "C" fn joiner(_: *mut c_void) -> *mut c_void {
 
 #[cfg(not(feature = "cancel-input"))]
 fn waiting(thread: &Handle<Thread>) -> bool {
+    waiting_registered(thread, || true)
+}
+
+#[cfg(not(feature = "cancel-input"))]
+fn waiting_registered(thread: &Handle<Thread>, registered: impl Fn() -> bool) -> bool {
     let wake = sys::channel_create(30).expect("poll wake channel");
     let timer = sys::timer_create(&wake, 30).expect("poll timer");
     for _ in 0..100 {
-        if sys::thread_info(thread).is_ok_and(|info| info.state == ThreadState::AwaitingReply) {
+        if sys::thread_info(thread).is_ok_and(|info| info.state == ThreadState::AwaitingReply)
+            && registered()
+        {
             return true;
         }
-        // Sleep so a base-priority-1 owner can accept a newly queued retry.
+        // Let setup RPCs finish before checking the specific registered wait.
         sys::timer_set(&timer, sys::clock_now().expect("poll clock") + 1_000_000)
             .expect("poll deadline");
         sys::receive(&wake).expect("poll wake");
@@ -278,6 +287,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !thread_replies::run()
         || !clock_replies::run(parent)
         || !heap_replies::run()
+        || !signals::run()
         || !cancellation::run()
     {
         return false;

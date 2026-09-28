@@ -81,25 +81,36 @@ fn scope<R>(
     result
 }
 
+fn inherited_id() -> u64 {
+    let old = pointer();
+    if old.is_null() {
+        0
+    } else {
+        // SAFETY: a non-null current register belongs to a still-live scope.
+        unsafe { (*old).thread_id }
+    }
+}
+
 /// Run C code with a file context exclusively borrowed on the current thread.
 /// The context is not inherited by other threads. Their errno can be initialized
 /// with `with_errno`; `with_process` uses the initialized shared process owner.
+/// Nested file and errno scopes preserve the managed thread identity.
 pub fn with_files<R>(files: &mut PosixFs, run: impl FnOnce() -> R) -> R {
     let mut directories = Streams::new();
-    let result = scope(files, &mut directories, false, 0, run);
+    let result = scope(files, &mut directories, false, inherited_id(), run);
     directories.close_all(files);
     result
 }
 
 /// Give the current thread its own errno without a file context.
 pub fn with_errno<R>(run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), ptr::null_mut(), false, 0, run)
+    scope(ptr::null_mut(), ptr::null_mut(), false, inherited_id(), run)
 }
 
 /// Give this thread its own errno while using the initialized process file owner.
 /// Leaving this scope leaves the process's descriptors and streams live.
 pub fn with_process<R>(run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), ptr::null_mut(), true, 0, run)
+    scope(ptr::null_mut(), ptr::null_mut(), true, inherited_id(), run)
 }
 
 pub(crate) fn process_files() -> bool {
@@ -133,7 +144,10 @@ pub(crate) fn directories() -> *mut Streams {
 
 /// Run a managed POSIX thread with its own errno and shared process files.
 pub fn with_thread<R>(id: u64, run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), ptr::null_mut(), true, id, run)
+    scope(ptr::null_mut(), ptr::null_mut(), true, id, || {
+        crate::signals::attach().expect("managed signal entry initialization");
+        run()
+    })
 }
 
 pub(crate) fn thread_id() -> u64 {

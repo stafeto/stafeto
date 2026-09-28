@@ -2,13 +2,14 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Initial managed pthread lifecycle. One IPC owner retains native handles,
-//! stack mappings and join results. ELF TLS, signal inheritance and scheduler
+//! stack mappings and join results. ELF TLS and scheduler
 //! attributes remain work.
 
 pub mod cancel;
 pub mod mutex;
 pub mod once;
 mod replies;
+mod signal_owner;
 pub mod sleep;
 pub mod specific;
 
@@ -153,7 +154,18 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
         return Err(Error::BadState);
     }
     let priority = sys::thread_info(&main)?.base;
-    let endpoint = sys::channel_create(priority)?;
+    // Between reply and receive the owner is ready without a donated boost.
+    // It must run at the process's ceiling to accept queued requests even when
+    // another application thread computes at a higher FIFO priority than main.
+    // The process ceiling is not exposed by object_info. Denied priorities
+    // allocate nothing, so discover the highest permitted level once at startup.
+    let (endpoint, owner_priority) = (1..rt::abi::PRIORITY_LEVELS)
+        .rev()
+        .find_map(|level| match sys::channel_create(level) {
+            Err(Error::AccessDenied) => None,
+            result => Some(result.map(|channel| (channel, level))),
+        })
+        .ok_or(Error::AccessDenied)??;
     crate::clock::watch(&endpoint).map_err(|status| {
         rt::println!("pthread clock watch failed: {:?}", status);
         Error::PeerClosed
@@ -174,7 +186,7 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
                 owner,
                 OWNER_STACK.top(),
                 0,
-                1,
+                owner_priority,
                 Policy::Fifo,
                 0xf00000,
             )
@@ -231,6 +243,12 @@ fn recovery_slot(op: u64) -> Option<usize> {
         sleep::ABANDON => Some(5),
         specific::GET => Some(6),
         specific::DELETE => Some(7),
+        crate::signals::ACTION => Some(8),
+        crate::signals::MASK => Some(9),
+        crate::signals::SEND => Some(10),
+        crate::signals::PENDING => Some(11),
+        crate::signals::TAKE => Some(12),
+        crate::signals::READY => Some(13),
         _ => None,
     }
 }
@@ -246,7 +264,8 @@ struct Entry {
     once_waiting: Option<once::Waiting>,
     mutex_waiting: Option<mutex::Waiting>,
     sleep_waiting: Option<sleep::Waiting>,
-    recovery: [Option<Recovery>; 8],
+    recovery: [Option<Recovery>; 14],
+    signal: posix_signals::Thread,
 }
 impl Entry {
     fn new(
@@ -267,7 +286,8 @@ impl Entry {
             once_waiting: None,
             mutex_waiting: None,
             sleep_waiting: None,
-            recovery: [None; 8],
+            recovery: [None; 14],
+            signal: posix_signals::Thread::new(0),
         }
     }
 }
@@ -275,6 +295,7 @@ struct Registry {
     entries: [Option<Entry>; CAPACITY],
     next_id: u64,
     specific: specific::Registry,
+    signals: posix_signals::Actions,
     replies: replies::Journal,
     #[cfg(feature = "transport-probe")]
     parked_reply: Option<(u64, u64, u64)>,
@@ -287,6 +308,7 @@ static REGISTRY: OwnerRegistry = OwnerRegistry(UnsafeCell::new(Registry {
     entries: [const { None }; CAPACITY],
     next_id: 2,
     specific: specific::Registry::new(),
+    signals: posix_signals::Actions::new(),
     replies: replies::Journal::new(),
     #[cfg(feature = "transport-probe")]
     parked_reply: None,
@@ -460,6 +482,7 @@ impl Registry {
             Some((address, length)),
             attr.detached != 0,
         ));
+        self.entry_mut(slot).signal.mask = self.entry(caller).signal.mask;
         // Install ownership before a successful start can run the callback.
         if sys::thread_start(self.entry(slot).native.as_ref().expect("new native thread")).is_err()
         {
@@ -784,6 +807,10 @@ extern "C" fn owner(_: u64) -> ! {
             _ => continue,
         };
         drop(handles);
+        // A target can end while this owner is blocked in receive. Reclaim its
+        // retained records before reserving the next caller's result, including
+        // a JOIN under handle/quota pressure, without waiting for the reap timer.
+        registry.reap();
         let caller = match registry.find(words[1]) {
             Ok(caller) if len == 64 && words[2] != 0 => caller,
             _ => {
@@ -881,6 +908,8 @@ extern "C" fn owner(_: u64) -> ! {
                 registry.once_perform(words).map(|value| (value, 0))
             } else if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
                 registry.specific.perform(caller, words)
+            } else if (crate::signals::ACTION..=crate::signals::READY).contains(&words[0]) {
+                registry.signal_perform(caller, words)
             } else {
                 registry.perform(caller, words).map(|value| (value, 0))
             };
@@ -918,7 +947,7 @@ fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
     request_pair(op, arguments).map(|(value, _)| value)
 }
 
-fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
+pub(crate) fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
     if !READY.load(Ordering::Acquire) || tls::thread_id() == 0 {
         return Err(EINVAL);
     }
@@ -1000,6 +1029,9 @@ pub unsafe extern "C" fn pthread_create(
     callback: Option<Start>,
     argument: *mut c_void,
 ) -> i32 {
+    // Serialize inheritance against this thread's handlers until the CREATE
+    // result is copied. Pending signals still enter before this call returns.
+    let _signal_mask = crate::signals::NativeMask::new();
     if out.is_null() || callback.is_none() {
         return EINVAL;
     }
@@ -1222,6 +1254,12 @@ pub fn probe_interrupt_replies(create: bool, join: bool, acknowledge: bool) {
 pub fn probe_reply_upcall(op: u64) {
     UPCALL_REPLIES.fetch_or(1 << op, Ordering::AcqRel);
 }
+/// Interrupt one ordinary signal operation after its result was committed.
+#[cfg(feature = "transport-probe")]
+pub fn probe_interrupt_signal_reply(op: u64) {
+    assert!((crate::signals::ACTION..=crate::signals::READY).contains(&op));
+    INTERRUPT_REPLIES.fetch_or(1 << op, Ordering::AcqRel);
+}
 #[cfg(feature = "transport-probe")]
 pub fn probe_ack_interrupt() {
     ACK_TARGET.store(tls::thread_id(), Ordering::Release);
@@ -1324,13 +1362,15 @@ pub fn probe_console_waiting(id: u64) -> bool {
 /// Temporarily schedule the owner ahead of a probe's low-priority target.
 /// The regular sysroot has no extra native-owner handle.
 #[cfg(feature = "transport-probe")]
-pub fn probe_owner_priority(priority: u8) {
+pub fn probe_owner_priority(priority: u8) -> u8 {
     let thread = unsafe {
         (*OWNER_NATIVE.0.get())
             .as_ref()
             .expect("probe owner handle")
     };
+    let old = sys::thread_info(thread).expect("probe owner info").base;
     sys::thread_set_priority(thread, priority, Policy::Fifo).expect("probe owner priority");
+    old
 }
 #[cfg(feature = "transport-probe")]
 pub fn probe_wake_retries() -> u64 {

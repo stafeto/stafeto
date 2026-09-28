@@ -98,7 +98,7 @@ fn child(args: &Args) -> u64 {
 }
 fn blocked(id: u64) -> bool {
     let native = unsafe { threads::probe_native(id) }.unwrap();
-    waiting(&native) && mutex::probe_waiting(id) == Ok(true)
+    waiting_registered(&native, || mutex::probe_waiting(id) == Ok(true))
 }
 fn join(id: u64, expected: usize) -> bool {
     let mut result = ptr::null_mut();

@@ -7,6 +7,23 @@
 
 pub mod constants;
 
+/// Ordinary signal numbers use bits 0..30; unused bits remain reserved.
+pub type SigSet = u64;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigAction {
+    /// SIG_DFL = 0, SIG_IGN = 1, otherwise a live C handler address.
+    pub handler: u64,
+    pub mask: SigSet,
+    pub flags: i32,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<SigAction>() == 24);
+    assert!(core::mem::align_of::<SigAction>() == 8);
+};
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum ConversionError {
     Malformed,
