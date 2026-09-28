@@ -1,0 +1,17 @@
+[package]
+name = "posix-thread-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "posix-thread-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi", features = ["transport-probe"] }
+posix-fs = { path = "../../lib/posix-fs" }
+rt = { path = "../../lib/rt" }

@@ -74,7 +74,12 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
         rt::println!("POSIX startup: heap worker failed");
         return 125;
     }
-    posix_abi::tls::with_process(|| {
+    // SAFETY: startup owns initialization and the manager ranges are unused.
+    if unsafe { posix_abi::threads::init(start.thread) }.is_err() {
+        rt::println!("POSIX startup: thread worker failed");
+        return 125;
+    }
+    posix_abi::tls::with_thread(1, || {
         // SAFETY: argv has count live C strings and a NULL sentinel; main is linked by C.
         let status = unsafe { main(count as c_int, arguments.as_mut_ptr()) };
         (status & 255) as u64
