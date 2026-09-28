@@ -3,9 +3,11 @@
 
 //! Pending/live acceptance, thread targeting, retry and cancellation cleanup.
 use super::*;
-use abi::signals::{self as api, SigAction};
+use abi::signals::{self as api, SigAction, SigInfo};
+use core::sync::atomic::AtomicBool;
 use rt::wait::{Waited, Waiter};
 use threads::cancel::{self, Cleanup};
+static INFO: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
 static RETURNED: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
@@ -49,13 +51,32 @@ unsafe extern "C" fn handler(signal: i32) {
     }
     unsafe { *abi::__errno_location() = 901 };
 }
+struct Output {
+    signal: i32,
+    info: SigInfo,
+}
+fn sentinel() -> SigInfo {
+    SigInfo {
+        si_code: -999,
+        si_value: u64::MAX,
+        ..SigInfo::thread(777)
+    }
+}
 unsafe extern "C" fn cleanup(argument: *mut c_void) {
-    let signal = unsafe { *argument.cast::<i32>() };
+    let output = unsafe { &*argument.cast::<Output>() };
+    let signal = output.signal;
     let mode = MODE.load(Ordering::Acquire);
     if api::probe_waiting(threads::pthread_self()) != Ok(false)
         || mask() != BLOCKED
         || unsafe { *abi::__errno_location() } != 777
         || signal != if mode == 5 { SIGUSR1 } else { 777 }
+        || (INFO.load(Ordering::Acquire)
+            && output.info
+                != if mode == 5 {
+                    SigInfo::thread(SIGUSR1)
+                } else {
+                    sentinel()
+                })
     {
         ERRORS.fetch_add(1, Ordering::Release);
     }
@@ -70,10 +91,13 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     if mask() != BLOCKED || pending() != 0 {
         return ptr::null_mut();
     }
-    let mut signal = 777;
+    let mut output = Output {
+        signal: 777,
+        info: sentinel(),
+    };
     let mut node = Cleanup::new();
     unsafe {
-        cancel::__stafeto_cleanup_push(&mut node, Some(cleanup), ptr::from_mut(&mut signal).cast())
+        cancel::__stafeto_cleanup_push(&mut node, Some(cleanup), ptr::from_mut(&mut output).cast())
     };
     if mode == 0 {
         assert_eq!(api::raise(SIGUSR1), 0);
@@ -93,10 +117,22 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
         threads::probe_ack_interrupt();
     }
     let set = if mode == 6 { 0 } else { bit(SIGUSR1) };
-    let status = unsafe { api::sigwait(&set, &mut signal) };
+    let with_info = INFO.load(Ordering::Acquire);
+    let status = if with_info {
+        let signal = unsafe { api::sigwaitinfo(&set, &mut output.info) };
+        if signal >= 0 {
+            output.signal = signal;
+            0
+        } else {
+            signal
+        }
+    } else {
+        unsafe { api::sigwait(&set, &mut output.signal) }
+    };
     let mut action = posix_signals::INITIAL;
     let passed = status == 0
-        && signal == SIGUSR1
+        && output.signal == SIGUSR1
+        && (!with_info || output.info == SigInfo::thread(SIGUSR1))
         && mask() == BLOCKED
         && pending()
             == if mode == 1 && index == 1 {
@@ -132,6 +168,28 @@ fn joined(id: u64, expected: usize) -> bool {
     (unsafe { threads::pthread_join(id, &mut value) }) == 0 && value as usize == expected
 }
 pub(super) fn run() -> bool {
+    let snapshot = [
+        0xffff_ffff_0000_1234,
+        0x8000_0001_0000_0010,
+        3,
+        0x8765_4321_fedc_ba98,
+        128,
+    ];
+    let before_ack = threads::probe_ack_interrupts();
+    if threads::probe_snapshot(snapshot)
+        != Ok([
+            snapshot[0],
+            snapshot[1],
+            snapshot[2],
+            snapshot[3],
+            snapshot[4],
+            u64::MAX,
+            1 << 63,
+        ])
+        || threads::probe_ack_interrupts() != before_ack + 1
+    {
+        return failed(449);
+    }
     let done = sys::channel_create(30).unwrap();
     let waiter = Waiter::new(&done, 0, 30).unwrap();
     DONE.store(done.raw().0, Ordering::Release);
@@ -150,88 +208,91 @@ pub(super) fn run() -> bool {
     if unsafe { api::pthread_sigmask(SIG_BLOCK, &BLOCKED, &mut old_mask) } != 0 {
         return failed(421);
     }
-    for mode in 0..7 {
-        MODE.store(mode, Ordering::Release);
-        CLEANED.store(0, Ordering::Release);
-        HANDLED.store(0, Ordering::Release);
-        ERRORS.store(0, Ordering::Release);
-        for result in &RETURNED {
-            result.store(0, Ordering::Release);
-        }
-        let count = if mode == 1 { 2 } else { 1 };
-        let mut ids = [0; 2];
-        for (index, id) in ids.iter_mut().enumerate().take(count) {
-            if unsafe {
-                threads::pthread_create(id, ptr::null(), Some(worker), index as *mut c_void)
-            } != 0
-            {
-                return failed(422);
+    for with_info in [false, true] {
+        INFO.store(with_info, Ordering::Release);
+        for mode in 0..7 {
+            MODE.store(mode, Ordering::Release);
+            CLEANED.store(0, Ordering::Release);
+            HANDLED.store(0, Ordering::Release);
+            ERRORS.store(0, Ordering::Release);
+            for result in &RETURNED {
+                result.store(0, Ordering::Release);
             }
-        }
-        if mode != 0 && mode != 4 {
-            for id in ids.iter().take(count) {
-                if !blocked(*id) {
-                    return failed(423);
+            let count = if mode == 1 { 2 } else { 1 };
+            let mut ids = [0; 2];
+            for (index, id) in ids.iter_mut().enumerate().take(count) {
+                if unsafe {
+                    threads::pthread_create(id, ptr::null(), Some(worker), index as *mut c_void)
+                } != 0
+                {
+                    return failed(422);
                 }
             }
-            if mode == 6 {
-                if threads::pthread_cancel(ids[0]) != 0 {
-                    return failed(424);
-                }
-            } else {
-                let native = unsafe { threads::probe_native(ids[0]) }.unwrap();
-                for _ in 0..3 {
-                    if sys::thread_interrupt(&native).is_err() || !blocked(ids[0]) {
-                        return failed(425);
+            if mode != 0 && mode != 4 {
+                for id in ids.iter().take(count) {
+                    if !blocked(*id) {
+                        return failed(423);
                     }
                 }
-                if mode == 2
-                    && (api::pthread_kill(ids[0], SIGTERM) != 0
-                        || !blocked(ids[0])
-                        || HANDLED.load(Ordering::Acquire) != 1)
-                {
-                    return failed(426);
-                }
-                if count == 2 && api::pthread_kill(ids[1], SIGUSR2) != 0 {
-                    return failed(427);
-                }
-                if api::pthread_kill(ids[0], SIGUSR1) != 0 {
-                    return failed(428);
+                if mode == 6 {
+                    if threads::pthread_cancel(ids[0]) != 0 {
+                        return failed(424);
+                    }
+                } else {
+                    let native = unsafe { threads::probe_native(ids[0]) }.unwrap();
+                    for _ in 0..3 {
+                        if sys::thread_interrupt(&native).is_err() || !blocked(ids[0]) {
+                            return failed(425);
+                        }
+                    }
+                    if mode == 2
+                        && (api::pthread_kill(ids[0], SIGTERM) != 0
+                            || !blocked(ids[0])
+                            || HANDLED.load(Ordering::Acquire) != 1)
+                    {
+                        return failed(426);
+                    }
+                    if count == 2 && api::pthread_kill(ids[1], SIGUSR2) != 0 {
+                        return failed(427);
+                    }
+                    if api::pthread_kill(ids[0], SIGUSR1) != 0 {
+                        return failed(428);
+                    }
                 }
             }
-        }
-        let now = || rt::time::ticks_to_ns(rt::time::now());
-        if !matches!(
-            waiter.receive_until(&done, now() + 500_000_000),
-            Ok(Waited::Got(_))
-        ) {
-            return failed(429);
-        }
-        if count == 2 {
-            if RETURNED[1].load(Ordering::Acquire) != 0
-                || !blocked(ids[1])
-                || api::pthread_kill(ids[1], SIGUSR1) != 0
-            {
-                return failed(430);
-            }
+            let now = || rt::time::ticks_to_ns(rt::time::now());
             if !matches!(
                 waiter.receive_until(&done, now() + 500_000_000),
                 Ok(Waited::Got(_))
             ) {
-                return failed(431);
+                return failed(429);
             }
-        }
-        for id in ids.iter().take(count) {
-            if !joined(*id, if mode >= 4 { usize::MAX } else { 1 }) {
-                return failed(432 + mode);
+            if count == 2 {
+                if RETURNED[1].load(Ordering::Acquire) != 0
+                    || !blocked(ids[1])
+                    || api::pthread_kill(ids[1], SIGUSR1) != 0
+                {
+                    return failed(430);
+                }
+                if !matches!(
+                    waiter.receive_until(&done, now() + 500_000_000),
+                    Ok(Waited::Got(_))
+                ) {
+                    return failed(431);
+                }
             }
-        }
-        if ERRORS.load(Ordering::Acquire) != 0
-            || CLEANED.load(Ordering::Acquire) != usize::from(mode >= 4)
-            || (mode == 5 && RETURNED[0].load(Ordering::Acquire) != 1)
-            || HANDLED.load(Ordering::Acquire) != usize::from(mode == 2)
-        {
-            return failed(440 + mode);
+            for id in ids.iter().take(count) {
+                if !joined(*id, if mode >= 4 { usize::MAX } else { 1 }) {
+                    return failed(432 + mode);
+                }
+            }
+            if ERRORS.load(Ordering::Acquire) != 0
+                || CLEANED.load(Ordering::Acquire) != usize::from(mode >= 4)
+                || (mode == 5 && RETURNED[0].load(Ordering::Acquire) != 1)
+                || HANDLED.load(Ordering::Acquire) != usize::from(mode == 2)
+            {
+                return failed(440 + mode);
+            }
         }
     }
     for (index, signal) in [SIGUSR1, SIGTERM].into_iter().enumerate() {
@@ -243,7 +304,7 @@ pub(super) fn run() -> bool {
         return failed(448);
     }
     rt::println!(
-        "signal-wait-probe: pending/live acceptance, targeting, handler/reply interruption, masks, dispositions, errno and cancellation cleanup ok"
+        "signal-wait-probe: sigwait/sigwaitinfo pending/live acceptance, targeting, handler/reply interruption, masks, dispositions, errno and cancellation cleanup ok"
     );
     true
 }

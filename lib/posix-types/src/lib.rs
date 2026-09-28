@@ -19,9 +19,72 @@ pub struct SigAction {
     pub flags: i32,
 }
 
+/// Fixed-width signal information, matching the AArch64 C siginfo_t layout.
+/// si_value stores the object representation of the C union sigval. Sources
+/// initialize all eight bytes; pointer and integer interpretations belong to
+/// the application and are never dereferenced by the runtime.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SigInfo {
+    pub si_signo: i32,
+    pub si_errno: i32,
+    pub si_code: i32,
+    pub si_pid: i32,
+    pub si_uid: u32,
+    pub si_status: i32,
+    pub si_addr: u64,
+    pub si_value: u64,
+}
+
+impl SigInfo {
+    /// Current non-value-generating thread-directed source. Fields other than
+    /// signo/code are unspecified for SI_THREAD and deterministically zeroed.
+    pub const fn thread(signal: i32) -> Self {
+        Self {
+            si_signo: signal,
+            si_errno: 0,
+            si_code: constants::SI_THREAD,
+            si_pid: 0,
+            si_uid: 0,
+            si_status: 0,
+            si_addr: 0,
+            si_value: 0,
+        }
+    }
+
+    /// Field encoding avoids reading C padding and keeps signed fields intact.
+    pub fn words(self) -> [u64; 5] {
+        let pair = |low: u32, high: u32| u64::from(low) | (u64::from(high) << 32);
+        [
+            pair(self.si_signo as u32, self.si_errno as u32),
+            pair(self.si_code as u32, self.si_pid as u32),
+            pair(self.si_uid, self.si_status as u32),
+            self.si_addr,
+            self.si_value,
+        ]
+    }
+
+    pub fn from_words(words: [u64; 5]) -> Self {
+        Self {
+            si_signo: words[0] as u32 as i32,
+            si_errno: (words[0] >> 32) as u32 as i32,
+            si_code: words[1] as u32 as i32,
+            si_pid: (words[1] >> 32) as u32 as i32,
+            si_uid: words[2] as u32,
+            si_status: (words[2] >> 32) as u32 as i32,
+            si_addr: words[3],
+            si_value: words[4],
+        }
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<SigAction>() == 24);
     assert!(core::mem::align_of::<SigAction>() == 8);
+    assert!(core::mem::size_of::<SigInfo>() == 40);
+    assert!(core::mem::align_of::<SigInfo>() == 8);
+    assert!(core::mem::offset_of!(SigInfo, si_addr) == 24);
+    assert!(core::mem::offset_of!(SigInfo, si_value) == 32);
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -128,6 +191,27 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_information_preserves_signed_fields_and_full_values() {
+        let info = SigInfo {
+            si_signo: 64,
+            si_errno: i32::MIN,
+            si_code: -1,
+            si_pid: i32::MAX,
+            si_uid: u32::MAX,
+            si_status: -127,
+            si_addr: 0xfedc_ba98_7654_3210,
+            si_value: 0x8765_4321_fedc_ba98,
+        };
+        assert_eq!(SigInfo::from_words(info.words()), info);
+        assert_eq!(info.words()[0], 0x8000_0000_0000_0040);
+        assert_eq!(info.words()[1], 0x7fff_ffff_ffff_ffff);
+        let thread = SigInfo::thread(constants::SIGUSR1);
+        assert_eq!(thread.si_signo, constants::SIGUSR1);
+        assert_eq!(thread.si_code, constants::SI_THREAD);
+        assert_eq!(&thread.words()[2..], &[0; 3]);
+    }
 
     fn node() -> proto_fs::NodeInfo {
         proto_fs::NodeInfo {

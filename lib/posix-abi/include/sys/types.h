@@ -4,6 +4,7 @@
 #define STAFETO_SYS_TYPES_H
 #include <stddef.h>
 #include <stdint.h>
+typedef int pid_t;
 typedef uint64_t pthread_t;
 typedef uint64_t pthread_key_t;
 typedef struct { uint64_t __state; } pthread_once_t;
