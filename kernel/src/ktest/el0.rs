@@ -3218,7 +3218,7 @@ fn done_raised_replies(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 /// After a portion, the stage Close goes back to the head of the higher of
-/// its cause and the top level of its queue (spec 7.7): 64 threads at 10
+/// its cause and the top level of its queue (spec 7.7): MAX_THREADS threads at 10
 /// wait in receive on one channel, and the closer closes its last handles
 /// with RECEIVE as a thread at 40 would. Both portions run at 40, 32 heads
 /// each; a stage that went back at its waiters' level would run the second

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The mappings of a process (spec 7.4, 7.5, 7.7): a table of up to
-//! abi::MAX_MAPPINGS entries (kcore::maps) in a block of the process's pool
-//! of blocks, which the process pays for whoever maps into it. An entry
+//! abi::MAX_MAPPINGS entries (kcore::maps) in one paid page recorded in
+//! the process page log, charged to it whoever maps into it. An entry
 //! shows pages of a memory object and holds a reference to it, so the
 //! object lives while it is mapped anywhere. mem_map, mem_unmap and
 //! mem_protect change one entry a portion at a time, PORTION pages, or

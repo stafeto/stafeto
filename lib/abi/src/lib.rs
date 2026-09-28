@@ -1391,7 +1391,7 @@ mod tests {
 
     #[test]
     fn mappings_have_a_fixed_bound_and_three_accesses() {
-        assert_eq!(MAX_MAPPINGS, 64);
+        assert_eq!(MAX_MAPPINGS, 128);
         let accesses = [
             (Access::Read, 1, Rights::MAP_READ),
             (Access::ReadWrite, 3, Rights::MAP_READ | Rights::MAP_WRITE),

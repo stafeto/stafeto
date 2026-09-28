@@ -137,7 +137,7 @@ compares and a branch. A window owns no frame: its
 pages come from its base without a read of a list, and its chunk only
 gives its place back. `mem_map` shows it as `Device-nGnRE`, R or RW,
 never executable, in the chunks of any memory object. An SError taken at
-EL0 still stops the machine; its report walks the running process's 64
+EL0 still stops the machine; its report walks the running process's 128
 mappings at most for the windows among them.
 
 From part 1.3d on, a memory object takes all its frames when it is made,

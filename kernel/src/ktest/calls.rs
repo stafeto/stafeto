@@ -3828,8 +3828,8 @@ fn frames_free(pa: u64, order: u8) {
 /// - map, map_exec: the entries of mem_map but the first, RW and RX, whose
 ///   portion crosses a bound of REGION and takes three tables;
 /// - protect, protect_exec, unmap: the entries of mem_protect to R and to
-///   RX and of mem_unmap of a mapping of 64 pages, among 64 mappings of a
-///   process with 64 threads and an ASID, which takes a TLBI a page;
+///   RX and of mem_unmap of a mapping of 64 pages, among MAX_MAPPINGS mappings
+///   of a process with MAX_THREADS threads and an ASID, which takes a TLBI a page;
 /// - release: the portion of cleanup of a memory object that gives back its
 ///   last pages, the node of their list and the object's place and budget,
 ///   whose frames are each alone in their free block of MAX_ORDER frames,

@@ -537,7 +537,7 @@ fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
     )
 }
 
-/// A process has 64 mappings at most (spec 7.4): the 65th fails with
+/// A process has abi::MAX_MAPPINGS mappings at most (spec 7.4): the next fails with
 /// LIMIT_REACHED alone, and once one went the next one maps. Init has
 /// INIT_MAPPINGS of its own.
 fn mapping_limit_is_64() -> Outcome {
