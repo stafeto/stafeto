@@ -15,6 +15,7 @@ pub mod metadata;
 pub mod ordering;
 pub mod scan;
 pub mod shared;
+pub mod threads;
 pub mod tls;
 
 use constants::*;

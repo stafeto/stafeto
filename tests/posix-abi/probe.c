@@ -5,12 +5,16 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <locale.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+_Static_assert(sizeof(pthread_t) == 8, "pthread ID ABI");
+_Static_assert(sizeof(pthread_attr_t) == 32, "pthread attributes ABI");
+_Static_assert(_Alignof(pthread_attr_t) == 8, "pthread attribute alignment");
 _Static_assert(sizeof(void *) == 8, "pointer ABI");
 _Static_assert(sizeof(int) == 4, "int ABI");
 _Static_assert(sizeof(long) == 8, "long ABI");
@@ -326,6 +330,122 @@ static int scans(void) {
     return 0;
 }
 
+static uint64_t fp_environment(void) {
+    uint64_t control, status;
+    __asm__ volatile ("mrs %0, fpcr; mrs %1, fpsr" : "=r"(control), "=r"(status));
+    return control | (status << 32);
+}
+static void set_fp_environment(uint64_t environment) {
+    uint64_t control = (uint32_t)environment, status = environment >> 32;
+    __asm__ volatile ("msr fpcr, %0; msr fpsr, %1" : : "r"(control), "r"(status) : "memory");
+}
+struct thread_context { pthread_t parent, self; int fd; char byte; int failure; uint64_t floating; };
+
+static void *thread_files(void *argument) {
+    struct thread_context *context = argument;
+    context->self = pthread_self();
+    if (!context->self || pthread_equal(context->self, context->parent) || errno != 0) {
+        context->failure = 1;
+        return NULL;
+    }
+    if (fp_environment() != context->floating) { context->failure = 4; return NULL; }
+    set_fp_environment(0);
+    errno = 777;
+    if (read(context->fd, &context->byte, 1) != 1 || context->byte != 's' || errno != 777) {
+        context->failure = 2;
+        return NULL;
+    }
+    char *owned = malloc(32);
+    if (!owned || errno != 777) { context->failure = 3; return NULL; }
+    owned[0] = 'p'; owned[31] = 't';
+    return owned;
+}
+
+static void *thread_exit_value(void *argument) { pthread_exit(argument); }
+static void *thread_return(void *argument) { return argument; }
+static void *thread_nested(void *argument) {
+    pthread_t child;
+    void *value = NULL;
+    errno = 777;
+    if (pthread_join(pthread_self(), &value) != EDEADLK || value != NULL
+            || pthread_create(&child, NULL, thread_exit_value, argument)
+            || pthread_join(child, &value) || value != argument || errno != 777) return NULL;
+    return value;
+}
+
+static int threads(void) {
+    pthread_t main_thread = pthread_self(), child = 0;
+    pthread_attr_t attr;
+    size_t size = 0;
+    int state = -1;
+    void *value = (void *)(uintptr_t)1234;
+    errno = 123;
+    if (!main_thread || !pthread_equal(main_thread, main_thread)
+            || pthread_join(main_thread, &value) != EDEADLK
+            || value != (void *)(uintptr_t)1234 || errno != 123) return 200;
+    if (pthread_attr_init(&attr) || pthread_attr_getstacksize(&attr, &size) || size != 65536
+            || pthread_attr_getguardsize(&attr, &size) || size != 4096
+            || pthread_attr_getdetachstate(&attr, &state) || state != PTHREAD_CREATE_JOINABLE) return 201;
+    if (pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN - 1) != EINVAL
+            || pthread_attr_getstacksize(&attr, &size) || size != 65536
+            || pthread_attr_setguardsize(&attr, SIZE_MAX) != EINVAL
+            || pthread_attr_setdetachstate(&attr, 123) != EINVAL
+            || pthread_attr_setstacksize(&attr, PTHREAD_STACK_MIN)
+            || pthread_attr_setguardsize(&attr, 1)
+            || pthread_attr_getguardsize(&attr, &size) || size != 1 || errno != 123) return 202;
+    if (pthread_create(NULL, &attr, thread_return, NULL) != EINVAL
+            || pthread_create(&child, &attr, NULL, NULL) != EINVAL || child != 0 || errno != 123) return 203;
+    uint64_t original_floating = fp_environment();
+    // Non-default rounding mode and exception status must be inherited.
+    set_fp_environment((1ULL << 22) | (1ULL << 32));
+    struct thread_context context = { .parent = main_thread, .fd = open("/etc/motd", O_RDONLY),
+        .floating = fp_environment() };
+    if (context.fd < 0 || pthread_create(&child, NULL, thread_files, &context)
+            || pthread_join(child, &value) || context.failure || context.self != child
+            || !value || ((char *)value)[0] != 'p' || ((char *)value)[31] != 't' || errno != 123
+            || fp_environment() != context.floating) return 204;
+    set_fp_environment(original_floating);
+    free(value);
+    char byte;
+    if (read(context.fd, &byte, 1) != 1 || byte != 't' || close(context.fd)) return 205;
+    value = (void *)(uintptr_t)1234;
+    if (pthread_join(child, &value) != ESRCH || pthread_detach(child) != ESRCH
+            || value != (void *)(uintptr_t)1234 || errno != 123) return 206;
+    pthread_t previous = child;
+    for (unsigned int i = 0; i < 64; i++) {
+        void *expected = (void *)(uintptr_t)(i + 1);
+        if (pthread_create(&child, &attr, thread_exit_value, expected)
+                || child <= previous || pthread_join(child, &value) || value != expected) return 207;
+        previous = child;
+    }
+    if (pthread_create(&child, NULL, thread_nested, &context)
+            || pthread_join(child, &value) || value != &context || errno != 123) return 208;
+    if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED)
+            || pthread_create(&child, &attr, thread_return, NULL)) return 209;
+    int detached_join = pthread_join(child, NULL);
+    if (detached_join != EINVAL && detached_join != ESRCH) return 210;
+    // The witness join lets the detached child finish before testing slot reuse.
+    if (pthread_create(&child, NULL, thread_return, &context)
+            || pthread_detach(child)) return 211;
+    pthread_t witness;
+    if (pthread_create(&witness, NULL, thread_return, &context)
+            || pthread_join(witness, &value) || value != &context) return 212;
+    if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE)) return 213;
+    pthread_t children[31];
+    for (size_t i = 0; i < 31; i++) {
+        if (pthread_create(&children[i], &attr, thread_return, (void *)(uintptr_t)(i + 1))) return 214;
+    }
+    child = 987;
+    if (pthread_create(&child, &attr, thread_return, NULL) != EAGAIN || child != 987 || errno != 123) return 215;
+    for (size_t i = 0; i < 31; i++) {
+        if (pthread_join(children[i], &value) || value != (void *)(uintptr_t)(i + 1)) return 216;
+    }
+    if (pthread_create(&child, &attr, thread_return, NULL) || pthread_join(child, NULL)
+            || pthread_attr_destroy(&attr) || pthread_attr_getstacksize(&attr, &size) != EINVAL
+            || pthread_create(&child, &attr, thread_return, NULL) != EINVAL || errno != 123) return 217;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -376,6 +496,8 @@ int main(int argc, char **argv) {
     if (metadata_result) return metadata_result;
     int directory_result = directories();
     if (directory_result) return directory_result;
+    int thread_result = threads();
+    if (thread_result) return thread_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();

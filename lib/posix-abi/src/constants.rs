@@ -6,6 +6,12 @@
 pub const ABI_VERSION: u32 = 1;
 pub const STAFETO_ERRNO_OFFSET: u32 = 16;
 pub const SYSROOT_VERSION: &str = "0.1.0";
+pub const ESRCH: i32 = 3;
+pub const EAGAIN: i32 = 11;
+pub const EDEADLK: i32 = 35;
+pub const PTHREAD_CREATE_JOINABLE: i32 = 0;
+pub const PTHREAD_CREATE_DETACHED: i32 = 1;
+pub const PTHREAD_STACK_MIN: u32 = 16384;
 pub const ENOENT: i32 = 2;
 pub const EINTR: i32 = 4;
 pub const EIO: i32 = 5;

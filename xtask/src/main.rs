@@ -61,6 +61,16 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
 ];
+const POSIX_THREAD_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-abi-probe",
+        "posix-thread-probe",
+        CHILD_STACK_SIZE,
+        &[],
+    ),
+];
 const POSIX_SHARED_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -524,6 +534,8 @@ commands:
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
+  posix-threads verify pthread interruption and main-thread exit
+  posix-threads-vz run the pthread probe on Apple Virtualization.framework
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify native console reads on Apple Virtualization.framework
@@ -552,6 +564,8 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
+        Some("posix-threads") => posix_thread_probe(false),
+        Some("posix-threads-vz") => posix_thread_probe(true),
         Some("posix-abi") => posix_abi_probe(),
         Some("posix-shared") => posix_shared_probe(),
         Some("posix-input") => posix_input_probe(false),
@@ -1049,10 +1063,36 @@ fn posix_abi_probe() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
+    posix_thread_probe(false)?;
     posix_shared_probe()?;
     posix_input_probe(false)?;
     posix_interrupt_probe(false)?;
     println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
+    Ok(())
+}
+
+fn posix_thread_probe(native: bool) -> Result<(), String> {
+    let kernel = build(if native { Variant::Vz } else { Variant::Normal })?;
+    let image = build_boot_image(
+        "boot-posix-threads.img",
+        &POSIX_THREAD_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = if native {
+        let mut cmd = Command::new(vz::runner()?);
+        cmd.arg(&kernel.image).arg(&image);
+        cmd
+    } else {
+        qemu::command(&qemu::VIRT, &kernel.image, Some(&image))
+    };
+    if !native {
+        cmd.args(qemu::HEADLESS);
+    }
+    const ENDED: &str = "init: posix-abi-probe ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_marker(&output, "posix-thread-probe: ok")?;
+    println!("Rust POSIX pthread lifecycle guest probe passed");
     Ok(())
 }
 
@@ -2805,6 +2845,8 @@ fn ci() -> Result<(), String> {
         "posix-abi-probe",
         "--package",
         "posix-tls-probe",
+        "--package",
+        "posix-thread-probe",
         "--package",
         "posix-shared-probe",
         "--package",

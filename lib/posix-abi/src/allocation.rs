@@ -303,3 +303,9 @@ pub unsafe extern "C" fn posix_memalign(out: *mut *mut u8, alignment: usize, siz
         Err(code) => code,
     }
 }
+
+/// Borrow the process handle kept alive by the initialized heap owner.
+pub(crate) fn process() -> &'static Handle<Process> {
+    assert!(READY.load(Ordering::Acquire), "published heap process");
+    &config().process
+}

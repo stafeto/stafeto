@@ -17,6 +17,7 @@ struct Block {
     process_files: u32,
     files: *mut PosixFs,
     directories: *mut Streams,
+    thread_id: u64,
 }
 
 const _: () = {
@@ -51,6 +52,7 @@ fn scope<R>(
     files: *mut PosixFs,
     directories: *mut Streams,
     process_files: bool,
+    thread_id: u64,
     run: impl FnOnce() -> R,
 ) -> R {
     let mut block = Block {
@@ -59,6 +61,7 @@ fn scope<R>(
         process_files: u32::from(process_files),
         files,
         directories,
+        thread_id,
     };
     let restore = Restore(pointer());
     // SAFETY: block remains at this stack address until after register restoration.
@@ -73,20 +76,20 @@ fn scope<R>(
 /// with `with_errno`; `with_process` uses the initialized shared process owner.
 pub fn with_files<R>(files: &mut PosixFs, run: impl FnOnce() -> R) -> R {
     let mut directories = Streams::new();
-    let result = scope(files, &mut directories, false, run);
+    let result = scope(files, &mut directories, false, 0, run);
     directories.close_all(files);
     result
 }
 
 /// Give the current thread its own errno without a file context.
 pub fn with_errno<R>(run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), ptr::null_mut(), false, run)
+    scope(ptr::null_mut(), ptr::null_mut(), false, 0, run)
 }
 
 /// Give this thread its own errno while using the initialized process file owner.
 /// Leaving this scope leaves the process's descriptors and streams live.
 pub fn with_process<R>(run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), ptr::null_mut(), true, run)
+    scope(ptr::null_mut(), ptr::null_mut(), true, 0, run)
 }
 
 pub(crate) fn process_files() -> bool {
@@ -116,4 +119,14 @@ pub(crate) fn files() -> *mut PosixFs {
 pub(crate) fn directories() -> *mut Streams {
     // SAFETY: the current scope uniquely owns its live directory registry.
     unsafe { (*block()).directories }
+}
+
+/// Run a managed POSIX thread with its own errno and shared process files.
+pub fn with_thread<R>(id: u64, run: impl FnOnce() -> R) -> R {
+    scope(ptr::null_mut(), ptr::null_mut(), true, id, run)
+}
+
+pub(crate) fn thread_id() -> u64 {
+    // SAFETY: pthread entry points require a live current-thread scope.
+    unsafe { (*block()).thread_id }
 }
