@@ -222,7 +222,7 @@ mod tests {
             input.read(7, RX_RING - 2, 'a', &mut out),
             Taken::Now(RX_RING - 2, 'a')
         );
-        for value in [b'a', b'b', b'c'] {
+        for value in *b"abc" {
             assert!(input.push(u32::from(value)));
         }
         assert_eq!(input.read(7, 3, 'b', &mut out), Taken::Now(3, 'b'));
@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(&out[..5], &[254, 255, b'a', b'b', b'c']);
         assert_eq!(input.room(), RX_RING);
         assert_eq!(input.read_cancelable(7, 2, 1, 'd', &mut out), Taken::Waits);
-        for value in [b'x', b'y', b'z'] {
+        for value in *b"xyz" {
             assert!(input.push(u32::from(value)));
         }
         assert_eq!(input.answer(&mut out), Some(('d', 2)));
