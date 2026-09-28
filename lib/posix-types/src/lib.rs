@@ -79,6 +79,21 @@ pub struct SigInfo {
 }
 
 impl SigInfo {
+    /// Value-carrying source. The process owner supplies the authenticated PID
+    /// and real UID; application-supplied values are copied without dereferencing.
+    pub const fn queued(signal: i32, pid: i32, uid: u32, value: u64) -> Self {
+        Self {
+            si_signo: signal,
+            si_errno: 0,
+            si_code: constants::SI_QUEUE,
+            si_pid: pid,
+            si_uid: uid,
+            si_status: 0,
+            si_addr: 0,
+            si_value: value,
+        }
+    }
+
     /// Current non-value-generating thread-directed source. Fields other than
     /// signo/code are unspecified for SI_THREAD and deterministically zeroed.
     pub const fn thread(signal: i32) -> Self {

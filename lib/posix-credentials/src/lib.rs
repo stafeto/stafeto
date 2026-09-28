@@ -9,6 +9,14 @@ pub enum Error {
     Invalid,
     Permission,
 }
+/// POSIX kill/sigqueue UID permission rule. The routing owner separately checks
+/// target lifetime and the SIGCONT exception for processes in the same session.
+pub fn user_ids_allow_signal(sender: Credentials, target: Credentials) -> bool {
+    sender.euid == 0
+        || [sender.uid, sender.euid]
+            .iter()
+            .any(|id| *id == target.uid || *id == target.suid)
+}
 /// Compute the entire next state before changing the process record.
 pub fn change(mut current: Credentials, operation: Change, id: u32) -> Result<Credentials, Error> {
     if id == u32::MAX {
@@ -44,6 +52,33 @@ pub fn change(mut current: Credentials, operation: Change, id: u32) -> Result<Cr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn signal_permission_checks_sender_real_effective_against_target_real_saved() {
+        let sender = Credentials::from_words([10, 11, 12, 0, 0, 0]);
+        for (uid, euid, suid, allowed) in [
+            (10, 99, 98, true),
+            (11, 99, 98, true),
+            (99, 98, 10, true),
+            (99, 98, 11, true),
+            (99, 10, 98, false),
+            (99, 11, 98, false),
+            (12, 99, 98, false),
+            (99, 98, 12, false),
+            (99, 98, 97, false),
+        ] {
+            let target = Credentials {
+                uid,
+                euid,
+                suid,
+                ..Credentials::ROOT
+            };
+            assert_eq!(user_ids_allow_signal(sender, target), allowed);
+            assert!(user_ids_allow_signal(Credentials::ROOT, target));
+        }
+        let dropped = Credentials::from_words([0, 1000, 0, 0, 0, 0]);
+        let unrelated = Credentials::from_words([1001, 1000, 1002, 0, 0, 0]);
+        assert!(!user_ids_allow_signal(dropped, unrelated));
+    }
     #[test]
     fn privileged_uid_change_drops_all_three_and_cannot_regain_root() {
         let next = change(Credentials::ROOT, Change::Uid, 1000).unwrap();
