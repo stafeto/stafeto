@@ -23,6 +23,8 @@ use rt::{
 #[cfg(feature = "input-probe")]
 mod input;
 
+mod wire;
+
 rt::entry!(main);
 #[cfg(not(feature = "input-probe"))]
 static STACK: Stack<16384> = Stack::new();
@@ -133,17 +135,25 @@ fn main(_: u64) -> u64 {
     let process = start.process.raw();
     // SAFETY: startup has exclusive ownership; both reserved message pages are unused.
     if unsafe { shared::init(&start.process, files) }.is_err()
+        || !wire::before_heap()
         || unsafe { abi::allocation::init(start.process) }.is_err()
     {
+        rt::println!(
+            "posix-shared-probe: startup failed stage {}",
+            ERROR.load(Ordering::Acquire)
+        );
         return 3;
     }
     #[cfg(feature = "input-probe")]
     let passed = tls::with_process(|| {
         let process = Handle::<rt::handle::Process>::borrowed(process);
-        input::run(&process, &start.thread) && shared::cleanup().is_ok()
+        wire::payload() && input::run(&process, &start.thread) && shared::cleanup().is_ok()
     });
     #[cfg(not(feature = "input-probe"))]
     let passed = tls::with_process(|| {
+        if !wire::payload() {
+            return false;
+        }
         let errno = unsafe { abi::__errno_location() };
         unsafe { *errno = EIO };
         let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };

@@ -11,9 +11,14 @@ description = "Initial C ABI and startup for the Rust stafeto POSIX layer"
 test = false
 bench = false
 
+[features]
+transport-probe = []
+
 [dependencies]
 posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }
 rt = { path = "../rt" }
 posix-heap = { path = "../posix-heap" }
 posix-order = { path = "../posix-order" }
+posix-request = { path = "../posix-request" }
+proto-wire = { path = "../../proto/wire" }

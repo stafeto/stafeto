@@ -1,0 +1,12 @@
+[package]
+name = "posix-request"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Validated value messages for the stafeto Rust POSIX file owner"
+
+[dependencies]
+proto-fs = { path = "../../proto/fs" }
+proto-wire = { path = "../../proto/wire" }
