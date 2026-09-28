@@ -118,6 +118,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "linked_list_allocator"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -128,6 +134,7 @@ name = "posix-abi"
 version = "0.1.0"
 dependencies = [
  "posix-fs",
+ "posix-heap",
  "posix-types",
  "rt",
 ]
@@ -171,6 +178,13 @@ dependencies = [
  "proto-fs",
  "proto-wire",
  "rt",
+]
+
+[[package]]
+name = "posix-heap"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator",
 ]
 
 [[package]]

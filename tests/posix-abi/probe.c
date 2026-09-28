@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -22,6 +23,7 @@ _Static_assert(offsetof(struct stat, st_atim) == 72, "stat timestamp offset");
 _Static_assert(sizeof(struct timespec) == 16, "timespec ABI");
 _Static_assert(sizeof(struct dirent) == STAFETO_DIRENT_SIZE, "dirent ABI");
 _Static_assert(offsetof(struct dirent, d_name) == 9, "dirent name offset");
+_Static_assert(_Alignof(max_align_t) == 16, "malloc fundamental alignment");
 
 static int same(const char *a, const char *b, size_t count) {
     for (size_t i = 0; i < count; i++) if (a[i] != b[i]) return 0;
@@ -120,6 +122,59 @@ static int directories(void) {
     return 0;
 }
 
+static int allocations(void) {
+    errno = 123;
+    unsigned char *p = malloc(37);
+    if (!p || (uintptr_t)p % _Alignof(max_align_t) || errno != 123) return 90;
+    for (size_t i = 0; i < 37; i++) p[i] = (unsigned char)(i + 1);
+    unsigned char *q = realloc(p, 127);
+    if (!q) return 91;
+    for (size_t i = 0; i < 37; i++) if (q[i] != i + 1) return 92;
+    p = realloc(q, 8);
+    if (!p || p != q) return 93;
+    if (realloc(p, SIZE_MAX) != NULL || errno != ENOMEM) return 94;
+    if (reallocarray(p, SIZE_MAX, 2) != NULL || errno != ENOMEM) return 95;
+    for (size_t i = 0; i < 8; i++) if (p[i] != i + 1) return 96;
+    errno = 456;
+    free(p); free(NULL);
+    if (errno != 456) return 97;
+    p = calloc(83, 5);
+    if (!p) return 98;
+    for (size_t i = 0; i < 415; i++) if (p[i]) return 99;
+    free(p);
+    if (calloc(SIZE_MAX, 2) != NULL || errno != ENOMEM) return 100;
+    p = malloc(0); q = malloc(0);
+    if (!p || !q || p == q) return 101;
+    free(p); free(q);
+    p = realloc(NULL, 19);
+    if (!p || (q = realloc(p, 0)) != p) return 102;
+    free(q);
+    p = aligned_alloc(256, 512);
+    if (!p || (uintptr_t)p % 256) return 103;
+    free(p);
+    if (aligned_alloc(3, 12) != NULL || errno != EINVAL
+            || aligned_alloc(256, 513) != NULL || errno != EINVAL) return 104;
+    void *out = (void *)17;
+    errno = 456;
+    if (posix_memalign(&out, 3, 128) != EINVAL || out != (void *)17 || errno != 456) return 105;
+    if (posix_memalign(&out, 4096, 300) || (uintptr_t)out % 4096 || errno != 456) return 106;
+    free(out); out = (void *)17;
+    if (posix_memalign(&out, 16, SIZE_MAX) != ENOMEM || out != (void *)17 || errno != 456) return 107;
+    p = calloc(70000, 1);
+    if (!p) return 108;
+    for (size_t i = 0; i < 70000; i++) if (p[i]) return 109;
+    free(p);
+    p = malloc(64);
+    if (!p) return 110;
+    p[0] = 77;
+    if (malloc(8 * 1024 * 1024) != NULL || errno != ENOMEM || p[0] != 77) return 111;
+    free(p);
+    p = malloc(64);
+    if (!p) return 112;
+    free(p);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -170,6 +225,8 @@ int main(int argc, char **argv) {
     if (metadata_result) return metadata_result;
     int directory_result = directories();
     if (directory_result) return directory_result;
+    int allocation_result = allocations();
+    if (allocation_result) return allocation_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

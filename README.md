@@ -202,6 +202,7 @@ checks for successful calls, failures, and ABI layout.
 | Initial Rust C ABI | Build ABI 1 headers, Rust startup and `libc.a`; boot a C main without Picolibc through both Cargo and standalone Clang linking; verify native-thread errno. | ✅ [#33](https://github.com/stafeto/stafeto/pull/33) |
 | Rust stat metadata | Export `stat`, `fstat` and `lstat` with a checked LP64 layout, stable RAM inode identity and timestamp updates; verify through Cargo and standalone C linking. | ✅ [#34](https://github.com/stafeto/stafeto/pull/34) |
 | Rust directory C ABI | Enumerate directories through owned descriptors with `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies; check inode identity, shared offsets and resource limits. | ✅ [#35](https://github.com/stafeto/stafeto/pull/35) |
+| Rust process allocation | Export malloc, calloc, realloc, reallocarray, free and aligned allocation over a shared process heap; verify overflow, quota failure, data preservation and cross-thread ownership. | ✅ [#36](https://github.com/stafeto/stafeto/pull/36) |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -218,7 +219,8 @@ with an empty environment;
 allocation, stdio, general ELF TLS and the remaining headers are pending.
 See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
-[notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) for the boundary.
+[notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) and
+[notes/m2-rust-posix-heap.md](notes/m2-rust-posix-heap.md) for the boundary.
 File timestamps currently use the platform counter; epoch time, symbolic
 links, credential checks and terminal-owned metadata remain pending.
 
@@ -251,7 +253,7 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask rtbench` | runs fixed-duration RTOS primitive and timer-wakeup workloads three times on QEMU TCG, and also HVF and VZ on Apple Silicon; `--repeats 1` is a quick smoke run |
 | `cargo xtask ext4ro` | boots a QEMU guest that reads a checked-in ext4 image created by e2fsprogs; no block driver is involved yet |
 | `cargo xtask ramfs` | boots a RAM file service and checks file descriptors, reads, writes, seeks, sizes, and standard output in QEMU |
-| `cargo xtask posix-abi` | boots C file-ABI probes linked with Rust startup through Cargo and standalone Clang, then checks errno isolation on native guest threads; no Picolibc |
+| `cargo xtask posix-abi` | boots C file and allocation ABI probes linked with Rust startup through Cargo and standalone Clang, then checks errno isolation and shared allocation on native guest threads; no Picolibc |
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |
@@ -286,3 +288,7 @@ into the BusyBox binary. Other programs can use a GPL-compatible Rust C ABI
 library directly. See the [BusyBox license](https://busybox.net/license.html).
 The [FSF compatibility table](https://www.gnu.org/licenses/gpl-faq.en.html)
 explains the linking restriction. `cargo xtask ci` checks this dependency boundary.
+It also checks the GPL-3.0-or-later package declarations and SPDX identifiers
+in every Rust POSIX source module and C header. The generated Rust POSIX
+sysroot includes the GPL license text as `LICENSE`. Third-party dependencies
+retain their own licenses.

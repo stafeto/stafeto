@@ -45,7 +45,8 @@ header deliberately fails the C static assertion; restoring it passes.
 These checks follow the thread isolation requirement in
 [POSIX.1-2024 section 2.3](https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html).
 
-This sysroot is an initial, experimental subset. Allocation, stdio,
+This sysroot is an initial, experimental subset. Process allocation is
+available through [the heap milestone](m2-rust-posix-heap.md). Stdio,
 remaining headers, environment inheritance,
 ELF TLS templates, constructor/destructor startup, signal handling, and
 multi-thread process file state still require implementation. File scopes

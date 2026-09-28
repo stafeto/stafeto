@@ -40,7 +40,8 @@ The private thread block grows to 48 bytes for the registry pointer while
 errno remains at offset 16. with_errno requires no directory storage.
 Returning from with_files attempts to close remaining owned streams;
 ordinary duplicated descriptors survive. Full shared multi-thread process
-state and general allocation are later library-foundation work.
+state remains later library-foundation work. Process allocation is now
+available as described in [m2-rust-posix-heap.md](m2-rust-posix-heap.md).
 
 The fixed namespace uses entry indices as opaque position cookies. telldir
 reads the service position; seekdir restores it and rewinddir resets it.
