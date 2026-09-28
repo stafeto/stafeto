@@ -638,6 +638,67 @@ static int specifics(void) {
     return 0;
 }
 
+
+_Static_assert(sizeof(pthread_once_t) == 8, "once control ABI");
+_Static_assert(_Alignof(pthread_once_t) == 8, "once control alignment");
+static pthread_once_t basic_once = PTHREAD_ONCE_INIT;
+static pthread_once_t inner_once = PTHREAD_ONCE_INIT;
+static pthread_once_t pending_once = PTHREAD_ONCE_INIT;
+static pthread_once_t exited_once = PTHREAD_ONCE_INIT;
+static int once_calls, inner_calls, pending_calls, exit_calls, once_errors, many_calls;
+static pthread_once_t many_once[129] = { PTHREAD_ONCE_INIT };
+static void initialize_many(void) { many_calls++; }
+static void initialize_inner(void) { inner_calls++; }
+static void initialize_basic(void) {
+    once_calls++;
+    if (pthread_once(&inner_once, initialize_inner)) once_errors++;
+    pthread_key_t key;
+    if (pthread_key_create(&key, NULL) || pthread_setspecific(key, &once_calls)
+            || pthread_getspecific(key) != &once_calls || pthread_key_delete(key)) once_errors++;
+    void *block = malloc(64);
+    if (!block) once_errors++;
+    free(block);
+}
+static void initialize_pending(void) { pending_calls++; }
+static void initialize_exit(void) {
+    exit_calls++;
+    pthread_exit(&exit_calls);
+}
+static void initialize_retry(void) { exit_calls++; }
+static void *once_pending_thread(void *argument) {
+    if (pthread_cancel(pthread_self()) || pthread_once(&pending_once, initialize_pending)
+            || pending_calls != 1 || errno != 0) once_errors++;
+    /* A pending request survives both initialization and the completed fast path. */
+    if (pthread_once(&pending_once, initialize_pending)) once_errors++;
+    pthread_testcancel();
+    return argument;
+}
+static void *once_exit_thread(void *argument) {
+    (void)argument;
+    pthread_once(&exited_once, initialize_exit);
+    return NULL;
+}
+static int once_initialization(void) {
+    errno = 123;
+    if (pthread_once(&basic_once, initialize_basic) || pthread_once(&basic_once, initialize_basic)
+            || pthread_once(&inner_once, initialize_inner) || once_calls != 1 || inner_calls != 1
+            || once_errors || errno != 123) return 240;
+    for (unsigned i = 0; i < 129; i++) {
+        if (pthread_once(&many_once[i], initialize_many)
+                || pthread_once(&many_once[i], initialize_many)) return 243;
+    }
+    if (many_calls != 129) return 243;
+    pthread_t thread;
+    void *value = NULL;
+    if (pthread_create(&thread, NULL, once_pending_thread, NULL) || pthread_join(thread, &value)
+            || value != PTHREAD_CANCELED || once_errors || pending_calls != 1
+            || pthread_once(&pending_once, initialize_pending) || pending_calls != 1) return 241;
+    if (pthread_create(&thread, NULL, once_exit_thread, NULL) || pthread_join(thread, &value)
+            || value != &exit_calls || exit_calls != 1
+            || pthread_once(&exited_once, initialize_retry) || exit_calls != 2 || errno != 123) return 242;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -694,6 +755,8 @@ int main(int argc, char **argv) {
     if (cancellation_result) return cancellation_result;
     int specific_result = specifics();
     if (specific_result) return specific_result;
+    int once_result = once_initialization();
+    if (once_result) return once_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();

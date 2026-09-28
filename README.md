@@ -212,6 +212,8 @@ checks for successful calls, failures, and ABI layout.
 | Rust pthread lifecycle | Create, join, detach and exit native threads with independent errno, inherited FP state, owned stacks and retry-safe results; verify interrupted waits and last-thread process exit. | ✅ [#43](https://github.com/stafeto/stafeto/pull/43) |
 | Rust deferred cancellation | Cancel read, write and join with disabled/pending state, LIFO handlers, acknowledged console cleanup and retained join results; verify the pre-IPC wake race on QEMU and Apple VZ. | ✅ [#44](https://github.com/stafeto/stafeto/pull/44) |
 | Rust thread-specific data | Provide pthread keys with isolated bindings, safe key/thread slot reuse, and four destructor passes after cleanup; verify interrupted replies and join ordering on QEMU and Apple VZ. | ✅ [#45](https://github.com/stafeto/stafeto/pull/45) |
+| Rust once initialization | Serialize one initializer per control, block contenders through IPC, publish application writes, and retry after cancellation/exit; verify nested recovery and interrupted replies on QEMU and Apple VZ. | ✅ [#46](https://github.com/stafeto/stafeto/pull/46) |
+| Rust thread synchronization and limits | Add mutexes, conditions, read/write locks, barriers and semaphores; complete required thread capacity and attributes, with guest contention, ownership and cancellation checks. The current managed-thread limit is 32. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
@@ -241,7 +243,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-messages.md](notes/m2-rust-posix-messages.md) and
 [notes/m2-rust-posix-threads.md](notes/m2-rust-posix-threads.md) and
 [notes/m2-rust-posix-deferred-cancel.md](notes/m2-rust-posix-deferred-cancel.md) and
-[notes/m2-rust-posix-thread-data.md](notes/m2-rust-posix-thread-data.md)
+[notes/m2-rust-posix-thread-data.md](notes/m2-rust-posix-thread-data.md) and
+[notes/m2-rust-posix-once.md](notes/m2-rust-posix-once.md)
 for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery
