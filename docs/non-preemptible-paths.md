@@ -3,7 +3,9 @@
 Interrupts are masked inside the kernel (spec 8.1), so each path below
 entirely counts toward the blocking time of any thread, even the
 highest-priority one. Resource bounds below include the 128-thread and
-128-mapping limits added for the Rust POSIX 64-thread capacity. Existing
+128-mapping limits added for the Rust POSIX 64-thread capacity. Current
+measurements and their limits are in
+[notes/m2-rust-posix-thread-capacity.md](../notes/m2-rust-posix-thread-capacity.md). Existing
 cycle figures remain historical measurements; the capacity note records
 the new kernel measurements. The table collects such paths with a work estimate
 for response-time analysis (spec 15.3). A path whose work grows with the

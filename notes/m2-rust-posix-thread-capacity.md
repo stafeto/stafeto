@@ -77,6 +77,17 @@ Three deliberate mutations were rejected at guest stage 81: the old
 pthread registry admitted only 31 live children, the old native-thread
 limit only 60, and the old mapping limit only 60. Sources were restored.
 
+## Measurements
+
+Full CI on e5a86ff passed: init 221, kernel 165, icount 176.
+The shipping kernel is 150608 bytes; C ABI and thread boot images are 303104.
+On 512M/2G, stopping 128 ready threads costs 17965/17965 icount ticks;
+first_map at the enlarged limits costs 16578/14490, unmap 3355/3355.
+The printed field is stop_threads with threads=128, replacing stop_64.
+These measured paths remain below the historical 20069-tick buffer case.
+They do not establish a fresh B: 128 last-session senders, mapping-table
+release and physical worst-case timing require further measurement.
+
 ## Remaining interfaces
 
 This capacity step does not complete POSIX thread synchronization.
