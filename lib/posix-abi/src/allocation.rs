@@ -9,7 +9,7 @@ use crate::{constants::*, fail};
 use core::{
     cell::UnsafeCell,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use posix_heap::{Allocator, Error, FUNDAMENTAL_ALIGNMENT};
 use rt::{
@@ -27,6 +27,19 @@ const ALLOC: u64 = 1;
 const REALLOC: u64 = 2;
 const FREE: u64 = 3;
 const ZERO: u64 = 4;
+const ACK: u64 = 5;
+mod replies;
+static NEXT: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "transport-probe")]
+static UPCALL_OPS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static NATIVE_TARGET: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static ACK_TARGET: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static ACK_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static REJECT_NEW: AtomicBool = AtomicBool::new(false);
 
 struct Config {
     process: Handle<Process>,
@@ -171,6 +184,7 @@ fn perform(heap: &mut Allocator, words: [u64; 8]) -> Result<usize, Error> {
 extern "C" fn worker(_: u64) -> ! {
     assert!(READY.load(Ordering::Acquire), "published heap owner");
     let mut heap = Allocator::new();
+    let mut journal = replies::Journal::new();
     loop {
         let Ok(sys::Received::Message {
             len,
@@ -183,15 +197,59 @@ extern "C" fn worker(_: u64) -> ! {
             continue;
         };
         drop(handles);
-        let result = if len == 32 {
-            perform(&mut heap, words)
+        #[cfg(feature = "transport-probe")]
+        if len == 40 && words[0] == 6 {
+            let (used, committed) = journal.stats();
+            let mut bytes = [0; 32];
+            for (i, value) in [used, committed, heap.used(), heap.committed()]
+                .iter()
+                .enumerate()
+            {
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&(*value as u64).to_le_bytes());
+            }
+            let _ = token.reply(&bytes);
+            continue;
+        }
+        let nonce = words[4];
+        let args = [words[0], words[1], words[2], words[3]];
+        let (status, value) = if len != 40 || nonce == 0 {
+            (EINVAL, 0)
+        } else if words[0] == ACK {
+            journal.ack(nonce);
+            #[cfg(feature = "transport-probe")]
+            {
+                let target = ACK_TARGET.swap(0, Ordering::AcqRel);
+                if target != 0 {
+                    let native = Handle::borrowed(rt::abi::Handle(target));
+                    sys::thread_interrupt(&native).expect("heap ACK caller");
+                    ACK_INTERRUPTS.fetch_add(1, Ordering::Release);
+                }
+            }
+            (0, 0)
+        } else if let Some(answer) = journal.ready(nonce, args) {
+            answer
         } else {
-            Err(Error::InvalidAlignment)
-        };
-        let (status, value) = match result {
-            Ok(value) => (0, value),
-            Err(Error::NoMemory) => (ENOMEM, 0),
-            Err(Error::InvalidAlignment) => (EINVAL, 0),
+            match journal.reserve(nonce, args) {
+                Err(code) => (code, 0),
+                Ok(record) => {
+                    let answer = match perform(&mut heap, words) {
+                        Ok(value) => (0, value),
+                        Err(Error::NoMemory) => (ENOMEM, 0),
+                        Err(Error::InvalidAlignment) => (EINVAL, 0),
+                    };
+                    journal.complete(record, answer);
+                    #[cfg(feature = "transport-probe")]
+                    if UPCALL_OPS.fetch_and(!(1 << words[0]), Ordering::AcqRel) & (1 << words[0])
+                        != 0
+                    {
+                        let native = Handle::borrowed(rt::abi::Handle(
+                            NATIVE_TARGET.load(Ordering::Acquire),
+                        ));
+                        sys::thread_upcall_request(&native).expect("heap caller after commit");
+                    }
+                    answer
+                }
+            }
         };
         let mut reply = [0; 16];
         reply[..8].copy_from_slice(&(status as u64).to_le_bytes());
@@ -204,21 +262,82 @@ fn request(op: u64, size: usize, alignment: usize, pointer: *mut u8) -> Result<*
     if !READY.load(Ordering::Acquire) {
         return Err(ENOMEM);
     }
-    let mut bytes = [0; 32];
-    for (index, word) in [op, size as u64, alignment as u64, pointer as u64]
-        .iter()
-        .enumerate()
-    {
-        bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    let reply = sys::send(&config().channel, &bytes).map_err(|_| ENOMEM)?;
-    if reply.len != 16 {
+    let nonce = NEXT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| ENOMEM)?;
+    let bytes = packet([op, size as u64, alignment as u64, pointer as u64, nonce]);
+    let result = call(&bytes)?;
+    let answer = if result.0 == 0 {
+        Ok(result.1 as *mut u8)
+    } else {
+        Err(result.0)
+    };
+    let ack = call(&packet([ACK, 0, 0, 0, nonce]))?;
+    if ack != (0, 0) {
         return Err(ENOMEM);
     }
-    if reply.words[0] != 0 {
-        return Err(reply.words[0] as i32);
+    answer
+}
+fn packet(words: [u64; 5]) -> [u8; 40] {
+    let mut bytes = [0; 40];
+    for (i, word) in words.iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
     }
-    Ok(reply.words[1] as *mut u8)
+    bytes
+}
+fn call(bytes: &[u8; 40]) -> Result<(i32, usize), i32> {
+    loop {
+        let reply = match sys::send(&config().channel, bytes) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            result => result.map_err(|_| ENOMEM)?,
+        };
+        if reply.len != 16 || !reply.handles.is_empty() {
+            return Err(ENOMEM);
+        }
+        return Ok((reply.words[0] as i32, reply.words[1] as usize));
+    }
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_upcall(thread: &Handle<rt::handle::Thread>, op: u64) {
+    assert!((ALLOC..=ZERO).contains(&op));
+    NATIVE_TARGET.store(thread.raw().0, Ordering::Release);
+    UPCALL_OPS.fetch_or(1 << op, Ordering::Release);
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_ack_interrupt(thread: &Handle<rt::handle::Thread>) {
+    ACK_TARGET.store(thread.raw().0, Ordering::Release);
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_ack_interrupts() -> u64 {
+    ACK_INTERRUPTS.load(Ordering::Acquire)
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_reject_new(reject: bool) {
+    REJECT_NEW.store(reject, Ordering::Release);
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_call(args: [u64; 4], nonce: u64) -> Result<(i32, usize), i32> {
+    call(&packet([args[0], args[1], args[2], args[3], nonce]))
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_ack(nonce: u64) -> Result<(i32, usize), i32> {
+    call(&packet([ACK, 0, 0, 0, nonce]))
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_stats() -> (u64, u64, u64, u64) {
+    loop {
+        let reply = match sys::send(&config().channel, &packet([6, 0, 0, 0, 0])) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            result => result.expect("heap diagnostic query"),
+        };
+        assert_eq!(reply.len, 32);
+        return (
+            reply.words[0],
+            reply.words[1],
+            reply.words[2],
+            reply.words[3],
+        );
+    }
 }
 
 fn returned(result: Result<*mut u8, i32>) -> *mut u8 {
