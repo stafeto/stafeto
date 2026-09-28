@@ -26,7 +26,7 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let Ok(mut files) = PosixFs::connect(&start.parent) else {
+    let Ok(files) = PosixFs::connect(&start.parent) else {
         rt::println!("POSIX startup: file connection failed");
         return 125;
     };
@@ -64,12 +64,17 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
     let mut environment = [ptr::null_mut(); 1];
     // SAFETY: startup runs once, before C. This empty vector lives until main returns.
     unsafe { environ = environment.as_mut_ptr() };
+    // SAFETY: only startup owns file initialization and the message range is unused.
+    if unsafe { posix_abi::shared::init(&start.process, files) }.is_err() {
+        rt::println!("POSIX startup: file worker failed");
+        return 125;
+    }
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     if unsafe { posix_abi::allocation::init(start.process) }.is_err() {
         rt::println!("POSIX startup: heap worker failed");
         return 125;
     }
-    posix_abi::tls::with_files(&mut files, || {
+    posix_abi::tls::with_process(|| {
         // SAFETY: argv has count live C strings and a NULL sentinel; main is linked by C.
         let status = unsafe { main(count as c_int, arguments.as_mut_ptr()) };
         (status & 255) as u64

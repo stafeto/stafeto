@@ -9,7 +9,7 @@
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
-pub use proto_fs::{DIRECTORY_ONLY, NodeInfo, SeekFrom};
+pub use proto_fs::{DIRECTORY_ONLY, MAX_READ, NodeInfo, SeekFrom};
 use proto_wire::Status;
 use rt::Handle;
 use rt::fs::Files;
@@ -135,7 +135,8 @@ fn release(files: &Files, backend: Backend) -> Result<(), DescriptorError> {
 
 /// One process's file state, mutated by one owner. Duplication keeps the same
 /// service descriptor, hence the same offset and file access mode. Process
-/// transfer and concurrent access will require service-owned session sharing.
+/// transfer requires service-owned session sharing. The shared C ABI worker
+/// serializes calls from threads of the same process.
 pub struct PosixFs {
     files: Files,
     paths: PathState,

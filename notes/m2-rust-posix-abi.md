@@ -49,9 +49,9 @@ This sysroot is an initial, experimental subset. Process allocation is
 available through [the heap milestone](m2-rust-posix-heap.md). Stdio,
 remaining headers, environment inheritance,
 ELF TLS templates, constructor/destructor startup, signal handling, and
-multi-thread process file state still require implementation. File scopes
-borrow a PosixFs exclusively; a second thread can initialize its own errno
-but sharing process descriptors needs the separate POSIX service. BusyBox
+complete blocking-I/O and cancellation handling still require implementation.
+Local file scopes borrow a PosixFs exclusively; process scopes now use
+[the shared file owner](m2-rust-posix-shared.md). BusyBox
 continues to use the MIT bridge; this GPL library stays out of its link graph.
 
 Stat structures and metadata are added by [the next milestone](m2-rust-posix-stat.md).

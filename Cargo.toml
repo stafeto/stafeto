@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["apps/shell", "kcore", "kernel", "lib/abi", "lib/bootimg", "lib/ext4ro", "lib/posix", "lib/posix-abi", "lib/posix-crt", "lib/posix-fd", "lib/posix-heap", "lib/posix-order", "lib/posix-types", "lib/posix-fs", "lib/posix-path", "lib/rt", "proto/fs", "proto/init", "proto/uart", "proto/wire", "services/init", "services/ramfs", "services/uart", "tests/busybox", "tests/child", "tests/cprobe", "tests/posix-abi", "tests/posix-tls", "tests/ext4ro", "tests/init", "tests/ramfs", "tests/rtbench", "tests/svc", "xtask"]
+members = ["apps/shell", "kcore", "kernel", "lib/abi", "lib/bootimg", "lib/ext4ro", "lib/posix", "lib/posix-abi", "lib/posix-crt", "lib/posix-fd", "lib/posix-heap", "lib/posix-order", "lib/posix-types", "lib/posix-fs", "lib/posix-path", "lib/rt", "proto/fs", "proto/init", "proto/uart", "proto/wire", "services/init", "services/ramfs", "services/uart", "tests/busybox", "tests/child", "tests/cprobe", "tests/posix-abi", "tests/posix-tls", "tests/posix-shared", "tests/ext4ro", "tests/init", "tests/ramfs", "tests/rtbench", "tests/svc", "xtask"]
 default-members = ["kcore", "lib/abi", "lib/bootimg", "lib/ext4ro", "lib/posix-path", "lib/posix-fd", "lib/posix-heap", "lib/posix-order", "lib/posix-types", "proto/fs", "proto/init", "proto/uart", "proto/wire", "xtask"]
 
 [workspace.package]

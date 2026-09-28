@@ -3,9 +3,10 @@
 
 //! Directory streams backed by real process descriptors. The initial ABI
 //! scope reserves OPEN_MAX stable stream objects; its single owner serializes
-//! calls. Sharing streams between threads requires shared process state.
+//! calls. Process scopes route calls to the shared owner. Callers still serialize
+//! reads and closure of the same stream while using its escaped entry buffer.
 
-use crate::{constants::*, error, fail, fd, path, tls};
+use crate::{constants::*, error, fail, fd, path};
 use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int};
 use core::ptr;
@@ -90,14 +91,10 @@ impl Streams {
     }
 }
 
-fn context<T>(run: impl FnOnce(&Streams, &mut PosixFs) -> Result<T, c_int>) -> Result<T, c_int> {
-    let streams = tls::directories();
-    let files = tls::files();
-    if streams.is_null() || files.is_null() {
-        return Err(ENOSYS);
-    }
-    // SAFETY: with_files uniquely borrows files and owns a disjoint live registry.
-    run(unsafe { &*streams }, unsafe { &mut *files })
+fn context<T: Send>(
+    run: impl FnOnce(&Streams, &mut PosixFs) -> Result<T, c_int> + Send,
+) -> Result<T, c_int> {
+    crate::shared::context(run)
 }
 
 /// # Safety
@@ -108,13 +105,15 @@ pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut Stream {
         context(|streams, files| {
             let index = streams.vacant()?;
             let directory = files.opendir(path).map_err(error)?;
-            Ok(streams.install(index, directory))
+            Ok(streams.install(index, directory) as usize)
         })
     });
-    result.unwrap_or_else(|code| {
-        fail(code);
-        ptr::null_mut()
-    })
+    result
+        .map(|address| address as *mut Stream)
+        .unwrap_or_else(|code| {
+            fail(code);
+            ptr::null_mut()
+        })
 }
 
 /// # Safety
@@ -135,13 +134,15 @@ pub unsafe extern "C" fn fdopendir(number: c_int) -> *mut Stream {
                 return Err(EINVAL);
             }
             let directory = files.fdopendir(fd).map_err(error)?;
-            Ok(streams.install(index, directory))
+            Ok(streams.install(index, directory) as usize)
         })
     });
-    result.unwrap_or_else(|code| {
-        fail(code);
-        ptr::null_mut()
-    })
+    result
+        .map(|address| address as *mut Stream)
+        .unwrap_or_else(|code| {
+            fail(code);
+            ptr::null_mut()
+        })
 }
 
 /// # Safety
@@ -156,8 +157,9 @@ pub unsafe extern "C" fn readdir(pointer: *mut Stream) -> *mut Dirent {
 }
 
 pub(crate) fn read_entry(pointer: *mut Stream) -> Result<*mut Dirent, c_int> {
+    let address = pointer as usize;
     context(|streams, files| {
-        let pointer = streams.slot(pointer)?;
+        let pointer = streams.slot(address as *mut Stream)?;
         // SAFETY: this call uniquely accesses this stream; other buffers stay untouched.
         let slot = unsafe { &mut *pointer };
         let entry = files
@@ -167,7 +169,7 @@ pub(crate) fn read_entry(pointer: *mut Stream) -> Result<*mut Dirent, c_int> {
             )
             .map_err(error)?;
         let Some(entry) = entry else {
-            return Ok(ptr::null_mut());
+            return Ok(0usize);
         };
         slot.entry.d_ino = entry.inode;
         slot.entry.d_type = match entry.kind {
@@ -176,8 +178,9 @@ pub(crate) fn read_entry(pointer: *mut Stream) -> Result<*mut Dirent, c_int> {
             FileKind::Character => DT_CHR,
         } as u8;
         slot.entry.d_name[entry.name_len] = 0;
-        Ok(&mut slot.entry as *mut Dirent)
+        Ok(&mut slot.entry as *mut Dirent as usize)
     })
+    .map(|address| address as *mut Dirent)
 }
 
 /// # Safety
@@ -185,8 +188,9 @@ pub(crate) fn read_entry(pointer: *mut Stream) -> Result<*mut Dirent, c_int> {
 /// the stream and closes its descriptor; duplicates keep their shared backend.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn closedir(pointer: *mut Stream) -> c_int {
+    let address = pointer as usize;
     context(|streams, files| {
-        let pointer = streams.slot(pointer)?;
+        let pointer = streams.slot(address as *mut Stream)?;
         // SAFETY: this call uniquely accesses this stream; other buffers stay untouched.
         let slot = unsafe { &mut *pointer };
         files
@@ -202,7 +206,8 @@ pub unsafe extern "C" fn closedir(pointer: *mut Stream) -> c_int {
 /// pointer is a live stream in this thread's file scope.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dirfd(pointer: *mut Stream) -> c_int {
-    context(|streams, _| Ok(streams.directory(pointer)?.descriptor()))
+    let address = pointer as usize;
+    context(|streams, _| Ok(streams.directory(address as *mut Stream)?.descriptor()))
         .map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
 }
 
@@ -210,9 +215,10 @@ pub unsafe extern "C" fn dirfd(pointer: *mut Stream) -> c_int {
 /// pointer is a live stream in this thread's file scope.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn telldir(pointer: *mut Stream) -> i64 {
+    let address = pointer as usize;
     context(|streams, files| {
         files
-            .directory_position(streams.directory(pointer)?)
+            .directory_position(streams.directory(address as *mut Stream)?)
             .map_err(error)
     })
     .unwrap_or_else(fail)
@@ -223,9 +229,10 @@ pub unsafe extern "C" fn telldir(pointer: *mut Stream) -> i64 {
 /// since its most recent rewinddir. The current fixed namespace uses indices.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn seekdir(pointer: *mut Stream, position: i64) {
+    let address = pointer as usize;
     if let Err(code) = context(|streams, files| {
         files
-            .seekdir(streams.directory(pointer)?, position)
+            .seekdir(streams.directory(address as *mut Stream)?, position)
             .map_err(error)
     }) {
         fail(code);
@@ -236,9 +243,12 @@ pub unsafe extern "C" fn seekdir(pointer: *mut Stream, position: i64) {
 /// pointer is a live stream in this thread's file scope.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rewinddir(pointer: *mut Stream) {
-    if let Err(code) =
-        context(|streams, files| files.rewinddir(streams.directory(pointer)?).map_err(error))
-    {
+    let address = pointer as usize;
+    if let Err(code) = context(|streams, files| {
+        files
+            .rewinddir(streams.directory(address as *mut Stream)?)
+            .map_err(error)
+    }) {
         fail(code);
     }
 }

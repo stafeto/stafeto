@@ -14,6 +14,7 @@ pub mod locale;
 pub mod metadata;
 pub mod ordering;
 pub mod scan;
+pub mod shared;
 pub mod tls;
 
 use constants::*;
@@ -52,13 +53,8 @@ fn fail(code: c_int) -> i64 {
     -1
 }
 
-fn file<T>(run: impl FnOnce(&mut PosixFs) -> Result<T, FsError>) -> Result<T, c_int> {
-    let files = tls::files();
-    if files.is_null() {
-        return Err(ENOSYS);
-    }
-    // SAFETY: with_files exclusively borrows this context until C returns.
-    run(unsafe { &mut *files }).map_err(error)
+fn file<T: Send>(run: impl FnOnce(&mut PosixFs) -> Result<T, FsError> + Send) -> Result<T, c_int> {
+    shared::context(|_, files| run(files).map_err(error))
 }
 
 fn fd(fd: c_int) -> Result<u32, c_int> {
@@ -141,15 +137,24 @@ pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> i
         return fail(EFAULT) as isize;
     }
     let result = fd(number).and_then(|fd| {
-        let out = if count == 0 {
-            &mut []
-        } else {
-            // SAFETY: the caller promises this writable extent.
-            unsafe { core::slice::from_raw_parts_mut(buffer, count) }
-        };
-        file(|files| files.read(fd, out))
+        file(|files| {
+            let mut bytes = [0; posix_fs::MAX_READ];
+            let extent = count.min(bytes.len());
+            let length = files.read(fd, &mut bytes[..extent])?;
+            Ok((length, bytes))
+        })
     });
-    result.map_or_else(|code| fail(code) as isize, |n| n as isize)
+    result.map_or_else(
+        |code| fail(code) as isize,
+        |(length, bytes)| {
+            if length != 0 {
+                // SAFETY: the C caller supplies count bytes; the bounded result fits.
+                // Publish application-visible output on the calling thread.
+                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+            }
+            length as isize
+        },
+    )
 }
 
 /// # Safety

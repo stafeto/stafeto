@@ -3,7 +3,7 @@
 
 //! AArch64 thread state for the initial C ABI. The first two words are
 //! reserved for an eventual ELF TLS control block. General C TLS templates
-//! are not loaded yet. Each scope exclusively borrows its file context.
+//! are not loaded yet. A scope uses a local file owner or the shared process owner.
 
 use crate::directory::Streams;
 use core::arch::asm;
@@ -14,6 +14,7 @@ use posix_fs::PosixFs;
 struct Block {
     reserved: [usize; 2],
     errno: i32,
+    process_files: u32,
     files: *mut PosixFs,
     directories: *mut Streams,
 }
@@ -46,10 +47,16 @@ impl Drop for Restore {
     }
 }
 
-fn scope<R>(files: *mut PosixFs, directories: *mut Streams, run: impl FnOnce() -> R) -> R {
+fn scope<R>(
+    files: *mut PosixFs,
+    directories: *mut Streams,
+    process_files: bool,
+    run: impl FnOnce() -> R,
+) -> R {
     let mut block = Block {
         reserved: [0; 2],
         errno: 0,
+        process_files: u32::from(process_files),
         files,
         directories,
     };
@@ -63,17 +70,28 @@ fn scope<R>(files: *mut PosixFs, directories: *mut Streams, run: impl FnOnce() -
 
 /// Run C code with a file context exclusively borrowed on the current thread.
 /// The context is not inherited by other threads. Their errno can be initialized
-/// with `with_errno`; sharing process descriptors needs the POSIX service.
+/// with `with_errno`; `with_process` uses the initialized shared process owner.
 pub fn with_files<R>(files: &mut PosixFs, run: impl FnOnce() -> R) -> R {
     let mut directories = Streams::new();
-    let result = scope(files, &mut directories, run);
+    let result = scope(files, &mut directories, false, run);
     directories.close_all(files);
     result
 }
 
 /// Give the current thread its own errno without a file context.
 pub fn with_errno<R>(run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), ptr::null_mut(), run)
+    scope(ptr::null_mut(), ptr::null_mut(), false, run)
+}
+
+/// Give this thread its own errno while using the initialized process file owner.
+/// Leaving this scope leaves the process's descriptors and streams live.
+pub fn with_process<R>(run: impl FnOnce() -> R) -> R {
+    scope(ptr::null_mut(), ptr::null_mut(), true, run)
+}
+
+pub(crate) fn process_files() -> bool {
+    // SAFETY: each ABI call has a live current-thread scope.
+    unsafe { (*block()).process_files != 0 }
 }
 
 fn block() -> *mut Block {
