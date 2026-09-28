@@ -42,6 +42,8 @@ mod sleep;
 #[cfg(not(feature = "cancel-input"))]
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
+mod thread_replies;
+#[cfg(not(feature = "cancel-input"))]
 mod timed;
 #[cfg(not(feature = "cancel-input"))]
 mod upcall;
@@ -266,6 +268,7 @@ fn run(clocks: &clocks::Peers) -> bool {
         || !upcall::run()
         || !reentry::run()
         || !file_replies::run()
+        || !thread_replies::run()
         || !cancellation::run()
     {
         return false;

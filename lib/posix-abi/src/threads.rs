@@ -8,6 +8,7 @@
 pub mod cancel;
 pub mod mutex;
 pub mod once;
+mod replies;
 pub mod sleep;
 pub mod specific;
 
@@ -36,6 +37,7 @@ const JOIN_ACK: u64 = 4;
 const DETACH: u64 = 5;
 const CANCEL: u64 = 7;
 const JOIN_ABANDON: u64 = 8;
+const REPLY_ACK: u64 = 28;
 const ATTR_MAGIC: u64 = 0x5054_4852_4154_5431;
 
 type Start = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
@@ -102,6 +104,12 @@ static OWNER_NATIVE: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
 static OWNER_PARKED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "transport-probe")]
 static WAKE_RETRIES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static UPCALL_REPLIES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static ACK_TARGET: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static ACK_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 struct Launch {
@@ -208,6 +216,24 @@ struct Waiting {
     nonce: u64,
     token: Option<sys::Token>,
 }
+#[derive(Clone, Copy)]
+struct Recovery {
+    nonce: u64,
+    answer: Option<Cached>,
+}
+fn recovery_slot(op: u64) -> Option<usize> {
+    match op {
+        EXIT => Some(0),
+        specific::TAKE => Some(1),
+        once::RESET => Some(2),
+        mutex::UNLOCK => Some(3),
+        JOIN_ABANDON => Some(4),
+        sleep::ABANDON => Some(5),
+        specific::GET => Some(6),
+        specific::DELETE => Some(7),
+        _ => None,
+    }
+}
 struct Entry {
     id: u64,
     native: Option<Handle<Thread>>,
@@ -216,11 +242,11 @@ struct Entry {
     detached: bool,
     value: u64,
     waiting: Option<Waiting>,
-    cached: Option<Cached>,
     woken_epoch: u64,
     once_waiting: Option<once::Waiting>,
     mutex_waiting: Option<mutex::Waiting>,
     sleep_waiting: Option<sleep::Waiting>,
+    recovery: [Option<Recovery>; 8],
 }
 impl Entry {
     fn new(
@@ -237,11 +263,11 @@ impl Entry {
             detached,
             value: 0,
             waiting: None,
-            cached: None,
             woken_epoch: 0,
             once_waiting: None,
             mutex_waiting: None,
             sleep_waiting: None,
+            recovery: [None; 8],
         }
     }
 }
@@ -249,7 +275,22 @@ struct Registry {
     entries: [Option<Entry>; CAPACITY],
     next_id: u64,
     specific: specific::Registry,
+    replies: replies::Journal,
+    #[cfg(feature = "transport-probe")]
+    parked_reply: Option<(u64, u64, u64)>,
 }
+struct OwnerRegistry(UnsafeCell<Registry>);
+// SAFETY: only the single successfully started owner borrows this registry.
+// Startup is exclusive, and the owner never binds native handlers or returns.
+unsafe impl Sync for OwnerRegistry {}
+static REGISTRY: OwnerRegistry = OwnerRegistry(UnsafeCell::new(Registry {
+    entries: [const { None }; CAPACITY],
+    next_id: 2,
+    specific: specific::Registry::new(),
+    replies: replies::Journal::new(),
+    #[cfg(feature = "transport-probe")]
+    parked_reply: None,
+}));
 impl Registry {
     fn find(&self, id: u64) -> Result<usize, i32> {
         self.entries
@@ -262,6 +303,41 @@ impl Registry {
     }
     fn entry_mut(&mut self, index: usize) -> &mut Entry {
         self.entries[index].as_mut().expect("live entry")
+    }
+    fn ready(&self, caller: usize, nonce: u64) -> Option<Cached> {
+        self.entry(caller)
+            .recovery
+            .iter()
+            .flatten()
+            .find(|record| record.nonce == nonce)
+            .and_then(|record| record.answer)
+            .or_else(|| self.replies.ready(self.entry(caller).id, nonce))
+    }
+    fn reserve(&mut self, caller: usize, nonce: u64, op: u64) -> Result<(), ()> {
+        if let Some(slot) = recovery_slot(op) {
+            let recovery = &mut self.entry_mut(caller).recovery[slot];
+            if recovery.is_none() {
+                *recovery = Some(Recovery {
+                    nonce,
+                    answer: None,
+                });
+                return Ok(());
+            }
+            if recovery.is_some_and(|record| record.nonce == nonce) {
+                return Ok(());
+            }
+        }
+        // Nested requests never overwrite a reserved recovery result; they
+        // use the dynamic journal, retaining the normal resource failure path.
+        self.replies.reserve(self.entry(caller).id, nonce)
+    }
+    fn acknowledge(&mut self, caller: usize, nonce: u64) {
+        for slot in &mut self.entry_mut(caller).recovery {
+            if slot.is_some_and(|record| record.nonce == nonce) {
+                *slot = None;
+            }
+        }
+        self.replies.ack(self.entry(caller).id, nonce);
     }
     fn cache(&mut self, caller: usize, nonce: u64, result: Result<u64, i32>, _op: u64) -> Cached {
         self.cache_pair(caller, nonce, result.map(|value| (value, 0)), _op)
@@ -283,7 +359,22 @@ impl Registry {
             value,
             extra,
         };
-        self.entry_mut(caller).cached = Some(answer);
+        if let Some(record) = self
+            .entry_mut(caller)
+            .recovery
+            .iter_mut()
+            .flatten()
+            .find(|record| record.nonce == nonce)
+        {
+            record.answer = Some(answer);
+        } else {
+            self.replies.complete(self.entry(caller).id, answer);
+        }
+        #[cfg(feature = "transport-probe")]
+        if _op < 64 && UPCALL_REPLIES.fetch_and(!(1 << _op), Ordering::AcqRel) & (1 << _op) != 0 {
+            sys::thread_upcall_request(self.entry(caller).native.as_ref().expect("probe caller"))
+                .expect("native handler after pthread commit");
+        }
         #[cfg(feature = "transport-probe")]
         if _op == JOIN && CANCEL_JOIN_REPLY.swap(false, Ordering::AcqRel) {
             LAUNCH[caller].cancel.pending.store(true, Ordering::SeqCst);
@@ -408,6 +499,8 @@ impl Registry {
             }
             entry.native = None;
             entry.phase = Phase::Ended;
+            entry.recovery.fill(None);
+            self.replies.forget(entry.id);
             if entry.detached {
                 self.entries[index] = None;
             }
@@ -522,6 +615,8 @@ impl Registry {
                 }
                 let entry = self.entry_mut(caller);
                 entry.sleep_waiting = None;
+                entry.once_waiting = None;
+                entry.mutex_waiting = None;
                 entry.phase = Phase::Exiting;
                 entry.value = words[3];
                 // Application threads determine process lifetime; internal owners remain live.
@@ -596,6 +691,28 @@ impl Registry {
             _ => Err(EINVAL),
         }
     }
+
+    fn abandon_reply(&mut self, caller: usize, nonce: u64) {
+        let id = self.entry(caller).id;
+        let entry = self.entry_mut(caller);
+        if entry
+            .sleep_waiting
+            .as_ref()
+            .is_some_and(|w| w.nonce == nonce)
+        {
+            entry.sleep_waiting = None;
+        }
+        // JOIN is the other request which can return before a terminal result.
+        for target in self.entries.iter_mut().flatten() {
+            if target
+                .waiting
+                .as_ref()
+                .is_some_and(|w| w.caller == id && w.nonce == nonce)
+            {
+                target.waiting = None;
+            }
+        }
+    }
 }
 
 fn respond(token: sys::Token, answer: Cached) {
@@ -609,11 +726,9 @@ fn respond(token: sys::Token, answer: Cached) {
 
 extern "C" fn owner(_: u64) -> ! {
     assert!(READY.load(Ordering::Acquire), "published thread owner");
-    let mut registry = Registry {
-        entries: core::array::from_fn(|_| None),
-        next_id: 2,
-        specific: specific::Registry::new(),
-    };
+    // SAFETY: this sole owner consumes the statically reserved table exactly once.
+    // Keeping it out of the stack avoids large initialization temporaries.
+    let registry = unsafe { &mut *REGISTRY.0.get() };
     // SAFETY: startup handed main exclusively to this owner.
     let main = unsafe { (*MAIN.0.get()).take().expect("initial main handle") };
     registry.entries[0] = Some(Entry::new(1, main, None, false));
@@ -684,19 +799,65 @@ extern "C" fn owner(_: u64) -> ! {
                 continue;
             }
         };
-        if let Some(answer) = registry
-            .entry(caller)
-            .cached
-            .filter(|c| c.nonce == words[2])
-        {
+        if words[0] == REPLY_ACK {
+            if words[3] != 0 {
+                registry.abandon_reply(caller, words[2]);
+            }
+            registry.acknowledge(caller, words[2]);
+            #[cfg(feature = "transport-probe")]
+            if ACK_TARGET
+                .compare_exchange(words[1], 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                sys::thread_interrupt(registry.entry(caller).native.as_ref().expect("ack caller"))
+                    .unwrap();
+                ACK_INTERRUPTS.fetch_add(1, Ordering::Release);
+            }
+            #[cfg(feature = "transport-probe")]
+            let parked = registry
+                .parked_reply
+                .filter(|(id, nonce, _)| *id == words[1] && *nonce == words[2]);
+            #[cfg(feature = "transport-probe")]
+            if parked.is_some() {
+                registry.parked_reply = None;
+            }
+            respond(
+                token,
+                Cached {
+                    nonce: words[2],
+                    status: 0,
+                    value: 0,
+                    extra: 0,
+                },
+            );
+            #[cfg(feature = "transport-probe")]
+            if let Some((_, _, gate)) = parked {
+                probe_park(&Handle::borrowed(rt::abi::Handle(gate)));
+            }
+            continue;
+        }
+        if let Some(answer) = registry.ready(caller, words[2]) {
             respond(token, answer);
-        } else if cfg!(feature = "transport-probe") && words[0] == 24 {
+            continue;
+        }
+        if registry.reserve(caller, words[2], words[0]).is_err() {
+            respond(
+                token,
+                Cached {
+                    nonce: words[2],
+                    status: if words[0] == CREATE { EAGAIN } else { ENOMEM },
+                    value: 0,
+                    extra: 0,
+                },
+            );
+            continue;
+        }
+        if cfg!(feature = "transport-probe") && words[0] == 24 {
             #[cfg(feature = "transport-probe")]
             {
-                let gate = Handle::<Channel>::borrowed(rt::abi::Handle(words[3]));
+                registry.parked_reply = Some((words[1], words[2], words[3]));
                 let answer = registry.cache(caller, words[2], Ok(0), words[0]);
                 respond(token, answer);
-                probe_park(&gate);
             }
         } else if words[0] == once::BEGIN {
             registry.once_begin(caller, words, token);
@@ -780,16 +941,41 @@ fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
     }
     loop {
         match sys::send(channel(), &bytes) {
-            Err(Error::Interrupted) if op == sleep::BEGIN => return Err(EINTR),
-            Err(Error::Interrupted) if op == JOIN && cancel::requested() => return Err(ECANCELED),
+            Err(Error::Interrupted) if op == sleep::BEGIN => {
+                acknowledge(words[1], nonce, true)?;
+                return Err(EINTR);
+            }
+            Err(Error::Interrupted) if op == JOIN && cancel::requested() => {
+                acknowledge(words[1], nonce, true)?;
+                return Err(ECANCELED);
+            }
             Err(Error::Interrupted) => continue,
             Err(_) => return Err(EIO),
             Ok(reply) if reply.len == 24 => {
-                if reply.words[0] != 0 {
-                    return Err(reply.words[0] as i32);
+                let [status, value, extra] = [reply.words[0], reply.words[1], reply.words[2]];
+                acknowledge(words[1], nonce, false)?;
+                if status != 0 {
+                    return Err(status as i32);
                 }
-                return Ok((reply.words[1], reply.words[2]));
+                return Ok((value, extra));
             }
+            _ => return Err(EIO),
+        }
+    }
+}
+
+fn acknowledge(caller: u64, nonce: u64, abandon: bool) -> Result<(), i32> {
+    let mut bytes = [0; 64];
+    for (index, word) in [REPLY_ACK, caller, nonce, u64::from(abandon), 0, 0, 0, 0]
+        .iter()
+        .enumerate()
+    {
+        bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    loop {
+        match sys::send(channel(), &bytes) {
+            Err(Error::Interrupted) => continue,
+            Ok(reply) if reply.len == 24 && reply.words[0] == 0 => return Ok(()),
             _ => return Err(EIO),
         }
     }
@@ -1029,6 +1215,51 @@ pub fn probe_interrupt_replies(create: bool, join: bool, acknowledge: bool) {
             | (u64::from(acknowledge) << JOIN_ACK),
         Ordering::Release,
     );
+}
+
+/// Arm one committed reply's native entry; supported probe methods are private.
+#[cfg(feature = "transport-probe")]
+pub fn probe_reply_upcall(op: u64) {
+    UPCALL_REPLIES.fetch_or(1 << op, Ordering::AcqRel);
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_ack_interrupt() {
+    ACK_TARGET.store(tls::thread_id(), Ordering::Release);
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_ack_interrupts() -> u64 {
+    ACK_INTERRUPTS.load(Ordering::Acquire)
+}
+
+/// Leave one completed result for the managed-exit reclamation probe.
+#[cfg(feature = "transport-probe")]
+pub fn probe_leave_reply() -> Result<u64, i32> {
+    let nonce = NONCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| EAGAIN)?;
+    let id = tls::thread_id();
+    let mut bytes = [0; 64];
+    for (index, word) in [6, id, nonce, id, 0, 0, 0, 0].iter().enumerate() {
+        bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    loop {
+        match sys::send(channel(), &bytes) {
+            Err(Error::Interrupted) => continue,
+            Ok(reply) if reply.len == 24 => {
+                return if reply.words[0] == 0 {
+                    Ok(nonce)
+                } else {
+                    Err(reply.words[0] as i32)
+                };
+            }
+            _ => return Err(EIO),
+        }
+    }
+}
+
+#[cfg(feature = "transport-probe")]
+pub fn probe_release_reply(nonce: u64) -> Result<(), i32> {
+    acknowledge(tls::thread_id(), nonce, false)
 }
 
 /// # Safety

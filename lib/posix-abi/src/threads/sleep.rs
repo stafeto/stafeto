@@ -14,7 +14,7 @@ pub(super) const ABANDON: u64 = 26;
 pub(super) const QUERY: u64 = 27;
 pub(super) struct Waiting {
     pub(super) deadline: Sleep,
-    nonce: u64,
+    pub(super) nonce: u64,
     token: sys::Token,
 }
 impl Registry {
