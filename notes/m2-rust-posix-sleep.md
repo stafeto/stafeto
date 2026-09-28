@@ -73,7 +73,13 @@ Intentional mutations target saturation, incorrect relative clock selection,
 automatic restart, unchanged remainder, missing ABANDON, consuming history twice,
 and omitting cancellation completion. All seven were detected; restored sources
 passed host tests, QEMU, Apple VZ, Clippy and the POSIX license audit.
-The complete CI run is recorded on the ready implementation commit.
+Full cargo xtask ci passed on ea051b5: licenses, formatting, Clippy, host and guest
+tests, BusyBox, image limits and shipping hot-path memcpy/memset checks.
+Init checks: 221 per machine; kernel checks: 165, or 176 under icount.
+Kernel images remain 150608 bytes normally and 171072 bytes for Apple VZ.
+Boot images: C ABI 385024, standalone C and pthreads 405504 bytes each.
+Normal null/clock/yield/notify/round_trip ticks remain 257/299/364/846/1763;
+IPC probe ticks remain 259/463/1918/2109/3018/4254. No separate HVF series ran.
 
 ## Remaining work
 
