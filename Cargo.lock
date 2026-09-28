@@ -136,7 +136,9 @@ dependencies = [
  "posix-fs",
  "posix-heap",
  "posix-order",
+ "posix-request",
  "posix-types",
+ "proto-wire",
  "rt",
 ]
 
@@ -200,11 +202,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-request"
+version = "0.1.0"
+dependencies = [
+ "proto-fs",
+ "proto-wire",
+]
+
+[[package]]
 name = "posix-shared-probe"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
  "posix-fs",
+ "posix-request",
+ "proto-wire",
  "rt",
 ]
 

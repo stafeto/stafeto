@@ -155,6 +155,14 @@ enum ReadState {
 }
 
 impl PreparedRead {
+    /// The non-owning console route, retained by this process's file owner.
+    pub fn input(&self) -> Option<(rt::fs::Input, usize)> {
+        match &self.0 {
+            ReadState::Input(input, extent) => Some((*input, *extent)),
+            ReadState::Data(..) => None,
+        }
+    }
+
     pub fn complete(self) -> Result<(usize, [u8; MAX_READ]), FsError> {
         match self.0 {
             ReadState::Data(length, bytes) => Ok((length, bytes)),

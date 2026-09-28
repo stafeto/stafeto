@@ -25,6 +25,11 @@ CRT now calls C main inside a process scope.
 
 ## Internal request lifetime
 
+The original transport described below has been replaced by
+[value messages](m2-rust-posix-messages.md); current requests own their payload
+in message pages and the worker's receive buffer.
+
+
 The transport sends an executor address and a pointer to a caller-stack
 job in the same address space. The closure and result require Send.
 UnsafeCell separates the worker-written fields from atomic publication.
@@ -36,7 +41,7 @@ It stays blocked throughout execution; no allocator or polling lock is used.
 Unexpected IPC failure, malformed acknowledgment or absent completion ends
 the process with status 125. Returning could recycle a stack still named
 by an executing job. Worker death recovery and cancellation need a different
-request lifetime model; fail-stop is the current explicit policy.
+request lifetime model; fail-stop was the original stage's explicit policy.
 The private channel is for trusted library calls, not external clients.
 The separate service will need explicit methods and validated data messages,
 without executable addresses or pointers into another address space.

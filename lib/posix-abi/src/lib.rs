@@ -20,7 +20,8 @@ pub mod tls;
 use constants::*;
 use core::ffi::{c_char, c_int};
 use core::ptr;
-use posix_fs::{DescriptorFlags, FsError, PosixFs, SeekFrom};
+use posix_fs::{DescriptorFlags, FsError, SeekFrom};
+use posix_request::{MESSAGE_MAX, Reply, Request};
 
 const _: () = {
     assert!(core::mem::size_of::<usize>() == 8);
@@ -51,10 +52,6 @@ fn fail(code: c_int) -> i64 {
     // SAFETY: errno belongs only to the current thread's live scope.
     unsafe { *tls::errno() = code };
     -1
-}
-
-fn file<T: Send>(run: impl FnOnce(&mut PosixFs) -> Result<T, FsError> + Send) -> Result<T, c_int> {
-    shared::context(|_, files| run(files).map_err(error))
 }
 
 fn fd(fd: c_int) -> Result<u32, c_int> {
@@ -102,15 +99,9 @@ pub unsafe extern "C" fn open(name: *const c_char, flags: c_int) -> c_int {
         {
             return Err(EINVAL);
         }
-        file(|files| {
-            let directory = if flags & O_DIRECTORY != 0 {
-                posix_fs::DIRECTORY_ONLY
-            } else {
-                0
-            };
-            let fd = files.open(name, (flags & O_ACCMODE) as u32 | directory)?;
-            files.set_descriptor_flags(fd, descriptor_flags(flags))?;
-            Ok(fd)
+        shared::number(Request::Open {
+            path: name,
+            flags: flags as u32,
         })
     })();
     result.map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
@@ -121,7 +112,7 @@ pub unsafe extern "C" fn open(name: *const c_char, flags: c_int) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn close(number: c_int) -> c_int {
     fd(number)
-        .and_then(|fd| file(|files| files.close(fd)))
+        .and_then(|fd| shared::unit(Request::Close { fd }))
         .map_or_else(|code| fail(code) as c_int, |()| 0)
 }
 
@@ -136,20 +127,45 @@ pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> i
     if buffer.is_null() && count != 0 {
         return fail(EFAULT) as isize;
     }
-    let result = fd(number)
-        .and_then(|fd| file(|files| files.prepare_read(fd, count)))
-        .and_then(|read| read.complete().map_err(error));
-    result.map_or_else(
-        |code| fail(code) as isize,
-        |(length, bytes)| {
-            if length != 0 {
-                // SAFETY: the C caller supplies count bytes; the bounded result fits.
-                // Publish application-visible output on the calling thread.
-                unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+    let mut message = [0; MESSAGE_MAX];
+    let result = fd(number).and_then(|fd| {
+        let count = count.min(posix_request::MAX_READ);
+        match shared::dispatch(
+            Request::Read {
+                fd,
+                count: count as u32,
+            },
+            &mut message,
+        )? {
+            Reply::Bytes(bytes) => {
+                if bytes.len() > count {
+                    return Err(EIO);
+                }
+                if !bytes.is_empty() {
+                    // SAFETY: the validated result fits the caller's writable extent.
+                    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len()) };
+                }
+                Ok(bytes.len())
             }
-            length as isize
-        },
-    )
+            Reply::Input { uart, extent } => {
+                if extent as usize > count {
+                    return Err(EIO);
+                }
+                let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
+                let mut bytes = [0; posix_request::MAX_READ];
+                let length = input
+                    .read(&mut bytes[..extent as usize])
+                    .map_err(|status| error(status.into()))?;
+                if length != 0 {
+                    // SAFETY: the transport returned at most the validated extent.
+                    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+                }
+                Ok(length)
+            }
+            _ => Err(EIO),
+        }
+    });
+    result.map_or_else(|code| fail(code) as isize, |length| length as isize)
 }
 
 /// # Safety
@@ -168,9 +184,9 @@ pub unsafe extern "C" fn write(number: c_int, buffer: *const u8, count: usize) -
             &[]
         } else {
             // SAFETY: the caller promises this readable extent.
-            unsafe { core::slice::from_raw_parts(buffer, count) }
+            unsafe { core::slice::from_raw_parts(buffer, count.min(posix_request::MAX_WRITE)) }
         };
-        file(|files| files.write(fd, bytes))
+        shared::number(Request::Write { fd, bytes })
     });
     result.map_or_else(|code| fail(code) as isize, |n| n as isize)
 }
@@ -188,7 +204,7 @@ pub unsafe extern "C" fn lseek(number: c_int, offset: i64, origin: c_int) -> i64
             SEEK_HOLE => SeekFrom::Hole,
             _ => return Err(EINVAL),
         };
-        file(|files| files.lseek(fd, offset, origin))
+        shared::number(Request::Seek { fd, offset, origin }).map(|offset| offset as i64)
     });
     result.unwrap_or_else(fail)
 }
@@ -198,7 +214,7 @@ pub unsafe extern "C" fn lseek(number: c_int, offset: i64, origin: c_int) -> i64
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dup(number: c_int) -> c_int {
     fd(number)
-        .and_then(|fd| file(|files| files.dup(fd)))
+        .and_then(|fd| shared::number(Request::Dup { fd }))
         .map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
 }
 
@@ -208,7 +224,7 @@ pub unsafe extern "C" fn dup(number: c_int) -> c_int {
 pub unsafe extern "C" fn dup2(source: c_int, target: c_int) -> c_int {
     let result = fd(source).and_then(|source| {
         let target = fd(target)?;
-        file(|files| files.dup2(source, target))
+        shared::number(Request::Dup2 { source, target })
     });
     result.map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
 }
@@ -222,7 +238,11 @@ pub unsafe extern "C" fn dup3(source: c_int, target: c_int, flags: c_int) -> c_i
         if flags & !(O_CLOEXEC | O_CLOFORK) != 0 {
             return Err(EINVAL);
         }
-        file(|files| files.dup3(source, target, descriptor_flags(flags)))
+        shared::number(Request::Dup3 {
+            source,
+            target,
+            flags: flags as u32,
+        })
     });
     result.map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
 }
@@ -231,7 +251,7 @@ pub unsafe extern "C" fn dup3(source: c_int, target: c_int, flags: c_int) -> c_i
 /// `name` is a live C string; this thread has an initialized ABI scope.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chdir(name: *const c_char) -> c_int {
-    let result = unsafe { path(name) }.and_then(|path| file(|files| files.chdir(path)));
+    let result = unsafe { path(name) }.and_then(|path| shared::unit(Request::Chdir { path }));
     result.map_or_else(|code| fail(code) as c_int, |()| 0)
 }
 
@@ -244,18 +264,19 @@ pub unsafe extern "C" fn getcwd(buffer: *mut c_char, size: usize) -> *mut c_char
     } else if size == 0 {
         Err(EINVAL)
     } else {
-        let mut path = [0; 129];
-        file(|files| {
-            let cwd = files.cwd();
-            path[..cwd.len()].copy_from_slice(cwd);
-            Ok(cwd.len())
-        })
-        .and_then(|length| {
-            if size <= length {
+        let mut message = [0; MESSAGE_MAX];
+        shared::dispatch(Request::Cwd, &mut message).and_then(|reply| {
+            let Reply::Bytes(path) = reply else {
+                return Err(EIO);
+            };
+            if size <= path.len() {
                 return Err(ERANGE);
             }
-            // SAFETY: the C caller promises at least size writable bytes.
-            unsafe { ptr::copy_nonoverlapping(path.as_ptr().cast(), buffer, length + 1) };
+            // SAFETY: the caller supplies room for the complete path and terminator.
+            unsafe {
+                ptr::copy_nonoverlapping(path.as_ptr().cast(), buffer, path.len());
+                *buffer.add(path.len()) = 0;
+            }
             Ok(buffer)
         })
     };

@@ -22,6 +22,16 @@ pub struct Input {
 }
 
 impl Input {
+    /// A process-local transport identifier for value-message routing.
+    pub fn uart(&self) -> Option<abi::Handle> {
+        self.uart
+    }
+
+    /// Borrow a transport retained elsewhere in this process; no ownership is taken.
+    pub const fn from_uart(uart: Option<abi::Handle>) -> Self {
+        Self { uart }
+    }
+
     pub fn read(&self, out: &mut [u8]) -> Result<usize, Status> {
         if out.is_empty() {
             return Ok(0);

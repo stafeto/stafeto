@@ -3,9 +3,10 @@
 
 //! AArch64 LP64 stat layout and checked conversion from file-service metadata.
 
-use crate::{constants::*, fail, fd, file, path};
+use crate::{constants::*, fail, fd, path};
 use core::ffi::{c_char, c_int};
 use posix_fs::NodeInfo;
+use posix_request::Request;
 
 pub use posix_types::{Stat, Timespec};
 
@@ -34,7 +35,8 @@ pub unsafe extern "C" fn stat(name: *const c_char, out: *mut Stat) -> c_int {
     if out.is_null() {
         return fail(EFAULT) as c_int;
     }
-    let result = unsafe { path(name) }.and_then(|path| file(|files| files.stat_information(path)));
+    let result =
+        unsafe { path(name) }.and_then(|path| crate::shared::information(Request::Stat { path }));
     unsafe { store(result, out) }
 }
 
@@ -53,6 +55,6 @@ pub unsafe extern "C" fn fstat(number: c_int, out: *mut Stat) -> c_int {
     if out.is_null() {
         return fail(EFAULT) as c_int;
     }
-    let result = fd(number).and_then(|fd| file(|files| files.descriptor_information(fd)));
+    let result = fd(number).and_then(|fd| crate::shared::information(Request::Fstat { fd }));
     unsafe { store(result, out) }
 }

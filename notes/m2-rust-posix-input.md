@@ -70,8 +70,8 @@ the file-progress marker; timer-backed waiting resolved that failure.
 
 ## Remaining requirements
 
-Stack-based private file jobs still require fail-stop on unexpected IPC loss.
-Owned requests, thread cancellation, signals, terminal discipline, device
+Private file calls now use [owned value messages](m2-rust-posix-messages.md).
+Thread cancellation, signals, terminal discipline, device
 notifications, session recovery and fork/exec inheritance remain mandatory work.
 This stage covers console waiting; a future blocking file backend must
 also defer its request without holding the descriptor owner.
