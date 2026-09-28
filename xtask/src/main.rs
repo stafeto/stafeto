@@ -1144,10 +1144,19 @@ fn posix_interrupt_probe(native: bool) -> Result<(), String> {
         cmd.args(qemu::HEADLESS);
         (cmd, "init: busybox-probe ended: exit code 0, not restarted")
     };
-    // Keep input open and inject no bytes: the read must genuinely block.
+    // Inject no input until cleanup and recovery have completed.
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
-        run.expect("posix-interrupt-probe: ok", BOOT_TIMEOUT)?;
+        if !native {
+            run.expect(
+                "posix-interrupt-probe: interrupted before cleanup",
+                BOOT_TIMEOUT,
+            )?;
+            run.send("r")?;
+        }
+        run.expect("posix-interrupt-probe: retry waiting", BOOT_TIMEOUT)?;
+        run.send("q")?;
+        run.expect("posix-interrupt-probe: ok", DIALOG_STEP)?;
         run.expect(ended, DIALOG_STEP)
     })();
     run.stop();

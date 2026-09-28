@@ -216,6 +216,7 @@ dependencies = [
  "posix-abi",
  "posix-fs",
  "posix-request",
+ "proto-uart",
  "proto-wire",
  "rt",
 ]

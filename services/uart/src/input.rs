@@ -35,7 +35,7 @@ pub struct Input<T> {
     len: usize,
     owner: Option<u64>,
     /// The most bytes of the read that waits, and its answer.
-    waiting: Option<(usize, T)>,
+    waiting: Option<(usize, u64, T)>,
     /// Bytes that came with an error: framing, parity, break or overrun.
     errors: u64,
 }
@@ -102,6 +102,18 @@ impl<T> Input<T> {
     /// `label`, answered through `token`; the bytes that come at once go
     /// into `out`.
     pub fn read(&mut self, label: u64, max: usize, token: T, out: &mut [u8]) -> Taken<T> {
+        self.read_cancelable(label, max, 0, token, out)
+    }
+
+    /// Like READ, with a session-local cancellation identifier (zero for legacy).
+    pub fn read_cancelable(
+        &mut self,
+        label: u64,
+        max: usize,
+        id: u64,
+        token: T,
+        out: &mut [u8],
+    ) -> Taken<T> {
         match self.owner {
             Some(owner) if owner != label => return Taken::Refused(token),
             Some(_) if self.waiting.is_some() => return Taken::Refused(token),
@@ -110,7 +122,7 @@ impl<T> Input<T> {
         if self.len > 0 {
             return Taken::Now(self.copy_out(max, out), token);
         }
-        self.waiting = Some((max, token));
+        self.waiting = Some((max, id, token));
         Taken::Waits
     }
 
@@ -120,8 +132,37 @@ impl<T> Input<T> {
         if self.len == 0 {
             return None;
         }
-        let (max, token) = self.waiting.take()?;
+        let (max, _, token) = self.waiting.take()?;
         Some((token, self.copy_out(max, out)))
+    }
+
+    /// Cancel only the matching session and nonzero identifier. Neither
+    /// ownership nor buffered bytes change; repeated cancellation is harmless.
+    pub fn cancel(&mut self, label: u64, id: u64) -> Option<T> {
+        if id == 0
+            || self.owner != Some(label)
+            || self
+                .waiting
+                .as_ref()
+                .is_none_or(|(_, pending, _)| *pending != id)
+        {
+            return None;
+        }
+        self.waiting.take().map(|(_, _, token)| token)
+    }
+
+    /// Restore bytes when reply delivery failed. The single driver thread
+    /// has not handled another read or IRQ since taking them from this ring.
+    pub fn restore(&mut self, bytes: &[u8]) {
+        assert!(
+            self.len + bytes.len() <= RX_RING,
+            "input rollback exceeds ring"
+        );
+        self.start = (self.start + RX_RING - bytes.len()) % RX_RING;
+        for (index, byte) in bytes.iter().enumerate() {
+            self.ring[(self.start + index) % RX_RING] = *byte;
+        }
+        self.len += bytes.len();
     }
 
     /// The client of label `label` went: when it owned the console, the
@@ -131,7 +172,7 @@ impl<T> Input<T> {
             return None;
         }
         self.owner = None;
-        self.waiting.take().map(|(_, token)| token)
+        self.waiting.take().map(|(_, _, token)| token)
     }
 }
 
@@ -144,6 +185,64 @@ impl<T> Default for Input<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_matches_session_and_id_and_preserves_bytes() {
+        let mut input = Input::new();
+        let mut out = [0; RX_RING];
+        assert_eq!(input.read_cancelable(7, 2, 11, 'a', &mut out), Taken::Waits);
+        assert_eq!(input.cancel(8, 11), None);
+        assert_eq!(input.cancel(7, 10), None);
+        assert_eq!(input.cancel(7, 0), None);
+        assert!(input.push(u32::from(b'q')));
+        assert_eq!(input.cancel(7, 11), Some('a'));
+        assert_eq!(input.cancel(7, 11), None);
+        assert_eq!(input.owner(), Some(7));
+        assert_eq!(
+            input.read_cancelable(7, 1, 12, 'b', &mut out),
+            Taken::Now(1, 'b')
+        );
+        assert_eq!(out[0], b'q');
+        assert_eq!(input.read_cancelable(7, 1, 13, 'c', &mut out), Taken::Waits);
+        assert_eq!(input.cancel(7, 11), None);
+        assert_eq!(input.cancel(7, 13), Some('c'));
+        assert_eq!(input.read(7, 1, 'd', &mut out), Taken::Waits);
+        assert_eq!(input.cancel(7, 13), None);
+        assert_eq!(input.gone(7), Some('d'));
+    }
+
+    #[test]
+    fn failed_delivery_restores_wrapped_bytes_in_order() {
+        let mut input = Input::new();
+        let mut out = [0; RX_RING];
+        for value in 0..RX_RING {
+            assert!(input.push(value as u32));
+        }
+        assert_eq!(
+            input.read(7, RX_RING - 2, 'a', &mut out),
+            Taken::Now(RX_RING - 2, 'a')
+        );
+        for value in *b"abc" {
+            assert!(input.push(u32::from(value)));
+        }
+        assert_eq!(input.read(7, 3, 'b', &mut out), Taken::Now(3, 'b'));
+        assert_eq!(&out[..3], &[254, 255, b'a']);
+        input.restore(&out[..3]);
+        assert_eq!(input.read(7, 5, 'c', &mut out), Taken::Now(5, 'c'));
+        assert_eq!(&out[..5], &[254, 255, b'a', b'b', b'c']);
+        assert_eq!(input.room(), RX_RING);
+        assert_eq!(input.read_cancelable(7, 2, 1, 'd', &mut out), Taken::Waits);
+        for value in *b"xyz" {
+            assert!(input.push(u32::from(value)));
+        }
+        assert_eq!(input.answer(&mut out), Some(('d', 2)));
+        input.restore(&out[..2]);
+        assert_eq!(
+            input.read_cancelable(7, 3, 2, 'e', &mut out),
+            Taken::Now(3, 'e')
+        );
+        assert_eq!(&out[..3], b"xyz");
+    }
 
     #[test]
     fn the_first_reader_owns_the_console() {

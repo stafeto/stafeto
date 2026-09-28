@@ -24,7 +24,9 @@ use core::fmt::{self, Write};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use proto_init::ServiceArgs;
-use proto_uart::{Method, ReadReply, ReadRequest, VERSION, WriteReply, WriteRequest};
+use proto_uart::{
+    CancelRead, CancelableRead, Method, ReadReply, ReadRequest, VERSION, WriteReply, WriteRequest,
+};
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
@@ -320,8 +322,10 @@ impl Uart {
     /// The read that waits gets what came.
     fn answer_read(&mut self) {
         let State { input, read, .. } = &mut *self.state;
-        if let Some((pending, n)) = input.answer(read) {
-            answer_read(pending, &read[..n]);
+        if let Some((pending, n)) = input.answer(read)
+            && !answer_read(pending, &read[..n])
+        {
+            input.restore(&read[..n]);
         }
     }
 
@@ -389,17 +393,33 @@ impl Uart {
     /// wait, gets BAD_STATE. Input masked for a full ring is let out again
     /// once bytes went.
     fn read(&mut self, r: &mut Request<'_>) -> Answer {
-        let max = match ReadRequest::read(r.body()) {
-            Ok(request) => request.max as usize,
-            Err(status) => return Answer::Status(status),
+        let (max, id) = if r.method() == Method::ReadCancelable.number() {
+            match CancelableRead::read(r.body()) {
+                Ok(request) => (request.max as usize, request.id),
+                Err(status) => return Answer::Status(status),
+            }
+        } else {
+            match ReadRequest::read(r.body()) {
+                Ok(request) => (request.max as usize, 0),
+                Err(status) => return Answer::Status(status),
+            }
         };
         let label = r.label();
         let Some(pending) = r.defer() else {
             return Answer::Deferred;
         };
         let State { input, read, .. } = &mut *self.state;
-        match input.read(label, max, pending, read) {
-            input::Taken::Now(n, pending) => answer_read(pending, &read[..n]),
+        let taken = if id == 0 {
+            input.read(label, max, pending, read)
+        } else {
+            input.read_cancelable(label, max, id, pending, read)
+        };
+        match taken {
+            input::Taken::Now(n, pending) => {
+                if !answer_read(pending, &read[..n]) {
+                    input.restore(&read[..n]);
+                }
+            }
             input::Taken::Waits => {}
             input::Taken::Refused(pending) => refuse(pending, Error::BadState),
         }
@@ -409,6 +429,19 @@ impl Uart {
         }
         Answer::Deferred
     }
+
+    fn cancel_read(&mut self, r: &Request<'_>) -> Answer {
+        let cancel = match CancelRead::read(r.body()) {
+            Ok(cancel) => cancel,
+            Err(status) => return Answer::Status(status),
+        };
+        // A live matching reader receives Interrupted. Replying to an already
+        // abandoned token is harmless; newer IDs, owner and ring stay intact.
+        if let Some(pending) = self.state.input.cancel(r.label(), cancel.id) {
+            refuse(pending, Error::Interrupted);
+        }
+        Answer::Status(Status::Ok)
+    }
 }
 
 /// The methods of the driver: CRASH only with the feature `crash`, and
@@ -417,10 +450,17 @@ impl Uart {
 const METHODS: &[u16] = &[
     Method::Write.number(),
     Method::Read.number(),
+    Method::ReadCancelable.number(),
+    Method::CancelRead.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
-const METHODS: &[u16] = &[Method::Write.number(), Method::Read.number()];
+const METHODS: &[u16] = &[
+    Method::Write.number(),
+    Method::Read.number(),
+    Method::ReadCancelable.number(),
+    Method::CancelRead.number(),
+];
 
 impl Service<HELD> for Uart {
     const VERSION: u16 = VERSION;
@@ -430,7 +470,8 @@ impl Service<HELD> for Uart {
     fn request(&mut self, _: &mut Session<(), HELD>, r: &mut Request<'_>) -> Answer {
         match Method::from_number(r.method()) {
             Some(Method::Write) => self.write(r),
-            Some(Method::Read) => self.read(r),
+            Some(Method::Read | Method::ReadCancelable) => self.read(r),
+            Some(Method::CancelRead) => self.cancel_read(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
@@ -494,11 +535,11 @@ fn answer_write(pending: Pending, n: u32) {
 }
 
 /// The reply to a READ with `bytes`, 1 to RX_RING of them.
-fn answer_read(pending: Pending, bytes: &[u8]) {
+fn answer_read(pending: Pending, bytes: &[u8]) -> bool {
     let mut w = Writer::new();
     // At most RX_RING bytes after eight fit a reply.
     let _ = ReadReply { bytes }.write(&mut w);
-    let _ = pending.answer(w.as_bytes(), Outgoing::new());
+    pending.answer(w.as_bytes(), Outgoing::new()).is_ok()
 }
 
 /// A reply that is the status of `error` alone.
