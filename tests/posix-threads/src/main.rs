@@ -32,6 +32,8 @@ mod clock_replies;
 #[cfg(not(feature = "cancel-input"))]
 mod clocks;
 #[cfg(not(feature = "cancel-input"))]
+mod credentials;
+#[cfg(not(feature = "cancel-input"))]
 mod file_replies;
 #[cfg(not(feature = "cancel-input"))]
 mod heap_replies;
@@ -161,6 +163,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(450);
     }
     rt::println!("process-identity-probe: Rust PID/PPID match native identity and preserve errno");
+    if !credentials::run(parent) {
+        return false;
+    }
     if !request_identity::run(expected) {
         return false;
     }
@@ -355,6 +360,10 @@ fn main(_: u64) -> u64 {
         return 5;
     };
     PROCESS.store(start.process.raw().0, Ordering::Release);
+    #[cfg(not(feature = "cancel-input"))]
+    if unsafe { abi::process::init(&start.parent, &start.process) }.is_err() {
+        return 6;
+    }
     if unsafe { abi::shared::init(&start.process, files) }.is_err()
         || unsafe { abi::allocation::init(start.process) }.is_err()
         || unsafe { threads::init(start.thread) }.is_err()

@@ -1026,6 +1026,28 @@ static int clocks(void) {
     return 0;
 }
 
+static int credentials(void) {
+    errno = 777;
+    if (getuid() || geteuid() || getgid() || getegid() || errno != 777) return 185;
+    if (setuid((uid_t)-1) != -1 || errno != EINVAL
+            || seteuid((uid_t)-1) != -1 || errno != EINVAL
+            || setgid((gid_t)-1) != -1 || errno != EINVAL
+            || setegid((gid_t)-1) != -1 || errno != EINVAL) return 186;
+    errno = 888;
+    if (getuid() || geteuid() || getgid() || getegid() || errno != 888) return 187;
+    if (setegid(77) || getgid() || getegid() != 77 || errno != 888) return 188;
+    if (setgid(33) || getgid() != 33 || getegid() != 33 || errno != 888) return 189;
+    if (seteuid(1000) || getuid() || geteuid() != 1000 || errno != 888) return 190;
+    if (setgid(0) != -1 || errno != EPERM || getgid() != 33 || getegid() != 33) return 191;
+    errno = 999;
+    if (setegid(33) || seteuid(0) || getuid() || geteuid() || errno != 999) return 192;
+    if (setgid(0) || setegid(0) || getgid() || getegid() || errno != 999) return 193;
+    if (setuid(1000) || getuid() != 1000 || geteuid() != 1000 || errno != 999) return 194;
+    if (setuid(0) != -1 || errno != EPERM || seteuid(0) != -1 || errno != EPERM
+            || getuid() != 1000 || geteuid() != 1000) return 195;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -1100,6 +1122,8 @@ int main(int argc, char **argv) {
     if (signal_result) return signal_result;
     int scan_result = scans();
     if (scan_result) return scan_result;
+    int credentials_result = credentials();
+    if (credentials_result) return credentials_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

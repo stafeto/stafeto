@@ -112,7 +112,12 @@ user-space console driver remain future work. What works today:
   nesting. Local borrowed file state defers entry while keeping IPC interruptible.
 - **Rust POSIX process identity:** `getpid` and `getppid` return native numeric
   identities shared by all pthreads. IDs and parent links survive ended shells;
-  sender credentials, process routing and orphan adoption remain work.
+  process routing and orphan adoption remain work.
+- **Rust POSIX credentials:** a shared authenticated service owns real,
+  effective and saved UID/GID. Eight C calls support queries, temporary
+  privilege changes and irreversible drops. Threads share state; child
+  registration preserves parent snapshots and retries preserve outcomes.
+  Supplementary groups, file permission checks and set-ID exec remain work.
 - **Rust POSIX ordinary signals:** C and pthread probes provide process actions,
   per-thread masks, pending sets, `raise` and `pthread_kill`, including CPU/IPC
   delivery, inherited masks, NODEFER, RESETHAND and restored errno. `sigwait`
@@ -269,6 +274,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust signal information and handler context | Add SA_SIGINFO, retained handler information and real interrupted AArch64 ucontext; verify register/PC/SIMD/mask edits, nesting, reset, C layouts and resource pressure on QEMU and Apple VZ. | ✅ [#63](https://github.com/stafeto/stafeto/pull/63) |
 | Rust timed signal acceptance | Add sigtimedwait with preserved monotonic deadlines, pending-before-validation, EAGAIN and unchanged error output; verify retries, cancellation, concurrent sleep/mutex waits, late-signal races and full resources on QEMU and Apple VZ. | ✅ [#64](https://github.com/stafeto/stafeto/pull/64) |
 | Authenticated IPC sender identity | Read native sender PID/PPID through an accepted reply token, check receiving-process authority and generation, and preserve reply/priority state; verify real children, foreign rejection, lifetime and QEMU/Apple VZ. Credentials and process routing remain work. | ✅ [#65](https://github.com/stafeto/stafeto/pull/65) |
+| Rust shared process credentials | Add authenticated UID/GID ownership, eight C query/set calls, real/effective/saved rules, child snapshots, retained outcomes and resource checks; verify C, QEMU and Apple VZ. | ✅ [#66](https://github.com/stafeto/stafeto/pull/66) |
 | Rust queued signals and process routing | Add real-time FIFO source/value queues and process-directed sigqueue; preserve masks, retained outcomes, queue resources and cancellation. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and remaining signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
@@ -371,7 +377,7 @@ How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
 The kernel, services, drivers, tools, and Rust POSIX implementation
 (beginning with `lib/posix-path`) are distributed under GPL-3.0-or-later
 ([LICENSE](LICENSE)). Libraries for programs (`lib/abi`, `lib/rt`,
-`lib/bootimg`, `proto/*`) and the temporary Picolibc bridge (`lib/posix`)
+`lib/bootimg`, `lib/process-client`, `proto/*`) and the temporary Picolibc bridge (`lib/posix`)
 are distributed under MIT
 ([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can be released under
 any license.

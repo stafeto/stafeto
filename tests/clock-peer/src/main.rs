@@ -29,6 +29,13 @@ fn main(_: u64) -> u64 {
     let Ok(clock) = Client::connect(&start.parent) else {
         return 4;
     };
+    let Ok(process) = process_client::Client::connect(&start.parent) else {
+        return 6;
+    };
+    if let Err(error) = process.enroll(&start.process) {
+        rt::println!("clock-peer: process registration failed {:?}", error);
+        return 7;
+    }
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -38,15 +45,49 @@ fn main(_: u64) -> u64 {
         }),
     };
     rt::println!("clock-peer: ready");
-    let _ = rt::service::run::<Relay, 2, 0>(&channel, &mut Relay(clock), config);
+    let _ = rt::service::run::<Relay, 2, 0>(&channel, &mut Relay { clock, process }, config);
     5
 }
-struct Relay(Client);
+struct Relay {
+    clock: Client,
+    process: process_client::Client,
+}
 impl Service<0> for Relay {
     const VERSION: u16 = proto_clock::VERSION;
-    const METHODS: &'static [u16] = &[proto_clock::Method::Get as u16];
+    const METHODS: &'static [u16] = &[proto_clock::Method::Get as u16, 8, 9];
     type Data = ();
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
+        if r.method() == 8 {
+            if !r.handles.is_empty() || r.body().finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let value = match self.process.query() {
+                Ok(value) => value,
+                Err(status) => return Answer::Status(status),
+            };
+            let w = r.reply();
+            w.u32(0)
+                .and_then(|()| w.u32(value.identity.id))
+                .and_then(|()| w.u32(value.identity.parent))
+                .expect("peer identity");
+            for id in value.credentials.words() {
+                w.u32(id).expect("peer credentials");
+            }
+            return Answer::Reply(Outgoing::new());
+        }
+        if r.method() == 9 {
+            if r.handles.len() != 1 || r.body().finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Ok(foreign) = r.handles.take::<rt::handle::Process>(0) else {
+                return Answer::Status(Status::BadSize);
+            };
+            return Answer::Status(
+                self.process
+                    .enroll(&foreign)
+                    .map_or_else(|error| error, |_| Status::Ok),
+            );
+        }
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
@@ -57,7 +98,7 @@ impl Service<0> for Relay {
         if reader.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        let value = match self.0.get(id) {
+        let value = match self.clock.get(id) {
             Ok(value) => value,
             Err(status) => return Answer::Status(status),
         };

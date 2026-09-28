@@ -72,9 +72,9 @@ pub enum TakeError {
 /// The start data of a program (spec 13.3), which `startup` gives once.
 pub struct Startup {
     /// The program's own process, with the rights its parent gave (MANAGE
-    /// and TRANSFER from rt::loader::spawn).
+    /// DUPLICATE and TRANSFER from rt::loader::spawn).
     pub process: Handle<Process>,
-    /// The program's first thread, likewise.
+    /// The program's first thread, with MANAGE and TRANSFER from the loader.
     pub thread: Handle<Thread>,
     /// The start channel, entry 0 of the table: for a service its
     /// connection to init.

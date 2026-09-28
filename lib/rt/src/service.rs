@@ -123,6 +123,15 @@ pub struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
+    /// Kernel-authenticated identity of this live request's sender.
+    /// Available until the handler takes or defers the reply token.
+    pub fn sender_identity(&self) -> Result<abi::ProcessIdentity, Error> {
+        self.token
+            .as_ref()
+            .ok_or(Error::BadState)?
+            .sender_identity()
+    }
+
     /// The label of the handle the request came through.
     pub fn label(&self) -> u64 {
         self.label

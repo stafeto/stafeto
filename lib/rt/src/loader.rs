@@ -161,8 +161,8 @@ impl Spawned {
 /// alone moves into the program's entry 0 (x5); A goes once the program
 /// is loaded. The requests of the program, the CLIENT_GONE of its last
 /// copy of B and the notification of its end so all carry the label. The
-/// `giver` of the result holds copies of the process and of the thread
-/// with MANAGE and TRANSFER. The errors are those of handle_duplicate,
+/// `giver` of the result holds the process with MANAGE, DUPLICATE and
+/// TRANSFER, and the thread with MANAGE and TRANSFER. The errors are those of handle_duplicate,
 /// `load` and of the copies; on an error the process goes, and A and B
 /// with it.
 ///
@@ -206,11 +206,12 @@ pub unsafe fn spawn(
 }
 
 /// Start data with copies of the process and the thread of `child` with
-/// MANAGE and TRANSFER, under the names `process` and `thread`.
+/// MANAGE, DUPLICATE and TRANSFER for `process`; MANAGE and TRANSFER for
+/// `thread`. Programs can lend a copy of their own process identity.
 fn start_data(child: &Child) -> Result<Giver, Error> {
-    let rights = Rights::MANAGE | Rights::TRANSFER;
+    let rights = Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER;
     let process = sys::handle_duplicate(&child.process, rights)?;
-    let thread = sys::handle_duplicate(&child.thread, rights)?;
+    let thread = sys::handle_duplicate(&child.thread, Rights::MANAGE | Rights::TRANSFER)?;
     let mut giver = Giver::new();
     // Two names of an empty giver fit.
     let _ = giver.give("process", process.erase());
