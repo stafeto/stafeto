@@ -98,6 +98,8 @@ static CANCEL_JOIN_REPLY: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "transport-probe")]
 static OWNER_NATIVE: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
 #[cfg(feature = "transport-probe")]
+static OWNER_PARKED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "transport-probe")]
 static WAKE_RETRIES: AtomicU64 = AtomicU64::new(0);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -141,10 +143,15 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
     if READY.load(Ordering::Acquire) {
         return Err(Error::BadState);
     }
-    let endpoint = sys::channel_create(1)?;
+    let priority = sys::thread_info(&main)?.base;
+    let endpoint = sys::channel_create(priority)?;
+    crate::clock::watch(&endpoint).map_err(|status| {
+        rt::println!("pthread clock watch failed: {:?}", status);
+        Error::PeerClosed
+    })?;
     // Reserve the timer before clients can exhaust the process memory quota.
     // Initial pthreads all inherit main's scheduling policy and base priority.
-    let timer = sys::timer_create(&endpoint, sys::thread_info(&main)?.base)?;
+    let timer = sys::timer_create(&endpoint, priority)?;
     unsafe {
         *CHANNEL.0.get() = Some(endpoint);
         *MAIN.0.get() = Some(main);
@@ -608,10 +615,12 @@ extern "C" fn owner(_: u64) -> ! {
     registry.entries[0] = Some(Entry::new(1, main, None, false));
     // SAFETY: startup transferred the reserved timer to this sole owner.
     let timer = unsafe { (*REAPER.0.get()).take().expect("initial reap timer") };
-    let mut armed = false;
+    let mut armed: Option<u64> = None;
+    let mut poll: Option<u64> = None;
     loop {
         registry.reap();
         registry.wake_cancelled();
+        let now = rt::time::ticks_to_ns(rt::time::now());
         if registry
             .entries
             .iter()
@@ -619,19 +628,24 @@ extern "C" fn owner(_: u64) -> ! {
             .any(|e| e.phase == Phase::Exiting)
             || (0..CAPACITY).any(|index| registry.wake_needed(index))
         {
-            if !armed {
-                sys::timer_set(
-                    &timer,
-                    sys::clock_now()
-                        .expect("pthread clock")
-                        .saturating_add(1_000_000),
-                )
-                .expect("pthread timer arm");
-                armed = true;
+            if poll.is_none_or(|when| when <= now) {
+                poll = Some(now.saturating_add(1_000_000));
             }
-        } else if armed {
-            sys::timer_cancel(&timer).expect("pthread timer cancel");
-            armed = false;
+        } else {
+            poll = None;
+        }
+        let mutex = registry.mutex_deadlines();
+        let wanted = match (poll, mutex) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if armed != wanted {
+            if let Some(when) = wanted {
+                sys::timer_set(&timer, when).expect("pthread deadline arm");
+            } else {
+                sys::timer_cancel(&timer).expect("pthread deadline cancel");
+            }
+            armed = wanted;
         }
         let (len, words, token, handles) = match sys::receive(channel()) {
             Ok(sys::Received::Message {
@@ -645,7 +659,7 @@ extern "C" fn owner(_: u64) -> ! {
                 source: rt::abi::Source::Timer,
                 ..
             }) => {
-                armed = false;
+                armed = None;
                 continue;
             }
             _ => continue,
@@ -672,9 +686,17 @@ extern "C" fn owner(_: u64) -> ! {
             .filter(|c| c.nonce == words[2])
         {
             respond(token, answer);
+        } else if cfg!(feature = "transport-probe") && words[0] == 24 {
+            #[cfg(feature = "transport-probe")]
+            {
+                let gate = Handle::<Channel>::borrowed(rt::abi::Handle(words[3]));
+                let answer = registry.cache(caller, words[2], Ok(0), words[0]);
+                respond(token, answer);
+                probe_park(&gate);
+            }
         } else if words[0] == once::BEGIN {
             registry.once_begin(caller, words, token);
-        } else if matches!(words[0], mutex::LOCK | mutex::TRY) {
+        } else if matches!(words[0], mutex::LOCK | mutex::TRY | mutex::TIMED) {
             registry.mutex_lock(caller, words, token);
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
@@ -1056,4 +1078,30 @@ pub fn probe_owner_priority(priority: u8) {
 #[cfg(feature = "transport-probe")]
 pub fn probe_wake_retries() -> u64 {
     WAKE_RETRIES.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "transport-probe")]
+pub fn probe_pause_owner(gate: &Handle<Channel>) {
+    request(24, [gate.raw().0, 0, 0, 0, 0]).expect("test owner pause");
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_owner_parked() -> bool {
+    OWNER_PARKED.load(Ordering::Acquire)
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_owner() -> core::mem::ManuallyDrop<Handle<Thread>> {
+    // SAFETY: initialization precedes application threads; the owner handle
+    // remains held for the entire process, and this accessor borrows it.
+    let raw = unsafe { &*OWNER_NATIVE.0.get() }
+        .as_ref()
+        .expect("test owner handle")
+        .raw();
+    Handle::borrowed(raw)
+}
+
+#[cfg(feature = "transport-probe")]
+fn probe_park(gate: &Handle<Channel>) {
+    OWNER_PARKED.store(true, Ordering::Release);
+    sys::receive(gate).expect("test owner gate");
+    OWNER_PARKED.store(false, Ordering::Release);
 }

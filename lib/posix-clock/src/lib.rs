@@ -5,7 +5,7 @@
 #![no_std]
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use posix_time::{Snapshot, Time};
+use posix_time::{Anchor, Observation, Snapshot, Time};
 use proto_clock::Method;
 use proto_wire::{Reader, Status, Writer};
 use rt::abi::{Error, MESSAGE_MAX};
@@ -14,6 +14,10 @@ use rt::{service, sys};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
+fn nonce() -> Result<u64, Status> {
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| Status::from_code(proto_clock::OVERFLOW))
+}
 pub struct Client {
     channel: Handle<Channel>,
 }
@@ -69,12 +73,95 @@ impl Client {
             generation,
         })
     }
+    /// Install one notification endpoint per clock session; retry by replacing
+    /// a previous copy after Interrupted consumed the transfer or its reply.
+    pub fn watch(&self, channel: &Handle<Channel>) -> Result<(), Status> {
+        let request = Method::Watch.header().bytes();
+        loop {
+            let copy = sys::handle_duplicate(
+                channel,
+                rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER,
+            )?;
+            let reply = match sys::send_handles(&self.channel, &request, [copy.erase()]) {
+                Err(e) if e.error == Error::Interrupted => continue,
+                result => result.map_err(|e| Status::Kernel(e.error))?,
+            };
+            let mut buffer = [0; MESSAGE_MAX];
+            let bytes = reply.bytes(&mut buffer);
+            if !reply.handles.is_empty() || bytes.len() != proto_wire::HEADER_LEN {
+                return Err(Status::BadSize);
+            }
+            let status = Status::from_code(Reader::new(bytes).u32()?);
+            if bytes != proto_wire::reply(status) {
+                return Err(Status::BadSize);
+            }
+            return match status {
+                Status::Ok => Ok(()),
+                status => Err(status),
+            };
+        }
+    }
+    pub fn anchor(&self) -> Result<Anchor, Status> {
+        let request = Method::Anchor.header().bytes();
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut reader = Reader::new(self.call(&request, &mut buffer)?);
+        reader.u32()?;
+        let time = Time {
+            seconds: reader.u64()? as i64,
+            nanos: reader.u64()? as i64,
+        };
+        let mono = reader.u64()?;
+        let resolution = reader.u64()?;
+        let generation = reader.u64()?;
+        reader.finish()?;
+        if time.value().is_err() || !(1..=1_000_000_000).contains(&resolution) {
+            return Err(Status::BadSize);
+        }
+        Ok(Anchor {
+            time,
+            mono,
+            resolution,
+            generation,
+        })
+    }
+    /// Exclusive observation consumer for this subscribed session. Consuming
+    /// the interval peak starts a new interval at the sampled current date.
+    pub fn observe(&self) -> Result<Observation, Status> {
+        let mut request = Writer::new();
+        Method::Observe.header().write(&mut request)?;
+        request.u64(nonce()?)?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut reader = Reader::new(self.call(request.as_bytes(), &mut buffer)?);
+        reader.u32()?;
+        let time = Time {
+            seconds: reader.u64()? as i64,
+            nanos: reader.u64()? as i64,
+        };
+        let mono = reader.u64()?;
+        let resolution = reader.u64()?;
+        let generation = reader.u64()?;
+        let high = reader.u64()?;
+        let low = reader.u64()?;
+        reader.finish()?;
+        let peak = i128::try_from((u128::from(high) << 64) | u128::from(low))
+            .map_err(|_| Status::BadSize)?;
+        if time.value().is_err() || !(1..=1_000_000_000).contains(&resolution) {
+            return Err(Status::BadSize);
+        }
+        Ok(Observation {
+            anchor: Anchor {
+                time,
+                mono,
+                resolution,
+                generation,
+            },
+            peak,
+        })
+    }
     pub fn set(&self, time: Time) -> Result<(), Status> {
         time.value()
             .map_err(|_| Status::from_code(proto_clock::INVALID))?;
-        let nonce = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Status::from_code(proto_clock::OVERFLOW))?;
+        let nonce = nonce()?;
         let mut request = Writer::new();
         Method::Set.header().write(&mut request)?;
         request.u64(nonce)?;
@@ -86,7 +173,7 @@ impl Client {
         ack.u64(nonce)?;
         self.unit(ack.as_bytes())
     }
-    /// Test-only interruption after a committed SET or ACK, while this native
+    /// Test-only interruption after a committed SET, ACK or OBSERVE, while this native
     /// caller is in AwaitingReply. The normal service does not expose method 4.
     #[cfg(feature = "transport-probe")]
     pub fn probe_interrupt(

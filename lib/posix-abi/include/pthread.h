@@ -6,11 +6,14 @@
 #include <stdint.h>
 #include <stafeto/abi.h>
 #include <sys/types.h>
+#include <time.h>
 #define PTHREAD_MUTEX_INITIALIZER { 0x53544d5800000003ULL, 0, 0, 0 }
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr);
 int pthread_mutex_destroy(pthread_mutex_t *mutex);
 int pthread_mutex_lock(pthread_mutex_t *mutex);
 int pthread_mutex_trylock(pthread_mutex_t *mutex);
+int pthread_mutex_timedlock(pthread_mutex_t *mutex, const struct timespec *deadline);
+int pthread_mutex_clocklock(pthread_mutex_t *mutex, clockid_t clock, const struct timespec *deadline);
 int pthread_mutex_unlock(pthread_mutex_t *mutex);
 int pthread_mutexattr_init(pthread_mutexattr_t *attr);
 int pthread_mutexattr_destroy(pthread_mutexattr_t *attr);

@@ -54,6 +54,78 @@ pub struct Snapshot {
     pub resolution: u64,
     pub generation: u64,
 }
+/// A consistent realtime anchor, valid even when the current date overflows time_t.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Anchor {
+    pub time: Time,
+    pub mono: u64,
+    pub resolution: u64,
+    pub generation: u64,
+}
+/// Interval history belongs to one observing consumer, reset after each sample.
+#[derive(Clone, Copy, Debug)]
+pub struct History {
+    peak: i128,
+}
+impl History {
+    pub fn new(current: i128) -> Self {
+        Self { peak: current }
+    }
+    pub fn see(&mut self, value: i128) {
+        self.peak = self.peak.max(value);
+    }
+    pub fn take(&mut self, current: i128, anchor: Anchor) -> Observation {
+        self.see(current);
+        let peak = self.peak;
+        self.peak = current;
+        Observation { anchor, peak }
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Observation {
+    pub anchor: Anchor,
+    pub peak: i128,
+}
+/// An absolute deadline keeps signed seconds; negative values are in the past.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Deadline {
+    pub clock: u32,
+    seconds: i64,
+    nanos: i64,
+}
+impl Deadline {
+    pub fn new(clock: u32, seconds: i64, nanos: i64) -> Result<Self, Error> {
+        if !matches!(clock, proto_clock::REALTIME | proto_clock::MONOTONIC)
+            || !(0..1_000_000_000).contains(&nanos)
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            clock,
+            seconds,
+            nanos,
+        })
+    }
+    pub fn value(self) -> i128 {
+        i128::from(self.seconds) * SECOND + i128::from(self.nanos)
+    }
+    pub fn expired(self, mono: u64, observation: Option<Observation>) -> Result<bool, Error> {
+        if self.clock == proto_clock::MONOTONIC {
+            return Ok(self.value() <= i128::from(mono));
+        }
+        Ok(self.value() <= observation.ok_or(Error::Invalid)?.peak)
+    }
+    /// Return the wide monotonic instant. A new anchor recalculates REALTIME;
+    /// MONOTONIC needs no service reading. Arithmetic cannot wrap far dates.
+    pub fn target(self, anchor: Option<Anchor>) -> Result<i128, Error> {
+        let value = self.value();
+        if self.clock == proto_clock::MONOTONIC {
+            return Ok(value);
+        }
+        let anchor = anchor.ok_or(Error::Invalid)?;
+        Ok(value - anchor.time.value()? + i128::from(anchor.mono))
+    }
+}
 pub struct Clock {
     value: i128,
     mono: u64,
@@ -68,6 +140,17 @@ impl Clock {
             resolution: resolution(hz)?,
             generation: 0,
         })
+    }
+    pub fn current(&self, now: u64) -> Result<i128, Error> {
+        Ok(self.value + i128::from(now.checked_sub(self.mono).ok_or(Error::Invalid)?))
+    }
+    pub fn anchor(&self) -> Anchor {
+        Anchor {
+            time: Time::from_value(self.value).expect("valid stored calendar anchor"),
+            mono: self.mono,
+            resolution: self.resolution,
+            generation: self.generation,
+        }
     }
     pub fn get(&self, id: u32, now: u64) -> Result<Snapshot, Error> {
         let time = match id {
@@ -250,5 +333,69 @@ mod tests {
         s = Settings::default();
         s.set(65, time(101, 0), 101, &mut c).unwrap();
         assert_eq!(c.generation, 66);
+    }
+    #[test]
+    fn absolute_deadlines_follow_each_clock_and_both_calendar_steps() {
+        let mut clock = Clock::new(100, 1_000_000_000).unwrap();
+        clock.set(time(10, 0), 100).unwrap();
+        let calendar = Deadline::new(REALTIME, 11, 0).unwrap();
+        let mono = Deadline::new(MONOTONIC, 0, 777).unwrap();
+        assert_eq!(calendar.target(Some(clock.anchor())), Ok(1_000_000_100));
+        clock.set(time(12, 0), 200).unwrap();
+        assert_eq!(calendar.target(Some(clock.anchor())), Ok(-999_999_800));
+        assert_eq!(mono.target(Some(clock.anchor())), Ok(777));
+        clock.set(time(1, 0), 300).unwrap();
+        assert_eq!(calendar.target(Some(clock.anchor())), Ok(10_000_000_300));
+        assert_eq!(mono.target(None), Ok(777));
+        assert_eq!(calendar.target(None), Err(Error::Invalid));
+    }
+    #[test]
+    fn deadlines_preserve_past_and_far_future_without_wrapping() {
+        assert_eq!(
+            Deadline::new(MONOTONIC, -1, 999_999_999)
+                .unwrap()
+                .target(None),
+            Ok(-1)
+        );
+        let far = Deadline::new(MONOTONIC, i64::MAX, 999_999_999)
+            .unwrap()
+            .target(None)
+            .unwrap();
+        assert!(far > i128::from(u64::MAX));
+        assert!(u64::try_from(far).is_err());
+        for ns in [-1, 1_000_000_000] {
+            assert_eq!(Deadline::new(REALTIME, 0, ns), Err(Error::Invalid));
+        }
+        assert_eq!(Deadline::new(2, 0, 0), Err(Error::Invalid));
+    }
+    #[test]
+    fn anchor_keeps_deadlines_valid_after_current_time_overflows_time_t() {
+        let mut clock = Clock::new(0, 1_000_000_000).unwrap();
+        clock.set(time(i64::MAX, 999_999_999), 50).unwrap();
+        assert_eq!(clock.get(REALTIME, 51), Err(Error::Overflow));
+        let deadline = Deadline::new(REALTIME, i64::MAX, 999_999_999).unwrap();
+        assert_eq!(deadline.target(Some(clock.anchor())), Ok(50));
+    }
+    #[test]
+    fn interval_peak_preserves_brief_forward_steps_and_resets_for_new_waits() {
+        let mut clock = Clock::new(100, 1_000_000_000).unwrap();
+        clock.set(time(10, 0), 100).unwrap();
+        let mut history = History::new(clock.current(100).unwrap());
+        let deadline = Deadline::new(REALTIME, 11, 0).unwrap();
+        history.see(clock.current(200).unwrap());
+        clock.set(time(12, 0), 200).unwrap();
+        history.see(clock.current(200).unwrap());
+        clock.set(time(10, 0), 300).unwrap();
+        let sample = history.take(clock.current(300).unwrap(), clock.anchor());
+        assert_eq!(deadline.expired(300, Some(sample)), Ok(true));
+        assert!(deadline.target(Some(sample.anchor)).unwrap() > 300);
+        let next = history.take(clock.current(400).unwrap(), clock.anchor());
+        assert_eq!(deadline.expired(400, Some(next)), Ok(false));
+        assert_eq!(
+            Deadline::new(MONOTONIC, 0, 500)
+                .unwrap()
+                .expired(400, Some(sample)),
+            Ok(false)
+        );
     }
 }

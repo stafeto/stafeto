@@ -11,6 +11,7 @@ pub const PTHREAD_CANCEL_DISABLE: i32 = 1;
 pub const PTHREAD_CANCEL_DEFERRED: i32 = 0;
 pub const PTHREAD_CANCEL_ASYNCHRONOUS: i32 = 1;
 pub const ECANCELED: i32 = 125;
+pub const ETIMEDOUT: i32 = 110;
 pub const ESRCH: i32 = 3;
 pub const EAGAIN: i32 = 11;
 pub const EDEADLK: i32 = 35;
