@@ -76,6 +76,13 @@ Four deliberate mutations were detected: exclusion (stage 92), recursive
 partial release (103), waiter priority (96), and repeated UNLOCK (94).
 Sources were restored before the ready implementation commit.
 
+## Verification result
+
+Full cargo xtask ci passed on 713da7b: init 221, kernel 165, icount 176.
+License declarations and SPDX checks passed. No host-only tests were added.
+The kernel is unchanged at 150608 bytes (Apple VZ 171072).
+Mutex-operation latency and the new global blocking bound were not measured.
+
 ## Remaining work
 
 This milestone adds process-private stalled mutex ownership. Timed/clock locks,
