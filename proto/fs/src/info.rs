@@ -25,6 +25,49 @@ pub struct NodeInfo {
     pub change_ns: u64,
 }
 
+impl NodeInfo {
+    pub fn write(&self, out: &mut Writer) -> Result<(), Status> {
+        out.u32(self.kind)?;
+        out.u32(self.permissions)?;
+        out.u64(self.device)?;
+        out.u64(self.special_device)?;
+        out.u64(self.inode)?;
+        out.u64(self.links)?;
+        out.u32(self.uid)?;
+        out.u32(self.gid)?;
+        out.u64(self.size)?;
+        out.u32(self.block_size)?;
+        out.u64(self.blocks)?;
+        out.u64(self.access_ns)?;
+        out.u64(self.modify_ns)?;
+        out.u64(self.change_ns)
+    }
+
+    pub fn read(input: &mut Reader<'_>) -> Result<Self, Status> {
+        let info = Self {
+            kind: input.u32()?,
+            permissions: input.u32()?,
+            device: input.u64()?,
+            special_device: input.u64()?,
+            inode: input.u64()?,
+            links: input.u64()?,
+            uid: input.u32()?,
+            gid: input.u32()?,
+            size: input.u64()?,
+            block_size: input.u32()?,
+            blocks: input.u64()?,
+            access_ns: input.u64()?,
+            modify_ns: input.u64()?,
+            change_ns: input.u64()?,
+        };
+        if !(1..=3).contains(&info.kind) || info.permissions & !0o7777 != 0 || info.block_size == 0
+        {
+            return Err(Status::BadSize);
+        }
+        Ok(info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,48 +118,5 @@ mod tests {
         let mut reader = Reader::new(writer.as_bytes());
         NodeInfo::read(&mut reader).unwrap();
         assert_eq!(reader.finish(), Err(Status::BadSize));
-    }
-}
-
-impl NodeInfo {
-    pub fn write(&self, out: &mut Writer) -> Result<(), Status> {
-        out.u32(self.kind)?;
-        out.u32(self.permissions)?;
-        out.u64(self.device)?;
-        out.u64(self.special_device)?;
-        out.u64(self.inode)?;
-        out.u64(self.links)?;
-        out.u32(self.uid)?;
-        out.u32(self.gid)?;
-        out.u64(self.size)?;
-        out.u32(self.block_size)?;
-        out.u64(self.blocks)?;
-        out.u64(self.access_ns)?;
-        out.u64(self.modify_ns)?;
-        out.u64(self.change_ns)
-    }
-
-    pub fn read(input: &mut Reader<'_>) -> Result<Self, Status> {
-        let info = Self {
-            kind: input.u32()?,
-            permissions: input.u32()?,
-            device: input.u64()?,
-            special_device: input.u64()?,
-            inode: input.u64()?,
-            links: input.u64()?,
-            uid: input.u32()?,
-            gid: input.u32()?,
-            size: input.u64()?,
-            block_size: input.u32()?,
-            blocks: input.u64()?,
-            access_ns: input.u64()?,
-            modify_ns: input.u64()?,
-            change_ns: input.u64()?,
-        };
-        if !(1..=3).contains(&info.kind) || info.permissions & !0o7777 != 0 || info.block_size == 0
-        {
-            return Err(Status::BadSize);
-        }
-        Ok(info)
     }
 }
