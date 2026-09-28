@@ -7,7 +7,9 @@
 
 #![cfg_attr(not(test), no_std)]
 
-pub use proto_fs::{MAX_READ, MAX_WRITE};
+pub mod exchange;
+pub use proto_fs::MAX_READ;
+pub const MAX_WRITE: usize = proto_fs::MAX_WRITE - exchange::HEADER_BYTES;
 use proto_fs::{NodeInfo, SeekFrom};
 use proto_wire::{Header, Reader, Status, Writer};
 pub const MESSAGE_MAX: usize = MAX_READ + 8;

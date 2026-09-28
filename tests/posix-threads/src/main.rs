@@ -27,6 +27,8 @@ mod cancellation;
 mod capacity;
 #[cfg(not(feature = "cancel-input"))]
 mod clocks;
+#[cfg(not(feature = "cancel-input"))]
+mod file_replies;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
@@ -263,6 +265,7 @@ fn run(clocks: &clocks::Peers) -> bool {
         || !sleep::run()
         || !upcall::run()
         || !reentry::run()
+        || !file_replies::run()
         || !cancellation::run()
     {
         return false;

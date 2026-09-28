@@ -23,3 +23,4 @@ posix-clock = { path = "../../lib/posix-clock", features = ["transport-probe"] }
 posix-time = { path = "../../lib/posix-time" }
 proto-clock = { path = "../../proto/clock" }
 proto-wire = { path = "../../proto/wire" }
+posix-request = { path = "../../lib/posix-request" }

@@ -503,15 +503,19 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     unsafe { *errno = EIO };
     if sys::thread_start(&request).is_err()
         || !state(&request, ThreadState::Sending)
-        || !interrupt(&request, 2)
+        || sys::thread_interrupt(&request).is_err()
         || unsafe { *errno } != EIO
     {
         return fail(86);
     }
+    // The interrupted client must Fetch/Ack before returning EINTR. Main's own
+    // round trip lets the lower-priority file owner process that control traffic.
     let mut path = [0; 129];
     if unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
         || &path[..2] != b"/\0"
         || unsafe { *errno } != EIO
+        || RESULTS[2].load(Ordering::Acquire) != 1
+        || !state(&request, ThreadState::Ended)
     {
         return fail(87);
     }

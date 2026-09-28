@@ -8,11 +8,13 @@
 use crate::{constants::*, directory::Streams, tls};
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use posix_fs::PosixFs;
-use posix_request::{MESSAGE_MAX, Reply, Request};
+use posix_request::{MESSAGE_MAX, Reply, Request, exchange::Exchange};
+mod replies;
 use proto_wire::Writer;
+use replies::Journal;
 use rt::{
     Stack,
     abi::Policy,
@@ -26,8 +28,78 @@ struct Cell<T>(UnsafeCell<Option<T>>);
 unsafe impl<T: Send> Sync for Cell<T> {}
 static CHANNEL: Cell<Handle<Channel>> = Cell(UnsafeCell::new(None));
 static FILES: Cell<PosixFs> = Cell(UnsafeCell::new(None));
+static PROCESS: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
+static NEXT: AtomicU64 = AtomicU64::new(1);
 static STACK: Stack<32768> = Stack::new();
+#[cfg(feature = "transport-probe")]
+static PROBE_UPCALL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_ACK: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_GATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_READY: AtomicU64 = AtomicU64::new(0);
+
+/// Pause after the next Ack reply; both channels must stay live until released.
+#[cfg(feature = "transport-probe")]
+pub fn probe_pause_after_ack(gate: &Handle<Channel>, ready: &Handle<Channel>) {
+    PROBE_READY.store(ready.raw().0, Ordering::Relaxed);
+    PROBE_GATE.store(gate.raw().0, Ordering::Release);
+}
+
+#[cfg(feature = "transport-probe")]
+fn probe_gate(input: &[u8]) -> (u64, u64) {
+    if matches!(Exchange::read(input), Ok(Exchange::Ack(_))) {
+        let gate = PROBE_GATE.swap(0, Ordering::AcqRel);
+        return (gate, PROBE_READY.load(Ordering::Relaxed));
+    }
+    (0, 0)
+}
+
+#[cfg(feature = "transport-probe")]
+fn probe_after_reply((gate, ready): (u64, u64)) {
+    if gate != 0 {
+        let gate = Handle::<Channel>::borrowed(rt::abi::Handle(gate));
+        let ready = Handle::<Channel>::borrowed(rt::abi::Handle(ready));
+        sys::notify(&ready, 1).unwrap();
+        sys::receive(&gate).unwrap();
+    }
+}
+
+/// Request one native handler after the next Execute result is committed.
+/// The caller keeps the target handle alive until that operation completes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_reply_upcall(target: &Handle<rt::handle::Thread>) {
+    PROBE_UPCALL.store(target.raw().0, Ordering::Release);
+}
+
+/// Interrupt one Ack after its journal entry has already been removed.
+/// The caller keeps the target handle alive until that operation completes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_ack_interrupt(target: &Handle<rt::handle::Thread>) {
+    PROBE_ACK.store(target.raw().0, Ordering::Release);
+}
+
+#[cfg(feature = "transport-probe")]
+fn probe_after_commit(input: &[u8]) {
+    let Ok(exchange) = Exchange::read(input) else {
+        return;
+    };
+    let target = match exchange {
+        Exchange::Execute { .. } => PROBE_UPCALL.swap(0, Ordering::AcqRel),
+        Exchange::Ack(_) => PROBE_ACK.swap(0, Ordering::AcqRel),
+        Exchange::Fetch(_) => 0,
+    };
+    if target != 0 {
+        let target = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(target));
+        match exchange {
+            Exchange::Execute { .. } => sys::thread_upcall_request(&target).unwrap(),
+            Exchange::Ack(_) => sys::thread_interrupt(&target).unwrap(),
+            Exchange::Fetch(_) => unreachable!(),
+        }
+    }
+}
 
 fn channel() -> &'static Handle<Channel> {
     // SAFETY: initialization or READY establishes an immutable installed handle.
@@ -37,6 +109,8 @@ fn channel() -> &'static Handle<Channel> {
 /// # Safety
 /// Startup has exclusive access, before any client thread uses the file owner.
 /// The worker stack is used once and its message page at 0xb00000 is unused.
+/// Reply storage reserves 0x20000000..0x28000000 independently of malloc.
+/// process must remain open until process exit (normally owned by allocation::init).
 pub unsafe fn init(process: &Handle<Process>, files: PosixFs) -> Result<(), rt::abi::Error> {
     if READY.load(Ordering::Acquire) {
         return Err(rt::abi::Error::BadState);
@@ -46,6 +120,7 @@ pub unsafe fn init(process: &Handle<Process>, files: PosixFs) -> Result<(), rt::
         *CHANNEL.0.get() = Some(channel);
         *FILES.0.get() = Some(files);
     }
+    PROCESS.store(process.raw().0, Ordering::Relaxed);
     let started = (|| {
         let thread = unsafe {
             sys::thread_create(process, worker, STACK.top(), 0, 1, Policy::Fifo, 0xb00000)
@@ -61,6 +136,7 @@ pub unsafe fn init(process: &Handle<Process>, files: PosixFs) -> Result<(), rt::
             *FILES.0.get() = None;
             *CHANNEL.0.get() = None;
         }
+        PROCESS.store(0, Ordering::Relaxed);
         return started;
     }
     Ok(())
@@ -216,6 +292,9 @@ extern "C" fn worker(_: u64) -> ! {
     // SAFETY: startup handed this state exclusively to this worker.
     let mut files = unsafe { (*FILES.0.get()).take().expect("initial file state") };
     tls::with_files(&mut files, || {
+        // Startup keeps this process capability alive for the worker's full lifetime.
+        let process = Handle::<Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Relaxed)));
+        let mut journal = Journal::new(&process);
         loop {
             let Ok(sys::Received::Message {
                 len,
@@ -240,25 +319,106 @@ extern "C" fn worker(_: u64) -> ! {
                 if len > inline {
                     rt::msgbuf::read(inline, &mut input[inline..len]);
                 }
-                Request::read(&input[..len])
+                Exchange::read(&input[..len])
                     .map_err(request_error)
-                    .and_then(|request| {
-                        // SAFETY: this thread uniquely owns the local file scope.
-                        perform(
-                            request,
-                            unsafe { &*tls::directories() },
-                            unsafe { &mut *tls::files() },
-                            &mut output,
-                        )
+                    .and_then(|exchange| match exchange {
+                        Exchange::Fetch(nonce) => output
+                            .bytes(journal.reply(nonce).ok_or(EINTR)?)
+                            .map_err(|_| EIO),
+                        Exchange::Ack(nonce) => {
+                            journal.ack(nonce);
+                            Reply::Unit.write(&mut output).map_err(|_| EIO)
+                        }
+                        Exchange::Execute { nonce, request } => {
+                            if journal.reply(nonce).is_none() {
+                                journal.reserve(nonce)?;
+                                let result = Request::read(request)
+                                    .map_err(request_error)
+                                    .and_then(|request| {
+                                        // SAFETY: this thread uniquely owns the local file scope.
+                                        perform(
+                                            request,
+                                            unsafe { &*tls::directories() },
+                                            unsafe { &mut *tls::files() },
+                                            journal.output(nonce),
+                                        )
+                                    });
+                                if let Err(code) = result {
+                                    *journal.output(nonce) = error_reply(code);
+                                }
+                            }
+                            output
+                                .bytes(journal.reply(nonce).expect("committed file reply"))
+                                .map_err(|_| EIO)
+                        }
                     })
             };
             if let Err(code) = result {
                 output = error_reply(code);
             }
+            #[cfg(feature = "transport-probe")]
+            if !unexpected_handles && len <= input.len() {
+                probe_after_commit(&input[..len]);
+            }
             // A departed client cannot invalidate input or output owned by this worker.
+            // Capture before reply resumes a client which can arm the next probe.
+            #[cfg(feature = "transport-probe")]
+            let gate = if !unexpected_handles && len <= input.len() {
+                probe_gate(&input[..len])
+            } else {
+                (0, 0)
+            };
             let _ = token.reply(output.as_bytes());
+            #[cfg(feature = "transport-probe")]
+            probe_after_reply(gate);
         }
     })
+}
+
+fn send_copy(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt::abi::Error> {
+    let reply = sys::send(channel(), request)?;
+    if !reply.handles.is_empty() {
+        return Err(rt::abi::Error::BadState);
+    }
+    Ok(reply.bytes(buffer).len())
+}
+fn retry(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, i32> {
+    loop {
+        match send_copy(request, buffer) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            value => return value.map_err(|_| EIO),
+        }
+    }
+}
+fn execute(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, i32> {
+    let nonce = NEXT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_add(1))
+        .map_err(|_| EOVERFLOW)?;
+    let mut wire = Writer::new();
+    Exchange::Execute { nonce, request }
+        .write(&mut wire)
+        .map_err(request_error)?;
+    let length = match send_copy(wire.as_bytes(), buffer) {
+        Err(rt::abi::Error::Interrupted) => {
+            wire = Writer::new();
+            Exchange::Fetch(nonce)
+                .write(&mut wire)
+                .map_err(request_error)?;
+            retry(wire.as_bytes(), buffer)?
+        }
+        value => value.map_err(|_| EIO)?,
+    };
+    // The reply has been copied to the caller's own stack before Ack overwrites IPC.
+    wire = Writer::new();
+    Exchange::Ack(nonce)
+        .write(&mut wire)
+        .map_err(request_error)?;
+    let mut response = [0; MESSAGE_MAX];
+    let size = retry(wire.as_bytes(), &mut response)?;
+    if !matches!(Reply::read(&response[..size]), Ok(Reply::Unit)) {
+        return Err(EIO);
+    }
+    Ok(length)
 }
 
 pub(crate) fn dispatch<'a>(
@@ -271,14 +431,8 @@ pub(crate) fn dispatch<'a>(
         }
         let mut encoded = Writer::new();
         request.write(&mut encoded).map_err(request_error)?;
-        let reply = sys::send(channel(), encoded.as_bytes()).map_err(|error| match error {
-            rt::abi::Error::Interrupted => EINTR,
-            _ => EIO,
-        })?;
-        if !reply.handles.is_empty() {
-            return Err(EIO);
-        }
-        reply.bytes(buffer)
+        let length = execute(encoded.as_bytes(), buffer)?;
+        &buffer[..length]
     } else {
         let streams = tls::directories();
         let files = tls::files();
@@ -349,6 +503,21 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
     if !READY.load(Ordering::Acquire) {
         return Err(rt::abi::Error::BadState);
     }
-    let reply = sys::send(channel(), request)?;
-    Ok(reply.bytes(buffer).len())
+    execute(request, buffer).map_err(|code| match code {
+        EINTR => rt::abi::Error::Interrupted,
+        ENOMEM => rt::abi::Error::NoMemory,
+        _ => rt::abi::Error::InvalidArgs,
+    })
+}
+
+/// Send an explicit transaction without automatic Fetch/Ack, for journal probes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_exchange(
+    request: &[u8],
+    buffer: &mut [u8; MESSAGE_MAX],
+) -> Result<usize, rt::abi::Error> {
+    if !READY.load(Ordering::Acquire) {
+        return Err(rt::abi::Error::BadState);
+    }
+    send_copy(request, buffer)
 }

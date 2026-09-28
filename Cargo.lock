@@ -263,6 +263,7 @@ dependencies = [
  "posix-abi",
  "posix-clock",
  "posix-fs",
+ "posix-request",
  "posix-time",
  "proto-clock",
  "proto-wire",
