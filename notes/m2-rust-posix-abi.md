@@ -46,9 +46,11 @@ These checks follow the thread isolation requirement in
 [POSIX.1-2024 section 2.3](https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html).
 
 This sysroot is an initial, experimental subset. Allocation, stdio,
-remaining headers, stat structures, directory C ABI, environment inheritance,
+remaining headers, directory C ABI, environment inheritance,
 ELF TLS templates, constructor/destructor startup, signal handling, and
 multi-thread process file state still require implementation. File scopes
 borrow a PosixFs exclusively; a second thread can initialize its own errno
 but sharing process descriptors needs the separate POSIX service. BusyBox
 continues to use the MIT bridge; this GPL library stays out of its link graph.
+
+Stat structures and metadata are added by [the next milestone](m2-rust-posix-stat.md).

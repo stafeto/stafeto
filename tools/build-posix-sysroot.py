@@ -17,7 +17,8 @@ TARGET = "aarch64-unknown-none"
 
 
 def stage() -> Path:
-    constants = (SOURCE / "src/constants.rs").read_text()
+    constants = (SOURCE / "src/constants.rs").read_text() + (
+        ROOT / "lib/posix-types/src/constants.rs").read_text()
     version = re.search(r'pub const SYSROOT_VERSION: &str = "([0-9.]+)";', constants)[1]
     destination = ROOT / "target/posix-sysroot" / version / "aarch64-stafeto"
     include = destination / "include"

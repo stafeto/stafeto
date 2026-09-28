@@ -9,7 +9,7 @@
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
-pub use proto_fs::SeekFrom;
+pub use proto_fs::{NodeInfo, SeekFrom};
 use proto_wire::Status;
 use rt::Handle;
 use rt::fs::Files;
@@ -18,6 +18,7 @@ use rt::handle::Channel;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
     NoEntry,
+    PermissionDenied,
     BadFileDescriptor,
     IsDirectory,
     NotDirectory,
@@ -57,6 +58,7 @@ impl From<Status> for FsError {
     fn from(status: Status) -> Self {
         match status {
             Status::Unknown(proto_fs::NO_ENTRY) => Self::NoEntry,
+            Status::Unknown(proto_fs::ACCESS_DENIED) => Self::PermissionDenied,
             Status::Unknown(proto_fs::BAD_FD) => Self::BadFileDescriptor,
             Status::Unknown(proto_fs::IS_DIRECTORY) => Self::IsDirectory,
             Status::Unknown(proto_fs::NO_SPACE) => Self::NoSpace,
@@ -81,6 +83,7 @@ impl FileKind {
         match kind {
             1 => Ok(Self::Directory),
             2 => Ok(Self::Regular),
+            3 => Ok(Self::Character),
             _ => Err(FsError::Io),
         }
     }
@@ -303,6 +306,41 @@ impl PosixFs {
             kind,
             size: meta.size,
         })
+    }
+
+    pub fn stat_information(&self, path: &[u8]) -> Result<NodeInfo, FsError> {
+        let trailing_slash = path.last() == Some(&b'/');
+        let mut resolved = [0; MAX_PATH + 1];
+        let name = self.path(path, &mut resolved)?;
+        let info = self.files.node_information(name).map_err(FsError::from)?;
+        if trailing_slash && FileKind::from_wire(info.kind)? != FileKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(info)
+    }
+
+    pub fn descriptor_information(&self, fd: u32) -> Result<NodeInfo, FsError> {
+        match self.descriptors.get(fd)? {
+            Backend::Ram(fd) => self.files.descriptor_information(fd).map_err(FsError::from),
+            // Unnamed console transport; richer terminal metadata comes with
+            // the terminal service and its namespace entry.
+            _ => Ok(NodeInfo {
+                kind: 3,
+                permissions: 0o666,
+                device: 2,
+                special_device: 1,
+                inode: 1,
+                links: 1,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                block_size: 1024,
+                blocks: 0,
+                access_ns: 0,
+                modify_ns: 0,
+                change_ns: 0,
+            }),
+        }
     }
 
     pub fn opendir(&self, path: &[u8]) -> Result<Directory, FsError> {

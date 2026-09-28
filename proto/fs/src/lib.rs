@@ -14,8 +14,13 @@
 //! size u32 (directories report zero until their metadata is available).
 //! SEEK_FROM: header, fd u32, signed offset i64, origin u32. Reply:
 //! status, resulting offset u64 (at most i64::MAX). Legacy SEEK is unchanged.
+//! INFO_FD: header, fd u32. INFO_PATH: header, absolute path bytes. Replies:
+//! status and NodeInfo fields (92 bytes), without C ABI padding.
 
 #![cfg_attr(not(test), no_std)]
+
+mod info;
+pub use info::NodeInfo;
 
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
@@ -37,6 +42,7 @@ pub const INVALID_ARGUMENT: u32 = 304;
 pub const OFFSET_OVERFLOW: u32 = 305;
 pub const NO_DATA: u32 = 306;
 pub const TOO_MANY_OPEN_FILES: u32 = 307;
+pub const ACCESS_DENIED: u32 = 308;
 
 /// Origins for the signed 64-bit SEEK_FROM request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +85,8 @@ pub enum Method {
     ReadDir = 7,
     Lookup = 8,
     SeekFrom = 9,
+    InfoFd = 10,
+    InfoPath = 11,
 }
 
 impl Method {
@@ -97,12 +105,14 @@ impl Method {
             7 => Some(Self::ReadDir),
             8 => Some(Self::Lookup),
             9 => Some(Self::SeekFrom),
+            10 => Some(Self::InfoFd),
+            11 => Some(Self::InfoPath),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
