@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <pthread.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -540,6 +541,103 @@ static int cancellation(void) {
     return 0;
 }
 
+
+_Static_assert(sizeof(pthread_key_t) == 8, "pthread key ABI");
+_Static_assert(PTHREAD_KEYS_MAX >= _POSIX_THREAD_KEYS_MAX, "minimum key capacity");
+_Static_assert(PTHREAD_DESTRUCTOR_ITERATIONS >= _POSIX_THREAD_DESTRUCTOR_ITERATIONS, "minimum destructor iterations");
+
+struct specific_context {
+    pthread_key_t key, plain;
+    int calls, cleaned, errors, mode;
+};
+static void specific_cleanup(void *argument) {
+    struct specific_context *context = argument;
+    if (pthread_getspecific(context->key) != context) context->errors++;
+    context->cleaned++;
+}
+static void specific_destructor(void *argument) {
+    struct specific_context *context = argument;
+    int old = 99;
+    if (pthread_getspecific(context->key) != NULL
+            || pthread_getspecific(context->plain) != context
+            || context->cleaned != (context->mode == 1 || context->mode == 2)
+            || pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old)
+            || old != PTHREAD_CANCEL_DISABLE || errno != 777) context->errors++;
+    pthread_testcancel();
+    pthread_key_t temporary;
+    if (pthread_key_create(&temporary, NULL)
+            || pthread_getspecific(temporary) != NULL
+            || pthread_setspecific(temporary, context)
+            || pthread_key_delete(temporary)) context->errors++;
+    void *block = malloc(64);
+    if (!block) context->errors++;
+    free(block);
+    context->calls++;
+    if (context->mode == 3) {
+        if (pthread_key_delete(context->key)
+                || pthread_key_create(&context->key, specific_destructor)
+                || pthread_getspecific(context->key) != NULL) context->errors++;
+        return;
+    }
+    /* Re-arm even the final pass: the implementation must bound destruction. */
+    if (pthread_setspecific(context->key, context)) context->errors++;
+}
+static void *specific_thread(void *argument) {
+    struct specific_context *context = argument;
+    errno = 777;
+    if (pthread_getspecific(context->key) != NULL || pthread_getspecific(context->plain) != NULL
+            || pthread_setspecific(context->key, context)
+            || pthread_setspecific(context->plain, context)) context->errors++;
+    pthread_cleanup_push(specific_cleanup, context);
+    if (context->mode == 1) pthread_exit(context);
+    if (context->mode == 2) {
+        if (pthread_cancel(pthread_self())
+                || pthread_setspecific(context->plain, NULL)
+                || pthread_getspecific(context->plain) != NULL
+                || pthread_setspecific(context->plain, context)) context->errors++;
+        /* The key operations above must return before the cancellation point. */
+        pthread_testcancel();
+        context->errors++;
+    }
+    pthread_cleanup_pop(0);
+    return context;
+}
+static int specifics(void) {
+    errno = 123;
+    pthread_key_t keys[PTHREAD_KEYS_MAX];
+    for (unsigned i = 0; i < PTHREAD_KEYS_MAX; i++) {
+        if (pthread_key_create(&keys[i], NULL) || pthread_getspecific(keys[i]) != NULL) return 230;
+    }
+    pthread_key_t extra = 987;
+    if (pthread_key_create(&extra, NULL) != EAGAIN || extra != 987 || errno != 123) return 231;
+    if (pthread_setspecific(keys[0], keys) || pthread_key_delete(keys[0])
+            || pthread_key_create(&extra, NULL) || extra == keys[0]
+            || pthread_getspecific(extra) != NULL || pthread_key_delete(extra)
+            || pthread_key_delete(keys[0]) != EINVAL || errno != 123) return 232;
+    for (unsigned i = 1; i < PTHREAD_KEYS_MAX; i++) {
+        if (pthread_key_delete(keys[i])) return 233;
+    }
+    struct specific_context context = {0};
+    if (pthread_key_create(&context.key, specific_destructor)
+            || pthread_key_create(&context.plain, NULL)
+            || pthread_setspecific(context.key, &extra)) return 234;
+    for (int mode = 0; mode < 4; mode++) {
+        context.mode = mode;
+        context.calls = context.cleaned = context.errors = 0;
+        pthread_t thread;
+        void *result = NULL;
+        if (pthread_create(&thread, NULL, specific_thread, &context)
+                || pthread_join(thread, &result)
+                || result != (mode == 2 ? PTHREAD_CANCELED : &context)
+                || context.calls != (mode == 3 ? 1 : PTHREAD_DESTRUCTOR_ITERATIONS)
+                || context.cleaned != (mode == 1 || mode == 2) || context.errors
+                || pthread_getspecific(context.key) != (mode == 3 ? NULL : &extra) || errno != 123) return 235 + mode;
+    }
+    if (pthread_setspecific(context.key, NULL) || pthread_key_delete(context.key)
+            || pthread_key_delete(context.plain) || errno != 123) return 238;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -594,6 +692,8 @@ int main(int argc, char **argv) {
     if (thread_result) return thread_result;
     int cancellation_result = cancellation();
     if (cancellation_result) return cancellation_result;
+    int specific_result = specifics();
+    if (specific_result) return specific_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();

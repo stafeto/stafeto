@@ -2,10 +2,11 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Initial managed pthread lifecycle. One IPC owner retains native handles,
-//! stack mappings and join results. ELF TLS, signal inheritance, cleanup
-//! handlers for thread-specific data and scheduler attributes remain work.
+//! stack mappings and join results. ELF TLS, signal inheritance and scheduler
+//! attributes remain work.
 
 pub mod cancel;
+pub mod specific;
 
 use crate::{allocation, constants::*, tls};
 use core::{
@@ -105,6 +106,7 @@ struct Launch {
     floating: AtomicU64,
     completed: AtomicBool,
     cancel: cancel::State,
+    specific: specific::Values,
 }
 static LAUNCH: [Launch; CAPACITY] = [const {
     Launch {
@@ -114,6 +116,7 @@ static LAUNCH: [Launch; CAPACITY] = [const {
         floating: AtomicU64::new(0),
         completed: AtomicBool::new(false),
         cancel: cancel::State::new(),
+        specific: specific::Values::new(),
     }
 }; CAPACITY];
 
@@ -188,6 +191,7 @@ struct Cached {
     nonce: u64,
     status: i32,
     value: u64,
+    extra: u64,
 }
 struct Waiting {
     caller: u64,
@@ -228,6 +232,7 @@ impl Entry {
 struct Registry {
     entries: [Option<Entry>; CAPACITY],
     next_id: u64,
+    specific: specific::Registry,
 }
 impl Registry {
     fn find(&self, id: u64) -> Result<usize, i32> {
@@ -243,14 +248,24 @@ impl Registry {
         self.entries[index].as_mut().expect("live entry")
     }
     fn cache(&mut self, caller: usize, nonce: u64, result: Result<u64, i32>, _op: u64) -> Cached {
-        let (status, value) = match result {
-            Ok(value) => (0, value),
-            Err(status) => (status, 0),
+        self.cache_pair(caller, nonce, result.map(|value| (value, 0)), _op)
+    }
+    fn cache_pair(
+        &mut self,
+        caller: usize,
+        nonce: u64,
+        result: Result<(u64, u64), i32>,
+        _op: u64,
+    ) -> Cached {
+        let (status, value, extra) = match result {
+            Ok((value, extra)) => (0, value, extra),
+            Err(status) => (status, 0, 0),
         };
         let answer = Cached {
             nonce,
             status,
             value,
+            extra,
         };
         self.entry_mut(caller).cached = Some(answer);
         #[cfg(feature = "transport-probe")]
@@ -310,6 +325,7 @@ impl Registry {
         LAUNCH[slot].floating.store(words[7], Ordering::Relaxed);
         LAUNCH[slot].completed.store(false, Ordering::Relaxed);
         LAUNCH[slot].cancel.reset();
+        LAUNCH[slot].specific.reset();
         LAUNCH[slot].id.store(id, Ordering::Release);
         // SAFETY: this slot owns the new stack until its native thread has ended.
         let native = unsafe {
@@ -556,9 +572,10 @@ impl Registry {
 }
 
 fn respond(token: sys::Token, answer: Cached) {
-    let mut bytes = [0; 16];
+    let mut bytes = [0; 24];
     bytes[..8].copy_from_slice(&(answer.status as u64).to_le_bytes());
-    bytes[8..].copy_from_slice(&answer.value.to_le_bytes());
+    bytes[8..16].copy_from_slice(&answer.value.to_le_bytes());
+    bytes[16..].copy_from_slice(&answer.extra.to_le_bytes());
     // An interrupted client's cached answer survives this rejected reply.
     let _ = token.reply(&bytes);
 }
@@ -568,6 +585,7 @@ extern "C" fn owner(_: u64) -> ! {
     let mut registry = Registry {
         entries: core::array::from_fn(|_| None),
         next_id: 2,
+        specific: specific::Registry::new(),
     };
     // SAFETY: startup handed main exclusively to this owner.
     let main = unsafe { (*MAIN.0.get()).take().expect("initial main handle") };
@@ -626,6 +644,7 @@ extern "C" fn owner(_: u64) -> ! {
                         nonce: 0,
                         status: EINVAL,
                         value: 0,
+                        extra: 0,
                     },
                 );
                 continue;
@@ -640,8 +659,12 @@ extern "C" fn owner(_: u64) -> ! {
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
         } else {
-            let result = registry.perform(caller, words);
-            let answer = registry.cache(caller, words[2], result, words[0]);
+            let result = if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
+                registry.specific.perform(caller, words)
+            } else {
+                registry.perform(caller, words).map(|value| (value, 0))
+            };
+            let answer = registry.cache_pair(caller, words[2], result, words[0]);
             respond(token, answer);
         }
     }
@@ -672,6 +695,10 @@ extern "C" fn trampoline(slot: u64) -> ! {
 }
 
 fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
+    request_pair(op, arguments).map(|(value, _)| value)
+}
+
+fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
     if !READY.load(Ordering::Acquire) || tls::thread_id() == 0 {
         return Err(EINVAL);
     }
@@ -697,11 +724,11 @@ fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
             Err(Error::Interrupted) if op == JOIN && cancel::requested() => return Err(ECANCELED),
             Err(Error::Interrupted) => continue,
             Err(_) => return Err(EIO),
-            Ok(reply) if reply.len == 16 => {
+            Ok(reply) if reply.len == 24 => {
                 if reply.words[0] != 0 {
                     return Err(reply.words[0] as i32);
                 }
-                return Ok(reply.words[1]);
+                return Ok((reply.words[1], reply.words[2]));
             }
             _ => return Err(EIO),
         }
@@ -811,10 +838,11 @@ pub extern "C" fn pthread_detach(thread: u64) -> i32 {
 
 /// # Safety
 /// The current thread is managed and has its initialized POSIX scope.
-/// Registered cleanup nodes remain live. Thread-specific destructors remain work.
+/// Registered cleanup nodes, destructors and their arguments remain live.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
     unsafe { cancel::exit_cleanup() };
+    unsafe { specific::exit_destructors() };
     let id = tls::thread_id();
     let launch = LAUNCH
         .iter()

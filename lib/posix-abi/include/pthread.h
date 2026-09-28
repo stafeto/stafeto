@@ -5,14 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stafeto/abi.h>
-typedef uint64_t pthread_t;
-typedef struct {
-    uint64_t __magic;
-    size_t __stack_size;
-    size_t __guard_size;
-    int __detached;
-    unsigned int __reserved;
-} pthread_attr_t;
+#include <sys/types.h>
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void *));
+int pthread_key_delete(pthread_key_t key);
+void *pthread_getspecific(pthread_key_t key);
+int pthread_setspecific(pthread_key_t key, const void *value);
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         void *(*start)(void *), void *argument);
 pthread_t pthread_self(void);

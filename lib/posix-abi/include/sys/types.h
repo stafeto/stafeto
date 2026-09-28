@@ -4,6 +4,15 @@
 #define STAFETO_SYS_TYPES_H
 #include <stddef.h>
 #include <stdint.h>
+typedef uint64_t pthread_t;
+typedef uint64_t pthread_key_t;
+typedef struct {
+    uint64_t __magic;
+    size_t __stack_size;
+    size_t __guard_size;
+    int __detached;
+    unsigned int __reserved;
+} pthread_attr_t;
 typedef uint64_t dev_t;
 typedef uint64_t ino_t;
 typedef uint32_t mode_t;
