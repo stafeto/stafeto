@@ -82,7 +82,11 @@ joining it must reclaim all records, handles and warmed memory.
 Restored-source QEMU/Apple VZ, C ABI, native input cancellation, Clippy and
 license checks passed. Seven mutations were caught: eviction/neighbor ACK (281),
 early release (1), missing free (87), missing reap (285), overwritten recovery
-(296), and absent recovery slots (destructor ENOMEM). Full CI is pending.
+(296), and absent recovery slots (destructor ENOMEM).
+Full cargo xtask ci passed on c6e5de6, including BusyBox and shipping hot paths.
+Init: 221 per machine; kernel: 165 normally, 176 under icount.
+Kernel images: 154704 bytes normally, 171072 for Apple VZ.
+Pthread/C ABI/standalone boot images: 495616/438272/454656 bytes.
 
 ## Remaining full POSIX work
 
