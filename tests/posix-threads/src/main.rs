@@ -31,6 +31,8 @@ mod clock_replies;
 mod clocks;
 #[cfg(not(feature = "cancel-input"))]
 mod file_replies;
+#[cfg(not(feature = "cancel-input"))]
+mod heap_replies;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
@@ -272,6 +274,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !file_replies::run()
         || !thread_replies::run()
         || !clock_replies::run(parent)
+        || !heap_replies::run()
         || !cancellation::run()
     {
         return false;
