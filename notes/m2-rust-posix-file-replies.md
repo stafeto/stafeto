@@ -77,7 +77,10 @@ at stage 251; duplicate effects at 269; missing deallocation at quota stage 257.
 The input-cancellation baseline now warms the journal before measuring reuse.
 The existing queued-file interruption check lets Fetch/Ack finish before
 checking EINTR, preserving its unchanged-output and ended-thread assertions.
-Full CI on the implementation commit is pending.
+Full cargo xtask ci passed on 1df6f3f, including BusyBox and shipping hot paths.
+Init: 221 per machine; kernel: 165 normally and 176 under icount.
+Kernel images: 154704 bytes normally, 171072 for Apple VZ.
+Pthread/C ABI/standalone boot images: 442368/393216/405504 bytes.
 
 ## Remaining full POSIX work
 
