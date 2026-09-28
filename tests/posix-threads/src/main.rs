@@ -28,6 +28,8 @@ mod capacity;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
+mod mutex;
+#[cfg(not(feature = "cancel-input"))]
 mod once;
 #[cfg(not(feature = "cancel-input"))]
 mod specific;
@@ -242,7 +244,8 @@ fn run() -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !capacity::run() || !specific::run() || !once::run() || !cancellation::run() {
+    if !capacity::run() || !specific::run() || !once::run() || !mutex::run() || !cancellation::run()
+    {
         return false;
     }
 

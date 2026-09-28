@@ -63,3 +63,10 @@ pub const LC_NUMERIC: i32 = 5;
 pub const LC_TIME: i32 = 6;
 
 pub use posix_types::constants::*;
+
+pub const EPERM: i32 = 1;
+pub const EBUSY: i32 = 16;
+pub const PTHREAD_MUTEX_NORMAL: i32 = 0;
+pub const PTHREAD_MUTEX_ERRORCHECK: i32 = 1;
+pub const PTHREAD_MUTEX_RECURSIVE: i32 = 2;
+pub const PTHREAD_MUTEX_DEFAULT: i32 = 3;
