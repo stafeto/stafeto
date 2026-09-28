@@ -52,7 +52,13 @@ Intentional mutations target zeroing the parent generation, dropping its console
 marker, and leaving Point::finish without closing its frame. All three were
 detected: lost cancellation wake at guest stage 243, and invalid state at stage
 244 for the marker and finish mutations. Sources were restored. Full CI and
-measurements are recorded after the ready implementation commit.
+cargo xtask ci passed on 6d44b62: licenses, formatting, Clippy, host and guest
+checks, BusyBox, image limits and shipping hot-path memcpy/memset checks.
+Init: 221 per machine; kernel: 165 normally and 176 under icount.
+Kernel images remain 154704 bytes normally and 171072 for Apple VZ.
+The pthread boot image is 425984 bytes; C ABI/standalone: 385024/405504 bytes.
+Normal null/clock/yield/notify/round_trip ticks remain 237/296/361/841/1756;
+test IPC ticks remain 245/467/1931/2122/3031/4267. Kernel code is unchanged.
 
 ## Remaining full POSIX work
 
