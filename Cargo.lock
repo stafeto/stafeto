@@ -282,6 +282,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-signal-queue"
+version = "0.1.0"
+dependencies = [
+ "posix-types",
+]
+
+[[package]]
 name = "posix-signals"
 version = "0.1.0"
 dependencies = [
