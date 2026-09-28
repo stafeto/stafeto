@@ -91,3 +91,7 @@ Retaining the join claim fails stage 16 while the canceled handler still runs.
 Skipping handlers or ignoring disabled state fails the C probe with code 220.
 Omitting UART cancellation acknowledgement fails input stage 32.
 All five mutations were restored before the final verification.
+
+Final cargo xtask ci passed on 8f096a7: init 221 per machine, kernel 165,
+and 176 under icount. Normal kernel 154704 bytes; Apple VZ 171072 bytes.
+Implementation: [#44](https://github.com/stafeto/stafeto/pull/44).

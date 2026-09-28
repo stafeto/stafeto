@@ -210,13 +210,14 @@ checks for successful calls, failures, and ABI layout.
 | Rust IPC wait interruption | Wake a live IPC client with Interrupted/EINTR, release queued transfers and wait references, preserve delivered handles and validate the next reply token; check UART and Virtio reads. | ✅ [#41](https://github.com/stafeto/stafeto/pull/41) |
 | Rust console cancellation recovery | Remove the tagged UART read before EINTR, restore input after a rejected reply, retry on the same thread/session, and retain delivered bytes when echo is interrupted; check UART and Virtio. | ✅ [#42](https://github.com/stafeto/stafeto/pull/42) |
 | Rust pthread lifecycle | Create, join, detach and exit native threads with independent errno, inherited FP state, owned stacks and retry-safe results; verify interrupted waits and last-thread process exit. | ✅ [#43](https://github.com/stafeto/stafeto/pull/43) |
-| Rust cancellation and signals | Add cancellation state/type and cleanup handlers, cancellation of future blocking file requests, accepted-operation result cleanup, and signal delivery with documented restart behavior. | 🚧 |
+| Rust deferred cancellation | Cancel read, write and join with disabled/pending state, LIFO handlers, acknowledged console cleanup and retained join results; verify the pre-IPC wake race on QEMU and Apple VZ. | ✅ [#44](https://github.com/stafeto/stafeto/pull/44) |
+| Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, thread-specific destructors, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
 | Shell I/O | Expose Rust descriptor duplication through the POSIX service and C ABI; add inherited descriptors and pipes, then verify `ash` pipelines and file output. | ⬜ |
 | Terminal input | Add a terminal service with line discipline, `termios`, window size, and BusyBox line editing; verify backspace, arrows, history, and Ctrl-C. | ⬜ |
-| Remaining interfaces | Add threads, signals, time, process control, sockets, permissions, and required utility behavior; publish a feature and option matrix. | ⬜ |
+| Remaining interfaces | Complete thread synchronization, signals, time, process control, sockets, permissions, and required utility behavior; publish a feature and option matrix. | ⬜ |
 | Conformance checks | Run API, shell, and utility suites on QEMU and Apple Virtualization.framework; record every remaining standard requirement and fix failures. | ⬜ |
 
 The initial Rust sysroot is experimental ABI 1 for AArch64 LP64.
@@ -224,9 +225,11 @@ The initial Rust sysroot is experimental ABI 1 for AArch64 LP64.
 under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links the C probe.
 It currently covers file calls, stat metadata, directory streams, process
 allocation, directory selection, sorting, the C/POSIX locale and startup
-with an empty environment, plus initial pthread lifecycle and stack attributes.
+with an empty environment, plus initial pthread lifecycle, stack attributes
+and deferred cancellation with cleanup handlers.
 Console waits leave the shared file owner available;
-stdio, general ELF TLS, cancellation and the remaining headers are pending.
+stdio, general ELF TLS, asynchronous cancellation and the remaining headers
+and cancellation points are pending.
 See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
 [notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) and
@@ -235,7 +238,9 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-shared.md](notes/m2-rust-posix-shared.md) and
 [notes/m2-rust-posix-input.md](notes/m2-rust-posix-input.md) and
 [notes/m2-rust-posix-messages.md](notes/m2-rust-posix-messages.md) and
-[notes/m2-rust-posix-threads.md](notes/m2-rust-posix-threads.md) for the boundary.
+[notes/m2-rust-posix-threads.md](notes/m2-rust-posix-threads.md) and
+[notes/m2-rust-posix-deferred-cancel.md](notes/m2-rust-posix-deferred-cancel.md)
+for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery
 still need implementation.
