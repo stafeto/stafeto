@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <stafeto/abi.h>
 #include <sys/types.h>
+#define PTHREAD_ONCE_INIT { 0 }
+int pthread_once(pthread_once_t *control, void (*routine)(void));
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *));
 int pthread_key_delete(pthread_key_t key);
 void *pthread_getspecific(pthread_key_t key);

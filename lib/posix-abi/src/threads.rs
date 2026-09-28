@@ -6,6 +6,7 @@
 //! attributes remain work.
 
 pub mod cancel;
+pub mod once;
 pub mod specific;
 
 use crate::{allocation, constants::*, tls};
@@ -208,6 +209,7 @@ struct Entry {
     waiting: Option<Waiting>,
     cached: Option<Cached>,
     woken_epoch: u64,
+    once_waiting: Option<once::Waiting>,
 }
 impl Entry {
     fn new(
@@ -226,6 +228,7 @@ impl Entry {
             waiting: None,
             cached: None,
             woken_epoch: 0,
+            once_waiting: None,
         }
     }
 }
@@ -562,6 +565,11 @@ impl Registry {
                 Ok(0)
             }
             #[cfg(feature = "transport-probe")]
+            17 => {
+                let index = self.find(words[3])?;
+                Ok(u64::from(self.entry(index).once_waiting.is_some()))
+            }
+            #[cfg(feature = "transport-probe")]
             6 => {
                 let index = self.find(words[3])?;
                 Ok(self.entry(index).native.as_ref().ok_or(ESRCH)?.raw().0)
@@ -656,10 +664,14 @@ extern "C" fn owner(_: u64) -> ! {
             .filter(|c| c.nonce == words[2])
         {
             respond(token, answer);
+        } else if words[0] == once::BEGIN {
+            registry.once_begin(caller, words, token);
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
         } else {
-            let result = if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
+            let result = if matches!(words[0], once::FINISH | once::RESET) {
+                registry.once_perform(words).map(|value| (value, 0))
+            } else if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
                 registry.specific.perform(caller, words)
             } else {
                 registry.perform(caller, words).map(|value| (value, 0))

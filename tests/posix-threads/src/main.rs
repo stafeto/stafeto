@@ -26,6 +26,8 @@ mod cancellation;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
+mod once;
+#[cfg(not(feature = "cancel-input"))]
 mod specific;
 
 rt::entry!(main);
@@ -238,7 +240,7 @@ fn run() -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !specific::run() || !cancellation::run() {
+    if !specific::run() || !once::run() || !cancellation::run() {
         return false;
     }
 
