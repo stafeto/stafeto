@@ -204,6 +204,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust directory C ABI | Enumerate directories through owned descriptors with `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies; check inode identity, shared offsets and resource limits. | ✅ [#35](https://github.com/stafeto/stafeto/pull/35) |
 | Rust process allocation | Export malloc, calloc, realloc, reallocarray, free and aligned allocation over a shared process heap; verify overflow, quota failure, data preservation and cross-thread ownership. | ✅ [#36](https://github.com/stafeto/stafeto/pull/36) |
 | Rust directory selection and ordering | Add owned `scandir` results, C/POSIX `alphasort`, `strcoll`/`strxfrm`, locale selection and allocation-free `qsort`/`qsort_r`; check callback reentry and cleanup after partial allocation failure. | ✅ [#37](https://github.com/stafeto/stafeto/pull/37) |
+| Shared Rust process file state | Serialize current RAM file operations through one owner; verify cross-thread descriptors, offsets, cwd, DIR lifetime and independent errno. Blocking-I/O concurrency and cancellation remain work. | ✅ [#38](https://github.com/stafeto/stafeto/pull/38) |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -222,7 +223,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
 [notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) and
 [notes/m2-rust-posix-heap.md](notes/m2-rust-posix-heap.md) and
-[notes/m2-rust-posix-scan.md](notes/m2-rust-posix-scan.md) for the boundary.
+[notes/m2-rust-posix-scan.md](notes/m2-rust-posix-scan.md) and
+[notes/m2-rust-posix-shared.md](notes/m2-rust-posix-shared.md) for the boundary.
 File timestamps currently use the platform counter; epoch time, symbolic
 links, credential checks and terminal-owned metadata remain pending.
 
@@ -256,6 +258,7 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask ext4ro` | boots a QEMU guest that reads a checked-in ext4 image created by e2fsprogs; no block driver is involved yet |
 | `cargo xtask ramfs` | boots a RAM file service and checks file descriptors, reads, writes, seeks, sizes, and standard output in QEMU |
 | `cargo xtask posix-abi` | boots C file and allocation ABI probes linked with Rust startup through Cargo and standalone Clang, then checks errno isolation and shared allocation on native guest threads; no Picolibc |
+| `cargo xtask posix-shared` | verifies shared Rust descriptors, offsets, cwd, directory streams and independent errno with two native clients; also included in `posix-abi` and `ci` |
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |
