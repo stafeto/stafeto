@@ -1249,6 +1249,11 @@ fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
 fn console_poll(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     lookup(thread, a[0], Rights::DEBUG, Object::resource)?;
     let mut bytes = [0u8; 8];
-    let count = crate::vz_driver::poll_input(&mut bytes);
+    // A zero limit preserves the original eight-byte ConsolePoll ABI.
+    let limit = if a[1] == 0 { 8 } else { a[1] };
+    if limit > 8 {
+        return Err(Error::InvalidArgs);
+    }
+    let count = crate::vz_driver::poll_input(&mut bytes[..limit as usize]);
     Ok(Values::new(&[count as u64, u64::from_le_bytes(bytes)]))
 }

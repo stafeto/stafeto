@@ -143,6 +143,30 @@ pub struct PosixFs {
     descriptors: Table<Backend, OPEN_MAX>,
 }
 
+/// A prepared read. RAM data is already serialized through the file owner;
+/// console waiting runs on the client while PosixFs retains the transport.
+pub struct PreparedRead(ReadState);
+
+// Fixed stack storage keeps reads usable before process allocation is initialized.
+#[allow(clippy::large_enum_variant)]
+enum ReadState {
+    Data(usize, [u8; MAX_READ]),
+    Input(rt::fs::Input, usize),
+}
+
+impl PreparedRead {
+    pub fn complete(self) -> Result<(usize, [u8; MAX_READ]), FsError> {
+        match self.0 {
+            ReadState::Data(length, bytes) => Ok((length, bytes)),
+            ReadState::Input(input, extent) => {
+                let mut bytes = [0; MAX_READ];
+                let length = input.read(&mut bytes[..extent]).map_err(FsError::from)?;
+                Ok((length, bytes))
+            }
+        }
+    }
+}
+
 impl PosixFs {
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, FsError> {
         Self::from_files(Files::connect(parent).map_err(FsError::from)?)
@@ -247,6 +271,20 @@ impl PosixFs {
 
     pub fn set_descriptor_flags(&mut self, fd: u32, flags: DescriptorFlags) -> Result<(), FsError> {
         self.descriptors.set_flags(fd, flags).map_err(FsError::from)
+    }
+
+    /// Validate a descriptor and snapshot console routing without waiting.
+    /// Keep this owner alive until every prepared console read finishes.
+    /// Closing or replacing a local fd does not close its retained transport.
+    pub fn prepare_read(&self, fd: u32, count: usize) -> Result<PreparedRead, FsError> {
+        let backend = self.descriptors.get(fd)?;
+        let extent = count.min(MAX_READ);
+        if matches!(backend, Backend::Input) && extent != 0 {
+            return Ok(PreparedRead(ReadState::Input(self.files.input(), extent)));
+        }
+        let mut bytes = [0; MAX_READ];
+        let length = self.read(fd, &mut bytes[..extent])?;
+        Ok(PreparedRead(ReadState::Data(length, bytes)))
     }
 
     pub fn read(&self, fd: u32, out: &mut [u8]) -> Result<usize, FsError> {

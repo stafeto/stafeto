@@ -48,6 +48,12 @@ pub fn poll(out: &mut [u8; 8]) -> Result<usize, Error> {
     sys::console_poll(&resource, out)
 }
 
+/// Poll at most limit bytes without consuming the rest of an input burst.
+pub fn poll_limit(out: &mut [u8; 8], limit: usize) -> Result<usize, Error> {
+    let resource = resource()?;
+    sys::console_poll_limit(&resource, out, limit)
+}
+
 /// Formats `args` into pieces of at most abi::INLINE_MAX bytes and writes
 /// each as it fills; stops writing at the first call that fails.
 pub fn write_fmt(args: fmt::Arguments<'_>) -> Result<(), Error> {

@@ -72,6 +72,27 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 3] = [
     ),
 ];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
+const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("uart", "uart", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "posix-shared-probe",
+        CHILD_STACK_SIZE,
+        &["input-probe"],
+    ),
+];
+const POSIX_NATIVE_INPUT_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-abi-probe",
+        "posix-shared-probe",
+        CHILD_STACK_SIZE,
+        &["native-input"],
+    ),
+];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -483,6 +504,8 @@ commands:
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-abi run a C main against Rust POSIX and verify thread-local errno
+  posix-input verify file progress during blocking console reads
+  posix-input-vz verify native console reads on Apple Virtualization.framework
   posix-shared verify cross-thread Rust POSIX file and directory state
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
@@ -508,6 +531,8 @@ fn main() {
         Some("cprobe") => cprobe(),
         Some("posix-abi") => posix_abi_probe(),
         Some("posix-shared") => posix_shared_probe(),
+        Some("posix-input") => posix_input_probe(false),
+        Some("posix-input-vz") => posix_input_probe(true),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -1000,6 +1025,7 @@ fn posix_abi_probe() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
     posix_shared_probe()?;
+    posix_input_probe(false)?;
     println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
     Ok(())
 }
@@ -1018,6 +1044,51 @@ fn posix_shared_probe() -> Result<(), String> {
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "posix-shared-probe: ok")?;
     println!("Rust POSIX shared-file guest probe passed");
+    Ok(())
+}
+
+fn posix_input_probe(native: bool) -> Result<(), String> {
+    let (mut cmd, ended) = if native {
+        let runner = vz::runner()?;
+        let kernel = build(Variant::Vz)?;
+        let image = build_boot_image(
+            "boot-posix-native-input.img",
+            &POSIX_NATIVE_INPUT_PROGRAMS,
+            BOOT_PROFILE,
+        )?;
+        let mut cmd = Command::new(runner);
+        cmd.arg(kernel.image).arg(image);
+        (
+            cmd,
+            "init: posix-abi-probe ended: exit code 0, not restarted",
+        )
+    } else {
+        let kernel = build(Variant::Normal)?;
+        let image = build_boot_image("boot-posix-input.img", &POSIX_INPUT_PROGRAMS, BOOT_PROFILE)?;
+        (
+            qemu::command(&qemu::VIRT, &kernel.image, Some(&image)),
+            "init: busybox-probe ended: exit code 0, not restarted",
+        )
+    };
+    if !native {
+        cmd.args(qemu::HEADLESS);
+    }
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect(
+            "posix-input-probe: files ready while input waits",
+            BOOT_TIMEOUT,
+        )?;
+        run.send("xyz")?;
+        run.expect("posix-input-probe: ok", DIALOG_STEP)?;
+        run.expect(ended, DIALOG_STEP)
+    })();
+    run.stop();
+    result?;
+    println!(
+        "Rust POSIX concurrent {} input guest probe passed",
+        if native { "native" } else { "UART" }
+    );
     Ok(())
 }
 
@@ -2667,7 +2738,7 @@ fn ci() -> Result<(), String> {
         "--package",
         "uart",
         "--features",
-        "uart/crash",
+        "uart/crash,posix-shared-probe/input-probe",
         "--package",
         "test-init",
         "--package",

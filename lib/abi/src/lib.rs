@@ -247,7 +247,9 @@ pub enum Call {
     TimerCancel = 26,
     ObjectInfo = 27,
     DebugWrite = 28,
-    /// Poll up to eight bytes from the native Virtio console.
+    /// Poll native Virtio console input. x0 names the DEBUG resource;
+    /// x1 limits consumption to 1..=8 bytes (zero retains the original limit 8).
+    /// Returns count in x1 and packed bytes in x2; excess input stays queued.
     ConsolePoll = 29,
 }
 
