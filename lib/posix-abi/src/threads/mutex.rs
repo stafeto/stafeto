@@ -7,12 +7,14 @@
 use super::{Registry, request, respond};
 use crate::{constants::*, tls};
 use core::sync::atomic::{AtomicU64, Ordering};
+use posix_time::Deadline;
 use rt::sys;
 
 pub(super) const LOCK: u64 = 18;
 pub(super) const TRY: u64 = 19;
 pub(super) const UNLOCK: u64 = 20;
 pub(super) const DESTROY: u64 = 21;
+pub(super) const TIMED: u64 = 23;
 const MAGIC: u64 = 0x5354_4d58_0000_0000;
 const ATTR_MAGIC: u64 = 0x5354_4d41_5454_5231;
 
@@ -84,11 +86,34 @@ pub(super) struct Waiting {
     address: u64,
     nonce: u64,
     token: sys::Token,
+    op: u64,
+    deadline: Option<Deadline>,
 }
 impl Registry {
     pub(super) fn mutex_lock(&mut self, caller: usize, words: [u64; 8], token: sys::Token) {
         // A retry replaces an interrupted token. A granted wait has already
         // been cleared and its nonce hits the shared reply cache instead.
+        #[cfg(feature = "transport-probe")]
+        if self
+            .entry(caller)
+            .mutex_waiting
+            .as_ref()
+            .is_some_and(|w| w.nonce == words[2])
+            && RETRY_TARGET
+                .compare_exchange(words[1], 0, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            let gate = rt::handle::Handle::<rt::handle::Channel>::borrowed(rt::abi::Handle(
+                RETRY_GATE.load(Ordering::Relaxed),
+            ));
+            super::probe_park(&gate);
+        }
+        if let Some(waiting) = self.entry_mut(caller).mutex_waiting.as_mut()
+            && waiting.nonce == words[2]
+        {
+            waiting.token = token;
+            return;
+        }
         self.entry_mut(caller).mutex_waiting = None;
         let result = (|| {
             if !valid_address(words[3]) {
@@ -121,15 +146,85 @@ impl Registry {
             Ok(true)
         })();
         if result == Ok(true) {
+            let deadline = if words[0] == TIMED {
+                match Deadline::new(words[4] as u32, words[5] as i64, words[6] as i64) {
+                    Ok(deadline) => Some(deadline),
+                    Err(_) => {
+                        let answer = self.cache(caller, words[2], Err(EINVAL), words[0]);
+                        respond(token, answer);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            // Flush existing calendar intervals before adding a new wait. Its
+            // first observation starts at registration, excluding earlier peaks.
+            if deadline.is_some_and(|d| d.clock == proto_clock::REALTIME) {
+                self.deadlines(true);
+            }
             self.entry_mut(caller).mutex_waiting = Some(Waiting {
                 address: words[3],
                 nonce: words[2],
                 token,
+                op: words[0],
+                deadline,
             });
         } else {
             let answer = self.cache(caller, words[2], result.map(|_| 0), words[0]);
             respond(token, answer);
         }
+    }
+    /// Expire in the original clock and choose the next representable wake.
+    /// Rechecking after every timer/clock notice rejects stale timer deliveries.
+    pub(super) fn mutex_deadlines(&mut self) -> Option<u64> {
+        self.deadlines(false)
+    }
+    fn deadlines(&mut self, force: bool) -> Option<u64> {
+        let realtime = self.entries.iter().flatten().any(|e| {
+            e.mutex_waiting
+                .as_ref()
+                .and_then(|w| w.deadline)
+                .is_some_and(|d| d.clock == proto_clock::REALTIME)
+        });
+        let observation = if realtime || force {
+            crate::clock::observation().ok()
+        } else {
+            None
+        };
+        let now = rt::time::ticks_to_ns(rt::time::now());
+        let mut next: Option<u64> = None;
+        for index in 0..self.entries.len() {
+            let Some(deadline) = self.entries[index]
+                .as_ref()
+                .and_then(|e| e.mutex_waiting.as_ref())
+                .and_then(|w| w.deadline)
+            else {
+                continue;
+            };
+            let target = deadline.target(observation.map(|o| o.anchor));
+            let error = match deadline.expired(now, observation) {
+                Err(_) => Some(EIO),
+                Ok(true) => Some(ETIMEDOUT),
+                Ok(false) => {
+                    let target = target.expect("validated deadline clock");
+                    if let Ok(when) = u64::try_from(target) {
+                        next = Some(next.map_or(when, |v| v.min(when)));
+                    }
+                    None
+                }
+            };
+            if let Some(error) = error {
+                let waiting = self
+                    .entry_mut(index)
+                    .mutex_waiting
+                    .take()
+                    .expect("expired mutex wait");
+                let answer = self.cache(index, waiting.nonce, Err(error), waiting.op);
+                respond(waiting.token, answer);
+            }
+        }
+        next
     }
     fn mutex_next(&self, address: u64) -> Option<usize> {
         self.entries
@@ -150,6 +245,7 @@ impl Registry {
             .map(|candidate| candidate.0)
     }
     pub(super) fn mutex_perform(&mut self, words: [u64; 8]) -> Result<u64, i32> {
+        self.mutex_deadlines();
         if !valid_address(words[3]) {
             return Err(EINVAL);
         }
@@ -182,7 +278,7 @@ impl Registry {
                         .take()
                         .expect("selected mutex waiter");
                     mutex.owner.store(self.entry(next).id, Ordering::Release);
-                    let answer = self.cache(next, waiting.nonce, Ok(0), LOCK);
+                    let answer = self.cache(next, waiting.nonce, Ok(0), waiting.op);
                     respond(waiting.token, answer);
                 } else {
                     mutex.count.store(0, Ordering::Relaxed);
@@ -228,8 +324,53 @@ pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut Mutex) -> i32 {
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut Mutex) -> i32 {
     unsafe { acquire(mutex, TRY) }
 }
+/// # Safety
+/// As for pthread_mutex_lock; deadline supplies one readable aligned Timespec.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_mutex_timedlock(
+    mutex: *mut Mutex,
+    deadline: *const posix_types::Timespec,
+) -> i32 {
+    unsafe { pthread_mutex_clocklock(mutex, crate::clock::CLOCK_REALTIME, deadline) }
+}
+/// # Safety
+/// As for pthread_mutex_timedlock. The original absolute deadline is retained
+/// across IPC interruption. This function is not a deferred cancellation point.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_mutex_clocklock(
+    mutex: *mut Mutex,
+    clock: i32,
+    deadline: *const posix_types::Timespec,
+) -> i32 {
+    if !matches!(
+        clock,
+        crate::clock::CLOCK_REALTIME | crate::clock::CLOCK_MONOTONIC
+    ) || deadline.is_null()
+    {
+        return EINVAL;
+    }
+    // SAFETY: the caller supplies one readable Timespec; invalid nanoseconds are
+    // checked only when ownership cannot be acquired immediately.
+    let deadline = unsafe { deadline.read() };
+    unsafe {
+        acquire_args(
+            mutex,
+            TIMED,
+            [
+                mutex as u64,
+                clock as u64,
+                deadline.tv_sec as u64,
+                deadline.tv_nsec as u64,
+                0,
+            ],
+        )
+    }
+}
 unsafe fn acquire(mutex: *mut Mutex, op: u64) -> i32 {
-    match request(op, [mutex as u64, 0, 0, 0, 0]) {
+    unsafe { acquire_args(mutex, op, [mutex as u64, 0, 0, 0, 0]) }
+}
+unsafe fn acquire_args(mutex: *mut Mutex, op: u64, arguments: [u64; 5]) -> i32 {
+    match request(op, arguments) {
         Ok(_) => {
             // SAFETY: a successful owner request validated the live object.
             // An Acquire RMW reads the latest ownership modification even
@@ -338,4 +479,19 @@ pub unsafe fn probe_recursion(mutex: *mut Mutex, count: u32) {
     assert_eq!(object.kind(), Ok(PTHREAD_MUTEX_RECURSIVE));
     assert!(count != 0);
     object.count.store(u64::from(count), Ordering::Relaxed);
+}
+
+#[cfg(feature = "transport-probe")]
+pub fn probe_interrupt_timed_reply() {
+    super::INTERRUPT_REPLIES.fetch_or(1 << TIMED, Ordering::AcqRel);
+}
+
+#[cfg(feature = "transport-probe")]
+static RETRY_GATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static RETRY_TARGET: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+pub fn probe_gate_retry(gate: &rt::handle::Handle<rt::handle::Channel>, thread: u64) {
+    RETRY_GATE.store(gate.raw().0, Ordering::Relaxed);
+    RETRY_TARGET.store(thread, Ordering::Release);
 }

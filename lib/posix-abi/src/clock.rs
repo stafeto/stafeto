@@ -44,6 +44,16 @@ pub fn probe_interrupt(
         .map_err(|_| Status::Kernel(rt::abi::Error::BadState))?
         .probe_interrupt(thread, method)
 }
+pub(crate) fn watch(channel: &Handle<Channel>) -> Result<(), Status> {
+    // SAFETY: startup initialized the immutable option before thread startup.
+    if let Some(client) = unsafe { &*STATE.0.get() }.as_ref() {
+        client.watch(channel)?;
+    }
+    Ok(())
+}
+pub(crate) fn observation() -> Result<posix_time::Observation, c_int> {
+    client()?.observe().map_err(error)
+}
 fn error(status: Status) -> c_int {
     match status.code() {
         proto_clock::INVALID => EINVAL,

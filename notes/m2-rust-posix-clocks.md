@@ -60,7 +60,8 @@ it verifies that another process observes both date and generation.
 A test-only service method interrupts a native setter in AwaitingReply after SET
 commits, then separately interrupts after ACK removes the retained record.
 Both calls succeed and SET advances the generation exactly once.
-The normal clock service does not expose this method or accept transferred handles.
+The normal clock service does not expose this native-thread test method.
+Its subsequent WATCH extension accepts notification-channel handles only.
 Further guest checks replay an older retained SET after another client's newer setting,
 reject changed payloads and trailing bytes, and check warmed quota and handle recovery.
 

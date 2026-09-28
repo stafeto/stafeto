@@ -763,6 +763,33 @@ static int mutexes(void) {
     return errno == 123 ? 0 : 261;
 }
 
+static int timed_mutexes(void) {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    const struct timespec invalid = {0, 1000000000}, past = {-1, 0};
+    errno = 123;
+    if (pthread_mutex_clocklock(&mutex, 99, &past) != EINVAL || errno != 123) return 283;
+    if (pthread_mutex_timedlock(&mutex, &invalid) || errno != 123
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_clocklock(&mutex, CLOCK_MONOTONIC, &past)
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_destroy(&mutex)) return 282;
+    if (pthread_mutex_init(&mutex, NULL) || pthread_mutex_lock(&mutex)
+            || pthread_mutex_timedlock(&mutex, &invalid) != EINVAL
+            || pthread_mutex_timedlock(&mutex, &past) != ETIMEDOUT
+            || pthread_mutex_clocklock(&mutex, CLOCK_MONOTONIC, &past) != ETIMEDOUT
+            || errno != 123 || pthread_mutex_unlock(&mutex) || pthread_mutex_destroy(&mutex)) return 284;
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr) || pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE)
+            || pthread_mutex_init(&mutex, &attr) || pthread_mutex_lock(&mutex)
+            || pthread_mutex_timedlock(&mutex, &invalid) || pthread_mutex_clocklock(&mutex, CLOCK_MONOTONIC, &past)
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_unlock(&mutex)
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_destroy(&mutex)) return 285;
+    if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK)
+            || pthread_mutex_init(&mutex, &attr) || pthread_mutex_lock(&mutex)
+            || pthread_mutex_timedlock(&mutex, &past) != EDEADLK
+            || pthread_mutex_unlock(&mutex) || pthread_mutex_destroy(&mutex)
+            || pthread_mutexattr_destroy(&attr) || errno != 123) return 286;
+    return 0;
+}
+
 static void *clock_reader(void *expected) {
     struct timespec value;
     errno = 777;
@@ -873,6 +900,8 @@ int main(int argc, char **argv) {
     if (mutex_result) return mutex_result;
     int clock_result = clocks();
     if (clock_result) return clock_result;
+    int timed_result = timed_mutexes();
+    if (timed_result) return timed_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();
