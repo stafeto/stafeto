@@ -147,7 +147,7 @@ pub const START_CHANNEL: Handle = Handle::new(0, 1);
 
 /// Threads of one process that have not ended, at most (spec 8):
 /// `thread_create` past it fails with LIMIT_REACHED.
-pub const MAX_THREADS: u32 = 64;
+pub const MAX_THREADS: u32 = 128;
 
 /// Timers one process pays for, at most (spec 10): `timer_create` past it
 /// fails with LIMIT_REACHED.
@@ -155,7 +155,7 @@ pub const MAX_TIMERS: u32 = 64;
 
 /// Mappings of one process, at most (spec 7.4): `mem_map` past it fails
 /// with LIMIT_REACHED.
-pub const MAX_MAPPINGS: u32 = 64;
+pub const MAX_MAPPINGS: u32 = 128;
 
 /// Bytes of the largest memory object (spec 7.3): `mem_create` takes whole
 /// pages from one page to this, 1 GiB.

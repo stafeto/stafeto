@@ -22,7 +22,7 @@ use rt::{
     sys,
 };
 
-const CAPACITY: usize = 32;
+const CAPACITY: usize = PTHREAD_THREADS_MAX as usize;
 const PAGE: usize = 4096;
 const STACK_BASE: usize = 0x3000_0000;
 const STRIDE: usize = 0x10_0000;
@@ -89,7 +89,7 @@ static CHANNEL: Once<Handle<Channel>> = Once(UnsafeCell::new(None));
 static MAIN: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
 static REAPER: Once<Handle<Timer>> = Once(UnsafeCell::new(None));
 static READY: AtomicBool = AtomicBool::new(false);
-static OWNER_STACK: Stack<32768> = Stack::new();
+static OWNER_STACK: Stack<65536> = Stack::new();
 #[cfg(feature = "transport-probe")]
 static INTERRUPT_REPLIES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "transport-probe")]
@@ -134,7 +134,7 @@ fn channel() -> &'static Handle<Channel> {
 ///
 /// # Safety
 /// Startup owns exclusive initialization. 0xf00000, message pages starting
-/// at 0x2000000 and stack reservations 0x30000000..0x32000000 are unused.
+/// at 0x2000000 and stack reservations 0x30000000..0x34000000 are unused.
 /// The supplied handle owns the calling main thread.
 pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
     if READY.load(Ordering::Acquire) {

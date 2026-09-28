@@ -20,15 +20,16 @@ use super::*;
 use crate::arch::cache;
 use crate::memory;
 use abi::{Access, Call};
-use core::mem::{MaybeUninit, align_of, size_of};
+use core::mem::{align_of, size_of};
 use kcore::maps::{Mapping, Maps};
+use kcore::slab::PageSource;
 
-/// The mapping table of a process: MAX_MAPPINGS entries in one block of
-/// its pool of blocks.
+/// The mapping table of a process: MAX_MAPPINGS entries in one paid page
+/// recorded in its page log. The page lives until the process shell is freed.
 pub type Table = Maps<NonNull<Memory>>;
 
 const _: () =
-    assert!(size_of::<Table>() <= size_of::<Block>() && align_of::<Table>() <= align_of::<Block>());
+    assert!(size_of::<Table>() <= PAGE_SIZE as usize && align_of::<Table>() <= PAGE_SIZE as usize);
 
 /// Pages a portion of mem_map, mem_unmap or mem_protect takes at most
 /// (spec 7.7).
@@ -80,7 +81,7 @@ impl Change {
 /// # Safety
 /// `process` is alive, and nothing else borrows its table meanwhile.
 pub(super) unsafe fn table<'a>(process: NonNull<Process>) -> Option<&'a mut Table> {
-    // SAFETY: the caller's promise; the block holds the table from its
+    // SAFETY: the caller's promise; the paid page holds the table from its
     // first mapping on (`add_mapping`).
     unsafe { (*process.as_ptr()).maps.map(|t| &mut *t.as_ptr()) }
 }
@@ -145,9 +146,9 @@ pub fn in_mapping(process: NonNull<Process>, va: usize) -> bool {
 /// The resources of mem_map, step (6), and its entry, `mapping`, whose
 /// range the call checked (`check_free`): LIMIT_REACHED when `target`
 /// has abi::MAX_MAPPINGS mappings; NO_MEMORY when its quota falls short for
-/// the block of its table at its first mapping, whose page its pool of
-/// blocks takes, or for the most tables the range may take, which are
-/// charged to it now (spec 7.5). A failure changes nothing but the block,
+/// the page of its table at its first mapping, or for the most page
+/// tables the range may take, which are
+/// charged to it now (spec 7.5). A failure changes nothing but the table page,
 /// which stays the table's. Then the entry goes in, busy, with a new
 /// reference to its object; returns the change, and the bytes charged for
 /// tables. The caller holds a reference to `target`, which lives.
@@ -163,15 +164,11 @@ pub fn add_mapping(
             return Err(Error::LimitReached);
         }
         if (*p).maps.is_none() {
-            let (pools, quota, log) = (&mut (*p).pools, &mut (*p).quota, &mut (*p).pages);
-            let block = pools
-                .blocks
-                .alloc(
-                    &mut PaidPages::new(KernelPages, quota, log),
-                    MaybeUninit::uninit(),
-                )
-                .map_err(|_| Error::NoMemory)?;
-            let t = block.cast::<Table>();
+            let (quota, log) = (&mut (*p).quota, &mut (*p).pages);
+            let page = PaidPages::new(KernelPages, quota, log)
+                .alloc_page()
+                .ok_or(Error::NoMemory)?;
+            let t = page.cast::<Table>();
             t.write(Table::new());
             (*p).maps = Some(t);
         }
@@ -373,8 +370,8 @@ pub fn device_windows(process: NonNull<Process>) -> usize {
 }
 
 /// The stage Mappings (spec 7.7): every entry of the table, busy or not,
-/// leaves it, its reference to the object going at `level`, and the block
-/// goes back to the pool of blocks. The stage Space took the ASID, so no
+/// leaves it, its reference to the object going at `level`. Its paid page
+/// stays in the page log until shell cleanup. The stage Space took the ASID, so no
 /// TLB entry maps a frame of an object that goes. One portion: at most
 /// abi::MAX_MAPPINGS entries, each O(1).
 ///
@@ -382,7 +379,7 @@ pub fn device_windows(process: NonNull<Process>) -> usize {
 /// `process` is alive and on its stages.
 pub(super) unsafe fn release_all(process: NonNull<Process>, level: u8) -> bool {
     let p = process.as_ptr();
-    // SAFETY: the caller's promise; only the table and the pool are
+    // SAFETY: the caller's promise; only the table and its references are
     // touched, and each entry's reference goes with the entry.
     unsafe {
         let Some(t) = (*p).maps.take() else {
@@ -390,7 +387,7 @@ pub(super) unsafe fn release_all(process: NonNull<Process>, level: u8) -> bool {
         };
         // Each entry that goes lets its reference to the object go.
         (*t.as_ptr()).drain(|m| memory::release_mapping(m.object, level));
-        (*p).pools.blocks.free(t.cast::<Block>());
+        // The table owns one paid page; PageLog returns it with the shell.
     }
     true
 }

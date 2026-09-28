@@ -16,6 +16,7 @@ pub const EAGAIN: i32 = 11;
 pub const EDEADLK: i32 = 35;
 pub const PTHREAD_CREATE_JOINABLE: i32 = 0;
 pub const PTHREAD_CREATE_DETACHED: i32 = 1;
+pub const PTHREAD_THREADS_MAX: u32 = 64;
 pub const PTHREAD_KEYS_MAX: u32 = 128;
 pub const PTHREAD_DESTRUCTOR_ITERATIONS: u32 = 4;
 pub const PTHREAD_STACK_MIN: u32 = 16384;

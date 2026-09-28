@@ -3,7 +3,7 @@
 
 //! The mappings of a process (spec 7.4, 7.7): up to MAX_MAPPINGS ranges of
 //! whole pages of its address space, each showing pages of one memory
-//! object, in a table of 2 KiB. A mapping holds a counted reference to its
+//! object, in a table of 4 KiB. A mapping holds a counted reference to its
 //! object, `T`, and the rights of the handle it was made through; a long
 //! call that works on it marks it busy, and the other calls on it get
 //! BAD_STATE until the mark goes. `mem_unmap` and `mem_protect` take
@@ -62,8 +62,8 @@ impl<T> Mapping<T> {
     }
 }
 
-/// The mapping table of a process: MAX_MAPPINGS entries, 2 KiB, one block
-/// of the process's pool (spec 7.8).
+/// The mapping table of a process: MAX_MAPPINGS entries, 4 KiB, one paid
+/// page recorded in the process page log (spec 7.8).
 #[derive(Debug)]
 pub struct Maps<T> {
     entries: [Option<Mapping<T>>; MAX_MAPPINGS],
@@ -226,10 +226,10 @@ mod tests {
     }
 
     #[test]
-    fn mapping_table_fits_one_block() {
+    fn mapping_table_fits_one_page() {
         assert_eq!(core::mem::size_of::<Mapping<NonNull<u8>>>(), 32);
-        assert_eq!(core::mem::size_of::<Maps<NonNull<u8>>>(), 2048);
-        assert_eq!(core::mem::size_of::<Maps<u32>>(), 2048);
+        assert_eq!(core::mem::size_of::<Maps<NonNull<u8>>>(), 4096);
+        assert_eq!(core::mem::size_of::<Maps<u32>>(), 4096);
     }
 
     #[test]
@@ -302,23 +302,23 @@ mod tests {
     }
 
     #[test]
-    fn limit_is_64() {
+    fn limit_is_128() {
         let mut maps = Maps::new();
         for i in 0..MAX_MAPPINGS as u64 {
             maps.insert(mapping(i * PAGE, 1, i as u32)).unwrap();
         }
-        assert_eq!(maps.len(), 64);
-        let next = mapping(64 * PAGE, 1, 64);
-        assert_eq!(maps.check_free(64 * PAGE, 1), Ok(()));
+        assert_eq!(maps.len(), 128);
+        let next = mapping(128 * PAGE, 1, 128);
+        assert_eq!(maps.check_free(128 * PAGE, 1), Ok(()));
         assert_eq!(maps.insert(next), Err(Error::LimitReached));
         let i = maps.find(7 * PAGE, 1).unwrap();
         maps.remove(i);
-        assert_eq!(maps.iter().count(), 63);
+        assert_eq!(maps.iter().count(), 127);
         assert!(maps.iter().all(|m| m.object != 7));
         assert_eq!(maps.insert(next), Ok(i));
         let mut drained = 0;
         maps.drain(|_| drained += 1);
-        assert_eq!((drained, maps.is_empty()), (64, true));
+        assert_eq!((drained, maps.is_empty()), (128, true));
     }
 
     #[test]

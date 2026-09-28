@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Pages for kernel object pools: frames from the allocator, reached
+//! Pages for kernel object pools, mapping tables and page logs: frames from
+//! the allocator, reached
 //! through the linear map. The pools of a payer take them through
 //! kcore::slab::PaidPages and give them back with the payer's shell
 //! (spec 7.8); the pool of processes with no parent keeps its pages.
@@ -14,7 +15,7 @@ use kcore::slab::PageSource;
 
 pub struct KernelPages;
 
-/// Pages the pools and page logs hold now.
+/// Pages the pools, mapping tables and page logs hold now.
 static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 // SAFETY: every page is a frame just taken from the allocator, 4 KiB
@@ -28,7 +29,7 @@ unsafe impl PageSource for KernelPages {
     }
 }
 
-/// Gives a page of a payer's pools or page log back to the frame
+/// Gives a page of a payer's pools, mapping table or page log back to the frame
 /// allocator (the stage Shell). Test builds fill it with POISON first: a
 /// use after the release reads the poison until the frame is taken again.
 ///
@@ -50,8 +51,8 @@ pub unsafe fn give_back(page: NonNull<u8>) {
 #[cfg(feature = "ktest")]
 pub const POISON: u8 = 0xA5;
 
-/// Pages the pools of kernel objects and the page logs of their payers
-/// hold: KSTATS reports them (spec 11), and together with the free frames
+/// Pages the pools of kernel objects, mapping tables and page logs of
+/// their payers hold: KSTATS reports them (spec 11), and together with the free frames
 /// they stay the same over the life of objects that give back all they
 /// took, their payer's shell included.
 pub fn taken() -> usize {

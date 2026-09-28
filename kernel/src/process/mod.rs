@@ -198,8 +198,8 @@ const _: () = assert!(Pool::<Process>::PER_PAGE >= 3);
 pub struct Pools {
     /// Its threads, whoever made them.
     threads: Pool<Thread>,
-    /// The chunks and the directory of its handle table, and the table of
-    /// its mappings (`maps`).
+    /// The chunks and the directory of its handle table. The mapping
+    /// table has its own paid page in the process page log.
     blocks: Pool<Block>,
     /// The shells of its children.
     children: Pool<Process>,
