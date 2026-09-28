@@ -1091,14 +1091,13 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
     fit
 }
 
-/// The end of `t` while it waits (sched::exit, spec 6.8, 7.7): its slot
+/// Abandon the current wait of `t` (exit or interrupt): its slot
 /// leaves the queue it stands in, wherever it stands there: a channel's, or
 /// the queue of accepted requests of the process that took its request,
-/// and then its number keeps the mark of a thread that died waiting for
-/// its reply (Table::mark_dead). What the wait held, a channel or a
+/// and then its last accepted request is marked dead (Table::mark_dead). What the wait held, a channel or a
 /// session, goes to the caller, which lets it go once the scheduler has
 /// let the thread go (`Via::let_go`); the handles of a request stay in the
-/// thread until its buffer goes (thread::drop_buffer). None for a thread
+/// thread until exit drops its buffer or interrupt drops its transit. None for a thread
 /// that waits for nothing, or for a reply. O(1).
 ///
 /// # Safety

@@ -24,7 +24,7 @@
 
 use crate::arch::{self, gic, timer};
 use crate::thread::{self, THREADS, Thread};
-use crate::{channel, cleanup};
+use crate::{channel, cleanup, syscall};
 use abi::{Error, Policy};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
@@ -204,6 +204,37 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
         // SAFETY: the reference `start` took ends with the thread.
         unsafe { thread::release(t, cause) };
     }
+}
+
+/// Interrupt only an existing send, receive, or accepted-request wait.
+/// The thread remains alive, retaining its number and message buffer. No
+/// interrupt is queued for a future call. Wait references and moved handles
+/// are released outside the scheduler lock. O(1), at most four handles.
+///
+/// # Safety
+/// `t` is alive and the caller holds a reference throughout this call.
+pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+    let waited = locked(|k| {
+        // SAFETY: the caller holds the thread; waits and queue membership
+        // change together under this lock. A live IPC waiter is blocked.
+        unsafe {
+            if t.as_ref().waits.is_none() {
+                return Err(Error::BadState);
+            }
+            let waited = channel::cancel(t, k);
+            syscall::set_result(t, Err(Error::Interrupted));
+            k.s.wake(t);
+            Ok(waited)
+        }
+    })?;
+    // SAFETY: queued send handles are still owned by the interrupted thread.
+    // Accepted sends have already moved them and hold no transit handles.
+    unsafe { thread::drop_transit(t, cause) };
+    if let Some(via) = waited {
+        // SAFETY: cancel removed the wait that held this reference.
+        unsafe { via.let_go(cause) };
+    }
+    Ok(())
 }
 
 /// yield: the running thread goes to the tail of its level with a new

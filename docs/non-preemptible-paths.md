@@ -77,6 +77,15 @@ the receiver runs at once, when its level after the boost is above the
 cleanup queue's and every ready thread's and no interrupt is pending; the
 state is the one the slow path leaves.
 
+ThreadInterrupt removes a live thread's current IPC wait and wakes it with
+Interrupted, keeping its thread number and message buffer. Queue removal,
+accepted-token marking and wakeup take O(1) under the scheduler lock. After
+the lock it releases the wait reference and up to four transit handles at
+the caller's effective priority. Closing a transferred RECEIVE handle can
+queue bounded cleanup as described above. No queue is scanned and no memory
+is allocated. The next accepted request increments the token count and clears
+the abandoned-request mark, making old tokens stale without number reuse.
+
 From part 1.3b on, the timers of programs stand in binary heaps, their
 nodes inside the timer objects (spec 10), and from part 1.3e on in a heap
 for each level of 1-63, the priority of the timer's slot: arming, moving,
@@ -304,6 +313,7 @@ window that goes.
 | `handle_duplicate` | without a label: inserts a copy of the handle with narrowed rights and adds a reference to the object (to a session, a copy too); with a label: checks the room in the caller's table (spec 11), takes one of the channel's 1024 slots, takes a slot in the caller's pool of sessions (the pool growth row), and inserts the session's handle | constant: at most one growth of the caller's pool of sessions and of its pool of blocks |  |
 | the last copy of a session goes (`session::release`: `handle_close`, the Handles stage) | with the channel open, posts the bit `CLIENT_GONE` into the session's slot as `notify` does (delivery to a waiter or enqueuing); then releases the copy's reference, and the last one puts the session on the cleanup queue | constant: as `notify`; takes no memory, the slot was allocated with the session |  |
 | a session chunk (`session::clean`) | returns the session's slot to the channel's limit and the object's slot to the payer's pool of sessions (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | constant |  |
+| `thread_interrupt` | checks a thread handle with MANAGE; removes its current send, receive or accepted-request wait, marks an accepted token abandoned and wakes the live thread with Interrupted under the scheduler lock; after the lock releases its wait reference and up to four queued transfer handles at the caller's effective priority | constant: one lookup, one queue removal, one token mark, one wake and at most four handle releases; closing a session can post CLIENT_GONE as above | not measured |
 | `thread_exit` | unmaps the message-buffer page, flushing its TLB entry, and returns the frame (a running thread carries no handles of a request); gives the thread's number back; removes the thread from the process's list; the last running thread terminates the process, as in the process termination row | constant, except for process termination |  |
 | `clock_now` | reads the counter and turns ticks into nanoseconds, rounded down | constant: one 64-by-64-bit multiplication and a shift (`abi::time::Scale`) | 293 |
 | `timer_create` | checks the room in the caller's table (spec 11) and the caller's 64 timers, takes one of the channel's 1024 slots, then a slot in the caller's pool of timers (the pool growth row), and inserts the handle | constant: at most one growth of the caller's pool of timers and of its pool of blocks; the timer is not armed |  |

@@ -207,6 +207,8 @@ checks for successful calls, failures, and ABI layout.
 | Shared Rust process file state | Serialize current RAM file operations through one owner; verify cross-thread descriptors, offsets, cwd, DIR lifetime and independent errno. Request cancellation and future blocking file backends remain work. | ✅ [#38](https://github.com/stafeto/stafeto/pull/38) |
 | Rust console read concurrency | Wait for console input outside the file owner; verify file and heap progress, descriptor close/reuse, stdin redirection and byte-at-a-time bursts on UART and native Virtio. | ✅ [#39](https://github.com/stafeto/stafeto/pull/39) |
 | Rust file request lifetime | Replace caller-stack jobs with checked value messages; reject malformed requests before heap startup and preserve full message payloads across nested RAM calls. | ✅ [#40](https://github.com/stafeto/stafeto/pull/40) |
+| Rust IPC wait interruption | Wake a live IPC client with Interrupted/EINTR, release queued transfers and wait references, preserve delivered handles and validate the next reply token; check UART and Virtio reads. | ✅ [#41](https://github.com/stafeto/stafeto/pull/41) |
+| Rust cancellation and signals | Add pthread lifecycle, cancellation state/type and cleanup handlers, service-side removal of deferred reads, accepted-operation result cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -269,6 +271,8 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask posix-input` | verifies file and heap progress during a UART input wait, descriptor reuse, stdin redirection and burst reads; included in `posix-abi` and `ci` |
 | `cargo xtask posix-input-vz` | verifies the same scenario through native Virtio input on Apple silicon without QEMU; requires Virtualization.framework |
 | `cargo xtask posix-shared` | verifies shared Rust file state and errno, rejects malformed messages before heap startup, and checks full message payloads; included in `posix-abi` and `ci` |
+| `cargo xtask posix-interrupt` | verifies IPC wait interruption, transfer cleanup, reply-token reuse and Rust POSIX EINTR on UART; included in `posix-abi` and `ci` |
+| `cargo xtask posix-interrupt-vz` | verifies the same IPC cases and Virtio read interruption, including timer/channel cleanup, on Apple silicon |
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |

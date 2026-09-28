@@ -6,12 +6,11 @@
 #![no_std]
 #![no_main]
 
-use core::{
-    ptr,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+#[cfg(not(feature = "interrupt-probe"))]
+use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use posix_abi::{self as abi, constants::*, shared, tls};
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 use posix_abi::{directory, metadata};
 use posix_fs::PosixFs;
 use rt::{
@@ -23,24 +22,27 @@ use rt::{
 #[cfg(feature = "input-probe")]
 mod input;
 
+#[cfg(feature = "interrupt-probe")]
+mod interrupt;
+
 mod wire;
 
 rt::entry!(main);
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static STACK: Stack<16384> = Stack::new();
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static FD: AtomicUsize = AtomicUsize::new(0);
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static ALIAS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 static ERROR: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static HISTOGRAM: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static MAIN_BYTES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static WORKER_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn fail(stage: usize) -> bool {
@@ -48,7 +50,7 @@ fn fail(stage: usize) -> bool {
     false
 }
 
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 fn reading(fd: i32, worker: bool) -> bool {
     let mut byte = 0;
     loop {
@@ -69,7 +71,7 @@ fn reading(fd: i32, worker: bool) -> bool {
     }
 }
 
-#[cfg(not(feature = "input-probe"))]
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 extern "C" fn worker(completion: u64) -> ! {
     let passed = tls::with_process(|| {
         let errno = unsafe { abi::__errno_location() };
@@ -124,7 +126,13 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let files = if cfg!(all(feature = "input-probe", not(feature = "native-input"))) {
+    let files = if cfg!(any(
+        all(feature = "input-probe", not(feature = "native-input")),
+        all(
+            feature = "interrupt-probe",
+            not(feature = "native-interrupt")
+        ),
+    )) {
         PosixFs::connect_with_uart(&start.parent)
     } else {
         PosixFs::connect(&start.parent)
@@ -144,12 +152,17 @@ fn main(_: u64) -> u64 {
         );
         return 3;
     }
+    #[cfg(feature = "interrupt-probe")]
+    let passed = tls::with_process(|| {
+        let process = Handle::<rt::handle::Process>::borrowed(process);
+        wire::payload() && interrupt::run(&process, &start.thread) && shared::cleanup().is_ok()
+    });
     #[cfg(feature = "input-probe")]
     let passed = tls::with_process(|| {
         let process = Handle::<rt::handle::Process>::borrowed(process);
         wire::payload() && input::run(&process, &start.thread) && shared::cleanup().is_ok()
     });
-    #[cfg(not(feature = "input-probe"))]
+    #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
     let passed = tls::with_process(|| {
         if !wire::payload() {
             return false;

@@ -93,6 +93,27 @@ const POSIX_NATIVE_INPUT_PROGRAMS: [ImageProgram; 3] = [
         &["native-input"],
     ),
 ];
+const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "posix-shared-probe",
+        CHILD_STACK_SIZE,
+        &["interrupt-probe"],
+    ),
+];
+const POSIX_NATIVE_INTERRUPT_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-abi-probe",
+        "posix-shared-probe",
+        CHILD_STACK_SIZE,
+        &["native-interrupt"],
+    ),
+];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -506,6 +527,8 @@ commands:
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
   posix-input-vz verify native console reads on Apple Virtualization.framework
+  posix-interrupt verify live IPC interruption and Rust POSIX EINTR on UART
+  posix-interrupt-vz verify interruption of native console timer waits
   posix-shared verify cross-thread Rust POSIX file and directory state
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
@@ -533,6 +556,8 @@ fn main() {
         Some("posix-shared") => posix_shared_probe(),
         Some("posix-input") => posix_input_probe(false),
         Some("posix-input-vz") => posix_input_probe(true),
+        Some("posix-interrupt") => posix_interrupt_probe(false),
+        Some("posix-interrupt-vz") => posix_interrupt_probe(true),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -1026,6 +1051,7 @@ fn posix_abi_probe() -> Result<(), String> {
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
     posix_shared_probe()?;
     posix_input_probe(false)?;
+    posix_interrupt_probe(false)?;
     println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
     Ok(())
 }
@@ -1087,6 +1113,47 @@ fn posix_input_probe(native: bool) -> Result<(), String> {
     result?;
     println!(
         "Rust POSIX concurrent {} input guest probe passed",
+        if native { "native" } else { "UART" }
+    );
+    Ok(())
+}
+
+fn posix_interrupt_probe(native: bool) -> Result<(), String> {
+    let (cmd, ended) = if native {
+        let runner = vz::runner()?;
+        let kernel = build(Variant::Vz)?;
+        let image = build_boot_image(
+            "boot-posix-native-interrupt.img",
+            &POSIX_NATIVE_INTERRUPT_PROGRAMS,
+            BOOT_PROFILE,
+        )?;
+        let mut cmd = Command::new(runner);
+        cmd.arg(kernel.image).arg(image);
+        (
+            cmd,
+            "init: posix-abi-probe ended: exit code 0, not restarted",
+        )
+    } else {
+        let kernel = build(Variant::Normal)?;
+        let image = build_boot_image(
+            "boot-posix-interrupt.img",
+            &POSIX_INTERRUPT_PROGRAMS,
+            BOOT_PROFILE,
+        )?;
+        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+        cmd.args(qemu::HEADLESS);
+        (cmd, "init: busybox-probe ended: exit code 0, not restarted")
+    };
+    // Keep input open and inject no bytes: the read must genuinely block.
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect("posix-interrupt-probe: ok", BOOT_TIMEOUT)?;
+        run.expect(ended, DIALOG_STEP)
+    })();
+    run.stop();
+    result?;
+    println!(
+        "Rust POSIX {} interruption guest probe passed",
         if native { "native" } else { "UART" }
     );
     Ok(())
@@ -2761,6 +2828,20 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
+    for feature in ["interrupt-probe", "native-interrupt"] {
+        run_cmd(cargo().args([
+            "clippy",
+            "--package",
+            "posix-shared-probe",
+            "--features",
+            feature,
+            "--target",
+            PROGRAM_TARGET,
+            "--",
+            "-D",
+            "warnings",
+        ]))?;
+    }
     for variant in Variant::ALL {
         let mut cmd = cargo();
         cmd.args([

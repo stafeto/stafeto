@@ -30,6 +30,7 @@ pub enum FsError {
     NameTooLong,
     InvalidArgument,
     UnsupportedEncoding,
+    Interrupted,
     Io,
 }
 
@@ -57,6 +58,7 @@ impl From<PathError> for FsError {
 impl From<Status> for FsError {
     fn from(status: Status) -> Self {
         match status {
+            Status::Kernel(rt::abi::Error::Interrupted) => Self::Interrupted,
             Status::Unknown(proto_fs::NO_ENTRY) => Self::NoEntry,
             Status::Unknown(proto_fs::ACCESS_DENIED) => Self::PermissionDenied,
             Status::Unknown(proto_fs::BAD_FD) => Self::BadFileDescriptor,

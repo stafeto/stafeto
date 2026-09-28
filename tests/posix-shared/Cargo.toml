@@ -12,6 +12,8 @@ test = false
 bench = false
 
 [features]
+interrupt-probe = []
+native-interrupt = ["interrupt-probe"]
 input-probe = []
 native-input = ["input-probe"]
 

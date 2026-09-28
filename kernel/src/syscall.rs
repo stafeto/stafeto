@@ -184,6 +184,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadStart) => thread_start(thread, &args),
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
+        Some(Call::ThreadInterrupt) => thread_interrupt(thread, &args),
         Some(Call::Yield) => yield_now(),
         Some(Call::DeviceWindowCreate) => device_window_create(thread, &args),
         Some(Call::IrqBind) => irq_bind(thread, &args),
@@ -971,6 +972,16 @@ fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<Values, Erro
     let target_ceiling = unsafe { target.as_ref().process().as_ref() }.ceiling();
     under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
     sched::set_priority(target, priority, policy)?;
+    Ok(Values::none())
+}
+
+/// thread_interrupt(x0 thread with MANAGE): abandon its current IPC wait
+/// and wake it with INTERRUPTED. BAD_STATE for any thread without such a
+/// wait. Stopped, runnable, ended and long-call threads are unaffected.
+fn thread_interrupt(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
+    // SAFETY: the caller's handle holds the target through interruption.
+    unsafe { sched::interrupt(target, cause(thread)) }?;
     Ok(Values::none())
 }
 
