@@ -66,7 +66,12 @@ Nine mutations were caught: missing information/wrong cause at stage 397;
 wrong SP at 456; lost GPR/PC/SIMD edits at 457; lost return mask at C exit
 174; reset retaining SIGINFO on the host; missing frame argument by a
 guest null-address fault. All altered files were restored afterward.
-Targeted C/UART and pthread QEMU checks passed. Final CI is pending.
+Targeted C/UART and pthread QEMU checks and Apple VZ passed. Full
+cargo xtask ci passed on 9f1db19, including C/standalone, pthreads,
+BusyBox, licenses, kcore 402, init 222 and kernel 166/177. Normal/VZ
+kernels remain 154708/171076 bytes. Thread/C/standalone images are
+634880/516096/532480 bytes. Normal and icount IPC/IRQ timings match
+#62. A fresh global blocking bound and handler latency were not measured.
 
 ## Remaining requirements
 
