@@ -11,6 +11,10 @@ name = "posix-thread-probe"
 test = false
 bench = false
 
+[features]
+cancel-input = []
+native-cancel-input = ["cancel-input"]
+
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi", features = ["transport-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }

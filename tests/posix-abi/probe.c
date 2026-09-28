@@ -446,6 +446,100 @@ static int threads(void) {
     return 0;
 }
 
+struct cancellation_context { int errors, sequence[4], count, survived, fd, output, mode; };
+static void cleanup_first(void *argument) {
+    struct cancellation_context *context = argument;
+    context->sequence[context->count++] = 1;
+}
+static void cleanup_second(void *argument) {
+    struct cancellation_context *context = argument;
+    int old = 99;
+    context->sequence[context->count++] = 2;
+    if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old) || old != PTHREAD_CANCEL_DISABLE) context->errors++;
+    pthread_testcancel();
+    // Cancellation must stay disabled throughout exit handlers, so this code runs.
+    context->survived++;
+    void *block = malloc(32);
+    if (!block) context->errors++;
+    free(block);
+}
+static void *cancel_pending(void *argument) {
+    struct cancellation_context *context = argument;
+    int old = 99, type = 99;
+    char byte;
+    errno = 777;
+    if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old) || old != PTHREAD_CANCEL_ENABLE
+            || pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &type) || type != PTHREAD_CANCEL_DEFERRED) context->errors++;
+    old = 99; type = 99;
+    if (pthread_setcancelstate(123, &old) != EINVAL || old != 99
+            || pthread_setcanceltype(123, &type) != EINVAL || type != 99
+            || pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &type) != ENOSYS || type != 99 || errno != 777) context->errors++;
+    pthread_cleanup_push(cleanup_first, context);
+    pthread_cleanup_push(cleanup_second, context);
+    if (pthread_cancel(pthread_self())) context->errors++;
+    pthread_testcancel();
+    if (read(context->fd, &byte, 1) != 1 || byte != 's') context->errors++;
+    context->survived++;
+    if (pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old) || old != PTHREAD_CANCEL_DISABLE
+            || lseek(context->fd, 0, SEEK_CUR) != 1 || errno != 777) context->errors++;
+    // Deferred enabling and lseek are not cancellation points.
+    context->survived++;
+    if (context->mode == 0) pthread_testcancel();
+    if (context->mode == 1) (void)read(context->fd, &byte, 1);
+    if (context->mode == 2) (void)write(context->output, "z", 1);
+    context->errors++;
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
+    return NULL;
+}
+static void *cleanup_exit(void *argument) {
+    struct cancellation_context *context = argument;
+    pthread_cleanup_push(cleanup_first, context);
+    pthread_cleanup_push(cleanup_first, context);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_push(cleanup_first, context);
+    pthread_cleanup_pop(1);
+    pthread_cleanup_push(cleanup_second, context);
+    // Explicit exit retains its supplied value even with a pending request.
+    if (pthread_cancel(pthread_self())) context->errors++;
+    pthread_exit(argument);
+    pthread_cleanup_pop(0);
+    pthread_cleanup_pop(0);
+}
+static void *fresh_cancel_state(void *argument) {
+    int old = 99, type = 99;
+    if (pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old) || old != PTHREAD_CANCEL_ENABLE
+            || pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &type) || type != PTHREAD_CANCEL_DEFERRED) return NULL;
+    pthread_testcancel();
+    return argument;
+}
+static int cancellation(void) {
+    _Static_assert(sizeof(struct __stafeto_cleanup_buffer) == 24, "cleanup ABI");
+    pthread_t child;
+    void *value = NULL;
+    errno = 123;
+    for (int mode = 0; mode < 3; mode++) {
+        struct cancellation_context context = { .fd = open("/etc/motd", O_RDONLY),
+            .output = open("/tmp/probe", O_RDWR), .mode = mode };
+        if (context.fd < 0 || context.output < 0
+                || pthread_create(&child, NULL, cancel_pending, &context)
+                || pthread_join(child, &value) || value != PTHREAD_CANCELED
+                || context.errors || context.count != 2 || context.sequence[0] != 2
+                || context.sequence[1] != 1 || context.survived != 3
+                || lseek(context.fd, 0, SEEK_CUR) != 1 || lseek(context.output, 0, SEEK_CUR) != 0
+                || close(context.fd) || close(context.output) || errno != 123) return 220 + mode;
+        if (pthread_cancel(child) != ESRCH
+                || pthread_create(&child, NULL, fresh_cancel_state, &context)
+                || pthread_join(child, &value) || value != &context) return 223;
+    }
+    struct cancellation_context context = {0};
+    if (pthread_create(&child, NULL, cleanup_exit, &context)
+            || pthread_join(child, &value) || value != &context || context.errors
+            || context.count != 3 || context.sequence[0] != 1 || context.sequence[1] != 2
+            || context.sequence[2] != 1 || context.survived != 1 || errno != 123) return 224;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -498,6 +592,8 @@ int main(int argc, char **argv) {
     if (directory_result) return directory_result;
     int thread_result = threads();
     if (thread_result) return thread_result;
+    int cancellation_result = cancellation();
+    if (cancellation_result) return cancellation_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();

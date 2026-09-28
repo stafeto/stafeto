@@ -123,6 +123,18 @@ pub unsafe extern "C" fn close(number: c_int) -> c_int {
 /// This thread has an initialized ABI scope.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> isize {
+    let point = threads::cancel::Point::begin();
+    let result = unsafe { read_inner(number, buffer, count) };
+    if result > 0 {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
+// Keep cancellation outside frames holding transport resources and buffers.
+unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
     if count > isize::MAX as usize {
         return fail(EINVAL) as isize;
     }
@@ -155,6 +167,7 @@ pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> i
                 }
                 let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
                 let mut bytes = [0; posix_request::MAX_READ];
+                threads::cancel::console_wait();
                 let length = input
                     .read(&mut bytes[..extent as usize])
                     .map_err(|status| error(status.into()))?;
@@ -175,6 +188,17 @@ pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> i
 /// This thread has an initialized ABI scope.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn write(number: c_int, buffer: *const u8, count: usize) -> isize {
+    let point = threads::cancel::Point::begin();
+    let result = unsafe { write_inner(number, buffer, count) };
+    if result > 0 {
+        point.end();
+    } else {
+        point.finish();
+    }
+    result
+}
+
+unsafe fn write_inner(number: c_int, buffer: *const u8, count: usize) -> isize {
     if count > isize::MAX as usize {
         return fail(EINVAL) as isize;
     }

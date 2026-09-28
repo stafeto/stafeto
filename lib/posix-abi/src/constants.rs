@@ -6,6 +6,11 @@
 pub const ABI_VERSION: u32 = 1;
 pub const STAFETO_ERRNO_OFFSET: u32 = 16;
 pub const SYSROOT_VERSION: &str = "0.1.0";
+pub const PTHREAD_CANCEL_ENABLE: i32 = 0;
+pub const PTHREAD_CANCEL_DISABLE: i32 = 1;
+pub const PTHREAD_CANCEL_DEFERRED: i32 = 0;
+pub const PTHREAD_CANCEL_ASYNCHRONOUS: i32 = 1;
+pub const ECANCELED: i32 = 125;
 pub const ESRCH: i32 = 3;
 pub const EAGAIN: i32 = 11;
 pub const EDEADLK: i32 = 35;
