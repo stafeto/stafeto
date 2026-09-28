@@ -119,10 +119,11 @@ user-space console driver remain future work. What works today:
   accepts pending/live thread-directed signals without a handler, preserving
   masks and dispositions through interruption and deferred cancellation.
   `sigwaitinfo` also returns a retained signal-information snapshot; unrelated
-  handlers resume both waits. `SA_SIGINFO` handlers receive retained information
+  handlers resume these waits. `sigtimedwait` adds a preserved monotonic interval,
+  EAGAIN on expiration and pending late signals. `SA_SIGINFO` handlers receive retained information
   and a real interrupted context; register, PC, SIMD, flag and mask edits
-  apply on return. Process routing, queued signals, timed waits,
-  alternate stacks, restart policy and stop/continue remain work.
+  apply on return. Process routing, queued signals, alternate stacks,
+  restart policy and stop/continue remain work.
 - **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
@@ -266,7 +267,8 @@ checks for successful calls, failures, and ABI layout.
 | Rust signal information acceptance | Add sigwaitinfo and C signal information, retain complete snapshots through reply/ACK interruption and cancellation, and separate full action masks from flags. Verify QEMU, Apple VZ and resource pressure; real-time queues and timed waits remain work. | ✅ [#61](https://github.com/stafeto/stafeto/pull/61) |
 | Rust process identity | Add boot-unique numeric IDs and retained parent identity, native ObjectInfo/rt access and Rust getpid/getppid; verify real process trees, ended shells, handle copies, pthreads and signal handlers. | ✅ [#62](https://github.com/stafeto/stafeto/pull/62) |
 | Rust signal information and handler context | Add SA_SIGINFO, retained handler information and real interrupted AArch64 ucontext; verify register/PC/SIMD/mask edits, nesting, reset, C layouts and resource pressure on QEMU and Apple VZ. | ✅ [#63](https://github.com/stafeto/stafeto/pull/63) |
-| Rust queued signals and timed acceptance | Add real-time FIFO source/value queues, process-directed sigqueue and sigtimedwait using MONOTONIC deadlines; preserve masks, retained outcomes, queue resources and cancellation. | 🚧 |
+| Rust timed signal acceptance | Add sigtimedwait with preserved monotonic deadlines, pending-before-validation, EAGAIN and unchanged error output; verify retries, cancellation, concurrent sleep/mutex waits, late-signal races and full resources on QEMU and Apple VZ. | ✅ [#64](https://github.com/stafeto/stafeto/pull/64) |
+| Rust queued signals and process routing | Add real-time FIFO source/value queues and process-directed sigqueue; preserve masks, retained outcomes, queue resources and cancellation. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and remaining signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |

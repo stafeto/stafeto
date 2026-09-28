@@ -230,6 +230,7 @@ impl Registry {
         self.sleep_deadlines(now, observation)
             .into_iter()
             .chain(next)
+            .chain(self.signal_deadlines(now))
             .min()
     }
     fn mutex_next(&self, address: u64) -> Option<usize> {

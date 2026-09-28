@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <time.h>
 #include <stafeto/abi.h>
 typedef int sig_atomic_t;
 typedef uint64_t sigset_t;
@@ -65,4 +66,6 @@ int pthread_kill(pthread_t thread, int sig);
 int raise(int sig);
 int sigwait(const sigset_t *restrict set, int *restrict sig);
 int sigwaitinfo(const sigset_t *restrict set, siginfo_t *restrict info);
+int sigtimedwait(const sigset_t *restrict set, siginfo_t *restrict info,
+                 const struct timespec *restrict timeout);
 #endif

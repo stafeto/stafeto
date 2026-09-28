@@ -8,6 +8,7 @@ use core::sync::atomic::AtomicBool;
 use rt::wait::{Waited, Waiter};
 use threads::cancel::{self, Cleanup};
 static INFO: AtomicBool = AtomicBool::new(false);
+static TIMED: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicU64 = AtomicU64::new(0);
 static RETURNED: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
@@ -119,7 +120,15 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     let set = if mode == 6 { 0 } else { bit(SIGUSR1) };
     let with_info = INFO.load(Ordering::Acquire);
     let status = if with_info {
-        let signal = unsafe { api::sigwaitinfo(&set, &mut output.info) };
+        let signal = if TIMED.load(Ordering::Acquire) {
+            let timeout = abi::metadata::Timespec {
+                tv_sec: 3,
+                tv_nsec: 0,
+            };
+            unsafe { api::sigtimedwait(&set, &mut output.info, &timeout) }
+        } else {
+            unsafe { api::sigwaitinfo(&set, &mut output.info) }
+        };
         if signal >= 0 {
             output.signal = signal;
             0
@@ -208,8 +217,9 @@ pub(super) fn run() -> bool {
     if unsafe { api::pthread_sigmask(SIG_BLOCK, &BLOCKED, &mut old_mask) } != 0 {
         return failed(421);
     }
-    for with_info in [false, true] {
+    for (with_info, timed) in [(false, false), (true, false), (true, true)] {
         INFO.store(with_info, Ordering::Release);
+        TIMED.store(timed, Ordering::Release);
         for mode in 0..7 {
             MODE.store(mode, Ordering::Release);
             CLEANED.store(0, Ordering::Release);
@@ -304,7 +314,7 @@ pub(super) fn run() -> bool {
         return failed(448);
     }
     rt::println!(
-        "signal-wait-probe: sigwait/sigwaitinfo pending/live acceptance, targeting, handler/reply interruption, masks, dispositions, errno and cancellation cleanup ok"
+        "signal-wait-probe: sigwait/sigwaitinfo/sigtimedwait pending/live acceptance, targeting, handler/reply interruption, masks, dispositions, errno and cancellation cleanup ok"
     );
     true
 }

@@ -10,12 +10,14 @@ pub(super) struct Waiting {
     pub(super) nonce: u64,
     set: posix_signals::SigSet,
     token: sys::Token,
+    pub(super) deadline: Option<posix_time::Sleep>,
 }
 impl Registry {
     pub(super) fn signal_wait_begin(&mut self, caller: usize, words: [u64; 8], token: sys::Token) {
         if let Some(wait) = self.entry_mut(caller).signal_waiting.as_mut() {
             if wait.nonce == words[2] {
                 wait.token = token;
+                self.signal_expire(caller, monotonic_now());
                 return;
             }
             let answer = self.cache(caller, words[2], Err(EBUSY), WAIT);
@@ -30,13 +32,91 @@ impl Registry {
                 return;
             }
         };
+        if words[4] > 1 {
+            let answer = self.cache(caller, words[2], Err(EINVAL), WAIT);
+            respond(token, answer);
+            return;
+        }
         self.entry_mut(caller).signal_waiting = Some(Waiting {
             nonce: words[2],
             set,
             token,
+            deadline: None,
         });
-        self.signal_accept_wait(caller);
+        // POSIX accepts a ready signal before validating the timeout value.
+        if self.signal_accept_wait(caller) || words[4] == 0 {
+            return;
+        }
+        let deadline = match posix_time::Sleep::new(
+            proto_clock::MONOTONIC,
+            false,
+            words[5] as i64,
+            words[6] as i64,
+            words[7],
+        ) {
+            Ok(deadline) => deadline,
+            Err(_) => {
+                let wait = self
+                    .entry_mut(caller)
+                    .signal_waiting
+                    .take()
+                    .expect("invalid signal interval");
+                let answer = self.cache(caller, words[2], Err(EINVAL), WAIT);
+                respond(wait.token, answer);
+                return;
+            }
+        };
+        self.entry_mut(caller)
+            .signal_waiting
+            .as_mut()
+            .expect("registered signal wait")
+            .deadline = Some(deadline);
+        self.signal_expire(caller, monotonic_now());
     }
+    fn signal_expire(&mut self, index: usize, now: u64) -> bool {
+        let expired = self
+            .entry(index)
+            .signal_waiting
+            .as_ref()
+            .and_then(|wait| wait.deadline)
+            .is_some_and(|deadline| {
+                deadline
+                    .expired(now, None)
+                    .expect("monotonic signal deadline")
+            });
+        if !expired {
+            return false;
+        }
+        let wait = self
+            .entry_mut(index)
+            .signal_waiting
+            .take()
+            .expect("expired signal wait");
+        let answer = self.cache(index, wait.nonce, Err(EAGAIN), WAIT);
+        respond(wait.token, answer);
+        true
+    }
+    /// Share the existing owner timer; retries retain the original wide deadline.
+    pub(super) fn signal_deadlines(&mut self, now: u64) -> Option<u64> {
+        let mut next: Option<u64> = None;
+        for index in 0..self.entries.len() {
+            if self.entries[index].is_none() || self.signal_expire(index, now) {
+                continue;
+            }
+            if let Some(deadline) = self
+                .entry(index)
+                .signal_waiting
+                .as_ref()
+                .and_then(|wait| wait.deadline)
+                && let Ok(target) =
+                    u64::try_from(deadline.target(None).expect("relative signal deadline"))
+            {
+                next = Some(next.map_or(target, |old| old.min(target)));
+            }
+        }
+        next
+    }
+
     fn signal_accept_wait(&mut self, index: usize) -> bool {
         let Some(wait) = self.entry(index).signal_waiting.as_ref() else {
             return false;
@@ -122,6 +202,16 @@ impl Registry {
                     posix_signals::bit(signal).map_err(|_| EINVAL)?;
                 }
                 let index = self.find(words[3])?;
+                #[cfg(feature = "transport-probe")]
+                {
+                    let gate =
+                        super::SIGNAL_SEND_GATE.swap(0, core::sync::atomic::Ordering::AcqRel);
+                    if gate != 0 {
+                        super::probe_park(&Handle::borrowed(rt::abi::Handle(gate)));
+                    }
+                }
+                // Generation after the interval must not satisfy an expired wait.
+                self.signal_expire(index, monotonic_now());
                 // Inactive joinable IDs retain their lifetime and accept signal 0.
                 if signal == 0 || self.entry(index).phase != Phase::Live {
                     return Ok(pair(0, 0));
@@ -177,4 +267,8 @@ impl Registry {
             _ => Err(EINVAL),
         }
     }
+}
+
+fn monotonic_now() -> u64 {
+    rt::time::ticks_to_ns(rt::time::now())
 }

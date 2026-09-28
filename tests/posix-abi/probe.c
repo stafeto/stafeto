@@ -157,6 +157,32 @@ static int signals(void) {
             || pthread_sigmask(-99, NULL, &set) || !sigismember(&set, SIGUSR2)
             || sigismember(&set, SIGUSR1)) return 174;
     if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)) return 175;
+    if (sigaddset(&set, SIGUSR1) || pthread_sigmask(SIG_BLOCK, &set, NULL)) return 176;
+    struct timespec timeout = { .tv_sec = 0, .tv_nsec = 0 };
+    info.si_code = -999;
+    info.si_value.sival_ptr = (void *)UINT64_C(18446744073709551615);
+    if (sigtimedwait(&set, &info, &timeout) != -1 || errno != EAGAIN
+            || info.si_code != -999 || info.si_value.sival_ptr != (void *)UINT64_C(18446744073709551615)) return 177;
+    const struct timespec invalid[] = { { 0, -1 }, { 0, 1000000000 }, { -1, 0 } };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        if (sigtimedwait(&set, &info, &invalid[i]) != -1 || errno != EINVAL
+                || info.si_code != -999 || info.si_value.sival_ptr != (void *)UINT64_C(18446744073709551615)) return 178;
+        if (raise(SIGUSR1)) return 179;
+        errno = 777;
+        if (sigtimedwait(&set, &info, &invalid[i]) != SIGUSR1 || errno != 777
+                || info.si_signo != SIGUSR1 || info.si_code != SI_THREAD || sigpending(&pending) || pending) return 180;
+        info.si_code = -999;
+        info.si_value.sival_ptr = (void *)UINT64_C(18446744073709551615);
+    }
+    if (raise(SIGUSR1) || sigtimedwait(&set, NULL, &timeout) != SIGUSR1 || errno != 777
+            || raise(SIGUSR1) || sigtimedwait(&set, NULL, NULL) != SIGUSR1 || errno != 777) return 181;
+    struct timespec before, after;
+    timeout.tv_nsec = 2000000;
+    if (clock_gettime(CLOCK_MONOTONIC, &before) || sigtimedwait(&set, &info, &timeout) != -1
+            || errno != EAGAIN || info.si_code != -999 || clock_gettime(CLOCK_MONOTONIC, &after)
+            || (after.tv_sec - before.tv_sec) * INT64_C(1000000000) + after.tv_nsec - before.tv_nsec < timeout.tv_nsec) return 182;
+    if (sigtimedwait(NULL, &info, &timeout) != -1 || errno != EFAULT || info.si_code != -999) return 183;
+    if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)) return 184;
     return 0;
 }
 

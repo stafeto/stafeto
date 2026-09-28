@@ -16,6 +16,8 @@ pub(crate) const TAKE: u64 = 44;
 pub(crate) const READY: u64 = 45;
 pub(crate) const WAIT: u64 = 46;
 pub(crate) const WAIT_QUERY: u64 = 47;
+#[cfg(feature = "transport-probe")]
+pub(crate) const WAIT_DEADLINE_QUERY: u64 = 49;
 
 // Only the bounded owner's bookkeeping transaction is masked. The owner never
 // binds an entry or calls user code, so there is no interrupted-owner lock cycle.
@@ -227,12 +229,34 @@ pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
 /// is not returned. Current pthread_kill/raise causes are reported as SI_THREAD.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> i32 {
+    unsafe { sigtimedwait(set, info, core::ptr::null()) }
+}
+
+/// # Safety
+/// The caller is managed. set is readable, info is null or writable for one
+/// SigInfo, timeout is null or readable for one Timespec. Storage does not
+/// overlap. Selected signals are blocked. NULL timeout means indefinite wait;
+/// unrelated caught signals resume the original monotonic interval without EINTR.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigtimedwait(
+    set: *const SigSet,
+    info: *mut SigInfo,
+    timeout: *const posix_types::Timespec,
+) -> i32 {
     let point = threads::cancel::Point::begin();
+    let start = rt::time::ticks_to_ns(rt::time::now());
     let result = if set.is_null() {
         Err(EFAULT)
     } else {
         let set = unsafe { set.read() };
-        threads::request_words(WAIT, [set, 0, 0, 0, 0]).map(|words| {
+        let (timed, seconds, nanos) = if timeout.is_null() {
+            (0, 0, 0)
+        } else {
+            // Copy once; the owner validates after checking pending signals.
+            let timeout = unsafe { timeout.read() };
+            (1, timeout.tv_sec as u64, timeout.tv_nsec as u64)
+        };
+        threads::request_words(WAIT, [set, timed, seconds, nanos, start]).map(|words| {
             if !info.is_null() {
                 let snapshot = SigInfo::from_words(words[2..].try_into().unwrap());
                 unsafe { info.write(snapshot) };
@@ -247,6 +271,15 @@ pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> 
 #[cfg(feature = "transport-probe")]
 pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
     call(WAIT_QUERY, [thread, 0, 0, 0, 0]).map(|(value, _)| value != 0)
+}
+
+/// Inspect the actual stored deadline in guest tests, without a timing tolerance.
+#[cfg(feature = "transport-probe")]
+pub fn probe_wait_deadline(thread: u64) -> Result<Option<i128>, i32> {
+    call(WAIT_DEADLINE_QUERY, [thread, 0, 0, 0, 0]).map(|(low, high)| {
+        let value = (u128::from(low) | (u128::from(high) << 64)) as i128;
+        (value != 0).then_some(value)
+    })
 }
 
 rt::upcall_entry!(entry, dispatch, context);
