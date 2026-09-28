@@ -71,6 +71,27 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 3] = [
         &[],
     ),
 ];
+const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "posix-thread-probe",
+        CHILD_STACK_SIZE,
+        &["cancel-input"],
+    ),
+];
+const POSIX_NATIVE_CANCEL_INPUT_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-abi-probe",
+        "posix-thread-probe",
+        CHILD_STACK_SIZE,
+        &["native-cancel-input"],
+    ),
+];
 const POSIX_SHARED_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -534,6 +555,8 @@ commands:
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
+  posix-cancel-input verify cancelled UART reads and cleanup handlers
+  posix-cancel-input-vz verify cancelled Virtio reads on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
   posix-abi run a C main against Rust POSIX and verify thread-local errno
@@ -564,6 +587,8 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
+        Some("posix-cancel-input") => posix_cancel_input_probe(false),
+        Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
         Some("posix-threads") => posix_thread_probe(false),
         Some("posix-threads-vz") => posix_thread_probe(true),
         Some("posix-abi") => posix_abi_probe(),
@@ -1064,6 +1089,7 @@ fn posix_abi_probe() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
     posix_thread_probe(false)?;
+    posix_cancel_input_probe(false)?;
     posix_shared_probe()?;
     posix_input_probe(false)?;
     posix_interrupt_probe(false)?;
@@ -1093,6 +1119,57 @@ fn posix_thread_probe(native: bool) -> Result<(), String> {
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "posix-thread-probe: ok")?;
     println!("Rust POSIX pthread lifecycle guest probe passed");
+    Ok(())
+}
+
+fn posix_cancel_input_probe(native: bool) -> Result<(), String> {
+    let kernel = build(if native { Variant::Vz } else { Variant::Normal })?;
+    let image = build_boot_image(
+        if native {
+            "boot-posix-native-cancel.img"
+        } else {
+            "boot-posix-cancel.img"
+        },
+        if native {
+            &POSIX_NATIVE_CANCEL_INPUT_PROGRAMS
+        } else {
+            &POSIX_CANCEL_INPUT_PROGRAMS
+        },
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = if native {
+        let mut cmd = Command::new(vz::runner()?);
+        cmd.arg(&kernel.image).arg(image);
+        cmd
+    } else {
+        qemu::command(&qemu::VIRT, &kernel.image, Some(&image))
+    };
+    if !native {
+        cmd.args(qemu::HEADLESS);
+    }
+    let ended = if native {
+        "init: posix-abi-probe ended: exit code 0, not restarted"
+    } else {
+        "init: busybox-probe ended: exit code 0, not restarted"
+    };
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect(
+            "posix-cancel-input-probe: cleanup read waiting",
+            BOOT_TIMEOUT,
+        )?;
+        run.send("z")?;
+        run.expect(
+            "posix-cancel-input-probe: read after cancellation waiting",
+            DIALOG_STEP,
+        )?;
+        run.send("v")?;
+        run.expect("posix-cancel-input-probe: ok", DIALOG_STEP)?;
+        run.expect(ended, DIALOG_STEP)
+    })();
+    run.stop();
+    result?;
+    println!("Rust POSIX cancelled input and cleanup guest probe passed");
     Ok(())
 }
 
@@ -2893,6 +2970,18 @@ fn ci() -> Result<(), String> {
             "warnings",
         ]))?;
     }
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "posix-thread-probe",
+        "--features",
+        "native-cancel-input",
+        "--target",
+        PROGRAM_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     for variant in Variant::ALL {
         let mut cmd = cargo();
         cmd.args([

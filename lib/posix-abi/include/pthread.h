@@ -28,4 +28,23 @@ int pthread_attr_setguardsize(pthread_attr_t *attr, size_t size);
 int pthread_attr_getguardsize(const pthread_attr_t *attr, size_t *size);
 int pthread_attr_setdetachstate(pthread_attr_t *attr, int state);
 int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *state);
+#define PTHREAD_CANCELED ((void *)-1)
+int pthread_cancel(pthread_t thread);
+int pthread_setcancelstate(int state, int *oldstate);
+int pthread_setcanceltype(int type, int *oldtype);
+void pthread_testcancel(void);
+struct __stafeto_cleanup_buffer {
+    struct __stafeto_cleanup_buffer *__next;
+    void (*__routine)(void *);
+    void *__argument;
+};
+void __stafeto_cleanup_push(struct __stafeto_cleanup_buffer *buffer,
+        void (*routine)(void *), void *argument);
+void __stafeto_cleanup_pop(struct __stafeto_cleanup_buffer *buffer, int execute);
+#define pthread_cleanup_push(routine, argument) do { \
+    struct __stafeto_cleanup_buffer __stafeto_cleanup; \
+    __stafeto_cleanup_push(&__stafeto_cleanup, (routine), (argument));
+#define pthread_cleanup_pop(execute) \
+    __stafeto_cleanup_pop(&__stafeto_cleanup, (execute)); \
+} while (0)
 #endif

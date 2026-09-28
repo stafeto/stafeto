@@ -13,28 +13,40 @@ use core::{
 };
 use posix_abi::{self as abi, constants::*, threads, tls};
 use posix_fs::PosixFs;
+#[cfg(not(feature = "cancel-input"))]
+use rt::handle::Channel;
 use rt::{
     abi::ThreadState,
-    handle::{Channel, Handle, Thread},
+    handle::{Handle, Thread},
     sys,
 };
 
+#[cfg(not(feature = "cancel-input"))]
+mod cancellation;
+#[cfg(feature = "cancel-input")]
+mod input;
+
 rt::entry!(main);
 static PROCESS: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "cancel-input"))]
 static TARGET: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "cancel-input"))]
 static JOINED: AtomicUsize = AtomicUsize::new(0);
 static CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "cancel-input"))]
 const VALUE: usize = 0x5678;
 
 unsafe extern "C" fn returning(argument: *mut c_void) -> *mut c_void {
     CALLS.fetch_add(1, Ordering::AcqRel);
     argument
 }
+#[cfg(not(feature = "cancel-input"))]
 unsafe extern "C" fn gated(argument: *mut c_void) -> *mut c_void {
     let gate = Handle::<Channel>::borrowed(rt::abi::Handle(argument as u64));
     sys::receive(&gate).expect("target release");
     VALUE as *mut c_void
 }
+#[cfg(not(feature = "cancel-input"))]
 unsafe extern "C" fn joiner(_: *mut c_void) -> *mut c_void {
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
@@ -45,6 +57,7 @@ unsafe extern "C" fn joiner(_: *mut c_void) -> *mut c_void {
     value
 }
 
+#[cfg(not(feature = "cancel-input"))]
 fn waiting(thread: &Handle<Thread>) -> bool {
     let wake = sys::channel_create(30).expect("poll wake channel");
     let timer = sys::timer_create(&wake, 30).expect("poll timer");
@@ -60,6 +73,7 @@ fn waiting(thread: &Handle<Thread>) -> bool {
     false
 }
 
+#[cfg(not(feature = "cancel-input"))]
 unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     // Main exited through pthread_exit. Its join must still yield its value.
     let mut value = ptr::null_mut();
@@ -86,6 +100,7 @@ fn failed(stage: usize) -> bool {
     false
 }
 
+#[cfg(not(feature = "cancel-input"))]
 fn run() -> bool {
     let mut child = 0;
     let mut value = ptr::null_mut();
@@ -221,6 +236,10 @@ fn run() -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
+    if !cancellation::run() {
+        return false;
+    }
+
     if unsafe {
         threads::pthread_create(&mut child, ptr::null(), Some(last_thread), ptr::null_mut())
     } != 0
@@ -239,7 +258,15 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<rt::handle::Resource>("console") {
         rt::console::set(console);
     }
-    let Ok(files) = PosixFs::connect(&start.parent) else {
+    let connection = if cfg!(all(
+        feature = "cancel-input",
+        not(feature = "native-cancel-input")
+    )) {
+        PosixFs::connect_with_uart(&start.parent)
+    } else {
+        PosixFs::connect(&start.parent)
+    };
+    let Ok(files) = connection else {
         return 2;
     };
     PROCESS.store(start.process.raw().0, Ordering::Release);
@@ -249,7 +276,17 @@ fn main(_: u64) -> u64 {
     {
         return 3;
     }
-    if !tls::with_thread(1, run) {
+    let passed = tls::with_thread(1, || {
+        #[cfg(feature = "cancel-input")]
+        {
+            input::run()
+        }
+        #[cfg(not(feature = "cancel-input"))]
+        {
+            run()
+        }
+    });
+    if !passed {
         rt::println!("posix-thread-probe: failed");
         return 4;
     }

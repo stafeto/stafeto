@@ -3,7 +3,9 @@
 
 //! Initial managed pthread lifecycle. One IPC owner retains native handles,
 //! stack mappings and join results. ELF TLS, signal inheritance, cleanup
-//! handlers, cancellation and scheduler attributes still require implementation.
+//! handlers for thread-specific data and scheduler attributes remain work.
+
+pub mod cancel;
 
 use crate::{allocation, constants::*, tls};
 use core::{
@@ -28,6 +30,8 @@ const EXIT: u64 = 2;
 const JOIN: u64 = 3;
 const JOIN_ACK: u64 = 4;
 const DETACH: u64 = 5;
+const CANCEL: u64 = 7;
+const JOIN_ABANDON: u64 = 8;
 const ATTR_MAGIC: u64 = 0x5054_4852_4154_5431;
 
 type Start = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
@@ -86,6 +90,12 @@ static READY: AtomicBool = AtomicBool::new(false);
 static OWNER_STACK: Stack<32768> = Stack::new();
 #[cfg(feature = "transport-probe")]
 static INTERRUPT_REPLIES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static CANCEL_JOIN_REPLY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "transport-probe")]
+static OWNER_NATIVE: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
+#[cfg(feature = "transport-probe")]
+static WAKE_RETRIES: AtomicU64 = AtomicU64::new(0);
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
 struct Launch {
@@ -94,6 +104,7 @@ struct Launch {
     argument: AtomicU64,
     floating: AtomicU64,
     completed: AtomicBool,
+    cancel: cancel::State,
 }
 static LAUNCH: [Launch; CAPACITY] = [const {
     Launch {
@@ -102,6 +113,7 @@ static LAUNCH: [Launch; CAPACITY] = [const {
         argument: AtomicU64::new(0),
         floating: AtomicU64::new(0),
         completed: AtomicBool::new(false),
+        cancel: cancel::State::new(),
     }
 }; CAPACITY];
 
@@ -147,7 +159,12 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
             )
         }?;
         READY.store(true, Ordering::Release);
-        sys::thread_start(&thread)
+        sys::thread_start(&thread)?;
+        #[cfg(feature = "transport-probe")]
+        unsafe {
+            *OWNER_NATIVE.0.get() = Some(thread);
+        }
+        Ok(())
     })();
     if result.is_err() {
         READY.store(false, Ordering::Release);
@@ -186,6 +203,7 @@ struct Entry {
     value: u64,
     waiting: Option<Waiting>,
     cached: Option<Cached>,
+    woken_epoch: u64,
 }
 impl Entry {
     fn new(
@@ -203,6 +221,7 @@ impl Entry {
             value: 0,
             waiting: None,
             cached: None,
+            woken_epoch: 0,
         }
     }
 }
@@ -234,6 +253,17 @@ impl Registry {
             value,
         };
         self.entry_mut(caller).cached = Some(answer);
+        #[cfg(feature = "transport-probe")]
+        if _op == JOIN && CANCEL_JOIN_REPLY.swap(false, Ordering::AcqRel) {
+            LAUNCH[caller].cancel.pending.store(true, Ordering::SeqCst);
+            sys::thread_interrupt(
+                self.entry(caller)
+                    .native
+                    .as_ref()
+                    .expect("cancelled reply caller"),
+            )
+            .expect("interrupt cancelled join result");
+        }
         #[cfg(feature = "transport-probe")]
         if _op < 64 && INTERRUPT_REPLIES.fetch_and(!(1 << _op), Ordering::AcqRel) & (1 << _op) != 0
         {
@@ -279,6 +309,7 @@ impl Registry {
         LAUNCH[slot].argument.store(words[4], Ordering::Relaxed);
         LAUNCH[slot].floating.store(words[7], Ordering::Relaxed);
         LAUNCH[slot].completed.store(false, Ordering::Relaxed);
+        LAUNCH[slot].cancel.reset();
         LAUNCH[slot].id.store(id, Ordering::Release);
         // SAFETY: this slot owns the new stack until its native thread has ended.
         let native = unsafe {
@@ -407,10 +438,56 @@ impl Registry {
             }
         }
     }
+    fn wake_needed(&self, index: usize) -> bool {
+        let Some(entry) = self.entries[index].as_ref() else {
+            return false;
+        };
+        let state = &LAUNCH[index].cancel;
+        let epoch = state.active.load(Ordering::SeqCst);
+        entry.phase == Phase::Live
+            && state.pending.load(Ordering::SeqCst)
+            && state.enabled.load(Ordering::SeqCst)
+            && epoch != 0
+            && epoch != entry.woken_epoch
+    }
+    fn wake_cancelled(&mut self) {
+        for (index, launch) in LAUNCH.iter().enumerate() {
+            if !self.wake_needed(index) {
+                continue;
+            }
+            let epoch = launch.cancel.active.load(Ordering::SeqCst);
+            match sys::thread_interrupt(
+                self.entry(index)
+                    .native
+                    .as_ref()
+                    .expect("live cancellation target"),
+            ) {
+                Ok(()) => {
+                    self.entry_mut(index).woken_epoch = epoch;
+                }
+                Err(Error::BadState) => {
+                    // The point may be about to enter IPC.
+                    #[cfg(feature = "transport-probe")]
+                    WAKE_RETRIES.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => panic!("owned pthread interruption: {error:?}"),
+            }
+        }
+    }
     fn perform(&mut self, caller: usize, words: [u64; 8]) -> Result<u64, i32> {
         match words[0] {
             CREATE => self.create(caller, words),
             EXIT => {
+                // Defensively remove claims still owned by an exiting thread.
+                for target in self.entries.iter_mut().flatten() {
+                    if target
+                        .waiting
+                        .as_ref()
+                        .is_some_and(|w| w.caller == words[1])
+                    {
+                        target.waiting = None;
+                    }
+                }
                 let entry = self.entry_mut(caller);
                 entry.phase = Phase::Exiting;
                 entry.value = words[3];
@@ -434,6 +511,26 @@ impl Registry {
                     return Err(EINVAL);
                 }
                 self.entries[target] = None;
+                Ok(0)
+            }
+            CANCEL => {
+                let index = self.find(words[3])?;
+                if self.entry(index).phase == Phase::Live {
+                    LAUNCH[index].cancel.pending.store(true, Ordering::SeqCst);
+                    self.wake_cancelled();
+                }
+                Ok(0)
+            }
+            JOIN_ABANDON => {
+                if let Ok(target) = self.find(words[3])
+                    && self
+                        .entry(target)
+                        .waiting
+                        .as_ref()
+                        .is_some_and(|w| w.caller == words[1])
+                {
+                    self.entry_mut(target).waiting = None;
+                }
                 Ok(0)
             }
             DETACH => {
@@ -477,28 +574,47 @@ extern "C" fn owner(_: u64) -> ! {
     registry.entries[0] = Some(Entry::new(1, main, None, false));
     // SAFETY: startup transferred the reserved timer to this sole owner.
     let timer = unsafe { (*REAPER.0.get()).take().expect("initial reap timer") };
+    let mut armed = false;
     loop {
         registry.reap();
+        registry.wake_cancelled();
         if registry
             .entries
             .iter()
             .flatten()
             .any(|e| e.phase == Phase::Exiting)
+            || (0..CAPACITY).any(|index| registry.wake_needed(index))
         {
-            sys::timer_set(&timer, sys::clock_now().expect("pthread clock") + 1_000_000)
+            if !armed {
+                sys::timer_set(
+                    &timer,
+                    sys::clock_now()
+                        .expect("pthread clock")
+                        .saturating_add(1_000_000),
+                )
                 .expect("pthread timer arm");
-        } else {
+                armed = true;
+            }
+        } else if armed {
             sys::timer_cancel(&timer).expect("pthread timer cancel");
+            armed = false;
         }
-        let Ok(sys::Received::Message {
-            len,
-            words,
-            token,
-            handles,
-            ..
-        }) = sys::receive(channel())
-        else {
-            continue;
+        let (len, words, token, handles) = match sys::receive(channel()) {
+            Ok(sys::Received::Message {
+                len,
+                words,
+                token,
+                handles,
+                ..
+            }) => (len, words, token, handles),
+            Ok(sys::Received::Notification {
+                source: rt::abi::Source::Timer,
+                ..
+            }) => {
+                armed = false;
+                continue;
+            }
+            _ => continue,
         };
         drop(handles);
         let caller = match registry.find(words[1]) {
@@ -578,6 +694,7 @@ fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
     }
     loop {
         match sys::send(channel(), &bytes) {
+            Err(Error::Interrupted) if op == JOIN && cancel::requested() => return Err(ECANCELED),
             Err(Error::Interrupted) => continue,
             Err(_) => return Err(EIO),
             Ok(reply) if reply.len == 16 => {
@@ -651,10 +768,20 @@ pub unsafe extern "C" fn pthread_create(
 /// The caller is managed; out is null or writable for one returned pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32 {
-    match request(JOIN, [thread, 0, 0, 0, 0]) {
+    let point = cancel::Point::begin();
+    let result = request(JOIN, [thread, 0, 0, 0, 0]);
+    if point.requested() {
+        // Undo the claim even if JOIN was interrupted before acceptance or
+        // after a completed target produced its retained value.
+        request(JOIN_ABANDON, [thread, 0, 0, 0, 0]).expect("cancelled join claim release");
+        point.finish();
+        unreachable!("accepted join cancellation");
+    }
+    // An accepted result wins cancellation arriving after this point. ACK
+    // retries are internal bookkeeping and cannot introduce a new point.
+    point.end();
+    match result {
         Ok(value) => {
-            // The target keeps its slot until JOIN_ACK. Acquire its completion
-            // publication so user writes happen before the joining thread resumes.
             let launch = LAUNCH
                 .iter()
                 .find(|launch| launch.id.load(Ordering::Acquire) == thread)
@@ -671,16 +798,23 @@ pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32
         Err(status) => status,
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pthread_cancel(thread: u64) -> i32 {
+    request(CANCEL, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn pthread_detach(thread: u64) -> i32 {
     request(DETACH, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
 }
 
 /// # Safety
-/// The current thread is managed and has its initialized POSIX scope. Cleanup
-/// handlers and thread-specific destructors are not yet implemented.
+/// The current thread is managed and has its initialized POSIX scope.
+/// Registered cleanup nodes remain live. Thread-specific destructors remain work.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
+    unsafe { cancel::exit_cleanup() };
     let id = tls::thread_id();
     let launch = LAUNCH
         .iter()
@@ -816,4 +950,58 @@ pub fn probe_interrupt_replies(create: bool, join: bool, acknowledge: bool) {
 #[cfg(feature = "transport-probe")]
 pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle<Thread>>, i32> {
     request(6, [thread, 0, 0, 0, 0]).map(|raw| Handle::borrowed(rt::abi::Handle(raw)))
+}
+
+fn current_launch() -> Option<&'static Launch> {
+    let id = tls::thread_id();
+    (id != 0)
+        .then(|| {
+            LAUNCH
+                .iter()
+                .find(|launch| launch.id.load(Ordering::Acquire) == id)
+        })
+        .flatten()
+}
+
+/// Test the real window before IPC entry; the closure's resources are dropped
+/// before its cancellation boundary. Excluded from the regular sysroot.
+#[cfg(feature = "transport-probe")]
+pub fn probe_cancel_window(run: impl FnOnce()) {
+    let point = cancel::Point::begin();
+    run();
+    point.finish();
+}
+
+/// Cancel once after JOIN produced a retained result, before its delivery.
+#[cfg(feature = "transport-probe")]
+pub fn probe_cancel_join_reply() {
+    CANCEL_JOIN_REPLY.store(true, Ordering::Release);
+}
+
+/// Confirm a live thread is inside the console phase of read.
+#[cfg(feature = "transport-probe")]
+pub fn probe_console_waiting(id: u64) -> bool {
+    LAUNCH
+        .iter()
+        .find(|launch| launch.id.load(Ordering::Acquire) == id)
+        .is_some_and(|launch| {
+            launch.cancel.console.load(Ordering::Acquire)
+                && launch.cancel.active.load(Ordering::SeqCst) != 0
+        })
+}
+
+/// Temporarily schedule the owner ahead of a probe's low-priority target.
+/// The regular sysroot has no extra native-owner handle.
+#[cfg(feature = "transport-probe")]
+pub fn probe_owner_priority(priority: u8) {
+    let thread = unsafe {
+        (*OWNER_NATIVE.0.get())
+            .as_ref()
+            .expect("probe owner handle")
+    };
+    sys::thread_set_priority(thread, priority, Policy::Fifo).expect("probe owner priority");
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_wake_retries() -> u64 {
+    WAKE_RETRIES.load(Ordering::Acquire)
 }
