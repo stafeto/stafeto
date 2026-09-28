@@ -85,6 +85,29 @@ impl TryFrom<proto_fs::NodeInfo> for Stat {
     }
 }
 
+/// Directory entry returned by the C ABI. d_type is a convenience extension.
+#[repr(C)]
+pub struct Dirent {
+    pub d_ino: u64,
+    pub d_type: u8,
+    pub d_name: [u8; constants::NAME_MAX as usize + 1],
+}
+
+impl Dirent {
+    pub const fn empty() -> Self {
+        Self {
+            d_ino: 0,
+            d_type: 0,
+            d_name: [0; constants::NAME_MAX as usize + 1],
+        }
+    }
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Dirent>() == constants::STAFETO_DIRENT_SIZE as usize);
+    assert!(core::mem::offset_of!(Dirent, d_name) == 9);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;

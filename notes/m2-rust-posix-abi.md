@@ -30,7 +30,7 @@ then runs a distinct guest image for native-thread errno checks. The full
 `posix-crt` unwraps init's ServiceArgs, builds up to 16 writable argument
 strings, supplies a NULL-terminated argv and an empty environment, sets the
 current-thread context, calls C main, and returns its eight-bit status.
-The kernel's existing TPIDR_EL0 save/restore supports a 32-byte thread block
+The kernel's existing TPIDR_EL0 save/restore supports a 48-byte thread block
 with errno at offset 16. A scope restores the previous thread register;
 the first two words are reserved for later ELF TLS support. This block does
 not yet load arbitrary `_Thread_local` objects from an ELF TLS segment.
@@ -46,7 +46,7 @@ These checks follow the thread isolation requirement in
 [POSIX.1-2024 section 2.3](https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html).
 
 This sysroot is an initial, experimental subset. Allocation, stdio,
-remaining headers, directory C ABI, environment inheritance,
+remaining headers, environment inheritance,
 ELF TLS templates, constructor/destructor startup, signal handling, and
 multi-thread process file state still require implementation. File scopes
 borrow a PosixFs exclusively; a second thread can initialize its own errno
@@ -54,3 +54,6 @@ but sharing process descriptors needs the separate POSIX service. BusyBox
 continues to use the MIT bridge; this GPL library stays out of its link graph.
 
 Stat structures and metadata are added by [the next milestone](m2-rust-posix-stat.md).
+
+The [directory milestone](m2-rust-posix-dir.md) adds descriptor-backed streams
+and a private registry pointer to the thread block; errno stays at offset 16.

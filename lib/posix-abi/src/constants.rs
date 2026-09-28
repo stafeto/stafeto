@@ -27,6 +27,7 @@ pub const O_RDONLY: i32 = 0;
 pub const O_WRONLY: i32 = 1;
 pub const O_RDWR: i32 = 2;
 pub const O_ACCMODE: i32 = 3;
+pub const O_DIRECTORY: i32 = 65536;
 pub const O_CLOEXEC: i32 = 524288;
 pub const O_CLOFORK: i32 = 16777216;
 pub const SEEK_SET: i32 = 0;

@@ -9,7 +9,7 @@
 use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION, valid_path};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use ramfs::{Fds, Ram, directory_entry};
+use ramfs::{Fds, Ram};
 use rt::handle::{Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
@@ -199,13 +199,47 @@ impl Service<0> for Fs {
                 let Ok(path) = body.bytes(body.left()).and_then(valid_path) else {
                     return Answer::Status(Status::BadSize);
                 };
-                match directory_entry(path, index) {
+                match self.ram.directory_read_path(
+                    path,
+                    index,
+                    rt::time::ticks_to_ns(rt::time::now()),
+                ) {
                     Ok(entry) => {
-                        let (name, kind) = entry.unwrap_or(("", 0));
+                        let (name, kind) = entry.map_or(("", 0), |entry| (entry.name, entry.kind));
                         let w = r.reply();
                         if w.u32(0)
                             .and_then(|()| w.u32(kind))
                             .and_then(|()| w.bytes(name.as_bytes()))
+                            .is_err()
+                        {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
+            Some(Method::ReadDirFd) => {
+                let Ok(fd) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                match self.ram.directory_read(
+                    &mut s.data,
+                    fd,
+                    rt::time::ticks_to_ns(rt::time::now()),
+                ) {
+                    Ok(entry) => {
+                        let entry = entry.map(|entry| proto_fs::DirectoryEntry {
+                            name: entry.name.as_bytes(),
+                            kind: entry.kind,
+                            inode: entry.inode,
+                        });
+                        let w = r.reply();
+                        if w.u32(0)
+                            .and_then(|()| proto_fs::DirectoryEntry::write(entry, w))
                             .is_err()
                         {
                             return Answer::Status(Status::BadSize);

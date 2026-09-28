@@ -5,6 +5,7 @@
 //! reserved for an eventual ELF TLS control block. General C TLS templates
 //! are not loaded yet. Each scope exclusively borrows its file context.
 
+use crate::directory::Streams;
 use core::arch::asm;
 use core::ptr;
 use posix_fs::PosixFs;
@@ -14,11 +15,12 @@ struct Block {
     reserved: [usize; 2],
     errno: i32,
     files: *mut PosixFs,
+    directories: *mut Streams,
 }
 
 const _: () = {
     assert!(core::mem::offset_of!(Block, errno) == crate::constants::STAFETO_ERRNO_OFFSET as usize);
-    assert!(core::mem::size_of::<Block>() == 32);
+    assert!(core::mem::size_of::<Block>() == 48);
 };
 
 fn pointer() -> *mut Block {
@@ -44,11 +46,12 @@ impl Drop for Restore {
     }
 }
 
-fn scope<R>(files: *mut PosixFs, run: impl FnOnce() -> R) -> R {
+fn scope<R>(files: *mut PosixFs, directories: *mut Streams, run: impl FnOnce() -> R) -> R {
     let mut block = Block {
         reserved: [0; 2],
         errno: 0,
         files,
+        directories,
     };
     let restore = Restore(pointer());
     // SAFETY: block remains at this stack address until after register restoration.
@@ -62,12 +65,15 @@ fn scope<R>(files: *mut PosixFs, run: impl FnOnce() -> R) -> R {
 /// The context is not inherited by other threads. Their errno can be initialized
 /// with `with_errno`; sharing process descriptors needs the POSIX service.
 pub fn with_files<R>(files: &mut PosixFs, run: impl FnOnce() -> R) -> R {
-    scope(files, run)
+    let mut directories = Streams::new();
+    let result = scope(files, &mut directories, run);
+    directories.close_all(files);
+    result
 }
 
 /// Give the current thread its own errno without a file context.
 pub fn with_errno<R>(run: impl FnOnce() -> R) -> R {
-    scope(ptr::null_mut(), run)
+    scope(ptr::null_mut(), ptr::null_mut(), run)
 }
 
 fn block() -> *mut Block {
@@ -87,4 +93,9 @@ pub(crate) fn errno() -> *mut i32 {
 pub(crate) fn files() -> *mut PosixFs {
     // SAFETY: a scope holds the unique file-context borrow on this thread.
     unsafe { (*block()).files }
+}
+
+pub(crate) fn directories() -> *mut Streams {
+    // SAFETY: the current scope uniquely owns its live directory registry.
+    unsafe { (*block()).directories }
 }

@@ -8,7 +8,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use proto_fs::{
-    BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, READ_WRITE, WRITE_ONLY,
+    BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, WRITE_ONLY,
 };
 
 const FILE_CAPACITY: usize = 1024;
@@ -28,8 +28,22 @@ pub fn directory_entry(path: &str, index: u32) -> Result<Option<(&'static str, u
     Ok(entries.get(index as usize).copied())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryRecord {
+    pub name: &'static str,
+    pub kind: u32,
+    pub inode: u64,
+}
+
+fn directory_count(path: &str) -> i64 {
+    if path == "/" { 4 } else { 3 }
+}
+
 #[derive(Clone, Copy)]
 enum File {
+    Root,
+    Etc,
+    Tmp,
     Motd,
     Scratch,
 }
@@ -55,16 +69,24 @@ impl Default for Fds {
 
 impl Fds {
     pub fn open(&mut self, path: &str, flags: u32) -> Result<u32, u32> {
-        if flags > READ_WRITE {
+        if flags & !7 != 0 || flags & 3 == 3 {
             return Err(proto_wire::BAD_SIZE);
         }
+        let directory_only = flags & proto_fs::DIRECTORY_ONLY != 0;
+        let flags = flags & 3;
         let file = match path {
-            "/" | "/etc" | "/tmp" => return Err(IS_DIRECTORY),
+            "/" | "/etc" | "/tmp" if flags != READ_ONLY => return Err(IS_DIRECTORY),
+            "/" => File::Root,
+            "/etc" => File::Etc,
+            "/tmp" => File::Tmp,
             "/etc/motd" if flags == READ_ONLY => File::Motd,
             "/etc/motd" => return Err(proto_fs::ACCESS_DENIED),
             "/tmp/probe" => File::Scratch,
             _ => return Err(NO_ENTRY),
         };
+        if directory_only && !file.is_directory() {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
         let slot = self
             .open
             .iter_mut()
@@ -112,15 +134,25 @@ struct FileTimes {
 }
 
 impl File {
+    fn is_directory(self) -> bool {
+        matches!(self, Self::Root | Self::Etc | Self::Tmp)
+    }
+
     fn index(self) -> usize {
         match self {
-            Self::Motd => 0,
-            Self::Scratch => 1,
+            Self::Root => 0,
+            Self::Etc => 1,
+            Self::Tmp => 2,
+            Self::Motd => 3,
+            Self::Scratch => 4,
         }
     }
 
     fn path(self) -> &'static str {
         match self {
+            Self::Root => "/",
+            Self::Etc => "/etc",
+            Self::Tmp => "/tmp",
             Self::Motd => "/etc/motd",
             Self::Scratch => "/tmp/probe",
         }
@@ -130,8 +162,7 @@ impl File {
 pub struct Ram {
     scratch: [u8; FILE_CAPACITY],
     len: usize,
-    created: u64,
-    times: [FileTimes; 2],
+    times: [FileTimes; 5],
 }
 
 impl Default for Ram {
@@ -146,33 +177,25 @@ impl Ram {
         Self {
             scratch: [0; FILE_CAPACITY],
             len: 0,
-            created: now,
             times: [FileTimes {
                 access: now,
                 modify: now,
                 change: now,
-            }; 2],
+            }; 5],
         }
     }
 
     pub fn information(&self, path: &str) -> Result<NodeInfo, u32> {
         let (kind, inode, links, permissions, file) = match path {
-            "/" => (DIR, 1, 4, 0o555, None),
-            "/etc" => (DIR, 2, 2, 0o555, None),
-            "/tmp" => (DIR, 3, 2, 0o555, None),
-            "/etc/motd" => (REG, 4, 1, 0o444, Some(File::Motd)),
-            "/tmp/probe" => (REG, 5, 1, 0o644, Some(File::Scratch)),
+            "/" => (DIR, 1, 4, 0o555, File::Root),
+            "/etc" => (DIR, 2, 2, 0o555, File::Etc),
+            "/tmp" => (DIR, 3, 2, 0o555, File::Tmp),
+            "/etc/motd" => (REG, 4, 1, 0o444, File::Motd),
+            "/tmp/probe" => (REG, 5, 1, 0o644, File::Scratch),
             _ => return Err(NO_ENTRY),
         };
-        let size = file.map_or(0, |file| self.bytes(file).len() as u64);
-        let times = file.map_or(
-            FileTimes {
-                access: self.created,
-                modify: self.created,
-                change: self.created,
-            },
-            |file| self.times[file.index()],
-        );
+        let size = self.bytes(file).len() as u64;
+        let times = self.times[file.index()];
         Ok(NodeInfo {
             kind,
             permissions,
@@ -228,6 +251,51 @@ impl Ram {
         Ok(n)
     }
 
+    pub fn directory_read(
+        &mut self,
+        fds: &mut Fds,
+        fd: u32,
+        now: u64,
+    ) -> Result<Option<DirectoryRecord>, u32> {
+        let open = fds.get_mut(fd)?;
+        if !open.file.is_directory() {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        let index = u32::try_from(open.offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
+        let entry = self.directory_read_path(open.file.path(), index, now)?;
+        if entry.is_some() {
+            open.offset += 1;
+        }
+        Ok(entry)
+    }
+
+    pub fn directory_read_path(
+        &mut self,
+        path: &str,
+        index: u32,
+        now: u64,
+    ) -> Result<Option<DirectoryRecord>, u32> {
+        let info = self.information(path)?;
+        if info.kind != DIR {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        let entry = directory_entry(path, index)?;
+        self.times[(info.inode - 1) as usize].access = now;
+        Ok(entry.map(|(name, kind)| DirectoryRecord {
+            name,
+            kind,
+            inode: match (path, name) {
+                (_, "..") => 1,
+                (_, ".") => info.inode,
+                ("/", "etc") => 2,
+                ("/", "tmp") => 3,
+                ("/etc", "motd") => 4,
+                ("/tmp", "probe") => 5,
+                _ => unreachable!("static namespace entry"),
+            },
+        }))
+    }
+
     pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
         let (kind, size) = match path {
             "/" | "/etc" | "/tmp" => (DIR, 0),
@@ -240,6 +308,7 @@ impl Ram {
 
     fn bytes(&self, file: File) -> &[u8] {
         match file {
+            File::Root | File::Etc | File::Tmp => &[],
             File::Motd => MOTD,
             File::Scratch => &self.scratch[..self.len],
         }
@@ -260,7 +329,14 @@ impl Ram {
     ) -> Result<i64, u32> {
         use proto_fs::{INVALID_ARGUMENT, NO_DATA, OFFSET_OVERFLOW, SeekFrom};
         let open = fds.get_mut(fd)?;
-        let size = self.bytes(open.file).len() as i64;
+        if open.file.is_directory() && matches!(origin, SeekFrom::Data | SeekFrom::Hole) {
+            return Err(INVALID_ARGUMENT);
+        }
+        let size = if open.file.is_directory() {
+            directory_count(open.file.path())
+        } else {
+            self.bytes(open.file).len() as i64
+        };
         let next = match origin {
             SeekFrom::Start => offset,
             SeekFrom::Current => open.offset.checked_add(offset).ok_or(OFFSET_OVERFLOW)?,
@@ -288,6 +364,9 @@ impl Ram {
 
     pub fn read(&self, fds: &mut Fds, fd: u32, out: &mut [u8]) -> Result<usize, u32> {
         let open = fds.get_mut(fd)?;
+        if open.file.is_directory() {
+            return Err(IS_DIRECTORY);
+        }
         if open.flags == WRITE_ONLY {
             return Err(BAD_FD);
         }
@@ -301,6 +380,9 @@ impl Ram {
 
     pub fn write(&mut self, fds: &mut Fds, fd: u32, bytes: &[u8]) -> Result<usize, u32> {
         let open = fds.get_mut(fd)?;
+        if open.file.is_directory() {
+            return Err(IS_DIRECTORY);
+        }
         if open.flags == READ_ONLY || matches!(open.file, File::Motd) {
             return Err(BAD_FD);
         }
@@ -325,6 +407,83 @@ impl Ram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proto_fs::READ_WRITE;
+
+    #[test]
+    fn directory_descriptions_keep_positions_identity_and_access_times() {
+        let mut ram = Ram::new(10);
+        let mut fds = Fds::default();
+        let fd = fds
+            .open("/etc", READ_ONLY | proto_fs::DIRECTORY_ONLY)
+            .unwrap();
+        let second = fds.open("/etc", READ_ONLY).unwrap();
+        assert_eq!(ram.descriptor_information(&fds, fd).unwrap().inode, 2);
+        assert_eq!(fds.open("/etc", WRITE_ONLY), Err(IS_DIRECTORY));
+        assert_eq!(
+            fds.open("/etc/motd", proto_fs::DIRECTORY_ONLY),
+            Err(proto_fs::NOT_DIRECTORY)
+        );
+        assert_eq!(
+            ram.read_at(&mut fds, fd, &mut [0; 1], 15),
+            Err(IS_DIRECTORY)
+        );
+        assert_eq!(ram.write_at(&mut fds, fd, b"x", 16), Err(IS_DIRECTORY));
+        assert_eq!(ram.information("/etc").unwrap().access_ns, 10);
+        for (now, name, inode, kind) in
+            [(20, ".", 2, DIR), (30, "..", 1, DIR), (40, "motd", 4, REG)]
+        {
+            assert_eq!(
+                ram.directory_read(&mut fds, fd, now),
+                Ok(Some(DirectoryRecord { name, kind, inode }))
+            );
+        }
+        assert_eq!(ram.directory_read(&mut fds, fd, 50), Ok(None));
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
+            Ok(3)
+        );
+        let info = ram.information("/etc").unwrap();
+        assert_eq!(
+            (info.access_ns, info.modify_ns, info.change_ns),
+            (50, 10, 10)
+        );
+        assert_eq!(
+            ram.directory_read(&mut fds, second, 60)
+                .unwrap()
+                .unwrap()
+                .name,
+            "."
+        );
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, 1, proto_fs::SeekFrom::Start),
+            Ok(1)
+        );
+        assert_eq!(
+            ram.directory_read(&mut fds, fd, 70).unwrap().unwrap().name,
+            ".."
+        );
+        let before = ram.information("/etc").unwrap();
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, -1, proto_fs::SeekFrom::Start),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Data),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
+            Ok(2)
+        );
+        fds.close(fd).unwrap();
+        assert_eq!(ram.directory_read(&mut fds, fd, 80), Err(BAD_FD));
+        let regular = fds.open("/etc/motd", READ_ONLY).unwrap();
+        assert_eq!(
+            ram.directory_read(&mut fds, regular, 90),
+            Err(proto_fs::NOT_DIRECTORY)
+        );
+        assert_eq!(ram.information("/etc").unwrap(), before);
+    }
 
     #[test]
     fn metadata_identity_and_clock_updates_are_shared_across_sessions() {
@@ -426,7 +585,7 @@ mod tests {
         );
         assert_eq!(ram.lookup("/missing"), Err(NO_ENTRY));
         let mut fds = Fds::default();
-        assert_eq!(fds.open("/etc", READ_ONLY), Err(IS_DIRECTORY));
+        assert_eq!(fds.open("/etc", WRITE_ONLY), Err(IS_DIRECTORY));
         let fd = fds.open("/tmp/probe", READ_WRITE).unwrap();
         assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
         assert_eq!(

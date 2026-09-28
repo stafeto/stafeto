@@ -3,6 +3,6 @@
 #ifndef STAFETO_FCNTL_H
 #define STAFETO_FCNTL_H
 #include <stafeto/abi.h>
-/* ABI 1 supports access mode and O_CLOEXEC/O_CLOFORK; creation is pending. */
+/* ABI 1 supports access mode, O_DIRECTORY and O_CLOEXEC/O_CLOFORK; creation is pending. */
 int open(const char *path, int flags, ...);
 #endif
