@@ -103,6 +103,9 @@ user-space console driver remain future work. What works today:
 - **Rust POSIX sleep waits:** `nanosleep` and `clock_nanosleep` share the pthread
   deadline timer, return elapsed remainders and remove waits before cancellation
   cleanup. Relative waits ignore calendar settings. Signal delivery remains work.
+- **Native user entries:** generic upcalls can enter a computing or IPC-waiting
+  thread and restore its registers, TLS, FP/SIMD and message buffer, including
+  nesting. Rust POSIX signal policy and safe library reentry remain work.
 - **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
@@ -228,6 +231,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust system clocks | Add shared REALTIME and immutable MONOTONIC clocks with gettime/getres/settime, wide calendar arithmetic and retry-safe settings; verify C ABI, independent processes and committed SET/ACK interruption on QEMU and Apple VZ. | ✅ [#49](https://github.com/stafeto/stafeto/pull/49) |
 | Rust absolute mutex waits | Add clock-step notifications and timed/clock mutex acquisition; verify forward/backward calendar changes, brief deadline crossings, earliest timers and interrupted replies on QEMU and Apple VZ. | ✅ [#50](https://github.com/stafeto/stafeto/pull/50) |
 | Rust sleep waits | Add relative and absolute nanosleep/clock_nanosleep waiting, interruption remainders and deferred cancellation; verify calendar changes and shared mutex/sleep history on QEMU and Apple VZ. Signal delivery remains below. | ✅ [#51](https://github.com/stafeto/stafeto/pull/51) |
+| Native signal entry foundation | Enter a computing or IPC-waiting thread through a MANAGE-protected request; preserve GPR/SIMD, user PSTATE, TLS and IPC, including masking and nesting. Verify QEMU and Apple VZ; POSIX signal policy and library reentry remain below. | ✅ [#52](https://github.com/stafeto/stafeto/pull/52) |
 | Rust timers | Add timer creation, event delivery and overrun accounting; verify relative/absolute expiry, clock changes, signal delivery and resource lifetime. | 🚧 |
 | Rust mutex completion | Add robust owner-death recovery and consistency, shared-process objects and priority protocols; verify recovery, process lifetime and scheduling behavior. | 🚧 |
 | Rust thread synchronization and attributes | Add conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |

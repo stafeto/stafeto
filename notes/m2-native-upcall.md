@@ -65,9 +65,17 @@ It also drains the startup notification boost before lowering effective priority
 The parent's timed waits then permit the priority-10 worker to run and wake safely.
 
 QEMU and Apple Virtualization.framework probes passed. Intentional mutations
-must detect lost pending, widened privilege access, dropped extra PSTATE bits,
+detected lost pending, widened privilege access, dropped extra PSTATE bits,
 omitted FP load, one damaged GPR, missing IPC restore and overwritten x0.
-Full CI and final image measurements are recorded after the implementation commit.
+Full cargo xtask ci passed on 66cc119, including licenses, formatting, Clippy,
+host/guest tests, BusyBox, image limits and shipping hot-path memcpy/memset checks.
+The previous run caught a stale unknown-syscall test; its first free number is
+now ThreadUpcallReturn + 1 (35). The targeted 221-test init rerun also passed.
+Kernel checks: 165 normally, 176 under icount; init: 221 per machine.
+Normal/VZ kernel images: 154704/171072 bytes; pthread boot image: 421888 bytes.
+Normal null/clock/yield/notify/round_trip ticks: 237/296/361/841/1756.
+Test IPC null/switch/fast/slow/buffer/handles ticks: 245/467/1931/2122/3031/4267.
+These icount figures do not measure the upcall path or a physical latency bound.
 
 ## Remaining POSIX work
 
