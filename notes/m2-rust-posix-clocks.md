@@ -65,7 +65,10 @@ Further guest checks replay an older retained SET after another client's newer s
 reject changed payloads and trailing bytes, and check warmed quota and handle recovery.
 
 Targeted tests, host/guest Clippy, license checks and final cargo xtask ci are recorded
-with the ready implementation commit. Intentional mutations exercise lost rounding,
+on ready implementation c743f54; the full run passed with 221 init tests,
+165 kernel tests and 176 icount tests. Normal kernel: 150608 bytes; Apple VZ: 171072.
+C/standalone/thread boot images: 372736/389120/385024 bytes.
+Intentional mutations exercise lost rounding,
 reapplied SET, an incorrect second-process date and failure to retry Interrupted.
 
 ## Remaining work

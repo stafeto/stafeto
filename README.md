@@ -93,6 +93,10 @@ user-space console driver remain future work. What works today:
   on interrupts at priority 60; it shows the kernel log between whole
   lines of its clients, lets writes wait whole for room and gives input
   to one reader at a time (`proto/uart`).
+- **Rust POSIX clocks:** dedicated C and pthread test images share a realtime
+  clock service and expose `clock_gettime`, `clock_getres` and `clock_settime`.
+  Realtime starts at an unsynchronized Unix epoch until explicitly set;
+  monotonic time uses the common hardware counter.
 - **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
@@ -215,7 +219,9 @@ checks for successful calls, failures, and ABI layout.
 | Rust once initialization | Serialize one initializer per control, block contenders through IPC, publish application writes, and retry after cancellation/exit; verify nested recovery and interrupted replies on QEMU and Apple VZ. | ✅ [#46](https://github.com/stafeto/stafeto/pull/46) |
 | Rust thread capacity | Support 64 simultaneously live application threads with independent data and errno, working heap/file owners, exact-limit failure, and joined resource recovery on QEMU and Apple VZ. | ✅ [#47](https://github.com/stafeto/stafeto/pull/47) |
 | Rust mutex ownership | Add private stalled NORMAL, ERRORCHECK and RECURSIVE mutexes, static initialization and type attributes; verify live waiters, priority handoff, interrupted replies, ordinary writes and cancellation cleanup on QEMU and Apple VZ. | ✅ [#48](https://github.com/stafeto/stafeto/pull/48) |
-| Rust mutex completion | Add timed/clock acquisition, robust owner-death recovery and consistency, shared-process objects and priority protocols; verify deadlines, recovery, process lifetime and scheduling behavior. | 🚧 |
+| Rust system clocks | Add shared REALTIME and immutable MONOTONIC clocks with gettime/getres/settime, wide calendar arithmetic and retry-safe settings; verify C ABI, independent processes and committed SET/ACK interruption on QEMU and Apple VZ. | ✅ [#49](https://github.com/stafeto/stafeto/pull/49) |
+| Rust absolute waiting | Add clock-step notifications, timed/clock mutex acquisition, timers and sleeps; verify forward/backward calendar changes, deadlines and interrupted replies. | 🚧 |
+| Rust mutex completion | Add robust owner-death recovery and consistency, shared-process objects and priority protocols; verify recovery, process lifetime and scheduling behavior. | 🚧 |
 | Rust thread synchronization and attributes | Add conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
@@ -249,7 +255,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-thread-data.md](notes/m2-rust-posix-thread-data.md) and
 [notes/m2-rust-posix-once.md](notes/m2-rust-posix-once.md) and
 [notes/m2-rust-posix-thread-capacity.md](notes/m2-rust-posix-thread-capacity.md) and
-[notes/m2-rust-posix-mutex.md](notes/m2-rust-posix-mutex.md)
+[notes/m2-rust-posix-mutex.md](notes/m2-rust-posix-mutex.md) and
+[notes/m2-rust-posix-clocks.md](notes/m2-rust-posix-clocks.md)
 for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery
