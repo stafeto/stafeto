@@ -798,6 +798,37 @@ static void *clock_reader(void *expected) {
         return (void *)1;
     return NULL;
 }
+static int sleeps(void) {
+    struct timespec request = {0, 0};
+    struct timespec remaining = {777, 888};
+    errno = 123;
+    if (nanosleep(&request, 0) || errno != 123) return 287;
+    if (nanosleep(&request, &remaining) || errno != 123
+        || remaining.tv_sec != 777 || remaining.tv_nsec != 888) return 287;
+    if (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &request, &remaining)
+        || errno != 123 || remaining.tv_sec != 777 || remaining.tv_nsec != 888) return 288;
+    request.tv_nsec = 1000000000;
+    if (nanosleep(&request, &remaining) != -1 || errno != EINVAL
+        || remaining.tv_sec != 777 || remaining.tv_nsec != 888) return 289;
+    errno = 123;
+    if (clock_nanosleep(CLOCK_REALTIME, 0, &request, &remaining) != EINVAL
+        || errno != 123 || remaining.tv_sec != 777 || remaining.tv_nsec != 888) return 290;
+    request.tv_nsec = 0;
+    request.tv_sec = -1;
+    if (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &request, &remaining) != EINVAL
+        || errno != 123) return 291;
+    request.tv_sec = 0;
+    if (clock_nanosleep(17, 0, &request, &remaining) != EINVAL
+        || clock_nanosleep(CLOCK_MONOTONIC, 2, &request, &remaining) != EINVAL
+        || clock_nanosleep(CLOCK_REALTIME, 0, 0, &remaining) != EFAULT
+        || errno != 123) return 292;
+    if (nanosleep(0, &remaining) != -1 || errno != EFAULT) return 293;
+    errno = 123;
+    if (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &request, &remaining)
+        || errno != 123 || remaining.tv_sec != 777 || remaining.tv_nsec != 888) return 294;
+    return 0;
+}
+
 static int clocks(void) {
     struct timespec saved, before, after, value = {987, 654}, resolution;
     errno = 123;
@@ -900,6 +931,8 @@ int main(int argc, char **argv) {
     if (mutex_result) return mutex_result;
     int clock_result = clocks();
     if (clock_result) return clock_result;
+    int sleep_result = sleeps();
+    if (sleep_result) return sleep_result;
     int timed_result = timed_mutexes();
     if (timed_result) return timed_result;
     int allocation_result = allocations();

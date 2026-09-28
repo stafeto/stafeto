@@ -8,6 +8,7 @@
 pub mod cancel;
 pub mod mutex;
 pub mod once;
+pub mod sleep;
 pub mod specific;
 
 use crate::{allocation, constants::*, tls};
@@ -219,6 +220,7 @@ struct Entry {
     woken_epoch: u64,
     once_waiting: Option<once::Waiting>,
     mutex_waiting: Option<mutex::Waiting>,
+    sleep_waiting: Option<sleep::Waiting>,
 }
 impl Entry {
     fn new(
@@ -239,6 +241,7 @@ impl Entry {
             woken_epoch: 0,
             once_waiting: None,
             mutex_waiting: None,
+            sleep_waiting: None,
         }
     }
 }
@@ -518,6 +521,7 @@ impl Registry {
                     }
                 }
                 let entry = self.entry_mut(caller);
+                entry.sleep_waiting = None;
                 entry.phase = Phase::Exiting;
                 entry.value = words[3];
                 // Application threads determine process lifetime; internal owners remain live.
@@ -634,8 +638,8 @@ extern "C" fn owner(_: u64) -> ! {
         } else {
             poll = None;
         }
-        let mutex = registry.mutex_deadlines();
-        let wanted = match (poll, mutex) {
+        let deadline = registry.wait_deadlines();
+        let wanted = match (poll, deadline) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
@@ -698,10 +702,19 @@ extern "C" fn owner(_: u64) -> ! {
             registry.once_begin(caller, words, token);
         } else if matches!(words[0], mutex::LOCK | mutex::TRY | mutex::TIMED) {
             registry.mutex_lock(caller, words, token);
+        } else if words[0] == sleep::BEGIN {
+            registry.sleep_begin(caller, words, token);
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
         } else {
-            let result = if matches!(words[0], mutex::UNLOCK | mutex::DESTROY) {
+            let result = if words[0] == sleep::ABANDON {
+                registry.entry_mut(caller).sleep_waiting = None;
+                Ok((0, 0))
+            } else if cfg!(feature = "transport-probe") && words[0] == sleep::QUERY {
+                registry
+                    .find(words[3])
+                    .map(|index| (u64::from(registry.entry(index).sleep_waiting.is_some()), 0))
+            } else if matches!(words[0], mutex::UNLOCK | mutex::DESTROY) {
                 registry.mutex_perform(words).map(|value| (value, 0))
             } else if matches!(words[0], once::FINISH | once::RESET) {
                 registry.once_perform(words).map(|value| (value, 0))
@@ -767,6 +780,7 @@ fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
     }
     loop {
         match sys::send(channel(), &bytes) {
+            Err(Error::Interrupted) if op == sleep::BEGIN => return Err(EINTR),
             Err(Error::Interrupted) if op == JOIN && cancel::requested() => return Err(ECANCELED),
             Err(Error::Interrupted) => continue,
             Err(_) => return Err(EIO),
