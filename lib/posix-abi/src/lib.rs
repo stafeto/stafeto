@@ -8,6 +8,7 @@
 #![no_std]
 
 pub mod allocation;
+pub mod clock;
 pub mod constants;
 pub mod directory;
 pub mod locale;

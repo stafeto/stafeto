@@ -7,4 +7,9 @@ struct timespec {
     time_t tv_sec;
     long tv_nsec;
 };
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+int clock_gettime(clockid_t clock, struct timespec *value);
+int clock_getres(clockid_t clock, struct timespec *resolution);
+int clock_settime(clockid_t clock, const struct timespec *value);
 #endif

@@ -26,6 +26,11 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    // SAFETY: startup runs once, before application threads and clock calls.
+    if unsafe { posix_abi::clock::init(&start.parent) }.is_err() {
+        rt::println!("POSIX startup: clock connection failed");
+        return 125;
+    }
     let Ok(files) = PosixFs::connect(&start.parent) else {
         rt::println!("POSIX startup: file connection failed");
         return 125;

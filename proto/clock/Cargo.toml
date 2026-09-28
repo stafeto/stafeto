@@ -1,0 +1,10 @@
+[package]
+name = "proto-clock"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+
+[dependencies]
+proto-wire = { path = "../wire" }

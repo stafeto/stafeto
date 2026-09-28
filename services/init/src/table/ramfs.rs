@@ -81,9 +81,25 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
 pub const POSIX_ABI_TABLE: &[Record] = &[
     TABLE[0],
     Record {
+        name: "clock",
+        program: "posix-clock-service",
+        quota: 64 * PAGE,
+        restart: Restart::Never,
+        ..TABLE[0]
+    },
+    Record {
+        name: "clock-peer",
+        program: "posix-clock-peer",
+        quota: 64 * PAGE,
+        connects: &["clock"],
+        restart: Restart::Never,
+        ..TABLE[0]
+    },
+    Record {
         name: "posix-abi-probe",
         program: "posix-abi-probe",
         args: b"posix-abi-probe\0argument\0",
+        connects: &["ramfs", "clock", "clock-peer"],
         quota: 2048 * PAGE,
         handle_limit: 128,
         ..TABLE[1]
