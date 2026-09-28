@@ -4,13 +4,15 @@
 //! System-wide realtime anchor. Starts at the Unix epoch until explicitly set.
 #![no_std]
 #![no_main]
-use posix_time::{Clock, Error, History, Observation, Settings, Snapshot, Time};
+use posix_time::{Clock, Error, History, Snapshot, Time};
 use proto_clock::Method;
 use proto_init::ServiceArgs;
 use proto_wire::Status;
 use rt::handle::{Channel, Handle, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
+mod replies;
+use replies::{Journal, Reply};
 rt::entry!(main);
 
 fn now() -> u64 {
@@ -47,6 +49,9 @@ fn main(_: u64) -> u64 {
         &channel,
         &mut Clocks {
             clock,
+            replies: Journal::new(start.process),
+            #[cfg(feature = "transport-probe")]
+            pressure: [const { None }; 128],
             watches: core::array::from_fn(|_| None),
         },
         config,
@@ -57,10 +62,12 @@ struct Watch {
     label: u64,
     channel: Handle<Channel>,
     history: History,
-    observed: Option<(u64, Observation)>,
 }
 struct Clocks {
     clock: Clock,
+    replies: Journal,
+    #[cfg(feature = "transport-probe")]
+    pressure: [Option<Handle<Channel>>; 128],
     watches: [Option<Watch>; 8],
 }
 impl Clocks {
@@ -82,19 +89,22 @@ impl Clocks {
 }
 #[derive(Default)]
 struct Data {
-    settings: Settings,
     #[cfg(feature = "transport-probe")]
-    interrupt: Option<(u16, rt::handle::Handle<rt::handle::Thread>)>,
+    interrupt: Option<(u16, bool, rt::handle::Handle<rt::handle::Thread>)>,
 }
 #[cfg(feature = "transport-probe")]
 fn interrupt(data: &mut Data, method: Method) {
     if data
         .interrupt
         .as_ref()
-        .is_some_and(|(m, _)| *m == method as u16)
+        .is_some_and(|(m, _, _)| *m == method as u16)
     {
-        let (_, thread) = data.interrupt.take().expect("armed clock interruption");
-        sys::thread_interrupt(&thread).expect("clock caller must await committed reply");
+        let (_, upcall, thread) = data.interrupt.take().expect("armed clock interruption");
+        if upcall {
+            sys::thread_upcall_request(&thread).expect("clock nested caller");
+        } else {
+            sys::thread_interrupt(&thread).expect("clock caller must await committed reply");
+        }
     }
 }
 fn status(result: Result<(), Error>) -> Answer {
@@ -123,11 +133,59 @@ impl Service<0> for Clocks {
     #[cfg(not(feature = "transport-probe"))]
     const METHODS: &'static [u16] = proto_clock::METHODS;
     #[cfg(feature = "transport-probe")]
-    const METHODS: &'static [u16] = &[1, 2, 3, 4, 5, 6, 7];
+    const METHODS: &'static [u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
     type Data = Data;
     fn request(&mut self, s: &mut Session<Data, 0>, r: &mut Request<'_>) -> Answer {
         #[cfg(feature = "transport-probe")]
-        if r.method() == 4 {
+        if r.method() == 11 {
+            let mut body = r.body();
+            let Ok(hold) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if hold > 1 || body.finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            for slot in &mut self.pressure {
+                if hold == 0 {
+                    *slot = None;
+                } else if slot.is_none() {
+                    match sys::channel_create(1) {
+                        Ok(channel) => *slot = Some(channel),
+                        Err(_) => break,
+                    }
+                }
+            }
+            return Answer::Status(Status::Ok);
+        }
+        #[cfg(feature = "transport-probe")]
+        if r.method() == 10 {
+            if r.body().finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            let (used, committed, handles, memory) = self.replies.stats();
+            let w = r.reply();
+            w.u32(0)
+                .and_then(|()| w.u64(used))
+                .and_then(|()| w.u64(committed))
+                .and_then(|()| w.u64(handles))
+                .and_then(|()| w.u64(memory))
+                .expect("clock journal statistics");
+            return Answer::Reply(Outgoing::new());
+        }
+        #[cfg(feature = "transport-probe")]
+        if r.method() == 9 {
+            let mut body = r.body();
+            let Ok(reject) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            if reject > 1 || body.finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            self.replies.reject = if reject != 0 { Some(r.label()) } else { None };
+            return Answer::Status(Status::Ok);
+        }
+        #[cfg(feature = "transport-probe")]
+        if matches!(r.method(), 4 | 8) {
             let mut body = r.body();
             let Ok(method) = body.u32() else {
                 return Answer::Status(Status::BadSize);
@@ -142,7 +200,7 @@ impl Service<0> for Clocks {
             let Ok(thread) = r.handles.take::<rt::handle::Thread>(0) else {
                 return Answer::Status(Status::BadSize);
             };
-            s.data.interrupt = Some((method as u16, thread));
+            s.data.interrupt = Some((method as u16, r.method() == 8, thread));
             return Answer::Status(Status::Ok);
         }
         if r.method() == Method::Watch as u16 {
@@ -175,12 +233,10 @@ impl Service<0> for Clocks {
                 .as_ref()
                 .map_or(History::new(current), |w| w.history);
             history.see(current);
-            let observed = self.watches[index].as_ref().and_then(|w| w.observed);
             self.watches[index] = Some(Watch {
                 label: r.label(),
                 channel,
                 history,
-                observed,
             });
             return Answer::Status(Status::Ok);
         }
@@ -209,22 +265,33 @@ impl Service<0> for Clocks {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                let generation = self.clock.anchor().generation;
-                let tick = now();
-                self.record(self.clock.current(tick).expect("calendar before setting"));
-                let result = s.data.settings.set(
-                    nonce,
-                    Time {
-                        seconds: seconds as i64,
-                        nanos: nanos as i64,
-                    },
-                    tick,
-                    &mut self.clock,
-                );
-                if result.is_ok() && self.clock.anchor().generation != generation {
-                    self.record(self.clock.current(tick).expect("calendar after setting"));
-                    self.changed();
+                let time = Time {
+                    seconds: seconds as i64,
+                    nanos: nanos as i64,
+                };
+                if nonce == 0 || time.value().is_err() {
+                    return status(Err(Error::Invalid));
                 }
+                let result = match self.replies.ready(r.label(), nonce) {
+                    Some(Reply::Set(previous, result)) if previous == time => result,
+                    Some(_) => Err(Error::Invalid),
+                    None => {
+                        if self.replies.reserve(r.label(), nonce).is_err() {
+                            return status(Err(Error::Full));
+                        }
+                        let generation = self.clock.anchor().generation;
+                        let tick = now();
+                        self.record(self.clock.current(tick).expect("calendar before setting"));
+                        let result = self.clock.set(time, tick);
+                        if result.is_ok() && self.clock.anchor().generation != generation {
+                            self.record(self.clock.current(tick).expect("calendar after setting"));
+                            self.changed();
+                        }
+                        self.replies
+                            .complete(r.label(), nonce, Reply::Set(time, result));
+                        result
+                    }
+                };
                 #[cfg(feature = "transport-probe")]
                 if result.is_ok() {
                     interrupt(&mut s.data, Method::Set);
@@ -238,7 +305,11 @@ impl Service<0> for Clocks {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                let result = s.data.settings.ack(nonce);
+                if nonce == 0 {
+                    return status(Err(Error::Invalid));
+                }
+                self.replies.ack(r.label(), nonce);
+                let result = Ok(());
                 #[cfg(feature = "transport-probe")]
                 if result.is_ok() {
                     interrupt(&mut s.data, Method::Ack);
@@ -262,29 +333,31 @@ impl Service<0> for Clocks {
                 }
                 let mut anchor = self.clock.anchor();
                 let peak = if let Some(nonce) = nonce {
-                    let current = self
-                        .clock
-                        .current(now())
-                        .expect("observed calendar progression");
-                    let Some(watch) = self
-                        .watches
-                        .iter_mut()
-                        .flatten()
-                        .find(|w| w.label == r.label())
-                    else {
-                        return Answer::Status(Status::Kernel(rt::abi::Error::BadState));
-                    };
-                    let observation =
-                        if let Some((_, value)) = watch.observed.filter(|(id, _)| *id == nonce) {
-                            value
-                        } else {
-                            if watch.observed.is_some_and(|(id, _)| nonce < id) {
-                                return status(Err(Error::Invalid));
+                    let observation = match self.replies.ready(r.label(), nonce) {
+                        Some(Reply::Observe(value)) => value,
+                        Some(_) => return status(Err(Error::Invalid)),
+                        None => {
+                            let current = self
+                                .clock
+                                .current(now())
+                                .expect("observed calendar progression");
+                            let Some(watch) = self
+                                .watches
+                                .iter_mut()
+                                .flatten()
+                                .find(|w| w.label == r.label())
+                            else {
+                                return Answer::Status(Status::Kernel(rt::abi::Error::BadState));
+                            };
+                            if self.replies.reserve(r.label(), nonce).is_err() {
+                                return status(Err(Error::Full));
                             }
                             let value = watch.history.take(current, anchor);
-                            watch.observed = Some((nonce, value));
+                            self.replies
+                                .complete(r.label(), nonce, Reply::Observe(value));
                             value
-                        };
+                        }
+                    };
                     anchor = observation.anchor;
                     Some(observation.peak as u128)
                 } else {
@@ -318,6 +391,11 @@ impl Service<0> for Clocks {
         }
     }
     fn gone(&mut self, s: &mut Session<Data, 0>) {
+        self.replies.forget(s.label());
+        #[cfg(feature = "transport-probe")]
+        if self.replies.reject == Some(s.label()) {
+            self.replies.reject = None;
+        }
         for slot in &mut self.watches {
             if slot.as_ref().is_some_and(|w| w.label == s.label()) {
                 *slot = None;

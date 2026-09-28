@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Shared realtime anchor, wide calendar arithmetic and retry-safe settings.
+//! Shared realtime anchor, wide calendar arithmetic and interval history.
 #![no_std]
 pub const SECOND: i128 = 1_000_000_000;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -224,64 +224,6 @@ impl Clock {
         Ok(())
     }
 }
-#[derive(Clone, Copy)]
-struct Setting {
-    nonce: u64,
-    time: Time,
-}
-pub struct Settings {
-    pending: [Option<Setting>; proto_clock::PENDING_MAX],
-}
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            pending: [None; proto_clock::PENDING_MAX],
-        }
-    }
-}
-impl Settings {
-    pub fn set(
-        &mut self,
-        nonce: u64,
-        time: Time,
-        now: u64,
-        clock: &mut Clock,
-    ) -> Result<(), Error> {
-        if nonce == 0 {
-            return Err(Error::Invalid);
-        }
-        time.value()?;
-        if let Some(previous) = self.pending.iter().flatten().find(|s| s.nonce == nonce) {
-            return if previous.time == time {
-                Ok(())
-            } else {
-                Err(Error::Invalid)
-            };
-        }
-        let free = self
-            .pending
-            .iter_mut()
-            .find(|s| s.is_none())
-            .ok_or(Error::Full)?;
-        clock.set(time, now)?;
-        *free = Some(Setting { nonce, time });
-        Ok(())
-    }
-    pub fn ack(&mut self, nonce: u64) -> Result<(), Error> {
-        if nonce == 0 {
-            return Err(Error::Invalid);
-        }
-        if let Some(slot) = self
-            .pending
-            .iter_mut()
-            .find(|s| s.is_some_and(|v| v.nonce == nonce))
-        {
-            *slot = None;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,47 +282,6 @@ mod tests {
         c.generation = u64::MAX;
         assert_eq!(c.set(time(10, 0), 200), Err(Error::Overflow));
         assert_eq!(c.get(REALTIME, 201).unwrap().time, time(0, 101));
-    }
-    #[test]
-    fn retry_never_reanchors_or_reapplies_a_committed_setting() {
-        let mut c = Clock::new(0, 1_000_000_000).unwrap();
-        let mut a = Settings::default();
-        let mut b = Settings::default();
-        a.set(1, time(10, 0), 100, &mut c).unwrap();
-        a.set(1, time(10, 0), 500, &mut c).unwrap();
-        assert_eq!(c.get(REALTIME, 600).unwrap().time, time(10, 500));
-        assert_eq!(c.generation, 1);
-        assert_eq!(a.set(1, time(11, 0), 600, &mut c), Err(Error::Invalid));
-        // A second session can step time between the first commit and retry.
-        b.set(1, time(20, 0), 600, &mut c).unwrap();
-        a.set(1, time(10, 0), 700, &mut c).unwrap();
-        assert_eq!(c.get(REALTIME, 700).unwrap().time, time(20, 100));
-        assert_eq!(c.generation, 2);
-        a.ack(1).unwrap();
-        a.ack(1).unwrap();
-        assert_eq!(a.ack(0), Err(Error::Invalid));
-    }
-    #[test]
-    fn full_retention_rejects_without_mutation_and_ack_reclaims_capacity() {
-        let mut c = Clock::new(0, 1_000_000_000).unwrap();
-        let mut s = Settings::default();
-        assert_eq!(s.set(0, Time::ZERO, 0, &mut c), Err(Error::Invalid));
-        for n in 1..=proto_clock::PENDING_MAX as u64 {
-            s.set(n, time(n as i64, 0), n, &mut c).unwrap();
-        }
-        let snapshot = c.get(REALTIME, 100).unwrap();
-        assert_eq!(s.set(65, time(99, 0), 100, &mut c), Err(Error::Full));
-        assert_eq!(c.get(REALTIME, 100).unwrap(), snapshot);
-        s.set(1, time(1, 0), 100, &mut c).unwrap();
-        assert_eq!(c.get(REALTIME, 100).unwrap(), snapshot);
-        s.ack(32).unwrap();
-        s.set(65, time(99, 0), 100, &mut c).unwrap();
-        assert_eq!(c.get(REALTIME, 100).unwrap().time, time(99, 0));
-        assert_eq!(c.generation, 65);
-        // A disconnected session drops all its retained state.
-        s = Settings::default();
-        s.set(65, time(101, 0), 101, &mut c).unwrap();
-        assert_eq!(c.generation, 66);
     }
     #[test]
     fn absolute_deadlines_follow_each_clock_and_both_calendar_steps() {
