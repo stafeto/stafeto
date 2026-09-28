@@ -8,6 +8,7 @@
 #![no_std]
 
 pub mod constants;
+pub mod metadata;
 pub mod tls;
 
 use constants::*;
@@ -24,6 +25,7 @@ const _: () = {
 fn error(error: FsError) -> c_int {
     match error {
         FsError::NoEntry => ENOENT,
+        FsError::PermissionDenied => EACCES,
         FsError::BadFileDescriptor => EBADF,
         FsError::IsDirectory => EISDIR,
         FsError::NotDirectory => ENOTDIR,

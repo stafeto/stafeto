@@ -10,6 +10,7 @@ pub const ENOENT: i32 = 2;
 pub const EIO: i32 = 5;
 pub const ENXIO: i32 = 6;
 pub const EBADF: i32 = 9;
+pub const EACCES: i32 = 13;
 pub const EFAULT: i32 = 14;
 pub const ENOTDIR: i32 = 20;
 pub const EISDIR: i32 = 21;
@@ -36,3 +37,5 @@ pub const SEEK_HOLE: i32 = 4;
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;
+
+pub use posix_types::constants::*;

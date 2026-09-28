@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 _Static_assert(sizeof(void *) == 8, "pointer ABI");
@@ -13,10 +14,56 @@ _Static_assert(sizeof(size_t) == 8, "size_t ABI");
 _Static_assert(sizeof(ssize_t) == 8, "ssize_t ABI");
 _Static_assert(sizeof(off_t) == 8, "off_t ABI");
 _Static_assert(ABI_VERSION == 1, "ABI version");
+_Static_assert(sizeof(struct stat) == STAFETO_STAT_SIZE, "stat ABI");
+_Static_assert(_Alignof(struct stat) == 8, "stat alignment");
+_Static_assert(offsetof(struct stat, st_size) == 48, "stat size offset");
+_Static_assert(offsetof(struct stat, st_atim) == 72, "stat timestamp offset");
+_Static_assert(sizeof(struct timespec) == 16, "timespec ABI");
 
 static int same(const char *a, const char *b, size_t count) {
     for (size_t i = 0; i < count; i++) if (a[i] != b[i]) return 0;
     return 1;
+}
+
+static int metadata(void) {
+    struct stat value, copy;
+    errno = 123;
+    if (stat("/", &value) || errno != 123 || !S_ISDIR(value.st_mode)
+            || (value.st_mode & 07777) != 0555 || value.st_ino != 1
+            || value.st_nlink != 4 || value.st_dev != 1 || value.st_uid || value.st_gid) return 40;
+    if (stat("motd", &value) || !S_ISREG(value.st_mode) || value.st_ino != 4
+            || value.st_size != 14 || value.st_nlink != 1 || value.st_blocks != 1
+            || value.st_blksize != 1024 || (value.st_mode & 07777) != 0444) return 41;
+    int fd = open("motd", O_RDONLY), alias = dup(fd);
+    if (fd < 0 || alias < 0 || fstat(alias, &copy) || copy.st_ino != value.st_ino
+            || copy.st_dev != value.st_dev || copy.st_size != value.st_size) return 42;
+    if (close(fd) || fstat(alias, &copy) || close(alias)) return 43;
+    if (lstat("motd", &copy) || copy.st_ino != value.st_ino) return 44;
+    if (fstat(1, &copy) || !S_ISCHR(copy.st_mode) || copy.st_rdev != 1) return 45;
+    if (open("motd", O_WRONLY) != -1 || errno != EACCES) return 46;
+    value.st_ino = 987;
+    if (stat("/missing", &value) != -1 || errno != ENOENT || value.st_ino != 987) return 47;
+    if (stat("motd/", &value) != -1 || errno != ENOTDIR) return 48;
+    if (fstat(-1, &value) != -1 || errno != EBADF || value.st_ino != 987) return 49;
+    if (stat(NULL, &value) != -1 || errno != EFAULT) return 50;
+    if (stat("/", NULL) != -1 || errno != EFAULT) return 51;
+    if (fstat(1, NULL) != -1 || errno != EFAULT) return 52;
+    fd = open("/tmp/probe", O_RDWR);
+    if (fd < 0 || lseek(fd, 10, SEEK_SET) != 10 || write(fd, "x", 1) != 1
+            || fstat(fd, &value) || value.st_size != 11 || value.st_ino != 5) return 53;
+    if (value.st_mtim.tv_nsec < 0 || value.st_mtim.tv_nsec >= 1000000000
+            || value.st_mtim.tv_sec != value.st_ctim.tv_sec
+            || value.st_mtim.tv_nsec != value.st_ctim.tv_nsec) return 54;
+    if (write(fd, NULL, 0) != 0 || fstat(fd, &copy)
+            || copy.st_mtim.tv_sec != value.st_mtim.tv_sec
+            || copy.st_mtim.tv_nsec != value.st_mtim.tv_nsec) return 55;
+    char byte;
+    if (read(fd, &byte, 1) != 0 || fstat(fd, &copy)
+            || copy.st_atim.tv_sec < value.st_atim.tv_sec
+            || (copy.st_atim.tv_sec == value.st_atim.tv_sec
+                && copy.st_atim.tv_nsec < value.st_atim.tv_nsec)) return 56;
+    if (close(fd) || fstat(fd, &copy) != -1 || errno != EBADF) return 57;
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -65,6 +112,8 @@ int main(int argc, char **argv) {
     if (write(1, NULL, 1) != -1 || errno != EFAULT) return 29;
     if (close(0) != 0 || open("motd", O_RDONLY) != 0 || read(0, text, 1) != 1 || text[0] != 's') return 30;
     if (close(0) != 0 || close(0) != -1 || errno != EBADF) return 31;
+    int metadata_result = metadata();
+    if (metadata_result) return metadata_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

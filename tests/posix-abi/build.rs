@@ -15,6 +15,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest
+            .join("../../lib/posix-types/src/constants.rs")
+            .display()
+    );
     let tools = env::var_os("STAFETO_C_TOOL_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

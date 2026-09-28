@@ -45,7 +45,7 @@ fn main(_: u64) -> u64 {
     };
     rt::println!("ramfs: ready");
     let mut fs = Fs {
-        ram: Ram::default(),
+        ram: Ram::new(rt::time::ticks_to_ns(rt::time::now())),
     };
     let _ = rt::service::run::<Fs, SESSIONS, 0>(&channel, &mut fs, config);
     4
@@ -95,7 +95,12 @@ impl Service<0> for Fs {
                     return Answer::Status(Status::BadSize);
                 }
                 let mut bytes = [0; MAX_READ];
-                match self.ram.read(&mut s.data, fd, &mut bytes[..count as usize]) {
+                match self.ram.read_at(
+                    &mut s.data,
+                    fd,
+                    &mut bytes[..count as usize],
+                    rt::time::ticks_to_ns(rt::time::now()),
+                ) {
                     Ok(n) => {
                         let w = r.reply();
                         if w.u32(0)
@@ -120,7 +125,12 @@ impl Service<0> for Fs {
                 if bytes.len() > MAX_WRITE {
                     return Answer::Status(Status::BadSize);
                 }
-                match self.ram.write(&mut s.data, fd, bytes) {
+                match self.ram.write_at(
+                    &mut s.data,
+                    fd,
+                    bytes,
+                    rt::time::ticks_to_ns(rt::time::now()),
+                ) {
                     Ok(n) => value(r, n as u32),
                     Err(code) => status(code),
                 }
@@ -198,6 +208,32 @@ impl Service<0> for Fs {
                             .and_then(|()| w.bytes(name.as_bytes()))
                             .is_err()
                         {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
+            Some(Method::InfoFd | Method::InfoPath) => {
+                let info = if r.method() == Method::InfoFd as u16 {
+                    let Ok(fd) = body.u32() else {
+                        return Answer::Status(Status::BadSize);
+                    };
+                    if body.finish().is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    self.ram.descriptor_information(&s.data, fd)
+                } else {
+                    let Ok(path) = body.bytes(body.left()).and_then(valid_path) else {
+                        return Answer::Status(Status::BadSize);
+                    };
+                    self.ram.information(path)
+                };
+                match info {
+                    Ok(info) => {
+                        let w = r.reply();
+                        if w.u32(0).and_then(|()| info.write(w)).is_err() {
                             return Answer::Status(Status::BadSize);
                         }
                         Answer::Reply(Outgoing::new())

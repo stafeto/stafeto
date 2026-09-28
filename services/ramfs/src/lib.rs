@@ -8,7 +8,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use proto_fs::{
-    BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, READ_ONLY, READ_WRITE, WRITE_ONLY,
+    BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, READ_WRITE, WRITE_ONLY,
 };
 
 const FILE_CAPACITY: usize = 1024;
@@ -61,7 +61,7 @@ impl Fds {
         let file = match path {
             "/" | "/etc" | "/tmp" => return Err(IS_DIRECTORY),
             "/etc/motd" if flags == READ_ONLY => File::Motd,
-            "/etc/motd" => return Err(proto_wire::BAD_SIZE),
+            "/etc/motd" => return Err(proto_fs::ACCESS_DENIED),
             "/tmp/probe" => File::Scratch,
             _ => return Err(NO_ENTRY),
         };
@@ -104,21 +104,130 @@ impl Fds {
     }
 }
 
-pub struct Ram {
-    scratch: [u8; FILE_CAPACITY],
-    len: usize,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileTimes {
+    access: u64,
+    modify: u64,
+    change: u64,
 }
 
-impl Default for Ram {
-    fn default() -> Self {
-        Self {
-            scratch: [0; FILE_CAPACITY],
-            len: 0,
+impl File {
+    fn index(self) -> usize {
+        match self {
+            Self::Motd => 0,
+            Self::Scratch => 1,
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::Motd => "/etc/motd",
+            Self::Scratch => "/tmp/probe",
         }
     }
 }
 
+pub struct Ram {
+    scratch: [u8; FILE_CAPACITY],
+    len: usize,
+    created: u64,
+    times: [FileTimes; 2],
+}
+
+impl Default for Ram {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 impl Ram {
+    /// Seeded namespace with one creation time on the caller's file clock.
+    pub fn new(now: u64) -> Self {
+        Self {
+            scratch: [0; FILE_CAPACITY],
+            len: 0,
+            created: now,
+            times: [FileTimes {
+                access: now,
+                modify: now,
+                change: now,
+            }; 2],
+        }
+    }
+
+    pub fn information(&self, path: &str) -> Result<NodeInfo, u32> {
+        let (kind, inode, links, permissions, file) = match path {
+            "/" => (DIR, 1, 4, 0o555, None),
+            "/etc" => (DIR, 2, 2, 0o555, None),
+            "/tmp" => (DIR, 3, 2, 0o555, None),
+            "/etc/motd" => (REG, 4, 1, 0o444, Some(File::Motd)),
+            "/tmp/probe" => (REG, 5, 1, 0o644, Some(File::Scratch)),
+            _ => return Err(NO_ENTRY),
+        };
+        let size = file.map_or(0, |file| self.bytes(file).len() as u64);
+        let times = file.map_or(
+            FileTimes {
+                access: self.created,
+                modify: self.created,
+                change: self.created,
+            },
+            |file| self.times[file.index()],
+        );
+        Ok(NodeInfo {
+            kind,
+            permissions,
+            device: 1,
+            special_device: 0,
+            inode,
+            links,
+            uid: 0,
+            gid: 0,
+            size,
+            block_size: FILE_CAPACITY as u32,
+            blocks: size.div_ceil(512),
+            access_ns: times.access,
+            modify_ns: times.modify,
+            change_ns: times.change,
+        })
+    }
+
+    pub fn descriptor_information(&self, fds: &Fds, fd: u32) -> Result<NodeInfo, u32> {
+        self.information(fds.get(fd)?.file.path())
+    }
+
+    /// A successful nonempty request updates atime even when it reads EOF.
+    pub fn read_at(
+        &mut self,
+        fds: &mut Fds,
+        fd: u32,
+        out: &mut [u8],
+        now: u64,
+    ) -> Result<usize, u32> {
+        let file = fds.get(fd)?.file;
+        let n = self.read(fds, fd, out)?;
+        if !out.is_empty() {
+            self.times[file.index()].access = now;
+        }
+        Ok(n)
+    }
+
+    pub fn write_at(
+        &mut self,
+        fds: &mut Fds,
+        fd: u32,
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<usize, u32> {
+        let file = fds.get(fd)?.file;
+        let n = self.write(fds, fd, bytes)?;
+        if n > 0 {
+            let times = &mut self.times[file.index()];
+            times.modify = now;
+            times.change = now;
+        }
+        Ok(n)
+    }
+
     pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
         let (kind, size) = match path {
             "/" | "/etc" | "/tmp" => (DIR, 0),
@@ -216,6 +325,67 @@ impl Ram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_identity_and_clock_updates_are_shared_across_sessions() {
+        let mut ram = Ram::new(10);
+        let root = ram.information("/").unwrap();
+        assert_eq!(
+            (root.kind, root.inode, root.links, root.permissions),
+            (DIR, 1, 4, 0o555)
+        );
+        let motd = ram.information("/etc/motd").unwrap();
+        assert_eq!(
+            (
+                motd.kind,
+                motd.inode,
+                motd.links,
+                motd.permissions,
+                motd.size,
+                motd.blocks
+            ),
+            (REG, 4, 1, 0o444, 14, 1)
+        );
+        let mut a = Fds::default();
+        let mut b = Fds::default();
+        assert_eq!(
+            a.open("/etc/motd", WRITE_ONLY),
+            Err(proto_fs::ACCESS_DENIED)
+        );
+        let fa = a.open("/tmp/probe", READ_WRITE).unwrap();
+        let fb = b.open("/tmp/probe", READ_ONLY).unwrap();
+        ram.write_at(&mut a, fa, b"abc", 20).unwrap();
+        let info = ram.descriptor_information(&b, fb).unwrap();
+        assert_eq!(info, ram.information("/tmp/probe").unwrap());
+        assert_eq!(
+            (
+                info.inode,
+                info.size,
+                info.blocks,
+                info.access_ns,
+                info.modify_ns,
+                info.change_ns
+            ),
+            (5, 3, 1, 10, 20, 20)
+        );
+        assert_eq!(ram.read_at(&mut b, fb, &mut [0; 3], 30), Ok(3));
+        assert_eq!(ram.read_at(&mut b, fb, &mut [0; 1], 40), Ok(0));
+        let info = ram.information("/tmp/probe").unwrap();
+        assert_eq!(
+            (info.access_ns, info.modify_ns, info.change_ns),
+            (40, 20, 20)
+        );
+        assert_eq!(ram.read_at(&mut b, fb, &mut [], 50), Ok(0));
+        assert_eq!(ram.write_at(&mut a, fa, b"", 60), Ok(0));
+        assert_eq!(ram.write_at(&mut b, fb, b"x", 70), Err(BAD_FD));
+        a.seek(fa, FILE_CAPACITY as u32).unwrap();
+        assert_eq!(ram.write_at(&mut a, fa, b"x", 80), Err(NO_SPACE));
+        assert_eq!(ram.information("/tmp/probe").unwrap(), info);
+        b.close(fb).unwrap();
+        assert_eq!(ram.descriptor_information(&b, fb), Err(BAD_FD));
+        assert_eq!(ram.information("/missing"), Err(NO_ENTRY));
+        assert_eq!(ram.information("/").unwrap(), root);
+    }
 
     #[test]
     fn description_limit_reports_emfile_and_recovers_on_close() {

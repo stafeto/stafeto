@@ -278,6 +278,33 @@ impl Files {
         Ok(metadata)
     }
 
+    pub fn node_information(&self, path: &str) -> Result<proto_fs::NodeInfo, Status> {
+        valid_path(path.as_bytes())?;
+        let mut w = Writer::new();
+        Method::InfoPath.header().write(&mut w)?;
+        w.bytes(path.as_bytes())?;
+        self.information(w.as_bytes())
+    }
+
+    pub fn descriptor_information(&self, fd: u32) -> Result<proto_fs::NodeInfo, Status> {
+        let mut w = Writer::new();
+        Method::InfoFd.header().write(&mut w)?;
+        w.u32(fd)?;
+        self.information(w.as_bytes())
+    }
+
+    fn information(&self, request: &[u8]) -> Result<proto_fs::NodeInfo, Status> {
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(request, &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let info = proto_fs::NodeInfo::read(&mut r)?;
+        r.finish()?;
+        Ok(info)
+    }
+
     pub fn close(&self, fd: u32) -> Result<(), Status> {
         let mut w = Writer::new();
         Method::Close.header().write(&mut w)?;

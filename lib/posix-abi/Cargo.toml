@@ -12,5 +12,6 @@ test = false
 bench = false
 
 [dependencies]
+posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }
 rt = { path = "../rt" }
