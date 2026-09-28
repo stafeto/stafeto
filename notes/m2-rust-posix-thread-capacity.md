@@ -69,6 +69,9 @@ The existing kernel probes derive their maximum-thread/mapping cases
 from the ABI, exercising creation, limit recovery and teardown at 128.
 The non-preemptible-path document records the larger fixed bounds;
 its previous cycle figures remain historical measurements.
+Full CI found the old ABI assertion; it now requires 128 mappings.
+Close/Replies probes require eight fixed-size portions for two full
+processes; their counts follow the enlarged crowd and retain interrupt checks.
 
 Three deliberate mutations were rejected at guest stage 81: the old
 pthread registry admitted only 31 live children, the old native-thread

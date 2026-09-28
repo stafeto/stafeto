@@ -44,7 +44,7 @@ pub(crate) const TESTS: [Test; 20] = [
         "mem_protect_takes_whole_mappings_within_their_rights",
         mem_protect_takes_whole_mappings_within_their_rights,
     ),
-    ("mapping_limit_is_64", mapping_limit_is_64),
+    ("mapping_limit_is_128", mapping_limit_is_128),
     (
         "buffer_page_cannot_be_mapped_over",
         buffer_page_cannot_be_mapped_over,
@@ -251,7 +251,7 @@ fn ended_child() -> Result<Handle<Process>, &'static str> {
 /// copy without MAP_READ ACCESS_DENIED); a process that ended fails with
 /// BAD_STATE before its range is looked at; a range past the object and
 /// one over a mapping fail with INVALID_ARGS. A good call changes x0
-/// alone. The limit of mappings is mapping_limit_is_64; the quota of the
+/// alone. The limit of mappings is mapping_limit_is_128; the quota of the
 /// process, which pays for the tables, is a kernel test
 /// (map_that_does_not_fit_maps_nothing).
 fn mem_map_checks_its_arguments() -> Outcome {
@@ -540,7 +540,7 @@ fn protect_cases(mem: u64, no_manage: u64, ended: u64, gone: u64) -> Outcome {
 /// A process has abi::MAX_MAPPINGS mappings at most (spec 7.4): the next fails with
 /// LIMIT_REACHED alone, and once one went the next one maps. Init has
 /// INIT_MAPPINGS of its own.
-fn mapping_limit_is_64() -> Outcome {
+fn mapping_limit_is_128() -> Outcome {
     const N: u16 = Call::MemMap.number();
     let m = memory_object(1)?;
     let (own, mem, page) = (own().raw().0, m.raw().0, PAGE as u64);
@@ -564,7 +564,7 @@ fn mapping_limit_is_64() -> Outcome {
     close(m)?;
     check(
         made + INIT_MAPPINGS == abi::MAX_MAPPINGS as usize && refused,
-        "the 65th mapping did not fail with LIMIT_REACHED alone",
+        "the 129th mapping did not fail with LIMIT_REACHED alone",
     )?;
     check(freed && again && unmapped, "no mapping fit once one went")
 }

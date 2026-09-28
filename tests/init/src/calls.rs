@@ -44,7 +44,7 @@ pub(crate) const TESTS: [Test; 32] = [
         thread_start_and_process_kill_check_their_handles,
     ),
     ("thread_states", thread_states),
-    ("thread_limit_is_64", thread_limit_is_64),
+    ("thread_limit_is_128", thread_limit_is_128),
     (
         "higher_priority_start_preempts_at_once",
         higher_priority_start_preempts_at_once,
@@ -639,7 +639,7 @@ fn marker(page: usize, priority: u8) -> Result<Handle<Thread>, Error> {
 /// (spec 8), init's first thread among them: past that thread_create
 /// fails with LIMIT_REACHED. A thread that exits makes room again, while
 /// its handle keeps its shell.
-fn thread_limit_is_64() -> Outcome {
+fn thread_limit_is_128() -> Outcome {
     reset_marks();
     let mut made: [Option<Handle<Thread>>; abi::MAX_THREADS as usize - 1] =
         [const { None }; abi::MAX_THREADS as usize - 1];
@@ -655,8 +655,8 @@ fn thread_limit_is_64() -> Outcome {
     for h in made.into_iter().flatten().chain(past).chain(again) {
         close(h)?;
     }
-    check(all, "63 threads next to init's did not fit")?;
-    check(refused, "a 65th thread was made")?;
+    check(all, "127 threads next to init's did not fit")?;
+    check(refused, "a 129th thread was made")?;
     check(
         started == Some(Ok(())) && mark(0) == 1,
         "a thread of the full process did not run to its exit",
