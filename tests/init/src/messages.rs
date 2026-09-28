@@ -8,7 +8,15 @@ use crate::channels::exit_channel;
 use crate::harness::*;
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 21] = [
+pub(crate) const TESTS: [Test; 23] = [
+    (
+        "request_identity_checks_tokens_and_preserves_reply",
+        request_identity_checks_tokens_and_preserves_reply,
+    ),
+    (
+        "request_identity_tracks_interrupted_generation",
+        request_identity_tracks_interrupted_generation,
+    ),
     ("send_checks_its_arguments", send_checks_its_arguments),
     (
         "request_carries_registers_and_label",
@@ -91,6 +99,128 @@ pub(crate) fn raw_send(x: Regs) -> Regs {
 pub(crate) fn raw_reply(x: Regs) -> Regs {
     // SAFETY: reply only reads its registers and never waits.
     unsafe { sys::raw::<{ Call::Reply.number() }>(x) }
+}
+
+/// RequestIdentity changes only x0 on failure and x0..x2 on success.
+pub(crate) fn raw_identity(token: u64) -> Regs {
+    let mut x = marked();
+    x[0] = token;
+    // SAFETY: this syscall reads only a token, without user memory.
+    unsafe { sys::raw::<{ Call::RequestIdentity.number() }>(x) }
+}
+
+extern "C" fn identity_reader(token: u64) -> ! {
+    record(1, &raw_identity(token));
+    ENDED[1].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+fn request_identity_checks_tokens_and_preserves_reply() -> Outcome {
+    for token in [0, u64::MAX, 1] {
+        let after = raw_identity(token);
+        check(
+            after[0] == Error::BadState.code() && after[1..] == marked()[1..],
+            "an invalid identity token changed result registers",
+        )?;
+    }
+    reset_results();
+    let c = channel(QUIET)?;
+    let send = copy(&c, Rights::SEND)?;
+    HANDLES[0].store(send.raw().0, Relaxed);
+    let sender = spawn(0, client, 0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c)?;
+    let identity = sys::process_identity(&own()).map_err(|_| "own identity failed")?;
+    let me = Handle::<Thread>::borrowed(abi::INIT_THREAD);
+    let before = sys::thread_info(&me);
+    let first = token.sender_identity();
+    let second = raw_identity(token.raw());
+    let after = sys::thread_info(&me);
+    close(c)?;
+    let closed = token.sender_identity();
+    let reader = spawn(1, identity_reader, token.raw(), HIGH, Policy::Fifo)?;
+    // The reader shares the service process but uses a different thread.
+    sys::yield_now().map_err(|_| "reader yield failed")?;
+    let read = result(1);
+    let raw = token.raw();
+    let reply = token.reply(&request(0));
+    let used = raw_identity(raw);
+    let_run()?;
+    for handle in [reader, sender] {
+        close(handle)?;
+    }
+    close(send)?;
+    check(
+        first == Ok(identity) && closed == first,
+        "identity read consumed the token or depended on the open channel",
+    )?;
+    let expected = identity.to_words();
+    check(
+        second[..3] == [0, expected[0], expected[1]]
+            && second[3..] == marked()[3..]
+            && read[..10] == second,
+        "identity read returned wrong registers or rejected another service thread",
+    )?;
+    check(
+        before.is_ok_and(|info| info.priority == HIGH) && before == after,
+        "identity read ended the request boost",
+    )?;
+    check(
+        reply.is_ok() && ended(0) && ended(1),
+        "identity read prevented the reply or a test thread stayed live",
+    )?;
+    check(
+        used[0] == Error::BadState.code() && used[1..] == marked()[1..],
+        "a consumed token still returned its sender",
+    )
+}
+
+extern "C" fn identity_retry_client(_: u64) -> ! {
+    let c = handle(0);
+    let first = sys::send(&c, &[]);
+    MARKS[0].store(first.map_or_else(|e| e.code(), |_| 0), Relaxed);
+    let second = sys::send(&c, &[]);
+    MARKS[1].store(second.map_or_else(|e| e.code(), |_| 0), Relaxed);
+    ENDED[0].store(1, Relaxed);
+    sys::thread_exit()
+}
+
+fn request_identity_tracks_interrupted_generation() -> Outcome {
+    reset_results();
+    let c = channel(QUIET)?;
+    HANDLES[0].store(c.raw().0, Relaxed);
+    let sender = spawn(0, identity_retry_client, 0, HIGH, Policy::Fifo)?;
+    let first = take_token(&c)?;
+    let identity = first.sender_identity();
+    sys::thread_set_priority(&sender, LOW, Policy::Fifo)
+        .map_err(|_| "lowering interrupted sender failed")?;
+    sys::thread_interrupt(&sender).map_err(|_| "interrupting sender failed")?;
+    let dead = first.sender_identity();
+    let dead_again = first.sender_identity();
+    check(
+        sys::try_receive(&c) == Err(Error::WouldBlock),
+        "the interrupted client unexpectedly sent again before being scheduled",
+    )?;
+    let_run()?;
+    let second = take_token(&c)?;
+    let live = second.sender_identity();
+    let stale = first.sender_identity();
+    let different = first.raw() != second.raw();
+    let replied = second.reply(&[]);
+    let_run()?;
+    close(sender)?;
+    close(c)?;
+    check(
+        identity.is_ok() && live == identity && different,
+        "a new accepted generation changed sender identity or reused the token",
+    )?;
+    check(
+        dead == Err(Error::PeerClosed) && dead_again == dead && stale == Err(Error::BadState),
+        "abandoned or stale generation remained readable",
+    )?;
+    check(
+        replied.is_ok() && ended(0) && mark(0) == Error::Interrupted.code() && mark(1) == 0,
+        "identity inspection changed interrupted or retried request outcomes",
+    )
 }
 
 /// The token of the request queued in `c`, taken without waiting.

@@ -41,7 +41,7 @@ user-space console driver remain future work. What works today:
   channels, sessions, program timers, memory objects, device windows and
   interrupt bindings; the system calls of the kernel (`debug_write`,
   `yield`, `thread_*`, `process_*`, `channel_create`, `notify`, `send`,
-  `receive`, `reply`, `timer_*`, `mem_create`, `mem_map`, `mem_unmap`,
+  `receive`, `reply`, `request_identity`, `timer_*`, `mem_create`, `mem_map`, `mem_unmap`,
   `mem_protect`, `irq_bind`, `irq_ack`, `device_window_create`,
   `object_info`), whose `object_info` reports the state of processes,
   threads, channels, memory objects, device windows and interrupt
@@ -268,6 +268,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust process identity | Add boot-unique numeric IDs and retained parent identity, native ObjectInfo/rt access and Rust getpid/getppid; verify real process trees, ended shells, handle copies, pthreads and signal handlers. | ✅ [#62](https://github.com/stafeto/stafeto/pull/62) |
 | Rust signal information and handler context | Add SA_SIGINFO, retained handler information and real interrupted AArch64 ucontext; verify register/PC/SIMD/mask edits, nesting, reset, C layouts and resource pressure on QEMU and Apple VZ. | ✅ [#63](https://github.com/stafeto/stafeto/pull/63) |
 | Rust timed signal acceptance | Add sigtimedwait with preserved monotonic deadlines, pending-before-validation, EAGAIN and unchanged error output; verify retries, cancellation, concurrent sleep/mutex waits, late-signal races and full resources on QEMU and Apple VZ. | ✅ [#64](https://github.com/stafeto/stafeto/pull/64) |
+| Authenticated IPC sender identity | Read native sender PID/PPID through an accepted reply token, check receiving-process authority and generation, and preserve reply/priority state; verify real children, foreign rejection, lifetime and QEMU/Apple VZ. Credentials and process routing remain work. | ✅ [#65](https://github.com/stafeto/stafeto/pull/65) |
 | Rust queued signals and process routing | Add real-time FIFO source/value queues and process-directed sigqueue; preserve masks, retained outcomes, queue resources and cancellation. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and remaining signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |

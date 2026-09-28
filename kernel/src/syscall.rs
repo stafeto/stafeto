@@ -172,6 +172,8 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::Send) => return send(thread, &args),
         Some(Call::Receive) => return receive(thread, &args),
         Some(Call::Reply) => reply(thread, &args),
+        Some(Call::RequestIdentity) => channel::sender_identity(thread, args[0])
+            .map(|identity| Values::new(&identity.to_words())),
         Some(Call::Notify) => notify(thread, &args),
         Some(Call::MemCreate) => return mem_create(thread, &args),
         Some(Call::MemMap) => return change(thread, &args, mem_map),

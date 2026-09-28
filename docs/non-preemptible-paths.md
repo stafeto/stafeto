@@ -91,6 +91,12 @@ queue bounded cleanup as described above. No queue is scanned and no memory
 is allocated. The next accepted request increments the token count and clears
 the abandoned-request mark, making old tokens stale without number reuse.
 
+RequestIdentity resolves one accepted reply token under the scheduler lock,
+checks that its sender still awaits a reply from the caller's process, and
+copies the sender's immutable PID and parent PID. It allocates nothing, waits
+for nothing, scans no queue, and preserves the token and priority boost. The
+work is O(1); its latency has not been measured.
+
 ThreadUpcallRequest adds one coalesced pending bit and applies that same bounded
 interruption to an enabled IPC waiter. A ready target keeps its scheduling level.
 Before EL0 return, a constant state check selects the registered user entry;
