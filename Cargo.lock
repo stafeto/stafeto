@@ -138,6 +138,7 @@ dependencies = [
  "posix-heap",
  "posix-order",
  "posix-request",
+ "posix-signals",
  "posix-time",
  "posix-types",
  "proto-clock",
@@ -258,6 +259,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-signals"
+version = "0.1.0"
+dependencies = [
+ "posix-types",
+]
+
+[[package]]
 name = "posix-thread-probe"
 version = "0.1.0"
 dependencies = [
@@ -265,6 +273,7 @@ dependencies = [
  "posix-clock",
  "posix-fs",
  "posix-request",
+ "posix-signals",
  "posix-time",
  "proto-clock",
  "proto-wire",

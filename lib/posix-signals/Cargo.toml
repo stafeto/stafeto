@@ -1,0 +1,11 @@
+[package]
+name = "posix-signals"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Signal sets and ordinary signal policy for stafeto Rust POSIX"
+
+[dependencies]
+posix-types = { path = "../posix-types" }

@@ -5,6 +5,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <locale.h>
+#include <signal.h>
 #include <pthread.h>
 #include <limits.h>
 #include <stdint.h>
@@ -16,6 +17,9 @@
 
 _Static_assert(PTHREAD_THREADS_MAX >= _POSIX_THREAD_THREADS_MAX, "minimum thread capacity");
 _Static_assert(sizeof(pthread_t) == 8, "pthread ID ABI");
+_Static_assert(sizeof(sigset_t) == 8, "signal set ABI");
+_Static_assert(sizeof(struct sigaction) == 24, "signal action ABI");
+_Static_assert(offsetof(struct sigaction, sa_flags) == 16, "signal flags offset");
 _Static_assert(sizeof(pthread_attr_t) == 32, "pthread attributes ABI");
 _Static_assert(_Alignof(pthread_attr_t) == 8, "pthread attribute alignment");
 _Static_assert(sizeof(void *) == 8, "pointer ABI");
@@ -33,6 +37,47 @@ _Static_assert(sizeof(struct timespec) == 16, "timespec ABI");
 _Static_assert(sizeof(struct dirent) == STAFETO_DIRENT_SIZE, "dirent ABI");
 _Static_assert(offsetof(struct dirent, d_name) == 9, "dirent name offset");
 _Static_assert(_Alignof(max_align_t) == 16, "malloc fundamental alignment");
+
+static volatile sig_atomic_t signal_calls;
+static volatile sig_atomic_t signal_bad;
+static void signal_handler(int sig) {
+    sigset_t mask;
+    if (sig != SIGUSR1 || pthread_sigmask(-99, NULL, &mask)
+            || !sigismember(&mask, SIGUSR1)) signal_bad = 1;
+    signal_calls++;
+    errno = 901;
+}
+static int signals(void) {
+    sigset_t set, old, pending;
+    struct sigaction action = { .sa_handler = signal_handler, .sa_mask = 0, .sa_flags = 0 }, previous;
+    errno = 777;
+    if (sigemptyset(&set) || sigaddset(&set, SIGUSR1) || !sigismember(&set, SIGUSR1)
+            || sigismember(&set, SIGUSR2) || sigaction(SIGUSR1, &action, &previous)
+            || previous.sa_handler != SIG_DFL || errno != 777) return 150;
+    if (pthread_sigmask(SIG_BLOCK, &set, &old) || old || raise(SIGUSR1) || raise(SIGUSR1)
+            || signal_calls || sigpending(&pending) || pending != set || errno != 777) return 151;
+    if (pthread_sigmask(SIG_UNBLOCK, &set, NULL) || signal_calls != 1 || signal_bad || errno != 777) return 152;
+    old = 999;
+    if (pthread_sigmask(-99, &set, &old) != EINVAL || old != 999 || errno != 777) return 153;
+    if (sigprocmask(-99, &set, &old) != -1 || errno != EINVAL || old != 999) return 154;
+    if (sigaction(SIGKILL, &action, NULL) != -1 || errno != EINVAL) return 155;
+    if (signal(SIGUSR1, SIG_IGN) != signal_handler || raise(SIGUSR1) || signal_calls != 1) return 156;
+    if (signal(SIGUSR1, SIG_DFL) != SIG_IGN || pthread_kill(pthread_self(), 0)) return 157;
+    if (sigfillset(&set) || !sigismember(&set, SIGKILL) || !sigismember(&set, SIGSTOP)) return 158;
+    if (pthread_sigmask(SIG_SETMASK, &set, NULL) || pthread_sigmask(-1, NULL, &old)
+            || sigismember(&old, SIGKILL) || sigismember(&old, SIGSTOP)) return 159;
+    if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)) return 160;
+    if (sigaddset(&set, 0) != -1 || errno != EINVAL || set) return 161;
+    action.sa_flags = 4;
+    previous.sa_handler = signal_handler;
+    previous.sa_mask = 123;
+    previous.sa_flags = 456;
+    if (sigaction(SIGUSR1, &action, &previous) != -1 || errno != EINVAL
+            || previous.sa_handler != signal_handler || previous.sa_mask != 123
+            || previous.sa_flags != 456) return 162;
+    if (sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != SIG_DFL) return 163;
+    return 0;
+}
 
 static int same(const char *a, const char *b, size_t count) {
     for (size_t i = 0; i < count; i++) if (a[i] != b[i]) return 0;
@@ -939,6 +984,8 @@ int main(int argc, char **argv) {
     if (allocation_result) return allocation_result;
     int collation_result = collation();
     if (collation_result) return collation_result;
+    int signal_result = signals();
+    if (signal_result) return signal_result;
     int scan_result = scans();
     if (scan_result) return scan_result;
     const char result[] = "posix-abi-probe: ok\n";

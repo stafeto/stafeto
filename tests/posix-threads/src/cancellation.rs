@@ -164,7 +164,7 @@ pub fn run() -> bool {
     let race_ready = sys::channel_create(30).expect("race ready channel");
     let race_gate = sys::channel_create(1).expect("race gate");
     RACE_GATE.store(race_gate.raw().0, Ordering::Release);
-    threads::probe_owner_priority(30);
+    let old_priority = threads::probe_owner_priority(30);
     if unsafe {
         threads::pthread_create(
             &mut child,
@@ -192,7 +192,7 @@ pub fn run() -> bool {
     {
         return failed(23);
     }
-    threads::probe_owner_priority(1);
+    threads::probe_owner_priority(old_priority);
     rt::println!("posix-cancel-probe: pre-wait race woke through timer retry");
     true
 }

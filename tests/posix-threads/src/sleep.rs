@@ -150,7 +150,7 @@ fn child(args: &Args) -> u64 {
 }
 fn blocked(id: u64) -> bool {
     let native = unsafe { threads::probe_native(id) }.unwrap();
-    waiting(&native) && sleep::probe_waiting(id) == Ok(true)
+    waiting_registered(&native, || sleep::probe_waiting(id) == Ok(true))
 }
 fn finished(channel: &Handle<Channel>, waiter: &Waiter, expected: usize) -> bool {
     let limit = now() + 500_000_000;

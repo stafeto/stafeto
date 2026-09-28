@@ -25,3 +25,4 @@ proto-wire = { path = "../../proto/wire" }
 posix-clock = { path = "../posix-clock" }
 posix-time = { path = "../posix-time" }
 proto-clock = { path = "../../proto/clock" }
+posix-signals = { path = "../posix-signals" }

@@ -16,6 +16,7 @@ pub mod metadata;
 pub mod ordering;
 pub mod scan;
 pub mod shared;
+pub mod signals;
 pub mod threads;
 pub mod tls;
 
