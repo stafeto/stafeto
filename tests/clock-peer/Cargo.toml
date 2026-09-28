@@ -1,0 +1,19 @@
+[package]
+name = "posix-clock-peer"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "posix-clock-peer"
+test = false
+bench = false
+
+[dependencies]
+proto-clock = { path = "../../proto/clock" }
+proto-wire = { path = "../../proto/wire" }
+posix-clock = { path = "../../lib/posix-clock" }
+proto-init = { path = "../../proto/init" }
+rt = { path = "../../lib/rt" }

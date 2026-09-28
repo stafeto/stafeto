@@ -12,7 +12,7 @@ test = false
 bench = false
 
 [features]
-transport-probe = []
+transport-probe = ["posix-clock/transport-probe"]
 
 [dependencies]
 posix-types = { path = "../posix-types" }
@@ -22,3 +22,6 @@ posix-heap = { path = "../posix-heap" }
 posix-order = { path = "../posix-order" }
 posix-request = { path = "../posix-request" }
 proto-wire = { path = "../../proto/wire" }
+posix-clock = { path = "../posix-clock" }
+posix-time = { path = "../posix-time" }
+proto-clock = { path = "../../proto/clock" }

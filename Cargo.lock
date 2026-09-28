@@ -133,11 +133,14 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "posix-abi"
 version = "0.1.0"
 dependencies = [
+ "posix-clock",
  "posix-fs",
  "posix-heap",
  "posix-order",
  "posix-request",
+ "posix-time",
  "posix-types",
+ "proto-clock",
  "proto-wire",
  "rt",
 ]
@@ -154,6 +157,38 @@ name = "posix-bridge"
 version = "0.1.0"
 dependencies = [
  "proto-fs",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "posix-clock"
+version = "0.1.0"
+dependencies = [
+ "posix-time",
+ "proto-clock",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "posix-clock-peer"
+version = "0.1.0"
+dependencies = [
+ "posix-clock",
+ "proto-clock",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "posix-clock-service"
+version = "0.1.0"
+dependencies = [
+ "posix-time",
+ "proto-clock",
+ "proto-init",
  "proto-wire",
  "rt",
 ]
@@ -226,8 +261,19 @@ name = "posix-thread-probe"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-clock",
  "posix-fs",
+ "posix-time",
+ "proto-clock",
+ "proto-wire",
  "rt",
+]
+
+[[package]]
+name = "posix-time"
+version = "0.1.0"
+dependencies = [
+ "proto-clock",
 ]
 
 [[package]]
@@ -252,6 +298,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "proto-clock"
+version = "0.1.0"
+dependencies = [
+ "proto-wire",
 ]
 
 [[package]]

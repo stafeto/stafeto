@@ -1,0 +1,20 @@
+[package]
+name = "posix-clock"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+test = false
+bench = false
+
+[features]
+transport-probe = []
+
+[dependencies]
+proto-clock = { path = "../../proto/clock" }
+proto-wire = { path = "../../proto/wire" }
+posix-time = { path = "../posix-time" }
+rt = { path = "../rt" }

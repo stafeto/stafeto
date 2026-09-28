@@ -25,6 +25,8 @@ use rt::{
 mod cancellation;
 #[cfg(not(feature = "cancel-input"))]
 mod capacity;
+#[cfg(not(feature = "cancel-input"))]
+mod clocks;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
@@ -109,7 +111,7 @@ fn failed(stage: usize) -> bool {
 }
 
 #[cfg(not(feature = "cancel-input"))]
-fn run() -> bool {
+fn run(clocks: &clocks::Peers) -> bool {
     let mut child = 0;
     let mut value = ptr::null_mut();
     let errno = unsafe { abi::__errno_location() };
@@ -244,7 +246,12 @@ fn run() -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !capacity::run() || !specific::run() || !once::run() || !mutex::run() || !cancellation::run()
+    if !clocks::run(clocks)
+        || !capacity::run()
+        || !specific::run()
+        || !once::run()
+        || !mutex::run()
+        || !cancellation::run()
     {
         return false;
     }
@@ -278,6 +285,10 @@ fn main(_: u64) -> u64 {
     let Ok(files) = connection else {
         return 2;
     };
+    #[cfg(not(feature = "cancel-input"))]
+    let Ok(clocks) = (unsafe { clocks::Peers::connect(&start.parent) }) else {
+        return 5;
+    };
     PROCESS.store(start.process.raw().0, Ordering::Release);
     if unsafe { abi::shared::init(&start.process, files) }.is_err()
         || unsafe { abi::allocation::init(start.process) }.is_err()
@@ -292,7 +303,7 @@ fn main(_: u64) -> u64 {
         }
         #[cfg(not(feature = "cancel-input"))]
         {
-            run()
+            run(&clocks)
         }
     });
     if !passed {

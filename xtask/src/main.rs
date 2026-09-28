@@ -56,14 +56,23 @@ const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
-const POSIX_ABI_PROGRAMS: [ImageProgram; 3] = [
+const POSIX_ABI_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
 ];
-const POSIX_THREAD_PROGRAMS: [ImageProgram; 3] = [
+const POSIX_THREAD_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-clock-service",
+        "posix-clock-service",
+        64 * 1024,
+        &["transport-probe"],
+    ),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-thread-probe",
@@ -82,9 +91,11 @@ const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
         &["cancel-input"],
     ),
 ];
-const POSIX_NATIVE_CANCEL_INPUT_PROGRAMS: [ImageProgram; 3] = [
+const POSIX_NATIVE_CANCEL_INPUT_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-thread-probe",
@@ -92,9 +103,11 @@ const POSIX_NATIVE_CANCEL_INPUT_PROGRAMS: [ImageProgram; 3] = [
         &["native-cancel-input"],
     ),
 ];
-const POSIX_SHARED_PROGRAMS: [ImageProgram; 3] = [
+const POSIX_SHARED_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-shared-probe",
@@ -114,9 +127,11 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
         &["input-probe"],
     ),
 ];
-const POSIX_NATIVE_INPUT_PROGRAMS: [ImageProgram; 3] = [
+const POSIX_NATIVE_INPUT_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-shared-probe",
@@ -135,9 +150,11 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
         &["interrupt-probe"],
     ),
 ];
-const POSIX_NATIVE_INTERRUPT_PROGRAMS: [ImageProgram; 3] = [
+const POSIX_NATIVE_INTERRUPT_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-shared-probe",
@@ -1075,6 +1092,16 @@ fn posix_abi_probe() -> Result<(), String> {
                 image_elf(&target, "boot-posix-abi.img", "ramfs"),
                 SVC_STACK_SIZE,
             ),
+            (
+                "posix-clock-service",
+                image_elf(&target, "boot-posix-abi.img", "posix-clock-service"),
+                64 * 1024,
+            ),
+            (
+                "posix-clock-peer",
+                image_elf(&target, "boot-posix-abi.img", "posix-clock-peer"),
+                32 * 1024,
+            ),
             ("posix-abi-probe", PathBuf::from(linked), CHILD_STACK_SIZE),
         ],
     )?;
@@ -1545,6 +1572,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "posix-request",
         "--package",
+        "posix-time",
+        "--package",
         "init",
         "--package",
         "kcore",
@@ -1556,6 +1585,8 @@ fn host_tests() -> Result<(), String> {
         "proto-uart",
         "--package",
         "proto-wire",
+        "--package",
+        "proto-clock",
         "--package",
         "shell",
         "--package",
@@ -2852,6 +2883,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "posix-request",
         "--package",
+        "posix-time",
+        "--package",
         "kcore",
         "--package",
         "proto-init",
@@ -2861,6 +2894,8 @@ fn ci() -> Result<(), String> {
         "proto-uart",
         "--package",
         "proto-wire",
+        "--package",
+        "proto-clock",
         "--package",
         "xtask",
         "--all-targets",
@@ -2911,6 +2946,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-wire",
         "--package",
+        "proto-clock",
+        "--package",
         "rt",
         "--package",
         "posix-fs",
@@ -2920,6 +2957,12 @@ fn ci() -> Result<(), String> {
         "posix-crt",
         "--package",
         "posix-abi-probe",
+        "--package",
+        "posix-clock",
+        "--package",
+        "posix-clock-service",
+        "--package",
+        "posix-clock-peer",
         "--package",
         "posix-tls-probe",
         "--package",

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 _Static_assert(PTHREAD_THREADS_MAX >= _POSIX_THREAD_THREADS_MAX, "minimum thread capacity");
 _Static_assert(sizeof(pthread_t) == 8, "pthread ID ABI");
@@ -762,6 +763,54 @@ static int mutexes(void) {
     return errno == 123 ? 0 : 261;
 }
 
+static void *clock_reader(void *expected) {
+    struct timespec value;
+    errno = 777;
+    if (clock_gettime(CLOCK_REALTIME, &value) || errno != 777
+            || value.tv_sec < *(time_t *)expected || value.tv_sec > *(time_t *)expected + 1)
+        return (void *)1;
+    return NULL;
+}
+static int clocks(void) {
+    struct timespec saved, before, after, value = {987, 654}, resolution;
+    errno = 123;
+    if (clock_getres(CLOCK_REALTIME, NULL) || clock_getres(CLOCK_MONOTONIC, &resolution)
+            || errno != 123 || resolution.tv_sec || resolution.tv_nsec < 1
+            || resolution.tv_nsec > 20000000 || sizeof(clockid_t) != 4) return 270;
+    if (clock_gettime(CLOCK_REALTIME, &saved) || clock_gettime(CLOCK_MONOTONIC, &before)
+            || errno != 123 || saved.tv_nsec < 0 || saved.tv_nsec >= 1000000000) return 271;
+    if (clock_gettime(99, &value) != -1 || errno != EINVAL || value.tv_sec != 987
+            || value.tv_nsec != 654 || clock_getres(99, NULL) != -1 || errno != EINVAL) return 272;
+    if (clock_gettime(CLOCK_REALTIME, NULL) != -1 || errno != EFAULT
+            || clock_settime(CLOCK_REALTIME, NULL) != -1 || errno != EFAULT) return 273;
+    if (clock_settime(CLOCK_MONOTONIC, &value) != -1 || errno != EINVAL) return 274;
+    const struct timespec invalid[] = {{-1, 0}, {0, -1}, {0, 1000000000}};
+    for (unsigned int i = 0; i < 3; i++)
+        if (clock_settime(CLOCK_REALTIME, &invalid[i]) != -1 || errno != EINVAL) return 275;
+    value.tv_sec = 20000000000LL; value.tv_nsec = 12345;
+    errno = 123;
+    if (clock_settime(CLOCK_REALTIME, &value) || errno != 123
+            || clock_gettime(CLOCK_REALTIME, &after) || errno != 123
+            || after.tv_sec < value.tv_sec - 1 || after.tv_sec > value.tv_sec + 1) return 276;
+    pthread_t child;
+    time_t expected = value.tv_sec - 1;
+    void *result = (void *)99;
+    if (pthread_create(&child, NULL, clock_reader, &expected)
+            || pthread_join(child, &result) || result) return 277;
+    value.tv_sec = 2; value.tv_nsec = 0;
+    if (clock_settime(CLOCK_REALTIME, &value) || clock_gettime(CLOCK_REALTIME, &after)
+            || after.tv_sec < 1 || after.tv_sec > 3
+            || clock_gettime(CLOCK_MONOTONIC, &after) || after.tv_sec < before.tv_sec
+            || (after.tv_sec == before.tv_sec && after.tv_nsec < before.tv_nsec)) return 278;
+    value.tv_sec = INT64_MAX; value.tv_nsec = 999999999;
+    if (clock_settime(CLOCK_REALTIME, &value)) return 279;
+    after.tv_sec = 987; after.tv_nsec = 654;
+    if (clock_gettime(CLOCK_REALTIME, &after) != -1 || errno != EOVERFLOW
+            || after.tv_sec != 987 || after.tv_nsec != 654) return 280;
+    if (clock_settime(CLOCK_REALTIME, &saved)) return 281;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -822,6 +871,8 @@ int main(int argc, char **argv) {
     if (once_result) return once_result;
     int mutex_result = mutexes();
     if (mutex_result) return mutex_result;
+    int clock_result = clocks();
+    if (clock_result) return clock_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
     int collation_result = collation();

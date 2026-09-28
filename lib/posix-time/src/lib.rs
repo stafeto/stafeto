@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Shared realtime anchor, wide calendar arithmetic and retry-safe settings.
+#![no_std]
+pub const SECOND: i128 = 1_000_000_000;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Error {
+    Invalid,
+    Overflow,
+    Full,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Time {
+    pub seconds: i64,
+    pub nanos: i64,
+}
+impl Time {
+    pub const ZERO: Self = Self {
+        seconds: 0,
+        nanos: 0,
+    };
+    pub fn value(self) -> Result<i128, Error> {
+        if self.seconds < 0 || !(0..1_000_000_000).contains(&self.nanos) {
+            return Err(Error::Invalid);
+        }
+        Ok(i128::from(self.seconds) * SECOND + i128::from(self.nanos))
+    }
+    pub fn from_value(value: i128) -> Result<Self, Error> {
+        if value < 0 {
+            return Err(Error::Invalid);
+        }
+        Ok(Self {
+            seconds: (value / SECOND).try_into().map_err(|_| Error::Overflow)?,
+            nanos: (value % SECOND) as i64,
+        })
+    }
+    pub fn from_mono(value: u64) -> Self {
+        Self {
+            seconds: (value / 1_000_000_000) as i64,
+            nanos: (value % 1_000_000_000) as i64,
+        }
+    }
+}
+pub fn resolution(hz: u64) -> Result<u64, Error> {
+    if hz == 0 {
+        return Err(Error::Invalid);
+    }
+    Ok(1_000_000_000u64.div_ceil(hz))
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Snapshot {
+    pub time: Time,
+    pub resolution: u64,
+    pub generation: u64,
+}
+pub struct Clock {
+    value: i128,
+    mono: u64,
+    resolution: u64,
+    generation: u64,
+}
+impl Clock {
+    pub fn new(mono: u64, hz: u64) -> Result<Self, Error> {
+        Ok(Self {
+            value: 0,
+            mono,
+            resolution: resolution(hz)?,
+            generation: 0,
+        })
+    }
+    pub fn get(&self, id: u32, now: u64) -> Result<Snapshot, Error> {
+        let time = match id {
+            proto_clock::MONOTONIC => Time::from_mono(now),
+            proto_clock::REALTIME => {
+                let elapsed = now.checked_sub(self.mono).ok_or(Error::Invalid)?;
+                Time::from_value(self.value + i128::from(elapsed))?
+            }
+            _ => return Err(Error::Invalid),
+        };
+        Ok(Snapshot {
+            time,
+            resolution: self.resolution,
+            generation: self.generation,
+        })
+    }
+    pub fn set(&mut self, time: Time, now: u64) -> Result<(), Error> {
+        let value = time.value()?;
+        let generation = self.generation.checked_add(1).ok_or(Error::Overflow)?;
+        self.value = value / i128::from(self.resolution) * i128::from(self.resolution);
+        self.mono = now;
+        self.generation = generation;
+        Ok(())
+    }
+}
+#[derive(Clone, Copy)]
+struct Setting {
+    nonce: u64,
+    time: Time,
+}
+pub struct Settings {
+    pending: [Option<Setting>; proto_clock::PENDING_MAX],
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            pending: [None; proto_clock::PENDING_MAX],
+        }
+    }
+}
+impl Settings {
+    pub fn set(
+        &mut self,
+        nonce: u64,
+        time: Time,
+        now: u64,
+        clock: &mut Clock,
+    ) -> Result<(), Error> {
+        if nonce == 0 {
+            return Err(Error::Invalid);
+        }
+        time.value()?;
+        if let Some(previous) = self.pending.iter().flatten().find(|s| s.nonce == nonce) {
+            return if previous.time == time {
+                Ok(())
+            } else {
+                Err(Error::Invalid)
+            };
+        }
+        let free = self
+            .pending
+            .iter_mut()
+            .find(|s| s.is_none())
+            .ok_or(Error::Full)?;
+        clock.set(time, now)?;
+        *free = Some(Setting { nonce, time });
+        Ok(())
+    }
+    pub fn ack(&mut self, nonce: u64) -> Result<(), Error> {
+        if nonce == 0 {
+            return Err(Error::Invalid);
+        }
+        if let Some(slot) = self
+            .pending
+            .iter_mut()
+            .find(|s| s.is_some_and(|v| v.nonce == nonce))
+        {
+            *slot = None;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto_clock::{MONOTONIC, REALTIME};
+    fn time(seconds: i64, nanos: i64) -> Time {
+        Time { seconds, nanos }
+    }
+    #[test]
+    fn calendar_moves_forward_and_backward_without_changing_monotonic() {
+        let mut c = Clock::new(1_000, 62_500_000).unwrap();
+        assert_eq!(c.get(REALTIME, 1_123).unwrap().time, time(0, 123));
+        c.set(time(1_700_000_000, 17), 2_000).unwrap();
+        assert_eq!(
+            c.get(REALTIME, 2_032).unwrap().time,
+            time(1_700_000_000, 48)
+        );
+        assert_eq!(c.get(MONOTONIC, 2_032).unwrap().time, time(0, 2_032));
+        c.set(time(2, 1), 3_000).unwrap();
+        assert_eq!(c.get(REALTIME, 3_000).unwrap().time, time(2, 0));
+        assert_eq!(c.get(MONOTONIC, 3_000).unwrap().time, time(0, 3_000));
+        assert_eq!(c.get(REALTIME, 3_000).unwrap().generation, 2);
+    }
+    #[test]
+    fn rounding_applies_to_the_whole_calendar_value() {
+        let mut c = Clock::new(0, 24_000_000).unwrap();
+        assert_eq!(resolution(24_000_000), Ok(42));
+        let input = time(1, 43);
+        c.set(input, 100).unwrap();
+        assert_eq!(
+            c.get(REALTIME, 100).unwrap().time.value().unwrap(),
+            input.value().unwrap() / 42 * 42
+        );
+        assert_eq!(resolution(62_500_000), Ok(16));
+        assert_eq!(resolution(2_000_000_000), Ok(1));
+        assert_eq!(resolution(0), Err(Error::Invalid));
+    }
+    #[test]
+    fn calendar_uses_more_than_u64_nanoseconds_and_detects_time_t_overflow() {
+        let mut c = Clock::new(0, 1_000_000_000).unwrap();
+        c.set(time(20_000_000_000, 999_999_999), 4).unwrap();
+        assert_eq!(c.get(REALTIME, 5).unwrap().time, time(20_000_000_001, 0));
+        c.set(time(i64::MAX, 999_999_999), 10).unwrap();
+        assert_eq!(c.get(REALTIME, 11), Err(Error::Overflow));
+        assert_eq!(c.get(MONOTONIC, 11).unwrap().time, time(0, 11));
+    }
+    #[test]
+    fn invalid_settings_and_generation_overflow_leave_the_anchor_unchanged() {
+        let mut c = Clock::new(100, 1_000_000_000).unwrap();
+        for invalid in [time(-1, 0), time(0, -1), time(0, 1_000_000_000)] {
+            assert_eq!(c.set(invalid, 200), Err(Error::Invalid));
+            assert_eq!(c.get(REALTIME, 201).unwrap().time, time(0, 101));
+            assert_eq!(c.generation, 0);
+        }
+        assert_eq!(c.get(2, 201), Err(Error::Invalid));
+        assert_eq!(c.get(REALTIME, 99), Err(Error::Invalid));
+        c.generation = u64::MAX;
+        assert_eq!(c.set(time(10, 0), 200), Err(Error::Overflow));
+        assert_eq!(c.get(REALTIME, 201).unwrap().time, time(0, 101));
+    }
+    #[test]
+    fn retry_never_reanchors_or_reapplies_a_committed_setting() {
+        let mut c = Clock::new(0, 1_000_000_000).unwrap();
+        let mut a = Settings::default();
+        let mut b = Settings::default();
+        a.set(1, time(10, 0), 100, &mut c).unwrap();
+        a.set(1, time(10, 0), 500, &mut c).unwrap();
+        assert_eq!(c.get(REALTIME, 600).unwrap().time, time(10, 500));
+        assert_eq!(c.generation, 1);
+        assert_eq!(a.set(1, time(11, 0), 600, &mut c), Err(Error::Invalid));
+        // A second session can step time between the first commit and retry.
+        b.set(1, time(20, 0), 600, &mut c).unwrap();
+        a.set(1, time(10, 0), 700, &mut c).unwrap();
+        assert_eq!(c.get(REALTIME, 700).unwrap().time, time(20, 100));
+        assert_eq!(c.generation, 2);
+        a.ack(1).unwrap();
+        a.ack(1).unwrap();
+        assert_eq!(a.ack(0), Err(Error::Invalid));
+    }
+    #[test]
+    fn full_retention_rejects_without_mutation_and_ack_reclaims_capacity() {
+        let mut c = Clock::new(0, 1_000_000_000).unwrap();
+        let mut s = Settings::default();
+        assert_eq!(s.set(0, Time::ZERO, 0, &mut c), Err(Error::Invalid));
+        for n in 1..=proto_clock::PENDING_MAX as u64 {
+            s.set(n, time(n as i64, 0), n, &mut c).unwrap();
+        }
+        let snapshot = c.get(REALTIME, 100).unwrap();
+        assert_eq!(s.set(65, time(99, 0), 100, &mut c), Err(Error::Full));
+        assert_eq!(c.get(REALTIME, 100).unwrap(), snapshot);
+        s.set(1, time(1, 0), 100, &mut c).unwrap();
+        assert_eq!(c.get(REALTIME, 100).unwrap(), snapshot);
+        s.ack(32).unwrap();
+        s.set(65, time(99, 0), 100, &mut c).unwrap();
+        assert_eq!(c.get(REALTIME, 100).unwrap().time, time(99, 0));
+        assert_eq!(c.generation, 65);
+        // A disconnected session drops all its retained state.
+        s = Settings::default();
+        s.set(65, time(101, 0), 101, &mut c).unwrap();
+        assert_eq!(c.generation, 66);
+    }
+}
