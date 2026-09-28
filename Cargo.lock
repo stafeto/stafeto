@@ -135,6 +135,7 @@ version = "0.1.0"
 dependencies = [
  "posix-fs",
  "posix-heap",
+ "posix-order",
  "posix-types",
  "rt",
 ]
@@ -186,6 +187,10 @@ version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
 ]
+
+[[package]]
+name = "posix-order"
+version = "0.1.0"
 
 [[package]]
 name = "posix-path"

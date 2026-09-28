@@ -39,5 +39,12 @@ pub const SEEK_HOLE: i32 = 4;
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;
 pub const STDERR_FILENO: i32 = 2;
+pub const LC_ALL: i32 = 0;
+pub const LC_COLLATE: i32 = 1;
+pub const LC_CTYPE: i32 = 2;
+pub const LC_MESSAGES: i32 = 3;
+pub const LC_MONETARY: i32 = 4;
+pub const LC_NUMERIC: i32 = 5;
+pub const LC_TIME: i32 = 6;
 
 pub use posix_types::constants::*;

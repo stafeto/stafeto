@@ -4,8 +4,10 @@
 #include <errno.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -175,6 +177,155 @@ static int allocations(void) {
     return 0;
 }
 
+static int integer_compare(const void *a, const void *b) {
+    int left = *(const int *)a, right = *(const int *)b;
+    return (left > right) - (left < right);
+}
+
+static int context_compare(const void *a, const void *b, void *context) {
+    int nested[] = {9, 1, 3};
+    qsort(nested, 3, sizeof(int), integer_compare);
+    if (nested[0] != 1 || nested[2] != 9) *(int *)context = 0;
+    return integer_compare(a, b) * *(int *)context;
+}
+
+static int byte_record_compare(const void *a, const void *b) {
+    return (int)*(const unsigned char *)a - (int)*(const unsigned char *)b;
+}
+
+static int collation(void) {
+    errno = 321;
+    if (!setlocale(LC_ALL, NULL) || strcmp(setlocale(LC_ALL, NULL), "C")
+            || !setlocale(LC_ALL, "POSIX") || !setlocale(LC_COLLATE, "C")
+            || setlocale(LC_ALL, "unsupported") || setlocale(999, "C")
+            || errno != 321 || !setlocale(LC_ALL, "")) return 120;
+    char **saved = environ;
+    char *environment[] = {"LANG=unsupported", "LC_COLLATE=POSIX", "LC_ALL=", NULL};
+    environ = environment;
+    int accepted = setlocale(LC_COLLATE, "") != NULL;
+    int rejected = setlocale(LC_ALL, "") == NULL;
+    environment[2] = "LC_ALL=C";
+    int override = setlocale(LC_ALL, "") != NULL;
+    environment[2] = "LC_ALL=unsupported";
+    int invalid = setlocale(LC_COLLATE, "") == NULL;
+    environ = saved;
+    if (!accepted || !rejected || !override || !invalid || errno != 321
+            || strcmp(setlocale(LC_ALL, NULL), "C")) return 121;
+    const char high[] = {(char)0x80, 0}, low[] = {(char)0x7f, 0};
+    if (strcmp(high, low) <= 0 || strcoll(high, low) <= 0
+            || strcoll("A", "a") >= 0 || strcoll("abc", "abcd") >= 0
+            || strcoll("same", "same") != 0 || errno != 321) return 122;
+    char out[8] = {7, 7, 7, 7, 7, 7, 7, 7};
+    if (strxfrm(NULL, "abc", 0) != 3 || strxfrm(out, "abc", 4) != 3
+            || strcmp(out, "abc") || out[4] != 7 || errno != 321) return 123;
+    out[0] = out[1] = out[2] = out[3] = 7;
+    if (strxfrm(out, "abc", 2) != 3 || out[2] != 7 || out[3] != 7) return 124;
+    int values[] = {5, 1, 8, 5, -1, 2};
+    qsort(values, 6, sizeof(int), integer_compare);
+    for (int i = 1; i < 6; i++) if (values[i - 1] > values[i]) return 125;
+    int direction = -1;
+    qsort_r(values, 6, sizeof(int), context_compare, &direction);
+    if (direction != -1) return 126;
+    for (int i = 1; i < 6; i++) if (values[i - 1] < values[i]) return 127;
+    qsort(NULL, 0, sizeof(int), integer_compare);
+    qsort(values, 1, sizeof(int), integer_compare);
+    if (errno != 321) return 128;
+    unsigned char records[] = {99, 3, 30, 31, 1, 10, 11, 2, 20, 21, 88};
+    qsort(records + 1, 3, 3, byte_record_compare);
+    const unsigned char expected[] = {99, 1, 10, 11, 2, 20, 21, 3, 30, 31, 88};
+    for (size_t i = 0; i < sizeof records; i++) if (records[i] != expected[i]) return 129;
+    return 0;
+}
+
+static int select_visible(const struct dirent *entry) {
+    DIR *nested = opendir("/tmp");
+    int ok = nested && readdir(nested) && closedir(nested) == 0;
+    errno = EIO;
+    return ok && entry->d_name[0] != '.';
+}
+
+static int select_none(const struct dirent *entry) {
+    (void)entry;
+    errno = ENOENT;
+    return 0;
+}
+
+static int reverse_names(const struct dirent **a, const struct dirent **b) {
+    errno = EIO;
+    return -alphasort(a, b);
+}
+
+static void release_names(struct dirent **names, int count) {
+    for (int i = 0; i < count; i++) free(names[i]);
+    free(names);
+}
+
+static void *pressure[4096];
+static int pressure_count, pressure_failed, select_count;
+
+static int select_pressure(const struct dirent *entry) {
+    (void)entry;
+    if (++select_count == 2) {
+        const size_t sizes[] = {1024, 144, 64, 1};
+        for (int i = 0; i < 4; i++) {
+            void *block;
+            while ((block = malloc(sizes[i])) != NULL) {
+                if (pressure_count == 4096) { free(block); pressure_failed = 1; return 1; }
+                pressure[pressure_count++] = block;
+            }
+        }
+    }
+    return 1;
+}
+
+static int scans(void) {
+    struct dirent **names = NULL;
+    errno = 321;
+    int count = scandir("/", &names, NULL, alphasort);
+    if (count != 4 || !names || errno != 321
+            || strcmp(names[0]->d_name, ".") || strcmp(names[1]->d_name, "..")
+            || strcmp(names[2]->d_name, "etc") || strcmp(names[3]->d_name, "tmp")
+            || names[2]->d_ino != 2 || names[2]->d_type != DT_DIR
+            || names[0] == names[1]) return 130;
+    DIR *dir = opendir("/tmp");
+    if (!dir || !readdir(dir) || closedir(dir) || strcmp(names[2]->d_name, "etc")) return 131;
+    release_names(names, count);
+    errno = 321;
+    count = scandir("/", &names, select_visible, reverse_names);
+    if (count != 2 || errno != 321 || strcmp(names[0]->d_name, "tmp")
+            || strcmp(names[1]->d_name, "etc")) return 132;
+    release_names(names, count);
+    count = scandir("/etc", &names, select_none, NULL);
+    if (count != 0 || !names || errno != 321) return 133;
+    free(names);
+    count = scandir("/etc", &names, NULL, NULL);
+    if (count != 3 || strcmp(names[2]->d_name, "motd")) return 134;
+    release_names(names, count);
+    names = (void *)17;
+    if (scandir("/absent", &names, NULL, NULL) != -1 || errno != ENOENT || names != (void *)17
+            || scandir("/etc/motd", &names, NULL, NULL) != -1 || errno != ENOTDIR
+            || names != (void *)17 || scandir("/", NULL, NULL, NULL) != -1 || errno != EFAULT) return 135;
+    for (int i = 0; i < 80; i++) {
+        count = scandir("/", &names, NULL, alphasort);
+        if (count != 4) return 136;
+        release_names(names, count);
+    }
+    names = (void *)17;
+    count = scandir("/", &names, select_pressure, alphasort);
+    int allocation_error = errno;
+    void *reused = malloc(144);
+    for (int i = 0; i < pressure_count; i++) free(pressure[i]);
+    if (count != -1 || allocation_error != ENOMEM || names != (void *)17
+            || pressure_failed || !reused || select_count != 2) return 137;
+    free(reused);
+    for (int i = 0; i < 40; i++) {
+        count = scandir("/", &names, NULL, alphasort);
+        if (count != 4) return 138;
+        release_names(names, count);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
@@ -227,6 +378,10 @@ int main(int argc, char **argv) {
     if (directory_result) return directory_result;
     int allocation_result = allocations();
     if (allocation_result) return allocation_result;
+    int collation_result = collation();
+    if (collation_result) return collation_result;
+    int scan_result = scans();
+    if (scan_result) return scan_result;
     const char result[] = "posix-abi-probe: ok\n";
     if (write(1, result, sizeof(result) - 1) != (ssize_t)(sizeof(result) - 1)) return 32;
     return 0;

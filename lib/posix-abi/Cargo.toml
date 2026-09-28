@@ -16,3 +16,4 @@ posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }
 rt = { path = "../rt" }
 posix-heap = { path = "../posix-heap" }
+posix-order = { path = "../posix-order" }

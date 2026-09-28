@@ -69,7 +69,9 @@ the existing BusyBox path; cargo xtask ci includes the full verification.
 
 ## Remaining interfaces
 
-scandir, alphasort and locale-aware ordering need allocation and collation.
+scandir and C/POSIX alphasort are now provided by
+[the selection milestone](m2-rust-posix-scan.md). Additional locale data,
+locale objects and the remaining locale interfaces are still pending.
 Mutable namespaces, symlinks, byte-path lookup and full credential checks
 remain pending. The current protocol fits names in one IPC message; larger
 filesystem entries will require a bounded continuation or shared buffer.
