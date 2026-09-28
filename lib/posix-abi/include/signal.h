@@ -27,4 +27,5 @@ int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict old);
 int sigpending(sigset_t *set);
 int pthread_kill(pthread_t thread, int sig);
 int raise(int sig);
+int sigwait(const sigset_t *restrict set, int *restrict sig);
 #endif

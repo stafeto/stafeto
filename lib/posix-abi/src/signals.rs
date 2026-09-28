@@ -14,6 +14,8 @@ pub(crate) const SEND: u64 = 42;
 pub(crate) const PENDING: u64 = 43;
 pub(crate) const TAKE: u64 = 44;
 pub(crate) const READY: u64 = 45;
+pub(crate) const WAIT: u64 = 46;
+pub(crate) const WAIT_QUERY: u64 = 47;
 
 // Only the bounded owner's bookkeeping transaction is masked. The owner never
 // binds an entry or calls user code, so there is no interrupted-owner lock cycle.
@@ -191,6 +193,31 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
 pub extern "C" fn raise(signal: i32) -> i32 {
     let status = pthread_kill(threads::pthread_self(), signal);
     if status == 0 { 0 } else { fail(status) }
+}
+
+/// # Safety
+/// The caller is managed. set is readable and sig is writable; their storage
+/// does not overlap. All selected signals are blocked before this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
+    let point = threads::cancel::Point::begin();
+    let result = if set.is_null() || sig.is_null() {
+        Err(EFAULT)
+    } else {
+        let set = unsafe { set.read() };
+        call(WAIT, [set, 0, 0, 0, 0]).map(|(signal, _)| {
+            unsafe { sig.write(signal as i32) };
+        })
+    };
+    // Interrupted cancellation removes the registration and acknowledges its
+    // retained record before user cleanup can inspect or reuse signal state.
+    point.finish();
+    result.map_or_else(|code| code, |()| 0)
+}
+
+#[cfg(feature = "transport-probe")]
+pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
+    call(WAIT_QUERY, [thread, 0, 0, 0, 0]).map(|(value, _)| value != 0)
 }
 
 rt::upcall_entry!(entry, dispatch);
