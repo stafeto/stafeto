@@ -6,4 +6,5 @@
 #define offsetof(type, member) __builtin_offsetof(type, member)
 typedef __SIZE_TYPE__ size_t;
 typedef __PTRDIFF_TYPE__ ptrdiff_t;
+typedef struct { long long __integer; long double __floating; } max_align_t;
 #endif

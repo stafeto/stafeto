@@ -7,6 +7,7 @@
 
 #![no_std]
 
+pub mod allocation;
 pub mod constants;
 pub mod directory;
 pub mod metadata;

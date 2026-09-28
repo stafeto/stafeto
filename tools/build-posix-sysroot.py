@@ -26,6 +26,11 @@ def stage() -> Path:
     if include.exists():
         shutil.rmtree(include)
     shutil.copytree(SOURCE / "include", include)
+    shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
+    shutil.copy2(ROOT / "LICENSE-MIT", destination / "LICENSE-MIT")
+    shutil.copytree(ROOT / "docs/licenses/linked_list_allocator-0.10.6",
+                    destination / "licenses/linked_list_allocator-0.10.6",
+                    dirs_exist_ok=True)
     values = re.findall(r"pub const ([A-Z][A-Z0-9_]*): (?:i32|u32) = ([0-9]+);", constants)
     header = ["/* SPDX-License-Identifier: GPL-3.0-or-later */",
               "/* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */",

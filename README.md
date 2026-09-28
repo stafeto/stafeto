@@ -286,3 +286,7 @@ into the BusyBox binary. Other programs can use a GPL-compatible Rust C ABI
 library directly. See the [BusyBox license](https://busybox.net/license.html).
 The [FSF compatibility table](https://www.gnu.org/licenses/gpl-faq.en.html)
 explains the linking restriction. `cargo xtask ci` checks this dependency boundary.
+It also checks the GPL-3.0-or-later package declarations and SPDX identifiers
+in every Rust POSIX source module and C header. The generated Rust POSIX
+sysroot includes the GPL license text as `LICENSE`. Third-party dependencies
+retain their own licenses.

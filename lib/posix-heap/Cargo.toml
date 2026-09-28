@@ -1,0 +1,11 @@
+[package]
+name = "posix-heap"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Checked POSIX allocation semantics over a Rust free-list allocator"
+
+[dependencies]
+linked_list_allocator = { version = "0.10.6", default-features = false }
