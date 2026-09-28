@@ -103,6 +103,9 @@ user-space console driver remain future work. What works today:
 - **Rust POSIX sleep waits:** `nanosleep` and `clock_nanosleep` share the pthread
   deadline timer, return elapsed remainders and remove waits before cancellation
   cleanup. Relative waits ignore calendar settings. Signal delivery remains work.
+- **Rust POSIX nested cancellation windows:** read/write in nested native
+  handlers retains the interrupted caller's window; a later cancellation wakes
+  its original wait and runs cleanup. Retained IPC outcomes remain work.
 - **Native user entries:** generic upcalls can enter a computing or IPC-waiting
   thread and restore its registers, TLS, FP/SIMD and message buffer, including
   nesting. Rust POSIX signal policy and safe library reentry remain work.
@@ -235,6 +238,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust timers | Add timer creation, event delivery and overrun accounting; verify relative/absolute expiry, clock changes, signal delivery and resource lifetime. | 🚧 |
 | Rust mutex completion | Add robust owner-death recovery and consistency, shared-process objects and priority protocols; verify recovery, process lifetime and scheduling behavior. | 🚧 |
 | Rust thread synchronization and attributes | Add conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |
+| Nested cancellation windows | Restore the containing generation after handler read/write; verify nested positive/zero/error results, a later cancellation wake, cleanup and quota on QEMU and Apple VZ. | ✅ [#53](https://github.com/stafeto/stafeto/pull/53) |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |

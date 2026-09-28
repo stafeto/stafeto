@@ -1060,6 +1060,18 @@ pub fn probe_cancel_window(run: impl FnOnce()) {
     point.finish();
 }
 
+/// Observe the current window without sending another owner request.
+#[cfg(feature = "transport-probe")]
+pub fn probe_cancel_active() -> u64 {
+    current_launch().map_or(0, |launch| launch.cancel.active.load(Ordering::SeqCst))
+}
+
+/// Mark the console phase for nested-window guest probes only.
+#[cfg(feature = "transport-probe")]
+pub fn probe_cancel_console() {
+    cancel::console_wait();
+}
+
 /// Cancel once after JOIN produced a retained result, before its delivery.
 #[cfg(feature = "transport-probe")]
 pub fn probe_cancel_join_reply() {

@@ -85,33 +85,49 @@ pub(super) fn requested() -> bool {
     state().is_some_and(State::requested)
 }
 
-/// An explicit cancellation window. It must be closed at the C boundary,
-/// after all internal Rust resources have been dropped, before taking cancellation.
-pub(crate) struct Point(Option<&'static State>);
+/// Stack-owned prior state for an interrupted caller's cancellation window.
+struct Frame {
+    state: &'static State,
+    previous: u64,
+    #[cfg(feature = "transport-probe")]
+    console: bool,
+}
+/// An explicit cancellation window. Close windows in nesting order at the C
+/// boundary, after internal resources are dropped and before taking cancellation.
+pub(crate) struct Point(Option<Frame>);
 impl Point {
     pub(crate) fn begin() -> Self {
-        let state = state();
-        if let Some(state) = state {
-            #[cfg(feature = "transport-probe")]
-            state.console.store(false, Ordering::Relaxed);
+        let frame = state().map(|state| {
             let generation = state
                 .generation
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .expect("cancellation generation exhausted")
                 + 1;
-            state.active.store(generation, Ordering::SeqCst);
+            // A signal handler may enter another cancellation point on this
+            // thread. Its return must retain the interrupted caller's window.
+            let previous = state.active.swap(generation, Ordering::SeqCst);
+            #[cfg(feature = "transport-probe")]
+            let console = state.console.swap(false, Ordering::AcqRel);
             if state.requested() {
                 terminate();
             }
-        }
-        Self(state)
+            Frame {
+                state,
+                previous,
+                #[cfg(feature = "transport-probe")]
+                console,
+            }
+        });
+        Self(frame)
     }
     pub(crate) fn requested(&self) -> bool {
-        self.0.is_some_and(State::requested)
+        self.0.as_ref().is_some_and(|frame| frame.state.requested())
     }
     pub(crate) fn end(self) {
-        if let Some(state) = self.0 {
-            state.active.store(0, Ordering::SeqCst);
+        if let Some(frame) = self.0 {
+            #[cfg(feature = "transport-probe")]
+            frame.state.console.store(frame.console, Ordering::Release);
+            frame.state.active.store(frame.previous, Ordering::SeqCst);
         }
     }
     pub(crate) fn finish(self) {
