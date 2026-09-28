@@ -70,8 +70,8 @@ under 204800 bytes. Thread/C/standalone boot images remain
 remain 237/296/361/842/1761 ticks. Icount IPC costs remain
 245/467/1936/2125/3034/4209 on both 512M and 2G. Driver costs move from
 675 to 673 ticks; bind 726/762, ack 205 and portion 247 remain unchanged.
-The generated call table changed code placement; these existing paths
-are not measurements of the new query. Logs:
+The cause of the driver difference was not separately investigated;
+these existing paths are not measurements of the new query. Logs:
 /tmp/stafeto-request-identity-{ci,init,vz,clippy,mutations}.log.
 No new request latency or global non-preemptible bound is claimed.
 
