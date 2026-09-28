@@ -75,7 +75,10 @@ Targeted QEMU and Apple VZ cases, Clippy and license checks passed.
 Six mutations were caught: lost replay, early release, wrong ACK and missing
 metadata deallocation at stage 322; unpaid free and lost failed-realloc address
 at stage 330. Sources were restored. C ABI, standalone C and QEMU/VZ passed.
-Full cargo xtask ci runs on the ready implementation commit.
+Full cargo xtask ci passed on 1025760: BusyBox, image size, shipping hot paths,
+221 init checks and 165/176 kernel checks. Kernel images remain 154704 bytes
+(normal) and 171072 bytes (Apple VZ). Thread/C ABI/standalone boot images are
+528384/442368/454656 bytes. No allocator latency or new kernel bound was measured.
 Kernel behavior is unchanged. Nonlocal exits from interrupted allocation,
 asynchronous cancellation and remaining exclusive library borrows require
 further work with signal actions, masks, queues and restart policy.
