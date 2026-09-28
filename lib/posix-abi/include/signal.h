@@ -7,6 +7,20 @@
 #include <stafeto/abi.h>
 typedef int sig_atomic_t;
 typedef uint64_t sigset_t;
+union sigval {
+    int sival_int;
+    void *sival_ptr;
+};
+typedef struct {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    pid_t si_pid;
+    uid_t si_uid;
+    int si_status;
+    void *si_addr;
+    union sigval si_value;
+} siginfo_t;
 struct sigaction {
     void (*sa_handler)(int);
     sigset_t sa_mask;
@@ -28,4 +42,5 @@ int sigpending(sigset_t *set);
 int pthread_kill(pthread_t thread, int sig);
 int raise(int sig);
 int sigwait(const sigset_t *restrict set, int *restrict sig);
+int sigwaitinfo(const sigset_t *restrict set, siginfo_t *restrict info);
 #endif

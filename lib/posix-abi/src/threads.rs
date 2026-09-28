@@ -222,6 +222,7 @@ struct Cached {
     status: i32,
     value: u64,
     extra: u64,
+    tail: [u64; 5],
 }
 struct Waiting {
     caller: u64,
@@ -374,15 +375,30 @@ impl Registry {
         result: Result<(u64, u64), i32>,
         _op: u64,
     ) -> Cached {
-        let (status, value, extra) = match result {
-            Ok((value, extra)) => (0, value, extra),
-            Err(status) => (status, 0, 0),
+        self.cache_words(
+            caller,
+            nonce,
+            result.map(|(value, extra)| [value, extra, 0, 0, 0, 0, 0]),
+            _op,
+        )
+    }
+    fn cache_words(
+        &mut self,
+        caller: usize,
+        nonce: u64,
+        result: Result<[u64; 7], i32>,
+        _op: u64,
+    ) -> Cached {
+        let (status, words) = match result {
+            Ok(words) => (0, words),
+            Err(status) => (status, [0; 7]),
         };
         let answer = Cached {
             nonce,
             status,
-            value,
-            extra,
+            value: words[0],
+            extra: words[1],
+            tail: words[2..].try_into().expect("retained result tail"),
         };
         if let Some(record) = self
             .entry_mut(caller)
@@ -750,10 +766,13 @@ impl Registry {
 }
 
 fn respond(token: sys::Token, answer: Cached) {
-    let mut bytes = [0; 24];
+    let mut bytes = [0; 64];
     bytes[..8].copy_from_slice(&(answer.status as u64).to_le_bytes());
     bytes[8..16].copy_from_slice(&answer.value.to_le_bytes());
-    bytes[16..].copy_from_slice(&answer.extra.to_le_bytes());
+    bytes[16..24].copy_from_slice(&answer.extra.to_le_bytes());
+    for (index, word) in answer.tail.iter().enumerate() {
+        bytes[24 + index * 8..32 + index * 8].copy_from_slice(&word.to_le_bytes());
+    }
     // An interrupted client's cached answer survives this rejected reply.
     let _ = token.reply(&bytes);
 }
@@ -832,6 +851,7 @@ extern "C" fn owner(_: u64) -> ! {
                         status: EINVAL,
                         value: 0,
                         extra: 0,
+                        tail: [0; 5],
                     },
                 );
                 continue;
@@ -866,6 +886,7 @@ extern "C" fn owner(_: u64) -> ! {
                     status: 0,
                     value: 0,
                     extra: 0,
+                    tail: [0; 5],
                 },
             );
             #[cfg(feature = "transport-probe")]
@@ -886,6 +907,7 @@ extern "C" fn owner(_: u64) -> ! {
                     status: if words[0] == CREATE { EAGAIN } else { ENOMEM },
                     value: 0,
                     extra: 0,
+                    tail: [0; 5],
                 },
             );
             continue;
@@ -907,6 +929,28 @@ extern "C" fn owner(_: u64) -> ! {
             registry.signal_wait_begin(caller, words, token);
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
+        } else if cfg!(feature = "transport-probe") && words[0] == 48 {
+            // A full-width retained-result witness, without publishing a new
+            // POSIX operation or pretending queued signal sources exist yet.
+            let answer = registry.cache_words(
+                caller,
+                words[2],
+                Ok([
+                    words[3],
+                    words[4],
+                    words[5],
+                    words[6],
+                    words[7],
+                    u64::MAX,
+                    1 << 63,
+                ]),
+                48,
+            );
+            respond(token, answer);
+        } else if (crate::signals::ACTION..=crate::signals::READY).contains(&words[0]) {
+            let result = registry.signal_perform(caller, words);
+            let answer = registry.cache_words(caller, words[2], result, words[0]);
+            respond(token, answer);
         } else {
             let result = if words[0] == sleep::ABANDON {
                 registry.entry_mut(caller).sleep_waiting = None;
@@ -932,8 +976,6 @@ extern "C" fn owner(_: u64) -> ! {
                 {
                     Err(EINVAL)
                 }
-            } else if (crate::signals::ACTION..=crate::signals::READY).contains(&words[0]) {
-                registry.signal_perform(caller, words)
             } else {
                 registry.perform(caller, words).map(|value| (value, 0))
             };
@@ -972,6 +1014,10 @@ fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
 }
 
 pub(crate) fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
+    request_words(op, arguments).map(|words| (words[0], words[1]))
+}
+
+pub(crate) fn request_words(op: u64, arguments: [u64; 5]) -> Result<[u64; 7], i32> {
     if !READY.load(Ordering::Acquire) || tls::thread_id() == 0 {
         return Err(EINVAL);
     }
@@ -1006,13 +1052,17 @@ pub(crate) fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i
             }
             Err(Error::Interrupted) => continue,
             Err(_) => return Err(EIO),
-            Ok(reply) if reply.len == 24 => {
-                let [status, value, extra] = [reply.words[0], reply.words[1], reply.words[2]];
+            Ok(reply) if reply.len == 64 => {
+                let status = reply.words[0];
+                // Copy every field before ACK releases the retained snapshot.
+                let data = reply.words[1..8]
+                    .try_into()
+                    .expect("complete pthread reply");
                 acknowledge(words[1], nonce, false)?;
                 if status != 0 {
                     return Err(status as i32);
                 }
-                return Ok((value, extra));
+                return Ok(data);
             }
             _ => return Err(EIO),
         }
@@ -1030,7 +1080,7 @@ fn acknowledge(caller: u64, nonce: u64, abandon: bool) -> Result<(), i32> {
     loop {
         match sys::send(channel(), &bytes) {
             Err(Error::Interrupted) => continue,
-            Ok(reply) if reply.len == 24 && reply.words[0] == 0 => return Ok(()),
+            Ok(reply) if reply.len == 64 && reply.words[0] == 0 => return Ok(()),
             _ => return Err(EIO),
         }
     }
@@ -1309,7 +1359,7 @@ pub fn probe_leave_reply() -> Result<u64, i32> {
     loop {
         match sys::send(channel(), &bytes) {
             Err(Error::Interrupted) => continue,
-            Ok(reply) if reply.len == 24 => {
+            Ok(reply) if reply.len == 64 => {
                 return if reply.words[0] == 0 {
                     Ok(nonce)
                 } else {
@@ -1324,6 +1374,14 @@ pub fn probe_leave_reply() -> Result<u64, i32> {
 #[cfg(feature = "transport-probe")]
 pub fn probe_release_reply(nonce: u64) -> Result<(), i32> {
     acknowledge(tls::thread_id(), nonce, false)
+}
+
+/// Exercise every retained word after committed reply and ACK interruption.
+#[cfg(feature = "transport-probe")]
+pub fn probe_snapshot(words: [u64; 5]) -> Result<[u64; 7], i32> {
+    INTERRUPT_REPLIES.fetch_or(1 << 48, Ordering::AcqRel);
+    probe_ack_interrupt();
+    request_words(48, words)
 }
 
 /// # Safety

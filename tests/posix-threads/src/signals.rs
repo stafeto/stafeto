@@ -369,17 +369,17 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
         && unsafe { *errno } == 777;
     passed &= unsafe { api::pthread_sigmask(SIG_BLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
     passed &= api::raise(SIGUSR1) == 0 && api::raise(SIGUSR1) == 0;
-    let mut accepted = 777;
+    let mut info = api::SigInfo::thread(777);
     threads::probe_interrupt_signal_reply(46);
     threads::probe_ack_interrupt();
-    passed &= unsafe { api::sigwait(&bit(SIGUSR1), &mut accepted) } == 0
-        && accepted == SIGUSR1
+    passed &= unsafe { api::sigwaitinfo(&bit(SIGUSR1), &mut info) } == SIGUSR1
+        && info == api::SigInfo::thread(SIGUSR1)
         && pending() == 0
         && mask() == bit(SIGUSR1);
     PRESSURE_WAIT.store(true, Ordering::Release);
-    accepted = 777;
-    passed &= unsafe { api::sigwait(&bit(SIGUSR1), &mut accepted) } == 0
-        && accepted == SIGUSR1
+    info = api::SigInfo::thread(777);
+    passed &= unsafe { api::sigwaitinfo(&bit(SIGUSR1), &mut info) } == SIGUSR1
+        && info == api::SigInfo::thread(SIGUSR1)
         && pending() == 0
         && mask() == bit(SIGUSR1)
         && COUNT.load(Ordering::Acquire) == 1
@@ -434,7 +434,7 @@ fn under_pressure() -> bool {
         return failed(397);
     }
     rt::println!(
-        "signal-action-probe: full journal/handles permit actions, mask, coalesced delivery, signal-safe I/O, pending/live sigwait, interrupted replies and managed exit"
+        "signal-action-probe: full journal/handles permit actions, mask, coalesced delivery, signal-safe I/O, pending/live sigwaitinfo, interrupted replies and managed exit"
     );
     true
 }

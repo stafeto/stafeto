@@ -34,14 +34,14 @@ pub fn mask(set: SigSet) -> Result<SigSet, Invalid> {
     }
     Ok(set & !UNBLOCKABLE)
 }
-pub fn packed(action: SigAction) -> u64 {
-    action.mask | ((action.flags as u64) << 32)
+pub fn action_words(action: SigAction) -> [u64; 3] {
+    [action.handler, action.mask, action.flags as u32 as u64]
 }
-pub fn unpacked(handler: u64, value: u64) -> SigAction {
+pub fn action_from_words(words: [u64; 3]) -> SigAction {
     SigAction {
-        handler,
-        mask: value & 0xffff_ffff,
-        flags: (value >> 32) as i32,
+        handler: words[0],
+        mask: words[1],
+        flags: words[2] as u32 as i32,
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +188,18 @@ impl Thread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn action_transport_preserves_upper_mask_bits_independently_of_flags() {
+        // Transport supports future real-time bits; public policy still rejects
+        // those numbers until queued delivery is implemented.
+        let action = SigAction {
+            handler: 0xffff_ffff_0000_1234,
+            mask: 0x8000_0001_0000_0010,
+            flags: SA_NODEFER | SA_RESETHAND,
+        };
+        assert_eq!(action_words(action), [action.handler, action.mask, 3]);
+        assert_eq!(action_from_words(action_words(action)), action);
+    }
     fn caught(flags: i32, mask: SigSet) -> SigAction {
         SigAction {
             handler: 0x1000,
@@ -227,7 +239,7 @@ mod tests {
         actions.replace(SIGUSR1, caught(0, UNBLOCKABLE)).unwrap();
         assert_eq!(actions.get(SIGUSR1).unwrap().mask, 0);
         assert_eq!(
-            unpacked(0x1000, packed(caught(FLAGS, VALID & !UNBLOCKABLE))),
+            action_from_words(action_words(caught(FLAGS, VALID & !UNBLOCKABLE))),
             caught(FLAGS, VALID & !UNBLOCKABLE)
         );
     }

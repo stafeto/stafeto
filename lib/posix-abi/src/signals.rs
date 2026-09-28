@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Process dispositions and ordinary thread-directed delivery through the owner.
-//! Real-time queues, process routing, stop/continue, alternate stacks, siginfo
-//! and automatic syscall restart still require implementation.
+//! Real-time queues, process routing, stop/continue, alternate stacks, handler
+//! siginfo/context and automatic syscall restart still require implementation.
 use crate::{constants::*, threads, tls};
 pub use posix_signals::{DEFAULT, IGNORE};
-pub use posix_types::{SigAction, SigSet};
+pub use posix_types::{SigAction, SigInfo, SigSet};
 use rt::upcall;
 pub(crate) const ACTION: u64 = 40;
 pub(crate) const MASK: u64 = 41;
@@ -114,10 +114,14 @@ pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut
         action.mask,
         action.flags as u64,
     ];
-    match call(ACTION, args) {
-        Ok((handler, packed)) => {
+    match threads::request_words(ACTION, args) {
+        Ok(words) => {
             if !old.is_null() {
-                unsafe { old.write(posix_signals::unpacked(handler, packed)) };
+                unsafe {
+                    old.write(posix_signals::action_from_words(
+                        words[..3].try_into().unwrap(),
+                    ))
+                };
             }
             0
         }
@@ -213,6 +217,30 @@ pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
     // retained record before user cleanup can inspect or reuse signal state.
     point.finish();
     result.map_or_else(|code| code, |()| 0)
+}
+
+/// # Safety
+/// The caller is managed. set is readable, info is null or writable for one
+/// SigInfo, and their storage does not overlap. All selected signals are blocked.
+/// Internal IPC interrupts and unrelated caught signals resume this wait; EINTR
+/// is not returned. Current pthread_kill/raise causes are reported as SI_THREAD.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> i32 {
+    let point = threads::cancel::Point::begin();
+    let result = if set.is_null() {
+        Err(EFAULT)
+    } else {
+        let set = unsafe { set.read() };
+        threads::request_words(WAIT, [set, 0, 0, 0, 0]).map(|words| {
+            if !info.is_null() {
+                let snapshot = SigInfo::from_words(words[2..].try_into().unwrap());
+                unsafe { info.write(snapshot) };
+            }
+            words[0] as i32
+        })
+    };
+    point.finish();
+    result.unwrap_or_else(fail)
 }
 
 #[cfg(feature = "transport-probe")]

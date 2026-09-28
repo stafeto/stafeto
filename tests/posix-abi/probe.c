@@ -20,6 +20,15 @@ _Static_assert(sizeof(pthread_t) == 8, "pthread ID ABI");
 _Static_assert(sizeof(sigset_t) == 8, "signal set ABI");
 _Static_assert(sizeof(struct sigaction) == 24, "signal action ABI");
 _Static_assert(offsetof(struct sigaction, sa_flags) == 16, "signal flags offset");
+_Static_assert(sizeof(union sigval) == 8, "signal value ABI");
+_Static_assert(sizeof(siginfo_t) == 40, "signal information ABI");
+_Static_assert(_Alignof(siginfo_t) == 8, "signal information alignment");
+_Static_assert(offsetof(siginfo_t, si_code) == 8, "signal cause offset");
+_Static_assert(offsetof(siginfo_t, si_pid) == 12, "signal sender offset");
+_Static_assert(offsetof(siginfo_t, si_addr) == 24, "signal address offset");
+_Static_assert(offsetof(siginfo_t, si_value) == 32, "signal value offset");
+_Static_assert(SI_THREAD != SI_USER && SI_THREAD != SI_QUEUE && SI_THREAD != SI_TIMER
+        && SI_THREAD != SI_ASYNCIO && SI_THREAD != SI_MESGQ, "thread cause is distinct");
 _Static_assert(sizeof(pthread_attr_t) == 32, "pthread attributes ABI");
 _Static_assert(_Alignof(pthread_attr_t) == 8, "pthread attribute alignment");
 _Static_assert(_Generic(INT64_C(1), int64_t: 1, default: 0), "signed 64-bit constant ABI");
@@ -91,6 +100,20 @@ static int signals(void) {
     accepted = 999;
     if (sigwait(&set, &accepted) != EINVAL || accepted != 999 || errno != 777
             || sigwait(NULL, &accepted) != EFAULT || accepted != 999 || errno != 777) return 166;
+    siginfo_t info = { .si_signo = 999, .si_code = -999, .si_value.sival_ptr = (void *)UINT64_C(18446744073709551615) };
+    if (sigwaitinfo(&set, &info) != -1 || errno != EINVAL || info.si_signo != 999
+            || info.si_code != -999 || info.si_value.sival_ptr != (void *)UINT64_C(18446744073709551615)) return 168;
+    if (sigwaitinfo(NULL, &info) != -1 || errno != EFAULT || info.si_signo != 999
+            || info.si_code != -999 || info.si_value.sival_ptr != (void *)UINT64_C(18446744073709551615)) return 169;
+    if (sigemptyset(&set) || sigaddset(&set, SIGUSR1) || raise(SIGUSR1) || raise(SIGUSR1)) return 170;
+    errno = 777;
+    if (sigwaitinfo(&set, &info) != SIGUSR1 || errno != 777 || info.si_signo != SIGUSR1
+            || info.si_code != SI_THREAD || info.si_errno || info.si_pid || info.si_uid
+            || info.si_status || info.si_addr || info.si_value.sival_ptr || sigpending(&pending)
+            || pending || signal_calls != 1 || sigaction(SIGUSR1, NULL, &previous)
+            || previous.sa_handler != signal_handler || previous.sa_flags != SA_RESETHAND) return 171;
+    if (raise(SIGUSR1) || sigwaitinfo(&set, NULL) != SIGUSR1 || errno != 777
+            || sigpending(&pending) || pending || signal_calls != 1) return 172;
     if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)
             || signal(SIGUSR1, SIG_DFL) != signal_handler) return 167;
     return 0;

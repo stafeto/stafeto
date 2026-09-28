@@ -55,7 +55,10 @@ impl Registry {
             .signal_waiting
             .take()
             .expect("accepted signal wait");
-        let answer = self.cache(index, wait.nonce, Ok(signal as u64), WAIT);
+        let mut result = [0; 7];
+        result[0] = signal as u64;
+        result[2..].copy_from_slice(&posix_types::SigInfo::thread(signal).words());
+        let answer = self.cache_words(index, wait.nonce, Ok(result), WAIT);
         respond(wait.token, answer);
         true
     }
@@ -71,7 +74,8 @@ impl Registry {
         &mut self,
         caller: usize,
         words: [u64; 8],
-    ) -> Result<(u64, u64), i32> {
+    ) -> Result<[u64; 7], i32> {
+        let pair = |value, extra| [value, extra, 0, 0, 0, 0, 0];
         match words[0] {
             ACTION => {
                 let signal = words[3] as i32;
@@ -93,7 +97,8 @@ impl Registry {
                         entry.signal.discard(signal);
                     }
                 }
-                Ok((old.handler, posix_signals::packed(old)))
+                let action = posix_signals::action_words(old);
+                Ok([action[0], action[1], action[2], 0, 0, 0, 0])
             }
             MASK => {
                 let before = self.entry(caller).signal;
@@ -109,7 +114,7 @@ impl Registry {
                     self.entry_mut(caller).signal = before;
                     return Err(code);
                 }
-                Ok((old, 0))
+                Ok(pair(old, 0))
             }
             SEND => {
                 let signal = words[4] as i32;
@@ -119,7 +124,7 @@ impl Registry {
                 let index = self.find(words[3])?;
                 // Inactive joinable IDs retain their lifetime and accept signal 0.
                 if signal == 0 || self.entry(index).phase != Phase::Live {
-                    return Ok((0, 0));
+                    return Ok(pair(0, 0));
                 }
                 let action = self.signals.get(signal).map_err(|_| EINVAL)?;
                 if signal == SIGCONT
@@ -140,22 +145,22 @@ impl Registry {
                 if self.signal_accept_wait(index) {
                     // Acceptance is committed. No fallible native request may
                     // roll the consumed signal back into the pending set.
-                    return Ok((0, 0));
+                    return Ok(pair(0, 0));
                 }
                 if let Err(code) = self.signal_wake(index) {
                     self.entry_mut(index).signal = before;
                     return Err(code);
                 }
-                Ok((0, 0))
+                Ok(pair(0, 0))
             }
-            PENDING => Ok((self.entry(caller).signal.pending(), 0)),
+            PENDING => Ok(pair(self.entry(caller).signal.pending(), 0)),
             TAKE => {
                 let entry = self.entries[caller].as_mut().expect("signal caller");
                 Ok(entry
                     .signal
                     .take(&mut self.signals)
-                    .map_or((0, 0), |(signal, action)| {
-                        (
+                    .map_or(pair(0, 0), |(signal, action)| {
+                        pair(
                             signal as u64 | ((action.flags as u64) << 32),
                             action.handler,
                         )
@@ -164,7 +169,7 @@ impl Registry {
             ATTACHED => {
                 self.entry_mut(caller).signal.ready = true;
                 self.signal_wake(caller)?;
-                Ok((0, 0))
+                Ok(pair(0, 0))
             }
             _ => Err(EINVAL),
         }
