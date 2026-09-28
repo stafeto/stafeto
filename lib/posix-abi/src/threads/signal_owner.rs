@@ -2,9 +2,64 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 use super::*;
-use crate::signals::{ACTION, DEFAULT, MASK, PENDING, READY as ATTACHED, SEND, SigAction, TAKE};
+use crate::signals::{
+    ACTION, DEFAULT, MASK, PENDING, READY as ATTACHED, SEND, SigAction, TAKE, WAIT,
+};
 
+pub(super) struct Waiting {
+    pub(super) nonce: u64,
+    set: posix_signals::SigSet,
+    token: sys::Token,
+}
 impl Registry {
+    pub(super) fn signal_wait_begin(&mut self, caller: usize, words: [u64; 8], token: sys::Token) {
+        if let Some(wait) = self.entry_mut(caller).signal_waiting.as_mut() {
+            if wait.nonce == words[2] {
+                wait.token = token;
+                return;
+            }
+            let answer = self.cache(caller, words[2], Err(EBUSY), WAIT);
+            respond(token, answer);
+            return;
+        }
+        let set = match posix_signals::mask(words[3]) {
+            Ok(set) if set & !self.entry(caller).signal.mask == 0 => set,
+            _ => {
+                let answer = self.cache(caller, words[2], Err(EINVAL), WAIT);
+                respond(token, answer);
+                return;
+            }
+        };
+        self.entry_mut(caller).signal_waiting = Some(Waiting {
+            nonce: words[2],
+            set,
+            token,
+        });
+        self.signal_accept_wait(caller);
+    }
+    fn signal_accept_wait(&mut self, index: usize) -> bool {
+        let Some(wait) = self.entry(index).signal_waiting.as_ref() else {
+            return false;
+        };
+        let set = wait.set;
+        let Some(signal) = self
+            .entry_mut(index)
+            .signal
+            .accept(set)
+            .expect("validated signal wait set")
+        else {
+            return false;
+        };
+        let wait = self
+            .entry_mut(index)
+            .signal_waiting
+            .take()
+            .expect("accepted signal wait");
+        let answer = self.cache(index, wait.nonce, Ok(signal as u64), WAIT);
+        respond(wait.token, answer);
+        true
+    }
+
     fn signal_wake(&self, index: usize) -> Result<(), i32> {
         let entry = self.entry(index);
         if entry.phase == Phase::Live && entry.signal.deliverable() {
@@ -82,6 +137,11 @@ impl Registry {
                     .signal
                     .generate(signal, &self.signals)
                     .map_err(|_| EINVAL)?;
+                if self.signal_accept_wait(index) {
+                    // Acceptance is committed. No fallible native request may
+                    // roll the consumed signal back into the pending set.
+                    return Ok((0, 0));
+                }
                 if let Err(code) = self.signal_wake(index) {
                     self.entry_mut(index).signal = before;
                     return Err(code);

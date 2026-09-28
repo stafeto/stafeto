@@ -4,6 +4,7 @@
 //! Real process dispositions, thread masks, native nesting and IPC wakeups.
 use super::*;
 use abi::signals::{self as api, SigAction, SigSet};
+use core::sync::atomic::AtomicBool;
 use rt::wait::{Waited, Waiter};
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -324,6 +325,7 @@ struct Held(core::cell::UnsafeCell<[Option<Handle<Channel>>; 128]>);
 unsafe impl Sync for Held {}
 static HELD: Held = Held(core::cell::UnsafeCell::new([const { None }; 128]));
 static PRESSURE_RESULT: AtomicUsize = AtomicUsize::new(0);
+static PRESSURE_WAIT: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     sys::receive(&channel(&GATE)).unwrap();
     ID.store(threads::pthread_self(), Ordering::Release);
@@ -365,6 +367,23 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
         && pending() == 0
         && ERRORS.load(Ordering::Acquire) == 0
         && unsafe { *errno } == 777;
+    passed &= unsafe { api::pthread_sigmask(SIG_BLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
+    passed &= api::raise(SIGUSR1) == 0 && api::raise(SIGUSR1) == 0;
+    let mut accepted = 777;
+    threads::probe_interrupt_signal_reply(46);
+    threads::probe_ack_interrupt();
+    passed &= unsafe { api::sigwait(&bit(SIGUSR1), &mut accepted) } == 0
+        && accepted == SIGUSR1
+        && pending() == 0
+        && mask() == bit(SIGUSR1);
+    PRESSURE_WAIT.store(true, Ordering::Release);
+    accepted = 777;
+    passed &= unsafe { api::sigwait(&bit(SIGUSR1), &mut accepted) } == 0
+        && accepted == SIGUSR1
+        && pending() == 0
+        && mask() == bit(SIGUSR1)
+        && COUNT.load(Ordering::Acquire) == 1
+        && unsafe { *errno } == 777;
     PRESSURE_RESULT.store(usize::from(passed), Ordering::Release);
     usize::from(passed) as *mut c_void
 }
@@ -387,7 +406,17 @@ fn under_pressure() -> bool {
     let retained = sys::handle_duplicate(&native, rt::abi::Rights::MANAGE).unwrap();
     sys::notify(&gate, 1).unwrap();
     let deadline = sys::clock_now().unwrap() + 5_000_000_000;
+    let mut delivered = false;
     while sys::thread_info(&retained).unwrap().state != ThreadState::Ended {
+        if !delivered
+            && PRESSURE_WAIT.load(Ordering::Acquire)
+            && sys::thread_info(&retained).unwrap().state == ThreadState::AwaitingReply
+        {
+            if api::pthread_kill(id, SIGUSR1) != 0 {
+                return failed(398);
+            }
+            delivered = true;
+        }
         let now = sys::clock_now().unwrap();
         if now >= deadline {
             return failed(396);
@@ -396,7 +425,7 @@ fn under_pressure() -> bool {
         sys::receive(&wake).unwrap();
     }
     // Native Ended and the release/acquire publication precede all reclamation.
-    let passed = PRESSURE_RESULT.load(Ordering::Acquire) == 1;
+    let passed = delivered && PRESSURE_RESULT.load(Ordering::Acquire) == 1;
     for slot in unsafe { &mut *HELD.0.get() } {
         *slot = None;
     }
@@ -405,7 +434,7 @@ fn under_pressure() -> bool {
         return failed(397);
     }
     rt::println!(
-        "signal-action-probe: full journal/handles permit actions, mask, coalesced delivery, signal-safe I/O, interrupted replies and managed exit"
+        "signal-action-probe: full journal/handles permit actions, mask, coalesced delivery, signal-safe I/O, pending/live sigwait, interrupted replies and managed exit"
     );
     true
 }

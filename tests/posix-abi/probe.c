@@ -22,6 +22,8 @@ _Static_assert(sizeof(struct sigaction) == 24, "signal action ABI");
 _Static_assert(offsetof(struct sigaction, sa_flags) == 16, "signal flags offset");
 _Static_assert(sizeof(pthread_attr_t) == 32, "pthread attributes ABI");
 _Static_assert(_Alignof(pthread_attr_t) == 8, "pthread attribute alignment");
+_Static_assert(_Generic(INT64_C(1), int64_t: 1, default: 0), "signed 64-bit constant ABI");
+_Static_assert(_Generic(UINT64_C(1), uint64_t: 1, default: 0), "unsigned 64-bit constant ABI");
 _Static_assert(sizeof(void *) == 8, "pointer ABI");
 _Static_assert(sizeof(int) == 4, "int ABI");
 _Static_assert(sizeof(long) == 8, "long ABI");
@@ -76,6 +78,21 @@ static int signals(void) {
             || previous.sa_handler != signal_handler || previous.sa_mask != 123
             || previous.sa_flags != 456) return 162;
     if (sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != SIG_DFL) return 163;
+    action.sa_flags = SA_RESETHAND;
+    if (sigaction(SIGUSR1, &action, NULL) || sigaddset(&set, SIGUSR1)
+            || pthread_sigmask(SIG_BLOCK, &set, NULL) || raise(SIGUSR1) || raise(SIGUSR1)) return 164;
+    int accepted = 999;
+    errno = 777;
+    if (sigwait(&set, &accepted) || accepted != SIGUSR1 || errno != 777
+            || sigpending(&pending) || pending || signal_calls != 1
+            || sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != signal_handler
+            || previous.sa_flags != SA_RESETHAND) return 165;
+    set = UINT64_C(1) << 63;
+    accepted = 999;
+    if (sigwait(&set, &accepted) != EINVAL || accepted != 999 || errno != 777
+            || sigwait(NULL, &accepted) != EFAULT || accepted != 999 || errno != 777) return 166;
+    if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)
+            || signal(SIGUSR1, SIG_DFL) != signal_handler) return 167;
     return 0;
 }
 

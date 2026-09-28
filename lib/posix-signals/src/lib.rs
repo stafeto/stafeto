@@ -145,6 +145,17 @@ impl Thread {
     pub fn deliverable(&self) -> bool {
         self.ready && self.pending & !self.mask != 0
     }
+    /// Atomically accept one pending signal without executing its disposition.
+    /// The caller has blocked the requested set; acceptance preserves that mask.
+    pub fn accept(&mut self, set: SigSet) -> Result<Option<i32>, Invalid> {
+        let eligible = self.pending & mask(set)?;
+        if eligible == 0 {
+            return Ok(None);
+        }
+        let signal = eligible.trailing_zeros() as i32 + 1;
+        self.discard(signal);
+        Ok(Some(signal))
+    }
     /// Copy the action and install its effective mask before executing user code.
     /// The dispatcher owns the saved old mask and restores it after the handler.
     pub fn take(&mut self, actions: &mut Actions) -> Option<(i32, SigAction)> {
@@ -338,5 +349,49 @@ mod tests {
         assert_eq!(default_action(SIGSTOP), DefaultAction::Stop);
         assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
         assert_eq!(default_action(SIGTERM), DefaultAction::Terminate);
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::*;
+    #[test]
+    fn acceptance_preserves_masks_actions_and_other_pending_signals() {
+        let mut actions = Actions::new();
+        let action = SigAction {
+            handler: 0x1000,
+            flags: SA_RESETHAND,
+            ..INITIAL
+        };
+        actions.replace(SIGUSR1, action).unwrap();
+        let first = bit(SIGUSR1).unwrap();
+        let second = bit(SIGUSR2).unwrap();
+        let mut thread = Thread::new(first | second);
+        // Synchronous acceptance does not depend on native readiness.
+        thread.generate(SIGUSR1, &actions).unwrap();
+        thread.generate(SIGUSR1, &actions).unwrap();
+        thread.generate(SIGUSR2, &actions).unwrap();
+        assert_eq!(thread.accept(first), Ok(Some(SIGUSR1)));
+        assert_eq!(thread.mask, first | second);
+        assert_eq!(thread.pending(), second);
+        assert_eq!(actions.get(SIGUSR1), Ok(action));
+        assert_eq!(thread.accept(first), Ok(None));
+        assert_eq!(thread.accept(first | second), Ok(Some(SIGUSR2)));
+        assert_eq!(thread.pending(), 0);
+    }
+    #[test]
+    fn invalid_set_is_atomic_and_lowest_pending_bit_wins() {
+        let actions = Actions::new();
+        let set = bit(SIGUSR1).unwrap() | bit(SIGUSR2).unwrap();
+        let mut thread = Thread::new(set);
+        thread.generate(SIGUSR2, &actions).unwrap();
+        thread.generate(SIGUSR1, &actions).unwrap();
+        assert_eq!(thread.accept(1 << 63), Err(Invalid::Mask));
+        assert_eq!(thread.pending(), set);
+        assert_eq!(thread.accept(0), Ok(None));
+        assert_eq!(thread.accept(set | UNBLOCKABLE), Ok(Some(SIGUSR1)));
+        assert_eq!(thread.accept(set), Ok(Some(SIGUSR2)));
+        assert_eq!(thread.accept(set), Ok(None));
+        assert_eq!(thread.mask, set);
     }
 }

@@ -249,6 +249,7 @@ fn recovery_slot(op: u64) -> Option<usize> {
         crate::signals::PENDING => Some(11),
         crate::signals::TAKE => Some(12),
         crate::signals::READY => Some(13),
+        crate::signals::WAIT => Some(14),
         _ => None,
     }
 }
@@ -264,8 +265,9 @@ struct Entry {
     once_waiting: Option<once::Waiting>,
     mutex_waiting: Option<mutex::Waiting>,
     sleep_waiting: Option<sleep::Waiting>,
-    recovery: [Option<Recovery>; 14],
+    recovery: [Option<Recovery>; 15],
     signal: posix_signals::Thread,
+    signal_waiting: Option<signal_owner::Waiting>,
 }
 impl Entry {
     fn new(
@@ -286,8 +288,9 @@ impl Entry {
             once_waiting: None,
             mutex_waiting: None,
             sleep_waiting: None,
-            recovery: [None; 14],
+            recovery: [None; 15],
             signal: posix_signals::Thread::new(0),
+            signal_waiting: None,
         }
     }
 }
@@ -638,6 +641,7 @@ impl Registry {
                 }
                 let entry = self.entry_mut(caller);
                 entry.sleep_waiting = None;
+                entry.signal_waiting = None;
                 entry.once_waiting = None;
                 entry.mutex_waiting = None;
                 entry.phase = Phase::Exiting;
@@ -725,7 +729,14 @@ impl Registry {
         {
             entry.sleep_waiting = None;
         }
-        // JOIN is the other request which can return before a terminal result.
+        if entry
+            .signal_waiting
+            .as_ref()
+            .is_some_and(|w| w.nonce == nonce)
+        {
+            entry.signal_waiting = None;
+        }
+        // A cancelled JOIN releases its target claim before terminal delivery.
         for target in self.entries.iter_mut().flatten() {
             if target
                 .waiting
@@ -892,6 +903,8 @@ extern "C" fn owner(_: u64) -> ! {
             registry.mutex_lock(caller, words, token);
         } else if words[0] == sleep::BEGIN {
             registry.sleep_begin(caller, words, token);
+        } else if words[0] == crate::signals::WAIT {
+            registry.signal_wait_begin(caller, words, token);
         } else if words[0] == JOIN {
             registry.join(caller, words, token);
         } else {
@@ -908,6 +921,17 @@ extern "C" fn owner(_: u64) -> ! {
                 registry.once_perform(words).map(|value| (value, 0))
             } else if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
                 registry.specific.perform(caller, words)
+            } else if cfg!(feature = "transport-probe") && words[0] == crate::signals::WAIT_QUERY {
+                #[cfg(feature = "transport-probe")]
+                {
+                    registry
+                        .find(words[3])
+                        .map(|index| (u64::from(registry.entry(index).signal_waiting.is_some()), 0))
+                }
+                #[cfg(not(feature = "transport-probe"))]
+                {
+                    Err(EINVAL)
+                }
             } else if (crate::signals::ACTION..=crate::signals::READY).contains(&words[0]) {
                 registry.signal_perform(caller, words)
             } else {
@@ -974,7 +998,9 @@ pub(crate) fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i
                 acknowledge(words[1], nonce, true)?;
                 return Err(EINTR);
             }
-            Err(Error::Interrupted) if op == JOIN && cancel::requested() => {
+            Err(Error::Interrupted)
+                if (op == JOIN || op == crate::signals::WAIT) && cancel::requested() =>
+            {
                 acknowledge(words[1], nonce, true)?;
                 return Err(ECANCELED);
             }
@@ -1257,7 +1283,7 @@ pub fn probe_reply_upcall(op: u64) {
 /// Interrupt one ordinary signal operation after its result was committed.
 #[cfg(feature = "transport-probe")]
 pub fn probe_interrupt_signal_reply(op: u64) {
-    assert!((crate::signals::ACTION..=crate::signals::READY).contains(&op));
+    assert!((crate::signals::ACTION..=crate::signals::WAIT).contains(&op));
     INTERRUPT_REPLIES.fetch_or(1 << op, Ordering::AcqRel);
 }
 #[cfg(feature = "transport-probe")]

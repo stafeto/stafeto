@@ -8,6 +8,8 @@ typedef __INT64_TYPE__ int64_t;
 typedef __UINT64_TYPE__ uint64_t;
 typedef __INTPTR_TYPE__ intptr_t;
 typedef __UINTPTR_TYPE__ uintptr_t;
-#define INT64_MAX 9223372036854775807LL
+#define INT64_MAX __INT64_MAX__
+#define INT64_C(value) value ## L
+#define UINT64_C(value) value ## UL
 #define SIZE_MAX __SIZE_MAX__
 #endif
