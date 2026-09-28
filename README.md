@@ -211,7 +211,8 @@ checks for successful calls, failures, and ABI layout.
 | Rust console cancellation recovery | Remove the tagged UART read before EINTR, restore input after a rejected reply, retry on the same thread/session, and retain delivered bytes when echo is interrupted; check UART and Virtio. | ✅ [#42](https://github.com/stafeto/stafeto/pull/42) |
 | Rust pthread lifecycle | Create, join, detach and exit native threads with independent errno, inherited FP state, owned stacks and retry-safe results; verify interrupted waits and last-thread process exit. | ✅ [#43](https://github.com/stafeto/stafeto/pull/43) |
 | Rust deferred cancellation | Cancel read, write and join with disabled/pending state, LIFO handlers, acknowledged console cleanup and retained join results; verify the pre-IPC wake race on QEMU and Apple VZ. | ✅ [#44](https://github.com/stafeto/stafeto/pull/44) |
-| Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, thread-specific destructors, and signal delivery with documented restart behavior. | 🚧 |
+| Rust thread-specific data | Provide pthread keys with isolated bindings, safe key/thread slot reuse, and four destructor passes after cleanup; verify interrupted replies and join ordering on QEMU and Apple VZ. | ✅ [#45](https://github.com/stafeto/stafeto/pull/45) |
+| Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
 | Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
@@ -239,7 +240,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-input.md](notes/m2-rust-posix-input.md) and
 [notes/m2-rust-posix-messages.md](notes/m2-rust-posix-messages.md) and
 [notes/m2-rust-posix-threads.md](notes/m2-rust-posix-threads.md) and
-[notes/m2-rust-posix-deferred-cancel.md](notes/m2-rust-posix-deferred-cancel.md)
+[notes/m2-rust-posix-deferred-cancel.md](notes/m2-rust-posix-deferred-cancel.md) and
+[notes/m2-rust-posix-thread-data.md](notes/m2-rust-posix-thread-data.md)
 for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery

@@ -25,6 +25,8 @@ use rt::{
 mod cancellation;
 #[cfg(feature = "cancel-input")]
 mod input;
+#[cfg(not(feature = "cancel-input"))]
+mod specific;
 
 rt::entry!(main);
 static PROCESS: AtomicU64 = AtomicU64::new(0);
@@ -78,7 +80,7 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     // Main exited through pthread_exit. Its join must still yield its value.
     let mut value = ptr::null_mut();
     let passed = unsafe { threads::pthread_join(1, &mut value) } == 0 && value as usize == VALUE;
-    if !passed {
+    if !passed || !specific::main_completed() {
         sys::process_exit(70);
     }
     // Files and allocation owners stay usable after main has ended.
@@ -236,7 +238,7 @@ fn run() -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !cancellation::run() {
+    if !specific::run() || !cancellation::run() {
         return false;
     }
 
