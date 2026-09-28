@@ -63,7 +63,17 @@ cargo xtask kernel-test and cargo xtask init-test. These also make
 targeted mutation checks independent of the full CI suite.
 Targeted kernel/EL0 init tests and C ABI probes passed. Apple VZ passed
 the pthread/signal checks. Host and guest Clippy passed.
-Mutation results and full CI are added after ready-commit verification.
+Ten mutations were caught: reused/wrapped/skipped-last IDs on the host;
+constant IDs, lost parents and ended IDs by the real kernel tree;
+handle-as-PID by init; swapped PID/PPID at guest stage 450; errno at C
+exit 199. Sources were restored before the complete verification.
+Full cargo xtask ci passed on 4b7c6a6: kcore 402, init 222, kernel
+166/177, all POSIX/BusyBox probes and shipping hot-path checks.
+Normal/VZ kernels are 154708/171076 bytes, four bytes above #61 and
+below 204800. Thread/C ABI/standalone images are 626688/516096/532480.
+Normal/icount IPC timings match #61. The icount IRQ driver measurement
+is 675 ticks, previously 673; bind/ack/portion are unchanged. New call
+latency and a fresh global blocking bound were not measured.
 
 ## Remaining requirements
 

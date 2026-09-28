@@ -110,6 +110,9 @@ user-space console driver remain future work. What works today:
 - **Native user entries:** generic upcalls can enter a computing or IPC-waiting
   thread and restore its registers, TLS, FP/SIMD and message buffer, including
   nesting. Local borrowed file state defers entry while keeping IPC interruptible.
+- **Rust POSIX process identity:** `getpid` and `getppid` return native numeric
+  identities shared by all pthreads. IDs and parent links survive ended shells;
+  sender credentials, process routing and orphan adoption remain work.
 - **Rust POSIX ordinary signals:** C and pthread probes provide process actions,
   per-thread masks, pending sets, `raise` and `pthread_kill`, including CPU/IPC
   delivery, inherited masks, NODEFER, RESETHAND and restored errno. `sigwait`
@@ -123,6 +126,9 @@ user-space console driver remain future work. What works today:
   shell connects to the new instance; after five crashes in 60 s the
   driver is broken, the shell says so through the kernel, and `init`
   shows the driver's last fault and its own decision.
+
+`cargo xtask kernel-test` and `cargo xtask init-test` run the kernel and EL0
+init test images separately for focused changes.
 
 `cargo xtask run` boots to the shell's prompt. `cargo xtask test` runs
 the tests on QEMU's GICv2 and GICv3, a dialog with the shell through the
@@ -256,6 +262,7 @@ checks for successful calls, failures, and ABI layout.
 | Rust ordinary signal actions | Add C signal sets, shared dispositions, per-thread masks and pending state, raise/pthread_kill, native CPU/IPC dispatch, inheritance, nested handlers and retained outcomes under resource pressure. Verify QEMU and Apple VZ. | ✅ [#59](https://github.com/stafeto/stafeto/pull/59) |
 | Rust synchronous signal acceptance | Add sigwait for ordinary blocked signals with atomic pending/live acceptance, directed delivery, retained replies and cancellation cleanup; verify full journal/handle pressure on QEMU and Apple VZ. Queued signals and other wait interfaces remain below. | ✅ [#60](https://github.com/stafeto/stafeto/pull/60) |
 | Rust signal information acceptance | Add sigwaitinfo and C signal information, retain complete snapshots through reply/ACK interruption and cancellation, and separate full action masks from flags. Verify QEMU, Apple VZ and resource pressure; real-time queues and timed waits remain work. | ✅ [#61](https://github.com/stafeto/stafeto/pull/61) |
+| Rust process identity | Add boot-unique numeric IDs and retained parent identity, native ObjectInfo/rt access and Rust getpid/getppid; verify real process trees, ended shells, handle copies, pthreads and signal handlers. | ✅ [#62](https://github.com/stafeto/stafeto/pull/62) |
 | Rust queued signals and timed acceptance | Add real-time FIFO source/value queues, SA_SIGINFO with interrupted context, process-directed sigqueue and sigtimedwait using MONOTONIC deadlines; preserve masks, retained outcomes, queue resources and cancellation. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and remaining signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
