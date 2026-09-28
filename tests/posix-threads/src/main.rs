@@ -22,6 +22,8 @@ use rt::{
 };
 
 #[cfg(not(feature = "cancel-input"))]
+mod borrow_guards;
+#[cfg(not(feature = "cancel-input"))]
 mod cancellation;
 #[cfg(not(feature = "cancel-input"))]
 mod capacity;
@@ -270,6 +272,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !timed::run()
         || !sleep::run()
         || !upcall::run()
+        || !borrow_guards::run(parent)
         || !reentry::run()
         || !file_replies::run()
         || !thread_replies::run()

@@ -30,6 +30,7 @@ pub struct State {
     pc: u64,
     flags: u64,
     depth: u32,
+    deferred: u32,
     masked: bool,
     pending: bool,
     entering: bool,
@@ -46,13 +47,14 @@ impl State {
             pc: 0,
             flags: 0,
             depth: 0,
+            deferred: 0,
             masked: true,
             pending: false,
             entering: false,
         }
     }
     pub fn bind(&mut self, entry: u64) -> Result<(), Error> {
-        if self.depth != 0 {
+        if self.depth != 0 || self.deferred != 0 {
             return Err(Error::BadState);
         }
         crate::args::check_start(entry, 0, 1)?;
@@ -85,12 +87,26 @@ impl State {
                 self.entering = false;
                 Ok((was, self.pc, self.flags))
             }
+            3 => {
+                self.deferred = self.deferred.checked_add(1).ok_or(Error::NoMemory)?;
+                Ok((was, 0, 0))
+            }
+            4 => {
+                self.deferred = self.deferred.checked_sub(1).ok_or(Error::BadState)?;
+                Ok((was, 0, 0))
+            }
             1..=2 => Err(Error::BadState),
             _ => Err(Error::InvalidArgs),
         }
     }
     pub fn prepare(&mut self, pc: u64, flags: u64, long_call: bool) -> Option<u64> {
-        if self.entry == 0 || self.masked || !self.pending || long_call || self.depth == u32::MAX {
+        if self.entry == 0
+            || self.masked
+            || self.deferred != 0
+            || !self.pending
+            || long_call
+            || self.depth == u32::MAX
+        {
             return None;
         }
         self.masked = true;
@@ -101,8 +117,12 @@ impl State {
         self.depth += 1;
         Some(self.entry)
     }
+    /// A request deferred by an internal borrow must not strand a new wait.
+    pub fn interrupt_wait(&self) -> bool {
+        self.deferred != 0 && self.pending && !self.masked
+    }
     pub fn can_return(&self) -> bool {
-        self.depth != 0 && self.masked && !self.entering
+        self.depth != 0 && self.deferred == 0 && self.masked && !self.entering
     }
     pub fn returned(&mut self) -> Result<(), Error> {
         if !self.can_return() {
@@ -183,12 +203,69 @@ mod tests {
         assert_eq!(state.request(), Err(Error::BadState));
     }
     #[test]
+    fn deferral_interrupts_waits_and_delivers_only_after_last_level() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(1).unwrap();
+        state.control(3).unwrap();
+        state.control(3).unwrap();
+        assert_eq!(state.request(), Ok(true));
+        assert!(state.interrupt_wait());
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        assert_eq!(state.bind(0), Err(Error::BadState));
+        state.control(4).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        state.control(4).unwrap();
+        assert!(!state.interrupt_wait());
+        assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
+        state.control(2).unwrap();
+        state.control(3).unwrap();
+        assert!(!state.can_return());
+        assert_eq!(state.returned(), Err(Error::BadState));
+        state.control(4).unwrap();
+        state.returned().unwrap();
+    }
+    #[test]
+    fn deferral_respects_mask_changes_and_rejects_unbalanced_control() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        assert_eq!(state.control(4), Err(Error::BadState));
+        state.control(3).unwrap();
+        assert_eq!(state.request(), Ok(false));
+        assert!(!state.interrupt_wait());
+        state.control(4).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        state.control(3).unwrap();
+        state.control(1).unwrap();
+        assert!(state.interrupt_wait());
+        state.control(0).unwrap();
+        state.control(4).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        state.control(1).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
+    }
+    #[test]
+    fn deferral_overflow_preserves_state_and_pending_request() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.control(1).unwrap();
+        state.request().unwrap();
+        state.deferred = u32::MAX;
+        assert_eq!(state.control(3), Err(Error::NoMemory));
+        assert_eq!(state.deferred, u32::MAX);
+        assert!(state.interrupt_wait());
+        assert_eq!(state.prepare(0x2000, 0, false), None);
+        state.deferred = 1;
+        state.control(4).unwrap();
+        assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
+    }
+    #[test]
     fn malformed_control_and_address_do_not_change_pending_state() {
         let mut state = State::new();
         state.bind(0x1000).unwrap();
         state.request().unwrap();
         assert_eq!(state.bind(0x1002), Err(Error::InvalidArgs));
-        assert_eq!(state.control(3), Err(Error::InvalidArgs));
+        assert_eq!(state.control(5), Err(Error::InvalidArgs));
         assert_eq!(state.control(2), Err(Error::BadState));
         state.control(1).unwrap();
         assert_eq!(state.prepare(0, 0, false), Some(0x1000));

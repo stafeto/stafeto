@@ -6,8 +6,8 @@
 //! are not loaded yet. A scope uses a local file owner or the shared process owner.
 
 use crate::directory::Streams;
-use core::arch::asm;
 use core::ptr;
+use core::{arch::asm, cell::UnsafeCell};
 use posix_fs::PosixFs;
 
 #[repr(C, align(16))]
@@ -39,12 +39,17 @@ unsafe fn install(pointer: *mut Block) {
     unsafe { asm!("msr tpidr_el0, {}", in(reg) pointer, options(nostack, preserves_flags)) };
 }
 
-struct Restore(*mut Block);
+struct Restore<'a> {
+    previous: *mut Block,
+    current: &'a UnsafeCell<Block>,
+}
 
-impl Drop for Restore {
+impl Drop for Restore<'_> {
     fn drop(&mut self) {
-        // SAFETY: restore the register's exact previous value before the block dies.
-        unsafe { install(self.0) };
+        let _guard = rt::upcall::defer_entries().expect("TLS restore deferral");
+        // SAFETY: the old scope is still live; defer entries until it is installed.
+        unsafe { install(self.previous) };
+        core::hint::black_box(self.current);
     }
 }
 
@@ -55,17 +60,22 @@ fn scope<R>(
     thread_id: u64,
     run: impl FnOnce() -> R,
 ) -> R {
-    let mut block = Block {
+    let block = UnsafeCell::new(Block {
         reserved: [0; 2],
         errno: 0,
         process_files: u32::from(process_files),
         files,
         directories,
         thread_id,
+    });
+    let guard = rt::upcall::defer_entries().expect("TLS install deferral");
+    let restore = Restore {
+        previous: pointer(),
+        current: &block,
     };
-    let restore = Restore(pointer());
     // SAFETY: block remains at this stack address until after register restoration.
-    unsafe { install(&mut block) };
+    unsafe { install(block.get()) };
+    drop(guard);
     let result = run();
     drop(restore);
     result

@@ -56,6 +56,22 @@ pub fn unbind() -> Result<(), Error> {
     Error::from_code(result[0]).map_or(Ok(()), Err)
 }
 
+/// Defer handler execution while keeping enabled IPC waits interruptible.
+/// Drop releases one nesting level; it can immediately enter a pending handler.
+/// The guard must outlive all exclusive borrows it protects and remain on its
+/// creating thread. It neither changes nor restores the application's mask.
+#[must_use = "keep the guard until all protected references have ended"]
+pub struct DeferredEntry(core::marker::PhantomData<*mut ()>);
+pub fn defer_entries() -> Result<DeferredEntry, Error> {
+    control(3)?;
+    Ok(DeferredEntry(core::marker::PhantomData))
+}
+impl Drop for DeferredEntry {
+    fn drop(&mut self) {
+        control(4).expect("balanced current-thread entry deferral");
+    }
+}
+
 /// Define a complete native entry around a no-argument C dispatcher.
 /// It starts masked; the dispatcher may enable nested entries after setting policy.
 /// Stack use is 1904 bytes plus the dispatcher. IPC data and handle metadata survive.

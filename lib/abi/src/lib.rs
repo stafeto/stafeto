@@ -257,6 +257,8 @@ pub enum Call {
     /// Register the current thread's upcall entry (zero disables it).
     ThreadUpcallBind = 31,
     /// Current upcall control: 0 masks, 1 enables, 2 takes original PC/PSTATE.
+    /// 3 starts an entry deferral; 4 ends one. Deferral preserves the mask
+    /// and interrupts enabled IPC waits while delaying dispatcher execution.
     /// x1 returns the previous mask; TAKE returns PC in x2 and PSTATE in x3.
     ThreadUpcallControl = 32,
     /// Request an upcall through a MANAGE thread handle.
