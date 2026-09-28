@@ -127,9 +127,15 @@ impl Client {
     /// Exclusive observation consumer for this subscribed session. Consuming
     /// the interval peak starts a new interval at the sampled current date.
     pub fn observe(&self) -> Result<Observation, Status> {
+        let nonce = nonce()?;
+        let value = self.observe_retained(nonce)?;
+        self.ack(nonce)?;
+        Ok(value)
+    }
+    fn observe_retained(&self, nonce: u64) -> Result<Observation, Status> {
         let mut request = Writer::new();
         Method::Observe.header().write(&mut request)?;
-        request.u64(nonce()?)?;
+        request.u64(nonce)?;
         let mut buffer = [0; MESSAGE_MAX];
         let mut reader = Reader::new(self.call(request.as_bytes(), &mut buffer)?);
         reader.u32()?;
@@ -148,7 +154,7 @@ impl Client {
         if time.value().is_err() || !(1..=1_000_000_000).contains(&resolution) {
             return Err(Status::BadSize);
         }
-        Ok(Observation {
+        let value = Observation {
             anchor: Anchor {
                 time,
                 mono,
@@ -156,7 +162,8 @@ impl Client {
                 generation,
             },
             peak,
-        })
+        };
+        Ok(value)
     }
     pub fn set(&self, time: Time) -> Result<(), Status> {
         time.value()
@@ -167,7 +174,11 @@ impl Client {
         request.u64(nonce)?;
         request.u64(time.seconds as u64)?;
         request.u64(time.nanos as u64)?;
-        self.unit(request.as_bytes())?;
+        let result = self.unit(request.as_bytes());
+        self.ack(nonce)?;
+        result
+    }
+    fn ack(&self, nonce: u64) -> Result<(), Status> {
         let mut ack = Writer::new();
         Method::Ack.header().write(&mut ack)?;
         ack.u64(nonce)?;
@@ -181,10 +192,27 @@ impl Client {
         thread: &Handle<rt::handle::Thread>,
         method: Method,
     ) -> Result<(), Status> {
+        self.probe_arm(thread, method, false)
+    }
+    #[cfg(feature = "transport-probe")]
+    pub fn probe_upcall(
+        &self,
+        thread: &Handle<rt::handle::Thread>,
+        method: Method,
+    ) -> Result<(), Status> {
+        self.probe_arm(thread, method, true)
+    }
+    #[cfg(feature = "transport-probe")]
+    fn probe_arm(
+        &self,
+        thread: &Handle<rt::handle::Thread>,
+        method: Method,
+        upcall: bool,
+    ) -> Result<(), Status> {
         let mut request = Writer::new();
         proto_wire::Header {
             version: proto_clock::VERSION,
-            method: 4,
+            method: if upcall { 8 } else { 4 },
         }
         .write(&mut request)?;
         request.u32(method as u32)?;
@@ -198,6 +226,50 @@ impl Client {
             return Err(Status::BadSize);
         }
         Ok(())
+    }
+    #[cfg(feature = "transport-probe")]
+    pub fn probe_observe(&self, nonce: u64) -> Result<Observation, Status> {
+        self.observe_retained(nonce)
+    }
+    #[cfg(feature = "transport-probe")]
+    pub fn probe_ack(&self, nonce: u64) -> Result<(), Status> {
+        self.ack(nonce)
+    }
+    #[cfg(feature = "transport-probe")]
+    pub fn probe_reject(&self, reject: bool) -> Result<(), Status> {
+        let mut request = Writer::new();
+        proto_wire::Header {
+            version: proto_clock::VERSION,
+            method: 9,
+        }
+        .write(&mut request)?;
+        request.u32(u32::from(reject))?;
+        self.unit(request.as_bytes())
+    }
+    #[cfg(feature = "transport-probe")]
+    pub fn probe_pressure(&self, hold: bool) -> Result<(), Status> {
+        let mut request = Writer::new();
+        proto_wire::Header {
+            version: proto_clock::VERSION,
+            method: 11,
+        }
+        .write(&mut request)?;
+        request.u32(u32::from(hold))?;
+        self.unit(request.as_bytes())
+    }
+    #[cfg(feature = "transport-probe")]
+    pub fn probe_stats(&self) -> Result<(u64, u64, u64, u64), Status> {
+        let request = proto_wire::Header {
+            version: proto_clock::VERSION,
+            method: 10,
+        }
+        .bytes();
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut reader = Reader::new(self.call(&request, &mut buffer)?);
+        reader.u32()?;
+        let value = (reader.u64()?, reader.u64()?, reader.u64()?, reader.u64()?);
+        reader.finish()?;
+        Ok(value)
     }
     /// Exercise retained operations and malformed bodies without acknowledging.
     #[cfg(feature = "transport-probe")]

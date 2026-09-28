@@ -26,6 +26,8 @@ mod cancellation;
 #[cfg(not(feature = "cancel-input"))]
 mod capacity;
 #[cfg(not(feature = "cancel-input"))]
+mod clock_replies;
+#[cfg(not(feature = "cancel-input"))]
 mod clocks;
 #[cfg(not(feature = "cancel-input"))]
 mod file_replies;
@@ -123,7 +125,7 @@ fn failed(stage: usize) -> bool {
 }
 
 #[cfg(not(feature = "cancel-input"))]
-fn run(clocks: &clocks::Peers) -> bool {
+fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let mut child = 0;
     let mut value = ptr::null_mut();
     let errno = unsafe { abi::__errno_location() };
@@ -269,6 +271,7 @@ fn run(clocks: &clocks::Peers) -> bool {
         || !reentry::run()
         || !file_replies::run()
         || !thread_replies::run()
+        || !clock_replies::run(parent)
         || !cancellation::run()
     {
         return false;
@@ -321,7 +324,7 @@ fn main(_: u64) -> u64 {
         }
         #[cfg(not(feature = "cancel-input"))]
         {
-            run(&clocks)
+            run(&clocks, &start.parent)
         }
     });
     if !passed {

@@ -20,3 +20,4 @@ proto-wire = { path = "../../proto/wire" }
 posix-time = { path = "../../lib/posix-time" }
 proto-init = { path = "../../proto/init" }
 rt = { path = "../../lib/rt" }
+posix-heap = { path = "../../lib/posix-heap" }
