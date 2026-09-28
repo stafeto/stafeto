@@ -20,6 +20,13 @@ _Static_assert(sizeof(pthread_t) == 8, "pthread ID ABI");
 _Static_assert(sizeof(sigset_t) == 8, "signal set ABI");
 _Static_assert(sizeof(struct sigaction) == 24, "signal action ABI");
 _Static_assert(offsetof(struct sigaction, sa_flags) == 16, "signal flags offset");
+_Static_assert(offsetof(struct sigaction, sa_sigaction) == 0, "handler union ABI");
+_Static_assert(sizeof(stack_t) == 24, "signal stack ABI");
+_Static_assert(sizeof(mcontext_t) == 800, "machine context ABI");
+_Static_assert(_Alignof(mcontext_t) == 16, "machine context alignment");
+_Static_assert(offsetof(mcontext_t, vectors) == 272, "vector context offset");
+_Static_assert(sizeof(ucontext_t) == 848, "user context ABI");
+_Static_assert(offsetof(ucontext_t, uc_mcontext) == 48, "machine context offset");
 _Static_assert(sizeof(union sigval) == 8, "signal value ABI");
 _Static_assert(sizeof(siginfo_t) == 40, "signal information ABI");
 _Static_assert(_Alignof(siginfo_t) == 8, "signal information alignment");
@@ -62,6 +69,26 @@ static void signal_handler(int sig) {
     if (getpid() <= 1 || getppid() != 1) signal_bad = 1;
     errno = 901;
 }
+static volatile sig_atomic_t info_calls;
+static volatile sig_atomic_t info_bad;
+static void info_handler(int sig, siginfo_t *info, void *raw) {
+    ucontext_t *context = raw;
+    sigset_t mask;
+    struct sigaction previous;
+    if (sig != SIGUSR1 || !info || !context || info->si_signo != sig
+            || info->si_code != SI_THREAD || info->si_errno || info->si_value.sival_ptr
+            || context->uc_link || context->uc_sigmask || context->uc_stack.ss_sp
+            || context->uc_stack.ss_size || context->uc_stack.ss_flags != SS_DISABLE
+            || !context->uc_mcontext.sp || context->uc_mcontext.sp % 16
+            || !context->uc_mcontext.pc || context->uc_mcontext.pc % 4
+            || pthread_sigmask(-99, NULL, &mask) || !sigismember(&mask, SIGUSR1)
+            || sigaction(SIGUSR1, NULL, &previous) || previous.sa_handler != SIG_DFL
+            || (previous.sa_flags & SA_SIGINFO)) info_bad = 1;
+    info_calls++;
+    sigemptyset(&context->uc_sigmask);
+    sigaddset(&context->uc_sigmask, SIGUSR2);
+    errno = 901;
+}
 static int signals(void) {
     sigset_t set, old, pending;
     struct sigaction action = { .sa_handler = signal_handler, .sa_mask = 0, .sa_flags = 0 }, previous;
@@ -83,7 +110,7 @@ static int signals(void) {
             || sigismember(&old, SIGKILL) || sigismember(&old, SIGSTOP)) return 159;
     if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)) return 160;
     if (sigaddset(&set, 0) != -1 || errno != EINVAL || set) return 161;
-    action.sa_flags = 4;
+    action.sa_flags = 8;
     previous.sa_handler = signal_handler;
     previous.sa_mask = 123;
     previous.sa_flags = 456;
@@ -120,6 +147,16 @@ static int signals(void) {
             || sigpending(&pending) || pending || signal_calls != 1) return 172;
     if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)
             || signal(SIGUSR1, SIG_DFL) != signal_handler) return 167;
+    action.sa_sigaction = info_handler;
+    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    if (sigaction(SIGUSR1, &action, &previous) || previous.sa_handler != SIG_DFL
+            || sigaction(SIGUSR1, NULL, &previous) || previous.sa_sigaction != info_handler
+            || previous.sa_flags != (SA_SIGINFO | SA_RESETHAND)) return 173;
+    errno = 777;
+    if (raise(SIGUSR1) || info_calls != 1 || info_bad || errno != 777
+            || pthread_sigmask(-99, NULL, &set) || !sigismember(&set, SIGUSR2)
+            || sigismember(&set, SIGUSR1)) return 174;
+    if (sigemptyset(&set) || pthread_sigmask(SIG_SETMASK, &set, NULL)) return 175;
     return 0;
 }
 

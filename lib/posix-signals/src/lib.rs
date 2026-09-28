@@ -9,7 +9,7 @@ pub const DEFAULT: u64 = 0;
 pub const IGNORE: u64 = 1;
 pub const VALID: SigSet = (1 << 31) - 1;
 pub const UNBLOCKABLE: SigSet = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
-pub const FLAGS: i32 = SA_NODEFER | SA_RESETHAND;
+pub const FLAGS: i32 = SA_NODEFER | SA_RESETHAND | SA_SIGINFO;
 pub const INITIAL: SigAction = SigAction {
     handler: DEFAULT,
     mask: 0,
@@ -226,7 +226,7 @@ mod tests {
             assert!(actions.replace(signal, caught(0, 0)).is_err());
         }
         for action in [
-            caught(4, 0),
+            caught(8, 0),
             caught(0, 1 << 63),
             SigAction {
                 handler: u64::MAX,
@@ -335,7 +335,9 @@ mod tests {
         let mut thread = Thread::new(0);
         thread.ready = true;
         for signal in [SIGUSR1, SIGILL, SIGTRAP] {
-            actions.replace(signal, caught(SA_RESETHAND, 0)).unwrap();
+            actions
+                .replace(signal, caught(SA_RESETHAND | SA_SIGINFO, 0))
+                .unwrap();
             thread.mask = 0;
             thread.generate(signal, &actions).unwrap();
             thread.take(&mut actions).unwrap();
@@ -344,7 +346,7 @@ mod tests {
                 if signal == SIGUSR1 {
                     INITIAL
                 } else {
-                    caught(SA_RESETHAND, 0)
+                    caught(SA_RESETHAND | SA_SIGINFO, 0)
                 }
             );
         }

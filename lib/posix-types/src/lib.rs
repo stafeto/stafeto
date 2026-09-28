@@ -19,6 +19,48 @@ pub struct SigAction {
     pub flags: i32,
 }
 
+/// Alternate signal stack descriptor. No alternate stack is enabled yet.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SignalStack {
+    pub ss_sp: *mut core::ffi::c_void,
+    pub ss_size: usize,
+    pub ss_flags: i32,
+}
+
+/// AArch64 machine context. Field names are stafeto ABI extensions; TLS and
+/// the native IPC address remain private to the runtime's return frame.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct MachineContext {
+    pub registers: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
+    pub pstate: u64,
+    pub vectors: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
+}
+
+/// Context interrupted by signal delivery, valid throughout that handler.
+/// uc_link is null for a signal frame; uc_stack describes the disabled
+/// alternate signal stack. getcontext/setcontext are not implemented yet.
+#[repr(C)]
+pub struct UserContext {
+    pub uc_link: *mut UserContext,
+    pub uc_sigmask: SigSet,
+    pub uc_stack: SignalStack,
+    pub uc_mcontext: MachineContext,
+}
+const _: () = {
+    assert!(core::mem::size_of::<SignalStack>() == 24);
+    assert!(core::mem::size_of::<MachineContext>() == 800);
+    assert!(core::mem::offset_of!(MachineContext, vectors) == 272);
+    assert!(core::mem::size_of::<UserContext>() == 848);
+    assert!(core::mem::align_of::<UserContext>() == 16);
+    assert!(core::mem::offset_of!(UserContext, uc_mcontext) == 48);
+};
+
 /// Fixed-width signal information, matching the AArch64 C siginfo_t layout.
 /// si_value stores the object representation of the C union sigval. Sources
 /// initialize all eight bytes; pointer and integer interpretations belong to

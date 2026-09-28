@@ -160,10 +160,13 @@ impl Registry {
                     .signal
                     .take(&mut self.signals)
                     .map_or(pair(0, 0), |(signal, action)| {
-                        pair(
+                        let mut snapshot = pair(
                             signal as u64 | ((action.flags as u64) << 32),
                             action.handler,
-                        )
+                        );
+                        snapshot[2..]
+                            .copy_from_slice(&posix_types::SigInfo::thread(signal).words());
+                        snapshot
                     }))
             }
             ATTACHED => {
