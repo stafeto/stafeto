@@ -200,6 +200,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-shared-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-fs",
+ "rt",
+]
+
+[[package]]
 name = "posix-tls-probe"
 version = "0.1.0"
 dependencies = [

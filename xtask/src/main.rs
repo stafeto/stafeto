@@ -61,6 +61,16 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
 ];
+const POSIX_SHARED_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-abi-probe",
+        "posix-shared-probe",
+        CHILD_STACK_SIZE,
+        &[],
+    ),
+];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
@@ -473,6 +483,7 @@ commands:
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-abi run a C main against Rust POSIX and verify thread-local errno
+  posix-shared verify cross-thread Rust POSIX file and directory state
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -496,6 +507,7 @@ fn main() {
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
         Some("posix-abi") => posix_abi_probe(),
+        Some("posix-shared") => posix_shared_probe(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -987,7 +999,25 @@ fn posix_abi_probe() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
-    println!("Rust POSIX C ABI and thread-local errno guest probes passed");
+    posix_shared_probe()?;
+    println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
+    Ok(())
+}
+
+fn posix_shared_probe() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-shared.img",
+        &POSIX_SHARED_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: posix-abi-probe ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    qemu::expect_marker(&output, "posix-shared-probe: ok")?;
+    println!("Rust POSIX shared-file guest probe passed");
     Ok(())
 }
 
@@ -2624,6 +2654,8 @@ fn ci() -> Result<(), String> {
         "posix-abi-probe",
         "--package",
         "posix-tls-probe",
+        "--package",
+        "posix-shared-probe",
         "--package",
         "ext4ro",
         "--package",

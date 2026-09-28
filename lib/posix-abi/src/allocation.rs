@@ -44,8 +44,9 @@ static STACK: Stack<16384> = Stack::new();
 /// The process heap reserves BASE..LIMIT; 0xa00000 is the worker message buffer.
 ///
 /// # Safety
-/// Called while startup has exclusive access, before any other program thread
-/// exists. The reserved heap and worker message ranges must be unused.
+/// Called while startup has exclusive heap initialization access, before any
+/// client thread uses allocation. Other runtime owners do not use this heap.
+/// The reserved heap and worker message ranges must be unused.
 pub unsafe fn init(process: Handle<Process>) -> Result<(), rt::abi::Error> {
     if READY.load(Ordering::Acquire) {
         return Err(rt::abi::Error::BadState);
@@ -69,14 +70,15 @@ pub unsafe fn init(process: Handle<Process>) -> Result<(), rt::abi::Error> {
                 0xa00000,
             )
         }?;
+        READY.store(true, Ordering::Release);
         sys::thread_start(&thread)
     })();
     if result.is_err() {
+        READY.store(false, Ordering::Release);
         // SAFETY: thread creation/start failed, so no worker can access the config.
         unsafe { *CONFIG.0.get() = None };
         return result;
     }
-    READY.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -167,6 +169,7 @@ fn perform(heap: &mut Allocator, words: [u64; 8]) -> Result<usize, Error> {
 }
 
 extern "C" fn worker(_: u64) -> ! {
+    assert!(READY.load(Ordering::Acquire), "published heap owner");
     let mut heap = Allocator::new();
     loop {
         let Ok(sys::Received::Message {
