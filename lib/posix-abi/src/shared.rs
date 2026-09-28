@@ -271,7 +271,10 @@ pub(crate) fn dispatch<'a>(
         }
         let mut encoded = Writer::new();
         request.write(&mut encoded).map_err(request_error)?;
-        let reply = sys::send(channel(), encoded.as_bytes()).map_err(|_| EIO)?;
+        let reply = sys::send(channel(), encoded.as_bytes()).map_err(|error| match error {
+            rt::abi::Error::Interrupted => EINTR,
+            _ => EIO,
+        })?;
         if !reply.handles.is_empty() {
             return Err(EIO);
         }

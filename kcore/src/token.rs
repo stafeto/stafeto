@@ -10,9 +10,9 @@
 //! number in bits 0-15 and the count in bits 16-63, as a handle carries its
 //! generation (spec 5.1). So a token is given out at most once in the life
 //! of the system, and since the first count is 1, no token is 0. A thread
-//! that ends while it waits for a reply marks its entry: the token of that
-//! request gets PEER_CLOSED from then on, until the number goes to another
-//! thread (spec 6.8). An entry whose count reached MAX_COUNT retires when
+//! that ends or is interrupted while it waits for a reply marks its entry:
+//! that request gets PEER_CLOSED until the next accepted request or number
+//! reuse; then its stale count gets BAD_STATE (spec 6.8). An entry whose count reached MAX_COUNT retires when
 //! its thread goes. Numbers never handed out come first, in order, then
 //! those given back, in the order they came back. Every operation takes
 //! constant time, nothing allocates, and a new table is all zeros (spec
@@ -29,8 +29,7 @@ pub const MAX_COUNT: u64 = (1 << (u64::BITS - INDEX_BITS)) - 1;
 
 /// The bit of an entry's word that says it names a thread.
 const TAKEN: u64 = 1 << 63;
-/// The bit of an entry's word that says its thread ended while it waited
-/// for the reply to its last accepted request.
+/// The bit that marks the last accepted request as abandoned.
 const DEAD: u64 = 1 << 62;
 /// The end of the list of numbers given back, which names number i as
 /// i + 1.
@@ -187,18 +186,18 @@ impl<T, const N: usize> Table<T, N> {
 
     /// A service accepts a request of the thread on `index` (spec 6.1):
     /// the count grows by 1, and the token of the request carries it.
+    /// A prior abandoned request loses its DEAD mark with the new count.
     /// `check_count` let the request in.
     pub fn accept(&mut self, index: u16) -> u64 {
         self.check_count(index)
             .expect("a thread with no count left sent a request");
         let e = &mut self.entries[usize::from(index)];
-        e.word += 1;
+        e.word = (e.word & !DEAD) + 1;
         (e.word & MAX_COUNT) << INDEX_BITS | u64::from(index)
     }
 
-    /// The thread on `index` ended while it waited for the reply to its
-    /// last accepted request (sched::exit, spec 6.8): the entry keeps a
-    /// mark until `alloc` hands the number out again.
+    /// Abandon the last accepted request of the thread on `index`.
+    /// The mark lasts until its next accepted request or number reuse.
     pub fn mark_dead(&mut self, index: u16) {
         self.taken(index);
         self.entries[usize::from(index)].word |= DEAD;
@@ -207,7 +206,7 @@ impl<T, const N: usize> Table<T, N> {
     /// The thread whose accepted request `token` names (reply, spec 6.1):
     /// BAD_STATE for a number outside the table, for count 0, and for a
     /// count other than the last its entry gave; PEER_CLOSED for the last
-    /// count of an entry whose thread ended while it waited for this reply
+    /// count of an entry whose request was abandoned before its reply
     /// (`mark_dead`), however often it is asked; BAD_STATE for a free
     /// number otherwise.
     pub fn check(&self, token: u64) -> Result<NonNull<T>, Error> {
@@ -254,6 +253,25 @@ mod tests {
     /// Threads as the table sees them: addresses it never reads.
     fn thread(n: usize) -> NonNull<u8> {
         NonNull::new((n + 1) as *mut u8).expect("not null")
+    }
+
+    #[test]
+    fn interrupted_request_does_not_poison_the_next_token() {
+        let mut table = Table::<u8, 1>::new();
+        let client = thread(0);
+        let index = table.alloc(client).unwrap();
+        let first = table.accept(index);
+        table.mark_dead(index);
+        assert_eq!(table.check(first), Err(Error::PeerClosed));
+        assert_eq!(table.check(first), Err(Error::PeerClosed));
+        let second = table.accept(index);
+        assert_ne!(first, second);
+        assert_eq!(table.check(second), Ok(client));
+        assert_eq!(table.check(first), Err(Error::BadState));
+        table.mark_dead(index);
+        assert_eq!(table.check(second), Err(Error::PeerClosed));
+        table.free(index);
+        assert_eq!(table.check(second), Err(Error::PeerClosed));
     }
 
     #[test]

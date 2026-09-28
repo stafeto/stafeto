@@ -251,11 +251,14 @@ pub enum Call {
     /// x1 limits consumption to 1..=8 bytes (zero retains the original limit 8).
     /// Returns count in x1 and packed bytes in x2; excess input stays queued.
     ConsolePoll = 29,
+    /// Interrupt the current IPC wait of x0, a thread with MANAGE.
+    /// Wakes it with Interrupted; BadState if it is not waiting in IPC.
+    ThreadInterrupt = 30,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 29] = [
+    pub const ALL: [Call; 30] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -285,6 +288,7 @@ impl Call {
         Call::ObjectInfo,
         Call::DebugWrite,
         Call::ConsolePoll,
+        Call::ThreadInterrupt,
     ];
 
     pub const fn number(self) -> u16 {
@@ -294,7 +298,7 @@ impl Call {
     /// The call with this number, if any.
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
-            1..=29 => Some(Self::ALL[number as usize - 1]),
+            1..=30 => Some(Self::ALL[number as usize - 1]),
             _ => None,
         }
     }
@@ -1095,6 +1099,8 @@ pub enum Error {
     PeerClosed,
     WouldBlock,
     BadState,
+    /// The current IPC wait was interrupted through a MANAGE thread handle.
+    Interrupted,
     /// A code this abi does not know, which a later kernel may return; it
     /// is above the codes of `KNOWN`. The kernel this abi comes with never
     /// returns one.
@@ -1103,7 +1109,7 @@ pub enum Error {
 
 impl Error {
     /// The errors this abi knows, in the order of their codes from 1.
-    pub const KNOWN: [Error; 9] = [
+    pub const KNOWN: [Error; 10] = [
         Error::BadHandle,
         Error::WrongType,
         Error::AccessDenied,
@@ -1113,6 +1119,7 @@ impl Error {
         Error::PeerClosed,
         Error::WouldBlock,
         Error::BadState,
+        Error::Interrupted,
     ];
 
     /// The code of the error in x0.
@@ -1127,6 +1134,7 @@ impl Error {
             Error::PeerClosed => 7,
             Error::WouldBlock => 8,
             Error::BadState => 9,
+            Error::Interrupted => 10,
             Error::Unknown(code) => code,
         }
     }
@@ -1136,7 +1144,7 @@ impl Error {
     pub const fn from_code(code: u64) -> Option<Error> {
         match code {
             0 => None,
-            1..=9 => Some(Self::KNOWN[code as usize - 1]),
+            1..=10 => Some(Self::KNOWN[code as usize - 1]),
             _ => Some(Error::Unknown(code)),
         }
     }
@@ -1145,7 +1153,7 @@ impl Error {
     /// error stay in the caller's table (spec 6.1): they do when the call
     /// refused the message before it moved them (INVALID_ARGS, BAD_HANDLE,
     /// WRONG_TYPE, ACCESS_DENIED, BAD_STATE, WOULD_BLOCK), and they are gone
-    /// with PEER_CLOSED, LIMIT_REACHED and NO_MEMORY. A code of a later
+    /// with PEER_CLOSED, LIMIT_REACHED, NO_MEMORY and INTERRUPTED. A code of a later
     /// kernel counts as gone: a value that stays names no other object
     /// (spec 5.1), where one given back would be closed twice.
     pub const fn keeps_handles(self) -> bool {
@@ -1156,7 +1164,11 @@ impl Error {
             | Error::AccessDenied
             | Error::BadState
             | Error::WouldBlock => true,
-            Error::PeerClosed | Error::LimitReached | Error::NoMemory | Error::Unknown(_) => false,
+            Error::PeerClosed
+            | Error::LimitReached
+            | Error::NoMemory
+            | Error::Interrupted
+            | Error::Unknown(_) => false,
         }
     }
 }
@@ -1230,13 +1242,13 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one() {
-        assert_eq!(Call::ALL.len(), 29);
+        assert_eq!(Call::ALL.len(), 30);
         for (i, call) in Call::ALL.iter().enumerate() {
             assert_eq!(call.number(), i as u16 + 1);
             assert_eq!(Call::from_number(call.number()), Some(*call));
             assert!(!TEST_CALLS.contains(&call.number()));
         }
-        for n in [0, 30, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [0, 31, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
             assert_eq!(Call::from_number(n), None);
         }
     }
@@ -1252,6 +1264,7 @@ mod tests {
         assert_eq!(Call::ObjectInfo.number(), 27);
         assert_eq!(Call::DebugWrite.number(), 28);
         assert_eq!(Call::ConsolePoll.number(), 29);
+        assert_eq!(Call::ThreadInterrupt.number(), 30);
         assert_eq!(RESULT_VALUES, 9);
     }
 
@@ -1635,7 +1648,7 @@ mod tests {
 
     #[test]
     fn unknown_error_codes_come_back_as_they_are() {
-        for code in [10, 1 << 32, u64::MAX] {
+        for code in [11, 1 << 32, u64::MAX] {
             assert_eq!(Error::from_code(code), Some(Error::Unknown(code)));
             assert_eq!(Error::Unknown(code).code(), code);
         }
@@ -1657,7 +1670,7 @@ mod tests {
         assert!(!Error::PeerClosed.keeps_handles());
         assert!(!Error::LimitReached.keeps_handles());
         assert!(!Error::NoMemory.keeps_handles());
-        assert!(!Error::Unknown(10).keeps_handles());
+        assert!(!Error::Unknown(11).keeps_handles());
     }
 
     #[test]

@@ -44,6 +44,7 @@ fn error(error: FsError) -> c_int {
         FsError::NameTooLong => ENAMETOOLONG,
         FsError::InvalidArgument => EINVAL,
         FsError::UnsupportedEncoding => EILSEQ,
+        FsError::Interrupted => EINTR,
         FsError::Io => EIO,
     }
 }

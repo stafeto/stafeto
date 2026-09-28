@@ -77,6 +77,15 @@ the receiver runs at once, when its level after the boost is above the
 cleanup queue's and every ready thread's and no interrupt is pending; the
 state is the one the slow path leaves.
 
+ThreadInterrupt removes a live thread's current IPC wait and wakes it with
+Interrupted, keeping its thread number and message buffer. Queue removal,
+accepted-token marking and wakeup take O(1) under the scheduler lock. After
+the lock it releases the wait reference and up to four transit handles at
+the caller's effective priority. Closing a transferred RECEIVE handle can
+queue bounded cleanup as described above. No queue is scanned and no memory
+is allocated. The next accepted request increments the token count and clears
+the abandoned-request mark, making old tokens stale without number reuse.
+
 From part 1.3b on, the timers of programs stand in binary heaps, their
 nodes inside the timer objects (spec 10), and from part 1.3e on in a heap
 for each level of 1-63, the priority of the timer's slot: arming, moving,

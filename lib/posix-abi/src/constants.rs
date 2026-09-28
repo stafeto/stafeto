@@ -7,6 +7,7 @@ pub const ABI_VERSION: u32 = 1;
 pub const STAFETO_ERRNO_OFFSET: u32 = 16;
 pub const SYSROOT_VERSION: &str = "0.1.0";
 pub const ENOENT: i32 = 2;
+pub const EINTR: i32 = 4;
 pub const EIO: i32 = 5;
 pub const ENXIO: i32 = 6;
 pub const EBADF: i32 = 9;

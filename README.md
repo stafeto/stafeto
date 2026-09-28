@@ -269,6 +269,8 @@ installs the Rust version, components, and targets itself from
 | `cargo xtask posix-input` | verifies file and heap progress during a UART input wait, descriptor reuse, stdin redirection and burst reads; included in `posix-abi` and `ci` |
 | `cargo xtask posix-input-vz` | verifies the same scenario through native Virtio input on Apple silicon without QEMU; requires Virtualization.framework |
 | `cargo xtask posix-shared` | verifies shared Rust file state and errno, rejects malformed messages before heap startup, and checks full message payloads; included in `posix-abi` and `ci` |
+| `cargo xtask posix-interrupt` | verifies IPC wait interruption, transfer cleanup, reply-token reuse and Rust POSIX EINTR on UART; included in `posix-abi` and `ci` |
+| `cargo xtask posix-interrupt-vz` | verifies the same IPC cases and Virtio read interruption, including timer/channel cleanup, on Apple silicon |
 | `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
 | `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
 | `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |

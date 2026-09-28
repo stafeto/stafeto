@@ -339,7 +339,8 @@ mod tests {
             assert_eq!(Status::from_code(e.code() as u32), Status::Kernel(e));
             assert_eq!(Status::from(e), Status::Kernel(e));
         }
-        assert_eq!(Status::from_code(10), Status::Kernel(Error::Unknown(10)));
+        assert_eq!(Status::from_code(10), Status::Kernel(Error::Interrupted));
+        assert_eq!(Status::from_code(11), Status::Kernel(Error::Unknown(11)));
         assert_eq!(Status::from_code(255), Status::Kernel(Error::Unknown(255)));
         for (status, code) in [
             (Status::UnknownMethod, 256),

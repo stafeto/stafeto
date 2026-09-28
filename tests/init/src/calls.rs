@@ -327,7 +327,7 @@ pub(crate) fn written(line: &[u8]) -> bool {
 /// (spec 11), those of the kernel's test builds too.
 fn unknown_system_calls_fail() -> Outcome {
     unknown::<0>()?;
-    unknown::<29>()?;
+    unknown::<31>()?;
     unknown::<0xFEFF>()?;
     unknown::<{ *abi::TEST_CALLS.start() }>()?;
     unknown::<{ *abi::TEST_CALLS.end() }>()
