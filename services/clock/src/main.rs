@@ -135,7 +135,7 @@ impl Service<0> for Clocks {
     #[cfg(feature = "transport-probe")]
     const METHODS: &'static [u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
     type Data = Data;
-    fn request(&mut self, s: &mut Session<Data, 0>, r: &mut Request<'_>) -> Answer {
+    fn request(&mut self, _s: &mut Session<Data, 0>, r: &mut Request<'_>) -> Answer {
         #[cfg(feature = "transport-probe")]
         if r.method() == 11 {
             let mut body = r.body();
@@ -193,14 +193,14 @@ impl Service<0> for Clocks {
             if body.finish().is_err()
                 || r.handles.len() != 1
                 || ![2, 3, 7].contains(&method)
-                || s.data.interrupt.is_some()
+                || _s.data.interrupt.is_some()
             {
                 return Answer::Status(Status::BadSize);
             }
             let Ok(thread) = r.handles.take::<rt::handle::Thread>(0) else {
                 return Answer::Status(Status::BadSize);
             };
-            s.data.interrupt = Some((method as u16, r.method() == 8, thread));
+            _s.data.interrupt = Some((method as u16, r.method() == 8, thread));
             return Answer::Status(Status::Ok);
         }
         if r.method() == Method::Watch as u16 {
@@ -294,7 +294,7 @@ impl Service<0> for Clocks {
                 };
                 #[cfg(feature = "transport-probe")]
                 if result.is_ok() {
-                    interrupt(&mut s.data, Method::Set);
+                    interrupt(&mut _s.data, Method::Set);
                 }
                 status(result)
             }
@@ -312,7 +312,7 @@ impl Service<0> for Clocks {
                 let result = Ok(());
                 #[cfg(feature = "transport-probe")]
                 if result.is_ok() {
-                    interrupt(&mut s.data, Method::Ack);
+                    interrupt(&mut _s.data, Method::Ack);
                 }
                 status(result)
             }
@@ -365,7 +365,7 @@ impl Service<0> for Clocks {
                 };
                 #[cfg(feature = "transport-probe")]
                 if nonce.is_some() {
-                    interrupt(&mut s.data, Method::Observe);
+                    interrupt(&mut _s.data, Method::Observe);
                 }
                 let w = r.reply();
                 if w.u32(0)
