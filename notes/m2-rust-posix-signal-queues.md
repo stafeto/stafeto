@@ -69,6 +69,14 @@ scope, cross-PID acceptance, wrapped serials, incorrect exit cleanup,
 reused acceptance, wrong usage accounting, missing signal 64, lost sender
 UID and permission granted by the target effective UID.
 All mutation sources were restored before final verification.
+Full cargo xtask ci passed on d5390fe: kcore 402, init 224, kernel
+166/177 and all existing POSIX/BusyBox probes, licenses and hot paths.
+The normal kernel remains 154708 bytes, below 204800. Thread/C/standalone
+images remain 716800/573440/589824. Normal ticks remain
+237/296/361/842/1761; icount IPC remains 245/467/1936/2125/3034/4209.
+Driver 673, bind 726/762, ack 205 and portion 247 match #66.
+This checks guest regressions; the new queue is verified on the host.
+No fresh VZ/HVF run or runtime queue latency was measured in this step.
 
 ## Integration still required
 
