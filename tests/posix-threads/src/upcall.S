@@ -109,9 +109,13 @@ msr nzcv, x10
 mov x10, #1
 stlr x10, [x9]
 mov x10, #0
+.global native_upcall_loop
+native_upcall_loop:
 2:
 ldr x10, [x9, #8]
 cbz x10, 2b
+.global native_upcall_resume
+native_upcall_resume:
 str x11, [sp, #664]
 ldr x11, [sp, #0]
 str x0, [x11, #0]
@@ -202,3 +206,8 @@ ldp x27, x28, [sp, #80]
 ldp x29, x30, [sp, #96]
 add sp, sp, #672
 ret
+
+.global native_upcall_redirect
+native_upcall_redirect:
+mov x0, #0xf00d
+b native_upcall_resume

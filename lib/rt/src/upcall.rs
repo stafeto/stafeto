@@ -5,6 +5,30 @@
 use crate::sys;
 use abi::{Call, Error};
 
+/// Saved AArch64 execution state passed by a context-aware entry trampoline.
+/// The frame is live only until the dispatcher returns. The kernel validates
+/// SP, PC, user PSTATE and the IPC address before restoring it.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct Context {
+    pub registers: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
+    pub pstate: u64,
+    pub tls: u64,
+    pub ipc: u64,
+    pub vectors: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
+}
+const _: () = {
+    assert!(core::mem::size_of::<Context>() == abi::UPCALL_CONTEXT_SIZE);
+    assert!(core::mem::offset_of!(Context, sp) == 248);
+    assert!(core::mem::offset_of!(Context, pc) == 256);
+    assert!(core::mem::offset_of!(Context, vectors) == 288);
+    assert!(core::mem::offset_of!(Context, fpcr) == 800);
+};
+
 fn control(operation: u64) -> Result<bool, Error> {
     // SAFETY: control touches only current-thread delivery state.
     let result = unsafe {
@@ -72,12 +96,21 @@ impl Drop for DeferredEntry {
     }
 }
 
-/// Define a complete native entry around a no-argument C dispatcher.
+/// Define a complete native entry around a C dispatcher.
+/// `upcall_entry!(name, dispatch)` uses a no-argument dispatcher.
+/// `upcall_entry!(name, dispatch, context)` passes a live `*mut Context`.
+/// Context changes are restored on return, subject to kernel validation.
 /// It starts masked; the dispatcher may enable nested entries after setting policy.
 /// Stack use is 1904 bytes plus the dispatcher. IPC data and handle metadata survive.
 #[macro_export]
 macro_rules! upcall_entry {
     ($visibility:vis $name:ident, $dispatch:path) => {
+        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "");
+    };
+    ($visibility:vis $name:ident, $dispatch:path, context) => {
+        $crate::upcall_entry!(@frame $visibility $name, $dispatch, "mov x0, sp");
+    };
+    (@frame $visibility:vis $name:ident, $dispatch:path, $argument:literal) => {
         #[unsafe(naked)]
         $visibility unsafe extern "C" fn $name() {
             core::arch::naked_asm!(
@@ -109,7 +142,7 @@ macro_rules! upcall_entry {
                 "subs x11, x11, #16", "b.ne 2b",
                 "mov x0, #2", "svc #{control}", "cbnz x0, 9f",
                 "str x2, [sp, #256]", "str x3, [sp, #264]",
-                "bl {dispatch}",
+                $argument, "bl {dispatch}",
                 "mov x0, #0", "svc #{control}", "cbnz x0, 9f",
                 "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
                 "3:", "ldp x12, x13, [x10], #16", "stp x12, x13, [x9], #16",

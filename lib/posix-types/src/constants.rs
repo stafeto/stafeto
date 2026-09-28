@@ -65,6 +65,8 @@ pub const SIG_UNBLOCK: i32 = 2;
 pub const SIG_SETMASK: i32 = 3;
 pub const SA_NODEFER: i32 = 1;
 pub const SA_RESETHAND: i32 = 2;
+pub const SA_SIGINFO: i32 = 4;
+pub const SS_DISABLE: i32 = 2;
 // Source codes are implementation-defined numbers. Reserved standard sources
 // are declared for C applications before their generators are implemented.
 pub const SI_USER: i32 = 0;

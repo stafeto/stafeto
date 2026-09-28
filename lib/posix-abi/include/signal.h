@@ -3,6 +3,7 @@
 #ifndef STAFETO_SIGNAL_H
 #define STAFETO_SIGNAL_H
 #include <stdint.h>
+#include <stddef.h>
 #include <sys/types.h>
 #include <stafeto/abi.h>
 typedef int sig_atomic_t;
@@ -21,8 +22,29 @@ typedef struct {
     void *si_addr;
     union sigval si_value;
 } siginfo_t;
+typedef struct {
+    void *ss_sp;
+    size_t ss_size;
+    int ss_flags;
+} stack_t;
+/* Register fields are stafeto-specific AArch64 ABI extensions. */
+typedef struct {
+    uint64_t registers[31];
+    uint64_t sp, pc, pstate;
+    __uint128_t vectors[32];
+    uint64_t fpcr, fpsr;
+} mcontext_t;
+typedef struct ucontext {
+    struct ucontext *uc_link;
+    sigset_t uc_sigmask;
+    stack_t uc_stack;
+    mcontext_t uc_mcontext;
+} ucontext_t;
 struct sigaction {
-    void (*sa_handler)(int);
+    union {
+        void (*sa_handler)(int);
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t sa_mask;
     int sa_flags;
 };

@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Process dispositions and ordinary thread-directed delivery through the owner.
-//! Real-time queues, process routing, stop/continue, alternate stacks, handler
-//! siginfo/context and automatic syscall restart still require implementation.
+//! Real-time queues, process routing, stop/continue, alternate stacks and
+//! automatic syscall restart still require implementation.
 use crate::{constants::*, threads, tls};
 pub use posix_signals::{DEFAULT, IGNORE};
-pub use posix_types::{SigAction, SigInfo, SigSet};
+pub use posix_types::{MachineContext, SigAction, SigInfo, SigSet, SignalStack, UserContext};
 use rt::upcall;
 pub(crate) const ACTION: u64 = 40;
 pub(crate) const MASK: u64 = 41;
@@ -98,7 +98,8 @@ pub unsafe extern "C" fn sigismember(set: *const SigSet, signal: i32) -> i32 {
 }
 /// # Safety
 /// act is null or readable; old is null or writable. Their storage does not
-/// overlap. A catching handler remains live and obeys async-signal safety.
+/// overlap. A catching handler uses the one-argument or SA_SIGINFO signature,
+/// remains live, and obeys async-signal safety.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut SigAction) -> i32 {
     let _mask = NativeMask::new();
@@ -248,7 +249,7 @@ pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
     call(WAIT_QUERY, [thread, 0, 0, 0, 0]).map(|(value, _)| value != 0)
 }
 
-rt::upcall_entry!(entry, dispatch);
+rt::upcall_entry!(entry, dispatch, context);
 pub(crate) fn attach() -> Result<(), i32> {
     // SAFETY: this dispatcher owns no interrupted Rust references or locks. It
     // communicates with the sole owner and enters only caller-supplied C code.
@@ -257,12 +258,14 @@ pub(crate) fn attach() -> Result<(), i32> {
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     Ok(())
 }
-unsafe extern "C" fn dispatch() {
+unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
     let errno = tls::errno();
     let saved_errno = unsafe { *errno };
     loop {
         let (old_mask, _) = call(MASK, [0; 5]).expect("signal mask snapshot");
-        let (delivery, handler) = call(TAKE, [0; 5]).expect("signal delivery snapshot");
+        let words = threads::request_words(TAKE, [0; 5]).expect("signal delivery snapshot");
+        let delivery = words[0];
+        let handler = words[1];
         let signal = delivery as u32 as i32;
         if signal == 0 {
             break;
@@ -271,13 +274,62 @@ unsafe extern "C" fn dispatch() {
             // Process wait-status encoding and stop/continue need process routing.
             sys_exit_signal(signal);
         }
-        // SAFETY: sigaction/signal callers supply this live void(int) C address.
-        let callback: unsafe extern "C" fn(i32) = unsafe { core::mem::transmute(handler as usize) };
-        // Effective signal masks are installed before allowing nested entries.
-        unsafe { upcall::enable() }.expect("nested signal entry");
-        unsafe { callback(signal) };
-        upcall::mask().expect("signal handler mask restoration");
-        call(MASK, [SIG_SETMASK as u64, 1, old_mask, 0, 0]).expect("signal mask restoration");
+        let flags = (delivery >> 32) as u32 as i32;
+        let mut restore_mask = old_mask;
+        if flags & SA_SIGINFO != 0 {
+            // SAFETY: the context-aware trampoline owns this unique live frame.
+            let frame = unsafe { native.read() };
+            let mut context = UserContext {
+                uc_link: core::ptr::null_mut(),
+                uc_sigmask: old_mask,
+                uc_stack: SignalStack {
+                    ss_sp: core::ptr::null_mut(),
+                    ss_size: 0,
+                    ss_flags: SS_DISABLE,
+                },
+                uc_mcontext: MachineContext {
+                    registers: frame.registers,
+                    sp: frame.sp,
+                    pc: frame.pc,
+                    pstate: frame.pstate,
+                    vectors: frame.vectors,
+                    fpcr: frame.fpcr,
+                    fpsr: frame.fpsr,
+                },
+            };
+            let mut info = SigInfo::from_words(words[2..].try_into().unwrap());
+            // SAFETY: SA_SIGINFO registers this live three-argument C address.
+            let callback: unsafe extern "C" fn(i32, *mut SigInfo, *mut core::ffi::c_void) =
+                unsafe { core::mem::transmute(handler as usize) };
+            unsafe { upcall::enable() }.expect("nested signal entry");
+            unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+            upcall::mask().expect("signal handler mask restoration");
+            // The callback may edit the return context. Preserve private native
+            // metadata and let the kernel validate machine state on return.
+            let machine = context.uc_mcontext;
+            unsafe {
+                native.write(upcall::Context {
+                    registers: machine.registers,
+                    sp: machine.sp,
+                    pc: machine.pc,
+                    pstate: machine.pstate,
+                    vectors: machine.vectors,
+                    fpcr: machine.fpcr,
+                    fpsr: machine.fpsr,
+                    ..frame
+                });
+            }
+            restore_mask =
+                posix_signals::mask(context.uc_sigmask).expect("valid signal return mask");
+        } else {
+            // SAFETY: signal/sigaction callers supply a live void(int) C address.
+            let callback: unsafe extern "C" fn(i32) =
+                unsafe { core::mem::transmute(handler as usize) };
+            unsafe { upcall::enable() }.expect("nested signal entry");
+            unsafe { callback(signal) };
+            upcall::mask().expect("signal handler mask restoration");
+        }
+        call(MASK, [SIG_SETMASK as u64, 1, restore_mask, 0, 0]).expect("signal mask restoration");
     }
     unsafe { *errno = saved_errno };
 }

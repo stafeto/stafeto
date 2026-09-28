@@ -328,6 +328,18 @@ unsafe impl Sync for Held {}
 static HELD: Held = Held(core::cell::UnsafeCell::new([const { None }; 128]));
 static PRESSURE_RESULT: AtomicUsize = AtomicUsize::new(0);
 static PRESSURE_WAIT: AtomicBool = AtomicBool::new(false);
+unsafe extern "C" fn pressure_info_handler(signal: i32, info: *mut api::SigInfo, raw: *mut c_void) {
+    // SAFETY: SA_SIGINFO supplies live per-delivery snapshots.
+    let (info, context) = unsafe { (&*info, &*raw.cast::<api::UserContext>()) };
+    if *info != api::SigInfo::thread(signal)
+        || context.uc_sigmask != 0
+        || context.uc_mcontext.sp == 0
+        || context.uc_mcontext.pc == 0
+    {
+        ERRORS.fetch_add(1, Ordering::Release);
+    }
+    unsafe { handler(signal) };
+}
 unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     sys::receive(&channel(&GATE)).unwrap();
     ID.store(threads::pthread_self(), Ordering::Release);
@@ -356,13 +368,18 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     }
     threads::probe_interrupt_signal_reply(40);
     let mut old = posix_signals::INITIAL;
-    let mut passed = unsafe { api::sigaction(SIGUSR1, &action(0), &mut old) } == 0;
+    let info_action = SigAction {
+        handler: pressure_info_handler as *const () as u64,
+        ..action(SA_SIGINFO)
+    };
+    let mut passed = unsafe { api::sigaction(SIGUSR1, &info_action, &mut old) } == 0;
     passed &= unsafe { api::pthread_sigmask(SIG_BLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
     threads::probe_interrupt_signal_reply(42);
     passed &= api::raise(SIGUSR1) == 0 && api::raise(SIGUSR1) == 0;
     passed &= pending() == bit(SIGUSR1) && COUNT.load(Ordering::Acquire) == 0;
     threads::probe_interrupt_signal_reply(41);
     threads::probe_ack_interrupt();
+    threads::probe_interrupt_signal_reply(44);
     passed &= unsafe { api::pthread_sigmask(SIG_UNBLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
     passed &= COUNT.load(Ordering::Acquire) == 1
         && mask() == 0
@@ -436,7 +453,7 @@ fn under_pressure() -> bool {
         return failed(397);
     }
     rt::println!(
-        "signal-action-probe: full journal/handles permit actions, mask, coalesced delivery, signal-safe I/O, pending/live sigwaitinfo, interrupted replies and managed exit"
+        "signal-action-probe: full journal/handles permit actions, mask, coalesced SA_SIGINFO, signal-safe I/O, pending/live sigwaitinfo, interrupted replies and managed exit"
     );
     true
 }
