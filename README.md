@@ -112,7 +112,9 @@ user-space console driver remain future work. What works today:
   nesting. Local borrowed file state defers entry while keeping IPC interruptible.
 - **Rust POSIX ordinary signals:** C and pthread probes provide process actions,
   per-thread masks, pending sets, `raise` and `pthread_kill`, including CPU/IPC
-  delivery, inherited masks, NODEFER, RESETHAND and restored errno. Process
+  delivery, inherited masks, NODEFER, RESETHAND and restored errno. `sigwait`
+  accepts pending/live thread-directed signals without a handler, preserving
+  masks and dispositions through interruption and deferred cancellation. Process
   routing, queued signals, restart policy and stop/continue remain work.
 - **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
@@ -250,6 +252,7 @@ checks for successful calls, failures, and ABI layout.
 | Retained heap replies | Preserve allocation outcomes during nested entry, prepay each live block's record so realloc/free need no new metadata, and retain old FREE replies across address reuse. Verify failures, growth and release under exhausted handles on QEMU and Apple VZ. | ✅ [#57](https://github.com/stafeto/stafeto/pull/57) |
 | Interruptible local borrow guards | Defer native dispatch across exclusive local file references while keeping IPC interruptible; reject waits with pending requests, preserve transfer ownership and scope TLS safely. Verified on QEMU and Apple VZ. | ✅ [#58](https://github.com/stafeto/stafeto/pull/58) |
 | Rust ordinary signal actions | Add C signal sets, shared dispositions, per-thread masks and pending state, raise/pthread_kill, native CPU/IPC dispatch, inheritance, nested handlers and retained outcomes under resource pressure. Verify QEMU and Apple VZ. | ✅ [#59](https://github.com/stafeto/stafeto/pull/59) |
+| Rust synchronous signal acceptance | Add sigwait for ordinary blocked signals with atomic pending/live acceptance, directed delivery, retained replies and cancellation cleanup; verify full journal/handle pressure on QEMU and Apple VZ. Queued signals and other wait interfaces remain below. | ✅ [#60](https://github.com/stafeto/stafeto/pull/60) |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and remaining signal delivery with documented restart behavior. | 🚧 |
 | Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
 | Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
@@ -266,7 +269,7 @@ It currently covers file calls, stat metadata, directory streams, process
 allocation, directory selection, sorting, the C/POSIX locale and startup
 with an empty environment, plus initial pthread lifecycle, stack attributes
 and deferred cancellation with cleanup handlers, plus ordinary signal actions,
-thread masks, pending sets and thread-directed delivery.
+thread masks, pending sets, thread-directed delivery and synchronous acceptance.
 Console waits leave the shared file owner available;
 stdio, general ELF TLS, asynchronous cancellation and the remaining headers
 and cancellation points are pending.

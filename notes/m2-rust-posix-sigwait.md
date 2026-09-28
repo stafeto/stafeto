@@ -79,7 +79,12 @@ checks passed. Ten mutations were caught: kept pending/changed masks on
 the host; missing offer/wrong target/early ACK at 396, lost token at 429,
 lost abandonment at 446, ignored cancellation at 429, unpaid WAIT at 397,
 and missing cancellation finish at 438. Sources were restored.
-Full cargo xtask ci is required on the ready code commit before merge.
+Full cargo xtask ci passed on 8fe3984: ten signal-model tests, 400 kcore
+host tests, 221 init checks, 165/176 kernel checks, BusyBox and shipping
+hot-path verification. Normal/VZ kernels remain 154704/171072 bytes.
+Thread/C ABI/standalone images are 585728/475136/491520 bytes.
+Normal/icount IPC timings remain unchanged from #59; new signal latency
+and a fresh global blocking bound were not measured.
 
 ## Remaining requirements
 
