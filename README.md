@@ -100,6 +100,9 @@ user-space console driver remain future work. What works today:
 - **Rust POSIX absolute mutex waits:** C and pthread images expose
   `pthread_mutex_timedlock` and `pthread_mutex_clocklock`. Calendar changes
   wake active waits; interrupted requests retain deadlines and committed results.
+- **Rust POSIX sleep waits:** `nanosleep` and `clock_nanosleep` share the pthread
+  deadline timer, return elapsed remainders and remove waits before cancellation
+  cleanup. Relative waits ignore calendar settings. Signal delivery remains work.
 - **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
@@ -224,7 +227,8 @@ checks for successful calls, failures, and ABI layout.
 | Rust mutex ownership | Add private stalled NORMAL, ERRORCHECK and RECURSIVE mutexes, static initialization and type attributes; verify live waiters, priority handoff, interrupted replies, ordinary writes and cancellation cleanup on QEMU and Apple VZ. | ✅ [#48](https://github.com/stafeto/stafeto/pull/48) |
 | Rust system clocks | Add shared REALTIME and immutable MONOTONIC clocks with gettime/getres/settime, wide calendar arithmetic and retry-safe settings; verify C ABI, independent processes and committed SET/ACK interruption on QEMU and Apple VZ. | ✅ [#49](https://github.com/stafeto/stafeto/pull/49) |
 | Rust absolute mutex waits | Add clock-step notifications and timed/clock mutex acquisition; verify forward/backward calendar changes, brief deadline crossings, earliest timers and interrupted replies on QEMU and Apple VZ. | ✅ [#50](https://github.com/stafeto/stafeto/pull/50) |
-| Rust timers and sleeps | Add relative and absolute sleeps, timer creation and delivery; verify clock changes, remaining time, interruption and cancellation. | 🚧 |
+| Rust sleep waits | Add relative and absolute nanosleep/clock_nanosleep waiting, interruption remainders and deferred cancellation; verify calendar changes and shared mutex/sleep history on QEMU and Apple VZ. Signal delivery remains below. | ✅ [#51](https://github.com/stafeto/stafeto/pull/51) |
+| Rust timers | Add timer creation, event delivery and overrun accounting; verify relative/absolute expiry, clock changes, signal delivery and resource lifetime. | 🚧 |
 | Rust mutex completion | Add robust owner-death recovery and consistency, shared-process objects and priority protocols; verify recovery, process lifetime and scheduling behavior. | 🚧 |
 | Rust thread synchronization and attributes | Add conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |
 | Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and signal delivery with documented restart behavior. | 🚧 |
@@ -261,7 +265,8 @@ See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
 [notes/m2-rust-posix-thread-capacity.md](notes/m2-rust-posix-thread-capacity.md) and
 [notes/m2-rust-posix-mutex.md](notes/m2-rust-posix-mutex.md) and
 [notes/m2-rust-posix-clocks.md](notes/m2-rust-posix-clocks.md) and
-[notes/m2-rust-posix-timed-mutex.md](notes/m2-rust-posix-timed-mutex.md)
+[notes/m2-rust-posix-timed-mutex.md](notes/m2-rust-posix-timed-mutex.md) and
+[notes/m2-rust-posix-sleep.md](notes/m2-rust-posix-sleep.md)
 for the boundary.
 Process file requests carry copied values instead of caller-stack jobs.
 Directory identifiers remain process-local; cancellation, signals and recovery

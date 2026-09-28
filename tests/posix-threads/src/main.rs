@@ -34,6 +34,8 @@ mod mutex;
 #[cfg(not(feature = "cancel-input"))]
 mod once;
 #[cfg(not(feature = "cancel-input"))]
+mod sleep;
+#[cfg(not(feature = "cancel-input"))]
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
 mod timed;
@@ -254,6 +256,7 @@ fn run(clocks: &clocks::Peers) -> bool {
         || !once::run()
         || !mutex::run()
         || !timed::run()
+        || !sleep::run()
         || !cancellation::run()
     {
         return false;

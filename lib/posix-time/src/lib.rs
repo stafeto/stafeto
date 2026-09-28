@@ -126,6 +126,54 @@ impl Deadline {
         Ok(value - anchor.time.value()? + i128::from(anchor.mono))
     }
 }
+/// A sleep keeps relative intervals independent of calendar settings.
+#[derive(Clone, Copy, Debug)]
+pub enum Sleep {
+    Relative(i128),
+    Absolute(Deadline),
+}
+impl Sleep {
+    pub fn new(
+        clock: u32,
+        absolute: bool,
+        seconds: i64,
+        nanos: i64,
+        start: u64,
+    ) -> Result<Self, Error> {
+        let deadline = Deadline::new(clock, seconds, nanos)?;
+        if seconds < 0 {
+            return Err(Error::Invalid);
+        }
+        Ok(if absolute {
+            Self::Absolute(deadline)
+        } else {
+            Self::Relative(i128::from(start) + deadline.value())
+        })
+    }
+    pub fn calendar(self) -> bool {
+        matches!(self, Self::Absolute(d) if d.clock == proto_clock::REALTIME)
+    }
+    pub fn expired(self, now: u64, observation: Option<Observation>) -> Result<bool, Error> {
+        match self {
+            Self::Relative(end) => Ok(end <= i128::from(now)),
+            Self::Absolute(deadline) => deadline.expired(now, observation),
+        }
+    }
+    pub fn target(self, anchor: Option<Anchor>) -> Result<i128, Error> {
+        match self {
+            Self::Relative(end) => Ok(end),
+            Self::Absolute(deadline) => deadline.target(anchor),
+        }
+    }
+    /// Only relative calls return a remainder; absolute calls leave it untouched.
+    pub fn remaining(self, now: u64) -> Result<Option<Time>, Error> {
+        match self {
+            Self::Relative(end) => Time::from_value((end - i128::from(now)).max(0)).map(Some),
+            Self::Absolute(_) => Ok(None),
+        }
+    }
+}
+
 pub struct Clock {
     value: i128,
     mono: u64,
@@ -397,5 +445,80 @@ mod tests {
                 .expired(400, Some(sample)),
             Ok(false)
         );
+    }
+    #[test]
+    fn relative_sleep_ignores_calendar_steps_and_reports_elapsed_remainder() {
+        for clock in [REALTIME, MONOTONIC] {
+            let sleep = Sleep::new(clock, false, 2, 100, 500).unwrap();
+            assert!(!sleep.calendar());
+            assert_eq!(sleep.target(None), Ok(2_000_000_600));
+            assert_eq!(sleep.expired(2_000_000_599, None), Ok(false));
+            assert_eq!(sleep.expired(2_000_000_600, None), Ok(true));
+            assert_eq!(sleep.remaining(1_000_000_500), Ok(Some(time(1, 100))));
+            assert_eq!(sleep.remaining(3_000_000_000), Ok(Some(Time::ZERO)));
+            let mut model = Clock::new(0, 1_000_000_000).unwrap();
+            for date in [100, 1] {
+                model.set(time(date, 0), 500).unwrap();
+                let sample = Observation {
+                    anchor: model.anchor(),
+                    peak: model.current(500).unwrap(),
+                };
+                assert_eq!(sleep.expired(600, Some(sample)), Ok(false));
+                assert_eq!(sleep.target(Some(sample.anchor)), Ok(2_000_000_600));
+            }
+        }
+    }
+    #[test]
+    fn absolute_sleep_uses_original_clock_and_ignores_remainder() {
+        let sleep = Sleep::new(REALTIME, true, 11, 0, 123).unwrap();
+        assert!(sleep.calendar());
+        assert_eq!(sleep.remaining(456), Ok(None));
+        let mut model = Clock::new(100, 1_000_000_000).unwrap();
+        model.set(time(10, 0), 100).unwrap();
+        let mut history = History::new(model.current(100).unwrap());
+        assert_eq!(sleep.target(Some(model.anchor())), Ok(1_000_000_100));
+        history.see(12 * SECOND);
+        model.set(time(1, 0), 200).unwrap();
+        let sample = history.take(model.current(200).unwrap(), model.anchor());
+        assert_eq!(sleep.expired(200, Some(sample)), Ok(true));
+        assert_eq!(sleep.target(Some(sample.anchor)), Ok(10_000_000_200));
+        let next = history.take(model.current(300).unwrap(), model.anchor());
+        assert_eq!(sleep.expired(300, Some(next)), Ok(false));
+        let mono = Sleep::new(MONOTONIC, true, 0, 999, 100).unwrap();
+        assert!(!mono.calendar());
+        assert_eq!(mono.expired(998, Some(sample)), Ok(false));
+        assert_eq!(mono.expired(999, None), Ok(true));
+    }
+    #[test]
+    fn sleep_preserves_largest_duration_without_saturating_deadline() {
+        let sleep = Sleep::new(REALTIME, false, i64::MAX, 999_999_999, u64::MAX).unwrap();
+        assert!(sleep.target(None).unwrap() > i128::from(u64::MAX));
+        assert_eq!(sleep.expired(u64::MAX, None), Ok(false));
+        assert_eq!(
+            sleep.remaining(u64::MAX),
+            Ok(Some(time(i64::MAX, 999_999_999)))
+        );
+        assert_eq!(
+            Sleep::new(MONOTONIC, false, 0, 0, 123)
+                .unwrap()
+                .expired(123, None),
+            Ok(true)
+        );
+    }
+    #[test]
+    fn sleep_rejects_negative_and_malformed_values_in_both_modes() {
+        for absolute in [false, true] {
+            for (clock, sec, ns) in [
+                (2, 0, 0),
+                (REALTIME, -1, 0),
+                (MONOTONIC, 0, -1),
+                (REALTIME, 0, 1_000_000_000),
+            ] {
+                assert!(matches!(
+                    Sleep::new(clock, absolute, sec, ns, 100),
+                    Err(Error::Invalid)
+                ));
+            }
+        }
     }
 }

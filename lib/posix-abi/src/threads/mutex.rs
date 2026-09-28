@@ -177,15 +177,18 @@ impl Registry {
     }
     /// Expire in the original clock and choose the next representable wake.
     /// Rechecking after every timer/clock notice rejects stale timer deliveries.
-    pub(super) fn mutex_deadlines(&mut self) -> Option<u64> {
+    pub(super) fn wait_deadlines(&mut self) -> Option<u64> {
         self.deadlines(false)
     }
-    fn deadlines(&mut self, force: bool) -> Option<u64> {
+    pub(super) fn deadlines(&mut self, force: bool) -> Option<u64> {
         let realtime = self.entries.iter().flatten().any(|e| {
-            e.mutex_waiting
+            e.sleep_waiting
                 .as_ref()
-                .and_then(|w| w.deadline)
-                .is_some_and(|d| d.clock == proto_clock::REALTIME)
+                .is_some_and(|w| w.deadline.calendar())
+                || e.mutex_waiting
+                    .as_ref()
+                    .and_then(|w| w.deadline)
+                    .is_some_and(|d| d.clock == proto_clock::REALTIME)
         });
         let observation = if realtime || force {
             crate::clock::observation().ok()
@@ -224,7 +227,10 @@ impl Registry {
                 respond(waiting.token, answer);
             }
         }
-        next
+        self.sleep_deadlines(now, observation)
+            .into_iter()
+            .chain(next)
+            .min()
     }
     fn mutex_next(&self, address: u64) -> Option<usize> {
         self.entries
@@ -245,7 +251,7 @@ impl Registry {
             .map(|candidate| candidate.0)
     }
     pub(super) fn mutex_perform(&mut self, words: [u64; 8]) -> Result<u64, i32> {
-        self.mutex_deadlines();
+        self.wait_deadlines();
         if !valid_address(words[3]) {
             return Err(EINVAL);
         }
