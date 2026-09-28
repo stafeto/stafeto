@@ -39,6 +39,7 @@ pub struct Thread {
     pub regs: UserRegs,
     /// Saved while the thread does not run.
     pub fp: FpRegs,
+    pub upcall: kcore::upcall::State,
     /// What the scheduler keeps in the thread: the base priority, which
     /// `create` or thread_set_priority gave, the boost of a notification or
     /// of a request's client (spec 6.6) and the effective priority they
@@ -133,6 +134,9 @@ struct Buffer {
 }
 
 const _: () = assert!(core::mem::offset_of!(Thread, regs) == 0);
+const _: () = assert!(
+    core::mem::size_of::<UserRegs>() + core::mem::size_of::<FpRegs>() == abi::UPCALL_CONTEXT_SIZE
+);
 
 // Three threads to a page of a pool (spec 7.8).
 const _: () = assert!(kcore::slab::Pool::<Thread>::PER_PAGE >= 3);
@@ -205,6 +209,7 @@ pub fn create(
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
         fp: FpRegs::ZERO,
+        upcall: kcore::upcall::State::new(),
         sched: Node::new(priority, policy),
         waits: None,
         // The owner is the thread's own place, known once it has one.
@@ -324,6 +329,37 @@ pub unsafe fn drop_buffer(t: NonNull<Thread>, cause: u8) {
 pub fn buffer_page(t: NonNull<Thread>) -> Option<usize> {
     // SAFETY: the caller holds the thread; only the field is read.
     unsafe { (*t.as_ptr()).buffer.as_ref() }.map(|b| b.va)
+}
+
+/// Restore only the current EL0 context from a retained, fixed buffer area.
+/// All context validation precedes changes; split fields avoid aliasing the buffer.
+pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
+    // SAFETY: the current thread is held by the scheduler; execution is serial.
+    let t = unsafe { thread.as_mut() };
+    if !t.upcall.can_return() {
+        return Err(Error::BadState);
+    }
+    let buffer = t.buffer.as_ref().ok_or(Error::BadState)?;
+    let word = |index| buffer.frame.word(abi::UPCALL_CONTEXT_OFFSET + index * 8);
+    let sp = word(31);
+    let pc = word(32);
+    let flags = word(33);
+    kcore::upcall::validate_context(pc, sp, flags, word(35), t.regs.tpidrro)?;
+    for index in 0..31 {
+        t.regs.x[index] = word(index);
+    }
+    t.regs.sp = sp;
+    t.regs.elr = pc;
+    t.regs.spsr = flags;
+    t.regs.tpidr = word(34);
+    for index in 0..32 {
+        t.fp.v[index] = u128::from(word(36 + index * 2)) | (u128::from(word(37 + index * 2)) << 64);
+    }
+    t.fp.fpcr = word(100);
+    t.fp.fpsr = word(101);
+    user::load_fp(&t.fp);
+    t.upcall.returned().expect("validated upcall return");
+    Ok(())
 }
 
 /// Copies bytes `range` of the message buffer of `from` to the same
@@ -673,6 +709,17 @@ pub fn run(next: NonNull<Thread>) -> ! {
         }
         let mut process = next.as_ref().process;
         process.as_mut().activate();
+        let thread = &mut *next.as_ptr();
+        if let Some(entry) =
+            thread
+                .upcall
+                .prepare(thread.regs.elr, thread.regs.spsr, thread.long.is_some())
+        {
+            thread.regs.elr = entry;
+            // The dispatcher starts a new control flow, rather than completing
+            // an interrupted indirect branch. Return restores the old BTYPE.
+            thread.regs.spsr &= !kcore::upcall::BRANCH_TYPE;
+        }
         user::enter(next.as_ptr().cast())
     }
 }

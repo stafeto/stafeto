@@ -280,6 +280,11 @@ pub fn thread_interrupt(thread: &Handle<Thread>) -> Result<(), Error> {
     call::<{ Call::ThreadInterrupt.number() }>(&[thread.raw().0]).map(drop)
 }
 
+/// Request the entry installed by the target itself; coalesces while masked.
+pub fn thread_upcall_request(thread: &Handle<Thread>) -> Result<(), Error> {
+    call::<{ Call::ThreadUpcallRequest.number() }>(&[thread.raw().0]).map(|_| ())
+}
+
 /// yield: the caller goes to the tail of its level, and the next thread
 /// there runs; lower levels do not.
 pub fn yield_now() -> Result<(), Error> {

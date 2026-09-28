@@ -39,6 +39,8 @@ mod sleep;
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
 mod timed;
+#[cfg(not(feature = "cancel-input"))]
+mod upcall;
 
 rt::entry!(main);
 static PROCESS: AtomicU64 = AtomicU64::new(0);
@@ -257,6 +259,7 @@ fn run(clocks: &clocks::Peers) -> bool {
         || !mutex::run()
         || !timed::run()
         || !sleep::run()
+        || !upcall::run()
         || !cancellation::run()
     {
         return false;

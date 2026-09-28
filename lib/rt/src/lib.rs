@@ -31,6 +31,7 @@ pub mod service;
 pub mod startup;
 pub mod sys;
 pub mod time;
+pub mod upcall;
 pub mod wait;
 
 use core::cell::UnsafeCell;

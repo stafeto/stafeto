@@ -185,6 +185,10 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::ThreadExit) => thread_exit(thread),
         Some(Call::ThreadSetPriority) => thread_set_priority(thread, &args),
         Some(Call::ThreadInterrupt) => thread_interrupt(thread, &args),
+        Some(Call::ThreadUpcallBind) => thread_upcall_bind(thread, &args),
+        Some(Call::ThreadUpcallControl) => thread_upcall_control(thread, &args),
+        Some(Call::ThreadUpcallRequest) => thread_upcall_request(thread, &args),
+        Some(Call::ThreadUpcallReturn) => return thread_upcall_return(thread),
         Some(Call::Yield) => yield_now(),
         Some(Call::DeviceWindowCreate) => device_window_create(thread, &args),
         Some(Call::IrqBind) => irq_bind(thread, &args),
@@ -983,6 +987,45 @@ fn thread_interrupt(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> 
     // SAFETY: the caller's handle holds the target through interruption.
     unsafe { sched::interrupt(target, cause(thread)) }?;
     Ok(Values::none())
+}
+
+fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    if thread::buffer_page(thread).is_none() {
+        return Err(Error::BadState);
+    }
+    // SAFETY: only the current thread configures its own entry under kernel serialization.
+    unsafe { thread.as_mut() }.upcall.bind(a[0])?;
+    Ok(Values::none())
+}
+fn thread_upcall_control(mut thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    // SAFETY: only current-thread state changes; no user pointers are accessed.
+    let (was, pc, flags) = unsafe { thread.as_mut() }.upcall.control(a[0])?;
+    Ok(Values::new(&[was, pc, flags]))
+}
+fn thread_upcall_request(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let mut target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
+    if matches!(
+        thread::info(target).state,
+        abi::ThreadState::Stopped | abi::ThreadState::Ended
+    ) {
+        return Err(Error::BadState);
+    }
+    // SAFETY: the handle retains the target. No user code runs during the call.
+    let target_ref = unsafe { target.as_mut() };
+    let wake = target_ref.upcall.request()? && target_ref.waits.is_some();
+    if wake {
+        // SAFETY: as above; the existing bounded interruption releases wait references.
+        unsafe { sched::interrupt(target, cause(thread)) }?;
+    }
+    Ok(Values::none())
+}
+
+/// Restore from a fixed area of the held buffer, never from an arbitrary user pointer.
+/// Validate before changing any context; successful restore has no usual x0 result.
+fn thread_upcall_return(thread: NonNull<Thread>) {
+    if let Err(error) = thread::restore_upcall(thread) {
+        set_result(thread, Err(error));
+    }
 }
 
 /// yield(): the caller goes to the tail of its level with a new quantum,
