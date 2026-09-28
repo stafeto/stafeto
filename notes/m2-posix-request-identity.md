@@ -53,7 +53,9 @@ and pthread_join result intact on QEMU and Apple Virtualization.framework.
 Targeted ABI tests, all 224 init tests and the Apple VZ pthread probe pass.
 Six mutations are caught: missing ownership check, receiver-as-sender,
 lost parent, boost removal, x3 clobber and acceptance of a stale generation.
-Sources were restored after each run. Complete CI follows the code commit.
+Sources were restored after each run. Complete cargo xtask ci passed on
+d3fefca: kcore 402, init 224, kernel 166 normally and 177 under icount,
+all POSIX/BusyBox probes, licenses, formatting, Clippy and hot-path checks.
 
 ## Cost and compatibility
 
@@ -62,7 +64,15 @@ The stats maximum array gains one slot through its shared declaration.
 The read uses the existing token table and immutable process identity;
 it adds no sender credential storage or global process search.
 See docs/non-preemptible-paths.md for its bounded kernel work.
-Final image sizes and existing path measurements follow the complete CI.
+Shipping kernels remain 154708 bytes (normal) and 171076 bytes (Apple VZ),
+under 204800 bytes. Thread/C/standalone boot images remain
+647168/524288/540672 bytes. Normal null/clock/yield/notify/round_trip costs
+remain 237/296/361/842/1761 ticks. Icount IPC costs remain
+245/467/1936/2125/3034/4209 on both 512M and 2G. Driver costs move from
+675 to 673 ticks; bind 726/762, ack 205 and portion 247 remain unchanged.
+The generated call table changed code placement; these existing paths
+are not measurements of the new query. Logs:
+/tmp/stafeto-request-identity-{ci,init,vz,clippy,mutations}.log.
 No new request latency or global non-preemptible bound is claimed.
 
 ## Remaining POSIX work
