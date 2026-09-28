@@ -73,8 +73,15 @@ The resource-pressure worker now uses sigwaitinfo for pending and live
 acceptance with exhausted handles and dynamic journal storage.
 
 Targeted QEMU, Apple Virtualization.framework and C ABI probes passed.
-Clippy passed for host models and guest library/probe. Mutation and full
-CI results are recorded after their bounded verification completes.
+Clippy passed for host models and guest library/probe. Eight mutations
+were caught: mask/value truncation on the host; lost cache/cause at 397,
+last reply word at 449, early ACK at 396, cancellation finish at 438,
+and missing error errno at C exit 168. All sources were restored.
+Full cargo xtask ci passed on d957ed0: 400 kcore host tests, 221 init
+checks and 165/176 kernel checks. Normal/VZ kernels remain 154704/171072
+bytes. Thread/C ABI/standalone images are 626688/512000/532480 bytes.
+Normal and icount IPC timings remain unchanged from #60. Signal latency
+and a fresh global blocking bound were not measured.
 
 ## Remaining work
 
