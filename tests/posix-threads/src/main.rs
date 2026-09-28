@@ -23,6 +23,8 @@ use rt::{
 
 #[cfg(not(feature = "cancel-input"))]
 mod cancellation;
+#[cfg(not(feature = "cancel-input"))]
+mod capacity;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
@@ -138,7 +140,7 @@ fn run() -> bool {
     let baseline = sys::process_handles(&process)
         .expect("handle baseline")
         .live;
-    let mut held: [Option<Handle<Channel>>; 32] = core::array::from_fn(|_| None);
+    let mut held: [Option<Handle<Channel>>; 128] = core::array::from_fn(|_| None);
     let mut count = 0;
     while count < held.len() {
         match sys::channel_create(1) {
@@ -240,7 +242,7 @@ fn run() -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !specific::run() || !once::run() || !cancellation::run() {
+    if !capacity::run() || !specific::run() || !once::run() || !cancellation::run() {
         return false;
     }
 

@@ -2436,9 +2436,9 @@ pub fn mapping_tables_are_paid_by_the_target(_: &Boot) -> Result<(), &'static st
 /// 3, left in the quota of the target, mem_map of a page in a region of
 /// 512 GiB with no table yet fails with NO_MEMORY in x0 alone, the page
 /// does not translate, the quota is what it was, and no entry stays; with
-/// the three pages left it maps and takes all three. Then 63 more
+/// the three pages left it maps and takes all three. Then MAX_MAPPINGS - 1 more
 /// mappings of the page in that region, whose tables are there, fill the
-/// table of mappings, and with two pages left a 65th fails with
+/// table of mappings, and with two pages left the next mapping fails with
 /// LIMIT_REACHED in x0 alone: the place in the table comes before the
 /// charge for tables (spec 11). A mapping made and unmapped first leaves
 /// the table of mappings.
@@ -3658,8 +3658,11 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     cleanup::portion();
     let shell = timer::now() - start;
     cleanup::drain();
-    let stop = stop_64_threads_ticks()?;
-    kprintln!("teardown portions ticks: buffers={buffers} shell={shell} stop_64={stop}");
+    let stop = stop_max_threads_ticks()?;
+    kprintln!(
+        "teardown portions ticks: buffers={buffers} shell={shell} stop_threads={stop} threads={}",
+        abi::MAX_THREADS
+    );
     check(
         (process::in_use(), thread::in_use()) == before,
         "the measured teardown kept a process or thread",
@@ -3667,7 +3670,7 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "icount")]
-fn stop_64_threads_ticks() -> Result<u64, &'static str> {
+fn stop_max_threads_ticks() -> Result<u64, &'static str> {
     let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
     let mut threads = [None; abi::MAX_THREADS as usize];
     for slot in &mut threads {
@@ -3828,16 +3831,16 @@ fn frames_free(pa: u64, order: u8) {
 /// - map, map_exec: the entries of mem_map but the first, RW and RX, whose
 ///   portion crosses a bound of REGION and takes three tables;
 /// - protect, protect_exec, unmap: the entries of mem_protect to R and to
-///   RX and of mem_unmap of a mapping of 64 pages, among 64 mappings of a
-///   process with 64 threads and an ASID, which takes a TLBI a page;
+///   RX and of mem_unmap of a mapping of 64 pages, among MAX_MAPPINGS mappings
+///   of a process with MAX_THREADS threads and an ASID, which takes a TLBI a page;
 /// - release: the portion of cleanup of a memory object that gives back its
 ///   last pages, the node of their list and the object's place and budget,
 ///   whose frames are each alone in their free block of MAX_ORDER frames,
 ///   and merge up to it as they go back (`Apart`);
 /// - first_map: the first entry of mem_map RX of 8 pages across a bound of
-///   REGION with no table on either side, six tables: the 64th mapping of
-///   that process, and the first one of a new process, with the block of
-///   its table.
+///   REGION with no table on either side, six tables: the last mapping slot
+///   of that process, and the first one of a new process, with the paid page
+///   of its mapping table.
 ///
 /// The test prints them in one line, `memory portions ticks: create=...
 /// map=... map_exec=... unmap=... protect=... protect_exec=... release=...
@@ -3974,8 +3977,8 @@ fn first_exec_ticks(c: &Caller, target: Handle, h: Handle) -> Result<u64, &'stat
 }
 
 /// Into `ticks`, for a process with abi::MAX_THREADS threads with their
-/// buffers, 63 mappings and an ASID: map, map_exec, unmap, protect,
-/// protect_exec, and the first entry of its 64th mapping (`first_exec_ticks`).
+/// buffers, MAX_MAPPINGS - 1 mappings and an ASID: map, map_exec, unmap, protect,
+/// protect_exec, and the first entry of its last mapping (`first_exec_ticks`).
 /// Its threads, its mappings and its own tables lie past 4 REGIONs, so the
 /// regions below them have no table.
 #[cfg(feature = "icount")]
@@ -4018,7 +4021,7 @@ fn changes_ticks(c: &Caller, ticks: &mut [u64; 6]) -> Result<(), &'static str> {
 }
 
 /// abi::MAX_THREADS threads of `t` with their buffers, which `threads`
-/// holds, and 63 mappings of a page of an object `t` pays for, all past 4
+/// holds, and MAX_MAPPINGS - 1 mappings of an object `t` pays for, all past 4
 /// REGIONs.
 #[cfg(feature = "icount")]
 fn crowd(

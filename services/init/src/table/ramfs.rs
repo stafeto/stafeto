@@ -84,7 +84,8 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix-abi-probe",
         program: "posix-abi-probe",
         args: b"posix-abi-probe\0argument\0",
-        quota: 512 * PAGE,
+        quota: 2048 * PAGE,
+        handle_limit: 128,
         ..TABLE[1]
     },
 ];

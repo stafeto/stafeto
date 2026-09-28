@@ -3,6 +3,7 @@
 #ifndef STAFETO_LIMITS_H
 #define STAFETO_LIMITS_H
 #include <stafeto/abi.h>
+#define _POSIX_THREAD_THREADS_MAX 64
 #define _POSIX_THREAD_KEYS_MAX 128
 #define _POSIX_THREAD_DESTRUCTOR_ITERATIONS 4
 #endif

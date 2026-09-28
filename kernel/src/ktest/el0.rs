@@ -2478,7 +2478,7 @@ fn done_requeue(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// full of them each, each process with a handle with RECEIVE. The closer
 /// below them closes both handles, and the last one closes the channel
 /// (spec 6.8): the stage Close wakes the waiters with PEER_CLOSED, 32 a
-/// portion, in four portions at their level, above the closer's (spec
+/// portion, in CROWD.div_ceil(32) portions at their level, above the closer's (spec
 /// 7.7); an interrupt comes after every portion, and none begins while one
 /// is pending. The judge below the closer finds every waiter ended with
 /// PEER_CLOSED.
@@ -2550,7 +2550,7 @@ fn crowd_of(
 }
 
 fn done_close_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
-    closed_crowd(f, t, (4, 32, 1 << PRIORITY))
+    closed_crowd(f, t, (CROWD.div_ceil(32) as u32, 32, 1 << PRIORITY))
 }
 
 /// The closer in slot 0 closes the crowd's handles, the last ones with
@@ -2802,9 +2802,9 @@ fn exit_channel_of(q: NonNull<Process>, p: NonNull<Process>) -> Result<u64, &'st
     h
 }
 
-/// A service takes the requests of two processes of clients, 127 of them,
+/// A service takes the requests of two processes, CROWD - 1 clients,
 /// and ends its process without a reply: the stage Replies wakes them with
-/// PEER_CLOSED, 32 a portion, in four portions at the service's level
+/// PEER_CLOSED, 32 a portion, in (CROWD - 1).div_ceil(32) portions at its level
 /// (spec 6.8, 7.7); an interrupt comes after every portion, and none
 /// begins while one is pending. The judge below, the last thread of the
 /// second process, finds every client ended with PEER_CLOSED.
@@ -2842,11 +2842,11 @@ fn done_replies_portions(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         "a client of the service that ended did not end with PEER_CLOSED",
     )?;
     check(
-        f.taken == (4, 32, 1 << (PRIORITY + 1)),
+        f.taken == ((CROWD - 1).div_ceil(32) as u32, 32, 1 << (PRIORITY + 1)),
         "the stage Replies did not wake the clients 32 a portion at the service's level",
     )?;
     check(
-        !cleanup::take_late() && f.interrupts >= 4,
+        !cleanup::take_late() && f.interrupts >= (CROWD - 1).div_ceil(32) as u32,
         "a portion began while an interrupt was pending",
     )
 }
@@ -3218,7 +3218,7 @@ fn done_raised_replies(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 /// After a portion, the stage Close goes back to the head of the higher of
-/// its cause and the top level of its queue (spec 7.7): 64 threads at 10
+/// its cause and the top level of its queue (spec 7.7): MAX_THREADS threads at 10
 /// wait in receive on one channel, and the closer closes its last handles
 /// with RECEIVE as a thread at 40 would. Both portions run at 40, 32 heads
 /// each; a stage that went back at its waiters' level would run the second

@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+_Static_assert(PTHREAD_THREADS_MAX >= _POSIX_THREAD_THREADS_MAX, "minimum thread capacity");
 _Static_assert(sizeof(pthread_t) == 8, "pthread ID ABI");
 _Static_assert(sizeof(pthread_attr_t) == 32, "pthread attributes ABI");
 _Static_assert(_Alignof(pthread_attr_t) == 8, "pthread attribute alignment");
@@ -265,7 +266,8 @@ static void release_names(struct dirent **names, int count) {
     free(names);
 }
 
-static void *pressure[4096];
+#define PRESSURE_LIMIT 16384
+static void *pressure[PRESSURE_LIMIT];
 static int pressure_count, pressure_failed, select_count;
 
 static int select_pressure(const struct dirent *entry) {
@@ -275,7 +277,7 @@ static int select_pressure(const struct dirent *entry) {
         for (int i = 0; i < 4; i++) {
             void *block;
             while ((block = malloc(sizes[i])) != NULL) {
-                if (pressure_count == 4096) { free(block); pressure_failed = 1; return 1; }
+                if (pressure_count == PRESSURE_LIMIT) { free(block); pressure_failed = 1; return 1; }
                 pressure[pressure_count++] = block;
             }
         }
@@ -432,13 +434,13 @@ static int threads(void) {
     if (pthread_create(&witness, NULL, thread_return, &context)
             || pthread_join(witness, &value) || value != &context) return 212;
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE)) return 213;
-    pthread_t children[31];
-    for (size_t i = 0; i < 31; i++) {
+    pthread_t children[PTHREAD_THREADS_MAX - 1];
+    for (size_t i = 0; i < PTHREAD_THREADS_MAX - 1; i++) {
         if (pthread_create(&children[i], &attr, thread_return, (void *)(uintptr_t)(i + 1))) return 214;
     }
     child = 987;
     if (pthread_create(&child, &attr, thread_return, NULL) != EAGAIN || child != 987 || errno != 123) return 215;
-    for (size_t i = 0; i < 31; i++) {
+    for (size_t i = 0; i < PTHREAD_THREADS_MAX - 1; i++) {
         if (pthread_join(children[i], &value) || value != (void *)(uintptr_t)(i + 1)) return 216;
     }
     if (pthread_create(&child, &attr, thread_return, NULL) || pthread_join(child, NULL)
