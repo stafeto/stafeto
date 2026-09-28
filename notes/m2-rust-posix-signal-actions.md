@@ -73,7 +73,12 @@ missing reset fail host tests; missing inheritance fails at 388, ignored
 pending cleanup at 393, errno/mask restoration at 383. An unpaid MASK slot
 panics on ENOMEM during pressure; owner priority 1 times out after entering
 the CPU-delivery case. Every mutated source was restored.
-Full cargo xtask ci is required on the ready code commit before merge.
+Full cargo xtask ci passed on 863c798: eight signal-model tests, 400 kcore
+host tests, 221 init checks, 165/176 kernel checks, BusyBox and shipping
+hot-path validation. Normal/VZ kernels remain 154704/171072 bytes.
+Thread/C ABI/standalone boot images are 577536/462848/483328 bytes.
+Normal ticks remain 237/296/361/842/1761; icount IPC remains
+245/467/1936/2125/3034/4209. Signal latency and a new global bound are unmeasured.
 
 ## Remaining standard requirements
 
