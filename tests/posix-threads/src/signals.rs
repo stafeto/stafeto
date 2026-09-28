@@ -397,12 +397,34 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
         && mask() == bit(SIGUSR1);
     PRESSURE_WAIT.store(true, Ordering::Release);
     info = api::SigInfo::thread(777);
-    passed &= unsafe { api::sigwaitinfo(&bit(SIGUSR1), &mut info) } == SIGUSR1
+    let timeout = abi::metadata::Timespec {
+        tv_sec: 3,
+        tv_nsec: 0,
+    };
+    passed &= unsafe { api::sigtimedwait(&bit(SIGUSR1), &mut info, &timeout) } == SIGUSR1
         && info == api::SigInfo::thread(SIGUSR1)
         && pending() == 0
         && mask() == bit(SIGUSR1)
         && COUNT.load(Ordering::Acquire) == 1
         && unsafe { *errno } == 777;
+    info = api::SigInfo::thread(777);
+    let timeout = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 2_000_000,
+    };
+    threads::probe_interrupt_signal_reply(46);
+    threads::probe_ack_interrupt();
+    passed &= unsafe { api::sigtimedwait(&bit(SIGUSR1), &mut info, &timeout) } == -1
+        && unsafe { *errno } == EAGAIN
+        && info == api::SigInfo::thread(777)
+        && mask() == bit(SIGUSR1);
+    let zero = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    passed &= unsafe { api::sigtimedwait(&bit(SIGUSR1), &mut info, &zero) } == -1
+        && unsafe { *errno } == EAGAIN
+        && info == api::SigInfo::thread(777);
     PRESSURE_RESULT.store(usize::from(passed), Ordering::Release);
     usize::from(passed) as *mut c_void
 }
@@ -453,7 +475,7 @@ fn under_pressure() -> bool {
         return failed(397);
     }
     rt::println!(
-        "signal-action-probe: full journal/handles permit actions, mask, coalesced SA_SIGINFO, signal-safe I/O, pending/live sigwaitinfo, interrupted replies and managed exit"
+        "signal-action-probe: full journal/handles permit actions, mask, coalesced SA_SIGINFO, signal-safe I/O, pending/live sigwaitinfo/sigtimedwait and timeout, interrupted replies and managed exit"
     );
     true
 }

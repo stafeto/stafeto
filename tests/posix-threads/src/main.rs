@@ -46,6 +46,8 @@ mod reentry;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_context;
 #[cfg(not(feature = "cancel-input"))]
+mod signal_timed;
+#[cfg(not(feature = "cancel-input"))]
 mod signal_wait;
 #[cfg(not(feature = "cancel-input"))]
 mod signals;
@@ -308,6 +310,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !signals::run()
         || !signal_context::run()
         || !signal_wait::run()
+        || !signal_timed::run()
         || !cancellation::run()
     {
         return false;

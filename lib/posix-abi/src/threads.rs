@@ -104,6 +104,12 @@ static OWNER_NATIVE: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
 #[cfg(feature = "transport-probe")]
 static OWNER_PARKED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "transport-probe")]
+static SIGNAL_SEND_GATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static SIGNAL_RETRY_GATE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static SIGNAL_RETRY_PARKED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "transport-probe")]
 static WAKE_RETRIES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "transport-probe")]
 static UPCALL_REPLIES: AtomicU64 = AtomicU64::new(0);
@@ -976,6 +982,25 @@ extern "C" fn owner(_: u64) -> ! {
                 {
                     Err(EINVAL)
                 }
+            } else if cfg!(feature = "transport-probe") && words[0] == 49 {
+                #[cfg(feature = "transport-probe")]
+                {
+                    registry.find(words[3]).map(|index| {
+                        let deadline = registry
+                            .entry(index)
+                            .signal_waiting
+                            .as_ref()
+                            .and_then(|wait| wait.deadline)
+                            .map_or(0, |value| {
+                                value.target(None).expect("relative signal deadline")
+                            }) as u128;
+                        (deadline as u64, (deadline >> 64) as u64)
+                    })
+                }
+                #[cfg(not(feature = "transport-probe"))]
+                {
+                    Err(EINVAL)
+                }
             } else {
                 registry.perform(caller, words).map(|value| (value, 0))
             };
@@ -1050,7 +1075,19 @@ pub(crate) fn request_words(op: u64, arguments: [u64; 5]) -> Result<[u64; 7], i3
                 acknowledge(words[1], nonce, true)?;
                 return Err(ECANCELED);
             }
-            Err(Error::Interrupted) => continue,
+            Err(Error::Interrupted) => {
+                #[cfg(feature = "transport-probe")]
+                if op == crate::signals::WAIT {
+                    let gate = SIGNAL_RETRY_GATE.swap(0, Ordering::AcqRel);
+                    if gate != 0 {
+                        SIGNAL_RETRY_PARKED.store(true, Ordering::Release);
+                        sys::receive(&Handle::borrowed(rt::abi::Handle(gate)))
+                            .expect("test signal retry gate");
+                        SIGNAL_RETRY_PARKED.store(false, Ordering::Release);
+                    }
+                }
+                continue;
+            }
             Err(_) => return Err(EIO),
             Ok(reply) if reply.len == 64 => {
                 let status = reply.words[0];
@@ -1461,6 +1498,21 @@ pub fn probe_wake_retries() -> u64 {
     WAKE_RETRIES.load(Ordering::Acquire)
 }
 
+/// Hold one interrupted WAIT before its retry, after the owner committed a result.
+#[cfg(feature = "transport-probe")]
+pub fn probe_pause_signal_wait_retry(gate: &Handle<Channel>) {
+    SIGNAL_RETRY_GATE.store(gate.raw().0, Ordering::Release);
+}
+#[cfg(feature = "transport-probe")]
+pub fn probe_signal_wait_retry_parked() -> bool {
+    SIGNAL_RETRY_PARKED.load(Ordering::Acquire)
+}
+
+/// Pause one SEND after its request reaches the owner, before deadline recheck.
+#[cfg(feature = "transport-probe")]
+pub fn probe_pause_signal_send(gate: &Handle<Channel>) {
+    SIGNAL_SEND_GATE.store(gate.raw().0, Ordering::Release);
+}
 #[cfg(feature = "transport-probe")]
 pub fn probe_pause_owner(gate: &Handle<Channel>) {
     request(24, [gate.raw().0, 0, 0, 0, 0]).expect("test owner pause");
