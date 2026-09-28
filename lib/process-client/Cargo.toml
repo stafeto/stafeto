@@ -1,0 +1,19 @@
+[package]
+name = "process-client"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+
+[lib]
+test = false
+bench = false
+
+[features]
+transport-probe = []
+
+[dependencies]
+proto-process = { path = "../../proto/process" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../rt" }

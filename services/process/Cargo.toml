@@ -1,5 +1,5 @@
 [package]
-name = "posix-clock-peer"
+name = "posix-process-service"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
@@ -7,15 +7,17 @@ repository.workspace = true
 license = "GPL-3.0-or-later"
 
 [[bin]]
-name = "posix-clock-peer"
+name = "posix-process-service"
 test = false
 bench = false
 
+[features]
+transport-probe = []
+
 [dependencies]
-proto-clock = { path = "../../proto/clock" }
+proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
-posix-clock = { path = "../../lib/posix-clock" }
 proto-init = { path = "../../proto/init" }
 rt = { path = "../../lib/rt" }
-process-client = { path = "../../lib/process-client" }
-proto-process = { path = "../../proto/process" }
+posix-credentials = { path = "../../lib/posix-credentials" }
+posix-heap = { path = "../../lib/posix-heap" }

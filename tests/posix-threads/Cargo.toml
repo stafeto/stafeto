@@ -25,3 +25,5 @@ proto-clock = { path = "../../proto/clock" }
 proto-wire = { path = "../../proto/wire" }
 posix-request = { path = "../../lib/posix-request" }
 posix-signals = { path = "../../lib/posix-signals" }
+process-client = { path = "../../lib/process-client", features = ["transport-probe"] }
+proto-process = { path = "../../proto/process" }

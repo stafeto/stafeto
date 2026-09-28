@@ -141,7 +141,9 @@ dependencies = [
  "posix-signals",
  "posix-time",
  "posix-types",
+ "process-client",
  "proto-clock",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
@@ -177,8 +179,10 @@ name = "posix-clock-peer"
 version = "0.1.0"
 dependencies = [
  "posix-clock",
+ "process-client",
  "proto-clock",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
@@ -193,6 +197,13 @@ dependencies = [
  "proto-init",
  "proto-wire",
  "rt",
+]
+
+[[package]]
+name = "posix-credentials"
+version = "0.1.0"
+dependencies = [
+ "proto-process",
 ]
 
 [[package]]
@@ -239,6 +250,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-process-service"
+version = "0.1.0"
+dependencies = [
+ "posix-credentials",
+ "posix-heap",
+ "proto-init",
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "posix-request"
 version = "0.1.0"
 dependencies = [
@@ -275,7 +298,9 @@ dependencies = [
  "posix-request",
  "posix-signals",
  "posix-time",
+ "process-client",
  "proto-clock",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
@@ -312,6 +337,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-client"
+version = "0.1.0"
+dependencies = [
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "proto-clock"
 version = "0.1.0"
 dependencies = [
@@ -331,6 +365,13 @@ name = "proto-init"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-wire",
+]
+
+[[package]]
+name = "proto-process"
+version = "0.1.0"
+dependencies = [
  "proto-wire",
 ]
 
