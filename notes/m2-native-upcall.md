@@ -4,13 +4,20 @@
 
 Four generic calls prepare asynchronous user entry on a selected native thread.
 ThreadUpcallBind (31) binds the current thread's entry; zero removes it.
-ThreadUpcallControl (32) masks (0), enables (1), or takes original PC/PSTATE (2).
+ThreadUpcallControl (32) masks (0), enables (1), takes original PC/PSTATE (2),
+starts entry deferral (3), or ends one deferral level (4).
 Control returns the former mask in x1; TAKE returns PC in x2 and PSTATE in x3.
 ThreadUpcallRequest (33) requires a MANAGE target handle.
 ThreadUpcallReturn (34) restores the current thread from a fixed reserved area.
 
 A request coalesces into one pending bit. A masked target stays masked.
 An enabled IPC waiter is released through the existing Interrupted path.
+Internal entry deferral preserves this wakeup while postponing the dispatcher.
+An enabled pending request prevents new blocking send/receive waits during
+deferral; send consumes transfers according to the Interrupted contract.
+Nonblocking receive still polls. Overflow, underflow, rebinding or native
+return while a deferral is live are rejected without changing that state.
+See [m2-interruptible-borrow-guards.md](m2-interruptible-borrow-guards.md).
 A ready target keeps its priority; entry occurs before its next EL0 return.
 A kernel long-call continuation completes before entry, so dispatcher calls
 cannot accidentally enter that continuation. Stopped/ended targets reject requests.

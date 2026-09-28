@@ -664,6 +664,10 @@ fn drop_handles(t: NonNull<Thread>, values: &[u64]) {
 /// holding a reference to `c`, and gets its result when the wait ends
 /// (`post`, `send`, `clean`). O(1).
 pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<(), Error> {
+    // SAFETY: the current thread is held; inspect its private delivery state.
+    if wait && unsafe { t.as_ref() }.upcall.interrupt_wait() {
+        return Err(Error::Interrupted);
+    }
     let ceiling = ceiling(t);
     let looked = sched::locked(|k| {
         // SAFETY: the running thread and the channel, which its handle
@@ -806,6 +810,12 @@ pub fn send(
     if is_closed(c) {
         drop_handles(t, values);
         return Err(Error::PeerClosed);
+    }
+    // SAFETY: as above; a pending internal deferral cannot enter user code yet.
+    // Match Interrupted's transfer contract even before the request is queued.
+    if unsafe { t.as_ref() }.upcall.interrupt_wait() {
+        drop_handles(t, values);
+        return Err(Error::Interrupted);
     }
     if desc.len <= INLINE_MAX
         && values.is_empty()

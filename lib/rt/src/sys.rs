@@ -791,7 +791,7 @@ pub fn try_send(channel: &Handle<Channel>, bytes: &[u8]) -> Result<Reply, Error>
 /// abi::MESSAGE_HANDLES, each with TRANSFER, none of them `channel`: they
 /// move into the receiver's table with their rights and labels (spec
 /// 6.1), and the reply may bring handles back. They leave the caller's
-/// table when the call succeeds, and when it fails with PEER_CLOSED,
+/// table when the call succeeds, and when it fails with INTERRUPTED, PEER_CLOSED,
 /// LIMIT_REACHED or NO_MEMORY, the last two when the receiver's table or
 /// the reply's had no room for them; on any other error they stay, and
 /// come back in `Refused::back`.
@@ -852,6 +852,8 @@ fn send_with(
 /// under its ceiling, until its next receive or, for a request, its reply
 /// with the token (spec 6.6). PEER_CLOSED when the last handle with
 /// RECEIVE goes while the caller waits.
+/// An enabled pending upcall within an entry deferral returns INTERRUPTED
+/// before consuming a notification or request. `try_receive` still polls.
 pub fn receive(channel: &Handle<Channel>) -> Result<Received, Error> {
     receive_with(channel, 0)
 }

@@ -40,6 +40,54 @@ static PROBE_ACK: AtomicU64 = AtomicU64::new(0);
 static PROBE_GATE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "transport-probe")]
 static PROBE_READY: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_LOCAL_KIND: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_LOCAL_TARGET: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_LOCAL_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Request entry while the next local operation holds its file references.
+/// kind 1 selects value replies, kind 2 selects numeric replies. The target
+/// handle must stay live until that call returns; only one probe may be armed.
+#[cfg(feature = "transport-probe")]
+pub fn probe_local_borrow(kind: u64, target: &Handle<rt::handle::Thread>) {
+    assert!(kind == 1 || kind == 2);
+    PROBE_LOCAL_TARGET.store(target.raw().0, Ordering::Relaxed);
+    PROBE_LOCAL_KIND.store(kind, Ordering::Release);
+}
+
+#[cfg(feature = "transport-probe")]
+pub fn probe_local_borrow_live() -> bool {
+    PROBE_LOCAL_LIVE.load(Ordering::Acquire)
+}
+
+#[cfg(feature = "transport-probe")]
+struct BorrowProbe(bool);
+#[cfg(feature = "transport-probe")]
+impl BorrowProbe {
+    fn enter(kind: u64) -> Self {
+        let armed = PROBE_LOCAL_KIND
+            .compare_exchange(kind, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if armed {
+            PROBE_LOCAL_LIVE.store(true, Ordering::Release);
+            let target = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
+                PROBE_LOCAL_TARGET.load(Ordering::Acquire),
+            ));
+            sys::thread_upcall_request(&target).unwrap();
+        }
+        Self(armed)
+    }
+}
+#[cfg(feature = "transport-probe")]
+impl Drop for BorrowProbe {
+    fn drop(&mut self) {
+        if self.0 {
+            PROBE_LOCAL_LIVE.store(false, Ordering::Release);
+        }
+    }
+}
 
 /// Pause after the next Ack reply; both channels must stay live until released.
 #[cfg(feature = "transport-probe")]
@@ -421,6 +469,29 @@ fn execute(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, i32>
     Ok(length)
 }
 
+// Keep every local reference inside the guard, including error exits. The
+// callback may return owned data or a reply borrowing its caller's buffer,
+// but its result cannot borrow these operation-local file references.
+fn local<R>(
+    kind: u64,
+    run: impl FnOnce(&Streams, &mut PosixFs) -> Result<R, i32>,
+) -> Result<R, i32> {
+    let _guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
+    let streams = tls::directories();
+    let files = tls::files();
+    if streams.is_null() || files.is_null() {
+        return Err(ENOSYS);
+    }
+    // SAFETY: the TLS scope owns both objects; deferred entries cannot reborrow
+    // them until this operation ends and all exclusive references are gone.
+    let (streams, files) = unsafe { (&*streams, &mut *files) };
+    #[cfg(feature = "transport-probe")]
+    let _probe = BorrowProbe::enter(kind);
+    #[cfg(not(feature = "transport-probe"))]
+    let _ = kind;
+    run(streams, files)
+}
+
 pub(crate) fn dispatch<'a>(
     request: Request<'_>,
     buffer: &'a mut [u8; MESSAGE_MAX],
@@ -434,19 +505,10 @@ pub(crate) fn dispatch<'a>(
         let length = execute(encoded.as_bytes(), buffer)?;
         &buffer[..length]
     } else {
-        let streams = tls::directories();
-        let files = tls::files();
-        if streams.is_null() || files.is_null() {
-            return Err(ENOSYS);
-        }
         let mut encoded = Writer::new();
-        // SAFETY: the local scope uniquely borrows files and owns its registry.
-        perform(
-            request,
-            unsafe { &*streams },
-            unsafe { &mut *files },
-            &mut encoded,
-        )?;
+        local(1, |streams, files| {
+            perform(request, streams, files, &mut encoded)
+        })?;
         let bytes = encoded.as_bytes();
         buffer[..bytes.len()].copy_from_slice(bytes);
         &buffer[..bytes.len()]
@@ -469,13 +531,9 @@ pub(crate) fn number(request: Request<'_>) -> Result<u64, i32> {
     if tls::process_files() {
         return remote_number(request);
     }
-    let streams = tls::directories();
-    let files = tls::files();
-    if streams.is_null() || files.is_null() {
-        return Err(ENOSYS);
-    }
-    // SAFETY: the unique local owner executes the same operation without IPC buffers.
-    number_operation(request, unsafe { &*streams }, unsafe { &mut *files })
+    local(2, |streams, files| {
+        number_operation(request, streams, files)
+    })
 }
 
 pub(crate) fn unit(request: Request<'_>) -> Result<(), i32> {
