@@ -3658,8 +3658,11 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     cleanup::portion();
     let shell = timer::now() - start;
     cleanup::drain();
-    let stop = stop_64_threads_ticks()?;
-    kprintln!("teardown portions ticks: buffers={buffers} shell={shell} stop_64={stop}");
+    let stop = stop_max_threads_ticks()?;
+    kprintln!(
+        "teardown portions ticks: buffers={buffers} shell={shell} stop_threads={stop} threads={}",
+        abi::MAX_THREADS
+    );
     check(
         (process::in_use(), thread::in_use()) == before,
         "the measured teardown kept a process or thread",
@@ -3667,7 +3670,7 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
 }
 
 #[cfg(feature = "icount")]
-fn stop_64_threads_ticks() -> Result<u64, &'static str> {
+fn stop_max_threads_ticks() -> Result<u64, &'static str> {
     let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
     let mut threads = [None; abi::MAX_THREADS as usize];
     for slot in &mut threads {
