@@ -122,7 +122,7 @@ user-space console driver remain future work. What works today:
   handlers resume both waits. `SA_SIGINFO` handlers receive retained information
   and a real interrupted context; register, PC, SIMD, flag and mask edits
   apply on return. Process routing, queued signals, timed waits,
-  handler context, restart policy and stop/continue remain work.
+  alternate stacks, restart policy and stop/continue remain work.
 - **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
   `crash uart`, which crashes the driver: `init` restarts it, and the
   shell connects to the new instance; after five crashes in 60 s the
