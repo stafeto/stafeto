@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <stafeto/abi.h>
 extern char **environ;
+pid_t getpid(void);
+pid_t getppid(void);
 int close(int fd);
 ssize_t read(int fd, void *buffer, size_t count);
 ssize_t write(int fd, const void *buffer, size_t count);

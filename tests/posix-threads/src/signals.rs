@@ -51,6 +51,8 @@ unsafe extern "C" fn handler(signal: i32) {
     let effective = mask();
     let own_blocked = mode != 2;
     if signal != SIGUSR1
+        || abi::process::getpid() <= 1
+        || abi::process::getppid() != 1
         || threads::pthread_self() != ID.load(Ordering::Acquire)
         || (effective & bit(SIGUSR1) != 0) != own_blocked
         || effective & bit(SIGUSR2) == 0

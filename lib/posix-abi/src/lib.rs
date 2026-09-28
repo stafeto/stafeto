@@ -14,6 +14,7 @@ pub mod directory;
 pub mod locale;
 pub mod metadata;
 pub mod ordering;
+pub mod process;
 pub mod scan;
 pub mod shared;
 pub mod signals;

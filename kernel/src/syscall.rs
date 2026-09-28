@@ -1199,6 +1199,12 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
     match a[1] {
+        abi::INFO_PROCESS_IDENTITY => {
+            let p = target()?;
+            // SAFETY: the handle holds the shell; identity outlives teardown.
+            let identity = unsafe { p.as_ref() }.identity();
+            Ok(Values::new(&identity.to_words()))
+        }
         abi::INFO_PROCESS_STATE => {
             let p = target()?;
             // SAFETY: the handle holds the process.
