@@ -72,10 +72,17 @@ Later registrations must not inherit earlier peaks. Warmed quota and handles rec
 Test gates and native-handle interruption methods are absent from the regular sysroot.
 
 Intentional mutations exercise lost peaks, the wrong timer choice, missing notification,
-a discarded observation result and restarting a wait on retry. Validation and image
-sizes are recorded on the ready implementation commit before the documentation commit.
+a discarded observation result and restarting a wait on retry. All five were detected.
 The notification check drains prior notices and observes the owner's receiving state
 through the kernel. An application RPC here would wake it and hide a missing notice.
+
+Full cargo xtask ci passed on 33de64b: licenses, formatting, Clippy, host and guest
+tests, BusyBox, image limits and absence of memcpy/memset in shipping hot paths.
+Init checks: 221 per machine; kernel checks: 165, or 176 under icount.
+Kernel images remain 150608 bytes normally and 171072 bytes for Apple VZ.
+Boot images: C ABI 380928, standalone C 401408, pthreads 397312 bytes.
+Normal null/clock/yield/notify/round_trip ticks remain 257/299/364/846/1763;
+IPC probe ticks remain 259/463/1918/2109/3018/4254. No separate HVF series ran.
 
 ## Remaining work
 
