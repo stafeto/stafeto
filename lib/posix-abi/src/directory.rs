@@ -149,7 +149,14 @@ pub unsafe extern "C" fn fdopendir(number: c_int) -> *mut Stream {
 /// not be freed; it remains valid until another read on this stream or closedir.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn readdir(pointer: *mut Stream) -> *mut Dirent {
-    let result = context(|streams, files| {
+    read_entry(pointer).unwrap_or_else(|code| {
+        fail(code);
+        ptr::null_mut()
+    })
+}
+
+pub(crate) fn read_entry(pointer: *mut Stream) -> Result<*mut Dirent, c_int> {
+    context(|streams, files| {
         let pointer = streams.slot(pointer)?;
         // SAFETY: this call uniquely accesses this stream; other buffers stay untouched.
         let slot = unsafe { &mut *pointer };
@@ -170,10 +177,6 @@ pub unsafe extern "C" fn readdir(pointer: *mut Stream) -> *mut Dirent {
         } as u8;
         slot.entry.d_name[entry.name_len] = 0;
         Ok(&mut slot.entry as *mut Dirent)
-    });
-    result.unwrap_or_else(|code| {
-        fail(code);
-        ptr::null_mut()
     })
 }
 

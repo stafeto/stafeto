@@ -10,7 +10,10 @@
 pub mod allocation;
 pub mod constants;
 pub mod directory;
+pub mod locale;
 pub mod metadata;
+pub mod ordering;
+pub mod scan;
 pub mod tls;
 
 use constants::*;

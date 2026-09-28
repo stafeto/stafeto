@@ -71,8 +71,8 @@ The full cargo xtask ci includes the new allocator tests and guest probes.
 
 ## Remaining work
 
-scandir and alphasort can now build on process allocation; ordering still
-needs locale support. ELF TLS loading, shared multi-thread file state,
+scandir and C/POSIX alphasort now use process allocation and ordering;
+see [m2-rust-posix-scan.md](m2-rust-posix-scan.md). ELF TLS loading, shared multi-thread file state,
 environment inheritance, mmap, process lifecycle and the remaining POSIX
 interfaces are pending. Heap-worker failure recovery is not implemented.
 BusyBox retains its MIT bridge until the separate Rust POSIX service exists.
