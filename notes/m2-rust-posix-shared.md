@@ -78,7 +78,9 @@ and target Clippy for the new guest package. BusyBox retains the MIT bridge.
 
 ## Remaining work
 
-A blocking read can hold the owner and delay all its queued operations.
+Console reads now wait outside the owner; see
+[the input milestone](m2-rust-posix-input.md). Future blocking file backends
+still need deferred execution to avoid holding the owner.
 Asynchronous backend requests, cancellation, signals, worker recovery,
 cross-process sessions and fork/exec inheritance remain requirements.
 ELF TLS and pthread interfaces still need implementation. This stage makes

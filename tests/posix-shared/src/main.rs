@@ -10,7 +10,9 @@ use core::{
     ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use posix_abi::{self as abi, constants::*, directory, metadata, shared, tls};
+use posix_abi::{self as abi, constants::*, shared, tls};
+#[cfg(not(feature = "input-probe"))]
+use posix_abi::{directory, metadata};
 use posix_fs::PosixFs;
 use rt::{
     Stack,
@@ -18,15 +20,25 @@ use rt::{
     sys,
 };
 
+#[cfg(feature = "input-probe")]
+mod input;
+
 rt::entry!(main);
+#[cfg(not(feature = "input-probe"))]
 static STACK: Stack<16384> = Stack::new();
+#[cfg(not(feature = "input-probe"))]
 static FD: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "input-probe"))]
 static ALIAS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "input-probe"))]
 static DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 static ERROR: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "input-probe"))]
 static HISTOGRAM: [AtomicUsize; 256] = [const { AtomicUsize::new(0) }; 256];
+#[cfg(not(feature = "input-probe"))]
 static MAIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(feature = "input-probe"))]
 static WORKER_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 fn fail(stage: usize) -> bool {
@@ -34,6 +46,7 @@ fn fail(stage: usize) -> bool {
     false
 }
 
+#[cfg(not(feature = "input-probe"))]
 fn reading(fd: i32, worker: bool) -> bool {
     let mut byte = 0;
     loop {
@@ -54,6 +67,7 @@ fn reading(fd: i32, worker: bool) -> bool {
     }
 }
 
+#[cfg(not(feature = "input-probe"))]
 extern "C" fn worker(completion: u64) -> ! {
     let passed = tls::with_process(|| {
         let errno = unsafe { abi::__errno_location() };
@@ -108,7 +122,12 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let Ok(files) = PosixFs::connect(&start.parent) else {
+    let files = if cfg!(all(feature = "input-probe", not(feature = "native-input"))) {
+        PosixFs::connect_with_uart(&start.parent)
+    } else {
+        PosixFs::connect(&start.parent)
+    };
+    let Ok(files) = files else {
         return 2;
     };
     let process = start.process.raw();
@@ -118,6 +137,12 @@ fn main(_: u64) -> u64 {
     {
         return 3;
     }
+    #[cfg(feature = "input-probe")]
+    let passed = tls::with_process(|| {
+        let process = Handle::<rt::handle::Process>::borrowed(process);
+        input::run(&process, &start.thread) && shared::cleanup().is_ok()
+    });
+    #[cfg(not(feature = "input-probe"))]
     let passed = tls::with_process(|| {
         let errno = unsafe { abi::__errno_location() };
         unsafe { *errno = EIO };
@@ -222,7 +247,10 @@ fn main(_: u64) -> u64 {
             unsafe { abi::allocation::free((*list.add(index)).cast()) };
         }
         unsafe { abi::allocation::free(list.cast()) };
-        if unsafe { abi::close(alias) } != 0 || shared::cleanup().is_err() {
+        if unsafe { abi::close(alias) } != 0 {
+            return fail(25);
+        }
+        if shared::cleanup().is_err() {
             return fail(25);
         }
         true

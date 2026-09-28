@@ -11,6 +11,10 @@ name = "posix-shared-probe"
 test = false
 bench = false
 
+[features]
+input-probe = []
+native-input = ["input-probe"]
+
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi" }
 posix-fs = { path = "../../lib/posix-fs" }

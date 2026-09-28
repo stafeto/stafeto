@@ -136,14 +136,9 @@ pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> i
     if buffer.is_null() && count != 0 {
         return fail(EFAULT) as isize;
     }
-    let result = fd(number).and_then(|fd| {
-        file(|files| {
-            let mut bytes = [0; posix_fs::MAX_READ];
-            let extent = count.min(bytes.len());
-            let length = files.read(fd, &mut bytes[..extent])?;
-            Ok((length, bytes))
-        })
-    });
+    let result = fd(number)
+        .and_then(|fd| file(|files| files.prepare_read(fd, count)))
+        .and_then(|read| read.complete().map_err(error));
     result.map_or_else(
         |code| fail(code) as isize,
         |(length, bytes)| {
