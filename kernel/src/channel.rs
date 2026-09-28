@@ -1101,6 +1101,23 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
     fit
 }
 
+/// Authenticated sender of a live accepted request. The receiving process
+/// alone may inspect it, through any of its threads. This read neither
+/// consumes the token nor changes priority or the accepted queue. O(1).
+pub fn sender_identity(t: NonNull<Thread>, token: u64) -> Result<abi::ProcessIdentity, Error> {
+    sched::locked(|k| {
+        let client = k.tokens.check(token)?;
+        // SAFETY: the running thread is alive. A taken token holds a live
+        // thread; a Reply wait holds its process and accepting process.
+        unsafe {
+            if (*client.as_ptr()).waits != Some(Wait::Reply(t.as_ref().process())) {
+                return Err(Error::BadState);
+            }
+            Ok(client.as_ref().process().as_ref().identity())
+        }
+    })
+}
+
 /// Abandon the current wait of `t` (exit or interrupt): its slot
 /// leaves the queue it stands in, wherever it stands there: a channel's, or
 /// the queue of accepted requests of the process that took its request,

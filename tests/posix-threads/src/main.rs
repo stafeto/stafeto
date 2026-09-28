@@ -44,6 +44,8 @@ mod once;
 #[cfg(not(feature = "cancel-input"))]
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
+mod request_identity;
+#[cfg(not(feature = "cancel-input"))]
 mod signal_context;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_timed;
@@ -159,6 +161,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(450);
     }
     rt::println!("process-identity-probe: Rust PID/PPID match native identity and preserve errno");
+    if !request_identity::run(expected) {
+        return false;
+    }
     let mut child = 0;
     let mut value = ptr::null_mut();
     let errno = unsafe { abi::__errno_location() };

@@ -637,6 +637,16 @@ const _: fn() = || {
 };
 
 impl Token {
+    /// Authenticated PID/parent PID of the sender of this accepted request.
+    /// Any thread of the receiving process may read it repeatedly without
+    /// consuming the reply right or ending the request's priority boost.
+    /// BadState for used/stale/foreign live tokens; PeerClosed after the
+    /// sender abandons the request, until its token generation changes.
+    pub fn sender_identity(&self) -> Result<abi::ProcessIdentity, Error> {
+        let x = call::<{ Call::RequestIdentity.number() }>(&[self.0])?;
+        Ok(abi::ProcessIdentity::from_words([x[1], x[2]]))
+    }
+
     /// The value the kernel knows the token by, for tests that hand the
     /// kernel values it must refuse.
     pub const fn raw(&self) -> u64 {

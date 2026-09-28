@@ -265,11 +265,14 @@ pub enum Call {
     ThreadUpcallRequest = 33,
     /// Restore the current EL0 context from its reserved message-buffer area.
     ThreadUpcallReturn = 34,
+    /// Read the sender's process identity through an accepted reply token.
+    /// x0 is the token; x1/x2 return PID/parent PID. Does not consume it.
+    RequestIdentity = 35,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 34] = [
+    pub const ALL: [Call; 35] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -304,6 +307,7 @@ impl Call {
         Call::ThreadUpcallControl,
         Call::ThreadUpcallRequest,
         Call::ThreadUpcallReturn,
+        Call::RequestIdentity,
     ];
 
     pub const fn number(self) -> u16 {
@@ -313,7 +317,7 @@ impl Call {
     /// The call with this number, if any.
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
-            1..=34 => Some(Self::ALL[number as usize - 1]),
+            1..=35 => Some(Self::ALL[number as usize - 1]),
             _ => None,
         }
     }
@@ -1291,13 +1295,13 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one() {
-        assert_eq!(Call::ALL.len(), 34);
+        assert_eq!(Call::ALL.len(), 35);
         for (i, call) in Call::ALL.iter().enumerate() {
             assert_eq!(call.number(), i as u16 + 1);
             assert_eq!(Call::from_number(call.number()), Some(*call));
             assert!(!TEST_CALLS.contains(&call.number()));
         }
-        for n in [0, 35, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [0, 36, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
             assert_eq!(Call::from_number(n), None);
         }
     }
@@ -1318,6 +1322,7 @@ mod tests {
         assert_eq!(Call::ThreadUpcallControl.number(), 32);
         assert_eq!(Call::ThreadUpcallRequest.number(), 33);
         assert_eq!(Call::ThreadUpcallReturn.number(), 34);
+        assert_eq!(Call::RequestIdentity.number(), 35);
         assert_eq!(RESULT_VALUES, 9);
         assert_eq!(UPCALL_CONTEXT_OFFSET, 1120);
         assert_eq!(UPCALL_CONTEXT_SIZE, 36 * 8 + 32 * 16 + 2 * 8);
