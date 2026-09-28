@@ -73,6 +73,10 @@ Mapping interrupted file RPC to EIO fails guest stage 86.
 Each mutation runs only the relevant host test or interruption image.
 Sources are restored before final validation.
 
+Full cargo xtask ci passed on c91fcf8: init 221, kernel 165, icount 176.
+The normal kernel is 154704 bytes; Apple VZ is 171072, both below 204800.
+Final logs use the /tmp/stafeto-rust-posix-interrupt- prefix.
+
 ## Remaining requirements
 
 pthread lifecycle, cancellation state/type, pending cancellation, cancellation

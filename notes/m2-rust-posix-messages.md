@@ -78,9 +78,12 @@ buffers stay in out-of-line helpers. The unchanged 16-KiB stack passes again.
 
 ## Remaining requirements
 
-pthread cancellation points, wakeup, cleanup handlers, signals, worker health,
+pthread cancellation points, cleanup handlers, signals, worker health,
 recovery and fork/exec inheritance remain required. A future blocking file
 backend needs deferred execution. BusyBox retains its compatible MIT bridge;
 the new GPL message package is not linked into that binary.
 
 Reference: [POSIX thread cancellation](https://pubs.opengroup.org/onlinepubs/9799919799/functions/V2_chap02.html).
+
+Current live IPC interruption and EINTR behavior is recorded in
+[m2-rust-posix-interrupt.md](m2-rust-posix-interrupt.md).
