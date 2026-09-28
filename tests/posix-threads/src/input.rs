@@ -77,7 +77,12 @@ pub fn run() -> bool {
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
     let mut child = 0;
     let mut value = ptr::null_mut();
-    // Warm the thread slot and stack page tables before measuring reclamation.
+    // Warm the file journal, thread slot and stack tables before measuring
+    // reclamation. Journal mappings are retained for reuse until process exit.
+    let mut cwd = [0; 2];
+    if unsafe { abi::getcwd(cwd.as_mut_ptr().cast(), cwd.len()) }.is_null() {
+        return failed(30);
+    }
     if unsafe { threads::pthread_create(&mut child, ptr::null(), Some(returning), ptr::null_mut()) }
         != 0
         || unsafe { threads::pthread_join(child, &mut value) } != 0

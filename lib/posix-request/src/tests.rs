@@ -117,10 +117,22 @@ fn full_payloads_fit_the_kernel_message_and_do_not_alias_the_source() {
     }
     .write(&mut out)
     .unwrap();
-    assert_eq!(out.as_bytes().len(), MESSAGE_MAX);
+    let mut wire = Writer::new();
+    exchange::Exchange::Execute {
+        nonce: 1,
+        request: out.as_bytes(),
+    }
+    .write(&mut wire)
+    .unwrap();
+    assert_eq!(wire.as_bytes().len(), MESSAGE_MAX);
     assert_eq!(&out.as_bytes()[..12], &[4, 0, 1, 0, 0, 0, 0, 0, 4, 3, 2, 1]);
     payload.fill(0);
-    let Request::Write { bytes, .. } = Request::read(out.as_bytes()).unwrap() else {
+    let exchange::Exchange::Execute { request, .. } =
+        exchange::Exchange::read(wire.as_bytes()).unwrap()
+    else {
+        panic!();
+    };
+    let Request::Write { bytes, .. } = Request::read(request).unwrap() else {
         panic!();
     };
     assert!(bytes.iter().all(|b| *b == 0x71));
