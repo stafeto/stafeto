@@ -33,6 +33,10 @@
 //! stays inside its process. Only a driver built with the feature `crash`
 //! has the method.
 //!
+//! READ_CANCELABLE (5) adds a nonzero request id u64 to the READ body.
+//! CANCEL_READ (6) carries that id; it removes only the matching session's
+//! pending read. Its status-only acknowledgement precedes client EINTR.
+//! A failed data reply leaves its bytes available to the next reader.
 //! Number 4 belongs to TRACE, which comes with milestone 1.4e.
 
 #![cfg_attr(not(test), no_std)]
@@ -59,10 +63,18 @@ pub enum Method {
     Write = 1,
     Read = 2,
     Crash = 3,
+    ReadCancelable = 5,
+    CancelRead = 6,
 }
 
 impl Method {
-    pub const ALL: [Method; 3] = [Method::Write, Method::Read, Method::Crash];
+    pub const ALL: [Method; 5] = [
+        Method::Write,
+        Method::Read,
+        Method::Crash,
+        Method::ReadCancelable,
+        Method::CancelRead,
+    ];
 
     pub const fn number(self) -> u16 {
         self as u16
@@ -169,6 +181,67 @@ impl ReadRequest {
     }
 }
 
+/// READ_CANCELABLE: header, max u32, reserved zero u32, nonzero request id u64.
+/// IDs are unique within a session; CANCEL_READ matches both session and id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelableRead {
+    pub max: u32,
+    pub id: u64,
+}
+
+impl CancelableRead {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        ReadRequest::check(self.max)?;
+        if self.id == 0 {
+            return Err(Status::BadSize);
+        }
+        Method::ReadCancelable.header().write(w)?;
+        w.u32(self.max)?;
+        w.u32(0)?;
+        w.u64(self.id)
+    }
+
+    pub fn read(mut body: Reader<'_>) -> Result<Self, Status> {
+        let max = body.u32()?;
+        let zero = body.u32()?;
+        let id = body.u64()?;
+        body.finish()?;
+        ReadRequest::check(max)?;
+        if zero != 0 || id == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self { max, id })
+    }
+}
+
+/// CANCEL_READ: header and nonzero request id u64. Idempotent for absent,
+/// completed or already cancelled requests; preserves console ownership.
+/// A live matching reader receives Interrupted. The cancellation reply is
+/// the standard eight-byte status-only acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelRead {
+    pub id: u64,
+}
+
+impl CancelRead {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        if self.id == 0 {
+            return Err(Status::BadSize);
+        }
+        Method::CancelRead.header().write(w)?;
+        w.u64(self.id)
+    }
+
+    pub fn read(mut body: Reader<'_>) -> Result<Self, Status> {
+        let id = body.u64()?;
+        body.finish()?;
+        if id == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self { id })
+    }
+}
+
 /// A reply to READ that is no refusal: the bytes that came, at least one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadReply<'a> {
@@ -209,7 +282,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed() {
-        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3]);
+        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 5, 6]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
@@ -220,6 +293,76 @@ mod tests {
         assert_eq!(VERSION, 1);
         assert_eq!((WRITE_MAX, READ_MAX), (1016, 1016));
         assert_eq!(Method::Crash.header().bytes(), [3, 0, 1, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn cancellation_requests_validate_ids_reserved_bytes_and_exact_lengths() {
+        let read = CancelableRead {
+            max: 2,
+            id: 0x0807060504030201,
+        };
+        let mut w = Writer::new();
+        read.write(&mut w).unwrap();
+        let expected = [
+            5, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        assert_eq!(w.as_bytes(), expected);
+        assert_eq!(CancelableRead::read(Reader::new(&expected[8..])), Ok(read));
+        for length in 0..16 {
+            assert_eq!(
+                CancelableRead::read(Reader::new(&expected[8..8 + length])),
+                Err(Status::BadSize)
+            );
+        }
+        for offset in [12, 13, 14, 15] {
+            let mut dirty = expected;
+            dirty[offset] = 1;
+            assert_eq!(
+                CancelableRead::read(Reader::new(&dirty[8..])),
+                Err(Status::BadSize)
+            );
+        }
+        let mut extra = expected[8..].to_vec();
+        extra.push(0);
+        assert_eq!(
+            CancelableRead::read(Reader::new(&extra)),
+            Err(Status::BadSize)
+        );
+        for max in [0, READ_MAX as u32 + 1] {
+            assert_eq!(
+                CancelableRead { max, id: 1 }.write(&mut Writer::new()),
+                Err(Status::BadSize)
+            );
+        }
+        assert_eq!(
+            CancelableRead { max: 1, id: 0 }.write(&mut Writer::new()),
+            Err(Status::BadSize)
+        );
+        let mut zero = expected;
+        zero[16..].fill(0);
+        assert_eq!(
+            CancelableRead::read(Reader::new(&zero[8..])),
+            Err(Status::BadSize)
+        );
+
+        let cancel = CancelRead { id: read.id };
+        let mut w = Writer::new();
+        cancel.write(&mut w).unwrap();
+        assert_eq!(
+            w.as_bytes(),
+            [6, 0, 1, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(
+            CancelRead::read(Reader::new(&w.as_bytes()[8..])),
+            Ok(cancel)
+        );
+        for bytes in [&[0; 8][..], &[1; 7][..], &[1; 9][..]] {
+            assert_eq!(CancelRead::read(Reader::new(bytes)), Err(Status::BadSize));
+        }
+        assert_eq!(
+            CancelRead { id: 0 }.write(&mut Writer::new()),
+            Err(Status::BadSize)
+        );
     }
 
     #[test]
