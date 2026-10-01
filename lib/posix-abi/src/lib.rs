@@ -12,6 +12,7 @@ pub mod clock;
 pub mod constants;
 pub mod directory;
 pub mod locale;
+pub mod long;
 pub mod metadata;
 pub mod ordering;
 pub mod process;
@@ -27,6 +28,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
 use posix_request::{MESSAGE_MAX, Reply, Request};
+use rt::handle::{Channel, Handle};
 
 const _: () = {
     assert!(core::mem::size_of::<usize>() == 8);
@@ -192,30 +194,67 @@ unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
                 if extent as usize > count {
                     return Err(EIO);
                 }
-                let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
-                let mut bytes = [0; posix_request::MAX_READ];
-                threads::cancel::console_wait();
-                // A request of cancellation that comes between this check
-                // and the wait in the console's service interrupts nothing:
-                // the read waits for input then. The two-step long
-                // operations (task 5) wait on the thread's own channel and
-                // close this window.
-                if threads::cancel::requested() {
-                    return Err(EINTR);
-                }
-                let length = input
-                    .read(&mut bytes[..extent as usize])
-                    .map_err(|status| error(status.into()))?;
-                if length != 0 {
-                    // SAFETY: the transport returned at most the validated extent.
-                    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
-                }
-                Ok(length)
+                // SAFETY: as the caller of read promises.
+                unsafe { console_read(uart, extent, buffer) }
             }
             _ => Err(EIO),
         }
     });
     result.map_or_else(|code| fail(code) as isize, |length| length as isize)
+}
+
+/// The console's branch of `read`, in its own frame: its buffers stay off
+/// the stack of reads of files, which go on to the shared worker.
+///
+/// # Safety
+/// `buffer` supplies `extent` writable bytes.
+#[inline(never)]
+unsafe fn console_read(uart: Option<u64>, extent: u32, buffer: *mut u8) -> Result<usize, i32> {
+    let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
+    let uart = Handle::<Channel>::borrowed(uart.map(rt::abi::Handle).ok_or(EBADF)?);
+    let mut bytes = [0; posix_request::MAX_READ];
+    threads::cancel::console_wait();
+    // A thread the layer did not attach has no channel of its
+    // own: a plain read waits for input.
+    // SAFETY: the block, when there is one, is this thread's.
+    let attached = unsafe { posix_thread::block().as_ref() }
+        .is_some_and(|b| b.channel.load(Ordering::Relaxed) != 0);
+    if !attached {
+        let length = input
+            .read(&mut bytes[..extent as usize])
+            .map_err(|status| error(status.into()))?;
+        if length != 0 {
+            // SAFETY: the transport returned at most the validated extent.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+        }
+        return Ok(length);
+    }
+    // A read in two steps waits on the thread's own channel: a
+    // signal or a request of cancellation ends it at once.
+    let mut start = proto_wire::Writer::new();
+    proto_uart::ReadRequest { max: extent }
+        .write_start(&mut start)
+        .map_err(|_| EINVAL)?;
+    let mut raw = [0; posix_request::MAX_READ];
+    let got = long::run(
+        &uart,
+        start.as_bytes(),
+        |cancel, key, w| {
+            let method = if cancel {
+                proto_uart::Method::ReadCancel
+            } else {
+                proto_uart::Method::ReadTake
+            };
+            proto_uart::ReadKey { key }.write(method, w)
+        },
+        &mut raw[..extent as usize],
+    )?;
+    let length = input.deliver(&raw[..got], &mut bytes[..extent as usize]);
+    if length != 0 {
+        // SAFETY: the transport returned at most the validated extent.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+    }
+    Ok(length)
 }
 
 /// # Safety

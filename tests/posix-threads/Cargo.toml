@@ -24,6 +24,7 @@ posix-thread = { path = "../../lib/posix-thread" }
 posix-time = { path = "../../lib/posix-time" }
 proto-clock = { path = "../../proto/clock" }
 proto-wire = { path = "../../proto/wire" }
+proto-uart = { path = "../../proto/uart" }
 posix-request = { path = "../../lib/posix-request" }
 posix-signals = { path = "../../lib/posix-signals" }
 process-client = { path = "../../lib/process-client", features = ["transport-probe"] }

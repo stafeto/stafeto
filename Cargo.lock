@@ -145,6 +145,7 @@ dependencies = [
  "process-client",
  "proto-clock",
  "proto-process",
+ "proto-uart",
  "proto-wire",
  "rt",
 ]
@@ -326,6 +327,7 @@ dependencies = [
  "process-client",
  "proto-clock",
  "proto-process",
+ "proto-uart",
  "proto-wire",
  "rt",
 ]

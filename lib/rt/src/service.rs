@@ -673,3 +673,149 @@ pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, 
         status => Err(status),
     }
 }
+
+/// The most long operations of one session that wait (spec 2, 3.4).
+pub const LONG_SESSION_MAX: usize = 16;
+
+/// A long operation that waits: its client, its generation and the handle
+/// with NOTIFY that tells the client once its result is ready.
+struct LongOp {
+    label: u64,
+    notify: Option<Handle<Channel>>,
+    told: bool,
+}
+
+/// The long operations of a service in two steps (proto_wire::long): N at
+/// most, LONG_SESSION_MAX of each session; each under its key k, the
+/// index of its place and the generation of the place, so that a key that
+/// went is never taken for a new one. Finding an operation by its key is
+/// O(1), taking back a session's O(N). The service keeps the operation's
+/// state itself; this keeps who waits and the handle to tell them.
+pub struct LongOps<const N: usize> {
+    ops: [Option<LongOp>; N],
+    generations: [u32; N],
+}
+
+impl<const N: usize> Default for LongOps<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> LongOps<N> {
+    pub const fn new() -> Self {
+        LongOps {
+            ops: [const { None }; N],
+            generations: [0; N],
+        }
+    }
+
+    /// A new operation of the client `label`: its key; LIMIT_REACHED when
+    /// the session or the service holds its most (the client gets EAGAIN).
+    pub fn start(&mut self, label: u64) -> Result<u64, Error> {
+        let of_session = self
+            .ops
+            .iter()
+            .flatten()
+            .filter(|o| o.label == label)
+            .count();
+        if of_session >= LONG_SESSION_MAX {
+            return Err(Error::LimitReached);
+        }
+        let index = self
+            .ops
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Error::LimitReached)?;
+        self.generations[index] = self.generations[index].wrapping_add(1).max(1);
+        self.ops[index] = Some(LongOp {
+            label,
+            notify: None,
+            told: false,
+        });
+        Ok((u64::from(self.generations[index]) << 32) | (index as u64 + 1))
+    }
+
+    /// The place of the operation `key` of the client `label`.
+    fn place(&self, label: u64, key: u64) -> Option<usize> {
+        let index = (key & 0xffff_ffff).checked_sub(1)? as usize;
+        let op = self.ops.get(index)?.as_ref()?;
+        (op.label == label && u64::from(self.generations[index]) == key >> 32).then_some(index)
+    }
+
+    /// Whether the operation `key` of `label` waits.
+    pub fn waits(&self, label: u64, key: u64) -> bool {
+        self.place(label, key).is_some()
+    }
+
+    /// Keeps `notify`, which the client's "take" brought, for the operation;
+    /// BAD_STATE for none.
+    pub fn arm(&mut self, label: u64, key: u64, notify: Handle<Channel>) -> Result<(), Error> {
+        let index = self.place(label, key).ok_or(Error::BadState)?;
+        let op = self.ops[index].as_mut().expect("a placed operation");
+        op.notify = Some(notify);
+        op.told = false;
+        Ok(())
+    }
+
+    /// Tells the client of the operation that its result is ready: bit 0
+    /// through its handle, once; nothing before it armed.
+    pub fn tell(&mut self, label: u64, key: u64) {
+        let Some(index) = self.place(label, key) else {
+            return;
+        };
+        let op = self.ops[index].as_mut().expect("a placed operation");
+        if let Some(notify) = op.notify.as_ref()
+            && !op.told
+        {
+            op.told = true;
+            // A client that went closed its end: nothing to tell then.
+            let _ = sys::notify(notify, 1);
+        }
+    }
+
+    /// The operation is over (taken or cancelled): it goes with its handle.
+    pub fn finish(&mut self, label: u64, key: u64) -> bool {
+        match self.place(label, key) {
+            Some(index) => {
+                self.ops[index] = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The client `label` went: its operations go with their handles.
+    pub fn gone(&mut self, label: u64) {
+        for op in &mut self.ops {
+            if op.as_ref().is_some_and(|o| o.label == label) {
+                *op = None;
+            }
+        }
+    }
+
+    /// The operations that wait, and the handles they hold.
+    pub fn counts(&self) -> (usize, usize) {
+        let live = self.ops.iter().flatten().count();
+        let held = self
+            .ops
+            .iter()
+            .flatten()
+            .filter(|o| o.notify.is_some())
+            .count();
+        (live, held)
+    }
+
+    /// The labels and keys of the operations that wait, for a service that
+    /// finishes them when their result comes.
+    pub fn keys(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ops.iter().enumerate().filter_map(|(index, op)| {
+            op.as_ref().map(|op| {
+                (
+                    op.label,
+                    (u64::from(self.generations[index]) << 32) | (index as u64 + 1),
+                )
+            })
+        })
+    }
+}

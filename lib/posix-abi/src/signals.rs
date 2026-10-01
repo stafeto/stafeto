@@ -535,6 +535,9 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             break;
         };
         let handler = action.handler;
+        if action.flags & SA_RESTART == 0 {
+            block.flags.fetch_or(flag::NO_RESTART, Ordering::SeqCst);
+        }
         if handler == DEFAULT {
             // Process wait-status encoding and stop/continue need process routing.
             sys_exit_signal(signal);

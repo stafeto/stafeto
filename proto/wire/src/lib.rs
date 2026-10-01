@@ -304,6 +304,81 @@ impl Default for Writer {
     }
 }
 
+/// The replies of a long operation in two steps (spec 2, 3.4): a request
+/// "start" without a handle; a result ready at once comes in its reply
+/// (READY); otherwise WAIT with the key k of the operation, which the
+/// service keeps. The client then sends "take k" with a handle with NOTIFY
+/// to its own channel, labelled k: READY when the result came meanwhile,
+/// otherwise ARMED, and the service holds the handle until the operation
+/// ends, putting bit 0 into that slot once the result is ready; the client
+/// then sends "take k" without a handle. "Cancel k" gives CANCELLED, with
+/// no effect of the operation, or READY with a result that was ready:
+/// nothing is lost or done twice. The service frees the operation and its
+/// handle on take with READY, on cancel and when the client goes.
+///
+/// | Bytes | Field |
+/// |---|---|
+/// | 0..4 | status 0 |
+/// | 4..8 | READY, WAIT, ARMED or CANCELLED |
+/// | 8.. | READY: the bytes of the result; WAIT: k, u64; others: nothing |
+pub mod long {
+    use super::{Reader, Status, Writer};
+
+    pub const READY: u32 = 1;
+    pub const WAIT: u32 = 2;
+    pub const ARMED: u32 = 3;
+    pub const CANCELLED: u32 = 4;
+
+    /// A reply of a long operation.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Reply<'a> {
+        Ready(&'a [u8]),
+        Wait(u64),
+        Armed,
+        Cancelled,
+    }
+
+    impl<'a> Reply<'a> {
+        pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+            w.u32(Status::Ok.code())?;
+            match *self {
+                Reply::Ready(bytes) => {
+                    w.u32(READY)?;
+                    w.bytes(bytes)
+                }
+                Reply::Wait(key) => {
+                    w.u32(WAIT)?;
+                    w.u64(key)
+                }
+                Reply::Armed => w.u32(ARMED),
+                Reply::Cancelled => w.u32(CANCELLED),
+            }
+        }
+
+        /// The reply in `bytes`: the status when it is a refusal, BAD_SIZE
+        /// for a layout of none of the four, or a WAIT with key 0.
+        pub fn read(bytes: &'a [u8]) -> Result<Reply<'a>, Status> {
+            let mut r = Reader::new(bytes);
+            match Status::from_code(r.u32()?) {
+                Status::Ok => {}
+                status => return Err(status),
+            }
+            let reply = match r.u32()? {
+                READY => Reply::Ready(r.bytes(r.left())?),
+                WAIT => match r.u64()? {
+                    0 => return Err(Status::BadSize),
+                    key => Reply::Wait(key),
+                },
+                ARMED => Reply::Armed,
+                CANCELLED => Reply::Cancelled,
+                _ => return Err(Status::BadSize),
+            };
+            r.finish()?;
+            Ok(reply)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +495,29 @@ mod tests {
         let mut first = [0; NAME_LEN];
         first[1] = b'x';
         assert_eq!(Name::from_field(first), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn long_replies_go_and_come_back() {
+        for reply in [
+            long::Reply::Ready(b"abc"),
+            long::Reply::Ready(b""),
+            long::Reply::Wait(0x1_0000_0002),
+            long::Reply::Armed,
+            long::Reply::Cancelled,
+        ] {
+            let mut w = Writer::new();
+            reply.write(&mut w).unwrap();
+            assert_eq!(long::Reply::read(w.as_bytes()), Ok(reply));
+        }
+        let mut w = Writer::new();
+        w.u32(0).unwrap();
+        w.u32(long::WAIT).unwrap();
+        w.u64(0).unwrap();
+        assert_eq!(long::Reply::read(w.as_bytes()), Err(Status::BadSize));
+        assert_eq!(
+            long::Reply::read(&reply(Status::Kernel(Error::LimitReached))),
+            Err(Status::Kernel(Error::LimitReached))
+        );
     }
 }

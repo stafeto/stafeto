@@ -127,13 +127,19 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix-abi-probe",
         program: "posix-abi-probe",
         args: b"posix-abi-probe\0argument\0",
-        connects: &["ramfs", "clock", "clock-peer", "posix"],
+        connects: &["ramfs", "clock", "clock-peer", "posix", "long"],
         quota: 2048 * PAGE,
         // Each pthread holds its handle, its channel and its timer
         // (posix-sync) besides the owner's native handle.
         handle_limit: 512,
         root: true,
         ..POSIX
+    },
+    // The service of long operations in two steps (tests/svc, role `l`)
+    // for the probe of reads in two steps.
+    Record {
+        name: "long",
+        ..LONG
     },
 ];
 

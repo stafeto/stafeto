@@ -24,6 +24,7 @@ posix-heap = { path = "../posix-heap" }
 posix-order = { path = "../posix-order" }
 posix-request = { path = "../posix-request" }
 proto-wire = { path = "../../proto/wire" }
+proto-uart = { path = "../../proto/uart" }
 posix-clock = { path = "../posix-clock" }
 posix-sync = { path = "../posix-sync" }
 posix-thread = { path = "../posix-thread" }

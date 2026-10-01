@@ -89,7 +89,7 @@ unsafe impl Sync for Session {}
 static PING: Session = Session(UnsafeCell::new(None));
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// PING of the service of long operations (tests/svc, long.rs).
-const PING_METHOD: u16 = 7;
+const PING_METHOD: u16 = 16;
 
 /// One empty round trip to the service of long operations through its
 /// loop (rt::service::run): 0, or -1 when it failed.

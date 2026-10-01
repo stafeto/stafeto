@@ -44,6 +44,8 @@ mod heap_replies;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
+mod long;
+#[cfg(not(feature = "cancel-input"))]
 mod mutex;
 #[cfg(not(feature = "cancel-input"))]
 mod once;
@@ -409,6 +411,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     if !tcb::run()
         || !futex::run()
         || !blocks::run()
+        || !long::run(parent)
         || !clocks::run(clocks)
         || !capacity::run()
         || !specific::run()

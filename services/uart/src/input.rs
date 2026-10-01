@@ -10,6 +10,12 @@
 //! ring holds, up to its most, at once; with nothing there it waits for
 //! input. The owner that goes frees the console. `T` is what answers a
 //! read later: the program's deferred reply.
+//!
+//! A read in two steps (proto_uart READ_START, READ_TAKE, READ_CANCEL;
+//! proto_wire::long) holds no reply: the driver keeps the reader (its key
+//! and, once it armed, `H`, its handle to tell it that input came) and
+//! the bytes stay in the ring until READ_TAKE or READ_CANCEL takes them.
+//! The console has one reader, so one read in two steps waits at most.
 
 use crate::regs::DR_ERRORS;
 
@@ -28,26 +34,65 @@ pub enum Taken<T> {
     Refused(T),
 }
 
+/// How READ_START went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Start {
+    /// This many bytes came at once.
+    Now(usize),
+    /// None came: the read waits under this key.
+    Wait(u64),
+    /// The console is another's, or a read of the owner waits already.
+    Refused,
+}
+
+/// How READ_TAKE or READ_CANCEL went.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Taken2 {
+    /// This many bytes came: the read is over.
+    Ready(usize),
+    /// Nothing came yet: the read waits (READ_TAKE).
+    Armed,
+    /// Nothing came: the read is over without an effect (READ_CANCEL).
+    Cancelled,
+    /// No read of the client waits under the key.
+    Unknown,
+}
+
+/// The read in two steps that waits.
+struct Reader<H> {
+    label: u64,
+    key: u64,
+    max: usize,
+    notify: Option<H>,
+    told: bool,
+}
+
 /// The input: the ring, the owner and the read that waits.
-pub struct Input<T> {
+pub struct Input<T, H = ()> {
     ring: [u8; RX_RING],
     start: usize,
     len: usize,
     owner: Option<u64>,
-    /// The most bytes of the read that waits, and its answer.
-    waiting: Option<(usize, u64, T)>,
+    /// The most bytes of the plain read that waits, and its answer.
+    waiting: Option<(usize, T)>,
+    /// The read in two steps that waits.
+    reader: Option<Reader<H>>,
+    /// The key of the next read in two steps.
+    next_key: u64,
     /// Bytes that came with an error: framing, parity, break or overrun.
     errors: u64,
 }
 
-impl<T> Input<T> {
-    pub const fn new() -> Input<T> {
+impl<T, H> Input<T, H> {
+    pub const fn new() -> Input<T, H> {
         Input {
             ring: [0; RX_RING],
             start: 0,
             len: 0,
             owner: None,
             waiting: None,
+            reader: None,
+            next_key: 1,
             errors: 0,
         }
     }
@@ -98,57 +143,125 @@ impl<T> Input<T> {
         n
     }
 
+    /// Whether the client of `label` may read now: the console becomes its
+    /// own when it has no owner; a client that waits already may not.
+    fn claim(&mut self, label: u64) -> bool {
+        match self.owner {
+            Some(owner) if owner != label => false,
+            Some(_) if self.waiting.is_some() || self.reader.is_some() => false,
+            _ => {
+                self.owner = Some(label);
+                true
+            }
+        }
+    }
+
     /// A read of at most `max` bytes, 1 or more, from the client of label
     /// `label`, answered through `token`; the bytes that come at once go
     /// into `out`.
     pub fn read(&mut self, label: u64, max: usize, token: T, out: &mut [u8]) -> Taken<T> {
-        self.read_cancelable(label, max, 0, token, out)
-    }
-
-    /// Like READ, with a session-local cancellation identifier (zero for legacy).
-    pub fn read_cancelable(
-        &mut self,
-        label: u64,
-        max: usize,
-        id: u64,
-        token: T,
-        out: &mut [u8],
-    ) -> Taken<T> {
-        match self.owner {
-            Some(owner) if owner != label => return Taken::Refused(token),
-            Some(_) if self.waiting.is_some() => return Taken::Refused(token),
-            _ => self.owner = Some(label),
+        if !self.claim(label) {
+            return Taken::Refused(token);
         }
         if self.len > 0 {
             return Taken::Now(self.copy_out(max, out), token);
         }
-        self.waiting = Some((max, id, token));
+        self.waiting = Some((max, token));
         Taken::Waits
     }
 
-    /// The read that waits takes what came: its token and the count of
-    /// bytes it moved into `out`; None while no read waits or nothing came.
+    /// The plain read that waits takes what came: its token and the count
+    /// of bytes it moved into `out`; None while no read waits or nothing
+    /// came.
     pub fn answer(&mut self, out: &mut [u8]) -> Option<(T, usize)> {
         if self.len == 0 {
             return None;
         }
-        let (max, _, token) = self.waiting.take()?;
+        let (max, token) = self.waiting.take()?;
         Some((token, self.copy_out(max, out)))
     }
 
-    /// Cancel only the matching session and nonzero identifier. Neither
-    /// ownership nor buffered bytes change; repeated cancellation is harmless.
-    pub fn cancel(&mut self, label: u64, id: u64) -> Option<T> {
-        if id == 0
-            || self.owner != Some(label)
-            || self
-                .waiting
-                .as_ref()
-                .is_none_or(|(_, pending, _)| *pending != id)
-        {
+    /// READ_START of at most `max` bytes from the client of `label`.
+    pub fn start(&mut self, label: u64, max: usize, out: &mut [u8]) -> Start {
+        if !self.claim(label) {
+            return Start::Refused;
+        }
+        if self.len > 0 {
+            return Start::Now(self.copy_out(max, out));
+        }
+        let key = self.next_key;
+        self.next_key = key.wrapping_add(1).max(1);
+        self.reader = Some(Reader {
+            label,
+            key,
+            max,
+            notify: None,
+            told: false,
+        });
+        Start::Wait(key)
+    }
+
+    /// Takes the bytes of the waiting read of `label` under `key`, when
+    /// some came; the read is over then.
+    fn finish(&mut self, label: u64, key: u64, out: &mut [u8]) -> Option<Option<usize>> {
+        let reader = self.reader.as_ref()?;
+        if reader.label != label || reader.key != key {
             return None;
         }
-        self.waiting.take().map(|(_, _, token)| token)
+        if self.len == 0 {
+            return Some(None);
+        }
+        let max = reader.max;
+        self.reader = None;
+        Some(Some(self.copy_out(max, out)))
+    }
+
+    /// READ_TAKE: the bytes that came, or ARMED, keeping `notify` when it
+    /// came with the request.
+    pub fn take(&mut self, label: u64, key: u64, notify: Option<H>, out: &mut [u8]) -> Taken2 {
+        match self.finish(label, key, out) {
+            None => Taken2::Unknown,
+            Some(Some(n)) => Taken2::Ready(n),
+            Some(None) => {
+                let reader = self.reader.as_mut().expect("the waiting read");
+                if notify.is_some() {
+                    reader.notify = notify;
+                    reader.told = false;
+                }
+                Taken2::Armed
+            }
+        }
+    }
+
+    /// READ_CANCEL: the bytes that came, or CANCELLED with nothing taken.
+    pub fn cancel(&mut self, label: u64, key: u64, out: &mut [u8]) -> Taken2 {
+        match self.finish(label, key, out) {
+            None => Taken2::Unknown,
+            Some(Some(n)) => Taken2::Ready(n),
+            Some(None) => {
+                self.reader = None;
+                Taken2::Cancelled
+            }
+        }
+    }
+
+    /// The handle to tell the waiting read that input came, once: Some
+    /// when bytes are there and the read armed and was not told yet.
+    pub fn to_tell(&mut self) -> Option<&H> {
+        if self.len == 0 {
+            return None;
+        }
+        let reader = self.reader.as_mut()?;
+        if reader.told || reader.notify.is_none() {
+            return None;
+        }
+        reader.told = true;
+        reader.notify.as_ref()
+    }
+
+    /// Whether a read in two steps waits, for the probes.
+    pub fn reading(&self) -> bool {
+        self.reader.is_some()
     }
 
     /// Restore bytes when reply delivery failed. The single driver thread
@@ -172,12 +285,13 @@ impl<T> Input<T> {
             return None;
         }
         self.owner = None;
-        self.waiting.take().map(|(_, _, token)| token)
+        self.reader = None;
+        self.waiting.take().map(|(_, token)| token)
     }
 }
 
-impl<T> Default for Input<T> {
-    fn default() -> Input<T> {
+impl<T, H> Default for Input<T, H> {
+    fn default() -> Input<T, H> {
         Input::new()
     }
 }
@@ -187,33 +301,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cancellation_matches_session_and_id_and_preserves_bytes() {
-        let mut input = Input::new();
+    fn a_read_in_two_steps_keeps_its_bytes_until_take_or_cancel() {
+        let mut input: Input<char, &str> = Input::new();
         let mut out = [0; RX_RING];
-        assert_eq!(input.read_cancelable(7, 2, 11, 'a', &mut out), Taken::Waits);
-        assert_eq!(input.cancel(8, 11), None);
-        assert_eq!(input.cancel(7, 10), None);
-        assert_eq!(input.cancel(7, 0), None);
+        assert_eq!(input.start(7, 2, &mut out), Start::Wait(1));
+        assert_eq!(input.start(8, 2, &mut out), Start::Refused);
+        assert_eq!(input.start(7, 2, &mut out), Start::Refused);
+        assert_eq!(input.take(8, 1, None, &mut out), Taken2::Unknown);
+        assert_eq!(input.take(7, 2, None, &mut out), Taken2::Unknown);
+        assert_eq!(input.take(7, 1, Some("h"), &mut out), Taken2::Armed);
+        assert_eq!(input.to_tell(), None);
         assert!(input.push(u32::from(b'q')));
-        assert_eq!(input.cancel(7, 11), Some('a'));
-        assert_eq!(input.cancel(7, 11), None);
-        assert_eq!(input.owner(), Some(7));
-        assert_eq!(
-            input.read_cancelable(7, 1, 12, 'b', &mut out),
-            Taken::Now(1, 'b')
-        );
+        assert_eq!(input.to_tell(), Some(&"h"));
+        assert_eq!(input.to_tell(), None);
+        // Cancel after the bytes came gives them: nothing is lost.
+        assert_eq!(input.cancel(7, 1, &mut out), Taken2::Ready(1));
         assert_eq!(out[0], b'q');
-        assert_eq!(input.read_cancelable(7, 1, 13, 'c', &mut out), Taken::Waits);
-        assert_eq!(input.cancel(7, 11), None);
-        assert_eq!(input.cancel(7, 13), Some('c'));
-        assert_eq!(input.read(7, 1, 'd', &mut out), Taken::Waits);
-        assert_eq!(input.cancel(7, 13), None);
-        assert_eq!(input.gone(7), Some('d'));
+        assert!(!input.reading());
+        // Cancel before they came takes nothing.
+        assert_eq!(input.start(7, 2, &mut out), Start::Wait(2));
+        assert_eq!(input.cancel(7, 2, &mut out), Taken2::Cancelled);
+        assert_eq!(input.cancel(7, 2, &mut out), Taken2::Unknown);
+        assert!(input.push(u32::from(b'r')));
+        assert_eq!(input.start(7, 4, &mut out), Start::Now(1));
+        assert_eq!(out[0], b'r');
+        assert_eq!(input.start(7, 4, &mut out), Start::Wait(3));
+        assert_eq!(input.read(7, 1, 'a', &mut out), Taken::Refused('a'));
+        assert_eq!(input.gone(7), None);
+        assert!(!input.reading());
     }
 
     #[test]
     fn failed_delivery_restores_wrapped_bytes_in_order() {
-        let mut input = Input::new();
+        let mut input: Input<char> = Input::new();
         let mut out = [0; RX_RING];
         for value in 0..RX_RING {
             assert!(input.push(value as u32));
@@ -231,22 +351,19 @@ mod tests {
         assert_eq!(input.read(7, 5, 'c', &mut out), Taken::Now(5, 'c'));
         assert_eq!(&out[..5], &[254, 255, b'a', b'b', b'c']);
         assert_eq!(input.room(), RX_RING);
-        assert_eq!(input.read_cancelable(7, 2, 1, 'd', &mut out), Taken::Waits);
+        assert_eq!(input.read(7, 2, 'd', &mut out), Taken::Waits);
         for value in *b"xyz" {
             assert!(input.push(u32::from(value)));
         }
         assert_eq!(input.answer(&mut out), Some(('d', 2)));
         input.restore(&out[..2]);
-        assert_eq!(
-            input.read_cancelable(7, 3, 2, 'e', &mut out),
-            Taken::Now(3, 'e')
-        );
+        assert_eq!(input.read(7, 3, 'e', &mut out), Taken::Now(3, 'e'));
         assert_eq!(&out[..3], b"xyz");
     }
 
     #[test]
     fn the_first_reader_owns_the_console() {
-        let mut i = Input::new();
+        let mut i: Input<char> = Input::new();
         assert_eq!(i.owner(), None);
         assert_eq!(i.read(7, 64, 'a', &mut [0; 64]), Taken::Waits);
         assert_eq!(i.owner(), Some(7));
@@ -254,7 +371,7 @@ mod tests {
 
     #[test]
     fn another_reader_gets_bad_state() {
-        let mut i = Input::new();
+        let mut i: Input<char> = Input::new();
         let mut out = [0; 64];
         assert!(i.push(u32::from(b'q')));
         assert_eq!(i.read(7, 64, 'a', &mut out), Taken::Now(1, 'a'));
@@ -267,7 +384,7 @@ mod tests {
 
     #[test]
     fn the_owner_that_goes_frees_the_console() {
-        let mut i = Input::new();
+        let mut i: Input<char> = Input::new();
         let mut out = [0; 64];
         assert_eq!(i.read(7, 64, 'a', &mut out), Taken::Waits);
         assert_eq!(i.gone(8), None);
@@ -280,7 +397,7 @@ mod tests {
 
     #[test]
     fn a_waiting_read_takes_what_comes() {
-        let mut i = Input::new();
+        let mut i: Input<char> = Input::new();
         let mut out = [0; 64];
         assert_eq!(i.answer(&mut out), None);
         assert_eq!(i.read(7, 2, 'a', &mut out), Taken::Waits);

@@ -1396,6 +1396,7 @@ mod tests {
                 "posix",
                 "clock",
                 "clock-peer",
+                "long",
                 "posix-abi-probe"
             ]
         );

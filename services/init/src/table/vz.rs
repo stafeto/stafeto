@@ -128,9 +128,10 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::POSIX_ABI_TABLE[3],
     Record {
-        connects: &["ramfs", "clock", "clock-peer", "posix", "uart"],
+        connects: &["ramfs", "clock", "clock-peer", "posix", "long", "uart"],
         ..super::ramfs::POSIX_ABI_TABLE[4]
     },
+    super::ramfs::POSIX_ABI_TABLE[5],
 ];
 
 /// The RAM file service and a probe that reads the console, as

@@ -101,7 +101,7 @@ const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
-const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -113,10 +113,11 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 /// The POSIX ABI image whose process service ends before it registers:
 /// each POSIX process fails its load (`posix_orphans`).
-const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -128,8 +129,9 @@ const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
-const POSIX_THREAD_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -151,6 +153,7 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 6] = [
         CHILD_STACK_SIZE,
         &[],
     ),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
@@ -212,7 +215,7 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
         &["cancel-input"],
     ),
 ];
-const POSIX_SHARED_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -229,6 +232,7 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 6] = [
         CHILD_STACK_SIZE,
         &[],
     ),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
 const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
@@ -285,7 +289,7 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
         &["interrupt-probe"],
     ),
 ];
-const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -308,6 +312,7 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 7] = [
         CHILD_STACK_SIZE,
         &[],
     ),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
@@ -1309,6 +1314,11 @@ fn posix_abi_probe() -> Result<(), String> {
                 32 * 1024,
             ),
             ("posix-abi-probe", PathBuf::from(linked), CHILD_STACK_SIZE),
+            (
+                "svc",
+                image_elf(&target, "boot-posix-abi.img", "test-svc"),
+                SVC_STACK_SIZE,
+            ),
         ],
     )?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -1513,10 +1523,7 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
     // Inject no input until cleanup and recovery have completed.
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
-        run.expect(
-            "posix-interrupt-probe: interrupted before cleanup",
-            BOOT_TIMEOUT,
-        )?;
+        run.expect("posix-interrupt-probe: read waits armed", BOOT_TIMEOUT)?;
         run.send("r")?;
         run.expect("posix-interrupt-probe: retry waiting", BOOT_TIMEOUT)?;
         run.send("q")?;

@@ -142,11 +142,11 @@ impl Default for Irq {
 /// Reads the receive FIFO into `input`: up to `limit` bytes, while
 /// `rx_empty` (FR.RXFE) says bytes wait, each as `dr` reads DR. Gives the
 /// count.
-pub fn receive<T>(
+pub fn receive<T, H>(
     limit: usize,
     mut rx_empty: impl FnMut() -> bool,
     mut dr: impl FnMut() -> u32,
-    input: &mut Input<T>,
+    input: &mut Input<T, H>,
 ) -> usize {
     let mut n = 0;
     while n < limit && !rx_empty() && input.push(dr()) {

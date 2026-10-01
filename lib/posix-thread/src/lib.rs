@@ -58,6 +58,8 @@ pub mod flag {
     pub const EXITING: u32 = 1 << 6;
     /// The entry of signals is bound and enabled.
     pub const SIGNALS_READY: u32 = 1 << 7;
+    /// A handler without SA_RESTART ran since a wait cleared this.
+    pub const NO_RESTART: u32 = 1 << 8;
     /// The depth of the critical sections: a section adds DEPTH_ONE.
     pub const DEPTH_SHIFT: u32 = 16;
     pub const DEPTH_ONE: u32 = 1 << DEPTH_SHIFT;

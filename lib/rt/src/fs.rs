@@ -8,38 +8,9 @@
 use crate::handle::{Channel, Handle};
 use crate::{console, service, sys};
 use abi::{Error, MESSAGE_MAX};
-use core::sync::atomic::{AtomicU64, Ordering};
 use proto_fs::{MAX_READ, MAX_WRITE, Metadata, Method, valid_path};
-use proto_uart::{CancelRead, CancelableRead, ReadReply, WriteReply, WriteRequest};
+use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
 use proto_wire::{Reader, Status, Writer};
-
-// Process-wide IDs never repeat within any retained UART session, even
-// when multiple Input snapshots read from different native threads.
-static NEXT_READ: AtomicU64 = AtomicU64::new(1);
-
-fn next_read_id() -> Result<u64, Status> {
-    NEXT_READ
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-        .map_err(|_| Status::Kernel(Error::LimitReached))
-}
-
-// Cleanup is idempotent, so an interrupted acknowledgement can be retried.
-// Return EINTR only after the driver removed this request or went away.
-#[inline(never)]
-fn cancel_read(uart: &Handle<Channel>, id: u64) -> Result<(), Status> {
-    let mut request = Writer::new();
-    CancelRead { id }.write(&mut request)?;
-    let mut reply = [0; MESSAGE_MAX];
-    loop {
-        match Files::call_on(uart, request.as_bytes(), &mut reply) {
-            Ok(bytes) if bytes == proto_wire::reply(Status::Ok) => return Ok(()),
-            Ok(_) => return Err(Status::BadSize),
-            Err(Status::Kernel(Error::Interrupted)) => continue,
-            Err(Status::Kernel(Error::PeerClosed)) => return Ok(()),
-            Err(status) => return Err(status),
-        }
-    }
-}
 
 /// A console transport snapshot, without a borrow of the file owner.
 /// It carries no application buffer or file-state pointer. The owning Files
@@ -61,54 +32,57 @@ impl Input {
         Self { uart }
     }
 
+    /// A plain READ (proto_uart): the reply waits for input. A program
+    /// with signals reads in two steps instead (posix-abi), so that a
+    /// signal never waits behind it.
     pub fn read(&self, out: &mut [u8]) -> Result<usize, Status> {
         if out.is_empty() {
             return Ok(0);
         }
-        if let Some(raw) = self.uart {
-            let uart = Handle::<Channel>::borrowed(raw);
-            let max = out.len().min(proto_uart::READ_MAX) as u32;
-            let mut request = Writer::new();
-            let id = next_read_id()?;
-            CancelableRead { max, id }.write(&mut request)?;
-            let mut reply = [0; MESSAGE_MAX];
-            let bytes = match Files::call_on(&uart, request.as_bytes(), &mut reply) {
-                Err(Status::Kernel(Error::Interrupted)) => {
-                    cancel_read(&uart, id)?;
-                    return Err(Status::Kernel(Error::Interrupted));
-                }
-                result => result?,
-            };
-            let input = ReadReply::read(bytes, max)?.bytes;
-            let mut echo = [0; proto_uart::READ_MAX];
-            let mut echoed = 0;
-            for (dst, &src) in out.iter_mut().zip(input) {
-                *dst = if src == b'\r' { b'\n' } else { src };
-            }
-            // Data has already been delivered. Echo failure cannot turn this
-            // successful read into EINTR and lose its bytes.
-            for &src in input {
-                let visible = if src == b'\r' {
-                    &b"\r\n"[..]
-                } else {
-                    core::slice::from_ref(&src)
-                };
-                if echoed + visible.len() > echo.len() {
-                    if console_write(Some(&uart), &echo[..echoed]).is_err() {
-                        return Ok(input.len());
-                    }
-                    echoed = 0;
-                }
-                echo[echoed..echoed + visible.len()].copy_from_slice(visible);
-                echoed += visible.len();
-            }
-            if echoed > 0 {
-                let _ = console_write(Some(&uart), &echo[..echoed]);
-            }
-            return Ok(input.len());
+        let Some(raw) = self.uart else {
+            // No console's driver to read from: input has no transport.
+            return Err(Status::Kernel(Error::BadHandle));
+        };
+        let uart = Handle::<Channel>::borrowed(raw);
+        let max = out.len().min(proto_uart::READ_MAX) as u32;
+        let mut request = Writer::new();
+        ReadRequest { max }.write(&mut request)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = Files::call_on(&uart, request.as_bytes(), &mut reply)?;
+        let input = ReadReply::read(bytes, max)?.bytes;
+        Ok(self.deliver(input, out))
+    }
+
+    /// Bytes `input` the console gave: into `out` with CR as LF, and their
+    /// echo back to the console (CR as CR LF); the count.
+    pub fn deliver(&self, input: &[u8], out: &mut [u8]) -> usize {
+        let uart = self.uart.map(Handle::<Channel>::borrowed);
+        let mut echo = [0; proto_uart::READ_MAX];
+        let mut echoed = 0;
+        for (dst, &src) in out.iter_mut().zip(input) {
+            *dst = if src == b'\r' { b'\n' } else { src };
         }
-        // No console's driver to read from: input has no transport.
-        Err(Status::Kernel(Error::BadHandle))
+        // Data has already been delivered. Echo failure cannot turn this
+        // successful read into an error and lose its bytes.
+        for &src in input {
+            let visible = if src == b'\r' {
+                &b"\r\n"[..]
+            } else {
+                core::slice::from_ref(&src)
+            };
+            if echoed + visible.len() > echo.len() {
+                if console_write(uart.as_deref(), &echo[..echoed]).is_err() {
+                    return input.len().min(out.len());
+                }
+                echoed = 0;
+            }
+            echo[echoed..echoed + visible.len()].copy_from_slice(visible);
+            echoed += visible.len();
+        }
+        if echoed > 0 {
+            let _ = console_write(uart.as_deref(), &echo[..echoed]);
+        }
+        input.len().min(out.len())
     }
 }
 
