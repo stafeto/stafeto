@@ -237,7 +237,9 @@ the sessions' slots, while those of the tree wait below it and each wakes
 boosted to the slot's level, some 7 ticks a wakeup (with its receivers at
 11, the tree gives 19,785 and 20,088). The same build measures the calls
 of upcalls and of a request's identity (the line `upcall ticks`); xtask
-prints the longest teardown row as `B on <machine>`.
+prints the longest row of the lines of portions (memory, timer,
+interrupt path, device window and teardown, the count `threads` aside)
+as `B on <machine>`, with the line it comes from.
 
 Stage 3 takes the stopping of the threads out of the call: the rows
 `stop_threads` and `stop_senders` give way to `end_call`, the call part of

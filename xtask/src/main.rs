@@ -2707,6 +2707,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         r.passed.len()
     );
     if icount {
+        let mut measured = Vec::new();
         for (what, rows) in [
             ("ipc round trip", &ROUND_TRIP_ROWS[..]),
             ("memory portions", &MEMORY_PORTION_ROWS[..]),
@@ -2718,11 +2719,10 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
-            if what == "teardown portions" {
-                let (row, n) = blocking_time(rows, &ticks);
-                println!("B on {}: {row}={n}", m.name);
-            }
+            measured.push((what, rows, ticks));
         }
+        let (what, row, n) = blocking_time(&measured);
+        println!("B on {}: {row}={n} ({what})", m.name);
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
@@ -2733,17 +2733,34 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     Ok(r.passed.len())
 }
 
-/// The longest of the teardown `rows` with their `ticks`, the row
-/// `threads` a count apart: the blocking time B of every level (spec 15.3),
-/// shown on its own so that a change of the longest row stands out in the
-/// output of `ci`; no number fails it.
-fn blocking_time<'a>(rows: &[&'a str], ticks: &[u64]) -> (&'a str, u64) {
-    rows.iter()
-        .zip(ticks)
-        .filter(|(row, _)| **row != "threads")
-        .map(|(row, &n)| (*row, n))
-        .max_by_key(|&(_, n)| n)
-        .unwrap_or(("none", 0))
+/// The lines whose rows are each one stretch of the kernel between two
+/// polls for interrupts: a portion of a long call, of the timer queue or
+/// of the cleanup, or a whole short call (spec 15.3).
+const PORTION_LINES: [&str; 5] = [
+    "memory portions",
+    "timer portions",
+    "interrupt path",
+    "device window",
+    "teardown portions",
+];
+
+/// The longest row of the PORTION_LINES among the `measured` lines (name,
+/// rows, ticks), with its line: the blocking time B of every level (spec
+/// 15.3). The teardown row `threads` is a count of threads and takes no
+/// part. Shown on its own so that a change of the longest row stands out
+/// in the output of `ci`; no number fails it.
+fn blocking_time<'a>(measured: &[(&'a str, &[&'a str], Vec<u64>)]) -> (&'a str, &'a str, u64) {
+    measured
+        .iter()
+        .filter(|(what, _, _)| PORTION_LINES.contains(what))
+        .flat_map(|(what, rows, ticks)| {
+            rows.iter()
+                .zip(ticks)
+                .map(move |(row, &n)| (*what, *row, n))
+        })
+        .filter(|&(what, row, _)| (what, row) != ("teardown portions", "threads"))
+        .max_by_key(|&(_, _, n)| n)
+        .unwrap_or(("none", "none", 0))
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -3809,16 +3826,44 @@ mod tests {
         }
     }
 
-    /// B is the longest teardown row, never the count of threads.
+    /// B is the longest row of any line of portions, never the count of
+    /// threads and never a row of a line that is no portion.
     #[test]
     fn blocking_time_is_the_longest_row_but_threads() {
-        let ticks = [5, 15, 1, 24, 42, 30, 20, 21, 128];
+        let line =
+            |what, rows: &'static [&'static str], ticks: &[u64]| (what, rows, ticks.to_vec());
+        let memory = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let timers = [1, 2, 3, 4];
+        let teardown = [5, 15, 1, 24, 42, 30, 20, 21, 128];
+        let mut measured = vec![
+            line("ipc round trip", &ROUND_TRIP_ROWS, &[1, 2, 3, 4, 5, 99_999]),
+            line("memory portions", &MEMORY_PORTION_ROWS, &memory),
+            line("timer portions", &TIMER_PORTION_ROWS, &timers),
+            line("interrupt path", &INTERRUPT_PATH_ROWS, &[1, 2, 3, 4]),
+            line("device window", &WINDOW_ROWS, &[1, 2, 3]),
+            line("upcall", &UPCALL_ROWS, &[1, 2, 3, 4, 99_999]),
+            line("teardown portions", &TEARDOWN_ROWS, &teardown),
+        ];
         assert_eq!(
-            blocking_time(&TEARDOWN_ROWS, &ticks),
-            ("teardown_threads", 42)
+            blocking_time(&measured),
+            ("teardown portions", "teardown_threads", 42)
         );
-        let ticks = [5, 15, 1, 24, 18, 30, 20, 21, 50_000];
-        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("child_threads", 30));
+        measured[6].2 = vec![5, 15, 1, 24, 18, 30, 20, 21, 50_000];
+        assert_eq!(
+            blocking_time(&measured),
+            ("teardown portions", "child_threads", 30)
+        );
+        // A memory portion above every teardown row is B.
+        measured[1].2[8] = 31;
+        assert_eq!(
+            blocking_time(&measured),
+            ("memory portions", "first_map", 31)
+        );
+        // So is the timer queue's, and a device window's.
+        measured[2].2[1] = 32;
+        assert_eq!(blocking_time(&measured), ("timer portions", "fire", 32));
+        measured[4].2[1] = 33;
+        assert_eq!(blocking_time(&measured), ("device window", "map", 33));
     }
 
     /// A child's panic is its place and its message on two whole lines, and

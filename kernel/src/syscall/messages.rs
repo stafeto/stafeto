@@ -3,7 +3,15 @@
 
 //! The calls of channels and messages (spec 6, 11): channel_create, notify, receive, send and reply.
 
-use super::*;
+use super::{Args, Values, caller, caller_ceiling, cause, lookup, set_result};
+use crate::channel::Via;
+use crate::object::Object;
+use crate::process;
+use crate::thread::{self, Thread};
+use crate::{channel, session};
+use abi::{CHANNEL_RIGHTS, Error, Rights};
+use core::ptr::NonNull;
+use kcore::args::{Desc, bits_arg, handle_values_arg, priority_arg, under_ceilings, wait_arg};
 
 /// channel_create(x0 priority): a channel whose slot of label 0 has the
 /// priority (spec 6.5); x1 returns a handle to it with SEND, NOTIFY,

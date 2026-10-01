@@ -3,7 +3,12 @@
 
 //! The calls of upcalls (spec 11): thread_upcall_bind, thread_upcall_control, thread_upcall_request and thread_upcall_return.
 
-use super::*;
+use super::{Args, Values, cause, lookup, set_result};
+use crate::object::Object;
+use crate::sched;
+use crate::thread::{self, Thread};
+use abi::{Error, Rights};
+use core::ptr::NonNull;
 
 pub(super) fn thread_upcall_bind(mut thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if thread::buffer_page(thread).is_none() {

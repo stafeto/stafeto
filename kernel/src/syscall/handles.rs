@@ -3,7 +3,14 @@
 
 //! The calls on handles (spec 11): handle_close and handle_duplicate.
 
-use super::*;
+use super::{Args, Values, caller, caller_ceiling, cause, lookup};
+use crate::object::Object;
+use crate::process;
+use crate::thread::Thread;
+use crate::{channel, session};
+use abi::{Error, Handle, Rights};
+use core::ptr::NonNull;
+use kcore::args::{notify_priority_arg, rights_arg, under_ceilings};
 
 /// handle_close(x0 handle), no right needed: the handle's reference goes,
 /// and the last reference queues the object for cleanup at the caller's
