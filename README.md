@@ -1,6 +1,11 @@
 # stafeto
 
-A learning phone OS built on its own microkernel (Rust, AArch64).
+A learning phone OS built on its own microkernel, written in Rust for
+AArch64. The kernel keeps only what must run privileged: address spaces,
+threads, scheduling, handles and messages. Drivers, file systems and the
+POSIX layer run as ordinary processes that talk through synchronous
+messages. The system boots in QEMU and on Apple silicon today; the
+PinePhone is the first real phone it targets.
 
 *Stafeto* is Esperanto for "messenger" and "relay". The system is built
 around messages that pass control from hand to hand.
@@ -11,386 +16,179 @@ around messages that pass control from hand to hand.
 - synchronous messages and handles with rights (a capability model);
 - drivers and services run as ordinary processes;
 - soft real time: every path inside the kernel is bounded in time;
-- the kernel is under 200 KB.
+- the kernel image stays under 200 KiB.
 
 ## Status
 
-stafeto boots in QEMU and runs programs at EL0, under QEMU's emulation
-and on Apple silicon under HVF. The native Apple Virtualization.framework
-port boots `init` and the shell through a Virtio PCI console without QEMU.
-Console input currently uses polling; interrupt-driven input and a separate
-user-space console driver remain future work. What works today:
+Numbers below are from `main` at 764be2a.
 
-- **Boot:** arm64 Image, drop from EL2, MMU on, device tree, checked boot
-  image.
-- **Interrupt controllers:** GICv2 and GICv3, chosen from the device tree;
-  drivers reach device registers with single loads and stores, which a
-  hypervisor can emulate.
-- **Memory:** the kernel's own page tables with W^X, a buddy frame
-  allocator, object pools, an address space with an ASID per process; every
-  process pays for its kernel memory from its quota. Memory objects take all
-  their pages when they are made, and a process maps them R, RW or RX,
-  never writable and executable at once, into its own space or into a
-  process whose handle with `MANAGE` it holds; long calls go in bounded
-  portions that let interrupts in. The segments and the stack of `init`
-  are memory objects too.
-- **Execution:** threads at EL0 with registers and FP/SIMD saved on every
-  switch; a scheduler with 64 priority levels (round robin with a 4 ms
-  quantum, and FIFO) and tickless timer preemption.
-- **Objects and calls:** 64-bit handles with rights; processes, threads,
-  channels, sessions, program timers, memory objects, device windows and
-  interrupt bindings; the system calls of the kernel (`debug_write`,
-  `yield`, `thread_*`, `process_*`, `channel_create`, `notify`, `send`,
-  `receive`, `reply`, `request_identity`, `timer_*`, `mem_create`, `mem_map`, `mem_unmap`,
-  `mem_protect`, `irq_bind`, `irq_ack`, `device_window_create`,
-  `object_info`), whose `object_info` reports the state of processes,
-  threads, channels, memory objects, device windows and interrupt
-  bindings.
-- **Messages:** synchronous requests and replies of up to 1 KB, the first
-  64 bytes in registers and the rest through a per-thread message buffer;
-  up to four handles move with a message, keeping their rights and labels;
-  a memory object moves the same way, so larger data goes through pages
-  both sides map; a service works at its client's priority under its own
-  ceiling until it replies; a fast path hands the CPU straight to a waiting
-  service.
-- **Devices:** an interrupt of a device line comes to its driver as a
-  notification of a channel, and the line stays masked until the driver
-  calls `irq_ack`; a device window maps the registers of a device into a
-  driver as device memory, never executable; a driver that dies frees its
-  line at once. The tests drive the PL031 real-time clock of QEMU from
-  EL0; a device window over the console's page takes the console from
-  the kernel until the window goes.
-- **Real time:** program timers fire at the priority of their slots, in
-  bounded portions after the timer's interrupt, which takes no timer off
-  itself.
-- **Faults:** a program fault ends only its own process, and the parent
-  learns why through its exit channel; the tests check it on child
-  processes with code that `init` loads from the boot image.
-- **Runtime:** programs build on `lib/rt`. A handle owns its table entry
-  and closes it when dropped; a send or a reply the kernel refuses gives
-  back the handles it left. The test images are strict builds, where
-  `BAD_HANDLE` panics. The kernel and `rt` share one time scale, a
-  multiply and a shift, and `rt` waits with a bound through a timer. A
-  parent starts a child with named handles and arguments through the
-  start protocol (`proto/wire`, `proto/init`). A service loop keeps a
-  session per client label with its own limits, answers deferred replies
-  when a client goes, and sends its heartbeat at absolute deadlines from
-  the thread that serves requests. One ELF reader, `bootimg::elf`, builds
-  the boot image, whose reader refuses two files with one name.
-- **Services:** `init` starts the services of its table in the order of
-  their dependencies and refuses a table with a cycle or a broken
-  ceiling; it hands out sessions by name (`connect`), restarts a service
-  that ends or goes silent after a growing pause, marks it broken after
-  five failures in 60 s, and loads, kills and tears services down on a
-  worker thread just above the service's ceiling. An image of a test
-  table checks all of it.
-- **Kernel log:** `debug_write` and the kernel's lines about processes go
-  into a ring of 64 records in the kernel, which the console's driver
-  reads and takes; the kernel prints a record itself only while no
-  driver holds the console, `init` shows what is left once the driver
-  is broken, and a panic prints what nobody showed.
-- **UART driver:** the PL011 driver (`services/uart`) serves the console
-  on interrupts at priority 60; it shows the kernel log between whole
-  lines of its clients, lets writes wait whole for room and gives input
-  to one reader at a time (`proto/uart`).
-- **Rust POSIX clocks:** dedicated C and pthread test images share a realtime
-  clock service and expose `clock_gettime`, `clock_getres` and `clock_settime`.
-  Realtime starts at an unsynchronized Unix epoch until explicitly set;
-  monotonic time uses the common hardware counter.
-- **Rust POSIX absolute mutex waits:** C and pthread images expose
-  `pthread_mutex_timedlock` and `pthread_mutex_clocklock`. Calendar changes
-  wake active waits; interrupted requests retain deadlines and committed results.
-- **Rust POSIX sleep waits:** `nanosleep` and `clock_nanosleep` share the pthread
-  deadline timer, return elapsed remainders and remove waits before cancellation
-  cleanup. Relative waits ignore calendar settings. Signal restart policy remains work.
-- **Rust POSIX nested cancellation windows:** read/write in nested native
-  handlers retains the interrupted caller's window; a later cancellation wakes
-  its original wait and runs cleanup. File, pthread, clock and heap owners retain
-  committed results across nested entry; local RAM outcome accounting remains work.
-- **Native user entries:** generic upcalls can enter a computing or IPC-waiting
-  thread and restore its registers, TLS, FP/SIMD and message buffer, including
-  nesting. Local borrowed file state defers entry while keeping IPC interruptible.
-- **Rust POSIX process identity:** `getpid` and `getppid` return native numeric
-  identities shared by all pthreads. IDs and parent links survive ended shells;
-  process routing and orphan adoption remain work.
-- **Rust POSIX credentials:** a shared authenticated service owns real,
-  effective and saved UID/GID. Eight C calls support queries, temporary
-  privilege changes and irreversible drops. Threads share state; child
-  registration preserves parent snapshots and retries preserve outcomes.
-  Supplementary groups, file permission checks and set-ID exec remain work.
-- **Rust POSIX ordinary signals:** C and pthread probes provide process actions,
-  per-thread masks, pending sets, `raise` and `pthread_kill`, including CPU/IPC
-  delivery, inherited masks, NODEFER, RESETHAND and restored errno. `sigwait`
-  accepts pending/live thread-directed signals without a handler, preserving
-  masks and dispositions through interruption and deferred cancellation.
-  `sigwaitinfo` also returns a retained signal-information snapshot; unrelated
-  handlers resume these waits. `sigtimedwait` adds a preserved monotonic interval,
-  EAGAIN on expiration and pending late signals. `SA_SIGINFO` handlers receive retained information
-  and a real interrupted context; register, PC, SIMD, flag and mask edits
-  apply on return. Process routing, queued signals, alternate stacks,
-  restart policy and stop/continue remain work.
-- **Shell:** `help`, `echo`, `uptime`, `ps`, `mem`, `bench`, `trace` and
-  `crash uart`, which crashes the driver: `init` restarts it, and the
-  shell connects to the new instance; after five crashes in 60 s the
-  driver is broken, the shell says so through the kernel, and `init`
-  shows the driver's last fault and its own decision.
+**Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
+turns on the MMU, reads the device tree and checks its boot image. It runs
+on three kinds of machine:
 
-`cargo xtask kernel-test` and `cargo xtask init-test` run the kernel and EL0
-init test images separately for focused changes.
+- QEMU `virt` under emulation (TCG), with GICv2 or GICv3;
+- QEMU with HVF on a Mac with Apple silicon, on Apple's GICv3 and on
+  QEMU's GICv2;
+- Apple Virtualization.framework without QEMU, through a Virtio PCI
+  console (`cargo xtask vz`).
 
-`cargo xtask run` boots to the shell's prompt. `cargo xtask test` runs
-the tests on QEMU's GICv2 and GICv3, a dialog with the shell through the
-console among them; `cargo xtask hvf` runs them on a Mac with Apple
-silicon, on Apple's GICv3 and on QEMU's GICv2.
+**Kernel.** 34 system calls (35 in the VZ build) over 64-bit handles
+with rights: processes, threads, channels, sessions, timers, memory
+objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
+four handles; a service runs at its client's priority under its own
+ceiling, and a fast path hands the CPU straight to a waiting service. The
+scheduler has 64 priority levels (round robin and FIFO) with tickless
+preemption. Every process pays for its kernel memory from a quota, memory
+is never writable and executable at once, and long operations run in
+bounded portions. Device interrupts reach drivers as notifications. A
+fault ends only its own process. The kernel image is 154,708 bytes of a
+204,800-byte budget.
 
-## Roadmap
+**User space and services.** `init` starts services from a table in
+dependency order, hands out sessions by name, restarts a service that
+crashes or goes silent and marks it broken after five failures in 60 s.
+The PL011 driver (`services/uart`) owns the console on interrupts and
+shows the kernel log. A RAM file service (`services/ramfs`) holds files
+and directories. Programs build on `lib/rt`, which owns handles, runs
+service loops and starts children through a start protocol.
 
-The work is split into subprojects; subproject 1 is split into stages and
-parts. Each finished part is merged through a pull request.
+**Shells.** The native shell boots by default and knows `help`, `echo`,
+`uptime`, `ps`, `mem`, `bench`, `trace` and `crash uart`; the last one
+crashes the driver, `init` restarts it and the shell reconnects. Separate
+images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
+and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
+links statically with Picolibc 1.8.12 through a small bridge
+(`lib/posix`).
 
-✅ done · 🚧 in progress · ⬜ planned
+**POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
+interface, implemented in Rust with a C ABI and a versioned sysroot
+(`tools/build-posix-sysroot.py`). The current crates cover paths,
+descriptors, files, `stat` and directories; the heap and the C locale;
+pthreads with cancellation, keys, `once` and mutexes; clocks and sleep;
+signal actions, masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and
+`SA_SIGINFO`; process IDs and credentials. Guest probes check them on QEMU
+and Apple VZ. The layer is a work in progress and paused: no real program
+uses it yet, and `ash` still runs on Picolibc. Details are in
+[docs/status.md](docs/status.md).
 
-### Subproject 1: kernel and minimal userland
+**Tests.** The kernel test image runs 166 tests (177 under `-icount`),
+the EL0 test `init` runs 224 and `kcore` has 402 host tests; `cargo xtask
+ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
+Apple silicon.
 
-| Stage | Part | What it brings | State |
-|---|---|---|---|
-| 1.1 Boot | | boot in QEMU, MMU, device tree, exceptions, in-kernel tests | ✅ [#2](https://github.com/stafeto/stafeto/pull/2) |
-| 1.2 Kernel | 1.2a Memory | page tables with W^X, buddy allocator, object pools, handles | ✅ [#3](https://github.com/stafeto/stafeto/pull/3) |
-| | 1.2b Threads and interrupts | GICv2, virtual timer, address spaces with ASIDs, EL0 threads with FP/SIMD | ✅ [#4](https://github.com/stafeto/stafeto/pull/4) |
-| | 1.2c System calls and scheduler | first system calls, 64-level scheduler, `init` from the boot image | ✅ [#5](https://github.com/stafeto/stafeto/pull/5) |
-| 1.3 Messages and objects | 1.3a Teardown and quotas | cleanup queue in bounded portions, process tree, quotas | ✅ [#6](https://github.com/stafeto/stafeto/pull/6) |
-| | 1.3b Channels and timers | channels, notifications, sessions with `CLIENT_GONE`, exit channel, program timers | ✅ [#8](https://github.com/stafeto/stafeto/pull/8) |
-| | 1.3c Requests and replies | `send`, `receive`, `reply`, message buffer, handle transfer, priority ceiling, fast path | ✅ [#11](https://github.com/stafeto/stafeto/pull/11) |
-| | 1.3d Memory objects | `mem_create`, `mem_map`, memory objects in messages, child processes with code | ✅ [#13](https://github.com/stafeto/stafeto/pull/13) |
-| | 1.3e Interrupts and devices | `irq_bind`, device windows, a test driver | ✅ [#14](https://github.com/stafeto/stafeto/pull/14) |
-| 1.4 Userland | | `init` with a service table and a watchdog, UART driver, shell, measurements | ✅ |
-| | 1.4a GICv3 and HVF | GICv3 driver, runs on Apple silicon under HVF, test runs end through PSCI | ✅ [#16](https://github.com/stafeto/stafeto/pull/16) |
-| | 1.4b Runtime and protocols | handles that own their entries, strict test builds, one time scale, `proto/wire` and `proto/init`, start protocol, service loop with sessions and a heartbeat, ELF reader in `bootimg` | ✅ [#17](https://github.com/stafeto/stafeto/pull/17) |
-| | 1.4c init services | `init` starts services from its table, refuses a table with a cycle or a broken ceiling, serves names through `connect`, restarts crashed and silent services and marks broken ones | ✅ [#18](https://github.com/stafeto/stafeto/pull/18) |
-| | 1.4d UART driver and shell | the kernel log, the PL011 driver on interrupts and the shell join init's table, `crash uart` shows the driver restart and the shell reconnecting | ✅ [#19](https://github.com/stafeto/stafeto/pull/19) |
-| | 1.4e Measurements and diagnostics | machine-specific TCG and HVF measurements, call maxima and entry timing, optional event trace, panic frame symbols | ✅ [#20](https://github.com/stafeto/stafeto/pull/20) |
+**Known limits.**
 
-Subproject 1 is done when `cargo xtask run` reaches a shell prompt,
-`crash uart` shows the driver restart and the shell reconnecting, and the
-kernel image stays under 200 KB.
-
-### Subproject 2 and later
-
-| # | Subproject | State |
-|---|---|---|
-| 2 | Name space and services: in-memory file system, virtio disk, programs from disk, and a Rust POSIX library with a C ABI | 🚧 |
-| 3 | Graphics and input: virtio-gpu, touch input, compositor | ⬜ |
-| 4 | Phone shell: home screen, notifications, settings, UI toolkit | ⬜ |
-| 5 | Packages: package format, signatures, installing from any source, app sandbox | ⬜ |
-| 6 | Network: virtio-net, a TCP/IP stack | ⬜ |
-| 7 | PinePhone port: boot through U-Boot, Allwinner A64 drivers | ⬜ |
-
-### Subproject 2: name space and services
-
-| Step | Deliverable and check | State |
-|---|---|---|
-| Virtual console | Boot to the shell on Apple Silicon through Virtualization.framework with `cargo xtask vz`; QEMU and HVF remain test platforms. | ✅ [#21](https://github.com/stafeto/stafeto/pull/21) |
-| File groundwork | Read an e2fsprogs ext4 image in a guest with `cargo xtask ext4ro`; exercise RAM file descriptors and static Picolibc I/O with `cargo xtask ramfs` and `cargo xtask cprobe`. | ✅ [#23](https://github.com/stafeto/stafeto/pull/23), [#24](https://github.com/stafeto/stafeto/pull/24) |
-| BusyBox shell | Run `cat` and an `ash` builtin script from boot images, then type `echo` and `exit` at an interactive `ash` prompt through the UART service. | ✅ [#24](https://github.com/stafeto/stafeto/pull/24), [#26](https://github.com/stafeto/stafeto/pull/26), [#27](https://github.com/stafeto/stafeto/pull/27) |
-| Directory utility | Run BusyBox `ls` over RAM files, including `ls -la` and `ls --help` from the interactive `ash` prompt. | ✅ [#28](https://github.com/stafeto/stafeto/pull/28) |
-| External programs | Load a static ELF from a file service and let `ash` start it, pass arguments and descriptors, and wait for its exit status. | ⬜ |
-| Shell composition | Add descriptor duplication, redirection, pipes, and the signal behavior needed for pipelines and exit status. | ⬜ |
-| Persistent files | Read ext4 through a Virtio block service, then qualify writes with `e2fsck` after normal and interrupted runs. Keep RAM files available for tests. | ⬜ |
-| Integrated userland | Boot `ash` and a small set of BusyBox utilities from storage on QEMU and Apple Virtualization.framework; check commands, redirection, pipelines, and exit status. | ⬜ |
-
-Program launch and block storage can proceed independently after the
-interactive shell check. An ext4 implementation becomes writable only
-after the recovery checks pass.
-
-#### Userland layers
-
-The kernel supplies isolation, scheduling, memory, handles, and IPC. A
-process service should use the existing `rt` ELF loader to start programs
-after boot and report exits. File, namespace, and terminal services own
-paths, descriptors, and interactive I/O. The target is a Rust POSIX
-service with a stable C ABI library for compatible programs and a small MIT
-client for GPLv2-only BusyBox. The current
-Picolibc build and small C hooks bootstrap BusyBox while that Rust
-implementation is built.
-
-Build upstream packages against a versioned AArch64 stafeto sysroot with
-headers, the appropriate C ABI client, startup code, and port patches. Keep one pinned source
-and patch manifest in `tools/`, then stage selected binaries and data into
-a root image. The current Picolibc and BusyBox build scripts are the first
-two package recipes. GPLv2-only packages retain a compatible C runtime and
-call the Rust POSIX service through the MIT client; compatible programs can
-use the Rust library directly. This lets more utilities share one build
-interface without copying their source into the kernel.
-
-#### Rust POSIX implementation
-
-The target is the full mandatory POSIX.1-2024 interface, implemented in Rust
-with C-compatible entry points, plus a conforming shell and utilities. Track
-optional interface groups separately. The current Picolibc bridge covers
-basic file calls and standard streams only. The GPL-3.0-or-later
-Rust crates now keep local path state, own a descriptor table with
-duplication, and perform bounded file operations through the RAM service. Each step below needs guest
-checks for successful calls, failures, and ABI layout.
-
-| Step | Interface and guest check | State |
-|---|---|---|
-| Rust pathname state | Keep the working directory and byte-oriented path components in GPL-3.0-or-later Rust; verify on the host and in a RAM file guest probe without linking BusyBox. | ✅ [#29](https://github.com/stafeto/stafeto/pull/29) |
-| Rust file client | Implement file metadata, relative file access, working-directory changes, and directory iteration in a GPL Rust package; verify through the RAM service in a guest. | ✅ [#30](https://github.com/stafeto/stafeto/pull/30) |
-| Rust file positioning | Add signed 64-bit `lseek`, all five POSIX.1-2024 origins, unchanged offsets on failure, and validated zero-length file I/O; verify on RAM files in the guest. | ✅ [#31](https://github.com/stafeto/stafeto/pull/31) |
-| Rust descriptor ownership | Own local descriptors, shared offsets, `dup`/`dup2`/`dup3`, descriptor flags, and standard-stream redirection; verify limits and lifetime in the guest. | ✅ [#32](https://github.com/stafeto/stafeto/pull/32) |
-| Initial Rust C ABI | Build ABI 1 headers, Rust startup and `libc.a`; boot a C main without Picolibc through both Cargo and standalone Clang linking; verify native-thread errno. | ✅ [#33](https://github.com/stafeto/stafeto/pull/33) |
-| Rust stat metadata | Export `stat`, `fstat` and `lstat` with a checked LP64 layout, stable RAM inode identity and timestamp updates; verify through Cargo and standalone C linking. | ✅ [#34](https://github.com/stafeto/stafeto/pull/34) |
-| Rust directory C ABI | Enumerate directories through owned descriptors with `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies; check inode identity, shared offsets and resource limits. | ✅ [#35](https://github.com/stafeto/stafeto/pull/35) |
-| Rust process allocation | Export malloc, calloc, realloc, reallocarray, free and aligned allocation over a shared process heap; verify overflow, quota failure, data preservation and cross-thread ownership. | ✅ [#36](https://github.com/stafeto/stafeto/pull/36) |
-| Rust directory selection and ordering | Add owned `scandir` results, C/POSIX `alphasort`, `strcoll`/`strxfrm`, locale selection and allocation-free `qsort`/`qsort_r`; check callback reentry and cleanup after partial allocation failure. | ✅ [#37](https://github.com/stafeto/stafeto/pull/37) |
-| Shared Rust process file state | Serialize current RAM file operations through one owner; verify cross-thread descriptors, offsets, cwd, DIR lifetime and independent errno. Request cancellation and future blocking file backends remain work. | ✅ [#38](https://github.com/stafeto/stafeto/pull/38) |
-| Rust console read concurrency | Wait for console input outside the file owner; verify file and heap progress, descriptor close/reuse, stdin redirection and byte-at-a-time bursts on UART and native Virtio. | ✅ [#39](https://github.com/stafeto/stafeto/pull/39) |
-| Rust file request lifetime | Replace caller-stack jobs with checked value messages; reject malformed requests before heap startup and preserve full message payloads across nested RAM calls. | ✅ [#40](https://github.com/stafeto/stafeto/pull/40) |
-| Rust IPC wait interruption | Wake a live IPC client with Interrupted/EINTR, release queued transfers and wait references, preserve delivered handles and validate the next reply token; check UART and Virtio reads. | ✅ [#41](https://github.com/stafeto/stafeto/pull/41) |
-| Rust console cancellation recovery | Remove the tagged UART read before EINTR, restore input after a rejected reply, retry on the same thread/session, and retain delivered bytes when echo is interrupted; check UART and Virtio. | ✅ [#42](https://github.com/stafeto/stafeto/pull/42) |
-| Rust pthread lifecycle | Create, join, detach and exit native threads with independent errno, inherited FP state, owned stacks and retry-safe results; verify interrupted waits and last-thread process exit. | ✅ [#43](https://github.com/stafeto/stafeto/pull/43) |
-| Rust deferred cancellation | Cancel read, write and join with disabled/pending state, LIFO handlers, acknowledged console cleanup and retained join results; verify the pre-IPC wake race on QEMU and Apple VZ. | ✅ [#44](https://github.com/stafeto/stafeto/pull/44) |
-| Rust thread-specific data | Provide pthread keys with isolated bindings, safe key/thread slot reuse, and four destructor passes after cleanup; verify interrupted replies and join ordering on QEMU and Apple VZ. | ✅ [#45](https://github.com/stafeto/stafeto/pull/45) |
-| Rust once initialization | Serialize one initializer per control, block contenders through IPC, publish application writes, and retry after cancellation/exit; verify nested recovery and interrupted replies on QEMU and Apple VZ. | ✅ [#46](https://github.com/stafeto/stafeto/pull/46) |
-| Rust thread capacity | Support 64 simultaneously live application threads with independent data and errno, working heap/file owners, exact-limit failure, and joined resource recovery on QEMU and Apple VZ. | ✅ [#47](https://github.com/stafeto/stafeto/pull/47) |
-| Rust mutex ownership | Add private stalled NORMAL, ERRORCHECK and RECURSIVE mutexes, static initialization and type attributes; verify live waiters, priority handoff, interrupted replies, ordinary writes and cancellation cleanup on QEMU and Apple VZ. | ✅ [#48](https://github.com/stafeto/stafeto/pull/48) |
-| Rust system clocks | Add shared REALTIME and immutable MONOTONIC clocks with gettime/getres/settime, wide calendar arithmetic and retry-safe settings; verify C ABI, independent processes and committed SET/ACK interruption on QEMU and Apple VZ. | ✅ [#49](https://github.com/stafeto/stafeto/pull/49) |
-| Rust absolute mutex waits | Add clock-step notifications and timed/clock mutex acquisition; verify forward/backward calendar changes, brief deadline crossings, earliest timers and interrupted replies on QEMU and Apple VZ. | ✅ [#50](https://github.com/stafeto/stafeto/pull/50) |
-| Rust sleep waits | Add relative and absolute nanosleep/clock_nanosleep waiting, interruption remainders and deferred cancellation; verify calendar changes and shared mutex/sleep history on QEMU and Apple VZ. Signal delivery remains below. | ✅ [#51](https://github.com/stafeto/stafeto/pull/51) |
-| Native signal entry foundation | Enter a computing or IPC-waiting thread through a MANAGE-protected request; preserve GPR/SIMD, user PSTATE, TLS and IPC, including masking and nesting. Verify QEMU and Apple VZ; POSIX signal policy and library reentry remain below. | ✅ [#52](https://github.com/stafeto/stafeto/pull/52) |
-| Rust timers | Add timer creation, event delivery and overrun accounting; verify relative/absolute expiry, clock changes, signal delivery and resource lifetime. | 🚧 |
-| Rust mutex completion | Add robust owner-death recovery and consistency, shared-process objects and priority protocols; verify recovery, process lifetime and scheduling behavior. | 🚧 |
-| Rust thread synchronization and attributes | Add conditions, read/write locks, barriers and semaphores; complete thread attributes, with guest contention, ownership and cancellation checks. The managed-thread limit is 64. | 🚧 |
-| Nested cancellation windows | Restore the containing generation after handler read/write; verify nested positive/zero/error results, a later cancellation wake, cleanup and quota on QEMU and Apple VZ. | ✅ [#53](https://github.com/stafeto/stafeto/pull/53) |
-| Retained file replies | Preserve committed read/write/open results across nested handlers with Execute/Fetch/Ack; verify independent replies, repeated acknowledgements, journal growth and failures before effects on QEMU and Apple VZ. | ✅ [#54](https://github.com/stafeto/stafeto/pull/54) |
-| Retained pthread replies | Reserve independent pending/ready outcomes, acknowledge copied results, retain nested CREATE/JOIN/GET snapshots and reclaim exited callers; verify cleanup with a full journal on QEMU and Apple VZ. | ✅ [#55](https://github.com/stafeto/stafeto/pull/55) |
-| Retained clock replies | Reserve independent SET/OBSERVE results until ACK or session disconnect; preserve nested snapshots and generation, notification-channel closure and failures before effects. Clock protocol v2 requires OBSERVE acknowledgement. Verified on QEMU and Apple VZ. | ✅ [#56](https://github.com/stafeto/stafeto/pull/56) |
-| Retained heap replies | Preserve allocation outcomes during nested entry, prepay each live block's record so realloc/free need no new metadata, and retain old FREE replies across address reuse. Verify failures, growth and release under exhausted handles on QEMU and Apple VZ. | ✅ [#57](https://github.com/stafeto/stafeto/pull/57) |
-| Interruptible local borrow guards | Defer native dispatch across exclusive local file references while keeping IPC interruptible; reject waits with pending requests, preserve transfer ownership and scope TLS safely. Verified on QEMU and Apple VZ. | ✅ [#58](https://github.com/stafeto/stafeto/pull/58) |
-| Rust ordinary signal actions | Add C signal sets, shared dispositions, per-thread masks and pending state, raise/pthread_kill, native CPU/IPC dispatch, inheritance, nested handlers and retained outcomes under resource pressure. Verify QEMU and Apple VZ. | ✅ [#59](https://github.com/stafeto/stafeto/pull/59) |
-| Rust synchronous signal acceptance | Add sigwait for ordinary blocked signals with atomic pending/live acceptance, directed delivery, retained replies and cancellation cleanup; verify full journal/handle pressure on QEMU and Apple VZ. Queued signals and other wait interfaces remain below. | ✅ [#60](https://github.com/stafeto/stafeto/pull/60) |
-| Rust signal information acceptance | Add sigwaitinfo and C signal information, retain complete snapshots through reply/ACK interruption and cancellation, and separate full action masks from flags. Verify QEMU, Apple VZ and resource pressure; real-time queues and timed waits remain work. | ✅ [#61](https://github.com/stafeto/stafeto/pull/61) |
-| Rust process identity | Add boot-unique numeric IDs and retained parent identity, native ObjectInfo/rt access and Rust getpid/getppid; verify real process trees, ended shells, handle copies, pthreads and signal handlers. | ✅ [#62](https://github.com/stafeto/stafeto/pull/62) |
-| Rust signal information and handler context | Add SA_SIGINFO, retained handler information and real interrupted AArch64 ucontext; verify register/PC/SIMD/mask edits, nesting, reset, C layouts and resource pressure on QEMU and Apple VZ. | ✅ [#63](https://github.com/stafeto/stafeto/pull/63) |
-| Rust timed signal acceptance | Add sigtimedwait with preserved monotonic deadlines, pending-before-validation, EAGAIN and unchanged error output; verify retries, cancellation, concurrent sleep/mutex waits, late-signal races and full resources on QEMU and Apple VZ. | ✅ [#64](https://github.com/stafeto/stafeto/pull/64) |
-| Authenticated IPC sender identity | Read native sender PID/PPID through an accepted reply token, check receiving-process authority and generation, and preserve reply/priority state; verify real children, foreign rejection, lifetime and QEMU/Apple VZ. Credentials and process routing remain work. | ✅ [#65](https://github.com/stafeto/stafeto/pull/65) |
-| Rust shared process credentials | Add authenticated UID/GID ownership, eight C query/set calls, real/effective/saved rules, child snapshots, retained outcomes and resource checks; verify C, QEMU and Apple VZ. | ✅ [#66](https://github.com/stafeto/stafeto/pull/66) |
-| Rust pending-signal storage | Store full reasons/values in one prepaid process/thread pool, preserve FIFO and lowest-number selection, use PID-bound acceptance tickets and check UID permissions. Verify host models and deliberate mutations; guest owner integration follows. | ✅ [#67](https://github.com/stafeto/stafeto/pull/67) |
-| Rust queued signals and process routing | Add real-time FIFO source/value queues and process-directed sigqueue; preserve masks, retained outcomes, queue resources and cancellation. | 🚧 |
-| Rust cancellation and signals | Add asynchronous cancellation, remaining cancellation points and returned-resource cleanup, and remaining signal delivery with documented restart behavior. | 🚧 |
-| Rust library foundation | Complete allocation, ELF TLS loading, shared multi-thread file state, remaining C interfaces and headers, and argument/environment inheritance in the versioned sysroot. | 🚧 |
-| Files and directories | Implement descriptors, paths, metadata, directory iteration, and errors in Rust; run BusyBox `ls /`, `ls /etc`, and `ls -la` against RAM files. The current C bridge is a temporary probe. | 🚧 |
-| Program lifecycle | Load a static ELF from a file service and return its exit status through `posix_spawn` and `waitpid`; implement `fork` semantics for the standard and the shell's external-command path. | ⬜ |
-| Shell I/O | Expose Rust descriptor duplication through the POSIX service and C ABI; add inherited descriptors and pipes, then verify `ash` pipelines and file output. | ⬜ |
-| Terminal input | Add a terminal service with line discipline, `termios`, window size, and BusyBox line editing; verify backspace, arrows, history, and Ctrl-C. | ⬜ |
-| Remaining interfaces | Complete thread synchronization, signals, time, process control, sockets, permissions, and required utility behavior; publish a feature and option matrix. | ⬜ |
-| Conformance checks | Run API, shell, and utility suites on QEMU and Apple Virtualization.framework; record every remaining standard requirement and fix failures. | ⬜ |
-
-The initial Rust sysroot is experimental ABI 1 for AArch64 LP64.
-`python3 tools/build-posix-sysroot.py --probe` stages headers and `lib/libc.a`
-under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links the C probe.
-It currently covers file calls, stat metadata, directory streams, process
-allocation, directory selection, sorting, the C/POSIX locale and startup
-with an empty environment, plus initial pthread lifecycle, stack attributes
-and deferred cancellation with cleanup handlers, plus ordinary signal actions,
-thread masks, pending sets, thread-directed delivery and synchronous acceptance.
-Console waits leave the shared file owner available;
-stdio, general ELF TLS, asynchronous cancellation and the remaining headers
-and cancellation points are pending.
-See [notes/m2-rust-posix-abi.md](notes/m2-rust-posix-abi.md) and
-[notes/m2-rust-posix-stat.md](notes/m2-rust-posix-stat.md), plus
-[notes/m2-rust-posix-dir.md](notes/m2-rust-posix-dir.md) and
-[notes/m2-rust-posix-heap.md](notes/m2-rust-posix-heap.md) and
-[notes/m2-rust-posix-scan.md](notes/m2-rust-posix-scan.md) and
-[notes/m2-rust-posix-shared.md](notes/m2-rust-posix-shared.md) and
-[notes/m2-rust-posix-input.md](notes/m2-rust-posix-input.md) and
-[notes/m2-rust-posix-messages.md](notes/m2-rust-posix-messages.md) and
-[notes/m2-rust-posix-threads.md](notes/m2-rust-posix-threads.md) and
-[notes/m2-rust-posix-deferred-cancel.md](notes/m2-rust-posix-deferred-cancel.md) and
-[notes/m2-rust-posix-thread-data.md](notes/m2-rust-posix-thread-data.md) and
-[notes/m2-rust-posix-once.md](notes/m2-rust-posix-once.md) and
-[notes/m2-rust-posix-thread-capacity.md](notes/m2-rust-posix-thread-capacity.md) and
-[notes/m2-rust-posix-mutex.md](notes/m2-rust-posix-mutex.md) and
-[notes/m2-rust-posix-clocks.md](notes/m2-rust-posix-clocks.md) and
-[notes/m2-rust-posix-timed-mutex.md](notes/m2-rust-posix-timed-mutex.md) and
-[notes/m2-rust-posix-sleep.md](notes/m2-rust-posix-sleep.md)
-for the boundary.
-Process file requests carry copied values instead of caller-stack jobs.
-Directory identifiers remain process-local; cancellation, signals and recovery
-still need implementation.
-File timestamps currently use the platform counter; epoch time, symbolic
-links, credential checks and terminal-owned metadata remain pending.
-
-`ls` is a BusyBox utility. Its current in-shell path uses BusyBox's
-single-process applet mode; other external programs still need the
-process service. A claim of full support follows the conformance matrix,
-not the first successful BusyBox build.
-
-Multi-core support is a separate subproject; its place in the order will be
-decided after subproject 3.
-
-An integration target across subprojects 2 and 3 is to launch a separate
-Doomgeneric program from BusyBox `ash` with a Freedoom IWAD. The first
-playable QEMU check will open a level, accept keyboard input, and return
-to the shell on exit. It depends on program launch, file access, graphics,
-and input; sound, networking, and saved games can follow later.
+- The Apple VZ build keeps its Virtio console driver in the kernel and
+  polls for input.
+- One CPU core only; no SMP.
+- No PinePhone port yet.
+- `ash` cannot start external programs: no `exec`, `fork` or pipes.
+- Files live in RAM; ext4 is read from an image inside the guest, with no
+  block driver.
 
 ## Build and run
 
-You need rustup, QEMU, and dtc (on macOS: `brew install qemu dtc`). rustup
-installs the Rust version, components, and targets itself from
-`rust-toolchain.toml`.
+You need rustup, QEMU and dtc (on macOS: `brew install qemu dtc`); rustup
+installs the toolchain from `rust-toolchain.toml`. The POSIX probes in
+`test` and `ci` also need Clang/LLVM, LLD and Python 3; the Picolibc and
+BusyBox commands need Meson, Ninja, GNU Make and Git as well (on macOS:
+`brew install llvm lld meson ninja make`). The VZ commands need the Xcode
+command line tools for `swiftc` and `codesign`.
 
-| Command | What it does |
-|---|---|
-| `cargo xtask build` | builds the kernel into `target/stafeto.img` (under `CARGO_TARGET_DIR` when it is set) and checks that the image is under 200 KB |
-| `cargo xtask run` | runs the system in QEMU to the shell's prompt; exit with Ctrl-A, then X |
-| `cargo xtask run --hvf` | the same under HVF on a Mac with Apple silicon; elsewhere it fails and says why |
-| `cargo xtask vz` | on an Apple silicon Mac, boots the shell through Virtualization.framework without QEMU; exit with Ctrl-C |
-| `cargo xtask rtbench` | runs fixed-duration RTOS primitive and timer-wakeup workloads three times on QEMU TCG, and also HVF and VZ on Apple Silicon; `--repeats 1` is a quick smoke run |
-| `cargo xtask ext4ro` | boots a QEMU guest that reads a checked-in ext4 image created by e2fsprogs; no block driver is involved yet |
-| `cargo xtask ramfs` | boots a RAM file service and checks file descriptors, reads, writes, seeks, sizes, and standard output in QEMU |
-| `cargo xtask posix-abi` | boots C file and allocation ABI probes linked with Rust startup through Cargo and standalone Clang, then checks errno isolation and shared allocation on native guest threads; no Picolibc |
-| `cargo xtask posix-input` | verifies file and heap progress during a UART input wait, descriptor reuse, stdin redirection and burst reads; included in `posix-abi` and `ci` |
-| `cargo xtask posix-input-vz` | verifies the same scenario through native Virtio input on Apple silicon without QEMU; requires Virtualization.framework |
-| `cargo xtask posix-shared` | verifies shared Rust file state and errno, rejects malformed messages before heap startup, and checks full message payloads; included in `posix-abi` and `ci` |
-| `cargo xtask posix-interrupt` | verifies IPC wait interruption, transfer cleanup, reply-token reuse, EINTR cleanup, input recovery and read retry on UART; included in `posix-abi` and `ci` |
-| `cargo xtask posix-interrupt-vz` | verifies the same IPC cases, Virtio read interruption/retry and echo interruption, including timer/channel cleanup, on Apple silicon |
-| `cargo xtask cprobe` | builds pinned Picolibc 1.8.12 with local LLVM, then boots a static C program using file I/O and `printf` through the RAM service |
-| `cargo xtask busybox` | builds pinned BusyBox 1.37.0 and Picolibc, then runs BusyBox `cat /etc/motd` against the RAM service in QEMU |
-| `cargo xtask ash` | runs BusyBox `ash -c 'echo shell-ready; exit 0'` in QEMU and checks its output and exit code |
-| `cargo xtask ash-shell` | opens BusyBox `ash` on the QEMU UART; `ls /` and `ls -la` work, `exit` leaves the shell, and Ctrl-A, X quits QEMU |
-| `cargo xtask ash-dialog` | checks `echo`, `ls`, missing paths, and `exit` at the `ash` prompt in QEMU |
-| `cargo xtask ls` | runs BusyBox `ls` against the RAM file service in a separate QEMU image |
-| `cargo xtask test` | host tests, boot in QEMU, a dialog with the shell, and tests inside the kernel |
-| `cargo xtask gdb` | QEMU stops before the kernel starts and waits for a debugger on port 1234 |
-| `cargo xtask ci` | formatting, clippy, and all tests |
-| `cargo xtask hvf` | on a Mac with Apple silicon: boot, the dialog with the shell, the test `init`, the tests of init's service table and the kernel tests under HVF, on Apple's GICv3 and on QEMU's GICv2; elsewhere it says why it skips; `ci` does not run it |
-
-`rtbench` adapts six [Thread-Metric](https://github.com/zephyrproject-rtos/zephyr/blob/main/tests/benchmarks/thread_metric/thread_metric_readme.txt) workloads to stafeto's primitives: baseline arithmetic, cooperative yields, preemptive notifications, channel request/reply, self-notification, and memory-object allocation. It also follows [Zyclictest](https://docs.zephyrproject.org/latest/services/debugging/zyclictest.html) by measuring 1,000 periodic timer wakeups at 1 ms intervals, both while idle and with a lower-priority CPU load. It reports median operations per second across runs, timer p99 and worst observed latency, and missed periods. The guest prints only after each workload. These are adapted workloads, not official Thread-Metric results; the hardware-interrupt cases await a portable guest interrupt source. Virtual-machine measurements do not establish a physical worst-case latency.
-
-The Rust POSIX probe included in `cargo xtask test` and `cargo xtask ci` needs Clang/LLVM, LLD and Python 3. The C and BusyBox probes need Clang/LLVM, LLD, Meson, Ninja, Python 3, GNU Make and Git. On macOS, install them with `brew install llvm lld meson ninja make`. Picolibc and BusyBox sources and build output stay under `target/`. See [notes/m2-ram-posix.md](notes/m2-ram-posix.md) for the current BusyBox port boundary.
+```sh
+cargo xtask build        # kernel and boot image in target/, checks the 200 KiB budget
+cargo xtask run          # QEMU to the shell prompt (Ctrl-A X quits); --hvf on Apple silicon
+cargo xtask vz           # the shell through Apple Virtualization.framework (Ctrl-C quits)
+cargo xtask test         # host tests, boot checks, shell dialog, init and kernel tests, POSIX probes
+cargo xtask ci           # formatting, clippy, licence checks, then everything test does
+cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
+cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ
+cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART
+cargo xtask gdb          # QEMU halted at the first instruction, debugger on :1234
+cargo xtask help         # every command, including single probes
+```
 
 How to debug hangs and crashes: [docs/debugging.md](docs/debugging.md).
+Bounded kernel paths and their costs:
+[docs/non-preemptible-paths.md](docs/non-preemptible-paths.md).
+
+## Repository layout
+
+| Directory | Contents |
+|---|---|
+| `kernel/` | the microkernel: boot, MMU, GIC, scheduler, system calls |
+| `kcore/` | kernel logic that builds and tests on the host |
+| `lib/` | `abi`, `rt`, `bootimg`, `ext4ro` and the `posix-*` crates |
+| `proto/` | message protocols between programs and services |
+| `services/` | `init`, the UART driver, the RAM file, clock and process services |
+| `apps/` | the native shell |
+| `tests/` | guest test programs and probes |
+| `tools/` | Picolibc, BusyBox and sysroot builds, the VZ runner, licence check |
+| `xtask/` | build, run, test and measurement commands |
+| `docs/` | debugging, kernel paths, status details, third-party licences |
+| `notes/` | design notes of individual parts |
+
+## Roadmap
+
+✅ done · 🚧 in progress · ⬜ planned
+
+### Subproject 1: kernel and minimal userland ✅
+
+| Stage | Parts | State |
+|---|---|---|
+| 1.1 Boot | QEMU boot, MMU, device tree, exceptions, in-kernel tests | ✅ [#2](https://github.com/stafeto/stafeto/pull/2) |
+| 1.2 Kernel | a memory and handles · b threads, GICv2, timer, ASIDs · c system calls, scheduler, `init` | ✅ [#3](https://github.com/stafeto/stafeto/pull/3), [#4](https://github.com/stafeto/stafeto/pull/4), [#5](https://github.com/stafeto/stafeto/pull/5) |
+| 1.3 Messages and objects | a teardown and quotas · b channels and timers · c requests and replies · d memory objects · e interrupts and devices; cleanups after audits 1 and 2 | ✅ [#6](https://github.com/stafeto/stafeto/pull/6), [#8](https://github.com/stafeto/stafeto/pull/8), [#11](https://github.com/stafeto/stafeto/pull/11), [#13](https://github.com/stafeto/stafeto/pull/13), [#14](https://github.com/stafeto/stafeto/pull/14); [#10](https://github.com/stafeto/stafeto/pull/10), [#12](https://github.com/stafeto/stafeto/pull/12), [#15](https://github.com/stafeto/stafeto/pull/15) |
+| 1.4 Userland | a GICv3 and HVF · b runtime and protocols · c `init` services · d UART driver and shell · e measurements | ✅ [#16](https://github.com/stafeto/stafeto/pull/16)–[#20](https://github.com/stafeto/stafeto/pull/20) |
+
+### Subproject 2: POSIX and services (so far)
+
+| Area | What it brings | State |
+|---|---|---|
+| Apple VZ | the shell through Virtualization.framework without QEMU | ✅ [#21](https://github.com/stafeto/stafeto/pull/21) |
+| Benchmarks | `rtbench`: workloads after Thread-Metric, 1 ms timer wakeups | ✅ [#22](https://github.com/stafeto/stafeto/pull/22) |
+| ext4 | read-only ext4 in a guest | ✅ [#23](https://github.com/stafeto/stafeto/pull/23) |
+| RAM files and BusyBox | RAM file service, Picolibc, BusyBox `cat`; Doom as a later target | ✅ [#24](https://github.com/stafeto/stafeto/pull/24), [#25](https://github.com/stafeto/stafeto/pull/25) |
+| BusyBox shell | `ash -c`, interactive `ash`, `ls` | ✅ [#26](https://github.com/stafeto/stafeto/pull/26)–[#28](https://github.com/stafeto/stafeto/pull/28) |
+| POSIX files | paths, files, `lseek`, descriptors, C ABI and `libc.a`, `stat`, directories, heap, `scandir`, shared file state | ✅ [#29](https://github.com/stafeto/stafeto/pull/29)–[#38](https://github.com/stafeto/stafeto/pull/38) |
+| POSIX interruption | console waits, value messages, IPC interruption and `EINTR`, UART read recovery | ✅ [#39](https://github.com/stafeto/stafeto/pull/39)–[#42](https://github.com/stafeto/stafeto/pull/42) |
+| POSIX threads and time | pthreads, deferred cancellation, keys, `once`, 64 threads, mutexes, clocks, timed mutexes, sleep | ✅ [#43](https://github.com/stafeto/stafeto/pull/43)–[#51](https://github.com/stafeto/stafeto/pull/51) |
+| Nested entry | kernel upcalls into user threads; results kept across nested handlers | ✅ [#52](https://github.com/stafeto/stafeto/pull/52)–[#58](https://github.com/stafeto/stafeto/pull/58) |
+| POSIX signals and processes | signal actions, `sigwait`, `sigwaitinfo`, PIDs, `SA_SIGINFO`, `sigtimedwait`, sender identity, credentials, pending-signal queues | ✅ [#59](https://github.com/stafeto/stafeto/pull/59)–[#67](https://github.com/stafeto/stafeto/pull/67) |
+
+### Next
+
+| Step | What it brings | State |
+|---|---|---|
+| Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | 🚧 |
+| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | ⬜ |
+| Kernel | DMA memory objects, the Virtio console as a user-space service, process IDs out of the kernel | ⬜ |
+| PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
+| POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ⬜ |
+| POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | ⬜ |
+| POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
+| POSIX: conformance | os-test and Open POSIX in `ci`; then conditions, semaphores, timers, `sigqueue` | ⬜ |
+
+### Later subprojects
+
+- Graphics and input: virtio-gpu, touch input, a compositor; Doomgeneric started from `ash` as the first playable target.
+- Phone shell: home screen, notifications, settings, a UI toolkit.
+- Packages: package format, signatures, app sandbox.
+- Network: virtio-net and a TCP/IP stack.
+- SMP: more than one CPU core.
 
 ## License
 
-The kernel, services, drivers, tools, and Rust POSIX implementation
-(beginning with `lib/posix-path`) are distributed under GPL-3.0-or-later
-([LICENSE](LICENSE)). Libraries for programs (`lib/abi`, `lib/rt`,
-`lib/bootimg`, `lib/process-client`, `proto/*`) and the temporary Picolibc bridge (`lib/posix`)
-are distributed under MIT
-([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can be released under
-any license.
+The kernel, `kcore`, services, drivers, the shell, `xtask`, the tests,
+`lib/ext4ro` and the Rust POSIX crates (`lib/posix-*`) are under
+GPL-3.0-or-later ([LICENSE](LICENSE)). The libraries that programs link
+(`lib/abi`, `lib/rt`, `lib/bootimg`, `lib/process-client`, `proto/*`) and
+the temporary Picolibc bridge `lib/posix` are under MIT
+([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can use any licence.
+Every source file carries an `SPDX-License-Identifier` line.
 
-BusyBox is GPL-2.0-only and links statically with the temporary MIT bridge.
-The GPL-3.0-or-later Rust POSIX implementation will run in a separate service;
-a small MIT client can carry requests from BusyBox without linking that service
-into the BusyBox binary. Other programs can use a GPL-compatible Rust C ABI
-library directly. See the [BusyBox license](https://busybox.net/license.html).
-The [FSF compatibility table](https://www.gnu.org/licenses/gpl-faq.en.html)
-explains the linking restriction. `cargo xtask ci` checks this dependency boundary.
-It also checks the GPL-3.0-or-later package declarations and SPDX identifiers
-in every Rust POSIX source module and C header. The generated Rust POSIX
-sysroot includes the GPL license text as `LICENSE`. Third-party dependencies
-retain their own licenses.
+BusyBox is GPL-2.0-only ([license](https://busybox.net/license.html)) and
+cannot link GPL-3.0-or-later code. It links only the MIT bridge and talks
+to GPL services through messages; `cargo xtask ci` checks this boundary
+and the licence declarations of the POSIX crates. Third-party
+dependencies keep their own licences ([docs/licenses](docs/licenses)).
