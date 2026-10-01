@@ -3,7 +3,17 @@
 
 //! The calls of processes and threads (spec 4, 8, 11).
 
-use super::*;
+use super::{Args, Values, caller, caller_ceiling, cause, lookup, record_call};
+use crate::object::Object;
+use crate::process::{self, Process};
+use crate::thread::{self, Thread};
+use crate::{channel, sched, session};
+use abi::{Call, Error, Handle, OWNER_RIGHTS, ProcessState, Rights};
+use core::ptr::NonNull;
+use kcore::args::{
+    check_buffer, check_start, handle_limit_arg, notify_priority_arg, policy_arg, priority_arg,
+    quota_arg, under_ceilings,
+};
 
 /// process_create(x0 memory quota, x1 handle limit, x2 priority ceiling,
 /// x3 exit channel, x4 notification priority, x5 start channel): a new

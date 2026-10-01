@@ -3,7 +3,16 @@
 
 //! object_info and debug_write (spec 11, 16).
 
-use super::*;
+use super::{Args, Values, call_maxima, lookup};
+use crate::memory;
+use crate::mm::{pages, phys};
+use crate::object::Object;
+use crate::process;
+use crate::thread::{self, Thread};
+use crate::{channel, cleanup, irq, sched, timer};
+use abi::{Error, KernelStats, ProcessHandles, ProcessMemory, Rights};
+use core::ptr::NonNull;
+use kcore::args::{inline_len_arg, reserved_arg};
 
 /// object_info(x0 handle, x1 kind, x2 reserved and 0): the kind and x2
 /// first (INVALID_ARGS), then the handle. For a process handle with any

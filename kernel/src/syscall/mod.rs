@@ -27,29 +27,15 @@
 //! abi::TEST_CALLS.
 
 use crate::arch::timer as clock;
-use crate::channel::{self, Via};
-use crate::memory::{self, Memory};
-use crate::mm::{pages, phys};
 use crate::object::Object;
-use crate::process::{self, Change, Op, Process};
-use crate::thread::{self, Long, Thread};
-use crate::{arch, cleanup, irq, sched, session, timer};
-use abi::{
-    CHANNEL_RIGHTS, Call, DMA_MEMORY_RIGHTS, Error, Handle, KernelStats, MEMORY_RIGHTS,
-    Notification, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
-};
+use crate::process::Process;
+use crate::thread::{self, Thread};
+use crate::{arch, cleanup, sched};
+use abi::{Call, Error, Handle, Notification, Rights};
 #[cfg(feature = "measure")]
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
-use kcore::PAGE_SIZE;
-use kcore::args::{
-    Desc, MemoryKind, access_arg, bits_arg, check_buffer, check_start, handle_limit_arg,
-    handle_values_arg, inline_len_arg, line_arg, memory_kind_arg, memory_size_arg,
-    notify_priority_arg, policy_arg, priority_arg, quota_arg, range_arg, reserved_arg, rights_arg,
-    trigger_arg, under_ceilings, wait_arg,
-};
-use kcore::maps::Mapping;
 
 mod devices;
 mod handles;

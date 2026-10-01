@@ -3,7 +3,15 @@
 
 //! The calls of devices (spec 9, 11): device_window_create, irq_bind and irq_ack.
 
-use super::*;
+use super::{Args, Values, caller, caller_ceiling, cause, lookup};
+use crate::memory;
+use crate::object::Object;
+use crate::process;
+use crate::thread::Thread;
+use crate::{arch, channel, irq, session};
+use abi::{Error, OWNER_RIGHTS, Rights, WINDOW_RIGHTS};
+use core::ptr::NonNull;
+use kcore::args::{line_arg, priority_arg, trigger_arg, under_ceilings};
 
 /// device_window_create(x0 system resource with DEVICE, x1 address, x2
 /// length): a device window, a memory object over the physical range

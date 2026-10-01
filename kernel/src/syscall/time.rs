@@ -3,7 +3,15 @@
 
 //! The calls of time (spec 10, 11): clock_now and the timers of programs.
 
-use super::*;
+use super::{Args, Values, caller, caller_ceiling, cause, lookup};
+use crate::arch::timer as clock;
+use crate::object::Object;
+use crate::process;
+use crate::thread::Thread;
+use crate::{session, timer};
+use abi::{Error, OWNER_RIGHTS, Rights};
+use core::ptr::NonNull;
+use kcore::args::{priority_arg, under_ceilings};
 
 /// clock_now(): x1 returns the counter in nanoseconds, rounded down
 /// (spec 10): the scale of the deadlines of timer_set.

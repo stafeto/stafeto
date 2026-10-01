@@ -3,7 +3,18 @@
 
 //! The calls of memory objects (spec 7, 11): mem_create, mem_map, mem_unmap and mem_protect, long calls in portions.
 
-use super::*;
+use super::{Args, Values, caller, cause, dispatch, lookup, restart, run_portions, set_result};
+use crate::arch::timer as clock;
+use crate::memory::{self, Memory};
+use crate::object::Object;
+use crate::process::{self, Change, Op};
+use crate::thread::{self, Long, Thread};
+use crate::{arch, cleanup, sched};
+use abi::{DMA_MEMORY_RIGHTS, Error, Handle, MEMORY_RIGHTS, Rights};
+use core::ptr::NonNull;
+use kcore::PAGE_SIZE;
+use kcore::args::{MemoryKind, access_arg, memory_kind_arg, memory_size_arg, range_arg};
+use kcore::maps::Mapping;
 
 /// The next entry of the long call `long` of `thread` (spec 7.7), which
 /// started over after an interrupt. An entry with the call's number goes

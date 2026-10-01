@@ -81,7 +81,8 @@ const RESET_READS: u32 = 1_000_000;
 
 /// The codes of a start that failed: the start data, `log` or `dma` among
 /// them; REGISTER, the windows or the binding; a map; no Virtio console
-/// at the function; the device refused the driver; the loop.
+/// at the function; the device refused the driver; the loop; the common
+/// configuration of the device lies elsewhere than at the start of BAR 0.
 const NO_START_DATA: u64 = 1;
 const NO_LOG: u64 = 2;
 const NOT_REGISTERED: u64 = 3;
@@ -89,6 +90,7 @@ const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
 const NO_DEVICE: u64 = 6;
 const NO_CONSOLE: u64 = 7;
+const CONFIG_ELSEWHERE: u64 = 9;
 /// The end of the first instance of the probe build `exit-before-decoding`
 /// (console-early-exit-vz): after BAR 1, before decoding is on.
 #[cfg(feature = "exit-before-decoding")]
@@ -368,6 +370,12 @@ fn main(_: u64) -> u64 {
     // device 5 of bus 0 whatever else the machine has).
     if config_read(pci::ID) != pci::CONSOLE_ID {
         return NO_DEVICE;
+    }
+    // init resets the device of an instance that ended through BAR 0 at
+    // the offset of `device_status` in the common configuration; a device
+    // that puts that structure elsewhere ends the driver before it writes.
+    if pci::common_config(config_read) != Some((0, 0)) {
+        return CONFIG_ELSEWHERE;
     }
     // The command word as the driver finds it: 0 at the machine's start,
     // and 0 again after init stopped the function of an instance that
