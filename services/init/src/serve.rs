@@ -8,7 +8,11 @@
 //! gives an instance its start data (rt::startup::Giver); REGISTER takes
 //! the channel of a service and gives it its windows and bindings; CONNECT
 //! gives a copy of a registered channel with SEND, TRANSFER and a label of
-//! its own, or holds the request until the service registers; HEARTBEAT
+//! its own, or holds the request until the service registers, but for the
+//! process service (table::PROCESS_SERVICE); ADOPT from the process service
+//! takes the next POSIX process init loaded, whose thread waits until
+//! ADOPTED brings the session of its record (spec 2, section 3.1): init
+//! holds the request and never sends one to a service (spec 6.7); HEARTBEAT
 //! answers a registered service and moves its watchdog deadline; LIST gives
 //! a page of the records, init first; STATS what the kernel, the worker and
 //! init's quota show; PING anyone. The notification of the worker thread
@@ -199,6 +203,10 @@ struct Entry {
     short: bool,
     /// Its first start is done, or waits for quota.
     begun: bool,
+    /// A POSIX process loaded whose thread waits for the session of its
+    /// record (ADOPTED); `offered` once ADOPT took it.
+    adopting: bool,
+    offered: bool,
 }
 
 impl Entry {
@@ -216,6 +224,8 @@ impl Entry {
         waited: 0,
         short: false,
         begun: false,
+        adopting: false,
+        offered: false,
     };
 }
 
@@ -252,6 +262,8 @@ pub struct Init {
     entries: [Entry; MAX_RECORDS],
     /// The job the worker does and those that wait.
     jobs: Jobs,
+    /// The process service's ADOPT that waits for a POSIX process.
+    adoption: Option<Pending>,
     /// The records whose first start is done or waits for quota.
     started: usize,
 }
@@ -275,6 +287,7 @@ impl Init {
             programs,
             entries: [Entry::NEW; MAX_RECORDS],
             jobs: Jobs::new(),
+            adoption: None,
             started: 0,
         }
     }
@@ -443,36 +456,33 @@ impl Init {
 
     /// An instance of the record at `place` loaded, or why not, which is a
     /// failure: its thread starts here, once its start data wait in the
-    /// entry. A client runs from its start, a service is STARTING until it
-    /// registers.
+    /// entry (`run`); that of a POSIX process once the process service gave
+    /// the session of its record (`offer`, `adopted`).
     fn loaded(&mut self, place: usize, result: Loaded) {
         let record = &TABLE[place];
         match result {
             Ok((spawned, dma)) => {
-                if let Err(e) = spawned.start() {
-                    println!("init: {} did not start: {e:?}", record.name);
-                }
-                let started = now();
-                // The watchdog of a service counts from its start until its
-                // REGISTER (spec 13.4); a client has none.
-                let watch = record.watch().map(|w| w.arm(started));
-                let deadline = watch.map(|w| w.deadline());
                 let entry = &mut self.entries[place];
                 entry.held = Held::Running(Instance {
                     spawned,
                     dma,
                     channel: None,
-                    started,
+                    started: 0,
                     released: false,
                 });
-                entry.watch = watch;
-                entry.state = if record.is_client() {
-                    State::Running
+                if record.is_posix() {
+                    // Its thread starts once the process service gave the
+                    // session of its record (`adopted`); with the service
+                    // ended or broken for good none comes.
+                    entry.adopting = true;
+                    entry.offered = false;
+                    if self.process_service_over() {
+                        self.adoption_failed(place, "the process service ended");
+                    } else {
+                        self.offer();
+                    }
                 } else {
-                    State::Starting
-                };
-                if let Some(at) = deadline {
-                    self.set_deadline(place, at);
+                    self.run(place);
                 }
             }
             Err(e) => {
@@ -481,6 +491,179 @@ impl Init {
             }
         }
         self.begin(place);
+    }
+
+    /// The thread of the instance of the record at `place` starts: a
+    /// client runs from then on, a service is STARTING until it registers.
+    fn run(&mut self, place: usize) {
+        let record = &TABLE[place];
+        let Some(instance) = self.entries[place].held.running_mut() else {
+            return;
+        };
+        if let Err(e) = instance.spawned.start() {
+            println!("init: {} did not start: {e:?}", record.name);
+        }
+        let started = now();
+        instance.started = started;
+        // The watchdog of a service counts from its start until its
+        // REGISTER (spec 13.4); a client has none.
+        let watch = record.watch().map(|w| w.arm(started));
+        let deadline = watch.map(|w| w.deadline());
+        let entry = &mut self.entries[place];
+        entry.watch = watch;
+        entry.state = if record.is_client() {
+            State::Running
+        } else {
+            State::Starting
+        };
+        if let Some(at) = deadline {
+            self.set_deadline(place, at);
+        }
+    }
+
+    /// Answers the process service's ADOPT, when one waits, with the first
+    /// POSIX process that waits for its session and was not offered yet:
+    /// its ticket (the label of its instance), root, and a copy of its
+    /// process with MANAGE, DUPLICATE and TRANSFER. A copy that cannot be
+    /// made fails the load.
+    fn offer(&mut self) {
+        // A process whose copy cannot be made fails, and the next one that
+        // waits is offered.
+        loop {
+            if self.adoption.is_none() {
+                return;
+            }
+            let waiting = (0..TABLE.len()).find(|&p| {
+                let e = &self.entries[p];
+                e.adopting && !e.offered && e.held.running().is_some()
+            });
+            let Some(place) = waiting else {
+                return;
+            };
+            if self.offer_one(place) {
+                return;
+            }
+        }
+    }
+
+    /// Whether the process service ended or broke for good: its record
+    /// does not restart, and no ADOPT comes any more.
+    fn process_service_over(&self) -> bool {
+        table::find(TABLE, table::PROCESS_SERVICE.as_bytes())
+            .is_none_or(|p| matches!(self.entries[p].state, State::Ended | State::Broken))
+    }
+
+    /// Offers the process at `place` to the waiting ADOPT; false when its
+    /// copy could not be made and its load failed.
+    fn offer_one(&mut self, place: usize) -> bool {
+        let instance = self.entries[place]
+            .held
+            .running()
+            .expect("an adopted instance");
+        let rights = Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER;
+        let copy = sys::handle_duplicate(instance.process(), rights);
+        let ticket = instance.spawned.label;
+        let Ok(copy) = copy else {
+            self.adoption_failed(place, "no copy of its process");
+            return false;
+        };
+        let mut w = proto_wire::Writer::new();
+        let written = w
+            .bytes(&proto_wire::reply(Status::Ok))
+            .and_then(|()| w.u64(ticket))
+            .and_then(|()| w.u32(u32::from(TABLE[place].root)));
+        let pending = self.adoption.take().expect("a waiting ADOPT");
+        if written.is_err() || pending.answer(w.as_bytes(), [copy.erase()]).is_err() {
+            // The service went: the next ADOPT offers the process again.
+            return true;
+        }
+        self.entries[place].offered = true;
+        true
+    }
+
+    /// The POSIX process at `place` gets no session of its record: a
+    /// failure of its record; its thread never ran.
+    fn adoption_failed(&mut self, place: usize, why: &str) {
+        let entry = &mut self.entries[place];
+        entry.adopting = false;
+        entry.offered = false;
+        let Some(instance) = entry.held.take_running() else {
+            return;
+        };
+        let what = format_args!("did not load: {why}");
+        self.failed(place, Some(instance), 0, what, Work::Kill);
+    }
+
+    /// ADOPT from the instance at `place`: only the process service's, at
+    /// most one at a time (BAD_STATE for any other caller, LIMIT_REACHED
+    /// for a second); BAD_SIZE for bytes after the header. Init holds it
+    /// until a POSIX process waits for its session (`offer`).
+    fn adopt(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if TABLE[place].name != table::PROCESS_SERVICE {
+            return refuse(Error::BadState);
+        }
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        if self.adoption.is_some() {
+            return refuse(Error::LimitReached);
+        }
+        self.adoption = r.defer();
+        self.offer();
+        Answer::Deferred
+    }
+
+    /// ADOPTED from the process service: the ticket of a process it took
+    /// and its status. With status 0 and the session, init gives the
+    /// session in the start data under `posix` and starts the thread; any
+    /// other status, or no session, fails the load. BAD_STATE for another
+    /// caller, BAD_SIZE out of the layout, INVALID_ARGS for
+    /// a ticket no waiting process has.
+    fn adopted(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if TABLE[place].name != table::PROCESS_SERVICE {
+            return refuse(Error::BadState);
+        }
+        let mut body = r.body();
+        let (Ok(ticket), Ok(status)) = (body.u64(), body.u32()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() || r.handles.len() > 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let waiting = (0..TABLE.len()).find(|&p| {
+            let e = &self.entries[p];
+            e.adopting && e.offered && e.held.running().is_some_and(|i| i.spawned.label == ticket)
+        });
+        let Some(place) = waiting else {
+            return refuse(Error::InvalidArgs);
+        };
+        let session = (status == 0)
+            .then(|| r.handles.take::<Channel>(0).ok())
+            .flatten();
+        let Some(session) = session else {
+            println!(
+                "init: the process service made no record for {}: status {status}",
+                TABLE[place].name
+            );
+            self.adoption_failed(place, "no record of the process service");
+            return Answer::Status(Status::Ok);
+        };
+        let entry = &mut self.entries[place];
+        let instance = entry.held.running_mut().expect("an adopted instance");
+        // The checks of the table keep the name apart from the others of
+        // the start data.
+        let given = instance
+            .spawned
+            .giver
+            .give(table::PROCESS_SERVICE, session.erase());
+        entry.adopting = false;
+        entry.offered = false;
+        if given.is_err() {
+            self.adoption_failed(place, "no room for its session");
+        } else {
+            self.run(place);
+        }
+        Answer::Status(Status::Ok)
     }
 
     /// The end of the instance whose label is `label` (its exit
@@ -578,6 +761,8 @@ impl Init {
             entry.held = Held::Gone(instance);
         }
         entry.watch = None;
+        entry.adopting = false;
+        entry.offered = false;
         let deadline = match verdict {
             None => {
                 entry.state = State::Ended;
@@ -605,6 +790,20 @@ impl Init {
         }
         if teardown {
             self.push(Job::new(work, place, record));
+        }
+        // With the process service ended or broken for good, the POSIX
+        // processes that wait for their sessions get none; a service that
+        // restarts asks for them again.
+        let over = matches!(self.entries[place].state, State::Ended | State::Broken);
+        if record.name == table::PROCESS_SERVICE {
+            self.adoption = None;
+            for p in 0..TABLE.len() {
+                if over && self.entries[p].adopting {
+                    self.adoption_failed(p, "the process service ended");
+                } else {
+                    self.entries[p].offered = false;
+                }
+            }
         }
     }
 
@@ -806,10 +1005,12 @@ impl Init {
             return Answer::Status(Status::BadSize);
         };
         let client = &TABLE[place];
-        let allowed = client
-            .connects
-            .iter()
-            .any(|to| to.as_bytes() == name.as_bytes());
+        // The sessions of the process service come in start data.
+        let allowed = name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
+            && client
+                .connects
+                .iter()
+                .any(|to| to.as_bytes() == name.as_bytes());
         let Some(to) = allowed
             .then(|| table::find(TABLE, name.as_bytes()))
             .flatten()
@@ -985,6 +1186,8 @@ impl Service<1> for Init {
         Method::List.number(),
         Method::Stats.number(),
         Method::Ping.number(),
+        Method::Adopt.number(),
+        Method::Adopted.number(),
     ];
     type Data = ();
 
@@ -999,6 +1202,8 @@ impl Service<1> for Init {
             Some(Method::Heartbeat) => self.heartbeat(place, r),
             Some(Method::List) => self.list(r),
             Some(Method::Stats) => self.stats(r),
+            Some(Method::Adopt) => self.adopt(place, r),
+            Some(Method::Adopted) => self.adopted(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),
@@ -1010,6 +1215,9 @@ impl Service<1> for Init {
     /// a service, ends through its exit notification (`ended`).
     fn gone(&mut self, s: &mut Session<(), 1>) {
         let label = s.label();
+        if self.adoption.as_ref().is_some_and(|p| p.label() == label) {
+            self.adoption = None;
+        }
         for entry in &mut self.entries {
             for slot in &mut entry.waiting {
                 if slot.as_ref().is_some_and(|(p, _)| p.label() == label) {

@@ -254,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "posix-credentials",
  "posix-heap",
+ "process-client",
  "proto-init",
  "proto-process",
  "proto-wire",

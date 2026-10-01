@@ -91,6 +91,18 @@
 //! HEARTBEAT: a service tells init that it lives (spec 13.4); PING: a round
 //! trip to init, for bench (spec 13.6). The request of each is the header
 //! alone, the reply its status alone.
+//!
+//! ADOPT and ADOPTED come only from the POSIX process service (spec 2,
+//! section 3.1): the service asks init for the next POSIX process init
+//! loaded, and init holds the request until there is one; init never asks
+//! the service anything. ADOPT: the header alone; the reply its status (8
+//! bytes, proto_wire::reply), the ticket of the process u64, root u32 (0
+//! or 1), and one handle, the process with MANAGE, DUPLICATE and TRANSFER.
+//! ADOPTED: the header,
+//! the ticket u64 and the service's status u32 (0, or why it made no
+//! record), and with status 0 one handle, the session of the record, which
+//! init gives the process under `posix` before it starts its thread; the
+//! reply is its status alone.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -110,10 +122,12 @@ pub enum Method {
     List = 5,
     Stats = 6,
     Ping = 7,
+    Adopt = 8,
+    Adopted = 9,
 }
 
 impl Method {
-    pub const ALL: [Method; 7] = [
+    pub const ALL: [Method; 9] = [
         Method::Start,
         Method::Register,
         Method::Connect,
@@ -121,6 +135,8 @@ impl Method {
         Method::List,
         Method::Stats,
         Method::Ping,
+        Method::Adopt,
+        Method::Adopted,
     ];
 
     pub const fn number(self) -> u16 {
@@ -967,13 +983,13 @@ mod tests {
     #[test]
     fn method_numbers_are_fixed() {
         let numbers = Method::ALL.map(Method::number);
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(8), None);
+        assert_eq!(Method::from_number(10), None);
         assert_eq!(VERSION, 1);
         assert_eq!(Method::Start.header().bytes(), [1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(START_PIECE_MAX, 952);

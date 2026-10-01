@@ -286,17 +286,6 @@ fn run(s: &Start) -> u64 {
             Ok(()) => 0,
             Err(e) => e.code(),
         },
-        Role::RequestIdentity => {
-            let mut x = marked();
-            x[0] = a[0];
-            // SAFETY: this read has no user-memory or handle arguments.
-            let after = unsafe { sys::raw::<{ Call::RequestIdentity.number() }>(x) };
-            if after[0] == Error::BadState.code() && after[1..] == x[1..] {
-                after[0]
-            } else {
-                FAILED
-            }
-        }
         Role::Reply => {
             let mut x = marked();
             x[..3].copy_from_slice(&[a[0], 8, a[1]]);
@@ -636,7 +625,7 @@ fn ceiling(s: &Start, checked: Checked) -> u64 {
         }
         Checked::ThreadCreate => {
             const N: u16 = Call::ThreadCreate.number();
-            let args = [process, 0x1000, 0x80_1000, 7, above, fifo, 0x3000];
+            let args = [process, 0x1000, 0x80_1000, 7, above, fifo, 0x3000, 0, 0];
             first_wrong(&[x0_alone::<N>(&args, denied)])
         }
         Checked::ProcessCreate => {

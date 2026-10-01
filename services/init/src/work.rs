@@ -204,6 +204,7 @@ mod tests {
             dma: &[],
             quiesce: &[],
             trusted: false,
+            root: false,
         }
     }
 

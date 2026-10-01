@@ -159,7 +159,12 @@ pub const MAX_THREADS: u32 = 128;
 
 /// Timers one process pays for, at most (spec 10): `timer_create` past it
 /// fails with LIMIT_REACHED.
-pub const MAX_TIMERS: u32 = 64;
+pub const MAX_TIMERS: u32 = 192;
+
+/// Timers the whole system holds, at most (spec 10): `timer_create` past it
+/// fails with LIMIT_REACHED after the bound of the process; arming never
+/// fails. The heap of a level is then at most 13 deep.
+pub const MAX_SYSTEM_TIMERS: u32 = 8192;
 
 /// Mappings of one process, at most (spec 7.4): `mem_map` past it fails
 /// with LIMIT_REACHED.
@@ -287,14 +292,13 @@ pub enum Call {
     ThreadUpcallRequest = 33,
     /// Restore the current EL0 context from its reserved message-buffer area.
     ThreadUpcallReturn = 34,
-    /// Read the sender's process identity through an accepted reply token.
-    /// x0 is the token; x1/x2 return PID/parent PID. Does not consume it.
-    RequestIdentity = 35,
+    // 35 went with request_identity: the process service names its
+    // clients by the labels of the sessions it gives (spec 11).
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 34] = [
+    pub const ALL: [Call; 33] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -328,7 +332,6 @@ impl Call {
         Call::ThreadUpcallControl,
         Call::ThreadUpcallRequest,
         Call::ThreadUpcallReturn,
-        Call::RequestIdentity,
     ];
 
     pub const fn number(self) -> u16 {
@@ -340,18 +343,18 @@ impl Call {
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
             1..=28 => Some(Self::ALL[number as usize - 1]),
-            30..=35 => Some(Self::ALL[number as usize - 2]),
+            30..=34 => Some(Self::ALL[number as usize - 2]),
             _ => None,
         }
     }
 
     /// The highest number of a call.
-    pub const HIGHEST: u16 = Call::RequestIdentity.number();
+    pub const HIGHEST: u16 = Call::ThreadUpcallReturn.number();
 }
 
 /// Numbers of calls that went, never given again (spec 11): 29,
-/// console_poll.
-pub const RETIRED_CALLS: [u16; 1] = [29];
+/// console_poll, and 35, request_identity. The next new call takes 36.
+pub const RETIRED_CALLS: [u16; 2] = [29, 35];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
 /// no real system call gets one.
@@ -537,7 +540,9 @@ pub enum Source {
     Session,
     /// A timer (spec 10).
     Timer,
-    /// The exit of a process (`process_create` x3, spec 7.9).
+    /// The exit of a process (`process_create` x3, spec 7.9) or the end of
+    /// a thread through thread_exit (`thread_create` x7, spec 6.5); the
+    /// label of the handle tells them apart.
     Exit,
     /// An interrupt line (milestone 1.3e).
     Interrupt,
@@ -706,30 +711,8 @@ pub const INFO_IRQ: u64 = 8;
 /// each, into the start of the calling thread's message buffer, and
 /// returns `LogBatch::to_words` in x1-x3 (spec 11, 16.3).
 pub const INFO_LOG: u64 = 9;
-/// PROCESS_IDENTITY takes a process handle with no right needed and returns
-/// its boot-unique positive ID and parent's ID in x1-x2. A root's parent is 0.
-/// Ended process shells retain both values until the object is released.
-pub const INFO_PROCESS_IDENTITY: u64 = 10;
-/// Process IDs fit a positive signed 32-bit namespace. They are not handles,
-/// addresses or thread IDs, and are never reused during one kernel boot.
-pub const PROCESS_ID_MAX: u32 = i32::MAX as u32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessIdentity {
-    pub id: u32,
-    pub parent: u32,
-}
-impl ProcessIdentity {
-    pub const fn to_words(self) -> [u64; 2] {
-        [self.id as u64, self.parent as u64]
-    }
-    pub const fn from_words(words: [u64; 2]) -> Self {
-        Self {
-            id: words[0] as u32,
-            parent: words[1] as u32,
-        }
-    }
-}
+// Kind 10 went with PROCESS_IDENTITY: process IDs live in the process
+// service (spec 11); a retired kind fails with INVALID_ARGS.
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -1363,17 +1346,25 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one_but_the_retired() {
-        assert_eq!(Call::ALL.len(), 34);
+        assert_eq!(Call::ALL.len(), 33);
         let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
         for (call, n) in Call::ALL.iter().zip(numbers) {
             assert_eq!(call.number(), n);
             assert_eq!(Call::from_number(n), Some(*call));
             assert!(!TEST_CALLS.contains(&n));
         }
-        for n in [0, 29, 36, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [
+            0,
+            29,
+            35,
+            36,
+            0xFEFF,
+            *TEST_CALLS.start(),
+            *TEST_CALLS.end(),
+        ] {
             assert_eq!(Call::from_number(n), None);
         }
-        assert_eq!(KERNEL_CALL_SLOTS, 36);
+        assert_eq!(KERNEL_CALL_SLOTS, 35);
     }
 
     #[test]
@@ -1391,29 +1382,9 @@ mod tests {
         assert_eq!(Call::ThreadUpcallControl.number(), 32);
         assert_eq!(Call::ThreadUpcallRequest.number(), 33);
         assert_eq!(Call::ThreadUpcallReturn.number(), 34);
-        assert_eq!(Call::RequestIdentity.number(), 35);
         assert_eq!(RESULT_VALUES, 9);
         assert_eq!(UPCALL_CONTEXT_OFFSET, 1120);
         assert_eq!(UPCALL_CONTEXT_SIZE, 36 * 8 + 32 * 16 + 2 * 8);
-    }
-
-    #[test]
-    fn process_identity_words_and_namespace_boundary_are_stable() {
-        assert_eq!(INFO_PROCESS_IDENTITY, 10);
-        assert_eq!(PROCESS_ID_MAX, 2_147_483_647);
-        for identity in [
-            ProcessIdentity { id: 1, parent: 0 },
-            ProcessIdentity {
-                id: PROCESS_ID_MAX,
-                parent: PROCESS_ID_MAX - 1,
-            },
-        ] {
-            assert_eq!(ProcessIdentity::from_words(identity.to_words()), identity);
-            assert_eq!(
-                identity.to_words(),
-                [u64::from(identity.id), u64::from(identity.parent)]
-            );
-        }
     }
 
     #[test]
@@ -1559,7 +1530,9 @@ mod tests {
 
     #[test]
     fn timers_have_a_fixed_bound() {
-        assert_eq!(MAX_TIMERS, 64);
+        assert_eq!(MAX_TIMERS, 192);
+        assert_eq!(MAX_SYSTEM_TIMERS, 8192);
+        assert_eq!(MAX_SYSTEM_TIMERS.next_power_of_two().trailing_zeros(), 13);
     }
 
     #[test]

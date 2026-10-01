@@ -23,9 +23,7 @@ use super::{
 };
 use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
-#[cfg(feature = "icount")]
-use crate::channel::Via;
-use crate::channel::{self, Channel};
+use crate::channel::{self, Channel, Via};
 use crate::cleanup;
 use crate::irq::{self, Irq};
 use crate::memory::{self, Memory};
@@ -45,7 +43,6 @@ use abi::{
 };
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
-#[cfg(feature = "icount")]
 use kcore::args::Desc;
 use kcore::handles::CHUNK;
 use kcore::layout::{GIB, LINEAR_BASE};
@@ -699,12 +696,38 @@ pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static 
 }
 
 fn thread_create_handles(c: &Caller, low: &Caller) -> Result<(), &'static str> {
+    exit_above_the_ceiling(low)?;
     let h = c.insert(Object::Process(low.process), Rights::MANAGE)?;
     thread_create_cases(c, low.process, h)
 }
 
+/// x8 of thread_create, the priority of the exit notification, above the
+/// caller's ceiling of 20 fails with ACCESS_DENIED (spec 6.5, 11), as x4
+/// of process_create does.
+fn exit_above_the_ceiling(low: &Caller) -> Result<(), &'static str> {
+    let ch = channel::create(low.process, 10).map_err(|_| "no channel")?;
+    let named = low.insert(Object::Channel(ch), Rights::NOTIFY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(ch, Rights::NONE, CAUSE) };
+    let named = named?;
+    let own = low.insert(Object::Process(low.process), Rights::MANAGE)?;
+    let mut args = thread_args(own.0, USER_VA as u64, 0x80_1000, 10, FIFO, BUFFER);
+    args[7] = named.0;
+    args[8] = 21;
+    let refused = low.fails(Call::ThreadCreate.number(), &args, Error::AccessDenied);
+    args[8] = 20;
+    let at = low.created(Call::ThreadCreate.number(), &args);
+    low.close(own)?;
+    low.close(named)?;
+    refused?;
+    low.close(at?)?;
+    cleanup::drain();
+    Ok(())
+}
+
 /// thread_create's arguments: the process, entry, stack, argument 7,
-/// priority, policy and buffer.
+/// priority, policy and buffer, no exit channel.
 fn thread_args(
     process: u64,
     entry: u64,
@@ -712,8 +735,8 @@ fn thread_args(
     priority: u64,
     policy: u64,
     buffer: u64,
-) -> [u64; 7] {
-    [process, entry, stack, 7, priority, policy, buffer]
+) -> [u64; 9] {
+    [process, entry, stack, 7, priority, policy, buffer, 0, 0]
 }
 
 fn thread_create_cases(
@@ -802,10 +825,12 @@ pub fn buffer_that_does_not_map_goes_back(_: &Boot) -> Result<(), &'static str> 
 
 /// process_kill ends a process whatever state its threads are in: a ready
 /// thread leaves the queue, a stopped one ends where it is (spec 11), both
-/// in the call. The process's space and its threads' buffers go with the
-/// cleanup at the caller's level, which runs before the caller does again:
-/// here the test runs the queue itself. Until then thread_create finds the
-/// process ended (BAD_STATE) and makes nothing. A running thread's case is
+/// in the first portion of the teardown, the stage Threads at the
+/// process's ceiling of 20, and the call only queues it there. The
+/// process's space and its threads' buffers go with the cleanup at the
+/// caller's level, which runs before the caller does again: here the test
+/// runs the queue itself. From the call on thread_create finds the process
+/// ended (BAD_STATE) and makes nothing. A running thread's case is
 /// the test init's `process_kills_itself`, and so are the reason and the
 /// handles of the calls.
 pub fn process_kill_ends_threads_in_every_state(_: &Boot) -> Result<(), &'static str> {
@@ -847,12 +872,12 @@ fn kill_objects(c: &Caller, handles: [Handle; 3]) -> Result<(), &'static str> {
     ) else {
         return Err("the new handles do not name their threads");
     };
-    kill_calls(c, [child, ready], [tr, ts])
+    kill_calls(c, [child, ready, stopped], [tr, ts])
 }
 
 fn kill_calls(
     c: &Caller,
-    [child, ready]: [Handle; 2],
+    [child, ready, stopped]: [Handle; 3],
     [tr, ts]: [NonNull<Thread>; 2],
 ) -> Result<(), &'static str> {
     c.succeeds(Call::ThreadStart.number(), &[ready.0], &[])?;
@@ -862,16 +887,25 @@ fn kill_calls(
     )?;
     let kill = Call::ProcessKill.number();
     let frames = phys::free_frames();
-    c.succeeds(kill, &[child.0], &[])?;
+    c.succeeds(kill, &[child.0, 0], &[])?;
     // SAFETY: the handles hold the threads.
-    let dead = unsafe { [tr, ts].map(|t| t.as_ref().sched.state() == State::Dead) };
+    let states = || unsafe { [tr, ts].map(|t| t.as_ref().sched.state()) };
     check(
-        dead == [true, true] && sched::first(10).is_none(),
-        "a thread of the killed process did not end",
+        states() == [State::Ready, State::Stopped]
+            && (cleanup::len(), cleanup::top()) == (1, Some(20)),
+        "the killed process was not queued at its ceiling, or the call stopped its threads",
+    )?;
+    let args = thread_args(child.0, USER_VA as u64, USER_VA as u64, 10, FIFO, BUFFER);
+    c.fails(Call::ThreadStart.number(), &[stopped.0], Error::BadState)?;
+    c.fails(Call::ThreadCreate.number(), &args, Error::BadState)?;
+    cleanup::portion();
+    check(
+        states() == [State::Dead, State::Dead] && sched::first(10).is_none(),
+        "a thread of the killed process did not end in the stage Threads",
     )?;
     check(
         (cleanup::len(), cleanup::top()) == (1, Some(10)),
-        "the killed process was not queued at the caller's level",
+        "the rest of the teardown was not queued at the caller's level",
     )?;
     // Until the stage Space the space is there, and a free page for a
     // buffer too: only the end keeps a new thread and its buffer out of
@@ -890,6 +924,264 @@ fn kill_calls(
         phys::free_frames() == frames + 6,
         "the killed process kept its tables or its threads' buffers",
     )
+}
+
+/// The end of a process takes off the running thread when it is one of
+/// the process's, and only that one (spec 7.7): the call that ended the
+/// process, or its fault, never returns to it. A ready thread of the
+/// process waits for the stage Threads. A process whose only thread runs
+/// skips the stage: its teardown begins at the stage Replies, at R.
+pub fn end_takes_the_running_thread_off(boot: &Boot) -> Result<(), &'static str> {
+    running_and_ready(boot)?;
+    let counts = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
+    let result = running(p).and_then(|r| {
+        // SAFETY: the test holds the process; `r` runs.
+        unsafe { process::end(p, ProcessState::Killed, CAUSE) };
+        let result = check(
+            process::progress(p).0 == Stage::Replies && cleanup::top() == Some(CAUSE),
+            "a process whose only thread ran took a portion of the stage Threads",
+        );
+        // SAFETY: the test's reference goes; the end stopped the thread.
+        unsafe { thread::release(r, CAUSE) };
+        result
+    });
+    // SAFETY: the test's reference goes.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use()) == counts,
+        "a process or a thread stayed in its pool",
+    )
+}
+
+fn running_and_ready(_: &Boot) -> Result<(), &'static str> {
+    let counts = (process::in_use(), thread::in_use());
+    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
+    let result = running(p).and_then(|r| {
+        let made = thread::create(p, USER_VA, USER_VA, 0, 5, Policy::Fifo).map_err(|_| "no thread");
+        let result = made.and_then(|ready| {
+            let result = thread::start(ready)
+                .map_err(|_| "a thread did not start")
+                .and_then(|()| {
+                    // SAFETY: the test holds the process; `r` runs.
+                    unsafe { process::end(p, ProcessState::Killed, CAUSE) };
+                    // SAFETY: the test holds the threads.
+                    let states = unsafe { [r, ready].map(|t| t.as_ref().sched.state()) };
+                    check(
+                        states == [State::Dead, State::Ready] && sched::view().running.is_none(),
+                        "the end did not take the running thread off, or took another",
+                    )
+                });
+            cleanup::drain();
+            // SAFETY: the test's reference goes; the stage Threads stopped
+            // the thread.
+            unsafe { thread::release(ready, CAUSE) };
+            result
+        });
+        // SAFETY: the test's reference goes, the kernel's first.
+        unsafe {
+            sched::exit(r, CAUSE);
+            thread::release(r, CAUSE);
+        }
+        result
+    });
+    // SAFETY: the test's reference goes.
+    unsafe { process::release(p, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use()) == counts,
+        "a process or a thread stayed in its pool",
+    )
+}
+
+/// A channel two processes receive on, one of which ended (spec 6.8, 7.7):
+/// until its stage Threads takes it off, the receiver of the process that
+/// ended, which waited first, stands at the head of the channel's queue and
+/// takes a live client's request, whose client wakes with PEER_CLOSED at
+/// the stage Replies. Once the teardown went past its stage Notify, the
+/// next request goes to the live receiver. The rule for services: hand a
+/// handle with RECEIVE to a new instance only after the end notification
+/// of the old one.
+pub fn shared_channel_feeds_a_dying_receiver(_: &Boot) -> Result<(), &'static str> {
+    let counts = (process::in_use(), thread::in_use(), channel::in_use());
+    let made = [0; 3].map(|_| process::create_root(QUOTA, 16, CEILING));
+    let result = match made {
+        [Ok(old), Ok(new), Ok(client)] => shared_receivers(old, new, client),
+        _ => Err("no process"),
+    };
+    for p in made.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(p, CAUSE) };
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use(), channel::in_use()) == counts,
+        "a process, a thread or a channel of the shared channel stayed",
+    )
+}
+
+fn shared_receivers(
+    old: NonNull<Process>,
+    new: NonNull<Process>,
+    client: NonNull<Process>,
+) -> Result<(), &'static str> {
+    let c = owned_channel(old)?;
+    process::insert_handle(new, Object::Channel(c), Rights::RECEIVE)
+        .map_err(|_| "no handle of the new instance")?;
+    let mut threads = [None; 4];
+    let result = (|| {
+        let r_old = *threads[0].insert(waiting(old, c)?);
+        let r_new = *threads[1].insert(waiting(new, c)?);
+        // SAFETY: the test holds the old process; no thread of it runs.
+        unsafe { process::end(old, ProcessState::Killed, CAUSE) };
+        let send = |slot: &mut Option<NonNull<Thread>>| {
+            let t = *slot.insert(running(client)?);
+            let sent = channel::send(t, Via::Channel(c), Desc::from_send(0).expect("a send"), &[]);
+            Ok::<_, &'static str>((t, sent.map_err(|_| "the send failed")?))
+        };
+        // The fast path is closed: the old instance's teardown stands at S.
+        let (first, ran) = send(&mut threads[2])?;
+        check(ran.is_none(), "the client did not wait for its reply")?;
+        // SAFETY: the test holds the threads.
+        let state = |t: NonNull<Thread>| unsafe { t.as_ref() }.sched.state();
+        check(
+            state(r_old) == State::Ready && state(r_new) == State::Waiting,
+            "the receiver of the process that ended did not take the request",
+        )?;
+        cleanup::drain();
+        check(
+            process::progress(old).0 == Stage::Shell,
+            "the teardown of the old instance did not pass its stage Notify",
+        )?;
+        // SAFETY: as above.
+        let x0 = unsafe { first.as_ref() }.regs.x[0];
+        check(
+            state(first) == State::Ready && x0 == Error::PeerClosed.code(),
+            "the client of the receiver that ended did not wake with PEER_CLOSED",
+        )?;
+        // SAFETY: the test holds the client; it leaves for the next one.
+        unsafe { sched::exit(first, CAUSE) };
+        let (_, ran) = send(&mut threads[3])?;
+        check(
+            ran.map_or(state(r_new) == State::Ready, |r| r == r_new),
+            "the live receiver did not take the request after the end notification",
+        )
+    })();
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    result
+}
+
+/// A thread of a process that ended still waits in receive until the
+/// process's stage Threads takes it off (spec 7.7): a request with a handle
+/// that comes meanwhile goes to it, and the handle into the process's
+/// table, which its stage Handles empties later; the client waits for its
+/// reply until the stage Replies wakes it with PEER_CLOSED. Afterwards the
+/// handle's object, a channel only the request held, went.
+pub fn dying_receiver_takes_a_request(_: &Boot) -> Result<(), &'static str> {
+    let counts = (process::in_use(), thread::in_use(), channel::in_use());
+    let service = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no service")?;
+    let client = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no client");
+    let result = client.and_then(|client| {
+        let result = request_to_the_dying(service, client);
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(client, CAUSE) };
+        result
+    });
+    // SAFETY: the test's reference goes.
+    unsafe { process::release(service, CAUSE) };
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use(), channel::in_use()) == counts,
+        "a process, a thread or a channel of the request stayed",
+    )
+}
+
+fn request_to_the_dying(
+    service: NonNull<Process>,
+    client: NonNull<Process>,
+) -> Result<(), &'static str> {
+    let c = owned_channel(service)?;
+    // Handles of a message go through the buffers of both threads.
+    let r =
+        thread::create(service, USER_VA, USER_VA, 0, 5, Policy::Fifo).map_err(|_| "no thread")?;
+    let waits = thread::give_buffer(r, BUFFER as usize)
+        .map_err(|_| "no buffer")
+        .and_then(|()| {
+            thread::start(r).map_err(|_| "a thread did not start")?;
+            // SAFETY: the scheduler's threads are alive.
+            sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+            channel::receive(r, c, true).map_err(|_| "the receiver did not wait")
+        });
+    if let Err(why) = waits {
+        // SAFETY: the test's reference goes, the kernel's first.
+        unsafe {
+            sched::exit(r, CAUSE);
+            thread::release(r, CAUSE);
+        }
+        return Err(why);
+    }
+    channel::retain(c, Rights::NONE);
+    let sent = running(client).and_then(|t| {
+        let carried = thread::give_buffer(t, BUFFER as usize)
+            .map_err(|_| "no buffer")
+            .and_then(|()| channel::create(client, FIRE_LEVEL).map_err(|_| "no channel to carry"));
+        let h = carried.and_then(|carried| {
+            let h = process::insert_handle(client, Object::Channel(carried), CHANNEL_RIGHTS);
+            // SAFETY: the reference `create` handed out goes; the handle,
+            // if it went in, holds the channel.
+            unsafe { channel::release(carried, Rights::NONE, CAUSE) };
+            h.map_err(|_| "a handle did not go in")
+        });
+        let result = h.and_then(|h| {
+            // SAFETY: the test holds the service; its receiver is not the
+            // running thread.
+            unsafe { process::end(service, ProcessState::Killed, CAUSE) };
+            let before = process::handle_counts(service).0;
+            let desc = Desc::from_send(1 << abi::HANDLES_SHIFT).expect("a send");
+            let sent = channel::send(t, Via::Channel(c), desc, &[h.0]);
+            check(
+                sent == Ok(None) && process::handle_counts(service).0 == before + 1,
+                "the receiver of a process that ended did not take the request and its handle",
+            )?;
+            cleanup::drain();
+            // SAFETY: the test holds the threads.
+            let (rs, ts, x0) = unsafe {
+                (
+                    r.as_ref().sched.state(),
+                    t.as_ref().sched.state(),
+                    t.as_ref().regs.x[0],
+                )
+            };
+            check(
+                rs == State::Dead && ts == State::Ready && x0 == Error::PeerClosed.code(),
+                "the client of a receiver that ended did not wake with PEER_CLOSED",
+            )
+        });
+        // SAFETY: the test's references go; the client leaves the scheduler
+        // first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+        result
+    });
+    // SAFETY: the test's references go.
+    unsafe {
+        thread::release(r, CAUSE);
+        channel::release(c, Rights::NONE, CAUSE);
+    }
+    sent
 }
 
 /// process_kill of a process that ended before hastens its teardown
@@ -932,7 +1224,7 @@ fn hasten_cases(c: &Caller, child: Handle, ready: NonNull<Thread>) -> Result<(),
         cleanup::top() == Some(2) && sched::first(10) == Some(ready),
         "the child's teardown does not wait at 2 behind the thread at 10",
     )?;
-    c.succeeds(Call::ProcessKill.number(), &[child.0], &[])?;
+    c.succeeds(Call::ProcessKill.number(), &[child.0, 0], &[])?;
     check(
         cleanup::top() == Some(20),
         "process_kill of a process that ended did not raise its teardown to the caller's level",
@@ -1431,6 +1723,10 @@ fn holder_dies(c: &Caller, h: Handle, ch: NonNull<Channel>) -> Result<(), &'stat
         holder.close(d)?;
         // SAFETY: the holder's process is the test's.
         unsafe { process::end(holder.process, ProcessState::Killed, HOLDER_END) };
+        // Its thread leaves first, at its ceiling.
+        while process::progress(holder.process).0 == Stage::Threads {
+            cleanup::portion();
+        }
         let level = cleanup::top();
         c.fails(Call::Receive.number(), &[h.0, NO_WAIT], Error::WouldBlock)?;
         cleanup::drain();
@@ -1519,7 +1815,7 @@ pub fn exit_notice_keeps_the_shell(_: &Boot) -> Result<(), &'static str> {
                 &[CHILD_QUOTA, 16, 20, h.0, 10, 0],
             )
             .and_then(|child| {
-                c.succeeds(Call::ProcessKill.number(), &[child.0], &[])?;
+                c.succeeds(Call::ProcessKill.number(), &[child.0, 0], &[])?;
                 c.close(child)?;
                 cleanup::drain();
                 let kept = process::in_use() == processes + 2;
@@ -4031,14 +4327,22 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 /// buffers, 42 handles in transit, and 32 charged pool pages. The buffer
 /// work exactly fills its 64-unit portion; the shell's 32 pages take four
 /// or more portions. The handles use the permanent system resource so
-/// they add no unrelated object cleanup. The rows after them:
-/// - stop_threads: the part of an end in the call (process::end, stage
-///   Stop) of a process with abi::MAX_THREADS ready threads, the kernel's
-///   reference the last of each, as when a program closed its handle to a
-///   thread it made: each thread goes on the cleanup queue
-///   (stop_max_threads_ticks);
-/// - stop_senders: the same with every thread waiting in send through the
-///   last copy of a session (stop_max_senders_ticks);
+/// they add no unrelated object cleanup. The rows after them
+/// (`threads_teardown`):
+/// - end_call: the part of an end in the call (process::end) of a process
+///   with abi::MAX_THREADS threads, the running one, whose kernel's
+///   reference is its last, as in process_exit or a fault, and the others
+///   waiting in send through the last copy of a session: the call takes
+///   the running thread off and queues the process;
+/// - threads_ready: the longest portion of the stage Threads of a process
+///   with abi::MAX_THREADS ready threads, the kernel's reference the last
+///   of each, as when a program closed its handle to a thread it made:
+///   each thread goes on the cleanup queue; the longer of the threads on
+///   one level and on a level each, 1-63 in turn (`Crowd::Ready`);
+/// - teardown_threads: the same with the senders of end_call;
+/// - child_threads: the longest portion of the teardown of a parent whose
+///   child has abi::MAX_THREADS such senders, its stage Stop ending the
+///   child;
 /// - session_buffers: the portion of the stage Buffers of 42 handles in
 ///   transit that are the last copies of sessions, each waking a receiver,
 ///   and 11 buffers whose frames merge up to the highest order
@@ -4049,9 +4353,11 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 ///   last copies of sessions, each waking a receiver
 ///   (session_handles_ticks).
 ///
-/// The last three are the session cases measured before this cleanup,
+/// The last two are the session cases measured before this cleanup,
 /// whose worst portion was the term B of the blocking of every level
-/// (spec 15.3).
+/// (spec 15.3). No portion of the teardowns of the threads rows, those of
+/// the threads' own cleanup included, is longer than that term, the
+/// session_handles of the same run (KERNEL_STATS x5).
 #[cfg(feature = "icount")]
 pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     let before = (process::in_use(), thread::in_use());
@@ -4119,41 +4425,23 @@ pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     cleanup::portion();
     let shell = timer::now() - start;
     cleanup::drain();
-    let stop = stop_max_threads_ticks()?;
-    let senders = stop_max_senders_ticks()?;
     let session_buffers = session_buffers_ticks()?;
     let session_handles = session_handles_ticks()?;
+    let b = session_handles;
+    let (_, one_level) = threads_teardown(Crowd::Ready { spread: false }, false, b)?;
+    let (_, spread) = threads_teardown(Crowd::Ready { spread: true }, false, b)?;
+    let ready = one_level.max(spread);
+    let (end_call, senders) = threads_teardown(Crowd::Senders, false, b)?;
+    let (_, child) = threads_teardown(Crowd::Senders, true, b)?;
+    kprintln!("threads ready ticks: one_level={one_level} spread={spread}");
     kprintln!(
-        "teardown portions ticks: buffers={buffers} shell={shell} stop_threads={stop} stop_senders={senders} session_buffers={session_buffers} session_handles={session_handles} threads={}",
+        "teardown portions ticks: buffers={buffers} shell={shell} end_call={end_call} threads_ready={ready} teardown_threads={senders} child_threads={child} session_buffers={session_buffers} session_handles={session_handles} threads={}",
         abi::MAX_THREADS
     );
     check(
         (process::in_use(), thread::in_use()) == before,
         "the measured teardown kept a process or thread",
     )
-}
-
-#[cfg(feature = "icount")]
-fn stop_max_threads_ticks() -> Result<u64, &'static str> {
-    let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
-    for _ in 0..abi::MAX_THREADS {
-        let t =
-            thread::create(p, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
-        let started = thread::start(t);
-        // SAFETY: the measurement's reference goes; a started thread is
-        // the kernel's, whose reference is then the last.
-        unsafe { thread::release(t, CAUSE) };
-        started.map_err(|_| "a thread did not start")?;
-    }
-    let start = timer::now();
-    // SAFETY: the test holds the process. Its ready threads do not run
-    // while the kernel measures the process's end.
-    unsafe { process::end(p, ProcessState::Killed, CAUSE) };
-    let took = timer::now() - start;
-    // SAFETY: the measurement owns the process reference.
-    unsafe { process::release(p, CAUSE) };
-    cleanup::drain();
-    Ok(took)
 }
 
 /// The calls of upcalls and of a request's identity (spec 11) in their
@@ -4169,11 +4457,10 @@ fn stop_max_threads_ticks() -> Result<u64, &'static str> {
 ///   interrupted one does, its entry enabled: the request ends the wait
 ///   as thread_interrupt does;
 /// - return: thread_upcall_return of the whole context from the buffer,
-///   FP and SIMD registers included;
-/// - identity: request_identity of a request the caller's process took.
+///   FP and SIMD registers included.
 ///
 /// The test prints them in one line, `upcall ticks: interrupt=... bind=...
-/// control=... request=... return=... identity=...`, which xtask shows;
+/// control=... request=... return=...`, which xtask shows;
 /// no number fails it (spec 15.3).
 #[cfg(feature = "icount")]
 pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
@@ -4189,14 +4476,13 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
         Call::ThreadUpcallControl,
         Call::ThreadUpcallRequest,
         Call::ThreadUpcallReturn,
-        Call::RequestIdentity,
     ] {
         syscall::clear_call_maximum(call.number());
     }
     let mut l = Listeners::new(2 * abi::MESSAGE_HANDLES)?;
     let other = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process");
     let result = other.and_then(|other| {
-        let mut threads = [None; 4];
+        let mut threads = [None; 2];
         let result = with_caller(|c| upcall_calls(c, other, &mut l, &mut threads));
         for t in threads.into_iter().flatten() {
             // SAFETY: the test's reference goes, and the kernel's first.
@@ -4215,13 +4501,12 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
     let maxima = syscall::call_maxima();
     let ticks = |call: Call| maxima[call.number() as usize];
     kprintln!(
-        "upcall ticks: interrupt={} bind={} control={} request={} return={} identity={}",
+        "upcall ticks: interrupt={} bind={} control={} request={} return={}",
         ticks(Call::ThreadInterrupt),
         ticks(Call::ThreadUpcallBind),
         ticks(Call::ThreadUpcallControl),
         ticks(Call::ThreadUpcallRequest),
         ticks(Call::ThreadUpcallReturn),
-        ticks(Call::RequestIdentity),
     );
     check(
         (
@@ -4234,16 +4519,51 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
     )
 }
 
+/// process_kill with a level below the caller's priority under -icount
+/// (spec 7.7, 11): the caller at 10 kills a child with a running thread at
+/// level 1, and the call returns once the part in the call is done, its
+/// teardown left in the cleanup queue (its stage Threads at S). The test prints the call's ticks, `process kill
+/// ticks: level=...`, which xtask records; no number fails it (spec 15.3).
+#[cfg(feature = "icount")]
+pub fn process_kill_with_a_level_is_measured(_: &Boot) -> Result<(), &'static str> {
+    let counts = (thread::in_use(), process::in_use());
+    syscall::clear_call_maximum(Call::ProcessKill.number());
+    let result = with_caller(|c| {
+        let child = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no child")?;
+        let made = running(child).and_then(|t| {
+            let h = c.insert(Object::Process(child), Rights::MANAGE)?;
+            let killed = c.succeeds(Call::ProcessKill.number(), &[h.0, 1], &[]);
+            let queued = cleanup::len() > 0;
+            c.close(h)?;
+            // SAFETY: the test's reference to the thread goes; the kill
+            // took the kernel's.
+            unsafe { thread::release(t, CAUSE) };
+            killed?;
+            check(queued, "the teardown did not wait in the cleanup queue")
+        });
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(child, CAUSE) };
+        cleanup::drain();
+        made
+    });
+    let ticks = syscall::call_maxima()[Call::ProcessKill.number() as usize];
+    kprintln!("process kill ticks: level={ticks}");
+    result?;
+    check(
+        ticks > 0 && (thread::in_use(), process::in_use()) == counts,
+        "process_kill was not timed, or a thread or a process stayed",
+    )
+}
+
 /// What `upcall_calls_are_measured` builds and calls for the caller `c`:
-/// the threads it waits on go into `threads`, two senders of `other`'s, a
-/// receiver of `c`'s process and a client of `other`'s, for the caller to
-/// end.
+/// the threads it waits on go into `threads`, two senders of `other`'s,
+/// for the caller to end.
 #[cfg(feature = "icount")]
 fn upcall_calls(
     c: &Caller,
     other: NonNull<Process>,
     l: &mut Listeners,
-    threads: &mut [Option<NonNull<Thread>>; 4],
+    threads: &mut [Option<NonNull<Thread>>; 2],
 ) -> Result<(), &'static str> {
     // Every thread waits before any wakes, so that each new one is what
     // the scheduler picks.
@@ -4255,32 +4575,6 @@ fn upcall_calls(
         .control(abi::UpcallControl::Enable.raw())
         .map_err(|_| "enable failed")?;
     sender_in_transit(other, l, 0, &mut threads[1])?;
-    // The receiver of a request with a handle takes it into its buffer.
-    let requests = owned_channel(c.process)?;
-    let receiver = thread::create(c.process, USER_VA, USER_VA, 0, 5, Policy::Fifo)
-        .map_err(|_| "no receiver")?;
-    threads[2] = Some(receiver);
-    thread::give_buffer(receiver, BUFFER as usize + PAGE).map_err(|_| "no buffer")?;
-    thread::start(receiver).map_err(|_| "the receiver did not start")?;
-    // SAFETY: the scheduler's threads are alive.
-    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
-    check(
-        matches!(picked, kcore::sched::Decision::Run(r) if r == receiver),
-        "the receiver did not run",
-    )?;
-    channel::receive(receiver, requests, true).map_err(|_| "the receiver did not wait")?;
-    let client = running(other)?;
-    threads[3] = Some(client);
-    let carried = process::insert_handle(other, Object::Resource, Rights::NONE)
-        .map_err(|_| "a handle did not go in")?;
-    let desc = Desc::from_send(1 << abi::HANDLES_SHIFT).expect("a send");
-    check(
-        channel::send(client, Via::Channel(requests), desc, &[carried.0]) == Ok(None),
-        "the request was not taken",
-    )?;
-    // SAFETY: the receiver is the test's.
-    let token = unsafe { threads[2].expect("the receiver").as_ref() }.regs.x[11];
-
     let thread_handle =
         |t: Option<NonNull<Thread>>| c.insert(Object::Thread(t.expect("a thread")), Rights::MANAGE);
     // A handle to a thread of the caller's own process would hold that
@@ -4301,8 +4595,6 @@ fn upcall_calls(
         l.woken() == 2 * abi::MESSAGE_HANDLES,
         "the request did not let the handles in transit go",
     )?;
-    let got = c.call(Call::RequestIdentity.number(), &[token]);
-    check(got[0] == 0, "request_identity failed")?;
 
     thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
     c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
@@ -4376,60 +4668,132 @@ fn sender_in_transit(
     sent
 }
 
-/// stop_senders of `teardown_portions_are_measured`: a process with
-/// abi::MAX_THREADS threads, each waiting in send through a session of a
-/// channel of its own of a service, the only copy of which its request
-/// holds, ends; the ticks of process::end. Each thread leaves its
-/// channel's queue and lets its copy go, the last, which posts CLIENT_GONE
-/// into the channel (session::release); no receiver waits there to wake,
-/// since the queue held the request. The kernel's reference to each thread
-/// is its last, as in stop_threads, so each goes on the cleanup queue. A
-/// channel for each costs some 250 ticks more than one channel for all.
+/// What the abi::MAX_THREADS threads of `threads_teardown` do when their
+/// process ends.
 #[cfg(feature = "icount")]
-fn stop_max_senders_ticks() -> Result<u64, &'static str> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Crowd {
+    /// Each is ready, the kernel's reference its last; all at 10, or with
+    /// `spread` on the levels 1-63 in turn, so that a thread that leaves
+    /// is more often the last of its level and clears its bit.
+    Ready { spread: bool },
+    /// The newest runs, as the caller of process_exit or a faulting thread
+    /// does; each other waits in send through a session of a channel of its
+    /// own of a service, the only copy of which its request holds. The
+    /// kernel's reference, held through the run or the wait, is the last of
+    /// each: leaving the channel's queue, a sender lets the copy go, which
+    /// posts CLIENT_GONE into the channel (session::release); no receiver
+    /// waits there to wake, since the queue held the request. A channel for
+    /// each costs some 250 ticks more than one channel for all.
+    Senders,
+}
+
+/// A process with abi::MAX_THREADS threads as `crowd` says ends, or its
+/// parent does when `as_child`, and its whole teardown runs: the ticks of
+/// process::end, and of the longest portion while the process was at its
+/// stage Threads. Each portion of the teardown, of the processes and of
+/// the threads, is no longer than `b` (KERNEL_STATS x5).
+#[cfg(feature = "icount")]
+fn threads_teardown(crowd: Crowd, as_child: bool, b: u64) -> Result<(u64, u64), &'static str> {
     let service =
         process::create_root(QUOTA, 2 * abi::MAX_THREADS, CEILING).map_err(|_| "no service")?;
-    let took = (|| {
-        let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process")?;
-        let queued = (0..abi::MAX_THREADS).try_for_each(|i| {
-            let t = running(p)?;
-            let c = owned_channel(service);
-            let s = c.and_then(|c| {
-                session::create(service, c, u64::from(i) + 1, FIRE_LEVEL).map_err(|_| "no session")
-            });
-            let sent = s.map(|s| {
-                let sent =
-                    channel::send(t, Via::Session(s), Desc::from_send(0).expect("a send"), &[]);
-                // SAFETY: the reference `create` handed out goes; the
-                // request, if it waits, holds the session.
-                unsafe { session::unref(s, CAUSE) };
-                sent
-            });
-            // SAFETY: the measurement's reference goes; the kernel's, held
-            // through the wait, is then the last.
-            unsafe { thread::release(t, CAUSE) };
-            check(sent? == Ok(None), "a sender did not wait in the queue")
-        });
-        let took = queued.map(|()| {
+    let parent = if as_child {
+        Some(process::create_root(QUOTA, 16, CEILING).map_err(|_| "no parent")?)
+    } else {
+        None
+    };
+    let made = match parent {
+        Some(parent) => process::create_child(parent, QUOTA / 4, 16, CEILING),
+        None => process::create_root(QUOTA, 16, CEILING),
+    };
+    let took = made.map_err(|_| "no process").and_then(|p| {
+        let took = fill_crowd(p, service, crowd).and_then(|()| {
+            cleanup::take_longest();
             let start = timer::now();
-            // SAFETY: the test holds the process; its threads wait.
-            unsafe { process::end(p, ProcessState::Killed, CAUSE) };
-            timer::now() - start
+            // SAFETY: the test holds the process or its parent; their
+            // threads do not run while the kernel measures.
+            unsafe { process::end(parent.unwrap_or(p), ProcessState::Killed, CAUSE) };
+            let end_call = timer::now() - start;
+            let mut threads = 0;
+            for _ in 0..1024 {
+                if cleanup::top().is_none() {
+                    break;
+                }
+                let at_threads = process::measurement_stage(p) == Stage::Threads;
+                let start = timer::now();
+                cleanup::portion();
+                if at_threads {
+                    threads = threads.max(timer::now() - start);
+                }
+            }
+            check(cleanup::top().is_none(), "the teardown did not end")?;
+            check(
+                cleanup::take_longest() <= b,
+                "a portion of a teardown of abi::MAX_THREADS threads is longer than B",
+            )?;
+            Ok((end_call, threads))
         });
         // SAFETY: the measurement owns the process reference.
         unsafe { process::release(p, CAUSE) };
         took
-    })();
+    });
+    if let Some(parent) = parent {
+        // SAFETY: the measurement owns the parent's reference.
+        unsafe { process::release(parent, CAUSE) };
+    }
     cleanup::drain();
-    // SAFETY: the measurement owns the process reference.
+    // SAFETY: the measurement owns the service's reference.
     unsafe { process::release(service, CAUSE) };
     cleanup::drain();
     took
 }
 
+/// abi::MAX_THREADS threads of `p` as `crowd` says, senders through
+/// sessions of channels of `service`.
+#[cfg(feature = "icount")]
+fn fill_crowd(
+    p: NonNull<Process>,
+    service: NonNull<Process>,
+    crowd: Crowd,
+) -> Result<(), &'static str> {
+    (0..abi::MAX_THREADS).try_for_each(|i| {
+        if let Crowd::Ready { spread } = crowd {
+            let level = if spread { 1 + (i % 63) as u8 } else { 10 };
+            let t = thread::create(p, USER_VA, USER_VA, 0, level, Policy::Fifo)
+                .map_err(|_| "no thread")?;
+            let started = thread::start(t);
+            // SAFETY: the measurement's reference goes; a started thread is
+            // the kernel's, whose reference is then the last.
+            unsafe { thread::release(t, CAUSE) };
+            return started.map_err(|_| "a thread did not start");
+        }
+        let t = running(p)?;
+        if i + 1 == abi::MAX_THREADS {
+            // SAFETY: the measurement's reference goes; the kernel's, held
+            // while the thread runs, is then the last.
+            unsafe { thread::release(t, CAUSE) };
+            return Ok(());
+        }
+        let c = owned_channel(service);
+        let s = c.and_then(|c| {
+            session::create(service, c, u64::from(i) + 1, FIRE_LEVEL).map_err(|_| "no session")
+        });
+        let sent = s.map(|s| {
+            let sent = channel::send(t, Via::Session(s), Desc::from_send(0).expect("a send"), &[]);
+            // SAFETY: the reference `create` handed out goes; the request,
+            // if it waits, holds the session.
+            unsafe { session::unref(s, CAUSE) };
+            sent
+        });
+        // SAFETY: the measurement's reference goes; the kernel's, held
+        // through the wait, is then the last.
+        unsafe { thread::release(t, CAUSE) };
+        check(sent? == Ok(None), "a sender did not wait in the queue")
+    })
+}
+
 /// A new thread of `p` that the scheduler runs: it starts, and it is what
 /// the scheduler picks next, so that a call made for it runs as its own.
-#[cfg(feature = "icount")]
 fn running(p: NonNull<Process>) -> Result<NonNull<Thread>, &'static str> {
     let t = thread::create(p, USER_VA, USER_VA, 0, 5, Policy::Fifo).map_err(|_| "no thread")?;
     thread::start(t).map_err(|_| "a thread did not start")?;
@@ -5134,11 +5498,12 @@ pub fn device_windows_are_measured(_: &Boot) -> Result<(), &'static str> {
 }
 
 /// The level of the heap of `timer_firing_is_measured`, its payers, and
-/// the receivers its firing wakes, one a timer.
-#[cfg(feature = "icount")]
+/// the receivers its firing wakes, one a timer. The payers have room for
+/// every timer of the system (abi::MAX_SYSTEM_TIMERS) beside those of
+/// levels 1-63.
 const FIRE_LEVEL: u8 = 10;
 #[cfg(feature = "icount")]
-const FIRE_PAYERS: usize = 64;
+const FIRE_PAYERS: usize = (abi::MAX_SYSTEM_TIMERS as usize).div_ceil(abi::MAX_TIMERS as usize);
 #[cfg(feature = "icount")]
 const WOKEN: usize = kcore::timer::FIRE_PORTION;
 
@@ -5148,15 +5513,20 @@ const WOKEN: usize = kcore::timer::FIRE_PORTION;
 ///   (timer::expire) with the top of every level of 1-63 expired, which
 ///   queues 63 firings;
 /// - fire: the portion of cleanup of the firing of FIRE_LEVEL, whose heap
-///   holds 4 096 timers of FIRE_PAYERS payers: it takes FIRE_PORTION
-///   expired ones off a heap of depth 12, and each wakes a receiver that
-///   waits in a channel of its own;
+///   holds every timer of the system but the 62 of the other levels, of
+///   FIRE_PAYERS payers, abi::MAX_SYSTEM_TIMERS in all, the next one
+///   refused with LIMIT_REACHED: it takes FIRE_PORTION expired ones off a
+///   heap of depth 13, and each wakes a receiver that waits in a channel
+///   of its own;
 /// - set: timer_set of the top of that heap, among 63 levels with timers
 ///   and none pending, to a deadline before every other: it leaves the
-///   root, the walk of the levels follows, and it climbs back to the root.
+///   root, the walk of the levels follows, and it climbs back to the root;
+/// - timers_8192: timer_cancel of that timer, the root then: the last node
+///   of the heap takes its place and goes down 13 steps (spec 10).
 ///
 /// The test prints them in one line, `timer portions ticks: interrupt=...
-/// fire=... set=...`, which xtask shows; no number fails it (spec 15.3).
+/// fire=... set=... timers_8192=...`, which xtask shows; no number fails
+/// it (spec 15.3).
 #[cfg(feature = "icount")]
 pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
     let counts = (
@@ -5176,8 +5546,10 @@ pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
         cleanup::drain();
         ticks
     })?;
-    let [interrupt, fire, set] = ticks;
-    kprintln!("timer portions ticks: interrupt={interrupt} fire={fire} set={set}");
+    let [interrupt, fire, set, cancel] = ticks;
+    kprintln!(
+        "timer portions ticks: interrupt={interrupt} fire={fire} set={set} timers_8192={cancel}"
+    );
     check(
         (
             timers::in_use(),
@@ -5193,7 +5565,7 @@ pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
 /// channels, their receivers and the timers of levels 1-63, with the
 /// handles that keep them; each payer holds its timers.
 #[cfg(feature = "icount")]
-fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 3], &'static str> {
+fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 4], &'static str> {
     let mut receivers = [None; WOKEN];
     let mut payers = [None; FIRE_PAYERS];
     let ticks = heap_ticks(c, owner, &mut receivers, &mut payers);
@@ -5214,7 +5586,6 @@ fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 3], &'stati
 
 /// A channel of `owner` at FIRE_LEVEL with a handle with RECEIVE in its
 /// table, which holds it.
-#[cfg(feature = "icount")]
 fn owned_channel(owner: NonNull<Process>) -> Result<NonNull<Channel>, &'static str> {
     let c = channel::create(owner, FIRE_LEVEL).map_err(|_| "no channel")?;
     let h = process::insert_handle(owner, Object::Channel(c), Rights::RECEIVE);
@@ -5245,7 +5616,6 @@ fn held_timer(
 
 /// A new thread of `owner` waits in receive on `ch`: it starts, runs as
 /// far as the scheduler knows, and its receive finds nothing.
-#[cfg(feature = "icount")]
 fn waiting(owner: NonNull<Process>, ch: NonNull<Channel>) -> Result<NonNull<Thread>, &'static str> {
     let t = thread::create(owner, USER_VA, USER_VA, 0, 5, Policy::Fifo).map_err(|_| "no thread")?;
     thread::start(t).map_err(|_| "a thread did not start")?;
@@ -5268,7 +5638,7 @@ fn heap_ticks(
     owner: NonNull<Process>,
     receivers: &mut [Option<NonNull<Thread>>; WOKEN],
     payers: &mut [Option<NonNull<Process>>; FIRE_PAYERS],
-) -> Result<[u64; 3], &'static str> {
+) -> Result<[u64; 4], &'static str> {
     let mut channels = [None; WOKEN];
     for (ch, r) in channels.iter_mut().zip(receivers.iter_mut()) {
         let made = owned_channel(owner)?;
@@ -5279,12 +5649,29 @@ fn heap_ticks(
     // The later timers of the heap by the order they go in, so that a
     // timer that leaves the root takes the last node down to a leaf.
     let far = timer::now() + 1_000_000_000;
+    let lc = owned_channel(owner)?;
+    let mut levels = [None; kcore::timer::LEVELS];
+    for (l, t) in levels.iter_mut().enumerate() {
+        *t = Some(held_timer(owner, lc, l as u8 + 1, 2 * far + l as u64)?);
+    }
+    // FIRE_LEVEL takes the rest of the system's timers: the next one is
+    // refused, though its payer has room.
     let mut early = [None; WOKEN];
     let mut top = None;
-    for (i, payer) in payers.iter_mut().enumerate() {
-        let p = process::create_root(QUOTA, 128, CEILING).map_err(|_| "no payer")?;
+    let mut refused = false;
+    'fill: for (i, payer) in payers.iter_mut().enumerate() {
+        let p = process::create_root(QUOTA, 256, CEILING).map_err(|_| "no payer")?;
         *payer = Some(p);
         for j in 0..abi::MAX_TIMERS as usize {
+            if timers::in_use() == abi::MAX_SYSTEM_TIMERS as usize {
+                match timers::create(p, channels[0], 0, FIRE_LEVEL) {
+                    Err(e) => refused = e == Error::LimitReached,
+                    // SAFETY: the reference `create` handed out goes, and
+                    // the timer with it.
+                    Ok(t) => unsafe { timers::release(t, CAUSE) },
+                }
+                break 'fill;
+            }
             let n = i * abi::MAX_TIMERS as usize + j;
             let t = held_timer(p, channels[n % WOKEN], FIRE_LEVEL, far + n as u64)?;
             match n {
@@ -5294,17 +5681,20 @@ fn heap_ticks(
             }
         }
     }
-    let lc = owned_channel(owner)?;
-    let mut levels = [None; kcore::timer::LEVELS];
-    for (l, t) in levels.iter_mut().enumerate() {
-        *t = Some(held_timer(owner, lc, l as u8 + 1, 2 * far + l as u64)?);
-    }
+    check(
+        refused,
+        "a timer past abi::MAX_SYSTEM_TIMERS was made, or the system did not fill",
+    )?;
     let top = top.expect("the top of the heap");
     let h = c.insert(Object::Timer(top), OWNER_RIGHTS)?;
     let before = timer::clock().ticks_to_ns(far / 2);
     let start = timer::now();
     c.succeeds(Call::TimerSet.number(), &[h.0, before], &[])?;
     let set = timer::now() - start;
+    // The timer is the root now: its cancel takes the last node down.
+    let start = timer::now();
+    c.succeeds(Call::TimerCancel.number(), &[h.0], &[])?;
+    let cancel = timer::now() - start;
     c.close(h)?;
     // Every level expires, and the heap's receivers' timers first of all.
     let at = timer::now() + 2_000_000;
@@ -5336,5 +5726,5 @@ fn heap_ticks(
         .all(|t| unsafe { t.as_ref() }.sched.state() == State::Ready);
     cleanup::drain();
     check(woke, "a receiver of the heap's timers did not wake")?;
-    Ok([interrupt, fire, set])
+    Ok([interrupt, fire, set, cancel])
 }

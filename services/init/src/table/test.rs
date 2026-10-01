@@ -43,6 +43,7 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         dma: &[],
         quiesce: &[],
         trusted: false,
+        root: false,
     }
 }
 

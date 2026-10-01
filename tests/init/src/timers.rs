@@ -31,7 +31,7 @@ pub(crate) const TESTS: [Test; 11] = [
     ("timer_set_moves_the_deadline", timer_set_moves_the_deadline),
     ("cancel_keeps_posted_bits", cancel_keeps_posted_bits),
     ("timer_never_fires_early", timer_never_fires_early),
-    ("timer_limit_is_64", timer_limit_is_64),
+    ("timer_limit_is_192", timer_limit_is_192),
     (
         "timer_fires_at_its_slot_priority",
         timer_fires_at_its_slot_priority,
@@ -422,10 +422,10 @@ extern "C" fn look_once_ended(slot: u64) -> ! {
 }
 
 /// Spec 15.2 (notifications): a process pays for abi::MAX_TIMERS timers at
-/// most (spec 10). With 64 made, the next timer_create fails with
+/// most (spec 10). With 192 made, the next timer_create fails with
 /// LIMIT_REACHED and changes x0 alone; once one of them went, another
 /// fits.
-fn timer_limit_is_64() -> Outcome {
+fn timer_limit_is_192() -> Outcome {
     let c = channel(QUIET)?;
     let mut timers = [const { None }; abi::MAX_TIMERS as usize];
     let made = timers.iter_mut().try_for_each(|slot| {
@@ -448,7 +448,7 @@ fn timer_limit_is_64() -> Outcome {
     made?;
     check(
         failed(after, x, Error::LimitReached),
-        "a timer past 64 was made, or the call changed more than x0",
+        "a timer past 192 was made, or the call changed more than x0",
     )?;
     check(
         freed == Some(Ok(())) && remade,

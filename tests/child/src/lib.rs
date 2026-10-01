@@ -306,13 +306,10 @@ pub enum Role {
     /// Role::Server, whose handler of server::BUSY spins, yielding, until
     /// a notification comes to handle 1, a channel with RECEIVE.
     Busy = 33,
-    /// Read the sender identity of argument 0, a foreign reply token.
-    /// Ends with the raw syscall status; checks error register preservation.
-    RequestIdentity = 34,
 }
 
 impl Role {
-    pub const ALL: [Role; 34] = [
+    pub const ALL: [Role; 33] = [
         Role::Exit,
         Role::Echo,
         Role::Recurse,
@@ -346,7 +343,6 @@ impl Role {
         Role::Spans,
         Role::Server,
         Role::Busy,
-        Role::RequestIdentity,
     ];
 
     /// The role whose code is `code`.

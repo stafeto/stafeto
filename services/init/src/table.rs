@@ -35,7 +35,14 @@ pub const MIN_QUOTA: u64 = 15 * PAGE;
 pub const MAX_DMA: usize = 2;
 /// The names init gives in start data besides the DMA objects (worker.rs):
 /// no window, binding or DMA object takes one.
-pub const START_DATA_NAMES: [&str; 3] = ["console", "log", "trace"];
+pub const START_DATA_NAMES: [&str; 4] = ["console", "log", "trace", PROCESS_SERVICE];
+/// The name of the POSIX process service (spec 2, section 3.1). A record
+/// that connects to it is a POSIX process: init takes no CONNECT to it, and
+/// gives the process the session of its record in its start data under
+/// this name instead: the service takes the process with ADOPT and gives
+/// the session back with ADOPTED (serve.rs), and the process starts then.
+/// Init never sends the service a request (spec 6.7).
+pub const PROCESS_SERVICE: &str = "posix";
 /// The lines a binding takes: the shared lines of the GIC (spec 9).
 pub const SHARED_LINES: RangeInclusive<u32> = 32..=1019;
 
@@ -161,6 +168,11 @@ pub struct Record {
     /// them: it can write any memory, so it is in the trusted base (spec
     /// 9; spec 2, section 4). Only such a record has DMA objects.
     pub trusted: bool,
+    /// The first POSIX process, whose record the process service gives
+    /// root credentials (spec 2, section 3.1); one record at most, a POSIX
+    /// process. The others init starts have none, and their children
+    /// inherit by the rules of setuid.
+    pub root: bool,
 }
 
 impl Record {
@@ -174,6 +186,11 @@ impl Record {
 
     pub const fn is_client(&self) -> bool {
         matches!(self.kind, Kind::Client)
+    }
+
+    /// Whether it is a POSIX process: it connects to PROCESS_SERVICE.
+    pub fn is_posix(&self) -> bool {
+        self.connects.contains(&PROCESS_SERVICE)
     }
 }
 
@@ -292,6 +309,10 @@ pub enum TableError<'a> {
         record: &'static str,
         window: &'static str,
     },
+    /// Root for a record that is no POSIX process, or for a second one.
+    Root {
+        record: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -381,6 +402,10 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} has a stopping write through {window}: a window of its own, 8 or 32 bits aligned within it"
             ),
+            TableError::Root { record } => write!(
+                f,
+                "{record} has root: one POSIX process at most, which connects to {PROCESS_SERVICE}"
+            ),
         }
     }
 }
@@ -399,8 +424,9 @@ impl fmt::Display for TableError<'_> {
 /// HANDLE_LIMIT_MAX handles and a quota of whole pages, at least
 /// MIN_QUOTA; DMA objects only for a trusted service, each named and of a
 /// power of two of pages up to abi::MAX_CONTIGUOUS_PAGES; each write that
-/// stops the device on a word within a window of the record. Whether the
-/// program is in the boot image, init checks at its start.
+/// stops the device on a word within a window of the record; root for one
+/// POSIX process at most. Whether the program is in the boot image, init
+/// checks at its start.
 pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     if table.len() > MAX_RECORDS {
         return Err(TableError::TooMany { count: table.len() });
@@ -442,6 +468,12 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     }
     for r in table {
         check_record(r)?;
+    }
+    for (place, r) in table.iter().enumerate() {
+        let first = table.iter().position(|r| r.root) == Some(place);
+        if r.root && (!r.is_posix() || !first) {
+            return Err(TableError::Root { record: r.name });
+        }
     }
     Ok(order(table))
 }
@@ -745,6 +777,7 @@ mod tests {
             dma: &[],
             quiesce: &[],
             trusted: false,
+            root: false,
         }
     }
 
@@ -1402,5 +1435,45 @@ mod tests {
                 assert_eq!(r.ceiling, r.priority + 1, "{}", r.name);
             }
         }
+        // The probe is the first POSIX process; the clock peer is one
+        // without root.
+        for table in [ramfs::POSIX_ABI_TABLE, vz::POSIX_ABI_TABLE] {
+            let roots: Vec<_> = table.iter().filter(|r| r.root).map(|r| r.name).collect();
+            assert_eq!(roots, ["posix-abi-probe"]);
+            assert!(table.iter().any(|r| r.name == "clock-peer" && r.is_posix()));
+        }
+    }
+
+    /// Root goes to one POSIX process at most: a record that does not
+    /// connect to the process service, or a second one, is refused.
+    #[test]
+    fn root_is_for_one_posix_process() {
+        const POSIX: &[&str] = &[PROCESS_SERVICE];
+        let process = service(PROCESS_SERVICE, 50, 50);
+        let root = Record {
+            root: true,
+            ..client("first", 20, 20, POSIX)
+        };
+        assert!(check(&[process, root, client("other", 20, 20, POSIX)]).is_ok());
+        let second = Record {
+            root: true,
+            ..client("second", 20, 20, POSIX)
+        };
+        assert_eq!(
+            check(&[process, root, second]),
+            Err(TableError::Root { record: "second" })
+        );
+        let plain = Record {
+            root: true,
+            ..client("plain", 20, 20, &[])
+        };
+        assert_eq!(
+            check(&[process, plain]),
+            Err(TableError::Root { record: "plain" })
+        );
+        assert_eq!(
+            TableError::Root { record: "plain" }.to_string(),
+            "plain has root: one POSIX process at most, which connects to posix"
+        );
     }
 }

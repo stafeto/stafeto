@@ -31,6 +31,7 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         dma: &[],
         quiesce: &[],
         trusted: false,
+        root: false,
     }
 }
 

@@ -55,6 +55,7 @@ unsafe extern "C" {
     static el0_pattern_yield: u8;
     static el0_mark: u8;
     static el0_count_until: u8;
+    static el0_count_to: u8;
     static el0_spin_then_yield: u8;
     static el0_set_priority: u8;
     static el0_set_priority_after_peer: u8;
@@ -66,6 +67,7 @@ unsafe extern "C" {
     static el0_info_then_exit: u8;
     #[cfg(feature = "icount")]
     static el0_close_then_exit: u8;
+    static el0_thread_exit: u8;
     static el0_receive: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
@@ -271,6 +273,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_descendants,
     },
     El0Test {
+        name: "dying_threads_stay_off_between_portions",
+        start: start_dying_threads,
+        done: done_dying_threads,
+    },
+    El0Test {
         name: "kill_takes_a_waiting_thread_off_the_channel",
         start: start_kill_waiting,
         done: done_kill_waiting,
@@ -284,6 +291,11 @@ const EL0_TESTS: &[El0Test] = &[
         name: "set_priority_moves_a_waiting_thread",
         start: start_requeue,
         done: done_requeue,
+    },
+    El0Test {
+        name: "last_thread_exit_is_not_heard",
+        start: start_last_exit,
+        done: done_last_exit,
     },
     El0Test {
         name: "closing_a_channel_wakes_waiters_in_portions",
@@ -479,6 +491,12 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "thread_exit_after_channel_close_is_measured",
         start: start_exit_after_close,
         done: done_exit_after_close,
+    },
+    #[cfg(feature = "icount")]
+    El0Test {
+        name: "thread_exit_notice_is_measured",
+        start: start_exit_notice,
+        done: done_exit_notice,
     },
     El0Test {
         name: "ipc_round_trip_is_measured",
@@ -2046,6 +2064,101 @@ fn done_exit_after_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// The last thread of a process, made with an exit channel of another
+/// process where a thread waits in receive, ends its process through
+/// thread_exit (spec 6.5): the end of the process replaces the end of the
+/// thread, nothing is posted, and the receiver waits on. The judge below
+/// finds the process exited with code 0.
+fn start_last_exit(f: &mut Fixture) -> Result<(), &'static str> {
+    let receiver = spawn(f, 0, &raw const el0_receive, 0)?;
+    sched::set_priority(receiver, PRIORITY + 2, FIFO).map_err(|_| "no receiver")?;
+    let p = f.processes[0].expect("the receiver's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    let exit = Some((c, EXIT_LABEL, PRIORITY + 1));
+    let ender = new_process(f, 1).and_then(|q| {
+        let entry = user_address(&raw const el0_thread_exit);
+        thread::create_with_exit(q, entry, DATA_VA + PAGE, 0, PRIORITY, FIFO, exit)
+            .map_err(|_| "no thread with an exit channel")
+    });
+    // SAFETY: the reference `create` handed out goes; the handle and the
+    // thread's source, if they were made, hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    set_args(receiver, &[h?, 0]);
+    f.threads[1] = Some(ender?);
+    f.ends[0] = true;
+    f.ends[1] = true;
+    judge(f, 2)
+}
+
+fn done_last_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => Err("the end of a process's last thread was heard"),
+        1 => Err("thread_exit returned"),
+        _ => check(
+            state(f, 1) == ProcessState::Exited { code: 0 }
+                && slot_thread(f, 0).sched.state() == State::Waiting,
+            "the last thread did not end its process, or the receiver did not wait on",
+        ),
+    }
+}
+
+/// A thread made with an exit channel ends through thread_exit while
+/// another thread of its process waits in receive on that channel (spec
+/// 6.5): the end wakes the receiver at the notification's priority with
+/// source Exit, the handle's label and bit 0, once the thread left the
+/// scheduler; its process lives on. The judge prints the cost of that
+/// thread_exit under -icount, `thread exit notice ticks: N`.
+#[cfg(feature = "icount")]
+fn start_exit_notice(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let receiver = sched_thread(f, 0, &raw const el0_receive, PRIORITY + 2, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    set_args(receiver, &[h?, 0]);
+    let entry = user_address(&raw const el0_thread_exit);
+    let exit = Some((c, EXIT_LABEL, PRIORITY + 1));
+    let t = thread::create_with_exit(p, entry, DATA_VA + PAGE, 0, PRIORITY, FIFO, exit)
+        .map_err(|_| "no thread with an exit channel")?;
+    f.threads[1] = Some(t);
+    f.ends[1] = true;
+    judge(f, 2)?;
+    syscall::clear_call_maximum(Call::ThreadExit.number());
+    Ok(())
+}
+
+#[cfg(feature = "icount")]
+fn done_exit_notice(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let ended = Notification {
+        source: Source::Exit,
+        label: EXIT_LABEL,
+        bits: 1,
+        count: 1,
+    };
+    match f.slot(t) {
+        0 => check(
+            t.regs.x[0] == 0
+                && t.regs.x[1..12] == ended.to_words()
+                && t.sched.priority() == PRIORITY + 2
+                && slot_thread(f, 1).sched.state() == State::Dead,
+            "the receiver did not take the end of the thread after it ended",
+        ),
+        1 => Err("thread_exit returned"),
+        _ => {
+            let ticks = syscall::call_maxima()[Call::ThreadExit.number() as usize];
+            kprintln!("thread exit notice ticks: {ticks}");
+            check(
+                ticks > 0 && state(f, 0) == ProcessState::Alive,
+                "the thread exit with a notice was not timed, or it ended its process",
+            )
+        }
+    }
+}
+
 /// The thread that waits for the alarm in slot 0 and the judge in slot 2,
 /// as for the kill; in slot 1 the child with the programs and
 /// CHILD_THREADS stopped threads, and its thread that starts at `entry`
@@ -2241,6 +2354,53 @@ fn done_big_teardown(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// the cause, and the exit notification of C, which its parent's channel
 /// hears of at that level (spec 7.9), waits for the judge's receive.
 fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
+    let counter = (
+        &raw const el0_count_until,
+        [COUNT_WORD as u64, STOP_WORD as u64],
+    );
+    descendants(f, CEILING, 0, counter)
+}
+
+/// What the counter of `dying_threads_stay_off_between_portions` counts to
+/// before it ends: far more than a quantum's worth, so that it ends only
+/// when it runs on after its process ended, and its end fails the test.
+const COUNT_TO: u64 = 1 << 26;
+
+/// Stopped threads of the grandchild of `dying_threads_stay_off_between_portions`
+/// ahead of its counter in its list: the stage Threads takes them in more
+/// than one portion, the counter in the last.
+const DYING_CROWD: usize = 100;
+
+/// `descendants_stop_above_the_cause` with a grandchild whose ceiling is
+/// its counter's level, PRIORITY + 2, and DYING_CROWD stopped threads
+/// ahead of the counter in its list (spec 7.7): the stage Threads of the
+/// grandchild runs at S, that ceiling, which the counter shares, in more
+/// than one portion, and the counter is in the last. The cleanup queue
+/// wins over the counter at their level, so the count stays from the end
+/// of the child on, between the portions too; and an interrupt comes after
+/// every portion, which none waits for. The counter counts to COUNT_TO and
+/// ends, which only a counter that runs on after the end reaches.
+fn start_dying_threads(f: &mut Fixture) -> Result<(), &'static str> {
+    let counter = (&raw const el0_count_to, [COUNT_WORD as u64, COUNT_TO]);
+    descendants(f, PRIORITY + 2, DYING_CROWD, counter)?;
+    f.interrupt_every = Some(1);
+    cleanup::take_late();
+    Ok(())
+}
+
+/// The tree of `descendants_stop_above_the_cause`, the grandchild with
+/// `ceiling` and `crowd` stopped threads made after its counter, which the
+/// fixture holds; the counter starts at the program of `counter` with its
+/// x0 and x1 and counts in x2.
+fn descendants(
+    f: &mut Fixture,
+    ceiling: u8,
+    crowd: usize,
+    (entry, args): (*const u8, [u64; 2]),
+) -> Result<(), &'static str> {
+    // Each thread of the crowd takes a third of a page of the grandchild's
+    // pool.
+    let crowd_quota = (crowd as u64).div_ceil(3) * PAGE_SIZE;
     let judge = spawn(f, 0, &raw const el0_alarm_then, 0)?;
     sched::set_priority(judge, PRIORITY + 10, FIFO).map_err(|_| "no judge")?;
     let parent = f.processes[0].expect("the judge's process");
@@ -2249,7 +2409,7 @@ fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
     let a = alarm(f, parent, Some(wake))?;
     let c = channel::create(parent, PRIORITY).map_err(|_| "no channel")?;
     let h = give(parent, Object::Channel(c), Rights::RECEIVE);
-    let child = process::create_child(parent, 2 * CHILD_QUOTA, HANDLE_LIMIT, CEILING);
+    let child = process::create_child(parent, 2 * CHILD_QUOTA + crowd_quota, HANDLE_LIMIT, CEILING);
     let heard = child.and_then(|child| {
         channel::reserve_source(c)?;
         process::set_exit(child, c, EXIT_LABEL, PRIORITY - 5);
@@ -2267,14 +2427,20 @@ fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
         .map_err(|_| "no thread in the child")?;
     f.threads[2] = Some(t);
     f.ends[2] = true;
-    let counter = process::create_child(child, CHILD_QUOTA, HANDLE_LIMIT, CEILING)
+    let counter = process::create_child(child, CHILD_QUOTA + crowd_quota, HANDLE_LIMIT, ceiling)
         .map_err(|_| "no grandchild")
         .and_then(|grandchild| {
             let p = with_programs(f, 1, grandchild)?;
-            new_thread(f, 1, p, DATA_VA, &raw const el0_count_until, 0)
+            new_thread(f, 1, p, DATA_VA, entry, 0)
         })?;
-    set_args(counter, &[COUNT_WORD as u64, STOP_WORD as u64]);
+    set_args(counter, &args);
     sched::set_priority(counter, PRIORITY + 2, RR).map_err(|_| "no counter")?;
+    let grandchild = f.processes[1].expect("the grandchild");
+    for slot in &mut f.crowd[..crowd] {
+        let t = thread::create(grandchild, TEXT_VA, DATA_VA + PAGE, 0, PRIORITY, FIFO)
+            .map_err(|_| "no stopped thread in the grandchild")?;
+        *slot = Some(t);
+    }
     f.ends[1] = true;
     f.exit_at_interrupt = Some((child, low));
     Ok(())
@@ -2283,6 +2449,14 @@ fn start_descendants(f: &mut Fixture) -> Result<(), &'static str> {
 /// What the thread in slot 1 counted, in x2 (el0_count_until).
 fn counted(f: &Fixture) -> u64 {
     slot_thread(f, 1).regs.x[2]
+}
+
+fn done_dying_threads(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    done_descendants(f, t)?;
+    check(
+        !cleanup::take_late() && f.portions >= 3,
+        "a portion began while an interrupt was pending, or the stage Threads took one portion",
+    )
 }
 
 fn done_descendants(f: &Fixture, t: &Thread) -> Result<(), &'static str> {

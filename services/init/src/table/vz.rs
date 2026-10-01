@@ -107,6 +107,7 @@ pub const CONSOLE: Record = Record {
         },
     ],
     trusted: true,
+    root: false,
 };
 
 pub const TABLE: &[Record] = &[

@@ -23,24 +23,29 @@ POSIX layer covers, and which commands check each piece. It describes
   invalidates cache lines from EL0.
 - **Execution:** EL0 threads with registers and FP/SIMD saved on every
   switch; 64 priority levels, round robin with a 4 ms quantum and FIFO;
-  tickless timer preemption.
+  tickless timer preemption. A thread made with an exit channel
+  (`thread_create` `x7`, `x8`) tells of its end through `thread_exit` with
+  a notification once it left the scheduler, so its stack may go; the end
+  of its process replaces it.
 - **System calls:** `handle_close`, `handle_duplicate`, `channel_create`,
-  `send`, `receive`, `reply`, `request_identity`, `notify`, `mem_create`,
+  `send`, `receive`, `reply`, `notify`, `mem_create`,
   `mem_map`, `mem_unmap`, `mem_protect`, `process_create`, `process_kill`,
   `process_exit`, `thread_create`, `thread_start`, `thread_exit`,
   `thread_set_priority`, `thread_interrupt`, `thread_upcall_bind`,
   `thread_upcall_control`, `thread_upcall_request`, `thread_upcall_return`,
   `yield`, `device_window_create`, `irq_bind`, `irq_ack`, `clock_now`,
   `timer_create`, `timer_set`, `timer_cancel`, `object_info`,
-  `debug_write`; the same on every machine. Number 29 (`console_poll`
-  of the old VZ build) is retired and fails as an unknown one.
+  `debug_write`; 33 in all, the same on every machine. Numbers 29
+  (`console_poll` of the old VZ build) and 35 (`request_identity`) are
+  retired and fail as unknown ones, and so does kind 10 of `object_info`;
+  the process service names its clients by the labels of the sessions it
+  gives. `process_kill` takes the level of the teardown it starts.
 - **Messages:** requests and replies of up to 1 KiB, the first 64 bytes in
   registers and the rest through a per-thread message buffer; up to four
   handles move with a message and keep their rights and labels. A service
   works at its client's priority under its own ceiling until it replies; a
   fast path hands the CPU straight to a waiting service. A live IPC wait
-  can be interrupted, and a receiver can read the authenticated process
-  identity of the sender.
+  can be interrupted.
 - **Upcalls:** a thread with `MANAGE` rights can enter a computing or
   IPC-waiting thread of another process and later restore its registers,
   TLS, FP/SIMD state and message buffer, including nested entries. The
@@ -50,7 +55,8 @@ POSIX layer covers, and which commands check each piece. It describes
   maps device registers into a driver, never executable; a driver that dies
   frees its line at once.
 - **Timers:** program timers fire at the priority of their slots, in
-  bounded portions after the timer interrupt.
+  bounded portions after the timer interrupt; a process pays for up to
+  192, the system holds up to 8,192, and arming never fails.
 - **Faults:** a fault ends only its own process, and the parent learns why
   through its exit channel.
 - **Kernel log:** a ring of 64 records that the console driver reads; the
@@ -79,7 +85,15 @@ Bounded paths with interrupts masked are listed in
 - `services/ramfs`: RAM files and directories (`proto/fs`).
 - `services/clock` and `services/process`: realtime clock, process
   identity and credentials for the POSIX layer (`proto/clock`,
-  `proto/process`).
+  `proto/process`). The process service keeps 256 records, PID = index +
+  256 * generation, and gives each its session through a label of its
+  own. A thread of the service asks `init` for each POSIX process `init`
+  loaded (`ADOPT`, root only for the record of the table that has it),
+  makes its record and gives `init` the session (`ADOPTED`), which `init`
+  puts in the process's start data before the process starts; `init`
+  never sends the service a request. A process gets a session for its
+  native child (`Child`, 32 live children a record, a handle with
+  `MANAGE`). A record goes with the last copy of its session.
 
 ## Rust POSIX layer
 
@@ -98,7 +112,7 @@ the C probe. No real program uses the layer yet; implementation is paused.
 | Threads | `pthread_create`/`join`/`detach`/`exit`, deferred cancellation and cleanup handlers, keys, `pthread_once`, 64 live threads | [threads](../notes/m2-rust-posix-threads.md), [cancel](../notes/m2-rust-posix-deferred-cancel.md), [keys](../notes/m2-rust-posix-thread-data.md), [once](../notes/m2-rust-posix-once.md), [capacity](../notes/m2-rust-posix-thread-capacity.md) |
 | Mutexes and time | NORMAL, ERRORCHECK and RECURSIVE mutexes, `pthread_mutex_timedlock`, `pthread_mutex_clocklock`, `clock_gettime`/`getres`/`settime`, `nanosleep`, `clock_nanosleep` | [mutex](../notes/m2-rust-posix-mutex.md), [timed](../notes/m2-rust-posix-timed-mutex.md), [clocks](../notes/m2-rust-posix-clocks.md), [sleep](../notes/m2-rust-posix-sleep.md) |
 | Signals | `sigaction`, masks, pending sets, `raise`, `pthread_kill`, `sigwait`, `sigwaitinfo`, `sigtimedwait`, `SA_SIGINFO` with a real interrupted context; host-tested pending-signal queues | [upcall](../notes/m2-native-upcall.md), [actions](../notes/m2-rust-posix-signal-actions.md), [sigwait](../notes/m2-rust-posix-sigwait.md), [sigwaitinfo](../notes/m2-rust-posix-sigwaitinfo.md), [context](../notes/m2-rust-posix-handler-context.md), [sigtimedwait](../notes/m2-rust-posix-sigtimedwait.md), [queues](../notes/m2-rust-posix-signal-queues.md) |
-| Processes | `getpid`, `getppid`, real, effective and saved UID/GID (eight calls) | [identity](../notes/m2-rust-posix-process-identity.md), [sender](../notes/m2-posix-request-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
+| Processes | `getpid`, `getppid`, real, effective and saved UID/GID (eight calls) through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
 
 Not there yet: `exec`, `fork`, `waitpid`, pipes, process-directed and
 queued signals, `SA_RESTART`, conditions, semaphores, POSIX timers,

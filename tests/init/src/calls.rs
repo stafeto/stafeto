@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 33] = [
+pub(crate) const TESTS: [Test; 37] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -44,6 +44,16 @@ pub(crate) const TESTS: [Test; 33] = [
         thread_start_and_process_kill_check_their_handles,
     ),
     ("thread_states", thread_states),
+    ("thread_end_is_heard_once", thread_end_is_heard_once),
+    ("unheld_thread_end_is_heard", unheld_thread_end_is_heard),
+    (
+        "failed_thread_create_gives_its_slot_back",
+        failed_thread_create_gives_its_slot_back,
+    ),
+    (
+        "threads_of_an_ended_process_are_not_heard",
+        threads_of_an_ended_process_are_not_heard,
+    ),
     ("thread_limit_is_128", thread_limit_is_128),
     (
         "higher_priority_start_preempts_at_once",
@@ -79,10 +89,6 @@ pub(crate) const TESTS: [Test; 33] = [
     ),
     ("quota_is_enforced", quota_is_enforced),
     ("process_info_kinds", process_info_kinds),
-    (
-        "process_identity_survives_exit_and_recreation",
-        process_identity_survives_exit_and_recreation,
-    ),
     ("kernel_stats_need_kstats", kernel_stats_need_kstats),
     (
         "kernel_call_maxima_use_the_buffer",
@@ -103,6 +109,10 @@ pub(crate) const TESTS: [Test; 33] = [
     (
         "process_kill_returns_after_the_teardown",
         process_kill_returns_after_the_teardown,
+    ),
+    (
+        "process_kill_takes_the_level_of_its_teardown",
+        process_kill_takes_the_level_of_its_teardown,
     ),
     ("child_quota_comes_back", child_quota_comes_back),
     (
@@ -331,7 +341,9 @@ pub(crate) fn written(line: &[u8]) -> bool {
 /// (spec 11), those of the kernel's test builds and the retired 29 too:
 /// the console_poll of the VZ build, which fails so even with the system
 /// resource and a byte to take, as it took them (and as debug_write,
-/// its neighbour, would write one).
+/// its neighbour, would write one). So do the retired 35,
+/// request_identity, with the token of a request init took, and the
+/// retired kind 10 of object_info, PROCESS_IDENTITY, with init's process.
 fn unknown_system_calls_fail() -> Outcome {
     unknown::<0>()?;
     let mut x = marked();
@@ -342,10 +354,52 @@ fn unknown_system_calls_fail() -> Outcome {
         after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
         "the retired 29 did not fail with INVALID_ARGS alone",
     )?;
+    let identity = retired_identity()?;
+    check(
+        identity,
+        "the retired 35 with a live token did not fail with INVALID_ARGS alone",
+    )?;
+    let mut x = marked();
+    x[..3].copy_from_slice(&[own().raw().0, 10, 0]);
+    // SAFETY: object_info only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+    check(
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
+        "the retired kind 10 did not fail with INVALID_ARGS alone",
+    )?;
     unknown::<{ Call::HIGHEST + 1 }>()?;
     unknown::<0xFEFF>()?;
     unknown::<{ *abi::TEST_CALLS.start() }>()?;
     unknown::<{ *abi::TEST_CALLS.end() }>()
+}
+
+/// Call 35 with the token of a request init took from a thread of its own
+/// in x0: true when it changed x0 alone, to INVALID_ARGS; the request is
+/// answered afterwards.
+fn retired_identity() -> Result<bool, &'static str> {
+    let c = channel(LEVEL)?;
+    let s = session(&c, Rights::SEND, CHILD, LEVEL)?;
+    let sender = spawn(0, send_empty, s.raw().0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c)?;
+    let mut x = marked();
+    x[0] = token.raw();
+    // SAFETY: no call has number 35 any more.
+    let after = unsafe { sys::raw::<35>(x) };
+    let replied = token.reply(&[]);
+    let_run()?;
+    close(sender)?;
+    close(s)?;
+    close(c)?;
+    check(replied.is_ok(), "the request was not answered")?;
+    Ok(after[0] == Error::InvalidArgs.code() && after[1..] == x[1..])
+}
+
+/// A thread that sends an empty request through the session `s` and
+/// exits.
+extern "C" fn send_empty(s: u64) -> ! {
+    let s = Handle::<Channel>::borrowed(abi::Handle(s));
+    let _ = sys::send(&s, &[]);
+    sys::thread_exit()
 }
 
 fn unknown<const N: u16>() -> Outcome {
@@ -510,8 +564,10 @@ fn thread_create_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Ou
     let fifo = Policy::Fifo as u64;
     // The page after the child's thread's buffer is free.
     let (entry, stack, free) = (CHILD_ENTRY, 0x80_1000, CHILD_BUFFER + PAGE as u64);
-    let args =
-        |h, entry, stack, priority, policy, buffer| [h, entry, stack, 7, priority, policy, buffer];
+    let args = |h, entry, stack, priority, policy, buffer| {
+        [h, entry, stack, 7, priority, policy, buffer, 0, 0]
+    };
+    let exits = exit_cases(c, t, gone);
     let values = [c.raw().0, gone].into_iter().all(|h| {
         [
             args(h, LOWER_END, stack, 10, fifo, free),
@@ -554,6 +610,278 @@ fn thread_create_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Ou
     check(
         taken,
         "a buffer on a taken page did not fail with INVALID_ARGS after the ceiling",
+    )?;
+    exits
+}
+
+/// x7 and x8 of thread_create, the exit channel and its priority (spec
+/// 6.5, 11), each failing with x0 alone: x8 not 0 without x7, or outside
+/// 1-63 with it, INVALID_ARGS before the handles; x7 closed, of another
+/// kind or a copy without NOTIFY BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED
+/// after x0; x7 on a channel that closed PEER_CLOSED after the state of
+/// the process, which a dead process fails first with BAD_STATE.
+fn exit_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Outcome {
+    const N: u16 = Call::ThreadCreate.number();
+    let fifo = Policy::Fifo as u64;
+    let (entry, stack, free) = (CHILD_ENTRY, 0x80_1000, CHILD_BUFFER + PAGE as u64);
+    let heard = channel(QUIET)?;
+    let notify = copy(&heard, Rights::NOTIFY)?;
+    let blind = copy(&heard, Rights::NONE)?;
+    let shut = channel(QUIET)?;
+    let late = copy(&shut, Rights::NOTIFY)?;
+    close(shut)?;
+    let dead = child(TEST_PRIORITY)?;
+    let killed = sys::process_kill(&dead).is_ok();
+    let (n, b, l) = (notify.raw().0, blind.raw().0, late.raw().0);
+    let x = |h, x7, x8| [h, entry, stack, 7, 10, fifo, free, x7, x8];
+    let p = c.raw().0;
+    let values = [p, gone].into_iter().all(|h| {
+        [x(h, 0, 5), x(h, n, 0), x(h, n, 64), x(h, n, 0x100 | 5)]
+            .iter()
+            .all(|a| x0_alone::<N>(a, Error::InvalidArgs.code()))
+    });
+    let handles = [
+        (x(gone, n, 5), Error::BadHandle),
+        (x(p, gone, 5), Error::BadHandle),
+        (x(p, t.raw().0, 5), Error::WrongType),
+        (x(p, b, 5), Error::AccessDenied),
+        (x(dead.raw().0, l, 5), Error::BadState),
+        (x(p, l, 5), Error::PeerClosed),
+    ]
+    .iter()
+    .all(|(a, e)| x0_alone::<N>(a, e.code()));
+    for h in [notify, blind, late, heard] {
+        close(h)?;
+    }
+    close(dead)?;
+    check(
+        killed && values,
+        "x8 without x7 or outside 1-63 did not fail with INVALID_ARGS alone before the handles",
+    )?;
+    check(
+        handles,
+        "a bad x7 did not fail alone in the order of spec 11",
+    )
+}
+
+/// The exit channel and the thread whose end `heard_end` watches, raw.
+static WATCHED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A thread made with an exit channel (thread_create x7, x8; spec 6.5)
+/// ends through thread_exit while init's process lives on: a watcher above
+/// it, waiting on the channel, wakes with source Exit, the handle's label
+/// and bit 0 once, and finds the thread ended then; nothing else comes.
+/// The thread holds one of the channel's slots until its handle goes, and
+/// a thread that never started gives its slot back with its handle.
+fn thread_end_is_heard_once() -> Outcome {
+    reset_marks();
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let ender = thread_heard(1, add_mark, 0, HIGH, (&name, NOTICE))?;
+    let idle = thread_heard(2, add_mark, 3, HIGH, (&name, NOTICE))?;
+    let held = sources();
+    close(idle)?;
+    let unstarted = sources();
+    WATCHED[0].store(c.raw().0, Relaxed);
+    WATCHED[1].store(ender.raw().0, Relaxed);
+    let watcher = spawn(0, heard_end, 1, HIGH + 5, Policy::Fifo)?;
+    let started = sys::thread_start(&ender);
+    let after_end = sources();
+    let rest = sys::try_receive(&c);
+    close(ender)?;
+    let gone = sources();
+    let_run()?;
+    close(watcher)?;
+    close(name)?;
+    close(c)?;
+    let before = before.map_err(|_| "CHANNEL failed")?;
+    check(
+        held == Ok(before + 2) && unstarted == Ok(before + 1),
+        "a thread with an exit channel took no slot, or one that never started kept it",
+    )?;
+    check(
+        started.is_ok() && mark(0) == 1,
+        "the thread with an exit channel did not run",
+    )?;
+    check(
+        mark(1) == 1 + ThreadState::Ended.code(),
+        "the end of the thread did not come once it ended",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock) && after_end == Ok(before + 1) && gone == Ok(before),
+        "more than one notification came, or the slot stayed after the thread went",
+    )
+}
+
+/// A thread with an exit channel whose handle went before it ended (spec
+/// 6.5): its end still comes, once, though nothing but the kernel held the
+/// thread when it ended, and the slot goes back with the thread once the
+/// notification was taken.
+fn unheld_thread_end_is_heard() -> Outcome {
+    reset_marks();
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let ender = thread_heard(1, add_mark, 0, LOW, (&name, NOTICE))?;
+    let started = sys::thread_start(&ender);
+    close(ender)?;
+    let_run()?;
+    let heard = take_one(&c);
+    let after = sources();
+    close(name)?;
+    close(c)?;
+    check(
+        started.is_ok() && mark(0) == 1,
+        "the thread with an exit channel did not run",
+    )?;
+    check(
+        heard.as_ref().ok() == Some(&exit_notice(CHILD)),
+        "the end of a thread whose handle went was not heard once",
+    )?;
+    check(
+        after == before,
+        "the slot of a thread whose end was taken stayed",
+    )
+}
+
+/// The labelled copies that fill a channel's slots in
+/// `failed_thread_create_gives_its_slot_back`, raw.
+static FILLERS: [AtomicU64; abi::MAX_SLOTS as usize] =
+    [const { AtomicU64::new(0) }; abi::MAX_SLOTS as usize];
+
+/// thread_create with x7 takes a slot of the channel after the limits of
+/// threads and before the quota (spec 6.5, 11): a channel with no slot left
+/// fails with LIMIT_REACHED, and a target whose quota falls short for its
+/// pool of threads fails with NO_MEMORY and gives the slot back.
+fn failed_thread_create_gives_its_slot_back() -> Outcome {
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let poor =
+        sys::process_create(2 * PAGE as u64, 16, LOW).map_err(|_| "process_create failed")?;
+    let make = |p: &Handle<Process>, buffer: u64| {
+        let mut x = [0; 10];
+        x[..9].copy_from_slice(&[
+            p.raw().0,
+            CHILD_ENTRY,
+            0,
+            0,
+            LOW.into(),
+            Policy::Fifo as u64,
+            buffer,
+            name.raw().0,
+            QUIET.into(),
+        ]);
+        // SAFETY: the thread would run in another process; it never starts.
+        unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) }
+    };
+    let short = make(&poor, CHILD_BUFFER);
+    let after_short = sources();
+    let mut filled = 0;
+    for slot in &FILLERS {
+        match sys::handle_label(&c, Rights::NOTIFY, CHILD + 1 + filled as u64, QUIET) {
+            Ok(h) => {
+                slot.store(h.into_raw().0, Relaxed);
+                filled += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    let kid = child(LOW)?;
+    let full = make(&kid, CHILD_BUFFER);
+    for slot in &FILLERS {
+        let raw = slot.swap(0, Relaxed);
+        if raw != 0 {
+            close(Handle::<Channel>::from_raw(abi::Handle(raw)))?;
+        }
+    }
+    // Each closed copy posted CLIENT_GONE, and its queued slot holds its
+    // session until receive takes it.
+    while sys::try_receive(&c).is_ok() {}
+    let after = sources();
+    close(kid)?;
+    close(poor)?;
+    close(name)?;
+    close(c)?;
+    check(
+        short[0] == Error::NoMemory.code() && after_short == before,
+        "a thread whose quota fell short kept its slot of the exit channel",
+    )?;
+    check(
+        filled > 0 && full[0] == Error::LimitReached.code() && after == before,
+        "a full exit channel did not fail with LIMIT_REACHED, or a slot stayed",
+    )
+}
+
+/// Waits on the channel of WATCHED; mark `i` gets 1 + the code of the
+/// state of the watched thread when the notification of its end came, 0
+/// for anything else.
+extern "C" fn heard_end(i: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(WATCHED[0].load(Relaxed)));
+    let t = Handle::<Thread>::borrowed(abi::Handle(WATCHED[1].load(Relaxed)));
+    let got = sys::receive(&c);
+    let end = Received::Notification {
+        source: abi::Source::Exit,
+        label: CHILD,
+        bits: 1,
+        count: 1,
+    };
+    let state = sys::thread_info(&t).map_or(0, |info| info.state.code());
+    let mark = if got == Ok(end) { 1 + state } else { 0 };
+    MARKS[i as usize].store(mark, Relaxed);
+    sys::thread_exit()
+}
+
+/// The threads of a process that ends are not heard of (spec 6.5): a child
+/// with two threads on init's exit channel, one never started, is killed;
+/// no notification comes, and the slots go back with the threads' handles.
+fn threads_of_an_ended_process_are_not_heard() -> Outcome {
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let kid = child(LOW)?;
+    let threads = [CHILD_BUFFER, CHILD_BUFFER + PAGE as u64].map(|buffer| {
+        let mut x = [0; 10];
+        x[..9].copy_from_slice(&[
+            kid.raw().0,
+            CHILD_ENTRY,
+            0,
+            0,
+            LOW.into(),
+            Policy::Fifo as u64,
+            buffer,
+            name.raw().0,
+            QUIET.into(),
+        ]);
+        // SAFETY: the thread runs in another process and touches nothing
+        // of init's.
+        let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+        (after[0] == 0).then(|| Handle::<Thread>::from_raw(abi::Handle(after[1])))
+    });
+    let held = sources();
+    let killed = sys::process_kill(&kid);
+    let heard = sys::try_receive(&c);
+    let made = threads.iter().all(Option::is_some);
+    for t in threads.into_iter().flatten() {
+        close(t)?;
+    }
+    close(kid)?;
+    let after = sources();
+    close(name)?;
+    close(c)?;
+    let before = before.map_err(|_| "CHANNEL failed")?;
+    check(
+        made && killed.is_ok() && held == Ok(before + 2),
+        "the child's threads with an exit channel were not made, or took no slots",
+    )?;
+    check(
+        heard == Err(Error::WouldBlock) && after == Ok(before),
+        "a thread of an ended process was heard of, or kept its slot",
     )
 }
 
@@ -584,9 +912,9 @@ fn start_and_kill_cases(c: &Handle<Process>, t: &Handle<Thread>) -> Outcome {
         x0_alone::<START>(&[0], Error::BadHandle.code()),
         x0_alone::<START>(&[c.raw().0], Error::WrongType.code()),
         x0_alone::<START>(&[weak_t.raw().0], Error::AccessDenied.code()),
-        x0_alone::<KILL>(&[0], Error::BadHandle.code()),
-        x0_alone::<KILL>(&[t.raw().0], Error::WrongType.code()),
-        x0_alone::<KILL>(&[weak_c.raw().0], Error::AccessDenied.code()),
+        x0_alone::<KILL>(&[0, 0], Error::BadHandle.code()),
+        x0_alone::<KILL>(&[t.raw().0, 0], Error::WrongType.code()),
+        x0_alone::<KILL>(&[weak_c.raw().0, 0], Error::AccessDenied.code()),
     ];
     let killed = sys::process_kill(c);
     let late = x0_alone::<START>(&[t.raw().0], Error::BadState.code());
@@ -1052,45 +1380,6 @@ fn process_info_kinds() -> Outcome {
     )
 }
 
-/// A numeric identity belongs to the object, independently of local handles.
-/// Ended shells retain it; recreation consumes a new positive identity.
-fn process_identity_survives_exit_and_recreation() -> Outcome {
-    let root = sys::process_identity(&own()).map_err(|_| "root identity failed")?;
-    check(
-        root.id == 1 && root.parent == 0,
-        "init numeric identity is not root 1",
-    )?;
-    let mut previous = root.id;
-    for _ in 0..6 {
-        let child = child(LOW)?;
-        let copied = copy(&child, Rights::NONE)?;
-        let before = sys::process_identity(&child);
-        let through_copy = sys::process_identity(&copied);
-        let killed = sys::process_kill(&child);
-        let after = sys::process_identity(&copied);
-        let state = sys::process_state(&child);
-        close(copied)?;
-        close(child)?;
-        let before = before.map_err(|_| "child identity failed")?;
-        check(
-            before.id > previous && before.id <= abi::PROCESS_ID_MAX && before.parent == root.id,
-            "child identity was reused, invalid or parent did not match",
-        )?;
-        check(
-            through_copy == Ok(before)
-                && killed.is_ok()
-                && after == Ok(before)
-                && state == Ok(ProcessState::Killed),
-            "copy or exit changed numeric identity",
-        )?;
-        previous = before.id;
-    }
-    check(
-        sys::process_identity(&own()) == Ok(root),
-        "children changed the root identity",
-    )
-}
-
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
 /// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
 /// though it writes; init's resource gets the counts in x1-x9 and changes
@@ -1197,7 +1486,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     let resource = resource().raw().0;
     let kinds = [
         [own, 0, 0],
-        [own, abi::INFO_PROCESS_IDENTITY + 1, 0],
+        [own, abi::INFO_LOG + 1, 0],
+        [own, abi::INFO_LOG + 2, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
@@ -1212,7 +1502,6 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
             thread_state,
             channel_kind,
             irq,
-            abi::INFO_PROCESS_IDENTITY,
         ]
         .into_iter()
         .flat_map(|kind| {
@@ -1229,9 +1518,6 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (0, thread_state, Error::BadHandle),
         (0, channel_kind, Error::BadHandle),
         (0, irq, Error::BadHandle),
-        (0, abi::INFO_PROCESS_IDENTITY, Error::BadHandle),
-        (resource, abi::INFO_PROCESS_IDENTITY, Error::WrongType),
-        (thread, abi::INFO_PROCESS_IDENTITY, Error::WrongType),
         (resource, state, Error::WrongType),
         (thread, state, Error::WrongType),
         (resource, memory, Error::WrongType),
@@ -1253,7 +1539,6 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (own, table, 4),
         (thread, thread_state, 5),
         (seen, channel_kind, 5),
-        (own, abi::INFO_PROCESS_IDENTITY, 3),
     ]
     .map(|(h, kind, past)| {
         let mut x = marked();
@@ -1488,6 +1773,71 @@ fn process_kill_returns_after_the_teardown() -> Outcome {
         memory.is_ok_and(|m| m.used == 2 * PAGE as u64 && m.used + m.returned == m.quota),
         "the child's quota was not back but for its two pages of pools when process_kill returned",
     )
+}
+
+/// x1 of process_kill, the level of the teardown (spec 7.7, 11): above 63
+/// or with bits past its byte INVALID_ARGS, before the handle; above the
+/// caller's effective priority ACCESS_DENIED, after it; each changes x0
+/// alone. Init at TEST_PRIORITY kills a child heard of at QUIET with level
+/// 2: the call returns before the teardown, with the queue not empty and no
+/// exit notification; a thread of init at LEVEL, between 2 and init, runs
+/// before the teardown once init lowers itself, and the notification is
+/// there once init runs again at 1.
+fn process_kill_takes_the_level_of_its_teardown() -> Outcome {
+    const KILL: u16 = Call::ProcessKill.number();
+    const BELOW: u64 = 2;
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, LOW)?;
+    let h = c.raw().0;
+    let above = u64::from(TEST_PRIORITY) + 1;
+    let refused = [
+        x0_alone::<KILL>(&[h, abi::PRIORITY_LEVELS.into()], Error::InvalidArgs.code()),
+        x0_alone::<KILL>(&[h, 0x100 | BELOW], Error::InvalidArgs.code()),
+        x0_alone::<KILL>(&[0, abi::PRIORITY_LEVELS.into()], Error::InvalidArgs.code()),
+        x0_alone::<KILL>(&[0, above], Error::BadHandle.code()),
+        x0_alone::<KILL>(&[h, above], Error::AccessDenied.code()),
+    ];
+    let alive = sys::process_state(&c) == Ok(ProcessState::Alive);
+    let t = child_thread(&c, LOW);
+    reset_marks();
+    let killed = sys::process_kill_at(&c, BELOW as u8);
+    let queued = sys::kernel_stats(&resource()).map(|s| s.cleanup_queue);
+    let early = sys::try_receive(&exits);
+    let between = spawn(0, queue_at_mark, 1, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let heard = take_one(&exits);
+    let state = sys::process_state(&c);
+    close(between)?;
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    close(exits)?;
+    close(name)?;
+    check(
+        refused.iter().all(|&ok| ok) && alive,
+        "a level past 63 or above the caller did not fail alone in the order of spec 11",
+    )?;
+    check(
+        killed.is_ok() && queued.is_ok_and(|n| n > 0) && early == Err(Error::WouldBlock),
+        "process_kill with a level below the caller did not return before the teardown",
+    )?;
+    check(
+        mark(1) > 1,
+        "a thread between the level and the caller did not run before the teardown",
+    )?;
+    check(
+        heard == Ok(exit_notice(CHILD)) && state == Ok(ProcessState::Killed),
+        "the exit notification did not come after the teardown",
+    )
+}
+
+/// Leaves the length of the cleanup queue, plus one, in mark `i`, and
+/// ends.
+extern "C" fn queue_at_mark(i: u64) -> ! {
+    let queued = sys::kernel_stats(&resource()).map_or(0, |s| s.cleanup_queue);
+    MARKS[i as usize].store(queued + 1, Relaxed);
+    sys::thread_exit()
 }
 
 /// A child's quota comes back to init in two parts (spec 7.5): once the

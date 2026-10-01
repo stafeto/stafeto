@@ -174,6 +174,17 @@ el0_count_until:
     cbz     x3, 1b
     svc     #SVC_DONE
 
+// Adds 1 to the word at x0 x1 times, the count in x2, then ends.
+.global el0_count_to
+el0_count_to:
+    mov     x3, x1
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    subs    x3, x3, #1
+    b.ne    1b
+    svc     #SVC_DONE
+
 // Spins until x1 counter ticks have passed, then yields. Ends with the
 // word at x0 read before the yield in x3, after it in x4, and the yield's
 // result in x0.
@@ -227,7 +238,7 @@ el0_wfi:
     wfi
     svc     #SVC_DONE
 
-// process_kill with the handle in x0.
+// process_kill with the handle in x0 and the level in x1.
 .global el0_kill
 el0_kill:
     svc     #CALL_PROCESS_KILL
@@ -243,6 +254,12 @@ el0_exit_process:
 .global el0_info_then_exit
 el0_info_then_exit:
     svc     #CALL_OBJECT_INFO
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
+// thread_exit at once.
+.global el0_thread_exit
+el0_thread_exit:
     svc     #CALL_THREAD_EXIT
     svc     #SVC_DONE
 
@@ -276,6 +293,7 @@ el0_receive_then_exit:
 el0_kill_notify_receive:
     mov     x21, x1
     mov     x22, x2
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     mov     x19, x0
     mov     x0, x21
@@ -481,6 +499,7 @@ el0_kill_close_notify:
     mov     x21, x0
     mov     x22, x1
     mov     x23, x2
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     mov     x19, x0
     mov     x0, x21
@@ -500,6 +519,7 @@ el0_raise_then_kill:
     svc     #CALL_THREAD_SET_PRIORITY
     mov     x19, x0
     mov     x0, x21
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     svc     #SVC_DONE
 
@@ -655,6 +675,7 @@ el0_measure:
     adr     x23, 8f
     bl      6f
     mov     x0, x25
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     cbnz    x0, 4f
     adr     x23, 9f

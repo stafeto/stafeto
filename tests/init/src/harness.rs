@@ -184,6 +184,31 @@ pub(crate) fn thread(
     t.map_err(|_| "thread_create failed")
 }
 
+/// `thread` with an exit channel: `exit`, a channel handle with NOTIFY and
+/// the priority of the notification (thread_create x7, x8).
+pub(crate) fn thread_heard(
+    slot: usize,
+    entry: extern "C" fn(u64) -> !,
+    arg: u64,
+    priority: u8,
+    exit: (&Handle<Channel>, u8),
+) -> Result<Handle<Thread>, &'static str> {
+    // SAFETY: as in `thread`.
+    let t = unsafe {
+        sys::thread_create_with(
+            &own(),
+            entry,
+            STACKS[slot].top(),
+            arg,
+            priority,
+            Policy::Fifo,
+            buffer(slot),
+            Some(exit),
+        )
+    };
+    t.map_err(|_| "thread_create with an exit channel failed")
+}
+
 /// `thread`, started.
 pub(crate) fn spawn(
     slot: usize,

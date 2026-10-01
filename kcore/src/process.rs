@@ -10,31 +10,6 @@
 
 use abi::{Error, ProcessState};
 
-/// Boot-wide process namespace. Allocation failure elsewhere consumes an ID:
-/// retiring it prevents a retained reference or future router from confusing a
-/// new process with an old one. Exhaustion stays exhausted without wraparound.
-pub struct Ids {
-    next: u32,
-}
-impl Ids {
-    pub const fn new() -> Self {
-        Self { next: 1 }
-    }
-    pub fn allocate(&mut self) -> Result<u32, Error> {
-        if self.next == 0 || self.next > abi::PROCESS_ID_MAX {
-            return Err(Error::LimitReached);
-        }
-        let id = self.next;
-        self.next = if id == abi::PROCESS_ID_MAX { 0 } else { id + 1 };
-        Ok(id)
-    }
-}
-impl Default for Ids {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub struct Life {
     /// Threads that started and have not ended.
     live: u32,
@@ -105,33 +80,6 @@ impl Default for Life {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn process_ids_are_positive_monotonic_and_retire_consumed_numbers() {
-        let mut ids = Ids::new();
-        assert_eq!(ids.allocate(), Ok(1));
-        // A later failure must never return this number to the namespace.
-        assert_eq!(ids.allocate(), Ok(2));
-        for id in 3..10000 {
-            assert_eq!(ids.allocate(), Ok(id));
-        }
-    }
-
-    #[test]
-    fn process_id_exhaustion_never_wraps_or_reuses_the_last_id() {
-        let mut ids = Ids {
-            next: abi::PROCESS_ID_MAX - 1,
-        };
-        assert_eq!(ids.allocate(), Ok(abi::PROCESS_ID_MAX - 1));
-        assert_eq!(ids.allocate(), Ok(abi::PROCESS_ID_MAX));
-        for _ in 0..4 {
-            assert_eq!(ids.allocate(), Err(Error::LimitReached));
-        }
-        let mut invalid = Ids {
-            next: abi::PROCESS_ID_MAX + 1,
-        };
-        assert_eq!(invalid.allocate(), Err(Error::LimitReached));
-    }
 
     const FAULT: ProcessState = ProcessState::Fault {
         esr: 0x9200_004F,

@@ -47,7 +47,7 @@ type Test = (&'static str, fn(&Checker) -> Outcome);
 /// `a_fifth_waiting_connect_gets_limit_reached` wait for `slow`, which
 /// registers once the checker opens the gate of `echo`, and
 /// `connect_waits_for_registration` opens it and collects them.
-const TESTS: [Test; 26] = [
+const TESTS: [Test; 27] = [
     (
         "start_data_brings_the_service_args",
         start_data_brings_the_service_args,
@@ -56,6 +56,10 @@ const TESTS: [Test; 26] = [
     (
         "ping_is_answered_and_a_client_has_no_heartbeat",
         ping_is_answered_and_a_client_has_no_heartbeat,
+    ),
+    (
+        "adoption_is_the_process_services_alone",
+        adoption_is_the_process_services_alone,
     ),
     (
         "register_from_a_client_is_refused",
@@ -361,6 +365,23 @@ fn ping_is_answered_and_a_client_has_no_heartbeat(c: &Checker) -> Outcome {
 }
 
 /// REGISTER from a client gets BAD_STATE.
+/// ADOPT and ADOPTED come from the process service alone (proto_init):
+/// from any other record init refuses them with BAD_STATE, before it reads
+/// a body, and holds nothing.
+fn adoption_is_the_process_services_alone(c: &Checker) -> Outcome {
+    let adopt = status(&c.s.parent, &Method::Adopt.header().bytes());
+    let mut w = Writer::new();
+    let _ = Method::Adopted.header().write(&mut w);
+    let _ = w.u64(1);
+    let _ = w.u32(0);
+    let adopted = status(&c.s.parent, w.as_bytes());
+    let bad = Status::Kernel(Error::BadState);
+    check(
+        adopt == bad && adopted == bad,
+        "ADOPT or ADOPTED from a record other than the process service was taken",
+    )
+}
+
 fn register_from_a_client_is_refused(c: &Checker) -> Outcome {
     let channel = sys::channel_create(base(&c.s)).map_err(|_| "channel_create failed")?;
     let got = rt::service::register(&c.s.parent, &channel).err();

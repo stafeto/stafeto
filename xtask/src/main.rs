@@ -78,6 +78,21 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
 ];
+/// The POSIX ABI image whose process service ends before it registers:
+/// each POSIX process fails its load (`posix_orphans`).
+const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["exit-early"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
+    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+];
 const POSIX_THREAD_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -338,7 +353,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
-const ICOUNT_TESTS: [&str; 14] = [
+const ICOUNT_TESTS: [&str; 16] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -348,11 +363,13 @@ const ICOUNT_TESTS: [&str; 14] = [
     "fast_path_arms_the_timer",
     "teardown_yields_to_a_pending_interrupt",
     "thread_exit_after_channel_close_is_measured",
+    "thread_exit_notice_is_measured",
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
     "device_windows_are_measured",
     "upcall_calls_are_measured",
+    "process_kill_with_a_level_is_measured",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
@@ -374,7 +391,7 @@ const MEMORY_PORTION_ROWS: [&str; 11] = [
 ];
 /// The rows of the line of `timer_firing_is_measured`, in its order (spec
 /// 15.3).
-const TIMER_PORTION_ROWS: [&str; 3] = ["interrupt", "fire", "set"];
+const TIMER_PORTION_ROWS: [&str; 4] = ["interrupt", "fire", "set", "timers_8192"];
 /// The rows of the line of `interrupt_path_is_measured`, in its order
 /// (spec 15.3).
 const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
@@ -383,21 +400,16 @@ const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
 const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 /// The rows of the line of `upcall_calls_are_measured`, in its order
 /// (spec 15.3).
-const UPCALL_ROWS: [&str; 6] = [
-    "interrupt",
-    "bind",
-    "control",
-    "request",
-    "return",
-    "identity",
-];
+const UPCALL_ROWS: [&str; 5] = ["interrupt", "bind", "control", "request", "return"];
 /// The rows of the line of `teardown_portions_are_measured`, in its order
 /// (spec 15.3): the term B of the out-of-tree measurement is the longest of them.
-const TEARDOWN_ROWS: [&str; 7] = [
+const TEARDOWN_ROWS: [&str; 9] = [
     "buffers",
     "shell",
-    "stop_threads",
-    "stop_senders",
+    "end_call",
+    "threads_ready",
+    "teardown_threads",
+    "child_threads",
     "session_buffers",
     "session_handles",
     "threads",
@@ -542,7 +554,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 226;
+const INIT_TESTS: u32 = 228;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -557,7 +569,7 @@ const LOG_ROWS: [&str; 2] = ["write", "take"];
 /// The page of the PL011 of QEMU `virt`, the console's port.
 const CONSOLE_PA: u64 = 0x0900_0000;
 /// Tests the client `checker` of init's test table has (tests/svc).
-const SVC_TESTS: u32 = 26;
+const SVC_TESTS: u32 = 27;
 /// What init prints for each table it refuses (services/init, features
 /// `table-cycle` and `table-ceiling`), each line whole.
 const REFUSED: [(&str, &[ImageProgram], &str); 2] = [
@@ -1250,6 +1262,7 @@ fn posix_abi_probe() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
+    posix_orphans()?;
     posix_thread_probe(false)?;
     posix_cancel_input_probe(false)?;
     posix_shared_probe()?;
@@ -1272,6 +1285,26 @@ fn probe_command(image: &Path, vz: bool) -> Result<(Command, Artifacts), String>
         cmd
     };
     Ok((cmd, kernel))
+}
+
+/// The process service ends before it registers (feature `exit-early`):
+/// init fails the load of each POSIX process, the one that waited for its
+/// session and the one loaded after the service ended, and starts neither.
+fn posix_orphans() -> Result<(), String> {
+    let image = build_boot_image(
+        "boot-posix-orphans.img",
+        &POSIX_ORPHAN_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let (cmd, kernel) = probe_command(&image, false)?;
+    const PEER: &str = "init: clock-peer did not load: the process service ended, not restarted";
+    const PROBE: &str =
+        "init: posix-abi-probe did not load: the process service ended, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(PROBE), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, PROBE)?;
+    qemu::expect_line(&output, PEER)?;
+    println!("POSIX processes whose service ended fail their loads");
+    Ok(())
 }
 
 fn posix_thread_probe(vz: bool) -> Result<(), String> {
@@ -1297,7 +1330,8 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(
             &output,
             "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
-        )
+        )?;
+        qemu::expect_marker(&output, "posix-process: adoption refusals ok")
     });
     if vz {
         vz::stop_hint(checked)?;
@@ -3778,10 +3812,13 @@ mod tests {
     /// B is the longest teardown row, never the count of threads.
     #[test]
     fn blocking_time_is_the_longest_row_but_threads() {
-        let ticks = [5, 15, 24, 42, 20, 21, 128];
-        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("stop_senders", 42));
-        let ticks = [5, 15, 24, 42, 20, 21, 50_000];
-        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("stop_senders", 42));
+        let ticks = [5, 15, 1, 24, 42, 30, 20, 21, 128];
+        assert_eq!(
+            blocking_time(&TEARDOWN_ROWS, &ticks),
+            ("teardown_threads", 42)
+        );
+        let ticks = [5, 15, 1, 24, 18, 30, 20, 21, 50_000];
+        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("child_threads", 30));
     }
 
     /// A child's panic is its place and its message on two whole lines, and

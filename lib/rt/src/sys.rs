@@ -193,9 +193,19 @@ pub fn process_create_with(
 }
 
 /// process_kill: the process ends, whatever its threads do; 0 for one that
-/// ended before. Killing the caller's own process does not return.
+/// ended before. Its teardown runs at the caller's effective priority
+/// before the call returns. Killing the caller's own process does not
+/// return.
 pub fn process_kill(process: &Handle<Process>) -> Result<(), Error> {
-    call::<{ Call::ProcessKill.number() }>(&[process.raw().0]).map(drop)
+    process_kill_at(process, 0)
+}
+
+/// process_kill with the level of its teardown (spec 7.7, 11): 1-63, no
+/// higher than the caller's effective priority (ACCESS_DENIED), or 0 for
+/// that priority. Below it the call returns once the part in the call is
+/// done, and the exit notification tells of the end.
+pub fn process_kill_at(process: &Handle<Process>, level: u8) -> Result<(), Error> {
+    call::<{ Call::ProcessKill.number() }>(&[process.raw().0, level.into()]).map(drop)
 }
 
 /// process_exit: the caller's process ends with `code`.
@@ -237,6 +247,42 @@ pub unsafe fn thread_create(
         priority.into(),
         policy as u64,
         buffer as u64,
+    ];
+    let x = call::<{ Call::ThreadCreate.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
+/// thread_create with an exit channel (x7, x8, spec 6.5): `exit`, a
+/// channel handle with NOTIFY, with a label or none, and a priority (1-63,
+/// no higher than the caller's ceiling), hears of the thread's end through
+/// thread_exit once it left the scheduler, so its stack may go: bit 0 with
+/// source Exit and the label of the handle, unless that exit ended the
+/// process. The thread takes one of the channel's slots until it goes.
+///
+/// # Safety
+/// As for `thread_create`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn thread_create_with(
+    process: &Handle<Process>,
+    entry: extern "C" fn(u64) -> !,
+    stack: usize,
+    arg: u64,
+    priority: u8,
+    policy: Policy,
+    buffer: usize,
+    exit: Option<(&Handle<Channel>, u8)>,
+) -> Result<Handle<Thread>, Error> {
+    let (channel, notice) = exit.map_or((0, 0), |(c, p)| (c.raw().0, p.into()));
+    let args = [
+        process.raw().0,
+        entry as *const () as u64,
+        stack as u64,
+        arg,
+        priority.into(),
+        policy as u64,
+        buffer as u64,
+        channel,
+        notice,
     ];
     let x = call::<{ Call::ThreadCreate.number() }>(&args)?;
     Ok(returned(&x))
@@ -297,13 +343,6 @@ pub fn process_state(process: &Handle<Process>) -> Result<ProcessState, Error> {
     let args = [process.raw().0, abi::INFO_PROCESS_STATE, 0];
     let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
     Ok(ProcessState::from_words([x[1], x[2], x[3], x[4]]))
-}
-
-/// Numeric identity independent of local handle values; readable after exit.
-pub fn process_identity(process: &Handle<Process>) -> Result<abi::ProcessIdentity, Error> {
-    let args = [process.raw().0, abi::INFO_PROCESS_IDENTITY, 0];
-    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
-    Ok(abi::ProcessIdentity::from_words([x[1], x[2]]))
 }
 
 /// object_info(PROCESS_MEMORY): the process's quota, what is charged to it
@@ -633,16 +672,6 @@ const _: fn() = || {
 };
 
 impl Token {
-    /// Authenticated PID/parent PID of the sender of this accepted request.
-    /// Any thread of the receiving process may read it repeatedly without
-    /// consuming the reply right or ending the request's priority boost.
-    /// BadState for used/stale/foreign live tokens; PeerClosed after the
-    /// sender abandons the request, until its token generation changes.
-    pub fn sender_identity(&self) -> Result<abi::ProcessIdentity, Error> {
-        let x = call::<{ Call::RequestIdentity.number() }>(&[self.0])?;
-        Ok(abi::ProcessIdentity::from_words([x[1], x[2]]))
-    }
-
     /// The value the kernel knows the token by, for tests that hand the
     /// kernel values it must refuse.
     pub const fn raw(&self) -> u64 {

@@ -8,14 +8,15 @@
 //! it, its threads, and the one `create` hands out; its children hold only
 //! its shell. It ends (`end`) through process_exit, process_kill, a fault
 //! at EL0 or the exit of its last started thread, when its last reference
-//! goes while it lives, and when its parent ends. The end itself only stops
-//! its threads, at most abi::MAX_THREADS, and queues the process for
-//! cleanup; the queue takes it apart in stages, a portion at a time, with
-//! how far it came kept in the process (`Stage`, spec 7.7): first a wave
-//! that stops its descendants above the cause, at its priority ceiling,
-//! then the teardown at the level of the cause, its descendants first. Once
-//! it gave its quota back, its exit channel hears of the end (spec 7.9),
-//! through a slot in its shell. A shell with the reason stays for
+//! goes while it lives, and when its parent ends. The end itself only
+//! takes the running thread off when it is one of the process's, and
+//! queues the process for cleanup; the queue takes it apart in stages, a
+//! portion at a time, with how far it came kept in the process (`Stage`,
+//! spec 7.7): first its threads, at most abi::MAX_THREADS, leave the
+//! scheduler and a wave stops its descendants, both above the cause, at
+//! its priority ceiling, then the teardown at the level of the cause, its
+//! descendants first. Once it gave its quota back, its exit channel hears
+//! of the end (spec 7.9), through a slot in its shell. A shell with the reason stays for
 //! object_info until the last reference queues it once more. Every release
 //! names the level of its cause, which the cleanup it may start takes. A
 //! process pays from its quota for what goes with it (spec 7.5, 7.8): a
@@ -97,8 +98,6 @@ pub fn fill_measurement_pages(process: NonNull<Process>, count: usize) -> Result
 }
 
 pub struct Process {
-    /// Boot-unique numeric identity retained with the shell after teardown.
-    id: u32,
     /// From `create` until the first portion of the stage Space takes it:
     /// from then on no call reaches its tables (`map_page` fails,
     /// `translate` finds nothing).
@@ -174,6 +173,10 @@ pub struct Process {
     /// At the stage Stop, the child it stops next; a child that leaves
     /// the list moves it on (`leave_parent`).
     stop_next: Option<NonNull<Process>>,
+    /// At the stage Threads, the thread of `threads` it takes off the
+    /// scheduler next; a thread that leaves the list moves it on
+    /// (`remove_thread`).
+    threads_next: Option<NonNull<Thread>>,
     /// The requests its threads accepted and have not answered (spec 6.1,
     /// 6.8): the own slots of their clients, which wait for the replies, at
     /// the levels the clients had. Any thread of the process may answer.
@@ -238,16 +241,6 @@ static ROOTS: Lock<Pool<Process>> = Lock::new(Pool::new());
 static LIVE: Live = Live::new();
 
 impl Process {
-    pub fn identity(&self) -> abi::ProcessIdentity {
-        abi::ProcessIdentity {
-            id: self.id,
-            // SAFETY: an adopted child holds its parent's shell until its own
-            // shell is released. Identity is immutable during that lifetime.
-            parent: self
-                .parent
-                .map_or(0, |parent| unsafe { parent.as_ref().id }),
-        }
-    }
     fn space(&mut self) -> &mut AddressSpace {
         self.space
             .as_mut()
@@ -303,14 +296,9 @@ fn create(
     let ceiling = kcore::args::priority_arg(u64::from(ceiling))?;
     kcore::args::handle_limit_arg(u64::from(handle_limit))?;
     let handles = Handles::new(handle_limit)?;
-    // Reserve before acquiring memory. A later failure retires this ID and
-    // follows the existing resource rollback; exhaustion allocates nothing.
-    static IDS: Lock<kcore::process::Ids> = Lock::new(kcore::process::Ids::new());
-    let id = IDS.lock().allocate()?;
     let mut quota = Account::new(quota);
     let space = AddressSpace::new(&mut quota).map_err(|_| Error::NoMemory)?;
     let process = Process {
-        id,
         space: Some(space),
         retired: None,
         maps: None,
@@ -340,6 +328,7 @@ fn create(
         level: 0,
         exit: None,
         stop_next: None,
+        threads_next: None,
         accepted: ReadyQueue::new(),
         stage: Stage::Whole,
         cleanup: Item::new(),
@@ -564,7 +553,7 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
             Stage::Whole => {
                 let ended = (*life(process)).end(ProcessState::Killed);
                 assert!(ended, "a whole process that ended");
-                begin(process, cause);
+                begin(process, cause, None);
             }
             Stage::Shell => queue_shell(process, cause),
             _ => unreachable!("the cleanup queue holds a process on its stages"),
@@ -655,15 +644,18 @@ const _: () = assert!(core::mem::offset_of!(Process, refs) >= 8);
 
 /// Ends `process` with `reason` unless it ended before, when the first
 /// reason stays: process_exit, process_kill, a fault at EL0 and the stage
-/// Stop of its parent come here. In the call itself every thread of the
-/// process leaves the scheduler for good, and the process is queued for
+/// Stop of its parent come here. From the record of the reason on,
+/// thread_start, thread_create and mem_map of the process give BAD_STATE.
+/// In the call itself only the running thread leaves the scheduler for
+/// good, when it is one of the process's, and the process is queued for
 /// its teardown at `cause`, the effective priority of the thread that made
-/// the call or the fault (`begin`): its stage Stop at its ceiling, the
-/// rest at the level of the cause, and what the teardown releases is
-/// queued at that level too. The running thread may be one of the
-/// process's: it never runs again and may be gone afterwards, so the
-/// caller leaves through sched::resume. When the process is init, the run
-/// ends (`init_ended`). True when the process ended here.
+/// the call or the fault (`begin`): its other threads leave at its stage
+/// Threads, and its stage Stop follows, both at its ceiling; the rest runs
+/// at the level of the cause, and what the teardown releases is queued at
+/// that level too. The running thread never runs again and may be gone
+/// afterwards, so the caller leaves through sched::resume. When the
+/// process is init, the run ends (`init_ended`). True when the process
+/// ended here. O(1).
 ///
 /// # Safety
 /// The caller holds a reference to `process`, or `process` is in its
@@ -680,16 +672,19 @@ pub unsafe fn end(process: NonNull<Process>, reason: ProcessState, cause: u8) ->
 
 /// A started thread of `process` ended through thread_exit; the last one
 /// ends the process with code 0, with the thread's priority as the
-/// `cause`. Threads that never started do not count.
+/// `cause`. Threads that never started do not count. True when this ended
+/// the process.
 ///
 /// # Safety
 /// As for `end`.
-pub unsafe fn thread_exited(process: NonNull<Process>, cause: u8) {
+pub unsafe fn thread_exited(process: NonNull<Process>, cause: u8) -> bool {
     // SAFETY: the caller's reference keeps the process alive.
-    if unsafe { (*life(process)).exit() } {
+    let ended = unsafe { (*life(process)).exit() };
+    if ended {
         // SAFETY: as above; the end was just recorded.
         unsafe { stop(process, cause) };
     }
+    ended
 }
 
 /// A thread of `process` starts (thread::start): BAD_STATE once the
@@ -722,26 +717,27 @@ unsafe fn life(process: NonNull<Process>) -> *mut Life {
 }
 
 /// The part of an end that runs in the call, once its reason was just
-/// recorded: each thread of the list, at most abi::MAX_THREADS, leaves the
-/// scheduler and loses the kernel's reference, which may queue it for
-/// cleanup at `cause`, though it stays alive and in the list until its
-/// portion or the stage Buffers; then the teardown begins at `cause`
-/// (spec 7.7). From milestone 1.3b the exit channel hears of the end once
-/// the stages gave back what they can.
+/// recorded: the running thread, when it is one of the process's, leaves
+/// the scheduler and loses the kernel's reference, which may queue it for
+/// cleanup at `cause`, though it stays in the list until its portion or
+/// the stage Buffers; then the teardown begins at `cause` (spec 7.7), its
+/// stage Threads taking the other threads off a portion at a time. No
+/// other thread of the process runs meanwhile: none has an effective
+/// priority above the ceiling, and the cleanup queue wins over threads of
+/// its level. O(1).
 ///
 /// # Safety
 /// As for `end`.
 unsafe fn stop(process: NonNull<Process>, cause: u8) {
     let p = process.as_ptr();
-    // SAFETY: the caller's reference keeps the process alive, and a
-    // release only queues, so every thread of the list stays alive here.
+    // SAFETY: the caller's reference keeps the process alive; the running
+    // thread is alive and holds its process.
     unsafe {
-        let mut next = (*p).threads;
-        while let Some(t) = next {
-            next = (*t.as_ptr()).siblings.and_then(|s| s.next);
+        let running = sched::running().filter(|t| t.as_ref().process() == process);
+        if let Some(t) = running {
             sched::exit(t, cause);
         }
-        begin(process, cause);
+        begin(process, cause, running);
     }
     // SAFETY: as above.
     let (init, state) = unsafe { ((*p).init, (*life(process)).state()) };
@@ -824,6 +820,10 @@ pub unsafe fn remove_thread(process: NonNull<Process>, t: NonNull<Thread>) {
         };
         let p = process.as_ptr();
         (*p).thread_count -= 1;
+        // The cursor of the stage Threads never names a thread that left.
+        if (*p).threads_next == Some(t) {
+            (*p).threads_next = next;
+        }
         match prev {
             Some(q) => sibling(q).next = next,
             None => (*p).threads = next,

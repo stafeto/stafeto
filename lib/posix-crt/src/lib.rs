@@ -26,8 +26,12 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    let Ok(session) = start.take::<rt::handle::Channel>(posix_abi::process::START_NAME) else {
+        rt::println!("POSIX startup: no session with the process service");
+        return 125;
+    };
     // SAFETY: startup runs once, before application threads and clock calls.
-    if let Err(error) = unsafe { posix_abi::process::init(&start.parent, &start.process) } {
+    if let Err(error) = unsafe { posix_abi::process::init(session) } {
         rt::println!("POSIX startup: process registration failed {:?}", error);
         return 125;
     }
