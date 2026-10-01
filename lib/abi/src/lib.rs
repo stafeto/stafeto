@@ -270,10 +270,9 @@ pub enum Call {
     TimerCancel = 26,
     ObjectInfo = 27,
     DebugWrite = 28,
-    /// Poll native Virtio console input. x0 names the DEBUG resource;
-    /// x1 limits consumption to 1..=8 bytes (zero retains the original limit 8).
-    /// Returns count in x1 and packed bytes in x2; excess input stays queued.
-    ConsolePoll = 29,
+    // 29 went with console_poll (the Virtio console of the VZ build moved
+    // into a service); a retired number is never given again and fails
+    // with INVALID_ARGS as an unknown one does (spec 11).
     /// Interrupt the current IPC wait of x0, a thread with MANAGE.
     /// Wakes it with Interrupted; BadState if it is not waiting in IPC.
     ThreadInterrupt = 30,
@@ -295,7 +294,7 @@ pub enum Call {
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 35] = [
+    pub const ALL: [Call; 34] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -324,7 +323,6 @@ impl Call {
         Call::TimerCancel,
         Call::ObjectInfo,
         Call::DebugWrite,
-        Call::ConsolePoll,
         Call::ThreadInterrupt,
         Call::ThreadUpcallBind,
         Call::ThreadUpcallControl,
@@ -337,14 +335,23 @@ impl Call {
         self as u16
     }
 
-    /// The call with this number, if any.
+    /// The call with this number, if any: none for a retired number
+    /// (RETIRED_CALLS).
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
-            1..=35 => Some(Self::ALL[number as usize - 1]),
+            1..=28 => Some(Self::ALL[number as usize - 1]),
+            30..=35 => Some(Self::ALL[number as usize - 2]),
             _ => None,
         }
     }
+
+    /// The highest number of a call.
+    pub const HIGHEST: u16 = Call::RequestIdentity.number();
 }
+
+/// Numbers of calls that went, never given again (spec 11): 29,
+/// console_poll.
+pub const RETIRED_CALLS: [u16; 1] = [29];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
 /// no real system call gets one.
@@ -353,8 +360,9 @@ pub const TEST_CALLS: core::ops::RangeInclusive<u16> = 0xFF00..=0xFFFF;
 /// Registers a call returns values in on success: x1-x9.
 pub const RESULT_VALUES: usize = 9;
 
-/// Slot zero and one slot for each system call in the KERNEL_STATS buffer.
-pub const KERNEL_CALL_SLOTS: usize = Call::ALL.len() + 1;
+/// Slot zero and one slot for each number up to the highest call in the
+/// KERNEL_STATS buffer; the slot of a retired number stays 0.
+pub const KERNEL_CALL_SLOTS: usize = Call::HIGHEST as usize + 1;
 
 /// Upcall context: 36 general/system words followed by 66 FP/SIMD words.
 /// Located after message data and handle metadata, aligned for SIMD registers.
@@ -1354,16 +1362,18 @@ mod tests {
     }
 
     #[test]
-    fn call_numbers_are_dense_from_one() {
-        assert_eq!(Call::ALL.len(), 35);
-        for (i, call) in Call::ALL.iter().enumerate() {
-            assert_eq!(call.number(), i as u16 + 1);
-            assert_eq!(Call::from_number(call.number()), Some(*call));
-            assert!(!TEST_CALLS.contains(&call.number()));
+    fn call_numbers_are_dense_from_one_but_the_retired() {
+        assert_eq!(Call::ALL.len(), 34);
+        let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
+        for (call, n) in Call::ALL.iter().zip(numbers) {
+            assert_eq!(call.number(), n);
+            assert_eq!(Call::from_number(n), Some(*call));
+            assert!(!TEST_CALLS.contains(&n));
         }
-        for n in [0, 36, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [0, 29, 36, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
             assert_eq!(Call::from_number(n), None);
         }
+        assert_eq!(KERNEL_CALL_SLOTS, 36);
     }
 
     #[test]
@@ -1376,7 +1386,6 @@ mod tests {
         assert_eq!(Call::ClockNow.number(), 23);
         assert_eq!(Call::ObjectInfo.number(), 27);
         assert_eq!(Call::DebugWrite.number(), 28);
-        assert_eq!(Call::ConsolePoll.number(), 29);
         assert_eq!(Call::ThreadInterrupt.number(), 30);
         assert_eq!(Call::ThreadUpcallBind.number(), 31);
         assert_eq!(Call::ThreadUpcallControl.number(), 32);

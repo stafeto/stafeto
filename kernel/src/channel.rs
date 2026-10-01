@@ -710,9 +710,9 @@ pub fn receive(t: NonNull<Thread>, c: NonNull<Channel>, wait: bool) -> Result<()
     let taken = match looked {
         Looked::Done(taken) => taken,
         Looked::Handles(client) => {
-            // SAFETY: the running thread holds its process; the client
-            // waits, so it is alive.
+            // SAFETY: the client waits, so it is alive.
             let n = unsafe { sent(client) }.handles;
+            // SAFETY: the running thread is alive and holds its process.
             let fit = process::reserve_handles(unsafe { t.as_ref() }.process(), n);
             // SAFETY: nothing changed the queue meanwhile: one CPU, and
             // interrupts are masked in the kernel (spec 8.1).

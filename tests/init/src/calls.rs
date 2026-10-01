@@ -328,10 +328,21 @@ pub(crate) fn written(line: &[u8]) -> bool {
 }
 
 /// Numbers no call has fail with INVALID_ARGS and change x0 alone
-/// (spec 11), those of the kernel's test builds too.
+/// (spec 11), those of the kernel's test builds and the retired 29 too:
+/// the console_poll of the VZ build, which fails so even with the system
+/// resource and a byte to take, as it took them (and as debug_write,
+/// its neighbour, would write one).
 fn unknown_system_calls_fail() -> Outcome {
     unknown::<0>()?;
-    unknown::<{ Call::RequestIdentity.number() + 1 }>()?;
+    let mut x = marked();
+    x[..2].copy_from_slice(&[resource().raw().0, 1]);
+    // SAFETY: no call has number 29 any more.
+    let after = unsafe { sys::raw::<29>(x) };
+    check(
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
+        "the retired 29 did not fail with INVALID_ARGS alone",
+    )?;
+    unknown::<{ Call::HIGHEST + 1 }>()?;
     unknown::<0xFEFF>()?;
     unknown::<{ *abi::TEST_CALLS.start() }>()?;
     unknown::<{ *abi::TEST_CALLS.end() }>()

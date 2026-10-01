@@ -1,0 +1,36 @@
+[package]
+name = "virtio-console"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The driver of the Virtio PCI console of Apple's Virtualization.framework"
+
+# What the driver decides, apart from the device and the calls: tested on
+# the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "virtio-console"
+test = false
+bench = false
+
+# `crash`: the method CRASH of proto_uart, as the PL011's driver has it;
+# xtask builds the VZ boot image with it, for the restart probe.
+[features]
+crash = []
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-init = { path = "../../proto/init" }
+proto-uart = { path = "../../proto/uart" }
+proto-wire = { path = "../../proto/wire" }
+uart = { path = "../uart" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt and without the device's crate (virtio-drivers, MIT).
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }
+virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }

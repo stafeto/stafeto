@@ -32,7 +32,8 @@ POSIX layer covers, and which commands check each piece. It describes
   `thread_upcall_control`, `thread_upcall_request`, `thread_upcall_return`,
   `yield`, `device_window_create`, `irq_bind`, `irq_ack`, `clock_now`,
   `timer_create`, `timer_set`, `timer_cancel`, `object_info`,
-  `debug_write`; the VZ build adds `console_poll`.
+  `debug_write`; the same on every machine. Number 29 (`console_poll`
+  of the old VZ build) is retired and fails as an unknown one.
 - **Messages:** requests and replies of up to 1 KiB, the first 64 bytes in
   registers and the rest through a per-thread message buffer; up to four
   handles move with a message and keep their rights and labels. A service
@@ -69,6 +70,12 @@ Bounded paths with interrupts masked are listed in
   60 s.
 - `services/uart`: PL011 console on interrupts at priority 60, kernel log
   between whole client lines, one input reader at a time (`proto/uart`).
+- `services/virtio-console`: the Virtio PCI console of Apple VZ with the
+  same protocol and the same rings, on its INTx line, its queues in a
+  contiguous uncached DMA object from `init`; output never waits for
+  the host, and the end of the host's input leaves the console with
+  output; `init` resets the device and clears the function's command
+  word before the object goes.
 - `services/ramfs`: RAM files and directories (`proto/fs`).
 - `services/clock` and `services/process`: realtime clock, process
   identity and credentials for the POSIX layer (`proto/clock`,
@@ -112,7 +119,8 @@ Picolibc probes run only on request.
 | `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes |
 | `posix-abi` | C programs linked with Rust startup through Cargo and standalone Clang |
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
-| `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework |
+| `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
+| `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
 | `cprobe` | a static Picolibc C program against the RAM service |
 | `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox `cat`, `ash -c`, an `ash` dialog, `ls` |
 
@@ -129,4 +137,6 @@ lower-priority CPU load. It reports median operations per second, timer
 p99 and worst latency, and missed periods, three runs per machine
 (`--repeats N` changes that). These are adapted workloads, not official
 Thread-Metric results, and virtual machines do not give a physical
-worst-case latency.
+worst-case latency. On Apple VZ the benchmark runs as a client of `init`
+beside the Virtio console's driver, which shows its lines, at priority 60
+with a 50 ms timer above every thread of the benchmark.

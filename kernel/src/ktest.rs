@@ -561,8 +561,8 @@ fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
     // A call no test of the build made has no maximum: "not measured", so
-    // that 0 does not read as a free call (debug_write, and console_poll,
-    // which only the VZ build has).
+    // that 0 does not read as a free call (debug_write, and 29, a retired
+    // number).
     #[cfg(feature = "measure")]
     for (number, &ticks) in crate::syscall::call_maxima().iter().enumerate().skip(1) {
         if ticks == 0 {

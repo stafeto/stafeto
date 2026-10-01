@@ -28,6 +28,9 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         bindings: &[],
         connects,
         args: b"e",
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     }
 }
 

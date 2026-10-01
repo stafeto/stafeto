@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from `main` at 764be2a.
+Numbers below are from part 3a of stage 3 (branch `m3k-dma`).
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -29,10 +29,11 @@ on three kinds of machine:
 - QEMU `virt` under emulation (TCG), with GICv2 or GICv3;
 - QEMU with HVF on a Mac with Apple silicon, on Apple's GICv3 and on
   QEMU's GICv2;
-- Apple Virtualization.framework without QEMU, through a Virtio PCI
-  console (`cargo xtask vz`).
+- Apple Virtualization.framework without QEMU: the same kernel image,
+  with the Virtio PCI console driven by a user-space service
+  (`cargo xtask vz`).
 
-**Kernel.** 34 system calls (35 in the VZ build) over 64-bit handles
+**Kernel.** 34 system calls, the same on every machine, over 64-bit handles
 with rights: processes, threads, channels, sessions, timers, memory
 objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
 four handles; a service runs at its client's priority under its own
@@ -40,15 +41,18 @@ ceiling, and a fast path hands the CPU straight to a waiting service. The
 scheduler has 64 priority levels (round robin and FIFO) with tickless
 preemption. Every process pays for its kernel memory from a quota, memory
 is never writable and executable at once, and long operations run in
-bounded portions. Device interrupts reach drivers as notifications. A
-fault ends only its own process. The kernel image is 154,708 bytes of a
-204,800-byte budget.
+bounded portions. Device interrupts reach drivers as notifications, and
+a driver gets contiguous, optionally uncached memory for DMA. The kernel
+drives no device with DMA. A fault ends only its own process. The kernel
+image is 158,788 bytes of a 204,800-byte budget, on QEMU and on Apple VZ.
 
 **User space and services.** `init` starts services from a table in
 dependency order, hands out sessions by name, restarts a service that
 crashes or goes silent and marks it broken after five failures in 60 s.
 The PL011 driver (`services/uart`) owns the console on interrupts and
-shows the kernel log. A RAM file service (`services/ramfs`) holds files
+shows the kernel log; on Apple VZ the Virtio console's driver
+(`services/virtio-console`) does the same with the same protocol, and
+`init` resets its device before its DMA memory goes. A RAM file service (`services/ramfs`) holds files
 and directories. Programs build on `lib/rt`, which owns handles, runs
 service loops and starts children through a start protocol.
 
@@ -71,15 +75,18 @@ and Apple VZ. The layer is a work in progress and paused: no real program
 uses it yet, and `ash` still runs on Picolibc. Details are in
 [docs/status.md](docs/status.md).
 
-**Tests.** The kernel test image runs 166 tests (177 under `-icount`),
-the EL0 test `init` runs 224 and `kcore` has 402 host tests; `cargo xtask
+**Tests.** The kernel test image runs 174 tests (187 under `-icount`),
+the EL0 test `init` runs 226 and `kcore` has 408 host tests; `cargo xtask
 ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
 Apple silicon.
 
 **Known limits.**
 
-- The Apple VZ build keeps its Virtio console driver in the kernel and
-  polls for input.
+- Apple VZ gives the kernel no port: a kernel panic there shows nothing
+  and powers the machine off (a VZ probe fails with a hint), and VZ
+  clears RAM at a reset, so the log does not outlive it; the same image
+  under HVF shows the panic. On VZ `rtbench` runs beside the console's
+  driver.
 - One CPU core only; no SMP.
 - No PinePhone port yet.
 - `ash` cannot start external programs: no `exec`, `fork` or pipes.
@@ -162,7 +169,7 @@ Bounded kernel paths and their costs:
 |---|---|---|
 | Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
-| Kernel | DMA memory objects, the Virtio console as a user-space service, process IDs out of the kernel | ⬜ |
+| Kernel | DMA memory objects, the Virtio console as a user-space service, process IDs out of the kernel | 🚧 |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ⬜ |
 | POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | ⬜ |
 | POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | ⬜ |

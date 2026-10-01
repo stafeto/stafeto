@@ -30,12 +30,7 @@ unsafe extern "C" fn cleanup(_: *mut c_void) {
         }
         length += result as usize;
     }
-    let ending = if cfg!(feature = "native-cancel-input") {
-        b'\r'
-    } else {
-        b'\n'
-    };
-    if bytes != [b'z', ending] {
+    if bytes != *b"z\n" {
         CLEANED.store(3, Ordering::Release);
         return;
     }
@@ -55,13 +50,8 @@ fn console_waiting(id: u64, native: &Handle<Thread>) -> bool {
     let wake = sys::channel_create(30).expect("console poll wake");
     let timer = sys::timer_create(&wake, 30).expect("console poll timer");
     for _ in 0..100 {
-        let waiting = if cfg!(feature = "native-cancel-input") {
-            ThreadState::Receiving
-        } else {
-            ThreadState::AwaitingReply
-        };
         if threads::probe_console_waiting(id)
-            && sys::thread_info(native).is_ok_and(|info| info.state == waiting)
+            && sys::thread_info(native).is_ok_and(|info| info.state == ThreadState::AwaitingReply)
         {
             return true;
         }

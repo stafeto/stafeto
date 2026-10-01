@@ -26,7 +26,7 @@
 //! main thread loads, maps and kills nothing itself, and lets go of no last
 //! handle of an instance (worker.rs).
 
-use crate::worker::{Loaded, Worker};
+use crate::worker::{Kept, Loaded, Worker};
 use abi::{Error, ObjectKind, ProcessState, Rights, Source};
 use bootimg::Program;
 use core::fmt;
@@ -43,7 +43,7 @@ use proto_init::{
     START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
-use rt::handle::{Channel, Outgoing, Process, Resource, Timer};
+use rt::handle::{Channel, Memory, Outgoing, Process, Resource, Timer};
 use rt::loader::Spawned;
 use rt::service::{Answer, Notice, Pending, Request, Service, Session};
 use rt::{Handle, println, sys, time};
@@ -64,6 +64,9 @@ const S: u64 = 1_000 * MS;
 /// worker thread: the main thread lets go of no Instance (spec 7.7).
 pub struct Instance {
     spawned: Spawned,
+    /// Init's own handles to its DMA objects, which go with it, after its
+    /// device stopped (worker.rs).
+    dma: Kept,
     channel: Option<Handle<Channel>>,
     started: u64,
     /// Set by the worker right before it lets go of the instance (`release`).
@@ -81,6 +84,24 @@ impl Instance {
     /// instance down (worker.rs).
     pub fn process(&self) -> &Handle<Process> {
         &self.spawned.process
+    }
+
+    /// Init's handle to the instance's first DMA object, if any, which
+    /// the probe of a stop reads (feature `dma-watch`).
+    #[cfg(feature = "dma-watch")]
+    pub fn dma(&self) -> Option<&Handle<Memory>> {
+        self.dma.first().and_then(Option::as_ref)
+    }
+
+    /// Init keeps the instance's DMA objects for good: their handles are
+    /// forgotten, so their frames never go back while a device that did
+    /// not stop may write them (worker.rs).
+    pub fn keep_dma(&mut self) {
+        for d in &mut self.dma {
+            if let Some(handle) = d.take() {
+                core::mem::forget(handle);
+            }
+        }
     }
 }
 
@@ -332,8 +353,10 @@ impl Init {
                 }
                 Work::Teardown => self
                     .worker
-                    .teardown(gone.expect("a teardown carries its instance")),
-                Work::Kill => self.worker.kill(gone.expect("a kill carries its instance")),
+                    .teardown(place, gone.expect("a teardown carries its instance")),
+                Work::Kill => self
+                    .worker
+                    .kill(place, gone.expect("a kill carries its instance")),
                 Work::ShowLog => self.worker.show_log(),
             };
             return;
@@ -423,7 +446,7 @@ impl Init {
     fn loaded(&mut self, place: usize, result: Loaded) {
         let record = &TABLE[place];
         match result {
-            Ok(spawned) => {
+            Ok((spawned, dma)) => {
                 if let Err(e) = spawned.start() {
                     println!("init: {} did not start: {e:?}", record.name);
                 }
@@ -435,6 +458,7 @@ impl Init {
                 let entry = &mut self.entries[place];
                 entry.held = Held::Running(Instance {
                     spawned,
+                    dma,
                     channel: None,
                     started,
                     released: false,
@@ -588,6 +612,16 @@ impl Init {
     /// broken or ended gets what is left of the kernel log shown by the
     /// worker at WORKER_IDLE (spec 13.4, 16.3).
     fn torn_down(&mut self, place: usize) {
+        if crate::worker::take_stuck(place) {
+            let entry = &mut self.entries[place];
+            entry.state = State::Broken;
+            entry.waiting = [const { None }; WAITING_MAX];
+            entry.deadline = None;
+            println!(
+                "init: {} did not stop; broken, its DMA memory stays with init",
+                TABLE[place].name
+            );
+        }
         let entry = &mut self.entries[place];
         if matches!(entry.state, State::Broken | State::Ended) && TABLE[place].log {
             // Ceiling 0: the worker goes to WORKER_IDLE for it (init::work).

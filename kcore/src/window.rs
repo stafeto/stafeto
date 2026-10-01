@@ -16,14 +16,10 @@ use abi::{Error, MAX_MEMORY};
 /// The end of the output addresses a descriptor holds (OA[47:12], [G8]).
 pub const OUTPUT_END: u64 = 1 << 48;
 
-/// Devices the kernel drives that the device tree does not name, at most:
-/// the VZ build's PCI windows (ECAM and the console's BAR).
-pub const KERNEL_DEVICES: usize = 2;
-
 /// What a window may not touch: the RAM regions of the device tree
-/// (MEMORY_REGIONS, at most), the regions of the GIC's node (GIC_REGIONS,
-/// at most) and the kernel's other devices (KERNEL_DEVICES, at most).
-pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS + KERNEL_DEVICES }>;
+/// (MEMORY_REGIONS, at most) and the regions of the GIC's node
+/// (GIC_REGIONS, at most).
+pub type Forbidden = RegionList<{ MEMORY_REGIONS + GIC_REGIONS }>;
 
 /// The range of `len` bytes from `addr` rounded out to whole pages: its
 /// first page and its count of pages. INVALID_ARGS for a length of 0, a
@@ -41,19 +37,14 @@ pub fn round_out(addr: u64, len: u64) -> Result<(u64, u64), Error> {
     }
 }
 
-/// What windows may not touch on the machine `info` describes: its RAM,
-/// every region of the GIC's node, whole, and `devices`, those the kernel
-/// drives beyond the device tree (at most KERNEL_DEVICES).
-pub fn forbidden(info: &BootInfo, devices: &[Region]) -> Forbidden {
+/// What windows may not touch on the machine `info` describes: its RAM
+/// and every region of the GIC's node, whole. The kernel drives no other
+/// device (spec 3.2).
+pub fn forbidden(info: &BootInfo) -> Forbidden {
     let mut list = Forbidden::new();
     let gic = info.gic.as_ref().map_or(&[][..], |g| g.regs.as_slice());
-    assert!(
-        devices.len() <= KERNEL_DEVICES,
-        "room for the kernel's devices"
-    );
-    for &r in info.memory.as_slice().iter().chain(gic).chain(devices) {
-        list.push(r)
-            .expect("room for the RAM, the GIC and the kernel's devices");
+    for &r in info.memory.as_slice().iter().chain(gic) {
+        list.push(r).expect("room for the RAM and the GIC");
     }
     list
 }
@@ -83,10 +74,12 @@ mod tests {
     const VIRT: &[u8] = include_bytes!("../tests/fixtures/virt.dtb");
     const VIRT_GICV3: &[u8] = include_bytes!("../tests/fixtures/virt-gicv3.dtb");
     const A64: &[u8] = include_bytes!("../tests/fixtures/a64-like.dtb");
+    /// The tree Apple's Virtualization.framework gives a guest.
+    const VZ: &[u8] = include_bytes!("../tests/fixtures/apple-vz.dtb");
 
     /// What windows may not touch on the machine of the fixture `blob`.
     fn forbidden_on(blob: &[u8]) -> Forbidden {
-        forbidden(&parse(&Fdt::new(blob).unwrap()).unwrap(), &[])
+        forbidden(&parse(&Fdt::new(blob).unwrap()).unwrap())
     }
 
     /// `round_out` and `check` together, as device_window_create takes a
@@ -115,39 +108,19 @@ mod tests {
         assert_eq!(round_out(u64::MAX - 0x10, 0x20), Err(Error::InvalidArgs));
     }
 
+    /// On Apple VZ (the fixture, its tree as the platform gives it) the
+    /// kernel keeps its RAM and its GIC alone: the page of the console's
+    /// function in ECAM and the console's BAR, which its service maps, are
+    /// open to windows, and the list has no third kind of region.
     #[test]
-    fn window_over_a_kernel_device_is_refused() {
-        // The VZ build's ECAM and console BAR (kernel/src/vz_driver.rs).
-        let devices = [
-            Region {
-                base: 0x4000_0000,
-                size: 0x1000_0000,
-            },
-            Region {
-                base: 0x1_0000_0000,
-                size: 0x1_0000,
-            },
-        ];
-        let info = parse(&Fdt::new(VIRT).unwrap()).unwrap();
-        let list = forbidden(&info, &devices);
-        for (addr, len) in [
-            (0x4002_8000, 4),
-            (0x4FFF_F000, 0x1000),
-            (0x1_0000_F000, 0x1000),
-        ] {
-            let (base, pages) = round_out(addr, len).unwrap();
-            assert_eq!(
-                check(base, pages, list.as_slice()),
-                Err(Error::InvalidArgs),
-                "{addr:#x}"
-            );
-        }
-        let (base, pages) = round_out(0x1_0001_0000, 0x1000).unwrap();
-        assert_eq!(check(base, pages, list.as_slice()), Ok(()));
-        assert_eq!(
-            list.as_slice().len(),
-            forbidden(&info, &[]).as_slice().len() + 2
-        );
+    fn the_pci_windows_of_vz_are_open() {
+        let list = forbidden_on(VZ);
+        assert_eq!(list.as_slice().len(), 3);
+        let window = |addr, len| window_on(VZ, addr, len);
+        assert_eq!(window(0x4002_8000, 0x1000), Ok((0x4002_8000, 1)));
+        assert_eq!(window(0x1_0000_0000, 0x1_0000), Ok((0x1_0000_0000, 16)));
+        assert_eq!(window(0x7000_0000, 0x1000), Err(Error::InvalidArgs));
+        assert_eq!(window(0x1001_0000, 0x1000), Err(Error::InvalidArgs));
     }
 
     #[test]

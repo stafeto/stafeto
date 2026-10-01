@@ -77,10 +77,6 @@ impl Attrs {
         memory: Memory::Device,
         ..Attrs::KERNEL_DATA
     };
-    pub const KERNEL_UNCACHED: Attrs = Attrs {
-        memory: Memory::Uncached,
-        ..Attrs::KERNEL_DATA
-    };
     /// A program's code: EL0 reads and executes it.
     pub const USER_TEXT: Attrs = Attrs {
         memory: Memory::Normal,

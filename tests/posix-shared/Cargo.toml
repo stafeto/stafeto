@@ -13,9 +13,7 @@ bench = false
 
 [features]
 interrupt-probe = []
-native-interrupt = ["interrupt-probe"]
 input-probe = []
-native-input = ["input-probe"]
 
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi", features = ["transport-probe"] }

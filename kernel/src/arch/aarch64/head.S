@@ -153,6 +153,9 @@ at_el1:
     str     x8, [x4, #(511 * 8)]
 
     // Linear map: devices in the first GiB, RAM for the kernel's and the device tree's GiBs.
+    // Nothing reaches a device through the first GiB any more: the early port went (spec 3.2),
+    // and the kernel tables map the devices of the tree. It stays until the boot tables are
+    // reworked, and keeps a device tree out of GiB 0 (kcore::layout::dtb_gib_is_mappable).
     ldr     x9, =BLOCK_DEVICE
     str     x9, [x3]
     ldr     x9, =BLOCK_RAM

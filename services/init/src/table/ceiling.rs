@@ -28,6 +28,9 @@ pub const TABLE: &[Record] = &[
         bindings: &[],
         connects: &[],
         args: b"e",
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     },
     Record {
         name: "high",
@@ -45,5 +48,8 @@ pub const TABLE: &[Record] = &[
         bindings: &[],
         connects: &["low"],
         args: b"c",
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     },
 ];

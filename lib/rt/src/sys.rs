@@ -572,26 +572,6 @@ pub fn debug_write(resource: &Handle<Resource>, bytes: &[u8]) -> Result<usize, E
     Ok(x[1] as usize)
 }
 
-/// Poll up to eight input bytes from the native Virtio console.
-pub fn console_poll(resource: &Handle<Resource>, out: &mut [u8; 8]) -> Result<usize, Error> {
-    console_poll_limit(resource, out, 8)
-}
-
-/// Poll at most limit bytes, leaving remaining native input queued.
-pub fn console_poll_limit(
-    resource: &Handle<Resource>,
-    out: &mut [u8; 8],
-    limit: usize,
-) -> Result<usize, Error> {
-    if !(1..=8).contains(&limit) {
-        return Err(Error::InvalidArgs);
-    }
-    let x = call::<{ Call::ConsolePoll.number() }>(&[resource.raw().0, limit as u64])?;
-    let count = (x[1] as usize).min(limit);
-    out[..count].copy_from_slice(&x[2].to_le_bytes()[..count]);
-    Ok(count)
-}
-
 /// channel_create: a channel whose slot of label 0 has `priority` (1-63,
 /// no higher than the caller's ceiling). The handle carries SEND, NOTIFY,
 /// RECEIVE, DUPLICATE and TRANSFER (abi::CHANNEL_RIGHTS).

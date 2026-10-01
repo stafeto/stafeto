@@ -105,12 +105,7 @@ extern "C" fn console_read(_: u64) -> ! {
         // Same thread, same descriptor and UART session. A stale deferred read
         // would refuse this new request or consume its bytes for a dead token.
         RESULTS[3].store(5, Ordering::Release);
-        let ending = if cfg!(feature = "native-interrupt") {
-            b'\r'
-        } else {
-            b'\n'
-        };
-        for expected in [b'q', ending] {
+        for expected in *b"q\n" {
             if unsafe { abi::read(0, bytes.as_mut_ptr(), 1) } != 1
                 || bytes[0] != expected
                 || unsafe { *errno } != EINTR
@@ -327,7 +322,6 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     true
 }
 
-#[cfg(not(feature = "native-interrupt"))]
 extern "C" fn active_read(_: u64) -> ! {
     let mut request = proto_wire::Writer::new();
     let encoded = (proto_uart::CancelableRead {
@@ -341,7 +335,6 @@ extern "C" fn active_read(_: u64) -> ! {
     passed(5, good)
 }
 
-#[cfg(not(feature = "native-interrupt"))]
 fn cancel_live_read(process: &Handle<Process>) -> bool {
     let Some(raw) = uart_route().and_then(|input| input.uart()) else {
         return fail(97);
@@ -436,7 +429,6 @@ fn delivered_data_survives_echo_interrupt(process: &Handle<Process>) -> bool {
     true
 }
 
-#[cfg(not(feature = "native-interrupt"))]
 fn uart_route() -> Option<rt::fs::Input> {
     let mut request = proto_wire::Writer::new();
     posix_request::Request::Read { fd: 0, count: 2 }
@@ -454,7 +446,6 @@ fn uart_route() -> Option<rt::fs::Input> {
 
 // Keep the interrupted client ready below main until UART has tried its dead
 // reply. IRQ runs above main, so real input arrives before CancelRead executes.
-#[cfg(not(feature = "native-interrupt"))]
 fn interrupt_before_irq(reader: &Handle<Thread>) -> bool {
     let Some(input) = uart_route() else {
         return fail(94);
@@ -530,19 +521,14 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
         return fail(89);
     }
     // The file owner completes read preparation at priority 1 while main's
-    // own file round trip waits. Native input then sleeps on its timer;
-    // UART input waits for an accepted driver request without incoming bytes.
+    // own file round trip waits. Input then waits for an accepted driver
+    // request without incoming bytes.
     let mut info = core::mem::MaybeUninit::<posix_abi::metadata::Stat>::uninit();
     if unsafe { posix_abi::metadata::fstat(0, info.as_mut_ptr()) } != 0 {
         return fail(90);
     }
-    let expected = if cfg!(feature = "native-interrupt") {
-        ThreadState::Receiving
-    } else {
-        ThreadState::AwaitingReply
-    };
-    // Native polling can briefly run between sleeps; observe the current
-    // state rather than relying on a fixed host delay.
+    let expected = ThreadState::AwaitingReply;
+    // Observe the current state rather than relying on a fixed host delay.
     for _ in 0..64 {
         if state(&reader, expected) {
             break;
@@ -552,18 +538,10 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     let Ok(during_read) = sys::process_handles(process) else {
         return fail(91);
     };
-    let temporary = if cfg!(feature = "native-interrupt") {
-        2
-    } else {
-        0
-    };
-    if !state(&reader, expected) || during_read.live != before_read.live + temporary {
+    if !state(&reader, expected) || during_read.live != before_read.live {
         return fail(91);
     }
-    #[cfg(not(feature = "native-interrupt"))]
     let interrupted = interrupt_before_irq(&reader);
-    #[cfg(feature = "native-interrupt")]
-    let interrupted = interrupt(&reader, 3);
     if !interrupted
         || sys::process_handles(process).map(|handles| handles.live) != Ok(before_read.live)
         || unsafe { *errno } != EIO
@@ -609,7 +587,6 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
         return fail(93);
     }
     rt::println!("posix-interrupt-probe: retry preserved input and errno");
-    #[cfg(not(feature = "native-interrupt"))]
     if !cancel_live_read(process) {
         return false;
     }

@@ -31,6 +31,8 @@ pub const HANDLE_LIMIT_MAX: u32 = 16_384;
 /// The least quota of a record: a program that owns no object loads and
 /// runs with 15 pages (spec 7.5).
 pub const MIN_QUOTA: u64 = 15 * PAGE;
+/// The DMA objects of a record at most.
+pub const MAX_DMA: usize = 2;
 /// The lines a binding takes: the shared lines of the GIC (spec 9).
 pub const SHARED_LINES: RangeInclusive<u32> = 32..=1019;
 
@@ -72,6 +74,36 @@ pub struct Binding {
     pub edge: bool,
 }
 
+/// A contiguous DMA object init makes for each instance of a driver (spec
+/// 7.3; spec 2, section 4) and gives it in its start data under `name`,
+/// its physical address first in the own arguments: `size` bytes, a power
+/// of two of pages up to abi::MAX_CONTIGUOUS_PAGES, uncached in every
+/// mapping when `uncached`. Init keeps a handle of its own until the
+/// instance ended and its device stopped (`quiesce`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dma {
+    pub name: &'static str,
+    pub size: u64,
+    pub uncached: bool,
+}
+
+/// A write of `bits` bits, 8 or 32, init makes through a window of its own
+/// over the window `window` of the record, at byte `offset`, aligned to
+/// its width, once an instance ended and before its DMA objects go; init
+/// reads the register back until its bits `settled` show `value`, at most
+/// worker::SETTLE_READS times, and the stop failed otherwise. In their
+/// order the writes stop the device's DMA: for a Virtio PCI function a
+/// reset (`device_status` 0, which reads 0 once done), then its command
+/// word 0 (no decoding, no bus mastering).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Write {
+    pub window: &'static str,
+    pub offset: u64,
+    pub bits: u8,
+    pub value: u32,
+    pub settled: u32,
+}
+
 /// A record of the table (spec 13.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
@@ -99,8 +131,17 @@ pub struct Record {
     pub bindings: &'static [Binding],
     /// The services it may connect to, by name.
     pub connects: &'static [&'static str],
-    /// Its own arguments (proto_init::ServiceArgs).
+    /// Its own arguments (proto_init::ServiceArgs), after the physical
+    /// addresses of its DMA objects, 8 bytes each.
     pub args: &'static [u8],
+    /// The DMA objects of each of its instances.
+    pub dma: &'static [Dma],
+    /// The writes that stop its device once an instance ended.
+    pub quiesce: &'static [Write],
+    /// A driver of a device that masters the bus with no SMMU between
+    /// them: it can write any memory, so it is in the trusted base (spec
+    /// 9; spec 2, section 4). Only such a record has DMA objects.
+    pub trusted: bool,
 }
 
 impl Record {
@@ -220,6 +261,18 @@ pub enum TableError<'a> {
         record: &'static str,
         quota: u64,
     },
+    /// A DMA object of a record that is no trusted service, or of a size
+    /// no contiguous object has, or a name that is no name.
+    Dma {
+        record: &'static str,
+        name: &'static str,
+    },
+    /// A write that names no window of the record, or lies past it or off
+    /// a word.
+    Quiesce {
+        record: &'static str,
+        window: &'static str,
+    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -300,6 +353,15 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} has a quota of {quota} bytes: whole pages, at least {MIN_QUOTA}"
             ),
+            TableError::Dma { record, name } => write!(
+                f,
+                "{record} has the DMA object {name}: a trusted service's, of a power of two of pages up to {}",
+                abi::MAX_CONTIGUOUS_PAGES
+            ),
+            TableError::Quiesce { record, window } => write!(
+                f,
+                "{record} has a stopping write through {window}: a window of its own, 8 or 32 bits aligned within it"
+            ),
         }
     }
 }
@@ -313,10 +375,13 @@ impl fmt::Display for TableError<'_> {
 /// MAX_CEILING; the watchdog of a service at least three periods of more
 /// than 0, and no window or binding for a client; at most START_NAMES
 /// windows and bindings, all named once, windows of whole pages and lines
-/// in SHARED_LINES; at most OWN_ARGS_MAX bytes of its own arguments, room
-/// for 1 to HANDLE_LIMIT_MAX handles and a quota of whole pages, at least
-/// MIN_QUOTA. Whether the program is in the boot image, init checks at
-/// its start.
+/// in SHARED_LINES; at most OWN_ARGS_MAX bytes of its own arguments, the
+/// addresses of its DMA objects among them, room for 1 to
+/// HANDLE_LIMIT_MAX handles and a quota of whole pages, at least
+/// MIN_QUOTA; DMA objects only for a trusted service, each named and of a
+/// power of two of pages up to abi::MAX_CONTIGUOUS_PAGES; each write that
+/// stops the device on a word within a window of the record. Whether the
+/// program is in the boot image, init checks at its start.
 pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     if table.len() > MAX_RECORDS {
         return Err(TableError::TooMany { count: table.len() });
@@ -412,11 +477,9 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
             });
         }
     }
-    if r.args.len() > OWN_ARGS_MAX {
-        return Err(TableError::Args {
-            record,
-            len: r.args.len(),
-        });
+    let own = r.args.len() + 8 * r.dma.len();
+    if own > OWN_ARGS_MAX {
+        return Err(TableError::Args { record, len: own });
     }
     if !(1..=HANDLE_LIMIT_MAX).contains(&r.handle_limit) {
         return Err(TableError::HandleLimit {
@@ -429,6 +492,32 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
             record,
             quota: r.quota,
         });
+    }
+    for d in r.dma {
+        let pages = d.size / PAGE;
+        let fits = d.size.is_multiple_of(PAGE)
+            && pages.is_power_of_two()
+            && pages <= abi::MAX_CONTIGUOUS_PAGES;
+        let named = Name::new(d.name.as_bytes()).is_ok() && r.dma.len() <= MAX_DMA;
+        if !r.trusted || r.is_client() || !fits || !named {
+            return Err(TableError::Dma {
+                record,
+                name: d.name,
+            });
+        }
+    }
+    for q in r.quiesce {
+        let window = r.windows.iter().find(|w| w.name == q.window);
+        let bytes = u64::from(q.bits / 8);
+        let width = matches!(q.bits, 8 | 32) && (q.bits == 32 || q.value <= 0xFF);
+        let within = width
+            && window.is_some_and(|w| q.offset.is_multiple_of(bytes) && q.offset + bytes <= w.len);
+        if !within {
+            return Err(TableError::Quiesce {
+                record,
+                window: q.window,
+            });
+        }
     }
     Ok(())
 }
@@ -533,45 +622,23 @@ pub mod ramfs;
 pub mod test;
 pub mod vz;
 
-#[cfg(any(
-    all(feature = "table-posix-abi", feature = "vz"),
-    all(feature = "table-posix-abi", feature = "table-test"),
-    all(feature = "table-posix-abi", feature = "table-cycle"),
-    all(feature = "table-posix-abi", feature = "table-ceiling"),
-    all(feature = "table-posix-abi", feature = "table-ramfs"),
-    all(feature = "table-posix-abi", feature = "table-cprobe"),
-    all(feature = "table-posix-abi", feature = "table-busybox"),
-    all(feature = "table-posix-abi", feature = "table-busybox-dialog"),
-    all(feature = "table-test", feature = "table-cycle"),
-    all(feature = "table-test", feature = "table-ceiling"),
-    all(feature = "table-cycle", feature = "table-ceiling"),
-    all(feature = "vz", feature = "table-test"),
-    all(feature = "vz", feature = "table-cycle"),
-    all(feature = "vz", feature = "table-ceiling"),
-    all(feature = "table-ramfs", feature = "vz"),
-    all(feature = "table-ramfs", feature = "table-test"),
-    all(feature = "table-ramfs", feature = "table-cycle"),
-    all(feature = "table-ramfs", feature = "table-ceiling"),
-    all(feature = "table-cprobe", feature = "vz"),
-    all(feature = "table-cprobe", feature = "table-test"),
-    all(feature = "table-cprobe", feature = "table-cycle"),
-    all(feature = "table-cprobe", feature = "table-ceiling"),
-    all(feature = "table-cprobe", feature = "table-ramfs"),
-    all(feature = "table-busybox", feature = "vz"),
-    all(feature = "table-busybox", feature = "table-test"),
-    all(feature = "table-busybox", feature = "table-cycle"),
-    all(feature = "table-busybox", feature = "table-ceiling"),
-    all(feature = "table-busybox", feature = "table-ramfs"),
-    all(feature = "table-busybox", feature = "table-cprobe"),
-    all(feature = "table-busybox-dialog", feature = "vz"),
-    all(feature = "table-busybox-dialog", feature = "table-test"),
-    all(feature = "table-busybox-dialog", feature = "table-cycle"),
-    all(feature = "table-busybox-dialog", feature = "table-ceiling"),
-    all(feature = "table-busybox-dialog", feature = "table-ramfs"),
-    all(feature = "table-busybox-dialog", feature = "table-cprobe"),
-    all(feature = "table-busybox-dialog", feature = "table-busybox"),
-))]
-compile_error!("init builds with one table feature at a time");
+/// The table features of the build: one at most.
+const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
+    + cfg!(feature = "table-cycle") as usize
+    + cfg!(feature = "table-ceiling") as usize
+    + cfg!(feature = "vz") as usize
+    + cfg!(feature = "table-ramfs") as usize
+    + cfg!(feature = "table-cprobe") as usize
+    + cfg!(feature = "table-busybox") as usize
+    + cfg!(feature = "table-busybox-dialog") as usize
+    + cfg!(feature = "table-posix-abi") as usize
+    + cfg!(feature = "table-posix-abi-vz") as usize
+    + cfg!(feature = "table-busybox-dialog-vz") as usize
+    + cfg!(feature = "table-rtbench-vz") as usize;
+const _: () = assert!(
+    matches!(TABLE_FEATURES, 0 | 1),
+    "init builds with one table feature at a time"
+);
 
 /// The table init starts (spec 13.4): the one of the build's feature, or
 /// the one that ships. The tables are constants, so a build carries only
@@ -585,7 +652,10 @@ compile_error!("init builds with one table feature at a time");
     feature = "table-cprobe",
     feature = "table-busybox",
     feature = "table-busybox-dialog",
-    feature = "table-posix-abi"
+    feature = "table-posix-abi",
+    feature = "table-posix-abi-vz",
+    feature = "table-busybox-dialog-vz",
+    feature = "table-rtbench-vz"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -600,6 +670,12 @@ pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "vz")]
 pub const TABLE: &[Record] = vz::TABLE;
+#[cfg(feature = "table-posix-abi-vz")]
+pub const TABLE: &[Record] = vz::POSIX_ABI_TABLE;
+#[cfg(feature = "table-busybox-dialog-vz")]
+pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
+#[cfg(feature = "table-rtbench-vz")]
+pub const TABLE: &[Record] = vz::RTBENCH_TABLE;
 #[cfg(feature = "table-test")]
 pub const TABLE: &[Record] = test::TABLE;
 #[cfg(feature = "table-cycle")]
@@ -635,6 +711,9 @@ mod tests {
             bindings: &[],
             connects: &[],
             args: &[],
+            dma: &[],
+            quiesce: &[],
+            trusted: false,
         }
     }
 
@@ -1096,12 +1175,117 @@ mod tests {
         }
     }
 
+    /// A DMA object belongs to a trusted service and has the size of a
+    /// contiguous object; its address counts among the own arguments; a
+    /// write that stops the device lies on a word of a window of the
+    /// record.
+    #[test]
+    fn dma_objects_and_quiesce_writes_have_limits() {
+        const DMA: Dma = Dma {
+            name: "dma",
+            size: 16 * PAGE,
+            uncached: true,
+        };
+        const STOP: Write = Write {
+            window: "rtc",
+            offset: 4,
+            bits: 32,
+            value: 0,
+            settled: u32::MAX,
+        };
+        let driver = |dma: &'static [Dma], trusted| Record {
+            windows: &[RTC],
+            dma,
+            quiesce: &[STOP],
+            trusted,
+            ..service("driver", 40, 40)
+        };
+        assert!(check_one(driver(&[DMA], true)).is_ok());
+        let byte = Record {
+            quiesce: &[Write {
+                offset: 0x15,
+                bits: 8,
+                ..STOP
+            }],
+            ..driver(&[DMA], true)
+        };
+        assert!(check_one(byte).is_ok());
+        assert_eq!(
+            check_one(driver(&[DMA], false)).map_err(|e| e.to_string()),
+            Err(
+                "driver has the DMA object dma: a trusted service's, of a power of two of pages up to 1024"
+                    .into()
+            )
+        );
+        for size in [3 * PAGE, 2048 * PAGE, PAGE + 1, 0] {
+            let d: &'static [Dma] = Box::leak(Box::new([Dma { size, ..DMA }]));
+            assert!(
+                matches!(check_one(driver(d, true)), Err(TableError::Dma { .. })),
+                "{size:#x}"
+            );
+        }
+        let args = Box::leak(Box::new([7; OWN_ARGS_MAX - 7]));
+        let crowded = Record {
+            args: &args[..],
+            ..driver(&[DMA], true)
+        };
+        assert!(matches!(check_one(crowded), Err(TableError::Args { .. })));
+        for stop in [
+            Write {
+                window: "regs",
+                ..STOP
+            },
+            Write { offset: 2, ..STOP },
+            Write { bits: 16, ..STOP },
+            Write {
+                bits: 8,
+                value: 0x100,
+                ..STOP
+            },
+            Write {
+                offset: PAGE - 2,
+                ..STOP
+            },
+            Write {
+                offset: PAGE,
+                ..STOP
+            },
+        ] {
+            let quiesce: &'static [Write] = Box::leak(Box::new([stop]));
+            let r = Record {
+                quiesce,
+                ..driver(&[DMA], true)
+            };
+            assert!(
+                matches!(check_one(r), Err(TableError::Quiesce { .. })),
+                "{stop:?}"
+            );
+        }
+    }
+
     /// The tables of the images (spec 15.2): the one that ships and the
     /// test table pass, in the order of their dependencies; the two bad
     /// tables are refused with the reasons xtask looks for in their runs.
     #[test]
     fn the_tables_of_the_images_pass_or_are_refused() {
         assert_eq!(order_of(normal::TABLE), ["uart", "shell"]);
+        assert_eq!(order_of(vz::TABLE), ["uart", "shell"]);
+        assert_eq!(
+            order_of(vz::POSIX_ABI_TABLE),
+            [
+                "uart",
+                "ramfs",
+                "posix",
+                "clock",
+                "clock-peer",
+                "posix-abi-probe"
+            ]
+        );
+        assert_eq!(
+            order_of(vz::BUSYBOX_DIALOG_TABLE),
+            ["uart", "ramfs", "busybox-probe"]
+        );
+        assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
         assert_eq!(
             order_of(test::TABLE),
             [
@@ -1128,6 +1312,8 @@ mod tests {
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
+            vz::POSIX_ABI_TABLE,
+            vz::BUSYBOX_DIALOG_TABLE,
         ];
         for table in tables {
             assert!(check(table).is_ok());

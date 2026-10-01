@@ -201,6 +201,9 @@ mod tests {
             bindings: &[],
             connects: &[],
             args: &[],
+            dma: &[],
+            quiesce: &[],
+            trusted: false,
         }
     }
 

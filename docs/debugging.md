@@ -99,6 +99,49 @@
    the device tree parks the processor instead, and the run ends at
    xtask's deadline.
 
+8. Until the kernel has read the device tree it knows no port and
+   writes nothing to one (spec 3.2): what it says goes into its log, and
+   the line `stafeto <version> booting` and anything after it come out
+   once the port of the tree is known. A panic before that, such as
+   `no device tree in x0` when the ELF is booted instead of the Image,
+   stays in the log in RAM. Read it through QEMU's monitor: start QEMU
+   with `-monitor tcp:127.0.0.1:4444,server=on,wait=off`, then
+   `printf 'pmemsave 0x40200000 0x100000 ram.bin\n' | nc 127.0.0.1 4444`
+   saves the kernel's image with its log into `ram.bin` in QEMU's
+   working directory. xtask reads the records out of such a file
+   (`xtask/src/ring.rs`) and does so in its check of the ELF boot.
+
+## On Apple VZ
+
+`cargo xtask vz` boots the image that ships with a boot image whose
+`init` starts `services/virtio-console`, the driver of the Virtio PCI
+console, under the console's name `uart`. VZ gives the machine no PL011,
+so the kernel never has a port there: its boot report and its log reach
+the terminal through the driver, as the PL011's driver shows them on
+QEMU. A kernel panic shows nothing and powers the machine off; the
+runner says `guest stopped: the kernel powered off (end of run or
+panic)` on its output, and a VZ probe that sees it before its end fails
+with a hint. The same kernel image shows the panic under HVF (`cargo
+xtask run --hvf`, `cargo xtask hvf`), and an early panic also stays in
+the log in RAM, which QEMU's monitor can save (item 8 above). VZ cannot
+keep the log across a reset: at PSCI `SYSTEM_RESET` it starts the
+machine again with RAM cleared. The runner keeps the guest's input open
+when its own stdin ends; a receive of no bytes, the end of the host's
+input, leaves the driver going with output alone.
+
+The console is device 5 of bus 0, its INTA is SPI 0x25 (INTID 69,
+level) through the tree's `interrupt-map`, and the driver checks the
+function's ID before it writes there. `cargo xtask console-restart-vz`
+crashes the driver: `init` resets the Virtio device (`device_status`
+0, read back until 0) and clears the function's command word through
+windows of its own before it lets the driver's DMA object go; VZ keeps
+a device's DMA going with bus mastering off, so the reset is what stops
+it. Init's `dma-watch` build then reads the old object for 300 ms while
+xtask types, and says it stayed unchanged. A stop that does not settle
+leaves the object with init for good and the driver broken. The new
+instance resets the device again before it turns bus mastering on and
+reports the command word it found, 0.
+
 ## Address from a panic
 
 A panic prints the call stack as addresses. lldb gives the function name

@@ -35,8 +35,6 @@ mod syscall;
 mod testpoint;
 mod thread;
 mod timer;
-#[cfg(feature = "vz")]
-mod vz_driver;
 
 use boot::Boot;
 use bootimg::Program;
@@ -48,7 +46,6 @@ use kcore::time::Clock;
 #[unsafe(no_mangle)]
 extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     arch::exceptions::init();
-    console::init();
     kprintln!("stafeto {} booting", env!("CARGO_PKG_VERSION"));
     let boot = boot::collect(dtb_pa, kernel_pa);
     psci::set_conduit(boot.info.psci);
@@ -56,12 +53,8 @@ extern "C" fn kernel_main(dtb_pa: usize, kernel_pa: usize) -> ! {
     // RAM in the GiBs the boot page tables map; the kernel tables are built
     // from that RAM, and the rest of RAM joins the allocator once they are live.
     let rest = mm::phys::init(boot);
-    #[cfg(feature = "vz")]
-    vz_driver::prepare_dma();
     mm::kmap::switch_to_kernel_tables(boot);
     console::set_port(&boot.info);
-    #[cfg(feature = "vz")]
-    vz_driver::init(boot.kernel_pa);
     let init = boot::init_program(boot);
     arch::user::init();
     mm::phys::add(rest.as_slice());
