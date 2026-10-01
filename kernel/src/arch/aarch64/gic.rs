@@ -134,8 +134,9 @@ fn init_v2(cpu: Region) {
     let lines = gic::lines(read(dist + GICD_TYPER));
     LINE_COUNT.store(lines, Ordering::Relaxed);
     reset_lines(dist, 0..lines);
+    let targets = gic::spi_targets(read(dist + GICD_ITARGETSR));
     for intid in (FIRST_SPI..lines).step_by(4) {
-        write(dist + gic::byte(GICD_ITARGETSR, intid).0, 0x0101_0101);
+        write(dist + gic::byte(GICD_ITARGETSR, intid).0, targets);
     }
     write(dist + GICD_CTLR, CTLR_ENABLE);
     let cpu = base(&CPU);

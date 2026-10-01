@@ -39,3 +39,11 @@ pub fn ttbr0_el1() -> u64 {
 pub fn id_aa64mmfr0_el1() -> u64 {
     read_sysreg!("id_aa64mmfr0_el1")
 }
+
+pub fn id_aa64pfr0_el1() -> u64 {
+    read_sysreg!("id_aa64pfr0_el1")
+}
+
+pub fn id_aa64pfr1_el1() -> u64 {
+    read_sysreg!("id_aa64pfr1_el1")
+}

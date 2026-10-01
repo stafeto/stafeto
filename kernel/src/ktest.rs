@@ -338,6 +338,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::object_pays_its_budget_back_to_the_payer,
     ),
     (
+        "upcall_request_refuses_a_stopped_thread",
+        calls::upcall_request_refuses_a_stopped_thread,
+    ),
+    (
+        "upcall_return_keeps_unimplemented_flags_off",
+        calls::upcall_return_keeps_unimplemented_flags_off,
+    ),
+    (
+        "long_call_polls_end_the_entry_interval",
+        calls::long_call_polls_end_the_entry_interval,
+    ),
+    (
         "mem_create_over_the_quota_is_no_memory",
         calls::mem_create_over_the_quota_is_no_memory,
     ),
@@ -636,14 +648,15 @@ fn every_line_is_group_1(_: &Boot) -> Result<(), &'static str> {
     )
 }
 
-/// Every shared line goes to this CPU (spec 9): GICD_ITARGETSR holds CPU
-/// interface 0 on a GICv2, or reads as zero where it has one CPU interface
-/// only (IHI 0048B 4.3.12, as QEMU's); GICD_IROUTER holds this CPU's
-/// affinity on a GICv3, and not IROUTER_ANY.
+/// Every shared line goes to this CPU (spec 9): GICD_ITARGETSR holds this
+/// CPU's interface bit on a GICv2, the byte of the banked GICD_ITARGETSR0
+/// (line 0's, kcore::gic::spi_targets), or reads as zero where it has one
+/// CPU interface only (IHI 0048B 4.3.12, as QEMU's); GICD_IROUTER holds this
+/// CPU's affinity on a GICv3, and not IROUTER_ANY.
 fn shared_lines_route_to_this_cpu(_: &Boot) -> Result<(), &'static str> {
     let here = match gic::version() {
         GicVersion::V2 if gic::cpu_interfaces() == 1 => 0,
-        GicVersion::V2 => 1,
+        GicVersion::V2 => u64::from(kcore::gic::spi_targets(gic::route(0) as u32) & 0xff),
         GicVersion::V3 => kcore::gic::irouter(registers::mpidr_el1()),
     };
     check(

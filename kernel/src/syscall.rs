@@ -511,9 +511,12 @@ fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
         // call held afterwards.
         unsafe { thread::drop_long(thread, cause(thread)) };
         cleanup::count_portion(entry);
+        sched::entry_polled();
         if arch::irq_pending() {
             return restart(thread);
         }
+        // The poll above ended the entry's interval; the call starts one.
+        sched::entry_started();
         return dispatch(thread, number);
     }
     match long {
@@ -600,11 +603,14 @@ fn run_portions(
             done => return Some((done.map(|_| ()), start)),
         }
         cleanup::count_portion(start);
+        sched::entry_polled();
         if arch::irq_pending() {
             restart(thread);
             return None;
         }
         start = clock::now();
+        // The next portion, up to the next poll, is an interval of its own.
+        sched::entry_started();
     }
 }
 
@@ -1005,20 +1011,9 @@ fn thread_upcall_control(mut thread: NonNull<Thread>, a: &Args) -> Result<Values
     Ok(Values::new(&[was, pc, flags]))
 }
 fn thread_upcall_request(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    let mut target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
-    if matches!(
-        thread::info(target).state,
-        abi::ThreadState::Stopped | abi::ThreadState::Ended
-    ) {
-        return Err(Error::BadState);
-    }
-    // SAFETY: the handle retains the target. No user code runs during the call.
-    let target_ref = unsafe { target.as_mut() };
-    let wake = target_ref.upcall.request()? && target_ref.waits.is_some();
-    if wake {
-        // SAFETY: as above; the existing bounded interruption releases wait references.
-        unsafe { sched::interrupt(target, cause(thread)) }?;
-    }
+    let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
+    // SAFETY: the caller's handle holds the target through the request.
+    unsafe { sched::request_upcall(target, cause(thread)) }?;
     Ok(Values::none())
 }
 

@@ -2018,6 +2018,156 @@ fn with_interrupt_pending(
     result
 }
 
+/// thread_upcall_request looks at its target under the scheduler's lock
+/// (sched::request_upcall): a stopped thread with an enabled entry is
+/// BAD_STATE and keeps no request, so its first run enters no handler.
+pub fn upcall_request_refuses_a_stopped_thread(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let t = c.thread;
+        // SAFETY: the thread is the test's and never runs.
+        let upcall = || unsafe { &mut (*t.as_ptr()).upcall };
+        upcall().bind(USER_VA as u64).map_err(|_| "bind failed")?;
+        upcall()
+            .control(abi::UpcallControl::Enable.raw())
+            .map_err(|_| "enable failed")?;
+        // SAFETY: the test holds the thread.
+        let stopped = unsafe { t.as_ref() }.sched.state() == State::Stopped;
+        // SAFETY: as above.
+        let result = unsafe { sched::request_upcall(t, CAUSE) };
+        let entered = upcall().prepare(USER_VA as u64, 0, false);
+        check(
+            stopped && result == Err(Error::BadState) && entered.is_none(),
+            "a request for a stopped thread was taken",
+        )
+    })
+}
+
+/// thread_upcall_return takes only the flags this processor implements
+/// (kcore::upcall::user_pstate, read once at boot): a context with DIT,
+/// TCO, SSBS or BTYPE set where ID_AA64PFR0_EL1 or ID_AA64PFR1_EL1 has no
+/// such feature (all four on QEMU's A53 and A72) is INVALID_ARGS and
+/// changes nothing, and one with NZCV alone comes back with those flags.
+pub fn upcall_return_keeps_unimplemented_flags_off(_: &Boot) -> Result<(), &'static str> {
+    use kcore::upcall::{BRANCH_TYPE, DIT, NZCV, SSBS, TCO};
+    let (pfr0, pfr1) = (
+        crate::arch::registers::id_aa64pfr0_el1(),
+        crate::arch::registers::id_aa64pfr1_el1(),
+    );
+    let absent = |register: u64, shift: u32| (register >> shift) & 0xf == 0;
+    with_caller(|c| {
+        thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
+        c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
+        let control = Call::ThreadUpcallControl.number();
+        c.succeeds(control, &[abi::UpcallControl::Enable.raw()], &[1, 0, 0])?;
+        let pc = (USER_VA + PAGE) as u64;
+        let mut t = c.thread;
+        // SAFETY: the caller's thread is the test's and never runs.
+        let upcall = unsafe { &mut t.as_mut().upcall };
+        upcall.request().map_err(|_| "no request")?;
+        check(
+            upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            "the caller's thread did not enter its handler",
+        )?;
+        c.succeeds(control, &[abi::UpcallControl::Take.raw()], &[1, pc, 0])?;
+        let returns = |flags| {
+            let mut context = [0u64; 102];
+            context[31] = 0x80_1000;
+            context[32] = pc;
+            context[33] = flags;
+            context[35] = BUFFER;
+            thread::write_words(c.thread, abi::UPCALL_CONTEXT_OFFSET, &context);
+            c.call(Call::ThreadUpcallReturn.number(), &[])
+        };
+        let unimplemented = [
+            (DIT, absent(pfr0, 48)),
+            (TCO, absent(pfr1, 8)),
+            (SSBS, absent(pfr1, 4)),
+            (BRANCH_TYPE, absent(pfr1, 0)),
+        ];
+        // The handler still runs after each: a refused return changes nothing.
+        for (flag, _) in unimplemented.iter().filter(|(_, absent)| *absent) {
+            check(
+                returns(NZCV | flag)[0] == Error::InvalidArgs.code(),
+                "a context with a flag this processor lacks came back",
+            )?;
+        }
+        returns(NZCV);
+        // SAFETY: as above.
+        let regs = unsafe { &c.thread.as_ref().regs };
+        check(
+            regs.spsr == NZCV && regs.elr == pc,
+            "a context with NZCV alone did not come back",
+        )
+    })
+}
+
+/// A long call polls for an interrupt between two portions (spec 7.7);
+/// that poll ends the interval of its entry (KERNEL_STATS x8) and the next
+/// portion starts one of its own: in `run_portions` on the call's own
+/// entries, and in `go_on` on the entry of another call that gives the
+/// long call up, which then runs that call in an interval of its own.
+pub fn long_call_polls_end_the_entry_interval(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let kept = sched::entry_timing();
+        sched::set_entry_timing((0, 0));
+        sched::entry_started();
+        let begun = timer::now();
+        let made = make_memory(c, 20);
+        let whole = timer::now() - begun;
+        let (start, longest) = sched::entry_timing();
+        sched::set_entry_timing((0, kept.1.max(longest)));
+        let (h, _) = made?;
+        check(
+            longest != 0 && longest < whole,
+            "the portions of mem_create did not end the entry interval",
+        )?;
+        check(
+            start > begun,
+            "a portion of mem_create after a poll started no interval",
+        )?;
+        c.close(h)?;
+        cleanup::drain();
+        with_interrupt_pending(|| {
+            c.call(Call::MemCreate.number(), &[20 * PAGE_SIZE, 0]);
+            check(
+                thread::long(c.thread).is_some(),
+                "mem_create did not stop after a portion",
+            )?;
+            sched::entry_started();
+            c.again(Call::ClockNow.number());
+            check(
+                thread::long(c.thread).is_none(),
+                "another call did not give the long call up",
+            )?;
+            check(
+                !sched::entry_unpolled(),
+                "giving a long call up did not end the entry interval",
+            )
+        })?;
+        with_interrupt_pending(|| {
+            c.call(Call::MemCreate.number(), &[20 * PAGE_SIZE, 0]);
+            check(
+                thread::long(c.thread).is_some(),
+                "mem_create did not stop after a portion",
+            )
+        })?;
+        sched::entry_started();
+        let begun = timer::now();
+        c.again(Call::ClockNow.number());
+        let (start, _) = sched::entry_timing();
+        // As exit_loop polls after the call.
+        sched::entry_polled();
+        check(
+            thread::long(c.thread).is_none(),
+            "another call did not give the long call up",
+        )?;
+        check(
+            start >= begun,
+            "the call after a long call given up ran in no interval",
+        )
+    })
+}
+
 /// mem_create stops at the caller's resources (spec 7.3, 11): with its
 /// quota spent it fails with NO_MEMORY for a page of its pool of memory
 /// objects, and with LIMIT_REACHED first when its table is full; with a

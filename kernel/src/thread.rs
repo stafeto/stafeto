@@ -39,6 +39,10 @@ pub struct Thread {
     pub regs: UserRegs,
     /// Saved while the thread does not run.
     pub fp: FpRegs,
+    /// The handler entry (spec 11). A request from another thread
+    /// changes it under the scheduler's lock (sched::request_upcall); the
+    /// thread itself changes it without that lock (bind, control, the entry
+    /// in `run`) while the kernel runs on one core (#8).
     pub upcall: kcore::upcall::State,
     /// What the scheduler keeps in the thread: the base priority, which
     /// `create` or thread_set_priority gave, the boost of a notification or
@@ -344,7 +348,7 @@ pub fn restore_upcall(mut thread: NonNull<Thread>) -> Result<(), Error> {
     let sp = word(31);
     let pc = word(32);
     let flags = word(33);
-    kcore::upcall::validate_context(pc, sp, flags, word(35), t.regs.tpidrro)?;
+    kcore::upcall::validate_context(pc, sp, flags, user::user_pstate(), word(35), t.regs.tpidrro)?;
     for index in 0..31 {
         t.regs.x[index] = word(index);
     }

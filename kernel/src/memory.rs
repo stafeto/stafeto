@@ -203,9 +203,14 @@ pub fn create_boot(
 }
 
 /// What device windows may not touch on the machine `info` describes
-/// (kcore::window::forbidden), once at boot, before init starts.
+/// (kcore::window::forbidden), with the VZ build's PCI windows
+/// (vz_driver::DEVICES), once at boot, before init starts.
 pub fn forbid(info: &BootInfo) {
-    if FORBIDDEN.set(window::forbidden(info)).is_err() {
+    #[cfg(feature = "vz")]
+    let devices = &crate::vz_driver::DEVICES[..];
+    #[cfg(not(feature = "vz"))]
+    let devices = &[];
+    if FORBIDDEN.set(window::forbidden(info, devices)).is_err() {
         panic!("memory::forbid runs once");
     }
 }

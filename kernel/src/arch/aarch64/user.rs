@@ -10,6 +10,7 @@
 
 use super::{mmu, registers};
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use kcore::sysreg::{self, CNTKCTL_EL1, CPACR_EL1, MDSCR_EL1, SCTLR_EL1, SPSR_EL0T};
 
 /// A program's registers, saved on every entry from EL0 and loaded on the
@@ -101,6 +102,16 @@ pub fn load_fp(regs: &FpRegs) {
     unsafe { fp_load(regs) }
 }
 
+/// The PSTATE bits a program may set on its way back from a handler
+/// (kcore::upcall::user_pstate), read from the ID registers once at boot:
+/// a hypervisor may trap every read of them (HCR_EL2.TID3).
+static USER_PSTATE: AtomicU64 = AtomicU64::new(0);
+
+/// The PSTATE bits a program may set on its way back from a handler.
+pub fn user_pstate() -> u64 {
+    USER_PSTATE.load(Ordering::Relaxed)
+}
+
 /// Opens EL0 (kcore::sysreg): FP and SIMD, the virtual counter, and the
 /// SCTLR_EL1 bits for programs; keeps the debug channel and the
 /// performance monitors closed, whose registers are UNKNOWN after reset.
@@ -135,6 +146,10 @@ pub fn init() {
             )
         };
     }
+    USER_PSTATE.store(
+        kcore::upcall::user_pstate(registers::id_aa64pfr0_el1(), registers::id_aa64pfr1_el1()),
+        Ordering::Relaxed,
+    );
     // TLB entries may hold the old WXN.
     mmu::flush_tlb();
 }
