@@ -231,6 +231,12 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
     }
 }
 
+/// The thread on the CPU: the one whose call or fault the kernel serves
+/// now; None while the kernel runs a portion of cleanup or idles.
+pub fn running() -> Option<NonNull<Thread>> {
+    SCHED.lock().s.running()
+}
+
 /// Interrupt only an existing send, receive, or accepted-request wait.
 /// The thread remains alive, retaining its number and message buffer. No
 /// interrupt is queued for a future call. Wait references and moved handles

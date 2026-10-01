@@ -641,6 +641,14 @@ pub unsafe fn exit(t: NonNull<Thread>) {
     }
 }
 
+/// Whether `t` waits in send, in receive or for a reply (spec 6.1), read
+/// with the scheduler locked: the stage Threads counts its work by it.
+pub fn waits(t: NonNull<Thread>) -> bool {
+    // SAFETY: the caller holds the thread, or its process's list does;
+    // only the field is read.
+    sched::locked(|_| unsafe { (*t.as_ptr()).waits.is_some() })
+}
+
 /// The count of references to `thread`, through the raw pointer.
 ///
 /// # Safety

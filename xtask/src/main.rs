@@ -387,11 +387,13 @@ const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 const UPCALL_ROWS: [&str; 5] = ["interrupt", "bind", "control", "request", "return"];
 /// The rows of the line of `teardown_portions_are_measured`, in its order
 /// (spec 15.3): the term B of the out-of-tree measurement is the longest of them.
-const TEARDOWN_ROWS: [&str; 7] = [
+const TEARDOWN_ROWS: [&str; 9] = [
     "buffers",
     "shell",
-    "stop_threads",
-    "stop_senders",
+    "end_call",
+    "threads_ready",
+    "teardown_threads",
+    "child_threads",
     "session_buffers",
     "session_handles",
     "threads",
@@ -3772,10 +3774,13 @@ mod tests {
     /// B is the longest teardown row, never the count of threads.
     #[test]
     fn blocking_time_is_the_longest_row_but_threads() {
-        let ticks = [5, 15, 24, 42, 20, 21, 128];
-        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("stop_senders", 42));
-        let ticks = [5, 15, 24, 42, 20, 21, 50_000];
-        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("stop_senders", 42));
+        let ticks = [5, 15, 1, 24, 42, 30, 20, 21, 128];
+        assert_eq!(
+            blocking_time(&TEARDOWN_ROWS, &ticks),
+            ("teardown_threads", 42)
+        );
+        let ticks = [5, 15, 1, 24, 18, 30, 20, 21, 50_000];
+        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("child_threads", 30));
     }
 
     /// A child's panic is its place and its message on two whole lines, and

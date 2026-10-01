@@ -14,6 +14,16 @@ use crate::syscall;
 /// all.
 const SHELL_PORTION: usize = 8;
 
+/// The work a portion of the stage Threads does, at most (spec 7.7): a
+/// thread that waits in send, in receive or for a reply leaves its queue
+/// and lets go what its wait held, WAIT_UNITS units of work; any other
+/// thread leaves the scheduler in one unit. 32 senders or 64 ready threads
+/// take one portion.
+const THREADS_PORTION: usize = 64;
+
+/// The units of work of a thread that waits in IPC (channel::cancel).
+const WAIT_UNITS: usize = 2;
+
 /// Clients of one level a portion of the stage Replies wakes, at most
 /// (spec 7.7).
 const REPLIES_PORTION: usize = 32;
@@ -35,10 +45,11 @@ const EXIT_BITS: u64 = 1;
 /// Where the teardown of a process stands (spec 7.7). A process is whole
 /// until it ends; then the cleanup queue holds it, with a reference of its
 /// own, and each portion takes one step of its stage, in the order of
-/// STAGES, with how far it came kept in the process. Stop, Replies,
-/// Children, Handles, Space and Shell take as many portions as their
-/// steps; the others one. The stage Stop runs at S, the higher of the
-/// process's ceiling and R (`level`); Replies at the higher of R and its
+/// STAGES, with how far it came kept in the process. Threads, Stop,
+/// Replies, Children, Handles, Space and Shell take as many portions as
+/// their steps; the others one. The stages Threads and Stop run at S, the
+/// higher of the process's ceiling and R (`level`); Replies at the higher
+/// of R and its
 /// top client; the others at R, but for Shell, which runs at the level of
 /// the last reference. After the stage Notify the queue lets its reference
 /// go.
@@ -46,9 +57,20 @@ const EXIT_BITS: u64 = 1;
 pub enum Stage {
     /// No teardown began: the process lives.
     Whole,
+    /// Only for a process with threads when it ends: its threads, from the
+    /// cursor `threads_next` on, leave the scheduler for good (sched::exit),
+    /// THREADS_PORTION units of work a portion, and each loses the
+    /// kernel's reference, which may queue it for cleanup at R; they stay
+    /// in the list until the stage Buffers. At S none of them runs
+    /// meanwhile: no effective priority is above the ceiling, the cleanup
+    /// queue wins over threads of its level (kcore::sched::Scheduler::pick),
+    /// and the fast path of send hands off to none of them
+    /// (Scheduler::can_hand_off). A thread that leaves the list moves the
+    /// cursor on (`remove_thread`).
+    Threads,
     /// Only for a process with children when it ends: a child a portion,
     /// the one at the cursor `stop_next`, ends, killed, at R, if it lives,
-    /// which stops its threads and begins its own teardown (`end`). At S
+    /// which begins its own teardown (`end`), its stage Threads first. At S
     /// no thread of a descendant runs meanwhile: none has an effective
     /// priority above its process's ceiling, and no ceiling of a
     /// descendant is above this one's (spec 4, 8).
@@ -104,7 +126,8 @@ pub enum Stage {
 }
 
 /// The stages of a teardown in the order they run (spec 7.7).
-const STAGES: [Stage; 10] = [
+const STAGES: [Stage; 11] = [
+    Stage::Threads,
     Stage::Stop,
     Stage::Replies,
     Stage::Children,
@@ -117,13 +140,38 @@ const STAGES: [Stage; 10] = [
     Stage::Shell,
 ];
 
-/// The stage after `stage`, which is one of STAGES but the last.
+// STAGES lists the stages in the order of their declaration after Whole.
+const _: () = {
+    let mut i = 0;
+    while i < STAGES.len() {
+        assert!(STAGES[i] as usize == i + 1);
+        i += 1;
+    }
+};
+
+/// The stage after `stage`, which is one of STAGES but the last: the one
+/// at the index of its discriminant there. O(1).
 fn after(stage: Stage) -> Stage {
-    let i = STAGES
-        .iter()
-        .position(|&s| s == stage)
-        .expect("a stage of a teardown");
-    STAGES[i + 1]
+    STAGES[stage as usize]
+}
+
+/// `stage`, or the first stage after it with work, when it is Threads or
+/// Stop and its cursor names nothing: no portion goes to an empty one.
+///
+/// # Safety
+/// `p` is alive; only the cursors are read.
+unsafe fn with_work(p: *mut Process, stage: Stage) -> Stage {
+    // SAFETY: the caller's promise.
+    unsafe {
+        let mut stage = stage;
+        if stage == Stage::Threads && (*p).threads_next.is_none() {
+            stage = Stage::Stop;
+        }
+        if stage == Stage::Stop && (*p).stop_next.is_none() {
+            stage = Stage::Replies;
+        }
+        stage
+    }
 }
 
 /// Queues the shell of a process for its last portion unless a child
@@ -145,9 +193,9 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
 
 /// The teardown of a process that just ended begins at `cause` (spec
 /// 7.7): R grows to it, and the cleanup queue takes a reference of its
-/// own and queues the process for its first stage: Stop at S for a
-/// process with children, Replies otherwise (`stage_level`). It takes the
-/// scheduler's lock.
+/// own and queues the process for its first stage: Threads at S for a
+/// process with threads in its list, Stop at S for one with children,
+/// Replies otherwise (`stage_level`). It takes the scheduler's lock.
 ///
 /// # Safety
 /// `process` is alive, whole, and in no queue.
@@ -161,11 +209,8 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
         );
         (*p).level = (*p).level.max(cause);
         (*p).stop_next = (*p).children;
-        (*p).stage = if (*p).children.is_some() {
-            Stage::Stop
-        } else {
-            Stage::Replies
-        };
+        (*p).threads_next = (*p).threads;
+        (*p).stage = with_work(p, Stage::Threads);
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
         refs(process).take();
@@ -175,7 +220,8 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
 }
 
 /// The level the stage of `process` runs at (spec 7.7): S, the higher of
-/// its ceiling and R, at the stage Stop; the higher of R and the top level
+/// its ceiling and R, at the stages Threads and Stop; the higher of R and
+/// the top level
 /// of its accepted requests at the stage Replies, read under the
 /// scheduler's lock; R at the others. O(1).
 ///
@@ -186,7 +232,7 @@ unsafe fn stage_level(process: NonNull<Process>) -> u8 {
     // SAFETY: the caller's promise.
     unsafe {
         match (*p).stage {
-            Stage::Stop => (*p).ceiling.max((*p).level),
+            Stage::Threads | Stage::Stop => (*p).ceiling.max((*p).level),
             Stage::Replies => {
                 let top = sched::locked(|k| accepted(process, k.s).top());
                 top.map_or((*p).level, |top| top.max((*p).level))
@@ -264,6 +310,8 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     let mut first = None;
     let done = match stage {
         Stage::Whole => unreachable!("a whole process in the cleanup queue"),
+        // SAFETY: the process is alive, and so are the threads in its list.
+        Stage::Threads => unsafe { stop_threads(process, r) },
         // SAFETY: the process is alive, and its children in the list too.
         Stage::Stop => unsafe { stop_child(process, r) },
         // SAFETY: the process is alive; its clients wait.
@@ -300,7 +348,12 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
             return;
         }
     };
-    let next = if done { after(stage) } else { stage };
+    let next = match (done, stage) {
+        (false, _) => stage,
+        // SAFETY: the process is alive; only the cursor is read.
+        (true, Stage::Threads) => unsafe { with_work(p, Stage::Stop) },
+        (true, _) => after(stage),
+    };
     // SAFETY: the process is alive; the queue's reference goes last, and
     // nothing uses the process afterwards; the child is alive while it is
     // in the list.
@@ -315,6 +368,36 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
         if let Some(child) = first {
             wait_for_child(child, r);
         }
+    }
+}
+
+/// The stage Threads: from the thread at the cursor on, each thread of
+/// the list leaves the scheduler (sched::exit) and loses the kernel's
+/// reference at `level` (R), WAIT_UNITS units of work for a thread that
+/// waits in IPC, which also leaves its queue and lets go what its wait
+/// held, one for any other, THREADS_PORTION units a portion; a thread goes
+/// into the portion only when its units fit. True once the cursor is past
+/// the last thread.
+///
+/// # Safety
+/// `process` is alive and at its stage Threads.
+unsafe fn stop_threads(process: NonNull<Process>, level: u8) -> bool {
+    let p = process.as_ptr();
+    let mut work = 0;
+    // SAFETY: the caller's promise; a thread in the list is alive, since a
+    // release only queues it, and its portion takes it out of the list
+    // first.
+    unsafe {
+        while let Some(t) = (*p).threads_next {
+            let units = if thread::waits(t) { WAIT_UNITS } else { 1 };
+            if work + units > THREADS_PORTION {
+                break;
+            }
+            work += units;
+            (*p).threads_next = (*t.as_ptr()).siblings.and_then(|s| s.next);
+            sched::exit(t, level);
+        }
+        (*p).threads_next.is_none()
     }
 }
 

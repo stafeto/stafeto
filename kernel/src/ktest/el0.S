@@ -174,6 +174,17 @@ el0_count_until:
     cbz     x3, 1b
     svc     #SVC_DONE
 
+// Adds 1 to the word at x0 x1 times, the count in x2, then ends.
+.global el0_count_to
+el0_count_to:
+    mov     x3, x1
+1:  ldr     x2, [x0]
+    add     x2, x2, #1
+    str     x2, [x0]
+    subs    x3, x3, #1
+    b.ne    1b
+    svc     #SVC_DONE
+
 // Spins until x1 counter ticks have passed, then yields. Ends with the
 // word at x0 read before the yield in x3, after it in x4, and the yield's
 // result in x0.

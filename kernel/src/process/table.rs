@@ -127,17 +127,23 @@ pub fn take_handles(mut process: NonNull<Process>, values: &[u64]) -> Moving {
     moving
 }
 
-/// Puts the handles of a message into the table of `process`, which lives,
-/// once `reserve_handles` made room for them (spec 6.1): each keeps its
-/// rights and brings its reference. Returns the values of the new handles
-/// and their info words (abi::msgbuf::info), in the order of the message.
+/// Puts the handles of a message into the table of `process` once
+/// `reserve_handles` made room for them (spec 6.1): each keeps its rights
+/// and brings its reference. The process lives, or it ended and is at its
+/// stage Threads: a thread of it that still waits in receive or for a
+/// reply takes them, and its stage Handles lets them go. Returns the
+/// values of the new handles and their info words (abi::msgbuf::info), in
+/// the order of the message.
 pub fn put_handles(
     process: NonNull<Process>,
     moving: Moving,
 ) -> [(u64, u64); abi::MESSAGE_HANDLES] {
+    // SAFETY: the caller holds a reference to the process; only the field
+    // is read.
+    let stage = unsafe { (*process.as_ptr()).stage };
     assert!(
-        check_alive(process).is_ok(),
-        "a handle went into the table of a process that ended"
+        matches!(stage, Stage::Whole | Stage::Threads),
+        "a handle went into the table of a process past its stage Threads"
     );
     // SAFETY: the caller holds a reference to the process.
     let (handles, mut chunks) = unsafe { table(process) };

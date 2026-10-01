@@ -896,8 +896,8 @@ fn new_child(
 }
 
 /// process_kill(x0 process with MANAGE, x1 level): the process ends,
-/// reason «killed» (spec 11): its threads stop in whatever state they are,
-/// its descendants stop in a wave at S, and the cleanup queue takes what it
+/// reason «killed» (spec 11): its threads stop in whatever state they are
+/// and its descendants in a wave, both at S, and the cleanup queue takes what it
 /// holds apart at R, the higher of the level and the priority of its exit
 /// notification (spec 7.7). Level 0 is the caller's effective priority:
 /// the teardown runs before the caller runs again, and the call returns
@@ -907,7 +907,7 @@ fn new_child(
 /// 0, and its teardown is raised to the level (process::hasten). Killing
 /// the caller's own process never returns. The checks in the order of
 /// spec 11: a level above 63 (INVALID_ARGS), the handle, then a level above
-/// the caller's effective priority (ACCESS_DENIED). O(1) besides the end.
+/// the caller's effective priority (ACCESS_DENIED). O(1).
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let level = match a[1] {
         0 => None,
