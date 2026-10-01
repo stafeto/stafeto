@@ -22,6 +22,7 @@
 #![no_std]
 
 pub mod console;
+pub mod dma;
 pub mod fs;
 pub mod handle;
 pub mod loader;

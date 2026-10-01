@@ -18,8 +18,8 @@
 //! the test init (spec 15.2).
 
 use super::{
-    CAUSE, CHILD_QUOTA, PAGE, QUOTA, check, nothing_pending, read_user, registers, translates,
-    wait_for_timer,
+    CAUSE, CHILD_QUOTA, PAGE, QUOTA, check, give_frames_back, nothing_pending, read_user,
+    registers, translates, wait_for_timer,
 };
 use crate::arch::{self, gic, timer};
 use crate::boot::Boot;
@@ -49,7 +49,9 @@ use kcore::PAGE_SIZE;
 use kcore::args::Desc;
 use kcore::handles::CHUNK;
 use kcore::layout::{GIB, LINEAR_BASE};
-use kcore::paging::{Attrs, MAIR_DEVICE, PXN, UXN, attr_index, page_descriptor};
+use kcore::paging::{
+    Attrs, MAIR_DEVICE, MAIR_NORMAL, MAIR_UNCACHED, PXN, UXN, attr_index, page_descriptor,
+};
 use kcore::sched::State;
 use kcore::sync::Lock;
 use kcore::token::MAX_COUNT;
@@ -2287,6 +2289,291 @@ pub fn new_object_is_zeroed(_: &Boot) -> Result<(), &'static str> {
             "the new object took none of the frames of the one before",
         )?;
         check(zero, "a frame of a new object holds what was there before")
+    })
+}
+
+/// A contiguous object of `pages` pages (abi::MEM_CONTIGUOUS, with
+/// abi::MEM_UNCACHED when `uncached`) that `c` makes with mem_create
+/// through a copy of the system resource with DEVICE, entry after entry
+/// until the call ends: x0 is 0, x1 the handle, with
+/// abi::DMA_MEMORY_RIGHTS, x2 the block's physical address, and nothing
+/// else changes. Returns the handle, the object and the address.
+fn make_contiguous(
+    c: &Caller,
+    pages: u64,
+    uncached: bool,
+) -> Result<(Handle, NonNull<Memory>, u64), &'static str> {
+    let n = Call::MemCreate.number();
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let flags = abi::MEM_CONTIGUOUS | if uncached { abi::MEM_UNCACHED } else { 0 };
+    let args = [pages * PAGE_SIZE, flags, r.0];
+    let mut got = c.call(n, &args);
+    while thread::long(c.thread).is_some() {
+        got = c.again(n);
+    }
+    c.close(r)?;
+    let mut want = with_marks(&args);
+    want[0] = 0;
+    want[1] = got[1];
+    want[2] = got[2];
+    if got != want || got[1] == 0 {
+        kprintln!("mem_create with {args:x?}: x0-x9 are {got:x?}");
+        return Err("a contiguous mem_create failed");
+    }
+    let h = Handle(got[1]);
+    // SAFETY: the caller's process is the test's.
+    let process = unsafe { c.process.as_ref() };
+    let m = process.lookup(h, abi::DMA_MEMORY_RIGHTS, Object::memory);
+    let exec = process.lookup(h, Rights::MAP_EXEC, Object::memory);
+    check(
+        exec.is_err(),
+        "the handle of a contiguous object carries MAP_EXEC",
+    )?;
+    Ok((
+        h,
+        m.map_err(|_| "the handle of a contiguous object lacks DMA_MEMORY_RIGHTS")?,
+        got[2],
+    ))
+}
+
+/// A contiguous object is one block of the frame allocator (spec 7.3):
+/// x2 of mem_create, its physical address, is aligned to the object's
+/// size, page i of the object is the frame i pages past it, and the
+/// object is whole, for 1, 16 and 1024 pages, uncached or not.
+pub fn contiguous_object_is_one_aligned_block(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        for (pages, uncached) in [(1, false), (16, true), (1024, false)] {
+            let (h, m, pa) = make_contiguous(c, pages, uncached)?;
+            let size = pages * PAGE_SIZE;
+            let in_order =
+                (0..pages as usize).all(|i| memory::frame(m, i) == pa + i as u64 * PAGE_SIZE);
+            let info = memory::info(m);
+            c.close(h)?;
+            cleanup::drain();
+            check(
+                pa != 0 && pa.is_multiple_of(size),
+                "a contiguous object is not aligned to its size",
+            )?;
+            check(
+                in_order,
+                "the pages of a contiguous object are not its block in order",
+            )?;
+            check(
+                info == MemoryInfo {
+                    size,
+                    pages,
+                    mappings: 0,
+                },
+                "a contiguous object is not whole",
+            )?;
+        }
+        Ok(())
+    })
+}
+
+/// A contiguous object pays for its block alone and gives it back whole
+/// (spec 7.3, 7.5): an object of 64 pages charges its payer 64 pages, no
+/// node of a list, and takes 64 frames; once its handle closes and its
+/// cleanup ran, which gives the block back in one portion, the payer's
+/// used quota and the free frames are what they were, to the byte.
+pub fn contiguous_object_pays_its_block_back(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        // The table's first chunk, so that no call below takes one.
+        let resource = c.insert(Object::Resource, Rights::NONE)?;
+        cleanup::drain();
+        let objects = memory::in_use();
+        let (used, free) = (process::quota(c.process).used(), phys::free_frames());
+        let (h, _, _) = make_contiguous(c, 64, true)?;
+        let charged = process::quota(c.process).used() - used;
+        let taken = free - phys::free_frames();
+        c.close(h)?;
+        cleanup::portion();
+        check(
+            memory::in_use() == objects,
+            "the cleanup of a contiguous object took more than one portion",
+        )?;
+        cleanup::drain();
+        c.close(resource)?;
+        check(
+            charged == 64 * PAGE_SIZE && taken == 64,
+            "a contiguous object did not charge its block alone",
+        )?;
+        check(
+            process::quota(c.process).used() == used && phys::free_frames() == free,
+            "a contiguous object did not give its block back",
+        )
+    })
+}
+
+/// A contiguous mem_create whose block is missing, though the quota
+/// covers it, fails with NO_MEMORY (spec 7.3): with every free block of
+/// two frames or more taken away, a contiguous object of 2 pages fails,
+/// x0 alone, and leaves the payer's used quota, the free frames and the
+/// live objects as they were; once a block of two frames is free again,
+/// the same call makes the object.
+pub fn missing_block_is_no_memory_without_a_charge(_: &Boot) -> Result<(), &'static str> {
+    let objects = memory::in_use();
+    with_caller(|c| {
+        let (h, _) = make_memory(c, 1)?;
+        c.close(h)?;
+        cleanup::drain();
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let args = [2 * PAGE_SIZE, abi::MEM_CONTIGUOUS, r.0];
+        let held = hold_blocks_of_two_frames_and_more();
+        let (used, free) = (process::quota(c.process).used(), phys::free_frames());
+        let refused = c.fails(Call::MemCreate.number(), &args, Error::NoMemory);
+        let unchanged = process::quota(c.process).used() == used
+            && phys::free_frames() == free
+            && memory::in_use() == objects;
+        give_frames_back(held);
+        refused?;
+        check(unchanged, "a missing block left a charge or an object")?;
+        c.close(r)?;
+        let (made, _, _) = make_contiguous(c, 2, false)?;
+        c.close(made)?;
+        cleanup::drain();
+        Ok(())
+    })?;
+    check(
+        memory::in_use() == objects,
+        "an object of the test stayed in its pool",
+    )
+}
+
+/// Takes every free block of order 1 and up from the frame allocator, so
+/// that only single frames are left free; the blocks are linked as
+/// `hold_frames_but` links them, for `give_frames_back`.
+fn hold_blocks_of_two_frames_and_more() -> u64 {
+    let mut guard = phys::FRAMES.lock();
+    let frames = guard.as_mut().expect("frame allocator");
+    // SAFETY: the blocks are the test's until `give_frames_back`.
+    let mut mem = unsafe { phys::LinearMem::new() };
+    let mut first = u64::MAX;
+    for order in (1..=kcore::frames::MAX_ORDER).rev() {
+        while let Some(pa) = frames.alloc(order) {
+            kcore::frames::PhysMem::write(&mut mem, pa, first);
+            kcore::frames::PhysMem::write(&mut mem, pa + 8, u64::from(order));
+            first = pa;
+        }
+    }
+    first
+}
+
+/// The mapping of an uncached object is Normal Non-cacheable (spec 7.4,
+/// [G6]): the leaf descriptor of its page has AttrIndx 2, and that of a
+/// contiguous object without abi::MEM_UNCACHED AttrIndx 0, R and RW.
+pub fn uncached_object_maps_as_normal_non_cacheable(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let (t, th) = target_of(c)?;
+        let result = [(false, MAIR_NORMAL), (true, MAIR_UNCACHED)]
+            .into_iter()
+            .try_for_each(|(uncached, index)| {
+                let (h, _, pa) = make_contiguous(c, 1, uncached)?;
+                let seen = [Access::Read, Access::ReadWrite].map(|access| {
+                    map_whole(c, th, h, 1, USER_VA, access)
+                        .map(|()| process::translate(t, USER_VA))
+                        .and_then(|seen| unmap_whole(c, th, 1, USER_VA).map(|()| seen))
+                });
+                c.close(h)?;
+                for got in seen {
+                    let (frame, desc) = got?.ok_or("the object's page does not translate")?;
+                    check(
+                        frame == pa && attr_index(desc) == index,
+                        "a contiguous object maps with the wrong memory type",
+                    )?;
+                }
+                Ok(())
+            });
+        c.close(th)?;
+        release_target(t);
+        result
+    })
+}
+
+/// The portions of a contiguous uncached mem_create of
+/// abi::MAX_CONTIGUOUS_PAGES pages and of the cleanup of its block, in
+/// counter ticks, with an interrupt pending all along so that each entry
+/// takes one portion: on a processor with caches (HVF) `dc civac` writes
+/// back what the zeroing dirtied, which -icount does not see [G18]. The
+/// test prints `dma portions ticks: create=... release=...`, the longest
+/// entry and the cleanup portion; no number fails it (spec 15.3).
+pub fn contiguous_portions_are_timed(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let flags = abi::MEM_CONTIGUOUS | abi::MEM_UNCACHED;
+        let args = [abi::MAX_CONTIGUOUS_PAGES * PAGE_SIZE, flags, r.0];
+        let (mut create, mut got) = (0, [0; 10]);
+        with_interrupt_pending(|| {
+            let start = timer::now();
+            got = c.call(n, &args);
+            create = timer::now() - start;
+            while thread::long(c.thread).is_some() {
+                let start = timer::now();
+                got = c.again(n);
+                create = create.max(timer::now() - start);
+            }
+            Ok(())
+        })?;
+        c.close(r)?;
+        check(got[0] == 0, "the timed contiguous mem_create failed")?;
+        c.close(Handle(got[1]))?;
+        let start = timer::now();
+        cleanup::portion();
+        let release = timer::now() - start;
+        cleanup::drain();
+        kprintln!("dma portions ticks: create={create} release={release}");
+        Ok(())
+    })
+}
+
+/// A contiguous mem_create goes in portions of memory::CREATE_PORTION
+/// pages, which zero and clean each page once (spec 7.3, 7.7): with the
+/// kernel's timer pending all along, each entry of a call for 32 pages
+/// takes one portion; a mark written after the first portion into page 0
+/// is still there once the call ended, and the object is whole.
+pub fn contiguous_create_resumes_without_zeroing_again(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::MemCreate.number();
+        let r = c.insert(Object::Resource, Rights::DEVICE)?;
+        let args = [32 * PAGE_SIZE, abi::MEM_CONTIGUOUS, r.0];
+        let mut filled = [0; 4];
+        let mut got = [0; 10];
+        let mut marked = None;
+        with_interrupt_pending(|| {
+            got = c.call(n, &args);
+            for f in &mut filled {
+                let Some(Long::Create(m)) = thread::long(c.thread) else {
+                    break;
+                };
+                *f = memory::filled(m);
+                if marked.is_none() {
+                    let word = (LINEAR_BASE + memory::frame(m, 0) as usize) as *mut u64;
+                    // SAFETY: the frame is the object's, which the test's
+                    // thread holds, and the linear map reaches it.
+                    unsafe { word.write_volatile(0x5A5A_5A5A) };
+                    marked = Some(word);
+                }
+                got = c.again(n);
+            }
+            Ok(())
+        })?;
+        c.close(r)?;
+        // SAFETY: as above; the object is whole and the test's handle holds it.
+        let kept = marked.is_some_and(|w| unsafe { w.read_volatile() } == 0x5A5A_5A5A);
+        let h = Handle(got[1]);
+        // SAFETY: the caller's process is the test's.
+        let m = unsafe { c.process.as_ref() }.lookup(h, abi::DMA_MEMORY_RIGHTS, Object::memory);
+        let whole = m.is_ok_and(|m| memory::info(m).pages == 32);
+        c.close(h)?;
+        check(
+            filled == [8, 16, 24, 0] && got[0] == 0,
+            "a contiguous object did not grow a portion an entry",
+        )?;
+        check(kept, "a later portion zeroed a page again")?;
+        check(whole, "the handle does not name a whole object of 32 pages")
     })
 }
 
@@ -4529,11 +4816,17 @@ fn frames_free(pa: u64, order: u8) {
 /// - first_map: the first entry of mem_map RX of 8 pages across a bound of
 ///   REGION with no table on either side, six tables: the last mapping slot
 ///   of that process, and the first one of a new process, with the paid page
-///   of its mapping table.
+///   of its mapping table;
+/// - dma_create: the longest entry of a contiguous uncached mem_create of
+///   abi::MAX_CONTIGUOUS_PAGES pages, the first with the block, each with
+///   memory::CREATE_PORTION pages zeroed and cleaned out of the data cache;
+/// - dma_release: the portion of cleanup of a contiguous object of one
+///   page, which gives its block back in one free.
 ///
 /// The test prints them in one line, `memory portions ticks: create=...
 /// map=... map_exec=... unmap=... protect=... protect_exec=... release=...
-/// first_map=...`, which xtask shows; no number fails it (spec 15.3).
+/// first_map=... dma_create=... dma_release=...`, which xtask shows; no
+/// number fails it (spec 15.3).
 #[cfg(feature = "icount")]
 pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     let objects = memory::in_use();
@@ -4554,9 +4847,10 @@ pub fn memory_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
         ticks
     })?;
     let release = with_caller(release_ticks)?;
+    let (dma_create, dma_release) = with_caller(dma_ticks)?;
     let [map, map_exec, unmap, protect, protect_exec, crowded] = changes;
     kprintln!(
-        "memory portions ticks: create={create} create_high={create_high} map={map} map_exec={map_exec} unmap={unmap} protect={protect} protect_exec={protect_exec} release={release} first_map={}",
+        "memory portions ticks: create={create} create_high={create_high} map={map} map_exec={map_exec} unmap={unmap} protect={protect} protect_exec={protect_exec} release={release} first_map={} dma_create={dma_create} dma_release={dma_release}",
         crowded.max(fresh)
     );
     check(
@@ -4764,6 +5058,26 @@ fn release_ticks(c: &Caller) -> Result<u64, &'static str> {
     });
     apart.rejoin();
     ticks
+}
+
+/// dma_create and dma_release of `memory_portions_are_measured`.
+#[cfg(feature = "icount")]
+fn dma_ticks(c: &Caller) -> Result<(u64, u64), &'static str> {
+    let r = c.insert(Object::Resource, Rights::DEVICE)?;
+    let flags = abi::MEM_CONTIGUOUS | abi::MEM_UNCACHED;
+    let args = [abi::MAX_CONTIGUOUS_PAGES * PAGE_SIZE, flags, r.0];
+    let created = timed_entries(c, Call::MemCreate.number(), &args);
+    c.close(r)?;
+    let (first, rest, got) = created?;
+    c.close(Handle(got[1]))?;
+    cleanup::drain();
+    let (h, _, _) = make_contiguous(c, 1, true)?;
+    c.close(h)?;
+    let start = timer::now();
+    cleanup::portion();
+    let release = timer::now() - start;
+    cleanup::drain();
+    Ok((first.max(rest), release))
 }
 
 /// Device windows in their worst cases, under -icount (spec 15.3): the

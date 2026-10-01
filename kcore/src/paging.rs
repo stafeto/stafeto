@@ -108,6 +108,16 @@ impl Attrs {
         }
     }
 
+    /// The attributes of the pages of an uncached memory object
+    /// (abi::MEM_UNCACHED) with `access` (spec 7.4, [G6]): those of `user`,
+    /// but Normal Non-cacheable (AttrIndx 2).
+    pub const fn user_uncached(access: Access) -> Attrs {
+        Attrs {
+            memory: Memory::Uncached,
+            ..Attrs::user(access)
+        }
+    }
+
     /// The attributes of the pages of a device window with `access` (spec
     /// 7.4, [G6], [G9]): Device-nGnRE (AttrIndx 1), EL0 access, read-only
     /// for R, and never executable at either level, whatever `access` says.
@@ -688,6 +698,18 @@ mod tests {
             assert_eq!(d & SH_INNER, 0);
             let read_only = d & AP_READ_ONLY != 0;
             assert_eq!(read_only, access != Access::ReadWrite);
+        }
+    }
+
+    #[test]
+    fn user_uncached_attrs_differ_from_user_attrs_only_in_the_mair_entry() {
+        for access in [Access::Read, Access::ReadWrite] {
+            let plain = page_descriptor(0x5000_0000, Attrs::user(access));
+            let uncached = page_descriptor(0x5000_0000, Attrs::user_uncached(access));
+            assert!(Attrs::user_uncached(access).is_valid());
+            assert_eq!(attr_index(plain), MAIR_NORMAL);
+            assert_eq!(attr_index(uncached), MAIR_UNCACHED);
+            assert_eq!(plain & !(0b111 << 2), uncached & !(0b111 << 2));
         }
     }
 

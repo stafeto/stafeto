@@ -299,7 +299,7 @@ const ICOUNT_TESTS: [&str; 14] = [
 const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
 /// The rows of the line of `memory_portions_are_measured`, in its order
 /// (spec 15.3).
-const MEMORY_PORTION_ROWS: [&str; 9] = [
+const MEMORY_PORTION_ROWS: [&str; 11] = [
     "create",
     "create_high",
     "map",
@@ -309,6 +309,8 @@ const MEMORY_PORTION_ROWS: [&str; 9] = [
     "protect_exec",
     "release",
     "first_map",
+    "dma_create",
+    "dma_release",
 ];
 /// The rows of the line of `timer_firing_is_measured`, in its order (spec
 /// 15.3).
@@ -480,7 +482,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 224;
+const INIT_TESTS: u32 = 226;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -3629,16 +3631,16 @@ mod tests {
         assert!(ticks_of(&[], what, &ROUND_TRIP_ROWS).is_err());
     }
 
-    /// The line of the portions of memory objects gives its nine rows in
+    /// The line of the portions of memory objects gives its eleven rows in
     /// order, and the round trip's does not pass for it.
     #[test]
-    fn memory_portions_line_gives_nine_rows() {
+    fn memory_portions_line_gives_eleven_rows() {
         let what = "memory portions";
         let line = "memory portions ticks: create=1 create_high=2 map=3 map_exec=4 unmap=5 protect=6 \
-                    protect_exec=7 release=8 first_map=9";
+                    protect_exec=7 release=8 first_map=9 dma_create=10 dma_release=11";
         let lines = [line.to_string()];
         let ticks = ticks_of(&lines, what, &MEMORY_PORTION_ROWS);
-        assert_eq!(ticks, Ok((1..=9).collect()));
+        assert_eq!(ticks, Ok((1..=11).collect()));
         for bad in [
             "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7",
             "memory portions ticks: map=2 create=1 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7 first_map=8",

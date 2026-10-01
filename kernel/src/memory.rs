@@ -26,8 +26,18 @@
 //! kernel (kcore::window), which programs map as Device-nGnRE and never
 //! execute (`attrs`, spec 7.4). A window over a page of the console's port
 //! takes the port from the kernel from its making to its last portion of
-//! cleanup (console::window_made, console::window_gone, spec 3.2).
+//! cleanup (console::window_made, console::window_gone, spec 3.2). A
+//! contiguous object (`create_contiguous`, abi::MEM_CONTIGUOUS) owns one
+//! block of the frame allocator, which `create` takes whole and `fill`
+//! zeroes and cleans out of the data cache a portion at a time, for a
+//! device's DMA; an uncached one maps as Normal Non-cacheable everywhere
+//! (abi::MEM_UNCACHED, spec 7.3, 7.4). Its cleanup gives the block back in
+//! one portion. The kernel's linear map stays cacheable over the block, as
+//! Linux leaves it for dma_alloc_coherent: after `fill` the kernel never
+//! touches the block's frames, so prefetches through it can only bring in
+//! clean lines of what `fill` cleaned [G6, G18].
 
+use crate::arch::cache;
 use crate::cleanup::{self, Item};
 use crate::mm::phys::{self, Frame, LinearMem};
 use crate::object::{Live, Object, Refs};
@@ -79,6 +89,15 @@ enum Backing {
     /// The `pages` pages of device registers from `base`: a device window
     /// (spec 9), which no frame allocator knows.
     Device { base: u64, pages: usize },
+    /// The block of 2^`order` frames from `base`, its own, of which the
+    /// first `filled` pages are zeroed and out of the data cache; its
+    /// mappings are Normal Non-cacheable when `uncached` (spec 7.3).
+    Contiguous {
+        base: u64,
+        order: u8,
+        uncached: bool,
+        filled: usize,
+    },
 }
 
 // SAFETY: memory objects are reached under the kernel's rules (spec 8.1):
@@ -168,6 +187,26 @@ pub fn fill(m: NonNull<Memory>) -> bool {
     let (backing, budget) = unsafe { (&mut (*m.as_ptr()).backing, &mut (*m.as_ptr()).budget) };
     match backing {
         Backing::Owned(list) => list.fill(&mut Budget(budget), CREATE_PORTION),
+        Backing::Contiguous {
+            base,
+            order,
+            filled,
+            ..
+        } => {
+            let start = *filled;
+            let end = (start + CREATE_PORTION).min(1 << *order);
+            let pa = *base + start as u64 * PAGE_SIZE;
+            for i in 0..(end - start) as u64 {
+                // SAFETY: the frames are the object's, which nothing maps
+                // until it is whole.
+                unsafe { phys::zero(pa + i * PAGE_SIZE, 0) };
+            }
+            // Both kinds: a dirty zero line evicted after a device wrote the
+            // frame would overwrite what it wrote [G18].
+            cache::clean_invalidate_frames(pa, end - start);
+            *filled = end;
+            end == 1 << *order
+        }
         Backing::Boot { .. } | Backing::Device { .. } => true,
     }
 }
@@ -200,6 +239,71 @@ pub fn create_boot(
     pages: usize,
 ) -> Result<NonNull<Memory>, Error> {
     create_over(payer, Backing::Boot { base, pages })
+}
+
+/// A contiguous object (spec 7.3, abi::MEM_CONTIGUOUS): one block of
+/// 2^`order` frames, `order` up to kcore::frames::MAX_ORDER, aligned to its
+/// size, whose mappings are Normal Non-cacheable when `uncached`; `payer`,
+/// the process of the thread that makes it, pays for it. First a place in
+/// the payer's pool of memory objects, then the budget, 2^`order` pages
+/// with no node of a list, charged to the payer's quota at once
+/// (NO_MEMORY), then the block, taken whole from the frame allocator and
+/// charged to the budget (NO_MEMORY when no free block is big enough,
+/// though its frames may be free apart; the charge goes back then, and
+/// nothing stays but a page of the pool). Its frames are as the allocator
+/// left them until `fill` zeroes them in portions. The object holds the
+/// payer's shell; the caller gets the first reference. O(MAX_ORDER).
+pub fn create_contiguous(
+    payer: NonNull<Process>,
+    order: u8,
+    uncached: bool,
+) -> Result<NonNull<Memory>, Error> {
+    let bytes = PAGE_SIZE << order;
+    let memory = Memory {
+        backing: Backing::Contiguous {
+            base: 0,
+            order,
+            uncached,
+            filled: 0,
+        },
+        budget: Account::new(bytes),
+        refs: Refs::one(),
+        mappings: 0,
+        payer,
+        cleanup: Item::new(),
+    };
+    let m = process::paid_alloc(payer, memory)?;
+    // SAFETY: the object was just made, and nothing else refers to it.
+    let budget = unsafe { &mut (*m.as_ptr()).budget };
+    let block = process::charge(payer, bytes)
+        .and_then(|()| phys::alloc(order, budget).inspect_err(|_| process::refund(payer, bytes)));
+    match block {
+        Ok(frame) => {
+            // SAFETY: as above; only the field is borrowed.
+            if let Backing::Contiguous { base, .. } = unsafe { &mut (*m.as_ptr()).backing } {
+                *base = frame.into_raw();
+            }
+        }
+        Err(e) => {
+            // SAFETY: as above; the object owns no frame.
+            unsafe { process::paid_free(payer, m) };
+            return Err(e);
+        }
+    }
+    process::retain_shell(payer);
+    LIVE.made();
+    Ok(m)
+}
+
+/// The physical address of the block of `m`, a contiguous object the
+/// caller holds (spec 7.3); None for any other object.
+pub fn contiguous_base(m: NonNull<Memory>) -> Option<u64> {
+    // SAFETY: the caller holds a reference to the object; only the field is
+    // read.
+    match unsafe { &(*m.as_ptr()).backing } {
+        Backing::Contiguous { base, .. } => Some(*base),
+        _ => None,
+    }
 }
 
 /// What device windows may not touch on the machine `info` describes
@@ -267,6 +371,7 @@ pub fn pages(m: NonNull<Memory>) -> usize {
     match unsafe { &(*m.as_ptr()).backing } {
         Backing::Owned(list) => list.pages(),
         Backing::Boot { pages, .. } | Backing::Device { pages, .. } => *pages,
+        Backing::Contiguous { order, .. } => 1 << *order,
     }
 }
 
@@ -280,12 +385,16 @@ pub fn is_window(m: NonNull<Memory>) -> bool {
 
 /// The attributes of the pages of `m`, which the caller holds, mapped with
 /// `access` (spec 7.4): Device-nGnRE and never executable for a device
-/// window, the attributes of a program's pages otherwise.
+/// window, Normal Non-cacheable for an uncached object, the attributes of
+/// a program's pages otherwise. The object fixes the type, so no frame is
+/// ever mapped with two cacheabilities at EL0 [G6, G18].
 pub fn attrs(m: NonNull<Memory>, access: Access) -> Attrs {
-    if is_window(m) {
-        Attrs::user_device(access)
-    } else {
-        Attrs::user(access)
+    // SAFETY: the caller holds a reference to the object; only the field is
+    // read.
+    match unsafe { &(*m.as_ptr()).backing } {
+        Backing::Device { .. } => Attrs::user_device(access),
+        Backing::Contiguous { uncached: true, .. } => Attrs::user_uncached(access),
+        _ => Attrs::user(access),
     }
 }
 
@@ -303,7 +412,9 @@ pub fn frame(m: NonNull<Memory>, i: usize) -> u64 {
             let mem = unsafe { LinearMem::new() };
             list.frame(&mem, i)
         }
-        Backing::Boot { base, .. } | Backing::Device { base, .. } => base + i as u64 * PAGE_SIZE,
+        Backing::Boot { base, .. }
+        | Backing::Device { base, .. }
+        | Backing::Contiguous { base, .. } => base + i as u64 * PAGE_SIZE,
     }
 }
 
@@ -316,6 +427,7 @@ pub fn info(m: NonNull<Memory>) -> MemoryInfo {
     let (backing, mappings) = unsafe { (&(*m.as_ptr()).backing, (*m.as_ptr()).mappings) };
     let owned = match backing {
         Backing::Owned(list) => list.filled(),
+        Backing::Contiguous { filled, .. } => *filled,
         Backing::Boot { .. } | Backing::Device { .. } => 0,
     };
     MemoryInfo {
@@ -405,6 +517,13 @@ pub unsafe fn clean(m: NonNull<Memory>, level: u8) {
         Backing::Boot { .. } => true,
         Backing::Device { base, pages } => {
             crate::console::window_gone(*base, *pages as u64);
+            true
+        }
+        Backing::Contiguous { base, order, .. } => {
+            // SAFETY: nothing maps the block any more and its TLB entries
+            // went with its mappings; it is the object's. No cache
+            // maintenance: the next holder zeroes it through the cache.
+            unsafe { phys::free(Frame::from_raw(*base, *order), budget) };
             true
         }
     };

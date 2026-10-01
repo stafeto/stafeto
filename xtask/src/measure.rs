@@ -37,6 +37,7 @@ fn measured_line(line: &str) -> bool {
         "timer portions ticks:",
         "interrupt path ticks:",
         "device window ticks:",
+        "dma portions ticks:",
         "KERNEL_STATS:",
         "call maximum ticks:",
         "fp switch ticks:",
@@ -218,6 +219,7 @@ mod tests {
         assert!(text.ends_with("normal build ticks: null=271\nipc round trip ticks: fast=1\n"));
         assert!(measured_line("memory portions ticks: create=1"));
         assert!(measured_line("upcall ticks: interrupt=1"));
+        assert!(measured_line("dma portions ticks: create=1 release=2"));
         assert!(!measured_line("TEST sample ok"));
         let lines = [
             "ipc round trip ticks: null=1 fast=30 slow=60",

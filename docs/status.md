@@ -16,7 +16,11 @@ POSIX layer covers, and which commands check each piece. It describes
   pays for its kernel memory from its quota. Memory objects take all their
   pages when they are made; a process maps them R, RW or RX into its own
   space or into a process whose handle with `MANAGE` it holds. The
-  segments and the stack of `init` are memory objects too.
+  segments and the stack of `init` are memory objects too. A holder of
+  `DEVICE` makes a contiguous object for a device's DMA: one aligned block
+  whose physical address comes back with the handle, never executable,
+  and uncached in every mapping when asked; `rt::dma` cleans and
+  invalidates cache lines from EL0.
 - **Execution:** EL0 threads with registers and FP/SIMD saved on every
   switch; 64 priority levels, round robin with a 4 ms quantum and FIFO;
   tickless timer preemption.

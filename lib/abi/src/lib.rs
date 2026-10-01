@@ -5,11 +5,13 @@
 //! 6, 8, 11, 12, 13.3): handle layout, rights, system call numbers and
 //! where their arguments and results go, what `receive` returns, the
 //! layout of a thread's message buffer, init's first handles, scheduling
-//! policies and error codes; and the time scale of the kernel and the
-//! programs (`time`).
+//! policies and error codes; the time scale of the kernel and the
+//! programs (`time`); and the data cache lines a maintenance covers
+//! (`cache`).
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod cache;
 pub mod time;
 
 /// A process's name for a kernel object (spec 5.1): the low 16 bits index
@@ -110,6 +112,12 @@ pub const MEMORY_RIGHTS: Rights = Rights(
         | Rights::TRANSFER.0,
 );
 
+/// Rights of the handle that `mem_create` with MEM_CONTIGUOUS returns
+/// (spec 7.3): its pages are a device's buffers, mapped R or RW and handed
+/// to a driver, and never run, so a mapping RX fails with ACCESS_DENIED.
+pub const DMA_MEMORY_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+
 /// Rights of the handle that `device_window_create` returns (spec 5.2,
 /// 7.4): a window maps R or RW and travels; the registers of a device are
 /// never run.
@@ -160,6 +168,21 @@ pub const MAX_MAPPINGS: u32 = 128;
 /// Bytes of the largest memory object (spec 7.3): `mem_create` takes whole
 /// pages from one page to this, 1 GiB.
 pub const MAX_MEMORY: u64 = 1 << 30;
+
+/// Bit 0 of the flags of `mem_create` (spec 7.3): the object is one block
+/// of the frame allocator, 2^k pages for k from 0 to 10, aligned to its
+/// size, for a device's DMA. x2 names a system resource with DEVICE, and
+/// x2 returns the block's physical address.
+pub const MEM_CONTIGUOUS: u64 = 1 << 0;
+
+/// Bit 1 of the flags of `mem_create`, only with MEM_CONTIGUOUS (spec
+/// 7.3, 7.4): every mapping of the object is Normal Non-cacheable, so a
+/// device and the program see the same bytes without cache maintenance.
+pub const MEM_UNCACHED: u64 = 1 << 1;
+
+/// Pages of the largest MEM_CONTIGUOUS object: 1 024, 4 MiB, the largest
+/// block of the frame allocator.
+pub const MAX_CONTIGUOUS_PAGES: u64 = 1 << 10;
 
 /// What a mapping lets a program do with its pages (spec 7.4): read, read
 /// and write, or read and execute. A register holds the sum of the bits
@@ -1446,6 +1469,13 @@ mod tests {
             WINDOW_RIGHTS,
             Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER
         );
+        assert_eq!(DMA_MEMORY_RIGHTS, WINDOW_RIGHTS);
+    }
+
+    #[test]
+    fn mem_create_flags_are_bits_0_and_1() {
+        assert_eq!((MEM_CONTIGUOUS, MEM_UNCACHED), (1, 2));
+        assert_eq!(MAX_CONTIGUOUS_PAGES, 1024);
     }
 
     #[test]

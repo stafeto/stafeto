@@ -355,6 +355,30 @@ const TESTS: &[(&str, TestFn)] = &[
     ),
     ("new_object_is_zeroed", calls::new_object_is_zeroed),
     (
+        "contiguous_object_is_one_aligned_block",
+        calls::contiguous_object_is_one_aligned_block,
+    ),
+    (
+        "contiguous_object_pays_its_block_back",
+        calls::contiguous_object_pays_its_block_back,
+    ),
+    (
+        "missing_block_is_no_memory_without_a_charge",
+        calls::missing_block_is_no_memory_without_a_charge,
+    ),
+    (
+        "uncached_object_maps_as_normal_non_cacheable",
+        calls::uncached_object_maps_as_normal_non_cacheable,
+    ),
+    (
+        "contiguous_create_resumes_without_zeroing_again",
+        calls::contiguous_create_resumes_without_zeroing_again,
+    ),
+    (
+        "contiguous_portions_are_timed",
+        calls::contiguous_portions_are_timed,
+    ),
+    (
         "create_resumes_where_it_stopped",
         calls::create_resumes_where_it_stopped,
     ),
