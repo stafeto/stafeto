@@ -5,11 +5,11 @@
 //! 13.2): the entry point and one loadable segment per protection.
 //! Programs are static AArch64 executables without thread-local storage,
 //! linked with 4 KiB pages, each segment on pages of its own and no RELRO
-//! split (.cargo/config.toml); `Program::parse` of the written program
-//! checks the rest. xtask builds the boot image with it; a loader of
-//! programs from a disk will read them with it too.
+//! split (.cargo/config.toml); `Program::check` checks the rest. xtask
+//! builds the boot image with it; a loader of programs from a disk will
+//! read them with it too.
 
-use crate::{Part, Program, Segment, u32_at, u64_at};
+use crate::{Error, Part, Program, Segment, u32_at, u64_at};
 use core::fmt;
 
 const ET_EXEC: u16 = 2;
@@ -49,6 +49,8 @@ pub enum ElfError {
     Twice(Part),
     /// The bytes of the segment of this part run past the end of the file.
     BytesPastEnd(Part),
+    /// The program breaks a rule of the simple format (`Program::check`).
+    Program(Error),
 }
 
 impl fmt::Display for ElfError {
@@ -77,13 +79,13 @@ impl fmt::Display for ElfError {
             ElfError::BytesPastEnd(part) => {
                 write!(f, "the {part} segment's bytes run past the end of the file")
             }
+            ElfError::Program(e) => write!(f, "the program: {e}"),
         }
     }
 }
 
-/// The program in `elf`, with a stack of `stack_size` bytes; its segments
-/// borrow the file's bytes. The program is not checked here:
-/// Program::parse of the written program checks it.
+/// The program in `elf`, with a stack of `stack_size` bytes, checked
+/// (`Program::check`); its segments borrow the file's bytes.
 pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
     if elf.len() < 64 || elf[..4] != *b"\x7fELF" {
         return Err(ElfError::NotElf);
@@ -136,11 +138,13 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
             bytes,
         };
     }
-    Ok(Program {
+    let program = Program {
         entry,
         stack_size,
         segments,
-    })
+    };
+    program.check().map_err(ElfError::Program)?;
+    Ok(program)
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -296,6 +300,36 @@ mod tests {
             };
             assert_eq!(program(&f, 0x1000), Err(why));
         }
+    }
+
+    /// The program of an ELF file keeps the rules of the simple format:
+    /// each fault of Program::check comes back as it is.
+    #[test]
+    fn the_program_is_checked() {
+        let at = |i: usize, field: usize| 64 + PHDR_SIZE * i + field;
+        let fault = |f: &[u8], stack, why| {
+            assert_eq!(program(f, stack), Err(ElfError::Program(why)), "{why}");
+        };
+        fault(&layout(), 0x1001, Error::BadStack(0x1001));
+        let mut f = layout();
+        put(&mut f, at(1, 16), &0x20_1008u64.to_le_bytes());
+        fault(&f, 0x1000, Error::Misaligned(Part::Code));
+        let mut f = layout();
+        put(&mut f, at(2, 40), &2u64.to_le_bytes());
+        fault(&f, 0x1000, Error::FileOverMemory(Part::Data));
+        let mut f = layout();
+        put(&mut f, at(0, 16), &0u64.to_le_bytes());
+        fault(&f, 0x1000, Error::Outside(Part::Rodata));
+        let mut f = layout();
+        put(&mut f, at(2, 16), &0x20_1000u64.to_le_bytes());
+        fault(&f, 0x1000, Error::Overlap(Part::Code, Part::Data));
+        let mut f = layout();
+        put(&mut f, 24, &0x20_2000u64.to_le_bytes());
+        fault(&f, 0x1000, Error::BadEntry(0x20_2000));
+        assert_eq!(
+            ElfError::Program(Error::BadEntry(0x20_2000)).to_string(),
+            format!("the program: {}", Error::BadEntry(0x20_2000))
+        );
     }
 
     #[test]

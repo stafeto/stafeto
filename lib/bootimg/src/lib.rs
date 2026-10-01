@@ -321,7 +321,6 @@ impl<'a> Program<'a> {
             });
         }
         let stack_size = u32_at(bytes, 12);
-        let room_end = room_end(stack_size).ok_or(Error::BadStack(stack_size))?;
         let mut segments = [Segment::EMPTY; 3];
         for part in Part::ALL {
             let at = SEGMENTS_AT + SEGMENT_SIZE * part as usize;
@@ -337,42 +336,70 @@ impl<'a> Program<'a> {
                 }
                 continue;
             }
-            if !vaddr.is_multiple_of(PAGE_SIZE) || !offset.is_multiple_of(PAGE_SIZE) {
+            if !offset.is_multiple_of(PAGE_SIZE) {
                 return Err(Error::Misaligned(part));
             }
-            if file_size > mem_size {
-                return Err(Error::FileOverMemory(part));
-            }
             let end = inside(bytes, offset, file_size)?;
-            let fits =
-                vaddr >= PAGE_SIZE && vaddr.checked_add(mem_size).is_some_and(|e| e <= room_end);
-            if !fits {
-                return Err(Error::Outside(part));
-            }
             segments[part as usize] = Segment {
                 vaddr,
                 mem_size,
                 bytes: &bytes[offset as usize..end],
             };
         }
+        let program = Program {
+            entry: u64_at(bytes, 16),
+            stack_size,
+            segments,
+        };
+        program.check()?;
+        Ok(program)
+    }
+
+    /// Checks what the type promises, whatever the program came from (the
+    /// simple format or an ELF file): the stack size, each segment at a
+    /// 4 KiB boundary between page 0 and the guard page with no more bytes
+    /// than its size in memory, no page shared, the entry point in the code.
+    pub fn check(&self) -> Result<(), Error> {
+        let room_end = room_end(self.stack_size).ok_or(Error::BadStack(self.stack_size))?;
+        for part in Part::ALL {
+            let s = &self.segments[part as usize];
+            if s.mem_size == 0 && s.bytes.is_empty() {
+                if s.vaddr != 0 {
+                    return Err(Error::EmptyNotZero(part));
+                }
+                continue;
+            }
+            if !s.vaddr.is_multiple_of(PAGE_SIZE) {
+                return Err(Error::Misaligned(part));
+            }
+            if s.bytes.len() as u64 > s.mem_size {
+                return Err(Error::FileOverMemory(part));
+            }
+            let fits = s.vaddr >= PAGE_SIZE
+                && s.vaddr
+                    .checked_add(s.mem_size)
+                    .is_some_and(|e| e <= room_end);
+            if !fits {
+                return Err(Error::Outside(part));
+            }
+        }
         for (i, &a) in Part::ALL.iter().enumerate() {
             for &b in &Part::ALL[i + 1..] {
-                let (pa, pb) = (segments[a as usize].pages(), segments[b as usize].pages());
+                let (pa, pb) = (
+                    self.segments[a as usize].pages(),
+                    self.segments[b as usize].pages(),
+                );
                 if !pa.is_empty() && !pb.is_empty() && pa.start < pb.end && pb.start < pa.end {
                     return Err(Error::Overlap(a, b));
                 }
             }
         }
-        let entry = u64_at(bytes, 16);
-        let code = &segments[Part::Code as usize];
+        let code = &self.segments[Part::Code as usize];
+        let entry = self.entry;
         if !entry.is_multiple_of(4) || !(code.vaddr..code.vaddr + code.mem_size).contains(&entry) {
             return Err(Error::BadEntry(entry));
         }
-        Ok(Program {
-            entry,
-            stack_size,
-            segments,
-        })
+        Ok(())
     }
 }
 
