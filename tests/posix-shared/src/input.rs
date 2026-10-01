@@ -23,12 +23,7 @@ extern "C" fn reader(completion: u64) -> ! {
             return false;
         }
         let second = SECOND.load(Ordering::Acquire) as i32;
-        let remaining = if cfg!(feature = "native-input") {
-            b"yz\r"
-        } else {
-            b"yz\n"
-        };
-        for expected in remaining {
+        for expected in b"yz\n" {
             if unsafe { abi::read(second, &mut byte, 1) } != 1 || byte != *expected {
                 return false;
             }
@@ -56,10 +51,8 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     SECOND.store(second as usize, Ordering::Release);
     unsafe { *errno = EIO };
     // UART read really blocks: the higher-priority client reaches the driver
-    // before main resumes. Native polling sleeps between attempts.
-    if !cfg!(feature = "native-input")
-        && sys::thread_set_priority(main, 29, rt::abi::Policy::Fifo).is_err()
-    {
+    // before main resumes.
+    if sys::thread_set_priority(main, 29, rt::abi::Policy::Fifo).is_err() {
         return fail(31);
     }
     let Ok(completion) = sys::channel_create(30) else {

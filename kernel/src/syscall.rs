@@ -35,8 +35,8 @@ use crate::process::{self, Change, Op, Process};
 use crate::thread::{self, Long, Thread};
 use crate::{arch, cleanup, irq, sched, session, timer};
 use abi::{
-    CHANNEL_RIGHTS, Call, Error, Handle, KernelStats, MEMORY_RIGHTS, Notification, OWNER_RIGHTS,
-    ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
+    CHANNEL_RIGHTS, Call, DMA_MEMORY_RIGHTS, Error, Handle, KernelStats, MEMORY_RIGHTS,
+    Notification, OWNER_RIGHTS, ProcessHandles, ProcessMemory, ProcessState, Rights, WINDOW_RIGHTS,
 };
 #[cfg(feature = "measure")]
 use core::cell::UnsafeCell;
@@ -44,9 +44,10 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use kcore::PAGE_SIZE;
 use kcore::args::{
-    Desc, access_arg, bits_arg, check_buffer, check_start, handle_limit_arg, handle_values_arg,
-    inline_len_arg, line_arg, memory_size_arg, notify_priority_arg, policy_arg, priority_arg,
-    quota_arg, range_arg, reserved_arg, rights_arg, trigger_arg, under_ceilings, wait_arg,
+    Desc, MemoryKind, access_arg, bits_arg, check_buffer, check_start, handle_limit_arg,
+    handle_values_arg, inline_len_arg, line_arg, memory_kind_arg, memory_size_arg,
+    notify_priority_arg, policy_arg, priority_arg, quota_arg, range_arg, reserved_arg, rights_arg,
+    trigger_arg, under_ceilings, wait_arg,
 };
 use kcore::maps::Mapping;
 
@@ -201,8 +202,6 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::TimerCancel) => timer_cancel(thread, &args),
         Some(Call::ObjectInfo) => object_info(thread, &args),
         Some(Call::DebugWrite) => debug_write(thread, &args),
-        #[cfg(feature = "vz")]
-        Some(Call::ConsolePoll) => console_poll(thread, &args),
         // Numbers no call has, and those of calls that come later.
         _ => Err(Error::InvalidArgs),
     };
@@ -525,26 +524,43 @@ fn go_on(thread: NonNull<Thread>, long: Long, number: u16) {
     }
 }
 
-/// mem_create(x0 size, x1 flags): a memory object of `size` bytes, whole
-/// pages from one page to abi::MAX_MEMORY, whose frames the kernel takes
-/// and zeroes at once, in portions (spec 7.3, 7.7); x1 returns a handle to
-/// it with abi::MEMORY_RIGHTS once it is whole. The checks in the order of
-/// spec 11: the size, then the flags, of which none is known
-/// (INVALID_ARGS); then the resources in the order the call takes them:
-/// room in the caller's table (LIMIT_REACHED) and a chunk for it
-/// (NO_MEMORY; process::reserve_handles), a place in the caller's pool of
-/// memory objects, whose page the caller's quota pays for when the pool
-/// grows, and the object's budget, its pages and the nodes of their list,
-/// from the caller's quota at once (NO_MEMORY; memory::create). A call
-/// that fails there changes nothing but a chunk of the table or a page of
-/// the pool, which stay the caller's. Then the portions (`make`); the call
-/// writes its own result.
+/// mem_create(x0 size, x1 flags, x2 resource): a memory object of `size`
+/// bytes, whole pages from one page to abi::MAX_MEMORY, whose frames the
+/// kernel takes and zeroes at once, in portions (spec 7.3, 7.7); x1
+/// returns a handle to it with abi::MEMORY_RIGHTS once it is whole. With
+/// abi::MEM_CONTIGUOUS the object is one block of the frame allocator,
+/// whose frames are also cleaned out of the data cache, x2 names a system
+/// resource with DEVICE, the handle carries abi::DMA_MEMORY_RIGHTS and x2
+/// returns the block's physical address; with abi::MEM_UNCACHED as well
+/// its mappings are Normal Non-cacheable. The checks in the order of spec
+/// 11: the size, then the flags, an unknown bit, MEM_UNCACHED alone, or a
+/// contiguous size other than a power of two of pages up to
+/// abi::MAX_CONTIGUOUS_PAGES (INVALID_ARGS); x2 with MEM_CONTIGUOUS alone
+/// (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED without DEVICE); then the
+/// resources in the order the call takes them: room in the caller's table
+/// (LIMIT_REACHED) and a chunk for it (NO_MEMORY;
+/// process::reserve_handles), a place in the caller's pool of memory
+/// objects, whose page the caller's quota pays for when the pool grows,
+/// and the object's budget, its pages and the nodes of their list, from
+/// the caller's quota at once (NO_MEMORY; memory::create), and for a
+/// contiguous object its block (NO_MEMORY; memory::create_contiguous). A
+/// call that fails there changes nothing but a chunk of the table or a page
+/// of the pool, which stay the caller's. Then the portions (`make`); the
+/// call writes its own result.
 fn mem_create(thread: NonNull<Thread>, a: &Args) {
     let entry = clock::now();
     let made = memory_size_arg(a[0]).and_then(|pages| {
-        reserved_arg(a[1])?;
+        let kind = memory_kind_arg(a[1], pages)?;
+        if matches!(kind, MemoryKind::Contiguous { .. }) {
+            lookup(thread, a[2], Rights::DEVICE, Object::resource)?;
+        }
         process::reserve_handles(caller(thread), 1)?;
-        memory::create(caller(thread), pages)
+        match kind {
+            MemoryKind::Pages => memory::create(caller(thread), pages),
+            MemoryKind::Contiguous { order, uncached } => {
+                memory::create_contiguous(caller(thread), order, uncached)
+            }
+        }
     });
     match made {
         Ok(m) => {
@@ -573,12 +589,24 @@ fn make(thread: NonNull<Thread>, m: NonNull<Memory>, entry: u64) {
         return;
     };
     thread::end_long(thread);
-    let h = process::insert_handle(caller(thread), Object::Memory(m), MEMORY_RIGHTS);
+    let base = memory::contiguous_base(m);
+    let rights = if base.is_some() {
+        DMA_MEMORY_RIGHTS
+    } else {
+        MEMORY_RIGHTS
+    };
+    let h = process::insert_handle(caller(thread), Object::Memory(m), rights);
     // SAFETY: the reference `create` handed out, which the long call held,
     // goes; the handle, if it went in, holds the object, and without it
     // the object goes.
     unsafe { memory::release(m, cause(thread)) };
-    set_result(thread, h.map(|h| Values::new(&[h.0])));
+    set_result(
+        thread,
+        h.map(|h| match base {
+            Some(pa) => Values::new(&[h.0, pa]),
+            None => Values::new(&[h.0]),
+        }),
+    );
     cleanup::count_portion(start);
 }
 
@@ -1300,17 +1328,4 @@ fn debug_write(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let words: &[u64; 8] = a[2..].try_into().expect("x2-x9");
     crate::log::text(&abi::inline_bytes(words)[..len]);
     Ok(Values::new(&[a[1]]))
-}
-
-#[cfg(feature = "vz")]
-fn console_poll(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
-    lookup(thread, a[0], Rights::DEBUG, Object::resource)?;
-    let mut bytes = [0u8; 8];
-    // A zero limit preserves the original eight-byte ConsolePoll ABI.
-    let limit = if a[1] == 0 { 8 } else { a[1] };
-    if limit > 8 {
-        return Err(Error::InvalidArgs);
-    }
-    let count = crate::vz_driver::poll_input(&mut bytes[..limit as usize]);
-    Ok(Values::new(&[count as u64, u64::from_le_bytes(bytes)]))
 }

@@ -126,13 +126,7 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
-    let files = if cfg!(any(
-        all(feature = "input-probe", not(feature = "native-input")),
-        all(
-            feature = "interrupt-probe",
-            not(feature = "native-interrupt")
-        ),
-    )) {
+    let files = if cfg!(any(feature = "input-probe", feature = "interrupt-probe")) {
         PosixFs::connect_with_uart(&start.parent)
     } else {
         PosixFs::connect(&start.parent)

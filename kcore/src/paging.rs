@@ -77,10 +77,6 @@ impl Attrs {
         memory: Memory::Device,
         ..Attrs::KERNEL_DATA
     };
-    pub const KERNEL_UNCACHED: Attrs = Attrs {
-        memory: Memory::Uncached,
-        ..Attrs::KERNEL_DATA
-    };
     /// A program's code: EL0 reads and executes it.
     pub const USER_TEXT: Attrs = Attrs {
         memory: Memory::Normal,
@@ -105,6 +101,16 @@ impl Attrs {
             Access::Read => Attrs::USER_RODATA,
             Access::ReadWrite => Attrs::USER_DATA,
             Access::ReadExec => Attrs::USER_TEXT,
+        }
+    }
+
+    /// The attributes of the pages of an uncached memory object
+    /// (abi::MEM_UNCACHED) with `access` (spec 7.4, [G6]): those of `user`,
+    /// but Normal Non-cacheable (AttrIndx 2).
+    pub const fn user_uncached(access: Access) -> Attrs {
+        Attrs {
+            memory: Memory::Uncached,
+            ..Attrs::user(access)
         }
     }
 
@@ -688,6 +694,18 @@ mod tests {
             assert_eq!(d & SH_INNER, 0);
             let read_only = d & AP_READ_ONLY != 0;
             assert_eq!(read_only, access != Access::ReadWrite);
+        }
+    }
+
+    #[test]
+    fn user_uncached_attrs_differ_from_user_attrs_only_in_the_mair_entry() {
+        for access in [Access::Read, Access::ReadWrite] {
+            let plain = page_descriptor(0x5000_0000, Attrs::user(access));
+            let uncached = page_descriptor(0x5000_0000, Attrs::user_uncached(access));
+            assert!(Attrs::user_uncached(access).is_valid());
+            assert_eq!(attr_index(plain), MAIR_NORMAL);
+            assert_eq!(attr_index(uncached), MAIR_UNCACHED);
+            assert_eq!(plain & !(0b111 << 2), uncached & !(0b111 << 2));
         }
     }
 

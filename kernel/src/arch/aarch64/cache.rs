@@ -26,13 +26,27 @@ fn lines() -> (usize, usize, bool) {
 
 /// The addresses of the data cache lines that cover `range`, by the
 /// smallest line of CTR_EL0 [G18], for maintenance by virtual address.
-/// Only the VZ build's console driver keeps DMA buffers.
-#[cfg(feature = "vz")]
 pub(crate) fn data_lines(
     range: core::ops::Range<usize>,
 ) -> core::iter::StepBy<core::ops::Range<usize>> {
-    let (dline, _, _) = lines();
-    (range.start & !(dline - 1)..range.end.next_multiple_of(dline)).step_by(dline)
+    abi::cache::lines(range, lines().0)
+}
+
+/// Cleans and invalidates the data cache lines of the `pages` frames from
+/// `pa` to the point of coherency through the linear map, `dc civac` by
+/// the smallest line of CTR_EL0, then `dsb sy` [G18]: what the kernel
+/// wrote there reaches memory before a device or an uncached mapping
+/// reads it, and no dirty line is left to be evicted over what a device
+/// writes later (memory::fill of a contiguous object, spec 7.3).
+pub fn clean_invalidate_frames(pa: u64, pages: usize) {
+    let va = LINEAR_BASE + pa as usize;
+    for line in data_lines(va..va + pages * PAGE_SIZE as usize) {
+        // SAFETY: cleaning and invalidating a line writes back what it
+        // holds and drops it; the frames are RAM the linear map covers.
+        unsafe { asm!("dc civac, {}", in(reg) line, options(nostack, preserves_flags)) };
+    }
+    // SAFETY: a barrier has no other effect.
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
 /// Makes the code in the frames `frames` visible to instruction fetch

@@ -3,10 +3,12 @@
 
 //! Compare the same EL0 RTOS workloads on TCG, HVF and Apple VZ.
 
-use std::path::Path;
 use std::time::Duration;
 
-use crate::{BOOT_PROFILE, RTBENCH_PROGRAMS, Variant, build, build_boot_image, hvf_host, qemu, vz};
+use crate::{
+    BOOT_PROFILE, RTBENCH_PROGRAMS, RTBENCH_VZ_PROGRAMS, Variant, build, build_boot_image,
+    hvf_host, qemu, vz,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(90);
 const NAMES: [&str; 6] = [
@@ -146,15 +148,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
         report(name, &rows);
     }
     if native {
+        // On VZ the kernel has no port: the benchmark runs as a client of
+        // init and the Virtio console's driver shows its lines, at 60 with
+        // a timer of 50 ms above every thread of the benchmark.
         let runner = vz::runner()?;
-        let vz = build(Variant::Vz)?;
+        let image = build_boot_image("rtbench-vz.img", &RTBENCH_VZ_PROGRAMS, BOOT_PROFILE)?;
+        let name = "Apple VZ (with the console's driver)";
         let mut rows = Vec::new();
         for _ in 0..repeats {
             let mut cmd = std::process::Command::new(&runner);
-            cmd.arg(Path::new(&vz.image)).arg(Path::new(&image));
-            rows.push(measure(cmd, "Apple VZ")?);
+            cmd.arg(&normal.image).arg(&image);
+            rows.push(measure(cmd, name)?);
         }
-        report("Apple VZ", &rows);
+        report(name, &rows);
     } else {
         println!("rtbench: HVF and Apple VZ require an Apple Silicon Mac");
     }

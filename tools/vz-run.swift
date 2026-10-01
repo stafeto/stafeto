@@ -16,11 +16,25 @@ let boot = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: CommandLine.argumen
 boot.initialRamdiskURL = URL(fileURLWithPath: CommandLine.arguments[2])
 boot.commandLine = "console=hvc0"
 configuration.bootLoader = boot
+// The guest reads a pipe of the runner's, which the runner fills from its
+// stdin and never closes: the end of stdin (a closed pipe, Ctrl-D) reaches
+// VZ as nothing, since VZ gives the guest an empty receive at the end of
+// its input.
+let input = Pipe()
 let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
 serial.attachment = VZFileHandleSerialPortAttachment(
-    fileHandleForReading: .standardInput,
+    fileHandleForReading: input.fileHandleForReading,
     fileHandleForWriting: .standardOutput
 )
+Thread.detachNewThread {
+    while true {
+        let data = FileHandle.standardInput.availableData
+        if data.isEmpty {
+            return
+        }
+        input.fileHandleForWriting.write(data)
+    }
+}
 configuration.serialPorts = [serial]
 
 do {
@@ -33,7 +47,12 @@ do {
 let machine = VZVirtualMachine(configuration: configuration)
 final class Delegate: NSObject, VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        fputs("guest stopped\n", stderr)
+        // The kernel powers off at the end of its run and after a panic,
+        // whose report has no port on VZ: the same kernel shows it under
+        // HVF (docs/debugging.md).
+        // On stdout, after the console's last bytes, where xtask reads it.
+        FileHandle.standardOutput.write(
+            "\nguest stopped: the kernel powered off (end of run or panic)\n".data(using: .utf8)!)
         exit(0)
     }
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {

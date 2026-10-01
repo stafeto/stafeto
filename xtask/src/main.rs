@@ -7,6 +7,7 @@ mod disasm;
 mod image;
 mod measure;
 mod qemu;
+mod ring;
 mod rtbench;
 mod symbolize;
 mod vz;
@@ -45,9 +46,17 @@ const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("uart", "uart", UART_STACK_SIZE, &["crash"]),
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
-const VZ_PROGRAMS: [ImageProgram; 2] = [
+/// The boot image of Apple VZ: init with its VZ table, the driver of the
+/// Virtio console with CRASH, as the image that ships on QEMU, and the shell.
+const VZ_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["vz"]),
-    ("shell", "shell", SHELL_STACK_SIZE, &["vz"]),
+    (
+        "virtio-console",
+        "virtio-console",
+        UART_STACK_SIZE,
+        &["crash"],
+    ),
+    ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
@@ -103,22 +112,53 @@ const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
         &["cancel-input"],
     ),
 ];
-const POSIX_NATIVE_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+/// The image of console-restart-vz: init watches the old DMA object of
+/// the driver that ended (`dma-watch`).
+const VZ_WATCH_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["vz", "dma-watch"]),
+    (
+        "virtio-console",
+        "virtio-console",
+        UART_STACK_SIZE,
+        &["crash"],
+    ),
+    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+];
+/// The image of console-early-exit-vz: the first instance of the driver
+/// ends after BAR 1, with decoding off (`exit-before-decoding`).
+const VZ_EARLY_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["vz"]),
+    (
+        "virtio-console",
+        "virtio-console",
+        UART_STACK_SIZE,
+        &["crash", "exit-before-decoding"],
+    ),
+    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+];
+/// rtbench on Apple VZ: a client of init, beside the Virtio console's
+/// driver, which shows its lines.
+const RTBENCH_VZ_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-rtbench-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("rtbench", "rtbench", INIT_STACK_SIZE, &[]),
+];
+/// The POSIX images of Apple VZ: those of QEMU with init's VZ tables and
+/// the Virtio console's driver in place of the PL011's.
+const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-busybox-dialog-vz"],
+    ),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
-        "posix-process-service",
-        "posix-process-service",
-        64 * 1024,
-        &[],
-    ),
-    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
-    (
-        "posix-abi-probe",
+        "busybox-probe",
         "posix-thread-probe",
         CHILD_STACK_SIZE,
-        &["native-cancel-input"],
+        &["cancel-input"],
     ),
 ];
 const POSIX_SHARED_PROGRAMS: [ImageProgram; 6] = [
@@ -151,22 +191,20 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
         &["input-probe"],
     ),
 ];
-const POSIX_NATIVE_INPUT_PROGRAMS: [ImageProgram; 6] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 4] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-busybox-dialog-vz"],
+    ),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
-        "posix-process-service",
-        "posix-process-service",
-        64 * 1024,
-        &[],
-    ),
-    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
-    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
-    (
-        "posix-abi-probe",
+        "busybox-probe",
         "posix-shared-probe",
         CHILD_STACK_SIZE,
-        &["native-input"],
+        &["input-probe"],
     ),
 ];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
@@ -180,22 +218,44 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
         &["interrupt-probe"],
     ),
 ];
-const POSIX_NATIVE_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
+    (
+        "init",
+        "init",
+        INIT_STACK_SIZE,
+        &["table-busybox-dialog-vz"],
+    ),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    (
+        "busybox-probe",
+        "posix-shared-probe",
+        CHILD_STACK_SIZE,
+        &["interrupt-probe"],
+    ),
+];
+const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 7] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &[],
+        &["transport-probe"],
     ),
-    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
+        "posix-clock-service",
+        "posix-clock-service",
+        64 * 1024,
+        &["transport-probe"],
+    ),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
-        "posix-shared-probe",
+        "posix-thread-probe",
         CHILD_STACK_SIZE,
-        &["native-interrupt"],
+        &[],
     ),
 ];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
@@ -299,7 +359,7 @@ const ICOUNT_TESTS: [&str; 14] = [
 const ROUND_TRIP_ROWS: [&str; 6] = ["null", "switch", "fast", "slow", "buffer", "handles"];
 /// The rows of the line of `memory_portions_are_measured`, in its order
 /// (spec 15.3).
-const MEMORY_PORTION_ROWS: [&str; 9] = [
+const MEMORY_PORTION_ROWS: [&str; 11] = [
     "create",
     "create_high",
     "map",
@@ -309,6 +369,8 @@ const MEMORY_PORTION_ROWS: [&str; 9] = [
     "protect_exec",
     "release",
     "first_map",
+    "dma_create",
+    "dma_release",
 ];
 /// The rows of the line of `timer_firing_is_measured`, in its order (spec
 /// 15.3).
@@ -480,7 +542,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 224;
+const INIT_TESTS: u32 = 226;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -553,7 +615,6 @@ enum Variant {
     TestIcount,
     FaultProbe,
     OverflowProbe,
-    Vz,
 }
 
 impl Variant {
@@ -576,7 +637,6 @@ impl Variant {
             Variant::TestIcount => Some("icount"),
             Variant::FaultProbe => Some("fault-probe"),
             Variant::OverflowProbe => Some("overflow-probe"),
-            Variant::Vz => Some("vz"),
         }
     }
 
@@ -586,8 +646,7 @@ impl Variant {
             Variant::Normal
             | Variant::TraceNormal
             | Variant::FaultProbe
-            | Variant::OverflowProbe
-            | Variant::Vz => (KERNEL_LIMIT, "spec 3.4"),
+            | Variant::OverflowProbe => (KERNEL_LIMIT, "spec 3.4"),
             Variant::Test | Variant::Baseline | Variant::Trace | Variant::TestIcount => {
                 (TEST_KERNEL_LIMIT, "test builds")
             }
@@ -604,7 +663,6 @@ impl Variant {
             Variant::TestIcount => "stafeto-ktest-icount",
             Variant::FaultProbe => "stafeto-probe",
             Variant::OverflowProbe => "stafeto-overflow",
-            Variant::Vz => "stafeto-vz",
         }
     }
 }
@@ -629,14 +687,18 @@ commands:
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
-  posix-cancel-input-vz verify cancelled Virtio reads on Apple VZ
+  posix-cancel-input-vz verify cancelled reads of the Virtio console on Apple VZ
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
   posix-abi run a C main against Rust POSIX and verify thread-local errno
   posix-input verify file progress during blocking console reads
-  posix-input-vz verify native console reads on Apple Virtualization.framework
+  posix-input-vz verify file progress during Virtio console reads on Apple VZ
   posix-interrupt verify live IPC interruption and Rust POSIX EINTR on UART
-  posix-interrupt-vz verify interruption of native console timer waits
+  posix-interrupt-vz verify live IPC interruption on the Virtio console on Apple VZ
+  console-restart-vz crash the Virtio console's driver on Apple VZ; init stops the
+            device and restarts it
+  console-early-exit-vz end the Virtio console's driver before it decodes its BARs;
+            init stops the function and restarts it
   posix-shared verify cross-thread Rust POSIX file and directory state
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
@@ -681,6 +743,8 @@ fn main() {
         Some("posix-input-vz") => posix_input_probe(true),
         Some("posix-interrupt") => posix_interrupt_probe(false),
         Some("posix-interrupt-vz") => posix_interrupt_probe(true),
+        Some("console-restart-vz") => vz::console_restart(),
+        Some("console-early-exit-vz") => vz::console_early_exit(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -852,11 +916,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     image::check_header(&bytes)?;
     let (limit, source) = variant.limit();
     image::check_size(bytes.len() as u64, limit)?;
-    let boot_image = if variant == Variant::Vz {
-        build_boot_image("boot-vz.img", &VZ_PROGRAMS, BOOT_PROFILE)?
-    } else {
-        build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?
-    };
+    let boot_image = build_boot_image("boot.img", &BOOT_PROGRAMS, BOOT_PROFILE)?;
     println!(
         "kernel image {} ({} bytes, limit {limit} of {source})",
         image.display(),
@@ -1199,65 +1259,71 @@ fn posix_abi_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn posix_thread_probe(native: bool) -> Result<(), String> {
-    let kernel = build(if native { Variant::Vz } else { Variant::Normal })?;
-    let image = build_boot_image(
-        "boot-posix-threads.img",
-        &POSIX_THREAD_PROGRAMS,
-        BOOT_PROFILE,
-    )?;
-    let mut cmd = if native {
-        let mut cmd = Command::new(vz::runner()?);
-        cmd.arg(&kernel.image).arg(&image);
-        cmd
+/// The command of a run of the kernel that ships with the boot image
+/// `image`: on Apple VZ when `vz` (vz::command), in QEMU headless
+/// otherwise; and the kernel's artifacts.
+fn probe_command(image: &Path, vz: bool) -> Result<(Command, Artifacts), String> {
+    let kernel = build(Variant::Normal)?;
+    let cmd = if vz {
+        vz::command(&kernel.image, image)?
     } else {
-        qemu::command(&qemu::VIRT, &kernel.image, Some(&image))
-    };
-    if !native {
+        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(image));
         cmd.args(qemu::HEADLESS);
-    }
+        cmd
+    };
+    Ok((cmd, kernel))
+}
+
+fn posix_thread_probe(vz: bool) -> Result<(), String> {
+    let image = if vz {
+        build_boot_image(
+            "boot-posix-threads-vz.img",
+            &POSIX_VZ_THREAD_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    } else {
+        build_boot_image(
+            "boot-posix-threads.img",
+            &POSIX_THREAD_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    };
+    let (cmd, kernel) = probe_command(&image, vz)?;
     const ENDED: &str = "init: posix-abi-probe ended: exit code 0, not restarted";
-    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, ENDED)?;
-    qemu::expect_marker(&output, "posix-thread-probe: ok")?;
-    qemu::expect_marker(
-        &output,
-        "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
-    )?;
+    let checked = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf).and_then(|output| {
+        qemu::expect_stopped_on(&output, ENDED)
+            .map_err(|e| format!("{e}; last lines: {:?}", output.lines.last()))?;
+        qemu::expect_marker(&output, "posix-thread-probe: ok")?;
+        qemu::expect_marker(
+            &output,
+            "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
+        )
+    });
+    if vz {
+        vz::stop_hint(checked)?;
+    } else {
+        checked?;
+    }
     println!("Rust POSIX pthread lifecycle guest probe passed");
     Ok(())
 }
 
-fn posix_cancel_input_probe(native: bool) -> Result<(), String> {
-    let kernel = build(if native { Variant::Vz } else { Variant::Normal })?;
-    let image = build_boot_image(
-        if native {
-            "boot-posix-native-cancel.img"
-        } else {
-            "boot-posix-cancel.img"
-        },
-        if native {
-            &POSIX_NATIVE_CANCEL_INPUT_PROGRAMS
-        } else {
-            &POSIX_CANCEL_INPUT_PROGRAMS
-        },
-        BOOT_PROFILE,
-    )?;
-    let mut cmd = if native {
-        let mut cmd = Command::new(vz::runner()?);
-        cmd.arg(&kernel.image).arg(image);
-        cmd
+fn posix_cancel_input_probe(vz: bool) -> Result<(), String> {
+    let image = if vz {
+        build_boot_image(
+            "boot-posix-cancel-vz.img",
+            &POSIX_VZ_CANCEL_INPUT_PROGRAMS,
+            BOOT_PROFILE,
+        )?
     } else {
-        qemu::command(&qemu::VIRT, &kernel.image, Some(&image))
+        build_boot_image(
+            "boot-posix-cancel.img",
+            &POSIX_CANCEL_INPUT_PROGRAMS,
+            BOOT_PROFILE,
+        )?
     };
-    if !native {
-        cmd.args(qemu::HEADLESS);
-    }
-    let ended = if native {
-        "init: posix-abi-probe ended: exit code 0, not restarted"
-    } else {
-        "init: busybox-probe ended: exit code 0, not restarted"
-    };
+    let (cmd, _) = probe_command(&image, vz)?;
+    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(
@@ -1271,10 +1337,14 @@ fn posix_cancel_input_probe(native: bool) -> Result<(), String> {
         )?;
         run.send("v")?;
         run.expect("posix-cancel-input-probe: ok", DIALOG_STEP)?;
-        run.expect(ended, DIALOG_STEP)
+        run.expect(ENDED, DIALOG_STEP)
     })();
     run.stop();
-    result?;
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
     println!("Rust POSIX cancelled input and cleanup guest probe passed");
     Ok(())
 }
@@ -1296,32 +1366,18 @@ fn posix_shared_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn posix_input_probe(native: bool) -> Result<(), String> {
-    let (mut cmd, ended) = if native {
-        let runner = vz::runner()?;
-        let kernel = build(Variant::Vz)?;
-        let image = build_boot_image(
-            "boot-posix-native-input.img",
-            &POSIX_NATIVE_INPUT_PROGRAMS,
+fn posix_input_probe(vz: bool) -> Result<(), String> {
+    let image = if vz {
+        build_boot_image(
+            "boot-posix-input-vz.img",
+            &POSIX_VZ_INPUT_PROGRAMS,
             BOOT_PROFILE,
-        )?;
-        let mut cmd = Command::new(runner);
-        cmd.arg(kernel.image).arg(image);
-        (
-            cmd,
-            "init: posix-abi-probe ended: exit code 0, not restarted",
-        )
+        )?
     } else {
-        let kernel = build(Variant::Normal)?;
-        let image = build_boot_image("boot-posix-input.img", &POSIX_INPUT_PROGRAMS, BOOT_PROFILE)?;
-        (
-            qemu::command(&qemu::VIRT, &kernel.image, Some(&image)),
-            "init: busybox-probe ended: exit code 0, not restarted",
-        )
+        build_boot_image("boot-posix-input.img", &POSIX_INPUT_PROGRAMS, BOOT_PROFILE)?
     };
-    if !native {
-        cmd.args(qemu::HEADLESS);
-    }
+    let (cmd, _) = probe_command(&image, vz)?;
+    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(
@@ -1330,63 +1386,59 @@ fn posix_input_probe(native: bool) -> Result<(), String> {
         )?;
         run.send("xyz")?;
         run.expect("posix-input-probe: ok", DIALOG_STEP)?;
-        run.expect(ended, DIALOG_STEP)
+        run.expect(ENDED, DIALOG_STEP)
     })();
     run.stop();
-    result?;
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
     println!(
-        "Rust POSIX concurrent {} input guest probe passed",
-        if native { "native" } else { "UART" }
+        "Rust POSIX concurrent input guest probe passed on {}",
+        if vz { "the Virtio console" } else { "the UART" }
     );
     Ok(())
 }
 
-fn posix_interrupt_probe(native: bool) -> Result<(), String> {
-    let (cmd, ended) = if native {
-        let runner = vz::runner()?;
-        let kernel = build(Variant::Vz)?;
-        let image = build_boot_image(
-            "boot-posix-native-interrupt.img",
-            &POSIX_NATIVE_INTERRUPT_PROGRAMS,
+fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
+    let image = if vz {
+        build_boot_image(
+            "boot-posix-interrupt-vz.img",
+            &POSIX_VZ_INTERRUPT_PROGRAMS,
             BOOT_PROFILE,
-        )?;
-        let mut cmd = Command::new(runner);
-        cmd.arg(kernel.image).arg(image);
-        (
-            cmd,
-            "init: posix-abi-probe ended: exit code 0, not restarted",
-        )
+        )?
     } else {
-        let kernel = build(Variant::Normal)?;
-        let image = build_boot_image(
+        build_boot_image(
             "boot-posix-interrupt.img",
             &POSIX_INTERRUPT_PROGRAMS,
             BOOT_PROFILE,
-        )?;
-        let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
-        cmd.args(qemu::HEADLESS);
-        (cmd, "init: busybox-probe ended: exit code 0, not restarted")
+        )?
     };
+    let (cmd, _) = probe_command(&image, vz)?;
+    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
     // Inject no input until cleanup and recovery have completed.
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
-        if !native {
-            run.expect(
-                "posix-interrupt-probe: interrupted before cleanup",
-                BOOT_TIMEOUT,
-            )?;
-            run.send("r")?;
-        }
+        run.expect(
+            "posix-interrupt-probe: interrupted before cleanup",
+            BOOT_TIMEOUT,
+        )?;
+        run.send("r")?;
         run.expect("posix-interrupt-probe: retry waiting", BOOT_TIMEOUT)?;
         run.send("q")?;
         run.expect("posix-interrupt-probe: ok", DIALOG_STEP)?;
-        run.expect(ended, DIALOG_STEP)
+        run.expect(ENDED, DIALOG_STEP)
     })();
     run.stop();
-    result?;
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
     println!(
-        "Rust POSIX {} interruption guest probe passed",
-        if native { "native" } else { "UART" }
+        "Rust POSIX interruption guest probe passed on {}",
+        if vz { "the Virtio console" } else { "the UART" }
     );
     Ok(())
 }
@@ -1683,6 +1735,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "uart",
         "--package",
+        "virtio-console",
+        "--package",
         "xtask",
     ]))
 }
@@ -1715,11 +1769,21 @@ fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     Ok(hz)
 }
 
+/// Whether `l` is the kernel's first line, `stafeto <version> booting`,
+/// which it says before it read the device tree and knew its port: it
+/// waits in the kernel log until the port is known, and goes out then
+/// (spec 3.2).
+fn is_booting(l: &str) -> bool {
+    l.strip_prefix("stafeto ")
+        .and_then(|l| l.strip_suffix(" booting"))
+        .is_some_and(|v| !v.is_empty() && !v.contains(' '))
+}
+
 /// The kernel's boot report (spec 3.3) on machine `m` with a boot image of
-/// `boot_image` bytes and the line of the GIC `gic`: the lines of `m`'s
-/// RAM at VIRT_RAM, the boot image, the GIC, `m`'s PSCI conduit, the timer
-/// and `boot complete`, each whole. Gives the timer's frequency, which
-/// depends on the host.
+/// `boot_image` bytes and the line of the GIC `gic`: `is_booting` once, before
+/// the line of `m`'s RAM at VIRT_RAM; the lines of the boot image, the
+/// GIC, `m`'s PSCI conduit, the timer and `boot complete`, each whole.
+/// Gives the timer's frequency, which depends on the host.
 fn boot_report(
     lines: &[String],
     m: &qemu::Machine,
@@ -1727,6 +1791,15 @@ fn boot_report(
     gic: &str,
 ) -> Result<u64, String> {
     let memory = format!("memory     {VIRT_RAM:#x}..{:#x}", VIRT_RAM + m.ram());
+    let booting: Vec<usize> = (0..lines.len())
+        .filter(|&i| is_booting(&lines[i]))
+        .collect();
+    let first_memory = lines.iter().position(|l| l.starts_with("memory     "));
+    if booting.len() != 1 || first_memory.is_some_and(|m| m < booting[0]) {
+        return Err(
+            "the boot report has not one line `stafeto <version> booting` before its memory".into(),
+        );
+    }
     let psci = format!("psci       {}", m.psci());
     for line in [memory.as_str(), gic, psci.as_str(), "boot complete"] {
         if !lines.iter().any(|l| l == line) {
@@ -2140,16 +2213,27 @@ fn is_uptime(line: &str) -> bool {
         .is_some_and(|(s, ms)| digits(s) && digits(ms) && ms.len() == 3)
 }
 
-/// Booting the ELF leaves x0 = 0; the kernel must say why it stops.
+/// Booting the ELF leaves x0 = 0; the kernel must say why it stops. It
+/// says so before it read the device tree, so with no port: its panic
+/// stays in the kernel log, which xtask reads from the guest's RAM through
+/// QEMU's monitor (ring, spec 3.2), after the line the kernel said first.
 fn elf_boot_reports_missing_device_tree() -> Result<(), String> {
     let a = build(Variant::Normal)?;
+    let port = ring::free_port()?;
+    let dump = ring::path(&target_dir(), "elf-boot.ram");
     let mut cmd = qemu::command(&qemu::VIRT, &a.elf, None);
-    cmd.args(qemu::HEADLESS);
-    let o = run_until(cmd, BOOT_TIMEOUT, Some("no device tree in x0"), &a.elf)?;
-    qemu::expect_marker(&o, "no device tree in x0")?;
-    if !o.stopped_on_marker {
-        return Err("QEMU was not stopped on the marker line".into());
+    cmd.args(["-display", "none", "-serial", "null"])
+        .args(ring::monitor_args(port));
+    const MARKER: &str = "no device tree in x0";
+    let text = ring::wait_for(cmd, port, &dump, MARKER, BOOT_TIMEOUT)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let first = lines.first().copied().unwrap_or_default();
+    if !is_booting(first) || !lines.iter().any(|l| l.contains("KERNEL PANIC")) {
+        return Err(format!(
+            "the kernel log in RAM has no first line `stafeto <version> booting` and panic: {text:?}"
+        ));
     }
+    println!("ELF boot: the panic before the device tree is in the kernel log in RAM");
     Ok(())
 }
 
@@ -3034,6 +3118,8 @@ fn ci() -> Result<(), String> {
         "shell",
         "--package",
         "uart",
+        "--package",
+        "virtio-console",
         "--lib",
         "--tests",
         "--",
@@ -3046,6 +3132,15 @@ fn ci() -> Result<(), String> {
         "abi",
         "--package",
         "bootimg",
+        "--target",
+        KERNEL_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    // The kernel's code: every unsafe block says why it is sound.
+    run_cmd(cargo().args([
+        "clippy",
         "--package",
         "kcore",
         "--target",
@@ -3053,6 +3148,8 @@ fn ci() -> Result<(), String> {
         "--",
         "-D",
         "warnings",
+        "-D",
+        "clippy::undocumented_unsafe_blocks",
     ]))?;
     run_cmd(cargo().args([
         "clippy",
@@ -3104,8 +3201,10 @@ fn ci() -> Result<(), String> {
         "shell",
         "--package",
         "uart",
+        "--package",
+        "virtio-console",
         "--features",
-        "uart/crash,posix-shared-probe/input-probe,posix-process-service/transport-probe",
+        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/transport-probe",
         "--package",
         "test-init",
         "--package",
@@ -3124,26 +3223,35 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
-    for feature in ["interrupt-probe", "native-interrupt"] {
-        run_cmd(cargo().args([
-            "clippy",
-            "--package",
-            "posix-shared-probe",
-            "--features",
-            feature,
-            "--target",
-            PROGRAM_TARGET,
-            "--",
-            "-D",
-            "warnings",
-        ]))?;
-    }
+    // Init as it ships, without the feature of the probe of a stop.
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "init",
+        "--target",
+        PROGRAM_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "posix-shared-probe",
+        "--features",
+        "interrupt-probe",
+        "--target",
+        PROGRAM_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     run_cmd(cargo().args([
         "clippy",
         "--package",
         "posix-thread-probe",
         "--features",
-        "native-cancel-input",
+        "cancel-input",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -3163,7 +3271,13 @@ fn ci() -> Result<(), String> {
         if let Some(feature) = variant.feature() {
             cmd.args(["--features", feature]);
         }
-        run_cmd(cmd.args(["--", "-D", "warnings"]))?;
+        run_cmd(cmd.args([
+            "--",
+            "-D",
+            "warnings",
+            "-D",
+            "clippy::undocumented_unsafe_blocks",
+        ]))?;
     }
     test()?;
     let a = build(Variant::Normal)?;
@@ -3373,6 +3487,7 @@ mod tests {
             ("Hvc", "Smc")
         );
         let report = [
+            "stafeto 0.1.0 booting",
             "memory     0x40000000..0x60000000",
             "boot image 0x48000000..0x48005000",
             GIC_V2_LINE,
@@ -3393,8 +3508,8 @@ mod tests {
         assert!(check(&report, &qemu::VIRT_2G, GIC_V2_LINE).is_err());
         assert!(check(&report, &qemu::VIRT_EL2, GIC_V2_LINE).is_err());
         for (i, other) in [
-            (1, "boot image 0x48000000..0x48006000"),
-            (4, "timer      0 Hz"),
+            (2, "boot image 0x48000000..0x48006000"),
+            (5, "timer      0 Hz"),
         ] {
             let mut changed = report.clone();
             changed[i] = other.to_string();
@@ -3402,9 +3517,17 @@ mod tests {
             assert!(changed.is_err(), "with {other:?}");
         }
         let mut el2 = report.clone();
-        el2[3] = "psci       Smc".to_string();
-        el2[4] = "timer      24000000 Hz".to_string();
+        el2[4] = "psci       Smc".to_string();
+        el2[5] = "timer      24000000 Hz".to_string();
         assert_eq!(check(&el2, &qemu::VIRT_EL2, GIC_V2_LINE), Ok(24_000_000));
+        // The early line after the report's memory, or twice, is out of its
+        // order.
+        let mut late = report.to_vec();
+        late.swap(0, 1);
+        assert!(check(&late, &qemu::VIRT, GIC_V2_LINE).is_err());
+        let mut twice = report.to_vec();
+        twice.push("stafeto 0.2.0 booting".into());
+        assert!(check(&twice, &qemu::VIRT, GIC_V2_LINE).is_err());
     }
 
     /// `cargo xtask run` boots VIRT; with `--hvf` it boots HVF_V3 only
@@ -3629,16 +3752,16 @@ mod tests {
         assert!(ticks_of(&[], what, &ROUND_TRIP_ROWS).is_err());
     }
 
-    /// The line of the portions of memory objects gives its nine rows in
+    /// The line of the portions of memory objects gives its eleven rows in
     /// order, and the round trip's does not pass for it.
     #[test]
-    fn memory_portions_line_gives_nine_rows() {
+    fn memory_portions_line_gives_eleven_rows() {
         let what = "memory portions";
         let line = "memory portions ticks: create=1 create_high=2 map=3 map_exec=4 unmap=5 protect=6 \
-                    protect_exec=7 release=8 first_map=9";
+                    protect_exec=7 release=8 first_map=9 dma_create=10 dma_release=11";
         let lines = [line.to_string()];
         let ticks = ticks_of(&lines, what, &MEMORY_PORTION_ROWS);
-        assert_eq!(ticks, Ok((1..=9).collect()));
+        assert_eq!(ticks, Ok((1..=11).collect()));
         for bad in [
             "memory portions ticks: create=1 map=2 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7",
             "memory portions ticks: map=2 create=1 map_exec=3 unmap=4 protect=5 protect_exec=6 release=7 first_map=8",

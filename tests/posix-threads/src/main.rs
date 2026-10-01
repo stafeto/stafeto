@@ -372,10 +372,7 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<rt::handle::Resource>("console") {
         rt::console::set(console);
     }
-    let connection = if cfg!(all(
-        feature = "cancel-input",
-        not(feature = "native-cancel-input")
-    )) {
+    let connection = if cfg!(feature = "cancel-input") {
         PosixFs::connect_with_uart(&start.parent)
     } else {
         PosixFs::connect(&start.parent)

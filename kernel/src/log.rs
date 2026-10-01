@@ -8,7 +8,8 @@
 //! console's port (console::is_kernels) a record goes to the port at once
 //! and is marked shown; otherwise it waits for the port's driver, which
 //! takes records with object_info LOG (`take`). The panic shows what
-//! nobody showed or took (`show_unshown`).
+//! nobody showed or took (`show_unshown`). What the kernel said before
+//! it knew its port goes there once it does (`show_early`).
 
 use crate::arch::timer;
 use crate::console;
@@ -106,6 +107,12 @@ pub fn switch(thread: u16) {
 #[cfg(feature = "trace")]
 pub fn interrupt(line: u32) {
     event(abi::LOG_INTERRUPT_KIND, format_args!("line={line}"));
+}
+
+/// What the kernel said before it had its port goes out on the port, in
+/// its order, and counts as shown (console::set_port, spec 3.2). O(64).
+pub fn show_early() {
+    RING.lock().show(|r| console::write_bytes(r.text()));
 }
 
 /// The panic shows what nobody showed or took, oldest first, on the port

@@ -5,11 +5,13 @@
 //! 6, 8, 11, 12, 13.3): handle layout, rights, system call numbers and
 //! where their arguments and results go, what `receive` returns, the
 //! layout of a thread's message buffer, init's first handles, scheduling
-//! policies and error codes; and the time scale of the kernel and the
-//! programs (`time`).
+//! policies and error codes; the time scale of the kernel and the
+//! programs (`time`); and the data cache lines a maintenance covers
+//! (`cache`).
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod cache;
 pub mod time;
 
 /// A process's name for a kernel object (spec 5.1): the low 16 bits index
@@ -110,6 +112,12 @@ pub const MEMORY_RIGHTS: Rights = Rights(
         | Rights::TRANSFER.0,
 );
 
+/// Rights of the handle that `mem_create` with MEM_CONTIGUOUS returns
+/// (spec 7.3): its pages are a device's buffers, mapped R or RW and handed
+/// to a driver, and never run, so a mapping RX fails with ACCESS_DENIED.
+pub const DMA_MEMORY_RIGHTS: Rights =
+    Rights(Rights::MAP_READ.0 | Rights::MAP_WRITE.0 | Rights::DUPLICATE.0 | Rights::TRANSFER.0);
+
 /// Rights of the handle that `device_window_create` returns (spec 5.2,
 /// 7.4): a window maps R or RW and travels; the registers of a device are
 /// never run.
@@ -160,6 +168,21 @@ pub const MAX_MAPPINGS: u32 = 128;
 /// Bytes of the largest memory object (spec 7.3): `mem_create` takes whole
 /// pages from one page to this, 1 GiB.
 pub const MAX_MEMORY: u64 = 1 << 30;
+
+/// Bit 0 of the flags of `mem_create` (spec 7.3): the object is one block
+/// of the frame allocator, 2^k pages for k from 0 to 10, aligned to its
+/// size, for a device's DMA. x2 names a system resource with DEVICE, and
+/// x2 returns the block's physical address.
+pub const MEM_CONTIGUOUS: u64 = 1 << 0;
+
+/// Bit 1 of the flags of `mem_create`, only with MEM_CONTIGUOUS (spec
+/// 7.3, 7.4): every mapping of the object is Normal Non-cacheable, so a
+/// device and the program see the same bytes without cache maintenance.
+pub const MEM_UNCACHED: u64 = 1 << 1;
+
+/// Pages of the largest MEM_CONTIGUOUS object: 1 024, 4 MiB, the largest
+/// block of the frame allocator.
+pub const MAX_CONTIGUOUS_PAGES: u64 = 1 << 10;
 
 /// What a mapping lets a program do with its pages (spec 7.4): read, read
 /// and write, or read and execute. A register holds the sum of the bits
@@ -247,10 +270,9 @@ pub enum Call {
     TimerCancel = 26,
     ObjectInfo = 27,
     DebugWrite = 28,
-    /// Poll native Virtio console input. x0 names the DEBUG resource;
-    /// x1 limits consumption to 1..=8 bytes (zero retains the original limit 8).
-    /// Returns count in x1 and packed bytes in x2; excess input stays queued.
-    ConsolePoll = 29,
+    // 29 went with console_poll (the Virtio console of the VZ build moved
+    // into a service); a retired number is never given again and fails
+    // with INVALID_ARGS as an unknown one does (spec 11).
     /// Interrupt the current IPC wait of x0, a thread with MANAGE.
     /// Wakes it with Interrupted; BadState if it is not waiting in IPC.
     ThreadInterrupt = 30,
@@ -272,7 +294,7 @@ pub enum Call {
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 35] = [
+    pub const ALL: [Call; 34] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -301,7 +323,6 @@ impl Call {
         Call::TimerCancel,
         Call::ObjectInfo,
         Call::DebugWrite,
-        Call::ConsolePoll,
         Call::ThreadInterrupt,
         Call::ThreadUpcallBind,
         Call::ThreadUpcallControl,
@@ -314,14 +335,23 @@ impl Call {
         self as u16
     }
 
-    /// The call with this number, if any.
+    /// The call with this number, if any: none for a retired number
+    /// (RETIRED_CALLS).
     pub const fn from_number(number: u16) -> Option<Call> {
         match number {
-            1..=35 => Some(Self::ALL[number as usize - 1]),
+            1..=28 => Some(Self::ALL[number as usize - 1]),
+            30..=35 => Some(Self::ALL[number as usize - 2]),
             _ => None,
         }
     }
+
+    /// The highest number of a call.
+    pub const HIGHEST: u16 = Call::RequestIdentity.number();
 }
+
+/// Numbers of calls that went, never given again (spec 11): 29,
+/// console_poll.
+pub const RETIRED_CALLS: [u16; 1] = [29];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
 /// no real system call gets one.
@@ -330,8 +360,9 @@ pub const TEST_CALLS: core::ops::RangeInclusive<u16> = 0xFF00..=0xFFFF;
 /// Registers a call returns values in on success: x1-x9.
 pub const RESULT_VALUES: usize = 9;
 
-/// Slot zero and one slot for each system call in the KERNEL_STATS buffer.
-pub const KERNEL_CALL_SLOTS: usize = Call::ALL.len() + 1;
+/// Slot zero and one slot for each number up to the highest call in the
+/// KERNEL_STATS buffer; the slot of a retired number stays 0.
+pub const KERNEL_CALL_SLOTS: usize = Call::HIGHEST as usize + 1;
 
 /// Upcall context: 36 general/system words followed by 66 FP/SIMD words.
 /// Located after message data and handle metadata, aligned for SIMD registers.
@@ -1331,16 +1362,18 @@ mod tests {
     }
 
     #[test]
-    fn call_numbers_are_dense_from_one() {
-        assert_eq!(Call::ALL.len(), 35);
-        for (i, call) in Call::ALL.iter().enumerate() {
-            assert_eq!(call.number(), i as u16 + 1);
-            assert_eq!(Call::from_number(call.number()), Some(*call));
-            assert!(!TEST_CALLS.contains(&call.number()));
+    fn call_numbers_are_dense_from_one_but_the_retired() {
+        assert_eq!(Call::ALL.len(), 34);
+        let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
+        for (call, n) in Call::ALL.iter().zip(numbers) {
+            assert_eq!(call.number(), n);
+            assert_eq!(Call::from_number(n), Some(*call));
+            assert!(!TEST_CALLS.contains(&n));
         }
-        for n in [0, 36, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
+        for n in [0, 29, 36, 0xFEFF, *TEST_CALLS.start(), *TEST_CALLS.end()] {
             assert_eq!(Call::from_number(n), None);
         }
+        assert_eq!(KERNEL_CALL_SLOTS, 36);
     }
 
     #[test]
@@ -1353,7 +1386,6 @@ mod tests {
         assert_eq!(Call::ClockNow.number(), 23);
         assert_eq!(Call::ObjectInfo.number(), 27);
         assert_eq!(Call::DebugWrite.number(), 28);
-        assert_eq!(Call::ConsolePoll.number(), 29);
         assert_eq!(Call::ThreadInterrupt.number(), 30);
         assert_eq!(Call::ThreadUpcallBind.number(), 31);
         assert_eq!(Call::ThreadUpcallControl.number(), 32);
@@ -1446,6 +1478,13 @@ mod tests {
             WINDOW_RIGHTS,
             Rights::MAP_READ | Rights::MAP_WRITE | Rights::DUPLICATE | Rights::TRANSFER
         );
+        assert_eq!(DMA_MEMORY_RIGHTS, WINDOW_RIGHTS);
+    }
+
+    #[test]
+    fn mem_create_flags_are_bits_0_and_1() {
+        assert_eq!((MEM_CONTIGUOUS, MEM_UNCACHED), (1, 2));
+        assert_eq!(MAX_CONTIGUOUS_PAGES, 1024);
     }
 
     #[test]

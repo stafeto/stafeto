@@ -355,6 +355,30 @@ const TESTS: &[(&str, TestFn)] = &[
     ),
     ("new_object_is_zeroed", calls::new_object_is_zeroed),
     (
+        "contiguous_object_is_one_aligned_block",
+        calls::contiguous_object_is_one_aligned_block,
+    ),
+    (
+        "contiguous_object_pays_its_block_back",
+        calls::contiguous_object_pays_its_block_back,
+    ),
+    (
+        "missing_block_is_no_memory_without_a_charge",
+        calls::missing_block_is_no_memory_without_a_charge,
+    ),
+    (
+        "uncached_object_maps_as_normal_non_cacheable",
+        calls::uncached_object_maps_as_normal_non_cacheable,
+    ),
+    (
+        "contiguous_create_resumes_without_zeroing_again",
+        calls::contiguous_create_resumes_without_zeroing_again,
+    ),
+    (
+        "contiguous_portions_are_timed",
+        calls::contiguous_portions_are_timed,
+    ),
+    (
         "create_resumes_where_it_stopped",
         calls::create_resumes_where_it_stopped,
     ),
@@ -537,8 +561,8 @@ fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
     // A call no test of the build made has no maximum: "not measured", so
-    // that 0 does not read as a free call (debug_write, and console_poll,
-    // which only the VZ build has).
+    // that 0 does not read as a free call (debug_write, and 29, a retired
+    // number).
     #[cfg(feature = "measure")]
     for (number, &ticks) in crate::syscall::call_maxima().iter().enumerate().skip(1) {
         if ticks == 0 {

@@ -7,7 +7,12 @@
 //! main thread at 63 never waits for work that grows with the size of a
 //! service, and never lets go of the last handles of an instance; once the
 //! console's driver ended for good, it shows what is left of the kernel
-//! log (`show_log`). The main thread puts a job into the cell
+//! log (`show_log`). For a driver with DMA objects it makes them at each
+//! load and keeps a handle of its own to each, and at the teardown or
+//! kill of an instance it first stops the device through windows of its
+//! own (`quiesce`), then lets the objects go with the instance: the device
+//! never writes frames the allocator gave back (spec 2, section 4). The
+//! main thread puts a job into the cell
 //! (`Worker::load`, `Worker::teardown`, `Worker::kill`,
 //! `Worker::show_log`), sets the worker's level (init::work::Jobs) and
 //! wakes it through the worker's channel; the worker does the job, leaves
@@ -17,22 +22,26 @@
 //! objects runs at the worker's level, below init (spec 7.7).
 
 use crate::serve::Instance;
-use abi::{Error, Policy, Rights};
+use abi::{Access, Error, Policy, Rights};
 use bootimg::Program;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use init::table::{Record, TABLE};
+use init::table::{Gate, MAX_DMA, Record, TABLE};
 use init::work::{WORKER_IDLE, WORKER_MAX};
-use proto_init::ServiceArgs;
+use proto_init::{OWN_ARGS_MAX, ServiceArgs};
 use proto_wire::Writer;
-use rt::handle::{Channel, Process, Resource, Thread};
+use rt::handle::{Channel, Memory, Process, Resource, Thread};
 use rt::loader::{self, SpawnParams, Spawned};
-use rt::{Handle, Stack, sys};
+use rt::{Handle, Stack, mmio, sys};
 
 /// Where the worker maps the objects of a program it loads, in init's
 /// space: a window only the loader uses (rt::loader::load).
 const LOADER_WINDOW: usize = 0x60_0000_0000;
+/// Where the worker maps the page of a device it writes to stop the
+/// device (`quiesce`).
+const QUIESCE_WINDOW: usize = 0x61_0000_0000;
+const PAGE: u64 = 4096;
 /// The worker's message buffer, the page after that of init's main thread.
 const BUFFER: usize = abi::INIT_MSGBUF as usize + 4096;
 const STACK_SIZE: usize = 32 * 1024;
@@ -48,19 +57,25 @@ enum Order {
         label: u64,
         program: Program<'static>,
     },
-    /// Close the handles of the instance in the cell's `gone`.
-    Teardown,
-    /// Kill the process of the instance in the cell's `gone`, then close
-    /// its handles.
-    Kill,
+    /// Stop the device of the record at `place`, then close the handles
+    /// of the instance in the cell's `gone`.
+    Teardown { place: usize },
+    /// Kill the process of the instance in the cell's `gone`, stop the
+    /// device of the record at `place`, then close its handles.
+    Kill { place: usize },
     /// Show what is left of the kernel log (`show_log`).
     ShowLog,
 }
 
 /// What a load leaves the main thread: the instance, its thread not
 /// started yet, whose start data hold its process, its thread, the console
-/// when its record has one, and its arguments; or why not.
-pub type Loaded = Result<Spawned, Error>;
+/// when its record has one, its DMA objects and its arguments, with init's
+/// own handles to the DMA objects; or why not.
+pub type Loaded = Result<(Spawned, Kept), Error>;
+
+/// Init's own handles to the DMA objects of an instance (Record::dma),
+/// which go only after its device stopped.
+pub type Kept = [Option<Handle<Memory>>; MAX_DMA];
 
 /// The states of the cell: FREE, the main thread's to fill; GIVEN, the
 /// worker's; DONE, the main thread's to empty.
@@ -180,16 +195,18 @@ impl Worker {
         self.give(order, None)
     }
 
-    /// Gives the worker the teardown of `gone`, an instance that ended:
-    /// its handles close in the worker (`give`).
-    pub fn teardown(&self, gone: Instance) -> Result<(), Error> {
-        self.give(Order::Teardown, Some(gone))
+    /// Gives the worker the teardown of `gone`, an instance of the record
+    /// at `place` that ended: its device stops, then its handles close in
+    /// the worker (`give`).
+    pub fn teardown(&self, place: usize, gone: Instance) -> Result<(), Error> {
+        self.give(Order::Teardown { place }, Some(gone))
     }
 
-    /// Gives the worker the kill of `gone`, an instance that went silent:
-    /// the worker kills its process, then its handles close (`give`).
-    pub fn kill(&self, gone: Instance) -> Result<(), Error> {
-        self.give(Order::Kill, Some(gone))
+    /// Gives the worker the kill of `gone`, an instance of the record at
+    /// `place` that went silent: the worker kills its process, stops its
+    /// device, then its handles close (`give`).
+    pub fn kill(&self, place: usize, gone: Instance) -> Result<(), Error> {
+        self.give(Order::Kill { place }, Some(gone))
     }
 
     /// Gives the worker what is left of the kernel log to show, once the
@@ -257,10 +274,11 @@ extern "C" fn work(_: u64) -> ! {
                 label,
                 program,
             } => Some(load(&TABLE[place], label, &program)),
-            Order::Teardown => {
-                // The handles close here, the cleanup at the worker's level.
+            Order::Teardown { place } => {
+                // The handles close here, the cleanup at the worker's level,
+                // once the device stopped.
                 if let Some(gone) = gone {
-                    gone.release();
+                    stop(place, gone);
                 }
                 None
             }
@@ -268,11 +286,12 @@ extern "C" fn work(_: u64) -> ! {
                 show_log();
                 None
             }
-            Order::Kill => {
+            Order::Kill { place } => {
                 if let Some(gone) = gone {
-                    // The process goes, then its handles (spec 7.7).
+                    // The process goes, its device stops, then its handles
+                    // (spec 7.7).
                     let _ = sys::process_kill(gone.process());
-                    gone.release();
+                    stop(place, gone);
                 }
                 None
             }
@@ -291,7 +310,7 @@ extern "C" fn work(_: u64) -> ! {
 /// its base priority (spec 13.4), and its start data (`start_data`). An
 /// instance whose start data could not be made is killed; its thread never
 /// ran.
-fn load(record: &Record, label: u64, program: &Program<'static>) -> Result<Spawned, Error> {
+fn load(record: &Record, label: u64, program: &Program<'static>) -> Loaded {
     let channel = view::<Channel>(CHANNEL);
     let params = SpawnParams {
         channel: &channel,
@@ -305,20 +324,25 @@ fn load(record: &Record, label: u64, program: &Program<'static>) -> Result<Spawn
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;
-    if let Err(e) = start_data(record, &mut spawned) {
-        let _ = sys::process_kill(&spawned.process);
-        return Err(e);
+    match start_data(record, &mut spawned) {
+        Ok(kept) => Ok((spawned, kept)),
+        Err(e) => {
+            let _ = sys::process_kill(&spawned.process);
+            Err(e)
+        }
     }
-    Ok(spawned)
 }
 
 /// The start data of an instance of `record` besides its process and
 /// thread (spec 13.3): copies of the system resource with DEBUG and
 /// TRANSFER under the name `console` and with KSTATS and TRANSFER under
-/// the name `log` when the record has them, and the arguments,
+/// the name `log` when the record has them; a copy of each of its DMA
+/// objects, made here (`dma`), under its name; and the arguments,
 /// ServiceArgs with the heartbeat and watchdog of a service (0 for a
-/// client) and the record's own arguments.
-fn start_data(record: &Record, spawned: &mut Spawned) -> Result<(), Error> {
+/// client) and the own arguments: the physical address of each DMA
+/// object, 8 bytes little-endian, then the record's. Returns init's own
+/// handles to the DMA objects.
+fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
     for (wanted, name, right) in [
         (record.console, "console", Rights::DEBUG),
         (record.log, "log", Rights::KSTATS),
@@ -331,16 +355,189 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<(), Error> {
             let _ = spawned.giver.give(name, copy.erase());
         }
     }
+    let mut own = [0; OWN_ARGS_MAX];
+    let mut kept: Kept = [const { None }; MAX_DMA];
+    let resource = view::<Resource>(RESOURCE);
+    for (i, d) in record.dma.iter().enumerate() {
+        let (object, pa) = sys::mem_create_contiguous(d.size, d.uncached, &resource)?;
+        let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+        let copy = sys::handle_duplicate(&object, rights)?;
+        // The checks of the table keep the names apart from the others of
+        // the start data, and MAX_DMA keeps them within its room.
+        let _ = spawned.giver.give(d.name, copy.erase());
+        own[8 * i..8 * i + 8].copy_from_slice(&pa.to_le_bytes());
+        kept[i] = Some(object);
+    }
+    // The checks of the table keep the own arguments within OWN_ARGS_MAX.
+    let len = 8 * record.dma.len() + record.args.len();
+    own[8 * record.dma.len()..len].copy_from_slice(record.args);
     let watch = record.watch();
     let args = ServiceArgs {
         period_ns: watch.map_or(0, |w| w.period_ns),
         deadline_ns: watch.map_or(0, |w| w.deadline_ns),
-        own: record.args,
+        own: &own[..len],
     };
     let mut w = Writer::new();
-    // The checks of the table keep the own arguments within OWN_ARGS_MAX.
     args.write(&mut w).map_err(|_| Error::InvalidArgs)?;
-    spawned.giver.set_args(w.as_bytes())
+    spawned.giver.set_args(w.as_bytes())?;
+    Ok(kept)
+}
+
+/// Reads of a register a stopping write wrote, at most, until it shows
+/// the value written (Record::quiesce).
+pub const SETTLE_READS: u32 = 1_000_000;
+
+/// The records whose device did not stop, a bit each by place: their DMA
+/// objects stay with init for good, and the main thread marks them broken
+/// (`take_stuck`).
+static STUCK: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the device of the record at `place` did not stop at the last
+/// teardown or kill; the mark goes.
+pub fn take_stuck(place: usize) -> bool {
+    STUCK.fetch_and(!(1 << place), Ordering::AcqRel) & (1 << place) != 0
+}
+
+/// The end of `gone`, an instance of the record at `place` (spec 2,
+/// section 4): its device stops (`quiesce`), then its handles close,
+/// init's to its DMA objects among them. A device that did not stop keeps
+/// the objects: init forgets its handles, so their frames never go back
+/// to the allocator while the device may still write them, and the record
+/// is marked broken (`take_stuck`).
+fn stop(place: usize, mut gone: Instance) {
+    let record = &TABLE[place];
+    if quiesce(record) {
+        #[cfg(feature = "dma-watch")]
+        watch(record, &gone);
+    } else {
+        gone.keep_dma();
+        STUCK.fetch_or(1 << place, Ordering::AcqRel);
+    }
+    gone.release();
+}
+
+/// Stops the device of `record` once an instance ended (Record::quiesce,
+/// spec 2 section 4): each write, in its order, goes through a window init
+/// makes over the page of the record's window that holds it, mapped at
+/// QUIESCE_WINDOW, and is read back until its settled bits show its value,
+/// so that it
+/// reached the device and the device finished it [G34]; a write whose
+/// register of Write::only_if shows none of its bits is skipped. False
+/// when a window does not come or a write does not settle.
+fn quiesce(record: &Record) -> bool {
+    let resource = view::<Resource>(RESOURCE);
+    let own = view::<Process>(OWN);
+    for q in record.quiesce {
+        if let Some(g) = q.only_if
+            && !gate_open(record, g)
+        {
+            continue;
+        }
+        let Some(w) = record.windows.iter().find(|w| w.name == q.window) else {
+            return false;
+        };
+        let page = q.offset & !(PAGE - 1);
+        let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
+            return false;
+        };
+        if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::ReadWrite).is_err() {
+            return false;
+        }
+        let at = QUIESCE_WINDOW + (q.offset - page) as usize;
+        // SAFETY: the window maps the device's page at QUIESCE_WINDOW as
+        // device memory, read and write; `at` is a register of q.bits bits
+        // within it, aligned to them (the checks of the table).
+        let settled = unsafe {
+            if q.bits == 8 {
+                mmio::write8(at, q.value as u8);
+                (0..SETTLE_READS).any(|_| u32::from(mmio::read8(at)) & q.settled == q.value)
+            } else {
+                mmio::write32(at, q.value);
+                (0..SETTLE_READS).any(|_| mmio::read32(at) & q.settled == q.value)
+            }
+        };
+        // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
+        let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
+        if !settled {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether the register of `g` shows one of its bits (Write::only_if),
+/// read through a window of init's own at QUIESCE_WINDOW; a register that
+/// cannot be read counts as open, so the write goes and must settle.
+fn gate_open(record: &Record, g: Gate) -> bool {
+    let Some(w) = record.windows.iter().find(|w| w.name == g.window) else {
+        return true;
+    };
+    let page = g.offset & !(PAGE - 1);
+    let resource = view::<Resource>(RESOURCE);
+    let own = view::<Process>(OWN);
+    let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
+        return true;
+    };
+    if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::Read).is_err() {
+        return true;
+    }
+    // SAFETY: the window maps the register's page at QUIESCE_WINDOW as
+    // device memory; the register is a word within it (the checks of the
+    // table).
+    let value = unsafe { mmio::read32(QUIESCE_WINDOW + (g.offset - page) as usize) };
+    // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
+    let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
+    value & g.bits != 0
+}
+
+/// Where the worker maps a DMA object it watches (`watch`).
+#[cfg(feature = "dma-watch")]
+const WATCH_WINDOW: usize = 0x62_0000_0000;
+/// How long `watch` watches.
+#[cfg(feature = "dma-watch")]
+const WATCH_NS: u64 = 300_000_000;
+
+/// The probe of a stop (feature `dma-watch`, console-restart-vz): with the
+/// device stopped, the first DMA object of `gone` is read whole, then again
+/// WATCH_NS later, while xtask types into the console; init says whether
+/// the device wrote it meanwhile. Init only reads the object.
+#[cfg(feature = "dma-watch")]
+fn watch(record: &Record, gone: &Instance) {
+    let (Some(object), Some(d)) = (gone.dma(), record.dma.first()) else {
+        return;
+    };
+    let own = view::<Process>(OWN);
+    if sys::mem_map(&own, object, 0, d.size, WATCH_WINDOW, Access::Read).is_err() {
+        return;
+    }
+    let sum = || {
+        (0..d.size as usize / 4).fold(0xcbf2_9ce4_8422_2325u64, |h, i| {
+            // SAFETY: the object is mapped read-only at WATCH_WINDOW, d.size
+            // bytes; the read is a word within it. The wait between the two
+            // sums is a system call, which the compiler moves no load over.
+            let word = unsafe { ((WATCH_WINDOW + 4 * i) as *const u32).read() };
+            (h ^ u64::from(word)).wrapping_mul(0x100_0000_01b3)
+        })
+    };
+    let before = sum();
+    let deadline = rt::time::ticks_to_ns(rt::time::now()).saturating_add(WATCH_NS);
+    if let Ok(channel) = sys::channel_create(1)
+        && let Ok(waiter) = rt::wait::Waiter::new(&channel, 0, 1)
+    {
+        let _ = waiter.receive_until(&channel, deadline);
+    }
+    let after = sum();
+    // SAFETY: only the worker maps and uses WATCH_WINDOW.
+    let _ = unsafe { sys::mem_unmap(&own, WATCH_WINDOW, d.size) };
+    let what = if before == after {
+        "unchanged"
+    } else {
+        "written"
+    };
+    rt::println!(
+        "init: {} DMA memory {what} for 300 ms after its stop",
+        record.name
+    );
 }
 
 /// Shows what is left of the kernel log once its reader, the console's

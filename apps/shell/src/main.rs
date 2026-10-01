@@ -20,7 +20,6 @@
 #![no_std]
 #![no_main]
 
-#[cfg(not(feature = "vz"))]
 use abi::Error;
 use abi::{
     LOG_BATCH, LOG_INTERRUPT_KIND, LOG_LEN_AT, LOG_RECORD, LOG_SWITCH_KIND, LOG_SYSCALL_KIND,
@@ -28,11 +27,9 @@ use abi::{
 };
 use core::fmt::{self, Write};
 use proto_init::{ListReply, ListRequest, Method, Stats};
-#[cfg(not(feature = "vz"))]
 use proto_uart::{ReadReply, ReadRequest, WriteReply, WriteRequest};
 use proto_wire::{Reader, Status, Writer};
 use rt::handle::{Channel, Resource};
-#[cfg(not(feature = "vz"))]
 use rt::println;
 use rt::{Handle, sys, time};
 use shell::command::{self, Command, HELP};
@@ -46,17 +43,11 @@ rt::entry!(main);
 const PROMPT: &[u8] = b"stafeto> ";
 /// The line the shell says once it connected, and once it connected again
 /// after the driver died.
-#[cfg(not(feature = "vz"))]
 const CONNECTED: &[u8] = b"shell: connected to uart; type help for the commands\n";
-#[cfg(feature = "vz")]
-const VZ_CONNECTED: &[u8] = b"shell: connected to virtio console; type help for the commands\n";
-#[cfg(not(feature = "vz"))]
 const RECONNECTED: &[u8] = b"shell: uart restarted; connected again\n";
 /// The line of `crash uart` before its CRASH.
-#[cfg(not(feature = "vz"))]
 const CRASHING: &[u8] = b"shell: crashing uart\n";
 /// The line through debug_write once init says the driver is broken.
-#[cfg(not(feature = "vz"))]
 const BROKEN: &str = "shell: uart is broken; no console left";
 /// The bytes one READ asks for at most.
 const READ_BYTES: u32 = 64;
@@ -66,13 +57,10 @@ const BENCH_ROUNDS: u32 = 1000;
 /// call to the driver failed; no channel to wait on once the driver is
 /// broken.
 const NO_START_DATA: u64 = 1;
-#[cfg(not(feature = "vz"))]
 const NO_UART: u64 = 2;
 const UART_FAILED: u64 = 3;
-#[cfg(not(feature = "vz"))]
 const NO_WAIT: u64 = 4;
 
-#[cfg(not(feature = "vz"))]
 fn main(_: u64) -> u64 {
     let Ok(mut s) = rt::startup() else {
         return NO_START_DATA;
@@ -115,36 +103,11 @@ fn main(_: u64) -> u64 {
     }
 }
 
-#[cfg(feature = "vz")]
-fn main(_: u64) -> u64 {
-    let Ok(mut s) = rt::startup() else {
-        return NO_START_DATA;
-    };
-    if let Ok(console) = s.take::<Resource>("console") {
-        rt::console::set(console);
-    }
-    let trace = s.take::<Resource>("trace").ok();
-    let mut shell = Shell {
-        parent: s.parent,
-        trace,
-        trace_next: 1,
-        line: Line::new(),
-        input: [0; READ_BYTES as usize],
-        at: 0,
-        len: 0,
-    };
-    match shell.serve(VZ_CONNECTED) {
-        Ok(never) => match never {},
-        Err(_) => UART_FAILED,
-    }
-}
-
 /// A session with the driver (spec 13.4, 13.6): CONNECT waits in init
 /// until an instance registers. PEER_CLOSED means the driver is broken:
 /// the shell says BROKEN through debug_write, which reaches the port since
 /// the driver's window went with it (spec 3.2), and waits for good
 /// (`wait_for_good`); another refusal gives NO_UART.
-#[cfg(not(feature = "vz"))]
 fn connect(parent: &Handle<Channel>) -> Result<Handle<Channel>, u64> {
     match rt::service::connect(parent, "uart") {
         Ok(uart) => Ok(uart),
@@ -163,7 +126,6 @@ fn connect(parent: &Handle<Channel>) -> Result<Handle<Channel>, u64> {
 /// a channel of its own, whose one handle the shell keeps and which
 /// nothing notifies or sends to. Gives NO_WAIT when it has no such
 /// channel, or when a receive fails, which it never repeats.
-#[cfg(not(feature = "vz"))]
 fn wait_for_good() -> u64 {
     let Ok(channel) = sys::channel_create(1) else {
         return NO_WAIT;
@@ -182,7 +144,6 @@ struct Shell {
     parent: Handle<Channel>,
     trace: Option<Handle<Resource>>,
     trace_next: u64,
-    #[cfg(not(feature = "vz"))]
     uart: Handle<Channel>,
     line: Line,
     input: [u8; READ_BYTES as usize],
@@ -274,7 +235,6 @@ impl Shell {
                 facts(&mut out, "bench", written);
             }
             Command::Trace => return self.trace(),
-            #[cfg(not(feature = "vz"))]
             Command::CrashUart => {
                 self.write(CRASHING)?;
                 let status = match self.crash() {
@@ -397,7 +357,6 @@ impl Shell {
     /// CRASH: the driver faults while it holds the request, and the kernel
     /// answers PEER_CLOSED; a driver built without the feature `crash`
     /// answers UNKNOWN_METHOD (spec 13.5).
-    #[cfg(not(feature = "vz"))]
     fn crash(&self) -> Result<(), Status> {
         let request = proto_uart::Method::Crash.header().bytes();
         let mut buffer = [0; MESSAGE_MAX];
@@ -406,7 +365,6 @@ impl Shell {
 
     /// READ of up to READ_BYTES: the reply waits for input, and its bytes
     /// become the input to take.
-    #[cfg(not(feature = "vz"))]
     fn fill(&mut self) -> Result<(), Status> {
         let mut w = Writer::new();
         ReadRequest { max: READ_BYTES }.write(&mut w)?;
@@ -419,35 +377,14 @@ impl Shell {
         Ok(())
     }
 
-    #[cfg(feature = "vz")]
-    fn fill(&mut self) -> Result<(), Status> {
-        loop {
-            let mut bytes = [0u8; 8];
-            let n = rt::console::poll(&mut bytes).map_err(Status::Kernel)?;
-            if n > 0 {
-                self.input[..n].copy_from_slice(&bytes[..n]);
-                self.at = 0;
-                self.len = n;
-                return Ok(());
-            }
-            sys::yield_now().map_err(Status::Kernel)?;
-        }
-    }
-
     /// WRITE of `bytes`: the reply comes once all are in the driver's
     /// ring.
-    #[cfg(not(feature = "vz"))]
     fn write(&self, bytes: &[u8]) -> Result<(), Status> {
         let mut w = Writer::new();
         WriteRequest { bytes }.write(&mut w)?;
         let mut buffer = [0; MESSAGE_MAX];
         let reply = call(&self.uart, w.as_bytes(), &mut buffer)?;
         WriteReply::read(reply).map(drop)
-    }
-
-    #[cfg(feature = "vz")]
-    fn write(&self, bytes: &[u8]) -> Result<(), Status> {
-        rt::console::write(bytes).map_err(Status::Kernel)
     }
 }
 

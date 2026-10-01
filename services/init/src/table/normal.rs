@@ -45,6 +45,9 @@ pub const TABLE: &[Record] = &[
         }],
         connects: &[],
         args: &PL011.to_le_bytes(),
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     },
     // No heartbeat: it waits for input and has no periodic work (spec
     // 13.6); the console only for the message of its panic.
@@ -64,5 +67,8 @@ pub const TABLE: &[Record] = &[
         bindings: &[],
         connects: &["uart"],
         args: &[],
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     },
 ];

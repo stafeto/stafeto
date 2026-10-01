@@ -170,11 +170,26 @@ impl Drop for Frame {
 }
 
 /// A block of 2^`order` zeroed frames charged to `quota` (spec 7.5, 7.8),
-/// which the caller gives back with `free`. NO_MEMORY when the quota falls
-/// short, or, for a block of more frames than one, when no free block is
-/// big enough; the charge goes back then. A single frame whose charge
-/// passed always finds one (spec 7.8).
+/// which the caller gives back with `free`. NO_MEMORY as for `alloc`.
+/// Kept a symbol of its own: xtask checks in its code that zeroing calls
+/// no `memset` (xtask/src/disasm.rs).
+#[inline(never)]
 pub fn alloc_zeroed(order: u8, quota: &mut Account) -> Result<Frame, Error> {
+    let frame = alloc(order, quota)?;
+    // SAFETY: the block was just handed out; no program sees it before it
+    // is zeroed.
+    unsafe { zero(frame.pa, order) };
+    Ok(frame)
+}
+
+/// A block of 2^`order` frames charged to `quota`, as they are (spec 7.5,
+/// 7.8): the caller zeroes them before a program may see them, as a
+/// contiguous memory object does in portions (memory::fill), and gives the
+/// block back with `free`. NO_MEMORY when the quota falls short, or, for a
+/// block of more frames than one, when no free block is big enough; the
+/// charge goes back then. A single frame whose charge passed always finds
+/// one (spec 7.8). O(MAX_ORDER).
+pub fn alloc(order: u8, quota: &mut Account) -> Result<Frame, Error> {
     let size = PAGE_SIZE << order;
     quota.charge(size)?;
     let Some(pa) = FRAMES
@@ -189,12 +204,8 @@ pub fn alloc_zeroed(order: u8, quota: &mut Account) -> Result<Frame, Error> {
         quota.refund(size);
         return Err(Error::NoMemory);
     };
-    // SAFETY: the allocator just handed the block out; no program sees it
-    // before it is zeroed.
-    let frame = unsafe { Frame::from_raw(pa, order) };
-    // SAFETY: as above.
-    unsafe { zero(pa, order) };
-    Ok(frame)
+    // SAFETY: the allocator just handed the block out.
+    Ok(unsafe { Frame::from_raw(pa, order) })
 }
 
 /// Zeroes the block of 2^`order` frames at `pa` through the linear map,

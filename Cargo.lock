@@ -114,7 +114,6 @@ dependencies = [
  "abi",
  "bootimg",
  "kcore",
- "virtio-drivers",
 ]
 
 [[package]]
@@ -451,9 +450,9 @@ dependencies = [
 
 [[package]]
 name = "safe-mmio"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5e4ed477d6ebc07e01ce97b87fe319e6b62d0ab2564594db6a8c4cdc29ffd9"
+checksum = "e885ed64c91774b671612cb99dda2ede3738b0aa2d39a85a1471b20bf09eabe0"
 dependencies = [
  "zerocopy",
 ]
@@ -559,6 +558,19 @@ name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
+
+[[package]]
+name = "virtio-console"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-uart",
+ "proto-wire",
+ "rt",
+ "uart",
+ "virtio-drivers",
+]
 
 [[package]]
 name = "virtio-drivers"

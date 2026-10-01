@@ -3,6 +3,10 @@
 
 //! Fixed-duration RTOS primitive throughput and periodic wakeup latency.
 //! The workloads follow Thread-Metric and Zyclictest's measurement patterns.
+//! It runs as init (QEMU), or as a client of init beside the console's
+//! driver, which shows its lines (Apple VZ, where the kernel has no port):
+//! the same layout of stacks and message buffers either way
+//! (rt::loader).
 
 #![no_std]
 #![no_main]
@@ -10,7 +14,7 @@
 use abi::{Policy, Source};
 use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use rt::handle::{Channel, Process, Thread};
+use rt::handle::{Channel, Process, Resource, Thread};
 use rt::{Handle, Stack, println, sys, time};
 
 rt::entry!(main);
@@ -315,10 +319,19 @@ fn timer_wakeup(process: &Handle<Process>, me: &Handle<Thread>, load: bool) {
 }
 
 fn main(_: u64) -> u64 {
-    let init = rt::init_handles().expect("benchmark runs as init");
-    rt::console::set(init.resource);
-    let process = init.process;
-    let me = init.thread;
+    let (process, me, child) = match rt::init_handles() {
+        Some(init) => {
+            rt::console::set(init.resource);
+            (init.process, init.thread, false)
+        }
+        None => {
+            let mut start = rt::startup().expect("benchmark start data");
+            if let Ok(console) = start.take::<Resource>("console") {
+                rt::console::set(console);
+            }
+            (start.process, start.thread, true)
+        }
+    };
     sys::thread_set_priority(&me, MAIN_PRIORITY, Policy::Fifo).expect("set benchmark priority");
     println!("RTBENCH START hz={}", time::frequency());
     baseline();
@@ -330,6 +343,9 @@ fn main(_: u64) -> u64 {
     timer_wakeup(&process, &me, false);
     timer_wakeup(&process, &me, true);
     println!("RTBENCH DONE");
+    if child {
+        return 0;
+    }
     loop {
         sys::yield_now().expect("wait for benchmark host");
     }

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-"""Keep the GPLv3 Rust POSIX code outside the GPLv2-only BusyBox binary."""
+"""Keep the GPLv3 Rust POSIX code outside the GPLv2-only BusyBox binary,
+and the crates of the drivers under licences the GPL takes."""
 
 import json
 import subprocess
@@ -50,6 +51,50 @@ def main() -> None:
                     f"BusyBox links GPLv3 dependency {packages[package_id]['name']}")
         pending.extend(nodes[package_id]["dependencies"])
     print("Rust POSIX GPL-3.0-or-later; BusyBox dependency graph remains GPLv3-free")
+    check_drivers(packages, nodes, named)
+
+
+# Licences a GPL-3.0-or-later program may link from crates.io.
+PERMISSIVE = {"MIT", "Apache-2.0", "MIT OR Apache-2.0", "Apache-2.0 OR MIT",
+              "Zlib OR Apache-2.0 OR MIT", "BSD-2-Clause OR Apache-2.0 OR MIT"}
+
+
+def closure(nodes, root, packages=None):
+    """The packages `root` links: with `packages`, procedural macros and
+    what they take run in the compiler and are left out."""
+    pending, seen = [root], set()
+    while pending:
+        package_id = pending.pop()
+        if package_id in seen:
+            continue
+        if packages is not None and any(
+                "proc-macro" in t["kind"] for t in packages[package_id]["targets"]):
+            continue
+        seen.add(package_id)
+        pending.extend(nodes[package_id]["dependencies"])
+    return seen
+
+
+def check_drivers(packages, nodes, named) -> None:
+    """The kernel links no crate from outside the workspace; the Virtio
+    console's driver links virtio-drivers (MIT) and crates under licences
+    the GPL takes."""
+    for package_id in closure(nodes, named["kernel"]["id"]):
+        if packages[package_id]["source"] is not None:
+            raise SystemExit(f"the kernel links {packages[package_id]['name']}")
+    outside = []
+    for package_id in closure(nodes, named["virtio-console"]["id"], packages):
+        package = packages[package_id]
+        if package["source"] is None:
+            continue
+        if package["license"] not in PERMISSIVE:
+            raise SystemExit(
+                f"virtio-console links {package['name']} under {package['license']}")
+        outside.append(package["name"])
+    if "virtio-drivers" not in outside:
+        raise SystemExit("virtio-console no longer links virtio-drivers")
+    print("kernel links no outside crate; virtio-console links "
+          + ", ".join(sorted(outside)) + " under permissive licences")
 
 
 if __name__ == "__main__":

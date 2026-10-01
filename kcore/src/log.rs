@@ -180,6 +180,20 @@ impl<const N: usize> Ring<N> {
         )
     }
 
+    /// Gives the text records nobody showed or took to `put`, oldest
+    /// first, and marks them shown: what the kernel said before it had a
+    /// port, which goes out once the port is known (spec 3.2). O(N).
+    pub fn show(&mut self, mut put: impl FnMut(&Record)) {
+        for n in self.first()..self.head {
+            let record = &mut self.records[(n % N as u64) as usize];
+            let text = matches!(record.kind, abi::LOG_TEXT_KIND | abi::LOG_KERNEL_KIND);
+            if text && !record.shown {
+                put(record);
+                record.shown = true;
+            }
+        }
+    }
+
     /// The records nobody showed or took, oldest first: what the panic
     /// prints before its report (spec 16.1). O(N).
     pub fn unshown(&self) -> impl Iterator<Item = &Record> {
@@ -273,6 +287,24 @@ mod tests {
             .trim_end()
             .parse()
             .unwrap()
+    }
+
+    /// What the kernel said before it had a port goes out once, in its
+    /// order, and no reader takes it afterwards; a record shown when it
+    /// was written and an event record stay as they were.
+    #[test]
+    fn show_gives_the_early_records_once_in_order() {
+        let mut ring = Ring::<8>::new();
+        ring.push(1, LOG_KERNEL_KIND, &numbered(0), false);
+        ring.push(2, LOG_TEXT_KIND, &numbered(1), true);
+        ring.push(3, 3, b"event", false);
+        ring.push(4, LOG_KERNEL_KIND, &numbered(2), false);
+        let mut shown = Vec::new();
+        ring.show(|r| shown.push(number_of(r)));
+        assert_eq!(shown, [0, 2]);
+        ring.show(|_| panic!("a record went out twice"));
+        let kinds: Vec<u8> = ring.unshown().map(|r| r.kind).collect();
+        assert_eq!(kinds, [3]);
     }
 
     #[test]

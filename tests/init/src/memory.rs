@@ -9,11 +9,16 @@ use crate::harness::*;
 use crate::timers::timer_at;
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 20] = [
+pub(crate) const TESTS: [Test; 22] = [
     (
         "mem_create_checks_its_arguments",
         mem_create_checks_its_arguments,
     ),
+    (
+        "contiguous_mem_create_checks_its_arguments",
+        contiguous_mem_create_checks_its_arguments,
+    ),
+    ("dma_maintenance_runs_at_el0", dma_maintenance_runs_at_el0),
     (
         "mem_create_takes_the_whole_object_at_once",
         mem_create_takes_the_whole_object_at_once,
@@ -80,11 +85,12 @@ pub(crate) fn memory_object(pages: u64) -> Result<Handle<Memory>, &'static str> 
 }
 
 /// mem_create(x0 size, x1 flags) checks its values, the size and then the
-/// flags, of which none is known (spec 7.3, 11), and changes x0 alone on an
-/// error: a size of 0, off whole pages, past abi::MAX_MEMORY or with bits
-/// past it, and any flag fail with INVALID_ARGS. A good call changes x0 and
-/// x1 alone: a handle with abi::MEMORY_RIGHTS, which a copy with all of
-/// them shows and one with MANAGE does not get. The caller's resources are
+/// flags (spec 7.3, 11), and changes x0 alone on an error: a size of 0,
+/// off whole pages, past abi::MAX_MEMORY or with bits past it, an unknown
+/// flag and abi::MEM_UNCACHED without abi::MEM_CONTIGUOUS fail with
+/// INVALID_ARGS. A good call without flags changes x0 and x1 alone, x2
+/// unread: a handle with abi::MEMORY_RIGHTS, which a copy with all of them
+/// shows and one with MANAGE does not get. The caller's resources are
 /// kernel tests (mem_create_over_the_quota_is_no_memory).
 fn mem_create_checks_its_arguments() -> Outcome {
     const N: u16 = Call::MemCreate.number();
@@ -97,7 +103,8 @@ fn mem_create_checks_its_arguments() -> Outcome {
         (abi::MAX_MEMORY + page, 0),
         (1 << 40, 0),
         (u64::MAX, 0),
-        (page, 1),
+        (page, 2),
+        (page, 4),
         (page, 1 << 63),
         (0, 1),
     ]
@@ -122,6 +129,114 @@ fn mem_create_checks_its_arguments() -> Outcome {
     check(
         all == Ok(Ok(())) && more == Err(Error::AccessDenied),
         "the handle of mem_create does not carry MEMORY_RIGHTS and no more",
+    )
+}
+
+/// mem_create(x0 size, x1 flags, x2 resource) with abi::MEM_CONTIGUOUS
+/// checks the values first, then x2, a system resource with DEVICE (spec
+/// 7.3, 11), and changes x0 alone on an error: an unknown flag beside it,
+/// and a size that is no power of two of pages or past
+/// abi::MAX_CONTIGUOUS_PAGES, fail with INVALID_ARGS, through a closed x2
+/// too; then x2 closed, a channel and a copy of the resource without
+/// DEVICE fail with BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED. A good call
+/// changes x0, x1 and x2 alone: a handle with abi::DMA_MEMORY_RIGHTS and
+/// no MAP_EXEC, so that a mapping RX fails with ACCESS_DENIED, and the
+/// block's physical address, aligned to its size.
+fn contiguous_mem_create_checks_its_arguments() -> Outcome {
+    const N: u16 = Call::MemCreate.number();
+    let page = PAGE as u64;
+    let gone = closed_handle()?;
+    let c = channel(QUIET)?;
+    let no_device = copy(&resource(), Rights::DEBUG)?;
+    let r = resource().raw().0;
+    let invalid = [
+        (page, 1 | 4, r),
+        (page, 3 | 1 << 63, r),
+        (3 * page, 1, r),
+        (12 * page, 3, r),
+        (2048 * page, 1, r),
+        (3 * page, 1, gone),
+    ]
+    .into_iter()
+    .all(|(size, flags, x2)| x0_alone::<N>(&[size, flags, x2], Error::InvalidArgs.code()));
+    let refused = [
+        (gone, Error::BadHandle),
+        (c.raw().0, Error::WrongType),
+        (no_device.raw().0, Error::AccessDenied),
+    ]
+    .into_iter()
+    .all(|(x2, e)| x0_alone::<N>(&[page, 1, x2], e.code()));
+    close(c)?;
+    close(no_device)?;
+    check(
+        invalid,
+        "a bad contiguous size or flag did not fail with INVALID_ARGS alone",
+    )?;
+    check(
+        refused,
+        "a bad x2 of a contiguous mem_create did not fail alone",
+    )?;
+    let mut x = marked();
+    x[..3].copy_from_slice(&[16 * page, abi::MEM_CONTIGUOUS | abi::MEM_UNCACHED, r]);
+    // SAFETY: mem_create only reads its registers.
+    let after = unsafe { sys::raw::<N>(x) };
+    check(
+        after[0] == 0 && after[1] != 0 && after[3..] == x[3..],
+        "a good contiguous mem_create failed or changed registers past x2",
+    )?;
+    let m: Handle<Memory> = Handle::from_raw(abi::Handle(after[1]));
+    let aligned = after[2] != 0 && after[2].is_multiple_of(16 * page);
+    let all = sys::handle_duplicate(&m, abi::DMA_MEMORY_RIGHTS).map(close);
+    let exec = sys::handle_duplicate(&m, Rights::MAP_EXEC).map(close);
+    let run = sys::mem_map(&own(), &m, 0, page, WINDOW, Access::ReadExec);
+    close(m)?;
+    check(aligned, "x2 is not a block aligned to the object's size")?;
+    check(
+        all == Ok(Ok(())) && exec == Err(Error::AccessDenied),
+        "the handle of a contiguous object does not carry DMA_MEMORY_RIGHTS and no more",
+    )?;
+    check(
+        run == Err(Error::AccessDenied),
+        "a contiguous object mapped RX",
+    )
+}
+
+/// rt::dma runs at EL0 (spec 7.3, [G18]): the line of CTR_EL0 is a power
+/// of two from 16 to 2048 bytes; `dc cvac` and `dc civac` over a mapping
+/// of a contiguous object, which SCTLR_EL1.UCI opens to programs, and the
+/// barriers leave what the program wrote in place. QEMU models no caches,
+/// so what the device sees is the business of the driver on VZ.
+fn dma_maintenance_runs_at_el0() -> Outcome {
+    let page = PAGE as u64;
+    let (m, pa) = sys::mem_create_contiguous(2 * page, false, &resource())
+        .map_err(|_| "a contiguous mem_create failed")?;
+    let line = rt::dma::line();
+    map(&m, 0, 2 * page, WINDOW, Access::ReadWrite)?;
+    // SAFETY: the two pages are init's mapping of the object, read and write.
+    unsafe { ((WINDOW + 5) as *mut u64).write_unaligned(0x5EE5_BAC4) };
+    rt::dma::clean_invalidate(WINDOW, 2 * PAGE);
+    // SAFETY: as above.
+    unsafe { ((WINDOW + PAGE + 64) as *mut u64).write_volatile(0xD0_0D1E) };
+    rt::dma::clean(WINDOW + 5, PAGE);
+    rt::dma::wmb();
+    rt::dma::rmb();
+    // SAFETY: as above.
+    let seen = unsafe {
+        (
+            ((WINDOW + 5) as *const u64).read_unaligned(),
+            ((WINDOW + PAGE + 64) as *const u64).read_volatile(),
+        )
+    };
+    unmap(WINDOW, 2 * page)?;
+    close(m)?;
+    check(
+        line.is_power_of_two() && (16..=2048).contains(&line),
+        "the line of CTR_EL0 is no power of two from 16 to 2048",
+    )?;
+    check(pa != 0, "a contiguous object came without its address")?;
+    check(
+        seen == (0x5EE5_BAC4, 0xD0_0D1E),
+        "cache maintenance lost what the program wrote",
     )
 }
 

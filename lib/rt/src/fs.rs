@@ -107,28 +107,8 @@ impl Input {
             }
             return Ok(input.len());
         }
-        let mut chars = [0; 8];
-        let mut wait = None;
-        loop {
-            let n = console::poll_limit(&mut chars, out.len().min(8)).map_err(Status::Kernel)?;
-            if n > 0 {
-                let n = n.min(out.len());
-                out[..n].copy_from_slice(&chars[..n]);
-                return Ok(n);
-            }
-            // Yield only rotates ready threads at the same priority. Sleeping
-            // lets lower-priority file and heap owners run while input is absent.
-            if wait.is_none() {
-                let channel = sys::channel_create(1).map_err(Status::Kernel)?;
-                let timer = crate::wait::Waiter::new(&channel, 0, 1).map_err(Status::Kernel)?;
-                wait = Some((channel, timer));
-            }
-            let (channel, timer) = wait.as_ref().expect("native input wait");
-            let deadline = crate::time::ticks_to_ns(crate::time::now()).saturating_add(1_000_000);
-            timer
-                .receive_until(channel, deadline)
-                .map_err(Status::Kernel)?;
-        }
+        // No console's driver to read from: input has no transport.
+        Err(Status::Kernel(Error::BadHandle))
     }
 }
 

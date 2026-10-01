@@ -334,8 +334,8 @@ impl<T: HeapNode> Heap<T> {
     /// `t` is in the heap.
     unsafe fn sift_down(&mut self, t: NonNull<T>) {
         loop {
-            // SAFETY: the caller's promise; a timer in the heap is alive.
             let (left, right) = {
+                // SAFETY: the caller's promise; a timer in the heap is alive.
                 let l = unsafe { link(t) };
                 (l.left, l.right)
             };

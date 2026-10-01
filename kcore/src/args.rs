@@ -252,6 +252,40 @@ pub fn memory_size_arg(raw: u64) -> Result<usize, Error> {
     }
 }
 
+/// What the flags of `mem_create` ask for (spec 7.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryKind {
+    /// Pages whose frames lie anywhere (no flag).
+    Pages,
+    /// One block of the frame allocator of 2^`order` pages
+    /// (abi::MEM_CONTIGUOUS), Normal Non-cacheable in every mapping when
+    /// `uncached` (abi::MEM_UNCACHED).
+    Contiguous { order: u8, uncached: bool },
+}
+
+/// The flags of `mem_create`, x1, for an object of `pages` pages, which
+/// `memory_size_arg` let through (spec 7.3): none, abi::MEM_CONTIGUOUS
+/// alone, or with abi::MEM_UNCACHED, for a power of two of pages up to
+/// abi::MAX_CONTIGUOUS_PAGES. INVALID_ARGS for any other bit, for
+/// MEM_UNCACHED alone, and for a contiguous object of another size.
+pub fn memory_kind_arg(flags: u64, pages: usize) -> Result<MemoryKind, Error> {
+    const UNCACHED: u64 = abi::MEM_CONTIGUOUS | abi::MEM_UNCACHED;
+    let uncached = match flags {
+        0 => return Ok(MemoryKind::Pages),
+        abi::MEM_CONTIGUOUS => false,
+        UNCACHED => true,
+        _ => return Err(Error::InvalidArgs),
+    };
+    if pages.is_power_of_two() && pages as u64 <= abi::MAX_CONTIGUOUS_PAGES {
+        Ok(MemoryKind::Contiguous {
+            order: pages.trailing_zeros() as u8,
+            uncached,
+        })
+    } else {
+        Err(Error::InvalidArgs)
+    }
+}
+
 /// A range of a program's address space from two registers, its start and
 /// its length in bytes (spec 7.4, 11): both whole pages, the length not 0,
 /// and the range in the lower half. Returns its pages; INVALID_ARGS
@@ -524,6 +558,30 @@ mod tests {
             u64::MAX,
         ] {
             assert_eq!(memory_size_arg(raw), Err(Error::InvalidArgs), "{raw:#x}");
+        }
+    }
+
+    #[test]
+    fn contiguous_objects_are_powers_of_two_up_to_1024_pages() {
+        assert_eq!(memory_kind_arg(0, 3), Ok(MemoryKind::Pages));
+        let contiguous = |order, uncached| Ok(MemoryKind::Contiguous { order, uncached });
+        assert_eq!(memory_kind_arg(1, 1), contiguous(0, false));
+        assert_eq!(memory_kind_arg(3, 16), contiguous(4, true));
+        assert_eq!(memory_kind_arg(1, 1024), contiguous(10, false));
+        for (flags, pages) in [
+            (1, 3),
+            (3, 12),
+            (1, 2048),
+            (2, 1),
+            (4, 1),
+            (5, 1),
+            (1 << 63 | 1, 1),
+        ] {
+            assert_eq!(
+                memory_kind_arg(flags, pages),
+                Err(Error::InvalidArgs),
+                "{flags:#x} {pages}"
+            );
         }
     }
 

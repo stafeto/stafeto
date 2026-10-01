@@ -29,6 +29,9 @@ pub const TABLE: &[Record] = &[
         bindings: &[],
         connects: &[],
         args: &[],
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     },
     Record {
         name: "ramfs-probe",
@@ -46,6 +49,9 @@ pub const TABLE: &[Record] = &[
         bindings: &[],
         connects: &["ramfs"],
         args: &[],
+        dma: &[],
+        quiesce: &[],
+        trusted: false,
     },
 ];
 

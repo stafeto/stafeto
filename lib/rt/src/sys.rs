@@ -484,6 +484,22 @@ pub fn mem_create(size: u64) -> Result<Handle<Memory>, Error> {
     Ok(returned(&x))
 }
 
+/// mem_create with abi::MEM_CONTIGUOUS and `uncached` for abi::MEM_UNCACHED
+/// (spec 7.3): one block of `size` bytes, a power of two of pages up to
+/// abi::MAX_CONTIGUOUS_PAGES, aligned to its size, zeroed and out of the
+/// data cache, through `resource`, a system resource with DEVICE. Returns
+/// the handle, with abi::DMA_MEMORY_RIGHTS, and the block's physical
+/// address, which a device's DMA takes.
+pub fn mem_create_contiguous(
+    size: u64,
+    uncached: bool,
+    resource: &Handle<Resource>,
+) -> Result<(Handle<Memory>, u64), Error> {
+    let flags = abi::MEM_CONTIGUOUS | if uncached { abi::MEM_UNCACHED } else { 0 };
+    let x = call::<{ Call::MemCreate.number() }>(&[size, flags, resource.raw().0])?;
+    Ok((returned(&x), x[2]))
+}
+
 /// mem_map: shows `len` bytes of `memory` from byte `offset` at `addr` of
 /// `process`, a handle with MANAGE, with `access` (spec 7.4): R needs
 /// MAP_READ, RW MAP_WRITE as well, RX MAP_EXEC as well. The pages of the
@@ -554,26 +570,6 @@ pub fn debug_write(resource: &Handle<Resource>, bytes: &[u8]) -> Result<usize, E
     args[2..].copy_from_slice(&abi::inline_words(bytes));
     let x = call::<{ Call::DebugWrite.number() }>(&args)?;
     Ok(x[1] as usize)
-}
-
-/// Poll up to eight input bytes from the native Virtio console.
-pub fn console_poll(resource: &Handle<Resource>, out: &mut [u8; 8]) -> Result<usize, Error> {
-    console_poll_limit(resource, out, 8)
-}
-
-/// Poll at most limit bytes, leaving remaining native input queued.
-pub fn console_poll_limit(
-    resource: &Handle<Resource>,
-    out: &mut [u8; 8],
-    limit: usize,
-) -> Result<usize, Error> {
-    if !(1..=8).contains(&limit) {
-        return Err(Error::InvalidArgs);
-    }
-    let x = call::<{ Call::ConsolePoll.number() }>(&[resource.raw().0, limit as u64])?;
-    let count = (x[1] as usize).min(limit);
-    out[..count].copy_from_slice(&x[2].to_le_bytes()[..count]);
-    Ok(count)
 }
 
 /// channel_create: a channel whose slot of label 0 has `priority` (1-63,
