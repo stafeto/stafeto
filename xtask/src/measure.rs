@@ -32,6 +32,7 @@ fn measured_line(line: &str) -> bool {
         "ipc round trip longest ticks:",
         "memory portions ticks:",
         "teardown portions ticks:",
+        "threads ready ticks:",
         "thread exit after close ticks:",
         "thread exit notice ticks:",
         "process kill ticks:",

@@ -49,10 +49,9 @@ const EXIT_BITS: u64 = 1;
 /// Replies, Children, Handles, Space and Shell take as many portions as
 /// their steps; the others one. The stages Threads and Stop run at S, the
 /// higher of the process's ceiling and R (`level`); Replies at the higher
-/// of R and its
-/// top client; the others at R, but for Shell, which runs at the level of
-/// the last reference. After the stage Notify the queue lets its reference
-/// go.
+/// of R and its top client; the others at R, but for Shell, which runs at
+/// the level of the last reference. After the stage Notify the queue lets
+/// its reference go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     /// No teardown began: the process lives.
@@ -66,7 +65,11 @@ pub enum Stage {
     /// queue wins over threads of its level (kcore::sched::Scheduler::pick),
     /// and the fast path of send hands off to none of them
     /// (Scheduler::can_hand_off). A thread that leaves the list moves the
-    /// cursor on (`remove_thread`).
+    /// cursor on (`remove_thread`). Until its portion, a thread that waits
+    /// in receive on a channel that a live process receives on too takes
+    /// requests and notifications there as any receiver does (spec 6.8):
+    /// its client wakes with PEER_CLOSED at the stage Replies, and the
+    /// notification goes with the process.
     Threads,
     /// Only for a process with children when it ends: a child a portion,
     /// the one at the cursor `stop_next`, ends, killed, at R, if it lives,
@@ -194,12 +197,14 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
 /// The teardown of a process that just ended begins at `cause` (spec
 /// 7.7): R grows to it, and the cleanup queue takes a reference of its
 /// own and queues the process for its first stage: Threads at S for a
-/// process with threads in its list, Stop at S for one with children,
+/// process with threads in its list past `stopped`, the thread the call
+/// took off when it heads the list, Stop at S for one with children,
 /// Replies otherwise (`stage_level`). It takes the scheduler's lock.
 ///
 /// # Safety
-/// `process` is alive, whole, and in no queue.
-pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
+/// `process` is alive, whole, and in no queue; `stopped`, if any, is a
+/// thread of it that left the scheduler.
+pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option<NonNull<Thread>>) {
     // SAFETY: the caller's promise; only the fields are touched.
     unsafe {
         let p = process.as_ptr();
@@ -210,6 +215,11 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
         (*p).level = (*p).level.max(cause);
         (*p).stop_next = (*p).children;
         (*p).threads_next = (*p).threads;
+        if let Some(t) = stopped
+            && (*p).threads_next == Some(t)
+        {
+            (*p).threads_next = (*t.as_ptr()).siblings.and_then(|s| s.next);
+        }
         (*p).stage = with_work(p, Stage::Threads);
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
@@ -221,9 +231,8 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8) {
 
 /// The level the stage of `process` runs at (spec 7.7): S, the higher of
 /// its ceiling and R, at the stages Threads and Stop; the higher of R and
-/// the top level
-/// of its accepted requests at the stage Replies, read under the
-/// scheduler's lock; R at the others. O(1).
+/// the top level of its accepted requests at the stage Replies, read under
+/// the scheduler's lock; R at the others. O(1).
 ///
 /// # Safety
 /// `process` is alive; only the fields are read.

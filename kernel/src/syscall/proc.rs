@@ -122,19 +122,22 @@ fn new_child(
     })
 }
 
-/// process_kill(x0 process with MANAGE, x1 level): the process ends,
-/// reason «killed» (spec 11): its threads stop in whatever state they are
-/// and its descendants in a wave, both at S, and the cleanup queue takes what it
+/// process_kill(x0 process with MANAGE, x1 level): the process ends, reason
+/// «killed» (spec 11): its threads stop in whatever state they are and its
+/// descendants in a wave, both at S, and the cleanup queue takes what it
 /// holds apart at R, the higher of the level and the priority of its exit
-/// notification (spec 7.7). Level 0 is the caller's effective priority:
-/// the teardown runs before the caller runs again, and the call returns
-/// after it. A level of 1-63 no higher than the caller's effective
-/// priority returns once the part in the call is done when it is lower;
-/// the exit notification tells of the end. A process that ended already:
-/// 0, and its teardown is raised to the level (process::hasten). Killing
-/// the caller's own process never returns. The checks in the order of
-/// spec 11: a level above 63 (INVALID_ARGS), the handle, then a level above
-/// the caller's effective priority (ACCESS_DENIED). O(1).
+/// notification (spec 7.7). Until the stage Threads took them, object_info
+/// shows its threads as they were, and thread_interrupt and
+/// thread_set_priority still act on them, though none runs. Level 0 is the
+/// caller's effective priority: the teardown runs before the caller runs
+/// again, and the call returns after it. A level of 1-63 no higher than the
+/// caller's effective priority returns once the part in the call is done
+/// when it is lower; the exit notification tells of the end. A process that
+/// ended already: 0, and its teardown is raised to the level
+/// (process::hasten). Killing the caller's own process never returns. The
+/// checks in the order of spec 11: a level above 63 (INVALID_ARGS), the
+/// handle, then a level above the caller's effective priority
+/// (ACCESS_DENIED). O(1).
 pub(super) fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let level = match a[1] {
         0 => None,

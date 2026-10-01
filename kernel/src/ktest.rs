@@ -269,6 +269,10 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::end_takes_the_running_thread_off,
     ),
     (
+        "shared_channel_feeds_a_dying_receiver",
+        calls::shared_channel_feeds_a_dying_receiver,
+    ),
+    (
         "dying_receiver_takes_a_request",
         calls::dying_receiver_takes_a_request,
     ),

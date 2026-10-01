@@ -72,7 +72,8 @@ pub fn handle_room(process: NonNull<Process>) -> Result<(), Error> {
 /// comes from the pool of blocks of `process`, whose quota pays for a page
 /// when the pool grows, whoever the handle comes from. LIMIT_REACHED at
 /// the table's limit, NO_MEMORY when the quota falls short for a page.
-/// The process lives: the table of one that ended stays empty.
+/// The process lives: only a message to a thread of one that ended, at its
+/// stage Threads, puts handles there (`put_handles`).
 pub fn insert_handle(
     process: NonNull<Process>,
     object: Object,

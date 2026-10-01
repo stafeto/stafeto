@@ -15,9 +15,8 @@
 //! spec 7.7): first its threads, at most abi::MAX_THREADS, leave the
 //! scheduler and a wave stops its descendants, both above the cause, at
 //! its priority ceiling, then the teardown at the level of the cause, its
-//! descendants first. Once
-//! it gave its quota back, its exit channel hears of the end (spec 7.9),
-//! through a slot in its shell. A shell with the reason stays for
+//! descendants first. Once it gave its quota back, its exit channel hears
+//! of the end (spec 7.9), through a slot in its shell. A shell with the reason stays for
 //! object_info until the last reference queues it once more. Every release
 //! names the level of its cause, which the cleanup it may start takes. A
 //! process pays from its quota for what goes with it (spec 7.5, 7.8): a
@@ -554,7 +553,7 @@ pub unsafe fn release(process: NonNull<Process>, cause: u8) {
             Stage::Whole => {
                 let ended = (*life(process)).end(ProcessState::Killed);
                 assert!(ended, "a whole process that ended");
-                begin(process, cause);
+                begin(process, cause, None);
             }
             Stage::Shell => queue_shell(process, cause),
             _ => unreachable!("the cleanup queue holds a process on its stages"),
@@ -734,12 +733,11 @@ unsafe fn stop(process: NonNull<Process>, cause: u8) {
     // SAFETY: the caller's reference keeps the process alive; the running
     // thread is alive and holds its process.
     unsafe {
-        if let Some(t) = sched::running()
-            && t.as_ref().process() == process
-        {
+        let running = sched::running().filter(|t| t.as_ref().process() == process);
+        if let Some(t) = running {
             sched::exit(t, cause);
         }
-        begin(process, cause);
+        begin(process, cause, running);
     }
     // SAFETY: as above.
     let (init, state) = unsafe { ((*p).init, (*life(process)).state()) };
