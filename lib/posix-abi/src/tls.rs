@@ -56,6 +56,23 @@ pub unsafe fn attach(page: *mut u8, len: usize, id: u64) {
     }
 }
 
+/// Gives the calling thread the TCB its creator built in `page` with
+/// posix_thread::build (so that signals sent before it ran wait in its
+/// block), as pthread `id` with the process's files.
+///
+/// # Safety
+/// `page` holds a TCB `build` made, the thread's alone for its life.
+pub unsafe fn attach_built(page: *mut u8, id: u64) {
+    let _guard = rt::upcall::defer_entries().expect("TCB install deferral");
+    // SAFETY: the caller's promise.
+    unsafe {
+        let tcb = page.add(posix_thread::TCB_OFFSET).cast::<Tcb>();
+        (*tcb).block.process_files = 1;
+        (*tcb).block.thread_id = id;
+        posix_thread::activate(page);
+    }
+}
+
 /// The fields of a block a scope changes.
 #[derive(Clone, Copy)]
 struct Fields {

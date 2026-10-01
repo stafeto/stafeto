@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Initial managed pthread lifecycle. One IPC owner retains native handles,
-//! stack mappings and join results. Each pthread is made with the owner's
-//! channel as its exit channel (thread_create x7, x8): the kernel tells the
-//! owner once the thread left the scheduler, and only then its stack goes
-//! and a join wakes, whether the thread ended through pthread_exit or past
-//! the library. Each pthread gets its TCB (posix-thread) in the page
-//! above its stack, in the same memory object, and attaches to it before
-//! its callback (`tls::attach`). ELF TLS and scheduler attributes remain
-//! work.
+//! pthreads without a helper thread (spec 2, 3.4, 3.5). Every operation
+//! runs in the calling thread: the table of threads (stacks, handles,
+//! claims of joins) is under the layer's lock, a thread's signals, its
+//! cancellation and its waits live in its block (posix-thread), and waits
+//! use its own channel (posix-sync). A pthread's stack and the page of its
+//! TCB above it are one memory object in its band; its end comes as the
+//! kernel's notification on its own exit channel (thread_create x7, x8),
+//! which its joiner, or the next create, join or detach for a detached one,
+//! takes before the stack and the handles go. The main thread's TCB is in
+//! `.bss`; its joiner waits on the end word of its block. The process ends
+//! with its last application thread.
 
 pub mod cancel;
 pub mod mutex;
 pub mod once;
-mod replies;
-mod signal_owner;
 pub mod sleep;
 pub mod specific;
 
@@ -23,12 +23,13 @@ use crate::{allocation, constants::*, tls};
 use core::{
     cell::UnsafeCell,
     ffi::c_void,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+use posix_sync::LayerLock;
+use posix_thread::Block;
 use rt::{
-    Stack,
-    abi::{Access, Error, Policy, ThreadState},
-    handle::{Channel, Handle, Thread, Timer},
+    abi::{Access, Error, Policy, Rights, Source},
+    handle::{Channel, Handle, Thread},
     sys,
 };
 
@@ -37,16 +38,7 @@ const PAGE: usize = 4096;
 const STACK_BASE: usize = 0x3000_0000;
 const STRIDE: usize = 0x10_0000;
 const DEFAULT_STACK: usize = 65536;
-const CREATE: u64 = 1;
-const EXIT: u64 = 2;
-const JOIN: u64 = 3;
-const JOIN_ACK: u64 = 4;
-const DETACH: u64 = 5;
-const CANCEL: u64 = 7;
-const JOIN_ABANDON: u64 = 8;
-const REPLY_ACK: u64 = 28;
 const ATTR_MAGIC: u64 = 0x5054_4852_4154_5431;
-
 type Start = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 
 #[repr(C)]
@@ -98,42 +90,13 @@ fn rounded(size: usize) -> Option<usize> {
     size.checked_add(PAGE - 1).map(|n| n & !(PAGE - 1))
 }
 
-struct Once<T>(UnsafeCell<Option<T>>);
-// SAFETY: startup publishes the immutable channel once. The main handle is
-// consumed only by the single owner after publication.
-unsafe impl<T: Send> Sync for Once<T> {}
-static CHANNEL: Once<Handle<Channel>> = Once(UnsafeCell::new(None));
-static MAIN: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
-static REAPER: Once<Handle<Timer>> = Once(UnsafeCell::new(None));
 static READY: AtomicBool = AtomicBool::new(false);
-static OWNER_STACK: Stack<65536> = Stack::new();
-#[cfg(feature = "transport-probe")]
-static INTERRUPT_REPLIES: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static CANCEL_JOIN_REPLY: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "transport-probe")]
-static OWNER_NATIVE: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
-#[cfg(feature = "transport-probe")]
-static TIMER_PRIORITY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-#[cfg(feature = "transport-probe")]
-static OWNER_PARKED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "transport-probe")]
-static SIGNAL_SEND_GATE: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static SIGNAL_RETRY_GATE: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static SIGNAL_RETRY_PARKED: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "transport-probe")]
-static WAKE_RETRIES: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static UPCALL_REPLIES: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static ACK_TARGET: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static ACK_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
-static NONCE: AtomicU64 = AtomicU64::new(1);
-/// The main thread's handle with MANAGE, for its block.
+/// The main thread's handle for its block: the loader gives it no
+/// DUPLICATE, so the block names the table's.
 static MAIN_SELF: AtomicU64 = AtomicU64::new(0);
+/// The application threads that have not ended: the last that ends ends
+/// the process, whatever the layer's own threads do.
+static LIVE: AtomicUsize = AtomicUsize::new(1);
 
 struct Launch {
     id: AtomicU64,
@@ -162,198 +125,55 @@ static LAUNCH: [Launch; CAPACITY] = [const {
     }
 }; CAPACITY];
 
-fn channel() -> &'static Handle<Channel> {
-    // SAFETY: successful startup publishes this immutable handle.
-    unsafe {
-        (*CHANNEL.0.get())
-            .as_ref()
-            .expect("thread owner initialized")
-    }
-}
-
-/// Initialize once after the heap and file owner, before entering C main.
-///
-/// # Safety
-/// Startup owns exclusive initialization. 0xf00000, message pages starting
-/// at 0x2000000 and stack reservations 0x30000000..0x34000000 are unused.
-/// The supplied handle owns the calling main thread.
-pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
-    if READY.load(Ordering::Acquire) {
-        return Err(Error::BadState);
-    }
-    // Between reply and receive the owner is ready without a donated boost.
-    // It must run at the process's ceiling to accept queued requests even when
-    // another application thread computes at a higher FIFO priority than main.
-    let owner_priority = crate::ceiling()?;
-    // A process whose ceiling is its main thread's level puts the owner, the
-    // workers and the timer level with the application (init's POSIX
-    // record gives main + 1): say so, since nothing else would.
-    if sys::thread_info(&main).is_ok_and(|info| info.base >= owner_priority) {
-        rt::println!(
-            "posix-abi: the process ceiling {} is not above main; its helper threads compete with main",
-            owner_priority
-        );
-    }
-    // The main thread's handle for its block (`attach`): the loader gives
-    // it no DUPLICATE, so the block names the owner's; the owner keeps it
-    // while the main thread lives.
-    MAIN_SELF.store(main.raw().0, Ordering::Release);
-    posix_sync::configure(owner_priority, crate::signals::deliver_deferred);
-    let endpoint = sys::channel_create(owner_priority)?;
-    crate::clock::watch(&endpoint).map_err(|status| {
-        rt::println!("pthread clock watch failed: {:?}", status);
-        Error::PeerClosed
-    })?;
-    // Reserve the timer before clients can exhaust the process memory quota.
-    // Its expiry wakes sleepers of every level, so it queues at the owner's
-    // level, ahead of the requests of application threads.
-    let timer = deadline_timer(&endpoint, owner_priority)?;
-    unsafe {
-        *CHANNEL.0.get() = Some(endpoint);
-        *MAIN.0.get() = Some(main);
-        *REAPER.0.get() = Some(timer);
-    }
-    LAUNCH[0].id.store(1, Ordering::Release);
-    let result = (|| {
-        let thread = unsafe {
-            sys::thread_create(
-                allocation::process(),
-                owner,
-                OWNER_STACK.top(),
-                0,
-                owner_priority,
-                Policy::Fifo,
-                0xf00000,
-            )
-        }?;
-        READY.store(true, Ordering::Release);
-        sys::thread_start(&thread)?;
-        #[cfg(feature = "transport-probe")]
-        unsafe {
-            *OWNER_NATIVE.0.get() = Some(thread);
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        READY.store(false, Ordering::Release);
-        unsafe {
-            *CHANNEL.0.get() = None;
-            *MAIN.0.get() = None;
-            *REAPER.0.get() = None;
-        }
-    }
-    result
-}
-
-/// The owner's sleep and poll timer, its expiries queued at `level`. The
-/// probe build records the level: object_info reports no timer priority.
-fn deadline_timer(endpoint: &Handle<Channel>, level: u8) -> Result<Handle<Timer>, Error> {
-    #[cfg(feature = "transport-probe")]
-    TIMER_PRIORITY.store(level, Ordering::Release);
-    sys::timer_create(endpoint, level)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
-    Live,
-    Exiting,
-    Ended,
-}
-#[derive(Clone, Copy)]
-struct Cached {
-    nonce: u64,
-    status: i32,
-    value: u64,
-    extra: u64,
-    tail: [u64; 5],
-}
-struct Waiting {
-    caller: u64,
-    nonce: u64,
-    token: Option<sys::Token>,
-}
-#[derive(Clone, Copy)]
-struct Recovery {
-    nonce: u64,
-    answer: Option<Cached>,
-}
-fn recovery_slot(op: u64) -> Option<usize> {
-    match op {
-        EXIT => Some(0),
-        specific::TAKE => Some(1),
-        JOIN_ABANDON => Some(4),
-        sleep::ABANDON => Some(5),
-        specific::GET => Some(6),
-        specific::DELETE => Some(7),
-        crate::signals::ACTION => Some(8),
-        crate::signals::MASK => Some(9),
-        crate::signals::SEND => Some(10),
-        crate::signals::PENDING => Some(11),
-        crate::signals::TAKE => Some(12),
-        crate::signals::READY => Some(13),
-        crate::signals::WAIT => Some(14),
-        _ => None,
-    }
-}
+/// A thread of the table: its pthread number, its handle with MANAGE, the
+/// channel of its end (none for the main thread), its stack and TCB, and
+/// whether it is detached or a join claimed it.
 struct Entry {
     id: u64,
-    native: Option<Handle<Thread>>,
+    native: Handle<Thread>,
+    exit: Option<Handle<Channel>>,
     mapping: Option<(usize, usize)>,
-    phase: Phase,
     detached: bool,
-    value: u64,
-    waiting: Option<Waiting>,
-    woken_epoch: u64,
-    sleep_waiting: Option<sleep::Waiting>,
-    recovery: [Option<Recovery>; 15],
-    signal: posix_signals::Thread,
-    signal_waiting: Option<signal_owner::Waiting>,
-}
-impl Entry {
-    fn new(
-        id: u64,
-        native: Handle<Thread>,
-        mapping: Option<(usize, usize)>,
-        detached: bool,
-    ) -> Self {
-        Self {
-            id,
-            native: Some(native),
-            mapping,
-            phase: Phase::Live,
-            detached,
-            value: 0,
-            waiting: None,
-            woken_epoch: 0,
-            sleep_waiting: None,
-            recovery: [None; 15],
-            signal: posix_signals::Thread::new(0),
-            signal_waiting: None,
-        }
-    }
+    claimed: bool,
 }
 struct Registry {
     entries: [Option<Entry>; CAPACITY],
     next_id: u64,
-    specific: specific::Registry,
-    signals: posix_signals::Actions,
-    replies: replies::Journal,
-    #[cfg(feature = "transport-probe")]
-    parked_reply: Option<(u64, u64, u64)>,
 }
-struct OwnerRegistry(UnsafeCell<Registry>);
-// SAFETY: only the single successfully started owner borrows this registry.
-// Startup is exclusive, and the owner never binds native handlers or returns.
-unsafe impl Sync for OwnerRegistry {}
-static REGISTRY: OwnerRegistry = OwnerRegistry(UnsafeCell::new(Registry {
+struct Table(UnsafeCell<Registry>);
+// SAFETY: only `registry` borrows it, under TABLE_LOCK.
+unsafe impl Sync for Table {}
+static TABLE: Table = Table(UnsafeCell::new(Registry {
     entries: [const { None }; CAPACITY],
     next_id: 2,
-    specific: specific::Registry::new(),
-    signals: posix_signals::Actions::new(),
-    replies: replies::Journal::new(),
-    #[cfg(feature = "transport-probe")]
-    parked_reply: None,
 }));
+static TABLE_LOCK: LayerLock = LayerLock::new();
+
+/// Runs `f` on the table under the layer's lock (a short critical section).
+fn registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
+    let _guard = TABLE_LOCK.lock();
+    // SAFETY: the lock gives this borrow alone.
+    f(unsafe { &mut *TABLE.0.get() })
+}
+
+/// The block of the thread in `slot` of the table.
+fn block_of(slot: usize) -> &'static Block {
+    let page = if slot == 0 {
+        tls::main_page() as usize
+    } else {
+        LAUNCH[slot].tcb.load(Ordering::Acquire) as usize
+    };
+    // SAFETY: the TCB of a thread in the table stays mapped until it is
+    // taken back under the table's lock.
+    unsafe { &*((page + posix_thread::TCB_OFFSET + posix_thread::BLOCK_OFFSET) as *const Block) }
+}
+
+/// The calling thread's block.
+pub(crate) fn own_block() -> &'static Block {
+    // SAFETY: a managed thread has its block for its life.
+    unsafe { posix_thread::block().as_ref() }.expect("an attached thread")
+}
+
 impl Registry {
     fn find(&self, id: u64) -> Result<usize, i32> {
         self.entries
@@ -361,713 +181,88 @@ impl Registry {
             .position(|e| e.as_ref().is_some_and(|e| e.id == id))
             .ok_or(ESRCH)
     }
-    fn entry(&self, index: usize) -> &Entry {
-        self.entries[index].as_ref().expect("live entry")
-    }
-    fn entry_mut(&mut self, index: usize) -> &mut Entry {
-        self.entries[index].as_mut().expect("live entry")
-    }
-    fn ready(&self, caller: usize, nonce: u64) -> Option<Cached> {
-        self.entry(caller)
-            .recovery
-            .iter()
-            .flatten()
-            .find(|record| record.nonce == nonce)
-            .and_then(|record| record.answer)
-            .or_else(|| self.replies.ready(self.entry(caller).id, nonce))
-    }
-    fn reserve(&mut self, caller: usize, nonce: u64, op: u64) -> Result<(), ()> {
-        if let Some(slot) = recovery_slot(op) {
-            let recovery = &mut self.entry_mut(caller).recovery[slot];
-            if recovery.is_none() {
-                *recovery = Some(Recovery {
-                    nonce,
-                    answer: None,
-                });
-                return Ok(());
-            }
-            if recovery.is_some_and(|record| record.nonce == nonce) {
-                return Ok(());
-            }
-        }
-        // Nested requests never overwrite a reserved recovery result; they
-        // use the dynamic journal, retaining the normal resource failure path.
-        self.replies.reserve(self.entry(caller).id, nonce)
-    }
-    fn acknowledge(&mut self, caller: usize, nonce: u64) {
-        for slot in &mut self.entry_mut(caller).recovery {
-            if slot.is_some_and(|record| record.nonce == nonce) {
-                *slot = None;
-            }
-        }
-        self.replies.ack(self.entry(caller).id, nonce);
-    }
-    fn cache(&mut self, caller: usize, nonce: u64, result: Result<u64, i32>, _op: u64) -> Cached {
-        self.cache_pair(caller, nonce, result.map(|value| (value, 0)), _op)
-    }
-    fn cache_pair(
-        &mut self,
-        caller: usize,
-        nonce: u64,
-        result: Result<(u64, u64), i32>,
-        _op: u64,
-    ) -> Cached {
-        self.cache_words(
-            caller,
-            nonce,
-            result.map(|(value, extra)| [value, extra, 0, 0, 0, 0, 0]),
-            _op,
-        )
-    }
-    fn cache_words(
-        &mut self,
-        caller: usize,
-        nonce: u64,
-        result: Result<[u64; 7], i32>,
-        _op: u64,
-    ) -> Cached {
-        let (status, words) = match result {
-            Ok(words) => (0, words),
-            Err(status) => (status, [0; 7]),
-        };
-        let answer = Cached {
-            nonce,
-            status,
-            value: words[0],
-            extra: words[1],
-            tail: words[2..].try_into().expect("retained result tail"),
-        };
-        if let Some(record) = self
-            .entry_mut(caller)
-            .recovery
-            .iter_mut()
-            .flatten()
-            .find(|record| record.nonce == nonce)
-        {
-            record.answer = Some(answer);
-        } else {
-            self.replies.complete(self.entry(caller).id, answer);
-        }
-        #[cfg(feature = "transport-probe")]
-        if _op < 64 && UPCALL_REPLIES.fetch_and(!(1 << _op), Ordering::AcqRel) & (1 << _op) != 0 {
-            sys::thread_upcall_request(self.entry(caller).native.as_ref().expect("probe caller"))
-                .expect("native handler after pthread commit");
-        }
-        #[cfg(feature = "transport-probe")]
-        if _op == JOIN && CANCEL_JOIN_REPLY.swap(false, Ordering::AcqRel) {
-            LAUNCH[caller].cancel.pending.store(true, Ordering::SeqCst);
-            sys::thread_interrupt(
-                self.entry(caller)
-                    .native
-                    .as_ref()
-                    .expect("cancelled reply caller"),
-            )
-            .expect("interrupt cancelled join result");
-        }
-        #[cfg(feature = "transport-probe")]
-        if _op < 64 && INTERRUPT_REPLIES.fetch_and(!(1 << _op), Ordering::AcqRel) & (1 << _op) != 0
-        {
-            sys::thread_interrupt(self.entry(caller).native.as_ref().expect("probe caller"))
-                .expect("interrupt cached pthread reply");
-        }
-        answer
-    }
-    fn create(&mut self, caller: usize, words: [u64; 8]) -> Result<u64, i32> {
-        let slot = self
-            .entries
-            .iter()
-            .position(Option::is_none)
-            .ok_or(EAGAIN)?;
-        let id = self.next_id;
-        let next = id.checked_add(1).ok_or(EAGAIN)?;
-        let attr = Attributes {
-            magic: ATTR_MAGIC,
-            stack_size: words[5] as usize,
-            guard_size: (words[6] >> 1) as usize,
-            detached: (words[6] & 1) as i32,
-            reserved: 0,
-        };
-        if words[3] == 0 || !attr.valid() {
-            return Err(EINVAL);
-        }
-        let parent =
-            sys::thread_info(self.entry(caller).native.as_ref().ok_or(ESRCH)?).map_err(|_| EIO)?;
-        let policy = parent.policy.ok_or(EIO)?;
-        let length = rounded(attr.stack_size).ok_or(EINVAL)?;
-        let address = STACK_BASE + slot * STRIDE + rounded(attr.guard_size).ok_or(EINVAL)?;
-        // The stack and, above it, the page of the thread's TCB.
-        let mapped = length + PAGE;
-        let memory = sys::mem_create(mapped as u64).map_err(|_| EAGAIN)?;
-        sys::mem_map(
-            allocation::process(),
-            &memory,
-            0,
-            mapped as u64,
-            address,
-            Access::ReadWrite,
-        )
-        .map_err(|_| EAGAIN)?;
-        LAUNCH[slot].callback.store(words[3], Ordering::Relaxed);
-        LAUNCH[slot].argument.store(words[4], Ordering::Relaxed);
-        LAUNCH[slot].floating.store(words[7], Ordering::Relaxed);
-        LAUNCH[slot]
-            .tcb
-            .store((address + length) as u64, Ordering::Relaxed);
-        LAUNCH[slot].completed.store(false, Ordering::Relaxed);
-        LAUNCH[slot].cancel.reset();
-        LAUNCH[slot].specific.reset();
-        LAUNCH[slot].id.store(id, Ordering::Release);
-        // The end of the thread comes to the owner's channel at its level.
-        let level = crate::ceiling().map_err(|_| EIO)?;
-        // SAFETY: this slot owns the new stack until its native thread has ended.
-        let native = unsafe {
-            sys::thread_create_with(
-                allocation::process(),
-                trampoline,
-                address + length,
-                slot as u64,
-                parent.base,
-                policy,
-                0x2000000 + slot * PAGE,
-                Some((channel(), level)),
-            )
-        };
-        let native = match native.and_then(|native| {
-            let own = sys::handle_duplicate(&native, rt::abi::Rights::MANAGE)?;
-            LAUNCH[slot]
-                .thread
-                .store(own.into_raw().0, Ordering::Relaxed);
-            Ok(native)
-        }) {
-            Ok(native) => native,
-            Err(_) => {
-                unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
-                    .expect("failed-create stack removal");
-                return Err(EAGAIN);
-            }
-        };
-        self.entries[slot] = Some(Entry::new(
-            id,
-            native,
-            Some((address, mapped)),
-            attr.detached != 0,
-        ));
-        self.entry_mut(slot).signal.mask = self.entry(caller).signal.mask;
-        // Install ownership before a successful start can run the callback.
-        if sys::thread_start(self.entry(slot).native.as_ref().expect("new native thread")).is_err()
-        {
-            // The failed start leaves the thread stopped; release its handle
-            // before removing the stack it cannot execute on.
-            self.entries[slot] = None;
+    /// Takes back a thread that ended: its handles, its stack and TCB.
+    fn take_back(&mut self, slot: usize) {
+        let entry = self.entries[slot].take().expect("an entry to take back");
+        if let Some((address, length)) = entry.mapping {
+            let block = block_of(slot);
+            close_raw(block.timer.swap(0, Ordering::Relaxed));
+            close_raw(block.channel.swap(0, Ordering::Relaxed));
             close_raw(LAUNCH[slot].thread.swap(0, Ordering::Relaxed));
-            unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
-                .expect("failed-start stack removal");
-            return Err(EAGAIN);
+            // SAFETY: the kernel told of the thread's end: it never runs again.
+            unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
+                .expect("ended pthread stack removal");
         }
-        self.next_id = next;
-        Ok(id)
+        LAUNCH[slot].id.store(0, Ordering::Release);
+        drop(entry);
     }
-    /// Takes back the stacks of the threads that ended and wakes their
-    /// joiners: those that said EXIT, and with `heard`, after the kernel
-    /// told of an end, also those that ended past the library, whose value
-    /// is null.
-    fn reap(&mut self, heard: bool) {
-        for (index, launch) in LAUNCH.iter().enumerate() {
-            let Some(entry) = self.entries[index].as_mut() else {
-                continue;
-            };
-            let past = heard && entry.phase == Phase::Live && entry.mapping.is_some();
-            if entry.phase != Phase::Exiting && !past {
-                continue;
-            }
-            if sys::thread_info(entry.native.as_ref().expect("exiting native handle"))
-                .expect("owned thread information")
-                .state
-                != ThreadState::Ended
-            {
-                continue;
-            }
-            assert!(
-                past || launch.completed.load(Ordering::Acquire),
-                "published pthread completion"
-            );
-            if past {
-                // The kernel says it ended: its join sees a completion
-                // with a null value.
-                entry.value = 0;
-                launch.completed.store(true, Ordering::Release);
-            }
-            if let Some((address, length)) = entry.mapping.take() {
-                // The handles of its block go with it; nothing uses them
-                // once the thread ended (posix_sync::futex_wake notifies
-                // under the bucket's lock).
-                let page = launch.tcb.load(Ordering::Relaxed) as usize;
-                // SAFETY: the page above the stack holds the thread's TCB
-                // until the unmapping below.
-                let block = unsafe {
-                    &*((page + posix_thread::TCB_OFFSET + posix_thread::BLOCK_OFFSET)
-                        as *const posix_thread::Block)
-                };
-                close_raw(block.timer.swap(0, Ordering::Relaxed));
-                close_raw(block.channel.swap(0, Ordering::Relaxed));
-                close_raw(launch.thread.swap(0, Ordering::Relaxed));
-                // SAFETY: the kernel confirms this thread will never execute again.
-                unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
-                    .expect("ended pthread stack removal");
-            }
-            entry.native = None;
-            entry.phase = Phase::Ended;
-            entry.recovery.fill(None);
-            self.replies.forget(entry.id);
-            if entry.detached {
-                self.entries[index] = None;
-            }
+    /// Whether the thread in `slot` ended: the kernel's notification on its
+    /// exit channel, or the end word of the main thread.
+    fn ended(&self, slot: usize) -> bool {
+        match self.entries[slot].as_ref().and_then(|e| e.exit.as_ref()) {
+            Some(exit) => matches!(
+                sys::try_receive(exit),
+                Ok(sys::Received::Notification {
+                    source: Source::Exit,
+                    ..
+                })
+            ),
+            None => block_of(slot).end.load(Ordering::SeqCst) != 0,
         }
-        for index in 0..CAPACITY {
-            let Some(entry) = self.entries[index].as_ref() else {
-                continue;
-            };
-            if entry.phase != Phase::Ended {
-                continue;
-            }
-            let Some(waiting) = entry.waiting.as_ref() else {
-                continue;
-            };
-            let caller_id = waiting.caller;
-            let nonce = waiting.nonce;
-            let value = entry.value;
-            let token = self
-                .entry_mut(index)
-                .waiting
-                .as_mut()
-                .expect("join claim")
-                .token
-                .take();
-            if let Some(token) = token {
-                let caller = self.find(caller_id).expect("live joiner");
-                let answer = self.cache(caller, nonce, Ok(value), JOIN);
-                respond(token, answer);
+    }
+    /// Takes back the detached threads that ended.
+    fn take_back_detached(&mut self) {
+        for slot in 0..CAPACITY {
+            if self.entries[slot].as_ref().is_some_and(|e| e.detached) && self.ended(slot) {
+                self.end_past_library(slot);
+                self.take_back(slot);
             }
         }
     }
-    fn join(&mut self, caller: usize, words: [u64; 8], token: sys::Token) {
-        let result = (|| {
-            let target = self.find(words[3])?;
-            if target == caller {
-                return Err(EDEADLK);
-            }
-            let entry = self.entry(target);
-            if entry.detached
-                || entry
-                    .waiting
-                    .as_ref()
-                    .is_some_and(|w| w.caller != words[1] || w.nonce != words[2])
-            {
-                return Err(EINVAL);
-            }
-            Ok(target)
-        })();
-        match result {
-            Ok(target) => {
-                self.entry_mut(target).waiting = Some(Waiting {
-                    caller: words[1],
-                    nonce: words[2],
-                    token: Some(token),
-                });
-            }
-            Err(status) => {
-                let answer = self.cache(caller, words[2], Err(status), JOIN);
-                respond(token, answer);
-            }
-        }
-    }
-    fn wake_needed(&self, index: usize) -> bool {
-        let Some(entry) = self.entries[index].as_ref() else {
-            return false;
-        };
-        let state = &LAUNCH[index].cancel;
-        let epoch = state.active.load(Ordering::SeqCst);
-        entry.phase == Phase::Live
-            && state.pending.load(Ordering::SeqCst)
-            && state.enabled.load(Ordering::SeqCst)
-            && epoch != 0
-            && epoch != entry.woken_epoch
-    }
-    fn wake_cancelled(&mut self) {
-        for (index, launch) in LAUNCH.iter().enumerate() {
-            if !self.wake_needed(index) {
-                continue;
-            }
-            let epoch = launch.cancel.active.load(Ordering::SeqCst);
-            match sys::thread_interrupt(
-                self.entry(index)
-                    .native
-                    .as_ref()
-                    .expect("live cancellation target"),
-            ) {
-                Ok(()) => {
-                    self.entry_mut(index).woken_epoch = epoch;
-                }
-                Err(Error::BadState) => {
-                    // The point may be about to enter IPC.
-                    #[cfg(feature = "transport-probe")]
-                    WAKE_RETRIES.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(error) => panic!("owned pthread interruption: {error:?}"),
-            }
-        }
-    }
-    fn perform(&mut self, caller: usize, words: [u64; 8]) -> Result<u64, i32> {
-        match words[0] {
-            CREATE => self.create(caller, words),
-            EXIT => {
-                // Defensively remove claims still owned by an exiting thread.
-                for target in self.entries.iter_mut().flatten() {
-                    if target
-                        .waiting
-                        .as_ref()
-                        .is_some_and(|w| w.caller == words[1])
-                    {
-                        target.waiting = None;
-                    }
-                }
-                let entry = self.entry_mut(caller);
-                entry.sleep_waiting = None;
-                entry.signal_waiting = None;
-                entry.phase = Phase::Exiting;
-                entry.value = words[3];
-                // Application threads determine process lifetime; internal owners remain live.
-                if self
-                    .entries
-                    .iter()
-                    .flatten()
-                    .all(|e| e.phase != Phase::Live)
-                {
-                    sys::process_exit(0);
-                }
-                Ok(0)
-            }
-            JOIN_ACK => {
-                let target = self.find(words[3])?;
-                let entry = self.entry(target);
-                if entry.phase != Phase::Ended
-                    || !entry.waiting.as_ref().is_some_and(|w| w.caller == words[1])
-                {
-                    return Err(EINVAL);
-                }
-                self.entries[target] = None;
-                Ok(0)
-            }
-            CANCEL => {
-                let index = self.find(words[3])?;
-                if self.entry(index).phase == Phase::Live {
-                    LAUNCH[index].cancel.pending.store(true, Ordering::SeqCst);
-                    self.wake_cancelled();
-                }
-                Ok(0)
-            }
-            JOIN_ABANDON => {
-                if let Ok(target) = self.find(words[3])
-                    && self
-                        .entry(target)
-                        .waiting
-                        .as_ref()
-                        .is_some_and(|w| w.caller == words[1])
-                {
-                    self.entry_mut(target).waiting = None;
-                }
-                Ok(0)
-            }
-            DETACH => {
-                let target = self.find(words[3])?;
-                let entry = self.entry_mut(target);
-                if entry.detached || entry.waiting.is_some() {
-                    return Err(EINVAL);
-                }
-                entry.detached = true;
-                if entry.phase == Phase::Ended {
-                    self.entries[target] = None;
-                }
-                Ok(0)
-            }
-            #[cfg(feature = "transport-probe")]
-            6 => {
-                let index = self.find(words[3])?;
-                Ok(self.entry(index).native.as_ref().ok_or(ESRCH)?.raw().0)
-            }
-            _ => Err(EINVAL),
-        }
-    }
-
-    fn abandon_reply(&mut self, caller: usize, nonce: u64) {
-        let id = self.entry(caller).id;
-        let entry = self.entry_mut(caller);
-        if entry
-            .sleep_waiting
-            .as_ref()
-            .is_some_and(|w| w.nonce == nonce)
-        {
-            entry.sleep_waiting = None;
-        }
-        if entry
-            .signal_waiting
-            .as_ref()
-            .is_some_and(|w| w.nonce == nonce)
-        {
-            entry.signal_waiting = None;
-        }
-        // A cancelled JOIN releases its target claim before terminal delivery.
-        for target in self.entries.iter_mut().flatten() {
-            if target
-                .waiting
-                .as_ref()
-                .is_some_and(|w| w.caller == id && w.nonce == nonce)
-            {
-                target.waiting = None;
-            }
+    /// A thread that ended through thread_exit, past pthread_exit, leaves
+    /// the count of live threads here.
+    fn end_past_library(&self, slot: usize) {
+        if block_of(slot).end.load(Ordering::SeqCst) == 0 {
+            LIVE.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
 
-fn respond(token: sys::Token, answer: Cached) {
-    let mut bytes = [0; 64];
-    bytes[..8].copy_from_slice(&(answer.status as u64).to_le_bytes());
-    bytes[8..16].copy_from_slice(&answer.value.to_le_bytes());
-    bytes[16..24].copy_from_slice(&answer.extra.to_le_bytes());
-    for (index, word) in answer.tail.iter().enumerate() {
-        bytes[24 + index * 8..32 + index * 8].copy_from_slice(&word.to_le_bytes());
+/// Initialize once after the heap and file workers, before entering C main.
+///
+/// # Safety
+/// Startup owns exclusive initialization. Stack reservations
+/// 0x30000000..0x34000000 and message pages from 0x2000000 are unused. The
+/// supplied handle owns the calling main thread.
+pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
+    if READY.load(Ordering::Acquire) {
+        return Err(Error::BadState);
     }
-    // An interrupted client's cached answer survives this rejected reply.
-    let _ = token.reply(&bytes);
-}
-
-extern "C" fn owner(_: u64) -> ! {
-    assert!(READY.load(Ordering::Acquire), "published thread owner");
-    // SAFETY: this sole owner consumes the statically reserved table exactly once.
-    // Keeping it out of the stack avoids large initialization temporaries.
-    let registry = unsafe { &mut *REGISTRY.0.get() };
-    // SAFETY: startup handed main exclusively to this owner.
-    let main = unsafe { (*MAIN.0.get()).take().expect("initial main handle") };
-    registry.entries[0] = Some(Entry::new(1, main, None, false));
-    // SAFETY: startup transferred the reserved timer to this sole owner.
-    let timer = unsafe { (*REAPER.0.get()).take().expect("initial reap timer") };
-    let mut armed: Option<u64> = None;
-    // The end of a pthread comes as a notification. Only main, which init
-    // made with no exit channel, is watched on a timer once it said EXIT,
-    // and so is a cancellation whose thread has not begun to wait yet.
-    let mut poll: Option<u64> = None;
-    loop {
-        registry.reap(false);
-        registry.wake_cancelled();
-        let now = rt::time::ticks_to_ns(rt::time::now());
-        // Main is the one entry with no stack of the owner's.
-        let main_exiting = registry
-            .entries
-            .iter()
-            .flatten()
-            .any(|e| e.phase == Phase::Exiting && e.mapping.is_none());
-        if main_exiting || (0..CAPACITY).any(|index| registry.wake_needed(index)) {
-            if poll.is_none_or(|when| when <= now) {
-                poll = Some(now.saturating_add(1_000_000));
-            }
-        } else {
-            poll = None;
-        }
-        let deadline = registry.wait_deadlines();
-        let wanted = match (poll, deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        if armed != wanted {
-            if let Some(when) = wanted {
-                sys::timer_set(&timer, when).expect("pthread deadline arm");
-            } else {
-                sys::timer_cancel(&timer).expect("pthread deadline cancel");
-            }
-            armed = wanted;
-        }
-        let (len, words, token, handles) = match sys::receive(channel()) {
-            Ok(sys::Received::Message {
-                len,
-                words,
-                token,
-                handles,
-                ..
-            }) => (len, words, token, handles),
-            Ok(sys::Received::Notification {
-                source: rt::abi::Source::Timer,
-                ..
-            }) => {
-                armed = None;
-                continue;
-            }
-            Ok(sys::Received::Notification {
-                source: rt::abi::Source::Exit,
-                ..
-            }) => {
-                registry.reap(true);
-                continue;
-            }
-            _ => continue,
-        };
-        drop(handles);
-        // A target can end while this owner is blocked in receive. Reclaim its
-        // retained records before reserving the next caller's result, including
-        // a JOIN under handle/quota pressure, before its notification comes.
-        registry.reap(false);
-        let caller = match registry.find(words[1]) {
-            Ok(caller) if len == 64 && words[2] != 0 => caller,
-            _ => {
-                respond(
-                    token,
-                    Cached {
-                        nonce: 0,
-                        status: EINVAL,
-                        value: 0,
-                        extra: 0,
-                        tail: [0; 5],
-                    },
-                );
-                continue;
-            }
-        };
-        if words[0] == REPLY_ACK {
-            if words[3] != 0 {
-                registry.abandon_reply(caller, words[2]);
-            }
-            registry.acknowledge(caller, words[2]);
-            #[cfg(feature = "transport-probe")]
-            if ACK_TARGET
-                .compare_exchange(words[1], 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                sys::thread_interrupt(registry.entry(caller).native.as_ref().expect("ack caller"))
-                    .unwrap();
-                ACK_INTERRUPTS.fetch_add(1, Ordering::Release);
-            }
-            #[cfg(feature = "transport-probe")]
-            let parked = registry
-                .parked_reply
-                .filter(|(id, nonce, _)| *id == words[1] && *nonce == words[2]);
-            #[cfg(feature = "transport-probe")]
-            if parked.is_some() {
-                registry.parked_reply = None;
-            }
-            respond(
-                token,
-                Cached {
-                    nonce: words[2],
-                    status: 0,
-                    value: 0,
-                    extra: 0,
-                    tail: [0; 5],
-                },
-            );
-            #[cfg(feature = "transport-probe")]
-            if let Some((_, _, gate)) = parked {
-                probe_park(&Handle::borrowed(rt::abi::Handle(gate)));
-            }
-            continue;
-        }
-        if let Some(answer) = registry.ready(caller, words[2]) {
-            respond(token, answer);
-            continue;
-        }
-        if registry.reserve(caller, words[2], words[0]).is_err() {
-            respond(
-                token,
-                Cached {
-                    nonce: words[2],
-                    status: if words[0] == CREATE { EAGAIN } else { ENOMEM },
-                    value: 0,
-                    extra: 0,
-                    tail: [0; 5],
-                },
-            );
-            continue;
-        }
-        if cfg!(feature = "transport-probe") && words[0] == 24 {
-            #[cfg(feature = "transport-probe")]
-            {
-                registry.parked_reply = Some((words[1], words[2], words[3]));
-                let answer = registry.cache(caller, words[2], Ok(0), words[0]);
-                respond(token, answer);
-            }
-        } else if words[0] == sleep::BEGIN {
-            registry.sleep_begin(caller, words, token);
-        } else if words[0] == crate::signals::WAIT {
-            registry.signal_wait_begin(caller, words, token);
-        } else if words[0] == JOIN {
-            registry.join(caller, words, token);
-        } else if cfg!(feature = "transport-probe") && words[0] == 48 {
-            // A full-width retained-result witness, without publishing a new
-            // POSIX operation or pretending queued signal sources exist yet.
-            let answer = registry.cache_words(
-                caller,
-                words[2],
-                Ok([
-                    words[3],
-                    words[4],
-                    words[5],
-                    words[6],
-                    words[7],
-                    u64::MAX,
-                    1 << 63,
-                ]),
-                48,
-            );
-            respond(token, answer);
-        } else if (crate::signals::ACTION..=crate::signals::READY).contains(&words[0]) {
-            let result = registry.signal_perform(caller, words);
-            let answer = registry.cache_words(caller, words[2], result, words[0]);
-            respond(token, answer);
-        } else {
-            let result = if words[0] == sleep::ABANDON {
-                registry.entry_mut(caller).sleep_waiting = None;
-                Ok((0, 0))
-            } else if cfg!(feature = "transport-probe") && words[0] == sleep::QUERY {
-                registry
-                    .find(words[3])
-                    .map(|index| (u64::from(registry.entry(index).sleep_waiting.is_some()), 0))
-            } else if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
-                registry.specific.perform(caller, words)
-            } else if cfg!(feature = "transport-probe") && words[0] == crate::signals::WAIT_QUERY {
-                #[cfg(feature = "transport-probe")]
-                {
-                    registry
-                        .find(words[3])
-                        .map(|index| (u64::from(registry.entry(index).signal_waiting.is_some()), 0))
-                }
-                #[cfg(not(feature = "transport-probe"))]
-                {
-                    Err(EINVAL)
-                }
-            } else if cfg!(feature = "transport-probe") && words[0] == 49 {
-                #[cfg(feature = "transport-probe")]
-                {
-                    registry.find(words[3]).map(|index| {
-                        let deadline = registry
-                            .entry(index)
-                            .signal_waiting
-                            .as_ref()
-                            .and_then(|wait| wait.deadline)
-                            .map_or(0, |value| {
-                                value.target(None).expect("relative signal deadline")
-                            }) as u128;
-                        (deadline as u64, (deadline >> 64) as u64)
-                    })
-                }
-                #[cfg(not(feature = "transport-probe"))]
-                {
-                    Err(EINVAL)
-                }
-            } else {
-                registry.perform(caller, words).map(|value| (value, 0))
-            };
-            let answer = registry.cache_pair(caller, words[2], result, words[0]);
-            respond(token, answer);
-        }
+    let ceiling = crate::ceiling()?;
+    // A process whose ceiling is its main thread's level puts the locks of
+    // the buckets and the layer's workers level with the application
+    // (init's POSIX record gives main + 1): say so, since nothing else
+    // would.
+    if sys::thread_info(&main).is_ok_and(|info| info.base >= ceiling) {
+        rt::println!(
+            "posix-abi: the process ceiling {} is not above main; its helper threads compete with main",
+            ceiling
+        );
     }
+    posix_sync::configure(ceiling, crate::signals::deliver_deferred);
+    MAIN_SELF.store(main.raw().0, Ordering::Release);
+    LAUNCH[0].id.store(1, Ordering::Release);
+    // SAFETY: startup is single-threaded.
+    unsafe { &mut *TABLE.0.get() }.entries[0] = Some(Entry {
+        id: 1,
+        native: main,
+        exit: None,
+        mapping: None,
+        detached: false,
+        claimed: false,
+    });
+    READY.store(true, Ordering::Release);
+    Ok(())
 }
 
 extern "C" fn trampoline(slot: u64) -> ! {
@@ -1088,9 +283,10 @@ extern "C" fn trampoline(slot: u64) -> ! {
             status = in(reg) floating >> 32,
             options(nomem, nostack, preserves_flags));
     }
-    let own = launch.thread.load(Ordering::Relaxed);
-    // SAFETY: the page above the stack is this thread's until it ended.
-    unsafe { attach_with(tcb, PAGE, id, own) }.expect("managed thread attach");
+    // SAFETY: the creator built the TCB in the page above the stack, the
+    // thread's until it ended.
+    unsafe { tls::attach_built(tcb, id) };
+    attach_resources(launch.thread.load(Ordering::Relaxed)).expect("managed thread attach");
     let value = unsafe { callback(argument) };
     // SAFETY: the current thread is managed and attached.
     unsafe { pthread_exit(value) }
@@ -1107,19 +303,18 @@ extern "C" fn trampoline(slot: u64) -> ! {
 /// `init`.
 pub unsafe fn attach(page: *mut u8, len: usize, id: u64) -> Result<(), i32> {
     // SAFETY: the caller's promise.
-    unsafe { attach_with(page, len, id, MAIN_SELF.load(Ordering::Acquire)) }
+    unsafe { tls::attach(page, len, id) };
+    attach_resources(MAIN_SELF.load(Ordering::Acquire))
 }
 
-/// `attach` with the thread's own handle `own` (MANAGE).
-unsafe fn attach_with(page: *mut u8, len: usize, id: u64, own: u64) -> Result<(), i32> {
-    // SAFETY: the caller's promise.
-    unsafe { tls::attach(page, len, id) };
-    // SAFETY: the thread is attached now.
-    let block = unsafe { posix_thread::block().as_ref() }.ok_or(EINVAL)?;
+/// The calling thread's channel, timer and own handle `own` (MANAGE) in its
+/// block, and its entry of signals.
+fn attach_resources(own: u64) -> Result<(), i32> {
+    let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(own));
     let base = sys::thread_info(&thread).map_err(|_| EIO)?.base;
-    // Its channel takes the wakes of waits by address and its timer the
-    // deadlines of its waits (posix-sync).
+    // Its channel takes the wakes of its waits and its timer their
+    // deadlines (posix-sync).
     let channel = sys::channel_create(base).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, base).map_err(|_| EAGAIN)?;
     block.thread.store(own, Ordering::Relaxed);
@@ -1138,106 +333,15 @@ fn close_raw(raw: u64) {
     }
 }
 
-fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
-    request_pair(op, arguments).map(|(value, _)| value)
-}
-
-pub(crate) fn request_pair(op: u64, arguments: [u64; 5]) -> Result<(u64, u64), i32> {
-    request_words(op, arguments).map(|words| (words[0], words[1]))
-}
-
-pub(crate) fn request_words(op: u64, arguments: [u64; 5]) -> Result<[u64; 7], i32> {
-    if !READY.load(Ordering::Acquire) || tls::thread_id() == 0 {
-        return Err(EINVAL);
-    }
-    let nonce = NONCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map_err(|_| EAGAIN)?;
-    let words = [
-        op,
-        tls::thread_id(),
-        nonce,
-        arguments[0],
-        arguments[1],
-        arguments[2],
-        arguments[3],
-        arguments[4],
-    ];
-    let mut bytes = [0; 64];
-    for (index, word) in words.iter().enumerate() {
-        bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    loop {
-        match sys::send(channel(), &bytes) {
-            Err(Error::Interrupted) if op == sleep::BEGIN => {
-                acknowledge(words[1], nonce, true)?;
-                return Err(EINTR);
-            }
-            Err(Error::Interrupted)
-                if (op == JOIN || op == crate::signals::WAIT) && cancel::requested() =>
-            {
-                acknowledge(words[1], nonce, true)?;
-                return Err(ECANCELED);
-            }
-            Err(Error::Interrupted) => {
-                #[cfg(feature = "transport-probe")]
-                if op == crate::signals::WAIT {
-                    let gate = SIGNAL_RETRY_GATE.swap(0, Ordering::AcqRel);
-                    if gate != 0 {
-                        SIGNAL_RETRY_PARKED.store(true, Ordering::Release);
-                        sys::receive(&Handle::borrowed(rt::abi::Handle(gate)))
-                            .expect("test signal retry gate");
-                        SIGNAL_RETRY_PARKED.store(false, Ordering::Release);
-                    }
-                }
-                continue;
-            }
-            Err(_) => return Err(EIO),
-            Ok(reply) if reply.len == 64 => {
-                let status = reply.words[0];
-                // Copy every field before ACK releases the retained snapshot.
-                let data = reply.words[1..8]
-                    .try_into()
-                    .expect("complete pthread reply");
-                acknowledge(words[1], nonce, false)?;
-                if status != 0 {
-                    return Err(status as i32);
-                }
-                return Ok(data);
-            }
-            _ => return Err(EIO),
-        }
-    }
-}
-
-fn acknowledge(caller: u64, nonce: u64, abandon: bool) -> Result<(), i32> {
-    let mut bytes = [0; 64];
-    for (index, word) in [REPLY_ACK, caller, nonce, u64::from(abandon), 0, 0, 0, 0]
-        .iter()
-        .enumerate()
-    {
-        bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    loop {
-        match sys::send(channel(), &bytes) {
-            Err(Error::Interrupted) => continue,
-            Ok(reply) if reply.len == 64 && reply.words[0] == 0 => return Ok(()),
-            _ => return Err(EIO),
-        }
-    }
-}
-
 /// Moves the calling thread to kernel level `level` under FIFO (1 to one
-/// below the process's ceiling; EINVAL otherwise) through its own handle in its
-/// block, and makes it the thread's base level, which the lock of a bucket
-/// returns to. A Rust call for the measurements of rtbench 2 until the
-/// scheduling attributes of POSIX come (spec 2, 3.5); the guest probes
-/// have it too.
+/// below the process's ceiling; EINVAL otherwise) through its own handle in
+/// its block, and makes it the thread's base level, which the lock of a
+/// bucket returns to. A Rust call for the measurements of rtbench 2
+/// (feature `rtbench`) until the scheduling attributes of POSIX come (spec
+/// 2, 3.5); the guest probes have it too.
 #[cfg(any(feature = "rtbench", feature = "transport-probe"))]
 pub fn set_level(level: u8) -> Result<(), i32> {
-    let block = posix_thread::block();
-    // SAFETY: the block is the calling thread's.
-    let block = unsafe { block.as_ref() }.ok_or(EINVAL)?;
+    let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
     // Strictly below the ceiling, where the lock of a bucket and the
     // helpers of the layer run: no application thread ties with them.
@@ -1246,6 +350,17 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     }
     sys::thread_set_priority(&thread, level, Policy::Fifo).map_err(|_| EINVAL)?;
     block.base_level.store(u32::from(level), Ordering::Relaxed);
+    // A wakeup through the channel or the timer works at their level until
+    // the next receive: they follow the thread's. Others reach the channel
+    // under the table's lock (cancellation) or only while the thread waits.
+    let channel = sys::channel_create(level).map_err(|_| EAGAIN)?;
+    let timer = sys::timer_create(&channel, level).map_err(|_| EAGAIN)?;
+    registry(|_| {
+        let channel = channel.into_raw().0;
+        close_raw(block.timer.swap(timer.into_raw().0, Ordering::SeqCst));
+        close_raw(block.channel.swap(channel, Ordering::SeqCst));
+        block.waker.store(channel, Ordering::SeqCst);
+    });
     Ok(())
 }
 
@@ -1268,18 +383,15 @@ pub unsafe extern "C" fn pthread_create(
     callback: Option<Start>,
     argument: *mut c_void,
 ) -> i32 {
-    // Serialize inheritance against this thread's handlers until the CREATE
-    // result is copied. Pending signals still enter before this call returns.
-    let _signal_mask = crate::signals::NativeMask::new();
-    if out.is_null() || callback.is_none() {
+    if out.is_null() || callback.is_none() || !READY.load(Ordering::Acquire) {
         return EINVAL;
     }
-    let attributes = if attr.is_null() {
+    let attr = if attr.is_null() {
         Attributes::defaults()
     } else {
         unsafe { *attr }
     };
-    if !attributes.valid() {
+    if !attr.valid() {
         return EINVAL;
     }
     let control: u64;
@@ -1290,16 +402,104 @@ pub unsafe extern "C" fn pthread_create(
             control = out(reg) control, status = out(reg) status,
             options(nomem, nostack, preserves_flags));
     }
-    match request(
-        CREATE,
-        [
-            callback.expect("checked callback") as *const () as u64,
-            argument as u64,
-            attributes.stack_size as u64,
-            ((attributes.guard_size as u64) << 1) | attributes.detached as u64,
-            control | (status << 32),
-        ],
-    ) {
+    let me = own_block();
+    let mask = me.mask.load(Ordering::SeqCst);
+    let base = me.base_level.load(Ordering::Relaxed) as u8;
+    let result = registry(|r| {
+        r.take_back_detached();
+        let slot = r.entries.iter().position(Option::is_none).ok_or(EAGAIN)?;
+        let id = r.next_id;
+        let next = id.checked_add(1).ok_or(EAGAIN)?;
+        let length = rounded(attr.stack_size).ok_or(EINVAL)?;
+        let address = STACK_BASE + slot * STRIDE + rounded(attr.guard_size).ok_or(EINVAL)?;
+        let ceiling = crate::ceiling().map_err(|_| EIO)?;
+        // The stack and, above it, the page of the thread's TCB.
+        let mapped = length + PAGE;
+        let memory = sys::mem_create(mapped as u64).map_err(|_| EAGAIN)?;
+        sys::mem_map(
+            allocation::process(),
+            &memory,
+            0,
+            mapped as u64,
+            address,
+            Access::ReadWrite,
+        )
+        .map_err(|_| EAGAIN)?;
+        let unmap = || {
+            // SAFETY: nothing runs on the stack mapped above.
+            unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
+                .expect("failed-create stack removal");
+        };
+        let launch = &LAUNCH[slot];
+        launch.callback.store(
+            callback.expect("checked") as usize as u64,
+            Ordering::Relaxed,
+        );
+        launch.argument.store(argument as u64, Ordering::Relaxed);
+        launch
+            .floating
+            .store(control | (status << 32), Ordering::Relaxed);
+        launch
+            .tcb
+            .store((address + length) as u64, Ordering::Relaxed);
+        // The TCB is built now, so that a signal sent before the thread
+        // runs waits in its block; it starts with its creator's mask.
+        // SAFETY: the page above the stack is mapped and the new thread's.
+        unsafe {
+            let tcb = posix_thread::build((address + length) as *mut u8, PAGE);
+            (*tcb).block.mask.store(mask, Ordering::SeqCst);
+        }
+        launch.completed.store(false, Ordering::Relaxed);
+        launch.cancel.reset();
+        launch.specific.reset();
+        launch.id.store(id, Ordering::Release);
+        let made = (|| {
+            let exit = sys::channel_create(ceiling)?;
+            // SAFETY: this slot owns the new stack until its thread ended.
+            let native = unsafe {
+                sys::thread_create_with(
+                    allocation::process(),
+                    trampoline,
+                    address + length,
+                    slot as u64,
+                    base,
+                    Policy::Fifo,
+                    0x2000000 + slot * PAGE,
+                    Some((&exit, ceiling)),
+                )
+            }?;
+            let own = sys::handle_duplicate(&native, Rights::MANAGE)?;
+            Ok::<_, Error>((native, exit, own))
+        })();
+        let (native, exit, own) = match made {
+            Ok(made) => made,
+            Err(_) => {
+                launch.id.store(0, Ordering::Release);
+                unmap();
+                return Err(EAGAIN);
+            }
+        };
+        launch.thread.store(own.into_raw().0, Ordering::Relaxed);
+        if sys::thread_start(&native).is_err() {
+            close_raw(launch.thread.swap(0, Ordering::Relaxed));
+            launch.id.store(0, Ordering::Release);
+            drop(native);
+            unmap();
+            return Err(EAGAIN);
+        }
+        r.entries[slot] = Some(Entry {
+            id,
+            native,
+            exit: Some(exit),
+            mapping: Some((address, mapped)),
+            detached: attr.detached != 0,
+            claimed: false,
+        });
+        r.next_id = next;
+        LIVE.fetch_add(1, Ordering::SeqCst);
+        Ok(id)
+    });
+    match result {
         Ok(id) => {
             unsafe { out.write(id) };
             0
@@ -1313,60 +513,174 @@ pub unsafe extern "C" fn pthread_create(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32 {
     let point = cancel::Point::begin();
-    let result = request(JOIN, [thread, 0, 0, 0, 0]);
-    if point.requested() {
-        // Undo the claim even if JOIN was interrupted before acceptance or
-        // after a completed target produced its retained value.
-        request(JOIN_ABANDON, [thread, 0, 0, 0, 0]).expect("cancelled join claim release");
-        point.finish();
-        unreachable!("accepted join cancellation");
-    }
-    // An accepted result wins cancellation arriving after this point. ACK
-    // retries are internal bookkeeping and cannot introduce a new point.
-    point.end();
-    match result {
-        Ok(value) => {
-            let launch = LAUNCH
-                .iter()
-                .find(|launch| launch.id.load(Ordering::Acquire) == thread)
-                .expect("join result retains launch slot");
-            assert!(
-                launch.completed.load(Ordering::Acquire),
-                "joined completion"
-            );
-            if !out.is_null() {
-                unsafe { out.write(value as *mut c_void) };
-            }
-            request(JOIN_ACK, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
+    let me = tls::thread_id();
+    let claim = registry(|r| {
+        r.take_back_detached();
+        let slot = r.find(thread)?;
+        let entry = r.entries[slot].as_mut().expect("found entry");
+        if entry.id == me {
+            return Err(EDEADLK);
         }
-        Err(status) => status,
+        if entry.detached || entry.claimed {
+            return Err(EINVAL);
+        }
+        entry.claimed = true;
+        Ok(slot)
+    });
+    let slot = match claim {
+        Ok(slot) => slot,
+        Err(status) => {
+            point.end();
+            return status;
+        }
+    };
+    let release = |point: cancel::Point| {
+        registry(|r| {
+            if let Some(entry) = r.entries[slot].as_mut() {
+                entry.claimed = false;
+            }
+        });
+        point.finish();
+        unreachable!("a cancelled join ends its thread");
+    };
+    let block = block_of(slot);
+    let exit = registry(|r| {
+        r.entries[slot]
+            .as_ref()
+            .and_then(|e| e.exit.as_ref())
+            .map(|h| h.raw())
+    });
+    match exit {
+        // The main thread has no exit channel: its end word says it ended.
+        None => {
+            while block.end.load(Ordering::SeqCst) == 0 {
+                let woken =
+                    posix_sync::futex_wait(&block.end, 0, posix_sync::CLOCK_MONOTONIC, None);
+                if woken == Ok(posix_sync::Woken::Entry) && point.requested() {
+                    release(point);
+                }
+            }
+        }
+        // The kernel's notification of the end: the stack may go then.
+        // Entries wait while the thread checks for cancellation and enters
+        // receive, so that a request of cancellation or a signal coming in
+        // between makes receive return at once.
+        Some(exit) => {
+            let exit = Handle::<Channel>::borrowed(exit);
+            loop {
+                let guard = rt::upcall::defer_entries().expect("join entry deferral");
+                if point.requested() {
+                    drop(guard);
+                    release(point);
+                }
+                let got = sys::receive(&exit);
+                drop(guard);
+                match got {
+                    Ok(sys::Received::Notification {
+                        source: Source::Exit,
+                        ..
+                    }) => break,
+                    Ok(_) | Err(Error::Interrupted) => {}
+                    Err(error) => panic!("join receive: {error:?}"),
+                }
+            }
+        }
     }
+    let value = if block.end.load(Ordering::SeqCst) != 0 {
+        block.result.load(Ordering::SeqCst)
+    } else {
+        0
+    };
+    registry(|r| {
+        if exit.is_some() {
+            r.end_past_library(slot);
+        }
+        r.take_back(slot);
+    });
+    point.end();
+    if !out.is_null() {
+        unsafe { out.write(value as *mut c_void) };
+    }
+    0
 }
 
+/// Cancellation asked of a thread (spec 2, 3.5): the flag in its block;
+/// when it is enabled, bit CANCEL in its channel for a wait there, an entry
+/// for a wait with a service (entries pending under deferral make the wait
+/// return), and an interrupt of an IPC wait it is in now.
 #[unsafe(no_mangle)]
 pub extern "C" fn pthread_cancel(thread: u64) -> i32 {
-    request(CANCEL, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
+    registry(|r| {
+        let slot = r.find(thread)?;
+        let block = block_of(slot);
+        let flags = block
+            .flags
+            .fetch_or(posix_thread::flag::CANCEL_PENDING, Ordering::SeqCst);
+        if flags & posix_thread::flag::CANCEL_DISABLED == 0 {
+            wake_for_cancel(slot);
+        }
+        Ok(())
+    })
+    .map_or_else(|e| e, |()| 0)
+}
+
+/// Wakes the thread in `slot` for its cancellation.
+fn wake_for_cancel(slot: usize) {
+    let block = block_of(slot);
+    let channel = block.channel.load(Ordering::Relaxed);
+    if channel != 0 {
+        let _ = sys::notify(
+            &Handle::<Channel>::borrowed(rt::abi::Handle(channel)),
+            posix_sync::bit::CANCEL,
+        );
+    }
+    // SAFETY: the table holds the entry of `slot` while the lock is held.
+    let native = unsafe { &*TABLE.0.get() }.entries[slot]
+        .as_ref()
+        .map(|e| e.native.raw());
+    if let Some(native) = native {
+        let native = Handle::<Thread>::borrowed(native);
+        if block.flags.load(Ordering::SeqCst) & posix_thread::flag::SIGNALS_READY != 0 {
+            let _ = sys::thread_upcall_request(&native);
+        }
+        let _ = sys::thread_interrupt(&native);
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn pthread_detach(thread: u64) -> i32 {
-    request(DETACH, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
+    registry(|r| {
+        let slot = r.find(thread)?;
+        let entry = r.entries[slot].as_mut().expect("found entry");
+        if entry.detached || entry.claimed {
+            return Err(EINVAL);
+        }
+        entry.detached = true;
+        r.take_back_detached();
+        Ok(())
+    })
+    .map_or_else(|e| e, |()| 0)
 }
 
 /// # Safety
-/// The current thread is managed and has its initialized POSIX scope.
-/// Registered cleanup nodes, destructors and their arguments remain live.
+/// The current thread is managed and attached. Registered cleanup nodes,
+/// destructors and their arguments remain live.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
     unsafe { cancel::exit_cleanup() };
     unsafe { specific::exit_destructors() };
-    let id = tls::thread_id();
-    let launch = LAUNCH
-        .iter()
-        .find(|launch| launch.id.load(Ordering::Acquire) == id && id != 0)
-        .expect("managed pthread completion slot");
-    launch.completed.store(true, Ordering::Release);
-    request(EXIT, [value as u64, 0, 0, 0, 0]).expect("managed pthread exit");
+    let block = own_block();
+    block.result.store(value as usize, Ordering::SeqCst);
+    block.end.store(1, Ordering::SeqCst);
+    posix_sync::futex_wake(&block.end, u32::MAX);
+    if let Some(launch) = current_launch() {
+        launch.completed.store(true, Ordering::Release);
+    }
+    // Application threads determine the process's life; the layer's
+    // workers do not keep it.
+    if LIVE.fetch_sub(1, Ordering::SeqCst) == 1 {
+        sys::process_exit(0);
+    }
     sys::thread_exit()
 }
 
@@ -1476,109 +790,26 @@ pub unsafe extern "C" fn pthread_attr_getdetachstate(
     0
 }
 
-/// Interrupt accepted replies after storing the actual operation result. Each
-/// selected operation fires once; this is excluded from the public sysroot.
-#[cfg(feature = "transport-probe")]
-pub fn probe_interrupt_replies(create: bool, join: bool, acknowledge: bool) {
-    INTERRUPT_REPLIES.store(
-        (u64::from(create) << CREATE)
-            | (u64::from(join) << JOIN)
-            | (u64::from(acknowledge) << JOIN_ACK),
-        Ordering::Release,
-    );
-}
-
-/// Arm one committed reply's native entry; supported probe methods are private.
-#[cfg(feature = "transport-probe")]
-pub fn probe_reply_upcall(op: u64) {
-    UPCALL_REPLIES.fetch_or(1 << op, Ordering::AcqRel);
-}
-/// Interrupt one ordinary signal operation after its result was committed.
-#[cfg(feature = "transport-probe")]
-pub fn probe_interrupt_signal_reply(op: u64) {
-    assert!((crate::signals::ACTION..=crate::signals::WAIT).contains(&op));
-    INTERRUPT_REPLIES.fetch_or(1 << op, Ordering::AcqRel);
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_ack_interrupt() {
-    ACK_TARGET.store(tls::thread_id(), Ordering::Release);
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_ack_interrupts() -> u64 {
-    ACK_INTERRUPTS.load(Ordering::Acquire)
-}
-
-/// Leave one completed result for the managed-exit reclamation probe.
-#[cfg(feature = "transport-probe")]
-pub fn probe_leave_reply() -> Result<u64, i32> {
-    let nonce = NONCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map_err(|_| EAGAIN)?;
-    let id = tls::thread_id();
-    let mut bytes = [0; 64];
-    for (index, word) in [6, id, nonce, id, 0, 0, 0, 0].iter().enumerate() {
-        bytes[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    loop {
-        match sys::send(channel(), &bytes) {
-            Err(Error::Interrupted) => continue,
-            Ok(reply) if reply.len == 64 => {
-                return if reply.words[0] == 0 {
-                    Ok(nonce)
-                } else {
-                    Err(reply.words[0] as i32)
-                };
-            }
-            _ => return Err(EIO),
-        }
-    }
-}
-
-#[cfg(feature = "transport-probe")]
-pub fn probe_release_reply(nonce: u64) -> Result<(), i32> {
-    acknowledge(tls::thread_id(), nonce, false)
-}
-
-/// Exercise every retained word after committed reply and ACK interruption.
-#[cfg(feature = "transport-probe")]
-pub fn probe_snapshot(words: [u64; 5]) -> Result<[u64; 7], i32> {
-    INTERRUPT_REPLIES.fetch_or(1 << 48, Ordering::AcqRel);
-    probe_ack_interrupt();
-    request_words(48, words)
-}
-
-/// # Safety
-/// The ID names a live managed thread that remains live while its borrowed
-/// handle is used. For tests only: arbitrary native thread termination would
-/// bypass the pthread lifecycle protocol.
-#[cfg(feature = "transport-probe")]
-pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle<Thread>>, i32> {
-    request(6, [thread, 0, 0, 0, 0]).map(|raw| Handle::borrowed(rt::abi::Handle(raw)))
-}
-
-/// The block of pthread `id` while it lives, for the guest probes.
-#[cfg(feature = "transport-probe")]
-pub fn probe_block(id: u64) -> Option<&'static posix_thread::Block> {
-    let page = if id == 1 {
-        tls::main_page() as usize
-    } else {
-        LAUNCH
-            .iter()
-            .find(|launch| launch.id.load(Ordering::Acquire) == id)?
-            .tcb
-            .load(Ordering::Acquire) as usize
-    };
-    // SAFETY: the TCB of a live thread is mapped; the caller keeps it live.
-    Some(unsafe {
-        &*((page + posix_thread::TCB_OFFSET + posix_thread::BLOCK_OFFSET)
-            as *const posix_thread::Block)
+/// Runs `f` with the block and the handle of live pthread `id` under the
+/// table's lock; ESRCH for none.
+pub(crate) fn with_target(id: u64, f: impl FnOnce(&Block, &Handle<Thread>)) -> Result<(), i32> {
+    registry(|r| {
+        let slot = r.find(id)?;
+        let native = &r.entries[slot].as_ref().expect("found entry").native;
+        f(block_of(slot), native);
+        Ok(())
     })
 }
 
-/// Whether pthread `id` waits by address now, for the guest probes.
-#[cfg(feature = "transport-probe")]
-pub fn probe_futex_waiting(id: u64) -> bool {
-    probe_block(id).is_some_and(posix_sync::waiting)
+/// Runs `f` on the block of every thread of the table.
+pub(crate) fn each_block(mut f: impl FnMut(&Block)) {
+    registry(|r| {
+        for slot in 0..CAPACITY {
+            if r.entries[slot].is_some() {
+                f(block_of(slot));
+            }
+        }
+    });
 }
 
 fn current_launch() -> Option<&'static Launch> {
@@ -1592,6 +823,32 @@ fn current_launch() -> Option<&'static Launch> {
         .flatten()
 }
 
+/// The handle with MANAGE of live pthread `thread`, for the guest probes.
+///
+/// # Safety
+/// The thread stays in the table while the borrowed handle is used.
+#[cfg(feature = "transport-probe")]
+pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle<Thread>>, i32> {
+    registry(|r| {
+        let slot = r.find(thread)?;
+        Ok(Handle::borrowed(
+            r.entries[slot].as_ref().expect("found entry").native.raw(),
+        ))
+    })
+}
+
+/// The block of pthread `id` while it lives, for the guest probes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_block(id: u64) -> Option<&'static posix_thread::Block> {
+    registry(|r| r.find(id).ok()).map(block_of)
+}
+
+/// Whether pthread `id` waits by address now, for the guest probes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_futex_waiting(id: u64) -> bool {
+    probe_block(id).is_some_and(posix_sync::waiting)
+}
+
 /// Test the real window before IPC entry; the closure's resources are dropped
 /// before its cancellation boundary. Excluded from the regular sysroot.
 #[cfg(feature = "transport-probe")]
@@ -1601,7 +858,7 @@ pub fn probe_cancel_window(run: impl FnOnce()) {
     point.finish();
 }
 
-/// Observe the current window without sending another owner request.
+/// Observe the current window.
 #[cfg(feature = "transport-probe")]
 pub fn probe_cancel_active() -> u64 {
     current_launch().map_or(0, |launch| launch.cancel.active.load(Ordering::SeqCst))
@@ -1611,12 +868,6 @@ pub fn probe_cancel_active() -> u64 {
 #[cfg(feature = "transport-probe")]
 pub fn probe_cancel_console() {
     cancel::console_wait();
-}
-
-/// Cancel once after JOIN produced a retained result, before its delivery.
-#[cfg(feature = "transport-probe")]
-pub fn probe_cancel_join_reply() {
-    CANCEL_JOIN_REPLY.store(true, Ordering::Release);
 }
 
 /// Confirm a live thread is inside the console phase of read.
@@ -1629,75 +880,4 @@ pub fn probe_console_waiting(id: u64) -> bool {
             launch.cancel.console.load(Ordering::Acquire)
                 && launch.cancel.active.load(Ordering::SeqCst) != 0
         })
-}
-
-/// Temporarily schedule the owner ahead of a probe's low-priority target.
-/// The regular sysroot has no extra native-owner handle.
-#[cfg(feature = "transport-probe")]
-pub fn probe_owner_priority(priority: u8) -> u8 {
-    let thread = unsafe {
-        (*OWNER_NATIVE.0.get())
-            .as_ref()
-            .expect("probe owner handle")
-    };
-    let old = sys::thread_info(thread).expect("probe owner info").base;
-    sys::thread_set_priority(thread, priority, Policy::Fifo).expect("probe owner priority");
-    old
-}
-/// The base priority of the live thread owner and the priority its sleep
-/// timer was created with.
-#[cfg(feature = "transport-probe")]
-pub fn probe_owner_levels() -> (u8, u8) {
-    let thread = unsafe {
-        (*OWNER_NATIVE.0.get())
-            .as_ref()
-            .expect("probe owner handle")
-    };
-    let owner = sys::thread_info(thread).expect("probe owner info").base;
-    (owner, TIMER_PRIORITY.load(Ordering::Acquire))
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_wake_retries() -> u64 {
-    WAKE_RETRIES.load(Ordering::Acquire)
-}
-
-/// Hold one interrupted WAIT before its retry, after the owner committed a result.
-#[cfg(feature = "transport-probe")]
-pub fn probe_pause_signal_wait_retry(gate: &Handle<Channel>) {
-    SIGNAL_RETRY_GATE.store(gate.raw().0, Ordering::Release);
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_signal_wait_retry_parked() -> bool {
-    SIGNAL_RETRY_PARKED.load(Ordering::Acquire)
-}
-
-/// Pause one SEND after its request reaches the owner, before deadline recheck.
-#[cfg(feature = "transport-probe")]
-pub fn probe_pause_signal_send(gate: &Handle<Channel>) {
-    SIGNAL_SEND_GATE.store(gate.raw().0, Ordering::Release);
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_pause_owner(gate: &Handle<Channel>) {
-    request(24, [gate.raw().0, 0, 0, 0, 0]).expect("test owner pause");
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_owner_parked() -> bool {
-    OWNER_PARKED.load(Ordering::Acquire)
-}
-#[cfg(feature = "transport-probe")]
-pub fn probe_owner() -> core::mem::ManuallyDrop<Handle<Thread>> {
-    // SAFETY: initialization precedes application threads; the owner handle
-    // remains held for the entire process, and this accessor borrows it.
-    let raw = unsafe { &*OWNER_NATIVE.0.get() }
-        .as_ref()
-        .expect("test owner handle")
-        .raw();
-    Handle::borrowed(raw)
-}
-
-#[cfg(feature = "transport-probe")]
-fn probe_park(gate: &Handle<Channel>) {
-    OWNER_PARKED.store(true, Ordering::Release);
-    sys::receive(gate).expect("test owner gate");
-    OWNER_PARKED.store(false, Ordering::Release);
 }

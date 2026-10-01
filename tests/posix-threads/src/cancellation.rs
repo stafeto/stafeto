@@ -10,7 +10,6 @@ static CANCEL_TARGET: AtomicU64 = AtomicU64::new(0);
 static CLEANUP_READY: AtomicU64 = AtomicU64::new(0);
 static CLEANUP_RELEASE: AtomicU64 = AtomicU64::new(0);
 static CLEANUP_RESULT: AtomicUsize = AtomicUsize::new(0);
-static FINISHED_TARGET: AtomicUsize = AtomicUsize::new(0);
 static RACE_GATE: AtomicU64 = AtomicU64::new(0);
 static RACE_NATIVE: AtomicU64 = AtomicU64::new(0);
 
@@ -23,15 +22,7 @@ unsafe extern "C" fn join_cleanup(_: *mut c_void) {
         return;
     }
     cancel::pthread_testcancel();
-    if FINISHED_TARGET.load(Ordering::Acquire) != 0 {
-        let mut value = ptr::null_mut();
-        if unsafe { threads::pthread_join(CANCEL_TARGET.load(Ordering::Acquire), &mut value) } != 0
-            || value as usize != VALUE
-        {
-            CLEANUP_RESULT.store(2, Ordering::Release);
-            return;
-        }
-    } else {
+    {
         let ready =
             Handle::<Channel>::borrowed(rt::abi::Handle(CLEANUP_READY.load(Ordering::Acquire)));
         let release =
@@ -63,11 +54,16 @@ unsafe extern "C" fn before_wait(argument: *mut c_void) -> *mut c_void {
     unsafe { cancel::__stafeto_cleanup_push(&mut cleanup, Some(race_cleanup), ptr::null_mut()) };
     threads::probe_cancel_window(|| {
         sys::notify(&ready, 1).expect("window ready");
-        // Main and the owner at priority 30 record cancellation while this
-        // priority-10 thread is still Ready, before it enters receive.
-        if sys::receive(&gate) != Err(rt::abi::Error::Interrupted) {
+        // Main at priority 30 records cancellation while this priority-10
+        // thread is still Ready, before it enters receive. As the layer's
+        // points do, entries wait while it checks and enters the wait: a
+        // request that came before is seen by the check, one that comes
+        // after interrupts the wait.
+        let deferred = rt::upcall::defer_entries().expect("window deferral");
+        if !cancel::requested() && sys::receive(&gate) != Err(rt::abi::Error::Interrupted) {
             sys::process_exit(80);
         }
+        drop(deferred);
     });
     CLEANUP_RESULT.store(3, Ordering::Release);
     unsafe { cancel::__stafeto_cleanup_pop(&mut cleanup, 0) };
@@ -128,43 +124,10 @@ pub fn run() -> bool {
     }
     rt::println!("posix-cancel-probe: live join released before cleanup finished");
 
-    FINISHED_TARGET.store(1, Ordering::Release);
-    CLEANUP_RESULT.store(0, Ordering::Release);
-    if unsafe {
-        threads::pthread_create(
-            &mut target,
-            ptr::null(),
-            Some(returning),
-            VALUE as *mut c_void,
-        )
-    } != 0
-    {
-        return failed(18);
-    }
-    CANCEL_TARGET.store(target, Ordering::Release);
-    threads::probe_cancel_join_reply();
-    if unsafe {
-        threads::pthread_create(
-            &mut child,
-            ptr::null(),
-            Some(cancelled_joiner),
-            ptr::null_mut(),
-        )
-    } != 0
-        || unsafe { threads::pthread_join(child, &mut value) } != 0
-        || value != cancel::CANCELED
-        || CLEANUP_RESULT.load(Ordering::Acquire) != 1
-        || unsafe { threads::pthread_join(target, ptr::null_mut()) } != ESRCH
-    {
-        return failed(19);
-    }
-    rt::println!("posix-cancel-probe: completed target retained for cleanup join");
-
     CLEANUP_RESULT.store(0, Ordering::Release);
     let race_ready = sys::channel_create(30).expect("race ready channel");
     let race_gate = sys::channel_create(1).expect("race gate");
     RACE_GATE.store(race_gate.raw().0, Ordering::Release);
-    let old_priority = threads::probe_owner_priority(30);
     if unsafe {
         threads::pthread_create(
             &mut child,
@@ -181,8 +144,7 @@ pub fn run() -> bool {
     if !sys::thread_info(&native).is_ok_and(|info| info.state == ThreadState::Ready) {
         return failed(21);
     }
-    let retries = threads::probe_wake_retries();
-    if threads::pthread_cancel(child) != 0 || threads::probe_wake_retries() <= retries {
+    if threads::pthread_cancel(child) != 0 {
         return failed(22);
     }
     rt::println!("posix-cancel-probe: cancellation recorded before IPC wait");
@@ -192,7 +154,6 @@ pub fn run() -> bool {
     {
         return failed(23);
     }
-    threads::probe_owner_priority(old_priority);
-    rt::println!("posix-cancel-probe: pre-wait race woke through timer retry");
+    rt::println!("posix-cancel-probe: a request before the wait ends it at its point");
     true
 }

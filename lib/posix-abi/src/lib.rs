@@ -195,6 +195,14 @@ unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
                 let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
                 let mut bytes = [0; posix_request::MAX_READ];
                 threads::cancel::console_wait();
+                // A request of cancellation that comes between this check
+                // and the wait in the console's service interrupts nothing:
+                // the read waits for input then. The two-step long
+                // operations (task 5) wait on the thread's own channel and
+                // close this window.
+                if threads::cancel::requested() {
+                    return Err(EINTR);
+                }
                 let length = input
                     .read(&mut bytes[..extent as usize])
                     .map_err(|status| error(status.into()))?;

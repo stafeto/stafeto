@@ -1388,7 +1388,7 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(&output, "posix-thread-probe: ok")?;
         qemu::expect_marker(
             &output,
-            "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
+            "priority-probe: heap and files at the ceiling above main, no pthread owner",
         )?;
         qemu::expect_marker(&output, "posix-process: adoption refusals ok")
     });

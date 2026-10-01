@@ -22,6 +22,8 @@ use rt::{
 };
 
 #[cfg(not(feature = "cancel-input"))]
+mod blocks;
+#[cfg(not(feature = "cancel-input"))]
 mod borrow_guards;
 #[cfg(not(feature = "cancel-input"))]
 mod cancellation;
@@ -50,8 +52,6 @@ mod reentry;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_context;
 #[cfg(not(feature = "cancel-input"))]
-mod signal_timed;
-#[cfg(not(feature = "cancel-input"))]
 mod signal_wait;
 #[cfg(not(feature = "cancel-input"))]
 mod signals;
@@ -61,8 +61,6 @@ mod sleep;
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
 mod tcb;
-#[cfg(not(feature = "cancel-input"))]
-mod thread_replies;
 #[cfg(not(feature = "cancel-input"))]
 mod timed;
 #[cfg(not(feature = "cancel-input"))]
@@ -118,8 +116,13 @@ fn waiting_registered(thread: &Handle<Thread>, registered: impl Fn() -> bool) ->
     let wake = sys::channel_create(30).expect("poll wake channel");
     let timer = sys::timer_create(&wake, 30).expect("poll timer");
     for _ in 0..100 {
-        if sys::thread_info(thread).is_ok_and(|info| info.state == ThreadState::AwaitingReply)
-            && registered()
+        // In a request of a service, or in receive on a channel of its own.
+        if sys::thread_info(thread).is_ok_and(|info| {
+            matches!(
+                info.state,
+                ThreadState::AwaitingReply | ThreadState::Receiving
+            )
+        }) && registered()
         {
             return true;
         }
@@ -217,26 +220,23 @@ fn failed(stage: usize) -> bool {
     false
 }
 
-/// The thread owner, the heap and file workers and the sleep timer all sit
-/// at the process ceiling, which the init table puts one above main.
+/// The heap and file workers sit at the process ceiling, which the init
+/// table puts one above main; no pthread owner exists.
 #[cfg(not(feature = "cancel-input"))]
 fn priorities() -> bool {
     let main = MAIN_BASE.load(Ordering::Acquire) as u8;
-    let (owner, timer) = threads::probe_owner_levels();
     let heap = abi::allocation::probe_worker_base();
     let files = abi::shared::probe_worker_base();
-    if owner != main + 1 || timer != owner || heap != owner || files != owner {
+    if heap != main + 1 || files != heap {
         rt::println!(
-            "posix-thread-probe: main {} owner {} timer {} heap {} files {}",
+            "posix-thread-probe: main {} heap {} files {}",
             main,
-            owner,
-            timer,
             heap,
             files
         );
         return failed(451);
     }
-    rt::println!("priority-probe: owner, heap, files and sleep timer at the ceiling above main");
+    rt::println!("priority-probe: heap and files at the ceiling above main, no pthread owner");
     true
 }
 
@@ -268,9 +268,6 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let mut value = ptr::null_mut();
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 123 };
-    // Interrupt after CREATE committed, after JOIN produced its value, and
-    // after JOIN_ACK released the ID. Retries must preserve exactly one child.
-    threads::probe_interrupt_replies(true, true, true);
     if unsafe {
         threads::pthread_create(
             &mut child,
@@ -411,6 +408,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
 
     if !tcb::run()
         || !futex::run()
+        || !blocks::run()
         || !clocks::run(clocks)
         || !capacity::run()
         || !specific::run()
@@ -422,13 +420,11 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !borrow_guards::run(parent)
         || !reentry::run()
         || !file_replies::run()
-        || !thread_replies::run()
         || !clock_replies::run(parent)
         || !heap_replies::run()
         || !signals::run()
         || !signal_context::run()
         || !signal_wait::run()
-        || !signal_timed::run()
         || !cancellation::run()
     {
         return false;

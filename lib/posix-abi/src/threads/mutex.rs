@@ -93,24 +93,22 @@ fn valid_address(address: u64) -> bool {
 /// The monotonic instant of an absolute deadline on `deadline.clock`; for
 /// CLOCK_REALTIME through the clock service now, rechecked after it passed.
 pub(crate) fn monotonic_target(deadline: Deadline) -> Result<u64, i32> {
-    let anchor = if deadline.clock == proto_clock::REALTIME {
-        Some(crate::clock::observation()?.anchor)
+    let target = if deadline.clock == proto_clock::REALTIME {
+        let (time, mono) = crate::clock::realtime_anchor()?;
+        deadline.value() - time + i128::from(mono)
     } else {
-        None
+        deadline.value()
     };
-    let target = deadline.target(anchor).map_err(|_| EINVAL)?;
     Ok(target.clamp(0, i128::from(u64::MAX)) as u64)
 }
 
 /// Whether an absolute deadline passed on its own clock.
 pub(crate) fn passed(deadline: Deadline) -> Result<bool, i32> {
-    let now = rt::time::ticks_to_ns(rt::time::now());
-    let observation = if deadline.clock == proto_clock::REALTIME {
-        Some(crate::clock::observation()?)
-    } else {
-        None
-    };
-    deadline.expired(now, observation).map_err(|_| EIO)
+    if deadline.clock == proto_clock::REALTIME {
+        let (time, _) = crate::clock::realtime_anchor()?;
+        return Ok(deadline.value() <= time);
+    }
+    Ok(deadline.value() <= i128::from(rt::time::ticks_to_ns(rt::time::now())))
 }
 
 /// Takes `mutex` for the calling thread: at once, or after waiting until

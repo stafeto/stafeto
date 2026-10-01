@@ -228,7 +228,6 @@ pub(super) fn run() -> bool {
         {
             return failed(454);
         }
-        threads::probe_interrupt_signal_reply(44);
         if api::pthread_kill(id, SIGUSR1) != 0 {
             return failed(455);
         }
