@@ -1540,7 +1540,7 @@ fn timer_notice() -> [u64; 11] {
 /// the kernel never idles. That takes some 100 µs of the machine's time,
 /// but under TCG with no -icount the counter is the host's: a host that
 /// holds QEMU's thread off its CPU past a deadline 1 ms away failed these
-/// tests about once in 20 runs (bug #93). 50 ms is five quanta of a busy
+/// tests about once in 20 runs. 50 ms is five quanta of a busy
 /// host's scheduler; it costs 50 ms of the run per test with no -icount
 /// and nothing under -icount, whose idle kernel skips to the deadline.
 const IDLE_ALARM_NS: u64 = 50_000_000;
@@ -2666,7 +2666,7 @@ fn start_timer_latency(f: &mut Fixture) -> Result<(), &'static str> {
     // holds QEMU's thread off its CPU across both the alarm's deadline and
     // the spinner's end lets the spinner see its end before the interrupt
     // comes. A spinner of 2 ms, 1 ms past the alarm, lost that race once
-    // in 20 runs on a busy host (bug #93); 50 ms is five quanta of the
+    // in 20 runs on a busy host; 50 ms is five quanta of the
     // host's scheduler. The spinner then runs on through quanta of its
     // own, alone at its level.
     const SPIN_PAST_ALARM_NS: u64 = 50_000_000;
@@ -3741,7 +3741,7 @@ fn done_same_state(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// first note arms the test's alarm half a quantum later, and the second
 /// request, on the fast path too, finds the timer armed for the alarm.
 /// The alarm has to come before the quantum ends, which no margin makes
-/// sure of on a busy host: the test runs under -icount only (bug #93).
+/// sure of on a busy host: the test runs under -icount only.
 fn start_armed(f: &mut Fixture) -> Result<(), &'static str> {
     snap_pair(f, PRIORITY + 2, RR, false)?;
     let p = f.processes[0].expect("the service's process");
@@ -3780,7 +3780,7 @@ fn done_armed(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// and sends: the service works at its ceiling, 12, level with the
 /// cleanup, which runs first, on the slow path. The alarm is
 /// IDLE_ALARM_NS away, so that the early client sends first on a busy
-/// host too (bug #93).
+/// host too.
 fn start_cleanup_first(f: &mut Fixture) -> Result<(), &'static str> {
     let root = process::create_root(QUOTA, HANDLE_LIMIT, 12).map_err(|_| "no process")?;
     let s = with_programs(f, 1, root)?;

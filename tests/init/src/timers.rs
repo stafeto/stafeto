@@ -367,7 +367,7 @@ fn timer_never_fires_early() -> Outcome {
 /// wakes ahead of S, or H ends S before the interrupt for the other
 /// timer reaches QEMU's CPU and init finds W still waiting. Under TCG
 /// with no -icount the counter is the host's, and a host that held QEMU's
-/// thread off its CPU past 1 ms failed this test once in 20 runs (bug #93).
+/// thread off its CPU past 1 ms failed this test once in 20 runs.
 /// S spins until the deadline, so the margin costs its 50 ms of the run.
 fn timer_fires_at_its_slot_priority() -> Outcome {
     const SLOT_DEADLINE_NS: u64 = 50_000_000;

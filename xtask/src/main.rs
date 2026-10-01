@@ -330,7 +330,7 @@ const UPCALL_ROWS: [&str; 6] = [
     "identity",
 ];
 /// The rows of the line of `teardown_portions_are_measured`, in its order
-/// (spec 15.3): the term B of audit 2 is the longest of them.
+/// (spec 15.3): the term B of the out-of-tree measurement is the longest of them.
 const TEARDOWN_ROWS: [&str; 7] = [
     "buffers",
     "shell",

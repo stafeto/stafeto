@@ -2106,7 +2106,7 @@ pub fn upcall_return_keeps_unimplemented_flags_off(_: &Boot) -> Result<(), &'sta
 }
 
 /// A long call polls for an interrupt between two portions (spec 7.7);
-/// that poll ends the interval of its entry (KERNEL_STATS x8) and the next
+/// that poll ends the interval of its entry (KERNEL_STATS x9) and the next
 /// portion starts one of its own: in `run_portions` on the call's own
 /// entries, and in `go_on` on the entry of another call that gives the
 /// long call up, which then runs that call in an interval of its own.
@@ -3762,9 +3762,9 @@ pub fn windows_of_the_running_process_are_counted(_: &Boot) -> Result<(), &'stat
 ///   last copies of sessions, each waking a receiver
 ///   (session_handles_ticks).
 ///
-/// The last three come from the stand of audit 2 (tools/audit `a2-*` in
-/// the design repository), whose worst portion was the term B of the
-/// blocking of every level (spec 15.3).
+/// The last three are the session cases measured before this cleanup,
+/// whose worst portion was the term B of the blocking of every level
+/// (spec 15.3).
 #[cfg(feature = "icount")]
 pub fn teardown_portions_are_measured(_: &Boot) -> Result<(), &'static str> {
     let before = (process::in_use(), thread::in_use());

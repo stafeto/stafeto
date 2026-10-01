@@ -1024,7 +1024,8 @@ pub struct KernelStats {
     /// level (spec 7.7, 10).
     pub longest_firing: u64,
     /// The longest time from an EL0 entry to the first pending-interrupt
-    /// poll on the way out of the kernel.
+    /// poll on the way out of the kernel, or between two portions of a long
+    /// call.
     pub entry_to_poll: u64,
 }
 

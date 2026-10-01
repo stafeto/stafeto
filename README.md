@@ -160,8 +160,8 @@ Bounded kernel paths and their costs:
 
 | Step | What it brings | State |
 |---|---|---|
-| Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | 🚧 |
-| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | ⬜ |
+| Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
+| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
 | Kernel | DMA memory objects, the Virtio console as a user-space service, process IDs out of the kernel | ⬜ |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ⬜ |
 | POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | ⬜ |

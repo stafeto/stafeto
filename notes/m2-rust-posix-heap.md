@@ -36,10 +36,11 @@ Closing a memory handle leaves its mapping alive. Freed blocks are reused;
 committed mappings remain until process exit.
 
 The worker runs at the process ceiling, one above the main thread in the
-init tables, and takes a client's priority on receive up to that ceiling. First-fit search, growth and large
-zeroing or copying have no established worst-case bounds. This implementation
-does not claim hard real-time allocation. Scheduling and latency analysis
-remain separate requirements of the wider runtime.
+init tables, and takes a client's priority on receive up to that ceiling.
+First-fit search, growth and large zeroing or copying have no established
+worst-case bounds. This implementation does not claim hard real-time
+allocation. Scheduling and latency analysis remain separate requirements of
+the wider runtime.
 
 ## Allocation semantics
 

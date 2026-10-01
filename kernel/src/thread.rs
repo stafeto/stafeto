@@ -42,7 +42,7 @@ pub struct Thread {
     /// The handler entry (spec 11). A request from another thread
     /// changes it under the scheduler's lock (sched::request_upcall); the
     /// thread itself changes it without that lock (bind, control, the entry
-    /// in `run`) while the kernel runs on one core (#8).
+    /// in `run`) while the kernel runs on one core (the unlocked path ends when it runs on more).
     pub upcall: kcore::upcall::State,
     /// What the scheduler keeps in the thread: the base priority, which
     /// `create` or thread_set_priority gave, the boost of a notification or
