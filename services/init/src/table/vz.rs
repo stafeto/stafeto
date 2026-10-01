@@ -32,7 +32,8 @@ const LINE: u32 = 64 + DEVICE as u32;
 /// where the driver puts it (virtio_console::pci::BAR_BASE).
 const BAR: u64 = 0x1_0000_0000;
 /// `device_status` of the Virtio common configuration, which VZ puts at
-/// the start of BAR 0 (the function's first Virtio capability).
+/// the start of BAR 0; the driver checks that in the function's
+/// capability list before it starts (virtio_console::pci::common_config).
 const DEVICE_STATUS: u64 = 0x14;
 /// The command word of the function and its bit of memory decoding.
 const COMMAND: u64 = 4;

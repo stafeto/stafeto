@@ -17,6 +17,18 @@ pub const CONSOLE_ID: u32 = 0x1043_1af4;
 pub const COMMAND: usize = 0x04;
 pub const MEMORY: u32 = 1 << 1;
 pub const BUS_MASTER: u32 = 1 << 2;
+/// INTx Disable: with it set the function raises no INTA, and the port's
+/// writes, which end only by the interrupt, would stop after the first.
+pub const INTX_DISABLE: u32 = 1 << 10;
+/// The capabilities pointer, in the low byte of the word at 0x34.
+pub const CAPABILITIES: usize = 0x34;
+/// A vendor capability, which Virtio uses for its structures, and its
+/// `cfg_type` of the common configuration (Virtio 1.2, 4.1.4).
+const VENDOR_CAPABILITY: u32 = 0x09;
+const COMMON_CONFIG: u32 = 1;
+/// The capabilities a list may hold: 48 fit in the 192 bytes past the
+/// header, so a longer walk is a loop in the list.
+const MOST_CAPABILITIES: usize = 48;
 /// The 64-bit BAR 0 and 1, and BAR 2.
 pub const BAR0: usize = 0x10;
 pub const BAR1: usize = 0x14;
@@ -34,7 +46,7 @@ pub const BAR_LEN: u64 = 0x1_0000;
 /// value), from `command`, the command word read before them: decoding
 /// and bus mastering off, the BARs, decoding on.
 pub fn set_up(command: u32) -> [(usize, u32); 5] {
-    let command = command & 0xFFFF & !BUS_MASTER;
+    let command = command & 0xFFFF & !BUS_MASTER & !INTX_DISABLE;
     [
         (COMMAND, command & !MEMORY),
         // The low word keeps only its type bits: a 64-bit memory BAR.
@@ -45,9 +57,32 @@ pub fn set_up(command: u32) -> [(usize, u32); 5] {
     ]
 }
 
-/// The command word once the device is reset: decoding and bus mastering.
+/// The command word once the device is reset: decoding and bus mastering,
+/// and the interrupt let through.
 pub fn bus_master(command: u32) -> u32 {
-    (command & 0xFFFF) | MEMORY | BUS_MASTER
+    (command & 0xFFFF & !INTX_DISABLE) | MEMORY | BUS_MASTER
+}
+
+/// Where the function's capability list puts the Virtio common
+/// configuration, as (BAR, offset), from `read`, the 32-bit registers of
+/// the configuration space: the first vendor capability of `cfg_type` 1.
+/// None when the list holds none or does not end. init stops the device
+/// through `device_status` at 0x14 of BAR 0 (init's table for VZ), so the
+/// driver starts only where the structure lies at offset 0 of BAR 0.
+pub fn common_config(mut read: impl FnMut(usize) -> u32) -> Option<(u8, u32)> {
+    let mut at = (read(CAPABILITIES) & 0xFC) as usize;
+    for _ in 0..MOST_CAPABILITIES {
+        if at == 0 {
+            return None;
+        }
+        // cap_vndr, cap_next, cap_len, cfg_type; then bar; then offset.
+        let head = read(at);
+        if head & 0xFF == VENDOR_CAPABILITY && (head >> 24) & 0xFF == COMMON_CONFIG {
+            return Some((read(at + 4) as u8, read(at + 8)));
+        }
+        at = ((head >> 8) & 0xFC) as usize;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -63,5 +98,55 @@ mod tests {
         let mut commands = writes.iter().filter(|&&(at, _)| at == COMMAND);
         assert!(commands.clone().count() == 2 && commands.all(|&(_, v)| v & BUS_MASTER == 0));
         assert_eq!(bus_master(0x0010_0001), 0x0007);
+    }
+
+    #[test]
+    fn intx_disable_found_set_is_cleared() {
+        let writes = set_up(0x0000_0400);
+        assert!(writes.iter().all(|&(_, v)| v & INTX_DISABLE == 0));
+        assert_eq!(writes[4], (COMMAND, MEMORY));
+        assert_eq!(bus_master(0x0000_0402), 0x0006);
+    }
+
+    /// A configuration space of 256 bytes as words, read by offset.
+    fn space(words: &[(usize, u32)]) -> impl FnMut(usize) -> u32 + '_ {
+        |at| words.iter().find(|&&(o, _)| o == at).map_or(0, |&(_, v)| v)
+    }
+
+    #[test]
+    fn common_config_is_found_through_the_list() {
+        // At 0x40 an MSI-X capability (0x11), at 0x50 the notify (type 2),
+        // at 0x64 the common configuration in BAR 0 at 0.
+        let vz = [
+            (CAPABILITIES, 0x40),
+            (0x40, 0x0000_5011),
+            (0x50, 0x0214_6409),
+            (0x64, 0x0110_0009),
+            (0x68, 0),
+            (0x6C, 0),
+        ];
+        assert_eq!(common_config(space(&vz)), Some((0, 0)));
+        // The structure moved: BAR 2, or offset 0x1000 of BAR 0.
+        let mut moved = vz;
+        moved[4].1 = 2;
+        assert_eq!(common_config(space(&moved)), Some((2, 0)));
+        moved[4].1 = 0;
+        moved[5].1 = 0x1000;
+        assert_eq!(common_config(space(&moved)), Some((0, 0x1000)));
+    }
+
+    #[test]
+    fn common_config_is_none_without_it_or_in_a_loop() {
+        assert_eq!(common_config(space(&[])), None);
+        // Only the notify capability.
+        let notify = [(CAPABILITIES, 0x50), (0x50, 0x0214_0009)];
+        assert_eq!(common_config(space(&notify)), None);
+        // A list whose last entry points back at its first.
+        let looped = [
+            (CAPABILITIES, 0x40),
+            (0x40, 0x0000_5011),
+            (0x50, 0x0214_4009),
+        ];
+        assert_eq!(common_config(space(&looped)), None);
     }
 }
