@@ -76,6 +76,13 @@ static CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(not(feature = "cancel-input"))]
 const VALUE: usize = 0x5678;
 
+/// Ends its thread with thread_exit, past the library: no EXIT reaches the
+/// owner, only the kernel's notification of the thread's end.
+#[cfg(not(feature = "cancel-input"))]
+unsafe extern "C" fn past_the_library(_: *mut c_void) -> *mut c_void {
+    sys::thread_exit()
+}
+
 unsafe extern "C" fn returning(argument: *mut c_void) -> *mut c_void {
     CALLS.fetch_add(1, Ordering::AcqRel);
     argument
@@ -220,6 +227,27 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(2);
     }
     rt::println!("posix-thread-probe: interrupted committed replies preserve result and identity");
+    // A thread that ends past the library is joined once the kernel tells
+    // the owner of its end: the owner polls no thread state on a timer.
+    let mut past = 0;
+    value = VALUE as *mut c_void;
+    if unsafe {
+        threads::pthread_create(
+            &mut past,
+            ptr::null(),
+            Some(past_the_library),
+            ptr::null_mut(),
+        )
+    } != 0
+        || unsafe { threads::pthread_join(past, &mut value) } != 0
+        || !value.is_null()
+        || unsafe { threads::pthread_join(past, ptr::null_mut()) } != ESRCH
+    {
+        return failed(13);
+    }
+    rt::println!(
+        "posix-thread-probe: a thread that ended past the library joins through its end's notification"
+    );
 
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));

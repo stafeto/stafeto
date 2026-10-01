@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 33] = [
+pub(crate) const TESTS: [Test; 35] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -44,6 +44,11 @@ pub(crate) const TESTS: [Test; 33] = [
         thread_start_and_process_kill_check_their_handles,
     ),
     ("thread_states", thread_states),
+    ("thread_end_is_heard_once", thread_end_is_heard_once),
+    (
+        "threads_of_an_ended_process_are_not_heard",
+        threads_of_an_ended_process_are_not_heard,
+    ),
     ("thread_limit_is_128", thread_limit_is_128),
     (
         "higher_priority_start_preempts_at_once",
@@ -554,8 +559,10 @@ fn thread_create_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Ou
     let fifo = Policy::Fifo as u64;
     // The page after the child's thread's buffer is free.
     let (entry, stack, free) = (CHILD_ENTRY, 0x80_1000, CHILD_BUFFER + PAGE as u64);
-    let args =
-        |h, entry, stack, priority, policy, buffer| [h, entry, stack, 7, priority, policy, buffer];
+    let args = |h, entry, stack, priority, policy, buffer| {
+        [h, entry, stack, 7, priority, policy, buffer, 0, 0]
+    };
+    let exits = exit_cases(c, t, gone);
     let values = [c.raw().0, gone].into_iter().all(|h| {
         [
             args(h, LOWER_END, stack, 10, fifo, free),
@@ -598,6 +605,176 @@ fn thread_create_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Ou
     check(
         taken,
         "a buffer on a taken page did not fail with INVALID_ARGS after the ceiling",
+    )?;
+    exits
+}
+
+/// x7 and x8 of thread_create, the exit channel and its priority (spec
+/// 6.5, 11), each failing with x0 alone: x8 not 0 without x7, or outside
+/// 1-63 with it, INVALID_ARGS before the handles; x7 closed, of another
+/// kind or a copy without NOTIFY BAD_HANDLE, WRONG_TYPE and ACCESS_DENIED
+/// after x0; x7 on a channel that closed PEER_CLOSED after the state of
+/// the process, which a dead process fails first with BAD_STATE.
+fn exit_cases(c: &Handle<Process>, t: &Handle<Thread>, gone: u64) -> Outcome {
+    const N: u16 = Call::ThreadCreate.number();
+    let fifo = Policy::Fifo as u64;
+    let (entry, stack, free) = (CHILD_ENTRY, 0x80_1000, CHILD_BUFFER + PAGE as u64);
+    let heard = channel(QUIET)?;
+    let notify = copy(&heard, Rights::NOTIFY)?;
+    let blind = copy(&heard, Rights::NONE)?;
+    let shut = channel(QUIET)?;
+    let late = copy(&shut, Rights::NOTIFY)?;
+    close(shut)?;
+    let dead = child(TEST_PRIORITY)?;
+    let killed = sys::process_kill(&dead).is_ok();
+    let (n, b, l) = (notify.raw().0, blind.raw().0, late.raw().0);
+    let x = |h, x7, x8| [h, entry, stack, 7, 10, fifo, free, x7, x8];
+    let p = c.raw().0;
+    let values = [p, gone].into_iter().all(|h| {
+        [x(h, 0, 5), x(h, n, 0), x(h, n, 64), x(h, n, 0x100 | 5)]
+            .iter()
+            .all(|a| x0_alone::<N>(a, Error::InvalidArgs.code()))
+    });
+    let handles = [
+        (x(gone, n, 5), Error::BadHandle),
+        (x(p, gone, 5), Error::BadHandle),
+        (x(p, t.raw().0, 5), Error::WrongType),
+        (x(p, b, 5), Error::AccessDenied),
+        (x(dead.raw().0, l, 5), Error::BadState),
+        (x(p, l, 5), Error::PeerClosed),
+    ]
+    .iter()
+    .all(|(a, e)| x0_alone::<N>(a, e.code()));
+    for h in [notify, blind, late, heard] {
+        close(h)?;
+    }
+    close(dead)?;
+    check(
+        killed && values,
+        "x8 without x7 or outside 1-63 did not fail with INVALID_ARGS alone before the handles",
+    )?;
+    check(
+        handles,
+        "a bad x7 did not fail alone in the order of spec 11",
+    )
+}
+
+/// The exit channel and the thread whose end `heard_end` watches, raw.
+static WATCHED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A thread made with an exit channel (thread_create x7, x8; spec 6.5)
+/// ends through thread_exit while init's process lives on: a watcher above
+/// it, waiting on the channel, wakes with source Exit, the handle's label
+/// and bit 0 once, and finds the thread ended then; nothing else comes.
+/// The thread holds one of the channel's slots until its handle goes, and
+/// a thread that never started gives its slot back with its handle.
+fn thread_end_is_heard_once() -> Outcome {
+    reset_marks();
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let ender = thread_heard(1, add_mark, 0, HIGH, (&name, NOTICE))?;
+    let idle = thread_heard(2, add_mark, 3, HIGH, (&name, NOTICE))?;
+    let held = sources();
+    close(idle)?;
+    let unstarted = sources();
+    WATCHED[0].store(c.raw().0, Relaxed);
+    WATCHED[1].store(ender.raw().0, Relaxed);
+    let watcher = spawn(0, heard_end, 1, HIGH + 5, Policy::Fifo)?;
+    let started = sys::thread_start(&ender);
+    let after_end = sources();
+    let rest = sys::try_receive(&c);
+    close(ender)?;
+    let gone = sources();
+    let_run()?;
+    close(watcher)?;
+    close(name)?;
+    close(c)?;
+    let before = before.map_err(|_| "CHANNEL failed")?;
+    check(
+        held == Ok(before + 2) && unstarted == Ok(before + 1),
+        "a thread with an exit channel took no slot, or one that never started kept it",
+    )?;
+    check(
+        started.is_ok() && mark(0) == 1,
+        "the thread with an exit channel did not run",
+    )?;
+    check(
+        mark(1) == 1 + ThreadState::Ended.code(),
+        "the end of the thread did not come once it ended",
+    )?;
+    check(
+        rest == Err(Error::WouldBlock) && after_end == Ok(before + 1) && gone == Ok(before),
+        "more than one notification came, or the slot stayed after the thread went",
+    )
+}
+
+/// Waits on the channel of WATCHED; mark `i` gets 1 + the code of the
+/// state of the watched thread when the notification of its end came, 0
+/// for anything else.
+extern "C" fn heard_end(i: u64) -> ! {
+    let c = Handle::<Channel>::borrowed(abi::Handle(WATCHED[0].load(Relaxed)));
+    let t = Handle::<Thread>::borrowed(abi::Handle(WATCHED[1].load(Relaxed)));
+    let got = sys::receive(&c);
+    let end = Received::Notification {
+        source: abi::Source::Exit,
+        label: CHILD,
+        bits: 1,
+        count: 1,
+    };
+    let state = sys::thread_info(&t).map_or(0, |info| info.state.code());
+    let mark = if got == Ok(end) { 1 + state } else { 0 };
+    MARKS[i as usize].store(mark, Relaxed);
+    sys::thread_exit()
+}
+
+/// The threads of a process that ends are not heard of (spec 6.5): a child
+/// with two threads on init's exit channel, one never started, is killed;
+/// no notification comes, and the slots go back with the threads' handles.
+fn threads_of_an_ended_process_are_not_heard() -> Outcome {
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let kid = child(LOW)?;
+    let threads = [CHILD_BUFFER, CHILD_BUFFER + PAGE as u64].map(|buffer| {
+        let mut x = [0; 10];
+        x[..9].copy_from_slice(&[
+            kid.raw().0,
+            CHILD_ENTRY,
+            0,
+            0,
+            LOW.into(),
+            Policy::Fifo as u64,
+            buffer,
+            name.raw().0,
+            QUIET.into(),
+        ]);
+        // SAFETY: the thread runs in another process and touches nothing
+        // of init's.
+        let after = unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) };
+        (after[0] == 0).then(|| Handle::<Thread>::from_raw(abi::Handle(after[1])))
+    });
+    let held = sources();
+    let killed = sys::process_kill(&kid);
+    let heard = sys::try_receive(&c);
+    let made = threads.iter().all(Option::is_some);
+    for t in threads.into_iter().flatten() {
+        close(t)?;
+    }
+    close(kid)?;
+    let after = sources();
+    close(name)?;
+    close(c)?;
+    let before = before.map_err(|_| "CHANNEL failed")?;
+    check(
+        made && killed.is_ok() && held == Ok(before + 2),
+        "the child's threads with an exit channel were not made, or took no slots",
+    )?;
+    check(
+        heard == Err(Error::WouldBlock) && after == Ok(before),
+        "a thread of an ended process was heard of, or kept its slot",
     )
 }
 

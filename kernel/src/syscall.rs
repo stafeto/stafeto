@@ -950,31 +950,50 @@ fn process_exit(thread: NonNull<Thread>, a: &Args) -> ! {
 }
 
 /// thread_create(x0 process with MANAGE, x1 entry, x2 stack, x3 argument,
-/// x4 priority, x5 policy, x6 message buffer address): a stopped thread in
-/// the process with its message buffer mapped at x6, whose address its
-/// TPIDRRO_EL0 holds (spec 6.2); x1 returns a handle to it with DUPLICATE,
-/// TRANSFER and MANAGE. The entry is in the lower half and 4-byte aligned,
-/// the stack no higher than its top and 16-byte aligned, the buffer a whole
-/// page there (INVALID_ARGS); the priority no higher than the ceiling of
-/// the process nor than the caller's (ACCESS_DENIED); the process has not
-/// ended (BAD_STATE); the buffer's page is free there and outside its
-/// mappings, mapped or not yet (INVALID_ARGS, spec 6.2).
-/// Resources come last and in the order the call occupies them, a limit
-/// that needs no allocation first (spec 11): the caller's own table has
-/// room for the new handle (LIMIT_REACHED), then the target has fewer than
-/// abi::MAX_THREADS threads that have not ended and the system a free
-/// thread number (LIMIT_REACHED, checked inside thread::create before it
-/// charges anything), then the target's quota (NO_MEMORY).
+/// x4 priority, x5 policy, x6 message buffer address, x7 exit channel, x8
+/// its priority): a stopped thread in the process with its message buffer
+/// mapped at x6, whose address its TPIDRRO_EL0 holds (spec 6.2); x1
+/// returns a handle to it with DUPLICATE, TRANSFER and MANAGE. The entry is
+/// in the lower half and 4-byte aligned, the stack no higher than its top
+/// and 16-byte aligned, the buffer a whole page there, x8 1-63 with x7 and
+/// exactly 0 without (INVALID_ARGS); x7, a channel handle with NOTIFY, with
+/// a label or none, or 0 (BAD_HANDLE, WRONG_TYPE, ACCESS_DENIED); the
+/// priority no higher than the ceiling of the process nor than the
+/// caller's, x8 no higher than the caller's (ACCESS_DENIED); the process
+/// has not ended (BAD_STATE); x7 on a channel that closed (PEER_CLOSED);
+/// the buffer's page is free there and outside its mappings, mapped or not
+/// yet (INVALID_ARGS, spec 6.2). Resources come last and in the order the
+/// call occupies them, a limit that needs no allocation first (spec 11):
+/// the caller's own table has room for the new handle (LIMIT_REACHED),
+/// then the target has fewer than abi::MAX_THREADS threads that have not
+/// ended and the system a free thread number, then the channel of x7 a slot
+/// (LIMIT_REACHED, checked inside thread::create before it charges
+/// anything), then the target's quota (NO_MEMORY). With x7 the thread's
+/// end through thread_exit posts bit 0 at x8 with the label of the handle
+/// (source Exit), unless that exit ended the process (thread::exit).
 fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let priority = priority_arg(a[4])?;
     let policy = policy_arg(a[5])?;
     check_start(a[1], a[2], priority)?;
     check_buffer(a[6])?;
+    let notice = notify_priority_arg(a[8], a[7] != 0)?;
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
+    let exit = match a[7] {
+        0 => None,
+        h => Some(lookup(thread, h, Rights::NOTIFY, |o| {
+            Some((o.channel()?, o.session().map_or(0, session::label)))
+        })?),
+    };
     // SAFETY: the handle holds the target process.
     let target_ceiling = unsafe { target.as_ref() }.ceiling();
     under_ceilings(priority, &[target_ceiling, caller_ceiling(thread)])?;
+    under_ceilings(notice, &[caller_ceiling(thread)])?;
     process::check_alive(target)?;
+    if let Some((c, _)) = exit
+        && channel::is_closed(c)
+    {
+        return Err(Error::PeerClosed);
+    }
     let buffer = a[6] as usize;
     if process::translate(target, buffer).is_some() || process::in_mapping(target, buffer) {
         return Err(Error::InvalidArgs);
@@ -982,7 +1001,9 @@ fn thread_create(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     // The caller's table first: it needs no allocation, and the call would
     // insert the new thread's handle there last (spec 11).
     process::handle_room(caller(thread))?;
-    let t = thread::create(target, a[1] as usize, a[2] as usize, a[3], priority, policy)?;
+    let exit = exit.map(|(c, label)| (c, label, notice));
+    let (entry, stack) = (a[1] as usize, a[2] as usize);
+    let t = thread::create_with_exit(target, entry, stack, a[3], priority, policy, exit)?;
     let h = thread::give_buffer(t, buffer)
         .and_then(|()| process::insert_handle(caller(thread), Object::Thread(t), OWNER_RIGHTS));
     // SAFETY: the reference `create` handed out goes; the handle, if it

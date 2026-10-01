@@ -338,7 +338,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
-const ICOUNT_TESTS: [&str; 14] = [
+const ICOUNT_TESTS: [&str; 15] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -348,6 +348,7 @@ const ICOUNT_TESTS: [&str; 14] = [
     "fast_path_arms_the_timer",
     "teardown_yields_to_a_pending_interrupt",
     "thread_exit_after_channel_close_is_measured",
+    "thread_exit_notice_is_measured",
     "ipc_round_trip_is_measured",
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
@@ -535,7 +536,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 224;
+const INIT_TESTS: u32 = 226;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the

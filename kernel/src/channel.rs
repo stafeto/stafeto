@@ -66,6 +66,9 @@ pub enum Owner {
     Session(NonNull<Session>),
     /// The end of a process, whose shell holds the slot (spec 7.9).
     Exit(NonNull<Process>),
+    /// The end of a thread through thread_exit, which lies in the thread
+    /// (thread_create x7, spec 6.5).
+    ThreadEnd(NonNull<Thread>),
     /// A timer (spec 10).
     Timer(NonNull<Timer>),
     /// An interrupt binding (spec 9).
@@ -81,7 +84,7 @@ impl Owner {
         match self {
             Owner::Channel => abi::Source::Unlabeled,
             Owner::Session(_) => abi::Source::Session,
-            Owner::Exit(_) => abi::Source::Exit,
+            Owner::Exit(_) | Owner::ThreadEnd(_) => abi::Source::Exit,
             Owner::Timer(_) => abi::Source::Timer,
             Owner::Irq(_) => abi::Source::Interrupt,
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
@@ -93,6 +96,7 @@ impl Owner {
             Owner::Channel => 0,
             Owner::Session(s) => session::label(s),
             Owner::Exit(p) => process::exit_label(p),
+            Owner::ThreadEnd(t) => thread::exit_label(t),
             Owner::Timer(t) => timer::label(t),
             Owner::Irq(b) => irq::label(b),
             Owner::Thread(_) => unreachable!("a thread's slot carries no notification"),
@@ -107,6 +111,7 @@ impl Owner {
             Owner::Channel => {}
             Owner::Session(s) => session::hold(s),
             Owner::Exit(p) => process::retain_shell(p),
+            Owner::ThreadEnd(t) => thread::retain(t),
             Owner::Timer(t) => timer::retain(t),
             Owner::Irq(b) => irq::retain(b),
             Owner::Thread(_) => unreachable!("a thread's slot is posted"),
@@ -126,6 +131,8 @@ impl Owner {
             // SAFETY: as above.
             Owner::Exit(p) => unsafe { process::release_shell(p, cause) },
             // SAFETY: as above.
+            Owner::ThreadEnd(t) => unsafe { thread::release(t, cause) },
+            // SAFETY: as above.
             Owner::Timer(t) => unsafe { timer::release(t, cause) },
             // SAFETY: as above.
             Owner::Irq(b) => unsafe { irq::release(b, cause) },
@@ -134,7 +141,8 @@ impl Owner {
 }
 
 /// A source of notifications on a channel (spec 6.5): a session, a timer,
-/// the end of a process or an interrupt binding, which it lies in. It holds
+/// the end of a process or of a thread or an interrupt binding, which it
+/// lies in. It holds
 /// one of the channel's slots from channel::reserve_source until `detach`,
 /// and the channel with a counted reference from `attach` until then; its
 /// own slot, whose owner is the object it lies in, and the label receive

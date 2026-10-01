@@ -66,6 +66,7 @@ unsafe extern "C" {
     static el0_info_then_exit: u8;
     #[cfg(feature = "icount")]
     static el0_close_then_exit: u8;
+    static el0_thread_exit: u8;
     static el0_receive: u8;
     static el0_receive_then_exit: u8;
     static el0_kill_notify_receive: u8;
@@ -286,6 +287,11 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_requeue,
     },
     El0Test {
+        name: "last_thread_exit_is_not_heard",
+        start: start_last_exit,
+        done: done_last_exit,
+    },
+    El0Test {
         name: "closing_a_channel_wakes_waiters_in_portions",
         start: start_close_portions,
         done: done_close_portions,
@@ -479,6 +485,12 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "thread_exit_after_channel_close_is_measured",
         start: start_exit_after_close,
         done: done_exit_after_close,
+    },
+    #[cfg(feature = "icount")]
+    El0Test {
+        name: "thread_exit_notice_is_measured",
+        start: start_exit_notice,
+        done: done_exit_notice,
     },
     El0Test {
         name: "ipc_round_trip_is_measured",
@@ -2044,6 +2056,101 @@ fn done_exit_after_close(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
         )?;
     }
     Ok(())
+}
+
+/// The last thread of a process, made with an exit channel of another
+/// process where a thread waits in receive, ends its process through
+/// thread_exit (spec 6.5): the end of the process replaces the end of the
+/// thread, nothing is posted, and the receiver waits on. The judge below
+/// finds the process exited with code 0.
+fn start_last_exit(f: &mut Fixture) -> Result<(), &'static str> {
+    let receiver = spawn(f, 0, &raw const el0_receive, 0)?;
+    sched::set_priority(receiver, PRIORITY + 2, FIFO).map_err(|_| "no receiver")?;
+    let p = f.processes[0].expect("the receiver's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    let exit = Some((c, EXIT_LABEL, PRIORITY + 1));
+    let ender = new_process(f, 1).and_then(|q| {
+        let entry = user_address(&raw const el0_thread_exit);
+        thread::create_with_exit(q, entry, DATA_VA + PAGE, 0, PRIORITY, FIFO, exit)
+            .map_err(|_| "no thread with an exit channel")
+    });
+    // SAFETY: the reference `create` handed out goes; the handle and the
+    // thread's source, if they were made, hold the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    set_args(receiver, &[h?, 0]);
+    f.threads[1] = Some(ender?);
+    f.ends[0] = true;
+    f.ends[1] = true;
+    judge(f, 2)
+}
+
+fn done_last_exit(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    match f.slot(t) {
+        0 => Err("the end of a process's last thread was heard"),
+        1 => Err("thread_exit returned"),
+        _ => check(
+            state(f, 1) == ProcessState::Exited { code: 0 }
+                && slot_thread(f, 0).sched.state() == State::Waiting,
+            "the last thread did not end its process, or the receiver did not wait on",
+        ),
+    }
+}
+
+/// A thread made with an exit channel ends through thread_exit while
+/// another thread of its process waits in receive on that channel (spec
+/// 6.5): the end wakes the receiver at the notification's priority with
+/// source Exit, the handle's label and bit 0, once the thread left the
+/// scheduler; its process lives on. The judge prints the cost of that
+/// thread_exit under -icount, `thread exit notice ticks: N`.
+#[cfg(feature = "icount")]
+fn start_exit_notice(f: &mut Fixture) -> Result<(), &'static str> {
+    sched_process(f)?;
+    let receiver = sched_thread(f, 0, &raw const el0_receive, PRIORITY + 2, FIFO)?;
+    let p = f.processes[0].expect("the test's process");
+    let c = channel::create(p, PRIORITY).map_err(|_| "no channel")?;
+    let h = give(p, Object::Channel(c), Rights::RECEIVE);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(c, Rights::NONE, CAUSE) };
+    set_args(receiver, &[h?, 0]);
+    let entry = user_address(&raw const el0_thread_exit);
+    let exit = Some((c, EXIT_LABEL, PRIORITY + 1));
+    let t = thread::create_with_exit(p, entry, DATA_VA + PAGE, 0, PRIORITY, FIFO, exit)
+        .map_err(|_| "no thread with an exit channel")?;
+    f.threads[1] = Some(t);
+    f.ends[1] = true;
+    judge(f, 2)?;
+    syscall::clear_call_maximum(Call::ThreadExit.number());
+    Ok(())
+}
+
+#[cfg(feature = "icount")]
+fn done_exit_notice(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    let ended = Notification {
+        source: Source::Exit,
+        label: EXIT_LABEL,
+        bits: 1,
+        count: 1,
+    };
+    match f.slot(t) {
+        0 => check(
+            t.regs.x[0] == 0
+                && t.regs.x[1..12] == ended.to_words()
+                && t.sched.priority() == PRIORITY + 2
+                && slot_thread(f, 1).sched.state() == State::Dead,
+            "the receiver did not take the end of the thread after it ended",
+        ),
+        1 => Err("thread_exit returned"),
+        _ => {
+            let ticks = syscall::call_maxima()[Call::ThreadExit.number() as usize];
+            kprintln!("thread exit notice ticks: {ticks}");
+            check(
+                ticks > 0 && state(f, 0) == ProcessState::Alive,
+                "the thread exit with a notice was not timed, or it ended its process",
+            )
+        }
+    }
 }
 
 /// The thread that waits for the alarm in slot 0 and the judge in slot 2,

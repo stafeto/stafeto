@@ -42,7 +42,13 @@ One joiner claims a target; its retry replaces the obsolete reply token.
 A separate JOIN_ACK releases the target ID after delivery of the exit value.
 The result remains owned even when the first reply is rejected by the kernel.
 
-The reaper's 1 ms timer is reserved during startup, before quota exhaustion.
+The owner's timer is reserved during startup, before quota exhaustion. Since
+#130 every pthread is made with the owner's channel as its exit channel: the
+kernel's notification of its end, once it left the scheduler, makes the owner
+take its stack back and wake its joiner, also for a thread that ended past the
+library (its value is null). The 1 ms timer only watches main, which init made
+with no exit channel, once it said EXIT, and retries a cancellation whose
+thread has not begun to wait yet.
 Initial pthreads inherit main's priority; the timer uses that priority.
 Future scheduling interfaces must update this priority arrangement.
 Polling waits in the guest probe sleep instead of starving a FIFO IPC owner.

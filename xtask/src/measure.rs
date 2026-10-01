@@ -33,6 +33,7 @@ fn measured_line(line: &str) -> bool {
         "memory portions ticks:",
         "teardown portions ticks:",
         "thread exit after close ticks:",
+        "thread exit notice ticks:",
         "abandon change ticks:",
         "timer portions ticks:",
         "interrupt path ticks:",

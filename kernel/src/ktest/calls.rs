@@ -699,12 +699,38 @@ pub fn thread_create_checks_the_callers_limits(_: &Boot) -> Result<(), &'static 
 }
 
 fn thread_create_handles(c: &Caller, low: &Caller) -> Result<(), &'static str> {
+    exit_above_the_ceiling(low)?;
     let h = c.insert(Object::Process(low.process), Rights::MANAGE)?;
     thread_create_cases(c, low.process, h)
 }
 
+/// x8 of thread_create, the priority of the exit notification, above the
+/// caller's ceiling of 20 fails with ACCESS_DENIED (spec 6.5, 11), as x4
+/// of process_create does.
+fn exit_above_the_ceiling(low: &Caller) -> Result<(), &'static str> {
+    let ch = channel::create(low.process, 10).map_err(|_| "no channel")?;
+    let named = low.insert(Object::Channel(ch), Rights::NOTIFY);
+    // SAFETY: the reference `create` handed out goes; the handle, if it
+    // went in, holds the channel.
+    unsafe { channel::release(ch, Rights::NONE, CAUSE) };
+    let named = named?;
+    let own = low.insert(Object::Process(low.process), Rights::MANAGE)?;
+    let mut args = thread_args(own.0, USER_VA as u64, 0x80_1000, 10, FIFO, BUFFER);
+    args[7] = named.0;
+    args[8] = 21;
+    let refused = low.fails(Call::ThreadCreate.number(), &args, Error::AccessDenied);
+    args[8] = 20;
+    let at = low.created(Call::ThreadCreate.number(), &args);
+    low.close(own)?;
+    low.close(named)?;
+    refused?;
+    low.close(at?)?;
+    cleanup::drain();
+    Ok(())
+}
+
 /// thread_create's arguments: the process, entry, stack, argument 7,
-/// priority, policy and buffer.
+/// priority, policy and buffer, no exit channel.
 fn thread_args(
     process: u64,
     entry: u64,
@@ -712,8 +738,8 @@ fn thread_args(
     priority: u64,
     policy: u64,
     buffer: u64,
-) -> [u64; 7] {
-    [process, entry, stack, 7, priority, policy, buffer]
+) -> [u64; 9] {
+    [process, entry, stack, 7, priority, policy, buffer, 0, 0]
 }
 
 fn thread_create_cases(

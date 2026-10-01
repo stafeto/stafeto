@@ -23,7 +23,10 @@ POSIX layer covers, and which commands check each piece. It describes
   invalidates cache lines from EL0.
 - **Execution:** EL0 threads with registers and FP/SIMD saved on every
   switch; 64 priority levels, round robin with a 4 ms quantum and FIFO;
-  tickless timer preemption.
+  tickless timer preemption. A thread made with an exit channel
+  (`thread_create` `x7`, `x8`) tells of its end through `thread_exit` with
+  a notification once it left the scheduler, so its stack may go; the end
+  of its process replaces it.
 - **System calls:** `handle_close`, `handle_duplicate`, `channel_create`,
   `send`, `receive`, `reply`, `notify`, `mem_create`,
   `mem_map`, `mem_unmap`, `mem_protect`, `process_create`, `process_kill`,

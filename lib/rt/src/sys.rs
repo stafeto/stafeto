@@ -252,6 +252,42 @@ pub unsafe fn thread_create(
     Ok(returned(&x))
 }
 
+/// thread_create with an exit channel (x7, x8, spec 6.5): `exit`, a
+/// channel handle with NOTIFY, with a label or none, and a priority (1-63,
+/// no higher than the caller's ceiling), hears of the thread's end through
+/// thread_exit once it left the scheduler, so its stack may go: bit 0 with
+/// source Exit and the label of the handle, unless that exit ended the
+/// process. The thread takes one of the channel's slots until it goes.
+///
+/// # Safety
+/// As for `thread_create`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn thread_create_with(
+    process: &Handle<Process>,
+    entry: extern "C" fn(u64) -> !,
+    stack: usize,
+    arg: u64,
+    priority: u8,
+    policy: Policy,
+    buffer: usize,
+    exit: Option<(&Handle<Channel>, u8)>,
+) -> Result<Handle<Thread>, Error> {
+    let (channel, notice) = exit.map_or((0, 0), |(c, p)| (c.raw().0, p.into()));
+    let args = [
+        process.raw().0,
+        entry as *const () as u64,
+        stack as u64,
+        arg,
+        priority.into(),
+        policy as u64,
+        buffer as u64,
+        channel,
+        notice,
+    ];
+    let x = call::<{ Call::ThreadCreate.number() }>(&args)?;
+    Ok(returned(&x))
+}
+
 /// thread_start: the stopped thread becomes ready; above the caller, it
 /// runs before the call returns.
 pub fn thread_start(thread: &Handle<Thread>) -> Result<(), Error> {

@@ -663,16 +663,19 @@ pub unsafe fn end(process: NonNull<Process>, reason: ProcessState, cause: u8) ->
 
 /// A started thread of `process` ended through thread_exit; the last one
 /// ends the process with code 0, with the thread's priority as the
-/// `cause`. Threads that never started do not count.
+/// `cause`. Threads that never started do not count. True when this ended
+/// the process.
 ///
 /// # Safety
 /// As for `end`.
-pub unsafe fn thread_exited(process: NonNull<Process>, cause: u8) {
+pub unsafe fn thread_exited(process: NonNull<Process>, cause: u8) -> bool {
     // SAFETY: the caller's reference keeps the process alive.
-    if unsafe { (*life(process)).exit() } {
+    let ended = unsafe { (*life(process)).exit() };
+    if ended {
         // SAFETY: as above; the end was just recorded.
         unsafe { stop(process, cause) };
     }
+    ended
 }
 
 /// A thread of `process` starts (thread::start): BAD_STATE once the

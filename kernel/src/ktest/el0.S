@@ -246,6 +246,12 @@ el0_info_then_exit:
     svc     #CALL_THREAD_EXIT
     svc     #SVC_DONE
 
+// thread_exit at once.
+.global el0_thread_exit
+el0_thread_exit:
+    svc     #CALL_THREAD_EXIT
+    svc     #SVC_DONE
+
 // Close the last handle to a channel, then end this process's last thread.
 .global el0_close_then_exit
 el0_close_then_exit:

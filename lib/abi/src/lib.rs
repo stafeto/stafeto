@@ -540,7 +540,9 @@ pub enum Source {
     Session,
     /// A timer (spec 10).
     Timer,
-    /// The exit of a process (`process_create` x3, spec 7.9).
+    /// The exit of a process (`process_create` x3, spec 7.9) or the end of
+    /// a thread through thread_exit (`thread_create` x7, spec 6.5); the
+    /// label of the handle tells them apart.
     Exit,
     /// An interrupt line (milestone 1.3e).
     Interrupt,

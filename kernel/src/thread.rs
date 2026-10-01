@@ -16,10 +16,14 @@
 //! number until its last reference goes, which queues it for cleanup (spec
 //! 7.7): its number goes back as it ends, or with its portion when it never
 //! started. Its process pays from its quota for the pages of its pool of
-//! threads (spec 7.8) and for the buffer while it lasts (spec 7.5).
+//! threads (spec 7.8) and for the buffer while it lasts (spec 7.5). A
+//! thread made with an exit channel (thread_create x7) carries the source
+//! of its end in itself: thread_exit posts it once the thread left the
+//! scheduler, unless that exit ended the process; a thread that ends with
+//! its process posts nothing, and its slot goes back with it.
 
 use crate::arch::user::{self, FpRegs, UserRegs};
-use crate::channel::{Owner, Wait};
+use crate::channel::{self, Channel, Owner, Source, Wait};
 use crate::cleanup::{self, Item};
 use crate::memory::{self, Memory};
 use crate::mm::phys::{self, Frame};
@@ -98,7 +102,15 @@ pub struct Thread {
     refs: Refs,
     /// Its place in the cleanup queue once its last reference goes.
     cleanup: Item,
+    /// The source of the notification of its end (thread_create x7, spec
+    /// 6.5): its slot lies here and holds the thread while it stands in the
+    /// channel's queue; the thread holds the channel, with one of its
+    /// slots, until its portion. Set once at `create`.
+    exit: Option<Source>,
 }
+
+/// The bits of the notification of a thread's end (spec 6.5): bit 0, once.
+const EXIT_BITS: u64 = 1;
 
 /// A long call a thread is making (spec 7.7): what the next entry of its
 /// `svc` goes on with, after the call started over for an interrupt
@@ -199,6 +211,23 @@ pub fn create(
     priority: u8,
     policy: Policy,
 ) -> Result<NonNull<Thread>, Error> {
+    create_with_exit(process, entry, stack, arg, priority, policy, None)
+}
+
+/// `create` with the source of the thread's end on `exit`, an open channel,
+/// its label and the priority of its slot, as thread_create checked them
+/// (x7, x8): a slot of the channel is taken after the limits of threads,
+/// LIMIT_REACHED when it has none left (spec 6.5), and before the quota;
+/// it goes back when the thread could not be made.
+pub fn create_with_exit(
+    process: NonNull<Process>,
+    entry: usize,
+    stack: usize,
+    arg: u64,
+    priority: u8,
+    policy: Policy,
+    exit: Option<(NonNull<Channel>, u64, u8)>,
+) -> Result<NonNull<Thread>, Error> {
     kcore::args::check_start(entry as u64, stack as u64, priority)?;
     // SAFETY: the caller holds a reference to the process.
     let ceiling = unsafe { process.as_ref() }.ceiling();
@@ -209,6 +238,9 @@ pub fn create(
     process::thread_room(process)?;
     if sched::locked(|k| k.tokens.available()) == 0 {
         return Err(Error::LimitReached);
+    }
+    if let Some((c, _, _)) = exit {
+        channel::reserve_source(c)?;
     }
     let thread = Thread {
         regs: UserRegs::start(entry as u64, stack as u64, arg),
@@ -227,19 +259,37 @@ pub fn create(
         process,
         refs: Refs::one(),
         cleanup: Item::new(),
+        exit: exit.map(|(c, _, _)| Source::new(c)),
     };
-    let thread = process::paid_alloc(process, thread)?;
+    let thread = process::paid_alloc(process, thread).inspect_err(|_| {
+        if let Some((c, _, _)) = exit {
+            channel::remove_source(c);
+        }
+    })?;
     let index = sched::locked(|k| k.tokens.alloc(thread)).expect("a free thread number went");
     // SAFETY: the thread was just made, nothing else refers to it, and its
     // slot is in no queue.
     unsafe {
         (*thread.as_ptr()).slot = Slot::new(priority, Owner::Thread(thread));
         (*thread.as_ptr()).index = Some(index);
+        if let (Some(source), Some((_, label, notice))) = ((*thread.as_ptr()).exit.as_mut(), exit) {
+            source.attach(Owner::ThreadEnd(thread), notice, label);
+        }
     }
     LIVE.made();
     process::retain(process);
     process::add_thread(process, thread);
     Ok(thread)
+}
+
+/// The label of the notification of the end of `t`, which receive reports
+/// with its slot.
+pub fn exit_label(t: NonNull<Thread>) -> u64 {
+    // SAFETY: the slot is being taken, and it holds the thread; only the
+    // field is read.
+    unsafe { (*t.as_ptr()).exit.as_ref() }
+        .expect("a thread with an exit slot")
+        .label()
 }
 
 /// The own slot of `t` (Thread::slot), which lives as long as the thread.
@@ -564,8 +614,10 @@ pub fn start(t: NonNull<Thread>) -> Result<(), Error> {
 /// the scheduler, with the kernel's reference, and its process's list of
 /// threads that have not ended; as the last started thread of its process
 /// it ends the process. What that releases is queued for cleanup at the
-/// thread's priority. The caller leaves through sched::resume: `t` may be
-/// queued for cleanup.
+/// thread's priority. A thread with an exit channel whose exit did not end
+/// its process posts bit 0 there at its priority, once it left the
+/// scheduler: from then on its stack is free (spec 6.5). O(1). The caller
+/// leaves through sched::resume: `t` may be queued for cleanup.
 ///
 /// # Safety
 /// `t` is the running thread, and the caller does not use it afterwards.
@@ -579,7 +631,13 @@ pub unsafe fn exit(t: NonNull<Thread>) {
         drop_buffer(t, cause);
         sched::exit(t, cause);
         process::remove_thread(p, t);
-        process::thread_exited(p, cause);
+        let ended = process::thread_exited(p, cause);
+        // The thread is alive until its portion, which comes after this
+        // call; a queued slot holds it from now on. PEER_CLOSED: nothing is
+        // posted (spec 6.5).
+        if !ended && let Some(source) = (*t.as_ptr()).exit.as_mut() {
+            let _ = Source::post(NonNull::from(source), EXIT_BITS, cause);
+        }
     }
 }
 
@@ -674,6 +732,10 @@ pub unsafe fn clean(thread: NonNull<Thread>, level: u8) {
         drop_buffer(thread, level);
         sched::locked(|k| give_number(thread, k.tokens));
         process::remove_thread(process, thread);
+        // Its slot is in no queue: a queued slot holds the thread.
+        if let Some(source) = (*thread.as_ptr()).exit.as_mut() {
+            source.detach(level);
+        }
         process::paid_free(process, thread);
         LIVE.gone(thread);
     }

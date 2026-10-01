@@ -2,8 +2,11 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Initial managed pthread lifecycle. One IPC owner retains native handles,
-//! stack mappings and join results. ELF TLS and scheduler
-//! attributes remain work.
+//! stack mappings and join results. Each pthread is made with the owner's
+//! channel as its exit channel (thread_create x7, x8): the kernel tells the
+//! owner once the thread left the scheduler, and only then its stack goes
+//! and a join wakes, whether the thread ended through pthread_exit or past
+//! the library. ELF TLS and scheduler attributes remain work.
 
 pub mod cancel;
 pub mod mutex;
@@ -493,9 +496,11 @@ impl Registry {
         LAUNCH[slot].cancel.reset();
         LAUNCH[slot].specific.reset();
         LAUNCH[slot].id.store(id, Ordering::Release);
+        // The end of the thread comes to the owner's channel at its level.
+        let level = crate::ceiling().map_err(|_| EIO)?;
         // SAFETY: this slot owns the new stack until its native thread has ended.
         let native = unsafe {
-            sys::thread_create(
+            sys::thread_create_with(
                 allocation::process(),
                 trampoline,
                 address + length,
@@ -503,6 +508,7 @@ impl Registry {
                 parent.base,
                 policy,
                 0x2000000 + slot * PAGE,
+                Some((channel(), level)),
             )
         };
         let native = match native {
@@ -533,12 +539,17 @@ impl Registry {
         self.next_id = next;
         Ok(id)
     }
-    fn reap(&mut self) {
+    /// Takes back the stacks of the threads that ended and wakes their
+    /// joiners: those that said EXIT, and with `heard`, after the kernel
+    /// told of an end, also those that ended past the library, whose value
+    /// is null.
+    fn reap(&mut self, heard: bool) {
         for (index, launch) in LAUNCH.iter().enumerate() {
             let Some(entry) = self.entries[index].as_mut() else {
                 continue;
             };
-            if entry.phase != Phase::Exiting {
+            let past = heard && entry.phase == Phase::Live && entry.mapping.is_some();
+            if entry.phase != Phase::Exiting && !past {
                 continue;
             }
             if sys::thread_info(entry.native.as_ref().expect("exiting native handle"))
@@ -549,9 +560,15 @@ impl Registry {
                 continue;
             }
             assert!(
-                launch.completed.load(Ordering::Acquire),
+                past || launch.completed.load(Ordering::Acquire),
                 "published pthread completion"
             );
+            if past {
+                // The kernel says it ended: its join sees a completion
+                // with a null value.
+                entry.value = 0;
+                launch.completed.store(true, Ordering::Release);
+            }
             if let Some((address, length)) = entry.mapping.take() {
                 // SAFETY: the kernel confirms this thread will never execute again.
                 unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
@@ -806,18 +823,21 @@ extern "C" fn owner(_: u64) -> ! {
     // SAFETY: startup transferred the reserved timer to this sole owner.
     let timer = unsafe { (*REAPER.0.get()).take().expect("initial reap timer") };
     let mut armed: Option<u64> = None;
+    // The end of a pthread comes as a notification. Only main, which init
+    // made with no exit channel, is watched on a timer once it said EXIT,
+    // and so is a cancellation whose thread has not begun to wait yet.
     let mut poll: Option<u64> = None;
     loop {
-        registry.reap();
+        registry.reap(false);
         registry.wake_cancelled();
         let now = rt::time::ticks_to_ns(rt::time::now());
-        if registry
+        // Main is the one entry with no stack of the owner's.
+        let main_exiting = registry
             .entries
             .iter()
             .flatten()
-            .any(|e| e.phase == Phase::Exiting)
-            || (0..CAPACITY).any(|index| registry.wake_needed(index))
-        {
+            .any(|e| e.phase == Phase::Exiting && e.mapping.is_none());
+        if main_exiting || (0..CAPACITY).any(|index| registry.wake_needed(index)) {
             if poll.is_none_or(|when| when <= now) {
                 poll = Some(now.saturating_add(1_000_000));
             }
@@ -852,13 +872,20 @@ extern "C" fn owner(_: u64) -> ! {
                 armed = None;
                 continue;
             }
+            Ok(sys::Received::Notification {
+                source: rt::abi::Source::Exit,
+                ..
+            }) => {
+                registry.reap(true);
+                continue;
+            }
             _ => continue,
         };
         drop(handles);
         // A target can end while this owner is blocked in receive. Reclaim its
         // retained records before reserving the next caller's result, including
-        // a JOIN under handle/quota pressure, without waiting for the reap timer.
-        registry.reap();
+        // a JOIN under handle/quota pressure, before its notification comes.
+        registry.reap(false);
         let caller = match registry.find(words[1]) {
             Ok(caller) if len == 64 && words[2] != 0 => caller,
             _ => {

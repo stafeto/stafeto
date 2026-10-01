@@ -625,7 +625,7 @@ fn ceiling(s: &Start, checked: Checked) -> u64 {
         }
         Checked::ThreadCreate => {
             const N: u16 = Call::ThreadCreate.number();
-            let args = [process, 0x1000, 0x80_1000, 7, above, fifo, 0x3000];
+            let args = [process, 0x1000, 0x80_1000, 7, above, fifo, 0x3000, 0, 0];
             first_wrong(&[x0_alone::<N>(&args, denied)])
         }
         Checked::ProcessCreate => {
