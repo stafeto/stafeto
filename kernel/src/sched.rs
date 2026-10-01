@@ -23,8 +23,9 @@
 //! timers is never held with it (crate::timer).
 
 use crate::arch::{self, gic, timer};
+use crate::channel::{self, Wait};
 use crate::thread::{self, THREADS, Thread};
-use crate::{channel, cleanup, syscall};
+use crate::{cleanup, syscall};
 use abi::{Error, Policy};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
@@ -237,9 +238,11 @@ pub fn running() -> Option<NonNull<Thread>> {
     SCHED.lock().s.running()
 }
 
-/// Interrupt only an existing send, receive, or accepted-request wait.
-/// The thread remains alive, retaining its number and message buffer. No
-/// interrupt is queued for a future call. Wait references and moved handles
+/// Interrupt only an existing send or receive. The thread remains alive,
+/// retaining its number and message buffer. No interrupt is queued for a
+/// future call. A thread that waits for the reply to an accepted request
+/// is not interrupted: BAD_STATE, as for a thread that waits for nothing,
+/// and the reply comes once (spec 6.1). Wait references and moved handles
 /// are released outside the scheduler lock. O(1), at most four handles.
 ///
 /// # Safety
@@ -248,8 +251,8 @@ pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
     // SAFETY: as the caller promises.
     unsafe {
         interrupt_if(t, cause, |thread| match thread.waits {
-            Some(_) => Ok(true),
-            None => Err(Error::BadState),
+            Some(Wait::Receive(_) | Wait::Send(_)) => Ok(true),
+            Some(Wait::Reply(_)) | None => Err(Error::BadState),
         })
     }
 }
@@ -258,8 +261,10 @@ pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
 /// and the look at its wait happen under the scheduler's lock with the
 /// interruption they decide, so no other path can start or end the wait
 /// in between (spec 8.1). BAD_STATE for a stopped or ended thread. A
-/// request that enables an entry ends an IPC wait as `interrupt` does;
-/// otherwise it stays pending for the target's next run.
+/// request that enables an entry ends a send or receive as `interrupt`
+/// does; otherwise, and for a thread that waits for a reply, it stays
+/// pending, and the entry comes on the thread's next way to EL0, after the
+/// reply.
 ///
 /// # Safety
 /// As for `interrupt`.
@@ -270,13 +275,14 @@ pub unsafe fn request_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error>
             if matches!(thread.sched.state(), State::Stopped | State::Dead) {
                 return Err(Error::BadState);
             }
-            Ok(thread.upcall.request()? && thread.waits.is_some())
+            Ok(thread.upcall.request()?
+                && matches!(thread.waits, Some(Wait::Receive(_) | Wait::Send(_))))
         })
     }
 }
 
-/// Under the lock, `decide` says whether to end the wait of `t`; then the
-/// interruption runs in the same critical section.
+/// Under the lock, `decide` says whether to end the send or receive of
+/// `t`; then the interruption runs in the same critical section.
 ///
 /// # Safety
 /// As for `interrupt`.
@@ -292,7 +298,7 @@ unsafe fn interrupt_if(
             if !decide(&mut *t.as_ptr())? {
                 return Ok(None);
             }
-            let waited = channel::cancel(t, k);
+            let waited = channel::withdraw(t, k);
             syscall::set_result(t, Err(Error::Interrupted));
             k.s.wake(t);
             Ok::<_, Error>(Some(waited))
@@ -302,10 +308,9 @@ unsafe fn interrupt_if(
         return Ok(());
     };
     // SAFETY: queued send handles are still owned by the interrupted thread.
-    // Accepted sends have already moved them and hold no transit handles.
     unsafe { thread::drop_transit(t, cause) };
     if let Some(via) = waited {
-        // SAFETY: cancel removed the wait that held this reference.
+        // SAFETY: withdraw removed the wait that held this reference.
         unsafe { via.let_go(cause) };
     }
     Ok(())

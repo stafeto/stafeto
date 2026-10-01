@@ -50,15 +50,16 @@ extern "C" fn sending(_: u64) -> ! {
     if after[0] != Error::Interrupted.code() || after[1..] != before[1..] {
         passed(1, false);
     }
-    // Two more requests from this live thread exercise accepted cancellation
-    // and the next token's validity on the same thread number.
+    // Two more requests from this live thread: the accepted one is not
+    // taken back by an interrupt and gets its reply whole, and the next
+    // token on the same thread number is a new one.
     before[0] = channel().raw().0;
     before[1] = 6 | (1 << rt::abi::HANDLES_SHIFT);
     before[2] = rt::abi::inline_words(b"second")[0];
     rt::msgbuf::put_handles(&[rt::abi::Handle(ACCEPTED.load(Ordering::Acquire) as u64)]);
     // SAFETY: second owned transfer and live channel as above.
     let after = unsafe { sys::raw::<{ Call::Send.number() }>(before) };
-    if after[0] != Error::Interrupted.code() || after[1..] != before[1..] {
+    if after[0] != 0 || after[1] != 8 || after[2] != rt::abi::inline_words(b"accepted")[0] {
         passed(1, false);
     }
     let good = sys::send(&channel(), b"third").is_ok_and(|reply| {
@@ -227,8 +228,12 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     let Ok(delivered) = handles.take::<Channel>(0) else {
         return fail(78);
     };
+    // An accepted request is not taken back (spec 6.1): thread_interrupt
+    // is BAD_STATE, the request's handle stays delivered, and the reply
+    // goes once.
     if !state(&sender, ThreadState::AwaitingReply)
-        || !interrupt(&sender, 1)
+        || sys::thread_interrupt(&sender) != Err(Error::BadState)
+        || !state(&sender, ThreadState::AwaitingReply)
         || sys::notify(&accepted_watch, 1).is_err()
         || !matches!(
             sys::try_receive(&delivered),
@@ -237,25 +242,17 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     {
         return fail(78);
     }
-    // A late reply consumes transfer handles even though the client is alive.
-    let Ok(late) = sys::channel_create(1) else {
-        return fail(79);
-    };
-    let Ok(late_watch) = sys::handle_duplicate(&late, Rights::NOTIFY) else {
-        return fail(79);
-    };
-    let late = late.into_raw();
-    rt::msgbuf::put_handles(&[late]);
+    let used = old.raw();
+    if old.reply(b"accepted").is_err() {
+        return fail(80);
+    }
+    // The token went with its reply.
     let mut before = registers();
-    before[0] = old.raw();
-    before[1] = 8 | (1 << rt::abi::HANDLES_SHIFT);
-    // SAFETY: the token is abandoned and this reply transfers one owned handle.
+    before[0] = used;
+    before[1] = 5;
+    // SAFETY: a reply with no handles and an inline body.
     let after = unsafe { sys::raw::<{ Call::Reply.number() }>(before) };
-    if after[0] != Error::PeerClosed.code()
-        || after[1..] != before[1..]
-        || !gone(late)
-        || sys::notify(&late_watch, 1) != Err(Error::PeerClosed)
-    {
+    if after[0] != Error::BadState.code() {
         return fail(80);
     }
     let Ok(sys::Received::Message {
@@ -266,17 +263,14 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     else {
         return fail(81);
     };
-    if next.raw() == old.raw()
-        || old.reply(b"stale") != Err(Error::BadState)
-        || next.reply(b"ok").is_err()
-    {
+    if next.raw() == used || next.reply(b"ok").is_err() {
         return fail(82);
     }
     let _ = sys::yield_now();
     if RESULTS[1].load(Ordering::Acquire) != 1 || !state(&sender, ThreadState::Ended) {
         return fail(83);
     }
-    rt::println!("posix-interrupt-probe: queued handles and accepted tokens ok");
+    rt::println!("posix-interrupt-probe: queued handles, and accepted requests answered once");
     true
 }
 
@@ -501,14 +495,25 @@ fn delivered_data_survives_echo_interrupt(process: &Handle<Process>) -> bool {
     else {
         return fail(95);
     };
+    // The echo's request is accepted: an interrupt does not take it back,
+    // its reply goes, and the read gives the bytes delivered.
+    let mut written = proto_wire::Writer::new();
     if words[0] != u64::from_le_bytes(proto_uart::Method::Write.header().bytes())
         || !state(&reader, ThreadState::AwaitingReply)
-        || !interrupt(&reader, 4)
-        || token.reply(b"late").is_ok()
+        || sys::thread_interrupt(&reader) != Err(Error::BadState)
+        || !state(&reader, ThreadState::AwaitingReply)
+        || (proto_uart::WriteReply { written: 2 })
+            .write(&mut written)
+            .is_err()
+        || token.reply(written.as_bytes()).is_err()
     {
         return fail(95);
     }
-    rt::println!("posix-interrupt-probe: delivered bytes survive echo interruption");
+    let _ = sys::yield_now();
+    if RESULTS[4].load(Ordering::Acquire) != 1 || !state(&reader, ThreadState::Ended) {
+        return fail(95);
+    }
+    rt::println!("posix-interrupt-probe: delivered bytes survive an interrupt of the echo");
     true
 }
 

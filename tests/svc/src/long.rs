@@ -17,7 +17,15 @@
 //! - WRITE: the bytes are dropped and all count as written (the echo);
 //! - PING: the status alone (rtbench S9);
 //! - STATS: the operations that wait and the handles they hold;
-//! - FEED: one byte, after the header, for the reads that wait for one.
+//! - FEED: one byte, after the header, for the reads that wait for one;
+//! - STORM with a thread handle (MANAGE): the service keeps the thread and
+//!   replies with a labelled copy of its channel with NOTIFY and TRANSFER,
+//!   which the client hands to the clock service (WATCH); then the clock
+//!   tells of each SET before its reply, the service, above the clock,
+//!   runs at once and makes an entry request (thread_upcall_request) of the
+//!   thread at every other notification, counting those that found it
+//!   waiting for its reply. STORM with no handle lets the thread go and
+//!   replies with the requests made and those counted.
 //!
 //! LongOps keeps 16 operations of a session and 24 in all; the state is
 //! static, off the service's 16 KiB stack.
@@ -26,7 +34,7 @@ use crate::{FAILED, base, serve};
 use abi::{Error, Rights};
 use proto_uart::{Method, ReadKey, ReadRequest, VERSION, WriteReply};
 use proto_wire::{HEADER_LEN, Status, long};
-use rt::handle::{Channel, Outgoing, Timer};
+use rt::handle::{Channel, Outgoing, Thread, Timer};
 use rt::service::{Answer, LongOps, Notice, Request, Service, Session};
 use rt::startup::Startup;
 use rt::{Handle, sys, time};
@@ -35,12 +43,15 @@ use rt::{Handle, sys, time};
 pub const PING: u16 = 16;
 pub const STATS: u16 = 17;
 pub const FEED: u16 = 18;
+pub const STORM: u16 = 19;
 /// The delay from a timed read to the readiness of its data.
 const DELAY_NS: u64 = 1_000_000;
 /// The fewest bytes of a timed read.
 const TIMED: u32 = 16;
 /// The label of the service's own timer, apart from the heartbeat's 0.
 const TIMER_LABEL: u64 = 1;
+/// The label of the copy of the channel STORM gives.
+const STORM_LABEL: u64 = 2;
 const OPS: usize = 24;
 
 pub fn run(s: Startup) -> u64 {
@@ -62,6 +73,12 @@ pub fn run(s: Startup) -> u64 {
     // SAFETY: the service's one thread takes the state once.
     let long = unsafe { &mut *STATE.0.get() };
     long.write(Long {
+        channel: channel.raw(),
+        level,
+        storm: None,
+        seen: 0,
+        requested: 0,
+        awaiting: 0,
         timer,
         _labelled: labelled,
         ops: LongOps::new(),
@@ -88,6 +105,16 @@ struct Op {
 }
 
 struct Long {
+    /// The service's channel, which `run` holds.
+    channel: abi::Handle,
+    /// The service's level, that of its channel.
+    level: u8,
+    /// The thread of STORM, and its counts: notifications, entry requests
+    /// made, and those that found the thread waiting for its reply.
+    storm: Option<Handle<Thread>>,
+    seen: u64,
+    requested: u32,
+    awaiting: u32,
     timer: Handle<Timer>,
     _labelled: Handle<Channel>,
     ops: LongOps<OPS>,
@@ -174,6 +201,41 @@ impl Long {
         reply(r, long::Reply::Armed)
     }
 
+    fn storm(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.handles.is_empty() {
+            self.storm = None;
+            let w = r.reply();
+            return match w
+                .u32(Status::Ok.code())
+                .and_then(|()| w.u32(self.requested))
+                .and_then(|()| w.u32(self.awaiting))
+            {
+                Ok(()) => Answer::Reply(Outgoing::new()),
+                Err(status) => Answer::Status(status),
+            };
+        }
+        let thread = match r.handles.take::<Thread>(0) {
+            Ok(thread) => thread,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        let channel = Handle::<Channel>::borrowed(self.channel);
+        let rights = Rights::NOTIFY | Rights::TRANSFER;
+        let copy = match sys::handle_label(
+            &channel,
+            rights | Rights::DUPLICATE,
+            STORM_LABEL,
+            self.level,
+        ) {
+            Ok(copy) => copy,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        (self.storm, self.seen, self.requested, self.awaiting) = (Some(thread), 0, 0, 0);
+        match r.reply().u32(Status::Ok.code()) {
+            Ok(()) => Answer::Reply([copy.erase()].into()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
     /// A result is ready for the operation in `place`: its client is told.
     fn ready(&mut self, place: usize, bytes: [u8; 16], len: usize) {
         let op = self.data[place].as_mut().expect("a waiting op");
@@ -200,6 +262,7 @@ impl Service<1> for Long {
         PING,
         STATS,
         FEED,
+        STORM,
     ];
     type Data = ();
 
@@ -246,6 +309,7 @@ impl Service<1> for Long {
                 }
                 Answer::Status(Status::Ok)
             }
+            STORM => self.storm(r),
             _ => Answer::Status(Status::Ok),
         }
     }
@@ -261,6 +325,20 @@ impl Service<1> for Long {
     }
 
     fn notification(&mut self, n: Notice) {
+        if n.label == STORM_LABEL {
+            self.seen += 1;
+            if let Some(thread) = &self.storm
+                && self.seen % 2 == 1
+            {
+                let awaiting = sys::thread_info(thread)
+                    .is_ok_and(|i| i.state == abi::ThreadState::AwaitingReply);
+                if sys::thread_upcall_request(thread).is_ok() {
+                    self.requested += 1;
+                    self.awaiting += u32::from(awaiting);
+                }
+            }
+            return;
+        }
         if n.label != TIMER_LABEL {
             return;
         }

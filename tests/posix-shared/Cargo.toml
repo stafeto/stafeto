@@ -16,7 +16,7 @@ interrupt-probe = []
 input-probe = []
 
 [dependencies]
-posix-abi = { path = "../../lib/posix-abi", features = ["transport-probe"] }
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }
 rt = { path = "../../lib/rt" }
 posix-request = { path = "../../lib/posix-request" }

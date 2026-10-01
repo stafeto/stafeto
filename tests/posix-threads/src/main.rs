@@ -30,17 +30,11 @@ mod cancellation;
 #[cfg(not(feature = "cancel-input"))]
 mod capacity;
 #[cfg(not(feature = "cancel-input"))]
-mod clock_replies;
-#[cfg(not(feature = "cancel-input"))]
 mod clocks;
 #[cfg(not(feature = "cancel-input"))]
 mod credentials;
 #[cfg(not(feature = "cancel-input"))]
-mod file_replies;
-#[cfg(not(feature = "cancel-input"))]
 mod futex;
-#[cfg(not(feature = "cancel-input"))]
-mod heap_replies;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
@@ -288,7 +282,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     if unsafe { threads::pthread_join(child, ptr::null_mut()) } != ESRCH {
         return failed(2);
     }
-    rt::println!("posix-thread-probe: interrupted committed replies preserve result and identity");
+    rt::println!("posix-thread-probe: a joined thread gives its value and keeps errno");
     // A thread that ends past the library is joined once the kernel tells
     // the owner of its end: the owner polls no thread state on a timer.
     let mut past = 0;
@@ -422,9 +416,6 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !upcall::run()
         || !borrow_guards::run(parent)
         || !reentry::run()
-        || !file_replies::run()
-        || !clock_replies::run(parent)
-        || !heap_replies::run()
         || !signals::run()
         || !signal_context::run()
         || !signal_wait::run()

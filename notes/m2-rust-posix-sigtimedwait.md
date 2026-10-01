@@ -57,7 +57,7 @@ handler completion, both calendar steps, live acceptance, a wide future
 interval, indefinite NULL timeout, empty-set expiration with another
 pending signal, generation held past expiry, and a late signal between
 committed expiration and client retry. Native gates and stored-deadline
-queries are enabled only in transport probes. They avoid scheduler
+queries were enabled only in the probes and went with the thread owner. They avoid scheduler
 priority assumptions and physical upper-latency assertions.
 
 The exhausted-handle/response-storage path also checks timed live

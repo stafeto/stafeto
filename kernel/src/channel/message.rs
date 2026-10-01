@@ -562,37 +562,59 @@ pub fn reply(t: NonNull<Thread>, token: u64, desc: Desc, values: &[u64]) -> Resu
     fit
 }
 
-/// Abandon the current wait of `t` (exit or interrupt): its slot
-/// leaves the queue it stands in, wherever it stands there: a channel's, or
-/// the queue of accepted requests of the process that took its request,
-/// and then its last accepted request is marked dead (Table::mark_dead). What the wait held, a channel or a
-/// session, goes to the caller, which lets it go once the scheduler has
-/// let the thread go (`Via::let_go`); the handles of a request stay in the
-/// thread until exit drops its buffer or interrupt drops its transit. None for a thread
-/// that waits for nothing, or for a reply. O(1).
+/// Withdraw the send or receive of `t` (interrupt): its slot leaves the
+/// channel's queue it stands in, wherever it stands there. What the wait
+/// held, a channel or a session, goes to the caller, which lets it go once
+/// the scheduler has let the thread go (`Via::let_go`); the handles of a
+/// request stay in the thread until interrupt drops its transit. A wait
+/// for the reply to an accepted request is never withdrawn: it stays as it
+/// is, and None comes back, as for a thread that waits for nothing; the
+/// reply comes once (spec 6.1). O(1).
 ///
 /// # Safety
 /// `t` is alive; `k` is the locked scheduler.
-pub unsafe fn cancel(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Via> {
+pub unsafe fn withdraw(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Via> {
     let slot = thread::slot(t);
-    // SAFETY: the caller's promise; a wait holds its channel or session,
-    // and the process that accepted the request holds the slot.
+    // SAFETY: the caller's promise; a wait holds its channel or session.
     unsafe {
-        match (*t.as_ptr()).waits.take()? {
-            Wait::Receive(c) => {
+        let waits = &mut (*t.as_ptr()).waits;
+        match *waits {
+            Some(Wait::Receive(c)) => {
+                *waits = None;
                 queue(c, k.s).cancel(slot);
                 Some(Via::Channel(c))
             }
-            Wait::Send(via) => {
+            Some(Wait::Send(via)) => {
+                *waits = None;
                 queue(via.channel(), k.s).cancel(slot);
                 Some(via)
             }
-            Wait::Reply(p) => {
-                process::accepted(p, k.s).remove(slot);
-                k.tokens.mark_dead(thread::index(t));
-                None
-            }
+            Some(Wait::Reply(_)) | None => None,
         }
+    }
+}
+
+/// Abandon the current wait of `t` on exit: a send or receive is withdrawn
+/// (`withdraw`); a slot in the queue of accepted requests of the process
+/// that took its request leaves that queue, and its last accepted request
+/// is marked dead (Table::mark_dead), so the reply finds PEER_CLOSED and a
+/// new owner of the number never takes the old token. None for a thread
+/// that waits for nothing, or for a reply. O(1).
+///
+/// # Safety
+/// As for `withdraw`.
+pub unsafe fn cancel(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Via> {
+    let slot = thread::slot(t);
+    // SAFETY: the caller's promise; the process that accepted the request
+    // holds the slot.
+    unsafe {
+        if let Some(Wait::Reply(p)) = (*t.as_ptr()).waits {
+            (*t.as_ptr()).waits = None;
+            process::accepted(p, k.s).remove(slot);
+            k.tokens.mark_dead(thread::index(t));
+            return None;
+        }
+        withdraw(t, k)
     }
 }
 
@@ -603,10 +625,10 @@ pub unsafe fn cancel(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Via> {
 /// after the scheduler's lock. O(1).
 ///
 /// # Safety
-/// As for `cancel`.
+/// As for `withdraw`.
 pub unsafe fn requeue(t: NonNull<Thread>, k: &mut Locked<'_>) -> Option<Wait> {
     let slot = thread::slot(t);
-    // SAFETY: the caller's promise, as in `cancel`.
+    // SAFETY: the caller's promise, as in `withdraw`.
     unsafe {
         let level = t.as_ref().priority();
         let waits = (*t.as_ptr()).waits;

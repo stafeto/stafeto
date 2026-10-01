@@ -620,7 +620,7 @@ fn sys_exit_signal(signal: i32) -> ! {
 }
 
 /// Whether pthread `thread` waits in sigwait now, for the guest probes.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
     threads::probe_block(thread)
         .map(|block| block.flags.load(Ordering::SeqCst) & flag::SIGNAL_WAIT != 0)

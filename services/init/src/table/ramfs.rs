@@ -102,8 +102,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix",
         program: "posix-process-service",
         quota: 256 * PAGE,
-        // A process handle for each of its 256 records, and a session of
-        // each besides in the probe of its bound (transport-probe).
+        // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
         ..TABLE[0]
@@ -136,9 +135,13 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         ..POSIX
     },
     // The service of long operations in two steps (tests/svc, role `l`)
-    // for the probe of reads in two steps.
+    // for the probe of reads in two steps; at 50, above the clock service,
+    // so that what the clock tells it (STORM) runs it before the clock's
+    // reply.
     Record {
         name: "long",
+        priority: 50,
+        ceiling: 50,
         ..LONG
     },
 ];

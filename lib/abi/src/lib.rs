@@ -278,8 +278,10 @@ pub enum Call {
     // 29 went with console_poll (the Virtio console of the VZ build moved
     // into a service); a retired number is never given again and fails
     // with INVALID_ARGS as an unknown one does (spec 11).
-    /// Interrupt the current IPC wait of x0, a thread with MANAGE.
-    /// Wakes it with Interrupted; BadState if it is not waiting in IPC.
+    /// Interrupt the current send or receive of x0, a thread with MANAGE:
+    /// wakes it with Interrupted. BadState if it waits in neither; a wait
+    /// for the reply to an accepted request is not taken back, and the
+    /// reply comes once (spec 6.1).
     ThreadInterrupt = 30,
     /// Register the current thread's upcall entry (zero disables it).
     ThreadUpcallBind = 31,
@@ -288,7 +290,10 @@ pub enum Call {
     /// execution. x1 returns the previous mask; TAKE returns PC in x2 and
     /// PSTATE in x3.
     ThreadUpcallControl = 32,
-    /// Request an upcall through a MANAGE thread handle.
+    /// Request an upcall through a MANAGE thread handle. An enabled
+    /// request ends a send or receive as ThreadInterrupt does; a wait for
+    /// the reply to an accepted request is not taken back, and the entry
+    /// comes after the reply.
     ThreadUpcallRequest = 33,
     /// Restore the current EL0 context from its reserved message-buffer area.
     ThreadUpcallReturn = 34,

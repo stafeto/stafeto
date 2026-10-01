@@ -79,8 +79,9 @@ and exits. Init must observe process exit code 0 despite the internal owners.
 
 cargo xtask posix-threads-vz runs this probe on Apple Virtualization.framework.
 The QEMU lifecycle probe is also included in cargo xtask test and ci.
-Probe-only native-handle access and reply interruption use transport-probe;
-they are absent from the normal sysroot library.
+Probe-only native-handle access uses the thread-probe feature of posix-abi;
+it is absent from the normal sysroot library. The reply-interruption hooks
+went with the reply journals: the kernel answers an accepted request once.
 
 ## Remaining standard work
 

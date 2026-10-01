@@ -193,7 +193,6 @@ dependencies = [
 name = "posix-clock-service"
 version = "0.1.0"
 dependencies = [
- "posix-heap",
  "posix-time",
  "proto-clock",
  "proto-init",
@@ -257,7 +256,6 @@ name = "posix-process-service"
 version = "0.1.0"
 dependencies = [
  "posix-credentials",
- "posix-heap",
  "process-client",
  "proto-init",
  "proto-process",

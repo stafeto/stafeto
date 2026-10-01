@@ -370,9 +370,11 @@ pub fn thread_set_priority(
     call::<{ Call::ThreadSetPriority.number() }>(&args).map(drop)
 }
 
-/// Wake a thread from its current IPC wait with Error::Interrupted.
-/// Requires MANAGE. Returns BadState if no IPC wait is present; no interrupt
-/// is retained for future calls. Transferred send handles remain consumed.
+/// Wake a thread from its current send or receive with Error::Interrupted.
+/// Requires MANAGE. Returns BadState if it waits in neither, as when it
+/// waits for the reply to an accepted request, which comes once; no
+/// interrupt is retained for future calls. Transferred send handles remain
+/// consumed.
 pub fn thread_interrupt(thread: &Handle<Thread>) -> Result<(), Error> {
     call::<{ Call::ThreadInterrupt.number() }>(&[thread.raw().0]).map(drop)
 }

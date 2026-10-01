@@ -138,14 +138,9 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &["transport-probe"],
+        &["adoption-refusals"],
     ),
-    (
-        "posix-clock-service",
-        "posix-clock-service",
-        64 * 1024,
-        &["transport-probe"],
-    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
@@ -297,14 +292,9 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &["transport-probe"],
+        &["adoption-refusals"],
     ),
-    (
-        "posix-clock-service",
-        "posix-clock-service",
-        64 * 1024,
-        &["transport-probe"],
-    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
@@ -1816,6 +1806,8 @@ fn host_tests() -> Result<(), String> {
         "--package",
         "proto-process",
         "--package",
+        "posix-process-service",
+        "--package",
         "init",
         "--package",
         "kcore",
@@ -3173,8 +3165,40 @@ fn hvf_host() -> Result<(), String> {
     )
 }
 
+/// The test hooks of the reply journals went with the journals (spec 6.1):
+/// no Cargo.toml of the workspace names the feature `transport-probe`.
+fn no_transport_probe() -> Result<(), String> {
+    let mut found = Vec::new();
+    let mut paths = vec![root()];
+    while let Some(path) = paths.pop() {
+        if path.is_dir() {
+            if path
+                .file_name()
+                .is_some_and(|n| n == "target" || n == ".git")
+            {
+                continue;
+            }
+            let entries = std::fs::read_dir(&path).map_err(|e| format!("{path:?}: {e}"))?;
+            for entry in entries {
+                paths.push(entry.map_err(|e| format!("{path:?}: {e}"))?.path());
+            }
+        } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
+            if text.contains("transport-probe") {
+                found.push(path);
+            }
+        }
+    }
+    if !found.is_empty() {
+        return Err(format!("the feature transport-probe is back in {found:?}"));
+    }
+    println!("no Cargo.toml names transport-probe");
+    Ok(())
+}
+
 fn ci() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/check-posix-licenses.py")))?;
+    no_transport_probe()?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(cargo().args([
         "clippy",
@@ -3239,6 +3263,8 @@ fn ci() -> Result<(), String> {
         "uart",
         "--package",
         "virtio-console",
+        "--package",
+        "posix-process-service",
         "--lib",
         "--tests",
         "--",
@@ -3327,7 +3353,7 @@ fn ci() -> Result<(), String> {
         "--package",
         "virtio-console",
         "--features",
-        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/transport-probe,posix-abi/rtbench",
+        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/adoption-refusals,posix-abi/rtbench",
         "--package",
         "test-init",
         "--package",

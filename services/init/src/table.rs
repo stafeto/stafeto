@@ -1392,11 +1392,11 @@ mod tests {
             order_of(vz::POSIX_ABI_TABLE),
             [
                 "uart",
+                "long",
                 "ramfs",
                 "posix",
                 "clock",
                 "clock-peer",
-                "long",
                 "posix-abi-probe"
             ]
         );

@@ -34,16 +34,6 @@ fn client() -> Result<&'static Client, c_int> {
     // SAFETY: startup finishes initialization before application threads start.
     unsafe { &*STATE.0.get() }.as_ref().ok_or(EIO)
 }
-/// Arm a real service interruption on this process's clock endpoint.
-#[cfg(feature = "transport-probe")]
-pub fn probe_interrupt(
-    thread: &Handle<rt::handle::Thread>,
-    method: proto_clock::Method,
-) -> Result<(), Status> {
-    client()
-        .map_err(|_| Status::Kernel(rt::abi::Error::BadState))?
-        .probe_interrupt(thread, method)
-}
 /// The calendar now (ns of CLOCK_REALTIME) and the monotonic instant it
 /// belongs to: the middle of the request to the clock service.
 pub(crate) fn realtime_anchor() -> Result<(i128, u64), c_int> {

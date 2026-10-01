@@ -47,7 +47,7 @@ pub(super) struct State {
     pub(super) active: AtomicU64,
     generation: AtomicU64,
     cleanup: AtomicPtr<Cleanup>,
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "thread-probe")]
     pub(super) console: core::sync::atomic::AtomicBool,
 }
 impl State {
@@ -56,7 +56,7 @@ impl State {
             active: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             cleanup: AtomicPtr::new(ptr::null_mut()),
-            #[cfg(feature = "transport-probe")]
+            #[cfg(feature = "thread-probe")]
             console: core::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -64,7 +64,7 @@ impl State {
         self.active.store(0, Ordering::Relaxed);
         self.generation.store(0, Ordering::Relaxed);
         self.cleanup.store(ptr::null_mut(), Ordering::Relaxed);
-        #[cfg(feature = "transport-probe")]
+        #[cfg(feature = "thread-probe")]
         self.console.store(false, Ordering::Relaxed);
     }
     fn requested(&self) -> bool {
@@ -93,7 +93,7 @@ pub fn requested() -> bool {
 struct Frame {
     state: &'static State,
     previous: u64,
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "thread-probe")]
     console: bool,
 }
 /// An explicit cancellation window. Close windows in nesting order at the C
@@ -110,7 +110,7 @@ impl Point {
             // A signal handler may enter another cancellation point on this
             // thread. Its return must retain the interrupted caller's window.
             let previous = state.active.swap(generation, Ordering::SeqCst);
-            #[cfg(feature = "transport-probe")]
+            #[cfg(feature = "thread-probe")]
             let console = state.console.swap(false, Ordering::AcqRel);
             if state.requested() {
                 terminate();
@@ -118,7 +118,7 @@ impl Point {
             Frame {
                 state,
                 previous,
-                #[cfg(feature = "transport-probe")]
+                #[cfg(feature = "thread-probe")]
                 console,
             }
         });
@@ -129,7 +129,7 @@ impl Point {
     }
     pub(crate) fn end(self) {
         if let Some(frame) = self.0 {
-            #[cfg(feature = "transport-probe")]
+            #[cfg(feature = "thread-probe")]
             frame.state.console.store(frame.console, Ordering::Release);
             frame.state.active.store(frame.previous, Ordering::SeqCst);
         }
@@ -274,7 +274,7 @@ pub unsafe extern "C" fn __stafeto_cleanup_pop(node: *mut Cleanup, execute: i32)
 
 /// Observe the console phase only in guest probes; regular builds contain no hook.
 pub(crate) fn console_wait() {
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "thread-probe")]
     if let Some(state) = state() {
         state.console.store(true, Ordering::Release);
     }

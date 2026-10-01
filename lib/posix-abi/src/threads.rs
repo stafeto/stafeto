@@ -339,7 +339,7 @@ fn close_raw(raw: u64) {
 /// bucket returns to. A Rust call for the measurements of rtbench 2
 /// (feature `rtbench`) until the scheduling attributes of POSIX come (spec
 /// 2, 3.5); the guest probes have it too.
-#[cfg(any(feature = "rtbench", feature = "transport-probe"))]
+#[cfg(any(feature = "rtbench", feature = "thread-probe"))]
 pub fn set_level(level: u8) -> Result<(), i32> {
     let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
@@ -827,7 +827,7 @@ fn current_launch() -> Option<&'static Launch> {
 ///
 /// # Safety
 /// The thread stays in the table while the borrowed handle is used.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle<Thread>>, i32> {
     registry(|r| {
         let slot = r.find(thread)?;
@@ -838,20 +838,20 @@ pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle
 }
 
 /// The block of pthread `id` while it lives, for the guest probes.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_block(id: u64) -> Option<&'static posix_thread::Block> {
     registry(|r| r.find(id).ok()).map(block_of)
 }
 
 /// Whether pthread `id` waits by address now, for the guest probes.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_futex_waiting(id: u64) -> bool {
     probe_block(id).is_some_and(posix_sync::waiting)
 }
 
 /// Test the real window before IPC entry; the closure's resources are dropped
 /// before its cancellation boundary. Excluded from the regular sysroot.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_cancel_window(run: impl FnOnce()) {
     let point = cancel::Point::begin();
     run();
@@ -859,19 +859,19 @@ pub fn probe_cancel_window(run: impl FnOnce()) {
 }
 
 /// Observe the current window.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_cancel_active() -> u64 {
     current_launch().map_or(0, |launch| launch.cancel.active.load(Ordering::SeqCst))
 }
 
 /// Mark the console phase for nested-window guest probes only.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_cancel_console() {
     cancel::console_wait();
 }
 
 /// Confirm a live thread is inside the console phase of read.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_console_waiting(id: u64) -> bool {
     LAUNCH
         .iter()

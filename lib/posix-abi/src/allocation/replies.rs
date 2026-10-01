@@ -103,10 +103,6 @@ impl Journal {
             }
             return Err(EINVAL);
         }
-        #[cfg(feature = "transport-probe")]
-        if super::REJECT_NEW.load(core::sync::atomic::Ordering::Acquire) {
-            return Err(ENOMEM);
-        }
         let allocate = |heap: &mut Allocator| {
             heap.allocate(core::mem::size_of::<Node>(), core::mem::align_of::<Node>())
         };
@@ -161,9 +157,5 @@ impl Journal {
                 link = ptr::addr_of_mut!((*node).next);
             }
         }
-    }
-    #[cfg(feature = "transport-probe")]
-    pub(super) fn stats(&self) -> (usize, usize) {
-        (self.heap.used(), self.heap.committed())
     }
 }

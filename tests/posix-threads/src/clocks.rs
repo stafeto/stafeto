@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Independent-process readings and real interruption after SET/ACK commits.
+//! Independent-process readings, and SET once under continuous signals:
+//! the kernel answers an accepted request once, so the clock service needs
+//! no journal (spec 6.1).
 use super::*;
 use abi::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
 use abi::metadata::Timespec;
@@ -13,6 +15,8 @@ use proto_wire::{Status, Writer};
 pub(super) struct Peers {
     direct: Client,
     relay: Client,
+    /// A session of the service `l` (tests/svc), above the clock.
+    long: Handle<Channel>,
 }
 impl Peers {
     /// # Safety
@@ -22,6 +26,7 @@ impl Peers {
         Ok(Self {
             direct: Client::connect(parent)?,
             relay: Client::connect_named(parent, "clock-peer")?,
+            long: rt::service::connect(parent, "long")?,
         })
     }
 }
@@ -40,16 +45,9 @@ unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
     }
     VALUE as *mut c_void
 }
-unsafe extern "C" fn interrupted_setter(argument: *mut c_void) -> *mut c_void {
-    let index = argument as usize;
-    let method = if index == 0 { Method::Set } else { Method::Ack };
-    // Native children have owner handles with DUPLICATE; startup deliberately
-    // gives the first thread only MANAGE and TRANSFER.
-    let native =
-        unsafe { threads::probe_native(threads::pthread_self()) }.expect("clock child handle");
-    clock::probe_interrupt(&native, method).expect("arm clock committed-reply interruption");
+unsafe extern "C" fn setter(argument: *mut c_void) -> *mut c_void {
     let value = Timespec {
-        tv_sec: 20_000_000_000 + index as i64,
+        tv_sec: 20_000_000_000 + argument as i64,
         tv_nsec: 42_123,
     };
     let errno = unsafe { abi::__errno_location() };
@@ -59,18 +57,114 @@ unsafe extern "C" fn interrupted_setter(argument: *mut c_void) -> *mut c_void {
     }
     VALUE as *mut c_void
 }
-fn set_packet(nonce: u64, time: Time) -> Writer {
+/// The SETs of the storm, each to another date.
+const STORM_SETS: usize = 300;
+/// The method STORM of the service `l` (tests/svc).
+const STORM: u16 = 19;
+static STORM_LONG: AtomicU64 = AtomicU64::new(0);
+static STORM_CLOCK: AtomicU64 = AtomicU64::new(0);
+/// STORM to `l` with a copy of the calling thread's handle: `l` keeps the
+/// thread, and the clock session `clock` tells `l` of each SET (WATCH).
+fn storm_start(long: &Handle<Channel>, clock: &Client) -> bool {
+    let Ok(native) = (unsafe { threads::probe_native(threads::pthread_self()) }) else {
+        return false;
+    };
+    let rights = rt::abi::Rights::MANAGE | rt::abi::Rights::TRANSFER;
+    let Ok(copy) = sys::handle_duplicate(&native, rights) else {
+        return false;
+    };
+    let request = proto_wire::Header::new(STORM, proto_uart::VERSION).bytes();
+    let Ok(mut reply) = sys::send_handles(long, &request, [copy.erase()]) else {
+        return false;
+    };
+    let Ok(notified) = reply.handles.take::<Channel>(0) else {
+        return false;
+    };
+    clock.watch(&notified).is_ok()
+}
+/// STORM with no handle: `l` lets the thread go; the entry requests it
+/// made and those that found the thread waiting for its reply.
+fn storm_end(long: &Handle<Channel>) -> Option<(u32, u32)> {
+    let request = proto_wire::Header::new(STORM, proto_uart::VERSION).bytes();
+    let reply = sys::send(long, &request).ok()?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    (r.u32().ok()? == 0).then_some(())?;
+    Some((r.u32().ok()?, r.u32().ok()?))
+}
+/// STORM_SETS SETs while `l`, above the clock service, makes an entry
+/// request of this thread at every other SET, before the clock replies.
+unsafe extern "C" fn storm_setter(_: *mut c_void) -> *mut c_void {
+    // SAFETY: `sets_once_under_entries` keeps the Peers alive until it
+    // joined this thread.
+    let p = unsafe { &*(STORM_CLOCK.load(Ordering::SeqCst) as *const Peers) };
+    let long = Handle::<Channel>::borrowed(rt::abi::Handle(STORM_LONG.load(Ordering::SeqCst)));
+    if !storm_start(&long, &p.direct) {
+        return ptr::null_mut();
+    }
+    for n in 0..STORM_SETS {
+        let value = Timespec {
+            tv_sec: 30_000_000_000 + n as i64,
+            tv_nsec: 0,
+        };
+        if unsafe { clock::clock_settime(CLOCK_REALTIME, &value) } != 0 {
+            return ptr::null_mut();
+        }
+    }
+    VALUE as *mut c_void
+}
+/// SET under continuous entry requests, as signals make them, takes effect
+/// exactly once: the generation of the clock grows by one a SET, each
+/// request found the setter waiting for its reply, and the kernel left
+/// that wait be (spec 6.1).
+fn sets_once_under_entries(p: &Peers) -> bool {
+    let before = p.direct.get(REALTIME).expect("generation before the storm");
+    STORM_CLOCK.store(p as *const Peers as u64, Ordering::SeqCst);
+    STORM_LONG.store(p.long.raw().0, Ordering::SeqCst);
+    let mut setter = 0;
+    let mut result = ptr::null_mut();
+    if unsafe {
+        threads::pthread_create(
+            &mut setter,
+            ptr::null(),
+            Some(storm_setter),
+            ptr::null_mut(),
+        )
+    } != 0
+        || unsafe { threads::pthread_join(setter, &mut result) } != 0
+        || result as usize != VALUE
+    {
+        return failed(153);
+    }
+    let after = p.direct.get(REALTIME).expect("generation after the storm");
+    let Some((requested, awaiting)) = storm_end(&p.long) else {
+        return failed(154);
+    };
+    if after.generation != before.generation + STORM_SETS as u64
+        || requested as usize != STORM_SETS / 2
+        || awaiting != requested
+    {
+        rt::println!(
+            "clock-storm-probe: {} SETs moved the generation by {}; {} entry requests, {} in the reply wait",
+            STORM_SETS,
+            after.generation - before.generation,
+            requested,
+            awaiting
+        );
+        return failed(155);
+    }
+    rt::println!(
+        "posix-thread-probe: {} clock SETs under {} entry requests in their reply waits took effect once each",
+        STORM_SETS,
+        requested
+    );
+    true
+}
+fn set_packet(time: Time) -> Writer {
     let mut w = Writer::new();
     Method::Set.header().write(&mut w).unwrap();
-    w.u64(nonce).unwrap();
     w.u64(time.seconds as u64).unwrap();
     w.u64(time.nanos as u64).unwrap();
-    w
-}
-fn ack_packet(nonce: u64) -> Writer {
-    let mut w = Writer::new();
-    Method::Ack.header().write(&mut w).unwrap();
-    w.u64(nonce).unwrap();
     w
 }
 pub(super) fn run(p: &Peers) -> bool {
@@ -99,12 +193,7 @@ pub(super) fn run(p: &Peers) -> bool {
         let mut child = 0;
         let mut result = ptr::null_mut();
         if unsafe {
-            threads::pthread_create(
-                &mut child,
-                ptr::null(),
-                Some(interrupted_setter),
-                index as *mut c_void,
-            )
+            threads::pthread_create(&mut child, ptr::null(), Some(setter), index as *mut c_void)
         } != 0
             || unsafe { threads::pthread_join(child, &mut result) } != 0
             || result as usize != VALUE
@@ -146,57 +235,17 @@ pub(super) fn run(p: &Peers) -> bool {
     {
         return failed(145);
     }
-    // Retain one SET, change global time through a different session, then
-    // replay the old SET. It must preserve the newer setting and generation.
-    let nonce = 1u64 << 63;
-    let packet = set_packet(
-        nonce,
-        Time {
-            seconds: 500,
-            nanos: 17,
-        },
-    );
-    p.direct
-        .probe_call(packet.as_bytes())
-        .expect("retained clock setting");
-    let value = Timespec {
-        tv_sec: 900,
-        tv_nsec: 0,
-    };
-    if unsafe { clock::clock_settime(CLOCK_REALTIME, &value) } != 0 {
-        return failed(146);
-    }
+    // A SET with a byte past its body changes nothing.
     let generation = p.direct.get(REALTIME).unwrap().generation;
-    p.direct
-        .probe_call(packet.as_bytes())
-        .expect("retry clock after another client set");
-    let other = p.relay.get(REALTIME).unwrap();
-    if other.generation != generation || !(899..=901).contains(&other.time.seconds) {
-        return failed(147);
-    }
-    let bad = set_packet(
-        nonce,
-        Time {
-            seconds: 501,
-            nanos: 17,
-        },
-    );
-    if p.direct.probe_call(bad.as_bytes()) != Err(Status::from_code(proto_clock::INVALID)) {
-        return failed(148);
-    }
-    let ack = ack_packet(nonce);
-    p.direct
-        .probe_call(ack.as_bytes())
-        .expect("ack retained setting");
-    p.direct
-        .probe_call(ack.as_bytes())
-        .expect("repeat setting ack");
-    let mut malformed = set_packet(nonce + 1, Time::ZERO);
+    let mut malformed = set_packet(Time::ZERO);
     malformed.u32(0).unwrap();
-    if p.direct.probe_call(malformed.as_bytes()) != Err(Status::BadSize)
+    if p.direct.raw(malformed.as_bytes()) != Err(Status::BadSize)
         || p.direct.get(REALTIME).unwrap().generation != generation
     {
         return failed(149);
+    }
+    if !sets_once_under_entries(p) {
+        return false;
     }
     let value = Timespec {
         tv_sec: saved.seconds,
@@ -216,8 +265,6 @@ pub(super) fn run(p: &Peers) -> bool {
     {
         return failed(151);
     }
-    rt::println!(
-        "posix-thread-probe: shared clocks, independent process, committed SET/ACK interruption"
-    );
+    rt::println!("posix-thread-probe: shared clocks, independent process, SET once");
     true
 }

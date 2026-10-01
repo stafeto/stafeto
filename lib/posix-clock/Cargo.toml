@@ -10,9 +10,6 @@ license = "GPL-3.0-or-later"
 test = false
 bench = false
 
-[features]
-transport-probe = []
-
 [dependencies]
 proto-clock = { path = "../../proto/clock" }
 proto-wire = { path = "../../proto/wire" }

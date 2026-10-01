@@ -221,10 +221,12 @@ unsafe extern "C" fn worker(parent: *mut c_void) -> *mut c_void {
             let outer = upcall::defer_entries().unwrap();
             let inner = upcall::defer_entries().unwrap();
             sys::notify(&channel(&READY), 1).unwrap();
+            // A receive is interrupted; a request the service accepted
+            // gets its reply, and the entry waits for the deferrals.
             let interrupted = if MODE.load(Ordering::Acquire) == 1 {
                 sys::receive(&channel(&GATE)) == Err(Error::Interrupted)
             } else {
-                sys::send(&channel(&GATE), b"live wait") == Err(Error::Interrupted)
+                sys::send(&channel(&GATE), b"live wait").is_ok_and(|reply| reply.len == 4)
             };
             let before = COUNT.load(Ordering::Acquire) == 0;
             drop(inner);
@@ -295,10 +297,11 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
             };
             poke();
             if let Some(token) = token {
-                // Interrupted clients invalidate an already accepted reply token.
-                let late = token.reply(b"late");
-                if late != Err(Error::PeerClosed) {
-                    rt::println!("borrow-guard-probe: late reply {:?}", late);
+                // The request of the worker stays accepted through the
+                // request of an entry: its reply goes (spec 6.1).
+                let reply = token.reply(b"late");
+                if reply != Ok(()) {
+                    rt::println!("borrow-guard-probe: reply {:?}", reply);
                     return failed(359);
                 }
             }

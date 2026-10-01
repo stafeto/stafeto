@@ -354,6 +354,18 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::upcall_request_refuses_a_stopped_thread,
     ),
     (
+        "interrupt_leaves_an_accepted_request",
+        calls::interrupt_leaves_an_accepted_request,
+    ),
+    (
+        "upcall_request_waits_for_the_reply",
+        calls::upcall_request_waits_for_the_reply,
+    ),
+    (
+        "reply_to_a_client_that_ended",
+        calls::reply_to_a_client_that_ended,
+    ),
+    (
         "upcall_return_keeps_unimplemented_flags_off",
         calls::upcall_return_keeps_unimplemented_flags_off,
     ),

@@ -33,27 +33,19 @@ static PROCESS: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static STACK: Stack<32768> = Stack::new();
-#[cfg(feature = "transport-probe")]
-static PROBE_UPCALL: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static PROBE_ACK: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static PROBE_GATE: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
-static PROBE_READY: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 static PROBE_LOCAL_KIND: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 static PROBE_LOCAL_TARGET: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 static PROBE_LOCAL_LIVE: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 static PROBE_WORKER: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 static PROBE_START: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// The base priority of the live file worker.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_worker_base() -> u8 {
     let raw = rt::abi::Handle(PROBE_WORKER.load(Ordering::Acquire));
     let thread = Handle::<rt::handle::Thread>::borrowed(raw);
@@ -63,7 +55,7 @@ pub fn probe_worker_base() -> u8 {
 /// Create the file worker at `priority` instead of the ceiling. A probe
 /// calls it before init to queue requests while the worker, below main,
 /// has not yet reached its receive.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_start_priority(priority: u8) {
     PROBE_START.store(priority, Ordering::Release);
 }
@@ -71,21 +63,21 @@ pub fn probe_start_priority(priority: u8) {
 /// Request entry while the next local operation holds its file references.
 /// kind 1 selects value replies, kind 2 selects numeric replies. The target
 /// handle must stay live until that call returns; only one probe may be armed.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_local_borrow(kind: u64, target: &Handle<rt::handle::Thread>) {
     assert!(kind == 1 || kind == 2);
     PROBE_LOCAL_TARGET.store(target.raw().0, Ordering::Relaxed);
     PROBE_LOCAL_KIND.store(kind, Ordering::Release);
 }
 
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 pub fn probe_local_borrow_live() -> bool {
     PROBE_LOCAL_LIVE.load(Ordering::Acquire)
 }
 
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 struct BorrowProbe(bool);
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 impl BorrowProbe {
     fn enter(kind: u64) -> Self {
         let armed = PROBE_LOCAL_KIND
@@ -101,71 +93,11 @@ impl BorrowProbe {
         Self(armed)
     }
 }
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "thread-probe")]
 impl Drop for BorrowProbe {
     fn drop(&mut self) {
         if self.0 {
             PROBE_LOCAL_LIVE.store(false, Ordering::Release);
-        }
-    }
-}
-
-/// Pause after the next Ack reply; both channels must stay live until released.
-#[cfg(feature = "transport-probe")]
-pub fn probe_pause_after_ack(gate: &Handle<Channel>, ready: &Handle<Channel>) {
-    PROBE_READY.store(ready.raw().0, Ordering::Relaxed);
-    PROBE_GATE.store(gate.raw().0, Ordering::Release);
-}
-
-#[cfg(feature = "transport-probe")]
-fn probe_gate(input: &[u8]) -> (u64, u64) {
-    if matches!(Exchange::read(input), Ok(Exchange::Ack(_))) {
-        let gate = PROBE_GATE.swap(0, Ordering::AcqRel);
-        return (gate, PROBE_READY.load(Ordering::Relaxed));
-    }
-    (0, 0)
-}
-
-#[cfg(feature = "transport-probe")]
-fn probe_after_reply((gate, ready): (u64, u64)) {
-    if gate != 0 {
-        let gate = Handle::<Channel>::borrowed(rt::abi::Handle(gate));
-        let ready = Handle::<Channel>::borrowed(rt::abi::Handle(ready));
-        sys::notify(&ready, 1).unwrap();
-        sys::receive(&gate).unwrap();
-    }
-}
-
-/// Request one native handler after the next Execute result is committed.
-/// The caller keeps the target handle alive until that operation completes.
-#[cfg(feature = "transport-probe")]
-pub fn probe_reply_upcall(target: &Handle<rt::handle::Thread>) {
-    PROBE_UPCALL.store(target.raw().0, Ordering::Release);
-}
-
-/// Interrupt one Ack after its journal entry has already been removed.
-/// The caller keeps the target handle alive until that operation completes.
-#[cfg(feature = "transport-probe")]
-pub fn probe_ack_interrupt(target: &Handle<rt::handle::Thread>) {
-    PROBE_ACK.store(target.raw().0, Ordering::Release);
-}
-
-#[cfg(feature = "transport-probe")]
-fn probe_after_commit(input: &[u8]) {
-    let Ok(exchange) = Exchange::read(input) else {
-        return;
-    };
-    let target = match exchange {
-        Exchange::Execute { .. } => PROBE_UPCALL.swap(0, Ordering::AcqRel),
-        Exchange::Ack(_) => PROBE_ACK.swap(0, Ordering::AcqRel),
-        Exchange::Fetch(_) => 0,
-    };
-    if target != 0 {
-        let target = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(target));
-        match exchange {
-            Exchange::Execute { .. } => sys::thread_upcall_request(&target).unwrap(),
-            Exchange::Ack(_) => sys::thread_interrupt(&target).unwrap(),
-            Exchange::Fetch(_) => unreachable!(),
         }
     }
 }
@@ -192,7 +124,7 @@ pub unsafe fn init(process: &Handle<Process>, files: PosixFs) -> Result<(), rt::
     PROCESS.store(process.raw().0, Ordering::Relaxed);
     let started = (|| {
         let level = crate::ceiling()?;
-        #[cfg(feature = "transport-probe")]
+        #[cfg(feature = "thread-probe")]
         let level = match PROBE_START.load(Ordering::Acquire) {
             0 => level,
             probe => probe,
@@ -211,7 +143,7 @@ pub unsafe fn init(process: &Handle<Process>, files: PosixFs) -> Result<(), rt::
         // Publish initialization before the worker can run. Startup excludes clients.
         READY.store(true, Ordering::Release);
         sys::thread_start(&thread)?;
-        #[cfg(feature = "transport-probe")]
+        #[cfg(feature = "thread-probe")]
         PROBE_WORKER.store(thread.into_raw().0, Ordering::Release);
         Ok(())
     })();
@@ -442,21 +374,7 @@ extern "C" fn worker(_: u64) -> ! {
             if let Err(code) = result {
                 output = error_reply(code);
             }
-            #[cfg(feature = "transport-probe")]
-            if !unexpected_handles && len <= input.len() {
-                probe_after_commit(&input[..len]);
-            }
-            // A departed client cannot invalidate input or output owned by this worker.
-            // Capture before reply resumes a client which can arm the next probe.
-            #[cfg(feature = "transport-probe")]
-            let gate = if !unexpected_handles && len <= input.len() {
-                probe_gate(&input[..len])
-            } else {
-                (0, 0)
-            };
             let _ = token.reply(output.as_bytes());
-            #[cfg(feature = "transport-probe")]
-            probe_after_reply(gate);
         }
     })
 }
@@ -523,9 +441,9 @@ fn local<R>(
     // SAFETY: the TLS scope owns both objects; deferred entries cannot reborrow
     // them until this operation ends and all exclusive references are gone.
     let (streams, files) = unsafe { (&*streams, &mut *files) };
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "thread-probe")]
     let _probe = BorrowProbe::enter(kind);
-    #[cfg(not(feature = "transport-probe"))]
+    #[cfg(not(feature = "thread-probe"))]
     let _ = kind;
     run(streams, files)
 }
@@ -594,7 +512,9 @@ pub fn cleanup() -> Result<(), i32> {
     unit(Request::Cleanup)
 }
 
-#[cfg(feature = "transport-probe")]
+/// A request as the probe wrote it, through the whole exchange with the
+/// worker: the probes of malformed requests.
+#[cfg(feature = "thread-probe")]
 pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt::abi::Error> {
     if !READY.load(Ordering::Acquire) {
         return Err(rt::abi::Error::BadState);
@@ -604,16 +524,4 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
         ENOMEM => rt::abi::Error::NoMemory,
         _ => rt::abi::Error::InvalidArgs,
     })
-}
-
-/// Send an explicit transaction without automatic Fetch/Ack, for journal probes.
-#[cfg(feature = "transport-probe")]
-pub fn probe_exchange(
-    request: &[u8],
-    buffer: &mut [u8; MESSAGE_MAX],
-) -> Result<usize, rt::abi::Error> {
-    if !READY.load(Ordering::Acquire) {
-        return Err(rt::abi::Error::BadState);
-    }
-    send_copy(request, buffer)
 }
