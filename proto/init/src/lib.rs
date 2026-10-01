@@ -96,9 +96,9 @@
 //! section 3.1): the service asks init for the next POSIX process init
 //! loaded, and init holds the request until there is one; init never asks
 //! the service anything. ADOPT: the header alone; the reply its status (8
-//! bytes, proto_wire::reply), the ticket of the process u64 and root u32 (0
-//! or 1), and one handle,
-//! the process with MANAGE, DUPLICATE and TRANSFER. ADOPTED: the header,
+//! bytes, proto_wire::reply), the ticket of the process u64, root u32 (0
+//! or 1), and one handle, the process with MANAGE, DUPLICATE and TRANSFER.
+//! ADOPTED: the header,
 //! the ticket u64 and the service's status u32 (0, or why it made no
 //! record), and with status 0 one handle, the session of the record, which
 //! init gives the process under `posix` before it starts its thread; the

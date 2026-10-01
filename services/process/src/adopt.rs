@@ -62,12 +62,15 @@ extern "C" fn adopter(_: u64) -> ! {
     let own = Handle::<Channel>::borrowed(abi::Handle(HANDLES[1].load(Ordering::Relaxed)));
     let records = ManuallyDrop::new(Client::new(ManuallyDrop::into_inner(own)));
     let mut buffer = [0; abi::MESSAGE_MAX];
+    #[cfg(feature = "transport-probe")]
+    refusals(&parent);
     loop {
         let mut reply = match sys::send(&parent, &Method::Adopt.header().bytes()) {
             Ok(reply) => reply,
             Err(abi::Error::Interrupted) => continue,
-            // Init lives as long as the system; nothing is left to adopt.
-            Err(_) => sys::thread_exit(),
+            // The service cannot take processes any more: it ends, so that
+            // init sees its failure and fails the POSIX processes that wait.
+            Err(_) => sys::process_exit(7),
         };
         let bytes = reply.bytes(&mut buffer);
         let mut r = Reader::new(bytes);
@@ -82,8 +85,10 @@ extern "C" fn adopter(_: u64) -> ! {
             r.finish()?;
             Ok((ticket, root == 1))
         })();
+        // A refusal of init (a second ADOPT, a reply out of the layout)
+        // would only come again: the service ends, as above.
         let Ok((ticket, root)) = taken else {
-            continue;
+            sys::process_exit(8);
         };
         let made = reply
             .handles
@@ -111,4 +116,36 @@ extern "C" fn adopter(_: u64) -> ! {
             Err(_) => sys::send(&parent, w.as_bytes()).map(drop),
         };
     }
+}
+
+/// The refusals of ADOPT and ADOPTED that only the service can reach
+/// (transport-probe): ADOPT with a byte after the header and ADOPTED with
+/// one after its body BAD_SIZE, ADOPTED with a ticket no process has
+/// INVALID_ARGS. Says so in one line.
+#[cfg(feature = "transport-probe")]
+fn refusals(parent: &Handle<Channel>) {
+    let answer = |w: &Writer| {
+        let mut buffer = [0; abi::MESSAGE_MAX];
+        sys::send(parent, w.as_bytes())
+            .map_err(Status::Kernel)
+            .and_then(|reply| status(reply.bytes(&mut buffer)))
+    };
+    let mut adopt = Writer::new();
+    let _ = Method::Adopt.header().write(&mut adopt);
+    let _ = adopt.u32(0);
+    let adopted = |ticket: u64, extra: bool| {
+        let mut w = Writer::new();
+        let _ = Method::Adopted.header().write(&mut w);
+        let _ = w.u64(ticket);
+        let _ = w.u32(0);
+        if extra {
+            let _ = w.u32(0);
+        }
+        w
+    };
+    let ok = answer(&adopt) == Ok(Status::BadSize)
+        && answer(&adopted(u64::MAX, true)) == Ok(Status::BadSize)
+        && answer(&adopted(u64::MAX, false)) == Ok(Status::Kernel(abi::Error::InvalidArgs));
+    let verdict = if ok { "ok" } else { "failed" };
+    rt::println!("posix-process: adoption refusals {verdict}");
 }

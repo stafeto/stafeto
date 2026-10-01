@@ -1,6 +1,6 @@
 # Numeric process identity for Rust POSIX
 
-> Replaced by the labels of the process service's sessions (#129): kind 10 of `object_info`, `ProcessIdentity` and `process_identity` are gone; `getpid` reads the PID of the record's snapshot and `getppid` queries the service.
+> Replaced by the labels of the process service's sessions ([#72](https://github.com/stafeto/stafeto/pull/72)): kind 10 of `object_info`, `ProcessIdentity` and `process_identity` are gone; `getpid` and `getppid` read the record's snapshot taken at startup.
 
 ## Behavior
 

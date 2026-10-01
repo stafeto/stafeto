@@ -4,8 +4,9 @@
 //! Process identity and credentials through the process service (spec 2,
 //! section 3.1). Startup takes the session of the process's record from the
 //! start data (`posix`), asks the service once for its snapshot and keeps
-//! the PID, which never changes; PPID and credentials are queries. Queries
-//! allocate nothing and do not touch errno or application TLS.
+//! the PID and the PPID, so `getpid` and `getppid` always succeed;
+//! credentials are queries. Queries allocate nothing and do not touch
+//! errno or application TLS.
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use process_client::Client;
@@ -18,8 +19,10 @@ struct State(UnsafeCell<Option<Client>>);
 // SAFETY: startup publishes once before threads; Client methods only borrow it.
 unsafe impl Sync for State {}
 static STATE: State = State(UnsafeCell::new(None));
-/// The PID of the snapshot at startup.
+/// The PID and the PPID of the snapshot at startup: neither changes until
+/// the service moves children to a new parent (stage 5b).
 static PID: AtomicU32 = AtomicU32::new(0);
+static PPID: AtomicU32 = AtomicU32::new(0);
 
 /// Takes `session`, the session of the process's record (start data
 /// `posix`), and the PID of its snapshot.
@@ -35,6 +38,7 @@ pub unsafe fn init(session: Handle<Channel>) -> Result<(), Status> {
     let client = Client::new(session);
     let snapshot = client.query()?;
     PID.store(snapshot.pid, Ordering::Release);
+    PPID.store(snapshot.parent, Ordering::Release);
     *state = Some(client);
     Ok(())
 }
@@ -117,9 +121,5 @@ pub extern "C" fn getpid() -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn getppid() -> i32 {
-    let parent = client()
-        .query()
-        .expect("live critical process service")
-        .parent;
-    i32::try_from(parent).expect("signed parent process namespace")
+    i32::try_from(PPID.load(Ordering::Acquire)).expect("signed parent process namespace")
 }

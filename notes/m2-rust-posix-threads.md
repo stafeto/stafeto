@@ -43,7 +43,7 @@ A separate JOIN_ACK releases the target ID after delivery of the exit value.
 The result remains owned even when the first reply is rejected by the kernel.
 
 The owner's timer is reserved during startup, before quota exhaustion. Since
-#130 every pthread is made with the owner's channel as its exit channel: the
+[#72](https://github.com/stafeto/stafeto/pull/72) every pthread is made with the owner's channel as its exit channel: the
 kernel's notification of its end, once it left the scheduler, makes the owner
 take its stack back and wake its joiner, also for a thread that ended past the
 library (its value is null). The 1 ms timer only watches main, which init made

@@ -78,6 +78,21 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
 ];
+/// The POSIX ABI image whose process service ends before it registers:
+/// each POSIX process fails its load (`posix_orphans`).
+const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["exit-early"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
+    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+];
 const POSIX_THREAD_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -554,7 +569,7 @@ const LOG_ROWS: [&str; 2] = ["write", "take"];
 /// The page of the PL011 of QEMU `virt`, the console's port.
 const CONSOLE_PA: u64 = 0x0900_0000;
 /// Tests the client `checker` of init's test table has (tests/svc).
-const SVC_TESTS: u32 = 26;
+const SVC_TESTS: u32 = 27;
 /// What init prints for each table it refuses (services/init, features
 /// `table-cycle` and `table-ceiling`), each line whole.
 const REFUSED: [(&str, &[ImageProgram], &str); 2] = [
@@ -1247,6 +1262,7 @@ fn posix_abi_probe() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
+    posix_orphans()?;
     posix_thread_probe(false)?;
     posix_cancel_input_probe(false)?;
     posix_shared_probe()?;
@@ -1269,6 +1285,26 @@ fn probe_command(image: &Path, vz: bool) -> Result<(Command, Artifacts), String>
         cmd
     };
     Ok((cmd, kernel))
+}
+
+/// The process service ends before it registers (feature `exit-early`):
+/// init fails the load of each POSIX process, the one that waited for its
+/// session and the one loaded after the service ended, and starts neither.
+fn posix_orphans() -> Result<(), String> {
+    let image = build_boot_image(
+        "boot-posix-orphans.img",
+        &POSIX_ORPHAN_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let (cmd, kernel) = probe_command(&image, false)?;
+    const PEER: &str = "init: clock-peer did not load: the process service ended, not restarted";
+    const PROBE: &str =
+        "init: posix-abi-probe did not load: the process service ended, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(PROBE), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, PROBE)?;
+    qemu::expect_line(&output, PEER)?;
+    println!("POSIX processes whose service ended fail their loads");
+    Ok(())
 }
 
 fn posix_thread_probe(vz: bool) -> Result<(), String> {
@@ -1294,7 +1330,8 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(
             &output,
             "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
-        )
+        )?;
+        qemu::expect_marker(&output, "posix-process: adoption refusals ok")
     });
     if vz {
         vz::stop_hint(checked)?;

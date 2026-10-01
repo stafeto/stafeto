@@ -76,6 +76,9 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    if cfg!(feature = "exit-early") {
+        return 9;
+    }
     let Ok(channel) = sys::channel_create(1) else {
         return 3;
     };

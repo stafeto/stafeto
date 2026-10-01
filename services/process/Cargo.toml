@@ -13,6 +13,9 @@ bench = false
 
 [features]
 transport-probe = []
+# The probe of POSIX processes whose service ended: the service ends before
+# it registers (xtask posix-orphans).
+exit-early = []
 
 [dependencies]
 proto-process = { path = "../../proto/process" }

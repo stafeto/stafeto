@@ -472,10 +472,15 @@ impl Init {
                 });
                 if record.is_posix() {
                     // Its thread starts once the process service gave the
-                    // session of its record (`adopted`).
+                    // session of its record (`adopted`); with the service
+                    // ended or broken for good none comes.
                     entry.adopting = true;
                     entry.offered = false;
-                    self.offer();
+                    if self.process_service_over() {
+                        self.adoption_failed(place, "the process service ended");
+                    } else {
+                        self.offer();
+                    }
                 } else {
                     self.run(place);
                 }
@@ -522,16 +527,35 @@ impl Init {
     /// process with MANAGE, DUPLICATE and TRANSFER. A copy that cannot be
     /// made fails the load.
     fn offer(&mut self) {
-        if self.adoption.is_none() {
-            return;
+        // A process whose copy cannot be made fails, and the next one that
+        // waits is offered.
+        loop {
+            if self.adoption.is_none() {
+                return;
+            }
+            let waiting = (0..TABLE.len()).find(|&p| {
+                let e = &self.entries[p];
+                e.adopting && !e.offered && e.held.running().is_some()
+            });
+            let Some(place) = waiting else {
+                return;
+            };
+            if self.offer_one(place) {
+                return;
+            }
         }
-        let waiting = (0..TABLE.len()).find(|&p| {
-            let e = &self.entries[p];
-            e.adopting && !e.offered && e.held.running().is_some()
-        });
-        let Some(place) = waiting else {
-            return;
-        };
+    }
+
+    /// Whether the process service ended or broke for good: its record
+    /// does not restart, and no ADOPT comes any more.
+    fn process_service_over(&self) -> bool {
+        table::find(TABLE, table::PROCESS_SERVICE.as_bytes())
+            .is_none_or(|p| matches!(self.entries[p].state, State::Ended | State::Broken))
+    }
+
+    /// Offers the process at `place` to the waiting ADOPT; false when its
+    /// copy could not be made and its load failed.
+    fn offer_one(&mut self, place: usize) -> bool {
         let instance = self.entries[place]
             .held
             .running()
@@ -541,7 +565,7 @@ impl Init {
         let ticket = instance.spawned.label;
         let Ok(copy) = copy else {
             self.adoption_failed(place, "no copy of its process");
-            return;
+            return false;
         };
         let mut w = proto_wire::Writer::new();
         let written = w
@@ -551,9 +575,10 @@ impl Init {
         let pending = self.adoption.take().expect("a waiting ADOPT");
         if written.is_err() || pending.answer(w.as_bytes(), [copy.erase()]).is_err() {
             // The service went: the next ADOPT offers the process again.
-            return;
+            return true;
         }
         self.entries[place].offered = true;
+        true
     }
 
     /// The POSIX process at `place` gets no session of its record: a
