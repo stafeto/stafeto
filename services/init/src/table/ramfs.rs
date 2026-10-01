@@ -129,7 +129,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         args: b"posix-abi-probe\0argument\0",
         connects: &["ramfs", "clock", "clock-peer", "posix"],
         quota: 2048 * PAGE,
-        handle_limit: 128,
+        // Each pthread holds its handle, its channel and its timer
+        // (posix-sync) besides the owner's native handle.
+        handle_limit: 512,
         root: true,
         ..POSIX
     },
@@ -169,7 +171,7 @@ pub const RTBENCH: Record = Record {
     args: b"rtbench-posix\0",
     connects: &["ramfs", "clock", "posix", "uart", "rtbench-load"],
     quota: 2048 * PAGE,
-    handle_limit: 128,
+    handle_limit: 512,
     root: true,
     ..POSIX
 };

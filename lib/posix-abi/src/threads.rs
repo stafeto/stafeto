@@ -44,9 +44,6 @@ const JOIN_ACK: u64 = 4;
 const DETACH: u64 = 5;
 const CANCEL: u64 = 7;
 const JOIN_ABANDON: u64 = 8;
-/// The caller's own level (`set_level`).
-#[cfg(feature = "rtbench")]
-const LEVEL: u64 = 30;
 const REPLY_ACK: u64 = 28;
 const ATTR_MAGIC: u64 = 0x5054_4852_4154_5431;
 
@@ -135,6 +132,8 @@ static ACK_TARGET: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "transport-probe")]
 static ACK_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 static NONCE: AtomicU64 = AtomicU64::new(1);
+/// The main thread's handle with MANAGE, for its block.
+static MAIN_SELF: AtomicU64 = AtomicU64::new(0);
 
 struct Launch {
     id: AtomicU64,
@@ -143,6 +142,8 @@ struct Launch {
     floating: AtomicU64,
     /// The page of the thread's TCB, above its stack.
     tcb: AtomicU64,
+    /// The thread's own handle with MANAGE, for its block.
+    thread: AtomicU64,
     completed: AtomicBool,
     cancel: cancel::State,
     specific: specific::Values,
@@ -154,6 +155,7 @@ static LAUNCH: [Launch; CAPACITY] = [const {
         argument: AtomicU64::new(0),
         floating: AtomicU64::new(0),
         tcb: AtomicU64::new(0),
+        thread: AtomicU64::new(0),
         completed: AtomicBool::new(false),
         cancel: cancel::State::new(),
         specific: specific::Values::new(),
@@ -192,6 +194,11 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
             owner_priority
         );
     }
+    // The main thread's handle for its block (`attach`): the loader gives
+    // it no DUPLICATE, so the block names the owner's; the owner keeps it
+    // while the main thread lives.
+    MAIN_SELF.store(main.raw().0, Ordering::Release);
+    posix_sync::configure(owner_priority, crate::signals::deliver_deferred);
     let endpoint = sys::channel_create(owner_priority)?;
     crate::clock::watch(&endpoint).map_err(|status| {
         rt::println!("pthread clock watch failed: {:?}", status);
@@ -274,8 +281,6 @@ fn recovery_slot(op: u64) -> Option<usize> {
     match op {
         EXIT => Some(0),
         specific::TAKE => Some(1),
-        once::RESET => Some(2),
-        mutex::UNLOCK => Some(3),
         JOIN_ABANDON => Some(4),
         sleep::ABANDON => Some(5),
         specific::GET => Some(6),
@@ -299,8 +304,6 @@ struct Entry {
     value: u64,
     waiting: Option<Waiting>,
     woken_epoch: u64,
-    once_waiting: Option<once::Waiting>,
-    mutex_waiting: Option<mutex::Waiting>,
     sleep_waiting: Option<sleep::Waiting>,
     recovery: [Option<Recovery>; 15],
     signal: posix_signals::Thread,
@@ -322,8 +325,6 @@ impl Entry {
             value: 0,
             waiting: None,
             woken_epoch: 0,
-            once_waiting: None,
-            mutex_waiting: None,
             sleep_waiting: None,
             recovery: [None; 15],
             signal: posix_signals::Thread::new(0),
@@ -531,7 +532,13 @@ impl Registry {
                 Some((channel(), level)),
             )
         };
-        let native = match native {
+        let native = match native.and_then(|native| {
+            let own = sys::handle_duplicate(&native, rt::abi::Rights::MANAGE)?;
+            LAUNCH[slot]
+                .thread
+                .store(own.into_raw().0, Ordering::Relaxed);
+            Ok(native)
+        }) {
             Ok(native) => native,
             Err(_) => {
                 unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
@@ -552,6 +559,7 @@ impl Registry {
             // The failed start leaves the thread stopped; release its handle
             // before removing the stack it cannot execute on.
             self.entries[slot] = None;
+            close_raw(LAUNCH[slot].thread.swap(0, Ordering::Relaxed));
             unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
                 .expect("failed-start stack removal");
             return Err(EAGAIN);
@@ -590,6 +598,19 @@ impl Registry {
                 launch.completed.store(true, Ordering::Release);
             }
             if let Some((address, length)) = entry.mapping.take() {
+                // The handles of its block go with it; nothing uses them
+                // once the thread ended (posix_sync::futex_wake notifies
+                // under the bucket's lock).
+                let page = launch.tcb.load(Ordering::Relaxed) as usize;
+                // SAFETY: the page above the stack holds the thread's TCB
+                // until the unmapping below.
+                let block = unsafe {
+                    &*((page + posix_thread::TCB_OFFSET + posix_thread::BLOCK_OFFSET)
+                        as *const posix_thread::Block)
+                };
+                close_raw(block.timer.swap(0, Ordering::Relaxed));
+                close_raw(block.channel.swap(0, Ordering::Relaxed));
+                close_raw(launch.thread.swap(0, Ordering::Relaxed));
                 // SAFETY: the kernel confirms this thread will never execute again.
                 unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
                     .expect("ended pthread stack removal");
@@ -713,8 +734,6 @@ impl Registry {
                 let entry = self.entry_mut(caller);
                 entry.sleep_waiting = None;
                 entry.signal_waiting = None;
-                entry.once_waiting = None;
-                entry.mutex_waiting = None;
                 entry.phase = Phase::Exiting;
                 entry.value = words[3];
                 // Application threads determine process lifetime; internal owners remain live.
@@ -759,18 +778,6 @@ impl Registry {
                 }
                 Ok(0)
             }
-            #[cfg(feature = "rtbench")]
-            LEVEL => {
-                let level = u8::try_from(words[3]).map_err(|_| EINVAL)?;
-                // Strictly below the ceiling, where the owner and the
-                // workers run: no application thread ties with them.
-                if level == 0 || level >= crate::ceiling().map_err(|_| EIO)? {
-                    return Err(EINVAL);
-                }
-                let native = self.entry(caller).native.as_ref().ok_or(ESRCH)?;
-                sys::thread_set_priority(native, level, Policy::Fifo).map_err(|_| EINVAL)?;
-                Ok(0)
-            }
             DETACH => {
                 let target = self.find(words[3])?;
                 let entry = self.entry_mut(target);
@@ -784,19 +791,9 @@ impl Registry {
                 Ok(0)
             }
             #[cfg(feature = "transport-probe")]
-            17 => {
-                let index = self.find(words[3])?;
-                Ok(u64::from(self.entry(index).once_waiting.is_some()))
-            }
-            #[cfg(feature = "transport-probe")]
             6 => {
                 let index = self.find(words[3])?;
                 Ok(self.entry(index).native.as_ref().ok_or(ESRCH)?.raw().0)
-            }
-            #[cfg(feature = "transport-probe")]
-            22 => {
-                let index = self.find(words[3])?;
-                Ok(u64::from(self.entry(index).mutex_waiting.is_some()))
             }
             _ => Err(EINVAL),
         }
@@ -996,10 +993,6 @@ extern "C" fn owner(_: u64) -> ! {
                 let answer = registry.cache(caller, words[2], Ok(0), words[0]);
                 respond(token, answer);
             }
-        } else if words[0] == once::BEGIN {
-            registry.once_begin(caller, words, token);
-        } else if matches!(words[0], mutex::LOCK | mutex::TRY | mutex::TIMED) {
-            registry.mutex_lock(caller, words, token);
         } else if words[0] == sleep::BEGIN {
             registry.sleep_begin(caller, words, token);
         } else if words[0] == crate::signals::WAIT {
@@ -1036,10 +1029,6 @@ extern "C" fn owner(_: u64) -> ! {
                 registry
                     .find(words[3])
                     .map(|index| (u64::from(registry.entry(index).sleep_waiting.is_some()), 0))
-            } else if matches!(words[0], mutex::UNLOCK | mutex::DESTROY) {
-                registry.mutex_perform(words).map(|value| (value, 0))
-            } else if matches!(words[0], once::FINISH | once::RESET) {
-                registry.once_perform(words).map(|value| (value, 0))
             } else if (specific::CREATE..=specific::TAKE).contains(&words[0]) {
                 registry.specific.perform(caller, words)
             } else if cfg!(feature = "transport-probe") && words[0] == crate::signals::WAIT_QUERY {
@@ -1099,25 +1088,54 @@ extern "C" fn trampoline(slot: u64) -> ! {
             status = in(reg) floating >> 32,
             options(nomem, nostack, preserves_flags));
     }
+    let own = launch.thread.load(Ordering::Relaxed);
     // SAFETY: the page above the stack is this thread's until it ended.
-    unsafe { attach(tcb, PAGE, id) }.expect("managed thread attach");
+    unsafe { attach_with(tcb, PAGE, id, own) }.expect("managed thread attach");
     let value = unsafe { callback(argument) };
     // SAFETY: the current thread is managed and attached.
     unsafe { pthread_exit(value) }
 }
 
-/// Attaches the calling thread to the TCB built in `page`, `len` bytes,
-/// as pthread `id` with the process's files, and binds and enables its
-/// entry of signals: the second step of a thread's start (spec 2, 3.5),
-/// after the process's (posix-crt) for the main thread, in the trampoline
-/// of `pthread_create` for another.
+/// Attaches the main thread to the TCB built in `page`, `len` bytes, as
+/// pthread `id` with the process's files, gives it its channel and timer,
+/// and binds and enables its entry of signals: the second step of its
+/// start (spec 2, 3.5), after the process's (posix-crt). The trampoline of
+/// `pthread_create` does the same for another thread.
 ///
 /// # Safety
-/// As for `tls::attach`; the thread is managed (its record is `id`).
+/// As for `tls::attach`; the calling thread is the main thread, after
+/// `init`.
 pub unsafe fn attach(page: *mut u8, len: usize, id: u64) -> Result<(), i32> {
     // SAFETY: the caller's promise.
+    unsafe { attach_with(page, len, id, MAIN_SELF.load(Ordering::Acquire)) }
+}
+
+/// `attach` with the thread's own handle `own` (MANAGE).
+unsafe fn attach_with(page: *mut u8, len: usize, id: u64, own: u64) -> Result<(), i32> {
+    // SAFETY: the caller's promise.
     unsafe { tls::attach(page, len, id) };
+    // SAFETY: the thread is attached now.
+    let block = unsafe { posix_thread::block().as_ref() }.ok_or(EINVAL)?;
+    let thread = Handle::<Thread>::borrowed(rt::abi::Handle(own));
+    let base = sys::thread_info(&thread).map_err(|_| EIO)?.base;
+    // Its channel takes the wakes of waits by address and its timer the
+    // deadlines of its waits (posix-sync).
+    let channel = sys::channel_create(base).map_err(|_| EAGAIN)?;
+    let timer = sys::timer_create(&channel, base).map_err(|_| EAGAIN)?;
+    block.thread.store(own, Ordering::Relaxed);
+    block.base_level.store(u32::from(base), Ordering::Relaxed);
+    block.timer.store(timer.into_raw().0, Ordering::Relaxed);
+    let channel = channel.into_raw().0;
+    block.channel.store(channel, Ordering::Relaxed);
+    block.waker.store(channel, Ordering::Release);
     crate::signals::attach()
+}
+
+/// Closes the handle `raw`, unless it is 0.
+fn close_raw(raw: u64) {
+    if raw != 0 {
+        drop(Handle::<rt::handle::Any>::from_raw(rt::abi::Handle(raw)));
+    }
 }
 
 fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {
@@ -1209,13 +1227,26 @@ fn acknowledge(caller: u64, nonce: u64, abandon: bool) -> Result<(), i32> {
     }
 }
 
-/// Moves the calling managed thread to kernel level `level` under FIFO
-/// (1 to one below the process's ceiling; EINVAL otherwise). A Rust call
-/// for the measurements of rtbench 2 (feature `rtbench`) until the
-/// scheduling attributes of POSIX come (spec 2, 3.5).
-#[cfg(feature = "rtbench")]
+/// Moves the calling thread to kernel level `level` under FIFO (1 to one
+/// below the process's ceiling; EINVAL otherwise) through its own handle in its
+/// block, and makes it the thread's base level, which the lock of a bucket
+/// returns to. A Rust call for the measurements of rtbench 2 until the
+/// scheduling attributes of POSIX come (spec 2, 3.5); the guest probes
+/// have it too.
+#[cfg(any(feature = "rtbench", feature = "transport-probe"))]
 pub fn set_level(level: u8) -> Result<(), i32> {
-    request(LEVEL, [u64::from(level), 0, 0, 0, 0]).map(drop)
+    let block = posix_thread::block();
+    // SAFETY: the block is the calling thread's.
+    let block = unsafe { block.as_ref() }.ok_or(EINVAL)?;
+    let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
+    // Strictly below the ceiling, where the lock of a bucket and the
+    // helpers of the layer run: no application thread ties with them.
+    if level == 0 || level >= crate::ceiling().map_err(|_| EIO)? {
+        return Err(EINVAL);
+    }
+    sys::thread_set_priority(&thread, level, Policy::Fifo).map_err(|_| EINVAL)?;
+    block.base_level.store(u32::from(level), Ordering::Relaxed);
+    Ok(())
 }
 
 #[unsafe(no_mangle)]
@@ -1523,6 +1554,31 @@ pub fn probe_snapshot(words: [u64; 5]) -> Result<[u64; 7], i32> {
 #[cfg(feature = "transport-probe")]
 pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle<Thread>>, i32> {
     request(6, [thread, 0, 0, 0, 0]).map(|raw| Handle::borrowed(rt::abi::Handle(raw)))
+}
+
+/// The block of pthread `id` while it lives, for the guest probes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_block(id: u64) -> Option<&'static posix_thread::Block> {
+    let page = if id == 1 {
+        tls::main_page() as usize
+    } else {
+        LAUNCH
+            .iter()
+            .find(|launch| launch.id.load(Ordering::Acquire) == id)?
+            .tcb
+            .load(Ordering::Acquire) as usize
+    };
+    // SAFETY: the TCB of a live thread is mapped; the caller keeps it live.
+    Some(unsafe {
+        &*((page + posix_thread::TCB_OFFSET + posix_thread::BLOCK_OFFSET)
+            as *const posix_thread::Block)
+    })
+}
+
+/// Whether pthread `id` waits by address now, for the guest probes.
+#[cfg(feature = "transport-probe")]
+pub fn probe_futex_waiting(id: u64) -> bool {
+    probe_block(id).is_some_and(posix_sync::waiting)
 }
 
 fn current_launch() -> Option<&'static Launch> {

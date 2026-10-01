@@ -3302,6 +3302,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "posix-thread",
         "--package",
+        "posix-sync",
+        "--package",
         "posix-thread-probe",
         "--package",
         "posix-shared-probe",

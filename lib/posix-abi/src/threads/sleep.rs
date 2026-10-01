@@ -18,6 +18,28 @@ pub(super) struct Waiting {
     token: sys::Token,
 }
 impl Registry {
+    /// Expire in the original clock and choose the next representable wake.
+    /// Rechecking after every timer/clock notice rejects stale timer deliveries.
+    pub(super) fn wait_deadlines(&mut self) -> Option<u64> {
+        self.deadlines(false)
+    }
+    pub(super) fn deadlines(&mut self, force: bool) -> Option<u64> {
+        let realtime = self.entries.iter().flatten().any(|e| {
+            e.sleep_waiting
+                .as_ref()
+                .is_some_and(|w| w.deadline.calendar())
+        });
+        let observation = if realtime || force {
+            crate::clock::observation().ok()
+        } else {
+            None
+        };
+        let now = now();
+        self.sleep_deadlines(now, observation)
+            .into_iter()
+            .chain(self.signal_deadlines(now))
+            .min()
+    }
     pub(super) fn sleep_begin(&mut self, caller: usize, words: [u64; 8], token: sys::Token) {
         if let Some(wait) = self.entry_mut(caller).sleep_waiting.as_mut()
             && wait.nonce == words[2]

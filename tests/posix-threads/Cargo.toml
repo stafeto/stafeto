@@ -17,7 +17,8 @@ cancel-input = []
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi", features = ["transport-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }
-rt = { path = "../../lib/rt" }
+rt = { path = "../../lib/rt", features = ["count-calls"] }
+posix-sync = { path = "../../lib/posix-sync" }
 posix-clock = { path = "../../lib/posix-clock", features = ["transport-probe"] }
 posix-thread = { path = "../../lib/posix-thread" }
 posix-time = { path = "../../lib/posix-time" }

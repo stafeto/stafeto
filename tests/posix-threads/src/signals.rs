@@ -321,11 +321,11 @@ pub(super) fn run() -> bool {
     true
 }
 
-struct Held(core::cell::UnsafeCell<[Option<Handle<Channel>>; 128]>);
+struct Held(core::cell::UnsafeCell<[Option<Handle<Channel>>; 1024]>);
 // SAFETY: the pressure worker owns these handles until main confirms kernel
 // Ended and acquires its completion publication. Handlers never access HELD.
 unsafe impl Sync for Held {}
-static HELD: Held = Held(core::cell::UnsafeCell::new([const { None }; 128]));
+static HELD: Held = Held(core::cell::UnsafeCell::new([const { None }; 1024]));
 static PRESSURE_RESULT: AtomicUsize = AtomicUsize::new(0);
 static PRESSURE_WAIT: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" fn pressure_info_handler(signal: i32, info: *mut api::SigInfo, raw: *mut c_void) {

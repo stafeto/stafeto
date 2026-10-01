@@ -36,6 +36,8 @@ mod credentials;
 #[cfg(not(feature = "cancel-input"))]
 mod file_replies;
 #[cfg(not(feature = "cancel-input"))]
+mod futex;
+#[cfg(not(feature = "cancel-input"))]
 mod heap_replies;
 #[cfg(feature = "cancel-input")]
 mod input;
@@ -129,6 +131,23 @@ fn waiting_registered(thread: &Handle<Thread>, registered: impl Fn() -> bool) ->
     false
 }
 
+/// Whether pthread `id` waits by address within 100 ms (its node linked
+/// in a bucket, posix-sync).
+#[cfg(not(feature = "cancel-input"))]
+fn futex_blocked(id: u64) -> bool {
+    let wake = sys::channel_create(30).expect("poll wake channel");
+    let timer = sys::timer_create(&wake, 30).expect("poll timer");
+    for _ in 0..100 {
+        if threads::probe_futex_waiting(id) {
+            return true;
+        }
+        sys::timer_set(&timer, sys::clock_now().expect("poll clock") + 1_000_000)
+            .expect("poll deadline");
+        sys::receive(&wake).expect("poll wake");
+    }
+    false
+}
+
 #[cfg(not(feature = "cancel-input"))]
 unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     // Main exited through pthread_exit. Its join must still yield its value.
@@ -149,6 +168,48 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     rt::println!("posix-thread-probe: main exit and last application thread ok");
     rt::println!("posix-thread-probe: ok");
     ptr::null_mut()
+}
+
+/// The channels that fill the table of handles (`fill_handles`).
+#[cfg(not(feature = "cancel-input"))]
+static HELD: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+
+/// The table of handles filled with channels until `channel_create`
+/// fails; they close when it drops.
+#[cfg(not(feature = "cancel-input"))]
+struct Filled(usize);
+#[cfg(not(feature = "cancel-input"))]
+impl Filled {
+    /// Whether the table filled before the room of HELD did.
+    fn full(&self) -> bool {
+        self.0 != 0 && self.0 != HELD.len()
+    }
+    /// Gives back the last channel.
+    fn release_last(&mut self) {
+        self.0 -= 1;
+        let raw = HELD[self.0].swap(0, Ordering::Relaxed);
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    }
+}
+#[cfg(not(feature = "cancel-input"))]
+impl Drop for Filled {
+    fn drop(&mut self) {
+        while self.0 != 0 {
+            self.release_last();
+        }
+    }
+}
+#[cfg(not(feature = "cancel-input"))]
+fn fill_handles() -> Filled {
+    let mut count = 0;
+    while count < HELD.len() {
+        let Ok(channel) = sys::channel_create(1) else {
+            break;
+        };
+        HELD[count].store(channel.into_raw().0, Ordering::Relaxed);
+        count += 1;
+    }
+    Filled(count)
 }
 
 fn failed(stage: usize) -> bool {
@@ -256,23 +317,13 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let baseline = sys::process_handles(&process)
         .expect("handle baseline")
         .live;
-    let mut held: [Option<Handle<Channel>>; 128] = core::array::from_fn(|_| None);
-    let mut count = 0;
-    while count < held.len() {
-        match sys::channel_create(1) {
-            Ok(channel) => {
-                held[count] = Some(channel);
-                count += 1;
-            }
-            Err(_) => break,
-        }
-    }
-    if count == 0 || count == held.len() {
+    let mut held = fill_handles();
+    if !held.full() {
         return failed(3);
     }
     // Leave one handle slot for the stack memory, forcing thread_create to
     // fail after the stack has actually been mapped by the real owner.
-    held[count - 1] = None;
+    held.release_last();
     let occupied = sys::process_handles(&process)
         .expect("occupied handles")
         .live;
@@ -359,6 +410,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
     if !tcb::run()
+        || !futex::run()
         || !clocks::run(clocks)
         || !capacity::run()
         || !specific::run()

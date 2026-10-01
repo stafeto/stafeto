@@ -145,6 +145,46 @@ pub extern "C" fn rtbench_load_rounds() -> u64 {
     }
 }
 
+/// Wait by address of the layer (posix-sync) while `*word == value`: 0
+/// woken, or the error number. With relibc this is `Pal::futex_wait`.
+///
+/// # Safety
+/// `word` is a live aligned word.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtbench_futex_wait(word: *const u32, value: u32) -> c_int {
+    // SAFETY: the caller's promise; the word is used atomically.
+    let word = unsafe { &*word.cast::<core::sync::atomic::AtomicU32>() };
+    match posix_sync::futex_wait(word, value, posix_sync::CLOCK_MONOTONIC, None) {
+        Ok(_) => 0,
+        Err(error) => error,
+    }
+}
+
+/// Wakes up to `count` waiters on `word`: how many.
+#[unsafe(no_mangle)]
+pub extern "C" fn rtbench_futex_wake(word: *const u32, count: u32) -> u32 {
+    posix_sync::futex_wake(word.cast(), count)
+}
+
+/// A word of `words` (`count` of them) in the bucket of `word` other than
+/// itself, or null.
+///
+/// # Safety
+/// `words` names `count` words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtbench_neighbour(
+    word: *const u32,
+    words: *const u32,
+    count: usize,
+) -> *const u32 {
+    let wanted = posix_sync::bucket_of(word.cast());
+    (0..count)
+        // SAFETY: the caller's promise.
+        .map(|index| unsafe { words.add(index) })
+        .find(|&other| other != word && posix_sync::bucket_of(other.cast()) == wanted)
+        .unwrap_or(core::ptr::null())
+}
+
 /// Writes `length` bytes at `text` to the console.
 ///
 /// # Safety

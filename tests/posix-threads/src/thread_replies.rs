@@ -12,11 +12,11 @@ static ERRORS: AtomicUsize = AtomicUsize::new(0);
 static CREATED: AtomicUsize = AtomicUsize::new(0);
 static MODE: AtomicUsize = AtomicUsize::new(0);
 static QUERY_KEY: AtomicU64 = AtomicU64::new(0);
-struct Held(UnsafeCell<[Option<Handle<Channel>>; 128]>);
+struct Held(UnsafeCell<[Option<Handle<Channel>>; 1024]>);
 // SAFETY: one pressure worker writes; main accesses only after join and an
 // acquire of PRESSURE_DONE. No other probe touches these owned handles.
 unsafe impl Sync for Held {}
-static HELD: Held = Held(UnsafeCell::new([const { None }; 128]));
+static HELD: Held = Held(UnsafeCell::new([const { None }; 1024]));
 static PRESSURE_GO: AtomicU64 = AtomicU64::new(0);
 static PRESSURE_KEY: AtomicU64 = AtomicU64::new(0);
 static PRESSURE_DONE: AtomicUsize = AtomicUsize::new(0);
@@ -133,16 +133,8 @@ fn reservation_failure() -> bool {
         count
     }
     let key_capacity = available_keys();
-    let mut held: [Option<Handle<Channel>>; 128] = core::array::from_fn(|_| None);
-    let mut handles = 0;
-    while handles < held.len() {
-        let Ok(channel) = sys::channel_create(1) else {
-            break;
-        };
-        held[handles] = Some(channel);
-        handles += 1;
-    }
-    if handles == 0 || handles == held.len() {
+    let held = fill_handles();
+    if !held.full() {
         return failed(286);
     }
     let mut nonces = [0; 2000];

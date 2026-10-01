@@ -297,7 +297,26 @@ pub(crate) fn attach() -> Result<(), i32> {
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
     Ok(())
 }
+/// Delivers an entry that came inside a critical section of the layer,
+/// at the end of the section (posix_sync::leave), with no frame to edit:
+/// a handler with SA_SIGINFO gets a context of zeros, and its edits go
+/// nowhere.
+pub(crate) fn deliver_deferred() {
+    let masked = upcall::mask().expect("deferred entry mask");
+    // SAFETY: called outside every critical section, on an attached thread.
+    unsafe { dispatch(core::ptr::null_mut()) };
+    if !masked {
+        // SAFETY: the thread had entries enabled before.
+        unsafe { upcall::enable() }.expect("deferred entry restore");
+    }
+}
+
 unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
+    // Inside a critical section of the layer the entry only marks itself
+    // deferred; the end of the section delivers it.
+    if posix_sync::defer_entry() {
+        return;
+    }
     // SAFETY: the entry runs on a thread with a block (attach).
     let errno = unsafe { ERRNO_LOCATION() };
     let saved_errno = unsafe { *errno };
@@ -317,8 +336,14 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
         let flags = (delivery >> 32) as u32 as i32;
         let mut restore_mask = old_mask;
         if flags & SA_SIGINFO != 0 {
-            // SAFETY: the context-aware trampoline owns this unique live frame.
-            let frame = unsafe { native.read() };
+            // SAFETY: the context-aware trampoline owns this unique live
+            // frame; a deferred entry has none, and gets zeros.
+            let frame = if native.is_null() {
+                // SAFETY: the context is plain integers.
+                unsafe { core::mem::zeroed::<upcall::Context>() }
+            } else {
+                unsafe { native.read() }
+            };
             let mut context = UserContext {
                 uc_link: core::ptr::null_mut(),
                 uc_sigmask: old_mask,
@@ -347,17 +372,19 @@ unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
             let machine = context.uc_mcontext;
-            unsafe {
-                native.write(upcall::Context {
-                    registers: machine.registers,
-                    sp: machine.sp,
-                    pc: machine.pc,
-                    pstate: machine.pstate,
-                    vectors: machine.vectors,
-                    fpcr: machine.fpcr,
-                    fpsr: machine.fpsr,
-                    ..frame
-                });
+            if !native.is_null() {
+                unsafe {
+                    native.write(upcall::Context {
+                        registers: machine.registers,
+                        sp: machine.sp,
+                        pc: machine.pc,
+                        pstate: machine.pstate,
+                        vectors: machine.vectors,
+                        fpcr: machine.fpcr,
+                        fpsr: machine.fpsr,
+                        ..frame
+                    });
+                }
             }
             restore_mask =
                 posix_signals::mask(context.uc_sigmask).expect("valid signal return mask");

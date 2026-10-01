@@ -271,16 +271,8 @@ fn storage(fd: i32) -> bool {
     let handles = sys::process_handles(&process).unwrap().live;
     // Exhaust handles so the journal cannot acquire a new memory chunk. Existing
     // capacity remains usable; the first refused reservation must precede effects.
-    let mut held: [Option<Handle<Channel>>; 128] = core::array::from_fn(|_| None);
-    let mut held_count = 0;
-    while held_count < held.len() {
-        let Ok(channel) = sys::channel_create(1) else {
-            break;
-        };
-        held[held_count] = Some(channel);
-        held_count += 1;
-    }
-    if held_count == 0 || held_count == held.len() {
+    let held = fill_handles();
+    if !held.full() {
         return failed(263);
     }
     let first = FIRST + 1000;

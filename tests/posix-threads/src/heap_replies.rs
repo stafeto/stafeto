@@ -239,13 +239,7 @@ fn failure() -> bool {
     true
 }
 fn pressure() -> bool {
-    let mut held: [Option<Handle<Channel>>; 128] = [const { None }; 128];
-    for slot in &mut held {
-        match sys::channel_create(1) {
-            Ok(h) => *slot = Some(h),
-            Err(_) => break,
-        }
-    }
+    let held = fill_handles();
     let before = heap::probe_stats();
     let block = unsafe { allocation(64) };
     if block.is_null() {

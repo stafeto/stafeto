@@ -22,14 +22,16 @@
  *
  * Levels: main starts at 30, the process's ceiling is 31 (the helper
  * threads of the layer). The scenarios (S1-S9 of the design of 5a):
- * S1 a mutex without a rival; S3 a mutex with rivals at 10, 20 and 30
+ * S1 a mutex without a rival; S2 futex_wake without waiters; S3 a mutex with rivals at 10, 20 and 30
  * and a thread at 25 that spins 20 ms in every 100 ms; S4 malloc/free of
  * 64 B and 4 KiB and dup/close from threads at 10, 20 and 30; S5 from
  * pthread_kill to the first statement of the handler at a thread at 30
  * that (a) sleeps, (b) waits in read of standard input, (c) sleeps while
  * a thread at 25 runs all the time; S6 from the readiness of the data in
  * the service (its counter) to the return of read; S7 the lateness of
- * clock_nanosleep TIMER_ABSTIME with a period of 1 ms; S9 an empty round
+ * clock_nanosleep TIMER_ABSTIME with a period of 1 ms; S8 from futex_wake
+ * to the return of the futex_wait of a thread at 30, and futex_wake on a
+ * word whose bucket holds a waiter on another word; S9 an empty round
  * trip through the loop of a service.
  */
 #include <errno.h>
@@ -49,6 +51,10 @@ int rtbench_level(int level);
 int rtbench_ping(void);
 void rtbench_say(const char *text, size_t length);
 uint64_t rtbench_load_rounds(void);
+/* Waits by address of the platform (relibc: Pal::futex_wait, futex_wake). */
+int rtbench_futex_wait(const uint32_t *word, uint32_t value);
+uint32_t rtbench_futex_wake(const uint32_t *word, uint32_t count);
+const uint32_t *rtbench_neighbour(const uint32_t *word, const uint32_t *words, size_t count);
 
 #define MAIN_LEVEL 30
 #define SENDER_LEVEL 28
@@ -306,6 +312,87 @@ static int mutex_alone(void) {
     return pthread_mutex_destroy(&m);
 }
 
+/* --- S2: futex_wake without waiters ------------------------------------ */
+
+static struct histogram s2;
+static uint32_t idle_word;
+
+static int wake_idle(void) {
+    uint64_t calls = rtbench_calls();
+    for (int i = 0; i < 1000; i++) {
+        uint64_t t0 = ticks();
+        uint32_t woken = rtbench_futex_wake(&idle_word, 1);
+        uint64_t t1 = ticks();
+        if (woken) {
+            fail("S2 woke", (int)woken);
+            return 1;
+        }
+        record(&s2, ticks_ns(t1 - t0));
+    }
+    s2.calls += rtbench_calls() - calls;
+    return 0;
+}
+
+/* --- S8: the slow path of waits by address ---------------------------- */
+
+static struct histogram s8[2];
+static uint32_t s8_words[256];
+static uint32_t *s8_word;
+static volatile uint64_t s8_returned;
+static int s8_returns;
+
+static void *s8_waiter(void *argument) {
+    struct worker *w = argument;
+    if (enter(w)) return NULL;
+    while (!load(&w->stop)) {
+        while (__atomic_load_n(s8_word, __ATOMIC_ACQUIRE) == 0)
+            rtbench_futex_wait(s8_word, 0);
+        s8_returned = ticks();
+        __atomic_store_n(s8_word, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&s8_returns, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+static int futex_slow(void) {
+    s8_word = &s8_words[0];
+    const uint32_t *neighbour = rtbench_neighbour(s8_word, s8_words, 256);
+    if (!neighbour) {
+        fail("S8 no neighbour", 0);
+        return 1;
+    }
+    struct worker waiter;
+    /* The waker is below the waiter, which runs at once when woken. */
+    int error = rtbench_level(SENDER_LEVEL);
+    if (!error) error = start(&waiter, s8_waiter, MAIN_LEVEL, NULL);
+    for (int i = 0; i < 100 && !error; i++) {
+        sleep_ns(1 * MS);
+        /* The waiter waits on s8_word: a wake of its neighbour scans it. */
+        uint64_t calls = rtbench_calls();
+        uint64_t t0 = ticks();
+        rtbench_futex_wake(neighbour, 1);
+        uint64_t t1 = ticks();
+        s8[1].calls += rtbench_calls() - calls;
+        record(&s8[1], ticks_ns(t1 - t0));
+        int before = load(&s8_returns);
+        t0 = ticks();
+        __atomic_store_n(s8_word, 1, __ATOMIC_RELEASE);
+        rtbench_futex_wake(s8_word, 1);
+        if (load(&s8_returns) == before) {
+            fail("S8 the waiter did not run", 0);
+            error = 1;
+            break;
+        }
+        record(&s8[0], ticks_ns(s8_returned - t0));
+    }
+    store(&waiter.stop, 1);
+    __atomic_store_n(s8_word, 1, __ATOMIC_RELEASE);
+    rtbench_futex_wake(s8_word, 1);
+    error |= finish(&waiter);
+    error |= rtbench_level(MAIN_LEVEL);
+    return error;
+}
+
 /* --- S3: a mutex with rivals at 10, 20 and 30 ------------------------- */
 
 static struct histogram s3[3];
@@ -559,14 +646,13 @@ static int service_round_trip(void) {
 /* --- the run ---------------------------------------------------------- */
 
 static int one_round(void) {
-    return mutex_alone() || mutex_rivals() || heap_and_table() || signals() || read_ready()
+    return mutex_alone() || wake_idle() || futex_slow() || mutex_rivals() || heap_and_table() || signals() || read_ready()
             || periodic_sleep() || service_round_trip();
 }
 
 static void report(void) {
-    static const char *const later = "the layer has no futex before task 3 of 5a";
     row("s1_mutex_alone", &s1, 1);
-    none("s2_futex_wake_idle", later);
+    row("s2_futex_wake_idle", &s2, 1);
     row("s3_mutex_rival_10", &s3[0], 0);
     row("s3_mutex_rival_20", &s3[1], 0);
     row("s3_mutex_rival_30", &s3[2], 0);
@@ -582,8 +668,8 @@ static void report(void) {
     row("s5_kill_busy_25", &s5[2], 0);
     row("s6_read_ready", &s6, 0);
     row("s7_sleep_abs_1ms", &s7, 0);
-    none("s8_futex_pair", later);
-    none("s8_futex_bucket_neighbour", later);
+    row("s8_futex_pair", &s8[0], 0);
+    row("s8_futex_bucket_neighbour", &s8[1], 1);
     row("s9_service_round_trip", &s9, 1);
     none("kill_through_service", "the process service sends no signals before 5b");
     none("fork_exec_waitpid", "fork and exec come with 5c and 5d");

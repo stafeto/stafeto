@@ -138,6 +138,7 @@ dependencies = [
  "posix-order",
  "posix-request",
  "posix-signals",
+ "posix-sync",
  "posix-thread",
  "posix-time",
  "posix-types",
@@ -298,6 +299,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-sync"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "posix-thread",
+ "rt",
+]
+
+[[package]]
 name = "posix-thread"
 version = "0.1.0"
 
@@ -310,6 +320,7 @@ dependencies = [
  "posix-fs",
  "posix-request",
  "posix-signals",
+ "posix-sync",
  "posix-thread",
  "posix-time",
  "process-client",
@@ -474,6 +485,7 @@ dependencies = [
  "abi",
  "posix-abi",
  "posix-crt",
+ "posix-sync",
  "proto-uart",
  "proto-wire",
  "rt",

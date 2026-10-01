@@ -39,13 +39,13 @@ pub struct GenericTcb {
     pub tcb_len: usize,
 }
 
-/// Bits of `Block::flags`.
+/// Bits of `Block::flags`; the depth of the thread's critical sections
+/// (posix-sync) takes the bits from DEPTH_SHIFT up.
 pub mod flag {
     /// The thread waits in sigwait for the signals of `Block::wait_set`.
     pub const SIGNAL_WAIT: u32 = 1 << 0;
-    /// The thread is in a critical section of the layer: an entry only
-    /// marks itself deferred.
-    pub const CRITICAL: u32 = 1 << 1;
+    /// The thread holds the lock of a bucket (one at most).
+    pub const BUCKET: u32 = 1 << 1;
     /// An entry came inside a critical section and waits for its end.
     pub const ENTRY_DEFERRED: u32 = 1 << 2;
     /// Cancellation was asked for.
@@ -54,6 +54,13 @@ pub mod flag {
     pub const CANCEL_DISABLED: u32 = 1 << 4;
     /// The type of cancellation is asynchronous.
     pub const CANCEL_ASYNCHRONOUS: u32 = 1 << 5;
+    /// The thread runs its cleanup and destructors on its way out.
+    pub const EXITING: u32 = 1 << 6;
+    /// The entry of signals is bound and enabled.
+    pub const SIGNALS_READY: u32 = 1 << 7;
+    /// The depth of the critical sections: a section adds DEPTH_ONE.
+    pub const DEPTH_SHIFT: u32 = 16;
+    pub const DEPTH_ONE: u32 = 1 << DEPTH_SHIFT;
 }
 
 /// The block of the POSIX layer for one thread: relibc's `os_specific`.
