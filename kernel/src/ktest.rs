@@ -478,9 +478,10 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 
 /// Tests of the icount build besides TESTS and the EL0 tests: the first
 /// checks that the run is under -icount, the others measure the portions
-/// of the long calls of memory objects, the timers of programs and device
-/// windows, whose counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 5 } else { 0 };
+/// of the long calls of memory objects, the timers of programs, device
+/// windows and the calls of upcalls, whose counts mean instructions only
+/// there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 6 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -511,6 +512,11 @@ pub fn run(boot: &Boot) -> ! {
         "device_windows_are_measured",
         calls::device_windows_are_measured(boot),
     );
+    #[cfg(feature = "icount")]
+    report(
+        "upcall_calls_are_measured",
+        calls::upcall_calls_are_measured(boot),
+    );
     el0::run()
 }
 
@@ -530,9 +536,16 @@ fn report(name: &str, result: Result<(), &'static str>) {
 fn finish() -> ! {
     let failed = FAILED.load(Ordering::Relaxed);
     let total = ICOUNT_ONLY + TESTS.len() + el0::count();
+    // A call no test of the build made has no maximum: "not measured", so
+    // that 0 does not read as a free call (debug_write, and console_poll,
+    // which only the VZ build has).
     #[cfg(feature = "measure")]
-    for (number, ticks) in crate::syscall::call_maxima().iter().enumerate().skip(1) {
-        kprintln!("call maximum ticks: {number}={ticks}");
+    for (number, &ticks) in crate::syscall::call_maxima().iter().enumerate().skip(1) {
+        if ticks == 0 {
+            kprintln!("call maximum ticks: {number}=not measured");
+        } else {
+            kprintln!("call maximum ticks: {number}={ticks}");
+        }
     }
     kprintln!("TESTS DONE total={total} failed={failed}");
     crate::psci::system_off()

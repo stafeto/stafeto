@@ -278,7 +278,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
-const ICOUNT_TESTS: [&str; 13] = [
+const ICOUNT_TESTS: [&str; 14] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -292,6 +292,7 @@ const ICOUNT_TESTS: [&str; 13] = [
     "long_call_yields_to_a_pending_interrupt",
     "interrupt_path_is_measured",
     "device_windows_are_measured",
+    "upcall_calls_are_measured",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
@@ -318,6 +319,27 @@ const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
 /// The rows of the line of `device_windows_are_measured`, in its order
 /// (spec 15.3).
 const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
+/// The rows of the line of `upcall_calls_are_measured`, in its order
+/// (spec 15.3).
+const UPCALL_ROWS: [&str; 6] = [
+    "interrupt",
+    "bind",
+    "control",
+    "request",
+    "return",
+    "identity",
+];
+/// The rows of the line of `teardown_portions_are_measured`, in its order
+/// (spec 15.3): the term B of audit 2 is the longest of them.
+const TEARDOWN_ROWS: [&str; 7] = [
+    "buffers",
+    "shell",
+    "stop_threads",
+    "stop_senders",
+    "session_buffers",
+    "session_handles",
+    "threads",
+];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
 const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
@@ -595,7 +617,7 @@ commands:
             --hvf under HVF on a Mac with Apple silicon
   test      host tests, then boot checks, the console dialog, init tests
             and kernel tests in QEMU
-  kernel-test [machine] run only the kernel test image in QEMU (512M by default)
+  kernel-test [machine [icount]] run only the kernel test image in QEMU (512M by default), under -icount with `icount`
   init-test [machine] run only the EL0 init test image in QEMU (512M by default)
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci        formatting, clippy, then everything `test` does
@@ -631,7 +653,12 @@ fn main() {
         Some("run") => run(&args[1..]),
         Some("test") => test(),
         Some("kernel-test") => {
-            qemu::machine(args.get(1)).and_then(|m| kernel_tests(m, Variant::Test).map(|_| ()))
+            let variant = if args.get(2).is_some_and(|a| a == "icount") {
+                Variant::TestIcount
+            } else {
+                Variant::Test
+            };
+            qemu::machine(args.get(1)).and_then(|m| kernel_tests(m, variant).map(|_| ()))
         }
         Some("init-test") => {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, false).map(|_| ()))
@@ -2564,17 +2591,37 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             ("timer portions", &TIMER_PORTION_ROWS[..]),
             ("interrupt path", &INTERRUPT_PATH_ROWS[..]),
             ("device window", &WINDOW_ROWS[..]),
+            ("upcall", &UPCALL_ROWS[..]),
+            ("teardown portions", &TEARDOWN_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
+            if what == "teardown portions" {
+                let (row, n) = blocking_time(rows, &ticks);
+                println!("B on {}: {row}={n}", m.name);
+            }
         }
     }
     match variant {
         Variant::Baseline => measure::record_as(m, &o.lines, "baseline "),
         Variant::Trace => measure::record_as(m, &o.lines, "trace "),
+        Variant::TestIcount => measure::record_as(m, &o.lines, measure::ICOUNT),
         _ => measure::record(m, &o.lines),
     }
     Ok(r.passed.len())
+}
+
+/// The longest of the teardown `rows` with their `ticks`, the row
+/// `threads` a count apart: the blocking time B of every level (spec 15.3),
+/// shown on its own so that a change of the longest row stands out in the
+/// output of `ci`; no number fails it.
+fn blocking_time<'a>(rows: &[&'a str], ticks: &[u64]) -> (&'a str, u64) {
+    rows.iter()
+        .zip(ticks)
+        .filter(|(row, _)| **row != "threads")
+        .map(|(row, &n)| (*row, n))
+        .max_by_key(|&(_, n)| n)
+        .unwrap_or(("none", 0))
 }
 
 /// `rows` with their `ticks`, as `<row>=<n> ...`.
@@ -2682,7 +2729,7 @@ fn init_tests(m: &qemu::Machine, icount: bool) -> Result<usize, String> {
         let ticks = ticks_of(&o.lines, "log", &LOG_ROWS)?;
         println!("log ticks on {}: {}", m.name, rows_of(&LOG_ROWS, &ticks));
     }
-    measure::record(m, &o.lines);
+    measure::record_as(m, &o.lines, if icount { measure::ICOUNT } else { "" });
     Ok(r.passed.len())
 }
 
@@ -3599,6 +3646,15 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// B is the longest teardown row, never the count of threads.
+    #[test]
+    fn blocking_time_is_the_longest_row_but_threads() {
+        let ticks = [5, 15, 24, 42, 20, 21, 128];
+        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("stop_senders", 42));
+        let ticks = [5, 15, 24, 42, 20, 21, 50_000];
+        assert_eq!(blocking_time(&TEARDOWN_ROWS, &ticks), ("stop_senders", 42));
     }
 
     /// A child's panic is its place and its message on two whole lines, and

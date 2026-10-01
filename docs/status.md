@@ -103,7 +103,7 @@ Picolibc probes run only on request.
 
 | Command | Checks |
 |---|---|
-| `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`) |
+| `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`); `kernel-test <machine> icount` runs the icount build under `-icount` |
 | `ext4ro` | reads an e2fsprogs ext4 image inside the guest |
 | `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes |
 | `posix-abi` | C programs linked with Rust startup through Cargo and standalone Clang |
