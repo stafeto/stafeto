@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from part 3a of stage 3 (branch `m3k-dma`).
+Numbers below are from `m3k-dma` at 96bb862.
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -169,7 +169,7 @@ Bounded kernel paths and their costs:
 |---|---|---|
 | Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
-| Kernel | DMA memory objects, the Virtio console as a user-space service, process IDs out of the kernel | 🚧 |
+| Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel | 🚧 [#71](https://github.com/stafeto/stafeto/pull/71) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ⬜ |
 | POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | ⬜ |
 | POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | ⬜ |

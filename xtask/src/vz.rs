@@ -18,8 +18,8 @@ use std::time::Duration;
 
 use crate::{
     BOOT_PROFILE, BOOT_TIMEOUT, CRASHING, DIALOG_STEP, PROMPT, RECONNECTED, SHELL_CONNECTED,
-    VZ_PROGRAMS, VZ_WATCH_PROGRAMS, Variant, build, build_boot_image, qemu, root, run_cmd,
-    target_dir,
+    VZ_EARLY_PROGRAMS, VZ_PROGRAMS, VZ_WATCH_PROGRAMS, Variant, build, build_boot_image, qemu,
+    root, run_cmd, target_dir,
 };
 
 /// The line of the Virtio console's driver at its start: device 5 of bus
@@ -150,6 +150,38 @@ pub fn console_restart() -> Result<(), String> {
     println!("console restart on VZ: ok");
     Ok(())
 }
+
+/// `cargo xtask console-early-exit-vz` (spec 2, section 4): the first
+/// instance of the driver ends after it wrote BAR 1, with decoding off, so
+/// BAR 0 reads 0xff and drops writes; init skips the reset through BAR 0
+/// (Write::only_if), clears the command word and starts the driver again,
+/// which comes up, and the shell connects and answers `echo`.
+pub fn console_early_exit() -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let boot = build_boot_image("boot-vz-early.img", &VZ_EARLY_PROGRAMS, BOOT_PROFILE)?;
+    let mut run = qemu::Run::start(command(&kernel.image, &boot)?, qemu::Input::Pipe)?;
+    let result = (|| {
+        let whole = |line: &'static str| move |l: &str| l == line;
+        run.expect_line(DRIVER_LINE, whole(DRIVER_LINE), BOOT_TIMEOUT)?;
+        run.expect_line(SHELL_CONNECTED, whole(SHELL_CONNECTED), DIALOG_STEP)?;
+        run.expect(PROMPT, DIALOG_STEP)?;
+        run.expect_seen(EARLY_END, DIALOG_STEP)?;
+        run.send("echo after the early end")?;
+        run.expect_line(
+            "after the early end",
+            whole("after the early end"),
+            DIALOG_STEP,
+        )?;
+        run.expect(PROMPT, DIALOG_STEP)
+    })();
+    run.stop();
+    stop_hint(result).map_err(|e| format!("early end on VZ: {e}"))?;
+    println!("early end of the console's driver on VZ: ok");
+    Ok(())
+}
+
+/// Init's line of the end of the first instance of `exit-before-decoding`.
+const EARLY_END: &str = "init: uart ended: exit code 8; restarts in 100 ms";
 
 #[cfg(test)]
 mod tests {

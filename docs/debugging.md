@@ -136,7 +136,9 @@ crashes the driver: `init` resets the Virtio device (`device_status`
 0, read back until 0) and clears the function's command word through
 windows of its own before it lets the driver's DMA object go; VZ keeps
 a device's DMA going with bus mastering off, so the reset is what stops
-it. Init's `dma-watch` build then reads the old object for 300 ms while
+it. The reset goes only while the function decodes its BARs: without
+decoding BAR 0 reads 0xff and drops writes, and no queue runs then
+(`cargo xtask console-early-exit-vz` ends a driver there). Init's `dma-watch` build then reads the old object for 300 ms while
 xtask types, and says it stayed unchanged. A stop that does not settle
 leaves the object with init for good and the driver broken. The new
 instance resets the device again before it turns bus mastering on and

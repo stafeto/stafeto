@@ -27,7 +27,7 @@ use bootimg::Program;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use init::table::{MAX_DMA, Record, TABLE};
+use init::table::{Gate, MAX_DMA, Record, TABLE};
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
 use proto_wire::Writer;
@@ -362,7 +362,8 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
         let (object, pa) = sys::mem_create_contiguous(d.size, d.uncached, &resource)?;
         let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
         let copy = sys::handle_duplicate(&object, rights)?;
-        // The checks of the table keep the names within the start data.
+        // The checks of the table keep the names apart from the others of
+        // the start data, and MAX_DMA keeps them within its room.
         let _ = spawned.giver.give(d.name, copy.erase());
         own[8 * i..8 * i + 8].copy_from_slice(&pa.to_le_bytes());
         kept[i] = Some(object);
@@ -420,12 +421,18 @@ fn stop(place: usize, mut gone: Instance) {
 /// makes over the page of the record's window that holds it, mapped at
 /// QUIESCE_WINDOW, and is read back until its settled bits show its value,
 /// so that it
-/// reached the device and the device finished it [G34]. False when a
-/// window does not come or a write does not settle.
+/// reached the device and the device finished it [G34]; a write whose
+/// register of Write::only_if shows none of its bits is skipped. False
+/// when a window does not come or a write does not settle.
 fn quiesce(record: &Record) -> bool {
     let resource = view::<Resource>(RESOURCE);
     let own = view::<Process>(OWN);
     for q in record.quiesce {
+        if let Some(g) = q.only_if
+            && !gate_open(record, g)
+        {
+            continue;
+        }
         let Some(w) = record.windows.iter().find(|w| w.name == q.window) else {
             return false;
         };
@@ -456,6 +463,31 @@ fn quiesce(record: &Record) -> bool {
         }
     }
     true
+}
+
+/// Whether the register of `g` shows one of its bits (Write::only_if),
+/// read through a window of init's own at QUIESCE_WINDOW; a register that
+/// cannot be read counts as open, so the write goes and must settle.
+fn gate_open(record: &Record, g: Gate) -> bool {
+    let Some(w) = record.windows.iter().find(|w| w.name == g.window) else {
+        return true;
+    };
+    let page = g.offset & !(PAGE - 1);
+    let resource = view::<Resource>(RESOURCE);
+    let own = view::<Process>(OWN);
+    let Ok(window) = sys::device_window_create(&resource, w.base + page, PAGE) else {
+        return true;
+    };
+    if sys::mem_map(&own, &window, 0, PAGE, QUIESCE_WINDOW, Access::Read).is_err() {
+        return true;
+    }
+    // SAFETY: the window maps the register's page at QUIESCE_WINDOW as
+    // device memory; the register is a word within it (the checks of the
+    // table).
+    let value = unsafe { mmio::read32(QUIESCE_WINDOW + (g.offset - page) as usize) };
+    // SAFETY: only the worker maps and uses QUIESCE_WINDOW.
+    let _ = unsafe { sys::mem_unmap(&own, QUIESCE_WINDOW, PAGE) };
+    value & g.bits != 0
 }
 
 /// Where the worker maps a DMA object it watches (`watch`).

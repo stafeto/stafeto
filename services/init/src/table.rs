@@ -33,6 +33,9 @@ pub const HANDLE_LIMIT_MAX: u32 = 16_384;
 pub const MIN_QUOTA: u64 = 15 * PAGE;
 /// The DMA objects of a record at most.
 pub const MAX_DMA: usize = 2;
+/// The names init gives in start data besides the DMA objects (worker.rs):
+/// no window, binding or DMA object takes one.
+pub const START_DATA_NAMES: [&str; 3] = ["console", "log", "trace"];
 /// The lines a binding takes: the shared lines of the GIC (spec 9).
 pub const SHARED_LINES: RangeInclusive<u32> = 32..=1019;
 
@@ -91,10 +94,15 @@ pub struct Dma {
 /// over the window `window` of the record, at byte `offset`, aligned to
 /// its width, once an instance ended and before its DMA objects go; init
 /// reads the register back until its bits `settled` show `value`, at most
-/// worker::SETTLE_READS times, and the stop failed otherwise. In their
-/// order the writes stop the device's DMA: for a Virtio PCI function a
-/// reset (`device_status` 0, which reads 0 once done), then its command
-/// word 0 (no decoding, no bus mastering).
+/// worker::SETTLE_READS times, and the stop failed otherwise. A write
+/// with `only_if` goes only while that register shows one of its bits; it
+/// is skipped otherwise. In their order the writes stop the device's DMA:
+/// for a Virtio PCI function a reset (`device_status` 0, which reads 0
+/// once done) only while the function decodes its BARs, then its command
+/// word 0 (no decoding, no bus mastering). A function that does not decode
+/// reads 0xff in BAR 0 and drops the write, and it runs no queue: its
+/// driver sets queues up only once decoding is on, and every stop before
+/// reset the device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Write {
     pub window: &'static str,
@@ -102,6 +110,17 @@ pub struct Write {
     pub bits: u8,
     pub value: u32,
     pub settled: u32,
+    pub only_if: Option<Gate>,
+}
+
+/// A 32-bit register a Write depends on: at word `offset` of the record's
+/// window `window`, read through init's own window; the write goes while
+/// its value has a bit of `bits`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gate {
+    pub window: &'static str,
+    pub offset: u64,
+    pub bits: u32,
 }
 
 /// A record of the table (spec 13.4).
@@ -453,11 +472,17 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
     if count > START_NAMES {
         return Err(TableError::Objects { record, count });
     }
+    // The names of the reply to REGISTER and those of the start data
+    // init gives (START_DATA_NAMES and the DMA objects): each once, so no
+    // handle is given under a name another took.
     let windows = r.windows.iter().map(|w| w.name);
-    let names = windows.clone().chain(r.bindings.iter().map(|b| b.name));
+    let names = windows
+        .clone()
+        .chain(r.bindings.iter().map(|b| b.name))
+        .chain(r.dma.iter().map(|d| d.name));
     for (i, name) in names.clone().enumerate() {
         let once = names.clone().position(|n| n == name) == Some(i);
-        if Name::new(name.as_bytes()).is_err() || !once {
+        if Name::new(name.as_bytes()).is_err() || !once || START_DATA_NAMES.contains(&name) {
             return Err(TableError::ObjectName { record, name });
         }
     }
@@ -510,7 +535,13 @@ fn check_record(r: &Record) -> Result<(), TableError<'static>> {
         let window = r.windows.iter().find(|w| w.name == q.window);
         let bytes = u64::from(q.bits / 8);
         let width = matches!(q.bits, 8 | 32) && (q.bits == 32 || q.value <= 0xFF);
+        let gate = q.only_if.is_none_or(|g| {
+            r.windows
+                .iter()
+                .any(|w| w.name == g.window && g.offset.is_multiple_of(4) && g.offset + 4 <= w.len)
+        });
         let within = width
+            && gate
             && window.is_some_and(|w| q.offset.is_multiple_of(bytes) && q.offset + bytes <= w.len);
         if !within {
             return Err(TableError::Quiesce {
@@ -1192,6 +1223,7 @@ mod tests {
             bits: 32,
             value: 0,
             settled: u32::MAX,
+            only_if: None,
         };
         let driver = |dma: &'static [Dma], trusted| Record {
             windows: &[RTC],
@@ -1201,6 +1233,35 @@ mod tests {
             ..service("driver", 40, 40)
         };
         assert!(check_one(driver(&[DMA], true)).is_ok());
+        let gated = Record {
+            quiesce: &[Write {
+                only_if: Some(Gate {
+                    window: "rtc",
+                    offset: 4,
+                    bits: 2,
+                }),
+                ..STOP
+            }],
+            ..driver(&[DMA], true)
+        };
+        assert!(check_one(gated).is_ok());
+        // A DMA object's name is a name of the start data: none twice, none
+        // a window's or a binding's, and none init gives itself.
+        for name in ["rtc", "log", "console", "trace"] {
+            let d: &'static [Dma] = Box::leak(Box::new([Dma { name, ..DMA }]));
+            assert!(
+                matches!(
+                    check_one(driver(d, true)),
+                    Err(TableError::ObjectName { .. })
+                ),
+                "{name}"
+            );
+        }
+        let twice = driver(&[DMA, DMA], true);
+        assert!(matches!(
+            check_one(twice),
+            Err(TableError::ObjectName { .. })
+        ));
         let byte = Record {
             quiesce: &[Write {
                 offset: 0x15,
@@ -1248,6 +1309,22 @@ mod tests {
             },
             Write {
                 offset: PAGE,
+                ..STOP
+            },
+            Write {
+                only_if: Some(Gate {
+                    window: "regs",
+                    offset: 4,
+                    bits: 2,
+                }),
+                ..STOP
+            },
+            Write {
+                only_if: Some(Gate {
+                    window: "rtc",
+                    offset: 2,
+                    bits: 2,
+                }),
                 ..STOP
             },
         ] {

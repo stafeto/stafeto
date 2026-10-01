@@ -121,6 +121,7 @@ Picolibc probes run only on request.
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
+| `console-early-exit-vz` | the driver ends on Apple VZ before its function decodes its BARs: `init` skips the reset through BAR 0, clears the command word and restarts it |
 | `cprobe` | a static Picolibc C program against the RAM service |
 | `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox `cat`, `ash -c`, an `ash` dialog, `ls` |
 

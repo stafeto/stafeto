@@ -47,7 +47,7 @@ const BOOT_PROGRAMS: [ImageProgram; 3] = [
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
 /// The boot image of Apple VZ: init with its VZ table, the driver of the
-/// Virtio console with CRASH, for the restart probe, and the shell.
+/// Virtio console with CRASH, as the image that ships on QEMU, and the shell.
 const VZ_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["vz"]),
     (
@@ -121,6 +121,18 @@ const VZ_WATCH_PROGRAMS: [ImageProgram; 3] = [
         "virtio-console",
         UART_STACK_SIZE,
         &["crash"],
+    ),
+    ("shell", "shell", SHELL_STACK_SIZE, &[]),
+];
+/// The image of console-early-exit-vz: the first instance of the driver
+/// ends after BAR 1, with decoding off (`exit-before-decoding`).
+const VZ_EARLY_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["vz"]),
+    (
+        "virtio-console",
+        "virtio-console",
+        UART_STACK_SIZE,
+        &["crash", "exit-before-decoding"],
     ),
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
@@ -685,6 +697,8 @@ commands:
   posix-interrupt-vz verify live IPC interruption on the Virtio console on Apple VZ
   console-restart-vz crash the Virtio console's driver on Apple VZ; init stops the
             device and restarts it
+  console-early-exit-vz end the Virtio console's driver before it decodes its BARs;
+            init stops the function and restarts it
   posix-shared verify cross-thread Rust POSIX file and directory state
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
@@ -730,6 +744,7 @@ fn main() {
         Some("posix-interrupt") => posix_interrupt_probe(false),
         Some("posix-interrupt-vz") => posix_interrupt_probe(true),
         Some("console-restart-vz") => vz::console_restart(),
+        Some("console-early-exit-vz") => vz::console_early_exit(),
         Some("busybox") => busybox_probe(),
         Some("ash") => ash_probe(),
         Some("ash-shell") => ash_shell(),
@@ -2013,8 +2028,7 @@ fn crash_uart(run: &mut qemu::Run, decision: &str) -> Result<(), String> {
     let whole = |l: &str| l == RECONNECTED;
     run.expect_line(RECONNECTED, whole, DIALOG_STEP)?;
     run.expect(PROMPT, DIALOG_STEP)?;
-    crash_lines(&run.lines()[from..], decision, UART_LINE)
-        .map_err(|e| format!("crash uart, {decision}: {e}"))
+    crash_lines(&run.lines()[from..], decision).map_err(|e| format!("crash uart, {decision}: {e}"))
 }
 
 /// The lines from `crash uart` to the prompt after it, when the driver
@@ -2025,7 +2039,7 @@ fn crash_uart(run: &mut qemu::Run, decision: &str) -> Result<(), String> {
 /// fault and `decision`, each exactly once, then the new driver's
 /// UART_LINE and the shell's RECONNECTED last, in this order. Other lines
 /// may come between: records of the log the dead instance did not show.
-fn crash_lines(lines: &[String], decision: &str, start: &str) -> Result<(), String> {
+fn crash_lines(lines: &[String], decision: &str) -> Result<(), String> {
     let fault = |l: &str| driver_fault(l);
     let ended = |l: &str| uart_ended(l, decision);
     let once = |what: &str, wanted: &dyn Fn(&str) -> bool| one_line(lines, what, wanted);
@@ -2033,7 +2047,7 @@ fn crash_lines(lines: &[String], decision: &str, start: &str) -> Result<(), Stri
         once("the shell's crashing", &|l| l == CRASHING)?,
         once("the driver's fault", &fault)?,
         once("uart's end", &|l| l.starts_with(UART_ENDED))?,
-        once("the driver's start", &|l| l == start)?,
+        once("the driver's start", &|l| l == UART_LINE)?,
     ];
     if !ended(&lines[steps[2]]) {
         return Err(format!(
@@ -2043,7 +2057,7 @@ fn crash_lines(lines: &[String], decision: &str, start: &str) -> Result<(), Stri
     }
     if !steps.is_sorted() || lines.last().is_none_or(|l| l != RECONNECTED) {
         return Err(format!(
-            "{CRASHING:?}, the fault, uart's end, {start:?} and {RECONNECTED:?} expected in this order: {lines:?}"
+            "{CRASHING:?}, the fault, uart's end, {UART_LINE:?} and {RECONNECTED:?} expected in this order: {lines:?}"
         ));
     }
     Ok(())
@@ -3209,6 +3223,17 @@ fn ci() -> Result<(), String> {
         "-D",
         "warnings",
     ]))?;
+    // Init as it ships, without the feature of the probe of a stop.
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "init",
+        "--target",
+        PROGRAM_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
     run_cmd(cargo().args([
         "clippy",
         "--package",
@@ -3553,14 +3578,14 @@ mod tests {
     #[test]
     fn a_crash_shows_the_fault_and_the_restart_once() {
         let run = crash_run("restarts in 200 ms");
-        assert_eq!(crash_lines(&run, "restarts in 200 ms", UART_LINE), Ok(()));
-        assert!(crash_lines(&run, "restarts in 100 ms", UART_LINE).is_err());
+        assert_eq!(crash_lines(&run, "restarts in 200 ms"), Ok(()));
+        assert!(crash_lines(&run, "restarts in 100 ms").is_err());
         for i in 1..run.len() {
             let mut cut = run.clone();
             cut.remove(i);
             if i != 2 {
                 assert!(
-                    crash_lines(&cut, "restarts in 200 ms", UART_LINE).is_err(),
+                    crash_lines(&cut, "restarts in 200 ms").is_err(),
                     "without {i}"
                 );
             }
@@ -3568,23 +3593,23 @@ mod tests {
             twice.insert(i, run[i].clone());
             if i != 2 && i != run.len() - 1 {
                 assert!(
-                    crash_lines(&twice, "restarts in 200 ms", UART_LINE).is_err(),
+                    crash_lines(&twice, "restarts in 200 ms").is_err(),
                     "{i} twice"
                 );
             }
         }
         let mut swapped = run.clone();
         swapped.swap(3, 4);
-        assert!(crash_lines(&swapped, "restarts in 200 ms", UART_LINE).is_err());
+        assert!(crash_lines(&swapped, "restarts in 200 ms").is_err());
         let mut late = run.clone();
         late.swap(5, 6);
-        assert!(crash_lines(&late, "restarts in 200 ms", UART_LINE).is_err());
+        assert!(crash_lines(&late, "restarts in 200 ms").is_err());
         let mut exited = run.clone();
         exited[4] = "init: uart ended: exit code 5; restarts in 200 ms".into();
-        assert!(crash_lines(&exited, "restarts in 200 ms", UART_LINE).is_err());
+        assert!(crash_lines(&exited, "restarts in 200 ms").is_err());
         let mut elsewhere = run.clone();
         elsewhere[3] = elsewhere[3].replace("FAR=0x0", "FAR=0x8");
-        assert!(crash_lines(&elsewhere, "restarts in 200 ms", UART_LINE).is_err());
+        assert!(crash_lines(&elsewhere, "restarts in 200 ms").is_err());
     }
 
     /// Spec 13.4, 16.3: the fifth crash passes with the shell's lines, then

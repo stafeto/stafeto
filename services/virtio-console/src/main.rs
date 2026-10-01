@@ -89,6 +89,10 @@ const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
 const NO_DEVICE: u64 = 6;
 const NO_CONSOLE: u64 = 7;
+/// The end of the first instance of the probe build `exit-before-decoding`
+/// (console-early-exit-vz): after BAR 1, before decoding is on.
+#[cfg(feature = "exit-before-decoding")]
+const EXITED_BEFORE_DECODING: u64 = 8;
 
 /// The heap of the device's crate: its queues' bookkeeping and the
 /// console's input buffer, made once; nothing goes back.
@@ -369,8 +373,17 @@ fn main(_: u64) -> u64 {
     // and 0 again after init stopped the function of an instance that
     // ended (Record::quiesce); the line below shows it.
     let found = config_read(pci::COMMAND) & 0xFFFF;
+    // The probe build ends the first instance, whose BAR 1 has not its
+    // value yet, between the writes, with decoding off: init must stop the
+    // function and start the driver again (Write::only_if).
+    #[cfg(feature = "exit-before-decoding")]
+    let first = config_read(pci::BAR1) != (pci::BAR_BASE >> 32) as u32;
     for (offset, value) in pci::set_up(found) {
         config_write(offset, value);
+        #[cfg(feature = "exit-before-decoding")]
+        if first && offset == pci::BAR1 {
+            return EXITED_BEFORE_DECODING;
+        }
     }
     let mut root = PciRoot::new(Function);
     let at = DeviceFunction {

@@ -21,6 +21,9 @@ bench = false
 # xtask builds the VZ boot image with it, for the restart probe.
 [features]
 crash = []
+# The probe of a stop before decoding (console-early-exit-vz): the first
+# instance ends after BAR 1, with decoding off.
+exit-before-decoding = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

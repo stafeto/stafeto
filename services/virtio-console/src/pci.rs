@@ -50,14 +50,6 @@ pub fn bus_master(command: u32) -> u32 {
     (command & 0xFFFF) | MEMORY | BUS_MASTER
 }
 
-/// `device_status` of the Virtio common configuration, which VZ puts at
-/// the start of BAR 0 (the function's first Virtio capability): 0 resets
-/// the device, which reads 0 once the reset is done (Virtio 1.2, 2.4.1).
-/// Init writes it through its own window when the driver ends, before the
-/// command word, since VZ does not stop a device's DMA when bus mastering
-/// goes off.
-pub const DEVICE_STATUS: u64 = 0x14;
-
 #[cfg(test)]
 mod tests {
     use super::*;

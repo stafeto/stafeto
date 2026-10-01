@@ -43,7 +43,9 @@ use proto_init::{
     START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
-use rt::handle::{Channel, Memory, Outgoing, Process, Resource, Timer};
+#[cfg(feature = "dma-watch")]
+use rt::handle::Memory;
+use rt::handle::{Channel, Outgoing, Process, Resource, Timer};
 use rt::loader::Spawned;
 use rt::service::{Answer, Notice, Pending, Request, Service, Session};
 use rt::{Handle, println, sys, time};

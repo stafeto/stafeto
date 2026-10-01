@@ -17,7 +17,7 @@
 //! trusted, and init resets the device and clears its command word before
 //! the DMA object of an instance that ended goes.
 
-use super::{Binding, Dma, Kind, Record, Restart, Window, Write};
+use super::{Binding, Dma, Gate, Kind, Record, Restart, Window, Write};
 use crate::PAGE;
 use crate::watch::Watch;
 
@@ -29,8 +29,14 @@ const FUNCTION: u64 = 0x4000_0000 + (DEVICE << 15);
 /// INTA of the device through `interrupt-map`.
 const LINE: u32 = 64 + DEVICE as u32;
 /// BAR 0, at the start of the host bridge's 64-bit window (`ranges`),
-/// where the driver puts it (virtio_console::pci).
+/// where the driver puts it (virtio_console::pci::BAR_BASE).
 const BAR: u64 = 0x1_0000_0000;
+/// `device_status` of the Virtio common configuration, which VZ puts at
+/// the start of BAR 0 (the function's first Virtio capability).
+const DEVICE_STATUS: u64 = 0x14;
+/// The command word of the function and its bit of memory decoding.
+const COMMAND: u64 = 4;
+const MEMORY: u32 = 1 << 1;
 
 /// The driver of the console (services/virtio-console).
 pub const CONSOLE: Record = Record {
@@ -72,25 +78,32 @@ pub const CONSOLE: Record = Record {
         size: 16 * PAGE,
         uncached: true,
     }],
-    // A Virtio reset through `device_status` (the common configuration
-    // at the start of BAR 0), which reads 0 once done, then the command
-    // byte 0: VZ keeps a device's DMA going with bus mastering off alone.
+    // A Virtio reset through `device_status`, which reads 0 once done,
+    // while the function decodes its BARs (Write::only_if), then the
+    // command word 0: VZ keeps a device's DMA going with bus mastering off
+    // alone.
     quiesce: &[
         Write {
             window: "bar",
-            offset: 0x14,
+            offset: DEVICE_STATUS,
             bits: 8,
             value: 0,
             settled: 0xFF,
+            only_if: Some(Gate {
+                window: "ecam",
+                offset: COMMAND,
+                bits: MEMORY,
+            }),
         },
         // The command word; its status half reads back what it holds. VZ
         // stops the machine at a byte write to the configuration space.
         Write {
             window: "ecam",
-            offset: 4,
+            offset: COMMAND,
             bits: 32,
             value: 0,
             settled: 0xFFFF,
+            only_if: None,
         },
     ],
     trusted: true,
