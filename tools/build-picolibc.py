@@ -17,7 +17,12 @@ SOURCE = WORK / "source"
 BUILD = WORK / "build"
 DEST = WORK / "root"
 STAMP = WORK / "config"
-CONFIG = f"{VERSION} {COMMIT} aarch64-none-elf no-tls posix-console heap=1048576 integer\n"
+# Cortex-A53 erratum 835769 (the PinePhone's A64): a nop between a memory
+# access and a 64-bit multiply-accumulate. libc.a goes into Rust programs,
+# whose aarch64-unknown-none link passes --fix-cortex-a53-843419.
+A53_ERRATA = "-mfix-cortex-a53-835769"
+CONFIG = (f"{VERSION} {COMMIT} aarch64-none-elf no-tls posix-console heap=1048576 integer"
+          f" {A53_ERRATA}\n")
 
 
 def run(*args: str, cwd: Path | None = None) -> None:
@@ -53,8 +58,10 @@ def main() -> None:
     cross = WORK / "aarch64-none-elf.txt"
     cross.write_text(
         "[binaries]\n"
-        f"c = [{str(clang)!r}, '--target=aarch64-none-elf', '-nostdlib', '-fuse-ld={linker}']\n"
-        f"cpp = [{str(clang)!r}, '--target=aarch64-none-elf', '-nostdlib', '-fuse-ld={linker}']\n"
+        f"c = [{str(clang)!r}, '--target=aarch64-none-elf', '{A53_ERRATA}', '-nostdlib',"
+        f" '-fuse-ld={linker}']\n"
+        f"cpp = [{str(clang)!r}, '--target=aarch64-none-elf', '{A53_ERRATA}', '-nostdlib',"
+        f" '-fuse-ld={linker}']\n"
         f"ar = {str(llvm_dir / 'llvm-ar')!r}\n"
         f"nm = {str(llvm_dir / 'llvm-nm')!r}\n"
         f"strip = {str(llvm_dir / 'llvm-strip')!r}\n"

@@ -52,6 +52,8 @@ def compile_probe(destination: Path) -> Path:
                     "-ffreestanding", "-fno-builtin", "-nostdinc", "-nostdlib",
                     "-fno-stack-protector", "-fno-pic", "-std=c11", "-Wall", "-Wextra", "-Werror",
                     "-O2", "-I", str(destination / "include"),
+                    # Cortex-A53 errata 835769 and 843419 (the PinePhone's A64).
+                    "-mfix-cortex-a53-835769", "-Wl,--fix-cortex-a53-843419",
                     "-Wl,--gc-sections", "-Wl,-z,max-page-size=4096",
                     "-Wl,-z,separate-loadable-segments", "-Wl,-z,norelro",
                     str(ROOT / "tests/posix-abi/probe.c"), str(destination / "lib/libc.a"),

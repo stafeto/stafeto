@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Direct memory-helper calls in the shipping kernel's hot paths.
+//! Checks on the disassembly of built ELF files: direct memory-helper
+//! calls in the shipping kernel's hot paths, and the instruction pairs of
+//! Cortex-A53 erratum 835769.
 
 use std::path::Path;
 use std::process::Command;
@@ -56,22 +58,122 @@ fn check(text: &str) -> Result<(), String> {
 }
 
 pub fn shipping(elf: &Path, objdump: &Path) -> Result<(), String> {
+    check(&disassemble(elf, objdump)?)?;
+    println!("shipping hot paths call no memcpy or memset");
+    Ok(())
+}
+
+fn disassemble(elf: &Path, objdump: &Path) -> Result<String, String> {
     let output = Command::new(objdump)
         .args(["--disassemble", "--demangle", "--no-show-raw-insn"])
         .arg(elf)
         .output()
         .map_err(|e| format!("{}: {e}", objdump.display()))?;
     if !output.status.success() {
-        return Err(format!("{} failed: {}", objdump.display(), output.status));
+        return Err(format!(
+            "{} failed on {}: {}",
+            objdump.display(),
+            elf.display(),
+            output.status
+        ));
     }
-    check(&String::from_utf8(output.stdout).map_err(|e| e.to_string())?)?;
-    println!("shipping hot paths call no memcpy or memset");
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
+/// The mnemonic and the operands of an instruction line of
+/// `llvm-objdump --no-show-raw-insn` ("addr:  \tmnemonic\toperands").
+fn instruction(line: &str) -> Option<(&str, &str)> {
+    let (address, rest) = line.split_once('\t')?;
+    if !address.trim_end().ends_with(':') {
+        return None;
+    }
+    Some(rest.split_once('\t').unwrap_or((rest, "")))
+}
+
+/// A load, a store or a prefetch: the first instruction of an erratum
+/// 835769 pair (LLVM AArch64A53Fix835769, `mayLoadOrStore` and PRFM).
+fn memory_access(mnemonic: &str) -> bool {
+    ["ld", "st", "prfm", "prfum", "cas", "swp"]
+        .iter()
+        .any(|p| mnemonic.starts_with(p))
+}
+
+/// A 64-bit integer multiply-accumulate: the second instruction of an
+/// erratum 835769 pair. The plain multiplies (Ra = XZR) disassemble as
+/// their aliases mul, mneg, smull, smnegl, umull and umnegl, which the
+/// erratum spares.
+fn multiply_accumulate(mnemonic: &str, operands: &str) -> bool {
+    match mnemonic {
+        "madd" | "msub" => operands.starts_with('x'),
+        "smaddl" | "smsubl" | "umaddl" | "umsubl" => true,
+        _ => false,
+    }
+}
+
+/// The erratum 835769 pairs of the disassembly `text`: a memory access
+/// followed at once by a 64-bit multiply-accumulate, which a Cortex-A53
+/// (the PinePhone's A64) may compute wrongly. Each pair as "symbol: line".
+fn pairs_835769(text: &str) -> Vec<String> {
+    let mut symbol = "";
+    let mut after_access = false;
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        if let Some((_, name)) = line.split_once(" <")
+            && let Some(name) = name.strip_suffix(">:")
+        {
+            symbol = name;
+            continue;
+        }
+        let Some((mnemonic, operands)) = instruction(line) else {
+            continue;
+        };
+        if after_access && multiply_accumulate(mnemonic, operands) {
+            pairs.push(format!("{symbol}: {}", line.trim()));
+        }
+        after_access = memory_access(mnemonic);
+    }
+    pairs
+}
+
+/// Fails when `elf` holds an erratum 835769 pair: the builds pass
+/// `+fix-cortex-a53-835769` (Rust) and `-mfix-cortex-a53-835769` (C), and
+/// this catches a toolchain or a build that drops it. Every kernel build
+/// and every program of a boot image goes through it, whichever command
+/// made them.
+pub fn erratum_835769(elf: &Path, objdump: &Path) -> Result<(), String> {
+    let found = pairs_835769(&disassemble(elf, objdump)?);
+    if !found.is_empty() {
+        return Err(format!(
+            "{}: {} erratum 835769 pairs (memory access, then a 64-bit multiply-accumulate):\n{}",
+            elf.display(),
+            found.len(),
+            found.join("\n")
+        ));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_an_access_followed_by_a_64_bit_multiply_accumulate() {
+        let text = "0 <f>:\n4:      \tldr\tx1, [x0]\n8:      \tmadd\tx2, x3, x4, x5\n\
+            c:      \tstp\tx1, x2, [sp]\n10:     \tumaddl\tx9, w11, w12, x9\n\
+            14:     \tprfm\tpldl1keep, [x0]\n18:     \tmsub\tx1, x2, x3, x4\n";
+        assert_eq!(pairs_835769(text).len(), 3);
+        assert!(pairs_835769(text)[0].starts_with("f: 8:"));
+    }
+
+    #[test]
+    fn spares_32_bit_plain_multiplies_and_separated_pairs() {
+        let text = "0 <f>:\n4:      \tldr\tw1, [x0]\n8:      \tmadd\tw2, w3, w4, w5\n\
+            c:      \tldr\tx1, [x0]\n10:     \tmul\tx2, x3, x4\n\
+            14:     \tldr\tx1, [x0]\n18:     \tnop\n1c:     \tmadd\tx2, x3, x4, x5\n\
+            20:     \tadd\tx1, x1, #1\n24:     \tsmaddl\tx2, w3, w4, x5\n";
+        assert!(pairs_835769(text).is_empty());
+    }
 
     #[test]
     fn catches_a_call_in_the_register_delivery_prefix() {

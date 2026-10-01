@@ -814,6 +814,7 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     let built = cargo_output(&target, KERNEL_TARGET, Profile::Release, "kernel");
     std::fs::copy(&built, &elf)
         .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
+    disasm::erratum_835769(&elf, &llvm_tool("llvm-objdump")?)?;
     run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
             .args(["-O", "binary"])
@@ -897,12 +898,14 @@ fn write_boot_image(
 
 fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathBuf, String> {
     let target = target_dir();
+    let objdump = llvm_tool("llvm-objdump")?;
     let mut files = Vec::new();
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
         let bytes = std::fs::read(elf).map_err(|e| why(e.to_string()))?;
         let program = bootimg::elf::program(&bytes, *stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
+        disasm::erratum_835769(elf, &objdump)?;
         files.push((*file, written, elf.clone()));
     }
     let list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();

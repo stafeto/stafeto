@@ -20,7 +20,11 @@ ARCHIVE = WORK / f"busybox-{VERSION}.tar.bz2"
 COMPAT = ROOT / "tools" / "busybox" / "compat"
 LOG = WORK / "build.log"
 STAMP = WORK / "config"
-PATCH = "echo cat ash ls-nofork picolibc-v12"
+# Cortex-A53 erratum 835769 (the PinePhone's A64): a nop between a memory
+# access and a 64-bit multiply-accumulate. The objects go into a Rust
+# program, whose aarch64-unknown-none link passes --fix-cortex-a53-843419.
+A53_ERRATA = "-mfix-cortex-a53-835769"
+PATCH = "echo cat ash ls-nofork picolibc-v12 a53-835769"
 OBJECTS = (
     "appletlib.o", "xfuncs_printf.o", "xfuncs.o", "full_write.o",
     "process_escape_sequence.o", "ptr_to_globals.o", "messages.o",
@@ -139,7 +143,7 @@ def main() -> None:
         f"AR={ar}", "HOSTCC=cc",
         "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-none-elf", f"-I{COMPAT}",
             f"-I{include}", "-ffreestanding", "-fno-stack-protector",
-            "-ffunction-sections", "-fdata-sections")), cwd=SOURCE)
+            "-ffunction-sections", "-fdata-sections", A53_ERRATA)), cwd=SOURCE)
     for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
                     SOURCE / "shell/lib.a"]:
         if not archive.exists():
