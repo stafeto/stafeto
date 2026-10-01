@@ -628,15 +628,25 @@ pub unsafe fn exit(t: NonNull<Thread>) {
     // SAFETY: the thread never runs at EL0 again, and the caller hands it
     // over; its reference keeps the process.
     unsafe {
+        // A thread with an exit source keeps a reference of its own over
+        // the post: the kernel's goes with sched::exit, and when no handle
+        // is left the post would hold a thread nothing refers to.
+        let heard = (*t.as_ptr()).exit.is_some();
+        if heard {
+            retain(t);
+        }
         drop_buffer(t, cause);
         sched::exit(t, cause);
         process::remove_thread(p, t);
         let ended = process::thread_exited(p, cause);
-        // The thread is alive until its portion, which comes after this
-        // call; a queued slot holds it from now on. PEER_CLOSED: nothing is
-        // posted (spec 6.5).
+        // PEER_CLOSED: nothing is posted (spec 6.5). A queued slot holds the
+        // thread from now on.
         if !ended && let Some(source) = (*t.as_ptr()).exit.as_mut() {
             let _ = Source::post(NonNull::from(source), EXIT_BITS, cause);
+        }
+        if heard {
+            // The last reference queues the thread, which ended, for cleanup.
+            release(t, cause);
         }
     }
 }

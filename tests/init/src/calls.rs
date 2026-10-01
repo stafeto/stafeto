@@ -13,7 +13,7 @@ use crate::messages::{mark_at_notice, take_token};
 use crate::processes::{Kid, LEAF_QUOTA, caller_ceiling, kid_mark, reset_kid_marks};
 
 /// The tests of this module, in the order they run.
-pub(crate) const TESTS: [Test; 35] = [
+pub(crate) const TESTS: [Test; 37] = [
     ("init_starts_fifo_at_63", init_starts_fifo_at_63),
     ("init_prints_from_el0", init_prints_from_el0),
     (
@@ -45,6 +45,11 @@ pub(crate) const TESTS: [Test; 35] = [
     ),
     ("thread_states", thread_states),
     ("thread_end_is_heard_once", thread_end_is_heard_once),
+    ("unheld_thread_end_is_heard", unheld_thread_end_is_heard),
+    (
+        "failed_thread_create_gives_its_slot_back",
+        failed_thread_create_gives_its_slot_back,
+    ),
     (
         "threads_of_an_ended_process_are_not_heard",
         threads_of_an_ended_process_are_not_heard,
@@ -707,6 +712,108 @@ fn thread_end_is_heard_once() -> Outcome {
     check(
         rest == Err(Error::WouldBlock) && after_end == Ok(before + 1) && gone == Ok(before),
         "more than one notification came, or the slot stayed after the thread went",
+    )
+}
+
+/// A thread with an exit channel whose handle went before it ended (spec
+/// 6.5): its end still comes, once, though nothing but the kernel held the
+/// thread when it ended, and the slot goes back with the thread once the
+/// notification was taken.
+fn unheld_thread_end_is_heard() -> Outcome {
+    reset_marks();
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let ender = thread_heard(1, add_mark, 0, LOW, (&name, NOTICE))?;
+    let started = sys::thread_start(&ender);
+    close(ender)?;
+    let_run()?;
+    let heard = take_one(&c);
+    let after = sources();
+    close(name)?;
+    close(c)?;
+    check(
+        started.is_ok() && mark(0) == 1,
+        "the thread with an exit channel did not run",
+    )?;
+    check(
+        heard.as_ref().ok() == Some(&exit_notice(CHILD)),
+        "the end of a thread whose handle went was not heard once",
+    )?;
+    check(
+        after == before,
+        "the slot of a thread whose end was taken stayed",
+    )
+}
+
+/// The labelled copies that fill a channel's slots in
+/// `failed_thread_create_gives_its_slot_back`, raw.
+static FILLERS: [AtomicU64; abi::MAX_SLOTS as usize] =
+    [const { AtomicU64::new(0) }; abi::MAX_SLOTS as usize];
+
+/// thread_create with x7 takes a slot of the channel after the limits of
+/// threads and before the quota (spec 6.5, 11): a channel with no slot left
+/// fails with LIMIT_REACHED, and a target whose quota falls short for its
+/// pool of threads fails with NO_MEMORY and gives the slot back.
+fn failed_thread_create_gives_its_slot_back() -> Outcome {
+    let c = channel(QUIET)?;
+    let name = session(&c, Rights::NOTIFY, CHILD, QUIET)?;
+    let sources = || sys::channel_info(&c).map(|i| i.sources);
+    let before = sources();
+    let poor =
+        sys::process_create(2 * PAGE as u64, 16, LOW).map_err(|_| "process_create failed")?;
+    let make = |p: &Handle<Process>, buffer: u64| {
+        let mut x = [0; 10];
+        x[..9].copy_from_slice(&[
+            p.raw().0,
+            CHILD_ENTRY,
+            0,
+            0,
+            LOW.into(),
+            Policy::Fifo as u64,
+            buffer,
+            name.raw().0,
+            QUIET.into(),
+        ]);
+        // SAFETY: the thread would run in another process; it never starts.
+        unsafe { sys::raw::<{ Call::ThreadCreate.number() }>(x) }
+    };
+    let short = make(&poor, CHILD_BUFFER);
+    let after_short = sources();
+    let mut filled = 0;
+    for slot in &FILLERS {
+        match sys::handle_label(&c, Rights::NOTIFY, CHILD + 1 + filled as u64, QUIET) {
+            Ok(h) => {
+                slot.store(h.into_raw().0, Relaxed);
+                filled += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    let kid = child(LOW)?;
+    let full = make(&kid, CHILD_BUFFER);
+    for slot in &FILLERS {
+        let raw = slot.swap(0, Relaxed);
+        if raw != 0 {
+            close(Handle::<Channel>::from_raw(abi::Handle(raw)))?;
+        }
+    }
+    // Each closed copy posted CLIENT_GONE, and its queued slot holds its
+    // session until receive takes it.
+    while sys::try_receive(&c).is_ok() {}
+    let after = sources();
+    close(kid)?;
+    close(poor)?;
+    close(name)?;
+    close(c)?;
+    check(
+        short[0] == Error::NoMemory.code() && after_short == before,
+        "a thread whose quota fell short kept its slot of the exit channel",
+    )?;
+    check(
+        filled > 0 && full[0] == Error::LimitReached.code() && after == before,
+        "a full exit channel did not fail with LIMIT_REACHED, or a slot stayed",
     )
 }
 
