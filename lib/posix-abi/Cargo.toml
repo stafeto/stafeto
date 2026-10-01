@@ -12,6 +12,8 @@ test = false
 bench = false
 
 [features]
+# threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).
+rtbench = []
 transport-probe = ["posix-clock/transport-probe", "process-client/transport-probe"]
 
 [dependencies]

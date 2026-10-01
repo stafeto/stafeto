@@ -158,3 +158,18 @@ pub const RTBENCH_TABLE: &[Record] = &[
         ..super::normal::TABLE[1]
     },
 ];
+
+/// rtbench 2 on VZ: the image of `ramfs::RTBENCH_POSIX_TABLE` with the
+/// Virtio console's driver for the console.
+pub const RTBENCH_POSIX_TABLE: &[Record] = &[
+    Record {
+        name: "console",
+        ..CONSOLE
+    },
+    super::ramfs::TABLE[0],
+    super::ramfs::POSIX_ABI_TABLE[1],
+    super::ramfs::POSIX_ABI_TABLE[2],
+    super::ramfs::LONG,
+    super::ramfs::LOAD,
+    super::ramfs::RTBENCH,
+];

@@ -41,6 +41,9 @@ const JOIN_ACK: u64 = 4;
 const DETACH: u64 = 5;
 const CANCEL: u64 = 7;
 const JOIN_ABANDON: u64 = 8;
+/// The caller's own level (`set_level`).
+#[cfg(feature = "rtbench")]
+const LEVEL: u64 = 30;
 const REPLY_ACK: u64 = 28;
 const ATTR_MAGIC: u64 = 0x5054_4852_4154_5431;
 
@@ -739,6 +742,18 @@ impl Registry {
                 }
                 Ok(0)
             }
+            #[cfg(feature = "rtbench")]
+            LEVEL => {
+                let level = u8::try_from(words[3]).map_err(|_| EINVAL)?;
+                // Strictly below the ceiling, where the owner and the
+                // workers run: no application thread ties with them.
+                if level == 0 || level >= crate::ceiling().map_err(|_| EIO)? {
+                    return Err(EINVAL);
+                }
+                let native = self.entry(caller).native.as_ref().ok_or(ESRCH)?;
+                sys::thread_set_priority(native, level, Policy::Fifo).map_err(|_| EINVAL)?;
+                Ok(0)
+            }
             DETACH => {
                 let target = self.find(words[3])?;
                 let entry = self.entry_mut(target);
@@ -1160,6 +1175,15 @@ fn acknowledge(caller: u64, nonce: u64, abandon: bool) -> Result<(), i32> {
             _ => return Err(EIO),
         }
     }
+}
+
+/// Moves the calling managed thread to kernel level `level` under FIFO
+/// (1 to one below the process's ceiling; EINVAL otherwise). A Rust call
+/// for the measurements of rtbench 2 (feature `rtbench`) until the
+/// scheduling attributes of POSIX come (spec 2, 3.5).
+#[cfg(feature = "rtbench")]
+pub fn set_level(level: u8) -> Result<(), i32> {
+    request(LEVEL, [u64::from(level), 0, 0, 0, 0]).map(drop)
 }
 
 #[unsafe(no_mangle)]

@@ -9,6 +9,7 @@ mod measure;
 mod qemu;
 mod ring;
 mod rtbench;
+mod rtbench2;
 mod symbolize;
 mod vz;
 
@@ -59,6 +60,41 @@ const VZ_PROGRAMS: [ImageProgram; 3] = [
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
+/// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
+/// process and clock services, the service of long operations (`svc`,
+/// role `l`, under the name `uart`), the load, and the PL011's driver for
+/// the console.
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
+    ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+];
+/// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
+    ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
@@ -695,7 +731,9 @@ commands:
             under HVF on a Mac with Apple silicon, on Apple's GICv3 and
             QEMU's GICv2; skips elsewhere
   vz        boot the shell through Apple Virtualization.framework
-  rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
+  rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
+            with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ;
+            with --short, one round of them on TCG, as ci runs it
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
@@ -741,7 +779,16 @@ fn main() {
         Some("ci") => ci(),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
-        Some("rtbench") => rtbench::run(&args[1..]),
+        Some("rtbench") => match &args[1..] {
+            [flag, minutes] if flag == "--minutes" => minutes
+                .parse::<u64>()
+                .ok()
+                .filter(|&minutes| (1..=600).contains(&minutes))
+                .ok_or_else(|| "rtbench --minutes expects 1..=600".to_owned())
+                .and_then(rtbench2::run),
+            [flag] if flag == "--short" => rtbench2::short(),
+            rest => rtbench::run(rest),
+        },
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
@@ -970,7 +1017,19 @@ fn write_boot_image(
     programs: &[ImageProgram],
     profile: Profile,
 ) -> Result<PathBuf, String> {
+    write_boot_image_with(name, programs, profile, &[])
+}
+
+/// `write_boot_image` with the variables `env` set for the build of the
+/// programs (rtbench 2 takes the length of its run so).
+fn write_boot_image_with(
+    name: &str,
+    programs: &[ImageProgram],
+    profile: Profile,
+    env: &[(&str, &str)],
+) -> Result<PathBuf, String> {
     let mut cmd = cargo();
+    cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
     cmd.args(["--target", PROGRAM_TARGET]);
     for (_, package, _, features) in programs {
@@ -1679,6 +1738,7 @@ fn test() -> Result<(), String> {
     ext4ro_probe()?;
     ramfs_probe()?;
     posix_abi_probe()?;
+    rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
@@ -3256,7 +3316,7 @@ fn ci() -> Result<(), String> {
         "--package",
         "virtio-console",
         "--features",
-        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/transport-probe",
+        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/transport-probe,posix-abi/rtbench",
         "--package",
         "test-init",
         "--package",
@@ -3269,6 +3329,10 @@ fn ci() -> Result<(), String> {
         "test-svc",
         "--package",
         "rtbench",
+        "--package",
+        "rtbench-posix",
+        "--package",
+        "rtbench-load",
         "--target",
         PROGRAM_TARGET,
         "--",

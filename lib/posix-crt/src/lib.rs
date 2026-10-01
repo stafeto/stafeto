@@ -40,7 +40,11 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
         rt::println!("POSIX startup: clock connection failed");
         return 125;
     }
-    let Ok(files) = PosixFs::connect(&start.parent) else {
+    #[cfg(feature = "uart-input")]
+    let files = PosixFs::connect_with_uart(&start.parent);
+    #[cfg(not(feature = "uart-input"))]
+    let files = PosixFs::connect(&start.parent);
+    let Ok(files) = files else {
         rt::println!("POSIX startup: file connection failed");
         return 125;
     };

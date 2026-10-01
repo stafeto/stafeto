@@ -32,6 +32,74 @@ use core::arch::asm;
 /// x0-x9 as a call takes and leaves them.
 pub type Regs = [u64; 10];
 
+/// The kernel calls this process made through `trap`, the one place of
+/// `svc` that returns (feature `count-calls`, which only the images of
+/// measurements and tests turn on). The entry trampoline of `upcall` and
+/// the calls that do not return (`thread_exit`, `process_exit`) are not
+/// counted.
+#[cfg(feature = "count-calls")]
+static CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The calls counted so far in this process (`CALLS`).
+#[cfg(feature = "count-calls")]
+pub fn calls() -> u64 {
+    CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `svc #N`, the one place of a returning call: x0-x9 in and out, and
+/// x10, x11 out (`receive`, OUT11) or only changed (every other call).
+///
+/// # Safety
+/// As for `raw`.
+#[inline(always)]
+unsafe fn trap<const N: u16, const OUT11: bool>(x: &mut [u64; 12]) {
+    #[cfg(feature = "count-calls")]
+    CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if OUT11 {
+        // SAFETY: the caller's promise; the kernel changes x0-x11 only.
+        unsafe {
+            asm!(
+                "svc #{n}",
+                n = const N,
+                inout("x0") x[0],
+                inout("x1") x[1],
+                inout("x2") x[2],
+                inout("x3") x[3],
+                inout("x4") x[4],
+                inout("x5") x[5],
+                inout("x6") x[6],
+                inout("x7") x[7],
+                inout("x8") x[8],
+                inout("x9") x[9],
+                lateout("x10") x[10],
+                lateout("x11") x[11],
+                options(nostack),
+            )
+        };
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            asm!(
+                "svc #{n}",
+                n = const N,
+                inout("x0") x[0],
+                inout("x1") x[1],
+                inout("x2") x[2],
+                inout("x3") x[3],
+                inout("x4") x[4],
+                inout("x5") x[5],
+                inout("x6") x[6],
+                inout("x7") x[7],
+                inout("x8") x[8],
+                inout("x9") x[9],
+                lateout("x10") _,
+                lateout("x11") _,
+                options(nostack),
+            )
+        };
+    }
+}
+
 /// System call `N` with `x` in x0-x9; returns x0-x9 as the kernel left
 /// them. x10 and x11 count as changed, which `receive` does when it takes
 /// something (spec 11). No number is refused here: the kernel fails an
@@ -44,28 +112,11 @@ pub type Regs = [u64; 10];
 /// stack. The caller answers for what the call does.
 #[inline(always)]
 pub unsafe fn raw<const N: u16>(x: Regs) -> Regs {
-    let mut x = x;
-    // SAFETY: the caller's promise; the kernel changes x0-x9 only.
-    unsafe {
-        asm!(
-            "svc #{n}",
-            n = const N,
-            inout("x0") x[0],
-            inout("x1") x[1],
-            inout("x2") x[2],
-            inout("x3") x[3],
-            inout("x4") x[4],
-            inout("x5") x[5],
-            inout("x6") x[6],
-            inout("x7") x[7],
-            inout("x8") x[8],
-            inout("x9") x[9],
-            lateout("x10") _,
-            lateout("x11") _,
-            options(nostack),
-        )
-    };
-    x
+    let mut all = [0; 12];
+    all[..10].copy_from_slice(&x);
+    // SAFETY: the caller's promise.
+    unsafe { trap::<N, false>(&mut all) };
+    all[..10].try_into().expect("x0-x9")
 }
 
 /// Call `N` with `args` in x0 and up and zero in the rest: x0-x9 on
@@ -911,25 +962,7 @@ fn receive_with(channel: &Handle<Channel>, flags: u64) -> Result<Received, Error
     x[0] = channel.raw().0;
     x[1] = flags;
     // SAFETY: receive uses no memory of the program; it writes x0-x11 only.
-    unsafe {
-        asm!(
-            "svc #{n}",
-            n = const Call::Receive.number(),
-            inout("x0") x[0],
-            inout("x1") x[1],
-            inout("x2") x[2],
-            inout("x3") x[3],
-            inout("x4") x[4],
-            inout("x5") x[5],
-            inout("x6") x[6],
-            inout("x7") x[7],
-            inout("x8") x[8],
-            inout("x9") x[9],
-            inout("x10") x[10],
-            inout("x11") x[11],
-            options(nostack),
-        )
-    };
+    unsafe { trap::<{ Call::Receive.number() }, true>(&mut x) };
     if let Some(e) = Error::from_code(x[0]) {
         return Err(strict::<{ Call::Receive.number() }>(e));
     }

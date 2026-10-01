@@ -450,6 +450,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtbench-load"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "rtbench-posix"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "posix-abi",
+ "posix-crt",
+ "proto-uart",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "safe-mmio"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,6 +541,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "proto-init",
+ "proto-uart",
  "proto-wire",
  "rt",
 ]

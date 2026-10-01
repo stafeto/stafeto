@@ -134,3 +134,58 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         ..POSIX
     },
 ];
+
+/// The service of long operations of rtbench 2 (tests/svc, role `l`)
+/// under the name of the console's driver: standard input of the
+/// benchmark reads from it. Above the benchmark's ceiling, as a service.
+pub const LONG: Record = Record {
+    name: "uart",
+    program: "svc",
+    quota: 16 * PAGE,
+    handle_limit: 16,
+    restart: Restart::Never,
+    args: b"l",
+    ..TABLE[0]
+};
+
+/// The hostile load of rtbench 2 (tests/rtbench-load): a service whose
+/// worker at level 5 makes and kills processes of 128 threads and large
+/// memory objects; the benchmark asks it for its rounds at its end.
+pub const LOAD: Record = Record {
+    name: "rtbench-load",
+    program: "rtbench-load",
+    quota: 2048 * PAGE,
+    handle_limit: 32,
+    restart: Restart::Never,
+    connects: &[],
+    ..TABLE[0]
+};
+
+/// rtbench 2 (tests/rtbench-posix): a POSIX process with main at 30, its
+/// threads from 10 to 30 under the ceiling 31 of the layer's helpers.
+pub const RTBENCH: Record = Record {
+    name: "rtbench-posix",
+    program: "rtbench-posix",
+    args: b"rtbench-posix\0",
+    connects: &["ramfs", "clock", "posix", "uart", "rtbench-load"],
+    quota: 2048 * PAGE,
+    handle_limit: 128,
+    root: true,
+    ..POSIX
+};
+
+/// The image of rtbench 2 on QEMU: the PL011's driver under another name,
+/// for the console alone, the RAM files, the process and clock services,
+/// the service of long operations, the load and the benchmark.
+pub const RTBENCH_POSIX_TABLE: &[Record] = &[
+    Record {
+        name: "console",
+        ..super::normal::TABLE[0]
+    },
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    LONG,
+    LOAD,
+    RTBENCH,
+];
