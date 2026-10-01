@@ -59,6 +59,12 @@ fn ceiling() -> Result<u8, rt::abi::Error> {
     Ok(level)
 }
 
+/// The process's ceiling, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_ceiling() -> u8 {
+    ceiling().expect("the ceiling")
+}
+
 fn error(error: FsError) -> c_int {
     match error {
         FsError::NoEntry => ENOENT,

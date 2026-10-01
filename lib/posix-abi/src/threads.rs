@@ -28,7 +28,7 @@ use core::{
 use posix_sync::LayerLock;
 use posix_thread::Block;
 use rt::{
-    abi::{Access, Error, Policy, Rights, Source},
+    abi::{Access, Error, Policy, Rights, Source, ThreadState},
     handle::{Channel, Handle, Thread},
     sys,
 };
@@ -135,6 +135,10 @@ struct Entry {
     mapping: Option<(usize, usize)>,
     detached: bool,
     claimed: bool,
+    /// The kernel told of its end (its exit channel's notification, taken).
+    ended: bool,
+    /// It ended past pthread_exit and left LIVE for it.
+    counted_out: bool,
 }
 struct Registry {
     entries: [Option<Entry>; CAPACITY],
@@ -147,7 +151,28 @@ static TABLE: Table = Table(UnsafeCell::new(Registry {
     entries: [const { None }; CAPACITY],
     next_id: 2,
 }));
-static TABLE_LOCK: LayerLock = LayerLock::new();
+/// Its holder runs at the ceiling of the process (spec 2, 3.4), and holds
+/// it for no call of the kernel that makes or takes back a thread: those
+/// run outside it, their slot reserved.
+static TABLE_LOCK: LayerLock = LayerLock::raising();
+/// The slots out of the table's use while a thread is made in them, taken
+/// back, or its exit channel looked at outside the table's lock: a bit
+/// each. The lock's holder chooses only slots without one.
+static RESERVED: AtomicU64 = AtomicU64::new(0);
+const _: () = assert!(CAPACITY <= 64);
+
+/// Reserves `slot` unless it is; whether it did.
+fn reserve(slot: usize) -> bool {
+    RESERVED.fetch_or(1 << slot, Ordering::SeqCst) & (1 << slot) == 0
+}
+
+fn release(slot: usize) {
+    RESERVED.fetch_and(!(1 << slot), Ordering::SeqCst);
+}
+
+fn reserved(slot: usize) -> bool {
+    RESERVED.load(Ordering::SeqCst) & (1 << slot) != 0
+}
 
 /// Runs `f` on the table under the layer's lock (a short critical section).
 fn registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
@@ -181,50 +206,129 @@ impl Registry {
             .position(|e| e.as_ref().is_some_and(|e| e.id == id))
             .ok_or(ESRCH)
     }
-    /// Takes back a thread that ended: its handles, its stack and TCB.
-    fn take_back(&mut self, slot: usize) {
+    /// A thread that ended leaves the table: its slot stays reserved
+    /// until `Leaving::clean`, outside the lock, took back its handles,
+    /// its stack and TCB.
+    fn leave(&mut self, slot: usize) -> Leaving {
         let entry = self.entries[slot].take().expect("an entry to take back");
-        if let Some((address, length)) = entry.mapping {
-            let block = block_of(slot);
+        RESERVED.fetch_or(1 << slot, Ordering::SeqCst);
+        Leaving {
+            slot,
+            native: entry.native.into_raw().0,
+            exit: entry.exit.map_or(0, |exit| exit.into_raw().0),
+            mapping: entry.mapping,
+        }
+    }
+    /// A thread that ended through thread_exit, past pthread_exit, leaves
+    /// the count of live threads here, once.
+    fn end_past_library(&mut self, slot: usize) {
+        let entry = self.entries[slot].as_mut().expect("an entry");
+        if block_of(slot).end.load(Ordering::SeqCst) == 0 && !entry.counted_out {
+            entry.counted_out = true;
+            LIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// What a thread that left the table holds until it is taken back.
+struct Leaving {
+    slot: usize,
+    native: u64,
+    exit: u64,
+    mapping: Option<(usize, usize)>,
+}
+
+impl Leaving {
+    /// Takes back the thread's handles, stack and TCB, outside the table's
+    /// lock, and frees its slot.
+    fn clean(self) {
+        if let Some((address, length)) = self.mapping {
+            let block = block_of(self.slot);
             close_raw(block.timer.swap(0, Ordering::Relaxed));
             close_raw(block.channel.swap(0, Ordering::Relaxed));
-            close_raw(LAUNCH[slot].thread.swap(0, Ordering::Relaxed));
+            close_raw(LAUNCH[self.slot].thread.swap(0, Ordering::Relaxed));
             // SAFETY: the kernel told of the thread's end: it never runs again.
             unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
                 .expect("ended pthread stack removal");
         }
-        LAUNCH[slot].id.store(0, Ordering::Release);
-        drop(entry);
+        close_raw(self.native);
+        close_raw(self.exit);
+        LAUNCH[self.slot].id.store(0, Ordering::Release);
+        release(self.slot);
     }
-    /// Whether the thread in `slot` ended: the kernel's notification on its
-    /// exit channel, or the end word of the main thread.
-    fn ended(&self, slot: usize) -> bool {
-        match self.entries[slot].as_ref().and_then(|e| e.exit.as_ref()) {
-            Some(exit) => matches!(
-                sys::try_receive(exit),
-                Ok(sys::Received::Notification {
-                    source: Source::Exit,
-                    ..
-                })
-            ),
-            None => block_of(slot).end.load(Ordering::SeqCst) != 0,
-        }
-    }
-    /// Takes back the detached threads that ended.
-    fn take_back_detached(&mut self) {
-        for slot in 0..CAPACITY {
-            if self.entries[slot].as_ref().is_some_and(|e| e.detached) && self.ended(slot) {
-                self.end_past_library(slot);
-                self.take_back(slot);
+}
+
+/// Whether the kernel told of the end of the thread whose exit channel is
+/// `exit`: takes its notification.
+fn exit_told(exit: u64) -> bool {
+    matches!(
+        sys::try_receive(&Handle::<Channel>::borrowed(rt::abi::Handle(exit))),
+        Ok(sys::Received::Notification {
+            source: Source::Exit,
+            ..
+        })
+    )
+}
+
+/// Looks, outside the table's lock, at the exit channels of the threads
+/// `pick` chooses and that are not told ended yet; under the lock it marks
+/// those the kernel told of as ended, counts out those that ended past
+/// pthread_exit, and gives the slots `then`, which may take them out.
+fn observe(pick: impl Fn(&Entry) -> bool, then: impl FnOnce(&mut Registry, u64)) {
+    let mut exits = [0u64; CAPACITY];
+    let looked = registry(|r| {
+        let mut looked = 0u64;
+        for (slot, (entry, raw)) in r.entries.iter().zip(exits.iter_mut()).enumerate() {
+            if let Some(entry) = entry.as_ref()
+                && !entry.ended
+                && pick(entry)
+                && let Some(exit) = entry.exit.as_ref()
+                && reserve(slot)
+            {
+                *raw = exit.raw().0;
+                looked |= 1 << slot;
             }
         }
-    }
-    /// A thread that ended through thread_exit, past pthread_exit, leaves
-    /// the count of live threads here.
-    fn end_past_library(&self, slot: usize) {
-        if block_of(slot).end.load(Ordering::SeqCst) == 0 {
-            LIVE.fetch_sub(1, Ordering::SeqCst);
+        looked
+    });
+    let mut told = 0u64;
+    for (slot, &exit) in exits.iter().enumerate() {
+        if looked & (1 << slot) != 0 && exit_told(exit) {
+            told |= 1 << slot;
         }
+    }
+    registry(|r| {
+        for slot in 0..CAPACITY {
+            if told & (1 << slot) != 0 {
+                r.entries[slot].as_mut().expect("a looked entry").ended = true;
+                r.end_past_library(slot);
+            }
+        }
+        RESERVED.fetch_and(!looked, Ordering::SeqCst);
+        then(r, told);
+    });
+}
+
+/// Takes back the detached threads that ended: their exit channels looked
+/// at and their stacks and handles taken back outside the table's lock.
+fn reap() {
+    let mut leaving: [Option<Leaving>; CAPACITY] = [const { None }; CAPACITY];
+    observe(
+        |entry| entry.detached,
+        |r, _| {
+            for (slot, out) in leaving.iter_mut().enumerate() {
+                if !reserved(slot)
+                    && r.entries[slot]
+                        .as_ref()
+                        .is_some_and(|e| e.detached && e.ended)
+                {
+                    *out = Some(r.leave(slot));
+                }
+            }
+        },
+    );
+    for left in leaving.into_iter().flatten() {
+        left.clean();
     }
 }
 
@@ -260,6 +364,8 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
         mapping: None,
         detached: false,
         claimed: false,
+        ended: false,
+        counted_out: false,
     });
     READY.store(true, Ordering::Release);
     Ok(())
@@ -320,9 +426,7 @@ fn attach_resources(own: u64) -> Result<(), i32> {
     block.thread.store(own, Ordering::Relaxed);
     block.base_level.store(u32::from(base), Ordering::Relaxed);
     block.timer.store(timer.into_raw().0, Ordering::Relaxed);
-    let channel = channel.into_raw().0;
-    block.channel.store(channel, Ordering::Relaxed);
-    block.waker.store(channel, Ordering::Release);
+    block.channel.store(channel.into_raw().0, Ordering::Release);
     crate::signals::attach()
 }
 
@@ -338,7 +442,8 @@ fn close_raw(raw: u64) {
 /// its block, and makes it the thread's base level, which the lock of a
 /// bucket returns to. A Rust call for the measurements of rtbench 2
 /// (feature `rtbench`) until the scheduling attributes of POSIX come (spec
-/// 2, 3.5); the guest probes have it too.
+/// 2, 3.5); the guest probes have it too. Not from a signal handler: a
+/// wait it interrupted keeps the old channel, which this closes.
 #[cfg(any(feature = "rtbench", feature = "thread-probe"))]
 pub fn set_level(level: u8) -> Result<(), i32> {
     let block = own_block();
@@ -356,10 +461,8 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     let channel = sys::channel_create(level).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, level).map_err(|_| EAGAIN)?;
     registry(|_| {
-        let channel = channel.into_raw().0;
         close_raw(block.timer.swap(timer.into_raw().0, Ordering::SeqCst));
-        close_raw(block.channel.swap(channel, Ordering::SeqCst));
-        block.waker.store(channel, Ordering::SeqCst);
+        close_raw(block.channel.swap(channel.into_raw().0, Ordering::SeqCst));
     });
     Ok(())
 }
@@ -405,98 +508,61 @@ pub unsafe extern "C" fn pthread_create(
     let me = own_block();
     let mask = me.mask.load(Ordering::SeqCst);
     let base = me.base_level.load(Ordering::Relaxed) as u8;
-    let result = registry(|r| {
-        r.take_back_detached();
-        let slot = r.entries.iter().position(Option::is_none).ok_or(EAGAIN)?;
+    reap();
+    // Under the lock: a free slot, reserved, and the thread's number.
+    let chosen = registry(|r| {
+        let slot = (0..CAPACITY)
+            .find(|&slot| r.entries[slot].is_none() && reserve(slot))
+            .ok_or(EAGAIN)?;
         let id = r.next_id;
-        let next = id.checked_add(1).ok_or(EAGAIN)?;
-        let length = rounded(attr.stack_size).ok_or(EINVAL)?;
-        let address = STACK_BASE + slot * STRIDE + rounded(attr.guard_size).ok_or(EINVAL)?;
-        let ceiling = crate::ceiling().map_err(|_| EIO)?;
-        // The stack and, above it, the page of the thread's TCB.
-        let mapped = length + PAGE;
-        let memory = sys::mem_create(mapped as u64).map_err(|_| EAGAIN)?;
-        sys::mem_map(
-            allocation::process(),
-            &memory,
-            0,
-            mapped as u64,
-            address,
-            Access::ReadWrite,
-        )
-        .map_err(|_| EAGAIN)?;
-        let unmap = || {
-            // SAFETY: nothing runs on the stack mapped above.
-            unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
-                .expect("failed-create stack removal");
-        };
-        let launch = &LAUNCH[slot];
-        launch.callback.store(
-            callback.expect("checked") as usize as u64,
-            Ordering::Relaxed,
-        );
-        launch.argument.store(argument as u64, Ordering::Relaxed);
-        launch
-            .floating
-            .store(control | (status << 32), Ordering::Relaxed);
-        launch
-            .tcb
-            .store((address + length) as u64, Ordering::Relaxed);
-        // The TCB is built now, so that a signal sent before the thread
-        // runs waits in its block; it starts with its creator's mask.
-        // SAFETY: the page above the stack is mapped and the new thread's.
-        unsafe {
-            let tcb = posix_thread::build((address + length) as *mut u8, PAGE);
-            (*tcb).block.mask.store(mask, Ordering::SeqCst);
-        }
-        launch.completed.store(false, Ordering::Relaxed);
-        launch.cancel.reset();
-        launch.specific.reset();
-        launch.id.store(id, Ordering::Release);
-        let made = (|| {
-            let exit = sys::channel_create(ceiling)?;
-            // SAFETY: this slot owns the new stack until its thread ended.
-            let native = unsafe {
-                sys::thread_create_with(
-                    allocation::process(),
-                    trampoline,
-                    address + length,
-                    slot as u64,
-                    base,
-                    Policy::Fifo,
-                    0x2000000 + slot * PAGE,
-                    Some((&exit, ceiling)),
-                )
-            }?;
-            let own = sys::handle_duplicate(&native, Rights::MANAGE)?;
-            Ok::<_, Error>((native, exit, own))
-        })();
-        let (native, exit, own) = match made {
-            Ok(made) => made,
-            Err(_) => {
-                launch.id.store(0, Ordering::Release);
-                unmap();
-                return Err(EAGAIN);
+        match id.checked_add(1) {
+            Some(next) => {
+                r.next_id = next;
+                Ok((slot, id))
             }
+            None => {
+                release(slot);
+                Err(EAGAIN)
+            }
+        }
+    });
+    let result = chosen.and_then(|(slot, id)| {
+        // Outside the lock: the stack, the TCB and the thread, in the
+        // reserved slot.
+        let made = unsafe {
+            make(
+                slot, id, &attr, callback, argument, control, status, mask, base,
+            )
         };
-        launch.thread.store(own.into_raw().0, Ordering::Relaxed);
-        if sys::thread_start(&native).is_err() {
-            close_raw(launch.thread.swap(0, Ordering::Relaxed));
-            launch.id.store(0, Ordering::Release);
-            drop(native);
-            unmap();
+        let Ok((native, exit, mapping)) = made else {
+            release(slot);
+            return Err(EAGAIN);
+        };
+        let raw = native.raw();
+        registry(|r| {
+            r.entries[slot] = Some(Entry {
+                id,
+                native,
+                exit: Some(exit),
+                mapping: Some(mapping),
+                detached: attr.detached != 0,
+                claimed: false,
+                ended: false,
+                counted_out: false,
+            });
+            release(slot);
+            LIVE.fetch_add(1, Ordering::SeqCst);
+        });
+        // Its number is the caller's alone until it returns: nobody takes
+        // the entry back meanwhile.
+        if sys::thread_start(&Handle::<Thread>::borrowed(raw)).is_err() {
+            let left = registry(|r| {
+                LIVE.fetch_sub(1, Ordering::SeqCst);
+                r.leave(slot)
+            });
+            left.clean();
             return Err(EAGAIN);
         }
-        r.entries[slot] = Some(Entry {
-            id,
-            native,
-            exit: Some(exit),
-            mapping: Some((address, mapped)),
-            detached: attr.detached != 0,
-            claimed: false,
-        });
-        r.next_id = next;
-        LIVE.fetch_add(1, Ordering::SeqCst);
         Ok(id)
     });
     match result {
@@ -508,14 +574,109 @@ pub unsafe extern "C" fn pthread_create(
     }
 }
 
+/// What `make` gives: the thread, its exit channel, its mapping.
+type Made = (Handle<Thread>, Handle<Channel>, (usize, usize));
+
+/// The stack and TCB of a new thread in reserved `slot`, its launch data,
+/// its exit channel and the thread itself, stopped, outside the table's
+/// lock: its handle, its exit channel and its mapping, or nothing made.
+///
+/// # Safety
+/// `slot` is reserved by the caller; `attr` is valid.
+#[allow(clippy::too_many_arguments)]
+unsafe fn make(
+    slot: usize,
+    id: u64,
+    attr: &Attributes,
+    callback: Option<Start>,
+    argument: *mut c_void,
+    control: u64,
+    status: u64,
+    mask: u64,
+    base: u8,
+) -> Result<Made, i32> {
+    let length = rounded(attr.stack_size).ok_or(EINVAL)?;
+    let address = STACK_BASE + slot * STRIDE + rounded(attr.guard_size).ok_or(EINVAL)?;
+    let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    // The stack and, above it, the page of the thread's TCB.
+    let mapped = length + PAGE;
+    let memory = sys::mem_create(mapped as u64).map_err(|_| EAGAIN)?;
+    sys::mem_map(
+        allocation::process(),
+        &memory,
+        0,
+        mapped as u64,
+        address,
+        Access::ReadWrite,
+    )
+    .map_err(|_| EAGAIN)?;
+    let unmap = || {
+        // SAFETY: nothing runs on the stack mapped above.
+        unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
+            .expect("failed-create stack removal");
+    };
+    let launch = &LAUNCH[slot];
+    launch.callback.store(
+        callback.expect("checked") as usize as u64,
+        Ordering::Relaxed,
+    );
+    launch.argument.store(argument as u64, Ordering::Relaxed);
+    launch
+        .floating
+        .store(control | (status << 32), Ordering::Relaxed);
+    launch
+        .tcb
+        .store((address + length) as u64, Ordering::Relaxed);
+    // The TCB is built now, so that a signal sent before the thread runs
+    // waits in its block; it starts with its creator's mask.
+    // SAFETY: the page above the stack is mapped and the new thread's.
+    unsafe {
+        let tcb = posix_thread::build((address + length) as *mut u8, PAGE);
+        (*tcb).block.mask.store(mask, Ordering::SeqCst);
+    }
+    launch.completed.store(false, Ordering::Relaxed);
+    launch.cancel.reset();
+    launch.specific.reset();
+    launch.id.store(id, Ordering::Release);
+    let made = (|| {
+        let exit = sys::channel_create(ceiling)?;
+        // SAFETY: this slot owns the new stack until its thread ended.
+        let native = unsafe {
+            sys::thread_create_with(
+                allocation::process(),
+                trampoline,
+                address + length,
+                slot as u64,
+                base,
+                Policy::Fifo,
+                0x2000000 + slot * PAGE,
+                Some((&exit, ceiling)),
+            )
+        }?;
+        let own = sys::handle_duplicate(&native, Rights::MANAGE)?;
+        Ok::<_, Error>((native, exit, own))
+    })();
+    match made {
+        Ok((native, exit, own)) => {
+            launch.thread.store(own.into_raw().0, Ordering::Relaxed);
+            Ok((native, exit, (address, mapped)))
+        }
+        Err(_) => {
+            launch.id.store(0, Ordering::Release);
+            unmap();
+            Err(EAGAIN)
+        }
+    }
+}
+
 /// # Safety
 /// The caller is managed; out is null or writable for one returned pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32 {
     let point = cancel::Point::begin();
     let me = tls::thread_id();
+    reap();
     let claim = registry(|r| {
-        r.take_back_detached();
         let slot = r.find(thread)?;
         let entry = r.entries[slot].as_mut().expect("found entry");
         if entry.id == me {
@@ -544,13 +705,13 @@ pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32
         unreachable!("a cancelled join ends its thread");
     };
     let block = block_of(slot);
-    let exit = registry(|r| {
-        r.entries[slot]
-            .as_ref()
-            .and_then(|e| e.exit.as_ref())
-            .map(|h| h.raw())
+    // A thread already told ended (`observe`) waits for nothing.
+    let (exit, told) = registry(|r| {
+        let entry = r.entries[slot].as_ref().expect("a claimed entry");
+        (entry.exit.as_ref().map(|h| h.raw()), entry.ended)
     });
     match exit {
+        Some(_) if told => {}
         // The main thread has no exit channel: its end word says it ended.
         None => {
             while block.end.load(Ordering::SeqCst) == 0 {
@@ -591,12 +752,13 @@ pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32
     } else {
         0
     };
-    registry(|r| {
+    let left = registry(|r| {
         if exit.is_some() {
             r.end_past_library(slot);
         }
-        r.take_back(slot);
+        r.leave(slot)
     });
+    left.clean();
     point.end();
     if !out.is_null() {
         unsafe { out.write(value as *mut c_void) };
@@ -638,9 +800,17 @@ fn wake_for_cancel(slot: usize) {
     let native = unsafe { &*TABLE.0.get() }.entries[slot]
         .as_ref()
         .map(|e| e.native.raw());
-    if let Some(native) = native {
+    // Outside a cancellation point a deferred request waits for the next
+    // point, which checks the flag set before this look: no entry, no
+    // interrupt (an asynchronous one takes its entry at once).
+    let flags = block.flags.load(Ordering::SeqCst);
+    let at_point = LAUNCH[slot].cancel.active.load(Ordering::SeqCst) != 0;
+    let asynchronous = flags & posix_thread::flag::CANCEL_ASYNCHRONOUS != 0;
+    if let Some(native) = native
+        && (at_point || asynchronous)
+    {
         let native = Handle::<Thread>::borrowed(native);
-        if block.flags.load(Ordering::SeqCst) & posix_thread::flag::SIGNALS_READY != 0 {
+        if flags & posix_thread::flag::SIGNALS_READY != 0 {
             let _ = sys::thread_upcall_request(&native);
         }
         let _ = sys::thread_interrupt(&native);
@@ -656,10 +826,15 @@ pub extern "C" fn pthread_detach(thread: u64) -> i32 {
             return Err(EINVAL);
         }
         entry.detached = true;
-        r.take_back_detached();
         Ok(())
     })
-    .map_or_else(|e| e, |()| 0)
+    .map_or_else(
+        |e| e,
+        |()| {
+            reap();
+            0
+        },
+    )
 }
 
 /// # Safety
@@ -677,11 +852,34 @@ pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
         launch.completed.store(true, Ordering::Release);
     }
     // Application threads determine the process's life; the layer's
-    // workers do not keep it.
-    if LIVE.fetch_sub(1, Ordering::SeqCst) == 1 {
+    // workers do not keep it. Threads that ended past pthread_exit and
+    // that nobody joined leave the count here (thread_info, a constant
+    // call for each of the table's other threads under its lock), so the
+    // process ends with the last of them too.
+    if LIVE.fetch_sub(1, Ordering::SeqCst) == 1 || others_ended() {
         sys::process_exit(0);
     }
     sys::thread_exit()
+}
+
+/// Counts out the threads of the table that ended past pthread_exit;
+/// whether no application thread is left then.
+fn others_ended() -> bool {
+    let me = tls::thread_id();
+    registry(|r| {
+        for slot in 1..CAPACITY {
+            let past = r.entries[slot].as_ref().is_some_and(|e| {
+                e.id != me
+                    && !e.counted_out
+                    && block_of(slot).end.load(Ordering::SeqCst) == 0
+                    && sys::thread_info(&e.native).is_ok_and(|i| i.state == ThreadState::Ended)
+            });
+            if past {
+                r.end_past_library(slot);
+            }
+        }
+        LIVE.load(Ordering::SeqCst) == 0
+    })
 }
 
 /// # Safety
@@ -841,6 +1039,12 @@ pub unsafe fn probe_native(thread: u64) -> Result<core::mem::ManuallyDrop<Handle
 #[cfg(feature = "thread-probe")]
 pub fn probe_block(id: u64) -> Option<&'static posix_thread::Block> {
     registry(|r| r.find(id).ok()).map(block_of)
+}
+
+/// Runs `run` holding the table's lock, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_hold_table(run: impl FnOnce()) {
+    registry(|_| run());
 }
 
 /// Whether pthread `id` waits by address now, for the guest probes.

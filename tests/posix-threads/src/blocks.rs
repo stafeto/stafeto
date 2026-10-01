@@ -6,13 +6,18 @@
 //! returns with none, a signal raised inside the layer's lock comes at its
 //! end with none; pthread_kill wakes a thread at 30 that sleeps, whose
 //! handler runs and whose sleep gives EINTR with the time left; a thread
-//! that only counts is not cancelled until it reaches a point.
+//! that only counts is not cancelled until it reaches a point; a handler
+//! that runs while its thread waits by address, which sleeps or waits for
+//! the lock of the actions, neither loses the wakeup of that wait nor
+//! links the thread's node twice.
 use super::*;
 use abi::metadata::Timespec;
 use abi::signals::{self as api, SigAction};
 use posix_sync::LayerLock;
+use posix_thread::flag;
 use rt::wait::{Waited, Waiter};
 use threads::cancel;
+use threads::mutex::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 static ERRORS: AtomicUsize = AtomicUsize::new(0);
@@ -22,6 +27,12 @@ static LEFT: AtomicU64 = AtomicU64::new(0);
 static COUNTED: AtomicU64 = AtomicU64::new(0);
 static GO: AtomicUsize = AtomicUsize::new(0);
 static LAYER: LayerLock = LayerLock::new();
+static MUTEX: Mutex = Mutex::new();
+static IN_HANDLER: AtomicUsize = AtomicUsize::new(0);
+static GOT: AtomicUsize = AtomicUsize::new(0);
+/// The channel the holder of the lock of the actions waits on.
+static RELEASE: AtomicU64 = AtomicU64::new(0);
+static HELD: AtomicUsize = AtomicUsize::new(0);
 
 fn bit(signal: i32) -> u64 {
     1 << (signal - 1)
@@ -79,6 +90,115 @@ unsafe extern "C" fn counter(_: *mut c_void) -> *mut c_void {
     cancel::pthread_testcancel();
     error();
     ptr::null_mut()
+}
+fn mutex() -> *mut Mutex {
+    ptr::from_ref(&MUTEX).cast_mut()
+}
+/// SIGUSR2: says it runs, then sleeps 50 ms.
+unsafe extern "C" fn slow_handler(_: i32) {
+    IN_HANDLER.store(1, Ordering::SeqCst);
+    let pause = Timespec {
+        tv_sec: 0,
+        tv_nsec: 50_000_000,
+    };
+    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+}
+/// Takes MUTEX, which main holds, with SIGUSR2 pending and an entry marked
+/// deferred: the entry comes at the end of the first section of its wait
+/// by address, its node linked in the bucket.
+unsafe extern "C" fn late_taker(_: *mut c_void) -> *mut c_void {
+    let Some(block) = threads::probe_block(threads::pthread_self()) else {
+        error();
+        return ptr::null_mut();
+    };
+    block.pending.fetch_or(bit(SIGUSR2), Ordering::SeqCst);
+    block.flags.fetch_or(flag::ENTRY_DEFERRED, Ordering::SeqCst);
+    if unsafe { pthread_mutex_lock(mutex()) } != 0 {
+        error();
+    }
+    GOT.store(1, Ordering::SeqCst);
+    if unsafe { pthread_mutex_unlock(mutex()) } != 0 {
+        error();
+    }
+    ptr::null_mut()
+}
+/// Holds the lock of the actions until RELEASE is notified.
+unsafe extern "C" fn actions_holder(_: *mut c_void) -> *mut c_void {
+    let release = Handle::<Channel>::borrowed(rt::abi::Handle(RELEASE.load(Ordering::SeqCst)));
+    api::probe_hold_actions(|| {
+        HELD.store(1, Ordering::SeqCst);
+        if sys::receive(&release).is_err() {
+            error();
+        }
+    });
+    ptr::null_mut()
+}
+/// Whether `flag` is set within 2 s, polling each millisecond.
+fn soon(flag: &AtomicUsize) -> bool {
+    let pause = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    (0..2000).any(|_| {
+        if flag.load(Ordering::SeqCst) != 0 {
+            return true;
+        }
+        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        false
+    })
+}
+/// The entry of a thread that waits for MUTEX runs a handler while the
+/// node of that wait is linked: with `hold`, the action has SA_RESETHAND,
+/// which the delivery writes under the lock of the actions, and a thread
+/// holds that lock, so that the delivery itself waits by address first.
+/// Main lets MUTEX go meanwhile; the thread takes it within 2 s.
+fn entry_in_a_wait(hold: bool) -> bool {
+    IN_HANDLER.store(0, Ordering::SeqCst);
+    GOT.store(0, Ordering::SeqCst);
+    HELD.store(0, Ordering::SeqCst);
+    let action = SigAction {
+        handler: slow_handler as *const () as u64,
+        mask: 0,
+        flags: if hold { SA_RESETHAND } else { 0 },
+    };
+    if unsafe { api::sigaction(SIGUSR2, &action, ptr::null_mut()) } != 0 {
+        return false;
+    }
+    if unsafe { pthread_mutex_lock(mutex()) } != 0 {
+        return false;
+    }
+    let release = sys::channel_create(30).expect("release channel");
+    RELEASE.store(release.raw().0, Ordering::SeqCst);
+    let holder = hold.then(|| create(actions_holder));
+    if hold && !soon(&HELD) {
+        return false;
+    }
+    let taker = create(late_taker);
+    let id = unsafe { threads::probe_native(taker) }.expect("taker handle");
+    // The taker waits: in the handler's sleep, or for the lock of the
+    // actions.
+    let waits = if hold {
+        (0..2000).any(|_| {
+            let _ = sys::yield_now();
+            threads::probe_futex_waiting(taker) && waiting(&id)
+        })
+    } else {
+        soon(&IN_HANDLER)
+    };
+    if !waits || unsafe { pthread_mutex_unlock(mutex()) } != 0 {
+        return false;
+    }
+    if hold && sys::notify(&release, 1).is_err() {
+        return false;
+    }
+    let got = soon(&GOT);
+    if got {
+        join(taker);
+        if let Some(holder) = holder {
+            join(holder);
+        }
+    }
+    got && IN_HANDLER.load(Ordering::SeqCst) == 1
 }
 fn create(callback: unsafe extern "C" fn(*mut c_void) -> *mut c_void) -> u64 {
     let mut id = 0;
@@ -212,5 +332,39 @@ pub(super) fn run() -> bool {
         return failed(648);
     }
     rt::println!("blocks-probe: a counting thread is cancelled only at its point");
+    // An entry while the thread's node is linked in a bucket.
+    if !entry_in_a_wait(false) {
+        return failed(650);
+    }
+    if !entry_in_a_wait(true) {
+        return failed(651);
+    }
+    if unsafe { api::sigaction(SIGUSR2, &restored, ptr::null_mut()) } != 0
+        || ERRORS.load(Ordering::SeqCst) != 0
+    {
+        return failed(652);
+    }
+    // The holders of the table's lock and of the lock of the actions run
+    // at the ceiling of the process, and go back to their level after.
+    let me = unsafe { threads::probe_native(threads::pthread_self()) }.expect("own handle");
+    let level = || sys::thread_info(&me).map_or(0, |info| info.base);
+    let ceiling = abi::probe_ceiling();
+    let before = level();
+    let (mut table, mut actions) = (0, 0);
+    threads::probe_hold_table(|| table = level());
+    api::probe_hold_actions(|| actions = level());
+    if table != ceiling || actions != ceiling || level() != before || before >= ceiling {
+        rt::println!(
+            "blocks-probe: at {} under the table's lock, {} under the actions', {} after, ceiling {}",
+            table,
+            actions,
+            level(),
+            ceiling
+        );
+        return failed(653);
+    }
+    rt::println!(
+        "blocks-probe: a handler that sleeps or waits for the lock of the actions inside a wait by address loses no wakeup; the table's and the actions' locks run at the ceiling"
+    );
     true
 }

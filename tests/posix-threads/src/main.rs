@@ -424,6 +424,20 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return false;
     }
 
+    // A thread that ends past the library and that nobody joins: the
+    // process still ends with its last application thread.
+    let mut unjoined = 0;
+    if unsafe {
+        threads::pthread_create(
+            &mut unjoined,
+            ptr::null(),
+            Some(past_the_library),
+            ptr::null_mut(),
+        )
+    } != 0
+    {
+        return failed(14);
+    }
     if unsafe {
         threads::pthread_create(&mut child, ptr::null(), Some(last_thread), ptr::null_mut())
     } != 0

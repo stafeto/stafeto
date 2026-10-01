@@ -13,7 +13,7 @@
 //! automatic syscall restart still require implementation.
 use crate::{constants::*, threads};
 use core::cell::UnsafeCell;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
@@ -30,13 +30,63 @@ struct Actions(UnsafeCell<posix_signals::Actions>);
 // SAFETY: only `actions` borrows it, under ACTIONS_LOCK.
 unsafe impl Sync for Actions {}
 static ACTIONS: Actions = Actions(UnsafeCell::new(posix_signals::Actions::new()));
-static ACTIONS_LOCK: LayerLock = LayerLock::new();
+/// Its holder runs at the ceiling of the process (spec 2, 3.4): a thread
+/// that changes an action is not delayed by application threads.
+static ACTIONS_LOCK: LayerLock = LayerLock::raising();
+/// The actions as a delivery reads them without the lock (`action`): a
+/// generation, odd while a writer changes them, and for each signal its
+/// handler, mask and flags. Writers change them under ACTIONS_LOCK.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static PUBLISHED: [[AtomicU64; 3]; 31] = [const { [const { AtomicU64::new(0) }; 3] }; 31];
+const _: () = assert!(posix_signals::INITIAL.handler == 0 && posix_signals::INITIAL.flags == 0);
 
-/// Runs `f` on the process's actions under the layer's lock.
+/// Runs `f` on the process's actions under their lock, and publishes them
+/// for the readers without it.
 fn actions<R>(f: impl FnOnce(&mut posix_signals::Actions) -> R) -> R {
     let _guard = ACTIONS_LOCK.lock();
     // SAFETY: the lock gives this borrow alone.
-    f(unsafe { &mut *ACTIONS.0.get() })
+    let table = unsafe { &mut *ACTIONS.0.get() };
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    let result = f(table);
+    for (signal, words) in (1..).zip(&PUBLISHED) {
+        let action = table.get(signal).expect("a signal of the table");
+        words[0].store(action.handler, Ordering::Relaxed);
+        words[1].store(action.mask, Ordering::Relaxed);
+        words[2].store(u64::from(action.flags as u32), Ordering::Relaxed);
+    }
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    result
+}
+
+/// The action of valid `signal` without the lock: a copy that no writer
+/// changed while it was read (the generation before and after is the same
+/// even number). On one processor a writer holds the lock at the ceiling,
+/// above every reader, so the loop turns only for a reader preempted
+/// inside it.
+fn action(signal: i32) -> SigAction {
+    let words = &PUBLISHED[signal as usize - 1];
+    loop {
+        let before = GENERATION.load(Ordering::Acquire);
+        if before & 1 == 0 {
+            let action = SigAction {
+                handler: words[0].load(Ordering::Relaxed),
+                mask: words[1].load(Ordering::Relaxed),
+                flags: words[2].load(Ordering::Relaxed) as u32 as i32,
+            };
+            fence(Ordering::Acquire);
+            if GENERATION.load(Ordering::Relaxed) == before {
+                return action;
+            }
+        }
+        let _ = sys::yield_now();
+    }
+}
+
+/// Whether `action` of `signal` ignores it.
+fn ignored(signal: i32, action: &SigAction) -> bool {
+    action.handler == IGNORE
+        || (action.handler == DEFAULT
+            && posix_signals::default_action(signal) == posix_signals::DefaultAction::Ignore)
 }
 
 /// # Safety
@@ -211,12 +261,8 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
     let action = if signal == 0 {
         None
     } else {
-        Some(actions(|table| {
-            (
-                table.get(signal).expect("valid signal"),
-                table.ignored(signal),
-            )
-        }))
+        let action = action(signal);
+        Some((action, ignored(signal, &action)))
     };
     if let Some((action, _)) = action
         && (signal == SIGCONT
@@ -229,6 +275,14 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
         return ENOSYS;
     }
     let me = threads::pthread_self();
+    if thread == me {
+        // The calling thread's own block: no lock, no call of the kernel.
+        if let Some((_, false)) = action {
+            own().pending.fetch_or(bit, Ordering::SeqCst);
+            deliver_now();
+        }
+        return 0;
+    }
     let sent = threads::with_target(thread, |block, native| {
         let Some((_, ignored)) = action else {
             return;
@@ -238,9 +292,6 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
             return;
         }
         block.pending.fetch_or(bit, Ordering::SeqCst);
-        if thread == me {
-            return;
-        }
         let flags = block.flags.load(Ordering::SeqCst);
         if flags & flag::SIGNAL_WAIT != 0 && block.wait_set.load(Ordering::SeqCst) & bit != 0 {
             let channel =
@@ -252,12 +303,7 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
         }
     });
     match sent {
-        Ok(()) => {
-            if thread == me && signal != 0 {
-                deliver_now();
-            }
-            0
-        }
+        Ok(()) => 0,
         Err(code) => code,
     }
 }
@@ -466,12 +512,8 @@ fn next_wants_context(block: &Block) -> bool {
         return false;
     }
     let signal = eligible.trailing_zeros() as i32 + 1;
-    actions(|table| {
-        !table.ignored(signal)
-            && table
-                .get(signal)
-                .is_ok_and(|action| action.handler != DEFAULT && action.flags & SA_SIGINFO != 0)
-    })
+    let action = action(signal);
+    !ignored(signal, &action) && action.handler != DEFAULT && action.flags & SA_SIGINFO != 0
 }
 
 /// Takes the lowest pending signal of `block` that its mask lets through,
@@ -492,18 +534,26 @@ fn take(block: &Block) -> Option<(i32, SigAction)> {
             continue;
         }
         let signal = bit.trailing_zeros() as i32 + 1;
-        let action = actions(|table| {
-            if table.ignored(signal) {
-                return None;
-            }
-            let action = table.get(signal).expect("pending signal");
-            if action.flags & SA_RESETHAND != 0 && signal != SIGILL && signal != SIGTRAP {
-                table
-                    .replace(signal, posix_signals::INITIAL)
-                    .expect("reset action");
-            }
-            Some(action)
-        });
+        // Read without the lock; SA_RESETHAND alone writes, under it.
+        let read = action(signal);
+        let action = if ignored(signal, &read) {
+            None
+        } else if read.flags & SA_RESETHAND != 0 && signal != SIGILL && signal != SIGTRAP {
+            actions(|table| {
+                if table.ignored(signal) {
+                    return None;
+                }
+                let action = table.get(signal).expect("pending signal");
+                if action.flags & SA_RESETHAND != 0 {
+                    table
+                        .replace(signal, posix_signals::INITIAL)
+                        .expect("reset action");
+                }
+                Some(action)
+            })
+        } else {
+            Some(read)
+        };
         if let Some(action) = action {
             return Some((signal, action));
         }
@@ -517,6 +567,11 @@ fn take(block: &Block) -> Option<(i32, SigAction)> {
 /// which leaves a handler with SA_SIGINFO to the thread's entry.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     let block = own();
+    // A wait by address of this thread ends before the first handler, and
+    // before the lock of the actions, whose wait uses the same block
+    // (posix_sync::abandon); it goes on as woken after the last one.
+    let abandoned = block.pending.load(Ordering::SeqCst) & !block.mask.load(Ordering::SeqCst) != 0
+        && posix_sync::abandon();
     // SAFETY: the thread has a block (attach).
     let errno = unsafe { ERRNO_LOCATION() };
     let saved_errno = unsafe { *errno };
@@ -614,12 +669,20 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
         block.mask.store(restore_mask, Ordering::SeqCst);
     }
     unsafe { *errno = saved_errno };
+    posix_sync::resume_wait(abandoned);
 }
 fn sys_exit_signal(signal: i32) -> ! {
     rt::sys::process_exit((128 + signal) as u64)
 }
 
 /// Whether pthread `thread` waits in sigwait now, for the guest probes.
+/// Runs `run` holding the lock of the actions, which every delivery
+/// takes, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_hold_actions(run: impl FnOnce()) {
+    let _guard = ACTIONS_LOCK.lock();
+    run();
+}
 #[cfg(feature = "thread-probe")]
 pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
     threads::probe_block(thread)

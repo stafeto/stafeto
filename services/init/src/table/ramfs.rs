@@ -128,8 +128,10 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         args: b"posix-abi-probe\0argument\0",
         connects: &["ramfs", "clock", "clock-peer", "posix", "long"],
         quota: 2048 * PAGE,
-        // Each pthread holds its handle, its channel and its timer
-        // (posix-sync) besides the owner's native handle.
+        // Each pthread holds five handles: its thread, its own copy with
+        // MANAGE, its channel, its timer (posix-sync) and its exit channel;
+        // two more while set_level makes the new channel and timer. 63
+        // pthreads take 315 besides main's and the layer's.
         handle_limit: 512,
         root: true,
         ..POSIX
