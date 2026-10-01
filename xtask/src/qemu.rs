@@ -142,6 +142,31 @@ pub const HVF_V2: Machine = Machine {
     accel: "hvf,kernel-irqchip=off",
 };
 
+/// The machines a command may name by their `name`.
+pub const MACHINES: [&Machine; 7] = [
+    &VIRT,
+    &VIRT_EL2,
+    &VIRT_2G,
+    &VIRT_V3,
+    &VIRT_EL2_V3,
+    &HVF_V3,
+    &HVF_V2,
+];
+
+/// The machine of MACHINES named `name`, VIRT when there is no name.
+pub fn machine(name: Option<&String>) -> Result<&'static Machine, String> {
+    let Some(name) = name else {
+        return Ok(&VIRT);
+    };
+    MACHINES
+        .into_iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| {
+            let names: Vec<_> = MACHINES.iter().map(|m| m.name).collect();
+            format!("no machine {name:?}; machines: {names:?}")
+        })
+}
+
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
         "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory, "-kernel",
@@ -925,6 +950,18 @@ mod tests {
                 .join(" ")
                 .contains("-initrd")
         );
+    }
+
+    #[test]
+    fn commands_find_machines_by_name() {
+        assert_eq!(machine(None).map(|m| m.name), Ok(VIRT.name));
+        let el2 = String::from("EL2");
+        assert_eq!(machine(Some(&el2)).map(|m| m.machine), Ok(VIRT_EL2.machine));
+        assert!(machine(Some(&String::from("el2"))).is_err());
+        let mut names: Vec<_> = MACHINES.iter().map(|m| m.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), MACHINES.len(), "two machines share a name");
     }
 
     #[test]

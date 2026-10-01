@@ -570,6 +570,9 @@ fn ram_size(boot: &Boot) -> u64 {
     boot.info.memory.as_slice().iter().map(|r| r.size).sum()
 }
 
+/// The device tree of QEMU's `virt` as xtask runs it: one bank of RAM at
+/// 0x4000_0000, the PL011, the GIC of either version, the PSCI conduit of
+/// the machine (qemu_psci_conduit) and the boot image.
 fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
     let info = &boot.info;
     // xtask runs the tests on machines with 512 MiB and 2 GiB.
@@ -601,8 +604,23 @@ fn device_tree_matches_qemu_virt(boot: &Boot) -> Result<(), &'static str> {
             "GIC redistributors are not at 0x080A_0000",
         )?,
     }
-    check(info.psci == PsciConduit::Hvc, "PSCI conduit is not HVC")?;
+    check(
+        info.psci == qemu_psci_conduit(registers::id_aa64pfr0_el1()),
+        "PSCI conduit is not the one QEMU gives this machine",
+    )?;
     check(info.initrd.is_some(), "no boot image in /chosen")
+}
+
+/// The PSCI conduit QEMU's `virt` gives a machine with no EL3 whose CPU
+/// has ID_AA64PFR0_EL1 `pfr0`: SMC when EL2 is implemented
+/// (`virtualization=on`, where an HVC would go to the hypervisor's EL2),
+/// HVC when it is not. The EL2 field (bits 11:8) is 0 without EL2.
+fn qemu_psci_conduit(pfr0: u64) -> PsciConduit {
+    if (pfr0 >> 8) & 0xf == 0 {
+        PsciConduit::Hvc
+    } else {
+        PsciConduit::Smc
+    }
 }
 
 /// The GIC runs as the device tree names it (spec 9): the driver's version

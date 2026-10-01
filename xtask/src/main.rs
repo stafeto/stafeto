@@ -271,25 +271,21 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
-/// Tests only the `icount` build has: the first checks that the run is
-/// under -icount; the second and the third measure the portions of the
-/// long calls of memory objects and of the timers of programs, which only
-/// -icount counts in instructions (spec 15.3); the next two depend on how
-/// much of a quantum is left, which only -icount makes repeatable; the
-/// sixth takes a big process apart in hundreds of portions with interrupts
-/// between them, where virtual time counts instructions and a stall of the
-/// host changes nothing; the seventh measures the round trip of a request;
-/// in the eighth a timer fires in the middle of each long call of memory
-/// objects at the same place on every run; the ninth measures the path of
-/// an interrupt of a bound line to its driver, and the last the calls and
-/// portions of device windows.
-const ICOUNT_TESTS: [&str; 12] = [
+/// Tests only the `icount` build has, where virtual time counts
+/// instructions and a stall of the host changes nothing: the check that the
+/// run is under -icount; the measurements of portions, calls, round trips
+/// and paths (spec 15.3); the tests that depend on how much of a quantum is
+/// left or on where a timer fires, which only -icount makes repeatable;
+/// and the teardown of a big process in hundreds of portions with
+/// interrupts between them.
+const ICOUNT_TESTS: [&str; 13] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
     "timer_firing_is_measured",
     "lone_round_robin_thread_is_not_switched",
     "preempted_rr_thread_resumes_before_its_peer",
+    "fast_path_arms_the_timer",
     "teardown_yields_to_a_pending_interrupt",
     "thread_exit_after_channel_close_is_measured",
     "ipc_round_trip_is_measured",
@@ -599,8 +595,8 @@ commands:
             --hvf under HVF on a Mac with Apple silicon
   test      host tests, then boot checks, the console dialog, init tests
             and kernel tests in QEMU
-  kernel-test run only the kernel test image in QEMU
-  init-test run only the EL0 init test image in QEMU
+  kernel-test [machine] run only the kernel test image in QEMU (512M by default)
+  init-test [machine] run only the EL0 init test image in QEMU (512M by default)
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
   ci        formatting, clippy, then everything `test` does
   hvf       boot checks, the console dialog, init tests and kernel tests
@@ -634,8 +630,12 @@ fn main() {
         Some("build") => build(Variant::Normal).map(|_| ()),
         Some("run") => run(&args[1..]),
         Some("test") => test(),
-        Some("kernel-test") => kernel_tests(&qemu::VIRT, Variant::Test).map(|_| ()),
-        Some("init-test") => init_tests(&qemu::VIRT, false).map(|_| ()),
+        Some("kernel-test") => {
+            qemu::machine(args.get(1)).and_then(|m| kernel_tests(m, Variant::Test).map(|_| ()))
+        }
+        Some("init-test") => {
+            qemu::machine(args.get(1)).and_then(|m| init_tests(m, false).map(|_| ()))
+        }
         Some("gdb") => gdb(),
         Some("ci") => ci(),
         Some("hvf") => hvf(),
@@ -1585,12 +1585,14 @@ fn test() -> Result<(), String> {
     init_tests(&qemu::VIRT, true)?;
     init_tests(&qemu::VIRT_2G, true)?;
     init_tests(&qemu::VIRT_V3, false)?;
+    init_tests(&qemu::VIRT_EL2, false)?;
     svc_tests(&qemu::VIRT)?;
     svc_tests(&qemu::VIRT_V3)?;
     bad_tables_are_refused()?;
     kernel_tests(&qemu::VIRT, Variant::Test)?;
     kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
     kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
+    kernel_tests(&qemu::VIRT_EL2, Variant::Test)?;
     kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
     kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
     write_measures()?;
@@ -2522,7 +2524,8 @@ fn stack_overflow_report() -> Result<(), String> {
 /// qemu::ICOUNT, where virtual time counts instructions: the tests that
 /// depend on how much of a quantum is left run only there. A hang, such
 /// as a quantum that never ends, fails at TEST_TIMEOUT. Gives the number
-/// of tests that passed.
+/// of tests that passed. The boot report names `m`'s PSCI conduit, as
+/// the kernel took it from the device tree (on VIRT_EL2 SMC).
 fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     let a = build(variant)?;
     let mut cmd = qemu::command(m, &a.image, Some(&a.boot_image));
@@ -2534,6 +2537,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     let o = run_until(cmd, TEST_TIMEOUT, None, &a.elf)?;
     let r = qemu::parse_report(&o.lines);
     qemu::counted_verdict(&o, &r, None)?;
+    qemu::expect_line(&o, &format!("psci       {}", m.psci()))?;
     for name in ICOUNT_TESTS {
         if name == "ipc_round_trip_is_measured" {
             continue;
