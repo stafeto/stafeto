@@ -301,7 +301,7 @@ impl Registry {
 /// # Safety
 /// mutex is writable and exclusively owned for initialization; attr is null or
 /// points to an initialized attribute object. A live mutex must not be reinitialized.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut Mutex, attr: *const Attributes) -> i32 {
     if !valid_address(mutex as u64) {
         return EINVAL;
@@ -321,19 +321,19 @@ pub unsafe extern "C" fn pthread_mutex_init(mutex: *mut Mutex, attr: *const Attr
 
 /// # Safety
 /// mutex points to a live initialized mutex, and remains valid through return.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_lock(mutex: *mut Mutex) -> i32 {
     unsafe { acquire(mutex, LOCK) }
 }
 /// # Safety
 /// As for pthread_mutex_lock.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_trylock(mutex: *mut Mutex) -> i32 {
     unsafe { acquire(mutex, TRY) }
 }
 /// # Safety
 /// As for pthread_mutex_lock; deadline supplies one readable aligned Timespec.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_timedlock(
     mutex: *mut Mutex,
     deadline: *const posix_types::Timespec,
@@ -343,7 +343,7 @@ pub unsafe extern "C" fn pthread_mutex_timedlock(
 /// # Safety
 /// As for pthread_mutex_timedlock. The original absolute deadline is retained
 /// across IPC interruption. This function is not a deferred cancellation point.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_clocklock(
     mutex: *mut Mutex,
     clock: i32,
@@ -394,7 +394,7 @@ unsafe fn acquire_args(mutex: *mut Mutex, op: u64, arguments: [u64; 5]) -> i32 {
 }
 /// # Safety
 /// As for pthread_mutex_lock. The current owner publishes protected writes.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut Mutex) -> i32 {
     if !valid_address(mutex as u64) || super::current_launch().is_none() {
         return EINVAL;
@@ -414,14 +414,14 @@ pub unsafe extern "C" fn pthread_mutex_unlock(mutex: *mut Mutex) -> i32 {
 }
 /// # Safety
 /// mutex is live, and no other thread is using it or can start a new operation.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutex_destroy(mutex: *mut Mutex) -> i32 {
     request(DESTROY, [mutex as u64, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
 }
 
 /// # Safety
 /// attr points to writable storage exclusively owned by this caller.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_init(attr: *mut Attributes) -> i32 {
     if attr.is_null() {
         return EINVAL;
@@ -437,7 +437,7 @@ pub unsafe extern "C" fn pthread_mutexattr_init(attr: *mut Attributes) -> i32 {
 }
 /// # Safety
 /// attr is initialized and exclusively owned by this caller.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_destroy(attr: *mut Attributes) -> i32 {
     if attr.is_null() || !unsafe { &*attr }.valid() {
         return EINVAL;
@@ -447,7 +447,7 @@ pub unsafe extern "C" fn pthread_mutexattr_destroy(attr: *mut Attributes) -> i32
 }
 /// # Safety
 /// attr is initialized; kind points to writable storage, disjoint from attr.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_gettype(attr: *const Attributes, kind: *mut i32) -> i32 {
     if attr.is_null() || kind.is_null() || !unsafe { &*attr }.valid() {
         return EINVAL;
@@ -457,7 +457,7 @@ pub unsafe extern "C" fn pthread_mutexattr_gettype(attr: *const Attributes, kind
 }
 /// # Safety
 /// attr is initialized and exclusively owned by this caller.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_mutexattr_settype(attr: *mut Attributes, kind: i32) -> i32 {
     if attr.is_null() || !valid_kind(kind) || !unsafe { &*attr }.valid() {
         return EINVAL;

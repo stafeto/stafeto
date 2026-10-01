@@ -52,7 +52,7 @@ unsafe fn sort(
 /// # Safety
 /// base supplies count initialized elements of width bytes; compare defines a
 /// consistent total order and does not modify the elements or unwind.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn qsort(
     base: *mut c_void,
     count: usize,
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn qsort(
 /// # Safety
 /// qsort's array and comparator contract holds; context remains valid for all
 /// comparator calls and is passed unchanged as their last argument.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn qsort_r(
     base: *mut c_void,
     count: usize,

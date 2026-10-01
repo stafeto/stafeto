@@ -100,7 +100,7 @@ unsafe extern "C" fn compare_entries(
 /// has file and heap initialization. Callbacks obey their C contracts and may
 /// reenter unrelated ABI functions; they must not invalidate directory entries.
 /// On success the caller frees each selected entry and then the pointer array.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn scandir(
     path: *const c_char,
     namelist: *mut *mut *mut Dirent,
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn scandir(
 /// # Safety
 /// Arguments point to readable pointers to live directory entries whose names
 /// are NUL terminated. The currently supported C/POSIX locale is used.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn alphasort(
     left: *const *const Dirent,
     right: *const *const Dirent,

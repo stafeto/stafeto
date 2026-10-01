@@ -361,14 +361,14 @@ fn returned(result: Result<*mut u8, i32>) -> *mut u8 {
 
 /// # Safety
 /// This thread has an initialized errno scope and the process heap is initialized.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut u8 {
     returned(request(ALLOC, size, FUNDAMENTAL_ALIGNMENT, ptr::null_mut()))
 }
 
 /// # Safety
 /// Same initialization contract as malloc.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
     let Some(size) = count.checked_mul(size) else {
         return returned(Err(ENOMEM));
@@ -379,14 +379,14 @@ pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut u8 {
 /// # Safety
 /// pointer is null or a live allocation from this process heap, with no
 /// overlapping accesses; the initialization contract of malloc also applies.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn realloc(pointer: *mut u8, size: usize) -> *mut u8 {
     returned(request(REALLOC, size, 0, pointer))
 }
 
 /// # Safety
 /// Same contract as realloc. Multiplication failure preserves the allocation.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn reallocarray(pointer: *mut u8, count: usize, size: usize) -> *mut u8 {
     let Some(size) = count.checked_mul(size) else {
         return returned(Err(ENOMEM));
@@ -397,7 +397,7 @@ pub unsafe extern "C" fn reallocarray(pointer: *mut u8, count: usize, size: usiz
 /// # Safety
 /// pointer is null or a uniquely live allocation from this process heap.
 /// Free preserves errno, including for a null pointer.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn free(pointer: *mut u8) {
     if !pointer.is_null() {
         let _ = request(FREE, 0, 0, pointer);
@@ -407,7 +407,7 @@ pub unsafe extern "C" fn free(pointer: *mut u8) {
 /// # Safety
 /// Same initialization contract as malloc. alignment is a nonzero power of two
 /// and size is a multiple of alignment; invalid values report EINVAL.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut u8 {
     if !alignment.is_power_of_two() || !size.is_multiple_of(alignment) {
         return returned(Err(EINVAL));
@@ -418,7 +418,7 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut u8
 /// # Safety
 /// out is writable/aligned for one pointer, and malloc's initialization holds.
 /// Failure preserves out and errno; the result is an error number directly.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn posix_memalign(out: *mut *mut u8, alignment: usize, size: usize) -> i32 {
     if out.is_null() {
         return EFAULT;

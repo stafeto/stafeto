@@ -104,7 +104,7 @@ impl Registry {
 /// # Safety
 /// key points to writable storage. The optional destructor remains callable
 /// while registered and while any already selected invocation is in flight.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_key_create(key: *mut u64, destructor: Option<Destructor>) -> i32 {
     if key.is_null() {
         return EINVAL;
@@ -121,17 +121,17 @@ pub unsafe extern "C" fn pthread_key_create(key: *mut u64, destructor: Option<De
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_key_delete(key: u64) -> i32 {
     request(DELETE, [key, 0, 0, 0, 0]).map_or_else(|error| error, |_| 0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_getspecific(key: u64) -> *mut c_void {
     request(GET, [key, 0, 0, 0, 0]).unwrap_or(0) as *mut c_void
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_setspecific(key: u64, value: *const c_void) -> i32 {
     request(SET, [key, value as u64, 0, 0, 0]).map_or_else(|error| error, |_| 0)
 }

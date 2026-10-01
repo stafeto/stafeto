@@ -1,0 +1,21 @@
+[package]
+name = "musl-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Probe: a C program on musl whose syscalls go to Rust POSIX"
+build = "build.rs"
+
+[[bin]]
+name = "musl-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi", features = ["libc-backend"] }
+posix-fs = { path = "../../lib/posix-fs" }
+posix-types = { path = "../../lib/posix-types" }
+proto-init = { path = "../../proto/init" }
+rt = { path = "../../lib/rt" }

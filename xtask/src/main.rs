@@ -69,6 +69,27 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
 ];
+const RELIBC_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
+    ("posix-abi-probe", "relibc-probe", 64 * 1024, &[]),
+];
+const MUSL_PROGRAMS: [ImageProgram; 6] = [
+    RELIBC_PROGRAMS[0],
+    RELIBC_PROGRAMS[1],
+    RELIBC_PROGRAMS[2],
+    RELIBC_PROGRAMS[3],
+    RELIBC_PROGRAMS[4],
+    ("posix-abi-probe", "musl-probe", 64 * 1024, &[]),
+];
 const POSIX_THREAD_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -633,6 +654,8 @@ commands:
   posix-threads verify pthread interruption and main-thread exit
   posix-threads-vz run the pthread probe on Apple Virtualization.framework
   posix-abi run a C main against Rust POSIX and verify thread-local errno
+  relibc    probe: a C program on relibc with a stafeto platform over Rust POSIX
+  musl      probe: a C program on musl with a stafeto syscall backend over Rust POSIX
   posix-input verify file progress during blocking console reads
   posix-input-vz verify native console reads on Apple Virtualization.framework
   posix-interrupt verify live IPC interruption and Rust POSIX EINTR on UART
@@ -676,6 +699,8 @@ fn main() {
         Some("posix-threads") => posix_thread_probe(false),
         Some("posix-threads-vz") => posix_thread_probe(true),
         Some("posix-abi") => posix_abi_probe(),
+        Some("relibc") => libc_probe("relibc"),
+        Some("musl") => libc_probe("musl"),
         Some("posix-shared") => posix_shared_probe(),
         Some("posix-input") => posix_input_probe(false),
         Some("posix-input-vz") => posix_input_probe(true),
@@ -1121,6 +1146,28 @@ fn ramfs_probe() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some("ramfs-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "ramfs-probe: ok")?;
     println!("RAM file service guest probe passed");
+    Ok(())
+}
+
+/// Probe of a standard libc (relibc or musl) over the Rust POSIX layer: the
+/// C program prints through the libc's stdio, allocates on the layer's heap
+/// and reads /etc/motd from the RAM file service.
+fn libc_probe(libc: &str) -> Result<(), String> {
+    let kernel = build(Variant::Normal)?;
+    let image = if libc == "musl" {
+        build_boot_image("boot-musl.img", &MUSL_PROGRAMS, BOOT_PROFILE)?
+    } else {
+        build_boot_image("boot-relibc.img", &RELIBC_PROGRAMS, BOOT_PROFILE)?
+    };
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: posix-abi-probe ended";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    for line in &output.lines {
+        println!("{line}");
+    }
+    qemu::expect_marker(&output, &format!("{libc}-probe: ok"))?;
+    println!("{libc} guest probe passed");
     Ok(())
 }
 

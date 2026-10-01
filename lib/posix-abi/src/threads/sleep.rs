@@ -96,7 +96,7 @@ fn now() -> u64 {
 /// # Safety
 /// The caller is managed. request supplies a readable aligned Timespec; remaining
 /// is null or writable. They may name the same object. Absolute calls ignore remaining.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_nanosleep(
     clock: i32,
     flags: i32,
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn clock_nanosleep(
 }
 /// # Safety
 /// As for clock_nanosleep with CLOCK_REALTIME and a relative interval.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn nanosleep(requested: *const Timespec, remaining: *mut Timespec) -> i32 {
     let status = unsafe { clock_nanosleep(crate::clock::CLOCK_REALTIME, 0, requested, remaining) };
     if status == 0 { 0 } else { fail(status) as i32 }

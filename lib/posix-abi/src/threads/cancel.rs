@@ -169,7 +169,7 @@ pub(super) unsafe fn exit_cleanup() {
 
 /// # Safety
 /// The current thread is initialized; old is null or writable for one int.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setcancelstate(value: i32, old: *mut i32) -> i32 {
     let Some(state) = state() else {
         return EINVAL;
@@ -198,7 +198,7 @@ pub unsafe extern "C" fn pthread_setcancelstate(value: i32, old: *mut i32) -> i3
 /// The current thread is initialized; old is null or writable for one int.
 /// Asynchronous cancellation needs future signal/trampoline support; it is
 /// explicitly rejected instead of silently using deferred cancellation.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_setcanceltype(value: i32, old: *mut i32) -> i32 {
     if state().is_none() {
         return EINVAL;
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn pthread_setcanceltype(value: i32, old: *mut i32) -> i32
     0
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_testcancel() {
     if requested() {
         terminate();
@@ -225,7 +225,7 @@ pub extern "C" fn pthread_testcancel() {
 /// # Safety
 /// node is uniquely writable and remains at this address until pop or exit;
 /// routine and argument remain valid while registered. Calls are lexically paired.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn __stafeto_cleanup_push(
     node: *mut Cleanup,
     routine: Option<Routine>,
@@ -248,7 +248,7 @@ pub unsafe extern "C" fn __stafeto_cleanup_push(
 
 /// # Safety
 /// node is the current thread's top live registered cleanup node.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn __stafeto_cleanup_pop(node: *mut Cleanup, execute: i32) {
     let state = state().expect("managed cleanup pop");
     assert!(

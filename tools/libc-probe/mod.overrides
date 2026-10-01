@@ -1,0 +1,45 @@
+@@ exit
+unsafe { stafeto_exit(status) }
+@@ exit_thread
+unsafe { stafeto_exit(0) }
+@@ clock_gettime
+ret(unsafe { stafeto_clock_gettime(clk_id, tp.as_mut_ptr()) } as isize).map(|_| ())
+@@ clock_getres
+ret(unsafe { stafeto_clock_getres(clk_id, res.map_or(ptr::null_mut(), |mut p| p.as_mut_ptr())) } as isize).map(|_| ())
+@@ close
+ret(unsafe { stafeto_close(fildes) } as isize).map(|_| ())
+@@ getpagesize
+4096
+@@ getpid
+unsafe { stafeto_getpid() }
+@@ getppid
+unsafe { stafeto_getppid() }
+@@ gettid
+unsafe { stafeto_getpid() }
+@@ current_os_tid
+crate::pthread::OsTid { thread_id: 1 }
+@@ lseek
+ret(unsafe { stafeto_lseek(fildes, offset, whence) } as isize).map(|v| v as off_t)
+@@ mmap
+// Only anonymous private memory, from the stafeto heap.
+if fildes != -1 || flags & crate::header::sys_mman::MAP_ANONYMOUS == 0 || !addr.is_null() {
+            return Err(Errno(ENOSYS));
+        }
+        let pointer = unsafe { stafeto_map_anonymous(len) };
+        if pointer.is_null() { Err(Errno(crate::header::errno::ENOMEM)) } else { Ok(pointer) }
+@@ munmap
+ret(unsafe { stafeto_unmap(addr, len) } as isize).map(|_| ())
+@@ openat
+ret(unsafe { stafeto_openat(dirfd, path.as_ptr(), oflag, mode) } as isize).map(|v| v as c_int)
+@@ read
+ret(unsafe { stafeto_read(fildes, buf.as_mut_ptr(), buf.len()) }).map(|v| v as usize)
+@@ write
+ret(unsafe { stafeto_write(fildes, buf.as_ptr(), buf.len()) }).map(|v| v as usize)
+@@ fstatat
+// Descriptor form only (fstat), filled by the stafeto layer.
+if path.is_some() || flags & AT_EMPTY_PATH == 0 {
+            return Err(Errno(ENOSYS));
+        }
+        ret(unsafe { stafeto_fstat(fildes, buf.as_mut_ptr()) } as isize).map(|_| ())
+@@ verify
+true

@@ -1135,11 +1135,11 @@ fn acknowledge(caller: u64, nonce: u64, abandon: bool) -> Result<(), i32> {
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_self() -> u64 {
     tls::thread_id()
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_equal(first: u64, second: u64) -> i32 {
     i32::from(first == second)
 }
@@ -1147,7 +1147,7 @@ pub extern "C" fn pthread_equal(first: u64, second: u64) -> i32 {
 /// # Safety
 /// out is writable, attr is null or initialized, and callback/argument remain
 /// valid for the child. The calling thread is managed by this process runtime.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_create(
     out: *mut u64,
     attr: *const Attributes,
@@ -1196,7 +1196,7 @@ pub unsafe extern "C" fn pthread_create(
 
 /// # Safety
 /// The caller is managed; out is null or writable for one returned pointer.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32 {
     let point = cancel::Point::begin();
     let result = request(JOIN, [thread, 0, 0, 0, 0]);
@@ -1229,12 +1229,12 @@ pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_cancel(thread: u64) -> i32 {
     request(CANCEL, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_detach(thread: u64) -> i32 {
     request(DETACH, [thread, 0, 0, 0, 0]).map_or_else(|e| e, |_| 0)
 }
@@ -1242,7 +1242,7 @@ pub extern "C" fn pthread_detach(thread: u64) -> i32 {
 /// # Safety
 /// The current thread is managed and has its initialized POSIX scope.
 /// Registered cleanup nodes, destructors and their arguments remain live.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
     unsafe { cancel::exit_cleanup() };
     unsafe { specific::exit_destructors() };
@@ -1258,7 +1258,7 @@ pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
 
 /// # Safety
 /// attr points to writable storage for a new attribute object.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_init(attr: *mut Attributes) -> i32 {
     if attr.is_null() {
         return EINVAL;
@@ -1268,7 +1268,7 @@ pub unsafe extern "C" fn pthread_attr_init(attr: *mut Attributes) -> i32 {
 }
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_destroy(attr: *mut Attributes) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -1279,7 +1279,7 @@ pub unsafe extern "C" fn pthread_attr_destroy(attr: *mut Attributes) -> i32 {
 
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_setstacksize(attr: *mut Attributes, size: usize) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -1294,7 +1294,7 @@ pub unsafe extern "C" fn pthread_attr_setstacksize(attr: *mut Attributes, size: 
 }
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_setguardsize(attr: *mut Attributes, size: usize) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -1309,7 +1309,7 @@ pub unsafe extern "C" fn pthread_attr_setguardsize(attr: *mut Attributes, size: 
 }
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_setdetachstate(attr: *mut Attributes, state: i32) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -1324,7 +1324,7 @@ pub unsafe extern "C" fn pthread_attr_setdetachstate(attr: *mut Attributes, stat
 }
 /// # Safety
 /// attr is initialized readable storage, and out is writable.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_getstacksize(
     attr: *const Attributes,
     out: *mut usize,
@@ -1337,7 +1337,7 @@ pub unsafe extern "C" fn pthread_attr_getstacksize(
 }
 /// # Safety
 /// attr is initialized readable storage, and out is writable.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_getguardsize(
     attr: *const Attributes,
     out: *mut usize,
@@ -1350,7 +1350,7 @@ pub unsafe extern "C" fn pthread_attr_getguardsize(
 }
 /// # Safety
 /// attr is initialized readable storage, and out is writable.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_getdetachstate(
     attr: *const Attributes,
     out: *mut i32,

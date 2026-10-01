@@ -131,7 +131,7 @@ unsafe extern "C" fn rollback(argument: *mut c_void) {
 /// control is a live, initialized static/extern once object shared only through
 /// pthread_once. routine remains callable. Recursive calls on the same object
 /// cannot complete; different nested objects are supported.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_once(control: *mut Control, routine: Option<Routine>) -> i32 {
     if !valid(control as u64) || routine.is_none() || super::current_launch().is_none() {
         return EINVAL;

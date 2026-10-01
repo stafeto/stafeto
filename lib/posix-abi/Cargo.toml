@@ -12,6 +12,9 @@ test = false
 bench = false
 
 [features]
+# Probe of a standard libc (relibc) above this layer: the libc owns the C
+# names, so this layer exports none of its own.
+libc-backend = []
 transport-probe = ["posix-clock/transport-probe", "process-client/transport-probe"]
 
 [dependencies]

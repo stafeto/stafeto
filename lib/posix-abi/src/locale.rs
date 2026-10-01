@@ -56,7 +56,7 @@ unsafe fn native(category: c_int) -> bool {
 /// locale is NULL or a readable C string. Environment entries are valid and
 /// no other thread changes environ during a request for the native locale.
 /// The returned name is borrowed and must not be modified or freed.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *mut c_char {
     if !(LC_ALL..=LC_TIME).contains(&category) {
         return ptr::null_mut();
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn setlocale(category: c_int, locale: *const c_char) -> *m
 
 /// # Safety
 /// Both arguments are readable NUL-terminated C strings.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn strcmp(left: *const c_char, right: *const c_char) -> c_int {
     let left = unsafe { CStr::from_ptr(left) }.to_bytes();
     let right = unsafe { CStr::from_ptr(right) }.to_bytes();
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn strcmp(left: *const c_char, right: *const c_char) -> c_
 /// # Safety
 /// strcmp's string contract holds. The current implementation supports only
 /// C/POSIX collation, which is unsigned byte ordering.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn strcoll(left: *const c_char, right: *const c_char) -> c_int {
     unsafe { strcmp(left, right) }
 }
@@ -103,7 +103,7 @@ pub unsafe extern "C" fn strcoll(left: *const c_char, right: *const c_char) -> c
 /// # Safety
 /// source is a readable C string; destination supplies count writable bytes,
 /// disjoint from source. destination may be NULL when count is zero.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn strxfrm(
     destination: *mut c_char,
     source: *const c_char,

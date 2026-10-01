@@ -114,7 +114,9 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
         match u32_at(h, 0) {
             PT_LOAD => {}
             PT_DYNAMIC | PT_INTERP => return Err(ElfError::NotStatic),
-            PT_TLS => return Err(ElfError::Tls),
+            // relibc probe: the C library builds its static TLS from the
+            // program headers itself, so the template is only data here.
+            PT_TLS => continue,
             _ => continue,
         }
         let (flags, offset, vaddr) = (u32_at(h, 4), u64_at(h, 8), u64_at(h, 16));
@@ -248,7 +250,6 @@ mod tests {
         for (kind, why) in [
             (PT_DYNAMIC, ElfError::NotStatic),
             (PT_INTERP, ElfError::NotStatic),
-            (PT_TLS, ElfError::Tls),
         ] {
             let mut f = good.clone();
             put(&mut f, 64 + PHDR_SIZE * 3, &kind.to_le_bytes());

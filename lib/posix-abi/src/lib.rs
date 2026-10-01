@@ -111,7 +111,7 @@ unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
 /// # Safety
 /// Called inside a current-thread ABI scope. The returned pointer stays live
 /// until the scope ends; it must not be shared between threads.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn __errno_location() -> *mut c_int {
     tls::errno()
 }
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn __errno_location() -> *mut c_int {
 /// # Safety
 /// `name` is a live C string and this thread has an initialized file scope.
 /// The initial ABI accepts access mode, O_DIRECTORY and close-on-exec/fork flags.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn open(name: *const c_char, flags: c_int) -> c_int {
     let result = (|| {
         let name = unsafe { path(name) }?;
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn open(name: *const c_char, flags: c_int) -> c_int {
 
 /// # Safety
 /// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn close(number: c_int) -> c_int {
     fd(number)
         .and_then(|fd| shared::unit(Request::Close { fd }))
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn close(number: c_int) -> c_int {
 /// # Safety
 /// `buffer` supplies `count` writable bytes (may be null for zero bytes).
 /// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> isize {
     let point = threads::cancel::Point::begin();
     let result = unsafe { read_inner(number, buffer, count) };
@@ -213,7 +213,7 @@ unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
 /// # Safety
 /// `buffer` supplies `count` readable bytes (may be null for zero bytes).
 /// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn write(number: c_int, buffer: *const u8, count: usize) -> isize {
     let point = threads::cancel::Point::begin();
     let result = unsafe { write_inner(number, buffer, count) };
@@ -246,7 +246,7 @@ unsafe fn write_inner(number: c_int, buffer: *const u8, count: usize) -> isize {
 
 /// # Safety
 /// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn lseek(number: c_int, offset: i64, origin: c_int) -> i64 {
     let result = fd(number).and_then(|fd| {
         let origin = match origin {
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn lseek(number: c_int, offset: i64, origin: c_int) -> i64
 
 /// # Safety
 /// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn dup(number: c_int) -> c_int {
     fd(number)
         .and_then(|fd| shared::number(Request::Dup { fd }))
@@ -273,7 +273,7 @@ pub unsafe extern "C" fn dup(number: c_int) -> c_int {
 
 /// # Safety
 /// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn dup2(source: c_int, target: c_int) -> c_int {
     let result = fd(source).and_then(|source| {
         let target = fd(target)?;
@@ -284,7 +284,7 @@ pub unsafe extern "C" fn dup2(source: c_int, target: c_int) -> c_int {
 
 /// # Safety
 /// This thread has an initialized ABI scope. Flags must be O_CLOEXEC/CLOFORK.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn dup3(source: c_int, target: c_int, flags: c_int) -> c_int {
     let result = fd(source).and_then(|source| {
         let target = fd(target)?;
@@ -302,7 +302,7 @@ pub unsafe extern "C" fn dup3(source: c_int, target: c_int, flags: c_int) -> c_i
 
 /// # Safety
 /// `name` is a live C string; this thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn chdir(name: *const c_char) -> c_int {
     let result = unsafe { path(name) }.and_then(|path| shared::unit(Request::Chdir { path }));
     result.map_or_else(|code| fail(code) as c_int, |()| 0)
@@ -310,7 +310,7 @@ pub unsafe extern "C" fn chdir(name: *const c_char) -> c_int {
 
 /// # Safety
 /// `buffer` supplies `size` writable bytes; this thread has an ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn getcwd(buffer: *mut c_char, size: usize) -> *mut c_char {
     let result = if buffer.is_null() {
         Err(EFAULT)
@@ -341,13 +341,13 @@ pub unsafe extern "C" fn getcwd(buffer: *mut c_char, size: usize) -> *mut c_char
 
 /// # Safety
 /// All process threads and resources are abandoned by this call.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn _exit(status: c_int) -> ! {
     rt::sys::process_exit((status & 255) as u64)
 }
 
 /// Numeric ABI revision, callable before thread initialization.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn stafeto_posix_abi_version() -> c_int {
     ABI_VERSION as c_int
 }

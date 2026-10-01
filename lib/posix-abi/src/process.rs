@@ -46,19 +46,19 @@ fn credentials() -> proto_process::Credentials {
         .credentials
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn getuid() -> u32 {
     credentials().uid
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn geteuid() -> u32 {
     credentials().euid
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn getgid() -> u32 {
     credentials().gid
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn getegid() -> u32 {
     credentials().egid
 }
@@ -77,19 +77,19 @@ fn change(operation: Change, id: u32) -> i32 {
         |()| 0,
     )
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn setuid(id: u32) -> i32 {
     change(Change::Uid, id)
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn seteuid(id: u32) -> i32 {
     change(Change::EffectiveUid, id)
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn setgid(id: u32) -> i32 {
     change(Change::Gid, id)
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn setegid(id: u32) -> i32 {
     change(Change::EffectiveGid, id)
 }
@@ -106,12 +106,12 @@ fn identity() -> rt::abi::ProcessIdentity {
     rt::sys::process_identity(allocation::process()).expect("live process identity")
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn getpid() -> i32 {
     i32::try_from(identity().id).expect("positive signed process namespace")
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn getppid() -> i32 {
     i32::try_from(identity().parent).expect("signed parent process namespace")
 }
