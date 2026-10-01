@@ -40,16 +40,24 @@ fn measured_line(line: &str) -> bool {
         "KERNEL_STATS:",
         "call maximum ticks:",
         "fp switch ticks:",
+        "upcall ticks:",
     ]
     .iter()
     .any(|prefix| line.starts_with(prefix))
 }
+
+/// The label of the lines of a run under -icount, where a tick is an
+/// instruction: a machine's file keeps them apart from those of its runs
+/// with no -icount, whose ticks are the host's time.
+pub const ICOUNT: &str = "icount ";
 
 /// Keeps the lines of a run only after its existing verdict has passed.
 pub fn record(machine: &Machine, lines: &[String]) {
     record_as(machine, lines, "");
 }
 
+/// As `record`, each line kept with `label` in front: the kind of run,
+/// such as ICOUNT, when one machine's file gathers several kinds.
 pub fn record_as(machine: &Machine, lines: &[String], label: &str) {
     let mut all = reports().lock().unwrap_or_else(PoisonError::into_inner);
     let report = all.entry(machine.name.to_owned()).or_default();
@@ -171,6 +179,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn icount_lines_carry_their_label() {
+        const M: Machine = Machine {
+            name: "label test",
+            machine: "virt",
+            cpu: "cortex-a53",
+            memory: "512M",
+            accel: "tcg",
+        };
+        let icount = ["KERNEL_STATS: idle=1", "TEST a_test ok"].map(str::to_owned);
+        record_as(&M, &icount, ICOUNT);
+        record(&M, &["KERNEL_STATS: idle=2".to_owned()]);
+        let all = reports().lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            all["label test"].lines,
+            ["icount KERNEL_STATS: idle=1", "KERNEL_STATS: idle=2"]
+        );
+    }
+
+    #[test]
     fn report_keeps_only_measurement_rows_and_sanitizes_machine_name() {
         let report = Report {
             accel: "tcg".into(),
@@ -190,6 +217,7 @@ mod tests {
         assert!(text.contains("kernel image bytes: 10\nboot image bytes: 20\n"));
         assert!(text.ends_with("normal build ticks: null=271\nipc round trip ticks: fast=1\n"));
         assert!(measured_line("memory portions ticks: create=1"));
+        assert!(measured_line("upcall ticks: interrupt=1"));
         assert!(!measured_line("TEST sample ok"));
         let lines = [
             "ipc round trip ticks: null=1 fast=30 slow=60",

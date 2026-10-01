@@ -357,6 +357,10 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
         Some(Err(e)) => return e,
     };
     let mut table: [Option<Session<S::Data, K>>; N] = core::array::from_fn(|_| None);
+    // Zeroed once: a request reads only its first `len` bytes, and both
+    // paths fill all `len` bytes, so no byte of an earlier client reaches
+    // the next request.
+    let mut buffer = [0; MESSAGE_MAX];
     loop {
         let notice = match sys::receive(channel) {
             Err(e) => return e,
@@ -367,7 +371,6 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 token,
                 words,
             }) => {
-                let mut buffer = [0; MESSAGE_MAX];
                 let bytes = &mut buffer[..len.min(MESSAGE_MAX)];
                 if len <= INLINE_MAX {
                     bytes.copy_from_slice(&abi::inline_bytes(&words)[..len]);

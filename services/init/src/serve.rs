@@ -66,13 +66,31 @@ pub struct Instance {
     spawned: Spawned,
     channel: Option<Handle<Channel>>,
     started: u64,
+    /// Set by the worker right before it lets go of the instance (`release`).
+    released: bool,
 }
 
 impl Instance {
+    /// Lets go of the instance: its handles close. Only init's worker
+    /// thread calls it (worker.rs).
+    pub fn release(mut self) {
+        self.released = true;
+    }
+
     /// The instance's process, which the worker kills before it tears the
     /// instance down (worker.rs).
     pub fn process(&self) -> &Handle<Process> {
         &self.spawned.process
+    }
+}
+
+/// The strict build (debug assertions) panics when an instance goes
+/// another way than `release`, such as a drop on the main thread.
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if cfg!(debug_assertions) && !self.released {
+            panic!("an instance dropped outside init's worker");
+        }
     }
 }
 
@@ -419,6 +437,7 @@ impl Init {
                     spawned,
                     channel: None,
                     started,
+                    released: false,
                 });
                 entry.watch = watch;
                 entry.state = if record.is_client() {

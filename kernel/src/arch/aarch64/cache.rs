@@ -24,6 +24,17 @@ fn lines() -> (usize, usize, bool) {
     (dline, iline, (ctr >> 14) & 0b11 == L1IP_PIPT)
 }
 
+/// The addresses of the data cache lines that cover `range`, by the
+/// smallest line of CTR_EL0 [G18], for maintenance by virtual address.
+/// Only the VZ build's console driver keeps DMA buffers.
+#[cfg(feature = "vz")]
+pub(crate) fn data_lines(
+    range: core::ops::Range<usize>,
+) -> core::iter::StepBy<core::ops::Range<usize>> {
+    let (dline, _, _) = lines();
+    (range.start & !(dline - 1)..range.end.next_multiple_of(dline)).step_by(dline)
+}
+
 /// Makes the code in the frames `frames` visible to instruction fetch
 /// before a program may run it (spec 7.4, [G18]): `dc cvau` over every
 /// line of each whole page through the linear map, `dsb ish`, `ic ivau`

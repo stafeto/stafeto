@@ -68,7 +68,8 @@ static SCHED: Lock<Sched> = Lock::new(Sched {
 });
 
 /// EL0 entry timing on the single core. Interrupts stay masked from the
-/// exception vector through the first poll in `exit_loop`.
+/// exception vector through the first poll: in `exit_loop`, or between two
+/// portions of a long call (`entry_polled`).
 struct EntryTiming(UnsafeCell<(u64, u64)>);
 
 // SAFETY: the kernel runs on one core, and the entry-to-poll interval has
@@ -83,8 +84,10 @@ pub fn entry_started() {
     unsafe { (*ENTRY_TIMING.0.get()).0 = timer::now() };
 }
 
+/// The interval of the entry ends at its first poll for an interrupt:
+/// `exit_loop`'s, or one between two portions of a long call (spec 7.7).
 #[inline(always)]
-fn entry_polled() {
+pub fn entry_polled() {
     // SAFETY: single core with interrupts masked, as above.
     let timing = unsafe { &mut *ENTRY_TIMING.0.get() };
     if timing.0 != 0 {
@@ -97,6 +100,28 @@ fn entry_polled() {
 pub fn longest_entry_to_poll() -> u64 {
     // SAFETY: single core with interrupts masked, as above.
     unsafe { (*ENTRY_TIMING.0.get()).1 }
+}
+
+/// Whether an entry started and has not polled yet.
+#[cfg(feature = "ktest")]
+pub fn entry_unpolled() -> bool {
+    // SAFETY: single core with interrupts masked, as above.
+    unsafe { (*ENTRY_TIMING.0.get()).0 != 0 }
+}
+
+/// The start of the open entry interval, 0 when it has polled, and the
+/// longest interval so far.
+#[cfg(feature = "ktest")]
+pub fn entry_timing() -> (u64, u64) {
+    // SAFETY: single core with interrupts masked, as above.
+    unsafe { *ENTRY_TIMING.0.get() }
+}
+
+/// Puts `timing` back, as `entry_timing` read it.
+#[cfg(feature = "ktest")]
+pub fn set_entry_timing(timing: (u64, u64)) {
+    // SAFETY: single core with interrupts masked, as above.
+    unsafe { *ENTRY_TIMING.0.get() = timing };
 }
 
 /// The table of thread numbers, which the scheduler's lock guards: only
@@ -214,19 +239,62 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
 /// # Safety
 /// `t` is alive and the caller holds a reference throughout this call.
 pub unsafe fn interrupt(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+    // SAFETY: as the caller promises.
+    unsafe {
+        interrupt_if(t, cause, |thread| match thread.waits {
+            Some(_) => Ok(true),
+            None => Err(Error::BadState),
+        })
+    }
+}
+
+/// thread_upcall_request: the look at the target's state, the request
+/// and the look at its wait happen under the scheduler's lock with the
+/// interruption they decide, so no other path can start or end the wait
+/// in between (spec 8.1). BAD_STATE for a stopped or ended thread. A
+/// request that enables an entry ends an IPC wait as `interrupt` does;
+/// otherwise it stays pending for the target's next run.
+///
+/// # Safety
+/// As for `interrupt`.
+pub unsafe fn request_upcall(t: NonNull<Thread>, cause: u8) -> Result<(), Error> {
+    // SAFETY: as the caller promises.
+    unsafe {
+        interrupt_if(t, cause, |thread| {
+            if matches!(thread.sched.state(), State::Stopped | State::Dead) {
+                return Err(Error::BadState);
+            }
+            Ok(thread.upcall.request()? && thread.waits.is_some())
+        })
+    }
+}
+
+/// Under the lock, `decide` says whether to end the wait of `t`; then the
+/// interruption runs in the same critical section.
+///
+/// # Safety
+/// As for `interrupt`.
+unsafe fn interrupt_if(
+    t: NonNull<Thread>,
+    cause: u8,
+    decide: impl FnOnce(&mut Thread) -> Result<bool, Error>,
+) -> Result<(), Error> {
     let waited = locked(|k| {
         // SAFETY: the caller holds the thread; waits and queue membership
         // change together under this lock. A live IPC waiter is blocked.
         unsafe {
-            if t.as_ref().waits.is_none() {
-                return Err(Error::BadState);
+            if !decide(&mut *t.as_ptr())? {
+                return Ok(None);
             }
             let waited = channel::cancel(t, k);
             syscall::set_result(t, Err(Error::Interrupted));
             k.s.wake(t);
-            Ok(waited)
+            Ok::<_, Error>(Some(waited))
         }
     })?;
+    let Some(waited) = waited else {
+        return Ok(());
+    };
     // SAFETY: queued send handles are still owned by the interrupted thread.
     // Accepted sends have already moved them and hold no transit handles.
     unsafe { thread::drop_transit(t, cause) };

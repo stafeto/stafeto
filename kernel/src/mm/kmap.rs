@@ -228,16 +228,7 @@ pub fn switch_to_kernel_tables(boot: &Boot) {
             );
         }
         #[cfg(feature = "vz")]
-        for dev in [
-            Region {
-                base: 0x4000_0000,
-                size: 0x1000_0000,
-            },
-            Region {
-                base: 0x1_0000_0000,
-                size: 0x1_0000,
-            },
-        ] {
+        for dev in crate::vz_driver::DEVICES {
             let (base, size) = pages(dev);
             map(
                 &mut pt,

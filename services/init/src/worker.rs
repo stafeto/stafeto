@@ -259,7 +259,9 @@ extern "C" fn work(_: u64) -> ! {
             } => Some(load(&TABLE[place], label, &program)),
             Order::Teardown => {
                 // The handles close here, the cleanup at the worker's level.
-                drop(gone);
+                if let Some(gone) = gone {
+                    gone.release();
+                }
                 None
             }
             Order::ShowLog => {
@@ -270,7 +272,7 @@ extern "C" fn work(_: u64) -> ! {
                 if let Some(gone) = gone {
                     // The process goes, then its handles (spec 7.7).
                     let _ = sys::process_kill(gone.process());
-                    drop(gone);
+                    gone.release();
                 }
                 None
             }

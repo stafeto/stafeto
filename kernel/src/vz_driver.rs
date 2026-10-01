@@ -12,6 +12,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use kcore::bootinfo::Region;
 use kcore::layout::{LINEAR_BASE, image_pa};
 use virtio_drivers::device::console::VirtIOConsole;
 use virtio_drivers::transport::pci::PciTransport;
@@ -19,8 +20,23 @@ use virtio_drivers::transport::pci::bus::{Cam, DeviceFunction, MmioCam, PciRoot}
 use virtio_drivers::{BufferDirection, Hal, PhysAddr};
 
 const PCI: usize = LINEAR_BASE + 0x4002_8000;
-const ECAM: usize = LINEAR_BASE + 0x4000_0000;
+const ECAM_PA: u64 = 0x4000_0000;
+const ECAM: usize = LINEAR_BASE + ECAM_PA as usize;
 const BAR_PA: u64 = 0x1_0000_0000;
+
+/// The PCI windows this driver uses, ECAM and the console's BAR: the
+/// kernel tables map them (mm::kmap), and no device window may reach them
+/// (memory::forbid).
+pub const DEVICES: [Region; 2] = [
+    Region {
+        base: ECAM_PA,
+        size: 0x1000_0000,
+    },
+    Region {
+        base: BAR_PA,
+        size: 0x1_0000,
+    },
+];
 
 #[repr(align(4096))]
 struct Arena([u8; 128 * 1024]);
@@ -68,7 +84,7 @@ pub fn dma_range() -> core::ops::Range<usize> {
 pub fn prepare_dma() {
     // The boot table mapped the arena cacheable. Drop its cache lines before
     // the permanent tables map it as normal non-cacheable memory.
-    for p in dma_range().step_by(64) {
+    for p in crate::arch::cache::data_lines(dma_range()) {
         unsafe {
             asm!("dc civac, {p}", p = in(reg) p, options(nostack, preserves_flags));
         }
@@ -83,9 +99,7 @@ fn physical(pointer: usize) -> PhysAddr {
 }
 
 fn sync(pointer: usize, size: usize, op: &str) {
-    let start = pointer & !63;
-    let end = (pointer + size + 63) & !63;
-    for p in (start..end).step_by(64) {
+    for p in crate::arch::cache::data_lines(pointer..pointer + size) {
         unsafe {
             match op {
                 "clean" => asm!("dc cvac, {p}", p = in(reg) p, options(nostack, preserves_flags)),
@@ -112,7 +126,7 @@ unsafe impl Hal for Host {
     }
 
     unsafe fn mmio_phys_to_virt(paddr: PhysAddr, size: usize) -> NonNull<u8> {
-        assert!(paddr >= BAR_PA && paddr + size as u64 <= BAR_PA + 0x1_0000);
+        assert!(paddr >= BAR_PA && paddr + size as u64 <= BAR_PA + DEVICES[1].size);
         NonNull::new((LINEAR_BASE + paddr as usize) as *mut u8).unwrap()
     }
 

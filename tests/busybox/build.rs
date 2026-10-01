@@ -62,6 +62,8 @@ fn main() {
     run(Command::new(tools.join("clang"))
         .args([
             "--target=aarch64-none-elf",
+            // Cortex-A53 erratum 835769 (the PinePhone's A64).
+            "-mfix-cortex-a53-835769",
             "-ffreestanding",
             "-fno-stack-protector",
             "-O2",

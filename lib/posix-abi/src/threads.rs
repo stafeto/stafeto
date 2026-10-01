@@ -102,6 +102,8 @@ static CANCEL_JOIN_REPLY: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "transport-probe")]
 static OWNER_NATIVE: Once<Handle<Thread>> = Once(UnsafeCell::new(None));
 #[cfg(feature = "transport-probe")]
+static TIMER_PRIORITY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+#[cfg(feature = "transport-probe")]
 static OWNER_PARKED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "transport-probe")]
 static SIGNAL_SEND_GATE: AtomicU64 = AtomicU64::new(0);
@@ -159,26 +161,28 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
     if READY.load(Ordering::Acquire) {
         return Err(Error::BadState);
     }
-    let priority = sys::thread_info(&main)?.base;
     // Between reply and receive the owner is ready without a donated boost.
     // It must run at the process's ceiling to accept queued requests even when
     // another application thread computes at a higher FIFO priority than main.
-    // The process ceiling is not exposed by object_info. Denied priorities
-    // allocate nothing, so discover the highest permitted level once at startup.
-    let (endpoint, owner_priority) = (1..rt::abi::PRIORITY_LEVELS)
-        .rev()
-        .find_map(|level| match sys::channel_create(level) {
-            Err(Error::AccessDenied) => None,
-            result => Some(result.map(|channel| (channel, level))),
-        })
-        .ok_or(Error::AccessDenied)??;
+    let owner_priority = crate::ceiling()?;
+    // A process whose ceiling is its main thread's level puts the owner, the
+    // workers and the timer level with the application (init's POSIX
+    // record gives main + 1): say so, since nothing else would.
+    if sys::thread_info(&main).is_ok_and(|info| info.base >= owner_priority) {
+        rt::println!(
+            "posix-abi: the process ceiling {} is not above main; its helper threads compete with main",
+            owner_priority
+        );
+    }
+    let endpoint = sys::channel_create(owner_priority)?;
     crate::clock::watch(&endpoint).map_err(|status| {
         rt::println!("pthread clock watch failed: {:?}", status);
         Error::PeerClosed
     })?;
     // Reserve the timer before clients can exhaust the process memory quota.
-    // Initial pthreads all inherit main's scheduling policy and base priority.
-    let timer = sys::timer_create(&endpoint, priority)?;
+    // Its expiry wakes sleepers of every level, so it queues at the owner's
+    // level, ahead of the requests of application threads.
+    let timer = deadline_timer(&endpoint, owner_priority)?;
     unsafe {
         *CHANNEL.0.get() = Some(endpoint);
         *MAIN.0.get() = Some(main);
@@ -214,6 +218,14 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
         }
     }
     result
+}
+
+/// The owner's sleep and poll timer, its expiries queued at `level`. The
+/// probe build records the level: object_info reports no timer priority.
+fn deadline_timer(endpoint: &Handle<Channel>, level: u8) -> Result<Handle<Timer>, Error> {
+    #[cfg(feature = "transport-probe")]
+    TIMER_PRIORITY.store(level, Ordering::Release);
+    sys::timer_create(endpoint, level)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1492,6 +1504,18 @@ pub fn probe_owner_priority(priority: u8) -> u8 {
     let old = sys::thread_info(thread).expect("probe owner info").base;
     sys::thread_set_priority(thread, priority, Policy::Fifo).expect("probe owner priority");
     old
+}
+/// The base priority of the live thread owner and the priority its sleep
+/// timer was created with.
+#[cfg(feature = "transport-probe")]
+pub fn probe_owner_levels() -> (u8, u8) {
+    let thread = unsafe {
+        (*OWNER_NATIVE.0.get())
+            .as_ref()
+            .expect("probe owner handle")
+    };
+    let owner = sys::thread_info(thread).expect("probe owner info").base;
+    (owner, TIMER_PRIORITY.load(Ordering::Acquire))
 }
 #[cfg(feature = "transport-probe")]
 pub fn probe_wake_retries() -> u64 {

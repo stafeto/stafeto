@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Process heap owned by an IPC worker. Requests serialize allocation and
-//! inherit client priority after receive. The worker never calls exported
-//! allocation APIs. This does not establish a bounded real-time allocator.
+//! Process heap owned by an IPC worker at the process ceiling. Requests
+//! serialize allocation; the worker never calls exported allocation APIs.
+//! This does not establish a bounded real-time allocator.
 
 use crate::{constants::*, fail};
 use core::{
@@ -40,6 +40,8 @@ static ACK_TARGET: AtomicU64 = AtomicU64::new(0);
 static ACK_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "transport-probe")]
 static REJECT_NEW: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "transport-probe")]
+static WORKER: AtomicU64 = AtomicU64::new(0);
 
 struct Config {
     process: Handle<Process>,
@@ -78,13 +80,16 @@ pub unsafe fn init(process: Handle<Process>) -> Result<(), rt::abi::Error> {
                 worker,
                 STACK.top(),
                 0,
-                1,
+                crate::ceiling()?,
                 Policy::Fifo,
                 0xa00000,
             )
         }?;
         READY.store(true, Ordering::Release);
-        sys::thread_start(&thread)
+        sys::thread_start(&thread)?;
+        #[cfg(feature = "transport-probe")]
+        WORKER.store(thread.into_raw().0, Ordering::Release);
+        Ok(())
     })();
     if result.is_err() {
         READY.store(false, Ordering::Release);
@@ -296,6 +301,13 @@ fn call(bytes: &[u8; 40]) -> Result<(i32, usize), i32> {
         }
         return Ok((reply.words[0] as i32, reply.words[1] as usize));
     }
+}
+/// The base priority of the live heap worker.
+#[cfg(feature = "transport-probe")]
+pub fn probe_worker_base() -> u8 {
+    let raw = rt::abi::Handle(WORKER.load(Ordering::Acquire));
+    let thread = Handle::<rt::handle::Thread>::borrowed(raw);
+    sys::thread_info(&thread).expect("heap worker info").base
 }
 #[cfg(feature = "transport-probe")]
 pub fn probe_upcall(thread: &Handle<rt::handle::Thread>, op: u64) {

@@ -176,6 +176,19 @@ pub fn byte(bank: usize, intid: u32) -> (usize, u32) {
     (bank + (intid & !3) as usize, 8 * (intid % 4))
 }
 
+/// The GICD_ITARGETSR word that sends four shared lines to the reading
+/// CPU, from `banked`, its GICD_ITARGETSR0: each byte of that banked
+/// register holds the reading CPU's own interface bit (IHI 0048B 4.3.12),
+/// whichever core booted. A GIC with one CPU interface reads it as zero
+/// and ignores the targets; 0x01 then stands for interface 0 [G25].
+pub const fn spi_targets(banked: u32) -> u32 {
+    let own = match banked & 0xff {
+        0 => 0x01,
+        own => own,
+    };
+    own * 0x0101_0101
+}
+
 /// Offset and mask of the bit of GICD_ICFGR that makes `intid` edge-triggered
 /// when set and level-triggered when clear: bit 2·(n % 16) + 1 of the
 /// register at 0xC00 + 4·(n / 16) [G25].
@@ -231,6 +244,14 @@ mod tests {
         assert_eq!(byte(GICD_IPRIORITYR, 27), (0x418, 24));
         assert_eq!(byte(GICD_IPRIORITYR, 32), (0x420, 0));
         assert_eq!(byte(GICD_ITARGETSR, 33), (0x820, 8));
+    }
+
+    #[test]
+    fn shared_lines_target_the_banked_interface() {
+        assert_eq!(spi_targets(0), 0x0101_0101);
+        assert_eq!(spi_targets(0x0101_0101), 0x0101_0101);
+        assert_eq!(spi_targets(0x0404_0404), 0x0404_0404);
+        assert_eq!(spi_targets(0x8080_8080), 0x8080_8080);
     }
 
     #[test]

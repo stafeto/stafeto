@@ -386,11 +386,6 @@ const EL0_TESTS: &[El0Test] = &[
         done: done_pending_interrupt,
     },
     El0Test {
-        name: "fast_path_arms_the_timer",
-        start: start_armed,
-        done: done_armed,
-    },
-    El0Test {
         name: "quantum_ends_with_a_far_timer_set",
         start: start_far_timer,
         done: done_far_timer,
@@ -468,6 +463,11 @@ const ICOUNT_TESTS: &[El0Test] = &[
         name: "preempted_rr_thread_resumes_before_its_peer",
         start: start_rest,
         done: done_rest,
+    },
+    El0Test {
+        name: "fast_path_arms_the_timer",
+        start: start_armed,
+        done: done_armed,
     },
     El0Test {
         name: "teardown_yields_to_a_pending_interrupt",
@@ -1535,12 +1535,22 @@ fn timer_notice() -> [u64; 11] {
     .to_words()
 }
 
+/// How far ahead start_idle arms the alarm, in ns. The thread must reach
+/// its receive before the deadline, or the alarm's notice waits for it and
+/// the kernel never idles. That takes some 100 µs of the machine's time,
+/// but under TCG with no -icount the counter is the host's: a host that
+/// holds QEMU's thread off its CPU past a deadline 1 ms away failed these
+/// tests about once in 20 runs. 50 ms is five quanta of a busy
+/// host's scheduler; it costs 50 ms of the run per test with no -icount
+/// and nothing under -icount, whose idle kernel skips to the deadline.
+const IDLE_ALARM_NS: u64 = 50_000_000;
+
 /// The thread in slot 0 fills its registers from a pattern and waits in
-/// receive on the test's alarm, armed 1 ms from now; nothing else is ready
-/// meanwhile, so the kernel idles until the alarm's interrupt.
+/// receive on the test's alarm, armed IDLE_ALARM_NS from now; nothing else
+/// is ready meanwhile, so the kernel idles until the alarm's interrupt.
 fn start_idle(f: &mut Fixture) -> Result<(), &'static str> {
     let p = new_process(f, 0)?;
-    f.counter = timer::clock().deadline_after(timer::now(), 1_000_000);
+    f.counter = timer::clock().deadline_after(timer::now(), IDLE_ALARM_NS);
     let h = alarm(f, p, Some(f.counter))?;
     call_pattern(f, &[h, 0]);
     new_thread(
@@ -1557,6 +1567,7 @@ fn start_idle(f: &mut Fixture) -> Result<(), &'static str> {
 }
 
 fn done_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    reached_idle(f)?;
     check(
         f.fired_at == Some(f.counter),
         "the idle kernel did not arm the timer for the alarm",
@@ -1586,9 +1597,21 @@ fn done_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// The idle wait leaves the GIC's priority mask open: every line the
 /// kernel unmasked wakes it (spec 8.1).
 fn done_idle_mask(f: &Fixture, _: &Thread) -> Result<(), &'static str> {
+    reached_idle(f)?;
     check(
         f.idle_mask == Some(PRIORITY_MASK),
         "the idle wait changed GICC_PMR",
+    )
+}
+
+/// The kernel came to its idle wait (note_idle_stack) during the test: a
+/// thread that reached its receive only after the alarm's deadline finds
+/// the notice there and the kernel never idles, which says nothing of the
+/// idle wait itself.
+fn reached_idle(f: &Fixture) -> Result<(), &'static str> {
+    check(
+        f.idle_depth.is_some(),
+        "the kernel did not reach its idle wait before the alarm's deadline",
     )
 }
 
@@ -1596,6 +1619,7 @@ fn done_idle_mask(f: &Fixture, _: &Thread) -> Result<(), &'static str> {
 /// 11): x0 0 and the alarm's notification in x1-x11, and every other
 /// register, FP and SIMD ones too, as the pattern left it.
 fn done_wait_in_idle(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
+    reached_idle(f)?;
     let mut results = [0; 12];
     results[1..].copy_from_slice(&timer_notice());
     check_pattern(&t.regs, &f.patterns[0], &results)
@@ -2631,17 +2655,25 @@ fn done_far_timer(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 }
 
 /// A thread waits in receive for the test's alarm, 1 ms from the start,
-/// while a round-robin thread below it spins at EL0 for 2 ms, within its
-/// quantum: the kernel's timer serves the alarm, the nearer deadline
-/// (spec 8), and its interrupt comes while a program runs. The thread it
-/// wakes runs before the spinner ends, and the time from the alarm's
-/// deadline to it counts, from nothing at the start, as the latency of an
-/// interrupt outside idle (spec 16).
+/// while a round-robin thread below it spins at EL0 for SPIN_PAST_ALARM_NS:
+/// the kernel's timer serves the alarm, nearer than the end of the
+/// spinner's quantum (spec 8), and its interrupt comes while a program
+/// runs. The thread it wakes runs before the spinner ends, and the time
+/// from the alarm's deadline to it counts, from nothing at the start, as
+/// the latency of an interrupt outside idle (spec 16).
 fn start_timer_latency(f: &mut Fixture) -> Result<(), &'static str> {
+    // Under TCG with no -icount the counter is the host's: a host that
+    // holds QEMU's thread off its CPU across both the alarm's deadline and
+    // the spinner's end lets the spinner see its end before the interrupt
+    // comes. A spinner of 2 ms, 1 ms past the alarm, lost that race once
+    // in 20 runs on a busy host; 50 ms is five quanta of the
+    // host's scheduler. The spinner then runs on through quanta of its
+    // own, alone at its level.
+    const SPIN_PAST_ALARM_NS: u64 = 50_000_000;
     sched_process(f)?;
     let spin = sched_thread(f, 1, &raw const el0_spin_then_yield, PRIORITY, RR)?;
     let clock = timer::clock();
-    set_args(spin, &[word(0), clock.ns_to_ticks(2_000_000)]);
+    set_args(spin, &[word(0), clock.ns_to_ticks(SPIN_PAST_ALARM_NS)]);
     let p = f.processes[0].expect("the test's process");
     let at = clock.deadline_after(timer::now(), 1_000_000);
     let h = alarm(f, p, Some(at))?;
@@ -3708,6 +3740,8 @@ fn done_same_state(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// another process; the timer holds the end of the service's quantum. The
 /// first note arms the test's alarm half a quantum later, and the second
 /// request, on the fast path too, finds the timer armed for the alarm.
+/// The alarm has to come before the quantum ends, which no margin makes
+/// sure of on a busy host: the test runs under -icount only.
 fn start_armed(f: &mut Fixture) -> Result<(), &'static str> {
     snap_pair(f, PRIORITY + 2, RR, false)?;
     let p = f.processes[0].expect("the service's process");
@@ -3744,7 +3778,9 @@ fn done_armed(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
 /// path takes it, and the service notes the portion still queued. A client
 /// at 20, woken by the alarm, lets a thread go at 12, the service's level,
 /// and sends: the service works at its ceiling, 12, level with the
-/// cleanup, which runs first, on the slow path.
+/// cleanup, which runs first, on the slow path. The alarm is
+/// IDLE_ALARM_NS away, so that the early client sends first on a busy
+/// host too.
 fn start_cleanup_first(f: &mut Fixture) -> Result<(), &'static str> {
     let root = process::create_root(QUOTA, HANDLE_LIMIT, 12).map_err(|_| "no process")?;
     let s = with_programs(f, 1, root)?;
@@ -3762,8 +3798,8 @@ fn start_cleanup_first(f: &mut Fixture) -> Result<(), &'static str> {
     }
     let [requests, from_p] = shared_channel(s, Rights::RECEIVE, p, Rights::SEND)?;
     let from_q = give(q, Object::Channel(channel_of(s, requests)?), Rights::SEND)?;
-    let wake = timer::clock().deadline_after(timer::now(), 1_000_000);
-    let alarmed = alarm(f, p, Some(wake))?;
+    f.counter = timer::clock().deadline_after(timer::now(), IDLE_ALARM_NS);
+    let alarmed = alarm(f, p, Some(f.counter))?;
     let then = user_address(&raw const el0_release_then_send) as u64;
     set_args(server, &[requests, 2]);
     set_args(late, &[alarmed, 0, then, 0, 12, from_p]);
@@ -3786,6 +3822,10 @@ fn done_cleanup_first(f: &Fixture, t: &Thread) -> Result<(), &'static str> {
     let [Some(below), Some(above)] = f.snaps else {
         return Err("the service noted no state twice");
     };
+    check(
+        below.now < f.counter,
+        "the early client sent only after the late client's alarm",
+    )?;
     check(
         below.cleanup == Some(5) && below.hits == 1,
         "the fast path did not pass cleanup below the service",

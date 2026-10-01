@@ -5,6 +5,11 @@ xtask = "run --package xtask --"
 rustflags = [
     "-C", "force-frame-pointers=yes",
     "-C", "link-arg=--fix-cortex-a53-843419",
+    # Cortex-A53 erratum 835769 (PinePhone): a nop between a memory access
+    # and a 64-bit multiply-accumulate. rustc warns that the feature is
+    # unknown and unstable and still passes it to LLVM; xtask's
+    # disasm::erratum_835769 fails any build that loses it.
+    "-C", "target-feature=+fix-cortex-a53-835769",
 ]
 
 # Programs (spec 14): 4 KiB pages, each loadable segment on pages of its
@@ -15,4 +20,6 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=4096",
     "-C", "link-arg=-zseparate-loadable-segments",
     "-C", "link-arg=-znorelro",
+    # Erratum 835769, as above.
+    "-C", "target-feature=+fix-cortex-a53-835769",
 ]

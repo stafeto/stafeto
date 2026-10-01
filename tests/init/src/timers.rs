@@ -360,7 +360,17 @@ fn timer_never_fires_early() -> Outcome {
 /// the firing of LEVEL waits until S ends, and only then W, whose level is
 /// above S, gets its expiry. Only the priorities order them; a second on
 /// the counter only keeps S from spinning forever.
+///
+/// The deadline is SLOT_DEADLINE_NS away: it must still be ahead when both
+/// timers are armed. One armed past it posts its expiry from timer_set at
+/// once, with no firing at its slot's priority, and the order breaks: W
+/// wakes ahead of S, or H ends S before the interrupt for the other
+/// timer reaches QEMU's CPU and init finds W still waiting. Under TCG
+/// with no -icount the counter is the host's, and a host that held QEMU's
+/// thread off its CPU past 1 ms failed this test once in 20 runs.
+/// S spins until the deadline, so the margin costs its 50 ms of the run.
 fn timer_fires_at_its_slot_priority() -> Outcome {
+    const SLOT_DEADLINE_NS: u64 = 50_000_000;
     const SPIN: u8 = 15;
     reset_results();
     let low = channel(TEST_PRIORITY)?;
@@ -374,7 +384,7 @@ fn timer_fires_at_its_slot_priority() -> Outcome {
     let yielded = sys::yield_now();
     let s = spawn(2, look_once_ended, 1, SPIN, Policy::Fifo)?;
     let armed = clock_now().and_then(|now| {
-        let at = now + 1_000_000;
+        let at = now + SLOT_DEADLINE_NS;
         timers.iter().try_for_each(|t| arm(t, at))
     });
     let ran = armed.and_then(|()| let_run());

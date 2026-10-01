@@ -3,7 +3,7 @@
 
 //! Generic current-thread entries. Signal policy belongs to a higher-level library.
 use crate::sys;
-use abi::{Call, Error};
+use abi::{Call, Error, UpcallControl};
 
 /// Saved AArch64 execution state passed by a context-aware entry trampoline.
 /// The frame is live only until the dispatcher returns. The kernel validates
@@ -29,10 +29,21 @@ const _: () = {
     assert!(core::mem::offset_of!(Context, fpcr) == 800);
 };
 
-fn control(operation: u64) -> Result<bool, Error> {
+fn control(operation: UpcallControl) -> Result<bool, Error> {
     // SAFETY: control touches only current-thread delivery state.
     let result = unsafe {
-        sys::raw::<{ Call::ThreadUpcallControl.number() }>([operation, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        sys::raw::<{ Call::ThreadUpcallControl.number() }>([
+            operation.raw(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ])
     };
     match Error::from_code(result[0]) {
         Some(error) => Err(error),
@@ -64,14 +75,14 @@ pub unsafe fn bind(entry: unsafe extern "C" fn()) -> Result<(), Error> {
 }
 /// Stop entries until enable; returns whether they were already masked.
 pub fn mask() -> Result<bool, Error> {
-    control(0)
+    control(UpcallControl::Mask)
 }
 /// Allow entries, including immediately pending requests.
 /// # Safety
 /// The bound dispatcher may run before this call returns; all interrupted code
 /// and live resources must permit this asynchronous reentry.
 pub unsafe fn enable() -> Result<bool, Error> {
-    control(1)
+    control(UpcallControl::Enable)
 }
 /// Remove the entry after all handlers have returned.
 pub fn unbind() -> Result<(), Error> {
@@ -87,12 +98,12 @@ pub fn unbind() -> Result<(), Error> {
 #[must_use = "keep the guard until all protected references have ended"]
 pub struct DeferredEntry(core::marker::PhantomData<*mut ()>);
 pub fn defer_entries() -> Result<DeferredEntry, Error> {
-    control(3)?;
+    control(UpcallControl::Defer)?;
     Ok(DeferredEntry(core::marker::PhantomData))
 }
 impl Drop for DeferredEntry {
     fn drop(&mut self) {
-        control(4).expect("balanced current-thread entry deferral");
+        control(UpcallControl::Resume).expect("balanced current-thread entry deferral");
     }
 }
 
@@ -140,10 +151,10 @@ macro_rules! upcall_entry {
                 "add x10, sp, #816", "mov x11, #1088",
                 "2:", "ldp x12, x13, [x9], #16", "stp x12, x13, [x10], #16",
                 "subs x11, x11, #16", "b.ne 2b",
-                "mov x0, #2", "svc #{control}", "cbnz x0, 9f",
+                "mov x0, #{take}", "svc #{control}", "cbnz x0, 9f",
                 "str x2, [sp, #256]", "str x3, [sp, #264]",
                 $argument, "bl {dispatch}",
-                "mov x0, #0", "svc #{control}", "cbnz x0, 9f",
+                "mov x0, #{mask}", "svc #{control}", "cbnz x0, 9f",
                 "mrs x9, tpidrro_el0", "add x10, sp, #816", "mov x11, #1088",
                 "3:", "ldp x12, x13, [x10], #16", "stp x12, x13, [x9], #16",
                 "subs x11, x11, #16", "b.ne 3b",
@@ -155,6 +166,8 @@ macro_rules! upcall_entry {
                 "9:", "brk #0",
                 dispatch = sym $dispatch,
                 control = const $crate::abi::Call::ThreadUpcallControl.number(),
+                take = const $crate::abi::UpcallControl::Take.raw(),
+                mask = const $crate::abi::UpcallControl::Mask.raw(),
                 restore = const $crate::abi::Call::ThreadUpcallReturn.number(),
                 offset = const $crate::abi::UPCALL_CONTEXT_OFFSET,
                 size = const $crate::abi::UPCALL_CONTEXT_SIZE,

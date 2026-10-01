@@ -256,10 +256,10 @@ pub enum Call {
     ThreadInterrupt = 30,
     /// Register the current thread's upcall entry (zero disables it).
     ThreadUpcallBind = 31,
-    /// Current upcall control: 0 masks, 1 enables, 2 takes original PC/PSTATE.
-    /// 3 starts an entry deferral; 4 ends one. Deferral preserves the mask
-    /// and interrupts enabled IPC waits while delaying dispatcher execution.
-    /// x1 returns the previous mask; TAKE returns PC in x2 and PSTATE in x3.
+    /// Current upcall control: x0 is an `UpcallControl`. Deferral preserves
+    /// the mask and interrupts enabled IPC waits while delaying dispatcher
+    /// execution. x1 returns the previous mask; TAKE returns PC in x2 and
+    /// PSTATE in x3.
     ThreadUpcallControl = 32,
     /// Request an upcall through a MANAGE thread handle.
     ThreadUpcallRequest = 33,
@@ -1024,7 +1024,8 @@ pub struct KernelStats {
     /// level (spec 7.7, 10).
     pub longest_firing: u64,
     /// The longest time from an EL0 entry to the first pending-interrupt
-    /// poll on the way out of the kernel.
+    /// poll on the way out of the kernel, or between two portions of a long
+    /// call.
     pub entry_to_poll: u64,
 }
 
@@ -1116,6 +1117,42 @@ pub const PRIORITY_LEVELS: u8 = 64;
 
 /// The round-robin quantum (spec 8).
 pub const RR_QUANTUM_NS: u64 = 4_000_000;
+
+/// The operations of `thread_upcall_control` (x0), each on the current
+/// thread's entry state; any other value is INVALID_ARGS.
+#[repr(u64)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpcallControl {
+    /// Stop entries until ENABLE.
+    Mask = 0,
+    /// Allow entries; BAD_STATE while an entry waits for TAKE.
+    Enable = 1,
+    /// Take the PC and PSTATE an entry interrupted; BAD_STATE without one.
+    Take = 2,
+    /// Start one level of entry deferral.
+    Defer = 3,
+    /// End one level of entry deferral; BAD_STATE without one.
+    Resume = 4,
+}
+
+impl UpcallControl {
+    /// The operation a register holds; None for any other value.
+    pub const fn from_raw(raw: u64) -> Option<UpcallControl> {
+        match raw {
+            0 => Some(UpcallControl::Mask),
+            1 => Some(UpcallControl::Enable),
+            2 => Some(UpcallControl::Take),
+            3 => Some(UpcallControl::Defer),
+            4 => Some(UpcallControl::Resume),
+            _ => None,
+        }
+    }
+
+    /// The value for a register.
+    pub const fn raw(self) -> u64 {
+        self as u64
+    }
+}
 
 /// Scheduling policies (spec 8), as `thread_create` and
 /// `thread_set_priority` take them.
@@ -1461,6 +1498,24 @@ mod tests {
     fn sessions_have_fixed_bounds() {
         assert_eq!(CLIENT_GONE, 1 << 63);
         assert_eq!(MAX_SLOTS, 1024);
+    }
+
+    #[test]
+    fn upcall_control_keeps_five_numbered_operations() {
+        let operations = [
+            (UpcallControl::Mask, 0),
+            (UpcallControl::Enable, 1),
+            (UpcallControl::Take, 2),
+            (UpcallControl::Defer, 3),
+            (UpcallControl::Resume, 4),
+        ];
+        for (operation, raw) in operations {
+            assert_eq!(operation.raw(), raw);
+            assert_eq!(UpcallControl::from_raw(raw), Some(operation));
+        }
+        for raw in [5, 1 << 32, u64::MAX] {
+            assert_eq!(UpcallControl::from_raw(raw), None, "{raw:#x}");
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Private in-process owner of file and directory state. Explicit value
-//! messages own their payload in message pages; the worker never borrows a
-//! caller job or invokes an address supplied in a request.
+//! Private in-process owner of file and directory state, a worker at the
+//! process ceiling. Explicit value messages own their payload in message
+//! pages; the worker never borrows a caller job or invokes an address
+//! supplied in a request.
 
 use crate::{constants::*, directory::Streams, tls};
 use core::{
@@ -46,6 +47,26 @@ static PROBE_LOCAL_KIND: AtomicU64 = AtomicU64::new(0);
 static PROBE_LOCAL_TARGET: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "transport-probe")]
 static PROBE_LOCAL_LIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "transport-probe")]
+static PROBE_WORKER: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "transport-probe")]
+static PROBE_START: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// The base priority of the live file worker.
+#[cfg(feature = "transport-probe")]
+pub fn probe_worker_base() -> u8 {
+    let raw = rt::abi::Handle(PROBE_WORKER.load(Ordering::Acquire));
+    let thread = Handle::<rt::handle::Thread>::borrowed(raw);
+    sys::thread_info(&thread).expect("file worker info").base
+}
+
+/// Create the file worker at `priority` instead of the ceiling. A probe
+/// calls it before init to queue requests while the worker, below main,
+/// has not yet reached its receive.
+#[cfg(feature = "transport-probe")]
+pub fn probe_start_priority(priority: u8) {
+    PROBE_START.store(priority, Ordering::Release);
+}
 
 /// Request entry while the next local operation holds its file references.
 /// kind 1 selects value replies, kind 2 selects numeric replies. The target
@@ -170,12 +191,29 @@ pub unsafe fn init(process: &Handle<Process>, files: PosixFs) -> Result<(), rt::
     }
     PROCESS.store(process.raw().0, Ordering::Relaxed);
     let started = (|| {
+        let level = crate::ceiling()?;
+        #[cfg(feature = "transport-probe")]
+        let level = match PROBE_START.load(Ordering::Acquire) {
+            0 => level,
+            probe => probe,
+        };
         let thread = unsafe {
-            sys::thread_create(process, worker, STACK.top(), 0, 1, Policy::Fifo, 0xb00000)
+            sys::thread_create(
+                process,
+                worker,
+                STACK.top(),
+                0,
+                level,
+                Policy::Fifo,
+                0xb00000,
+            )
         }?;
         // Publish initialization before the worker can run. Startup excludes clients.
         READY.store(true, Ordering::Release);
-        sys::thread_start(&thread)
+        sys::thread_start(&thread)?;
+        #[cfg(feature = "transport-probe")]
+        PROBE_WORKER.store(thread.into_raw().0, Ordering::Release);
+        Ok(())
     })();
     if started.is_err() {
         READY.store(false, Ordering::Release);
