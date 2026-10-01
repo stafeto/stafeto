@@ -27,12 +27,12 @@ fn check(text: &str) -> Result<(), String> {
             register_part = true;
             seen_dispatch |= name == "kernel::syscall::dispatch";
             seen_zeroed |= name == "kernel::mm::phys::alloc_zeroed";
-            seen_deliver |= name == "kernel::channel::deliver";
+            seen_deliver |= name == "kernel::channel::message::deliver";
             continue;
         }
         // The register-only prefix ends at the length > 64 branch. The
         // remainder may copy the message buffer or handle records.
-        if symbol == "kernel::channel::deliver"
+        if symbol == "kernel::channel::message::deliver"
             && line.contains("\tsubs\t")
             && line.contains("#0x40")
         {
@@ -46,7 +46,7 @@ fn check(text: &str) -> Result<(), String> {
             || symbol.contains("::alloc_table")
             || symbol == "kernel::mm::kmap::map"
             || (symbol.starts_with("kernel::mm::aspace::") && symbol != "kernel::mm::aspace::init")
-            || (symbol == "kernel::channel::deliver" && register_part);
+            || (symbol == "kernel::channel::message::deliver" && register_part);
         if guarded && memory_call(line) {
             return Err(format!("{symbol} calls a memory helper: {line}"));
         }
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn catches_a_call_in_the_register_delivery_prefix() {
-        let text = "1 <kernel::syscall::dispatch>:\n2 <kernel::mm::phys::alloc_zeroed>:\n3 <kernel::channel::deliver>:\n4:\tbl\t<memcpy>\n";
+        let text = "1 <kernel::syscall::dispatch>:\n2 <kernel::mm::phys::alloc_zeroed>:\n3 <kernel::channel::message::deliver>:\n4:\tbl\t<memcpy>\n";
         assert!(check(text).is_err());
     }
 
