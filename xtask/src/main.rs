@@ -338,7 +338,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
-const ICOUNT_TESTS: [&str; 15] = [
+const ICOUNT_TESTS: [&str; 16] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -354,6 +354,7 @@ const ICOUNT_TESTS: [&str; 15] = [
     "interrupt_path_is_measured",
     "device_windows_are_measured",
     "upcall_calls_are_measured",
+    "process_kill_with_a_level_is_measured",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).

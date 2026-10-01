@@ -511,9 +511,9 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// Tests of the icount build besides TESTS and the EL0 tests: the first
 /// checks that the run is under -icount, the others measure the portions
 /// of the long calls of memory objects, the timers of programs, device
-/// windows and the calls of upcalls, whose counts mean instructions only
-/// there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 6 } else { 0 };
+/// windows, the calls of upcalls and process_kill with a level, whose
+/// counts mean instructions only there (spec 15.3).
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 7 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -548,6 +548,11 @@ pub fn run(boot: &Boot) -> ! {
     report(
         "upcall_calls_are_measured",
         calls::upcall_calls_are_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "process_kill_with_a_level_is_measured",
+        calls::process_kill_with_a_level_is_measured(boot),
     );
     el0::run()
 }

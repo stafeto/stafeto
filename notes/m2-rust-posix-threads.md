@@ -48,7 +48,10 @@ kernel's notification of its end, once it left the scheduler, makes the owner
 take its stack back and wake its joiner, also for a thread that ended past the
 library (its value is null). The 1 ms timer only watches main, which init made
 with no exit channel, once it said EXIT, and retries a cancellation whose
-thread has not begun to wait yet.
+thread has not begun to wait yet. The owner's channel has no label for the
+ends, so each notification makes the owner read THREAD_STATE of every live
+or exiting pthread, up to 64 calls at its ceiling, instead of one session
+and its handle for each thread.
 Initial pthreads inherit main's priority; the timer uses that priority.
 Future scheduling interfaces must update this priority arrangement.
 Polling waits in the guest probe sleep instead of starving a FIFO IPC owner.

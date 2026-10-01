@@ -4403,6 +4403,42 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
     )
 }
 
+/// process_kill with a level below the caller's priority under -icount
+/// (spec 7.7, 11): the caller at 10 kills a child with a running thread at
+/// level 1, and the call returns once the part in the call is done, its
+/// teardown left in the cleanup queue (its stage Threads at S). The test prints the call's ticks, `process kill
+/// ticks: level=...`, which xtask records; no number fails it (spec 15.3).
+#[cfg(feature = "icount")]
+pub fn process_kill_with_a_level_is_measured(_: &Boot) -> Result<(), &'static str> {
+    let counts = (thread::in_use(), process::in_use());
+    syscall::clear_call_maximum(Call::ProcessKill.number());
+    let result = with_caller(|c| {
+        let child = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no child")?;
+        let made = running(child).and_then(|t| {
+            let h = c.insert(Object::Process(child), Rights::MANAGE)?;
+            let killed = c.succeeds(Call::ProcessKill.number(), &[h.0, 1], &[]);
+            let queued = cleanup::len() > 0;
+            c.close(h)?;
+            // SAFETY: the test's reference to the thread goes; the kill
+            // took the kernel's.
+            unsafe { thread::release(t, CAUSE) };
+            killed?;
+            check(queued, "the teardown did not wait in the cleanup queue")
+        });
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(child, CAUSE) };
+        cleanup::drain();
+        made
+    });
+    let ticks = syscall::call_maxima()[Call::ProcessKill.number() as usize];
+    kprintln!("process kill ticks: level={ticks}");
+    result?;
+    check(
+        ticks > 0 && (thread::in_use(), process::in_use()) == counts,
+        "process_kill was not timed, or a thread or a process stayed",
+    )
+}
+
 /// What `upcall_calls_are_measured` builds and calls for the caller `c`:
 /// the threads it waits on go into `threads`, two senders of `other`'s,
 /// for the caller to end.

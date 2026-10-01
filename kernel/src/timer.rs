@@ -128,6 +128,9 @@ pub fn create(
     priority: u8,
 ) -> Result<NonNull<Timer>, Error> {
     process::timer_room(payer)?;
+    // The check and the count below are two steps: right on one core with
+    // no preemption inside the kernel; more cores need one fetch_update.
+    // The bound is shared by all: 43 processes of 192 timers reach it.
     if CREATED.load(Ordering::Relaxed) >= MAX_SYSTEM_TIMERS {
         return Err(Error::LimitReached);
     }

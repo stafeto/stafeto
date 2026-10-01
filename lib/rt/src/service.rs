@@ -507,6 +507,7 @@ fn session<S: Service<K>, const K: usize>(
 ) -> Option<&mut Session<S::Data, K>> {
     let found = match place {
         Some(i) => {
+            debug_assert!(i < S::PLACED, "a place past those Service::place gives");
             let s = table.get(i)?;
             if s.as_ref().is_some_and(|s| s.label != label) {
                 return None;
