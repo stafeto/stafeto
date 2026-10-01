@@ -2736,11 +2736,12 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
 /// The lines whose rows are each one stretch of the kernel between two
 /// polls for interrupts: a portion of a long call, of the timer queue or
 /// of the cleanup, or a whole short call (spec 15.3).
-const PORTION_LINES: [&str; 5] = [
+const PORTION_LINES: [&str; 6] = [
     "memory portions",
     "timer portions",
     "interrupt path",
     "device window",
+    "upcall",
     "teardown portions",
 ];
 
@@ -3826,8 +3827,9 @@ mod tests {
         }
     }
 
-    /// B is the longest row of any line of portions, never the count of
-    /// threads and never a row of a line that is no portion.
+    /// B is the longest row of any line of portions or short calls, never
+    /// the count of threads and never a row of the round trip, which spans
+    /// two calls.
     #[test]
     fn blocking_time_is_the_longest_row_but_threads() {
         let line =
@@ -3841,7 +3843,7 @@ mod tests {
             line("timer portions", &TIMER_PORTION_ROWS, &timers),
             line("interrupt path", &INTERRUPT_PATH_ROWS, &[1, 2, 3, 4]),
             line("device window", &WINDOW_ROWS, &[1, 2, 3]),
-            line("upcall", &UPCALL_ROWS, &[1, 2, 3, 4, 99_999]),
+            line("upcall", &UPCALL_ROWS, &[1, 2, 3, 4, 5]),
             line("teardown portions", &TEARDOWN_ROWS, &teardown),
         ];
         assert_eq!(
@@ -3864,6 +3866,9 @@ mod tests {
         assert_eq!(blocking_time(&measured), ("timer portions", "fire", 32));
         measured[4].2[1] = 33;
         assert_eq!(blocking_time(&measured), ("device window", "map", 33));
+        // An upcall call is a stretch of its own as well.
+        measured[5].2[4] = 34;
+        assert_eq!(blocking_time(&measured), ("upcall", "return", 34));
     }
 
     /// A child's panic is its place and its message on two whole lines, and

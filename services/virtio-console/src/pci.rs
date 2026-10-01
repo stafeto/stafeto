@@ -26,6 +26,9 @@ pub const CAPABILITIES: usize = 0x34;
 /// `cfg_type` of the common configuration (Virtio 1.2, 4.1.4).
 const VENDOR_CAPABILITY: u32 = 0x09;
 const COMMON_CONFIG: u32 = 1;
+/// The first byte past the header of the configuration space, where
+/// capabilities begin.
+const FIRST_CAPABILITY: usize = 0x40;
 /// The capabilities a list may hold: 48 fit in the 192 bytes past the
 /// header, so a longer walk is a loop in the list.
 const MOST_CAPABILITIES: usize = 48;
@@ -65,22 +68,29 @@ pub fn bus_master(command: u32) -> u32 {
 
 /// Where the function's capability list puts the Virtio common
 /// configuration, as (BAR, offset), from `read`, the 32-bit registers of
-/// the configuration space: the first vendor capability of `cfg_type` 1.
-/// None when the list holds none or does not end. init stops the device
+/// the configuration space: the first vendor capability of `cfg_type` 1
+/// and at least 16 bytes long. None when the list holds none or does not
+/// end. The walk follows the rules of `virtio-drivers`, so that both take
+/// the same structure: a capability shorter than 16 bytes is passed over,
+/// and a next pointer below 0x40 or off a word ends the list. init stops the device
 /// through `device_status` at 0x14 of BAR 0 (init's table for VZ), so the
 /// driver starts only where the structure lies at offset 0 of BAR 0.
 pub fn common_config(mut read: impl FnMut(usize) -> u32) -> Option<(u8, u32)> {
     let mut at = (read(CAPABILITIES) & 0xFC) as usize;
+    if at < FIRST_CAPABILITY {
+        return None;
+    }
     for _ in 0..MOST_CAPABILITIES {
-        if at == 0 {
-            return None;
-        }
         // cap_vndr, cap_next, cap_len, cfg_type; then bar; then offset.
         let head = read(at);
-        if head & 0xFF == VENDOR_CAPABILITY && (head >> 24) & 0xFF == COMMON_CONFIG {
+        let len = (head >> 16) & 0xFF;
+        if head & 0xFF == VENDOR_CAPABILITY && len >= 16 && head >> 24 == COMMON_CONFIG {
             return Some((read(at + 4) as u8, read(at + 8)));
         }
-        at = ((head >> 8) & 0xFC) as usize;
+        at = ((head >> 8) & 0xFF) as usize;
+        if at < FIRST_CAPABILITY || at & 3 != 0 {
+            return None;
+        }
     }
     None
 }
@@ -148,5 +158,29 @@ mod tests {
             (0x50, 0x0214_4009),
         ];
         assert_eq!(common_config(space(&looped)), None);
+        // A common configuration of 12 bytes is passed over, and the one
+        // after it taken, as virtio-drivers does.
+        let short = [
+            (CAPABILITIES, 0x40),
+            (0x40, 0x010C_5009),
+            (0x50, 0x0110_0009),
+            (0x54, 2),
+            (0x58, 0),
+        ];
+        assert_eq!(common_config(space(&short)), Some((2, 0)));
+        // A next pointer into the header, or off a word, ends the list
+        // before the common configuration behind it.
+        let into_header = [
+            (CAPABILITIES, 0x40),
+            (0x40, 0x0000_3011),
+            (0x30, 0x0110_0009),
+        ];
+        assert_eq!(common_config(space(&into_header)), None);
+        let unaligned = [
+            (CAPABILITIES, 0x40),
+            (0x40, 0x0000_5211),
+            (0x52, 0x0110_0009),
+        ];
+        assert_eq!(common_config(space(&unaligned)), None);
     }
 }
