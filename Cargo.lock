@@ -94,7 +94,6 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
- "process-client",
  "proto-init",
  "proto-wire",
  "rt",
@@ -255,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "posix-credentials",
  "posix-heap",
+ "process-client",
  "proto-init",
  "proto-process",
  "proto-wire",

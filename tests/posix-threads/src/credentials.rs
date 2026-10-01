@@ -109,6 +109,44 @@ fn settled(c: &Client, count: u64) -> bool {
 fn native() -> Handle<rt::handle::Process> {
     sys::process_create(65536, 16, 30).unwrap()
 }
+/// The raw values of the sessions `children` holds.
+static CHILDREN: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
+/// 32 Child of one record succeed, the 33rd is FULL though records are
+/// free, and once the sessions closed the records are free again. The
+/// failed stage, if any.
+#[inline(never)]
+fn children(c: &Client, child: &Handle<rt::handle::Process>, baseline: u64) -> Option<usize> {
+    let mut made = 0;
+    let mut full = false;
+    for slot in &CHILDREN {
+        match c.child(child) {
+            Ok((_, session)) => {
+                slot.store(session.into_raw().0, Ordering::Relaxed);
+                made += 1;
+            }
+            Err(status) => {
+                full = status.code() == proto_process::FULL;
+                break;
+            }
+        }
+    }
+    let count = c.stats().unwrap()[4];
+    for slot in &CHILDREN {
+        let raw = slot.swap(0, Ordering::Relaxed);
+        if raw != 0 {
+            drop(core::mem::ManuallyDrop::into_inner(
+                Handle::<Channel>::borrowed(rt::abi::Handle(raw)),
+            ));
+        }
+    }
+    if made != 32 || !full || count != baseline + 32 {
+        return Some(514);
+    }
+    if !settled(c, baseline) {
+        return Some(515);
+    }
+    None
+}
 /// The records' bound: the service fills its free records with copies of
 /// one native child, keeping their sessions (transport-probe), up to
 /// RECORDS in all; Child is FULL then, and once the service let the
@@ -257,6 +295,18 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     if !settled(c, baseline) {
         return failed(512);
     }
+    // Child takes a process handle with MANAGE alone, and one record makes
+    // CHILDREN_MAX (32) live records at most; its end gives them back.
+    let child = native();
+    let weak = c.child_with(&child, rt::abi::Rights::DUPLICATE);
+    if weak.err() != Some(Status::from_code(proto_process::PERMISSION)) {
+        return failed(513);
+    }
+    if let Some(stage) = children(c, &child, baseline) {
+        return failed(stage);
+    }
+    sys::process_kill(&child).unwrap();
+    drop(child);
     if let Some(stage) = bound(c, baseline) {
         return failed(stage);
     }

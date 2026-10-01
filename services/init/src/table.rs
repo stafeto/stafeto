@@ -39,8 +39,9 @@ pub const START_DATA_NAMES: [&str; 4] = ["console", "log", "trace", PROCESS_SERV
 /// The name of the POSIX process service (spec 2, section 3.1). A record
 /// that connects to it is a POSIX process: init takes no CONNECT to it, and
 /// gives the process the session of its record in its start data under
-/// this name instead, which init's worker asks the service for with Create
-/// through the service's registered channel, the one copy with no label.
+/// this name instead: the service takes the process with ADOPT and gives
+/// the session back with ADOPTED (serve.rs), and the process starts then.
+/// Init never sends the service a request (spec 6.7).
 pub const PROCESS_SERVICE: &str = "posix";
 /// The lines a binding takes: the shared lines of the GIC (spec 9).
 pub const SHARED_LINES: RangeInclusive<u32> = 32..=1019;

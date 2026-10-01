@@ -6,9 +6,11 @@
 //! it serves through `handle_label` on its own channel, the label naming
 //! the record (proto_process::Label), so the label of a request finds its
 //! record in O(1) and no kernel call names a process. Create comes only
-//! through the channel with no label, which init alone holds since it took
-//! the copy at REGISTER; Child through the session of a record, which the
-//! new record inherits its credentials from. A record goes with the
+//! through the channel with no label, from the service's own adopter
+//! (adopt.rs), which takes the processes init loaded with ADOPT; Child
+//! through the session of a record, which the new record inherits its
+//! credentials from, CHILDREN_MAX at a time. Either takes a process handle
+//! with MANAGE alone, which the service calls with later. A record goes with the
 //! CLIENT_GONE of its session, once the last copy of it closed: when its
 //! process ended, or when nobody took the session.
 #![no_std]
@@ -21,6 +23,7 @@ use rt::{
     service::{Answer, Config, Heartbeat, Request, Service, Session},
     sys,
 };
+mod adopt;
 mod replies;
 use core::mem::ManuallyDrop;
 use replies::{Journal, Reply};
@@ -31,7 +34,14 @@ struct Record {
     label: Label,
     parent: u32,
     credentials: Credentials,
+    /// The live records Child made through its session.
+    children: u32,
+    /// The record whose Child made it, by its label.
+    maker: Option<Label>,
 }
+/// The live records one record makes through Child at most, so that no
+/// process fills the table (RLIMIT_NPROC of 5b replaces it).
+const CHILDREN_MAX: u32 = 32;
 /// The sessions of the loop: init's through the channel with no label at
 /// place 0, a record's at its index plus 1 (`Service::place`), and a few
 /// for labels no record has.
@@ -72,8 +82,11 @@ fn main(_: u64) -> u64 {
     if rt::service::register(&start.parent, &channel).is_err() {
         return 4;
     }
-    let args = proto_init::ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |i| i.base);
+    if adopt::start(&start.process, &start.parent, &channel, level).is_err() {
+        return 6;
+    }
+    let args = proto_init::ServiceArgs::read(start.args()).ok();
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -135,14 +148,28 @@ impl Processes {
     }
     /// A new record of the process the request brought, with `parent` and
     /// `credentials`: the reply is its snapshot and its session (`add`).
-    fn insert(&mut self, r: &mut Request<'_>, parent: u32, credentials: Credentials) -> Answer {
+    fn insert(
+        &mut self,
+        r: &mut Request<'_>,
+        parent: u32,
+        credentials: Credentials,
+        maker: Option<Label>,
+    ) -> Answer {
+        // The service calls with the handle later (process_kill, mem_map).
+        let manages = r
+            .handles
+            .info(0)
+            .is_some_and(|(_, rights)| rights.contains(Rights::MANAGE));
+        if !manages {
+            return refuse(proto_process::PERMISSION);
+        }
         let Ok(process) = r.handles.take::<Process>(0) else {
             return Answer::Status(Status::BadSize);
         };
         if sys::process_state(&process) != Ok(ProcessState::Alive) {
             return refuse(proto_process::UNREGISTERED);
         }
-        match self.add(process, parent, credentials) {
+        match self.add(process, parent, credentials, maker) {
             Ok((index, session)) => {
                 snapshot(r, self.records[index].as_ref().expect("new record"));
                 Answer::Reply([session.erase()].into())
@@ -158,6 +185,7 @@ impl Processes {
         process: Handle<Process>,
         parent: u32,
         credentials: Credentials,
+        maker: Option<Label>,
     ) -> Result<(usize, Handle<Channel>), Status> {
         if self.free_len == 0 {
             return Err(Status::from_code(proto_process::FULL));
@@ -178,7 +206,15 @@ impl Processes {
             label,
             parent,
             credentials,
+            children: 0,
+            maker,
         });
+        if let Some(m) = maker {
+            self.records[usize::from(m.index)]
+                .as_mut()
+                .expect("a live maker")
+                .children += 1;
+        }
         Ok((i, session))
     }
 }
@@ -216,7 +252,7 @@ impl Service<0> for Processes {
             } else {
                 Credentials::NOBODY
             };
-            return self.insert(r, INIT_PID, credentials);
+            return self.insert(r, INIT_PID, credentials, None);
         }
         #[cfg(feature = "transport-probe")]
         if r.method() == 6 {
@@ -326,7 +362,7 @@ impl Service<0> for Processes {
                     let Ok(copy) = sys::handle_duplicate(&process, Rights::MANAGE) else {
                         break;
                     };
-                    match self.add(copy, pid, Credentials::NOBODY) {
+                    match self.add(copy, pid, Credentials::NOBODY, None) {
                         Ok((_, session)) => {
                             self.held[slot] = Some(session);
                             made += 1;
@@ -348,8 +384,11 @@ impl Service<0> for Processes {
                 return Answer::Status(Status::BadSize);
             }
             let parent = self.records[index].as_ref().expect("registered parent");
-            let (pid, credentials) = (parent.label.pid(), parent.credentials);
-            return self.insert(r, pid, credentials);
+            if parent.children >= CHILDREN_MAX {
+                return refuse(proto_process::FULL);
+            }
+            let (label, credentials) = (parent.label, parent.credentials);
+            return self.insert(r, label.pid(), credentials, Some(label));
         }
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
@@ -447,6 +486,13 @@ impl Service<0> for Processes {
             self.replies.reject = None;
         }
         if let Some(index) = self.find(label) {
+            let maker = self.records[index].as_ref().and_then(|r| r.maker);
+            if let Some(m) = maker
+                && let Some(i) = self.find(m.raw())
+                && let Some(made) = self.records[i].as_mut()
+            {
+                made.children -= 1;
+            }
             self.records[index] = None;
             self.free[self.free_len] = index as u16;
             self.free_len += 1;

@@ -18,6 +18,7 @@ transport-probe = []
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 proto-init = { path = "../../proto/init" }
+process-client = { path = "../../lib/process-client" }
 rt = { path = "../../lib/rt" }
 posix-credentials = { path = "../../lib/posix-credentials" }
 posix-heap = { path = "../../lib/posix-heap" }

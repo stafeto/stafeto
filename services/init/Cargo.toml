@@ -48,4 +48,3 @@ uart = { path = "../uart" }
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }
-process-client = { path = "../../lib/process-client" }

@@ -87,11 +87,13 @@ Bounded paths with interrupts masked are listed in
   identity and credentials for the POSIX layer (`proto/clock`,
   `proto/process`). The process service keeps 256 records, PID = index +
   256 * generation, and gives each its session through a label of its
-  own; `init` asks it for the session of each POSIX process it starts
-  (`Create`, root only for the record of the table that has it) and puts
-  the session in the process's start data, and a process gets one for its
-  native child (`Child`). A record goes with the last copy of its
-  session.
+  own. A thread of the service asks `init` for each POSIX process `init`
+  loaded (`ADOPT`, root only for the record of the table that has it),
+  makes its record and gives `init` the session (`ADOPTED`), which `init`
+  puts in the process's start data before the process starts; `init`
+  never sends the service a request. A process gets a session for its
+  native child (`Child`, 32 live children a record, a handle with
+  `MANAGE`). A record goes with the last copy of its session.
 
 ## Rust POSIX layer
 

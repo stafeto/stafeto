@@ -4,9 +4,12 @@
 //! Process protocol v2 (spec 2, section 3.1). The service gives every
 //! session it serves: the label of the session names the caller's record
 //! (`Label`), never the body. Create comes only through the service's
-//! channel with no label, which init alone holds: body root u32 (0 or 1),
-//! one process handle. Child comes through a session: no body, one process
-//! handle, the new record inheriting the caller's credentials. Both reply
+//! channel with no label, from the service's own thread that takes the
+//! processes init loaded (proto_init ADOPT): body root u32 (0 or 1), one
+//! process handle. Child comes through a session: no body, one process
+//! handle, the new record inheriting the caller's credentials, 32 live
+//! children a record at most (FULL). Either handle carries MANAGE
+//! (PERMISSION otherwise). Both reply
 //! with the snapshot and one handle, the new record's session. Query has no
 //! body or handles. Snapshot reply: status u32, pid u32, parent u32,
 //! uid/euid/suid/gid/egid/sgid u32. Change: nonce u64, operation u32, id

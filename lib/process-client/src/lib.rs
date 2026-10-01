@@ -94,12 +94,20 @@ impl Client {
         body: &[u8],
         process: &Handle<Process>,
     ) -> Result<(Snapshot, Handle<Channel>), Status> {
+        self.register_with(method, body, process, Rights::MANAGE)
+    }
+    fn register_with(
+        &self,
+        method: Method,
+        body: &[u8],
+        process: &Handle<Process>,
+        rights: Rights,
+    ) -> Result<(Snapshot, Handle<Channel>), Status> {
         let mut w = Writer::new();
         method.header().write(&mut w)?;
         w.bytes(body)?;
         loop {
-            let rights = Rights::MANAGE | Rights::TRANSFER;
-            let handle = sys::handle_duplicate(process, rights)?;
+            let handle = sys::handle_duplicate(process, rights | Rights::TRANSFER)?;
             let mut reply = match sys::send_handles(&self.channel, w.as_bytes(), [handle.erase()]) {
                 Err(error) if error.error == Error::Interrupted => continue,
                 other => other.map_err(|e| Status::Kernel(e.error))?,
@@ -210,6 +218,16 @@ impl Client {
             return Err(Status::BadSize);
         }
         Ok(())
+    }
+    /// Child with a copy of `child` with `rights` and TRANSFER (the probe
+    /// of the right the service checks).
+    #[cfg(feature = "transport-probe")]
+    pub fn child_with(
+        &self,
+        child: &Handle<Process>,
+        rights: Rights,
+    ) -> Result<(Snapshot, Handle<Channel>), Status> {
+        self.register_with(Method::Child, &[], child, rights)
     }
     /// A session of the service with `label`, which names no record (the
     /// probe of a session the service did not give).
