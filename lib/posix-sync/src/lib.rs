@@ -154,6 +154,19 @@ struct Held<'a> {
     block: Option<&'a Block>,
 }
 
+/// Whether `block`'s thread holds or waits for a raising lock of the
+/// layer, and so stays at the ceiling.
+fn raised(block: &Block) -> bool {
+    block.flags.load(Ordering::Relaxed) & flag::RAISED_MASK != 0
+}
+
+/// Moves the thread of `block` to `level` through its own handle.
+fn set_level(block: &Block, level: u8) {
+    if let Some(thread) = own_thread(block) {
+        let _ = sys::thread_set_priority(&thread, level, Policy::Fifo);
+    }
+}
+
 fn lock(bucket: &'static Bucket) -> Held<'static> {
     enter();
     let block = current();
@@ -162,18 +175,32 @@ fn lock(bucket: &'static Bucket) -> Held<'static> {
             block.flags.fetch_or(flag::BUCKET, Ordering::Relaxed) & flag::BUCKET == 0,
             "one lock of a bucket at a time"
         );
-        if let Some(thread) = own_thread(block) {
-            let ceiling = CEILING.load(Ordering::Relaxed);
-            if ceiling != 0 {
-                let _ = sys::thread_set_priority(&thread, ceiling, Policy::Fifo);
-            }
+        let ceiling = CEILING.load(Ordering::Relaxed);
+        if ceiling != 0 && !raised(block) {
+            set_level(block, ceiling);
         }
     }
+    // One processor (spec 2, 3.4; #8): the holder runs at the ceiling and
+    // holds no second lock of a bucket, so only a holder preempted before
+    // its raise can make this loop turn, and yielding runs it. The step of
+    // rule 3 of the ABI for several processors (16 tries, then the node on
+    // the stack, a bit and a look again) comes with #8; a build for more
+    // than one processor must not take this loop as it is: a debug build
+    // stops when the loop turns more than a holder preempted before its
+    // raise can make it.
+    let mut turns = 0u32;
     while bucket
         .lock
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        if cfg!(debug_assertions) {
+            turns += 1;
+            assert!(
+                turns < 64,
+                "the lock of a bucket yields for one processor only (#8)"
+            );
+        }
         // The holder is a thread of this process at the ceiling, preempted:
         // yielding gives it the processor.
         let _ = sys::yield_now();
@@ -188,11 +215,9 @@ impl Drop for Held<'_> {
             debug_assert!(
                 block.flags.fetch_and(!flag::BUCKET, Ordering::Relaxed) & flag::BUCKET != 0
             );
-            if let Some(thread) = own_thread(block)
-                && CEILING.load(Ordering::Relaxed) != 0
-            {
-                let base = block.base_level.load(Ordering::Relaxed) as u8;
-                let _ = sys::thread_set_priority(&thread, base, Policy::Fifo);
+            // A holder of a raising lock of the layer stays at the ceiling.
+            if CEILING.load(Ordering::Relaxed) != 0 && !raised(block) {
+                set_level(block, block.base_level.load(Ordering::Relaxed) as u8);
             }
         }
         leave();
@@ -298,6 +323,7 @@ pub fn futex_wait(
             .level
             .store(block.base_level.load(Ordering::Relaxed), Ordering::Relaxed);
         insert(&held, block);
+        block.flags.fetch_or(flag::WAITING, Ordering::SeqCst);
     }
     let channel = Handle::<Channel>::borrowed(abi::Handle(channel));
     let timer = Handle::<Timer>::borrowed(abi::Handle(timer));
@@ -334,13 +360,51 @@ pub fn futex_wait(
         let _ = sys::timer_cancel(&timer);
     }
     let held = lock(bucket);
+    block.flags.fetch_and(!flag::WAITING, Ordering::SeqCst);
     if block.address.load(Ordering::Relaxed) == address {
         remove(&held, block);
         outcome
     } else {
-        // A waker unlinked the node: the wait was answered.
+        // A waker unlinked the node, or an entry did (`abandon`): the wait
+        // was answered.
         Ok(outcome.unwrap_or(Woken::Woken))
     }
+}
+
+/// For the entry of signals, before its first handler: when the calling
+/// thread is in a wait by address, the wait ends here. Its node leaves the
+/// bucket, if a waker has not unlinked it already, so that a handler that
+/// waits by address, sleeps or takes a lock of the layer with the same
+/// block finds no node of it linked, and no wake meant for the wait is
+/// eaten by a wait of the handler unnoticed. Returns whether the thread was
+/// in a wait; `resume_wait` with it after the handlers.
+pub fn abandon() -> bool {
+    let Some(block) = current() else {
+        return false;
+    };
+    if block.flags.fetch_and(!flag::WAITING, Ordering::SeqCst) & flag::WAITING == 0 {
+        return false;
+    }
+    let address = block.address.load(Ordering::Relaxed);
+    if address != 0 {
+        let held = lock(bucket(address));
+        if block.address.load(Ordering::Relaxed) == address {
+            remove(&held, block);
+        }
+    }
+    true
+}
+
+/// After the handlers of an entry that `abandon` ended a wait for: the wait
+/// goes on as one that was woken, with WAKE in its slot (a spurious wakeup,
+/// which `futex_wait` allows): its caller looks at its word again.
+pub fn resume_wait(abandoned: bool) {
+    let Some(block) = current().filter(|_| abandoned) else {
+        return;
+    };
+    block.flags.fetch_or(flag::WAITING, Ordering::SeqCst);
+    let channel = Handle::<Channel>::borrowed(abi::Handle(block.channel.load(Ordering::Relaxed)));
+    let _ = sys::notify(&channel, bit::WAKE);
 }
 
 /// Wakes up to `count` threads that wait on `word`, the highest level
@@ -400,17 +464,34 @@ pub fn bucket_waiters(word: *const AtomicU32) -> u32 {
 /// long as it holds it.
 pub struct LayerLock {
     word: AtomicU32,
+    raise: bool,
 }
 
 impl LayerLock {
+    /// A lock whose holder stays at its own level: no call of the kernel
+    /// with no rival.
     pub const fn new() -> Self {
         LayerLock {
             word: AtomicU32::new(0),
+            raise: false,
+        }
+    }
+
+    /// A lock whose holder runs at the ceiling of the process from before
+    /// it takes the word until after it lets it go, as the holder of the
+    /// lock of a bucket (immediate ceiling): no application thread delays
+    /// it. Two calls of the kernel a section, none for a thread already at
+    /// the ceiling through another such lock.
+    pub const fn raising() -> Self {
+        LayerLock {
+            word: AtomicU32::new(0),
+            raise: true,
         }
     }
 
     pub fn lock(&self) -> LayerGuard<'_> {
         enter();
+        let raised = self.raise && raise();
         if self
             .word
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -422,7 +503,37 @@ impl LayerLock {
                 }
             }
         }
-        LayerGuard { lock: self }
+        LayerGuard { lock: self, raised }
+    }
+}
+
+/// The calling thread enters a raising lock: at the ceiling from the first.
+fn raise() -> bool {
+    let Some(block) = current() else {
+        return false;
+    };
+    let ceiling = CEILING.load(Ordering::Relaxed);
+    let old = block.flags.fetch_add(flag::RAISED_ONE, Ordering::SeqCst);
+    debug_assert!(
+        old & flag::RAISED_MASK != flag::RAISED_MASK,
+        "raising locks nest too deep"
+    );
+    if old & flag::RAISED_MASK == 0 && ceiling != 0 {
+        set_level(block, ceiling);
+    }
+    true
+}
+
+/// The calling thread leaves a raising lock: back to its base level after
+/// the last.
+fn lower() {
+    let Some(block) = current() else {
+        return;
+    };
+    let old = block.flags.fetch_sub(flag::RAISED_ONE, Ordering::SeqCst);
+    debug_assert!(old & flag::RAISED_MASK != 0, "balanced raising locks");
+    if old & flag::RAISED_MASK == flag::RAISED_ONE && CEILING.load(Ordering::Relaxed) != 0 {
+        set_level(block, block.base_level.load(Ordering::Relaxed) as u8);
     }
 }
 
@@ -434,12 +545,16 @@ impl Default for LayerLock {
 
 pub struct LayerGuard<'a> {
     lock: &'a LayerLock,
+    raised: bool,
 }
 
 impl Drop for LayerGuard<'_> {
     fn drop(&mut self) {
         if self.lock.word.swap(0, Ordering::Release) == 2 {
             futex_wake(&self.lock.word, 1);
+        }
+        if self.raised {
+            lower();
         }
         leave();
     }

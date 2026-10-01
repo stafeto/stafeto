@@ -60,6 +60,16 @@ pub mod flag {
     pub const SIGNALS_READY: u32 = 1 << 7;
     /// A handler without SA_RESTART ran since a wait cleared this.
     pub const NO_RESTART: u32 = 1 << 8;
+    /// The thread is in a wait by address (posix-sync), from the link of
+    /// its node to the wait's last look at it.
+    pub const WAITING: u32 = 1 << 9;
+    /// The locks of the layer that raise their holder to the ceiling of
+    /// the process (posix-sync, LayerLock::raising) the thread holds or
+    /// waits for: a lock adds RAISED_ONE; while any is, the thread stays at
+    /// the ceiling.
+    pub const RAISED_SHIFT: u32 = 10;
+    pub const RAISED_ONE: u32 = 1 << RAISED_SHIFT;
+    pub const RAISED_MASK: u32 = 0x3f << RAISED_SHIFT;
     /// The depth of the critical sections: a section adds DEPTH_ONE.
     pub const DEPTH_SHIFT: u32 = 16;
     pub const DEPTH_ONE: u32 = 1 << DEPTH_SHIFT;
@@ -81,8 +91,9 @@ pub struct Block {
     pub flags: AtomicU32,
     /// The thread's own base level.
     pub base_level: AtomicU32,
-    /// Handles: the thread with MANAGE, its channel, its timer, and a copy
-    /// of its channel with label 0 and NOTIFY for those who wake it.
+    /// Handles: the thread with MANAGE, its channel, its timer. `waker`
+    /// keeps its place for a copy of the channel with label 0 and NOTIFY
+    /// for wakers in other processes (5b); 0 until then, nothing reads it.
     pub thread: AtomicU64,
     pub channel: AtomicU64,
     pub timer: AtomicU64,
