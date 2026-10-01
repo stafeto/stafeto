@@ -1118,4 +1118,26 @@ mod tests {
             "low at priority 40 is below the ceiling 50 of its client high"
         );
     }
+
+    /// Every POSIX process leaves one level above main for its thread
+    /// owner, heap and file workers and sleep timer, and its table passes.
+    #[test]
+    fn posix_processes_have_a_ceiling_above_main() {
+        let tables = [
+            ramfs::CPROBE_TABLE,
+            ramfs::BUSYBOX_TABLE,
+            ramfs::BUSYBOX_DIALOG_TABLE,
+            ramfs::POSIX_ABI_TABLE,
+        ];
+        for table in tables {
+            assert!(check(table).is_ok());
+            let posix = table
+                .iter()
+                .filter(|r| ["cprobe", "busybox-probe", "posix-abi-probe"].contains(&r.program));
+            assert_eq!(posix.clone().count(), 1);
+            for r in posix {
+                assert_eq!(r.ceiling, r.priority + 1, "{}", r.name);
+            }
+        }
+    }
 }

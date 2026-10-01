@@ -1220,6 +1220,10 @@ fn posix_thread_probe(native: bool) -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "posix-thread-probe: ok")?;
+    qemu::expect_marker(
+        &output,
+        "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
+    )?;
     println!("Rust POSIX pthread lifecycle guest probe passed");
     Ok(())
 }

@@ -24,6 +24,7 @@ pub mod tls;
 use constants::*;
 use core::ffi::{c_char, c_int};
 use core::ptr;
+use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 
@@ -32,6 +33,29 @@ const _: () = {
     assert!(core::mem::size_of::<core::ffi::c_long>() == 8);
     assert!(core::mem::size_of::<c_int>() == 4);
 };
+
+static CEILING: AtomicU8 = AtomicU8::new(0);
+
+/// The process's ceiling (spec 6.6), found once at startup. The thread owner,
+/// the heap and file workers and the sleep timer run there, so no application
+/// thread at main's level delays them between a reply and the next receive.
+/// object_info does not report the ceiling and a denied priority allocates
+/// nothing, so the first caller probes channel_create from the top down.
+fn ceiling() -> Result<u8, rt::abi::Error> {
+    let known = CEILING.load(Ordering::Relaxed);
+    if known != 0 {
+        return Ok(known);
+    }
+    let level = (1..rt::abi::PRIORITY_LEVELS)
+        .rev()
+        .find_map(|level| match rt::sys::channel_create(level) {
+            Err(rt::abi::Error::AccessDenied) => None,
+            result => Some(result.map(|_| level)),
+        })
+        .ok_or(rt::abi::Error::AccessDenied)??;
+    CEILING.store(level, Ordering::Relaxed);
+    Ok(level)
+}
 
 fn error(error: FsError) -> c_int {
     match error {

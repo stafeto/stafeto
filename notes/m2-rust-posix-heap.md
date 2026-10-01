@@ -35,8 +35,8 @@ slack. Process page quotas and mapping limits can stop growth earlier.
 Closing a memory handle leaves its mapping alive. Freed blocks are reused;
 committed mappings remain until process exit.
 
-The worker starts at priority 1 and inherits client priority on receive.
-Ready work may delay that receive. First-fit search, growth and large
+The worker runs at the process ceiling, one above the main thread in the
+init tables, and takes a client's priority on receive up to that ceiling. First-fit search, growth and large
 zeroing or copying have no established worst-case bounds. This implementation
 does not claim hard real-time allocation. Scheduling and latency analysis
 remain separate requirements of the wider runtime.

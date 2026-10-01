@@ -49,13 +49,23 @@ pub const TABLE: &[Record] = &[
     },
 ];
 
+/// A POSIX process: main at the probe's level, the ceiling one above it,
+/// room for the helper threads of `posix-abi`: its thread owner, heap and
+/// file workers and sleep timer run at the ceiling, so an application
+/// thread at main's level never delays them. Programs on `posix-bridge`
+/// (`cprobe`, `busybox-probe`) have no such threads and leave it empty.
+const POSIX: Record = Record {
+    ceiling: TABLE[1].priority + 1,
+    ..TABLE[1]
+};
+
 pub const CPROBE_TABLE: &[Record] = &[
     TABLE[0],
     Record {
         name: "cprobe",
         program: "cprobe",
         quota: 512 * PAGE,
-        ..TABLE[1]
+        ..POSIX
     },
 ];
 
@@ -65,7 +75,7 @@ pub const BUSYBOX_TABLE: &[Record] = &[
         name: "busybox-probe",
         program: "busybox-probe",
         quota: 512 * PAGE,
-        ..TABLE[1]
+        ..POSIX
     },
 ];
 
@@ -110,6 +120,6 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         connects: &["ramfs", "clock", "clock-peer", "posix"],
         quota: 2048 * PAGE,
         handle_limit: 128,
-        ..TABLE[1]
+        ..POSIX
     },
 ];

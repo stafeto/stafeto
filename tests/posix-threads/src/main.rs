@@ -69,6 +69,8 @@ mod upcall;
 rt::entry!(main);
 static PROCESS: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(feature = "cancel-input"))]
+static MAIN_BASE: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(feature = "cancel-input"))]
 static TARGET: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(feature = "cancel-input"))]
 static JOINED: AtomicUsize = AtomicUsize::new(0);
@@ -147,6 +149,29 @@ fn failed(stage: usize) -> bool {
     false
 }
 
+/// The thread owner, the heap and file workers and the sleep timer all sit
+/// at the process ceiling, which the init table puts one above main.
+#[cfg(not(feature = "cancel-input"))]
+fn priorities() -> bool {
+    let main = MAIN_BASE.load(Ordering::Acquire) as u8;
+    let (owner, timer) = threads::probe_owner_levels();
+    let heap = abi::allocation::probe_worker_base();
+    let files = abi::shared::probe_worker_base();
+    if owner != main + 1 || timer != owner || heap != owner || files != owner {
+        rt::println!(
+            "posix-thread-probe: main {} owner {} timer {} heap {} files {}",
+            main,
+            owner,
+            timer,
+            heap,
+            files
+        );
+        return failed(451);
+    }
+    rt::println!("priority-probe: owner, heap, files and sleep timer at the ceiling above main");
+    true
+}
+
 #[cfg(not(feature = "cancel-input"))]
 fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let native =
@@ -163,6 +188,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(450);
     }
     rt::println!("process-identity-probe: Rust PID/PPID match native identity and preserve errno");
+    if !priorities() {
+        return false;
+    }
     if !credentials::run(parent) {
         return false;
     }
@@ -360,6 +388,11 @@ fn main(_: u64) -> u64 {
         return 5;
     };
     PROCESS.store(start.process.raw().0, Ordering::Release);
+    #[cfg(not(feature = "cancel-input"))]
+    MAIN_BASE.store(
+        sys::thread_info(&start.thread).map_or(0, |info| info.base as u64),
+        Ordering::Release,
+    );
     #[cfg(not(feature = "cancel-input"))]
     if unsafe { abi::process::init(&start.parent, &start.process) }.is_err() {
         return 6;
