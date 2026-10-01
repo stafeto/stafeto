@@ -31,9 +31,10 @@ use crate::channel::{self, Channel, Owner, Source};
 use crate::cleanup::{self, Item, Work};
 use crate::object::{Live, Object, Refs};
 use crate::process::{self, Process};
-use abi::Error;
+use abi::{Error, MAX_SYSTEM_TIMERS};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, Ordering};
 use kcore::sync::Lock;
 use kcore::timer::{Firing, HeapLink, HeapNode, LEVELS, Levels};
 
@@ -106,10 +107,17 @@ fn firing(level: u8) -> NonNull<Item> {
 /// Timers whose places have not gone back.
 static LIVE: Live = Live::new();
 
+/// Timers of the whole system whose places have not gone back, at most
+/// abi::MAX_SYSTEM_TIMERS (spec 10): with them the heap of a level is at
+/// most 13 deep, and arming or cancelling takes at most 13 steps. Read and
+/// changed with interrupts masked inside the kernel (spec 8.1).
+static CREATED: AtomicU32 = AtomicU32::new(0);
+
 /// A timer of `payer`, the process of the thread that makes it, on `c`,
 /// an open channel, whose slot has `priority` and `label`, as timer_create
 /// checked them (spec 10): LIMIT_REACHED when the payer has
-/// abi::MAX_TIMERS, then when the channel has no slot left (spec 6.5),
+/// abi::MAX_TIMERS, then when the system holds abi::MAX_SYSTEM_TIMERS
+/// (`CREATED`), then when the channel has no slot left (spec 6.5),
 /// NO_MEMORY when the payer's quota falls short for a page of its pool of
 /// timers (spec 7.8). The timer is not armed; it holds the channel and the
 /// payer's shell. The caller gets the first reference.
@@ -120,6 +128,9 @@ pub fn create(
     priority: u8,
 ) -> Result<NonNull<Timer>, Error> {
     process::timer_room(payer)?;
+    if CREATED.load(Ordering::Relaxed) >= MAX_SYSTEM_TIMERS {
+        return Err(Error::LimitReached);
+    }
     channel::reserve_source(c)?;
     let timer = Timer {
         node: HeapLink::new(),
@@ -137,6 +148,7 @@ pub fn create(
             .attach(Owner::Timer(t), priority, label)
     };
     process::retain_shell(payer);
+    CREATED.fetch_add(1, Ordering::Relaxed);
     LIVE.made();
     Ok(t)
 }
@@ -366,6 +378,7 @@ pub unsafe fn clean(t: NonNull<Timer>, level: u8) {
         let payer = (*t.as_ptr()).payer;
         (*t.as_ptr()).source.detach(level);
         process::paid_free(payer, t);
+        CREATED.fetch_sub(1, Ordering::Relaxed);
         LIVE.gone(t);
         process::release_shell(payer, level);
     }

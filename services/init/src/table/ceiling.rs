@@ -31,6 +31,7 @@ pub const TABLE: &[Record] = &[
         dma: &[],
         quiesce: &[],
         trusted: false,
+        root: false,
     },
     Record {
         name: "high",
@@ -51,5 +52,6 @@ pub const TABLE: &[Record] = &[
         dma: &[],
         quiesce: &[],
         trusted: false,
+        root: false,
     },
 ];

@@ -8,7 +8,10 @@
 //! gives an instance its start data (rt::startup::Giver); REGISTER takes
 //! the channel of a service and gives it its windows and bindings; CONNECT
 //! gives a copy of a registered channel with SEND, TRANSFER and a label of
-//! its own, or holds the request until the service registers; HEARTBEAT
+//! its own, or holds the request until the service registers, but for the
+//! process service, whose sessions POSIX processes find in their start
+//! data (table::PROCESS_SERVICE): their loads wait until it registered;
+//! HEARTBEAT
 //! answers a registered service and moves its watchdog deadline; LIST gives
 //! a page of the records, init first; STATS what the kernel, the worker and
 //! init's quota show; PING anyone. The notification of the worker thread
@@ -199,6 +202,9 @@ struct Entry {
     short: bool,
     /// Its first start is done, or waits for quota.
     begun: bool,
+    /// A POSIX process whose load waits for the process service to
+    /// register (`next`).
+    awaits_process: bool,
 }
 
 impl Entry {
@@ -216,6 +222,7 @@ impl Entry {
         waited: 0,
         short: false,
         begun: false,
+        awaits_process: false,
     };
 }
 
@@ -328,14 +335,28 @@ impl Init {
     /// Gives the worker the next job of the queue, when it has none, at
     /// the level of that job and of those that wait; with no job left the
     /// worker waits at WORKER_IDLE. A load for which init's quota falls
-    /// short waits (`quota_fits`), and the next job goes.
+    /// short waits (`quota_fits`), and so does that of a POSIX process
+    /// until the process service registered (`process_channel`); the next
+    /// job goes.
     fn next(&mut self) {
         if self.jobs.current().is_some() {
             return;
         }
         while let Some(job) = self.jobs.pop() {
             let place = job.record;
+            let mut process = None;
             let gone = match job.work {
+                Work::Load if TABLE[place].is_posix() => match self.process_channel() {
+                    Err(()) => {
+                        self.entries[place].awaits_process = true;
+                        continue;
+                    }
+                    Ok(_) if !self.quota_fits(place) => continue,
+                    Ok(channel) => {
+                        process = channel;
+                        None
+                    }
+                },
                 Work::Load if !self.quota_fits(place) => continue,
                 Work::Load | Work::ShowLog => None,
                 _ => match self.entries[place].held.take_gone() {
@@ -351,7 +372,7 @@ impl Init {
                     let label = self.labels.next().expect("init gave every label");
                     let program =
                         self.programs[place].expect("init found each program at its start");
-                    self.worker.load(place, label, program)
+                    self.worker.load(place, label, program, process)
                 }
                 Work::Teardown => self
                     .worker
@@ -364,6 +385,20 @@ impl Init {
             return;
         }
         let _ = self.worker.set_level(WORKER_IDLE);
+    }
+
+    /// The value of the registered channel of the process service, which
+    /// the worker sends Create through for a POSIX process: None once the
+    /// service is broken or ended, and the load fails; Err while it has not
+    /// registered. The instance holds the channel until the worker tore it
+    /// down, which comes after the load.
+    fn process_channel(&self) -> Result<Option<u64>, ()> {
+        let to = table::find(TABLE, table::PROCESS_SERVICE.as_bytes()).ok_or(())?;
+        let service = &self.entries[to];
+        if matches!(service.state, State::Broken | State::Ended) {
+            return Ok(None);
+        }
+        open(service).map(|c| Some(c.raw().0)).ok_or(())
     }
 
     /// Whether init's quota covers an instance of the record at `place`
@@ -746,6 +781,7 @@ impl Init {
             instance.channel = Some(channel);
         }
         entry.state = State::Running;
+        let process = record.name == table::PROCESS_SERVICE;
         // From REGISTER on, the watchdog counts the heartbeats (spec 13.4).
         let deadline = record.watch().map(|w| {
             let armed = w.arm(now());
@@ -754,6 +790,13 @@ impl Init {
         });
         if let Some(at) = deadline {
             self.set_deadline(place, at);
+        }
+        if process {
+            for waiting in 0..TABLE.len() {
+                if mem::take(&mut self.entries[waiting].awaits_process) {
+                    self.launch(waiting);
+                }
+            }
         }
         Answer::Reply(handles)
     }
@@ -796,7 +839,8 @@ impl Init {
 
     /// CONNECT from the instance at `place` (spec 13.4): BAD_SIZE for a
     /// request that is no name; ACCESS_DENIED for a name its record may not
-    /// connect to; PEER_CLOSED for a service that is broken or ended; a
+    /// connect to, and for the process service, whose sessions come in
+    /// start data; PEER_CLOSED for a service that is broken or ended; a
     /// session with the service when its registered channel is open
     /// (`session`); otherwise the request waits for the service to
     /// register, at most WAITING_MAX for one service, and LIMIT_REACHED
@@ -806,10 +850,11 @@ impl Init {
             return Answer::Status(Status::BadSize);
         };
         let client = &TABLE[place];
-        let allowed = client
-            .connects
-            .iter()
-            .any(|to| to.as_bytes() == name.as_bytes());
+        let allowed = name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
+            && client
+                .connects
+                .iter()
+                .any(|to| to.as_bytes() == name.as_bytes());
         let Some(to) = allowed
             .then(|| table::find(TABLE, name.as_bytes()))
             .flatten()

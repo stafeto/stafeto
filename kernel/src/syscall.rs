@@ -173,8 +173,6 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::Send) => return send(thread, &args),
         Some(Call::Receive) => return receive(thread, &args),
         Some(Call::Reply) => reply(thread, &args),
-        Some(Call::RequestIdentity) => channel::sender_identity(thread, args[0])
-            .map(|identity| Values::new(&identity.to_words())),
         Some(Call::Notify) => notify(thread, &args),
         Some(Call::MemCreate) => return mem_create(thread, &args),
         Some(Call::MemMap) => return change(thread, &args, mem_map),
@@ -897,19 +895,36 @@ fn new_child(
     })
 }
 
-/// process_kill(x0 process with MANAGE): the process ends, reason
-/// «killed» (spec 11): its threads stop in whatever state they are, its
-/// descendants stop in a wave at its ceiling, and the cleanup queue takes
-/// what it holds apart at the caller's priority, before the caller runs
-/// again. A process that ended already: 0, and its teardown is raised to
-/// the caller's priority (process::hasten), so that the call returns after
-/// it as well. Killing the caller's own process never returns.
+/// process_kill(x0 process with MANAGE, x1 level): the process ends,
+/// reason «killed» (spec 11): its threads stop in whatever state they are,
+/// its descendants stop in a wave at S, and the cleanup queue takes what it
+/// holds apart at R, the higher of the level and the priority of its exit
+/// notification (spec 7.7). Level 0 is the caller's effective priority:
+/// the teardown runs before the caller runs again, and the call returns
+/// after it. A level of 1-63 no higher than the caller's effective
+/// priority returns once the part in the call is done when it is lower;
+/// the exit notification tells of the end. A process that ended already:
+/// 0, and its teardown is raised to the level (process::hasten). Killing
+/// the caller's own process never returns. The checks in the order of
+/// spec 11: a level above 63 (INVALID_ARGS), the handle, then a level above
+/// the caller's effective priority (ACCESS_DENIED). O(1) besides the end.
 fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let level = match a[1] {
+        0 => None,
+        l => Some(kcore::args::priority_arg(l)?),
+    };
     let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
+    let cause = match level {
+        None => cause(thread),
+        Some(l) => {
+            under_ceilings(l, &[cause(thread)])?;
+            l
+        }
+    };
     let own = target == caller(thread);
     // SAFETY: the handle holds the process; the end takes its own
     // reference before the table that holds the handle may go.
-    let ended = unsafe { process::end(target, ProcessState::Killed, cause(thread)) };
+    let ended = unsafe { process::end(target, ProcessState::Killed, cause) };
     if own {
         // The caller ended with its process and may be gone.
         record_call(Call::ProcessKill.number());
@@ -918,7 +933,7 @@ fn process_kill(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     if !ended {
         // SAFETY: the handle holds the process, which ended before; no
         // portion runs during a call.
-        unsafe { process::hasten(target, cause(thread)) };
+        unsafe { process::hasten(target, cause) };
     }
     Ok(Values::none())
 }
@@ -1077,7 +1092,8 @@ fn clock_now() -> Result<Values, Error> {
 /// ACCESS_DENIED without RECEIVE); the priority above the caller's ceiling
 /// (ACCESS_DENIED); then the resources in the order the call takes them:
 /// room in the caller's table (LIMIT_REACHED), abi::MAX_TIMERS timers the
-/// caller pays for (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED,
+/// caller pays for (LIMIT_REACHED), abi::MAX_SYSTEM_TIMERS timers in the
+/// system (LIMIT_REACHED), a slot of the channel (LIMIT_REACHED,
 /// spec 6.5), a page of the caller's pool of timers and a block of its
 /// table (NO_MEMORY). A channel with a handle with RECEIVE is open. A
 /// timer whose handle did not go in goes again.
@@ -1224,12 +1240,6 @@ fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
     match a[1] {
-        abi::INFO_PROCESS_IDENTITY => {
-            let p = target()?;
-            // SAFETY: the handle holds the shell; identity outlives teardown.
-            let identity = unsafe { p.as_ref() }.identity();
-            Ok(Values::new(&identity.to_words()))
-        }
         abi::INFO_PROCESS_STATE => {
             let p = target()?;
             // SAFETY: the handle holds the process.

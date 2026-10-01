@@ -39,6 +39,21 @@ pub trait Service<const K: usize> {
     /// deferred replies.
     type Data: Default;
 
+    /// The places of the table before PLACED are those `place` gives; a
+    /// label it gives none takes the first free place from PLACED on.
+    const PLACED: usize = 0;
+
+    /// The place in the table of the session of `label`, for a service
+    /// that gives its clients' labels itself: a lookup in O(1), and the
+    /// client goes to `gone` even when it never sent a request. None
+    /// (the default) looks through the places from PLACED on. A place
+    /// that holds the session of another label, or one past the table,
+    /// refuses the request with LIMIT_REACHED.
+    fn place(&self, label: u64) -> Option<usize> {
+        let _ = label;
+        None
+    }
+
     /// Answers `r`, a request of the client of `s` with a header of this
     /// version and one of METHODS; the handler checks the body. What it
     /// returns goes to the client, unless the handler took the token
@@ -47,7 +62,8 @@ pub trait Service<const K: usize> {
     fn request(&mut self, s: &mut Session<Self::Data, K>, r: &mut Request<'_>) -> Answer;
 
     /// The client of `s` went (CLIENT_GONE); the session ends right after,
-    /// and what it holds closes.
+    /// and what it holds closes. A client `place` names comes here with a
+    /// new session when it had none.
     fn gone(&mut self, s: &mut Session<Self::Data, K>) {
         let _ = s;
     }
@@ -123,15 +139,6 @@ pub struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    /// Kernel-authenticated identity of this live request's sender.
-    /// Available until the handler takes or defers the reply token.
-    pub fn sender_identity(&self) -> Result<abi::ProcessIdentity, Error> {
-        self.token
-            .as_ref()
-            .ok_or(Error::BadState)?
-            .sender_identity()
-    }
-
     /// The label of the handle the request came through.
     pub fn label(&self) -> u64 {
         self.label
@@ -407,10 +414,20 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 if bits != 0 {
                     service.notification(Notice { bits, ..notice });
                 }
-                if let Some(slot) = table
-                    .iter_mut()
-                    .find(|s| s.as_ref().is_some_and(|s| s.label == label))
-                {
+                let placed = service.place(label);
+                let found = match placed {
+                    Some(i) => table
+                        .get_mut(i)
+                        .filter(|s| s.as_ref().is_none_or(|s| s.label == label)),
+                    None => table
+                        .iter_mut()
+                        .skip(S::PLACED)
+                        .find(|s| s.as_ref().is_some_and(|s| s.label == label)),
+                };
+                if let Some(slot) = found {
+                    if placed.is_some() && slot.is_none() {
+                        *slot = Some(Session::new(label, S::Data::default(), config.issued));
+                    }
                     if let Some(s) = slot.as_mut() {
                         service.gone(s);
                     }
@@ -438,7 +455,8 @@ fn request<S: Service<K>, const K: usize>(
         Ok(header) if !S::METHODS.contains(&header.method) => Err(Status::UnknownMethod),
         other => other,
     };
-    let (header, s) = match header.map(|h| (h, session(table, label, issued))) {
+    let place = service.place(label);
+    let (header, s) = match header.map(|h| (h, session::<S, K>(table, label, place, issued))) {
         Ok((header, Some(s))) => (header, s),
         Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
         Err(status) => return refuse(token, status),
@@ -477,25 +495,46 @@ fn refuse(token: Token, status: Status) {
     let _ = reply(token, &proto_wire::reply(status), Outgoing::new());
 }
 
-/// The session of `label`, made in the first free place when there is
-/// none; None when the table is full.
-fn session<T: Default, const K: usize>(
-    table: &mut [Option<Session<T, K>>],
+/// The session of `label`: at `place` when the service gives one
+/// (Service::place), or else found from PLACED on; made in that place, or
+/// in the first free one from PLACED on, when there is none. None when the
+/// place holds another label's session or the table is full.
+fn session<S: Service<K>, const K: usize>(
+    table: &mut [Option<Session<S::Data, K>>],
     label: u64,
+    place: Option<usize>,
     issued: u32,
-) -> Option<&mut Session<T, K>> {
-    let i = match table
-        .iter()
-        .position(|s| s.as_ref().is_some_and(|s| s.label == label))
-    {
-        Some(i) => i,
-        None => {
-            let i = table.iter().position(Option::is_none)?;
-            table[i] = Some(Session::new(label, T::default(), issued));
+) -> Option<&mut Session<S::Data, K>> {
+    let found = match place {
+        Some(i) => {
+            let s = table.get(i)?;
+            if s.as_ref().is_some_and(|s| s.label != label) {
+                return None;
+            }
             i
         }
+        None => match table
+            .iter()
+            .enumerate()
+            .skip(S::PLACED)
+            .find(|(_, s)| s.as_ref().is_some_and(|s| s.label == label))
+        {
+            Some((i, _)) => i,
+            None => {
+                table
+                    .iter()
+                    .enumerate()
+                    .skip(S::PLACED)
+                    .find(|(_, s)| s.is_none())?
+                    .0
+            }
+        },
     };
-    table[i].as_mut()
+    let slot = &mut table[found];
+    if slot.is_none() {
+        *slot = Some(Session::new(label, S::Data::default(), issued));
+    }
+    slot.as_mut()
 }
 
 /// Token::reply_handles; when the kernel refused the reply before it

@@ -227,7 +227,7 @@ el0_wfi:
     wfi
     svc     #SVC_DONE
 
-// process_kill with the handle in x0.
+// process_kill with the handle in x0 and the level in x1.
 .global el0_kill
 el0_kill:
     svc     #CALL_PROCESS_KILL
@@ -276,6 +276,7 @@ el0_receive_then_exit:
 el0_kill_notify_receive:
     mov     x21, x1
     mov     x22, x2
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     mov     x19, x0
     mov     x0, x21
@@ -481,6 +482,7 @@ el0_kill_close_notify:
     mov     x21, x0
     mov     x22, x1
     mov     x23, x2
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     mov     x19, x0
     mov     x0, x21
@@ -500,6 +502,7 @@ el0_raise_then_kill:
     svc     #CALL_THREAD_SET_PRIORITY
     mov     x19, x0
     mov     x0, x21
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     svc     #SVC_DONE
 
@@ -655,6 +658,7 @@ el0_measure:
     adr     x23, 8f
     bl      6f
     mov     x0, x25
+    mov     x1, #0
     svc     #CALL_PROCESS_KILL
     cbnz    x0, 4f
     adr     x23, 9f

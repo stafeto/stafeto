@@ -18,6 +18,10 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    let Ok(session) = start.take::<rt::handle::Channel>(process_client::START_NAME) else {
+        rt::println!("clock-peer: no session with the process service");
+        return 6;
+    };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |i| i.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -29,13 +33,7 @@ fn main(_: u64) -> u64 {
     let Ok(clock) = Client::connect(&start.parent) else {
         return 4;
     };
-    let Ok(process) = process_client::Client::connect(&start.parent) else {
-        return 6;
-    };
-    if let Err(error) = process.enroll(&start.process) {
-        rt::println!("clock-peer: process registration failed {:?}", error);
-        return 7;
-    }
+    let process = process_client::Client::new(session);
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -67,8 +65,8 @@ impl Service<0> for Relay {
             };
             let w = r.reply();
             w.u32(0)
-                .and_then(|()| w.u32(value.identity.id))
-                .and_then(|()| w.u32(value.identity.parent))
+                .and_then(|()| w.u32(value.pid))
+                .and_then(|()| w.u32(value.parent))
                 .expect("peer identity");
             for id in value.credentials.words() {
                 w.u32(id).expect("peer credentials");
@@ -82,9 +80,11 @@ impl Service<0> for Relay {
             let Ok(foreign) = r.handles.take::<rt::handle::Process>(0) else {
                 return Answer::Status(Status::BadSize);
             };
+            // Create through its own session, which the service refuses:
+            // only init holds the channel with no label.
             return Answer::Status(
                 self.process
-                    .enroll(&foreign)
+                    .create(&foreign, true)
                     .map_or_else(|error| error, |_| Status::Ok),
             );
         }

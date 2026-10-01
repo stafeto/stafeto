@@ -33,7 +33,7 @@ on three kinds of machine:
   with the Virtio PCI console driven by a user-space service
   (`cargo xtask vz`).
 
-**Kernel.** 34 system calls, the same on every machine, over 64-bit handles
+**Kernel.** 33 system calls, the same on every machine, over 64-bit handles
 with rights: processes, threads, channels, sessions, timers, memory
 objects, device windows and interrupt bindings. Synchronous requests and replies carry up to 1 KiB and
 four handles; a service runs at its client's priority under its own

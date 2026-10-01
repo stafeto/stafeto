@@ -1,5 +1,7 @@
 # Authenticated IPC sender identity for Rust POSIX
 
+> Replaced by the labels of the process service's sessions (#129): call 35 and `Token::sender_identity` are gone, and the number stays retired.
+
 ## Behavior
 
 RequestIdentity (35) reads the native sender's PID and parent PID from

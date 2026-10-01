@@ -8,7 +8,7 @@
 use crate::channels::exit_notice;
 use crate::harness::*;
 use crate::memory::memory_object;
-use crate::messages::{raw_client, raw_identity, raw_reply};
+use crate::messages::{raw_client, raw_reply};
 use crate::timers::{expiry, timer_at};
 use crate::transfers::copy_raw;
 use core::cell::Cell;
@@ -1236,27 +1236,10 @@ fn foreign_reply(kid: &Kid) -> Outcome {
     let Received::Message { token, .. } = kid.ear.next()? else {
         return Err("the child sent no request");
     };
-    let expected = sys::process_identity(&kid.process);
-    let observed = token.sender_identity();
-    let foreign = ran(Role::RequestIdentity, &[token.raw()], &[]);
-    let retained = token.sender_identity();
     let other = ran(Role::Reply, &[token.raw(), ANSWER + 1], &[]);
     let waits = kid.ear.now();
     let answered = token.reply(&ANSWER.to_le_bytes());
     let state = kid.end();
-    check(
-        expected.is_ok_and(|identity| identity.id != 1 && identity.parent == 1)
-            && observed == expected
-            && retained == expected,
-        "sender identity did not authenticate the real child process",
-    )?;
-    check(
-        foreign
-            == Ok(ProcessState::Exited {
-                code: Error::BadState.code(),
-            }),
-        "another process inspected the service's accepted request",
-    )?;
     check(
         other
             == Ok(ProcessState::Exited {
@@ -1374,8 +1357,6 @@ fn dead_client(kid: &Kid) -> Outcome {
     };
     let raw = token.raw();
     let killed = sys::process_kill(&kid.process);
-    let identity = token.sender_identity();
-    let raw_dead = raw_identity(raw);
     let first = token.reply(&[]);
     let mut x = marked();
     x[..2].copy_from_slice(&[raw, 0]);
@@ -1385,12 +1366,6 @@ fn dead_client(kid: &Kid) -> Outcome {
     let_run()?;
     close(t)?;
     let state = kid.end();
-    check(
-        identity == Err(Error::PeerClosed)
-            && raw_dead[0] == Error::PeerClosed.code()
-            && raw_dead[1..] == marked()[1..],
-        "identity read disclosed a dead sender or changed error registers",
-    )?;
     check(
         killed.is_ok() && first == Err(Error::PeerClosed) && second == Error::PeerClosed.code(),
         "a reply to the client that ended was not PEER_CLOSED, twice",

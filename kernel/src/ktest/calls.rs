@@ -862,7 +862,7 @@ fn kill_calls(
     )?;
     let kill = Call::ProcessKill.number();
     let frames = phys::free_frames();
-    c.succeeds(kill, &[child.0], &[])?;
+    c.succeeds(kill, &[child.0, 0], &[])?;
     // SAFETY: the handles hold the threads.
     let dead = unsafe { [tr, ts].map(|t| t.as_ref().sched.state() == State::Dead) };
     check(
@@ -932,7 +932,7 @@ fn hasten_cases(c: &Caller, child: Handle, ready: NonNull<Thread>) -> Result<(),
         cleanup::top() == Some(2) && sched::first(10) == Some(ready),
         "the child's teardown does not wait at 2 behind the thread at 10",
     )?;
-    c.succeeds(Call::ProcessKill.number(), &[child.0], &[])?;
+    c.succeeds(Call::ProcessKill.number(), &[child.0, 0], &[])?;
     check(
         cleanup::top() == Some(20),
         "process_kill of a process that ended did not raise its teardown to the caller's level",
@@ -1519,7 +1519,7 @@ pub fn exit_notice_keeps_the_shell(_: &Boot) -> Result<(), &'static str> {
                 &[CHILD_QUOTA, 16, 20, h.0, 10, 0],
             )
             .and_then(|child| {
-                c.succeeds(Call::ProcessKill.number(), &[child.0], &[])?;
+                c.succeeds(Call::ProcessKill.number(), &[child.0, 0], &[])?;
                 c.close(child)?;
                 cleanup::drain();
                 let kept = process::in_use() == processes + 2;
@@ -4169,11 +4169,10 @@ fn stop_max_threads_ticks() -> Result<u64, &'static str> {
 ///   interrupted one does, its entry enabled: the request ends the wait
 ///   as thread_interrupt does;
 /// - return: thread_upcall_return of the whole context from the buffer,
-///   FP and SIMD registers included;
-/// - identity: request_identity of a request the caller's process took.
+///   FP and SIMD registers included.
 ///
 /// The test prints them in one line, `upcall ticks: interrupt=... bind=...
-/// control=... request=... return=... identity=...`, which xtask shows;
+/// control=... request=... return=...`, which xtask shows;
 /// no number fails it (spec 15.3).
 #[cfg(feature = "icount")]
 pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
@@ -4189,14 +4188,13 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
         Call::ThreadUpcallControl,
         Call::ThreadUpcallRequest,
         Call::ThreadUpcallReturn,
-        Call::RequestIdentity,
     ] {
         syscall::clear_call_maximum(call.number());
     }
     let mut l = Listeners::new(2 * abi::MESSAGE_HANDLES)?;
     let other = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no process");
     let result = other.and_then(|other| {
-        let mut threads = [None; 4];
+        let mut threads = [None; 2];
         let result = with_caller(|c| upcall_calls(c, other, &mut l, &mut threads));
         for t in threads.into_iter().flatten() {
             // SAFETY: the test's reference goes, and the kernel's first.
@@ -4215,13 +4213,12 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
     let maxima = syscall::call_maxima();
     let ticks = |call: Call| maxima[call.number() as usize];
     kprintln!(
-        "upcall ticks: interrupt={} bind={} control={} request={} return={} identity={}",
+        "upcall ticks: interrupt={} bind={} control={} request={} return={}",
         ticks(Call::ThreadInterrupt),
         ticks(Call::ThreadUpcallBind),
         ticks(Call::ThreadUpcallControl),
         ticks(Call::ThreadUpcallRequest),
         ticks(Call::ThreadUpcallReturn),
-        ticks(Call::RequestIdentity),
     );
     check(
         (
@@ -4235,15 +4232,14 @@ pub fn upcall_calls_are_measured(_: &Boot) -> Result<(), &'static str> {
 }
 
 /// What `upcall_calls_are_measured` builds and calls for the caller `c`:
-/// the threads it waits on go into `threads`, two senders of `other`'s, a
-/// receiver of `c`'s process and a client of `other`'s, for the caller to
-/// end.
+/// the threads it waits on go into `threads`, two senders of `other`'s,
+/// for the caller to end.
 #[cfg(feature = "icount")]
 fn upcall_calls(
     c: &Caller,
     other: NonNull<Process>,
     l: &mut Listeners,
-    threads: &mut [Option<NonNull<Thread>>; 4],
+    threads: &mut [Option<NonNull<Thread>>; 2],
 ) -> Result<(), &'static str> {
     // Every thread waits before any wakes, so that each new one is what
     // the scheduler picks.
@@ -4255,32 +4251,6 @@ fn upcall_calls(
         .control(abi::UpcallControl::Enable.raw())
         .map_err(|_| "enable failed")?;
     sender_in_transit(other, l, 0, &mut threads[1])?;
-    // The receiver of a request with a handle takes it into its buffer.
-    let requests = owned_channel(c.process)?;
-    let receiver = thread::create(c.process, USER_VA, USER_VA, 0, 5, Policy::Fifo)
-        .map_err(|_| "no receiver")?;
-    threads[2] = Some(receiver);
-    thread::give_buffer(receiver, BUFFER as usize + PAGE).map_err(|_| "no buffer")?;
-    thread::start(receiver).map_err(|_| "the receiver did not start")?;
-    // SAFETY: the scheduler's threads are alive.
-    let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
-    check(
-        matches!(picked, kcore::sched::Decision::Run(r) if r == receiver),
-        "the receiver did not run",
-    )?;
-    channel::receive(receiver, requests, true).map_err(|_| "the receiver did not wait")?;
-    let client = running(other)?;
-    threads[3] = Some(client);
-    let carried = process::insert_handle(other, Object::Resource, Rights::NONE)
-        .map_err(|_| "a handle did not go in")?;
-    let desc = Desc::from_send(1 << abi::HANDLES_SHIFT).expect("a send");
-    check(
-        channel::send(client, Via::Channel(requests), desc, &[carried.0]) == Ok(None),
-        "the request was not taken",
-    )?;
-    // SAFETY: the receiver is the test's.
-    let token = unsafe { threads[2].expect("the receiver").as_ref() }.regs.x[11];
-
     let thread_handle =
         |t: Option<NonNull<Thread>>| c.insert(Object::Thread(t.expect("a thread")), Rights::MANAGE);
     // A handle to a thread of the caller's own process would hold that
@@ -4301,8 +4271,6 @@ fn upcall_calls(
         l.woken() == 2 * abi::MESSAGE_HANDLES,
         "the request did not let the handles in transit go",
     )?;
-    let got = c.call(Call::RequestIdentity.number(), &[token]);
-    check(got[0] == 0, "request_identity failed")?;
 
     thread::give_buffer(c.thread, BUFFER as usize).map_err(|_| "no buffer")?;
     c.succeeds(Call::ThreadUpcallBind.number(), &[USER_VA as u64], &[])?;
@@ -5134,11 +5102,13 @@ pub fn device_windows_are_measured(_: &Boot) -> Result<(), &'static str> {
 }
 
 /// The level of the heap of `timer_firing_is_measured`, its payers, and
-/// the receivers its firing wakes, one a timer.
+/// the receivers its firing wakes, one a timer. The payers have room for
+/// every timer of the system (abi::MAX_SYSTEM_TIMERS) beside those of
+/// levels 1-63.
 #[cfg(feature = "icount")]
 const FIRE_LEVEL: u8 = 10;
 #[cfg(feature = "icount")]
-const FIRE_PAYERS: usize = 64;
+const FIRE_PAYERS: usize = (abi::MAX_SYSTEM_TIMERS as usize).div_ceil(abi::MAX_TIMERS as usize);
 #[cfg(feature = "icount")]
 const WOKEN: usize = kcore::timer::FIRE_PORTION;
 
@@ -5148,15 +5118,20 @@ const WOKEN: usize = kcore::timer::FIRE_PORTION;
 ///   (timer::expire) with the top of every level of 1-63 expired, which
 ///   queues 63 firings;
 /// - fire: the portion of cleanup of the firing of FIRE_LEVEL, whose heap
-///   holds 4 096 timers of FIRE_PAYERS payers: it takes FIRE_PORTION
-///   expired ones off a heap of depth 12, and each wakes a receiver that
-///   waits in a channel of its own;
+///   holds every timer of the system but the 62 of the other levels, of
+///   FIRE_PAYERS payers, abi::MAX_SYSTEM_TIMERS in all, the next one
+///   refused with LIMIT_REACHED: it takes FIRE_PORTION expired ones off a
+///   heap of depth 13, and each wakes a receiver that waits in a channel
+///   of its own;
 /// - set: timer_set of the top of that heap, among 63 levels with timers
 ///   and none pending, to a deadline before every other: it leaves the
-///   root, the walk of the levels follows, and it climbs back to the root.
+///   root, the walk of the levels follows, and it climbs back to the root;
+/// - timers_8192: timer_cancel of that timer, the root then: the last node
+///   of the heap takes its place and goes down 13 steps (spec 10).
 ///
 /// The test prints them in one line, `timer portions ticks: interrupt=...
-/// fire=... set=...`, which xtask shows; no number fails it (spec 15.3).
+/// fire=... set=... timers_8192=...`, which xtask shows; no number fails
+/// it (spec 15.3).
 #[cfg(feature = "icount")]
 pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
     let counts = (
@@ -5176,8 +5151,10 @@ pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
         cleanup::drain();
         ticks
     })?;
-    let [interrupt, fire, set] = ticks;
-    kprintln!("timer portions ticks: interrupt={interrupt} fire={fire} set={set}");
+    let [interrupt, fire, set, cancel] = ticks;
+    kprintln!(
+        "timer portions ticks: interrupt={interrupt} fire={fire} set={set} timers_8192={cancel}"
+    );
     check(
         (
             timers::in_use(),
@@ -5193,7 +5170,7 @@ pub fn timer_firing_is_measured(_: &Boot) -> Result<(), &'static str> {
 /// channels, their receivers and the timers of levels 1-63, with the
 /// handles that keep them; each payer holds its timers.
 #[cfg(feature = "icount")]
-fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 3], &'static str> {
+fn firing_ticks(c: &Caller, owner: NonNull<Process>) -> Result<[u64; 4], &'static str> {
     let mut receivers = [None; WOKEN];
     let mut payers = [None; FIRE_PAYERS];
     let ticks = heap_ticks(c, owner, &mut receivers, &mut payers);
@@ -5268,7 +5245,7 @@ fn heap_ticks(
     owner: NonNull<Process>,
     receivers: &mut [Option<NonNull<Thread>>; WOKEN],
     payers: &mut [Option<NonNull<Process>>; FIRE_PAYERS],
-) -> Result<[u64; 3], &'static str> {
+) -> Result<[u64; 4], &'static str> {
     let mut channels = [None; WOKEN];
     for (ch, r) in channels.iter_mut().zip(receivers.iter_mut()) {
         let made = owned_channel(owner)?;
@@ -5279,12 +5256,29 @@ fn heap_ticks(
     // The later timers of the heap by the order they go in, so that a
     // timer that leaves the root takes the last node down to a leaf.
     let far = timer::now() + 1_000_000_000;
+    let lc = owned_channel(owner)?;
+    let mut levels = [None; kcore::timer::LEVELS];
+    for (l, t) in levels.iter_mut().enumerate() {
+        *t = Some(held_timer(owner, lc, l as u8 + 1, 2 * far + l as u64)?);
+    }
+    // FIRE_LEVEL takes the rest of the system's timers: the next one is
+    // refused, though its payer has room.
     let mut early = [None; WOKEN];
     let mut top = None;
-    for (i, payer) in payers.iter_mut().enumerate() {
-        let p = process::create_root(QUOTA, 128, CEILING).map_err(|_| "no payer")?;
+    let mut refused = false;
+    'fill: for (i, payer) in payers.iter_mut().enumerate() {
+        let p = process::create_root(QUOTA, 256, CEILING).map_err(|_| "no payer")?;
         *payer = Some(p);
         for j in 0..abi::MAX_TIMERS as usize {
+            if timers::in_use() == abi::MAX_SYSTEM_TIMERS as usize {
+                match timers::create(p, channels[0], 0, FIRE_LEVEL) {
+                    Err(e) => refused = e == Error::LimitReached,
+                    // SAFETY: the reference `create` handed out goes, and
+                    // the timer with it.
+                    Ok(t) => unsafe { timers::release(t, CAUSE) },
+                }
+                break 'fill;
+            }
             let n = i * abi::MAX_TIMERS as usize + j;
             let t = held_timer(p, channels[n % WOKEN], FIRE_LEVEL, far + n as u64)?;
             match n {
@@ -5294,17 +5288,20 @@ fn heap_ticks(
             }
         }
     }
-    let lc = owned_channel(owner)?;
-    let mut levels = [None; kcore::timer::LEVELS];
-    for (l, t) in levels.iter_mut().enumerate() {
-        *t = Some(held_timer(owner, lc, l as u8 + 1, 2 * far + l as u64)?);
-    }
+    check(
+        refused,
+        "a timer past abi::MAX_SYSTEM_TIMERS was made, or the system did not fill",
+    )?;
     let top = top.expect("the top of the heap");
     let h = c.insert(Object::Timer(top), OWNER_RIGHTS)?;
     let before = timer::clock().ticks_to_ns(far / 2);
     let start = timer::now();
     c.succeeds(Call::TimerSet.number(), &[h.0, before], &[])?;
     let set = timer::now() - start;
+    // The timer is the root now: its cancel takes the last node down.
+    let start = timer::now();
+    c.succeeds(Call::TimerCancel.number(), &[h.0], &[])?;
+    let cancel = timer::now() - start;
     c.close(h)?;
     // Every level expires, and the heap's receivers' timers first of all.
     let at = timer::now() + 2_000_000;
@@ -5336,5 +5333,5 @@ fn heap_ticks(
         .all(|t| unsafe { t.as_ref() }.sched.state() == State::Ready);
     cleanup::drain();
     check(woke, "a receiver of the heap's timers did not wake")?;
-    Ok([interrupt, fire, set])
+    Ok([interrupt, fire, set, cancel])
 }

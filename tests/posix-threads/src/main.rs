@@ -46,8 +46,6 @@ mod once;
 #[cfg(not(feature = "cancel-input"))]
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
-mod request_identity;
-#[cfg(not(feature = "cancel-input"))]
 mod signal_context;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_timed;
@@ -174,27 +172,26 @@ fn priorities() -> bool {
 
 #[cfg(not(feature = "cancel-input"))]
 fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
-    let native =
-        Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
-    let expected = sys::process_identity(&native).expect("native process identity");
+    let expected = abi::process::client()
+        .query()
+        .expect("the snapshot of the process's record");
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 123 };
-    if expected.id <= 1
-        || expected.parent != 1
-        || abi::process::getpid() != expected.id as i32
+    if expected.pid < proto_process::RECORDS as u32
+        || expected.parent != proto_process::INIT_PID
+        || abi::process::getpid() != expected.pid as i32
         || abi::process::getppid() != expected.parent as i32
         || unsafe { *errno } != 123
     {
         return failed(450);
     }
-    rt::println!("process-identity-probe: Rust PID/PPID match native identity and preserve errno");
+    rt::println!(
+        "process-identity-probe: Rust PID/PPID match the process service's record and preserve errno"
+    );
     if !priorities() {
         return false;
     }
     if !credentials::run(parent) {
-        return false;
-    }
-    if !request_identity::run(expected) {
         return false;
     }
     let mut child = 0;
@@ -391,8 +388,13 @@ fn main(_: u64) -> u64 {
         Ordering::Release,
     );
     #[cfg(not(feature = "cancel-input"))]
-    if unsafe { abi::process::init(&start.parent, &start.process) }.is_err() {
-        return 6;
+    {
+        let Ok(session) = start.take::<Channel>(abi::process::START_NAME) else {
+            return 6;
+        };
+        if unsafe { abi::process::init(session) }.is_err() {
+            return 6;
+        }
     }
     if unsafe { abi::shared::init(&start.process, files) }.is_err()
         || unsafe { abi::allocation::init(start.process) }.is_err()

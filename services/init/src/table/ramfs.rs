@@ -32,6 +32,7 @@ pub const TABLE: &[Record] = &[
         dma: &[],
         quiesce: &[],
         trusted: false,
+        root: false,
     },
     Record {
         name: "ramfs-probe",
@@ -52,6 +53,7 @@ pub const TABLE: &[Record] = &[
         dma: &[],
         quiesce: &[],
         trusted: false,
+        root: false,
     },
 ];
 
@@ -100,7 +102,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix",
         program: "posix-process-service",
         quota: 256 * PAGE,
-        handle_limit: 128,
+        // A process handle for each of its 256 records, and a session of
+        // each besides in the probe of its bound (transport-probe).
+        handle_limit: 1024,
         restart: Restart::Never,
         ..TABLE[0]
     },
@@ -126,6 +130,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         connects: &["ramfs", "clock", "clock-peer", "posix"],
         quota: 2048 * PAGE,
         handle_limit: 128,
+        root: true,
         ..POSIX
     },
 ];

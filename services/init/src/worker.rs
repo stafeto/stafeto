@@ -51,11 +51,14 @@ static STACK: Stack<STACK_SIZE> = Stack::new();
 /// A job the main thread gives the worker.
 enum Order {
     /// Load an instance of the record at `place` of the table from
-    /// `program`, named by `label` on init's channel.
+    /// `program`, named by `label` on init's channel; for a POSIX process
+    /// `process` is the value of the process service's registered channel
+    /// (None when the service ended).
     Load {
         place: usize,
         label: u64,
         program: Program<'static>,
+        process: Option<u64>,
     },
     /// Stop the device of the record at `place`, then close the handles
     /// of the instance in the cell's `gone`.
@@ -185,12 +188,22 @@ impl Worker {
     }
 
     /// Gives the worker the load of an instance of the record at `place`
-    /// from `program`, named by `label` on init's channel (`give`).
-    pub fn load(&self, place: usize, label: u64, program: Program<'static>) -> Result<(), Error> {
+    /// from `program`, named by `label` on init's channel, with the value
+    /// of the process service's registered channel for a POSIX process
+    /// (`give`); the main thread keeps that channel until the worker is
+    /// done.
+    pub fn load(
+        &self,
+        place: usize,
+        label: u64,
+        program: Program<'static>,
+        process: Option<u64>,
+    ) -> Result<(), Error> {
         let order = Order::Load {
             place,
             label,
             program,
+            process,
         };
         self.give(order, None)
     }
@@ -273,7 +286,8 @@ extern "C" fn work(_: u64) -> ! {
                 place,
                 label,
                 program,
-            } => Some(load(&TABLE[place], label, &program)),
+                process,
+            } => Some(load(&TABLE[place], label, &program, process)),
             Order::Teardown { place } => {
                 // The handles close here, the cleanup at the worker's level,
                 // once the device stopped.
@@ -307,10 +321,11 @@ extern "C" fn work(_: u64) -> ! {
 /// Loads an instance of `record` from `program` with the label `label` on
 /// init's channel (rt::loader::spawn): its quota, room for handles,
 /// ceiling and priority from the record, the notification of its end at
-/// its base priority (spec 13.4), and its start data (`start_data`). An
-/// instance whose start data could not be made is killed; its thread never
-/// ran.
-fn load(record: &Record, label: u64, program: &Program<'static>) -> Loaded {
+/// its base priority (spec 13.4), and its start data (`start_data`), with
+/// the session of its record of the process service for a POSIX process
+/// (`process`). An instance whose start data could not be made is killed;
+/// its thread never ran.
+fn load(record: &Record, label: u64, program: &Program<'static>, process: Option<u64>) -> Loaded {
     let channel = view::<Channel>(CHANNEL);
     let params = SpawnParams {
         channel: &channel,
@@ -324,13 +339,54 @@ fn load(record: &Record, label: u64, program: &Program<'static>) -> Loaded {
     };
     // SAFETY: only the worker maps and uses LOADER_WINDOW.
     let mut spawned = unsafe { loader::spawn(&view(OWN), program, LOADER_WINDOW, params) }?;
-    match start_data(record, &mut spawned) {
+    let posix = if record.is_posix() {
+        session(record, &spawned, process).and_then(|s| {
+            // The checks of the table keep the name apart from the others
+            // of the start data.
+            spawned
+                .giver
+                .give(PROCESS_SESSION, s.erase())
+                .map_err(|_| Error::LimitReached)
+        })
+    } else {
+        Ok(())
+    };
+    match posix.and_then(|()| start_data(record, &mut spawned)) {
         Ok(kept) => Ok((spawned, kept)),
         Err(e) => {
             let _ = sys::process_kill(&spawned.process);
             Err(e)
         }
     }
+}
+
+/// The name of the session with the process service in the start data of
+/// a POSIX process (process_client::START_NAME): the service's name, since
+/// `process` names the process's own handle (rt::loader).
+const PROCESS_SESSION: &str = init::table::PROCESS_SERVICE;
+
+/// The session of the record of `spawned`, an instance of `record`, a
+/// POSIX process, with the process service: Create through `process`, the
+/// value of the service's registered channel, which only init holds, with
+/// a copy of the instance's process with MANAGE and TRANSFER, root when
+/// the record has it (spec 2, section 3.1). PEER_CLOSED without the
+/// channel or for a refusal of the service; the errors of the calls.
+fn session(
+    record: &Record,
+    spawned: &Spawned,
+    process: Option<u64>,
+) -> Result<Handle<Channel>, Error> {
+    let channel = process.ok_or(Error::PeerClosed)?;
+    let client = ManuallyDrop::new(process_client::Client::new(ManuallyDrop::into_inner(
+        Handle::borrowed(abi::Handle(channel)),
+    )));
+    client
+        .create(&spawned.process, record.root)
+        .map(|(_, session)| session)
+        .map_err(|status| match status {
+            proto_wire::Status::Kernel(e) => e,
+            _ => Error::PeerClosed,
+        })
 }
 
 /// The start data of an instance of `record` besides its process and

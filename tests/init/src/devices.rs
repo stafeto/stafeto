@@ -839,8 +839,7 @@ fn object_info_log_checks_its_arguments() -> Outcome {
     let c = channel(QUIET)?;
     let debug = copy(&resource(), Rights::DEBUG)?;
     let (r, log) = (resource().raw().0, abi::INFO_LOG);
-    let unknown = abi::INFO_PROCESS_IDENTITY + 1;
-    let invalid = [[r, unknown, 0], [gone, unknown, 0]]
+    let invalid = [[r, log + 1, 0], [gone, log + 1, 0], [r, log + 2, 0]]
         .iter()
         .all(|x| x0_alone::<N>(x, Error::InvalidArgs.code()));
     let refused = [

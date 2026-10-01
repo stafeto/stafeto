@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Session replies reserved before effects, released only by ACK or disconnect.
+//! Session replies reserved before effects, released only by ACK or the
+//! end of the session's record.
 use core::ptr::{self, NonNull};
 use posix_heap::Allocator;
 use proto_process::Change;
@@ -23,7 +24,6 @@ struct Node {
     next: *mut Node,
     label: u64,
     nonce: u64,
-    pid: u32,
     answer: Option<Reply>,
 }
 pub(super) struct Journal {
@@ -69,12 +69,12 @@ impl Journal {
         }
         Ok(())
     }
-    fn find(&self, pid: u32, label: u64, nonce: u64) -> *mut Node {
+    fn find(&self, label: u64, nonce: u64) -> *mut Node {
         let mut node = self.head;
         while !node.is_null() {
             // SAFETY: the sole owner maintains allocated nodes until removal.
             unsafe {
-                if (*node).pid == pid && (*node).label == label && (*node).nonce == nonce {
+                if (*node).label == label && (*node).nonce == nonce {
                     return node;
                 }
                 node = (*node).next;
@@ -82,8 +82,8 @@ impl Journal {
         }
         ptr::null_mut()
     }
-    pub(super) fn reserve(&mut self, pid: u32, label: u64, nonce: u64) -> Result<(), ()> {
-        if !self.find(pid, label, nonce).is_null() {
+    pub(super) fn reserve(&mut self, label: u64, nonce: u64) -> Result<(), ()> {
+        if !self.find(label, nonce).is_null() {
             return Ok(());
         }
         #[cfg(feature = "transport-probe")]
@@ -107,15 +107,14 @@ impl Journal {
                 next: self.head,
                 label,
                 nonce,
-                pid,
                 answer: None,
             });
         }
         self.head = node;
         Ok(())
     }
-    pub(super) fn ready(&self, pid: u32, label: u64, nonce: u64) -> Option<Reply> {
-        let node = self.find(pid, label, nonce);
+    pub(super) fn ready(&self, label: u64, nonce: u64) -> Option<Reply> {
+        let node = self.find(label, nonce);
         // SAFETY: the shared owner borrow prevents removal while copying.
         if node.is_null() {
             None
@@ -123,22 +122,19 @@ impl Journal {
             unsafe { (*node).answer }
         }
     }
-    pub(super) fn complete(&mut self, pid: u32, label: u64, nonce: u64, answer: Reply) {
-        let node = self.find(pid, label, nonce);
+    pub(super) fn complete(&mut self, label: u64, nonce: u64, answer: Reply) {
+        let node = self.find(label, nonce);
         assert!(!node.is_null(), "reserved process result");
         // SAFETY: this exclusive owner borrow keeps the selected node live.
         unsafe {
             (*node).answer = Some(answer);
         }
     }
-    pub(super) fn ack(&mut self, pid: u32, label: u64, nonce: u64) {
-        self.remove(Some(pid), Some(label), Some(nonce));
+    pub(super) fn ack(&mut self, label: u64, nonce: u64) {
+        self.remove(label, Some(nonce));
     }
     pub(super) fn forget(&mut self, label: u64) {
-        self.remove(None, Some(label), None);
-    }
-    pub(super) fn forget_process(&mut self, pid: u32) {
-        self.remove(Some(pid), None, None);
+        self.remove(label, None);
     }
     #[cfg(feature = "transport-probe")]
     pub(super) fn stats(&self) -> (u64, u64, u64, u64) {
@@ -153,17 +149,14 @@ impl Journal {
                 .used as u64,
         )
     }
-    fn remove(&mut self, pid: Option<u32>, label: Option<u64>, nonce: Option<u64>) {
+    fn remove(&mut self, label: u64, nonce: Option<u64>) {
         let mut link = ptr::addr_of_mut!(self.head);
         // SAFETY: links point to the sole owner's head or a live predecessor.
         // Unlinking finishes before deallocation, and no node borrow escapes.
         unsafe {
             while !(*link).is_null() {
                 let node = *link;
-                if pid.is_none_or(|p| (*node).pid == p)
-                    && label.is_none_or(|l| (*node).label == l)
-                    && nonce.is_none_or(|n| (*node).nonce == n)
-                {
+                if (*node).label == label && nonce.is_none_or(|n| (*node).nonce == n) {
                     *link = (*node).next;
                     self.heap.deallocate(NonNull::new_unchecked(node.cast()));
                     if nonce.is_some() {

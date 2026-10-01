@@ -374,7 +374,7 @@ const MEMORY_PORTION_ROWS: [&str; 11] = [
 ];
 /// The rows of the line of `timer_firing_is_measured`, in its order (spec
 /// 15.3).
-const TIMER_PORTION_ROWS: [&str; 3] = ["interrupt", "fire", "set"];
+const TIMER_PORTION_ROWS: [&str; 4] = ["interrupt", "fire", "set", "timers_8192"];
 /// The rows of the line of `interrupt_path_is_measured`, in its order
 /// (spec 15.3).
 const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
@@ -383,14 +383,7 @@ const INTERRUPT_PATH_ROWS: [&str; 4] = ["driver", "bind", "ack", "portion"];
 const WINDOW_ROWS: [&str; 3] = ["create", "map", "release"];
 /// The rows of the line of `upcall_calls_are_measured`, in its order
 /// (spec 15.3).
-const UPCALL_ROWS: [&str; 6] = [
-    "interrupt",
-    "bind",
-    "control",
-    "request",
-    "return",
-    "identity",
-];
+const UPCALL_ROWS: [&str; 5] = ["interrupt", "bind", "control", "request", "return"];
 /// The rows of the line of `teardown_portions_are_measured`, in its order
 /// (spec 15.3): the term B of the out-of-tree measurement is the longest of them.
 const TEARDOWN_ROWS: [&str; 7] = [
@@ -542,7 +535,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 226;
+const INIT_TESTS: u32 = 224;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the

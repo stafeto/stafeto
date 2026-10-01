@@ -97,8 +97,6 @@ pub fn fill_measurement_pages(process: NonNull<Process>, count: usize) -> Result
 }
 
 pub struct Process {
-    /// Boot-unique numeric identity retained with the shell after teardown.
-    id: u32,
     /// From `create` until the first portion of the stage Space takes it:
     /// from then on no call reaches its tables (`map_page` fails,
     /// `translate` finds nothing).
@@ -238,16 +236,6 @@ static ROOTS: Lock<Pool<Process>> = Lock::new(Pool::new());
 static LIVE: Live = Live::new();
 
 impl Process {
-    pub fn identity(&self) -> abi::ProcessIdentity {
-        abi::ProcessIdentity {
-            id: self.id,
-            // SAFETY: an adopted child holds its parent's shell until its own
-            // shell is released. Identity is immutable during that lifetime.
-            parent: self
-                .parent
-                .map_or(0, |parent| unsafe { parent.as_ref().id }),
-        }
-    }
     fn space(&mut self) -> &mut AddressSpace {
         self.space
             .as_mut()
@@ -303,14 +291,9 @@ fn create(
     let ceiling = kcore::args::priority_arg(u64::from(ceiling))?;
     kcore::args::handle_limit_arg(u64::from(handle_limit))?;
     let handles = Handles::new(handle_limit)?;
-    // Reserve before acquiring memory. A later failure retires this ID and
-    // follows the existing resource rollback; exhaustion allocates nothing.
-    static IDS: Lock<kcore::process::Ids> = Lock::new(kcore::process::Ids::new());
-    let id = IDS.lock().allocate()?;
     let mut quota = Account::new(quota);
     let space = AddressSpace::new(&mut quota).map_err(|_| Error::NoMemory)?;
     let process = Process {
-        id,
         space: Some(space),
         retired: None,
         maps: None,

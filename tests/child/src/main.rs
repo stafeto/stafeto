@@ -286,17 +286,6 @@ fn run(s: &Start) -> u64 {
             Ok(()) => 0,
             Err(e) => e.code(),
         },
-        Role::RequestIdentity => {
-            let mut x = marked();
-            x[0] = a[0];
-            // SAFETY: this read has no user-memory or handle arguments.
-            let after = unsafe { sys::raw::<{ Call::RequestIdentity.number() }>(x) };
-            if after[0] == Error::BadState.code() && after[1..] == x[1..] {
-                after[0]
-            } else {
-                FAILED
-            }
-        }
         Role::Reply => {
             let mut x = marked();
             x[..3].copy_from_slice(&[a[0], 8, a[1]]);

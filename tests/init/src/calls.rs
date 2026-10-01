@@ -79,10 +79,6 @@ pub(crate) const TESTS: [Test; 33] = [
     ),
     ("quota_is_enforced", quota_is_enforced),
     ("process_info_kinds", process_info_kinds),
-    (
-        "process_identity_survives_exit_and_recreation",
-        process_identity_survives_exit_and_recreation,
-    ),
     ("kernel_stats_need_kstats", kernel_stats_need_kstats),
     (
         "kernel_call_maxima_use_the_buffer",
@@ -103,6 +99,10 @@ pub(crate) const TESTS: [Test; 33] = [
     (
         "process_kill_returns_after_the_teardown",
         process_kill_returns_after_the_teardown,
+    ),
+    (
+        "process_kill_takes_the_level_of_its_teardown",
+        process_kill_takes_the_level_of_its_teardown,
     ),
     ("child_quota_comes_back", child_quota_comes_back),
     (
@@ -331,7 +331,9 @@ pub(crate) fn written(line: &[u8]) -> bool {
 /// (spec 11), those of the kernel's test builds and the retired 29 too:
 /// the console_poll of the VZ build, which fails so even with the system
 /// resource and a byte to take, as it took them (and as debug_write,
-/// its neighbour, would write one).
+/// its neighbour, would write one). So do the retired 35,
+/// request_identity, with the token of a request init took, and the
+/// retired kind 10 of object_info, PROCESS_IDENTITY, with init's process.
 fn unknown_system_calls_fail() -> Outcome {
     unknown::<0>()?;
     let mut x = marked();
@@ -342,10 +344,52 @@ fn unknown_system_calls_fail() -> Outcome {
         after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
         "the retired 29 did not fail with INVALID_ARGS alone",
     )?;
+    let identity = retired_identity()?;
+    check(
+        identity,
+        "the retired 35 with a live token did not fail with INVALID_ARGS alone",
+    )?;
+    let mut x = marked();
+    x[..3].copy_from_slice(&[own().raw().0, 10, 0]);
+    // SAFETY: object_info only reads its registers.
+    let after = unsafe { sys::raw::<{ Call::ObjectInfo.number() }>(x) };
+    check(
+        after[0] == Error::InvalidArgs.code() && after[1..] == x[1..],
+        "the retired kind 10 did not fail with INVALID_ARGS alone",
+    )?;
     unknown::<{ Call::HIGHEST + 1 }>()?;
     unknown::<0xFEFF>()?;
     unknown::<{ *abi::TEST_CALLS.start() }>()?;
     unknown::<{ *abi::TEST_CALLS.end() }>()
+}
+
+/// Call 35 with the token of a request init took from a thread of its own
+/// in x0: true when it changed x0 alone, to INVALID_ARGS; the request is
+/// answered afterwards.
+fn retired_identity() -> Result<bool, &'static str> {
+    let c = channel(LEVEL)?;
+    let s = session(&c, Rights::SEND, CHILD, LEVEL)?;
+    let sender = spawn(0, send_empty, s.raw().0, HIGH, Policy::Fifo)?;
+    let token = take_token(&c)?;
+    let mut x = marked();
+    x[0] = token.raw();
+    // SAFETY: no call has number 35 any more.
+    let after = unsafe { sys::raw::<35>(x) };
+    let replied = token.reply(&[]);
+    let_run()?;
+    close(sender)?;
+    close(s)?;
+    close(c)?;
+    check(replied.is_ok(), "the request was not answered")?;
+    Ok(after[0] == Error::InvalidArgs.code() && after[1..] == x[1..])
+}
+
+/// A thread that sends an empty request through the session `s` and
+/// exits.
+extern "C" fn send_empty(s: u64) -> ! {
+    let s = Handle::<Channel>::borrowed(abi::Handle(s));
+    let _ = sys::send(&s, &[]);
+    sys::thread_exit()
 }
 
 fn unknown<const N: u16>() -> Outcome {
@@ -584,9 +628,9 @@ fn start_and_kill_cases(c: &Handle<Process>, t: &Handle<Thread>) -> Outcome {
         x0_alone::<START>(&[0], Error::BadHandle.code()),
         x0_alone::<START>(&[c.raw().0], Error::WrongType.code()),
         x0_alone::<START>(&[weak_t.raw().0], Error::AccessDenied.code()),
-        x0_alone::<KILL>(&[0], Error::BadHandle.code()),
-        x0_alone::<KILL>(&[t.raw().0], Error::WrongType.code()),
-        x0_alone::<KILL>(&[weak_c.raw().0], Error::AccessDenied.code()),
+        x0_alone::<KILL>(&[0, 0], Error::BadHandle.code()),
+        x0_alone::<KILL>(&[t.raw().0, 0], Error::WrongType.code()),
+        x0_alone::<KILL>(&[weak_c.raw().0, 0], Error::AccessDenied.code()),
     ];
     let killed = sys::process_kill(c);
     let late = x0_alone::<START>(&[t.raw().0], Error::BadState.code());
@@ -1052,45 +1096,6 @@ fn process_info_kinds() -> Outcome {
     )
 }
 
-/// A numeric identity belongs to the object, independently of local handles.
-/// Ended shells retain it; recreation consumes a new positive identity.
-fn process_identity_survives_exit_and_recreation() -> Outcome {
-    let root = sys::process_identity(&own()).map_err(|_| "root identity failed")?;
-    check(
-        root.id == 1 && root.parent == 0,
-        "init numeric identity is not root 1",
-    )?;
-    let mut previous = root.id;
-    for _ in 0..6 {
-        let child = child(LOW)?;
-        let copied = copy(&child, Rights::NONE)?;
-        let before = sys::process_identity(&child);
-        let through_copy = sys::process_identity(&copied);
-        let killed = sys::process_kill(&child);
-        let after = sys::process_identity(&copied);
-        let state = sys::process_state(&child);
-        close(copied)?;
-        close(child)?;
-        let before = before.map_err(|_| "child identity failed")?;
-        check(
-            before.id > previous && before.id <= abi::PROCESS_ID_MAX && before.parent == root.id,
-            "child identity was reused, invalid or parent did not match",
-        )?;
-        check(
-            through_copy == Ok(before)
-                && killed.is_ok()
-                && after == Ok(before)
-                && state == Ok(ProcessState::Killed),
-            "copy or exit changed numeric identity",
-        )?;
-        previous = before.id;
-    }
-    check(
-        sys::process_identity(&own()) == Ok(root),
-        "children changed the root identity",
-    )
-}
-
 /// KERNEL_STATS takes the system resource with KSTATS (spec 11): a process
 /// is WRONG_TYPE, a copy of the resource with DEBUG alone ACCESS_DENIED,
 /// though it writes; init's resource gets the counts in x1-x9 and changes
@@ -1197,7 +1202,8 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
     let resource = resource().raw().0;
     let kinds = [
         [own, 0, 0],
-        [own, abi::INFO_PROCESS_IDENTITY + 1, 0],
+        [own, abi::INFO_LOG + 1, 0],
+        [own, abi::INFO_LOG + 2, 0],
         [own, state | 1 << 32, 0],
         [own, state, 8],
         [0, 0, 0],
@@ -1212,7 +1218,6 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
             thread_state,
             channel_kind,
             irq,
-            abi::INFO_PROCESS_IDENTITY,
         ]
         .into_iter()
         .flat_map(|kind| {
@@ -1229,9 +1234,6 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (0, thread_state, Error::BadHandle),
         (0, channel_kind, Error::BadHandle),
         (0, irq, Error::BadHandle),
-        (0, abi::INFO_PROCESS_IDENTITY, Error::BadHandle),
-        (resource, abi::INFO_PROCESS_IDENTITY, Error::WrongType),
-        (thread, abi::INFO_PROCESS_IDENTITY, Error::WrongType),
         (resource, state, Error::WrongType),
         (thread, state, Error::WrongType),
         (resource, memory, Error::WrongType),
@@ -1253,7 +1255,6 @@ fn object_info_cases(own: u64, debug: u64, thread: u64, seen: u64) -> Outcome {
         (own, table, 4),
         (thread, thread_state, 5),
         (seen, channel_kind, 5),
-        (own, abi::INFO_PROCESS_IDENTITY, 3),
     ]
     .map(|(h, kind, past)| {
         let mut x = marked();
@@ -1488,6 +1489,71 @@ fn process_kill_returns_after_the_teardown() -> Outcome {
         memory.is_ok_and(|m| m.used == 2 * PAGE as u64 && m.used + m.returned == m.quota),
         "the child's quota was not back but for its two pages of pools when process_kill returned",
     )
+}
+
+/// x1 of process_kill, the level of the teardown (spec 7.7, 11): above 63
+/// or with bits past its byte INVALID_ARGS, before the handle; above the
+/// caller's effective priority ACCESS_DENIED, after it; each changes x0
+/// alone. Init at TEST_PRIORITY kills a child heard of at QUIET with level
+/// 2: the call returns before the teardown, with the queue not empty and no
+/// exit notification; a thread of init at LEVEL, between 2 and init, runs
+/// before the teardown once init lowers itself, and the notification is
+/// there once init runs again at 1.
+fn process_kill_takes_the_level_of_its_teardown() -> Outcome {
+    const KILL: u16 = Call::ProcessKill.number();
+    const BELOW: u64 = 2;
+    let (exits, name) = exit_channel()?;
+    let c = heard_child(&name, QUIET, LOW)?;
+    let h = c.raw().0;
+    let above = u64::from(TEST_PRIORITY) + 1;
+    let refused = [
+        x0_alone::<KILL>(&[h, abi::PRIORITY_LEVELS.into()], Error::InvalidArgs.code()),
+        x0_alone::<KILL>(&[h, 0x100 | BELOW], Error::InvalidArgs.code()),
+        x0_alone::<KILL>(&[0, abi::PRIORITY_LEVELS.into()], Error::InvalidArgs.code()),
+        x0_alone::<KILL>(&[0, above], Error::BadHandle.code()),
+        x0_alone::<KILL>(&[h, above], Error::AccessDenied.code()),
+    ];
+    let alive = sys::process_state(&c) == Ok(ProcessState::Alive);
+    let t = child_thread(&c, LOW);
+    reset_marks();
+    let killed = sys::process_kill_at(&c, BELOW as u8);
+    let queued = sys::kernel_stats(&resource()).map(|s| s.cleanup_queue);
+    let early = sys::try_receive(&exits);
+    let between = spawn(0, queue_at_mark, 1, LEVEL, Policy::Fifo)?;
+    let_run()?;
+    let heard = take_one(&exits);
+    let state = sys::process_state(&c);
+    close(between)?;
+    close(c)?;
+    if let Ok(t) = t {
+        close(t)?;
+    }
+    close(exits)?;
+    close(name)?;
+    check(
+        refused.iter().all(|&ok| ok) && alive,
+        "a level past 63 or above the caller did not fail alone in the order of spec 11",
+    )?;
+    check(
+        killed.is_ok() && queued.is_ok_and(|n| n > 0) && early == Err(Error::WouldBlock),
+        "process_kill with a level below the caller did not return before the teardown",
+    )?;
+    check(
+        mark(1) > 1,
+        "a thread between the level and the caller did not run before the teardown",
+    )?;
+    check(
+        heard == Ok(exit_notice(CHILD)) && state == Ok(ProcessState::Killed),
+        "the exit notification did not come after the teardown",
+    )
+}
+
+/// Leaves the length of the cleanup queue, plus one, in mark `i`, and
+/// ends.
+extern "C" fn queue_at_mark(i: u64) -> ! {
+    let queued = sys::kernel_stats(&resource()).map_or(0, |s| s.cleanup_queue);
+    MARKS[i as usize].store(queued + 1, Relaxed);
+    sys::thread_exit()
 }
 
 /// A child's quota comes back to init in two parts (spec 7.5): once the

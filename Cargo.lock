@@ -94,6 +94,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "process-client",
  "proto-init",
  "proto-wire",
  "rt",
