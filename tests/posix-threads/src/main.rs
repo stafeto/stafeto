@@ -58,6 +58,8 @@ mod sleep;
 #[cfg(not(feature = "cancel-input"))]
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
+mod tcb;
+#[cfg(not(feature = "cancel-input"))]
 mod thread_replies;
 #[cfg(not(feature = "cancel-input"))]
 mod timed;
@@ -356,7 +358,8 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !clocks::run(clocks)
+    if !tcb::run()
+        || !clocks::run(clocks)
         || !capacity::run()
         || !specific::run()
         || !once::run()
@@ -430,16 +433,14 @@ fn main(_: u64) -> u64 {
     {
         return 3;
     }
-    let passed = tls::with_thread(1, || {
-        #[cfg(feature = "cancel-input")]
-        {
-            input::run()
-        }
-        #[cfg(not(feature = "cancel-input"))]
-        {
-            run(&clocks, &start.parent)
-        }
-    });
+    // SAFETY: the main page is this thread's for its life.
+    if unsafe { threads::attach(tls::main_page(), posix_thread::PAGE_SIZE, 1) }.is_err() {
+        return 3;
+    }
+    #[cfg(feature = "cancel-input")]
+    let passed = input::run();
+    #[cfg(not(feature = "cancel-input"))]
+    let passed = run(&clocks, &start.parent);
     if !passed {
         rt::println!("posix-thread-probe: failed");
         return 4;

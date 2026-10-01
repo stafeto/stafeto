@@ -138,6 +138,7 @@ dependencies = [
  "posix-order",
  "posix-request",
  "posix-signals",
+ "posix-thread",
  "posix-time",
  "posix-types",
  "process-client",
@@ -211,6 +212,7 @@ version = "0.1.0"
 dependencies = [
  "posix-abi",
  "posix-fs",
+ "posix-thread",
  "proto-init",
  "rt",
 ]
@@ -296,6 +298,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-thread"
+version = "0.1.0"
+
+[[package]]
 name = "posix-thread-probe"
 version = "0.1.0"
 dependencies = [
@@ -304,6 +310,7 @@ dependencies = [
  "posix-fs",
  "posix-request",
  "posix-signals",
+ "posix-thread",
  "posix-time",
  "process-client",
  "proto-clock",
@@ -324,6 +331,7 @@ name = "posix-tls-probe"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-thread",
  "rt",
 ]
 

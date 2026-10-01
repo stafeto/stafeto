@@ -1051,8 +1051,12 @@ static int credentials(void) {
 int main(int argc, char **argv) {
     if (argc != 2 || !argv || argv[2] != NULL || !same(argv[0], "posix-abi-probe", 15)
             || !same(argv[1], "argument", 9) || !environ || environ[0] != NULL) return 1;
-    if (stafeto_posix_abi_version() != ABI_VERSION ||
-            (char *)__errno_location() - (char *)__builtin_thread_pointer() != STAFETO_ERRNO_OFFSET) return 33;
+    /* errno lies in the layer's block of this thread's TCB: TPIDR_EL0 names
+     * the ABI word, the word the TCB, the block is 192 bytes 32 on. */
+    char *tcb = *(char **)__builtin_thread_pointer();
+    char *errno_at = (char *)__errno_location();
+    if (stafeto_posix_abi_version() != ABI_VERSION || errno_at < tcb + 32
+            || errno_at + sizeof(int) > tcb + 32 + 192) return 33;
     errno = 123;
     int fd = open("/etc/motd", O_RDONLY | O_CLOEXEC);
     if (fd != 3 || errno != 123) return 2;

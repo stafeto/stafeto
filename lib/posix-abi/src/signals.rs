@@ -4,7 +4,7 @@
 //! Process dispositions and ordinary thread-directed delivery through the owner.
 //! Real-time queues, process routing, stop/continue, alternate stacks and
 //! automatic syscall restart still require implementation.
-use crate::{constants::*, threads, tls};
+use crate::{constants::*, threads};
 pub use posix_signals::{DEFAULT, IGNORE};
 pub use posix_types::{MachineContext, SigAction, SigInfo, SigSet, SignalStack, UserContext};
 use rt::upcall;
@@ -283,6 +283,12 @@ pub fn probe_wait_deadline(thread: u64) -> Result<Option<i128>, i32> {
 }
 
 rt::upcall_entry!(entry, dispatch, context);
+
+/// Where the calling thread's errno lives: the layer's block until 5a′,
+/// relibc's `__errno_location` after it. The entry saves and gives back
+/// the value there; it never moves the thread pointer (spec 2, 3.5).
+static ERRNO_LOCATION: unsafe extern "C" fn() -> *mut core::ffi::c_int = crate::__errno_location;
+
 pub(crate) fn attach() -> Result<(), i32> {
     // SAFETY: this dispatcher owns no interrupted Rust references or locks. It
     // communicates with the sole owner and enters only caller-supplied C code.
@@ -292,7 +298,8 @@ pub(crate) fn attach() -> Result<(), i32> {
     Ok(())
 }
 unsafe extern "C" fn dispatch(native: *mut upcall::Context) {
-    let errno = tls::errno();
+    // SAFETY: the entry runs on a thread with a block (attach).
+    let errno = unsafe { ERRNO_LOCATION() };
     let saved_errno = unsafe { *errno };
     loop {
         let (old_mask, _) = call(MASK, [0; 5]).expect("signal mask snapshot");

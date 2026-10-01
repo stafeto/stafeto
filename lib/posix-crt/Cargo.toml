@@ -21,4 +21,5 @@ uart-input = []
 proto-init = { path = "../../proto/init" }
 posix-abi = { path = "../posix-abi" }
 posix-fs = { path = "../posix-fs" }
+posix-thread = { path = "../posix-thread" }
 rt = { path = "../rt" }

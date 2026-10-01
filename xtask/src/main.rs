@@ -3300,6 +3300,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "posix-tls-probe",
         "--package",
+        "posix-thread",
+        "--package",
         "posix-thread-probe",
         "--package",
         "posix-shared-probe",

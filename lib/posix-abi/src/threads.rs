@@ -6,7 +6,10 @@
 //! channel as its exit channel (thread_create x7, x8): the kernel tells the
 //! owner once the thread left the scheduler, and only then its stack goes
 //! and a join wakes, whether the thread ended through pthread_exit or past
-//! the library. ELF TLS and scheduler attributes remain work.
+//! the library. Each pthread gets its TCB (posix-thread) in the page
+//! above its stack, in the same memory object, and attaches to it before
+//! its callback (`tls::attach`). ELF TLS and scheduler attributes remain
+//! work.
 
 pub mod cancel;
 pub mod mutex;
@@ -79,7 +82,13 @@ impl Attributes {
             && self.stack_size >= PTHREAD_STACK_MIN as usize
             && rounded(self.stack_size)
                 .zip(rounded(self.guard_size))
-                .is_some_and(|(stack, guard)| stack.checked_add(guard).is_some_and(|n| n <= STRIDE))
+                .is_some_and(|(stack, guard)| {
+                    // The stack, its guard and the page of the TCB above it.
+                    stack
+                        .checked_add(guard)
+                        .and_then(|n| n.checked_add(PAGE))
+                        .is_some_and(|n| n <= STRIDE)
+                })
     }
 }
 
@@ -132,6 +141,8 @@ struct Launch {
     callback: AtomicU64,
     argument: AtomicU64,
     floating: AtomicU64,
+    /// The page of the thread's TCB, above its stack.
+    tcb: AtomicU64,
     completed: AtomicBool,
     cancel: cancel::State,
     specific: specific::Values,
@@ -142,6 +153,7 @@ static LAUNCH: [Launch; CAPACITY] = [const {
         callback: AtomicU64::new(0),
         argument: AtomicU64::new(0),
         floating: AtomicU64::new(0),
+        tcb: AtomicU64::new(0),
         completed: AtomicBool::new(false),
         cancel: cancel::State::new(),
         specific: specific::Values::new(),
@@ -482,12 +494,14 @@ impl Registry {
         let policy = parent.policy.ok_or(EIO)?;
         let length = rounded(attr.stack_size).ok_or(EINVAL)?;
         let address = STACK_BASE + slot * STRIDE + rounded(attr.guard_size).ok_or(EINVAL)?;
-        let memory = sys::mem_create(length as u64).map_err(|_| EAGAIN)?;
+        // The stack and, above it, the page of the thread's TCB.
+        let mapped = length + PAGE;
+        let memory = sys::mem_create(mapped as u64).map_err(|_| EAGAIN)?;
         sys::mem_map(
             allocation::process(),
             &memory,
             0,
-            length as u64,
+            mapped as u64,
             address,
             Access::ReadWrite,
         )
@@ -495,6 +509,9 @@ impl Registry {
         LAUNCH[slot].callback.store(words[3], Ordering::Relaxed);
         LAUNCH[slot].argument.store(words[4], Ordering::Relaxed);
         LAUNCH[slot].floating.store(words[7], Ordering::Relaxed);
+        LAUNCH[slot]
+            .tcb
+            .store((address + length) as u64, Ordering::Relaxed);
         LAUNCH[slot].completed.store(false, Ordering::Relaxed);
         LAUNCH[slot].cancel.reset();
         LAUNCH[slot].specific.reset();
@@ -517,7 +534,7 @@ impl Registry {
         let native = match native {
             Ok(native) => native,
             Err(_) => {
-                unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
+                unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
                     .expect("failed-create stack removal");
                 return Err(EAGAIN);
             }
@@ -525,7 +542,7 @@ impl Registry {
         self.entries[slot] = Some(Entry::new(
             id,
             native,
-            Some((address, length)),
+            Some((address, mapped)),
             attr.detached != 0,
         ));
         self.entry_mut(slot).signal.mask = self.entry(caller).signal.mask;
@@ -535,7 +552,7 @@ impl Registry {
             // The failed start leaves the thread stopped; release its handle
             // before removing the stack it cannot execute on.
             self.entries[slot] = None;
-            unsafe { sys::mem_unmap(allocation::process(), address, length as u64) }
+            unsafe { sys::mem_unmap(allocation::process(), address, mapped as u64) }
                 .expect("failed-start stack removal");
             return Err(EAGAIN);
         }
@@ -1073,6 +1090,7 @@ extern "C" fn trampoline(slot: u64) -> ! {
         unsafe { core::mem::transmute(launch.callback.load(Ordering::Relaxed) as usize) };
     let argument = launch.argument.load(Ordering::Relaxed) as *mut c_void;
     let floating = launch.floating.load(Ordering::Relaxed);
+    let tcb = launch.tcb.load(Ordering::Relaxed) as *mut u8;
     // SAFETY: EL0 owns its FP environment. Restore the creator's control and
     // status registers before entering any user callback.
     unsafe {
@@ -1081,11 +1099,25 @@ extern "C" fn trampoline(slot: u64) -> ! {
             status = in(reg) floating >> 32,
             options(nomem, nostack, preserves_flags));
     }
-    tls::with_thread(id, || {
-        let value = unsafe { callback(argument) };
-        // SAFETY: the current thread is managed and has an initialized scope.
-        unsafe { pthread_exit(value) }
-    })
+    // SAFETY: the page above the stack is this thread's until it ended.
+    unsafe { attach(tcb, PAGE, id) }.expect("managed thread attach");
+    let value = unsafe { callback(argument) };
+    // SAFETY: the current thread is managed and attached.
+    unsafe { pthread_exit(value) }
+}
+
+/// Attaches the calling thread to the TCB built in `page`, `len` bytes,
+/// as pthread `id` with the process's files, and binds and enables its
+/// entry of signals: the second step of a thread's start (spec 2, 3.5),
+/// after the process's (posix-crt) for the main thread, in the trampoline
+/// of `pthread_create` for another.
+///
+/// # Safety
+/// As for `tls::attach`; the thread is managed (its record is `id`).
+pub unsafe fn attach(page: *mut u8, len: usize, id: u64) -> Result<(), i32> {
+    // SAFETY: the caller's promise.
+    unsafe { tls::attach(page, len, id) };
+    crate::signals::attach()
 }
 
 fn request(op: u64, arguments: [u64; 5]) -> Result<u64, i32> {

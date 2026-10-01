@@ -13,4 +13,5 @@ bench = false
 
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi" }
+posix-thread = { path = "../../lib/posix-thread" }
 rt = { path = "../../lib/rt" }

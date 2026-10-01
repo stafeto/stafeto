@@ -4,7 +4,6 @@
 //! Experimental ABI 1 constants; the sysroot generator reads these definitions.
 
 pub const ABI_VERSION: u32 = 1;
-pub const STAFETO_ERRNO_OFFSET: u32 = 16;
 pub const SYSROOT_VERSION: &str = "0.1.0";
 pub const PTHREAD_CANCEL_ENABLE: i32 = 0;
 pub const PTHREAD_CANCEL_DISABLE: i32 = 1;
