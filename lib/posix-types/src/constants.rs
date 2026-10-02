@@ -69,6 +69,11 @@ pub const SA_SIGINFO: i32 = 4;
 /// A read in two steps that a handler with this flag interrupted goes on
 /// waiting (spec 2, 3.3); other calls return EINTR as before.
 pub const SA_RESTART: i32 = 16;
+/// SIGCHLD only: no SIGCHLD when a child stops (5e).
+pub const SA_NOCLDSTOP: i32 = 32;
+/// SIGCHLD only: the children leave no zombies (the process service
+/// reads it from the record's page).
+pub const SA_NOCLDWAIT: i32 = 64;
 pub const SS_DISABLE: i32 = 2;
 // Source codes are implementation-defined numbers. Reserved standard sources
 // are declared for C applications before their generators are implemented.

@@ -39,6 +39,48 @@ pub unsafe fn init(session: Handle<Channel>) -> Result<(), Status> {
     let snapshot = client.query()?;
     PID.store(snapshot.pid, Ordering::Release);
     *state = Some(client);
+    crate::signals::publish_initial();
+    Ok(())
+}
+
+/// kill of the process `pid` (> 0, the caller's own among them) with
+/// `signal` through the process service (0 checks alone): ESRCH, EPERM,
+/// EINVAL from the service. A signal to the caller's own process comes to
+/// a thread of it before the return, the caller when its mask lets it
+/// through ([P24-KILL]).
+pub fn kill(pid: i32, signal: i32) -> Result<(), i32> {
+    use crate::constants::{EINVAL, EIO, EPERM, ESRCH};
+    let pid = u32::try_from(pid).ok().filter(|&p| p != 0).ok_or(EINVAL)?;
+    let signal = u32::try_from(signal).map_err(|_| EINVAL)?;
+    let mut w = Writer::new();
+    proto_process::Method::Kill
+        .header()
+        .write(&mut w)
+        .map_err(|_| EIO)?;
+    w.u32(pid).map_err(|_| EIO)?;
+    w.u32(signal).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let status = loop {
+        match rt::sys::send(client().session(), w.as_bytes()) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            Err(_) => return Err(EIO),
+            Ok(reply) => {
+                let bytes = reply.bytes(&mut buffer);
+                break proto_wire::Reader::new(bytes).u32().map_err(|_| EIO)?;
+            }
+        }
+    };
+    match status {
+        0 => {}
+        proto_process::NO_PROCESS => return Err(ESRCH),
+        proto_process::PERMISSION => return Err(EPERM),
+        proto_process::INVALID => return Err(EINVAL),
+        _ => return Err(EIO),
+    }
+    if pid == PID.load(Ordering::Acquire) && signal != 0 {
+        crate::signals::route();
+        crate::signals::deliver_now();
+    }
     Ok(())
 }
 

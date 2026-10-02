@@ -9,7 +9,8 @@ pub const DEFAULT: u64 = 0;
 pub const IGNORE: u64 = 1;
 pub const VALID: SigSet = (1 << 31) - 1;
 pub const UNBLOCKABLE: SigSet = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
-pub const FLAGS: i32 = SA_NODEFER | SA_RESETHAND | SA_SIGINFO | SA_RESTART;
+pub const FLAGS: i32 =
+    SA_NODEFER | SA_RESETHAND | SA_SIGINFO | SA_RESTART | SA_NOCLDSTOP | SA_NOCLDWAIT;
 pub const INITIAL: SigAction = SigAction {
     handler: DEFAULT,
     mask: 0,

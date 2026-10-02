@@ -13,7 +13,8 @@
 //! record, its exit place and the process, and replies status u32, pid
 //! u32, label u64 with two handles: the process (MANAGE, DUPLICATE,
 //! TRANSFER) for the load, and the record's session. Loaded, body label
-//! u64: the process was loaded and runs; reply its status, and the parent
+//! u64 and one handle, the first thread (MANAGE), the router of the
+//! process's signals: the process was loaded and runs; reply its status, and the parent
 //! whose Spawn made it gets its PID. Abandon, body label u64 (0 for no
 //! record), parent label u64 (0 for none) and status u32: the process,
 //! if any, is killed, and the record goes with its end; the parent's
@@ -29,6 +30,13 @@
 //! WaitTake: body k u64 and a copy of the caller's channel with NOTIFY,
 //! labelled k: READY or ARMED, then bit 0 through the copy once a child of
 //! the selector ended. WaitCancel: body k u64: READY or CANCELLED.
+//!
+//! Kill, through a session: body pid u32 (> 0) and signal u32 (0 to 64);
+//! reply its status: NO_PROCESS, PERMISSION, or INVALID for a signal past
+//! 64 and for the stop signals until stops come (5e). Router, through a
+//! session: no body and one handle, the thread (MANAGE) whose entry the
+//! service asks for once it set a signal on the page, in place of the
+//! first thread; reply its status.
 //!
 //! The page of the record (`Page`) lies at PAGE_ADDRESS of the process,
 //! the service's to write but for the fields the process writes.
@@ -226,6 +234,8 @@ pub enum Method {
     WaitStart = 10,
     WaitTake = 11,
     WaitCancel = 12,
+    Kill = 13,
+    Router = 14,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -235,7 +245,7 @@ impl Method {
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9, 10, 11, 12];
+pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -575,12 +585,21 @@ pub enum End {
     Signaled(u8),
 }
 
+pub const SIGHUP: u8 = 1;
 pub const SIGILL: u8 = 4;
 pub const SIGTRAP: u8 = 5;
 pub const SIGBUS: u8 = 7;
 pub const SIGFPE: u8 = 8;
 pub const SIGKILL: u8 = 9;
+pub const SIGUSR1: u8 = 10;
 pub const SIGSEGV: u8 = 11;
+pub const SIGTERM: u8 = 15;
+pub const SIGCHLD: u8 = 17;
+pub const SIGCONT: u8 = 18;
+pub const SIGSTOP: u8 = 19;
+pub const SIGTSTP: u8 = 20;
+pub const SIGTTIN: u8 = 21;
+pub const SIGTTOU: u8 = 22;
 /// The highest signal number (Linux AArch64, relibc's NSIG - 1).
 pub const SIGNAL_MAX: u8 = 64;
 
@@ -698,6 +717,8 @@ mod tests {
             Method::WaitStart,
             Method::WaitTake,
             Method::WaitCancel,
+            Method::Kill,
+            Method::Router,
         ];
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);

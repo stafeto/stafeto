@@ -24,15 +24,17 @@
 use core::cell::UnsafeCell;
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, Record, Records, State};
+use posix_process_service::signals::{self, Info, Posted};
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use proto_process::{
-    Change, Create, Credentials, End, INIT_PID, Method, Next, RECORDS, SIGKILL, Selector, Spawn,
+    CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, INIT_PID, Method, Next,
+    PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, RECORDS, SI_USER, SIGCHLD, SIGKILL, Selector, Spawn,
     WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
     abi::{self, Access, ObjectKind, Rights, Source},
-    handle::{Channel, Handle, Memory, Outgoing, Process, Resource},
+    handle::{Channel, Handle, Memory, Outgoing, Process, Resource, Thread},
     service::{
         Answer, Config, Heartbeat, LongOps, LongSession, Notice, Pending, Request, Service, Session,
     },
@@ -77,6 +79,9 @@ struct Processes {
     next: Option<Pending>,
     /// The pages of the records.
     pages: pages::Pages,
+    /// The thread of each record's process whose entry the service asks
+    /// for once it set a signal on the page (Router).
+    routers: [Option<Handle<Thread>>; RECORDS],
     /// The witness of each record's process, which init gave with ADOPT or
     /// SPAWN: it closes once the process ended, and init hears of the end.
     witnesses: [Option<Handle<Channel>>; RECORDS],
@@ -95,6 +100,7 @@ impl Processes {
             next: None,
             pages: pages::Pages::new(),
             witnesses: [const { None }; RECORDS],
+            routers: [const { None }; RECORDS],
             ops: LongOps::new(),
             waits: Waits::new(),
         }
@@ -269,29 +275,34 @@ impl Processes {
         }
     }
 
-    /// Loaded (label 0) of the LOADING record the body names: it is ALIVE,
-    /// and the Spawn that asked for it gets its PID. UNREGISTERED for a
+    /// Loaded (label 0) of the LOADING record the body names, with its
+    /// first thread, the router of its signals: it is ALIVE, and the Spawn
+    /// that asked for it gets its PID. UNREGISTERED for a
     /// label of no such record. A child that ended between thread_start
     /// and Loaded would leave its parent's Spawn waiting; it does not come
     /// to pass on one processor, where the spawning thread runs at the
     /// loop's level, above the child's ceiling, from its start to Loaded.
     fn loaded(&mut self, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
-        let (Ok(label), true) = (body.u64(), r.handles.is_empty()) else {
+        let (Ok(label), Ok(thread)) = (body.u64(), r.handles.take::<Thread>(0)) else {
             return Answer::Status(Status::BadSize);
         };
         if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
+        let Some(index) = self.records.find(label) else {
+            return refuse(proto_process::UNREGISTERED);
+        };
         let Some(record) = self
             .records
-            .find(label)
-            .and_then(|i| self.records.get_mut(i))
+            .get_mut(index)
             .filter(|r| r.state == State::Loading)
         else {
             return refuse(proto_process::UNREGISTERED);
         };
         record.state = State::Alive;
+        // The first thread routes the process's signals (spec 2, 3.3).
+        self.routers[index] = Some(thread);
         let pid = record.label.pid();
         let parent = record.parent_index.map(usize::from);
         if let Some(spawning) = parent.and_then(|p| self.spawns[p].take()) {
@@ -585,6 +596,129 @@ impl Processes {
         }
     }
 }
+impl Processes {
+    /// Router of the record in `index`: one thread handle with MANAGE, the
+    /// thread whose entry routes the process's signals (spec 2, 3.3); a
+    /// signal that waits on the page already asks for its entry at once.
+    fn router(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() != 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let manages = matches!(r.handles.info(0), Some((ObjectKind::Thread, rights)) if rights.contains(Rights::MANAGE));
+        let Some(thread) = manages.then(|| r.handles.take::<Thread>(0).ok()).flatten() else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let waiting = self
+            .pages
+            .page(index)
+            .is_some_and(|p| p.pending.load(core::sync::atomic::Ordering::Acquire) != 0);
+        if waiting {
+            let _ = sys::thread_upcall_request(&thread);
+        }
+        self.routers[index] = Some(thread);
+        Answer::Status(Status::Ok)
+    }
+
+    /// Posts `signal` with `info` to the process of the record in `target`
+    /// and asks for its router's entry when it waits now (O(1)).
+    fn signal(&mut self, target: usize, signal: u8, info: Info) {
+        let Some(page) = self.pages.page(target) else {
+            return;
+        };
+        if signals::post(page, signal, info) == Posted::Pending
+            && let Some(router) = self.routers[target].as_ref()
+        {
+            // A router that ended asks nothing; the signal waits on the
+            // page for a thread that unblocks or waits for it.
+            let _ = sys::thread_upcall_request(router);
+        }
+    }
+
+    /// Kill of the record in `index`: pid u32 and signal u32. NO_PROCESS
+    /// for no live or zombie process of that PID (a LOADING one is none
+    /// yet); PERMISSION past kill's rule (`signals::may_signal`); signal 0
+    /// checks alone; SIGKILL ends the process from the service at the
+    /// target's ceiling (process_kill_at); INVALID for a signal the service
+    /// refuses until stops come (`signals::refused`); any other is posted
+    /// on the target's page (`signal`). The reply comes once the signal is
+    /// there: the caller's layer looks at its own page before its return.
+    fn kill(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(pid), Ok(signal)) = (body.u32(), body.u32()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() || pid == 0 {
+            return Answer::Status(Status::BadSize);
+        }
+        let Ok(signal) = u8::try_from(signal) else {
+            return refuse(proto_process::INVALID);
+        };
+        let sender = self.records.get(index).expect("the sender");
+        let (from_pid, from, from_session) = (sender.label.pid(), sender.credentials, sender.sid);
+        let Some(target) = self.records.find_pid(pid).filter(|&t| {
+            self.records
+                .get(t)
+                .is_some_and(|r| r.state != State::Loading)
+        }) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        let record = self.records.get(target).expect("a target");
+        if !signals::may_signal(from, record.credentials, signal, from_session == record.sid) {
+            return refuse(proto_process::PERMISSION);
+        }
+        let zombie = matches!(record.state, State::Zombie(_));
+        if signal == 0 || zombie {
+            return Answer::Status(Status::Ok);
+        }
+        if signal == SIGKILL {
+            let _ = sys::process_kill_at(&record.process, record.ceiling);
+            return Answer::Status(Status::Ok);
+        }
+        let Some(page) = self.pages.page(target) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        if signals::refused(signal, page) {
+            return refuse(proto_process::INVALID);
+        }
+        let info = Info {
+            code: SI_USER,
+            pid: from_pid,
+            uid: from.uid,
+            status: 0,
+        };
+        self.signal(target, signal, info);
+        Answer::Status(Status::Ok)
+    }
+
+    /// The child in `child` of the record in `parent` ended with `end`: a
+    /// parent whose page says SA_NOCLDWAIT or SIGCHLD ignored takes no
+    /// zombie, which goes at once; SIGCHLD goes to the parent (CLD_EXITED
+    /// or CLD_KILLED with the child's PID, real UID and status); the
+    /// parent's waits that take the child are told.
+    fn child_ended(&mut self, parent: usize, child: usize, end: End) {
+        let record = self.records.get(child).expect("a zombie");
+        let (pid, uid) = (record.label.pid(), record.credentials.uid);
+        let (code, status) = match end {
+            End::Exited(code) => (CLD_EXITED, i32::from(code)),
+            End::Signaled(n) => (CLD_KILLED, i32::from(n)),
+        };
+        let flags = self
+            .pages
+            .page(parent)
+            .map_or(0, |p| p.flags.load(core::sync::atomic::Ordering::Acquire));
+        self.tell(parent, child);
+        if flags & (PAGE_NOCLDWAIT | PAGE_CHLD_IGNORED) != 0 {
+            self.records.reap(child);
+        }
+        let info = Info {
+            code,
+            pid,
+            uid,
+            status,
+        };
+        self.signal(parent, SIGCHLD, info);
+    }
+}
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = proto_process::METHODS;
@@ -623,6 +757,9 @@ impl Service<0> for Processes {
         if method == Method::WaitTake as u16 {
             return self.wait_take(index, s, r);
         }
+        if method == Method::Router as u16 {
+            return self.router(index, r);
+        }
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
@@ -653,6 +790,7 @@ impl Service<0> for Processes {
             n if n == Method::Spawn as u16 => self.spawn(index, r),
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
+            n if n == Method::Kill as u16 => self.kill(index, r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
@@ -686,8 +824,9 @@ impl Service<0> for Processes {
                     .store(INIT_PID, core::sync::atomic::Ordering::Release);
             }
         }
+        self.routers[index] = None;
         if let Exit::Zombie { parent } = exit {
-            self.tell(parent, index);
+            self.child_ended(parent, index, end);
         }
     }
 }

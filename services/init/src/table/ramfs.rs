@@ -220,7 +220,9 @@ pub const RELIBC_TABLE: &[Record] = &[
 /// one whose 32 MiB stack its 15 pages of quota cannot map, so that its
 /// load fails (the image gives `posix-procs-big` that stack), one that
 /// ends 300 ms after its start, one that exits with 7, one that faults,
-/// and one that spawns the last, which waits to be an orphan.
+/// one that spawns the next, which waits to be an orphan, one that blocks
+/// every signal and spins, and one that exits with 42 from its handler of
+/// SIGUSR1.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
     POSIX_ABI_TABLE[1],
@@ -276,6 +278,21 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     Record {
         name: "procs-orphan",
         args: b"posix-procs\0orphan\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    // It spins: below the probe, which runs FIFO at its own level.
+    Record {
+        name: "procs-block",
+        args: b"posix-procs\0block\0",
+        priority: 20,
+        ceiling: 21,
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-catch",
+        args: b"posix-procs\0catch\0",
         on_demand: true,
         ..PROCS_CHILD
     },

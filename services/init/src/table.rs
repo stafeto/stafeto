@@ -1480,7 +1480,9 @@ mod tests {
                 "procs-exit7",
                 "procs-segv",
                 "procs-middle",
-                "procs-orphan"
+                "procs-orphan",
+                "procs-catch",
+                "procs-block"
             ]
         );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {

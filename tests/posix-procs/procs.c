@@ -20,6 +20,14 @@
  * the build's limit of four children (feature children-max-4 of the
  * service), a fifth is EAGAIN, zombies counted.
  *
+ * Stage 3, kill (the first goal of 5b): SIGTERM to a child without a
+ * handler gives WIFSIGNALED SIGTERM, apart from exit(143); SIGKILL ends a
+ * child that blocks every signal and spins; a child that catches SIGUSR1
+ * exits with 42 from its handler; SIGCHLD comes to sigwaitinfo with the
+ * child's PID, CLD_EXITED and its status; a signal to the probe's own
+ * process runs its handler before kill returns, and one its main thread
+ * blocks goes to the thread that lets it through.
+ *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
 #include <errno.h>
@@ -132,6 +140,84 @@ static void interrupted_wait(int restart) {
     expect("the handler in the wait", handled, 1);
 }
 
+static void exit_42(int signal) {
+    (void)signal;
+    _exit(42);
+}
+
+static volatile pthread_t usr2_thread;
+static volatile int usr2_ready, usr2_done;
+static void on_usr2(int signal) {
+    (void)signal;
+    usr2_thread = pthread_self();
+    usr2_done = 1;
+}
+/* Lets SIGUSR2 through and waits until a handler ran. */
+static void *usr2_taker(void *arg) {
+    (void)arg;
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    pthread_sigmask(SIG_UNBLOCK, &usr2, NULL);
+    usr2_ready = 1;
+    for (int i = 0; i < 300 && !usr2_done; i++) pause_ms(10);
+    return NULL;
+}
+
+/* Stage 3: kill and SIGCHLD, with the sleeper of stage 1 alive. */
+static void kills(pid_t sleeper) {
+    expect("kill of the sleeper", kill(sleeper, SIGTERM), 0);
+    reap("the sleeper after SIGTERM", sleeper, 0, SIGTERM);
+    expect("kill of a taken child", kill(sleeper, SIGTERM) == -1 && errno == ESRCH, 1);
+
+    pid_t blocker = start("/boot/procs-block");
+    pause_ms(100);
+    expect("SIGTERM to a child that blocks it", kill(blocker, SIGTERM), 0);
+    expect("SIGKILL", kill(blocker, SIGKILL), 0);
+    reap("the blocker after SIGKILL", blocker, 0, SIGKILL);
+
+    pid_t catcher = start("/boot/procs-catch");
+    pause_ms(100);
+    expect("kill of the catcher", kill(catcher, SIGUSR1), 0);
+    reap("the catcher", catcher, 42, 0);
+
+    sigset_t chld;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, NULL);
+    pid_t seven = start("/boot/procs-exit7");
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    expect("sigwaitinfo for SIGCHLD", sigwaitinfo(&chld, &info), SIGCHLD);
+    expect("SIGCHLD's si_pid", info.si_pid, (int)seven);
+    expect("SIGCHLD's si_code", info.si_code, CLD_EXITED);
+    expect("SIGCHLD's si_status", info.si_status, 7);
+    reap("procs-exit7 after SIGCHLD", seven, 7, 0);
+    sigprocmask(SIG_UNBLOCK, &chld, NULL);
+
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_usr1;
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &action, NULL);
+    handled = 0;
+    expect("kill of its own process", kill(getpid(), SIGUSR1), 0);
+    expect("its handler before kill returned", handled, 1);
+
+    action.sa_handler = on_usr2;
+    sigaction(SIGUSR2, &action, NULL);
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &usr2, NULL);
+    pthread_t taker;
+    pthread_create(&taker, NULL, usr2_taker, NULL);
+    while (!usr2_ready) pause_ms(1);
+    expect("kill of SIGUSR2 the main thread blocks", kill(getpid(), SIGUSR2), 0);
+    pthread_join(taker, NULL);
+    expect("SIGUSR2 on the thread that lets it through", usr2_done && pthread_equal(usr2_thread, taker), 1);
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
@@ -153,6 +239,20 @@ static int role(const char *name) {
     if (strcmp(name, "middle") == 0) {
         pid_t orphan = start("/boot/procs-orphan");
         return orphan > 0 ? 0 : 1;
+    }
+    if (strcmp(name, "block") == 0) {
+        sigset_t all;
+        sigfillset(&all);
+        sigprocmask(SIG_BLOCK, &all, NULL);
+        for (volatile unsigned long i = 0;; i++) {
+        }
+    }
+    if (strcmp(name, "catch") == 0) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = exit_42;
+        sigaction(SIGUSR1, &action, NULL);
+        for (;;) sleep(60);
     }
     if (strcmp(name, "orphan") == 0) {
         for (int i = 0; i < 300 && getppid() != 1; i++) pause_ms(10);
@@ -243,6 +343,7 @@ int main(int argc, char **argv) {
     expect("no PID for a refused spawn", none, -7);
 
     waits(child);
+    kills(sleeper);
     if (failures == 0) printf("posix-procs: ok\n");
     return failures == 0 ? 0 : 1;
 }

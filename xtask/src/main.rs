@@ -1819,6 +1819,9 @@ fn posix_procs_probe() -> Result<(), String> {
             "init: procs-exit7 ended: exit code 7, not restarted",
             "init: procs-middle ended: exit code 0, not restarted",
             "init: procs-orphan ended: exit code 0, not restarted",
+            "init: procs-sleeper ended: signal 15 (SIGTERM), not restarted",
+            "init: procs-block ended: killed, not restarted",
+            "init: procs-catch ended: exit code 42, not restarted",
         ] {
             run.expect_seen(line, BOOT_TIMEOUT)?;
         }

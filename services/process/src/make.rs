@@ -119,13 +119,14 @@ fn ask(
     Ok((len, reply.handles))
 }
 
-/// Loaded of the record of `label`.
-pub fn loaded(label: u64) -> Result<(), Status> {
+/// Loaded of the record of `label`, with its first thread, the router of
+/// the process's signals until the process names another (Router).
+pub fn loaded(label: u64, thread: Handle<Thread>) -> Result<(), Status> {
     let mut w = Writer::new();
     Method::Loaded.header().write(&mut w)?;
     w.u64(label)?;
     let mut buffer = [0; abi::MESSAGE_MAX];
-    ask(&w, rt::handle::Outgoing::new(), &mut buffer).map(drop)
+    ask(&w, [thread.erase()].into(), &mut buffer).map(drop)
 }
 
 /// Abandon of the record of `label` (0 for none), whose process is killed,
@@ -185,7 +186,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
                 .is_ok_and(|reply| status(reply.bytes(&mut buffer)) == Ok(Status::Ok))
         });
     if taken && sys::thread_start(&thread).is_ok() {
-        let _ = loaded(label);
+        let _ = loaded(label, thread);
     } else {
         let _ = abandon(label, parent, Status::from_code(proto_process::AGAIN));
     }
