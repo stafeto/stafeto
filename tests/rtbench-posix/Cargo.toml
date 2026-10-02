@@ -13,6 +13,11 @@ name = "rtbench-posix"
 test = false
 bench = false
 
+# The same C on relibc (5a′): relibc's headers and libc.a, started by
+# relibc over the layer.
+[features]
+relibc = ["posix-crt/relibc"]
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 posix-abi = { path = "../../lib/posix-abi", features = ["rtbench"] }

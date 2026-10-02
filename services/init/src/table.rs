@@ -696,6 +696,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-posix-abi") as usize
     + cfg!(feature = "table-relibc") as usize
+    + cfg!(feature = "table-relibc-threads") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
@@ -720,6 +721,7 @@ const _: () = assert!(
     feature = "table-busybox-dialog",
     feature = "table-posix-abi",
     feature = "table-relibc",
+    feature = "table-relibc-threads",
     feature = "table-posix-abi-vz",
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
@@ -733,6 +735,8 @@ pub const TABLE: &[Record] = ramfs::TABLE;
 pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
 #[cfg(feature = "table-relibc")]
 pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
+#[cfg(feature = "table-relibc-threads")]
+pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
 #[cfg(feature = "table-cprobe")]
 pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
 #[cfg(feature = "table-busybox")]
@@ -1413,6 +1417,10 @@ mod tests {
             order_of(ramfs::RELIBC_TABLE),
             ["ramfs", "posix", "clock", "relibc-hello"]
         );
+        assert_eq!(
+            order_of(ramfs::RELIBC_THREADS_TABLE),
+            ["ramfs", "posix", "clock", "relibc-threads"]
+        );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
             assert_eq!(
                 order_of(table),
@@ -1454,6 +1462,7 @@ mod tests {
             ramfs::BUSYBOX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
             ramfs::RELIBC_TABLE,
+            ramfs::RELIBC_THREADS_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
@@ -1467,6 +1476,7 @@ mod tests {
                     "busybox-probe",
                     "posix-abi-probe",
                     "relibc-hello",
+                    "relibc-threads",
                     "rtbench-posix",
                 ]
                 .contains(&r.program)

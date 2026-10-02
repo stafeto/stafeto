@@ -83,6 +83,12 @@ pub fn probe_inside() -> bool {
     INSIDE.load(Ordering::SeqCst)
 }
 
+/// The bytes the heap took from the kernel so far, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_committed() -> usize {
+    heap(|heap| heap.committed())
+}
+
 /// Runs `run` holding the heap's lock, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_hold(run: impl FnOnce()) {

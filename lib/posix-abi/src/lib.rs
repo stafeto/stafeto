@@ -16,6 +16,7 @@ pub mod long;
 pub mod metadata;
 pub mod ordering;
 pub mod process;
+pub mod relibc;
 pub mod scan;
 pub mod shared;
 pub mod signals;

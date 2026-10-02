@@ -15,15 +15,17 @@
 
 #![no_std]
 
+mod signals;
+
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use posix_abi::constants::EINVAL;
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 1;
+pub const PLATFORM_INTERFACE: u64 = 2;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -54,9 +56,18 @@ fn call(run: impl FnOnce() -> i64) -> i64 {
 /// relibc's start calls it once, on the main thread, with its TCB.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_init(tcb: *mut c_void) -> c_int {
+    posix_abi::relibc::configure(unmap);
     // SAFETY: the caller's promise.
     match unsafe { posix_abi::threads::attach_installed(tcb.cast(), 1) } {
-        Ok(()) => 0,
+        Ok(()) => {
+            // SAFETY: the main thread's block lies 32 bytes into its TCB.
+            unsafe {
+                posix_abi::relibc::attach_main(
+                    tcb.cast::<u8>().add(posix_thread::BLOCK_OFFSET).cast(),
+                )
+            };
+            0
+        }
         Err(errno) => -errno,
     }
 }
@@ -162,7 +173,7 @@ const PAGE: usize = 4096;
 /// The heap frees whole blocks only, so a part of a mapping is not
 /// unmapped (EINVAL); dlmalloc keeps such a part. Later in 5a′ the heap
 /// becomes a source of pages.
-const MAPPINGS: usize = 64;
+const MAPPINGS: usize = 256;
 static ADDRESSES: [AtomicUsize; MAPPINGS] = [const { AtomicUsize::new(0) }; MAPPINGS];
 static SIZES: [AtomicUsize; MAPPINGS] = [const { AtomicUsize::new(0) }; MAPPINGS];
 /// The address of a slot `stafeto_munmap` holds: no page is at 1.
@@ -232,4 +243,176 @@ pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
         }) as c_int;
     }
     -EINVAL
+}
+
+/// Takes back one of relibc's mappings for the thread table.
+fn unmap(address: usize, length: usize) {
+    let _ = stafeto_munmap(address as *mut c_void, length);
+}
+
+/// A new thread's first instructions: the stack holds what relibc pushed
+/// for its clone (the shim, then its arguments, 64 bytes); the shim never
+/// returns.
+#[unsafe(naked)]
+extern "C" fn thread_entry(_id: u64) -> ! {
+    core::arch::naked_asm!(
+        "ldp x8, x0, [sp], #16",
+        "ldp x1, x2, [sp], #16",
+        "ldp x3, x4, [sp], #16",
+        "ldr x5, [sp], #16",
+        "mov x29, xzr",
+        "mov x30, xzr",
+        "br x8",
+    )
+}
+
+/// # Safety
+/// `stack` is the new thread's, prepared by relibc; `block` is the block of
+/// the TCB relibc made for it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_thread_create(stack: *mut usize, block: *mut c_void) -> c_int {
+    // SAFETY: the caller's promise.
+    match unsafe { posix_abi::relibc::create(thread_entry, stack as usize, block.cast()) } {
+        Ok(id) => id as c_int,
+        Err(errno) => -errno,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_id() -> c_int {
+    posix_abi::relibc::current() as c_int
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_started() -> c_int {
+    match posix_abi::relibc::started() {
+        Ok(()) => 0,
+        Err(errno) => -errno,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_leaving() {
+    posix_abi::relibc::leaving();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_thread_release(id: c_int) {
+    posix_abi::relibc::release(id as u64);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_exit_thread(stack: *mut c_void, size: usize) -> ! {
+    posix_abi::relibc::exit_thread(stack as usize, size)
+}
+
+/// # Safety
+/// `addr` is a live aligned word of the process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_futex_wait(addr: *mut u32, val: u32, deadline: u64) -> c_int {
+    // SAFETY: the caller's promise.
+    let word = unsafe { &*addr.cast::<AtomicU32>() };
+    let deadline = (deadline != u64::MAX).then_some(deadline);
+    match posix_sync::futex_wait(word, val, posix_sync::CLOCK_MONOTONIC, deadline) {
+        Ok(_) => 0,
+        Err(errno) => -errno,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_futex_wake(addr: *mut u32, count: u32) -> u32 {
+    posix_sync::futex_wake(addr.cast::<AtomicU32>(), count)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_sched_yield() -> c_int {
+    let _ = rt::sys::yield_now();
+    0
+}
+
+/// # Safety
+/// `request` is a readable timespec; `remaining` is null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_nanosleep(
+    request: *const Timespec,
+    remaining: *mut Timespec,
+) -> c_int {
+    // SAFETY: the caller's promise; the layouts are Linux's.
+    call(|| i64::from(unsafe { posix_abi::threads::sleep::nanosleep(request, remaining) })) as c_int
+}
+
+/// clock_nanosleep: 0 or an error number.
+///
+/// # Safety
+/// `request` is a readable timespec; `remaining` is null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_clock_nanosleep(
+    clock: c_int,
+    flags: c_int,
+    request: *const Timespec,
+    remaining: *mut Timespec,
+) -> c_int {
+    // SAFETY: the caller's promise; the clocks and TIMER_ABSTIME are
+    // Linux's numbers in both.
+    unsafe { posix_abi::threads::sleep::clock_nanosleep(clock, flags, request, remaining) }
+}
+
+/// relibc's cancellation states and types (its pthread.h).
+const PTHREAD_CANCEL_ASYNCHRONOUS: c_int = 0;
+const PTHREAD_CANCEL_ENABLE: c_int = 1;
+const PTHREAD_CANCEL_DEFERRED: c_int = 2;
+const PTHREAD_CANCEL_DISABLE: c_int = 3;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_cancel(id: c_int) -> c_int {
+    -posix_abi::relibc::cancel(id as u64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_testcancel() -> c_int {
+    c_int::from(posix_abi::relibc::testcancel())
+}
+
+/// # Safety
+/// `old` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_setcancelstate(state: c_int, old: *mut c_int) -> c_int {
+    let enabled = match state {
+        PTHREAD_CANCEL_ENABLE => true,
+        PTHREAD_CANCEL_DISABLE => false,
+        _ => return -EINVAL,
+    };
+    match posix_abi::relibc::set_cancel_enabled(enabled) {
+        Ok(was) => {
+            let value = if was {
+                PTHREAD_CANCEL_ENABLE
+            } else {
+                PTHREAD_CANCEL_DISABLE
+            };
+            // SAFETY: the caller's promise.
+            unsafe { old.write(value) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// # Safety
+/// `old` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_setcanceltype(kind: c_int, old: *mut c_int) -> c_int {
+    let asynchronous = match kind {
+        PTHREAD_CANCEL_ASYNCHRONOUS => true,
+        PTHREAD_CANCEL_DEFERRED => false,
+        _ => return -EINVAL,
+    };
+    let was = posix_abi::relibc::set_cancel_asynchronous(asynchronous);
+    let value = if was {
+        PTHREAD_CANCEL_ASYNCHRONOUS
+    } else {
+        PTHREAD_CANCEL_DEFERRED
+    };
+    // SAFETY: the caller's promise.
+    unsafe { old.write(value) };
+    0
 }

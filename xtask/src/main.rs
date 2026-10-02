@@ -82,6 +82,17 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
 ];
+/// rtbench 2 on relibc (5a′): the same C, relibc's start and pthreads.
+const RTBENCH_POSIX_RELIBC_PROGRAMS: [ImageProgram; 8] = [
+    RTBENCH_POSIX_PROGRAMS[0],
+    RTBENCH_POSIX_PROGRAMS[1],
+    RTBENCH_POSIX_PROGRAMS[2],
+    RTBENCH_POSIX_PROGRAMS[3],
+    RTBENCH_POSIX_PROGRAMS[4],
+    RTBENCH_POSIX_PROGRAMS[5],
+    RTBENCH_POSIX_PROGRAMS[6],
+    ("rtbench-posix", "rtbench-posix", 64 * 1024, &["relibc"]),
+];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
 const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
@@ -319,6 +330,19 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-hello", "relibc-hello", POSIX_STACK_SIZE, &[]),
+];
+/// The threads of relibc (5a′) and the services they need.
+const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("relibc-threads", "relibc-threads", POSIX_STACK_SIZE, &[]),
 ];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
@@ -744,7 +768,8 @@ commands:
   vz        boot the shell through Apple Virtualization.framework
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
             with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ;
-            with --short, one round of them on TCG, as ci runs it
+            with --short, one round of them on TCG, as ci runs it;
+            with --short --relibc, that round with the C on relibc
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
@@ -764,6 +789,8 @@ commands:
   relibc    build relibc for stafeto from the fork at its pinned commit
             (tools/build-relibc.py) into target/relibc/sysroot
   relibc-hello run the first C program on relibc over the Rust POSIX layer
+  relibc-threads run relibc's pthreads, waits, cancellation and signals
+            over the Rust POSIX layer
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -802,12 +829,16 @@ fn main() {
                 .ok_or_else(|| "rtbench --minutes expects 1..=600".to_owned())
                 .and_then(rtbench2::run),
             [flag] if flag == "--short" => rtbench2::short(),
+            [flag, libc] if flag == "--short" && libc == "--relibc" => {
+                relibc().and_then(|()| rtbench2::short_relibc())
+            }
             rest => rtbench::run(rest),
         },
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
         Some("relibc-hello") => relibc_hello_probe(),
+        Some("relibc-threads") => relibc_threads_probe(),
         Some("cprobe") => cprobe(),
         Some("posix-cancel-input") => posix_cancel_input_probe(false),
         Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
@@ -1583,6 +1614,33 @@ fn relibc_hello_probe() -> Result<(), String> {
     Ok(())
 }
 
+fn relibc_threads_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-relibc-threads.img",
+        &RELIBC_THREADS_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    // Stops on any end, so that a failure shows at once.
+    const ENDED: &str = "init: relibc-threads ended: exit code 0, not restarted";
+    let output = run_until(
+        cmd,
+        RELIBC_THREADS_TIMEOUT,
+        Some("init: relibc-threads ended"),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, ENDED)?;
+    qemu::expect_marker(&output, "relibc-threads: ok")?;
+    println!("relibc pthread guest probe passed");
+    Ok(())
+}
+
+/// The threads probe runs about 10^5 turns of each object on TCG.
+const RELIBC_THREADS_TIMEOUT: Duration = Duration::from_secs(240);
+
 fn cprobe() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
     let kernel = build(Variant::Normal)?;
@@ -1786,6 +1844,7 @@ fn test() -> Result<(), String> {
     ramfs_probe()?;
     posix_abi_probe()?;
     relibc_hello_probe()?;
+    relibc_threads_probe()?;
     rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
@@ -3460,6 +3519,8 @@ fn ci() -> Result<(), String> {
         "posix-platform",
         "--package",
         "relibc-hello",
+        "--package",
+        "relibc-threads",
         "--target",
         PROGRAM_TARGET,
         "--",

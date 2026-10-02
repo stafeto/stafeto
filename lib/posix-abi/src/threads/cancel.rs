@@ -44,8 +44,6 @@ const _: () = {
 };
 
 pub(super) struct State {
-    pub(super) active: AtomicU64,
-    generation: AtomicU64,
     cleanup: AtomicPtr<Cleanup>,
     #[cfg(feature = "thread-probe")]
     pub(super) console: core::sync::atomic::AtomicBool,
@@ -53,28 +51,27 @@ pub(super) struct State {
 impl State {
     pub(super) const fn new() -> Self {
         Self {
-            active: AtomicU64::new(0),
-            generation: AtomicU64::new(0),
             cleanup: AtomicPtr::new(ptr::null_mut()),
             #[cfg(feature = "thread-probe")]
             console: core::sync::atomic::AtomicBool::new(false),
         }
     }
     pub(super) fn reset(&self) {
-        self.active.store(0, Ordering::Relaxed);
-        self.generation.store(0, Ordering::Relaxed);
         self.cleanup.store(ptr::null_mut(), Ordering::Relaxed);
         #[cfg(feature = "thread-probe")]
         self.console.store(false, Ordering::Relaxed);
-    }
-    fn requested(&self) -> bool {
-        requested()
     }
 }
 
 fn flags() -> Option<&'static core::sync::atomic::AtomicU32> {
     // SAFETY: a managed thread's block lives as long as the thread.
     unsafe { posix_thread::block().as_ref() }.map(|block| &block.flags)
+}
+
+/// The calling thread's word of its cancellation point (posix-thread).
+fn point() -> Option<&'static AtomicU64> {
+    // SAFETY: a managed thread's block lives as long as the thread.
+    unsafe { posix_thread::block().as_ref() }.map(|block| &block.cancel_point)
 }
 
 fn state() -> Option<&'static State> {
@@ -91,32 +88,35 @@ pub fn requested() -> bool {
 
 /// Stack-owned prior state for an interrupted caller's cancellation window.
 struct Frame {
-    state: &'static State,
+    point: &'static AtomicU64,
     previous: u64,
     #[cfg(feature = "thread-probe")]
-    console: bool,
+    console: Option<bool>,
 }
-/// An explicit cancellation window. Close windows in nesting order at the C
-/// boundary, after internal resources are dropped and before taking cancellation.
+/// An explicit cancellation window: while it is open, the word
+/// `cancel_point` of the thread's block is not 0 and a request of
+/// cancellation interrupts the thread's wait. Close windows in nesting
+/// order at the C boundary, after internal resources are dropped and
+/// before taking cancellation.
 pub(crate) struct Point(Option<Frame>);
 impl Point {
     pub(crate) fn begin() -> Self {
-        let frame = state().map(|state| {
-            let generation = state
-                .generation
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-                .expect("cancellation generation exhausted")
-                + 1;
+        let frame = point().map(|point| {
             // A signal handler may enter another cancellation point on this
-            // thread. Its return must retain the interrupted caller's window.
-            let previous = state.active.swap(generation, Ordering::SeqCst);
+            // thread: its window has a value of its own, and its end gives
+            // the interrupted caller's back.
+            let previous = point
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    Some(n.wrapping_add(1).max(1))
+                })
+                .expect("the update always succeeds");
             #[cfg(feature = "thread-probe")]
-            let console = state.console.swap(false, Ordering::AcqRel);
-            if state.requested() {
+            let console = state().map(|state| state.console.swap(false, Ordering::AcqRel));
+            if requested() {
                 terminate();
             }
             Frame {
-                state,
+                point,
                 previous,
                 #[cfg(feature = "thread-probe")]
                 console,
@@ -125,13 +125,15 @@ impl Point {
         Self(frame)
     }
     pub(crate) fn requested(&self) -> bool {
-        self.0.as_ref().is_some_and(|frame| frame.state.requested())
+        self.0.is_some() && requested()
     }
     pub(crate) fn end(self) {
         if let Some(frame) = self.0 {
             #[cfg(feature = "thread-probe")]
-            frame.state.console.store(frame.console, Ordering::Release);
-            frame.state.active.store(frame.previous, Ordering::SeqCst);
+            if let (Some(state), Some(console)) = (state(), frame.console) {
+                state.console.store(console, Ordering::Release);
+            }
+            frame.point.store(frame.previous, Ordering::SeqCst);
         }
     }
     pub(crate) fn finish(self) {
@@ -142,9 +144,28 @@ impl Point {
     }
 }
 
-pub(super) fn terminate() -> ! {
+/// The value of the calling thread's cancellation window, 0 outside one.
+#[cfg(feature = "thread-probe")]
+pub(crate) fn window() -> u64 {
+    point().map_or(0, |point| point.load(Ordering::SeqCst))
+}
+
+pub(crate) fn terminate() -> ! {
+    // relibc runs the cleanup handlers and the destructors of a thread
+    // that relibc made and attached.
+    #[cfg(feature = "libc-backend")]
+    {
+        unsafe extern "C" {
+            fn pthread_exit(value: *mut c_void) -> !;
+        }
+        // SAFETY: relibc's pthread_exit, on a thread relibc started.
+        unsafe { pthread_exit(CANCELED) }
+    }
     // SAFETY: the requesting state belongs to the current managed thread.
-    unsafe { super::pthread_exit(CANCELED) }
+    #[cfg(not(feature = "libc-backend"))]
+    unsafe {
+        super::pthread_exit(CANCELED)
+    }
 }
 
 /// Run exit handlers on their own thread with cancellation disabled.
@@ -156,7 +177,9 @@ pub(super) unsafe fn exit_cleanup() {
     flags()
         .expect("managed exit cleanup")
         .fetch_or(flag::CANCEL_DISABLED | flag::EXITING, Ordering::SeqCst);
-    state.active.store(0, Ordering::SeqCst);
+    if let Some(point) = point() {
+        point.store(0, Ordering::SeqCst);
+    }
     loop {
         let node = state.cleanup.load(Ordering::Relaxed);
         if node.is_null() {

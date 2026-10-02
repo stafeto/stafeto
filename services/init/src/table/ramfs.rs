@@ -164,6 +164,22 @@ pub const RELIBC_TABLE: &[Record] = &[
     },
 ];
 
+/// The threads of relibc (5a′): as RELIBC_TABLE, with room for 64
+/// threads (four handles each, their stacks and TCBs).
+pub const RELIBC_THREADS_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "relibc-threads",
+        program: "relibc-threads",
+        args: b"relibc-threads\0",
+        quota: 4096 * PAGE,
+        handle_limit: 512,
+        ..RELIBC_TABLE[3]
+    },
+];
+
 /// The service of long operations of rtbench 2 (tests/svc, role `l`)
 /// under the name of the console's driver: standard input of the
 /// benchmark reads from it. Above the benchmark's ceiling, as a service.

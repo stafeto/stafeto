@@ -15,3 +15,6 @@ bench = false
 posix-abi = { path = "../posix-abi", features = ["libc-backend"] }
 posix-thread = { path = "../posix-thread" }
 posix-types = { path = "../posix-types" }
+posix-signals = { path = "../posix-signals" }
+posix-sync = { path = "../posix-sync" }
+rt = { path = "../rt" }

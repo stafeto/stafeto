@@ -116,9 +116,13 @@ pub struct Block {
     pub files: *mut c_void,
     pub directories: *mut c_void,
     /// The pthread number of the thread; 0 for a thread pthread does not
-    /// know.
+    /// know. Under relibc, the thread's number in the layer's table of
+    /// threads plus 1 (its OsTid).
     pub thread_id: u64,
-    reserved: [u64; 7],
+    /// Not 0 while the thread is inside a cancellation point of the layer:
+    /// a request of cancellation interrupts its wait then.
+    pub cancel_point: AtomicU64,
+    reserved: [u64; 6],
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -149,6 +153,7 @@ const _: () = {
     assert!(offset_of!(Block, errno) == 104);
     assert!(offset_of!(Block, files) == 112);
     assert!(offset_of!(Block, thread_id) == 128);
+    assert!(offset_of!(Block, cancel_point) == 136);
     assert!(offset_of!(Page, tcb) == TCB_OFFSET);
     assert!(size_of::<Page>() == PAGE_SIZE);
 };
@@ -214,7 +219,8 @@ impl Block {
             files: ptr::null_mut(),
             directories: ptr::null_mut(),
             thread_id: 0,
-            reserved: [0; 7],
+            cancel_point: AtomicU64::new(0),
+            reserved: [0; 6],
         }
     }
 }

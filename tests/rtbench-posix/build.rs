@@ -33,6 +33,10 @@ fn main() {
         "rtbench 2 is a guest program"
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
+    if env::var_os("CARGO_FEATURE_RELIBC").is_some() {
+        relibc(&manifest, &tools, &out);
+        return;
+    }
     let generated = Command::new("python3")
         .arg(manifest.join("../../tools/build-posix-sysroot.py"))
         .arg("--headers-only")
@@ -89,4 +93,42 @@ fn main() {
         .arg(out.join("rtbench.o")));
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=rtbench");
+}
+
+/// The same source with relibc's headers, linked with relibc's libc.a
+/// (target/relibc/sysroot, cargo xtask relibc).
+fn relibc(manifest: &std::path::Path, tools: &std::path::Path, out: &std::path::Path) {
+    let sysroot = manifest.join("../../target/relibc/sysroot");
+    let lib = sysroot.join("lib");
+    assert!(
+        lib.join("libc.a").exists(),
+        "build relibc first: cargo xtask relibc"
+    );
+    println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
+    run(Command::new(tools.join("clang"))
+        .args([
+            "--target=aarch64-linux-gnu",
+            // Cortex-A53 erratum 835769 (the PinePhone's A64).
+            "-mfix-cortex-a53-835769",
+            "-nostdinc",
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fno-stack-protector",
+            "-fno-pic",
+            "-O2",
+            "-isystem",
+        ])
+        .arg(sysroot.join("include"))
+        .args(["-c", "rtbench.c", "-o"])
+        .arg(out.join("rtbench.o")));
+    run(Command::new(tools.join("llvm-ar"))
+        .args(["crs"])
+        .arg(out.join("librtbench.a"))
+        .arg(out.join("rtbench.o")));
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-lib=static=rtbench");
+    println!("cargo:rustc-link-lib=static=c");
 }

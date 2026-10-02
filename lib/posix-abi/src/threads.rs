@@ -196,6 +196,11 @@ fn block_of(slot: usize) -> &'static Block {
     unsafe { &*((page + posix_thread::TCB_OFFSET + posix_thread::BLOCK_OFFSET) as *const Block) }
 }
 
+/// The main thread's handle, as the loader gave it.
+pub(crate) fn main_handle() -> core::mem::ManuallyDrop<Handle<Thread>> {
+    Handle::borrowed(rt::abi::Handle(MAIN_SELF.load(Ordering::Acquire)))
+}
+
 /// The calling thread's block.
 pub(crate) fn own_block() -> &'static Block {
     // SAFETY: a managed thread has its block for its life.
@@ -878,7 +883,7 @@ fn wake_for_cancel(slot: usize) {
     // point, which checks the flag set before this look: no entry, no
     // interrupt (an asynchronous one takes its entry at once).
     let flags = block.flags.load(Ordering::SeqCst);
-    let at_point = LAUNCH[slot].cancel.active.load(Ordering::SeqCst) != 0;
+    let at_point = block.cancel_point.load(Ordering::SeqCst) != 0;
     let asynchronous = flags & posix_thread::flag::CANCEL_ASYNCHRONOUS != 0;
     if let Some(native) = native
         && (at_point || asynchronous)
@@ -1065,8 +1070,13 @@ pub(crate) fn with_target(id: u64, f: impl FnOnce(&Block, &Handle<Thread>)) -> R
     })
 }
 
-/// Runs `f` on the block of every thread of the table.
+/// Runs `f` on the block of every thread: of the table, or of relibc's
+/// table under relibc (crate::relibc).
 pub(crate) fn each_block(mut f: impl FnMut(&Block)) {
+    if cfg!(feature = "libc-backend") {
+        crate::relibc::each_block(f);
+        return;
+    }
     registry(|r| {
         for slot in 0..CAPACITY {
             if r.entries[slot].is_some() {
@@ -1131,7 +1141,7 @@ pub fn probe_cancel_window(run: impl FnOnce()) {
 /// Observe the current window.
 #[cfg(feature = "thread-probe")]
 pub fn probe_cancel_active() -> u64 {
-    current_launch().map_or(0, |launch| launch.cancel.active.load(Ordering::SeqCst))
+    cancel::window()
 }
 
 /// Mark the console phase for nested-window guest probes only.
@@ -1148,6 +1158,14 @@ pub fn probe_console_waiting(id: u64) -> bool {
         .find(|launch| launch.id.load(Ordering::Acquire) == id)
         .is_some_and(|launch| {
             launch.cancel.console.load(Ordering::Acquire)
-                && launch.cancel.active.load(Ordering::SeqCst) != 0
+                && block_of(
+                    LAUNCH
+                        .iter()
+                        .position(|l| core::ptr::eq(l, launch))
+                        .expect("a launch"),
+                )
+                .cancel_point
+                .load(Ordering::SeqCst)
+                    != 0
         })
 }

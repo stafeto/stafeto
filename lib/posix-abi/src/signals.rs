@@ -286,29 +286,110 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
         }
         return 0;
     }
-    let sent = threads::with_target(thread, |block, native| {
-        let Some((_, ignored)) = action else {
-            return;
-        };
-        // An ended thread that is not joined yet takes no signal.
-        if ignored || block.end.load(Ordering::SeqCst) != 0 {
-            return;
-        }
-        block.pending.fetch_or(bit, Ordering::SeqCst);
-        let flags = block.flags.load(Ordering::SeqCst);
-        if flags & flag::SIGNAL_WAIT != 0 && block.wait_set.load(Ordering::SeqCst) & bit != 0 {
-            let channel =
-                Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
-            let _ = sys::notify(&channel, posix_sync::bit::WAKE);
-        } else if flags & flag::SIGNALS_READY != 0 && bit & !block.mask.load(Ordering::SeqCst) != 0
-        {
-            let _ = sys::thread_upcall_request(native);
-        }
-    });
+    let sent = threads::with_target(thread, |block, native| send(block, native, bit, action));
     match sent {
         Ok(()) => 0,
         Err(code) => code,
     }
+}
+
+/// Sends `bit` with its `action` (none for signal 0) to the thread of
+/// `block` and `native`: the bit in its block, then a wake of its sigwait
+/// through its channel or a request of its entry.
+fn send(
+    block: &Block,
+    native: &Handle<rt::handle::Thread>,
+    bit: u64,
+    action: Option<(SigAction, bool)>,
+) {
+    let Some((_, ignored)) = action else {
+        return;
+    };
+    // An ended thread that is not joined yet takes no signal.
+    if ignored || block.end.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    block.pending.fetch_or(bit, Ordering::SeqCst);
+    let flags = block.flags.load(Ordering::SeqCst);
+    if flags & flag::SIGNAL_WAIT != 0 && block.wait_set.load(Ordering::SeqCst) & bit != 0 {
+        let channel =
+            Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
+        let _ = sys::notify(&channel, posix_sync::bit::WAKE);
+    } else if flags & flag::SIGNALS_READY != 0 && bit & !block.mask.load(Ordering::SeqCst) != 0 {
+        let _ = sys::thread_upcall_request(native);
+    }
+}
+
+/// pthread_kill for a thread of relibc (crate::relibc): its number is
+/// relibc's OsTid. 0 or an error number.
+pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
+    let bit = if signal == 0 {
+        0
+    } else {
+        match posix_signals::bit(signal) {
+            Ok(bit) => bit,
+            Err(_) => return EINVAL,
+        }
+    };
+    let action = (signal != 0).then(|| {
+        let action = action(signal);
+        (action, ignored(signal, &action))
+    });
+    let (block, native) = match crate::relibc::target(id) {
+        Ok(target) => target,
+        Err(code) => return code,
+    };
+    if core::ptr::eq(block, own()) {
+        if let Some((_, false)) = action {
+            own().pending.fetch_or(bit, Ordering::SeqCst);
+            deliver_now();
+        }
+        return 0;
+    }
+    send(block, &native, bit, action);
+    0
+}
+
+/// sigsuspend: the calling thread's mask becomes `mask` until a handler
+/// ran, then the old one comes back. Always an error: EINTR after a
+/// handler; a cancellation point.
+pub fn suspend(mask: SigSet) -> i32 {
+    let point = threads::cancel::Point::begin();
+    let block = own();
+    let Ok(mask) = posix_signals::mask(mask) else {
+        point.end();
+        return EINVAL;
+    };
+    let old = block.mask.swap(mask, Ordering::SeqCst);
+    let channel =
+        Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
+    loop {
+        if block.pending.load(Ordering::SeqCst) & !mask != 0 {
+            deliver_now();
+            break;
+        }
+        // An entry between the check and `receive` stays pending and makes
+        // `receive` return at once; it runs when the guard goes.
+        let guard = rt::upcall::defer_entries().expect("sigsuspend entry deferral");
+        let got = sys::receive(&channel);
+        drop(guard);
+        match got {
+            Err(Error::Interrupted) => break,
+            Ok(sys::Received::Notification {
+                source: Source::Unlabeled,
+                bits,
+                ..
+            }) if bits & posix_sync::bit::CANCEL != 0 && threads::cancel::requested() => break,
+            Ok(_) => {}
+            Err(error) => panic!("sigsuspend receive: {error:?}"),
+        }
+    }
+    block.mask.store(old, Ordering::SeqCst);
+    if block.pending.load(Ordering::SeqCst) & !old != 0 {
+        deliver_now();
+    }
+    point.finish();
+    EINTR
 }
 #[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn raise(signal: i32) -> i32 {
@@ -470,7 +551,16 @@ rt::upcall_entry!(entry, dispatch, context);
 /// Where the calling thread's errno lives: the layer's block until 5a′,
 /// relibc's `__errno_location` after it. The entry saves and gives back
 /// the value there; it never moves the thread pointer (spec 2, 3.5).
+#[cfg(not(feature = "libc-backend"))]
 static ERRNO_LOCATION: unsafe extern "C" fn() -> *mut core::ffi::c_int = crate::__errno_location;
+#[cfg(feature = "libc-backend")]
+static ERRNO_LOCATION: unsafe extern "C" fn() -> *mut core::ffi::c_int = relibc_errno_location;
+#[cfg(feature = "libc-backend")]
+unsafe extern "C" {
+    /// relibc's errno in its static TLS.
+    #[link_name = "__errno_location"]
+    fn relibc_errno_location() -> *mut core::ffi::c_int;
+}
 
 /// Binds and enables the calling thread's entry, then delivers what came
 /// before it.

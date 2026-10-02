@@ -257,8 +257,11 @@ name = "posix-platform"
 version = "0.1.0"
 dependencies = [
  "posix-abi",
+ "posix-signals",
+ "posix-sync",
  "posix-thread",
  "posix-types",
+ "rt",
 ]
 
 [[package]]
@@ -462,6 +465,14 @@ dependencies = [
 name = "relibc-hello"
 version = "0.1.0"
 dependencies = [
+ "posix-crt",
+]
+
+[[package]]
+name = "relibc-threads"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
  "posix-crt",
 ]
 
