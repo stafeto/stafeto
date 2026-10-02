@@ -35,6 +35,8 @@ mod clocks;
 mod credentials;
 #[cfg(not(feature = "cancel-input"))]
 mod futex;
+#[cfg(not(feature = "cancel-input"))]
+mod heap_lock;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
@@ -43,6 +45,8 @@ mod long;
 mod mutex;
 #[cfg(not(feature = "cancel-input"))]
 mod once;
+#[cfg(not(feature = "cancel-input"))]
+mod one_thread;
 #[cfg(not(feature = "cancel-input"))]
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
@@ -216,14 +220,18 @@ fn failed(stage: usize) -> bool {
     false
 }
 
-/// The heap and file workers sit at the process ceiling, which the init
-/// table puts one above main; no pthread owner exists.
+/// The holders of the locks of the heap and of the files run at the
+/// process ceiling, which the init table puts one above main; the process
+/// has no helper thread.
 #[cfg(not(feature = "cancel-input"))]
 fn priorities() -> bool {
     let main = MAIN_BASE.load(Ordering::Acquire) as u8;
-    let heap = abi::allocation::probe_worker_base();
-    let files = abi::shared::probe_worker_base();
-    if heap != main + 1 || files != heap {
+    let me = unsafe { threads::probe_native(threads::pthread_self()) }.expect("own handle");
+    let level = || sys::thread_info(&me).map_or(0, |info| info.base);
+    let (mut heap, mut files) = (0, 0);
+    abi::allocation::probe_hold(|| heap = level());
+    abi::shared::probe_hold(|| files = level());
+    if heap != main + 1 || files != heap || level() != main {
         rt::println!(
             "posix-thread-probe: main {} heap {} files {}",
             main,
@@ -232,7 +240,7 @@ fn priorities() -> bool {
         );
         return failed(451);
     }
-    rt::println!("priority-probe: heap and files at the ceiling above main, no pthread owner");
+    rt::println!("priority-probe: heap and files at the ceiling above main, no helper thread");
     true
 }
 
@@ -254,6 +262,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     rt::println!(
         "process-identity-probe: Rust PID/PPID match the process service's record and preserve errno"
     );
+    if !one_thread::run() {
+        return false;
+    }
     if !priorities() {
         return false;
     }
@@ -405,6 +416,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     if !tcb::run()
         || !futex::run()
         || !blocks::run()
+        || !heap_lock::run()
         || !long::run(parent)
         || !clocks::run(clocks)
         || !capacity::run()
@@ -483,7 +495,7 @@ fn main(_: u64) -> u64 {
             return 6;
         }
     }
-    if unsafe { abi::shared::init(&start.process, files) }.is_err()
+    if unsafe { abi::shared::init(files) }.is_err()
         || unsafe { abi::allocation::init(start.process) }.is_err()
         || unsafe { threads::init(start.thread) }.is_err()
     {

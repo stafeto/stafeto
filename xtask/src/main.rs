@@ -28,6 +28,9 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a child of the test init (tests/child), which its loader
 /// maps (rt::loader).
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
+/// The main stack of a POSIX program: its requests on its files run on its
+/// own stack, under the lock of the layer, with no file worker.
+const POSIX_STACK_SIZE: u32 = 32 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
@@ -112,7 +115,7 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
-    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+    ("posix-abi-probe", "posix-abi-probe", POSIX_STACK_SIZE, &[]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 /// The POSIX ABI image whose process service ends before it registers:
@@ -128,7 +131,7 @@ const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
-    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+    ("posix-abi-probe", "posix-abi-probe", POSIX_STACK_SIZE, &[]),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
@@ -145,7 +148,7 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     (
         "posix-abi-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &[],
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
@@ -157,7 +160,7 @@ const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["cancel-input"],
     ),
 ];
@@ -206,7 +209,7 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["cancel-input"],
     ),
 ];
@@ -224,7 +227,7 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
     (
         "posix-abi-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &[],
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
@@ -237,7 +240,7 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
@@ -253,7 +256,7 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
@@ -264,7 +267,7 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
 ];
@@ -280,7 +283,7 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
 ];
@@ -299,7 +302,7 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
     (
         "posix-abi-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &[],
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
@@ -307,12 +310,12 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
-    ("cprobe", "cprobe", CHILD_STACK_SIZE, &[]),
+    ("cprobe", "cprobe", POSIX_STACK_SIZE, &[]),
 ];
 const BUSYBOX_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
-    ("busybox-probe", "busybox-probe", CHILD_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", POSIX_STACK_SIZE, &[]),
 ];
 const ASH_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
@@ -320,7 +323,7 @@ const ASH_PROGRAMS: [ImageProgram; 3] = [
     (
         "busybox-probe",
         "busybox-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["ash-probe"],
     ),
 ];
@@ -331,7 +334,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "busybox-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["ash-interactive"],
     ),
 ];
@@ -341,7 +344,7 @@ const LS_PROGRAMS: [ImageProgram; 3] = [
     (
         "busybox-probe",
         "busybox-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["ls-probe"],
     ),
 ];
@@ -1303,7 +1306,7 @@ fn posix_abi_probe() -> Result<(), String> {
                 image_elf(&target, "boot-posix-abi.img", "posix-clock-peer"),
                 32 * 1024,
             ),
-            ("posix-abi-probe", PathBuf::from(linked), CHILD_STACK_SIZE),
+            ("posix-abi-probe", PathBuf::from(linked), POSIX_STACK_SIZE),
             (
                 "svc",
                 image_elf(&target, "boot-posix-abi.img", "test-svc"),
@@ -1388,7 +1391,7 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(&output, "posix-thread-probe: ok")?;
         qemu::expect_marker(
             &output,
-            "priority-probe: heap and files at the ceiling above main, no pthread owner",
+            "priority-probe: heap and files at the ceiling above main, no helper thread",
         )?;
         qemu::expect_marker(&output, "posix-process: adoption refusals ok")
     });

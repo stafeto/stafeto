@@ -332,7 +332,7 @@ fn reap() {
     }
 }
 
-/// Initialize once after the heap and file workers, before entering C main.
+/// Initialize once after the heap and the files, before entering C main.
 ///
 /// # Safety
 /// Startup owns exclusive initialization. Stack reservations
@@ -342,14 +342,14 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
     if READY.load(Ordering::Acquire) {
         return Err(Error::BadState);
     }
-    let ceiling = crate::ceiling()?;
-    // A process whose ceiling is its main thread's level puts the locks of
-    // the buckets and the layer's workers level with the application
-    // (init's POSIX record gives main + 1): say so, since nothing else
-    // would.
-    if sys::thread_info(&main).is_ok_and(|info| info.base >= ceiling) {
+    let base = sys::thread_info(&main)?.base;
+    let ceiling = crate::set_ceiling(base);
+    // A process whose ceiling is its main thread's level puts the holders
+    // of the layer's locks level with the application (init's POSIX record
+    // gives main + 1): say so, since nothing else would.
+    if ceiling <= base {
         rt::println!(
-            "posix-abi: the process ceiling {} is not above main; its helper threads compete with main",
+            "posix-abi: the process ceiling {} is not above main; the holders of the layer's locks compete with main",
             ceiling
         );
     }
@@ -851,8 +851,7 @@ pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
     if let Some(launch) = current_launch() {
         launch.completed.store(true, Ordering::Release);
     }
-    // Application threads determine the process's life; the layer's
-    // workers do not keep it. Threads that ended past pthread_exit and
+    // Application threads determine the process's life. Threads that ended past pthread_exit and
     // that nobody joined leave the count here (thread_info, a constant
     // call for each of the table's other threads under its lock), so the
     // process ends with the last of them too.

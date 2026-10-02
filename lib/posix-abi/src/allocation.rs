@@ -1,21 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Process heap owned by an IPC worker at the process ceiling. Requests
-//! serialize allocation; the worker never calls exported allocation APIs.
-//! This does not establish a bounded real-time allocator.
+//! The process heap under a lock of the layer (spec 2, 3.4): the calling
+//! thread allocates itself, its holder at the ceiling of the process
+//! (LayerLock::raising), and grows the heap (`mem_create`, `mem_map`)
+//! under the same lock. No helper thread. An entry of signals inside the
+//! section waits for its end. This does not establish a bounded real-time
+//! allocator: a section that grows the heap or splits a long free list is
+//! longer.
 
 use crate::{constants::*, fail};
 use core::{
     cell::UnsafeCell,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use posix_heap::{Allocator, Error, FUNDAMENTAL_ALIGNMENT};
+use posix_sync::LayerLock;
 use rt::{
-    Stack,
-    abi::Policy,
-    handle::{Channel, Handle, Process},
+    handle::{Handle, Process},
     sys,
 };
 
@@ -27,72 +30,68 @@ const ALLOC: u64 = 1;
 const REALLOC: u64 = 2;
 const FREE: u64 = 3;
 const ZERO: u64 = 4;
-const ACK: u64 = 5;
-mod replies;
-static NEXT: AtomicU64 = AtomicU64::new(1);
-#[cfg(feature = "thread-probe")]
-static WORKER: AtomicU64 = AtomicU64::new(0);
 
 struct Config {
     process: Handle<Process>,
-    channel: Handle<Channel>,
 }
 struct Once(UnsafeCell<Option<Config>>);
-// SAFETY: startup writes once before starting the worker; config is immutable
-// thereafter. READY publishes it to clients; the worker starts after that write.
+// SAFETY: startup writes once before any allocation; READY publishes it and
+// it stays immutable thereafter.
 unsafe impl Sync for Once {}
 static CONFIG: Once = Once(UnsafeCell::new(None));
 static READY: AtomicBool = AtomicBool::new(false);
-static STACK: Stack<16384> = Stack::new();
+struct Heap(UnsafeCell<Allocator>);
+// SAFETY: only `heap` borrows it, under HEAP_LOCK.
+unsafe impl Sync for Heap {}
+static HEAP: Heap = Heap(UnsafeCell::new(Allocator::new()));
+static HEAP_LOCK: LayerLock = LayerLock::raising();
+/// Set while a thread is inside the heap's section, for the probes.
+#[cfg(feature = "thread-probe")]
+static INSIDE: AtomicBool = AtomicBool::new(false);
 
 /// Initialize once during single-threaded startup, before any allocation call.
-/// The process heap reserves BASE..LIMIT; 0xa00000 is the worker message buffer.
+/// The process heap reserves BASE..LIMIT.
 ///
 /// # Safety
 /// Called while startup has exclusive heap initialization access, before any
-/// client thread uses allocation. Other runtime owners do not use this heap.
-/// The reserved heap and worker message ranges must be unused.
+/// client thread uses allocation. The reserved heap range must be unused.
 pub unsafe fn init(process: Handle<Process>) -> Result<(), rt::abi::Error> {
     if READY.load(Ordering::Acquire) {
         return Err(rt::abi::Error::BadState);
     }
-    let settings = Config {
-        process,
-        channel: sys::channel_create(1)?,
-    };
-    // SAFETY: startup has exclusive access; no worker/client exists yet.
-    unsafe { *CONFIG.0.get() = Some(settings) };
-    let result = (|| {
-        // SAFETY: this stack is used once; the message page is outside image segments.
-        let thread = unsafe {
-            sys::thread_create(
-                &config().process,
-                worker,
-                STACK.top(),
-                0,
-                crate::ceiling()?,
-                Policy::Fifo,
-                0xa00000,
-            )
-        }?;
-        READY.store(true, Ordering::Release);
-        sys::thread_start(&thread)?;
-        #[cfg(feature = "thread-probe")]
-        WORKER.store(thread.into_raw().0, Ordering::Release);
-        Ok(())
-    })();
-    if result.is_err() {
-        READY.store(false, Ordering::Release);
-        // SAFETY: thread creation/start failed, so no worker can access the config.
-        unsafe { *CONFIG.0.get() = None };
-        return result;
-    }
+    // SAFETY: startup has exclusive access; no client exists yet.
+    unsafe { *CONFIG.0.get() = Some(Config { process }) };
+    READY.store(true, Ordering::Release);
     Ok(())
 }
 
+/// Runs `f` on the heap under its lock.
+fn heap<R>(f: impl FnOnce(&mut Allocator) -> R) -> R {
+    let _guard = HEAP_LOCK.lock();
+    #[cfg(feature = "thread-probe")]
+    INSIDE.store(true, Ordering::SeqCst);
+    // SAFETY: the lock gives this borrow alone.
+    let result = f(unsafe { &mut *HEAP.0.get() });
+    #[cfg(feature = "thread-probe")]
+    INSIDE.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Whether a thread is inside the heap's section now, for the probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_inside() -> bool {
+    INSIDE.load(Ordering::SeqCst)
+}
+
+/// Runs `run` holding the heap's lock, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_hold(run: impl FnOnce()) {
+    heap(|_| run());
+}
+
 fn config() -> &'static Config {
-    // SAFETY: called after successful startup or by the worker it created.
-    unsafe { (*CONFIG.0.get()).as_ref().expect("heap worker initialized") }
+    // SAFETY: called after successful startup, which wrote it once.
+    unsafe { (*CONFIG.0.get()).as_ref().expect("heap initialized") }
 }
 
 fn grow(heap: &mut Allocator, needed: usize, alignment: usize) -> Result<(), Error> {
@@ -137,14 +136,17 @@ fn allocate(heap: &mut Allocator, size: usize, alignment: usize) -> Result<NonNu
     heap.allocate(size, alignment)
 }
 
-fn perform(heap: &mut Allocator, words: [u64; 8]) -> Result<usize, Error> {
-    let size = words[1] as usize;
-    let alignment = words[2] as usize;
-    let pointer = words[3] as *mut u8;
-    match words[0] {
+fn perform(
+    heap: &mut Allocator,
+    op: u64,
+    size: usize,
+    alignment: usize,
+    pointer: *mut u8,
+) -> Result<usize, Error> {
+    match op {
         ALLOC | ZERO => {
             let result = allocate(heap, size, alignment)?;
-            if words[0] == ZERO {
+            if op == ZERO {
                 // SAFETY: result owns at least size writable bytes.
                 unsafe { result.as_ptr().write_bytes(0, size) };
             }
@@ -176,97 +178,15 @@ fn perform(heap: &mut Allocator, words: [u64; 8]) -> Result<usize, Error> {
     }
 }
 
-extern "C" fn worker(_: u64) -> ! {
-    assert!(READY.load(Ordering::Acquire), "published heap owner");
-    let mut heap = Allocator::new();
-    let mut journal = replies::Journal::new();
-    loop {
-        let Ok(sys::Received::Message {
-            len,
-            words,
-            token,
-            handles,
-            ..
-        }) = sys::receive(&config().channel)
-        else {
-            continue;
-        };
-        drop(handles);
-        let nonce = words[4];
-        let args = [words[0], words[1], words[2], words[3]];
-        let (status, value) = if len != 40 || nonce == 0 {
-            (EINVAL, 0)
-        } else if words[0] == ACK {
-            journal.ack(nonce);
-            (0, 0)
-        } else if let Some(answer) = journal.ready(nonce, args) {
-            answer
-        } else {
-            match journal.reserve(nonce, args) {
-                Err(code) => (code, 0),
-                Ok(record) => {
-                    let answer = match perform(&mut heap, words) {
-                        Ok(value) => (0, value),
-                        Err(Error::NoMemory) => (ENOMEM, 0),
-                        Err(Error::InvalidAlignment) => (EINVAL, 0),
-                    };
-                    journal.complete(record, answer);
-                    answer
-                }
-            }
-        };
-        let mut reply = [0; 16];
-        reply[..8].copy_from_slice(&(status as u64).to_le_bytes());
-        reply[8..].copy_from_slice(&(value as u64).to_le_bytes());
-        let _ = token.reply(&reply);
-    }
-}
-
 fn request(op: u64, size: usize, alignment: usize, pointer: *mut u8) -> Result<*mut u8, i32> {
     if !READY.load(Ordering::Acquire) {
         return Err(ENOMEM);
     }
-    let nonce = NEXT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-        .map_err(|_| ENOMEM)?;
-    let bytes = packet([op, size as u64, alignment as u64, pointer as u64, nonce]);
-    let result = call(&bytes)?;
-    let answer = if result.0 == 0 {
-        Ok(result.1 as *mut u8)
-    } else {
-        Err(result.0)
-    };
-    let ack = call(&packet([ACK, 0, 0, 0, nonce]))?;
-    if ack != (0, 0) {
-        return Err(ENOMEM);
+    match heap(|heap| perform(heap, op, size, alignment, pointer)) {
+        Ok(value) => Ok(value as *mut u8),
+        Err(Error::NoMemory) => Err(ENOMEM),
+        Err(Error::InvalidAlignment) => Err(EINVAL),
     }
-    answer
-}
-fn packet(words: [u64; 5]) -> [u8; 40] {
-    let mut bytes = [0; 40];
-    for (i, word) in words.iter().enumerate() {
-        bytes[i * 8..i * 8 + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    bytes
-}
-fn call(bytes: &[u8; 40]) -> Result<(i32, usize), i32> {
-    loop {
-        let reply = match sys::send(&config().channel, bytes) {
-            Err(rt::abi::Error::Interrupted) => continue,
-            result => result.map_err(|_| ENOMEM)?,
-        };
-        if reply.len != 16 || !reply.handles.is_empty() {
-            return Err(ENOMEM);
-        }
-        return Ok((reply.words[0] as i32, reply.words[1] as usize));
-    }
-}
-/// The base priority of the live heap worker.
-#[cfg(feature = "thread-probe")]
-pub fn probe_worker_base() -> u8 {
-    let raw = rt::abi::Handle(WORKER.load(Ordering::Acquire));
-    let thread = Handle::<rt::handle::Thread>::borrowed(raw);
-    sys::thread_info(&thread).expect("heap worker info").base
 }
 
 fn returned(result: Result<*mut u8, i32>) -> *mut u8 {
@@ -352,7 +272,7 @@ pub unsafe extern "C" fn posix_memalign(out: *mut *mut u8, alignment: usize, siz
     }
 }
 
-/// Borrow the process handle kept alive by the initialized heap owner.
+/// Borrow the process handle kept alive by the initialized heap.
 pub(crate) fn process() -> &'static Handle<Process> {
     assert!(READY.load(Ordering::Acquire), "published heap process");
     &config().process

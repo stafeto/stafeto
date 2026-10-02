@@ -38,25 +38,30 @@ const _: () = {
 
 static CEILING: AtomicU8 = AtomicU8::new(0);
 
-/// The process's ceiling (spec 6.6), found once at startup. The thread owner,
-/// the heap and file workers and the sleep timer run there, so no application
-/// thread at main's level delays them between a reply and the next receive.
-/// object_info does not report the ceiling and a denied priority allocates
-/// nothing, so the first caller probes channel_create from the top down.
+/// The process's ceiling (spec 6.6): one level above the main thread's
+/// base, as init's POSIX record gives it (audit 3, decision 1.5), set once
+/// at startup (`set_ceiling`). The locks of the layer raise their holders
+/// there, and the exit channels of pthreads post at it.
 fn ceiling() -> Result<u8, rt::abi::Error> {
-    let known = CEILING.load(Ordering::Relaxed);
-    if known != 0 {
-        return Ok(known);
+    match CEILING.load(Ordering::Relaxed) {
+        0 => Err(rt::abi::Error::BadState),
+        known => Ok(known),
     }
-    let level = (1..rt::abi::PRIORITY_LEVELS)
-        .rev()
-        .find_map(|level| match rt::sys::channel_create(level) {
-            Err(rt::abi::Error::AccessDenied) => None,
-            result => Some(result.map(|_| level)),
-        })
-        .ok_or(rt::abi::Error::AccessDenied)??;
+}
+
+/// The ceiling one above `main_level`; when the process may not use it
+/// (a record whose ceiling is main's level), main's level, which the
+/// caller says. One `channel_create` checks it.
+fn set_ceiling(main_level: u8) -> u8 {
+    let above = main_level
+        .saturating_add(1)
+        .min(rt::abi::PRIORITY_LEVELS - 1);
+    let level = match rt::sys::channel_create(above) {
+        Ok(_) => above,
+        Err(_) => main_level,
+    };
     CEILING.store(level, Ordering::Relaxed);
-    Ok(level)
+    level
 }
 
 /// The process's ceiling, for the guest probes.
@@ -210,7 +215,7 @@ unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
 }
 
 /// The console's branch of `read`, in its own frame: its buffers stay off
-/// the stack of reads of files, which go on to the shared worker.
+/// the stack of reads of files, which go on under the lock of the files.
 ///
 /// # Safety
 /// `buffer` supplies `extent` writable bytes.

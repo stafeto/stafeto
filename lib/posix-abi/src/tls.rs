@@ -179,7 +179,7 @@ pub fn with_errno<R>(run: impl FnOnce() -> R) -> R {
     scope(ptr::null_mut(), ptr::null_mut(), false, run)
 }
 
-/// Give this thread an errno while using the initialized process file owner.
+/// Give this thread an errno while using the initialized process files.
 /// Leaving this scope leaves the process's descriptors and streams live.
 pub fn with_process<R>(run: impl FnOnce() -> R) -> R {
     scope(ptr::null_mut(), ptr::null_mut(), true, run)

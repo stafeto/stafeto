@@ -26,8 +26,8 @@ unsafe extern "C" {
 
 /// The first step of the start: the process's registration with the
 /// process service (`session`), its clocks and files through `parent`,
-/// its heap and its thread owner. The calling thread's block is not
-/// touched.
+/// its heap and its table of threads; no helper thread. The calling
+/// thread's block is not touched.
 ///
 /// # Safety
 /// Runs once, on the main thread, before any other thread of the process;
@@ -47,12 +47,12 @@ pub unsafe fn posix_init_process(
     #[cfg(not(feature = "uart-input"))]
     let files = PosixFs::connect(parent);
     let files = files.map_err(|_| "file connection failed")?;
-    // SAFETY: only startup owns file initialization and the message range is unused.
-    unsafe { posix_abi::shared::init(&process, files) }.map_err(|_| "file worker failed")?;
+    // SAFETY: only startup owns file initialization.
+    unsafe { posix_abi::shared::init(files) }.map_err(|_| "files failed")?;
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
-    unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap worker failed")?;
-    // SAFETY: startup owns initialization and the manager ranges are unused.
-    unsafe { posix_abi::threads::init(thread) }.map_err(|_| "thread worker failed")?;
+    unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
+    // SAFETY: startup owns initialization and the stack ranges are unused.
+    unsafe { posix_abi::threads::init(thread) }.map_err(|_| "threads failed")?;
     Ok(())
 }
 

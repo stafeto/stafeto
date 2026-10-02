@@ -73,9 +73,9 @@ extern "C" fn file_request(_: u64) -> ! {
         let mut path = [0xa5; 129];
         let errno = unsafe { abi::__errno_location() };
         unsafe { *errno = EINVAL };
-        unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
-            && unsafe { *errno } == EINTR
-            && path == [0xa5; 129]
+        !unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
+            && &path[..2] == b"/\0"
+            && unsafe { *errno } == EINVAL
     });
     passed(2, good)
 }
@@ -537,36 +537,25 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
         return false;
     }
     // End the receive boost; return to base 29 so newly started clients run
-    // ahead of main while the file owner stays at base 1.
+    // ahead of main.
     let Ok(empty) = sys::channel_create(1) else {
         return fail(84);
     };
     let _ = sys::try_receive(&empty);
     RETRY.store(empty.raw().0 as usize, Ordering::Release);
+    // No file worker: a thread's file request runs in that thread, under
+    // the lock of the process's files, and has no IPC of its own to
+    // interrupt.
     let Some(request) = create(process, 2, file_request) else {
         return fail(85);
     };
-    let errno = unsafe { abi::__errno_location() };
-    unsafe { *errno = EIO };
     if sys::thread_start(&request).is_err()
-        || !state(&request, ThreadState::Sending)
-        || sys::thread_interrupt(&request).is_err()
-        || unsafe { *errno } != EIO
-    {
-        return fail(86);
-    }
-    // The interrupted client must Fetch/Ack before returning EINTR. Main's own
-    // round trip lets the lower-priority file owner process that control traffic.
-    let mut path = [0; 129];
-    if unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
-        || &path[..2] != b"/\0"
-        || unsafe { *errno } != EIO
         || RESULTS[2].load(Ordering::Acquire) != 1
         || !state(&request, ThreadState::Ended)
     {
-        return fail(87);
+        return fail(86);
     }
-    rt::println!("posix-interrupt-probe: file RPC EINTR ok");
+    rt::println!("posix-interrupt-probe: a file request runs in its own thread");
     if !two_step_reads() {
         return false;
     }

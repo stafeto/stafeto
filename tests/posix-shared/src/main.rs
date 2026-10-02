@@ -135,13 +135,8 @@ fn main(_: u64) -> u64 {
         return 2;
     };
     let process = start.process.raw();
-    // The interruption phases need a file request queued, as it queues
-    // behind a busy worker: the probe starts the worker at level 1, below
-    // main, so that it has not reached its receive when they send.
-    #[cfg(feature = "interrupt-probe")]
-    shared::probe_start_priority(1);
-    // SAFETY: startup has exclusive ownership; both reserved message pages are unused.
-    if unsafe { shared::init(&start.process, files) }.is_err()
+    // SAFETY: startup has exclusive ownership.
+    if unsafe { shared::init(files) }.is_err()
         || !wire::before_heap()
         || unsafe { abi::allocation::init(start.process) }.is_err()
     {

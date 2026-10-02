@@ -148,7 +148,9 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     } else if mode == 3 || mode == 4 {
         let native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
         NATIVE.store(native.raw().0, Ordering::Release);
-        sys::thread_set_priority(&native, 10, rt::abi::Policy::Fifo).unwrap();
+        // Through the layer, which keeps the level the holders of its locks
+        // come back to.
+        threads::set_level(10).unwrap();
         let drain = sys::channel_create(10).unwrap();
         assert_eq!(sys::try_receive(&drain), Err(rt::abi::Error::WouldBlock));
         drop(drain);

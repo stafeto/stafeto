@@ -58,10 +58,10 @@ pub const TABLE: &[Record] = &[
 ];
 
 /// A POSIX process: main at the probe's level, the ceiling one above it,
-/// room for the helper threads of `posix-abi`: its thread owner, heap and
-/// file workers and sleep timer run at the ceiling, so an application
-/// thread at main's level never delays them. Programs on `posix-bridge`
-/// (`cprobe`, `busybox-probe`) have no such threads and leave it empty.
+/// where the holders of the locks of `posix-abi` (buckets, heap, files,
+/// threads, actions) run, so an application thread at main's level never
+/// delays them. Programs on `posix-bridge` (`cprobe`, `busybox-probe`)
+/// take no such lock and leave it empty.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     ..TABLE[1]
