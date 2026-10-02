@@ -8,7 +8,8 @@
 //!
 //! Through the service's channel with no label, which only the service's
 //! own threads and init hold: Create, body `Create` (`Create::write`) and
-//! one handle, the start channel init gave (B); the service makes the
+//! two handles, the start channel init gave (B) and the witness, which the
+//! service closes once the process ended (proto_init ADOPT); the service makes the
 //! record, its exit place and the process, and replies status u32, pid
 //! u32, label u64 with two handles: the process (MANAGE, DUPLICATE,
 //! TRANSFER) for the load, and the record's session. Loaded, body label
@@ -20,6 +21,17 @@
 //! once a Spawn waits, is status u32, zero u32, the parent's label u64,
 //! the name of the record of init's table, 16 bytes, and the level of the
 //! parent's Spawn u32 (`Next`).
+//!
+//! WaitStart, WaitTake and WaitCancel, through a session: wait for a child
+//! in two steps (proto_wire::long, spec 2, 3.4). WaitStart: body
+//! `WaitStart`; READY with a `WaitResult` when a child's state is there
+//! (or none is, for WNOHANG, or there is no such child), WAIT k otherwise.
+//! WaitTake: body k u64 and a copy of the caller's channel with NOTIFY,
+//! labelled k: READY or ARMED, then bit 0 through the copy once a child of
+//! the selector ended. WaitCancel: body k u64: READY or CANCELLED.
+//!
+//! The page of the record (`Page`) lies at PAGE_ADDRESS of the process,
+//! the service's to write but for the fields the process writes.
 //!
 //! Spawn, through a session: body `Spawn`; the reply, once the child was
 //! loaded and init took it (Loaded), is status u32 and the child's PID
@@ -34,6 +46,7 @@
 //! Change takes effect once with no journal.
 #![cfg_attr(not(test), no_std)]
 use abi::ProcessState;
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
 use proto_wire::{Header, Name, Reader, Status, Writer};
 pub const VERSION: u16 = 4;
 pub const INVALID: u32 = 500;
@@ -210,6 +223,9 @@ pub enum Method {
     Abandon = 7,
     Spawn = 8,
     Next = 9,
+    WaitStart = 10,
+    WaitTake = 11,
+    WaitCancel = 12,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -219,7 +235,7 @@ impl Method {
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9];
+pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9, 10, 11, 12];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -294,6 +310,186 @@ impl Create {
         })
     }
 }
+
+/// The options of WaitStart, with Linux's values: WNOHANG, WSTOPPED (or
+/// WUNTRACED), WEXITED, WCONTINUED and WNOWAIT. Waitpid sends WEXITED.
+pub const WNOHANG: u32 = 1;
+pub const WSTOPPED: u32 = 2;
+pub const WEXITED: u32 = 4;
+pub const WCONTINUED: u32 = 8;
+pub const WNOWAIT: u32 = 0x0100_0000;
+pub const WAIT_OPTIONS: u32 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT;
+
+/// The children a wait takes: the child of a PID, any child, or the
+/// children of a process group (waitpid's pid > 0, -1, < -1; 0 is the
+/// caller's own group).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selector {
+    Pid(u32),
+    Any,
+    Group(u32),
+}
+
+impl Selector {
+    /// The selector of waitpid's `pid`, with the caller's group `own`.
+    pub const fn of(pid: i32, own: u32) -> Self {
+        match pid {
+            -1 => Selector::Any,
+            0 => Selector::Group(own),
+            p if p > 0 => Selector::Pid(p as u32),
+            p => Selector::Group(p.unsigned_abs()),
+        }
+    }
+}
+
+/// The body of WaitStart: waitpid's pid (the caller's group already put
+/// for 0) and the options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitStart {
+    pub selector: Selector,
+    pub options: u32,
+}
+
+impl WaitStart {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        let (kind, id) = match self.selector {
+            Selector::Pid(pid) => (1, pid),
+            Selector::Any => (0, 0),
+            Selector::Group(pgid) => (2, pgid),
+        };
+        w.u32(kind)?;
+        w.u32(id)?;
+        w.u32(self.options)
+    }
+
+    /// BAD_SIZE out of the layout, for an unknown kind, an id of 0 or an
+    /// option past WAIT_OPTIONS.
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let (kind, id, options) = (r.u32()?, r.u32()?, r.u32()?);
+        r.finish()?;
+        let selector = match (kind, id) {
+            (0, 0) => Selector::Any,
+            (1, pid) if pid != 0 => Selector::Pid(pid),
+            (2, pgid) if pgid != 0 => Selector::Group(pgid),
+            _ => return Err(Status::BadSize),
+        };
+        if options & !WAIT_OPTIONS != 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self { selector, options })
+    }
+}
+
+/// What a wait found: a child that exited or died by a signal, none yet
+/// (WNOHANG), or no child of the selector at all (ECHILD).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitResult {
+    Ended { pid: u32, end: End, uid: u32 },
+    Nothing,
+    NoChild,
+}
+
+impl WaitResult {
+    /// pid u32, kind u32 (1 exited, 2 signaled, 0 nothing, 3 no child),
+    /// value u32 (the code or the signal), uid u32: 16 bytes.
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        let (pid, kind, value, uid) = match *self {
+            WaitResult::Ended {
+                pid,
+                end: End::Exited(code),
+                uid,
+            } => (pid, 1, code, uid),
+            WaitResult::Ended {
+                pid,
+                end: End::Signaled(n),
+                uid,
+            } => (pid, 2, n, uid),
+            WaitResult::Nothing => (0, 0, 0, 0),
+            WaitResult::NoChild => (0, 3, 0, 0),
+        };
+        w.u32(pid)?;
+        w.u32(kind)?;
+        w.u32(value.into())?;
+        w.u32(uid)
+    }
+
+    pub fn read(bytes: &[u8]) -> Result<Self, Status> {
+        let mut r = Reader::new(bytes);
+        let (pid, kind, value, uid) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+        r.finish()?;
+        let value = u8::try_from(value).map_err(|_| Status::BadSize)?;
+        match (kind, pid) {
+            (1, p) if p != 0 => Ok(WaitResult::Ended {
+                pid,
+                end: End::Exited(value),
+                uid,
+            }),
+            (2, p) if p != 0 => Ok(WaitResult::Ended {
+                pid,
+                end: End::Signaled(value),
+                uid,
+            }),
+            (0, 0) => Ok(WaitResult::Nothing),
+            (3, 0) => Ok(WaitResult::NoChild),
+            _ => Err(Status::BadSize),
+        }
+    }
+}
+
+/// Where the page of its record lies in a POSIX process.
+pub const PAGE_ADDRESS: usize = 0x0D00_0000;
+/// The version of the page's layout.
+pub const PAGE_VERSION: u32 = 1;
+
+/// The page of a record (spec 2, 3.1, 3.3), one page in the process at
+/// PAGE_ADDRESS and in the service. The service writes the identity and
+/// the signals that wait for the process with their information; the
+/// process writes which signals it ignores and catches, and the flags of
+/// SIGCHLD, which the service reads as hints and checks.
+#[repr(C)]
+pub struct Page {
+    pub version: AtomicU32,
+    pub pid: AtomicU32,
+    pub ppid: AtomicU32,
+    pub pgid: AtomicU32,
+    pub sid: AtomicU32,
+    _zero: u32,
+    /// The signals sent to the process that no thread took yet, bit n - 1
+    /// for signal n.
+    pub pending: AtomicU64,
+    /// The process's: the signals whose action ignores them, those it
+    /// catches, and PAGE_NOCLDWAIT, PAGE_NOCLDSTOP, PAGE_CHLD_IGNORED.
+    pub ignored: AtomicU64,
+    pub caught: AtomicU64,
+    pub flags: AtomicU64,
+    _reserved: [u64; 3],
+    /// The information of the first sending of each pending signal.
+    pub info: [PageInfo; 64],
+}
+
+/// SA_NOCLDWAIT on SIGCHLD.
+pub const PAGE_NOCLDWAIT: u64 = 1;
+/// SA_NOCLDSTOP on SIGCHLD.
+pub const PAGE_NOCLDSTOP: u64 = 2;
+/// SIGCHLD set to SIG_IGN, which reaps children at once.
+pub const PAGE_CHLD_IGNORED: u64 = 4;
+
+/// The information of a signal sent to a process (siginfo_t): its code,
+/// the sender's PID and real UID, and for SIGCHLD the child's status.
+#[repr(C)]
+pub struct PageInfo {
+    pub code: AtomicI32,
+    pub pid: AtomicU32,
+    pub uid: AtomicU32,
+    pub status: AtomicI32,
+}
+
+const _: () = assert!(core::mem::size_of::<Page>() <= 4096);
+
+/// si_code of a signal kill sent, and of SIGCHLD.
+pub const SI_USER: i32 = 0;
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
 
 /// The body of Spawn: the name of the record of init's table, 16 bytes,
 /// the spawn-flags u32, the process group u32 and the caller's level u32,
@@ -499,6 +695,9 @@ mod tests {
             Method::Abandon,
             Method::Spawn,
             Method::Next,
+            Method::WaitStart,
+            Method::WaitTake,
+            Method::WaitCancel,
         ];
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
@@ -626,6 +825,51 @@ mod tests {
             Next::read(&proto_wire::reply(Status::BadSize)),
             Err(Status::BadSize)
         );
+    }
+
+    #[test]
+    fn waits_round_trip() {
+        assert_eq!(Selector::of(-1, 300), Selector::Any);
+        assert_eq!(Selector::of(0, 300), Selector::Group(300));
+        assert_eq!(Selector::of(257, 300), Selector::Pid(257));
+        assert_eq!(Selector::of(-260, 300), Selector::Group(260));
+        for selector in [Selector::Any, Selector::Pid(9), Selector::Group(4)] {
+            let start = WaitStart {
+                selector,
+                options: WNOHANG | WEXITED | WNOWAIT,
+            };
+            let mut w = Writer::new();
+            start.write(&mut w).unwrap();
+            assert_eq!(WaitStart::read(Reader::new(w.as_bytes())), Ok(start));
+        }
+        let mut w = Writer::new();
+        w.u32(1).unwrap();
+        w.u32(0).unwrap();
+        w.u32(0).unwrap();
+        assert_eq!(
+            WaitStart::read(Reader::new(w.as_bytes())),
+            Err(Status::BadSize),
+            "pid 0"
+        );
+        for result in [
+            WaitResult::Ended {
+                pid: 300,
+                end: End::Exited(7),
+                uid: 0,
+            },
+            WaitResult::Ended {
+                pid: 301,
+                end: End::Signaled(SIGSEGV),
+                uid: 65534,
+            },
+            WaitResult::Nothing,
+            WaitResult::NoChild,
+        ] {
+            let mut w = Writer::new();
+            result.write(&mut w).unwrap();
+            assert_eq!(w.as_bytes().len(), 16);
+            assert_eq!(WaitResult::read(w.as_bytes()), Ok(result));
+        }
     }
 
     /// The reasons of PROCESS_STATE as wait reports them (decision 4 of

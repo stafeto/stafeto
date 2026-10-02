@@ -120,7 +120,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     Record {
         name: "posix",
         program: "posix-process-service",
-        quota: 256 * PAGE,
+        // Its own, and the eight objects of the pages of its records
+        // (32 pages each); what its POSIX records take init adds.
+        quota: 640 * PAGE,
         // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
@@ -215,8 +217,10 @@ pub const RELIBC_TABLE: &[Record] = &[
 /// The probe of POSIX processes (tests/posix-procs, 5b): the RAM files,
 /// the process and clock services, the probe, and the records it spawns,
 /// which start on demand: a child that says its parent, one that sleeps,
-/// and one whose 32 MiB stack its 15 pages of quota cannot map, so that
-/// its load fails (the image gives `posix-procs-big` that stack).
+/// one whose 32 MiB stack its 15 pages of quota cannot map, so that its
+/// load fails (the image gives `posix-procs-big` that stack), one that
+/// ends 300 ms after its start, one that exits with 7, one that faults,
+/// and one that spawns the last, which waits to be an orphan.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
     POSIX_ABI_TABLE[1],
@@ -242,6 +246,36 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         name: "procs-big",
         program: "posix-procs-big",
         quota: super::MIN_QUOTA,
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-nap",
+        args: b"posix-procs\0nap\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-exit7",
+        args: b"posix-procs\0exit7\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-segv",
+        args: b"posix-procs\0segv\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-middle",
+        args: b"posix-procs\0middle\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-orphan",
+        args: b"posix-procs\0orphan\0",
         on_demand: true,
         ..PROCS_CHILD
     },

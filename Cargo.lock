@@ -255,6 +255,7 @@ dependencies = [
  "posix-sync",
  "posix-thread",
  "posix-types",
+ "proto-process",
  "rt",
 ]
 

@@ -57,7 +57,7 @@ pub fn channel() -> ManuallyDrop<Handle<Channel>> {
     Handle::borrowed(abi::Handle(OWN[0].load(Ordering::Acquire)))
 }
 
-fn own() -> ManuallyDrop<Handle<Process>> {
+pub fn own() -> ManuallyDrop<Handle<Process>> {
     Handle::borrowed(abi::Handle(OWN[1].load(Ordering::Acquire)))
 }
 
@@ -191,7 +191,8 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
     }
 }
 
-/// Makes the process of `create` with the start channel `start` from the
+/// Makes the process of `create` with the start channel and the witness of
+/// `start` (proto_init Adoption) from the
 /// program `name` of the boot image, loading it through `window` of the
 /// service's space, which only the calling thread uses, while `thread`,
 /// the caller's own, runs at `level`: the process's priority, or that of
@@ -204,7 +205,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
 /// biggest segment of a program of the boot image.
 pub unsafe fn make(
     create: &Create,
-    start: Handle<Channel>,
+    start: [Handle<Channel>; 2],
     name: &Name,
     window: usize,
     thread: &Handle<Thread>,
@@ -219,7 +220,9 @@ pub unsafe fn make(
     Method::Create.header().write(&mut w).map_err(refused)?;
     create.write(&mut w).map_err(refused)?;
     let mut buffer = [0; abi::MESSAGE_MAX];
-    let (len, mut handles) = ask(&w, [start.erase()].into(), &mut buffer).map_err(refused)?;
+    let [start, witness] = start;
+    let (len, mut handles) =
+        ask(&w, [start.erase(), witness.erase()].into(), &mut buffer).map_err(refused)?;
     let mut r = Reader::new(&buffer[..len]);
     // The status, then the PID, which init's start data do not need, and
     // the label first: past it the record exists, and a failure ends it.

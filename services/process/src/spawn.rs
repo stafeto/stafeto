@@ -106,19 +106,23 @@ extern "C" fn spawner(_: u64) -> ! {
             root: false,
             parent: next.parent,
         };
-        let made = match reply.handles.take::<Channel>(0) {
+        let handed = (
+            reply.handles.take::<Channel>(0),
+            reply.handles.take::<Channel>(1),
+        );
+        let made = match handed {
             // SAFETY: only this thread maps and uses WINDOW.
-            Ok(start) => unsafe {
+            (Ok(start), Ok(witness)) => unsafe {
                 make::make(
                     &create,
-                    start,
+                    [start, witness],
                     &adoption.program,
                     WINDOW,
                     &own,
                     adoption.priority.max(next.level),
                 )
             },
-            Err(_) => Err(Failed {
+            _ => Err(Failed {
                 status: Status::BadSize,
                 label: None,
             }),

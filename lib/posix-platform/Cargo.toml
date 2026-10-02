@@ -19,3 +19,4 @@ posix-signals = { path = "../posix-signals" }
 posix-sync = { path = "../posix-sync" }
 rt = { path = "../rt" }
 posix-fs = { path = "../posix-fs" }
+proto-process = { path = "../../proto/process" }

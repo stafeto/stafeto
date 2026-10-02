@@ -1475,7 +1475,12 @@ mod tests {
                 "posix-procs",
                 "procs-child",
                 "procs-sleeper",
-                "procs-big"
+                "procs-big",
+                "procs-nap",
+                "procs-exit7",
+                "procs-segv",
+                "procs-middle",
+                "procs-orphan"
             ]
         );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {

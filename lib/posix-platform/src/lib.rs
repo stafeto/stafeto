@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 5;
+pub const PLATFORM_INTERFACE: u64 = 6;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -239,6 +239,89 @@ pub extern "C" fn stafeto_getpid() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_getppid() -> c_int {
     posix_abi::process::getppid()
+}
+
+/// waitpid (posix_abi::process::waitpid): the child's PID, 0 for WNOHANG
+/// with none, its status (Linux's layout) at `status`; or the negated
+/// errno.
+///
+/// # Safety
+/// `status` is writable for an int.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
+    match call(|| posix_abi::process::waitpid(pid, options)) {
+        Ok(waited) => {
+            let word = waited.end.map_or(0, proto_process::End::wait_status);
+            // SAFETY: the caller's promise.
+            unsafe { status.write(word) };
+            waited.pid
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// The idtype_t of waitid.
+const P_ALL: c_int = 0;
+const P_PID: c_int = 1;
+const P_PGID: c_int = 2;
+/// SIGCHLD, and the offsets of the child's fields in Linux's siginfo_t.
+const SIGCHLD: i32 = 17;
+const SIGINFO_LEN: usize = 128;
+
+/// waitid (POSIX: the child that `idtype` and `id` name, as `options`
+/// say): 0 with Linux's siginfo_t of the child at `info` (signo SIGCHLD,
+/// code CLD_EXITED or CLD_KILLED, pid, uid, status), zeroed for WNOHANG
+/// with none; or the negated errno: EINVAL for another idtype, no
+/// WEXITED, WSTOPPED or WCONTINUED, or another option.
+///
+/// # Safety
+/// `info` is writable for a siginfo_t.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_waitid(
+    idtype: c_int,
+    id: u32,
+    info: *mut u8,
+    options: c_int,
+) -> c_int {
+    use proto_process::{
+        CLD_EXITED, CLD_KILLED, End, Selector, WAIT_OPTIONS, WCONTINUED, WEXITED, WSTOPPED,
+    };
+    let Ok(options) = u32::try_from(options) else {
+        return -EINVAL;
+    };
+    if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 || options & !WAIT_OPTIONS != 0 {
+        return -EINVAL;
+    }
+    let own = posix_abi::process::page()
+        .pgid
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let selector = match (idtype, id) {
+        (P_ALL, _) => Selector::Any,
+        (P_PID, pid) if pid != 0 => Selector::Pid(pid),
+        (P_PGID, 0) => Selector::Group(own),
+        (P_PGID, pgid) => Selector::Group(pgid),
+        _ => return -EINVAL,
+    };
+    match call(|| posix_abi::process::wait(selector, options)) {
+        Ok(waited) => {
+            let mut words = [0i32; SIGINFO_LEN / 4];
+            if let Some(end) = waited.end {
+                let (code, status) = match end {
+                    End::Exited(code) => (CLD_EXITED, i32::from(code)),
+                    End::Signaled(n) => (CLD_KILLED, i32::from(n)),
+                };
+                words[0] = SIGCHLD;
+                words[2] = code;
+                words[4] = waited.pid;
+                words[5] = waited.uid as i32;
+                words[6] = status;
+            }
+            // SAFETY: the caller's promise.
+            unsafe { ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), info, SIGINFO_LEN) };
+            0
+        }
+        Err(errno) => -errno,
+    }
 }
 
 /// posix_spawn of the program at `path` (posix_abi::process::spawn): the

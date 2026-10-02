@@ -66,10 +66,6 @@ const STARTED: &str = "init: services started";
 const MAIN: u8 = 63;
 const MS: u64 = 1_000_000;
 const S: u64 = 1_000 * MS;
-/// The first and the longest pause before init looks again at the end of
-/// a POSIX process whose start channel closed before it ended.
-const POLL_FIRST_NS: u64 = MS;
-const POLL_MAX_NS: u64 = S;
 
 /// An instance of a record: its process, the first thread init starts,
 /// the label of its start channel and what is left of its start data,
@@ -240,11 +236,9 @@ struct Entry {
     adopting: bool,
     offered: bool,
     ticket: u64,
-    /// The start channel of its POSIX process closed while the process
-    /// still ran: init looks at its end on the record's timer, after
-    /// `poll_ns`, which doubles up to POLL_MAX_NS (`closed`, `expired`).
-    closing: bool,
-    poll_ns: u64,
+    /// The label of the witness of its POSIX process: the process service
+    /// closes it once the process ended (`adoption`, `closed`).
+    witness: u64,
 }
 
 impl Entry {
@@ -265,8 +259,7 @@ impl Entry {
         adopting: false,
         offered: false,
         ticket: 0,
-        closing: false,
-        poll_ns: 0,
+        witness: 0,
     };
 }
 
@@ -628,12 +621,15 @@ impl Init {
     /// failed.
     fn offer_one(&mut self, place: usize) -> bool {
         let mut w = proto_wire::Writer::new();
-        let Ok(start) = self.adoption(place, &mut w) else {
+        let Ok([start, witness]) = self.adoption(place, &mut w) else {
             self.adoption_failed(place, "no start channel");
             return false;
         };
         let pending = self.adoption.take().expect("a waiting ADOPT");
-        if pending.answer(w.as_bytes(), [start.erase()]).is_ok() {
+        if pending
+            .answer(w.as_bytes(), [start.erase(), witness.erase()])
+            .is_ok()
+        {
             self.entries[place].offered = true;
         }
         // Else the service went: the next ADOPT offers the record again.
@@ -644,18 +640,22 @@ impl Init {
     /// (proto_init Adoption) with a new ticket, the label of the start
     /// channel B it returns: a copy of init's channel with SEND and
     /// TRANSFER whose slot has the record's priority, as rt::loader::spawn
-    /// makes it, so that the process's requests, and the CLIENT_GONE of the
-    /// last copy once the process ended, carry the ticket. The record
-    /// waits for ADOPTED with that ticket. The error of handle_label.
+    /// makes it, so that the process's requests carry the ticket; and the
+    /// witness W, a copy with TRANSFER alone and a label of its own, which
+    /// the service keeps with the record and closes once the process ended:
+    /// its CLIENT_GONE is the end (`closed`). The record waits for ADOPTED
+    /// with that ticket. The error of handle_label.
     fn adoption(
         &mut self,
         place: usize,
         w: &mut proto_wire::Writer,
-    ) -> Result<Handle<Channel>, Error> {
+    ) -> Result<[Handle<Channel>; 2], Error> {
         let record = &TABLE[place];
         let ticket = self.labels.next().expect("init gave every label");
         let rights = Rights::SEND | Rights::TRANSFER;
         let start = sys::handle_label(&self.channel, rights, ticket, record.priority)?;
+        let witness = self.labels.next().expect("init gave every label");
+        let seen = sys::handle_label(&self.channel, Rights::TRANSFER, witness, record.priority)?;
         let adoption = Adoption {
             ticket,
             quota: record.quota,
@@ -668,7 +668,8 @@ impl Init {
         // The reply has room for the 48 bytes of an adoption.
         let _ = adoption.write(w);
         self.entries[place].ticket = ticket;
-        Ok(start)
+        self.entries[place].witness = witness;
+        Ok([start, seen])
     }
 
     /// SPAWN from the instance at `place`: only the process service's
@@ -697,8 +698,8 @@ impl Init {
             return refuse(Error::LimitReached);
         }
         let mut w = proto_wire::Writer::new();
-        let start = match self.adoption(target, &mut w) {
-            Ok(start) => start,
+        let [start, witness] = match self.adoption(target, &mut w) {
+            Ok(handles) => handles,
             Err(e) => return refuse(e),
         };
         let entry = &mut self.entries[target];
@@ -706,7 +707,7 @@ impl Init {
         entry.adopting = true;
         entry.offered = true;
         let _ = r.reply().bytes(w.as_bytes());
-        Answer::Reply([start.erase()].into())
+        Answer::Reply([start.erase(), witness.erase()].into())
     }
 
     /// The POSIX record at `place` gets no process: a failure of its
@@ -833,27 +834,6 @@ impl Init {
         })
     }
 
-    /// The start channel of the POSIX process of the record at `place`
-    /// closed: its end (`ended`) once PROCESS_STATE shows it; a process
-    /// that closed its start channel before it ended is looked at again
-    /// on the record's timer after `poll_ns` (`expired`), its watchdog off.
-    fn closing(&mut self, place: usize, poll_ns: u64) {
-        let Some(instance) = self.entries[place].held.running() else {
-            return;
-        };
-        let label = instance.label;
-        if sys::process_state(instance.process()) != Ok(ProcessState::Alive) {
-            self.entries[place].closing = false;
-            self.ended(label);
-            return;
-        }
-        let entry = &mut self.entries[place];
-        entry.closing = true;
-        entry.watch = None;
-        entry.poll_ns = poll_ns;
-        self.set_deadline(place, now().saturating_add(poll_ns));
-    }
-
     /// The end of the instance whose label is `label` (its exit
     /// notification): a failure of its record, with the reason of
     /// PROCESS_STATE.
@@ -954,7 +934,6 @@ impl Init {
         entry.watch = None;
         entry.adopting = false;
         entry.offered = false;
-        entry.closing = false;
         let deadline = match verdict {
             None => {
                 entry.state = State::Ended;
@@ -1048,11 +1027,6 @@ impl Init {
         let now = now();
         let entry = &mut self.entries[place];
         if !entry.deadline.is_some_and(time::reached) {
-            return;
-        }
-        if entry.closing {
-            let poll_ns = (entry.poll_ns * 2).min(POLL_MAX_NS);
-            self.closing(place, poll_ns);
             return;
         }
         match entry.state {
@@ -1426,22 +1400,23 @@ impl Service<1> for Init {
         }
     }
 
-    /// The last copy of a start channel closed (CLIENT_GONE of its label):
-    /// for a POSIX process, whose end the process service hears of, the
-    /// end of its instance (`closing`); for a POSIX record whose start
-    /// channel the service let go before ADOPTED, a failure of the record.
+    /// The witness of a POSIX record closed (CLIENT_GONE of its label):
+    /// the process service closes it once the process ended, so that
+    /// PROCESS_STATE shows the end: the end of the instance (`ended`); for
+    /// a record whose process the service did not make, a failure of the
+    /// record. The start channel's own CLIENT_GONE tells nothing of a POSIX
+    /// process, which may close it or give it away before it ends.
     fn closed(&mut self, label: u64) {
-        if let Some(place) = self.caller(label) {
-            if TABLE[place].is_posix() {
-                self.closing(place, POLL_FIRST_NS);
-            }
+        let Some(place) = (0..TABLE.len())
+            .find(|&p| TABLE[p].is_posix() && self.entries[p].witness == label && label != 0)
+        else {
             return;
-        }
-        let offered = (0..TABLE.len()).find(|&p| {
-            let e = &self.entries[p];
-            e.adopting && e.offered && e.ticket == label
-        });
-        if let Some(place) = offered {
+        };
+        self.entries[place].witness = 0;
+        let entry = &self.entries[place];
+        if let Some(ticket) = entry.held.running().map(|i| i.label) {
+            self.ended(ticket);
+        } else if entry.adopting && entry.offered {
             self.adoption_failed(place, "the process service let it go");
         }
     }

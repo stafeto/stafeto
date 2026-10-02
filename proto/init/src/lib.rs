@@ -99,17 +99,19 @@
 //! service anything. ADOPT: the header alone; the reply (`Adoption`) its
 //! status (8 bytes, proto_wire::reply), the ticket of the instance, the
 //! record's quota, room for handles, ceiling, priority, root and program,
-//! and one handle, the instance's start channel (a copy of init's channel
+//! and two handles: the instance's start channel (a copy of init's channel
 //! with SEND, TRANSFER and the ticket as its label), which the process
-//! gets as its entry 0. ADOPTED: the header, the ticket u64 and the
+//! gets as its entry 0, and its witness (a copy with TRANSFER alone and a
+//! label of its own), which the service closes once the process ended, so
+//! that its CLIENT_GONE tells init of the end. ADOPTED: the header, the ticket u64 and the
 //! service's status u32 (0, or why it made no process), and with status 0
 //! three handles: the session of the record, the process (MANAGE,
 //! DUPLICATE, TRANSFER) and its first thread (MANAGE, TRANSFER), which
 //! init gives the process in its start data under `posix`, `process` and
 //! `thread`; the reply is its status alone. Init keeps a copy of the
 //! process with no rights and reads its end once the last copy of the
-//! start channel closed. Once init answered 0, the service starts the
-//! thread; on any other answer it kills the process.
+//! witness closed. Once init answered 0, the service starts the thread; on
+//! any other answer it kills the process.
 //!
 //! SPAWN, also from the process service alone, for posix_spawn of a
 //! POSIX process (5b, until the loader of 5c): the header and the name of

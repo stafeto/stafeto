@@ -358,7 +358,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &[],
+        &["children-max-4"],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
@@ -1816,6 +1816,9 @@ fn posix_procs_probe() -> Result<(), String> {
             "init: posix-procs ended: exit code 0, not restarted",
             "init: procs-child ended: exit code 0, not restarted",
             "init: procs-big did not load: no process of the process service, not restarted",
+            "init: procs-exit7 ended: exit code 7, not restarted",
+            "init: procs-middle ended: exit code 0, not restarted",
+            "init: procs-orphan ended: exit code 0, not restarted",
         ] {
             run.expect_seen(line, BOOT_TIMEOUT)?;
         }
@@ -1825,6 +1828,7 @@ fn posix_procs_probe() -> Result<(), String> {
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
     let number = |prefix: &str| -> Result<Vec<i64>, String> {
         let line = outcome
             .lines
