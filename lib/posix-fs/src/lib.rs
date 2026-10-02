@@ -306,6 +306,16 @@ impl PosixFs {
         self.files.read(backend, out).map_err(FsError::from)
     }
 
+    /// The console route of `fd` when it is standard output or error, for
+    /// a write the caller makes after it let go of the file state (the
+    /// owner stays alive meanwhile); None for a file of the service.
+    pub fn console_route(&self, fd: u32) -> Result<Option<rt::fs::Input>, FsError> {
+        Ok(match self.descriptors.get(fd)? {
+            Backend::Output | Backend::Error => Some(self.files.input()),
+            _ => None,
+        })
+    }
+
     pub fn write(&self, fd: u32, bytes: &[u8]) -> Result<usize, FsError> {
         let backend = match self.descriptors.get(fd)? {
             Backend::Output => 1,

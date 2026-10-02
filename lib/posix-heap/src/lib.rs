@@ -112,6 +112,14 @@ impl Allocator {
         unsafe { (*pointer.as_ptr().sub(size_of::<Header>()).cast::<Header>()).alignment }
     }
 
+    /// The bytes the caller asked for in the live allocation `pointer`.
+    ///
+    /// # Safety
+    /// pointer names a live allocation from this allocator.
+    pub unsafe fn requested(pointer: NonNull<u8>) -> usize {
+        unsafe { (*pointer.as_ptr().sub(size_of::<Header>()).cast::<Header>()).requested }
+    }
+
     /// # Safety
     /// pointer names a currently live allocation from this allocator, with no
     /// overlapping accesses. It may not be used again after this call.

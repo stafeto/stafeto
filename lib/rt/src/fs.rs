@@ -32,6 +32,17 @@ impl Input {
         Self { uart }
     }
 
+    /// A write of standard output or error to the console through this
+    /// snapshot, as `Files::write` makes it: out of any lock of its owner,
+    /// since the driver answers a write into a full ring later.
+    pub fn write(&self, bytes: &[u8]) -> Result<usize, Status> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let uart = self.uart.map(Handle::<Channel>::borrowed);
+        console_write(uart.as_deref(), bytes)
+    }
+
     /// A plain READ (proto_uart): the reply waits for input. A program
     /// with signals reads in two steps instead (posix-abi), so that a
     /// signal never waits behind it.

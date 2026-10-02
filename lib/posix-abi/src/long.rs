@@ -154,7 +154,10 @@ pub fn run(
                     Ok((long::ARMED, _, _)) => {}
                     Ok(_) => break 'wait Some(EIO),
                     Err(EINTR) if ending(&block.flags) => break 'wait None,
-                    Err(EINTR) => {}
+                    // The service told once and keeps the result for the
+                    // next "take"; it tells no second time, so the take
+                    // goes again with a new copy instead of a wait.
+                    Err(EINTR) => armed = false,
                     Err(error) => break 'wait Some(error),
                 }
             }

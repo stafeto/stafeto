@@ -413,4 +413,31 @@ mod tests {
         let refused = proto_wire::reply(Status::Kernel(abi::Error::BadState));
         assert_eq!(ReadReply::read(&refused, 64), Err(Status::BadSize));
     }
+
+    /// The bytes of the driver's messages as it and its clients write
+    /// them, from a writer made again over a longer message: the fields
+    /// and nothing past them (#86), whose reader takes them back.
+    #[test]
+    fn messages_carry_their_fields_and_nothing_more() {
+        let write = |f: &dyn Fn(&mut Writer)| {
+            let mut w = Writer::new();
+            w.bytes(&[0xee; MESSAGE_MAX]).unwrap();
+            assert_eq!(w.as_bytes().len(), MESSAGE_MAX);
+            w = Writer::new();
+            f(&mut w);
+            w.as_bytes().to_vec()
+        };
+        let reply = write(&|w| WriteReply { written: 3 }.write(w).unwrap());
+        assert_eq!(reply, [0, 0, 0, 0, 3, 0, 0, 0]);
+        assert_eq!(WriteReply::read(&reply), Ok(WriteReply { written: 3 }));
+        let reply = write(&|w| ReadReply { bytes: b"ok" }.write(w).unwrap());
+        assert_eq!(reply, [0, 0, 0, 0, 2, 0, 0, 0, b'o', b'k']);
+        assert_eq!(ReadReply::read(&reply, 64), Ok(ReadReply { bytes: b"ok" }));
+        let request = write(&|w| WriteRequest { bytes: b"hi" }.write(w).unwrap());
+        assert_eq!(request.len(), HEADER_LEN + 2);
+        assert_eq!(&request[HEADER_LEN..], b"hi");
+        let key = write(&|w| ReadKey { key: 0x0102 }.write(Method::ReadTake, w).unwrap());
+        assert_eq!(key.len(), HEADER_LEN + 8);
+        assert_eq!(&key[HEADER_LEN..], &[2, 1, 0, 0, 0, 0, 0, 0]);
+    }
 }

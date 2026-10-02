@@ -305,6 +305,17 @@ pub(crate) fn dispatch<'a>(
 
 pub(crate) fn number(request: Request<'_>) -> Result<u64, i32> {
     if tls::process_files() {
+        // A write to the console leaves the section: the driver answers a
+        // write into a full ring only once it drained.
+        if let Request::Write { fd, bytes } = request
+            && let Some(console) =
+                process_state(|_, files| files.console_route(fd).map_err(crate::error))?
+        {
+            return console
+                .write(bytes)
+                .map(|n| n as u64)
+                .map_err(|status| crate::error(posix_fs::FsError::from(status)));
+        }
         return process_state(|streams, files| number_operation(request, streams, files));
     }
     local(2, |streams, files| {

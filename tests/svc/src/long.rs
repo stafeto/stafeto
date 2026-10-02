@@ -18,7 +18,8 @@
 //! - PING: the status alone (rtbench S9);
 //! - STATS: the operations that wait and the handles they hold;
 //! - FEED: one byte, after the header, for the reads that wait for one;
-//! - HOLD with a u32 of milliseconds: after its next WAIT reply the
+//! - HOLD with a u32 of milliseconds, and a second u32 1 to hold after
+//!   the next FEED instead: after its next WAIT reply (or FEED) the
 //!   service waits that long on a channel of its own, out of `receive` on
 //!   its service channel, so that a request sent meanwhile stands in the
 //!   queue, where an interrupt can take it back;
@@ -94,6 +95,7 @@ pub fn run(s: Startup) -> u64 {
         level,
         storm: None,
         hold_ms: 0,
+        hold_after_feed: false,
         hold,
         pause,
         pause_timer,
@@ -137,6 +139,7 @@ struct Long {
     /// copy of the channel that tells the service so, and its own channel
     /// and timer to wait on.
     hold_ms: u32,
+    hold_after_feed: bool,
     hold: Handle<Channel>,
     pause: Handle<Channel>,
     pause_timer: Handle<Timer>,
@@ -194,7 +197,7 @@ impl Long {
             result: None,
         });
         self.arm_timer();
-        if self.hold_ms != 0 {
+        if self.hold_ms != 0 && !self.hold_after_feed {
             let _ = sys::notify(&self.hold, 1);
         }
         reply(r, long::Reply::Wait(key))
@@ -339,6 +342,9 @@ impl Service<1> for Long {
                     }
                     None => self.fed = Some(byte),
                 }
+                if self.hold_ms != 0 && self.hold_after_feed {
+                    let _ = sys::notify(&self.hold, 1);
+                }
                 Answer::Status(Status::Ok)
             }
             STORM => self.storm(r),
@@ -348,6 +354,7 @@ impl Service<1> for Long {
                     return Answer::Status(Status::BadSize);
                 };
                 self.hold_ms = ms;
+                self.hold_after_feed = body.u32() == Ok(1);
                 Answer::Status(Status::Ok)
             }
             _ => Answer::Status(Status::Ok),
@@ -368,6 +375,7 @@ impl Service<1> for Long {
         if n.label == HOLD_LABEL && self.hold_ms != 0 {
             let due = time::ticks_to_ns(time::now()) + u64::from(self.hold_ms) * 1_000_000;
             self.hold_ms = 0;
+            self.hold_after_feed = false;
             if sys::timer_set(&self.pause_timer, due).is_ok() {
                 let _ = sys::receive(&self.pause);
             }

@@ -4,7 +4,10 @@
 //! The heap and the descriptor table under the layer's locks, with no
 //! helper thread: eight threads malloc, free, dup and close while signals
 //! come; a signal raised inside the heap's section is delivered at its end,
-//! where the handler finds itself outside it.
+//! where the handler finds itself outside it; a thread that waits for the
+//! files' lock takes its signal after the holder left; a thread with the
+//! least stack (PTHREAD_STACK_MIN) makes file requests with a signal
+//! inside the files' section, and the peak of its stack is measured.
 use super::*;
 use abi::metadata::Timespec;
 use abi::signals::{self as api, SigAction};
@@ -52,6 +55,124 @@ unsafe extern "C" fn churner(argument: *mut c_void) -> *mut c_void {
     }
     DONE.fetch_add(1, Ordering::SeqCst);
     ptr::null_mut()
+}
+
+static HOLDING: AtomicUsize = AtomicUsize::new(0);
+static DUPED: AtomicUsize = AtomicUsize::new(0);
+static CAUGHT_HOLDING: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+const PAINT: u8 = 0xa5;
+
+unsafe extern "C" fn seen_holding(_: i32) {
+    CAUGHT_HOLDING.store(HOLDING.load(Ordering::SeqCst), Ordering::SeqCst);
+}
+
+/// dup while main holds the lock of the files.
+unsafe extern "C" fn dupper(_: *mut c_void) -> *mut c_void {
+    let fd = FD.load(Ordering::SeqCst) as i32;
+    let copy = unsafe { abi::dup(fd) };
+    if copy >= 0 && unsafe { abi::close(copy) } == 0 {
+        DUPED.store(1, Ordering::SeqCst);
+    }
+    ptr::null_mut()
+}
+
+/// On a stack of PTHREAD_STACK_MIN: paints the stack below its frame,
+/// makes file requests with a signal raised inside the files' section,
+/// and finds the deepest painted byte that changed.
+unsafe extern "C" fn small_stack(_: *mut c_void) -> *mut c_void {
+    let Some(block) = threads::probe_block(threads::pthread_self()) else {
+        return ptr::null_mut();
+    };
+    // The stack lies right below the page of the TCB.
+    let top = ptr::from_ref(block) as usize & !0xfff;
+    let bottom = top - PTHREAD_STACK_MIN as usize;
+    let marker = 0u8;
+    let here = ptr::from_ref(&marker) as usize;
+    let painted = here - 512;
+    // SAFETY: the bytes from the bottom of this thread's stack to below
+    // its live frames are its own and unused.
+    unsafe { ptr::write_bytes(bottom as *mut u8, PAINT, painted - bottom) };
+    let mut ok = true;
+    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+    let mut buffer = [0u8; 64];
+    ok &= fd >= 0 && unsafe { abi::read(fd, buffer.as_mut_ptr(), buffer.len()) } > 0;
+    abi::shared::probe_hold(|| {
+        let _ = api::raise(SIGUSR1);
+    });
+    let mut status = core::mem::MaybeUninit::<abi::metadata::Stat>::uninit();
+    ok &= unsafe { abi::metadata::fstat(fd, status.as_mut_ptr()) } == 0;
+    ok &= unsafe { abi::write(1, b"\n".as_ptr(), 1) } == 1;
+    ok &= unsafe { abi::close(fd) } == 0;
+    let first = (bottom..painted)
+        // SAFETY: as above.
+        .find(|&a| unsafe { *(a as *const u8) } != PAINT)
+        .unwrap_or(painted);
+    PEAK.store(top - first, Ordering::SeqCst);
+    usize::from(ok) as *mut c_void
+}
+
+/// The two probes of the files' lock and of the least stack.
+fn files_lock_and_stack(fd: i32) -> bool {
+    FD.store(fd as usize, Ordering::SeqCst);
+    let action = SigAction {
+        handler: seen_holding as *const () as u64,
+        mask: 0,
+        flags: 0,
+    };
+    if unsafe { api::sigaction(SIGUSR1, &action, ptr::null_mut()) } != 0 {
+        return failed(696);
+    }
+    let pause = Timespec {
+        tv_sec: 0,
+        tv_nsec: 5_000_000,
+    };
+    let mut id = 0;
+    let mut created = false;
+    abi::shared::probe_hold(|| {
+        HOLDING.store(1, Ordering::SeqCst);
+        created =
+            unsafe { threads::pthread_create(&mut id, ptr::null(), Some(dupper), ptr::null_mut()) }
+                == 0;
+        // The dupper runs while main sleeps and waits for the lock; the
+        // signal comes then.
+        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = api::pthread_kill(id, SIGUSR1);
+        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        HOLDING.store(0, Ordering::SeqCst);
+    });
+    if !created
+        || unsafe { threads::pthread_join(id, ptr::null_mut()) } != 0
+        || DUPED.load(Ordering::SeqCst) != 1
+        || CAUGHT_HOLDING.load(Ordering::SeqCst) != 0
+    {
+        rt::println!(
+            "heap-lock-probe: dup {}, handler saw the holder {}",
+            DUPED.load(Ordering::SeqCst),
+            CAUGHT_HOLDING.load(Ordering::SeqCst)
+        );
+        return failed(697);
+    }
+    let mut attr = core::mem::MaybeUninit::uninit();
+    let mut value = ptr::null_mut();
+    if unsafe { threads::pthread_attr_init(attr.as_mut_ptr()) } != 0
+        || unsafe {
+            threads::pthread_attr_setstacksize(attr.as_mut_ptr(), PTHREAD_STACK_MIN as usize)
+        } != 0
+        || unsafe {
+            threads::pthread_create(&mut id, attr.as_ptr(), Some(small_stack), ptr::null_mut())
+        } != 0
+        || unsafe { threads::pthread_join(id, &mut value) } != 0
+        || value as usize != 1
+    {
+        return failed(698);
+    }
+    rt::println!(
+        "heap-lock-probe: a waiter for the files' lock takes its signal after the holder; file requests with a signal in the section peak at {} of {} bytes of stack",
+        PEAK.load(Ordering::SeqCst),
+        PTHREAD_STACK_MIN
+    );
+    true
 }
 
 pub(super) fn run() -> bool {
@@ -107,6 +228,9 @@ pub(super) fn run() -> bool {
         if unsafe { threads::pthread_join(id, ptr::null_mut()) } != 0 {
             return failed(694);
         }
+    }
+    if !files_lock_and_stack(fd) {
+        return false;
     }
     if ERRORS.load(Ordering::SeqCst) != 0
         || INSIDE.load(Ordering::SeqCst) != 0

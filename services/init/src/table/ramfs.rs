@@ -61,7 +61,7 @@ pub const TABLE: &[Record] = &[
 /// where the holders of the locks of `posix-abi` (buckets, heap, files,
 /// threads, actions) run, so an application thread at main's level never
 /// delays them. Programs on `posix-bridge` (`cprobe`, `busybox-probe`)
-/// take no such lock and leave it empty.
+/// share the record and its ceiling.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     ..TABLE[1]

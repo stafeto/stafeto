@@ -45,8 +45,12 @@ fn stats(channel: &Handle<Channel>) -> (u32, u32) {
 }
 
 fn start_request() -> Writer {
+    sized_start(1)
+}
+
+fn sized_start(max: u32) -> Writer {
     let mut w = Writer::new();
-    ReadRequest { max: 1 }.write_start(&mut w).unwrap();
+    ReadRequest { max }.write_start(&mut w).unwrap();
     w
 }
 
@@ -84,6 +88,55 @@ unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
 
 unsafe extern "C" fn on_signal(_: i32) {
     HANDLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A handler that reads itself: a timed read of 16 bytes, ready 1 ms
+/// later, in two steps nested in the read it interrupted.
+unsafe extern "C" fn reading_handler(_: i32) {
+    HANDLED.fetch_add(1, Ordering::SeqCst);
+    let mut out = [0; 16];
+    let read = abi::long::run(
+        &service(),
+        sized_start(16).as_bytes(),
+        |cancel, key, w| {
+            let method = if cancel {
+                Method::ReadCancel
+            } else {
+                Method::ReadTake
+            };
+            ReadKey { key }.write(method, w)
+        },
+        &mut out,
+    );
+    if read != Ok(16) {
+        INNER_FAILED.fetch_add(1, Ordering::SeqCst);
+    }
+}
+static INNER_FAILED: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether RESULT is `value` within `ms` milliseconds.
+fn result_within(value: u64, ms: usize) -> bool {
+    let pause = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    (0..ms).any(|_| {
+        if RESULT.load(Ordering::SeqCst) == value {
+            return true;
+        }
+        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        false
+    })
+}
+
+fn hold(ms: u32, after_feed: bool) -> bool {
+    let mut w = Writer::new();
+    proto_wire::Header::new(HOLD, VERSION)
+        .write(&mut w)
+        .unwrap();
+    w.u32(ms).unwrap();
+    w.u32(u32::from(after_feed)).unwrap();
+    sys::send(&service(), w.as_bytes()).is_ok()
 }
 
 fn handler(flags: i32) -> bool {
@@ -295,5 +348,60 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         return failed(684);
     }
     rt::println!("long-op-probe: a signal that takes back a queued take cancels the operation");
+    // With SA_RESTART, a signal that takes back the "take" after the bit
+    // (the service holds 50 ms after FEED) sends it again: the service
+    // told once and tells no second time, and the read gets its byte.
+    if !handler(SA_RESTART) || !hold(50, true) {
+        return failed(685);
+    }
+    let Some(id) = waiting_reader() else {
+        return failed(685);
+    };
+    let native = unsafe { threads::probe_native(id) }.expect("reader handle");
+    if !feed(b'j') {
+        return failed(686);
+    }
+    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let queued = sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::Sending);
+    if !queued || api::pthread_kill(id, SIGUSR1) != 0 || !result_within(u64::from(b'j'), 1000) {
+        rt::println!(
+            "long-op-probe: second take queued {}, result {:#x}",
+            queued,
+            RESULT.load(Ordering::SeqCst)
+        );
+        return failed(687);
+    }
+    joined(id);
+    rt::println!("long-op-probe: a second take taken back with SA_RESTART goes again");
+    // A handler without SA_RESTART that reads itself leaves the mark of
+    // the read it interrupted: that read ends with EINTR.
+    let action = SigAction {
+        handler: reading_handler as *const () as u64,
+        mask: 0,
+        flags: 0,
+    };
+    if unsafe { api::sigaction(SIGUSR1, &action, ptr::null_mut()) } != 0 {
+        return failed(688);
+    }
+    let Some(id) = waiting_reader() else {
+        return failed(688);
+    };
+    if api::pthread_kill(id, SIGUSR1) != 0
+        || !result_within(0x1000 + EINTR as u64, 1000)
+        || INNER_FAILED.load(Ordering::SeqCst) != 0
+    {
+        rt::println!(
+            "long-op-probe: outer read {:#x} after a reading handler",
+            RESULT.load(Ordering::SeqCst)
+        );
+        return failed(689);
+    }
+    joined(id);
+    if stats(&channel) != (0, 0)
+        || unsafe { api::sigaction(SIGUSR1, &restored, ptr::null_mut()) } != 0
+    {
+        return failed(689);
+    }
+    rt::println!("long-op-probe: a handler that reads keeps the interrupted read's EINTR");
     true
 }

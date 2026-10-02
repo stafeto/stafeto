@@ -136,56 +136,63 @@ fn allocate(heap: &mut Allocator, size: usize, alignment: usize) -> Result<NonNu
     heap.allocate(size, alignment)
 }
 
-fn perform(
-    heap: &mut Allocator,
-    op: u64,
-    size: usize,
-    alignment: usize,
-    pointer: *mut u8,
-) -> Result<usize, Error> {
-    match op {
-        ALLOC | ZERO => {
-            let result = allocate(heap, size, alignment)?;
-            if op == ZERO {
-                // SAFETY: result owns at least size writable bytes.
-                unsafe { result.as_ptr().write_bytes(0, size) };
-            }
-            Ok(result.as_ptr() as usize)
-        }
-        REALLOC => {
-            let Some(pointer) = NonNull::new(pointer) else {
-                return allocate(heap, size, FUNDAMENTAL_ALIGNMENT).map(|p| p.as_ptr() as usize);
-            };
-            // SAFETY: realloc callers supply a live allocation from this heap.
-            match unsafe { heap.reallocate(pointer, size) } {
-                Ok(result) => Ok(result.as_ptr() as usize),
-                Err(Error::NoMemory) => {
-                    let alignment = unsafe { Allocator::alignment(pointer) };
-                    grow(heap, Allocator::required(size, alignment)?, alignment)?;
-                    unsafe { heap.reallocate(pointer, size) }.map(|p| p.as_ptr() as usize)
-                }
-                Err(error) => Err(error),
-            }
-        }
-        FREE => {
-            if let Some(pointer) = NonNull::new(pointer) {
-                // SAFETY: free callers supply a uniquely live allocation from this heap.
-                unsafe { heap.deallocate(pointer) };
-            }
-            Ok(0)
-        }
-        _ => Err(Error::InvalidAlignment),
+fn errno(error: Error) -> i32 {
+    match error {
+        Error::NoMemory => ENOMEM,
+        Error::InvalidAlignment => EINVAL,
     }
 }
 
+/// The work under the heap's lock is the list of the allocator alone: the
+/// zeroing of `calloc` and the copy of a moving `realloc` run after the
+/// section, on a block only the caller holds, so that a large one keeps
+/// no other thread of the process off the heap or below the ceiling.
 fn request(op: u64, size: usize, alignment: usize, pointer: *mut u8) -> Result<*mut u8, i32> {
     if !READY.load(Ordering::Acquire) {
         return Err(ENOMEM);
     }
-    match heap(|heap| perform(heap, op, size, alignment, pointer)) {
-        Ok(value) => Ok(value as *mut u8),
-        Err(Error::NoMemory) => Err(ENOMEM),
-        Err(Error::InvalidAlignment) => Err(EINVAL),
+    match op {
+        ALLOC | ZERO => {
+            let block = heap(|heap| allocate(heap, size, alignment)).map_err(errno)?;
+            if op == ZERO {
+                // SAFETY: the block owns at least size writable bytes and is
+                // the caller's alone.
+                unsafe { block.as_ptr().write_bytes(0, size) };
+            }
+            Ok(block.as_ptr())
+        }
+        REALLOC => {
+            let Some(old) = NonNull::new(pointer) else {
+                return heap(|heap| allocate(heap, size, FUNDAMENTAL_ALIGNMENT))
+                    .map(|p| p.as_ptr())
+                    .map_err(errno);
+            };
+            // SAFETY: realloc callers supply a live allocation from this heap.
+            let (kept, alignment) =
+                unsafe { (Allocator::requested(old), Allocator::alignment(old)) };
+            if size <= kept {
+                // In place, under the lock: no copy.
+                // SAFETY: as above.
+                return heap(|heap| unsafe { heap.reallocate(old, size) })
+                    .map(|p| p.as_ptr())
+                    .map_err(errno);
+            }
+            let new = heap(|heap| allocate(heap, size, alignment)).map_err(errno)?;
+            // SAFETY: both blocks are live and the caller's alone; the new
+            // one holds at least `size` > `kept` bytes.
+            unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), new.as_ptr(), kept) };
+            // SAFETY: the old block is live and goes once.
+            heap(|heap| unsafe { heap.deallocate(old) });
+            Ok(new.as_ptr())
+        }
+        FREE => {
+            if let Some(pointer) = NonNull::new(pointer) {
+                // SAFETY: free callers supply a uniquely live allocation from this heap.
+                heap(|heap| unsafe { heap.deallocate(pointer) });
+            }
+            Ok(ptr::null_mut())
+        }
+        _ => Err(EINVAL),
     }
 }
 

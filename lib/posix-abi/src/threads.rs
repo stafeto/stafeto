@@ -499,8 +499,8 @@ fn close_raw(raw: u64) {
 pub fn set_level(level: u8) -> Result<(), i32> {
     let block = own_block();
     let thread = Handle::<Thread>::borrowed(rt::abi::Handle(block.thread.load(Ordering::Relaxed)));
-    // Strictly below the ceiling, where the lock of a bucket and the
-    // helpers of the layer run: no application thread ties with them.
+    // Strictly below the ceiling, where the holders of the layer's locks
+    // run: no application thread ties with them.
     if level == 0 || level >= crate::ceiling().map_err(|_| EIO)? {
         return Err(EINVAL);
     }
