@@ -187,4 +187,13 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::ramfs::LONG,
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,
+    super::ramfs::RTBENCH_CHILDREN[0],
+    super::ramfs::RTBENCH_CHILDREN[1],
+    super::ramfs::RTBENCH_CHILDREN[2],
+    super::ramfs::RTBENCH_CHILDREN[3],
+    super::ramfs::RTBENCH_CHILDREN[4],
+    super::ramfs::RTBENCH_CHILDREN[5],
+    super::ramfs::RTBENCH_CHILDREN[6],
+    super::ramfs::RTBENCH_CHILDREN[7],
+    super::ramfs::RTBENCH_CHILDREN[8],
 ];

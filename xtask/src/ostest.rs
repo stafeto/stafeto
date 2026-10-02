@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! `cargo xtask os-test`: the io and malloc suites of os-test
+//! `cargo xtask os-test`: the io, malloc and signal suites of os-test
 //! (tools/build-os-test.py) on relibc, one test a boot of QEMU (init has
 //! no order among its programs). A test's outcome is what os-test's
 //! misc/run.sh writes: its output, then `exit: N` when the output is empty
@@ -330,7 +330,7 @@ fn write(rows: &[(String, Verdict, String)]) -> Result<PathBuf, String> {
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut text = format!(
-        "os-test io and malloc on relibc (commit {}): {}\n\n| test | result | outcome |\n|---|---|---|\n",
+        "os-test io, malloc and signal on relibc (commit {}): {}\n\n| test | result | outcome |\n|---|---|---|\n",
         crate::rtbench2::commit(),
         score(rows)
     );

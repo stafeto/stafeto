@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 """Compile os-test's suites for stafeto (`cargo xtask os-test`): Sortix's
-os-test (ISC) at a pinned commit, its io and malloc suites, each test with
+os-test (ISC) at a pinned commit, its io, malloc and signal suites, each test with
 relibc's headers (target/relibc/sysroot, cargo xtask relibc) into an
 object of its own under target/os-test/objects. A test that does not
 compile gets os-test's outcome for it (compile.sh: missing_header,
@@ -21,7 +21,7 @@ import subprocess
 
 REPOSITORY = "https://gitlab.com/sortix/os-test.git"
 COMMIT = "f8144f0215ea265fd46281e29271d8e857a6856e"
-SUITES = ("io", "malloc")
+SUITES = ("io", "malloc", "signal")
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "os-test"
 SOURCE = WORK / "source"
@@ -76,7 +76,7 @@ def outcome(errors: str, source: str) -> str:
 
 
 def fetch() -> None:
-    if SOURCE.exists() and subprocess.run(
+    if SOURCE.exists() and all((SOURCE / suite).exists() for suite in SUITES) and subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=SOURCE, capture_output=True,
             text=True).stdout.strip() == COMMIT:
         return
@@ -100,7 +100,7 @@ def fetch() -> None:
 def main() -> None:
     if not (INCLUDE / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
-    config = f"{COMMIT} relibc {relibc_commit()} {' '.join(FLAGS)}\n"
+    config = f"{COMMIT} {SUITES} relibc {relibc_commit()} {' '.join(FLAGS)}\n"
     if STAMP.exists() and STAMP.read_text() == config and LIST.exists():
         print(f"os-test objects ready: {LIST}")
         return

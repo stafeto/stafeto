@@ -1512,7 +1512,16 @@ mod tests {
                     "clock",
                     "uart",
                     "rtbench-load",
-                    "rtbench-posix"
+                    "rtbench-posix",
+                    "rtbench-target",
+                    "rtbench-quick",
+                    "rtbench-exiter",
+                    "rtbench-wait1",
+                    "rtbench-wait2",
+                    "rtbench-wait3",
+                    "rtbench-wait4",
+                    "rtbench-wait5",
+                    "rtbench-wait6"
                 ]
             );
         }

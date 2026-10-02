@@ -415,4 +415,70 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     LONG,
     LOAD,
     RTBENCH,
+    RTBENCH_CHILDREN[0],
+    RTBENCH_CHILDREN[1],
+    RTBENCH_CHILDREN[2],
+    RTBENCH_CHILDREN[3],
+    RTBENCH_CHILDREN[4],
+    RTBENCH_CHILDREN[5],
+    RTBENCH_CHILDREN[6],
+    RTBENCH_CHILDREN[7],
+    RTBENCH_CHILDREN[8],
 ];
+
+/// The children of rtbench 2 (S10 to S13), which start on demand.
+pub const RTBENCH_CHILDREN: [Record; 9] = [
+    Record {
+        name: "rtbench-target",
+        args: b"rtbench-posix\0target\0",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-quick",
+        args: b"rtbench-posix\0quick\0",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-exiter",
+        args: b"rtbench-posix\0exiter\0",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait1",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait2",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait3",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait4",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait5",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait6",
+        ..RTBENCH_CHILD
+    },
+];
+
+/// A child of rtbench 2 (S10 to S13), which starts on demand: the
+/// benchmark under a role named by its first argument. The table holds
+/// 16 records, so a group of seven (`target` and the six `wait`) is the
+/// largest one the benchmark can start.
+pub const RTBENCH_CHILD: Record = Record {
+    name: "rtbench-wait1",
+    program: "rtbench-posix",
+    args: b"rtbench-posix\0wait\0",
+    connects: &["ramfs", "clock", "posix", "uart"],
+    quota: 512 * PAGE,
+    on_demand: true,
+    ..POSIX
+};

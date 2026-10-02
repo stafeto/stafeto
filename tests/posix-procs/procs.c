@@ -43,6 +43,9 @@
  * gives it back, and setuid(65534) takes it for good: the call right after
  * a change of the credentials sees the new ones.
  *
+ * Stage 6, churn: 1100 children one after the other, so that the
+ * identity sessions of the ended do not fill the service's channel.
+ *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
 #include <errno.h>
@@ -549,6 +552,21 @@ static void waits(pid_t child) {
     reap("a zombie procs-child", zombies[2], 0, 0);
 }
 
+/* Stage 6: more children than the service has places for sessions, one
+ * after the other (1100; the identity sessions of the ended stay in the
+ * service until it receives their ends: its 1024 places fill without it). */
+static void churn(void) {
+    for (int i = 0; i < 1100; i++) {
+        pid_t pid = start("/boot/procs-exit7");
+        if (pid < 0) {
+            printf("posix-procs: the %dth child did not start\n", i);
+            return;
+        }
+        reap("a child of the churn", pid, 7, 0);
+        if (failures) return;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) return role(argv[1]);
     pid_t child = 0;
@@ -586,6 +604,7 @@ int main(int argc, char **argv) {
     waits(child);
     kills(sleeper);
     groups();
+    churn();
     clock_rights();
     wave();
     if (failures == 0) printf("posix-procs: ok\n");
