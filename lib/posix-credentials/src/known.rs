@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The credentials of a client that a service remembers (spec 2, 3.1,
-//! "Учётные данные не устаревают"): the answer to Who comes with the
-//! generation of the record's credentials, which the process service
-//! raises before it answers a change; the service reads that generation
-//! from the page it maps (Acquire, no call) before each check and asks
-//! Who again only when it moved. A request sent after `setuid` returned
+//! The credentials of a client that a service remembers, never stale: the
+//! answer of the process service (Vouch) comes with the generation of the
+//! record's credentials, which the service raises before it answers a
+//! change; the asking service reads that generation from the page it maps
+//! (Acquire, no call) before each check and asks again only when it moved. A request sent after `setuid` returned
 //! is checked by the new credentials, as the generation was raised
 //! before `setuid` was answered.
 
 use proto_process::{Credentials, RECORDS, WhoReply};
 
-/// What Who said of a client: its PID, credentials and their generation.
+/// What Vouch said of a client: its PID, credentials and their generation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Known {
     answer: Option<WhoReply>,
@@ -25,7 +24,7 @@ impl Known {
 
     /// The client's credentials now: the remembered ones while `generation`
     /// (the page's word of the remembered PID's record, `Acquire`) stands,
-    /// else what `ask` (one Who) says, which is remembered. None when `ask`
+    /// else what `ask` (one Vouch) says, which is remembered. None when `ask`
     /// has no answer; nothing is remembered then.
     pub fn credentials(
         &mut self,
@@ -62,7 +61,7 @@ mod tests {
         }
     }
 
-    /// Who is asked once while the generation of the record stands, and
+    /// Vouch is asked once while the generation of the record stands, and
     /// again, once, after it moved; the new credentials are those of the
     /// new answer.
     #[test]
@@ -88,7 +87,7 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(check(&mut known), Some(0));
         }
-        assert_eq!(asked.get(), 1, "one Who for a hundred checks");
+        assert_eq!(asked.get(), 1, "one Vouch for a hundred checks");
         // seteuid: the service raised the word before it answered.
         page.set(6);
         euid.set(65534);
@@ -98,7 +97,7 @@ mod tests {
             "the new credentials at once"
         );
         assert_eq!(check(&mut known), Some(65534));
-        assert_eq!(asked.get(), 2, "one Who for the change");
+        assert_eq!(asked.get(), 2, "one Vouch for the change");
         assert_eq!(known.pid(), Some(300));
     }
 
@@ -114,7 +113,7 @@ mod tests {
                 .map(|c| c.euid),
             Some(0)
         );
-        // The record's word moved and Who failed: no credentials, and the
+        // The record's word moved and Vouch failed: no credentials, and the
         // old ones do not stand in for them.
         assert_eq!(known.credentials(|_| 1, || None), None);
         assert_eq!(known.pid(), None);

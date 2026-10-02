@@ -87,7 +87,7 @@ pub struct Record<P> {
     /// The ceiling of its process.
     pub ceiling: u8,
     /// Its process group and session: those of its parent, or its own PID
-    /// for a record of init's table (5b T5 changes them).
+    /// for a record of init's table.
     pub pgid: u32,
     pub sid: u32,
     /// The index of its parent's record while the parent lives.

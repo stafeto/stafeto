@@ -192,7 +192,7 @@ fn main(_: u64) -> u64 {
         return 4;
     }
     let level = sys::thread_info(&start.thread).map_or(1, |i| i.base);
-    make::set_handles(&channel, &start.process, &start.parent, level);
+    make::set_handles(&channel, &start.process, &start.parent, level, &identities);
     if adopt::start(&start.process, level).is_err() || spawn::start(&start.process, level).is_err()
     {
         return 6;
@@ -364,11 +364,6 @@ impl Processes {
                 self.level,
             )
         });
-        // The end of an identity session waits in its channel, which no
-        // loop receives on, and the session stays until it is received:
-        // empty the channel, the earlier ends of a record each once, so
-        // that the sessions of the processes that went do not fill it.
-        while sys::try_receive(&self.identities).is_ok() {}
         // The identity session: the process gives copies of it (DUPLICATE)
         // to the services it asks something of, which have it vouched for.
         let who = sys::handle_label(

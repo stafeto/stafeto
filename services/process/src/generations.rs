@@ -6,7 +6,7 @@
 //! the service maps for writing at its own address and gives the services
 //! that ask (Register) a read-only copy of. The service raises a record's
 //! word with Release when it makes the record and before it answers a
-//! change of its credentials; a service that remembers Who's answer reads
+//! change of its credentials; a service that remembers the answer of Vouch reads
 //! the word with Acquire, with no call, before each check. The words never
 //! start over: a record made in a used index raises its word.
 

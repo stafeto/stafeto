@@ -3,7 +3,7 @@
 The README gives the short status. This page keeps the details that are
 useful when working on the code: what the kernel offers, what the Rust
 POSIX layer covers, and which commands check each piece. It describes
-`main` at 764be2a, with the process service of step 5b added.
+`main` at 5e26124 with step 5b (the process service) on top.
 
 ## Kernel
 
@@ -120,7 +120,7 @@ provides the C side of each.
 | Threads | `pthread_create`/`join`/`detach`/`exit`, deferred cancellation and cleanup handlers, keys, `pthread_once`, 64 live threads | [threads](../notes/m2-rust-posix-threads.md), [cancel](../notes/m2-rust-posix-deferred-cancel.md), [keys](../notes/m2-rust-posix-thread-data.md), [once](../notes/m2-rust-posix-once.md), [capacity](../notes/m2-rust-posix-thread-capacity.md) |
 | Mutexes and time | NORMAL, ERRORCHECK and RECURSIVE mutexes, `pthread_mutex_timedlock`, `pthread_mutex_clocklock`, `clock_gettime`/`getres`/`settime`, `nanosleep`, `clock_nanosleep` | [mutex](../notes/m2-rust-posix-mutex.md), [timed](../notes/m2-rust-posix-timed-mutex.md), [clocks](../notes/m2-rust-posix-clocks.md), [sleep](../notes/m2-rust-posix-sleep.md) |
 | Signals | `sigaction`, masks, pending sets, `raise`, `pthread_kill`, `sigwait`, `sigwaitinfo`, `sigtimedwait`, `SA_SIGINFO` with a real interrupted context; host-tested pending-signal queues | [upcall](../notes/m2-native-upcall.md), [actions](../notes/m2-rust-posix-signal-actions.md), [sigwait](../notes/m2-rust-posix-sigwait.md), [sigwaitinfo](../notes/m2-rust-posix-sigwaitinfo.md), [context](../notes/m2-rust-posix-handler-context.md), [sigtimedwait](../notes/m2-rust-posix-sigtimedwait.md), [queues](../notes/m2-rust-posix-signal-queues.md) |
-| Processes | `getpid`, `getppid`, real, effective and saved UID/GID (eight calls) through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
+| Processes | `getpid`, `getppid`, `getpgrp` and `getsid(0)` read the process's page of its record; real, effective and saved UID/GID (eight calls) go through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
 | Process lifetime | `posix_spawn` of a boot-image record, `waitpid`, `waitid`, `WNOHANG`, `WIFSIGNALED` apart from `exit(143)`, `kill`, `killpg`, `kill(0)`, `kill(-1)`, `SIGKILL` through the kernel, `SIGCHLD` to `sigwaitinfo`, `setpgid`, `setsid`, `getpgid`, `getsid`, orphans to PID 1 | [m5b](../notes/m5b-processes.md) |
 
 relibc gives conditions, semaphores and stdio over the layer

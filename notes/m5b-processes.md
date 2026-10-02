@@ -25,7 +25,7 @@ checks it on relibc.
 - **`kill`.** The service sets a bit on the target's page of signals and
   asks the kernel to enter the target's router thread (`thread_upcall_request`);
   the layer picks the receiving thread late, by mask. `SIGKILL` goes
-  through `process_kill` and works on a process that blocks everything.
+  through `process_kill_at` at the target's ceiling and works on a process that blocks everything.
   `killpg`, `kill(0)` and `kill(-1)` walk the records in steps that return
   to the service loop between deliveries.
 - **Groups and sessions.** `setpgid`, `setsid`, `getpgid`, `getsid`,
@@ -40,9 +40,10 @@ checks it on relibc.
 A run of rtbench 2 spawns about 1,000 children in ten minutes and stopped
 with `EAGAIN` at the 1,023rd: the end of an identity session waits in its
 channel until it is received, and no loop receives on that channel, so the
-sessions of the processes that went filled its 1,024 places. The service
-now empties the channel when it makes the next identity session (each end
-is received once). The probe `posix-procs` has a stage of 1,100 children
+sessions of the processes that went filled its 1,024 places. The
+receiving and launch threads now empty the channel before each Create
+(each end is received once, on their stack, so no step of the loop grows
+with the number of processes). The probe `posix-procs` has a stage of 1,100 children
 in a row for it.
 
 ## Measurements
@@ -53,6 +54,17 @@ every child is a record of `init`'s table, which holds 16, and a record has
 one live child.
 
 ## Known limits
+
+- **Vouch is bounded, not measured.** Vouch (a service asking who a client
+  is) empties the identity channel before it notifies through the copy it
+  was given and reads the answer: at most 255 ends not yet received (those
+  since the last Create) and 255 notifications of live processes, each one
+  `try_receive`, about 510 kernel calls at the most at the loop's level. The
+  worst case needs 255 processes at once and `init`'s table holds 16, so
+  it is not measured; the longest step of the service under `-icount` with
+  128 children moves to step 5c with `exec`.
+- **Limits of the moment.** A second walk of one sender waits in a queue
+  of 64 places; past them, and past 1,024 long waits, `EAGAIN`.
 
 - **One CPU.** The service tells a notice from a forged one by reading
   which place of its channel a notification came to, between the

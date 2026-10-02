@@ -21,9 +21,9 @@ use rt::{abi, loader, sys};
 /// The boot image the service maps read-only at its start (`set_image`).
 static IMAGE: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 /// The service's channel with no label, its own process, init's channel
-/// and the level of its loop, which the main thread keeps for good
-/// (`set_handles`).
-static OWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// the level of its loop and the channel of the identity sessions, which
+/// the main thread keeps for good (`set_handles`).
+static OWN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// The boot image, `len` bytes mapped at `addr` for as long as the
 /// service lives.
@@ -40,10 +40,12 @@ pub fn set_handles(
     own: &Handle<Process>,
     init: &Handle<Channel>,
     level: u8,
+    identities: &Handle<Channel>,
 ) {
     OWN[0].store(channel.raw().0, Ordering::Relaxed);
     OWN[1].store(own.raw().0, Ordering::Relaxed);
     OWN[2].store(init.raw().0, Ordering::Relaxed);
+    OWN[4].store(identities.raw().0, Ordering::Relaxed);
     OWN[3].store(level.into(), Ordering::Release);
 }
 
@@ -227,6 +229,13 @@ pub unsafe fn make(
         label: None,
     };
     let program = program(name).ok_or(refused(Status::from_code(proto_process::INVALID)))?;
+    // The end of an identity session waits in its channel, which no loop
+    // receives on, and the session stays until it is received: this thread
+    // empties the channel before each Create, so that the sessions of the
+    // processes that went do not fill it and no step of the loop grows
+    // with their number.
+    let identities = Handle::<Channel>::borrowed(abi::Handle(OWN[4].load(Ordering::Acquire)));
+    while sys::try_receive(&identities).is_ok() {}
     let mut w = Writer::new();
     Method::Create.header().write(&mut w).map_err(refused)?;
     create.write(&mut w).map_err(refused)?;

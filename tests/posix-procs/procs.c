@@ -389,7 +389,7 @@ static void on_usr1_info(int signal, siginfo_t *info, void *context) {
     info_pid = info->si_pid;
 }
 
-/* The fixes of the review of T3 and T4. */
+/* Signals that arrive early or with a handler that exits, and a thread that takes a signal after main left. */
 static void wave(void) {
     /* A signal right after posix_spawn, before the child bound its entry. */
     pid_t sleeper = start("/boot/procs-sleeper");

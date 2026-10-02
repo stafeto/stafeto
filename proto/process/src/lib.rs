@@ -122,7 +122,7 @@ pub const INIT_PID: u32 = 1;
 pub const IMAGE: u32 = 1;
 
 /// Which of the record's three places of the service's channel a label
-/// names: its session, its identity session (bit 62, 5b T6), the place of
+/// names: its session, its identity session (bit 62), the place of
 /// the notification of its end (bit 61).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
@@ -377,7 +377,7 @@ impl Create {
 /// record index (see Register).
 pub const GENERATIONS_SIZE: usize = RECORDS * 8;
 
-/// The reply to Who: status u32 (0), the record's PID u32, the six
+/// The reply to Vouch: status u32 (0), the record's PID u32, the six
 /// credentials u32 and the generation of the credentials u64: 40 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WhoReply {
