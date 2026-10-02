@@ -15,6 +15,11 @@ name = "ramfs"
 test = false
 bench = false
 
+[features]
+# The tables of the measurement of the process service's longest step,
+# which holds a crowd of children (xtask process-steps).
+steps = []
+
 [dependencies]
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }

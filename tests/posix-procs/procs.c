@@ -59,6 +59,14 @@
  * children from files, each with the parent's quota from the service's
  * pool).
  *
+ * The steps mode (the table `table-posix-steps`, under -icount): the
+ * longest step of the process service with a crowd of live children
+ * (BRANCHES branches with LEAVES leaves each, every one arming the
+ * notification of its identity session every 400 ms), through kill(-1),
+ * spawn, exec, the ends of all, and a Vouch (an OpenExec of a process that
+ * is no loader) with the identity channel full: xtask process-steps reads
+ * the lines the service prints for each new longest step.
+ *
  * Stage 8, descriptors through posix_spawn (5c): fd 3 with FD_CLOEXEC is
  * closed in the child, fd 4 dup2'd onto itself and fd 5 a copy of it stay
  * open (os-test posix_spawn_file_actions_adddup2); a description the child
@@ -114,6 +122,7 @@ static int failures;
 /* The layer's probes of 5c (posix-crt, posix-platform). */
 void stafeto_start_handles(unsigned long *out);
 int stafeto_probe_open_exec(const char *path);
+int stafeto_probe_notify_identity(void);
 int stafeto_probe_exec_commit(void);
 int stafeto_probe_exec_then_exit(const char *path, char *const argv[], int code);
 int stafeto_probe_exec_outlive(const char *path, char *const argv[]);
@@ -644,8 +653,156 @@ static int exec_spawning(void) {
     return 100 + errno;
 }
 
+/* The steps mode: BRANCHES children, each with LEAVES children of its
+ * own, all armed. */
+#ifndef STEPS_BRANCHES
+#define STEPS_BRANCHES 7
+#endif
+#define STEPS_LEAVES 31
+
+static int steps_spawn(pid_t *pid, const char *role, const char *index) {
+    char *argv[] = {"procs-child", (char *)role, (char *)index, NULL};
+    char *envp[] = {NULL};
+    /* The service loads a few children at once (EAGAIN beyond them). */
+    int e;
+    for (int tries = 0; tries < 5000; tries++) {
+        e = posix_spawn(pid, "/bin/procs-child", NULL, NULL, argv, envp);
+        if (e != EAGAIN) return e;
+        if (tries == 100) printf("posix-procs: steps: 100 EAGAIN of %s\n", role);
+        pause_ms(1);
+    }
+    return e;
+}
+
+/* SIGUSR1 arms the notification of this process's identity session, so
+ * that the next Vouch takes one more entry. */
+static void arm_identity(int signal) {
+    (void)signal;
+    stafeto_probe_notify_identity();
+}
+
+/* The child of the crowd: it arms on each SIGUSR1 and sleeps. */
+static void steps_setup(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = arm_identity;
+    sigaction(SIGUSR1, &action, NULL);
+    /* The first request of the child's session of the RAM files takes the
+     * place its Clone held (the service keeps 64 of them for children that
+     * sent nothing yet). */
+    close(open("/etc/motd", O_RDONLY));
+}
+
+static int steps_armed(void) {
+    steps_setup();
+    for (;;) pause_ms(1000);
+}
+
+/* A branch: its leaves, a stamp of /tmp/probe at its index, then armed. */
+static int steps_branch(void) {
+    int index = atoi(argv_seen[2]);
+    steps_setup();
+    for (int i = 0; i < STEPS_LEAVES; i++) {
+        pid_t pid;
+        int e = steps_spawn(&pid, "armed", "0");
+        if (e != 0) {
+            printf("posix-procs: steps: branch %d leaf %d gave %d (%s)\n", index, i, e, strerror(e));
+            return 50;
+        }
+    }
+    int fd = open("/tmp/probe", O_WRONLY);
+    unsigned char one = 1;
+    if (fd < 0 || pwrite(fd, &one, 1, index) != 1) return 90;
+    close(fd);
+    for (;;) pause_ms(1000);
+}
+
+static int steps_run(void) {
+    int failed = 0;
+    int fd = open("/tmp/probe", O_RDWR);
+    unsigned char zeros[STEPS_BRANCHES] = {0};
+    if (fd < 0 || pwrite(fd, zeros, sizeof zeros, 0) != (ssize_t)sizeof zeros) return 2;
+    pid_t branches[STEPS_BRANCHES];
+    for (int b = 0; b < STEPS_BRANCHES; b++) {
+        char index[8];
+        snprintf(index, sizeof index, "%d", b);
+        int e = steps_spawn(&branches[b], "branch", index);
+        if (e != 0) {
+            printf("posix-procs: steps: branch %d gave %d (%s)\n", b, e, strerror(e));
+            return 3;
+        }
+    }
+    /* The probe's own children, up to the 31 it may keep beside the one
+     * that comes and goes (the service allows 32 to a process). */
+    int own = STEPS_BRANCHES < 7 ? 0 : 31 - STEPS_BRANCHES;
+    for (int i = 0; i < own; i++) {
+        pid_t pid;
+        if (steps_spawn(&pid, "armed", "0") != 0) return 3;
+    }
+    for (int turns = 0;; turns++) {
+        unsigned char stamps[STEPS_BRANCHES] = {0};
+        int ready = pread(fd, stamps, sizeof stamps, 0) == (ssize_t)sizeof stamps;
+        for (int b = 0; ready && b < STEPS_BRANCHES; b++) ready = stamps[b] == 1;
+        if (ready) break;
+        if (turns > 6000) {
+            printf("posix-procs: steps: the branches did not finish\n");
+            return 4;
+        }
+        pause_ms(10);
+    }
+    printf("posix-procs: steps %d children live\n", STEPS_BRANCHES * (STEPS_LEAVES + 1) + own);
+    /* kill(-1) in a loop: signal 0 and a signal that is ignored by default. */
+    for (int i = 0; i < 20; i++) {
+        if (kill(-1, 0) != 0 || kill(-1, SIGCHLD) != 0) {
+            printf("posix-procs: steps: kill(-1) gave %s\n", strerror(errno));
+            failed++;
+            break;
+        }
+    }
+    /* spawn, exec and the end of a child, among the crowd. */
+    for (int i = 0; i < 5; i++) {
+        pid_t pid = -1;
+        if (steps_spawn(&pid, "exit7", "0") != 0) return 5;
+        reap("a child among the crowd", pid, 7, 0);
+        char *exec_argv[] = {"procs-child", "execto", "/bin/procs-child", "exit7", NULL};
+        char *envp[] = {NULL};
+        if (posix_spawn(&pid, "/bin/procs-child", NULL, NULL, exec_argv, envp) != 0) return 5;
+        reap("a child that execs among the crowd", pid, 7, 0);
+    }
+    /* Volleys: SIGUSR1 to the crowd arms every identity session. A change
+     * of the credentials moves their generation, and the clock service
+     * asks the process service who the caller is again (Vouch) when
+     * clock_settime comes: nothing drains the channel before it. */
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) failed++;
+    for (int volley = 0; volley < 5; volley++) {
+        pause_ms(1000);
+        if (kill(-1, SIGUSR1) != 0) failed++;
+        pause_ms(1000);
+        if (seteuid(65534) != 0 || seteuid(0) != 0 || clock_settime(CLOCK_REALTIME, &now) != 0)
+            failed++;
+    }
+    /* The ends of all of them wait in the identity channel for the next
+     * call that drains it. */
+    kill(-1, SIGKILL);
+    pid_t last = -1;
+    if (steps_spawn(&last, "exit7", "0") != 0) return 7;
+    reap("a spawn after the ends", last, 7, 0);
+    for (int b = 0; b < STEPS_BRANCHES; b++) {
+        int status;
+        waitpid(branches[b], &status, 0);
+    }
+    pause_ms(300);
+    failed += failures;
+    printf("posix-procs: steps %s\n", failed ? "failed" : "done");
+    return failed;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
+    if (strcmp(name, "steps") == 0) return steps_run();
+    if (strcmp(name, "branch") == 0) return steps_branch();
+    if (strcmp(name, "armed") == 0) return steps_armed();
     if (strcmp(name, "child") == 0) {
         sigset_t mask;
         sigprocmask(SIG_BLOCK, NULL, &mask);

@@ -394,6 +394,8 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 } else {
                     msgbuf::read(0, bytes);
                 }
+                let kind = steps::kind_of(bytes);
+                let began = steps::begin();
                 request(
                     service,
                     &mut table,
@@ -403,6 +405,7 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                     handles,
                     token,
                 );
+                steps::end(began, kind);
                 continue;
             }
             Ok(Received::Notification {
@@ -417,6 +420,7 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 count,
             },
         };
+        let began = steps::begin();
         match (notice.source, notice.label, &mut beat) {
             (Source::Timer, 0, Some(beat)) => beat.expired(),
             (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
@@ -447,7 +451,88 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
             }
             _ => service.notification(notice),
         }
+        steps::end(began, steps::NOTICE);
     }
+}
+
+/// The longest step of the loop (feature `step-stats`, which only the
+/// images of measurements and tests turn on): the ticks from the return of
+/// `receive` to the handler's end and its reply, for each method of the
+/// protocol and for notifications. A new longest of a kind goes to the
+/// console as a line `service step: kind K N ticks detail D` after the step, so that
+/// the print does not count in it (`report_steps` turns it on); K is the
+/// method, or `NOTICE`.
+#[cfg(feature = "step-stats")]
+mod steps {
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// The kinds: methods below this number, and the notifications.
+    pub const NOTICE: usize = 64;
+    const KINDS: usize = NOTICE + 1;
+    static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// A number the handler of the step gives (`super::step_detail`), for
+    /// the line a new longest prints.
+    static DETAIL: AtomicU64 = AtomicU64::new(0);
+    /// Whether a new longest goes to the console: the service that asked.
+    static REPORT: AtomicBool = AtomicBool::new(false);
+
+    pub fn report() {
+        REPORT.store(true, Ordering::Relaxed);
+    }
+
+    pub fn detail(value: u64) {
+        DETAIL.store(value, Ordering::Relaxed);
+    }
+
+    /// The kind of a request: its method, or the last place for a request
+    /// whose header is short or whose method is past the table.
+    pub fn kind_of(bytes: &[u8]) -> usize {
+        match super::Header::read(&mut super::Reader::new(bytes)) {
+            Ok(header) if (header.method as usize) < NOTICE => header.method as usize,
+            _ => NOTICE - 1,
+        }
+    }
+
+    pub fn begin() -> u64 {
+        super::time::now()
+    }
+
+    pub fn end(began: u64, kind: usize) {
+        let took = super::time::now().saturating_sub(began);
+        let detail = DETAIL.swap(0, Ordering::Relaxed);
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && REPORT.load(Ordering::Relaxed)
+        {
+            crate::println!("service step: kind {kind} {took} ticks detail {detail}");
+        }
+    }
+}
+
+#[cfg(not(feature = "step-stats"))]
+mod steps {
+    pub const NOTICE: usize = 0;
+    pub fn kind_of(_: &[u8]) -> usize {
+        0
+    }
+    pub fn begin() -> u64 {
+        0
+    }
+    pub fn end(_: u64, _: usize) {}
+    pub fn detail(_: u64) {}
+    pub fn report() {}
+}
+
+/// Makes the loop of this service print each new longest step (feature
+/// `step-stats`; nothing without it): the images with several services
+/// that count their steps get the lines of the one that asked.
+pub fn report_steps() {
+    steps::report();
+}
+
+/// Tells the line of the longest step a number of this step, such as the
+/// entries a handler took off a channel (feature `step-stats`; nothing
+/// without it).
+pub fn step_detail(value: u64) {
+    steps::detail(value);
 }
 
 /// Hands the request in `bytes` of the client `label` to `service`, and

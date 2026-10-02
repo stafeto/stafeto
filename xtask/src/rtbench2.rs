@@ -21,7 +21,7 @@ use crate::{
 
 /// The rows of a run, in its order: each comes once, as numbers or as
 /// `none` with the reason the layer has no such operation yet.
-pub const ROWS: [&str; 27] = [
+pub const ROWS: [&str; 28] = [
     "s1_mutex_alone",
     "s2_futex_wake_idle",
     "s3_mutex_rival_10",
@@ -44,6 +44,7 @@ pub const ROWS: [&str; 27] = [
     "s11_exit_to_waitpid",
     "s12_killpg_group_32",
     "s13_spawn_to_main",
+    "s14_exec_to_main",
     "fork_exec_waitpid",
     "timer_1ms",
     "inheritance_chain",

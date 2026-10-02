@@ -24,6 +24,9 @@ adoption-refusals = []
 # The probe of POSIX processes whose service ended: the service ends before
 # it registers (xtask posix-orphans).
 exit-early = []
+# The longest step of the loop for each method, printed when it grows (rt
+# feature step-stats; xtask process-steps, under -icount).
+steps = ["rt/step-stats"]
 
 [dependencies]
 proto-process = { path = "../../proto/process" }

@@ -43,7 +43,8 @@
  * _exit of a child to the return of waitpid of the parent, which holds
  * one write of the child's stamp (an upper bound); S12 killpg to a group
  * of 32, to the last waitpid of its members; S13 posix_spawn from a file
- * to the first statement of the child's main.
+ * to the first statement of the child's main; S14 execve of a child, from
+ * the call to the first statement of the new image's main.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -662,10 +663,11 @@ static int service_round_trip(void) {
 #define STAMP_HANDLER 0
 #define STAMP_READY 8
 #define STAMP_MAIN 16
+#define STAMP_EXEC 24
 #define STAMP_EXIT 32
 #define GROUP 32
 
-static struct histogram s10[2], s11[2], s12, s13;
+static struct histogram s10[2], s11[2], s12, s13, s14;
 static int probe_fd = -1;
 
 static int put_stamp(int fd, off_t offset, uint64_t value) {
@@ -790,6 +792,23 @@ static int spawn_and_wait(void) {
     return 0;
 }
 
+/* S14: 20 children that stamp the clock, then exec the quick role. */
+static int exec_to_main(void) {
+    for (int i = 0; i < 20; i++) {
+        pid_t pid = -1;
+        if (clear_stamps() || spawn_child(&pid, "execer", 0, 0)) return 1;
+        if (await_stamp(STAMP_MAIN, "S14 new image did not start")) return 1;
+        uint64_t from = get_stamp(STAMP_EXEC), to = get_stamp(STAMP_MAIN);
+        if (from == 0 || to < from) {
+            fail("S14 stamps", 0);
+            return 1;
+        }
+        record(&s14, ticks_ns(to - from));
+        if (reaped(pid, 0, 0, "S14 waitpid of the new image") != 1) return 1;
+    }
+    return 0;
+}
+
 /* S11, the second half: from the stamp before the child's _exit to waitpid. */
 static int exit_to_wait(void) {
     for (int i = 0; i < 20; i++) {
@@ -842,6 +861,7 @@ static int processes(void) {
     if (!error) error = kill_process(0, &s10[0]);
     if (!error) error = kill_process(1, &s10[1]);
     if (!error) error = spawn_and_wait();
+    if (!error) error = exec_to_main();
     if (!error) error = exit_to_wait();
     if (!error) error = kill_group();
     error |= rtbench_level(MAIN_LEVEL);
@@ -868,6 +888,14 @@ static int child(uint64_t entered, const char *role) {
     int fd = open("/tmp/probe", O_WRONLY);
     if (fd < 0) return 2;
     if (strcmp(role, "quick") == 0) return put_stamp(fd, STAMP_MAIN, entered) ? 3 : 0;
+    if (strcmp(role, "execer") == 0) {
+        char *argv[] = { "rtbench-posix", "quick", NULL };
+        char *envp[] = { NULL };
+        put_stamp(fd, STAMP_EXEC, ticks());
+        close(fd);
+        execve("/bin/rtbench-posix", argv, envp);
+        return 5;
+    }
     if (strcmp(role, "exiter") == 0) {
         put_stamp(fd, STAMP_EXIT, ticks());
         _exit(0);
@@ -923,7 +951,8 @@ static void report(void) {
     row("s11_exit_to_waitpid", &s11[1], 0);
     row("s12_killpg_group_32", &s12, 0);
     row("s13_spawn_to_main", &s13, 0);
-    none("fork_exec_waitpid", "fork and exec come with 5c and 5d");
+    row("s14_exec_to_main", &s14, 0);
+    none("fork_exec_waitpid", "fork comes with 5d");
     none("timer_1ms", "POSIX timers come with 5h");
     none("inheritance_chain", "priority inheritance comes with 5h");
     struct line l = { .length = 0 };

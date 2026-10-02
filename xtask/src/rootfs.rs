@@ -212,6 +212,15 @@ fn procs() -> Vec<RootFile> {
     ]
 }
 
+/// The probe of the longest step of the process service (5c): the probe
+/// itself as the file its children run.
+fn steps() -> Vec<RootFile> {
+    vec![
+        dir("/bin"),
+        file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
+    ]
+}
+
 /// rtbench 2 (5c): the benchmark's children are files of it, the program
 /// itself under a role its first argument names.
 fn rtbench() -> Vec<RootFile> {
@@ -293,6 +302,7 @@ pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "boot-posix-steps.img",
     "rtbench-posix.img",
     "rtbench-posix-vz.img",
     "rtbench-posix-short.img",
@@ -304,6 +314,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" => procs(),
+        "boot-posix-steps.img" => steps(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
     }
@@ -404,6 +415,7 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
                 "rtbench-posix.img" | "rtbench-posix-short.img" => &crate::RTBENCH_POSIX_PROGRAMS,
                 "rtbench-posix-vz.img" => &crate::RTBENCH_POSIX_VZ_PROGRAMS,
                 other => panic!("no programs known for {other}"),

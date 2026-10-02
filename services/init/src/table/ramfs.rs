@@ -242,6 +242,43 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     },
 ];
 
+/// The probe of the longest step of the process service (tests/posix-procs
+/// in the steps mode, xtask process-steps): the pool for the crowd of
+/// children it starts from files, each with the probe's quota, and one
+/// more for the child that execs among them.
+pub const POSIX_STEPS_TABLE: &[Record] = &[
+    // The RAM and clock services have tables of 320 sessions on stacks of
+    // 512 and 256 KiB (feature `steps`).
+    Record {
+        quota: 512 * PAGE,
+        ..TABLE[0]
+    },
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + (STEPS_CHILDREN + 2) * STEPS_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    Record {
+        quota: 192 * PAGE,
+        ..POSIX_ABI_TABLE[2]
+    },
+    Record {
+        name: "posix-procs",
+        program: "posix-procs",
+        args: b"posix-procs\0steps\0",
+        connects: &["ramfs", "clock", "posix"],
+        root: true,
+        quota: STEPS_QUOTA,
+        ..POSIX
+    },
+];
+
+/// The children of the steps probe: its 7 branches with their leaves, 32
+/// each, and 24 of its own (tests/posix-procs STEPS_BRANCHES).
+const STEPS_CHILDREN: u64 = 7 * 32 + 24;
+
+/// The quota of the steps probe, which each child it spawns gets too.
+const STEPS_QUOTA: u64 = 256 * PAGE;
+
 /// The quota of the probe of POSIX processes, which each child it spawns
 /// from a file gets too (5c).
 const PROCS_QUOTA: u64 = 512 * PAGE;

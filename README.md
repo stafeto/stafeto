@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from step 5a′ (`m5a2-relibc`).
+Numbers below are from step 5c (`m5c-spawn-exec`).
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -62,7 +62,7 @@ crashes the driver, `init` restarts it and the shell reconnects. Separate
 images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
 and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
 links statically with relibc over the Rust POSIX layer; `ash` reports
-`can't fork` for commands outside BusyBox until `exec` and `fork` come.
+`can't fork` for commands outside BusyBox until `fork` comes.
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
 interface. The C library is relibc (a fork pinned by
@@ -85,9 +85,17 @@ QEMU and Apple VZ.
 
 **Processes.** The process service creates every POSIX process, keeps its
 record (256 of them; PID = index + 256 * generation, never 1) and hands
-out its sessions. `posix_spawn` starts a program of the boot image
-(`/boot/<name>`) as a child, with `POSIX_SPAWN_SETPGROUP` and
-`POSIX_SPAWN_SETSID`; `waitpid`, `waitid` and `WNOHANG` take zombies and
+out its sessions. `posix_spawn` and `exec` start a program from a file of
+the RAM file service: a loader in the new process opens the file through
+a session that only `init` and the process service hand out, maps its
+segments and jumps; an error before the image is ready comes back from
+`posix_spawn`, a set-ID file sets the new process's IDs, and the parent
+holds no handle of the child. A spawned child shares the open
+descriptions its parent keeps; `exec` keeps the PID, the open files and
+the mask, and an `exec` that fails leaves the old image whole.
+`posix_spawn` takes `POSIX_SPAWN_SETPGROUP`, `SETSID`, `SETSIGMASK`,
+`SETSIGDEF`, `RESETIDS` and file actions; `waitpid`, `waitid` and
+`WNOHANG` take zombies and
 tell an exit from a death by a signal (`WIFSIGNALED` for `SIGTERM` differs
 from `exit(143)`); `kill`, `killpg`, `kill(0)` and `kill(-1)` reach any
 process, a handler runs on the target's router thread, and `SIGKILL`
@@ -95,16 +103,18 @@ works on a child that blocks every signal; `SIGCHLD` carries the child's
 PID and status to `sigwaitinfo`. Process groups and sessions follow
 `setpgid`, `setsid`, `getpgid` and `getsid`; orphans go to PID 1, which
 the service itself plays. The clock service asks the process service for
-the effective UID before `clock_settime`. The C probe `posix-procs` and
-`rtbench` rows S10 to S13 check it. `fork` and `exec` are not there yet;
-[notes/m5b-processes.md](notes/m5b-processes.md) lists the limits.
+the effective UID before `clock_settime`. The C probe `posix-procs`,
+`cargo xtask process-steps` and `rtbench` rows S10 to S14 check it. `fork`
+is not there yet; [notes/m5b-processes.md](notes/m5b-processes.md) and
+[notes/m5c-spawn-exec.md](notes/m5c-spawn-exec.md) list the limits.
 
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
-os-test's io, malloc and signal suites run on it in `ci`, one test a
-boot: 33 pass, 39 fail (38 at `mkstemp`: the RAM service creates no file
-yet; one at `sigaltstack`) and 18 need `fork`, `exec` or pipes; `ci` fails
-when a test that passed stops passing. relibc
+os-test's io, malloc, signal, `basic/spawn` and `basic/unistd` `exec*`
+suites run on it in `ci` from files, one boot a suite: 63 pass, 48 fail
+(`mkstemp`, `access`, `sigaltstack`: the RAM service creates no file yet)
+and 9 need `fork` or pipes; `ci` fails when a test that passed stops
+passing. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
 [docs/status.md](docs/status.md).
@@ -123,8 +133,11 @@ Apple silicon.
   driver.
 - One CPU core only; no SMP.
 - No PinePhone port yet.
-- `ash` cannot start external programs: no `exec`, `fork` or pipes; a
-  program starts others only by `posix_spawn` from the boot image.
+- `ash` cannot start external programs: BusyBox runs them through `fork`,
+  and `fork` and pipes are not there yet; a program starts others by
+  `posix_spawn` and `exec` from files.
+- About 60 POSIX processes at once: the RAM file and clock services keep
+  64 sessions each; the process service itself holds 256 records.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 
@@ -207,8 +220,9 @@ Bounded kernel paths and their costs:
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
 | POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
-| POSIX: process service | process service, `posix_spawn` from the boot image, `waitpid`, `kill`, process groups and sessions | 🚧 [#76](https://github.com/stafeto/stafeto/pull/76) |
-| POSIX: spawn and fork | `posix_spawn` and `exec` from files, then `fork` | ⬜ |
+| POSIX: process service | process service, `posix_spawn` from the boot image, `waitpid`, `kill`, process groups and sessions | ✅ [#76](https://github.com/stafeto/stafeto/pull/76) |
+| POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | 🚧 branch `m5c-spawn-exec`, pull request to come |
+| POSIX: fork | `fork` with the loader copying the parent | ⬜ |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |

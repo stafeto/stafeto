@@ -373,6 +373,27 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
     ("loader", "loader", 0, &[]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
+/// The probe of the longest step of the process service (xtask
+/// process-steps): the probe in its steps mode, and the process service
+/// that prints each new longest step.
+const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
+    ("ramfs", "ramfs", 512 * 1024, &["steps"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["steps"],
+    ),
+    (
+        "posix-clock-service",
+        "posix-clock-service",
+        256 * 1024,
+        &["steps"],
+    ),
+    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
+];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
@@ -479,6 +500,8 @@ const KERNEL_LIMIT: u64 = 200 * 1024;
 /// limit of their own still catches a runaway growth.
 const TEST_KERNEL_LIMIT: u64 = 512 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The crowd of the steps probe under -icount, on the host's clock.
+const STEPS_TIMEOUT: Duration = Duration::from_secs(600);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
@@ -857,6 +880,8 @@ commands:
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
             boot image and from files through the process service
+  process-steps run the probe of the longest step of the process service
+            under -icount with a crowd of children
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -914,6 +939,16 @@ fn main() {
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("process-steps") => match &args[1..] {
+            [] => process_steps(&qemu::VIRT, 7),
+            [n] => n
+                .parse()
+                .ok()
+                .filter(|n| (1..=7).contains(n))
+                .ok_or_else(|| "process-steps expects 1..=7 branches".to_owned())
+                .and_then(|n| process_steps(&qemu::VIRT, n)),
+            _ => Err("process-steps [branches]".to_owned()),
+        },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
@@ -1988,6 +2023,117 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
+/// The kinds of the lines `service step: kind K N ticks detail D` of the
+/// process service, by the numbers of proto_process::Method.
+const STEP_KINDS: [(usize, &str); 12] = [
+    (1, "Create"),
+    (13, "Kill"),
+    (21, "Vouch"),
+    (22, "SpawnStart"),
+    (23, "Boot"),
+    (24, "Take"),
+    (25, "SpawnCommit"),
+    (28, "ExecStart"),
+    (29, "ExecCommit"),
+    (31, "Replace"),
+    (10, "WaitStart"),
+    (64, "notification"),
+];
+
+/// The longest step of each kind in `lines`: (kind, ticks, detail), the
+/// last line of a kind being its longest, since each prints only when it
+/// grows.
+fn longest_steps(lines: &[String]) -> Vec<(usize, u64, u64)> {
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "step:",
+            "kind",
+            kind,
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+        ] = words.as_slice()
+        else {
+            continue;
+        };
+        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
+        else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(row) => *row = (kind, ticks, detail),
+            None => out.push((kind, ticks, detail)),
+        }
+    }
+    out
+}
+
+/// The longest step of the process service under -icount with the crowd
+/// of children of tests/posix-procs in its steps mode: kill(-1), spawn,
+/// exec, the ends of all, and a Vouch with the identity channel full.
+/// The crowd is `branches` branches of 32 children each (up to 7; with 7,
+/// 24 children of the probe's own beside them).
+/// Prints a row for each kind of step and the Vouch with the entries it
+/// took off the channel, and the numbers go to `target/measure`.
+fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = write_boot_image_with(
+        "boot-posix-steps.img",
+        &POSIX_STEPS_PROGRAMS,
+        BOOT_PROFILE,
+        &[("STEPS_BRANCHES", &branches.to_string())],
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::ICOUNT);
+    let outcome = run_until(
+        cmd,
+        STEPS_TIMEOUT,
+        Some("init: posix-procs ended"),
+        &kernel.elf,
+    )?;
+    let dir = target_dir().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let log = dir.join("process-steps.log");
+    std::fs::write(&log, outcome.lines.join("\n") + "\n")
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    qemu::expect_marker(&outcome, "posix-procs: steps done")?;
+    let rows = longest_steps(&outcome.lines);
+    if rows.is_empty() {
+        return Err("the process service printed no step".into());
+    }
+    // The volleys armed the crowd: the Vouch that follows takes about one
+    // entry for each child.
+    let live = qemu::number_after(&outcome.lines, "posix-procs: steps ").unwrap_or(0);
+    let vouch = rows.iter().find(|(k, ..)| *k == 21).map_or(0, |r| r.2);
+    if vouch < live / 2 {
+        return Err(format!(
+            "the longest Vouch took {vouch} entries off the channel of {live} children"
+        ));
+    }
+    let mut text = String::from("kind method ticks detail\n");
+    for (kind, ticks, detail) in &rows {
+        let name = STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("{kind} {name} {ticks} {detail}\n");
+    }
+    let path = dir.join("process-steps.txt");
+    std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+    print!(
+        "process steps under icount on {}, {live} children live:\n{text}",
+        machine.name
+    );
+    println!("C process steps passed: {}", log.display());
+    Ok(())
+}
+
 fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -2257,6 +2403,8 @@ fn test() -> Result<(), String> {
     relibc_hello_probe()?;
     relibc_threads_probe(&qemu::VIRT)?;
     posix_procs_probe(&qemu::VIRT)?;
+    // The longest step of the process service with 128 children.
+    process_steps(&qemu::VIRT, 4)?;
     // BusyBox on relibc guards the C surface (5a′).
     busybox_probe()?;
     ash_probe()?;

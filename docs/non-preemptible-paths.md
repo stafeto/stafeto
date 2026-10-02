@@ -420,3 +420,32 @@ window that goes.
 | a binding chunk (`irq::clean`) | returns its slot to the channel's limit and its place to its payer's pool of bindings (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | constant | 252 (test build) |
 | a teardown that a thread at a high level starts (`process_kill`, the last handle to a big process or to a channel with many waiters) | runs at the level of its cause (spec 7.7), the Close and Replies stages at the higher of the cause and their top waiter: the chunks of the whole teardown follow one another at that level, with interrupt polls between them, and no thread at or below that level runs until they end | each chunk as in its row; in all, the sum of the object's chunks | no single number since stage 3, which took the end into chunks: the call part, 350 (`end_call`), then the Threads chunks at S, the longest 13,213 (`threads_ready`), then the chunks of the later stages, each at most B (the rows above); in stage 1.3c, when the call stopped the threads, `process_kill` of a child with 64 threads that never ran took 42,961 with its whole teardown; closing a channel with 60 waiting receivers is no single path: two chunks of the Close stage at their level, the longer 3,844 (test build), then each of the 60 receivers it wakes runs above the closer and exits on its own, about 1,100 instructions each |
 | B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 20,536 under -icount (test build) after stage 3: a Handles chunk of 64 last copies of sessions each waking a receiver (42,539 after the cleanup of audit 3, the end of a process with 128 threads waiting in `send` through the last copies of sessions, until the Threads stage took that end into chunks); of the chunks, 20,536, a Handles chunk of 64 last copies of sessions each waking a receiver, then 20,079, a Buffers chunk whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3), and 19,354, a Buffers chunk of 32 frames; printing costs nothing there; B does not grow with the number of timers, bindings, slots or threads of an ending process; the longest Threads chunk is 13,213; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 13,276 since the timer heap of 8,192 timers (depth 13), stays below it |
+
+## Steps of the process service
+
+The rows above bound what a pending interrupt waits for. A step of a
+service is user-space work at the service's level, and a request that waits
+for the service waits for the steps ahead of it. `cargo xtask
+process-steps` (4 branches in `ci`) measures them under -icount with 128
+children from files (the same ticks as B; `rt` feature `step-stats`, the
+service's features `steps` and the larger tables of the RAM file and clock
+services in that image only):
+
+| Step | Ticks | Entries taken off the identity channel |
+|---|---|---|
+| SpawnStart | 158,692 | 128 |
+| Vouch | 75,508 | 132 |
+| ExecStart | 48,142 | 1 |
+| Create | 59,602 | 0 |
+| a `STEP` notification (a step of the walk of `kill(-1)`, ends) | 14,137 | 0 |
+| Boot, WaitStart, Take, ExecCommit, SpawnCommit | 6,806, 6,857, 5,422, 4,189, 2,214 | 0 |
+| Kill (one step of its walk) | 1,201 | 0 |
+
+SpawnStart, ExecStart, Create and Vouch empty the channel of identity
+sessions with one `try_receive` for each entry, 539 ticks and 4,360
+fixed (36 entries 23,764; 132 entries 75,508; 252 entries 140,188). With
+the most identities the probe can build, 248 children and 252 entries, a
+Vouch takes 140,188 ticks and a SpawnStart 261,532; to the 510 receives
+the loop can face, a Vouch takes about 279,000 ticks, 13.6 times B. The
+other steps do not grow with the number of processes. Details are in
+[notes/m5c-spawn-exec.md](../notes/m5c-spawn-exec.md).

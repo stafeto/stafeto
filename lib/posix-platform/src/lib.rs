@@ -574,6 +574,13 @@ pub extern "C" fn stafeto_probe_pool() -> u64 {
     posix_abi::process::probe_pool()
 }
 
+/// Arms the notification of the process's identity session
+/// (posix_abi::process::probe_notify_identity): 0 or EIO.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_notify_identity() -> c_int {
+    posix_abi::process::probe_notify_identity()
+}
+
 /// OPEN_EXEC through the process's own session with the RAM file
 /// service (posix_abi::process::probe_open_exec): 0 or the errno, for the
 /// probes of 5c.

@@ -37,6 +37,9 @@ table-relibc = []
 table-relibc-threads = []
 # The probe of POSIX processes (posix-procs) and the records it spawns.
 table-posix-procs = []
+# The probe of the longest step of the process service (posix-procs in the
+# steps mode, xtask process-steps).
+table-posix-steps = []
 table-os-test = []
 table-busybox = []
 table-busybox-dialog = []

@@ -55,14 +55,13 @@ one live child.
 
 ## Known limits
 
-- **Vouch is bounded, not measured.** Vouch (a service asking who a client
-  is) empties the identity channel before it notifies through the copy it
-  was given and reads the answer: at most 255 ends not yet received (those
-  since the last Create) and 255 notifications of live processes, each one
-  `try_receive`, about 510 kernel calls at the most at the loop's level. The
-  worst case needs 255 processes at once and `init`'s table holds 16, so
-  it is not measured; the longest step of the service under `-icount` with
-  128 children moves to step 5c with `exec`.
+- **Vouch is bounded, and measured in 5c.** Vouch (a service asking who a
+  client is) empties the identity channel before it notifies through the
+  copy it was given and reads the answer: at most 255 ends not yet
+  received and 255 notifications of live processes, each one
+  `try_receive`. Step 5c measured it under `-icount`: 539 ticks an entry,
+  140,188 ticks with 252 entries, about 279,000 extrapolated to 510 (see
+  [m5c-spawn-exec](m5c-spawn-exec.md)).
 - **Limits of the moment.** A second walk of one sender waits in a queue
   of 64 places; past them, and past 1,024 long waits, `EAGAIN`.
 

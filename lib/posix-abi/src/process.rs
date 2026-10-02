@@ -1196,6 +1196,17 @@ pub fn probe_pool() -> u64 {
     }
 }
 
+/// Arms the notification of the process's identity session in the process
+/// service's channel of identity sessions, as a process that wants a
+/// Vouch to take one more entry does (the probe of the longest Vouch). 0,
+/// or EIO when the process has no identity session.
+pub fn probe_notify_identity() -> i32 {
+    match identity() {
+        Some(own) if rt::sys::notify(own, 1).is_ok() => 0,
+        _ => crate::constants::EIO,
+    }
+}
+
 /// OPEN_EXEC of `path` through the process's own session with the RAM
 /// file service, with a copy of its identity: what a process that is no
 /// loader gets (5c, the probe of condition O1). 0 when an image session came back,

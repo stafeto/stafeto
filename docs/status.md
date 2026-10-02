@@ -3,7 +3,7 @@
 The README gives the short status. This page keeps the details that are
 useful when working on the code: what the kernel offers, what the Rust
 POSIX layer covers, and which commands check each piece. It describes
-`main` at 5e26124 with step 5b (the process service) on top.
+`main` at d167d16 (step 5b, the process service) with step 5c (`posix_spawn` and `exec` from files) on top.
 
 ## Kernel
 
@@ -127,10 +127,11 @@ provides the C side of each.
 | Mutexes and time | NORMAL, ERRORCHECK and RECURSIVE mutexes, `pthread_mutex_timedlock`, `pthread_mutex_clocklock`, `clock_gettime`/`getres`/`settime`, `nanosleep`, `clock_nanosleep` | [mutex](../notes/m2-rust-posix-mutex.md), [timed](../notes/m2-rust-posix-timed-mutex.md), [clocks](../notes/m2-rust-posix-clocks.md), [sleep](../notes/m2-rust-posix-sleep.md) |
 | Signals | `sigaction`, masks, pending sets, `raise`, `pthread_kill`, `sigwait`, `sigwaitinfo`, `sigtimedwait`, `SA_SIGINFO` with a real interrupted context; host-tested pending-signal queues | [upcall](../notes/m2-native-upcall.md), [actions](../notes/m2-rust-posix-signal-actions.md), [sigwait](../notes/m2-rust-posix-sigwait.md), [sigwaitinfo](../notes/m2-rust-posix-sigwaitinfo.md), [context](../notes/m2-rust-posix-handler-context.md), [sigtimedwait](../notes/m2-rust-posix-sigtimedwait.md), [queues](../notes/m2-rust-posix-signal-queues.md) |
 | Processes | `getpid`, `getppid`, `getpgrp` and `getsid(0)` read the process's page of its record; real, effective and saved UID/GID (eight calls) go through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
-| Process lifetime | `posix_spawn` of a boot-image record, `waitpid`, `waitid`, `WNOHANG`, `WIFSIGNALED` apart from `exit(143)`, `kill`, `killpg`, `kill(0)`, `kill(-1)`, `SIGKILL` through the kernel, `SIGCHLD` to `sigwaitinfo`, `setpgid`, `setsid`, `getpgid`, `getsid`, orphans to PID 1 | [m5b](../notes/m5b-processes.md) |
+| Spawn and `exec` | `posix_spawn` and `exec` of a file of the RAM service through a loader in the new process: `argv`, `envp`, the current directory, file actions (`adddup2`, `addclose`, `addopen`, `addchdir`), `SETPGROUP`, `SETSID`, `SETSIGMASK`, `SETSIGDEF`, `RESETIDS`, set-ID files, descriptions shared with the child, `FD_CLOEXEC`, a failed `exec` that leaves the old image whole | [m5c](../notes/m5c-spawn-exec.md) |
+| Process lifetime | `waitpid`, `waitid`, `WNOHANG`, `WIFSIGNALED` apart from `exit(143)`, `kill`, `killpg`, `kill(0)`, `kill(-1)`, `SIGKILL` through the kernel, `SIGCHLD` to `sigwaitinfo`, `setpgid`, `setsid`, `getpgid`, `getsid`, orphans to PID 1 | [m5b](../notes/m5b-processes.md) |
 
 relibc gives conditions, semaphores and stdio over the layer
-(`relibc-threads` checks the first two). Not there yet: `exec`, `fork`,
+(`relibc-threads` checks the first two). Not there yet: `fork`, `fexecve`,
 pipes, queued signals (`sigqueue`), stop and continue signals,
 `SA_RESTART` beyond console reads and `waitpid`, POSIX timers, `termios`, asynchronous cancellation,
 general ELF TLS. BusyBox
@@ -152,8 +153,9 @@ cancellation, shared-state, input and interruption probes as well, and
 | `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes; the files of the boot image's table: modes, owners, links, reads at an offset, the longest path |
 | `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` within 16 KiB |
 | `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
-| `posix-procs` | the C probe of processes on relibc: `posix_spawn` from `/boot`, exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, a fault as `SIGSEGV`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |
-| `os-test` | os-test (Sortix, ISC, pinned) io, malloc and signal suites on relibc, one test a boot; PASS, FAIL and UNSUPPORTED (needs `fork`, `exec` or pipes) in `target/measure/os-test.txt`; a fault, a kill or no end within 60 s is a FAIL, the run stops after 300 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
+| `posix-procs` | the C probe of processes on relibc: `posix_spawn` and `exec` from files (`/bin/ls /etc`, `argv`, `envp`, set-ID, 32 live children, 1,100 in a row, descriptors, a failed `exec`), exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, a fault as `SIGSEGV`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |
+| `os-test` | os-test (Sortix, ISC, pinned) io, malloc, signal, `basic/spawn` and `basic/unistd` `exec*` suites on relibc, a boot a suite with the tests started from files; PASS, FAIL and UNSUPPORTED (needs `fork` or pipes) in `target/measure/os-test.txt`; a test that runs 10 s is killed, the run stops after 300 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
+| `process-steps` [branches] | the longest step of the process service under `-icount` with a crowd of children (128 with 4 branches, in `ci`; 248 with 7) and the entries a Vouch takes off the identity channel; the table is in `target/measure/process-steps.txt` and in [non-preemptible-paths](non-preemptible-paths.md) |
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
@@ -192,7 +194,8 @@ and a waiter in the same bucket, S9 a round trip to a service, S10 `kill` of ano
 statement of its handler (the target sleeps; and with a thread at level 25
 running all the time), S11 a `waitpid` of a ready zombie and from a
 child's `_exit` to the return of `waitpid`, S12 `killpg` to a group of
-seven to the last `waitpid`, S13 `posix_spawn` to the child's `main`.
+32 to the last `waitpid`, S13 `posix_spawn` of a file to the child's `main`,
+S14 `exec` to the new image's `main`.
 Each row
 gives n, min, p50, p99, max in ns and kernel calls per operation, with a
 histogram, in `target/measure/rtbench-<machine>.txt`.
@@ -213,3 +216,8 @@ still make no kernel call; S4 `malloc`/`free` of 64 bytes falls from 335
 423 / 463 ns, S6 1,343 / 2,367 ns, S7 3,583 / 7,295 ns. relibc built for
 size (level `s`) had S4 `dup`/`close` at 671 / 751 ns and S6 at 2,175 /
 3,583 ns.
+
+10 minutes at step 5c (HVF / VZ, p50 / p99): S13 `posix_spawn` of a file to
+the child's `main` 221 / 303 and 221 / 295 us (step 5b, from a boot-image
+record: 55 us p50); S14 `exec` to the new image's `main` 229 / 270 us on
+both; S12 `killpg` to a group of 32 639 / 918 and 655 / 918 us.

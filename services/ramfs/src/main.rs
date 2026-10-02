@@ -29,7 +29,10 @@ rt::entry!(main);
 const METHODS: &[u16] = proto_fs::METHODS;
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the children of POSIX processes.
+#[cfg(not(feature = "steps"))]
 const SESSIONS: usize = 64;
+#[cfg(feature = "steps")]
+const SESSIONS: usize = 320;
 /// Where the service maps the boot image, read-only, for as long as it
 /// lives: the files of its table are read from there.
 const IMAGE: usize = 0x50_0000_0000;
@@ -126,7 +129,10 @@ struct Fs {
 }
 
 /// The clones the service keeps alive at most.
+#[cfg(not(feature = "steps"))]
 const CLONES: usize = 128;
+#[cfg(feature = "steps")]
+const CLONES: usize = 320;
 
 /// Clones whose sessions sent nothing yet, at most: past them, Clone is
 /// LIMIT_REACHED.

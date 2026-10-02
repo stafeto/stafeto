@@ -17,6 +17,10 @@ bench = false
 # images of measurements and tests only (rtbench 2).
 [features]
 count-calls = []
+# The longest step of a service's loop for each method, which a service
+# that asks (`service::report_steps`) prints when it grows; off in every
+# image but the process service's measurement (xtask process-steps).
+step-stats = []
 
 [dependencies]
 abi = { path = "../abi" }
