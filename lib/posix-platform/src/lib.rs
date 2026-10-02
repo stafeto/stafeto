@@ -22,7 +22,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::AtomicU32;
-use posix_abi::constants::{EINVAL, ENOMEM};
+use posix_abi::constants::{EFAULT, EINVAL, ENOMEM};
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
@@ -37,32 +37,16 @@ pub static STAFETO_PLATFORM_ABI: u64 = posix_thread::BLOCK_SIZE as u64
     | (posix_thread::BLOCK_OFFSET as u64) << 16
     | PLATFORM_INTERFACE << 32;
 
-/// Runs one call of the layer with the process's files and an errno of
-/// its own; a negative result becomes the negated errno. A thread the
-/// layer attached already uses the process's files: its errno is saved and
-/// given back around the call, with no call of the kernel. Before that
-/// (relibc's start) the call runs in a scope of the layer (posix_abi::tls).
-fn call(run: impl FnOnce() -> i64) -> i64 {
-    // SAFETY: a block lives while its thread runs.
-    if let Some(block) = unsafe { posix_thread::block().as_mut() }
-        && block.process_files != 0
-    {
-        let saved = core::mem::replace(&mut block.errno, 0);
-        let value = run();
-        // The block is the calling thread's: no entry changes its errno
-        // across the call without giving it back.
-        let errno = core::mem::replace(&mut block.errno, saved);
-        return if value < 0 { -i64::from(errno) } else { value };
-    }
-    posix_abi::tls::with_process(|| {
-        let value = run();
-        if value < 0 {
-            // SAFETY: the scope gives this thread an errno.
-            -i64::from(unsafe { *posix_abi::__errno_location() })
-        } else {
-            value
-        }
-    })
+/// Runs one call of the layer on a thread with a block: its own, or
+/// before relibc attached the main thread (its start) a transient one
+/// (posix_abi::tls). The layer gives a value or an errno and keeps none.
+fn call<T>(run: impl FnOnce() -> Result<T, c_int>) -> Result<T, c_int> {
+    posix_abi::tls::with_process(run)
+}
+
+/// A value of the platform's interface: the value, or the negated errno.
+fn value(result: Result<i64, c_int>) -> i64 {
+    result.unwrap_or_else(|errno| -i64::from(errno))
 }
 
 /// Attaches the main thread, whose TCB relibc built and installed, to the
@@ -92,16 +76,32 @@ pub unsafe extern "C" fn stafeto_init(tcb: *mut c_void) -> c_int {
 /// `buf` is readable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_write(fd: c_int, buf: *const u8, len: usize) -> isize {
+    if buf.is_null() && len != 0 {
+        return -(EFAULT as isize);
+    }
     // SAFETY: the caller's promise.
-    call(|| unsafe { posix_abi::write(fd, buf, len) } as i64) as isize
+    let bytes = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { core::slice::from_raw_parts(buf, len) }
+    };
+    value(call(|| posix_abi::write(fd, bytes)).map(|n| n as i64)) as isize
 }
 
 /// # Safety
 /// `buf` is writable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> isize {
-    // SAFETY: the caller's promise.
-    call(|| unsafe { posix_abi::read(fd, buf, len) } as i64) as isize
+    if buf.is_null() && len != 0 {
+        return -(EFAULT as isize);
+    }
+    let buffer = if len == 0 {
+        &mut [][..]
+    } else {
+        // SAFETY: the caller's promise.
+        unsafe { core::slice::from_raw_parts_mut(buf, len) }
+    };
+    value(call(|| posix_abi::read(fd, buffer)).map(|n| n as i64)) as isize
 }
 
 /// relibc's open flags (its headers for AArch64 Linux, asm/fcntl.h).
@@ -142,25 +142,26 @@ pub unsafe extern "C" fn stafeto_openat(
         ours |= posix_abi::constants::O_CLOEXEC;
     }
     // SAFETY: the caller's promise.
-    call(|| i64::from(unsafe { posix_abi::open(path, ours) })) as c_int
+    let name = match unsafe { posix_abi::path(path) } {
+        Ok(name) => name,
+        Err(errno) => return -errno,
+    };
+    value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_close(fd: c_int) -> c_int {
-    // SAFETY: closing a number touches only the layer's table.
-    call(|| i64::from(unsafe { posix_abi::close(fd) })) as c_int
+    value(call(|| posix_abi::close(fd)).map(|()| 0)) as c_int
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_lseek(fd: c_int, offset: i64, whence: c_int) -> i64 {
-    // SAFETY: seeking touches only the layer's table.
-    call(|| unsafe { posix_abi::lseek(fd, offset, whence) })
+    value(call(|| posix_abi::lseek(fd, offset, whence)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_exit(status: c_int) -> ! {
-    // SAFETY: the process ends here.
-    unsafe { posix_abi::_exit(status) }
+    posix_abi::exit(status)
 }
 
 /// CLOCK_MONOTONIC from the counter, CLOCK_REALTIME from the clock
@@ -189,8 +190,19 @@ pub unsafe extern "C" fn stafeto_clock_gettime(clock: c_int, out: *mut Timespec)
 /// `out` is null or writable for a timespec.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_clock_getres(clock: c_int, out: *mut Timespec) -> c_int {
-    // SAFETY: the caller's promise.
-    call(|| i64::from(unsafe { posix_abi::clock::clock_getres(clock, out) })) as c_int
+    match posix_abi::clock::getres(clock) {
+        Ok(time) => {
+            // SAFETY: the caller's promise.
+            if let Some(out) = unsafe { out.as_mut() } {
+                *out = Timespec {
+                    tv_sec: time.seconds,
+                    tv_nsec: time.nanos,
+                };
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -409,8 +421,9 @@ pub unsafe extern "C" fn stafeto_nanosleep(
     request: *const Timespec,
     remaining: *mut Timespec,
 ) -> c_int {
-    // SAFETY: the caller's promise; the layouts are Linux's.
-    call(|| i64::from(unsafe { posix_abi::threads::sleep::nanosleep(request, remaining) })) as c_int
+    // relibc's nanosleep: 0 or a negated errno.
+    // SAFETY: the caller's promise.
+    -unsafe { sleep(CLOCK_REALTIME, 0, request, remaining) }
 }
 
 /// clock_nanosleep: 0 or an error number.
@@ -424,9 +437,42 @@ pub unsafe extern "C" fn stafeto_clock_nanosleep(
     request: *const Timespec,
     remaining: *mut Timespec,
 ) -> c_int {
-    // SAFETY: the caller's promise; the clocks and TIMER_ABSTIME are
-    // Linux's numbers in both.
-    unsafe { posix_abi::threads::sleep::clock_nanosleep(clock, flags, request, remaining) }
+    // SAFETY: the caller's promise.
+    unsafe { sleep(clock, flags, request, remaining) }
+}
+
+const CLOCK_REALTIME: c_int = 0;
+
+/// A sleep of the layer: 0 or the error number; the time left of a cut
+/// relative sleep goes to `remaining`. The clocks and TIMER_ABSTIME are
+/// Linux's numbers in both.
+///
+/// # Safety
+/// `request` is a readable timespec; `remaining` is null or writable.
+unsafe fn sleep(
+    clock: c_int,
+    flags: c_int,
+    request: *const Timespec,
+    remaining: *mut Timespec,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let Some(requested) = (unsafe { request.as_ref() }).copied() else {
+        return EFAULT;
+    };
+    match call(|| {
+        posix_abi::threads::sleep::clock_nanosleep(clock, flags, requested).map_err(
+            |(errno, left)| {
+                // SAFETY: the caller's promise.
+                if let (Some(left), Some(out)) = (left, unsafe { remaining.as_mut() }) {
+                    *out = left;
+                }
+                errno
+            },
+        )
+    }) {
+        Ok(()) => 0,
+        Err(errno) => errno,
+    }
 }
 
 /// relibc's cancellation states and types (its pthread.h).

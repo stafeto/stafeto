@@ -3,7 +3,7 @@
 
 //! Pending/live acceptance, thread targeting, retry and cancellation cleanup.
 use super::*;
-use abi::signals::{self as api, SigAction, SigInfo};
+use crate::layer::signals::{self as api, SigAction, SigInfo};
 use core::sync::atomic::AtomicBool;
 use ffi::Cleanup;
 use rt::wait::{Waited, Waiter};
@@ -41,16 +41,16 @@ unsafe extern "C" fn handler(signal: i32) {
         ERRORS.fetch_add(1, Ordering::Release);
     }
     HANDLED.fetch_add(1, Ordering::AcqRel);
-    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+    let fd = unsafe { ffi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
     let mut byte = 0;
     if fd < 0
-        || unsafe { abi::read(fd, &mut byte, 1) } != 1
+        || unsafe { ffi::read(fd, &mut byte, 1) } != 1
         || byte != b's'
-        || unsafe { abi::close(fd) } != 0
+        || unsafe { ffi::close(fd) } != 0
     {
         ERRORS.fetch_add(1, Ordering::Release);
     }
-    unsafe { *abi::__errno_location() = 901 };
+    unsafe { *ffi::__errno_location() = 901 };
 }
 struct Output {
     signal: i32,
@@ -69,7 +69,7 @@ unsafe extern "C" fn cleanup(argument: *mut c_void) {
     let mode = MODE.load(Ordering::Acquire);
     if api::probe_waiting(ffi::pthread_self()) != Ok(false)
         || mask() != BLOCKED
-        || unsafe { *abi::__errno_location() } != 777
+        || unsafe { *ffi::__errno_location() } != 777
         || signal != if mode == 5 { SIGUSR1 } else { 777 }
         || (INFO.load(Ordering::Acquire)
             && output.info
@@ -87,7 +87,7 @@ unsafe extern "C" fn cleanup(argument: *mut c_void) {
 unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     let index = argument as usize;
     let mode = MODE.load(Ordering::Acquire);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     if mask() != BLOCKED || pending() != 0 {
         return ptr::null_mut();

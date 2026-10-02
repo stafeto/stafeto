@@ -38,7 +38,7 @@ fn error() {
 /// Adds to both words ROUNDS times under LOCK, yielding inside so that the
 /// others wait on it.
 unsafe extern "C" fn contender(argument: *mut c_void) -> *mut c_void {
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     for _ in 0..ROUNDS {
         if unsafe { pthread_mutex_lock(address(&LOCK)) } != 0 {
@@ -106,7 +106,7 @@ fn join(id: u64, expected: *mut c_void) -> bool {
 pub(super) fn run() -> bool {
     let ready_channel = sys::channel_create(30).expect("mutex ready channel");
     READY.store(ready_channel.raw().0, Ordering::Release);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 123 };
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));

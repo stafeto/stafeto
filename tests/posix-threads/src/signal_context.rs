@@ -3,7 +3,7 @@
 
 //! Read and edit a real interrupted CPU loop, including nested signal contexts.
 use super::*;
-use abi::signals::{self as api, LinuxContext, LinuxSigInfo, SigAction};
+use crate::layer::signals::{self as api, LinuxContext, LinuxSigInfo, SigAction};
 use core::cell::UnsafeCell;
 use rt::wait::{Waited, Waiter};
 unsafe extern "C" {
@@ -106,16 +106,16 @@ unsafe extern "C" fn handler(signal: i32, info: *mut LinuxSigInfo, context: *mut
         valid &= mode == 2 && depth == 2 && context.sp < OUTER_SP.load(Ordering::Acquire);
     }
     // A real asynchronous handler also performs required signal-safe file I/O.
-    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+    let fd = unsafe { ffi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
     let mut byte = 0;
     valid &= fd >= 0
-        && unsafe { abi::read(fd, &mut byte, 1) } == 1
+        && unsafe { ffi::read(fd, &mut byte, 1) } == 1
         && byte == b's'
-        && unsafe { abi::close(fd) } == 0;
+        && unsafe { ffi::close(fd) } == 0;
     if !valid {
         ERRORS.fetch_add(1, Ordering::Release);
     }
-    unsafe { *abi::__errno_location() = 901 };
+    unsafe { *ffi::__errno_location() = 901 };
     DEPTH.fetch_sub(1, Ordering::SeqCst);
     if depth == 1 {
         STATE.done.store(1, Ordering::Release);
@@ -127,7 +127,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     let drain = sys::channel_create(10).unwrap();
     assert_eq!(sys::try_receive(&drain), Err(rt::abi::Error::WouldBlock));
     drop(drain);
-    unsafe { *abi::__errno_location() = 777 };
+    unsafe { *ffi::__errno_location() = 777 };
     // SAFETY: one worker owns this retained output during the assembly call.
     unsafe { native_upcall_register_probe((*OUTPUT.0.get()).as_mut_ptr(), &STATE.seeded) };
     let mode = MODE.load(Ordering::Acquire);
@@ -143,7 +143,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         && COUNT.load(Ordering::Acquire) == if mode == 2 { 2 } else { 1 }
         && ERRORS.load(Ordering::Acquire) == 0
         && DEPTH.load(Ordering::Acquire) == 0
-        && unsafe { *abi::__errno_location() } == 777;
+        && unsafe { *ffi::__errno_location() } == 777;
     for (index, &actual) in output[..31].iter().enumerate() {
         let expected = match index {
             0 if mode == 1 => 0xf00d,

@@ -5,14 +5,14 @@
 //! names the ABI word, the word the TCB, whose generic part relibc wrote
 //! (the static TLS from 16 bytes past the word to the TCB, the TCB naming
 //! itself) and whose
-//! block of the layer is 32 bytes on, the layer's errno in it. relibc maps
+//! block of the layer is 32 bytes on; relibc's errno lies in the TLS. relibc maps
 //! the ABI page, the TLS and the TCB page of each thread; two threads have
 //! two blocks; a scope of the layer keeps the thread's block. A handler that enters
 //! while the thread waits in a call of the layer, and a second one that
 //! enters inside the first, leave each errno as it was.
 use super::*;
-use abi::signals::{self as api, SigAction};
-use posix_thread::{BLOCK_OFFSET, Block};
+use crate::layer::signals::{self as api, SigAction};
+use posix_thread::BLOCK_OFFSET;
 
 static ERRORS: AtomicUsize = AtomicUsize::new(0);
 static BLOCKS: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
@@ -37,7 +37,7 @@ fn chain() -> usize {
     // SAFETY: the word names the TCB, whose first four words relibc owns.
     let generic = unsafe { *(tcb as *const [usize; 4]) };
     let block = tcb + BLOCK_OFFSET;
-    let errno = unsafe { abi::__errno_location() } as usize;
+    let errno = unsafe { ffi::__errno_location() } as usize;
     // AArch64's TLS variant 1: the static TLS starts 16 bytes past the
     // word and ends at the TCB.
     let fine = generic[0] == tcb
@@ -45,14 +45,16 @@ fn chain() -> usize {
         && word + 16 == tcb - generic[1]
         && generic[2] == tcb
         && generic[3] >= core::mem::size_of::<posix_thread::Tcb>()
-        && errno == block + core::mem::offset_of!(Block, errno)
+        // errno is relibc's, in the thread's static TLS.
+        && errno >= tcb - generic[1]
+        && errno + 4 <= tcb
         && block == posix_thread::block() as usize;
     if fine { block } else { 0 }
 }
 
 unsafe extern "C" fn on_signal(_: i32) {
     // SAFETY: the handler runs on a thread with a block.
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 99 };
     HANDLED.fetch_add(1, Ordering::SeqCst);
     // A second entry inside this one: its errno goes back to 99.
@@ -63,7 +65,7 @@ unsafe extern "C" fn on_signal(_: i32) {
 
 unsafe extern "C" fn on_nested(_: i32) {
     // SAFETY: as above.
-    unsafe { *abi::__errno_location() = 98 };
+    unsafe { *ffi::__errno_location() = 98 };
     HANDLED.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -76,13 +78,9 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     if block == 0 || !(word + 16).is_multiple_of(4096) {
         error();
     }
-    // A scope of the layer keeps the thread's block and gives errno back.
-    unsafe { *abi::__errno_location() = 55 };
-    let inner = tls::with_process(|| {
-        unsafe { *abi::__errno_location() = 66 };
-        chain()
-    });
-    if inner != block || unsafe { *abi::__errno_location() } != 55 {
+    // A scope of the layer keeps the thread's block.
+    let inner = tls::with_process(chain);
+    if inner != block {
         error();
     }
     BLOCKS[index].store(block, Ordering::SeqCst);
@@ -92,7 +90,7 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
 /// Joins the thread GATED holds back, with errno 777, while a handler
 /// writes 99 to errno.
 unsafe extern "C" fn waiter(_: *mut c_void) -> *mut c_void {
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     let mut value = ptr::null_mut();
     let status = unsafe { ffi::pthread_join(GATED.load(Ordering::Acquire), &mut value) };

@@ -25,7 +25,13 @@ Rust layer below it is the system part and exports no C names.
 - **Start.** `posix-crt` starts the process (registration, clocks, files,
   heap, the clock's page) and hands the thread to `relibc_start_v1`.
 - **Licences.** `tools/check-licenses.py` (items 1 to 6) runs first in
-  `ci`; images with a program on relibc carry `THIRD-PARTY-NOTICES`.
+  `ci`; images with a program on relibc carry `THIRD-PARTY-NOTICES`
+  (121 KB: the MIT text of a crate under MIT or another licence), and
+  images with BusyBox carry its licence and the note of its exact source.
+- **The layer's surface.** The layer's functions give a value or an errno
+  (`Result<_, i32>`) and keep no errno and no C name; `cargo xtask
+  layer-names` checks the symbols of `lib/posix-*`. Its `.data` and
+  `.bss` in a program: 10.5 KB.
 
 ## Checks
 
@@ -46,5 +52,8 @@ bytes falls under a tick (dlmalloc).
 ## Limits
 
 `fork`, `exec` and pipes come with steps 5b to 5e; `ash` reports `can't
-fork` for a command outside BusyBox. `times()` gives no CPU time. relibc
-adds about 225 KB of `.text` to BusyBox.
+fork` for a command outside BusyBox. `times()` gives no CPU time. relibc,
+built for size (level `s`, one codegen unit, LTO), adds about 157 KB of
+`.text` to BusyBox (246 KB against 89 KB on Picolibc); `ci` bounds it at
+256 KiB. Five copies of `printf` and relibc's own copy of `core` make most
+of it (#150).

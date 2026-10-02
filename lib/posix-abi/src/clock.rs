@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! POSIX clocks: immutable common counter and a system-wide realtime service.
-use crate::{constants::*, fail};
+use crate::constants::*;
 use core::cell::UnsafeCell;
 use core::ffi::c_int;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
@@ -134,21 +134,6 @@ fn valid(id: c_int) -> Result<(), c_int> {
         Err(EINVAL)
     }
 }
-unsafe fn store(result: Result<Time, c_int>, out: *mut Timespec) -> c_int {
-    match result {
-        Ok(time) => {
-            // SAFETY: the entry point checked null; the caller supplies one Timespec.
-            unsafe {
-                out.write(Timespec {
-                    tv_sec: time.seconds,
-                    tv_nsec: time.nanos,
-                })
-            };
-            0
-        }
-        Err(code) => fail(code) as c_int,
-    }
-}
 /// The time of clock `id`: MONOTONIC from the counter, REALTIME from the
 /// page or the service; no errno.
 pub fn gettime(id: c_int) -> Result<Time, c_int> {
@@ -162,49 +147,24 @@ pub fn gettime(id: c_int) -> Result<Time, c_int> {
     }
 }
 
-/// # Safety
-/// out is writable and aligned for Timespec; the current thread has an ABI scope.
-pub unsafe extern "C" fn clock_gettime(id: c_int, out: *mut Timespec) -> c_int {
-    if out.is_null() {
-        return fail(EFAULT) as c_int;
-    }
-    let result = gettime(id);
-    unsafe { store(result, out) }
-}
-/// # Safety
-/// out is null or writable/aligned for Timespec; the thread has an ABI scope.
-pub unsafe extern "C" fn clock_getres(id: c_int, out: *mut Timespec) -> c_int {
-    if let Err(code) = valid(id) {
-        return fail(code) as c_int;
-    }
-    if out.is_null() {
-        return 0;
-    }
-    let result = resolution(rt::time::frequency())
+/// The resolution of clock `id`: one tick of the counter.
+pub fn getres(id: c_int) -> Result<Time, c_int> {
+    valid(id)?;
+    resolution(rt::time::frequency())
         .map(Time::from_mono)
-        .map_err(|_| EIO);
-    unsafe { store(result, out) }
+        .map_err(|_| EIO)
 }
-/// # Safety
-/// time supplies one readable aligned Timespec; the thread has an ABI scope.
-/// Connecting to the clock service grants setting permission in the current
-/// capability table. CLOCK_MONOTONIC is never settable.
-pub unsafe extern "C" fn clock_settime(id: c_int, time: *const Timespec) -> c_int {
+
+/// Sets CLOCK_REALTIME to `time` through the clock service (connecting to
+/// it grants the right); CLOCK_MONOTONIC is never settable.
+pub fn settime(id: c_int, time: Timespec) -> Result<(), c_int> {
     if id != CLOCK_REALTIME {
-        return fail(EINVAL) as c_int;
+        return Err(EINVAL);
     }
-    if time.is_null() {
-        return fail(EFAULT) as c_int;
-    }
-    // SAFETY: caller supplies one live Timespec.
-    let time = unsafe { time.read() };
     let value = Time {
         seconds: time.tv_sec,
         nanos: time.tv_nsec,
     };
-    let result = value
-        .value()
-        .map_err(|_| EINVAL)
-        .and_then(|_| client()?.set(value).map_err(error));
-    result.map_or_else(|code| fail(code) as c_int, |()| 0)
+    value.value().map_err(|_| EINVAL)?;
+    client()?.set(value).map_err(error)
 }

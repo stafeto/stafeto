@@ -22,10 +22,6 @@ use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
 use rt::{sys, upcall};
 
-fn fail(code: i32) -> i32 {
-    crate::fail(code) as i32
-}
-
 struct Actions(UnsafeCell<posix_signals::Actions>);
 // SAFETY: only `actions` borrows it, under ACTIONS_LOCK.
 unsafe impl Sync for Actions {}
@@ -92,18 +88,15 @@ fn ignored(signal: i32, action: &SigAction) -> bool {
             && posix_signals::default_action(signal) == posix_signals::DefaultAction::Ignore)
 }
 
-/// # Safety
-/// act is null or readable; old is null or writable. Their storage does not
-/// overlap. A catching handler uses the one-argument or SA_SIGINFO signature,
+/// Sets the action of `signal` to `act` when given; the action before.
+/// A catching handler uses the one-argument or SA_SIGINFO signature,
 /// remains live, and obeys async-signal safety.
-pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut SigAction) -> i32 {
-    let result = actions(|table| {
-        if act.is_null() {
+pub fn sigaction(signal: i32, act: Option<SigAction>) -> Result<SigAction, i32> {
+    actions(|table| {
+        let Some(act) = act else {
             return table.get(signal).map_err(|_| EINVAL);
-        }
-        let old = table
-            .replace(signal, unsafe { act.read() })
-            .map_err(|_| EINVAL)?;
+        };
+        let old = table.replace(signal, act).map_err(|_| EINVAL)?;
         Ok((old, table.ignored(signal))).map(|(old, ignored)| {
             if ignored {
                 // An ignored signal pending in any thread is discarded.
@@ -114,63 +107,37 @@ pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut
             }
             old
         })
-    });
-    match result {
-        Ok(previous) => {
-            if !old.is_null() {
-                unsafe { old.write(previous) };
-            }
-            0
-        }
-        Err(code) => fail(code),
-    }
+    })
 }
 /// The calling thread's block.
 fn own() -> &'static Block {
     threads::own_block()
 }
-/// # Safety
-/// set is null or readable, old is null or writable; storage does not overlap.
-/// No call of the kernel: the mask is a word of the thread's block.
-pub unsafe extern "C" fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32 {
+/// Changes the calling thread's mask by `how` with `set` when given; the
+/// mask before. No call of the kernel: the mask is a word of the thread's
+/// block.
+pub fn pthread_sigmask(how: i32, set: Option<SigSet>) -> Result<SigSet, i32> {
     let block = own();
     let before = block.mask.load(Ordering::SeqCst);
-    if !set.is_null() {
-        let Ok(set) = posix_signals::mask(unsafe { set.read() }) else {
-            return EINVAL;
-        };
+    if let Some(set) = set {
+        let set = posix_signals::mask(set).map_err(|_| EINVAL)?;
         let mask = match how {
             SIG_BLOCK => before | set,
             SIG_UNBLOCK => before & !set,
             SIG_SETMASK => set,
-            _ => return EINVAL,
+            _ => return Err(EINVAL),
         };
         block.mask.store(mask, Ordering::SeqCst);
         if block.pending.load(Ordering::SeqCst) & !mask != 0 {
             deliver_now();
         }
     }
-    if !old.is_null() {
-        unsafe { old.write(before) };
-    }
-    0
+    Ok(before)
 }
-/// # Safety
-/// Same pointers as pthread_sigmask; this implementation also supports threads.
-pub unsafe extern "C" fn sigprocmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32 {
-    let code = unsafe { pthread_sigmask(how, set, old) };
-    if code == 0 { 0 } else { fail(code) }
-}
-/// # Safety
-/// set is writable for one signal set, in a managed thread.
-pub unsafe extern "C" fn sigpending(set: *mut SigSet) -> i32 {
-    if set.is_null() {
-        return fail(EFAULT);
-    }
+/// The calling thread's pending signals that its mask holds back.
+pub fn sigpending() -> SigSet {
     let block = own();
-    let pending = block.pending.load(Ordering::SeqCst) & block.mask.load(Ordering::SeqCst);
-    unsafe { set.write(pending) };
-    0
+    block.pending.load(Ordering::SeqCst) & block.mask.load(Ordering::SeqCst)
 }
 /// Sends `bit` with its `action` (none for signal 0) to the thread of
 /// `block` and `native`: the bit in its block, then a wake of its sigwait
@@ -283,9 +250,12 @@ pub fn suspend(mask: SigSet) -> i32 {
     point.finish();
     EINTR
 }
-pub extern "C" fn raise(signal: i32) -> i32 {
-    let status = kill_relibc_thread(threads::thread_number(), signal);
-    if status == 0 { 0 } else { fail(status) }
+/// Sends `signal` to the calling thread.
+pub fn raise(signal: i32) -> Result<(), i32> {
+    match kill_relibc_thread(threads::thread_number(), signal) {
+        0 => Ok(()),
+        status => Err(status),
+    }
 }
 
 /// Waits for a signal of `set`, which the caller blocked, until `deadline`
@@ -380,58 +350,24 @@ fn wait(set: SigSet, timeout: Option<posix_types::Timespec>, start: u64) -> Resu
     result
 }
 
-/// # Safety
-/// The caller is managed. set is readable and sig is writable; their storage
-/// does not overlap. All selected signals are blocked before this call.
-pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
-    let point = threads::cancel::Point::begin();
-    let result = if set.is_null() || sig.is_null() {
-        Err(EFAULT)
-    } else {
-        let set = unsafe { set.read() };
-        wait(set, None, 0).map(|signal| {
-            unsafe { sig.write(signal) };
-        })
-    };
-    point.finish();
-    result.map_or_else(|code| code, |()| 0)
-}
-
-/// # Safety
-/// The caller is managed. set is readable, info is null or writable for one
-/// SigInfo, and their storage does not overlap. All selected signals are blocked.
-/// Caught signals resume this wait; EINTR is not returned. Current
-/// pthread_kill/raise causes are reported as SI_THREAD.
-pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> i32 {
-    unsafe { sigtimedwait(set, info, core::ptr::null()) }
-}
-
-/// # Safety
-/// The caller is managed. set is readable, info is null or writable for one
-/// SigInfo, timeout is null or readable for one Timespec. Storage does not
-/// overlap. Selected signals are blocked. NULL timeout means indefinite wait;
-/// unrelated caught signals resume the original monotonic interval without EINTR.
-pub unsafe extern "C" fn sigtimedwait(
-    set: *const SigSet,
-    info: *mut SigInfo,
-    timeout: *const posix_types::Timespec,
-) -> i32 {
+/// Waits for a signal of `set`, which the caller blocked, at most
+/// `timeout` (none: no end): the signal, with its information in `info`;
+/// EAGAIN when the time ran out. Caught signals resume the wait over the
+/// original interval. A point of cancellation.
+pub fn sigtimedwait(
+    set: SigSet,
+    info: Option<&mut SigInfo>,
+    timeout: Option<posix_types::Timespec>,
+) -> Result<i32, i32> {
     let point = threads::cancel::Point::begin();
     let start = rt::time::ticks_to_ns(rt::time::now());
-    let result = if set.is_null() {
-        Err(EFAULT)
-    } else {
-        let set = unsafe { set.read() };
-        // Copy once; the wait validates it after checking pending signals.
-        let timeout = (!timeout.is_null()).then(|| unsafe { timeout.read() });
-        wait(set, timeout, start).inspect(|&signal| {
-            if !info.is_null() {
-                unsafe { info.write(SigInfo::thread(signal)) };
-            }
-        })
-    };
+    let result = wait(set, timeout, start).inspect(|&signal| {
+        if let Some(info) = info {
+            *info = SigInfo::thread(signal);
+        }
+    });
     point.finish();
-    result.unwrap_or_else(fail)
+    result
 }
 
 rt::upcall_entry!(entry, dispatch, context);
@@ -557,12 +493,6 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     // SAFETY: the thread has a block (attach).
     let errno = unsafe { ERRNO_LOCATION() };
     let saved_errno = unsafe { *errno };
-    // The layer's own errno, which the call the handler interrupted may
-    // not have handed to relibc yet: a call of the layer in the handler
-    // must not change what the interrupted one returns.
-    let layer_errno = crate::tls::errno();
-    // SAFETY: the block's errno is this thread's.
-    let saved_layer_errno = unsafe { *layer_errno };
     // The handlers run outside the interrupted cancellation point and
     // sigwait: a request of cancellation that comes meanwhile waits for the
     // return to the point (POSIX), and a signal sent meanwhile enters as a
@@ -639,8 +569,6 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     block.flags.fetch_or(signal_wait, Ordering::SeqCst);
     block.cancel_point.store(window, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
-    // SAFETY: as above.
-    unsafe { *layer_errno = saved_layer_errno };
     posix_sync::resume_wait(abandoned);
 }
 /// The siginfo_t of relibc's headers (Linux AArch64): 128 bytes, the

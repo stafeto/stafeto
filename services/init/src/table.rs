@@ -693,6 +693,8 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-ramfs") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
+    + cfg!(feature = "table-posix-dialog") as usize
+    + cfg!(feature = "table-posix-dialog-vz") as usize
     + cfg!(feature = "table-posix-abi") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
@@ -718,6 +720,8 @@ const _: () = assert!(
     feature = "table-ramfs",
     feature = "table-busybox",
     feature = "table-busybox-dialog",
+    feature = "table-posix-dialog",
+    feature = "table-posix-dialog-vz",
     feature = "table-posix-abi",
     feature = "table-relibc",
     feature = "table-relibc-threads",
@@ -743,6 +747,10 @@ pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "table-busybox-dialog")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
+#[cfg(feature = "table-posix-dialog")]
+pub const TABLE: &[Record] = ramfs::POSIX_DIALOG_TABLE;
+#[cfg(feature = "table-posix-dialog-vz")]
+pub const TABLE: &[Record] = vz::POSIX_DIALOG_TABLE;
 #[cfg(feature = "vz")]
 pub const TABLE: &[Record] = vz::TABLE;
 #[cfg(feature = "table-posix-abi-vz")]
@@ -1467,6 +1475,8 @@ mod tests {
         let tables = [
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
+            ramfs::POSIX_DIALOG_TABLE,
+            vz::POSIX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
             ramfs::RELIBC_TABLE,
             ramfs::RELIBC_THREADS_TABLE,
@@ -1481,6 +1491,7 @@ mod tests {
             let posix = table.iter().filter(|r| {
                 [
                     "busybox-probe",
+                    "posix-probe",
                     "posix-abi-probe",
                     "relibc-hello",
                     "relibc-threads",

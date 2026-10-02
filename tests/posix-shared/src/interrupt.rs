@@ -71,11 +71,7 @@ extern "C" fn sending(_: u64) -> ! {
 extern "C" fn file_request(_: u64) -> ! {
     let good = tls::with_process(|| {
         let mut path = [0xa5; 129];
-        let errno = unsafe { abi::__errno_location() };
-        unsafe { *errno = EINVAL };
-        !unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
-            && &path[..2] == b"/\0"
-            && unsafe { *errno } == EINVAL
+        abi::getcwd(&mut path) == Ok(1) && &path[..2] == b"/\0"
     });
     passed(2, good)
 }
@@ -445,11 +441,7 @@ extern "C" fn echo_read(_: u64) -> ! {
     let good = tls::with_process(|| {
         let input = rt::fs::Input::from_uart(Some(channel().raw()));
         let mut bytes = [0xa5; 4];
-        let errno = unsafe { abi::__errno_location() };
-        unsafe { *errno = EIO };
-        input.read(&mut bytes) == Ok(2)
-            && bytes == [b'e', b'\n', 0xa5, 0xa5]
-            && unsafe { *errno } == EIO
+        input.read(&mut bytes) == Ok(2) && bytes == [b'e', b'\n', 0xa5, 0xa5]
     });
     passed(4, good)
 }

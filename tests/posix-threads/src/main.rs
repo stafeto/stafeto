@@ -50,6 +50,8 @@ mod heap_lock;
 #[cfg(feature = "cancel-input")]
 mod input;
 #[cfg(not(feature = "cancel-input"))]
+mod layer;
+#[cfg(not(feature = "cancel-input"))]
 mod long;
 #[cfg(not(feature = "cancel-input"))]
 mod mutex;
@@ -111,7 +113,7 @@ unsafe extern "C" fn gated(argument: *mut c_void) -> *mut c_void {
 }
 #[cfg(not(feature = "cancel-input"))]
 unsafe extern "C" fn joiner(_: *mut c_void) -> *mut c_void {
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     let mut value = ptr::null_mut();
     let status = unsafe { ffi::pthread_join(TARGET.load(Ordering::Acquire), &mut value) };
@@ -185,7 +187,7 @@ unsafe extern "C" fn after_main(_: *mut c_void) -> *mut c_void {
         if REUSED_SIGNALLED.load(Ordering::SeqCst) != 0 {
             break;
         }
-        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
     }
     0x55 as *mut c_void
 }
@@ -200,24 +202,24 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
         sys::process_exit(70);
     }
     // Files and allocation owners stay usable after main has ended.
-    let block = unsafe { abi::allocation::malloc(64) };
+    let block = unsafe { ffi::malloc(64) };
     if block.is_null() {
         sys::process_exit(71);
     }
-    unsafe { abi::allocation::free(block) };
-    if unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) } < 0 {
+    unsafe { ffi::free(block) };
+    if unsafe { ffi::open(c"/etc/motd".as_ptr(), O_RDONLY) } < 0 {
         sys::process_exit(72);
     }
     // A thread made after main was joined has a block of its own: its
     // signal and its value are its, not main's.
-    let action = abi::signals::SigAction {
+    let action = crate::layer::signals::SigAction {
         handler: reused_signal as *const () as u64,
         mask: 0,
         flags: 0,
     };
     let mut reused = 0;
     let mut value = ptr::null_mut();
-    if unsafe { abi::signals::sigaction(SIGUSR2, &action, ptr::null_mut()) } != 0
+    if unsafe { crate::layer::signals::sigaction(SIGUSR2, &action, ptr::null_mut()) } != 0
         || unsafe {
             ffi::pthread_create(&mut reused, ptr::null(), Some(after_main), ptr::null_mut())
         } != 0
@@ -327,7 +329,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let expected = abi::process::client()
         .query()
         .expect("the snapshot of the process's record");
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 123 };
     if expected.pid < proto_process::RECORDS as u32
         || expected.parent != proto_process::INIT_PID
@@ -351,7 +353,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     }
     let mut child = 0;
     let mut value = ptr::null_mut();
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 123 };
     if unsafe {
         ffi::pthread_create(
@@ -484,7 +486,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !timed::run()
         || !sleep::run()
         || !upcall::run()
-        || !borrow_guards::run(parent)
+        || !borrow_guards::run()
         || !reentry::run()
         || !signals::run()
         || !signal_context::run()

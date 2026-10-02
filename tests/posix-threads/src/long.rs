@@ -8,7 +8,7 @@
 //! with SA_RESTART the read waits on; the 17th operation of a session gets
 //! EAGAIN; a client that goes frees its operations and their handles.
 use super::*;
-use abi::signals::{self as api, SigAction};
+use crate::layer::signals::{self as api, SigAction};
 use proto_uart::{Method, ReadKey, ReadRequest};
 use proto_wire::{Writer, long};
 
@@ -124,7 +124,7 @@ fn result_within(value: u64, ms: usize) -> bool {
         if RESULT.load(Ordering::SeqCst) == value {
             return true;
         }
-        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
         false
     })
 }
@@ -325,7 +325,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         tv_sec: 0,
         tv_nsec: 10_000_000,
     };
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
     let queued = sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::Sending);
     if !queued
         || ffi::pthread_kill(id, SIGUSR1) != 0
@@ -359,7 +359,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     if !feed(b'j') {
         return failed(686);
     }
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
     let queued = sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::Sending);
     if !queued || ffi::pthread_kill(id, SIGUSR1) != 0 || !result_within(u64::from(b'j'), 1000) {
         rt::println!(
@@ -414,7 +414,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         return failed(690);
     }
     let native = unsafe { threads::probe_native(id) }.expect("reader handle");
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
     let awaiting =
         sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::AwaitingReply);
     if !awaiting

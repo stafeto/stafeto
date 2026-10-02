@@ -8,7 +8,7 @@
 //! order they came; 10^5 handoffs of a mutex between two threads lose no
 //! wakeup; an entry of signals inside the layer's lock waits for its end.
 use super::*;
-use abi::signals::{self as api, SigAction};
+use crate::layer::signals::{self as api, SigAction};
 use core::sync::atomic::AtomicU32;
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 use posix_sync::{CLOCK_MONOTONIC, EAGAIN, ETIMEDOUT, LayerLock, futex_wait, futex_wake};
@@ -121,7 +121,7 @@ unsafe extern "C" fn visitor(_: *mut c_void) -> *mut c_void {
         tv_nsec: 50_000,
     };
     for _ in 0..VISITS_WANTED {
-        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
         if unsafe { pthread_mutex_lock(mutex) } != 0 {
             error();
         }

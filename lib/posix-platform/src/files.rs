@@ -6,11 +6,11 @@
 //! AArch64: struct stat of asm-generic, dirent64, struct termios, struct
 //! utsname, struct rlimit) on the layer's files (posix-fs).
 
-use super::call;
+use super::{call, value};
 use core::ffi::{c_char, c_int, c_ulong, c_void};
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
-use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS, ERANGE, ESPIPE};
+use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS, ESPIPE};
 use posix_fs::{DescriptorFlags, FileKind, NodeInfo, PosixFs, SeekFrom};
 
 /// relibc's struct stat on AArch64 Linux (asm-generic/stat.h).
@@ -260,15 +260,12 @@ pub unsafe extern "C" fn stafeto_getcwd(buf: *mut u8, len: usize) -> c_int {
     if len == 0 {
         return -EINVAL;
     }
-    // SAFETY: the caller's promise.
-    let status = call(|| {
-        let got = unsafe { posix_abi::getcwd(buf.cast(), len) };
-        if got.is_null() { -1 } else { 0 }
-    });
-    if status == -i64::from(ERANGE) {
-        return -ERANGE;
+    if buf.is_null() {
+        return -EFAULT;
     }
-    status as c_int
+    // SAFETY: the caller's promise.
+    let buffer = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    value(call(|| posix_abi::getcwd(buffer)).map(|_| 0)) as c_int
 }
 
 /// # Safety
@@ -276,19 +273,21 @@ pub unsafe extern "C" fn stafeto_getcwd(buf: *mut u8, len: usize) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_chdir(path: *const c_char) -> c_int {
     // SAFETY: the caller's promise.
-    call(|| i64::from(unsafe { posix_abi::chdir(path) })) as c_int
+    let name = match unsafe { posix_abi::path(path) } {
+        Ok(name) => name,
+        Err(errno) => return -errno,
+    };
+    value(call(|| posix_abi::chdir(name)).map(|()| 0)) as c_int
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_dup(fd: c_int) -> c_int {
-    // SAFETY: duplicating touches only the layer's table.
-    call(|| i64::from(unsafe { posix_abi::dup(fd) })) as c_int
+    value(call(|| posix_abi::dup(fd)).map(i64::from)) as c_int
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_dup2(fd: c_int, target: c_int) -> c_int {
-    // SAFETY: as above.
-    call(|| i64::from(unsafe { posix_abi::dup2(fd, target) })) as c_int
+    value(call(|| posix_abi::dup2(fd, target)).map(i64::from)) as c_int
 }
 
 /// relibc's fcntl commands (Linux's).
@@ -461,10 +460,10 @@ pub extern "C" fn stafeto_setresuid(real: u32, effective: u32, saved: u32) -> c_
     let keep = u32::MAX;
     let status = match (real, saved) {
         (r, s) if r == keep && s == keep => {
-            call(|| i64::from(posix_abi::process::seteuid(effective)))
+            value(call(|| posix_abi::process::seteuid(effective)).map(|()| 0))
         }
         (r, s) if r == effective && s == keep => {
-            call(|| i64::from(posix_abi::process::setuid(effective)))
+            value(call(|| posix_abi::process::setuid(effective)).map(|()| 0))
         }
         _ => return -ENOSYS,
     };
@@ -477,10 +476,10 @@ pub extern "C" fn stafeto_setresgid(real: u32, effective: u32, saved: u32) -> c_
     let keep = u32::MAX;
     let status = match (real, saved) {
         (r, s) if r == keep && s == keep => {
-            call(|| i64::from(posix_abi::process::setegid(effective)))
+            value(call(|| posix_abi::process::setegid(effective)).map(|()| 0))
         }
         (r, s) if r == effective && s == keep => {
-            call(|| i64::from(posix_abi::process::setgid(effective)))
+            value(call(|| posix_abi::process::setgid(effective)).map(|()| 0))
         }
         _ => return -ENOSYS,
     };
@@ -560,5 +559,8 @@ pub unsafe extern "C" fn stafeto_clock_settime(
     time: *const posix_types::Timespec,
 ) -> c_int {
     // SAFETY: the caller's promise.
-    call(|| i64::from(unsafe { posix_abi::clock::clock_settime(clock, time) })) as c_int
+    let Some(time) = (unsafe { time.as_ref() }).copied() else {
+        return -EFAULT;
+    };
+    value(call(|| posix_abi::clock::settime(clock, time)).map(|()| 0)) as c_int
 }

@@ -3,11 +3,11 @@
 
 //! Actual sleep deadlines, interruption, cancellation and shared observation.
 use super::*;
-use abi::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
+use crate::layer::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
+use crate::layer::sleep::{self, TIMER_ABSTIME};
 use abi::metadata::Timespec;
 use ffi::Cleanup;
 use rt::wait::{Waited, Waiter};
-use threads::sleep::{self, TIMER_ABSTIME};
 
 static DONE_CHANNEL: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
@@ -45,17 +45,15 @@ fn notify() {
     sys::notify(&channel, 1).unwrap();
 }
 unsafe extern "C" fn cleanup(argument: *mut c_void) {
+    // The time left of a cancelled sleep is not written: the thread ends
+    // at the point (POSIX leaves it so); a sleep cut before keeps its own.
     let remaining = unsafe { &*argument.cast::<Timespec>() };
-    let remainder = MODE.load(Ordering::Acquire) != 2 || remaining.tv_sec < 30;
-    let status = if remainder
-        && remaining.tv_sec >= 0
-        && remaining.tv_nsec >= 0
-        && remaining.tv_nsec < 1_000_000_000
-    {
-        1000
-    } else {
-        999
-    };
+    let status =
+        if remaining.tv_sec >= 0 && remaining.tv_nsec >= 0 && remaining.tv_nsec < 1_000_000_000 {
+            1000
+        } else {
+            999
+        };
     DONE.store(status, Ordering::Release);
     notify();
 }
@@ -87,7 +85,7 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
         );
         assert_eq!(ffi::pthread_cancel(ffi::pthread_self()), 0);
     }
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     let status = if args.mode == 1 {
         remaining = args.time;

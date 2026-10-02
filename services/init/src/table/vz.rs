@@ -144,6 +144,16 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
 ];
 
+/// The probes of console input and interruption, as
+/// `ramfs::POSIX_DIALOG_TABLE` on QEMU.
+pub const POSIX_DIALOG_TABLE: &[Record] = &[
+    CONSOLE,
+    super::ramfs::TABLE[0],
+    super::ramfs::POSIX_ABI_TABLE[1],
+    super::ramfs::POSIX_ABI_TABLE[2],
+    super::ramfs::POSIX_DIALOG_TABLE[4],
+];
+
 /// rtbench as a client beside the driver, which shows its lines: its main
 /// thread at 20, its workers up to 30 (tests/rtbench), the driver at 60
 /// above them all with its timer of 50 ms.

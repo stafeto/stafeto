@@ -70,6 +70,10 @@ OPENLIBM = ("openlibm/LICENSE.md",
             "b1843fbf5b03f519a5f0a44fce751bdd1022ae7148614923f9d6293e17a18b17",
             "BSD-2-Clause AND ISC AND MIT AND SunPro AND LicenseRef-public-domain")
 
+# The copyright line of the Rust project's standard library (its
+# COPYRIGHT), for core and alloc, which carry no licence file of their own.
+RUST_COPYRIGHT = ("COPYRIGHT", "Copyright (c) The Rust Project Contributors")
+
 # Licences a GPL-3.0-or-later program may link from crates.io (drivers).
 PERMISSIVE = {"MIT", "Apache-2.0", "MIT OR Apache-2.0", "Apache-2.0 OR MIT",
               "Zlib OR Apache-2.0 OR MIT", "BSD-2-Clause OR Apache-2.0 OR MIT"}
@@ -251,6 +255,39 @@ def licence_files(directory: Path) -> list[Path]:
         r"(LICEN[CS]E|COPYING|UNLICENSE|NOTICE|COPYRIGHT)", path.name, re.I))
 
 
+def chosen(files: list, license_name: str) -> tuple[list, str]:
+    """The files of the licence the programs take: of an expression with
+    MIT among its alternatives, the MIT text alone (and the part is used
+    under MIT); otherwise every licence file."""
+    alternatives = [item.strip("() ")
+                    for item in license_name.replace("/", " OR ").split(" OR ")]
+    mit = [path for path in files
+           if "MIT" in (path[0] if isinstance(path, tuple) else path.name).upper()]
+    if len(alternatives) > 1 and "MIT" in alternatives and mit:
+        return mit, f"{license_name}, used under MIT"
+    return files, license_name
+
+
+def layer_outside() -> list:
+    """The crates from outside the workspace that the layer links into
+    every program (item 1's closure), with their licence files."""
+    data = metadata(ROOT, "--all-features", "--filter-platform", "aarch64-unknown-none")
+    packages = {package["id"]: package for package in data["packages"]}
+    named = {package["name"]: package for package in data["packages"]}
+    linked = closure(data, [named[name]["id"] for name in LINK_ROOTS])
+    members = set(data["workspace_members"])
+    notices = []
+    for package_id in sorted(linked - members, key=lambda i: packages[i]["name"]):
+        package = packages[package_id]
+        files = licence_files(Path(package["manifest_path"]).parent)
+        if not files:
+            fail(f"programs link {package['name']}, which ships no licence file")
+        files, license_name = chosen(files, package["license"] or "")
+        notices.append((f"{package['name']} {package['version']} (the layer)", license_name,
+                        files))
+    return notices
+
+
 def relibc() -> None:
     """Item 6: relibc's closure on the target, the crates -Z build-std
     builds, openlibm's headers."""
@@ -283,7 +320,8 @@ def relibc() -> None:
             files = [RELIBC / path]
         if not allowed(license_name):
             fail(f"relibc links {name} under {license_name!r}")
-        notices.append((f"{name} {package['version']}", license_name, files))
+        files, used = chosen(files, license_name)
+        notices.append((f"{name} {package['version']}", used, files))
     # The crates of the standard library relibc builds with -Z build-std.
     sysroot = subprocess.check_output(["rustup", "run", TOOLCHAIN, "rustc", "--print",
                                        "sysroot"], text=True).strip()
@@ -295,12 +333,13 @@ def relibc() -> None:
             fail(f"relibc links {package['name']} under {license_name!r}")
         files = licence_files(library / manifest.split("/")[0])
         if not files:
-            # core and alloc: the toolchain's MIT text and its copyright file.
-            files = [Path(sysroot) / "share/doc/rust/licenses/MIT.txt",
-                     Path(sysroot) / "share/doc/rust/COPYRIGHT-library.html"]
-            if not all(path.exists() for path in files):
+            # core and alloc: the toolchain's MIT text with the Rust
+            # project's copyright line.
+            files = [RUST_COPYRIGHT, Path(sysroot) / "share/doc/rust/licenses/MIT.txt"]
+            if not files[1].exists():
                 fail(f"no licence text of {package['name']} in {sysroot}/share/doc/rust")
-        notices.append((f"{package['name']} ({TOOLCHAIN})", license_name, files))
+        files, used = chosen(files, license_name)
+        notices.append((f"{package['name']} ({TOOLCHAIN})", used, files))
     path, digest, license_name = OPENLIBM
     if sha256(RELIBC / path) != digest:
         fail(f"{path} changed: read it again")
@@ -309,26 +348,28 @@ def relibc() -> None:
         if "General Public License" in header.read_text(errors="replace"):
             fail(f"openlibm header {header.name} is under a GNU licence")
     notices.append(("openlibm (headers)", license_name, [RELIBC / path]))
-    write_notices(notices)
+    write_notices(notices + layer_outside())
     print(f"relibc links {len(linked)} crates and {len(notices) - len(linked)} more parts,"
           " all under licences GPL-2.0-only takes")
 
 
 def write_notices(notices) -> None:
-    """The licence files of each part; a text met before is named, not
-    repeated. A part without files (core, alloc) points to its source."""
-    parts = ["Third-party notices: relibc and what it links into stafeto programs.\n"]
+    """The licence files of each part; a text met before (equal but for
+    spacing) is named, not repeated. A file may be a text of its own."""
+    parts = ["Third-party notices: relibc, the crates the layer takes from"
+             " outside, and what they link into stafeto programs.\n"]
     seen = {}
     for title, license_name, files in notices:
         parts.append(f"\n{'=' * 72}\n{title}: {license_name}\n{'=' * 72}\n")
-        for path in files:
-            text = path.read_text(errors="replace").rstrip()
-            digest = hashlib.sha256(text.encode()).hexdigest()
+        for item in files:
+            name, text = (item if isinstance(item, tuple)
+                          else (item.name, item.read_text(errors="replace").rstrip()))
+            digest = hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
             if digest in seen:
-                parts.append(f"\n--- {path.name}: the same text as for {seen[digest]}\n")
+                parts.append(f"\n--- {name}: the same text as for {seen[digest]}\n")
                 continue
             seen[digest] = title
-            parts.append(f"\n--- {path.name}\n\n{text}\n")
+            parts.append(f"\n--- {name}\n\n{text}\n")
     NOTICES.write_text("".join(parts))
 
 

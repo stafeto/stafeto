@@ -14,7 +14,7 @@ const CHILDREN: usize = PTHREAD_THREADS_MAX as usize - 1;
 
 unsafe extern "C" fn live(argument: *mut c_void) -> *mut c_void {
     let key = KEY.load(Ordering::Acquire);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     if !pthread_getspecific(key).is_null() || pthread_setspecific(key, argument) != 0 {
         ERRORS.fetch_add(1, Ordering::Relaxed);
     }
@@ -60,7 +60,7 @@ pub(super) fn run() -> bool {
     KEY.store(key, Ordering::Release);
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 123 };
     for round in 0..2 {
         if !settle() {
@@ -103,17 +103,17 @@ pub(super) fn run() -> bool {
             return failed(83);
         }
         // Heap and file workers must still run while all application slots are occupied.
-        let memory = unsafe { abi::allocation::malloc(64) };
+        let memory = unsafe { ffi::malloc(64) };
         if memory.is_null() {
             return failed(84);
         }
-        unsafe { abi::allocation::free(memory) };
-        let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+        unsafe { ffi::free(memory) };
+        let fd = unsafe { ffi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
         let mut text = [0u8; 3];
         if fd < 0
-            || unsafe { abi::read(fd, text.as_mut_ptr().cast(), text.len()) } != 3
+            || unsafe { ffi::read(fd, text.as_mut_ptr().cast(), text.len()) } != 3
             || text != *b"sta"
-            || unsafe { abi::close(fd) } != 0
+            || unsafe { ffi::close(fd) } != 0
             || unsafe { *errno } != 123
         {
             return failed(85);

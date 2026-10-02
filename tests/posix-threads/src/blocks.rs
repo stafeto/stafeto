@@ -11,8 +11,8 @@
 //! the lock of the actions, neither loses the wakeup of that wait nor
 //! links the thread's node twice.
 use super::*;
+use crate::layer::signals::{self as api, SigAction};
 use abi::metadata::Timespec;
-use abi::signals::{self as api, SigAction};
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 use posix_sync::LayerLock;
 use posix_thread::flag;
@@ -71,7 +71,7 @@ unsafe extern "C" fn sleeper(_: *mut c_void) -> *mut c_void {
         tv_nsec: 0,
     };
     let status = unsafe {
-        threads::sleep::clock_nanosleep(abi::clock::CLOCK_MONOTONIC, 0, &request, &mut left)
+        crate::layer::sleep::clock_nanosleep(abi::clock::CLOCK_MONOTONIC, 0, &request, &mut left)
     };
     SLEPT.store(status as usize, Ordering::SeqCst);
     LEFT.store(left.tv_sec as u64, Ordering::SeqCst);
@@ -100,7 +100,7 @@ unsafe extern "C" fn slow_handler(_: i32) {
         tv_sec: 0,
         tv_nsec: 50_000_000,
     };
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
 }
 /// Takes MUTEX, which main holds, with SIGUSR2 pending and an entry marked
 /// deferred: the entry comes at the end of the first section of its wait
@@ -142,7 +142,7 @@ fn soon(flag: &AtomicUsize) -> bool {
         if flag.load(Ordering::SeqCst) != 0 {
             return true;
         }
-        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
         false
     })
 }
@@ -310,7 +310,7 @@ pub(super) fn run() -> bool {
         tv_sec: 0,
         tv_nsec: 5_000_000,
     };
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
     if COUNTED.load(Ordering::Relaxed) == counted {
         return failed(646);
     }

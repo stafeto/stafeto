@@ -95,6 +95,24 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     },
 ];
 
+/// The probes of console input and interruption (posix-threads with
+/// cancel-input, posix-shared): the console's driver, the RAM files, the
+/// process and clock services, and the probe under the name
+/// `posix-probe`.
+pub const POSIX_DIALOG_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-probe",
+        program: "posix-probe",
+        connects: &["ramfs", "uart", "clock", "posix"],
+        quota: 512 * PAGE,
+        ..POSIX
+    },
+];
+
 pub const POSIX_ABI_TABLE: &[Record] = &[
     TABLE[0],
     Record {

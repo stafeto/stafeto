@@ -9,7 +9,7 @@
 //! instant, checked on the calendar once it passed; a calendar set forward
 //! does not wake the sleep earlier, until the clock patch of relibc.
 use super::{cancel, own_block};
-use crate::{constants::*, fail};
+use crate::constants::*;
 use core::sync::atomic::Ordering;
 use posix_time::{Deadline, Sleep};
 use posix_types::Timespec;
@@ -101,55 +101,48 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
     result
 }
 
-/// # Safety
-/// The caller is managed. request supplies a readable aligned Timespec; remaining
-/// is null or writable. They may name the same object. Absolute calls ignore remaining.
-pub unsafe extern "C" fn clock_nanosleep(
+/// Sleeps on `clock` for `requested` (an absolute time with
+/// TIMER_ABSTIME): Ok at its end; EINTR with the time left of a relative
+/// sleep when a caught signal cut it; EINVAL for a bad request. A point
+/// of cancellation.
+pub fn clock_nanosleep(
     clock: i32,
     flags: i32,
-    requested: *const Timespec,
-    remaining: *mut Timespec,
-) -> i32 {
+    requested: Timespec,
+) -> Result<(), (i32, Option<Timespec>)> {
     let point = cancel::Point::begin();
     let result = (|| {
-        if requested.is_null() {
-            return Err(EFAULT);
-        }
         if !matches!(flags, 0 | TIMER_ABSTIME) {
-            return Err(EINVAL);
+            return Err((EINVAL, None));
         }
-        // SAFETY: caller supplies one Timespec; copy before touching a possible alias.
-        let value = unsafe { requested.read() };
         let start = now();
         let deadline = Sleep::new(
             clock as u32,
             flags == TIMER_ABSTIME,
-            value.tv_sec,
-            value.tv_nsec,
+            requested.tv_sec,
+            requested.tv_nsec,
             start,
         )
-        .map_err(|_| EINVAL)?;
-        let result = sleep_until(deadline);
-        if result == Err(EINTR)
-            && !remaining.is_null()
-            && let Some(time) = deadline.remaining(now()).map_err(|_| EOVERFLOW)?
-        {
-            // SAFETY: caller supplies writable storage, possibly aliasing the copied request.
-            unsafe {
-                remaining.write(Timespec {
-                    tv_sec: time.seconds,
-                    tv_nsec: time.nanos,
-                })
-            };
+        .map_err(|_| (EINVAL, None))?;
+        match sleep_until(deadline) {
+            Err(EINTR) => {
+                let left = deadline
+                    .remaining(now())
+                    .map_err(|_| (EOVERFLOW, None))?
+                    .map(|time| Timespec {
+                        tv_sec: time.seconds,
+                        tv_nsec: time.nanos,
+                    });
+                Err((EINTR, left))
+            }
+            other => other.map_err(|error| (error, None)),
         }
-        result
     })();
     point.finish();
-    result.map_or_else(|error| error, |()| 0)
+    result
 }
-/// # Safety
-/// As for clock_nanosleep with CLOCK_REALTIME and a relative interval.
-pub unsafe extern "C" fn nanosleep(requested: *const Timespec, remaining: *mut Timespec) -> i32 {
-    let status = unsafe { clock_nanosleep(crate::clock::CLOCK_REALTIME, 0, requested, remaining) };
-    if status == 0 { 0 } else { fail(status) as i32 }
+
+/// clock_nanosleep with CLOCK_REALTIME and a relative interval.
+pub fn nanosleep(requested: Timespec) -> Result<(), (i32, Option<Timespec>)> {
+    clock_nanosleep(crate::clock::CLOCK_REALTIME, 0, requested)
 }

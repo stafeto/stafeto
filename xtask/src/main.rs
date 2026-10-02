@@ -31,7 +31,7 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
 /// The main stack of a POSIX program: its requests on its files run on its
 /// own stack, under the lock of the layer, with no file worker.
-const POSIX_STACK_SIZE: u32 = 32 * 1024;
+const POSIX_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
@@ -155,7 +155,7 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -166,7 +166,7 @@ const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
-        "busybox-probe",
+        "posix-probe",
         "posix-thread-probe",
         POSIX_STACK_SIZE,
         &["cancel-input"],
@@ -206,12 +206,7 @@ const RTBENCH_VZ_PROGRAMS: [ImageProgram; 3] = [
 /// The POSIX images of Apple VZ: those of QEMU with init's VZ tables and
 /// the Virtio console's driver in place of the PL011's.
 const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
-    (
-        "init",
-        "init",
-        INIT_STACK_SIZE,
-        &["table-busybox-dialog-vz"],
-    ),
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -222,7 +217,7 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
-        "busybox-probe",
+        "posix-probe",
         "posix-thread-probe",
         POSIX_STACK_SIZE,
         &["cancel-input"],
@@ -249,7 +244,7 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
 ];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
 const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", SVC_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -260,19 +255,14 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
-        "busybox-probe",
+        "posix-probe",
         "posix-shared-probe",
         POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
 const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
-    (
-        "init",
-        "init",
-        INIT_STACK_SIZE,
-        &["table-busybox-dialog-vz"],
-    ),
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -283,14 +273,14 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
-        "busybox-probe",
+        "posix-probe",
         "posix-shared-probe",
         POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
         "posix-process-service",
@@ -301,19 +291,14 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     (
-        "busybox-probe",
+        "posix-probe",
         "posix-shared-probe",
         POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
 ];
 const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
-    (
-        "init",
-        "init",
-        INIT_STACK_SIZE,
-        &["table-busybox-dialog-vz"],
-    ),
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
         "posix-process-service",
@@ -324,7 +309,7 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     (
-        "busybox-probe",
+        "posix-probe",
         "posix-shared-probe",
         POSIX_STACK_SIZE,
         &["interrupt-probe"],
@@ -851,6 +836,7 @@ commands:
   ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits)
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
+  layer-names  check that the layer's libraries export no C name
   os-test   run os-test's io and malloc suites on relibc, one test a boot;
             the table goes to target/measure/os-test.txt
   help      this text";
@@ -891,6 +877,7 @@ fn main() {
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
         Some("os-test") => ostest::run(),
+        Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
@@ -1190,6 +1177,20 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     };
     if let Some(notices) = &notices {
         list.push((NOTICES, notices.as_slice()));
+    }
+    // An image with BusyBox (GPL-2.0-only) carries its licence, its
+    // copyright notice and where its exact source is (GPLv2, 1 and 3).
+    let busybox = sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "busybox-probe"));
+    let busybox_files = if busybox {
+        Some(busybox_terms()?)
+    } else {
+        None
+    };
+    if let Some((licence, source)) = &busybox_files {
+        list.push((BUSYBOX_LICENSE, licence.as_slice()));
+        list.push((BUSYBOX_SOURCE, source.as_bytes()));
     }
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
@@ -1499,7 +1500,7 @@ fn posix_cancel_input_probe(vz: bool) -> Result<(), String> {
         )?
     };
     let (cmd, _) = probe_command(&image, vz)?;
-    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
+    const ENDED: &str = "init: posix-probe ended: exit code 0, not restarted";
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(
@@ -1553,7 +1554,7 @@ fn posix_input_probe(vz: bool) -> Result<(), String> {
         build_boot_image("boot-posix-input.img", &POSIX_INPUT_PROGRAMS, BOOT_PROFILE)?
     };
     let (cmd, _) = probe_command(&image, vz)?;
-    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
+    const ENDED: &str = "init: posix-probe ended: exit code 0, not restarted";
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
         run.expect(
@@ -1592,7 +1593,7 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
         )?
     };
     let (cmd, _) = probe_command(&image, vz)?;
-    const ENDED: &str = "init: busybox-probe ended: exit code 0, not restarted";
+    const ENDED: &str = "init: posix-probe ended: exit code 0, not restarted";
     // Inject no input until cleanup and recovery have completed.
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
@@ -1626,6 +1627,44 @@ fn notices_path() -> PathBuf {
 
 /// The name of the notices in a boot image.
 const NOTICES: &str = "THIRD-PARTY-NOTICES";
+/// BusyBox's licence and the note of its notice and source in an image.
+const BUSYBOX_LICENSE: &str = "BUSYBOX-LICENSE";
+const BUSYBOX_SOURCE: &str = "BUSYBOX-SOURCE";
+
+/// The value of `NAME = "value"` in the Python script `script`.
+fn script_value(script: &str, name: &str) -> Result<String, String> {
+    let text =
+        std::fs::read_to_string(root().join(script)).map_err(|e| format!("{script}: {e}"))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} = \"")))
+        .and_then(|rest| rest.split('"').next())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{script}: no {name}"))
+}
+
+/// BusyBox's LICENSE (GPLv2 with its note) and the note of BusyBox's
+/// copyright and of the exact source of the program in the image.
+fn busybox_terms() -> Result<(Vec<u8>, String), String> {
+    let path = target_dir().join("busybox/source/LICENSE");
+    let licence = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let version = script_value("tools/build-busybox.py", "VERSION")?;
+    let sha256 = script_value("tools/build-busybox.py", "SHA256")?;
+    let relibc = script_value("tools/build-relibc.py", "COMMIT")?;
+    let source = format!(
+        "busybox-probe holds BusyBox {version}.\n\
+         BusyBox is copyrighted by many authors between 1998-2015.\n\
+         Licensed under GPLv2 (BUSYBOX-LICENSE). See source distribution for\n\
+         detailed copyright notices.\n\n\
+         Its source: https://busybox.net/downloads/busybox-{version}.tar.bz2\n\
+         (SHA-256 {sha256}), changed and configured by tools/build-busybox.py\n\
+         of https://github.com/stafeto/stafeto at commit {}, which also holds\n\
+         the probe's main (tests/busybox); linked with relibc\n\
+         https://github.com/stafeto/relibc at commit {relibc}\n\
+         (THIRD-PARTY-NOTICES).\n",
+        rtbench2::commit()
+    );
+    Ok((licence, source))
+}
 
 fn relibc() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))?;
@@ -1647,6 +1686,30 @@ fn links_relibc(bytes: &[u8]) -> bool {
     bytes
         .windows(b"relibc_start_v1".len())
         .any(|window| window == b"relibc_start_v1")
+}
+
+/// Fails unless the boot image at `path` carries BusyBox's licence and
+/// the note of its source.
+fn image_has_busybox_terms(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (licence, _) = busybox_terms()?;
+    let carries = |name: &str, check: &dyn Fn(&[u8]) -> bool| {
+        image
+            .files()
+            .any(|file| file.name == name && check(file.data))
+    };
+    if carries(BUSYBOX_LICENSE, &|data| data == licence.as_slice())
+        && carries(BUSYBOX_SOURCE, &|data| {
+            data.windows(16).any(|w| w == b"busybox-1.37.0.t")
+                && data.windows(5).any(|w| w == b"GPLv2")
+        })
+    {
+        Ok(())
+    } else {
+        Err(format!("{} carries no BusyBox terms", path.display()))
+    }
 }
 
 /// Fails unless the boot image at `path` carries relibc's notices.
@@ -1745,7 +1808,10 @@ fn busybox_probe() -> Result<(), String> {
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "stafeto ramfs")?;
     image_has_notices(&image)?;
-    println!("BusyBox cat guest probe passed, {NOTICES} in its image");
+    image_has_busybox_terms(&image)?;
+    println!(
+        "BusyBox cat guest probe passed, {NOTICES}, {BUSYBOX_LICENSE} and {BUSYBOX_SOURCE} in its image"
+    );
     Ok(())
 }
 
@@ -1796,6 +1862,8 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls -la")?;
         run.expect("ls -la", DIALOG_STEP)?;
+        // The directories show as such: st_mode of a directory.
+        run.expect("dr-xr-xr-x", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls --help")?;
         run.expect("ls --help", DIALOG_STEP)?;
@@ -1889,7 +1957,16 @@ fn ash_dialog() -> Result<(), String> {
     }) {
         return Err("ash long listing is incomplete".into());
     }
-    println!("BusyBox ash interactive guest dialog passed");
+    let elf = image_elf(&target_dir(), "boot-ash-dialog.img", "busybox-probe");
+    let text = text_size(&elf)?;
+    println!(
+        "BusyBox ash interactive guest dialog passed; .text {text} bytes, limit {BUSYBOX_TEXT_LIMIT}"
+    );
+    if text > BUSYBOX_TEXT_LIMIT {
+        return Err(format!(
+            "BusyBox's .text is {text} bytes, over {BUSYBOX_TEXT_LIMIT}: the growth wants its analysis (llvm-nm --size-sort)"
+        ));
+    }
     Ok(())
 }
 
@@ -3381,68 +3458,100 @@ fn layer_symbol_allowed(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with("stafeto_") || name == "__rt_main"
 }
 
-/// The names `text` gives the linker: each `no_mangle` item's own name and
-/// each `export_name`.
-fn exported_names(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut pending = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.split("export_name = \"").nth(1) {
-            names.extend(rest.split('"').next().map(str::to_owned));
-            continue;
-        }
-        if line.contains("no_mangle") && line.starts_with("#[") {
-            pending = true;
-            continue;
-        }
-        if pending && !line.starts_with("#[") && !line.starts_with("//") {
-            let words: Vec<&str> = line
-                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                .filter(|w| !w.is_empty())
-                .collect();
-            if let Some(at) = words.iter().position(|w| *w == "fn" || *w == "static") {
-                let at = if words.get(at + 1) == Some(&"mut") {
-                    at + 2
-                } else {
-                    at + 1
-                };
-                names.extend(words.get(at).map(|w| (*w).to_owned()));
-            }
-            pending = false;
-        }
-    }
-    names
+/// The C names in `listing`, the output of `llvm-nm --defined-only -g`:
+/// the global symbols that are no Rust symbol (`_R`, `_ZN`), which the
+/// linker would match with relibc's.
+fn c_symbols(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let (_, kind, name) = (words.next()?, words.next()?, words.next()?);
+            (kind != "U" && !name.starts_with("_R") && !name.starts_with("_ZN"))
+                .then(|| name.to_owned())
+        })
+        .collect()
 }
 
-/// No C names in the layer: `lib/posix-*` exports only `layer_symbol_allowed`.
-fn layer_c_names() -> Result<(), String> {
-    let mut found = Vec::new();
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(root().join("lib"))
-        .map_err(|e| format!("lib: {e}"))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("posix-"))
+/// The `.rlib` files cargo's JSON messages `messages` name for packages
+/// whose crate starts with `posix_`.
+fn layer_libraries(messages: &str) -> Vec<PathBuf> {
+    messages
+        .lines()
+        .filter(|line| {
+            line.contains("\"reason\":\"compiler-artifact\"") && line.contains("\"name\":\"posix_")
         })
-        .collect();
-    while let Some(path) = paths.pop() {
-        if path.is_dir() {
-            for entry in std::fs::read_dir(&path).map_err(|e| format!("{path:?}: {e}"))? {
-                paths.push(entry.map_err(|e| format!("{path:?}: {e}"))?.path());
-            }
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
-            for name in exported_names(&text) {
-                if !layer_symbol_allowed(&name) {
-                    found.push(format!("{}: {name}", path.display()));
-                }
+        .flat_map(|line| {
+            line.split('"')
+                .filter(|word| word.ends_with(".rlib"))
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// No C names in the layer: the symbols of every crate of `lib/posix-*`,
+/// as built for the programs, are Rust's or `layer_symbol_allowed`
+/// (`no_mangle`, `export_name`, `global_asm!` and macros alike).
+fn layer_c_names() -> Result<(), String> {
+    let mut packages = Vec::new();
+    for entry in std::fs::read_dir(root().join("lib")).map_err(|e| format!("lib: {e}"))? {
+        let path = entry.map_err(|e| format!("lib: {e}"))?.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("posix-"))
+        {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(path.join("Cargo.toml"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = manifest
+            .lines()
+            .find_map(|line| line.strip_prefix("name = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .ok_or_else(|| format!("{}: no package name", path.display()))?;
+        packages.push(name.to_owned());
+    }
+    let mut cmd = cargo();
+    cmd.args([
+        "build",
+        "--release",
+        "--target",
+        PROGRAM_TARGET,
+        "--message-format=json",
+    ]);
+    for package in &packages {
+        cmd.args(["--package", package]);
+    }
+    let messages = stdout_of(&mut cmd)?;
+    let libraries = layer_libraries(&messages);
+    if libraries.len() < packages.len() {
+        return Err(format!(
+            "the layer's names: {} libraries for {} packages",
+            libraries.len(),
+            packages.len()
+        ));
+    }
+    let nm = llvm_tool("llvm-nm")?;
+    let mut found = Vec::new();
+    for library in &libraries {
+        let listing = stdout_of(
+            Command::new(&nm)
+                .args(["--defined-only", "-g", "--no-sort"])
+                .arg(library),
+        )?;
+        for name in c_symbols(&listing) {
+            if !layer_symbol_allowed(&name) {
+                found.push(format!("{}: {name}", library.display()));
             }
         }
     }
     if found.is_empty() {
-        println!("layer C names: none, only stafeto_* and __rt_main");
+        println!(
+            "layer C names: none in {} libraries, only stafeto_* and __rt_main",
+            libraries.len()
+        );
         Ok(())
     } else {
         Err(format!("C names in the layer (relibc has them): {found:?}"))
@@ -3473,6 +3582,23 @@ fn layer_data_of(listing: &str) -> u64 {
                 .then(|| u64::from_str_radix(size, 16).ok())?
         })
         .sum()
+}
+
+/// The bound of the `.text` of the BusyBox probe of the `ash` dialog: 246
+/// KB at 5a′ (relibc for size), so that growth does not creep in
+/// unnoticed.
+const BUSYBOX_TEXT_LIMIT: u64 = 256 * 1024;
+
+/// The size of `.text` in the ELF `elf` (`llvm-size -A`).
+fn text_size(elf: &Path) -> Result<u64, String> {
+    let output = stdout_of(Command::new(llvm_tool("llvm-size")?).arg("-A").arg(elf))?;
+    output
+        .lines()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some(".text")).then(|| words.next()?.parse().ok())?
+        })
+        .ok_or_else(|| format!("{}: no .text", elf.display()))
 }
 
 /// The bound of the layer's `.data` + `.bss` in a program (5a′, Т5).
@@ -3771,18 +3897,43 @@ fn ci() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// The check of the layer's names sees `no_mangle` items and
-    /// `export_name`, and lets through only the platform's names.
+    /// The check of the layer's names takes every global defined symbol
+    /// that is no Rust symbol, and lets through only the platform's names.
     #[test]
     fn layer_names_are_found() {
-        let text = "#[unsafe(no_mangle)]\npub extern \"C\" fn strlen() {}\n\
-                    #[unsafe(no_mangle)]\npub extern \"C\" fn stafeto_read() {}\n\
-                    #[unsafe(export_name = \"__rt_main\")]\nfn crt() {}\n\
-                    #[unsafe(no_mangle)]\npub static mut environ: u64 = 0;\n";
-        let names = exported_names(text);
-        assert_eq!(names, ["strlen", "stafeto_read", "__rt_main", "environ"]);
+        let listing = "\n/x/libposix_abi.rlib(posix_abi-1.o):\n\
+                       0000000000000000 T strlen\n\
+                       0000000000000010 T _RNvCs123_9posix_abi4open\n\
+                       0000000000000020 T _ZN9posix_abi4read17h0E\n\
+                       0000000000000030 T stafeto_read\n\
+                       0000000000000040 T __rt_main\n\
+                       0000000000000050 D STAFETO_PLATFORM_ABI\n\
+                       0000000000000060 T memset\n\
+                                        U strcmp\n";
+        let names = c_symbols(listing);
+        assert_eq!(
+            names,
+            [
+                "strlen",
+                "stafeto_read",
+                "__rt_main",
+                "STAFETO_PLATFORM_ABI",
+                "memset"
+            ]
+        );
         let refused: Vec<_> = names.iter().filter(|n| !layer_symbol_allowed(n)).collect();
-        assert_eq!(refused, ["strlen", "environ"]);
+        assert_eq!(refused, ["strlen", "memset"]);
+    }
+
+    /// The libraries of the layer come from cargo's messages.
+    #[test]
+    fn layer_libraries_come_from_cargo() {
+        let messages = "{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"posix_abi\"},\"filenames\":[\"/t/libposix_abi-1.rlib\",\"/t/libposix_abi-1.rmeta\"]}\n\
+                        {\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"rt\"},\"filenames\":[\"/t/librt-2.rlib\"]}\n";
+        assert_eq!(
+            layer_libraries(messages),
+            [PathBuf::from("/t/libposix_abi-1.rlib")]
+        );
     }
 
     /// The layer's data counts the data and bss symbols of its crates.

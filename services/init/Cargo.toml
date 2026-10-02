@@ -38,6 +38,8 @@ table-relibc-threads = []
 table-os-test = []
 table-busybox = []
 table-busybox-dialog = []
+table-posix-dialog = []
+table-posix-dialog-vz = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

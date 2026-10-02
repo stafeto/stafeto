@@ -17,7 +17,7 @@ extern "C" fn handler(_: i32) {
     }
 }
 unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 733 };
     let passed = abi::process::getuid() == 0
         && abi::process::geteuid() == 1000
@@ -90,25 +90,25 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     {
         return failed(490);
     }
-    if abi::process::seteuid(1000) != 0 || !joined(reader) || !peer(parent, &own) {
+    if abi::process::seteuid(1000).is_err() || !joined(reader) || !peer(parent, &own) {
         return failed(491);
     }
-    let action = abi::signals::SigAction {
+    let action = crate::layer::signals::SigAction {
         handler: handler as *const () as u64,
         mask: 0,
         flags: 0,
     };
     let mut old = action;
-    if unsafe { abi::signals::sigaction(SIGUSR1, &action, &mut old) } != 0
-        || abi::signals::raise(SIGUSR1) != 0
+    if unsafe { crate::layer::signals::sigaction(SIGUSR1, &action, &mut old) } != 0
+        || crate::layer::signals::raise(SIGUSR1) != 0
         || HANDLED.load(Ordering::Acquire) != 1
-        || unsafe { abi::signals::sigaction(SIGUSR1, &old, ptr::null_mut()) } != 0
+        || unsafe { crate::layer::signals::sigaction(SIGUSR1, &old, ptr::null_mut()) } != 0
     {
         return failed(492);
     }
     // Create only through the channel with no label.
     if c.create(&own, true).err() != Some(Status::from_code(proto_process::PERMISSION))
-        || abi::process::seteuid(0) != 0
+        || abi::process::seteuid(0).is_err()
         || c.query().unwrap() != original
     {
         return failed(493);

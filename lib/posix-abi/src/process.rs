@@ -58,50 +58,46 @@ fn credentials() -> proto_process::Credentials {
         .credentials
 }
 
-pub extern "C" fn getuid() -> u32 {
+pub fn getuid() -> u32 {
     credentials().uid
 }
-pub extern "C" fn geteuid() -> u32 {
+pub fn geteuid() -> u32 {
     credentials().euid
 }
-pub extern "C" fn getgid() -> u32 {
+pub fn getgid() -> u32 {
     credentials().gid
 }
-pub extern "C" fn getegid() -> u32 {
+pub fn getegid() -> u32 {
     credentials().egid
 }
 
-fn change(operation: Change, id: u32) -> i32 {
-    client().change(operation, id).map_or_else(
-        |error| {
-            let code = match error.code() {
-                proto_process::INVALID => crate::constants::EINVAL,
-                proto_process::PERMISSION => crate::constants::EPERM,
-                proto_process::FULL => crate::constants::ENOMEM,
-                _ => crate::constants::EIO,
-            };
-            crate::fail(code) as i32
-        },
-        |()| 0,
-    )
+fn change(operation: Change, id: u32) -> Result<(), i32> {
+    client()
+        .change(operation, id)
+        .map_err(|error| match error.code() {
+            proto_process::INVALID => crate::constants::EINVAL,
+            proto_process::PERMISSION => crate::constants::EPERM,
+            proto_process::FULL => crate::constants::ENOMEM,
+            _ => crate::constants::EIO,
+        })
 }
-pub extern "C" fn setuid(id: u32) -> i32 {
+pub fn setuid(id: u32) -> Result<(), i32> {
     change(Change::Uid, id)
 }
-pub extern "C" fn seteuid(id: u32) -> i32 {
+pub fn seteuid(id: u32) -> Result<(), i32> {
     change(Change::EffectiveUid, id)
 }
-pub extern "C" fn setgid(id: u32) -> i32 {
+pub fn setgid(id: u32) -> Result<(), i32> {
     change(Change::Gid, id)
 }
-pub extern "C" fn setegid(id: u32) -> i32 {
+pub fn setegid(id: u32) -> Result<(), i32> {
     change(Change::EffectiveGid, id)
 }
 
-pub extern "C" fn getpid() -> i32 {
+pub fn getpid() -> i32 {
     i32::try_from(PID.load(Ordering::Acquire)).expect("positive signed process namespace")
 }
 
-pub extern "C" fn getppid() -> i32 {
+pub fn getppid() -> i32 {
     i32::try_from(PPID.load(Ordering::Acquire)).expect("signed parent process namespace")
 }

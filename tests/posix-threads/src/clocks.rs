@@ -5,7 +5,7 @@
 //! the kernel answers an accepted request once, so the clock service needs
 //! no journal (spec 6.1).
 use super::*;
-use abi::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
+use crate::layer::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
 use abi::metadata::Timespec;
 use posix_clock::Client;
 use posix_time::Time;
@@ -34,7 +34,7 @@ unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     if unsafe { clock::clock_gettime(CLOCK_REALTIME, &mut value) } != 0
         || unsafe { *errno } != 777
@@ -49,7 +49,7 @@ unsafe extern "C" fn setter(argument: *mut c_void) -> *mut c_void {
         tv_sec: 20_000_000_000 + argument as i64,
         tv_nsec: 42_123,
     };
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     if unsafe { clock::clock_settime(CLOCK_REALTIME, &value) } != 0 || unsafe { *errno } != 777 {
         return ptr::null_mut();

@@ -15,10 +15,8 @@ fn refused(bytes: &[u8], errno: i32) -> bool {
 
 pub fn before_heap() -> bool {
     tls::with_process(|| {
-        let errno = unsafe { abi::__errno_location() };
-        unsafe { *errno = EIO };
         let mut cwd = [0; 3];
-        if unsafe { abi::getcwd(cwd.as_mut_ptr(), cwd.len()) }.is_null() || &cwd[..2] != b"/\0" {
+        if abi::getcwd(&mut cwd) != Ok(1) || &cwd[..2] != b"/\0" {
             return fail(60);
         }
         if !refused(&[1], EINVAL)
@@ -44,22 +42,17 @@ pub fn before_heap() -> bool {
         Request::DirRead { stream: u64::MAX }
             .write(&mut request)
             .unwrap();
-        if !refused(request.as_bytes(), EBADF) {
+        // Directory streams are relibc's: the layer refuses their requests.
+        if !refused(request.as_bytes(), ENOSYS) {
             return fail(64);
         }
         let mut long_path = [b'x'; 82];
         long_path[0] = b'/';
         long_path[81] = 0;
-        if unsafe { abi::open(long_path.as_ptr().cast(), O_RDONLY) } != -1
-            || unsafe { *errno } != ENOENT
-        {
+        if abi::open(&long_path[..81], O_RDONLY) != Err(ENOENT) {
             return fail(65);
         }
-        unsafe { *errno = EIO };
-        if unsafe { abi::getcwd(cwd.as_mut_ptr(), cwd.len()) }.is_null()
-            || &cwd[..2] != b"/\0"
-            || unsafe { *errno } != EIO
-        {
+        if abi::getcwd(&mut cwd) != Ok(1) || &cwd[..2] != b"/\0" {
             return fail(66);
         }
         rt::println!("posix-message-probe: malformed requests rejected before heap");
@@ -68,9 +61,9 @@ pub fn before_heap() -> bool {
 }
 
 pub fn payload() -> bool {
-    let errno = unsafe { abi::__errno_location() };
-    unsafe { *errno = EIO };
-    let fd = unsafe { abi::open(c"/tmp/probe".as_ptr(), O_RDWR) };
+    let Ok(fd) = abi::open(b"/tmp/probe", O_RDWR) else {
+        return fail(67);
+    };
     if fd != 3 {
         return fail(67);
     }
@@ -78,20 +71,17 @@ pub fn payload() -> bool {
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = (index.wrapping_mul(37) ^ (index >> 3)) as u8;
     }
-    if unsafe { abi::write(fd, bytes.as_ptr(), bytes.len()) } != MAX_WRITE as isize
-        || unsafe { abi::write(fd, bytes[MAX_WRITE..].as_ptr(), bytes.len() - MAX_WRITE) }
-            != (bytes.len() - MAX_WRITE) as isize
-        || unsafe { abi::lseek(fd, 0, SEEK_SET) } != 0
+    if abi::write(fd, &bytes) != Ok(MAX_WRITE)
+        || abi::write(fd, &bytes[MAX_WRITE..]) != Ok(bytes.len() - MAX_WRITE)
+        || abi::lseek(fd, 0, SEEK_SET) != Ok(0)
     {
         return fail(68);
     }
     let mut copy = [0; 1024];
-    if unsafe { abi::read(fd, copy.as_mut_ptr(), copy.len()) } != MAX_READ as isize
-        || unsafe { abi::read(fd, copy[MAX_READ..].as_mut_ptr(), copy.len() - MAX_READ) }
-            != (copy.len() - MAX_READ) as isize
+    if abi::read(fd, &mut copy) != Ok(MAX_READ)
+        || abi::read(fd, &mut copy[MAX_READ..]) != Ok(copy.len() - MAX_READ)
         || copy != bytes
-        || unsafe { *errno } != EIO
-        || unsafe { abi::close(fd) } != 0
+        || abi::close(fd).is_err()
     {
         return fail(69);
     }

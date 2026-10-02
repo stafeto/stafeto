@@ -148,6 +148,9 @@ pub unsafe fn attach_main(block: *mut Block) {
 /// request of cancellation; ESRCH for none. A thread stays in its place
 /// until relibc released it, which relibc does after the last use of its
 /// number.
+/// The block is read without the lock of the table: `collect` frees only a
+/// place relibc released, and after that the thread's `pthread_t` is no
+/// longer valid (POSIX), so no caller asks for it.
 pub fn target(id: u64) -> Result<(&'static Block, core::mem::ManuallyDrop<Handle<Thread>>), i32> {
     let place = usize::try_from(id)
         .ok()
@@ -383,7 +386,6 @@ pub unsafe fn create(
         block.thread.store(own.into_raw().0, Ordering::Relaxed);
         block.timer.store(timer.into_raw().0, Ordering::Relaxed);
         block.channel.store(channel.into_raw().0, Ordering::Relaxed);
-        block.process_files = 1;
         block.thread_id = id;
         block.cancel_point.store(0, Ordering::Relaxed);
     }

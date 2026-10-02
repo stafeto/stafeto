@@ -31,6 +31,10 @@ pub const PTHREAD_MUTEX_ERRORCHECK: c_int = 1;
 pub const PTHREAD_MUTEX_NORMAL: c_int = 2;
 pub const PTHREAD_MUTEX_RECURSIVE: c_int = 3;
 pub const PTHREAD_STACK_MIN: usize = 65536;
+pub const O_RDONLY: c_int = 0;
+pub const O_RDWR: c_int = 2;
+pub const SEEK_SET: c_int = 0;
+pub const SEEK_CUR: c_int = 1;
 pub const PTHREAD_DESTRUCTOR_ITERATIONS: u32 = 4;
 /// `pthread_join`'s value of a cancelled thread.
 pub const CANCELED: *mut c_void = usize::MAX as *mut c_void;
@@ -200,8 +204,40 @@ unsafe extern "C" {
     pub safe fn pthread_getspecific(key: pthread_key_t) -> *mut c_void;
     pub safe fn pthread_setspecific(key: pthread_key_t, value: *const c_void) -> c_int;
     pub fn __errno_location() -> *mut c_int;
+    pub fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
+    pub fn close(fd: c_int) -> c_int;
+    pub fn read(fd: c_int, buffer: *mut u8, count: usize) -> isize;
+    pub fn write(fd: c_int, buffer: *const u8, count: usize) -> isize;
+    pub fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
+    pub fn dup(fd: c_int) -> c_int;
+    pub fn dup2(fd: c_int, target: c_int) -> c_int;
+    pub fn getcwd(buffer: *mut core::ffi::c_char, size: usize) -> *mut core::ffi::c_char;
+    pub fn chdir(path: *const core::ffi::c_char) -> c_int;
+    pub fn stat(path: *const core::ffi::c_char, out: *mut Stat) -> c_int;
+    pub fn fstat(fd: c_int, out: *mut Stat) -> c_int;
+    pub fn malloc(size: usize) -> *mut u8;
+    pub fn free(pointer: *mut u8);
     fn __relibc_internal_pthread_cleanup_push(node: *mut c_void);
     fn __relibc_internal_pthread_cleanup_pop(execute: c_int);
+}
+
+/// relibc's `struct stat` (Linux AArch64, 128 bytes), opaque but for its
+/// size field.
+#[repr(C, align(8))]
+pub struct Stat([u8; 128]);
+impl Stat {
+    pub const fn new() -> Self {
+        Self([0; 128])
+    }
+    /// `st_size`, 48 bytes on.
+    pub fn size(&self) -> i64 {
+        i64::from_le_bytes(self.0[48..56].try_into().expect("eight bytes"))
+    }
+}
+impl Default for Stat {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// `struct timespec`.

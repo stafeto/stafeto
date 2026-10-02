@@ -7,7 +7,7 @@
 //! layer has signals 1 to 31; a real-time signal is EINVAL, and the bits
 //! 32 to 64 of a set are dropped.
 
-use super::call;
+use super::{call, value};
 use core::ffi::c_int;
 use posix_abi::constants::{EINVAL, ENOSYS};
 use posix_abi::signals::{SigAction, SigSet};
@@ -63,15 +63,10 @@ pub unsafe extern "C" fn stafeto_sigaction(
         mask: act.mask & LAYER,
         flags: to_layer_flags(act.flags),
     });
-    let mut previous = posix_signals::INITIAL;
-    let new_ptr = new.as_ref().map_or(core::ptr::null(), core::ptr::from_ref);
-    // SAFETY: the action is a copy on this stack; `previous` is writable.
-    let status = call(|| {
-        i64::from(unsafe { posix_abi::signals::sigaction(signal, new_ptr, &mut previous) })
-    });
-    if status < 0 {
-        return status as c_int;
-    }
+    let previous = match call(|| posix_abi::signals::sigaction(signal, new)) {
+        Ok(previous) => previous,
+        Err(errno) => return -errno,
+    };
     // SAFETY: the caller's promise.
     if let Some(old) = unsafe { old.as_mut() } {
         *old = LinuxSigaction {
@@ -99,13 +94,10 @@ pub unsafe extern "C" fn stafeto_sigprocmask(how: c_int, set: *const u64, old: *
     };
     // SAFETY: the caller's promise.
     let set = unsafe { set.as_ref() }.map(|set| set & LAYER & !posix_signals::UNBLOCKABLE);
-    let mut previous: SigSet = 0;
-    let set_ptr = set.as_ref().map_or(core::ptr::null(), core::ptr::from_ref);
-    // SAFETY: both point to this stack.
-    let status = unsafe { posix_abi::signals::pthread_sigmask(how, set_ptr, &mut previous) };
-    if status != 0 {
-        return -status;
-    }
+    let previous: SigSet = match posix_abi::signals::pthread_sigmask(how, set) {
+        Ok(previous) => previous,
+        Err(errno) => return -errno,
+    };
     // SAFETY: the caller's promise.
     if let Some(old) = unsafe { old.as_mut() } {
         *old = previous;
@@ -117,8 +109,12 @@ pub unsafe extern "C" fn stafeto_sigprocmask(how: c_int, set: *const u64, old: *
 /// `set` is writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_sigpending(set: *mut u64) -> c_int {
+    if set.is_null() {
+        return -posix_abi::constants::EFAULT;
+    }
     // SAFETY: the caller's promise.
-    call(|| i64::from(unsafe { posix_abi::signals::sigpending(set) })) as c_int
+    unsafe { set.write(posix_abi::signals::sigpending()) };
+    0
 }
 
 /// # Safety
@@ -151,10 +147,10 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
     if set == 0 {
         return -EINVAL;
     }
-    let status = call(|| {
-        // SAFETY: a set on this stack; the timeout as given.
-        i64::from(unsafe { posix_abi::signals::sigtimedwait(&set, core::ptr::null_mut(), timeout) })
-    });
+    // SAFETY: the caller's promise.
+    let timeout = unsafe { timeout.as_ref() }.copied();
+    let status =
+        value(call(|| posix_abi::signals::sigtimedwait(set, None, timeout)).map(i64::from));
     if status > 0 && !info.is_null() {
         // SAFETY: the caller's promise.
         unsafe {
@@ -168,7 +164,7 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_raise(signal: c_int) -> c_int {
-    call(|| i64::from(posix_abi::signals::raise(signal))) as c_int
+    value(call(|| posix_abi::signals::raise(signal)).map(|()| 0)) as c_int
 }
 
 /// kill: the process's own signals go to the calling thread until the

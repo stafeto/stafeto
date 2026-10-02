@@ -8,7 +8,7 @@
 //! steps back after the wait began is checked again: the lock waits for
 //! the new instant.
 use super::*;
-use abi::clock::{self, CLOCK_REALTIME};
+use crate::layer::clock::{self, CLOCK_REALTIME};
 use abi::metadata::Timespec;
 use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_timedlock, pthread_mutex_unlock};
 

@@ -3,7 +3,7 @@
 
 //! Real process dispositions, thread masks, native nesting and IPC wakeups.
 use super::*;
-use abi::signals::{self as api, SigAction, SigSet};
+use crate::layer::signals::{self as api, SigAction, SigSet};
 use core::sync::atomic::AtomicBool;
 use rt::wait::{Waited, Waiter};
 static MODE: AtomicUsize = AtomicUsize::new(0);
@@ -85,27 +85,27 @@ unsafe extern "C" fn handler(signal: i32) {
     }
     if mode == 8 {
         // The errno-only scope preserves identity without providing file context.
-        unsafe { *abi::__errno_location() = 901 };
+        unsafe { *ffi::__errno_location() = 901 };
         DEPTH.fetch_sub(1, Ordering::SeqCst);
         return;
     }
     // Required signal-safe file calls use the independent process file owner.
-    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+    let fd = unsafe { ffi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
     let mut byte = 0;
     if fd < 0
-        || unsafe { abi::read(fd, &mut byte, 1) } != 1
+        || unsafe { ffi::read(fd, &mut byte, 1) } != 1
         || byte != b's'
-        || unsafe { abi::close(fd) } != 0
+        || unsafe { ffi::close(fd) } != 0
     {
         ERRORS.fetch_add(1, Ordering::Release);
     }
-    unsafe { *abi::__errno_location() = 901 };
+    unsafe { *ffi::__errno_location() = 901 };
     DEPTH.fetch_sub(1, Ordering::SeqCst);
 }
 unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     ID.store(ffi::pthread_self(), Ordering::Release);
     let mode = MODE.load(Ordering::Acquire);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     let mut passed = true;
     if mode <= 2 || mode == 6 {
@@ -130,12 +130,10 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         passed &= mask() == 0 && pending() == 0 && unsafe { *errno } == 777;
         passed &= ffi::pthread_kill(ffi::pthread_self(), 0) == 0;
     } else if mode == 8 {
-        passed &= abi::tls::with_errno(|| {
-            let inner = unsafe { abi::__errno_location() };
-            unsafe { *inner = 555 };
+        // A nested scope of the layer keeps the thread's block.
+        passed &= abi::tls::with_process(|| {
             api::raise(SIGUSR1) == 0
                 && COUNT.load(Ordering::Acquire) == 1
-                && unsafe { *inner } == 555
                 && ffi::pthread_self() == ID.load(Ordering::Acquire)
         });
         passed &= unsafe { *errno } == 777;
@@ -338,7 +336,7 @@ unsafe extern "C" fn pressure_info_handler(
 unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     sys::receive(&channel(&GATE)).unwrap();
     ID.store(ffi::pthread_self(), Ordering::Release);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     let mut old = posix_signals::INITIAL;
     let info_action = SigAction {
@@ -414,7 +412,7 @@ fn under_pressure() -> bool {
     while sys::thread_info(&retained).unwrap().state != ThreadState::Ended {
         if !delivered
             && PRESSURE_WAIT.load(Ordering::Acquire)
-            && abi::signals::probe_waiting(id) == Ok(true)
+            && crate::layer::signals::probe_waiting(id) == Ok(true)
         {
             if ffi::pthread_kill(id, SIGUSR1) != 0 {
                 return failed(398);
