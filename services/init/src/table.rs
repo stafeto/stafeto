@@ -696,6 +696,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-abi") as usize
     + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-relibc-threads") as usize
+    + cfg!(feature = "table-os-test") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
@@ -720,6 +721,7 @@ const _: () = assert!(
     feature = "table-posix-abi",
     feature = "table-relibc",
     feature = "table-relibc-threads",
+    feature = "table-os-test",
     feature = "table-posix-abi-vz",
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
@@ -735,6 +737,8 @@ pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
 pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
 #[cfg(feature = "table-relibc-threads")]
 pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
+#[cfg(feature = "table-os-test")]
+pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 #[cfg(feature = "table-busybox")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "table-busybox-dialog")]
@@ -1466,6 +1470,7 @@ mod tests {
             ramfs::POSIX_ABI_TABLE,
             ramfs::RELIBC_TABLE,
             ramfs::RELIBC_THREADS_TABLE,
+            ramfs::OS_TEST_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
@@ -1479,6 +1484,7 @@ mod tests {
                     "posix-abi-probe",
                     "relibc-hello",
                     "relibc-threads",
+                    "os-test",
                     "rtbench-posix",
                 ]
                 .contains(&r.program)

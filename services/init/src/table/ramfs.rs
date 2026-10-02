@@ -180,6 +180,20 @@ pub const RELIBC_TABLE: &[Record] = &[
     },
 ];
 
+/// One test of os-test a boot (cargo xtask os-test): the RAM files, the
+/// process and clock services, and the test, under the name `os-test`.
+pub const OS_TEST_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "os-test",
+        program: "os-test",
+        args: b"os-test\0",
+        ..RELIBC_HELLO
+    },
+];
+
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {
     name: "relibc-hello",

@@ -6,6 +6,7 @@
 mod disasm;
 mod image;
 mod measure;
+mod ostest;
 mod qemu;
 mod ring;
 mod rtbench;
@@ -850,6 +851,8 @@ commands:
   ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits)
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
+  os-test   run os-test's io and malloc suites on relibc, one test a boot;
+            the table goes to target/measure/os-test.txt
   help      this text";
 
 fn main() {
@@ -887,6 +890,7 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
+        Some("os-test") => ostest::run(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
@@ -1931,6 +1935,8 @@ fn test() -> Result<(), String> {
     ash_probe()?;
     ash_dialog()?;
     ls_probe()?;
+    // The first row of os-test (io and malloc) within its time budget.
+    ostest::run_in_budget()?;
     rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;

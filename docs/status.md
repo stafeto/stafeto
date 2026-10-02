@@ -131,15 +131,17 @@ its first steps.
 
 `cargo xtask help` lists them all. `posix-abi` runs the thread,
 cancellation, shared-state, input and interruption probes as well, and
-`test` and `ci` run `posix-abi`, `ramfs`, `ext4ro`, the relibc probes and
-the BusyBox probes.
+`test` and `ci` run `posix-abi`, `ramfs`, `ext4ro`, the relibc probes,
+the BusyBox probes and os-test's io and malloc suites (within 300 s).
 
 | Command | Checks |
 |---|---|
 | `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`); `kernel-test <machine> icount` runs the icount build under `-icount` |
 | `ext4ro` | reads an e2fsprogs ext4 image inside the guest |
 | `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes |
-| `posix-abi` | C programs linked with Rust startup through Cargo and standalone Clang |
+| `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` within 16 KiB |
+| `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
+| `os-test` | os-test (Sortix, ISC, pinned) io and malloc suites on relibc, one test a boot; PASS, FAIL and UNSUPPORTED (needs `fork`) in `target/measure/os-test.txt` |
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
@@ -184,3 +186,10 @@ p50 on HVF and VZ: S1 3,327 → 0 ns with 12 → 0 kernel calls; S4
 463 ns; S6 959 → 1,343 ns (the console's read in two steps); S3 rival at
 20: 6,783 → 98,303 ns, since waiters now take the mutex by level and the
 rival at 30 goes first.
+
+10 minutes at b8141fd (step 5a′: relibc's mutex, dlmalloc and pthreads
+over the layer) against 8c254c0, p50 / p99 on HVF: every row within two
+counter ticks or 10 % of 5a; S1 and S2 still make no kernel call; S4
+`malloc`/`free` of 64 bytes falls from 335 / 3,007 ns to under one tick
+(dlmalloc's cache); S6 1,343 / 2,495 ns, S7 3,583 / 7,167 ns. VZ gives
+the same within a tick.

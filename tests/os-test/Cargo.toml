@@ -1,0 +1,17 @@
+[package]
+name = "os-test-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "One test of os-test on relibc, chosen when it is built"
+build = "build.rs"
+
+[[bin]]
+name = "os-test-probe"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

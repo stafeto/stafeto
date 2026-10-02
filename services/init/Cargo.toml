@@ -35,6 +35,7 @@ table-ramfs = []
 table-posix-abi = []
 table-relibc = []
 table-relibc-threads = []
+table-os-test = []
 table-busybox = []
 table-busybox-dialog = []
 

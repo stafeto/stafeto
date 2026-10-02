@@ -79,7 +79,13 @@ wait by address in the layer with no kernel call when uncontended; the heap,
 the descriptor table and the table of threads live under the layer's locks,
 whose holders run at the process ceiling; a read of the console is a long
 operation in two steps that a signal interrupts. Guest probes check them on
-QEMU and Apple VZ. Details are in
+QEMU and Apple VZ.
+
+**C library.** relibc (MIT) is the C library of every POSIX program,
+BusyBox included; its platform is the layer's `stafeto_*` functions.
+os-test's io and malloc suites run on it in `ci`, one test a boot: 10
+pass, 46 fail (no file creation in the RAM service yet, no open file
+description locks) and 2 need `fork`. Details are in
 [docs/status.md](docs/status.md).
 
 **Tests.** The kernel test image runs 182 tests (197 under `-icount`),
@@ -117,6 +123,7 @@ cargo xtask ci           # formatting, clippy, licence checks, then everything t
 cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
 cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ
 cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART
+cargo xtask os-test      # os-test's io and malloc suites on relibc, a table in target/measure/
 cargo xtask gdb          # QEMU halted at the first instruction, debugger on :1234
 cargo xtask help         # every command, including single probes
 ```
@@ -177,8 +184,8 @@ Bounded kernel paths and their costs:
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
-| POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | 🚧 |
-| POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | ⬜ |
+| POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ (pull request to come) |
+| POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | 🚧 |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then conditions, semaphores, timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
