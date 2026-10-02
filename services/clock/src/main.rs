@@ -104,6 +104,12 @@ impl Page {
         let value = anchor.time.value().expect("valid stored calendar anchor");
         let sequence = Self::word(page::SEQUENCE).load(Ordering::Relaxed);
         let place = page::PLACES + ((sequence + 1) % 2) as usize * page::PLACE_SIZE;
+        // The writes of the place come after the last move of the counter
+        // for every processor: a reader that saw that move and reads this
+        // place (as sequence s+2 later) never mixes it with the old one, as
+        // Linux's write of a latch (smp_wmb) keeps it. One processor needs
+        // no barrier; several do.
+        core::sync::atomic::fence(Ordering::Release);
         Self::word(place + page::LOW).store(value as u64, Ordering::Relaxed);
         Self::word(place + page::HIGH).store((value >> 64) as u64, Ordering::Relaxed);
         Self::word(place + page::MONO).store(anchor.mono, Ordering::Relaxed);

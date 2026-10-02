@@ -12,6 +12,23 @@ use core::ffi::{c_int, c_ulong};
 #[used]
 static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
+/// The calling thread's window of cancellation (0 outside a point).
+#[unsafe(no_mangle)]
+extern "C" fn relibc_threads_cancel_window() -> u64 {
+    posix_abi::threads::probe_cancel_active()
+}
+
+/// Whether the thread whose relibc `pthread_t` is `thread` has ended for
+/// the kernel (its place stays until relibc releases it).
+#[unsafe(no_mangle)]
+extern "C" fn relibc_threads_ended(thread: u64) -> c_int {
+    // SAFETY: the thread keeps its place until its detach or join.
+    let ended = unsafe { posix_abi::threads::probe_native(thread) }.is_ok_and(|native| {
+        rt::sys::thread_info(&native).is_ok_and(|info| info.state == rt::abi::ThreadState::Ended)
+    });
+    c_int::from(ended)
+}
+
 /// The places of the layer's table of threads that hold a thread.
 #[unsafe(no_mangle)]
 extern "C" fn relibc_threads_places() -> c_int {

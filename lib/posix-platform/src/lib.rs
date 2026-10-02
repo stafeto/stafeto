@@ -261,8 +261,10 @@ pub extern "C" fn stafeto_mmap_anonymous(len: usize) -> *mut c_void {
 }
 
 /// Unmaps whole pages of a mapping of `stafeto_mmap_anonymous`: all of it,
-/// pages from an edge, or pages from the middle. EINVAL for a range that
-/// is not inside one mapping, ENOMEM when a split finds no free record.
+/// pages from an edge, or pages from the middle. A range that meets no
+/// mapping is left alone (POSIX: success); EINVAL for one that is part in
+/// a mapping and part outside or across two, ENOMEM when a split finds no
+/// free record.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
     let start = addr as usize;
@@ -275,14 +277,17 @@ pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
     else {
         return -EINVAL;
     };
-    let result: Result<(), c_int> = mappings(|maps| {
-        let index = maps
-            .iter()
-            .position(|&held| {
+    let result: Result<bool, c_int> = mappings(|maps| {
+        let Some(index) = maps.iter().position(|&held| {
+            let (first, last) = bounds(held);
+            held.1 != 0 && first <= start && end <= last
+        }) else {
+            let meets = maps.iter().any(|&held| {
                 let (first, last) = bounds(held);
-                held.1 != 0 && first <= start && end <= last
-            })
-            .ok_or(EINVAL)?;
+                held.1 != 0 && first < end && start < last
+            });
+            return if meets { Err(EINVAL) } else { Ok(false) };
+        };
         let (first, last) = bounds(maps[index]);
         match (start == first, end == last) {
             (true, true) => maps[index] = (0, 0),
@@ -294,10 +299,11 @@ pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
                 maps[free] = record(end, last);
             }
         }
-        Ok(())
+        Ok(true)
     });
     match result {
-        Ok(()) => {
+        Ok(false) => 0,
+        Ok(true) => {
             // SAFETY: the pages left the records: relibc gave them up.
             unsafe {
                 posix_abi::allocation::unmap_pages(

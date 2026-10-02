@@ -165,8 +165,13 @@ pub fn target(id: u64) -> Result<(&'static Block, core::mem::ManuallyDrop<Handle
     ))
 }
 
+/// Held while a block of the table is read (`each_block`) and while
+/// `collect` frees a place, so that no block is read after its TCB went.
+static TABLE_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::raising();
+
 /// Runs `f` on the block of every live thread.
 pub fn each_block(mut f: impl FnMut(&Block)) {
+    let _guard = TABLE_LOCK.lock();
     for place in &TABLE {
         if place.state.load(Ordering::Acquire) & LIVE != 0 {
             // SAFETY: as in `target`.
@@ -199,7 +204,9 @@ pub fn collect() {
         let native = place.native.load(Ordering::Relaxed);
         let ended = sys::thread_info(&borrowed::<Thread>(native))
             .is_ok_and(|info| info.state == ThreadState::Ended);
-        // One collector takes the place.
+        // One collector takes the place, under the lock of the table: no
+        // `each_block` reads the block from here until the place is free.
+        let _guard = TABLE_LOCK.lock();
         if !ended
             || place
                 .state

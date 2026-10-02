@@ -563,6 +563,14 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     let layer_errno = crate::tls::errno();
     // SAFETY: the block's errno is this thread's.
     let saved_layer_errno = unsafe { *layer_errno };
+    // The handlers run outside the interrupted cancellation point and
+    // sigwait: a request of cancellation that comes meanwhile waits for the
+    // return to the point (POSIX), and a signal sent meanwhile enters as a
+    // signal. A handler that leaves by siglongjmp leaves neither the window
+    // nor SIGNAL_WAIT behind; one that returns gets both back.
+    let window = block.cancel_point.swap(0, Ordering::SeqCst);
+    let signal_wait =
+        block.flags.fetch_and(!flag::SIGNAL_WAIT, Ordering::SeqCst) & flag::SIGNAL_WAIT;
     loop {
         let old_mask = block.mask.load(Ordering::SeqCst);
         if native.is_null() && next_wants_context(block) {
@@ -628,6 +636,8 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
         }
         block.mask.store(restore_mask, Ordering::SeqCst);
     }
+    block.flags.fetch_or(signal_wait, Ordering::SeqCst);
+    block.cancel_point.store(window, Ordering::SeqCst);
     unsafe { *errno = saved_errno };
     // SAFETY: as above.
     unsafe { *layer_errno = saved_layer_errno };

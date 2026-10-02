@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,7 +20,9 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -52,6 +55,10 @@ _Static_assert(offsetof(struct stat, st_mtim) == 88, "st_mtim");
 _Static_assert(O_DIRECTORY == 040000, "O_DIRECTORY of arm64");
 _Static_assert(O_NOFOLLOW == 0100000, "O_NOFOLLOW of arm64");
 _Static_assert(SIGRTMIN == 35 && SIGRTMAX == 64, "relibc's real-time signals");
+_Static_assert(O_CLOEXEC == 02000000, "O_CLOEXEC of Linux");
+_Static_assert(F_DUPFD_CLOEXEC == 1030, "F_DUPFD_CLOEXEC of Linux");
+_Static_assert(sizeof(struct termios) == 60, "termios of Linux");
+_Static_assert(sizeof(sigjmp_buf) == 312, "sigjmp_buf: 39 words, the mask at word 23");
 
 #define CHECK(cond) do { if (!(cond)) { \
     printf("relibc-hello: check failed at line %d: %s (errno %d)\n", __LINE__, #cond, errno); \
@@ -114,7 +121,24 @@ static int files(void) {
     CHECK(munmap(pages + 4 * page, page) == 0);
     CHECK(munmap(pages + 3 * page, page) == 0);
     CHECK(munmap(pages + page, page) == 0);
-    CHECK(munmap(pages + page, page) == -1 && errno == EINVAL);
+    /* A range with no mapping left: nothing to do, success (POSIX). */
+    CHECK(munmap(pages + page, page) == 0);
+
+    /* The access mode follows the descriptor: a file moved onto standard
+     * input is no longer the console's input. F_SETFL takes no change. */
+    int input = dup(0), file = open("/etc/motd", O_RDONLY);
+    CHECK(input >= 0 && file >= 0 && (fcntl(0, F_GETFL) & O_ACCMODE) == O_RDONLY);
+    CHECK(dup2(file, 0) == 0 && (fcntl(0, F_GETFL) & O_ACCMODE) == O_RDWR);
+    CHECK(fcntl(0, F_SETFL, fcntl(0, F_GETFL)) == 0);
+    CHECK(fcntl(0, F_SETFL, O_NONBLOCK) == -1 && errno == EINVAL);
+    CHECK(dup2(input, 0) == 0 && close(input) == 0 && close(file) == 0);
+
+    /* writev keeps the bytes of the parts before one that fails; a count
+     * of parts outside 1 to IOV_MAX is EINVAL. */
+    int scratch = open("/tmp/probe", O_RDWR);
+    struct iovec parts[2] = {{"ab", 2}, {NULL, 5}};
+    CHECK(scratch >= 0 && writev(scratch, parts, 2) == 2);
+    CHECK(writev(scratch, parts, 0) == -1 && errno == EINVAL && close(scratch) == 0);
 
     volatile double two = 2.0, ten = 10.0, zero = 0.0;
     CHECK(fabs(sqrt(two) - 1.41421356) < 1e-6 && pow(two, ten) == 1024.0 && sin(zero) == 0.0);

@@ -5,7 +5,8 @@
  * full table three times, the end of joinable and detached threads under
  * signals, mutex, condition, rwlock, semaphore and barrier on four
  * threads, one waiter woken per unlock by level, deferred cancellation at
- * its points, and siglongjmp out of a handler. */
+ * its points, siglongjmp out of a handler and out of sigwait, threads
+ * detached after their end, and the clock service's page. */
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -25,6 +26,8 @@ unsigned long relibc_threads_heap(void);
 int relibc_threads_set_level(int level);
 long relibc_threads_realtime(long *seconds, long *nanos);
 unsigned long relibc_threads_calls(void);
+unsigned long relibc_threads_cancel_window(void);
+int relibc_threads_ended(pthread_t thread);
 
 #define FAIL(...) do { printf("relibc-threads: " __VA_ARGS__); printf("\n"); exit(10 + __LINE__ % 80); } while (0)
 #define CHECK(cond) do { if (!(cond)) FAIL("check failed at line %d: %s", __LINE__, #cond); } while (0)
@@ -371,6 +374,8 @@ static void long_jump(void) {
         for (;;) sleep_ms(1000);
     }
     CHECK(pthread_join(thread, NULL) == 0);
+    /* The jump left nanosleep's window of cancellation behind: none stays. */
+    CHECK(relibc_threads_cancel_window() == 0);
     action.sa_handler = count_handler;
     CHECK(sigaction(SIGUSR2, &action, NULL) == 0);
     CHECK(pthread_create(&thread, &small, sends, (void *)100L) == 0);
@@ -386,11 +391,72 @@ static void long_jump(void) {
            handled);
 }
 
+/* H: siglongjmp out of sigwait: the handler of SIGUSR2 jumps out of a
+ * sigwait for SIGUSR1; SIGUSR1, unblocked again by the jump, then comes
+ * from another thread while main sleeps, with no call to the mask. */
+static volatile int usr1_seen;
+static void see_usr1(int signal) { (void)signal; usr1_seen++; }
+static void *kills(void *arg) {
+    sleep_ms(5);
+    CHECK(pthread_kill(main_thread, (int)(long)arg) == 0);
+    return NULL;
+}
+static void leave_sigwait(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = jump_out;
+    CHECK(sigaction(SIGUSR2, &action, NULL) == 0);
+    action.sa_handler = see_usr1;
+    CHECK(sigaction(SIGUSR1, &action, NULL) == 0);
+    main_thread = pthread_self();
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    static pthread_t thread;
+    if (sigsetjmp(back, 1) == 0) {
+        CHECK(pthread_sigmask(SIG_BLOCK, &set, NULL) == 0);
+        CHECK(pthread_create(&thread, &small, kills, (void *)(long)SIGUSR2) == 0);
+        int signal;
+        sigwait(&set, &signal);
+        FAIL("sigwait returned %d", signal);
+    }
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(relibc_threads_cancel_window() == 0);
+    CHECK(pthread_create(&thread, &small, kills, (void *)(long)SIGUSR1) == 0);
+    struct timespec pause = {0, 50000000};
+    nanosleep(&pause, NULL);
+    if (usr1_seen != 1) FAIL("SIGUSR1 after the jump out of sigwait came %d times", usr1_seen);
+    CHECK(pthread_join(thread, NULL) == 0);
+    printf("relibc-threads: siglongjmp out of sigwait leaves no window and no wait behind\n");
+}
+
+/* I: threads detached after their end give back their places. */
+static void detach_after_end(void) {
+    relibc_threads_collect();
+    int base = relibc_threads_places();
+    for (int i = 0; i < 100; i++) {
+        pthread_t thread;
+        CHECK(pthread_create(&thread, &small, returns, NULL) == 0);
+        /* The thread ends while main sleeps. */
+        while (relibc_threads_ended(thread) == 0) sleep_ms(1);
+        CHECK(pthread_detach(thread) == 0);
+    }
+    for (int i = 0; i < 1000 && relibc_threads_places() != base; i++) {
+        relibc_threads_collect();
+        sleep_ms(1);
+    }
+    if (relibc_threads_places() != base)
+        FAIL("100 threads detached after their end: %d places, %d before", relibc_threads_places(), base);
+    printf("relibc-threads: 100 threads detached after their end gave their places back\n");
+}
+
 /* G: CLOCK_REALTIME from the clock service's page: a thread at 20 reads it
- * while main at 30 sets the time 1000 times, twice each time it wakes,
+ * while main at 30 sets the time SETTINGS times, twice each time it wakes,
  * so that the service writes both places while a read is cut; every read
  * must be whole (its time and the generation of its anchor agree), and a
  * read makes no call of the kernel. */
+/* Enough settings that a torn read shows on HVF in nearly every run. */
+#define SETTINGS 3000
 static volatile int setting;
 static volatile long torn, reads;
 static void *reads_clock(void *arg) {
@@ -410,7 +476,7 @@ static void clock_page(void) {
     pthread_t reader;
     setting = 1;
     CHECK(pthread_create(&reader, &small, reads_clock, NULL) == 0);
-    for (long k = 1; k <= 1000; k += 2) {
+    for (long k = 1; k <= SETTINGS; k += 2) {
         struct timespec at = {k * 1000000, 0};
         CHECK(clock_settime(CLOCK_REALTIME, &at) == 0);
         at.tv_sec += 1000000;
@@ -425,10 +491,10 @@ static void clock_page(void) {
     unsigned long before = relibc_threads_calls();
     for (int i = 0; i < 1000; i++) CHECK(clock_gettime(CLOCK_REALTIME, &now) == 0);
     unsigned long calls = relibc_threads_calls() - before;
-    CHECK(now.tv_sec / 1000000 == 1000);
+    CHECK(now.tv_sec / 1000000 == SETTINGS);
     if (calls != 0) FAIL("1000 reads of CLOCK_REALTIME made %lu kernel calls", calls);
-    printf("relibc-threads: %ld reads of the clock page during 1000 settings, none torn; no kernel call to read\n",
-           reads);
+    printf("relibc-threads: %ld reads of the clock page during %d settings, none torn; no kernel call to read\n",
+           reads, SETTINGS);
 }
 
 int main(void) {
@@ -451,6 +517,10 @@ int main(void) {
     long_jump();
     stage = 7;
     clock_page();
+    stage = 8;
+    leave_sigwait();
+    stage = 9;
+    detach_after_end();
     printf("relibc-threads: ok\n");
     return 0;
 }

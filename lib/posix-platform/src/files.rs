@@ -296,6 +296,9 @@ const F_DUPFD: c_int = 0;
 const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
+const F_SETFL: c_int = 4;
+/// The status flags F_SETFL cannot take yet (Linux's O_APPEND, O_NONBLOCK).
+const UNSUPPORTED_STATUS: u64 = 0o2000 | 0o4000;
 const F_DUPFD_CLOEXEC: c_int = 1030;
 /// relibc's FD_CLOEXEC (its fcntl.h), which differs from Linux's 1: both
 /// are taken, relibc's comes back.
@@ -308,8 +311,10 @@ const O_RDWR: c_int = 2;
 
 /// fcntl: F_DUPFD and F_DUPFD_CLOEXEC (the lowest free number from the
 /// argument), F_GETFD and F_SETFD (close-on-exec), F_GETFL (the access
-/// mode: standard input reads, the console's output writes, a file of the
-/// service reads and writes as the service allows); EINVAL for the rest.
+/// mode by the descriptor's kind: the console's input reads, its output
+/// writes, a file of the service reads and writes as the service allows),
+/// F_SETFL with no flag to change (0; O_APPEND and O_NONBLOCK are
+/// EINVAL); EINVAL for the rest.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_int {
     let result = posix_abi::shared::with_files(|files| {
@@ -339,13 +344,20 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
             }
             F_GETFL => {
                 files.descriptor_flags(fd).map_err(error)?;
-                Ok(if fd == 0 {
+                Ok(if files.console_input(fd).map_err(error)? {
                     O_RDONLY
                 } else if files.console_route(fd).map_err(error)?.is_some() {
                     O_WRONLY
                 } else {
                     O_RDWR
                 })
+            }
+            F_SETFL => {
+                files.descriptor_flags(fd).map_err(error)?;
+                if argument & UNSUPPORTED_STATUS != 0 {
+                    return Err(EINVAL);
+                }
+                Ok(0)
             }
             _ => Err(EINVAL),
         }
