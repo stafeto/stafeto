@@ -6,12 +6,11 @@
 //! gives every session it serves through `handle_label` on its own
 //! channel, the label naming the record (proto_process::Label), so the
 //! label of a request finds its record in O(1) and no kernel call names a
-//! process. Create, Loaded, Abandon and Next come only through the channel
-//! with no label, from the service's own threads: the receiving thread
-//! (adopt.rs) takes the records init's table starts with ADOPT, the
-//! spawning thread (spawn.rs) the children Spawn asks for, which init
-//! gives with SPAWN, and both load the programs from the boot image
-//! (make.rs). Create makes the record, the place of its end, a copy of
+//! process. Create, Loaded and Abandon come only through the channel
+//! with no label, from the service's own receiving thread (adopt.rs),
+//! which takes the records init's table starts with ADOPT and loads their
+//! programs from the boot image (make.rs), and Replace from the thread
+//! that tells init of an exec (replace.rs). Create makes the record, the place of its end, a copy of
 //! the channel with NOTIFY and the record's exit label at the process's
 //! ceiling, and the process with it, so that the kernel tells the service
 //! of the end: the record ends with that notification alone, whoever
@@ -30,9 +29,9 @@ use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, INIT_PID, Label, LoaderOf, Method,
-    Next, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX,
-    SIGSTOP, SPAWN_FLAGS, SPAWN_SETPGROUP, SPAWN_SETSID, Selector, SetId, Spawn, SpawnStart,
-    WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
+    PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX,
+    SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
+    WSTOPPED, WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
@@ -48,7 +47,7 @@ mod generations;
 mod loader;
 mod make;
 mod pages;
-mod spawn;
+mod replace;
 use core::mem::ManuallyDrop;
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
@@ -67,12 +66,15 @@ const IMAGE: usize = 0x50_0000_0000;
 /// The waits of the service at most (spec 2, 3.4): 16 of a record, 1024
 /// in all; past them a wait is EAGAIN.
 const WAITS: usize = 1024;
-/// A Spawn that waits: its deferred reply and its request. A record has
-/// one at a time, so Loaded and Abandon of its child find it by the
-/// parent alone.
-struct Spawning {
+/// The ExecCommit of a record of init's table that waits until init took
+/// the new process (replace.rs): the old image's request, the loader's
+/// channel through which the new image hears the record is ready, the
+/// copy of the new process for init, and init's ticket of the record.
+struct Replacing {
     pending: Pending,
-    request: Spawn,
+    ready: Option<Handle<Channel>>,
+    process: Option<Handle<Process>>,
+    ticket: u64,
 }
 /// A walk of kill(0), kill(-pgid) or kill(-1) that waits (walk.rs): the
 /// sender's request, what it sends, and what the steps found so far.
@@ -117,12 +119,14 @@ struct Processes {
     /// The priority of the slot of a session: the loop's level.
     level: u8,
     records: Records<Handle<Process>>,
-    /// The Spawn of each record that waits, by the record's index.
-    spawns: [Option<Spawning>; RECORDS],
-    /// The records whose Spawn waits for the spawning thread.
-    queue: Queue,
-    /// The spawning thread's Next that waits for a Spawn.
-    next: Option<Pending>,
+    /// The ticket init gave each record of its table, 0 for the others.
+    tickets: [u64; RECORDS],
+    /// The ExecCommit of each record that waits for init, by the record's
+    /// index, the records whose new process waits for the thread that
+    /// tells init, and that thread's Replace that waits for one.
+    replacing: [Option<Replacing>; RECORDS],
+    replace_queue: Queue,
+    replacer: Option<Pending>,
     /// The pages of the records.
     pages: pages::Pages,
     /// The page of the credentials generations.
@@ -130,8 +134,8 @@ struct Processes {
     /// The thread of each record's process whose entry the service asks
     /// for once it set a signal on the page (Router).
     routers: [Option<Handle<Thread>>; RECORDS],
-    /// The witness of each record's process, which init gave with ADOPT or
-    /// SPAWN: it closes once the process ended, and init hears of the end.
+    /// The witness of each record's process, which init gave with ADOPT:
+    /// it closes once the process ended, and init hears of the end.
     witnesses: [Option<Handle<Channel>>; RECORDS],
     /// The waits that wait: LongOps, and what each takes.
     ops: LongOps<WAITS>,
@@ -162,9 +166,10 @@ impl Processes {
             identities: Handle::borrowed(abi::Handle::INVALID),
             level: 1,
             records: Records::new(),
-            spawns: [const { None }; RECORDS],
-            queue: Queue::new(),
-            next: None,
+            tickets: [0; RECORDS],
+            replacing: [const { None }; RECORDS],
+            replace_queue: Queue::new(),
+            replacer: None,
             pages: pages::Pages::new(),
             generations: generations::Generations::new(),
             witnesses: [const { None }; RECORDS],
@@ -183,7 +188,7 @@ impl Processes {
         }
     }
 }
-/// The loop's state, in .bss: the records and the spawns that wait are
+/// The loop's state, in .bss: the records are
 /// too big for the main thread's stack.
 struct Owner(UnsafeCell<Processes>);
 // SAFETY: only the main thread reaches it (`main`), once.
@@ -241,7 +246,8 @@ fn main(_: u64) -> u64 {
     if owner.loader.is_some() {
         owner.files = rt::service::connect(&start.parent, "ramfs").ok();
     }
-    if adopt::start(&start.process, level).is_err() || spawn::start(&start.process, level).is_err()
+    if adopt::start(&start.process, level).is_err()
+        || replace::start(&start.process, level).is_err()
     {
         return 6;
     }
@@ -319,16 +325,13 @@ fn number(r: &mut Request<'_>, n: u32) -> Answer {
     Answer::Reply(Outgoing::new())
 }
 impl Processes {
-    /// Create (label 0): a record, LOADING, of a new process with the
-    /// parameters of the body and the start channel the request brought,
-    /// the process's end told through the record's exit place (O(1)): a
-    /// record of init's table, or a child of the live record of the body's
-    /// parent with its credentials (UNREGISTERED for none, AGAIN for one
-    /// with CHILDREN_MAX children), in the group and session its Spawn
-    /// asks for (PERMISSION where setpgid would be EPERM). The reply: the PID and the label, a
-    /// copy of the process for the load and the record's session. FULL
-    /// with every record taken; the errors of the calls as the status, and
-    /// nothing stays.
+    /// Create (label 0): a record of init's table, LOADING, of a new
+    /// process with the parameters of the body and the start channel the
+    /// request brought, the process's end told through the record's exit
+    /// place (O(1)). The reply: the PID and the label, a copy of the
+    /// process for the load and the record's session. FULL with every
+    /// record taken; the errors of the calls as the status, and nothing
+    /// stays.
     fn create(&mut self, r: &mut Request<'_>) -> Answer {
         let Ok(create) = Create::read(r.body()) else {
             return Answer::Status(Status::BadSize);
@@ -340,30 +343,8 @@ impl Processes {
         else {
             return Answer::Status(Status::BadSize);
         };
-        let parent = match create.parent {
-            0 => None,
-            label => match self.records.find(label) {
-                None => return refuse(proto_process::UNREGISTERED),
-                Some(p) if !self.records.may_spawn(p) => return refuse(proto_process::AGAIN),
-                Some(p) => Some(p),
-            },
-        };
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
-        };
-        // The group and session the parent's Spawn asks for, before any
-        // call: PERMISSION where setpgid would say EPERM.
-        let join = match parent {
-            Some(p) => {
-                let (flags, pgroup) = self.spawns[p]
-                    .as_ref()
-                    .map_or((0, 0), |s| (s.request.flags, s.request.pgroup));
-                match self.records.joining(p, flags, pgroup, label.pid()) {
-                    Some(join) => join,
-                    None => return refuse(proto_process::PERMISSION),
-                }
-            }
-            None => Join::Inherit,
         };
         let place = records::exit_place(label, &create, self.level);
         let made = sys::handle_label(&self.channel, Rights::NOTIFY, place.label, place.slot)
@@ -385,19 +366,25 @@ impl Processes {
         // process takes it out, so that the exit label is never given twice.
         let rights = Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER;
         let copy = sys::handle_duplicate(&process, rights);
-        let credentials = match parent {
-            Some(p) => self.records.get(p).expect("a live parent").credentials,
-            None if create.root => Credentials::ROOT,
-            None => Credentials::NOBODY,
+        let credentials = if create.root {
+            Credentials::ROOT
+        } else {
+            Credentials::NOBODY
         };
-        let index = self
-            .records
-            .insert(label, process, parent, credentials, create.ceiling, join);
+        let index = self.records.insert(
+            label,
+            process,
+            None,
+            credentials,
+            create.ceiling,
+            Join::Inherit,
+        );
         if let Some(record) = self.records.get_mut(index) {
             record.quota = create.quota;
             record.handle_limit = create.handle_limit;
         }
         self.witnesses[index] = Some(witness);
+        self.tickets[index] = create.ticket;
         // A record made in a used index never starts its generation over.
         self.generations.raise(index);
         let record = self.records.get(index).expect("a new record");
@@ -405,19 +392,6 @@ impl Processes {
         let paged = self
             .pages
             .give(&make::own(), index, &record.process, identity);
-        // A spawned child starts with the caller's mask and the parent's
-        // SIG_IGN ([P24-SPAWN]); the layer reads them at its start.
-        if let (Ok(()), Some(p)) = (&paged, parent)
-            && let (Some(child), Some(from)) = (self.pages.page(index), self.pages.page(p))
-        {
-            use core::sync::atomic::Ordering::{Acquire, Release};
-            let mask = self.spawns[p].as_ref().map_or(0, |s| s.request.mask);
-            child.start_mask.store(mask, Release);
-            child.ignored.store(from.ignored.load(Acquire), Release);
-        }
-        if paged.is_ok() && parent.is_some() {
-            self.signal_newborn(index);
-        }
         let session = paged.and_then(|()| {
             sys::handle_label(
                 &self.channel,
@@ -457,12 +431,8 @@ impl Processes {
     }
 
     /// Loaded (label 0) of the LOADING record the body names, with its
-    /// first thread, the router of its signals: it is ALIVE, and the Spawn
-    /// that asked for it gets its PID. UNREGISTERED for a
-    /// label of no such record. A child that ended between thread_start
-    /// and Loaded would leave its parent's Spawn waiting; it does not come
-    /// to pass on one processor, where the spawning thread runs at the
-    /// loop's level, above the child's ceiling, from its start to Loaded.
+    /// first thread, the router of its signals: it is ALIVE. UNREGISTERED
+    /// for a label of no such record.
     fn loaded(&mut self, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let (Ok(label), Ok(thread)) = (body.u64(), r.handles.take::<Thread>(0)) else {
@@ -484,39 +454,19 @@ impl Processes {
         record.state = State::Alive;
         // The first thread routes the process's signals (spec 2, 3.3).
         self.routers[index] = Some(thread);
-        let pid = record.label.pid();
-        let parent = record.parent_index.map(usize::from);
-        if let Some(spawning) = parent.and_then(|p| self.spawns[p].take()) {
-            let mut w = Writer::new();
-            if w.u32(0).and_then(|()| w.u32(pid)).is_ok() {
-                // A parent that went meanwhile takes no reply.
-                let _ = spawning.pending.answer(w.as_bytes(), Outgoing::new());
-            }
-        }
         Answer::Status(Status::Ok)
     }
 
     /// Abandon (label 0): the LOADING record of the body's label, if any,
-    /// is killed, and goes with the end of its process; the Spawn of the
-    /// body's parent, if any, gets the body's status. UNREGISTERED for a
+    /// is killed, and goes with the end of its process. UNREGISTERED for a
     /// label of no LOADING record.
     fn abandon(&mut self, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
-        let (Ok(label), Ok(parent), Ok(code)) = (body.u64(), body.u64(), body.u32()) else {
+        let Ok(label) = body.u64() else {
             return Answer::Status(Status::BadSize);
         };
         if body.finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
-        }
-        if let Some(spawning) = self
-            .records
-            .find(parent)
-            .and_then(|p| self.spawns[p].take())
-        {
-            let status = Status::from_code(code.max(1));
-            let _ = spawning
-                .pending
-                .answer(&proto_wire::reply(status), Outgoing::new());
         }
         if label == 0 {
             return Answer::Status(Status::Ok);
@@ -531,84 +481,6 @@ impl Processes {
         };
         let _ = sys::process_kill(&record.process);
         Answer::Status(Status::Ok)
-    }
-
-    /// Spawn of the record in `index`: the request waits for the spawning
-    /// thread, which makes the child (spawn.rs), and its reply comes with
-    /// Loaded or Abandon. AGAIN while a Spawn of the record waits or it
-    /// has CHILDREN_MAX children; INVALID for a spawn-flag other than
-    /// SETPGROUP and SETSID, PERMISSION for the group they ask for when
-    /// setpgid would be EPERM (Create asks again: the groups may change).
-    fn spawn(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
-        let Ok(mut request) = Spawn::read(r.body()) else {
-            return Answer::Status(Status::BadSize);
-        };
-        // The caller's level, as it says, within the ceiling of its record:
-        // the copy of the child's program never runs above the caller.
-        let ceiling = self.records.get(index).map_or(1, |r| r.ceiling);
-        request.level = request.level.min(ceiling);
-        if request.flags & !(SPAWN_SETPGROUP | SPAWN_SETSID) != 0 {
-            return refuse(proto_process::INVALID);
-        }
-        if self
-            .records
-            .joining(index, request.flags, request.pgroup, 0)
-            .is_none()
-        {
-            return refuse(proto_process::PERMISSION);
-        }
-        if self.spawns[index].is_some() || !self.records.may_spawn(index) {
-            return refuse(proto_process::AGAIN);
-        }
-        let Some(pending) = r.defer() else {
-            return Answer::Status(Status::BadSize);
-        };
-        self.spawns[index] = Some(Spawning { pending, request });
-        self.queue.push(index);
-        self.dispatch();
-        Answer::Deferred
-    }
-
-    /// Next (label 0): the spawning thread waits for the next Spawn; AGAIN
-    /// for a second Next.
-    fn next(&mut self, r: &mut Request<'_>) -> Answer {
-        if r.body().finish().is_err() || !r.handles.is_empty() {
-            return Answer::Status(Status::BadSize);
-        }
-        if self.next.is_some() {
-            return refuse(proto_process::AGAIN);
-        }
-        self.next = r.defer();
-        self.dispatch();
-        Answer::Deferred
-    }
-
-    /// Gives the waiting Next the Spawn at the head of the queue, if both
-    /// wait: the parent's label and the record's name.
-    fn dispatch(&mut self) {
-        while self.next.is_some() {
-            let Some(index) = self.queue.pop() else {
-                return;
-            };
-            let (Some(spawning), Some(record)) = (&self.spawns[index], self.records.get(index))
-            else {
-                continue;
-            };
-            let next = Next {
-                parent: record.label.raw(),
-                name: spawning.request.name,
-                level: spawning.request.level,
-            };
-            let mut w = Writer::new();
-            if next.write(&mut w).is_err() {
-                continue;
-            }
-            let pending = self.next.take().expect("a waiting Next");
-            if pending.answer(w.as_bytes(), Outgoing::new()).is_err() {
-                // The thread went; the Spawn waits for it again.
-                self.queue.push(index);
-            }
-        }
     }
 }
 /// A READY reply of a wait with `result`.
@@ -1292,7 +1164,7 @@ impl Processes {
             ceiling: parent.ceiling,
             priority: start.level.clamp(1, parent.ceiling),
             root: false,
-            parent: parent.label.raw(),
+            ticket: 0,
         };
         let credentials = loaders::child_credentials(parent.credentials, start.flags);
         // The child's quota comes from the service's: the pool, past which
@@ -1487,7 +1359,10 @@ impl Processes {
     /// before the reply, its caught signals are the default on the page
     /// (sp4.M3), the new main thread routes its signals, and the loader
     /// hears that the record is ready. The old process ends itself after
-    /// the reply. BAD_STATE without an exec whose image is ready.
+    /// the reply. For a record of init's table the reply and the loader's
+    /// notification wait until init took the new process for the record's
+    /// end line (`replace`). BAD_STATE without an exec whose image is
+    /// ready.
     fn exec_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
@@ -1508,9 +1383,11 @@ impl Processes {
         let image = place.image;
         let incoming = place.held.incoming.take().expect("the new process");
         self.routers[index] = place.held.thread.take();
-        if let Some(ready) = place.held.ready.as_ref() {
-            let _ = sys::notify(ready, 1);
-        }
+        let ready = place.held.ready.take();
+        let ticket = self.tickets[index];
+        let copy = (ticket != 0)
+            .then(|| sys::handle_duplicate(&incoming, Rights::DUPLICATE | Rights::TRANSFER).ok())
+            .flatten();
         let record = self.records.get_mut(index).expect("the caller");
         // The old process's handle goes; the process ends itself.
         drop(core::mem::replace(&mut record.process, incoming));
@@ -1524,7 +1401,90 @@ impl Processes {
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
         }
+        if let Some(process) = copy
+            && let Some(pending) = r.defer()
+        {
+            self.replacing[index] = Some(Replacing {
+                pending,
+                ready,
+                process: Some(process),
+                ticket,
+            });
+            self.replace_queue.push(index);
+            self.dispatch_replace();
+            return Answer::Deferred;
+        }
+        if let Some(ready) = ready.as_ref() {
+            let _ = sys::notify(ready, 1);
+        }
         Answer::Status(Status::Ok)
+    }
+
+    /// Replace (label 0): the thread that tells init of an exec names the
+    /// record whose exec init heard of (`finish_replace`), then waits for
+    /// the next ExecCommit of a record of init's table; AGAIN for a second
+    /// Replace that waits.
+    fn replace(&mut self, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let Ok(done) = body.u64() else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if let Some(index) = self.records.find(done) {
+            self.finish_replace(index);
+        }
+        if self.replacer.is_some() {
+            return refuse(proto_process::AGAIN);
+        }
+        self.replacer = r.defer();
+        self.dispatch_replace();
+        Answer::Deferred
+    }
+
+    /// Gives the waiting Replace the new process of the exec at the head
+    /// of the queue, if both wait: the record's label at its new image,
+    /// init's ticket and the process. A thread that went leaves the exec to go on at once.
+    fn dispatch_replace(&mut self) {
+        while self.replacer.is_some() {
+            let Some(index) = self.replace_queue.pop() else {
+                return;
+            };
+            let (Some(replacing), Some(record)) =
+                (self.replacing[index].as_mut(), self.records.get(index))
+            else {
+                continue;
+            };
+            let Some(process) = replacing.process.take() else {
+                continue;
+            };
+            let mut w = Writer::new();
+            let written = w
+                .u32(0)
+                .and_then(|()| w.u32(0))
+                .and_then(|()| w.u64(record.label.raw_at(record.image)))
+                .and_then(|()| w.u64(replacing.ticket));
+            let pending = self.replacer.take().expect("a waiting Replace");
+            if written.is_err() || pending.answer(w.as_bytes(), [process.erase()]).is_err() {
+                self.finish_replace(index);
+            }
+        }
+    }
+
+    /// The exec of the record in `index` that waited for init goes on: the
+    /// loader tells the new image the record is ready, and the old image
+    /// gets its ExecCommit's reply and ends itself.
+    fn finish_replace(&mut self, index: usize) {
+        let Some(replacing) = self.replacing[index].take() else {
+            return;
+        };
+        if let Some(ready) = replacing.ready.as_ref() {
+            let _ = sys::notify(ready, 1);
+        }
+        let _ = replacing
+            .pending
+            .answer(&proto_wire::reply(Status::Ok), Outgoing::new());
     }
 
     /// ExecAbort of the record in `index`: the new process of its exec is
@@ -1803,7 +1763,7 @@ impl Service<0> for Processes {
             Method::Create,
             Method::Loaded,
             Method::Abandon,
-            Method::Next,
+            Method::Replace,
         ];
         if own.map(|m| m as u16).contains(&method) {
             // Only the service's own threads and init hold the channel with
@@ -1814,8 +1774,8 @@ impl Service<0> for Processes {
             return match method {
                 n if n == Method::Create as u16 => self.create(r),
                 n if n == Method::Loaded as u16 => self.loaded(r),
-                n if n == Method::Abandon as u16 => self.abandon(r),
-                _ => self.next(r),
+                n if n == Method::Replace as u16 => self.replace(r),
+                _ => self.abandon(r),
             };
         }
         if proto_process::is_notary(r.label()) {
@@ -1871,7 +1831,6 @@ impl Service<0> for Processes {
                 }
                 Answer::Status(status(result))
             }
-            n if n == Method::Spawn as u16 => self.spawn(index, r),
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
             n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r),
             n if n == Method::SpawnAbort as u16 => self.spawn_abort(index, r),
@@ -1928,8 +1887,6 @@ impl Service<0> for Processes {
         }
         let end = End::of(sys::process_state(&record.process).unwrap_or(abi::ProcessState::Killed))
             .unwrap_or(End::Signaled(SIGKILL));
-        self.queue.remove(index);
-        self.spawns[index] = None;
         // A walk of the ended sender stops, and those it queued: their
         // replies have no taker.
         self.walking.remove(index);
@@ -1948,6 +1905,10 @@ impl Service<0> for Processes {
             let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
         }
         let (exit, orphans) = self.records.exited(index, end);
+        // An exec that waited for init goes on: its new image is dead.
+        self.replace_queue.remove(index);
+        self.finish_replace(index);
+        self.tickets[index] = 0;
         // Init reads the end once the witness closed.
         self.witnesses[index] = None;
         for &orphan in orphans.as_slice() {

@@ -212,12 +212,90 @@ fn procs() -> Vec<RootFile> {
     ]
 }
 
+/// rtbench 2 (5c): the benchmark's children are files of it, the program
+/// itself under a role its first argument names.
+fn rtbench() -> Vec<RootFile> {
+    vec![
+        dir("/bin"),
+        file("/bin/rtbench-posix", 0o755, ROOT, "rtbench-posix"),
+    ]
+}
+
+/// The files of an image of os-test (5c): each test `name` (`suite/test`,
+/// or `basic/part/test`) a file `/os-test/<name>` with the bytes of its
+/// ELF file, in the directory of its suite, and the list the runner reads,
+/// `/os-test/list`: a line a test with its name, its directory
+/// (`/os-test/<suite>`) and its path from there. Names and bytes live for
+/// the rest of the run of xtask.
+pub fn os_test(tests: &[(String, Vec<u8>)]) -> Vec<RootFile> {
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    let mut files = vec![dir("/os-test")];
+    let mut list = String::new();
+    for (n, (name, elf)) in tests.iter().enumerate() {
+        let parts: Vec<&str> = name.split('/').collect();
+        // The directories above the file, from the suite down.
+        for depth in 1..parts.len() {
+            let path = leak(format!("/os-test/{}", parts[..depth].join("/")));
+            if !files.iter().any(|f| f.path == path) {
+                files.push(dir(path));
+            }
+        }
+        let suite = parts[0];
+        list.push_str(&format!(
+            "{name} /os-test/{suite} {}\n",
+            parts[1..].join("/")
+        ));
+        let file_name = leak(format!("t{n}"));
+        let bytes: &'static [u8] = Box::leak(elf.clone().into_boxed_slice());
+        files.push(of(
+            leak(format!("/os-test/{name}")),
+            0o755,
+            ROOT,
+            Source::Bytes(file_name, bytes),
+        ));
+    }
+    let list: &'static [u8] = Box::leak(list.into_bytes().into_boxed_slice());
+    files.push(of(
+        "/os-test/list",
+        0o644,
+        ROOT,
+        Source::Bytes("list", list),
+    ));
+    files
+}
+
+/// The files of the check of the runner of os-test: two files that are the
+/// runner itself, `hang` (never ends) and `quick` (exits with 7), and a
+/// list that gives each a second (`limit`).
+pub fn runner_check() -> Vec<RootFile> {
+    vec![
+        dir("/os-test"),
+        dir("/os-test/check"),
+        file("/os-test/check/hang", 0o755, ROOT, "os-test-run"),
+        file("/os-test/check/quick", 0o755, ROOT, "os-test-run"),
+        of(
+            "/os-test/list",
+            0o644,
+            ROOT,
+            Source::Bytes(
+                "list",
+                b"limit 1000\ncheck/hang /os-test/check hang\ncheck/quick /os-test/check quick\n",
+            ),
+        ),
+    ]
+}
+
 /// The names of the images that carry a table, which `files_of` lists.
 #[cfg(test)]
 pub const IMAGES: &[&str] = &[
     "boot-ramfs.img",
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
+    "rtbench-posix.img",
+    "rtbench-posix-vz.img",
+    "rtbench-posix-short.img",
 ];
 
 /// The list of the image `name`: none for an image with no table.
@@ -226,6 +304,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" => procs(),
+        "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
     }
 }
@@ -325,6 +404,8 @@ mod tests {
                 "boot-ramfs.img" => &crate::RAMFS_PROGRAMS,
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" => &crate::POSIX_PROCS_PROGRAMS,
+                "rtbench-posix.img" | "rtbench-posix-short.img" => &crate::RTBENCH_POSIX_PROGRAMS,
+                "rtbench-posix-vz.img" => &crate::RTBENCH_POSIX_VZ_PROGRAMS,
                 other => panic!("no programs known for {other}"),
             };
             list.iter().map(|p| p.0).collect()
@@ -345,6 +426,60 @@ mod tests {
         // The longest path of the probe's list is the longest there is.
         let deep = ramfs().iter().map(|f| f.path.len()).max();
         assert_eq!(deep, Some(bootimg::rootfs::PATH_MAX));
+    }
+
+    /// The files of an image of os-test: each suite's directory, the tests
+    /// below it as files of their own, and the list of the runner with the
+    /// directory a test runs in and its path from there.
+    #[test]
+    fn an_os_test_image_lists_its_tests_and_their_directories() {
+        let tests = [
+            ("io/open".to_owned(), vec![1, 2, 3]),
+            ("basic/spawn/posix_spawn".to_owned(), vec![4, 5]),
+            ("basic/unistd/execl".to_owned(), vec![6]),
+        ];
+        let files = os_test(&tests);
+        // The directories are listed once, the runner's list is a file.
+        let paths: Vec<&str> = files.iter().map(|f| f.path).collect();
+        for dir in [
+            "/os-test",
+            "/os-test/io",
+            "/os-test/basic",
+            "/os-test/basic/spawn",
+            "/os-test/basic/unistd",
+        ] {
+            assert_eq!(paths.iter().filter(|p| **p == dir).count(), 1, "{dir}");
+        }
+        let list = files.iter().find(|f| f.path == "/os-test/list").unwrap();
+        let Some(Source::Bytes(_, text)) = list.source else {
+            panic!("the list is bytes");
+        };
+        assert_eq!(
+            std::str::from_utf8(text).unwrap(),
+            "io/open /os-test/io open\n\
+             basic/spawn/posix_spawn /os-test/basic spawn/posix_spawn\n\
+             basic/unistd/execl /os-test/basic unistd/execl\n"
+        );
+        // Each test is a file of its own, and the table reads back with
+        // the directories above them (it refuses a file without its
+        // parent).
+        let wanted = sources(&files);
+        assert_eq!(wanted.len(), 4);
+        let bytes = table(&files, 3, 3 + wanted.len() as u32 + 1).unwrap();
+        let read = Rootfs::parse(&bytes, 3 + wanted.len() as u32 + 1).unwrap();
+        for path in [
+            "/os-test/io/open",
+            "/os-test/basic/spawn/posix_spawn",
+            "/os-test/basic/unistd/execl",
+        ] {
+            let entry = read.entry(read.find(path).unwrap() as u32);
+            assert_eq!(entry.mode, rootfs::REGULAR | 0o755, "{path}");
+        }
+        // The check of the runner has its hung test and its quick one, the
+        // runner itself twice, so one image file.
+        let check = runner_check();
+        assert_eq!(sources(&check).len(), 2);
+        assert!(table(&check, 3, 6).is_ok());
     }
 
     /// A variant is a file of its own, its data segment grown; bytes of the

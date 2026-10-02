@@ -897,7 +897,7 @@ mod tests {
                 ceiling,
                 priority: ceiling,
                 root: false,
-                parent: 0,
+                ticket: 0,
             };
             let place = exit_place(label, &create, loop_level);
             assert_eq!(place.label, label.exit());

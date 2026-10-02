@@ -35,7 +35,6 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
-        on_demand: false,
     },
     Record {
         name: "ramfs-probe",
@@ -57,7 +56,6 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
-        on_demand: false,
     },
 ];
 
@@ -218,15 +216,10 @@ pub const RELIBC_TABLE: &[Record] = &[
     },
 ];
 
-/// The probe of POSIX processes (tests/posix-procs, 5b): the RAM files,
-/// the process and clock services, the probe, and the records it spawns,
-/// which start on demand: a child that says its parent, one that sleeps,
-/// one whose 32 MiB stack its 15 pages of quota cannot map, so that its
-/// load fails (the image gives `posix-procs-big` that stack), one that
-/// ends 300 ms after its start, one that exits with 7, one that faults,
-/// one that spawns the next, which waits to be an orphan, one that blocks
-/// every signal and spins, one that exits with 42 from its handler of
-/// SIGUSR1, a second sleeper, and one that calls setsid and setpgid.
+/// The probe of POSIX processes (tests/posix-procs): the RAM files, the
+/// process and clock services and the probe, whose children start from
+/// files (5c): the table has the pool for 33 of them and holds no record
+/// of theirs.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
     Record {
@@ -241,84 +234,11 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0",
+        connects: &["ramfs", "clock", "posix"],
         root: true,
         // A child from a file gets its parent's quota: room for BusyBox.
         quota: PROCS_QUOTA,
-        ..PROCS_CHILD
-    },
-    Record {
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-sleeper",
-        args: b"posix-procs\0sleep\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-big",
-        program: "posix-procs-big",
-        quota: super::MIN_QUOTA,
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-nap",
-        args: b"posix-procs\0nap\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-exit7",
-        args: b"posix-procs\0exit7\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-segv",
-        args: b"posix-procs\0segv\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-middle",
-        args: b"posix-procs\0middle\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-orphan",
-        args: b"posix-procs\0orphan\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    // It spins: below the probe, which runs FIFO at its own level.
-    Record {
-        name: "procs-block",
-        args: b"posix-procs\0block\0",
-        priority: 20,
-        ceiling: 21,
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-catch",
-        args: b"posix-procs\0catch\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-sleep2",
-        args: b"posix-procs\0sleep2\0",
-        on_demand: true,
-        ..PROCS_CHILD
-    },
-    Record {
-        name: "procs-ids",
-        args: b"posix-procs\0ids\0",
-        on_demand: true,
-        ..PROCS_CHILD
+        ..POSIX
     },
 ];
 
@@ -326,29 +246,30 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 /// from a file gets too (5c).
 const PROCS_QUOTA: u64 = 512 * PAGE;
 
-/// The child of the probe of POSIX processes.
-const PROCS_CHILD: Record = Record {
-    name: "procs-child",
-    program: "posix-procs",
-    args: b"posix-procs\0child\0",
-    connects: &["ramfs", "clock", "posix"],
-    quota: 512 * PAGE,
-    ..POSIX
-};
-
-/// One test of os-test a boot (cargo xtask os-test): the RAM files, the
-/// process and clock services, and the test, under the name `os-test`.
+/// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
+/// files with the tests of the image, the process and clock services, and
+/// the runner, whose children are the tests, started from their files
+/// (5c), one at a time and one more for the exec of a test that execs.
 pub const OS_TEST_TABLE: &[Record] = &[
     TABLE[0],
-    POSIX_ABI_TABLE[1],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 4 * OS_TEST_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
     POSIX_ABI_TABLE[2],
     Record {
-        name: "os-test",
-        program: "os-test",
-        args: b"os-test\0",
-        ..RELIBC_HELLO
+        name: "os-test-run",
+        program: "os-test-run",
+        args: b"os-test-run\0",
+        connects: &["ramfs", "clock", "posix"],
+        root: true,
+        quota: OS_TEST_QUOTA,
+        ..POSIX
     },
 ];
+
+/// The quota of the runner of os-test, which each test it starts gets too.
+const OS_TEST_QUOTA: u64 = 512 * PAGE;
 
 /// relibc-hello's record, for the records of its other runs.
 const RELIBC_HELLO: Record = Record {
@@ -419,82 +340,26 @@ pub const RTBENCH: Record = Record {
 
 /// The image of rtbench 2 on QEMU: the PL011's driver under another name,
 /// for the console alone, the RAM files, the process and clock services,
-/// the service of long operations, the load and the benchmark.
+/// the service of long operations, the load and the benchmark, whose
+/// children (S10 to S13) are files of the image started from the loader.
 pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     Record {
         name: "console",
         ..super::normal::TABLE[0]
     },
     TABLE[0],
-    POSIX_ABI_TABLE[1],
+    RTBENCH_POOL,
     POSIX_ABI_TABLE[2],
     LONG,
     LOAD,
     RTBENCH,
-    RTBENCH_CHILDREN[0],
-    RTBENCH_CHILDREN[1],
-    RTBENCH_CHILDREN[2],
-    RTBENCH_CHILDREN[3],
-    RTBENCH_CHILDREN[4],
-    RTBENCH_CHILDREN[5],
-    RTBENCH_CHILDREN[6],
-    RTBENCH_CHILDREN[7],
-    RTBENCH_CHILDREN[8],
 ];
 
-/// The children of rtbench 2 (S10 to S13), which start on demand.
-pub const RTBENCH_CHILDREN: [Record; 9] = [
-    Record {
-        name: "rtbench-target",
-        args: b"rtbench-posix\0target\0",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-quick",
-        args: b"rtbench-posix\0quick\0",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-exiter",
-        args: b"rtbench-posix\0exiter\0",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-wait1",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-wait2",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-wait3",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-wait4",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-wait5",
-        ..RTBENCH_CHILD
-    },
-    Record {
-        name: "rtbench-wait6",
-        ..RTBENCH_CHILD
-    },
-];
-
-/// A child of rtbench 2 (S10 to S13), which starts on demand: the
-/// benchmark under a role named by its first argument. The table holds
-/// 16 records, so a group of seven (`target` and the six `wait`) is the
-/// largest one the benchmark can start.
-pub const RTBENCH_CHILD: Record = Record {
-    name: "rtbench-wait1",
-    program: "rtbench-posix",
-    args: b"rtbench-posix\0wait\0",
-    connects: &["ramfs", "clock", "posix", "uart"],
-    quota: 512 * PAGE,
-    on_demand: true,
-    ..POSIX
+/// The process service of rtbench 2: the pool for the children the
+/// benchmark starts from files (5c), which get the benchmark's quota: 32
+/// at once (S12, a group of 32) and one that fails its load, with the
+/// service's reserve (posix_process_service::loaders::RESERVE).
+pub const RTBENCH_POOL: Record = Record {
+    quota: POSIX_ABI_TABLE[1].quota + 33 * RTBENCH.quota + 384 * PAGE,
+    ..POSIX_ABI_TABLE[1]
 };

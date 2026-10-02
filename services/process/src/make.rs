@@ -97,7 +97,7 @@ pub struct Made {
     pub thread: Handle<Thread>,
 }
 
-/// Why no process was made: the status for init or the parent, and the
+/// Why no process was made: the status for init, and the
 /// label of the record when one was made, which Abandon then ends.
 pub struct Failed {
     pub status: Status,
@@ -132,15 +132,11 @@ pub fn loaded(label: u64, thread: Handle<Thread>) -> Result<(), Status> {
     ask(&w, [thread.erase()].into(), &mut buffer).map(drop)
 }
 
-/// Abandon of the record of `label` (0 for none), whose process is killed,
-/// and of the Spawn of the record of `parent` (0 for none), which gets
-/// `status`.
-pub fn abandon(label: u64, parent: u64, status: Status) -> Result<(), Status> {
+/// Abandon of the record of `label` (0 for none), whose process is killed.
+pub fn abandon(label: u64) -> Result<(), Status> {
     let mut w = Writer::new();
     Method::Abandon.header().write(&mut w)?;
     w.u64(label)?;
-    w.u64(parent)?;
-    w.u32(status.code())?;
     let mut buffer = [0; abi::MESSAGE_MAX];
     ask(&w, rt::handle::Outgoing::new(), &mut buffer).map(drop)
 }
@@ -152,10 +148,8 @@ pub fn status(bytes: &[u8]) -> Result<Status, Status> {
 
 /// ADOPTED for `ticket` with what `made` gave: the session, the process,
 /// a copy of its thread and the identity session, then thread_start and Loaded once init took
-/// them; a refusal of init, or no process, ends the record and the Spawn
-/// of `parent` (0 for none) with Abandon. `buffer` is the calling
-/// thread's.
-pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
+/// them; a refusal of init, or no process, ends the record with Abandon.
+pub fn adopted(ticket: u64, made: Result<Made, Failed>) {
     let mut w = Writer::new();
     if proto_init::Method::Adopted.header().write(&mut w).is_err() || w.u64(ticket).is_err() {
         return;
@@ -170,7 +164,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
             // channel's end.
             let _ = w.u32(failed.status.code().max(1));
             let _ = sys::send(&init, w.as_bytes());
-            let _ = abandon(failed.label.unwrap_or(0), parent, failed.status);
+            let _ = abandon(failed.label.unwrap_or(0));
             return;
         }
     };
@@ -200,7 +194,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
     if taken && sys::thread_start(&thread).is_ok() {
         let _ = loaded(label, thread);
     } else {
-        let _ = abandon(label, parent, Status::from_code(proto_process::AGAIN));
+        let _ = abandon(label);
     }
 }
 
@@ -208,10 +202,8 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
 /// `start` (proto_init Adoption) from the
 /// program `name` of the boot image, loading it through `window` of the
 /// service's space, which only the calling thread uses, while `thread`,
-/// the caller's own, runs at `level`: the process's priority, or that of
-/// the parent whose Spawn waits for it when higher, so that a parent
-/// waits for no copy below its own level; never above the loop's. The
-/// record stays LOADING until `loaded`.
+/// the caller's own, runs at `level`: the process's priority, never above
+/// the loop's. The record stays LOADING until `loaded`.
 ///
 /// # Safety
 /// Only the calling thread maps and uses `window`, a range as big as the

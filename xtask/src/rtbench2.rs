@@ -42,7 +42,7 @@ pub const ROWS: [&str; 27] = [
     "s10_kill_process_busy_25",
     "s11_waitpid_zombie",
     "s11_exit_to_waitpid",
-    "s12_killpg_group_7",
+    "s12_killpg_group_32",
     "s13_spawn_to_main",
     "fork_exec_waitpid",
     "timer_1ms",

@@ -145,6 +145,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "os-test-run"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
 name = "posix-abi"
 version = "0.1.0"
 dependencies = [

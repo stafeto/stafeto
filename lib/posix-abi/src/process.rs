@@ -13,7 +13,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use process_client::Client;
 pub use process_client::{IDENTITY_NAME, START_NAME};
-use proto_process::{Change, Spawn};
+use proto_process::Change;
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Handle};
 
@@ -323,55 +323,6 @@ pub fn waitpid(pid: i32, options: i32) -> Result<Waited, i32> {
     }
     let own = page().pgid.load(Ordering::Relaxed);
     wait(proto_process::Selector::of(pid, own), options | WEXITED)
-}
-
-/// posix_spawn of the program at `path` with the spawn-flags `flags` and
-/// the process group `pgroup` (5b, until the loader of 5c): `path` names a
-/// record of init's table that starts on demand, `/boot/<name>`, whose
-/// program and arguments the child gets. ENOENT for another path or no
-/// such record; EINVAL for a flag other than POSIX_SPAWN_SETPGROUP and
-/// POSIX_SPAWN_SETSID or a negative group; EAGAIN past the children of a
-/// process, while the record's child lives, or with the service's records
-/// taken; ENOMEM when the child could not be loaded. The error comes
-/// before posix_spawn returns: the child got no PID then.
-pub fn spawn(path: &[u8], flags: i32, pgroup: i32) -> Result<i32, i32> {
-    use crate::constants::{EAGAIN, EINVAL, ENOENT, ENOMEM, EPERM};
-    let name = path
-        .strip_prefix(b"/boot/")
-        .filter(|name| !name.contains(&b'/'))
-        .and_then(|name| proto_wire::Name::new(name).ok())
-        .ok_or(ENOENT)?;
-    let allowed = proto_process::SPAWN_SETPGROUP | proto_process::SPAWN_SETSID;
-    let flags = u32::try_from(flags).map_err(|_| EINVAL)?;
-    let pgroup = u32::try_from(pgroup).map_err(|_| EINVAL)?;
-    if flags & !allowed != 0 {
-        return Err(EINVAL);
-    }
-    // The copy of the child's program runs at least at the caller's level.
-    let level = crate::threads::own_block()
-        .base_level
-        .load(core::sync::atomic::Ordering::Relaxed) as u8;
-    // The child's main thread starts with the caller's mask.
-    let mask = crate::threads::own_block()
-        .mask
-        .load(core::sync::atomic::Ordering::SeqCst);
-    let spawn = Spawn {
-        name,
-        flags,
-        pgroup,
-        level,
-        mask,
-    };
-    let pid = client().spawn(&spawn).map_err(|status| match status {
-        Status::Kernel(rt::abi::Error::NoMemory) => ENOMEM,
-        status => match status.code() {
-            proto_process::NOT_FOUND => ENOENT,
-            proto_process::INVALID => EINVAL,
-            proto_process::PERMISSION => EPERM,
-            _ => EAGAIN,
-        },
-    })?;
-    i32::try_from(pid).map_err(|_| EAGAIN)
 }
 
 /// The probe of condition O2 (5c): with it set, Start carries a second

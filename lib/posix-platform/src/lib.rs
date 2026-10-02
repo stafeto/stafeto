@@ -428,11 +428,9 @@ unsafe fn strings<'a>(list: *const *const c_char) -> impl Iterator<Item = &'a [u
 }
 
 /// posix_spawn of the program at `path` with `argv`, `envp` and the
-/// attributes at `attributes` (null for none): from a file through the
-/// loader (posix_abi::process::spawn_file, 5c), or, for a path under
-/// `/boot/`, the record of init's table that starts on demand (5b,
-/// posix_abi::process::spawn), which takes the table's arguments. The
-/// child's PID, or the negated errno.
+/// attributes at `attributes` (null for none): from its file through the
+/// loader (posix_abi::process::spawn_file, 5c). The child's PID, or the
+/// negated errno.
 ///
 /// # Safety
 /// `path` is a C string; `argv` and `envp` are null or NULL-ended arrays
@@ -452,18 +450,6 @@ pub unsafe extern "C" fn stafeto_spawn(
     // SAFETY: as above.
     let attributes = unsafe { attributes.as_ref() };
     let (flags, pgroup) = attributes.map_or((0, 0), |a| (a.flags, a.pgroup));
-    if path.starts_with(b"/boot/") {
-        let old = proto_process::SPAWN_SETPGROUP | proto_process::SPAWN_SETSID;
-        let flags = if flags as u32 & !old == 0 && count == 0 {
-            flags
-        } else {
-            -1
-        };
-        return match call(|| posix_abi::process::spawn(path, flags, pgroup)) {
-            Ok(pid) => pid,
-            Err(errno) => -errno,
-        };
-    }
     let (Ok(flags), Ok(pgroup)) = (u32::try_from(flags), u32::try_from(pgroup)) else {
         return -posix_abi::constants::EINVAL;
     };

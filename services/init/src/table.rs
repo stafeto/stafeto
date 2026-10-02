@@ -198,10 +198,6 @@ pub struct Record {
     /// process. The others init starts have none, and their children
     /// inherit by the rules of setuid.
     pub root: bool,
-    /// A POSIX client init does not start at its start: the process
-    /// service starts it for posix_spawn of `/boot/<name>` (SPAWN,
-    /// serve.rs), one instance at a time, until the loader of 5c.
-    pub on_demand: bool,
 }
 
 impl Record {
@@ -342,11 +338,6 @@ pub enum TableError<'a> {
     Root {
         record: &'static str,
     },
-    /// A record started on demand that is no POSIX client, has root or
-    /// restarts.
-    OnDemand {
-        record: &'static str,
-    },
 }
 
 impl fmt::Display for TableError<'_> {
@@ -440,10 +431,6 @@ impl fmt::Display for TableError<'_> {
                 f,
                 "{record} has root: one POSIX process at most, which connects to {PROCESS_SERVICE}"
             ),
-            TableError::OnDemand { record } => write!(
-                f,
-                "{record} starts on demand: a POSIX client without root that does not restart"
-            ),
         }
     }
 }
@@ -463,9 +450,8 @@ impl fmt::Display for TableError<'_> {
 /// MIN_QUOTA; DMA objects only for a trusted service, each named and of a
 /// power of two of pages up to abi::MAX_CONTIGUOUS_PAGES; each write that
 /// stops the device on a word within a window of the record; root for one
-/// POSIX process at most; a start on demand only for a POSIX client
-/// without root that does not restart. Whether the program is in the boot image, init checks at
-/// its start.
+/// POSIX process at most. Whether the program is in the boot image, init
+/// checks at its start.
 pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
     if table.len() > MAX_RECORDS {
         return Err(TableError::TooMany { count: table.len() });
@@ -512,10 +498,6 @@ pub fn check(table: &[Record]) -> Result<Order, TableError<'_>> {
         let first = table.iter().position(|r| r.root) == Some(place);
         if r.root && (!r.is_posix() || !first) {
             return Err(TableError::Root { record: r.name });
-        }
-        let restarts = r.restart == Restart::Always;
-        if r.on_demand && (!r.is_posix() || !r.is_client() || r.root || restarts) {
-            return Err(TableError::OnDemand { record: r.name });
         }
     }
     Ok(order(table))
@@ -849,7 +831,6 @@ mod tests {
             quiesce: &[],
             trusted: false,
             root: false,
-            on_demand: false,
         }
     }
 
@@ -1488,24 +1469,7 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),
-            [
-                "ramfs",
-                "posix",
-                "clock",
-                "posix-procs",
-                "procs-child",
-                "procs-sleeper",
-                "procs-big",
-                "procs-nap",
-                "procs-exit7",
-                "procs-segv",
-                "procs-middle",
-                "procs-orphan",
-                "procs-catch",
-                "procs-sleep2",
-                "procs-ids",
-                "procs-block"
-            ]
+            ["ramfs", "posix", "clock", "posix-procs"]
         );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
             assert_eq!(
@@ -1517,16 +1481,7 @@ mod tests {
                     "clock",
                     "uart",
                     "rtbench-load",
-                    "rtbench-posix",
-                    "rtbench-target",
-                    "rtbench-quick",
-                    "rtbench-exiter",
-                    "rtbench-wait1",
-                    "rtbench-wait2",
-                    "rtbench-wait3",
-                    "rtbench-wait4",
-                    "rtbench-wait5",
-                    "rtbench-wait6"
+                    "rtbench-posix"
                 ]
             );
         }
@@ -1574,7 +1529,7 @@ mod tests {
                     "posix-abi-probe",
                     "relibc-hello",
                     "relibc-threads",
-                    "os-test",
+                    "os-test-run",
                     "rtbench-posix",
                 ]
                 .contains(&r.program)
@@ -1624,61 +1579,6 @@ mod tests {
         assert_eq!(
             TableError::Root { record: "plain" }.to_string(),
             "plain has root: one POSIX process at most, which connects to posix"
-        );
-    }
-
-    /// A start on demand goes to a POSIX client without root that does
-    /// not restart alone.
-    #[test]
-    fn on_demand_is_for_posix_clients() {
-        const POSIX: &[&str] = &[PROCESS_SERVICE];
-        let process = service(PROCESS_SERVICE, 50, 50);
-        let child = Record {
-            on_demand: true,
-            ..client("child", 20, 20, POSIX)
-        };
-        assert!(check(&[process, child]).is_ok());
-        for (refused, name) in [
-            (
-                Record {
-                    on_demand: true,
-                    ..client("plain", 20, 20, &[])
-                },
-                "plain",
-            ),
-            (
-                Record {
-                    on_demand: true,
-                    root: true,
-                    ..client("root", 20, 20, POSIX)
-                },
-                "root",
-            ),
-            (
-                Record {
-                    on_demand: true,
-                    restart: Restart::Always,
-                    ..client("again", 20, 20, POSIX)
-                },
-                "again",
-            ),
-            (
-                Record {
-                    on_demand: true,
-                    connects: POSIX,
-                    ..service("daemon", 20, 20)
-                },
-                "daemon",
-            ),
-        ] {
-            assert_eq!(
-                check(&[process, refused]),
-                Err(TableError::OnDemand { record: name })
-            );
-        }
-        assert_eq!(
-            TableError::OnDemand { record: "plain" }.to_string(),
-            "plain starts on demand: a POSIX client without root that does not restart"
         );
     }
 }

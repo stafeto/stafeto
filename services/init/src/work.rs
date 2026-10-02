@@ -205,7 +205,6 @@ mod tests {
             quiesce: &[],
             trusted: false,
             root: false,
-            on_demand: false,
         }
     }
 

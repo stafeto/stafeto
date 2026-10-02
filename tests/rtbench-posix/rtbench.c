@@ -33,18 +33,17 @@
  * to the return of the futex_wait of a thread at 30, and futex_wake on a
  * word whose bucket holds a waiter on another word; S9 an empty round
  * trip through the loop of a service. The scenarios of 5b, which need the
- * process service and children from the boot image (the records
- * rtbench-target, -quick, -exiter and -wait1 to -wait6, one live child
- * to a record, the program itself under a role named by its first
- * argument; the children hand their stamps of the shared counter to the
- * parent through offsets of /tmp/probe): S10 from kill() of another
+ * process service and children from a file (/bin/rtbench-posix, the
+ * program itself under a role named by its first argument: target,
+ * quick, exiter and wait; the children hand their stamps of the shared
+ * counter to the parent through offsets of /tmp/probe): S10 from kill() of another
  * process to the first statement of the handler of its main thread, while
  * the target sleeps and while a thread at 25 runs all the time; S11 a
  * waitpid of a zombie that is ready (one round trip), and from the
  * _exit of a child to the return of waitpid of the parent, which holds
  * one write of the child's stamp (an upper bound); S12 killpg to a group
- * of seven, to the last waitpid of its members; S13 posix_spawn from the
- * boot image to the first statement of the child's main.
+ * of 32, to the last waitpid of its members; S13 posix_spawn from a file
+ * to the first statement of the child's main.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -658,13 +657,13 @@ static int service_round_trip(void) {
     return 0;
 }
 
-/* --- S10-S13: children from the boot image ---------------------------- */
+/* --- S10-S13: children from a file ------------------------------------ */
 
 #define STAMP_HANDLER 0
 #define STAMP_READY 8
 #define STAMP_MAIN 16
 #define STAMP_EXIT 32
-#define GROUP 7
+#define GROUP 32
 
 static struct histogram s10[2], s11[2], s12, s13;
 static int probe_fd = -1;
@@ -690,16 +689,17 @@ static int clear_stamps(void) {
     return 0;
 }
 
-static int spawn_child(pid_t *pid, const char *path, int flags, pid_t group) {
-    char *argv[] = { "rtbench-posix", NULL };
+/* Spawns /bin/rtbench-posix in role `role`. */
+static int spawn_child(pid_t *pid, const char *role, int flags, pid_t group) {
+    char *argv[] = { "rtbench-posix", (char *)role, NULL };
     char *envp[] = { NULL };
     posix_spawnattr_t attr;
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, flags);
     posix_spawnattr_setpgroup(&attr, group);
-    int error = posix_spawn(pid, path, NULL, &attr, argv, envp);
+    int error = posix_spawn(pid, "/bin/rtbench-posix", NULL, &attr, argv, envp);
     posix_spawnattr_destroy(&attr);
-    if (error) fail(path, error);
+    if (error) fail(role, error);
     return error;
 }
 
@@ -735,7 +735,7 @@ static int kill_process(int spin, struct histogram *h) {
     struct worker spinner;
     pid_t pid = -1;
     bursts = 0;
-    int error = clear_stamps() || spawn_child(&pid, "/boot/rtbench-target", 0, 0)
+    int error = clear_stamps() || spawn_child(&pid, "target", 0, 0)
             || await_stamp(STAMP_READY, "S10 target did not start");
     if (error) return 1;
     if (spin && start(&spinner, busy, BUSY_LEVEL, NULL)) return 1;
@@ -768,7 +768,7 @@ static int spawn_and_wait(void) {
         pid_t pid = -1;
         if (clear_stamps()) return 1;
         uint64_t t0 = ticks();
-        if (spawn_child(&pid, "/boot/rtbench-quick", 0, 0)) return 1;
+        if (spawn_child(&pid, "quick", 0, 0)) return 1;
         if (await_stamp(STAMP_MAIN, "S13 child did not start")) return 1;
         record(&s13, ticks_ns(get_stamp(STAMP_MAIN) - t0));
         for (int tries = 0;; tries++) {
@@ -794,7 +794,7 @@ static int spawn_and_wait(void) {
 static int exit_to_wait(void) {
     for (int i = 0; i < 20; i++) {
         pid_t pid = -1;
-        if (clear_stamps() || spawn_child(&pid, "/boot/rtbench-exiter", 0, 0)) return 1;
+        if (clear_stamps() || spawn_child(&pid, "exiter", 0, 0)) return 1;
         int got = reaped(pid, 0, 0, "S11 waitpid of the exiter");
         uint64_t t1 = ticks();
         uint64_t stamp = get_stamp(STAMP_EXIT);
@@ -809,13 +809,10 @@ static int exit_to_wait(void) {
 
 /* S12: killpg to a group of GROUP children, until the last waitpid. */
 static int kill_group(void) {
-    static const char *const records[GROUP] = {
-        "/boot/rtbench-target", "/boot/rtbench-wait1", "/boot/rtbench-wait2", "/boot/rtbench-wait3",
-        "/boot/rtbench-wait4", "/boot/rtbench-wait5", "/boot/rtbench-wait6" };
     pid_t pids[GROUP];
     for (int round = 0; round < 5; round++) {
         for (int i = 0; i < GROUP; i++)
-            if (spawn_child(&pids[i], records[i], POSIX_SPAWN_SETPGROUP, i ? pids[0] : 0)) return 1;
+            if (spawn_child(&pids[i], i ? "wait" : "target", POSIX_SPAWN_SETPGROUP, i ? pids[0] : 0)) return 1;
         sleep_ns(100 * MS);
         uint64_t t0 = ticks();
         if (killpg(pids[0], SIGTERM)) {
@@ -924,7 +921,7 @@ static void report(void) {
     row("s10_kill_process_busy_25", &s10[1], 0);
     row("s11_waitpid_zombie", &s11[0], 0);
     row("s11_exit_to_waitpid", &s11[1], 0);
-    row("s12_killpg_group_7", &s12, 0);
+    row("s12_killpg_group_32", &s12, 0);
     row("s13_spawn_to_main", &s13, 0);
     none("fork_exec_waitpid", "fork and exec come with 5c and 5d");
     none("timer_1ms", "POSIX timers come with 5h");

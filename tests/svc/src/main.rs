@@ -80,6 +80,9 @@ mod method {
 
 /// The sessions of a test service.
 const SESSIONS: usize = 8;
+/// The sessions of the service of long operations: the benchmark's, and
+/// the clones its children (S12, a group of 32) start with.
+const LONG_SESSIONS: usize = 48;
 
 fn main(_: u64) -> u64 {
     let Ok(s) = rt::startup() else {
@@ -192,6 +195,15 @@ fn base(s: &Startup) -> u8 {
 /// init at the period of the service's arguments (spec 13.4); returns
 /// only when the loop failed, with FAILED.
 fn serve<S: Service<1>>(s: &Startup, channel: &Handle<Channel>, service: &mut S) -> u64 {
+    serve_with::<S, SESSIONS>(s, channel, service)
+}
+
+/// `serve` with `N` sessions.
+fn serve_with<S: Service<1>, const N: usize>(
+    s: &Startup,
+    channel: &Handle<Channel>,
+    service: &mut S,
+) -> u64 {
     let period_ns = ServiceArgs::read(s.args()).map_or(0, |a| a.period_ns);
     let heartbeat = Heartbeat {
         to: &s.parent,
@@ -202,6 +214,6 @@ fn serve<S: Service<1>>(s: &Startup, channel: &Handle<Channel>, service: &mut S)
         issued: 0,
         heartbeat: Some(heartbeat),
     };
-    let _ = service::run::<S, SESSIONS, 1>(channel, service, config);
+    let _ = service::run::<S, N, 1>(channel, service, config);
     FAILED
 }

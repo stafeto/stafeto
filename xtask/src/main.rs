@@ -72,8 +72,9 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 /// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
-/// the console.
-const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
+/// the console; the loader, which starts the benchmark's children from the
+/// files of the image (5c).
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -87,9 +88,10 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
 ];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
-const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -103,6 +105,7 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
 ];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
@@ -353,11 +356,10 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-hello", "relibc-hello", POSIX_STACK_SIZE, &[]),
 ];
-/// The probe of POSIX processes (5b) and the services it needs: the same
-/// program a second time with a stack of 32 MiB, which the 15 pages of
-/// quota of its record cannot map (procs-big); the loader, and BusyBox
-/// with its applets, which the table of files names (5c).
-const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
+/// The probe of POSIX processes (5b) and the services it needs, the loader
+/// and BusyBox with its applets, which the table of files names (5c): the
+/// probe's children are files of it.
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -368,7 +370,6 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
-    ("posix-procs-big", "posix-procs", 32 * 1024 * 1024, &[]),
     ("loader", "loader", 0, &[]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
@@ -863,9 +864,11 @@ commands:
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
-  os-test   run os-test's io and malloc suites on relibc, one test a boot;
+  os-test   run os-test's io, malloc, signal and basic spawn and exec tests
+            on relibc, a boot a suite, the tests started from files;
             the table goes to target/measure/os-test.txt; fails when a
-            test of tests/os-test/pass.txt does not pass
+            test of tests/os-test/pass.txt does not pass; with
+            --one NAME, one test in a boot of its own, with its log
   help      this text";
 
 fn main() {
@@ -903,7 +906,11 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
-        Some("os-test") => ostest::run_in_budget(),
+        Some("os-test") => match &args[1..] {
+            [flag, name] if flag == "--one" => ostest::run_one(name),
+            [] => ostest::run_in_budget(),
+            _ => Err("os-test [--one suite/test]".to_owned()),
+        },
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
@@ -1151,6 +1158,18 @@ fn write_boot_image_with(
     profile: Profile,
     env: &[(&str, &str)],
 ) -> Result<PathBuf, String> {
+    write_boot_image_files(name, programs, profile, env, Vec::new())
+}
+
+/// `write_boot_image_with` with `extra` files in the image's table of
+/// files after those `rootfs::files_of(name)` lists (os-test's tests).
+fn write_boot_image_files(
+    name: &str,
+    programs: &[ImageProgram],
+    profile: Profile,
+    env: &[(&str, &str)],
+    extra: Vec<rootfs::RootFile>,
+) -> Result<PathBuf, String> {
     let mut cmd = cargo();
     cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
@@ -1174,10 +1193,14 @@ fn write_boot_image_with(
         std::fs::copy(&built, &elf).map_err(|e| format!("{}: {e}", built.display()))?;
         sources.push((file, elf, stack));
     }
-    write_elf_image(name, &sources)
+    write_elf_image(name, &sources, extra)
 }
 
-fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathBuf, String> {
+fn write_elf_image(
+    name: &str,
+    sources: &[(&str, PathBuf, u32)],
+    extra: Vec<rootfs::RootFile>,
+) -> Result<PathBuf, String> {
     let target = target_dir();
     let objdump = llvm_tool("llvm-objdump")?;
     let mut files = Vec::new();
@@ -1228,7 +1251,7 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
         .iter()
-        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "os-test-probe"));
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "os-test-run"));
     let os_test_licence = if os_test {
         Some(ostest::licence()?)
     } else {
@@ -1241,7 +1264,8 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     // ELF files of programs as the linker wrote them among them, then the
     // ELF files of the other programs of stack 0 (the loader, `loader.elf`),
     // then the table (rootfs.rs).
-    let listed = rootfs::files_of(name);
+    let mut listed = rootfs::files_of(name);
+    listed.extend(extra);
     let wanted = rootfs::sources(&listed);
     let read_elf = |program: &str| -> Result<Vec<u8>, String> {
         let (_, elf, _) = sources
@@ -1882,30 +1906,19 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    // The parent and its child end in either order.
-    let ended = (|| {
-        for line in [
-            "init: posix-procs ended: exit code 0, not restarted",
-            "init: procs-child ended: exit code 0, not restarted",
-            "init: procs-big did not load: no process of the process service, not restarted",
-            "init: procs-exit7 ended: exit code 7, not restarted",
-            "init: procs-middle ended: exit code 0, not restarted",
-            "init: procs-orphan ended: exit code 0, not restarted",
-            "init: procs-sleeper ended: signal 15 (SIGTERM), not restarted",
-            "init: procs-block ended: killed, not restarted",
-            "init: procs-catch ended: exit code 42, not restarted",
-            "init: procs-catch ended: signal 15 (SIGTERM), not restarted",
-            "init: procs-sleep2 ended: signal 15 (SIGTERM), not restarted",
-            "init: procs-ids ended: exit code 0, not restarted",
-        ] {
-            run.expect_seen(line, BOOT_TIMEOUT)?;
-        }
-        Ok::<(), String>(())
-    })();
+    // The probe is the table's only record: its end is init's line, and
+    // its children are processes of the service that init never hears of.
+    // It ends in an exec (stage 10) of the role that exits with 42: init
+    // reports the new image's end.
+    let ended = run.expect_seen(
+        "init: posix-procs ended: exit code 42, not restarted",
+        BOOT_TIMEOUT,
+    );
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
     // The first goal of 5c: /bin/ls from a file lists /etc, a line alone,
     // from a spawn and from an exec.
@@ -1956,7 +1969,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
             "the child says {child:?}, the parent {parent:?}: no child of that parent"
         ));
     }
-    println!("C POSIX process probe passed: posix_spawn from the boot image and from files");
+    println!("C POSIX process probe passed: posix_spawn and exec from files");
     Ok(())
 }
 
@@ -4077,6 +4090,8 @@ fn ci() -> Result<(), String> {
         "relibc-threads",
         "--package",
         "posix-procs",
+        "--package",
+        "os-test-run",
         "--target",
         PROGRAM_TARGET,
         "--",

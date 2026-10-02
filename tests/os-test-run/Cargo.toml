@@ -1,0 +1,17 @@
+[package]
+name = "os-test-run"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The runner of os-test in C on relibc: starts each test of an image from its file"
+build = "build.rs"
+
+[[bin]]
+name = "os-test-run"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }
