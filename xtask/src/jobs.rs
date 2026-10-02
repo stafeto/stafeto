@@ -137,11 +137,17 @@ pub fn run_all(jobs: Vec<Job>, limit: usize) -> Result<(), String> {
             }
         }
     });
-    let failures: Vec<&str> = results
+    let failures: Vec<String> = results
         .iter()
         .enumerate()
-        .filter(|(_, done)| done.as_ref().is_some_and(|d| d.result.is_err()))
-        .map(|(i, _)| names[i].as_str())
+        .filter_map(|(i, done)| match done.as_ref()?.result.as_ref() {
+            Err(why) => Some(format!(
+                "{} ({})",
+                names[i],
+                why.lines().next().unwrap_or_default()
+            )),
+            Ok(()) => None,
+        })
         .collect();
     let skipped = results.iter().filter(|done| done.is_none()).count();
     println!(
@@ -181,13 +187,17 @@ mod tests {
 
     #[test]
     fn a_failure_is_named() {
-        let jobs = vec![
-            ok("a"),
-            job("b", || Err("broken".to_owned())),
-            job("c", || panic!("boom")),
-        ];
+        let jobs = vec![ok("a"), job("b", || Err("broken".to_owned()))];
         let e = run_all(jobs, 3).unwrap_err();
         assert!(e.contains("b"), "{e}");
+    }
+
+    /// A job that panics ends as `panicked` in the summary.
+    #[test]
+    fn a_panic_is_caught_and_named() {
+        let jobs = vec![job("boom", || panic!("boom"))];
+        let e = run_all(jobs, 2).unwrap_err();
+        assert_eq!(e, "1 failed: boom (panicked)");
     }
 
     #[test]

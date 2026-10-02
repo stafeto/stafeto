@@ -305,6 +305,9 @@ pub struct Run {
     child: Child,
     stdin: Option<ChildStdin>,
     reader: Option<JoinHandle<()>>,
+    /// The reader of the child's stderr when this thread keeps its
+    /// output (out.rs): its text joins the job's output at the end.
+    errors: Option<JoinHandle<String>>,
     pieces: mpsc::Receiver<Vec<u8>>,
     /// The reader sets it as it ends: the test of `stop` looks at it.
     #[cfg(test)]
@@ -334,11 +337,24 @@ impl Run {
             Input::Null => Stdio::null(),
             Input::Pipe => Stdio::piped(),
         };
+        let keep = crate::out::capturing();
         let mut child = cmd
             .stdin(stdin)
             .stdout(Stdio::piped())
+            .stderr(if keep {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .spawn()
             .map_err(|e| format!("{cmd:?}: {e}"))?;
+        let errors = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                let _ = stderr.read_to_end(&mut text);
+                String::from_utf8_lossy(&text).into_owned()
+            })
+        });
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let (tx, pieces) = mpsc::channel();
         #[cfg(test)]
@@ -360,6 +376,7 @@ impl Run {
             stdin: child.stdin.take(),
             child,
             reader: Some(reader),
+            errors,
             pieces,
             #[cfg(test)]
             ended,
@@ -505,6 +522,9 @@ impl Run {
         drop(self.stdin.take());
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
+        }
+        if let Some(Ok(text)) = self.errors.take().map(JoinHandle::join) {
+            crate::out::write(&text, true);
         }
         while let Ok(piece) = self.pieces.try_recv() {
             self.take(&piece);

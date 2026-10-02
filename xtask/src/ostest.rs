@@ -13,7 +13,7 @@
 //! tests/os-test/pass.txt does not pass.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::jobs::Job;
@@ -194,15 +194,14 @@ type Row = (String, Verdict, String);
 /// The suites as a job for each test, and what `finish` needs.
 pub struct Plan {
     rows: Rows,
-    start: Instant,
+    /// The start of the first test's job: the budget counts from it.
+    started: Arc<OnceLock<Instant>>,
 }
 
 /// The tests of the suites as jobs (each boots its own image under its own
 /// name), after the build of os-test's tests. `ci` puts them among its
 /// own jobs.
 pub fn plan() -> Result<(Vec<Job>, Plan), String> {
-    let start = Instant::now();
-    let deadline = start + BUDGET;
     crate::relibc()?;
     crate::run_cmd(
         std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
@@ -219,17 +218,20 @@ pub fn plan() -> Result<(Vec<Job>, Plan), String> {
         })
         .collect::<Result<_, String>>()?;
     let rows: Rows = Arc::new(Mutex::new(vec![None; tests.len()]));
+    let started = Arc::new(OnceLock::new());
     let mut jobs = Vec::new();
     for (index, (name, built)) in tests.into_iter().enumerate() {
         let (rows, work, kernel) = (Arc::clone(&rows), work.clone(), kernel.clone());
+        let started = Arc::clone(&started);
         jobs.push(crate::jobs::job(&format!("os-test {name}"), move || {
+            let deadline = *started.get_or_init(Instant::now) + BUDGET;
             let row = one(index, &name, &built, &work, &kernel, deadline)?;
             println!("os-test {name}: {} ({})", row.1.name(), first_line(&row.2));
             rows.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(row);
             Ok(())
         }));
     }
-    Ok((jobs, Plan { rows, start }))
+    Ok((jobs, Plan { rows, started }))
 }
 
 /// The end of a run of the suites: the table, the score and the list of
@@ -246,9 +248,9 @@ pub fn finish(plan: Plan) -> Result<(), String> {
     let path = write(&rows)?;
     println!("os-test: {}", score(&rows));
     println!("os-test table: {}", path.display());
-    let took = plan.start.elapsed();
+    let took = plan.started.get().map_or(Duration::ZERO, Instant::elapsed);
     println!(
-        "os-test: {} s of its {} s",
+        "os-test boots: {} s of its {} s",
         took.as_secs(),
         BUDGET.as_secs()
     );

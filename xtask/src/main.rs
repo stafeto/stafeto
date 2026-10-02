@@ -2179,10 +2179,39 @@ fn test(jobs: usize) -> Result<(), String> {
     }
     let (os_test, plan) = ostest::plan()?;
     jobs::run_all(boot_jobs(os_test), jobs)?;
+    // Checks that read the host's time on TCG run alone, after the rest.
+    jobs::run_all(timing_jobs(), 1)?;
+    println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
     ostest::finish(plan)?;
     write_measures()?;
     println!("all checks passed");
     Ok(())
+}
+
+/// The boots of `test` whose verdicts depend on the host's time (the test
+/// init's heartbeats on their absolute deadlines without -icount, the
+/// monitor of QEMU for the ELF boot): they run one at a time once the
+/// others have ended, so that the load of the others cannot fail them.
+fn timing_jobs() -> Vec<jobs::Job> {
+    use jobs::job;
+    vec![
+        job(
+            "elf boot without a device tree",
+            elf_boot_reports_missing_device_tree,
+        ),
+        job("init tests 512M", || {
+            init_tests(&qemu::VIRT, false).map(drop)
+        }),
+        job("init tests 2G", || {
+            init_tests(&qemu::VIRT_2G, false).map(drop)
+        }),
+        job("init tests GICv3", || {
+            init_tests(&qemu::VIRT_V3, false).map(drop)
+        }),
+        job("init tests EL2", || {
+            init_tests(&qemu::VIRT_EL2, false).map(drop)
+        }),
+    ]
 }
 
 /// The independent boots of `test`, in the order they ran in before there
@@ -2224,10 +2253,6 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("console dialog 512M", || console_dialog(&qemu::VIRT)),
         job("trace dialog 512M", || trace_dialog(&qemu::VIRT)),
         job("console dialog GICv3", || console_dialog(&qemu::VIRT_V3)),
-        job(
-            "elf boot without a device tree",
-            elf_boot_reports_missing_device_tree,
-        ),
         job("bad boot images", bad_boot_images_stop_the_boot),
         job("init fault", init_fault_stops_the_machine),
         job("panic log", panic_prints_the_log_nobody_showed),
@@ -2237,23 +2262,11 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("strict panic", strict_panic_only_in_checked_programs),
         job("no u128 division", no_u128_division_is_linked),
         job("shipping init", shipping_init_has_no_test_table),
-        job("init tests 512M", || {
-            init_tests(&qemu::VIRT, false).map(drop)
-        }),
-        job("init tests 2G", || {
-            init_tests(&qemu::VIRT_2G, false).map(drop)
-        }),
         job("init tests 512M icount", || {
             init_tests(&qemu::VIRT, true).map(drop)
         }),
         job("init tests 2G icount", || {
             init_tests(&qemu::VIRT_2G, true).map(drop)
-        }),
-        job("init tests GICv3", || {
-            init_tests(&qemu::VIRT_V3, false).map(drop)
-        }),
-        job("init tests EL2", || {
-            init_tests(&qemu::VIRT_EL2, false).map(drop)
         }),
         job("service tests 512M", || svc_tests(&qemu::VIRT).map(drop)),
         job("service tests GICv3", || {

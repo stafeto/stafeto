@@ -70,7 +70,7 @@ credential-based access checks, chmod, chown and mutable directories remain.
 Console fstat supplies provisional character-device metadata with zero
 timestamps until a terminal service owns its node. st_blocks reports the
 logical RAM extent rounded to 512 bytes, without disk allocation accounting.
-These probes establish the implemented subset.
+These probes establish the implemented subset; full POSIX conformance lies outside their scope.
 
 References: [read semantics](https://pubs.opengroup.org/onlinepubs/9799919799.2024edition/functions/read.html)
 and [file timestamp rules](https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap04.html).

@@ -8,6 +8,11 @@ Every guest boots on one core of the host, and the host has many. `cargo xtask t
 - Everything the boots share is built once, before they start: relibc, BusyBox, the three kernel builds and the two test boot images. A lock (`BUILD_LOCK`) covers each cargo build of programs together with the copy of its result, so two builds never meet in the path that a package's builds share.
 - Each os-test boot has its own image name and removes its image when it ends.
 - The measurements that `write_measures` keeps carry the place of their job, so the files read in the same order whatever the pace of the jobs.
+- Checks that read the host's time on TCG run alone after the parallel set (`timing_jobs`): the init tests without `-icount` (heartbeats on absolute deadlines) and the ELF boot. Under the load of six boots they failed in 2 of 8 runs.
+- The budget of os-test counts from the start of its first job, and its summary line gives the time of its boots (`os-test boots: N s of its 300 s`).
+- QEMU's stderr belongs to the job's output (`qemu::Run`) and, for the ELF boot, to the error message.
+- With `--jobs 1` the build of os-test's tests comes before the first boot, and the timing checks come last.
+- The summary line of the POSIX probes prints once the whole set has passed.
 - Runs under HVF and VZ (`cargo xtask hvf`, `vz`) stay one after the other, since their numbers depend on the load of the host.
 
 ## Time of `cargo xtask ci`

@@ -55,7 +55,7 @@ for each thread would read one thread only.
 Initial pthreads inherit main's priority; the timer uses that priority.
 Future scheduling interfaces must update this priority arrangement.
 Polling waits in the guest probe sleep, so that a FIFO IPC owner is never starved.
-This is a functional lifecycle implementation.
+This is a functional lifecycle implementation; it gives no worst-case latency bound.
 
 ## Verification
 
