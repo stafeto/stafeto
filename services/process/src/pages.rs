@@ -43,6 +43,23 @@ impl Pages {
         Some(unsafe { &*((BASE + index * PAGE) as *const Page) })
     }
 
+    /// The page of the record in `index` mapped into `process` as it is,
+    /// with the signals that wait on it: the new process of an exec (5c).
+    pub fn map_again(&self, index: usize, process: &Handle<Process>) -> Result<(), Error> {
+        let object = self.objects[index / GROUP]
+            .as_ref()
+            .ok_or(Error::BadState)?;
+        let offset = ((index % GROUP) * PAGE) as u64;
+        loader::map_narrowed(
+            process,
+            object,
+            offset,
+            PAGE as u64,
+            PAGE_ADDRESS,
+            Access::ReadWrite,
+        )
+    }
+
     /// The page of a new record in `index` of process `pid`: its object
     /// made and mapped in `own`, the service's process, when it is the
     /// first; zeroed, with the identity, and mapped into `process`.

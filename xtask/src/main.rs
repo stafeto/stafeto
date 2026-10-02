@@ -1907,9 +1907,18 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
-    // The first goal of 5c: /bin/ls from a file lists /etc, a line alone.
-    if !outcome.lines.iter().any(|l| l.trim() == "motd") {
-        return Err("ls of /etc printed no line `motd`".into());
+    // The first goal of 5c: /bin/ls from a file lists /etc, a line alone,
+    // from a spawn and from an exec.
+    if outcome.lines.iter().filter(|l| l.trim() == "motd").count() < 2 {
+        return Err("ls of /etc printed `motd` fewer than twice".into());
+    }
+    // The new image of an exec whose old image ended first never runs.
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("the image of a dead exec ran"))
+    {
+        return Err("an exec ran after its old image ended".into());
     }
     for marker in [
         "posix-procs: a child inherits the mask and SIG_IGN",
@@ -1923,6 +1932,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: nobody uid 65534 euid 65534",
         // Stage 8: the file actions' current directory.
         "posix-procs: the child's directory is /bin",
+        // Stage 9: exec keeps the PID.
+        "posix-procs: after exec pid",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }

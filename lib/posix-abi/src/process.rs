@@ -666,6 +666,7 @@ fn block<'s>(
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     umask: u32,
     shadow: &Shadow,
+    carried: proto_loader::Carried,
 ) -> Result<(usize, Handle<rt::handle::Memory>), i32> {
     use crate::constants::{E2BIG, EINVAL, ENAMETOOLONG, ENOMEM};
     use proto_loader::{Block, BlockError};
@@ -689,7 +690,8 @@ fn block<'s>(
     // SAFETY: the window maps `pages` bytes of the new object, which only
     // this call uses under SPAWN_LOCK.
     let out = unsafe { core::slice::from_raw_parts_mut(SPAWN_WINDOW as *mut u8, pages as usize) };
-    let written = Block::write_with(out, path, cwd, umask, argv, envp, &descriptors[..count]);
+    let written = Block::write_with(out, path, cwd, umask, argv, envp, &descriptors[..count])
+        .and_then(|len| Block::carry(&mut out[..len], carried).map(|()| len));
     // SAFETY: the mapping made above, which nothing uses after the write.
     let _ = unsafe { rt::sys::mem_unmap(process, SPAWN_WINDOW, pages) };
     match written {
@@ -745,7 +747,14 @@ fn spawn_shadowed<'s>(
     use crate::constants::{EAGAIN, EIO};
     use proto_process::{Method, SpawnStart};
     let pgroup = attributes.pgroup;
-    let (len, object) = block(path, argv, envp, attributes.umask, shadow)?;
+    let (len, object) = block(
+        path,
+        argv,
+        envp,
+        attributes.umask,
+        shadow,
+        proto_loader::Carried::default(),
+    )?;
     let block = &crate::threads::own_block;
     let level = block().base_level.load(Ordering::Relaxed) as u8;
     let mask = attributes
@@ -782,6 +791,206 @@ fn spawn_shadowed<'s>(
         let _ = ask(&request(Method::SpawnAbort, &[pid as u32])?);
     }
     finished.map(|()| pid)
+}
+
+/// execve of the program in the file at `path` with `argv` and `envp`
+/// (5c, spec 2, 3.2): the other threads stop and every signal of the
+/// caller is held (step 1); the service makes the new process with the
+/// loader for this record (ExecStart) and the loader opens and loads the
+/// file (step 2); on "the image is ready" (step 3) the descriptors with
+/// FD_CLOEXEC close and the sessions move to the loader as they are, the
+/// descriptions, offsets and labels with them (step 4); ExecCommit moves
+/// the record (step 5) and this process ends (step 7) while the loader
+/// jumps (step 6). An error before step 4 comes back with every thread
+/// and descriptor as it was: ENOENT, EACCES, ENOEXEC, ENOMEM, E2BIG,
+/// ENAMETOOLONG, ENOTDIR, EPERM, EAGAIN.
+pub fn exec<'s>(
+    path: &[u8],
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    umask: u32,
+) -> Result<core::convert::Infallible, i32> {
+    use crate::constants::ENOENT;
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    let block = crate::threads::own_block();
+    // Step 1: every signal of the caller held, the others stopped.
+    let mask = block.mask.swap(!0, Ordering::SeqCst);
+    let pending = block.pending.load(Ordering::SeqCst);
+    let stopped = crate::signals::stop_others();
+    let result = stopped.and_then(|()| exec_stopped(path, argv, envp, umask, mask, pending, None));
+    // Back from an exec that failed before step 4: all as it was.
+    crate::signals::resume_others();
+    block.mask.store(mask, Ordering::SeqCst);
+    crate::signals::deliver_now();
+    result
+}
+
+/// exec once the process stopped (steps 2 to 7).
+fn exec_stopped<'s>(
+    path: &[u8],
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    umask: u32,
+    mask: u64,
+    pending: u64,
+    abandon: Option<u64>,
+) -> Result<core::convert::Infallible, i32> {
+    use crate::constants::{EAGAIN, EIO};
+    use proto_process::{Method, SpawnStart};
+    let mut shadow = Shadow::take()?;
+    let carried = proto_loader::Carried {
+        pending,
+        timers: 0,
+        alarm: 0,
+    };
+    let built = block(path, argv, envp, umask, &shadow, carried);
+    shadow.finish();
+    let (len, object) = built?;
+    let level = crate::threads::own_block()
+        .base_level
+        .load(Ordering::Relaxed) as u8;
+    let start = SpawnStart {
+        flags: 0,
+        pgroup: 0,
+        level,
+        mask,
+        default: 0,
+    };
+    let mut w = Writer::new();
+    Method::ExecStart.header().write(&mut w).map_err(|_| EIO)?;
+    start.write(&mut w).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let mut reply = loop {
+        match rt::sys::send(client().session(), w.as_bytes()) {
+            Err(rt::abi::Error::Interrupted) => continue,
+            Err(_) => return Err(EAGAIN),
+            Ok(reply) => break reply,
+        }
+    };
+    let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    let status = Status::from_code(r.u32().map_err(|_| EIO)?);
+    if status != Status::Ok {
+        return Err(start_errno(status));
+    }
+    let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
+    let ready = image_ready(&c, len, object);
+    if let Err(errno) = ready {
+        let _ = ask(&request(Method::ExecAbort, &[])?);
+        return Err(errno);
+    }
+    // The probe of the window: the old image ends before ExecCommit.
+    if let Some(code) = abandon {
+        rt::sys::process_exit(code);
+    }
+    // Step 4: past this point the old image gives its sessions away, and
+    // a failure ends it.
+    move_files(&c);
+    if ask(&request(Method::ExecCommit, &[])?).is_err() {
+        rt::sys::process_exit(127);
+    }
+    // Step 7: the old image ends; the loader of the new one jumps once the
+    // record is ready.
+    rt::sys::process_exit(0)
+}
+
+/// The probes of the window of exec (5c): ExecCommit with no exec (the
+/// service's status as an errno), and an exec whose old image ends with
+/// `code` once the new one is ready, before ExecCommit.
+pub fn probe_exec_commit() -> i32 {
+    match request(proto_process::Method::ExecCommit, &[]).and_then(|w| ask(&w)) {
+        Ok(_) => 0,
+        Err(errno) => errno,
+    }
+}
+
+pub fn probe_exec_then_exit<'s>(
+    path: &[u8],
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    code: u64,
+) -> i32 {
+    let block = crate::threads::own_block();
+    let mask = block.mask.swap(!0, Ordering::SeqCst);
+    let result = crate::signals::stop_others()
+        .and_then(|()| exec_stopped(path, argv, [].into_iter(), 0o022, mask, 0, Some(code)));
+    crate::signals::resume_others();
+    block.mask.store(mask, Ordering::SeqCst);
+    match result {
+        Ok(never) => match never {},
+        Err(errno) => errno,
+    }
+}
+
+/// Start with the block and Go: Ok once the loader said "the image is
+/// ready", else the errno of its answer.
+fn image_ready(
+    c: &Handle<Channel>,
+    len: usize,
+    object: Handle<rt::handle::Memory>,
+) -> Result<(), i32> {
+    use crate::constants::{EIO, ENOMEM};
+    use proto_loader::Method;
+    let rights = rt::abi::Rights::MAP_READ | rt::abi::Rights::TRANSFER;
+    let copy = rt::sys::handle_duplicate(&object, rights).map_err(|_| ENOMEM)?;
+    let mut w = Writer::new();
+    Method::Start.header().write(&mut w).map_err(|_| EIO)?;
+    w.u32(len as u32).map_err(|_| EIO)?;
+    if ask_loader(c, &w, Some([copy.erase()].into())) != 0 {
+        return Err(EIO);
+    }
+    drop(object);
+    let mut w = Writer::new();
+    Method::Go.header().write(&mut w).map_err(|_| EIO)?;
+    match ask_loader(c, &w, None) {
+        0 => Ok(()),
+        code => Err(load_errno(code)),
+    }
+}
+
+/// Step 4 of exec: the descriptors with FD_CLOEXEC close (their
+/// descriptions with the last of them), then the process's own sessions
+/// with the RAM files, the clock and the console's input move to the
+/// loader (Handles): the new image keeps the descriptions, offsets and
+/// labels. Nothing of this image uses them afterwards.
+fn move_files(c: &Handle<Channel>) {
+    use proto_loader::{Method, Slot};
+    for fd in 0..posix_fs::OPEN_MAX as u32 {
+        let close_on_exec = crate::shared::with_files(|files| {
+            Ok(files
+                .descriptor_flags(fd)
+                .is_ok_and(|flags| flags.close_on_exec))
+        });
+        if close_on_exec == Ok(true) {
+            let _ = crate::close(fd as i32);
+        }
+    }
+    let sessions = crate::shared::with_files(|files| {
+        let (files, uart) = files.sessions();
+        Ok((files.raw(), uart.map(Handle::raw)))
+    });
+    let clock = crate::clock::session().map(Handle::raw);
+    let Ok((files, uart)) = sessions else {
+        return;
+    };
+    let mut w = Writer::new();
+    if Method::Handles.header().write(&mut w).is_err() {
+        return;
+    }
+    let mut handles = rt::handle::Outgoing::new();
+    for (slot, session) in [
+        (Slot::Files, Some(files)),
+        (Slot::Clock, clock),
+        (Slot::Uart, uart),
+    ] {
+        if let Some(raw) = session
+            && w.u32(slot as u32).is_ok()
+        {
+            // The handle moves: this image's owner never uses it again.
+            let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
+        }
+    }
+    let _ = ask_loader(c, &w, Some(handles));
 }
 
 /// The parent's side of the loader's protocol for the child `pid`: Start

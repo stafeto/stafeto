@@ -126,7 +126,19 @@ impl Descriptor {
     }
 }
 /// The bytes of the header of a block.
-pub const HEADER: usize = 48;
+pub const HEADER: usize = 72;
+
+/// What an exec carries to the new image besides `argv` and `envp` ([P24-
+/// EXEC], spec 2, 3.2 step 2): the signals pending for the calling thread,
+/// the word of the timers that expired with no delivery yet, and the
+/// absolute deadline of `alarm` by the counter (0 for none). Timers and
+/// `alarm` come with step 5h: until then both are 0. A spawn carries none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Carried {
+    pub pending: u64,
+    pub timers: u64,
+    pub alarm: u64,
+}
 
 /// The methods through C.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +270,7 @@ pub struct Block<'a> {
     pub cwd: &'a [u8],
     pub argc: usize,
     pub envc: usize,
+    pub carried: Carried,
     descriptors: &'a [u8],
     strings: &'a [u8],
 }
@@ -339,6 +352,7 @@ impl<'a> Block<'a> {
         let len = Self::len(path.len(), cwd.len(), strings);
         let out = out.get_mut(..len).ok_or(BlockError::Malformed)?;
         out[..8].copy_from_slice(&MAGIC);
+        out[48..HEADER].fill(0);
         let words = [
             BLOCK_VERSION,
             len as u32,
@@ -425,15 +439,35 @@ impl<'a> Block<'a> {
         if !well_formed {
             return Err(BlockError::Malformed);
         }
+        let long = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
         Ok(Block {
             umask: umask as u32,
             path,
             cwd,
             argc,
             envc,
+            carried: Carried {
+                pending: long(48),
+                timers: long(56),
+                alarm: long(64),
+            },
             descriptors,
             strings,
         })
+    }
+
+    /// Writes `carried` into the block `out` that `write` or `write_with`
+    /// made.
+    pub fn carry(out: &mut [u8], carried: Carried) -> Result<(), BlockError> {
+        let header = out.get_mut(..HEADER).ok_or(BlockError::Malformed)?;
+        for (at, value) in [
+            (48, carried.pending),
+            (56, carried.timers),
+            (64, carried.alarm),
+        ] {
+            header[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
     }
 
     /// The strings of `argv` and then of `envp`, each with its NUL.
@@ -512,6 +546,11 @@ pub struct Start {
     pub descriptors: u64,
     pub descriptor_count: u32,
     _reserved: u32,
+    /// What an exec carried (`Carried`), all 0 for a spawn.
+    pub pending: u64,
+    pub timers: u64,
+    pub alarm: u64,
+    _pad: u64,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
@@ -521,7 +560,7 @@ pub const SECURE: u32 = 1;
 pub const AUXV_PAIRS: usize = 8;
 /// The bytes of the header.
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
-const _: () = assert!(START_SIZE == 128);
+const _: () = assert!(START_SIZE == 160);
 
 /// The bytes of the start area of `block`: the header, the initial stack
 /// and the strings, rounded up to 16.
@@ -600,6 +639,10 @@ pub fn write_area(
         descriptors: at + descriptors_at as u64,
         descriptor_count: (block.descriptors.len() / DESCRIPTOR) as u32,
         _reserved: 0,
+        pending: block.carried.pending,
+        timers: block.carried.timers,
+        alarm: block.carried.alarm,
+        _pad: 0,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -940,5 +983,32 @@ mod tests {
             .filter_map(|chunk| Descriptor::read(chunk))
             .collect();
         assert_eq!(back, list);
+    }
+
+    /// What an exec carries reaches the start area; a spawn's block
+    /// carries zeros.
+    #[test]
+    fn an_exec_carries_its_pending_signals_timers_and_alarm() {
+        let mut out = vec![0xFF; BLOCK_MAX];
+        let len = block(&mut out, &[b"ls"], &[]);
+        assert_eq!(
+            Block::read(&out[..len]).unwrap().carried,
+            Carried::default()
+        );
+        let carried = Carried {
+            pending: 1 << 9,
+            timers: 3,
+            alarm: 12_345,
+        };
+        Block::carry(&mut out[..len], carried).unwrap();
+        let read = Block::read(&out[..len]).unwrap();
+        assert_eq!(read.carried, carried);
+        let mut area = vec![0; area_len(&read)];
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS]).unwrap();
+        let start = Start::read(&area).unwrap();
+        assert_eq!(
+            (start.pending, start.timers, start.alarm),
+            (1 << 9, 3, 12_345)
+        );
     }
 }

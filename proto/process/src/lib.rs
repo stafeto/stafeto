@@ -97,6 +97,21 @@
 //! LOADING child is killed and the SetId of its place wiped; reply its
 //! status. NO_PROCESS for a PID of no LOADING child of the caller.
 //!
+//! ExecStart, through a session (spec 2, 3.2; 5c): body `SpawnStart` with
+//! no flags and no group. The service makes a new process for the record,
+//! image number one past its own (AGAIN past IMAGE_MAX), with the loader
+//! and the record's page, as SpawnStart; the reply waits for Boot: status
+//! u32, the record's PID u32 and the copy of C. One exec of a record at a
+//! time. ExecCommit, no body, once the loader said "the image is ready":
+//! the record moves to the new process in one step (its image number +1,
+//! the set-ID of the loader's place, the generation of its credentials
+//! raised, its caught signals the default on the page) and the loader
+//! hears that the record is ready; the old process ends itself. ExecAbort,
+//! no body: the new process is killed and the place goes. The end of the
+//! old process before ExecCommit kills the new one; SIGKILL in the window
+//! kills both; the end of the old one after ExecCommit carries the old
+//! image number and ends nothing.
+//!
 //! Through the session of a loader (label `Label::loader` on the
 //! service's channel, entry 0 of its process): Boot, no body and two
 //! handles, the copies of C for the parent (SEND) and for the service
@@ -162,8 +177,11 @@ pub const GENERATION_MAX: u32 = (1 << 23) - 1;
 /// The parent PID of a record that init created, and of an orphan: the
 /// service itself, the system process that adopts them.
 pub const INIT_PID: u32 = 1;
-/// The image number of a label until exec comes (5c).
+/// The image number of a record's first process; each exec gives the next
+/// (5c), up to IMAGE_MAX, past which exec is AGAIN: a number never names
+/// two images of one record.
 pub const IMAGE: u32 = 1;
+pub const IMAGE_MAX: u32 = (1 << 21) - 1;
 
 /// Which place of the service a label names: the record's session, its
 /// identity session (bit 62), the place of the notification of its end
@@ -194,17 +212,34 @@ impl Label {
     const IMAGE_SHIFT: u32 = 40;
     const IMAGE_MASK: u64 = (1 << 21) - 1;
 
-    /// The label of the record's session.
+    /// The label of the record's session of its first image.
     pub const fn raw(self) -> u64 {
+        self.raw_at(IMAGE)
+    }
+
+    /// The label of the record's session of image `image` (5c: `exec`
+    /// gives a record one image after another, IMAGE first).
+    pub const fn raw_at(self, image: u32) -> u64 {
         Self::SERVICE
-            | (IMAGE as u64) << Self::IMAGE_SHIFT
+            | (image as u64 & Self::IMAGE_MASK) << Self::IMAGE_SHIFT
             | (self.generation as u64) << 16
             | self.index as u64
     }
 
-    /// The label of the record's exit place.
+    /// The label of the record's exit place of its first image.
     pub const fn exit(self) -> u64 {
-        self.raw() | Self::EXIT
+        self.exit_at(IMAGE)
+    }
+
+    /// The label of the exit place of the process of image `image`.
+    pub const fn exit_at(self, image: u32) -> u64 {
+        self.raw_at(image) | Self::EXIT
+    }
+
+    /// The label of the session and of the identity of the loader of
+    /// image `image` of the record.
+    pub const fn loader_at(self, image: u32) -> u64 {
+        self.raw_at(image) | Self::IDENTITY | Self::EXIT
     }
 
     /// The label of the record's identity session.
@@ -219,9 +254,17 @@ impl Label {
     }
 
     /// The record and the place `raw` names, when it is a label the
-    /// service gives: bit 63, the image IMAGE, an index below RECORDS and
-    /// a generation of 1 to GENERATION_MAX.
+    /// service gives: bit 63, an image of 1 to IMAGE_MAX, an index below
+    /// RECORDS and a generation of 1 to GENERATION_MAX.
     pub const fn parse(raw: u64) -> Option<(Self, Place)> {
+        match Self::parse_image(raw) {
+            Some((label, place, _)) => Some((label, place)),
+            None => None,
+        }
+    }
+
+    /// `parse` with the image the label names.
+    pub const fn parse_image(raw: u64) -> Option<(Self, Place, u32)> {
         let index = (raw & 0xFFFF) as u16;
         let generation = ((raw >> 16) & 0xFF_FFFF) as u32;
         let image = (raw >> Self::IMAGE_SHIFT) & Self::IMAGE_MASK;
@@ -232,14 +275,14 @@ impl Label {
             (true, true) => Place::Loader,
         };
         if raw & Self::SERVICE == 0
-            || image != IMAGE as u64
+            || image == 0
             || index as usize >= RECORDS
             || generation == 0
             || generation > GENERATION_MAX
         {
             return None;
         }
-        Some((Self { index, generation }, place))
+        Some((Self { index, generation }, place, image as u32))
     }
 
     /// The record whose session has the label `raw`.
@@ -334,6 +377,9 @@ pub enum Method {
     SpawnCommit = 25,
     SpawnAbort = 26,
     SetId = 27,
+    ExecStart = 28,
+    ExecCommit = 29,
+    ExecAbort = 30,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -344,7 +390,8 @@ impl Method {
     }
 }
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27,
+    1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -1013,6 +1060,9 @@ mod tests {
             Method::SpawnCommit,
             Method::SpawnAbort,
             Method::SetId,
+            Method::ExecStart,
+            Method::ExecCommit,
+            Method::ExecAbort,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
@@ -1052,7 +1102,6 @@ mod tests {
             3 << 16 | 5,
             label.loader() & !(1 << 63),
             label.raw() & !(1 << 40),
-            label.raw() | 1 << 41,
             1 << 63 | 1 << 40 | 3 << 16 | 256,
             1 << 63 | 1 << 40 | 5,
             1 << 63 | 1 << 40 | u64::from(GENERATION_MAX + 1) << 16,

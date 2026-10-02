@@ -67,6 +67,18 @@
  * the child's descriptors and current directory, the relative path of the
  * program taken from the new one.
  *
+ * Stage 9, exec (5c): a child execs /bin/ls of /etc and its parent's
+ * waitpid of the same PID sees exit 0; across exec the PID and the PPID
+ * stay, argv and envp are the new ones, FD_CLOEXEC closes, an open file
+ * keeps its offset, a caught SIGUSR1 is SIG_DFL, an ignored SIGUSR2 stays
+ * ignored, the mask stays and a pending SIGHUP of the calling thread is
+ * still pending; an exec of a file that is no program returns ENOEXEC
+ * with the process, its other thread and its files as they were; an old
+ * image that ends before ExecCommit leaves its own status and the new one
+ * never runs; ExecCommit with no exec is refused. As nobody: an exec of a
+ * set-user-ID file of root gives euid 0, the clock's rights at once, and
+ * after a set-ID file that failed to load, the next exec keeps euid 65534.
+ *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
 #include <errno.h>
@@ -93,6 +105,8 @@ static int failures;
 /* The layer's probes of 5c (posix-crt, posix-platform). */
 void stafeto_start_handles(unsigned long *out);
 int stafeto_probe_open_exec(const char *path);
+int stafeto_probe_exec_commit(void);
+int stafeto_probe_exec_then_exit(const char *path, char *const argv[], int code);
 void stafeto_probe_decoy(int on);
 
 static void expect(const char *what, int got, int want) {
@@ -469,6 +483,94 @@ static void wave(void) {
 static int argc_seen;
 static char **argv_seen;
 
+static volatile int caught_usr1;
+static void on_usr1_exec(int signal) {
+    (void)signal;
+    caught_usr1 = 1;
+}
+
+/* Before exec: a file at offset 3, one with FD_CLOEXEC, SIGUSR1 caught,
+ * SIGUSR2 ignored, SIGHUP blocked and pending for this thread. */
+static int exec_self(void) {
+    int keep = open("/etc/motd", O_RDONLY);
+    char three[3];
+    if (keep < 0 || read(keep, three, 3) != 3) return 1;
+    int gone = open("/etc/motd", O_RDONLY | O_CLOEXEC);
+    if (gone < 0) return 2;
+    signal(SIGUSR1, on_usr1_exec);
+    signal(SIGUSR2, SIG_IGN);
+    sigset_t hup;
+    sigemptyset(&hup);
+    sigaddset(&hup, SIGHUP);
+    sigprocmask(SIG_BLOCK, &hup, NULL);
+    raise(SIGHUP);
+    char k[8], g[8], p[16], pp[16];
+    snprintf(k, sizeof k, "%d", keep);
+    snprintf(g, sizeof g, "%d", gone);
+    snprintf(p, sizeof p, "%d", (int)getpid());
+    snprintf(pp, sizeof pp, "%d", (int)getppid());
+    char *next[] = {"procs-child", "after", k, g, p, pp, NULL};
+    char *env[] = {"X=2", NULL};
+    execve("/bin/procs-child", next, env);
+    return 100 + errno;
+}
+
+/* After exec: what POSIX says stays and what goes. */
+static int after_exec(void) {
+    int keep = atoi(argv_seen[2]), gone = atoi(argv_seen[3]);
+    struct stat st;
+    if (getpid() != atoi(argv_seen[4]) || getppid() != atoi(argv_seen[5])) {
+        printf("posix-procs: after exec pid %d ppid %d, before %s %s\n", (int)getpid(),
+               (int)getppid(), argv_seen[4], argv_seen[5]);
+        return 1;
+    }
+    if (fstat(gone, &st) == 0 || errno != EBADF) return 2;
+    if (lseek(keep, 0, SEEK_CUR) != 3) return 3;
+    struct sigaction a;
+    sigaction(SIGUSR1, NULL, &a);
+    if (a.sa_handler != SIG_DFL) return 4;
+    sigaction(SIGUSR2, NULL, &a);
+    if (a.sa_handler != SIG_IGN) return 5;
+    sigset_t mask, pending;
+    sigprocmask(SIG_BLOCK, NULL, &mask);
+    sigpending(&pending);
+    if (!sigismember(&mask, SIGHUP)) return 6;
+    if (!sigismember(&pending, SIGHUP)) return 7;
+    const char *x = getenv("X");
+    if (!x || strcmp(x, "2") != 0) return 8;
+    printf("posix-procs: after exec pid %d\n", (int)getpid());
+    /* The record's end is the new image's: 42, never the old one's 0. */
+    return 42;
+}
+
+static volatile int spins;
+static void *spinner(void *arg) {
+    (void)arg;
+    for (;;) {
+        spins++;
+        pause_ms(1);
+    }
+    return NULL;
+}
+
+/* An exec that fails comes back with the other thread running and the
+ * files as they were. */
+static int exec_fail(void) {
+    int fd = open("/etc/motd", O_RDONLY);
+    pthread_t other;
+    if (fd < 0 || pthread_create(&other, NULL, spinner, NULL) != 0) return 1;
+    pause_ms(20);
+    char *next[] = {"procs-child", "child", NULL};
+    char *env[] = {NULL};
+    if (execve("/bin/script", next, env) != -1 || errno != ENOEXEC) return 2;
+    int before = spins;
+    pause_ms(50);
+    if (spins == before) return 3;
+    char bytes[7];
+    if (read(fd, bytes, 7) != 7 || memcmp(bytes, "stafeto", 7) != 0) return 4;
+    return 0;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
@@ -509,9 +611,13 @@ static int role(const char *name) {
     }
     if (strcmp(name, "setid") == 0) {
         /* A set-user-ID file of root: the real IDs stay, the secure mode
-         * is on, and a new file takes a number above 2. */
+         * is on, a new file takes a number above 2, and the clock service
+         * sees euid 0 with no asking (the page of generations). */
         int fd = open("/etc/motd", O_RDONLY);
-        int ok = getuid() == 65534 && geteuid() == 0 && getauxval(23) == 1 && fd > 2;
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        int ok = getuid() == 65534 && geteuid() == 0 && getauxval(23) == 1 && fd > 2 &&
+                 clock_settime(CLOCK_REALTIME, &now) == 0;
         printf("posix-procs: setid uid %d euid %d secure %lu fd %d\n", (int)getuid(),
                (int)geteuid(), getauxval(23), fd);
         return ok ? 0 : 1;
@@ -544,6 +650,38 @@ static int role(const char *name) {
         if (!getcwd(cwd, sizeof cwd)) return 1;
         printf("posix-procs: the child's directory is %s\n", cwd);
         return strcmp(cwd, "/bin") == 0 ? 0 : 2;
+    }
+    if (strcmp(name, "execls") == 0) {
+        char *ls[] = {"ls", "/etc", NULL};
+        char *env[] = {"PATH=/bin", NULL};
+        execve("/bin/ls", ls, env);
+        return 100 + errno;
+    }
+    if (strcmp(name, "execself") == 0) return exec_self();
+    if (strcmp(name, "after") == 0) return after_exec();
+    if (strcmp(name, "execfail") == 0) return exec_fail();
+    if (strcmp(name, "execto") == 0) {
+        /* exec of the program argv_seen[2] in role argv_seen[3]. */
+        char *next[] = {"procs-child", argv_seen[3], NULL};
+        char *env[] = {NULL};
+        execve(argv_seen[2], next, env);
+        return 100 + errno;
+    }
+    if (strcmp(name, "execjunk") == 0) {
+        char *next[] = {"procs-child", "nobody", NULL};
+        char *env[] = {NULL};
+        if (execve("/bin/setid-junk", next, env) != -1 || errno != ENOEXEC) return 1;
+        execve("/bin/procs-child", next, env);
+        return 100 + errno;
+    }
+    if (strcmp(name, "ghostexec") == 0) {
+        char *next[] = {"procs-child", "ghost", NULL};
+        stafeto_probe_exec_then_exit("/bin/procs-child", next, 7);
+        return 1;
+    }
+    if (strcmp(name, "ghost") == 0) {
+        printf("posix-procs: the image of a dead exec ran\n");
+        return 9;
     }
     if (strcmp(name, "sleep") == 0 || strcmp(name, "sleep2") == 0) {
         for (;;) sleep(60);
@@ -830,6 +968,33 @@ static void descriptors(void) {
     posix_spawn_file_actions_destroy(&actions);
 }
 
+/* Stage 9: exec. */
+static void execs(void) {
+    run_role("/bin/procs-child", "execls", NULL);
+    char *self[] = {"procs-child", "execself", NULL};
+    char *none[] = {NULL};
+    pid_t pid = -1;
+    expect("spawn of execself", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, self, none), 0);
+    reap("a child that execs itself", pid, 42, 0);
+    run_role("/bin/procs-child", "execfail", NULL);
+    char *ghost[] = {"procs-child", "ghostexec", NULL};
+    char *envp[] = {NULL};
+    pid = -1;
+    expect("spawn of ghostexec", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, ghost, envp), 0);
+    reap("an old image that ends before ExecCommit", pid, 7, 0);
+    expect("ExecCommit with no exec", stafeto_probe_exec_commit(), EIO);
+}
+
+/* Stage 9 as nobody: set-ID through exec. */
+static void execs_nobody(void) {
+    char *argv[] = {"procs-child", "execto", "/bin/procs-setid", "setid", NULL};
+    char *envp[] = {NULL};
+    pid_t pid = -1;
+    expect("spawn of execto", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, envp), 0);
+    reap("an exec of a set-user-ID file", pid, 0, 0);
+    run_role("/bin/procs-child", "execjunk", NULL);
+}
+
 /* Stage 7 once the probe is nobody: set-ID files. */
 static void files_nobody(void) {
     run_role("/bin/procs-setid", "setid", NULL);
@@ -887,8 +1052,10 @@ int main(int argc, char **argv) {
     churn();
     files();
     descriptors();
+    execs();
     clock_rights();
     files_nobody();
+    execs_nobody();
     wave();
     if (failures == 0) printf("posix-procs: ok\n");
     return failures == 0 ? 0 : 1;

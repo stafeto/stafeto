@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 9;
+pub const PLATFORM_INTERFACE: u64 = 10;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -496,6 +496,50 @@ pub unsafe extern "C" fn stafeto_spawn(
         Ok(pid) => pid,
         Err(errno) => -errno,
     }
+}
+
+/// execve of the program in the file at `path` with `argv` and `envp`
+/// (posix_abi::process::exec): it returns only with the negated errno.
+///
+/// # Safety
+/// `path` is a C string; `argv` and `envp` are null or NULL-ended arrays
+/// of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_exec(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { bytes_of(path) };
+    // SAFETY: as above.
+    let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
+    let umask = files::umask();
+    match call(|| posix_abi::process::exec(path, argv.clone(), envp.clone(), umask)) {
+        Ok(never) => match never {},
+        Err(errno) => -errno,
+    }
+}
+
+/// The probes of the window of exec (posix_abi::process): ExecCommit
+/// with no exec gives its errno; an exec whose old image ends with `code`
+/// before ExecCommit returns only on an error.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_exec_commit() -> c_int {
+    posix_abi::process::probe_exec_commit()
+}
+
+/// # Safety
+/// `path` is a C string; `argv` a NULL-ended array of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_exec_then_exit(
+    path: *const c_char,
+    argv: *const *const c_char,
+    code: c_int,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let (path, argv) = unsafe { (bytes_of(path), strings(argv)) };
+    posix_abi::process::probe_exec_then_exit(path, argv, code as u64)
 }
 
 /// OPEN_EXEC through the process's own session with the RAM file

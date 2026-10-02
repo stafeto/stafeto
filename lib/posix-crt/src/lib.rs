@@ -246,6 +246,7 @@ fn loaded_main() -> u64 {
     };
     // SAFETY: the main thread, once, before any other.
     let started = unsafe {
+        posix_abi::signals::carry_pending(area.pending);
         posix_abi::process::init(Handle::from_raw(posix))
             .map_err(|_| "process registration failed")
             .and_then(|()| {

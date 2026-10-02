@@ -99,6 +99,8 @@ struct Held {
     thread: Option<Handle<Thread>>,
     ready: Option<Handle<Channel>>,
     start: Option<Pending>,
+    /// The new process of an exec, which ExecCommit gives the record.
+    incoming: Option<Handle<Process>>,
 }
 /// What one delivery of a signal to one process came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -865,7 +867,8 @@ impl Processes {
             Some((_, Place::Loader)) => {
                 let index = self.records.find_loader(label)?;
                 let ticket = self.loaders.vouches(index)?;
-                let image = proto_process::IMAGE;
+                let place = self.loaders.get(self.loaders.of(index)?)?;
+                let image = place.image;
                 Some((index, Some(LoaderOf { image, ticket })))
             }
             _ => Some((self.records.find_identity(label)?, None)),
@@ -1372,6 +1375,7 @@ impl Processes {
             thread: None,
             ready: None,
             start: Some(pending),
+            incoming: None,
         };
         let Some(slot) = self.loaders.take(child, index, proto_process::IMAGE, held) else {
             let _ = sys::process_kill(&record.process);
@@ -1385,14 +1389,175 @@ impl Processes {
         Answer::Deferred
     }
 
+    /// ExecStart of the record in `index` (5c, spec 2, 3.2 step 2): a new
+    /// process for the record, image one past its own, with the record's
+    /// quota, room for handles and ceiling, its page as it is, the loader
+    /// mapped and started at the caller's level; the reply waits for Boot.
+    /// AGAIN while an exec or two loads of the record are on, or past
+    /// IMAGE_MAX; INVALID for flags or a group.
+    fn exec_start(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let Ok(start) = SpawnStart::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if start.flags != 0 || start.pgroup != 0 {
+            return refuse(proto_process::INVALID);
+        }
+        if self.loader.is_none() || self.files.is_none() {
+            return refuse(proto_process::NOT_FOUND);
+        }
+        let record = self.records.get(index).expect("the caller");
+        if self.loaders.of(index).is_some()
+            || !self.loaders.room_for(index)
+            || record.image >= proto_process::IMAGE_MAX
+        {
+            return refuse(proto_process::AGAIN);
+        }
+        let free = sys::process_memory(&make::own()).map_or(0, |m| m.quota.saturating_sub(m.used));
+        if !loaders::pool_allows(free, record.quota) {
+            return kernel(abi::Error::NoMemory);
+        }
+        drain(&self.identities);
+        let (label, image, ceiling) = (record.label, record.image + 1, record.ceiling);
+        let priority = start.level.clamp(1, ceiling);
+        let rights = Rights::SEND | Rights::TRANSFER;
+        let made = sys::handle_label(&self.channel, rights, label.loader_at(image), self.level)
+            .and_then(|session| {
+                let exit = sys::handle_label(
+                    &self.channel,
+                    Rights::NOTIFY,
+                    label.exit_at(image),
+                    ceiling,
+                )?;
+                sys::process_create_with(
+                    record.quota,
+                    record.handle_limit,
+                    ceiling,
+                    Some((&exit, ceiling)),
+                    Some(session),
+                )
+                .map_err(|(e, _)| e)
+            });
+        let process = match made {
+            Ok(process) => process,
+            Err(e) => return kernel(e),
+        };
+        let placed = self.pages.map_again(index, &process).and_then(|()| {
+            let image = self.loader.as_ref().expect("a loader");
+            image.place(&make::own(), &process, priority)
+        });
+        let thread = match placed {
+            Ok(thread) => thread,
+            Err(e) => {
+                let _ = sys::process_kill(&process);
+                return kernel(e);
+            }
+        };
+        // The new image's main thread starts with the caller's mask.
+        if let Some(page) = self.pages.page(index) {
+            page.start_mask
+                .store(start.mask, core::sync::atomic::Ordering::Release);
+        }
+        let Some(pending) = r.defer() else {
+            let _ = sys::process_kill(&process);
+            return Answer::Status(Status::BadSize);
+        };
+        let started = sys::thread_start(&thread);
+        let held = Held {
+            thread: Some(thread),
+            ready: None,
+            start: Some(pending),
+            incoming: Some(process),
+        };
+        if self.loaders.take(index, index, image, held).is_none() {
+            return Answer::Deferred;
+        }
+        if let Err(e) = started {
+            self.abort_load(index, Status::Kernel(e));
+        }
+        Answer::Deferred
+    }
+
+    /// ExecCommit of the record in `index` (step 5): the record moves to
+    /// the new process in one step of the loop, O(1): its image number
+    /// grows, the set-ID its loader's place kept applies (the saved IDs
+    /// follow the effective ones), the generation of its credentials grows
+    /// before the reply, its caught signals are the default on the page
+    /// (sp4.M3), the new main thread routes its signals, and the loader
+    /// hears that the record is ready. The old process ends itself after
+    /// the reply. BAD_STATE without an exec whose image is ready.
+    fn exec_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let exec = self
+            .loaders
+            .of(index)
+            .and_then(|slot| self.loaders.get(slot))
+            .is_some_and(|p| p.parent == index && p.held.incoming.is_some());
+        if !exec {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        }
+        let Ok(set_id) = self.loaders.commit(index) else {
+            return Answer::Status(Status::Kernel(abi::Error::BadState));
+        };
+        let slot = self.loaders.of(index).expect("an exec's place");
+        let place = self.loaders.get_mut(slot).expect("a place");
+        let image = place.image;
+        let incoming = place.held.incoming.take().expect("the new process");
+        self.routers[index] = place.held.thread.take();
+        if let Some(ready) = place.held.ready.as_ref() {
+            let _ = sys::notify(ready, 1);
+        }
+        let record = self.records.get_mut(index).expect("the caller");
+        // The old process's handle goes; the process ends itself.
+        drop(core::mem::replace(&mut record.process, incoming));
+        record.image = image;
+        let mut credentials = loaders::child_credentials(record.credentials, 0);
+        if let Some(ids) = set_id {
+            credentials = loaders::set_ids(credentials, ids);
+        }
+        record.credentials = credentials;
+        self.generations.raise(index);
+        if let Some(page) = self.pages.page(index) {
+            page.caught.store(0, core::sync::atomic::Ordering::Release);
+        }
+        Answer::Status(Status::Ok)
+    }
+
+    /// ExecAbort of the record in `index`: the new process of its exec is
+    /// killed, the place and its SetId go, and the old image goes on.
+    fn exec_abort(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let exec = self
+            .loaders
+            .of(index)
+            .and_then(|slot| self.loaders.get(slot))
+            .is_some_and(|p| p.parent == index && p.held.incoming.is_some());
+        if exec {
+            self.abort_load(index, Status::from_code(proto_process::AGAIN));
+        }
+        Answer::Status(Status::Ok)
+    }
+
     /// The load of the record in `child` stops: its process is killed, its
     /// loader's place and SetId go, and a SpawnStart that waits gets
     /// `status`. The record goes with the end of its process.
     fn abort_load(&mut self, child: usize, status: Status) {
-        if let Some(place) = self.loaders.free(child)
-            && let Some(start) = place.held.start
-        {
-            let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
+        if let Some(place) = self.loaders.free(child) {
+            if let Some(start) = place.held.start {
+                let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
+            }
+            // An exec's new process goes; the record keeps its old one.
+            if let Some(incoming) = place.held.incoming {
+                let ceiling = self.records.get(child).map_or(0, |r| r.ceiling);
+                let _ = sys::process_kill_at(&incoming, ceiling);
+                return;
+            }
         }
         if let Some(record) = self.records.get(child)
             && record.state == State::Loading
@@ -1439,9 +1604,12 @@ impl Processes {
         let record = self.records.get(child).expect("a loading record");
         let (label, pid) = (record.label, record.label.pid());
         let place = self.loaders.get(slot).expect("a place");
+        let image = place.image;
+        // The process the loader loads: an exec's new one, or the child's.
+        let target = place.held.incoming.as_ref().unwrap_or(&record.process);
         let owner = Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER;
         let made = (|| {
-            let process = sys::handle_duplicate(&record.process, owner)?;
+            let process = sys::handle_duplicate(target, owner)?;
             let thread = place.held.thread.as_ref().ok_or(abi::Error::BadState)?;
             let thread = sys::handle_duplicate(thread, owner)?;
             let files = self.files.as_ref().ok_or(abi::Error::BadState)?;
@@ -1449,7 +1617,7 @@ impl Processes {
             let identity = sys::handle_label(
                 &self.identities,
                 Rights::NOTIFY | Rights::DUPLICATE | Rights::TRANSFER,
-                label.loader(),
+                label.loader_at(image),
                 self.level,
             )?;
             Ok::<_, abi::Error>([
@@ -1504,11 +1672,12 @@ impl Processes {
         }
         let record = self.records.get(child).expect("a ready record");
         let (label, credentials) = (record.label, record.credentials);
+        let work = record.label.raw_at(record.image);
         let made = (|| {
             let session = sys::handle_label(
                 &self.channel,
                 Rights::SEND | Rights::TRANSFER,
-                label.raw(),
+                work,
                 self.level,
             )?;
             let identity = sys::handle_label(
@@ -1706,6 +1875,9 @@ impl Service<0> for Processes {
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
             n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r),
             n if n == Method::SpawnAbort as u16 => self.spawn_abort(index, r),
+            n if n == Method::ExecStart as u16 => self.exec_start(index, r),
+            n if n == Method::ExecCommit as u16 => self.exec_commit(index, r),
+            n if n == Method::ExecAbort as u16 => self.exec_abort(index, r),
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
             n if n == Method::Kill as u16 => self.kill(index, r),
@@ -1736,10 +1908,24 @@ impl Service<0> for Processes {
         if n.source != Source::Exit {
             return;
         }
-        let Some(index) = self.records.find_exit(n.label) else {
+        let Some((index, image)) = self.records.find_exit_any(n.label) else {
             return;
         };
         let record = self.records.get(index).expect("an ended record");
+        if image != record.image {
+            // The new process of an exec ended before ExecCommit: the place
+            // goes, and the old image goes on. The end of an old image
+            // after ExecCommit names nothing.
+            let incoming = self
+                .loaders
+                .of(index)
+                .and_then(|slot| self.loaders.get(slot))
+                .is_some_and(|p| p.image == image && p.held.incoming.is_some());
+            if incoming {
+                self.abort_load(index, Status::from_code(proto_process::AGAIN));
+            }
+            return;
+        }
         let end = End::of(sys::process_state(&record.process).unwrap_or(abi::ProcessState::Killed))
             .unwrap_or(End::Signaled(SIGKILL));
         self.queue.remove(index);
