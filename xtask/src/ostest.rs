@@ -7,11 +7,13 @@
 //! misc/run.sh writes: its output, then `exit: N` when the output is empty
 //! or the status is 2 or more; it passes when one of its expectations
 //! (<suite>.expect/<test>.*) is that text. A test that needs fork, exec or
-//! pipes is UNSUPPORTED and does not run. The table goes to
-//! target/measure/os-test.txt.
+//! pipes is UNSUPPORTED and does not run. A test that faults, is killed
+//! or gives no end within its time FAILs, and the run goes on. The table
+//! goes to target/measure/os-test.txt; `ci` fails when a test of
+//! tests/os-test/pass.txt does not pass.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{BOOT_PROFILE, ImageProgram, Variant, build, qemu, target_dir, write_boot_image_with};
 
@@ -30,8 +32,10 @@ const PROGRAMS: [ImageProgram; 5] = [
     ("os-test", "os-test-probe", crate::POSIX_STACK_SIZE, &[]),
 ];
 
-/// The end of a test in the log, before its status.
-const ENDED: &str = "init: os-test ended: exit code ";
+/// The end of a test in the log, before how it ended.
+const ENDED: &str = "init: os-test ended: ";
+/// How a test ended with a status, after ENDED.
+const EXIT_CODE: &str = "exit code ";
 /// The time a test may take on TCG, its boot included.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -53,20 +57,25 @@ impl Verdict {
     }
 }
 
-/// The outcome text of the test whose boot printed `lines`: the lines it
-/// wrote (the services' and init's own lines left out) and `exit: N` as
-/// misc/run.sh adds it. An error when the log has no end of the test: a
-/// test without its result line counts for nothing.
-pub fn outcome(lines: &[String]) -> Result<String, String> {
-    let end = lines
-        .iter()
-        .position(|line| line.starts_with(ENDED))
-        .ok_or("the test printed no result line (init saw no end of it)")?;
-    let code: i64 = lines[end][ENDED.len()..]
-        .split(',')
-        .next()
-        .and_then(|code| code.trim().parse().ok())
-        .ok_or_else(|| format!("no status in {:?}", lines[end]))?;
+/// The end of a test as its boot's log tells it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// It exited: what misc/run.sh writes, which its expectations judge.
+    Exited(String),
+    /// It faulted, was killed or gave no end: a FAIL whatever it wrote.
+    Failed(String),
+}
+
+/// The end of the test whose boot printed `lines`. For an exit, the lines
+/// it wrote (the services' and init's own lines left out) and `exit: N`
+/// as misc/run.sh adds it; for a fault or a kill, its lines and `exit:
+/// signal` (run.sh's word for a death by a signal) with init's reason; a
+/// log without the end of the test is a FAIL `timeout`.
+pub fn outcome(lines: &[String]) -> Ended {
+    let Some(end) = lines.iter().position(|line| line.starts_with(ENDED)) else {
+        return Ended::Failed("timeout: no end of the test\n".to_owned());
+    };
+    let how = lines[end][ENDED.len()..].trim_end_matches('\r');
     let start = lines
         .iter()
         .position(|line| line == "init: services started")
@@ -85,10 +94,22 @@ pub fn outcome(lines: &[String]) -> Result<String, String> {
             text.push('\n');
         }
     }
+    let Some(status) = how.strip_prefix(EXIT_CODE) else {
+        let reason = how.split(',').next().unwrap_or(how);
+        text.push_str(&format!("exit: signal ({reason})\n"));
+        return Ended::Failed(text);
+    };
+    let Some(code) = status
+        .split(',')
+        .next()
+        .and_then(|code| code.trim().parse::<i64>().ok())
+    else {
+        return Ended::Failed(format!("no status in {how:?}\n"));
+    };
     if text.is_empty() || code >= 2 {
         text.push_str(&format!("exit: {code}\n"));
     }
-    Ok(text)
+    Ended::Exited(text)
 }
 
 /// Whether `outcome` is one of the expectations of `test` in `expect`
@@ -128,27 +149,73 @@ fn needs_processes(source: &str) -> bool {
 /// The time `ci` gives the suites (about 70 s on TCG for 56 boots).
 const BUDGET: Duration = Duration::from_secs(300);
 
-/// The suites within BUDGET, for `ci`.
+/// The tests that pass on stafeto: `ci` fails when one of them does not.
+const PASSING: &str = "tests/os-test/pass.txt";
+
+/// The name of os-test's licence (ISC) in an image with a test.
+pub const LICENCE: &str = "OS-TEST-LICENSE";
+
+/// os-test's LICENSE (tools/build-os-test.py fetches the source).
+pub fn licence() -> Result<Vec<u8>, String> {
+    let path = target_dir().join("os-test/source/LICENSE");
+    std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The suites within BUDGET (`cargo xtask os-test`, `ci`): the run stops once the budget is
+/// spent, and the tests of PASSING pass.
 pub fn run_in_budget() -> Result<(), String> {
-    let start = std::time::Instant::now();
-    run()?;
+    let start = Instant::now();
+    let rows = suites(start + BUDGET)?;
     let took = start.elapsed();
-    if took > BUDGET {
-        return Err(format!(
-            "os-test took {} s, over its {} s",
-            took.as_secs(),
-            BUDGET.as_secs()
-        ));
-    }
     println!(
         "os-test: {} s of its {} s",
         took.as_secs(),
         BUDGET.as_secs()
     );
-    Ok(())
+    let path = crate::root().join(PASSING);
+    let list = std::fs::read_to_string(&path).map_err(|e| format!("{PASSING}: {e}"))?;
+    let (lost, new) = compare(&list, &rows);
+    for name in &new {
+        println!("os-test {name} passes and is not in {PASSING}");
+    }
+    if lost.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "os-test: {} of {PASSING} no longer pass: {}",
+            lost.len(),
+            lost.join(", ")
+        ))
+    }
 }
 
-pub fn run() -> Result<(), String> {
+/// The tests of `list` (one name a line, `#` for a comment) that do not
+/// pass in `rows`, and the passing tests that `list` lacks.
+fn compare(list: &str, rows: &[(String, Verdict, String)]) -> (Vec<String>, Vec<String>) {
+    let listed: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let passes = |name: &str| {
+        rows.iter()
+            .any(|(row, verdict, _)| row == name && *verdict == Verdict::Pass)
+    };
+    let lost = listed
+        .iter()
+        .filter(|name| !passes(name))
+        .map(|name| (*name).to_owned())
+        .collect();
+    let new = rows
+        .iter()
+        .filter(|(row, verdict, _)| *verdict == Verdict::Pass && !listed.contains(&row.as_str()))
+        .map(|(row, _, _)| row.clone())
+        .collect();
+    (lost, new)
+}
+
+/// The suites, a row a test; an error once `deadline` passes.
+fn suites(deadline: Instant) -> Result<Vec<(String, Verdict, String)>, String> {
     crate::relibc()?;
     crate::run_cmd(
         std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
@@ -158,6 +225,7 @@ pub fn run() -> Result<(), String> {
         .map_err(|e| format!("os-test list: {e}"))?;
     let kernel = build(Variant::Normal)?;
     let mut rows = Vec::new();
+    let mut licensed = false;
     for line in list.lines() {
         let (name, built) = line.split_once(' ').ok_or("a bad line of tests.txt")?;
         let (suite, test) = name.split_once('/').ok_or("a test without its suite")?;
@@ -167,29 +235,43 @@ pub fn run() -> Result<(), String> {
         let (verdict, text) = if needs_processes(&source) {
             (Verdict::Unsupported, "needs fork, exec or pipes".to_owned())
         } else {
-            let text = match built.strip_prefix('!') {
+            let ended = match built.strip_prefix('!') {
                 // A test that did not compile: os-test's outcome for it.
-                Some(failed) => format!("{failed}\n"),
+                Some(failed) => Ended::Exited(format!("{failed}\n")),
                 None => {
+                    let left = deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|left| !left.is_zero())
+                        .ok_or_else(|| {
+                            format!("os-test spent its {} s before {name}", BUDGET.as_secs())
+                        })?;
                     let image = write_boot_image_with(
                         "boot-os-test.img",
                         &PROGRAMS,
                         BOOT_PROFILE,
                         &[("STAFETO_OS_TEST_OBJECT", built)],
                     )?;
+                    if !licensed {
+                        carries_licence(&image)?;
+                        licensed = true;
+                    }
                     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
                     cmd.args(qemu::HEADLESS);
-                    let run = qemu::run_until(cmd, TIMEOUT, Some(ENDED))?;
-                    outcome(&run.lines).map_err(|e| format!("{name}: {e}"))?
+                    let run = qemu::run_until(cmd, left.min(TIMEOUT), Some(ENDED))?;
+                    outcome(&run.lines)
                 }
             };
-            let expect = work.join("source").join(format!("{suite}.expect"));
-            let verdict = if expected(&expect, test, &text)? {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            };
-            (verdict, text)
+            match ended {
+                Ended::Exited(text) => {
+                    let expect = work.join("source").join(format!("{suite}.expect"));
+                    if expected(&expect, test, &text)? {
+                        (Verdict::Pass, text)
+                    } else {
+                        (Verdict::Fail, text)
+                    }
+                }
+                Ended::Failed(text) => (Verdict::Fail, text),
+            }
         };
         println!("os-test {name}: {} ({})", verdict.name(), first_line(&text));
         rows.push((name.to_owned(), verdict, text));
@@ -197,7 +279,23 @@ pub fn run() -> Result<(), String> {
     let path = write(&rows)?;
     println!("os-test: {}", score(&rows));
     println!("os-test table: {}", path.display());
-    Ok(())
+    Ok(rows)
+}
+
+/// Fails unless the boot image at `path` carries os-test's licence.
+fn carries_licence(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let licence = licence()?;
+    if image
+        .files()
+        .any(|file| file.name == LICENCE && file.data == licence.as_slice())
+    {
+        Ok(())
+    } else {
+        Err(format!("{} carries no {LICENCE}", path.display()))
+    }
 }
 
 fn first_line(text: &str) -> &str {
@@ -256,27 +354,63 @@ mod tests {
             "open: EISDIR\r",
             "init: os-test ended: exit code 1, not restarted",
         ]);
-        assert_eq!(outcome(&log).unwrap(), "open: EISDIR\n");
+        assert_eq!(outcome(&log), Ended::Exited("open: EISDIR\n".to_owned()));
         let silent = lines(&[
             "init: services started",
             "init: os-test ended: exit code 0, not restarted",
         ]);
-        assert_eq!(outcome(&silent).unwrap(), "exit: 0\n");
+        assert_eq!(outcome(&silent), Ended::Exited("exit: 0\n".to_owned()));
         let aborted = lines(&[
             "init: services started",
             "NULL",
             "init: os-test ended: exit code 134, not restarted",
         ]);
-        assert_eq!(outcome(&aborted).unwrap(), "NULL\nexit: 134\n");
+        assert_eq!(
+            outcome(&aborted),
+            Ended::Exited("NULL\nexit: 134\n".to_owned())
+        );
     }
 
-    /// A log without the end of the test is refused, never scored.
+    /// A fault, a kill, a garbled status and a log without the end of the
+    /// test are FAILs, never scored by the expectations.
     #[test]
-    fn a_test_without_its_result_line_is_refused() {
+    fn a_test_without_an_exit_fails() {
+        let fault = lines(&[
+            "init: services started",
+            "partial",
+            "init: os-test ended: fault ESR=0x92000046 FAR=0x0 ELR=0x200000, not restarted",
+        ]);
+        assert_eq!(
+            outcome(&fault),
+            Ended::Failed(
+                "partial\nexit: signal (fault ESR=0x92000046 FAR=0x0 ELR=0x200000)\n".to_owned()
+            )
+        );
+        let killed = lines(&["init: os-test ended: killed, not restarted"]);
+        assert_eq!(
+            outcome(&killed),
+            Ended::Failed("exit: signal (killed)\n".to_owned())
+        );
         let log = lines(&["init: services started", "open: EISDIR"]);
-        assert!(outcome(&log).is_err());
+        assert!(matches!(outcome(&log), Ended::Failed(text) if text.starts_with("timeout")));
         let garbled = lines(&["init: os-test ended: exit code ?, not restarted"]);
-        assert!(outcome(&garbled).is_err());
+        assert!(matches!(outcome(&garbled), Ended::Failed(_)));
+    }
+
+    /// `ci` names each test of the list that no longer passes, and the
+    /// passing tests the list lacks.
+    #[test]
+    fn the_list_of_passing_tests_holds() {
+        let row = |name: &str, verdict| (name.to_owned(), verdict, String::new());
+        let rows = [
+            row("io/a", Verdict::Pass),
+            row("io/b", Verdict::Fail),
+            row("io/c", Verdict::Pass),
+        ];
+        let (lost, new) = compare("# comment\nio/a\nio/b\n\nio/d\n", &rows);
+        assert_eq!(lost, ["io/b", "io/d"]);
+        assert_eq!(new, ["io/c"]);
+        assert_eq!(compare("io/a\nio/c\n", &rows), (vec![], vec![]));
     }
 
     #[test]

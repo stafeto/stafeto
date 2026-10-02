@@ -838,7 +838,8 @@ commands:
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
   os-test   run os-test's io and malloc suites on relibc, one test a boot;
-            the table goes to target/measure/os-test.txt
+            the table goes to target/measure/os-test.txt; fails when a
+            test of tests/os-test/pass.txt does not pass
   help      this text";
 
 fn main() {
@@ -876,7 +877,7 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
-        Some("os-test") => ostest::run(),
+        Some("os-test") => ostest::run_in_budget(),
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
@@ -1191,6 +1192,18 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     if let Some((licence, source)) = &busybox_files {
         list.push((BUSYBOX_LICENSE, licence.as_slice()));
         list.push((BUSYBOX_SOURCE, source.as_bytes()));
+    }
+    // An image with a test of os-test (ISC) carries os-test's licence.
+    let os_test = sources
+        .iter()
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "os-test-probe"));
+    let os_test_licence = if os_test {
+        Some(ostest::licence()?)
+    } else {
+        None
+    };
+    if let Some(licence) = &os_test_licence {
+        list.push((ostest::LICENCE, licence.as_slice()));
     }
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
@@ -2006,7 +2019,8 @@ fn test() -> Result<(), String> {
     ash_probe()?;
     ash_dialog()?;
     ls_probe()?;
-    // The first row of os-test (io and malloc) within its time budget.
+    // os-test (io and malloc) within its time budget; its passing tests
+    // (tests/os-test/pass.txt) still pass.
     ostest::run_in_budget()?;
     rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;

@@ -22,7 +22,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
 use core::sync::atomic::AtomicU32;
-use posix_abi::constants::{EFAULT, EINVAL, ENOMEM};
+use posix_abi::constants::{EFAULT, EINVAL, EISDIR, ENOMEM};
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
@@ -107,6 +107,10 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
 /// relibc's open flags (its headers for AArch64 Linux, asm/fcntl.h).
 const AT_FDCWD: c_int = -100;
 const O_ACCMODE: c_int = 0o3;
+const O_RDONLY: c_int = 0;
+const O_CREAT: c_int = 0o100;
+const O_TRUNC: c_int = 0o1000;
+const O_APPEND: c_int = 0o2000;
 const O_NOCTTY: c_int = 0o400;
 const O_DIRECTORY: c_int = 0o40000;
 const O_NOFOLLOW: c_int = 0o100000;
@@ -118,6 +122,10 @@ const O_CLOEXEC: c_int = 0o2000000;
 /// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY, O_NOFOLLOW (no
 /// symbolic links yet) and O_LARGEFILE change nothing; other flags, and a
 /// relative path from a directory other than `AT_FDCWD`, answer EINVAL.
+/// O_CREAT, O_TRUNC and O_APPEND name a directory as POSIX has it: EISDIR
+/// for O_CREAT without O_DIRECTORY and for O_TRUNC or O_APPEND with write
+/// access; O_APPEND for reading opens the directory; on anything else they
+/// answer EINVAL (the service creates, truncates and appends nothing yet).
 ///
 /// # Safety
 /// `path` is a live C string.
@@ -129,10 +137,27 @@ pub unsafe extern "C" fn stafeto_openat(
     _mode: u32,
 ) -> c_int {
     let known = O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC;
+    let changes = O_CREAT | O_TRUNC | O_APPEND;
     // SAFETY: the caller's promise.
     let absolute = !path.is_null() && unsafe { *path } == b'/' as c_char;
-    if (dirfd != AT_FDCWD && !absolute) || flags & !known != 0 {
+    if (dirfd != AT_FDCWD && !absolute) || flags & !(known | changes) != 0 {
         return -EINVAL;
+    }
+    // SAFETY: the caller's promise.
+    let name = match unsafe { posix_abi::path(path) } {
+        Ok(name) => name,
+        Err(errno) => return -errno,
+    };
+    if flags & changes != 0 {
+        let reads = flags & O_ACCMODE == O_RDONLY;
+        let creates = flags & O_CREAT != 0 && flags & O_DIRECTORY == 0;
+        let directory = (creates || !reads || flags & changes == O_APPEND) && is_directory(name);
+        if directory && (creates || !reads) {
+            return -EISDIR;
+        }
+        if !(directory && flags & changes == O_APPEND) {
+            return -EINVAL;
+        }
     }
     let mut ours = flags & O_ACCMODE;
     if flags & O_DIRECTORY != 0 {
@@ -141,12 +166,13 @@ pub unsafe extern "C" fn stafeto_openat(
     if flags & O_CLOEXEC != 0 {
         ours |= posix_abi::constants::O_CLOEXEC;
     }
-    // SAFETY: the caller's promise.
-    let name = match unsafe { posix_abi::path(path) } {
-        Ok(name) => name,
-        Err(errno) => return -errno,
-    };
     value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
+}
+
+/// Whether `name` opens as a directory.
+fn is_directory(name: &[u8]) -> bool {
+    call(|| posix_abi::open(name, posix_abi::constants::O_DIRECTORY).and_then(posix_abi::close))
+        .is_ok()
 }
 
 #[unsafe(no_mangle)]
