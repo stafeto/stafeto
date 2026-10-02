@@ -1835,6 +1835,13 @@ fn posix_procs_probe() -> Result<(), String> {
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
+    for marker in [
+        "posix-procs: a child inherits the mask and SIG_IGN",
+        "posix-procs: a thread took SIGUSR1 after main left",
+        "posix-procs: the last thread ran atexit",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
     let number = |prefix: &str| -> Result<Vec<i64>, String> {
         let line = outcome
             .lines

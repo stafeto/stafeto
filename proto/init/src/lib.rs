@@ -106,7 +106,7 @@
 //! that its CLIENT_GONE tells init of the end. ADOPTED: the header, the ticket u64 and the
 //! service's status u32 (0, or why it made no process), and with status 0
 //! three handles: the session of the record, the process (MANAGE,
-//! DUPLICATE, TRANSFER) and its first thread (MANAGE, TRANSFER), and a
+//! DUPLICATE, TRANSFER) and its first thread (MANAGE, DUPLICATE, TRANSFER), and a
 //! fourth, the record's identity session (SEND, TRANSFER, DUPLICATE),
 //! which init gives the process in its start data under `posix`,
 //! `process`, `thread` and `posix-id`; the reply is its status alone. Init keeps a copy of the

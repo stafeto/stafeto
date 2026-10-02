@@ -108,6 +108,25 @@ pub fn identity() -> Option<&'static Handle<Channel>> {
     unsafe { &*IDENTITY.0.get() }.as_ref()
 }
 
+/// Router: the service asks for the entry of `thread`, a thread of the
+/// process, once it set a signal on the page (spec 2, 3.3): the main
+/// thread at the start, the next live one when the router leaves
+/// (relibc::leaving).
+pub fn register_router(thread: &Handle<rt::handle::Thread>) -> Result<(), i32> {
+    use crate::constants::EIO;
+    use rt::abi::Rights;
+    let copy =
+        rt::sys::handle_duplicate(thread, Rights::MANAGE | Rights::TRANSFER).map_err(|_| EIO)?;
+    let request = proto_process::Method::Router.header().bytes();
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let reply =
+        rt::sys::send_handles(client().session(), &request, [copy.erase()]).map_err(|_| EIO)?;
+    if reply.bytes(&mut buffer) != proto_wire::reply(Status::Ok) {
+        return Err(EIO);
+    }
+    Ok(())
+}
+
 /// kill of `pid` with `signal` through the process service (0 checks
 /// alone): a process for `pid` above 0, the caller's group for 0, every
 /// process but the caller's for -1, the group -`pid` below; ESRCH, EPERM,
@@ -332,11 +351,16 @@ pub fn spawn(path: &[u8], flags: i32, pgroup: i32) -> Result<i32, i32> {
     let level = crate::threads::own_block()
         .base_level
         .load(core::sync::atomic::Ordering::Relaxed) as u8;
+    // The child's main thread starts with the caller's mask.
+    let mask = crate::threads::own_block()
+        .mask
+        .load(core::sync::atomic::Ordering::SeqCst);
     let spawn = Spawn {
         name,
         flags,
         pgroup,
         level,
+        mask,
     };
     let pid = client().spawn(&spawn).map_err(|status| match status {
         Status::Kernel(rt::abi::Error::NoMemory) => ENOMEM,

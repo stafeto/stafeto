@@ -556,7 +556,11 @@ pub struct Page {
     pub ignored: AtomicU64,
     pub caught: AtomicU64,
     pub flags: AtomicU64,
-    _reserved: [u64; 3],
+    /// The signal mask of the main thread at the process's start: that of
+    /// the thread whose posix_spawn made it ([P24-SPAWN]); the service
+    /// writes it, and `ignored` too, before the process runs.
+    pub start_mask: AtomicU64,
+    _reserved: [u64; 2],
     /// The information of the first sending of each pending signal.
     pub info: [PageInfo; 64],
 }
@@ -586,14 +590,16 @@ pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 
 /// The body of Spawn: the name of the record of init's table, 16 bytes,
-/// the spawn-flags u32, the process group u32 and the caller's level u32,
-/// which the copy of the child's program runs at least at.
+/// the spawn-flags u32, the process group u32, the caller's level u32,
+/// which the copy of the child's program runs at least at, and the
+/// caller's signal mask u64, which the child's main thread starts with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spawn {
     pub name: Name,
     pub flags: u32,
     pub pgroup: u32,
     pub level: u8,
+    pub mask: u64,
 }
 
 impl Spawn {
@@ -601,13 +607,14 @@ impl Spawn {
         w.name(Some(self.name))?;
         w.u32(self.flags)?;
         w.u32(self.pgroup)?;
-        w.u32(self.level.into())
+        w.u32(self.level.into())?;
+        w.u64(self.mask)
     }
 
     /// BAD_SIZE out of the layout, without a name or with a level past 63.
     pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
         let name = r.name()?.ok_or(Status::BadSize)?;
-        let (flags, pgroup, level) = (r.u32()?, r.u32()?, r.u32()?);
+        let (flags, pgroup, level, mask) = (r.u32()?, r.u32()?, r.u32()?, r.u64()?);
         r.finish()?;
         let level = u8::try_from(level)
             .ok()
@@ -618,6 +625,7 @@ impl Spawn {
             flags,
             pgroup,
             level,
+            mask,
         })
     }
 }
@@ -903,17 +911,18 @@ mod tests {
             flags: SPAWN_SETPGROUP,
             pgroup: 0,
             level: 30,
+            mask: 1 << 9,
         };
         let mut w = Writer::new();
         spawn.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 28);
+        assert_eq!(w.as_bytes().len(), 36);
         assert_eq!(Spawn::read(Reader::new(w.as_bytes())), Ok(spawn));
         assert_eq!(
-            Spawn::read(Reader::new(&w.as_bytes()[..27])),
+            Spawn::read(Reader::new(&w.as_bytes()[..35])),
             Err(Status::BadSize)
         );
         assert_eq!(
-            Spawn::read(Reader::new(&[0; 28])),
+            Spawn::read(Reader::new(&[0; 36])),
             Err(Status::BadSize),
             "no name"
         );

@@ -465,6 +465,40 @@ pub fn leaving() {
     block
         .flags
         .fetch_or(flag::EXITING | flag::CANCEL_DISABLED, Ordering::SeqCst);
+    // The process signals this thread took go back to the page; the router
+    // of the process's signals, if it was this thread, is the next live
+    // one; with none left the process ends as exit(0) ends it (POSIX: the
+    // last thread's pthread_exit), atexit handlers and stdio included.
+    let own = current();
+    // A thread that left is LIVE until its place goes (the main thread's
+    // never does); its block says EXITING from `leaving` on.
+    let next = TABLE.iter().enumerate().find(|(index, place)| {
+        index + 1 != own as usize
+            && place.state.load(Ordering::Acquire) & (LIVE | EXITED) == LIVE
+            // SAFETY: a LIVE place's block lives until the place goes, and
+            // only `collect` frees a place, under the lock, after EXITED.
+            && unsafe { (place.block.load(Ordering::Acquire) as *const Block).as_ref() }
+                .is_some_and(|b| b.flags.load(Ordering::SeqCst) & flag::EXITING == 0)
+    });
+    let Some((index, place)) = next else {
+        // SAFETY: relibc's exit, with its atexit handlers and stdio.
+        unsafe { exit(0) }
+    };
+    if ROUTER.load(Ordering::Acquire) == own {
+        ROUTER.store(index as u64 + 1, Ordering::Release);
+        let native = borrowed::<Thread>(place.native.load(Ordering::Relaxed));
+        let _ = crate::process::register_router(&native);
+    }
+    crate::signals::leaving();
+}
+
+/// The number of the thread that routes the process's signals: the main
+/// thread first (`leaving`).
+static ROUTER: AtomicU64 = AtomicU64::new(1);
+
+unsafe extern "C" {
+    /// relibc's exit.
+    fn exit(status: core::ffi::c_int) -> !;
 }
 
 /// relibc gave thread `id` up.

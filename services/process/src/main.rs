@@ -327,6 +327,16 @@ impl Processes {
         let paged = self
             .pages
             .give(&make::own(), index, &record.process, identity);
+        // A spawned child starts with the caller's mask and the parent's
+        // SIG_IGN ([P24-SPAWN]); the layer reads them at its start.
+        if let (Ok(()), Some(p)) = (&paged, parent)
+            && let (Some(child), Some(from)) = (self.pages.page(index), self.pages.page(p))
+        {
+            use core::sync::atomic::Ordering::{Acquire, Release};
+            let mask = self.spawns[p].as_ref().map_or(0, |s| s.request.mask);
+            child.start_mask.store(mask, Release);
+            child.ignored.store(from.ignored.load(Acquire), Release);
+        }
         let session = paged.and_then(|()| {
             sys::handle_label(
                 &self.channel,
@@ -449,9 +459,13 @@ impl Processes {
     /// SETPGROUP and SETSID, PERMISSION for the group they ask for when
     /// setpgid would be EPERM (Create asks again: the groups may change).
     fn spawn(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
-        let Ok(request) = Spawn::read(r.body()) else {
+        let Ok(mut request) = Spawn::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
+        // The caller's level, as it says, within the ceiling of its record:
+        // the copy of the child's program never runs above the caller.
+        let ceiling = self.records.get(index).map_or(1, |r| r.ceiling);
+        request.level = request.level.min(ceiling);
         if request.flags & !(SPAWN_SETPGROUP | SPAWN_SETSID) != 0 {
             return refuse(proto_process::INVALID);
         }
@@ -633,8 +647,9 @@ impl Processes {
     }
 
     /// WaitTake of key k with the caller's labelled copy of its channel
-    /// (NOTIFY): READY with what the wait finds now, the wait over; or
-    /// ARMED, the copy kept to tell. BAD_STATE for a key of no wait.
+    /// (NOTIFY), or without one after a tell: READY with what the wait
+    /// finds now, the wait over; or ARMED, the copy kept to tell, again
+    /// after a tell that found nothing. BAD_STATE for a key of no wait.
     fn wait_take(
         &mut self,
         index: usize,
@@ -669,6 +684,10 @@ impl Processes {
             if let Err(e) = self.ops.arm(r.label(), key, copy) {
                 return Answer::Status(Status::Kernel(e));
             }
+        } else {
+            // A take after a tell found nothing (another wait took the
+            // zombie, or SA_NOCLDWAIT reaped it): the next end tells again.
+            self.ops.untell(r.label(), key);
         }
         long_reply(r, long::Reply::Armed)
     }

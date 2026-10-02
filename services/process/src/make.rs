@@ -179,7 +179,10 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
         identity,
         thread,
     } = made;
-    let copy = sys::handle_duplicate(&thread, abi::Rights::MANAGE | abi::Rights::TRANSFER);
+    // DUPLICATE: the process names its main thread the router of its
+    // signals with a copy of it (proto_process Router).
+    let rights = abi::Rights::MANAGE | abi::Rights::DUPLICATE | abi::Rights::TRANSFER;
+    let copy = sys::handle_duplicate(&thread, rights);
     let taken = w.u32(0).is_ok()
         && copy.is_ok_and(|copy| {
             let mut buffer = [0; abi::MESSAGE_MAX];

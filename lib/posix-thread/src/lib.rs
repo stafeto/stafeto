@@ -118,7 +118,11 @@ pub struct Block {
     /// Not 0 while the thread waits in the console phase of a read, for
     /// the guest probes.
     pub probe: AtomicU64,
-    reserved: [u64; 5],
+    /// Of the pending signals, those that came from the process's page:
+    /// their sender's information is the layer's, and they go back to the
+    /// page when the thread blocks them or leaves.
+    pub process: AtomicU64,
+    reserved: [u64; 4],
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -212,7 +216,8 @@ impl Block {
             thread_id: 0,
             cancel_point: AtomicU64::new(0),
             probe: AtomicU64::new(0),
-            reserved: [0; 5],
+            process: AtomicU64::new(0),
+            reserved: [0; 4],
         }
     }
 }

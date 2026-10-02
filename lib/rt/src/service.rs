@@ -840,6 +840,14 @@ impl<const N: usize> LongOps<N> {
         }
     }
 
+    /// The client took after a tell and found nothing ready: the next
+    /// `tell` tells again through the handle kept, as after `arm`.
+    pub fn untell(&mut self, label: u64, key: u64) {
+        if let Some(index) = self.place(label, key) {
+            self.ops[index].as_mut().expect("a placed operation").told = false;
+        }
+    }
+
     /// The operation is over (taken or cancelled): it goes with its handle.
     pub fn finish(&mut self, session: &mut LongSession, label: u64, key: u64) -> bool {
         match self.place(label, key) {

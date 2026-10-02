@@ -66,7 +66,18 @@ pub unsafe extern "C" fn stafeto_init(tcb: *mut c_void) -> c_int {
                     tcb.cast::<u8>().add(posix_thread::BLOCK_OFFSET).cast(),
                 )
             };
-            0
+            // The main thread routes the process's signals, and those that
+            // came before its entry was bound come now (spec 2, 3.3).
+            let routed =
+                call(|| posix_abi::process::register_router(&posix_abi::threads::main_handle()));
+            let _ = call(|| {
+                posix_abi::signals::take_waiting();
+                Ok::<(), i32>(())
+            });
+            match routed {
+                Ok(()) => 0,
+                Err(errno) => -errno,
+            }
         }
         Err(errno) => -errno,
     }

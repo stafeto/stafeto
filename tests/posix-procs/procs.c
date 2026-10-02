@@ -50,6 +50,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -354,9 +355,94 @@ static void clock_rights(void) {
     expect("seteuid(0) of a process that dropped root", seteuid(0) == -1 && errno == EPERM, 1);
 }
 
+static void said_atexit(void) { printf("posix-procs: the last thread ran atexit\n"); }
+
+static void *leave_waiter(void *arg) {
+    (void)arg;
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    int signal = 0;
+    if (sigwait(&usr1, &signal) == 0 && signal == SIGUSR1)
+        printf("posix-procs: a thread took SIGUSR1 after main left\n");
+    return NULL;
+}
+
+/* A child that starts with SIGUSR1 blocked: its main thread leaves, the
+ * thread that waits for SIGUSR1 is the router then, and its pthread_exit,
+ * the last, ends the process as exit(0) does, atexit handlers included. */
+static int leave(void) {
+    atexit(said_atexit);
+    pthread_t waiter;
+    pthread_create(&waiter, NULL, leave_waiter, NULL);
+    pthread_exit(NULL);
+}
+
+static volatile int info_code = -1, info_pid = -1;
+static void on_usr1_info(int signal, siginfo_t *info, void *context) {
+    (void)signal;
+    (void)context;
+    info_code = info->si_code;
+    info_pid = info->si_pid;
+}
+
+/* The fixes of the review of T3 and T4. */
+static void wave(void) {
+    /* A signal right after posix_spawn, before the child bound its entry. */
+    pid_t sleeper = start("/boot/procs-sleeper");
+    expect("kill right after posix_spawn", kill(sleeper, SIGTERM), 0);
+    reap("a sleeper killed at once", sleeper, 0, SIGTERM);
+
+    /* A wait told of a child SA_NOCLDWAIT reaped waits for the next end. */
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = SIG_DFL;
+    action.sa_flags = SA_NOCLDWAIT;
+    sigaction(SIGCHLD, &action, NULL);
+    start("/boot/procs-exit7");
+    start("/boot/procs-nap");
+    int status = -1;
+    expect("waitpid(-1) with SA_NOCLDWAIT", (int)waitpid(-1, &status, 0) == -1 && errno == ECHILD, 1);
+    action.sa_flags = 0;
+    sigaction(SIGCHLD, &action, NULL);
+
+    /* A handler with SA_SIGINFO sees the sender of a process signal. */
+    memset(&action, 0, sizeof action);
+    action.sa_sigaction = on_usr1_info;
+    action.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &action, NULL);
+    expect("kill with SA_SIGINFO", kill(getpid(), SIGUSR1), 0);
+    expect("si_code of kill", info_code, SI_USER);
+    expect("si_pid of kill", info_pid, (int)getpid());
+
+    /* A child starts with the caller's mask (SIGUSR2 blocked since stage
+     * 3) and the parent's SIG_IGN. */
+    signal(SIGPIPE, SIG_IGN);
+    reap("a child with the mask", start("/boot/procs-child"), 0, 0);
+    signal(SIGPIPE, SIG_DFL);
+
+    /* The router after the main thread left, and exit(0) of the last. */
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &usr1, NULL);
+    pid_t leaver = start("/boot/procs-child");
+    sigprocmask(SIG_UNBLOCK, &usr1, NULL);
+    pause_ms(200);
+    expect("kill of a child whose main thread left", kill(leaver, SIGUSR1), 0);
+    reap("a child whose last thread left", leaver, 0, 0);
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
+        sigset_t mask;
+        sigprocmask(SIG_BLOCK, NULL, &mask);
+        if (sigismember(&mask, SIGUSR1)) return leave();
+        struct sigaction pipe;
+        sigaction(SIGPIPE, NULL, &pipe);
+        if (sigismember(&mask, SIGUSR2) && pipe.sa_handler == SIG_IGN)
+            printf("posix-procs: a child inherits the mask and SIG_IGN\n");
         printf("posix-procs: child %d of %d\n", (int)getpid(), (int)getppid());
         return 0;
     }
@@ -501,6 +587,7 @@ int main(int argc, char **argv) {
     kills(sleeper);
     groups();
     clock_rights();
+    wave();
     if (failures == 0) printf("posix-procs: ok\n");
     return failures == 0 ? 0 : 1;
 }
