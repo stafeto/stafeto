@@ -37,3 +37,5 @@ proto-clock = { path = "../../proto/clock" }
 posix-signals = { path = "../posix-signals" }
 process-client = { path = "../process-client" }
 proto-process = { path = "../../proto/process" }
+proto-fs = { path = "../../proto/fs" }
+proto-loader = { path = "../../proto/loader" }

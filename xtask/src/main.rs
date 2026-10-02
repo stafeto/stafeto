@@ -36,8 +36,9 @@ const POSIX_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// The stack of the RAM file service: its start reads the table of the boot
-/// image (services/ramfs/src/tree.rs) on top of the start data.
-const RAMFS_STACK_SIZE: u32 = 32 * 1024;
+/// image (services/ramfs/src/tree.rs) on top of the start data, and its
+/// loop holds the table of its sessions.
+const RAMFS_STACK_SIZE: u32 = 48 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
@@ -354,8 +355,9 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 ];
 /// The probe of POSIX processes (5b) and the services it needs: the same
 /// program a second time with a stack of 32 MiB, which the 15 pages of
-/// quota of its record cannot map (procs-big).
-const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
+/// quota of its record cannot map (procs-big); the loader, and BusyBox
+/// with its applets, which the table of files names (5c).
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
@@ -367,6 +369,8 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
     ("posix-procs-big", "posix-procs", 32 * 1024 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
@@ -851,7 +855,7 @@ commands:
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
-            boot image through the process service
+            boot image and from files through the process service
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -902,7 +906,7 @@ fn main() {
         Some("os-test") => ostest::run_in_budget(),
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
-        Some("posix-procs") => posix_procs_probe(),
+        Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
@@ -1179,10 +1183,15 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     let mut files = Vec::new();
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
+        disasm::erratum_835769(elf, &objdump)?;
+        // A program of stack 0 goes into the image as its ELF file alone:
+        // the loader, and the programs only files of the table name.
+        if *stack == 0 {
+            continue;
+        }
         let bytes = std::fs::read(elf).map_err(|e| why(e.to_string()))?;
         let program = bootimg::elf::program(&bytes, *stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
-        disasm::erratum_835769(elf, &objdump)?;
         files.push((*file, written, elf.clone()));
     }
     let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
@@ -1228,19 +1237,31 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     if let Some(licence) = &os_test_licence {
         list.push((ostest::LICENCE, licence.as_slice()));
     }
-    // The files of the RAM file service: the ELF files of the programs its
-    // table names, as the linker wrote them, then the table (rootfs.rs).
+    // The files of the RAM file service: the files its table names, the
+    // ELF files of programs as the linker wrote them among them, then the
+    // ELF files of the other programs of stack 0 (the loader, `loader.elf`),
+    // then the table (rootfs.rs).
     let listed = rootfs::files_of(name);
-    let wanted = rootfs::programs(&listed);
-    let mut elf_names = Vec::new();
-    let mut elf_bytes = Vec::new();
-    for program in &wanted {
+    let wanted = rootfs::sources(&listed);
+    let read_elf = |program: &str| -> Result<Vec<u8>, String> {
         let (_, elf, _) = sources
             .iter()
-            .find(|(file, _, _)| file == program)
+            .find(|(file, _, _)| *file == program)
             .ok_or_else(|| format!("{name}: no program {program} for its rootfs"))?;
-        elf_bytes.push(std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?);
-        elf_names.push(rootfs::elf_name(program));
+        std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))
+    };
+    let mut elf_names = Vec::new();
+    let mut elf_bytes = Vec::new();
+    for source in &wanted {
+        elf_bytes.push(source.bytes(read_elf)?);
+        elf_names.push(source.file_name());
+    }
+    for (file, _, stack) in sources {
+        let raw = rootfs::elf_name(file);
+        if *stack == 0 && !elf_names.contains(&raw) {
+            elf_bytes.push(read_elf(file)?);
+            elf_names.push(raw);
+        }
     }
     let first = list.len() as u32;
     for (file, bytes) in elf_names.iter().zip(&elf_bytes) {
@@ -1852,11 +1873,13 @@ fn relibc_hello_probe() -> Result<(), String> {
 /// The probe of POSIX processes (tests/posix-procs): its checks pass, its
 /// child says the PID the parent's posix_spawn gave and the parent's PID,
 /// and the child that did not load got no process.
-fn posix_procs_probe() -> Result<(), String> {
+fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
+    // BusyBox is /bin/ls of the image's files (5c).
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
     // The parent and its child end in either order.
@@ -1884,10 +1907,20 @@ fn posix_procs_probe() -> Result<(), String> {
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
+    // The first goal of 5c: /bin/ls from a file lists /etc, a line alone.
+    if !outcome.lines.iter().any(|l| l.trim() == "motd") {
+        return Err("ls of /etc printed no line `motd`".into());
+    }
     for marker in [
         "posix-procs: a child inherits the mask and SIG_IGN",
         "posix-procs: a thread took SIGUSR1 after main left",
         "posix-procs: the last thread ran atexit",
+        // Stage 7 (5c): ls of /etc from a file, argv and envp, set-ID.
+        "posix-process: loader ready",
+        "posix-procs: ls of /etc ended with 0",
+        "posix-procs: args 4 [one two] [three] X=1",
+        "posix-procs: setid uid 65534 euid 0 secure 1 fd 3",
+        "posix-procs: nobody uid 65534 euid 65534",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -1910,7 +1943,7 @@ fn posix_procs_probe() -> Result<(), String> {
             "the child says {child:?}, the parent {parent:?}: no child of that parent"
         ));
     }
-    println!("C POSIX process probe passed: posix_spawn from the boot image");
+    println!("C POSIX process probe passed: posix_spawn from the boot image and from files");
     Ok(())
 }
 
@@ -2182,7 +2215,7 @@ fn test() -> Result<(), String> {
     posix_abi_probe()?;
     relibc_hello_probe()?;
     relibc_threads_probe(&qemu::VIRT)?;
-    posix_procs_probe()?;
+    posix_procs_probe(&qemu::VIRT)?;
     // BusyBox on relibc guards the C surface (5a′).
     busybox_probe()?;
     ash_probe()?;
@@ -3566,9 +3599,11 @@ fn hvf() -> Result<(), String> {
         }
         console_dialog(m)?;
         trace_dialog(m)?;
-        // relibc's pthreads on the real processor: about a second.
+        // relibc's pthreads and the POSIX processes, the loader of files
+        // among them, on the real processor.
         if m.name == qemu::HVF_V3.name {
             relibc_threads_probe(m)?;
+            posix_procs_probe(m)?;
         }
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
@@ -3591,7 +3626,7 @@ fn hvf() -> Result<(), String> {
         }
         write_measures()?;
         println!(
-            "hvf on {}: boot ok, console dialog ok, relibc threads ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
+            "hvf on {}: boot ok, console dialog ok, relibc threads and POSIX processes ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
@@ -3855,6 +3890,8 @@ fn ci() -> Result<(), String> {
         "--package",
         "proto-clock",
         "--package",
+        "proto-loader",
+        "--package",
         "xtask",
         "--all-targets",
         "--",
@@ -3966,6 +4003,8 @@ fn ci() -> Result<(), String> {
         "virtio-console",
         "--features",
         "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/adoption-refusals,posix-abi/rtbench",
+        "--package",
+        "loader",
         "--package",
         "test-init",
         "--package",

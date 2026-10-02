@@ -86,6 +86,10 @@ pub struct Record<P> {
     pub state: State,
     /// The ceiling of its process.
     pub ceiling: u8,
+    /// The quota and the room for handles of its process, which a child
+    /// it spawns from a file gets too (5c).
+    pub quota: u64,
+    pub handle_limit: u32,
     /// Its process group and session: those of its parent, or its own PID
     /// for a record of init's table.
     pub pgid: u32,
@@ -289,6 +293,8 @@ impl<P> Records<P> {
             credentials,
             state: State::Loading,
             ceiling,
+            quota: 0,
+            handle_limit: 0,
             pgid,
             sid,
             parent_index: parent.map(|p| p as u16),
@@ -531,6 +537,12 @@ impl<P> Records<P> {
     /// the record is in the table (a zombie too: it answers who it was).
     pub fn find_identity(&self, label: u64) -> Option<usize> {
         self.named(label, Place::Identity)
+    }
+
+    /// The index of the record whose loader's session or identity has
+    /// `label`, while the record is in the table.
+    pub fn find_loader(&self, label: u64) -> Option<usize> {
+        self.named(label, Place::Loader)
     }
 
     /// The index of the record whose exit place has `label`, while its

@@ -32,6 +32,26 @@ pub unsafe fn init(parent: &Handle<Channel>) -> Result<(), Status> {
     *slot = Some(Client::connect(parent)?);
     Ok(())
 }
+/// The clock through `session`, a session the program was given (its
+/// loader's start, spec 2, 3.2).
+///
+/// # Safety
+/// As for `init`.
+pub unsafe fn init_with(session: Handle<Channel>) -> Result<(), Status> {
+    // SAFETY: the caller exclusively owns startup initialization.
+    let slot = unsafe { &mut *STATE.0.get() };
+    if slot.is_some() {
+        return Err(Status::Kernel(rt::abi::Error::BadState));
+    }
+    *slot = Some(Client::from_session(session));
+    Ok(())
+}
+
+/// The process's session with the clock service.
+pub fn session() -> Option<&'static Handle<Channel>> {
+    client().ok().map(Client::session)
+}
+
 /// Where a process maps the clock service's page of the anchor.
 const PAGE_ADDRESS: usize = 0x0E00_0000;
 /// Set once the page is mapped: CLOCK_REALTIME reads it with no IPC.

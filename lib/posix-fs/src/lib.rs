@@ -186,6 +186,26 @@ impl PosixFs {
         Self::from_files(Files::connect_with_uart(parent).map_err(FsError::from)?)
     }
 
+    /// The files through sessions the program was given (its loader's
+    /// start, spec 2, 3.2), with `cwd` its current directory.
+    pub fn from_sessions(
+        files: Handle<Channel>,
+        uart: Option<Handle<Channel>>,
+        cwd: &[u8],
+    ) -> Result<Self, FsError> {
+        let mut fs = Self::from_files(Files::from_sessions(files, uart))?;
+        if !cwd.is_empty() {
+            fs.paths.set_cwd(cwd)?;
+        }
+        Ok(fs)
+    }
+
+    /// The session with the RAM file service and the console's driver's,
+    /// which a child gets clones of.
+    pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
+        self.files.sessions()
+    }
+
     fn from_files(files: Files) -> Result<Self, FsError> {
         let mut descriptors = Table::default();
         for backend in [Backend::Input, Backend::Output, Backend::Error] {

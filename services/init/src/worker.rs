@@ -397,7 +397,14 @@ pub fn resources(
         (record.trace, "trace", Rights::KSTATS),
     ] {
         if wanted {
-            let copy = sys::handle_duplicate(resource, right | Rights::TRANSFER)?;
+            // The process service gives the programs its loaders start a
+            // console of their own (5c): its copy may be copied.
+            let copy_right = if name == "console" && record.name == PROCESS_SERVICE {
+                Rights::DUPLICATE
+            } else {
+                Rights::NONE
+            };
+            let copy = sys::handle_duplicate(resource, right | Rights::TRANSFER | copy_right)?;
             // The names of the start data fit the giver (NAMES_MAX).
             let _ = giver.give(name, copy.erase());
         }

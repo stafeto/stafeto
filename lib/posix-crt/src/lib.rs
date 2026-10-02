@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The start of a C program on relibc. Args are a bounded, NUL-separated
-//! list from init; environment inheritance is pending. The start goes in
+//! The start of a C program on relibc. A program init starts takes its
+//! arguments, a bounded NUL-separated list, from its start data; one its
+//! loader started (posix_spawn from a file, spec 2, 3.2; 5c) finds them
+//! with its environment and its sessions in the start area the loader
+//! wrote (proto_loader::Start), x0 naming it. The start goes in
 //! two steps (spec 2, 3.5): the process's (`posix_init_process`:
 //! registration, clocks, files, heap, the clock's page), which leaves the
 //! thread alone, then relibc's: `crt_main` hands the thread to
@@ -27,6 +30,8 @@ type Main = unsafe extern "C" fn(isize, *mut *mut c_char, *mut *mut c_char) -> c
 unsafe extern "C" {
     fn main(argc: isize, argv: *mut *mut c_char, envp: *mut *mut c_char) -> c_int;
     fn relibc_start_v1(stack: *const usize, main: Main) -> !;
+    /// The process's umask (posix-platform).
+    fn stafeto_umask(mask: u32) -> u32;
     /// The ELF header, which lld maps with the read-only data.
     static __ehdr_start: [u8; 64];
 }
@@ -38,13 +43,13 @@ mod auxv {
     pub const AT_PHENT: usize = 4;
     pub const AT_PHNUM: usize = 5;
     pub const AT_PAGESZ: usize = 6;
+    pub const AT_SECURE: usize = 23;
 }
 
-/// Hands the main thread to relibc's start with the initial stack of a
-/// Linux process: argc, the `count` arguments, NULL, an empty environment
-/// (until 5c), the auxiliary vector with the program headers (relibc
-/// builds the static TLS from `PT_TLS`) and the page size.
-fn start_relibc(arguments: &[*mut c_char]) -> ! {
+/// The auxiliary vector into `out`, pairs of words: the program headers
+/// (relibc builds the static TLS from `PT_TLS`), the page size and, for
+/// a set-ID program, AT_SECURE; then AT_NULL. Six pairs.
+fn auxiliary(out: &mut [usize], secure: bool) {
     use auxv::*;
     let header = ptr::addr_of!(__ehdr_start).cast::<u8>();
     // SAFETY: the ELF header is 64 readable bytes.
@@ -55,31 +60,50 @@ fn start_relibc(arguments: &[*mut c_char]) -> ! {
             usize::from(ptr::read_unaligned(header.add(56).cast::<u16>())),
         )
     };
-    let mut stack = [0usize; 40];
+    let pairs = [
+        (AT_PHDR, header as usize + phoff),
+        (AT_PHENT, phent),
+        (AT_PHNUM, phnum),
+        (AT_PAGESZ, 4096),
+        (AT_SECURE, usize::from(secure)),
+        (AT_NULL, 0),
+    ];
+    for (index, (key, value)) in pairs.into_iter().enumerate() {
+        out[2 * index] = key;
+        out[2 * index + 1] = value;
+    }
+}
+
+/// Hands the main thread to relibc's start with the initial stack of a
+/// Linux process: argc, the `count` arguments, NULL, an empty environment
+/// (until 5c), the auxiliary vector with the program headers (relibc
+/// builds the static TLS from `PT_TLS`) and the page size.
+fn start_relibc(arguments: &[*mut c_char]) -> ! {
+    let mut stack = [0usize; 42];
     stack[0] = arguments.len();
     for (word, &argument) in stack[1..].iter_mut().zip(arguments) {
         *word = argument as usize;
     }
     // argv's NULL and the empty environment's NULL follow the arguments.
     let auxv = 1 + arguments.len() + 2;
-    let pairs = [
-        (AT_PHDR, header as usize + phoff),
-        (AT_PHENT, phent),
-        (AT_PHNUM, phnum),
-        (AT_PAGESZ, 4096),
-        (AT_NULL, 0),
-    ];
-    for (index, (key, value)) in pairs.into_iter().enumerate() {
-        stack[auxv + 2 * index] = key;
-        stack[auxv + 2 * index + 1] = value;
-    }
+    auxiliary(&mut stack[auxv..], false);
+    // SAFETY: the stack follows the Linux start contract, and it lives on:
+    // relibc's start does not return.
+    unsafe { enter_relibc(stack.as_ptr()) }
+}
+
+/// relibc's start with the initial stack at `stack`.
+///
+/// # Safety
+/// `stack` holds a Linux initial stack (argc, argv, NULL, envp, NULL, the
+/// auxiliary vector) that lives for the program's life.
+unsafe fn enter_relibc(stack: *const usize) -> ! {
     // relibc builds the TCB and the static TLS only when the register is
     // 0; the layer's start left no TCB there, and this says so.
     // SAFETY: no TCB of the layer is installed on this thread.
     unsafe { posix_thread::activate(ptr::null_mut()) };
-    // SAFETY: the stack follows the Linux start contract relibc reads, and
-    // it lives on: relibc's start does not return.
-    unsafe { relibc_start_v1(stack.as_ptr(), main) }
+    // SAFETY: the caller's promise; relibc's start does not return.
+    unsafe { relibc_start_v1(stack, main) }
 }
 
 /// The first step of the start: the process's registration with the
@@ -128,8 +152,111 @@ pub fn parent() -> ManuallyDrop<Handle<Channel>> {
     Handle::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)))
 }
 
+/// The live handles of the process at the start of a program its loader
+/// started, and the handles its start area names: the loader closed all
+/// that was its own when the two agree (spec 2, 3.2, condition O6).
+static START_HANDLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The handles of the process at its start and those its start area
+/// named, for the probes: zeros for a program init started.
+///
+/// # Safety
+/// `out` is null or has room for two words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_start_handles(out: *mut u64) {
+    if out.is_null() {
+        return;
+    }
+    for (i, value) in START_HANDLES.iter().enumerate() {
+        // SAFETY: the caller gives room for two words.
+        unsafe { out.add(i).write(value.load(Ordering::Relaxed)) };
+    }
+}
+
+/// The start of a program its loader started: the area at
+/// proto_loader::START_AREA names its handles, its current directory, its
+/// umask and its initial stack, whose auxiliary vector this fills.
+fn loaded_main() -> u64 {
+    use proto_loader::{SECURE, START_AREA, START_SIZE, Slot, Start};
+    // SAFETY: the loader mapped the area read and write at START_AREA for
+    // the program's life, its header first.
+    let header = unsafe { core::slice::from_raw_parts(START_AREA as *const u8, START_SIZE) };
+    let Some(area) = Start::read(header) else {
+        return 125;
+    };
+    let value = |slot: Slot| rt::abi::Handle(area.handles[slot as usize]);
+    let named = area.handles.iter().filter(|&&h| h != 0).count() as u64;
+    let one = |slot: Slot| (value(slot) != rt::abi::Handle::INVALID).then(|| value(slot));
+    if let Some(console) = one(Slot::Console) {
+        rt::console::set(Handle::<Resource>::from_raw(console));
+    }
+    let (Some(process), Some(thread), Some(posix), Some(files), Some(clock)) = (
+        one(Slot::Process),
+        one(Slot::Thread),
+        one(Slot::Posix),
+        one(Slot::Files),
+        one(Slot::Clock),
+    ) else {
+        rt::println!("POSIX startup: the start area lacks a handle");
+        return 125;
+    };
+    let process = Handle::<Process>::from_raw(process);
+    if let Ok(table) = rt::sys::process_handles(&process) {
+        START_HANDLES[0].store(table.live, Ordering::Relaxed);
+        START_HANDLES[1].store(named, Ordering::Relaxed);
+    }
+    let cwd = if area.cwd == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the loader wrote the current directory as a C string in
+        // the area.
+        unsafe { core::ffi::CStr::from_ptr(area.cwd as *const c_char) }.to_bytes()
+    };
+    // SAFETY: the main thread, once, before any other.
+    let started = unsafe {
+        posix_abi::process::init(Handle::from_raw(posix))
+            .map_err(|_| "process registration failed")
+            .and_then(|()| {
+                posix_abi::clock::init_with(Handle::from_raw(clock))
+                    .map_err(|_| "clock session failed")
+            })
+            .and_then(|()| {
+                let uart = one(Slot::Uart).map(Handle::from_raw);
+                PosixFs::from_sessions(Handle::from_raw(files), uart, cwd)
+                    .map_err(|_| "files failed")
+            })
+            .and_then(|files| posix_abi::shared::init(files).map_err(|_| "files failed"))
+            .and_then(|()| posix_abi::allocation::init(process).map_err(|_| "heap failed"))
+            .and_then(|()| {
+                let _ = posix_abi::clock::attach_page(posix_abi::allocation::process());
+                posix_abi::threads::init(Handle::from_raw(thread)).map_err(|_| "threads failed")
+            })
+    };
+    if let Err(why) = started {
+        rt::println!("POSIX startup: {}", why);
+        return 125;
+    }
+    if let Some(identity) = one(Slot::PosixId) {
+        // SAFETY: still single-threaded, after the process service's init.
+        unsafe { posix_abi::process::set_identity(Handle::from_raw(identity)) };
+    }
+    // SAFETY: the platform's umask takes any mask.
+    unsafe { stafeto_umask(area.umask) };
+    // The auxiliary vector's pairs lie in the area, after the NULL of envp.
+    // SAFETY: the loader left proto_loader::AUXV_PAIRS pairs of words there.
+    let auxv = unsafe {
+        core::slice::from_raw_parts_mut(area.auxv as *mut usize, 2 * proto_loader::AUXV_PAIRS)
+    };
+    auxiliary(auxv, area.flags & SECURE != 0);
+    // SAFETY: the area holds the initial stack and lives for good.
+    unsafe { enter_relibc(area.stack as *const usize) }
+}
+
 #[unsafe(export_name = "__rt_main")]
-pub extern "C" fn crt_main(_: u64) -> u64 {
+pub extern "C" fn crt_main(arg: u64) -> u64 {
+    if arg == proto_loader::START_AREA {
+        return loaded_main();
+    }
     let Ok(mut start) = rt::startup() else {
         return 125;
     };

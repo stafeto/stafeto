@@ -46,15 +46,30 @@
  * Stage 6, churn: 1100 children one after the other, so that the
  * identity sessions of the ended do not fill the service's channel.
  *
+ * Stage 7, posix_spawn from files (5c): the loader in the child opens the
+ * program through the RAM file service. /bin/ls lists /etc (the first goal
+ * of 5c) and is waited for; a child gets argv and envp; ENOENT, EACCES
+ * (a file without execute), ENOEXEC (a file that is no program), E2BIG
+ * (65 KiB of arguments) and ENOMEM (a program bigger than the child's
+ * quota) come from posix_spawn with no PID; POSIX_SPAWN_SETSIGMASK and
+ * POSIX_SPAWN_SETSIGDEF reach the child; the child holds no handle of its
+ * loader; a process that is no loader gets EPERM from OpenExec. Once the
+ * probe is nobody (stage 5): a set-user-ID file of root runs with euid 0
+ * in the secure mode, with POSIX_SPAWN_RESETIDS too; after a set-ID file
+ * that failed to load, the next child keeps euid 65534; a directory only
+ * root may search gives EACCES.
+ *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -65,6 +80,10 @@ _Static_assert(POSIX_SPAWN_SETPGROUP == 0x02 && POSIX_SPAWN_SETSID == 0x80,
                "the spawn-flags of the process service");
 
 static int failures;
+
+/* The layer's probes of 5c (posix-crt, posix-platform). */
+void stafeto_start_handles(unsigned long *out);
+int stafeto_probe_open_exec(const char *path);
 
 static void expect(const char *what, int got, int want) {
     if (got != want) {
@@ -436,6 +455,10 @@ static void wave(void) {
     reap("a child whose last thread left", leaver, 0, 0);
 }
 
+/* The arguments of a child, for the roles that look at them. */
+static int argc_seen;
+static char **argv_seen;
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
@@ -448,6 +471,45 @@ static int role(const char *name) {
             printf("posix-procs: a child inherits the mask and SIG_IGN\n");
         printf("posix-procs: child %d of %d\n", (int)getpid(), (int)getppid());
         return 0;
+    }
+    if (strcmp(name, "args") == 0) {
+        const char *x = getenv("X");
+        printf("posix-procs: args %d [%s] [%s] X=%s\n", argc_seen, argv_seen[2], argv_seen[3],
+               x ? x : "(none)");
+        return 0;
+    }
+    if (strcmp(name, "mask") == 0) {
+        sigset_t mask;
+        sigprocmask(SIG_BLOCK, NULL, &mask);
+        return sigismember(&mask, SIGHUP) && !sigismember(&mask, SIGUSR2) ? 0 : 1;
+    }
+    if (strcmp(name, "default") == 0) {
+        struct sigaction pipe;
+        sigaction(SIGPIPE, NULL, &pipe);
+        return pipe.sa_handler == SIG_DFL ? 0 : 1;
+    }
+    if (strcmp(name, "handles") == 0) {
+        unsigned long handles[2];
+        stafeto_start_handles(handles);
+        if (handles[0] != handles[1]) {
+            printf("posix-procs: %lu handles at the start, %lu named\n", handles[0], handles[1]);
+            return 1;
+        }
+        return 0;
+    }
+    if (strcmp(name, "setid") == 0) {
+        /* A set-user-ID file of root: the real IDs stay, the secure mode
+         * is on, and a new file takes a number above 2. */
+        int fd = open("/etc/motd", O_RDONLY);
+        int ok = getuid() == 65534 && geteuid() == 0 && getauxval(23) == 1 && fd > 2;
+        printf("posix-procs: setid uid %d euid %d secure %lu fd %d\n", (int)getuid(),
+               (int)geteuid(), getauxval(23), fd);
+        return ok ? 0 : 1;
+    }
+    if (strcmp(name, "nobody") == 0) {
+        int ok = getuid() == 65534 && geteuid() == 65534 && getauxval(23) == 0;
+        printf("posix-procs: nobody uid %d euid %d\n", (int)getuid(), (int)geteuid());
+        return ok ? 0 : 1;
     }
     if (strcmp(name, "sleep") == 0 || strcmp(name, "sleep2") == 0) {
         for (;;) sleep(60);
@@ -567,7 +629,109 @@ static void churn(void) {
     }
 }
 
+/* posix_spawn of the file `path` with `argv` and `envp`: the error, the
+ * PID in *pid. */
+static int spawn_file(pid_t *pid, const char *path, char *const argv[], char *const envp[],
+                      const posix_spawnattr_t *attr) {
+    return posix_spawn(pid, path, NULL, attr, argv, envp);
+}
+
+/* Spawns the file `path` in role `name` and checks it exits with 0. */
+static void run_role(const char *path, const char *name, const posix_spawnattr_t *attr) {
+    char *argv[] = {"procs-child", (char *)name, NULL};
+    char *envp[] = {NULL};
+    pid_t pid = -1;
+    int e = spawn_file(&pid, path, argv, envp, attr);
+    if (e != 0) {
+        printf("posix-procs: spawn of %s for %s gave %d (%s)\n", path, name, e, strerror(e));
+        failures++;
+        return;
+    }
+    reap(name, pid, 0, 0);
+}
+
+/* A spawn that fails with `want`, and leaves no PID. */
+static void refused(const char *what, const char *path, char *const argv[], int want) {
+    char *envp[] = {NULL};
+    pid_t pid = -7;
+    expect(what, spawn_file(&pid, path, argv, envp, NULL), want);
+    expect(what, pid, -7);
+}
+
+/* Stage 7, as root. */
+static void files(void) {
+    /* The first goal of 5c: ls of /etc from a file, waited for. */
+    char *ls[] = {"ls", "/etc", NULL};
+    char *path_env[] = {"PATH=/bin", NULL};
+    pid_t pid = -1;
+    expect("spawn of /bin/ls", spawn_file(&pid, "/bin/ls", ls, path_env, NULL), 0);
+    int status = -1;
+    expect("waitpid of ls", (int)waitpid(pid, &status, 0), (int)pid);
+    expect("ls exited 0", WIFEXITED(status) && WEXITSTATUS(status) == 0, 1);
+    printf("posix-procs: ls of /etc ended with %#x\n", status);
+
+    char *args[] = {"procs-child", "args", "one two", "three", NULL};
+    char *x[] = {"X=1", NULL};
+    pid = -1;
+    expect("spawn with argv and envp", spawn_file(&pid, "/bin/procs-child", args, x, NULL), 0);
+    reap("a child with argv and envp", pid, 0, 0);
+
+    char *child[] = {"procs-child", "child", NULL};
+    refused("spawn of /bin/none", "/bin/none", child, ENOENT);
+    refused("spawn of a file without execute", "/bin/data", child, EACCES);
+    refused("spawn of a file that is no program", "/bin/script", child, ENOEXEC);
+    refused("spawn of a program past the quota", "/bin/procs-big", child, ENOMEM);
+    refused("spawn of a directory", "/bin", child, EACCES);
+    static char big[65 * 1024];
+    memset(big, 'a', sizeof big - 1);
+    char *huge[] = {"procs-child", big, NULL};
+    refused("spawn with 65 KiB of arguments", "/bin/procs-child", huge, E2BIG);
+
+    /* The child's mask is that of the attribute, the caller's aside. */
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t mask, own;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    pthread_sigmask(SIG_BLOCK, &mask, &own);
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGHUP);
+    posix_spawnattr_setsigmask(&attr, &mask);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK);
+    run_role("/bin/procs-child", "mask", &attr);
+    pthread_sigmask(SIG_SETMASK, &own, NULL);
+    signal(SIGPIPE, SIG_IGN);
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGPIPE);
+    posix_spawnattr_setsigdefault(&attr, &mask);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGDEF);
+    run_role("/bin/procs-child", "default", &attr);
+    posix_spawnattr_destroy(&attr);
+    signal(SIGPIPE, SIG_DFL);
+
+    run_role("/bin/procs-child", "handles", NULL);
+    expect("OpenExec through the probe's own session", stafeto_probe_open_exec("/bin/ls"), EPERM);
+}
+
+/* Stage 7 once the probe is nobody: set-ID files. */
+static void files_nobody(void) {
+    run_role("/bin/procs-setid", "setid", NULL);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_RESETIDS);
+    run_role("/bin/procs-setid", "setid", &attr);
+    posix_spawnattr_destroy(&attr);
+    /* A set-ID file that the loader opens and cannot load: its SetId goes
+     * with the attempt, and the next child of the same place is nobody. */
+    char *child[] = {"procs-child", "child", NULL};
+    refused("spawn of a set-ID file that is no program", "/bin/setid-junk", child, ENOEXEC);
+    run_role("/bin/procs-child", "nobody", NULL);
+    refused("spawn under a directory without search", "/sbin/procs-child", child, EACCES);
+}
+
 int main(int argc, char **argv) {
+    argc_seen = argc;
+    argv_seen = argv;
     if (argc > 1) return role(argv[1]);
     pid_t child = 0;
     int e = spawn(&child, "/boot/procs-child", NULL, NULL);
@@ -576,7 +740,6 @@ int main(int argc, char **argv) {
 
     pid_t none = -7;
     expect("spawn of /boot/none", spawn(&none, "/boot/none", NULL, NULL), ENOENT);
-    expect("spawn of /bin/procs-child", spawn(&none, "/bin/procs-child", NULL, NULL), ENOENT);
     expect("spawn of the probe's own record", spawn(&none, "/boot/posix-procs", NULL, NULL),
            ENOENT);
 
@@ -605,7 +768,9 @@ int main(int argc, char **argv) {
     kills(sleeper);
     groups();
     churn();
+    files();
     clock_rights();
+    files_nobody();
     wave();
     if (failures == 0) printf("posix-procs: ok\n");
     return failures == 0 ? 0 : 1;

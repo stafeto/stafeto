@@ -19,7 +19,9 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        quota: 32 * PAGE,
+        // Its segments, a stack of 48 KiB for its table of sessions, and
+        // the tables of the image's files.
+        quota: 64 * PAGE,
         handle_limit: 32,
         restart: Restart::Always,
         console: true,
@@ -126,6 +128,8 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
+        // The session of the loaders (5c), which init marks.
+        connects: &["ramfs"],
         ..TABLE[0]
     },
     Record {
@@ -225,13 +229,21 @@ pub const RELIBC_TABLE: &[Record] = &[
 /// SIGUSR1, a second sleeper, and one that calls setsid and setpgid.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
-    POSIX_ABI_TABLE[1],
+    Record {
+        // The pool of the children from files (5c): five of the probe's
+        // quota at once (four children and one that fails its load), and
+        // the loaders' data.
+        quota: POSIX_ABI_TABLE[1].quota + 5 * PROCS_QUOTA + 16 * 5 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
     POSIX_ABI_TABLE[2],
     Record {
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0",
         root: true,
+        // A child from a file gets its parent's quota: room for BusyBox.
+        quota: PROCS_QUOTA,
         ..PROCS_CHILD
     },
     Record {
@@ -309,6 +321,10 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         ..PROCS_CHILD
     },
 ];
+
+/// The quota of the probe of POSIX processes, which each child it spawns
+/// from a file gets too (5c).
+const PROCS_QUOTA: u64 = 4096 * PAGE;
 
 /// The child of the probe of POSIX processes.
 const PROCS_CHILD: Record = Record {

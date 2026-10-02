@@ -17,6 +17,12 @@ use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 rt::entry!(main);
 
+/// The sessions: the POSIX processes init starts and their children, each
+/// with a session of its own (Clone).
+const SESSIONS: usize = 24;
+/// The mark of the labels the service gives itself (Clone): bit 63, which
+/// no label of init has.
+const OWN: u64 = 1 << 63;
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -51,9 +57,12 @@ fn main(_: u64) -> u64 {
         }),
     };
     rt::println!("clock: ready (unsynchronized epoch)");
-    let _ = rt::service::run::<Clocks, 8, 0>(
+    let _ = rt::service::run::<Clocks, SESSIONS, 0>(
         &channel,
         &mut Clocks {
+            channel: Handle::borrowed(channel.raw()),
+            level,
+            given: 0,
             clock,
             page,
             watches: core::array::from_fn(|_| None),
@@ -83,6 +92,11 @@ struct Identity {
     known: Known,
 }
 struct Clocks {
+    /// The service's channel, which the sessions Clone gives are copies
+    /// of, at the loop's level, and how many it gave.
+    channel: ManuallyDrop<Handle<Channel>>,
+    level: u8,
+    given: u64,
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
@@ -348,6 +362,22 @@ impl Service<0> for Clocks {
             });
             return Answer::Status(Status::Ok);
         }
+        if r.method() == Method::Clone as u16 {
+            if r.body().finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            self.given += 1;
+            let rights = rt::abi::Rights::SEND.union(rt::abi::Rights::TRANSFER);
+            return match sys::handle_label(&self.channel, rights, OWN | self.given, self.level) {
+                Ok(session) => {
+                    if r.reply().u32(0).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    Answer::Reply([session.erase()].into())
+                }
+                Err(e) => Answer::Status(Status::Kernel(e)),
+            };
+        }
         if r.handles.len() > usize::from(r.method() == Method::Set as u16) {
             return Answer::Status(Status::BadSize);
         }
@@ -456,7 +486,7 @@ impl Service<0> for Clocks {
                 }
                 Answer::Reply(handles)
             }
-            Some(Method::Watch) | None => Answer::Status(Status::UnknownMethod),
+            Some(Method::Watch | Method::Clone) | None => Answer::Status(Status::UnknownMethod),
         }
     }
     fn gone(&mut self, s: &mut Session<(), 0>) {

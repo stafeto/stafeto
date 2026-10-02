@@ -96,6 +96,125 @@ impl fmt::Display for ElfError {
 /// The program in `elf`, with a stack of `stack_size` bytes, checked
 /// (`Program::check`); its segments borrow the file's bytes.
 pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
+    let read = headers(elf, elf.len() as u64)?;
+    let mut segments = [Segment::EMPTY; 3];
+    for part in Part::ALL {
+        let load = &read.segments[part as usize];
+        if load.mem_size == 0 && load.file_size == 0 && load.vaddr == 0 {
+            continue;
+        }
+        // `headers` checked that the bytes lie in the file.
+        let (offset, file_size) = (load.offset as usize, load.file_size as usize);
+        segments[part as usize] = Segment {
+            vaddr: load.vaddr,
+            mem_size: load.mem_size,
+            bytes: &elf[offset..offset + file_size],
+        };
+    }
+    let program = Program {
+        entry: read.entry,
+        stack_size,
+        segments,
+    };
+    program.check().map_err(ElfError::Program)?;
+    Ok(program)
+}
+
+/// A loadable segment as the file lays it out (`layout`): its address and
+/// size in memory, and where its bytes lie in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Load {
+    pub vaddr: u64,
+    pub mem_size: u64,
+    pub offset: u64,
+    pub file_size: u64,
+}
+
+impl Load {
+    pub const EMPTY: Load = Load {
+        vaddr: 0,
+        mem_size: 0,
+        offset: 0,
+        file_size: 0,
+    };
+
+    /// The whole pages the segment takes.
+    pub fn pages(&self) -> core::ops::Range<u64> {
+        self.vaddr..(self.vaddr + self.mem_size).next_multiple_of(crate::PAGE_SIZE)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mem_size == 0 && self.file_size == 0
+    }
+}
+
+/// A program read from the head of its ELF file (`layout`): the entry
+/// point and the code, read-only data and data segments, in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    pub entry: u64,
+    pub segments: [Load; 3],
+}
+
+/// The program whose ELF file is `file_len` bytes long and starts with
+/// `head`, which holds the ELF header and every program header (a loader
+/// that reads a file in pieces gives its first page): the rules of
+/// `program`, and each segment within `room`, a range of whole pages, so
+/// that a loader keeps a program's segments off the addresses it and the
+/// layer reserve. Nothing past `head` is read: the bytes of each segment
+/// lie at `offset` in the file, and the loader copies them itself.
+pub fn layout(head: &[u8], file_len: u64, room: core::ops::Range<u64>) -> Result<Layout, ElfError> {
+    let read = headers(head, file_len)?;
+    for part in Part::ALL {
+        let s = &read.segments[part as usize];
+        if s.is_empty() {
+            if s.vaddr != 0 {
+                return Err(ElfError::Program(Error::EmptyNotZero(part)));
+            }
+            continue;
+        }
+        if !s.vaddr.is_multiple_of(crate::PAGE_SIZE) {
+            return Err(ElfError::Program(Error::Misaligned(part)));
+        }
+        if s.file_size > s.mem_size {
+            return Err(ElfError::Program(Error::FileOverMemory(part)));
+        }
+        let fits = s.vaddr >= room.start
+            && s.vaddr
+                .checked_add(s.mem_size)
+                .is_some_and(|e| e <= room.end);
+        if !fits {
+            return Err(ElfError::Program(Error::Outside(part)));
+        }
+    }
+    for (i, &a) in Part::ALL.iter().enumerate() {
+        for &b in &Part::ALL[i + 1..] {
+            let (pa, pb) = (
+                read.segments[a as usize].pages(),
+                read.segments[b as usize].pages(),
+            );
+            if !pa.is_empty() && !pb.is_empty() && pa.start < pb.end && pb.start < pa.end {
+                return Err(ElfError::Program(Error::Overlap(a, b)));
+            }
+        }
+    }
+    let code = &read.segments[Part::Code as usize];
+    let entry = read.entry;
+    if code.is_empty()
+        || !entry.is_multiple_of(4)
+        || !(code.vaddr..code.vaddr + code.mem_size).contains(&entry)
+    {
+        return Err(ElfError::Program(Error::BadEntry(entry)));
+    }
+    Ok(read)
+}
+
+/// The entry point and the loadable segments of the ELF file whose first
+/// bytes are `head` and whose length is `file_len`: the checks of the ELF
+/// header, one segment of each protection, the bytes of each within the
+/// file, and one template of TLS within the data segment's bytes.
+fn headers(head: &[u8], file_len: u64) -> Result<Layout, ElfError> {
+    let elf = head;
     if elf.len() < 64 || elf[..4] != *b"\x7fELF" {
         return Err(ElfError::NotElf);
     }
@@ -112,15 +231,14 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
         return Err(ElfError::HeaderSize);
     }
     let entry = u64_at(elf, 24);
-    let headers = u64_at(elf, 32) as usize;
-    let mut segments = [Segment::EMPTY; 3];
+    let headers = u64_at(elf, 32);
+    let mut segments = [Load::EMPTY; 3];
     let mut seen = [false; 3];
-    // The template's address and its bytes in the file.
     let mut tls = None;
-    for i in 0..usize::from(u16_at(elf, 56)) {
-        let at = headers.saturating_add(i * PHDR_SIZE);
-        let h = elf
-            .get(at..at.saturating_add(PHDR_SIZE))
+    for i in 0..u64::from(u16_at(elf, 56)) {
+        let h = usize::try_from(headers.saturating_add(i * PHDR_SIZE as u64))
+            .ok()
+            .and_then(|at| elf.get(at..at.checked_add(PHDR_SIZE)?))
             .ok_or(ElfError::HeadersPastEnd)?;
         match u32_at(h, 0) {
             PT_LOAD => {}
@@ -144,31 +262,27 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
         if core::mem::replace(&mut seen[part as usize], true) {
             return Err(ElfError::Twice(part));
         }
-        let (offset, file_size) = (offset as usize, file_size as usize);
-        let bytes = elf
-            .get(offset..offset.saturating_add(file_size))
-            .ok_or(ElfError::BytesPastEnd(part))?;
-        segments[part as usize] = Segment {
+        if offset
+            .checked_add(file_size)
+            .is_none_or(|end| end > file_len)
+        {
+            return Err(ElfError::BytesPastEnd(part));
+        }
+        segments[part as usize] = Load {
             vaddr,
             mem_size,
-            bytes,
+            offset,
+            file_size,
         };
     }
-    // A template of zeros alone (`.tbss`) has no bytes to lie anywhere.
     if let Some((vaddr, size @ 1..)) = tls {
         let data = &segments[Part::Data as usize];
-        let end = data.vaddr.saturating_add(data.bytes.len() as u64);
+        let end = data.vaddr.saturating_add(data.file_size);
         if !seen[Part::Data as usize] || vaddr < data.vaddr || vaddr.saturating_add(size) > end {
             return Err(ElfError::TlsOutside);
         }
     }
-    let program = Program {
-        entry,
-        stack_size,
-        segments,
-    };
-    program.check().map_err(ElfError::Program)?;
-    Ok(program)
+    Ok(Layout { entry, segments })
 }
 
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -421,5 +535,53 @@ mod tests {
         let len = f.len() as u64;
         put(&mut f, 32, &len.to_le_bytes());
         assert_eq!(program(&f, 0x1000), Err(ElfError::HeadersPastEnd));
+    }
+
+    /// The head of a file, its first page, gives the segments by their
+    /// place in the file, as `program` reads them from the whole file; a
+    /// head without every program header, bytes past the file's length, a
+    /// segment outside the room and no code are refused.
+    #[test]
+    fn a_layout_comes_from_the_head_of_the_file() {
+        let f = layout();
+        let room = 0x1000..0x100_0000;
+        let read = super::layout(&f[..0x1000], f.len() as u64, room.clone()).unwrap();
+        let whole = program(&f, 0x1000).unwrap();
+        assert_eq!(read.entry, whole.entry);
+        for part in Part::ALL {
+            let (load, segment) = (read.segments[part as usize], whole.segments[part as usize]);
+            assert_eq!(
+                (load.vaddr, load.mem_size),
+                (segment.vaddr, segment.mem_size)
+            );
+            let bytes = &f[load.offset as usize..(load.offset + load.file_size) as usize];
+            assert_eq!(bytes, segment.bytes, "{part}");
+        }
+        assert_eq!(
+            super::layout(&f[..64 + PHDR_SIZE * 2], f.len() as u64, room.clone()),
+            Err(ElfError::HeadersPastEnd)
+        );
+        assert_eq!(
+            super::layout(&f[..0x1000], f.len() as u64 - 1, room.clone()),
+            Err(ElfError::BytesPastEnd(Part::Data))
+        );
+        // A segment on the reserved pages above the room, or below it.
+        for room in [0x1000..0x20_2000, 0x20_1000..0x100_0000] {
+            assert!(matches!(
+                super::layout(&f[..0x1000], f.len() as u64, room),
+                Err(ElfError::Program(Error::Outside(_)))
+            ));
+        }
+        let no_code = elf(&[(PF_R, 0x20_0000, 0x1000, b"rodata", 0x474)]);
+        assert_eq!(
+            super::layout(&no_code, no_code.len() as u64, room.clone()),
+            Err(ElfError::Program(Error::BadEntry(0x20_1010)))
+        );
+        let mut f = layout();
+        put(&mut f, 64 + PHDR_SIZE * 2 + 16, &0x20_1000u64.to_le_bytes());
+        assert_eq!(
+            super::layout(&f, f.len() as u64, room),
+            Err(ElfError::Program(Error::Overlap(Part::Code, Part::Data)))
+        );
     }
 }

@@ -11,6 +11,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod loaders;
 pub mod queue;
 pub mod records;
 pub mod signals;

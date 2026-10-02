@@ -41,6 +41,10 @@
 //! sets bit 0 there once input came, and keeps the bytes until READ_TAKE;
 //! READ_CANCEL carries k and answers CANCELLED, or READY with input that
 //! came. A failed data reply leaves its bytes available to the next reader.
+//! CLONE (10): the header alone; the reply is status 0 and one handle, a
+//! new session (SEND, TRANSFER) with a label of the driver's own, for a
+//! child of the client (spec 2, 3.7; 5c).
+//!
 //! Number 4 belongs to TRACE, which comes with milestone 1.4e; 5 and 6
 //! (READ_CANCELABLE, CANCEL_READ of version 1) are retired.
 
@@ -71,16 +75,18 @@ pub enum Method {
     ReadStart = 7,
     ReadTake = 8,
     ReadCancel = 9,
+    Clone = 10,
 }
 
 impl Method {
-    pub const ALL: [Method; 6] = [
+    pub const ALL: [Method; 7] = [
         Method::Write,
         Method::Read,
         Method::Crash,
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
+        Method::Clone,
     ];
 
     pub const fn number(self) -> u16 {
@@ -263,7 +269,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed() {
-        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 7, 8, 9]);
+        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 7, 8, 9, 10]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));

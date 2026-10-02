@@ -38,6 +38,68 @@ pub fn directory_entry(path: &str, index: u32) -> Result<Option<(&'static str, u
     Ok(entries.get(index as usize).copied())
 }
 
+/// The effective IDs an exec is checked with (proto_process Vouch of the
+/// loader: those of the record it loads).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Who {
+    pub euid: u32,
+    pub egid: u32,
+}
+
+/// A program file OpenExec found (spec 2, 3.2; 5c): the entry of the
+/// image's table the image session reads, and its mode and owner, whose
+/// set-ID bits the service tells the process service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Exec {
+    pub entry: u16,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Who OpenExec opens a program for (condition O1): a request through the session
+/// of the loaders, whose label init marks (`proto_fs::is_loaders`), and an
+/// identity the process service vouched for as a loader's that loads
+/// (`who`, None when it refused): the effective IDs of the record the
+/// loader loads, its PID and the loader's ticket. PERMISSION otherwise.
+pub fn exec_for(
+    label: u64,
+    who: Option<proto_process::WhoReply>,
+) -> Result<(Who, u32, proto_process::LoaderOf), u32> {
+    if !proto_fs::is_loaders(label) {
+        return Err(proto_fs::PERMISSION);
+    }
+    let who = who.ok_or(proto_fs::PERMISSION)?;
+    let loader = who.loader.ok_or(proto_fs::PERMISSION)?;
+    let ids = Who {
+        euid: who.credentials.euid,
+        egid: who.credentials.egid,
+    };
+    Ok((ids, who.pid, loader))
+}
+
+/// The set-user-ID and set-group-ID bits of a mode.
+pub const SET_UID: u32 = 0o4000;
+pub const SET_GID: u32 = 0o2000;
+
+/// Whether `who` may do what `bit` of the class names (0o1 execute or
+/// search, of the owner, the group or the others by its effective IDs)
+/// on a node of `info`. Root may search any directory and execute a file
+/// with any execute bit.
+fn may(info: &NodeInfo, who: Who, bit: u32) -> bool {
+    if who.euid == 0 {
+        return info.kind == DIR || info.permissions & 0o111 != 0;
+    }
+    let class = if who.euid == info.uid {
+        info.permissions >> 6
+    } else if who.egid == info.gid {
+        info.permissions >> 3
+    } else {
+        info.permissions
+    };
+    class & bit != 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DirectoryRecord<'a> {
     pub name: &'a str,
@@ -246,6 +308,83 @@ impl<'a> Ram<'a> {
 
     pub fn information(&self, path: &str) -> Result<NodeInfo, u32> {
         Ok(self.node_information(self.resolve(path)?))
+    }
+
+    /// OpenExec's resolution of `path` for `who`, in one step of the
+    /// service (condition O3): the path is made plain (`.` goes, `..` takes the
+    /// directory back, and above `/` names nothing: NO_ENTRY), every
+    /// directory on the way needs search by `who` (ACCESS_DENIED) and
+    /// is one (NOT_DIRECTORY); the last is a regular file of the image
+    /// that `who` may execute: ACCESS_DENIED for a directory or a file
+    /// without execute, NO_ENTRY for none.
+    pub fn exec(&self, path: &str, who: Who) -> Result<Exec, u32> {
+        let mut plain = [0u8; proto_fs::MAX_PATH];
+        let mut len = 0;
+        for part in path.split('/').filter(|p| !p.is_empty() && *p != ".") {
+            if part == ".." {
+                if len == 0 {
+                    return Err(NO_ENTRY);
+                }
+                len = plain[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                continue;
+            }
+            let end = len + 1 + part.len();
+            let room = plain.get_mut(len..end).ok_or(proto_fs::INVALID_ARGUMENT)?;
+            room[0] = b'/';
+            room[1..].copy_from_slice(part.as_bytes());
+            let directory = core::str::from_utf8(&plain[..len.max(1)]).map_err(|_| NO_ENTRY)?;
+            let directory = if len == 0 { "/" } else { directory };
+            let info = self.information(directory)?;
+            if info.kind != DIR {
+                return Err(proto_fs::NOT_DIRECTORY);
+            }
+            if !may(&info, who, 0o1) {
+                return Err(proto_fs::ACCESS_DENIED);
+            }
+            len = end;
+        }
+        let plain = core::str::from_utf8(&plain[..len]).map_err(|_| NO_ENTRY)?;
+        let file = if plain.is_empty() {
+            File::Root
+        } else {
+            self.resolve(plain)?
+        };
+        let info = self.node_information(file);
+        if info.kind != REG || !may(&info, who, 0o1) {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        let File::ImageRegular(entry) = file else {
+            return Err(proto_fs::ACCESS_DENIED);
+        };
+        Ok(Exec {
+            entry,
+            mode: info.permissions,
+            uid: info.uid,
+            gid: info.gid,
+        })
+    }
+
+    /// The information of the program file of an image session.
+    pub fn image_information(&self, entry: u16) -> Result<NodeInfo, u32> {
+        let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
+        if entry >= tree.len() || tree.entry(entry).is_directory() {
+            return Err(NO_ENTRY);
+        }
+        Ok(self.node_information(File::ImageRegular(entry)))
+    }
+
+    /// ReadAt of an image session: the bytes of the program file `entry`
+    /// from `offset`; the time of the image does not change.
+    pub fn image_read(&self, entry: u16, offset: u64, out: &mut [u8]) -> Result<usize, u32> {
+        self.image_information(entry)?;
+        if i64::try_from(offset).is_err() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let bytes = self.bytes(File::ImageRegular(entry));
+        let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
+        let n = out.len().min(bytes.len() - start);
+        out[..n].copy_from_slice(&bytes[start..start + n]);
+        Ok(n)
     }
 
     fn node_information(&self, file: File) -> NodeInfo {
@@ -1142,5 +1281,101 @@ mod tests {
         let ram = Ram::default();
         assert_eq!(ram.information("/bin"), Err(NO_ENTRY));
         assert_eq!(ram.lookup("/bin/ash"), Err(NO_ENTRY));
+    }
+
+    /// OpenExec opens for a loader alone: through the session of the
+    /// loaders, with an identity the process service vouched for as a
+    /// loader's; another session, a refused Vouch and a process's own
+    /// identity get PERMISSION.
+    #[test]
+    fn exec_is_for_a_loader_through_the_loaders_session() {
+        use proto_process::{Credentials, LoaderOf, WhoReply};
+        let loader = LoaderOf {
+            image: 1,
+            ticket: 3 << 8 | 2,
+        };
+        let who = WhoReply {
+            pid: 300,
+            credentials: Credentials {
+                euid: 0,
+                ..Credentials::NOBODY
+            },
+            generation: 1,
+            loader: Some(loader),
+        };
+        let loaders = proto_fs::LOADERS | 9;
+        assert_eq!(
+            exec_for(loaders, Some(who)),
+            Ok((
+                Who {
+                    euid: 0,
+                    egid: 65534
+                },
+                300,
+                loader
+            ))
+        );
+        let refused = Err(proto_fs::PERMISSION);
+        assert_eq!(exec_for(9, Some(who)), refused, "a client's session");
+        assert_eq!(exec_for(proto_fs::OWN | 9, Some(who)), refused, "a clone");
+        assert_eq!(exec_for(loaders, None), refused, "Vouch refused");
+        let process = WhoReply {
+            loader: None,
+            ..who
+        };
+        assert_eq!(exec_for(loaders, Some(process)), refused, "no loader");
+    }
+
+    /// OpenExec resolves in one step for the loader's effective IDs:
+    /// search on every directory, execute on the file, `.` and `..`
+    /// within the tree and none above `/`, and a regular file of the
+    /// image; the set-ID bits come with the owner.
+    #[test]
+    fn exec_checks_search_and_execute_for_the_loaders_ids() {
+        let bytes = image();
+        let mut index = Index::new();
+        let ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let root = Who { euid: 0, egid: 0 };
+        let nobody = Who {
+            euid: 65534,
+            egid: 65534,
+        };
+        let owner = Who { euid: 3, egid: 9 };
+        let ash = ram.exec("/bin/ash", nobody).unwrap();
+        assert_eq!((ash.mode, ash.uid, ash.gid), (0o4755, 3, 4));
+        assert_eq!(ram.exec("/bin/./ash", nobody), Ok(ash));
+        assert_eq!(ram.exec("/lib/../bin/ash", nobody), Ok(ash));
+        assert_eq!(ram.exec("//bin//ash", nobody), Ok(ash));
+        // `..` above the root names nothing.
+        assert_eq!(ram.exec("/../bin/ash", nobody), Err(NO_ENTRY));
+        assert_eq!(ram.exec("/bin/../../bin/ash", nobody), Err(NO_ENTRY));
+        // /bin/sub is 0700 of root: no search for others, root passes,
+        // and b (0640) has no execute bit even for root.
+        assert_eq!(ram.exec("/bin/sub/b", nobody), Err(proto_fs::ACCESS_DENIED));
+        assert_eq!(ram.exec("/bin/sub/b", root), Err(proto_fs::ACCESS_DENIED));
+        assert_eq!(ram.exec("/bin/ash", owner).map(|e| e.entry), Ok(ash.entry));
+        // A directory, a file of the fixed tree, a file on the way.
+        assert_eq!(ram.exec("/bin", root), Err(proto_fs::ACCESS_DENIED));
+        assert_eq!(ram.exec("/etc/motd", root), Err(proto_fs::ACCESS_DENIED));
+        assert_eq!(ram.exec("/bin/ash/x", root), Err(proto_fs::NOT_DIRECTORY));
+        assert_eq!(ram.exec("/bin/none", root), Err(NO_ENTRY));
+        assert_eq!(ram.exec("/", root), Err(proto_fs::ACCESS_DENIED));
+        // An executable file under a directory only root may search.
+        let locked = test_image(&[
+            entry("/sbin", DIRECTORY | 0o700, 0),
+            entry("/sbin/x", REGULAR | 0o755, 1),
+        ]);
+        let mut locked_index = Index::new();
+        let locked = Ram::with_tree(10, load(&locked, &mut locked_index).unwrap());
+        assert_eq!(locked.exec("/sbin/x", nobody), Err(proto_fs::ACCESS_DENIED));
+        assert!(locked.exec("/sbin/x", root).is_ok());
+        // The image session reads the file and nothing else.
+        let mut out = [0; 4];
+        assert_eq!(ram.image_read(ash.entry, 0, &mut out), Ok(4));
+        assert_eq!(ram.image_information(ash.entry).unwrap().size, 11);
+        let bin = ram.exec("/bin/sub", root);
+        assert!(bin.is_err());
+        assert_eq!(ram.image_read(0, 0, &mut out), Err(NO_ENTRY), "a directory");
+        assert_eq!(ram.image_read(99, 0, &mut out), Err(NO_ENTRY));
     }
 }

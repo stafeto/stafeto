@@ -1,17 +1,15 @@
 [package]
-name = "ramfs"
+name = "loader"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
-license = "GPL-3.0-or-later"
-description = "Small writable RAM file service for early stafeto userspace"
-
-[lib]
-bench = false
+license = "GPL-3.0-or-later WITH GCC-exception-3.1"
+description = "The loader of POSIX programs from files: it runs in the new process, which pays for the program's image"
+build = "build.rs"
 
 [[bin]]
-name = "ramfs"
+name = "loader"
 test = false
 bench = false
 
@@ -19,12 +17,7 @@ bench = false
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 proto-fs = { path = "../../proto/fs" }
-proto-init = { path = "../../proto/init" }
+proto-loader = { path = "../../proto/loader" }
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
-
-[target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }
-
-[dev-dependencies]
-bootimg = { path = "../../lib/bootimg", features = ["write"] }

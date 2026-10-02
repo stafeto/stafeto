@@ -211,7 +211,7 @@ struct Entry {
     watch: Option<Watched>,
     /// Each with the client's base priority and whether its session is a
     /// notary session of the process service (`connect`).
-    waiting: [Option<(Pending, u8, bool)>; WAITING_MAX],
+    waiting: [Option<(Pending, u8, Grant)>; WAITING_MAX],
     /// The record's timer on init's channel, its slot at the record's
     /// ceiling, and its deadline: the watchdog deadline (STARTING,
     /// RUNNING), the end of the pause before a restart (STOPPING, PAUSED)
@@ -1117,8 +1117,8 @@ impl Init {
             entries, labels, ..
         } = self;
         let entry = &mut entries[place];
-        for (p, priority, notary) in entry.waiting.iter_mut().filter_map(Option::take) {
-            let _ = match session(labels, &channel, priority, notary) {
+        for (p, priority, grant) in entry.waiting.iter_mut().filter_map(Option::take) {
+            let _ = match session(labels, &channel, priority, grant) {
                 Ok(copy) => p.answer(&proto_wire::reply(Status::Ok), [copy.erase()]),
                 Err(e) => p.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new()),
             };
@@ -1194,6 +1194,26 @@ impl Init {
             && !client.is_client()
             && !client.is_posix()
             && table::VOUCHERS.contains(&client.name);
+        // A file service of SET_ID_VOUCHERS may say a file is set-ID
+        // (proto_process::SET_ID); the process service's session with
+        // the RAM file service is that of the loaders, which it copies
+        // for each (proto_fs::LOADERS).
+        let grant = if notary {
+            let set_id = table::SET_ID_VOUCHERS.contains(&client.name);
+            Grant {
+                mark: proto_process::NOTARY | if set_id { proto_process::SET_ID } else { 0 },
+                duplicate: false,
+            }
+        } else if client.name == table::PROCESS_SERVICE
+            && name.as_bytes() == table::RAM_SERVICE.as_bytes()
+        {
+            Grant {
+                mark: proto_fs::LOADERS,
+                duplicate: true,
+            }
+        } else {
+            Grant::PLAIN
+        };
         let allowed = notary
             || (name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
                 && client
@@ -1214,7 +1234,7 @@ impl Init {
             return refuse(Error::PeerClosed);
         }
         if let Some(channel) = open(service) {
-            return match session(labels, channel, client.priority, notary) {
+            return match session(labels, channel, client.priority, grant) {
                 Ok(copy) => {
                     let _ = r.reply().bytes(&proto_wire::reply(Status::Ok));
                     Answer::Reply([copy.erase()].into())
@@ -1226,7 +1246,7 @@ impl Init {
             return refuse(Error::LimitReached);
         };
         if let Some(pending) = r.defer() {
-            *free = Some((pending, client.priority, notary));
+            *free = Some((pending, client.priority, grant));
         }
         Answer::Deferred
     }
@@ -1347,25 +1367,42 @@ fn open(entry: &Entry) -> Option<&Handle<Channel>> {
     matches!(sys::channel_info(channel), Ok(info) if !info.closed).then_some(channel)
 }
 
+/// What a session CONNECT gives carries besides the next label: a mark
+/// in its label only init gives (proto_process::NOTARY and SET_ID for a
+/// voucher's notary session, proto_fs::LOADERS for the process service's
+/// session of the loaders), and DUPLICATE for a session its holder copies
+/// (the loaders').
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grant {
+    mark: u64,
+    duplicate: bool,
+}
+
+impl Grant {
+    const PLAIN: Grant = Grant {
+        mark: 0,
+        duplicate: false,
+    };
+}
+
 /// A session of a client with a service (spec 13.4): a copy of the
-/// service's registered `channel` with SEND and TRANSFER and no DUPLICATE,
-/// the next of `labels`, and a slot at `priority`, the client's base
-/// priority; a notary session of the process service carries
-/// proto_process::NOTARY in its label, which only init gives. The errors
-/// are those of handle_label.
+/// service's registered `channel` with SEND and TRANSFER, and DUPLICATE
+/// only as `grant` says, the next of `labels` with the mark of `grant`,
+/// and a slot at `priority`, the client's base priority. The errors are
+/// those of handle_label.
 fn session(
     labels: &mut Labels,
     channel: &Handle<Channel>,
     priority: u8,
-    notary: bool,
+    grant: Grant,
 ) -> Result<Handle<Channel>, Error> {
-    let label = labels.next().expect("init gave every label");
-    let label = if notary {
-        label | proto_process::NOTARY
+    let label = labels.next().expect("init gave every label") | grant.mark;
+    let rights = if grant.duplicate {
+        Rights::SEND | Rights::TRANSFER | Rights::DUPLICATE
     } else {
-        label
+        Rights::SEND | Rights::TRANSFER
     };
-    sys::handle_label(channel, Rights::SEND | Rights::TRANSFER, label, priority)
+    sys::handle_label(channel, rights, label, priority)
 }
 
 /// A refusal with the error `e` as its status.

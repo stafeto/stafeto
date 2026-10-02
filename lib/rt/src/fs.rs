@@ -117,6 +117,18 @@ impl Files {
         })
     }
 
+    /// Files through sessions the program was given: its own session with
+    /// the RAM file service and, for input, with the console's driver (a
+    /// POSIX program its loader started, spec 2, 3.2).
+    pub fn from_sessions(channel: Handle<Channel>, uart: Option<Handle<Channel>>) -> Self {
+        Self { channel, uart }
+    }
+
+    /// The session with the RAM file service and the console's driver's.
+    pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
+        (&self.channel, self.uart.as_ref())
+    }
+
     /// Snapshot the input endpoint; this Files retains its UART session.
     pub fn input(&self) -> Input {
         Input {

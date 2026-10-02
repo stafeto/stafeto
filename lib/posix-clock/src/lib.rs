@@ -29,6 +29,17 @@ impl Client {
             vouched: core::sync::atomic::AtomicBool::new(false),
         })
     }
+    /// A client through `channel`, a session the program was given.
+    pub fn from_session(channel: Handle<Channel>) -> Self {
+        Self {
+            channel,
+            vouched: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    /// The session, which a child gets a clone of.
+    pub fn session(&self) -> &Handle<Channel> {
+        &self.channel
+    }
     fn call<'a>(
         &self,
         request: &[u8],

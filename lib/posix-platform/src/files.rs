@@ -488,6 +488,11 @@ pub extern "C" fn stafeto_setresgid(real: u32, effective: u32, saved: u32) -> c_
 
 static UMASK: AtomicU32 = AtomicU32::new(0o022);
 
+/// The process's umask, which a child spawned from a file inherits.
+pub(crate) fn umask() -> u32 {
+    UMASK.load(Ordering::Relaxed)
+}
+
 /// umask: the process's mask (no file the layer creates reads it yet).
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_umask(mask: u32) -> u32 {

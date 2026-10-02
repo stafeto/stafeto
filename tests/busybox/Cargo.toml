@@ -12,6 +12,9 @@ build = "build.rs"
 ash-probe = []
 ash-interactive = ["posix-crt/uart-input"]
 ls-probe = []
+# BusyBox as the program of a file (posix_spawn, 5c): the applet and its
+# arguments are the program's own argv.
+applets = []
 
 [[bin]]
 name = "busybox-probe"

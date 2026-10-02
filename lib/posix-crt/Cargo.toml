@@ -19,6 +19,7 @@ uart-input = []
 
 [dependencies]
 proto-init = { path = "../../proto/init" }
+proto-loader = { path = "../../proto/loader" }
 posix-abi = { path = "../posix-abi" }
 posix-fs = { path = "../posix-fs" }
 posix-platform = { path = "../posix-platform" }

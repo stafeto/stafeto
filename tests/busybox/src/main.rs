@@ -25,8 +25,18 @@ unsafe extern "C" {
     fn busybox_main(argc: c_int, argv: *const *const c_char) -> c_int;
 }
 
+/// BusyBox's dispatcher with the program's own arguments.
+#[cfg(feature = "applets")]
+#[unsafe(no_mangle)]
+extern "C" fn main(argc: isize, argv: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
+    // SAFETY: relibc's start gives argv with argc strings and a final null
+    // pointer; BusyBox's dispatcher takes the applet from argv[0].
+    unsafe { busybox_main(argc as c_int, argv.cast()) }
+}
+
 /// The probe's C main: the applet and its arguments of the build's
 /// feature, then BusyBox's dispatcher.
+#[cfg(not(feature = "applets"))]
 #[unsafe(no_mangle)]
 extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
     #[cfg(not(any(

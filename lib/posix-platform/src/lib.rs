@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 7;
+pub const PLATFORM_INTERFACE: u64 = 8;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -335,19 +335,105 @@ pub unsafe extern "C" fn stafeto_waitid(
     }
 }
 
-/// posix_spawn of the program at `path` (posix_abi::process::spawn): the
+/// What relibc's posix_spawn gives of its attributes: the spawn-flags
+/// and the process group, the masks of POSIX_SPAWN_SETSIGMASK and
+/// POSIX_SPAWN_SETSIGDEF (bit n - 1 for signal n).
+#[repr(C)]
+pub struct SpawnAttributes {
+    flags: c_int,
+    pgroup: c_int,
+    mask: u64,
+    default: u64,
+}
+
+/// The strings of the NULL-ended list `list` of C strings, without NULs.
+///
+/// # Safety
+/// `list` is null or a NULL-ended array of C strings that live through
+/// the call.
+unsafe fn strings<'a>(list: *const *const c_char) -> impl Iterator<Item = &'a [u8]> + Clone {
+    let mut i = 0;
+    core::iter::from_fn(move || {
+        if list.is_null() {
+            return None;
+        }
+        // SAFETY: the caller's promise: the array ends with NULL.
+        let p = unsafe { *list.add(i) };
+        if p.is_null() {
+            return None;
+        }
+        i += 1;
+        // SAFETY: as above, each entry is a C string.
+        Some(unsafe { core::ffi::CStr::from_ptr(p) }.to_bytes())
+    })
+}
+
+/// posix_spawn of the program at `path` with `argv`, `envp` and the
+/// attributes at `attributes` (null for none): from a file through the
+/// loader (posix_abi::process::spawn_file, 5c), or, for a path under
+/// `/boot/`, the record of init's table that starts on demand (5b,
+/// posix_abi::process::spawn), which takes the table's arguments. The
 /// child's PID, or the negated errno.
+///
+/// # Safety
+/// `path` is a C string; `argv` and `envp` are null or NULL-ended arrays
+/// of C strings; `attributes` is null or points to SpawnAttributes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_spawn(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    attributes: *const SpawnAttributes,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+    // SAFETY: as above.
+    let attributes = unsafe { attributes.as_ref() };
+    let (flags, pgroup) = attributes.map_or((0, 0), |a| (a.flags, a.pgroup));
+    if path.starts_with(b"/boot/") {
+        let old = proto_process::SPAWN_SETPGROUP | proto_process::SPAWN_SETSID;
+        let flags = if flags as u32 & !old == 0 { flags } else { -1 };
+        return match call(|| posix_abi::process::spawn(path, flags, pgroup)) {
+            Ok(pid) => pid,
+            Err(errno) => -errno,
+        };
+    }
+    let (Ok(flags), Ok(pgroup)) = (u32::try_from(flags), u32::try_from(pgroup)) else {
+        return -posix_abi::constants::EINVAL;
+    };
+    let mask = attributes
+        .filter(|_| flags & proto_process::SPAWN_SETSIGMASK != 0)
+        .map(|a| a.mask);
+    let default = attributes
+        .filter(|_| flags & proto_process::SPAWN_SETSIGDEF != 0)
+        .map_or(0, |a| a.default);
+    let umask = files::umask();
+    let attributes = posix_abi::process::SpawnAttributes {
+        flags,
+        pgroup,
+        mask,
+        default,
+        umask,
+    };
+    // SAFETY: the caller's promise for argv and envp.
+    let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
+    match call(|| posix_abi::process::spawn_file(path, argv.clone(), envp.clone(), attributes)) {
+        Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
+}
+
+/// OPEN_EXEC through the process's own session with the RAM file
+/// service (posix_abi::process::probe_open_exec): 0 or the errno, for the
+/// probes of 5c.
 ///
 /// # Safety
 /// `path` is a C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stafeto_spawn(path: *const c_char, flags: c_int, pgroup: c_int) -> c_int {
+pub unsafe extern "C" fn stafeto_probe_open_exec(path: *const c_char) -> c_int {
     // SAFETY: the caller's promise.
     let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
-    match call(|| posix_abi::process::spawn(path, flags, pgroup)) {
-        Ok(pid) => pid,
-        Err(errno) => -errno,
-    }
+    posix_abi::process::probe_open_exec(path)
 }
 
 const PAGE: usize = 4096;

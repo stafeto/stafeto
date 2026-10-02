@@ -38,4 +38,5 @@ posix-credentials = { path = "../../lib/posix-credentials" }
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
 bootimg = { path = "../../lib/bootimg" }
+proto-loader = { path = "../../proto/loader" }
 rt = { path = "../../lib/rt" }

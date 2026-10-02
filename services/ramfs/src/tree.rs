@@ -179,6 +179,15 @@ impl<'a> Tree<'a> {
         self.table.find(path).map(|n| n as u16)
     }
 
+    /// The entries of the table.
+    pub fn len(&self) -> u16 {
+        self.table.len() as u16
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn entry(&self, n: u16) -> Entry<'a> {
         self.table.entry(u32::from(n))
     }
