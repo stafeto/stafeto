@@ -95,7 +95,14 @@ fn unknown_versions_methods_reserved_fields_and_invalid_paths_are_rejected() {
     header = Header::new(10, VERSION).bytes();
     header[7] = 1;
     assert_eq!(Request::read(&header), Err(Status::BadSize));
-    for path in [&[b'x'; 129][..], &b"a\0b"[..]] {
+    // 511 bytes of path and the terminator make PATH_MAX (512).
+    assert_eq!(MAX_PATH, 511);
+    assert!(
+        Request::Stat { path: &[b'x'; 511] }
+            .write(&mut Writer::new())
+            .is_ok()
+    );
+    for path in [&[b'x'; 512][..], &b"a\0b"[..]] {
         assert_eq!(
             Request::Stat { path }.write(&mut Writer::new()),
             Err(Status::BadSize)

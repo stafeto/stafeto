@@ -19,6 +19,11 @@
 //! READ_DIR_FD: header, fd u32. Reply: status u32, kind u32, inode u64,
 //! name bytes. At end, kind/inode are zero and name is empty. The service
 //! advances the open-description position and updates directory access time.
+//! READ_AT: header, fd u32, offset u64, count u32. Reply: status, count u32,
+//! bytes. The bytes start at the offset of the file; the position of the
+//! open description stays where it is (the model of pread).
+//! Paths are at most MAX_PATH bytes, which leaves room for the terminator
+//! within the 512 bytes of PATH_MAX.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -31,7 +36,7 @@ use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Status};
 
 pub const VERSION: u16 = 1;
-pub const MAX_PATH: usize = 128;
+pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
 
@@ -96,6 +101,7 @@ pub enum Method {
     InfoFd = 10,
     InfoPath = 11,
     ReadDirFd = 12,
+    ReadAt = 13,
 }
 
 impl Method {
@@ -117,12 +123,13 @@ impl Method {
             10 => Some(Self::InfoFd),
             11 => Some(Self::InfoPath),
             12 => Some(Self::ReadDirFd),
+            13 => Some(Self::ReadAt),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
@@ -142,5 +149,27 @@ mod tests {
         }
         assert_eq!(valid_path(b"/tmp/a"), Ok("/tmp/a"));
         assert_eq!(valid_path(b"/"), Ok("/"));
+    }
+
+    #[test]
+    fn paths_take_511_bytes_and_a_request_with_them_fits_a_message() {
+        // PATH_MAX is 512 with the terminator.
+        assert_eq!(MAX_PATH + 1, 512);
+        let mut path = [b'a'; MAX_PATH + 1];
+        path[0] = b'/';
+        assert_eq!(valid_path(&path[..MAX_PATH]).map(str::len), Ok(MAX_PATH));
+        assert_eq!(valid_path(&path), Err(Status::BadSize));
+        const { assert!(HEADER_LEN + 4 + MAX_PATH <= MESSAGE_MAX) };
+    }
+
+    #[test]
+    fn every_method_number_round_trips_and_is_listed() {
+        for number in 0..=14u16 {
+            let method = Method::from_number(number);
+            assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
+            if let Some(method) = method {
+                assert_eq!(method as u16, number);
+            }
+        }
     }
 }

@@ -3,17 +3,27 @@
 
 //! Bounded RAM files and per-client open descriptions for the first POSIX
 //! userspace experiment. A single service thread owns `Ram`; each IPC
-//! session owns its own `Fds`, so closing a session closes its files.
+//! session owns its own `Fds`, so closing a session closes its files. Next
+//! to its fixed tree (`/etc/motd`, the scratch file `/tmp/probe`) the
+//! service shows the files of the boot image's table `rootfs` (`tree`),
+//! read-only, with the modes and owners of the table, and reads them from
+//! the mapped image as they lie.
 
 #![cfg_attr(not(test), no_std)]
+
+pub mod tree;
 
 use proto_fs::{
     BAD_FD, IS_DIRECTORY, Metadata, NO_ENTRY, NO_SPACE, NodeInfo, READ_ONLY, WRITE_ONLY,
 };
+use tree::Tree;
 
 const FILE_CAPACITY: usize = 1024;
 const OPEN_MAX: usize = 32;
 const MOTD: &[u8] = b"stafeto ramfs\n";
+/// The inode of entry `n` of the table is this plus the number of the
+/// first entry that names its file (the fixed tree has 1 to 5).
+const IMAGE_INODE: u64 = 6;
 
 pub const DIR: u32 = 1;
 pub const REG: u32 = 2;
@@ -29,23 +39,22 @@ pub fn directory_entry(path: &str, index: u32) -> Result<Option<(&'static str, u
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectoryRecord {
-    pub name: &'static str,
+pub struct DirectoryRecord<'a> {
+    pub name: &'a str,
     pub kind: u32,
     pub inode: u64,
 }
 
-fn directory_count(path: &str) -> i64 {
-    if path == "/" { 4 } else { 3 }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum File {
     Root,
     Etc,
     Tmp,
     Motd,
     Scratch,
+    /// Entry `n` of the table, a directory or a regular file.
+    ImageDir(u16),
+    ImageRegular(u16),
 }
 
 #[derive(Clone, Copy)]
@@ -68,25 +77,7 @@ impl Default for Fds {
 }
 
 impl Fds {
-    pub fn open(&mut self, path: &str, flags: u32) -> Result<u32, u32> {
-        if flags & !7 != 0 || flags & 3 == 3 {
-            return Err(proto_wire::BAD_SIZE);
-        }
-        let directory_only = flags & proto_fs::DIRECTORY_ONLY != 0;
-        let flags = flags & 3;
-        let file = match path {
-            "/" | "/etc" | "/tmp" if flags != READ_ONLY => return Err(IS_DIRECTORY),
-            "/" => File::Root,
-            "/etc" => File::Etc,
-            "/tmp" => File::Tmp,
-            "/etc/motd" if flags == READ_ONLY => File::Motd,
-            "/etc/motd" => return Err(proto_fs::ACCESS_DENIED),
-            "/tmp/probe" => File::Scratch,
-            _ => return Err(NO_ENTRY),
-        };
-        if directory_only && !file.is_directory() {
-            return Err(proto_fs::NOT_DIRECTORY);
-        }
+    fn insert(&mut self, file: File, flags: u32) -> Result<u32, u32> {
         let slot = self
             .open
             .iter_mut()
@@ -135,43 +126,39 @@ struct FileTimes {
 
 impl File {
     fn is_directory(self) -> bool {
-        matches!(self, Self::Root | Self::Etc | Self::Tmp)
+        matches!(self, Self::Root | Self::Etc | Self::Tmp | Self::ImageDir(_))
     }
 
-    fn index(self) -> usize {
+    /// The place of a file of the fixed tree among its times; the files of
+    /// the image are read-only and keep the time the service started.
+    fn index(self) -> Option<usize> {
         match self {
-            Self::Root => 0,
-            Self::Etc => 1,
-            Self::Tmp => 2,
-            Self::Motd => 3,
-            Self::Scratch => 4,
-        }
-    }
-
-    fn path(self) -> &'static str {
-        match self {
-            Self::Root => "/",
-            Self::Etc => "/etc",
-            Self::Tmp => "/tmp",
-            Self::Motd => "/etc/motd",
-            Self::Scratch => "/tmp/probe",
+            Self::Root => Some(0),
+            Self::Etc => Some(1),
+            Self::Tmp => Some(2),
+            Self::Motd => Some(3),
+            Self::Scratch => Some(4),
+            Self::ImageDir(_) | Self::ImageRegular(_) => None,
         }
     }
 }
 
-pub struct Ram {
+pub struct Ram<'a> {
     scratch: [u8; FILE_CAPACITY],
     len: usize,
     times: [FileTimes; 5],
+    /// When the service started: the times of the files of the image.
+    born: u64,
+    tree: Option<Tree<'a>>,
 }
 
-impl Default for Ram {
+impl Default for Ram<'_> {
     fn default() -> Self {
         Self::new(0)
     }
 }
 
-impl Ram {
+impl<'a> Ram<'a> {
     /// Seeded namespace with one creation time on the caller's file clock.
     pub fn new(now: u64) -> Self {
         Self {
@@ -182,40 +169,145 @@ impl Ram {
                 modify: now,
                 change: now,
             }; 5],
+            born: now,
+            tree: None,
         }
     }
 
+    /// `new` with the files of the boot image's table as well.
+    pub fn with_tree(now: u64, tree: Tree<'a>) -> Self {
+        Self {
+            tree: Some(tree),
+            ..Self::new(now)
+        }
+    }
+
+    fn resolve(&self, path: &str) -> Result<File, u32> {
+        Ok(match path {
+            "/" => File::Root,
+            "/etc" => File::Etc,
+            "/tmp" => File::Tmp,
+            "/etc/motd" => File::Motd,
+            "/tmp/probe" => File::Scratch,
+            _ => {
+                let tree = self.tree.as_ref().ok_or(NO_ENTRY)?;
+                let n = tree.find(path).ok_or(NO_ENTRY)?;
+                if tree.entry(n).is_directory() {
+                    File::ImageDir(n)
+                } else {
+                    File::ImageRegular(n)
+                }
+            }
+        })
+    }
+
+    pub fn open(&self, fds: &mut Fds, path: &str, flags: u32) -> Result<u32, u32> {
+        if flags & !7 != 0 || flags & 3 == 3 {
+            return Err(proto_wire::BAD_SIZE);
+        }
+        let directory_only = flags & proto_fs::DIRECTORY_ONLY != 0;
+        let flags = flags & 3;
+        let file = self.resolve(path)?;
+        if file.is_directory() && flags != READ_ONLY {
+            return Err(IS_DIRECTORY);
+        }
+        if matches!(file, File::Motd | File::ImageRegular(_)) && flags != READ_ONLY {
+            return Err(proto_fs::ACCESS_DENIED);
+        }
+        if directory_only && !file.is_directory() {
+            return Err(proto_fs::NOT_DIRECTORY);
+        }
+        fds.insert(file, flags)
+    }
+
+    fn touch_access(&mut self, file: File, now: u64) {
+        if let Some(index) = file.index() {
+            self.times[index].access = now;
+        }
+    }
+
+    fn inode(&self, file: File) -> u64 {
+        match file {
+            File::Root => 1,
+            File::Etc => 2,
+            File::Tmp => 3,
+            File::Motd => 4,
+            File::Scratch => 5,
+            File::ImageDir(n) | File::ImageRegular(n) => {
+                IMAGE_INODE + u64::from(self.tree().canonical(n))
+            }
+        }
+    }
+
+    /// The tree of a file of the image, which only a tree gives.
+    fn tree(&self) -> &Tree<'a> {
+        self.tree.as_ref().expect("files of the image need a tree")
+    }
+
     pub fn information(&self, path: &str) -> Result<NodeInfo, u32> {
-        let (kind, inode, links, permissions, file) = match path {
-            "/" => (DIR, 1, 4, 0o555, File::Root),
-            "/etc" => (DIR, 2, 2, 0o555, File::Etc),
-            "/tmp" => (DIR, 3, 2, 0o555, File::Tmp),
-            "/etc/motd" => (REG, 4, 1, 0o444, File::Motd),
-            "/tmp/probe" => (REG, 5, 1, 0o644, File::Scratch),
-            _ => return Err(NO_ENTRY),
-        };
+        Ok(self.node_information(self.resolve(path)?))
+    }
+
+    fn node_information(&self, file: File) -> NodeInfo {
         let size = self.bytes(file).len() as u64;
-        let times = self.times[file.index()];
-        Ok(NodeInfo {
+        let (kind, links, permissions, uid, gid, times) = match file {
+            File::ImageDir(n) | File::ImageRegular(n) => {
+                let entry = self.tree().entry(n);
+                let kind = if file.is_directory() { DIR } else { REG };
+                let times = FileTimes {
+                    access: self.born,
+                    modify: self.born,
+                    change: self.born,
+                };
+                let links = u64::from(self.tree().links(n));
+                (
+                    kind,
+                    links,
+                    entry.mode & 0o7777,
+                    entry.uid,
+                    entry.gid,
+                    times,
+                )
+            }
+            _ => {
+                let (kind, links, permissions) = match file {
+                    File::Root => (DIR, 4 + self.root_links(), 0o555),
+                    File::Etc => (DIR, 2, 0o555),
+                    File::Tmp => (DIR, 2, 0o555),
+                    File::Motd => (REG, 1, 0o444),
+                    _ => (REG, 1, 0o644),
+                };
+                let times = self.times[file.index().expect("fixed tree")];
+                (kind, links, permissions, 0, 0, times)
+            }
+        };
+        NodeInfo {
             kind,
             permissions,
             device: 1,
             special_device: 0,
-            inode,
+            inode: self.inode(file),
             links,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             size,
             block_size: FILE_CAPACITY as u32,
             blocks: size.div_ceil(512),
             access_ns: times.access,
             modify_ns: times.modify,
             change_ns: times.change,
-        })
+        }
+    }
+
+    /// The directories of the image at `/`: each has a `..` in `/`.
+    fn root_links(&self) -> u64 {
+        self.tree
+            .as_ref()
+            .map_or(0, |tree| u64::from(tree.root_links()))
     }
 
     pub fn descriptor_information(&self, fds: &Fds, fd: u32) -> Result<NodeInfo, u32> {
-        self.information(fds.get(fd)?.file.path())
+        Ok(self.node_information(fds.get(fd)?.file))
     }
 
     /// A successful nonempty request updates atime even when it reads EOF.
@@ -229,7 +321,37 @@ impl Ram {
         let file = fds.get(fd)?.file;
         let n = self.read(fds, fd, out)?;
         if !out.is_empty() {
-            self.times[file.index()].access = now;
+            self.touch_access(file, now);
+        }
+        Ok(n)
+    }
+
+    /// Reads from `offset` of the file and leaves the position of the open
+    /// description where it is. The offset is at most `i64::MAX`.
+    pub fn pread(
+        &mut self,
+        fds: &Fds,
+        fd: u32,
+        offset: u64,
+        out: &mut [u8],
+        now: u64,
+    ) -> Result<usize, u32> {
+        let open = fds.get(fd)?;
+        if open.file.is_directory() {
+            return Err(IS_DIRECTORY);
+        }
+        if open.flags == WRITE_ONLY {
+            return Err(BAD_FD);
+        }
+        if i64::try_from(offset).is_err() {
+            return Err(proto_fs::INVALID_ARGUMENT);
+        }
+        let bytes = self.bytes(open.file);
+        let start = usize::try_from(offset).map_or(bytes.len(), |o| o.min(bytes.len()));
+        let n = out.len().min(bytes.len() - start);
+        out[..n].copy_from_slice(&bytes[start..start + n]);
+        if !out.is_empty() {
+            self.touch_access(open.file, now);
         }
         Ok(n)
     }
@@ -244,7 +366,7 @@ impl Ram {
         let file = fds.get(fd)?.file;
         let n = self.write(fds, fd, bytes)?;
         if n > 0 {
-            let times = &mut self.times[file.index()];
+            let times = &mut self.times[file.index().expect("only the scratch file is written")];
             times.modify = now;
             times.change = now;
         }
@@ -256,13 +378,13 @@ impl Ram {
         fds: &mut Fds,
         fd: u32,
         now: u64,
-    ) -> Result<Option<DirectoryRecord>, u32> {
+    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
         let open = fds.get_mut(fd)?;
         if !open.file.is_directory() {
             return Err(proto_fs::NOT_DIRECTORY);
         }
         let index = u32::try_from(open.offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
-        let entry = self.directory_read_path(open.file.path(), index, now)?;
+        let entry = self.entry_of(open.file, index, now);
         if entry.is_some() {
             open.offset += 1;
         }
@@ -274,43 +396,109 @@ impl Ram {
         path: &str,
         index: u32,
         now: u64,
-    ) -> Result<Option<DirectoryRecord>, u32> {
-        let info = self.information(path)?;
-        if info.kind != DIR {
+    ) -> Result<Option<DirectoryRecord<'a>>, u32> {
+        let file = self.resolve(path)?;
+        if !file.is_directory() {
             return Err(proto_fs::NOT_DIRECTORY);
         }
-        let entry = directory_entry(path, index)?;
-        self.times[(info.inode - 1) as usize].access = now;
-        Ok(entry.map(|(name, kind)| DirectoryRecord {
-            name,
-            kind,
-            inode: match (path, name) {
-                (_, "..") => 1,
-                (_, ".") => info.inode,
-                ("/", "etc") => 2,
-                ("/", "tmp") => 3,
-                ("/etc", "motd") => 4,
-                ("/tmp", "probe") => 5,
-                _ => unreachable!("static namespace entry"),
-            },
-        }))
+        Ok(self.entry_of(file, index, now))
+    }
+
+    /// Entry `index` of directory `dir`: `.`, `..`, then the fixed
+    /// entries, then the children from the table; the access time of the
+    /// directory is `now`.
+    fn entry_of(&mut self, dir: File, index: u32, now: u64) -> Option<DirectoryRecord<'a>> {
+        self.touch_access(dir, now);
+        let tree = self.tree;
+        let index = index as usize;
+        let name_of = |tree: &Tree<'a>, n: u16| {
+            let path = tree.entry(n).path;
+            &path[path.rfind('/').map_or(0, |slash| slash + 1)..]
+        };
+        // The fixed children of the directory, which come before the image's.
+        let fixed: &[(&'static str, File)] = match dir {
+            File::Root => &[("etc", File::Etc), ("tmp", File::Tmp)],
+            File::Etc => &[("motd", File::Motd)],
+            File::Tmp => &[("probe", File::Scratch)],
+            _ => &[],
+        };
+        match index {
+            0 => Some(DirectoryRecord {
+                name: ".",
+                kind: DIR,
+                inode: self.inode(dir),
+            }),
+            1 => {
+                let parent = match dir {
+                    File::ImageDir(n) => self.tree().parent(n).map(File::ImageDir),
+                    _ => None,
+                };
+                Some(DirectoryRecord {
+                    name: "..",
+                    kind: DIR,
+                    inode: parent.map_or(1, |parent| self.inode(parent)),
+                })
+            }
+            _ => {
+                let index = index - 2;
+                if let Some(&(name, file)) = fixed.get(index) {
+                    return Some(DirectoryRecord {
+                        name,
+                        kind: if file.is_directory() { DIR } else { REG },
+                        inode: self.inode(file),
+                    });
+                }
+                let tree = tree?;
+                let parent = match dir {
+                    File::ImageDir(n) => Some(n),
+                    File::Root => None,
+                    _ => return None,
+                };
+                let n = *tree.children(parent).get(index - fixed.len())?;
+                let file = if tree.entry(n).is_directory() {
+                    File::ImageDir(n)
+                } else {
+                    File::ImageRegular(n)
+                };
+                Some(DirectoryRecord {
+                    name: name_of(&tree, n),
+                    kind: if file.is_directory() { DIR } else { REG },
+                    inode: self.inode(file),
+                })
+            }
+        }
+    }
+
+    /// The entries of a directory, with `.` and `..`.
+    fn directory_count(&self, dir: File) -> i64 {
+        let kids = |parent: Option<u16>| {
+            self.tree
+                .as_ref()
+                .map_or(0, |tree| tree.children(parent).len() as i64)
+        };
+        match dir {
+            File::Root => 4 + kids(None),
+            File::ImageDir(n) => 2 + kids(Some(n)),
+            _ => 3,
+        }
     }
 
     pub fn lookup(&self, path: &str) -> Result<Metadata, u32> {
-        let (kind, size) = match path {
-            "/" | "/etc" | "/tmp" => (DIR, 0),
-            "/etc/motd" => (REG, MOTD.len() as u32),
-            "/tmp/probe" => (REG, self.len as u32),
-            _ => return Err(NO_ENTRY),
+        let file = self.resolve(path)?;
+        let (kind, size) = if file.is_directory() {
+            (DIR, 0)
+        } else {
+            (REG, self.bytes(file).len() as u32)
         };
         Ok(Metadata { kind, size })
     }
 
     fn bytes(&self, file: File) -> &[u8] {
         match file {
-            File::Root | File::Etc | File::Tmp => &[],
+            File::Root | File::Etc | File::Tmp | File::ImageDir(_) => &[],
             File::Motd => MOTD,
             File::Scratch => &self.scratch[..self.len],
+            File::ImageRegular(n) => self.tree().data(n),
         }
     }
 
@@ -333,7 +521,7 @@ impl Ram {
             return Err(INVALID_ARGUMENT);
         }
         let size = if open.file.is_directory() {
-            directory_count(open.file.path())
+            self.directory_count(open.file)
         } else {
             self.bytes(open.file).len() as i64
         };
@@ -383,7 +571,7 @@ impl Ram {
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
-        if open.flags == READ_ONLY || matches!(open.file, File::Motd) {
+        if open.flags == READ_ONLY || matches!(open.file, File::Motd | File::ImageRegular(_)) {
             return Err(BAD_FD);
         }
         if bytes.is_empty() {
@@ -413,14 +601,14 @@ mod tests {
     fn directory_descriptions_keep_positions_identity_and_access_times() {
         let mut ram = Ram::new(10);
         let mut fds = Fds::default();
-        let fd = fds
-            .open("/etc", READ_ONLY | proto_fs::DIRECTORY_ONLY)
+        let fd = ram
+            .open(&mut fds, "/etc", READ_ONLY | proto_fs::DIRECTORY_ONLY)
             .unwrap();
-        let second = fds.open("/etc", READ_ONLY).unwrap();
+        let second = ram.open(&mut fds, "/etc", READ_ONLY).unwrap();
         assert_eq!(ram.descriptor_information(&fds, fd).unwrap().inode, 2);
-        assert_eq!(fds.open("/etc", WRITE_ONLY), Err(IS_DIRECTORY));
+        assert_eq!(ram.open(&mut fds, "/etc", WRITE_ONLY), Err(IS_DIRECTORY));
         assert_eq!(
-            fds.open("/etc/motd", proto_fs::DIRECTORY_ONLY),
+            ram.open(&mut fds, "/etc/motd", proto_fs::DIRECTORY_ONLY),
             Err(proto_fs::NOT_DIRECTORY)
         );
         assert_eq!(
@@ -477,7 +665,7 @@ mod tests {
         );
         fds.close(fd).unwrap();
         assert_eq!(ram.directory_read(&mut fds, fd, 80), Err(BAD_FD));
-        let regular = fds.open("/etc/motd", READ_ONLY).unwrap();
+        let regular = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
         assert_eq!(
             ram.directory_read(&mut fds, regular, 90),
             Err(proto_fs::NOT_DIRECTORY)
@@ -508,11 +696,11 @@ mod tests {
         let mut a = Fds::default();
         let mut b = Fds::default();
         assert_eq!(
-            a.open("/etc/motd", WRITE_ONLY),
+            ram.open(&mut a, "/etc/motd", WRITE_ONLY),
             Err(proto_fs::ACCESS_DENIED)
         );
-        let fa = a.open("/tmp/probe", READ_WRITE).unwrap();
-        let fb = b.open("/tmp/probe", READ_ONLY).unwrap();
+        let fa = ram.open(&mut a, "/tmp/probe", READ_WRITE).unwrap();
+        let fb = ram.open(&mut b, "/tmp/probe", READ_ONLY).unwrap();
         ram.write_at(&mut a, fa, b"abc", 20).unwrap();
         let info = ram.descriptor_information(&b, fb).unwrap();
         assert_eq!(info, ram.information("/tmp/probe").unwrap());
@@ -548,16 +736,17 @@ mod tests {
 
     #[test]
     fn description_limit_reports_emfile_and_recovers_on_close() {
+        let ram = Ram::default();
         let mut fds = Fds::default();
         for expected in 3..OPEN_MAX as u32 + 3 {
-            assert_eq!(fds.open("/etc/motd", READ_ONLY), Ok(expected));
+            assert_eq!(ram.open(&mut fds, "/etc/motd", READ_ONLY), Ok(expected));
         }
         assert_eq!(
-            fds.open("/etc/motd", READ_ONLY),
+            ram.open(&mut fds, "/etc/motd", READ_ONLY),
             Err(proto_fs::TOO_MANY_OPEN_FILES)
         );
         fds.close(7).unwrap();
-        assert_eq!(fds.open("/etc/motd", READ_ONLY), Ok(7));
+        assert_eq!(ram.open(&mut fds, "/etc/motd", READ_ONLY), Ok(7));
     }
 
     #[test]
@@ -585,8 +774,8 @@ mod tests {
         );
         assert_eq!(ram.lookup("/missing"), Err(NO_ENTRY));
         let mut fds = Fds::default();
-        assert_eq!(fds.open("/etc", WRITE_ONLY), Err(IS_DIRECTORY));
-        let fd = fds.open("/tmp/probe", READ_WRITE).unwrap();
+        assert_eq!(ram.open(&mut fds, "/etc", WRITE_ONLY), Err(IS_DIRECTORY));
+        let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
         assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
         assert_eq!(
             ram.lookup("/tmp/probe"),
@@ -599,8 +788,8 @@ mod tests {
         let ram = Ram::default();
         let mut a = Fds::default();
         let mut b = Fds::default();
-        let fa = a.open("/etc/motd", READ_ONLY).unwrap();
-        let fb = b.open("/etc/motd", READ_ONLY).unwrap();
+        let fa = ram.open(&mut a, "/etc/motd", READ_ONLY).unwrap();
+        let fb = ram.open(&mut b, "/etc/motd", READ_ONLY).unwrap();
         let mut out = [0; 7];
         assert_eq!(ram.read(&mut a, fa, &mut out), Ok(7));
         assert_eq!(&out, b"stafeto");
@@ -616,7 +805,7 @@ mod tests {
         use proto_fs::{INVALID_ARGUMENT, NO_DATA, OFFSET_OVERFLOW, SeekFrom::*};
         let mut ram = Ram::default();
         let mut fds = Fds::default();
-        let fd = fds.open("/tmp/probe", READ_WRITE).unwrap();
+        let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
         ram.write(&mut fds, fd, b"abc").unwrap();
         assert_eq!(ram.seek_from(&mut fds, fd, -1, End), Ok(2));
         assert_eq!(ram.seek_from(&mut fds, fd, -1, Current), Ok(1));
@@ -667,8 +856,8 @@ mod tests {
     fn zero_io_checks_access_without_modifying_files_or_offsets() {
         let mut ram = Ram::default();
         let mut fds = Fds::default();
-        let read = fds.open("/etc/motd", READ_ONLY).unwrap();
-        let write = fds.open("/tmp/probe", WRITE_ONLY).unwrap();
+        let read = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+        let write = ram.open(&mut fds, "/tmp/probe", WRITE_ONLY).unwrap();
         assert_eq!(ram.read(&mut fds, write, &mut []), Err(BAD_FD));
         assert_eq!(ram.write(&mut fds, read, b""), Err(BAD_FD));
         assert_eq!(ram.read(&mut fds, 99, &mut []), Err(BAD_FD));
@@ -690,7 +879,7 @@ mod tests {
     fn write_seek_read_and_no_space_leave_file_intact() {
         let mut ram = Ram::default();
         let mut fds = Fds::default();
-        let fd = fds.open("/tmp/probe", READ_WRITE).unwrap();
+        let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
         assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
         assert_eq!(fds.seek(fd, 1), Ok(1));
         assert_eq!(ram.write(&mut fds, fd, b"Z"), Ok(1));
@@ -702,5 +891,256 @@ mod tests {
         let mut out = [0; 3];
         assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(3));
         assert_eq!(&out, b"aZc");
+    }
+
+    use crate::tree::{Index, load, test_image};
+    use bootimg::rootfs::{DIRECTORY, Entry, REGULAR};
+
+    fn entry(path: &str, mode: u32, file: u32) -> Entry<'_> {
+        Entry {
+            path,
+            mode,
+            uid: 0,
+            gid: 0,
+            file,
+        }
+    }
+
+    /// `/bin/ash` and `/bin/ls` are one file `a` (owner 3, 4), `/bin/sub/b`
+    /// is `b` and `/lib` is an empty directory.
+    fn image() -> Vec<u8> {
+        let owned = |entry: Entry<'static>| Entry {
+            uid: 3,
+            gid: 4,
+            ..entry
+        };
+        test_image(&[
+            entry("/bin", DIRECTORY | 0o755, 0),
+            owned(entry("/bin/ash", REGULAR | 0o4755, 1)),
+            owned(entry("/bin/ls", REGULAR | 0o4755, 1)),
+            entry("/bin/sub", DIRECTORY | 0o700, 0),
+            entry("/bin/sub/b", REGULAR | 0o640, 2),
+            entry("/lib", DIRECTORY | 0o755, 0),
+        ])
+    }
+
+    #[test]
+    fn image_files_have_the_mode_owner_size_inode_and_links_of_the_table() {
+        let bytes = image();
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let ash = ram.information("/bin/ash").unwrap();
+        let ls = ram.information("/bin/ls").unwrap();
+        assert_eq!(
+            (
+                ash.kind,
+                ash.permissions,
+                ash.uid,
+                ash.gid,
+                ash.size,
+                ash.links
+            ),
+            (REG, 0o4755, 3, 4, 11, 2)
+        );
+        assert_eq!(ash.blocks, 1);
+        assert_eq!((ls.inode, ls.links), (ash.inode, 2));
+        let b = ram.information("/bin/sub/b").unwrap();
+        assert_eq!((b.permissions, b.size, b.links), (0o640, 4, 1));
+        assert_ne!(b.inode, ash.inode);
+        // The times are the service's start: nothing of the image changes.
+        assert_eq!((ash.access_ns, ash.modify_ns, ash.change_ns), (10, 10, 10));
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        assert_eq!(ram.read_at(&mut fds, fd, &mut [0; 4], 99), Ok(4));
+        assert_eq!(ram.information("/bin/ash").unwrap().access_ns, 10);
+        assert_eq!(ram.descriptor_information(&fds, fd).unwrap(), ash);
+        // `/bin` has `.`, its entry in `/`, and `..` of `sub`.
+        let bin = ram.information("/bin").unwrap();
+        assert_eq!((bin.kind, bin.permissions, bin.links), (DIR, 0o755, 3));
+        let root = ram.information("/").unwrap();
+        // `.`, `..`, `etc`, `tmp`, `bin` and `lib` give 2 + 4.
+        assert_eq!((root.links, root.inode), (6, 1));
+        assert_eq!(
+            ram.lookup("/bin/sub/b"),
+            Ok(Metadata { kind: REG, size: 4 })
+        );
+        assert_eq!(ram.lookup("/bin"), Ok(Metadata { kind: DIR, size: 0 }));
+        assert_eq!(ram.information("/bin/none"), Err(NO_ENTRY));
+        assert_eq!(ram.information("/bin/ash/x"), Err(NO_ENTRY));
+        // The fixed tree is as before.
+        assert_eq!(ram.information("/etc/motd").unwrap().size, 14);
+    }
+
+    /// The entries of the directory `path`, one call each.
+    fn names<'a>(ram: &mut Ram<'a>, path: &str) -> Vec<(&'a str, u32, u64)> {
+        let mut out = Vec::new();
+        while let Some(entry) = ram.directory_read_path(path, out.len() as u32, 20).unwrap() {
+            out.push((entry.name, entry.kind, entry.inode));
+        }
+        out
+    }
+
+    #[test]
+    fn image_directories_list_dot_dotdot_the_fixed_entries_then_the_children() {
+        let bytes = image();
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut fds = Fds::default();
+        let bin = ram.information("/bin").unwrap().inode;
+        let sub = ram.information("/bin/sub").unwrap().inode;
+        let ash = ram.information("/bin/ash").unwrap().inode;
+        let root: Vec<_> = names(&mut ram, "/").iter().map(|e| (e.0, e.1)).collect();
+        assert_eq!(
+            root,
+            [
+                (".", DIR),
+                ("..", DIR),
+                ("etc", DIR),
+                ("tmp", DIR),
+                ("bin", DIR),
+                ("lib", DIR)
+            ]
+        );
+        assert_eq!(
+            names(&mut ram, "/bin"),
+            [
+                (".", DIR, bin),
+                ("..", DIR, 1),
+                ("ash", REG, ash),
+                ("ls", REG, ash),
+                ("sub", DIR, sub),
+            ]
+        );
+        let parent_of_sub = names(&mut ram, "/bin/sub");
+        assert_eq!((parent_of_sub[1].0, parent_of_sub[1].2), ("..", bin));
+        assert_eq!(names(&mut ram, "/lib").len(), 2);
+        assert_eq!(names(&mut ram, "/etc").len(), 3);
+        assert_eq!(
+            ram.directory_read_path("/bin/ash", 0, 20),
+            Err(proto_fs::NOT_DIRECTORY)
+        );
+        // An open directory advances through the same entries, and its
+        // size for seeking counts them (`.`, `..` and the children).
+        let fd = ram.open(&mut fds, "/bin", READ_ONLY | proto_fs::DIRECTORY_ONLY);
+        let fd = fd.unwrap();
+        assert_eq!(
+            ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::End),
+            Ok(5)
+        );
+        ram.seek_from(&mut fds, fd, 4, proto_fs::SeekFrom::Start)
+            .unwrap();
+        let last = ram.directory_read(&mut fds, fd, 30).unwrap().unwrap();
+        assert_eq!(last.name, "sub");
+        assert_eq!(ram.directory_read(&mut fds, fd, 30), Ok(None));
+        let root_fd = ram.open(&mut fds, "/", READ_ONLY).unwrap();
+        assert_eq!(
+            ram.seek_from(&mut fds, root_fd, 0, proto_fs::SeekFrom::End),
+            Ok(6)
+        );
+        assert_eq!(ram.open(&mut fds, "/bin", WRITE_ONLY), Err(IS_DIRECTORY));
+    }
+
+    #[test]
+    fn image_files_are_read_only_and_read_from_the_start_of_their_own_bytes() {
+        let bytes = image();
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut fds = Fds::default();
+        assert_eq!(
+            ram.open(&mut fds, "/bin/ash", WRITE_ONLY),
+            Err(proto_fs::ACCESS_DENIED)
+        );
+        assert_eq!(
+            ram.open(&mut fds, "/bin/ash", READ_WRITE),
+            Err(proto_fs::ACCESS_DENIED)
+        );
+        assert_eq!(
+            ram.open(&mut fds, "/bin/ash", proto_fs::DIRECTORY_ONLY),
+            Err(proto_fs::NOT_DIRECTORY)
+        );
+        let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        assert_eq!(ram.write(&mut fds, fd, b"x"), Err(BAD_FD));
+        let mut out = [0; 16];
+        assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(11));
+        assert_eq!(&out[..11], b"alpha bytes");
+        // The same file through the other link, and the other file.
+        let other = ram.open(&mut fds, "/bin/ls", READ_ONLY).unwrap();
+        assert_eq!(ram.read(&mut fds, other, &mut out[..5]), Ok(5));
+        assert_eq!(&out[..5], b"alpha");
+        let b = ram.open(&mut fds, "/bin/sub/b", READ_ONLY).unwrap();
+        assert_eq!(ram.read(&mut fds, b, &mut out), Ok(4));
+        assert_eq!(&out[..4], b"beta");
+    }
+
+    #[test]
+    fn pread_takes_the_offset_of_the_file_and_keeps_the_position() {
+        let bytes = image();
+        let mut index = Index::new();
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut fds = Fds::default();
+        let fd = ram.open(&mut fds, "/bin/ash", READ_ONLY).unwrap();
+        let mut out = [0; 32];
+        // From the start, from the middle, up to the end, and a count over it.
+        assert_eq!(ram.pread(&fds, fd, 0, &mut out[..5], 40), Ok(5));
+        assert_eq!(&out[..5], b"alpha");
+        assert_eq!(ram.pread(&fds, fd, 6, &mut out, 40), Ok(5));
+        assert_eq!(&out[..5], b"bytes");
+        assert_eq!(ram.pread(&fds, fd, 10, &mut out, 40), Ok(1));
+        assert_eq!(out[0], b's');
+        // At the end, past it, and at the largest offset.
+        assert_eq!(ram.pread(&fds, fd, 11, &mut out, 40), Ok(0));
+        assert_eq!(ram.pread(&fds, fd, 1 << 40, &mut out, 40), Ok(0));
+        assert_eq!(ram.pread(&fds, fd, i64::MAX as u64, &mut out, 40), Ok(0));
+        assert_eq!(
+            ram.pread(&fds, fd, i64::MAX as u64 + 1, &mut out, 40),
+            Err(proto_fs::INVALID_ARGUMENT)
+        );
+        // The position of the description did not move, so a read starts at 0.
+        assert_eq!(ram.read(&mut fds, fd, &mut out[..5]), Ok(5));
+        assert_eq!(&out[..5], b"alpha");
+        assert_eq!(ram.pread(&fds, fd, 0, &mut [], 40), Ok(0));
+        // A read updates the access time of a file of the fixed tree only.
+        let motd = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
+        assert_eq!(ram.pread(&fds, motd, 7, &mut out, 50), Ok(7));
+        assert_eq!(&out[..7], b" ramfs\n");
+        assert_eq!(ram.information("/etc/motd").unwrap().access_ns, 50);
+        assert_eq!(ram.information("/bin/ash").unwrap().access_ns, 10);
+        // The scratch file reads at an offset as well, and errors are the
+        // read's: a closed descriptor, a directory, a write-only open.
+        let scratch = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
+        ram.write(&mut fds, scratch, b"abcdef").unwrap();
+        assert_eq!(ram.pread(&fds, scratch, 4, &mut out, 60), Ok(2));
+        assert_eq!(&out[..2], b"ef");
+        let write_only = ram.open(&mut fds, "/tmp/probe", WRITE_ONLY).unwrap();
+        assert_eq!(ram.pread(&fds, write_only, 0, &mut out, 60), Err(BAD_FD));
+        let dir = ram.open(&mut fds, "/bin", READ_ONLY).unwrap();
+        assert_eq!(ram.pread(&fds, dir, 0, &mut out, 60), Err(IS_DIRECTORY));
+        fds.close(fd).unwrap();
+        assert_eq!(ram.pread(&fds, fd, 0, &mut out, 60), Err(BAD_FD));
+    }
+
+    #[test]
+    fn a_path_of_the_most_bytes_names_a_file_of_the_image() {
+        let name = "n".repeat(255);
+        let deep = format!("/{name}/{}", "m".repeat(254));
+        assert_eq!(deep.len(), proto_fs::MAX_PATH);
+        assert_eq!(bootimg::rootfs::PATH_MAX, proto_fs::MAX_PATH);
+        let bytes = test_image(&[
+            entry(&deep[..256], DIRECTORY | 0o755, 0),
+            entry(&deep, REGULAR | 0o644, 1),
+        ]);
+        let mut index = Index::new();
+        let ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut fds = Fds::default();
+        assert!(ram.open(&mut fds, &deep, READ_ONLY).is_ok());
+        assert_eq!(ram.information(&deep).unwrap().size, 11);
+        assert_eq!(proto_fs::valid_path(deep.as_bytes()), Ok(deep.as_str()));
+    }
+
+    #[test]
+    fn without_a_tree_the_image_paths_do_not_exist() {
+        let ram = Ram::default();
+        assert_eq!(ram.information("/bin"), Err(NO_ENTRY));
+        assert_eq!(ram.lookup("/bin/ash"), Err(NO_ENTRY));
     }
 }

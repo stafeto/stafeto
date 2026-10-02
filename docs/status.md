@@ -82,7 +82,13 @@ Bounded paths with interrupts masked are listed in
   the host, and the end of the host's input leaves the console with
   output; `init` resets the device and clears the function's command
   word before the object goes.
-- `services/ramfs`: RAM files and directories (`proto/fs`).
+- `services/ramfs`: RAM files and directories (`proto/fs`). Next to its
+  fixed tree it shows the files of the boot image's table `rootfs`
+  (`lib/bootimg/src/rootfs.rs`): each has a path, a mode, an owner and
+  the bytes of a file of the image (a program's ELF file), which the
+  service reads from its read-only mapping of the image without a copy;
+  `READ_AT` reads at an offset. Paths are at most 511 bytes (512 with the
+  terminator, as `PATH_MAX`), names at most 255.
 - `services/clock` and `services/process`: realtime clock, process
   identity and credentials for the POSIX layer (`proto/clock`,
   `proto/process`). The process service keeps 256 records, PID = index +
@@ -143,7 +149,7 @@ cancellation, shared-state, input and interruption probes as well, and
 |---|---|
 | `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`); `kernel-test <machine> icount` runs the icount build under `-icount` |
 | `ext4ro` | reads an e2fsprogs ext4 image inside the guest |
-| `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes |
+| `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes; the files of the boot image's table: modes, owners, links, reads at an offset, the longest path |
 | `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` within 16 KiB |
 | `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
 | `posix-procs` | the C probe of processes on relibc: `posix_spawn` from `/boot`, exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, a fault as `SIGSEGV`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |

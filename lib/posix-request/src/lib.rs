@@ -8,7 +8,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod exchange;
-pub use proto_fs::MAX_READ;
+pub use proto_fs::{MAX_PATH, MAX_READ};
 pub const MAX_WRITE: usize = proto_fs::MAX_WRITE - exchange::HEADER_BYTES;
 use proto_fs::{NodeInfo, SeekFrom};
 use proto_wire::{Header, Reader, Status, Writer};
@@ -16,7 +16,7 @@ pub const MESSAGE_MAX: usize = MAX_READ + 8;
 pub const VERSION: u16 = 1;
 
 fn valid_path(path: &[u8]) -> Result<(), Status> {
-    if path.len() > proto_fs::MAX_PATH || path.contains(&0) {
+    if path.len() > MAX_PATH || path.contains(&0) {
         Err(Status::BadSize)
     } else {
         Ok(())

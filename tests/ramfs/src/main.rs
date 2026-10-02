@@ -8,7 +8,9 @@
 
 use posix_fs::{DescriptorFlags, FileKind, FsError, OPEN_MAX, PosixFs, SeekFrom};
 use posix_path::{MAX_PATH, PathState};
-use proto_fs::{BAD_FD, NO_ENTRY, READ_ONLY, READ_WRITE};
+use proto_fs::{
+    ACCESS_DENIED, BAD_FD, INVALID_ARGUMENT, NO_ENTRY, READ_ONLY, READ_WRITE, WRITE_ONLY,
+};
 use proto_wire::Status;
 use rt::fs::Files;
 use rt::handle::Resource;
@@ -41,7 +43,11 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
     if fs.read_dir("/", 2, &mut name) != Ok(Some((3, 1))) || &name[..3] != b"etc" {
         return Err("root entry");
     }
-    if fs.read_dir("/", 4, &mut name) != Ok(None)
+    // The directories of the boot image's table follow `etc` and `tmp`.
+    if fs.read_dir("/", 4, &mut name) != Ok(Some((3, 1))) || &name[..3] != b"bin" {
+        return Err("root entry of the image");
+    }
+    if fs.read_dir("/", 6, &mut name) != Ok(None)
         || fs.read_dir("/missing", 0, &mut name) != Err(Status::Unknown(NO_ENTRY))
     {
         return Err("directory end and error");
@@ -98,10 +104,126 @@ fn check(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static str> {
         return Err("stdout");
     }
     fs.close(fd).map_err(|_| "close scratch")?;
+    check_image(&fs)?;
     check_posix(parent)?;
     check_seek(parent)?;
     check_duplicates(parent)?;
     check_descriptor_limit(parent)?;
+    Ok(())
+}
+
+/// The files of the boot image's table (xtask's rootfs.rs): modes, owners,
+/// sizes, links and reads at an offset.
+fn check_image(fs: &Files) -> Result<(), &'static str> {
+    let program = fs
+        .node_information("/bin/ramfs-probe")
+        .map_err(|_| "stat image file")?;
+    if (
+        program.kind,
+        program.permissions,
+        program.uid,
+        program.gid,
+        program.links,
+    ) != (2, 0o755, 0, 0, 3)
+    {
+        return Err("image file mode, owner or links");
+    }
+    // xtask compares this size with the ELF file on the host.
+    rt::println!("ramfs-probe: image file size {}", program.size);
+    let link = fs.node_information("/bin/probe").map_err(|_| "stat link")?;
+    let service = fs
+        .node_information("/bin/ramfs")
+        .map_err(|_| "stat service")?;
+    if link.inode != program.inode
+        || link.size != program.size
+        || service.inode == program.inode
+        || (service.permissions, service.uid, service.gid) != (0o4750, 1000, 100)
+    {
+        return Err("image links and owners");
+    }
+    let bin = fs.node_information("/bin").map_err(|_| "stat directory")?;
+    if (bin.kind, bin.permissions, bin.links) != (1, 0o755, 2) {
+        return Err("image directory");
+    }
+    let mut name = [0; 32];
+    for (index, expected) in [".", "..", "probe", "ramfs", "ramfs-probe"]
+        .iter()
+        .enumerate()
+    {
+        let entry = fs.read_dir("/bin", index as u32, &mut name);
+        if entry != Ok(Some((expected.len(), if index < 2 { 1 } else { 2 })))
+            || &name[..expected.len()] != expected.as_bytes()
+        {
+            return Err("image directory entries");
+        }
+    }
+    if fs.read_dir("/bin", 5, &mut name) != Ok(None) {
+        return Err("image directory end");
+    }
+    let fd = fs
+        .open("/bin/ramfs-probe", READ_ONLY)
+        .map_err(|_| "open image file")?;
+    let mut magic = [0; 4];
+    if fs.read_at(fd, 0, &mut magic) != Ok(4) || &magic != b"\x7fELF" {
+        return Err("ELF magic at offset 0");
+    }
+    // The whole file in pieces of 1 000 bytes at their offsets, and the
+    // same bytes read in order from the position of the description.
+    let (mut offset, mut chunk, mut order) = (0u64, [0; 1000], [0; 1000]);
+    while offset < program.size {
+        let n = fs.read_at(fd, offset, &mut chunk).map_err(|_| "read at")?;
+        if n == 0 || fs.read(fd, &mut order[..n]) != Ok(n) || chunk[..n] != order[..n] {
+            return Err("read at against read");
+        }
+        offset += n as u64;
+    }
+    if offset != program.size {
+        return Err("read at sums to the size");
+    }
+    // The read at an offset left the position where the reads put it: the end.
+    if fs.read(fd, &mut chunk) != Ok(0)
+        || fs.read_at(fd, program.size, &mut chunk) != Ok(0)
+        || fs.read_at(fd, 1 << 40, &mut chunk) != Ok(0)
+        || fs.read_at(fd, 1 << 63, &mut chunk) != Err(Status::Unknown(INVALID_ARGUMENT))
+        || fs.read_at(99, 0, &mut chunk) != Err(Status::Unknown(BAD_FD))
+    {
+        return Err("read at the end and past it");
+    }
+    fs.close(fd).map_err(|_| "close image file")?;
+    if fs.open("/bin/ramfs-probe", WRITE_ONLY) != Err(Status::Unknown(ACCESS_DENIED)) {
+        return Err("image files are read-only");
+    }
+    // The longest path: a name of 255 bytes, then one of 254.
+    let mut path = [b'm'; MAX_PATH];
+    path[0] = b'/';
+    path[256] = b'/';
+    path[1..256].fill(b'n');
+    let deep = core::str::from_utf8(&path).map_err(|_| "deep path")?;
+    let deep_info = fs
+        .node_information(deep)
+        .map_err(|_| "stat the longest path")?;
+    let deep_fd = fs
+        .open(deep, READ_ONLY)
+        .map_err(|_| "open the longest path")?;
+    if deep_info.inode != program.inode
+        || fs.read_at(deep_fd, 0, &mut magic) != Ok(4)
+        || &magic != b"\x7fELF"
+    {
+        return Err("the longest path");
+    }
+    fs.close(deep_fd).map_err(|_| "close the longest path")?;
+    // One byte more is no path; the same length with another name is absent.
+    let mut over = [b'm'; MAX_PATH + 1];
+    over[0] = b'/';
+    let over = core::str::from_utf8(&over).map_err(|_| "over path")?;
+    if fs.open(over, READ_ONLY) != Err(Status::BadSize) {
+        return Err("path over the limit");
+    }
+    path[300] = b'x';
+    let absent = core::str::from_utf8(&path).map_err(|_| "absent path")?;
+    if fs.open(absent, READ_ONLY) != Err(Status::Unknown(NO_ENTRY)) {
+        return Err("path of the limit but absent");
+    }
     Ok(())
 }
 

@@ -9,6 +9,7 @@ mod measure;
 mod ostest;
 mod qemu;
 mod ring;
+mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod symbolize;
@@ -34,6 +35,9 @@ const CHILD_STACK_SIZE: u32 = 16 * 1024;
 const POSIX_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
+/// The stack of the RAM file service: its start reads the table of the boot
+/// image (services/ramfs/src/tree.rs) on top of the start data.
+const RAMFS_STACK_SIZE: u32 = 32 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
@@ -71,7 +75,7 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -87,7 +91,7 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
 const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -102,12 +106,12 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
 const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -123,7 +127,7 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
 /// each POSIX process fails its load (`posix_orphans`).
 const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -137,7 +141,7 @@ const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
 ];
 const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -157,7 +161,7 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
 const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -208,7 +212,7 @@ const RTBENCH_VZ_PROGRAMS: [ImageProgram; 3] = [
 const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -225,7 +229,7 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
 ];
 const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -246,7 +250,7 @@ const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_
 const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", SVC_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -264,7 +268,7 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
 const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -281,7 +285,7 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
 ];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -299,7 +303,7 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
 ];
 const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -318,7 +322,7 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
 const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -338,7 +342,7 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
 /// The first C program on relibc (5a′) and the services it needs.
 const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -353,7 +357,7 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// quota of its record cannot map (procs-big).
 const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -367,7 +371,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -379,7 +383,7 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
 ];
 const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -391,7 +395,7 @@ const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
 ];
 const ASH_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -409,7 +413,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -426,7 +430,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
 ];
 const LS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -1224,6 +1228,32 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     if let Some(licence) = &os_test_licence {
         list.push((ostest::LICENCE, licence.as_slice()));
     }
+    // The files of the RAM file service: the ELF files of the programs its
+    // table names, as the linker wrote them, then the table (rootfs.rs).
+    let listed = rootfs::files_of(name);
+    let wanted = rootfs::programs(&listed);
+    let mut elf_names = Vec::new();
+    let mut elf_bytes = Vec::new();
+    for program in &wanted {
+        let (_, elf, _) = sources
+            .iter()
+            .find(|(file, _, _)| file == program)
+            .ok_or_else(|| format!("{name}: no program {program} for its rootfs"))?;
+        elf_bytes.push(std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?);
+        elf_names.push(rootfs::elf_name(program));
+    }
+    let first = list.len() as u32;
+    for (file, bytes) in elf_names.iter().zip(&elf_bytes) {
+        list.push((file.as_str(), bytes.as_slice()));
+    }
+    let table = if listed.is_empty() {
+        None
+    } else {
+        Some(rootfs::table(&listed, first, list.len() as u32 + 1)?)
+    };
+    if let Some(table) = &table {
+        list.push(("rootfs", table.as_slice()));
+    }
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
     std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1408,6 +1438,20 @@ fn ramfs_probe() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("ramfs-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "ramfs-probe: ok")?;
+    // The service reports the size of the ELF file the image carries: the
+    // guest's `wc -c` of it is the host's file length.
+    let elf = image_elf(&target_dir(), "boot-ramfs.img", "ramfs-probe");
+    let host = std::fs::metadata(&elf)
+        .map_err(|e| format!("{}: {e}", elf.display()))?
+        .len();
+    match qemu::number_after(&output.lines, "ramfs-probe: image file size ") {
+        Some(guest) if guest == host => {}
+        guest => {
+            return Err(format!(
+                "the guest reads {guest:?} bytes of /bin/ramfs-probe, the ELF file has {host}"
+            ));
+        }
+    }
     println!("RAM file service guest probe passed");
     Ok(())
 }
@@ -1942,6 +1986,20 @@ fn ash_dialog() -> Result<(), String> {
         &ASH_INTERACTIVE_PROGRAMS,
         BOOT_PROFILE,
     )?;
+    // What `ls -l` shows of the files of /bin: the mode, the links and the
+    // size of the ELF file of the program the file holds (rootfs.rs).
+    let elf_size = |program: &str| -> Result<String, String> {
+        let elf = image_elf(&target_dir(), "boot-ash-dialog.img", program);
+        let meta = std::fs::metadata(&elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+        Ok(meta.len().to_string())
+    };
+    let busybox = elf_size("busybox-probe")?;
+    let bin_listing = [
+        ("-rwxr-xr-x", "3", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "3", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "3", "ls", busybox),
+        ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
+    ];
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -1968,6 +2026,26 @@ fn ash_dialog() -> Result<(), String> {
         // The directories show as such: st_mode of a directory.
         run.expect("dr-xr-xr-x", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        // The files of the boot image's table: the modes and the sizes of
+        // the ELF files (three links of BusyBox, a set-user-ID file), one
+        // command each.
+        for (mode, links, name, size) in &bin_listing {
+            let command = format!("ls -l /bin/{name}");
+            run.send(&command)?;
+            run.expect(&command, DIALOG_STEP)?;
+            run.expect_line(
+                name,
+                |line| {
+                    let words: Vec<_> = line.split_whitespace().collect();
+                    line.starts_with(mode)
+                        && words.get(1) == Some(links)
+                        && words.contains(&size.as_str())
+                        && words.last() == Some(&format!("/bin/{name}").as_str())
+                },
+                DIALOG_STEP,
+            )?;
+            run.expect("# ", DIALOG_STEP)?;
+        }
         run.send("ls --help")?;
         run.expect("ls --help", DIALOG_STEP)?;
         run.expect("Usage: ls", DIALOG_STEP)?;

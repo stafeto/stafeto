@@ -207,6 +207,29 @@ impl Files {
         Ok(n)
     }
 
+    /// Reads from `offset` of the file; the position of the description
+    /// stays (READ_AT). Only a file of the RAM service reads so.
+    pub fn read_at(&self, fd: u32, offset: u64, out: &mut [u8]) -> Result<usize, Status> {
+        let mut w = Writer::new();
+        Method::ReadAt.header().write(&mut w)?;
+        w.u32(fd)?;
+        w.u64(offset)?;
+        w.u32(out.len().min(MAX_READ) as u32)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let n = r.u32()? as usize;
+        if n > out.len() || n > MAX_READ {
+            return Err(Status::BadSize);
+        }
+        out[..n].copy_from_slice(r.bytes(n)?);
+        r.finish()?;
+        Ok(n)
+    }
+
     pub fn write(&self, fd: u32, bytes: &[u8]) -> Result<usize, Status> {
         if bytes.is_empty() && (fd == 1 || fd == 2) {
             return Ok(0);

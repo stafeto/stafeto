@@ -6,11 +6,14 @@
 #![no_std]
 #![no_main]
 
+use core::cell::UnsafeCell;
 use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION, valid_path};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
+use ramfs::tree::{self, Index};
 use ramfs::{Fds, Ram};
-use rt::handle::{Outgoing, Resource};
+use rt::abi::Access;
+use rt::handle::{Memory, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 
@@ -18,6 +21,36 @@ rt::entry!(main);
 
 const METHODS: &[u16] = proto_fs::METHODS;
 const SESSIONS: usize = 8;
+/// Where the service maps the boot image, read-only, for as long as it
+/// lives: the files of its table are read from there.
+const IMAGE: usize = 0x50_0000_0000;
+
+/// The index of the table of the boot image, in the service's `.bss`.
+struct Table(UnsafeCell<Index>);
+// SAFETY: only the main thread reaches it, once (`image_tree`).
+unsafe impl Sync for Table {}
+static TABLE: Table = Table(UnsafeCell::new(Index::new()));
+
+/// The files of the boot image's table: the image is mapped from the
+/// start data (`bootimage`, given to this record by init), and the table is
+/// read. An image with no table, or no image, leaves the fixed tree alone.
+fn image_tree(start: &mut rt::startup::Startup) -> Option<tree::Tree<'static>> {
+    let image = start.take::<Memory>("bootimage").ok()?;
+    let size = sys::memory_info(&image).ok()?.size;
+    sys::mem_map(&start.process, &image, 0, size, IMAGE, Access::Read).ok()?;
+    // SAFETY: the image stays mapped, read-only, for the life of the process.
+    let bytes = unsafe { core::slice::from_raw_parts(IMAGE as *const u8, size as usize) };
+    // SAFETY: only the main thread reaches TABLE, here once.
+    let index = unsafe { &mut *TABLE.0.get() };
+    match tree::load(bytes, index) {
+        Ok(tree) => Some(tree),
+        Err(tree::Error::Missing) => None,
+        Err(error) => {
+            rt::println!("ramfs: the table of the boot image is refused: {error:?}");
+            None
+        }
+    }
+}
 
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
@@ -26,6 +59,11 @@ fn main(_: u64) -> u64 {
     if let Ok(console) = start.take::<Resource>("console") {
         rt::console::set(console);
     }
+    let now = rt::time::ticks_to_ns(rt::time::now());
+    let ram = match image_tree(&mut start) {
+        Some(tree) => Ram::with_tree(now, tree),
+        None => Ram::new(now),
+    };
     let args = ServiceArgs::read(start.args()).ok();
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(1) else {
@@ -44,15 +82,13 @@ fn main(_: u64) -> u64 {
         heartbeat: Some(heartbeat),
     };
     rt::println!("ramfs: ready");
-    let mut fs = Fs {
-        ram: Ram::new(rt::time::ticks_to_ns(rt::time::now())),
-    };
+    let mut fs = Fs { ram };
     let _ = rt::service::run::<Fs, SESSIONS, 0>(&channel, &mut fs, config);
     4
 }
 
 struct Fs {
-    ram: Ram,
+    ram: Ram<'static>,
 }
 
 fn status(code: u32) -> Answer {
@@ -82,7 +118,7 @@ impl Service<0> for Fs {
                 let Ok(path) = body.bytes(body.left()).and_then(valid_path) else {
                     return Answer::Status(Status::BadSize);
                 };
-                match s.data.open(path, flags) {
+                match self.ram.open(&mut s.data, path, flags) {
                     Ok(fd) => value(r, fd),
                     Err(code) => status(code),
                 }
@@ -98,6 +134,35 @@ impl Service<0> for Fs {
                 match self.ram.read_at(
                     &mut s.data,
                     fd,
+                    &mut bytes[..count as usize],
+                    rt::time::ticks_to_ns(rt::time::now()),
+                ) {
+                    Ok(n) => {
+                        let w = r.reply();
+                        if w.u32(0)
+                            .and_then(|()| w.u32(n as u32))
+                            .and_then(|()| w.bytes(&bytes[..n]))
+                            .is_err()
+                        {
+                            return Answer::Status(Status::BadSize);
+                        }
+                        Answer::Reply(Outgoing::new())
+                    }
+                    Err(code) => status(code),
+                }
+            }
+            Some(Method::ReadAt) => {
+                let (Ok(fd), Ok(offset), Ok(count)) = (body.u32(), body.u64(), body.u32()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if body.finish().is_err() || count as usize > MAX_READ {
+                    return Answer::Status(Status::BadSize);
+                }
+                let mut bytes = [0; MAX_READ];
+                match self.ram.pread(
+                    &s.data,
+                    fd,
+                    offset,
                     &mut bytes[..count as usize],
                     rt::time::ticks_to_ns(rt::time::now()),
                 ) {

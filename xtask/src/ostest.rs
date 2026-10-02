@@ -21,7 +21,7 @@ use crate::{BOOT_PROFILE, ImageProgram, Variant, build, qemu, target_dir, write_
 /// the test under the name `os-test`.
 const PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
-    ("ramfs", "ramfs", crate::SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",

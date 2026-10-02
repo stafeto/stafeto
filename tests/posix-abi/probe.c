@@ -846,10 +846,14 @@ int main(int argc, char **argv) {
     if (read(fd, NULL, 0) != -1 || errno != EBADF || close(copy) != 0) return 6;
     if (open("/missing", O_RDONLY) != -1 || errno != ENOENT) return 7;
     if (open("/etc/motd", O_ACCMODE) != -1 || errno != EINVAL) return 9;
-    char too_long[130];
-    for (size_t i = 0; i < sizeof(too_long) - 1; i++) too_long[i] = 'x';
-    too_long[129] = 0;
-    if (open(too_long, O_RDONLY) != -1 || errno != ENAMETOOLONG) return 10;
+    /* PATH_MAX is 512 with the terminator: 511 bytes of path are the most. */
+    char too_long[513 + 1];
+    too_long[0] = '/';
+    for (size_t i = 1; i < sizeof(too_long) - 1; i++) too_long[i] = 'x';
+    too_long[512] = 0;
+    if (PATH_MAX != 512 || open(too_long, O_RDONLY) != -1 || errno != ENAMETOOLONG) return 10;
+    too_long[511] = 0;
+    if (open(too_long, O_RDONLY) != -1 || errno != ENOENT) return 34;
     if (chdir("/etc") != 0 || getcwd(text, sizeof(text)) != text || !same(text, "/etc", 5)) return 11;
     if (getcwd(text, 4) != NULL || errno != ERANGE) return 12;
     fd = open("motd", O_RDONLY);

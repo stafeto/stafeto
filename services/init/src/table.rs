@@ -44,9 +44,11 @@ pub const START_DATA_NAMES: [&str; 6] = [
     IDENTITY_SESSION,
 ];
 /// The name of the boot image, read-only, in the start data of the
-/// process service: until the loader of 5c it loads the POSIX processes
-/// from there (serve.rs).
+/// process service, which loads the POSIX processes from there (serve.rs),
+/// and of the RAM file service, which shows the files of its table.
 pub const BOOT_IMAGE: &str = "bootimage";
+/// The name of the RAM file service's record: it gets the boot image.
+pub const RAM_SERVICE: &str = "ramfs";
 /// The name of the POSIX process service (spec 2, section 3.1). A record
 /// that connects to it is a POSIX process: init takes no CONNECT to it and
 /// loads no program for it; the service takes the record with ADOPT,
