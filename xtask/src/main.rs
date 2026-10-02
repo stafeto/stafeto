@@ -3250,7 +3250,7 @@ fn no_transport_probe() -> Result<(), String> {
 fn ci() -> Result<(), String> {
     // First: the licence check and the C programs take relibc's build.
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/check-posix-licenses.py")))?;
+    run_cmd(Command::new("python3").arg(root().join("tools/check-licenses.py")))?;
     no_transport_probe()?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(cargo().args([

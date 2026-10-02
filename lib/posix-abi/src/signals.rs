@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Signals of threads in their blocks (spec 2, 3.3, design of 5a, 1.9):

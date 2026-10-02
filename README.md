@@ -193,15 +193,23 @@ Bounded kernel paths and their costs:
 ## License
 
 The kernel, `kcore`, services, drivers, the shell, `xtask`, the tests,
-`lib/ext4ro` and the Rust POSIX crates (`lib/posix-*`) are under
+`lib/ext4ro` and the POSIX crates that programs do not link
+(`lib/posix-signal-queue`, `lib/posix-credentials`) are under
 GPL-3.0-or-later ([LICENSE](LICENSE)). The libraries that programs link
 (`lib/abi`, `lib/rt`, `lib/bootimg`, `lib/process-client`, `proto/*`) and
 the temporary Picolibc bridge `lib/posix` are under MIT
-([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can use any licence.
-Every source file carries an `SPDX-License-Identifier` line.
+([LICENSE-MIT](LICENSE-MIT)).
 
-BusyBox is GPL-2.0-only ([license](https://busybox.net/license.html)) and
-cannot link GPL-3.0-or-later code. It links only the MIT bridge and talks
-to GPL services through messages; `cargo xtask ci` checks this boundary
-and the licence declarations of the POSIX crates. Third-party
-dependencies keep their own licences ([docs/licenses](docs/licenses)).
+The POSIX system layer that programs link (crates listed by
+`tools/check-licenses.py`) is GPL-3.0-or-later with the GCC Runtime Library
+Exception 3.1 ([LICENSE-GCC-exception-3.1](LICENSE-GCC-exception-3.1)):
+programs under any licence, including GPL-2.0-only BusyBox, may link it.
+Services stay GPL-3.0-or-later. relibc and its dependencies keep their own
+licences (THIRD-PARTY-NOTICES, which `tools/check-licenses.py` writes to
+`target/relibc/`).
+
+Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
+ci` checks the licence of every crate and file, that BusyBox links no bare
+GPL-3.0 code, and that relibc and everything it links are under licences
+GPL-2.0-only takes. Other third-party dependencies keep their own licences
+([docs/licenses](docs/licenses)).

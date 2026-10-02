@@ -28,11 +28,12 @@ def stage() -> Path:
     shutil.copytree(SOURCE / "include", include)
     shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
     shutil.copy2(ROOT / "LICENSE-MIT", destination / "LICENSE-MIT")
+    shutil.copy2(ROOT / "LICENSE-GCC-exception-3.1", destination / "LICENSE-GCC-exception-3.1")
     shutil.copytree(ROOT / "docs/licenses/linked_list_allocator-0.10.6",
                     destination / "licenses/linked_list_allocator-0.10.6",
                     dirs_exist_ok=True)
     values = re.findall(r"pub const ([A-Z][A-Z0-9_]*): (?:i32|u32) = ([0-9]+);", constants)
-    header = ["/* SPDX-License-Identifier: GPL-3.0-or-later */",
+    header = ["/* SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1 */",
               "/* Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com> */",
               "#ifndef STAFETO_ABI_H", "#define STAFETO_ABI_H",
               f'#define STAFETO_SYSROOT_VERSION "{version}"']

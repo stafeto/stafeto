@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Long operations of services in two steps (spec 2, 3.4; design of 5a,
