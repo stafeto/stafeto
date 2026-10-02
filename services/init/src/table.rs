@@ -691,7 +691,6 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-ceiling") as usize
     + cfg!(feature = "vz") as usize
     + cfg!(feature = "table-ramfs") as usize
-    + cfg!(feature = "table-cprobe") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-posix-abi") as usize
@@ -716,7 +715,6 @@ const _: () = assert!(
     feature = "table-ceiling",
     feature = "vz",
     feature = "table-ramfs",
-    feature = "table-cprobe",
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-posix-abi",
@@ -737,8 +735,6 @@ pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
 pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
 #[cfg(feature = "table-relibc-threads")]
 pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
-#[cfg(feature = "table-cprobe")]
-pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
 #[cfg(feature = "table-busybox")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "table-busybox-dialog")]
@@ -1465,7 +1461,6 @@ mod tests {
     #[test]
     fn posix_processes_have_a_ceiling_above_main() {
         let tables = [
-            ramfs::CPROBE_TABLE,
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
@@ -1480,7 +1475,6 @@ mod tests {
             assert!(check(table).is_ok());
             let posix = table.iter().filter(|r| {
                 [
-                    "cprobe",
                     "busybox-probe",
                     "posix-abi-probe",
                     "relibc-hello",

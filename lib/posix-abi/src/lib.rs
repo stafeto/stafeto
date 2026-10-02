@@ -3,7 +3,7 @@
 
 //! Experimental C file ABI 1 and startup, backed entirely by Rust. Entry points
 //! require the initialized current-thread scope. The C caller supplies live,
-//! properly sized buffers; null pointers are reported as EFAULT. No Picolibc.
+//! properly sized buffers; null pointers are reported as EFAULT.
 
 #![no_std]
 

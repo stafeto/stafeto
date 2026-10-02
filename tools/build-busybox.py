@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-"""Build pinned BusyBox objects for the stafeto guest probes."""
+"""Build pinned BusyBox objects for the stafeto guest probes, with
+relibc's headers (target/relibc/sysroot, cargo xtask relibc) and the Linux
+AArch64 C ABI they describe."""
 
 from hashlib import sha256
+import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
@@ -17,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "busybox"
 SOURCE = WORK / "source"
 ARCHIVE = WORK / f"busybox-{VERSION}.tar.bz2"
+RELIBC = ROOT / "target" / "relibc" / "sysroot"
+# Headers BusyBox includes on Linux that relibc lacks; searched after
+# relibc's own (-idirafter).
 COMPAT = ROOT / "tools" / "busybox" / "compat"
 LOG = WORK / "build.log"
 STAMP = WORK / "config"
@@ -24,7 +30,18 @@ STAMP = WORK / "config"
 # access and a 64-bit multiply-accumulate. The objects go into a Rust
 # program, whose aarch64-unknown-none link passes --fix-cortex-a53-843419.
 A53_ERRATA = "-mfix-cortex-a53-835769"
-PATCH = "echo cat ash ls-nofork picolibc-v12 a53-835769"
+# BusyBox's main becomes busybox_main: the probe's own C main, which relibc
+# calls, chooses the applet and its arguments.
+PATCH = "echo cat ash ls-nofork relibc main-renamed a53-835769"
+
+
+def relibc_commit() -> str:
+    """The relibc commit tools/build-relibc.py pins, for the stamp."""
+    spec = importlib.util.spec_from_file_location(
+        "build_relibc", ROOT / "tools" / "build-relibc.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.COMMIT
 OBJECTS = (
     "appletlib.o", "xfuncs_printf.o", "xfuncs.o", "full_write.o",
     "process_escape_sequence.o", "ptr_to_globals.o", "messages.o",
@@ -73,7 +90,7 @@ def tool(name: str, brew_formula: str | None = None) -> Path:
 def main() -> None:
     headers = sorted(COMPAT.rglob("*.h"))
     compatibility = sha256(b"".join(path.read_bytes() for path in headers)).hexdigest()
-    config_stamp = f"{VERSION} {SHA256} {PATCH} {compatibility}\n"
+    config_stamp = f"{VERSION} {SHA256} {PATCH} {compatibility} relibc {relibc_commit()}\n"
     if (STAMP.exists() and STAMP.read_text() == config_stamp
             and (SOURCE / "libbb/lib.a").exists()
             and (SOURCE / "coreutils/lib.a").exists()
@@ -91,21 +108,19 @@ def main() -> None:
         shutil.rmtree(SOURCE)
     run("tar", "-xjf", str(ARCHIVE), "-C", str(WORK))
     (WORK / f"busybox-{VERSION}").rename(SOURCE)
-    replace(SOURCE / "include/platform.h",
-            " || defined _NEWLIB_VERSION\n# include <features.h>",
-            "\n# include <features.h>")
-    replace(SOURCE / "include/libbb.h", '#include "platform.h"',
-            '#include "platform.h"\n#undef HAVE_PRINTF_PERCENTM\n#ifdef _NEWLIB_VERSION\n'
-            '#undef HAVE_UNLOCKED_STDIO\n#undef HAVE_UNLOCKED_LINE_OPS\n#endif')
-    replace(SOURCE / "include/libbb.h", "#include <stdlib.h>",
-            "#include <stdlib.h>\n#define utoa bb_utoa\n#define itoa bb_itoa")
-    replace(SOURCE / "libbb/xfuncs_printf.c", "return fflush(NULL);",
-            "return fflush(stdout) | fflush(stderr);")
     replace(SOURCE / "coreutils/ls.c",
             "APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)",
             "APPLET_NOFORK(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls)")
-    replace(SOURCE / "shell/ash.c", '#include "NUM_APPLETS.h"',
-            '#include "NUM_APPLETS.h"\nextern int clearenv(void);')
+    # relibc next to the other C libraries of platform.h: the glibc
+    # extensions it lacks, alloca from its own header, and the declaration
+    # of settimeofday, which libbb's xsettimeofday names and no probe calls.
+    replace(SOURCE / "include/platform.h",
+            "#if defined(ANDROID) || defined(__ANDROID__)\n# if __ANDROID_API__ < 8",
+            "#if defined(__RELIBC__)\n# include <alloca.h>\n# undef HAVE_CLEARENV\n"
+            "# undef HAVE_MEMPCPY\n# undef HAVE_STRVERSCMP\n# undef HAVE_UNLOCKED_STDIO\n"
+            "# undef HAVE_UNLOCKED_LINE_OPS\nstruct timeval;\nstruct timezone;\n"
+            "int settimeofday(const struct timeval *, const struct timezone *);\n#endif\n\n"
+            "#if defined(ANDROID) || defined(__ANDROID__)\n# if __ANDROID_API__ < 8")
     kbuild = SOURCE / "libbb/Kbuild.src"
     lines = [line for line in kbuild.read_text().splitlines()
              if not line.startswith("lib-y +=")]
@@ -136,14 +151,15 @@ def main() -> None:
     clang = tool("clang", "llvm")
     lld = tool("ld.lld", "lld")
     ar = tool("llvm-ar", "llvm")
-    include = ROOT / "target/picolibc/root/usr/include"
-    if not include.exists():
-        raise SystemExit("build Picolibc with tools/build-picolibc.py first")
+    include = RELIBC / "include"
+    if not (include / "stdio.h").exists():
+        raise SystemExit("build relibc with cargo xtask relibc first")
     run("make", "-j4", "libbb", "coreutils", "shell", f"CC={clang}", f"LD={lld}",
         f"AR={ar}", "HOSTCC=cc",
-        "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-none-elf", f"-I{COMPAT}",
-            f"-I{include}", "-ffreestanding", "-fno-stack-protector",
-            "-ffunction-sections", "-fdata-sections", A53_ERRATA)), cwd=SOURCE)
+        "EXTRA_CFLAGS=" + " ".join(("--target=aarch64-linux-gnu", "-nostdinc",
+            f"-isystem {include}", f"-idirafter {COMPAT}", "-mno-outline-atomics", "-fno-stack-protector",
+            "-ffunction-sections", "-fdata-sections", "-Dmain=busybox_main",
+            A53_ERRATA)), cwd=SOURCE)
     for archive in [SOURCE / "libbb/lib.a", SOURCE / "coreutils/lib.a",
                     SOURCE / "shell/lib.a"]:
         if not archive.exists():

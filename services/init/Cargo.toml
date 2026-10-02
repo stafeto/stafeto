@@ -32,7 +32,6 @@ table-rtbench-posix-vz = []
 # object of a driver that ended for 300 ms after the stop.
 dma-watch = []
 table-ramfs = []
-table-cprobe = []
 table-posix-abi = []
 table-relibc = []
 table-relibc-threads = []

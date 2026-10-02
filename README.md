@@ -61,8 +61,8 @@ service loops and starts children through a start protocol.
 crashes the driver, `init` restarts it and the shell reconnects. Separate
 images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
 and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
-links statically with Picolibc 1.8.12 through a small bridge
-(`lib/posix`).
+links statically with relibc over the Rust POSIX layer; `ash` reports
+`can't fork` for commands outside BusyBox until `fork` comes (5b).
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
 interface. The C library is relibc (a fork pinned by
@@ -79,8 +79,7 @@ wait by address in the layer with no kernel call when uncontended; the heap,
 the descriptor table and the table of threads live under the layer's locks,
 whose holders run at the process ceiling; a read of the console is a long
 operation in two steps that a signal interrupts. Guest probes check them on
-QEMU and Apple VZ. `ash` still runs on Picolibc until step 5a′ moves it to
-relibc. Details are in
+QEMU and Apple VZ. Details are in
 [docs/status.md](docs/status.md).
 
 **Tests.** The kernel test image runs 182 tests (197 under `-icount`),
@@ -105,9 +104,8 @@ Apple silicon.
 
 You need rustup, QEMU and dtc (on macOS: `brew install qemu dtc`); rustup
 installs the toolchain from `rust-toolchain.toml`. The POSIX probes in
-`test` and `ci` also need Clang/LLVM, LLD and Python 3; the Picolibc and
-BusyBox commands need Meson, Ninja, GNU Make and Git as well (on macOS:
-`brew install llvm lld meson ninja make`). The VZ commands need the Xcode
+`test` and `ci` also need Clang/LLVM, LLD, Python 3, GNU Make and Git (for
+relibc and BusyBox; on macOS: `brew install llvm lld make`). The VZ commands need the Xcode
 command line tools for `swiftc` and `codesign`.
 
 ```sh
@@ -138,7 +136,7 @@ Bounded kernel paths and their costs:
 | `services/` | `init`, the UART driver, the RAM file, clock and process services |
 | `apps/` | the native shell |
 | `tests/` | guest test programs and probes |
-| `tools/` | Picolibc, BusyBox and sysroot builds, the VZ runner, licence check |
+| `tools/` | relibc and BusyBox builds, the VZ runner, licence check |
 | `xtask/` | build, run, test and measurement commands |
 | `docs/` | debugging, kernel paths, status details, third-party licences |
 | `notes/` | design notes of individual parts |
@@ -199,9 +197,8 @@ The kernel, `kcore`, services, drivers, the shell, `xtask`, the tests,
 `lib/ext4ro` and the POSIX crates that programs do not link
 (`lib/posix-signal-queue`, `lib/posix-credentials`) are under
 GPL-3.0-or-later ([LICENSE](LICENSE)). The libraries that programs link
-(`lib/abi`, `lib/rt`, `lib/bootimg`, `lib/process-client`, `proto/*`) and
-the temporary Picolibc bridge `lib/posix` are under MIT
-([LICENSE-MIT](LICENSE-MIT)).
+(`lib/abi`, `lib/rt`, `lib/bootimg`, `lib/process-client`, `proto/*`) are
+under MIT ([LICENSE-MIT](LICENSE-MIT)).
 
 The POSIX system layer that programs link (crates listed by
 `tools/check-licenses.py`) is GPL-3.0-or-later with the GCC Runtime Library
@@ -209,10 +206,10 @@ Exception 3.1 ([LICENSE-GCC-exception-3.1](LICENSE-GCC-exception-3.1)):
 programs under any licence, including GPL-2.0-only BusyBox, may link it.
 Services stay GPL-3.0-or-later. relibc and its dependencies keep their own
 licences (THIRD-PARTY-NOTICES, which `tools/check-licenses.py` writes to
-`target/relibc/`).
+`target/relibc/` and every boot image with a program on relibc carries).
 
 Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
-ci` checks the licence of every crate and file, that BusyBox links no bare
-GPL-3.0 code, and that relibc and everything it links are under licences
+ci` checks the licence of every crate and file, that the GPL-2.0-only
+programs (BusyBox) link no bare GPL-3.0 code, and that relibc and everything it links are under licences
 GPL-2.0-only takes. Other third-party dependencies keep their own licences
 ([docs/licenses](docs/licenses)).

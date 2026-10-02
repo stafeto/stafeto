@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Invoke BusyBox's dispatcher from the boot image.
+//! BusyBox on relibc: the probe's C main invokes BusyBox's dispatcher.
 
 #![no_std]
 #![no_main]
@@ -14,29 +14,21 @@
 compile_error!("choose one BusyBox probe");
 
 use core::ffi::{c_char, c_int};
-use rt::handle::Resource;
 
-rt::entry!(main);
+// posix-crt starts the process and hands the thread to relibc, which calls
+// `main` below.
+#[used]
+static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 
 unsafe extern "C" {
-    #[link_name = "main"]
+    /// BusyBox's main, renamed when tools/build-busybox.py compiles it.
     fn busybox_main(argc: c_int, argv: *const *const c_char) -> c_int;
 }
 
-fn main(_: u64) -> u64 {
-    let Ok(mut start) = rt::startup() else {
-        return 1;
-    };
-    if let Ok(console) = start.take::<Resource>("console") {
-        rt::console::set(console);
-    }
-    #[cfg(feature = "ash-interactive")]
-    let connected = posix_bridge::init_with_uart(&start.parent);
-    #[cfg(not(feature = "ash-interactive"))]
-    let connected = posix_bridge::init(&start.parent);
-    if connected.is_err() {
-        return 2;
-    }
+/// The probe's C main: the applet and its arguments of the build's
+/// feature, then BusyBox's dispatcher.
+#[unsafe(no_mangle)]
+extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
     #[cfg(not(any(
         feature = "ash-probe",
         feature = "ash-interactive",
@@ -72,7 +64,7 @@ fn main(_: u64) -> u64 {
         c"/etc".as_ptr(),
         core::ptr::null(),
     ];
-    // SAFETY: BusyBox and Picolibc are statically linked; argv has
+    // SAFETY: BusyBox and relibc are statically linked; argv has
     // NUL-terminated strings and a final null pointer.
     let code = unsafe { busybox_main((argv.len() - 1) as c_int, argv.as_ptr()) };
     if code == 0 {
@@ -80,5 +72,5 @@ fn main(_: u64) -> u64 {
     } else {
         rt::println!("busybox-probe: failed {code}");
     }
-    code as u64
+    code
 }

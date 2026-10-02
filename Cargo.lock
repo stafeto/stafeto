@@ -23,17 +23,7 @@ dependencies = [
 name = "busybox-probe"
 version = "0.1.0"
 dependencies = [
- "posix-bridge",
- "rt",
-]
-
-[[package]]
-name = "cprobe"
-version = "0.1.0"
-dependencies = [
- "posix-bridge",
- "proto-fs",
- "proto-wire",
+ "posix-crt",
  "rt",
 ]
 
@@ -159,15 +149,6 @@ name = "posix-abi-probe"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
-]
-
-[[package]]
-name = "posix-bridge"
-version = "0.1.0"
-dependencies = [
- "proto-fs",
- "proto-wire",
- "rt",
 ]
 
 [[package]]

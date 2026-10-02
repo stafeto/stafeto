@@ -60,22 +60,11 @@ pub const TABLE: &[Record] = &[
 /// A POSIX process: main at the probe's level, the ceiling one above it,
 /// where the holders of the locks of `posix-abi` (buckets, heap, files,
 /// threads, actions) run, so an application thread at main's level never
-/// delays them. Programs on `posix-bridge` (`cprobe`, `busybox-probe`)
-/// share the record and its ceiling.
+/// delays them. BusyBox shares the record and its ceiling.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     ..TABLE[1]
 };
-
-pub const CPROBE_TABLE: &[Record] = &[
-    TABLE[0],
-    Record {
-        name: "cprobe",
-        program: "cprobe",
-        quota: 512 * PAGE,
-        ..POSIX
-    },
-];
 
 /// BusyBox, or a probe in its place, with the RAM files and the process
 /// and clock services a program on relibc starts with.
@@ -88,6 +77,8 @@ pub const BUSYBOX_TABLE: &[Record] = &[
         program: "busybox-probe",
         connects: &["ramfs", "clock", "posix"],
         quota: 512 * PAGE,
+        // The first POSIX process: root, so ash prompts with `#`.
+        root: true,
         ..POSIX
     },
 ];

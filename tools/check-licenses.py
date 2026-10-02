@@ -15,6 +15,7 @@ import importlib.util
 import json
 import re
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -181,9 +182,6 @@ def workspace() -> None:
         manifest = Path(package["manifest_path"]).relative_to(ROOT)
         if package["license"] == EXCEPTION:
             fail(f"{package['name']} has the exception but no program links it")
-        # The bridge of Picolibc programs is MIT until relibc replaces it.
-        if package["name"] == "posix-bridge":
-            continue
         if (package["name"].startswith("posix-") or manifest.parts[0] == "services") \
                 and package["license"] != GPL:
             fail(f"{package['name']} must be {GPL}")
@@ -210,13 +208,20 @@ def workspace() -> None:
     print(f"the layer programs link is {EXCEPTION}: {', '.join(layer)}")
     print(f"programs link {len(linked & members)} workspace crates, MIT or with the exception;"
           f" the other POSIX crates and the services are {GPL}")
-    # 5: the GPL-2.0-only BusyBox links no bare GPLv3 code.
-    busybox = named["busybox-probe"]["id"]
-    for package_id in closure(data, [busybox]) - {busybox}:
-        license_name = packages[package_id]["license"] or ""
-        if license_name != EXCEPTION and not allowed(license_name):
-            fail(f"BusyBox links {packages[package_id]['name']} under {license_name!r}")
-    print("BusyBox links MIT, GPL-2.0-only compatible and exception crates alone")
+    # 5: a GPL-2.0-only program (BusyBox) links no bare GPLv3 code: neither
+    # its crates (here) nor relibc's libc.a, which it links too (item 6).
+    gpl2 = sorted((packages[i] for i in members if packages[i]["license"] == "GPL-2.0-only"),
+                  key=lambda package: package["name"])
+    if "busybox-probe" not in [package["name"] for package in gpl2]:
+        fail("busybox-probe is no longer GPL-2.0-only")
+    for program in gpl2:
+        for package_id in closure(data, [program["id"]]) - {program["id"]}:
+            license_name = packages[package_id]["license"] or ""
+            if license_name != EXCEPTION and not allowed(license_name):
+                fail(f"{program['name']} (GPL-2.0-only) links {packages[package_id]['name']}"
+                     f" under {license_name!r}")
+    print(f"GPL-2.0-only programs ({', '.join(p['name'] for p in gpl2)}) link MIT,"
+          " GPL-2.0-only compatible and exception crates alone")
     drivers(data, packages, named)
 
 
@@ -328,7 +333,10 @@ def write_notices(notices) -> None:
 
 
 def main() -> None:
-    workspace()
+    # --notices: relibc's closure and THIRD-PARTY-NOTICES alone (item 6),
+    # for cargo xtask relibc, which puts the file into the boot images.
+    if "--notices" not in sys.argv[1:]:
+        workspace()
     relibc()
 
 

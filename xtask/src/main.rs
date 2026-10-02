@@ -375,11 +375,6 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-threads", "relibc-threads", POSIX_STACK_SIZE, &[]),
 ];
-const CPROBE_PROGRAMS: [ImageProgram; 3] = [
-    ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
-    ("cprobe", "cprobe", POSIX_STACK_SIZE, &[]),
-];
 const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -850,7 +845,6 @@ commands:
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
-  cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
   ash-shell  run an interactive BusyBox ash in QEMU (Ctrl-A X quits)
@@ -902,7 +896,6 @@ fn main() {
                 Ok(())
             }
         },
-        Some("cprobe") => cprobe(),
         Some("posix-cancel-input") => posix_cancel_input_probe(false),
         Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
         Some("posix-threads") => posix_thread_probe(false),
@@ -1177,7 +1170,23 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
         disasm::erratum_835769(elf, &objdump)?;
         files.push((*file, written, elf.clone()));
     }
-    let list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+    let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
+    // An image with a program on relibc carries relibc's licence notices.
+    let mut relibc = false;
+    for (_, elf, _) in sources {
+        relibc |= links_relibc(&std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))?);
+    }
+    let notices = if relibc {
+        Some(
+            std::fs::read(notices_path())
+                .map_err(|e| format!("{NOTICES}: {e}: cargo xtask relibc writes it"))?,
+        )
+    } else {
+        None
+    };
+    if let Some(notices) = &notices {
+        list.push((NOTICES, notices.as_slice()));
+    }
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
     std::fs::write(&path, &image).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1605,8 +1614,51 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
 
 /// relibc for stafeto in target/relibc/sysroot; nothing when its stamp
 /// matches.
+/// relibc's licence notices, which tools/check-licenses.py writes from
+/// its closure (item 6) and the boot images carry.
+fn notices_path() -> PathBuf {
+    target_dir().join("relibc/THIRD-PARTY-NOTICES")
+}
+
+/// The name of the notices in a boot image.
+const NOTICES: &str = "THIRD-PARTY-NOTICES";
+
 fn relibc() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))
+    run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))?;
+    // The notices follow each build of relibc.
+    let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let library = modified(target_dir().join("relibc/sysroot/lib/libc.a"));
+    if modified(notices_path()) < library {
+        run_cmd(
+            Command::new("python3")
+                .arg(root().join("tools/check-licenses.py"))
+                .arg("--notices"),
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether the ELF `bytes` links relibc: its start's symbol is there.
+fn links_relibc(bytes: &[u8]) -> bool {
+    bytes
+        .windows(b"relibc_start_v1".len())
+        .any(|window| window == b"relibc_start_v1")
+}
+
+/// Fails unless the boot image at `path` carries relibc's notices.
+fn image_has_notices(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let image =
+        bootimg::BootImage::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let notices = std::fs::read(notices_path()).map_err(|e| format!("{NOTICES}: {e}"))?;
+    if image
+        .files()
+        .any(|file| file.name == NOTICES && file.data == notices.as_slice())
+    {
+        Ok(())
+    } else {
+        Err(format!("{} carries no {NOTICES}", path.display()))
+    }
 }
 
 fn relibc_hello_probe() -> Result<(), String> {
@@ -1675,20 +1727,8 @@ fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
 /// The threads probe runs about 10^5 turns of each object on TCG.
 const RELIBC_THREADS_TIMEOUT: Duration = Duration::from_secs(240);
 
-fn cprobe() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
-    let kernel = build(Variant::Normal)?;
-    let image = build_boot_image("boot-cprobe.img", &CPROBE_PROGRAMS, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
-    cmd.args(qemu::HEADLESS);
-    let output = run_until(cmd, BOOT_TIMEOUT, Some("cprobe: ok"), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, "cprobe: ok")?;
-    println!("Picolibc C-program guest probe passed");
-    Ok(())
-}
-
 fn busybox_probe() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    relibc()?;
     if std::env::var_os("STAFETO_BUSYBOX_ROOT").is_none() {
         run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     }
@@ -1700,12 +1740,13 @@ fn busybox_probe() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "stafeto ramfs")?;
-    println!("BusyBox cat guest probe passed");
+    image_has_notices(&image)?;
+    println!("BusyBox cat guest probe passed, {NOTICES} in its image");
     Ok(())
 }
 
 fn ash_probe() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash.img", &ASH_PROGRAMS, BOOT_PROFILE)?;
@@ -1720,7 +1761,7 @@ fn ash_probe() -> Result<(), String> {
 }
 
 fn ash_dialog() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
@@ -1759,6 +1800,12 @@ fn ash_dialog() -> Result<(), String> {
         run.send("le /?")?;
         run.expect("le /?", DIALOG_STEP)?;
         run.expect("ash: le: not found", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // A command with a path is no applet: ash forks for it, which
+        // stafeto refuses (ENOSYS until 5b), and the shell goes on.
+        run.send("/bin/x")?;
+        run.expect("/bin/x", DIALOG_STEP)?;
+        run.expect("ash: can't fork: Function not implemented", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls /missing")?;
         run.expect("ls /missing", DIALOG_STEP)?;
@@ -1843,7 +1890,7 @@ fn ash_dialog() -> Result<(), String> {
 }
 
 fn ash_shell() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
@@ -1856,7 +1903,7 @@ fn ash_shell() -> Result<(), String> {
 }
 
 fn ls_probe() -> Result<(), String> {
-    run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
+    relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ls.img", &LS_PROGRAMS, BOOT_PROFILE)?;
@@ -1879,6 +1926,11 @@ fn test() -> Result<(), String> {
     posix_abi_probe()?;
     relibc_hello_probe()?;
     relibc_threads_probe(&qemu::VIRT)?;
+    // BusyBox on relibc guards the C surface (5a′).
+    busybox_probe()?;
+    ash_probe()?;
+    ash_dialog()?;
+    ls_probe()?;
     rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
@@ -3254,6 +3306,10 @@ fn hvf() -> Result<(), String> {
         }
         console_dialog(m)?;
         trace_dialog(m)?;
+        // relibc's pthreads on the real processor: about a second.
+        if m.name == qemu::HVF_V3.name {
+            relibc_threads_probe(m)?;
+        }
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -3275,7 +3331,7 @@ fn hvf() -> Result<(), String> {
         }
         write_measures()?;
         println!(
-            "hvf on {}: boot ok, console dialog ok, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
+            "hvf on {}: boot ok, console dialog ok, relibc threads ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }

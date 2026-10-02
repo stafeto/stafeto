@@ -124,14 +124,15 @@ provides the C side of each.
 Not there yet: `exec`, `fork`, `waitpid`, pipes, process-directed and
 queued signals, `SA_RESTART` beyond console reads, conditions, semaphores, POSIX timers,
 stdio, `termios`, asynchronous cancellation, general ELF TLS. BusyBox
-still uses the Picolibc bridge; see [m2-ram-posix](../notes/m2-ram-posix.md).
+runs on relibc since 5a′; see [m2-ram-posix](../notes/m2-ram-posix.md) for
+its first steps.
 
 ## Probe commands
 
 `cargo xtask help` lists them all. `posix-abi` runs the thread,
 cancellation, shared-state, input and interruption probes as well, and
-`test` and `ci` run `posix-abi`, `ramfs` and `ext4ro`. The BusyBox and
-Picolibc probes run only on request.
+`test` and `ci` run `posix-abi`, `ramfs`, `ext4ro`, the relibc probes and
+the BusyBox probes.
 
 | Command | Checks |
 |---|---|
@@ -143,8 +144,7 @@ Picolibc probes run only on request.
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
 | `console-early-exit-vz` | the driver ends on Apple VZ before its function decodes its BARs: `init` skips the reset through BAR 0, clears the command word and restarts it |
-| `cprobe` | a static Picolibc C program against the RAM service |
-| `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox `cat`, `ash -c`, an `ash` dialog, `ls` |
+| `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox on relibc: `cat`, `ash -c`, an `ash` dialog (with `can't fork` for `/bin/x`), `ls` |
 
 ## rtbench
 
