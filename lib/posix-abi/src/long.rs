@@ -65,10 +65,42 @@ impl Errno for Error {
     }
 }
 
+/// Keeps the caller's NO_RESTART across a nested long operation: a
+/// handler without SA_RESTART that ran while the outer one waited stays
+/// seen by it, whatever the inner one clears (a handler may read too).
+struct OuterRestart(u32);
+
+impl OuterRestart {
+    fn enter(flags: &core::sync::atomic::AtomicU32) -> OuterRestart {
+        OuterRestart(flags.fetch_and(!flag::NO_RESTART, Ordering::SeqCst) & flag::NO_RESTART)
+    }
+}
+
+impl Drop for OuterRestart {
+    fn drop(&mut self) {
+        crate::threads::own_block()
+            .flags
+            .fetch_or(self.0, Ordering::SeqCst);
+    }
+}
+
+/// Whether the wait of the operation ends with "cancel k": a request of
+/// cancellation, or a handler without SA_RESTART ran since it started.
+fn ending(flags: &core::sync::atomic::AtomicU32) -> bool {
+    crate::threads::cancel::requested() || flags.load(Ordering::SeqCst) & flag::NO_RESTART != 0
+}
+
 /// Runs a long operation on `service`: `start` is its first request,
 /// `keyed(cancel, k)` writes "take k" or "cancel k". The result goes into
 /// `out`; its length, or EINTR when a signal or cancellation ended it with
-/// no effect.
+/// no effect. Once the service answered WAIT k, every way out of here
+/// goes through a "take k" that brings the result or a "cancel k": a
+/// "take" that the kernel took back from the queue (EINTR), or a labelled
+/// copy that could not be made, ends as an entry in the wait does. The
+/// service keeps the operation until then, or until the client's session
+/// goes: a thread that leaves between the two steps past this function
+/// (siglongjmp, asynchronous cancellation, thread_exit) leaves it there
+/// until the session goes.
 pub fn run(
     service: &Handle<Channel>,
     start: &[u8],
@@ -89,17 +121,27 @@ pub fn run(
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
-    block.flags.fetch_and(!flag::NO_RESTART, Ordering::SeqCst);
+    let _outer = OuterRestart::enter(&block.flags);
     // The first take brings the labelled copy: the service keeps it while
-    // the operation waits.
-    let labelled = sys::handle_label(&channel, Rights::NOTIFY | Rights::TRANSFER, key, level)
-        .map_err(|_| EAGAIN)?;
-    match call(service, take.as_bytes(), Some(labelled), out)? {
-        (long::READY, n, _) => return Ok(n),
-        (long::ARMED, _, _) => {}
-        _ => return Err(EIO),
-    }
-    let cancel = loop {
+    // the operation waits. A take the kernel took back left the service
+    // without it, and the next one brings a new copy.
+    let mut armed = false;
+    let cancel = 'wait: loop {
+        if !armed {
+            let Ok(labelled) =
+                sys::handle_label(&channel, Rights::NOTIFY | Rights::TRANSFER, key, level)
+            else {
+                break 'wait Some(EAGAIN);
+            };
+            match call(service, take.as_bytes(), Some(labelled), out) {
+                Ok((long::READY, n, _)) => return Ok(n),
+                Ok((long::ARMED, _, _)) => armed = true,
+                Ok(_) => break 'wait Some(EIO),
+                Err(EINTR) if ending(&block.flags) => break 'wait None,
+                Err(EINTR) => continue,
+                Err(error) => break 'wait Some(error),
+            }
+        }
         match sys::receive(&channel) {
             Ok(sys::Received::Notification {
                 source: Source::Session,
@@ -107,10 +149,13 @@ pub fn run(
                 bits,
                 ..
             }) if label == key && bits & 1 != 0 => {
-                match call(service, take.as_bytes(), None, out)? {
-                    (long::READY, n, _) => return Ok(n),
-                    (long::ARMED, _, _) => {}
-                    _ => return Err(EIO),
+                match call(service, take.as_bytes(), None, out) {
+                    Ok((long::READY, n, _)) => return Ok(n),
+                    Ok((long::ARMED, _, _)) => {}
+                    Ok(_) => break 'wait Some(EIO),
+                    Err(EINTR) if ending(&block.flags) => break 'wait None,
+                    Err(EINTR) => {}
+                    Err(error) => break 'wait Some(error),
                 }
             }
             Ok(sys::Received::Notification {
@@ -118,26 +163,25 @@ pub fn run(
                 bits,
                 ..
             }) if bits & posix_sync::bit::CANCEL != 0 && crate::threads::cancel::requested() => {
-                break true;
+                break 'wait None;
             }
             Ok(_) => {}
             Err(Error::Interrupted) => {
-                if crate::threads::cancel::requested()
-                    || block.flags.load(Ordering::SeqCst) & flag::NO_RESTART != 0
-                {
-                    break true;
+                if ending(&block.flags) {
+                    break 'wait None;
                 }
                 // Every handler that ran had SA_RESTART: wait on.
             }
             Err(error) => panic!("long operation receive: {error:?}"),
         }
     };
-    debug_assert!(cancel);
+    // "Cancel k": the result if it was ready, nothing otherwise; the
+    // error of the way out, EINTR for an entry or a cancellation.
     let request = request(true).map_err(|_| EIO)?;
     loop {
         match call(service, request.as_bytes(), None, out) {
             Ok((long::READY, n, _)) => return Ok(n),
-            Ok((long::CANCELLED, _, _)) => return Err(EINTR),
+            Ok((long::CANCELLED, _, _)) => return Err(cancel.unwrap_or(EINTR)),
             Err(EINTR) => {}
             Ok(_) => return Err(EIO),
             Err(error) => return Err(error),

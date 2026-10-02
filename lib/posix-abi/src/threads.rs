@@ -139,6 +139,9 @@ struct Entry {
     ended: bool,
     /// It ended past pthread_exit and left LIVE for it.
     counted_out: bool,
+    /// Its joiner or creator left it while `observe` looked at it: the
+    /// observer takes it back.
+    deferred_leave: bool,
 }
 struct Registry {
     entries: [Option<Entry>; CAPACITY],
@@ -219,6 +222,18 @@ impl Registry {
             mapping: entry.mapping,
         }
     }
+    /// `leave`, unless `observe` looks at the thread now: then the
+    /// observer takes it back when it is done.
+    fn leave_or_defer(&mut self, slot: usize) -> Option<Leaving> {
+        if reserved(slot) {
+            self.entries[slot]
+                .as_mut()
+                .expect("an entry")
+                .deferred_leave = true;
+            return None;
+        }
+        Some(self.leave(slot))
+    }
     /// A thread that ended through thread_exit, past pthread_exit, leaves
     /// the count of live threads here, once.
     fn end_past_library(&mut self, slot: usize) {
@@ -270,43 +285,77 @@ fn exit_told(exit: u64) -> bool {
     )
 }
 
-/// Looks, outside the table's lock, at the exit channels of the threads
-/// `pick` chooses and that are not told ended yet; under the lock it marks
-/// those the kernel told of as ended, counts out those that ended past
-/// pthread_exit, and gives the slots `then`, which may take them out.
-fn observe(pick: impl Fn(&Entry) -> bool, then: impl FnOnce(&mut Registry, u64)) {
-    let mut exits = [0u64; CAPACITY];
+/// How `observe` looks at a thread outside the table's lock.
+#[derive(Clone, Copy)]
+enum Look {
+    /// The notification of its end on its exit channel, which it takes.
+    Exit,
+    /// Its state (thread_info): its exit channel stays as it is for a
+    /// joiner.
+    State,
+}
+
+/// Looks, outside the table's lock, at the threads `pick` chooses that are
+/// not told ended yet, their slots reserved meanwhile; under the lock it
+/// marks those that ended, counts out those that ended past pthread_exit,
+/// takes back those their joiner left meanwhile, and gives the slots of
+/// the ended ones to `then`, which may take them out.
+fn observe(look: Look, pick: impl Fn(&Entry) -> bool, then: impl FnOnce(&mut Registry, u64)) {
+    let mut raws = [0u64; CAPACITY];
     let looked = registry(|r| {
         let mut looked = 0u64;
-        for (slot, (entry, raw)) in r.entries.iter().zip(exits.iter_mut()).enumerate() {
+        for (slot, (entry, raw)) in r.entries.iter().zip(raws.iter_mut()).enumerate() {
             if let Some(entry) = entry.as_ref()
                 && !entry.ended
                 && pick(entry)
                 && let Some(exit) = entry.exit.as_ref()
                 && reserve(slot)
             {
-                *raw = exit.raw().0;
+                *raw = match look {
+                    Look::Exit => exit.raw().0,
+                    Look::State => entry.native.raw().0,
+                };
                 looked |= 1 << slot;
             }
         }
         looked
     });
     let mut told = 0u64;
-    for (slot, &exit) in exits.iter().enumerate() {
-        if looked & (1 << slot) != 0 && exit_told(exit) {
+    for (slot, &raw) in raws.iter().enumerate() {
+        let ended = looked & (1 << slot) != 0
+            && match look {
+                Look::Exit => exit_told(raw),
+                Look::State => sys::thread_info(&Handle::<Thread>::borrowed(rt::abi::Handle(raw)))
+                    .is_ok_and(|i| i.state == ThreadState::Ended),
+            };
+        if ended {
             told |= 1 << slot;
         }
     }
+    let mut deferred: [Option<Leaving>; CAPACITY] = [const { None }; CAPACITY];
     registry(|r| {
-        for slot in 0..CAPACITY {
+        let mut kept = 0u64;
+        for (slot, out) in deferred.iter_mut().enumerate() {
+            if looked & (1 << slot) == 0 {
+                continue;
+            }
+            let entry = r.entries[slot].as_mut().expect("a looked entry");
             if told & (1 << slot) != 0 {
-                r.entries[slot].as_mut().expect("a looked entry").ended = true;
+                entry.ended = true;
                 r.end_past_library(slot);
             }
+            if r.entries[slot].as_ref().is_some_and(|e| e.deferred_leave) {
+                // `leave` keeps the slot reserved until its cleaning.
+                *out = Some(r.leave(slot));
+                kept |= 1 << slot;
+            }
         }
-        RESERVED.fetch_and(!looked, Ordering::SeqCst);
+        RESERVED.fetch_and(!(looked & !kept), Ordering::SeqCst);
         then(r, told);
     });
+    for left in deferred.into_iter().flatten() {
+        left.clean();
+    }
 }
 
 /// Takes back the detached threads that ended: their exit channels looked
@@ -314,6 +363,7 @@ fn observe(pick: impl Fn(&Entry) -> bool, then: impl FnOnce(&mut Registry, u64))
 fn reap() {
     let mut leaving: [Option<Leaving>; CAPACITY] = [const { None }; CAPACITY];
     observe(
+        Look::Exit,
         |entry| entry.detached,
         |r, _| {
             for (slot, out) in leaving.iter_mut().enumerate() {
@@ -366,6 +416,7 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
         claimed: false,
         ended: false,
         counted_out: false,
+        deferred_leave: false,
     });
     READY.store(true, Ordering::Release);
     Ok(())
@@ -549,6 +600,7 @@ pub unsafe extern "C" fn pthread_create(
                 claimed: false,
                 ended: false,
                 counted_out: false,
+                deferred_leave: false,
             });
             release(slot);
             LIVE.fetch_add(1, Ordering::SeqCst);
@@ -558,9 +610,11 @@ pub unsafe extern "C" fn pthread_create(
         if sys::thread_start(&Handle::<Thread>::borrowed(raw)).is_err() {
             let left = registry(|r| {
                 LIVE.fetch_sub(1, Ordering::SeqCst);
-                r.leave(slot)
+                r.leave_or_defer(slot)
             });
-            left.clean();
+            if let Some(left) = left {
+                left.clean();
+            }
             return Err(EAGAIN);
         }
         Ok(id)
@@ -756,9 +810,11 @@ pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32
         if exit.is_some() {
             r.end_past_library(slot);
         }
-        r.leave(slot)
+        r.leave_or_defer(slot)
     });
-    left.clean();
+    if let Some(left) = left {
+        left.clean();
+    }
     point.end();
     if !out.is_null() {
         unsafe { out.write(value as *mut c_void) };
@@ -861,24 +917,17 @@ pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
     sys::thread_exit()
 }
 
-/// Counts out the threads of the table that ended past pthread_exit;
-/// whether no application thread is left then.
+/// Counts out the threads of the table that ended past pthread_exit, by
+/// their state, outside the table's lock; whether no application thread is
+/// left then.
 fn others_ended() -> bool {
     let me = tls::thread_id();
-    registry(|r| {
-        for slot in 1..CAPACITY {
-            let past = r.entries[slot].as_ref().is_some_and(|e| {
-                e.id != me
-                    && !e.counted_out
-                    && block_of(slot).end.load(Ordering::SeqCst) == 0
-                    && sys::thread_info(&e.native).is_ok_and(|i| i.state == ThreadState::Ended)
-            });
-            if past {
-                r.end_past_library(slot);
-            }
-        }
-        LIVE.load(Ordering::SeqCst) == 0
-    })
+    observe(
+        Look::State,
+        |entry| entry.id != me && !entry.counted_out,
+        |_, _| {},
+    );
+    LIVE.load(Ordering::SeqCst) == 0
 }
 
 /// # Safety

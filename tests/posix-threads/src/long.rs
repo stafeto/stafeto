@@ -17,6 +17,7 @@ static RESULT: AtomicU64 = AtomicU64::new(0);
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 const STATS: u16 = 17;
 const FEED: u16 = 18;
+const HOLD: u16 = 20;
 const VERSION: u16 = proto_uart::VERSION;
 
 fn service() -> core::mem::ManuallyDrop<Handle<Channel>> {
@@ -248,5 +249,51 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     rt::println!(
         "long-op-probe: the 17th operation of a session gets EAGAIN; a client that goes frees its record and handle"
     );
+    // A signal takes back the "take" that waits in the queue of the
+    // service, which holds 50 ms after its WAIT: the read cancels, EINTR,
+    // nothing stays in the service, and the next read goes through.
+    if !handler(0) {
+        return failed(681);
+    }
+    let mut w = Writer::new();
+    proto_wire::Header::new(HOLD, VERSION)
+        .write(&mut w)
+        .unwrap();
+    w.u32(50).unwrap();
+    if sys::send(&channel, w.as_bytes()).is_err() {
+        return failed(681);
+    }
+    RESULT.store(0, Ordering::SeqCst);
+    let mut id = 0;
+    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0
+    {
+        return failed(682);
+    }
+    let native = unsafe { threads::probe_native(id) }.expect("reader handle");
+    let pause = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let queued = sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::Sending);
+    if !queued
+        || api::pthread_kill(id, SIGUSR1) != 0
+        || joined(id) != 0x1000 + EINTR as u64
+        || stats(&channel) != (0, 0)
+    {
+        rt::println!(
+            "long-op-probe: take queued {}, then {:?} in the service",
+            queued,
+            stats(&channel)
+        );
+        return failed(683);
+    }
+    let Some(id) = waiting_reader() else {
+        return failed(684);
+    };
+    if !feed(b'h') || joined(id) != u64::from(b'h') {
+        return failed(684);
+    }
+    rt::println!("long-op-probe: a signal that takes back a queued take cancels the operation");
     true
 }

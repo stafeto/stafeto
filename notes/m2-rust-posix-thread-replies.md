@@ -1,5 +1,9 @@
 # Rust POSIX retained pthread replies
 
+History: the pthread owner and its reply journal are gone (pthreads run
+in the calling thread, and the kernel answers an accepted request once).
+This note records how the removed journal worked.
+
 ## Problem and result
 
 The pthread owner previously kept one cached reply per caller. A native handler
@@ -14,7 +18,7 @@ join, once, mutex and sleep completion. Retrying a ready operation returns its
 stored value. Pending retries keep the existing record and replace the rejected
 wait token through the existing waiting protocols. No handler runs on the owner.
 
-Clients copy all three reply words before REPLY_ACK. That private operation
+Clients copied all three reply words before the acknowledgement. That private operation
 removes only the caller/nonce pair, allocates no record, and tolerates repetition
 after removal. Its interruption retries internally. A new nested request never
 replaces an ancestor result, and no fixed per-thread reply depth is introduced.
@@ -48,7 +52,7 @@ and retains its 64 KiB stack without large stack initialization temporaries.
 Reservation failure precedes effects, returning EAGAIN for CREATE and ENOMEM
 for other operations. Acknowledgement can proceed with no free handle/memory.
 
-The test owner-pause request now parks after its matching REPLY_ACK reply.
+The test owner-pause request parked after its matching acknowledgement reply.
 Parking after the initial reply would prevent the client from acknowledging it.
 Caller/nonce captures keep a previous reply from using the next probe's gate.
 Existing deadline, cancellation, priority and memory-baseline probes are retained.

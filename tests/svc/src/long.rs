@@ -18,6 +18,10 @@
 //! - PING: the status alone (rtbench S9);
 //! - STATS: the operations that wait and the handles they hold;
 //! - FEED: one byte, after the header, for the reads that wait for one;
+//! - HOLD with a u32 of milliseconds: after its next WAIT reply the
+//!   service waits that long on a channel of its own, out of `receive` on
+//!   its service channel, so that a request sent meanwhile stands in the
+//!   queue, where an interrupt can take it back;
 //! - STORM with a thread handle (MANAGE): the service keeps the thread and
 //!   replies with a labelled copy of its channel with NOTIFY and TRANSFER,
 //!   which the client hands to the clock service (WATCH); then the clock
@@ -35,7 +39,7 @@ use abi::{Error, Rights};
 use proto_uart::{Method, ReadKey, ReadRequest, VERSION, WriteReply};
 use proto_wire::{HEADER_LEN, Status, long};
 use rt::handle::{Channel, Outgoing, Thread, Timer};
-use rt::service::{Answer, LongOps, Notice, Request, Service, Session};
+use rt::service::{Answer, LongOps, LongSession, Notice, Request, Service, Session};
 use rt::startup::Startup;
 use rt::{Handle, sys, time};
 
@@ -44,6 +48,7 @@ pub const PING: u16 = 16;
 pub const STATS: u16 = 17;
 pub const FEED: u16 = 18;
 pub const STORM: u16 = 19;
+pub const HOLD: u16 = 20;
 /// The delay from a timed read to the readiness of its data.
 const DELAY_NS: u64 = 1_000_000;
 /// The fewest bytes of a timed read.
@@ -52,6 +57,9 @@ const TIMED: u32 = 16;
 const TIMER_LABEL: u64 = 1;
 /// The label of the copy of the channel STORM gives.
 const STORM_LABEL: u64 = 2;
+/// The label of the copy of the channel the service tells itself to hold
+/// with.
+const HOLD_LABEL: u64 = 3;
 const OPS: usize = 24;
 
 pub fn run(s: Startup) -> u64 {
@@ -67,6 +75,15 @@ pub fn run(s: Startup) -> u64 {
     let Ok(timer) = sys::timer_create(&labelled, level) else {
         return FAILED;
     };
+    let Ok(hold) = sys::handle_label(&channel, Rights::NOTIFY, HOLD_LABEL, level) else {
+        return FAILED;
+    };
+    let Ok(pause) = sys::channel_create(level) else {
+        return FAILED;
+    };
+    let Ok(pause_timer) = sys::timer_create(&pause, level) else {
+        return FAILED;
+    };
     if rt::service::register(&s.parent, &channel).is_err() {
         return FAILED;
     }
@@ -76,6 +93,10 @@ pub fn run(s: Startup) -> u64 {
         channel: channel.raw(),
         level,
         storm: None,
+        hold_ms: 0,
+        hold,
+        pause,
+        pause_timer,
         seen: 0,
         requested: 0,
         awaiting: 0,
@@ -112,6 +133,13 @@ struct Long {
     /// The thread of STORM, and its counts: notifications, entry requests
     /// made, and those that found the thread waiting for its reply.
     storm: Option<Handle<Thread>>,
+    /// HOLD: the milliseconds to wait after the next WAIT, 0 for none; the
+    /// copy of the channel that tells the service so, and its own channel
+    /// and timer to wait on.
+    hold_ms: u32,
+    hold: Handle<Channel>,
+    pause: Handle<Channel>,
+    pause_timer: Handle<Timer>,
     seen: u64,
     requested: u32,
     awaiting: u32,
@@ -141,7 +169,7 @@ impl Long {
         }
     }
 
-    fn start(&mut self, r: &mut Request<'_>) -> Answer {
+    fn start(&mut self, session: &mut LongSession, r: &mut Request<'_>) -> Answer {
         let request = match ReadRequest::read(r.body()) {
             Ok(request) => request,
             Err(status) => return Answer::Status(status),
@@ -150,7 +178,7 @@ impl Long {
         if !timed && let Some(byte) = self.fed.take() {
             return reply(r, long::Reply::Ready(&[byte]));
         }
-        let key = match self.ops.start(r.label()) {
+        let key = match self.ops.start(session, r.label()) {
             Ok(key) => key,
             Err(error) => return Answer::Status(Status::Kernel(error)),
         };
@@ -166,10 +194,13 @@ impl Long {
             result: None,
         });
         self.arm_timer();
+        if self.hold_ms != 0 {
+            let _ = sys::notify(&self.hold, 1);
+        }
         reply(r, long::Reply::Wait(key))
     }
 
-    fn take(&mut self, r: &mut Request<'_>, cancel: bool) -> Answer {
+    fn take(&mut self, session: &mut LongSession, r: &mut Request<'_>, cancel: bool) -> Answer {
         let key = match ReadKey::read(r.body()) {
             Ok(key) => key.key,
             Err(status) => return Answer::Status(status),
@@ -180,12 +211,12 @@ impl Long {
         };
         if let Some((bytes, len)) = self.data[place].as_ref().and_then(|o| o.result) {
             self.data[place] = None;
-            self.ops.finish(label, key);
+            self.ops.finish(session, label, key);
             return reply(r, long::Reply::Ready(&bytes[..len]));
         }
         if cancel {
             self.data[place] = None;
-            self.ops.finish(label, key);
+            self.ops.finish(session, label, key);
             return reply(r, long::Reply::Cancelled);
         }
         if !r.handles.is_empty() {
@@ -263,14 +294,15 @@ impl Service<1> for Long {
         STATS,
         FEED,
         STORM,
+        HOLD,
     ];
-    type Data = ();
+    type Data = LongSession;
 
-    fn request(&mut self, _: &mut Session<(), 1>, r: &mut Request<'_>) -> Answer {
+    fn request(&mut self, s: &mut Session<LongSession, 1>, r: &mut Request<'_>) -> Answer {
         match r.method() {
-            n if n == Method::ReadStart.number() => self.start(r),
-            n if n == Method::ReadTake.number() => self.take(r, false),
-            n if n == Method::ReadCancel.number() => self.take(r, true),
+            n if n == Method::ReadStart.number() => self.start(&mut s.data, r),
+            n if n == Method::ReadTake.number() => self.take(&mut s.data, r, false),
+            n if n == Method::ReadCancel.number() => self.take(&mut s.data, r, true),
             n if n == Method::Write.number() => {
                 let written = (r.bytes().len() - HEADER_LEN) as u32;
                 match (WriteReply { written }).write(r.reply()) {
@@ -310,13 +342,21 @@ impl Service<1> for Long {
                 Answer::Status(Status::Ok)
             }
             STORM => self.storm(r),
+            HOLD => {
+                let mut body = r.body();
+                let Ok(ms) = body.u32() else {
+                    return Answer::Status(Status::BadSize);
+                };
+                self.hold_ms = ms;
+                Answer::Status(Status::Ok)
+            }
             _ => Answer::Status(Status::Ok),
         }
     }
 
-    fn gone(&mut self, s: &mut Session<(), 1>) {
+    fn gone(&mut self, s: &mut Session<LongSession, 1>) {
         let label = s.label();
-        self.ops.gone(label);
+        self.ops.gone(&mut s.data);
         for op in &mut self.data {
             if op.as_ref().is_some_and(|o| o.label == label) {
                 *op = None;
@@ -325,6 +365,14 @@ impl Service<1> for Long {
     }
 
     fn notification(&mut self, n: Notice) {
+        if n.label == HOLD_LABEL && self.hold_ms != 0 {
+            let due = time::ticks_to_ns(time::now()) + u64::from(self.hold_ms) * 1_000_000;
+            self.hold_ms = 0;
+            if sys::timer_set(&self.pause_timer, due).is_ok() {
+                let _ = sys::receive(&self.pause);
+            }
+            return;
+        }
         if n.label == STORM_LABEL {
             self.seen += 1;
             if let Some(thread) = &self.storm

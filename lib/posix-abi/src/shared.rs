@@ -243,6 +243,7 @@ fn perform(
     }
 }
 
+#[cfg(feature = "thread-probe")]
 fn error_reply(code: i32) -> Writer {
     let mut out = Writer::new();
     Reply::Error(code)
@@ -251,6 +252,7 @@ fn error_reply(code: i32) -> Writer {
     out
 }
 
+#[cfg(feature = "thread-probe")]
 fn request_error(error: proto_wire::Status) -> i32 {
     match error {
         proto_wire::Status::UnknownMethod | proto_wire::Status::BadVersion => ENOSYS,
