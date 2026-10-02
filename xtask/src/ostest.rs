@@ -36,6 +36,8 @@ const PROGRAMS: [ImageProgram; 5] = [
 const ENDED: &str = "init: os-test ended: ";
 /// How a test ended with a status, after ENDED.
 const EXIT_CODE: &str = "exit code ";
+/// How a POSIX test ended by a signal, after ENDED: `signal N (NAME)`.
+const SIGNAL: &str = "signal ";
 /// The time a test may take on TCG, its boot included.
 const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -68,9 +70,10 @@ pub enum Ended {
 
 /// The end of the test whose boot printed `lines`. For an exit, the lines
 /// it wrote (the services' and init's own lines left out) and `exit: N`
-/// as misc/run.sh adds it; for a fault or a kill, its lines and `exit:
-/// signal` (run.sh's word for a death by a signal) with init's reason; a
-/// log without the end of the test is a FAIL `timeout`.
+/// as misc/run.sh adds it; a death by signal N is the shell's status 128 +
+/// N, as run.sh sees it; for a fault or a kill, its lines and `exit:
+/// signal` with init's reason; a log without the end of the test is a
+/// FAIL `timeout`.
 pub fn outcome(lines: &[String]) -> Ended {
     let Some(end) = lines.iter().position(|line| line.starts_with(ENDED)) else {
         return Ended::Failed("timeout: no end of the test\n".to_owned());
@@ -93,6 +96,14 @@ pub fn outcome(lines: &[String]) -> Ended {
             text.push_str(line);
             text.push('\n');
         }
+    }
+    let signal = how
+        .strip_prefix(SIGNAL)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse::<i64>().ok());
+    if let Some(n) = signal {
+        text.push_str(&format!("exit: {}\n", 128 + n));
+        return Ended::Exited(text);
     }
     let Some(status) = how.strip_prefix(EXIT_CODE) else {
         let reason = how.split(',').next().unwrap_or(how);
@@ -367,6 +378,17 @@ mod tests {
         ]);
         assert_eq!(
             outcome(&aborted),
+            Ended::Exited("NULL\nexit: 134\n".to_owned())
+        );
+        // A death by a signal, as init tells it of a POSIX process: the
+        // shell's status 128 + N.
+        let signaled = lines(&[
+            "init: services started",
+            "NULL",
+            "init: os-test ended: signal 6 (SIGABRT), not restarted",
+        ]);
+        assert_eq!(
+            outcome(&signaled),
             Ended::Exited("NULL\nexit: 134\n".to_owned())
         );
     }

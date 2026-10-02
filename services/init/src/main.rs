@@ -75,9 +75,22 @@ fn main(_: u64) -> u64 {
     let channel = sys::channel_create(CHANNEL_PRIORITY).expect("init makes its channel");
     let mut labels = Labels::new();
     let label = labels.next().expect("the first label");
-    let worker = worker::Worker::start(&init.process, &channel, &init.resource, label)
-        .expect("init starts its worker thread");
-    let mut service = serve::Init::new(init.process, init.resource, worker, labels, programs);
+    let worker = worker::Worker::start(
+        &init.process,
+        &channel,
+        &init.resource,
+        label,
+        init.boot_image,
+    )
+    .expect("init starts its worker thread");
+    let mut service = serve::Init::new(
+        init.process,
+        &channel,
+        init.resource,
+        worker,
+        labels,
+        programs,
+    );
     service.start(&channel, &order);
     let config = Config {
         issued: 0,

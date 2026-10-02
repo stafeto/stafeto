@@ -1748,13 +1748,14 @@ fn relibc_hello_probe() -> Result<(), String> {
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    // The four runs end in any order: the program, then abort, a failed
-    // assert and a panic of relibc, each with SIGABRT's status.
+    // The four runs end in any order: the program, then abort and a failed
+    // assert, which die by SIGABRT, and a panic of relibc, which exits
+    // with 134 itself.
     let ended = (|| {
         for line in [
             "init: relibc-hello ended: exit code 0, not restarted",
-            "init: relibc-abort ended: exit code 134, not restarted",
-            "init: relibc-assert ended: exit code 134, not restarted",
+            "init: relibc-abort ended: signal 6 (SIGABRT), not restarted",
+            "init: relibc-assert ended: signal 6 (SIGABRT), not restarted",
             "init: relibc-panic ended: exit code 134, not restarted",
         ] {
             run.expect_seen(line, BOOT_TIMEOUT)?;

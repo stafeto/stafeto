@@ -35,13 +35,18 @@ pub const MIN_QUOTA: u64 = 15 * PAGE;
 pub const MAX_DMA: usize = 2;
 /// The names init gives in start data besides the DMA objects (worker.rs):
 /// no window, binding or DMA object takes one.
-pub const START_DATA_NAMES: [&str; 4] = ["console", "log", "trace", PROCESS_SERVICE];
+pub const START_DATA_NAMES: [&str; 5] = ["console", "log", "trace", PROCESS_SERVICE, BOOT_IMAGE];
+/// The name of the boot image, read-only, in the start data of the
+/// process service: until the loader of 5c it loads the POSIX processes
+/// from there (serve.rs).
+pub const BOOT_IMAGE: &str = "bootimage";
 /// The name of the POSIX process service (spec 2, section 3.1). A record
-/// that connects to it is a POSIX process: init takes no CONNECT to it, and
-/// gives the process the session of its record in its start data under
-/// this name instead: the service takes the process with ADOPT and gives
-/// the session back with ADOPTED (serve.rs), and the process starts then.
-/// Init never sends the service a request (spec 6.7).
+/// that connects to it is a POSIX process: init takes no CONNECT to it and
+/// loads no program for it; the service takes the record with ADOPT,
+/// creates and loads the process itself, and gives init the session of
+/// its record with ADOPTED, which init puts in the process's start data
+/// under this name (serve.rs); the service pays for the process. Init
+/// never sends the service a request (spec 6.7).
 pub const PROCESS_SERVICE: &str = "posix";
 /// The lines a binding takes: the shared lines of the GIC (spec 9).
 pub const SHARED_LINES: RangeInclusive<u32> = 32..=1019;
@@ -1413,7 +1418,8 @@ mod tests {
                 "posix",
                 "clock",
                 "clock-peer",
-                "posix-abi-probe"
+                "posix-abi-probe",
+                "posix-sender"
             ]
         );
         assert_eq!(

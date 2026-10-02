@@ -237,12 +237,16 @@ pub fn map_narrowed(
     mapped.and(narrow.close())
 }
 
-/// The segments and the stack of `program` in `process`, and its first
-/// thread.
+/// The segments and the stack of `program` in `process`, a new process
+/// with MANAGE in the caller's hands, and its first thread at `priority`
+/// with `policy` (as `load` makes them): for a caller that made the
+/// process itself, such as the POSIX process service. The caller pays
+/// for the objects; on an error the process keeps what was mapped, and
+/// its end lets it go.
 ///
 /// # Safety
 /// As for `load`.
-unsafe fn fill(
+pub unsafe fn fill(
     own: &Handle<Process>,
     process: &Handle<Process>,
     program: &Program<'_>,

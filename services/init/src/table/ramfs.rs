@@ -163,6 +163,18 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         ceiling: 50,
         ..LONG
     },
+    // A POSIX process that gives the clock peer its session with the
+    // process service and ends (tests/svc, role `t`): the probe of the
+    // credentials sees its record go with it.
+    Record {
+        name: "posix-sender",
+        program: "svc",
+        args: b"t",
+        connects: &["clock-peer", "posix"],
+        quota: 16 * PAGE,
+        handle_limit: 16,
+        ..POSIX
+    },
 ];
 
 /// The first C program on relibc (5a′): the RAM files, the process and

@@ -132,6 +132,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         ..super::ramfs::POSIX_ABI_TABLE[4]
     },
     super::ramfs::POSIX_ABI_TABLE[5],
+    super::ramfs::POSIX_ABI_TABLE[6],
 ];
 
 /// The RAM file service and a probe that reads the console, as

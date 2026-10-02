@@ -85,6 +85,7 @@ dependencies = [
  "abi",
  "bootimg",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
  "uart",
@@ -261,8 +262,8 @@ dependencies = [
 name = "posix-process-service"
 version = "0.1.0"
 dependencies = [
+ "bootimg",
  "posix-credentials",
- "process-client",
  "proto-init",
  "proto-process",
  "proto-wire",
@@ -408,6 +409,7 @@ dependencies = [
 name = "proto-process"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "proto-wire",
 ]
 
@@ -585,6 +587,7 @@ name = "test-svc"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "proto-clock",
  "proto-init",
  "proto-uart",
  "proto-wire",

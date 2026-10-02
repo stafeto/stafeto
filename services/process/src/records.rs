@@ -2,28 +2,33 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The records of the process service (spec 2, section 3.1): RECORDS of
-//! them at most, each in an index with a generation, so that the label of
-//! its session (proto_process::Label) finds it in O(1) and a label of a
-//! gone generation finds nothing. A record made through Child counts in
-//! its maker's children, CHILDREN_MAX at a time. `P` is what the service
-//! keeps of the record's process: its handle.
+//! them at most, each in an index with a generation, so that a label the
+//! service gave (proto_process::Label) finds its record in O(1) and a
+//! label of a gone generation finds nothing. A record comes with its
+//! process, which the service creates (Create), and goes only with the
+//! notification of the process's end, whose place carries the record's
+//! exit label: a copy of its session that outlives the process keeps
+//! nothing. `P` is what the service keeps of the record's process: its
+//! handle.
 
-use proto_process::{Credentials, Label, RECORDS};
+use proto_process::{Credentials, Label, Place, RECORDS};
 
-/// The live records one record makes through Child at most, so that no
-/// process fills the table (RLIMIT_NPROC of 5b replaces it).
-pub const CHILDREN_MAX: u32 = 32;
+/// Where a record is in its life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// Created; one of the service's threads loads its program.
+    Loading,
+    /// Loaded and started.
+    Alive,
+}
 
 pub struct Record<P> {
-    /// Its process, which the service keeps for its later calls (5b).
+    /// Its process, which the service created and calls with later.
     pub process: P,
     pub label: Label,
     pub parent: u32,
     pub credentials: Credentials,
-    /// The live records Child made through its session.
-    pub children: u32,
-    /// The record whose Child made it, by its label.
-    pub maker: Option<Label>,
+    pub state: State,
 }
 
 pub struct Records<P> {
@@ -56,14 +61,20 @@ impl<P> Records<P> {
         }
     }
 
+    /// The index of the live record that `raw` names in `place`.
+    fn named(&self, raw: u64, place: Place) -> Option<usize> {
+        let (label, got) = Label::parse(raw)?;
+        let index = usize::from(label.index);
+        (got == place
+            && self.records[index]
+                .as_ref()
+                .is_some_and(|r| r.label == label))
+        .then_some(index)
+    }
+
     /// The index of the record whose session has `label`, if it lives.
     pub fn find(&self, label: u64) -> Option<usize> {
-        let label = Label::from_raw(label)?;
-        let index = usize::from(label.index);
-        self.records[index]
-            .as_ref()
-            .is_some_and(|r| r.label == label)
-            .then_some(index)
+        self.named(label, Place::Work)
     }
 
     pub fn get(&self, index: usize) -> Option<&Record<P>> {
@@ -89,23 +100,17 @@ impl<P> Records<P> {
         })
     }
 
-    /// Whether the record in `index` may make another through Child.
-    pub fn may_make(&self, index: usize) -> bool {
-        self.get(index).is_some_and(|r| r.children < CHILDREN_MAX)
-    }
-
-    /// A record of `process` with the label `next_label` gave, which the
-    /// caller made its session with: O(1). Its maker counts it.
+    /// A record of `process`, LOADING, with the label `next_label` gave,
+    /// which the caller made its exit place and session with: O(1).
     ///
     /// # Panics
-    /// When `label` is not that of `next_label`, or a maker is not live.
+    /// When `label` is not that of `next_label`.
     pub fn insert(
         &mut self,
         label: Label,
         process: P,
         parent: u32,
         credentials: Credentials,
-        maker: Option<Label>,
     ) -> usize {
         assert_eq!(
             self.next_label(),
@@ -120,35 +125,30 @@ impl<P> Records<P> {
             label,
             parent,
             credentials,
-            children: 0,
-            maker,
+            state: State::Loading,
         });
-        if let Some(m) = maker {
-            self.records[usize::from(m.index)]
-                .as_mut()
-                .filter(|r| r.label == m)
-                .expect("a live maker")
-                .children += 1;
-        }
         i
     }
 
-    /// The record whose session has `label` goes, when it lives: its maker,
-    /// if it still lives, counts one child less, and its index waits on
-    /// top of the free ones, its next label one generation on. O(1).
-    pub fn remove(&mut self, label: u64) -> Option<Record<P>> {
-        let index = self.find(label)?;
+    /// The record whose exit place has `label` goes: the notification of
+    /// its process's end came. Its index waits on top of the free ones,
+    /// its next label one generation on. A label of another place, of a
+    /// gone generation or of no record takes nothing. O(1).
+    pub fn ended(&mut self, label: u64) -> Option<Record<P>> {
+        let index = self.named(label, Place::Exit)?;
         let record = self.records[index].take()?;
-        if let Some(m) = record.maker
-            && let Some(i) = self.find(m.raw())
-            && let Some(maker) = self.records[i].as_mut()
-        {
-            maker.children -= 1;
-        }
         self.free[self.free_len] = index as u16;
         self.free_len += 1;
         Some(record)
     }
+}
+
+/// The exit place of the record of `label` for a process of `ceiling`: its
+/// label and the priority of the notification of the end, the process's
+/// ceiling (spec 2, section 3.1), so that the end of a process lifts the
+/// service no higher than the process could run.
+pub const fn exit_place(label: Label, ceiling: u8) -> (u64, u8) {
+    (label.exit(), ceiling)
 }
 
 #[cfg(test)]
@@ -156,36 +156,39 @@ mod tests {
     use super::*;
     use proto_process::INIT_PID;
 
-    fn add(t: &mut Records<u32>, maker: Option<Label>) -> Option<Label> {
+    fn add(t: &mut Records<u32>) -> Option<Label> {
         let label = t.next_label()?;
-        t.insert(label, 0, INIT_PID, Credentials::NOBODY, maker);
+        t.insert(label, 0, INIT_PID, Credentials::NOBODY);
         Some(label)
     }
 
     #[test]
-    fn the_bound_is_records_and_a_gone_record_frees_its_index() {
+    fn the_bound_is_records_and_an_ended_record_frees_its_index() {
         let mut t = Records::<u32>::new();
-        let labels: Vec<Label> = (0..RECORDS).map(|_| add(&mut t, None).unwrap()).collect();
+        let labels: Vec<Label> = (0..RECORDS).map(|_| add(&mut t).unwrap()).collect();
         assert_eq!(t.count(), RECORDS);
         assert_eq!(t.next_label(), None, "FULL with every record taken");
         let gone = labels[17];
-        assert!(t.remove(gone.raw()).is_some());
-        assert!(t.remove(gone.raw()).is_none(), "a record goes once");
+        assert!(t.ended(gone.exit()).is_some());
+        assert!(t.ended(gone.exit()).is_none(), "a record goes once");
         assert_eq!(t.count(), RECORDS - 1);
-        let next = add(&mut t, None).unwrap();
+        let next = add(&mut t).unwrap();
         assert_eq!(next.index, gone.index, "the index freed last comes first");
         assert_eq!(next.pid(), gone.pid() + RECORDS as u32, "one generation on");
         for label in labels.iter().filter(|l| **l != gone) {
-            assert!(t.remove(label.raw()).is_some());
+            assert!(t.ended(label.exit()).is_some());
         }
-        assert!(t.remove(next.raw()).is_some());
+        assert!(t.ended(next.exit()).is_some());
         assert_eq!(t.count(), 0);
     }
 
+    /// Only the exit label of a live record takes it away: its session's
+    /// label, the identity label, both place bits, a label of the gone
+    /// generation and an index with no record take nothing.
     #[test]
-    fn labels_the_service_did_not_give_name_no_record() {
+    fn the_exit_label_alone_ends_a_record() {
         let mut t = Records::<u32>::new();
-        let live = add(&mut t, None).unwrap();
+        let live = add(&mut t).unwrap();
         let stale = Label {
             generation: live.generation + 1,
             ..live
@@ -194,34 +197,59 @@ mod tests {
             index: live.index + 1,
             ..live
         };
-        assert_eq!(t.find(live.raw()), Some(usize::from(live.index)));
-        for raw in [0, 0x1234, stale.raw(), free.raw(), live.raw() | 1 << 62] {
-            assert_eq!(t.find(raw), None, "{raw:#x}");
-            assert!(t.remove(raw).is_none(), "{raw:#x}");
+        for raw in [
+            live.raw(),
+            live.identity(),
+            live.exit() | live.identity(),
+            stale.exit(),
+            free.exit(),
+            0,
+        ] {
+            assert!(t.ended(raw).is_none(), "{raw:#x}");
         }
         assert_eq!(t.count(), 1);
+        assert_eq!(t.find(live.raw()), Some(usize::from(live.index)));
+        assert_eq!(
+            t.find(live.exit()),
+            None,
+            "no request through the exit place"
+        );
+        let record = t.ended(live.exit()).expect("the exit label ends it");
+        assert_eq!(record.label, live);
+        // A notification of the old generation after the index came back
+        // leaves the new record.
+        let next = add(&mut t).unwrap();
+        assert_eq!(next.index, live.index);
+        assert!(t.ended(live.exit()).is_none());
+        assert_eq!(t.find(next.raw()), Some(usize::from(next.index)));
     }
 
     #[test]
-    fn a_maker_makes_children_max_at_a_time() {
+    fn labels_the_service_did_not_give_name_no_record() {
         let mut t = Records::<u32>::new();
-        let maker = add(&mut t, None).unwrap();
-        let index = usize::from(maker.index);
-        let children: Vec<Label> = (0..CHILDREN_MAX)
-            .map(|_| {
-                assert!(t.may_make(index));
-                add(&mut t, Some(maker)).unwrap()
-            })
-            .collect();
-        assert!(!t.may_make(index), "FULL past CHILDREN_MAX");
-        assert_eq!(t.get(index).unwrap().children, CHILDREN_MAX);
-        assert!(t.remove(children[3].raw()).is_some());
-        assert!(t.may_make(index), "a child that went frees its place");
-        // A child outlives its maker; its end touches no other record.
-        assert!(t.remove(maker.raw()).is_some());
-        let other = add(&mut t, None).unwrap();
-        assert_eq!(other.index, maker.index);
-        assert!(t.remove(children[4].raw()).is_some());
-        assert_eq!(t.get(index).unwrap().children, 0);
+        let live = add(&mut t).unwrap();
+        let stale = Label {
+            generation: live.generation + 1,
+            ..live
+        };
+        assert_eq!(
+            t.get(usize::from(live.index)).unwrap().state,
+            State::Loading
+        );
+        for raw in [0, 0x1234, stale.raw(), live.raw() | 1 << 62 | 1 << 61] {
+            assert_eq!(t.find(raw), None, "{raw:#x}");
+        }
+    }
+
+    /// The end of a process is heard at its ceiling.
+    #[test]
+    fn the_exit_place_is_at_the_ceiling_of_the_process() {
+        let label = Label {
+            index: 3,
+            generation: 1,
+        };
+        for ceiling in [1, 31, 40] {
+            assert_eq!(exit_place(label, ceiling), (label.exit(), ceiling));
+        }
     }
 }

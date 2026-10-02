@@ -93,16 +93,23 @@
 //! alone, the reply its status alone.
 //!
 //! ADOPT and ADOPTED come only from the POSIX process service (spec 2,
-//! section 3.1): the service asks init for the next POSIX process init
-//! loaded, and init holds the request until there is one; init never asks
-//! the service anything. ADOPT: the header alone; the reply its status (8
-//! bytes, proto_wire::reply), the ticket of the process u64, root u32 (0
-//! or 1), and one handle, the process with MANAGE, DUPLICATE and TRANSFER.
-//! ADOPTED: the header,
-//! the ticket u64 and the service's status u32 (0, or why it made no
-//! record), and with status 0 one handle, the session of the record, which
-//! init gives the process under `posix` before it starts its thread; the
-//! reply is its status alone.
+//! section 3.1), which creates and loads every POSIX process itself: the
+//! service asks init for the next POSIX record of init's table to start,
+//! and init holds the request until there is one; init never asks the
+//! service anything. ADOPT: the header alone; the reply (`Adoption`) its
+//! status (8 bytes, proto_wire::reply), the ticket of the instance, the
+//! record's quota, room for handles, ceiling, priority, root and program,
+//! and one handle, the instance's start channel (a copy of init's channel
+//! with SEND, TRANSFER and the ticket as its label), which the process
+//! gets as its entry 0. ADOPTED: the header, the ticket u64 and the
+//! service's status u32 (0, or why it made no process), and with status 0
+//! three handles: the session of the record, the process (MANAGE,
+//! DUPLICATE, TRANSFER) and its first thread (MANAGE, TRANSFER), which
+//! init gives the process in its start data under `posix`, `process` and
+//! `thread`; the reply is its status alone. Init keeps a copy of the
+//! process with no rights and reads its end once the last copy of the
+//! start channel closed. Once init answered 0, the service starts the
+//! thread; on any other answer it kills the process.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -150,6 +157,66 @@ impl Method {
     /// The header of a request of this method.
     pub const fn header(self) -> Header {
         Header::new(self.number(), VERSION)
+    }
+}
+
+/// The reply to ADOPT that is no refusal (the text above):
+///
+/// | Bytes | Field |
+/// |---|---|
+/// | 0..8 | status 0 (proto_wire::reply) |
+/// | 8..16 | ticket |
+/// | 16..24 | quota in bytes |
+/// | 24..28 | room for handles |
+/// | 28 | ceiling |
+/// | 29 | priority of the first thread |
+/// | 30 | root: 0 or 1 |
+/// | 31 | zero |
+/// | 32..48 | the program's name in the boot image |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Adoption {
+    pub ticket: u64,
+    pub quota: u64,
+    pub handle_limit: u32,
+    pub ceiling: u8,
+    pub priority: u8,
+    pub root: bool,
+    pub program: Name,
+}
+
+impl Adoption {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.bytes(&proto_wire::reply(Status::Ok))?;
+        w.u64(self.ticket)?;
+        w.u64(self.quota)?;
+        w.u32(self.handle_limit)?;
+        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])?;
+        w.name(Some(self.program))
+    }
+
+    /// BAD_SIZE unless `bytes` hold status 0 and the fields in their
+    /// layout, with a root byte of 0 or 1 and a name.
+    pub fn read(bytes: &[u8]) -> Result<Adoption, Status> {
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 || r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let (ticket, quota, handle_limit) = (r.u64()?, r.u64()?, r.u32()?);
+        let b = r.bytes(4)?;
+        if b[2] > 1 || b[3] != 0 {
+            return Err(Status::BadSize);
+        }
+        let program = r.name()?.ok_or(Status::BadSize)?;
+        r.finish()?;
+        Ok(Adoption {
+            ticket,
+            quota,
+            handle_limit,
+            ceiling: b[0],
+            priority: b[1],
+            root: b[2] == 1,
+            program,
+        })
     }
 }
 
@@ -647,6 +714,30 @@ mod tests {
         let mut w = Writer::new();
         reply.write(&mut w).unwrap();
         w.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn adoption_round_trips_and_refuses_its_layout() {
+        let adoption = Adoption {
+            ticket: 0x1234_5678_9abc,
+            quota: 512 * 4096,
+            handle_limit: 32,
+            ceiling: 31,
+            priority: 30,
+            root: true,
+            program: name("posix-abi-probe").unwrap(),
+        };
+        let mut w = Writer::new();
+        adoption.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 48);
+        assert_eq!(Adoption::read(w.as_bytes()), Ok(adoption));
+        let mut bad = w.as_bytes().to_vec();
+        bad[30] = 2;
+        assert_eq!(Adoption::read(&bad), Err(Status::BadSize));
+        let mut refusal = w.as_bytes().to_vec();
+        refusal[0] = 1;
+        assert_eq!(Adoption::read(&refusal), Err(Status::BadSize));
+        assert_eq!(Adoption::read(&w.as_bytes()[..47]), Err(Status::BadSize));
     }
 
     #[test]

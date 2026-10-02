@@ -520,7 +520,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             block.flags.fetch_or(flag::NO_RESTART, Ordering::SeqCst);
         }
         if handler == DEFAULT {
-            // Process wait-status encoding and stop/continue need process routing.
+            // Stop and continue need process routing (5e).
             sys_exit_signal(signal);
         }
         let mut mask = old_mask | action.mask;
@@ -690,8 +690,11 @@ impl LinuxContext {
     }
 }
 
+/// The death of the process by `signal`: the code `0x100 | signal`, which
+/// `_exit` never gives (it keeps 8 bits), so that the process service reads
+/// WIFSIGNALED from the kernel's reason (proto_process::End).
 fn sys_exit_signal(signal: i32) -> ! {
-    rt::sys::process_exit((128 + signal) as u64)
+    rt::sys::process_exit(0x100 | signal as u64)
 }
 
 /// Runs `run` holding the lock of the actions, which a delivery takes to

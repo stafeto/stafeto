@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! What the POSIX process service decides apart from the calls it makes:
-//! the table of its records (`records`). The program makes the sessions
-//! and keeps the process handles; everything here builds for the host too,
-//! where `cargo test -p posix-process-service` exercises it.
+//! the table of its records (`records`). The program creates the
+//! processes and keeps their handles; everything here builds for the host
+//! too, where `cargo test -p posix-process-service` exercises it.
 
 #![cfg_attr(not(test), no_std)]
 

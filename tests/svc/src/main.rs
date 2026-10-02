@@ -11,7 +11,9 @@
 //! that keeps init's STATS from a kill (sink.rs), `l` a service of long
 //! operations under the console's protocol (long.rs, rtbench 2), `m` a
 //! service that never registers (`mute`), `c` the client that runs the
-//! tests of init as a service manager (checker.rs). A service registers
+//! tests of init as a service manager (checker.rs), `t` a POSIX process
+//! that gives the clock peer its session with the process service and
+//! ends (`sender`). A service registers
 //! its channel with init (rt::service::register) and serves it with its
 //! heartbeat (rt::service::run). The program ends with the code of its
 //! role, or FAILED when its start data did not come.
@@ -46,6 +48,7 @@ const SINK: u8 = b'k';
 const LONG: u8 = b'l';
 const MUTE: u8 = b'm';
 const CHECKER: u8 = b'c';
+const SENDER: u8 = b't';
 
 /// The code of a role that could not do its part.
 const FAILED: u64 = 1;
@@ -91,6 +94,30 @@ fn main(_: u64) -> u64 {
         Some(&LONG) => long::run(s),
         Some(&MUTE) => mute(&s),
         Some(&CHECKER) => checker::run(s),
+        Some(&SENDER) => sender(s),
+        _ => FAILED,
+    }
+}
+
+/// The role `sender`: a POSIX process that gives its session with the
+/// process service, the one copy it has, to the clock peer (its method
+/// 10) and ends with 0, or FAILED. The peer still holds the session when
+/// the process ended (tests/posix-threads, credentials.rs).
+fn sender(mut s: Startup) -> u64 {
+    let Ok(session) = s.take::<Channel>("posix") else {
+        return FAILED;
+    };
+    let Ok(peer) = service::connect(&s.parent, "clock-peer") else {
+        return FAILED;
+    };
+    let keep = proto_wire::Header {
+        version: proto_clock::VERSION,
+        method: 10,
+    }
+    .bytes();
+    let mut buffer = [0; MESSAGE_MAX];
+    match sys::send_handles(&peer, &keep, [session.erase()]) {
+        Ok(reply) if reply.bytes(&mut buffer) == proto_wire::reply(Status::Ok) => 0,
         _ => FAILED,
     }
 }
