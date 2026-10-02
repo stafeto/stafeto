@@ -11,8 +11,9 @@
 //! two handles, the start channel init gave (B) and the witness, which the
 //! service closes once the process ended (proto_init ADOPT); the service makes the
 //! record, its exit place and the process, and replies status u32, pid
-//! u32, label u64 with two handles: the process (MANAGE, DUPLICATE,
-//! TRANSFER) for the load, and the record's session. Loaded, body label
+//! u32, label u64 with three handles: the process (MANAGE, DUPLICATE,
+//! TRANSFER) for the load, the record's session, and its identity session
+//! (SEND, TRANSFER, DUPLICATE). Loaded, body label
 //! u64 and one handle, the first thread (MANAGE), the router of the
 //! process's signals: the process was loaded and runs; reply its status, and the parent
 //! whose Spawn made it gets its PID. Abandon, body label u64 (0 for no
@@ -42,6 +43,20 @@
 //! session: no body and one handle, the thread (MANAGE) whose entry the
 //! service asks for once it set a signal on the page, in place of the
 //! first thread; reply its status.
+//!
+//! Through the identity session of a record (label bit 62, `Label::identity`;
+//! the service gives it with Create, init puts it in the process's start
+//! data under `posix-id`, and the process gives a copy to a service it
+//! asks something of, such as the clock): Who, no body; the reply
+//! (`WhoReply`) is the record's PID, its six credentials and the
+//! generation of its credentials. Register, no body; the reply is a copy
+//! of the page of the credentials generations with MAP_READ and TRANSFER
+//! (`GENERATIONS_SIZE` bytes, a u64 per record index, which the service
+//! raises with Release before it answers a Change and when it makes a
+//! record): a service that asks Who remembers the answer with the
+//! generation and asks again only when the page's word of the record
+//! moved. The identity session answers to the record's index and
+//! generation for any image number, and to nothing else.
 //!
 //! SetPgid: pid u32 (0 for the caller) and pgid u32 (0 for the target's
 //! PID); reply its status: NO_PROCESS, PERMISSION, ACCESS. SetSid: no
@@ -253,6 +268,8 @@ pub enum Method {
     SetSid = 16,
     GetPgid = 17,
     GetSid = 18,
+    Who = 19,
+    Register = 20,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -262,7 +279,9 @@ impl Method {
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
+pub const METHODS: &[u16] = &[
+    1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -334,6 +353,54 @@ impl Create {
             priority,
             root: b[2] == 1,
             parent,
+        })
+    }
+}
+
+/// The bytes of the page of the credentials generations: a u64 for each
+/// record index (see Register).
+pub const GENERATIONS_SIZE: usize = RECORDS * 8;
+
+/// The reply to Who: status u32 (0), the record's PID u32, the six
+/// credentials u32 and the generation of the credentials u64: 40 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WhoReply {
+    pub pid: u32,
+    pub credentials: Credentials,
+    pub generation: u64,
+}
+
+impl WhoReply {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(0)?;
+        w.u32(self.pid)?;
+        for id in self.credentials.words() {
+            w.u32(id)?;
+        }
+        w.u64(self.generation)
+    }
+
+    /// BAD_SIZE out of the layout, for a PID of 0 or past the signed range,
+    /// or a credential of -1.
+    pub fn read(bytes: &[u8]) -> Result<Self, Status> {
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let pid = r.u32()?;
+        let mut words = [0; 6];
+        for w in &mut words {
+            *w = r.u32()?;
+        }
+        let generation = r.u64()?;
+        r.finish()?;
+        if pid == 0 || pid > i32::MAX as u32 || words.contains(&u32::MAX) {
+            return Err(Status::BadSize);
+        }
+        Ok(Self {
+            pid,
+            credentials: Credentials::from_words(words),
+            generation,
         })
     }
 }
@@ -740,6 +807,8 @@ mod tests {
             Method::SetSid,
             Method::GetPgid,
             Method::GetSid,
+            Method::Who,
+            Method::Register,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
@@ -868,6 +937,24 @@ mod tests {
             Next::read(&proto_wire::reply(Status::BadSize)),
             Err(Status::BadSize)
         );
+    }
+
+    #[test]
+    fn who_round_trips_and_refuses_what_is_no_identity() {
+        let reply = WhoReply {
+            pid: 300,
+            credentials: Credentials::NOBODY,
+            generation: 1 << 40 | 7,
+        };
+        let mut w = Writer::new();
+        reply.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 40);
+        assert_eq!(WhoReply::read(w.as_bytes()), Ok(reply));
+        let mut bytes = w.as_bytes().to_vec();
+        bytes[4..8].fill(0);
+        assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "pid 0");
+        assert_eq!(WhoReply::read(&w.as_bytes()[..39]), Err(Status::BadSize));
+        assert_eq!(GENERATIONS_SIZE, 2048);
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, Ordering};
 use process_client::Client;
-pub use process_client::START_NAME;
+pub use process_client::{IDENTITY_NAME, START_NAME};
 use proto_process::{Change, Spawn};
 use proto_wire::{Status, Writer};
 use rt::handle::{Channel, Handle};
@@ -21,6 +21,12 @@ struct State(UnsafeCell<Option<Client>>);
 // SAFETY: startup publishes once before threads; Client methods only borrow it.
 unsafe impl Sync for State {}
 static STATE: State = State(UnsafeCell::new(None));
+struct Identity(UnsafeCell<Option<Handle<Channel>>>);
+// SAFETY: startup publishes once before threads; afterwards only shared reads.
+unsafe impl Sync for Identity {}
+/// The process's identity session (start data `posix-id`), whose copies
+/// the process gives to the services that ask who it is.
+static IDENTITY: Identity = Identity(UnsafeCell::new(None));
 /// The PID of the snapshot at startup.
 static PID: AtomicU32 = AtomicU32::new(0);
 
@@ -84,6 +90,22 @@ fn request(method: proto_process::Method, words: &[u32]) -> Result<Writer, i32> 
         w.u32(word).map_err(|_| crate::constants::EIO)?;
     }
     Ok(w)
+}
+
+/// Takes `session`, the process's identity session.
+///
+/// # Safety
+/// Call at most once during single-threaded startup, after `init`.
+pub unsafe fn set_identity(session: Handle<Channel>) {
+    // SAFETY: startup has exclusive access until threads start.
+    unsafe { *IDENTITY.0.get() = Some(session) };
+}
+
+/// The process's identity session, which startup published; None when its
+/// start data had none.
+pub fn identity() -> Option<&'static Handle<Channel>> {
+    // SAFETY: startup finished publishing before application threads.
+    unsafe { &*IDENTITY.0.get() }.as_ref()
 }
 
 /// kill of `pid` with `signal` through the process service (0 checks

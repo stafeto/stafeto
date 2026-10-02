@@ -743,7 +743,8 @@ impl Init {
     /// ADOPTED from the process service: the ticket of a record it took
     /// and its status. With status 0, the session, the process and its
     /// thread, init keeps a copy of the process with no rights, gives the
-    /// three in the start data under `posix`, `process` and `thread` with
+    /// three in the start data under `posix`, `process` and `thread` (and
+    /// the identity session, a fourth handle, under `posix-id`) with
     /// the record's resources and arguments (worker::resources,
     /// worker::set_args), and the record runs; the service then starts the
     /// thread. Any other status fails the record. BAD_STATE for another
@@ -759,7 +760,7 @@ impl Init {
         let (Ok(ticket), Ok(status)) = (body.u64(), body.u32()) else {
             return Answer::Status(Status::BadSize);
         };
-        if body.finish().is_err() || r.handles.len() > 3 {
+        if body.finish().is_err() || r.handles.len() > 4 {
             return Answer::Status(Status::BadSize);
         }
         let waiting = (0..TABLE.len()).find(|&p| {
@@ -786,7 +787,11 @@ impl Init {
             self.adoption_failed(place, "no process of the process service");
             return Answer::Status(Status::BadSize);
         };
-        let instance = match self.posix_instance(place, ticket, session, process, thread) {
+        // The fourth, the record's identity session, comes with every
+        // record the service makes.
+        let identity = r.handles.take::<Channel>(3).ok();
+        let instance = match self.posix_instance(place, ticket, session, identity, process, thread)
+        {
             Ok(instance) => instance,
             Err(e) => {
                 self.adoption_failed(place, "no room for its start data");
@@ -808,6 +813,7 @@ impl Init {
         place: usize,
         ticket: u64,
         session: Handle<Channel>,
+        identity: Option<Handle<Channel>>,
         process: Handle<Process>,
         thread: Handle<Any>,
     ) -> Result<Instance, Error> {
@@ -820,6 +826,9 @@ impl Init {
         let _ = giver.give("process", process.erase());
         let _ = giver.give("thread", thread);
         let _ = giver.give(table::PROCESS_SERVICE, session.erase());
+        if let Some(identity) = identity {
+            let _ = giver.give(table::IDENTITY_SESSION, identity.erase());
+        }
         crate::worker::resources(record, &mut giver, &self.resource)?;
         crate::worker::set_args(record, &mut giver, &[])?;
         Ok(Instance {

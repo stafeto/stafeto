@@ -186,9 +186,11 @@ dependencies = [
 name = "posix-clock-service"
 version = "0.1.0"
 dependencies = [
+ "posix-credentials",
  "posix-time",
  "proto-clock",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
 ]

@@ -526,6 +526,12 @@ impl<P> Records<P> {
             .map(usize::from)
     }
 
+    /// The index of the record whose identity session has `label`, while
+    /// the record is in the table (a zombie too: it answers who it was).
+    pub fn find_identity(&self, label: u64) -> Option<usize> {
+        self.named(label, Place::Identity)
+    }
+
     /// The index of the record whose exit place has `label`, while its
     /// process lives: a label of another place, of a gone generation, of
     /// no record or of a zombie names none. O(1).
@@ -797,6 +803,29 @@ mod tests {
         assert_eq!(next.index, live.index);
         assert_eq!(t.find_exit(live.exit()), None);
         assert_eq!(t.find(next.raw()), Some(usize::from(next.index)));
+    }
+
+    /// The identity label names the record in the table, and only through
+    /// its place: the work label does not name it, nor the old generation.
+    #[test]
+    fn the_identity_label_names_its_record_through_its_place() {
+        let mut t = Records::<u32>::new();
+        let live = add(&mut t).unwrap();
+        let stale = Label {
+            generation: live.generation + 1,
+            ..live
+        };
+        assert_eq!(t.find_identity(live.identity()), Some(at(live)));
+        assert_eq!(t.find(live.identity()), None, "no work through it");
+        assert_eq!(t.find_identity(live.raw()), None);
+        assert_eq!(t.find_identity(live.exit()), None);
+        assert_eq!(t.find_identity(stale.identity()), None);
+        end(&mut t, live, End::Exited(0));
+        assert_eq!(
+            t.find_identity(live.identity()),
+            None,
+            "gone with the record"
+        );
     }
 
     #[test]

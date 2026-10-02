@@ -85,12 +85,13 @@ fn program(name: &Name) -> Option<Program<'static>> {
 
 /// A process the service made and loaded, whose first thread waits for
 /// thread_start: the label of its record, a copy of the process
-/// with MANAGE, DUPLICATE and TRANSFER, the record's session, and the
-/// thread.
+/// with MANAGE, DUPLICATE and TRANSFER, the record's session and its
+/// identity session, and the thread.
 pub struct Made {
     pub label: u64,
     pub process: Handle<Process>,
     pub session: Handle<Channel>,
+    pub identity: Handle<Channel>,
     pub thread: Handle<Thread>,
 }
 
@@ -147,8 +148,8 @@ pub fn status(bytes: &[u8]) -> Result<Status, Status> {
     Ok(Status::from_code(Reader::new(bytes).u32()?))
 }
 
-/// ADOPTED for `ticket` with what `made` gave: the session, the process
-/// and a copy of its thread, then thread_start and Loaded once init took
+/// ADOPTED for `ticket` with what `made` gave: the session, the process,
+/// a copy of its thread and the identity session, then thread_start and Loaded once init took
 /// them; a refusal of init, or no process, ends the record and the Spawn
 /// of `parent` (0 for none) with Abandon. `buffer` is the calling
 /// thread's.
@@ -175,13 +176,19 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
         label,
         process,
         session,
+        identity,
         thread,
     } = made;
     let copy = sys::handle_duplicate(&thread, abi::Rights::MANAGE | abi::Rights::TRANSFER);
     let taken = w.u32(0).is_ok()
         && copy.is_ok_and(|copy| {
             let mut buffer = [0; abi::MESSAGE_MAX];
-            let handles = [session.erase(), process.erase(), copy.erase()];
+            let handles = [
+                session.erase(),
+                process.erase(),
+                copy.erase(),
+                identity.erase(),
+            ];
             sys::send_handles(&init, w.as_bytes(), handles)
                 .is_ok_and(|reply| status(reply.bytes(&mut buffer)) == Ok(Status::Ok))
         });
@@ -236,9 +243,10 @@ pub unsafe fn make(
         r.finish()?;
         let process = handles.take::<Process>(0).map_err(|_| Status::BadSize)?;
         let session = handles.take::<Channel>(1).map_err(|_| Status::BadSize)?;
-        Ok((process, session))
+        let identity = handles.take::<Channel>(2).map_err(|_| Status::BadSize)?;
+        Ok((process, session, identity))
     })();
-    let (process, session) = handed.map_err(failed)?;
+    let (process, session, identity) = handed.map_err(failed)?;
     // The copy runs at its level, and the thread goes back to the loop's
     // level for its next request.
     let copy_level = level.clamp(1, self::level());
@@ -260,6 +268,7 @@ pub unsafe fn make(
         label,
         process,
         session,
+        identity,
         thread: first,
     })
 }

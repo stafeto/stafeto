@@ -175,15 +175,38 @@ impl Client {
         Ok(value)
     }
     /// SET: the service sets the date once, whatever signals come while
-    /// the caller waits for the reply.
-    pub fn set(&self, time: Time) -> Result<(), Status> {
+    /// the caller waits for the reply. `identity` is the caller's identity
+    /// session of the process service (a copy of it goes with the request:
+    /// the service keeps the first for the session); without one the
+    /// service answers PERMISSION.
+    pub fn set(&self, time: Time, identity: Option<&Handle<Channel>>) -> Result<(), Status> {
         time.value()
             .map_err(|_| Status::from_code(proto_clock::INVALID))?;
         let mut request = Writer::new();
         Method::Set.header().write(&mut request)?;
         request.u64(time.seconds as u64)?;
         request.u64(time.nanos as u64)?;
-        self.unit(request.as_bytes())
+        let Some(identity) = identity else {
+            return self.unit(request.as_bytes());
+        };
+        loop {
+            let copy =
+                sys::handle_duplicate(identity, rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER)?;
+            let reply = match sys::send_handles(&self.channel, request.as_bytes(), [copy.erase()]) {
+                Err(e) if e.error == Error::Interrupted => continue,
+                result => result.map_err(|e| Status::Kernel(e.error))?,
+            };
+            let mut buffer = [0; MESSAGE_MAX];
+            let bytes = reply.bytes(&mut buffer);
+            if !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
+            return match Status::from_code(Reader::new(bytes).u32()?) {
+                Status::Ok if bytes == proto_wire::reply(Status::Ok) => Ok(()),
+                Status::Ok => Err(Status::BadSize),
+                status => Err(status),
+            };
+        }
     }
     /// A request as the caller wrote it, for the probes of malformed
     /// bodies.

@@ -36,6 +36,13 @@
  * call setsid and setpgid themselves (role ids) see EPERM for a leader
  * and the new numbers on their page and through the service.
  *
+ * Stage 5, credentials and the clock: clock_settime is the clock service's
+ * to allow only to an effective UID of 0, which it asks the process
+ * service once and remembers with the generation of the credentials. The
+ * probe is root; seteuid(65534) takes the right at once (EPERM), seteuid(0)
+ * gives it back, and setuid(65534) takes it for good: the call right after
+ * a change of the credentials sees the new ones.
+ *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
 #include <errno.h>
@@ -331,6 +338,22 @@ static void groups(void) {
     ids_child(POSIX_SPAWN_SETSID, "a child that leads a session");
 }
 
+/* Stage 5: credentials and the clock service. */
+static void clock_rights(void) {
+    struct timespec now;
+    expect("clock_gettime", clock_gettime(CLOCK_REALTIME, &now), 0);
+    expect("clock_settime as root", clock_settime(CLOCK_REALTIME, &now), 0);
+    expect("clock_settime again with the credentials unchanged", clock_settime(CLOCK_REALTIME, &now), 0);
+    expect("seteuid(65534)", seteuid(65534), 0);
+    expect("clock_settime after seteuid(65534)", clock_settime(CLOCK_REALTIME, &now) == -1 && errno == EPERM, 1);
+    expect("clock_settime once more", clock_settime(CLOCK_REALTIME, &now) == -1 && errno == EPERM, 1);
+    expect("seteuid(0)", seteuid(0), 0);
+    expect("clock_settime after seteuid(0)", clock_settime(CLOCK_REALTIME, &now), 0);
+    expect("setuid(65534)", setuid(65534), 0);
+    expect("clock_settime right after setuid", clock_settime(CLOCK_REALTIME, &now) == -1 && errno == EPERM, 1);
+    expect("seteuid(0) of a process that dropped root", seteuid(0) == -1 && errno == EPERM, 1);
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
@@ -477,6 +500,7 @@ int main(int argc, char **argv) {
     waits(child);
     kills(sleeper);
     groups();
+    clock_rights();
     if (failures == 0) printf("posix-procs: ok\n");
     return failures == 0 ? 0 : 1;
 }

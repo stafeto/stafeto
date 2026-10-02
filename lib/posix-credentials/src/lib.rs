@@ -3,6 +3,7 @@
 
 //! POSIX real/effective/saved ID transitions. Effective UID zero is privileged.
 #![cfg_attr(not(test), no_std)]
+pub mod known;
 pub use proto_process::{Change, Credentials};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

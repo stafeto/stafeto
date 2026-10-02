@@ -356,6 +356,8 @@ pub const RELIBC_THREADS_TABLE: &[Record] = &[
         args: b"relibc-threads\0",
         quota: 4096 * PAGE,
         handle_limit: 512,
+        // It sets the clock, which only an effective UID of 0 may.
+        root: true,
         ..RELIBC_TABLE[3]
     },
 ];

@@ -4,13 +4,15 @@
 //! System-wide realtime anchor. Starts at the Unix epoch until explicitly set.
 #![no_std]
 #![no_main]
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
+use posix_credentials::known::Known;
 use posix_time::{Clock, Error, History, Snapshot, Time};
 use proto_clock::Method;
 use proto_clock::page;
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
+use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 rt::entry!(main);
@@ -55,6 +57,9 @@ fn main(_: u64) -> u64 {
             clock,
             page,
             watches: core::array::from_fn(|_| None),
+            process: Handle::borrowed(start.process.raw()),
+            generations: None,
+            identities: core::array::from_fn(|_| None),
         },
         config,
     );
@@ -65,10 +70,121 @@ struct Watch {
     channel: Handle<Channel>,
     history: History,
 }
+/// What the service knows of the process behind a session: its identity
+/// session of the process service, which the first SET of the session
+/// brought, and what Who said, with the generation of the credentials.
+struct Identity {
+    label: u64,
+    channel: Handle<Channel>,
+    known: Known,
+}
 struct Clocks {
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
+    /// The service's own process, to map the generations page in.
+    process: ManuallyDrop<Handle<Process>>,
+    /// The page of the credentials generations of the process service, once
+    /// the first SET asked for it (Register).
+    generations: Option<Handle<Memory>>,
+    identities: [Option<Identity>; 8],
+}
+
+/// Where the service maps the process service's page of the credentials
+/// generations, read-only.
+const GENERATIONS_ADDRESS: usize = 0x0F00_0000;
+
+/// The generation of the credentials of the record at `index`, read from
+/// the page with no call (Acquire); the page is mapped.
+fn generation(index: usize) -> u64 {
+    // SAFETY: the page is mapped for reading at GENERATIONS_ADDRESS for the
+    // service's life once `generations` is set, which every caller checked;
+    // an index below RECORDS (a PID modulo it) is a u64 word inside it.
+    unsafe { &*((GENERATIONS_ADDRESS + index * 8) as *const AtomicU64) }.load(Ordering::Acquire)
+}
+
+/// Who, through an identity session: the process service's answer.
+fn who(channel: &Handle<Channel>) -> Option<proto_process::WhoReply> {
+    let request = proto_process::Method::Who.header().bytes();
+    let reply = sys::send(channel, &request).ok()?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    proto_process::WhoReply::read(reply.bytes(&mut buffer)).ok()
+}
+
+impl Clocks {
+    /// Maps the page of the generations through the identity session of
+    /// `channel` (Register), once.
+    fn map_generations(&mut self, channel: &Handle<Channel>) -> bool {
+        if self.generations.is_some() {
+            return true;
+        }
+        let request = proto_process::Method::Register.header().bytes();
+        let Ok(mut reply) = sys::send(channel, &request) else {
+            return false;
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+            return false;
+        }
+        let Ok(memory) = reply.handles.take::<Memory>(0) else {
+            return false;
+        };
+        // The object is a page, of which the generations take GENERATIONS_SIZE.
+        let mapped = sys::mem_map(
+            &self.process,
+            &memory,
+            0,
+            4096,
+            GENERATIONS_ADDRESS,
+            rt::abi::Access::Read,
+        );
+        if mapped.is_err() {
+            return false;
+        }
+        self.generations = Some(memory);
+        true
+    }
+
+    /// Whether the process behind the session `label` may set the clock:
+    /// its effective UID is 0 (spec 2, 3.1). `offered` is the identity
+    /// session the request brought; the first one of a session is kept and
+    /// the later ones close. What Who said is remembered with the
+    /// generation of the credentials, and asked again only when the
+    /// generation on the page moved: no call to the process service
+    /// otherwise, and a SET sent after `setuid` returned sees the new
+    /// credentials. Without an identity session, or when anything fails,
+    /// no.
+    fn may_set(&mut self, label: u64, offered: Option<Handle<Channel>>) -> bool {
+        let found = self
+            .identities
+            .iter()
+            .position(|i| i.as_ref().is_some_and(|i| i.label == label));
+        let slot = match (found, offered) {
+            (Some(slot), _) => slot,
+            (None, Some(channel)) => {
+                let Some(free) = self.identities.iter().position(Option::is_none) else {
+                    return false;
+                };
+                self.identities[free] = Some(Identity {
+                    label,
+                    channel,
+                    known: Known::new(),
+                });
+                free
+            }
+            (None, None) => return false,
+        };
+        let Some(mut identity) = self.identities[slot].take() else {
+            return false;
+        };
+        let allowed = self.map_generations(&identity.channel)
+            && identity
+                .known
+                .credentials(generation, || who(&identity.channel))
+                .is_some_and(|c| c.euid == 0);
+        self.identities[slot] = Some(identity);
+        allowed
+    }
 }
 
 /// Where the service maps its page of the anchor.
@@ -197,9 +313,10 @@ impl Service<0> for Clocks {
             });
             return Answer::Status(Status::Ok);
         }
-        if !r.handles.is_empty() {
+        if r.handles.len() > usize::from(r.method() == Method::Set as u16) {
             return Answer::Status(Status::BadSize);
         }
+        let offered = r.handles.take::<Channel>(0).ok();
         let mut body = r.body();
         match Method::from_number(r.method()) {
             Some(Method::Get) => {
@@ -227,6 +344,9 @@ impl Service<0> for Clocks {
                 };
                 if time.value().is_err() {
                     return status(Err(Error::Invalid));
+                }
+                if !self.may_set(r.label(), offered) {
+                    return Answer::Status(Status::from_code(proto_clock::PERMISSION));
                 }
                 let generation = self.clock.anchor().generation;
                 let tick = now();
@@ -305,6 +425,11 @@ impl Service<0> for Clocks {
         }
     }
     fn gone(&mut self, s: &mut Session<(), 0>) {
+        for slot in &mut self.identities {
+            if slot.as_ref().is_some_and(|i| i.label == s.label()) {
+                *slot = None;
+            }
+        }
         for slot in &mut self.watches {
             if slot.as_ref().is_some_and(|w| w.label == s.label()) {
                 *slot = None;

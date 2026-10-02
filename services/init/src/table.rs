@@ -35,7 +35,14 @@ pub const MIN_QUOTA: u64 = 15 * PAGE;
 pub const MAX_DMA: usize = 2;
 /// The names init gives in start data besides the DMA objects (worker.rs):
 /// no window, binding or DMA object takes one.
-pub const START_DATA_NAMES: [&str; 5] = ["console", "log", "trace", PROCESS_SERVICE, BOOT_IMAGE];
+pub const START_DATA_NAMES: [&str; 6] = [
+    "console",
+    "log",
+    "trace",
+    PROCESS_SERVICE,
+    BOOT_IMAGE,
+    IDENTITY_SESSION,
+];
 /// The name of the boot image, read-only, in the start data of the
 /// process service: until the loader of 5c it loads the POSIX processes
 /// from there (serve.rs).
@@ -48,6 +55,10 @@ pub const BOOT_IMAGE: &str = "bootimage";
 /// under this name (serve.rs); the service pays for the process. Init
 /// never sends the service a request (spec 6.7).
 pub const PROCESS_SERVICE: &str = "posix";
+/// The name of the identity session of a POSIX process in its start data
+/// (spec 2, 3.1): the process gives copies of it to the services it asks
+/// something of, which ask the process service who it is.
+pub const IDENTITY_SESSION: &str = "posix-id";
 /// The lines a binding takes: the shared lines of the GIC (spec 9).
 pub const SHARED_LINES: RangeInclusive<u32> = 32..=1019;
 

@@ -16,6 +16,10 @@ use rt::{
 /// The name of the session in the start data of a process: the name of
 /// the service, since `process` names the process's own handle.
 pub const START_NAME: &str = "posix";
+/// The name of the identity session in the start data of a process: what
+/// the process gives a copy of to a service that asks the process service
+/// who it is.
+pub const IDENTITY_NAME: &str = "posix-id";
 pub struct Client {
     channel: Handle<Channel>,
 }

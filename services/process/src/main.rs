@@ -43,6 +43,7 @@ use rt::{
     sys,
 };
 mod adopt;
+mod generations;
 mod make;
 mod pages;
 mod spawn;
@@ -50,10 +51,11 @@ use core::mem::ManuallyDrop;
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
 /// the channel with no label at place 0, a record's at its index plus 1
+/// and its identity session's at RECORDS + 1 + its index
 /// (`Service::place`), and a few for labels no record has: a session of a
 /// record that went, whose place a new record took, asks there and gets
 /// UNREGISTERED, or LIMIT_REACHED while five such hold the spare places.
-const SESSIONS: usize = RECORDS + 1 + 4;
+const SESSIONS: usize = 2 * RECORDS + 1 + 4;
 /// Where the service maps the boot image, read-only, for as long as it
 /// lives: the programs it loads are read from there.
 const IMAGE: usize = 0x50_0000_0000;
@@ -102,6 +104,8 @@ struct Processes {
     next: Option<Pending>,
     /// The pages of the records.
     pages: pages::Pages,
+    /// The page of the credentials generations.
+    generations: generations::Generations,
     /// The thread of each record's process whose entry the service asks
     /// for once it set a signal on the page (Router).
     routers: [Option<Handle<Thread>>; RECORDS],
@@ -130,6 +134,7 @@ impl Processes {
             queue: Queue::new(),
             next: None,
             pages: pages::Pages::new(),
+            generations: generations::Generations::new(),
             witnesses: [const { None }; RECORDS],
             routers: [const { None }; RECORDS],
             ops: LongOps::new(),
@@ -190,6 +195,9 @@ fn main(_: u64) -> u64 {
     let owner = unsafe { &mut *OWNER.0.get() };
     owner.channel = Handle::borrowed(channel.raw());
     owner.level = level;
+    if owner.generations.make(&start.process).is_err() {
+        return 7;
+    }
     // The notification of a step goes to the loop's own channel at its
     // level, so that a step waits in the queue with the requests.
     let Ok(step) = sys::handle_label(&channel, Rights::NOTIFY, STEP, level) else {
@@ -312,6 +320,8 @@ impl Processes {
             .records
             .insert(label, process, parent, credentials, create.ceiling, join);
         self.witnesses[index] = Some(witness);
+        // A record made in a used index never starts its generation over.
+        self.generations.raise(index);
         let record = self.records.get(index).expect("a new record");
         let identity = [label.pid(), record.parent, record.pgid, record.sid];
         let paged = self
@@ -325,9 +335,17 @@ impl Processes {
                 self.level,
             )
         });
-        let (copy, session) = match (copy, session) {
-            (Ok(copy), Ok(session)) => (copy, session),
-            (Err(e), _) | (_, Err(e)) => {
+        // The identity session: the process gives copies of it (DUPLICATE)
+        // to the services it asks something of.
+        let who = sys::handle_label(
+            &self.channel,
+            Rights::SEND | Rights::TRANSFER | Rights::DUPLICATE,
+            label.identity(),
+            self.level,
+        );
+        let (copy, session, who) = match (copy, session, who) {
+            (Ok(copy), Ok(session), Ok(who)) => (copy, session, who),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 let record = self.records.get(index).expect("a new record");
                 let _ = sys::process_kill(&record.process);
                 return Answer::Status(Status::Kernel(e));
@@ -339,7 +357,7 @@ impl Processes {
             .and_then(|()| w.u32(label.pid()))
             .and_then(|()| w.u64(label.raw()));
         match written {
-            Ok(()) => Answer::Reply([copy.erase(), session.erase()].into()),
+            Ok(()) => Answer::Reply([copy.erase(), session.erase(), who.erase()].into()),
             Err(status) => {
                 let _ = sys::process_kill(&copy);
                 Answer::Status(status)
@@ -677,6 +695,39 @@ impl Processes {
     }
 }
 impl Processes {
+    /// A request through the identity session of the record in `index`:
+    /// Who, the PID, credentials and generation; Register, a copy of the
+    /// page of the generations to read. Nothing else is asked here
+    /// (PERMISSION), and no handle comes.
+    fn identity(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() || r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let method = r.method();
+        if method == Method::Register as u16 {
+            let Ok(copy) = self.generations.copy() else {
+                return Answer::Status(Status::Kernel(abi::Error::NoMemory));
+            };
+            if r.reply().u32(0).is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply([copy.erase()].into());
+        }
+        if method != Method::Who as u16 {
+            return refuse(proto_process::PERMISSION);
+        }
+        let record = self.records.get(index).expect("an identity process");
+        let who = proto_process::WhoReply {
+            pid: record.label.pid(),
+            credentials: record.credentials,
+            generation: self.generations.get(index),
+        };
+        if who.write(r.reply()).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
+    }
+
     /// Router of the record in `index`: one thread handle with MANAGE, the
     /// thread whose entry routes the process's signals (spec 2, 3.3); a
     /// signal that waits on the page already asks for its entry at once.
@@ -998,11 +1049,14 @@ impl Processes {
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = proto_process::METHODS;
-    const PLACED: usize = RECORDS + 1;
+    const PLACED: usize = 2 * RECORDS + 1;
     type Data = LongSession;
     fn place(&self, label: u64) -> Option<usize> {
         if label == 0 {
             return Some(0);
+        }
+        if let Some(i) = self.records.find_identity(label) {
+            return Some(RECORDS + 1 + i);
         }
         self.records.find(label).map(|i| i + 1)
     }
@@ -1026,6 +1080,9 @@ impl Service<0> for Processes {
                 n if n == Method::Abandon as u16 => self.abandon(r),
                 _ => self.next(r),
             };
+        }
+        if let Some(index) = self.records.find_identity(r.label()) {
+            return self.identity(index, r);
         }
         let Some(index) = self.records.find(r.label()) else {
             return refuse(proto_process::UNREGISTERED);
@@ -1061,6 +1118,13 @@ impl Service<0> for Processes {
                 let record = self.records.get_mut(index).expect("change process");
                 let result = posix_credentials::change(record.credentials, operation, id)
                     .map(|next| record.credentials = next);
+                // The services that remember the credentials see the
+                // generation move before the caller's reply, so that
+                // whatever the caller sends after it returns is checked by
+                // the new ones.
+                if result.is_ok() {
+                    self.generations.raise(index);
+                }
                 Answer::Status(status(result))
             }
             n if n == Method::Spawn as u16 => self.spawn(index, r),
