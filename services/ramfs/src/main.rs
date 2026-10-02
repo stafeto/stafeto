@@ -15,6 +15,7 @@ use core::mem::ManuallyDrop;
 use proto_fs::{MAX_READ, MAX_WRITE, Method, VERSION, valid_path};
 use proto_init::ServiceArgs;
 use proto_wire::Status;
+use proto_wire::clones::Clones;
 use ramfs::tree::{self, Index};
 use ramfs::{Exec, SET_GID, SET_UID};
 use ramfs::{Fds, Ram};
@@ -28,7 +29,7 @@ rt::entry!(main);
 const METHODS: &[u16] = proto_fs::METHODS;
 /// The sessions: one place the image sessions share (they hold nothing),
 /// then the clients', with room for the children of POSIX processes.
-const SESSIONS: usize = 16;
+const SESSIONS: usize = 64;
 /// Where the service maps the boot image, read-only, for as long as it
 /// lives: the files of its table are read from there.
 const IMAGE: usize = 0x50_0000_0000;
@@ -98,6 +99,7 @@ fn main(_: u64) -> u64 {
         given: 0,
         level,
         births: [None; BIRTHS],
+        clones: Clones::new(),
     };
     let _ = rt::service::run::<Fs, SESSIONS, 0>(&channel, &mut fs, config);
     4
@@ -119,11 +121,16 @@ struct Fs {
     /// by their labels: the session's first request takes them, and the
     /// end of its last copy closes them.
     births: [Option<(u64, Fds)>; BIRTHS],
+    /// The clones alive, bounded for each client and in all.
+    clones: Clones<CLONES>,
 }
+
+/// The clones the service keeps alive at most.
+const CLONES: usize = 128;
 
 /// Clones whose sessions sent nothing yet, at most: past them, Clone is
 /// LIMIT_REACHED.
-const BIRTHS: usize = 8;
+const BIRTHS: usize = 64;
 
 impl Fs {
     /// The notary session, asked of init once.
@@ -315,6 +322,9 @@ impl Fs {
         let Some(free) = self.births.iter().position(Option::is_none) else {
             return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
         };
+        if self.clones.room(r.label()).is_err() {
+            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+        }
         let mut child = match self.ram.clone_fds(fds, &list[..count]) {
             Ok(child) => child,
             Err(code) => return status(code),
@@ -327,6 +337,7 @@ impl Fs {
                     return Answer::Status(Status::BadSize);
                 }
                 self.births[free] = Some((label, child));
+                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
             Err(e) => {
@@ -351,6 +362,7 @@ impl Service<0> for Fs {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptors it was born with close.
     fn closed(&mut self, label: u64) {
+        self.clones.gone(label);
         if let Some(birth) = self
             .births
             .iter_mut()

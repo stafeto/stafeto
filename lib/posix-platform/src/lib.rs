@@ -511,6 +511,13 @@ pub unsafe extern "C" fn stafeto_probe_open_exec(path: *const c_char) -> c_int {
     posix_abi::process::probe_open_exec(path)
 }
 
+/// The probe of condition O2 of 5c: Start of the next spawns carries a
+/// channel of the caller's (posix_abi::process::probe_decoy).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_decoy(on: c_int) {
+    posix_abi::process::probe_decoy(on != 0);
+}
+
 const PAGE: usize = 4096;
 
 /// The anonymous mappings relibc holds: (first page, pages) of each, in

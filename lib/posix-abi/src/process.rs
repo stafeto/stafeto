@@ -374,6 +374,16 @@ pub fn spawn(path: &[u8], flags: i32, pgroup: i32) -> Result<i32, i32> {
     i32::try_from(pid).map_err(|_| EAGAIN)
 }
 
+/// The probe of condition O2 (5c): with it set, Start carries a second
+/// handle, a copy of a channel whose receiver the caller closed, which an
+/// honest loader never sends through.
+static DECOY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Sets the probe of condition O2.
+pub fn probe_decoy(on: bool) {
+    DECOY.store(on, Ordering::Relaxed);
+}
+
 /// The window where the layer writes the block of a spawn (5c); one
 /// spawn of the process writes there at a time (SPAWN_LOCK).
 const SPAWN_WINDOW: usize = 0x3000_0000;
@@ -791,7 +801,18 @@ fn commit(
     let mut w = Writer::new();
     Method::Start.header().write(&mut w).map_err(|_| EIO)?;
     w.u32(len as u32).map_err(|_| EIO)?;
-    if ask_loader(c, &w, Some([copy.erase()].into())) != 0 {
+    let mut start = rt::handle::Outgoing::new();
+    start.push(copy.erase()).map_err(|_| EIO)?;
+    if DECOY.load(Ordering::Relaxed) {
+        // A loader that sent through it would get PEER_CLOSED, and the
+        // spawn would fail.
+        let decoy = rt::sys::channel_create(1).map_err(|_| ENOMEM)?;
+        let rights = rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER;
+        let copy = rt::sys::handle_duplicate(&decoy, rights).map_err(|_| ENOMEM)?;
+        drop(decoy);
+        start.push(copy.erase()).map_err(|_| EIO)?;
+    }
+    if ask_loader(c, &w, Some(start)) != 0 {
         return Err(EIO);
     }
     drop(object);

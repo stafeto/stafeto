@@ -230,10 +230,10 @@ pub const RELIBC_TABLE: &[Record] = &[
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
     Record {
-        // The pool of the children from files (5c): five of the probe's
-        // quota at once (four children and one that fails its load), and
-        // the loaders' data.
-        quota: POSIX_ABI_TABLE[1].quota + 5 * PROCS_QUOTA + 16 * 5 * PAGE,
+        // The pool of the children from files (5c): 32 of the probe's
+        // quota at once and one that fails its load, with the service's
+        // reserve (posix_process_service::loaders::RESERVE).
+        quota: POSIX_ABI_TABLE[1].quota + 33 * PROCS_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],
@@ -324,7 +324,7 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 
 /// The quota of the probe of POSIX processes, which each child it spawns
 /// from a file gets too (5c).
-const PROCS_QUOTA: u64 = 4096 * PAGE;
+const PROCS_QUOTA: u64 = 512 * PAGE;
 
 /// The child of the probe of POSIX processes.
 const PROCS_CHILD: Record = Record {

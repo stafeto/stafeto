@@ -427,6 +427,16 @@ impl<'a> Ram<'a> {
                 if len == 0 {
                     return Err(NO_ENTRY);
                 }
+                // `..` of a node needs it to be a directory `who` may
+                // search, as any other name in it.
+                let here = core::str::from_utf8(&plain[..len]).map_err(|_| NO_ENTRY)?;
+                let info = self.information(here)?;
+                if info.kind != DIR {
+                    return Err(proto_fs::NOT_DIRECTORY);
+                }
+                if !may(&info, who, 0o1) {
+                    return Err(proto_fs::ACCESS_DENIED);
+                }
                 len = plain[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
                 continue;
             }
@@ -1479,6 +1489,16 @@ mod tests {
         // `..` above the root names nothing.
         assert_eq!(ram.exec("/../bin/ash", nobody), Err(NO_ENTRY));
         assert_eq!(ram.exec("/bin/../../bin/ash", nobody), Err(NO_ENTRY));
+        // `..` of a file, and of a directory only root may search.
+        assert_eq!(
+            ram.exec("/bin/ash/../ash", nobody),
+            Err(proto_fs::NOT_DIRECTORY)
+        );
+        assert_eq!(
+            ram.exec("/bin/sub/../ash", nobody),
+            Err(proto_fs::ACCESS_DENIED)
+        );
+        assert_eq!(ram.exec("/bin/sub/../ash", root), Ok(ash));
         // /bin/sub is 0700 of root: no search for others, root passes,
         // and b (0640) has no execute bit even for root.
         assert_eq!(ram.exec("/bin/sub/b", nobody), Err(proto_fs::ACCESS_DENIED));

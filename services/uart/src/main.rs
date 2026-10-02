@@ -159,6 +159,7 @@ fn main(_: u64) -> u64 {
         channel: Handle::borrowed(channel.raw()),
         level,
         given: 0,
+        clones: proto_wire::clones::Clones::new(),
         regs: Regs(REGS_AT),
         irq,
         log,
@@ -200,6 +201,8 @@ struct Uart {
     channel: core::mem::ManuallyDrop<Handle<Channel>>,
     level: u8,
     given: u64,
+    /// The sessions CLONE gave that live, bounded for each client.
+    clones: proto_wire::clones::Clones<32>,
     regs: Regs,
     irq: Handle<Interrupt>,
     log: Handle<Resource>,
@@ -542,6 +545,11 @@ impl Service<HELD> for Uart {
         drop(input.gone(label));
     }
 
+    /// The last copy of a session CLONE gave went.
+    fn closed(&mut self, label: u64) {
+        self.clones.gone(label);
+    }
+
     /// The interrupt of the line, and the timer of the reads of the log:
     /// a stale expiry, before its deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
@@ -563,6 +571,9 @@ impl Uart {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        if self.clones.room(r.label()).is_err() {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
         self.given += 1;
         let rights = abi::Rights::SEND.union(abi::Rights::TRANSFER);
         let label = 1 << 63 | self.given;
@@ -571,6 +582,7 @@ impl Uart {
                 if r.reply().u32(0).is_err() {
                     return Answer::Status(Status::BadSize);
                 }
+                let _ = self.clones.add(label, r.label());
                 Answer::Reply([session.erase()].into())
             }
             Err(e) => Answer::Status(Status::Kernel(e)),

@@ -1253,10 +1253,21 @@ impl Processes {
         if start.flags & !SPAWN_FLAGS != 0 {
             return refuse(proto_process::INVALID);
         }
+        // A RAM file service that started again closed the session of
+        // the loaders: the service asks init for the new one (init answers
+        // once the service registered).
+        if self.loader.is_some()
+            && self
+                .files
+                .as_ref()
+                .is_none_or(|f| sys::channel_info(f).is_ok_and(|i| i.closed))
+        {
+            self.files = rt::service::connect(&make::init(), "ramfs").ok();
+        }
         if self.loader.is_none() || self.files.is_none() {
             return refuse(proto_process::NOT_FOUND);
         }
-        if !self.records.may_spawn(index) || !self.loaders.room() {
+        if !self.records.may_spawn(index) || !self.loaders.room_for(index) {
             return refuse(proto_process::AGAIN);
         }
         // The ends of identity sessions wait in their channel until they
@@ -1281,6 +1292,12 @@ impl Processes {
             parent: parent.label.raw(),
         };
         let credentials = loaders::child_credentials(parent.credentials, start.flags);
+        // The child's quota comes from the service's: the pool, past which
+        // the service keeps a reserve for its own records and loaders.
+        let free = sys::process_memory(&make::own()).map_or(0, |m| m.quota.saturating_sub(m.used));
+        if !loaders::pool_allows(free, create.quota) {
+            return kernel(abi::Error::NoMemory);
+        }
         let place = records::exit_place(label, &create, self.level);
         // TRANSFER: the session moves into the process's entry 0.
         let rights = Rights::SEND | Rights::TRANSFER;
@@ -1536,7 +1553,10 @@ impl Processes {
 
     /// SpawnCommit of the record in `index`: its LOADING child lives, with
     /// the IDs SetId kept for its loader's place, and the loader hears that
-    /// the record is ready.
+    /// the record is ready. The service does not see the loader's answer
+    /// to Go: a parent that commits after a failed load gets a child that
+    /// ends with 127 (its loader gave up), set-ID or not, which runs no
+    /// program.
     fn spawn_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let Some(child) = self.loading_child(index, r) else {
             return refuse(proto_process::NO_PROCESS);

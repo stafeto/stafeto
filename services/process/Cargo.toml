@@ -24,9 +24,6 @@ adoption-refusals = []
 # The probe of POSIX processes whose service ended: the service ends before
 # it registers (xtask posix-orphans).
 exit-early = []
-# The probe of POSIX processes: four children of a record at most, so that
-# the guest reaches the limit (tests/posix-procs).
-children-max-4 = []
 
 [dependencies]
 proto-process = { path = "../../proto/process" }

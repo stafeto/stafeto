@@ -33,13 +33,9 @@ use proto_process::{
 };
 
 /// The children of one record at most, its zombies among them, until
-/// RLIMIT_NPROC (5b design, question 3): Spawn past them is EAGAIN. Four
-/// in the image of the probe of POSIX processes, which reaches the limit.
-pub const CHILDREN_MAX: u32 = if cfg!(feature = "children-max-4") {
-    4
-} else {
-    32
-};
+/// RLIMIT_NPROC (5b design, question 3): Spawn past them is EAGAIN. The
+/// probe of POSIX processes reaches it with children from files (5c).
+pub const CHILDREN_MAX: u32 = 32;
 
 /// Where a record is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

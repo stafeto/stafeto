@@ -16,6 +16,21 @@
 
 use proto_process::{Credentials, NO_ID, RECORDS, SPAWN_RESETIDS};
 
+/// The service's own pages it keeps out of the pool of the children's
+/// quotas (5c): the objects of the pages of its records (8 of 32 pages),
+/// the data and stacks of its loaders (16 of 5 pages) and room for the
+/// tables of its mappings.
+pub const RESERVE: u64 = 384 * 4096;
+
+/// Whether a child of `quota` bytes fits the pool: the service's quota
+/// left (`free`) keeps RESERVE after it.
+pub const fn pool_allows(free: u64, quota: u64) -> bool {
+    match free.checked_sub(RESERVE) {
+        Some(pool) => quota <= pool,
+        None => false,
+    }
+}
+
 /// The credentials a child of `parent` starts with: those of an exec, the
 /// saved IDs taken from the effective ones, and the effective ones reset
 /// to the real ones for POSIX_SPAWN_RESETIDS ([P24-SPAWN], [P24-EXEC]).
@@ -53,6 +68,9 @@ pub fn set_ids(c: Credentials, (uid, gid): (u32, u32)) -> Credentials {
 /// The loaders that run at most: the service pays for their data and
 /// stack (five pages each) and holds a place of its channel for each.
 pub const LOADERS: usize = 16;
+/// The loaders of one parent at once (5c, decision 7): a process that
+/// starts spawns and never finishes them holds no more places than these.
+pub const LOADERS_OF_PARENT: usize = 2;
 
 /// Where a load is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,11 +132,24 @@ impl<T> Loaders<T> {
         self.places.iter().any(Option::is_none)
     }
 
+    /// Whether the record in `parent` may start another load: a place is
+    /// free and it has fewer than LOADERS_OF_PARENT.
+    pub fn room_for(&self, parent: usize) -> bool {
+        let own = self
+            .places
+            .iter()
+            .flatten()
+            .filter(|p| p.parent == parent)
+            .count();
+        self.room() && own < LOADERS_OF_PARENT
+    }
+
     /// A place for the loader of the record in `record`, a child of the
     /// record in `parent`, image `image`: Booting, one generation on. None
-    /// with every place taken, or when the record has one.
+    /// with every place taken, when the parent has LOADERS_OF_PARENT, or
+    /// when the record has one.
     pub fn take(&mut self, record: usize, parent: usize, image: u32, held: T) -> Option<usize> {
-        if self.of_record[record].is_some() {
+        if self.of_record[record].is_some() || !self.room_for(parent) {
             return None;
         }
         let index = self.places.iter().position(Option::is_none)?;
@@ -243,6 +274,16 @@ mod tests {
         assert_eq!(set_ids(reset, (NO_ID, 7)).words(), [1, 1, 1, 4, 7, 7]);
     }
 
+    /// A child's quota comes from the pool only while the service keeps
+    /// its reserve after it.
+    #[test]
+    fn the_pool_keeps_the_reserve() {
+        let child = 512 * 4096;
+        assert!(pool_allows(RESERVE + child, child));
+        assert!(!pool_allows(RESERVE + child - 1, child));
+        assert!(!pool_allows(RESERVE - 1, 0));
+    }
+
     /// A loader that booted: the place loads.
     fn loading(t: &mut Loaders<()>, record: usize) -> u64 {
         let index = t.take(record, 0, 1, ()).unwrap();
@@ -255,7 +296,7 @@ mod tests {
     fn sixteen_places_one_per_record() {
         let mut t = Loaders::<()>::new();
         for record in 1..=LOADERS {
-            assert!(t.take(record, 0, 1, ()).is_some());
+            assert!(t.take(record, 200 + record, 1, ()).is_some());
         }
         assert!(!t.room());
         assert_eq!(t.take(100, 0, 1, ()), None, "the seventeenth waits");
@@ -263,6 +304,22 @@ mod tests {
         assert_eq!(t.take(4, 0, 1, ()), None, "one place a record");
         assert!(t.take(100, 0, 1, ()).is_some());
         assert_eq!(t.count(), LOADERS);
+    }
+
+    /// One parent holds LOADERS_OF_PARENT places at most: the others stay
+    /// for the other parents, and a place it frees is its own again.
+    #[test]
+    fn a_parent_holds_two_places_at_most() {
+        let mut t = Loaders::<()>::new();
+        for record in 1..=LOADERS_OF_PARENT {
+            assert!(t.room_for(7));
+            assert!(t.take(record, 7, 1, ()).is_some());
+        }
+        assert!(!t.room_for(7));
+        assert_eq!(t.take(50, 7, 1, ()), None, "a third load of one parent");
+        assert!(t.take(50, 8, 1, ()).is_some(), "another parent's");
+        t.free(1);
+        assert!(t.take(51, 7, 1, ()).is_some());
     }
 
     /// SetId is kept once, for the record and image of its place, while it

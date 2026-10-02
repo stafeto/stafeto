@@ -19,7 +19,7 @@ rt::entry!(main);
 
 /// The sessions: the POSIX processes init starts and their children, each
 /// with a session of its own (Clone).
-const SESSIONS: usize = 24;
+const SESSIONS: usize = 64;
 /// The mark of the labels the service gives itself (Clone): bit 63, which
 /// no label of init has.
 const OWN: u64 = 1 << 63;
@@ -63,6 +63,7 @@ fn main(_: u64) -> u64 {
             channel: Handle::borrowed(channel.raw()),
             level,
             given: 0,
+            clones: proto_wire::clones::Clones::new(),
             clock,
             page,
             watches: core::array::from_fn(|_| None),
@@ -97,6 +98,8 @@ struct Clocks {
     channel: ManuallyDrop<Handle<Channel>>,
     level: u8,
     given: u64,
+    /// The sessions Clone gave that live, bounded for each client.
+    clones: proto_wire::clones::Clones<64>,
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
@@ -366,13 +369,18 @@ impl Service<0> for Clocks {
             if r.body().finish().is_err() || !r.handles.is_empty() {
                 return Answer::Status(Status::BadSize);
             }
+            if self.clones.room(r.label()).is_err() {
+                return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+            }
             self.given += 1;
             let rights = rt::abi::Rights::SEND.union(rt::abi::Rights::TRANSFER);
-            return match sys::handle_label(&self.channel, rights, OWN | self.given, self.level) {
+            let label = OWN | self.given;
+            return match sys::handle_label(&self.channel, rights, label, self.level) {
                 Ok(session) => {
                     if r.reply().u32(0).is_err() {
                         return Answer::Status(Status::BadSize);
                     }
+                    let _ = self.clones.add(label, r.label());
                     Answer::Reply([session.erase()].into())
                 }
                 Err(e) => Answer::Status(Status::Kernel(e)),
@@ -488,6 +496,10 @@ impl Service<0> for Clocks {
             }
             Some(Method::Watch | Method::Clone) | None => Answer::Status(Status::UnknownMethod),
         }
+    }
+    /// The last copy of a session Clone gave went.
+    fn closed(&mut self, label: u64) {
+        self.clones.gone(label);
     }
     fn gone(&mut self, s: &mut Session<(), 0>) {
         for slot in &mut self.identities {

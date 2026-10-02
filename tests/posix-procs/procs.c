@@ -15,9 +15,7 @@
  * signal in waitpid with SA_RESTART waits on, without it EINTR; exit(7)
  * gives WIFEXITED 7, a load from address 0 WIFSIGNALED SIGSEGV; waitid
  * with WNOWAIT leaves the zombie for the next wait; a grandchild whose
- * parent ended sees getppid() 1; a PID that is no child is ECHILD; with
- * the build's limit of four children (feature children-max-4 of the
- * service), a fifth is EAGAIN, zombies counted.
+ * parent ended sees getppid() 1; a PID that is no child is ECHILD.
  *
  * Stage 3, kill (the first goal of 5b): SIGTERM to a child without a
  * handler gives WIFSIGNALED SIGTERM, apart from exit(143); SIGKILL ends a
@@ -57,7 +55,10 @@
  * probe is nobody (stage 5): a set-user-ID file of root runs with euid 0
  * in the secure mode, with POSIX_SPAWN_RESETIDS too; after a set-ID file
  * that failed to load, the next child keeps euid 65534; a directory only
- * root may search gives EACCES.
+ * root may search gives EACCES. A process has 32 children at most, live
+ * or zombies: the 33rd is EAGAIN (5b's CHILDREN_MAX, now reached with
+ * children from files, each with the parent's quota from the service's
+ * pool).
  *
  * Stage 8, descriptors through posix_spawn (5c): fd 3 with FD_CLOEXEC is
  * closed in the child, fd 4 dup2'd onto itself and fd 5 a copy of it stay
@@ -92,6 +93,7 @@ static int failures;
 /* The layer's probes of 5c (posix-crt, posix-platform). */
 void stafeto_start_handles(unsigned long *out);
 int stafeto_probe_open_exec(const char *path);
+void stafeto_probe_decoy(int on);
 
 static void expect(const char *what, int got, int want) {
     if (got != want) {
@@ -635,15 +637,6 @@ static void waits(pid_t child) {
     expect("waitpid of PID 1", (int)waitpid(1, &status, 0) == -1 && errno == ECHILD, 1);
     expect("waitpid of its own PID", (int)waitpid(getpid(), &status, WNOHANG) == -1 && errno == ECHILD, 1);
     expect("waitpid(-1, WNOHANG) with the sleeper alive", (int)waitpid(-1, &status, WNOHANG), 0);
-
-    /* The sleeper and three zombies make four children: a fifth is EAGAIN. */
-    pid_t zombies[3] = {start("/boot/procs-exit7"), start("/boot/procs-segv"), start("/boot/procs-child")};
-    pause_ms(100);
-    pid_t fifth = -7;
-    expect("a fifth child", spawn(&fifth, "/boot/procs-nap", NULL, NULL), EAGAIN);
-    reap("a zombie procs-exit7", zombies[0], 7, 0);
-    reap("a zombie procs-segv", zombies[1], 0, SIGSEGV);
-    reap("a zombie procs-child", zombies[2], 0, 0);
 }
 
 /* Stage 6: more children than the service has places for sessions, one
@@ -690,8 +683,32 @@ static void refused(const char *what, const char *path, char *const argv[], int 
     expect(what, pid, -7);
 }
 
+/* 32 children from files live at once; the 33rd is EAGAIN. */
+static void thirty_two(void) {
+    char *argv[] = {"procs-child", "sleep", NULL};
+    char *envp[] = {NULL};
+    pid_t pids[32];
+    int live = 0;
+    for (; live < 32; live++) {
+        int e = posix_spawn(&pids[live], "/bin/procs-child", NULL, NULL, argv, envp);
+        if (e != 0) {
+            printf("posix-procs: child %d of 32 gave %d (%s)\n", live + 1, e, strerror(e));
+            failures++;
+            break;
+        }
+    }
+    pid_t none = -7;
+    if (live == 32) {
+        expect("a 33rd child", posix_spawn(&none, "/bin/procs-child", NULL, NULL, argv, envp), EAGAIN);
+        printf("posix-procs: 32 children live\n");
+    }
+    for (int i = 0; i < live; i++) kill(pids[i], SIGKILL);
+    for (int i = 0; i < live; i++) reap("one of 32 children", pids[i], 0, SIGKILL);
+}
+
 /* Stage 7, as root. */
 static void files(void) {
+    thirty_two();
     /* The first goal of 5c: ls of /etc from a file, waited for. */
     char *ls[] = {"ls", "/etc", NULL};
     char *path_env[] = {"PATH=/bin", NULL};
@@ -742,6 +759,11 @@ static void files(void) {
     signal(SIGPIPE, SIG_DFL);
 
     run_role("/bin/procs-child", "handles", NULL);
+    /* Condition O2: a channel of the parent's in Start carries no request
+     * of the loader, whose own handles come from the service. */
+    stafeto_probe_decoy(1);
+    run_role("/bin/procs-child", "child", NULL);
+    stafeto_probe_decoy(0);
     expect("OpenExec through the probe's own session", stafeto_probe_open_exec("/bin/ls"), EPERM);
 }
 

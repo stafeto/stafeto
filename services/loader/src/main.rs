@@ -142,11 +142,18 @@ fn serve(start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
             });
         }
         match sys::receive(start).ok()? {
-            Received::Notification { source, label, .. } => {
-                // The service's word through its copy, label 2: a parent's
-                // copy carries no NOTIFY. The parent's end (CLIENT_GONE of
-                // label 1) changes nothing: its death ends the child.
-                if source == Source::Session && label == pl::SERVICE {
+            Received::Notification {
+                source,
+                label,
+                bits,
+                ..
+            } => {
+                // The service's word through its copy, label 2, bit 1: a
+                // parent's copy carries no NOTIFY, and the end of the
+                // service's copy (CLIENT_GONE) says nothing. The parent's
+                // end (CLIENT_GONE of label 1) changes nothing either: its
+                // death ends the child.
+                if source == Source::Session && label == pl::SERVICE && bits & 1 != 0 {
                     ready = true;
                 }
             }
@@ -187,7 +194,10 @@ fn serve(start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
                         }
                     }
                     Some(Method::Go) if block_len.is_some() && loaded.is_none() => {
-                        let block = Block::read(staged(block_len?)).ok()?;
+                        let Ok(block) = Block::read(staged(block_len?)) else {
+                            reply(token, Status::BadSize.code());
+                            return None;
+                        };
                         match load(own, &block) {
                             Ok(done) => {
                                 loaded = Some(done);
