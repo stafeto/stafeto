@@ -28,14 +28,15 @@ rt::entry!(main);
 
 const METHODS: &[u16] = proto_fs::METHODS;
 /// The sessions: one place the image sessions share (they hold nothing),
-/// then the clients', with room for the children of POSIX processes.
-#[cfg(not(feature = "steps"))]
-const SESSIONS: usize = 64;
-#[cfg(feature = "steps")]
+/// then the clients', with room for the 255 records of the process
+/// service and the services beside them. The table lies in `.bss`
+/// (`SESSION_TABLE`).
 const SESSIONS: usize = 320;
 /// Where the service maps the boot image, read-only, for as long as it
 /// lives: the files of its table are read from there.
 const IMAGE: usize = 0x50_0000_0000;
+/// Where the service maps the object of a READ_INTO while it fills it.
+const INTO: usize = 0x58_0000_0000;
 
 /// The index of the table of the boot image, in the service's `.bss`.
 struct Table(UnsafeCell<Index>);
@@ -94,22 +95,27 @@ fn main(_: u64) -> u64 {
         heartbeat: Some(heartbeat),
     };
     rt::println!("ramfs: ready");
+    // SAFETY: only the main thread reaches TABLES, here once.
+    let tables = unsafe { &mut *TABLES.0.get() };
     let mut fs = Fs {
         ram,
+        process: Handle::borrowed(start.process.raw()),
         channel: Handle::borrowed(channel.raw()),
         parent: Handle::borrowed(start.parent.raw()),
         notary: None,
         given: 0,
         level,
-        births: [None; BIRTHS],
+        births: &mut tables.births,
         clones: Clones::new(),
     };
-    let _ = rt::service::run::<Fs, SESSIONS, 0>(&channel, &mut fs, config);
+    let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
     4
 }
 
 struct Fs {
     ram: Ram<'static>,
+    /// The service's own process, to map the object of a READ_INTO in.
+    process: ManuallyDrop<Handle<rt::handle::Process>>,
     /// The service's channel, which its own sessions are copies of, and
     /// its connection to init, which gives the notary session.
     channel: ManuallyDrop<Handle<Channel>>,
@@ -123,20 +129,33 @@ struct Fs {
     /// The descriptors of the sessions Clone made that sent nothing yet,
     /// by their labels: the session's first request takes them, and the
     /// end of its last copy closes them.
-    births: [Option<(u64, Fds)>; BIRTHS],
+    births: &'static mut [Option<(u64, Fds)>; BIRTHS],
     /// The clones alive, bounded for each client and in all.
     clones: Clones<CLONES>,
 }
 
-/// The clones the service keeps alive at most.
-#[cfg(not(feature = "steps"))]
-const CLONES: usize = 128;
-#[cfg(feature = "steps")]
+/// The clones the service keeps alive at most: one for each record of the
+/// process service and room beside them.
 const CLONES: usize = 320;
 
 /// Clones whose sessions sent nothing yet, at most: past them, Clone is
-/// LIMIT_REACHED.
-const BIRTHS: usize = 64;
+/// LIMIT_REACHED. A child that never touches a file keeps its birth, so
+/// there is one for each record of the process service.
+const BIRTHS: usize = 256;
+
+/// The tables of the sessions and of the births, in `.bss`: too big for
+/// the service's stack.
+struct Tables {
+    sessions: [Option<Session<Fds, 0>>; SESSIONS],
+    births: [Option<(u64, Fds)>; BIRTHS],
+}
+struct Bss(UnsafeCell<Tables>);
+// SAFETY: only the main thread reaches it, once (`main`).
+unsafe impl Sync for Bss {}
+static TABLES: Bss = Bss(UnsafeCell::new(Tables {
+    sessions: [const { None }; SESSIONS],
+    births: [None; BIRTHS],
+}));
 
 impl Fs {
     /// The notary session, asked of init once.
@@ -241,10 +260,35 @@ impl Fs {
     }
 
     /// A request through an image session for the file of `entry`:
-    /// READ_AT and INFO_FD of fd 0 alone.
+    /// READ_AT, READ_INTO and INFO_FD of fd 0 alone.
     fn image(&mut self, entry: u16, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         match Method::from_number(r.method()) {
+            Some(Method::ReadInto) => {
+                let (Ok(fd), Ok(offset), Ok(count), Ok(at)) =
+                    (body.u32(), body.u64(), body.u32(), body.u64())
+                else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let rights = Rights::MAP_READ | Rights::MAP_WRITE;
+                let writable = matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Memory, got)) if got.contains(rights));
+                if body.finish().is_err()
+                    || fd != 0
+                    || count as usize > proto_fs::READ_INTO_MAX
+                    || at % 4096 != 0
+                    || r.handles.len() != 1
+                    || !writable
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                let Ok(memory) = r.handles.take::<Memory>(0) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.read_into(entry, offset, count as usize, &memory, at) {
+                    Ok(n) => value(r, n as u32),
+                    Err(answer) => answer,
+                }
+            }
             Some(Method::ReadAt) => {
                 let (Ok(fd), Ok(offset), Ok(count)) = (body.u32(), body.u64(), body.u32()) else {
                     return Answer::Status(Status::BadSize);
@@ -288,6 +332,34 @@ impl Fs {
             }
             _ => status(proto_fs::PERMISSION),
         }
+    }
+}
+
+impl Fs {
+    /// READ_INTO: `count` bytes of the file of `entry` from `offset` into
+    /// `memory` from `at`, through the window INTO of the service's own
+    /// space, mapped for the copy alone: the count copied.
+    fn read_into(
+        &mut self,
+        entry: u16,
+        offset: u64,
+        count: usize,
+        memory: &Handle<Memory>,
+        at: u64,
+    ) -> Result<usize, Answer> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let len = (count as u64).next_multiple_of(4096);
+        sys::mem_map(&self.process, memory, at, len, INTO, Access::ReadWrite)
+            .map_err(|e| Answer::Status(Status::Kernel(e)))?;
+        // SAFETY: the window maps `len` bytes of the object, which only this
+        // step touches until the unmap below.
+        let out = unsafe { core::slice::from_raw_parts_mut(INTO as *mut u8, count) };
+        let read = self.ram.image_read(entry, offset, out);
+        // SAFETY: the mapping made above, which nothing uses now.
+        let _ = unsafe { sys::mem_unmap(&self.process, INTO, len) };
+        read.map_err(status)
     }
 }
 
@@ -411,7 +483,7 @@ impl Service<0> for Fs {
         let mut body = r.body();
         match Method::from_number(r.method()) {
             Some(Method::Clone) => self.clone_session(&s.data, r),
-            Some(Method::OpenExec) => status(proto_fs::PERMISSION),
+            Some(Method::OpenExec | Method::ReadInto) => status(proto_fs::PERMISSION),
             Some(Method::Open) => {
                 let Ok(flags) = body.u32() else {
                     return Answer::Status(Status::BadSize);

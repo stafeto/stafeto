@@ -136,8 +136,8 @@ Apple silicon.
 - `ash` cannot start external programs: BusyBox runs them through `fork`,
   and `fork` and pipes are not there yet; a program starts others by
   `posix_spawn` and `exec` from files.
-- About 60 POSIX processes at once: the RAM file and clock services keep
-  64 sessions each; the process service itself holds 256 records.
+- 255 POSIX processes at once: the process service holds 256 records,
+  and the RAM file and clock services keep 320 sessions each.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 

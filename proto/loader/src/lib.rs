@@ -49,8 +49,6 @@ pub const VERSION: u16 = 1;
 /// half (spec 2, 3.2), which no program's segment may take.
 pub const LOADER_BASE: u64 = (1 << 48) - (16 << 20);
 pub const LOADER_END: u64 = 1 << 48;
-/// Where the loader maps the objects it fills, in its own region.
-pub const LOADER_WINDOW: u64 = LOADER_BASE + (8 << 20);
 /// The pages a program's segments may take: below the fixed addresses of
 /// the POSIX layer (its buffers of the threads from 0x200_0000, the page of
 /// the record, the clock's pages, the heap), the start area and the stack.

@@ -368,12 +368,23 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
     service: &mut S,
     config: Config<'_>,
 ) -> Error {
+    let mut table: [Option<Session<S::Data, K>>; N] = core::array::from_fn(|_| None);
+    run_in(channel, service, config, &mut table)
+}
+
+/// `run` with the table of sessions the caller gives, all of them free:
+/// a service with a table too big for its stack keeps it in its `.bss`.
+pub fn run_in<S: Service<K>, const K: usize>(
+    channel: &Handle<Channel>,
+    service: &mut S,
+    config: Config<'_>,
+    table: &mut [Option<Session<S::Data, K>>],
+) -> Error {
     let mut beat = match config.heartbeat.map(|h| Beat::start(channel, h)) {
         None => None,
         Some(Ok(beat)) => Some(beat),
         Some(Err(e)) => return e,
     };
-    let mut table: [Option<Session<S::Data, K>>; N] = core::array::from_fn(|_| None);
     // Zeroed once: a request reads only its first `len` bytes, and both
     // paths fill all `len` bytes, so no byte of an earlier client reaches
     // the next request.
@@ -396,15 +407,7 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 }
                 let kind = steps::kind_of(bytes);
                 let began = steps::begin();
-                request(
-                    service,
-                    &mut table,
-                    config.issued,
-                    label,
-                    bytes,
-                    handles,
-                    token,
-                );
+                request(service, table, config.issued, label, bytes, handles, token);
                 steps::end(began, kind);
                 continue;
             }

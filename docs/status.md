@@ -39,7 +39,9 @@ POSIX layer covers, and which commands check each piece. It describes
   (`console_poll` of the old VZ build) and 35 (`request_identity`) are
   retired and fail as unknown ones, and so does kind 10 of `object_info`;
   the process service names its clients by the labels of the sessions it
-  gives. `process_kill` takes the level of the teardown it starts.
+  gives. Kind 11 of `object_info`, LABEL, gives the owner of a channel
+  (with RECEIVE) the label of a labelled copy of it, O(1): the process
+  service's Vouch. `process_kill` takes the level of the teardown it starts.
 - **Messages:** requests and replies of up to 1 KiB, the first 64 bytes in
   registers and the rest through a per-thread message buffer; up to four
   handles move with a message and keep their rights and labels. A service
@@ -155,7 +157,7 @@ cancellation, shared-state, input and interruption probes as well, and
 | `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
 | `posix-procs` | the C probe of processes on relibc: `posix_spawn` and `exec` from files (`/bin/ls /etc`, `argv`, `envp`, set-ID, 32 live children, 1,100 in a row, descriptors, a failed `exec`), exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, a fault as `SIGSEGV`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |
 | `os-test` | os-test (Sortix, ISC, pinned) io, malloc, signal, `basic/spawn` and `basic/unistd` `exec*` suites on relibc, a boot a suite with the tests started from files; PASS, FAIL and UNSUPPORTED (needs `fork` or pipes) in `target/measure/os-test.txt`; a test that runs 10 s is killed, the run stops after 300 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
-| `process-steps` [branches] | the longest step of the process service under `-icount` with a crowd of children (128 with 4 branches, in `ci`; 248 with 7) and the entries a Vouch takes off the identity channel; the table is in `target/measure/process-steps.txt` and in [non-preemptible-paths](non-preemptible-paths.md) |
+| `process-steps` [branches] | the longest step of the process service under `-icount` with a crowd of children (128 with 4 branches, in `ci`; 248 with 7); it fails when the longest Vouch passes 6,000 ticks; the table is in `target/measure/process-steps.txt` and in [non-preemptible-paths](non-preemptible-paths.md) |
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
@@ -220,4 +222,6 @@ size (level `s`) had S4 `dup`/`close` at 671 / 751 ns and S6 at 2,175 /
 10 minutes at step 5c (HVF / VZ, p50 / p99): S13 `posix_spawn` of a file to
 the child's `main` 221 / 303 and 221 / 295 us (step 5b, from a boot-image
 record: 55 us p50); S14 `exec` to the new image's `main` 229 / 270 us on
-both; S12 `killpg` to a group of 32 639 / 918 and 655 / 918 us.
+both; S12 `killpg` to a group of 32 639 / 918 and 655 / 918 us. After the
+loader reads its segments by `ReadInto` (one minute, HVF / VZ): S13 88 /
+152 and 88 / 139 us, S14 102 / 125 and 102 / 139 us.

@@ -13,7 +13,9 @@ files, a boot for each suite.
 - **Files.** `lib/bootimg/src/rootfs.rs` holds the table (up to 1,024
   entries, paths up to 511 bytes, names up to 255). `services/ramfs` reads
   files from its read-only mapping of the image; `ReadAt` copies at most
-  1 KiB a step. Modes and owners come from the table.
+  1 KiB a step, and `ReadInto` of an image session copies up to 64 KiB
+  into a memory object the loader gives. Modes and owners come from the
+  table.
 - **Loader.** `services/loader` runs in the child at `abi::LOADER_BASE`.
   The parent sends the block of `argv`, `envp`, the current directory and
   the descriptors (`proto/loader`, up to 64 KiB of strings), then
@@ -32,8 +34,8 @@ files, a boot for each suite.
 - **`exec`.** Seven steps (spec 2, 3.2): the other threads park, ExecStart
   makes a new process under the same record, the loader loads the file,
   descriptors move after "image ready", ExecCommit moves the record (PID,
-  PPID, groups and open files stay), the old image ends. An error before
-  ExecCommit leaves the old image whole.
+  PPID, groups and open files stay), the service kills the old image. An
+  error before ExecCommit leaves the old image whole.
 - **Table of `init`.** Records of the table no longer start children; the
   children of `posix-procs` and `rtbench` come from `/bin` with the
   parent's quota out of the service's pool.
@@ -53,7 +55,7 @@ files, a boot for each suite.
 | S10 `kill` of a process, target sleeping | 1.4 / 3.5 / 16 | 1.4 / 3.3 / 11 |
 
 Step 5b measured `posix_spawn` from a boot-image record at 55 us p50.
-From a file the same call takes 221 us: a spawn now makes the loader's
+From a file the same call took 221 us: a spawn makes the loader's
 process, runs its boot and the OpenExec round trip, reads the image, and
 clones three sessions. An `exec` costs about the same, since it makes the
 new process under the same record. Both stay within 1.4 ms in the 4,440
@@ -61,73 +63,71 @@ samples of each run. The run is at the commit's tree with documents
 (`+changes` in the file header). Raw files are in the closed reports
 folder.
 
+### Where the 221 us went (fix wave after T6)
+
+One-minute runs of `cargo xtask rtbench --minutes 1` (460 samples a row),
+p50 / p99 in microseconds, HVF and VZ:
+
+| Tree | S13 HVF | S13 VZ | S14 HVF | S14 VZ |
+|---|---|---|---|---|
+| reads by `ReadAt` (the loader of T6) | 221 / 287 | 225 / 270 | 233 / 270 | 238 / 270 |
+| reads by `ReadInto` | 88 / 152 | 88 / 139 | 102 / 125 | 102 / 139 |
+
+The child, `rtbench-posix`, has 198,764 bytes in its segments (39,412,
+157,568 and 1,784). `ReadAt` carries at most 1,016 bytes in the reply
+through the message buffers, so the loader made 196 round trips with the
+file service: 133 us of the 221, about 0.68 us a request. `ReadInto`
+takes a copy of the segment's object and the service copies up to 64 KiB
+from its mapping of the boot image straight into it: five requests for
+the three segments. The remaining 88 us are the steps no boot-image spawn
+(55 us in 5b) had: the loader's process with its code, data and stack
+(SpawnStart, about 88,000 ticks under `-icount`, the longest step of the
+service), Boot, the copy of the block, OpenExec with the file service's
+Vouch through the notary, InfoFd, the first page by `ReadAt`, Ready, the
+three Clones of the files, clock and console sessions, Handles,
+SpawnCommit and Take; each is a round trip or two, and none is measured
+alone. The child's own start (relibc, its sessions) is in both numbers.
+
 ### The longest step of the process service, under `-icount`
 
 `cargo xtask process-steps [branches]` (a part of `ci` with 4 branches)
 boots the probe in its steps mode under `-icount shift=4,sleep=off` and
 prints the longest step of the service's loop for each method; a tick is
-the counter's tick, the unit of term B of the kernel (20,536). With 128
-children, four branches of 32 each (`kill(-1)` twenty times, spawns and
-`exec` among them, volleys of `SIGUSR1` that arm every identity session,
-`kill(-1, SIGKILL)` and a spawn after the ends):
+the counter's tick, the unit of term B of the kernel (20,536). The crowd:
+branches of 32 children (`kill(-1)` twenty times, spawns and `exec` among
+them, volleys of `SIGUSR1` that arm every identity session, `kill(-1,
+SIGKILL)` and a spawn after the ends), then `seteuid` and `clock_settime`
+make the clock service ask Vouch with every identity session in the
+identity channel. The table with 32, 128 and 248 children is in
+[docs/non-preemptible-paths.md](../docs/non-preemptible-paths.md); no
+step grows with the number of processes.
 
-| Step | Ticks | Entries taken off the identity channel |
-|---|---|---|
-| SpawnStart | 158,692 | 128 |
-| Vouch | 75,508 | 132 |
-| ExecStart | 48,142 | 1 |
-| Create | 59,602 | 0 |
-| `STEP` notification (the walk of `kill(-1)`, ends) | 14,137 | 0 |
-| Boot | 6,806 | 0 |
-| WaitStart | 6,857 | 0 |
-| Take | 5,422 | 0 |
-| ExecCommit | 4,189 | 0 |
-| SpawnCommit | 2,214 | 0 |
-| Kill (one step of the walk) | 1,201 | 0 |
-
-Without a backlog in the identity channel a SpawnStart takes 87,891 ticks
-(32 children). The steps of `Kill`, `ExecCommit` and `SpawnCommit` do not
-grow with the number of processes. SpawnStart, ExecStart, Create and
-Vouch empty the channel of identity sessions before they notify (the
-cost of 5b's Vouch), so each grows with the entries that wait there. The
-line is in [docs/non-preemptible-paths.md](../docs/non-preemptible-paths.md)
-next to the kernel paths.
-
-### Vouch under `-icount`
-
-The probe builds the most identities it can: 248 children (seven branches
-of 32 and 24 of the probe's own, the limit of the 256 records), each
-armed by a `SIGUSR1` volley, then `seteuid` and `clock_settime` make the
-clock service ask Vouch with nothing draining the channel before it.
-
-| Entries taken | Ticks |
-|---|---|
-| 36 | 23,764 |
-| 132 | 75,508 |
-| 252 | 140,188 |
-
-Two segments both give 539 ticks an entry, about 4,360 ticks fixed. The
-probe reached 252 of the 510 receives that the loop can face (255 ends
-not yet received and 255 notifications of live processes) and cannot go
-further, since every entry belongs to a process that lives or ended since
-the last call that drained the channel. Linear extrapolation to 510:
-about 279,000 ticks, 13.6 times term B (20,536). **The worst Vouch is far
-above term B**: Vouch alone reaches B at about 30 entries. The cure is a
-small kernel change (`object_info` of a copy a caller receives on gives
-its label, O(1), which also removes the dependence on one processor).
-This step leaves the kernel unchanged; the change is due before multicore
-and before the process service takes a hostile load.
+T6 measured the steps with a Vouch that emptied the identity channel,
+539 ticks an entry and about 4,360 fixed: 23,764 ticks with 36 entries,
+75,508 with 132 and 140,188 with 252, about 279,000 extrapolated to 510,
+13.6 times term B; SpawnStart, ExecStart and Create emptied it too
+(SpawnStart 261,532 ticks with 248 entries). The fix wave after T6 gave
+the kernel `object_info` LABEL: the owner of a channel, which holds it
+with RECEIVE, reads the label of a labelled copy of it in O(1). Vouch now
+takes the label of the copy a client gave from the kernel and looks at
+nothing in the channel: 2,837 ticks with 32 children, 2,798 with 248. A
+thread of the service of its own (`services/process/src/ends.rs`) takes
+the ends of identity sessions and the notifications through them, one
+`receive` each, at the loop's level; no step of the loop empties the
+channel, and the answer no longer depends on one processor.
 
 ## Known limits
 
-- **Vouch and the drain.** Above. SpawnStart, ExecStart and Create carry
-  the same cost: SpawnStart takes 261,532 ticks with 248 entries.
-- **About 60 POSIX processes at once.** The RAM file and clock services
-  keep 64 sessions each, 128 clones in all, 48 live clones a client, and
-  64 clones whose session has sent nothing yet (a child that never touches
-  a file keeps one: `EAGAIN` for the next spawn). The probe of the steps
-  builds both services with 320 places (feature `steps`); the shipping
-  tables stay at 64.
+- **Fixed steps above term B.** SpawnStart (about 88,000 ticks), Create
+  (about 60,000) and ExecStart (about 47,000) make a process in the
+  kernel a call at a time; they do not grow with the number of processes.
+- **255 POSIX processes at once.** The process service holds 256
+  records. The RAM file and clock services keep 320 sessions each and 320
+  clones in all, 48 live clones a client; the RAM file service keeps 256
+  clones whose session has sent nothing yet (a child that never touches a
+  file keeps one), its tables in `.bss`. The UART driver keeps 128 clones
+  and 8 sessions: a child that reads the console takes one. The steps
+  probe runs 248 children on these shipping tables.
 - **Loads at once.** 16 loaders in all, 2 for a parent; a spawn past them
   is `EAGAIN` (a caller retries).
 - **32 live children a process** (zombies count), 256 records in all.
@@ -170,7 +170,8 @@ From the table of steps in spec 2 and the first goals of the design.
 4. **Set-ID through the file service.** Met: OpenExec, SetId tied to the
    loader's place, probes of the forged channel and of a failed load.
 5. **The 5b debts.** The group of 32 (met, row S12), the Vouch limit
-   measured (done; above term B), the longest step of the service with 128
-   children (done, above).
+   measured (done; above term B, then O(1) through `object_info` LABEL),
+   the longest step of the service with 128 children (done, above; none
+   grows with the number of processes).
 6. **Limits as specified.** 33rd child `EAGAIN`, 1,100 children in a row
    (met).

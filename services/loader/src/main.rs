@@ -11,7 +11,7 @@
 //! requests (condition O2). Through C the parent gives the block (Start), which the
 //! loader copies before it reads it (sp3.M6), and says Go: the loader opens
 //! the program through the session of the loaders with a copy of its
-//! identity (OpenExec, condition O1), reads its ELF file piece by piece into objects
+//! identity (OpenExec, condition O1), has the file service copy its ELF file into objects
 //! of the new process, which pays for them, tells the service the image
 //! is ready (Ready, before which no commit of its place is taken) and
 //! answers "the image is ready" or why not. The parent gives the program's sessions (Handles);
@@ -44,9 +44,6 @@ const PAGE: u64 = 4096;
 const STAGING: u64 = LOADER_BASE + (4 << 20);
 /// Where it maps the parent's block to copy it.
 const BORROWED: u64 = LOADER_BASE + (6 << 20);
-/// Where it maps a piece of a segment to fill it from the file.
-const WINDOW: u64 = pl::LOADER_WINDOW;
-const WINDOW_LEN: u64 = 1 << 20;
 /// The exit code of a loader that gave up: the parent hears why through C
 /// first, or its wait reports 127 (posix_spawn's fallback, [MUSL-SPAWN]).
 const GAVE_UP: u64 = 127;
@@ -459,37 +456,52 @@ const fn access(part: Part) -> Access {
 }
 
 /// A segment of the program: a new object of its pages, which the new
-/// process pays for, filled from the file a window at a time and mapped
-/// at its address with its access.
+/// process pays for, filled by the file service READ_INTO_MAX bytes a
+/// request (READ_INTO) and mapped at its address with its access.
 fn segment(own: &Own, image: &Handle<Channel>, load: &Load, part: Part) -> Result<(), u32> {
     let pages = load.pages();
     let len = pages.end - pages.start;
     let m = sys::mem_create(len).map_err(code)?;
     let mut at = 0;
     while at < load.file_size {
-        let piece = (load.file_size - at).min(WINDOW_LEN);
-        let mapped = piece.next_multiple_of(PAGE);
-        sys::mem_map(
-            &own.process,
-            &m,
-            at,
-            mapped,
-            WINDOW as usize,
-            Access::ReadWrite,
-        )
-        .map_err(code)?;
-        // SAFETY: the window maps `mapped` bytes of the new object, which
-        // only the loader uses.
-        let out = unsafe { core::slice::from_raw_parts_mut(WINDOW as *mut u8, piece as usize) };
-        let read = read_at(image, load.offset + at, out);
-        // SAFETY: the mapping made above, which nothing uses now.
-        let _ = unsafe { sys::mem_unmap(&own.process, WINDOW as usize, mapped) };
-        if read? != piece as usize {
+        let piece = (load.file_size - at).min(proto_fs::READ_INTO_MAX as u64);
+        if read_into(image, &m, load.offset + at, piece, at)? != piece {
             return Err(pl::NOT_EXEC);
         }
         at += piece;
     }
     loader::map_narrowed(&own.process, &m, 0, len, pages.start as usize, access(part)).map_err(code)
+}
+
+/// READ_INTO of the image session: `count` bytes of the file from
+/// `offset` into `m` from `at`, a whole page, through a copy of `m` the
+/// service maps for the copy; the count read.
+fn read_into(
+    image: &Handle<Channel>,
+    m: &Handle<Memory>,
+    offset: u64,
+    count: u64,
+    at: u64,
+) -> Result<u64, u32> {
+    let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
+    let copy = sys::handle_duplicate(m, rights).map_err(code)?;
+    let mut w = Writer::new();
+    proto_fs::Method::ReadInto
+        .header()
+        .write(&mut w)
+        .and_then(|()| w.u32(0))
+        .and_then(|()| w.u64(offset))
+        .and_then(|()| w.u32(count as u32))
+        .and_then(|()| w.u64(at))
+        .map_err(|_| pl::IO)?;
+    let reply = sys::send_handles(image, w.as_bytes(), [copy.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    let mut r = Reader::new(reply.bytes(&mut buffer));
+    match (r.u32(), r.u32()) {
+        (Ok(0), Ok(n)) => Ok(n.into()),
+        _ => Err(pl::IO),
+    }
 }
 
 /// What Take brought: the credentials and the program's sessions.

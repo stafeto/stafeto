@@ -18,17 +18,11 @@ use rt::sys;
 rt::entry!(main);
 
 /// The sessions: the POSIX processes init starts and their children, each
-/// with a session of its own (Clone).
-#[cfg(not(feature = "steps"))]
-const SESSIONS: usize = 64;
-#[cfg(feature = "steps")]
+/// with a session of its own (Clone): the 255 records of the process
+/// service and the services beside them.
 const SESSIONS: usize = 320;
-/// The clones the service keeps alive at most, for all its clients: room
-/// for the 32 children of rtbench's S12 and the probes beside them, as the
-/// RAM file service's 128 (sp5.V5).
-#[cfg(not(feature = "steps"))]
-const CLONES: usize = 128;
-#[cfg(feature = "steps")]
+/// The clones the service keeps alive at most, for all its clients: one
+/// for each record of the process service and room beside them.
 const CLONES: usize = 320;
 /// The mark of the labels the service gives itself (Clone): bit 63, which
 /// no label of init has.

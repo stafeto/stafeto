@@ -19,9 +19,9 @@ pub const TABLE: &[Record] = &[
         }),
         priority: 40,
         ceiling: 40,
-        // Its segments, a stack of 48 KiB for its table of sessions, and
-        // the tables of the image's files.
-        quota: 64 * PAGE,
+        // Its segments, a stack of 48 KiB, its tables of 320 sessions and
+        // 256 births in `.bss`, and the tables of the image's files.
+        quota: 96 * PAGE,
         handle_limit: 32,
         restart: Restart::Always,
         console: true,
@@ -247,8 +247,7 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
 /// children it starts from files, each with the probe's quota, and one
 /// more for the child that execs among them.
 pub const POSIX_STEPS_TABLE: &[Record] = &[
-    // The RAM and clock services have tables of 320 sessions on stacks of
-    // 512 and 256 KiB (feature `steps`).
+    // Room for the crowd's descriptions in the RAM file service.
     Record {
         quota: 512 * PAGE,
         ..TABLE[0]

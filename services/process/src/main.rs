@@ -43,6 +43,7 @@ use rt::{
     sys,
 };
 mod adopt;
+mod ends;
 mod generations;
 mod loader;
 mod make;
@@ -234,8 +235,9 @@ fn main(_: u64) -> u64 {
     let Ok(channel) = sys::channel_create(1) else {
         return 3;
     };
-    // The channel of the identity sessions, which no loop receives on:
-    // a notification through a copy shows which record's it is (`vouch`).
+    // The channel of the identity sessions: object_info LABEL of a copy
+    // shows which record's it is (`vouch`), and the thread of ends.rs takes
+    // what comes into it.
     let Ok(identities) = sys::channel_create(1) else {
         return 3;
     };
@@ -243,7 +245,7 @@ fn main(_: u64) -> u64 {
         return 4;
     }
     let level = sys::thread_info(&start.thread).map_or(1, |i| i.base);
-    make::set_handles(&channel, &start.process, &start.parent, level, &identities);
+    make::set_handles(&channel, &start.process, &start.parent, level);
     // The session of the loaders with the RAM file service, when init's
     // table gives one (proto_fs LOADERS): every loader gets a copy.
     if owner.loader.is_some() {
@@ -251,6 +253,7 @@ fn main(_: u64) -> u64 {
     }
     if adopt::start(&start.process, level).is_err()
         || replace::start(&start.process, level).is_err()
+        || ends::start(&start.process, &identities, level).is_err()
     {
         return 6;
     }
@@ -308,14 +311,6 @@ fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
 }
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
-}
-/// Takes what waits in `channel` and drops it: how many entries it was.
-fn drain(channel: &Handle<Channel>) -> u64 {
-    let mut taken = 0;
-    while sys::try_receive(channel).is_ok() {
-        taken += 1;
-    }
-    taken
 }
 /// The status of a failed call of groups and sessions.
 const fn group_error(e: GroupError) -> u32 {
@@ -717,11 +712,12 @@ impl Processes {
     }
 
     /// The record whose identity session the one handle of `r` is a copy
-    /// of: the service empties the identity channel, notifies through the
-    /// handle and takes what came there. A copy of an identity session
-    /// lands in its record's place (its label, which the kernel set); a
-    /// channel of anyone else lands elsewhere, and none came. On one
-    /// processor nothing runs between, the loop being above every client.
+    /// of: the kernel gives the copy's label to the service, which receives
+    /// on the identity channel (object_info LABEL, O(1)); a channel of
+    /// anyone else, or one without a label, proves nothing. Nothing goes
+    /// through the copy and nothing is taken off the channel, so the step
+    /// is the same with any number of processes, and on any number of
+    /// processors.
     ///
     /// A copy of a loader's identity names its record only while the
     /// loader loads (loaders.rs `vouches`), with the image and the ticket
@@ -731,21 +727,7 @@ impl Processes {
             return None;
         }
         let handle = r.handles.take::<Channel>(0).ok()?;
-        let mut taken = drain(&self.identities);
-        sys::notify(&handle, 1).ok()?;
-        let got = sys::try_receive(&self.identities);
-        taken += u64::from(got.is_ok());
-        taken += drain(&self.identities);
-        rt::service::step_detail(taken);
-        let label = match got {
-            Ok(sys::Received::Notification {
-                source: Source::Session,
-                label,
-                bits,
-                ..
-            }) if bits & 1 != 0 => label,
-            _ => return None,
-        };
+        let label = sys::copy_label(&self.identities, &handle).ok()?;
         match Label::parse(label) {
             Some((_, Place::Loader)) => {
                 let index = self.records.find_loader(label)?;
@@ -1135,8 +1117,7 @@ impl Processes {
     /// process with the parent's quota, room for handles and ceiling, the
     /// loader's session in its entry 0, the loader mapped and its thread
     /// started at the caller's level; the reply waits for Boot. O(1) but
-    /// for the emptying of the identity channel (`drain`) and the copy of
-    /// the loader's data, a page.
+    /// for the copy of the loader's data, a page.
     fn spawn_start(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let Ok(start) = SpawnStart::read(r.body()) else {
             return Answer::Status(Status::BadSize);
@@ -1164,9 +1145,6 @@ impl Processes {
         if !self.records.may_spawn(index) || !self.loaders.room_for(index) {
             return refuse(proto_process::AGAIN);
         }
-        // The ends of identity sessions wait in their channel until they
-        // are received, and hold its places meanwhile (5b).
-        rt::service::step_detail(drain(&self.identities));
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::AGAIN);
         };
@@ -1308,7 +1286,6 @@ impl Processes {
         if !loaders::pool_allows(free_quota(), record.quota) {
             return kernel(abi::Error::NoMemory);
         }
-        rt::service::step_detail(drain(&self.identities));
         let (label, image, ceiling) = (record.label, record.tried + 1, record.ceiling);
         let (quota, handle_limit) = (record.quota, record.handle_limit);
         // The number goes to this attempt whatever comes of it (sp5.M1).

@@ -354,7 +354,7 @@ window that goes.
 | `arch::cache::sync_icache_frames` | `dc cvau` and `ic ivau` over the cache lines of whole frames through the linear map, with one set of barriers; on a VIPT instruction cache (A53), a flush of the whole instruction cache (`ic ialluis`) instead of `ic ivau` | frames / line size; a chunk of an executable mapping: 8 pages |  |
 | FP/SIMD switch in `thread::run` | saves the outgoing thread's registers and loads the incoming thread's (528 bytes each) | constant: 1056 bytes |  |
 | `debug_write` | puts up to 64 bytes into the kernel log as one record (a read of the counter, a copy of 64 bytes, two counters); while no device window covers the console's page, also writes them to the PL011 synchronously, waiting for room in the transmit queue, with a CR before every LF | with a window: constant; without one, up to 128 characters: on hardware at 115,200 baud and 10 bits per character, about 11 ms; instant in QEMU; after 1.4d only early boot, time with no driver and the test images print this way | 499 under -icount (normal build, `log ticks` of the test init): the whole call of 64 bytes behind a window |
-| `object_info` | reads process fields (state, quota count, three handle-table numbers), a thread's state, what it waits for, its priorities and policy under the scheduler's lock, a channel's counts of its queue under the scheduler's lock, its sources and whether it is closed, a memory object's or a device window's size, pages and mappings, a binding's line, mask and trigger, or kernel counters for `KERNEL_STATS`: the scheduler's and frame allocator's under their locks, the queue length and the longest chunk under the queue lock taken twice, and the atomic pool page counter; for `LOG`, a walk of the 64 records of the kernel log and a copy of up to 12 records, 960 bytes, into the caller's message buffer through the linear map | constant: for `KERNEL_STATS`, four lock acquisitions, one at a time; for `LOG`, 64 records and 960 bytes | 810 under -icount (normal build, `log ticks` of the test init): the whole call of `LOG` that takes a full batch |
+| `object_info` | reads process fields (state, quota count, three handle-table numbers), a thread's state, what it waits for, its priorities and policy under the scheduler's lock, a channel's counts of its queue under the scheduler's lock, its sources and whether it is closed, a memory object's or a device window's size, pages and mappings, a binding's line, mask and trigger, the label of a labelled copy of a channel for `LABEL` (two lookups and a compare), or kernel counters for `KERNEL_STATS`: the scheduler's and frame allocator's under their locks, the queue length and the longest chunk under the queue lock taken twice, and the atomic pool page counter; for `LOG`, a walk of the 64 records of the kernel log and a copy of up to 12 records, 960 bytes, into the caller's message buffer through the linear map | constant: for `KERNEL_STATS`, four lock acquisitions, one at a time; for `LOG`, 64 records and 960 bytes | 810 under -icount (normal build, `log ticks` of the test init): the whole call of `LOG` that takes a full batch |
 | the last reference to an object (`object::release`, `process::release`, `thread::release`, `memory::release`) | puts the object at the tail of the cleanup queue at the level of the cause: the effective priority of the thread whose call or fault released the reference, or the level of the object whose chunk released it; a live process is terminated in the process, as in the process termination row, without threads | constant: insertion at the tail of a level and a mask bit; no nested teardown |  |
 | pool growth (`kcore::slab::PaidPages`: the payer's pools of threads, blocks (the chunks and the directory of its handle table), child shells, channels, sessions, timers, memory objects, and interrupt bindings) | only when the pool has no free slot: charges a page against the payer's quota, takes an order-0 frame, and lays the page out into slots; when the entries of the payer's page log have run out, first takes a list page the same way | constant: up to two charges and two order-0 frames (each at most `MAX_ORDER` = 10 splits in `FRAMES`) and laying a page out into slots; freeing a slot is O(1) and does not call the allocator |  |
 | a chunk of the Threads stage (`process::clean`, `stop_threads`) | from the `threads_next` cursor on, each thread of the list leaves the scheduler for good (`sched::exit`) at level R: a thread that waits in `send`, `receive` or for a reply first leaves its queue and lets go what its wait held (2 units), any other thread 1 unit, 64 units a chunk; the kernel's reference goes, which may queue the thread; the process goes to the head of level S, and after the last thread moves on to the Stop or the Replies stage; a thread that leaves the list moves the cursor on | up to 64 units: 32 threads in IPC or 64 others, each O(1); a sender through the last copy of a session posts `CLIENT_GONE` as `notify` does | 12,189 (test build, `threads_ready`): 64 ready threads on a level each, 1-63 in turn, the kernel's reference the last of each (12,127 on one level); 10,747 (`teardown_threads`): 32 threads waiting in `send`, each through the last copy of a session of a channel of its own |
@@ -426,26 +426,36 @@ window that goes.
 The rows above bound what a pending interrupt waits for. A step of a
 service is user-space work at the service's level, and a request that waits
 for the service waits for the steps ahead of it. `cargo xtask
-process-steps` (4 branches in `ci`) measures them under -icount with 128
-children from files (the same ticks as B; `rt` feature `step-stats`, the
-service's features `steps` and the larger tables of the RAM file and clock
-services in that image only):
+process-steps` (4 branches in `ci`) measures them under -icount with a
+crowd of children from files (the same ticks as B; `rt` feature
+`step-stats` and the process service's feature `steps` in that image
+only; the RAM file and clock services are the shipping ones). The longest
+step of each kind, with 32, 128 and 248 children:
 
-| Step | Ticks | Entries taken off the identity channel |
-|---|---|---|
-| SpawnStart | 158,692 | 128 |
-| Vouch | 75,508 | 132 |
-| ExecStart | 48,142 | 1 |
-| Create | 59,602 | 0 |
-| a `STEP` notification (a step of the walk of `kill(-1)`, ends) | 14,137 | 0 |
-| Boot, WaitStart, Take, ExecCommit, SpawnCommit | 6,806, 6,857, 5,422, 4,189, 2,214 | 0 |
-| Kill (one step of its walk) | 1,201 | 0 |
+| Step | 32 | 128 | 248 |
+|---|---|---|---|
+| SpawnStart | 87,579 | 87,784 | 87,950 |
+| Create | 59,806 | 59,806 | 59,605 |
+| ExecStart | 46,721 | 47,001 | 47,402 |
+| a notification (an end, a step of the walk of `kill(-1)`) | 5,336 | 5,336 | 11,768 |
+| WaitStart, WaitTake | 6,432, 7,141 | 6,634, 7,122 | 7,518, 7,137 |
+| Boot, Take | 6,853, 4,917 | 7,241, 5,128 | 6,882, 5,439 |
+| ExecCommit, SpawnCommit | 4,200, 2,610 | 4,200, 2,222 | 4,360, 2,588 |
+| Vouch | 2,837 | 2,837 | 2,798 |
+| Kill (one step of its walk) | 1,204 | 1,204 | 1,188 |
 
-SpawnStart, ExecStart, Create and Vouch empty the channel of identity
-sessions with one `try_receive` for each entry, 539 ticks and 4,360
-fixed (36 entries 23,764; 132 entries 75,508; 252 entries 140,188). With
-the most identities the probe can build, 248 children and 252 entries, a
-Vouch takes 140,188 ticks and a SpawnStart 261,532; to the 510 receives
-the loop can face, a Vouch takes about 279,000 ticks, 13.6 times B. The
-other steps do not grow with the number of processes. Details are in
+No step grows with the number of processes. Vouch reads the label of the
+copy it was given from the kernel (`object_info` LABEL, the row of
+`object_info` above) and takes nothing off the identity channel; the ends
+of identity sessions and the notifications through them go to a thread of
+the service of their own, one `receive` each, at the loop's level, so no
+step of the loop empties that channel (until step 5c's fix wave, Vouch,
+SpawnStart, ExecStart and Create did, 539 ticks an entry: a Vouch with 252
+entries took 140,188 ticks, about 279,000 extrapolated to 510). The end of
+a process walks the children of its record, 32 at most: the notification
+row grows with them and stops there. SpawnStart, Create and ExecStart are
+fixed costs above B: they make a process in the kernel, a call at a time
+(its space, the record's page, the loader's code, data and stack and its
+thread), each call bounded on its own. `process-steps` fails when the
+longest Vouch passes 6,000 ticks. Details are in
 [notes/m5c-spawn-exec.md](../notes/m5c-spawn-exec.md).

@@ -35,7 +35,15 @@
 //! of the record the loader loads, tells the process service the set-ID
 //! bits of the file (SetId) and replies status and one handle, the image
 //! session (SEND): a session of its own (IMAGE_SESSION) that takes
-//! READ_AT and INFO_FD of fd 0 alone and reads that file. PERMISSION
+//! READ_AT, READ_INTO and INFO_FD of fd 0 alone and reads that file.
+//! READ_INTO, through an image session alone: header, fd u32 (0), offset
+//! u64, count u32 (at most READ_INTO_MAX), the place u64 in the object
+//! (a whole page), and one handle, a memory object with MAP_READ and
+//! MAP_WRITE that holds `count` bytes from the place: the service maps it,
+//! copies the file's bytes from the offset into it and unmaps it. Reply:
+//! status, count u32, short at the end of the file. A loader fills a
+//! segment of a program this way in a few requests, where READ_AT takes
+//! one for each MAX_READ bytes. PERMISSION
 //! through any other session or for any other identity; NO_ENTRY,
 //! ACCESS_DENIED, NOT_DIRECTORY.
 //! CLONE: header, a count u32 (at most 32) and as many descriptors u32 of
@@ -62,6 +70,9 @@ pub const VERSION: u16 = 2;
 pub const MAX_PATH: usize = 511;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
+/// The bytes of one READ_INTO at most: the copy one request of an image
+/// session makes in the service's step.
+pub const READ_INTO_MAX: usize = 64 * 1024;
 
 pub const READ_ONLY: u32 = 0;
 pub const WRITE_ONLY: u32 = 1;
@@ -161,6 +172,7 @@ pub enum Method {
     OpenExec = 14,
     Clone = 15,
     WriteAt = 16,
+    ReadInto = 17,
 }
 
 impl Method {
@@ -186,12 +198,13 @@ impl Method {
             14 => Some(Self::OpenExec),
             15 => Some(Self::Clone),
             16 => Some(Self::WriteAt),
+            17 => Some(Self::ReadInto),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {

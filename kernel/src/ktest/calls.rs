@@ -36,8 +36,8 @@ use crate::timer::{self as timers, Timer};
 use crate::{sched, syscall};
 use abi::{
     Access, CHANNEL_RIGHTS, CLIENT_GONE, Call, Error, Handle, INFO_IRQ, INFO_KERNEL_STATS,
-    INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, IrqInfo, KernelStats,
-    MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy,
+    INFO_LABEL, INFO_PROCESS_HANDLES, INFO_PROCESS_MEMORY, INIT_RESOURCE_RIGHTS, IrqInfo,
+    KernelStats, MAX_SLOTS, MEMORY_RIGHTS, MemoryInfo, NO_WAIT, Notification, OWNER_RIGHTS, Policy,
     ProcessHandles, ProcessMemory, ProcessState, Rights, START_CHANNEL, Source, TRIGGER_EDGE,
     WINDOW_RIGHTS,
 };
@@ -256,6 +256,54 @@ fn counted_cases(c: &Caller, handles: [Handle; 2]) -> Result<(), &'static str> {
         "the measured build did not record object_info",
     )?;
     Ok(())
+}
+
+/// object_info LABEL (spec 5.3, 11): a labelled copy's label goes to a
+/// caller that holds the same channel with RECEIVE, through its handle or
+/// through a labelled copy with RECEIVE, and to nobody else: a receiver
+/// handle without RECEIVE and a handle of another channel are
+/// ACCESS_DENIED, a channel handle without a label in x0 is WRONG_TYPE, a
+/// bad x2 is BAD_HANDLE. Nothing goes into the channel's queue.
+pub fn object_info_label_answers_the_channels_owner(_: &Boot) -> Result<(), &'static str> {
+    let (sessions, channels) = (session::in_use(), channel::in_use());
+    with_caller(|c| {
+        let own = c.created(Call::CreateChannel.number(), &[10])?;
+        let other = c.created(Call::CreateChannel.number(), &[10])?;
+        let result = label_cases(c, own, other);
+        c.close(own)?;
+        c.close(other)?;
+        result
+    })?;
+    cleanup::drain();
+    check(
+        session::in_use() == sessions && channel::in_use() == channels,
+        "a session or a channel of the test stayed in its pool",
+    )
+}
+
+fn label_cases(c: &Caller, own: Handle, other: Handle) -> Result<(), &'static str> {
+    let (n, d) = (Call::ObjectInfo.number(), Call::HandleDuplicate.number());
+    let notify = u64::from((Rights::NOTIFY | Rights::DUPLICATE).0);
+    let copy = c.created(d, &[own.0, notify, 0x1D_0007, 10])?;
+    let sender = c.created(d, &[own.0, u64::from(Rights::NOTIFY.0), 0, 0])?;
+    let receiver = c.created(d, &[own.0, u64::from(Rights::RECEIVE.0), 9, 10])?;
+    let result = (|| {
+        c.succeeds(n, &[copy.0, INFO_LABEL, own.0], &[0x1D_0007])?;
+        c.succeeds(n, &[copy.0, INFO_LABEL, receiver.0], &[0x1D_0007])?;
+        c.fails(n, &[copy.0, INFO_LABEL, sender.0], Error::AccessDenied)?;
+        c.fails(n, &[copy.0, INFO_LABEL, other.0], Error::AccessDenied)?;
+        c.fails(n, &[own.0, INFO_LABEL, own.0], Error::WrongType)?;
+        c.fails(n, &[copy.0, INFO_LABEL, 0xBAD], Error::BadHandle)?;
+        let ch = channel_of(c, own)?;
+        check(
+            channel::info(ch).queued == 0,
+            "a label read put something into the channel's queue",
+        )
+    })();
+    for h in [copy, sender, receiver] {
+        c.close(h)?;
+    }
+    result
 }
 
 /// A handle holds its object: the last close queues a thread and a

@@ -40,16 +40,16 @@
 //! first thread; reply its status.
 //!
 //! The identity session of a record (label bit 62, `Label::identity`) is
-//! a copy of a channel of the service that no loop receives on, with
-//! NOTIFY, TRANSFER and DUPLICATE: the service gives it with Create, init
+//! a copy of a channel of the service that no loop serves, with NOTIFY,
+//! TRANSFER and DUPLICATE: the service gives it with Create, init
 //! puts it in the process's start data under `posix-id`, and the process
 //! gives a copy to a service it asks something of, such as the clock. It
 //! carries no request: it proves who brought it. Through a notary session
 //! (a label with NOTARY and no bit 63, which only init gives, on CONNECT,
 //! to the services of its table's VOUCHERS): Vouch, no body and one
-//! handle, a copy a client gave; the service notifies through it and looks
-//! which identity place of its channel the notification reached, so a
-//! channel of anyone else proves nothing (PERMISSION); the reply
+//! handle, a copy a client gave; the kernel tells the service the copy's
+//! label (object_info LABEL, which answers the owner of the channel alone,
+//! O(1)), so a channel of anyone else proves nothing (PERMISSION); the reply
 //! (`WhoReply`) is that record's PID, its six credentials and the
 //! generation of its credentials. Register, no body; the reply is a copy
 //! of the page of the credentials generations with MAP_READ and TRANSFER

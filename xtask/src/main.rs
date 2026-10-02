@@ -378,19 +378,14 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
 /// that prints each new longest step.
 const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
-    ("ramfs", "ramfs", 512 * 1024, &["steps"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
         &["steps"],
     ),
-    (
-        "posix-clock-service",
-        "posix-clock-service",
-        256 * 1024,
-        &["steps"],
-    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
 ];
@@ -2025,6 +2020,11 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
 
 /// The kinds of the lines `service step: kind K N ticks detail D` of the
 /// process service, by the numbers of proto_process::Method.
+/// The longest Vouch the measurement takes, in ticks under -icount: about
+/// 3,000 with 32 or with 248 children, so a step that grows with the
+/// processes fails it at once (5b's Vouch took 539 ticks an entry).
+const VOUCH_TICKS_MAX: u64 = 6_000;
+
 const STEP_KINDS: [(usize, &str); 12] = [
     (1, "Create"),
     (13, "Kill"),
@@ -2077,8 +2077,8 @@ fn longest_steps(lines: &[String]) -> Vec<(usize, u64, u64)> {
 /// exec, the ends of all, and a Vouch with the identity channel full.
 /// The crowd is `branches` branches of 32 children each (up to 7; with 7,
 /// 24 children of the probe's own beside them).
-/// Prints a row for each kind of step and the Vouch with the entries it
-/// took off the channel, and the numbers go to `target/measure`.
+/// Prints a row for each kind of step, checks that the longest Vouch stays
+/// under VOUCH_TICKS_MAX, and the numbers go to `target/measure`.
 fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
@@ -2107,13 +2107,15 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if rows.is_empty() {
         return Err("the process service printed no step".into());
     }
-    // The volleys armed the crowd: the Vouch that follows takes about one
-    // entry for each child.
+    // The volleys armed the crowd, and the clock asked Vouch with every
+    // identity session in the channel: Vouch reads the label of the copy
+    // from the kernel (object_info LABEL) and stays as short as with no
+    // crowd at all.
     let live = qemu::number_after(&outcome.lines, "posix-procs: steps ").unwrap_or(0);
-    let vouch = rows.iter().find(|(k, ..)| *k == 21).map_or(0, |r| r.2);
-    if vouch < live / 2 {
+    let vouch = rows.iter().find(|(k, ..)| *k == 21).map_or(0, |r| r.1);
+    if vouch == 0 || vouch > VOUCH_TICKS_MAX {
         return Err(format!(
-            "the longest Vouch took {vouch} entries off the channel of {live} children"
+            "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
         ));
     }
     let mut text = String::from("kind method ticks detail\n");

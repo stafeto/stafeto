@@ -56,12 +56,11 @@ one live child.
 ## Known limits
 
 - **Vouch is bounded, and measured in 5c.** Vouch (a service asking who a
-  client is) empties the identity channel before it notifies through the
-  copy it was given and reads the answer: at most 255 ends not yet
-  received and 255 notifications of live processes, each one
-  `try_receive`. Step 5c measured it under `-icount`: 539 ticks an entry,
-  140,188 ticks with 252 entries, about 279,000 extrapolated to 510 (see
-  [m5c-spawn-exec](m5c-spawn-exec.md)).
+  client is) emptied the identity channel before it notified through the
+  copy it was given: 539 ticks an entry under `-icount`, 140,188 ticks with
+  252 entries. Since the fix wave after step 5c's T6 it reads the copy's
+  label from the kernel (`object_info` LABEL) in O(1), about 2,800 ticks
+  with any number of processes (see [m5c-spawn-exec](m5c-spawn-exec.md)).
 - **Limits of the moment.** A second walk of one sender waits in a queue
   of 64 places; past them, and past 1,024 long waits, `EAGAIN`.
 
