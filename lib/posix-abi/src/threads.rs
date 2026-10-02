@@ -481,6 +481,22 @@ fn attach_resources(own: u64) -> Result<(), i32> {
     crate::signals::attach()
 }
 
+/// Attaches the main thread to the TCB relibc built and installed (5a′):
+/// as `attach`, the block in relibc's TCB. EINVAL when `TPIDR_EL0` does
+/// not name `tcb`.
+///
+/// # Safety
+/// `tcb` is the calling thread's for its life; the calling thread is the
+/// main thread, after `init`.
+pub unsafe fn attach_installed(tcb: *mut posix_thread::Tcb, id: u64) -> Result<(), i32> {
+    if tcb.is_null() || posix_thread::tcb() != tcb {
+        return Err(EINVAL);
+    }
+    // SAFETY: the caller's promise; the register names the TCB.
+    unsafe { tls::attach_installed(tcb, id) };
+    attach_resources(MAIN_SELF.load(Ordering::Acquire))
+}
+
 /// Closes the handle `raw`, unless it is 0.
 fn close_raw(raw: u64) {
     if raw != 0 {
@@ -518,11 +534,11 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     Ok(())
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_self() -> u64 {
     tls::thread_id()
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_equal(first: u64, second: u64) -> i32 {
     i32::from(first == second)
 }
@@ -530,7 +546,7 @@ pub extern "C" fn pthread_equal(first: u64, second: u64) -> i32 {
 /// # Safety
 /// out is writable, attr is null or initialized, and callback/argument remain
 /// valid for the child. The calling thread is managed by this process runtime.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_create(
     out: *mut u64,
     attr: *const Attributes,
@@ -727,7 +743,7 @@ unsafe fn make(
 
 /// # Safety
 /// The caller is managed; out is null or writable for one returned pointer.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32 {
     let point = cancel::Point::begin();
     let me = tls::thread_id();
@@ -828,7 +844,7 @@ pub unsafe extern "C" fn pthread_join(thread: u64, out: *mut *mut c_void) -> i32
 /// when it is enabled, bit CANCEL in its channel for a wait there, an entry
 /// for a wait with a service (entries pending under deferral make the wait
 /// return), and an interrupt of an IPC wait it is in now.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_cancel(thread: u64) -> i32 {
     registry(|r| {
         let slot = r.find(thread)?;
@@ -875,7 +891,7 @@ fn wake_for_cancel(slot: usize) {
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_detach(thread: u64) -> i32 {
     registry(|r| {
         let slot = r.find(thread)?;
@@ -898,7 +914,7 @@ pub extern "C" fn pthread_detach(thread: u64) -> i32 {
 /// # Safety
 /// The current thread is managed and attached. Registered cleanup nodes,
 /// destructors and their arguments remain live.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_exit(value: *mut c_void) -> ! {
     unsafe { cancel::exit_cleanup() };
     unsafe { specific::exit_destructors() };
@@ -934,7 +950,7 @@ fn others_ended() -> bool {
 
 /// # Safety
 /// attr points to writable storage for a new attribute object.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_init(attr: *mut Attributes) -> i32 {
     if attr.is_null() {
         return EINVAL;
@@ -944,7 +960,7 @@ pub unsafe extern "C" fn pthread_attr_init(attr: *mut Attributes) -> i32 {
 }
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_destroy(attr: *mut Attributes) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -955,7 +971,7 @@ pub unsafe extern "C" fn pthread_attr_destroy(attr: *mut Attributes) -> i32 {
 
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_setstacksize(attr: *mut Attributes, size: usize) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -970,7 +986,7 @@ pub unsafe extern "C" fn pthread_attr_setstacksize(attr: *mut Attributes, size: 
 }
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_setguardsize(attr: *mut Attributes, size: usize) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -985,7 +1001,7 @@ pub unsafe extern "C" fn pthread_attr_setguardsize(attr: *mut Attributes, size: 
 }
 /// # Safety
 /// attr is initialized writable attribute storage with no concurrent access.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_setdetachstate(attr: *mut Attributes, state: i32) -> i32 {
     if attr.is_null() || !unsafe { (*attr).valid() } {
         return EINVAL;
@@ -1000,7 +1016,7 @@ pub unsafe extern "C" fn pthread_attr_setdetachstate(attr: *mut Attributes, stat
 }
 /// # Safety
 /// attr is initialized readable storage, and out is writable.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_getstacksize(
     attr: *const Attributes,
     out: *mut usize,
@@ -1013,7 +1029,7 @@ pub unsafe extern "C" fn pthread_attr_getstacksize(
 }
 /// # Safety
 /// attr is initialized readable storage, and out is writable.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_getguardsize(
     attr: *const Attributes,
     out: *mut usize,
@@ -1026,7 +1042,7 @@ pub unsafe extern "C" fn pthread_attr_getguardsize(
 }
 /// # Safety
 /// attr is initialized readable storage, and out is writable.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_attr_getdetachstate(
     attr: *const Attributes,
     out: *mut i32,

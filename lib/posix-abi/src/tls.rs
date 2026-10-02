@@ -73,6 +73,20 @@ pub unsafe fn attach_built(page: *mut u8, id: u64) {
     }
 }
 
+/// Makes the calling thread pthread `id` with the process's files in the
+/// block of `tcb`, the TCB the register already names (relibc's).
+///
+/// # Safety
+/// `tcb` is the calling thread's installed TCB for its life.
+pub unsafe fn attach_installed(tcb: *mut Tcb, id: u64) {
+    let _guard = rt::upcall::defer_entries().expect("TCB install deferral");
+    // SAFETY: the caller's promise.
+    unsafe {
+        (*tcb).block.process_files = 1;
+        (*tcb).block.thread_id = id;
+    }
+}
+
 /// The fields of a block a scope changes.
 #[derive(Clone, Copy)]
 struct Fields {

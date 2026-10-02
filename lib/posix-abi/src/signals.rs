@@ -94,7 +94,7 @@ fn ignored(signal: i32, action: &SigAction) -> bool {
 
 /// # Safety
 /// set is writable for one signal set. No managed thread is required.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigemptyset(set: *mut SigSet) -> i32 {
     if set.is_null() {
         return fail(EFAULT);
@@ -104,7 +104,7 @@ pub unsafe extern "C" fn sigemptyset(set: *mut SigSet) -> i32 {
 }
 /// # Safety
 /// set is writable for one signal set.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigfillset(set: *mut SigSet) -> i32 {
     if set.is_null() {
         return fail(EFAULT);
@@ -125,19 +125,19 @@ unsafe fn alter(set: *mut SigSet, signal: i32, add: bool) -> i32 {
 }
 /// # Safety
 /// set is initialized and writable for one signal set.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigaddset(set: *mut SigSet, signal: i32) -> i32 {
     unsafe { alter(set, signal, true) }
 }
 /// # Safety
 /// set is initialized and writable for one signal set.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigdelset(set: *mut SigSet, signal: i32) -> i32 {
     unsafe { alter(set, signal, false) }
 }
 /// # Safety
 /// set is initialized and readable for one signal set.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigismember(set: *const SigSet, signal: i32) -> i32 {
     if set.is_null() {
         return fail(EFAULT);
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn sigismember(set: *const SigSet, signal: i32) -> i32 {
 /// act is null or readable; old is null or writable. Their storage does not
 /// overlap. A catching handler uses the one-argument or SA_SIGINFO signature,
 /// remains live, and obeys async-signal safety.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut SigAction) -> i32 {
     let result = actions(|table| {
         if act.is_null() {
@@ -184,7 +184,7 @@ pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut
 /// # Safety
 /// A non-special handler is a live void(int) C function, safe during asynchronous
 /// entry. Stable BSD semantics are used: no reset, signal deferred during handler.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn signal(signal: i32, handler: u64) -> u64 {
     let action = SigAction {
         handler,
@@ -205,7 +205,7 @@ fn own() -> &'static Block {
 /// # Safety
 /// set is null or readable, old is null or writable; storage does not overlap.
 /// No call of the kernel: the mask is a word of the thread's block.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32 {
     let block = own();
     let before = block.mask.load(Ordering::SeqCst);
@@ -231,14 +231,14 @@ pub unsafe extern "C" fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut
 }
 /// # Safety
 /// Same pointers as pthread_sigmask; this implementation also supports threads.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigprocmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32 {
     let code = unsafe { pthread_sigmask(how, set, old) };
     if code == 0 { 0 } else { fail(code) }
 }
 /// # Safety
 /// set is writable for one signal set, in a managed thread.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigpending(set: *mut SigSet) -> i32 {
     if set.is_null() {
         return fail(EFAULT);
@@ -251,7 +251,7 @@ pub unsafe extern "C" fn sigpending(set: *mut SigSet) -> i32 {
 /// Sends `signal` to pthread `thread`: the bit in its block, then a wake of
 /// its sigwait through its channel or a request of its entry; to the
 /// calling thread itself, delivery before the return.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
     let bit = if signal == 0 {
         0
@@ -310,7 +310,7 @@ pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
         Err(code) => code,
     }
 }
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn raise(signal: i32) -> i32 {
     let status = pthread_kill(threads::pthread_self(), signal);
     if status == 0 { 0 } else { fail(status) }
@@ -411,7 +411,7 @@ fn wait(set: SigSet, timeout: Option<posix_types::Timespec>, start: u64) -> Resu
 /// # Safety
 /// The caller is managed. set is readable and sig is writable; their storage
 /// does not overlap. All selected signals are blocked before this call.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
     let point = threads::cancel::Point::begin();
     let result = if set.is_null() || sig.is_null() {
@@ -431,7 +431,7 @@ pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
 /// SigInfo, and their storage does not overlap. All selected signals are blocked.
 /// Caught signals resume this wait; EINTR is not returned. Current
 /// pthread_kill/raise causes are reported as SI_THREAD.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> i32 {
     unsafe { sigtimedwait(set, info, core::ptr::null()) }
 }
@@ -441,7 +441,7 @@ pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> 
 /// SigInfo, timeout is null or readable for one Timespec. Storage does not
 /// overlap. Selected signals are blocked. NULL timeout means indefinite wait;
 /// unrelated caught signals resume the original monotonic interval without EINTR.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigtimedwait(
     set: *const SigSet,
     info: *mut SigInfo,

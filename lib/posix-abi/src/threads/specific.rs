@@ -73,7 +73,7 @@ fn own_values() -> Result<&'static Values, i32> {
 /// # Safety
 /// key points to writable storage. The optional destructor remains callable
 /// while registered and while any already selected invocation is in flight.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_key_create(key: *mut u64, destructor: Option<Destructor>) -> i32 {
     if key.is_null() {
         return EINVAL;
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn pthread_key_create(key: *mut u64, destructor: Option<De
     }
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_key_delete(key: u64) -> i32 {
     keys(|r| {
         let slot = r.slot(key)?;
@@ -112,7 +112,7 @@ pub extern "C" fn pthread_key_delete(key: u64) -> i32 {
     .map_or_else(|error| error, |()| 0)
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_getspecific(key: u64) -> *mut c_void {
     let Ok(values) = own_values() else {
         return core::ptr::null_mut();
@@ -120,7 +120,7 @@ pub extern "C" fn pthread_getspecific(key: u64) -> *mut c_void {
     keys(|r| r.slot(key)).map_or(0, |slot| values.0[slot].load(Ordering::Acquire)) as *mut c_void
 }
 
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn pthread_setspecific(key: u64, value: *const c_void) -> i32 {
     let values = match own_values() {
         Ok(values) => values,

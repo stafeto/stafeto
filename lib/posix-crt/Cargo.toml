@@ -16,10 +16,14 @@ bench = false
 # `uart` (rt::fs::Files::connect_with_uart), besides the RAM files.
 [features]
 uart-input = []
+# The program is C on relibc (5a′): relibc starts it and gives the C
+# names; the layer serves relibc's stafeto platform (posix-platform).
+relibc = ["dep:posix-platform", "posix-abi/libc-backend"]
 
 [dependencies]
 proto-init = { path = "../../proto/init" }
 posix-abi = { path = "../posix-abi" }
 posix-fs = { path = "../posix-fs" }
+posix-platform = { path = "../posix-platform", optional = true }
 posix-thread = { path = "../posix-thread" }
 rt = { path = "../rt" }

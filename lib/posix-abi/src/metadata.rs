@@ -30,7 +30,7 @@ unsafe fn store(result: Result<NodeInfo, c_int>, out: *mut Stat) -> c_int {
 /// # Safety
 /// name is a live C string, out is writable/aligned for Stat, and this thread
 /// has an initialized ABI scope. On error the destination is left untouched.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn stat(name: *const c_char, out: *mut Stat) -> c_int {
     if out.is_null() {
         return fail(EFAULT) as c_int;
@@ -43,14 +43,14 @@ pub unsafe extern "C" fn stat(name: *const c_char, out: *mut Stat) -> c_int {
 /// # Safety
 /// Same contract as stat. The current RAM namespace contains no symbolic links;
 /// final-component no-follow resolution must be extended when links are added.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn lstat(name: *const c_char, out: *mut Stat) -> c_int {
     unsafe { stat(name, out) }
 }
 
 /// # Safety
 /// out is writable/aligned for Stat; this thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
+#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn fstat(number: c_int, out: *mut Stat) -> c_int {
     if out.is_null() {
         return fail(EFAULT) as c_int;

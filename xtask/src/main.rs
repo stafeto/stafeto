@@ -307,6 +307,19 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
+/// The first C program on relibc (5a′) and the services it needs.
+const RELIBC_PROGRAMS: [ImageProgram; 5] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-relibc"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("relibc-hello", "relibc-hello", POSIX_STACK_SIZE, &[]),
+];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -748,6 +761,9 @@ commands:
   console-early-exit-vz end the Virtio console's driver before it decodes its BARs;
             init stops the function and restarts it
   posix-shared verify cross-thread Rust POSIX file and directory state
+  relibc    build relibc for stafeto from the fork at its pinned commit
+            (tools/build-relibc.py) into target/relibc/sysroot
+  relibc-hello run the first C program on relibc over the Rust POSIX layer
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -790,6 +806,8 @@ fn main() {
         },
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
+        Some("relibc") => relibc(),
+        Some("relibc-hello") => relibc_hello_probe(),
         Some("cprobe") => cprobe(),
         Some("posix-cancel-input") => posix_cancel_input_probe(false),
         Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
@@ -1537,6 +1555,34 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// relibc for stafeto in target/relibc/sysroot; nothing when its stamp
+/// matches.
+fn relibc() -> Result<(), String> {
+    run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))
+}
+
+fn relibc_hello_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-relibc.img", &RELIBC_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    const ENDED: &str = "init: relibc-hello ended: exit code 0, not restarted";
+    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
+    qemu::expect_stopped_on(&output, ENDED)?;
+    for marker in [
+        "relibc-hello: printf argc=1 argv0=relibc-hello pi=3.142",
+        "relibc-hello: malloc heap x",
+        "relibc-hello: fread ",
+        "relibc-hello: monotonic ",
+        "relibc-hello: ok",
+    ] {
+        qemu::expect_marker(&output, marker)?;
+    }
+    println!("relibc C-program guest probe passed");
+    Ok(())
+}
+
 fn cprobe() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/build-picolibc.py")))?;
     let kernel = build(Variant::Normal)?;
@@ -1739,6 +1785,7 @@ fn test() -> Result<(), String> {
     ext4ro_probe()?;
     ramfs_probe()?;
     posix_abi_probe()?;
+    relibc_hello_probe()?;
     rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
@@ -3201,6 +3248,8 @@ fn no_transport_probe() -> Result<(), String> {
 }
 
 fn ci() -> Result<(), String> {
+    // First: the licence check and the C programs take relibc's build.
+    relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/check-posix-licenses.py")))?;
     no_transport_probe()?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
@@ -3397,6 +3446,20 @@ fn ci() -> Result<(), String> {
         "posix-shared-probe",
         "--features",
         "interrupt-probe",
+        "--target",
+        PROGRAM_TARGET,
+        "--",
+        "-D",
+        "warnings",
+    ]))?;
+    // The layer under relibc (posix-abi without its C names), apart: the
+    // feature would take the C names from the programs above.
+    run_cmd(cargo().args([
+        "clippy",
+        "--package",
+        "posix-platform",
+        "--package",
+        "relibc-hello",
         "--target",
         PROGRAM_TARGET,
         "--",

@@ -34,6 +34,7 @@ dma-watch = []
 table-ramfs = []
 table-cprobe = []
 table-posix-abi = []
+table-relibc = []
 table-busybox = []
 table-busybox-dialog = []
 

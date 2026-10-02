@@ -695,6 +695,7 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
     + cfg!(feature = "table-posix-abi") as usize
+    + cfg!(feature = "table-relibc") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
@@ -718,6 +719,7 @@ const _: () = assert!(
     feature = "table-busybox",
     feature = "table-busybox-dialog",
     feature = "table-posix-abi",
+    feature = "table-relibc",
     feature = "table-posix-abi-vz",
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
@@ -729,6 +731,8 @@ pub const TABLE: &[Record] = normal::TABLE;
 pub const TABLE: &[Record] = ramfs::TABLE;
 #[cfg(feature = "table-posix-abi")]
 pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
+#[cfg(feature = "table-relibc")]
+pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
 #[cfg(feature = "table-cprobe")]
 pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
 #[cfg(feature = "table-busybox")]
@@ -1405,6 +1409,10 @@ mod tests {
             ["uart", "ramfs", "busybox-probe"]
         );
         assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
+        assert_eq!(
+            order_of(ramfs::RELIBC_TABLE),
+            ["ramfs", "posix", "clock", "relibc-hello"]
+        );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
             assert_eq!(
                 order_of(table),
@@ -1445,6 +1453,7 @@ mod tests {
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
+            ramfs::RELIBC_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
@@ -1457,6 +1466,7 @@ mod tests {
                     "cprobe",
                     "busybox-probe",
                     "posix-abi-probe",
+                    "relibc-hello",
                     "rtbench-posix",
                 ]
                 .contains(&r.program)

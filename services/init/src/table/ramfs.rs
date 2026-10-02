@@ -148,6 +148,22 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     },
 ];
 
+/// The first C program on relibc (5a′): the RAM files, the process and
+/// clock services, and the program.
+pub const RELIBC_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "relibc-hello",
+        program: "relibc-hello",
+        args: b"relibc-hello\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 512 * PAGE,
+        ..POSIX
+    },
+];
+
 /// The service of long operations of rtbench 2 (tests/svc, role `l`)
 /// under the name of the console's driver: standard input of the
 /// benchmark reads from it. Above the benchmark's ceiling, as a service.
