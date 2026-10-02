@@ -3,8 +3,12 @@
 
 //! Build, run and test stafeto. Usage: `cargo xtask <command>`.
 
+#[macro_use]
+mod out;
+
 mod disasm;
 mod image;
+mod jobs;
 mod measure;
 mod ostest;
 mod qemu;
@@ -812,18 +816,20 @@ commands:
   build     build the kernel image and the boot image
   run       build and boot in QEMU to the shell (Ctrl-A X quits); with
             --hvf under HVF on a Mac with Apple silicon
-  test      host tests, then boot checks, the console dialog, init tests
-            and kernel tests in QEMU
+  test [--jobs N] host tests, then boot checks, the console dialog, init
+            tests and kernel tests in QEMU; N boots at a time (half the
+            cores by default; 1 runs them one after the other)
   kernel-test [machine [icount]] run only the kernel test image in QEMU (512M by default), under -icount with `icount`
   init-test [machine] run only the EL0 init test image in QEMU (512M by default)
   gdb       boot in QEMU halted at the first instruction, debugger on :1234
-  ci        formatting, clippy, then everything `test` does
+  ci [--jobs N] formatting, clippy, then everything `test` does
   hvf       boot checks, the console dialog, init tests and kernel tests
             under HVF on a Mac with Apple silicon, on Apple's GICv3 and
             QEMU's GICv2; skips elsewhere
   vz        boot the shell through Apple Virtualization.framework
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
-            with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ;
+            with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ,
+            at the same time or, with --serial, one after the other;
             with --short, one round of them on TCG, as ci runs it
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
@@ -855,7 +861,8 @@ commands:
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
-  os-test   run os-test's io and malloc suites on relibc, one test a boot;
+  os-test [--jobs N] run os-test's io and malloc suites on relibc, one test
+            a boot, N boots at a time;
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass
   help      this text";
@@ -865,7 +872,7 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("build") => build(Variant::Normal).map(|_| ()),
         Some("run") => run(&args[1..]),
-        Some("test") => test(),
+        Some("test") => jobs::parse_jobs("test", &args[1..]).and_then(test),
         Some("kernel-test") => {
             let variant = if args.get(2).is_some_and(|a| a == "icount") {
                 Variant::TestIcount
@@ -879,23 +886,35 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("gdb") => gdb(),
-        Some("ci") => ci(),
+        Some("ci") => jobs::parse_jobs("ci", &args[1..]).and_then(ci),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
         Some("rtbench") => match &args[1..] {
-            [flag, minutes] if flag == "--minutes" => minutes
+            [flag, minutes, placing @ ..] if flag == "--minutes" => minutes
                 .parse::<u64>()
                 .ok()
                 .filter(|&minutes| (1..=600).contains(&minutes))
                 .ok_or_else(|| "rtbench --minutes expects 1..=600".to_owned())
-                .and_then(rtbench2::run),
+                .and_then(|minutes| {
+                    let placing = match placing {
+                        [] => rtbench2::Placing::Concurrent,
+                        [flag] if flag == "--serial" => rtbench2::Placing::Serial,
+                        [flag] if flag == "--concurrent" => rtbench2::Placing::Concurrent,
+                        _ => {
+                            return Err(
+                                "usage: rtbench --minutes N [--serial|--concurrent]".to_owned()
+                            );
+                        }
+                    };
+                    rtbench2::run(minutes, placing)
+                }),
             [flag] if flag == "--short" => relibc().and_then(|()| rtbench2::short()),
             rest => rtbench::run(rest),
         },
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
-        Some("os-test") => ostest::run_in_budget(),
+        Some("os-test") => jobs::parse_jobs("os-test", &args[1..]).and_then(ostest::run_in_budget),
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(),
@@ -984,7 +1003,15 @@ fn cargo() -> Command {
 }
 
 fn run_cmd(cmd: &mut Command) -> Result<(), String> {
-    let status = cmd.status().map_err(|e| format!("{cmd:?}: {e}"))?;
+    // A job that keeps its output (out.rs) keeps the command's too.
+    let status = if out::capturing() {
+        let output = cmd.output().map_err(|e| format!("{cmd:?}: {e}"))?;
+        out::write(&String::from_utf8_lossy(&output.stdout), false);
+        out::write(&String::from_utf8_lossy(&output.stderr), true);
+        output.status
+    } else {
+        cmd.status().map_err(|e| format!("{cmd:?}: {e}"))?
+    };
     if status.success() {
         Ok(())
     } else {
@@ -1042,6 +1069,11 @@ struct Artifacts {
     boot_image: PathBuf,
 }
 
+/// Held while cargo builds programs or a kernel and the result is copied
+/// from the path every build of a package shares: another build in
+/// between would leave its own file there.
+static BUILD_LOCK: Mutex<()> = Mutex::new(());
+
 /// The kernel builds of this run of xtask, one per variant.
 static BUILDS: Mutex<Vec<(Variant, Artifacts)>> = Mutex::new(Vec::new());
 /// A boot image name with the programs it names: the name stands for its
@@ -1070,15 +1102,18 @@ fn build_kernel(variant: Variant) -> Result<Artifacts, String> {
     if let Some(feature) = variant.feature() {
         cmd.args(["--features", feature]);
     }
-    run_cmd(&mut cmd)?;
     let target = target_dir();
     // Every variant writes the same cargo output path; a copy next to each image
     // keeps the symbols that match it.
     let elf = target.join(format!("{}.elf", variant.stem()));
     let image = target.join(format!("{}.img", variant.stem()));
-    let built = cargo_output(&target, KERNEL_TARGET, Profile::Release, "kernel");
-    std::fs::copy(&built, &elf)
-        .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
+    {
+        let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        run_cmd(&mut cmd)?;
+        let built = cargo_output(&target, KERNEL_TARGET, Profile::Release, "kernel");
+        std::fs::copy(&built, &elf)
+            .map_err(|e| format!("{} -> {}: {e}", built.display(), elf.display()))?;
+    }
     disasm::erratum_835769(&elf, &llvm_tool("llvm-objdump")?)?;
     run_cmd(
         Command::new(llvm_tool("llvm-objcopy")?)
@@ -1153,18 +1188,21 @@ fn write_boot_image_with(
             cmd.args(["--features", &format!("{package}/{feature}")]);
         }
     }
-    run_cmd(&mut cmd)?;
     let target = target_dir();
     let mut sources = Vec::new();
-    for &(file, package, stack, _) in programs {
-        let built = cargo_output(&target, PROGRAM_TARGET, profile, package);
-        let elf = image_elf(&target, name, package);
-        let why = |e: String| format!("{}: {e}", elf.display());
-        if let Some(dir) = elf.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| why(e.to_string()))?;
+    {
+        let _building = BUILD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        run_cmd(&mut cmd)?;
+        for &(file, package, stack, _) in programs {
+            let built = cargo_output(&target, PROGRAM_TARGET, profile, package);
+            let elf = image_elf(&target, name, package);
+            let why = |e: String| format!("{}: {e}", elf.display());
+            if let Some(dir) = elf.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| why(e.to_string()))?;
+            }
+            std::fs::copy(&built, &elf).map_err(|e| format!("{}: {e}", built.display()))?;
+            sources.push((file, elf, stack));
         }
-        std::fs::copy(&built, &elf).map_err(|e| format!("{}: {e}", built.display()))?;
-        sources.push((file, elf, stack));
     }
     write_elf_image(name, &sources)
 }
@@ -1413,6 +1451,20 @@ fn ramfs_probe() -> Result<(), String> {
 }
 
 fn posix_abi_probe() -> Result<(), String> {
+    posix_abi_boots()?;
+    posix_orphans()?;
+    posix_thread_probe(false)?;
+    posix_cancel_input_probe(false)?;
+    posix_shared_probe()?;
+    posix_input_probe(false)?;
+    posix_interrupt_probe(false)?;
+    println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
+    Ok(())
+}
+
+/// The first two boots of `posix-abi`: the C main on the layer, and the
+/// thread-local errno.
+fn posix_abi_boots() -> Result<(), String> {
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-abi.img", &POSIX_ABI_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -1436,15 +1488,7 @@ fn posix_abi_probe() -> Result<(), String> {
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("posix-tls-probe: ok"), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, "posix-tls-probe: ok")?;
-    posix_orphans()?;
-    posix_thread_probe(false)?;
-    posix_cancel_input_probe(false)?;
-    posix_shared_probe()?;
-    posix_input_probe(false)?;
-    posix_interrupt_probe(false)?;
-    println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
-    Ok(())
+    qemu::expect_stopped_on(&output, "posix-tls-probe: ok")
 }
 
 /// The command of a run of the kernel that ships with the boot image
@@ -1703,7 +1747,24 @@ fn busybox_terms() -> Result<(Vec<u8>, String), String> {
     Ok((licence, source))
 }
 
+/// The builds of relibc and of BusyBox of this run of xtask: one is
+/// enough for every check that takes them.
+static RELIBC_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+static BUSYBOX_BUILT: Mutex<Vec<((), ())>> = Mutex::new(Vec::new());
+
+/// relibc built, once in a run of xtask.
 fn relibc() -> Result<(), String> {
+    once(&RELIBC_BUILT, (), build_relibc)
+}
+
+/// BusyBox built, once in a run of xtask.
+fn busybox_build() -> Result<(), String> {
+    once(&BUSYBOX_BUILT, (), || {
+        run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))
+    })
+}
+
+fn build_relibc() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/build-relibc.py")))?;
     // The notices follow each build of relibc.
     let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
@@ -1900,7 +1961,7 @@ const RELIBC_THREADS_TIMEOUT: Duration = Duration::from_secs(240);
 fn busybox_probe() -> Result<(), String> {
     relibc()?;
     if std::env::var_os("STAFETO_BUSYBOX_ROOT").is_none() {
-        run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+        busybox_build()?;
     }
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-busybox.img", &BUSYBOX_PROGRAMS, BOOT_PROFILE)?;
@@ -1920,7 +1981,7 @@ fn busybox_probe() -> Result<(), String> {
 
 fn ash_probe() -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ash.img", &ASH_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -1935,7 +1996,7 @@ fn ash_probe() -> Result<(), String> {
 
 fn ash_dialog() -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -2069,7 +2130,7 @@ fn ash_dialog() -> Result<(), String> {
 
 fn ash_shell() -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
         "boot-ash-dialog.img",
@@ -2082,7 +2143,7 @@ fn ash_shell() -> Result<(), String> {
 
 fn ls_probe() -> Result<(), String> {
     relibc()?;
-    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
+    busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-ls.img", &LS_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -2097,59 +2158,149 @@ fn ls_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn test() -> Result<(), String> {
+/// `cargo xtask test`: the host tests, then the boots, up to `jobs` at a
+/// time (jobs.rs). The boots stand alone, so the order of the list is the
+/// order of the output and of the files of measures, and `--jobs 1` runs
+/// them one after the other in it. Under -icount the numbers of the
+/// kernel tests count instructions, so a loaded host changes none of
+/// them.
+fn test(jobs: usize) -> Result<(), String> {
     host_tests()?;
-    ext4ro_probe()?;
-    ramfs_probe()?;
-    posix_abi_probe()?;
-    relibc_hello_probe()?;
-    relibc_threads_probe(&qemu::VIRT)?;
-    posix_procs_probe()?;
-    // BusyBox on relibc guards the C surface (5a′).
-    busybox_probe()?;
-    ash_probe()?;
-    ash_dialog()?;
-    ls_probe()?;
-    // os-test (io and malloc) within its time budget; its passing tests
-    // (tests/os-test/pass.txt) still pass.
-    ostest::run_in_budget()?;
-    rtbench2::short()?;
-    boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
-    boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
-    boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
-    boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE)?;
-    two_gib_boot()?;
-    console_dialog(&qemu::VIRT)?;
-    trace_dialog(&qemu::VIRT)?;
-    console_dialog(&qemu::VIRT_V3)?;
-    elf_boot_reports_missing_device_tree()?;
-    bad_boot_images_stop_the_boot()?;
-    init_fault_stops_the_machine()?;
-    panic_prints_the_log_nobody_showed()?;
-    fault_report()?;
-    stack_overflow_report()?;
-    test_build_carries_test_symbols()?;
-    strict_panic_only_in_checked_programs()?;
-    no_u128_division_is_linked()?;
-    shipping_init_has_no_test_table()?;
-    init_tests(&qemu::VIRT, false)?;
-    init_tests(&qemu::VIRT_2G, false)?;
-    init_tests(&qemu::VIRT, true)?;
-    init_tests(&qemu::VIRT_2G, true)?;
-    init_tests(&qemu::VIRT_V3, false)?;
-    init_tests(&qemu::VIRT_EL2, false)?;
-    svc_tests(&qemu::VIRT)?;
-    svc_tests(&qemu::VIRT_V3)?;
-    bad_tables_are_refused()?;
-    kernel_tests(&qemu::VIRT, Variant::Test)?;
-    kernel_tests(&qemu::VIRT_2G, Variant::Test)?;
-    kernel_tests(&qemu::VIRT_V3, Variant::Test)?;
-    kernel_tests(&qemu::VIRT_EL2, Variant::Test)?;
-    kernel_tests(&qemu::VIRT, Variant::TestIcount)?;
-    kernel_tests(&qemu::VIRT_2G, Variant::TestIcount)?;
+    if jobs > 1 {
+        // What several boots share is built once, before they start, so
+        // that the log tells where each line comes from.
+        relibc()?;
+        busybox_build()?;
+        for variant in [Variant::Normal, Variant::Test, Variant::TestIcount] {
+            build(variant)?;
+        }
+        build_boot_image("boot-test.img", &TEST_PROGRAMS, TEST_PROFILE)?;
+        build_boot_image("boot-svc.img", &SVC_PROGRAMS, TEST_PROFILE)?;
+    }
+    let (os_test, plan) = ostest::plan()?;
+    jobs::run_all(boot_jobs(os_test), jobs)?;
+    // Checks that read the host's time on TCG run alone, after the rest.
+    jobs::run_all(timing_jobs(), 1)?;
+    println!("Rust POSIX C ABI, errno and shared-file guest probes passed");
+    ostest::finish(plan)?;
     write_measures()?;
     println!("all checks passed");
     Ok(())
+}
+
+/// The boots of `test` whose verdicts depend on the host's time (the test
+/// init's heartbeats on their absolute deadlines without -icount, the
+/// monitor of QEMU for the ELF boot): they run one at a time once the
+/// others have ended, so that the load of the others cannot fail them.
+fn timing_jobs() -> Vec<jobs::Job> {
+    use jobs::job;
+    vec![
+        job(
+            "elf boot without a device tree",
+            elf_boot_reports_missing_device_tree,
+        ),
+        job("init tests 512M", || {
+            init_tests(&qemu::VIRT, false).map(drop)
+        }),
+        job("init tests 2G", || {
+            init_tests(&qemu::VIRT_2G, false).map(drop)
+        }),
+        job("init tests GICv3", || {
+            init_tests(&qemu::VIRT_V3, false).map(drop)
+        }),
+        job("init tests EL2", || {
+            init_tests(&qemu::VIRT_EL2, false).map(drop)
+        }),
+    ]
+}
+
+/// The independent boots of `test`, in the order they ran in before there
+/// were jobs.
+fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
+    use jobs::job;
+    let mut list = vec![
+        job("ext4ro", ext4ro_probe),
+        job("ramfs", ramfs_probe),
+        job("posix-abi", posix_abi_boots),
+        job("posix-orphans", posix_orphans),
+        job("posix-threads", || posix_thread_probe(false)),
+        job("posix-cancel-input", || posix_cancel_input_probe(false)),
+        job("posix-shared", posix_shared_probe),
+        job("posix-input", || posix_input_probe(false)),
+        job("posix-interrupt", || posix_interrupt_probe(false)),
+        job("relibc-hello", relibc_hello_probe),
+        job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
+        job("posix-procs", posix_procs_probe),
+        // BusyBox on relibc guards the C surface (5a').
+        job("busybox", busybox_probe),
+        job("ash", ash_probe),
+        job("ash-dialog", ash_dialog),
+        job("ls", ls_probe),
+        job("rtbench-short", rtbench2::short),
+        job("boot 512M GICv2", || {
+            boot_smoke(&qemu::VIRT, GIC_V2_LINE).map(drop)
+        }),
+        job("boot 512M GICv3", || {
+            boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE).map(drop)
+        }),
+        job("boot EL2 GICv2", || {
+            boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE).map(drop)
+        }),
+        job("boot EL2 GICv3", || {
+            boot_smoke(&qemu::VIRT_EL2_V3, GIC_V3_LINE).map(drop)
+        }),
+        job("boot 2G", two_gib_boot),
+        job("console dialog 512M", || console_dialog(&qemu::VIRT)),
+        job("trace dialog 512M", || trace_dialog(&qemu::VIRT)),
+        job("console dialog GICv3", || console_dialog(&qemu::VIRT_V3)),
+        job("bad boot images", bad_boot_images_stop_the_boot),
+        job("init fault", init_fault_stops_the_machine),
+        job("panic log", panic_prints_the_log_nobody_showed),
+        job("fault report", fault_report),
+        job("stack overflow", stack_overflow_report),
+        job("test build symbols", test_build_carries_test_symbols),
+        job("strict panic", strict_panic_only_in_checked_programs),
+        job("no u128 division", no_u128_division_is_linked),
+        job("shipping init", shipping_init_has_no_test_table),
+        job("init tests 512M icount", || {
+            init_tests(&qemu::VIRT, true).map(drop)
+        }),
+        job("init tests 2G icount", || {
+            init_tests(&qemu::VIRT_2G, true).map(drop)
+        }),
+        job("service tests 512M", || svc_tests(&qemu::VIRT).map(drop)),
+        job("service tests GICv3", || {
+            svc_tests(&qemu::VIRT_V3).map(drop)
+        }),
+        job("bad tables", bad_tables_are_refused),
+        job("kernel tests 512M", || {
+            kernel_tests(&qemu::VIRT, Variant::Test).map(drop)
+        }),
+        job("kernel tests 2G", || {
+            kernel_tests(&qemu::VIRT_2G, Variant::Test).map(drop)
+        }),
+        job("kernel tests GICv3", || {
+            kernel_tests(&qemu::VIRT_V3, Variant::Test).map(drop)
+        }),
+        job("kernel tests EL2", || {
+            kernel_tests(&qemu::VIRT_EL2, Variant::Test).map(drop)
+        }),
+        job("kernel tests 512M icount", || {
+            kernel_tests(&qemu::VIRT, Variant::TestIcount).map(drop)
+        }),
+        job("kernel tests 2G icount", || {
+            kernel_tests(&qemu::VIRT_2G, Variant::TestIcount).map(drop)
+        }),
+    ];
+    // os-test (io and malloc) within its time budget; its passing tests
+    // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
+    // come after `ls`.
+    let at = list
+        .iter()
+        .position(|j| j.name() == "ls")
+        .map_or(0, |i| i + 1);
+    list.splice(at..at, os_test);
+    list
 }
 
 fn host_tests() -> Result<(), String> {
@@ -2222,7 +2373,7 @@ fn host_tests() -> Result<(), String> {
 /// does: head.S must drop to EL1, and with a GICv3 open its system
 /// registers to EL1 first. The image also carries none of the kernel's own
 /// tests (spec 3.4): `no_test_symbols` checks it here so every normal
-/// build, not just the one that ships, is covered.
+/// build, the one that ships included, is covered.
 fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let a = build(Variant::Normal)?;
     no_test_symbols(&a.elf)?;
@@ -2883,8 +3034,8 @@ fn init_registers(elr: u64) -> String {
 
 /// A kernel that executes an undefined instruction must name the exception
 /// class, print the registers, and its backtrace must name the interrupted
-/// instruction: proof that exception entry recorded a frame, not just that
-/// the panic handler's own frames print (they would with no record at all).
+/// instruction: proof that exception entry recorded a frame, beyond the printing of
+/// the panic handler's own frames (they would print with no record at all).
 fn fault_report() -> Result<(), String> {
     let a = build(Variant::FaultProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));
@@ -3727,7 +3878,7 @@ fn no_transport_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn ci() -> Result<(), String> {
+fn ci(jobs: usize) -> Result<(), String> {
     // First: the licence check and the C programs take relibc's build.
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/check-licenses.py")))?;
@@ -3984,7 +4135,7 @@ fn ci() -> Result<(), String> {
             "clippy::undocumented_unsafe_blocks",
         ]))?;
     }
-    test()?;
+    test(jobs)?;
     let a = build(Variant::Normal)?;
     disasm::shipping(&a.elf, &llvm_tool("llvm-objdump")?)
 }

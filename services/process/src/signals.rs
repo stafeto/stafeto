@@ -69,7 +69,7 @@ pub struct Info {
     pub status: i32,
 }
 
-/// Posts `signal` (1 to SIGNAL_MAX, not SIGKILL, which the service carries
+/// Posts `signal` (1 to SIGNAL_MAX except SIGKILL, which the service carries
 /// out itself) with `info` on `page`. The service is the page's one
 /// writer of the information and of the bits it sets; a thread of the
 /// process clears a bit when it takes the signal.

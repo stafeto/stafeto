@@ -46,8 +46,8 @@ impl Clock {
 impl Clock {
     /// Compare value for a deadline `ns` nanoseconds after the counter
     /// value `now`. A deadline beyond the counter's range saturates at
-    /// u64::MAX, which the counter never reaches, instead of wrapping into
-    /// the past.
+    /// u64::MAX, which the counter never reaches, so the deadline never wraps
+    /// into the past.
     pub fn deadline_after(self, now: u64, ns: u64) -> u64 {
         now.saturating_add(self.ns_to_ticks(ns))
     }

@@ -167,7 +167,7 @@ impl Label {
     }
 
     /// The record and the place `raw` names, when it is a label the
-    /// service gives: bit 63, not both of bits 62 and 61, the image IMAGE,
+    /// service gives: bit 63, at most one of bits 62 and 61, the image IMAGE,
     /// an index below RECORDS and a generation of 1 to GENERATION_MAX.
     pub const fn parse(raw: u64) -> Option<(Self, Place)> {
         let index = (raw & 0xFFFF) as u16;

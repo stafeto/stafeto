@@ -305,6 +305,9 @@ pub struct Run {
     child: Child,
     stdin: Option<ChildStdin>,
     reader: Option<JoinHandle<()>>,
+    /// The reader of the child's stderr when this thread keeps its
+    /// output (out.rs): its text joins the job's output at the end.
+    errors: Option<JoinHandle<String>>,
     pieces: mpsc::Receiver<Vec<u8>>,
     /// The reader sets it as it ends: the test of `stop` looks at it.
     #[cfg(test)]
@@ -334,11 +337,24 @@ impl Run {
             Input::Null => Stdio::null(),
             Input::Pipe => Stdio::piped(),
         };
+        let keep = crate::out::capturing();
         let mut child = cmd
             .stdin(stdin)
             .stdout(Stdio::piped())
+            .stderr(if keep {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .spawn()
             .map_err(|e| format!("{cmd:?}: {e}"))?;
+        let errors = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut text = Vec::new();
+                let _ = stderr.read_to_end(&mut text);
+                String::from_utf8_lossy(&text).into_owned()
+            })
+        });
         let mut stdout = child.stdout.take().expect("stdout is piped");
         let (tx, pieces) = mpsc::channel();
         #[cfg(test)]
@@ -360,6 +376,7 @@ impl Run {
             stdin: child.stdin.take(),
             child,
             reader: Some(reader),
+            errors,
             pieces,
             #[cfg(test)]
             ended,
@@ -506,6 +523,9 @@ impl Run {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        if let Some(Ok(text)) = self.errors.take().map(JoinHandle::join) {
+            crate::out::write(&text, true);
+        }
         while let Ok(piece) = self.pieces.try_recv() {
             self.take(&piece);
         }
@@ -645,7 +665,7 @@ fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
 
 /// The backtrace must name the interrupted instruction (its `ELR`) and at
 /// least one caller above it: proof that exception entry recorded a frame
-/// linking the fault into the backtrace, not just the panic handler's own
+/// linking the fault into the backtrace, beyond the panic handler's own
 /// frames (which a backtrace prints regardless of that record).
 pub fn backtrace_names_the_fault(lines: &[String]) -> Result<(), String> {
     let elr = elr_in_panic(lines).ok_or("no panic line with ELR=0x...")?;
@@ -1491,7 +1511,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         b"boot complete\r\nstafeto> echo hello stafeto\r\nhello stafeto\r\nstafeto> ";
 
     /// Spec 14: the answer to a command is looked for after the command
-    /// was typed, not in its echo or in what came before.
+    /// was typed, so its echo and what came before do not count.
     #[test]
     fn an_answer_is_looked_for_after_its_command() {
         let mut t = Transcript::new(DIALOG);

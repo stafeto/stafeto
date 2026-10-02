@@ -873,7 +873,7 @@ impl IrqInfo {
 /// that waits what it waits for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
-    /// Made, not started yet.
+    /// Made and waiting for its first start.
     Stopped,
     /// Ready to run.
     Ready,

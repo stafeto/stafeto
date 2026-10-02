@@ -78,7 +78,7 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         self.insert_at_free(backend, 0, flags)
     }
 
-    /// F_DUPFD-style allocation. Flags are per descriptor, not per backend.
+    /// F_DUPFD-style allocation. Flags belong to the descriptor.
     pub fn duplicate(&mut self, fd: u32, minimum: u32, flags: Flags) -> Result<u32, Error> {
         let backend = self.get(fd)?;
         self.insert_at_free(backend, minimum, flags)

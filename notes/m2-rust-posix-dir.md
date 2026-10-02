@@ -57,7 +57,7 @@ truncated headers, malformed kinds, zero inode, empty names, NUL and slash.
 A RAM host test checks independent positions, actual inode values, access
 updates, restoration, invalid requests and preservation on errors.
 Deliberately disabling position advancement fails at the second entry:
-the test receives dot instead of dot-dot. Restoring the increment passes.
+the test receives dot where it expects dot-dot. Restoring the increment passes.
 
 cargo xtask posix-abi boots the extended C probe through Cargo and standalone
 Clang linking. It checks relative paths, types, inode values, independent

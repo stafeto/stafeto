@@ -139,9 +139,16 @@ pub fn wait_for(
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("qemu: {e}"))?;
+    let errors = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut text);
+            String::from_utf8_lossy(&text).into_owned()
+        })
+    });
     let deadline = Instant::now() + timeout;
     let mut text = String::new();
     while Instant::now() < deadline {
@@ -155,11 +162,14 @@ pub fn wait_for(
     }
     let _ = child.kill();
     let _ = child.wait();
+    let errors = errors
+        .and_then(|reader| reader.join().ok())
+        .unwrap_or_default();
     if text.contains(marker) {
         Ok(text)
     } else {
         Err(format!(
-            "the kernel log in RAM never held {marker:?}; it held {text:?}"
+            "the kernel log in RAM never held {marker:?}; it held {text:?}; QEMU said {errors:?}"
         ))
     }
 }

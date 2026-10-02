@@ -104,7 +104,7 @@ fn forged(parent: &Handle<Channel>) -> bool {
     refused && allowed
 }
 
-/// A record goes with its process, not with the session of its parent:
+/// A record goes with its process:
 /// `posix-sender` (tests/svc, role `t`) gives the clock peer its own
 /// session and ends; a query through that session, which the peer still
 /// holds, then finds no record. Before the sender's session reached the

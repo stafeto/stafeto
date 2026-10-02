@@ -44,7 +44,7 @@ Unexpected IPC failure, malformed acknowledgment or absent completion ends
 the process with status 125. Returning could recycle a stack still named
 by an executing job. Worker death recovery and cancellation need a different
 request lifetime model; fail-stop was the original stage's explicit policy.
-The private channel is for trusted library calls, not external clients.
+The private channel serves trusted library calls only.
 The separate service will need explicit methods and validated data messages,
 without executable addresses or pointers into another address space.
 

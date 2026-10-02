@@ -37,7 +37,7 @@ No kernel changes or per-call channel/timer allocations are needed.
 
 ## Interruption and cancellation
 
-An interrupted sleep request returns EINTR instead of automatically restarting.
+An interrupted sleep request returns EINTR and never restarts automatically.
 It may already have committed, so a subsequent ABANDON removes its record and
 retries its own interrupted acknowledgement before returning to the caller.
 The relative remainder is calculated after acknowledgement from the original end,

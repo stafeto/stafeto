@@ -3,7 +3,7 @@
 
 //! Minimal flattened device tree (FDT) reader: header, memory reservation
 //! block and a structure-block walker. It never allocates, and every read is
-//! bounds checked, so a malformed blob yields an error instead of a fault.
+//! bounds checked, so a malformed blob yields an error and never a fault.
 
 const MAGIC: u32 = 0xd00d_feed;
 /// Size of the FDT header; enough to learn the size of the whole blob.

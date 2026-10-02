@@ -32,7 +32,7 @@ static BOOT: SetOnce<Boot> = SetOnce::new();
 /// Reads the device tree and works out the usable RAM, once.
 pub fn collect(dtb_pa: usize, kernel_pa: usize) -> &'static Boot {
     if dtb_pa == 0 {
-        panic!("no device tree in x0: boot the arm64 Image, not the ELF");
+        panic!("no device tree in x0: boot the arm64 Image");
     }
     if !dtb_gib_is_mappable(dtb_pa as u64) {
         panic!("device tree pointer {dtb_pa:#x} is outside the RAM the boot page tables map");

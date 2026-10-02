@@ -57,12 +57,12 @@ the working directory; a trailing slash on a regular file gives ENOTDIR.
 
 Changing the access-time condition from a nonempty request to a positive
 return count deliberately fails the RAM test at EOF: access time remains
-30 instead of 40. Restoring the condition passes the regression test.
+30 where 40 is expected. Restoring the condition passes the regression test.
 
 ## Remaining work
 
-The service clock is the platform counter expressed in nanoseconds, not
-configured wall time since the Unix epoch. A realtime clock service and
+The service clock is the platform counter expressed in nanoseconds and carries
+no configured wall time since the Unix epoch. A realtime clock service and
 epoch provisioning are required for conforming file times. The fixed RAM
 namespace has no symbolic links, so lstat currently equals stat; links
 require final-component no-follow resolution. All owners are uid/gid zero;
@@ -70,7 +70,7 @@ credential-based access checks, chmod, chown and mutable directories remain.
 Console fstat supplies provisional character-device metadata with zero
 timestamps until a terminal service owns its node. st_blocks reports the
 logical RAM extent rounded to 512 bytes, without disk allocation accounting.
-These probes establish the implemented subset, not full POSIX conformance.
+These probes establish the implemented subset; full POSIX conformance lies outside their scope.
 
 References: [read semantics](https://pubs.opengroup.org/onlinepubs/9799919799.2024edition/functions/read.html)
 and [file timestamp rules](https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap04.html).

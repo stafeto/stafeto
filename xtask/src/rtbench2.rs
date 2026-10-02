@@ -3,7 +3,8 @@
 
 //! rtbench 2: the real-time scenarios of a POSIX program
 //! (tests/rtbench-posix) beside a hostile load (tests/rtbench-load), on
-//! HVF and Apple VZ for N minutes (`cargo xtask rtbench --minutes N`), or
+//! HVF and Apple VZ for N minutes at the same time
+//! (`cargo xtask rtbench --minutes N [--serial]`), or
 //! one round on QEMU TCG in `ci` (`short`). Each run writes
 //! `target/measure/rtbench-<machine>.txt`: the commit, the host's `uptime`
 //! before and after, and a row for each scenario with n, min, p50, p99,
@@ -283,18 +284,51 @@ fn measure(cmd: Command, machine: &str, seconds: u64) -> Result<Run, String> {
     Ok(run)
 }
 
-/// `cargo xtask rtbench --minutes N`: N minutes on HVF, then on VZ.
-pub fn run(minutes: u64) -> Result<(), String> {
+/// How `rtbench --minutes N` places its two runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placing {
+    /// HVF, then VZ (`--serial`).
+    Serial,
+    /// Both at once, the default: the host has cores for two guests, and
+    /// the report of each run says how loaded it was (the uptime before
+    /// and after). Two runs of 2 minutes each way (notes/parallel-guests.md)
+    /// kept the p99 and the maximum of the main rows within the spread of
+    /// two serial runs.
+    Concurrent,
+}
+
+/// `cargo xtask rtbench --minutes N`: N minutes on HVF and on VZ, at the
+/// same time unless `placing` says otherwise.
+pub fn run(minutes: u64, placing: Placing) -> Result<(), String> {
     hvf_host().map_err(|why| format!("rtbench 2 runs on HVF and VZ: {why}"))?;
     let seconds = minutes * 60;
     let kernel = build(Variant::Normal)?;
     let image_qemu = image("rtbench-posix.img", &RTBENCH_POSIX_PROGRAMS, seconds)?;
-    let mut cmd = qemu::command(&qemu::HVF_V3, &kernel.image, Some(&image_qemu));
-    cmd.args(qemu::HEADLESS);
-    measure(cmd, "hvf", seconds)?;
     let image_vz = image("rtbench-posix-vz.img", &RTBENCH_POSIX_VZ_PROGRAMS, seconds)?;
-    let cmd = vz::command(&kernel.image, &image_vz)?;
-    vz::stop_hint(measure(cmd, "vz", seconds))?;
+    let mut hvf = qemu::command(&qemu::HVF_V3, &kernel.image, Some(&image_qemu));
+    hvf.args(qemu::HEADLESS);
+    let vz = vz::command(&kernel.image, &image_vz)?;
+    match placing {
+        Placing::Serial => {
+            measure(hvf, "hvf", seconds)?;
+            vz::stop_hint(measure(vz, "vz", seconds))?;
+        }
+        Placing::Concurrent => {
+            // Each run keeps its output, shown whole once both ended.
+            let ((hvf, hvf_out), (vz, vz_out)) = std::thread::scope(|scope| {
+                let hvf = scope.spawn(|| crate::out::capture(1, || measure(hvf, "hvf", seconds)));
+                let vz = scope
+                    .spawn(|| crate::out::capture(2, || vz::stop_hint(measure(vz, "vz", seconds))));
+                (
+                    hvf.join().expect("the HVF run does not panic"),
+                    vz.join().expect("the VZ run does not panic"),
+                )
+            });
+            print!("{hvf_out}{vz_out}");
+            hvf?;
+            vz?;
+        }
+    }
     Ok(())
 }
 

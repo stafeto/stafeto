@@ -48,8 +48,8 @@ pub enum ElfError {
     /// Its template of thread-local storage is not in the data segment's
     /// bytes.
     TlsOutside,
-    /// The loadable segment at `vaddr` has the protection `flags`, not r-x,
-    /// r-- or rw-.
+    /// The loadable segment at `vaddr` has the protection `flags`, which is none of
+    /// r-x, r-- and rw-.
     Protection { vaddr: u64, flags: u32 },
     /// Two loadable segments have the protection of this part.
     Twice(Part),
@@ -78,7 +78,7 @@ impl fmt::Display for ElfError {
                 let bit = |b, c| if flags & b != 0 { c } else { '-' };
                 write!(
                     f,
-                    "the segment at {vaddr:#x} is {}{}{}, not r-x, r-- or rw-",
+                    "the segment at {vaddr:#x} is {}{}{}, which is none of r-x, r-- and rw-",
                     bit(PF_R, 'r'),
                     bit(PF_W, 'w'),
                     bit(PF_X, 'x')
@@ -300,7 +300,7 @@ mod tests {
                     vaddr: 0x20_1000,
                     flags: PF_W,
                 },
-                "the segment at 0x201000 is -w-, not r-x, r-- or rw-",
+                "the segment at 0x201000 is -w-, which is none of r-x, r-- and rw-",
             ),
             (ElfError::Twice(Part::Code), "two code segments"),
             (

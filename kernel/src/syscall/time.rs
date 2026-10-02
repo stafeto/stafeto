@@ -19,8 +19,8 @@ pub(super) fn clock_now() -> Result<Values, Error> {
     Ok(Values::new(&[clock::clock().ticks_to_ns(clock::now())]))
 }
 
-/// timer_create(x0 channel with RECEIVE, x1 priority): a timer on the
-/// channel, not armed, whose notifications have the priority and the
+/// timer_create(x0 channel with RECEIVE, x1 priority): an unarmed timer on
+/// the channel, whose notifications have the priority and the
 /// label of the handle (spec 10); x1 returns a handle to it with
 /// DUPLICATE, TRANSFER and MANAGE (abi::OWNER_RIGHTS). The channel is the
 /// caller's own to receive from: its slots and the priorities that lift

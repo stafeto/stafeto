@@ -168,7 +168,7 @@ pub fn run(
                     Err(EINTR) if ending(&block.flags) => break 'wait None,
                     // The service told once and keeps the result for the
                     // next "take"; it tells no second time, so the take
-                    // goes again with a new copy instead of a wait.
+                    // goes again with a new copy and does not wait.
                     Err(EINTR) => armed = false,
                     Err(error) => break 'wait Some(error),
                 }
