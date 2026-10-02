@@ -33,6 +33,7 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        on_demand: false,
     },
     Record {
         name: "ramfs-probe",
@@ -54,6 +55,7 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        on_demand: false,
     },
 ];
 
@@ -118,7 +120,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     Record {
         name: "posix",
         program: "posix-process-service",
-        quota: 256 * PAGE,
+        // Its own, and the eight objects of the pages of its records
+        // (32 pages each); what its POSIX records take init adds.
+        quota: 640 * PAGE,
         // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
@@ -163,6 +167,18 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         ceiling: 50,
         ..LONG
     },
+    // A POSIX process that gives the clock peer its session with the
+    // process service and ends (tests/svc, role `t`): the probe of the
+    // credentials sees its record go with it.
+    Record {
+        name: "posix-sender",
+        program: "svc",
+        args: b"t",
+        connects: &["clock-peer", "clock", "posix"],
+        quota: 16 * PAGE,
+        handle_limit: 16,
+        ..POSIX
+    },
 ];
 
 /// The first C program on relibc (5a′): the RAM files, the process and
@@ -197,6 +213,112 @@ pub const RELIBC_TABLE: &[Record] = &[
         ..RELIBC_HELLO
     },
 ];
+
+/// The probe of POSIX processes (tests/posix-procs, 5b): the RAM files,
+/// the process and clock services, the probe, and the records it spawns,
+/// which start on demand: a child that says its parent, one that sleeps,
+/// one whose 32 MiB stack its 15 pages of quota cannot map, so that its
+/// load fails (the image gives `posix-procs-big` that stack), one that
+/// ends 300 ms after its start, one that exits with 7, one that faults,
+/// one that spawns the next, which waits to be an orphan, one that blocks
+/// every signal and spins, one that exits with 42 from its handler of
+/// SIGUSR1, a second sleeper, and one that calls setsid and setpgid.
+pub const POSIX_PROCS_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-procs",
+        program: "posix-procs",
+        args: b"posix-procs\0",
+        root: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-sleeper",
+        args: b"posix-procs\0sleep\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-big",
+        program: "posix-procs-big",
+        quota: super::MIN_QUOTA,
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-nap",
+        args: b"posix-procs\0nap\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-exit7",
+        args: b"posix-procs\0exit7\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-segv",
+        args: b"posix-procs\0segv\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-middle",
+        args: b"posix-procs\0middle\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-orphan",
+        args: b"posix-procs\0orphan\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    // It spins: below the probe, which runs FIFO at its own level.
+    Record {
+        name: "procs-block",
+        args: b"posix-procs\0block\0",
+        priority: 20,
+        ceiling: 21,
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-catch",
+        args: b"posix-procs\0catch\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-sleep2",
+        args: b"posix-procs\0sleep2\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-ids",
+        args: b"posix-procs\0ids\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+];
+
+/// The child of the probe of POSIX processes.
+const PROCS_CHILD: Record = Record {
+    name: "procs-child",
+    program: "posix-procs",
+    args: b"posix-procs\0child\0",
+    connects: &["ramfs", "clock", "posix"],
+    quota: 512 * PAGE,
+    ..POSIX
+};
 
 /// One test of os-test a boot (cargo xtask os-test): the RAM files, the
 /// process and clock services, and the test, under the name `os-test`.
@@ -234,6 +356,8 @@ pub const RELIBC_THREADS_TABLE: &[Record] = &[
         args: b"relibc-threads\0",
         quota: 4096 * PAGE,
         handle_limit: 512,
+        // It sets the clock, which only an effective UID of 0 may.
+        root: true,
         ..RELIBC_TABLE[3]
     },
 ];
@@ -291,4 +415,70 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     LONG,
     LOAD,
     RTBENCH,
+    RTBENCH_CHILDREN[0],
+    RTBENCH_CHILDREN[1],
+    RTBENCH_CHILDREN[2],
+    RTBENCH_CHILDREN[3],
+    RTBENCH_CHILDREN[4],
+    RTBENCH_CHILDREN[5],
+    RTBENCH_CHILDREN[6],
+    RTBENCH_CHILDREN[7],
+    RTBENCH_CHILDREN[8],
 ];
+
+/// The children of rtbench 2 (S10 to S13), which start on demand.
+pub const RTBENCH_CHILDREN: [Record; 9] = [
+    Record {
+        name: "rtbench-target",
+        args: b"rtbench-posix\0target\0",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-quick",
+        args: b"rtbench-posix\0quick\0",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-exiter",
+        args: b"rtbench-posix\0exiter\0",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait1",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait2",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait3",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait4",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait5",
+        ..RTBENCH_CHILD
+    },
+    Record {
+        name: "rtbench-wait6",
+        ..RTBENCH_CHILD
+    },
+];
+
+/// A child of rtbench 2 (S10 to S13), which starts on demand: the
+/// benchmark under a role named by its first argument. The table holds
+/// 16 records, so a group of seven (`target` and the six `wait`) is the
+/// largest one the benchmark can start.
+pub const RTBENCH_CHILD: Record = Record {
+    name: "rtbench-wait1",
+    program: "rtbench-posix",
+    args: b"rtbench-posix\0wait\0",
+    connects: &["ramfs", "clock", "posix", "uart"],
+    quota: 512 * PAGE,
+    on_demand: true,
+    ..POSIX
+};

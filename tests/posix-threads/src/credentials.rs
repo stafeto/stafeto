@@ -2,13 +2,13 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Credentials in the process service: the shared state of a record,
-//! Child snapshots and the right Child takes, Create refused through a
-//! session. The records' bound, the children of a record, a record that
-//! goes with its session and its PID one generation on, and labels the
-//! service did not give are the service's host tests (records.rs).
+//! Create refused through a session, and a record that goes with its
+//! process whoever holds its session. The records' bound, a record that
+//! goes with the notification of its end and its PID one generation on,
+//! and labels the service did not give are the service's host tests
+//! (records.rs).
 use super::*;
-use process_client::Client;
-use proto_process::{Change, Credentials};
+use proto_process::Credentials;
 use proto_wire::{Header, Reader, Status};
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn handler(_: i32) {
@@ -73,10 +73,64 @@ fn peer(parent: &Handle<Channel>, own: &Handle<rt::handle::Process>) -> bool {
     let bytes = reply.bytes(&mut buffer);
     bytes == proto_wire::reply(Status::from_code(proto_process::PERMISSION))
 }
-/// A native child with no thread, as the parent of a POSIX child makes it
-/// before it starts.
-fn native() -> Handle<rt::handle::Process> {
-    sys::process_create(65536, 16, 30).unwrap()
+/// A channel of the probe's own, offered to the clock in place of its
+/// identity session, proves nothing, even to a root process: the clock
+/// asks the process service, which finds no identity place reached
+/// (PERMISSION at once, the clock never sends to the channel); the real
+/// identity session on another connection sets the clock. Says so.
+fn forged(parent: &Handle<Channel>) -> bool {
+    let time = posix_time::Time {
+        seconds: 1_800_000_000,
+        nanos: 0,
+    };
+    let Ok(own) = sys::channel_create(30) else {
+        return false;
+    };
+    let rights = rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER | rt::abi::Rights::DUPLICATE;
+    let Ok(fake) = sys::handle_label(&own, rights, 77, 30) else {
+        return false;
+    };
+    let (Ok(forger), Ok(honest)) = (
+        posix_clock::Client::connect(parent),
+        posix_clock::Client::connect(parent),
+    ) else {
+        return false;
+    };
+    let refused = forger.set(time, Some(&fake)) == Err(Status::from_code(proto_clock::PERMISSION));
+    let allowed = honest.set(time, abi::process::identity()).is_ok();
+    if refused && allowed {
+        rt::println!("credential-probe: a forged identity does not set the clock");
+    }
+    refused && allowed
+}
+
+/// A record goes with its process, not with the session of its parent:
+/// `posix-sender` (tests/svc, role `t`) gives the clock peer its own
+/// session and ends; a query through that session, which the peer still
+/// holds, then finds no record. Before the sender's session reached the
+/// peer the peer says BAD_STATE; while the record lives the query passes.
+/// Two seconds at most.
+fn transferred(parent: &Handle<Channel>) -> bool {
+    let connection = rt::service::connect(parent, "clock-peer").unwrap();
+    let ask = Header {
+        version: proto_clock::VERSION,
+        method: 11,
+    }
+    .bytes();
+    let gone = proto_wire::reply(Status::from_code(proto_process::UNREGISTERED));
+    let pause = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 10_000_000,
+    };
+    for _ in 0..200 {
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let reply = sys::send(&connection, &ask).unwrap();
+        if reply.bytes(&mut buffer) == gone {
+            return true;
+        }
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
+    }
+    false
 }
 #[inline(never)]
 pub(super) fn run(parent: &Handle<Channel>) -> bool {
@@ -106,50 +160,17 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     {
         return failed(492);
     }
-    // Create only through the channel with no label.
-    if c.create(&own, true).err() != Some(Status::from_code(proto_process::PERMISSION))
-        || abi::process::seteuid(0).is_err()
-        || c.query().unwrap() != original
-    {
+    if abi::process::seteuid(0).is_err() || c.query().unwrap() != original {
         return failed(493);
     }
-    // A stopped native child gets a snapshot of the caller's credentials,
-    // which later changes of the caller leave alone.
-    let child = native();
-    let (first, first_session) = c.child(&child).unwrap();
-    if first.parent != original.pid
-        || first.pid == original.pid
-        || first.credentials != Credentials::ROOT
-    {
+    if !transferred(parent) {
         return failed(498);
     }
-    c.change(Change::EffectiveUid, 1000).unwrap();
-    let unprivileged = native();
-    let (inherited, inherited_session) = c.child(&unprivileged).unwrap();
-    let first_client = Client::new(first_session);
-    if inherited.credentials.words() != [0, 1000, 0, 0, 0, 0]
-        || inherited.parent != original.pid
-        || first_client.query() != Ok(first)
-    {
-        return failed(510);
+    if !forged(parent) {
+        return failed(499);
     }
-    c.change(Change::EffectiveUid, 0).unwrap();
-    drop(inherited_session);
-    sys::process_kill(&unprivileged).unwrap();
-    drop(unprivileged);
-    drop(first_client);
-    sys::process_kill(&child).unwrap();
-    drop(child);
-    // Child takes a process handle with MANAGE alone.
-    let child = native();
-    let weak = c.child_with(&child, rt::abi::Rights::DUPLICATE);
-    if weak.err() != Some(Status::from_code(proto_process::PERMISSION)) {
-        return failed(513);
-    }
-    sys::process_kill(&child).unwrap();
-    drop(child);
     rt::println!(
-        "credential-probe: shared UID/GID, saved IDs, sessions by label, child snapshots and rights ok"
+        "credential-probe: shared UID/GID, saved IDs, sessions by label, a record that goes with its process ok"
     );
     true
 }

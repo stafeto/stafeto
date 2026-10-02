@@ -124,6 +124,7 @@ fn error(status: Status) -> c_int {
         proto_clock::INVALID => EINVAL,
         proto_clock::OVERFLOW => EOVERFLOW,
         proto_clock::FULL => EAGAIN,
+        proto_clock::PERMISSION => EPERM,
         _ => EIO,
     }
 }
@@ -155,8 +156,10 @@ pub fn getres(id: c_int) -> Result<Time, c_int> {
         .map_err(|_| EIO)
 }
 
-/// Sets CLOCK_REALTIME to `time` through the clock service (connecting to
-/// it grants the right); CLOCK_MONOTONIC is never settable.
+/// Sets CLOCK_REALTIME to `time` through the clock service, which lets
+/// only a process whose effective UID is 0 do it (EPERM otherwise, the
+/// process's identity session telling who it is); CLOCK_MONOTONIC is never
+/// settable.
 pub fn settime(id: c_int, time: Timespec) -> Result<(), c_int> {
     if id != CLOCK_REALTIME {
         return Err(EINVAL);
@@ -166,5 +169,7 @@ pub fn settime(id: c_int, time: Timespec) -> Result<(), c_int> {
         nanos: time.tv_nsec,
     };
     value.value().map_err(|_| EINVAL)?;
-    client()?.set(value).map_err(error)
+    client()?
+        .set(value, crate::process::identity())
+        .map_err(error)
 }

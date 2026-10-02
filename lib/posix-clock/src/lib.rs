@@ -16,6 +16,8 @@ use rt::{service, sys};
 
 pub struct Client {
     channel: Handle<Channel>,
+    /// Whether the service has the caller's identity for the session.
+    vouched: core::sync::atomic::AtomicBool,
 }
 impl Client {
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
@@ -24,6 +26,7 @@ impl Client {
     pub fn connect_named(parent: &Handle<Channel>, name: &str) -> Result<Self, Status> {
         Ok(Self {
             channel: service::connect(parent, name)?,
+            vouched: core::sync::atomic::AtomicBool::new(false),
         })
     }
     fn call<'a>(
@@ -175,15 +178,66 @@ impl Client {
         Ok(value)
     }
     /// SET: the service sets the date once, whatever signals come while
-    /// the caller waits for the reply.
-    pub fn set(&self, time: Time) -> Result<(), Status> {
+    /// the caller waits for the reply. `identity` is the caller's identity
+    /// session of the process service (a copy of it goes with the request:
+    /// the service keeps the first for the session); without one the
+    /// service answers PERMISSION.
+    pub fn set(&self, time: Time, identity: Option<&Handle<Channel>>) -> Result<(), Status> {
         time.value()
             .map_err(|_| Status::from_code(proto_clock::INVALID))?;
         let mut request = Writer::new();
         Method::Set.header().write(&mut request)?;
         request.u64(time.seconds as u64)?;
         request.u64(time.nanos as u64)?;
-        self.unit(request.as_bytes())
+        let Some(identity) = identity else {
+            return self.unit(request.as_bytes());
+        };
+        // The copy of the identity goes with the first SET of the session,
+        // and again when the service answers PERMISSION to a SET without
+        // one (it gave its place for the session to another).
+        let first = !self.vouched.load(core::sync::atomic::Ordering::Relaxed);
+        let result = self.set_with(request.as_bytes(), first.then_some(identity));
+        let result = match result {
+            Err(s) if !first && s == Status::from_code(proto_clock::PERMISSION) => {
+                self.set_with(request.as_bytes(), Some(identity))
+            }
+            other => other,
+        };
+        if result.is_ok() {
+            self.vouched
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+    /// SET of `request`, with a copy of `identity` (NOTIFY, TRANSFER and
+    /// DUPLICATE: the service has the process service vouch for it) when
+    /// given.
+    fn set_with(&self, request: &[u8], identity: Option<&Handle<Channel>>) -> Result<(), Status> {
+        loop {
+            let rights =
+                rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER | rt::abi::Rights::DUPLICATE;
+            let sent = match identity {
+                Some(identity) => {
+                    let copy = sys::handle_duplicate(identity, rights)?;
+                    sys::send_handles(&self.channel, request, [copy.erase()]).map_err(|e| e.error)
+                }
+                None => sys::send(&self.channel, request),
+            };
+            let reply = match sent {
+                Err(Error::Interrupted) => continue,
+                result => result.map_err(Status::Kernel)?,
+            };
+            let mut buffer = [0; MESSAGE_MAX];
+            let bytes = reply.bytes(&mut buffer);
+            if !reply.handles.is_empty() {
+                return Err(Status::BadSize);
+            }
+            return match Status::from_code(Reader::new(bytes).u32()?) {
+                Status::Ok if bytes == proto_wire::reply(Status::Ok) => Ok(()),
+                Status::Ok => Err(Status::BadSize),
+                status => Err(status),
+            };
+        }
     }
     /// A request as the caller wrote it, for the probes of malformed
     /// bodies.

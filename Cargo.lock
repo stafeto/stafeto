@@ -85,6 +85,7 @@ dependencies = [
  "abi",
  "bootimg",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
  "uart",
@@ -185,9 +186,11 @@ dependencies = [
 name = "posix-clock-service"
 version = "0.1.0"
 dependencies = [
+ "posix-credentials",
  "posix-time",
  "proto-clock",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
 ]
@@ -254,6 +257,7 @@ dependencies = [
  "posix-sync",
  "posix-thread",
  "posix-types",
+ "proto-process",
  "rt",
 ]
 
@@ -261,12 +265,19 @@ dependencies = [
 name = "posix-process-service"
 version = "0.1.0"
 dependencies = [
+ "bootimg",
  "posix-credentials",
- "process-client",
  "proto-init",
  "proto-process",
  "proto-wire",
  "rt",
+]
+
+[[package]]
+name = "posix-procs"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
 ]
 
 [[package]]
@@ -408,6 +419,7 @@ dependencies = [
 name = "proto-process"
 version = "0.1.0"
 dependencies = [
+ "abi",
  "proto-wire",
 ]
 
@@ -585,6 +597,9 @@ name = "test-svc"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "posix-clock",
+ "posix-time",
+ "proto-clock",
  "proto-init",
  "proto-uart",
  "proto-wire",

@@ -47,8 +47,11 @@ pub trait Service<const K: usize> {
     /// that gives its clients' labels itself: a lookup in O(1), and the
     /// client goes to `gone` even when it never sent a request. None
     /// (the default) looks through the places from PLACED on. A place
-    /// that holds the session of another label, or one past the table,
-    /// refuses the request with LIMIT_REACHED.
+    /// that holds the session of another label is the service's to give
+    /// again: that session ends as if its client went (`gone`, then its
+    /// handles close and its deferred replies get PEER_CLOSED), and the
+    /// request of `label` takes the place. A place past the table refuses the request with
+    /// LIMIT_REACHED.
     fn place(&self, label: u64) -> Option<usize> {
         let _ = label;
         None
@@ -66,6 +69,13 @@ pub trait Service<const K: usize> {
     /// new session when it had none.
     fn gone(&mut self, s: &mut Session<Self::Data, K>) {
         let _ = s;
+    }
+
+    /// CLIENT_GONE of `label`, whether or not it had a session: after
+    /// `gone`, for a service that hears of the last copy of a handle it
+    /// gave away, such as the start channel of a program.
+    fn closed(&mut self, label: u64) {
+        let _ = label;
     }
 
     /// A notification other than CLIENT_GONE and the heartbeat's timer:
@@ -433,6 +443,7 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                     }
                     *slot = None;
                 }
+                service.closed(label);
             }
             _ => service.notification(notice),
         }
@@ -456,11 +467,12 @@ fn request<S: Service<K>, const K: usize>(
         other => other,
     };
     let place = service.place(label);
-    let (header, s) = match header.map(|h| (h, session::<S, K>(table, label, place, issued))) {
-        Ok((header, Some(s))) => (header, s),
-        Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
-        Err(status) => return refuse(token, status),
-    };
+    let (header, s) =
+        match header.map(|h| (h, session::<S, K>(service, table, label, place, issued))) {
+            Ok((header, Some(s))) => (header, s),
+            Ok((_, None)) => return refuse(token, Status::Kernel(Error::LimitReached)),
+            Err(status) => return refuse(token, status),
+        };
     let mut r = Request {
         label,
         header,
@@ -497,20 +509,25 @@ fn refuse(token: Token, status: Status) {
 
 /// The session of `label`: at `place` when the service gives one
 /// (Service::place), or else found from PLACED on; made in that place, or
-/// in the first free one from PLACED on, when there is none. None when the
-/// place holds another label's session or the table is full.
-fn session<S: Service<K>, const K: usize>(
-    table: &mut [Option<Session<S::Data, K>>],
+/// in the first free one from PLACED on, when there is none; a session of
+/// another label at the service's place ends first. None when the table
+/// is full or the place lies past it.
+fn session<'a, S: Service<K>, const K: usize>(
+    service: &mut S,
+    table: &'a mut [Option<Session<S::Data, K>>],
     label: u64,
     place: Option<usize>,
     issued: u32,
-) -> Option<&mut Session<S::Data, K>> {
+) -> Option<&'a mut Session<S::Data, K>> {
     let found = match place {
         Some(i) => {
             debug_assert!(i < S::PLACED, "a place past those Service::place gives");
-            let s = table.get(i)?;
+            let s = table.get_mut(i)?;
             if s.as_ref().is_some_and(|s| s.label != label) {
-                return None;
+                // A session of a label the service gave the place up for.
+                if let Some(mut old) = s.take() {
+                    service.gone(&mut old);
+                }
             }
             i
         }
@@ -820,6 +837,14 @@ impl<const N: usize> LongOps<N> {
             op.told = true;
             // A client that went closed its end: nothing to tell then.
             let _ = sys::notify(notify, 1);
+        }
+    }
+
+    /// The client took after a tell and found nothing ready: the next
+    /// `tell` tells again through the handle kept, as after `arm`.
+    pub fn untell(&mut self, label: u64, key: u64) {
+        if let Some(index) = self.place(label, key) {
+            self.ops[index].as_mut().expect("a placed operation").told = false;
         }
     }
 

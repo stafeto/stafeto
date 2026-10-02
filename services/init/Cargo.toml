@@ -35,6 +35,8 @@ table-ramfs = []
 table-posix-abi = []
 table-relibc = []
 table-relibc-threads = []
+# The probe of POSIX processes (posix-procs) and the records it spawns.
+table-posix-procs = []
 table-os-test = []
 table-busybox = []
 table-busybox-dialog = []
@@ -45,6 +47,7 @@ table-posix-dialog-vz = []
 abi = { path = "../../lib/abi" }
 bootimg = { path = "../../lib/bootimg" }
 proto-init = { path = "../../proto/init" }
+proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 # The text of a batch of the kernel log (uart::log), which the worker
 # shows once the console's driver ended for good.

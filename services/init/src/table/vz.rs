@@ -109,6 +109,7 @@ pub const CONSOLE: Record = Record {
     ],
     trusted: true,
     root: false,
+    on_demand: false,
 };
 
 pub const TABLE: &[Record] = &[
@@ -132,6 +133,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         ..super::ramfs::POSIX_ABI_TABLE[4]
     },
     super::ramfs::POSIX_ABI_TABLE[5],
+    super::ramfs::POSIX_ABI_TABLE[6],
 ];
 
 /// The RAM file service and a probe that reads the console, as
@@ -185,4 +187,13 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::ramfs::LONG,
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,
+    super::ramfs::RTBENCH_CHILDREN[0],
+    super::ramfs::RTBENCH_CHILDREN[1],
+    super::ramfs::RTBENCH_CHILDREN[2],
+    super::ramfs::RTBENCH_CHILDREN[3],
+    super::ramfs::RTBENCH_CHILDREN[4],
+    super::ramfs::RTBENCH_CHILDREN[5],
+    super::ramfs::RTBENCH_CHILDREN[6],
+    super::ramfs::RTBENCH_CHILDREN[7],
+    super::ramfs::RTBENCH_CHILDREN[8],
 ];

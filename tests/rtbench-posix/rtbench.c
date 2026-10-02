@@ -32,15 +32,30 @@
  * clock_nanosleep TIMER_ABSTIME with a period of 1 ms; S8 from futex_wake
  * to the return of the futex_wait of a thread at 30, and futex_wake on a
  * word whose bucket holds a waiter on another word; S9 an empty round
- * trip through the loop of a service.
+ * trip through the loop of a service. The scenarios of 5b, which need the
+ * process service and children from the boot image (the records
+ * rtbench-target, -quick, -exiter and -wait1 to -wait6, one live child
+ * to a record, the program itself under a role named by its first
+ * argument; the children hand their stamps of the shared counter to the
+ * parent through offsets of /tmp/probe): S10 from kill() of another
+ * process to the first statement of the handler of its main thread, while
+ * the target sleeps and while a thread at 25 runs all the time; S11 a
+ * waitpid of a zombie that is ready (one round trip), and from the
+ * _exit of a child to the return of waitpid of the parent, which holds
+ * one write of the child's stamp (an upper bound); S12 killpg to a group
+ * of seven, to the last waitpid of its members; S13 posix_spawn from the
+ * boot image to the first statement of the child's main.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -643,11 +658,245 @@ static int service_round_trip(void) {
     return 0;
 }
 
+/* --- S10-S13: children from the boot image ---------------------------- */
+
+#define STAMP_HANDLER 0
+#define STAMP_READY 8
+#define STAMP_MAIN 16
+#define STAMP_EXIT 32
+#define GROUP 7
+
+static struct histogram s10[2], s11[2], s12, s13;
+static int probe_fd = -1;
+
+static int put_stamp(int fd, off_t offset, uint64_t value) {
+    if (lseek(fd, offset, SEEK_SET) < 0) return -1;
+    return write(fd, &value, sizeof value) == (ssize_t)sizeof value ? 0 : -1;
+}
+
+static uint64_t get_stamp(off_t offset) {
+    uint64_t value = 0;
+    if (lseek(probe_fd, offset, SEEK_SET) < 0 || read(probe_fd, &value, sizeof value) != (ssize_t)sizeof value)
+        return 0;
+    return value;
+}
+
+static int clear_stamps(void) {
+    for (off_t offset = 0; offset < 64; offset += 8)
+        if (put_stamp(probe_fd, offset, 0)) {
+            fail("clear stamps", errno);
+            return 1;
+        }
+    return 0;
+}
+
+static int spawn_child(pid_t *pid, const char *path, int flags, pid_t group) {
+    char *argv[] = { "rtbench-posix", NULL };
+    char *envp[] = { NULL };
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, flags);
+    posix_spawnattr_setpgroup(&attr, group);
+    int error = posix_spawn(pid, path, NULL, &attr, argv, envp);
+    posix_spawnattr_destroy(&attr);
+    if (error) fail(path, error);
+    return error;
+}
+
+/* The status of `pid` has to be exit 0 (`signal` 0) or that signal. */
+static int reaped(pid_t pid, int options, int signal, const char *what) {
+    int status = -1;
+    pid_t got = waitpid(pid, &status, options);
+    if (got == 0) return 0;
+    int good = got > 0 && (signal ? WIFSIGNALED(status) && WTERMSIG(status) == signal
+                                  : WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    if (!good) {
+        fail(what, got < 0 ? errno : status);
+        return -1;
+    }
+    return 1;
+}
+
+/* Waits until the stamp at `offset` is not 0 (at most 2 s): 0 when it is. */
+static int await_stamp(off_t offset, const char *what) {
+    uint64_t limit = now_ns() + 2000 * MS;
+    while (!get_stamp(offset)) {
+        if (now_ns() > limit) {
+            fail(what, 0);
+            return 1;
+        }
+        sleep_ns(1 * MS);
+    }
+    return 0;
+}
+
+/* S10: 50 SIGUSR1 to the child of rtbench-target, 5 ms apart. */
+static int kill_process(int spin, struct histogram *h) {
+    struct worker spinner;
+    pid_t pid = -1;
+    bursts = 0;
+    int error = clear_stamps() || spawn_child(&pid, "/boot/rtbench-target", 0, 0)
+            || await_stamp(STAMP_READY, "S10 target did not start");
+    if (error) return 1;
+    if (spin && start(&spinner, busy, BUSY_LEVEL, NULL)) return 1;
+    for (int i = 0; i < 50 && !error; i++) {
+        sleep_ns(2 * MS);
+        put_stamp(probe_fd, STAMP_HANDLER, 0);
+        uint64_t t0 = ticks();
+        if (kill(pid, SIGUSR1)) {
+            fail("S10 kill", errno);
+            error = 1;
+            break;
+        }
+        sleep_ns(3 * MS);
+        uint64_t at = get_stamp(STAMP_HANDLER);
+        if (at < t0) {
+            fail("S10 handler did not run", 0);
+            error = 1;
+        } else {
+            record(h, ticks_ns(at - t0));
+        }
+    }
+    if (spin) error |= finish(&spinner);
+    if (kill(pid, SIGTERM)) error = 1;
+    return error | (reaped(pid, 0, SIGTERM, "S10 target after SIGTERM") != 1);
+}
+
+/* S13 and the first half of S11: 20 children that stamp their main and end. */
+static int spawn_and_wait(void) {
+    for (int i = 0; i < 20; i++) {
+        pid_t pid = -1;
+        if (clear_stamps()) return 1;
+        uint64_t t0 = ticks();
+        if (spawn_child(&pid, "/boot/rtbench-quick", 0, 0)) return 1;
+        if (await_stamp(STAMP_MAIN, "S13 child did not start")) return 1;
+        record(&s13, ticks_ns(get_stamp(STAMP_MAIN) - t0));
+        for (int tries = 0;; tries++) {
+            uint64_t t1 = ticks();
+            int got = reaped(pid, WNOHANG, 0, "S11 waitpid");
+            uint64_t t2 = ticks();
+            if (got < 0) return 1;
+            if (got) {
+                record(&s11[0], ticks_ns(t2 - t1));
+                break;
+            }
+            if (tries > 200) {
+                fail("S11 zombie not ready", 0);
+                return 1;
+            }
+            sleep_ns(5 * MS);
+        }
+    }
+    return 0;
+}
+
+/* S11, the second half: from the stamp before the child's _exit to waitpid. */
+static int exit_to_wait(void) {
+    for (int i = 0; i < 20; i++) {
+        pid_t pid = -1;
+        if (clear_stamps() || spawn_child(&pid, "/boot/rtbench-exiter", 0, 0)) return 1;
+        int got = reaped(pid, 0, 0, "S11 waitpid of the exiter");
+        uint64_t t1 = ticks();
+        uint64_t stamp = get_stamp(STAMP_EXIT);
+        if (got != 1 || stamp == 0 || stamp > t1) {
+            fail("S11 exit stamp", 0);
+            return 1;
+        }
+        record(&s11[1], ticks_ns(t1 - stamp));
+    }
+    return 0;
+}
+
+/* S12: killpg to a group of GROUP children, until the last waitpid. */
+static int kill_group(void) {
+    static const char *const records[GROUP] = {
+        "/boot/rtbench-target", "/boot/rtbench-wait1", "/boot/rtbench-wait2", "/boot/rtbench-wait3",
+        "/boot/rtbench-wait4", "/boot/rtbench-wait5", "/boot/rtbench-wait6" };
+    pid_t pids[GROUP];
+    for (int round = 0; round < 5; round++) {
+        for (int i = 0; i < GROUP; i++)
+            if (spawn_child(&pids[i], records[i], POSIX_SPAWN_SETPGROUP, i ? pids[0] : 0)) return 1;
+        sleep_ns(100 * MS);
+        uint64_t t0 = ticks();
+        if (killpg(pids[0], SIGTERM)) {
+            fail("S12 killpg", errno);
+            return 1;
+        }
+        for (int i = 0; i < GROUP; i++) {
+            int status = -1;
+            pid_t got = waitpid(-pids[0], &status, 0);
+            if (got <= 0 || !WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
+                fail("S12 waitpid of a member", got < 0 ? errno : status);
+                return 1;
+            }
+        }
+        record(&s12, ticks_ns(ticks() - t0));
+    }
+    return 0;
+}
+
+static int processes(void) {
+    probe_fd = open("/tmp/probe", O_RDWR);
+    if (probe_fd < 0) {
+        fail("open /tmp/probe", errno);
+        return 1;
+    }
+    int error = rtbench_level(SENDER_LEVEL);
+    if (!error) error = kill_process(0, &s10[0]);
+    if (!error) error = kill_process(1, &s10[1]);
+    if (!error) error = spawn_and_wait();
+    if (!error) error = exit_to_wait();
+    if (!error) error = kill_group();
+    error |= rtbench_level(MAIN_LEVEL);
+    close(probe_fd);
+    return error;
+}
+
+/* The children: the program with a role as its first argument. */
+static volatile uint64_t handler_at;
+
+static void on_target(int signal) {
+    handler_at = ticks();
+    (void)signal;
+}
+
+static void sleep_forever(void) {
+    for (;;) {
+        struct timespec request = spec(10000 * MS), remaining;
+        nanosleep(&request, &remaining);
+    }
+}
+
+static int child(uint64_t entered, const char *role) {
+    int fd = open("/tmp/probe", O_WRONLY);
+    if (fd < 0) return 2;
+    if (strcmp(role, "quick") == 0) return put_stamp(fd, STAMP_MAIN, entered) ? 3 : 0;
+    if (strcmp(role, "exiter") == 0) {
+        put_stamp(fd, STAMP_EXIT, ticks());
+        _exit(0);
+    }
+    if (strcmp(role, "target") == 0) {
+        struct sigaction action = { .sa_handler = on_target, .sa_mask = 0, .sa_flags = 0 };
+        if (sigaction(SIGUSR1, &action, NULL) || put_stamp(fd, STAMP_READY, 1)) return 4;
+        for (;;) {
+            struct timespec request = spec(10000 * MS), remaining;
+            nanosleep(&request, &remaining);
+            uint64_t at = handler_at;
+            if (at) {
+                handler_at = 0;
+                put_stamp(fd, STAMP_HANDLER, at);
+            }
+        }
+    }
+    sleep_forever();
+    return 0;
+}
+
 /* --- the run ---------------------------------------------------------- */
 
 static int one_round(void) {
     return mutex_alone() || wake_idle() || futex_slow() || mutex_rivals() || heap_and_table() || signals() || read_ready()
-            || periodic_sleep() || service_round_trip();
+            || periodic_sleep() || service_round_trip() || processes();
 }
 
 static void report(void) {
@@ -671,7 +920,12 @@ static void report(void) {
     row("s8_futex_pair", &s8[0], 0);
     row("s8_futex_bucket_neighbour", &s8[1], 1);
     row("s9_service_round_trip", &s9, 1);
-    none("kill_through_service", "the process service sends no signals before 5b");
+    row("s10_kill_process_sleeping", &s10[0], 0);
+    row("s10_kill_process_busy_25", &s10[1], 0);
+    row("s11_waitpid_zombie", &s11[0], 0);
+    row("s11_exit_to_waitpid", &s11[1], 0);
+    row("s12_killpg_group_7", &s12, 0);
+    row("s13_spawn_to_main", &s13, 0);
     none("fork_exec_waitpid", "fork and exec come with 5c and 5d");
     none("timer_1ms", "POSIX timers come with 5h");
     none("inheritance_chain", "priority inheritance comes with 5h");
@@ -684,7 +938,9 @@ static void report(void) {
     say(&l);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    uint64_t entered = ticks();
+    if (argc > 1) return child(entered, argv[1]);
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
     struct line l = { .length = 0 };
     uint64_t seconds = rtbench_seconds();

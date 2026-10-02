@@ -9,14 +9,25 @@
 //! returns, and so does pthread_sigmask that unblocks a pending signal,
 //! with no call of the kernel. An entry inside a critical section of the
 //! layer only marks itself deferred; the end of the section delivers it.
-//! Real-time queues, process routing, stop/continue, alternate stacks and
-//! automatic syscall restart still require implementation.
+//!
+//! Signals sent to the process (kill) wait on the page of the process's
+//! record, where the process service sets their bits and asks for the
+//! entry of the router, the main thread (spec 2, 3.3). The thread that
+//! takes one is chosen late, when a thread looks at the page (`route`):
+//! one in sigwait for that signal, else the first in the table of threads
+//! whose mask lets it through; with none the signal stays on the page, and
+//! pthread_sigmask that unblocks it, sigsuspend and sigwait look again.
+//! The page also says which signals the process ignores and catches and
+//! the flags of SIGCHLD (`publish`). Real-time queues, stop/continue,
+//! alternate stacks and automatic syscall restart still require
+//! implementation.
 use crate::{constants::*, threads};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
+use posix_types::constants::{SA_NOCLDSTOP, SA_NOCLDWAIT};
 pub use posix_types::{SigAction, SigInfo, SigSet};
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
@@ -51,7 +62,258 @@ fn actions<R>(f: impl FnOnce(&mut posix_signals::Actions) -> R) -> R {
         words[2].store(u64::from(action.flags as u32), Ordering::Relaxed);
     }
     GENERATION.fetch_add(1, Ordering::SeqCst);
+    publish(table);
     result
+}
+
+/// Tells the process service through the record's page which signals the
+/// actions of `table` ignore and catch, and SA_NOCLDWAIT, SA_NOCLDSTOP and
+/// SIG_IGN of SIGCHLD. The service reads them as hints: it drops a signal
+/// the process ignores, keeps no zombie for SA_NOCLDWAIT or SIG_IGN, and
+/// refuses the stops nobody handles.
+fn publish(table: &posix_signals::Actions) {
+    let page = crate::process::page();
+    let (mut ignored, mut caught) = (0, 0);
+    // SIG_IGN alone: a signal ignored by default stays for sigwait while
+    // it is blocked, and the entry drops it otherwise.
+    for signal in 1..=31 {
+        let action = table.get(signal).expect("a signal of the table");
+        let bit = posix_signals::bit(signal).expect("a signal of the table");
+        if action.handler == IGNORE {
+            ignored |= bit;
+        } else if action.handler != DEFAULT {
+            caught |= bit;
+        }
+    }
+    let child = table.get(SIGCHLD).expect("SIGCHLD");
+    let mut flags = 0;
+    if child.flags & SA_NOCLDWAIT != 0 {
+        flags |= proto_process::PAGE_NOCLDWAIT;
+    }
+    if child.flags & SA_NOCLDSTOP != 0 {
+        flags |= proto_process::PAGE_NOCLDSTOP;
+    }
+    if child.handler == IGNORE {
+        flags |= proto_process::PAGE_CHLD_IGNORED;
+    }
+    page.ignored.store(ignored, Ordering::Release);
+    page.caught.store(caught, Ordering::Release);
+    page.flags.store(flags, Ordering::Release);
+}
+
+/// Publishes the initial actions on the page (`publish`), at the start
+/// of the process.
+pub(crate) fn publish_initial() {
+    // The signals the parent ignored stay ignored in a spawned child
+    // ([P24-SPAWN]): the service put them on the page.
+    let inherited = crate::process::page().ignored.load(Ordering::Acquire);
+    actions(|table| {
+        for signal in 1..=31 {
+            let bit = posix_signals::bit(signal).expect("a signal of the table");
+            if inherited & bit != 0 && posix_signals::UNBLOCKABLE & bit == 0 {
+                let ignore = SigAction {
+                    handler: IGNORE,
+                    mask: 0,
+                    flags: 0,
+                };
+                let _ = table.replace(signal, ignore);
+            }
+        }
+    });
+}
+
+/// The sender's information of each process signal a thread took from the
+/// page and has pending (Block::process): the service keeps one sending of
+/// a signal on the page, so one slot a signal serves the process.
+struct Taken {
+    code: AtomicU64,
+    from: AtomicU64,
+    status: AtomicU64,
+}
+static TAKEN: [Taken; 31] = [const {
+    Taken {
+        code: AtomicU64::new(0),
+        from: AtomicU64::new(0),
+        status: AtomicU64::new(0),
+    }
+}; 31];
+
+/// The information of process signal `signal` on the page, read again
+/// until the bit stayed while it was read (the service writes it before
+/// the bit).
+fn page_info(signal: i32) -> Option<SigInfo> {
+    let page = crate::process::page();
+    let bit = posix_signals::bit(signal).ok()?;
+    let slot = &page.info[signal as usize - 1];
+    loop {
+        let before = page.pending.load(Ordering::Acquire);
+        if before & bit == 0 {
+            return None;
+        }
+        let info = SigInfo {
+            si_signo: signal,
+            si_errno: 0,
+            si_code: slot.code.load(Ordering::Acquire),
+            si_pid: slot.pid.load(Ordering::Acquire) as i32,
+            si_uid: slot.uid.load(Ordering::Acquire),
+            si_status: slot.status.load(Ordering::Acquire),
+            si_addr: 0,
+            si_value: 0,
+        };
+        if page.pending.load(Ordering::Acquire) == before {
+            return Some(info);
+        }
+    }
+}
+
+/// Keeps `info` of a process signal a thread took (`TAKEN`).
+fn keep_taken(signal: i32, info: &SigInfo) {
+    let slot = &TAKEN[signal as usize - 1];
+    slot.code
+        .store(info.si_code as u32 as u64, Ordering::Relaxed);
+    slot.from.store(
+        u64::from(info.si_pid as u32) | u64::from(info.si_uid) << 32,
+        Ordering::Relaxed,
+    );
+    slot.status
+        .store(info.si_status as u32 as u64, Ordering::Release);
+}
+
+/// The information `keep_taken` kept for `signal`.
+fn taken(signal: i32) -> SigInfo {
+    let slot = &TAKEN[signal as usize - 1];
+    let from = slot.from.load(Ordering::Acquire);
+    SigInfo {
+        si_signo: signal,
+        si_errno: 0,
+        si_code: slot.code.load(Ordering::Acquire) as u32 as i32,
+        si_pid: from as u32 as i32,
+        si_uid: (from >> 32) as u32,
+        si_status: slot.status.load(Ordering::Acquire) as u32 as i32,
+        si_addr: 0,
+        si_value: 0,
+    }
+}
+
+/// Puts the process signals of `bits` that `block` holds back on the page
+/// with their information, and routes them anew: the thread blocked them
+/// or leaves.
+fn give_back(block: &Block, bits: u64) {
+    let page = crate::process::page();
+    let back = block.process.fetch_and(!bits, Ordering::SeqCst) & bits;
+    let back = block.pending.fetch_and(!back, Ordering::SeqCst) & back;
+    if back == 0 {
+        return;
+    }
+    let mut rest = back;
+    while rest != 0 {
+        let bit = rest.isolate_lowest_one();
+        rest &= !bit;
+        let signal = bit.trailing_zeros() as i32 + 1;
+        let info = taken(signal);
+        let slot = &page.info[signal as usize - 1];
+        if page.pending.load(Ordering::Acquire) & bit == 0 {
+            slot.code.store(info.si_code, Ordering::Relaxed);
+            slot.pid.store(info.si_pid as u32, Ordering::Relaxed);
+            slot.uid.store(info.si_uid, Ordering::Relaxed);
+            slot.status.store(info.si_status, Ordering::Relaxed);
+        }
+        page.pending.fetch_or(bit, Ordering::Release);
+    }
+    route();
+}
+
+/// Takes the signals that wait on the process's page to threads (spec 2,
+/// 3.3), lowest first: a thread in sigwait for one is woken and takes it
+/// from the page itself, with its information; else the first live thread
+/// in the table whose mask lets it through gets it as its own pending
+/// signal with its information (`TAKEN`), under the lock of the table, so
+/// that the thread neither blocks it nor leaves meanwhile (each gives it
+/// back then, `give_back`); its entry is asked for unless it is the
+/// caller, which delivers after. A signal no thread takes stays on the
+/// page.
+pub(crate) fn route() {
+    let page = crate::process::page();
+    let mut pending = page.pending.load(Ordering::Acquire);
+    let own = own() as *const Block;
+    while pending != 0 {
+        let bit = pending.isolate_lowest_one();
+        pending &= !bit;
+        let signal = bit.trailing_zeros() as i32 + 1;
+        let mut waiter = None;
+        threads::each_block(|block| {
+            if waiter.is_none()
+                && block.end.load(Ordering::SeqCst) == 0
+                && block.flags.load(Ordering::SeqCst) & flag::SIGNAL_WAIT != 0
+                && block.wait_set.load(Ordering::SeqCst) & bit != 0
+            {
+                waiter = Some(block.channel.load(Ordering::Relaxed));
+            }
+        });
+        if let Some(channel) = waiter {
+            let channel = Handle::<Channel>::borrowed(rt::abi::Handle(channel));
+            let _ = sys::notify(&channel, posix_sync::bit::WAKE);
+            continue;
+        }
+        let mut entry = None;
+        threads::each_block(|block| {
+            if entry.is_some()
+                || block.end.load(Ordering::SeqCst) != 0
+                || block.flags.load(Ordering::SeqCst) & flag::EXITING != 0
+                || block.mask.load(Ordering::SeqCst) & bit != 0
+            {
+                return;
+            }
+            let Some(info) = page_info(signal) else {
+                entry = Some(None);
+                return;
+            };
+            if page.pending.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+                // Another thread took it meanwhile.
+                entry = Some(None);
+                return;
+            }
+            keep_taken(signal, &info);
+            block.process.fetch_or(bit, Ordering::SeqCst);
+            block.pending.fetch_or(bit, Ordering::SeqCst);
+            entry =
+                Some((!core::ptr::eq(block, own)).then(|| block.thread.load(Ordering::Relaxed)));
+        });
+        if let Some(Some(thread)) = entry {
+            let native = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(thread));
+            let _ = sys::thread_upcall_request(&native);
+        }
+    }
+}
+
+/// Takes `signal` from the process's page for a thread in sigwait: its
+/// information, or None when it no longer waits there.
+fn take_from_page(signal: i32) -> Option<SigInfo> {
+    let page = crate::process::page();
+    let bit = posix_signals::bit(signal).ok()?;
+    let info = page_info(signal)?;
+    (page.pending.fetch_and(!bit, Ordering::AcqRel) & bit != 0).then_some(info)
+}
+
+/// The process signals that wait on the page come to the threads that let
+/// them through, the caller first: once the main thread is attached, for
+/// a signal that came before (its router's entry was not bound yet).
+pub fn take_waiting() {
+    // The main thread starts with the mask of the thread whose posix_spawn
+    // made the process ([P24-SPAWN]).
+    let mask = crate::process::page().start_mask.load(Ordering::Acquire);
+    own().mask.store(
+        mask & posix_signals::VALID & !posix_signals::UNBLOCKABLE,
+        Ordering::SeqCst,
+    );
+    route();
+    deliver_now();
+}
+
+/// The calling thread leaves: the process signals it holds go back to the
+/// page for the other threads.
+pub fn leaving() {
+    give_back(own(), u64::MAX);
 }
 
 /// The action of valid `signal` without the lock: a copy that no writer
@@ -128,16 +390,28 @@ pub fn pthread_sigmask(how: i32, set: Option<SigSet>) -> Result<SigSet, i32> {
             _ => return Err(EINVAL),
         };
         block.mask.store(mask, Ordering::SeqCst);
+        // A process signal this thread holds and blocks now goes back to
+        // the page for a thread that lets it through.
+        if block.process.load(Ordering::SeqCst) & mask != 0 {
+            give_back(block, mask);
+        }
+        // A process signal this thread lets through now comes to it.
+        if crate::process::page().pending.load(Ordering::Acquire) & !mask != 0 {
+            route();
+        }
         if block.pending.load(Ordering::SeqCst) & !mask != 0 {
             deliver_now();
         }
     }
     Ok(before)
 }
-/// The calling thread's pending signals that its mask holds back.
+/// The calling thread's pending signals that its mask holds back, and the
+/// process's.
 pub fn sigpending() -> SigSet {
     let block = own();
-    block.pending.load(Ordering::SeqCst) & block.mask.load(Ordering::SeqCst)
+    let pending = block.pending.load(Ordering::SeqCst)
+        | crate::process::page().pending.load(Ordering::Acquire);
+    pending & block.mask.load(Ordering::SeqCst)
 }
 /// Sends `bit` with its `action` (none for signal 0) to the thread of
 /// `block` and `native`: the bit in its block, then a wake of its sigwait
@@ -223,6 +497,7 @@ pub fn suspend(mask: SigSet) -> i32 {
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     loop {
+        route();
         if block.pending.load(Ordering::SeqCst) & !mask != 0 {
             deliver_now();
             break;
@@ -263,17 +538,31 @@ pub fn raise(signal: i32) -> Result<(), i32> {
 /// EAGAIN once the deadline passed, EINVAL for a bad set or timeout. A
 /// caught signal or an interrupt resumes the wait; cancellation ends it at
 /// the point (EINTR to the caller, which terminates).
-fn wait(set: SigSet, timeout: Option<posix_types::Timespec>, start: u64) -> Result<i32, i32> {
+fn wait(
+    set: SigSet,
+    timeout: Option<posix_types::Timespec>,
+    start: u64,
+) -> Result<(i32, SigInfo), i32> {
     let block = own();
     let set = posix_signals::mask(set).map_err(|_| EINVAL)?;
     if set & !block.mask.load(Ordering::SeqCst) != 0 {
         return Err(EINVAL);
     }
+    // The thread's own signals first, then the process's on the page, with
+    // their information.
     let take = || loop {
         let pending = block.pending.load(Ordering::SeqCst);
         let eligible = pending & set;
         if eligible == 0 {
-            return None;
+            let process = crate::process::page().pending.load(Ordering::Acquire) & set;
+            if process == 0 {
+                return None;
+            }
+            let signal = process.trailing_zeros() as i32 + 1;
+            match take_from_page(signal) {
+                Some(info) => return Some((signal, info)),
+                None => continue,
+            }
         }
         let bit = eligible.isolate_lowest_one();
         if block
@@ -281,7 +570,14 @@ fn wait(set: SigSet, timeout: Option<posix_types::Timespec>, start: u64) -> Resu
             .compare_exchange(pending, pending & !bit, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            return Some(bit.trailing_zeros() as i32 + 1);
+            let signal = bit.trailing_zeros() as i32 + 1;
+            let from_process = block.process.fetch_and(!bit, Ordering::SeqCst) & bit != 0;
+            let info = if from_process {
+                taken(signal)
+            } else {
+                SigInfo::thread(signal)
+            };
+            return Some((signal, info));
         }
     };
     block.wait_set.store(set, Ordering::SeqCst);
@@ -361,10 +657,11 @@ pub fn sigtimedwait(
 ) -> Result<i32, i32> {
     let point = threads::cancel::Point::begin();
     let start = rt::time::ticks_to_ns(rt::time::now());
-    let result = wait(set, timeout, start).inspect(|&signal| {
+    let result = wait(set, timeout, start).map(|(signal, taken)| {
         if let Some(info) = info {
-            *info = SigInfo::thread(signal);
+            *info = taken;
         }
+        signal
     });
     point.finish();
     result
@@ -436,7 +733,7 @@ fn next_wants_context(block: &Block) -> bool {
 
 /// Takes the lowest pending signal of `block` that its mask lets through,
 /// with its action (SA_RESETHAND applied); ignored ones go.
-fn take(block: &Block) -> Option<(i32, SigAction)> {
+fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>)> {
     loop {
         let pending = block.pending.load(Ordering::SeqCst);
         let eligible = pending & !block.mask.load(Ordering::SeqCst);
@@ -452,6 +749,8 @@ fn take(block: &Block) -> Option<(i32, SigAction)> {
             continue;
         }
         let signal = bit.trailing_zeros() as i32 + 1;
+        let from_process =
+            (block.process.fetch_and(!bit, Ordering::SeqCst) & bit != 0).then(|| taken(signal));
         // Read without the lock; SA_RESETHAND alone writes, under it.
         let read = action(signal);
         let action = if ignored(signal, &read) {
@@ -473,7 +772,7 @@ fn take(block: &Block) -> Option<(i32, SigAction)> {
             Some(read)
         };
         if let Some(action) = action {
-            return Some((signal, action));
+            return Some((signal, action, from_process));
         }
     }
 }
@@ -484,6 +783,8 @@ fn take(block: &Block) -> Option<(i32, SigAction)> {
 /// no call. `native` is the entry's frame, or null for a direct delivery,
 /// which leaves a handler with SA_SIGINFO to the thread's entry.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    // The process's signals first: one of them may be this thread's.
+    route();
     let block = own();
     // A wait by address of this thread ends before the first handler, and
     // before the lock of the actions, whose wait uses the same block
@@ -512,7 +813,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             let _ = sys::thread_upcall_request(&thread);
             break;
         }
-        let Some((signal, action)) = take(block) else {
+        let Some((signal, action, from_process)) = take(block) else {
             break;
         };
         let handler = action.handler;
@@ -520,7 +821,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             block.flags.fetch_or(flag::NO_RESTART, Ordering::SeqCst);
         }
         if handler == DEFAULT {
-            // Process wait-status encoding and stop/continue need process routing.
+            // Stop and continue need process routing (5e).
             sys_exit_signal(signal);
         }
         let mut mask = old_mask | action.mask;
@@ -535,7 +836,13 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             // SAFETY: the context-aware trampoline owns this unique live frame.
             let frame = unsafe { native.read() };
             let mut context = LinuxContext::new(&frame, old_mask);
-            let mut info = LinuxSigInfo::thread(signal);
+            // A signal of the process carries its sender's information
+            // (XSH 2.4.3): SI_USER with the PID and UID, or SIGCHLD's code
+            // and status.
+            let mut info = match from_process {
+                Some(taken) => LinuxSigInfo::process(&taken),
+                None => LinuxSigInfo::thread(signal),
+            };
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
             let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
                 unsafe { core::mem::transmute(handler as usize) };
@@ -591,6 +898,22 @@ const _: () = assert!(core::mem::size_of::<LinuxSigInfo>() == 128);
 pub const SI_TKILL: i32 = -6;
 
 impl LinuxSigInfo {
+    /// The information of a signal of the process (kill, SIGCHLD): the
+    /// code, the sender's PID and UID, and the status after them, where
+    /// Linux keeps SIGCHLD's.
+    pub const fn process(info: &SigInfo) -> Self {
+        Self {
+            signo: info.si_signo,
+            errno: 0,
+            code: info.si_code,
+            pad: 0,
+            pid: info.si_pid,
+            uid: info.si_uid,
+            value: info.si_status as u32 as u64,
+            rest: [0; 96],
+        }
+    }
+
     /// The information of `signal` sent by pthread_kill or raise.
     pub const fn thread(signal: i32) -> Self {
         Self {
@@ -690,8 +1013,11 @@ impl LinuxContext {
     }
 }
 
+/// The death of the process by `signal`: the code `0x100 | signal`, which
+/// `_exit` never gives (it keeps 8 bits), so that the process service reads
+/// WIFSIGNALED from the kernel's reason (proto_process::End).
 fn sys_exit_signal(signal: i32) -> ! {
-    rt::sys::process_exit((128 + signal) as u64)
+    rt::sys::process_exit(0x100 | signal as u64)
 }
 
 /// Runs `run` holding the lock of the actions, which a delivery takes to

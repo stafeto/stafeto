@@ -348,6 +348,22 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-hello", "relibc-hello", POSIX_STACK_SIZE, &[]),
 ];
+/// The probe of POSIX processes (5b) and the services it needs: the same
+/// program a second time with a stack of 32 MiB, which the 15 pages of
+/// quota of its record cannot map (procs-big).
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["children-max-4"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    ("posix-procs-big", "posix-procs", 32 * 1024 * 1024, &[]),
+];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
@@ -830,6 +846,8 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  posix-procs run the C probe of POSIX processes: posix_spawn from the
+            boot image through the process service
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -880,6 +898,7 @@ fn main() {
         Some("os-test") => ostest::run_in_budget(),
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
+        Some("posix-procs") => posix_procs_probe(),
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
@@ -1485,6 +1504,11 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(&output, "posix-thread-probe: ok")?;
         qemu::expect_marker(
             &output,
+            "credential-probe: a forged identity does not set the clock",
+        )?;
+        qemu::expect_marker(&output, "posix-sender: nobody may not set the clock")?;
+        qemu::expect_marker(
+            &output,
             "priority-probe: heap and files at the ceiling above main, no helper thread",
         )?;
         qemu::expect_marker(&output, "posix-process: adoption refusals ok")
@@ -1748,13 +1772,14 @@ fn relibc_hello_probe() -> Result<(), String> {
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    // The four runs end in any order: the program, then abort, a failed
-    // assert and a panic of relibc, each with SIGABRT's status.
+    // The four runs end in any order: the program, then abort and a failed
+    // assert, which die by SIGABRT, and a panic of relibc, which exits
+    // with 134 itself.
     let ended = (|| {
         for line in [
             "init: relibc-hello ended: exit code 0, not restarted",
-            "init: relibc-abort ended: exit code 134, not restarted",
-            "init: relibc-assert ended: exit code 134, not restarted",
+            "init: relibc-abort ended: signal 6 (SIGABRT), not restarted",
+            "init: relibc-assert ended: signal 6 (SIGABRT), not restarted",
             "init: relibc-panic ended: exit code 134, not restarted",
         ] {
             run.expect_seen(line, BOOT_TIMEOUT)?;
@@ -1777,6 +1802,71 @@ fn relibc_hello_probe() -> Result<(), String> {
         qemu::expect_marker(&outcome, marker)?;
     }
     println!("relibc C-program guest probe passed");
+    Ok(())
+}
+
+/// The probe of POSIX processes (tests/posix-procs): its checks pass, its
+/// child says the PID the parent's posix_spawn gave and the parent's PID,
+/// and the child that did not load got no process.
+fn posix_procs_probe() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    // The parent and its child end in either order.
+    let ended = (|| {
+        for line in [
+            "init: posix-procs ended: exit code 0, not restarted",
+            "init: procs-child ended: exit code 0, not restarted",
+            "init: procs-big did not load: no process of the process service, not restarted",
+            "init: procs-exit7 ended: exit code 7, not restarted",
+            "init: procs-middle ended: exit code 0, not restarted",
+            "init: procs-orphan ended: exit code 0, not restarted",
+            "init: procs-sleeper ended: signal 15 (SIGTERM), not restarted",
+            "init: procs-block ended: killed, not restarted",
+            "init: procs-catch ended: exit code 42, not restarted",
+            "init: procs-catch ended: signal 15 (SIGTERM), not restarted",
+            "init: procs-sleep2 ended: signal 15 (SIGTERM), not restarted",
+            "init: procs-ids ended: exit code 0, not restarted",
+        ] {
+            run.expect_seen(line, BOOT_TIMEOUT)?;
+        }
+        Ok::<(), String>(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    ended?;
+    qemu::expect_marker(&outcome, "posix-procs: ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
+    for marker in [
+        "posix-procs: a child inherits the mask and SIG_IGN",
+        "posix-procs: a thread took SIGUSR1 after main left",
+        "posix-procs: the last thread ran atexit",
+    ] {
+        qemu::expect_marker(&outcome, marker)?;
+    }
+    let number = |prefix: &str| -> Result<Vec<i64>, String> {
+        let line = outcome
+            .lines
+            .iter()
+            .find_map(|l| l.trim_end().strip_prefix(prefix))
+            .ok_or_else(|| format!("no line {prefix:?}"))?;
+        line.split(|c: char| !c.is_ascii_digit())
+            .filter(|w| !w.is_empty())
+            .map(|w| w.parse().map_err(|e| format!("{line:?}: {e}")))
+            .collect()
+    };
+    let parent = number("posix-procs: parent ")?;
+    let child = number("posix-procs: child ")?;
+    // "parent P spawned C" and "child C of P".
+    if parent.len() != 2 || child != [parent[1], parent[0]] || parent[0] < 256 {
+        return Err(format!(
+            "the child says {child:?}, the parent {parent:?}: no child of that parent"
+        ));
+    }
+    println!("C POSIX process probe passed: posix_spawn from the boot image");
     Ok(())
 }
 
@@ -2014,6 +2104,7 @@ fn test() -> Result<(), String> {
     posix_abi_probe()?;
     relibc_hello_probe()?;
     relibc_threads_probe(&qemu::VIRT)?;
+    posix_procs_probe()?;
     // BusyBox on relibc guards the C surface (5a′).
     busybox_probe()?;
     ash_probe()?;
@@ -3852,6 +3943,8 @@ fn ci() -> Result<(), String> {
         "relibc-hello",
         "--package",
         "relibc-threads",
+        "--package",
+        "posix-procs",
         "--target",
         PROGRAM_TARGET,
         "--",

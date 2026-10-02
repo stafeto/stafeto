@@ -27,12 +27,13 @@ use bootimg::Program;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use init::table::{Gate, MAX_DMA, Record, TABLE};
+use init::table::{BOOT_IMAGE, Gate, MAX_DMA, PROCESS_SERVICE, Record, TABLE};
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
 use proto_wire::Writer;
 use rt::handle::{Channel, Memory, Process, Resource, Thread};
 use rt::loader::{self, SpawnParams, Spawned};
+use rt::startup::Giver;
 use rt::{Handle, Stack, mmio, sys};
 
 /// Where the worker maps the objects of a program it loads, in init's
@@ -56,6 +57,7 @@ enum Order {
         place: usize,
         label: u64,
         program: Program<'static>,
+        quota: u64,
     },
     /// Stop the device of the record at `place`, then close the handles
     /// of the instance in the cell's `gone`.
@@ -112,15 +114,16 @@ static CELL: Cell = Cell {
 };
 
 /// The values of the handles the worker uses: init's process, init's
-/// channel, the system resource, the worker's channel and its copy of
-/// init's channel. The main thread keeps the first four for good; the
-/// worker owns the last.
-static HANDLES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// channel, the system resource, the worker's channel, its copy of init's
+/// channel and the boot image. The main thread keeps the first four for
+/// good; the worker owns the last two.
+static HANDLES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 const OWN: usize = 0;
 const CHANNEL: usize = 1;
 const RESOURCE: usize = 2;
 const WAKE: usize = 3;
 const TELL: usize = 4;
+const BOOT: usize = 5;
 
 fn view<K>(i: usize) -> ManuallyDrop<Handle<K>> {
     Handle::borrowed(abi::Handle(HANDLES[i].load(Ordering::Relaxed)))
@@ -139,14 +142,16 @@ impl Worker {
     /// 13.4): it loads through `channel`, init's channel, gives copies of
     /// `resource` as consoles, waits on a channel of its own whose slot of
     /// label 0 is at WORKER_IDLE, so a wake lifts it no higher, and tells
-    /// the main thread through a copy of `channel` with NOTIFY and `label`.
-    /// BAD_STATE once a worker started: the cell is one; the other errors
-    /// are those of the calls.
+    /// the main thread through a copy of `channel` with NOTIFY and `label`;
+    /// it keeps `boot`, the boot image, for the start data of the process
+    /// service. BAD_STATE once a worker started: the cell is one; the
+    /// other errors are those of the calls.
     pub fn start(
         own: &Handle<Process>,
         channel: &Handle<Channel>,
         resource: &Handle<Resource>,
         label: u64,
+        boot: Handle<Memory>,
     ) -> Result<Worker, Error> {
         if STARTED.swap(true, Ordering::AcqRel) {
             return Err(Error::BadState);
@@ -159,6 +164,7 @@ impl Worker {
             (RESOURCE, resource.raw()),
             (WAKE, wake.raw()),
             (TELL, tell.into_raw()),
+            (BOOT, boot.into_raw()),
         ] {
             HANDLES[i].store(raw.0, Ordering::Relaxed);
         }
@@ -185,12 +191,20 @@ impl Worker {
     }
 
     /// Gives the worker the load of an instance of the record at `place`
-    /// from `program`, named by `label` on init's channel (`give`).
-    pub fn load(&self, place: usize, label: u64, program: Program<'static>) -> Result<(), Error> {
+    /// from `program` with `quota` bytes, named by `label` on init's
+    /// channel (`give`).
+    pub fn load(
+        &self,
+        place: usize,
+        label: u64,
+        program: Program<'static>,
+        quota: u64,
+    ) -> Result<(), Error> {
         let order = Order::Load {
             place,
             label,
             program,
+            quota,
         };
         self.give(order, None)
     }
@@ -273,7 +287,8 @@ extern "C" fn work(_: u64) -> ! {
                 place,
                 label,
                 program,
-            } => Some(load(&TABLE[place], label, &program)),
+                quota,
+            } => Some(load(&TABLE[place], label, &program, quota)),
             Order::Teardown { place } => {
                 // The handles close here, the cleanup at the worker's level,
                 // once the device stopped.
@@ -305,18 +320,18 @@ extern "C" fn work(_: u64) -> ! {
 }
 
 /// Loads an instance of `record` from `program` with the label `label` on
-/// init's channel (rt::loader::spawn): its quota, room for handles,
-/// ceiling and priority from the record, the notification of its end at
-/// its base priority (spec 13.4), and its start data (`start_data`). An
-/// instance whose start data could not be made is killed; its thread never
-/// ran.
-fn load(record: &Record, label: u64, program: &Program<'static>) -> Loaded {
+/// init's channel (rt::loader::spawn): `quota` (the record's, and more for
+/// the process service, serve.rs), room for handles, ceiling and priority
+/// from the record, the notification of its end at its base priority
+/// (spec 13.4), and its start data (`start_data`). An instance whose start
+/// data could not be made is killed; its thread never ran.
+fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> Loaded {
     let channel = view::<Channel>(CHANNEL);
     let params = SpawnParams {
         channel: &channel,
         label,
         notice: record.priority,
-        quota: record.quota,
+        quota,
         handle_limit: record.handle_limit,
         ceiling: record.ceiling,
         priority: record.priority,
@@ -334,30 +349,23 @@ fn load(record: &Record, label: u64, program: &Program<'static>) -> Loaded {
 }
 
 /// The start data of an instance of `record` besides its process and
-/// thread (spec 13.3): copies of the system resource with DEBUG and
-/// TRANSFER under the name `console` and with KSTATS and TRANSFER under
-/// the name `log` when the record has them; a copy of each of its DMA
-/// objects, made here (`dma`), under its name; and the arguments,
-/// ServiceArgs with the heartbeat and watchdog of a service (0 for a
-/// client) and the own arguments: the physical address of each DMA
-/// object, 8 bytes little-endian, then the record's. Returns init's own
+/// thread (spec 13.3): the copies of the system resource of `resources`;
+/// a copy of each of its DMA objects, made here (`dma`), under its name;
+/// the boot image, read-only, for the process service (BOOT_IMAGE); and
+/// the arguments (`set_args`) with the physical address of each DMA
+/// object, 8 bytes little-endian, before the record's. Returns init's own
 /// handles to the DMA objects.
 fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
-    for (wanted, name, right) in [
-        (record.console, "console", Rights::DEBUG),
-        (record.log, "log", Rights::KSTATS),
-        (record.trace, "trace", Rights::KSTATS),
-    ] {
-        if wanted {
-            let copy =
-                sys::handle_duplicate(&view::<Resource>(RESOURCE), right | Rights::TRANSFER)?;
-            // The third and fourth names of the start data fit.
-            let _ = spawned.giver.give(name, copy.erase());
-        }
+    let resource = view::<Resource>(RESOURCE);
+    resources(record, &mut spawned.giver, &resource)?;
+    if record.name == PROCESS_SERVICE {
+        let image =
+            sys::handle_duplicate(&view::<Memory>(BOOT), Rights::MAP_READ | Rights::TRANSFER)?;
+        // The checks of the table keep the name apart from the others.
+        let _ = spawned.giver.give(BOOT_IMAGE, image.erase());
     }
     let mut own = [0; OWN_ARGS_MAX];
     let mut kept: Kept = [const { None }; MAX_DMA];
-    let resource = view::<Resource>(RESOURCE);
     for (i, d) in record.dma.iter().enumerate() {
         let (object, pa) = sys::mem_create_contiguous(d.size, d.uncached, &resource)?;
         let rights = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER;
@@ -368,9 +376,43 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
         own[8 * i..8 * i + 8].copy_from_slice(&pa.to_le_bytes());
         kept[i] = Some(object);
     }
+    set_args(record, &mut spawned.giver, &own[..8 * record.dma.len()])?;
+    Ok(kept)
+}
+
+/// Copies of `resource`, the system resource, in `giver` for `record`:
+/// with DEBUG and TRANSFER under the name `console`, with KSTATS and
+/// TRANSFER under `log` and `trace`, when the record has them. The main
+/// thread makes them for a POSIX process (serve.rs), the worker for the
+/// others.
+pub fn resources(
+    record: &Record,
+    giver: &mut Giver,
+    resource: &Handle<Resource>,
+) -> Result<(), Error> {
+    for (wanted, name, right) in [
+        (record.console, "console", Rights::DEBUG),
+        (record.log, "log", Rights::KSTATS),
+        (record.trace, "trace", Rights::KSTATS),
+    ] {
+        if wanted {
+            let copy = sys::handle_duplicate(resource, right | Rights::TRANSFER)?;
+            // The names of the start data fit the giver (NAMES_MAX).
+            let _ = giver.give(name, copy.erase());
+        }
+    }
+    Ok(())
+}
+
+/// The arguments of `record` in `giver`: ServiceArgs with the heartbeat
+/// and watchdog of a service (0 for a client) and the own arguments,
+/// `first` and then the record's.
+pub fn set_args(record: &Record, giver: &mut Giver, first: &[u8]) -> Result<(), Error> {
+    let mut own = [0; OWN_ARGS_MAX];
     // The checks of the table keep the own arguments within OWN_ARGS_MAX.
-    let len = 8 * record.dma.len() + record.args.len();
-    own[8 * record.dma.len()..len].copy_from_slice(record.args);
+    let len = first.len() + record.args.len();
+    own[..first.len()].copy_from_slice(first);
+    own[first.len()..len].copy_from_slice(record.args);
     let watch = record.watch();
     let args = ServiceArgs {
         period_ns: watch.map_or(0, |w| w.period_ns),
@@ -379,8 +421,7 @@ fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
     };
     let mut w = Writer::new();
     args.write(&mut w).map_err(|_| Error::InvalidArgs)?;
-    spawned.giver.set_args(w.as_bytes())?;
-    Ok(kept)
+    giver.set_args(w.as_bytes())
 }
 
 /// Reads of a register a stopping write wrote, at most, until it shows

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Test relay: obtains clock readings in a different process.
+//! Test relay: obtains clock readings in a different process, and speaks
+//! to the process service through sessions it holds.
 #![no_std]
 #![no_main]
 use posix_clock::Client;
@@ -43,16 +44,60 @@ fn main(_: u64) -> u64 {
         }),
     };
     rt::println!("clock-peer: ready");
-    let _ = rt::service::run::<Relay, 2, 0>(&channel, &mut Relay { clock, process }, config);
+    let _ = rt::service::run::<Relay, 2, 0>(
+        &channel,
+        &mut Relay {
+            clock,
+            process,
+            kept: None,
+        },
+        config,
+    );
     5
 }
+/// The relay: method 8 queries its own record, 9 sends Create through its
+/// session, 10 keeps a session another process gave it, 11 queries
+/// through that session (BAD_STATE before one came).
 struct Relay {
     clock: Client,
     process: process_client::Client,
+    kept: Option<process_client::Client>,
+}
+
+/// Create through `session` with `start` as its start channel: the
+/// service's status.
+fn create(
+    session: &rt::handle::Handle<rt::handle::Channel>,
+    start: rt::handle::Handle<rt::handle::Any>,
+) -> Status {
+    let mut w = proto_wire::Writer::new();
+    let body = proto_process::Create {
+        quota: 64 * 1024,
+        handle_limit: 16,
+        ceiling: 30,
+        priority: 30,
+        root: true,
+        parent: 0,
+    };
+    if proto_process::Method::Create
+        .header()
+        .write(&mut w)
+        .is_err()
+        || body.write(&mut w).is_err()
+    {
+        return Status::BadSize;
+    }
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    match sys::send_handles(session, w.as_bytes(), [start]) {
+        Ok(reply) => proto_wire::Reader::new(reply.bytes(&mut buffer))
+            .u32()
+            .map_or(Status::BadSize, Status::from_code),
+        Err(refused) => Status::Kernel(refused.error),
+    }
 }
 impl Service<0> for Relay {
     const VERSION: u16 = proto_clock::VERSION;
-    const METHODS: &'static [u16] = &[proto_clock::Method::Get as u16, 8, 9];
+    const METHODS: &'static [u16] = &[proto_clock::Method::Get as u16, 8, 9, 10, 11];
     type Data = ();
     fn request(&mut self, _: &mut Session<(), 0>, r: &mut Request<'_>) -> Answer {
         if r.method() == 8 {
@@ -77,16 +122,32 @@ impl Service<0> for Relay {
             if r.handles.len() != 1 || r.body().finish().is_err() {
                 return Answer::Status(Status::BadSize);
             }
-            let Ok(foreign) = r.handles.take::<rt::handle::Process>(0) else {
+            let Ok(foreign) = r.handles.take_any(0) else {
                 return Answer::Status(Status::BadSize);
             };
-            // Create through its own session, which the service refuses:
-            // only init holds the channel with no label.
-            return Answer::Status(
-                self.process
-                    .create(&foreign, true)
-                    .map_or_else(|error| error, |_| Status::Ok),
-            );
+            // Create through its own session, with the handle as its start
+            // channel, which the service refuses: only its own threads and
+            // init hold the channel with no label.
+            return Answer::Status(create(self.process.session(), foreign));
+        }
+        if r.method() == 10 {
+            if r.handles.len() != 1 || r.body().finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let Ok(session) = r.handles.take::<rt::handle::Channel>(0) else {
+                return Answer::Status(Status::BadSize);
+            };
+            self.kept = Some(process_client::Client::new(session));
+            return Answer::Status(Status::Ok);
+        }
+        if r.method() == 11 {
+            if !r.handles.is_empty() || r.body().finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Status(match self.kept.as_ref() {
+                None => Status::Kernel(rt::abi::Error::BadState),
+                Some(kept) => kept.query().map_or_else(|error| error, |_| Status::Ok),
+            });
         }
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);

@@ -24,6 +24,9 @@ adoption-refusals = []
 # The probe of POSIX processes whose service ended: the service ends before
 # it registers (xtask posix-orphans).
 exit-early = []
+# The probe of POSIX processes: four children of a record at most, so that
+# the guest reaches the limit (tests/posix-procs).
+children-max-4 = []
 
 [dependencies]
 proto-process = { path = "../../proto/process" }
@@ -34,5 +37,5 @@ posix-credentials = { path = "../../lib/posix-credentials" }
 # The program alone runs on stafeto: the host tests of the library build
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
-process-client = { path = "../../lib/process-client" }
+bootimg = { path = "../../lib/bootimg" }
 rt = { path = "../../lib/rt" }

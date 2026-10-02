@@ -10,16 +10,18 @@
 //! gives a copy of a registered channel with SEND, TRANSFER and a label of
 //! its own, or holds the request until the service registers, but for the
 //! process service (table::PROCESS_SERVICE); ADOPT from the process service
-//! takes the next POSIX process init loaded, whose thread waits until
-//! ADOPTED brings the session of its record (spec 2, section 3.1): init
-//! holds the request and never sends one to a service (spec 6.7); HEARTBEAT
+//! takes the next POSIX record to start, whose process the service creates
+//! and loads, and ADOPTED brings its session, process and thread (spec 2,
+//! section 3.1): init holds the request and never sends one to a service
+//! (spec 6.7); HEARTBEAT
 //! answers a registered service and moves its watchdog deadline; LIST gives
 //! a page of the records, init first; STATS what the kernel, the worker and
 //! init's quota show; PING anyone. The notification of the worker thread
 //! brings the outcome of its job: the main thread starts the thread of the
 //! instance it loaded, and gives the worker the next job of the queue at
-//! the level init::work::Jobs sets. The notification of the end of
-//! an instance is a failure of its record: init prints its reason and what
+//! the level init::work::Jobs sets. The notification of the end of an
+//! instance, or for a POSIX process the CLIENT_GONE of its start channel,
+//! is a failure of its record: init prints its reason and what
 //! it decided (init::restart), the worker tears the instance down, and the
 //! record's timer, whose slot is at the record's ceiling and whose expiries
 //! carry a label of its own, ends the pause before its restart; a service
@@ -35,6 +37,7 @@ use abi::{Error, ObjectKind, ProcessState, Rights, Source};
 use bootimg::Program;
 use core::fmt;
 use core::mem;
+use core::mem::ManuallyDrop;
 use init::PAGE;
 use init::labels::Labels;
 use init::quota::{self, Start};
@@ -43,15 +46,16 @@ use init::table::{self, MAX_RECORDS, Record, Restart, TABLE};
 use init::watch::{Action, Watched};
 use init::work::{Job, Jobs, WORKER_IDLE, worker_level};
 use proto_init::{
-    Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
+    Adoption, Connect, LIST_PAGE, ListReply, ListRequest, Method, Record as Listed, RegisterReply,
     START_NAMES, State, Stats, VERSION, Work,
 };
 use proto_wire::{Name, Status};
 #[cfg(feature = "dma-watch")]
 use rt::handle::Memory;
-use rt::handle::{Channel, Outgoing, Process, Resource, Timer};
+use rt::handle::{Any, Channel, Outgoing, Process, Resource, Thread, Timer};
 use rt::loader::Spawned;
 use rt::service::{Answer, Notice, Pending, Request, Service, Session};
+use rt::startup::Giver;
 use rt::{Handle, println, sys, time};
 
 /// The CONNECT requests that wait for one service at most.
@@ -63,13 +67,21 @@ const MAIN: u8 = 63;
 const MS: u64 = 1_000_000;
 const S: u64 = 1_000 * MS;
 
-/// An instance of a record: what the worker loaded (its process and first
-/// thread, the label of its start channel, what is left of its start
-/// data), the channel a service registered, and when its thread started,
-/// in nanoseconds on the one scale of the system. Its handles close in the
+/// An instance of a record: its process, the first thread init starts,
+/// the label of its start channel and what is left of its start data,
+/// which the worker loaded or, for a POSIX process, ADOPTED brought; the
+/// channel a service registered, and when its thread started, in
+/// nanoseconds on the one scale of the system. Its handles close in the
 /// worker thread: the main thread lets go of no Instance (spec 7.7).
 pub struct Instance {
-    spawned: Spawned,
+    /// The process: with the owner's rights, or with none for a POSIX
+    /// process, whose end init only reads.
+    process: Handle<Process>,
+    /// The first thread init starts; None for a POSIX process, which the
+    /// process service starts.
+    thread: Option<Handle<Thread>>,
+    label: u64,
+    giver: Giver,
     /// Init's own handles to its DMA objects, which go with it, after its
     /// device stopped (worker.rs).
     dma: Kept,
@@ -80,6 +92,21 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// The instance the worker loaded, with init's handles to its DMA
+    /// objects.
+    fn loaded(spawned: Spawned, dma: Kept) -> Instance {
+        Instance {
+            process: spawned.process,
+            thread: Some(spawned.thread),
+            label: spawned.label,
+            giver: spawned.giver,
+            dma,
+            channel: None,
+            started: 0,
+            released: false,
+        }
+    }
+
     /// Lets go of the instance: its handles close. Only init's worker
     /// thread calls it (worker.rs).
     pub fn release(mut self) {
@@ -89,7 +116,7 @@ impl Instance {
     /// The instance's process, which the worker kills before it tears the
     /// instance down (worker.rs).
     pub fn process(&self) -> &Handle<Process> {
-        &self.spawned.process
+        &self.process
     }
 
     /// Init's handle to the instance's first DMA object, if any, which
@@ -182,7 +209,9 @@ struct Entry {
     /// its mark of suspicion (init::watch). None for a client, and between
     /// instances.
     watch: Option<Watched>,
-    waiting: [Option<(Pending, u8)>; WAITING_MAX],
+    /// Each with the client's base priority and whether its session is a
+    /// notary session of the process service (`connect`).
+    waiting: [Option<(Pending, u8, bool)>; WAITING_MAX],
     /// The record's timer on init's channel, its slot at the record's
     /// ceiling, and its deadline: the watchdog deadline (STARTING,
     /// RUNNING), the end of the pause before a restart (STOPPING, PAUSED)
@@ -203,10 +232,15 @@ struct Entry {
     short: bool,
     /// Its first start is done, or waits for quota.
     begun: bool,
-    /// A POSIX process loaded whose thread waits for the session of its
-    /// record (ADOPTED); `offered` once ADOPT took it.
+    /// A POSIX record that waits for the process service to make its
+    /// process (ADOPTED); `offered` once ADOPT took it with `ticket`, the
+    /// label of the start channel it gave.
     adopting: bool,
     offered: bool,
+    ticket: u64,
+    /// The label of the witness of its POSIX process: the process service
+    /// closes it once the process ended (`adoption`, `closed`).
+    witness: u64,
 }
 
 impl Entry {
@@ -226,16 +260,25 @@ impl Entry {
         begun: false,
         adopting: false,
         offered: false,
+        ticket: 0,
+        witness: 0,
     };
 }
 
 /// How an instance ended (PROCESS_STATE), as the line of its failure says
-/// it (spec 16.2).
-struct End(Result<ProcessState, Error>);
+/// it (spec 16.2); for a POSIX process (`posix`) a death by a signal as the
+/// signal (proto_process::End).
+struct End(Result<ProcessState, Error>, bool);
 
 impl fmt::Display for End {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
+            Ok(ProcessState::Exited { code }) if self.1 => match proto_process::End::exited(code) {
+                proto_process::End::Signaled(n) => {
+                    write!(f, "signal {n} ({})", proto_process::signal_name(n))
+                }
+                proto_process::End::Exited(code) => write!(f, "exit code {code}"),
+            },
             Ok(ProcessState::Exited { code }) => write!(f, "exit code {code}"),
             Ok(ProcessState::Killed) => write!(f, "killed"),
             Ok(ProcessState::Fault { esr, far, elr }) => {
@@ -255,6 +298,9 @@ fn now() -> u64 {
 /// Init as the service of its channel.
 pub struct Init {
     own: Handle<Process>,
+    /// Init's channel, which the main thread keeps for good: the start
+    /// channel of a POSIX process is a copy of it (`offer_one`).
+    channel: ManuallyDrop<Handle<Channel>>,
     resource: Handle<Resource>,
     worker: Worker,
     labels: Labels,
@@ -269,11 +315,12 @@ pub struct Init {
 }
 
 impl Init {
-    /// Init with its own process, the system resource, its worker, the
-    /// count of labels the worker's own came from, and the program of each
-    /// record of the table.
+    /// Init with its own process, its channel, the system resource, its
+    /// worker, the count of labels the worker's own came from, and the
+    /// program of each record of the table.
     pub fn new(
         own: Handle<Process>,
+        channel: &Handle<Channel>,
         resource: Handle<Resource>,
         worker: Worker,
         labels: Labels,
@@ -281,6 +328,7 @@ impl Init {
     ) -> Init {
         Init {
             own,
+            channel: Handle::borrowed(channel.raw()),
             resource,
             worker,
             labels,
@@ -311,17 +359,55 @@ impl Init {
             entry.timer_label = label;
         }
         for &place in order.as_slice() {
-            self.launch(place);
+            if TABLE[place].on_demand {
+                // It starts on the process service's SPAWN (`spawn`).
+                self.entries[place].state = State::Ended;
+                self.begin(place);
+            } else {
+                self.launch(place);
+            }
         }
         if TABLE.is_empty() {
             println!("{STARTED}");
         }
     }
 
-    /// Puts the load of the record at `place` in the queue: LOADING.
+    /// Puts the load of the record at `place` in the queue: LOADING. A
+    /// POSIX record waits for the process service instead, which makes
+    /// and loads its process and pays for it (`offer`).
     fn launch(&mut self, place: usize) {
         self.entries[place].state = State::Loading;
+        if TABLE[place].is_posix() {
+            let entry = &mut self.entries[place];
+            entry.adopting = true;
+            entry.offered = false;
+            self.begin(place);
+            if self.process_service_over() {
+                self.adoption_failed(place, "the process service ended");
+            } else {
+                self.offer();
+            }
+            return;
+        }
         self.push(Job::new(Work::Load, place, &TABLE[place]));
+    }
+
+    /// The quota of an instance of the record at `place` in bytes: the
+    /// record's; for the process service also what each POSIX record of
+    /// the table takes from it (quota::need_pages), since the service
+    /// creates and loads their processes.
+    fn quota_of(&self, place: usize) -> u64 {
+        let record = &TABLE[place];
+        if record.name != table::PROCESS_SERVICE {
+            return record.quota;
+        }
+        let posix = (0..TABLE.len()).filter(|&p| TABLE[p].is_posix());
+        let children: u64 = posix
+            .filter_map(|p| {
+                self.programs[p].map(|program| quota::need_pages(TABLE[p].quota, &program))
+            })
+            .sum();
+        record.quota + children * PAGE
     }
 
     /// Puts `job` in the queue. With the worker at a job, its level goes
@@ -364,7 +450,8 @@ impl Init {
                     let label = self.labels.next().expect("init gave every label");
                     let program =
                         self.programs[place].expect("init found each program at its start");
-                    self.worker.load(place, label, program)
+                    let quota = self.quota_of(place);
+                    self.worker.load(place, label, program, quota)
                 }
                 Work::Teardown => self
                     .worker
@@ -385,7 +472,8 @@ impl Init {
     /// 100 ms up to 5 s, no failure; the first wait in a row prints a line.
     fn quota_fits(&mut self, place: usize) -> bool {
         let record = &TABLE[place];
-        let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(record.quota, &p));
+        let quota = self.quota_of(place);
+        let need = self.programs[place].map_or(u64::MAX, |p| quota::need_pages(quota, &p));
         let memory = sys::process_memory(&self.own);
         let free = memory.map_or(0, |m| m.quota.saturating_sub(m.used) / PAGE);
         let entry = &mut self.entries[place];
@@ -456,34 +544,12 @@ impl Init {
 
     /// An instance of the record at `place` loaded, or why not, which is a
     /// failure: its thread starts here, once its start data wait in the
-    /// entry (`run`); that of a POSIX process once the process service gave
-    /// the session of its record (`offer`, `adopted`).
+    /// entry (`run`).
     fn loaded(&mut self, place: usize, result: Loaded) {
-        let record = &TABLE[place];
         match result {
             Ok((spawned, dma)) => {
-                let entry = &mut self.entries[place];
-                entry.held = Held::Running(Instance {
-                    spawned,
-                    dma,
-                    channel: None,
-                    started: 0,
-                    released: false,
-                });
-                if record.is_posix() {
-                    // Its thread starts once the process service gave the
-                    // session of its record (`adopted`); with the service
-                    // ended or broken for good none comes.
-                    entry.adopting = true;
-                    entry.offered = false;
-                    if self.process_service_over() {
-                        self.adoption_failed(place, "the process service ended");
-                    } else {
-                        self.offer();
-                    }
-                } else {
-                    self.run(place);
-                }
+                self.entries[place].held = Held::Running(Instance::loaded(spawned, dma));
+                self.run(place);
             }
             Err(e) => {
                 let what = format_args!("did not load: {e:?}");
@@ -500,7 +566,7 @@ impl Init {
         let Some(instance) = self.entries[place].held.running_mut() else {
             return;
         };
-        if let Err(e) = instance.spawned.start() {
+        if let Some(Err(e)) = instance.thread.as_ref().map(sys::thread_start) {
             println!("init: {} did not start: {e:?}", record.name);
         }
         let started = now();
@@ -522,20 +588,19 @@ impl Init {
     }
 
     /// Answers the process service's ADOPT, when one waits, with the first
-    /// POSIX process that waits for its session and was not offered yet:
-    /// its ticket (the label of its instance), root, and a copy of its
-    /// process with MANAGE, DUPLICATE and TRANSFER. A copy that cannot be
-    /// made fails the load.
+    /// POSIX record that waits for its process and was not offered yet: the
+    /// record's parameters and its start channel (`offer_one`). A start
+    /// channel that cannot be made fails the record.
     fn offer(&mut self) {
-        // A process whose copy cannot be made fails, and the next one that
-        // waits is offered.
+        // A record whose start channel cannot be made fails, and the next
+        // one that waits is offered.
         loop {
             if self.adoption.is_none() {
                 return;
             }
             let waiting = (0..TABLE.len()).find(|&p| {
                 let e = &self.entries[p];
-                e.adopting && !e.offered && e.held.running().is_some()
+                e.adopting && !e.offered
             });
             let Some(place) = waiting else {
                 return;
@@ -553,51 +618,115 @@ impl Init {
             .is_none_or(|p| matches!(self.entries[p].state, State::Ended | State::Broken))
     }
 
-    /// Offers the process at `place` to the waiting ADOPT; false when its
-    /// copy could not be made and its load failed.
+    /// Offers the record at `place` to the waiting ADOPT (`adoption`).
+    /// False when its start channel could not be made and the record
+    /// failed.
     fn offer_one(&mut self, place: usize) -> bool {
-        let instance = self.entries[place]
-            .held
-            .running()
-            .expect("an adopted instance");
-        let rights = Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER;
-        let copy = sys::handle_duplicate(instance.process(), rights);
-        let ticket = instance.spawned.label;
-        let Ok(copy) = copy else {
-            self.adoption_failed(place, "no copy of its process");
+        let mut w = proto_wire::Writer::new();
+        let Ok([start, witness]) = self.adoption(place, &mut w) else {
+            self.adoption_failed(place, "no start channel");
             return false;
         };
-        let mut w = proto_wire::Writer::new();
-        let written = w
-            .bytes(&proto_wire::reply(Status::Ok))
-            .and_then(|()| w.u64(ticket))
-            .and_then(|()| w.u32(u32::from(TABLE[place].root)));
         let pending = self.adoption.take().expect("a waiting ADOPT");
-        if written.is_err() || pending.answer(w.as_bytes(), [copy.erase()]).is_err() {
-            // The service went: the next ADOPT offers the process again.
-            return true;
+        if pending
+            .answer(w.as_bytes(), [start.erase(), witness.erase()])
+            .is_ok()
+        {
+            self.entries[place].offered = true;
         }
-        self.entries[place].offered = true;
+        // Else the service went: the next ADOPT offers the record again.
         true
     }
 
-    /// The POSIX process at `place` gets no session of its record: a
-    /// failure of its record; its thread never ran.
+    /// The reply of ADOPT or SPAWN for the POSIX record at `place` in `w`
+    /// (proto_init Adoption) with a new ticket, the label of the start
+    /// channel B it returns: a copy of init's channel with SEND and
+    /// TRANSFER whose slot has the record's priority, as rt::loader::spawn
+    /// makes it, so that the process's requests carry the ticket; and the
+    /// witness W, a copy with TRANSFER alone and a label of its own, which
+    /// the service keeps with the record and closes once the process ended:
+    /// its CLIENT_GONE is the end (`closed`). The record waits for ADOPTED
+    /// with that ticket. The error of handle_label.
+    fn adoption(
+        &mut self,
+        place: usize,
+        w: &mut proto_wire::Writer,
+    ) -> Result<[Handle<Channel>; 2], Error> {
+        let record = &TABLE[place];
+        let ticket = self.labels.next().expect("init gave every label");
+        let rights = Rights::SEND | Rights::TRANSFER;
+        let start = sys::handle_label(&self.channel, rights, ticket, record.priority)?;
+        let witness = self.labels.next().expect("init gave every label");
+        let seen = sys::handle_label(&self.channel, Rights::TRANSFER, witness, record.priority)?;
+        let adoption = Adoption {
+            ticket,
+            quota: record.quota,
+            handle_limit: record.handle_limit,
+            ceiling: record.ceiling,
+            priority: record.priority,
+            root: record.root,
+            program: Name::new(record.program.as_bytes()).expect("a checked table has names"),
+        };
+        // The reply has room for the 48 bytes of an adoption.
+        let _ = adoption.write(w);
+        self.entries[place].ticket = ticket;
+        self.entries[place].witness = witness;
+        Ok([start, seen])
+    }
+
+    /// SPAWN from the instance at `place`: only the process service's
+    /// (BAD_STATE for any other caller); BAD_SIZE for a body that is no
+    /// name; ACCESS_DENIED for a name of no record that starts on demand;
+    /// LIMIT_REACHED while an instance of it lives, waits or ends. The
+    /// reply is that of ADOPT for the record (`adoption`), which waits for
+    /// ADOPTED from then on, LOADING.
+    fn spawn(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if TABLE[place].name != table::PROCESS_SERVICE {
+            return refuse(Error::BadState);
+        }
+        let mut body = r.body();
+        let Ok(Some(name)) = body.name() else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(target) = table::find(TABLE, name.as_bytes()).filter(|&p| TABLE[p].on_demand)
+        else {
+            return refuse(Error::AccessDenied);
+        };
+        let entry = &self.entries[target];
+        if entry.adopting || !matches!(entry.held, Held::Empty) {
+            return refuse(Error::LimitReached);
+        }
+        let mut w = proto_wire::Writer::new();
+        let [start, witness] = match self.adoption(target, &mut w) {
+            Ok(handles) => handles,
+            Err(e) => return refuse(e),
+        };
+        let entry = &mut self.entries[target];
+        entry.state = State::Loading;
+        entry.adopting = true;
+        entry.offered = true;
+        let _ = r.reply().bytes(w.as_bytes());
+        Answer::Reply([start.erase(), witness.erase()].into())
+    }
+
+    /// The POSIX record at `place` gets no process: a failure of its
+    /// record, with no instance; a process the service made goes with the
+    /// service's Abandon.
     fn adoption_failed(&mut self, place: usize, why: &str) {
         let entry = &mut self.entries[place];
         entry.adopting = false;
         entry.offered = false;
-        let Some(instance) = entry.held.take_running() else {
-            return;
-        };
         let what = format_args!("did not load: {why}");
-        self.failed(place, Some(instance), 0, what, Work::Kill);
+        self.failed(place, None, 0, what, Work::Kill);
     }
 
     /// ADOPT from the instance at `place`: only the process service's, at
     /// most one at a time (BAD_STATE for any other caller, LIMIT_REACHED
     /// for a second); BAD_SIZE for bytes after the header. Init holds it
-    /// until a POSIX process waits for its session (`offer`).
+    /// until a POSIX record waits for its process (`offer`).
     fn adopt(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
         if TABLE[place].name != table::PROCESS_SERVICE {
             return refuse(Error::BadState);
@@ -613,12 +742,18 @@ impl Init {
         Answer::Deferred
     }
 
-    /// ADOPTED from the process service: the ticket of a process it took
-    /// and its status. With status 0 and the session, init gives the
-    /// session in the start data under `posix` and starts the thread; any
-    /// other status, or no session, fails the load. BAD_STATE for another
-    /// caller, BAD_SIZE out of the layout, INVALID_ARGS for
-    /// a ticket no waiting process has.
+    /// ADOPTED from the process service: the ticket of a record it took
+    /// and its status. With status 0, the session, the process and its
+    /// thread, init keeps a copy of the process with no rights, gives the
+    /// three in the start data under `posix`, `process` and `thread` (and
+    /// the identity session, a fourth handle, under `posix-id`) with
+    /// the record's resources and arguments (worker::resources,
+    /// worker::set_args), and the record runs; the service then starts the
+    /// thread. Any other status fails the record. BAD_STATE for another
+    /// caller, BAD_SIZE out of the layout, INVALID_ARGS for a ticket no
+    /// waiting record has; with status 0, BAD_SIZE without the three
+    /// handles and the error of a copy, which fail the record, and the
+    /// service kills the process.
     fn adopted(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
         if TABLE[place].name != table::PROCESS_SERVICE {
             return refuse(Error::BadState);
@@ -627,43 +762,87 @@ impl Init {
         let (Ok(ticket), Ok(status)) = (body.u64(), body.u32()) else {
             return Answer::Status(Status::BadSize);
         };
-        if body.finish().is_err() || r.handles.len() > 1 {
+        if body.finish().is_err() || r.handles.len() > 4 {
             return Answer::Status(Status::BadSize);
         }
         let waiting = (0..TABLE.len()).find(|&p| {
             let e = &self.entries[p];
-            e.adopting && e.offered && e.held.running().is_some_and(|i| i.spawned.label == ticket)
+            e.adopting && e.offered && e.ticket == ticket
         });
         let Some(place) = waiting else {
             return refuse(Error::InvalidArgs);
         };
-        let session = (status == 0)
-            .then(|| r.handles.take::<Channel>(0).ok())
-            .flatten();
-        let Some(session) = session else {
+        if status != 0 {
             println!(
-                "init: the process service made no record for {}: status {status}",
+                "init: the process service made no process for {}: status {status}",
                 TABLE[place].name
             );
-            self.adoption_failed(place, "no record of the process service");
+            self.adoption_failed(place, "no process of the process service");
             return Answer::Status(Status::Ok);
+        }
+        let handles = (
+            r.handles.take::<Channel>(0),
+            r.handles.take::<Process>(1),
+            r.handles.take_any(2),
+        );
+        let (Ok(session), Ok(process), Ok(thread)) = handles else {
+            self.adoption_failed(place, "no process of the process service");
+            return Answer::Status(Status::BadSize);
+        };
+        // The fourth, the record's identity session, comes with every
+        // record the service makes.
+        let identity = r.handles.take::<Channel>(3).ok();
+        let instance = match self.posix_instance(place, ticket, session, identity, process, thread)
+        {
+            Ok(instance) => instance,
+            Err(e) => {
+                self.adoption_failed(place, "no room for its start data");
+                return refuse(e);
+            }
         };
         let entry = &mut self.entries[place];
-        let instance = entry.held.running_mut().expect("an adopted instance");
-        // The checks of the table keep the name apart from the others of
-        // the start data.
-        let given = instance
-            .spawned
-            .giver
-            .give(table::PROCESS_SERVICE, session.erase());
         entry.adopting = false;
         entry.offered = false;
-        if given.is_err() {
-            self.adoption_failed(place, "no room for its session");
-        } else {
-            self.run(place);
-        }
+        entry.held = Held::Running(instance);
+        self.run(place);
         Answer::Status(Status::Ok)
+    }
+
+    /// The instance of the POSIX record at `place` that ADOPTED brought:
+    /// a copy of `process` with no rights, and the start data.
+    fn posix_instance(
+        &self,
+        place: usize,
+        ticket: u64,
+        session: Handle<Channel>,
+        identity: Option<Handle<Channel>>,
+        process: Handle<Process>,
+        thread: Handle<Any>,
+    ) -> Result<Instance, Error> {
+        let record = &TABLE[place];
+        let watched = sys::handle_duplicate(&process, Rights::NONE)?;
+        let mut giver = Giver::new();
+        // An empty giver has room for the three and the resources
+        // (rt::startup::NAMES_MAX); the checks of the table keep the names
+        // apart.
+        let _ = giver.give("process", process.erase());
+        let _ = giver.give("thread", thread);
+        let _ = giver.give(table::PROCESS_SERVICE, session.erase());
+        if let Some(identity) = identity {
+            let _ = giver.give(table::IDENTITY_SESSION, identity.erase());
+        }
+        crate::worker::resources(record, &mut giver, &self.resource)?;
+        crate::worker::set_args(record, &mut giver, &[])?;
+        Ok(Instance {
+            process: watched,
+            thread: None,
+            label: ticket,
+            giver,
+            dma: [const { None }; table::MAX_DMA],
+            channel: None,
+            started: 0,
+            released: false,
+        })
     }
 
     /// The end of the instance whose label is `label` (its exit
@@ -679,7 +858,10 @@ impl Init {
             return;
         };
         let lived = now().saturating_sub(instance.started);
-        let end = End(sys::process_state(instance.process()));
+        let end = End(
+            sys::process_state(instance.process()),
+            TABLE[place].is_posix(),
+        );
         let what = format_args!("ended: {end}");
         self.failed(place, Some(instance), lived, what, Work::Teardown);
     }
@@ -792,13 +974,13 @@ impl Init {
             self.push(Job::new(work, place, record));
         }
         // With the process service ended or broken for good, the POSIX
-        // processes that wait for their sessions get none; a service that
-        // restarts asks for them again.
+        // records that wait for their processes get none; a service that
+        // restarts asks for them again, but for those its SPAWN asked for.
         let over = matches!(self.entries[place].state, State::Ended | State::Broken);
         if record.name == table::PROCESS_SERVICE {
             self.adoption = None;
-            for p in 0..TABLE.len() {
-                if over && self.entries[p].adopting {
+            for (p, other) in TABLE.iter().enumerate() {
+                if (over || other.on_demand) && self.entries[p].adopting {
                     self.adoption_failed(p, "the process service ended");
                 } else {
                     self.entries[p].offered = false;
@@ -882,7 +1064,7 @@ impl Init {
 
     /// The place of the record whose instance has `label`.
     fn caller(&self, label: u64) -> Option<usize> {
-        let named = |e: &Entry| e.held.running().is_some_and(|i| i.spawned.label == label);
+        let named = |e: &Entry| e.held.running().is_some_and(|i| i.label == label);
         self.entries[..TABLE.len()].iter().position(named)
     }
 
@@ -893,7 +1075,7 @@ impl Init {
         let instance = self.entries[place].held.running_mut();
         if let (Some(instance), Some(token)) = (instance, r.token()) {
             // A request of this method: Giver never gives it back.
-            let _ = instance.spawned.giver.answer(r.bytes(), token);
+            let _ = instance.giver.answer(r.bytes(), token);
         }
         Answer::Deferred
     }
@@ -935,8 +1117,8 @@ impl Init {
             entries, labels, ..
         } = self;
         let entry = &mut entries[place];
-        for (p, priority) in entry.waiting.iter_mut().filter_map(Option::take) {
-            let _ = match session(labels, &channel, priority) {
+        for (p, priority, notary) in entry.waiting.iter_mut().filter_map(Option::take) {
+            let _ = match session(labels, &channel, priority, notary) {
                 Ok(copy) => p.answer(&proto_wire::reply(Status::Ok), [copy.erase()]),
                 Err(e) => p.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new()),
             };
@@ -1005,12 +1187,19 @@ impl Init {
             return Answer::Status(Status::BadSize);
         };
         let client = &TABLE[place];
-        // The sessions of the process service come in start data.
-        let allowed = name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
-            && client
-                .connects
-                .iter()
-                .any(|to| to.as_bytes() == name.as_bytes());
+        // The sessions of the process service come in start data; a
+        // service of VOUCHERS gets one of its own, a notary session, whose
+        // label says so (proto_process::NOTARY).
+        let notary = name.as_bytes() == table::PROCESS_SERVICE.as_bytes()
+            && !client.is_client()
+            && !client.is_posix()
+            && table::VOUCHERS.contains(&client.name);
+        let allowed = notary
+            || (name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
+                && client
+                    .connects
+                    .iter()
+                    .any(|to| to.as_bytes() == name.as_bytes()));
         let Some(to) = allowed
             .then(|| table::find(TABLE, name.as_bytes()))
             .flatten()
@@ -1025,7 +1214,7 @@ impl Init {
             return refuse(Error::PeerClosed);
         }
         if let Some(channel) = open(service) {
-            return match session(labels, channel, client.priority) {
+            return match session(labels, channel, client.priority, notary) {
                 Ok(copy) => {
                     let _ = r.reply().bytes(&proto_wire::reply(Status::Ok));
                     Answer::Reply([copy.erase()].into())
@@ -1037,7 +1226,7 @@ impl Init {
             return refuse(Error::LimitReached);
         };
         if let Some(pending) = r.defer() {
-            *free = Some((pending, client.priority));
+            *free = Some((pending, client.priority, notary));
         }
         Answer::Deferred
     }
@@ -1161,13 +1350,21 @@ fn open(entry: &Entry) -> Option<&Handle<Channel>> {
 /// A session of a client with a service (spec 13.4): a copy of the
 /// service's registered `channel` with SEND and TRANSFER and no DUPLICATE,
 /// the next of `labels`, and a slot at `priority`, the client's base
-/// priority. The errors are those of handle_label.
+/// priority; a notary session of the process service carries
+/// proto_process::NOTARY in its label, which only init gives. The errors
+/// are those of handle_label.
 fn session(
     labels: &mut Labels,
     channel: &Handle<Channel>,
     priority: u8,
+    notary: bool,
 ) -> Result<Handle<Channel>, Error> {
     let label = labels.next().expect("init gave every label");
+    let label = if notary {
+        label | proto_process::NOTARY
+    } else {
+        label
+    };
     sys::handle_label(channel, Rights::SEND | Rights::TRANSFER, label, priority)
 }
 
@@ -1188,6 +1385,7 @@ impl Service<1> for Init {
         Method::Ping.number(),
         Method::Adopt.number(),
         Method::Adopted.number(),
+        Method::Spawn.number(),
     ];
     type Data = ();
 
@@ -1204,6 +1402,7 @@ impl Service<1> for Init {
             Some(Method::Stats) => self.stats(r),
             Some(Method::Adopt) => self.adopt(place, r),
             Some(Method::Adopted) => self.adopted(place, r),
+            Some(Method::Spawn) => self.spawn(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),
@@ -1220,10 +1419,31 @@ impl Service<1> for Init {
         }
         for entry in &mut self.entries {
             for slot in &mut entry.waiting {
-                if slot.as_ref().is_some_and(|(p, _)| p.label() == label) {
+                if slot.as_ref().is_some_and(|(p, _, _)| p.label() == label) {
                     *slot = None;
                 }
             }
+        }
+    }
+
+    /// The witness of a POSIX record closed (CLIENT_GONE of its label):
+    /// the process service closes it once the process ended, so that
+    /// PROCESS_STATE shows the end: the end of the instance (`ended`); for
+    /// a record whose process the service did not make, a failure of the
+    /// record. The start channel's own CLIENT_GONE tells nothing of a POSIX
+    /// process, which may close it or give it away before it ends.
+    fn closed(&mut self, label: u64) {
+        let Some(place) = (0..TABLE.len())
+            .find(|&p| TABLE[p].is_posix() && self.entries[p].witness == label && label != 0)
+        else {
+            return;
+        };
+        self.entries[place].witness = 0;
+        let entry = &self.entries[place];
+        if let Some(ticket) = entry.held.running().map(|i| i.label) {
+            self.ended(ticket);
+        } else if entry.adopting && entry.offered {
+            self.adoption_failed(place, "the process service let it go");
         }
     }
 

@@ -172,6 +172,11 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
         return 125;
     };
     PARENT.store(start.parent.raw().0, Ordering::Release);
+    // The identity session: a process whose start data has none gives no
+    // service a way to ask who it is.
+    let identity = start
+        .take::<Channel>(posix_abi::process::IDENTITY_NAME)
+        .ok();
     // SAFETY: the main thread, once, before any other; the start channel
     // stays in `start` until main returned.
     if let Err(why) =
@@ -179,6 +184,10 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
     {
         rt::println!("POSIX startup: {}", why);
         return 125;
+    }
+    if let Some(identity) = identity {
+        // SAFETY: still single-threaded, after the process service's init.
+        unsafe { posix_abi::process::set_identity(identity) };
     }
     start_relibc(&arguments[..count])
 }

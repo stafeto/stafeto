@@ -4,13 +4,15 @@
 //! System-wide realtime anchor. Starts at the Unix epoch until explicitly set.
 #![no_std]
 #![no_main]
+use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicU64, Ordering};
+use posix_credentials::known::Known;
 use posix_time::{Clock, Error, History, Snapshot, Time};
 use proto_clock::Method;
 use proto_clock::page;
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
+use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 rt::entry!(main);
@@ -55,6 +57,12 @@ fn main(_: u64) -> u64 {
             clock,
             page,
             watches: core::array::from_fn(|_| None),
+            process: Handle::borrowed(start.process.raw()),
+            parent: Handle::borrowed(start.parent.raw()),
+            notary: None,
+            generations: None,
+            identities: core::array::from_fn(|_| None),
+            evict: 0,
         },
         config,
     );
@@ -65,10 +73,153 @@ struct Watch {
     channel: Handle<Channel>,
     history: History,
 }
+/// What the service knows of the process behind a session: a copy of its
+/// identity session of the process service, which a SET of the session
+/// brought, and what the process service vouched, with the generation of
+/// the credentials.
+struct Identity {
+    label: u64,
+    channel: Handle<Channel>,
+    known: Known,
+}
 struct Clocks {
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
+    /// The service's own process, to map the generations page in.
+    process: ManuallyDrop<Handle<Process>>,
+    /// Its channel to init, for the notary session.
+    parent: ManuallyDrop<Handle<Channel>>,
+    /// The notary session with the process service, which init gives the
+    /// clock on CONNECT (init's VOUCHERS): the one channel the service
+    /// trusts for who a client is; asked for at the first SET.
+    notary: Option<Handle<Channel>>,
+    /// The page of the credentials generations of the process service,
+    /// through the notary session (Register).
+    generations: Option<Handle<Memory>>,
+    identities: [Option<Identity>; 8],
+    /// The place a session with none takes when all are used: each is
+    /// taken in turn, and its session brings its copy again.
+    evict: usize,
+}
+
+/// Where the service maps the process service's page of the credentials
+/// generations, read-only.
+const GENERATIONS_ADDRESS: usize = 0x0F00_0000;
+
+/// The generation of the credentials of the record at `index`, read from
+/// the page with no call (Acquire); the page is mapped.
+fn generation(index: usize) -> u64 {
+    // SAFETY: the page is mapped for reading at GENERATIONS_ADDRESS for the
+    // service's life once `generations` is set, which every caller checked;
+    // an index below RECORDS (a PID modulo it) is a u64 word inside it.
+    unsafe { &*((GENERATIONS_ADDRESS + index * 8) as *const AtomicU64) }.load(Ordering::Acquire)
+}
+
+/// Vouch through the notary session: what the process service says of
+/// the client whose identity session `identity` is a copy of (none for a
+/// channel of anyone else). The request goes to the process service alone,
+/// never to a client (spec 2, 2).
+fn vouch(notary: &Handle<Channel>, identity: &Handle<Channel>) -> Option<proto_process::WhoReply> {
+    let rights = rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER;
+    let copy = sys::handle_duplicate(identity, rights).ok()?;
+    let request = proto_process::Method::Vouch.header().bytes();
+    let reply = sys::send_handles(notary, &request, [copy.erase()]).ok()?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    proto_process::WhoReply::read(reply.bytes(&mut buffer)).ok()
+}
+
+impl Clocks {
+    /// The notary session (asked of init once) and the page of the
+    /// generations mapped through it (Register), once.
+    fn notary(&mut self) -> bool {
+        if self.notary.is_none() {
+            self.notary = rt::service::connect(&self.parent, "posix").ok();
+        }
+        let Some(notary) = self.notary.as_ref() else {
+            return false;
+        };
+        if self.generations.is_some() {
+            return true;
+        }
+        let request = proto_process::Method::Register.header().bytes();
+        let Ok(mut reply) = sys::send(notary, &request) else {
+            return false;
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+            return false;
+        }
+        let Ok(memory) = reply.handles.take::<Memory>(0) else {
+            return false;
+        };
+        // The object is a page, of which the generations take GENERATIONS_SIZE.
+        let mapped = sys::mem_map(
+            &self.process,
+            &memory,
+            0,
+            4096,
+            GENERATIONS_ADDRESS,
+            rt::abi::Access::Read,
+        );
+        if mapped.is_err() {
+            return false;
+        }
+        self.generations = Some(memory);
+        true
+    }
+
+    /// Whether the process behind the session `label` may set the clock:
+    /// its effective UID is 0 (spec 2, 3.1). `offered` is the identity
+    /// session the request brought; the first one of a session is kept and
+    /// the later ones close. The process service vouches for it through
+    /// the notary session, and what it said is remembered with the
+    /// generation of the credentials and asked again only when the
+    /// generation on the page moved: no call to the process service
+    /// otherwise, and a SET sent after `setuid` returned sees the new
+    /// credentials. A channel that is no identity session, no identity
+    /// session, or any failure: no.
+    fn may_set(&mut self, label: u64, offered: Option<Handle<Channel>>) -> bool {
+        if !self.notary() {
+            return false;
+        }
+        let found = self
+            .identities
+            .iter()
+            .position(|i| i.as_ref().is_some_and(|i| i.label == label));
+        let slot = match (found, offered) {
+            (Some(slot), _) => slot,
+            (None, Some(channel)) => {
+                // A free place, or else each in turn: the session whose
+                // place went brings its copy with its next SET again.
+                let slot = self
+                    .identities
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or_else(|| {
+                        self.evict = (self.evict + 1) % self.identities.len();
+                        self.evict
+                    });
+                self.identities[slot] = Some(Identity {
+                    label,
+                    channel,
+                    known: Known::new(),
+                });
+                slot
+            }
+            (None, None) => return false,
+        };
+        let Some(mut identity) = self.identities[slot].take() else {
+            return false;
+        };
+        let notary = self.notary.as_ref().expect("the notary session");
+        let allowed = identity
+            .known
+            .credentials(generation, || vouch(notary, &identity.channel))
+            .is_some_and(|c| c.euid == 0);
+        self.identities[slot] = Some(identity);
+        allowed
+    }
 }
 
 /// Where the service maps its page of the anchor.
@@ -197,9 +348,10 @@ impl Service<0> for Clocks {
             });
             return Answer::Status(Status::Ok);
         }
-        if !r.handles.is_empty() {
+        if r.handles.len() > usize::from(r.method() == Method::Set as u16) {
             return Answer::Status(Status::BadSize);
         }
+        let offered = r.handles.take::<Channel>(0).ok();
         let mut body = r.body();
         match Method::from_number(r.method()) {
             Some(Method::Get) => {
@@ -227,6 +379,9 @@ impl Service<0> for Clocks {
                 };
                 if time.value().is_err() {
                     return status(Err(Error::Invalid));
+                }
+                if !self.may_set(r.label(), offered) {
+                    return Answer::Status(Status::from_code(proto_clock::PERMISSION));
                 }
                 let generation = self.clock.anchor().generation;
                 let tick = now();
@@ -305,6 +460,11 @@ impl Service<0> for Clocks {
         }
     }
     fn gone(&mut self, s: &mut Session<(), 0>) {
+        for slot in &mut self.identities {
+            if slot.as_ref().is_some_and(|i| i.label == s.label()) {
+                *slot = None;
+            }
+        }
         for slot in &mut self.watches {
             if slot.as_ref().is_some_and(|w| w.label == s.label()) {
                 *slot = None;

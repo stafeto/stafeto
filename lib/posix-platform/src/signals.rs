@@ -9,7 +9,7 @@
 
 use super::{call, value};
 use core::ffi::c_int;
-use posix_abi::constants::{EINVAL, ENOSYS};
+use posix_abi::constants::EINVAL;
 use posix_abi::signals::{SigAction, SigSet};
 use posix_types::Timespec;
 
@@ -25,11 +25,13 @@ pub struct LinuxSigaction {
 const _: () = assert!(core::mem::size_of::<LinuxSigaction>() == 32);
 
 /// Linux's SA_ flags the layer has, with the layer's values.
-const FLAGS: [(u32, i32); 4] = [
+const FLAGS: [(u32, i32); 6] = [
     (0x4000_0000, posix_types::constants::SA_NODEFER),
     (0x8000_0000, posix_types::constants::SA_RESETHAND),
     (0x0000_0004, posix_types::constants::SA_SIGINFO),
     (0x1000_0000, posix_types::constants::SA_RESTART),
+    (0x0000_0001, posix_types::constants::SA_NOCLDSTOP),
+    (0x0000_0002, posix_types::constants::SA_NOCLDWAIT),
 ];
 
 /// The signals of the layer in a Linux set.
@@ -149,14 +151,26 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
     }
     // SAFETY: the caller's promise.
     let timeout = unsafe { timeout.as_ref() }.copied();
-    let status =
-        value(call(|| posix_abi::signals::sigtimedwait(set, None, timeout)).map(i64::from));
+    let mut taken = posix_types::SigInfo::thread(0);
+    let status = value(
+        call(|| posix_abi::signals::sigtimedwait(set, Some(&mut taken), timeout)).map(i64::from),
+    );
     if status > 0 && !info.is_null() {
+        // A thread's signal says SI_TKILL; the process's carries what its
+        // sender gave: si_code, si_pid, si_uid, and SIGCHLD's si_status.
+        let code = if taken.si_code == posix_types::constants::SI_THREAD {
+            SI_TKILL
+        } else {
+            taken.si_code
+        };
         // SAFETY: the caller's promise.
         unsafe {
             info.write_bytes(0, SIGINFO_SIZE);
             info.cast::<c_int>().write(status as c_int);
-            info.cast::<c_int>().add(2).write(SI_TKILL);
+            info.cast::<c_int>().add(2).write(code);
+            info.cast::<c_int>().add(4).write(taken.si_pid);
+            info.cast::<u32>().add(5).write(taken.si_uid);
+            info.cast::<c_int>().add(6).write(taken.si_status);
         }
     }
     status as c_int
@@ -167,14 +181,41 @@ pub extern "C" fn stafeto_raise(signal: c_int) -> c_int {
     value(call(|| posix_abi::signals::raise(signal)).map(|()| 0)) as c_int
 }
 
-/// kill: the process's own signals go to the calling thread until the
-/// process service routes them (5b); other processes are ENOSYS.
+/// kill through the process service: a PID, 0 for the caller's group, -1
+/// for every process but the caller's, below -1 the group -pid.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_kill(pid: c_int, signal: c_int) -> c_int {
-    if pid != 0 && pid != posix_abi::process::getpid() {
-        return -ENOSYS;
-    }
-    stafeto_raise(signal)
+    value(call(|| posix_abi::process::kill(pid, signal)).map(|()| 0)) as c_int
+}
+
+/// killpg through the process service (posix_abi::process::killpg).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_killpg(pgrp: c_int, signal: c_int) -> c_int {
+    value(call(|| posix_abi::process::killpg(pgrp, signal)).map(|()| 0)) as c_int
+}
+
+/// setpgid of `pid` to `pgid` through the process service.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setpgid(pid: c_int, pgid: c_int) -> c_int {
+    value(call(|| posix_abi::process::setpgid(pid, pgid)).map(|()| 0)) as c_int
+}
+
+/// setsid: the new session's number, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setsid() -> c_int {
+    value(call(|| posix_abi::process::setsid().map(i64::from))) as c_int
+}
+
+/// getpgid of `pid`: the group's number, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getpgid(pid: c_int) -> c_int {
+    value(call(|| posix_abi::process::getpgid(pid).map(i64::from))) as c_int
+}
+
+/// getsid of `pid`: the session's number, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getsid(pid: c_int) -> c_int {
+    value(call(|| posix_abi::process::getsid(pid).map(i64::from))) as c_int
 }
 
 #[unsafe(no_mangle)]
