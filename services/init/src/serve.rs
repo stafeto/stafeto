@@ -209,7 +209,9 @@ struct Entry {
     /// its mark of suspicion (init::watch). None for a client, and between
     /// instances.
     watch: Option<Watched>,
-    waiting: [Option<(Pending, u8)>; WAITING_MAX],
+    /// Each with the client's base priority and whether its session is a
+    /// notary session of the process service (`connect`).
+    waiting: [Option<(Pending, u8, bool)>; WAITING_MAX],
     /// The record's timer on init's channel, its slot at the record's
     /// ceiling, and its deadline: the watchdog deadline (STARTING,
     /// RUNNING), the end of the pause before a restart (STOPPING, PAUSED)
@@ -1115,8 +1117,8 @@ impl Init {
             entries, labels, ..
         } = self;
         let entry = &mut entries[place];
-        for (p, priority) in entry.waiting.iter_mut().filter_map(Option::take) {
-            let _ = match session(labels, &channel, priority) {
+        for (p, priority, notary) in entry.waiting.iter_mut().filter_map(Option::take) {
+            let _ = match session(labels, &channel, priority, notary) {
                 Ok(copy) => p.answer(&proto_wire::reply(Status::Ok), [copy.erase()]),
                 Err(e) => p.answer(&proto_wire::reply(Status::Kernel(e)), Outgoing::new()),
             };
@@ -1185,12 +1187,19 @@ impl Init {
             return Answer::Status(Status::BadSize);
         };
         let client = &TABLE[place];
-        // The sessions of the process service come in start data.
-        let allowed = name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
-            && client
-                .connects
-                .iter()
-                .any(|to| to.as_bytes() == name.as_bytes());
+        // The sessions of the process service come in start data; a
+        // service of VOUCHERS gets one of its own, a notary session, whose
+        // label says so (proto_process::NOTARY).
+        let notary = name.as_bytes() == table::PROCESS_SERVICE.as_bytes()
+            && !client.is_client()
+            && !client.is_posix()
+            && table::VOUCHERS.contains(&client.name);
+        let allowed = notary
+            || (name.as_bytes() != table::PROCESS_SERVICE.as_bytes()
+                && client
+                    .connects
+                    .iter()
+                    .any(|to| to.as_bytes() == name.as_bytes()));
         let Some(to) = allowed
             .then(|| table::find(TABLE, name.as_bytes()))
             .flatten()
@@ -1205,7 +1214,7 @@ impl Init {
             return refuse(Error::PeerClosed);
         }
         if let Some(channel) = open(service) {
-            return match session(labels, channel, client.priority) {
+            return match session(labels, channel, client.priority, notary) {
                 Ok(copy) => {
                     let _ = r.reply().bytes(&proto_wire::reply(Status::Ok));
                     Answer::Reply([copy.erase()].into())
@@ -1217,7 +1226,7 @@ impl Init {
             return refuse(Error::LimitReached);
         };
         if let Some(pending) = r.defer() {
-            *free = Some((pending, client.priority));
+            *free = Some((pending, client.priority, notary));
         }
         Answer::Deferred
     }
@@ -1341,13 +1350,21 @@ fn open(entry: &Entry) -> Option<&Handle<Channel>> {
 /// A session of a client with a service (spec 13.4): a copy of the
 /// service's registered `channel` with SEND and TRANSFER and no DUPLICATE,
 /// the next of `labels`, and a slot at `priority`, the client's base
-/// priority. The errors are those of handle_label.
+/// priority; a notary session of the process service carries
+/// proto_process::NOTARY in its label, which only init gives. The errors
+/// are those of handle_label.
 fn session(
     labels: &mut Labels,
     channel: &Handle<Channel>,
     priority: u8,
+    notary: bool,
 ) -> Result<Handle<Channel>, Error> {
     let label = labels.next().expect("init gave every label");
+    let label = if notary {
+        label | proto_process::NOTARY
+    } else {
+        label
+    };
     sys::handle_label(channel, Rights::SEND | Rights::TRANSFER, label, priority)
 }
 
@@ -1402,7 +1419,7 @@ impl Service<1> for Init {
         }
         for entry in &mut self.entries {
             for slot in &mut entry.waiting {
-                if slot.as_ref().is_some_and(|(p, _)| p.label() == label) {
+                if slot.as_ref().is_some_and(|(p, _, _)| p.label() == label) {
                     *slot = None;
                 }
             }

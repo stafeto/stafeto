@@ -597,6 +597,8 @@ name = "test-svc"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "posix-clock",
+ "posix-time",
  "proto-clock",
  "proto-init",
  "proto-uart",

@@ -174,7 +174,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix-sender",
         program: "svc",
         args: b"t",
-        connects: &["clock-peer", "posix"],
+        connects: &["clock-peer", "clock", "posix"],
         quota: 16 * PAGE,
         handle_limit: 16,
         ..POSIX

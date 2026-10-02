@@ -26,7 +26,7 @@ use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::signals::{self, Info, Posted};
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
-use posix_process_service::walk::{Step, Target, Walk};
+use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, INIT_PID, Method, Next,
     PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, RECORDS, SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX, SIGSTOP,
@@ -51,11 +51,11 @@ use core::mem::ManuallyDrop;
 rt::entry!(main);
 /// The sessions of the loop: those of the service's own threads through
 /// the channel with no label at place 0, a record's at its index plus 1
-/// and its identity session's at RECORDS + 1 + its index
-/// (`Service::place`), and a few for labels no record has: a session of a
-/// record that went, whose place a new record took, asks there and gets
-/// UNREGISTERED, or LIMIT_REACHED while five such hold the spare places.
-const SESSIONS: usize = 2 * RECORDS + 1 + 4;
+/// (`Service::place`), and a few for labels no record has: the notary
+/// sessions init gives the vouchers, and a session of a record that went,
+/// whose place a new record took, which asks there and gets UNREGISTERED,
+/// or LIMIT_REACHED while the spare places are taken.
+const SESSIONS: usize = RECORDS + 1 + 8;
 /// Where the service maps the boot image, read-only, for as long as it
 /// lives: the programs it loads are read from there.
 const IMAGE: usize = 0x50_0000_0000;
@@ -79,6 +79,9 @@ struct Walking {
     refused: bool,
     denied: bool,
 }
+/// The walks of the service that wait for an earlier walk of their sender
+/// at most; past them kill is EAGAIN.
+const LATER: usize = 64;
 /// The label of the service's own place for the notification that makes
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
@@ -93,6 +96,8 @@ enum Delivery {
 struct Processes {
     /// The service's channel, which the sessions are copies of.
     channel: ManuallyDrop<Handle<Channel>>,
+    /// The channel the identity sessions are copies of (`vouch`).
+    identities: ManuallyDrop<Handle<Channel>>,
     /// The priority of the slot of a session: the loop's level.
     level: u8,
     records: Records<Handle<Process>>,
@@ -119,6 +124,9 @@ struct Processes {
     /// their next steps.
     walks: [Option<Walking>; RECORDS],
     walking: Queue,
+    /// The walks that wait for an earlier walk of their sender, with the
+    /// sender's index.
+    later: [Option<(usize, Walking)>; LATER],
     /// The place of the service's channel that tells it of the next step
     /// (STEP), and whether a step was told and not taken.
     step: Option<Handle<Channel>>,
@@ -128,6 +136,7 @@ impl Processes {
     const fn new() -> Self {
         Self {
             channel: Handle::borrowed(abi::Handle::INVALID),
+            identities: Handle::borrowed(abi::Handle::INVALID),
             level: 1,
             records: Records::new(),
             spawns: [const { None }; RECORDS],
@@ -141,6 +150,7 @@ impl Processes {
             waits: Waits::new(),
             walks: [const { None }; RECORDS],
             walking: Queue::new(),
+            later: [const { None }; LATER],
             step: None,
             step_told: false,
         }
@@ -173,6 +183,11 @@ fn main(_: u64) -> u64 {
     let Ok(channel) = sys::channel_create(1) else {
         return 3;
     };
+    // The channel of the identity sessions, which no loop receives on:
+    // a notification through a copy shows which record's it is (`vouch`).
+    let Ok(identities) = sys::channel_create(1) else {
+        return 3;
+    };
     if rt::service::register(&start.parent, &channel).is_err() {
         return 4;
     }
@@ -194,6 +209,7 @@ fn main(_: u64) -> u64 {
     // SAFETY: the main thread is the one that reaches OWNER, here once.
     let owner = unsafe { &mut *OWNER.0.get() };
     owner.channel = Handle::borrowed(channel.raw());
+    owner.identities = Handle::borrowed(identities.raw());
     owner.level = level;
     if owner.generations.make(&start.process).is_err() {
         return 7;
@@ -337,6 +353,9 @@ impl Processes {
             child.start_mask.store(mask, Release);
             child.ignored.store(from.ignored.load(Acquire), Release);
         }
+        if paged.is_ok() && parent.is_some() {
+            self.signal_newborn(index);
+        }
         let session = paged.and_then(|()| {
             sys::handle_label(
                 &self.channel,
@@ -346,10 +365,10 @@ impl Processes {
             )
         });
         // The identity session: the process gives copies of it (DUPLICATE)
-        // to the services it asks something of.
+        // to the services it asks something of, which have it vouched for.
         let who = sys::handle_label(
-            &self.channel,
-            Rights::SEND | Rights::TRANSFER | Rights::DUPLICATE,
+            &self.identities,
+            Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
             label.identity(),
             self.level,
         );
@@ -714,16 +733,16 @@ impl Processes {
     }
 }
 impl Processes {
-    /// A request through the identity session of the record in `index`:
-    /// Who, the PID, credentials and generation; Register, a copy of the
-    /// page of the generations to read. Nothing else is asked here
-    /// (PERMISSION), and no handle comes.
-    fn identity(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
-        if !r.handles.is_empty() || r.body().finish().is_err() {
+    /// A request through a notary session, which init gives the services
+    /// of its VOUCHERS: Register, a copy of the page of the generations to
+    /// read; Vouch, who brought the handle the request brings (`vouch`).
+    /// Nothing else (PERMISSION).
+    fn notary(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
         let method = r.method();
-        if method == Method::Register as u16 {
+        if method == Method::Register as u16 && r.handles.is_empty() {
             let Ok(copy) = self.generations.copy() else {
                 return Answer::Status(Status::Kernel(abi::Error::NoMemory));
             };
@@ -732,10 +751,13 @@ impl Processes {
             }
             return Answer::Reply([copy.erase()].into());
         }
-        if method != Method::Who as u16 {
+        if method != Method::Vouch as u16 {
             return refuse(proto_process::PERMISSION);
         }
-        let record = self.records.get(index).expect("an identity process");
+        let Some(index) = self.vouch(r) else {
+            return refuse(proto_process::PERMISSION);
+        };
+        let record = self.records.get(index).expect("a vouched record");
         let who = proto_process::WhoReply {
             pid: record.label.pid(),
             credentials: record.credentials,
@@ -745,6 +767,33 @@ impl Processes {
             return Answer::Status(Status::BadSize);
         }
         Answer::Reply(Outgoing::new())
+    }
+
+    /// The record whose identity session the one handle of `r` is a copy
+    /// of: the service empties the identity channel, notifies through the
+    /// handle and takes what came there. A copy of an identity session
+    /// lands in its record's place (its label, which the kernel set); a
+    /// channel of anyone else lands elsewhere, and none came. On one
+    /// processor nothing runs between, the loop being above every client.
+    fn vouch(&mut self, r: &mut Request<'_>) -> Option<usize> {
+        if r.handles.len() != 1 {
+            return None;
+        }
+        let handle = r.handles.take::<Channel>(0).ok()?;
+        let drain = |c: &Handle<Channel>| while sys::try_receive(c).is_ok() {};
+        drain(&self.identities);
+        sys::notify(&handle, 1).ok()?;
+        let got = sys::try_receive(&self.identities);
+        drain(&self.identities);
+        match got {
+            Ok(sys::Received::Notification {
+                source: Source::Session,
+                label,
+                bits,
+                ..
+            }) if bits & 1 != 0 => self.records.find_identity(label),
+            _ => None,
+        }
     }
 
     /// Router of the record in `index`: one thread handle with MANAGE, the
@@ -882,20 +931,29 @@ impl Processes {
         if matches!(target, Target::Group(g) if self.records.members(g) == 0) {
             return refuse(proto_process::NO_PROCESS);
         }
-        if self.walks[index].is_some() {
+        let busy = self.walks[index].is_some();
+        let free = self.later.iter().position(Option::is_none);
+        if busy && free.is_none() {
             return refuse(proto_process::AGAIN);
         }
         let Some(pending) = r.defer() else {
             return Answer::Status(Status::BadSize);
         };
-        self.walks[index] = Some(Walking {
+        let walking = Walking {
             walk: Walk::new(target, index),
             pending,
             signal,
             delivered: false,
             refused: false,
             denied: false,
-        });
+        };
+        if busy {
+            // A second walk of the sender waits for the first (no EAGAIN
+            // in kill): LATER of them in the service.
+            self.later[free.expect("a free place")] = Some((index, walking));
+            return Answer::Deferred;
+        }
+        self.walks[index] = Some(walking);
         self.walking.push(index);
         self.kick();
         Answer::Deferred
@@ -951,16 +1009,20 @@ impl Processes {
             },
             Step::Looked => {}
             Step::Done => {
-                let code = match (w.delivered, w.refused, w.denied) {
-                    (true, _, _) => 0,
-                    (_, true, _) => proto_process::INVALID,
-                    (_, _, true) => proto_process::PERMISSION,
-                    _ => proto_process::NO_PROCESS,
-                };
+                let code = walk::outcome(w.delivered, w.refused, w.denied);
                 let status = Status::from_code(code);
                 let _ = w
                     .pending
                     .answer(&proto_wire::reply(status), Outgoing::new());
+                // The sender's next walk, which waited, starts.
+                let next = self
+                    .later
+                    .iter()
+                    .position(|l| l.as_ref().is_some_and(|(s, _)| *s == index));
+                if let Some((_, next)) = next.and_then(|n| self.later[n].take()) {
+                    self.walks[index] = Some(next);
+                    self.walking.push(index);
+                }
                 self.kick();
                 return;
             }
@@ -968,6 +1030,34 @@ impl Processes {
         self.walks[index] = Some(w);
         self.walking.push(index);
         self.kick();
+    }
+
+    /// A child just made in `index` whose group a walk passed already gets
+    /// that walk's signal at its birth (walk.rs `takes_newborn`): a member
+    /// that spawns while kill(-pgid) or kill(-1) is on leaves no child
+    /// behind the cursor. Only while walks are on: RECORDS looks then.
+    fn signal_newborn(&mut self, index: usize) {
+        if self.walking.is_empty() {
+            return;
+        }
+        let pgid = self.records.get(index).map_or(0, |r| r.pgid);
+        for sender in 0..RECORDS {
+            let Some(w) = self.walks[sender].as_ref() else {
+                continue;
+            };
+            if !w.walk.takes_newborn(index, pgid) {
+                continue;
+            }
+            let signal = w.signal;
+            let delivery = self.deliver(sender, index, signal);
+            if let Some(w) = self.walks[sender].as_mut() {
+                match delivery {
+                    Delivery::Done => w.delivered = true,
+                    Delivery::Denied => w.denied = true,
+                    Delivery::Refused => w.refused = true,
+                }
+            }
+        }
     }
 
     /// Publishes the group and session of the record in `index` on its
@@ -1068,14 +1158,11 @@ impl Processes {
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
     const METHODS: &'static [u16] = proto_process::METHODS;
-    const PLACED: usize = 2 * RECORDS + 1;
+    const PLACED: usize = RECORDS + 1;
     type Data = LongSession;
     fn place(&self, label: u64) -> Option<usize> {
         if label == 0 {
             return Some(0);
-        }
-        if let Some(i) = self.records.find_identity(label) {
-            return Some(RECORDS + 1 + i);
         }
         self.records.find(label).map(|i| i + 1)
     }
@@ -1100,8 +1187,8 @@ impl Service<0> for Processes {
                 _ => self.next(r),
             };
         }
-        if let Some(index) = self.records.find_identity(r.label()) {
-            return self.identity(index, r);
+        if proto_process::is_notary(r.label()) {
+            return self.notary(r);
         }
         let Some(index) = self.records.find(r.label()) else {
             return refuse(proto_process::UNREGISTERED);
@@ -1185,9 +1272,15 @@ impl Service<0> for Processes {
             .unwrap_or(End::Signaled(SIGKILL));
         self.queue.remove(index);
         self.spawns[index] = None;
-        // A walk of the ended sender stops: its reply has no taker.
+        // A walk of the ended sender stops, and those it queued: their
+        // replies have no taker.
         self.walking.remove(index);
         self.walks[index] = None;
+        for slot in &mut self.later {
+            if slot.as_ref().is_some_and(|(s, _)| *s == index) {
+                *slot = None;
+            }
+        }
         let (exit, orphans) = self.records.exited(index, end);
         // Init reads the end once the witness closed.
         self.witnesses[index] = None;

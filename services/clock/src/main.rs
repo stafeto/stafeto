@@ -58,8 +58,11 @@ fn main(_: u64) -> u64 {
             page,
             watches: core::array::from_fn(|_| None),
             process: Handle::borrowed(start.process.raw()),
+            parent: Handle::borrowed(start.parent.raw()),
+            notary: None,
             generations: None,
             identities: core::array::from_fn(|_| None),
+            evict: 0,
         },
         config,
     );
@@ -70,9 +73,10 @@ struct Watch {
     channel: Handle<Channel>,
     history: History,
 }
-/// What the service knows of the process behind a session: its identity
-/// session of the process service, which the first SET of the session
-/// brought, and what Who said, with the generation of the credentials.
+/// What the service knows of the process behind a session: a copy of its
+/// identity session of the process service, which a SET of the session
+/// brought, and what the process service vouched, with the generation of
+/// the credentials.
 struct Identity {
     label: u64,
     channel: Handle<Channel>,
@@ -84,10 +88,19 @@ struct Clocks {
     watches: [Option<Watch>; 8],
     /// The service's own process, to map the generations page in.
     process: ManuallyDrop<Handle<Process>>,
-    /// The page of the credentials generations of the process service, once
-    /// the first SET asked for it (Register).
+    /// Its channel to init, for the notary session.
+    parent: ManuallyDrop<Handle<Channel>>,
+    /// The notary session with the process service, which init gives the
+    /// clock on CONNECT (init's VOUCHERS): the one channel the service
+    /// trusts for who a client is; asked for at the first SET.
+    notary: Option<Handle<Channel>>,
+    /// The page of the credentials generations of the process service,
+    /// through the notary session (Register).
     generations: Option<Handle<Memory>>,
     identities: [Option<Identity>; 8],
+    /// The place a session with none takes when all are used: each is
+    /// taken in turn, and its session brings its copy again.
+    evict: usize,
 }
 
 /// Where the service maps the process service's page of the credentials
@@ -103,23 +116,34 @@ fn generation(index: usize) -> u64 {
     unsafe { &*((GENERATIONS_ADDRESS + index * 8) as *const AtomicU64) }.load(Ordering::Acquire)
 }
 
-/// Who, through an identity session: the process service's answer.
-fn who(channel: &Handle<Channel>) -> Option<proto_process::WhoReply> {
-    let request = proto_process::Method::Who.header().bytes();
-    let reply = sys::send(channel, &request).ok()?;
+/// Vouch through the notary session: what the process service says of
+/// the client whose identity session `identity` is a copy of (none for a
+/// channel of anyone else). The request goes to the process service alone,
+/// never to a client (spec 2, 2).
+fn vouch(notary: &Handle<Channel>, identity: &Handle<Channel>) -> Option<proto_process::WhoReply> {
+    let rights = rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER;
+    let copy = sys::handle_duplicate(identity, rights).ok()?;
+    let request = proto_process::Method::Vouch.header().bytes();
+    let reply = sys::send_handles(notary, &request, [copy.erase()]).ok()?;
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     proto_process::WhoReply::read(reply.bytes(&mut buffer)).ok()
 }
 
 impl Clocks {
-    /// Maps the page of the generations through the identity session of
-    /// `channel` (Register), once.
-    fn map_generations(&mut self, channel: &Handle<Channel>) -> bool {
+    /// The notary session (asked of init once) and the page of the
+    /// generations mapped through it (Register), once.
+    fn notary(&mut self) -> bool {
+        if self.notary.is_none() {
+            self.notary = rt::service::connect(&self.parent, "posix").ok();
+        }
+        let Some(notary) = self.notary.as_ref() else {
+            return false;
+        };
         if self.generations.is_some() {
             return true;
         }
         let request = proto_process::Method::Register.header().bytes();
-        let Ok(mut reply) = sys::send(channel, &request) else {
+        let Ok(mut reply) = sys::send(notary, &request) else {
             return false;
         };
         let mut buffer = [0; rt::abi::MESSAGE_MAX];
@@ -148,13 +172,17 @@ impl Clocks {
     /// Whether the process behind the session `label` may set the clock:
     /// its effective UID is 0 (spec 2, 3.1). `offered` is the identity
     /// session the request brought; the first one of a session is kept and
-    /// the later ones close. What Who said is remembered with the
-    /// generation of the credentials, and asked again only when the
+    /// the later ones close. The process service vouches for it through
+    /// the notary session, and what it said is remembered with the
+    /// generation of the credentials and asked again only when the
     /// generation on the page moved: no call to the process service
     /// otherwise, and a SET sent after `setuid` returned sees the new
-    /// credentials. Without an identity session, or when anything fails,
-    /// no.
+    /// credentials. A channel that is no identity session, no identity
+    /// session, or any failure: no.
     fn may_set(&mut self, label: u64, offered: Option<Handle<Channel>>) -> bool {
+        if !self.notary() {
+            return false;
+        }
         let found = self
             .identities
             .iter()
@@ -162,26 +190,33 @@ impl Clocks {
         let slot = match (found, offered) {
             (Some(slot), _) => slot,
             (None, Some(channel)) => {
-                let Some(free) = self.identities.iter().position(Option::is_none) else {
-                    return false;
-                };
-                self.identities[free] = Some(Identity {
+                // A free place, or else each in turn: the session whose
+                // place went brings its copy with its next SET again.
+                let slot = self
+                    .identities
+                    .iter()
+                    .position(Option::is_none)
+                    .unwrap_or_else(|| {
+                        self.evict = (self.evict + 1) % self.identities.len();
+                        self.evict
+                    });
+                self.identities[slot] = Some(Identity {
                     label,
                     channel,
                     known: Known::new(),
                 });
-                free
+                slot
             }
             (None, None) => return false,
         };
         let Some(mut identity) = self.identities[slot].take() else {
             return false;
         };
-        let allowed = self.map_generations(&identity.channel)
-            && identity
-                .known
-                .credentials(generation, || who(&identity.channel))
-                .is_some_and(|c| c.euid == 0);
+        let notary = self.notary.as_ref().expect("the notary session");
+        let allowed = identity
+            .known
+            .credentials(generation, || vouch(notary, &identity.channel))
+            .is_some_and(|c| c.euid == 0);
         self.identities[slot] = Some(identity);
         allowed
     }

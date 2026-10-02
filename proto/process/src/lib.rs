@@ -44,19 +44,25 @@
 //! service asks for once it set a signal on the page, in place of the
 //! first thread; reply its status.
 //!
-//! Through the identity session of a record (label bit 62, `Label::identity`;
-//! the service gives it with Create, init puts it in the process's start
-//! data under `posix-id`, and the process gives a copy to a service it
-//! asks something of, such as the clock): Who, no body; the reply
-//! (`WhoReply`) is the record's PID, its six credentials and the
+//! The identity session of a record (label bit 62, `Label::identity`) is
+//! a copy of a channel of the service that no loop receives on, with
+//! NOTIFY, TRANSFER and DUPLICATE: the service gives it with Create, init
+//! puts it in the process's start data under `posix-id`, and the process
+//! gives a copy to a service it asks something of, such as the clock. It
+//! carries no request: it proves who brought it. Through a notary session
+//! (a label with NOTARY and no bit 63, which only init gives, on CONNECT,
+//! to the services of its table's VOUCHERS): Vouch, no body and one
+//! handle, a copy a client gave; the service notifies through it and looks
+//! which identity place of its channel the notification reached, so a
+//! channel of anyone else proves nothing (PERMISSION); the reply
+//! (`WhoReply`) is that record's PID, its six credentials and the
 //! generation of its credentials. Register, no body; the reply is a copy
 //! of the page of the credentials generations with MAP_READ and TRANSFER
 //! (`GENERATIONS_SIZE` bytes, a u64 per record index, which the service
 //! raises with Release before it answers a Change and when it makes a
-//! record): a service that asks Who remembers the answer with the
-//! generation and asks again only when the page's word of the record
-//! moved. The identity session answers to the record's index and
-//! generation for any image number, and to nothing else.
+//! record): the voucher remembers an answer with the generation and asks
+//! again only when the page's word of the record moved. Nothing else is
+//! asked through a notary session, and a record's session asks neither.
 //!
 //! SetPgid: pid u32 (0 for the caller) and pgid u32 (0 for the target's
 //! PID); reply its status: NO_PROCESS, PERMISSION, ACCESS. SetSid: no
@@ -268,8 +274,8 @@ pub enum Method {
     SetSid = 16,
     GetPgid = 17,
     GetSid = 18,
-    Who = 19,
     Register = 20,
+    Vouch = 21,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -280,8 +286,18 @@ impl Method {
     }
 }
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21,
 ];
+
+/// The mark of a notary session's label: bit 62 with bit 63 clear, which
+/// no record's label has; only init makes such labels on the service's
+/// channel (proto_init CONNECT of a voucher).
+pub const NOTARY: u64 = 1 << 62;
+
+/// Whether `label` is that of a notary session.
+pub const fn is_notary(label: u64) -> bool {
+    label & (1 << 63) == 0 && label & NOTARY != 0
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -815,8 +831,8 @@ mod tests {
             Method::SetSid,
             Method::GetPgid,
             Method::GetSid,
-            Method::Who,
             Method::Register,
+            Method::Vouch,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

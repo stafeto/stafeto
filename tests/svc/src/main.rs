@@ -99,14 +99,31 @@ fn main(_: u64) -> u64 {
     }
 }
 
-/// The role `sender`: a POSIX process that gives its session with the
-/// process service, the one copy it has, to the clock peer (its method
-/// 10) and ends with 0, or FAILED. The peer still holds the session when
+/// The role `sender`: a POSIX process without root, which finds the clock
+/// refuses it SET and says so, then gives its session with the process
+/// service, the one copy it has, to the clock peer (its method 10) and
+/// ends with 0, or FAILED. The peer still holds the session when
 /// the process ended (tests/posix-threads, credentials.rs).
 fn sender(mut s: Startup) -> u64 {
     let Ok(session) = s.take::<Channel>("posix") else {
         return FAILED;
     };
+    // A process without root may not set the clock, from its first SET on.
+    if let Ok(console) = s.take::<rt::handle::Resource>("console") {
+        rt::console::set(console);
+    }
+    if let (Ok(identity), Ok(clock)) = (
+        s.take::<Channel>("posix-id"),
+        posix_clock::Client::connect(&s.parent),
+    ) {
+        let time = posix_time::Time {
+            seconds: 1_800_000_000,
+            nanos: 0,
+        };
+        if clock.set(time, Some(&identity)) == Err(Status::from_code(proto_clock::PERMISSION)) {
+            rt::println!("posix-sender: nobody may not set the clock");
+        }
+    }
     let Ok(peer) = service::connect(&s.parent, "clock-peer") else {
         return FAILED;
     };

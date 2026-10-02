@@ -1504,6 +1504,11 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(&output, "posix-thread-probe: ok")?;
         qemu::expect_marker(
             &output,
+            "credential-probe: a forged identity does not set the clock",
+        )?;
+        qemu::expect_marker(&output, "posix-sender: nobody may not set the clock")?;
+        qemu::expect_marker(
+            &output,
             "priority-probe: heap and files at the ceiling above main, no helper thread",
         )?;
         qemu::expect_marker(&output, "posix-process: adoption refusals ok")

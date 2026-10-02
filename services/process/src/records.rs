@@ -208,7 +208,8 @@ impl<P> Records<P> {
         self.records.get_mut(index)?.as_mut()
     }
 
-    /// The live records.
+    /// The places taken: the live records, and the places held for a
+    /// group or a session whose number is still used.
     pub fn count(&self) -> usize {
         RECORDS - self.free_len
     }
@@ -1261,6 +1262,19 @@ mod tests {
             None,
             "a LOADING record is none"
         );
+    }
+
+    /// setsid of a former group leader: its group lives on with a member,
+    /// so the number is taken (EPERM), whatever group the caller is in now.
+    #[test]
+    fn setsid_of_a_leader_whose_group_lives_on() {
+        let mut t = Records::<u32>::new();
+        let p = add(&mut t).unwrap();
+        let b = child_in(&mut t, p, Join::NewGroup);
+        let _member = child_in(&mut t, p, Join::Group(b.pid()));
+        assert_eq!(t.set_pgid(at(b), 0, p.pid()), Ok(()), "b leaves its group");
+        assert_eq!(t.members(b.pid()), 1);
+        assert_eq!(t.set_sid(at(b)), Err(GroupError::Permission));
     }
 
     /// Spawn's group flags: a group of its own, an existing group of the

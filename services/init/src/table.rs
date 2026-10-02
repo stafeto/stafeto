@@ -55,6 +55,10 @@ pub const BOOT_IMAGE: &str = "bootimage";
 /// under this name (serve.rs); the service pays for the process. Init
 /// never sends the service a request (spec 6.7).
 pub const PROCESS_SERVICE: &str = "posix";
+/// The services init gives a notary session of the process service on
+/// CONNECT (proto_process::NOTARY): through it they ask who a client is
+/// (Vouch) and map the page of the credentials generations (Register).
+pub const VOUCHERS: &[&str] = &["clock"];
 /// The name of the identity session of a POSIX process in its start data
 /// (spec 2, 3.1): the process gives copies of it to the services it asks
 /// something of, which ask the process service who it is.

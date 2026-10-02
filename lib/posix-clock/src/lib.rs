@@ -16,6 +16,8 @@ use rt::{service, sys};
 
 pub struct Client {
     channel: Handle<Channel>,
+    /// Whether the service has the caller's identity for the session.
+    vouched: core::sync::atomic::AtomicBool,
 }
 impl Client {
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
@@ -24,6 +26,7 @@ impl Client {
     pub fn connect_named(parent: &Handle<Channel>, name: &str) -> Result<Self, Status> {
         Ok(Self {
             channel: service::connect(parent, name)?,
+            vouched: core::sync::atomic::AtomicBool::new(false),
         })
     }
     fn call<'a>(
@@ -189,12 +192,40 @@ impl Client {
         let Some(identity) = identity else {
             return self.unit(request.as_bytes());
         };
+        // The copy of the identity goes with the first SET of the session,
+        // and again when the service answers PERMISSION to a SET without
+        // one (it gave its place for the session to another).
+        let first = !self.vouched.load(core::sync::atomic::Ordering::Relaxed);
+        let result = self.set_with(request.as_bytes(), first.then_some(identity));
+        let result = match result {
+            Err(s) if !first && s == Status::from_code(proto_clock::PERMISSION) => {
+                self.set_with(request.as_bytes(), Some(identity))
+            }
+            other => other,
+        };
+        if result.is_ok() {
+            self.vouched
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+    /// SET of `request`, with a copy of `identity` (NOTIFY, TRANSFER and
+    /// DUPLICATE: the service has the process service vouch for it) when
+    /// given.
+    fn set_with(&self, request: &[u8], identity: Option<&Handle<Channel>>) -> Result<(), Status> {
         loop {
-            let copy =
-                sys::handle_duplicate(identity, rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER)?;
-            let reply = match sys::send_handles(&self.channel, request.as_bytes(), [copy.erase()]) {
-                Err(e) if e.error == Error::Interrupted => continue,
-                result => result.map_err(|e| Status::Kernel(e.error))?,
+            let rights =
+                rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER | rt::abi::Rights::DUPLICATE;
+            let sent = match identity {
+                Some(identity) => {
+                    let copy = sys::handle_duplicate(identity, rights)?;
+                    sys::send_handles(&self.channel, request, [copy.erase()]).map_err(|e| e.error)
+                }
+                None => sys::send(&self.channel, request),
+            };
+            let reply = match sent {
+                Err(Error::Interrupted) => continue,
+                result => result.map_err(Status::Kernel)?,
             };
             let mut buffer = [0; MESSAGE_MAX];
             let bytes = reply.bytes(&mut buffer);

@@ -73,6 +73,37 @@ fn peer(parent: &Handle<Channel>, own: &Handle<rt::handle::Process>) -> bool {
     let bytes = reply.bytes(&mut buffer);
     bytes == proto_wire::reply(Status::from_code(proto_process::PERMISSION))
 }
+/// A channel of the probe's own, offered to the clock in place of its
+/// identity session, proves nothing, even to a root process: the clock
+/// asks the process service, which finds no identity place reached
+/// (PERMISSION at once, the clock never sends to the channel); the real
+/// identity session on another connection sets the clock. Says so.
+fn forged(parent: &Handle<Channel>) -> bool {
+    let time = posix_time::Time {
+        seconds: 1_800_000_000,
+        nanos: 0,
+    };
+    let Ok(own) = sys::channel_create(30) else {
+        return false;
+    };
+    let rights = rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER | rt::abi::Rights::DUPLICATE;
+    let Ok(fake) = sys::handle_label(&own, rights, 77, 30) else {
+        return false;
+    };
+    let (Ok(forger), Ok(honest)) = (
+        posix_clock::Client::connect(parent),
+        posix_clock::Client::connect(parent),
+    ) else {
+        return false;
+    };
+    let refused = forger.set(time, Some(&fake)) == Err(Status::from_code(proto_clock::PERMISSION));
+    let allowed = honest.set(time, abi::process::identity()).is_ok();
+    if refused && allowed {
+        rt::println!("credential-probe: a forged identity does not set the clock");
+    }
+    refused && allowed
+}
+
 /// A record goes with its process (case (a) of mk.P1 in the audit 4):
 /// `posix-sender` (tests/svc, role `t`) gives the clock peer its own
 /// session and ends; a query through that session, which the peer still
@@ -134,6 +165,9 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     }
     if !transferred(parent) {
         return failed(498);
+    }
+    if !forged(parent) {
+        return failed(499);
     }
     rt::println!(
         "credential-probe: shared UID/GID, saved IDs, sessions by label, a record that goes with its process ok"
