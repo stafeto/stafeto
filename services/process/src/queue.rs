@@ -48,6 +48,11 @@ impl Queue {
         true
     }
 
+    /// Whether no index waits.
+    pub fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
     /// The index at the head, which leaves.
     pub fn pop(&mut self) -> Option<usize> {
         let head = usize::from(self.head?);

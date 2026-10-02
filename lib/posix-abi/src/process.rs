@@ -43,45 +43,114 @@ pub unsafe fn init(session: Handle<Channel>) -> Result<(), Status> {
     Ok(())
 }
 
-/// kill of the process `pid` (> 0, the caller's own among them) with
-/// `signal` through the process service (0 checks alone): ESRCH, EPERM,
-/// EINVAL from the service. A signal to the caller's own process comes to
-/// a thread of it before the return, the caller when its mask lets it
-/// through ([P24-KILL]).
-pub fn kill(pid: i32, signal: i32) -> Result<(), i32> {
-    use crate::constants::{EINVAL, EIO, EPERM, ESRCH};
-    let pid = u32::try_from(pid).ok().filter(|&p| p != 0).ok_or(EINVAL)?;
-    let signal = u32::try_from(signal).map_err(|_| EINVAL)?;
-    let mut w = Writer::new();
-    proto_process::Method::Kill
-        .header()
-        .write(&mut w)
-        .map_err(|_| EIO)?;
-    w.u32(pid).map_err(|_| EIO)?;
-    w.u32(signal).map_err(|_| EIO)?;
+/// The service's answer to a request through the session of the process's
+/// record: the number its reply carries (0 for a status alone), or the
+/// errno of its status. A send that came back INTERRUPTED was never seen
+/// by the service and goes again; an accepted request that waits for its
+/// reply (a walk of a group) is not taken back by a signal.
+fn ask(w: &Writer) -> Result<u32, i32> {
+    use crate::constants::{EACCES, EAGAIN, EINVAL, EIO, EPERM, ESRCH};
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
-    let status = loop {
+    let (status, value) = loop {
         match rt::sys::send(client().session(), w.as_bytes()) {
             Err(rt::abi::Error::Interrupted) => continue,
             Err(_) => return Err(EIO),
             Ok(reply) => {
-                let bytes = reply.bytes(&mut buffer);
-                break proto_wire::Reader::new(bytes).u32().map_err(|_| EIO)?;
+                let mut bytes = proto_wire::Reader::new(reply.bytes(&mut buffer));
+                let status = bytes.u32().map_err(|_| EIO)?;
+                break (status, bytes.u32().unwrap_or(0));
             }
         }
     };
     match status {
-        0 => {}
-        proto_process::NO_PROCESS => return Err(ESRCH),
-        proto_process::PERMISSION => return Err(EPERM),
-        proto_process::INVALID => return Err(EINVAL),
-        _ => return Err(EIO),
+        0 => Ok(value),
+        proto_process::NO_PROCESS => Err(ESRCH),
+        proto_process::PERMISSION => Err(EPERM),
+        proto_process::INVALID => Err(EINVAL),
+        proto_process::ACCESS => Err(EACCES),
+        proto_process::AGAIN => Err(EAGAIN),
+        _ => Err(EIO),
     }
-    if pid == PID.load(Ordering::Acquire) && signal != 0 {
+}
+
+/// A request of `method` with the numbers `words` as its body.
+fn request(method: proto_process::Method, words: &[u32]) -> Result<Writer, i32> {
+    let mut w = Writer::new();
+    method
+        .header()
+        .write(&mut w)
+        .map_err(|_| crate::constants::EIO)?;
+    for &word in words {
+        w.u32(word).map_err(|_| crate::constants::EIO)?;
+    }
+    Ok(w)
+}
+
+/// kill of `pid` with `signal` through the process service (0 checks
+/// alone): a process for `pid` above 0, the caller's group for 0, every
+/// process but the caller's for -1, the group -`pid` below; ESRCH, EPERM,
+/// EINVAL from the service, EAGAIN while another walk of the process's
+/// groups is on. A signal to the caller's own process or group comes to a
+/// thread of it before the return, the caller when its mask lets it
+/// through ([P24-KILL]).
+pub fn kill(pid: i32, signal: i32) -> Result<(), i32> {
+    let signal = u32::try_from(signal).map_err(|_| crate::constants::EINVAL)?;
+    ask(&request(
+        proto_process::Method::Kill,
+        &[pid as u32, signal],
+    )?)?;
+    if signal != 0 && (pid == getpid() || (pid <= 0 && pid != -1)) {
         crate::signals::route();
         crate::signals::deliver_now();
     }
     Ok(())
+}
+
+/// killpg of group `pgrp`: 0 is the caller's own, one or below is EINVAL
+/// (no group 1 exists: PID 1 is the service).
+pub fn killpg(pgrp: i32, signal: i32) -> Result<(), i32> {
+    if pgrp < 0 || pgrp == 1 {
+        return Err(crate::constants::EINVAL);
+    }
+    kill(-pgrp, signal)
+}
+
+/// setpgid ([P24-SETPGID]) through the service: EINVAL for a negative
+/// number; ESRCH, EPERM, EACCES from it.
+pub fn setpgid(pid: i32, pgid: i32) -> Result<(), i32> {
+    let (Ok(pid), Ok(pgid)) = (u32::try_from(pid), u32::try_from(pgid)) else {
+        return Err(crate::constants::EINVAL);
+    };
+    ask(&request(proto_process::Method::SetPgid, &[pid, pgid])?).map(drop)
+}
+
+/// setsid ([P24-SETSID]): the new session's number; EPERM for a leader of
+/// a group. The page takes the new numbers before the reply.
+pub fn setsid() -> Result<i32, i32> {
+    let sid = ask(&request(proto_process::Method::SetSid, &[])?)?;
+    i32::try_from(sid).map_err(|_| crate::constants::EIO)
+}
+
+/// getpgid of `pid`: the caller's own group from its page with no call.
+pub fn getpgid(pid: i32) -> Result<i32, i32> {
+    let pid = u32::try_from(pid).map_err(|_| crate::constants::EINVAL)?;
+    if pid == 0 || pid == getpid() as u32 {
+        return i32::try_from(page().pgid.load(Ordering::Acquire))
+            .map_err(|_| crate::constants::EIO);
+    }
+    let pgid = ask(&request(proto_process::Method::GetPgid, &[pid])?)?;
+    i32::try_from(pgid).map_err(|_| crate::constants::EIO)
+}
+
+/// getsid of `pid`: the caller's own session from its page with no call.
+pub fn getsid(pid: i32) -> Result<i32, i32> {
+    let pid = u32::try_from(pid).map_err(|_| crate::constants::EINVAL)?;
+    if pid == 0 || pid == getpid() as u32 {
+        return i32::try_from(page().sid.load(Ordering::Acquire))
+            .map_err(|_| crate::constants::EIO);
+    }
+    let sid = ask(&request(proto_process::Method::GetSid, &[pid])?)?;
+    i32::try_from(sid).map_err(|_| crate::constants::EIO)
 }
 
 /// The client of the process's record, which startup published.

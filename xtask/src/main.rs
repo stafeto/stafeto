@@ -1822,6 +1822,9 @@ fn posix_procs_probe() -> Result<(), String> {
             "init: procs-sleeper ended: signal 15 (SIGTERM), not restarted",
             "init: procs-block ended: killed, not restarted",
             "init: procs-catch ended: exit code 42, not restarted",
+            "init: procs-catch ended: signal 15 (SIGTERM), not restarted",
+            "init: procs-sleep2 ended: signal 15 (SIGTERM), not restarted",
+            "init: procs-ids ended: exit code 0, not restarted",
         ] {
             run.expect_seen(line, BOOT_TIMEOUT)?;
         }

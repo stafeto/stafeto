@@ -1482,6 +1482,8 @@ mod tests {
                 "procs-middle",
                 "procs-orphan",
                 "procs-catch",
+                "procs-sleep2",
+                "procs-ids",
                 "procs-block"
             ]
         );

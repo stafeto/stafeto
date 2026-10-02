@@ -23,13 +23,15 @@
 #![no_main]
 use core::cell::UnsafeCell;
 use posix_process_service::queue::Queue;
-use posix_process_service::records::{self, Exit, Record, Records, State};
+use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
 use posix_process_service::signals::{self, Info, Posted};
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
+use posix_process_service::walk::{Step, Target, Walk};
 use proto_process::{
     CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, INIT_PID, Method, Next,
-    PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, RECORDS, SI_USER, SIGCHLD, SIGKILL, Selector, Spawn,
-    WCONTINUED, WEXITED, WNOHANG, WNOWAIT, WSTOPPED, WaitResult, WaitStart,
+    PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, RECORDS, SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX, SIGSTOP,
+    SPAWN_SETPGROUP, SPAWN_SETSID, Selector, Spawn, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
+    WSTOPPED, WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
@@ -65,6 +67,27 @@ struct Spawning {
     pending: Pending,
     request: Spawn,
 }
+/// A walk of kill(0), kill(-pgid) or kill(-1) that waits (walk.rs): the
+/// sender's request, what it sends, and what the steps found so far.
+struct Walking {
+    walk: Walk,
+    pending: Pending,
+    signal: u8,
+    delivered: bool,
+    refused: bool,
+    denied: bool,
+}
+/// The label of the service's own place for the notification that makes
+/// the next step of a walk: a service label no record has (its index
+/// is past RECORDS).
+const STEP: u64 = 1 << 63 | 0xFFFF;
+/// What one delivery of a signal to one process came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    Done,
+    Denied,
+    Refused,
+}
 struct Processes {
     /// The service's channel, which the sessions are copies of.
     channel: ManuallyDrop<Handle<Channel>>,
@@ -88,6 +111,14 @@ struct Processes {
     /// The waits that wait: LongOps, and what each takes.
     ops: LongOps<WAITS>,
     waits: Waits<WAITS>,
+    /// The walks that wait, by their sender's index, and the order of
+    /// their next steps.
+    walks: [Option<Walking>; RECORDS],
+    walking: Queue,
+    /// The place of the service's channel that tells it of the next step
+    /// (STEP), and whether a step was told and not taken.
+    step: Option<Handle<Channel>>,
+    step_told: bool,
 }
 impl Processes {
     const fn new() -> Self {
@@ -103,6 +134,10 @@ impl Processes {
             routers: [const { None }; RECORDS],
             ops: LongOps::new(),
             waits: Waits::new(),
+            walks: [const { None }; RECORDS],
+            walking: Queue::new(),
+            step: None,
+            step_told: false,
         }
     }
 }
@@ -155,6 +190,12 @@ fn main(_: u64) -> u64 {
     let owner = unsafe { &mut *OWNER.0.get() };
     owner.channel = Handle::borrowed(channel.raw());
     owner.level = level;
+    // The notification of a step goes to the loop's own channel at its
+    // level, so that a step waits in the queue with the requests.
+    let Ok(step) = sys::handle_label(&channel, Rights::NOTIFY, STEP, level) else {
+        return 7;
+    };
+    owner.step = Some(step);
     rt::println!("posix-process: ready (records with their processes, root by init's table)");
     let _ = rt::service::run::<Processes, SESSIONS, 0>(&channel, owner, config);
     5
@@ -179,13 +220,30 @@ fn snapshot(r: &mut Request<'_>, record: &Record<Handle<Process>>) {
 fn refuse(code: u32) -> Answer {
     Answer::Status(Status::from_code(code))
 }
+/// The status of a failed call of groups and sessions.
+const fn group_error(e: GroupError) -> u32 {
+    match e {
+        GroupError::NoProcess => proto_process::NO_PROCESS,
+        GroupError::Permission => proto_process::PERMISSION,
+        GroupError::Access => proto_process::ACCESS,
+    }
+}
+/// A reply of status 0 and the number `n`.
+fn number(r: &mut Request<'_>, n: u32) -> Answer {
+    let w = r.reply();
+    if w.u32(0).and_then(|()| w.u32(n)).is_err() {
+        return Answer::Status(Status::BadSize);
+    }
+    Answer::Reply(Outgoing::new())
+}
 impl Processes {
     /// Create (label 0): a record, LOADING, of a new process with the
     /// parameters of the body and the start channel the request brought,
     /// the process's end told through the record's exit place (O(1)): a
     /// record of init's table, or a child of the live record of the body's
     /// parent with its credentials (UNREGISTERED for none, AGAIN for one
-    /// with CHILDREN_MAX children). The reply: the PID and the label, a
+    /// with CHILDREN_MAX children), in the group and session its Spawn
+    /// asks for (PERMISSION where setpgid would be EPERM). The reply: the PID and the label, a
     /// copy of the process for the load and the record's session. FULL
     /// with every record taken; the errors of the calls as the status, and
     /// nothing stays.
@@ -210,6 +268,20 @@ impl Processes {
         };
         let Some(label) = self.records.next_label() else {
             return refuse(proto_process::FULL);
+        };
+        // The group and session the parent's Spawn asks for, before any
+        // call: PERMISSION where setpgid would say EPERM.
+        let join = match parent {
+            Some(p) => {
+                let (flags, pgroup) = self.spawns[p]
+                    .as_ref()
+                    .map_or((0, 0), |s| (s.request.flags, s.request.pgroup));
+                match self.records.joining(p, flags, pgroup, label.pid()) {
+                    Some(join) => join,
+                    None => return refuse(proto_process::PERMISSION),
+                }
+            }
+            None => Join::Inherit,
         };
         let place = records::exit_place(label, &create, self.level);
         let made = sys::handle_label(&self.channel, Rights::NOTIFY, place.label, place.slot)
@@ -238,7 +310,7 @@ impl Processes {
         };
         let index = self
             .records
-            .insert(label, process, parent, credentials, create.ceiling);
+            .insert(label, process, parent, credentials, create.ceiling, join);
         self.witnesses[index] = Some(witness);
         let record = self.records.get(index).expect("a new record");
         let identity = [label.pid(), record.parent, record.pgid, record.sid];
@@ -355,14 +427,22 @@ impl Processes {
     /// Spawn of the record in `index`: the request waits for the spawning
     /// thread, which makes the child (spawn.rs), and its reply comes with
     /// Loaded or Abandon. AGAIN while a Spawn of the record waits or it
-    /// has CHILDREN_MAX children; INVALID for any spawn-flag until process
-    /// groups come (5b T5).
+    /// has CHILDREN_MAX children; INVALID for a spawn-flag other than
+    /// SETPGROUP and SETSID, PERMISSION for the group they ask for when
+    /// setpgid would be EPERM (Create asks again: the groups may change).
     fn spawn(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let Ok(request) = Spawn::read(r.body()) else {
             return Answer::Status(Status::BadSize);
         };
-        if request.flags != 0 {
+        if request.flags & !(SPAWN_SETPGROUP | SPAWN_SETSID) != 0 {
             return refuse(proto_process::INVALID);
+        }
+        if self
+            .records
+            .joining(index, request.flags, request.pgroup, 0)
+            .is_none()
+        {
+            return refuse(proto_process::PERMISSION);
         }
         if self.spawns[index].is_some() || !self.records.may_spawn(index) {
             return refuse(proto_process::AGAIN);
@@ -634,60 +714,256 @@ impl Processes {
         }
     }
 
-    /// Kill of the record in `index`: pid u32 and signal u32. NO_PROCESS
-    /// for no live or zombie process of that PID (a LOADING one is none
-    /// yet); PERMISSION past kill's rule (`signals::may_signal`); signal 0
-    /// checks alone; SIGKILL ends the process from the service at the
-    /// target's ceiling (process_kill_at); INVALID for a signal the service
-    /// refuses until stops come (`signals::refused`); any other is posted
-    /// on the target's page (`signal`). The reply comes once the signal is
-    /// there: the caller's layer looks at its own page before its return.
+    /// Delivers `signal` from the record in `sender` to the process of the
+    /// record in `target`: Denied past kill's rule (`signals::may_signal`),
+    /// Refused for a signal the service refuses until stops come
+    /// (`signals::refused`); signal 0 and a zombie take nothing; SIGKILL
+    /// ends the process from the service at the target's ceiling
+    /// (process_kill_at); any other is posted on the target's page
+    /// (`signal`). O(1).
+    fn deliver(&mut self, sender: usize, target: usize, signal: u8) -> Delivery {
+        let from = self.records.get(sender).expect("the sender");
+        let (from_pid, creds, from_session) = (from.label.pid(), from.credentials, from.sid);
+        let record = self.records.get(target).expect("a target");
+        if !signals::may_signal(
+            creds,
+            record.credentials,
+            signal,
+            from_session == record.sid,
+        ) {
+            return Delivery::Denied;
+        }
+        let zombie = matches!(record.state, State::Zombie(_));
+        if signal == 0 || zombie {
+            return Delivery::Done;
+        }
+        if signal == SIGKILL {
+            let _ = sys::process_kill_at(&record.process, record.ceiling);
+            return Delivery::Done;
+        }
+        let Some(page) = self.pages.page(target) else {
+            return Delivery::Refused;
+        };
+        if signals::refused(signal, page) {
+            return Delivery::Refused;
+        }
+        let info = Info {
+            code: SI_USER,
+            pid: from_pid,
+            uid: creds.uid,
+            status: 0,
+        };
+        self.signal(target, signal, info);
+        Delivery::Done
+    }
+
+    /// Kill of the record in `index`: pid (an i32 as a u32) and signal
+    /// u32. A pid above 0 names one process: NO_PROCESS for no live or
+    /// zombie process of that PID (a LOADING one is none yet), PERMISSION
+    /// and INVALID as `deliver` says, and the reply comes once the signal
+    /// is there: the caller's layer looks at its own page before its
+    /// return. 0 is the sender's group, -1 every process but the sender's,
+    /// below -1 the group -pid: a walk over the records, one step at a
+    /// time, whose reply comes at its end (`walk_start`).
     fn kill(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let (Ok(pid), Ok(signal)) = (body.u32(), body.u32()) else {
             return Answer::Status(Status::BadSize);
         };
-        if body.finish().is_err() || pid == 0 {
+        if body.finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
         let Ok(signal) = u8::try_from(signal) else {
             return refuse(proto_process::INVALID);
         };
-        let sender = self.records.get(index).expect("the sender");
-        let (from_pid, from, from_session) = (sender.label.pid(), sender.credentials, sender.sid);
-        let Some(target) = self.records.find_pid(pid).filter(|&t| {
+        let pid = pid as i32;
+        if pid <= 0 {
+            return self.walk_start(index, pid, signal, r);
+        }
+        let Some(target) = self.records.find_pid(pid as u32).filter(|&t| {
             self.records
                 .get(t)
                 .is_some_and(|r| r.state != State::Loading)
         }) else {
             return refuse(proto_process::NO_PROCESS);
         };
-        let record = self.records.get(target).expect("a target");
-        if !signals::may_signal(from, record.credentials, signal, from_session == record.sid) {
-            return refuse(proto_process::PERMISSION);
+        match self.deliver(index, target, signal) {
+            Delivery::Done => Answer::Status(Status::Ok),
+            Delivery::Denied => refuse(proto_process::PERMISSION),
+            Delivery::Refused => refuse(proto_process::INVALID),
         }
-        let zombie = matches!(record.state, State::Zombie(_));
-        if signal == 0 || zombie {
-            return Answer::Status(Status::Ok);
-        }
-        if signal == SIGKILL {
-            let _ = sys::process_kill_at(&record.process, record.ceiling);
-            return Answer::Status(Status::Ok);
-        }
-        let Some(page) = self.pages.page(target) else {
-            return refuse(proto_process::NO_PROCESS);
-        };
-        if signals::refused(signal, page) {
+    }
+
+    /// The start of a walk of `index` for `pid` of 0 or below: INVALID for
+    /// a signal past SIGNAL_MAX and SIGSTOP (until stops come, as
+    /// `signals::refused` says for one process); NO_PROCESS at once for a
+    /// group nobody is in; AGAIN while the sender's other walk is on; else
+    /// the request waits for the steps (`walk_step`).
+    fn walk_start(&mut self, index: usize, pid: i32, signal: u8, r: &mut Request<'_>) -> Answer {
+        if signal > SIGNAL_MAX || signal == SIGSTOP {
             return refuse(proto_process::INVALID);
         }
-        let info = Info {
-            code: SI_USER,
-            pid: from_pid,
-            uid: from.uid,
-            status: 0,
+        let own = self.records.get(index).expect("the sender").pgid;
+        let target = match pid {
+            0 => Target::Group(own),
+            -1 => Target::All,
+            p => Target::Group(p.unsigned_abs()),
         };
-        self.signal(target, signal, info);
-        Answer::Status(Status::Ok)
+        if matches!(target, Target::Group(g) if self.records.members(g) == 0) {
+            return refuse(proto_process::NO_PROCESS);
+        }
+        if self.walks[index].is_some() {
+            return refuse(proto_process::AGAIN);
+        }
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.walks[index] = Some(Walking {
+            walk: Walk::new(target, index),
+            pending,
+            signal,
+            delivered: false,
+            refused: false,
+            denied: false,
+        });
+        self.walking.push(index);
+        self.kick();
+        Answer::Deferred
+    }
+
+    /// Tells the loop of a step of the walks that wait, unless one is
+    /// told already: a notification to the loop's own channel, which comes
+    /// in its turn between the requests. When the call fails the walks
+    /// that wait are answered AGAIN, none is left waiting for a step that
+    /// never comes.
+    fn kick(&mut self) {
+        while !self.step_told && !self.walking.is_empty() {
+            if self
+                .step
+                .as_ref()
+                .is_some_and(|s| sys::notify(s, 1).is_ok())
+            {
+                self.step_told = true;
+                return;
+            }
+            let Some(index) = self.walking.pop() else {
+                return;
+            };
+            if let Some(w) = self.walks[index].take() {
+                let status = Status::from_code(proto_process::AGAIN);
+                let _ = w
+                    .pending
+                    .answer(&proto_wire::reply(status), Outgoing::new());
+            }
+        }
+    }
+
+    /// One step of the walk at the head of the queue (walk.rs): one
+    /// delivery, or a look at up to LOOKS places; the walk goes to the
+    /// tail unless it is done, and its sender's request is answered with
+    /// what the steps found: Ok when a process took the signal, else
+    /// INVALID for one it refuses, PERMISSION when processes were there
+    /// and none could be signalled, NO_PROCESS for none.
+    fn walk_step(&mut self) {
+        self.step_told = false;
+        let Some(index) = self.walking.pop() else {
+            return;
+        };
+        let Some(mut w) = self.walks[index].take() else {
+            self.kick();
+            return;
+        };
+        match w.walk.step(&self.records) {
+            Step::Found(target) => match self.deliver(index, target, w.signal) {
+                Delivery::Done => w.delivered = true,
+                Delivery::Denied => w.denied = true,
+                Delivery::Refused => w.refused = true,
+            },
+            Step::Looked => {}
+            Step::Done => {
+                let code = match (w.delivered, w.refused, w.denied) {
+                    (true, _, _) => 0,
+                    (_, true, _) => proto_process::INVALID,
+                    (_, _, true) => proto_process::PERMISSION,
+                    _ => proto_process::NO_PROCESS,
+                };
+                let status = Status::from_code(code);
+                let _ = w
+                    .pending
+                    .answer(&proto_wire::reply(status), Outgoing::new());
+                self.kick();
+                return;
+            }
+        }
+        self.walks[index] = Some(w);
+        self.walking.push(index);
+        self.kick();
+    }
+
+    /// Publishes the group and session of the record in `index` on its
+    /// page, where `getpgrp`, `getsid(0)` and waitpid(0) read them.
+    fn publish_group(&self, index: usize) {
+        let (Some(record), Some(page)) = (self.records.get(index), self.pages.page(index)) else {
+            return;
+        };
+        page.pgid
+            .store(record.pgid, core::sync::atomic::Ordering::Release);
+        page.sid
+            .store(record.sid, core::sync::atomic::Ordering::Release);
+    }
+
+    /// SetPgid of the record in `index`: pid u32 and pgid u32 (records.rs
+    /// `set_pgid`); the status alone: NO_PROCESS, PERMISSION, ACCESS.
+    fn set_pgid(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(pid), Ok(pgid)) = (body.u32(), body.u32()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() || pid > i32::MAX as u32 || pgid > i32::MAX as u32 {
+            return Answer::Status(Status::BadSize);
+        }
+        match self.records.set_pgid(index, pid, pgid) {
+            Ok(()) => {
+                self.publish_group(index);
+                Answer::Status(Status::Ok)
+            }
+            Err(e) => refuse(group_error(e)),
+        }
+    }
+
+    /// SetSid of the record in `index`: the status and the new number.
+    fn set_sid(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        match self.records.set_sid(index) {
+            Ok(sid) => {
+                self.publish_group(index);
+                number(r, sid)
+            }
+            Err(e) => refuse(group_error(e)),
+        }
+    }
+
+    /// GetPgid or GetSid of `pid` (0 for the record in `index`): the
+    /// status and the number, NO_PROCESS for no such record.
+    fn get_group(&self, index: usize, session: bool, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let Ok(pid) = body.u32() else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let found = if session {
+            self.records.sid_of(index, pid)
+        } else {
+            self.records.pgid_of(index, pid)
+        };
+        match found {
+            Some(n) => number(r, n),
+            None => refuse(proto_process::NO_PROCESS),
+        }
     }
 
     /// The child in `child` of the record in `parent` ended with `end`: a
@@ -791,6 +1067,10 @@ impl Service<0> for Processes {
             n if n == Method::WaitStart as u16 => self.wait_start(index, s, r),
             n if n == Method::WaitCancel as u16 => self.wait_cancel(s, r),
             n if n == Method::Kill as u16 => self.kill(index, r),
+            n if n == Method::SetPgid as u16 => self.set_pgid(index, r),
+            n if n == Method::SetSid as u16 => self.set_sid(index, r),
+            n if n == Method::GetPgid as u16 => self.get_group(index, false, r),
+            n if n == Method::GetSid as u16 => self.get_group(index, true, r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
@@ -798,12 +1078,19 @@ impl Service<0> for Processes {
     fn gone(&mut self, s: &mut Session<LongSession, 0>) {
         self.ops.gone(&mut s.data);
     }
+    /// The telling of a step of the walks (STEP): one step of the walk at
+    /// the head of the queue (`walk_step`).
+    ///
     /// The end of a process, through its record's exit place: the record
     /// ends with its reason (proto_process::End), its live children get
     /// PID 1 in their records and pages, and it waits as a zombie for its
     /// parent's wait, whose waits that take it are told, or goes at once
     /// without a parent. An end of an older generation takes nothing.
     fn notification(&mut self, n: Notice) {
+        if n.source == Source::Session && n.label == STEP {
+            self.walk_step();
+            return;
+        }
         if n.source != Source::Exit {
             return;
         }
@@ -815,6 +1102,9 @@ impl Service<0> for Processes {
             .unwrap_or(End::Signaled(SIGKILL));
         self.queue.remove(index);
         self.spawns[index] = None;
+        // A walk of the ended sender stops: its reply has no taker.
+        self.walking.remove(index);
+        self.walks[index] = None;
         let (exit, orphans) = self.records.exited(index, end);
         // Init reads the end once the witness closed.
         self.witnesses[index] = None;

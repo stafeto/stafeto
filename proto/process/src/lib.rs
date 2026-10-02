@@ -31,12 +31,25 @@
 //! labelled k: READY or ARMED, then bit 0 through the copy once a child of
 //! the selector ended. WaitCancel: body k u64: READY or CANCELLED.
 //!
-//! Kill, through a session: body pid u32 (> 0) and signal u32 (0 to 64);
-//! reply its status: NO_PROCESS, PERMISSION, or INVALID for a signal past
-//! 64 and for the stop signals until stops come (5e). Router, through a
+//! Kill, through a session: body pid i32 as a u32 and signal u32 (0 to
+//! 64); pid > 0 names a process, 0 the sender's group, -1 every process
+//! but the sender's the sender may signal, < -1 the group -pid; the
+//! reply, once the signal is there or the walk of a group or of every
+//! process is over (one step at a time, in the service's loop), is its
+//! status: NO_PROCESS for none found, PERMISSION when none took it,
+//! INVALID for a signal past 64 and for the stop signals until stops come
+//! (5e), AGAIN while another walk of the sender's record is on. Router, through a
 //! session: no body and one handle, the thread (MANAGE) whose entry the
 //! service asks for once it set a signal on the page, in place of the
 //! first thread; reply its status.
+//!
+//! SetPgid: pid u32 (0 for the caller) and pgid u32 (0 for the target's
+//! PID); reply its status: NO_PROCESS, PERMISSION, ACCESS. SetSid: no
+//! body; reply status u32 and the new session's number u32 (the PID);
+//! PERMISSION for a leader of a group. GetPgid and GetSid: pid u32 (0 for
+//! the caller); reply status u32 and the number u32; NO_PROCESS. The page
+//! carries the caller's own group and session, which it reads without a
+//! call.
 //!
 //! The page of the record (`Page`) lies at PAGE_ADDRESS of the process,
 //! the service's to write but for the fields the process writes.
@@ -236,6 +249,10 @@ pub enum Method {
     WaitCancel = 12,
     Kill = 13,
     Router = 14,
+    SetPgid = 15,
+    SetSid = 16,
+    GetPgid = 17,
+    GetSid = 18,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -245,7 +262,7 @@ impl Method {
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -719,7 +736,12 @@ mod tests {
             Method::WaitCancel,
             Method::Kill,
             Method::Router,
+            Method::SetPgid,
+            Method::SetSid,
+            Method::GetPgid,
+            Method::GetSid,
         ];
+        assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
             assert_eq!(m.header().version, 4);

@@ -4,7 +4,8 @@
 //! What the POSIX process service decides apart from the calls it makes:
 //! the table of its records (`records`), the queue of the spawns that
 //! wait (`queue`), the waits that wait (`waits`) and the rules of
-//! signals (`signals`). The program creates the
+//! signals (`signals`), and the steps of the walks over the records
+//! (`walk`). The program creates the
 //! processes and keeps their handles; everything here builds for the host
 //! too, where `cargo test -p posix-process-service` exercises it.
 
@@ -14,3 +15,4 @@ pub mod queue;
 pub mod records;
 pub mod signals;
 pub mod waits;
+pub mod walk;

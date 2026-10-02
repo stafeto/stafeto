@@ -221,8 +221,8 @@ pub const RELIBC_TABLE: &[Record] = &[
 /// load fails (the image gives `posix-procs-big` that stack), one that
 /// ends 300 ms after its start, one that exits with 7, one that faults,
 /// one that spawns the next, which waits to be an orphan, one that blocks
-/// every signal and spins, and one that exits with 42 from its handler of
-/// SIGUSR1.
+/// every signal and spins, one that exits with 42 from its handler of
+/// SIGUSR1, a second sleeper, and one that calls setsid and setpgid.
 pub const POSIX_PROCS_TABLE: &[Record] = &[
     TABLE[0],
     POSIX_ABI_TABLE[1],
@@ -293,6 +293,18 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
     Record {
         name: "procs-catch",
         args: b"posix-procs\0catch\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-sleep2",
+        args: b"posix-procs\0sleep2\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-ids",
+        args: b"posix-procs\0ids\0",
         on_demand: true,
         ..PROCS_CHILD
     },

@@ -9,7 +9,7 @@
 
 use super::{call, value};
 use core::ffi::c_int;
-use posix_abi::constants::{EINVAL, ENOSYS};
+use posix_abi::constants::EINVAL;
 use posix_abi::signals::{SigAction, SigSet};
 use posix_types::Timespec;
 
@@ -181,17 +181,41 @@ pub extern "C" fn stafeto_raise(signal: c_int) -> c_int {
     value(call(|| posix_abi::signals::raise(signal)).map(|()| 0)) as c_int
 }
 
-/// kill through the process service: a PID, or 0 for the caller's own
-/// process until process groups come (5b T5); groups and -1 are ENOSYS
-/// until then.
+/// kill through the process service: a PID, 0 for the caller's group, -1
+/// for every process but the caller's, below -1 the group -pid.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_kill(pid: c_int, signal: c_int) -> c_int {
-    let pid = match pid {
-        0 => posix_abi::process::getpid(),
-        p if p > 0 => p,
-        _ => return -ENOSYS,
-    };
     value(call(|| posix_abi::process::kill(pid, signal)).map(|()| 0)) as c_int
+}
+
+/// killpg through the process service (posix_abi::process::killpg).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_killpg(pgrp: c_int, signal: c_int) -> c_int {
+    value(call(|| posix_abi::process::killpg(pgrp, signal)).map(|()| 0)) as c_int
+}
+
+/// setpgid of `pid` to `pgid` through the process service.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setpgid(pid: c_int, pgid: c_int) -> c_int {
+    value(call(|| posix_abi::process::setpgid(pid, pgid)).map(|()| 0)) as c_int
+}
+
+/// setsid: the new session's number, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setsid() -> c_int {
+    value(call(|| posix_abi::process::setsid().map(i64::from))) as c_int
+}
+
+/// getpgid of `pid`: the group's number, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getpgid(pid: c_int) -> c_int {
+    value(call(|| posix_abi::process::getpgid(pid).map(i64::from))) as c_int
+}
+
+/// getsid of `pid`: the session's number, or the negated errno.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getsid(pid: c_int) -> c_int {
+    value(call(|| posix_abi::process::getsid(pid).map(i64::from))) as c_int
 }
 
 #[unsafe(no_mangle)]

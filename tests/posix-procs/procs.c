@@ -8,8 +8,7 @@
  * compares them with the parent's line); a path outside /boot and a name
  * of no record give ENOENT; a second spawn of a record whose child lives
  * EAGAIN; a child that does not load ENOMEM, with no PID; file actions,
- * flags outside SETPGROUP and SETSID, and until process groups come those
- * two too, EINVAL.
+ * flags outside SETPGROUP and SETSID EINVAL.
  *
  * Stage 2, zombies and waits: the child is waited for, and the same
  * record spawned again at once; WNOHANG before a child's end gives 0; a
@@ -27,6 +26,15 @@
  * child's PID, CLD_EXITED and its status; a signal to the probe's own
  * process runs its handler before kill returns, and one its main thread
  * blocks goes to the thread that lets it through.
+ *
+ * Stage 4, process groups and sessions: the probe leads a group and a
+ * session; three children join a group by POSIX_SPAWN_SETPGROUP, killpg
+ * ends them with SIGTERM, and waitpid(-pgid) takes them alone, leaving a
+ * zombie of the probe's own group; setpgid of a child that started is
+ * EACCES, and a spawn into a group no session has EPERM; kill(0) reaches
+ * the probe's group, kill(-1) every process but the probe; children that
+ * call setsid and setpgid themselves (role ids) see EPERM for a leader
+ * and the new numbers on their page and through the service.
  *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
@@ -218,13 +226,118 @@ static void kills(pid_t sleeper) {
     expect("SIGUSR2 on the thread that lets it through", usr2_done && pthread_equal(usr2_thread, taker), 1);
 }
 
+/* Spawns `path` with the spawn-flags `flags` and the group `group`. */
+static int spawn_in(pid_t *pid, const char *path, int flags, pid_t group) {
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, flags);
+    posix_spawnattr_setpgroup(&attr, group);
+    int e = spawn(pid, path, NULL, &attr);
+    posix_spawnattr_destroy(&attr);
+    return e;
+}
+
+/* The ids a child of `flags` sees (role ids) end with exit 0. */
+static void ids_child(int flags, const char *what) {
+    pid_t child = -1;
+    int e = spawn_in(&child, "/boot/procs-ids", flags, 0);
+    expect(what, e, 0);
+    if (e == 0) reap(what, child, 0, 0);
+}
+
+/* Stage 4: process groups, sessions, killpg, kill(0) and kill(-1). */
+static void groups(void) {
+    pid_t me = getpid();
+    int status = 0;
+    expect("the probe leads its group", getpgrp() == me && getpgid(0) == me, 1);
+    expect("the probe leads its session", getsid(0) == me && getsid(me) == me, 1);
+    expect("setsid of a leader", setsid() == -1 && errno == EPERM, 1);
+    expect("setpgid of a session leader", setpgid(0, 0) == -1 && errno == EPERM, 1);
+    expect("getpgid of no process", getpgid(99999) == -1 && errno == ESRCH, 1);
+    expect("getsid of no process", getsid(99999) == -1 && errno == ESRCH, 1);
+    expect("setpgid of no child", setpgid(99999, 0) == -1 && errno == ESRCH, 1);
+    expect("setpgid of PID 1", setpgid(1, 0) == -1 && errno == ESRCH, 1);
+    expect("setpgid of a negative group", setpgid(0, -1) == -1 && errno == EINVAL, 1);
+
+    /* A group no session has, and both flags, are refused with no child. */
+    pid_t none = -7;
+    expect("a group that does not exist",
+           spawn_in(&none, "/boot/procs-child", POSIX_SPAWN_SETPGROUP, 12345), EPERM);
+    expect("SETSID with SETPGROUP",
+           spawn_in(&none, "/boot/procs-child", POSIX_SPAWN_SETSID | POSIX_SPAWN_SETPGROUP, 0),
+           EPERM);
+    expect("no PID for a refused group", none, -7);
+
+    /* A child of the probe's own group; it ends at once and stays a zombie. */
+    pid_t seven = start("/boot/procs-exit7");
+    expect("a child's group is its parent's", getpgid(seven) == me && getsid(seven) == me, 1);
+
+    /* Three children in a group of their own. */
+    pid_t g1 = -1, g2 = -1, g3 = -1;
+    expect("a child in a new group",
+           spawn_in(&g1, "/boot/procs-sleeper", POSIX_SPAWN_SETPGROUP, 0), 0);
+    expect("its group is its PID, its session the probe's", getpgid(g1) == g1 && getsid(g1) == me, 1);
+    expect("setpgid of a child that started", setpgid(g1, g1) == -1 && errno == EACCES, 1);
+    expect("a child in that group",
+           spawn_in(&g2, "/boot/procs-sleep2", POSIX_SPAWN_SETPGROUP, g1), 0);
+    expect("a second child in that group",
+           spawn_in(&g3, "/boot/procs-catch", POSIX_SPAWN_SETPGROUP, g1), 0);
+    expect("the joined groups", getpgid(g2) == g1 && getpgid(g3) == g1, 1);
+    pause_ms(100);
+    expect("killpg", killpg(g1, SIGTERM), 0);
+    int seen = 0;
+    for (int i = 0; i < 3; i++) {
+        pid_t got = waitpid(-g1, &status, 0);
+        int member = got == g1 || got == g2 || got == g3;
+        expect("waitpid(-pgid) takes a member", member, 1);
+        expect("the member's end", WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM, 1);
+        seen += got == g1;
+        seen += got == g2;
+        seen += got == g3;
+    }
+    expect("each member once", seen, 3);
+    expect("waitpid(-pgid) of a group with no children left",
+           waitpid(-g1, &status, WNOHANG) == -1 && errno == ECHILD, 1);
+    reap("the zombie of the probe's group, which waitpid(-pgid) left", seven, 7, 0);
+    expect("killpg of a group nobody is in", killpg(g1, SIGTERM) == -1 && errno == ESRCH, 1);
+    expect("killpg of group 1", killpg(1, SIGTERM) == -1 && errno == EINVAL, 1);
+
+    /* kill(0) reaches the probe's own group, itself and a child. */
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_usr1;
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &action, NULL);
+    handled = 0;
+    pid_t c = start("/boot/procs-catch");
+    pause_ms(100);
+    expect("kill(0)", kill(0, SIGUSR1), 0);
+    expect("the probe's handler before kill(0) returned", handled, 1);
+    reap("a child of the probe's group after kill(0)", c, 42, 0);
+
+    /* kill(-1) reaches a child of another group, not the probe. */
+    handled = 0;
+    expect("a child in a group of its own",
+           spawn_in(&c, "/boot/procs-catch", POSIX_SPAWN_SETPGROUP, 0), 0);
+    pause_ms(100);
+    expect("kill(-1)", kill(-1, SIGUSR1), 0);
+    expect("kill(-1) left the sender out", handled, 0);
+    reap("a child of another group after kill(-1)", c, 42, 0);
+    expect("kill(-1) with no one else", kill(-1, SIGUSR1) == -1 && errno == ESRCH, 1);
+    expect("kill of a group nobody is in", kill(-12345, SIGUSR1) == -1 && errno == ESRCH, 1);
+
+    ids_child(0, "a child that makes its own session");
+    ids_child(POSIX_SPAWN_SETPGROUP, "a child that moves between groups");
+    ids_child(POSIX_SPAWN_SETSID, "a child that leads a session");
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
         printf("posix-procs: child %d of %d\n", (int)getpid(), (int)getppid());
         return 0;
     }
-    if (strcmp(name, "sleep") == 0) {
+    if (strcmp(name, "sleep") == 0 || strcmp(name, "sleep2") == 0) {
         for (;;) sleep(60);
     }
     if (strcmp(name, "nap") == 0) {
@@ -258,6 +371,28 @@ static int role(const char *name) {
         for (int i = 0; i < 300 && getppid() != 1; i++) pause_ms(10);
         if (getppid() != 1) return 1;
         printf("posix-procs: orphan saw ppid 1\n");
+        return 0;
+    }
+    if (strcmp(name, "ids") == 0) {
+        pid_t me = getpid(), parent_group = getpgid(getppid());
+        if (getsid(0) == me) { /* SETSID: a session and a group of its own */
+            if (getpgrp() != me || getpgid(me) != me) return 1;
+            if (setpgid(0, 0) != -1 || errno != EPERM) return 2;
+            if (setsid() != -1 || errno != EPERM) return 3;
+            return 0;
+        }
+        if (getpgrp() == me) { /* SETPGROUP: a group of its own, in the parent's session */
+            if (getsid(0) != getsid(getppid())) return 4;
+            if (setsid() != -1 || errno != EPERM) return 5;
+            if (setpgid(0, parent_group) != 0 || getpgrp() != parent_group) return 6;
+            if (setpgid(0, 0) != 0 || getpgrp() != me) return 7;
+            return 0;
+        }
+        /* Plain: the parent's group and session, so setsid works. */
+        if (getpgrp() != parent_group || getsid(0) != getsid(getppid())) return 8;
+        if (setsid() != me || getsid(0) != me || getpgrp() != me) return 9;
+        if (setpgid(0, 0) != -1 || errno != EPERM) return 10;
+        if (setsid() != -1 || errno != EPERM) return 11;
         return 0;
     }
     return 125;
@@ -336,14 +471,12 @@ int main(int argc, char **argv) {
     posix_spawnattr_init(&attr);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK);
     expect("POSIX_SPAWN_SETSIGMASK", spawn(&none, "/boot/procs-child", NULL, &attr), EINVAL);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
-    expect("POSIX_SPAWN_SETPGROUP before process groups",
-           spawn(&none, "/boot/procs-child", NULL, &attr), EINVAL);
     posix_spawnattr_destroy(&attr);
     expect("no PID for a refused spawn", none, -7);
 
     waits(child);
     kills(sleeper);
+    groups();
     if (failures == 0) printf("posix-procs: ok\n");
     return failures == 0 ? 0 : 1;
 }
