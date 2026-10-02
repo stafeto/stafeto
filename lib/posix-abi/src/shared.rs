@@ -127,6 +127,16 @@ fn releasing<R>(
     Ok(value)
 }
 
+/// The holds of the threads an exec stopped go, and the descriptions
+/// whose last descriptor went while one was held close in the service.
+pub fn abandon_holds() {
+    while let Ok(Some((transport, target))) =
+        process_state(|files| Ok(files.abandon_hold().map(|t| (files.transport(), t))))
+    {
+        let _ = transport.release(Some(target));
+    }
+}
+
 /// Close of the service's open description `fd`, which the table handed
 /// back to release, outside the lock.
 pub fn release(fd: u32) -> Result<(), i32> {

@@ -1933,6 +1933,21 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     {
         return Err("an exec ran after its old image ended".into());
     }
+    // The old image of an exec ends at ExecCommit (sp5.K1).
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("the old image lived past ExecCommit"))
+    {
+        return Err("an old image lived past its ExecCommit".into());
+    }
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("the old image set the clock"))
+    {
+        return Err("an old image set the clock with its record's new rights".into());
+    }
     for marker in [
         "posix-procs: a child inherits the mask and SIG_IGN",
         "posix-procs: a thread took SIGUSR1 after main left",

@@ -86,9 +86,12 @@ pub struct Record<P> {
     /// it spawns from a file gets too (5c).
     pub quota: u64,
     pub handle_limit: u32,
-    /// The image number of its process: IMAGE, one more at each exec
-    /// (5c). Its session and exit place carry it; its identity does not.
+    /// The image number of its process: IMAGE, then that of each exec
+    /// that committed (5c). Its session, exit place and identity carry it.
     pub image: u32,
+    /// The last image number an exec of the record took, committed or
+    /// not: the next exec takes one more, so no number names two attempts.
+    pub tried: u32,
     /// Its process group and session: those of its parent, or its own PID
     /// for a record of init's table.
     pub pgid: u32,
@@ -188,12 +191,13 @@ impl<P> Records<P> {
     }
 
     /// The index of the live record that `raw` names in `place`: a
-    /// session and an exit place of its present image, an identity and a
-    /// loader of any (an identity names the record across exec, sp4.N1).
+    /// session, an exit place and an identity of its present image, a
+    /// loader of any (the service checks the image of its place). A copy
+    /// of an old image's identity vouches for nothing after the exec.
     fn named(&self, raw: u64, place: Place) -> Option<usize> {
         let (label, got, image) = Label::parse_image(raw)?;
         let index = usize::from(label.index);
-        let any_image = matches!(place, Place::Identity | Place::Loader);
+        let any_image = place == Place::Loader;
         (got == place
             && self.records[index]
                 .as_ref()
@@ -305,6 +309,7 @@ impl<P> Records<P> {
             quota: 0,
             handle_limit: 0,
             image: proto_process::IMAGE,
+            tried: proto_process::IMAGE,
             pgid,
             sid,
             parent_index: parent.map(|p| p as u16),
@@ -1345,7 +1350,7 @@ mod tests {
     /// name no record, those of the new one do, and the identity of either
     /// names the same record; the PID stays.
     #[test]
-    fn an_exec_moves_the_session_and_keeps_the_identity() {
+    fn an_exec_moves_the_session_and_the_identity() {
         let mut t = Records::<u32>::new();
         let live = add(&mut t).unwrap();
         let i = at(live);
@@ -1355,7 +1360,12 @@ mod tests {
         assert_eq!(t.find(live.raw_at(2)), Some(i));
         assert_eq!(t.session_label(i), Some(live.raw_at(2)));
         assert_eq!(t.find_exit(live.exit_at(2)), Some(i));
-        assert_eq!(t.find_identity(live.identity()), Some(i));
+        assert_eq!(
+            t.find_identity(live.identity()),
+            None,
+            "the old image's identity"
+        );
+        assert_eq!(t.find_identity(live.identity_at(2)), Some(i));
         assert_eq!(t.find_loader(live.loader_at(3)), Some(i));
         assert_eq!(t.find_pid(live.pid()), Some(i));
     }

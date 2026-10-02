@@ -69,11 +69,14 @@ const WAITS: usize = 1024;
 /// The ExecCommit of a record of init's table that waits until init took
 /// the new process (replace.rs): the old image's request, the loader's
 /// channel through which the new image hears the record is ready, the
-/// copy of the new process for init, and init's ticket of the record.
+/// copy of the new process for init, the old process, and init's ticket
+/// of the record.
 struct Replacing {
     pending: Pending,
     ready: Option<Handle<Channel>>,
     process: Option<Handle<Process>>,
+    /// The old process, which the service kills once init took the new.
+    old: Option<Handle<Process>>,
     ticket: u64,
 }
 /// A walk of kill(0), kill(-pgid) or kill(-1) that waits (walk.rs): the
@@ -741,7 +744,9 @@ impl Processes {
                 let ticket = self.loaders.vouches(index)?;
                 let place = self.loaders.get(self.loaders.of(index)?)?;
                 let image = place.image;
-                Some((index, Some(LoaderOf { image, ticket })))
+                // A loader of another attempt of the record names nothing.
+                let (_, _, named) = Label::parse_image(label)?;
+                (named == image).then_some((index, Some(LoaderOf { image, ticket })))
             }
             _ => Some((self.records.find_identity(label)?, None)),
         }
@@ -1110,6 +1115,12 @@ impl Processes {
 fn kernel(e: abi::Error) -> Answer {
     Answer::Status(Status::Kernel(e))
 }
+
+/// The service's quota left, of which the children's quotas come past
+/// its reserve (loaders::pool_allows).
+fn free_quota() -> u64 {
+    sys::process_memory(&make::own()).map_or(0, |m| m.quota.saturating_sub(m.used))
+}
 impl Processes {
     /// SpawnStart of the record in `index` (5c, spec 2, 3.2): a child from
     /// a file. The record of the child (LOADING, as Create makes it), its
@@ -1169,8 +1180,7 @@ impl Processes {
         let credentials = loaders::child_credentials(parent.credentials, start.flags);
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
-        let free = sys::process_memory(&make::own()).map_or(0, |m| m.quota.saturating_sub(m.used));
-        if !loaders::pool_allows(free, create.quota) {
+        if !loaders::pool_allows(free_quota(), create.quota) {
             return kernel(abi::Error::NoMemory);
         }
         let place = records::exit_place(label, &create, self.level);
@@ -1283,16 +1293,18 @@ impl Processes {
         let record = self.records.get(index).expect("the caller");
         if self.loaders.of(index).is_some()
             || !self.loaders.room_for(index)
-            || record.image >= proto_process::IMAGE_MAX
+            || record.tried >= proto_process::IMAGE_MAX
         {
             return refuse(proto_process::AGAIN);
         }
-        let free = sys::process_memory(&make::own()).map_or(0, |m| m.quota.saturating_sub(m.used));
-        if !loaders::pool_allows(free, record.quota) {
+        if !loaders::pool_allows(free_quota(), record.quota) {
             return kernel(abi::Error::NoMemory);
         }
         drain(&self.identities);
-        let (label, image, ceiling) = (record.label, record.image + 1, record.ceiling);
+        let (label, image, ceiling) = (record.label, record.tried + 1, record.ceiling);
+        let (quota, handle_limit) = (record.quota, record.handle_limit);
+        // The number goes to this attempt whatever comes of it (sp5.M1).
+        self.records.get_mut(index).expect("the caller").tried = image;
         let priority = start.level.clamp(1, ceiling);
         let rights = Rights::SEND | Rights::TRANSFER;
         let made = sys::handle_label(&self.channel, rights, label.loader_at(image), self.level)
@@ -1304,8 +1316,8 @@ impl Processes {
                     ceiling,
                 )?;
                 sys::process_create_with(
-                    record.quota,
-                    record.handle_limit,
+                    quota,
+                    handle_limit,
                     ceiling,
                     Some((&exit, ceiling)),
                     Some(session),
@@ -1353,16 +1365,19 @@ impl Processes {
     }
 
     /// ExecCommit of the record in `index` (step 5): the record moves to
-    /// the new process in one step of the loop, O(1): its image number
-    /// grows, the set-ID its loader's place kept applies (the saved IDs
-    /// follow the effective ones), the generation of its credentials grows
-    /// before the reply, its caught signals are the default on the page
-    /// (sp4.M3), the new main thread routes its signals, and the loader
-    /// hears that the record is ready. The old process ends itself after
-    /// the reply. For a record of init's table the reply and the loader's
-    /// notification wait until init took the new process for the record's
-    /// end line (`replace`). BAD_STATE without an exec whose image is
-    /// ready.
+    /// the new process in one step of the loop: its image number is the
+    /// new one (its old session, exit place and identity name nothing
+    /// from here on), the set-ID its loader's place kept applies (the
+    /// saved IDs follow the effective ones), the generation of its
+    /// credentials grows before the reply, its caught signals are the
+    /// default on the page (sp4.M3), the new main thread routes its
+    /// signals, the loads of children the old image started and did not
+    /// commit stop (their parent's copy of C goes with it), the service
+    /// kills the old process (process_kill_at, O(1) for the caller, sp5.K1)
+    /// and the loader hears that the record is ready. For a record of
+    /// init's table the loader's notification and the kill wait until init
+    /// took the new process for the record's end line (`replace`).
+    /// BAD_STATE without an exec whose image is ready.
     fn exec_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
@@ -1389,8 +1404,8 @@ impl Processes {
             .then(|| sys::handle_duplicate(&incoming, Rights::DUPLICATE | Rights::TRANSFER).ok())
             .flatten();
         let record = self.records.get_mut(index).expect("the caller");
-        // The old process's handle goes; the process ends itself.
-        drop(core::mem::replace(&mut record.process, incoming));
+        let old = core::mem::replace(&mut record.process, incoming);
+        let ceiling = record.ceiling;
         record.image = image;
         let mut credentials = loaders::child_credentials(record.credentials, 0);
         if let Some(ids) = set_id {
@@ -1401,6 +1416,17 @@ impl Processes {
         if let Some(page) = self.pages.page(index) {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
         }
+        // The loads the old image started: nobody gives their loaders a
+        // block once it is gone (sp5.V2).
+        let mut children = [0u16; loaders::LOADERS];
+        let mut count = 0;
+        for child in self.loaders.uncommitted_of(index) {
+            children[count] = child as u16;
+            count += 1;
+        }
+        for &child in &children[..count] {
+            self.abort_load(usize::from(child), Status::Kernel(abi::Error::PeerClosed));
+        }
         if let Some(process) = copy
             && let Some(pending) = r.defer()
         {
@@ -1408,12 +1434,14 @@ impl Processes {
                 pending,
                 ready,
                 process: Some(process),
+                old: Some(old),
                 ticket,
             });
             self.replace_queue.push(index);
             self.dispatch_replace();
             return Answer::Deferred;
         }
+        let _ = sys::process_kill_at(&old, ceiling);
         if let Some(ready) = ready.as_ref() {
             let _ = sys::notify(ready, 1);
         }
@@ -1473,12 +1501,16 @@ impl Processes {
     }
 
     /// The exec of the record in `index` that waited for init goes on: the
-    /// loader tells the new image the record is ready, and the old image
-    /// gets its ExecCommit's reply and ends itself.
+    /// service kills the old process and the loader tells the new image
+    /// the record is ready.
     fn finish_replace(&mut self, index: usize) {
         let Some(replacing) = self.replacing[index].take() else {
             return;
         };
+        if let Some(old) = replacing.old.as_ref() {
+            let ceiling = self.records.get(index).map_or(0, |r| r.ceiling);
+            let _ = sys::process_kill_at(old, ceiling);
+        }
         if let Some(ready) = replacing.ready.as_ref() {
             let _ = sys::notify(ready, 1);
         }
@@ -1537,6 +1569,7 @@ impl Processes {
         };
         match r.method() {
             m if m == Method::Boot as u16 => self.boot(child, slot, r),
+            m if m == Method::Ready as u16 => self.ready(child, r),
             m if m == Method::Take as u16 => self.take(child, slot, r),
             _ => refuse(proto_process::PERMISSION),
         }
@@ -1623,6 +1656,18 @@ impl Processes {
         Answer::Reply(handles.into())
     }
 
+    /// Ready of the loader of the record in `child`: its image is loaded,
+    /// and the parent may commit the place from now on (sp5.V1).
+    fn ready(&mut self, child: usize, r: &mut Request<'_>) -> Answer {
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        match self.loaders.loaded(child) {
+            Ok(()) => Answer::Status(Status::Ok),
+            Err(loaders::Refused) => Answer::Status(Status::Kernel(abi::Error::BadState)),
+        }
+    }
+
     /// Take of the loader in place `slot`, once the record in `child` is
     /// ready: its credentials, the program's session and identity session,
     /// and a console; the place goes.
@@ -1631,7 +1676,7 @@ impl Processes {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         }
         let record = self.records.get(child).expect("a ready record");
-        let (label, credentials) = (record.label, record.credentials);
+        let (label, credentials, image) = (record.label, record.credentials, record.image);
         let work = record.label.raw_at(record.image);
         let made = (|| {
             let session = sys::handle_label(
@@ -1643,7 +1688,7 @@ impl Processes {
             let identity = sys::handle_label(
                 &self.identities,
                 Rights::NOTIFY | Rights::TRANSFER | Rights::DUPLICATE,
-                label.identity(),
+                label.identity_at(image),
                 self.level,
             )?;
             let mut handles = Outgoing::new();
@@ -1682,10 +1727,9 @@ impl Processes {
 
     /// SpawnCommit of the record in `index`: its LOADING child lives, with
     /// the IDs SetId kept for its loader's place, and the loader hears that
-    /// the record is ready. The service does not see the loader's answer
-    /// to Go: a parent that commits after a failed load gets a child that
-    /// ends with 127 (its loader gave up), set-ID or not, which runs no
-    /// program.
+    /// the record is ready. BAD_STATE until the loader said its image is
+    /// ready (Ready): a parent that commits before, or after a failed
+    /// load, gets no child that waits for a block (sp5.V1).
     fn spawn_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let Some(child) = self.loading_child(index, r) else {
             return refuse(proto_process::NO_PROCESS);
@@ -1784,7 +1828,7 @@ impl Service<0> for Processes {
         if let Some(child) = self.records.find_loader(r.label()) {
             return self.loader_request(child, r);
         }
-        let loaders_own = [Method::Boot, Method::Take, Method::SetId];
+        let loaders_own = [Method::Boot, Method::Ready, Method::Take, Method::SetId];
         if loaders_own.map(|m| m as u16).contains(&method) {
             return refuse(proto_process::PERMISSION);
         }
@@ -1844,6 +1888,17 @@ impl Service<0> for Processes {
             n if n == Method::SetSid as u16 => self.set_sid(index, r),
             n if n == Method::GetPgid as u16 => self.get_group(index, false, r),
             n if n == Method::GetSid as u16 => self.get_group(index, true, r),
+            n if n == Method::Pool as u16 => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let pool = free_quota().saturating_sub(loaders::RESERVE);
+                let w = r.reply();
+                if w.u32(0).and_then(|()| w.u64(pool)).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(Outgoing::new())
+            }
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
@@ -1897,13 +1952,10 @@ impl Service<0> for Processes {
             }
         }
         // A loader that ended: its place and SetId go, and a SpawnStart
-        // that waited for its Boot gets AGAIN.
-        if let Some(place) = self.loaders.free(index)
-            && let Some(start) = place.held.start
-        {
-            let status = Status::from_code(proto_process::AGAIN);
-            let _ = start.answer(&proto_wire::reply(status), Outgoing::new());
-        }
+        // that waited for its Boot gets AGAIN. An old image that ended
+        // before its ExecCommit, by itself or by SIGKILL, takes the new
+        // process with it, whose quota comes back to the pool (sp5.K2).
+        self.abort_load(index, Status::from_code(proto_process::AGAIN));
         let (exit, orphans) = self.records.exited(index, end);
         // An exec that waited for init goes on: its new image is dead.
         self.replace_queue.remove(index);

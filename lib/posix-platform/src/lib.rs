@@ -509,7 +509,8 @@ pub unsafe extern "C" fn stafeto_exec(
 
 /// The probes of the window of exec (posix_abi::process): ExecCommit
 /// with no exec gives its errno; an exec whose old image ends with `code`
-/// before ExecCommit returns only on an error.
+/// before ExecCommit (by its own SIGKILL for 137) returns only on an
+/// error.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_exec_commit() -> c_int {
     posix_abi::process::probe_exec_commit()
@@ -526,6 +527,51 @@ pub unsafe extern "C" fn stafeto_probe_exec_then_exit(
     // SAFETY: the caller's promise.
     let (path, argv) = unsafe { (bytes_of(path), strings(argv)) };
     posix_abi::process::probe_exec_then_exit(path, argv, code as u64)
+}
+
+/// The probe of an exec whose old image outlives its ExecCommit and asks
+/// the clock service to set the time (posix_abi::process::probe_exec_outlive):
+/// returns only on an error, with its errno.
+///
+/// # Safety
+/// `path` is a C string; `argv` a NULL-ended array of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_exec_outlive(
+    path: *const c_char,
+    argv: *const *const c_char,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let (path, argv) = unsafe { (bytes_of(path), strings(argv)) };
+    posix_abi::process::probe_exec_outlive(path, argv)
+}
+
+/// The probe of a SpawnCommit before the loader's image is ready
+/// (posix_abi::process::probe_commit_early): its errno, and the child's
+/// PID in `pid` to reap.
+///
+/// # Safety
+/// `pid` points to an int.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_commit_early(pid: *mut c_int) -> c_int {
+    let mut child = -1;
+    let errno = posix_abi::process::probe_commit_early(&mut child);
+    // SAFETY: the caller's promise.
+    unsafe { pid.write(child) };
+    errno
+}
+
+/// The loads the calling record may have at once
+/// (posix_abi::process::probe_loads).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loads() -> c_int {
+    posix_abi::process::probe_loads()
+}
+
+/// The bytes of the process service's quota left for children (Pool),
+/// for the probe that the ends of loads give theirs back.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_pool() -> u64 {
+    posix_abi::process::probe_pool()
 }
 
 /// OPEN_EXEC through the process's own session with the RAM file

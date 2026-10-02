@@ -55,6 +55,10 @@ const IDLE_NS: u64 = 10_000_000;
 const CHANNEL_PRIORITY: u8 = 1;
 /// The sessions of the driver's channel, and what each holds at most.
 const SESSIONS: usize = 8;
+/// The clones the service keeps alive at most, for all its clients: room
+/// for the 32 children of rtbench's S12 and the probes beside them, as the
+/// RAM file service's 128 (sp5.V5).
+const CLONES: usize = 128;
 const HELD: usize = 2;
 /// Batches of the kernel log one read takes in a row at most, while each
 /// goes out whole at once: the whole ring of the kernel.
@@ -202,7 +206,7 @@ struct Uart {
     level: u8,
     given: u64,
     /// The sessions CLONE gave that live, bounded for each client.
-    clones: proto_wire::clones::Clones<32>,
+    clones: proto_wire::clones::Clones<CLONES>,
     regs: Regs,
     irq: Handle<Interrupt>,
     log: Handle<Resource>,

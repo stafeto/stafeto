@@ -80,8 +80,10 @@ pub enum Stage {
     /// Boot came: the parent has the loader's start channel, and the
     /// loader opens and reads the program.
     Loading,
-    /// SpawnCommit came: the record lives, and the loader takes its
-    /// program's sessions next.
+    /// The loader said the image is ready (Ready): the parent may commit.
+    Loaded,
+    /// SpawnCommit or ExecCommit came: the record lives, and the loader
+    /// takes its program's sessions next.
     Ready,
 }
 
@@ -222,12 +224,26 @@ impl<T> Loaders<T> {
         Ok(())
     }
 
-    /// SpawnCommit of the record in `record`, whose loader loads: the place
-    /// is Ready, and what SetId kept comes back to be applied.
-    pub fn commit(&mut self, record: usize) -> Result<Option<(u32, u32)>, Refused> {
+    /// Ready of the loader of the record in `record`: its image is loaded,
+    /// and the place may be committed.
+    pub fn loaded(&mut self, record: usize) -> Result<(), Refused> {
         let index = self.of(record).ok_or(Refused)?;
         let place = self.places[index].as_mut().ok_or(Refused)?;
         if place.stage != Stage::Loading {
+            return Err(Refused);
+        }
+        place.stage = Stage::Loaded;
+        Ok(())
+    }
+
+    /// SpawnCommit or ExecCommit of the record in `record`, whose loader
+    /// said its image is ready: the place is Ready, and what SetId kept
+    /// comes back to be applied. A commit before Ready is refused, so no
+    /// place waits for a load its parent never lets finish.
+    pub fn commit(&mut self, record: usize) -> Result<Option<(u32, u32)>, Refused> {
+        let index = self.of(record).ok_or(Refused)?;
+        let place = self.places[index].as_mut().ok_or(Refused)?;
+        if place.stage != Stage::Loaded {
             return Err(Refused);
         }
         place.stage = Stage::Ready;
@@ -241,6 +257,16 @@ impl<T> Loaders<T> {
         self.of_record[record] = None;
         self.generations[index] = self.generations[index].wrapping_add(1);
         self.places[index].take()
+    }
+
+    /// The records whose loads the record in `parent` started and has not
+    /// committed, itself aside: what an exec of `parent` stops.
+    pub fn uncommitted_of(&self, parent: usize) -> impl Iterator<Item = usize> + '_ {
+        self.places
+            .iter()
+            .flatten()
+            .filter(move |p| p.parent == parent && p.record != parent && p.stage != Stage::Ready)
+            .map(|p| p.record)
     }
 
     /// The places taken.
@@ -335,6 +361,8 @@ mod tests {
         assert_eq!(t.set_id(a ^ 1 << 8, 5, 1, (0, 0)), Err(Refused), "stale");
         assert_eq!(t.set_id(a, 5, 1, (0, 7)), Ok(()));
         assert_eq!(t.set_id(a, 5, 1, (0, 0)), Err(Refused), "a second SetId");
+        assert_eq!(t.loaded(5), Ok(()));
+        assert_eq!(t.vouches(5), None, "no loader once the image is ready");
         assert_eq!(t.commit(5), Ok(Some((0, 7))));
         assert_eq!(t.vouches(5), None, "no loader after SpawnCommit");
         assert_eq!(t.set_id(b, 6, 1, (0, 0)), Ok(()));
@@ -353,7 +381,31 @@ mod tests {
         assert!(t.free(5).is_some());
         let next = loading(&mut t, 5);
         assert_ne!(next, first);
+        assert_eq!(t.loaded(5), Ok(()));
         assert_eq!(t.commit(5), Ok(None), "no IDs from the attempt before");
         assert_eq!(t.set_id(first, 5, 1, (0, 0)), Err(Refused));
+    }
+
+    /// A commit before the loader said its image is ready is refused (the
+    /// place would wait for a load nobody lets finish), and Ready comes
+    /// once, from Loading; an exec stops the uncommitted loads of the
+    /// record's children, its own and the committed ones aside.
+    #[test]
+    fn a_place_commits_only_once_its_image_is_ready() {
+        let mut t = Loaders::<()>::new();
+        loading(&mut t, 5);
+        assert_eq!(t.commit(5), Err(Refused), "before Ready");
+        assert_eq!(t.loaded(5), Ok(()));
+        assert_eq!(t.loaded(5), Err(Refused), "a second Ready");
+        assert_eq!(t.commit(5), Ok(None));
+        assert_eq!(t.loaded(9), Err(Refused), "no place");
+        let mut t = Loaders::<()>::new();
+        t.take(7, 7, 2, ()).unwrap();
+        t.take(8, 7, 1, ()).unwrap();
+        t.take(9, 3, 1, ()).unwrap();
+        assert_eq!(t.uncommitted_of(7).collect::<Vec<_>>(), [8]);
+        let index = t.of(8).unwrap();
+        t.get_mut(index).unwrap().stage = Stage::Ready;
+        assert_eq!(t.uncommitted_of(7).count(), 0, "a committed child loads on");
     }
 }

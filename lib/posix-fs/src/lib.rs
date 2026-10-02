@@ -475,6 +475,12 @@ impl PosixFs {
         self.descriptors.unhold(target)
     }
 
+    /// The holds of requests that never end go: the next target whose
+    /// last descriptor went meanwhile, to release (posix_fd abandon_hold).
+    pub fn abandon_hold(&mut self) -> Option<Target> {
+        self.descriptors.abandon_hold()
+    }
+
     /// A descriptor of the service's description `fd` with `flags`, the
     /// lowest free one: the caller closes `fd` on an error.
     pub fn insert(&mut self, fd: u32, flags: DescriptorFlags) -> Result<u32, FsError> {

@@ -751,7 +751,7 @@ fn spawn_shadowed<'s>(
 /// file (step 2); on "the image is ready" (step 3) the descriptors with
 /// FD_CLOEXEC close and the sessions move to the loader as they are, the
 /// descriptions, offsets and labels with them (step 4); ExecCommit moves
-/// the record (step 5) and this process ends (step 7) while the loader
+/// the record (step 5) and the service kills this process (step 7) while the loader
 /// jumps (step 6). An error before step 4 comes back with every thread
 /// and descriptor as it was: ENOENT, EACCES, ENOEXEC, ENOMEM, E2BIG,
 /// ENAMETOOLONG, ENOTDIR, EPERM, EAGAIN.
@@ -770,7 +770,8 @@ pub fn exec<'s>(
     let mask = block.mask.swap(!0, Ordering::SeqCst);
     let pending = block.pending.load(Ordering::SeqCst);
     let stopped = crate::signals::stop_others();
-    let result = stopped.and_then(|()| exec_stopped(path, argv, envp, umask, mask, pending, None));
+    let result =
+        stopped.and_then(|()| exec_stopped(path, argv, envp, umask, mask, pending, Probe::None));
     // Back from an exec that failed before step 4: all as it was.
     crate::signals::resume_others();
     block.mask.store(mask, Ordering::SeqCst);
@@ -786,7 +787,7 @@ fn exec_stopped<'s>(
     umask: u32,
     mask: u64,
     pending: u64,
-    abandon: Option<u64>,
+    probe: Probe,
 ) -> Result<core::convert::Infallible, i32> {
     use crate::constants::{EAGAIN, EIO};
     use proto_process::{Method, SpawnStart};
@@ -831,24 +832,74 @@ fn exec_stopped<'s>(
         let _ = ask(&request(Method::ExecAbort, &[])?);
         return Err(errno);
     }
-    // The probe of the window: the old image ends before ExecCommit.
-    if let Some(code) = abandon {
-        rt::sys::process_exit(code);
+    // The probes of the window: the old image ends before ExecCommit.
+    match probe {
+        Probe::None | Probe::Outlive => {}
+        Probe::Exit(code) => rt::sys::process_exit(code),
+        Probe::Kill => {
+            let pid = page().pid.load(Ordering::Acquire) as i32;
+            let _ = kill(pid, crate::constants::SIGKILL);
+            rt::sys::process_exit(1);
+        }
     }
+    // The probe of an old image that outlives its ExecCommit keeps a clone
+    // of its clock session to ask with afterwards.
+    let kept = match probe {
+        Probe::Outlive => crate::clock::session().and_then(|clock| {
+            rt::service::clone_session(clock, &proto_clock::Method::Clone.header().bytes()).ok()
+        }),
+        _ => None,
+    };
     // Step 4: past this point the old image gives its sessions away, and
     // a failure ends it.
     move_files(&c);
     if ask(&request(Method::ExecCommit, &[])?).is_err() {
         rt::sys::process_exit(127);
     }
-    // Step 7: the old image ends; the loader of the new one jumps once the
-    // record is ready.
+    if let Some(clock) = kept {
+        outlived(clock);
+    }
+    // Step 7: the service killed this process at ExecCommit (for a record
+    // of init's table, once init took the new one); the loader of the new
+    // image jumps once the record is ready. An exit here ends it all the
+    // same.
     rt::sys::process_exit(0)
 }
 
+/// What a probe of the window of exec makes of the old image once the
+/// new one is ready: nothing; it ends with a code, or by its own SIGKILL,
+/// before ExecCommit; or it asks the clock service to set the time after
+/// ExecCommit's reply, should it get one.
+#[derive(Clone, Copy)]
+enum Probe {
+    None,
+    Exit(u64),
+    Kill,
+    Outlive,
+}
+
+/// The old image of the probe `Probe::Outlive` after ExecCommit: the
+/// service should have killed it (sp5.K1). It says so on the console and
+/// asks the clock service to set the time with its own identity through
+/// the clone of the clock session it kept; then it ends.
+fn outlived(clock: Handle<Channel>) -> ! {
+    rt::println!("posix-procs: the old image lived past ExecCommit");
+    let client = posix_clock::Client::from_session(clock);
+    let now = posix_time::Time {
+        seconds: 1_800_000_000,
+        nanos: 0,
+    };
+    if client.set(now, identity()).is_ok() {
+        rt::println!("posix-procs: the old image set the clock");
+    }
+    rt::sys::process_exit(3)
+}
+
 /// The probes of the window of exec (5c): ExecCommit with no exec (the
-/// service's status as an errno), and an exec whose old image ends with
-/// `code` once the new one is ready, before ExecCommit.
+/// service's status as an errno), an exec whose old image ends with
+/// `code` once the new one is ready, before ExecCommit (by its own
+/// SIGKILL for a code of 137), and an exec whose old image tries to set
+/// the clock after ExecCommit.
 pub fn probe_exec_commit() -> i32 {
     match request(proto_process::Method::ExecCommit, &[]).and_then(|w| ask(&w)) {
         Ok(_) => 0,
@@ -861,10 +912,22 @@ pub fn probe_exec_then_exit<'s>(
     argv: impl Iterator<Item = &'s [u8]> + Clone,
     code: u64,
 ) -> i32 {
+    let probe = match code {
+        137 => Probe::Kill,
+        code => Probe::Exit(code),
+    };
+    probe_exec(path, argv, probe)
+}
+
+pub fn probe_exec_outlive<'s>(path: &[u8], argv: impl Iterator<Item = &'s [u8]> + Clone) -> i32 {
+    probe_exec(path, argv, Probe::Outlive)
+}
+
+fn probe_exec<'s>(path: &[u8], argv: impl Iterator<Item = &'s [u8]> + Clone, probe: Probe) -> i32 {
     let block = crate::threads::own_block();
     let mask = block.mask.swap(!0, Ordering::SeqCst);
     let result = crate::signals::stop_others()
-        .and_then(|()| exec_stopped(path, argv, [].into_iter(), 0o022, mask, 0, Some(code)));
+        .and_then(|()| exec_stopped(path, argv, [].into_iter(), 0o022, mask, 0, probe));
     crate::signals::resume_others();
     block.mask.store(mask, Ordering::SeqCst);
     match result {
@@ -916,6 +979,11 @@ fn move_files(c: &Handle<Channel>) {
             let _ = crate::close(fd as i32);
         }
     }
+    // A stopped thread never ends the request it holds a description
+    // for: a description whose last descriptor went meanwhile closes
+    // here, or the new image would keep it in the service with no
+    // descriptor (sp5.V3).
+    crate::shared::abandon_holds();
     let sessions = crate::shared::with_files(|files| {
         let (files, uart) = files.sessions();
         Ok((files.raw(), uart.map(Handle::raw)))
@@ -942,6 +1010,17 @@ fn move_files(c: &Handle<Channel>) {
         }
     }
     let _ = ask_loader(c, &w, Some(handles));
+}
+
+/// The errno of a refused Clone: EAGAIN for a service at its limit of
+/// clones or sessions (a limit of the moment), ENOMEM, EIO otherwise.
+fn clone_errno(status: Status) -> i32 {
+    use crate::constants::{EAGAIN, EIO, ENOMEM};
+    match status {
+        Status::Kernel(rt::abi::Error::LimitReached) => EAGAIN,
+        Status::Kernel(rt::abi::Error::NoMemory) => ENOMEM,
+        _ => EIO,
+    }
 }
 
 /// The parent's side of the loader's protocol for the child `pid`: Start
@@ -986,7 +1065,7 @@ fn commit(
     // RAM files sharing the descriptions the child starts with.
     let clock = crate::clock::session().ok_or(EIO)?;
     let clock = rt::service::clone_session(clock, &proto_clock::Method::Clone.header().bytes())
-        .map_err(|_| EIO)?;
+        .map_err(clone_errno)?;
     let (files, uart) = crate::shared::with_files(|fs| {
         let (files, uart) = fs.sessions();
         Ok((files.raw(), uart.map(Handle::raw)))
@@ -1003,14 +1082,14 @@ fn commit(
     }
     // The sessions live as long as the process's files.
     let files = rt::service::clone_session(&Handle::<Channel>::borrowed(files), w.as_bytes())
-        .map_err(|_| EIO)?;
+        .map_err(clone_errno)?;
     let uart = match uart {
         Some(u) => Some(
             rt::service::clone_session(
                 &Handle::<Channel>::borrowed(u),
                 &proto_uart::Method::Clone.header().bytes(),
             )
-            .map_err(|_| EIO)?,
+            .map_err(clone_errno)?,
         ),
         None => None,
     };
@@ -1031,6 +1110,90 @@ fn commit(
         return Err(EIO);
     }
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)
+}
+
+/// A SpawnStart whose loader never gets a block, for the probes: the
+/// child's PID and the parent's copy of C, or the errno of the refusal.
+fn start_bare() -> Result<(u32, Handle<Channel>), i32> {
+    use crate::constants::EIO;
+    use proto_process::{Method, SpawnStart};
+    let level = crate::threads::own_block()
+        .base_level
+        .load(Ordering::Relaxed) as u8;
+    let start = SpawnStart {
+        flags: 0,
+        pgroup: 0,
+        level,
+        mask: 0,
+        default: 0,
+    };
+    let mut w = Writer::new();
+    Method::SpawnStart.header().write(&mut w).map_err(|_| EIO)?;
+    start.write(&mut w).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let mut reply = rt::sys::send(client().session(), w.as_bytes()).map_err(|_| EIO)?;
+    let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    let status = Status::from_code(r.u32().map_err(|_| EIO)?);
+    if status != Status::Ok {
+        return Err(start_errno(status));
+    }
+    let pid = r.u32().map_err(|_| EIO)?;
+    let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
+    Ok((pid, c))
+}
+
+/// The probe of a commit before the loader's image is ready (sp5.V1): a
+/// SpawnStart whose loader never gets a block, SpawnCommit at once, then
+/// SpawnAbort; the child's PID in `pid`, and the errno SpawnCommit came
+/// back with (0 had it been taken).
+pub fn probe_commit_early(pid: &mut i32) -> i32 {
+    use proto_process::Method;
+    let (child, _c) = match start_bare() {
+        Ok(started) => started,
+        Err(errno) => return errno,
+    };
+    *pid = child as i32;
+    let committed = request(Method::SpawnCommit, &[child]).and_then(|w| ask(&w));
+    let _ = request(Method::SpawnAbort, &[child]).and_then(|w| ask(&w));
+    committed.err().unwrap_or(0)
+}
+
+/// The probe of the loads a record may have at once (sp5.V2): up to
+/// three SpawnStarts that wait together, then SpawnAbort of each; how
+/// many the service took (LOADERS_OF_PARENT, 2, when no load of the
+/// record was left behind).
+pub fn probe_loads() -> i32 {
+    use proto_process::Method;
+    let mut started = [None, None, None];
+    for slot in &mut started {
+        match start_bare() {
+            Ok(load) => *slot = Some(load),
+            Err(_) => break,
+        }
+    }
+    let mut count = 0;
+    for (pid, _c) in started.into_iter().flatten() {
+        count += 1;
+        let _ = request(Method::SpawnAbort, &[pid]).and_then(|w| ask(&w));
+    }
+    count
+}
+
+/// The bytes of the service's quota left for children (Pool), for the
+/// probe that the ends of loads give theirs back; 0 on an error.
+pub fn probe_pool() -> u64 {
+    let Ok(w) = request(proto_process::Method::Pool, &[]) else {
+        return 0;
+    };
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let Ok(reply) = rt::sys::send(client().session(), w.as_bytes()) else {
+        return 0;
+    };
+    let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    match (r.u32(), r.u64()) {
+        (Ok(0), Ok(pool)) => pool,
+        _ => 0,
+    }
 }
 
 /// OPEN_EXEC of `path` through the process's own session with the RAM

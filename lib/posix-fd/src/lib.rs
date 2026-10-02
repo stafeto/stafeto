@@ -184,6 +184,20 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         (closed && !self.referenced(backend)).then_some(backend)
     }
 
+    /// The holds of operations that never end go (the other threads of a
+    /// process that execs, stopped for good), one call at a time: the next
+    /// backend whose last descriptor went meanwhile, to release; None once
+    /// no hold is left.
+    pub fn abandon_hold(&mut self) -> Option<T> {
+        while let Some(slot) = self.holds.iter_mut().find(|h| h.is_some()) {
+            let hold = slot.take().expect("a hold");
+            if hold.closed && !self.referenced(hold.backend) {
+                return Some(hold.backend);
+            }
+        }
+        None
+    }
+
     /// Close: the descriptor goes at once; the backend to release, when it
     /// was the last that named it and nothing holds it.
     pub fn close(&mut self, fd: u32) -> Result<Option<T>, Error> {
@@ -306,6 +320,23 @@ mod tests {
         assert_eq!(table.hold(b), Ok(61));
         assert_eq!(table.dup2(a, b), Ok((b, None)), "the replaced one is held");
         assert_eq!(table.unhold(61), Some(61));
+    }
+
+    /// Holds nobody will end go: a held backend whose descriptors went is
+    /// handed back to release, once; one with a descriptor left stays.
+    #[test]
+    fn abandoned_holds_hand_back_what_was_closed() {
+        let mut table = Table::<u32, 4>::default();
+        let a = table.insert(70, Flags::default()).unwrap();
+        let b = table.insert(71, Flags::default()).unwrap();
+        assert_eq!(table.hold(a), Ok(70));
+        assert_eq!(table.hold(a), Ok(70));
+        assert_eq!(table.hold(b), Ok(71));
+        assert_eq!(table.close(a), Ok(None), "held");
+        assert_eq!(table.abandon_hold(), Some(70));
+        assert_eq!(table.abandon_hold(), None, "71 has its descriptor");
+        assert_eq!(table.unhold(70), None, "no hold left");
+        assert_eq!(table.close(b), Ok(Some(71)), "no hold keeps it now");
     }
 
     #[test]

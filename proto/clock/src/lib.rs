@@ -6,7 +6,9 @@
 //! and, until the service has one for the session, a handle: a copy of the
 //! caller's identity session of the process service (NOTIFY, TRANSFER,
 //! DUPLICATE), for which the service has the process service vouch
-//! through its notary session; reply status alone, PERMISSION unless
+//! through its notary session; a handle a later SET brings takes the
+//! place of the one before (an exec gives the session a new image's
+//! identity); reply status alone, PERMISSION unless
 //! the caller's effective UID is 0 (spec 2, 3.1). WATCH: empty body, one NOTIFY channel; reply status.
 //! ANCHOR: empty body; reply status, seconds i64, nanos u64, mono u64,
 //! resolution u64, generation u64. OBSERVE: empty body, subscribed session

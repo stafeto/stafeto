@@ -12,8 +12,9 @@
 //! loader copies before it reads it (sp3.M6), and says Go: the loader opens
 //! the program through the session of the loaders with a copy of its
 //! identity (OpenExec, condition O1), reads its ELF file piece by piece into objects
-//! of the new process, which pays for them, and answers "the image is
-//! ready" or why not. The parent gives the program's sessions (Handles);
+//! of the new process, which pays for them, tells the service the image
+//! is ready (Ready, before which no commit of its place is taken) and
+//! answers "the image is ready" or why not. The parent gives the program's sessions (Handles);
 //! once the service says through C that the record is ready (label 2, the
 //! only notification the loader trusts), the loader takes the program's
 //! sessions and credentials (Take), writes the start area, closes all that
@@ -71,7 +72,7 @@ fn main(level: u64) -> u64 {
     let Ok(own) = boot(&session, &start, level) else {
         return GAVE_UP;
     };
-    let Some(loaded) = serve(&start, &own) else {
+    let Some(loaded) = serve(&session, &start, &own) else {
         return GAVE_UP;
     };
     let Ok(taken) = take(&session) else {
@@ -126,7 +127,7 @@ fn staged(len: usize) -> &'static [u8] {
 /// The requests of the parent through C and the service's word that the
 /// record is ready: the load once Start and Go came, and the end once the
 /// image is ready and the record too. None when the loader gives up.
-fn serve(start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
+fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
     let mut block_len = None;
     let mut loaded: Option<(u64, Handle<Channel>)> = None;
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
@@ -198,7 +199,8 @@ fn serve(start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
                             reply(token, Status::BadSize.code());
                             return None;
                         };
-                        match load(own, &block) {
+                        match load(own, &block).and_then(|done| tell_ready(session).map(|()| done))
+                        {
                             Ok(done) => {
                                 loaded = Some(done);
                                 0
@@ -223,6 +225,17 @@ fn serve(start: &Handle<Channel>, own: &Own) -> Option<Loaded> {
                 reply(token, status);
             }
         }
+    }
+}
+
+/// Ready: the service hears the image is loaded before the parent does,
+/// and takes a commit of the place only from then on.
+fn tell_ready(session: &Handle<Channel>) -> Result<(), u32> {
+    let request = proto_process::Method::Ready.header().bytes();
+    let mut buffer = [0; MESSAGE_MAX];
+    match sys::send(session, &request) {
+        Ok(reply) if Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0) => Ok(()),
+        _ => Err(pl::IO),
     }
 }
 

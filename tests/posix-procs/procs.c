@@ -74,9 +74,14 @@
  * still pending; an exec of a file that is no program returns ENOEXEC
  * with the process, its other thread and its files as they were; an old
  * image that ends before ExecCommit leaves its own status and the new one
- * never runs; ExecCommit with no exec is refused. As nobody: an exec of a
- * set-user-ID file of root gives euid 0, the clock's rights at once, and
- * after a set-ID file that failed to load, the next exec keeps euid 65534.
+ * never runs; ExecCommit with no exec is refused. The window (`windows`):
+ * 40 old images that end before ExecCommit, by exit or SIGKILL, and 8
+ * execs while another thread spawns give the service's pool back; an exec
+ * while threads wait in waitpid and sleep goes on; SpawnCommit before the
+ * loader's image is ready is refused. As nobody: an exec of a set-user-ID
+ * file of root gives euid 0, the clock's rights at once, and after a
+ * set-ID file that failed to load, the next exec keeps euid 65534; the old
+ * image of such an exec is killed at ExecCommit and never sets the clock.
  *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
@@ -111,6 +116,10 @@ void stafeto_start_handles(unsigned long *out);
 int stafeto_probe_open_exec(const char *path);
 int stafeto_probe_exec_commit(void);
 int stafeto_probe_exec_then_exit(const char *path, char *const argv[], int code);
+int stafeto_probe_exec_outlive(const char *path, char *const argv[]);
+int stafeto_probe_commit_early(int *pid);
+int stafeto_probe_loads(void);
+unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 
 static void expect(const char *what, int got, int want) {
@@ -578,6 +587,63 @@ static int exec_fail(void) {
     return 0;
 }
 
+/* An exec while other threads wait in long calls: one in waitpid of a
+ * child that never ends, one in sleep. The new image kills and reaps that
+ * child, a child of the record since before the exec. */
+static pid_t busy_child;
+static void *busy_wait(void *arg) {
+    (void)arg;
+    int status;
+    waitpid(busy_child, &status, 0);
+    return NULL;
+}
+static void *busy_sleep(void *arg) {
+    (void)arg;
+    sleep(60);
+    return NULL;
+}
+static int exec_busy(void) {
+    busy_child = start("sleep");
+    if (busy_child <= 0) return 1;
+    pthread_t a, b;
+    if (pthread_create(&a, NULL, busy_wait, NULL) != 0) return 2;
+    if (pthread_create(&b, NULL, busy_sleep, NULL) != 0) return 3;
+    pause_ms(30);
+    char pid[16];
+    snprintf(pid, sizeof pid, "%d", (int)busy_child);
+    char *next[] = {"procs-child", "reapkill", pid, NULL};
+    char *env[] = {NULL};
+    execve("/bin/procs-child", next, env);
+    return 100 + errno;
+}
+
+/* An exec while another thread spawns children without end: the loads
+ * the old image started and did not commit go with it (the new image may
+ * start two at once), and the new image reaps the children that lived
+ * until none is left. */
+static void *spawner(void *arg) {
+    (void)arg;
+    char *argv[] = {"procs-child", "exit7", NULL};
+    char *envp[] = {NULL};
+    for (;;) {
+        pid_t pid;
+        if (posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, envp) == 0)
+            waitpid(pid, NULL, 0);
+    }
+    return NULL;
+}
+static int exec_spawning(void) {
+    pthread_t other;
+    if (pthread_create(&other, NULL, spawner, NULL) != 0) return 1;
+    /* Each yield lets the spawner run to its next request: the exec comes
+     * at another step of a spawn each time. */
+    for (int turns = atoi(argv_seen[2]); turns > 0; turns--) sched_yield();
+    char *next[] = {"procs-child", "drain", NULL};
+    char *env[] = {NULL};
+    execve("/bin/procs-child", next, env);
+    return 100 + errno;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "child") == 0) {
@@ -689,6 +755,44 @@ static int role(const char *name) {
     if (strcmp(name, "last") == 0) {
         printf("posix-procs: the last image ran\n");
         return 42;
+    }
+    if (strcmp(name, "ghostkill") == 0) {
+        char *next[] = {"procs-child", "ghost", NULL};
+        stafeto_probe_exec_then_exit("/bin/procs-child", next, 137);
+        return 1;
+    }
+    if (strcmp(name, "execoutlive") == 0) {
+        /* The old image of an exec of a set-user-ID file of root that
+         * outlives its ExecCommit asks the clock to be set (it is killed
+         * first); the new image runs the role setid. */
+        char *next[] = {"procs-child", "setid", NULL};
+        /* The clock service keeps this image's identity for the session,
+         * which moves to the new image: it takes the new one's. */
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        if (clock_settime(CLOCK_REALTIME, &now) == 0 || errno != EPERM) return 99;
+        stafeto_probe_exec_outlive("/bin/procs-setid", next);
+        return 100 + errno;
+    }
+    if (strcmp(name, "execbusy") == 0) return exec_busy();
+    if (strcmp(name, "execspawn") == 0) return exec_spawning();
+    if (strcmp(name, "drain") == 0) {
+        /* No load of the old image holds a place of the record. */
+        int loads = stafeto_probe_loads();
+        if (loads != 2) {
+            printf("posix-procs: the record took %d loads after its exec\n", loads);
+            return 2;
+        }
+        while (waitpid(-1, NULL, 0) > 0) {
+        }
+        return errno == ECHILD ? 7 : 1;
+    }
+    if (strcmp(name, "reapkill") == 0) {
+        pid_t pid = atoi(argv_seen[2]);
+        int status = -1;
+        if (kill(pid, SIGKILL) != 0) return 1;
+        if (waitpid(pid, &status, 0) != pid) return 2;
+        return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 7 : 3;
     }
     if (strcmp(name, "ghost") == 0) {
         printf("posix-procs: the image of a dead exec ran\n");
@@ -980,6 +1084,53 @@ static void descriptors(void) {
     posix_spawn_file_actions_destroy(&actions);
 }
 
+/* Stage 9, the window of exec: old images that end before ExecCommit, 20
+ * by exit and 20 by their own SIGKILL, and 8 execs while another thread
+ * spawns, give the service's pool back; an exec while other threads wait
+ * in waitpid and sleep goes on; a SpawnCommit before the loader's image
+ * is ready is refused. */
+static void windows(void) {
+    char *envp[] = {NULL};
+    unsigned long long before = stafeto_probe_pool();
+    expect("the pool is known", before > 0, 1);
+    for (int i = 0; i < 40; i++) {
+        int killed = i % 2;
+        char *ghost[] = {"procs-child", killed ? "ghostkill" : "ghostexec", NULL};
+        pid_t pid = -1;
+        int e = posix_spawn(&pid, "/bin/procs-child", NULL, NULL, ghost, envp);
+        if (e != 0) {
+            printf("posix-procs: spawn of ghost %d gave %d (%s)\n", i, e, strerror(e));
+            failures++;
+            break;
+        }
+        reap("an old image that ends before ExecCommit", pid, killed ? 0 : 7,
+             killed ? SIGKILL : 0);
+    }
+    for (int i = 0; i < 8; i++) {
+        char turns[8];
+        snprintf(turns, sizeof turns, "%d", 3 + 5 * i);
+        char *argv[] = {"procs-child", "execspawn", turns, NULL};
+        pid_t pid = -1;
+        expect("spawn of execspawn", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, envp),
+               0);
+        reap("an exec while another thread spawns", pid, 7, 0);
+    }
+    unsigned long long after = stafeto_probe_pool();
+    printf("posix-procs: pool %llu before the window, %llu after\n", before, after);
+    if (after + 32 * 4096 < before) {
+        printf("posix-procs: the window kept %llu bytes of the pool\n", before - after);
+        failures++;
+    }
+    char *busy[] = {"procs-child", "execbusy", NULL};
+    pid_t pid = -1;
+    expect("spawn of execbusy", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, busy, envp), 0);
+    reap("an exec while threads wait", pid, 7, 0);
+    int early = -1;
+    expect("SpawnCommit before the image is ready", stafeto_probe_commit_early(&early), EIO);
+    /* SpawnAbort took the uncommitted child, which leaves no status. */
+    expect("a wait for the aborted child", waitpid(early, NULL, WNOHANG), -1);
+}
+
 /* Stage 9: exec. */
 static void execs(void) {
     run_role("/bin/procs-child", "execls", NULL);
@@ -995,6 +1146,7 @@ static void execs(void) {
     expect("spawn of ghostexec", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, ghost, envp), 0);
     reap("an old image that ends before ExecCommit", pid, 7, 0);
     expect("ExecCommit with no exec", stafeto_probe_exec_commit(), EIO);
+    windows();
 }
 
 /* Stage 9 as nobody: set-ID through exec. */
@@ -1005,6 +1157,7 @@ static void execs_nobody(void) {
     expect("spawn of execto", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, envp), 0);
     reap("an exec of a set-user-ID file", pid, 0, 0);
     run_role("/bin/procs-child", "execjunk", NULL);
+    run_role("/bin/procs-child", "execoutlive", NULL);
 }
 
 /* Stage 7 once the probe is nobody: set-ID files. */

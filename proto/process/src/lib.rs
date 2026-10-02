@@ -95,14 +95,21 @@
 //! time. ExecCommit, no body, once the loader said "the image is ready":
 //! the record moves to the new process in one step (its image number +1,
 //! the set-ID of the loader's place, the generation of its credentials
-//! raised, its caught signals the default on the page) and the loader
-//! hears that the record is ready; the old process ends itself. For a
-//! record of init's table the loader and the old image hear it only once
-//! init took the new process for its end line (Replace, below). ExecAbort,
-//! no body: the new process is killed and the place goes. The end of the
-//! old process before ExecCommit kills the new one; SIGKILL in the window
-//! kills both; the end of the old one after ExecCommit carries the old
-//! image number and ends nothing.
+//! raised, its caught signals the default on the page), the loads of
+//! children the record started and not committed stop, the service kills
+//! the old process and the loader hears that the record is ready. For a
+//! record of init's table the loader hears it, and the old process is
+//! killed, only once init took the new process for its end line (Replace,
+//! below). ExecAbort, no body: the new process is killed and the place
+//! goes. The end of the old process before ExecCommit, by itself or by
+//! SIGKILL, kills the new one and its quota comes back to the service;
+//! the end of the old one after ExecCommit carries the old image number
+//! and ends nothing. The identity session carries the image number too:
+//! a copy of an old image's identity vouches for nothing.
+//!
+//! Pool, through a session, no body: status u32 and the bytes u64 of the
+//! service's quota left for the children past its reserve, what a probe
+//! reads to see that ended loads gave their quota back.
 //!
 //! Replace, through the channel with no label, from the service's own
 //! thread that tells init of an exec (replace.rs): body the session label
@@ -115,7 +122,11 @@
 //! exec is done.
 //!
 //! Through the session of a loader (label `Label::loader` on the
-//! service's channel, entry 0 of its process): Boot, no body and two
+//! service's channel, entry 0 of its process): Ready, no body, once the
+//! image is loaded and before the loader answers Go: the place may be
+//! committed from then on, and SpawnCommit or ExecCommit before it is
+//! BAD_STATE, so a parent that commits a load it never let finish holds
+//! no place. Boot, no body and two
 //! handles, the copies of C for the parent (SEND) and for the service
 //! (NOTIFY); reply status u32, the address and the length u64 of the
 //! loader's data and stack, which it unmaps at its end, and four handles:
@@ -130,10 +141,10 @@
 //!
 //! SetId, through a notary session whose label has SET_ID (init gives it
 //! to the file services of its table): body `SetId`; the place of the
-//! loader the ticket names, while it waits for SpawnCommit and has no
-//! SetId yet, keeps the IDs; PERMISSION otherwise. Vouch of a loader's
-//! identity answers with the image and the ticket of its place
-//! (`LoaderOf`) only until its SpawnCommit or SpawnAbort.
+//! loader the ticket names, while it loads (from Boot until Ready) and
+//! has no SetId yet, keeps the IDs; PERMISSION otherwise. Vouch of a
+//! loader's identity, of the image its place loads, answers with the
+//! image and the ticket of its place (`LoaderOf`) only while it loads.
 //!
 //! Through a session: Query has no body or handles. Snapshot reply:
 //! status u32, pid u32, parent u32, uid/euid/suid/gid/egid/sgid u32.
@@ -244,9 +255,15 @@ impl Label {
         self.raw_at(image) | Self::IDENTITY | Self::EXIT
     }
 
-    /// The label of the record's identity session.
+    /// The label of the identity session of the record's first image.
     pub const fn identity(self) -> u64 {
-        self.raw() | Self::IDENTITY
+        self.identity_at(IMAGE)
+    }
+
+    /// The label of the identity session of image `image` of the record:
+    /// it vouches for the record only while that image is the record's.
+    pub const fn identity_at(self, image: u32) -> u64 {
+        self.raw_at(image) | Self::IDENTITY
     }
 
     /// The label of the session and of the identity of the loader of the
@@ -381,6 +398,8 @@ pub enum Method {
     ExecCommit = 29,
     ExecAbort = 30,
     Replace = 31,
+    Ready = 32,
+    Pool = 33,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -392,7 +411,7 @@ impl Method {
 }
 pub const METHODS: &[u16] = &[
     1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-    31,
+    31, 32, 33,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -987,6 +1006,8 @@ mod tests {
             Method::ExecCommit,
             Method::ExecAbort,
             Method::Replace,
+            Method::Ready,
+            Method::Pool,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {

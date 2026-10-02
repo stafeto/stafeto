@@ -20,6 +20,10 @@ rt::entry!(main);
 /// The sessions: the POSIX processes init starts and their children, each
 /// with a session of its own (Clone).
 const SESSIONS: usize = 64;
+/// The clones the service keeps alive at most, for all its clients: room
+/// for the 32 children of rtbench's S12 and the probes beside them, as the
+/// RAM file service's 128 (sp5.V5).
+const CLONES: usize = 128;
 /// The mark of the labels the service gives itself (Clone): bit 63, which
 /// no label of init has.
 const OWN: u64 = 1 << 63;
@@ -99,7 +103,7 @@ struct Clocks {
     level: u8,
     given: u64,
     /// The sessions Clone gave that live, bounded for each client.
-    clones: proto_wire::clones::Clones<64>,
+    clones: proto_wire::clones::Clones<CLONES>,
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
@@ -188,8 +192,10 @@ impl Clocks {
 
     /// Whether the process behind the session `label` may set the clock:
     /// its effective UID is 0 (spec 2, 3.1). `offered` is the identity
-    /// session the request brought; the first one of a session is kept and
-    /// the later ones close. The process service vouches for it through
+    /// session the request brought, which the session keeps in place of
+    /// the one before: after an exec the session moved to the new image,
+    /// whose identity is another, and the old one vouches for nothing
+    /// (sp5.K1). The process service vouches for it through
     /// the notary session, and what it said is remembered with the
     /// generation of the credentials and asked again only when the
     /// generation on the page moved: no call to the process service
@@ -205,7 +211,15 @@ impl Clocks {
             .iter()
             .position(|i| i.as_ref().is_some_and(|i| i.label == label));
         let slot = match (found, offered) {
-            (Some(slot), _) => slot,
+            (Some(slot), None) => slot,
+            (Some(slot), Some(channel)) => {
+                self.identities[slot] = Some(Identity {
+                    label,
+                    channel,
+                    known: Known::new(),
+                });
+                slot
+            }
             (None, Some(channel)) => {
                 // A free place, or else each in turn: the session whose
                 // place went brings its copy with its next SET again.
