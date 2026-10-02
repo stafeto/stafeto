@@ -165,7 +165,7 @@ self-notification and memory-object allocation. After
 it measures 1,000 periodic timer wakeups at 1 ms, idle and under a
 lower-priority CPU load. It reports median operations per second, timer
 p99 and worst latency, and missed periods, three runs per machine
-(`--repeats N` changes that). These are adapted workloads, not official
+(`--repeats N` changes that). These are adapted workloads, which give no official
 Thread-Metric results, and virtual machines do not give a physical
 worst-case latency. On Apple VZ the benchmark runs as a client of `init`
 beside the Virtio console's driver, which shows its lines, at priority 60

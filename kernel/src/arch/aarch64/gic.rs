@@ -97,7 +97,7 @@ fn block(intid: u32) -> usize {
 }
 
 /// Resets the GIC and turns it on, as the device tree names it (spec 9):
-/// every line masked, not pending, not active, at DEFAULT_PRIORITY; shared
+/// every line masked, clear of pending and active state, at DEFAULT_PRIORITY; shared
 /// lines go to this CPU; the priority mask lets DEFAULT_PRIORITY through.
 /// Runs once, at boot.
 pub fn init(info: &BootInfo) {

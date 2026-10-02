@@ -2360,7 +2360,7 @@ fn host_tests() -> Result<(), String> {
 /// does: head.S must drop to EL1, and with a GICv3 open its system
 /// registers to EL1 first. The image also carries none of the kernel's own
 /// tests (spec 3.4): `no_test_symbols` checks it here so every normal
-/// build, not just the one that ships, is covered.
+/// build, the one that ships included, is covered.
 fn boot_smoke(m: &qemu::Machine, gic: &str) -> Result<u64, String> {
     let a = build(Variant::Normal)?;
     no_test_symbols(&a.elf)?;
@@ -3021,8 +3021,8 @@ fn init_registers(elr: u64) -> String {
 
 /// A kernel that executes an undefined instruction must name the exception
 /// class, print the registers, and its backtrace must name the interrupted
-/// instruction: proof that exception entry recorded a frame, not just that
-/// the panic handler's own frames print (they would with no record at all).
+/// instruction: proof that exception entry recorded a frame, beyond the printing of
+/// the panic handler's own frames (they would print with no record at all).
 fn fault_report() -> Result<(), String> {
     let a = build(Variant::FaultProbe)?;
     let mut cmd = qemu::command(&qemu::VIRT, &a.image, Some(&a.boot_image));

@@ -4,8 +4,8 @@
 //! The waits of the service that wait (WaitStart answered WAIT k): each
 //! under the key rt::service::LongOps gave it, in the place of the key,
 //! and the keys of each record's waits, WAITS_OF_RECORD of them, so that
-//! the end of a child looks at its parent's waits alone, not at all the
-//! service's. A key whose operation went is stale: the caller says which
+//! the end of a child looks at its parent's waits alone and leaves the rest of the
+//! service's waits untouched. A key whose operation went is stale: the caller says which
 //! are alive (`live`), and a stale place is free.
 
 use proto_process::{RECORDS, Selector};

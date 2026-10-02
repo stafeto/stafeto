@@ -21,7 +21,7 @@ local reference. Dropping `PosixFs` ends the session and releases all RAM
 opens. Console descriptors use the same local table and can be replaced
 with files; closing or replacing one console entry retains the process's
 console transport for remaining streams. A file allocated at descriptor
-zero routes to RAM instead of accidentally invoking console input.
+zero routes to RAM and never invokes console input.
 Console metadata reports a character device; seeking returns `NotSeekable`.
 
 RAM sessions now permit 32 open descriptions so all 32 local slots can be

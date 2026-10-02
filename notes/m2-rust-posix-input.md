@@ -31,7 +31,7 @@ After an empty poll, native input now creates a private channel and timer,
 then blocks in receive between polls, at one-millisecond deadlines.
 The timer slot has priority 1 and does not raise a client's base priority.
 Both temporary handles close when the operation completes or fails.
-This is bounded-rate polling, not device-driven wakeup or a hard RT guarantee.
+This is bounded-rate polling, which gives no device-driven wakeup and no hard RT guarantee.
 
 ConsolePoll accepts a consumption limit of 1 through 8 in x1.
 Zero preserves the original eight-byte kernel ABI.
@@ -65,7 +65,7 @@ Reading input inside prepare_read prevents file progress and times out the
 UART dialog before the host sends data.
 Ignoring the native consumption limit loses burst bytes and prevents the
 native completion marker after one-byte reads.
-The initial native run with yield instead of sleeping also failed before
+The initial native run, whose waits yielded, also failed before
 the file-progress marker; timer-backed waiting resolved that failure.
 
 ## Remaining requirements

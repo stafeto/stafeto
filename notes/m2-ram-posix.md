@@ -10,7 +10,7 @@ The protocol has distinct missing-path, bad-descriptor and no-space codes.
 maps descriptors 0, 1 and 2 to the kernel console. Input currently polls
 the native console and yields between empty polls; the normal UART driver
 has a separate input path. This first interface is intended for the
-dedicated RAMFS boot images, not yet for a general interactive shell.
+dedicated RAMFS boot images; a general interactive shell comes later.
 
 `cargo xtask ramfs` builds `boot-ramfs.img`, starts the service and a
 Rust client, and waits for `ramfs-probe: ok`. The client checks a read-only

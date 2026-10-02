@@ -24,8 +24,8 @@ unsafe extern "C" {
 /// must mask interrupts (DAIF) for the duration of the call: the switch
 /// runs part of the way with TTBR0 pointed at the identity map and does not
 /// tolerate being re-entered. Only one CPU may be running: the TLB flushes
-/// here are local (`tlbi vmalle1`, `dsb nsh`), not broadcast to other
-/// cores. `kernel_pa` must be the kernel image's actual physical load
+/// here are local to this core (`tlbi vmalle1`, `dsb nsh`) and reach no
+/// other core. `kernel_pa` must be the kernel image's actual physical load
 /// address, or the physical addresses computed from it are wrong.
 pub unsafe fn replace_ttbr1(new_root: u64, kernel_pa: u64) {
     let pa = |va: usize| image_pa(kernel_pa, va);

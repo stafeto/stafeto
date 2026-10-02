@@ -125,7 +125,8 @@ pub enum Post<O> {
 /// allocates.
 pub struct Queue<O> {
     items: ReadyQueue<Slot<O>>,
-    /// The items are receivers that wait, not slots and requests.
+    /// Whether the items are receivers that wait (otherwise slots and
+    /// requests).
     receivers: bool,
     /// The items in the queue: one more at each insert, one less at each
     /// removal (object_info CHANNEL, spec 11).
@@ -491,7 +492,7 @@ mod tests {
     /// The queue holds receivers or else slots and requests, and the kind
     /// turns only through an empty queue: receivers that wait take the
     /// requests that come, then requests queue, and a receiver takes them
-    /// in `receive` instead of waiting; a receiver that would wait behind a
+    /// in `receive` without waiting; a receiver that would wait behind a
     /// queued request stops the kernel.
     #[test]
     #[should_panic(expected = "a receiver waits while a slot or a request is queued")]

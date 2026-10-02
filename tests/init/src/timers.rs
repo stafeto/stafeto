@@ -186,8 +186,8 @@ fn timer_handle_cases(gone: u64, channel: u64, seen: u64) -> bool {
 
 /// Spec 15.2 (time): a timer on a channel and receive make a wait with a
 /// bound (spec 6.1, 10). Init waits on an empty channel whose timer fires
-/// 1 ms from now and wakes with the timer's notification, bit 0 once, not
-/// before the deadline; nothing else comes.
+/// 1 ms from now and wakes with the timer's notification, bit 0 once, at or
+/// after the deadline; nothing else comes.
 fn timer_bounds_a_wait() -> Outcome {
     let c = channel(QUIET)?;
     let t = timer(&c)?;

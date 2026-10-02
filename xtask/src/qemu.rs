@@ -645,7 +645,7 @@ fn backtrace_addresses(lines: &[String]) -> Vec<u64> {
 
 /// The backtrace must name the interrupted instruction (its `ELR`) and at
 /// least one caller above it: proof that exception entry recorded a frame
-/// linking the fault into the backtrace, not just the panic handler's own
+/// linking the fault into the backtrace, beyond the panic handler's own
 /// frames (which a backtrace prints regardless of that record).
 pub fn backtrace_names_the_fault(lines: &[String]) -> Result<(), String> {
     let elr = elr_in_panic(lines).ok_or("no panic line with ELR=0x...")?;
@@ -1491,7 +1491,7 @@ ffffffffc0001200 t kernel::testpoint::skip_brk
         b"boot complete\r\nstafeto> echo hello stafeto\r\nhello stafeto\r\nstafeto> ";
 
     /// Spec 14: the answer to a command is looked for after the command
-    /// was typed, not in its echo or in what came before.
+    /// was typed, so its echo and what came before do not count.
     #[test]
     fn an_answer_is_looked_for_after_its_command() {
         let mut t = Transcript::new(DIALOG);

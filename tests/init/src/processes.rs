@@ -164,7 +164,7 @@ pub(crate) const PROVIDER_QUOTA: u64 = LEAF_QUOTA + (child::SHARED_PAGES as u64 
 /// for the boot image and for the loader's window, pages of its pools of
 /// memory objects, shells, channels and sessions, the grandchild's
 /// objects, under 20 pages, the grandchild's LEAF_QUOTA, and 3 pages paid
-/// ahead: an upper bound with room, not measured.
+/// ahead: an estimated upper bound with room.
 const GRANDPARENT_QUOTA: u64 = 64 * PAGE as u64;
 /// What `Kid::load` says when the child's quota fell short.
 const KID_NO_MEMORY: &str = "the child's quota fell short of its loading";

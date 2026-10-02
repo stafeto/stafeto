@@ -103,7 +103,7 @@
    writes nothing to one (spec 3.2): what it says goes into its log, and
    the line `stafeto <version> booting` and anything after it come out
    once the port of the tree is known. A panic before that, such as
-   `no device tree in x0` when the ELF is booted instead of the Image,
+   `no device tree in x0` when the ELF is booted (QEMU gives the Image a device tree),
    stays in the log in RAM. Read it through QEMU's monitor: start QEMU
    with `-monitor tcp:127.0.0.1:4444,server=on,wait=off`, then
    `printf 'pmemsave 0x40200000 0x100000 ram.bin\n' | nc 127.0.0.1 4444`
@@ -162,7 +162,7 @@ instruction-counted time), and `target/stafeto-probe.elf` and
 and stack overflow) from `cargo xtask test`. The right file is named by
 the `backtrace (look up: ...)` line itself in the panic output. With
 `CARGO_TARGET_DIR` set, the images, the ELFs and the boot images are
-there instead of under `target/`.
+in that directory.
 
 `cargo xtask run`, `test` and `hvf` also pass each panic frame to
 `llvm-symbolizer` with that run's ELF and print its function and source

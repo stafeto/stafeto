@@ -30,7 +30,7 @@ Handle chunks and directories still use the existing 2048-byte block pool.
 No new pool field or uncharged mapping allocation is introduced.
 
 The pthread owner's stack grows from 32 to 64 KiB for its larger registry.
-Thread-specific bindings take 64 KiB instead of 32 KiB in static storage.
+Thread-specific bindings take 64 KiB in static storage, up from 32 KiB.
 Stack reservations now span 0x30000000..0x34000000, one MiB per slot;
 the default mapped stack is still 64 KiB with a 4 KiB unmapped guard.
 Message pages start at 0x2000000, one per application slot.

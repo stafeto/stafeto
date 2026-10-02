@@ -52,7 +52,7 @@ unsafe impl Send for Session {}
 /// Sessions whose places have not gone back.
 static LIVE: Live = Live::new();
 
-/// A session of `c`, an open channel, with `label`, not 0, and a slot of
+/// A session of `c`, an open channel, with a `label` above 0 and a slot of
 /// `priority`, 1-63 under the payer's ceiling, as handle_duplicate checked
 /// them (spec 5.3): it takes one of the channel's slots, LIMIT_REACHED
 /// past abi::MAX_SLOTS, then a place in the pool of sessions of `payer`,

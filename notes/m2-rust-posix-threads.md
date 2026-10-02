@@ -50,12 +50,12 @@ library (its value is null). The 1 ms timer only watches main, which init made
 with no exit channel, once it said EXIT, and retries a cancellation whose
 thread has not begun to wait yet. The owner's channel has no label for the
 ends, so each notification makes the owner read THREAD_STATE of every live
-or exiting pthread, up to 64 calls at its ceiling, instead of one session
-and its handle for each thread.
+or exiting pthread, up to 64 calls at its ceiling. A session and its handle
+for each thread would read one thread only.
 Initial pthreads inherit main's priority; the timer uses that priority.
 Future scheduling interfaces must update this priority arrangement.
-Polling waits in the guest probe sleep instead of starving a FIFO IPC owner.
-This is a functional lifecycle implementation, not a worst-case latency bound.
+Polling waits in the guest probe sleep, so that a FIFO IPC owner is never starved.
+This is a functional lifecycle implementation.
 
 ## Verification
 

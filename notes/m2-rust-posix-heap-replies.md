@@ -16,7 +16,7 @@ A growing private journal reserves metadata before malloc/calloc/realloc(NULL).
 Reservation failure precedes the application heap operation. A successful
 allocation prepays one live-block record. ACK clears its operation identity
 while keeping the record associated with the live application address.
-Realloc and free reuse that record instead of acquiring new journal storage.
+Realloc and free reuse that record and acquire no new journal storage.
 A failed realloc retains the original live address and bytes. Success updates
 the tracked address. Free mutates application storage once, keeping its result
 until ACK releases the now-empty metadata record.

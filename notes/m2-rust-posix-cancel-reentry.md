@@ -34,8 +34,8 @@ The dispatcher saves/restores errno; the worker's value must remain 777.
 After both handlers return, the worker blocks in a raw receive inside its
 original window. Its parent requests deferred cancellation. A bounded 500 ms
 wait must observe cleanup; joining must return PTHREAD_CANCELED. This checks
-that the restored outer window actually causes an IPC wake, rather than only
-checking its numeric value. The parent validates both bytes through the C ABI,
+that the restored outer window causes an IPC wake, and it checks the
+numeric value besides. The parent validates both bytes through the C ABI,
 closes the descriptor, and verifies joined-thread handle and memory recovery.
 The parent's own inactive window remains zero.
 

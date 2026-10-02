@@ -26,8 +26,8 @@ No client job, closure, result slot, application buffer or callback escapes.
 Kernel channel cancellation removes a queued sender or marks an accepted
 reply token dead before releasing the departed thread's message buffer.
 The receiver's copy stays valid after the client goes; a failed reply does
-not expose freed client storage. IPC errors now report EIO rather than
-terminating the entire process to protect a stack job.
+not expose freed client storage. IPC errors now report EIO, and the entire
+process no longer terminates to protect a stack job.
 No failed request is automatically retried, since it might have taken effect.
 This storage model supports future cancellation, but does not implement it.
 

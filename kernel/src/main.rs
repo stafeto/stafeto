@@ -4,7 +4,7 @@
 //! The stafeto kernel. Milestone 1.2c: boot, read the device tree and the
 //! boot image, set up the kernel's memory, the interrupt controller, the
 //! timer and the scheduler, report, and start init from the boot image;
-//! init's end ends the run. Test builds run the kernel tests instead of
+//! init's end ends the run. Test builds run the kernel tests and start no
 //! init.
 
 #![no_std]

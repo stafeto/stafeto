@@ -62,8 +62,8 @@ pub enum Error {
     BadSignature(&'static str),
     /// The format's version is `found`; the reader knows `known`.
     BadVersion { found: u32, known: u32 },
-    /// File `n`'s name is empty, longer than 32 bytes, not UTF-8 or not
-    /// padded with zeros.
+    /// File `n`'s name is empty, longer than 32 bytes, invalid UTF-8 or
+    /// padded with bytes other than zeros.
     BadName(u32),
     /// File `n` does not start at a 4 KiB boundary at or after the end of
     /// the table and of the file before it.
@@ -72,7 +72,7 @@ pub enum Error {
     DuplicateName(u32),
     /// The image has no files, or its first file is not init.
     NoInit,
-    /// The stack size is zero, not whole pages, or so large that the stack
+    /// The stack size is zero, ends inside a page, or is so large that the stack
     /// and its guard page leave nothing above page 0.
     BadStack(u32),
     /// The segment's address or the offset of its bytes is not at a 4 KiB
@@ -113,7 +113,7 @@ impl fmt::Display for Error {
             Error::NoInit => f.write_str("the first file is not init"),
             Error::BadStack(s) => write!(
                 f,
-                "stack size {s:#x} is zero, not whole pages or leaves no room for the program"
+                "stack size {s:#x} is zero, ends inside a page or leaves no room for the program"
             ),
             Error::Misaligned(p) => write!(
                 f,
@@ -404,8 +404,8 @@ impl<'a> Program<'a> {
 }
 
 /// The end of the room a program has: the bottom of the guard page under a
-/// stack of `stack_size` bytes, if that size is whole pages, not zero, and
-/// leaves room above page 0.
+/// stack of `stack_size` bytes, if that size is a nonzero whole number of pages
+/// and leaves room above page 0.
 fn room_end(stack_size: u32) -> Option<u64> {
     let size = u64::from(stack_size);
     if size == 0 || !size.is_multiple_of(PAGE_SIZE) {

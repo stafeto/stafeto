@@ -3,7 +3,7 @@
 
 //! The layer's side of relibc's stafeto platform (spec 2, 3.10): the C
 //! functions `stafeto_*` that the module `src/platform/stafeto` of the
-//! fork stafeto/relibc calls instead of Linux system calls. Each returns a
+//! fork stafeto/relibc calls as its system calls. Each returns a
 //! value or a negated errno; numbers and structures are those of Linux
 //! AArch64 as relibc sees them.
 //!

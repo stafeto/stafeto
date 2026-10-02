@@ -1944,7 +1944,7 @@ fn killer_and_child(
 }
 
 /// The thread in slot 0 of the test's process, above the others, which
-/// waits in receive for the test's alarm, not armed yet.
+/// waits in receive for the test's alarm, which is still unarmed.
 fn waiting_for_the_alarm(f: &mut Fixture) -> Result<(), &'static str> {
     let p = f.processes[0].expect("the test's process");
     let h = alarm(f, p, None)?;
