@@ -44,6 +44,7 @@ const fn echo(name: &'static str, level: u8, watch: Watch, args: &'static [u8]) 
         quiesce: &[],
         trusted: false,
         root: false,
+        on_demand: false,
     }
 }
 

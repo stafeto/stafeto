@@ -20,9 +20,10 @@ use rt::{abi, loader, sys};
 
 /// The boot image the service maps read-only at its start (`set_image`).
 static IMAGE: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
-/// The service's channel with no label, its own process, and the level of
-/// its loop, which the main thread keeps for good (`set_handles`).
-static OWN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The service's channel with no label, its own process, init's channel
+/// and the level of its loop, which the main thread keeps for good
+/// (`set_handles`).
+static OWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The boot image, `len` bytes mapped at `addr` for as long as the
 /// service lives.
@@ -32,12 +33,23 @@ pub fn set_image(addr: usize, len: usize) {
 }
 
 /// The handles the threads of the service share: `channel`, the service's
-/// channel with no label, and `own`, its process with MANAGE; `level`, the
-/// loop's priority.
-pub fn set_handles(channel: &Handle<Channel>, own: &Handle<Process>, level: u8) {
+/// channel with no label, `own`, its process with MANAGE, and `init`, its
+/// channel to init (Startup::parent); `level`, the loop's priority.
+pub fn set_handles(
+    channel: &Handle<Channel>,
+    own: &Handle<Process>,
+    init: &Handle<Channel>,
+    level: u8,
+) {
     OWN[0].store(channel.raw().0, Ordering::Relaxed);
     OWN[1].store(own.raw().0, Ordering::Relaxed);
-    OWN[2].store(level.into(), Ordering::Release);
+    OWN[2].store(init.raw().0, Ordering::Relaxed);
+    OWN[3].store(level.into(), Ordering::Release);
+}
+
+/// The service's channel to init.
+pub fn init() -> ManuallyDrop<Handle<Channel>> {
+    Handle::borrowed(abi::Handle(OWN[2].load(Ordering::Acquire)))
 }
 
 /// The service's channel with no label.
@@ -50,7 +62,7 @@ fn own() -> ManuallyDrop<Handle<Process>> {
 }
 
 fn level() -> u8 {
-    OWN[2].load(Ordering::Acquire) as u8
+    OWN[3].load(Ordering::Acquire) as u8
 }
 
 /// The program `name` of the boot image.
@@ -107,20 +119,85 @@ fn ask(
     Ok((len, reply.handles))
 }
 
-/// Loaded or Abandon of the record of `label` (`method`).
-pub fn tell(method: Method, label: u64) -> Result<(), Status> {
+/// Loaded of the record of `label`.
+pub fn loaded(label: u64) -> Result<(), Status> {
     let mut w = Writer::new();
-    method.header().write(&mut w)?;
+    Method::Loaded.header().write(&mut w)?;
     w.u64(label)?;
     let mut buffer = [0; abi::MESSAGE_MAX];
     ask(&w, rt::handle::Outgoing::new(), &mut buffer).map(drop)
 }
 
+/// Abandon of the record of `label` (0 for none), whose process is killed,
+/// and of the Spawn of the record of `parent` (0 for none), which gets
+/// `status`.
+pub fn abandon(label: u64, parent: u64, status: Status) -> Result<(), Status> {
+    let mut w = Writer::new();
+    Method::Abandon.header().write(&mut w)?;
+    w.u64(label)?;
+    w.u64(parent)?;
+    w.u32(status.code())?;
+    let mut buffer = [0; abi::MESSAGE_MAX];
+    ask(&w, rt::handle::Outgoing::new(), &mut buffer).map(drop)
+}
+
+/// The status of a reply, its first word.
+pub fn status(bytes: &[u8]) -> Result<Status, Status> {
+    Ok(Status::from_code(Reader::new(bytes).u32()?))
+}
+
+/// ADOPTED for `ticket` with what `made` gave: the session, the process
+/// and a copy of its thread, then thread_start and Loaded once init took
+/// them; a refusal of init, or no process, ends the record and the Spawn
+/// of `parent` (0 for none) with Abandon. `buffer` is the calling
+/// thread's.
+pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
+    let mut w = Writer::new();
+    if proto_init::Method::Adopted.header().write(&mut w).is_err() || w.u64(ticket).is_err() {
+        return;
+    }
+    let init = init();
+    let made = match made {
+        Ok(made) => made,
+        Err(failed) => {
+            // Init hears of the failure first, then the process goes, and
+            // with it the last copy of the start channel. Init answers at
+            // once; a lost answer leaves its record waiting until the start
+            // channel's end.
+            let _ = w.u32(failed.status.code().max(1));
+            let _ = sys::send(&init, w.as_bytes());
+            let _ = abandon(failed.label.unwrap_or(0), parent, failed.status);
+            return;
+        }
+    };
+    let Made {
+        label,
+        process,
+        session,
+        thread,
+    } = made;
+    let copy = sys::handle_duplicate(&thread, abi::Rights::MANAGE | abi::Rights::TRANSFER);
+    let taken = w.u32(0).is_ok()
+        && copy.is_ok_and(|copy| {
+            let mut buffer = [0; abi::MESSAGE_MAX];
+            let handles = [session.erase(), process.erase(), copy.erase()];
+            sys::send_handles(&init, w.as_bytes(), handles)
+                .is_ok_and(|reply| status(reply.bytes(&mut buffer)) == Ok(Status::Ok))
+        });
+    if taken && sys::thread_start(&thread).is_ok() {
+        let _ = loaded(label);
+    } else {
+        let _ = abandon(label, parent, Status::from_code(proto_process::AGAIN));
+    }
+}
+
 /// Makes the process of `create` with the start channel `start` from the
 /// program `name` of the boot image, loading it through `window` of the
 /// service's space, which only the calling thread uses, while `thread`,
-/// the caller's own, runs at the process's priority. The record stays
-/// LOADING until `tell(Loaded)`.
+/// the caller's own, runs at `level`: the process's priority, or that of
+/// the parent whose Spawn waits for it when higher, so that a parent
+/// waits for no copy below its own level; never above the loop's. The
+/// record stays LOADING until `loaded`.
 ///
 /// # Safety
 /// Only the calling thread maps and uses `window`, a range as big as the
@@ -131,6 +208,7 @@ pub unsafe fn make(
     name: &Name,
     window: usize,
     thread: &Handle<Thread>,
+    level: u8,
 ) -> Result<Made, Failed> {
     let refused = |status| Failed {
         status,
@@ -143,22 +221,24 @@ pub unsafe fn make(
     let mut buffer = [0; abi::MESSAGE_MAX];
     let (len, mut handles) = ask(&w, [start.erase()].into(), &mut buffer).map_err(refused)?;
     let mut r = Reader::new(&buffer[..len]);
-    let made = (|| {
-        // The status, then the PID, which init's start data do not need.
-        let (_, _, label) = (r.u32()?, r.u32()?, r.u64()?);
-        r.finish()?;
-        let process = handles.take::<Process>(0).map_err(|_| Status::BadSize)?;
-        let session = handles.take::<Channel>(1).map_err(|_| Status::BadSize)?;
-        Ok((label, process, session))
-    })();
-    let (label, process, session) = made.map_err(refused)?;
+    // The status, then the PID, which init's start data do not need, and
+    // the label first: past it the record exists, and a failure ends it.
+    let (_, _, label) = (|| Ok::<_, Status>((r.u32()?, r.u32()?, r.u64()?)))().map_err(refused)?;
     let failed = |status| Failed {
         status,
         label: Some(label),
     };
-    // The copy runs at the process's own level, and the thread goes back
-    // to the loop's level for its next request.
-    let _ = sys::thread_set_priority(thread, create.priority, abi::Policy::Fifo);
+    let handed = (|| {
+        r.finish()?;
+        let process = handles.take::<Process>(0).map_err(|_| Status::BadSize)?;
+        let session = handles.take::<Channel>(1).map_err(|_| Status::BadSize)?;
+        Ok((process, session))
+    })();
+    let (process, session) = handed.map_err(failed)?;
+    // The copy runs at its level, and the thread goes back to the loop's
+    // level for its next request.
+    let copy_level = level.clamp(1, self::level());
+    let _ = sys::thread_set_priority(thread, copy_level, abi::Policy::Fifo);
     // SAFETY: the caller's promise for `window`.
     let filled = unsafe {
         loader::fill(
@@ -170,7 +250,7 @@ pub unsafe fn make(
             abi::Policy::Fifo,
         )
     };
-    let _ = sys::thread_set_priority(thread, level(), abi::Policy::Fifo);
+    let _ = sys::thread_set_priority(thread, self::level(), abi::Policy::Fifo);
     let first = filled.map_err(|e| failed(Status::Kernel(e)))?;
     Ok(Made {
         label,

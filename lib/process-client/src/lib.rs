@@ -6,7 +6,7 @@
 //! gave (proto_process): init puts it in the start data of a process under
 //! the name `posix`.
 #![no_std]
-use proto_process::{Change, Credentials, Method};
+use proto_process::{Change, Credentials, Method, Spawn};
 use proto_wire::{Reader, Status, Writer};
 use rt::{
     abi::Error,
@@ -86,6 +86,23 @@ impl Client {
     pub fn query(&self) -> Result<Snapshot, Status> {
         let mut buffer = [0; 64];
         Self::snapshot(self.call(&Method::Query.header().bytes(), &mut buffer)?)
+    }
+    /// Spawn: the PID of the child the service made of `spawn`'s record of
+    /// init's table, once it was loaded; the service's status otherwise.
+    /// A send that came back INTERRUPTED goes again: the service never saw
+    /// it.
+    pub fn spawn(&self, spawn: &Spawn) -> Result<u32, Status> {
+        let mut w = Writer::new();
+        Method::Spawn.header().write(&mut w)?;
+        spawn.write(&mut w)?;
+        let mut buffer = [0; 64];
+        let mut r = Reader::new(self.call(w.as_bytes(), &mut buffer)?);
+        let (_, pid) = (r.u32()?, r.u32()?);
+        r.finish()?;
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(Status::BadSize);
+        }
+        Ok(pid)
     }
     /// Change: the service changes the record's credentials once, whatever
     /// signals come while the caller waits for the reply.

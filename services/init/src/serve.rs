@@ -364,7 +364,13 @@ impl Init {
             entry.timer_label = label;
         }
         for &place in order.as_slice() {
-            self.launch(place);
+            if TABLE[place].on_demand {
+                // It starts on the process service's SPAWN (`spawn`).
+                self.entries[place].state = State::Ended;
+                self.begin(place);
+            } else {
+                self.launch(place);
+            }
         }
         if TABLE.is_empty() {
             println!("{STARTED}");
@@ -617,21 +623,39 @@ impl Init {
             .is_none_or(|p| matches!(self.entries[p].state, State::Ended | State::Broken))
     }
 
-    /// Offers the record at `place` to the waiting ADOPT (proto_init
-    /// Adoption) with a new ticket, the label of its start channel B: a
-    /// copy of init's channel with SEND and TRANSFER whose slot has the
-    /// record's priority, as rt::loader::spawn makes it, so that the
-    /// process's requests, and the CLIENT_GONE of the last copy once the
-    /// process ended, carry the ticket. False when B could not be made
-    /// and the record failed.
+    /// Offers the record at `place` to the waiting ADOPT (`adoption`).
+    /// False when its start channel could not be made and the record
+    /// failed.
     fn offer_one(&mut self, place: usize) -> bool {
-        let record = &TABLE[place];
-        let ticket = self.labels.next().expect("init gave every label");
-        let rights = Rights::SEND | Rights::TRANSFER;
-        let Ok(start) = sys::handle_label(&self.channel, rights, ticket, record.priority) else {
+        let mut w = proto_wire::Writer::new();
+        let Ok(start) = self.adoption(place, &mut w) else {
             self.adoption_failed(place, "no start channel");
             return false;
         };
+        let pending = self.adoption.take().expect("a waiting ADOPT");
+        if pending.answer(w.as_bytes(), [start.erase()]).is_ok() {
+            self.entries[place].offered = true;
+        }
+        // Else the service went: the next ADOPT offers the record again.
+        true
+    }
+
+    /// The reply of ADOPT or SPAWN for the POSIX record at `place` in `w`
+    /// (proto_init Adoption) with a new ticket, the label of the start
+    /// channel B it returns: a copy of init's channel with SEND and
+    /// TRANSFER whose slot has the record's priority, as rt::loader::spawn
+    /// makes it, so that the process's requests, and the CLIENT_GONE of the
+    /// last copy once the process ended, carry the ticket. The record
+    /// waits for ADOPTED with that ticket. The error of handle_label.
+    fn adoption(
+        &mut self,
+        place: usize,
+        w: &mut proto_wire::Writer,
+    ) -> Result<Handle<Channel>, Error> {
+        let record = &TABLE[place];
+        let ticket = self.labels.next().expect("init gave every label");
+        let rights = Rights::SEND | Rights::TRANSFER;
+        let start = sys::handle_label(&self.channel, rights, ticket, record.priority)?;
         let adoption = Adoption {
             ticket,
             quota: record.quota,
@@ -641,17 +665,48 @@ impl Init {
             root: record.root,
             program: Name::new(record.program.as_bytes()).expect("a checked table has names"),
         };
-        let mut w = proto_wire::Writer::new();
-        let written = adoption.write(&mut w);
-        let pending = self.adoption.take().expect("a waiting ADOPT");
-        if written.is_err() || pending.answer(w.as_bytes(), [start.erase()]).is_err() {
-            // The service went: the next ADOPT offers the record again.
-            return true;
+        // The reply has room for the 48 bytes of an adoption.
+        let _ = adoption.write(w);
+        self.entries[place].ticket = ticket;
+        Ok(start)
+    }
+
+    /// SPAWN from the instance at `place`: only the process service's
+    /// (BAD_STATE for any other caller); BAD_SIZE for a body that is no
+    /// name; ACCESS_DENIED for a name of no record that starts on demand;
+    /// LIMIT_REACHED while an instance of it lives, waits or ends. The
+    /// reply is that of ADOPT for the record (`adoption`), which waits for
+    /// ADOPTED from then on, LOADING.
+    fn spawn(&mut self, place: usize, r: &mut Request<'_>) -> Answer {
+        if TABLE[place].name != table::PROCESS_SERVICE {
+            return refuse(Error::BadState);
         }
-        let entry = &mut self.entries[place];
+        let mut body = r.body();
+        let Ok(Some(name)) = body.name() else {
+            return Answer::Status(Status::BadSize);
+        };
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(target) = table::find(TABLE, name.as_bytes()).filter(|&p| TABLE[p].on_demand)
+        else {
+            return refuse(Error::AccessDenied);
+        };
+        let entry = &self.entries[target];
+        if entry.adopting || !matches!(entry.held, Held::Empty) {
+            return refuse(Error::LimitReached);
+        }
+        let mut w = proto_wire::Writer::new();
+        let start = match self.adoption(target, &mut w) {
+            Ok(start) => start,
+            Err(e) => return refuse(e),
+        };
+        let entry = &mut self.entries[target];
+        entry.state = State::Loading;
+        entry.adopting = true;
         entry.offered = true;
-        entry.ticket = ticket;
-        true
+        let _ = r.reply().bytes(w.as_bytes());
+        Answer::Reply([start.erase()].into())
     }
 
     /// The POSIX record at `place` gets no process: a failure of its
@@ -929,13 +984,13 @@ impl Init {
             self.push(Job::new(work, place, record));
         }
         // With the process service ended or broken for good, the POSIX
-        // processes that wait for their sessions get none; a service that
-        // restarts asks for them again.
+        // records that wait for their processes get none; a service that
+        // restarts asks for them again, but for those its SPAWN asked for.
         let over = matches!(self.entries[place].state, State::Ended | State::Broken);
         if record.name == table::PROCESS_SERVICE {
             self.adoption = None;
-            for p in 0..TABLE.len() {
-                if over && self.entries[p].adopting {
+            for (p, other) in TABLE.iter().enumerate() {
+                if (over || other.on_demand) && self.entries[p].adopting {
                     self.adoption_failed(p, "the process service ended");
                 } else {
                     self.entries[p].offered = false;
@@ -1330,6 +1385,7 @@ impl Service<1> for Init {
         Method::Ping.number(),
         Method::Adopt.number(),
         Method::Adopted.number(),
+        Method::Spawn.number(),
     ];
     type Data = ();
 
@@ -1346,6 +1402,7 @@ impl Service<1> for Init {
             Some(Method::Stats) => self.stats(r),
             Some(Method::Adopt) => self.adopt(place, r),
             Some(Method::Adopted) => self.adopted(place, r),
+            Some(Method::Spawn) => self.spawn(place, r),
             Some(Method::Ping) if r.body().finish().is_ok() => Answer::Status(Status::Ok),
             Some(Method::Ping) => Answer::Status(Status::BadSize),
             _ => Answer::Status(Status::UnknownMethod),

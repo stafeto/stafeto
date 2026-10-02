@@ -8,10 +8,18 @@
 //! process, which the service creates (Create), and goes only with the
 //! notification of the process's end, whose place carries the record's
 //! exit label: a copy of its session that outlives the process keeps
-//! nothing. `P` is what the service keeps of the record's process: its
-//! handle.
+//! nothing. A record that Spawn made is a child of the record that asked
+//! for it, CHILDREN_MAX children of one record at a time, linked by their
+//! indices so that a child that goes leaves its parent in O(1); the
+//! children of a record that goes get the service, PID 1, for their parent
+//! (CHILDREN_MAX steps). `P` is what the service keeps of the record's
+//! process: its handle.
 
-use proto_process::{Credentials, Label, Place, RECORDS};
+use proto_process::{Create, Credentials, INIT_PID, Label, Place, RECORDS};
+
+/// The live children of one record at most, until RLIMIT_NPROC (5b
+/// design, question 3): Spawn past them is EAGAIN.
+pub const CHILDREN_MAX: u32 = 32;
 
 /// Where a record is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,9 +34,19 @@ pub struct Record<P> {
     /// Its process, which the service created and calls with later.
     pub process: P,
     pub label: Label,
+    /// The PID of its parent: INIT_PID for a record of init's table and
+    /// for an orphan.
     pub parent: u32,
     pub credentials: Credentials,
     pub state: State,
+    /// The index of its parent's record while the parent lives.
+    pub parent_index: Option<u16>,
+    /// Its live children, and the first of their list.
+    pub children: u32,
+    first_child: Option<u16>,
+    /// Its neighbours in the list of its parent's children.
+    previous: Option<u16>,
+    next: Option<u16>,
 }
 
 pub struct Records<P> {
@@ -48,13 +66,15 @@ impl<P> Default for Records<P> {
 
 impl<P> Records<P> {
     /// No record, every index free, index 0 on top.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         let mut free = [0; RECORDS];
-        for (i, slot) in free.iter_mut().enumerate() {
-            *slot = (RECORDS - 1 - i) as u16;
+        let mut i = 0;
+        while i < RECORDS {
+            free[i] = (RECORDS - 1 - i) as u16;
+            i += 1;
         }
         Self {
-            records: core::array::from_fn(|_| None),
+            records: [const { None }; RECORDS],
             generations: [0; RECORDS],
             free,
             free_len: RECORDS,
@@ -100,16 +120,23 @@ impl<P> Records<P> {
         })
     }
 
+    /// Whether the record in `index` may have another child.
+    pub fn may_spawn(&self, index: usize) -> bool {
+        self.get(index).is_some_and(|r| r.children < CHILDREN_MAX)
+    }
+
     /// A record of `process`, LOADING, with the label `next_label` gave,
-    /// which the caller made its exit place and session with: O(1).
+    /// which the caller made its exit place and session with: a child of
+    /// the live record in `parent`, which counts it, or of PID 1. O(1).
     ///
     /// # Panics
-    /// When `label` is not that of `next_label`.
+    /// When `label` is not that of `next_label`, or `parent` holds no
+    /// record that may have another child (`may_spawn`).
     pub fn insert(
         &mut self,
         label: Label,
         process: P,
-        parent: u32,
+        parent: Option<usize>,
         credentials: Credentials,
     ) -> usize {
         assert_eq!(
@@ -118,16 +145,44 @@ impl<P> Records<P> {
             "the label of the next record"
         );
         let i = usize::from(label.index);
+        let (pid, first) = match parent {
+            Some(p) => {
+                assert!(self.may_spawn(p), "a parent with room for a child");
+                let parent = self.records[p].as_mut().expect("a live parent");
+                parent.children += 1;
+                let first = parent.first_child.replace(i as u16);
+                (parent.label.pid(), first)
+            }
+            None => (INIT_PID, None),
+        };
+        if let Some(f) = first {
+            self.records[usize::from(f)]
+                .as_mut()
+                .expect("a child")
+                .previous = Some(i as u16);
+        }
         self.free_len -= 1;
         self.generations[i] = label.generation;
         self.records[i] = Some(Record {
             process,
             label,
-            parent,
+            parent: pid,
             credentials,
             state: State::Loading,
+            parent_index: parent.map(|p| p as u16),
+            children: 0,
+            first_child: None,
+            previous: None,
+            next: first,
         });
         i
+    }
+
+    /// The live children of the record in `index`, by their indices.
+    pub fn children(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
+        let first = self.get(index).and_then(|r| r.first_child);
+        core::iter::successors(first, |&c| self.records[usize::from(c)].as_ref()?.next)
+            .map(usize::from)
     }
 
     /// The record whose exit place has `label` goes: the notification of
@@ -137,18 +192,72 @@ impl<P> Records<P> {
     pub fn ended(&mut self, label: u64) -> Option<Record<P>> {
         let index = self.named(label, Place::Exit)?;
         let record = self.records[index].take()?;
+        // Out of its parent's list.
+        match record.previous {
+            Some(p) => {
+                self.records[usize::from(p)]
+                    .as_mut()
+                    .expect("a sibling")
+                    .next = record.next
+            }
+            None => {
+                if let Some(parent) = record
+                    .parent_index
+                    .and_then(|p| self.records[usize::from(p)].as_mut())
+                {
+                    parent.first_child = record.next;
+                }
+            }
+        }
+        if let Some(n) = record.next {
+            self.records[usize::from(n)]
+                .as_mut()
+                .expect("a sibling")
+                .previous = record.previous;
+        }
+        if let Some(parent) = record
+            .parent_index
+            .and_then(|p| self.records[usize::from(p)].as_mut())
+        {
+            parent.children -= 1;
+        }
+        // Its children are the service's, PID 1: CHILDREN_MAX at most.
+        let mut child = record.first_child;
+        while let Some(c) = child {
+            let orphan = self.records[usize::from(c)].as_mut().expect("a child");
+            child = orphan.next;
+            orphan.parent = INIT_PID;
+            orphan.parent_index = None;
+            orphan.previous = None;
+            orphan.next = None;
+        }
         self.free[self.free_len] = index as u16;
         self.free_len += 1;
         Some(record)
     }
 }
 
-/// The exit place of the record of `label` for a process of `ceiling`: its
-/// label and the priority of the notification of the end, the process's
-/// ceiling (spec 2, section 3.1), so that the end of a process lifts the
-/// service no higher than the process could run.
-pub const fn exit_place(label: Label, ceiling: u8) -> (u64, u8) {
-    (label.exit(), ceiling)
+/// The exit place of the record of `label` for the process of `create`,
+/// with the service's loop at `loop_level`: the label of the copy of the
+/// channel with NOTIFY, the priority of its slot and that of the
+/// notification of the end, both the process's ceiling (spec 2, 3.1,
+/// decision 1 of 5b), so that the end of a process lifts the service no
+/// higher than the process could run, whatever the loop's level.
+pub const fn exit_place(label: Label, create: &Create, loop_level: u8) -> ExitPlace {
+    let _ = loop_level;
+    ExitPlace {
+        label: label.exit(),
+        slot: create.ceiling,
+        notice: create.ceiling,
+    }
+}
+
+/// What `handle_label` and `process_create` take for an exit place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitPlace {
+    pub label: u64,
+    pub slot: u8,
+    pub notice: u8,
 }
 
 #[cfg(test)]
@@ -158,8 +267,68 @@ mod tests {
 
     fn add(t: &mut Records<u32>) -> Option<Label> {
         let label = t.next_label()?;
-        t.insert(label, 0, INIT_PID, Credentials::NOBODY);
+        t.insert(label, 0, None, Credentials::NOBODY);
         Some(label)
+    }
+
+    fn child(t: &mut Records<u32>, parent: Label) -> Label {
+        let label = t.next_label().unwrap();
+        t.insert(label, 0, Some(usize::from(parent.index)), Credentials::ROOT);
+        label
+    }
+
+    /// A record has CHILDREN_MAX live children at most; a child that ends
+    /// frees its place, and one that ended in the middle of the list
+    /// leaves the others linked.
+    #[test]
+    fn a_record_has_children_max_children() {
+        let mut t = Records::<u32>::new();
+        let parent = add(&mut t).unwrap();
+        let p = usize::from(parent.index);
+        let children: Vec<Label> = (0..CHILDREN_MAX)
+            .map(|_| {
+                assert!(t.may_spawn(p));
+                child(&mut t, parent)
+            })
+            .collect();
+        assert!(!t.may_spawn(p), "the 33rd child is refused");
+        assert_eq!(t.get(p).unwrap().children, CHILDREN_MAX);
+        assert_eq!(t.children(p).count(), CHILDREN_MAX as usize);
+        for c in &children {
+            let record = t.get(usize::from(c.index)).unwrap();
+            assert_eq!(record.parent, parent.pid());
+            assert_eq!(record.parent_index, Some(parent.index));
+        }
+        assert!(t.ended(children[5].exit()).is_some());
+        assert!(t.may_spawn(p), "a child that ended frees its place");
+        assert_eq!(t.children(p).count(), CHILDREN_MAX as usize - 1);
+        assert!(!t.children(p).any(|c| c == usize::from(children[5].index)));
+        // The first and the last of the list go too.
+        assert!(t.ended(children[31].exit()).is_some());
+        assert!(t.ended(children[0].exit()).is_some());
+        assert_eq!(t.children(p).count(), CHILDREN_MAX as usize - 3);
+        assert_eq!(t.get(p).unwrap().children, CHILDREN_MAX - 3);
+    }
+
+    /// The children of a record that ends get PID 1; a new record in its
+    /// index is no parent of theirs.
+    #[test]
+    fn the_children_of_an_ended_record_get_pid_1() {
+        let mut t = Records::<u32>::new();
+        let parent = add(&mut t).unwrap();
+        let a = child(&mut t, parent);
+        let b = child(&mut t, parent);
+        assert!(t.ended(parent.exit()).is_some());
+        for c in [a, b] {
+            let record = t.get(usize::from(c.index)).unwrap();
+            assert_eq!(record.parent, INIT_PID);
+            assert_eq!(record.parent_index, None);
+        }
+        let next = add(&mut t).unwrap();
+        assert_eq!(next.index, parent.index);
+        assert_eq!(t.children(usize::from(next.index)).count(), 0);
+        assert!(t.ended(a.exit()).is_some());
+        assert_eq!(t.get(usize::from(next.index)).unwrap().children, 0);
     }
 
     #[test]
@@ -241,15 +410,30 @@ mod tests {
         }
     }
 
-    /// The end of a process is heard at its ceiling.
+    /// The end of a process is heard at its ceiling, below the loop's
+    /// level (40, the service of the tables) or above it.
     #[test]
     fn the_exit_place_is_at_the_ceiling_of_the_process() {
         let label = Label {
             index: 3,
             generation: 1,
         };
-        for ceiling in [1, 31, 40] {
-            assert_eq!(exit_place(label, ceiling), (label.exit(), ceiling));
+        for (ceiling, loop_level) in [(31, 40), (1, 40), (40, 40), (31, 52)] {
+            let create = Create {
+                quota: 64 * 4096,
+                handle_limit: 16,
+                ceiling,
+                priority: ceiling,
+                root: false,
+                parent: 0,
+            };
+            let place = exit_place(label, &create, loop_level);
+            assert_eq!(place.label, label.exit());
+            assert_eq!(
+                (place.slot, place.notice),
+                (ceiling, ceiling),
+                "{ceiling} {loop_level}"
+            );
         }
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "posix-procs"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The probe of POSIX processes in C on relibc: posix_spawn through the process service"
+build = "build.rs"
+
+[[bin]]
+name = "posix-procs"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

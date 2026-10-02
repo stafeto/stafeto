@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 4;
+pub const PLATFORM_INTERFACE: u64 = 5;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -239,6 +239,21 @@ pub extern "C" fn stafeto_getpid() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_getppid() -> c_int {
     posix_abi::process::getppid()
+}
+
+/// posix_spawn of the program at `path` (posix_abi::process::spawn): the
+/// child's PID, or the negated errno.
+///
+/// # Safety
+/// `path` is a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_spawn(path: *const c_char, flags: c_int, pgroup: c_int) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+    match call(|| posix_abi::process::spawn(path, flags, pgroup)) {
+        Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
 }
 
 const PAGE: usize = 4096;

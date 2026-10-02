@@ -35,6 +35,8 @@ table-ramfs = []
 table-posix-abi = []
 table-relibc = []
 table-relibc-threads = []
+# The probe of POSIX processes (posix-procs) and the records it spawns.
+table-posix-procs = []
 table-os-test = []
 table-busybox = []
 table-busybox-dialog = []

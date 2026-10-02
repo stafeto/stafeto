@@ -33,6 +33,7 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        on_demand: false,
     },
     Record {
         name: "ramfs-probe",
@@ -54,6 +55,7 @@ pub const TABLE: &[Record] = &[
         quiesce: &[],
         trusted: false,
         root: false,
+        on_demand: false,
     },
 ];
 
@@ -209,6 +211,51 @@ pub const RELIBC_TABLE: &[Record] = &[
         ..RELIBC_HELLO
     },
 ];
+
+/// The probe of POSIX processes (tests/posix-procs, 5b): the RAM files,
+/// the process and clock services, the probe, and the records it spawns,
+/// which start on demand: a child that says its parent, one that sleeps,
+/// and one whose 32 MiB stack its 15 pages of quota cannot map, so that
+/// its load fails (the image gives `posix-procs-big` that stack).
+pub const POSIX_PROCS_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-procs",
+        program: "posix-procs",
+        args: b"posix-procs\0",
+        root: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-sleeper",
+        args: b"posix-procs\0sleep\0",
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+    Record {
+        name: "procs-big",
+        program: "posix-procs-big",
+        quota: super::MIN_QUOTA,
+        on_demand: true,
+        ..PROCS_CHILD
+    },
+];
+
+/// The child of the probe of POSIX processes.
+const PROCS_CHILD: Record = Record {
+    name: "procs-child",
+    program: "posix-procs",
+    args: b"posix-procs\0child\0",
+    connects: &["ramfs", "clock", "posix"],
+    quota: 512 * PAGE,
+    ..POSIX
+};
 
 /// One test of os-test a boot (cargo xtask os-test): the RAM files, the
 /// process and clock services, and the test, under the name `os-test`.

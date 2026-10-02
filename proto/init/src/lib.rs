@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The protocol of init (spec 13.3, 13.4, 13.8, proto_wire): the numbers
-//! of its seven methods, which never change once given, and their bodies.
+//! of its methods, which never change once given, and their bodies.
 //! Every number goes low byte first.
 //!
 //! START: a program asks its parent for its start data through its start
@@ -110,6 +110,14 @@
 //! process with no rights and reads its end once the last copy of the
 //! start channel closed. Once init answered 0, the service starts the
 //! thread; on any other answer it kills the process.
+//!
+//! SPAWN, also from the process service alone, for posix_spawn of a
+//! POSIX process (5b, until the loader of 5c): the header and the name of
+//! a record of init's table that starts on demand, 16 bytes; the reply
+//! that is no refusal is that of ADOPT for that record (`Adoption`), whose
+//! process the service makes as for ADOPT and gives with ADOPTED.
+//! ACCESS_DENIED for a name of no record that starts on demand,
+//! LIMIT_REACHED while an instance of it lives or ends.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -131,10 +139,11 @@ pub enum Method {
     Ping = 7,
     Adopt = 8,
     Adopted = 9,
+    Spawn = 10,
 }
 
 impl Method {
-    pub const ALL: [Method; 9] = [
+    pub const ALL: [Method; 10] = [
         Method::Start,
         Method::Register,
         Method::Connect,
@@ -144,6 +153,7 @@ impl Method {
         Method::Ping,
         Method::Adopt,
         Method::Adopted,
+        Method::Spawn,
     ];
 
     pub const fn number(self) -> u16 {
@@ -1074,13 +1084,13 @@ mod tests {
     #[test]
     fn method_numbers_are_fixed() {
         let numbers = Method::ALL.map(Method::number);
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(10), None);
+        assert_eq!(Method::from_number(11), None);
         assert_eq!(VERSION, 1);
         assert_eq!(Method::Start.header().bytes(), [1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(START_PIECE_MAX, 952);

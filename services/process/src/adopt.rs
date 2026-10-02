@@ -11,12 +11,13 @@
 //! service (spec 6.7). The thread works at the loop's level but for the
 //! load; its stack, message buffer and loader window are its own.
 
-use crate::make::{self, Failed, Made};
-use core::mem::ManuallyDrop;
+use crate::make::{self, Failed};
 use core::sync::atomic::{AtomicU64, Ordering};
 use proto_init::{Adoption, Method};
 use proto_process::Create;
-use proto_wire::{Reader, Status, Writer};
+use proto_wire::Status;
+#[cfg(feature = "adoption-refusals")]
+use proto_wire::Writer;
 use rt::handle::{Channel, Handle, Process, Thread};
 use rt::{Stack, abi, sys};
 
@@ -26,13 +27,11 @@ static STACK: Stack<STACK_SIZE> = Stack::new();
 const BUFFER: usize = abi::INIT_MSGBUF as usize + 4096;
 /// Where the thread maps the objects of a program it loads.
 const WINDOW: usize = 0x60_0000_0000;
-/// The values of init's channel (Startup::parent) and of the thread's own
-/// handle, which the service keeps for good.
-static HANDLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// The value of the thread's own handle, which the service keeps for good.
+static THREAD: AtomicU64 = AtomicU64::new(0);
 
 /// Starts the receiving thread at `level` in `own`, the service's process.
-pub fn start(own: &Handle<Process>, parent: &Handle<Channel>, level: u8) -> Result<(), abi::Error> {
-    HANDLES[0].store(parent.raw().0, Ordering::Relaxed);
+pub fn start(own: &Handle<Process>, level: u8) -> Result<(), abi::Error> {
     // SAFETY: STACK is the thread's alone, and the page after the main
     // thread's buffer is free.
     let thread = unsafe {
@@ -47,19 +46,15 @@ pub fn start(own: &Handle<Process>, parent: &Handle<Channel>, level: u8) -> Resu
         )
     }?;
     // The thread lives as long as the service, and sets its own priority.
-    HANDLES[1].store(thread.into_raw().0, Ordering::Release);
-    let thread = Handle::<Thread>::borrowed(abi::Handle(HANDLES[1].load(Ordering::Acquire)));
-    sys::thread_start(&thread)
-}
-
-/// The status of a reply, its first word.
-fn status(bytes: &[u8]) -> Result<Status, Status> {
-    Ok(Status::from_code(Reader::new(bytes).u32()?))
+    THREAD.store(thread.into_raw().0, Ordering::Release);
+    sys::thread_start(&Handle::<Thread>::borrowed(abi::Handle(
+        THREAD.load(Ordering::Acquire),
+    )))
 }
 
 extern "C" fn receiver(_: u64) -> ! {
-    let parent = Handle::<Channel>::borrowed(abi::Handle(HANDLES[0].load(Ordering::Relaxed)));
-    let own = Handle::<Thread>::borrowed(abi::Handle(HANDLES[1].load(Ordering::Acquire)));
+    let parent = make::init();
+    let own = Handle::<Thread>::borrowed(abi::Handle(THREAD.load(Ordering::Acquire)));
     let mut buffer = [0; abi::MESSAGE_MAX];
     #[cfg(feature = "adoption-refusals")]
     refusals(&parent);
@@ -82,59 +77,26 @@ extern "C" fn receiver(_: u64) -> ! {
             ceiling: adoption.ceiling,
             priority: adoption.priority,
             root: adoption.root,
+            parent: 0,
         };
         let made = match reply.handles.take::<Channel>(0) {
             // SAFETY: only this thread maps and uses WINDOW.
-            Ok(start) => unsafe { make::make(&create, start, &adoption.program, WINDOW, &own) },
+            Ok(start) => unsafe {
+                make::make(
+                    &create,
+                    start,
+                    &adoption.program,
+                    WINDOW,
+                    &own,
+                    adoption.priority,
+                )
+            },
             Err(_) => Err(Failed {
                 status: Status::BadSize,
                 label: None,
             }),
         };
-        adopted(&parent, adoption.ticket, made);
-    }
-}
-
-/// ADOPTED for `ticket` with what `made` gave: the session, the process
-/// and a copy of its thread, then thread_start and Loaded once init took
-/// them; a refusal of init, or no process, ends the record (Abandon).
-fn adopted(parent: &ManuallyDrop<Handle<Channel>>, ticket: u64, made: Result<Made, Failed>) {
-    let mut w = Writer::new();
-    if Method::Adopted.header().write(&mut w).is_err() || w.u64(ticket).is_err() {
-        return;
-    }
-    let made = match made {
-        Ok(made) => made,
-        Err(failed) => {
-            if let Some(label) = failed.label {
-                let _ = make::tell(proto_process::Method::Abandon, label);
-            }
-            let _ = w.u32(failed.status.code().max(1));
-            // Init answers at once; a lost answer leaves its record waiting
-            // until the start channel's end, which the failure closed.
-            let _ = sys::send(parent, w.as_bytes());
-            return;
-        }
-    };
-    let Made {
-        label,
-        process,
-        session,
-        thread,
-        ..
-    } = made;
-    let copy = sys::handle_duplicate(&thread, abi::Rights::MANAGE | abi::Rights::TRANSFER);
-    let taken = w.u32(0).is_ok()
-        && copy.is_ok_and(|copy| {
-            let mut buffer = [0; abi::MESSAGE_MAX];
-            let handles = [session.erase(), process.erase(), copy.erase()];
-            sys::send_handles(parent, w.as_bytes(), handles)
-                .is_ok_and(|reply| status(reply.bytes(&mut buffer)) == Ok(Status::Ok))
-        });
-    if taken && sys::thread_start(&thread).is_ok() {
-        let _ = make::tell(proto_process::Method::Loaded, label);
-    } else {
-        let _ = make::tell(proto_process::Method::Abandon, label);
+        make::adopted(adoption.ticket, made, 0);
     }
 }
 
@@ -148,7 +110,7 @@ fn refusals(parent: &Handle<Channel>) {
         let mut buffer = [0; abi::MESSAGE_MAX];
         sys::send(parent, w.as_bytes())
             .map_err(Status::Kernel)
-            .and_then(|reply| status(reply.bytes(&mut buffer)))
+            .and_then(|reply| make::status(reply.bytes(&mut buffer)))
     };
     let mut adopt = Writer::new();
     let _ = Method::Adopt.header().write(&mut adopt);

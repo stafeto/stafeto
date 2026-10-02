@@ -12,9 +12,19 @@
 //! record, its exit place and the process, and replies status u32, pid
 //! u32, label u64 with two handles: the process (MANAGE, DUPLICATE,
 //! TRANSFER) for the load, and the record's session. Loaded, body label
-//! u64: the process was loaded and runs; reply its status. Abandon, body
-//! label u64: the load failed, the service kills the process, and the
-//! record goes with its end; reply its status.
+//! u64: the process was loaded and runs; reply its status, and the parent
+//! whose Spawn made it gets its PID. Abandon, body label u64 (0 for no
+//! record), parent label u64 (0 for none) and status u32: the process,
+//! if any, is killed, and the record goes with its end; the parent's
+//! Spawn gets the status; reply its own status. Next: no body; the reply,
+//! once a Spawn waits, is status u32, zero u32, the parent's label u64,
+//! the name of the record of init's table, 16 bytes, and the level of the
+//! parent's Spawn u32 (`Next`).
+//!
+//! Spawn, through a session: body `Spawn`; the reply, once the child was
+//! loaded and init took it (Loaded), is status u32 and the child's PID
+//! u32, or the status of why not. One Spawn of a record waits at a time
+//! and CHILDREN_MAX children live (AGAIN past either).
 //!
 //! Through a session: Query has no body or handles. Snapshot reply:
 //! status u32, pid u32, parent u32, uid/euid/suid/gid/egid/sgid u32.
@@ -24,7 +34,7 @@
 //! Change takes effect once with no journal.
 #![cfg_attr(not(test), no_std)]
 use abi::ProcessState;
-use proto_wire::{Header, Reader, Status, Writer};
+use proto_wire::{Header, Name, Reader, Status, Writer};
 pub const VERSION: u16 = 4;
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
@@ -38,6 +48,12 @@ pub const NO_CHILD: u32 = 505;
 pub const AGAIN: u32 = 506;
 /// EACCES.
 pub const ACCESS: u32 = 507;
+/// ENOENT: no program of that name.
+pub const NOT_FOUND: u32 = 508;
+
+/// The flags of Spawn: those of posix_spawnattr_setflags (Linux values).
+pub const SPAWN_SETPGROUP: u32 = 0x02;
+pub const SPAWN_SETSID: u32 = 0x80;
 
 /// Records of the service at most: PID = index + RECORDS * generation.
 pub const RECORDS: usize = 256;
@@ -192,6 +208,8 @@ pub enum Method {
     Change = 3,
     Loaded = 6,
     Abandon = 7,
+    Spawn = 8,
+    Next = 9,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -201,7 +219,7 @@ impl Method {
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 3, 6, 7];
+pub const METHODS: &[u16] = &[1, 2, 3, 6, 7, 8, 9];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -224,7 +242,8 @@ impl Change {
 
 /// The body of Create: the process as init's table has it (proto_init
 /// ADOPT), its quota in bytes, room for handles, ceiling and the priority
-/// of its first thread, and root credentials when `root`.
+/// of its first thread, root credentials when `root`, and the label of the
+/// parent whose Spawn asked for it, 0 for a record init's table starts.
 ///
 /// | Bytes | Field |
 /// |---|---|
@@ -234,6 +253,7 @@ impl Change {
 /// | 13 | priority |
 /// | 14 | root: 0 or 1 |
 /// | 15 | zero |
+/// | 16..24 | parent |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Create {
     pub quota: u64,
@@ -241,13 +261,15 @@ pub struct Create {
     pub ceiling: u8,
     pub priority: u8,
     pub root: bool,
+    pub parent: u64,
 }
 
 impl Create {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         w.u64(self.quota)?;
         w.u32(self.handle_limit)?;
-        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])
+        w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])?;
+        w.u64(self.parent)
     }
 
     /// BAD_SIZE out of the layout; a ceiling or priority past 63, a
@@ -256,6 +278,7 @@ impl Create {
         let quota = r.u64()?;
         let handle_limit = r.u32()?;
         let b = r.bytes(4)?;
+        let parent = r.u64()?;
         r.finish()?;
         let (ceiling, priority) = (b[0], b[1]);
         if ceiling > 63 || priority == 0 || priority > ceiling || b[2] > 1 || b[3] != 0 {
@@ -267,6 +290,80 @@ impl Create {
             ceiling,
             priority,
             root: b[2] == 1,
+            parent,
+        })
+    }
+}
+
+/// The body of Spawn: the name of the record of init's table, 16 bytes,
+/// the spawn-flags u32, the process group u32 and the caller's level u32,
+/// which the copy of the child's program runs at least at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spawn {
+    pub name: Name,
+    pub flags: u32,
+    pub pgroup: u32,
+    pub level: u8,
+}
+
+impl Spawn {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.name(Some(self.name))?;
+        w.u32(self.flags)?;
+        w.u32(self.pgroup)?;
+        w.u32(self.level.into())
+    }
+
+    /// BAD_SIZE out of the layout, without a name or with a level past 63.
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let name = r.name()?.ok_or(Status::BadSize)?;
+        let (flags, pgroup, level) = (r.u32()?, r.u32()?, r.u32()?);
+        r.finish()?;
+        let level = u8::try_from(level)
+            .ok()
+            .filter(|&l| l <= 63)
+            .ok_or(Status::BadSize)?;
+        Ok(Self {
+            name,
+            flags,
+            pgroup,
+            level,
+        })
+    }
+}
+
+/// The reply to Next that is no refusal: the spawn the spawning thread
+/// makes next, and the level of the parent's Spawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Next {
+    pub parent: u64,
+    pub name: Name,
+    pub level: u8,
+}
+
+impl Next {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(0)?;
+        w.u32(0)?;
+        w.u64(self.parent)?;
+        w.name(Some(self.name))?;
+        w.u32(self.level.into())
+    }
+
+    /// BAD_SIZE unless `bytes` hold status 0 and the fields.
+    pub fn read(bytes: &[u8]) -> Result<Self, Status> {
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 || r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let parent = r.u64()?;
+        let name = r.name()?.ok_or(Status::BadSize)?;
+        let level = u8::try_from(r.u32()?).map_err(|_| Status::BadSize)?;
+        r.finish()?;
+        Ok(Self {
+            parent,
+            name,
+            level,
         })
     }
 }
@@ -400,6 +497,8 @@ mod tests {
             Method::Change,
             Method::Loaded,
             Method::Abandon,
+            Method::Spawn,
+            Method::Next,
         ];
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
@@ -461,22 +560,72 @@ mod tests {
             ceiling: 31,
             priority: 30,
             root: true,
+            parent: Label {
+                index: 2,
+                generation: 1,
+            }
+            .raw(),
         };
         let mut w = Writer::new();
         create.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 16);
+        assert_eq!(w.as_bytes().len(), 24);
         assert_eq!(Create::read(Reader::new(w.as_bytes())), Ok(create));
         for (ceiling, priority, root) in [(64, 30, 0), (31, 32, 0), (31, 0, 0), (31, 30, 2)] {
             let mut w = Writer::new();
             w.u64(4096).unwrap();
             w.u32(16).unwrap();
             w.bytes(&[ceiling, priority, root, 0]).unwrap();
+            w.u64(0).unwrap();
             assert_eq!(
                 Create::read(Reader::new(w.as_bytes())),
                 Err(Status::BadSize),
                 "{ceiling} {priority} {root}"
             );
         }
+    }
+
+    #[test]
+    fn spawn_and_next_round_trip() {
+        let name = Name::new(b"procs-child").unwrap();
+        let spawn = Spawn {
+            name,
+            flags: SPAWN_SETPGROUP,
+            pgroup: 0,
+            level: 30,
+        };
+        let mut w = Writer::new();
+        spawn.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 28);
+        assert_eq!(Spawn::read(Reader::new(w.as_bytes())), Ok(spawn));
+        assert_eq!(
+            Spawn::read(Reader::new(&w.as_bytes()[..27])),
+            Err(Status::BadSize)
+        );
+        assert_eq!(
+            Spawn::read(Reader::new(&[0; 28])),
+            Err(Status::BadSize),
+            "no name"
+        );
+        let mut high = w.as_bytes().to_vec();
+        high[24] = 64;
+        assert_eq!(
+            Spawn::read(Reader::new(&high)),
+            Err(Status::BadSize),
+            "level 64"
+        );
+        let next = Next {
+            parent: 7,
+            name,
+            level: 30,
+        };
+        let mut w = Writer::new();
+        next.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 36);
+        assert_eq!(Next::read(w.as_bytes()), Ok(next));
+        assert_eq!(
+            Next::read(&proto_wire::reply(Status::BadSize)),
+            Err(Status::BadSize)
+        );
     }
 
     /// The reasons of PROCESS_STATE as wait reports them (decision 4 of
