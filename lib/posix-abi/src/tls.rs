@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The calling thread's block of the layer, in its TCB (posix-thread):
-//! `TPIDR_EL0`, the ABI word, the TCB, the block 32 bytes on. A POSIX
-//! thread gets its TCB once (`posix_thread_attach`): the main thread in a
-//! page of `.bss`, another pthread in the page above its stack; the
-//! register then stays as it is for the thread's life. A scope
+//! `TPIDR_EL0`, the ABI word, the TCB, the block 32 bytes on. relibc
+//! builds a thread's TCB; the layer attaches the thread to its block once
+//! (`attach_installed` for the main thread, crate::relibc for the others),
+//! and the register stays as it is for the thread's life. A scope
 //! (`with_files`, `with_errno`, `with_process`) on such a thread changes
 //! the fields of its block for the scope and gives them back after. A
 //! thread the layer did not attach (a helper of the layer or a thread of a
@@ -14,20 +14,9 @@
 //! yet.
 
 use crate::directory::Streams;
-use core::cell::UnsafeCell;
 use core::ptr;
 use posix_fs::PosixFs;
-use posix_thread::{Block, Page, Tcb};
-
-struct MainPage(UnsafeCell<Page>);
-// SAFETY: only the main thread uses its page, once startup attached it.
-unsafe impl Sync for MainPage {}
-static MAIN: MainPage = MainPage(UnsafeCell::new(Page::new()));
-
-/// The page of the main thread's TCB.
-pub fn main_page() -> *mut u8 {
-    MAIN.0.get().cast()
-}
+use posix_thread::{Block, Tcb};
 
 /// The ABI word and a TCB on the stack of a thread the layer did not
 /// attach, for its outermost scope.
@@ -35,42 +24,6 @@ pub fn main_page() -> *mut u8 {
 struct Transient {
     abi: [usize; 2],
     tcb: Tcb,
-}
-
-/// Gives the calling thread a TCB in `page`, `len` bytes from its ABI
-/// word on, with pthread number `id`, using the process's files; the
-/// register names it from now on.
-///
-/// # Safety
-/// `page` is writable for `len` bytes (at least the word and the TCB),
-/// aligned to 16, and the thread's alone for its life.
-pub unsafe fn attach(page: *mut u8, len: usize, id: u64) {
-    let _guard = rt::upcall::defer_entries().expect("TCB install deferral");
-    // SAFETY: the caller's promise.
-    let tcb = unsafe { posix_thread::build(page, len) };
-    // SAFETY: `build` made the block; the thread is not attached yet.
-    unsafe {
-        (*tcb).block.process_files = 1;
-        (*tcb).block.thread_id = id;
-        posix_thread::activate(page);
-    }
-}
-
-/// Gives the calling thread the TCB its creator built in `page` with
-/// posix_thread::build (so that signals sent before it ran wait in its
-/// block), as pthread `id` with the process's files.
-///
-/// # Safety
-/// `page` holds a TCB `build` made, the thread's alone for its life.
-pub unsafe fn attach_built(page: *mut u8, id: u64) {
-    let _guard = rt::upcall::defer_entries().expect("TCB install deferral");
-    // SAFETY: the caller's promise.
-    unsafe {
-        let tcb = page.add(posix_thread::TCB_OFFSET).cast::<Tcb>();
-        (*tcb).block.process_files = 1;
-        (*tcb).block.thread_id = id;
-        posix_thread::activate(page);
-    }
 }
 
 /// Makes the calling thread pthread `id` with the process's files in the
@@ -226,9 +179,4 @@ pub(crate) fn files() -> *mut PosixFs {
 pub(crate) fn directories() -> *mut Streams {
     // SAFETY: the current scope uniquely owns its live directory registry.
     unsafe { (*block()).directories.cast() }
-}
-
-pub(crate) fn thread_id() -> u64 {
-    // SAFETY: pthread entry points run on a thread with a block.
-    unsafe { (*block()).thread_id }
 }

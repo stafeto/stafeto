@@ -97,12 +97,15 @@ Bounded paths with interrupts masked are listed in
 
 ## Rust POSIX layer
 
-ABI 1 for AArch64 LP64 is experimental.
-`python3 tools/build-posix-sysroot.py --probe` stages headers and
-`lib/libc.a` under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links
-the C probe. No real program uses the layer yet. Since step 5a the layer
-has no helper threads; [m5a-transport](../notes/m5a-transport.md) says how
-it works and where it stops.
+Since step 5a′ the C library is relibc (`tools/build-relibc.py`, the fork
+pinned there): its headers and `libc.a` under `target/relibc/sysroot`, its
+platform the layer's `stafeto_*` functions (`lib/posix-platform`, interface
+4). The layer exports no C names (`cargo xtask ci` checks it) and keeps the
+system part; the C probe `posix-abi` and the Rust guest probes are programs
+on relibc. Since step 5a the layer has no helper threads;
+[m5a-transport](../notes/m5a-transport.md) says how it works and where it
+stops. The rows below date from the layer's own C surface; relibc now
+provides the C side of each.
 
 | Area | Interfaces | Notes |
 |---|---|---|

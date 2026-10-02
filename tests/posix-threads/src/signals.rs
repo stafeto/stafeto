@@ -53,7 +53,7 @@ unsafe extern "C" fn handler(signal: i32) {
     if signal != SIGUSR1
         || abi::process::getpid() <= 1
         || abi::process::getppid() != 1
-        || threads::pthread_self() != ID.load(Ordering::Acquire)
+        || ffi::pthread_self() != ID.load(Ordering::Acquire)
         || (effective & bit(SIGUSR1) != 0) != own_blocked
         || effective & bit(SIGUSR2) == 0
     {
@@ -103,7 +103,7 @@ unsafe extern "C" fn handler(signal: i32) {
     DEPTH.fetch_sub(1, Ordering::SeqCst);
 }
 unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
-    ID.store(threads::pthread_self(), Ordering::Release);
+    ID.store(ffi::pthread_self(), Ordering::Release);
     let mode = MODE.load(Ordering::Acquire);
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
@@ -128,7 +128,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
         passed &= COUNT.load(Ordering::Acquire) == if mode == 1 || mode == 2 { 2 } else { 1 };
         passed &= MAX_DEPTH.load(Ordering::Acquire) == if mode == 2 { 2 } else { 1 };
         passed &= mask() == 0 && pending() == 0 && unsafe { *errno } == 777;
-        passed &= api::pthread_kill(threads::pthread_self(), 0) == 0;
+        passed &= ffi::pthread_kill(ffi::pthread_self(), 0) == 0;
     } else if mode == 8 {
         passed &= abi::tls::with_errno(|| {
             let inner = unsafe { abi::__errno_location() };
@@ -136,7 +136,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
             api::raise(SIGUSR1) == 0
                 && COUNT.load(Ordering::Acquire) == 1
                 && unsafe { *inner } == 555
-                && threads::pthread_self() == ID.load(Ordering::Acquire)
+                && ffi::pthread_self() == ID.load(Ordering::Acquire)
         });
         passed &= unsafe { *errno } == 777;
     } else if mode == 9 {
@@ -146,7 +146,7 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
             && mask() == 0
             && unsafe { *errno } == 777;
     } else if mode == 3 || mode == 4 {
-        let native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
+        let native = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
         NATIVE.store(native.raw().0, Ordering::Release);
         // Through the layer, which keeps the level the holders of its locks
         // come back to.
@@ -220,8 +220,7 @@ pub(super) fn run() -> bool {
         }
         let mut id = 0;
         let mut result = ptr::null_mut();
-        if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) }
-            != 0
+        if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) } != 0
         {
             return failed(374);
         }
@@ -248,7 +247,7 @@ pub(super) fn run() -> bool {
                 };
                 if unsafe { api::sigaction(SIGUSR1, &ignore, ptr::null_mut()) } != 0
                     || pending() != 0
-                    || api::pthread_kill(id, SIGUSR1) != 0
+                    || ffi::pthread_kill(id, SIGUSR1) != 0
                 {
                     return failed(377);
                 }
@@ -264,7 +263,7 @@ pub(super) fn run() -> bool {
                 {
                     return failed(378);
                 }
-                if api::pthread_kill(id, SIGUSR1) != 0 {
+                if ffi::pthread_kill(id, SIGUSR1) != 0 {
                     return failed(379);
                 }
                 if mode == 3 {
@@ -287,10 +286,10 @@ pub(super) fn run() -> bool {
         ) {
             return failed(382);
         }
-        if unsafe { threads::pthread_join(id, &mut result) } != 0 || result as usize != 1 {
+        if unsafe { ffi::pthread_join(id, &mut result) } != 0 || result as usize != 1 {
             return failed(383 + mode);
         }
-        if api::pthread_kill(id, 0) != ESRCH || api::pthread_kill(id, 32) != EINVAL {
+        if ffi::pthread_kill(ffi::pthread_self(), 65) != EINVAL {
             return failed(392);
         }
         if mode == 5 || mode == 7 {
@@ -320,13 +319,17 @@ pub(super) fn run() -> bool {
 
 static PRESSURE_RESULT: AtomicUsize = AtomicUsize::new(0);
 static PRESSURE_WAIT: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" fn pressure_info_handler(signal: i32, info: *mut api::SigInfo, raw: *mut c_void) {
+unsafe extern "C" fn pressure_info_handler(
+    signal: i32,
+    info: *mut api::LinuxSigInfo,
+    raw: *mut c_void,
+) {
     // SAFETY: SA_SIGINFO supplies live per-delivery snapshots.
-    let (info, context) = unsafe { (&*info, &*raw.cast::<api::UserContext>()) };
-    if *info != api::SigInfo::thread(signal)
-        || context.uc_sigmask != 0
-        || context.uc_mcontext.sp == 0
-        || context.uc_mcontext.pc == 0
+    let (info, context) = unsafe { (&*info, &*raw.cast::<api::LinuxContext>()) };
+    if *info != api::LinuxSigInfo::thread(signal)
+        || context.mask != 0
+        || context.sp == 0
+        || context.pc == 0
     {
         ERRORS.fetch_add(1, Ordering::Release);
     }
@@ -334,7 +337,7 @@ unsafe extern "C" fn pressure_info_handler(signal: i32, info: *mut api::SigInfo,
 }
 unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     sys::receive(&channel(&GATE)).unwrap();
-    ID.store(threads::pthread_self(), Ordering::Release);
+    ID.store(ffi::pthread_self(), Ordering::Release);
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
     let mut old = posix_signals::INITIAL;
@@ -400,9 +403,7 @@ fn under_pressure() -> bool {
     let timer = sys::timer_create(&wake, 30).unwrap();
     GATE.store(gate.raw().0, Ordering::Release);
     let mut id = 0;
-    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(pressure), ptr::null_mut()) }
-        != 0
-    {
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(pressure), ptr::null_mut()) } != 0 {
         return failed(395);
     }
     let native = unsafe { threads::probe_native(id) }.unwrap();
@@ -415,7 +416,7 @@ fn under_pressure() -> bool {
             && PRESSURE_WAIT.load(Ordering::Acquire)
             && abi::signals::probe_waiting(id) == Ok(true)
         {
-            if api::pthread_kill(id, SIGUSR1) != 0 {
+            if ffi::pthread_kill(id, SIGUSR1) != 0 {
                 return failed(398);
             }
             delivered = true;
@@ -430,7 +431,7 @@ fn under_pressure() -> bool {
     // Native Ended and the release/acquire publication precede all reclamation.
     let passed = delivered && PRESSURE_RESULT.load(Ordering::Acquire) == 1;
     let mut result = ptr::null_mut();
-    if !passed || unsafe { threads::pthread_join(id, &mut result) } != 0 || result as usize != 1 {
+    if !passed || unsafe { ffi::pthread_join(id, &mut result) } != 0 || result as usize != 1 {
         return failed(397);
     }
     rt::println!(

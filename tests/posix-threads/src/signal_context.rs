@@ -3,7 +3,7 @@
 
 //! Read and edit a real interrupted CPU loop, including nested signal contexts.
 use super::*;
-use abi::signals::{self as api, SigAction, SigInfo, UserContext};
+use abi::signals::{self as api, LinuxContext, LinuxSigInfo, SigAction};
 use core::cell::UnsafeCell;
 use rt::wait::{Waited, Waiter};
 unsafe extern "C" {
@@ -41,33 +41,32 @@ fn now() -> u64 {
 fn channel(raw: &AtomicU64) -> core::mem::ManuallyDrop<Handle<Channel>> {
     Handle::borrowed(rt::abi::Handle(raw.load(Ordering::Acquire)))
 }
-unsafe extern "C" fn handler(signal: i32, info: *mut SigInfo, context: *mut c_void) {
+unsafe extern "C" fn handler(signal: i32, info: *mut LinuxSigInfo, context: *mut c_void) {
     let depth = DEPTH.fetch_add(1, Ordering::SeqCst) + 1;
     COUNT.fetch_add(1, Ordering::SeqCst);
     let mode = MODE.load(Ordering::Acquire);
     // SAFETY: the SA_SIGINFO dispatcher owns these live per-entry objects.
-    let (info, context) = unsafe { (&*info, &mut *context.cast::<UserContext>()) };
-    let machine = &mut context.uc_mcontext;
+    let (info, context) = unsafe { (&*info, &mut *context.cast::<LinuxContext>()) };
     let mut effective = 0;
     let mut valid = signal == SIGUSR1
-        && *info == SigInfo::thread(SIGUSR1)
-        && context.uc_link.is_null()
-        && context.uc_stack.ss_sp.is_null()
-        && context.uc_stack.ss_size == 0
-        && context.uc_stack.ss_flags == SS_DISABLE
+        && *info == LinuxSigInfo::thread(SIGUSR1)
+        && context.link.is_null()
+        && context.stack_pointer.is_null()
+        && context.stack_size == 0
+        && context.stack_flags == SS_DISABLE
         && unsafe { api::pthread_sigmask(-99, ptr::null(), &mut effective) } == 0
         && effective == bit(SIGPIPE) | bit(SIGUSR2) | if mode == 2 { 0 } else { bit(SIGUSR1) }
-        && context.uc_sigmask == bit(SIGPIPE) | if depth == 2 { bit(SIGUSR2) } else { 0 };
+        && context.mask == bit(SIGPIPE) | if depth == 2 { bit(SIGUSR2) } else { 0 };
     if depth == 1 {
-        OUTER_SP.store(machine.sp, Ordering::Release);
+        OUTER_SP.store(context.sp, Ordering::Release);
         let expected_sp = unsafe { (*OUTPUT.0.get())[102] };
-        valid &= machine.sp == expected_sp
-            && machine.pc >= ptr::addr_of!(native_upcall_loop) as u64
-            && machine.pc < ptr::addr_of!(native_upcall_resume) as u64
-            && machine.pstate == 0xa000_0000
-            && machine.fpcr == 0x800000
-            && machine.fpsr == 1;
-        for (index, &register) in machine.registers.iter().enumerate() {
+        valid &= context.sp == expected_sp
+            && context.pc >= ptr::addr_of!(native_upcall_loop) as u64
+            && context.pc < ptr::addr_of!(native_upcall_resume) as u64
+            && context.pstate == 0xa000_0000
+            && context.fpcr == 0x800000
+            && context.fpsr == 1;
+        for (index, &register) in context.registers.iter().enumerate() {
             valid &= if index == 9 {
                 register == ptr::from_ref(&STATE.seeded) as u64
             } else if index == 10 {
@@ -76,26 +75,26 @@ unsafe extern "C" fn handler(signal: i32, info: *mut SigInfo, context: *mut c_vo
                 register == 1000 + index as u64
             };
         }
-        for (index, &vector) in machine.vectors.iter().enumerate() {
+        for (index, &vector) in context.vectors.iter().enumerate() {
             valid &= vector == u128::from_ne_bytes([index as u8 + 1; 16]);
         }
         if mode == 1 {
-            machine.registers[0] = 0xfeed;
-            machine.registers[1] = 0xfeed;
-            machine.registers[10] = 1;
-            machine.pc = ptr::addr_of!(native_upcall_redirect) as u64;
-            machine.pstate = 0x6000_0000;
-            machine.vectors[31] = u128::from_ne_bytes([0x77; 16]);
-            machine.fpcr = 0;
-            machine.fpsr = 0;
-            context.uc_sigmask = bit(SIGTERM) | bit(SIGKILL);
+            context.registers[0] = 0xfeed;
+            context.registers[1] = 0xfeed;
+            context.registers[10] = 1;
+            context.pc = ptr::addr_of!(native_upcall_redirect) as u64;
+            context.pstate = 0x6000_0000;
+            context.vectors[31] = u128::from_ne_bytes([0x77; 16]);
+            context.fpcr = 0;
+            context.fpsr = 0;
+            context.mask = bit(SIGTERM) | bit(SIGKILL);
         }
         if mode == 2 {
-            let saved_pc = machine.pc;
+            let saved_pc = context.pc;
             valid &= api::raise(SIGUSR1) == 0
                 && COUNT.load(Ordering::Acquire) == 2
-                && machine.pc == saved_pc
-                && machine.sp == OUTER_SP.load(Ordering::Acquire);
+                && context.pc == saved_pc
+                && context.sp == OUTER_SP.load(Ordering::Acquire);
         }
         if mode == 3 {
             let mut old = posix_signals::INITIAL;
@@ -104,7 +103,7 @@ unsafe extern "C" fn handler(signal: i32, info: *mut SigInfo, context: *mut c_vo
                 && old.flags & SA_SIGINFO == 0;
         }
     } else {
-        valid &= mode == 2 && depth == 2 && machine.sp < OUTER_SP.load(Ordering::Acquire);
+        valid &= mode == 2 && depth == 2 && context.sp < OUTER_SP.load(Ordering::Acquire);
     }
     // A real asynchronous handler also performs required signal-safe file I/O.
     let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
@@ -123,7 +122,7 @@ unsafe extern "C" fn handler(signal: i32, info: *mut SigInfo, context: *mut c_vo
     }
 }
 unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
-    let native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
+    let native = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
     sys::thread_set_priority(&native, 10, rt::abi::Policy::Fifo).unwrap();
     let drain = sys::channel_create(10).unwrap();
     assert_eq!(sys::try_receive(&drain), Err(rt::abi::Error::WouldBlock));
@@ -180,6 +179,7 @@ pub(super) fn run() -> bool {
     let waiter = Waiter::new(&done, 0, 30).unwrap();
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let handles = sys::process_handles(&process).unwrap().live;
     let memory = sys::process_memory(&process).unwrap().used;
     let mut original = posix_signals::INITIAL;
@@ -215,8 +215,7 @@ pub(super) fn run() -> bool {
             original = old;
         }
         let mut id = 0;
-        if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) }
-            != 0
+        if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) } != 0
         {
             return failed(453);
         }
@@ -228,7 +227,7 @@ pub(super) fn run() -> bool {
         {
             return failed(454);
         }
-        if api::pthread_kill(id, SIGUSR1) != 0 {
+        if ffi::pthread_kill(id, SIGUSR1) != 0 {
             return failed(455);
         }
         if !matches!(
@@ -238,12 +237,13 @@ pub(super) fn run() -> bool {
         {
             return failed(456 + mode);
         }
-        if unsafe { threads::pthread_join(id, ptr::null_mut()) } != 0 {
+        if unsafe { ffi::pthread_join(id, ptr::null_mut()) } != 0 {
             return failed(460);
         }
     }
     if unsafe { api::sigaction(SIGUSR1, &original, ptr::null_mut()) } != 0
         || unsafe { api::pthread_sigmask(SIG_SETMASK, &inherited, ptr::null_mut()) } != 0
+        || !settle()
         || sys::process_handles(&process).unwrap().live != handles
         || sys::process_memory(&process).unwrap().used != memory
     {

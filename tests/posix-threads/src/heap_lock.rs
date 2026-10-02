@@ -81,12 +81,12 @@ unsafe extern "C" fn dupper(_: *mut c_void) -> *mut c_void {
 /// makes file requests with a signal raised inside the files' section,
 /// and finds the deepest painted byte that changed.
 unsafe extern "C" fn small_stack(_: *mut c_void) -> *mut c_void {
-    let Some(block) = threads::probe_block(threads::pthread_self()) else {
+    let Some(block) = threads::probe_block(ffi::pthread_self()) else {
         return ptr::null_mut();
     };
     // The stack lies right below the page of the TCB.
     let top = ptr::from_ref(block) as usize & !0xfff;
-    let bottom = top - PTHREAD_STACK_MIN as usize;
+    let bottom = top - PTHREAD_STACK_MIN;
     let marker = 0u8;
     let here = ptr::from_ref(&marker) as usize;
     let painted = here - 512;
@@ -132,17 +132,17 @@ fn files_lock_and_stack(fd: i32) -> bool {
     abi::shared::probe_hold(|| {
         HOLDING.store(1, Ordering::SeqCst);
         created =
-            unsafe { threads::pthread_create(&mut id, ptr::null(), Some(dupper), ptr::null_mut()) }
+            unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(dupper), ptr::null_mut()) }
                 == 0;
         // The dupper runs while main sleeps and waits for the lock; the
         // signal comes then.
         let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
-        let _ = api::pthread_kill(id, SIGUSR1);
+        let _ = ffi::pthread_kill(id, SIGUSR1);
         let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
         HOLDING.store(0, Ordering::SeqCst);
     });
     if !created
-        || unsafe { threads::pthread_join(id, ptr::null_mut()) } != 0
+        || unsafe { ffi::pthread_join(id, ptr::null_mut()) } != 0
         || DUPED.load(Ordering::SeqCst) != 1
         || CAUGHT_HOLDING.load(Ordering::SeqCst) != 0
     {
@@ -155,14 +155,12 @@ fn files_lock_and_stack(fd: i32) -> bool {
     }
     let mut attr = core::mem::MaybeUninit::uninit();
     let mut value = ptr::null_mut();
-    if unsafe { threads::pthread_attr_init(attr.as_mut_ptr()) } != 0
+    if unsafe { ffi::pthread_attr_init(attr.as_mut_ptr()) } != 0
+        || unsafe { ffi::pthread_attr_setstacksize(attr.as_mut_ptr(), PTHREAD_STACK_MIN) } != 0
         || unsafe {
-            threads::pthread_attr_setstacksize(attr.as_mut_ptr(), PTHREAD_STACK_MIN as usize)
+            ffi::pthread_create(&mut id, attr.as_ptr(), Some(small_stack), ptr::null_mut())
         } != 0
-        || unsafe {
-            threads::pthread_create(&mut id, attr.as_ptr(), Some(small_stack), ptr::null_mut())
-        } != 0
-        || unsafe { threads::pthread_join(id, &mut value) } != 0
+        || unsafe { ffi::pthread_join(id, &mut value) } != 0
         || value as usize != 1
     {
         return failed(698);
@@ -205,9 +203,9 @@ pub(super) fn run() -> bool {
     FD.store(fd as usize, Ordering::SeqCst);
     let mut ids = [0u64; THREADS];
     for (seed, id) in ids.iter_mut().enumerate() {
-        if unsafe { threads::pthread_create(id, ptr::null(), Some(churner), seed as *mut c_void) }
-            != 0
-        {
+        let made =
+            unsafe { ffi::pthread_create(id, ptr::null(), Some(churner), seed as *mut c_void) };
+        if made != 0 {
             return failed(693);
         }
     }
@@ -218,14 +216,14 @@ pub(super) fn run() -> bool {
     let mut sent = 0;
     while DONE.load(Ordering::SeqCst) < THREADS {
         for &id in &ids {
-            if api::pthread_kill(id, SIGUSR1) == 0 {
+            if ffi::pthread_kill(id, SIGUSR1) == 0 {
                 sent += 1;
             }
         }
         let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
     }
     for id in ids {
-        if unsafe { threads::pthread_join(id, ptr::null_mut()) } != 0 {
+        if unsafe { ffi::pthread_join(id, ptr::null_mut()) } != 0 {
             return failed(694);
         }
     }

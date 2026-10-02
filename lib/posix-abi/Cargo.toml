@@ -19,9 +19,6 @@ rtbench = []
 # the file and heap workers, a cancellation window and a borrow of the
 # file state (tests/posix-threads, tests/posix-shared).
 thread-probe = []
-# The C names come from relibc (5a′): the layer's functions stay for Rust
-# callers (posix-platform) and none is exported under its C name.
-libc-backend = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }

@@ -2,17 +2,27 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Real interrupted pthread requests and application-thread process lifetime.
+//! The probe is a C program on relibc: posix-crt starts it, relibc calls
+//! its `main`; relibc's pthreads come through libc-ffi, the layer's
+//! internals through the layer's Rust interface.
 
 #![no_std]
 #![no_main]
 
 use core::{
-    ffi::c_void,
+    ffi::{c_char, c_int, c_void},
     ptr,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
-use posix_abi::{self as abi, constants::*, threads, tls};
-use posix_fs::PosixFs;
+use libc_ffi::{self as ffi, PTHREAD_CANCEL_DISABLE};
+#[cfg(not(feature = "cancel-input"))]
+use libc_ffi::{
+    PTHREAD_CANCEL_ENABLE, PTHREAD_DESTRUCTOR_ITERATIONS, PTHREAD_MUTEX_ERRORCHECK,
+    PTHREAD_MUTEX_RECURSIVE, PTHREAD_STACK_MIN,
+};
+use posix_abi::{self as abi, threads};
+#[cfg(not(feature = "cancel-input"))]
+use posix_abi::{constants::*, tls};
 #[cfg(not(feature = "cancel-input"))]
 use rt::handle::Channel;
 use rt::{
@@ -66,7 +76,11 @@ mod timed;
 #[cfg(not(feature = "cancel-input"))]
 mod upcall;
 
-rt::entry!(main);
+#[used]
+static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
+/// The main thread's relibc `pthread_t`, which a later thread joins.
+#[cfg(not(feature = "cancel-input"))]
+static MAIN: AtomicU64 = AtomicU64::new(0);
 static PROCESS: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(feature = "cancel-input"))]
 static MAIN_BASE: AtomicU64 = AtomicU64::new(0);
@@ -100,7 +114,7 @@ unsafe extern "C" fn joiner(_: *mut c_void) -> *mut c_void {
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
     let mut value = ptr::null_mut();
-    let status = unsafe { threads::pthread_join(TARGET.load(Ordering::Acquire), &mut value) };
+    let status = unsafe { ffi::pthread_join(TARGET.load(Ordering::Acquire), &mut value) };
     let passed = status == 0 && value as usize == VALUE && unsafe { *errno } == 777;
     JOINED.store(if passed { 1 } else { 2 }, Ordering::Release);
     value
@@ -180,7 +194,8 @@ unsafe extern "C" fn after_main(_: *mut c_void) -> *mut c_void {
 unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     // Main exited through pthread_exit. Its join must still yield its value.
     let mut value = ptr::null_mut();
-    let passed = unsafe { threads::pthread_join(1, &mut value) } == 0 && value as usize == VALUE;
+    let passed = unsafe { ffi::pthread_join(MAIN.load(Ordering::Acquire), &mut value) } == 0
+        && value as usize == VALUE;
     if !passed || !specific::main_completed() {
         sys::process_exit(70);
     }
@@ -204,10 +219,10 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     let mut value = ptr::null_mut();
     if unsafe { abi::signals::sigaction(SIGUSR2, &action, ptr::null_mut()) } != 0
         || unsafe {
-            threads::pthread_create(&mut reused, ptr::null(), Some(after_main), ptr::null_mut())
+            ffi::pthread_create(&mut reused, ptr::null(), Some(after_main), ptr::null_mut())
         } != 0
-        || abi::signals::pthread_kill(reused, SIGUSR2) != 0
-        || unsafe { threads::pthread_join(reused, &mut value) } != 0
+        || ffi::pthread_kill(reused, SIGUSR2) != 0
+        || unsafe { ffi::pthread_join(reused, &mut value) } != 0
         || value as usize != 0x55
         || REUSED_SIGNALLED.load(Ordering::SeqCst) != 1
     {
@@ -265,6 +280,19 @@ fn fill_handles() -> Filled {
     Filled(count)
 }
 
+/// Waits until the layer took back what the joined threads held (it does
+/// so once the kernel says they ended): their places, handles and memory.
+fn settle() -> bool {
+    for _ in 0..1000 {
+        abi::relibc::collect();
+        if abi::relibc::occupied() == 1 {
+            return true;
+        }
+        let _ = sys::yield_now();
+    }
+    false
+}
+
 fn failed(stage: usize) -> bool {
     rt::println!("posix-thread-probe: failed stage {}", stage);
     false
@@ -276,7 +304,7 @@ fn failed(stage: usize) -> bool {
 #[cfg(not(feature = "cancel-input"))]
 fn priorities() -> bool {
     let main = MAIN_BASE.load(Ordering::Acquire) as u8;
-    let me = unsafe { threads::probe_native(threads::pthread_self()) }.expect("own handle");
+    let me = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("own handle");
     let level = || sys::thread_info(&me).map_or(0, |info| info.base);
     let (mut heap, mut files) = (0, 0);
     abi::allocation::probe_hold(|| heap = level());
@@ -326,48 +354,27 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 123 };
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut child,
             ptr::null(),
             Some(returning),
             VALUE as *mut c_void,
         )
     } != 0
-        || unsafe { threads::pthread_join(child, &mut value) } != 0
+        || unsafe { ffi::pthread_join(child, &mut value) } != 0
         || value as usize != VALUE
         || CALLS.load(Ordering::Acquire) != 1
         || unsafe { *errno } != 123
     {
         return failed(1);
     }
-    if unsafe { threads::pthread_join(child, ptr::null_mut()) } != ESRCH {
-        return failed(2);
-    }
     rt::println!("posix-thread-probe: a joined thread gives its value and keeps errno");
-    // A thread that ends past the library is joined once the kernel tells
-    // the owner of its end: the owner polls no thread state on a timer.
-    let mut past = 0;
-    value = VALUE as *mut c_void;
-    if unsafe {
-        threads::pthread_create(
-            &mut past,
-            ptr::null(),
-            Some(past_the_library),
-            ptr::null_mut(),
-        )
-    } != 0
-        || unsafe { threads::pthread_join(past, &mut value) } != 0
-        || !value.is_null()
-        || unsafe { threads::pthread_join(past, ptr::null_mut()) } != ESRCH
-    {
-        return failed(13);
-    }
-    rt::println!(
-        "posix-thread-probe: a thread that ended past the library joins through its end's notification"
-    );
-
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    if !settle() {
+        return failed(2);
+    }
+    let _ = settle();
     let baseline = sys::process_handles(&process)
         .expect("handle baseline")
         .live;
@@ -378,6 +385,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     // Leave one handle slot for the stack memory, forcing thread_create to
     // fail after the stack has actually been mapped by the real owner.
     held.release_last();
+    let _ = settle();
     let occupied = sys::process_handles(&process)
         .expect("occupied handles")
         .live;
@@ -385,7 +393,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         .expect("failure quota baseline")
         .used;
     child = 987;
-    if unsafe { threads::pthread_create(&mut child, ptr::null(), Some(returning), ptr::null_mut()) }
+    if unsafe { ffi::pthread_create(&mut child, ptr::null(), Some(returning), ptr::null_mut()) }
         != EAGAIN
         || child != 987
         || unsafe { *errno } != 123
@@ -398,20 +406,22 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(4);
     }
     drop(held);
+    let _ = settle();
     let charged = sys::process_memory(&process)
         .expect("reuse quota baseline")
         .used;
     for index in 0..32 {
         if unsafe {
-            threads::pthread_create(
+            ffi::pthread_create(
                 &mut child,
                 ptr::null(),
                 Some(returning),
                 (index + 1) as *mut c_void,
             )
         } != 0
-            || unsafe { threads::pthread_join(child, &mut value) } != 0
+            || unsafe { ffi::pthread_join(child, &mut value) } != 0
             || value as usize != index + 1
+            || !settle()
             || sys::process_handles(&process).expect("reuse handles").live != baseline
             || sys::process_memory(&process).expect("reuse quota").used != charged
         {
@@ -423,7 +433,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let gate = sys::channel_create(1).expect("target gate");
     let mut target = 0;
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut target,
             ptr::null(),
             Some(gated),
@@ -434,9 +444,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(6);
     }
     TARGET.store(target, Ordering::Release);
-    if unsafe { threads::pthread_create(&mut child, ptr::null(), Some(joiner), ptr::null_mut()) }
-        != 0
-    {
+    if unsafe { ffi::pthread_create(&mut child, ptr::null(), Some(joiner), ptr::null_mut()) } != 0 {
         return failed(7);
     }
     // The gate keeps the target live; the waiting joiner cannot finish yet.
@@ -454,7 +462,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         return failed(10);
     }
     // Stop using the borrowed handle before allowing the joiner to terminate.
-    if unsafe { threads::pthread_join(child, &mut value) } != 0
+    if unsafe { ffi::pthread_join(child, &mut value) } != 0
         || value as usize != VALUE
         || JOINED.load(Ordering::Acquire) != 1
         || unsafe { *errno } != 123
@@ -490,7 +498,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     // process still ends with its last application thread.
     let mut unjoined = 0;
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut unjoined,
             ptr::null(),
             Some(past_the_library),
@@ -500,65 +508,42 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     {
         return failed(14);
     }
-    if unsafe {
-        threads::pthread_create(&mut child, ptr::null(), Some(last_thread), ptr::null_mut())
-    } != 0
+    if unsafe { ffi::pthread_create(&mut child, ptr::null(), Some(last_thread), ptr::null_mut()) }
+        != 0
     {
         return failed(12);
     }
     // This call ends main only. The child verifies main's value and becomes the
     // last application thread; internal owners must not keep the process alive.
-    unsafe { threads::pthread_exit(VALUE as *mut c_void) }
+    unsafe { ffi::pthread_exit(VALUE as *mut c_void) }
 }
 
-fn main(_: u64) -> u64 {
-    let Ok(mut start) = rt::startup() else {
-        return 1;
-    };
-    if let Ok(console) = start.take::<rt::handle::Resource>("console") {
-        rt::console::set(console);
-    }
-    let connection = if cfg!(feature = "cancel-input") {
-        PosixFs::connect_with_uart(&start.parent)
-    } else {
-        PosixFs::connect(&start.parent)
-    };
-    let Ok(files) = connection else {
-        return 2;
-    };
+/// The probe's C main, which relibc calls once posix-crt started the
+/// process (files, clocks, heap, the process service) and relibc the
+/// thread.
+#[unsafe(no_mangle)]
+extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
     #[cfg(not(feature = "cancel-input"))]
-    let Ok(clocks) = (unsafe { clocks::Peers::connect(&start.parent) }) else {
+    let parent = posix_crt::parent();
+    #[cfg(not(feature = "cancel-input"))]
+    let Ok(clocks) = clocks::Peers::connect(&parent) else {
         return 5;
     };
-    PROCESS.store(start.process.raw().0, Ordering::Release);
-    #[cfg(not(feature = "cancel-input"))]
-    MAIN_BASE.store(
-        sys::thread_info(&start.thread).map_or(0, |info| info.base as u64),
-        Ordering::Release,
-    );
+    PROCESS.store(abi::allocation::process().raw().0, Ordering::Release);
     #[cfg(not(feature = "cancel-input"))]
     {
-        let Ok(session) = start.take::<Channel>(abi::process::START_NAME) else {
-            return 6;
-        };
-        if unsafe { abi::process::init(session) }.is_err() {
-            return 6;
-        }
-    }
-    if unsafe { abi::shared::init(files) }.is_err()
-        || unsafe { abi::allocation::init(start.process) }.is_err()
-        || unsafe { threads::init(start.thread) }.is_err()
-    {
-        return 3;
-    }
-    // SAFETY: the main page is this thread's for its life.
-    if unsafe { threads::attach(tls::main_page(), posix_thread::PAGE_SIZE, 1) }.is_err() {
-        return 3;
+        let main = ffi::pthread_self();
+        MAIN.store(main, Ordering::Release);
+        let native = unsafe { threads::probe_native(main) }.expect("main's handle");
+        MAIN_BASE.store(
+            sys::thread_info(&native).map_or(0, |info| info.base as u64),
+            Ordering::Release,
+        );
     }
     #[cfg(feature = "cancel-input")]
     let passed = input::run();
     #[cfg(not(feature = "cancel-input"))]
-    let passed = run(&clocks, &start.parent);
+    let passed = run(&clocks, &parent);
     if !passed {
         rt::println!("posix-thread-probe: failed");
         return 4;

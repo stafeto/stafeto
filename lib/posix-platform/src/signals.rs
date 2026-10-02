@@ -88,11 +88,13 @@ pub unsafe extern "C" fn stafeto_sigaction(
 /// `set` is null or readable, `old` null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_sigprocmask(how: c_int, set: *const u64, old: *mut u64) -> c_int {
-    // Linux's SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK are 0, 1, 2.
+    // Linux's SIG_BLOCK, SIG_UNBLOCK, SIG_SETMASK are 0, 1, 2. With no
+    // set, `how` means nothing (POSIX): only the mask is read.
     let how = match how {
         0 => posix_types::constants::SIG_BLOCK,
         1 => posix_types::constants::SIG_UNBLOCK,
         2 => posix_types::constants::SIG_SETMASK,
+        _ if set.is_null() => posix_types::constants::SIG_BLOCK,
         _ => return -EINVAL,
     };
     // SAFETY: the caller's promise.
@@ -144,6 +146,11 @@ pub unsafe extern "C" fn stafeto_sigtimedwait(
 ) -> c_int {
     // SAFETY: the caller's promise.
     let set = unsafe { set.read() } & LAYER;
+    // A set of no signal the layer has would wait for good: refused as
+    // unsupported (POSIX's EINVAL for sigwait).
+    if set == 0 {
+        return -EINVAL;
+    }
     let status = call(|| {
         // SAFETY: a set on this stack; the timeout as given.
         i64::from(unsafe { posix_abi::signals::sigtimedwait(&set, core::ptr::null_mut(), timeout) })

@@ -4,19 +4,19 @@
 //! Real read cancellation cleans UART/Virtio waits before the user's handler.
 
 use super::*;
-use threads::cancel::{self, Cleanup};
+use ffi::Cleanup;
 static CLEANED: AtomicUsize = AtomicUsize::new(0);
 static BODY_RETURNED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" fn cleanup(_: *mut c_void) {
     let mut old = 99;
-    if unsafe { cancel::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &mut old) } != 0
+    if unsafe { ffi::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &mut old) } != 0
         || old != PTHREAD_CANCEL_DISABLE
     {
         CLEANED.store(2, Ordering::Release);
         return;
     }
-    cancel::pthread_testcancel();
+    ffi::pthread_testcancel();
     rt::println!("posix-cancel-input-probe: cleanup read waiting");
     let mut bytes = [0; 2];
     let mut length = 0;
@@ -38,11 +38,11 @@ unsafe extern "C" fn cleanup(_: *mut c_void) {
 }
 unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
     let mut node = Cleanup::new();
-    unsafe { cancel::__stafeto_cleanup_push(&mut node, Some(cleanup), ptr::null_mut()) };
+    unsafe { ffi::cleanup_push(&mut node, Some(cleanup), ptr::null_mut()) };
     let mut byte = 0;
     let _ = unsafe { abi::read(0, &mut byte, 1) };
     BODY_RETURNED.store(1, Ordering::Release);
-    unsafe { cancel::__stafeto_cleanup_pop(&mut node, 0) };
+    unsafe { ffi::cleanup_pop(&mut node, 0) };
     ptr::null_mut()
 }
 
@@ -73,9 +73,9 @@ pub fn run() -> bool {
     if unsafe { abi::getcwd(cwd.as_mut_ptr().cast(), cwd.len()) }.is_null() {
         return failed(30);
     }
-    if unsafe { threads::pthread_create(&mut child, ptr::null(), Some(returning), ptr::null_mut()) }
+    if unsafe { ffi::pthread_create(&mut child, ptr::null(), Some(returning), ptr::null_mut()) }
         != 0
-        || unsafe { threads::pthread_join(child, &mut value) } != 0
+        || unsafe { ffi::pthread_join(child, &mut value) } != 0
     {
         return failed(30);
     }
@@ -84,6 +84,7 @@ pub fn run() -> bool {
     let warm = sys::channel_create(30).expect("session pool warm channel");
     drop(sys::handle_label(&warm, rt::abi::Rights::NOTIFY, 1, 30).expect("session pool warm"));
     drop(warm);
+    let _ = settle();
     let handles = sys::process_handles(&process)
         .expect("console baseline handles")
         .live;
@@ -92,25 +93,24 @@ pub fn run() -> bool {
         .used;
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 123 };
-    if unsafe { threads::pthread_create(&mut child, ptr::null(), Some(reader), ptr::null_mut()) }
-        != 0
-    {
+    if unsafe { ffi::pthread_create(&mut child, ptr::null(), Some(reader), ptr::null_mut()) } != 0 {
         return failed(31);
     }
     let native = unsafe { threads::probe_native(child) }.expect("console reader handle");
     if !console_waiting(child, &native)
-        || threads::pthread_cancel(child) != 0
-        || unsafe { threads::pthread_join(child, &mut value) } != 0
-        || value != cancel::CANCELED
+        || ffi::pthread_cancel(child) != 0
+        || unsafe { ffi::pthread_join(child, &mut value) } != 0
+        || value != ffi::CANCELED
         || CLEANED.load(Ordering::Acquire) != 1
         || BODY_RETURNED.load(Ordering::Acquire) != 0
     {
         return failed(32);
     }
-    if sys::process_handles(&process)
-        .expect("console returned handles")
-        .live
-        != handles
+    if !settle()
+        || sys::process_handles(&process)
+            .expect("console returned handles")
+            .live
+            != handles
         || sys::process_memory(&process)
             .expect("console returned quota")
             .used

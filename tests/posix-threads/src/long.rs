@@ -152,8 +152,7 @@ fn handler(flags: i32) -> bool {
 fn waiting_reader() -> Option<u64> {
     RESULT.store(0, Ordering::SeqCst);
     let mut id = 0;
-    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0
-    {
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0 {
         return None;
     }
     let native = unsafe { threads::probe_native(id) }.ok()?;
@@ -161,7 +160,7 @@ fn waiting_reader() -> Option<u64> {
 }
 
 fn joined(id: u64) -> u64 {
-    assert_eq!(unsafe { threads::pthread_join(id, ptr::null_mut()) }, 0);
+    assert_eq!(unsafe { ffi::pthread_join(id, ptr::null_mut()) }, 0);
     RESULT.load(Ordering::SeqCst)
 }
 
@@ -202,7 +201,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     let Some(id) = waiting_reader() else {
         return failed(665);
     };
-    if api::pthread_kill(id, SIGUSR1) != 0
+    if ffi::pthread_kill(id, SIGUSR1) != 0
         || joined(id) != 0x1000 + EINTR as u64
         || stats(&channel) != (0, 0)
     {
@@ -213,7 +212,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     let Some(id) = waiting_reader() else {
         return failed(667);
     };
-    if api::pthread_kill(id, SIGUSR1) != 0 || !feed(b'c') || joined(id) != u64::from(b'c') {
+    if ffi::pthread_kill(id, SIGUSR1) != 0 || !feed(b'c') || joined(id) != u64::from(b'c') {
         return failed(668);
     }
     rt::println!("long-op-probe: a signal cancels with EINTR, or gives a result that came");
@@ -225,7 +224,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     let Some(id) = waiting_reader() else {
         return failed(670);
     };
-    if api::pthread_kill(id, SIGUSR1) != 0 {
+    if ffi::pthread_kill(id, SIGUSR1) != 0 {
         return failed(671);
     }
     let native = unsafe { threads::probe_native(id) }.expect("reader handle");
@@ -318,8 +317,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     }
     RESULT.store(0, Ordering::SeqCst);
     let mut id = 0;
-    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0
-    {
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0 {
         return failed(682);
     }
     let native = unsafe { threads::probe_native(id) }.expect("reader handle");
@@ -330,7 +328,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
     let queued = sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::Sending);
     if !queued
-        || api::pthread_kill(id, SIGUSR1) != 0
+        || ffi::pthread_kill(id, SIGUSR1) != 0
         || joined(id) != 0x1000 + EINTR as u64
         || stats(&channel) != (0, 0)
     {
@@ -363,7 +361,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     }
     let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
     let queued = sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::Sending);
-    if !queued || api::pthread_kill(id, SIGUSR1) != 0 || !result_within(u64::from(b'j'), 1000) {
+    if !queued || ffi::pthread_kill(id, SIGUSR1) != 0 || !result_within(u64::from(b'j'), 1000) {
         rt::println!(
             "long-op-probe: second take queued {}, result {:#x}",
             queued,
@@ -386,7 +384,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     let Some(id) = waiting_reader() else {
         return failed(688);
     };
-    if api::pthread_kill(id, SIGUSR1) != 0
+    if ffi::pthread_kill(id, SIGUSR1) != 0
         || !result_within(0x1000 + EINTR as u64, 1000)
         || INNER_FAILED.load(Ordering::SeqCst) != 0
     {
@@ -412,8 +410,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     }
     RESULT.store(0, Ordering::SeqCst);
     let mut id = 0;
-    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0
-    {
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0 {
         return failed(690);
     }
     let native = unsafe { threads::probe_native(id) }.expect("reader handle");
@@ -421,7 +418,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     let awaiting =
         sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::AwaitingReply);
     if !awaiting
-        || api::pthread_kill(id, SIGUSR1) != 0
+        || ffi::pthread_kill(id, SIGUSR1) != 0
         || !result_within(0x1000 + EINTR as u64, 1000)
     {
         rt::println!(

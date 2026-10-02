@@ -164,7 +164,6 @@ pub fn gettime(id: c_int) -> Result<Time, c_int> {
 
 /// # Safety
 /// out is writable and aligned for Timespec; the current thread has an ABI scope.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_gettime(id: c_int, out: *mut Timespec) -> c_int {
     if out.is_null() {
         return fail(EFAULT) as c_int;
@@ -174,7 +173,6 @@ pub unsafe extern "C" fn clock_gettime(id: c_int, out: *mut Timespec) -> c_int {
 }
 /// # Safety
 /// out is null or writable/aligned for Timespec; the thread has an ABI scope.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_getres(id: c_int, out: *mut Timespec) -> c_int {
     if let Err(code) = valid(id) {
         return fail(code) as c_int;
@@ -191,7 +189,6 @@ pub unsafe extern "C" fn clock_getres(id: c_int, out: *mut Timespec) -> c_int {
 /// time supplies one readable aligned Timespec; the thread has an ABI scope.
 /// Connecting to the clock service grants setting permission in the current
 /// capability table. CLOCK_MONOTONIC is never settable.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_settime(id: c_int, time: *const Timespec) -> c_int {
     if id != CLOCK_REALTIME {
         return fail(EINVAL) as c_int;

@@ -117,6 +117,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc-ffi"
+version = "0.1.0"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -289,7 +293,9 @@ dependencies = [
 name = "posix-shared-probe"
 version = "0.1.0"
 dependencies = [
+ "libc-ffi",
  "posix-abi",
+ "posix-crt",
  "posix-fs",
  "posix-request",
  "proto-uart",
@@ -328,8 +334,10 @@ version = "0.1.0"
 name = "posix-thread-probe"
 version = "0.1.0"
 dependencies = [
+ "libc-ffi",
  "posix-abi",
  "posix-clock",
+ "posix-crt",
  "posix-fs",
  "posix-request",
  "posix-signals",

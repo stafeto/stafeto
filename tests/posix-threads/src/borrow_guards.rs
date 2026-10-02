@@ -3,6 +3,7 @@
 
 //! Deferred entries preserve interruptibility without overlapping local borrows.
 use super::*;
+use posix_fs::PosixFs;
 use rt::{
     abi::Error,
     upcall,
@@ -59,12 +60,14 @@ fn simple() -> bool {
     }
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let handles = sys::process_handles(&process).unwrap().live;
     let moved = sys::channel_create(10).unwrap();
     match sys::send_handles(&gate, b"not queued", [moved.erase()]) {
         Err(refused) if refused.error == Error::Interrupted && refused.back.is_none() => (),
         _ => return failed(341),
     }
+    let _ = settle();
     if sys::process_handles(&process).unwrap().live != handles
         || sys::send(&gate, b"inline") != Err(Error::Interrupted)
         || sys::send(&gate, &[0x55; 80]) != Err(Error::Interrupted)
@@ -113,7 +116,7 @@ fn simple() -> bool {
     true
 }
 fn local(parent: &Handle<Channel>) -> bool {
-    let id = threads::pthread_self();
+    let id = ffi::pthread_self();
     let outer_errno = unsafe { abi::__errno_location() };
     unsafe { *outer_errno = 777 };
     let mut files = PosixFs::connect(parent).unwrap();
@@ -206,12 +209,12 @@ fn local(parent: &Handle<Channel>) -> bool {
         COUNT.load(Ordering::Acquire) == 3 && ERRORS.load(Ordering::Acquire) == 0
     });
     result
-        && threads::pthread_self() == id
+        && ffi::pthread_self() == id
         && unsafe { abi::__errno_location() } == outer_errno
         && unsafe { *outer_errno } == 777
 }
 unsafe extern "C" fn worker(parent: *mut c_void) -> *mut c_void {
-    let native_handle = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
+    let native_handle = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
     NATIVE.store(native_handle.raw().0, Ordering::Release);
     unsafe { upcall::bind(entry) }.unwrap();
     unsafe { upcall::enable() }.unwrap();
@@ -253,6 +256,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     DONE.store(done.raw().0, Ordering::Release);
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let handles = sys::process_handles(&process).unwrap().live;
     for mode in 0..4 {
         MODE.store(mode, Ordering::Release);
@@ -262,7 +266,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         let mut id = 0;
         let mut result = ptr::null_mut();
         if unsafe {
-            threads::pthread_create(
+            ffi::pthread_create(
                 &mut id,
                 ptr::null(),
                 Some(worker),
@@ -313,13 +317,14 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         ) {
             return failed(369);
         }
-        if unsafe { threads::pthread_join(id, &mut result) } != 0
+        if unsafe { ffi::pthread_join(id, &mut result) } != 0
             || result as usize != 1
             || RESULT.load(Ordering::Acquire) != 1
         {
             return failed(360 + mode);
         }
     }
+    let _ = settle();
     if sys::process_handles(&process).unwrap().live != handles {
         return failed(368);
     }

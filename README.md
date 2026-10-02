@@ -65,19 +65,22 @@ links statically with Picolibc 1.8.12 through a small bridge
 (`lib/posix`).
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
-interface, implemented in Rust with a C ABI and a versioned sysroot
-(`tools/build-posix-sysroot.py`). The current crates cover paths,
-descriptors, files, `stat` and directories; the heap and the C locale;
-pthreads with cancellation, keys, `once` and mutexes; clocks and sleep;
-signal actions, masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and
-`SA_SIGINFO`; process IDs and credentials. The layer runs without helper
+interface. The C library is relibc (a fork pinned by
+`tools/build-relibc.py`, `cargo xtask relibc`); below it the Rust layer
+is the system part, with no C names of its own: the platform functions
+`stafeto_*` relibc calls (`lib/posix-platform`) over paths, descriptors,
+files, `stat` and directories; the heap; the table of threads, waits by
+address and deferred cancellation; clocks and sleep; signal actions,
+masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and `SA_SIGINFO`; process
+IDs and credentials. Every POSIX program starts through `posix-crt` and
+relibc, the Rust guest probes too (`tests/libc-ffi`). The layer runs without helper
 threads: a single-threaded program has one thread; mutexes, `once` and joins
 wait by address in the layer with no kernel call when uncontended; the heap,
 the descriptor table and the table of threads live under the layer's locks,
 whose holders run at the process ceiling; a read of the console is a long
 operation in two steps that a signal interrupts. Guest probes check them on
-QEMU and Apple VZ. The layer is a work in progress and paused: no real program
-uses it yet, and `ash` still runs on Picolibc. Details are in
+QEMU and Apple VZ. `ash` still runs on Picolibc until step 5a′ moves it to
+relibc. Details are in
 [docs/status.md](docs/status.md).
 
 **Tests.** The kernel test image runs 182 tests (197 under `-icount`),

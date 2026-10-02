@@ -5,11 +5,9 @@
 use super::*;
 use abi::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
 use abi::metadata::Timespec;
+use ffi::Cleanup;
 use rt::wait::{Waited, Waiter};
-use threads::{
-    cancel::{self, Cleanup},
-    sleep::{self, TIMER_ABSTIME},
-};
+use threads::sleep::{self, TIMER_ABSTIME};
 
 static DONE_CHANNEL: AtomicU64 = AtomicU64::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
@@ -72,7 +70,7 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     let mut node = Cleanup::new();
     if args.mode >= 2 {
         unsafe {
-            cancel::__stafeto_cleanup_push(
+            ffi::cleanup_push(
                 &mut node,
                 Some(cleanup),
                 ptr::from_mut(&mut remaining).cast(),
@@ -80,14 +78,14 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
         };
     }
     if args.mode == 3 {
-        assert_eq!(threads::pthread_cancel(threads::pthread_self()), 0);
+        assert_eq!(ffi::pthread_cancel(ffi::pthread_self()), 0);
     }
     if args.mode == 4 {
         assert_eq!(
-            unsafe { cancel::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, ptr::null_mut()) },
+            unsafe { ffi::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, ptr::null_mut()) },
             0
         );
-        assert_eq!(threads::pthread_cancel(threads::pthread_self()), 0);
+        assert_eq!(ffi::pthread_cancel(ffi::pthread_self()), 0);
     }
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
@@ -115,13 +113,13 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     notify();
     if args.mode == 4 {
         assert_eq!(
-            unsafe { cancel::pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, ptr::null_mut()) },
+            unsafe { ffi::pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, ptr::null_mut()) },
             0
         );
-        cancel::pthread_testcancel();
+        ffi::pthread_testcancel();
     }
     if args.mode >= 2 {
-        unsafe { cancel::__stafeto_cleanup_pop(&mut node, 0) };
+        unsafe { ffi::cleanup_pop(&mut node, 0) };
     }
     outcome as *mut c_void
 }
@@ -133,7 +131,7 @@ fn child(args: &Args) -> u64 {
     let mut id = 0;
     assert_eq!(
         unsafe {
-            threads::pthread_create(
+            ffi::pthread_create(
                 &mut id,
                 ptr::null(),
                 Some(worker),
@@ -161,7 +159,7 @@ fn finished(channel: &Handle<Channel>, waiter: &Waiter, expected: usize) -> bool
 }
 fn join(id: u64, expected: usize) -> bool {
     let mut value = ptr::null_mut();
-    (unsafe { threads::pthread_join(id, &mut value) }) == 0 && value as usize == expected
+    (unsafe { ffi::pthread_join(id, &mut value) }) == 0 && value as usize == expected
 }
 fn sentinel() -> bool {
     REM_SEC.load(Ordering::Relaxed) == 777 && REM_NS.load(Ordering::Relaxed) == 888
@@ -181,6 +179,7 @@ pub(super) fn run() -> bool {
     DONE_CHANNEL.store(channel.raw().0, Ordering::Release);
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let before_handles = sys::process_handles(&process).unwrap().live;
     let before_used = sys::process_memory(&process).unwrap().used;
 
@@ -330,7 +329,7 @@ pub(super) fn run() -> bool {
     if !blocked(id) {
         return failed(219);
     }
-    assert_eq!(threads::pthread_cancel(id), 0);
+    assert_eq!(ffi::pthread_cancel(id), 0);
     if !finished(&channel, &waiter, 1000)
         || !join(id, usize::MAX)
         || RETURNED.load(Ordering::Acquire) != 0
@@ -379,6 +378,7 @@ pub(super) fn run() -> bool {
         return failed(224);
     }
     assert_eq!(unsafe { clock::clock_settime(CLOCK_REALTIME, &saved) }, 0);
+    let _ = settle();
     if sys::process_handles(&process).unwrap().live != before_handles
         || sys::process_memory(&process).unwrap().used != before_used
     {

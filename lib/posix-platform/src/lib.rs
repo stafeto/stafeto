@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 3;
+pub const PLATFORM_INTERFACE: u64 = 4;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -205,18 +205,31 @@ pub extern "C" fn stafeto_getppid() -> c_int {
 
 const PAGE: usize = 4096;
 
-/// The anonymous mappings relibc holds: (start, bytes) of each, 0 bytes
-/// for a free record. The pages come from the layer's heap (no header), so
+/// The anonymous mappings relibc holds: (first page, pages) of each, in
+/// pages of the address space (32 bits each reach 16 TiB), 0 pages for a
+/// free record. The pages come from the layer's heap (no header), so
 /// munmap gives back the whole mapping, pages from either edge, or pages
 /// from the middle, which splits the record in two.
 const MAPPINGS: usize = 256;
-struct Mappings(UnsafeCell<[(usize, usize); MAPPINGS]>);
+type Records = [(u32, u32); MAPPINGS];
+struct Mappings(UnsafeCell<Records>);
 // SAFETY: only `mappings` borrows the records, under MAPPINGS_LOCK.
 unsafe impl Sync for Mappings {}
 static MAPS: Mappings = Mappings(UnsafeCell::new([(0, 0); MAPPINGS]));
 static MAPPINGS_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::new();
 
-fn mappings<R>(f: impl FnOnce(&mut [(usize, usize); MAPPINGS]) -> R) -> R {
+/// A record of the bytes from `start` to `end`, both page-aligned.
+fn record(start: usize, end: usize) -> (u32, u32) {
+    ((start / PAGE) as u32, ((end - start) / PAGE) as u32)
+}
+
+/// The bytes a record holds: its start and end.
+fn bounds((page, pages): (u32, u32)) -> (usize, usize) {
+    let start = page as usize * PAGE;
+    (start, start + pages as usize * PAGE)
+}
+
+fn mappings<R>(f: impl FnOnce(&mut Records) -> R) -> R {
     let _guard = MAPPINGS_LOCK.lock();
     // SAFETY: the lock gives this borrow alone.
     f(unsafe { &mut *MAPS.0.get() })
@@ -235,8 +248,8 @@ pub extern "C" fn stafeto_mmap_anonymous(len: usize) -> *mut c_void {
     let start = pointer.as_ptr() as usize;
     let recorded = mappings(|maps| {
         maps.iter_mut()
-            .find(|record| record.1 == 0)
-            .map(|record| *record = (start, size))
+            .find(|free| free.1 == 0)
+            .map(|free| *free = record(start, start + size))
             .is_some()
     });
     if !recorded {
@@ -265,18 +278,20 @@ pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
     let result: Result<(), c_int> = mappings(|maps| {
         let index = maps
             .iter()
-            .position(|&(first, bytes)| bytes != 0 && first <= start && end <= first + bytes)
+            .position(|&held| {
+                let (first, last) = bounds(held);
+                held.1 != 0 && first <= start && end <= last
+            })
             .ok_or(EINVAL)?;
-        let (first, bytes) = maps[index];
-        let last = first + bytes;
+        let (first, last) = bounds(maps[index]);
         match (start == first, end == last) {
             (true, true) => maps[index] = (0, 0),
-            (true, false) => maps[index] = (end, last - end),
-            (false, true) => maps[index] = (first, start - first),
+            (true, false) => maps[index] = record(end, last),
+            (false, true) => maps[index] = record(first, start),
             (false, false) => {
-                let free = maps.iter().position(|record| record.1 == 0).ok_or(ENOMEM)?;
-                maps[index] = (first, start - first);
-                maps[free] = (end, last - end);
+                let free = maps.iter().position(|free| free.1 == 0).ok_or(ENOMEM)?;
+                maps[index] = record(first, start);
+                maps[free] = record(end, last);
             }
         }
         Ok(())

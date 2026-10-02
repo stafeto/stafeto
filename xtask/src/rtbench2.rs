@@ -15,9 +15,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::{
-    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_RELIBC_PROGRAMS,
-    RTBENCH_POSIX_VZ_PROGRAMS, Variant, build, hvf_host, qemu, target_dir, vz,
-    write_boot_image_with,
+    BOOT_PROFILE, ImageProgram, RTBENCH_POSIX_PROGRAMS, RTBENCH_POSIX_VZ_PROGRAMS, Variant, build,
+    hvf_host, qemu, target_dir, vz, write_boot_image_with,
 };
 
 /// The rows of a run, in its order: each comes once, as numbers or as
@@ -302,19 +301,6 @@ pub fn short() -> Result<(), String> {
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     measure(cmd, "tcg", 0).map(drop)
-}
-
-/// `short` with the C on relibc (5a′), its log as `tcg-relibc`.
-pub fn short_relibc() -> Result<(), String> {
-    let kernel = build(Variant::Normal)?;
-    let image = image(
-        "rtbench-posix-relibc-short.img",
-        &RTBENCH_POSIX_RELIBC_PROGRAMS,
-        0,
-    )?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
-    cmd.args(qemu::HEADLESS);
-    measure(cmd, "tcg-relibc", 0).map(drop)
 }
 
 #[cfg(test)]

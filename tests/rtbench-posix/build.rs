@@ -33,69 +33,10 @@ fn main() {
         "rtbench 2 is a guest program"
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    if env::var_os("CARGO_FEATURE_RELIBC").is_some() {
-        relibc(&manifest, &tools, &out);
-        return;
-    }
-    let generated = Command::new("python3")
-        .arg(manifest.join("../../tools/build-posix-sysroot.py"))
-        .arg("--headers-only")
-        .output()
-        .expect("Python sysroot generator");
-    assert!(generated.status.success(), "sysroot generation failed");
-    let output = String::from_utf8(generated.stdout).expect("sysroot path is UTF-8");
-    let include = PathBuf::from(
-        output
-            .trim()
-            .strip_prefix("Rust POSIX sysroot: ")
-            .expect("sysroot path"),
-    )
-    .join("include");
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("../../lib/posix-abi/include").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest
-            .join("../../lib/posix-abi/src/constants.rs")
-            .display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest
-            .join("../../tools/build-posix-sysroot.py")
-            .display()
-    );
-    run(Command::new(tools.join("clang"))
-        .args([
-            "--target=aarch64-none-elf",
-            // Cortex-A53 erratum 835769 (the PinePhone's A64).
-            "-mfix-cortex-a53-835769",
-            "-ffreestanding",
-            "-nostdinc",
-            "-fno-builtin",
-            "-std=c11",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-fno-stack-protector",
-            "-fno-pic",
-            "-O2",
-            "-I",
-        ])
-        .arg(&include)
-        .args(["-c", "rtbench.c", "-o"])
-        .arg(out.join("rtbench.o")));
-    run(Command::new(tools.join("llvm-ar"))
-        .args(["crs"])
-        .arg(out.join("librtbench.a"))
-        .arg(out.join("rtbench.o")));
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=rtbench");
+    relibc(&manifest, &tools, &out);
 }
 
-/// The same source with relibc's headers, linked with relibc's libc.a
+/// rtbench.c with relibc's headers, linked with relibc's libc.a
 /// (target/relibc/sysroot, cargo xtask relibc).
 fn relibc(manifest: &std::path::Path, tools: &std::path::Path, out: &std::path::Path) {
     let sysroot = manifest.join("../../target/relibc/sysroot");

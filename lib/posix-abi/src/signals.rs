@@ -17,7 +17,7 @@ use core::sync::atomic::{AtomicU64, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
-pub use posix_types::{MachineContext, SigAction, SigInfo, SigSet, SignalStack, UserContext};
+pub use posix_types::{SigAction, SigInfo, SigSet};
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
 use rt::{sys, upcall};
@@ -93,65 +93,9 @@ fn ignored(signal: i32, action: &SigAction) -> bool {
 }
 
 /// # Safety
-/// set is writable for one signal set. No managed thread is required.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub unsafe extern "C" fn sigemptyset(set: *mut SigSet) -> i32 {
-    if set.is_null() {
-        return fail(EFAULT);
-    }
-    unsafe { set.write(0) };
-    0
-}
-/// # Safety
-/// set is writable for one signal set.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub unsafe extern "C" fn sigfillset(set: *mut SigSet) -> i32 {
-    if set.is_null() {
-        return fail(EFAULT);
-    }
-    unsafe { set.write(posix_signals::VALID) };
-    0
-}
-unsafe fn alter(set: *mut SigSet, signal: i32, add: bool) -> i32 {
-    if set.is_null() {
-        return fail(EFAULT);
-    }
-    let Ok(bit) = posix_signals::bit(signal) else {
-        return fail(EINVAL);
-    };
-    let old = unsafe { set.read() };
-    unsafe { set.write(if add { old | bit } else { old & !bit }) };
-    0
-}
-/// # Safety
-/// set is initialized and writable for one signal set.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub unsafe extern "C" fn sigaddset(set: *mut SigSet, signal: i32) -> i32 {
-    unsafe { alter(set, signal, true) }
-}
-/// # Safety
-/// set is initialized and writable for one signal set.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub unsafe extern "C" fn sigdelset(set: *mut SigSet, signal: i32) -> i32 {
-    unsafe { alter(set, signal, false) }
-}
-/// # Safety
-/// set is initialized and readable for one signal set.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub unsafe extern "C" fn sigismember(set: *const SigSet, signal: i32) -> i32 {
-    if set.is_null() {
-        return fail(EFAULT);
-    }
-    let Ok(bit) = posix_signals::bit(signal) else {
-        return fail(EINVAL);
-    };
-    i32::from(unsafe { set.read() } & bit != 0)
-}
-/// # Safety
 /// act is null or readable; old is null or writable. Their storage does not
 /// overlap. A catching handler uses the one-argument or SA_SIGINFO signature,
 /// remains live, and obeys async-signal safety.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut SigAction) -> i32 {
     let result = actions(|table| {
         if act.is_null() {
@@ -181,23 +125,6 @@ pub unsafe extern "C" fn sigaction(signal: i32, act: *const SigAction, old: *mut
         Err(code) => fail(code),
     }
 }
-/// # Safety
-/// A non-special handler is a live void(int) C function, safe during asynchronous
-/// entry. Stable BSD semantics are used: no reset, signal deferred during handler.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub unsafe extern "C" fn signal(signal: i32, handler: u64) -> u64 {
-    let action = SigAction {
-        handler,
-        mask: 0,
-        flags: 0,
-    };
-    let mut old = posix_signals::INITIAL;
-    if unsafe { sigaction(signal, &action, &mut old) } == 0 {
-        old.handler
-    } else {
-        u64::MAX
-    }
-}
 /// The calling thread's block.
 fn own() -> &'static Block {
     threads::own_block()
@@ -205,7 +132,6 @@ fn own() -> &'static Block {
 /// # Safety
 /// set is null or readable, old is null or writable; storage does not overlap.
 /// No call of the kernel: the mask is a word of the thread's block.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32 {
     let block = own();
     let before = block.mask.load(Ordering::SeqCst);
@@ -231,14 +157,12 @@ pub unsafe extern "C" fn pthread_sigmask(how: i32, set: *const SigSet, old: *mut
 }
 /// # Safety
 /// Same pointers as pthread_sigmask; this implementation also supports threads.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigprocmask(how: i32, set: *const SigSet, old: *mut SigSet) -> i32 {
     let code = unsafe { pthread_sigmask(how, set, old) };
     if code == 0 { 0 } else { fail(code) }
 }
 /// # Safety
 /// set is writable for one signal set, in a managed thread.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigpending(set: *mut SigSet) -> i32 {
     if set.is_null() {
         return fail(EFAULT);
@@ -248,51 +172,6 @@ pub unsafe extern "C" fn sigpending(set: *mut SigSet) -> i32 {
     unsafe { set.write(pending) };
     0
 }
-/// Sends `signal` to pthread `thread`: the bit in its block, then a wake of
-/// its sigwait through its channel or a request of its entry; to the
-/// calling thread itself, delivery before the return.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
-pub extern "C" fn pthread_kill(thread: u64, signal: i32) -> i32 {
-    let bit = if signal == 0 {
-        0
-    } else {
-        match posix_signals::bit(signal) {
-            Ok(bit) => bit,
-            Err(_) => return EINVAL,
-        }
-    };
-    let action = if signal == 0 {
-        None
-    } else {
-        let action = action(signal);
-        Some((action, ignored(signal, &action)))
-    };
-    if let Some((action, _)) = action
-        && (signal == SIGCONT
-            || (action.handler == DEFAULT
-                && matches!(
-                    posix_signals::default_action(signal),
-                    posix_signals::DefaultAction::Stop
-                )))
-    {
-        return ENOSYS;
-    }
-    let me = threads::pthread_self();
-    if thread == me {
-        // The calling thread's own block: no lock, no call of the kernel.
-        if let Some((_, false)) = action {
-            own().pending.fetch_or(bit, Ordering::SeqCst);
-            deliver_now();
-        }
-        return 0;
-    }
-    let sent = threads::with_target(thread, |block, native| send(block, native, bit, action));
-    match sent {
-        Ok(()) => 0,
-        Err(code) => code,
-    }
-}
-
 /// Sends `bit` with its `action` (none for signal 0) to the thread of
 /// `block` and `native`: the bit in its block, then a wake of its sigwait
 /// through its channel or a request of its entry.
@@ -320,8 +199,11 @@ fn send(
     }
 }
 
-/// pthread_kill for a thread of relibc (crate::relibc): its number is
-/// relibc's OsTid. 0 or an error number.
+/// Sends `signal` to the thread number `id` (relibc's OsTid): the bit in
+/// its block, then a wake of its sigwait through its channel or a request
+/// of its entry; to the calling thread itself, delivery before the
+/// return. Stop and continue are ENOSYS until the process service routes
+/// them. 0 or an error number.
 pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
     let bit = if signal == 0 {
         0
@@ -335,6 +217,16 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         let action = action(signal);
         (action, ignored(signal, &action))
     });
+    if let Some((action, _)) = action
+        && (signal == SIGCONT
+            || (action.handler == DEFAULT
+                && matches!(
+                    posix_signals::default_action(signal),
+                    posix_signals::DefaultAction::Stop
+                )))
+    {
+        return ENOSYS;
+    }
     let (block, native) = match crate::relibc::target(id) {
         Ok(target) => target,
         Err(code) => return code,
@@ -391,9 +283,8 @@ pub fn suspend(mask: SigSet) -> i32 {
     point.finish();
     EINTR
 }
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub extern "C" fn raise(signal: i32) -> i32 {
-    let status = pthread_kill(threads::pthread_self(), signal);
+    let status = kill_relibc_thread(threads::thread_number(), signal);
     if status == 0 { 0 } else { fail(status) }
 }
 
@@ -492,7 +383,6 @@ fn wait(set: SigSet, timeout: Option<posix_types::Timespec>, start: u64) -> Resu
 /// # Safety
 /// The caller is managed. set is readable and sig is writable; their storage
 /// does not overlap. All selected signals are blocked before this call.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
     let point = threads::cancel::Point::begin();
     let result = if set.is_null() || sig.is_null() {
@@ -512,7 +402,6 @@ pub unsafe extern "C" fn sigwait(set: *const SigSet, sig: *mut i32) -> i32 {
 /// SigInfo, and their storage does not overlap. All selected signals are blocked.
 /// Caught signals resume this wait; EINTR is not returned. Current
 /// pthread_kill/raise causes are reported as SI_THREAD.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> i32 {
     unsafe { sigtimedwait(set, info, core::ptr::null()) }
 }
@@ -522,7 +411,6 @@ pub unsafe extern "C" fn sigwaitinfo(set: *const SigSet, info: *mut SigInfo) -> 
 /// SigInfo, timeout is null or readable for one Timespec. Storage does not
 /// overlap. Selected signals are blocked. NULL timeout means indefinite wait;
 /// unrelated caught signals resume the original monotonic interval without EINTR.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn sigtimedwait(
     set: *const SigSet,
     info: *mut SigInfo,
@@ -548,14 +436,9 @@ pub unsafe extern "C" fn sigtimedwait(
 
 rt::upcall_entry!(entry, dispatch, context);
 
-/// Where the calling thread's errno lives: the layer's block until 5a′,
-/// relibc's `__errno_location` after it. The entry saves and gives back
+/// Where the calling thread's C errno lives: relibc's `__errno_location`. The entry saves and gives back
 /// the value there; it never moves the thread pointer (spec 2, 3.5).
-#[cfg(not(feature = "libc-backend"))]
-static ERRNO_LOCATION: unsafe extern "C" fn() -> *mut core::ffi::c_int = crate::__errno_location;
-#[cfg(feature = "libc-backend")]
 static ERRNO_LOCATION: unsafe extern "C" fn() -> *mut core::ffi::c_int = relibc_errno_location;
-#[cfg(feature = "libc-backend")]
 unsafe extern "C" {
     /// relibc's errno in its static TLS.
     #[link_name = "__errno_location"]
@@ -674,6 +557,12 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
     // SAFETY: the thread has a block (attach).
     let errno = unsafe { ERRNO_LOCATION() };
     let saved_errno = unsafe { *errno };
+    // The layer's own errno, which the call the handler interrupted may
+    // not have handed to relibc yet: a call of the layer in the handler
+    // must not change what the interrupted one returns.
+    let layer_errno = crate::tls::errno();
+    // SAFETY: the block's errno is this thread's.
+    let saved_layer_errno = unsafe { *layer_errno };
     loop {
         let old_mask = block.mask.load(Ordering::SeqCst);
         if native.is_null() && next_wants_context(block) {
@@ -707,27 +596,10 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
         if action.flags & SA_SIGINFO != 0 {
             // SAFETY: the context-aware trampoline owns this unique live frame.
             let frame = unsafe { native.read() };
-            let mut context = UserContext {
-                uc_link: core::ptr::null_mut(),
-                uc_sigmask: old_mask,
-                uc_stack: SignalStack {
-                    ss_sp: core::ptr::null_mut(),
-                    ss_size: 0,
-                    ss_flags: SS_DISABLE,
-                },
-                uc_mcontext: MachineContext {
-                    registers: frame.registers,
-                    sp: frame.sp,
-                    pc: frame.pc,
-                    pstate: frame.pstate,
-                    vectors: frame.vectors,
-                    fpcr: frame.fpcr,
-                    fpsr: frame.fpsr,
-                },
-            };
-            let mut info = SigInfo::thread(signal);
+            let mut context = LinuxContext::new(&frame, old_mask);
+            let mut info = LinuxSigInfo::thread(signal);
             // SAFETY: SA_SIGINFO registers this live three-argument C address.
-            let callback: unsafe extern "C" fn(i32, *mut SigInfo, *mut core::ffi::c_void) =
+            let callback: unsafe extern "C" fn(i32, *mut LinuxSigInfo, *mut core::ffi::c_void) =
                 unsafe { core::mem::transmute(handler as usize) };
             if entered {
                 unsafe { upcall::enable() }.expect("nested signal entry");
@@ -738,21 +610,10 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
             }
             // The callback may edit the return context. Preserve private native
             // metadata and let the kernel validate machine state on return.
-            let machine = context.uc_mcontext;
-            unsafe {
-                native.write(upcall::Context {
-                    registers: machine.registers,
-                    sp: machine.sp,
-                    pc: machine.pc,
-                    pstate: machine.pstate,
-                    vectors: machine.vectors,
-                    fpcr: machine.fpcr,
-                    fpsr: machine.fpsr,
-                    ..frame
-                });
-            }
-            restore_mask =
-                posix_signals::mask(context.uc_sigmask).expect("valid signal return mask");
+            // SAFETY: the frame is the entry's.
+            unsafe { native.write(context.frame(frame)) };
+            restore_mask = posix_signals::mask(context.mask & posix_signals::VALID)
+                .expect("valid signal return mask");
         } else {
             // SAFETY: signal/sigaction callers supply a live void(int) C address.
             let callback: unsafe extern "C" fn(i32) =
@@ -768,8 +629,129 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
         block.mask.store(restore_mask, Ordering::SeqCst);
     }
     unsafe { *errno = saved_errno };
+    // SAFETY: as above.
+    unsafe { *layer_errno = saved_layer_errno };
     posix_sync::resume_wait(abandoned);
 }
+/// The siginfo_t of relibc's headers (Linux AArch64): 128 bytes, the
+/// signal, errno and code, then the sender's pid and uid and the value.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LinuxSigInfo {
+    pub signo: i32,
+    pub errno: i32,
+    pub code: i32,
+    pad: i32,
+    pub pid: i32,
+    pub uid: u32,
+    pub value: u64,
+    rest: [u8; 96],
+}
+const _: () = assert!(core::mem::size_of::<LinuxSigInfo>() == 128);
+
+/// si_code of a signal sent by pthread_kill or raise (Linux SI_TKILL).
+pub const SI_TKILL: i32 = -6;
+
+impl LinuxSigInfo {
+    /// The information of `signal` sent by pthread_kill or raise.
+    pub const fn thread(signal: i32) -> Self {
+        Self {
+            signo: signal,
+            errno: 0,
+            code: SI_TKILL,
+            pad: 0,
+            pid: 0,
+            uid: 0,
+            value: 0,
+            rest: [0; 96],
+        }
+    }
+}
+
+/// The ucontext_t of relibc's headers (Linux AArch64, asm/ucontext.h) with
+/// its mcontext_t (struct sigcontext): x0 to x30, sp, pc, pstate, then
+/// the record of the FP and SIMD registers (fpsimd_context) and an empty
+/// record that ends the list.
+#[repr(C, align(16))]
+pub struct LinuxContext {
+    flags: u64,
+    pub link: *mut core::ffi::c_void,
+    pub stack_pointer: *mut core::ffi::c_void,
+    pub stack_flags: i32,
+    pub stack_size: usize,
+    pub mask: u64,
+    unused: [u8; 120],
+    /// uc_mcontext is 16-byte aligned.
+    pad0: u64,
+    fault_address: u64,
+    pub registers: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
+    pub pstate: u64,
+    /// The records start 16-byte aligned.
+    pad: u64,
+    /// fpsimd_context: magic, size, fpsr, fpcr, the 32 vector registers.
+    fp_magic: u32,
+    fp_size: u32,
+    pub fpsr: u32,
+    pub fpcr: u32,
+    pub vectors: [u128; 32],
+    /// The empty record after it, then the rest of the 4096 bytes.
+    reserved: [u8; 4096 - 528],
+}
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<LinuxContext>() == 4560);
+    assert!(offset_of!(LinuxContext, mask) == 40);
+    assert!(offset_of!(LinuxContext, fault_address) == 176);
+    assert!(offset_of!(LinuxContext, sp) == 432);
+    assert!(offset_of!(LinuxContext, pc) == 440);
+    assert!(offset_of!(LinuxContext, fp_magic) == 464);
+    assert!(offset_of!(LinuxContext, vectors) == 480);
+};
+const FPSIMD_MAGIC: u32 = 0x4650_8001;
+
+impl LinuxContext {
+    fn new(frame: &upcall::Context, mask: u64) -> Self {
+        Self {
+            flags: 0,
+            link: core::ptr::null_mut(),
+            stack_pointer: core::ptr::null_mut(),
+            stack_flags: SS_DISABLE,
+            stack_size: 0,
+            mask,
+            unused: [0; 120],
+            pad0: 0,
+            fault_address: 0,
+            registers: frame.registers,
+            sp: frame.sp,
+            pc: frame.pc,
+            pstate: frame.pstate,
+            pad: 0,
+            fp_magic: FPSIMD_MAGIC,
+            fp_size: 528,
+            fpsr: frame.fpsr as u32,
+            fpcr: frame.fpcr as u32,
+            vectors: frame.vectors,
+            reserved: [0; 4096 - 528],
+        }
+    }
+
+    /// The entry's frame with the registers the handler left here.
+    fn frame(&self, frame: upcall::Context) -> upcall::Context {
+        upcall::Context {
+            registers: self.registers,
+            sp: self.sp,
+            pc: self.pc,
+            pstate: self.pstate,
+            vectors: self.vectors,
+            fpcr: u64::from(self.fpcr),
+            fpsr: u64::from(self.fpsr),
+            ..frame
+        }
+    }
+}
+
 fn sys_exit_signal(signal: i32) -> ! {
     rt::sys::process_exit((128 + signal) as u64)
 }
@@ -781,7 +763,8 @@ pub fn probe_hold_actions(run: impl FnOnce()) {
     let _guard = ACTIONS_LOCK.lock();
     run();
 }
-/// Whether pthread `thread` waits in sigwait now, for the guest probes.
+/// Whether thread `thread` (its relibc `pthread_t`) waits in sigwait now,
+/// for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
     threads::probe_block(thread)

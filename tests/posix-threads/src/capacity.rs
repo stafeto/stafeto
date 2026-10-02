@@ -4,7 +4,7 @@
 //! The advertised 64 pthreads are live simultaneously with internal workers.
 
 use super::*;
-use threads::specific::*;
+use ffi::{pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific};
 
 static KEY: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +63,10 @@ pub(super) fn run() -> bool {
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 123 };
     for round in 0..2 {
+        if !settle() {
+            return failed(89);
+        }
+        let _ = settle();
         let handles = sys::process_handles(&process)
             .expect("capacity handle baseline")
             .live;
@@ -72,7 +76,7 @@ pub(super) fn run() -> bool {
         let mut children = [0; CHILDREN];
         for (index, child) in children.iter_mut().enumerate() {
             if unsafe {
-                threads::pthread_create(child, ptr::null(), Some(live), (index + 1) as *mut c_void)
+                ffi::pthread_create(child, ptr::null(), Some(live), (index + 1) as *mut c_void)
             } != 0
             {
                 rt::println!("posix-capacity-probe: created only {} live children", index);
@@ -90,9 +94,8 @@ pub(super) fn run() -> bool {
             children.len() + 1
         );
         let mut past = 987;
-        if unsafe {
-            threads::pthread_create(&mut past, ptr::null(), Some(returning), ptr::null_mut())
-        } != EAGAIN
+        if unsafe { ffi::pthread_create(&mut past, ptr::null(), Some(returning), ptr::null_mut()) }
+            != EAGAIN
             || past != 987
             || unsafe { *errno } != 123
             || pthread_getspecific(key) as usize != VALUE
@@ -120,12 +123,14 @@ pub(super) fn run() -> bool {
         }
         for (index, child) in children.into_iter().enumerate() {
             let mut value = ptr::null_mut();
-            if unsafe { threads::pthread_join(child, &mut value) } != 0
-                || value as usize != index + 1
-            {
+            if unsafe { ffi::pthread_join(child, &mut value) } != 0 || value as usize != index + 1 {
                 return failed(86);
             }
         }
+        if !settle() {
+            return failed(89);
+        }
+        let _ = settle();
         let after = sys::process_memory(&process)
             .expect("capacity quota after join")
             .used;

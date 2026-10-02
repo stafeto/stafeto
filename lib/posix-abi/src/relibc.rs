@@ -54,6 +54,9 @@ struct Place {
     /// relibc's mapping of the stack, from exit_thread.
     stack: AtomicUsize,
     stack_len: AtomicUsize,
+    /// The creator's floating-point environment, FPCR low and FPSR high,
+    /// which the thread takes on at its start (POSIX: inherited).
+    floating: AtomicU64,
 }
 const _: () = assert!(core::mem::size_of::<Place>() == 64);
 
@@ -66,6 +69,7 @@ static TABLE: [Place; PLACES] = [const {
         tcb_len: AtomicUsize::new(0),
         stack: AtomicUsize::new(0),
         stack_len: AtomicUsize::new(0),
+        floating: AtomicU64::new(0),
     }
 }; PLACES];
 
@@ -105,6 +109,24 @@ fn close_raw(raw: u64) {
 pub fn current() -> u64 {
     // SAFETY: a block lives while its thread runs.
     unsafe { posix_thread::block().as_ref() }.map_or(0, |block| block.thread_id)
+}
+
+/// The number of the live thread whose relibc `pthread_t` is `pthread`,
+/// 0 for none: relibc's thread record lies in its TCB, whose page begins
+/// `BLOCK_OFFSET` before the block. For the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn number_of(pthread: u64) -> u64 {
+    let pthread = pthread as usize;
+    for (index, place) in TABLE.iter().enumerate() {
+        if place.state.load(Ordering::Acquire) & LIVE == 0 {
+            continue;
+        }
+        let tcb = place.block.load(Ordering::Relaxed) - posix_thread::BLOCK_OFFSET;
+        if (tcb..tcb + PAGE).contains(&pthread) {
+            return index as u64 + 1;
+        }
+    }
+    0
 }
 
 /// The main thread's place, from stafeto_init once relibc built its TCB.
@@ -364,6 +386,7 @@ pub unsafe fn create(
     place.native.store(native.raw().0, Ordering::Relaxed);
     place.stack.store(0, Ordering::Relaxed);
     place.stack_len.store(0, Ordering::Relaxed);
+    place.floating.store(floating(), Ordering::Relaxed);
     place.state.store(LIVE, Ordering::Release);
     if sys::thread_start(&native).is_err() {
         // SAFETY: the block is the new thread's, which never ran.
@@ -384,7 +407,42 @@ pub unsafe fn create(
 /// The new thread's part of its start, once relibc installed its TCB: its
 /// entry of signals.
 pub fn started() -> Result<(), i32> {
+    let id = crate::threads::own_block().thread_id;
+    if let Some(place) = (id as usize).checked_sub(1).and_then(|i| TABLE.get(i)) {
+        set_floating(place.floating.load(Ordering::Relaxed));
+    }
     crate::signals::attach()
+}
+
+/// The calling thread's floating-point environment: FPCR, FPSR above.
+fn floating() -> u64 {
+    let (control, status): (u64, u64);
+    // SAFETY: reading the floating-point control and status registers.
+    unsafe {
+        core::arch::asm!(
+            "mrs {c}, fpcr",
+            "mrs {s}, fpsr",
+            c = out(reg) control,
+            s = out(reg) status,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (control & 0xffff_ffff) | (status << 32)
+}
+
+/// Sets the calling thread's floating-point environment from `floating`.
+fn set_floating(environment: u64) {
+    // SAFETY: writing the floating-point control and status registers;
+    // the values are another thread's, so valid.
+    unsafe {
+        core::arch::asm!(
+            "msr fpcr, {c}",
+            "msr fpsr, {s}",
+            c = in(reg) environment & 0xffff_ffff,
+            s = in(reg) environment >> 32,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 /// The calling thread leaves: every signal masked, cancellation disabled,

@@ -82,17 +82,6 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
 ];
-/// rtbench 2 on relibc (5a′): the same C, relibc's start and pthreads.
-const RTBENCH_POSIX_RELIBC_PROGRAMS: [ImageProgram; 8] = [
-    RTBENCH_POSIX_PROGRAMS[0],
-    RTBENCH_POSIX_PROGRAMS[1],
-    RTBENCH_POSIX_PROGRAMS[2],
-    RTBENCH_POSIX_PROGRAMS[3],
-    RTBENCH_POSIX_PROGRAMS[4],
-    RTBENCH_POSIX_PROGRAMS[5],
-    RTBENCH_POSIX_PROGRAMS[6],
-    ("rtbench-posix", "rtbench-posix", 64 * 1024, &["relibc"]),
-];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
 const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
@@ -164,10 +153,17 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     ),
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
-const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
+const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
         "busybox-probe",
         "posix-thread-probe",
@@ -208,7 +204,7 @@ const RTBENCH_VZ_PROGRAMS: [ImageProgram; 3] = [
 ];
 /// The POSIX images of Apple VZ: those of QEMU with init's VZ tables and
 /// the Virtio console's driver in place of the PL011's.
-const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
+const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     (
         "init",
         "init",
@@ -217,6 +213,13 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     ),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
         "busybox-probe",
         "posix-thread-probe",
@@ -244,10 +247,17 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
-const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
+const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", SVC_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
         "busybox-probe",
         "posix-shared-probe",
@@ -255,7 +265,7 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
         &["input-probe"],
     ),
 ];
-const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 4] = [
+const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
     (
         "init",
         "init",
@@ -265,15 +275,29 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 4] = [
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    (
         "busybox-probe",
         "posix-shared-probe",
         POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
-const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
+const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     (
         "busybox-probe",
@@ -282,7 +306,7 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
         &["interrupt-probe"],
     ),
 ];
-const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
+const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     (
         "init",
         "init",
@@ -290,6 +314,13 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
         &["table-busybox-dialog-vz"],
     ),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     (
         "busybox-probe",
@@ -349,14 +380,28 @@ const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("cprobe", "cprobe", POSIX_STACK_SIZE, &[]),
 ];
-const BUSYBOX_PROGRAMS: [ImageProgram; 3] = [
+const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("busybox-probe", "busybox-probe", POSIX_STACK_SIZE, &[]),
 ];
-const ASH_PROGRAMS: [ImageProgram; 3] = [
+const ASH_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
         "busybox-probe",
         "busybox-probe",
@@ -364,10 +409,17 @@ const ASH_PROGRAMS: [ImageProgram; 3] = [
         &["ash-probe"],
     ),
 ];
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 4] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
         "busybox-probe",
         "busybox-probe",
@@ -375,9 +427,16 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 4] = [
         &["ash-interactive"],
     ),
 ];
-const LS_PROGRAMS: [ImageProgram; 3] = [
+const LS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     (
         "busybox-probe",
         "busybox-probe",
@@ -768,8 +827,7 @@ commands:
   vz        boot the shell through Apple Virtualization.framework
   rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
             with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ;
-            with --short, one round of them on TCG, as ci runs it;
-            with --short --relibc, that round with the C on relibc
+            with --short, one round of them on TCG, as ci runs it
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
@@ -829,10 +887,7 @@ fn main() {
                 .filter(|&minutes| (1..=600).contains(&minutes))
                 .ok_or_else(|| "rtbench --minutes expects 1..=600".to_owned())
                 .and_then(rtbench2::run),
-            [flag] if flag == "--short" => rtbench2::short(),
-            [flag, libc] if flag == "--short" && libc == "--relibc" => {
-                relibc().and_then(|()| rtbench2::short_relibc())
-            }
+            [flag] if flag == "--short" => relibc().and_then(|()| rtbench2::short()),
             rest => rtbench::run(rest),
         },
         Some("ext4ro") => ext4ro_probe(),
@@ -1078,48 +1133,12 @@ fn write_boot_image(
 
 /// `write_boot_image` with the variables `env` set for the build of the
 /// programs (rtbench 2 takes the length of its run so).
-/// The programs whose C names come from relibc (or that have the feature
-/// `relibc`), and those whose come from the layer (posix-abi without the
-/// feature `libc-backend`). One `cargo build` builds the programs of an
-/// image with the union of their features, so with both in one image
-/// posix-abi loses its C names for all (5a′ removes them for good).
-const RELIBC_C_PROGRAMS: [&str; 2] = ["relibc-hello", "relibc-threads"];
-const LAYER_C_PROGRAMS: [&str; 6] = [
-    "posix-abi-probe",
-    "posix-tls-probe",
-    "posix-shared-probe",
-    "posix-thread-probe",
-    "ramfs-probe",
-    "rtbench-posix",
-];
-
-/// Refuses an image of programs on relibc and programs on the layer's C
-/// names together.
-fn one_c_library(name: &str, programs: &[ImageProgram]) -> Result<(), String> {
-    let relibc = |(_, package, _, features): &&ImageProgram| {
-        RELIBC_C_PROGRAMS.contains(package) || features.contains(&"relibc")
-    };
-    let on_relibc: Vec<_> = programs.iter().filter(relibc).map(|p| p.1).collect();
-    let on_layer: Vec<_> = programs
-        .iter()
-        .filter(|program| !relibc(program) && LAYER_C_PROGRAMS.contains(&program.1))
-        .map(|p| p.1)
-        .collect();
-    if !on_relibc.is_empty() && !on_layer.is_empty() {
-        return Err(format!(
-            "{name}: {on_relibc:?} on relibc and {on_layer:?} on the layer's C names in one image"
-        ));
-    }
-    Ok(())
-}
-
 fn write_boot_image_with(
     name: &str,
     programs: &[ImageProgram],
     profile: Profile,
     env: &[(&str, &str)],
 ) -> Result<PathBuf, String> {
-    one_c_library(name, programs)?;
     let mut cmd = cargo();
     cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
@@ -1356,63 +1375,17 @@ fn posix_abi_probe() -> Result<(), String> {
     let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
     qemu::expect_stopped_on(&output, ENDED)?;
     qemu::expect_marker(&output, "posix-abi-probe: ok")?;
-    let output = Command::new("python3")
-        .arg(root().join("tools/build-posix-sysroot.py"))
-        .arg("--probe")
-        .output()
-        .map_err(|error| format!("POSIX sysroot tool: {error}"))?;
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    if !output.status.success() {
-        return Err("POSIX standalone C link failed".into());
+    let data = layer_data(&image_elf(
+        &target_dir(),
+        "boot-posix-abi.img",
+        "posix-abi-probe",
+    ))?;
+    println!("posix-abi-probe: the layer's .data + .bss {data} bytes, limit {LAYER_DATA_LIMIT}");
+    if data > LAYER_DATA_LIMIT {
+        return Err(format!(
+            "the layer's .data + .bss in posix-abi-probe is {data} bytes, over {LAYER_DATA_LIMIT}"
+        ));
     }
-    let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-    let linked = output
-        .lines()
-        .find_map(|line| line.strip_prefix("Rust POSIX standalone probe: "))
-        .ok_or("missing standalone C program path")?;
-    let target = target_dir();
-    let image = write_elf_image(
-        "boot-posix-standalone.img",
-        &[
-            (
-                "init",
-                image_elf(&target, "boot-posix-abi.img", "init"),
-                INIT_STACK_SIZE,
-            ),
-            (
-                "ramfs",
-                image_elf(&target, "boot-posix-abi.img", "ramfs"),
-                SVC_STACK_SIZE,
-            ),
-            (
-                "posix-process-service",
-                image_elf(&target, "boot-posix-abi.img", "posix-process-service"),
-                64 * 1024,
-            ),
-            (
-                "posix-clock-service",
-                image_elf(&target, "boot-posix-abi.img", "posix-clock-service"),
-                64 * 1024,
-            ),
-            (
-                "posix-clock-peer",
-                image_elf(&target, "boot-posix-abi.img", "posix-clock-peer"),
-                32 * 1024,
-            ),
-            ("posix-abi-probe", PathBuf::from(linked), POSIX_STACK_SIZE),
-            (
-                "svc",
-                image_elf(&target, "boot-posix-abi.img", "test-svc"),
-                SVC_STACK_SIZE,
-            ),
-        ],
-    )?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
-    cmd.args(qemu::HEADLESS);
-    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, ENDED)?;
-    qemu::expect_marker(&output, "posix-abi-probe: ok")?;
     let image = build_boot_image("boot-posix-tls.img", &POSIX_TLS_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
@@ -1907,7 +1880,6 @@ fn test() -> Result<(), String> {
     relibc_hello_probe()?;
     relibc_threads_probe(&qemu::VIRT)?;
     rtbench2::short()?;
-    rtbench2::short_relibc()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
@@ -3339,6 +3311,111 @@ fn hvf_host() -> Result<(), String> {
 
 /// The test hooks of the reply journals went with the journals (spec 6.1):
 /// no Cargo.toml of the workspace names the feature `transport-probe`.
+/// The names the layer's crates (`lib/posix-*`) may give the linker: the
+/// platform's `stafeto_*` (and its `STAFETO_PLATFORM_ABI`) and posix-crt's
+/// `__rt_main`. A C name there would
+/// stand in for relibc's, or clash with it (5a′, Т5).
+fn layer_symbol_allowed(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("stafeto_") || name == "__rt_main"
+}
+
+/// The names `text` gives the linker: each `no_mangle` item's own name and
+/// each `export_name`.
+fn exported_names(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.split("export_name = \"").nth(1) {
+            names.extend(rest.split('"').next().map(str::to_owned));
+            continue;
+        }
+        if line.contains("no_mangle") && line.starts_with("#[") {
+            pending = true;
+            continue;
+        }
+        if pending && !line.starts_with("#[") && !line.starts_with("//") {
+            let words: Vec<&str> = line
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+                .collect();
+            if let Some(at) = words.iter().position(|w| *w == "fn" || *w == "static") {
+                let at = if words.get(at + 1) == Some(&"mut") {
+                    at + 2
+                } else {
+                    at + 1
+                };
+                names.extend(words.get(at).map(|w| (*w).to_owned()));
+            }
+            pending = false;
+        }
+    }
+    names
+}
+
+/// No C names in the layer: `lib/posix-*` exports only `layer_symbol_allowed`.
+fn layer_c_names() -> Result<(), String> {
+    let mut found = Vec::new();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(root().join("lib"))
+        .map_err(|e| format!("lib: {e}"))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("posix-"))
+        })
+        .collect();
+    while let Some(path) = paths.pop() {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path).map_err(|e| format!("{path:?}: {e}"))? {
+                paths.push(entry.map_err(|e| format!("{path:?}: {e}"))?.path());
+            }
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
+            for name in exported_names(&text) {
+                if !layer_symbol_allowed(&name) {
+                    found.push(format!("{}: {name}", path.display()));
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        println!("layer C names: none, only stafeto_* and __rt_main");
+        Ok(())
+    } else {
+        Err(format!("C names in the layer (relibc has them): {found:?}"))
+    }
+}
+
+/// The layer's `.data` and `.bss` in the ELF `elf`: the sizes of the
+/// symbols of the layer's crates (`posix_*`, `rt`), by `llvm-nm`.
+fn layer_data(elf: &Path) -> Result<u64, String> {
+    let output = stdout_of(
+        Command::new(llvm_tool("llvm-nm")?)
+            .args(["--size-sort", "-S", "-C"])
+            .arg(elf),
+    )?;
+    Ok(layer_data_of(&output))
+}
+
+/// `layer_data` of the output of `llvm-nm --size-sort -S -C`.
+fn layer_data_of(listing: &str) -> u64 {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.splitn(4, ' ');
+            let (_, size, kind, name) =
+                (words.next()?, words.next()?, words.next()?, words.next()?);
+            let layer = name.starts_with("posix_") || name.starts_with("rt::");
+            (layer && matches!(kind, "b" | "B" | "d" | "D"))
+                .then(|| u64::from_str_radix(size, 16).ok())?
+        })
+        .sum()
+}
+
+/// The bound of the layer's `.data` + `.bss` in a program (5a′, Т5).
+const LAYER_DATA_LIMIT: u64 = 16 * 1024;
+
 fn no_transport_probe() -> Result<(), String> {
     let mut found = Vec::new();
     let mut paths = vec![root()];
@@ -3373,6 +3450,7 @@ fn ci() -> Result<(), String> {
     relibc()?;
     run_cmd(Command::new("python3").arg(root().join("tools/check-licenses.py")))?;
     no_transport_probe()?;
+    layer_c_names()?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(cargo().args([
         "clippy",
@@ -3631,27 +3709,29 @@ fn ci() -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// An image takes programs of one C library: relibc's or the layer's.
+    /// The check of the layer's names sees `no_mangle` items and
+    /// `export_name`, and lets through only the platform's names.
     #[test]
-    fn an_image_has_one_c_library() {
-        assert!(one_c_library("a", &RELIBC_PROGRAMS).is_ok());
-        assert!(one_c_library("b", &POSIX_ABI_PROGRAMS).is_ok());
-        assert!(one_c_library("c", &RTBENCH_POSIX_RELIBC_PROGRAMS).is_ok());
-        let mixed = [
-            ("relibc-hello", "relibc-hello", 4096, &[] as &[&str]),
-            ("posix-abi-probe", "posix-abi-probe", 4096, &[]),
-        ];
-        assert!(one_c_library("d", &mixed).is_err());
-        let mixed = [
-            (
-                "rtbench-posix",
-                "rtbench-posix",
-                4096,
-                &["relibc"] as &[&str],
-            ),
-            ("ramfs-probe", "ramfs-probe", 4096, &[]),
-        ];
-        assert!(one_c_library("e", &mixed).is_err());
+    fn layer_names_are_found() {
+        let text = "#[unsafe(no_mangle)]\npub extern \"C\" fn strlen() {}\n\
+                    #[unsafe(no_mangle)]\npub extern \"C\" fn stafeto_read() {}\n\
+                    #[unsafe(export_name = \"__rt_main\")]\nfn crt() {}\n\
+                    #[unsafe(no_mangle)]\npub static mut environ: u64 = 0;\n";
+        let names = exported_names(text);
+        assert_eq!(names, ["strlen", "stafeto_read", "__rt_main", "environ"]);
+        let refused: Vec<_> = names.iter().filter(|n| !layer_symbol_allowed(n)).collect();
+        assert_eq!(refused, ["strlen", "environ"]);
+    }
+
+    /// The layer's data counts the data and bss symbols of its crates.
+    #[test]
+    fn layer_data_counts_its_crates() {
+        let listing = "0000000000001000 0000000000000800 b posix_sync::TABLE\n\
+                       0000000000002000 0000000000000100 d rt::time::SCALE\n\
+                       0000000000003000 0000000000000388 b relibc::ALLOCATOR\n\
+                       0000000000004000 0000000000000040 t posix_abi::read\n\
+                       0000000000005000 0000000000000010 D posix_abi::relibc::TABLE\n";
+        assert_eq!(layer_data_of(listing), 0x800 + 0x100 + 0x10);
     }
 
     #[test]

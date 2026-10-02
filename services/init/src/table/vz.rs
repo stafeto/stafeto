@@ -139,7 +139,9 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     CONSOLE,
     super::ramfs::TABLE[0],
-    super::ramfs::BUSYBOX_DIALOG_TABLE[2],
+    super::ramfs::POSIX_ABI_TABLE[1],
+    super::ramfs::POSIX_ABI_TABLE[2],
+    super::ramfs::BUSYBOX_DIALOG_TABLE[4],
 ];
 
 /// rtbench as a client beside the driver, which shows its lines: its main

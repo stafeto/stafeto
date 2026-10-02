@@ -14,4 +14,4 @@ test = false
 bench = false
 
 [dependencies]
-posix-crt = { path = "../../lib/posix-crt", features = ["relibc"] }
+posix-crt = { path = "../../lib/posix-crt" }

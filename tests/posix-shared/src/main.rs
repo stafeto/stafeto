@@ -2,22 +2,26 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Native threads share Rust POSIX descriptors, offsets, cwd and directory streams.
+//! The probe is a C program on relibc (posix-crt starts it, relibc calls
+//! its `main`); its native threads use the layer through its scopes.
 
 #![no_std]
 #![no_main]
 
-#[cfg(not(feature = "interrupt-probe"))]
+use core::ffi::{c_char, c_int};
+#[cfg(feature = "input-probe")]
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use posix_abi::{self as abi, constants::*, shared, tls};
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 use posix_abi::{directory, metadata};
-use posix_fs::PosixFs;
 use rt::{
     Stack,
-    handle::{Channel, Handle, Resource},
+    handle::{Channel, Handle},
     sys,
 };
+// relibc's libc.a.
+use libc_ffi as _;
 
 #[cfg(feature = "input-probe")]
 mod input;
@@ -27,7 +31,8 @@ mod interrupt;
 
 mod wire;
 
-rt::entry!(main);
+#[used]
+static CRT: extern "C" fn(u64) -> u64 = posix_crt::crt_main;
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
 static STACK: Stack<16384> = Stack::new();
 #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
@@ -119,27 +124,14 @@ extern "C" fn worker(completion: u64) -> ! {
     sys::thread_exit()
 }
 
-fn main(_: u64) -> u64 {
-    let Ok(mut start) = rt::startup() else {
-        return 1;
-    };
-    if let Ok(console) = start.take::<Resource>("console") {
-        rt::console::set(console);
-    }
-    let files = if cfg!(any(feature = "input-probe", feature = "interrupt-probe")) {
-        PosixFs::connect_with_uart(&start.parent)
-    } else {
-        PosixFs::connect(&start.parent)
-    };
-    let Ok(files) = files else {
-        return 2;
-    };
-    let process = start.process.raw();
-    // SAFETY: startup has exclusive ownership.
-    if unsafe { shared::init(files) }.is_err()
-        || !wire::before_heap()
-        || unsafe { abi::allocation::init(start.process) }.is_err()
-    {
+/// The probe's C main: posix-crt connected the files (with the console's
+/// driver for the input and interrupt probes) and the heap.
+#[unsafe(no_mangle)]
+extern "C" fn main(_: isize, _: *mut *mut c_char, _: *mut *mut c_char) -> c_int {
+    let process = abi::allocation::process().raw();
+    #[cfg(feature = "interrupt-probe")]
+    let main = abi::threads::main_handle();
+    if !wire::before_heap() {
         rt::println!(
             "posix-shared-probe: startup failed stage {}",
             ERROR.load(Ordering::Acquire)
@@ -149,129 +141,15 @@ fn main(_: u64) -> u64 {
     #[cfg(feature = "interrupt-probe")]
     let passed = tls::with_process(|| {
         let process = Handle::<rt::handle::Process>::borrowed(process);
-        wire::payload() && interrupt::run(&process, &start.thread) && shared::cleanup().is_ok()
+        wire::payload() && interrupt::run(&process, &main) && shared::cleanup().is_ok()
     });
     #[cfg(feature = "input-probe")]
     let passed = tls::with_process(|| {
         let process = Handle::<rt::handle::Process>::borrowed(process);
-        wire::payload() && input::run(&process, &start.thread) && shared::cleanup().is_ok()
+        wire::payload() && input::run(&process) && shared::cleanup().is_ok()
     });
     #[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
-    let passed = tls::with_process(|| {
-        if !wire::payload() {
-            return false;
-        }
-        let errno = unsafe { abi::__errno_location() };
-        unsafe { *errno = EIO };
-        let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
-        let alias = unsafe { abi::dup(fd) };
-        let dir = unsafe { directory::opendir(c"/etc".as_ptr()) };
-        if fd != 3 || alias != 4 || dir.is_null() {
-            return fail(4);
-        }
-        let mut byte = 0;
-        if unsafe { abi::read(fd, &mut byte, 1) } != 1
-            || byte != b's'
-            || unsafe { directory::readdir(dir) }.is_null()
-        {
-            return fail(5);
-        }
-        FD.store(fd as usize, Ordering::Release);
-        ALIAS.store(alias as usize, Ordering::Release);
-        DIRECTORY.store(dir as usize, Ordering::Release);
-        let Ok(completion) = sys::channel_create(30) else {
-            return fail(6);
-        };
-        let process = Handle::<rt::handle::Process>::borrowed(process);
-        // SAFETY: static stack is used once; this message page is disjoint from workers.
-        let Ok(thread) = (unsafe {
-            sys::thread_create(
-                &process,
-                worker,
-                STACK.top(),
-                completion.raw().0,
-                30,
-                rt::abi::Policy::Fifo,
-                0xc00000,
-            )
-        }) else {
-            return fail(7);
-        };
-        if sys::thread_start(&thread).is_err() || sys::receive(&completion).is_err() {
-            return fail(8);
-        }
-        if DONE.load(Ordering::Acquire) != 1 || unsafe { *errno } != EIO {
-            return fail(9);
-        }
-        let mut cwd = [0; 129];
-        if unsafe { abi::getcwd(cwd.as_mut_ptr(), cwd.len()) }.is_null() || &cwd[..5] != b"/etc\0" {
-            return fail(17);
-        }
-        let mut info = core::mem::MaybeUninit::<metadata::Stat>::uninit();
-        if unsafe { metadata::fstat(fd, info.as_mut_ptr()) } != -1
-            || unsafe { *errno } != EBADF
-            || unsafe { abi::lseek(alias, 0, SEEK_CUR) } != 2
-        {
-            return fail(18);
-        }
-        let entry = unsafe { directory::readdir(dir) };
-        if entry.is_null()
-            || unsafe { (*entry).d_ino } != 4
-            || unsafe { directory::closedir(dir) } != 0
-        {
-            return fail(19);
-        }
-        let opened = unsafe { abi::open(c"motd".as_ptr(), O_RDONLY) };
-        if opened != fd || unsafe { abi::close(opened) } != 0 {
-            return fail(20);
-        }
-        if unsafe { abi::lseek(alias, 0, SEEK_SET) } != 0 {
-            return fail(21);
-        }
-        unsafe { *errno = EIO };
-        if sys::notify(&completion, 4).is_err()
-            || !reading(alias, false)
-            || sys::receive(&completion).is_err()
-        {
-            return fail(22);
-        }
-        if DONE.load(Ordering::Acquire) != 2
-            || MAIN_BYTES.load(Ordering::Acquire) == 0
-            || WORKER_BYTES.load(Ordering::Acquire) == 0
-            || unsafe { *errno } != EIO
-        {
-            return fail(23);
-        }
-        let mut expected = [0usize; 256];
-        for byte in b"stafeto ramfs\n" {
-            expected[*byte as usize] += 1;
-        }
-        if HISTOGRAM
-            .iter()
-            .zip(expected)
-            .any(|(count, expected)| count.load(Ordering::Acquire) != expected)
-        {
-            return fail(26);
-        }
-        let mut list = ptr::null_mut();
-        let count = unsafe {
-            abi::scan::scandir(c".".as_ptr(), &mut list, None, Some(abi::scan::alphasort))
-        };
-        if count != 3 {
-            return fail(24);
-        }
-        for index in 0..count as usize {
-            unsafe { abi::allocation::free((*list.add(index)).cast()) };
-        }
-        unsafe { abi::allocation::free(list.cast()) };
-        if unsafe { abi::close(alias) } != 0 {
-            return fail(25);
-        }
-        if shared::cleanup().is_err() {
-            return fail(25);
-        }
-        true
-    });
+    let passed = in_native_thread(process);
     if passed {
         rt::println!("posix-shared-probe: ok");
         0
@@ -283,4 +161,167 @@ fn main(_: u64) -> u64 {
         );
         4
     }
+}
+
+/// The scenario of the default probe: a native thread the layer did not
+/// attach (`driver`) and its own native worker share the process's
+/// descriptors, offsets, working directory and directory streams. Both are
+/// native, at one level, as the scenario needs: a thread of relibc would
+/// rise to the ceiling for the layer's locks, which a native thread cannot.
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+fn in_native_thread(process: rt::abi::Handle) -> bool {
+    let Ok(completion) = sys::channel_create(30) else {
+        return fail(27);
+    };
+    PROCESS.store(process.0 as usize, Ordering::Release);
+    let process = Handle::<rt::handle::Process>::borrowed(process);
+    // SAFETY: the static stack is used once; the message page is disjoint
+    // from the worker's.
+    let Ok(thread) = (unsafe {
+        sys::thread_create(
+            &process,
+            driver,
+            DRIVER_STACK.top(),
+            completion.raw().0,
+            30,
+            rt::abi::Policy::Fifo,
+            0xc01000,
+        )
+    }) else {
+        return fail(27);
+    };
+    if sys::thread_start(&thread).is_err() || sys::receive(&completion).is_err() {
+        return fail(28);
+    }
+    PASSED.load(Ordering::Acquire) == 1
+}
+
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static DRIVER_STACK: Stack<16384> = Stack::new();
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static PROCESS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static PASSED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+extern "C" fn driver(completion: u64) -> ! {
+    let process = rt::abi::Handle(PROCESS.load(Ordering::Acquire) as u64);
+    let passed = tls::with_process(|| scenario(process));
+    PASSED.store(usize::from(passed), Ordering::Release);
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(completion));
+    let _ = sys::notify(&channel, 1);
+    sys::thread_exit()
+}
+
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+fn scenario(process: rt::abi::Handle) -> bool {
+    if !wire::payload() {
+        return false;
+    }
+    let errno = unsafe { abi::__errno_location() };
+    unsafe { *errno = EIO };
+    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+    let alias = unsafe { abi::dup(fd) };
+    let dir = unsafe { directory::opendir(c"/etc".as_ptr()) };
+    if fd != 3 || alias != 4 || dir.is_null() {
+        return fail(4);
+    }
+    let mut byte = 0;
+    if unsafe { abi::read(fd, &mut byte, 1) } != 1
+        || byte != b's'
+        || unsafe { directory::readdir(dir) }.is_null()
+    {
+        return fail(5);
+    }
+    FD.store(fd as usize, Ordering::Release);
+    ALIAS.store(alias as usize, Ordering::Release);
+    DIRECTORY.store(dir as usize, Ordering::Release);
+    let Ok(completion) = sys::channel_create(30) else {
+        return fail(6);
+    };
+    let process = Handle::<rt::handle::Process>::borrowed(process);
+    // SAFETY: static stack is used once; this message page is disjoint from workers.
+    let Ok(thread) = (unsafe {
+        sys::thread_create(
+            &process,
+            worker,
+            STACK.top(),
+            completion.raw().0,
+            30,
+            rt::abi::Policy::Fifo,
+            0xc00000,
+        )
+    }) else {
+        return fail(7);
+    };
+    if sys::thread_start(&thread).is_err() || sys::receive(&completion).is_err() {
+        return fail(8);
+    }
+    if DONE.load(Ordering::Acquire) != 1 || unsafe { *errno } != EIO {
+        return fail(9);
+    }
+    let mut cwd = [0; 129];
+    if unsafe { abi::getcwd(cwd.as_mut_ptr(), cwd.len()) }.is_null() || &cwd[..5] != b"/etc\0" {
+        return fail(17);
+    }
+    let mut info = core::mem::MaybeUninit::<metadata::Stat>::uninit();
+    if unsafe { metadata::fstat(fd, info.as_mut_ptr()) } != -1
+        || unsafe { *errno } != EBADF
+        || unsafe { abi::lseek(alias, 0, SEEK_CUR) } != 2
+    {
+        return fail(18);
+    }
+    let entry = unsafe { directory::readdir(dir) };
+    if entry.is_null() || unsafe { (*entry).d_ino } != 4 || unsafe { directory::closedir(dir) } != 0
+    {
+        return fail(19);
+    }
+    let opened = unsafe { abi::open(c"motd".as_ptr(), O_RDONLY) };
+    if opened != fd || unsafe { abi::close(opened) } != 0 {
+        return fail(20);
+    }
+    if unsafe { abi::lseek(alias, 0, SEEK_SET) } != 0 {
+        return fail(21);
+    }
+    unsafe { *errno = EIO };
+    if sys::notify(&completion, 4).is_err()
+        || !reading(alias, false)
+        || sys::receive(&completion).is_err()
+    {
+        return fail(22);
+    }
+    if DONE.load(Ordering::Acquire) != 2
+        || MAIN_BYTES.load(Ordering::Acquire) == 0
+        || WORKER_BYTES.load(Ordering::Acquire) == 0
+        || unsafe { *errno } != EIO
+    {
+        return fail(23);
+    }
+    let mut expected = [0usize; 256];
+    for byte in b"stafeto ramfs\n" {
+        expected[*byte as usize] += 1;
+    }
+    if HISTOGRAM
+        .iter()
+        .zip(expected)
+        .any(|(count, expected)| count.load(Ordering::Acquire) != expected)
+    {
+        return fail(26);
+    }
+    // The working directory the worker changed lists three entries.
+    let dir = unsafe { directory::opendir(c".".as_ptr()) };
+    let mut count = 0;
+    while !dir.is_null() && !unsafe { directory::readdir(dir) }.is_null() {
+        count += 1;
+    }
+    if dir.is_null() || count != 3 || unsafe { directory::closedir(dir) } != 0 {
+        return fail(24);
+    }
+    if unsafe { abi::close(alias) } != 0 {
+        return fail(25);
+    }
+    if shared::cleanup().is_err() {
+        return fail(25);
+    }
+    true
 }

@@ -5,7 +5,7 @@
 
 use super::*;
 use posix_abi::metadata;
-use rt::handle::{Process, Thread};
+use rt::handle::Process;
 
 static INPUT_STACK: Stack<16384> = Stack::new();
 static SECOND: AtomicUsize = AtomicUsize::new(0);
@@ -36,7 +36,7 @@ extern "C" fn reader(completion: u64) -> ! {
     sys::thread_exit()
 }
 
-pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
+pub fn run(process: &Handle<Process>) -> bool {
     let errno = unsafe { abi::__errno_location() };
     let first = unsafe { abi::dup(0) };
     let second = unsafe { abi::dup(0) };
@@ -52,7 +52,8 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     unsafe { *errno = EIO };
     // UART read really blocks: the higher-priority client reaches the driver
     // before main resumes.
-    if sys::thread_set_priority(main, 29, rt::abi::Policy::Fifo).is_err() {
+    // Through the layer, which keeps the level of a thread of relibc.
+    if abi::threads::set_level(29).is_err() {
         return fail(31);
     }
     let Ok(completion) = sys::channel_create(30) else {

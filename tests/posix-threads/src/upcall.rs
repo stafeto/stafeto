@@ -46,7 +46,7 @@ fn poke() {
     sys::thread_upcall_request(&target).unwrap();
 }
 unsafe extern "C" fn dispatch() {
-    HANDLER_ID.store(threads::pthread_self(), Ordering::Release);
+    HANDLER_ID.store(ffi::pthread_self(), Ordering::Release);
     let depth = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
     DEEPEST.fetch_max(depth, Ordering::SeqCst);
     COUNT.fetch_add(1, Ordering::SeqCst);
@@ -90,7 +90,7 @@ unsafe extern "C" fn dispatch() {
 }
 unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     unsafe { upcall::bind(entry) }.unwrap();
-    let self_native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
+    let self_native = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
     NATIVE.store(self_native.raw().0, Ordering::Release);
     sys::thread_set_priority(&self_native, 10, rt::abi::Policy::Fifo).unwrap();
     // The launch notification leaves a boost until the next receive. End it
@@ -168,6 +168,7 @@ pub(super) fn run() -> bool {
     GATE.store(gate.raw().0, Ordering::Release);
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let before_handles = sys::process_handles(&process).unwrap().live;
     let before_used = sys::process_memory(&process).unwrap().used;
     let inactive = unsafe { sys::raw::<{ rt::abi::Call::ThreadUpcallReturn.number() }>([0; 10]) };
@@ -183,7 +184,7 @@ pub(super) fn run() -> bool {
         GO.store(0, Ordering::Release);
         let mut id = 0;
         assert_eq!(
-            unsafe { threads::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) },
+            unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) },
             0
         );
         if !matches!(
@@ -234,13 +235,14 @@ pub(super) fn run() -> bool {
         }
         let mut result = ptr::null_mut();
         let retained = sys::handle_duplicate(&native, rt::abi::Rights::MANAGE).unwrap();
-        if unsafe { threads::pthread_join(id, &mut result) } != 0 {
+        if unsafe { ffi::pthread_join(id, &mut result) } != 0 {
             return failed(234);
         }
         if sys::thread_upcall_request(&retained) != Err(rt::abi::Error::BadState) {
             return failed(237);
         }
     }
+    let _ = settle();
     if sys::process_handles(&process).unwrap().live != before_handles
         || sys::process_memory(&process).unwrap().used != before_used
     {

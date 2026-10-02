@@ -442,6 +442,39 @@ pub extern "C" fn stafeto_getegid() -> u32 {
     posix_abi::process::getegid()
 }
 
+/// setresuid as relibc's setuid (r = e, s kept) and seteuid (only e) call
+/// it; other forms are ENOSYS until the process service has them.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setresuid(real: u32, effective: u32, saved: u32) -> c_int {
+    let keep = u32::MAX;
+    let status = match (real, saved) {
+        (r, s) if r == keep && s == keep => {
+            call(|| i64::from(posix_abi::process::seteuid(effective)))
+        }
+        (r, s) if r == effective && s == keep => {
+            call(|| i64::from(posix_abi::process::setuid(effective)))
+        }
+        _ => return -ENOSYS,
+    };
+    status as c_int
+}
+
+/// setresgid as relibc's setgid and setegid call it.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_setresgid(real: u32, effective: u32, saved: u32) -> c_int {
+    let keep = u32::MAX;
+    let status = match (real, saved) {
+        (r, s) if r == keep && s == keep => {
+            call(|| i64::from(posix_abi::process::setegid(effective)))
+        }
+        (r, s) if r == effective && s == keep => {
+            call(|| i64::from(posix_abi::process::setgid(effective)))
+        }
+        _ => return -ENOSYS,
+    };
+    status as c_int
+}
+
 static UMASK: AtomicU32 = AtomicU32::new(0o022);
 
 /// umask: the process's mask (no file the layer creates reads it yet).

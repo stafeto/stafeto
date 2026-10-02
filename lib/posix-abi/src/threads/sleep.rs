@@ -8,10 +8,10 @@
 //! point. An absolute deadline on CLOCK_REALTIME becomes a monotonic
 //! instant, checked on the calendar once it passed; a calendar set forward
 //! does not wake the sleep earlier, until the clock patch of relibc.
-use super::{cancel, mutex, own_block};
+use super::{cancel, own_block};
 use crate::{constants::*, fail};
 use core::sync::atomic::Ordering;
-use posix_time::Sleep;
+use posix_time::{Deadline, Sleep};
 use posix_types::Timespec;
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
@@ -23,11 +23,32 @@ fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
 
+/// The monotonic instant of an absolute deadline on `deadline.clock`; for
+/// CLOCK_REALTIME through the clock's anchor now, rechecked after it passed.
+fn absolute_target(deadline: Deadline) -> Result<u64, i32> {
+    let target = if deadline.clock == proto_clock::REALTIME {
+        let (time, mono) = crate::clock::realtime_anchor()?;
+        deadline.value() - time + i128::from(mono)
+    } else {
+        deadline.value()
+    };
+    Ok(target.clamp(0, i128::from(u64::MAX)) as u64)
+}
+
+/// Whether an absolute deadline passed on its own clock.
+fn absolute_passed(deadline: Deadline) -> Result<bool, i32> {
+    if deadline.clock == proto_clock::REALTIME {
+        let (time, _) = crate::clock::realtime_anchor()?;
+        return Ok(deadline.value() <= time);
+    }
+    Ok(deadline.value() <= i128::from(rt::time::ticks_to_ns(rt::time::now())))
+}
+
 /// The monotonic instant of `deadline`.
 fn target(deadline: Sleep) -> Result<u64, i32> {
     match deadline {
         Sleep::Relative(end) => Ok(end.clamp(0, i128::from(u64::MAX)) as u64),
-        Sleep::Absolute(deadline) => mutex::monotonic_target(deadline),
+        Sleep::Absolute(deadline) => absolute_target(deadline),
     }
 }
 
@@ -35,7 +56,7 @@ fn target(deadline: Sleep) -> Result<u64, i32> {
 fn passed(deadline: Sleep) -> Result<bool, i32> {
     match deadline {
         Sleep::Relative(end) => Ok(end <= i128::from(now())),
-        Sleep::Absolute(deadline) => mutex::passed(deadline),
+        Sleep::Absolute(deadline) => absolute_passed(deadline),
     }
 }
 
@@ -83,7 +104,6 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
 /// # Safety
 /// The caller is managed. request supplies a readable aligned Timespec; remaining
 /// is null or writable. They may name the same object. Absolute calls ignore remaining.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn clock_nanosleep(
     clock: i32,
     flags: i32,
@@ -129,7 +149,6 @@ pub unsafe extern "C" fn clock_nanosleep(
 }
 /// # Safety
 /// As for clock_nanosleep with CLOCK_REALTIME and a relative interval.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn nanosleep(requested: *const Timespec, remaining: *mut Timespec) -> i32 {
     let status = unsafe { clock_nanosleep(crate::clock::CLOCK_REALTIME, 0, requested, remaining) };
     if status == 0 { 0 } else { fail(status) as i32 }

@@ -1410,7 +1410,7 @@ mod tests {
         );
         assert_eq!(
             order_of(vz::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "busybox-probe"]
+            ["uart", "ramfs", "posix", "clock", "busybox-probe"]
         );
         assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
         assert_eq!(

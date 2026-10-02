@@ -21,7 +21,7 @@ fn channel(raw: &AtomicU64) -> core::mem::ManuallyDrop<Handle<Channel>> {
 fn unchanged(epoch: u64) {
     if epoch == 0
         || threads::probe_cancel_active() != epoch
-        || !threads::probe_console_waiting(threads::pthread_self())
+        || !threads::probe_console_waiting(ffi::pthread_self())
     {
         ERRORS.fetch_add(1, Ordering::Release);
     }
@@ -73,14 +73,12 @@ unsafe extern "C" fn cleanup(_: *mut c_void) {
     sys::notify(&channel(&DONE), 1).unwrap();
 }
 unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
-    let native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
+    let native = unsafe { threads::probe_native(ffi::pthread_self()) }.unwrap();
     NATIVE.store(native.raw().0, Ordering::Release);
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
-    let mut cleanup_node = threads::cancel::Cleanup::new();
-    unsafe {
-        threads::cancel::__stafeto_cleanup_push(&mut cleanup_node, Some(cleanup), ptr::null_mut())
-    };
+    let mut cleanup_node = ffi::Cleanup::new();
+    unsafe { ffi::cleanup_push(&mut cleanup_node, Some(cleanup), ptr::null_mut()) };
     unsafe { rt::upcall::bind(entry) }.unwrap();
     threads::probe_cancel_window(|| {
         let epoch = threads::probe_cancel_active();
@@ -120,11 +118,12 @@ pub(super) fn run() -> bool {
     GATE.store(gate.raw().0, Ordering::Release);
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let before_handles = sys::process_handles(&process).unwrap().live;
     let before_used = sys::process_memory(&process).unwrap().used;
     let mut id = 0;
     assert_eq!(
-        unsafe { threads::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) },
+        unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(worker), ptr::null_mut()) },
         0
     );
     if !matches!(
@@ -133,7 +132,7 @@ pub(super) fn run() -> bool {
     ) {
         return failed(241);
     }
-    if threads::pthread_cancel(id) != 0 {
+    if ffi::pthread_cancel(id) != 0 {
         return failed(242);
     }
     if !matches!(
@@ -144,10 +143,11 @@ pub(super) fn run() -> bool {
         return failed(243);
     }
     let mut value = ptr::null_mut();
-    if unsafe { threads::pthread_join(id, &mut value) } != 0
-        || value != threads::cancel::CANCELED
+    if unsafe { ffi::pthread_join(id, &mut value) } != 0
+        || value != ffi::CANCELED
         || ERRORS.load(Ordering::Acquire) != 0
         || threads::probe_cancel_active() != 0
+        || !settle()
         || sys::process_handles(&process).unwrap().live != before_handles
         || sys::process_memory(&process).unwrap().used != before_used
     {

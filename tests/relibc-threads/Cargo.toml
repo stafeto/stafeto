@@ -15,5 +15,5 @@ bench = false
 
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
-posix-crt = { path = "../../lib/posix-crt", features = ["relibc"] }
+posix-crt = { path = "../../lib/posix-crt" }
 rt = { path = "../../lib/rt", features = ["count-calls"] }

@@ -12,7 +12,7 @@ test = false
 bench = false
 
 [dependencies]
-posix-abi = { path = "../posix-abi", features = ["libc-backend"] }
+posix-abi = { path = "../posix-abi" }
 posix-thread = { path = "../posix-thread" }
 posix-types = { path = "../posix-types" }
 posix-signals = { path = "../posix-signals" }

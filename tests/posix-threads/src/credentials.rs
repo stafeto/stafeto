@@ -29,9 +29,8 @@ unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
 fn joined(entry: unsafe extern "C" fn(*mut c_void) -> *mut c_void) -> bool {
     let mut thread = 0;
     let mut value = ptr::null_mut();
-    (unsafe { threads::pthread_create(&mut thread, ptr::null(), Some(entry), ptr::null_mut()) })
-        == 0
-        && (unsafe { threads::pthread_join(thread, &mut value) }) == 0
+    (unsafe { ffi::pthread_create(&mut thread, ptr::null(), Some(entry), ptr::null_mut()) }) == 0
+        && (unsafe { ffi::pthread_join(thread, &mut value) }) == 0
         && value as usize == 1
 }
 /// The clock peer, a process init created without root, has a record of

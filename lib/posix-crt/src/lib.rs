@@ -1,41 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Initial static C-program startup. Args are a bounded, NUL-separated list
-//! from init; environment inheritance and ELF TLS templates are pending.
-//! The start goes in two steps (spec 2, 3.5): the process's
-//! (`posix_init_process`: registration, clocks, files, heap, threads),
-//! which leaves the thread's block alone, then the thread's
-//! (`posix_abi::threads::attach`: its TCB in the main page and its entry
-//! of signals). With relibc (feature `relibc`, 5a′) the second step moves
-//! to the platform's start (posix-platform `stafeto_init`), after relibc
-//! built the TCB: `crt_main` hands the thread to `relibc_start_v1` with a
-//! Linux initial stack and `TPIDR_EL0` at 0.
+//! The start of a C program on relibc. Args are a bounded, NUL-separated
+//! list from init; environment inheritance is pending. The start goes in
+//! two steps (spec 2, 3.5): the process's (`posix_init_process`:
+//! registration, clocks, files, heap, the clock's page), which leaves the
+//! thread alone, then relibc's: `crt_main` hands the thread to
+//! `relibc_start_v1` with a Linux initial stack and `TPIDR_EL0` at 0;
+//! relibc builds the TCB and its platform attaches the thread to the layer
+//! (posix-platform `stafeto_init`).
 
 #![no_std]
 
 use core::ffi::{c_char, c_int};
+use core::mem::ManuallyDrop;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 use posix_fs::PosixFs;
 use rt::handle::{Channel, Handle, Process, Resource, Thread};
 
 // relibc's platform calls the layer through posix-platform's functions.
-#[cfg(feature = "relibc")]
 extern crate posix_platform;
 
-#[cfg(not(feature = "relibc"))]
-#[unsafe(no_mangle)]
-pub static mut environ: *mut *mut c_char = ptr::null_mut();
-
-#[cfg(not(feature = "relibc"))]
-unsafe extern "C" {
-    fn main(argc: c_int, argv: *mut *mut c_char) -> c_int;
-}
-
-#[cfg(feature = "relibc")]
 type Main = unsafe extern "C" fn(isize, *mut *mut c_char, *mut *mut c_char) -> c_int;
 
-#[cfg(feature = "relibc")]
 unsafe extern "C" {
     fn main(argc: isize, argv: *mut *mut c_char, envp: *mut *mut c_char) -> c_int;
     fn relibc_start_v1(stack: *const usize, main: Main) -> !;
@@ -44,7 +32,6 @@ unsafe extern "C" {
 }
 
 /// Linux auxiliary vector keys relibc's start reads.
-#[cfg(feature = "relibc")]
 mod auxv {
     pub const AT_NULL: usize = 0;
     pub const AT_PHDR: usize = 3;
@@ -57,7 +44,6 @@ mod auxv {
 /// Linux process: argc, the `count` arguments, NULL, an empty environment
 /// (until 5c), the auxiliary vector with the program headers (relibc
 /// builds the static TLS from `PT_TLS`) and the page size.
-#[cfg(feature = "relibc")]
 fn start_relibc(arguments: &[*mut c_char]) -> ! {
     use auxv::*;
     let header = ptr::addr_of!(__ehdr_start).cast::<u8>();
@@ -132,6 +118,16 @@ pub unsafe fn posix_init_process(
     Ok(())
 }
 
+/// The start's parent channel, which stays open for the program's life
+/// (crt_main does not return).
+static PARENT: AtomicU64 = AtomicU64::new(0);
+
+/// The start's parent channel, for a program that connects to services by
+/// name beyond its files and clocks (the guest probes).
+pub fn parent() -> ManuallyDrop<Handle<Channel>> {
+    Handle::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)))
+}
+
 #[unsafe(export_name = "__rt_main")]
 pub extern "C" fn crt_main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
@@ -175,6 +171,7 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
         rt::println!("POSIX startup: no session with the process service");
         return 125;
     };
+    PARENT.store(start.parent.raw().0, Ordering::Release);
     // SAFETY: the main thread, once, before any other; the start channel
     // stays in `start` until main returned.
     if let Err(why) =
@@ -183,24 +180,5 @@ pub extern "C" fn crt_main(_: u64) -> u64 {
         rt::println!("POSIX startup: {}", why);
         return 125;
     }
-    #[cfg(feature = "relibc")]
-    start_relibc(&arguments[..count]);
-    #[cfg(not(feature = "relibc"))]
-    {
-        let mut environment = [ptr::null_mut(); 1];
-        // SAFETY: startup runs once, before C. This empty vector lives until main returns.
-        unsafe { environ = environment.as_mut_ptr() };
-        // SAFETY: the main page is the main thread's for its life.
-        if unsafe {
-            posix_abi::threads::attach(posix_abi::tls::main_page(), posix_thread::PAGE_SIZE, 1)
-        }
-        .is_err()
-        {
-            rt::println!("POSIX startup: main thread attach failed");
-            return 125;
-        }
-        // SAFETY: argv has count live C strings and a NULL sentinel; main is linked by C.
-        let status = unsafe { main(count as c_int, arguments.as_mut_ptr()) };
-        (status & 255) as u64
-    }
+    start_relibc(&arguments[..count])
 }

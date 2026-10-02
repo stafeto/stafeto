@@ -77,22 +77,30 @@ pub const CPROBE_TABLE: &[Record] = &[
     },
 ];
 
+/// BusyBox, or a probe in its place, with the RAM files and the process
+/// and clock services a program on relibc starts with.
 pub const BUSYBOX_TABLE: &[Record] = &[
     TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
     Record {
         name: "busybox-probe",
         program: "busybox-probe",
+        connects: &["ramfs", "clock", "posix"],
         quota: 512 * PAGE,
         ..POSIX
     },
 ];
 
+/// BUSYBOX_TABLE with the console's driver, which the program reads.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
     Record {
-        connects: &["ramfs", "uart"],
-        ..BUSYBOX_TABLE[1]
+        connects: &["ramfs", "uart", "clock", "posix"],
+        ..BUSYBOX_TABLE[3]
     },
 ];
 

@@ -170,7 +170,6 @@ impl Streams {
 
 /// # Safety
 /// name is a live C string; this thread has an initialized file scope.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut Stream {
     unsafe { path(name) }
         .and_then(|path| crate::shared::number(Request::OpenDir { path }))
@@ -184,7 +183,6 @@ pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut Stream {
 /// # Safety
 /// Success transfers ownership of number to this stream; the caller must not
 /// close, replace or adopt it again before closedir. An ABI scope is required.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn fdopendir(number: c_int) -> *mut Stream {
     fd(number)
         .and_then(|fd| crate::shared::number(Request::FdOpenDir { fd }))
@@ -198,7 +196,6 @@ pub unsafe extern "C" fn fdopendir(number: c_int) -> *mut Stream {
 /// # Safety
 /// pointer is a live stream. The returned buffer remains valid until the next
 /// read on that stream or closedir; callers serialize use of the same stream.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn readdir(pointer: *mut Stream) -> *mut Dirent {
     read_entry(pointer).unwrap_or_else(|code| {
         fail(code);
@@ -215,7 +212,6 @@ pub(crate) fn read_entry(pointer: *mut Stream) -> Result<*mut Dirent, c_int> {
 
 /// # Safety
 /// pointer is a live stream. Success closes its descriptor and invalidates it.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn closedir(pointer: *mut Stream) -> c_int {
     crate::shared::number(Request::DirClose {
         stream: pointer as u64,
@@ -225,7 +221,6 @@ pub unsafe extern "C" fn closedir(pointer: *mut Stream) -> c_int {
 
 /// # Safety
 /// pointer is a live stream in this process's file scope.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn dirfd(pointer: *mut Stream) -> c_int {
     crate::shared::number(Request::DirFd {
         stream: pointer as u64,
@@ -235,7 +230,6 @@ pub unsafe extern "C" fn dirfd(pointer: *mut Stream) -> c_int {
 
 /// # Safety
 /// pointer is a live stream in this process's file scope.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn telldir(pointer: *mut Stream) -> i64 {
     crate::shared::number(Request::DirTell {
         stream: pointer as u64,
@@ -246,7 +240,6 @@ pub unsafe extern "C" fn telldir(pointer: *mut Stream) -> i64 {
 
 /// # Safety
 /// position was returned by telldir on this stream since its last rewinddir.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn seekdir(pointer: *mut Stream, position: i64) {
     if let Err(code) = crate::shared::number(Request::DirSeek {
         stream: pointer as u64,
@@ -258,7 +251,6 @@ pub unsafe extern "C" fn seekdir(pointer: *mut Stream, position: i64) {
 
 /// # Safety
 /// pointer is a live stream in this process's file scope.
-#[cfg_attr(not(feature = "libc-backend"), unsafe(no_mangle))]
 pub unsafe extern "C" fn rewinddir(pointer: *mut Stream) {
     if let Err(code) = crate::shared::number(Request::DirRewind {
         stream: pointer as u64,

@@ -533,7 +533,10 @@ fn uart_route() -> Option<rt::fs::Input> {
 }
 
 pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
-    if sys::thread_set_priority(main, 29, Policy::Fifo).is_err() || !ipc(process, main) {
+    // Main is a thread of relibc: the layer keeps its level (its base, to
+    // which it comes back after a lock of the layer), so the move goes
+    // through the layer.
+    if abi::threads::set_level(29).is_err() || !ipc(process, main) {
         return false;
     }
     // End the receive boost; return to base 29 so newly started clients run

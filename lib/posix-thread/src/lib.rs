@@ -122,7 +122,10 @@ pub struct Block {
     /// Not 0 while the thread is inside a cancellation point of the layer:
     /// a request of cancellation interrupts its wait then.
     pub cancel_point: AtomicU64,
-    reserved: [u64; 6],
+    /// Not 0 while the thread waits in the console phase of a read, for
+    /// the guest probes.
+    pub probe: AtomicU64,
+    reserved: [u64; 5],
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -220,7 +223,8 @@ impl Block {
             directories: ptr::null_mut(),
             thread_id: 0,
             cancel_point: AtomicU64::new(0),
-            reserved: [0; 6],
+            probe: AtomicU64::new(0),
+            reserved: [0; 5],
         }
     }
 }
