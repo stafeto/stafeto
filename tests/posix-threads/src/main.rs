@@ -152,6 +152,31 @@ fn futex_blocked(id: u64) -> bool {
 }
 
 #[cfg(not(feature = "cancel-input"))]
+static REUSED_SIGNALLED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(feature = "cancel-input"))]
+unsafe extern "C" fn reused_signal(_: i32) {
+    REUSED_SIGNALLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Made after main was joined: waits up to 1 s for its signal, then
+/// returns 0x55.
+#[cfg(not(feature = "cancel-input"))]
+unsafe extern "C" fn after_main(_: *mut c_void) -> *mut c_void {
+    let pause = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    for _ in 0..1000 {
+        if REUSED_SIGNALLED.load(Ordering::SeqCst) != 0 {
+            break;
+        }
+        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    }
+    0x55 as *mut c_void
+}
+
+#[cfg(not(feature = "cancel-input"))]
 unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     // Main exited through pthread_exit. Its join must still yield its value.
     let mut value = ptr::null_mut();
@@ -167,6 +192,31 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     unsafe { abi::allocation::free(block) };
     if unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) } < 0 {
         sys::process_exit(72);
+    }
+    // A thread made after main was joined has a block of its own: its
+    // signal and its value are its, not main's.
+    let action = abi::signals::SigAction {
+        handler: reused_signal as *const () as u64,
+        mask: 0,
+        flags: 0,
+    };
+    let mut reused = 0;
+    let mut value = ptr::null_mut();
+    if unsafe { abi::signals::sigaction(SIGUSR2, &action, ptr::null_mut()) } != 0
+        || unsafe {
+            threads::pthread_create(&mut reused, ptr::null(), Some(after_main), ptr::null_mut())
+        } != 0
+        || abi::signals::pthread_kill(reused, SIGUSR2) != 0
+        || unsafe { threads::pthread_join(reused, &mut value) } != 0
+        || value as usize != 0x55
+        || REUSED_SIGNALLED.load(Ordering::SeqCst) != 1
+    {
+        rt::println!(
+            "posix-thread-probe: after main, value {:#x}, signalled {}",
+            value as usize,
+            REUSED_SIGNALLED.load(Ordering::SeqCst)
+        );
+        sys::process_exit(73);
     }
     rt::println!("posix-thread-probe: main exit and last application thread ok");
     rt::println!("posix-thread-probe: ok");

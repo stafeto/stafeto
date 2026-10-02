@@ -1979,7 +1979,7 @@ fn normal_build_costs() -> Outcome {
 /// The round trip of `normal_build_costs` through the code of rt on both
 /// sides, as a client and a service make it: sys::send and the bytes of
 /// its reply; sys::receive, a Writer for the reply and Token::reply. The
-/// difference from the raw row is what rt costs on a round trip (#86).
+/// difference from the raw row is what rt costs on a round trip.
 fn rt_round_trip() -> Result<u64, &'static str> {
     let s = channel(QUIET)?;
     let t = spawn(0, rt_echo_until_empty, s.raw().0, HIGH, Policy::Fifo)?;

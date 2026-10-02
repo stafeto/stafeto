@@ -257,7 +257,7 @@ impl<'a> Reader<'a> {
 /// abi::MESSAGE_MAX bytes, the most a message holds. A write past it is
 /// BAD_SIZE and writes nothing. The buffer is not cleared when the writer
 /// is made: only the bytes written so far are ever read (`as_bytes`), so a
-/// reply of a few bytes costs a few stores (#86).
+/// reply of a few bytes costs a few stores.
 pub struct Writer {
     buffer: [MaybeUninit<u8>; MESSAGE_MAX],
     len: usize,
@@ -533,7 +533,7 @@ mod tests {
     /// The bytes of replies as services write them, which went out the
     /// same before the writer stopped clearing its buffer: exactly the
     /// fields written, nothing of what lay in the buffer past them, also
-    /// for a writer whose memory held another message before (#86).
+    /// for a writer whose memory held another message before.
     #[test]
     fn replies_carry_their_fields_and_nothing_more() {
         let write = |f: &dyn Fn(&mut Writer)| {

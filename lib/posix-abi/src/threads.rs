@@ -562,7 +562,9 @@ pub unsafe extern "C" fn pthread_create(
     reap();
     // Under the lock: a free slot, reserved, and the thread's number.
     let chosen = registry(|r| {
-        let slot = (0..CAPACITY)
+        // Slot 0 is the main thread's alone: its block lies in the main
+        // page (`block_of`), also once main ended and was joined.
+        let slot = (1..CAPACITY)
             .find(|&slot| r.entries[slot].is_none() && reserve(slot))
             .ok_or(EAGAIN)?;
         let id = r.next_id;

@@ -18,11 +18,12 @@
 //! - PING: the status alone (rtbench S9);
 //! - STATS: the operations that wait and the handles they hold;
 //! - FEED: one byte, after the header, for the reads that wait for one;
-//! - HOLD with a u32 of milliseconds, and a second u32 1 to hold after
-//!   the next FEED instead: after its next WAIT reply (or FEED) the
-//!   service waits that long on a channel of its own, out of `receive` on
-//!   its service channel, so that a request sent meanwhile stands in the
-//!   queue, where an interrupt can take it back;
+//! - HOLD with a u32 of milliseconds and a u32 mode: after its next WAIT
+//!   reply (mode 0) or FEED (mode 1) the service waits that long on a
+//!   channel of its own, out of `receive` on its service channel, so that
+//!   a request sent meanwhile stands in the queue, where an interrupt can
+//!   take it back; with mode 2 it waits inside the next READ_START, before
+//!   its reply, so that its client waits for that reply;
 //! - STORM with a thread handle (MANAGE): the service keeps the thread and
 //!   replies with a labelled copy of its channel with NOTIFY and TRANSFER,
 //!   which the client hands to the clock service (WATCH); then the clock
@@ -95,7 +96,7 @@ pub fn run(s: Startup) -> u64 {
         level,
         storm: None,
         hold_ms: 0,
-        hold_after_feed: false,
+        hold_mode: 0,
         hold,
         pause,
         pause_timer,
@@ -139,7 +140,7 @@ struct Long {
     /// copy of the channel that tells the service so, and its own channel
     /// and timer to wait on.
     hold_ms: u32,
-    hold_after_feed: bool,
+    hold_mode: u32,
     hold: Handle<Channel>,
     pause: Handle<Channel>,
     pause_timer: Handle<Timer>,
@@ -177,6 +178,9 @@ impl Long {
             Ok(request) => request,
             Err(status) => return Answer::Status(status),
         };
+        if self.hold_ms != 0 && self.hold_mode == 2 {
+            self.pause();
+        }
         let timed = request.max >= TIMED;
         if !timed && let Some(byte) = self.fed.take() {
             return reply(r, long::Reply::Ready(&[byte]));
@@ -197,7 +201,7 @@ impl Long {
             result: None,
         });
         self.arm_timer();
-        if self.hold_ms != 0 && !self.hold_after_feed {
+        if self.hold_ms != 0 && self.hold_mode == 0 {
             let _ = sys::notify(&self.hold, 1);
         }
         reply(r, long::Reply::Wait(key))
@@ -267,6 +271,16 @@ impl Long {
         match r.reply().u32(Status::Ok.code()) {
             Ok(()) => Answer::Reply([copy.erase()].into()),
             Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// HOLD: waits `hold_ms` on the service's own channel, then forgets it.
+    fn pause(&mut self) {
+        let due = time::ticks_to_ns(time::now()) + u64::from(self.hold_ms) * 1_000_000;
+        self.hold_ms = 0;
+        self.hold_mode = 0;
+        if sys::timer_set(&self.pause_timer, due).is_ok() {
+            let _ = sys::receive(&self.pause);
         }
     }
 
@@ -342,7 +356,7 @@ impl Service<1> for Long {
                     }
                     None => self.fed = Some(byte),
                 }
-                if self.hold_ms != 0 && self.hold_after_feed {
+                if self.hold_ms != 0 && self.hold_mode == 1 {
                     let _ = sys::notify(&self.hold, 1);
                 }
                 Answer::Status(Status::Ok)
@@ -354,7 +368,7 @@ impl Service<1> for Long {
                     return Answer::Status(Status::BadSize);
                 };
                 self.hold_ms = ms;
-                self.hold_after_feed = body.u32() == Ok(1);
+                self.hold_mode = body.u32().unwrap_or(0);
                 Answer::Status(Status::Ok)
             }
             _ => Answer::Status(Status::Ok),
@@ -372,15 +386,11 @@ impl Service<1> for Long {
     }
 
     fn notification(&mut self, n: Notice) {
-        if n.label == HOLD_LABEL && self.hold_ms != 0 {
-            let due = time::ticks_to_ns(time::now()) + u64::from(self.hold_ms) * 1_000_000;
-            self.hold_ms = 0;
-            self.hold_after_feed = false;
-            if sys::timer_set(&self.pause_timer, due).is_ok() {
-                let _ = sys::receive(&self.pause);
-            }
+        if n.label == HOLD_LABEL && self.hold_ms != 0 && self.hold_mode != 2 {
+            self.pause();
             return;
         }
+
         if n.label == STORM_LABEL {
             self.seen += 1;
             if let Some(thread) = &self.storm

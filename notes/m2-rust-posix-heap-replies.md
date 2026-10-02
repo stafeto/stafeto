@@ -1,5 +1,7 @@
 # Rust POSIX retained heap replies
 
+History: the heap worker and its reply journal are gone: the heap lives under a lock of the layer (notes/m5a-transport.md). This note records the earlier design.
+
 ## Problem and result
 
 Allocation transport previously converted every interrupted send to ENOMEM.

@@ -129,13 +129,13 @@ fn result_within(value: u64, ms: usize) -> bool {
     })
 }
 
-fn hold(ms: u32, after_feed: bool) -> bool {
+fn hold(ms: u32, mode: u32) -> bool {
     let mut w = Writer::new();
     proto_wire::Header::new(HOLD, VERSION)
         .write(&mut w)
         .unwrap();
     w.u32(ms).unwrap();
-    w.u32(u32::from(after_feed)).unwrap();
+    w.u32(mode).unwrap();
     sys::send(&service(), w.as_bytes()).is_ok()
 }
 
@@ -351,7 +351,7 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     // With SA_RESTART, a signal that takes back the "take" after the bit
     // (the service holds 50 ms after FEED) sends it again: the service
     // told once and tells no second time, and the read gets its byte.
-    if !handler(SA_RESTART) || !hold(50, true) {
+    if !handler(SA_RESTART) || !hold(50, 1) {
         return failed(685);
     }
     let Some(id) = waiting_reader() else {
@@ -403,5 +403,40 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         return failed(689);
     }
     rt::println!("long-op-probe: a handler that reads keeps the interrupted read's EINTR");
+    // A signal while the reader waits for the reply of its "start" (the
+    // service holds 50 ms inside it): its handler runs on the way back
+    // from that reply, outside `receive`, and the read ends with EINTR
+    // before it waits.
+    if !handler(0) || !hold(50, 2) {
+        return failed(690);
+    }
+    RESULT.store(0, Ordering::SeqCst);
+    let mut id = 0;
+    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(reader), ptr::null_mut()) } != 0
+    {
+        return failed(690);
+    }
+    let native = unsafe { threads::probe_native(id) }.expect("reader handle");
+    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let awaiting =
+        sys::thread_info(&native).is_ok_and(|i| i.state == rt::abi::ThreadState::AwaitingReply);
+    if !awaiting
+        || api::pthread_kill(id, SIGUSR1) != 0
+        || !result_within(0x1000 + EINTR as u64, 1000)
+    {
+        rt::println!(
+            "long-op-probe: start awaited {}, result {:#x}",
+            awaiting,
+            RESULT.load(Ordering::SeqCst)
+        );
+        return failed(691);
+    }
+    joined(id);
+    if stats(&channel) != (0, 0)
+        || unsafe { api::sigaction(SIGUSR1, &restored, ptr::null_mut()) } != 0
+    {
+        return failed(691);
+    }
+    rt::println!("long-op-probe: a signal in the reply of start ends the read with EINTR");
     true
 }

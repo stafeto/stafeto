@@ -25,7 +25,9 @@
 //! Wakeups are not lost: the waiter counts itself in the bucket before it
 //! compares the word, the waker changed the word before it reads the count
 //! (SeqCst on both sides), and a notification stays in the slot of the
-//! channel until the waiter's `receive`.
+//! channel until the waiter's `receive`. A WAKE left in the slot (after
+//! `resume_wait`, or after a wait that ended by its deadline) gives the
+//! next wait a spurious wakeup, which `futex_wait` allows: harmless.
 
 #![no_std]
 
@@ -39,8 +41,8 @@ use rt::sys;
 pub const EINVAL: i32 = 22;
 pub const EAGAIN: i32 = 11;
 pub const ETIMEDOUT: i32 = 110;
-/// The clocks of a deadline (spec 2, 3.4): MONOTONIC now; the patch of 5h
-/// (#150) adds the clock of the caller without changing the call.
+/// The clocks of a deadline (spec 2, 3.4): MONOTONIC now; the clock patch
+/// of relibc adds the clock of the caller without changing the call.
 pub const CLOCK_MONOTONIC: u32 = 1;
 
 /// Bits of the slot of label 0 of a thread's channel.
@@ -180,11 +182,11 @@ fn lock(bucket: &'static Bucket) -> Held<'static> {
             set_level(block, ceiling);
         }
     }
-    // One processor (spec 2, 3.4; #8): the holder runs at the ceiling and
+    // One processor (spec 2, 3.4; until SMP): the holder runs at the ceiling and
     // holds no second lock of a bucket, so only a holder preempted before
     // its raise can make this loop turn, and yielding runs it. The step of
     // rule 3 of the ABI for several processors (16 tries, then the node on
-    // the stack, a bit and a look again) comes with #8; a build for more
+    // the stack, a bit and a look again) comes with SMP; a build for more
     // than one processor must not take this loop as it is: a debug build
     // stops when the loop turns more than a holder preempted before its
     // raise can make it.
@@ -198,7 +200,7 @@ fn lock(bucket: &'static Bucket) -> Held<'static> {
             turns += 1;
             assert!(
                 turns < 64,
-                "the lock of a bucket yields for one processor only (#8)"
+                "the lock of a bucket yields for one processor only, until SMP"
             );
         }
         // The holder is a thread of this process at the ceiling, preempted:

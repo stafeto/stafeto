@@ -7,7 +7,7 @@
 //! giving one up without waiters make no call of the kernel. The owner's
 //! pthread number serves the recursive and error-checking kinds. Waiters
 //! wake by level, first come first among equals; a waiter whose level
-//! changes while it waits keeps its place until inheritance comes (5h).
+//! changes while it waits keeps its place until priority inheritance comes.
 
 use crate::{constants::*, tls};
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

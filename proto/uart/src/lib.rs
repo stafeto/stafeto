@@ -416,7 +416,7 @@ mod tests {
 
     /// The bytes of the driver's messages as it and its clients write
     /// them, from a writer made again over a longer message: the fields
-    /// and nothing past them (#86), whose reader takes them back.
+    /// and nothing past them, whose reader takes them back.
     #[test]
     fn messages_carry_their_fields_and_nothing_more() {
         let write = |f: &dyn Fn(&mut Writer)| {

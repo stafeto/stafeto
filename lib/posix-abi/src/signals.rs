@@ -65,7 +65,7 @@ fn actions<R>(f: impl FnOnce(&mut posix_signals::Actions) -> R) -> R {
 /// inside it.
 fn action(signal: i32) -> SigAction {
     let words = &PUBLISHED[signal as usize - 1];
-    loop {
+    for _ in 0..16 {
         let before = GENERATION.load(Ordering::Acquire);
         if before & 1 == 0 {
             let action = SigAction {
@@ -80,6 +80,9 @@ fn action(signal: i32) -> SigAction {
         }
         let _ = sys::yield_now();
     }
+    // A writer below the reader (no ceiling yet, a thread without a block)
+    // gets the processor only through the lock.
+    actions(|table| table.get(signal).expect("a signal of the table"))
 }
 
 /// Whether `action` of `signal` ignores it.
@@ -372,13 +375,19 @@ fn wait(set: SigSet, timeout: Option<posix_types::Timespec>, start: u64) -> Resu
         if let Some(signal) = take() {
             break Ok(signal);
         }
+        // As in a sleep: an entry between the timer and `receive` stays
+        // pending and makes `receive` return at once.
+        let guard = rt::upcall::defer_entries().expect("sigwait entry deferral");
         if let Some(deadline) = deadline {
             if rt::time::reached(deadline) {
+                drop(guard);
                 break Err(EAGAIN);
             }
             let _ = sys::timer_set(&timer, deadline);
         }
-        match sys::receive(&channel) {
+        let got = sys::receive(&channel);
+        drop(guard);
+        match got {
             Ok(sys::Received::Notification {
                 source: Source::Unlabeled,
                 bits,
@@ -675,14 +684,14 @@ fn sys_exit_signal(signal: i32) -> ! {
     rt::sys::process_exit((128 + signal) as u64)
 }
 
-/// Whether pthread `thread` waits in sigwait now, for the guest probes.
-/// Runs `run` holding the lock of the actions, which every delivery
-/// takes, for the guest probes.
+/// Runs `run` holding the lock of the actions, which a delivery takes to
+/// apply SA_RESETHAND, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_hold_actions(run: impl FnOnce()) {
     let _guard = ACTIONS_LOCK.lock();
     run();
 }
+/// Whether pthread `thread` waits in sigwait now, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_waiting(thread: u64) -> Result<bool, i32> {
     threads::probe_block(thread)

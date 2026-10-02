@@ -1,5 +1,7 @@
 # Rust POSIX retained file results
 
+History: the file worker and its reply journal are gone (notes/m5a-transport.md). This note records the earlier design.
+
 ## Problem and result
 
 An interrupted file-owner request could lose a completed read, write or open.

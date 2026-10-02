@@ -298,6 +298,12 @@ unsafe fn interrupt_if(
             if !decide(&mut *t.as_ptr())? {
                 return Ok(None);
             }
+            // `decide` lets only a send or a receive through: the wait
+            // for a reply is never taken back (spec 6.1).
+            debug_assert!(matches!(
+                t.as_ref().waits,
+                Some(Wait::Receive(_) | Wait::Send(_))
+            ));
             let waited = channel::withdraw(t, k);
             syscall::set_result(t, Err(Error::Interrupted));
             k.s.wake(t);

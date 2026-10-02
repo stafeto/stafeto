@@ -1,5 +1,7 @@
 # Rust POSIX retained clock replies
 
+History: the clock service has no reply journal any more: the kernel answers an accepted request once (notes/m5a-transport.md). This note records the earlier design.
+
 ## Problem and result
 
 The clock service retained only its most recent observation. A handler could

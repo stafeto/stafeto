@@ -100,22 +100,26 @@ Bounded paths with interrupts masked are listed in
 ABI 1 for AArch64 LP64 is experimental.
 `python3 tools/build-posix-sysroot.py --probe` stages headers and
 `lib/libc.a` under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links
-the C probe. No real program uses the layer yet; implementation is paused.
+the C probe. No real program uses the layer yet. Since step 5a the layer
+has no helper threads; [m5a-transport](../notes/m5a-transport.md) says how
+it works and where it stops.
 
 | Area | Interfaces | Notes |
 |---|---|---|
 | Paths and files | working directory, `open`/`read`/`write`, `lseek` with 64-bit offsets, `dup`/`dup2`/`dup3`, `stat`/`fstat`/`lstat` | [fs](../notes/m2-rust-posix-fs.md), [seek](../notes/m2-rust-posix-seek.md), [fds](../notes/m2-rust-posix-fds.md), [stat](../notes/m2-rust-posix-stat.md) |
 | Directories | `opendir`, `fdopendir`, `readdir`, `closedir`, `dirfd`, rewind and position cookies, `scandir`, `alphasort` | [dir](../notes/m2-rust-posix-dir.md), [scan](../notes/m2-rust-posix-scan.md) |
 | C runtime | startup, `errno` per thread, `malloc` family, C/POSIX locale, `strcoll`, `strxfrm`, `qsort`, `qsort_r` | [abi](../notes/m2-rust-posix-abi.md), [heap](../notes/m2-rust-posix-heap.md) |
-| Shared state | one owner for file state across threads, console waits outside it, value messages | [shared](../notes/m2-rust-posix-shared.md), [input](../notes/m2-rust-posix-input.md), [messages](../notes/m2-rust-posix-messages.md) |
-| Interruption | IPC interruption and `EINTR`, UART read recovery, nested cancellation windows, results kept across nested entry | [interrupt](../notes/m2-rust-posix-interrupt.md), [uart-cancel](../notes/m2-rust-posix-uart-cancel.md), [cancel-reentry](../notes/m2-rust-posix-cancel-reentry.md), [file](../notes/m2-rust-posix-file-replies.md), [thread](../notes/m2-rust-posix-thread-replies.md), [clock](../notes/m2-rust-posix-clock-replies.md), [heap](../notes/m2-rust-posix-heap-replies.md), [borrow guards](../notes/m2-interruptible-borrow-guards.md) |
+| Thread block and TCB | a TCB in relibc's layout per thread, the layer's block in it: mask, pending signals, cancellation, the thread's channel and timer, its node of a wait by address | [m5a](../notes/m5a-transport.md) |
+| Waits and locks | a table of waits by address (`posix-sync`): no kernel call without waiters; the layer's locks, the heap's, the files', the threads' and the actions', raise their holder to the process ceiling; a signal inside a section comes at its end | [m5a](../notes/m5a-transport.md) |
+| Shared state | the process's files and heap under the layer's locks, in the calling thread; console reads and writes outside the files' lock | [m5a](../notes/m5a-transport.md), [input](../notes/m2-rust-posix-input.md), [messages](../notes/m2-rust-posix-messages.md) |
+| Interruption | IPC interruption and `EINTR`; an accepted request is answered once (no reply journals); console reads as long operations in two steps that a signal cancels, `SA_RESTART`; nested cancellation windows | [m5a](../notes/m5a-transport.md), [interrupt](../notes/m2-rust-posix-interrupt.md), [cancel-reentry](../notes/m2-rust-posix-cancel-reentry.md), [borrow guards](../notes/m2-interruptible-borrow-guards.md); history: [shared owner](../notes/m2-rust-posix-shared.md), [uart-cancel](../notes/m2-rust-posix-uart-cancel.md), [file](../notes/m2-rust-posix-file-replies.md), [thread](../notes/m2-rust-posix-thread-replies.md), [clock](../notes/m2-rust-posix-clock-replies.md), [heap](../notes/m2-rust-posix-heap-replies.md) |
 | Threads | `pthread_create`/`join`/`detach`/`exit`, deferred cancellation and cleanup handlers, keys, `pthread_once`, 64 live threads | [threads](../notes/m2-rust-posix-threads.md), [cancel](../notes/m2-rust-posix-deferred-cancel.md), [keys](../notes/m2-rust-posix-thread-data.md), [once](../notes/m2-rust-posix-once.md), [capacity](../notes/m2-rust-posix-thread-capacity.md) |
 | Mutexes and time | NORMAL, ERRORCHECK and RECURSIVE mutexes, `pthread_mutex_timedlock`, `pthread_mutex_clocklock`, `clock_gettime`/`getres`/`settime`, `nanosleep`, `clock_nanosleep` | [mutex](../notes/m2-rust-posix-mutex.md), [timed](../notes/m2-rust-posix-timed-mutex.md), [clocks](../notes/m2-rust-posix-clocks.md), [sleep](../notes/m2-rust-posix-sleep.md) |
 | Signals | `sigaction`, masks, pending sets, `raise`, `pthread_kill`, `sigwait`, `sigwaitinfo`, `sigtimedwait`, `SA_SIGINFO` with a real interrupted context; host-tested pending-signal queues | [upcall](../notes/m2-native-upcall.md), [actions](../notes/m2-rust-posix-signal-actions.md), [sigwait](../notes/m2-rust-posix-sigwait.md), [sigwaitinfo](../notes/m2-rust-posix-sigwaitinfo.md), [context](../notes/m2-rust-posix-handler-context.md), [sigtimedwait](../notes/m2-rust-posix-sigtimedwait.md), [queues](../notes/m2-rust-posix-signal-queues.md) |
 | Processes | `getpid`, `getppid`, real, effective and saved UID/GID (eight calls) through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
 
 Not there yet: `exec`, `fork`, `waitpid`, pipes, process-directed and
-queued signals, `SA_RESTART`, conditions, semaphores, POSIX timers,
+queued signals, `SA_RESTART` beyond console reads, conditions, semaphores, POSIX timers,
 stdio, `termios`, asynchronous cancellation, general ELF TLS. BusyBox
 still uses the Picolibc bridge; see [m2-ram-posix](../notes/m2-ram-posix.md).
 
@@ -155,3 +159,25 @@ Thread-Metric results, and virtual machines do not give a physical
 worst-case latency. On Apple VZ the benchmark runs as a client of `init`
 beside the Virtio console's driver, which shows its lines, at priority 60
 with a 50 ms timer above every thread of the benchmark.
+
+### rtbench 2
+
+`cargo xtask rtbench --minutes N` runs rtbench 2 for N minutes on HVF,
+then on Apple VZ; `cargo xtask rtbench --short` runs one round on TCG
+(`ci` does). It is a C program over pthreads (`tests/rtbench-posix`)
+beside a hostile load (`tests/rtbench-load`: a worker that makes and
+kills processes of 128 threads and large memory objects). Its rows: S1 a
+mutex without a rival, S2 `futex_wake` without waiters, S3 a mutex with
+rivals at levels 10, 20 and 30, S4 `malloc`/`free` and `dup`/`close`, S5
+`pthread_kill` to a sleeping, a reading and a busy thread, S6 a `read` of
+ready data, S7 an absolute sleep of 1 ms, S8 a pair waiting by address
+and a waiter in the same bucket, S9 a round trip to a service. Each row
+gives n, min, p50, p99, max in ns and kernel calls per operation, with a
+histogram, in `target/measure/rtbench-<machine>.txt`.
+
+10 minutes at 8c254c0 against the same run before step 5a (bf764f6),
+p50 on HVF and VZ: S1 3,327 → 0 ns with 12 → 0 kernel calls; S4
+`malloc`/`free` 1,215 → 335 ns, `dup`/`close` 2,047 → 423 ns; S5 4,351 →
+463 ns; S6 959 → 1,343 ns (the console's read in two steps); S3 rival at
+20: 6,783 → 98,303 ns, since waiters now take the mutex by level and the
+rival at 30 goes first.

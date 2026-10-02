@@ -7,7 +7,7 @@
 //! or an entry with cancellation requested ends it at its cancellation
 //! point. An absolute deadline on CLOCK_REALTIME becomes a monotonic
 //! instant, checked on the calendar once it passed; a calendar set forward
-//! does not wake the sleep earlier (5h, #146).
+//! does not wake the sleep earlier, until the clock patch of relibc.
 use super::{cancel, mutex, own_block};
 use crate::{constants::*, fail};
 use core::sync::atomic::Ordering;
@@ -56,8 +56,14 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
             at = target(deadline)?;
             continue;
         }
+        // An entry between the timer and `receive` stays pending and makes
+        // `receive` return at once; a handler that sleeps itself cannot
+        // take this wait's timer meanwhile.
+        let guard = rt::upcall::defer_entries().expect("sleep entry deferral");
         let _ = sys::timer_set(&timer, at);
-        match sys::receive(&channel) {
+        let got = sys::receive(&channel);
+        drop(guard);
+        match got {
             Ok(sys::Received::Notification {
                 source: Source::Unlabeled,
                 bits,

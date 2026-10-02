@@ -393,7 +393,7 @@ pub fn inline_words(bytes: &[u8]) -> [u64; 8] {
     let mut words = [0; 8];
     let (whole, tail) = bytes.as_chunks::<8>();
     // Whole words as loads, the tail byte by byte: no call of memcpy for
-    // a few bytes (#86).
+    // a few bytes.
     for (word, chunk) in words.iter_mut().zip(whole) {
         *word = u64::from_le_bytes(*chunk);
     }

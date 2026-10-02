@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from `m3k-proc` at eeb97d1.
+Numbers below are from `m5a-transport` at 047fa12.
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -70,12 +70,17 @@ interface, implemented in Rust with a C ABI and a versioned sysroot
 descriptors, files, `stat` and directories; the heap and the C locale;
 pthreads with cancellation, keys, `once` and mutexes; clocks and sleep;
 signal actions, masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and
-`SA_SIGINFO`; process IDs and credentials. Guest probes check them on QEMU
-and Apple VZ. The layer is a work in progress and paused: no real program
+`SA_SIGINFO`; process IDs and credentials. The layer runs without helper
+threads: a single-threaded program has one thread; mutexes, `once` and joins
+wait by address in the layer with no kernel call when uncontended; the heap,
+the descriptor table and the table of threads live under the layer's locks,
+whose holders run at the process ceiling; a read of the console is a long
+operation in two steps that a signal interrupts. Guest probes check them on
+QEMU and Apple VZ. The layer is a work in progress and paused: no real program
 uses it yet, and `ash` still runs on Picolibc. Details are in
 [docs/status.md](docs/status.md).
 
-**Tests.** The kernel test image runs 179 tests (194 under `-icount`),
+**Tests.** The kernel test image runs 182 tests (197 under `-icount`),
 the EL0 test `init` runs 228 and `kcore` has 406 host tests; `cargo xtask
 ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
 Apple silicon.
@@ -170,8 +175,8 @@ Bounded kernel paths and their costs:
 | Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
-| POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | 🚧 |
-| POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | ⬜ |
+| POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
+| POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | 🚧 |
 | POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | ⬜ |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then conditions, semaphores, timers, `sigqueue` | ⬜ |

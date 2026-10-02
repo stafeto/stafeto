@@ -48,7 +48,7 @@ pub fn probe_hold(run: impl FnOnce()) {
 }
 
 /// Request entry while the next local operation holds its file references.
-/// kind 1 selects value replies, kind 2 selects numeric replies. The target
+/// kind 1 selects operations with a reply, kind 2 numeric operations. The target
 /// handle must stay live until that call returns; only one probe may be armed.
 #[cfg(feature = "thread-probe")]
 pub fn probe_local_borrow(kind: u64, target: &Handle<rt::handle::Thread>) {

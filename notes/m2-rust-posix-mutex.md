@@ -1,5 +1,7 @@
 # Rust POSIX mutex ownership
 
+History: the mutex no longer goes through an owner thread: it waits by address in the layer (notes/m5a-transport.md). This note records the earlier design.
+
 ## Interfaces and layout
 
 The GPL-3.0-or-later Rust C ABI adds pthread_mutex_init/destroy,

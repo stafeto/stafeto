@@ -307,7 +307,7 @@ pub(super) fn run() -> bool {
     {
         return failed(212);
     }
-    // A calendar set forward wakes no sleep before 5h (#146): an interrupt
+    // A calendar set forward wakes no sleep until the clock patch of relibc: an interrupt
     // ends this one.
     let native = unsafe { threads::probe_native(id) }.unwrap();
     sys::thread_interrupt(&native).unwrap();

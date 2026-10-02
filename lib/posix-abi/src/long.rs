@@ -107,6 +107,10 @@ pub fn run(
     keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
     out: &mut [u8],
 ) -> Result<usize, i32> {
+    // From before the first request: a handler that ran on the way back
+    // from a reply, outside `receive`, leaves its mark for the wait.
+    let block = crate::threads::own_block();
+    let _outer = OuterRestart::enter(&block.flags);
     let key = match call(service, start, None, out)? {
         (long::READY, n, _) => return Ok(n),
         (long::WAIT, _, key) => key,
@@ -117,11 +121,9 @@ pub fn run(
         keyed(cancel, key, &mut w).map(|()| w)
     };
     let take = request(false).map_err(|_| EIO)?;
-    let block = crate::threads::own_block();
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
-    let _outer = OuterRestart::enter(&block.flags);
     // The first take brings the labelled copy: the service keeps it while
     // the operation waits. A take the kernel took back left the service
     // without it, and the next one brings a new copy.
@@ -142,7 +144,17 @@ pub fn run(
                 Err(error) => break 'wait Some(error),
             }
         }
-        match sys::receive(&channel) {
+        // An entry that came outside `receive` ends the wait before it
+        // blocks; one that comes from here on stays pending and makes
+        // `receive` return at once.
+        let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
+        if ending(&block.flags) {
+            drop(guard);
+            break 'wait None;
+        }
+        let got = sys::receive(&channel);
+        drop(guard);
+        match got {
             Ok(sys::Received::Notification {
                 source: Source::Session,
                 label,

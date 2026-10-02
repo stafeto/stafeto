@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Directory streams backed by real process descriptors. The initial ABI
-//! scope reserves OPEN_MAX stable stream objects; its single owner serializes
-//! calls. Process scopes route calls to the shared owner. Callers still serialize
-//! reads and closure of the same stream while using its escaped entry buffer.
+//! Directory streams backed by real process descriptors. A scope reserves
+//! OPEN_MAX stable stream objects; the process's streams live under the
+//! lock of its files (shared.rs). Callers still serialize reads and closure
+//! of the same stream while using its escaped entry buffer.
 
 use crate::{constants::*, error, fail, fd, path};
 use core::cell::UnsafeCell;

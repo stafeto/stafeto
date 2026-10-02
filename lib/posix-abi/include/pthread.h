@@ -7,7 +7,7 @@
 #include <stafeto/abi.h>
 #include <sys/types.h>
 #include <time.h>
-#define PTHREAD_MUTEX_INITIALIZER { 0x53544d5800000003ULL, 0, 0, 0 }
+#define PTHREAD_MUTEX_INITIALIZER { 0x53544d5800000003ULL, 0, 0, 0, 0 }
 int pthread_mutex_init(pthread_mutex_t *mutex, const pthread_mutexattr_t *attr);
 int pthread_mutex_destroy(pthread_mutex_t *mutex);
 int pthread_mutex_lock(pthread_mutex_t *mutex);
