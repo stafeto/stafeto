@@ -1958,15 +1958,9 @@ fn ash_dialog() -> Result<(), String> {
         return Err("ash long listing is incomplete".into());
     }
     let elf = image_elf(&target_dir(), "boot-ash-dialog.img", "busybox-probe");
+    // Information only: a program's size has no bound, the kernel's has.
     let text = text_size(&elf)?;
-    println!(
-        "BusyBox ash interactive guest dialog passed; .text {text} bytes, limit {BUSYBOX_TEXT_LIMIT}"
-    );
-    if text > BUSYBOX_TEXT_LIMIT {
-        return Err(format!(
-            "BusyBox's .text is {text} bytes, over {BUSYBOX_TEXT_LIMIT}: the growth wants its analysis (llvm-nm --size-sort)"
-        ));
-    }
+    println!("BusyBox ash interactive guest dialog passed; .text {text} bytes");
     Ok(())
 }
 
@@ -3448,12 +3442,10 @@ fn hvf_host() -> Result<(), String> {
     )
 }
 
-/// The test hooks of the reply journals went with the journals (spec 6.1):
-/// no Cargo.toml of the workspace names the feature `transport-probe`.
 /// The names the layer's crates (`lib/posix-*`) may give the linker: the
 /// platform's `stafeto_*` (and its `STAFETO_PLATFORM_ABI`) and posix-crt's
-/// `__rt_main`. A C name there would
-/// stand in for relibc's, or clash with it (5a′, Т5).
+/// `__rt_main`. A C name there would stand in for relibc's, or clash with
+/// it (step 5a′).
 fn layer_symbol_allowed(name: &str) -> bool {
     name.to_ascii_lowercase().starts_with("stafeto_") || name == "__rt_main"
 }
@@ -3584,11 +3576,6 @@ fn layer_data_of(listing: &str) -> u64 {
         .sum()
 }
 
-/// The bound of the `.text` of the BusyBox probe of the `ash` dialog: 246
-/// KB at 5a′ (relibc for size), so that growth does not creep in
-/// unnoticed.
-const BUSYBOX_TEXT_LIMIT: u64 = 256 * 1024;
-
 /// The size of `.text` in the ELF `elf` (`llvm-size -A`).
 fn text_size(elf: &Path) -> Result<u64, String> {
     let output = stdout_of(Command::new(llvm_tool("llvm-size")?).arg("-A").arg(elf))?;
@@ -3601,9 +3588,11 @@ fn text_size(elf: &Path) -> Result<u64, String> {
         .ok_or_else(|| format!("{}: no .text", elf.display()))
 }
 
-/// The bound of the layer's `.data` + `.bss` in a program (5a′, Т5).
+/// The bound of the layer's `.data` + `.bss` in a program (step 5a′).
 const LAYER_DATA_LIMIT: u64 = 16 * 1024;
 
+/// The test hooks of the reply journals went with the journals (spec 6.1):
+/// no Cargo.toml of the workspace names the feature `transport-probe`.
 fn no_transport_probe() -> Result<(), String> {
     let mut found = Vec::new();
     let mut paths = vec![root()];

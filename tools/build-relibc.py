@@ -8,9 +8,10 @@ stafeto on aarch64-unknown-linux-gnu), into target/relibc/sysroot:
 include/ (cbindgen's headers, relibc's include/ and openlibm's headers)
 and lib/libc.a. The fork carries its dependencies in vendor/, so the build
 itself runs with --frozen --offline; the first run fetches the commit, the
-pinned nightly toolchain with rust-src and cbindgen. A stamp of the
-commit, the toolchain, the flags and the cbindgen version makes a second
-run do nothing."""
+pinned nightly toolchain with rust-src and cbindgen. relibc builds with
+its own release profile (level 3): a program's size has no bound, its
+speed counts (rtbench). A stamp of the commit, the toolchain, the flags,
+clang and the cbindgen version makes a second run do nothing."""
 
 import os
 from pathlib import Path
@@ -20,7 +21,7 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-COMMIT = "5c4a1bdc30d3ef77abad44c88bf3fe0594aaad6e"
+COMMIT = "7fcea62816913874844b20498226dfa6ca528d1b"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
@@ -33,12 +34,6 @@ BUILD_STD = "core,alloc,compiler_builtins"
 # The C math functions from the Rust libm crate (MIT), declared by
 # openlibm's headers.
 FEATURES = "math_libm"
-# relibc's release profile for size: its default (level 3, 16 units, no
-# LTO) adds about 64 KB to a program (BusyBox) over these.
-PROFILE = {"CARGO_PROFILE_RELEASE_OPT_LEVEL": "s",
-           "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1",
-           "CARGO_PROFILE_RELEASE_LTO": "fat"}
-
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "relibc"
 SOURCE = WORK / "source"
@@ -46,9 +41,7 @@ BUILD = WORK / "build"
 SYSROOT = WORK / "sysroot"
 STAMP = WORK / "stamp"
 TOOLS = ROOT / "target" / "tools"
-CONFIG = (f"{COMMIT} {TOOLCHAIN} {TARGET} {RUSTFLAGS} {CFLAGS} build-std={BUILD_STD}"
-          f" features={FEATURES} cbindgen {CBINDGEN}"
-          f" profile {' '.join(f'{k}={v}' for k, v in sorted(PROFILE.items()))}\n")
+CARGO_HOME = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
 
 
 def run(*args, cwd=None, env=None, stdout=None) -> subprocess.CompletedProcess:
@@ -122,15 +115,35 @@ def cbindgen(env: dict) -> Path:
     return binary
 
 
+def remap(env: dict) -> tuple[str, str]:
+    """RUSTFLAGS and CFLAGS with the build's directories (the source, the
+    toolchain's library sources, CARGO_HOME, the build directory) mapped
+    to fixed names: libc.a then holds no path of this machine."""
+    sysroot = output("rustup", "run", TOOLCHAIN, "rustc", "--print", "sysroot", env=env)
+    pairs = [(BUILD, "/build"), (SOURCE, "/relibc"), (Path(sysroot), "/rust"),
+             (CARGO_HOME, "/cargo")]
+    rust = " ".join(f"--remap-path-prefix={path}={name}" for path, name in pairs)
+    c = " ".join(f"-ffile-prefix-map={path}={name}" for path, name in pairs)
+    return f"{RUSTFLAGS} {rust}", f"{CFLAGS} {c}"
+
+
+def config(env: dict) -> str:
+    """What the stamp holds: a change of any of it builds relibc again."""
+    rustflags, cflags = remap(env)
+    clang = output(llvm("clang"), "--version", env=env).splitlines()[0]
+    return (f"{COMMIT} {TOOLCHAIN} {TARGET} {rustflags} {cflags} build-std={BUILD_STD}"
+            f" features={FEATURES} cbindgen {CBINDGEN} {clang}\n")
+
+
 def build(env: dict) -> None:
+    rustflags, cflags = remap(env)
     env = dict(env)
     env.update({
         "CARGO_TARGET_DIR": str(BUILD),
-        "RUSTFLAGS": RUSTFLAGS,
+        "RUSTFLAGS": rustflags,
         "CC_aarch64_unknown_linux_gnu": str(llvm("clang")),
         "AR_aarch64_unknown_linux_gnu": str(llvm("llvm-ar")),
-        "CFLAGS_aarch64_unknown_linux_gnu": CFLAGS,
-        **PROFILE,
+        "CFLAGS_aarch64_unknown_linux_gnu": cflags,
     })
     library = WORK / "librelibc.a"
     run("cargo", f"+{TOOLCHAIN}", "rustc", "--frozen", "--offline", "--release", "--target",
@@ -171,18 +184,19 @@ def headers(env: dict, generator: Path) -> None:
 
 def main() -> None:
     library = SYSROOT / "lib" / "libc.a"
-    if library.exists() and STAMP.exists() and STAMP.read_text() == CONFIG:
+    env = clean_env()
+    toolchain(env)
+    wanted = config(env)
+    if library.exists() and STAMP.exists() and STAMP.read_text() == wanted:
         print(f"relibc ready: {SYSROOT}")
         return
-    env = clean_env()
     WORK.mkdir(parents=True, exist_ok=True)
     STAMP.unlink(missing_ok=True)
     fetch(env)
-    toolchain(env)
     generator = cbindgen(env)
     build(env)
     headers(env, generator)
-    STAMP.write_text(CONFIG)
+    STAMP.write_text(wanted)
     print(f"relibc ready: {SYSROOT}")
 
 
