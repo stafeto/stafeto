@@ -38,9 +38,15 @@
 //! READ_AT and INFO_FD of fd 0 alone and reads that file. PERMISSION
 //! through any other session or for any other identity; NO_ENTRY,
 //! ACCESS_DENIED, NOT_DIRECTORY.
-//! CLONE: header alone, through a session of a client: reply status and
-//! one handle, a new session (SEND, TRANSFER) of the service's own label
-//! with no open descriptions, for a child of the client (5c).
+//! CLONE: header, a count u32 (at most 32) and as many descriptors u32 of
+//! the session, through a session of a client: reply status and one
+//! handle, a new session (SEND, TRANSFER) of the service's own label
+//! whose descriptors of the same numbers share the open descriptions,
+//! their offsets and access modes, for a child of the client (5c); BAD_FD
+//! for a number of no descriptor.
+//! WRITE_AT: header, fd u32, offset u64, bytes. Reply: status, count u32.
+//! The bytes go at the offset of the file; the position of the open
+//! description stays where it is (the model of pwrite).
 
 #![cfg_attr(not(test), no_std)]
 
@@ -154,6 +160,7 @@ pub enum Method {
     ReadAt = 13,
     OpenExec = 14,
     Clone = 15,
+    WriteAt = 16,
 }
 
 impl Method {
@@ -178,12 +185,13 @@ impl Method {
             13 => Some(Self::ReadAt),
             14 => Some(Self::OpenExec),
             15 => Some(Self::Clone),
+            16 => Some(Self::WriteAt),
             _ => None,
         }
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 pub fn valid_path(path: &[u8]) -> Result<&str, Status> {
     if path.is_empty() || path.len() > MAX_PATH || path[0] != b'/' || path.contains(&0) {
@@ -218,7 +226,7 @@ mod tests {
 
     #[test]
     fn every_method_number_round_trips_and_is_listed() {
-        for number in 0..=16u16 {
+        for number in 0..=17u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(method) = method {

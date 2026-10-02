@@ -97,6 +97,7 @@ fn main(_: u64) -> u64 {
         notary: None,
         given: 0,
         level,
+        births: [None; BIRTHS],
     };
     let _ = rt::service::run::<Fs, SESSIONS, 0>(&channel, &mut fs, config);
     4
@@ -114,7 +115,15 @@ struct Fs {
     /// The sessions the service gave itself so far.
     given: u64,
     level: u8,
+    /// The descriptors of the sessions Clone made that sent nothing yet,
+    /// by their labels: the session's first request takes them, and the
+    /// end of its last copy closes them.
+    births: [Option<(u64, Fds)>; BIRTHS],
 }
+
+/// Clones whose sessions sent nothing yet, at most: past them, Clone is
+/// LIMIT_REACHED.
+const BIRTHS: usize = 8;
 
 impl Fs {
     /// The notary session, asked of init once.
@@ -281,11 +290,76 @@ fn value(r: &mut Request<'_>, number: u32) -> Answer {
     Answer::Reply(Outgoing::new())
 }
 
+impl Fs {
+    /// CLONE with a list of descriptors of the session `fds` (count u32,
+    /// then each u32): a session of the service's own label whose
+    /// descriptors of the same numbers share their open descriptions;
+    /// BAD_FD for a number of none, LIMIT_REACHED with BIRTHS clones that
+    /// sent nothing yet.
+    fn clone_session(&mut self, fds: &Fds, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let mut list = [0u32; 32];
+        let count = body.u32().unwrap_or(0) as usize;
+        if count > list.len() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        for fd in &mut list[..count] {
+            let Ok(n) = body.u32() else {
+                return Answer::Status(Status::BadSize);
+            };
+            *fd = n;
+        }
+        if body.finish().is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        let Some(free) = self.births.iter().position(Option::is_none) else {
+            return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+        };
+        let mut child = match self.ram.clone_fds(fds, &list[..count]) {
+            Ok(child) => child,
+            Err(code) => return status(code),
+        };
+        let label = proto_fs::OWN | self.given;
+        match self.session(label) {
+            Ok(session) => {
+                if r.reply().u32(0).is_err() {
+                    self.ram.release(&mut child);
+                    return Answer::Status(Status::BadSize);
+                }
+                self.births[free] = Some((label, child));
+                Answer::Reply([session.erase()].into())
+            }
+            Err(e) => {
+                self.ram.release(&mut child);
+                Answer::Status(Status::Kernel(e))
+            }
+        }
+    }
+}
+
 impl Service<0> for Fs {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = METHODS;
     const PLACED: usize = 1;
     type Data = Fds;
+
+    /// The client of `s` went: its descriptors close.
+    fn gone(&mut self, s: &mut Session<Fds, 0>) {
+        self.ram.release(&mut s.data);
+    }
+
+    /// The last copy of a session Clone made went before it sent anything:
+    /// the descriptors it was born with close.
+    fn closed(&mut self, label: u64) {
+        if let Some(birth) = self
+            .births
+            .iter_mut()
+            .find(|b| b.is_some_and(|(l, _)| l == label))
+            && let Some((_, mut fds)) = birth.take()
+        {
+            self.ram.release(&mut fds);
+        }
+    }
 
     /// The image sessions share place 0: they hold nothing.
     fn place(&self, label: u64) -> Option<usize> {
@@ -296,6 +370,19 @@ impl Service<0> for Fs {
         if let Some(entry) = proto_fs::image_entry(r.label()) {
             return self.image(entry, r);
         }
+        if !s.data.claimed {
+            // The first request of a session Clone made takes its
+            // descriptors.
+            let label = r.label();
+            if let Some(birth) = self
+                .births
+                .iter_mut()
+                .find(|b| b.is_some_and(|(l, _)| l == label))
+            {
+                s.data = birth.take().expect("a birth").1;
+            }
+            s.data.claimed = true;
+        }
         if r.method() == Method::OpenExec as u16 {
             return self.open_exec(r);
         }
@@ -305,21 +392,7 @@ impl Service<0> for Fs {
         }
         let mut body = r.body();
         match Method::from_number(r.method()) {
-            Some(Method::Clone) => {
-                if body.finish().is_err() || !r.handles.is_empty() {
-                    return Answer::Status(Status::BadSize);
-                }
-                let label = proto_fs::OWN | self.given;
-                match self.session(label) {
-                    Ok(session) => {
-                        if r.reply().u32(0).is_err() {
-                            return Answer::Status(Status::BadSize);
-                        }
-                        Answer::Reply([session.erase()].into())
-                    }
-                    Err(e) => Answer::Status(Status::Kernel(e)),
-                }
-            }
+            Some(Method::Clone) => self.clone_session(&s.data, r),
             Some(Method::OpenExec) => status(proto_fs::PERMISSION),
             Some(Method::Open) => {
                 let Ok(flags) = body.u32() else {
@@ -410,6 +483,24 @@ impl Service<0> for Fs {
                     Err(code) => status(code),
                 }
             }
+            Some(Method::WriteAt) => {
+                let (Ok(fd), Ok(offset)) = (body.u32(), body.u64()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                let Ok(bytes) = body.bytes(body.left()) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                match self.ram.pwrite(
+                    &mut s.data,
+                    fd,
+                    offset,
+                    bytes,
+                    rt::time::ticks_to_ns(rt::time::now()),
+                ) {
+                    Ok(n) => value(r, n as u32),
+                    Err(code) => status(code),
+                }
+            }
             Some(Method::Seek) => {
                 let (Ok(fd), Ok(offset)) = (body.u32(), body.u32()) else {
                     return Answer::Status(Status::BadSize);
@@ -417,7 +508,7 @@ impl Service<0> for Fs {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                match s.data.seek(fd, offset) {
+                match self.ram.seek(&mut s.data, fd, offset) {
                     Ok(offset) => value(r, offset),
                     Err(code) => status(code),
                 }
@@ -462,7 +553,7 @@ impl Service<0> for Fs {
                 if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                match s.data.close(fd) {
+                match self.ram.close(&mut s.data, fd) {
                     Ok(()) => Answer::Status(Status::Ok),
                     Err(code) => status(code),
                 }

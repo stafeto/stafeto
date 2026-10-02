@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 8;
+pub const PLATFORM_INTERFACE: u64 = 9;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -346,6 +346,65 @@ pub struct SpawnAttributes {
     default: u64,
 }
 
+/// A file action as relibc's posix_spawn gives it: OPEN (1) of `path`
+/// with `flags` at `fd`, CLOSE (2) of `fd`, DUP2 (3) of `fd` to `newfd`,
+/// CHDIR (4) to `path`, FCHDIR (5) to `fd`.
+#[repr(C)]
+pub struct SpawnAction {
+    kind: c_int,
+    fd: c_int,
+    newfd: c_int,
+    flags: c_int,
+    mode: u32,
+    path: *const c_char,
+}
+
+/// The file actions of `list`, `count` of them, as the layer takes them;
+/// a kind it does not know is a close of a number past the table, which
+/// fails with EBADF.
+///
+/// # Safety
+/// `list` is null or holds `count` actions whose paths are C strings that
+/// live through the call.
+unsafe fn actions<'a>(
+    list: *const SpawnAction,
+    count: usize,
+) -> impl Iterator<Item = posix_abi::process::FileAction<'a>> + Clone {
+    use posix_abi::process::FileAction;
+    let count = if list.is_null() { 0 } else { count };
+    (0..count).map(move |i| {
+        // SAFETY: the caller's promise.
+        let a = unsafe { &*list.add(i) };
+        let number = |n: c_int| u32::try_from(n).unwrap_or(u32::MAX);
+        // SAFETY: as above, for the paths of OPEN and CHDIR.
+        let path = || unsafe { bytes_of(a.path) };
+        match a.kind {
+            1 => FileAction::Open {
+                fd: number(a.fd),
+                path: path(),
+                flags: a.flags,
+            },
+            2 => FileAction::Close(number(a.fd)),
+            3 => FileAction::Dup2(number(a.fd), number(a.newfd)),
+            4 => FileAction::Chdir(path()),
+            5 => FileAction::Fchdir(number(a.fd)),
+            _ => FileAction::Close(u32::MAX),
+        }
+    })
+}
+
+/// The bytes of the C string `path`, without its NUL; empty for null.
+///
+/// # Safety
+/// `path` is null or a C string that lives as long as `'a`.
+unsafe fn bytes_of<'a>(path: *const c_char) -> &'a [u8] {
+    if path.is_null() {
+        return &[];
+    }
+    // SAFETY: the caller's promise.
+    unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes()
+}
+
 /// The strings of the NULL-ended list `list` of C strings, without NULs.
 ///
 /// # Safety
@@ -377,13 +436,16 @@ unsafe fn strings<'a>(list: *const *const c_char) -> impl Iterator<Item = &'a [u
 ///
 /// # Safety
 /// `path` is a C string; `argv` and `envp` are null or NULL-ended arrays
-/// of C strings; `attributes` is null or points to SpawnAttributes.
+/// of C strings; `attributes` is null or points to SpawnAttributes;
+/// `file_actions` is null or holds `count` SpawnAction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_spawn(
     path: *const c_char,
     argv: *const *const c_char,
     envp: *const *const c_char,
     attributes: *const SpawnAttributes,
+    file_actions: *const SpawnAction,
+    count: usize,
 ) -> c_int {
     // SAFETY: the caller's promise.
     let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
@@ -392,7 +454,11 @@ pub unsafe extern "C" fn stafeto_spawn(
     let (flags, pgroup) = attributes.map_or((0, 0), |a| (a.flags, a.pgroup));
     if path.starts_with(b"/boot/") {
         let old = proto_process::SPAWN_SETPGROUP | proto_process::SPAWN_SETSID;
-        let flags = if flags as u32 & !old == 0 { flags } else { -1 };
+        let flags = if flags as u32 & !old == 0 && count == 0 {
+            flags
+        } else {
+            -1
+        };
         return match call(|| posix_abi::process::spawn(path, flags, pgroup)) {
             Ok(pid) => pid,
             Err(errno) => -errno,
@@ -415,9 +481,18 @@ pub unsafe extern "C" fn stafeto_spawn(
         default,
         umask,
     };
-    // SAFETY: the caller's promise for argv and envp.
-    let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
-    match call(|| posix_abi::process::spawn_file(path, argv.clone(), envp.clone(), attributes)) {
+    // SAFETY: the caller's promise for argv, envp and the file actions.
+    let (argv, envp, file_actions) =
+        unsafe { (strings(argv), strings(envp), actions(file_actions, count)) };
+    match call(|| {
+        posix_abi::process::spawn_file(
+            path,
+            argv.clone(),
+            envp.clone(),
+            attributes,
+            file_actions.clone(),
+        )
+    }) {
         Ok(pid) => pid,
         Err(errno) => -errno,
     }

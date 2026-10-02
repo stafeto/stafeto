@@ -59,6 +59,13 @@
  * that failed to load, the next child keeps euid 65534; a directory only
  * root may search gives EACCES.
  *
+ * Stage 8, descriptors through posix_spawn (5c): fd 3 with FD_CLOEXEC is
+ * closed in the child, fd 4 dup2'd onto itself and fd 5 a copy of it stay
+ * open (os-test posix_spawn_file_actions_adddup2); a description the child
+ * reads moves the parent's offset; addopen, addclose and addchdir shape
+ * the child's descriptors and current directory, the relative path of the
+ * program taken from the new one.
+ *
  * The first argument picks the role: none for the parent, else that of
  * the child of a record (`main`). */
 #include <errno.h>
@@ -70,6 +77,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -511,6 +519,30 @@ static int role(const char *name) {
         printf("posix-procs: nobody uid %d euid %d\n", (int)getuid(), (int)geteuid());
         return ok ? 0 : 1;
     }
+    if (strcmp(name, "fds") == 0) {
+        struct stat st;
+        if (fstat(3, &st) == 0 || errno != EBADF) return 1;
+        if (fstat(4, &st) != 0 || fstat(5, &st) != 0) return 2;
+        return 0;
+    }
+    if (strcmp(name, "read10") == 0) {
+        char bytes[10];
+        return read(atoi(argv_seen[2]), bytes, sizeof bytes) == 10 ? 0 : 1;
+    }
+    if (strcmp(name, "opened") == 0) {
+        /* fd 7 opened by the action reads the motd; fd 6 was closed. */
+        char bytes[7];
+        struct stat st;
+        if (fstat(6, &st) == 0) return 1;
+        if (read(7, bytes, sizeof bytes) != 7 || memcmp(bytes, "stafeto", 7) != 0) return 2;
+        return 0;
+    }
+    if (strcmp(name, "cwd") == 0) {
+        char cwd[64];
+        if (!getcwd(cwd, sizeof cwd)) return 1;
+        printf("posix-procs: the child's directory is %s\n", cwd);
+        return strcmp(cwd, "/bin") == 0 ? 0 : 2;
+    }
     if (strcmp(name, "sleep") == 0 || strcmp(name, "sleep2") == 0) {
         for (;;) sleep(60);
     }
@@ -713,6 +745,69 @@ static void files(void) {
     expect("OpenExec through the probe's own session", stafeto_probe_open_exec("/bin/ls"), EPERM);
 }
 
+/* Spawns /bin/procs-child in role `name` with `actions` and checks it
+ * exits with 0. */
+static void run_with(const char *path, const char *name, const char *arg,
+                     const posix_spawn_file_actions_t *actions) {
+    char *argv[] = {"procs-child", (char *)name, (char *)arg, NULL};
+    char *envp[] = {NULL};
+    pid_t pid = -1;
+    int e = posix_spawn(&pid, path, actions, NULL, argv, envp);
+    if (e != 0) {
+        printf("posix-procs: spawn for %s gave %d (%s)\n", name, e, strerror(e));
+        failures++;
+        return;
+    }
+    reap(name, pid, 0, 0);
+}
+
+/* Stage 8: descriptors through posix_spawn. */
+static void descriptors(void) {
+    for (int fd = 3; fd < 8; fd++) close(fd);
+    int fd3 = open("/etc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int fd4 = dup(fd3);
+    expect("open of fd 3", fd3, 3);
+    expect("dup to fd 4", fd4, 4);
+    expect("FD_CLOEXEC on fd 4", fcntl(fd4, F_SETFD, FD_CLOEXEC), 0);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, fd4, fd4);
+    posix_spawn_file_actions_adddup2(&actions, fd4, 5);
+    run_with("/bin/procs-child", "fds", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+    close(fd3);
+    close(fd4);
+
+    /* The child reads 10 bytes of the description it shares. */
+    int motd = open("/etc/motd", O_RDONLY);
+    char number[8];
+    snprintf(number, sizeof number, "%d", motd);
+    run_with("/bin/procs-child", "read10", number, NULL);
+    expect("the offset the child moved", (int)lseek(motd, 0, SEEK_CUR), 10);
+    close(motd);
+
+    /* addopen at 7, addclose of 6, addchdir with a relative program. */
+    int six = open("/etc/motd", O_RDONLY);
+    expect("open of fd 6", six >= 0, 1);
+    if (six != 6) {
+        dup2(six, 6);
+        close(six);
+    }
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 7, "/etc/motd", O_RDONLY, 0);
+    posix_spawn_file_actions_addclose(&actions, 6);
+    run_with("/bin/procs-child", "opened", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+    struct stat st;
+    expect("fd 7 of the action stays in the child", fstat(7, &st) == -1 && errno == EBADF, 1);
+    expect("fd 6 stays open in the parent", fstat(6, &st), 0);
+    close(6);
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addchdir(&actions, "/bin");
+    run_with("procs-child", "cwd", NULL, &actions);
+    posix_spawn_file_actions_destroy(&actions);
+}
+
 /* Stage 7 once the probe is nobody: set-ID files. */
 static void files_nobody(void) {
     run_role("/bin/procs-setid", "setid", NULL);
@@ -769,6 +864,7 @@ int main(int argc, char **argv) {
     groups();
     churn();
     files();
+    descriptors();
     clock_rights();
     files_nobody();
     wave();

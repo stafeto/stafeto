@@ -20,6 +20,9 @@ use tree::Tree;
 
 const FILE_CAPACITY: usize = 1024;
 const OPEN_MAX: usize = 32;
+/// The open descriptions of the service at most, which the sessions share
+/// (spec 2, 3.7; 5c): past them, open is TOO_MANY_OPEN_FILES.
+pub const DESCRIPTIONS: usize = 128;
 const MOTD: &[u8] = b"stafeto ramfs\n";
 /// The inode of entry `n` of the table is this plus the number of the
 /// first entry that names its file (the fixed tree has 1 to 5).
@@ -126,57 +129,52 @@ struct Open {
     flags: u32,
 }
 
+/// The descriptors of one session: each names an open description of the
+/// service (`Ram`), which sessions a client cloned for its children share
+/// with their offsets and access modes (Clone). `claimed`: the session's
+/// first request took what Clone made for its label.
+#[derive(Clone, Copy)]
 pub struct Fds {
-    open: [Option<Open>; OPEN_MAX],
+    slots: [Option<u8>; OPEN_MAX],
+    pub claimed: bool,
 }
 
 impl Default for Fds {
     fn default() -> Self {
         Self {
-            open: [None; OPEN_MAX],
+            slots: [None; OPEN_MAX],
+            claimed: false,
         }
     }
 }
 
 impl Fds {
-    fn insert(&mut self, file: File, flags: u32) -> Result<u32, u32> {
-        let slot = self
-            .open
-            .iter_mut()
-            .position(|fd| fd.is_none())
-            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
-        self.open[slot] = Some(Open {
-            file,
-            offset: 0,
-            flags,
-        });
-        Ok(slot as u32 + 3)
-    }
-
-    fn get(&self, fd: u32) -> Result<Open, u32> {
+    /// The description of `fd`.
+    fn description(&self, fd: u32) -> Result<usize, u32> {
         let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
-        self.open.get(slot).and_then(|fd| *fd).ok_or(BAD_FD)
-    }
-
-    fn get_mut(&mut self, fd: u32) -> Result<&mut Open, u32> {
-        let slot = fd.checked_sub(3).ok_or(BAD_FD)? as usize;
-        self.open
-            .get_mut(slot)
-            .and_then(Option::as_mut)
+        self.slots
+            .get(slot)
+            .copied()
+            .flatten()
+            .map(usize::from)
             .ok_or(BAD_FD)
     }
 
-    pub fn close(&mut self, fd: u32) -> Result<(), u32> {
-        self.get(fd)?;
-        self.open[(fd - 3) as usize] = None;
-        Ok(())
+    /// The descriptors that name a description, for a session that goes.
+    pub fn numbers(&self) -> impl Iterator<Item = u32> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.is_some())
+            .map(|(slot, _)| slot as u32 + 3)
     }
+}
 
-    pub fn seek(&mut self, fd: u32, offset: u32) -> Result<u32, u32> {
-        let open = self.get_mut(fd)?;
-        open.offset = i64::from(offset);
-        Ok(offset)
-    }
+/// An open description and the descriptors of all sessions that name it.
+#[derive(Clone, Copy)]
+struct Shared {
+    open: Open,
+    refs: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +206,8 @@ impl File {
 pub struct Ram<'a> {
     scratch: [u8; FILE_CAPACITY],
     len: usize,
+    /// The open descriptions, shared by the sessions that name them.
+    descriptions: [Option<Shared>; DESCRIPTIONS],
     times: [FileTimes; 5],
     /// When the service started: the times of the files of the image.
     born: u64,
@@ -226,6 +226,7 @@ impl<'a> Ram<'a> {
         Self {
             scratch: [0; FILE_CAPACITY],
             len: 0,
+            descriptions: [None; DESCRIPTIONS],
             times: [FileTimes {
                 access: now,
                 modify: now,
@@ -242,6 +243,100 @@ impl<'a> Ram<'a> {
             tree: Some(tree),
             ..Self::new(now)
         }
+    }
+
+    /// The open description `fd` of `fds` names.
+    fn get(&self, fds: &Fds, fd: u32) -> Result<Open, u32> {
+        let index = fds.description(fd)?;
+        Ok(self.descriptions[index].expect("a named description").open)
+    }
+
+    /// The open description `fd` of `fds` names takes `open`.
+    fn put(&mut self, fds: &Fds, fd: u32, open: Open) -> Result<(), u32> {
+        let index = fds.description(fd)?;
+        self.descriptions[index]
+            .as_mut()
+            .expect("a named description")
+            .open = open;
+        Ok(())
+    }
+
+    /// A new description of `open` under the lowest free descriptor of
+    /// `fds`: TOO_MANY_OPEN_FILES with the session's descriptors or the
+    /// service's descriptions taken.
+    fn insert(&mut self, fds: &mut Fds, open: Open) -> Result<u32, u32> {
+        let slot = fds
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+        let index = self
+            .descriptions
+            .iter()
+            .position(Option::is_none)
+            .ok_or(proto_fs::TOO_MANY_OPEN_FILES)?;
+        self.descriptions[index] = Some(Shared { open, refs: 1 });
+        fds.slots[slot] = Some(index as u8);
+        Ok(slot as u32 + 3)
+    }
+
+    /// Close: the descriptor goes, and its description with the last one
+    /// that names it, in any session.
+    pub fn close(&mut self, fds: &mut Fds, fd: u32) -> Result<(), u32> {
+        let index = fds.description(fd)?;
+        fds.slots[(fd - 3) as usize] = None;
+        let shared = self.descriptions[index]
+            .as_mut()
+            .expect("a named description");
+        shared.refs -= 1;
+        if shared.refs == 0 {
+            self.descriptions[index] = None;
+        }
+        Ok(())
+    }
+
+    /// The descriptors of a session that goes, all of them closed.
+    pub fn release(&mut self, fds: &mut Fds) {
+        let numbers: [Option<u32>; OPEN_MAX] = {
+            let mut list = [None; OPEN_MAX];
+            for (place, fd) in list.iter_mut().zip(fds.numbers()) {
+                *place = Some(fd);
+            }
+            list
+        };
+        for fd in numbers.into_iter().flatten() {
+            let _ = self.close(fds, fd);
+        }
+    }
+
+    /// Clone's descriptors: a session's of the same numbers as `list` of
+    /// `fds`, which share their descriptions, offsets and access modes;
+    /// BAD_FD for a number no descriptor has. O(OPEN_MAX).
+    pub fn clone_fds(&mut self, fds: &Fds, list: &[u32]) -> Result<Fds, u32> {
+        let mut out = Fds::default();
+        for &fd in list {
+            let index = fds.description(fd)?;
+            out.slots[(fd - 3) as usize] = Some(index as u8);
+        }
+        for index in out.slots.iter().flatten() {
+            self.descriptions[usize::from(*index)]
+                .as_mut()
+                .expect("a named description")
+                .refs += 1;
+        }
+        Ok(out)
+    }
+
+    /// The descriptions that are open.
+    pub fn open_descriptions(&self) -> usize {
+        self.descriptions.iter().flatten().count()
+    }
+
+    pub fn seek(&mut self, fds: &mut Fds, fd: u32, offset: u32) -> Result<u32, u32> {
+        let mut open = self.get(fds, fd)?;
+        open.offset = i64::from(offset);
+        self.put(fds, fd, open)?;
+        Ok(offset)
     }
 
     fn resolve(&self, path: &str) -> Result<File, u32> {
@@ -263,7 +358,7 @@ impl<'a> Ram<'a> {
         })
     }
 
-    pub fn open(&self, fds: &mut Fds, path: &str, flags: u32) -> Result<u32, u32> {
+    pub fn open(&mut self, fds: &mut Fds, path: &str, flags: u32) -> Result<u32, u32> {
         if flags & !7 != 0 || flags & 3 == 3 {
             return Err(proto_wire::BAD_SIZE);
         }
@@ -279,7 +374,14 @@ impl<'a> Ram<'a> {
         if directory_only && !file.is_directory() {
             return Err(proto_fs::NOT_DIRECTORY);
         }
-        fds.insert(file, flags)
+        self.insert(
+            fds,
+            Open {
+                file,
+                offset: 0,
+                flags,
+            },
+        )
     }
 
     fn touch_access(&mut self, file: File, now: u64) {
@@ -446,7 +548,7 @@ impl<'a> Ram<'a> {
     }
 
     pub fn descriptor_information(&self, fds: &Fds, fd: u32) -> Result<NodeInfo, u32> {
-        Ok(self.node_information(fds.get(fd)?.file))
+        Ok(self.node_information(self.get(fds, fd)?.file))
     }
 
     /// A successful nonempty request updates atime even when it reads EOF.
@@ -457,7 +559,7 @@ impl<'a> Ram<'a> {
         out: &mut [u8],
         now: u64,
     ) -> Result<usize, u32> {
-        let file = fds.get(fd)?.file;
+        let file = self.get(fds, fd)?.file;
         let n = self.read(fds, fd, out)?;
         if !out.is_empty() {
             self.touch_access(file, now);
@@ -475,7 +577,7 @@ impl<'a> Ram<'a> {
         out: &mut [u8],
         now: u64,
     ) -> Result<usize, u32> {
-        let open = fds.get(fd)?;
+        let open = self.get(fds, fd)?;
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
@@ -502,7 +604,7 @@ impl<'a> Ram<'a> {
         bytes: &[u8],
         now: u64,
     ) -> Result<usize, u32> {
-        let file = fds.get(fd)?.file;
+        let file = self.get(fds, fd)?.file;
         let n = self.write(fds, fd, bytes)?;
         if n > 0 {
             let times = &mut self.times[file.index().expect("only the scratch file is written")];
@@ -512,13 +614,34 @@ impl<'a> Ram<'a> {
         Ok(n)
     }
 
+    /// pwrite: `bytes` at `offset` of the file, the position of the open
+    /// description as it was.
+    pub fn pwrite(
+        &mut self,
+        fds: &mut Fds,
+        fd: u32,
+        offset: u64,
+        bytes: &[u8],
+        now: u64,
+    ) -> Result<usize, u32> {
+        let at = i64::try_from(offset).map_err(|_| proto_fs::INVALID_ARGUMENT)?;
+        let mut open = self.get(fds, fd)?;
+        let position = open.offset;
+        open.offset = at;
+        self.put(fds, fd, open)?;
+        let written = self.write_at(fds, fd, bytes, now);
+        open.offset = position;
+        self.put(fds, fd, open)?;
+        written
+    }
+
     pub fn directory_read(
         &mut self,
         fds: &mut Fds,
         fd: u32,
         now: u64,
     ) -> Result<Option<DirectoryRecord<'a>>, u32> {
-        let open = fds.get_mut(fd)?;
+        let mut open = self.get(fds, fd)?;
         if !open.file.is_directory() {
             return Err(proto_fs::NOT_DIRECTORY);
         }
@@ -526,6 +649,7 @@ impl<'a> Ram<'a> {
         let entry = self.entry_of(open.file, index, now);
         if entry.is_some() {
             open.offset += 1;
+            self.put(fds, fd, open)?;
         }
         Ok(entry)
     }
@@ -642,20 +766,20 @@ impl<'a> Ram<'a> {
     }
 
     pub fn size(&self, fds: &Fds, fd: u32) -> Result<u32, u32> {
-        Ok(self.bytes(fds.get(fd)?.file).len() as u32)
+        Ok(self.bytes(self.get(fds, fd)?.file).len() as u32)
     }
 
     /// Reposition one open description without extending its file. RAM files
     /// expose a single data extent and the required virtual hole at EOF.
     pub fn seek_from(
-        &self,
+        &mut self,
         fds: &mut Fds,
         fd: u32,
         offset: i64,
         origin: proto_fs::SeekFrom,
     ) -> Result<i64, u32> {
         use proto_fs::{INVALID_ARGUMENT, NO_DATA, OFFSET_OVERFLOW, SeekFrom};
-        let open = fds.get_mut(fd)?;
+        let mut open = self.get(fds, fd)?;
         if open.file.is_directory() && matches!(origin, SeekFrom::Data | SeekFrom::Hole) {
             return Err(INVALID_ARGUMENT);
         }
@@ -686,11 +810,12 @@ impl<'a> Ram<'a> {
             return Err(INVALID_ARGUMENT);
         }
         open.offset = next;
+        self.put(fds, fd, open)?;
         Ok(next)
     }
 
-    pub fn read(&self, fds: &mut Fds, fd: u32, out: &mut [u8]) -> Result<usize, u32> {
-        let open = fds.get_mut(fd)?;
+    pub fn read(&mut self, fds: &mut Fds, fd: u32, out: &mut [u8]) -> Result<usize, u32> {
+        let mut open = self.get(fds, fd)?;
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
@@ -702,11 +827,12 @@ impl<'a> Ram<'a> {
         let n = out.len().min(bytes.len() - start);
         out[..n].copy_from_slice(&bytes[start..start + n]);
         open.offset += n as i64;
+        self.put(fds, fd, open)?;
         Ok(n)
     }
 
     pub fn write(&mut self, fds: &mut Fds, fd: u32, bytes: &[u8]) -> Result<usize, u32> {
-        let open = fds.get_mut(fd)?;
+        let mut open = self.get(fds, fd)?;
         if open.file.is_directory() {
             return Err(IS_DIRECTORY);
         }
@@ -727,6 +853,7 @@ impl<'a> Ram<'a> {
         self.scratch[offset..end].copy_from_slice(bytes);
         self.len = self.len.max(end);
         open.offset = end as i64;
+        self.put(fds, fd, open)?;
         Ok(bytes.len())
     }
 }
@@ -802,7 +929,7 @@ mod tests {
             ram.seek_from(&mut fds, fd, 0, proto_fs::SeekFrom::Current),
             Ok(2)
         );
-        fds.close(fd).unwrap();
+        ram.close(&mut fds, fd).unwrap();
         assert_eq!(ram.directory_read(&mut fds, fd, 80), Err(BAD_FD));
         let regular = ram.open(&mut fds, "/etc/motd", READ_ONLY).unwrap();
         assert_eq!(
@@ -864,10 +991,10 @@ mod tests {
         assert_eq!(ram.read_at(&mut b, fb, &mut [], 50), Ok(0));
         assert_eq!(ram.write_at(&mut a, fa, b"", 60), Ok(0));
         assert_eq!(ram.write_at(&mut b, fb, b"x", 70), Err(BAD_FD));
-        a.seek(fa, FILE_CAPACITY as u32).unwrap();
+        ram.seek(&mut a, fa, FILE_CAPACITY as u32).unwrap();
         assert_eq!(ram.write_at(&mut a, fa, b"x", 80), Err(NO_SPACE));
         assert_eq!(ram.information("/tmp/probe").unwrap(), info);
-        b.close(fb).unwrap();
+        ram.close(&mut b, fb).unwrap();
         assert_eq!(ram.descriptor_information(&b, fb), Err(BAD_FD));
         assert_eq!(ram.information("/missing"), Err(NO_ENTRY));
         assert_eq!(ram.information("/").unwrap(), root);
@@ -875,7 +1002,7 @@ mod tests {
 
     #[test]
     fn description_limit_reports_emfile_and_recovers_on_close() {
-        let ram = Ram::default();
+        let mut ram = Ram::default();
         let mut fds = Fds::default();
         for expected in 3..OPEN_MAX as u32 + 3 {
             assert_eq!(ram.open(&mut fds, "/etc/motd", READ_ONLY), Ok(expected));
@@ -884,7 +1011,7 @@ mod tests {
             ram.open(&mut fds, "/etc/motd", READ_ONLY),
             Err(proto_fs::TOO_MANY_OPEN_FILES)
         );
-        fds.close(7).unwrap();
+        ram.close(&mut fds, 7).unwrap();
         assert_eq!(ram.open(&mut fds, "/etc/motd", READ_ONLY), Ok(7));
     }
 
@@ -924,7 +1051,7 @@ mod tests {
 
     #[test]
     fn sessions_have_independent_offsets_and_close_invalidates_fd() {
-        let ram = Ram::default();
+        let mut ram = Ram::default();
         let mut a = Fds::default();
         let mut b = Fds::default();
         let fa = ram.open(&mut a, "/etc/motd", READ_ONLY).unwrap();
@@ -934,7 +1061,7 @@ mod tests {
         assert_eq!(&out, b"stafeto");
         assert_eq!(ram.read(&mut b, fb, &mut out), Ok(7));
         assert_eq!(&out, b"stafeto");
-        assert_eq!(a.close(fa), Ok(()));
+        assert_eq!(ram.close(&mut a, fa), Ok(()));
         assert_eq!(ram.read(&mut a, fa, &mut out), Err(BAD_FD));
         assert_eq!(ram.size(&b, fb), Ok(MOTD.len() as u32));
     }
@@ -987,7 +1114,7 @@ mod tests {
         // RAM reports a single data extent even when it contains zero bytes.
         assert_eq!(ram.seek_from(&mut fds, fd, 4, Data), Ok(4));
         assert_eq!(ram.seek_from(&mut fds, fd, 4, Hole), Ok(8));
-        fds.close(fd).unwrap();
+        ram.close(&mut fds, fd).unwrap();
         assert_eq!(ram.seek_from(&mut fds, fd, 0, Start), Err(BAD_FD));
     }
 
@@ -1001,7 +1128,7 @@ mod tests {
         assert_eq!(ram.write(&mut fds, read, b""), Err(BAD_FD));
         assert_eq!(ram.read(&mut fds, 99, &mut []), Err(BAD_FD));
         assert_eq!(ram.write(&mut fds, 99, b""), Err(BAD_FD));
-        fds.seek(write, 100).unwrap();
+        ram.seek(&mut fds, write, 100).unwrap();
         assert_eq!(ram.write(&mut fds, write, b""), Ok(0));
         assert_eq!(ram.size(&fds, write), Ok(0));
         assert_eq!(
@@ -1020,13 +1147,16 @@ mod tests {
         let mut fds = Fds::default();
         let fd = ram.open(&mut fds, "/tmp/probe", READ_WRITE).unwrap();
         assert_eq!(ram.write(&mut fds, fd, b"abc"), Ok(3));
-        assert_eq!(fds.seek(fd, 1), Ok(1));
+        assert_eq!(ram.seek(&mut fds, fd, 1), Ok(1));
         assert_eq!(ram.write(&mut fds, fd, b"Z"), Ok(1));
         assert_eq!(ram.size(&fds, fd), Ok(3));
-        assert_eq!(fds.seek(fd, FILE_CAPACITY as u32), Ok(FILE_CAPACITY as u32));
+        assert_eq!(
+            ram.seek(&mut fds, fd, FILE_CAPACITY as u32),
+            Ok(FILE_CAPACITY as u32)
+        );
         assert_eq!(ram.write(&mut fds, fd, b"overflow"), Err(NO_SPACE));
         assert_eq!(ram.size(&fds, fd), Ok(3));
-        assert_eq!(fds.seek(fd, 0), Ok(0));
+        assert_eq!(ram.seek(&mut fds, fd, 0), Ok(0));
         let mut out = [0; 3];
         assert_eq!(ram.read(&mut fds, fd, &mut out), Ok(3));
         assert_eq!(&out, b"aZc");
@@ -1254,7 +1384,7 @@ mod tests {
         assert_eq!(ram.pread(&fds, write_only, 0, &mut out, 60), Err(BAD_FD));
         let dir = ram.open(&mut fds, "/bin", READ_ONLY).unwrap();
         assert_eq!(ram.pread(&fds, dir, 0, &mut out, 60), Err(IS_DIRECTORY));
-        fds.close(fd).unwrap();
+        ram.close(&mut fds, fd).unwrap();
         assert_eq!(ram.pread(&fds, fd, 0, &mut out, 60), Err(BAD_FD));
     }
 
@@ -1269,7 +1399,7 @@ mod tests {
             entry(&deep, REGULAR | 0o644, 1),
         ]);
         let mut index = Index::new();
-        let ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
+        let mut ram = Ram::with_tree(10, load(&bytes, &mut index).unwrap());
         let mut fds = Fds::default();
         assert!(ram.open(&mut fds, &deep, READ_ONLY).is_ok());
         assert_eq!(ram.information(&deep).unwrap().size, 11);
@@ -1377,5 +1507,55 @@ mod tests {
         assert!(bin.is_err());
         assert_eq!(ram.image_read(0, 0, &mut out), Err(NO_ENTRY), "a directory");
         assert_eq!(ram.image_read(99, 0, &mut out), Err(NO_ENTRY));
+    }
+
+    /// Clone's session shares the descriptions it names: an offset one
+    /// session moves the other sees; a close in one leaves the description
+    /// to the other, and the last close frees it.
+    #[test]
+    fn cloned_sessions_share_descriptions_and_offsets() {
+        let mut ram = Ram::default();
+        let mut parent = Fds::default();
+        let fd = ram.open(&mut parent, "/etc/motd", READ_ONLY).unwrap();
+        let other = ram.open(&mut parent, "/tmp/probe", READ_WRITE).unwrap();
+        let mut child = ram.clone_fds(&parent, &[fd]).unwrap();
+        assert_eq!(ram.read(&mut child, fd, &mut [0; 10]), Ok(10));
+        assert_eq!(
+            ram.seek_from(&mut parent, fd, 0, proto_fs::SeekFrom::Current),
+            Ok(10)
+        );
+        assert_eq!(
+            ram.read(&mut child, other, &mut [0; 1]),
+            Err(BAD_FD),
+            "not cloned"
+        );
+        assert_eq!(ram.open_descriptions(), 2);
+        ram.close(&mut parent, fd).unwrap();
+        assert_eq!(ram.open_descriptions(), 2, "the child still names it");
+        assert_eq!(ram.read(&mut child, fd, &mut [0; 10]), Ok(4));
+        ram.release(&mut child);
+        assert_eq!(ram.open_descriptions(), 1);
+        assert_eq!(ram.clone_fds(&parent, &[fd]).err(), Some(BAD_FD));
+        ram.release(&mut parent);
+        assert_eq!(ram.open_descriptions(), 0);
+    }
+
+    /// The service's descriptions are bounded across its sessions.
+    #[test]
+    fn descriptions_are_bounded_across_sessions() {
+        let mut ram = Ram::default();
+        let mut sessions = [Fds::default(); DESCRIPTIONS / OPEN_MAX];
+        for fds in &mut sessions {
+            for _ in 0..OPEN_MAX {
+                ram.open(fds, "/etc/motd", READ_ONLY).unwrap();
+            }
+        }
+        let mut one_more = Fds::default();
+        assert_eq!(
+            ram.open(&mut one_more, "/etc/motd", READ_ONLY),
+            Err(proto_fs::TOO_MANY_OPEN_FILES)
+        );
+        ram.release(&mut sessions[0]);
+        assert!(ram.open(&mut one_more, "/etc/motd", READ_ONLY).is_ok());
     }
 }

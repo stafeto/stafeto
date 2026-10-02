@@ -6,13 +6,14 @@
 
 #![no_std]
 
+use core::mem::ManuallyDrop;
 pub use posix_fd::Flags as DescriptorFlags;
 use posix_fd::{Error as DescriptorError, Table};
 use posix_path::{MAX_PATH, PathError, PathState};
 pub use proto_fs::{DIRECTORY_ONLY, MAX_READ, NodeInfo, SeekFrom};
 use proto_wire::Status;
 use rt::Handle;
-use rt::fs::Files;
+use rt::fs::{Files, View};
 use rt::handle::Channel;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,30 +120,51 @@ pub struct DirEntry {
 
 /// Local descriptor bound. The RAM service separately bounds open descriptions.
 pub const OPEN_MAX: usize = 32;
+/// The longest current directory, in bytes.
+pub const MAX_CWD: usize = MAX_PATH;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Backend {
+/// What a descriptor names: the console's input, output or error, or an
+/// open description of the RAM file service by its number in the
+/// process's session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Target {
     Input,
     Output,
     Error,
     Ram(u32),
 }
 
-fn release(files: &Files, backend: Backend) -> Result<(), DescriptorError> {
-    match backend {
-        Backend::Ram(fd) => files.close(fd).map_err(|_| DescriptorError::Io),
-        _ => Ok(()),
-    }
-}
-
-/// One process's file state, mutated by one owner. Duplication keeps the same
-/// service descriptor, hence the same offset and file access mode. Process
-/// transfer requires service-owned session sharing. The shared C ABI worker
-/// serializes calls from threads of the same process.
+/// One process's file state, mutated by one owner: the table of
+/// descriptors and the current directory. The requests to the services go
+/// through the `Transport`, which needs no owner: the owner snapshots a
+/// descriptor's target and holds it (`hold`), lets go of its lock, and the
+/// request runs outside it (spec 2, 3.4; 5c). Duplication keeps the same
+/// service descriptor, hence the same offset and file access mode.
 pub struct PosixFs {
     files: Files,
     paths: PathState,
-    descriptors: Table<Backend, OPEN_MAX>,
+    descriptors: Table<Target, OPEN_MAX>,
+}
+
+/// The transports of a process's files, borrowed from its PosixFs, which
+/// stays alive while a transport is used: what a request needs outside
+/// the owner's lock.
+#[derive(Clone, Copy)]
+pub struct Transport(View);
+
+/// A path the owner resolved against its current directory, for a
+/// request outside its lock.
+pub struct Resolved {
+    bytes: [u8; MAX_PATH + 1],
+    len: usize,
+    /// The path the caller gave ends with a slash: a directory is meant.
+    pub trailing_slash: bool,
+}
+
+impl Resolved {
+    pub fn as_str(&self) -> Result<&str, FsError> {
+        core::str::from_utf8(&self.bytes[..self.len]).map_err(|_| FsError::UnsupportedEncoding)
+    }
 }
 
 /// A prepared read. RAM data is already serialized through the file owner;
@@ -177,6 +199,168 @@ impl PreparedRead {
     }
 }
 
+/// The node information of the console's descriptors.
+const CONSOLE_INFO: NodeInfo = NodeInfo {
+    kind: 3,
+    permissions: 0o666,
+    device: 2,
+    special_device: 1,
+    inode: 1,
+    links: 1,
+    uid: 0,
+    gid: 0,
+    size: 0,
+    block_size: 1024,
+    blocks: 0,
+    access_ns: 0,
+    modify_ns: 0,
+    change_ns: 0,
+};
+
+impl Transport {
+    fn files(&self) -> ManuallyDrop<Files> {
+        self.0.files()
+    }
+
+    /// Close of the service's description `fd` that the table handed back.
+    pub fn release(&self, target: Option<Target>) -> Result<(), FsError> {
+        match target {
+            Some(Target::Ram(fd)) => self.files().close(fd).map_err(FsError::from),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn open(&self, path: &str, flags: u32) -> Result<u32, FsError> {
+        self.files().open(path, flags).map_err(FsError::from)
+    }
+
+    /// The console's input route of the process.
+    pub fn input(&self) -> rt::fs::Input {
+        self.files().input()
+    }
+
+    pub fn prepare_read(&self, target: Target, count: usize) -> Result<PreparedRead, FsError> {
+        let extent = count.min(MAX_READ);
+        if matches!(target, Target::Input) && extent != 0 {
+            return Ok(PreparedRead(ReadState::Input(self.input(), extent)));
+        }
+        let mut bytes = [0; MAX_READ];
+        let length = self.read(target, &mut bytes[..extent])?;
+        Ok(PreparedRead(ReadState::Data(length, bytes)))
+    }
+
+    pub fn read(&self, target: Target, out: &mut [u8]) -> Result<usize, FsError> {
+        let fd = match target {
+            Target::Input => 0,
+            Target::Ram(fd) => fd,
+            _ => return Err(FsError::BadFileDescriptor),
+        };
+        self.files().read(fd, out).map_err(FsError::from)
+    }
+
+    /// pread of the service's description `fd`.
+    pub fn read_at(&self, fd: u32, offset: u64, out: &mut [u8]) -> Result<usize, FsError> {
+        self.files().read_at(fd, offset, out).map_err(FsError::from)
+    }
+
+    /// pwrite of the service's description `fd`.
+    pub fn write_at(&self, fd: u32, offset: u64, bytes: &[u8]) -> Result<usize, FsError> {
+        self.files()
+            .write_at(fd, offset, bytes)
+            .map_err(FsError::from)
+    }
+
+    pub fn write(&self, target: Target, bytes: &[u8]) -> Result<usize, FsError> {
+        let fd = match target {
+            Target::Output => 1,
+            Target::Error => 2,
+            Target::Ram(fd) => fd,
+            _ => return Err(FsError::BadFileDescriptor),
+        };
+        self.files().write(fd, bytes).map_err(FsError::from)
+    }
+
+    pub fn lseek(&self, target: Target, offset: i64, origin: SeekFrom) -> Result<i64, FsError> {
+        match target {
+            Target::Ram(fd) => self
+                .files()
+                .seek_from(fd, offset, origin)
+                .map_err(FsError::from),
+            _ => Err(FsError::NotSeekable),
+        }
+    }
+
+    pub fn descriptor_information(&self, target: Target) -> Result<NodeInfo, FsError> {
+        match target {
+            Target::Ram(fd) => self
+                .files()
+                .descriptor_information(fd)
+                .map_err(FsError::from),
+            // Unnamed console transport; richer terminal metadata comes with
+            // the terminal service and its namespace entry.
+            _ => Ok(CONSOLE_INFO),
+        }
+    }
+
+    pub fn fstat(&self, target: Target) -> Result<Metadata, FsError> {
+        let info = self.descriptor_information(target)?;
+        Ok(Metadata {
+            kind: FileKind::from_wire(info.kind)?,
+            size: u32::try_from(info.size).map_err(|_| FsError::OffsetOverflow)?,
+        })
+    }
+
+    pub fn stat(&self, path: &Resolved) -> Result<Metadata, FsError> {
+        let meta = self.files().lookup(path.as_str()?).map_err(FsError::from)?;
+        let kind = FileKind::from_wire(meta.kind)?;
+        if path.trailing_slash && kind == FileKind::Regular {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(Metadata {
+            kind,
+            size: meta.size,
+        })
+    }
+
+    pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
+        let info = self
+            .files()
+            .node_information(path.as_str()?)
+            .map_err(FsError::from)?;
+        if path.trailing_slash && FileKind::from_wire(info.kind)? != FileKind::Directory {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(info)
+    }
+
+    pub fn readdir(&self, target: Target, out: &mut [u8]) -> Result<Option<DirEntry>, FsError> {
+        match target {
+            Target::Ram(fd) => self
+                .files()
+                .read_dir_fd(fd, out)
+                .map_err(FsError::from)?
+                .map(|(name_len, kind, inode)| {
+                    Ok(DirEntry {
+                        inode,
+                        kind: FileKind::from_wire(kind)?,
+                        name_len,
+                    })
+                })
+                .transpose(),
+            _ => Err(FsError::NotDirectory),
+        }
+    }
+}
+
+/// A descriptor a process starts with, from its parent's table (spec 2,
+/// 3.2): its number, what it names, and the service's number of the
+/// description for a file of the service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Inherited {
+    pub fd: u32,
+    pub target: Target,
+}
+
 impl PosixFs {
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, FsError> {
         Self::from_files(Files::connect(parent).map_err(FsError::from)?)
@@ -187,13 +371,43 @@ impl PosixFs {
     }
 
     /// The files through sessions the program was given (its loader's
-    /// start, spec 2, 3.2), with `cwd` its current directory.
+    /// start, spec 2, 3.2), with `cwd` its current directory and the
+    /// descriptors of `inherited` (the console's 0, 1 and 2 when None).
+    /// With `secure`, the secure mode of a set-ID program, a free 0, 1 or
+    /// 2 gets the console, so that no file the program opens becomes one
+    /// of them.
     pub fn from_sessions(
         files: Handle<Channel>,
         uart: Option<Handle<Channel>>,
         cwd: &[u8],
+        inherited: Option<&[Inherited]>,
+        secure: bool,
     ) -> Result<Self, FsError> {
-        let mut fs = Self::from_files(Files::from_sessions(files, uart))?;
+        let mut fs = match inherited {
+            None => Self::from_files(Files::from_sessions(files, uart))?,
+            Some(list) => {
+                let mut fs = Self {
+                    files: Files::from_sessions(files, uart),
+                    paths: PathState::new(),
+                    descriptors: Table::default(),
+                };
+                for d in list {
+                    fs.descriptors
+                        .place(d.fd, d.target, DescriptorFlags::default())?;
+                }
+                if secure {
+                    for (fd, target) in
+                        [(0, Target::Input), (1, Target::Output), (2, Target::Error)]
+                    {
+                        if fs.descriptors.get(fd).is_err() {
+                            fs.descriptors
+                                .place(fd, target, DescriptorFlags::default())?;
+                        }
+                    }
+                }
+                fs
+            }
+        };
         if !cwd.is_empty() {
             fs.paths.set_cwd(cwd)?;
         }
@@ -208,8 +422,8 @@ impl PosixFs {
 
     fn from_files(files: Files) -> Result<Self, FsError> {
         let mut descriptors = Table::default();
-        for backend in [Backend::Input, Backend::Output, Backend::Error] {
-            descriptors.insert(backend, DescriptorFlags::default())?;
+        for target in [Target::Input, Target::Output, Target::Error] {
+            descriptors.insert(target, DescriptorFlags::default())?;
         }
         Ok(Self {
             files,
@@ -218,13 +432,79 @@ impl PosixFs {
         })
     }
 
+    /// The transports, for a request outside the owner's lock.
+    pub fn transport(&self) -> Transport {
+        Transport(self.files.view())
+    }
+
     pub fn cwd(&self) -> &[u8] {
         self.paths.cwd()
     }
 
-    fn path<'a>(&self, input: &[u8], out: &'a mut [u8; MAX_PATH + 1]) -> Result<&'a str, FsError> {
-        let length = self.paths.resolve(input, out)?;
-        core::str::from_utf8(&out[..length]).map_err(|_| FsError::UnsupportedEncoding)
+    /// `input` against the current directory.
+    pub fn resolve(&self, input: &[u8]) -> Result<Resolved, FsError> {
+        let mut bytes = [0; MAX_PATH + 1];
+        let len = self.paths.resolve(input, &mut bytes)?;
+        Ok(Resolved {
+            bytes,
+            len,
+            trailing_slash: input.last() == Some(&b'/'),
+        })
+    }
+
+    /// The current directory becomes `path`, which the caller found to be
+    /// a directory.
+    pub fn set_cwd(&mut self, path: &[u8]) -> Result<(), FsError> {
+        self.paths.set_cwd(path).map_err(FsError::from)
+    }
+
+    /// What `fd` names.
+    pub fn target(&self, fd: u32) -> Result<Target, FsError> {
+        self.descriptors.get(fd).map_err(FsError::from)
+    }
+
+    /// What `fd` names, held for a request outside the owner's lock: a
+    /// close meanwhile leaves the service's description until `unhold`.
+    pub fn hold(&mut self, fd: u32) -> Result<Target, FsError> {
+        self.descriptors.hold(fd).map_err(FsError::from)
+    }
+
+    /// The request on `target` is over: what to release, when its last
+    /// descriptor went meanwhile.
+    pub fn unhold(&mut self, target: Target) -> Option<Target> {
+        self.descriptors.unhold(target)
+    }
+
+    /// A descriptor of the service's description `fd` with `flags`, the
+    /// lowest free one: the caller closes `fd` on an error.
+    pub fn insert(&mut self, fd: u32, flags: DescriptorFlags) -> Result<u32, FsError> {
+        self.descriptors
+            .insert(Target::Ram(fd), flags)
+            .map_err(FsError::from)
+    }
+
+    /// Close: the descriptor goes; what to release outside the lock.
+    pub fn take_close(&mut self, fd: u32) -> Result<Option<Target>, FsError> {
+        self.descriptors.close(fd).map_err(FsError::from)
+    }
+
+    /// dup2 and dup3: the target and what it named before, to release.
+    pub fn take_dup3(
+        &mut self,
+        source: u32,
+        target: u32,
+        flags: Option<DescriptorFlags>,
+    ) -> Result<(u32, Option<Target>), FsError> {
+        match flags {
+            None => self.descriptors.dup2(source, target),
+            Some(flags) => self.descriptors.dup3(source, target, flags),
+        }
+        .map_err(FsError::from)
+    }
+
+    /// The descriptors that are open, what they name and their flags.
+    pub fn descriptors(&self) -> impl Iterator<Item = (u32, Target, DescriptorFlags)> + '_ {
+        self.descriptors.open()
     }
 
     pub fn chdir(&mut self, path: &[u8]) -> Result<(), FsError> {
@@ -235,30 +515,27 @@ impl PosixFs {
         Ok(())
     }
 
+    /// Open by a single owner: the request, then the descriptor.
     pub fn open(&mut self, path: &[u8], flags: u32) -> Result<u32, FsError> {
         if path.last() == Some(&b'/') && self.stat(path)?.kind == FileKind::Regular {
             return Err(FsError::NotDirectory);
         }
-        let mut resolved = [0; MAX_PATH + 1];
-        let path = self.path(path, &mut resolved)?;
+        let resolved = self.resolve(path)?;
         self.descriptors.vacant(0)?;
-        let backend = self.files.open(path, flags).map_err(FsError::from)?;
-        match self
-            .descriptors
-            .insert(Backend::Ram(backend), DescriptorFlags::default())
-        {
+        let transport = self.transport();
+        let fd = transport.open(resolved.as_str()?, flags)?;
+        match self.insert(fd, DescriptorFlags::default()) {
             Ok(fd) => Ok(fd),
             Err(error) => {
-                let _ = self.files.close(backend);
-                Err(error.into())
+                let _ = transport.release(Some(Target::Ram(fd)));
+                Err(error)
             }
         }
     }
 
     pub fn close(&mut self, fd: u32) -> Result<(), FsError> {
-        self.descriptors
-            .close(fd, |backend| release(&self.files, backend))
-            .map_err(FsError::from)
+        let release = self.take_close(fd)?;
+        self.transport().release(release)
     }
 
     pub fn dup(&mut self, fd: u32) -> Result<u32, FsError> {
@@ -277,9 +554,9 @@ impl PosixFs {
     }
 
     pub fn dup2(&mut self, source: u32, target: u32) -> Result<u32, FsError> {
-        self.descriptors
-            .dup2(source, target, |backend| release(&self.files, backend))
-            .map_err(FsError::from)
+        let (fd, release) = self.take_dup3(source, target, None)?;
+        self.transport().release(release)?;
+        Ok(fd)
     }
 
     pub fn dup3(
@@ -288,11 +565,9 @@ impl PosixFs {
         target: u32,
         flags: DescriptorFlags,
     ) -> Result<u32, FsError> {
-        self.descriptors
-            .dup3(source, target, flags, |backend| {
-                release(&self.files, backend)
-            })
-            .map_err(FsError::from)
+        let (fd, release) = self.take_dup3(source, target, Some(flags))?;
+        self.transport().release(release)?;
+        Ok(fd)
     }
 
     pub fn descriptor_flags(&self, fd: u32) -> Result<DescriptorFlags, FsError> {
@@ -303,53 +578,32 @@ impl PosixFs {
         self.descriptors.set_flags(fd, flags).map_err(FsError::from)
     }
 
-    /// Validate a descriptor and snapshot console routing without waiting.
-    /// Keep this owner alive until every prepared console read finishes.
-    /// Closing or replacing a local fd does not close its retained transport.
     pub fn prepare_read(&self, fd: u32, count: usize) -> Result<PreparedRead, FsError> {
-        let backend = self.descriptors.get(fd)?;
-        let extent = count.min(MAX_READ);
-        if matches!(backend, Backend::Input) && extent != 0 {
-            return Ok(PreparedRead(ReadState::Input(self.files.input(), extent)));
-        }
-        let mut bytes = [0; MAX_READ];
-        let length = self.read(fd, &mut bytes[..extent])?;
-        Ok(PreparedRead(ReadState::Data(length, bytes)))
+        self.transport().prepare_read(self.target(fd)?, count)
     }
 
     pub fn read(&self, fd: u32, out: &mut [u8]) -> Result<usize, FsError> {
-        let backend = match self.descriptors.get(fd)? {
-            Backend::Input => 0,
-            Backend::Ram(fd) => fd,
-            _ => return Err(FsError::BadFileDescriptor),
-        };
-        self.files.read(backend, out).map_err(FsError::from)
+        self.transport().read(self.target(fd)?, out)
+    }
+
+    /// Whether `fd` is the console's input (standard input as the process
+    /// started, wherever `dup2` moved it).
+    pub fn console_input(&self, fd: u32) -> Result<bool, FsError> {
+        Ok(matches!(self.target(fd)?, Target::Input))
     }
 
     /// The console route of `fd` when it is standard output or error, for
     /// a write the caller makes after it let go of the file state (the
     /// owner stays alive meanwhile); None for a file of the service.
-    /// Whether `fd` is the console's input (standard input as the process
-    /// started, wherever `dup2` moved it).
-    pub fn console_input(&self, fd: u32) -> Result<bool, FsError> {
-        Ok(matches!(self.descriptors.get(fd)?, Backend::Input))
-    }
-
     pub fn console_route(&self, fd: u32) -> Result<Option<rt::fs::Input>, FsError> {
-        Ok(match self.descriptors.get(fd)? {
-            Backend::Output | Backend::Error => Some(self.files.input()),
+        Ok(match self.target(fd)? {
+            Target::Output | Target::Error => Some(self.files.input()),
             _ => None,
         })
     }
 
     pub fn write(&self, fd: u32, bytes: &[u8]) -> Result<usize, FsError> {
-        let backend = match self.descriptors.get(fd)? {
-            Backend::Output => 1,
-            Backend::Error => 2,
-            Backend::Ram(fd) => fd,
-            _ => return Err(FsError::BadFileDescriptor),
-        };
-        self.files.write(backend, bytes).map_err(FsError::from)
+        self.transport().write(self.target(fd)?, bytes)
     }
 
     pub fn seek_set(&self, fd: u32, offset: u32) -> Result<u32, FsError> {
@@ -358,82 +612,23 @@ impl PosixFs {
     }
 
     pub fn lseek(&self, fd: u32, offset: i64, origin: SeekFrom) -> Result<i64, FsError> {
-        match self.descriptors.get(fd)? {
-            Backend::Ram(fd) => self
-                .files
-                .seek_from(fd, offset, origin)
-                .map_err(FsError::from),
-            _ => Err(FsError::NotSeekable),
-        }
+        self.transport().lseek(self.target(fd)?, offset, origin)
     }
 
     pub fn fstat(&self, fd: u32) -> Result<Metadata, FsError> {
-        match self.descriptors.get(fd)? {
-            Backend::Ram(fd) => {
-                let info = self
-                    .files
-                    .descriptor_information(fd)
-                    .map_err(FsError::from)?;
-                Ok(Metadata {
-                    kind: FileKind::from_wire(info.kind)?,
-                    size: u32::try_from(info.size).map_err(|_| FsError::OffsetOverflow)?,
-                })
-            }
-            _ => Ok(Metadata {
-                kind: FileKind::Character,
-                size: 0,
-            }),
-        }
+        self.transport().fstat(self.target(fd)?)
     }
 
     pub fn stat(&self, path: &[u8]) -> Result<Metadata, FsError> {
-        let trailing_slash = path.last() == Some(&b'/');
-        let mut resolved = [0; MAX_PATH + 1];
-        let path = self.path(path, &mut resolved)?;
-        let meta = self.files.lookup(path).map_err(FsError::from)?;
-        let kind = FileKind::from_wire(meta.kind)?;
-        if trailing_slash && kind == FileKind::Regular {
-            return Err(FsError::NotDirectory);
-        }
-        Ok(Metadata {
-            kind,
-            size: meta.size,
-        })
+        self.transport().stat(&self.resolve(path)?)
     }
 
     pub fn stat_information(&self, path: &[u8]) -> Result<NodeInfo, FsError> {
-        let trailing_slash = path.last() == Some(&b'/');
-        let mut resolved = [0; MAX_PATH + 1];
-        let name = self.path(path, &mut resolved)?;
-        let info = self.files.node_information(name).map_err(FsError::from)?;
-        if trailing_slash && FileKind::from_wire(info.kind)? != FileKind::Directory {
-            return Err(FsError::NotDirectory);
-        }
-        Ok(info)
+        self.transport().stat_information(&self.resolve(path)?)
     }
 
     pub fn descriptor_information(&self, fd: u32) -> Result<NodeInfo, FsError> {
-        match self.descriptors.get(fd)? {
-            Backend::Ram(fd) => self.files.descriptor_information(fd).map_err(FsError::from),
-            // Unnamed console transport; richer terminal metadata comes with
-            // the terminal service and its namespace entry.
-            _ => Ok(NodeInfo {
-                kind: 3,
-                permissions: 0o666,
-                device: 2,
-                special_device: 1,
-                inode: 1,
-                links: 1,
-                uid: 0,
-                gid: 0,
-                size: 0,
-                block_size: 1024,
-                blocks: 0,
-                access_ns: 0,
-                modify_ns: 0,
-                change_ns: 0,
-            }),
-        }
+        self.transport().descriptor_information(self.target(fd)?)
     }
 
     pub fn opendir(&mut self, path: &[u8]) -> Result<Directory, FsError> {
@@ -481,20 +676,6 @@ impl PosixFs {
         dir: &mut Directory,
         out: &mut [u8],
     ) -> Result<Option<DirEntry>, FsError> {
-        match self.descriptors.get(dir.fd)? {
-            Backend::Ram(fd) => self
-                .files
-                .read_dir_fd(fd, out)
-                .map_err(FsError::from)?
-                .map(|(name_len, kind, inode)| {
-                    Ok(DirEntry {
-                        inode,
-                        kind: FileKind::from_wire(kind)?,
-                        name_len,
-                    })
-                })
-                .transpose(),
-            _ => Err(FsError::NotDirectory),
-        }
+        self.transport().readdir(self.target(dir.fd)?, out)
     }
 }

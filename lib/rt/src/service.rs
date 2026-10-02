@@ -691,15 +691,14 @@ pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, 
     }
 }
 
-/// CLONE of a service through `session`, the request `header` with no
-/// body: the new session (SEND, TRANSFER) the service made for a child of
+/// CLONE of a service through `session`, the request `request` (its
+/// header and the body its protocol gives): the new session (SEND, TRANSFER) the service made for a child of
 /// the caller (spec 2, 3.7; 5c). A send that came back INTERRUPTED goes
 /// again: the service never saw it. The errors: send's, the service's
 /// status, BAD_SIZE for a reply without the session.
-pub fn clone_session(session: &Handle<Channel>, header: Header) -> Result<Handle<Channel>, Status> {
-    let request = header.bytes();
+pub fn clone_session(session: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
     let mut reply = loop {
-        match sys::send(session, &request) {
+        match sys::send(session, request) {
             Err(Error::Interrupted) => continue,
             other => break other?,
         }

@@ -70,7 +70,61 @@ pub const ARG_MAX: usize = 64 * 1024;
 pub const PATH_MAX: usize = 511;
 /// The most bytes of a block: the header, the path, the current directory
 /// and the strings.
-pub const BLOCK_MAX: usize = HEADER + 2 * PATH_MAX + ARG_MAX;
+pub const BLOCK_MAX: usize = HEADER + 2 * PATH_MAX + DESCRIPTORS * DESCRIPTOR + ARG_MAX;
+/// The descriptors a block carries at most, and the bytes of each: the
+/// number u32, what it names u32 (`Names`) and the service's number of its
+/// open description u32.
+pub const DESCRIPTORS: usize = 32;
+pub const DESCRIPTOR: usize = 12;
+
+/// What a descriptor of a block names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Names {
+    Input,
+    Output,
+    Error,
+    /// The open description of this number in the session of the RAM file
+    /// service the child gets (Clone shares it).
+    File(u32),
+}
+
+/// A descriptor the child starts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Descriptor {
+    pub fd: u32,
+    pub names: Names,
+}
+
+impl Descriptor {
+    fn bytes(&self) -> [u8; DESCRIPTOR] {
+        let (kind, file) = match self.names {
+            Names::Input => (0, 0),
+            Names::Output => (1, 0),
+            Names::Error => (2, 0),
+            Names::File(n) => (3, n),
+        };
+        let mut out = [0; DESCRIPTOR];
+        out[..4].copy_from_slice(&self.fd.to_le_bytes());
+        out[4..8].copy_from_slice(&u32::to_le_bytes(kind));
+        out[8..].copy_from_slice(&file.to_le_bytes());
+        out
+    }
+
+    /// The descriptor in `bytes`: a number below DESCRIPTORS and a kind it
+    /// knows, or None.
+    pub fn read(bytes: &[u8]) -> Option<Descriptor> {
+        let word = |i: usize| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap());
+        let fd = word(0);
+        let names = match (word(1), word(2)) {
+            (0, 0) => Names::Input,
+            (1, 0) => Names::Output,
+            (2, 0) => Names::Error,
+            (3, n) => Names::File(n),
+            _ => return None,
+        };
+        ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
+    }
+}
 /// The bytes of the header of a block.
 pub const HEADER: usize = 48;
 
@@ -189,11 +243,13 @@ pub const fn arg_size(argc: usize, envc: usize, strings: usize) -> usize {
 }
 
 /// What the parent gives the loader (spec 2, 3.2): the path of the
-/// program and the parent's current directory, its umask, `argv` and
-/// `envp`. The layout: the signature `STAFSPWN`, the version u32, the
-/// length u32, the umask u32, argc u32, envc u32, the length of the path
-/// u32, of the current directory u32, of the strings u32, 8 zero bytes;
-/// then the path, the current directory (empty or absolute), and the
+/// program and the parent's current directory, its umask, `argv`, `envp`
+/// and the descriptors the child starts with. The layout: the signature
+/// `STAFSPWN`, the version u32, the length u32, the umask u32, argc u32,
+/// envc u32, the length of the path u32, of the current directory u32, of
+/// the strings u32, the count of descriptors u32 and 4 zero bytes; then
+/// the path, the current directory (empty or absolute), the descriptors
+/// (`Descriptor`, DESCRIPTOR bytes each, distinct numbers), and the
 /// strings of `argv` and then `envp`, each with its NUL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Block<'a> {
@@ -202,6 +258,7 @@ pub struct Block<'a> {
     pub cwd: &'a [u8],
     pub argc: usize,
     pub envc: usize,
+    descriptors: &'a [u8],
     strings: &'a [u8],
 }
 
@@ -209,6 +266,43 @@ impl<'a> Block<'a> {
     /// The bytes a block of these lengths takes.
     pub const fn len(path: usize, cwd: usize, strings: usize) -> usize {
         HEADER + path + cwd + strings
+    }
+
+    /// The descriptors the child starts with.
+    pub fn descriptors(&self) -> impl Iterator<Item = Descriptor> + 'a {
+        self.descriptors
+            .as_chunks::<DESCRIPTOR>()
+            .0
+            .iter()
+            .filter_map(|chunk| Descriptor::read(chunk))
+    }
+
+    /// `write` with the descriptors `descriptors` (DESCRIPTORS at most).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_with<'s>(
+        out: &mut [u8],
+        path: &[u8],
+        cwd: &[u8],
+        umask: u32,
+        argv: impl Iterator<Item = &'s [u8]> + Clone,
+        envp: impl Iterator<Item = &'s [u8]> + Clone,
+        descriptors: &[Descriptor],
+    ) -> Result<usize, BlockError> {
+        if descriptors.len() > DESCRIPTORS {
+            return Err(BlockError::Malformed);
+        }
+        let len = Self::write(out, path, cwd, umask, argv, envp)?;
+        let extra = DESCRIPTOR * descriptors.len();
+        let at = HEADER + path.len() + cwd.len();
+        let total = len + extra;
+        let out = out.get_mut(..total).ok_or(BlockError::Malformed)?;
+        out.copy_within(at..len, at + extra);
+        for (i, d) in descriptors.iter().enumerate() {
+            out[at + DESCRIPTOR * i..at + DESCRIPTOR * (i + 1)].copy_from_slice(&d.bytes());
+        }
+        out[12..16].copy_from_slice(&(total as u32).to_le_bytes());
+        out[40..44].copy_from_slice(&(descriptors.len() as u32).to_le_bytes());
+        Ok(total)
     }
 
     /// Writes the block of `path`, `cwd`, `umask`, `argv` and `envp` (each
@@ -290,7 +384,8 @@ impl<'a> Block<'a> {
         };
         let (version, len, umask, argc, envc) = (word(0), word(1), word(2), word(3), word(4));
         let (path_len, cwd_len, strings_len) = (word(5), word(6), word(7));
-        if version != BLOCK_VERSION as usize || word(8) != 0 || word(9) != 0 {
+        let count = word(8);
+        if version != BLOCK_VERSION as usize || count > DESCRIPTORS || word(9) != 0 {
             return Err(BlockError::Malformed);
         }
         if path_len > PATH_MAX || cwd_len > PATH_MAX {
@@ -299,6 +394,7 @@ impl<'a> Block<'a> {
         let total = HEADER
             .checked_add(path_len)
             .and_then(|n| n.checked_add(cwd_len))
+            .and_then(|n| n.checked_add(DESCRIPTOR * count))
             .and_then(|n| n.checked_add(strings_len));
         if total != Some(len) || len != bytes.len() {
             return Err(BlockError::Malformed);
@@ -308,7 +404,17 @@ impl<'a> Block<'a> {
         }
         let path = &bytes[HEADER..HEADER + path_len];
         let cwd = &bytes[HEADER + path_len..HEADER + path_len + cwd_len];
-        let strings = &bytes[HEADER + path_len + cwd_len..];
+        let at = HEADER + path_len + cwd_len;
+        let descriptors = &bytes[at..at + DESCRIPTOR * count];
+        let strings = &bytes[at + DESCRIPTOR * count..];
+        let mut seen = 0u64;
+        for chunk in descriptors.as_chunks::<DESCRIPTOR>().0 {
+            let d = Descriptor::read(chunk).ok_or(BlockError::Malformed)?;
+            if seen & 1 << d.fd != 0 {
+                return Err(BlockError::Malformed);
+            }
+            seen |= 1 << d.fd;
+        }
         let nuls = strings.iter().filter(|&&b| b == 0).count();
         let well_formed = !path.is_empty()
             && !path.contains(&0)
@@ -325,6 +431,7 @@ impl<'a> Block<'a> {
             cwd,
             argc,
             envc,
+            descriptors,
             strings,
         })
     }
@@ -400,7 +507,11 @@ pub struct Start {
     pub auxv: u64,
     /// The values of the handles, by `Slot`; 0 for none.
     pub handles: [u64; SLOTS],
-    _reserved: [u64; 2],
+    /// The descriptors the program starts with (`Descriptor`, DESCRIPTOR
+    /// bytes each) and their count.
+    pub descriptors: u64,
+    pub descriptor_count: u32,
+    _reserved: u32,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
@@ -416,7 +527,7 @@ const _: () = assert!(START_SIZE == 128);
 /// and the strings, rounded up to 16.
 pub const fn area_len(block: &Block<'_>) -> usize {
     let stack = 8 * (1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS);
-    let strings = block.cwd.len() + 1 + block.strings.len();
+    let strings = block.cwd.len() + 1 + block.strings.len() + block.descriptors.len();
     (START_SIZE + stack + strings).next_multiple_of(16)
 }
 
@@ -442,6 +553,9 @@ pub fn write_area(
     area[cwd_at + block.cwd.len()] = 0;
     let copied_at = cwd_at + block.cwd.len() + 1;
     area[copied_at..copied_at + block.strings.len()].copy_from_slice(block.strings);
+    let descriptors_at = copied_at + block.strings.len();
+    area[descriptors_at..descriptors_at + block.descriptors.len()]
+        .copy_from_slice(block.descriptors);
     let mut word = |i: usize, value: u64| {
         area[stack_at + 8 * i..stack_at + 8 * i + 8].copy_from_slice(&value.to_le_bytes());
     };
@@ -483,7 +597,9 @@ pub fn write_area(
         stack: at + stack_at as u64,
         auxv: at + (stack_at + 8 * auxv) as u64,
         handles,
-        _reserved: [0; 2],
+        descriptors: at + descriptors_at as u64,
+        descriptor_count: (block.descriptors.len() / DESCRIPTOR) as u32,
+        _reserved: 0,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -770,5 +886,59 @@ mod tests {
             }
             assert_eq!(start.stack % 16, 0);
         }
+    }
+
+    /// The descriptors ride between the current directory and the strings,
+    /// each number once, and reach the start area.
+    #[test]
+    fn descriptors_ride_in_the_block_and_the_area() {
+        let list = [
+            Descriptor {
+                fd: 0,
+                names: Names::Input,
+            },
+            Descriptor {
+                fd: 4,
+                names: Names::File(7),
+            },
+        ];
+        let mut out = vec![0; BLOCK_MAX];
+        let argv: [&[u8]; 1] = [b"ls"];
+        let len = Block::write_with(
+            &mut out,
+            b"/bin/ls",
+            b"/",
+            0,
+            argv.into_iter(),
+            [].into_iter(),
+            &list,
+        )
+        .unwrap();
+        let read = Block::read(&out[..len]).unwrap();
+        assert_eq!(read.descriptors().collect::<Vec<_>>(), list);
+        assert_eq!(read.strings(), b"ls\0");
+        let mut twice = out[..len].to_vec();
+        let at = HEADER + 7 + 1;
+        twice[at + DESCRIPTOR..at + DESCRIPTOR + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            Block::read(&twice),
+            Err(BlockError::Malformed),
+            "fd 0 twice"
+        );
+        let mut far = out[..len].to_vec();
+        far[at..at + 4].copy_from_slice(&32u32.to_le_bytes());
+        assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 32");
+        let mut area = vec![0; area_len(&read)];
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS]).unwrap();
+        let start = Start::read(&area).unwrap();
+        assert_eq!(start.descriptor_count, 2);
+        let at = (start.descriptors - START_AREA) as usize;
+        let back: Vec<_> = area[at..at + 2 * DESCRIPTOR]
+            .as_chunks::<DESCRIPTOR>()
+            .0
+            .iter()
+            .filter_map(|chunk| Descriptor::read(chunk))
+            .collect();
+        assert_eq!(back, list);
     }
 }

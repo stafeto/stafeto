@@ -173,6 +173,38 @@ pub unsafe extern "C" fn stafeto_start_handles(out: *mut u64) {
     }
 }
 
+/// The descriptors the start area names (proto_loader::Descriptor), as
+/// the layer's files take them.
+fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::DESCRIPTORS] {
+    use posix_fs::{Inherited, Target};
+    use proto_loader::{DESCRIPTOR, DESCRIPTORS, Descriptor, Names};
+    let mut list = [Inherited {
+        fd: 0,
+        target: Target::Input,
+    }; DESCRIPTORS];
+    let count = (area.descriptor_count as usize).min(DESCRIPTORS);
+    // SAFETY: the loader wrote `count` descriptors at `descriptors` in
+    // the area, which stays mapped.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(area.descriptors as *const u8, count * DESCRIPTOR) };
+    for (place, d) in list.iter_mut().zip(
+        bytes
+            .as_chunks::<DESCRIPTOR>()
+            .0
+            .iter()
+            .filter_map(|c| Descriptor::read(c)),
+    ) {
+        let target = match d.names {
+            Names::Input => Target::Input,
+            Names::Output => Target::Output,
+            Names::Error => Target::Error,
+            Names::File(n) => Target::Ram(n),
+        };
+        *place = Inherited { fd: d.fd, target };
+    }
+    list
+}
+
 /// The start of a program its loader started: the area at
 /// proto_loader::START_AREA names its handles, its current directory, its
 /// umask and its initial stack, whose auxiliary vector this fills.
@@ -222,8 +254,17 @@ fn loaded_main() -> u64 {
             })
             .and_then(|()| {
                 let uart = one(Slot::Uart).map(Handle::from_raw);
-                PosixFs::from_sessions(Handle::from_raw(files), uart, cwd)
-                    .map_err(|_| "files failed")
+                let inherited = inherited(&area);
+                let count = area.descriptor_count as usize;
+                let secure = area.flags & SECURE != 0;
+                PosixFs::from_sessions(
+                    Handle::from_raw(files),
+                    uart,
+                    cwd,
+                    Some(&inherited[..count.min(inherited.len())]),
+                    secure,
+                )
+                .map_err(|_| "files failed")
             })
             .and_then(|files| posix_abi::shared::init(files).map_err(|_| "files failed"))
             .and_then(|()| posix_abi::allocation::init(process).map_err(|_| "heap failed"))

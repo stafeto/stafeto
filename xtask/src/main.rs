@@ -1921,6 +1921,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: args 4 [one two] [three] X=1",
         "posix-procs: setid uid 65534 euid 0 secure 1 fd 3",
         "posix-procs: nobody uid 65534 euid 65534",
+        // Stage 8: the file actions' current directory.
+        "posix-procs: the child's directory is /bin",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }

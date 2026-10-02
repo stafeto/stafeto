@@ -379,6 +379,206 @@ pub fn spawn(path: &[u8], flags: i32, pgroup: i32) -> Result<i32, i32> {
 const SPAWN_WINDOW: usize = 0x3000_0000;
 static SPAWN_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::raising();
 
+/// A file action of posix_spawn (spawn.h): open `path` with `flags` at
+/// `fd`, close `fd`, dup2, chdir and fchdir.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileAction<'a> {
+    Open { fd: u32, path: &'a [u8], flags: i32 },
+    Close(u32),
+    Dup2(u32, u32),
+    Chdir(&'a [u8]),
+    Fchdir(u32),
+}
+
+/// The child's descriptors and current directory as the file actions
+/// shape them (5c, decision 8): a shadow of the caller's table, whose
+/// files of the service the caller holds until the child's session shares
+/// them, and the descriptors the actions opened in the caller, which close
+/// after the spawn.
+struct Shadow {
+    entries: [Option<(posix_fs::Target, bool)>; posix_fs::OPEN_MAX],
+    held: [Option<posix_fs::Target>; posix_fs::OPEN_MAX],
+    opened: [Option<u32>; posix_fs::OPEN_MAX],
+    cwd: [u8; proto_loader::PATH_MAX],
+    cwd_len: usize,
+}
+
+impl Shadow {
+    /// The caller's table and current directory, its files held.
+    fn take() -> Result<Shadow, i32> {
+        let mut shadow = Shadow {
+            entries: [None; posix_fs::OPEN_MAX],
+            held: [None; posix_fs::OPEN_MAX],
+            opened: [None; posix_fs::OPEN_MAX],
+            cwd: [0; proto_loader::PATH_MAX],
+            cwd_len: 0,
+        };
+        crate::shared::with_files(|files| {
+            let mut open = [None; posix_fs::OPEN_MAX];
+            for (fd, target, flags) in files.descriptors() {
+                open[fd as usize] = Some((target, flags.close_on_exec));
+            }
+            for (fd, entry) in open.iter().enumerate() {
+                if let Some((_, close_on_exec)) = entry {
+                    let target = files.hold(fd as u32).map_err(crate::error)?;
+                    shadow.held[fd] = Some(target);
+                    shadow.entries[fd] = Some((target, *close_on_exec));
+                }
+            }
+            let own = files.cwd();
+            let n = own.len().min(shadow.cwd.len());
+            shadow.cwd[..n].copy_from_slice(&own[..n]);
+            shadow.cwd_len = n;
+            Ok(())
+        })?;
+        Ok(shadow)
+    }
+
+    fn cwd(&self) -> &[u8] {
+        &self.cwd[..self.cwd_len]
+    }
+
+    /// `path` against the shadow's current directory, into `out`.
+    fn absolute<'o>(
+        &self,
+        path: &[u8],
+        out: &'o mut [u8; proto_loader::PATH_MAX],
+    ) -> Result<&'o [u8], i32> {
+        use crate::constants::{ENAMETOOLONG, ENOENT};
+        if path.is_empty() {
+            return Err(ENOENT);
+        }
+        let parts: [&[u8]; 3] = if path[0] == b'/' {
+            [path, b"", b""]
+        } else if self.cwd().ends_with(b"/") {
+            [self.cwd(), path, b""]
+        } else {
+            [self.cwd(), b"/", path]
+        };
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        if len > out.len() {
+            return Err(ENAMETOOLONG);
+        }
+        let mut at = 0;
+        for p in parts {
+            out[at..at + p.len()].copy_from_slice(p);
+            at += p.len();
+        }
+        Ok(&out[..len])
+    }
+
+    /// One file action, in order ([P24-SPAWN]).
+    fn apply(&mut self, action: FileAction<'_>) -> Result<(), i32> {
+        use crate::constants::{EBADF, ENOSYS, ENOTDIR};
+        let slot = |fd: u32| -> Result<usize, i32> {
+            ((fd as usize) < posix_fs::OPEN_MAX)
+                .then_some(fd as usize)
+                .ok_or(EBADF)
+        };
+        match action {
+            FileAction::Close(fd) => {
+                self.entries[slot(fd)?] = None;
+            }
+            FileAction::Dup2(fd, new) => {
+                let (target, _) = self.entries[slot(fd)?].ok_or(EBADF)?;
+                // The copy has no FD_CLOEXEC, and so has the descriptor
+                // dup2 names twice ([P24-SPAWN]).
+                self.entries[slot(new)?] = Some((target, false));
+            }
+            FileAction::Open { fd, path, flags } => {
+                let place = slot(fd)?;
+                let mut full = [0; proto_loader::PATH_MAX];
+                let full = self.absolute(path, &mut full)?;
+                let own = crate::open(full, flags & !crate::constants::O_CLOEXEC)?;
+                let own = own as u32;
+                let target =
+                    crate::shared::with_files(|files| files.target(own).map_err(crate::error));
+                let Some(free) = self.opened.iter_mut().find(|o| o.is_none()) else {
+                    let _ = crate::close(own as i32);
+                    return Err(crate::constants::EMFILE);
+                };
+                *free = Some(own);
+                self.entries[place] = Some((target?, flags & crate::constants::O_CLOEXEC != 0));
+            }
+            FileAction::Chdir(path) => {
+                let mut full = [0; proto_loader::PATH_MAX];
+                let full = self.absolute(path, &mut full)?;
+                let directory = crate::shared::resolved(full, |transport, path| {
+                    Ok(transport.stat(path).map_err(crate::error)?.kind
+                        == posix_fs::FileKind::Directory)
+                })?;
+                if !directory {
+                    return Err(ENOTDIR);
+                }
+                let len = full.len();
+                let mut copy = [0; proto_loader::PATH_MAX];
+                copy[..len].copy_from_slice(full);
+                self.cwd = copy;
+                self.cwd_len = len;
+            }
+            // The layer keeps no path of a descriptor yet.
+            FileAction::Fchdir(_) => return Err(ENOSYS),
+        }
+        Ok(())
+    }
+
+    /// The descriptors the child starts with: those without FD_CLOEXEC.
+    fn descriptors(&self) -> ([proto_loader::Descriptor; proto_loader::DESCRIPTORS], usize) {
+        use proto_loader::{Descriptor, Names};
+        let mut out = [Descriptor {
+            fd: 0,
+            names: Names::Input,
+        }; proto_loader::DESCRIPTORS];
+        let mut count = 0;
+        for (fd, entry) in self.entries.iter().enumerate() {
+            let Some((target, false)) = entry else {
+                continue;
+            };
+            let names = match *target {
+                posix_fs::Target::Input => Names::Input,
+                posix_fs::Target::Output => Names::Output,
+                posix_fs::Target::Error => Names::Error,
+                posix_fs::Target::Ram(n) => Names::File(n),
+            };
+            out[count] = Descriptor {
+                fd: fd as u32,
+                names,
+            };
+            count += 1;
+        }
+        (out, count)
+    }
+
+    /// The service's descriptions the child's session shares, each once.
+    fn shared(&self) -> impl Iterator<Item = u32> + Clone + '_ {
+        let (list, count) = self.descriptors();
+        (0..count).filter_map(move |i| match list[i].names {
+            proto_loader::Names::File(n)
+                if !list[..i]
+                    .iter()
+                    .any(|d| d.names == proto_loader::Names::File(n)) =>
+            {
+                Some(n)
+            }
+            _ => None,
+        })
+    }
+
+    /// The caller lets go: its holds end and the descriptors the actions
+    /// opened close (the child's session keeps the descriptions it shares).
+    fn finish(&mut self) {
+        for target in self.held.iter_mut().filter_map(Option::take) {
+            let release = crate::shared::with_files(|files| Ok(files.unhold(target)));
+            if let Ok(Some(posix_fs::Target::Ram(n))) = release {
+                let _ = crate::shared::release(n);
+            }
+        }
+        for fd in self.opened.iter_mut().filter_map(Option::take) {
+            let _ = crate::close(fd as i32);
+        }
+    }
+}
+
 /// What posix_spawn of a file takes beyond the path and the strings: the
 /// spawn-flags and the process group (proto_process::SPAWN_FLAGS), the
 /// mask of POSIX_SPAWN_SETSIGMASK (None: the caller's), the signals of
@@ -455,18 +655,14 @@ fn block<'s>(
     argv: impl Iterator<Item = &'s [u8]> + Clone,
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     umask: u32,
+    shadow: &Shadow,
 ) -> Result<(usize, Handle<rt::handle::Memory>), i32> {
     use crate::constants::{E2BIG, EINVAL, ENAMETOOLONG, ENOMEM};
     use proto_loader::{Block, BlockError};
-    let mut cwd = [0; proto_loader::PATH_MAX];
-    let cwd_len = crate::shared::with_files(|files| {
-        let own = files.cwd();
-        let n = own.len().min(cwd.len());
-        cwd[..n].copy_from_slice(&own[..n]);
-        Ok(n)
-    })?;
+    let cwd = shadow.cwd();
+    let (descriptors, count) = shadow.descriptors();
     let strings: usize = argv.clone().chain(envp.clone()).map(|s| s.len() + 1).sum();
-    let len = Block::len(path.len(), cwd_len, strings);
+    let len = Block::len(path.len(), cwd.len(), strings) + proto_loader::DESCRIPTOR * count;
     let pages = (len.min(proto_loader::BLOCK_MAX) as u64).next_multiple_of(4096);
     let object = rt::sys::mem_create(pages).map_err(|_| ENOMEM)?;
     let _guard = SPAWN_LOCK.lock();
@@ -483,7 +679,7 @@ fn block<'s>(
     // SAFETY: the window maps `pages` bytes of the new object, which only
     // this call uses under SPAWN_LOCK.
     let out = unsafe { core::slice::from_raw_parts_mut(SPAWN_WINDOW as *mut u8, pages as usize) };
-    let written = Block::write(out, path, &cwd[..cwd_len], umask, argv, envp);
+    let written = Block::write_with(out, path, cwd, umask, argv, envp, &descriptors[..count]);
     // SAFETY: the mapping made above, which nothing uses after the write.
     let _ = unsafe { rt::sys::mem_unmap(process, SPAWN_WINDOW, pages) };
     match written {
@@ -503,14 +699,14 @@ fn block<'s>(
 /// gone: ENOENT, EACCES, ENOEXEC, ENOMEM, E2BIG, ENAMETOOLONG, ENOTDIR,
 /// EPERM, EINVAL for a flag the service does not take, EAGAIN past its
 /// limits.
-pub fn spawn_file<'s>(
+pub fn spawn_file<'s, 'a>(
     path: &[u8],
     argv: impl Iterator<Item = &'s [u8]> + Clone,
     envp: impl Iterator<Item = &'s [u8]> + Clone,
     attributes: SpawnAttributes,
+    actions: impl Iterator<Item = FileAction<'a>>,
 ) -> Result<i32, i32> {
-    use crate::constants::{EAGAIN, EINVAL, EIO, ENOENT};
-    use proto_process::{Method, SpawnStart};
+    use crate::constants::{EINVAL, ENOENT};
     if path.is_empty() {
         return Err(ENOENT);
     }
@@ -518,7 +714,28 @@ pub fn spawn_file<'s>(
     if pgroup > i32::MAX as u32 || attributes.flags & !proto_process::SPAWN_FLAGS != 0 {
         return Err(EINVAL);
     }
-    let (len, object) = block(path, argv, envp, attributes.umask)?;
+    let mut shadow = Shadow::take()?;
+    let spawned = actions
+        .into_iter()
+        .try_for_each(|action| shadow.apply(action))
+        .and_then(|()| spawn_shadowed(path, argv, envp, attributes, &shadow));
+    shadow.finish();
+    spawned
+}
+
+/// spawn_file once the file actions shaped the child's descriptors and
+/// current directory in `shadow`.
+fn spawn_shadowed<'s>(
+    path: &[u8],
+    argv: impl Iterator<Item = &'s [u8]> + Clone,
+    envp: impl Iterator<Item = &'s [u8]> + Clone,
+    attributes: SpawnAttributes,
+    shadow: &Shadow,
+) -> Result<i32, i32> {
+    use crate::constants::{EAGAIN, EIO};
+    use proto_process::{Method, SpawnStart};
+    let pgroup = attributes.pgroup;
+    let (len, object) = block(path, argv, envp, attributes.umask, shadow)?;
     let block = &crate::threads::own_block;
     let level = block().base_level.load(Ordering::Relaxed) as u8;
     let mask = attributes
@@ -550,7 +767,7 @@ pub fn spawn_file<'s>(
     let pid = r.u32().map_err(|_| EIO)?;
     let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
     let pid = i32::try_from(pid).map_err(|_| EIO)?;
-    let finished = commit(&c, pid, len, object);
+    let finished = commit(&c, pid, len, object, shadow);
     if finished.is_err() {
         let _ = ask(&request(Method::SpawnAbort, &[pid as u32])?);
     }
@@ -565,6 +782,7 @@ fn commit(
     pid: i32,
     len: usize,
     object: Handle<rt::handle::Memory>,
+    shadow: &Shadow,
 ) -> Result<(), i32> {
     use crate::constants::{EIO, ENOMEM};
     use proto_loader::{Method, Slot};
@@ -583,23 +801,38 @@ fn commit(
     if code != 0 {
         return Err(load_errno(code));
     }
-    // The child's own sessions: clones of the caller's.
+    // The child's own sessions: clones of the caller's, the one of the
+    // RAM files sharing the descriptions the child starts with.
     let clock = crate::clock::session().ok_or(EIO)?;
-    let clock =
-        rt::service::clone_session(clock, proto_clock::Method::Clone.header()).map_err(|_| EIO)?;
+    let clock = rt::service::clone_session(clock, &proto_clock::Method::Clone.header().bytes())
+        .map_err(|_| EIO)?;
     let (files, uart) = crate::shared::with_files(|fs| {
         let (files, uart) = fs.sessions();
-        let files =
-            rt::service::clone_session(files, proto_fs::Method::Clone.header()).map_err(|_| EIO)?;
-        let uart = match uart {
-            Some(u) => Some(
-                rt::service::clone_session(u, proto_uart::Method::Clone.header())
-                    .map_err(|_| EIO)?,
-            ),
-            None => None,
-        };
-        Ok((files, uart))
+        Ok((files.raw(), uart.map(Handle::raw)))
     })?;
+    let mut w = Writer::new();
+    proto_fs::Method::Clone
+        .header()
+        .write(&mut w)
+        .map_err(|_| EIO)?;
+    let shared = shadow.shared();
+    w.u32(shared.clone().count() as u32).map_err(|_| EIO)?;
+    for fd in shared {
+        w.u32(fd).map_err(|_| EIO)?;
+    }
+    // The sessions live as long as the process's files.
+    let files = rt::service::clone_session(&Handle::<Channel>::borrowed(files), w.as_bytes())
+        .map_err(|_| EIO)?;
+    let uart = match uart {
+        Some(u) => Some(
+            rt::service::clone_session(
+                &Handle::<Channel>::borrowed(u),
+                &proto_uart::Method::Clone.header().bytes(),
+            )
+            .map_err(|_| EIO)?,
+        ),
+        None => None,
+    };
     let mut w = Writer::new();
     Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
     let mut handles = rt::handle::Outgoing::new();
@@ -636,15 +869,19 @@ pub fn probe_open_exec(path: &[u8]) -> i32 {
     if proto_fs::Method::OpenExec.header().write(&mut w).is_err() || w.bytes(path).is_err() {
         return EIO;
     }
-    let sent = crate::shared::with_files(|files| {
-        let (session, _) = files.sessions();
-        let mut buffer = [0; rt::abi::MESSAGE_MAX];
-        let reply =
-            rt::sys::send_handles(session, w.as_bytes(), [copy.erase()]).map_err(|_| EIO)?;
-        proto_wire::Reader::new(reply.bytes(&mut buffer))
-            .u32()
-            .map_err(|_| EIO)
-    });
+    let Ok(session) = crate::shared::with_files(|files| Ok(files.sessions().0.raw())) else {
+        return EIO;
+    };
+    // The session lives as long as the process's files.
+    let session = Handle::<Channel>::borrowed(session);
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let sent = rt::sys::send_handles(&session, w.as_bytes(), [copy.erase()])
+        .map_err(|_| EIO)
+        .and_then(|reply| {
+            proto_wire::Reader::new(reply.bytes(&mut buffer))
+                .u32()
+                .map_err(|_| EIO)
+        });
     match sent {
         Ok(0) => 0,
         Ok(proto_fs::PERMISSION) => EPERM,
