@@ -845,8 +845,13 @@ fn message_regs(
         return Err(Error::InvalidArgs);
     }
     let (inline, rest) = bytes.split_at(bytes.len().min(INLINE_MAX));
-    msgbuf::write(INLINE_MAX, rest);
-    msgbuf::put_handles(handles);
+    // A short message without handles touches no memory of the buffer.
+    if !rest.is_empty() {
+        msgbuf::write(INLINE_MAX, rest);
+    }
+    if !handles.is_empty() {
+        msgbuf::put_handles(handles);
+    }
     let mut x = [0; 10];
     x[0] = target;
     x[1] = bytes.len() as u64 | (handles.len() as u64) << HANDLES_SHIFT | flags;

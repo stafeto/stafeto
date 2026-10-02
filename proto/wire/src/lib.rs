@@ -27,6 +27,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use core::mem::MaybeUninit;
+
 use abi::{Error, MESSAGE_MAX};
 use core::fmt;
 
@@ -253,16 +255,18 @@ impl<'a> Reader<'a> {
 
 /// Writes the fields of a message in order into a buffer of
 /// abi::MESSAGE_MAX bytes, the most a message holds. A write past it is
-/// BAD_SIZE and writes nothing.
+/// BAD_SIZE and writes nothing. The buffer is not cleared when the writer
+/// is made: only the bytes written so far are ever read (`as_bytes`), so a
+/// reply of a few bytes costs a few stores (#86).
 pub struct Writer {
-    buffer: [u8; MESSAGE_MAX],
+    buffer: [MaybeUninit<u8>; MESSAGE_MAX],
     len: usize,
 }
 
 impl Writer {
     pub const fn new() -> Writer {
         Writer {
-            buffer: [0; MESSAGE_MAX],
+            buffer: [const { MaybeUninit::uninit() }; MESSAGE_MAX],
             len: 0,
         }
     }
@@ -270,7 +274,9 @@ impl Writer {
     pub fn bytes(&mut self, bytes: &[u8]) -> Result<(), Status> {
         let end = self.len + bytes.len();
         let room = self.buffer.get_mut(self.len..end).ok_or(Status::BadSize)?;
-        room.copy_from_slice(bytes);
+        for (slot, byte) in room.iter_mut().zip(bytes) {
+            slot.write(*byte);
+        }
         self.len = end;
         Ok(())
     }
@@ -294,7 +300,10 @@ impl Writer {
 
     /// The message written so far.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.buffer[..self.len]
+        let written = &self.buffer[..self.len];
+        // SAFETY: `bytes` initialized every byte below `len`, and
+        // MaybeUninit<u8> has the layout of u8.
+        unsafe { core::slice::from_raw_parts(written.as_ptr().cast::<u8>(), written.len()) }
     }
 }
 
@@ -519,5 +528,39 @@ mod tests {
             long::Reply::read(&reply(Status::Kernel(Error::LimitReached))),
             Err(Status::Kernel(Error::LimitReached))
         );
+    }
+
+    /// The bytes of replies as services write them, which went out the
+    /// same before the writer stopped clearing its buffer: exactly the
+    /// fields written, nothing of what lay in the buffer past them, also
+    /// for a writer whose memory held another message before (#86).
+    #[test]
+    fn replies_carry_their_fields_and_nothing_more() {
+        let write = |f: &dyn Fn(&mut Writer)| {
+            // A writer made again where a longer message lay before.
+            let mut w = Writer::new();
+            w.bytes(&[0xee; MESSAGE_MAX]).unwrap();
+            assert_eq!(w.as_bytes().len(), MESSAGE_MAX);
+            w = Writer::new();
+            f(&mut w);
+            w.as_bytes().to_vec()
+        };
+        assert_eq!(
+            write(&|w| w.u32(Status::Ok.code()).unwrap()),
+            reply(Status::Ok)[..4]
+        );
+        assert_eq!(
+            write(&|w| long::Reply::Wait(0x1_0000_0002).write(w).unwrap()),
+            [0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            write(&|w| long::Reply::Ready(b"ab").write(w).unwrap()),
+            [0, 0, 0, 0, 1, 0, 0, 0, b'a', b'b']
+        );
+        assert_eq!(
+            write(&|w| Header::new(7, 2).write(w).unwrap()),
+            Header::new(7, 2).bytes()
+        );
+        assert_eq!(write(&|_| {}), [0u8; 0]);
     }
 }

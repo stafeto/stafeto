@@ -391,10 +391,16 @@ pub const INLINE_MAX: usize = 64;
 pub fn inline_words(bytes: &[u8]) -> [u64; 8] {
     assert!(bytes.len() <= INLINE_MAX, "x2-x9 carry at most 64 bytes");
     let mut words = [0; 8];
-    for (i, chunk) in bytes.chunks(8).enumerate() {
-        let mut word = [0; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        words[i] = u64::from_le_bytes(word);
+    let (whole, tail) = bytes.as_chunks::<8>();
+    // Whole words as loads, the tail byte by byte: no call of memcpy for
+    // a few bytes (#86).
+    for (word, chunk) in words.iter_mut().zip(whole) {
+        *word = u64::from_le_bytes(*chunk);
+    }
+    if let Some(word) = words.get_mut(whole.len()) {
+        for (i, byte) in tail.iter().enumerate() {
+            *word |= u64::from(*byte) << (8 * i);
+        }
     }
     words
 }
@@ -402,8 +408,8 @@ pub fn inline_words(bytes: &[u8]) -> [u64; 8] {
 /// The bytes that x2-x9 carry, in the order of `inline_words`.
 pub fn inline_bytes(words: &[u64; 8]) -> [u8; INLINE_MAX] {
     let mut bytes = [0; INLINE_MAX];
-    for (chunk, word) in bytes.chunks_mut(8).zip(words) {
-        chunk.copy_from_slice(&word.to_le_bytes());
+    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
     }
     bytes
 }

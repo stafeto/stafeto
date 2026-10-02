@@ -771,7 +771,8 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| kernel_tests(m, variant).map(|_| ()))
         }
         Some("init-test") => {
-            qemu::machine(args.get(1)).and_then(|m| init_tests(m, false).map(|_| ()))
+            let icount = args.get(2).is_some_and(|a| a == "icount");
+            qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("gdb") => gdb(),
         Some("ci") => ci(),
