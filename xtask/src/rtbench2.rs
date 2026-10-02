@@ -224,7 +224,7 @@ fn output(program: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn commit() -> String {
+pub fn commit() -> String {
     let hash = output("git", &["rev-parse", "--short", "HEAD"]);
     let dirty = !output("git", &["status", "--porcelain", "--untracked-files=no"]).is_empty();
     if dirty {

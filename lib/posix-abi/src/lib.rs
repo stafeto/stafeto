@@ -1,22 +1,21 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Experimental C file ABI 1 and startup, backed entirely by Rust. Entry points
-//! require the initialized current-thread scope. The C caller supplies live,
-//! properly sized buffers; null pointers are reported as EFAULT. No Picolibc.
+//! The POSIX system layer in Rust: files, descriptors, the process's
+//! pages, threads, waits, cancellation, signals, clocks and credentials,
+//! which relibc's platform (posix-platform's `stafeto_*`) calls. Its
+//! functions give a value or an errno (`Result<_, i32>`) and keep no errno
+//! of their own; the C side is relibc's.
 
 #![no_std]
 
 pub mod allocation;
 pub mod clock;
 pub mod constants;
-pub mod directory;
-pub mod locale;
 pub mod long;
 pub mod metadata;
-pub mod ordering;
 pub mod process;
-pub mod scan;
+pub mod relibc;
 pub mod shared;
 pub mod signals;
 pub mod threads;
@@ -24,7 +23,6 @@ pub mod tls;
 
 use constants::*;
 use core::ffi::{c_char, c_int};
-use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
 use posix_request::{MESSAGE_MAX, Reply, Request};
@@ -70,7 +68,8 @@ pub fn probe_ceiling() -> u8 {
     ceiling().expect("the ceiling")
 }
 
-fn error(error: FsError) -> c_int {
+/// The errno of a file error.
+pub fn error(error: FsError) -> c_int {
     match error {
         FsError::NoEntry => ENOENT,
         FsError::PermissionDenied => EACCES,
@@ -90,12 +89,6 @@ fn error(error: FsError) -> c_int {
     }
 }
 
-fn fail(code: c_int) -> i64 {
-    // SAFETY: errno belongs only to the current thread's live scope.
-    unsafe { *tls::errno() = code };
-    -1
-}
-
 fn fd(fd: c_int) -> Result<u32, c_int> {
     u32::try_from(fd).map_err(|_| EBADF)
 }
@@ -107,7 +100,11 @@ fn descriptor_flags(flags: c_int) -> DescriptorFlags {
     }
 }
 
-unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
+/// The bytes of the C string at `pointer`, at most 128 of them.
+///
+/// # Safety
+/// `pointer` is null or a readable, terminated C string.
+pub unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
     if pointer.is_null() {
         return Err(EFAULT);
     }
@@ -121,51 +118,30 @@ unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
     Err(ENAMETOOLONG)
 }
 
-/// # Safety
-/// Called inside a current-thread ABI scope. The returned pointer stays live
-/// until the scope ends; it must not be shared between threads.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn __errno_location() -> *mut c_int {
-    tls::errno()
+/// Opens `name` with the access mode, O_DIRECTORY and the close-on-exec
+/// and close-on-fork flags of `flags`: the descriptor or an errno.
+pub fn open(name: &[u8], flags: c_int) -> Result<c_int, c_int> {
+    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
+        || flags & O_ACCMODE == O_ACCMODE
+    {
+        return Err(EINVAL);
+    }
+    shared::number(Request::Open {
+        path: name,
+        flags: flags as u32,
+    })
+    .map(|fd| fd as c_int)
 }
 
-/// # Safety
-/// `name` is a live C string and this thread has an initialized file scope.
-/// The initial ABI accepts access mode, O_DIRECTORY and close-on-exec/fork flags.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn open(name: *const c_char, flags: c_int) -> c_int {
-    let result = (|| {
-        let name = unsafe { path(name) }?;
-        if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
-            || flags & O_ACCMODE == O_ACCMODE
-        {
-            return Err(EINVAL);
-        }
-        shared::number(Request::Open {
-            path: name,
-            flags: flags as u32,
-        })
-    })();
-    result.map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
+pub fn close(number: c_int) -> Result<(), c_int> {
+    shared::unit(Request::Close { fd: fd(number)? })
 }
 
-/// # Safety
-/// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn close(number: c_int) -> c_int {
-    fd(number)
-        .and_then(|fd| shared::unit(Request::Close { fd }))
-        .map_or_else(|code| fail(code) as c_int, |()| 0)
-}
-
-/// # Safety
-/// `buffer` supplies `count` writable bytes (may be null for zero bytes).
-/// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> isize {
+/// Reads into `buffer`: a point of cancellation.
+pub fn read(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
     let point = threads::cancel::Point::begin();
-    let result = unsafe { read_inner(number, buffer, count) };
-    if result > 0 {
+    let result = read_inner(number, buffer);
+    if result.is_ok_and(|n| n > 0) {
         point.end();
     } else {
         point.finish();
@@ -174,53 +150,39 @@ pub unsafe extern "C" fn read(number: c_int, buffer: *mut u8, count: usize) -> i
 }
 
 // Keep cancellation outside frames holding transport resources and buffers.
-unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
-    if count > isize::MAX as usize {
-        return fail(EINVAL) as isize;
-    }
-    if buffer.is_null() && count != 0 {
-        return fail(EFAULT) as isize;
-    }
+fn read_inner(number: c_int, buffer: &mut [u8]) -> Result<usize, c_int> {
     let mut message = [0; MESSAGE_MAX];
-    let result = fd(number).and_then(|fd| {
-        let count = count.min(posix_request::MAX_READ);
-        match shared::dispatch(
-            Request::Read {
-                fd,
-                count: count as u32,
-            },
-            &mut message,
-        )? {
-            Reply::Bytes(bytes) => {
-                if bytes.len() > count {
-                    return Err(EIO);
-                }
-                if !bytes.is_empty() {
-                    // SAFETY: the validated result fits the caller's writable extent.
-                    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, bytes.len()) };
-                }
-                Ok(bytes.len())
+    let fd = fd(number)?;
+    let count = buffer.len().min(posix_request::MAX_READ);
+    match shared::dispatch(
+        Request::Read {
+            fd,
+            count: count as u32,
+        },
+        &mut message,
+    )? {
+        Reply::Bytes(bytes) => {
+            if bytes.len() > count {
+                return Err(EIO);
             }
-            Reply::Input { uart, extent } => {
-                if extent as usize > count {
-                    return Err(EIO);
-                }
-                // SAFETY: as the caller of read promises.
-                unsafe { console_read(uart, extent, buffer) }
-            }
-            _ => Err(EIO),
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
         }
-    });
-    result.map_or_else(|code| fail(code) as isize, |length| length as isize)
+        Reply::Input { uart, extent } => {
+            if extent as usize > count {
+                return Err(EIO);
+            }
+            console_read(uart, &mut buffer[..extent as usize])
+        }
+        _ => Err(EIO),
+    }
 }
 
 /// The console's branch of `read`, in its own frame: its buffers stay off
 /// the stack of reads of files, which go on under the lock of the files.
-///
-/// # Safety
-/// `buffer` supplies `extent` writable bytes.
 #[inline(never)]
-unsafe fn console_read(uart: Option<u64>, extent: u32, buffer: *mut u8) -> Result<usize, i32> {
+fn console_read(uart: Option<u64>, buffer: &mut [u8]) -> Result<usize, i32> {
+    let extent = buffer.len();
     let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
     let uart = Handle::<Channel>::borrowed(uart.map(rt::abi::Handle).ok_or(EBADF)?);
     let mut bytes = [0; posix_request::MAX_READ];
@@ -232,18 +194,15 @@ unsafe fn console_read(uart: Option<u64>, extent: u32, buffer: *mut u8) -> Resul
         .is_some_and(|b| b.channel.load(Ordering::Relaxed) != 0);
     if !attached {
         let length = input
-            .read(&mut bytes[..extent as usize])
+            .read(&mut bytes[..extent])
             .map_err(|status| error(status.into()))?;
-        if length != 0 {
-            // SAFETY: the transport returned at most the validated extent.
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
-        }
+        buffer[..length].copy_from_slice(&bytes[..length]);
         return Ok(length);
     }
     // A read in two steps waits on the thread's own channel: a
     // signal or a request of cancellation ends it at once.
     let mut start = proto_wire::Writer::new();
-    proto_uart::ReadRequest { max: extent }
+    proto_uart::ReadRequest { max: extent as u32 }
         .write_start(&mut start)
         .map_err(|_| EINVAL)?;
     let mut raw = [0; posix_request::MAX_READ];
@@ -258,24 +217,22 @@ unsafe fn console_read(uart: Option<u64>, extent: u32, buffer: *mut u8) -> Resul
             };
             proto_uart::ReadKey { key }.write(method, w)
         },
-        &mut raw[..extent as usize],
+        &mut raw[..extent],
     )?;
-    let length = input.deliver(&raw[..got], &mut bytes[..extent as usize]);
-    if length != 0 {
-        // SAFETY: the transport returned at most the validated extent.
-        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
-    }
+    let length = input.deliver(&raw[..got], &mut bytes[..extent]);
+    buffer[..length].copy_from_slice(&bytes[..length]);
     Ok(length)
 }
 
-/// # Safety
-/// `buffer` supplies `count` readable bytes (may be null for zero bytes).
-/// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn write(number: c_int, buffer: *const u8, count: usize) -> isize {
+/// Writes `bytes` (at most the transport's extent): a point of
+/// cancellation.
+pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     let point = threads::cancel::Point::begin();
-    let result = unsafe { write_inner(number, buffer, count) };
-    if result > 0 {
+    let bytes = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
+    let result = fd(number)
+        .and_then(|fd| shared::number(Request::Write { fd, bytes }))
+        .map(|n| n as usize);
+    if result.is_ok_and(|n| n > 0) {
         point.end();
     } else {
         point.finish();
@@ -283,129 +240,53 @@ pub unsafe extern "C" fn write(number: c_int, buffer: *const u8, count: usize) -
     result
 }
 
-unsafe fn write_inner(number: c_int, buffer: *const u8, count: usize) -> isize {
-    if count > isize::MAX as usize {
-        return fail(EINVAL) as isize;
-    }
-    if buffer.is_null() && count != 0 {
-        return fail(EFAULT) as isize;
-    }
-    let result = fd(number).and_then(|fd| {
-        let bytes = if count == 0 {
-            &[]
-        } else {
-            // SAFETY: the caller promises this readable extent.
-            unsafe { core::slice::from_raw_parts(buffer, count.min(posix_request::MAX_WRITE)) }
-        };
-        shared::number(Request::Write { fd, bytes })
-    });
-    result.map_or_else(|code| fail(code) as isize, |n| n as isize)
-}
-
-/// # Safety
-/// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn lseek(number: c_int, offset: i64, origin: c_int) -> i64 {
-    let result = fd(number).and_then(|fd| {
-        let origin = match origin {
-            SEEK_SET => SeekFrom::Start,
-            SEEK_CUR => SeekFrom::Current,
-            SEEK_END => SeekFrom::End,
-            SEEK_DATA => SeekFrom::Data,
-            SEEK_HOLE => SeekFrom::Hole,
-            _ => return Err(EINVAL),
-        };
-        shared::number(Request::Seek { fd, offset, origin }).map(|offset| offset as i64)
-    });
-    result.unwrap_or_else(fail)
-}
-
-/// # Safety
-/// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dup(number: c_int) -> c_int {
-    fd(number)
-        .and_then(|fd| shared::number(Request::Dup { fd }))
-        .map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
-}
-
-/// # Safety
-/// This thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dup2(source: c_int, target: c_int) -> c_int {
-    let result = fd(source).and_then(|source| {
-        let target = fd(target)?;
-        shared::number(Request::Dup2 { source, target })
-    });
-    result.map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
-}
-
-/// # Safety
-/// This thread has an initialized ABI scope. Flags must be O_CLOEXEC/CLOFORK.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn dup3(source: c_int, target: c_int, flags: c_int) -> c_int {
-    let result = fd(source).and_then(|source| {
-        let target = fd(target)?;
-        if flags & !(O_CLOEXEC | O_CLOFORK) != 0 {
-            return Err(EINVAL);
-        }
-        shared::number(Request::Dup3 {
-            source,
-            target,
-            flags: flags as u32,
-        })
-    });
-    result.map_or_else(|code| fail(code) as c_int, |fd| fd as c_int)
-}
-
-/// # Safety
-/// `name` is a live C string; this thread has an initialized ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn chdir(name: *const c_char) -> c_int {
-    let result = unsafe { path(name) }.and_then(|path| shared::unit(Request::Chdir { path }));
-    result.map_or_else(|code| fail(code) as c_int, |()| 0)
-}
-
-/// # Safety
-/// `buffer` supplies `size` writable bytes; this thread has an ABI scope.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn getcwd(buffer: *mut c_char, size: usize) -> *mut c_char {
-    let result = if buffer.is_null() {
-        Err(EFAULT)
-    } else if size == 0 {
-        Err(EINVAL)
-    } else {
-        let mut message = [0; MESSAGE_MAX];
-        shared::dispatch(Request::Cwd, &mut message).and_then(|reply| {
-            let Reply::Bytes(path) = reply else {
-                return Err(EIO);
-            };
-            if size <= path.len() {
-                return Err(ERANGE);
-            }
-            // SAFETY: the caller supplies room for the complete path and terminator.
-            unsafe {
-                ptr::copy_nonoverlapping(path.as_ptr().cast(), buffer, path.len());
-                *buffer.add(path.len()) = 0;
-            }
-            Ok(buffer)
-        })
+pub fn lseek(number: c_int, offset: i64, origin: c_int) -> Result<i64, c_int> {
+    let fd = fd(number)?;
+    let origin = match origin {
+        SEEK_SET => SeekFrom::Start,
+        SEEK_CUR => SeekFrom::Current,
+        SEEK_END => SeekFrom::End,
+        SEEK_DATA => SeekFrom::Data,
+        SEEK_HOLE => SeekFrom::Hole,
+        _ => return Err(EINVAL),
     };
-    result.unwrap_or_else(|code| {
-        fail(code);
-        ptr::null_mut()
+    shared::number(Request::Seek { fd, offset, origin }).map(|offset| offset as i64)
+}
+
+pub fn dup(number: c_int) -> Result<c_int, c_int> {
+    shared::number(Request::Dup { fd: fd(number)? }).map(|fd| fd as c_int)
+}
+
+pub fn dup2(source: c_int, target: c_int) -> Result<c_int, c_int> {
+    shared::number(Request::Dup2 {
+        source: fd(source)?,
+        target: fd(target)?,
     })
+    .map(|fd| fd as c_int)
 }
 
-/// # Safety
-/// All process threads and resources are abandoned by this call.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn _exit(status: c_int) -> ! {
+pub fn chdir(name: &[u8]) -> Result<(), c_int> {
+    shared::unit(Request::Chdir { path: name })
+}
+
+/// The working directory into `buffer`, NUL-terminated: its length.
+pub fn getcwd(buffer: &mut [u8]) -> Result<usize, c_int> {
+    if buffer.is_empty() {
+        return Err(EINVAL);
+    }
+    let mut message = [0; MESSAGE_MAX];
+    let Reply::Bytes(path) = shared::dispatch(Request::Cwd, &mut message)? else {
+        return Err(EIO);
+    };
+    if buffer.len() <= path.len() {
+        return Err(ERANGE);
+    }
+    buffer[..path.len()].copy_from_slice(path);
+    buffer[path.len()] = 0;
+    Ok(path.len())
+}
+
+/// Ends the process with `status`; its threads and resources go with it.
+pub fn exit(status: c_int) -> ! {
     rt::sys::process_exit((status & 255) as u64)
-}
-
-/// Numeric ABI revision, callable before thread initialization.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_posix_abi_version() -> c_int {
-    ABI_VERSION as c_int
 }

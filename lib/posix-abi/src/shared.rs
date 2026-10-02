@@ -1,13 +1,13 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The process's file and directory state under a lock of the layer (spec
+//! The process's file state under a lock of the layer (spec
 //! 2, 3.4): the calling thread performs its request itself, its holder at
 //! the ceiling of the process (LayerLock::raising). No helper thread. The
 //! lock is held through the request to the file service, since the state
 //! of a descriptor and its session go together in posix-fs.
 
-use crate::{constants::*, directory::Streams, tls};
+use crate::constants::*;
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
@@ -16,77 +16,22 @@ use posix_fs::PosixFs;
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
-#[cfg(feature = "thread-probe")]
-use rt::{handle::Handle, sys};
 
 struct State {
     files: Option<PosixFs>,
-    streams: Streams,
 }
 struct Cell(UnsafeCell<State>);
 // SAFETY: startup installs the files once; afterwards only `process_state`
 // borrows the state, under FILES_LOCK.
 unsafe impl Sync for Cell {}
-static STATE: Cell = Cell(UnsafeCell::new(State {
-    files: None,
-    streams: Streams::new(),
-}));
+static STATE: Cell = Cell(UnsafeCell::new(State { files: None }));
 static READY: AtomicBool = AtomicBool::new(false);
 static FILES_LOCK: LayerLock = LayerLock::raising();
-#[cfg(feature = "thread-probe")]
-static PROBE_LOCAL_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "thread-probe")]
-static PROBE_LOCAL_TARGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "thread-probe")]
-static PROBE_LOCAL_LIVE: AtomicBool = AtomicBool::new(false);
-
 /// Runs `run` holding the lock of the process's files, for the guest probes.
 #[cfg(feature = "thread-probe")]
 pub fn probe_hold(run: impl FnOnce()) {
     let _guard = FILES_LOCK.lock();
     run();
-}
-
-/// Request entry while the next local operation holds its file references.
-/// kind 1 selects operations with a reply, kind 2 numeric operations. The target
-/// handle must stay live until that call returns; only one probe may be armed.
-#[cfg(feature = "thread-probe")]
-pub fn probe_local_borrow(kind: u64, target: &Handle<rt::handle::Thread>) {
-    assert!(kind == 1 || kind == 2);
-    PROBE_LOCAL_TARGET.store(target.raw().0, Ordering::Relaxed);
-    PROBE_LOCAL_KIND.store(kind, Ordering::Release);
-}
-
-#[cfg(feature = "thread-probe")]
-pub fn probe_local_borrow_live() -> bool {
-    PROBE_LOCAL_LIVE.load(Ordering::Acquire)
-}
-
-#[cfg(feature = "thread-probe")]
-struct BorrowProbe(bool);
-#[cfg(feature = "thread-probe")]
-impl BorrowProbe {
-    fn enter(kind: u64) -> Self {
-        let armed = PROBE_LOCAL_KIND
-            .compare_exchange(kind, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if armed {
-            PROBE_LOCAL_LIVE.store(true, Ordering::Release);
-            let target = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
-                PROBE_LOCAL_TARGET.load(Ordering::Acquire),
-            ));
-            sys::thread_upcall_request(&target).unwrap();
-        }
-        Self(armed)
-    }
-}
-#[cfg(feature = "thread-probe")]
-impl Drop for BorrowProbe {
-    fn drop(&mut self) {
-        if self.0 {
-            PROBE_LOCAL_LIVE.store(false, Ordering::Release);
-        }
-    }
 }
 
 /// # Safety
@@ -101,8 +46,8 @@ pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
     Ok(())
 }
 
-/// Runs `f` on the process's streams and files under their lock.
-fn process_state<R>(f: impl FnOnce(&Streams, &mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+/// Runs `f` on the process's files under their lock.
+fn process_state<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
     if !READY.load(Ordering::Acquire) {
         return Err(ENOSYS);
     }
@@ -110,11 +55,10 @@ fn process_state<R>(f: impl FnOnce(&Streams, &mut PosixFs) -> Result<R, i32>) ->
     // SAFETY: the lock gives this borrow alone; READY published the state.
     let state = unsafe { &mut *STATE.0.get() };
     let files = state.files.as_mut().ok_or(ENOSYS)?;
-    f(&state.streams, files)
+    f(files)
 }
 
-// Keep read buffers out of metadata/directory dispatch stack frames. Local
-// scopes already carry a directory registry on their caller's fixed stack.
+// Keep read buffers out of the frames of the other requests.
 #[inline(never)]
 fn read_reply(files: &mut PosixFs, fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
     let read = files
@@ -142,11 +86,7 @@ fn write_number(files: &PosixFs, fd: u32, bytes: &[u8]) -> Result<u64, i32> {
         .map_err(crate::error)
 }
 
-fn number_operation(
-    request: Request<'_>,
-    streams: &Streams,
-    files: &mut PosixFs,
-) -> Result<u64, i32> {
+fn number_operation(request: Request<'_>, files: &mut PosixFs) -> Result<u64, i32> {
     use Request::*;
     match request {
         Open { path, flags } => {
@@ -195,16 +135,12 @@ fn number_operation(
                 .map(|value| value as u64)
                 .map_err(crate::error)
         }
-        directory => streams.perform(directory, files),
+        // Directory streams are relibc's (getdents on a descriptor).
+        _ => Err(ENOSYS),
     }
 }
 
-fn perform(
-    request: Request<'_>,
-    streams: &Streams,
-    files: &mut PosixFs,
-    out: &mut Writer,
-) -> Result<(), i32> {
+fn perform(request: Request<'_>, files: &mut PosixFs, out: &mut Writer) -> Result<(), i32> {
     use Request::*;
     let write = |reply: Reply<'_>, out: &mut Writer| reply.write(out).map_err(|_| EIO);
     match request {
@@ -227,7 +163,6 @@ fn perform(
             out,
         ),
         Cleanup => {
-            streams.close_all(files);
             for fd in 0..posix_fs::OPEN_MAX as u32 {
                 match files.close(fd) {
                     Ok(()) | Err(posix_fs::FsError::BadFileDescriptor) => (),
@@ -236,10 +171,7 @@ fn perform(
             }
             write(Reply::Unit, out)
         }
-        number => write(
-            Reply::Number(number_operation(number, streams, files)?),
-            out,
-        ),
+        number => write(Reply::Number(number_operation(number, files)?), out),
     }
 }
 
@@ -260,27 +192,10 @@ fn request_error(error: proto_wire::Status) -> i32 {
     }
 }
 
-// Keep every local reference inside the guard, including error exits. The
-// callback may return owned data or a reply borrowing its caller's buffer,
-// but its result cannot borrow these operation-local file references.
-fn local<R>(
-    kind: u64,
-    run: impl FnOnce(&Streams, &mut PosixFs) -> Result<R, i32>,
-) -> Result<R, i32> {
-    let _guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
-    let streams = tls::directories();
-    let files = tls::files();
-    if streams.is_null() || files.is_null() {
-        return Err(ENOSYS);
-    }
-    // SAFETY: the TLS scope owns both objects; deferred entries cannot reborrow
-    // them until this operation ends and all exclusive references are gone.
-    let (streams, files) = unsafe { (&*streams, &mut *files) };
-    #[cfg(feature = "thread-probe")]
-    let _probe = BorrowProbe::enter(kind);
-    #[cfg(not(feature = "thread-probe"))]
-    let _ = kind;
-    run(streams, files)
+/// Runs `f` on the process's files under their lock (relibc's platform:
+/// every thread of a program on relibc uses the process's files).
+pub fn with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    process_state(f)
 }
 
 pub(crate) fn dispatch<'a>(
@@ -288,13 +203,7 @@ pub(crate) fn dispatch<'a>(
     buffer: &'a mut [u8; MESSAGE_MAX],
 ) -> Result<Reply<'a>, i32> {
     let mut encoded = Writer::new();
-    if tls::process_files() {
-        process_state(|streams, files| perform(request, streams, files, &mut encoded))?;
-    } else {
-        local(1, |streams, files| {
-            perform(request, streams, files, &mut encoded)
-        })?;
-    }
+    process_state(|files| perform(request, files, &mut encoded))?;
     let bytes = encoded.as_bytes();
     buffer[..bytes.len()].copy_from_slice(bytes);
     match Reply::read(&buffer[..bytes.len()]).map_err(|_| EIO)? {
@@ -304,23 +213,17 @@ pub(crate) fn dispatch<'a>(
 }
 
 pub(crate) fn number(request: Request<'_>) -> Result<u64, i32> {
-    if tls::process_files() {
-        // A write to the console leaves the section: the driver answers a
-        // write into a full ring only once it drained.
-        if let Request::Write { fd, bytes } = request
-            && let Some(console) =
-                process_state(|_, files| files.console_route(fd).map_err(crate::error))?
-        {
-            return console
-                .write(bytes)
-                .map(|n| n as u64)
-                .map_err(|status| crate::error(posix_fs::FsError::from(status)));
-        }
-        return process_state(|streams, files| number_operation(request, streams, files));
+    // A write to the console leaves the section: the driver answers a
+    // write into a full ring only once it drained.
+    if let Request::Write { fd, bytes } = request
+        && let Some(console) = process_state(|files| files.console_route(fd).map_err(crate::error))?
+    {
+        return console
+            .write(bytes)
+            .map(|n| n as u64)
+            .map_err(|status| crate::error(posix_fs::FsError::from(status)));
     }
-    local(2, |streams, files| {
-        number_operation(request, streams, files)
-    })
+    process_state(|files| number_operation(request, files))
 }
 
 pub(crate) fn unit(request: Request<'_>) -> Result<(), i32> {
@@ -330,14 +233,7 @@ pub(crate) fn unit(request: Request<'_>) -> Result<(), i32> {
     }
 }
 
-pub(crate) fn information(request: Request<'_>) -> Result<posix_fs::NodeInfo, i32> {
-    match dispatch(request, &mut [0; MESSAGE_MAX])? {
-        Reply::Info(info) => Ok(info),
-        _ => Err(EIO),
-    }
-}
-
-/// Close process descriptors and streams after every client has stopped using them.
+/// Close the process's descriptors after every client has stopped using them.
 /// Callers must arrange quiescence.
 pub fn cleanup() -> Result<(), i32> {
     unit(Request::Cleanup)
@@ -353,9 +249,7 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
     let mut encoded = Writer::new();
     let result = Request::read(request)
         .map_err(request_error)
-        .and_then(|request| {
-            process_state(|streams, files| perform(request, streams, files, &mut encoded))
-        });
+        .and_then(|request| process_state(|files| perform(request, files, &mut encoded)));
     if let Err(code) = result {
         encoded = error_reply(code);
     }

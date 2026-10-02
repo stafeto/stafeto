@@ -12,11 +12,13 @@ test = false
 bench = false
 
 [features]
-cancel-input = []
+cancel-input = ["posix-crt/uart-input"]
 
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }
+posix-crt = { path = "../../lib/posix-crt" }
+libc-ffi = { path = "../libc-ffi" }
 rt = { path = "../../lib/rt", features = ["count-calls"] }
 posix-sync = { path = "../../lib/posix-sync" }
 posix-clock = { path = "../../lib/posix-clock" }

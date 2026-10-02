@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! C sleep in the calling thread: its timer on its own channel (posix-sync),
@@ -8,10 +8,10 @@
 //! point. An absolute deadline on CLOCK_REALTIME becomes a monotonic
 //! instant, checked on the calendar once it passed; a calendar set forward
 //! does not wake the sleep earlier, until the clock patch of relibc.
-use super::{cancel, mutex, own_block};
-use crate::{constants::*, fail};
+use super::{cancel, own_block};
+use crate::constants::*;
 use core::sync::atomic::Ordering;
-use posix_time::Sleep;
+use posix_time::{Deadline, Sleep};
 use posix_types::Timespec;
 use rt::abi::{Error, Source};
 use rt::handle::{Channel, Handle, Timer};
@@ -23,11 +23,32 @@ fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
 
+/// The monotonic instant of an absolute deadline on `deadline.clock`; for
+/// CLOCK_REALTIME through the clock's anchor now, rechecked after it passed.
+fn absolute_target(deadline: Deadline) -> Result<u64, i32> {
+    let target = if deadline.clock == proto_clock::REALTIME {
+        let (time, mono) = crate::clock::realtime_anchor()?;
+        deadline.value() - time + i128::from(mono)
+    } else {
+        deadline.value()
+    };
+    Ok(target.clamp(0, i128::from(u64::MAX)) as u64)
+}
+
+/// Whether an absolute deadline passed on its own clock.
+fn absolute_passed(deadline: Deadline) -> Result<bool, i32> {
+    if deadline.clock == proto_clock::REALTIME {
+        let (time, _) = crate::clock::realtime_anchor()?;
+        return Ok(deadline.value() <= time);
+    }
+    Ok(deadline.value() <= i128::from(rt::time::ticks_to_ns(rt::time::now())))
+}
+
 /// The monotonic instant of `deadline`.
 fn target(deadline: Sleep) -> Result<u64, i32> {
     match deadline {
         Sleep::Relative(end) => Ok(end.clamp(0, i128::from(u64::MAX)) as u64),
-        Sleep::Absolute(deadline) => mutex::monotonic_target(deadline),
+        Sleep::Absolute(deadline) => absolute_target(deadline),
     }
 }
 
@@ -35,7 +56,7 @@ fn target(deadline: Sleep) -> Result<u64, i32> {
 fn passed(deadline: Sleep) -> Result<bool, i32> {
     match deadline {
         Sleep::Relative(end) => Ok(end <= i128::from(now())),
-        Sleep::Absolute(deadline) => mutex::passed(deadline),
+        Sleep::Absolute(deadline) => absolute_passed(deadline),
     }
 }
 
@@ -80,57 +101,48 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
     result
 }
 
-/// # Safety
-/// The caller is managed. request supplies a readable aligned Timespec; remaining
-/// is null or writable. They may name the same object. Absolute calls ignore remaining.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn clock_nanosleep(
+/// Sleeps on `clock` for `requested` (an absolute time with
+/// TIMER_ABSTIME): Ok at its end; EINTR with the time left of a relative
+/// sleep when a caught signal cut it; EINVAL for a bad request. A point
+/// of cancellation.
+pub fn clock_nanosleep(
     clock: i32,
     flags: i32,
-    requested: *const Timespec,
-    remaining: *mut Timespec,
-) -> i32 {
+    requested: Timespec,
+) -> Result<(), (i32, Option<Timespec>)> {
     let point = cancel::Point::begin();
     let result = (|| {
-        if requested.is_null() {
-            return Err(EFAULT);
-        }
         if !matches!(flags, 0 | TIMER_ABSTIME) {
-            return Err(EINVAL);
+            return Err((EINVAL, None));
         }
-        // SAFETY: caller supplies one Timespec; copy before touching a possible alias.
-        let value = unsafe { requested.read() };
         let start = now();
         let deadline = Sleep::new(
             clock as u32,
             flags == TIMER_ABSTIME,
-            value.tv_sec,
-            value.tv_nsec,
+            requested.tv_sec,
+            requested.tv_nsec,
             start,
         )
-        .map_err(|_| EINVAL)?;
-        let result = sleep_until(deadline);
-        if result == Err(EINTR)
-            && !remaining.is_null()
-            && let Some(time) = deadline.remaining(now()).map_err(|_| EOVERFLOW)?
-        {
-            // SAFETY: caller supplies writable storage, possibly aliasing the copied request.
-            unsafe {
-                remaining.write(Timespec {
-                    tv_sec: time.seconds,
-                    tv_nsec: time.nanos,
-                })
-            };
+        .map_err(|_| (EINVAL, None))?;
+        match sleep_until(deadline) {
+            Err(EINTR) => {
+                let left = deadline
+                    .remaining(now())
+                    .map_err(|_| (EOVERFLOW, None))?
+                    .map(|time| Timespec {
+                        tv_sec: time.seconds,
+                        tv_nsec: time.nanos,
+                    });
+                Err((EINTR, left))
+            }
+            other => other.map_err(|error| (error, None)),
         }
-        result
     })();
     point.finish();
-    result.map_or_else(|error| error, |()| 0)
+    result
 }
-/// # Safety
-/// As for clock_nanosleep with CLOCK_REALTIME and a relative interval.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn nanosleep(requested: *const Timespec, remaining: *mut Timespec) -> i32 {
-    let status = unsafe { clock_nanosleep(crate::clock::CLOCK_REALTIME, 0, requested, remaining) };
-    if status == 0 { 0 } else { fail(status) as i32 }
+
+/// clock_nanosleep with CLOCK_REALTIME and a relative interval.
+pub fn nanosleep(requested: Timespec) -> Result<(), (i32, Option<Timespec>)> {
+    clock_nanosleep(crate::clock::CLOCK_REALTIME, 0, requested)
 }

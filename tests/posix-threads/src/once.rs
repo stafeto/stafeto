@@ -7,7 +7,7 @@
 
 use super::*;
 use core::cell::UnsafeCell;
-use threads::once::{Control, pthread_once};
+use ffi::{Once as Control, pthread_once};
 
 static BLOCKED: Control = Control::new();
 static OUTER: Control = Control::new();
@@ -58,10 +58,10 @@ unsafe extern "C" fn initialize_outer() {
 /// The first call cancels its own thread inside the routine.
 unsafe extern "C" fn initialize_rollback() {
     if ROLLBACK_CALLS.fetch_add(1, Ordering::Relaxed) == 0 {
-        if threads::pthread_cancel(threads::pthread_self()) != 0 {
+        if ffi::pthread_cancel(ffi::pthread_self()) != 0 {
             error();
         }
-        threads::cancel::pthread_testcancel();
+        ffi::pthread_testcancel();
         error();
     }
 }
@@ -73,16 +73,14 @@ unsafe extern "C" fn rollback_worker(_: *mut c_void) -> *mut c_void {
 }
 fn create(callback: unsafe extern "C" fn(*mut c_void) -> *mut c_void) -> u64 {
     let mut id = 0;
-    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(callback), ptr::null_mut()) }
-        != 0
-    {
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(callback), ptr::null_mut()) } != 0 {
         error();
     }
     id
 }
 fn join(id: u64, expected: *mut c_void) -> bool {
     let mut value = ptr::null_mut();
-    (unsafe { threads::pthread_join(id, &mut value) }) == 0 && value == expected
+    (unsafe { ffi::pthread_join(id, &mut value) }) == 0 && value == expected
 }
 
 pub(super) fn run() -> bool {
@@ -116,7 +114,7 @@ pub(super) fn run() -> bool {
     }
     // A cancelled routine rolls back; the next caller runs it.
     let cancelled = create(rollback_worker);
-    if !join(cancelled, threads::cancel::CANCELED) {
+    if !join(cancelled, ffi::CANCELED) {
         return failed(53);
     }
     let retry = create(rollback_worker);

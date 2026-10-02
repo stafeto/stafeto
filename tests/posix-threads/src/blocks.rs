@@ -11,13 +11,12 @@
 //! the lock of the actions, neither loses the wakeup of that wait nor
 //! links the thread's node twice.
 use super::*;
+use crate::layer::signals::{self as api, SigAction};
 use abi::metadata::Timespec;
-use abi::signals::{self as api, SigAction};
+use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 use posix_sync::LayerLock;
 use posix_thread::flag;
 use rt::wait::{Waited, Waiter};
-use threads::cancel;
-use threads::mutex::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 static ERRORS: AtomicUsize = AtomicUsize::new(0);
@@ -72,7 +71,7 @@ unsafe extern "C" fn sleeper(_: *mut c_void) -> *mut c_void {
         tv_nsec: 0,
     };
     let status = unsafe {
-        threads::sleep::clock_nanosleep(abi::clock::CLOCK_MONOTONIC, 0, &request, &mut left)
+        crate::layer::sleep::clock_nanosleep(abi::clock::CLOCK_MONOTONIC, 0, &request, &mut left)
     };
     SLEPT.store(status as usize, Ordering::SeqCst);
     LEFT.store(left.tv_sec as u64, Ordering::SeqCst);
@@ -87,7 +86,7 @@ unsafe extern "C" fn counter(_: *mut c_void) -> *mut c_void {
         let _ = sys::yield_now();
     }
     done();
-    cancel::pthread_testcancel();
+    ffi::pthread_testcancel();
     error();
     ptr::null_mut()
 }
@@ -101,13 +100,13 @@ unsafe extern "C" fn slow_handler(_: i32) {
         tv_sec: 0,
         tv_nsec: 50_000_000,
     };
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
 }
 /// Takes MUTEX, which main holds, with SIGUSR2 pending and an entry marked
 /// deferred: the entry comes at the end of the first section of its wait
 /// by address, its node linked in the bucket.
 unsafe extern "C" fn late_taker(_: *mut c_void) -> *mut c_void {
-    let Some(block) = threads::probe_block(threads::pthread_self()) else {
+    let Some(block) = threads::probe_block(ffi::pthread_self()) else {
         error();
         return ptr::null_mut();
     };
@@ -143,7 +142,7 @@ fn soon(flag: &AtomicUsize) -> bool {
         if flag.load(Ordering::SeqCst) != 0 {
             return true;
         }
-        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
         false
     })
 }
@@ -202,16 +201,14 @@ fn entry_in_a_wait(hold: bool) -> bool {
 }
 fn create(callback: unsafe extern "C" fn(*mut c_void) -> *mut c_void) -> u64 {
     let mut id = 0;
-    if unsafe { threads::pthread_create(&mut id, ptr::null(), Some(callback), ptr::null_mut()) }
-        != 0
-    {
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(callback), ptr::null_mut()) } != 0 {
         error();
     }
     id
 }
 fn join(id: u64) -> *mut c_void {
     let mut value = ptr::null_mut();
-    if unsafe { threads::pthread_join(id, &mut value) } != 0 {
+    if unsafe { ffi::pthread_join(id, &mut value) } != 0 {
         error();
     }
     value
@@ -287,7 +284,7 @@ pub(super) fn run() -> bool {
     let before = HANDLED.load(Ordering::SeqCst);
     let id = create(sleeper);
     let native = unsafe { threads::probe_native(id) }.expect("sleeper handle");
-    if !waiting(&native) || api::pthread_kill(id, SIGUSR1) != 0 || !wait() {
+    if !waiting(&native) || ffi::pthread_kill(id, SIGUSR1) != 0 || !wait() {
         return failed(643);
     }
     join(id);
@@ -305,7 +302,7 @@ pub(super) fn run() -> bool {
     // A counting thread is cancelled only at its point.
     GO.store(1, Ordering::SeqCst);
     let id = create(counter);
-    if !wait() || threads::pthread_cancel(id) != 0 {
+    if !wait() || ffi::pthread_cancel(id) != 0 {
         return failed(645);
     }
     let counted = COUNTED.load(Ordering::Relaxed);
@@ -313,12 +310,12 @@ pub(super) fn run() -> bool {
         tv_sec: 0,
         tv_nsec: 5_000_000,
     };
-    let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
     if COUNTED.load(Ordering::Relaxed) == counted {
         return failed(646);
     }
     GO.store(0, Ordering::SeqCst);
-    if !wait() || join(id) != cancel::CANCELED {
+    if !wait() || join(id) != ffi::CANCELED {
         return failed(647);
     }
     let restored = SigAction {
@@ -344,19 +341,17 @@ pub(super) fn run() -> bool {
     {
         return failed(652);
     }
-    // The holders of the table's lock and of the lock of the actions run
-    // at the ceiling of the process, and go back to their level after.
-    let me = unsafe { threads::probe_native(threads::pthread_self()) }.expect("own handle");
+    // The holder of the lock of the actions runs at the ceiling of the
+    // process, and goes back to its level after.
+    let me = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("own handle");
     let level = || sys::thread_info(&me).map_or(0, |info| info.base);
     let ceiling = abi::probe_ceiling();
     let before = level();
-    let (mut table, mut actions) = (0, 0);
-    threads::probe_hold_table(|| table = level());
+    let mut actions = 0;
     api::probe_hold_actions(|| actions = level());
-    if table != ceiling || actions != ceiling || level() != before || before >= ceiling {
+    if actions != ceiling || level() != before || before >= ceiling {
         rt::println!(
-            "blocks-probe: at {} under the table's lock, {} under the actions', {} after, ceiling {}",
-            table,
+            "blocks-probe: at {} under the actions' lock, {} after, ceiling {}",
             actions,
             level(),
             ceiling
@@ -364,7 +359,7 @@ pub(super) fn run() -> bool {
         return failed(653);
     }
     rt::println!(
-        "blocks-probe: a handler that sleeps or waits for the lock of the actions inside a wait by address loses no wakeup; the table's and the actions' locks run at the ceiling"
+        "blocks-probe: a handler that sleeps or waits for the lock of the actions inside a wait by address loses no wakeup; the actions' lock runs at the ceiling"
     );
     true
 }

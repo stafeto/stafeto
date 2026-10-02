@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+#
+# The os-test tests that pass on stafeto (cargo xtask os-test): `ci`
+# fails when one of them does not. A test that starts to pass joins it.
+io/open-tmpdir-rdonly-append
+io/open-tmpdir-rdonly-creat
+io/open-tmpdir-rdonly-directory
+io/open-tmpdir-rdonly-trunc
+io/open-tmpdir-rdonly
+io/open-tmpdir-rdwr-append
+io/open-tmpdir-rdwr-creat
+io/open-tmpdir-rdwr-directory
+io/open-tmpdir-rdwr-trunc
+io/open-tmpdir-rdwr
+io/open-tmpdir-wronly-append
+io/open-tmpdir-wronly-creat
+io/open-tmpdir-wronly-directory
+io/open-tmpdir-wronly-trunc
+io/open-tmpdir-wronly
+malloc/malloc-0
+malloc/realloc-0
+malloc/realloc-null-0

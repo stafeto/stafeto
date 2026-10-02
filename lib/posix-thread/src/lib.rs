@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! The thread control block (TCB) of a POSIX thread in relibc's layout
@@ -21,7 +21,6 @@
 #![no_std]
 
 use core::arch::asm;
-use core::ffi::c_void;
 use core::mem::{offset_of, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
@@ -75,11 +74,10 @@ pub mod flag {
     pub const DEPTH_ONE: u32 = 1 << DEPTH_SHIFT;
 }
 
-/// The block of the POSIX layer for one thread: relibc's `os_specific`.
-/// The fields before `errno` are the thread's state of the transport of
-/// 5a (its signals, cancellation, its channel and timer, its node in the
-/// table of waits by address, its end); from `errno` on they leave for
-/// relibc in 5a′.
+/// The block of the POSIX layer for one thread: relibc's `os_specific`:
+/// its signals, cancellation, its channel and timer, its node in the table
+/// of waits by address, its end and its number. errno and the file state
+/// are relibc's and the process's.
 #[repr(C, align(16))]
 pub struct Block {
     /// The thread's signal mask and its pending signals.
@@ -107,18 +105,20 @@ pub struct Block {
     /// Nonzero once the thread ended; `result` is its value.
     pub end: AtomicU32,
     pub result: AtomicUsize,
-    /// The thread's errno.
-    pub errno: i32,
-    /// Nonzero when the calls of the thread use the process's file owner.
-    pub process_files: u32,
-    /// The file context and directory streams of a thread with its own
-    /// files (the file owner and tests); null with the process's.
-    pub files: *mut c_void,
-    pub directories: *mut c_void,
+    /// Room that kept the fields after it in their places when errno and
+    /// the file state left (5a′).
+    unused: [u64; 3],
     /// The pthread number of the thread; 0 for a thread pthread does not
-    /// know.
+    /// know. Under relibc, the thread's number in the layer's table of
+    /// threads plus 1 (its OsTid).
     pub thread_id: u64,
-    reserved: [u64; 7],
+    /// Not 0 while the thread is inside a cancellation point of the layer:
+    /// a request of cancellation interrupts its wait then.
+    pub cancel_point: AtomicU64,
+    /// Not 0 while the thread waits in the console phase of a read, for
+    /// the guest probes.
+    pub probe: AtomicU64,
+    reserved: [u64; 5],
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -146,9 +146,8 @@ const _: () = {
     assert!(offset_of!(Block, previous) == 64);
     assert!(offset_of!(Block, end) == 92);
     assert!(offset_of!(Block, result) == 96);
-    assert!(offset_of!(Block, errno) == 104);
-    assert!(offset_of!(Block, files) == 112);
     assert!(offset_of!(Block, thread_id) == 128);
+    assert!(offset_of!(Block, cancel_point) == 136);
     assert!(offset_of!(Page, tcb) == TCB_OFFSET);
     assert!(size_of::<Page>() == PAGE_SIZE);
 };
@@ -209,12 +208,11 @@ impl Block {
             level: AtomicU32::new(0),
             end: AtomicU32::new(0),
             result: AtomicUsize::new(0),
-            errno: 0,
-            process_files: 0,
-            files: ptr::null_mut(),
-            directories: ptr::null_mut(),
+            unused: [0; 3],
             thread_id: 0,
-            reserved: [0; 7],
+            cancel_point: AtomicU64::new(0),
+            probe: AtomicU64::new(0),
+            reserved: [0; 5],
         }
     }
 }

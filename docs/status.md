@@ -97,12 +97,16 @@ Bounded paths with interrupts masked are listed in
 
 ## Rust POSIX layer
 
-ABI 1 for AArch64 LP64 is experimental.
-`python3 tools/build-posix-sysroot.py --probe` stages headers and
-`lib/libc.a` under `target/posix-sysroot/0.1.0/aarch64-stafeto` and links
-the C probe. No real program uses the layer yet. Since step 5a the layer
-has no helper threads; [m5a-transport](../notes/m5a-transport.md) says how
-it works and where it stops.
+Since step 5a′ the C library is relibc (`tools/build-relibc.py`, the fork
+pinned there): its headers and `libc.a` under `target/relibc/sysroot`, its
+platform the layer's `stafeto_*` functions (`lib/posix-platform`, interface
+4). The layer exports no C names (`cargo xtask ci` checks it) and keeps the
+system part; the C probe `posix-abi` and the Rust guest probes on a C main
+(`tests/libc-ffi`) are programs on relibc, and the native probe
+`posix-tls` checks the layer's TCB for threads relibc did not start. Since step 5a the layer has no helper threads;
+[m5a-transport](../notes/m5a-transport.md) says how it works and where it
+stops. The rows below date from the layer's own C surface; relibc now
+provides the C side of each.
 
 | Area | Interfaces | Notes |
 |---|---|---|
@@ -118,30 +122,34 @@ it works and where it stops.
 | Signals | `sigaction`, masks, pending sets, `raise`, `pthread_kill`, `sigwait`, `sigwaitinfo`, `sigtimedwait`, `SA_SIGINFO` with a real interrupted context; host-tested pending-signal queues | [upcall](../notes/m2-native-upcall.md), [actions](../notes/m2-rust-posix-signal-actions.md), [sigwait](../notes/m2-rust-posix-sigwait.md), [sigwaitinfo](../notes/m2-rust-posix-sigwaitinfo.md), [context](../notes/m2-rust-posix-handler-context.md), [sigtimedwait](../notes/m2-rust-posix-sigtimedwait.md), [queues](../notes/m2-rust-posix-signal-queues.md) |
 | Processes | `getpid`, `getppid`, real, effective and saved UID/GID (eight calls) through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
 
-Not there yet: `exec`, `fork`, `waitpid`, pipes, process-directed and
-queued signals, `SA_RESTART` beyond console reads, conditions, semaphores, POSIX timers,
-stdio, `termios`, asynchronous cancellation, general ELF TLS. BusyBox
-still uses the Picolibc bridge; see [m2-ram-posix](../notes/m2-ram-posix.md).
+relibc gives conditions, semaphores and stdio over the layer
+(`relibc-threads` checks the first two). Not there yet: `exec`, `fork`,
+`waitpid`, pipes, process-directed and queued signals, `SA_RESTART`
+beyond console reads, POSIX timers, `termios`, asynchronous cancellation,
+general ELF TLS. BusyBox
+runs on relibc since 5a′; see [m2-ram-posix](../notes/m2-ram-posix.md) for
+its first steps.
 
 ## Probe commands
 
 `cargo xtask help` lists them all. `posix-abi` runs the thread,
 cancellation, shared-state, input and interruption probes as well, and
-`test` and `ci` run `posix-abi`, `ramfs` and `ext4ro`. The BusyBox and
-Picolibc probes run only on request.
+`test` and `ci` run `posix-abi`, `ramfs`, `ext4ro`, the relibc probes,
+the BusyBox probes and os-test's io and malloc suites (within 300 s).
 
 | Command | Checks |
 |---|---|
 | `kernel-test`, `init-test` [machine] | the kernel test image or the EL0 test `init` alone, on `512M` or the machine named (`EL2`, `2G`, `GICv3`, `EL2 GICv3`, `HVF GICv3`, `HVF GICv2`); `kernel-test <machine> icount` runs the icount build under `-icount` |
 | `ext4ro` | reads an e2fsprogs ext4 image inside the guest |
 | `ramfs` | RAM file service: descriptors, reads, writes, seeks, sizes |
-| `posix-abi` | C programs linked with Rust startup through Cargo and standalone Clang |
+| `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` within 16 KiB |
+| `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
+| `os-test` | os-test (Sortix, ISC, pinned) io and malloc suites on relibc, one test a boot; PASS, FAIL and UNSUPPORTED (needs `fork`) in `target/measure/os-test.txt`; a fault, a kill or no end within 60 s is a FAIL, the run stops after 300 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
 | `console-restart-vz` | `crash uart` on Apple VZ: `init` stops the Virtio function, restarts the driver, which finds it stopped, and input comes again |
 | `console-early-exit-vz` | the driver ends on Apple VZ before its function decodes its BARs: `init` skips the reset through BAR 0, clears the command word and restarts it |
-| `cprobe` | a static Picolibc C program against the RAM service |
-| `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox `cat`, `ash -c`, an `ash` dialog, `ls` |
+| `busybox`, `ash`, `ash-dialog`, `ls` | BusyBox on relibc: `cat`, `ash -c`, an `ash` dialog (with `can't fork` for `/bin/x`), `ls` |
 
 ## rtbench
 
@@ -181,3 +189,13 @@ p50 on HVF and VZ: S1 3,327 → 0 ns with 12 → 0 kernel calls; S4
 463 ns; S6 959 → 1,343 ns (the console's read in two steps); S3 rival at
 20: 6,783 → 98,303 ns, since waiters now take the mutex by level and the
 rival at 30 goes first.
+
+10 minutes on the last commit of step 5a′ (relibc's mutex, dlmalloc and
+pthreads over the layer, relibc at its own level 3) against 8c254c0, p50
+/ p99 on HVF: every row within two counter ticks or 10 % of 5a; S1 and S2
+still make no kernel call; S4 `malloc`/`free` of 64 bytes falls from 335
+/ 3,007 ns to under one tick (dlmalloc's cache); S4 `dup`/`close` 375 /
+463 ns, S6 1,343 / 2,495 ns, S7 3,583 / 7,039 ns. VZ: S4 `dup`/`close`
+423 / 463 ns, S6 1,343 / 2,367 ns, S7 3,583 / 7,295 ns. relibc built for
+size (level `s`) had S4 `dup`/`close` at 671 / 751 ns and S6 at 2,175 /
+3,583 ns.

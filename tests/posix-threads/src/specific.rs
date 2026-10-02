@@ -4,7 +4,7 @@
 //! Real interrupted key replies, cross-thread deletion and destructor joins.
 
 use super::*;
-use threads::specific::*;
+use ffi::{pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific};
 
 static MAIN_KEY: AtomicU64 = AtomicU64::new(0);
 static MAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -33,7 +33,7 @@ unsafe extern "C" fn child(_: *mut c_void) -> *mut c_void {
 }
 unsafe extern "C" fn joiner(_: *mut c_void) -> *mut c_void {
     let mut value = ptr::null_mut();
-    if unsafe { threads::pthread_join(TARGET_ID.load(Ordering::Acquire), &mut value) } != 0
+    if unsafe { ffi::pthread_join(TARGET_ID.load(Ordering::Acquire), &mut value) } != 0
         || value as usize != VALUE
     {
         RESULT.store(2, Ordering::Release);
@@ -83,16 +83,13 @@ pub(super) fn run() -> bool {
     }
     KEY.store(key, Ordering::Release);
     let mut target = 0;
-    if unsafe { threads::pthread_create(&mut target, ptr::null(), Some(child), ptr::null_mut()) }
-        != 0
-    {
+    if unsafe { ffi::pthread_create(&mut target, ptr::null(), Some(child), ptr::null_mut()) } != 0 {
         return failed(41);
     }
     TARGET_ID.store(target, Ordering::Release);
     sys::receive(&ready).expect("destructor readiness");
     let mut waiter = 0;
-    if unsafe { threads::pthread_create(&mut waiter, ptr::null(), Some(joiner), ptr::null_mut()) }
-        != 0
+    if unsafe { ffi::pthread_create(&mut waiter, ptr::null(), Some(joiner), ptr::null_mut()) } != 0
     {
         return failed(42);
     }
@@ -101,7 +98,7 @@ pub(super) fn run() -> bool {
         return failed(43);
     }
     sys::notify(&gate, 1).expect("finish destructor");
-    if unsafe { threads::pthread_join(waiter, ptr::null_mut()) } != 0
+    if unsafe { ffi::pthread_join(waiter, ptr::null_mut()) } != 0
         || RESULT.load(Ordering::Acquire) != 0
         || pthread_key_delete(key) != 0
     {
@@ -114,7 +111,7 @@ pub(super) fn run() -> bool {
     }
     KEY.store(key, Ordering::Release);
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut target,
             ptr::null(),
             Some(deleted_binding),
@@ -132,7 +129,7 @@ pub(super) fn run() -> bool {
     }
     KEY.store(key, Ordering::Release);
     sys::notify(&gate, 1).expect("resume after key reuse");
-    if unsafe { threads::pthread_join(target, ptr::null_mut()) } != 0
+    if unsafe { ffi::pthread_join(target, ptr::null_mut()) } != 0
         || RESULT.load(Ordering::Acquire) != 0
         || DESTRUCTIONS.load(Ordering::Acquire) != 1
         || pthread_key_delete(key) != 0

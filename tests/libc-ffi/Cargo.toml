@@ -1,0 +1,13 @@
+[package]
+name = "libc-ffi"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The relibc functions the Rust guest probes call, and relibc's link"
+build = "build.rs"
+
+[lib]
+test = false
+bench = false

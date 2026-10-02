@@ -8,11 +8,11 @@
 //! order they came; 10^5 handoffs of a mutex between two threads lose no
 //! wakeup; an entry of signals inside the layer's lock waits for its end.
 use super::*;
-use abi::signals::{self as api, SigAction};
+use crate::layer::signals::{self as api, SigAction};
 use core::sync::atomic::AtomicU32;
+use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 use posix_sync::{CLOCK_MONOTONIC, EAGAIN, ETIMEDOUT, LayerLock, futex_wait, futex_wake};
 use rt::wait::{Waited, Waiter};
-use threads::mutex::{Mutex, pthread_mutex_lock, pthread_mutex_unlock};
 
 static WORD: AtomicU32 = AtomicU32::new(0);
 static GATE: AtomicU32 = AtomicU32::new(0);
@@ -61,7 +61,7 @@ unsafe extern "C" fn ordered(argument: *mut c_void) -> *mut c_void {
         error();
     }
     let place = NEXT.fetch_add(1, Ordering::SeqCst);
-    ORDER[place].store(threads::pthread_self(), Ordering::SeqCst);
+    ORDER[place].store(ffi::pthread_self(), Ordering::SeqCst);
     done();
     ptr::null_mut()
 }
@@ -121,7 +121,7 @@ unsafe extern "C" fn visitor(_: *mut c_void) -> *mut c_void {
         tv_nsec: 50_000,
     };
     for _ in 0..VISITS_WANTED {
-        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+        let _ = unsafe { crate::layer::sleep::nanosleep(&pause, ptr::null_mut()) };
         if unsafe { pthread_mutex_lock(mutex) } != 0 {
             error();
         }
@@ -144,9 +144,8 @@ unsafe extern "C" fn on_signal(_: i32) {
 
 fn create(callback: unsafe extern "C" fn(*mut c_void) -> *mut c_void, value: usize) -> u64 {
     let mut id = 0;
-    if unsafe {
-        threads::pthread_create(&mut id, ptr::null(), Some(callback), value as *mut c_void)
-    } != 0
+    if unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(callback), value as *mut c_void) }
+        != 0
     {
         error();
     }
@@ -154,7 +153,7 @@ fn create(callback: unsafe extern "C" fn(*mut c_void) -> *mut c_void, value: usi
 }
 
 fn join(id: u64) {
-    if unsafe { threads::pthread_join(id, ptr::null_mut()) } != 0 {
+    if unsafe { ffi::pthread_join(id, ptr::null_mut()) } != 0 {
         error();
     }
 }

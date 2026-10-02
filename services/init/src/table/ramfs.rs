@@ -60,39 +60,56 @@ pub const TABLE: &[Record] = &[
 /// A POSIX process: main at the probe's level, the ceiling one above it,
 /// where the holders of the locks of `posix-abi` (buckets, heap, files,
 /// threads, actions) run, so an application thread at main's level never
-/// delays them. Programs on `posix-bridge` (`cprobe`, `busybox-probe`)
-/// share the record and its ceiling.
+/// delays them. BusyBox shares the record and its ceiling.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     ..TABLE[1]
 };
 
-pub const CPROBE_TABLE: &[Record] = &[
-    TABLE[0],
-    Record {
-        name: "cprobe",
-        program: "cprobe",
-        quota: 512 * PAGE,
-        ..POSIX
-    },
-];
-
+/// BusyBox, or a probe in its place, with the RAM files and the process
+/// and clock services a program on relibc starts with.
 pub const BUSYBOX_TABLE: &[Record] = &[
     TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
     Record {
         name: "busybox-probe",
         program: "busybox-probe",
+        connects: &["ramfs", "clock", "posix"],
         quota: 512 * PAGE,
+        // The first POSIX process: root, so ash prompts with `#`.
+        root: true,
         ..POSIX
     },
 ];
 
+/// BUSYBOX_TABLE with the console's driver, which the program reads.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
     Record {
-        connects: &["ramfs", "uart"],
-        ..BUSYBOX_TABLE[1]
+        connects: &["ramfs", "uart", "clock", "posix"],
+        ..BUSYBOX_TABLE[3]
+    },
+];
+
+/// The probes of console input and interruption (posix-threads with
+/// cancel-input, posix-shared): the console's driver, the RAM files, the
+/// process and clock services, and the probe under the name
+/// `posix-probe`.
+pub const POSIX_DIALOG_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "posix-probe",
+        program: "posix-probe",
+        connects: &["ramfs", "uart", "clock", "posix"],
+        quota: 512 * PAGE,
+        ..POSIX
     },
 ];
 
@@ -145,6 +162,79 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         priority: 50,
         ceiling: 50,
         ..LONG
+    },
+];
+
+/// The first C program on relibc (5a′): the RAM files, the process and
+/// clock services, and the program.
+pub const RELIBC_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "relibc-hello",
+        program: "relibc-hello",
+        args: b"relibc-hello\0",
+        connects: &["ramfs", "clock", "posix"],
+        quota: 512 * PAGE,
+        ..POSIX
+    },
+    // The same program ending by abort, a failed assert and a panic of
+    // relibc: each ends with status 134.
+    Record {
+        name: "relibc-abort",
+        args: b"relibc-hello\0abort\0",
+        ..RELIBC_HELLO
+    },
+    Record {
+        name: "relibc-assert",
+        args: b"relibc-hello\0assert\0",
+        ..RELIBC_HELLO
+    },
+    Record {
+        name: "relibc-panic",
+        args: b"relibc-hello\0panic\0",
+        ..RELIBC_HELLO
+    },
+];
+
+/// One test of os-test a boot (cargo xtask os-test): the RAM files, the
+/// process and clock services, and the test, under the name `os-test`.
+pub const OS_TEST_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "os-test",
+        program: "os-test",
+        args: b"os-test\0",
+        ..RELIBC_HELLO
+    },
+];
+
+/// relibc-hello's record, for the records of its other runs.
+const RELIBC_HELLO: Record = Record {
+    name: "relibc-hello",
+    program: "relibc-hello",
+    args: b"relibc-hello\0",
+    connects: &["ramfs", "clock", "posix"],
+    quota: 512 * PAGE,
+    ..POSIX
+};
+
+/// The threads of relibc (5a′): as RELIBC_TABLE, with room for 64
+/// threads (four handles each, their stacks and TCBs).
+pub const RELIBC_THREADS_TABLE: &[Record] = &[
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    Record {
+        name: "relibc-threads",
+        program: "relibc-threads",
+        args: b"relibc-threads\0",
+        quota: 4096 * PAGE,
+        handle_limit: 512,
+        ..RELIBC_TABLE[3]
     },
 ];
 

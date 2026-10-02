@@ -132,13 +132,7 @@ impl State {
         }
     }
     pub fn prepare(&mut self, pc: u64, flags: u64, long_call: bool) -> Option<u64> {
-        if self.entry == 0
-            || self.masked
-            || self.deferred != 0
-            || !self.pending
-            || long_call
-            || self.depth == u32::MAX
-        {
+        if self.entry == 0 || self.masked || self.deferred != 0 || !self.pending || long_call {
             return None;
         }
         self.masked = true;
@@ -146,7 +140,10 @@ impl State {
         self.entering = true;
         self.pc = pc;
         self.flags = flags;
-        self.depth += 1;
+        // A handler that leaves its entry by a long jump never returns it:
+        // the count stays at its top then, and entries go on (`can_return`
+        // and `bind` only ask whether it is 0).
+        self.depth = self.depth.saturating_add(1);
         Some(self.entry)
     }
     /// A request deferred by an internal borrow must not strand a new wait.
@@ -213,6 +210,25 @@ mod tests {
         assert_eq!(user_pstate(0, 2 << 4), NZCV | SSBS);
         assert_eq!(user_pstate(0, 1), NZCV | BRANCH_TYPE);
         assert_eq!(user_pstate(u64::MAX, u64::MAX), USER_PSTATE);
+    }
+    /// 2^32 entries left by long jumps (half an hour of them on HVF) do
+    /// not shut the entry: the depth stops at its top.
+    #[test]
+    fn entries_left_by_long_jumps_do_not_shut_the_entry() {
+        let mut state = State::new();
+        state.bind(0x1000).unwrap();
+        state.depth = u32::MAX - 1;
+        for _ in 0..3 {
+            state.control(ENABLE).unwrap();
+            assert_eq!(state.request(), Ok(true));
+            assert_eq!(state.prepare(0x2000, 0, false), Some(0x1000));
+            assert_eq!(state.control(TAKE), Ok((1, 0x2000, 0)));
+            // The handler jumps out: the thread unmasks with no return.
+        }
+        assert_eq!(state.depth, u32::MAX);
+        assert!(state.can_return());
+        state.returned().unwrap();
+        assert_eq!(state.depth, u32::MAX - 1);
     }
     #[test]
     fn requests_wait_for_registration_enable_and_long_call_completion() {

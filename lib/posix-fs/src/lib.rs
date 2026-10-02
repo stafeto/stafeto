@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! File and directory operations for the evolving Rust POSIX layer.
@@ -309,6 +309,12 @@ impl PosixFs {
     /// The console route of `fd` when it is standard output or error, for
     /// a write the caller makes after it let go of the file state (the
     /// owner stays alive meanwhile); None for a file of the service.
+    /// Whether `fd` is the console's input (standard input as the process
+    /// started, wherever `dup2` moved it).
+    pub fn console_input(&self, fd: u32) -> Result<bool, FsError> {
+        Ok(matches!(self.descriptors.get(fd)?, Backend::Input))
+    }
+
     pub fn console_route(&self, fd: u32) -> Result<Option<rt::fs::Input>, FsError> {
         Ok(match self.descriptors.get(fd)? {
             Backend::Output | Backend::Error => Some(self.files.input()),

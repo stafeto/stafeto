@@ -1,0 +1,17 @@
+[package]
+name = "relibc-hello"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The first C program on relibc over the Rust POSIX layer"
+build = "build.rs"
+
+[[bin]]
+name = "relibc-hello"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt" }

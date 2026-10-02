@@ -5,7 +5,7 @@
 //! the kernel answers an accepted request once, so the clock service needs
 //! no journal (spec 6.1).
 use super::*;
-use abi::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
+use crate::layer::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
 use abi::metadata::Timespec;
 use posix_clock::Client;
 use posix_time::Time;
@@ -19,10 +19,9 @@ pub(super) struct Peers {
     long: Handle<Channel>,
 }
 impl Peers {
-    /// # Safety
-    /// Single-threaded startup before any ABI calls.
-    pub(super) unsafe fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
-        unsafe { clock::init(parent) }?;
+    /// The sessions of the probe's own (posix-crt connected the layer's
+    /// clock).
+    pub(super) fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
         Ok(Self {
             direct: Client::connect(parent)?,
             relay: Client::connect_named(parent, "clock-peer")?,
@@ -35,7 +34,7 @@ unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     if unsafe { clock::clock_gettime(CLOCK_REALTIME, &mut value) } != 0
         || unsafe { *errno } != 777
@@ -50,7 +49,7 @@ unsafe extern "C" fn setter(argument: *mut c_void) -> *mut c_void {
         tv_sec: 20_000_000_000 + argument as i64,
         tv_nsec: 42_123,
     };
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     if unsafe { clock::clock_settime(CLOCK_REALTIME, &value) } != 0 || unsafe { *errno } != 777 {
         return ptr::null_mut();
@@ -66,7 +65,7 @@ static STORM_CLOCK: AtomicU64 = AtomicU64::new(0);
 /// STORM to `l` with a copy of the calling thread's handle: `l` keeps the
 /// thread, and the clock session `clock` tells `l` of each SET (WATCH).
 fn storm_start(long: &Handle<Channel>, clock: &Client) -> bool {
-    let Ok(native) = (unsafe { threads::probe_native(threads::pthread_self()) }) else {
+    let Ok(native) = (unsafe { threads::probe_native(ffi::pthread_self()) }) else {
         return false;
     };
     let rights = rt::abi::Rights::MANAGE | rt::abi::Rights::TRANSFER;
@@ -124,14 +123,14 @@ fn sets_once_under_entries(p: &Peers) -> bool {
     let mut setter = 0;
     let mut result = ptr::null_mut();
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut setter,
             ptr::null(),
             Some(storm_setter),
             ptr::null_mut(),
         )
     } != 0
-        || unsafe { threads::pthread_join(setter, &mut result) } != 0
+        || unsafe { ffi::pthread_join(setter, &mut result) } != 0
         || result as usize != VALUE
     {
         return failed(153);
@@ -170,6 +169,7 @@ fn set_packet(time: Time) -> Writer {
 pub(super) fn run(p: &Peers) -> bool {
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let before_handles = sys::process_handles(&process)
         .expect("clock handles baseline")
         .live;
@@ -193,9 +193,9 @@ pub(super) fn run(p: &Peers) -> bool {
         let mut child = 0;
         let mut result = ptr::null_mut();
         if unsafe {
-            threads::pthread_create(&mut child, ptr::null(), Some(setter), index as *mut c_void)
+            ffi::pthread_create(&mut child, ptr::null(), Some(setter), index as *mut c_void)
         } != 0
-            || unsafe { threads::pthread_join(child, &mut result) } != 0
+            || unsafe { ffi::pthread_join(child, &mut result) } != 0
             || result as usize != VALUE
         {
             return failed(141);
@@ -219,9 +219,8 @@ pub(super) fn run(p: &Peers) -> bool {
     }
     let mut child = 0;
     let mut result = ptr::null_mut();
-    if unsafe { threads::pthread_create(&mut child, ptr::null(), Some(reader), ptr::null_mut()) }
-        != 0
-        || unsafe { threads::pthread_join(child, &mut result) } != 0
+    if unsafe { ffi::pthread_create(&mut child, ptr::null(), Some(reader), ptr::null_mut()) } != 0
+        || unsafe { ffi::pthread_join(child, &mut result) } != 0
         || result as usize != VALUE
     {
         return failed(144);
@@ -254,6 +253,7 @@ pub(super) fn run(p: &Peers) -> bool {
     if unsafe { clock::clock_settime(CLOCK_REALTIME, &value) } != 0 {
         return failed(150);
     }
+    let _ = settle();
     if sys::process_handles(&process)
         .expect("clock handles after")
         .live

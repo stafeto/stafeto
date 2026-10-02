@@ -4,11 +4,13 @@
 //! System-wide realtime anchor. Starts at the Unix epoch until explicitly set.
 #![no_std]
 #![no_main]
+use core::sync::atomic::{AtomicU64, Ordering};
 use posix_time::{Clock, Error, History, Snapshot, Time};
 use proto_clock::Method;
+use proto_clock::page;
 use proto_init::ServiceArgs;
 use proto_wire::Status;
-use rt::handle::{Channel, Handle, Outgoing, Resource};
+use rt::handle::{Channel, Handle, Memory, Outgoing, Resource};
 use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 rt::entry!(main);
@@ -34,6 +36,10 @@ fn main(_: u64) -> u64 {
     let Ok(clock) = Clock::new(now(), rt::time::frequency()) else {
         return 4;
     };
+    let Ok(page) = Page::new(&start.process) else {
+        return 6;
+    };
+    page.publish(&clock);
     let config = Config {
         issued: 0,
         heartbeat: Some(Heartbeat {
@@ -47,6 +53,7 @@ fn main(_: u64) -> u64 {
         &channel,
         &mut Clocks {
             clock,
+            page,
             watches: core::array::from_fn(|_| None),
         },
         config,
@@ -60,7 +67,55 @@ struct Watch {
 }
 struct Clocks {
     clock: Clock,
+    page: Page,
     watches: [Option<Watch>; 8],
+}
+
+/// Where the service maps its page of the anchor.
+const PAGE_ADDRESS: usize = 0x0E00_0000;
+
+/// The page of the CLOCK_REALTIME anchor (proto_clock::page): the service
+/// writes it, every POSIX process maps it to read.
+struct Page {
+    memory: Handle<Memory>,
+}
+impl Page {
+    fn new(process: &Handle<rt::handle::Process>) -> Result<Self, rt::abi::Error> {
+        let memory = sys::mem_create(page::SIZE as u64)?;
+        sys::mem_map(
+            process,
+            &memory,
+            0,
+            page::SIZE as u64,
+            PAGE_ADDRESS,
+            rt::abi::Access::ReadWrite,
+        )?;
+        Ok(Self { memory })
+    }
+    fn word(offset: usize) -> &'static AtomicU64 {
+        // SAFETY: the page is mapped read-write at PAGE_ADDRESS for the
+        // service's life; its words are aligned.
+        unsafe { &*((PAGE_ADDRESS + offset) as *const AtomicU64) }
+    }
+    /// Writes the anchor of `clock` into the place readers do not look at,
+    /// then moves the counter to it.
+    fn publish(&self, clock: &Clock) {
+        let anchor = clock.anchor();
+        let value = anchor.time.value().expect("valid stored calendar anchor");
+        let sequence = Self::word(page::SEQUENCE).load(Ordering::Relaxed);
+        let place = page::PLACES + ((sequence + 1) % 2) as usize * page::PLACE_SIZE;
+        // The writes of the place come after the last move of the counter
+        // for every processor: a reader that saw that move and reads this
+        // place (as sequence s+2 later) never mixes it with the old one, as
+        // Linux's write of a latch (smp_wmb) keeps it. One processor needs
+        // no barrier; several do.
+        core::sync::atomic::fence(Ordering::Release);
+        Self::word(place + page::LOW).store(value as u64, Ordering::Relaxed);
+        Self::word(place + page::HIGH).store((value >> 64) as u64, Ordering::Relaxed);
+        Self::word(place + page::MONO).store(anchor.mono, Ordering::Relaxed);
+        Self::word(place + page::GENERATION).store(anchor.generation, Ordering::Relaxed);
+        Self::word(page::SEQUENCE).store(sequence + 1, Ordering::Release);
+    }
 }
 impl Clocks {
     fn record(&mut self, value: i128) {
@@ -178,6 +233,7 @@ impl Service<0> for Clocks {
                 self.record(self.clock.current(tick).expect("calendar before setting"));
                 let result = self.clock.set(time, tick);
                 if result.is_ok() && self.clock.anchor().generation != generation {
+                    self.page.publish(&self.clock);
                     self.record(self.clock.current(tick).expect("calendar after setting"));
                     self.changed();
                 }
@@ -227,6 +283,23 @@ impl Service<0> for Clocks {
                     return Answer::Status(Status::BadSize);
                 }
                 Answer::Reply(Outgoing::new())
+            }
+            Some(Method::Page) => {
+                if body.finish().is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let rights = rt::abi::Rights::MAP_READ.union(rt::abi::Rights::TRANSFER);
+                let Ok(copy) = sys::handle_duplicate(&self.page.memory, rights) else {
+                    return Answer::Status(Status::Kernel(rt::abi::Error::NoMemory));
+                };
+                let mut handles = Outgoing::new();
+                if handles.push(copy.erase()).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply(handles)
             }
             Some(Method::Watch) | None => Answer::Status(Status::UnknownMethod),
         }

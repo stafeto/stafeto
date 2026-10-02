@@ -192,31 +192,6 @@ fn check_posix(parent: &rt::Handle<rt::handle::Channel>) -> Result<(), &'static 
     if posix.fstat(fd) != Err(FsError::BadFileDescriptor) {
         return Err("closedir ownership");
     }
-    let (owned, duplicate) = posix_abi::tls::with_files(&mut posix, || {
-        // SAFETY: this scope owns its file context and supplies a live C string.
-        unsafe {
-            let stream = posix_abi::directory::opendir(c"/etc".as_ptr());
-            if stream.is_null() {
-                return (-1, -1);
-            }
-            let owned = posix_abi::directory::dirfd(stream);
-            (owned, posix_abi::dup(owned))
-        }
-    });
-    if owned < 0
-        || duplicate < 0
-        || posix.fstat(owned as u32) != Err(FsError::BadFileDescriptor)
-        || posix
-            .fstat(duplicate as u32)
-            .map_err(|_| "scope duplicate")?
-            .kind
-            != FileKind::Directory
-    {
-        return Err("directory scope cleanup");
-    }
-    posix
-        .close(duplicate as u32)
-        .map_err(|_| "scope duplicate close")?;
     Ok(())
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "relibc-threads"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "pthreads of relibc over the Rust POSIX layer"
+build = "build.rs"
+
+[[bin]]
+name = "relibc-threads"
+test = false
+bench = false
+
+[dependencies]
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
+posix-crt = { path = "../../lib/posix-crt" }
+rt = { path = "../../lib/rt", features = ["count-calls"] }

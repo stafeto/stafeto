@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from `m5a-transport` at 047fa12.
+Numbers below are from step 5a′ (`m5a2-relibc`).
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -61,27 +61,39 @@ service loops and starts children through a start protocol.
 crashes the driver, `init` restarts it and the shell reconnects. Separate
 images run BusyBox 1.37.0 against the RAM file service: `cat`, `ash -c`
 and an interactive `ash` on the UART with `echo` and `ls -la`. BusyBox
-links statically with Picolibc 1.8.12 through a small bridge
-(`lib/posix`).
+links statically with relibc over the Rust POSIX layer; `ash` reports
+`can't fork` for commands outside BusyBox until `fork` comes (5b).
 
 **POSIX layer in Rust.** The goal is the full mandatory POSIX.1-2024
-interface, implemented in Rust with a C ABI and a versioned sysroot
-(`tools/build-posix-sysroot.py`). The current crates cover paths,
-descriptors, files, `stat` and directories; the heap and the C locale;
-pthreads with cancellation, keys, `once` and mutexes; clocks and sleep;
-signal actions, masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and
-`SA_SIGINFO`; process IDs and credentials. The layer runs without helper
+interface. The C library is relibc (a fork pinned by
+`tools/build-relibc.py`, `cargo xtask relibc`); below it the Rust layer
+is the system part, with no C names of its own: the platform functions
+`stafeto_*` relibc calls (`lib/posix-platform`) over paths, descriptors,
+files, `stat` and directories; the heap; the table of threads, waits by
+address and deferred cancellation; clocks and sleep; signal actions,
+masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and `SA_SIGINFO`; process
+IDs and credentials. Every POSIX program starts through `posix-crt` and
+relibc, the Rust guest probes on a C main too (`tests/libc-ffi`); the
+native probe `posix-tls` checks the layer's TCB for threads relibc did not
+start. The layer runs without helper
 threads: a single-threaded program has one thread; mutexes, `once` and joins
 wait by address in the layer with no kernel call when uncontended; the heap,
 the descriptor table and the table of threads live under the layer's locks,
 whose holders run at the process ceiling; a read of the console is a long
 operation in two steps that a signal interrupts. Guest probes check them on
-QEMU and Apple VZ. The layer is a work in progress and paused: no real program
-uses it yet, and `ash` still runs on Picolibc. Details are in
+QEMU and Apple VZ.
+
+**C library.** relibc (MIT) is the C library of every POSIX program,
+BusyBox included; its platform is the layer's `stafeto_*` functions.
+os-test's io and malloc suites run on it in `ci`, one test a boot: 18
+pass, 38 fail (all at `mkstemp`: the RAM service creates no file yet) and
+2 need `fork`; `ci` fails when a test that passed stops passing. relibc
+builds at its own level 3: user-space programs have no size limit, only
+the kernel has one. Details are in
 [docs/status.md](docs/status.md).
 
 **Tests.** The kernel test image runs 182 tests (197 under `-icount`),
-the EL0 test `init` runs 228 and `kcore` has 406 host tests; `cargo xtask
+the EL0 test `init` runs 228 and `kcore` has 407 host tests; `cargo xtask
 ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
 Apple silicon.
 
@@ -102,9 +114,8 @@ Apple silicon.
 
 You need rustup, QEMU and dtc (on macOS: `brew install qemu dtc`); rustup
 installs the toolchain from `rust-toolchain.toml`. The POSIX probes in
-`test` and `ci` also need Clang/LLVM, LLD and Python 3; the Picolibc and
-BusyBox commands need Meson, Ninja, GNU Make and Git as well (on macOS:
-`brew install llvm lld meson ninja make`). The VZ commands need the Xcode
+`test` and `ci` also need Clang/LLVM, LLD, Python 3, GNU Make and Git (for
+relibc and BusyBox; on macOS: `brew install llvm lld make`). The VZ commands need the Xcode
 command line tools for `swiftc` and `codesign`.
 
 ```sh
@@ -116,6 +127,7 @@ cargo xtask ci           # formatting, clippy, licence checks, then everything t
 cargo xtask hvf          # the test set under HVF on Apple silicon; skips elsewhere
 cargo xtask rtbench      # throughput and 1 ms timer wakeups on TCG, HVF and VZ
 cargo xtask ash-shell    # interactive BusyBox ash over the QEMU UART
+cargo xtask os-test      # os-test's io and malloc suites on relibc, a table in target/measure/
 cargo xtask gdb          # QEMU halted at the first instruction, debugger on :1234
 cargo xtask help         # every command, including single probes
 ```
@@ -135,7 +147,7 @@ Bounded kernel paths and their costs:
 | `services/` | `init`, the UART driver, the RAM file, clock and process services |
 | `apps/` | the native shell |
 | `tests/` | guest test programs and probes |
-| `tools/` | Picolibc, BusyBox and sysroot builds, the VZ runner, licence check |
+| `tools/` | relibc and BusyBox builds, the VZ runner, licence check |
 | `xtask/` | build, run, test and measurement commands |
 | `docs/` | debugging, kernel paths, status details, third-party licences |
 | `notes/` | design notes of individual parts |
@@ -176,10 +188,10 @@ Bounded kernel paths and their costs:
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
-| POSIX: C library | a standard libc on top of the Rust system layer; BusyBox and utilities build with it | 🚧 |
-| POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | ⬜ |
+| POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
+| POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | 🚧 |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
-| POSIX: conformance | os-test and Open POSIX in `ci`; then conditions, semaphores, timers, `sigqueue` | ⬜ |
+| POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 
 ### Later subprojects
@@ -193,15 +205,22 @@ Bounded kernel paths and their costs:
 ## License
 
 The kernel, `kcore`, services, drivers, the shell, `xtask`, the tests,
-`lib/ext4ro` and the Rust POSIX crates (`lib/posix-*`) are under
+`lib/ext4ro` and the POSIX crates that programs do not link
+(`lib/posix-signal-queue`, `lib/posix-credentials`) are under
 GPL-3.0-or-later ([LICENSE](LICENSE)). The libraries that programs link
-(`lib/abi`, `lib/rt`, `lib/bootimg`, `lib/process-client`, `proto/*`) and
-the temporary Picolibc bridge `lib/posix` are under MIT
-([LICENSE-MIT](LICENSE-MIT)), so programs for stafeto can use any licence.
-Every source file carries an `SPDX-License-Identifier` line.
+(`lib/abi`, `lib/rt`, `lib/bootimg`, `lib/process-client`, `proto/*`) are
+under MIT ([LICENSE-MIT](LICENSE-MIT)).
 
-BusyBox is GPL-2.0-only ([license](https://busybox.net/license.html)) and
-cannot link GPL-3.0-or-later code. It links only the MIT bridge and talks
-to GPL services through messages; `cargo xtask ci` checks this boundary
-and the licence declarations of the POSIX crates. Third-party
-dependencies keep their own licences ([docs/licenses](docs/licenses)).
+The POSIX system layer that programs link (crates listed by
+`tools/check-licenses.py`) is GPL-3.0-or-later with the GCC Runtime Library
+Exception 3.1 ([LICENSE-GCC-exception-3.1](LICENSE-GCC-exception-3.1)):
+programs under any licence, including GPL-2.0-only BusyBox, may link it.
+Services stay GPL-3.0-or-later. relibc and its dependencies keep their own
+licences (THIRD-PARTY-NOTICES, which `tools/check-licenses.py` writes to
+`target/relibc/` and every boot image with a program on relibc carries).
+
+Every source file carries an `SPDX-License-Identifier` line. `cargo xtask
+ci` checks the licence of every crate and file, that the GPL-2.0-only
+programs (BusyBox) link no bare GPL-3.0 code, and that relibc and everything it links are under licences
+GPL-2.0-only takes. Other third-party dependencies keep their own licences
+([docs/licenses](docs/licenses)).

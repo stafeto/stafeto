@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The layer's mutex over waits by address: contended ordinary writes,
-//! kinds (EDEADLK, recursion and its bound, EBUSY, EPERM), and the release
-//! by a cleanup handler of a cancelled holder that wakes the next waiter.
+//! relibc's mutex over the layer's waits by address: contended ordinary
+//! writes, kinds (EDEADLK, recursion, EBUSY, EPERM), and the release by a
+//! cleanup handler of a cancelled holder that wakes the next waiter.
 
 use super::*;
 use core::cell::UnsafeCell;
-use threads::{
-    cancel,
-    mutex::{
-        self, Mutex, pthread_mutex_destroy, pthread_mutex_lock, pthread_mutex_trylock,
-        pthread_mutex_unlock,
-    },
+use ffi::{
+    Mutex, MutexAttr, pthread_mutex_destroy, pthread_mutex_init, pthread_mutex_lock,
+    pthread_mutex_trylock, pthread_mutex_unlock, pthread_mutexattr_destroy, pthread_mutexattr_init,
+    pthread_mutexattr_settype,
 };
 
 static LOCK: Mutex = Mutex::new();
@@ -40,7 +38,7 @@ fn error() {
 /// Adds to both words ROUNDS times under LOCK, yielding inside so that the
 /// others wait on it.
 unsafe extern "C" fn contender(argument: *mut c_void) -> *mut c_void {
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     for _ in 0..ROUNDS {
         if unsafe { pthread_mutex_lock(address(&LOCK)) } != 0 {
@@ -75,12 +73,11 @@ unsafe extern "C" fn cancellation_owner(_: *mut c_void) -> *mut c_void {
         error();
         return ptr::null_mut();
     }
-    let mut cleanup = cancel::Cleanup::new();
-    unsafe { cancel::__stafeto_cleanup_push(&mut cleanup, Some(unlock_cleanup), ptr::null_mut()) };
+    let mut cleanup = ffi::Cleanup::new();
+    unsafe { ffi::cleanup_push(&mut cleanup, Some(unlock_cleanup), ptr::null_mut()) };
     ready();
-    let _ =
-        unsafe { threads::pthread_join(CANCEL_TARGET.load(Ordering::Acquire), ptr::null_mut()) };
-    unsafe { cancel::__stafeto_cleanup_pop(&mut cleanup, 1) };
+    let _ = unsafe { ffi::pthread_join(CANCEL_TARGET.load(Ordering::Acquire), ptr::null_mut()) };
+    unsafe { ffi::cleanup_pop(&mut cleanup, 1) };
     error();
     ptr::null_mut()
 }
@@ -97,22 +94,23 @@ unsafe extern "C" fn recover(_: *mut c_void) -> *mut c_void {
 }
 fn create(callback: unsafe extern "C" fn(*mut c_void) -> *mut c_void, value: usize) -> Option<u64> {
     let mut id = 0;
-    (unsafe { threads::pthread_create(&mut id, ptr::null(), Some(callback), value as *mut c_void) }
+    (unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(callback), value as *mut c_void) }
         == 0)
         .then_some(id)
 }
 fn join(id: u64, expected: *mut c_void) -> bool {
     let mut value = ptr::null_mut();
-    (unsafe { threads::pthread_join(id, &mut value) }) == 0 && value == expected
+    (unsafe { ffi::pthread_join(id, &mut value) }) == 0 && value == expected
 }
 
 pub(super) fn run() -> bool {
     let ready_channel = sys::channel_create(30).expect("mutex ready channel");
     READY.store(ready_channel.raw().0, Ordering::Release);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 123 };
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
+    let _ = settle();
     let before_handles = sys::process_handles(&process)
         .expect("mutex handle baseline")
         .live;
@@ -134,57 +132,49 @@ pub(super) fn run() -> bool {
         || unsafe { *errno } != 123
         || unsafe { pthread_mutex_trylock(address(&LOCK)) } != 0
         || unsafe { pthread_mutex_trylock(address(&LOCK)) } != EBUSY
-        || unsafe { pthread_mutex_destroy(address(&LOCK)) } != EBUSY
         || unsafe { pthread_mutex_unlock(address(&LOCK)) } != 0
-        || unsafe { pthread_mutex_unlock(address(&LOCK)) } != EPERM
         || unsafe { pthread_mutex_destroy(address(&LOCK)) } != 0
     {
         return failed(92);
     }
-    rt::println!("posix-mutex-probe: four contended writers, trylock, EBUSY and EPERM ok");
+    rt::println!("posix-mutex-probe: four contended writers, trylock and EBUSY ok");
 
-    let mut attr = core::mem::MaybeUninit::<mutex::Attributes>::uninit();
-    let mut object = core::mem::MaybeUninit::<Mutex>::uninit();
-    let a = attr.as_mut_ptr();
-    let m = object.as_mut_ptr();
-    // Error checking: a second lock of the owner is EDEADLK.
-    if unsafe { mutex::pthread_mutexattr_init(a) } != 0
-        || unsafe { mutex::pthread_mutexattr_settype(a, PTHREAD_MUTEX_ERRORCHECK) } != 0
-        || unsafe { mutex::pthread_mutex_init(m, a) } != 0
+    let mut attr = MutexAttr::new();
+    let object = Mutex::new();
+    let a = &raw mut attr;
+    let m = object.get();
+    // Error checking: a second lock of the owner is EDEADLK, an unlock of
+    // a mutex it does not hold EPERM.
+    if unsafe { pthread_mutexattr_init(a) } != 0
+        || unsafe { pthread_mutexattr_settype(a, PTHREAD_MUTEX_ERRORCHECK) } != 0
+        || unsafe { pthread_mutex_init(m, a) } != 0
         || unsafe { pthread_mutex_lock(m) } != 0
         || unsafe { pthread_mutex_lock(m) } != EDEADLK
         || unsafe { pthread_mutex_trylock(m) } != EBUSY
         || unsafe { pthread_mutex_unlock(m) } != 0
+        || unsafe { pthread_mutex_unlock(m) } != EPERM
         || unsafe { pthread_mutex_destroy(m) } != 0
     {
         return failed(93);
     }
-    // Recursion counts, its bound gives EAGAIN, partial release keeps it.
-    if unsafe { mutex::pthread_mutexattr_settype(a, PTHREAD_MUTEX_RECURSIVE) } != 0
-        || unsafe { mutex::pthread_mutex_init(m, a) } != 0
+    // Recursion counts; a partial release keeps the mutex.
+    if unsafe { pthread_mutexattr_settype(a, PTHREAD_MUTEX_RECURSIVE) } != 0
+        || unsafe { pthread_mutex_init(m, a) } != 0
         || unsafe { pthread_mutex_lock(m) } != 0
         || unsafe { pthread_mutex_lock(m) } != 0
         || unsafe { pthread_mutex_trylock(m) } != 0
         || unsafe { pthread_mutex_unlock(m) } != 0
         || unsafe { pthread_mutex_unlock(m) } != 0
-        || unsafe { pthread_mutex_destroy(m) } != EBUSY
+        || object.word().load(Ordering::Relaxed) == 0
+        || unsafe { pthread_mutex_unlock(m) } != 0
+        || object.word().load(Ordering::Relaxed) != 0
+        || unsafe { pthread_mutex_unlock(m) } != EPERM
+        || unsafe { pthread_mutex_destroy(m) } != 0
+        || unsafe { pthread_mutexattr_destroy(a) } != 0
     {
         return failed(94);
     }
-    unsafe { mutex::probe_recursion(m, u32::MAX) };
-    if unsafe { pthread_mutex_lock(m) } != EAGAIN || unsafe { pthread_mutex_trylock(m) } != EAGAIN {
-        return failed(95);
-    }
-    unsafe { mutex::probe_recursion(m, 2) };
-    if unsafe { pthread_mutex_unlock(m) } != 0
-        || unsafe { pthread_mutex_destroy(m) } != EBUSY
-        || unsafe { pthread_mutex_unlock(m) } != 0
-        || unsafe { pthread_mutex_destroy(m) } != 0
-        || unsafe { mutex::pthread_mutexattr_destroy(a) } != 0
-    {
-        return failed(96);
-    }
-    rt::println!("posix-mutex-probe: EDEADLK, recursion, its bound and partial release ok");
+    rt::println!("posix-mutex-probe: EDEADLK, EPERM, recursion and partial release ok");
 
     // A cancelled holder's cleanup releases the mutex to its waiter.
     let target_gate = sys::channel_create(30).expect("cancellation join target gate");
@@ -203,10 +193,10 @@ pub(super) fn run() -> bool {
     let Some(waiter) = create(recover, 0) else {
         return failed(100);
     };
-    if !futex_blocked(waiter) || threads::pthread_cancel(owner) != 0 {
+    if !futex_blocked(waiter) || ffi::pthread_cancel(owner) != 0 {
         return failed(101);
     }
-    if !join(owner, cancel::CANCELED)
+    if !join(owner, ffi::CANCELED)
         || !join(waiter, VALUE as *mut c_void)
         || CLEANED.load(Ordering::Relaxed) != 1
         || RECOVERED.load(Ordering::Relaxed) != 1
@@ -222,6 +212,7 @@ pub(super) fn run() -> bool {
         return failed(103);
     }
     drop(target_gate);
+    let _ = settle();
     if sys::process_handles(&process)
         .expect("mutex final handles")
         .live

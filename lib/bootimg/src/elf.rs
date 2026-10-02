@@ -3,11 +3,14 @@
 
 //! A program's ELF file as the simple program format wants it (spec 3.3,
 //! 13.2): the entry point and one loadable segment per protection.
-//! Programs are static AArch64 executables without thread-local storage,
-//! linked with 4 KiB pages, each segment on pages of its own and no RELRO
-//! split (.cargo/config.toml); `Program::check` checks the rest. xtask
-//! builds the boot image with it; a loader of programs from a disk will
-//! read them with it too.
+//! Programs are static AArch64 executables, linked with 4 KiB pages, each
+//! segment on pages of its own and no RELRO split (.cargo/config.toml);
+//! `Program::check` checks the rest. A program may have one template of
+//! thread-local storage (`PT_TLS`, spec 2, 3.5): its bytes, if any, lie in
+//! the data segment, and the program's C library (relibc) builds each
+//! thread's TLS from them, so the loader gives it no memory of its own.
+//! xtask builds the boot image with it; a loader of programs from a disk
+//! will read them with it too.
 
 use crate::{Error, Part, Program, Segment, u32_at, u64_at};
 use core::fmt;
@@ -40,8 +43,11 @@ pub enum ElfError {
     HeaderSize,
     /// Its program headers run past the end of the file.
     HeadersPastEnd,
-    /// It has thread-local storage.
-    Tls,
+    /// It has two templates of thread-local storage.
+    TlsTwice,
+    /// Its template of thread-local storage is not in the data segment's
+    /// bytes.
+    TlsOutside,
     /// The loadable segment at `vaddr` has the protection `flags`, not r-x,
     /// r-- or rw-.
     Protection { vaddr: u64, flags: u32 },
@@ -64,7 +70,10 @@ impl fmt::Display for ElfError {
             ElfError::HeadersPastEnd => {
                 f.write_str("the program headers run past the end of the file")
             }
-            ElfError::Tls => f.write_str("thread-local storage is not supported"),
+            ElfError::TlsTwice => f.write_str("two thread-local storage templates"),
+            ElfError::TlsOutside => {
+                f.write_str("the thread-local storage template is not in the data segment")
+            }
             ElfError::Protection { vaddr, flags } => {
                 let bit = |b, c| if flags & b != 0 { c } else { '-' };
                 write!(
@@ -106,6 +115,8 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
     let headers = u64_at(elf, 32) as usize;
     let mut segments = [Segment::EMPTY; 3];
     let mut seen = [false; 3];
+    // The template's address and its bytes in the file.
+    let mut tls = None;
     for i in 0..usize::from(u16_at(elf, 56)) {
         let at = headers.saturating_add(i * PHDR_SIZE);
         let h = elf
@@ -114,7 +125,12 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
         match u32_at(h, 0) {
             PT_LOAD => {}
             PT_DYNAMIC | PT_INTERP => return Err(ElfError::NotStatic),
-            PT_TLS => return Err(ElfError::Tls),
+            PT_TLS => {
+                if tls.replace((u64_at(h, 16), u64_at(h, 32))).is_some() {
+                    return Err(ElfError::TlsTwice);
+                }
+                continue;
+            }
             _ => continue,
         }
         let (flags, offset, vaddr) = (u32_at(h, 4), u64_at(h, 8), u64_at(h, 16));
@@ -137,6 +153,14 @@ pub fn program(elf: &[u8], stack_size: u32) -> Result<Program<'_>, ElfError> {
             mem_size,
             bytes,
         };
+    }
+    // A template of zeros alone (`.tbss`) has no bytes to lie anywhere.
+    if let Some((vaddr, size @ 1..)) = tls {
+        let data = &segments[Part::Data as usize];
+        let end = data.vaddr.saturating_add(data.bytes.len() as u64);
+        if !seen[Part::Data as usize] || vaddr < data.vaddr || vaddr.saturating_add(size) > end {
+            return Err(ElfError::TlsOutside);
+        }
     }
     let program = Program {
         entry,
@@ -248,7 +272,6 @@ mod tests {
         for (kind, why) in [
             (PT_DYNAMIC, ElfError::NotStatic),
             (PT_INTERP, ElfError::NotStatic),
-            (PT_TLS, ElfError::Tls),
         ] {
             let mut f = good.clone();
             put(&mut f, 64 + PHDR_SIZE * 3, &kind.to_le_bytes());
@@ -267,7 +290,11 @@ mod tests {
                 ElfError::HeadersPastEnd,
                 "the program headers run past the end of the file",
             ),
-            (ElfError::Tls, "thread-local storage is not supported"),
+            (ElfError::TlsTwice, "two thread-local storage templates"),
+            (
+                ElfError::TlsOutside,
+                "the thread-local storage template is not in the data segment",
+            ),
             (
                 ElfError::Protection {
                     vaddr: 0x20_1000,
@@ -283,6 +310,58 @@ mod tests {
         ] {
             assert_eq!(e.to_string(), text);
         }
+    }
+
+    /// `layout()` with its stack header turned into templates of TLS:
+    /// address and bytes of each.
+    fn with_tls(templates: &[(u64, u64)]) -> Vec<u8> {
+        let mut f = layout();
+        // The stack header's place and room for more headers after it.
+        let first = 64 + PHDR_SIZE * 3;
+        let count = 3 + templates.len();
+        let mut headers = vec![0; PHDR_SIZE * templates.len()];
+        for (i, &(vaddr, size)) in templates.iter().enumerate() {
+            let h = PHDR_SIZE * i;
+            put(&mut headers, h, &PT_TLS.to_le_bytes());
+            put(&mut headers, h + 4, &PF_R.to_le_bytes());
+            put(&mut headers, h + 16, &vaddr.to_le_bytes());
+            put(&mut headers, h + 32, &size.to_le_bytes());
+            put(&mut headers, h + 40, &(size + 16).to_le_bytes());
+        }
+        // The headers end before the first segment's bytes at 0x1000.
+        put(&mut f, first, &headers);
+        put(&mut f, 56, &(count as u16).to_le_bytes());
+        f
+    }
+
+    /// One template of thread-local storage whose bytes are in the data
+    /// segment's, or that has no bytes (lld puts a `.tbss` alone after the
+    /// code), passes and changes nothing of the program; a template with
+    /// bytes elsewhere, or a second one, is refused.
+    #[test]
+    fn one_tls_template_in_the_data_is_taken() {
+        let plain = layout();
+        let plain = program(&plain, 0x1000).unwrap();
+        // The data segment's four bytes are at 0x202000.
+        for template in [
+            (0x20_2000, 4),
+            (0x20_2001, 2),
+            (0x20_2004, 0),
+            (0x20_1a80, 0),
+        ] {
+            let f = with_tls(&[template]);
+            assert_eq!(program(&f, 0x1000), Ok(plain), "{template:x?}");
+        }
+        for template in [(0x20_1ff0, 4), (0x20_2002, 4), (0x20_0000, 2)] {
+            let f = with_tls(&[template]);
+            assert_eq!(
+                program(&f, 0x1000),
+                Err(ElfError::TlsOutside),
+                "{template:x?}"
+            );
+        }
+        let f = with_tls(&[(0x20_2000, 4), (0x20_2000, 4)]);
+        assert_eq!(program(&f, 0x1000), Err(ElfError::TlsTwice));
     }
 
     #[test]

@@ -12,12 +12,14 @@ test = false
 bench = false
 
 [features]
-interrupt-probe = []
-input-probe = []
+interrupt-probe = ["posix-crt/uart-input"]
+input-probe = ["posix-crt/uart-input"]
 
 [dependencies]
 posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }
+posix-crt = { path = "../../lib/posix-crt" }
+libc-ffi = { path = "../libc-ffi" }
 rt = { path = "../../lib/rt" }
 posix-request = { path = "../../lib/posix-request" }
 proto-wire = { path = "../../proto/wire" }

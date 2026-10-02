@@ -691,10 +691,14 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-ceiling") as usize
     + cfg!(feature = "vz") as usize
     + cfg!(feature = "table-ramfs") as usize
-    + cfg!(feature = "table-cprobe") as usize
     + cfg!(feature = "table-busybox") as usize
     + cfg!(feature = "table-busybox-dialog") as usize
+    + cfg!(feature = "table-posix-dialog") as usize
+    + cfg!(feature = "table-posix-dialog-vz") as usize
     + cfg!(feature = "table-posix-abi") as usize
+    + cfg!(feature = "table-relibc") as usize
+    + cfg!(feature = "table-relibc-threads") as usize
+    + cfg!(feature = "table-os-test") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
@@ -714,10 +718,14 @@ const _: () = assert!(
     feature = "table-ceiling",
     feature = "vz",
     feature = "table-ramfs",
-    feature = "table-cprobe",
     feature = "table-busybox",
     feature = "table-busybox-dialog",
+    feature = "table-posix-dialog",
+    feature = "table-posix-dialog-vz",
     feature = "table-posix-abi",
+    feature = "table-relibc",
+    feature = "table-relibc-threads",
+    feature = "table-os-test",
     feature = "table-posix-abi-vz",
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
@@ -729,12 +737,20 @@ pub const TABLE: &[Record] = normal::TABLE;
 pub const TABLE: &[Record] = ramfs::TABLE;
 #[cfg(feature = "table-posix-abi")]
 pub const TABLE: &[Record] = ramfs::POSIX_ABI_TABLE;
-#[cfg(feature = "table-cprobe")]
-pub const TABLE: &[Record] = ramfs::CPROBE_TABLE;
+#[cfg(feature = "table-relibc")]
+pub const TABLE: &[Record] = ramfs::RELIBC_TABLE;
+#[cfg(feature = "table-relibc-threads")]
+pub const TABLE: &[Record] = ramfs::RELIBC_THREADS_TABLE;
+#[cfg(feature = "table-os-test")]
+pub const TABLE: &[Record] = ramfs::OS_TEST_TABLE;
 #[cfg(feature = "table-busybox")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_TABLE;
 #[cfg(feature = "table-busybox-dialog")]
 pub const TABLE: &[Record] = ramfs::BUSYBOX_DIALOG_TABLE;
+#[cfg(feature = "table-posix-dialog")]
+pub const TABLE: &[Record] = ramfs::POSIX_DIALOG_TABLE;
+#[cfg(feature = "table-posix-dialog-vz")]
+pub const TABLE: &[Record] = vz::POSIX_DIALOG_TABLE;
 #[cfg(feature = "vz")]
 pub const TABLE: &[Record] = vz::TABLE;
 #[cfg(feature = "table-posix-abi-vz")]
@@ -1402,9 +1418,25 @@ mod tests {
         );
         assert_eq!(
             order_of(vz::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "busybox-probe"]
+            ["uart", "ramfs", "posix", "clock", "busybox-probe"]
         );
         assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
+        assert_eq!(
+            order_of(ramfs::RELIBC_TABLE),
+            [
+                "ramfs",
+                "posix",
+                "clock",
+                "relibc-hello",
+                "relibc-abort",
+                "relibc-assert",
+                "relibc-panic"
+            ]
+        );
+        assert_eq!(
+            order_of(ramfs::RELIBC_THREADS_TABLE),
+            ["ramfs", "posix", "clock", "relibc-threads"]
+        );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
             assert_eq!(
                 order_of(table),
@@ -1441,10 +1473,14 @@ mod tests {
     #[test]
     fn posix_processes_have_a_ceiling_above_main() {
         let tables = [
-            ramfs::CPROBE_TABLE,
             ramfs::BUSYBOX_TABLE,
             ramfs::BUSYBOX_DIALOG_TABLE,
+            ramfs::POSIX_DIALOG_TABLE,
+            vz::POSIX_DIALOG_TABLE,
             ramfs::POSIX_ABI_TABLE,
+            ramfs::RELIBC_TABLE,
+            ramfs::RELIBC_THREADS_TABLE,
+            ramfs::OS_TEST_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
@@ -1454,14 +1490,18 @@ mod tests {
             assert!(check(table).is_ok());
             let posix = table.iter().filter(|r| {
                 [
-                    "cprobe",
                     "busybox-probe",
+                    "posix-probe",
                     "posix-abi-probe",
+                    "relibc-hello",
+                    "relibc-threads",
+                    "os-test",
                     "rtbench-posix",
                 ]
                 .contains(&r.program)
             });
-            assert_eq!(posix.clone().count(), 1);
+            // One POSIX program; relibc's table runs it four times.
+            assert!(posix.clone().count() >= 1);
             for r in posix {
                 assert_eq!(r.ceiling, r.priority + 1, "{}", r.name);
             }

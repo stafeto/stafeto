@@ -4,8 +4,7 @@
 //! File progress while a different thread waits for console input.
 
 use super::*;
-use posix_abi::metadata;
-use rt::handle::{Process, Thread};
+use rt::handle::Process;
 
 static INPUT_STACK: Stack<16384> = Stack::new();
 static SECOND: AtomicUsize = AtomicUsize::new(0);
@@ -14,21 +13,19 @@ static ENTERED: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn reader(completion: u64) -> ! {
     let passed = tls::with_process(|| {
-        let errno = unsafe { abi::__errno_location() };
-        unsafe { *errno = EINVAL };
         ENTERED.store(1, Ordering::Release);
         // fd 3 is closed and reused by main after this read has begun.
         let mut byte = 0;
-        if unsafe { abi::read(3, &mut byte, 1) } != 1 || byte != b'x' {
+        if abi::read(3, core::slice::from_mut(&mut byte)) != Ok(1) || byte != b'x' {
             return false;
         }
         let second = SECOND.load(Ordering::Acquire) as i32;
         for expected in b"yz\n" {
-            if unsafe { abi::read(second, &mut byte, 1) } != 1 || byte != *expected {
+            if abi::read(second, core::slice::from_mut(&mut byte)) != Ok(1) || byte != *expected {
                 return false;
             }
         }
-        unsafe { *errno == EINVAL }
+        true
     });
     RESULT.store(if passed { 1 } else { 2 }, Ordering::Release);
     let completion = Handle::<Channel>::borrowed(rt::abi::Handle(completion));
@@ -36,23 +33,22 @@ extern "C" fn reader(completion: u64) -> ! {
     sys::thread_exit()
 }
 
-pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
-    let errno = unsafe { abi::__errno_location() };
-    let first = unsafe { abi::dup(0) };
-    let second = unsafe { abi::dup(0) };
+pub fn run(process: &Handle<Process>) -> bool {
+    let (Ok(first), Ok(second)) = (abi::dup(0), abi::dup(0)) else {
+        return fail(30);
+    };
     if first != 3
         || second != 4
-        || unsafe { abi::read(first, ptr::null_mut(), 0) } != 0
-        || unsafe { abi::read(1, ptr::null_mut(), 0) } != -1
-        || unsafe { *errno } != EBADF
+        || abi::read(first, &mut []) != Ok(0)
+        || abi::read(1, &mut []) != Err(EBADF)
     {
         return fail(30);
     }
     SECOND.store(second as usize, Ordering::Release);
-    unsafe { *errno = EIO };
     // UART read really blocks: the higher-priority client reaches the driver
     // before main resumes.
-    if sys::thread_set_priority(main, 29, rt::abi::Policy::Fifo).is_err() {
+    // Through the layer, which keeps the level of a thread of relibc.
+    if abi::threads::set_level(29).is_err() {
         return fail(31);
     }
     let Ok(completion) = sys::channel_create(30) else {
@@ -83,41 +79,36 @@ pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     if ENTERED.load(Ordering::Acquire) != 1 || RESULT.load(Ordering::Acquire) != 0 {
         return fail(35);
     }
-    let mut info = core::mem::MaybeUninit::<metadata::Stat>::uninit();
-    if unsafe { metadata::fstat(second, info.as_mut_ptr()) } != 0
-        || unsafe { abi::close(first) } != 0
-    {
+    // A round trip under the files' lock: the console seeks nowhere.
+    if abi::lseek(second, 0, SEEK_CUR) != Err(ESPIPE) || abi::close(first).is_err() {
         return fail(36);
     }
-    let file = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
-    if file != first || unsafe { abi::dup2(file, 0) } != 0 {
+    let file = abi::open(b"/etc/motd", O_RDONLY);
+    if file != Ok(first) || abi::dup2(first, 0) != Ok(0) {
         return fail(37);
     }
+    let file = first;
     let mut byte = 0;
-    if unsafe { abi::read(0, &mut byte, 1) } != 1
+    if abi::read(0, core::slice::from_mut(&mut byte)) != Ok(1)
         || byte != b's'
-        || unsafe { abi::lseek(file, 0, SEEK_CUR) } != 1
-        || unsafe { *errno } != EIO
+        || abi::lseek(file, 0, SEEK_CUR) != Ok(1)
         || RESULT.load(Ordering::Acquire) != 0
     {
         return fail(38);
     }
-    let block = unsafe { abi::allocation::malloc(16) };
-    if block.is_null() {
+    // The process's pages go on while input waits.
+    let Ok(pages) = abi::allocation::map_pages(4096) else {
         return fail(40);
-    }
-    unsafe { abi::allocation::free(block) };
-    if unsafe { *errno } != EIO {
-        return fail(41);
-    }
+    };
+    // SAFETY: the page came from map_pages just now.
+    unsafe { abi::allocation::unmap_pages(pages, 4096) };
     // The host sends no bytes until it observes this marker. A blocked file
     // owner deadlocks before the marker, causing the dialog to time out.
     rt::println!("posix-input-probe: files ready while input waits");
     if sys::receive(&completion).is_err()
         || RESULT.load(Ordering::Acquire) != 1
-        || unsafe { *errno } != EIO
-        || unsafe { abi::close(file) } != 0
-        || unsafe { abi::close(second) } != 0
+        || abi::close(file).is_err()
+        || abi::close(second).is_err()
     {
         return fail(39);
     }

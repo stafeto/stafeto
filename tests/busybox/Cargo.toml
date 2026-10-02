@@ -5,12 +5,12 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-2.0-only"
-description = "First BusyBox applet in a stafeto boot image"
+description = "BusyBox applets on relibc in a stafeto boot image"
 build = "build.rs"
 
 [features]
 ash-probe = []
-ash-interactive = []
+ash-interactive = ["posix-crt/uart-input"]
 ls-probe = []
 
 [[bin]]
@@ -19,5 +19,5 @@ test = false
 bench = false
 
 [dependencies]
-posix-bridge = { path = "../../lib/posix" }
+posix-crt = { path = "../../lib/posix-crt" }
 rt = { path = "../../lib/rt" }

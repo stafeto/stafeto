@@ -3,10 +3,10 @@
 
 //! Pending/live acceptance, thread targeting, retry and cancellation cleanup.
 use super::*;
-use abi::signals::{self as api, SigAction, SigInfo};
+use crate::layer::signals::{self as api, SigAction, SigInfo};
 use core::sync::atomic::AtomicBool;
+use ffi::Cleanup;
 use rt::wait::{Waited, Waiter};
-use threads::cancel::{self, Cleanup};
 static INFO: AtomicBool = AtomicBool::new(false);
 static TIMED: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicUsize = AtomicUsize::new(0);
@@ -41,16 +41,16 @@ unsafe extern "C" fn handler(signal: i32) {
         ERRORS.fetch_add(1, Ordering::Release);
     }
     HANDLED.fetch_add(1, Ordering::AcqRel);
-    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
+    let fd = unsafe { ffi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
     let mut byte = 0;
     if fd < 0
-        || unsafe { abi::read(fd, &mut byte, 1) } != 1
+        || unsafe { ffi::read(fd, &mut byte, 1) } != 1
         || byte != b's'
-        || unsafe { abi::close(fd) } != 0
+        || unsafe { ffi::close(fd) } != 0
     {
         ERRORS.fetch_add(1, Ordering::Release);
     }
-    unsafe { *abi::__errno_location() = 901 };
+    unsafe { *ffi::__errno_location() = 901 };
 }
 struct Output {
     signal: i32,
@@ -67,9 +67,9 @@ unsafe extern "C" fn cleanup(argument: *mut c_void) {
     let output = unsafe { &*argument.cast::<Output>() };
     let signal = output.signal;
     let mode = MODE.load(Ordering::Acquire);
-    if api::probe_waiting(threads::pthread_self()) != Ok(false)
+    if api::probe_waiting(ffi::pthread_self()) != Ok(false)
         || mask() != BLOCKED
-        || unsafe { *abi::__errno_location() } != 777
+        || unsafe { *ffi::__errno_location() } != 777
         || signal != if mode == 5 { SIGUSR1 } else { 777 }
         || (INFO.load(Ordering::Acquire)
             && output.info
@@ -87,7 +87,7 @@ unsafe extern "C" fn cleanup(argument: *mut c_void) {
 unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     let index = argument as usize;
     let mode = MODE.load(Ordering::Acquire);
-    let errno = unsafe { abi::__errno_location() };
+    let errno = unsafe { ffi::__errno_location() };
     unsafe { *errno = 777 };
     if mask() != BLOCKED || pending() != 0 {
         return ptr::null_mut();
@@ -97,9 +97,7 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
         info: sentinel(),
     };
     let mut node = Cleanup::new();
-    unsafe {
-        cancel::__stafeto_cleanup_push(&mut node, Some(cleanup), ptr::from_mut(&mut output).cast())
-    };
+    unsafe { ffi::cleanup_push(&mut node, Some(cleanup), ptr::from_mut(&mut output).cast()) };
     if mode == 0 {
         assert_eq!(api::raise(SIGUSR1), 0);
         assert_eq!(api::raise(SIGUSR1), 0);
@@ -107,11 +105,11 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     if mode == 4 || mode == 5 {
         if mode == 5 {
             assert_eq!(
-                unsafe { cancel::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, ptr::null_mut()) },
+                unsafe { ffi::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, ptr::null_mut()) },
                 0
             );
         }
-        assert_eq!(threads::pthread_cancel(threads::pthread_self()), 0);
+        assert_eq!(ffi::pthread_cancel(ffi::pthread_self()), 0);
     }
     let set = if mode == 6 { 0 } else { bit(SIGUSR1) };
     let with_info = INFO.load(Ordering::Acquire);
@@ -155,12 +153,12 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
     RETURNED[index].store(usize::from(passed), Ordering::Release);
     if mode == 5 {
         assert_eq!(
-            unsafe { cancel::pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, ptr::null_mut()) },
+            unsafe { ffi::pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, ptr::null_mut()) },
             0
         );
-        cancel::pthread_testcancel();
+        ffi::pthread_testcancel();
     }
-    unsafe { cancel::__stafeto_cleanup_pop(&mut node, 0) };
+    unsafe { ffi::cleanup_pop(&mut node, 0) };
     notify();
     usize::from(passed) as *mut c_void
 }
@@ -170,7 +168,7 @@ fn blocked(id: u64) -> bool {
 }
 fn joined(id: u64, expected: usize) -> bool {
     let mut value = ptr::null_mut();
-    (unsafe { threads::pthread_join(id, &mut value) }) == 0 && value as usize == expected
+    (unsafe { ffi::pthread_join(id, &mut value) }) == 0 && value as usize == expected
 }
 pub(super) fn run() -> bool {
     let done = sys::channel_create(30).unwrap();
@@ -206,7 +204,7 @@ pub(super) fn run() -> bool {
             let mut ids = [0; 2];
             for (index, id) in ids.iter_mut().enumerate().take(count) {
                 if unsafe {
-                    threads::pthread_create(id, ptr::null(), Some(worker), index as *mut c_void)
+                    ffi::pthread_create(id, ptr::null(), Some(worker), index as *mut c_void)
                 } != 0
                 {
                     return failed(422);
@@ -219,7 +217,7 @@ pub(super) fn run() -> bool {
                     }
                 }
                 if mode == 6 {
-                    if threads::pthread_cancel(ids[0]) != 0 {
+                    if ffi::pthread_cancel(ids[0]) != 0 {
                         return failed(424);
                     }
                 } else {
@@ -230,16 +228,16 @@ pub(super) fn run() -> bool {
                         }
                     }
                     if mode == 2
-                        && (api::pthread_kill(ids[0], SIGTERM) != 0
+                        && (ffi::pthread_kill(ids[0], SIGTERM) != 0
                             || !blocked(ids[0])
                             || HANDLED.load(Ordering::Acquire) != 1)
                     {
                         return failed(426);
                     }
-                    if count == 2 && api::pthread_kill(ids[1], SIGUSR2) != 0 {
+                    if count == 2 && ffi::pthread_kill(ids[1], SIGUSR2) != 0 {
                         return failed(427);
                     }
-                    if api::pthread_kill(ids[0], SIGUSR1) != 0 {
+                    if ffi::pthread_kill(ids[0], SIGUSR1) != 0 {
                         return failed(428);
                     }
                 }
@@ -254,7 +252,7 @@ pub(super) fn run() -> bool {
             if count == 2 {
                 if RETURNED[1].load(Ordering::Acquire) != 0
                     || !blocked(ids[1])
-                    || api::pthread_kill(ids[1], SIGUSR1) != 0
+                    || ffi::pthread_kill(ids[1], SIGUSR1) != 0
                 {
                     return failed(430);
                 }

@@ -4,7 +4,8 @@
 //! Cancellation releases join claims before handlers and closes IPC-entry races.
 
 use super::*;
-use threads::cancel::{self, Cleanup};
+use ffi::Cleanup;
+use threads::cancel;
 
 static CANCEL_TARGET: AtomicU64 = AtomicU64::new(0);
 static CLEANUP_READY: AtomicU64 = AtomicU64::new(0);
@@ -15,13 +16,13 @@ static RACE_NATIVE: AtomicU64 = AtomicU64::new(0);
 
 unsafe extern "C" fn join_cleanup(_: *mut c_void) {
     let mut old = 99;
-    if unsafe { cancel::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &mut old) } != 0
+    if unsafe { ffi::pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &mut old) } != 0
         || old != PTHREAD_CANCEL_DISABLE
     {
         CLEANUP_RESULT.store(2, Ordering::Release);
         return;
     }
-    cancel::pthread_testcancel();
+    ffi::pthread_testcancel();
     {
         let ready =
             Handle::<Channel>::borrowed(rt::abi::Handle(CLEANUP_READY.load(Ordering::Acquire)));
@@ -34,10 +35,10 @@ unsafe extern "C" fn join_cleanup(_: *mut c_void) {
 }
 unsafe extern "C" fn cancelled_joiner(_: *mut c_void) -> *mut c_void {
     let mut cleanup = Cleanup::new();
-    unsafe { cancel::__stafeto_cleanup_push(&mut cleanup, Some(join_cleanup), ptr::null_mut()) };
+    unsafe { ffi::cleanup_push(&mut cleanup, Some(join_cleanup), ptr::null_mut()) };
     let mut value = ptr::null_mut();
-    let _ = unsafe { threads::pthread_join(CANCEL_TARGET.load(Ordering::Acquire), &mut value) };
-    unsafe { cancel::__stafeto_cleanup_pop(&mut cleanup, 0) };
+    let _ = unsafe { ffi::pthread_join(CANCEL_TARGET.load(Ordering::Acquire), &mut value) };
+    unsafe { ffi::cleanup_pop(&mut cleanup, 0) };
     CLEANUP_RESULT.store(3, Ordering::Release);
     value
 }
@@ -47,11 +48,11 @@ unsafe extern "C" fn race_cleanup(_: *mut c_void) {
 unsafe extern "C" fn before_wait(argument: *mut c_void) -> *mut c_void {
     let ready = Handle::<Channel>::borrowed(rt::abi::Handle(argument as u64));
     let gate = Handle::<Channel>::borrowed(rt::abi::Handle(RACE_GATE.load(Ordering::Acquire)));
-    let native = unsafe { threads::probe_native(threads::pthread_self()) }.expect("self handle");
+    let native = unsafe { threads::probe_native(ffi::pthread_self()) }.expect("self handle");
     RACE_NATIVE.store(native.raw().0, Ordering::Release);
     sys::thread_set_priority(&native, 10, rt::abi::Policy::Fifo).expect("race target priority");
     let mut cleanup = Cleanup::new();
-    unsafe { cancel::__stafeto_cleanup_push(&mut cleanup, Some(race_cleanup), ptr::null_mut()) };
+    unsafe { ffi::cleanup_push(&mut cleanup, Some(race_cleanup), ptr::null_mut()) };
     threads::probe_cancel_window(|| {
         sys::notify(&ready, 1).expect("window ready");
         // Main at priority 30 records cancellation while this priority-10
@@ -66,7 +67,7 @@ unsafe extern "C" fn before_wait(argument: *mut c_void) -> *mut c_void {
         drop(deferred);
     });
     CLEANUP_RESULT.store(3, Ordering::Release);
-    unsafe { cancel::__stafeto_cleanup_pop(&mut cleanup, 0) };
+    unsafe { ffi::cleanup_pop(&mut cleanup, 0) };
     ptr::null_mut()
 }
 
@@ -81,7 +82,7 @@ pub fn run() -> bool {
     let mut child = 0;
     let mut value = ptr::null_mut();
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut target,
             ptr::null(),
             Some(gated),
@@ -93,7 +94,7 @@ pub fn run() -> bool {
     }
     CANCEL_TARGET.store(target, Ordering::Release);
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut child,
             ptr::null(),
             Some(cancelled_joiner),
@@ -104,20 +105,20 @@ pub fn run() -> bool {
         return failed(14);
     }
     let native = unsafe { threads::probe_native(child) }.expect("cancelled joiner handle");
-    if !waiting(&native) || threads::pthread_cancel(child) != 0 || sys::receive(&ready).is_err() {
+    if !waiting(&native) || ffi::pthread_cancel(child) != 0 || sys::receive(&ready).is_err() {
         return failed(15);
     }
     // The cancelled thread remains blocked in its handler. Another thread
     // must already be able to claim the original target before cleanup ends.
     if sys::notify(&target_gate, 1).is_err()
-        || unsafe { threads::pthread_join(target, &mut value) } != 0
+        || unsafe { ffi::pthread_join(target, &mut value) } != 0
         || value as usize != VALUE
     {
         return failed(16);
     }
     if sys::notify(&release, 1).is_err()
-        || unsafe { threads::pthread_join(child, &mut value) } != 0
-        || value != cancel::CANCELED
+        || unsafe { ffi::pthread_join(child, &mut value) } != 0
+        || value != ffi::CANCELED
         || CLEANUP_RESULT.load(Ordering::Acquire) != 1
     {
         return failed(17);
@@ -129,7 +130,7 @@ pub fn run() -> bool {
     let race_gate = sys::channel_create(1).expect("race gate");
     RACE_GATE.store(race_gate.raw().0, Ordering::Release);
     if unsafe {
-        threads::pthread_create(
+        ffi::pthread_create(
             &mut child,
             ptr::null(),
             Some(before_wait),
@@ -144,12 +145,12 @@ pub fn run() -> bool {
     if !sys::thread_info(&native).is_ok_and(|info| info.state == ThreadState::Ready) {
         return failed(21);
     }
-    if threads::pthread_cancel(child) != 0 {
+    if ffi::pthread_cancel(child) != 0 {
         return failed(22);
     }
     rt::println!("posix-cancel-probe: cancellation recorded before IPC wait");
-    if unsafe { threads::pthread_join(child, &mut value) } != 0
-        || value != cancel::CANCELED
+    if unsafe { ffi::pthread_join(child, &mut value) } != 0
+        || value != ffi::CANCELED
         || CLEANUP_RESULT.load(Ordering::Acquire) != 1
     {
         return failed(23);

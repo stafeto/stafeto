@@ -23,17 +23,7 @@ dependencies = [
 name = "busybox-probe"
 version = "0.1.0"
 dependencies = [
- "posix-bridge",
- "rt",
-]
-
-[[package]]
-name = "cprobe"
-version = "0.1.0"
-dependencies = [
- "posix-bridge",
- "proto-fs",
- "proto-wire",
+ "posix-crt",
  "rt",
 ]
 
@@ -117,6 +107,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc-ffi"
+version = "0.1.0"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -127,6 +121,13 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "os-test-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
 
 [[package]]
 name = "posix-abi"
@@ -155,15 +156,6 @@ name = "posix-abi-probe"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
-]
-
-[[package]]
-name = "posix-bridge"
-version = "0.1.0"
-dependencies = [
- "proto-fs",
- "proto-wire",
- "rt",
 ]
 
 [[package]]
@@ -213,6 +205,7 @@ version = "0.1.0"
 dependencies = [
  "posix-abi",
  "posix-fs",
+ "posix-platform",
  "posix-thread",
  "proto-init",
  "rt",
@@ -252,6 +245,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "posix-platform"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-fs",
+ "posix-signals",
+ "posix-sync",
+ "posix-thread",
+ "posix-types",
+ "rt",
+]
+
+[[package]]
 name = "posix-process-service"
 version = "0.1.0"
 dependencies = [
@@ -275,7 +281,9 @@ dependencies = [
 name = "posix-shared-probe"
 version = "0.1.0"
 dependencies = [
+ "libc-ffi",
  "posix-abi",
+ "posix-crt",
  "posix-fs",
  "posix-request",
  "proto-uart",
@@ -314,8 +322,10 @@ version = "0.1.0"
 name = "posix-thread-probe"
 version = "0.1.0"
 dependencies = [
+ "libc-ffi",
  "posix-abi",
  "posix-clock",
+ "posix-crt",
  "posix-fs",
  "posix-request",
  "posix-signals",
@@ -440,11 +450,26 @@ dependencies = [
 name = "ramfs-probe"
 version = "0.1.0"
 dependencies = [
- "posix-abi",
  "posix-fs",
  "posix-path",
  "proto-fs",
  "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "relibc-hello"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
+name = "relibc-threads"
+version = "0.1.0"
+dependencies = [
+ "posix-abi",
+ "posix-crt",
  "rt",
 ]
 

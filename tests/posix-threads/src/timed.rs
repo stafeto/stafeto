@@ -1,27 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Timed locks over waits by address, from a thread while main holds the
-//! mutex: a passed deadline gives ETIMEDOUT at once, a future one after it
-//! on both clocks, a bad one EINVAL, and a release before the deadline
-//! gives the lock. A deadline on CLOCK_REALTIME whose calendar steps back
-//! after the wait began is checked again: the lock waits for the new
-//! instant.
+//! relibc's timed locks over the layer's waits by address, from a thread
+//! while main holds the mutex: a passed deadline gives ETIMEDOUT at once, a
+//! future one after it, a bad one EINVAL, and a release before the
+//! deadline gives the lock. A deadline on CLOCK_REALTIME whose calendar
+//! steps back after the wait began is checked again: the lock waits for
+//! the new instant.
 use super::*;
-use abi::clock::{self, CLOCK_MONOTONIC, CLOCK_REALTIME};
+use crate::layer::clock::{self, CLOCK_REALTIME};
 use abi::metadata::Timespec;
-use threads::mutex::{Mutex, pthread_mutex_clocklock, pthread_mutex_lock, pthread_mutex_unlock};
+use ffi::{Mutex, pthread_mutex_lock, pthread_mutex_timedlock, pthread_mutex_unlock};
 
 static LOCK: Mutex = Mutex::new();
-static CLOCK: AtomicUsize = AtomicUsize::new(0);
 static SECONDS: AtomicU64 = AtomicU64::new(0);
 static NANOS: AtomicU64 = AtomicU64::new(0);
 static RESULT: AtomicUsize = AtomicUsize::new(0);
 static ELAPSED: AtomicU64 = AtomicU64::new(0);
 
-/// A clock, a deadline taken when the check starts, the result and the
-/// least time it takes.
-type Check = (i32, fn() -> Timespec, i32, u64);
+/// A deadline on the calendar taken when the check starts, the result and
+/// the least time it takes.
+type Check = (fn() -> Timespec, i32, u64);
 
 const BAD: Timespec = Timespec {
     tv_sec: 0,
@@ -54,16 +53,18 @@ fn set(ns: u64) {
         0
     );
 }
-/// A clocklock on CLOCK until SECONDS and NANOS; its result and how long it
-/// took.
+/// A timed lock until SECONDS and NANOS; its result and how long it took.
 unsafe extern "C" fn timed(_: *mut c_void) -> *mut c_void {
     let at = Timespec {
         tv_sec: SECONDS.load(Ordering::SeqCst) as i64,
         tv_nsec: NANOS.load(Ordering::SeqCst) as i64,
     };
     let start = now();
-    let result =
-        unsafe { pthread_mutex_clocklock(lock(), CLOCK.load(Ordering::SeqCst) as i32, &at) };
+    let at = ffi::Timespec {
+        tv_sec: at.tv_sec,
+        tv_nsec: at.tv_nsec,
+    };
+    let result = unsafe { pthread_mutex_timedlock(lock(), &at) };
     ELAPSED.store(now() - start, Ordering::SeqCst);
     RESULT.store(result as usize, Ordering::SeqCst);
     if result == 0 && unsafe { pthread_mutex_unlock(lock()) } != 0 {
@@ -71,20 +72,19 @@ unsafe extern "C" fn timed(_: *mut c_void) -> *mut c_void {
     }
     ptr::null_mut()
 }
-fn start(clock_id: i32, at: Timespec) -> u64 {
-    CLOCK.store(clock_id as usize, Ordering::SeqCst);
+fn start(at: Timespec) -> u64 {
     SECONDS.store(at.tv_sec as u64, Ordering::SeqCst);
     NANOS.store(at.tv_nsec as u64, Ordering::SeqCst);
     let mut id = 0;
     assert_eq!(
-        unsafe { threads::pthread_create(&mut id, ptr::null(), Some(timed), ptr::null_mut()) },
+        unsafe { ffi::pthread_create(&mut id, ptr::null(), Some(timed), ptr::null_mut()) },
         0
     );
     id
 }
 /// The result and duration of the timed lock of thread `id`, once it ended.
 fn outcome(id: u64) -> (i32, u64) {
-    assert_eq!(unsafe { threads::pthread_join(id, ptr::null_mut()) }, 0);
+    assert_eq!(unsafe { ffi::pthread_join(id, ptr::null_mut()) }, 0);
     (
         RESULT.load(Ordering::SeqCst) as i32,
         ELAPSED.load(Ordering::SeqCst),
@@ -96,24 +96,13 @@ pub(super) fn run() -> bool {
         return failed(160);
     }
     // Each deadline is taken when its check starts.
-    let checks: [Check; 4] = [
-        (CLOCK_MONOTONIC, || spec(now() - 1), ETIMEDOUT, 0),
-        (CLOCK_MONOTONIC, || BAD, EINVAL, 0),
-        (
-            CLOCK_MONOTONIC,
-            || spec(now() + 20_000_000),
-            ETIMEDOUT,
-            15_000_000,
-        ),
-        (
-            CLOCK_REALTIME,
-            || spec(realtime() + 20_000_000),
-            ETIMEDOUT,
-            15_000_000,
-        ),
+    let checks: [Check; 3] = [
+        (|| spec(realtime() - 1), ETIMEDOUT, 0),
+        (|| BAD, EINVAL, 0),
+        (|| spec(realtime() + 20_000_000), ETIMEDOUT, 15_000_000),
     ];
-    for (index, (clock_id, at, expected, at_least)) in checks.into_iter().enumerate() {
-        let (result, elapsed) = outcome(start(clock_id, at()));
+    for (index, (at, expected, at_least)) in checks.into_iter().enumerate() {
+        let (result, elapsed) = outcome(start(at()));
         if result != expected || elapsed < at_least {
             rt::println!(
                 "posix-timed-mutex-probe: check {} gave {} after {} ns",
@@ -125,7 +114,7 @@ pub(super) fn run() -> bool {
         }
     }
     // A release before the deadline gives the lock.
-    let id = start(CLOCK_MONOTONIC, spec(now() + 2_000_000_000));
+    let id = start(spec(realtime() + 2_000_000_000));
     if !futex_blocked(id) || unsafe { pthread_mutex_unlock(lock()) } != 0 {
         return failed(162);
     }
@@ -139,7 +128,7 @@ pub(super) fn run() -> bool {
         return failed(164);
     }
     let (calendar, monotonic) = (realtime(), now());
-    let id = start(CLOCK_REALTIME, spec(calendar + 30_000_000));
+    let id = start(spec(calendar + 30_000_000));
     if !futex_blocked(id) {
         return failed(165);
     }
@@ -158,7 +147,7 @@ pub(super) fn run() -> bool {
         return failed(167);
     }
     rt::println!(
-        "posix-timed-mutex-probe: passed, bad and future deadlines on both clocks, release and a calendar step back ok"
+        "posix-timed-mutex-probe: passed, bad and future deadlines, release and a calendar step back ok"
     );
     true
 }
