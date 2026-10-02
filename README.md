@@ -20,7 +20,7 @@ around messages that pass control from hand to hand.
 
 ## Status
 
-Numbers below are from `m5a-transport` at 047fa12.
+Numbers below are from step 5a′ (`m5a2-relibc`).
 
 **Boot and machines.** The kernel boots as an arm64 Image from EL2 or EL1,
 turns on the MMU, reads the device tree and checks its boot image. It runs
@@ -73,7 +73,9 @@ files, `stat` and directories; the heap; the table of threads, waits by
 address and deferred cancellation; clocks and sleep; signal actions,
 masks, `sigwait`, `sigwaitinfo`, `sigtimedwait` and `SA_SIGINFO`; process
 IDs and credentials. Every POSIX program starts through `posix-crt` and
-relibc, the Rust guest probes too (`tests/libc-ffi`). The layer runs without helper
+relibc, the Rust guest probes on a C main too (`tests/libc-ffi`); the
+native probe `posix-tls` checks the layer's TCB for threads relibc did not
+start. The layer runs without helper
 threads: a single-threaded program has one thread; mutexes, `once` and joins
 wait by address in the layer with no kernel call when uncontended; the heap,
 the descriptor table and the table of threads live under the layer's locks,
@@ -83,13 +85,15 @@ QEMU and Apple VZ.
 
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
-os-test's io and malloc suites run on it in `ci`, one test a boot: 10
-pass, 46 fail (no file creation in the RAM service yet, no open file
-description locks) and 2 need `fork`. Details are in
+os-test's io and malloc suites run on it in `ci`, one test a boot: 18
+pass, 38 fail (all at `mkstemp`: the RAM service creates no file yet) and
+2 need `fork`; `ci` fails when a test that passed stops passing. relibc
+builds at its own level 3: user-space programs have no size limit, only
+the kernel has one. Details are in
 [docs/status.md](docs/status.md).
 
 **Tests.** The kernel test image runs 182 tests (197 under `-icount`),
-the EL0 test `init` runs 228 and `kcore` has 406 host tests; `cargo xtask
+the EL0 test `init` runs 228 and `kcore` has 407 host tests; `cargo xtask
 ci` runs them with the guest probes, and `cargo xtask hvf` runs them on
 Apple silicon.
 
@@ -184,10 +188,10 @@ Bounded kernel paths and their costs:
 | Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
-| POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ (pull request to come) |
+| POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
 | POSIX: processes | process service, `waitpid`, `kill`, `posix_spawn` and `exec`, then `fork` | 🚧 |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
-| POSIX: conformance | os-test and Open POSIX in `ci`; then conditions, semaphores, timers, `sigqueue` | ⬜ |
+| POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 
 ### Later subprojects
