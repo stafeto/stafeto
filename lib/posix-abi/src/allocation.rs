@@ -142,6 +142,32 @@ fn allocate(heap: &mut Allocator, size: usize, alignment: usize) -> Result<NonNu
     heap.allocate(size, alignment)
 }
 
+/// Zeroed whole pages for an anonymous mapping (relibc's mmap): no header,
+/// so any whole pages of them go back with `unmap_pages`.
+pub fn map_pages(size: usize) -> Result<NonNull<u8>, i32> {
+    let pointer = heap(|heap| {
+        if let Ok(pointer) = heap.allocate_pages(size) {
+            return Ok(pointer);
+        }
+        grow(heap, size, PAGE)?;
+        heap.allocate_pages(size)
+    })
+    .map_err(errno)?;
+    // SAFETY: the heap gave `size` bytes there to this caller alone.
+    unsafe { core::ptr::write_bytes(pointer.as_ptr(), 0, size) };
+    Ok(pointer)
+}
+
+/// Gives back whole pages of a mapping of `map_pages`.
+///
+/// # Safety
+/// The pages came from `map_pages`, are not given back yet, and nothing
+/// uses them any more.
+pub unsafe fn unmap_pages(pointer: NonNull<u8>, size: usize) {
+    // SAFETY: the caller's promise.
+    heap(|heap| unsafe { heap.free_pages(pointer, size) });
+}
+
 fn errno(error: Error) -> i32 {
     match error {
         Error::NoMemory => ENOMEM,
@@ -286,7 +312,7 @@ pub unsafe extern "C" fn posix_memalign(out: *mut *mut u8, alignment: usize, siz
 }
 
 /// Borrow the process handle kept alive by the initialized heap.
-pub(crate) fn process() -> &'static Handle<Process> {
+pub fn process() -> &'static Handle<Process> {
     assert!(READY.load(Ordering::Acquire), "published heap process");
     &config().process
 }

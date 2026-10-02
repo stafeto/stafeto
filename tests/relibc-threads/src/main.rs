@@ -38,3 +38,29 @@ extern "C" fn relibc_threads_set_level(level: c_int) -> c_int {
         Err(errno) => errno,
     }
 }
+
+/// CLOCK_REALTIME through the clock service's page, and the generation of
+/// its anchor: -1 without the page.
+///
+/// # Safety
+/// `seconds` and `nanos` are writable.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn relibc_threads_realtime(seconds: *mut i64, nanos: *mut i64) -> i64 {
+    match posix_abi::clock::probe_realtime() {
+        Ok((time, generation)) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                seconds.write(time.seconds);
+                nanos.write(time.nanos);
+            }
+            generation as i64
+        }
+        Err(_) => -1,
+    }
+}
+
+/// The kernel calls of the process so far (rt, feature count-calls).
+#[unsafe(no_mangle)]
+extern "C" fn relibc_threads_calls() -> u64 {
+    rt::sys::calls()
+}

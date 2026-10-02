@@ -1,0 +1,519 @@
+// SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
+// Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
+
+//! Files, directories and the process's identity for relibc's stafeto
+//! platform: relibc's numbers and structures (its headers for Linux
+//! AArch64: struct stat of asm-generic, dirent64, struct termios, struct
+//! utsname, struct rlimit) on the layer's files (posix-fs).
+
+use super::call;
+use core::ffi::{c_char, c_int, c_ulong, c_void};
+use core::mem::{offset_of, size_of};
+use core::sync::atomic::{AtomicU32, Ordering};
+use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS, ERANGE, ESPIPE};
+use posix_fs::{DescriptorFlags, FileKind, NodeInfo, PosixFs, SeekFrom};
+
+/// relibc's struct stat on AArch64 Linux (asm-generic/stat.h).
+#[repr(C)]
+pub struct LinuxStat {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    rdev: u64,
+    pad1: u64,
+    size: i64,
+    blksize: i32,
+    pad2: i32,
+    blocks: i64,
+    atime: [i64; 2],
+    mtime: [i64; 2],
+    ctime: [i64; 2],
+    unused: [u32; 2],
+}
+const _: () = {
+    assert!(size_of::<LinuxStat>() == 128);
+    assert!(offset_of!(LinuxStat, mode) == 16);
+    assert!(offset_of!(LinuxStat, nlink) == 20);
+    assert!(offset_of!(LinuxStat, size) == 48);
+    assert!(offset_of!(LinuxStat, blksize) == 56);
+    assert!(offset_of!(LinuxStat, blocks) == 64);
+    assert!(offset_of!(LinuxStat, atime) == 72);
+    assert!(offset_of!(LinuxStat, ctime) == 104);
+};
+
+/// The file type bits of st_mode.
+const S_IFDIR: u32 = 0o040_000;
+const S_IFREG: u32 = 0o100_000;
+const S_IFCHR: u32 = 0o020_000;
+/// Linux's dirent64 d_type.
+const DT_CHR: u8 = 2;
+const DT_DIR: u8 = 4;
+const DT_REG: u8 = 8;
+/// relibc's (Linux's) AT_ values.
+const AT_FDCWD: c_int = -100;
+const AT_EMPTY_PATH: c_int = 0x1000;
+
+fn time(ns: u64) -> [i64; 2] {
+    [(ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64]
+}
+
+fn linux_stat(info: &NodeInfo) -> LinuxStat {
+    let kind = match info.kind {
+        1 => S_IFDIR,
+        2 => S_IFREG,
+        _ => S_IFCHR,
+    };
+    LinuxStat {
+        dev: info.device,
+        ino: info.inode,
+        mode: kind | (info.permissions & 0o7777),
+        nlink: info.links as u32,
+        uid: info.uid,
+        gid: info.gid,
+        rdev: info.special_device,
+        pad1: 0,
+        size: info.size as i64,
+        blksize: info.block_size as i32,
+        pad2: 0,
+        blocks: info.blocks as i64,
+        atime: time(info.access_ns),
+        mtime: time(info.modify_ns),
+        ctime: time(info.change_ns),
+        unused: [0; 2],
+    }
+}
+
+fn number(fd: c_int) -> Result<u32, c_int> {
+    u32::try_from(fd).map_err(|_| EBADF)
+}
+
+/// The bytes of a C string, without its NUL.
+///
+/// # Safety
+/// `path` is a live C string.
+unsafe fn bytes<'a>(path: *const c_char) -> &'a [u8] {
+    // SAFETY: the caller's promise.
+    unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes()
+}
+
+/// fstat (`path` null or empty with AT_EMPTY_PATH), stat and lstat (no
+/// symbolic links yet) in relibc's struct stat.
+///
+/// # Safety
+/// `path` is null or a live C string; `out` is writable for a LinuxStat.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_fstatat(
+    fd: c_int,
+    path: *const c_char,
+    out: *mut LinuxStat,
+    flags: c_int,
+) -> c_int {
+    if out.is_null() {
+        return -EFAULT;
+    }
+    // SAFETY: the caller's promise.
+    let path = (!path.is_null()).then(|| unsafe { bytes(path) });
+    let info = posix_abi::shared::with_files(|files| match path {
+        Some(path) if !path.is_empty() => {
+            if fd != AT_FDCWD && path.first() != Some(&b'/') {
+                return Err(ENOSYS);
+            }
+            files.stat_information(path).map_err(posix_abi::error)
+        }
+        _ if path.is_none() || flags & AT_EMPTY_PATH != 0 => files
+            .descriptor_information(number(fd)?)
+            .map_err(posix_abi::error),
+        _ => Err(posix_abi::constants::ENOENT),
+    });
+    match info {
+        Ok(info) => {
+            // SAFETY: the caller's promise.
+            unsafe { out.write(linux_stat(&info)) };
+            0
+        }
+        Err(errno) => -errno,
+    }
+}
+
+/// Writes one dirent64 record at `out`, `reclen` bytes; false when it
+/// does not fit.
+fn record(out: &mut [u8], inode: u64, next: i64, kind: u8, name: &[u8]) -> Option<usize> {
+    // ino 8, off 8, reclen 2, type 1, the name and its NUL; 8-byte steps.
+    let length = (19 + name.len() + 1).next_multiple_of(8);
+    let record = out.get_mut(..length)?;
+    record.fill(0);
+    record[..8].copy_from_slice(&inode.to_ne_bytes());
+    record[8..16].copy_from_slice(&next.to_ne_bytes());
+    record[16..18].copy_from_slice(&(length as u16).to_ne_bytes());
+    record[18] = kind;
+    record[19..19 + name.len()].copy_from_slice(name);
+    Some(length)
+}
+
+fn entries(files: &mut PosixFs, fd: u32, out: &mut [u8], position: u64) -> Result<usize, c_int> {
+    let error = posix_abi::error;
+    let mut directory = files.fdopendir(fd).map_err(error)?;
+    let position = i64::try_from(position).map_err(|_| EINVAL)?;
+    files.lseek(fd, position, SeekFrom::Start).map_err(error)?;
+    let mut used = 0;
+    loop {
+        let before = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
+        let mut name = [0u8; 256];
+        let Some(entry) = files.readdir(&mut directory, &mut name).map_err(error)? else {
+            break;
+        };
+        let after = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
+        let kind = match entry.kind {
+            FileKind::Directory => DT_DIR,
+            FileKind::Regular => DT_REG,
+            FileKind::Character => DT_CHR,
+        };
+        let name = &name[..entry.name_len.min(name.len())];
+        match record(&mut out[used..], entry.inode, after, kind, name) {
+            Some(length) => used += length,
+            None => {
+                // The next call takes this entry again.
+                files.lseek(fd, before, SeekFrom::Start).map_err(error)?;
+                if used == 0 {
+                    return Err(EINVAL);
+                }
+                break;
+            }
+        }
+    }
+    Ok(used)
+}
+
+/// Linux dirent64 records of directory `fd` from `position` (the d_off of
+/// the last record relibc took, a position of the descriptor): how many
+/// bytes, 0 at the end.
+///
+/// # Safety
+/// `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_getdents(
+    fd: c_int,
+    buf: *mut u8,
+    len: usize,
+    position: u64,
+) -> isize {
+    // SAFETY: the caller's promise.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    match posix_abi::shared::with_files(|files| entries(files, number(fd)?, out, position)) {
+        Ok(used) => used as isize,
+        Err(errno) => -(errno as isize),
+    }
+}
+
+/// pread and pwrite: at `offset`, the descriptor's own offset as before.
+fn at_offset(
+    fd: c_int,
+    offset: i64,
+    run: impl FnOnce(&PosixFs, u32) -> Result<usize, posix_fs::FsError>,
+) -> isize {
+    let result = posix_abi::shared::with_files(|files| {
+        let fd = number(fd)?;
+        let error = posix_abi::error;
+        // The console has no offset: ESPIPE.
+        let before = files.lseek(fd, 0, SeekFrom::Current).map_err(|_| ESPIPE)?;
+        files.lseek(fd, offset, SeekFrom::Start).map_err(error)?;
+        let done = run(files, fd).map_err(error);
+        files.lseek(fd, before, SeekFrom::Start).map_err(error)?;
+        done
+    });
+    match result {
+        Ok(count) => count as isize,
+        Err(errno) => -(errno as isize),
+    }
+}
+
+/// # Safety
+/// `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
+    // SAFETY: the caller's promise.
+    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    at_offset(fd, offset, |files, fd| files.read(fd, out))
+}
+
+/// # Safety
+/// `buf` is readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_pwrite(
+    fd: c_int,
+    buf: *const u8,
+    len: usize,
+    offset: i64,
+) -> isize {
+    // SAFETY: the caller's promise.
+    let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
+    at_offset(fd, offset, |files, fd| files.write(fd, bytes))
+}
+
+/// # Safety
+/// `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_getcwd(buf: *mut u8, len: usize) -> c_int {
+    if len == 0 {
+        return -EINVAL;
+    }
+    // SAFETY: the caller's promise.
+    let status = call(|| {
+        let got = unsafe { posix_abi::getcwd(buf.cast(), len) };
+        if got.is_null() { -1 } else { 0 }
+    });
+    if status == -i64::from(ERANGE) {
+        return -ERANGE;
+    }
+    status as c_int
+}
+
+/// # Safety
+/// `path` is a live C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_chdir(path: *const c_char) -> c_int {
+    // SAFETY: the caller's promise.
+    call(|| i64::from(unsafe { posix_abi::chdir(path) })) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_dup(fd: c_int) -> c_int {
+    // SAFETY: duplicating touches only the layer's table.
+    call(|| i64::from(unsafe { posix_abi::dup(fd) })) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_dup2(fd: c_int, target: c_int) -> c_int {
+    // SAFETY: as above.
+    call(|| i64::from(unsafe { posix_abi::dup2(fd, target) })) as c_int
+}
+
+/// relibc's fcntl commands (Linux's).
+const F_DUPFD: c_int = 0;
+const F_GETFD: c_int = 1;
+const F_SETFD: c_int = 2;
+const F_GETFL: c_int = 3;
+const F_DUPFD_CLOEXEC: c_int = 1030;
+/// relibc's FD_CLOEXEC (its fcntl.h), which differs from Linux's 1: both
+/// are taken, relibc's comes back.
+const FD_CLOEXEC: c_int = 0x8_0000;
+const LINUX_FD_CLOEXEC: c_int = 1;
+/// Access modes for F_GETFL.
+const O_RDONLY: c_int = 0;
+const O_WRONLY: c_int = 1;
+const O_RDWR: c_int = 2;
+
+/// fcntl: F_DUPFD and F_DUPFD_CLOEXEC (the lowest free number from the
+/// argument), F_GETFD and F_SETFD (close-on-exec), F_GETFL (the access
+/// mode: standard input reads, the console's output writes, a file of the
+/// service reads and writes as the service allows); EINVAL for the rest.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_int {
+    let result = posix_abi::shared::with_files(|files| {
+        let error = posix_abi::error;
+        let fd = number(fd)?;
+        match command {
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                let minimum = u32::try_from(argument).map_err(|_| EINVAL)?;
+                let flags = DescriptorFlags {
+                    close_on_exec: command == F_DUPFD_CLOEXEC,
+                    close_on_fork: false,
+                };
+                files
+                    .dup_from(fd, minimum, flags)
+                    .map(|new| new as c_int)
+                    .map_err(error)
+            }
+            F_GETFD => {
+                let flags = files.descriptor_flags(fd).map_err(error)?;
+                Ok(if flags.close_on_exec { FD_CLOEXEC } else { 0 })
+            }
+            F_SETFD => {
+                let mut flags = files.descriptor_flags(fd).map_err(error)?;
+                flags.close_on_exec = argument as c_int & (FD_CLOEXEC | LINUX_FD_CLOEXEC) != 0;
+                files.set_descriptor_flags(fd, flags).map_err(error)?;
+                Ok(0)
+            }
+            F_GETFL => {
+                files.descriptor_flags(fd).map_err(error)?;
+                Ok(if fd == 0 {
+                    O_RDONLY
+                } else if files.console_route(fd).map_err(error)?.is_some() {
+                    O_WRONLY
+                } else {
+                    O_RDWR
+                })
+            }
+            _ => Err(EINVAL),
+        }
+    });
+    result.unwrap_or_else(|errno| -errno)
+}
+
+/// relibc's struct termios (Linux): four flag words, the line, 32 control
+/// characters, two speeds.
+#[repr(C)]
+struct Termios {
+    iflag: u32,
+    oflag: u32,
+    cflag: u32,
+    lflag: u32,
+    line: u8,
+    cc: [u8; 32],
+    ispeed: u32,
+    ospeed: u32,
+}
+const _: () = assert!(size_of::<Termios>() == 60);
+
+const TCGETS: c_ulong = 0x5401;
+const TCSETS: c_ulong = 0x5402;
+const TCSETSW: c_ulong = 0x5403;
+const TCSETSF: c_ulong = 0x5404;
+const ENOTTY: c_int = 25;
+
+/// ioctl: TCGETS gives a terminal's settings for the console (so isatty
+/// says yes), the settings of the console's driver as they are; setting
+/// them is ENOSYS until the terminal service (5e); ENOTTY elsewhere.
+///
+/// # Safety
+/// For TCGETS `argument` is writable for a struct termios.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_ioctl(
+    fd: c_int,
+    request: c_ulong,
+    argument: *mut c_void,
+) -> c_int {
+    let console = posix_abi::shared::with_files(|files| {
+        let info = files
+            .descriptor_information(number(fd)?)
+            .map_err(posix_abi::error)?;
+        Ok(info.kind == 3)
+    });
+    match (request, console) {
+        (_, Err(errno)) => -errno,
+        (TCGETS, Ok(true)) => {
+            if argument.is_null() {
+                return -EFAULT;
+            }
+            // Canonical input with echo and signals, CR to NL in, NL to
+            // CR NL out, 8 bits at 38400 baud.
+            let mut cc = [0u8; 32];
+            cc[..7].copy_from_slice(&[3, 28, 127, 21, 4, 0, 1]);
+            // SAFETY: the caller's promise.
+            unsafe {
+                argument.cast::<Termios>().write(Termios {
+                    iflag: 0o400,
+                    oflag: 0o5,
+                    cflag: 0o277,
+                    lflag: 0o105_073,
+                    line: 0,
+                    cc,
+                    ispeed: 0o17,
+                    ospeed: 0o17,
+                })
+            };
+            0
+        }
+        (TCSETS | TCSETSW | TCSETSF, Ok(true)) => -ENOSYS,
+        _ => -ENOTTY,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getuid() -> u32 {
+    posix_abi::process::getuid()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_geteuid() -> u32 {
+    posix_abi::process::geteuid()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getgid() -> u32 {
+    posix_abi::process::getgid()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_getegid() -> u32 {
+    posix_abi::process::getegid()
+}
+
+static UMASK: AtomicU32 = AtomicU32::new(0o022);
+
+/// umask: the process's mask (no file the layer creates reads it yet).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_umask(mask: u32) -> u32 {
+    UMASK.swap(mask & 0o777, Ordering::Relaxed)
+}
+
+/// relibc's struct rlimit and the limits it names.
+#[repr(C)]
+pub struct Rlimit {
+    current: u64,
+    maximum: u64,
+}
+const RLIMIT_NOFILE: c_int = 7;
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// getrlimit: RLIMIT_NOFILE is the size of the layer's table of
+/// descriptors; the others have no limit the layer keeps.
+///
+/// # Safety
+/// `out` is writable for a struct rlimit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_getrlimit(resource: c_int, out: *mut Rlimit) -> c_int {
+    if !(0..16).contains(&resource) {
+        return -EINVAL;
+    }
+    let value = if resource == RLIMIT_NOFILE {
+        posix_fs::OPEN_MAX as u64
+    } else {
+        RLIM_INFINITY
+    };
+    // SAFETY: the caller's promise.
+    unsafe {
+        out.write(Rlimit {
+            current: value,
+            maximum: value,
+        })
+    };
+    0
+}
+
+/// relibc's struct utsname: six fields of 65 bytes.
+const UTS: usize = 65;
+
+/// # Safety
+/// `out` is writable for a struct utsname.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_uname(out: *mut [[u8; UTS]; 6]) -> c_int {
+    let mut fields = [[0u8; UTS]; 6];
+    for (field, text) in fields.iter_mut().zip([
+        &b"stafeto"[..],
+        b"stafeto",
+        b"0.1.0",
+        b"5a'",
+        b"aarch64",
+        b"",
+    ]) {
+        field[..text.len()].copy_from_slice(text);
+    }
+    // SAFETY: the caller's promise.
+    unsafe { out.write(fields) };
+    0
+}
+
+/// # Safety
+/// `time` is a readable timespec.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_clock_settime(
+    clock: c_int,
+    time: *const posix_types::Timespec,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    call(|| i64::from(unsafe { posix_abi::clock::clock_settime(clock, time) })) as c_int
+}

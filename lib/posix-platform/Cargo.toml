@@ -18,3 +18,4 @@ posix-types = { path = "../posix-types" }
 posix-signals = { path = "../posix-signals" }
 posix-sync = { path = "../posix-sync" }
 rt = { path = "../rt" }
+posix-fs = { path = "../posix-fs" }

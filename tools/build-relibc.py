@@ -20,7 +20,7 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-COMMIT = "eee511c8268ee358ae7bc0ff79cf6192d494b7ea"
+COMMIT = "e10a891e477399127e529316ec8feec00740555e"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"
@@ -30,6 +30,9 @@ RUSTFLAGS = ("--cfg stafeto -C relocation-model=static -Z tls-model=local-exec"
              " -C target-feature=+fix-cortex-a53-835769")
 CFLAGS = "--target=aarch64-linux-gnu -mfix-cortex-a53-835769"
 BUILD_STD = "core,alloc,compiler_builtins"
+# The C math functions from the Rust libm crate (MIT), declared by
+# openlibm's headers.
+FEATURES = "math_libm"
 
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "relibc"
@@ -39,7 +42,7 @@ SYSROOT = WORK / "sysroot"
 STAMP = WORK / "stamp"
 TOOLS = ROOT / "target" / "tools"
 CONFIG = (f"{COMMIT} {TOOLCHAIN} {TARGET} {RUSTFLAGS} {CFLAGS} build-std={BUILD_STD}"
-          f" cbindgen {CBINDGEN}\n")
+          f" features={FEATURES} cbindgen {CBINDGEN}\n")
 
 
 def run(*args, cwd=None, env=None, stdout=None) -> subprocess.CompletedProcess:
@@ -124,7 +127,8 @@ def build(env: dict) -> None:
     })
     library = WORK / "librelibc.a"
     run("cargo", f"+{TOOLCHAIN}", "rustc", "--frozen", "--offline", "--release", "--target",
-        TARGET, f"-Zbuild-std={BUILD_STD}", "--lib", "--", "--emit", f"link={library}",
+        TARGET, f"-Zbuild-std={BUILD_STD}", "--features", FEATURES, "--lib", "--", "--emit",
+        f"link={library}",
         cwd=SOURCE, env=env)
     # relibc's Rust symbols get its prefix and its copies of core's math
     # go, so that it links with the Rust of a stafeto program (relibc's

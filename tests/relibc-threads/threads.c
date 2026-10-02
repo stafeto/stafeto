@@ -23,6 +23,8 @@ int relibc_threads_places(void);
 void relibc_threads_collect(void);
 unsigned long relibc_threads_heap(void);
 int relibc_threads_set_level(int level);
+long relibc_threads_realtime(long *seconds, long *nanos);
+unsigned long relibc_threads_calls(void);
 
 #define FAIL(...) do { printf("relibc-threads: " __VA_ARGS__); printf("\n"); exit(10 + __LINE__ % 80); } while (0)
 #define CHECK(cond) do { if (!(cond)) FAIL("check failed at line %d: %s", __LINE__, #cond); } while (0)
@@ -384,6 +386,51 @@ static void long_jump(void) {
            handled);
 }
 
+/* G: CLOCK_REALTIME from the clock service's page: a thread at 20 reads it
+ * while main at 30 sets the time 1000 times, twice each time it wakes,
+ * so that the service writes both places while a read is cut; every read
+ * must be whole (its time and the generation of its anchor agree), and a
+ * read makes no call of the kernel. */
+static volatile int setting;
+static volatile long torn, reads;
+static void *reads_clock(void *arg) {
+    (void)arg;
+    CHECK(relibc_threads_set_level(20) == 0);
+    while (setting) {
+        long seconds, nanos;
+        long generation = relibc_threads_realtime(&seconds, &nanos);
+        CHECK(generation >= 0);
+        /* Set number k puts the calendar at k * 10^6 s. */
+        if (seconds / 1000000 != generation) torn++;
+        reads++;
+    }
+    return NULL;
+}
+static void clock_page(void) {
+    pthread_t reader;
+    setting = 1;
+    CHECK(pthread_create(&reader, &small, reads_clock, NULL) == 0);
+    for (long k = 1; k <= 1000; k += 2) {
+        struct timespec at = {k * 1000000, 0};
+        CHECK(clock_settime(CLOCK_REALTIME, &at) == 0);
+        at.tv_sec += 1000000;
+        CHECK(clock_settime(CLOCK_REALTIME, &at) == 0);
+        struct timespec pause = {0, 200000};
+        nanosleep(&pause, NULL);
+    }
+    setting = 0;
+    CHECK(pthread_join(reader, NULL) == 0);
+    if (torn != 0) FAIL("%ld of %ld reads of the clock page were torn", torn, reads);
+    struct timespec now;
+    unsigned long before = relibc_threads_calls();
+    for (int i = 0; i < 1000; i++) CHECK(clock_gettime(CLOCK_REALTIME, &now) == 0);
+    unsigned long calls = relibc_threads_calls() - before;
+    CHECK(now.tv_sec / 1000000 == 1000);
+    if (calls != 0) FAIL("1000 reads of CLOCK_REALTIME made %lu kernel calls", calls);
+    printf("relibc-threads: %ld reads of the clock page during 1000 settings, none torn; no kernel call to read\n",
+           reads);
+}
+
 int main(void) {
     CHECK(pthread_attr_init(&small) == 0);
     CHECK(pthread_attr_setstacksize(&small, 65536) == 0);
@@ -402,6 +449,8 @@ int main(void) {
     cancellation();
     stage = 6;
     long_jump();
+    stage = 7;
+    clock_page();
     printf("relibc-threads: ok\n");
     return 0;
 }

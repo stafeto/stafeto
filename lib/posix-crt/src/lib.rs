@@ -123,6 +123,10 @@ pub unsafe fn posix_init_process(
     unsafe { posix_abi::shared::init(files) }.map_err(|_| "files failed")?;
     // SAFETY: startup is single-threaded and its layout reserves the heap ranges.
     unsafe { posix_abi::allocation::init(process) }.map_err(|_| "heap failed")?;
+    // CLOCK_REALTIME without IPC; a clock service without its page leaves
+    // the requests. SAFETY: startup, after the clock's connection; the
+    // page's address is the layer's.
+    let _ = unsafe { posix_abi::clock::attach_page(posix_abi::allocation::process()) };
     // SAFETY: startup owns initialization and the stack ranges are unused.
     unsafe { posix_abi::threads::init(thread) }.map_err(|_| "threads failed")?;
     Ok(())

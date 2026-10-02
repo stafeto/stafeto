@@ -791,6 +791,7 @@ commands:
   relibc-hello run the first C program on relibc over the Rust POSIX layer
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
+  relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   cprobe    run a statically linked Picolibc C program against ramfs
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -838,7 +839,14 @@ fn main() {
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
         Some("relibc-hello") => relibc_hello_probe(),
-        Some("relibc-threads") => relibc_threads_probe(),
+        Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
+        Some("relibc-threads-hvf") => match hvf_host() {
+            Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
+            Err(why) => {
+                println!("relibc-threads-hvf: skipped: {why}");
+                Ok(())
+            }
+        },
         Some("cprobe") => cprobe(),
         Some("posix-cancel-input") => posix_cancel_input_probe(false),
         Some("posix-cancel-input-vz") => posix_cancel_input_probe(true),
@@ -1656,6 +1664,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: malloc heap x",
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
+        "relibc-hello: directories, stat, descriptors, mmap, math",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
         "RELIBC PANIC: ",
@@ -1666,7 +1675,7 @@ fn relibc_hello_probe() -> Result<(), String> {
     Ok(())
 }
 
-fn relibc_threads_probe() -> Result<(), String> {
+fn relibc_threads_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image(
@@ -1674,7 +1683,7 @@ fn relibc_threads_probe() -> Result<(), String> {
         &RELIBC_THREADS_PROGRAMS,
         BOOT_PROFILE,
     )?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     // Stops on any end, so that a failure shows at once.
     const ENDED: &str = "init: relibc-threads ended: exit code 0, not restarted";
@@ -1896,8 +1905,9 @@ fn test() -> Result<(), String> {
     ramfs_probe()?;
     posix_abi_probe()?;
     relibc_hello_probe()?;
-    relibc_threads_probe()?;
+    relibc_threads_probe(&qemu::VIRT)?;
     rtbench2::short()?;
+    rtbench2::short_relibc()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;

@@ -15,17 +15,19 @@
 
 #![no_std]
 
+mod files;
 mod signals;
 
+use core::cell::UnsafeCell;
 use core::ffi::{c_char, c_int, c_void};
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use posix_abi::constants::EINVAL;
+use core::sync::atomic::AtomicU32;
+use posix_abi::constants::{EINVAL, ENOMEM};
 use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 2;
+pub const PLATFORM_INTERFACE: u64 = 3;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -36,8 +38,22 @@ pub static STAFETO_PLATFORM_ABI: u64 = posix_thread::BLOCK_SIZE as u64
     | PLATFORM_INTERFACE << 32;
 
 /// Runs one call of the layer with the process's files and an errno of
-/// its own; a negative result becomes the negated errno.
+/// its own; a negative result becomes the negated errno. A thread the
+/// layer attached already uses the process's files: its errno is saved and
+/// given back around the call, with no call of the kernel. Before that
+/// (relibc's start) the call runs in a scope of the layer (posix_abi::tls).
 fn call(run: impl FnOnce() -> i64) -> i64 {
+    // SAFETY: a block lives while its thread runs.
+    if let Some(block) = unsafe { posix_thread::block().as_mut() }
+        && block.process_files != 0
+    {
+        let saved = core::mem::replace(&mut block.errno, 0);
+        let value = run();
+        // The block is the calling thread's: no entry changes its errno
+        // across the call without giving it back.
+        let errno = core::mem::replace(&mut block.errno, saved);
+        return if value < 0 { -i64::from(errno) } else { value };
+    }
     posix_abi::tls::with_process(|| {
         let value = run();
         if value < 0 {
@@ -88,17 +104,20 @@ pub unsafe extern "C" fn stafeto_read(fd: c_int, buf: *mut u8, len: usize) -> is
     call(|| unsafe { posix_abi::read(fd, buf, len) } as i64) as isize
 }
 
-/// Linux AArch64 values relibc passes (asm-generic fcntl.h).
+/// relibc's open flags (its headers for AArch64 Linux, asm/fcntl.h).
 const AT_FDCWD: c_int = -100;
 const O_ACCMODE: c_int = 0o3;
+const O_NOCTTY: c_int = 0o400;
 const O_DIRECTORY: c_int = 0o40000;
+const O_NOFOLLOW: c_int = 0o100000;
 const O_LARGEFILE: c_int = 0o400000;
 const O_CLOEXEC: c_int = 0o2000000;
 
-/// Opens `path` relative to the current directory. The layer opens files
-/// of the RAM file service for reading; other flags, and a directory
-/// other than `AT_FDCWD`, answer EINVAL until the layer takes Linux's
-/// numbers (later in 5a′).
+/// Opens `path`, relative to the current directory or absolute (any
+/// `dirfd` then). The layer opens files of the RAM file service: the
+/// access mode, O_DIRECTORY and O_CLOEXEC; O_NOCTTY, O_NOFOLLOW (no
+/// symbolic links yet) and O_LARGEFILE change nothing; other flags, and a
+/// relative path from a directory other than `AT_FDCWD`, answer EINVAL.
 ///
 /// # Safety
 /// `path` is a live C string.
@@ -109,8 +128,10 @@ pub unsafe extern "C" fn stafeto_openat(
     flags: c_int,
     _mode: u32,
 ) -> c_int {
-    let known = O_ACCMODE | O_DIRECTORY | O_LARGEFILE | O_CLOEXEC;
-    if dirfd != AT_FDCWD || flags & !known != 0 {
+    let known = O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC;
+    // SAFETY: the caller's promise.
+    let absolute = !path.is_null() && unsafe { *path } == b'/' as c_char;
+    if (dirfd != AT_FDCWD && !absolute) || flags & !known != 0 {
         return -EINVAL;
     }
     let mut ours = flags & O_ACCMODE;
@@ -142,12 +163,26 @@ pub extern "C" fn stafeto_exit(status: c_int) -> ! {
     unsafe { posix_abi::_exit(status) }
 }
 
+/// CLOCK_MONOTONIC from the counter, CLOCK_REALTIME from the clock
+/// service's page: no call of the kernel.
+///
 /// # Safety
 /// `out` is writable for a timespec, whose layout is Linux's.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stafeto_clock_gettime(clock: c_int, out: *mut Timespec) -> c_int {
-    // SAFETY: the caller's promise.
-    call(|| i64::from(unsafe { posix_abi::clock::clock_gettime(clock, out) })) as c_int
+    match posix_abi::clock::gettime(clock) {
+        Ok(time) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                out.write(Timespec {
+                    tv_sec: time.seconds,
+                    tv_nsec: time.nanos,
+                })
+            };
+            0
+        }
+        Err(errno) => -errno,
+    }
 }
 
 /// # Safety
@@ -169,15 +204,23 @@ pub extern "C" fn stafeto_getppid() -> c_int {
 }
 
 const PAGE: usize = 4096;
-/// The anonymous mappings: their addresses (0 for a free slot) and sizes.
-/// The heap frees whole blocks only, so a part of a mapping is not
-/// unmapped (EINVAL); dlmalloc keeps such a part. Later in 5a′ the heap
-/// becomes a source of pages.
+
+/// The anonymous mappings relibc holds: (start, bytes) of each, 0 bytes
+/// for a free record. The pages come from the layer's heap (no header), so
+/// munmap gives back the whole mapping, pages from either edge, or pages
+/// from the middle, which splits the record in two.
 const MAPPINGS: usize = 256;
-static ADDRESSES: [AtomicUsize; MAPPINGS] = [const { AtomicUsize::new(0) }; MAPPINGS];
-static SIZES: [AtomicUsize; MAPPINGS] = [const { AtomicUsize::new(0) }; MAPPINGS];
-/// The address of a slot `stafeto_munmap` holds: no page is at 1.
-const BUSY: usize = 1;
+struct Mappings(UnsafeCell<[(usize, usize); MAPPINGS]>);
+// SAFETY: only `mappings` borrows the records, under MAPPINGS_LOCK.
+unsafe impl Sync for Mappings {}
+static MAPS: Mappings = Mappings(UnsafeCell::new([(0, 0); MAPPINGS]));
+static MAPPINGS_LOCK: posix_sync::LayerLock = posix_sync::LayerLock::new();
+
+fn mappings<R>(f: impl FnOnce(&mut [(usize, usize); MAPPINGS]) -> R) -> R {
+    let _guard = MAPPINGS_LOCK.lock();
+    // SAFETY: the lock gives this borrow alone.
+    f(unsafe { &mut *MAPS.0.get() })
+}
 
 /// Zeroed, page-aligned memory for `len` bytes from the layer's heap, or
 /// null, which relibc reports as ENOMEM.
@@ -186,63 +229,71 @@ pub extern "C" fn stafeto_mmap_anonymous(len: usize) -> *mut c_void {
     let Some(size) = len.checked_next_multiple_of(PAGE).filter(|&size| size != 0) else {
         return ptr::null_mut();
     };
-    let mut pointer = ptr::null_mut::<u8>();
-    call(|| {
-        // SAFETY: the heap returns `size` writable bytes or null.
-        pointer = unsafe { posix_abi::allocation::aligned_alloc(PAGE, size) };
-        if pointer.is_null() {
-            return -1;
-        }
-        // SAFETY: as above.
-        unsafe { ptr::write_bytes(pointer, 0, size) };
-        0
+    let Ok(pointer) = posix_abi::allocation::map_pages(size) else {
+        return ptr::null_mut();
+    };
+    let start = pointer.as_ptr() as usize;
+    let recorded = mappings(|maps| {
+        maps.iter_mut()
+            .find(|record| record.1 == 0)
+            .map(|record| *record = (start, size))
+            .is_some()
     });
-    if pointer.is_null() {
+    if !recorded {
+        // SAFETY: the pages are this call's, and nobody saw them.
+        unsafe { posix_abi::allocation::unmap_pages(pointer, size) };
         return ptr::null_mut();
     }
-    for (address, length) in ADDRESSES.iter().zip(&SIZES) {
-        if address
-            .compare_exchange(0, pointer as usize, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            length.store(size, Ordering::Release);
-            return pointer.cast();
-        }
-    }
-    // SAFETY: the block came from aligned_alloc and nobody else has it.
-    call(|| {
-        unsafe { posix_abi::allocation::free(pointer) };
-        0
-    });
-    ptr::null_mut()
+    pointer.as_ptr().cast()
 }
 
-/// Unmaps a whole mapping of `stafeto_mmap_anonymous`; EINVAL for any
-/// other range.
+/// Unmaps whole pages of a mapping of `stafeto_mmap_anonymous`: all of it,
+/// pages from an edge, or pages from the middle. EINVAL for a range that
+/// is not inside one mapping, ENOMEM when a split finds no free record.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_munmap(addr: *mut c_void, len: usize) -> c_int {
-    let size = len.next_multiple_of(PAGE);
-    for (address, length) in ADDRESSES.iter().zip(&SIZES) {
-        // The slot is taken while its address is BUSY.
-        if address
-            .compare_exchange(addr as usize, BUSY, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            continue;
+    let start = addr as usize;
+    let Some(size) = len.checked_next_multiple_of(PAGE).filter(|&size| size != 0) else {
+        return -EINVAL;
+    };
+    let Some(end) = start
+        .checked_add(size)
+        .filter(|_| start.is_multiple_of(PAGE))
+    else {
+        return -EINVAL;
+    };
+    let result: Result<(), c_int> = mappings(|maps| {
+        let index = maps
+            .iter()
+            .position(|&(first, bytes)| bytes != 0 && first <= start && end <= first + bytes)
+            .ok_or(EINVAL)?;
+        let (first, bytes) = maps[index];
+        let last = first + bytes;
+        match (start == first, end == last) {
+            (true, true) => maps[index] = (0, 0),
+            (true, false) => maps[index] = (end, last - end),
+            (false, true) => maps[index] = (first, start - first),
+            (false, false) => {
+                let free = maps.iter().position(|record| record.1 == 0).ok_or(ENOMEM)?;
+                maps[index] = (first, start - first);
+                maps[free] = (end, last - end);
+            }
         }
-        if length.load(Ordering::Acquire) != size {
-            address.store(addr as usize, Ordering::Release);
-            return -EINVAL;
-        }
-        length.store(0, Ordering::Relaxed);
-        address.store(0, Ordering::Release);
-        // SAFETY: the block came from aligned_alloc and is freed once.
-        return call(|| {
-            unsafe { posix_abi::allocation::free(addr.cast()) };
+        Ok(())
+    });
+    match result {
+        Ok(()) => {
+            // SAFETY: the pages left the records: relibc gave them up.
+            unsafe {
+                posix_abi::allocation::unmap_pages(
+                    core::ptr::NonNull::new_unchecked(addr.cast()),
+                    size,
+                )
+            };
             0
-        }) as c_int;
+        }
+        Err(errno) => -errno,
     }
-    -EINVAL
 }
 
 /// Takes back one of relibc's mappings for the thread table.

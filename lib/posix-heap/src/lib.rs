@@ -14,6 +14,8 @@ use core::{
 use linked_list_allocator::Heap;
 
 pub const FUNDAMENTAL_ALIGNMENT: usize = 16;
+/// The page of `allocate_pages`.
+pub const PAGE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -84,6 +86,30 @@ impl Allocator {
         let total = prefix.checked_add(size.max(1)).ok_or(Error::NoMemory)?;
         let layout = Layout::from_size_align(total, alignment).map_err(|_| Error::NoMemory)?;
         Ok((layout, prefix))
+    }
+
+    /// `size` bytes (whole pages) aligned to a page, with no header: what
+    /// an anonymous mmap gives. Any whole pages of it go back with
+    /// `free_pages`, alone or together, in any order.
+    pub fn allocate_pages(&mut self, size: usize) -> Result<NonNull<u8>, Error> {
+        if size == 0 || !size.is_multiple_of(PAGE) {
+            return Err(Error::InvalidAlignment);
+        }
+        let layout = Layout::from_size_align(size, PAGE).map_err(|_| Error::NoMemory)?;
+        self.heap
+            .allocate_first_fit(layout)
+            .map_err(|()| Error::NoMemory)
+    }
+
+    /// Gives back `size` bytes (whole pages) at `pointer`.
+    ///
+    /// # Safety
+    /// The pages came from `allocate_pages` and are not given back yet.
+    pub unsafe fn free_pages(&mut self, pointer: NonNull<u8>, size: usize) {
+        let layout = Layout::from_size_align(size, PAGE).expect("pages of a mapping");
+        // SAFETY: the caller's promise; a part of an allocation goes back
+        // as a hole of its own, which the list merges with its neighbours.
+        unsafe { self.heap.deallocate(pointer, layout) };
     }
 
     pub fn allocate(&mut self, size: usize, alignment: usize) -> Result<NonNull<u8>, Error> {
@@ -170,6 +196,29 @@ mod tests {
 
     #[repr(align(4096))]
     struct Region([u8; 65536]);
+
+    /// Pages go back whole, from either edge or from the middle, and come
+    /// back as one free run once all of them went.
+    #[test]
+    fn pages_go_back_in_any_part() {
+        let mut storage = std::boxed::Box::new(Region([0; 65536]));
+        let mut allocator = Allocator::new();
+        unsafe { allocator.init(storage.0.as_mut_ptr(), storage.0.len()) };
+        let start = allocator.allocate_pages(8 * PAGE).unwrap();
+        assert_eq!(start.as_ptr() as usize % PAGE, 0);
+        assert!(allocator.allocate_pages(PAGE + 1).is_err());
+        let at = |page: usize| unsafe { NonNull::new_unchecked(start.as_ptr().add(page * PAGE)) };
+        unsafe {
+            allocator.free_pages(at(0), PAGE);
+            allocator.free_pages(at(7), PAGE);
+            allocator.free_pages(at(3), 2 * PAGE);
+            allocator.free_pages(at(1), 2 * PAGE);
+            allocator.free_pages(at(5), 2 * PAGE);
+        }
+        assert_eq!(allocator.used(), 0);
+        let again = allocator.allocate_pages(15 * PAGE).unwrap();
+        unsafe { allocator.free_pages(again, 15 * PAGE) };
+    }
 
     #[test]
     fn extension_preserves_live_data_and_coalesces_across_the_boundary() {

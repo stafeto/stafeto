@@ -283,6 +283,12 @@ fn local<R>(
     run(streams, files)
 }
 
+/// Runs `f` on the process's files under their lock (relibc's platform:
+/// every thread of a program on relibc uses the process's files).
+pub fn with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
+    process_state(|_, files| f(files))
+}
+
 pub(crate) fn dispatch<'a>(
     request: Request<'_>,
     buffer: &'a mut [u8; MESSAGE_MAX],

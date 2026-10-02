@@ -71,7 +71,8 @@ pub fn probe_ceiling() -> u8 {
     ceiling().expect("the ceiling")
 }
 
-fn error(error: FsError) -> c_int {
+/// The errno of a file error.
+pub fn error(error: FsError) -> c_int {
     match error {
         FsError::NoEntry => ENOENT,
         FsError::PermissionDenied => EACCES,

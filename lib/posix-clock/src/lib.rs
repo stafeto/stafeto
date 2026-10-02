@@ -97,6 +97,27 @@ impl Client {
             };
         }
     }
+    /// PAGE: the service's page of the CLOCK_REALTIME anchor, to map for
+    /// reading (proto_clock::page).
+    pub fn page(&self) -> Result<Handle<rt::handle::Memory>, Status> {
+        let request = Method::Page.header().bytes();
+        loop {
+            let mut reply = match sys::send(&self.channel, &request) {
+                Err(Error::Interrupted) => continue,
+                result => result.map_err(Status::Kernel)?,
+            };
+            let mut buffer = [0; MESSAGE_MAX];
+            let bytes = reply.bytes(&mut buffer);
+            match Status::from_code(Reader::new(bytes).u32()?) {
+                Status::Ok => {}
+                status => return Err(status),
+            }
+            if reply.handles.len() != 1 {
+                return Err(Status::BadSize);
+            }
+            return reply.handles.take(0).map_err(Status::Kernel);
+        }
+    }
     pub fn anchor(&self) -> Result<Anchor, Status> {
         let request = Method::Anchor.header().bytes();
         let mut buffer = [0; MESSAGE_MAX];
