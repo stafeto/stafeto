@@ -34,25 +34,14 @@ fn client() -> Result<&'static Client, c_int> {
     // SAFETY: startup finishes initialization before application threads start.
     unsafe { &*STATE.0.get() }.as_ref().ok_or(EIO)
 }
-/// Arm a real service interruption on this process's clock endpoint.
-#[cfg(feature = "transport-probe")]
-pub fn probe_interrupt(
-    thread: &Handle<rt::handle::Thread>,
-    method: proto_clock::Method,
-) -> Result<(), Status> {
-    client()
-        .map_err(|_| Status::Kernel(rt::abi::Error::BadState))?
-        .probe_interrupt(thread, method)
-}
-pub(crate) fn watch(channel: &Handle<Channel>) -> Result<(), Status> {
-    // SAFETY: startup initialized the immutable option before thread startup.
-    if let Some(client) = unsafe { &*STATE.0.get() }.as_ref() {
-        client.watch(channel)?;
-    }
-    Ok(())
-}
-pub(crate) fn observation() -> Result<posix_time::Observation, c_int> {
-    client()?.observe().map_err(error)
+/// The calendar now (ns of CLOCK_REALTIME) and the monotonic instant it
+/// belongs to: the middle of the request to the clock service.
+pub(crate) fn realtime_anchor() -> Result<(i128, u64), c_int> {
+    let before = rt::time::ticks_to_ns(rt::time::now());
+    let snapshot = client()?.get(proto_clock::REALTIME).map_err(error)?;
+    let after = rt::time::ticks_to_ns(rt::time::now());
+    let time = snapshot.time.value().map_err(|_| EOVERFLOW)?;
+    Ok((time, before + (after - before) / 2))
 }
 fn error(status: Status) -> c_int {
     match status.code() {

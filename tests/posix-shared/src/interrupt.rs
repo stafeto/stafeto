@@ -50,15 +50,16 @@ extern "C" fn sending(_: u64) -> ! {
     if after[0] != Error::Interrupted.code() || after[1..] != before[1..] {
         passed(1, false);
     }
-    // Two more requests from this live thread exercise accepted cancellation
-    // and the next token's validity on the same thread number.
+    // Two more requests from this live thread: the accepted one is not
+    // taken back by an interrupt and gets its reply whole, and the next
+    // token on the same thread number is a new one.
     before[0] = channel().raw().0;
     before[1] = 6 | (1 << rt::abi::HANDLES_SHIFT);
     before[2] = rt::abi::inline_words(b"second")[0];
     rt::msgbuf::put_handles(&[rt::abi::Handle(ACCEPTED.load(Ordering::Acquire) as u64)]);
     // SAFETY: second owned transfer and live channel as above.
     let after = unsafe { sys::raw::<{ Call::Send.number() }>(before) };
-    if after[0] != Error::Interrupted.code() || after[1..] != before[1..] {
+    if after[0] != 0 || after[1] != 8 || after[2] != rt::abi::inline_words(b"accepted")[0] {
         passed(1, false);
     }
     let good = sys::send(&channel(), b"third").is_ok_and(|reply| {
@@ -72,53 +73,11 @@ extern "C" fn file_request(_: u64) -> ! {
         let mut path = [0xa5; 129];
         let errno = unsafe { abi::__errno_location() };
         unsafe { *errno = EINVAL };
-        unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
-            && unsafe { *errno } == EINTR
-            && path == [0xa5; 129]
+        !unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
+            && &path[..2] == b"/\0"
+            && unsafe { *errno } == EINVAL
     });
     passed(2, good)
-}
-
-extern "C" fn console_read(_: u64) -> ! {
-    let good = tls::with_process(|| {
-        let mut bytes = [0xa5; 4];
-        let errno = unsafe { abi::__errno_location() };
-        unsafe { *errno = EINVAL };
-        let retry =
-            Handle::<Channel>::borrowed(rt::abi::Handle(RETRY.load(Ordering::Acquire) as u64));
-        for attempt in 0..2 {
-            bytes.fill(0xa5);
-            if attempt == 1 {
-                RESULTS[3].store(4, Ordering::Release);
-            }
-            if unsafe { abi::read(0, bytes.as_mut_ptr(), bytes.len()) } != -1
-                || unsafe { *errno } != EINTR
-                || bytes != [0xa5; 4]
-            {
-                return false;
-            }
-            RESULTS[3].store(1, Ordering::Release);
-            if sys::receive(&retry).is_err() {
-                return false;
-            }
-        }
-        // Same thread, same descriptor and UART session. A stale deferred read
-        // would refuse this new request or consume its bytes for a dead token.
-        RESULTS[3].store(5, Ordering::Release);
-        for expected in *b"q\n" {
-            if unsafe { abi::read(0, bytes.as_mut_ptr(), 1) } != 1
-                || bytes[0] != expected
-                || unsafe { *errno } != EINTR
-            {
-                return false;
-            }
-        }
-        true
-    });
-    let retry = Handle::<Channel>::borrowed(rt::abi::Handle(RETRY.load(Ordering::Acquire) as u64));
-    RESULTS[3].store(if good { 3 } else { 2 }, Ordering::Release);
-    let _ = sys::notify(&retry, 2);
-    sys::thread_exit()
 }
 
 fn state(t: &Handle<Thread>, expected: ThreadState) -> bool {
@@ -269,8 +228,12 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     let Ok(delivered) = handles.take::<Channel>(0) else {
         return fail(78);
     };
+    // An accepted request is not taken back (spec 6.1): thread_interrupt
+    // is BAD_STATE, the request's handle stays delivered, and the reply
+    // goes once.
     if !state(&sender, ThreadState::AwaitingReply)
-        || !interrupt(&sender, 1)
+        || sys::thread_interrupt(&sender) != Err(Error::BadState)
+        || !state(&sender, ThreadState::AwaitingReply)
         || sys::notify(&accepted_watch, 1).is_err()
         || !matches!(
             sys::try_receive(&delivered),
@@ -279,25 +242,17 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     {
         return fail(78);
     }
-    // A late reply consumes transfer handles even though the client is alive.
-    let Ok(late) = sys::channel_create(1) else {
-        return fail(79);
-    };
-    let Ok(late_watch) = sys::handle_duplicate(&late, Rights::NOTIFY) else {
-        return fail(79);
-    };
-    let late = late.into_raw();
-    rt::msgbuf::put_handles(&[late]);
+    let used = old.raw();
+    if old.reply(b"accepted").is_err() {
+        return fail(80);
+    }
+    // The token went with its reply.
     let mut before = registers();
-    before[0] = old.raw();
-    before[1] = 8 | (1 << rt::abi::HANDLES_SHIFT);
-    // SAFETY: the token is abandoned and this reply transfers one owned handle.
+    before[0] = used;
+    before[1] = 5;
+    // SAFETY: a reply with no handles and an inline body.
     let after = unsafe { sys::raw::<{ Call::Reply.number() }>(before) };
-    if after[0] != Error::PeerClosed.code()
-        || after[1..] != before[1..]
-        || !gone(late)
-        || sys::notify(&late_watch, 1) != Err(Error::PeerClosed)
-    {
+    if after[0] != Error::BadState.code() {
         return fail(80);
     }
     let Ok(sys::Received::Message {
@@ -308,56 +263,181 @@ fn ipc(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     else {
         return fail(81);
     };
-    if next.raw() == old.raw()
-        || old.reply(b"stale") != Err(Error::BadState)
-        || next.reply(b"ok").is_err()
-    {
+    if next.raw() == used || next.reply(b"ok").is_err() {
         return fail(82);
     }
     let _ = sys::yield_now();
     if RESULTS[1].load(Ordering::Acquire) != 1 || !state(&sender, ThreadState::Ended) {
         return fail(83);
     }
-    rt::println!("posix-interrupt-probe: queued handles and accepted tokens ok");
+    rt::println!("posix-interrupt-probe: queued handles, and accepted requests answered once");
     true
 }
 
-extern "C" fn active_read(_: u64) -> ! {
-    let mut request = proto_wire::Writer::new();
-    let encoded = (proto_uart::CancelableRead {
-        max: 1,
-        id: u64::MAX,
-    })
-    .write(&mut request);
-    let good = encoded.is_ok()
-        && sys::send(&channel(), request.as_bytes())
-            .is_ok_and(|reply| reply.len == 8 && reply.words[0] == Error::Interrupted.code());
-    passed(5, good)
+/// One request of the two-step read to the driver: its long reply.
+fn long_call(
+    uart: &Handle<Channel>,
+    request: &proto_wire::Writer,
+    handle: Option<Handle<Channel>>,
+    out: &mut [u8],
+) -> Option<(u32, usize, u64)> {
+    let reply = match handle {
+        None => sys::send(uart, request.as_bytes()).ok()?,
+        Some(handle) => sys::send_handles(uart, request.as_bytes(), [handle.erase()]).ok()?,
+    };
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    match proto_wire::long::Reply::read(reply.bytes(&mut buffer)).ok()? {
+        proto_wire::long::Reply::Ready(bytes) => {
+            out[..bytes.len()].copy_from_slice(bytes);
+            Some((proto_wire::long::READY, bytes.len(), 0))
+        }
+        proto_wire::long::Reply::Wait(key) => Some((proto_wire::long::WAIT, 0, key)),
+        proto_wire::long::Reply::Armed => Some((proto_wire::long::ARMED, 0, 0)),
+        proto_wire::long::Reply::Cancelled => Some((proto_wire::long::CANCELLED, 0, 0)),
+    }
 }
 
-fn cancel_live_read(process: &Handle<Process>) -> bool {
-    let Some(raw) = uart_route().and_then(|input| input.uart()) else {
-        return fail(97);
-    };
-    CHANNEL.store(raw.0 as usize, Ordering::Release);
-    let Some(reader) = create(process, 5, active_read) else {
-        return fail(97);
-    };
-    if sys::thread_start(&reader).is_err() || !state(&reader, ThreadState::AwaitingReply) {
-        return fail(97);
+fn start(uart: &Handle<Channel>) -> Option<u64> {
+    let mut w = proto_wire::Writer::new();
+    proto_uart::ReadRequest { max: 1 }
+        .write_start(&mut w)
+        .ok()?;
+    match long_call(uart, &w, None, &mut [0; 1])? {
+        (proto_wire::long::WAIT, _, key) => Some(key),
+        _ => None,
     }
-    let mut request = proto_wire::Writer::new();
-    if (proto_uart::CancelRead { id: u64::MAX })
-        .write(&mut request)
-        .is_err()
-        || !sys::send(&channel(), request.as_bytes())
-            .is_ok_and(|reply| reply.len == 8 && reply.words[0] == 0)
-        || RESULTS[5].load(Ordering::Acquire) != 1
-        || !state(&reader, ThreadState::Ended)
+}
+
+fn keyed(
+    uart: &Handle<Channel>,
+    method: proto_uart::Method,
+    key: u64,
+    handle: Option<Handle<Channel>>,
+    out: &mut [u8],
+) -> Option<(u32, usize)> {
+    let mut w = proto_wire::Writer::new();
+    proto_uart::ReadKey { key }.write(method, &mut w).ok()?;
+    long_call(uart, &w, handle, out).map(|(kind, n, _)| (kind, n))
+}
+
+/// The read in two steps of the console's driver (proto_uart 2): a read
+/// that waits holds no reply; once armed with a labelled copy of a channel
+/// it is told when input came and takes it; a cancel before input has no
+/// effect; a cancel after input came gives that input, so nothing is lost.
+fn two_step_reads() -> bool {
+    let Some(raw) = uart_route().and_then(|input| input.uart()) else {
+        return fail(91);
+    };
+    let uart = Handle::<Channel>::borrowed(raw);
+    let Ok(notified) = sys::channel_create(30) else {
+        return fail(92);
+    };
+    let Some(key) = start(&uart) else {
+        return fail(93);
+    };
+    let Ok(labelled) = sys::handle_label(&notified, Rights::NOTIFY | Rights::TRANSFER, key, 30)
+    else {
+        return fail(94);
+    };
+    let mut byte = [0; 1];
+    if keyed(
+        &uart,
+        proto_uart::Method::ReadTake,
+        key,
+        Some(labelled),
+        &mut byte,
+    ) != Some((proto_wire::long::ARMED, 0))
+    {
+        return fail(94);
+    }
+    rt::println!("posix-interrupt-probe: read waits armed");
+    // The host types "r": the driver tells this read and keeps the byte.
+    match sys::receive(&notified) {
+        Ok(sys::Received::Notification {
+            source: rt::abi::Source::Session,
+            label,
+            bits: 1,
+            ..
+        }) if label == key => {}
+        _ => return fail(95),
+    }
+    if keyed(&uart, proto_uart::Method::ReadTake, key, None, &mut byte)
+        != Some((proto_wire::long::READY, 1))
+        || byte != *b"r"
+    {
+        return fail(95);
+    }
+    rt::println!("posix-interrupt-probe: told, taken");
+    // The terminal sends a CR after the byte: let it come and take it.
+    let Ok(pause) = sys::channel_create(30) else {
+        return fail(96);
+    };
+    let Ok(timer) = sys::timer_create(&pause, 30) else {
+        return fail(96);
+    };
+    let _ = sys::timer_set(&timer, sys::clock_now().unwrap_or(0) + 20_000_000);
+    let _ = sys::receive(&pause);
+    let key = loop {
+        let mut w = proto_wire::Writer::new();
+        if (proto_uart::ReadRequest { max: 1 })
+            .write_start(&mut w)
+            .is_err()
+        {
+            return fail(96);
+        }
+        match long_call(&uart, &w, None, &mut byte) {
+            Some((proto_wire::long::READY, _, _)) => {}
+            Some((proto_wire::long::WAIT, _, key)) => break key,
+            _ => return fail(96),
+        }
+    };
+    if keyed(&uart, proto_uart::Method::ReadCancel, key, None, &mut byte)
+        != Some((proto_wire::long::CANCELLED, 0))
+        || keyed(&uart, proto_uart::Method::ReadCancel, key, None, &mut byte).is_some()
+    {
+        return fail(96);
+    }
+    let Some(key) = start(&uart) else {
+        return fail(97);
+    };
+    let Ok(labelled) = sys::handle_label(&notified, Rights::NOTIFY | Rights::TRANSFER, key, 30)
+    else {
+        return fail(97);
+    };
+    if keyed(
+        &uart,
+        proto_uart::Method::ReadTake,
+        key,
+        Some(labelled),
+        &mut byte,
+    ) != Some((proto_wire::long::ARMED, 0))
     {
         return fail(97);
     }
-    rt::println!("posix-interrupt-probe: explicit cancellation wakes live reader");
+    rt::println!("posix-interrupt-probe: retry waiting");
+    // The host types "q": the cancel that comes after it gives the byte.
+    loop {
+        match sys::receive(&notified) {
+            Ok(sys::Received::Notification {
+                source: rt::abi::Source::Session,
+                label,
+                bits,
+                ..
+            }) if label == key && bits & 1 != 0 => break,
+            Ok(_) => {}
+            Err(_) => return fail(98),
+        }
+    }
+    if keyed(&uart, proto_uart::Method::ReadCancel, key, None, &mut byte)
+        != Some((proto_wire::long::READY, 1))
+        || byte != *b"q"
+    {
+        return fail(98);
+    }
+    rt::println!("posix-interrupt-probe: a cancel after input gives the input");
+    // The notification left main at its priority, 30, until a receive:
+    // back to 29, so that the next readers run ahead of it.
+    let _ = sys::try_receive(&pause);
     true
 }
 
@@ -388,16 +468,13 @@ fn delivered_data_survives_echo_interrupt(process: &Handle<Process>) -> bool {
     let Ok(sys::Received::Message {
         token,
         words,
-        len: 24,
+        len: 16,
         ..
     }) = sys::try_receive(&c)
     else {
         return fail(95);
     };
-    if words[0] != u64::from_le_bytes(proto_uart::Method::ReadCancelable.header().bytes())
-        || words[1] != 4
-        || words[2] == 0
-    {
+    if words[0] != u64::from_le_bytes(proto_uart::Method::Read.header().bytes()) || words[1] != 4 {
         return fail(95);
     }
     let mut reply = proto_wire::Writer::new();
@@ -418,14 +495,25 @@ fn delivered_data_survives_echo_interrupt(process: &Handle<Process>) -> bool {
     else {
         return fail(95);
     };
+    // The echo's request is accepted: an interrupt does not take it back,
+    // its reply goes, and the read gives the bytes delivered.
+    let mut written = proto_wire::Writer::new();
     if words[0] != u64::from_le_bytes(proto_uart::Method::Write.header().bytes())
         || !state(&reader, ThreadState::AwaitingReply)
-        || !interrupt(&reader, 4)
-        || token.reply(b"late").is_ok()
+        || sys::thread_interrupt(&reader) != Err(Error::BadState)
+        || !state(&reader, ThreadState::AwaitingReply)
+        || (proto_uart::WriteReply { written: 2 })
+            .write(&mut written)
+            .is_err()
+        || token.reply(written.as_bytes()).is_err()
     {
         return fail(95);
     }
-    rt::println!("posix-interrupt-probe: delivered bytes survive echo interruption");
+    let _ = sys::yield_now();
+    if RESULTS[4].load(Ordering::Acquire) != 1 || !state(&reader, ThreadState::Ended) {
+        return fail(95);
+    }
+    rt::println!("posix-interrupt-probe: delivered bytes survive an interrupt of the echo");
     true
 }
 
@@ -444,150 +532,31 @@ fn uart_route() -> Option<rt::fs::Input> {
     }
 }
 
-// Keep the interrupted client ready below main until UART has tried its dead
-// reply. IRQ runs above main, so real input arrives before CancelRead executes.
-fn interrupt_before_irq(reader: &Handle<Thread>) -> bool {
-    let Some(input) = uart_route() else {
-        return fail(94);
-    };
-    if sys::thread_set_priority(reader, 10, Policy::Fifo).is_err()
-        || sys::thread_interrupt(reader).is_err()
-        || !state(reader, ThreadState::Ready)
-    {
-        return fail(94);
-    }
-    rt::println!("posix-interrupt-probe: interrupted before cleanup");
-    let start = rt::time::now();
-    let mut bytes = [0; 2];
-    loop {
-        match input.read(&mut bytes) {
-            Ok(2) if bytes == *b"r\n" => break,
-            Err(proto_wire::Status::Kernel(Error::BadState))
-                if rt::time::now().saturating_sub(start) < 5_000_000_000 => {}
-            _ => return fail(94),
-        }
-    }
-    if RESULTS[3].load(Ordering::Acquire) != 0
-        || sys::thread_set_priority(reader, 30, Policy::Fifo).is_err()
-    {
-        return fail(94);
-    }
-    rt::println!("posix-interrupt-probe: abandoned reply preserved input");
-    RESULTS[3].load(Ordering::Acquire) == 1 && state(reader, ThreadState::Receiving)
-}
-
 pub fn run(process: &Handle<Process>, main: &Handle<Thread>) -> bool {
     if sys::thread_set_priority(main, 29, Policy::Fifo).is_err() || !ipc(process, main) {
         return false;
     }
     // End the receive boost; return to base 29 so newly started clients run
-    // ahead of main while the file owner stays at base 1.
+    // ahead of main.
     let Ok(empty) = sys::channel_create(1) else {
         return fail(84);
     };
     let _ = sys::try_receive(&empty);
     RETRY.store(empty.raw().0 as usize, Ordering::Release);
+    // No file worker: a thread's file request runs in that thread, under
+    // the lock of the process's files, and has no IPC of its own to
+    // interrupt.
     let Some(request) = create(process, 2, file_request) else {
         return fail(85);
     };
-    let errno = unsafe { abi::__errno_location() };
-    unsafe { *errno = EIO };
     if sys::thread_start(&request).is_err()
-        || !state(&request, ThreadState::Sending)
-        || sys::thread_interrupt(&request).is_err()
-        || unsafe { *errno } != EIO
-    {
-        return fail(86);
-    }
-    // The interrupted client must Fetch/Ack before returning EINTR. Main's own
-    // round trip lets the lower-priority file owner process that control traffic.
-    let mut path = [0; 129];
-    if unsafe { abi::getcwd(path.as_mut_ptr(), path.len()) }.is_null()
-        || &path[..2] != b"/\0"
-        || unsafe { *errno } != EIO
         || RESULTS[2].load(Ordering::Acquire) != 1
         || !state(&request, ThreadState::Ended)
     {
-        return fail(87);
+        return fail(86);
     }
-    rt::println!("posix-interrupt-probe: file RPC EINTR ok");
-    let Some(reader) = create(process, 3, console_read) else {
-        return fail(88);
-    };
-    let Ok(before_read) = sys::process_handles(process) else {
-        return fail(89);
-    };
-    if sys::thread_start(&reader).is_err() {
-        return fail(89);
-    }
-    // The file owner completes read preparation at priority 1 while main's
-    // own file round trip waits. Input then waits for an accepted driver
-    // request without incoming bytes.
-    let mut info = core::mem::MaybeUninit::<posix_abi::metadata::Stat>::uninit();
-    if unsafe { posix_abi::metadata::fstat(0, info.as_mut_ptr()) } != 0 {
-        return fail(90);
-    }
-    let expected = ThreadState::AwaitingReply;
-    // Observe the current state rather than relying on a fixed host delay.
-    for _ in 0..64 {
-        if state(&reader, expected) {
-            break;
-        }
-        let _ = sys::yield_now();
-    }
-    let Ok(during_read) = sys::process_handles(process) else {
-        return fail(91);
-    };
-    if !state(&reader, expected) || during_read.live != before_read.live {
-        return fail(91);
-    }
-    let interrupted = interrupt_before_irq(&reader);
-    if !interrupted
-        || sys::process_handles(process).map(|handles| handles.live) != Ok(before_read.live)
-        || unsafe { *errno } != EIO
-    {
-        return fail(91);
-    }
-    let fd = unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) };
-    let mut byte = 0;
-    if fd != 3
-        || unsafe { abi::read(fd, &mut byte, 1) } != 1
-        || byte != b's'
-        || unsafe { abi::close(fd) } != 0
-        || unsafe { *errno } != EIO
-    {
-        return fail(92);
-    }
-    rt::println!("posix-interrupt-probe: console EINTR and continued file I/O ok");
-    // Interrupt another empty read, with no IRQ to retire the old request.
-    // This phase requires the explicit CancelRead handler to remove it.
-    if sys::notify(&empty, 1).is_err()
-        || unsafe { posix_abi::metadata::fstat(0, info.as_mut_ptr()) } != 0
-        || RESULTS[3].load(Ordering::Acquire) != 4
-        || !state(&reader, expected)
-        || !interrupt(&reader, 3)
-        || sys::process_handles(process).map(|handles| handles.live) != Ok(before_read.live)
-    {
-        return fail(96);
-    }
-    rt::println!("posix-interrupt-probe: empty-read cancellation acknowledged");
-    if sys::notify(&empty, 1).is_err()
-        || unsafe { posix_abi::metadata::fstat(0, info.as_mut_ptr()) } != 0
-        || RESULTS[3].load(Ordering::Acquire) != 5
-        || !state(&reader, expected)
-    {
-        return fail(93);
-    }
-    rt::println!("posix-interrupt-probe: retry waiting");
-    if sys::receive(&empty).is_err()
-        || RESULTS[3].load(Ordering::Acquire) != 3
-        || !state(&reader, ThreadState::Ended)
-        || unsafe { *errno } != EIO
-    {
-        return fail(93);
-    }
-    rt::println!("posix-interrupt-probe: retry preserved input and errno");
-    if !cancel_live_read(process) {
+    rt::println!("posix-interrupt-probe: a file request runs in its own thread");
+    if !two_step_reads() {
         return false;
     }
     if !delivered_data_survives_echo_interrupt(process) {

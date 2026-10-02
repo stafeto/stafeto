@@ -697,7 +697,9 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-posix-abi") as usize
     + cfg!(feature = "table-posix-abi-vz") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
-    + cfg!(feature = "table-rtbench-vz") as usize;
+    + cfg!(feature = "table-rtbench-vz") as usize
+    + cfg!(feature = "table-rtbench-posix") as usize
+    + cfg!(feature = "table-rtbench-posix-vz") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -718,7 +720,9 @@ const _: () = assert!(
     feature = "table-posix-abi",
     feature = "table-posix-abi-vz",
     feature = "table-busybox-dialog-vz",
-    feature = "table-rtbench-vz"
+    feature = "table-rtbench-vz",
+    feature = "table-rtbench-posix",
+    feature = "table-rtbench-posix-vz"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -739,6 +743,10 @@ pub const TABLE: &[Record] = vz::POSIX_ABI_TABLE;
 pub const TABLE: &[Record] = vz::BUSYBOX_DIALOG_TABLE;
 #[cfg(feature = "table-rtbench-vz")]
 pub const TABLE: &[Record] = vz::RTBENCH_TABLE;
+#[cfg(feature = "table-rtbench-posix")]
+pub const TABLE: &[Record] = ramfs::RTBENCH_POSIX_TABLE;
+#[cfg(feature = "table-rtbench-posix-vz")]
+pub const TABLE: &[Record] = vz::RTBENCH_POSIX_TABLE;
 #[cfg(feature = "table-test")]
 pub const TABLE: &[Record] = test::TABLE;
 #[cfg(feature = "table-cycle")]
@@ -1384,6 +1392,7 @@ mod tests {
             order_of(vz::POSIX_ABI_TABLE),
             [
                 "uart",
+                "long",
                 "ramfs",
                 "posix",
                 "clock",
@@ -1396,6 +1405,20 @@ mod tests {
             ["uart", "ramfs", "busybox-probe"]
         );
         assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
+        for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
+            assert_eq!(
+                order_of(table),
+                [
+                    "console",
+                    "ramfs",
+                    "posix",
+                    "clock",
+                    "uart",
+                    "rtbench-load",
+                    "rtbench-posix"
+                ]
+            );
+        }
         assert_eq!(
             order_of(test::TABLE),
             [
@@ -1424,12 +1447,20 @@ mod tests {
             ramfs::POSIX_ABI_TABLE,
             vz::POSIX_ABI_TABLE,
             vz::BUSYBOX_DIALOG_TABLE,
+            ramfs::RTBENCH_POSIX_TABLE,
+            vz::RTBENCH_POSIX_TABLE,
         ];
         for table in tables {
             assert!(check(table).is_ok());
-            let posix = table
-                .iter()
-                .filter(|r| ["cprobe", "busybox-probe", "posix-abi-probe"].contains(&r.program));
+            let posix = table.iter().filter(|r| {
+                [
+                    "cprobe",
+                    "busybox-probe",
+                    "posix-abi-probe",
+                    "rtbench-posix",
+                ]
+                .contains(&r.program)
+            });
             assert_eq!(posix.clone().count(), 1);
             for r in posix {
                 assert_eq!(r.ceiling, r.priority + 1, "{}", r.name);

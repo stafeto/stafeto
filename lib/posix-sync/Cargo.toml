@@ -1,0 +1,17 @@
+[package]
+name = "posix-sync"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Waits by address, critical sections and the layer's lock of the Rust POSIX layer"
+
+[lib]
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../abi" }
+posix-thread = { path = "../posix-thread" }
+rt = { path = "../rt" }

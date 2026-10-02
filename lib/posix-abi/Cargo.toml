@@ -12,7 +12,13 @@ test = false
 bench = false
 
 [features]
-transport-probe = ["posix-clock/transport-probe", "process-client/transport-probe"]
+# threads::set_level, the levels of rtbench 2's threads (tests/rtbench-posix).
+rtbench = []
+# What the thread probes look at and steer from outside the layer: a
+# thread's native handle and block, the waits it stands in, the levels of
+# the file and heap workers, a cancellation window and a borrow of the
+# file state (tests/posix-threads, tests/posix-shared).
+thread-probe = []
 
 [dependencies]
 posix-types = { path = "../posix-types" }
@@ -22,7 +28,10 @@ posix-heap = { path = "../posix-heap" }
 posix-order = { path = "../posix-order" }
 posix-request = { path = "../posix-request" }
 proto-wire = { path = "../../proto/wire" }
+proto-uart = { path = "../../proto/uart" }
 posix-clock = { path = "../posix-clock" }
+posix-sync = { path = "../posix-sync" }
+posix-thread = { path = "../posix-thread" }
 posix-time = { path = "../posix-time" }
 proto-clock = { path = "../../proto/clock" }
 posix-signals = { path = "../posix-signals" }

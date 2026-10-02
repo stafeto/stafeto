@@ -62,7 +62,7 @@ extern "C" fn adopter(_: u64) -> ! {
     let own = Handle::<Channel>::borrowed(abi::Handle(HANDLES[1].load(Ordering::Relaxed)));
     let records = ManuallyDrop::new(Client::new(ManuallyDrop::into_inner(own)));
     let mut buffer = [0; abi::MESSAGE_MAX];
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "adoption-refusals")]
     refusals(&parent);
     loop {
         let mut reply = match sys::send(&parent, &Method::Adopt.header().bytes()) {
@@ -119,10 +119,10 @@ extern "C" fn adopter(_: u64) -> ! {
 }
 
 /// The refusals of ADOPT and ADOPTED that only the service can reach
-/// (transport-probe): ADOPT with a byte after the header and ADOPTED with
+/// (adoption-refusals): ADOPT with a byte after the header and ADOPTED with
 /// one after its body BAD_SIZE, ADOPTED with a ticket no process has
 /// INVALID_ARGS. Says so in one line.
-#[cfg(feature = "transport-probe")]
+#[cfg(feature = "adoption-refusals")]
 fn refusals(parent: &Handle<Channel>) {
     let answer = |w: &Writer| {
         let mut buffer = [0; abi::MESSAGE_MAX];

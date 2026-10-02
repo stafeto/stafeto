@@ -11,13 +11,9 @@ name = "posix-clock-service"
 test = false
 bench = false
 
-[features]
-transport-probe = []
-
 [dependencies]
 proto-clock = { path = "../../proto/clock" }
 proto-wire = { path = "../../proto/wire" }
 posix-time = { path = "../../lib/posix-time" }
 proto-init = { path = "../../proto/init" }
 rt = { path = "../../lib/rt" }
-posix-heap = { path = "../../lib/posix-heap" }

@@ -113,10 +113,6 @@ unsafe extern "C" fn worker(argument: *mut c_void) -> *mut c_void {
         }
         assert_eq!(threads::pthread_cancel(threads::pthread_self()), 0);
     }
-    if mode == 3 {
-        threads::probe_interrupt_signal_reply(46);
-        threads::probe_ack_interrupt();
-    }
     let set = if mode == 6 { 0 } else { bit(SIGUSR1) };
     let with_info = INFO.load(Ordering::Acquire);
     let status = if with_info {
@@ -177,28 +173,6 @@ fn joined(id: u64, expected: usize) -> bool {
     (unsafe { threads::pthread_join(id, &mut value) }) == 0 && value as usize == expected
 }
 pub(super) fn run() -> bool {
-    let snapshot = [
-        0xffff_ffff_0000_1234,
-        0x8000_0001_0000_0010,
-        3,
-        0x8765_4321_fedc_ba98,
-        128,
-    ];
-    let before_ack = threads::probe_ack_interrupts();
-    if threads::probe_snapshot(snapshot)
-        != Ok([
-            snapshot[0],
-            snapshot[1],
-            snapshot[2],
-            snapshot[3],
-            snapshot[4],
-            u64::MAX,
-            1 << 63,
-        ])
-        || threads::probe_ack_interrupts() != before_ack + 1
-    {
-        return failed(449);
-    }
     let done = sys::channel_create(30).unwrap();
     let waiter = Waiter::new(&done, 0, 30).unwrap();
     DONE.store(done.raw().0, Ordering::Release);

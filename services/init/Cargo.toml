@@ -26,6 +26,8 @@ vz = []
 table-posix-abi-vz = []
 table-busybox-dialog-vz = []
 table-rtbench-vz = []
+table-rtbench-posix = []
+table-rtbench-posix-vz = []
 # The probe of a device's stop (console-restart-vz): init watches the DMA
 # object of a driver that ended for 300 ms after the stop.
 dma-watch = []

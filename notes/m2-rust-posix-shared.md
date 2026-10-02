@@ -1,5 +1,7 @@
 # Shared Rust POSIX file state
 
+History: the file worker is gone: the process files live under a lock of the layer and each thread performs its request itself (notes/m5a-transport.md). This note records the earlier design.
+
 The GPL-3.0-or-later Rust C ABI now routes process file operations to one
 private native worker. It owns PosixFs and the stable directory-stream registry.
 Process threads share descriptors, their flags, backend offsets, the current

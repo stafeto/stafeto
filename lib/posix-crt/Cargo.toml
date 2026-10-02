@@ -12,8 +12,14 @@ crate-type = ["rlib", "staticlib"]
 test = false
 bench = false
 
+# Standard input and output through the console's driver, the service
+# `uart` (rt::fs::Files::connect_with_uart), besides the RAM files.
+[features]
+uart-input = []
+
 [dependencies]
 proto-init = { path = "../../proto/init" }
 posix-abi = { path = "../posix-abi" }
 posix-fs = { path = "../posix-fs" }
+posix-thread = { path = "../posix-thread" }
 rt = { path = "../rt" }

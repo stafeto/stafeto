@@ -6,13 +6,21 @@ authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
 
+# The table of records, apart from the calls the service makes: tested on
+# the host.
+[lib]
+bench = false
+
 [[bin]]
 name = "posix-process-service"
 test = false
 bench = false
 
 [features]
-transport-probe = []
+# The refusals of ADOPT and ADOPTED that only the service can reach: the
+# adopter sends them to init first and says how they went (xtask
+# posix-threads).
+adoption-refusals = []
 # The probe of POSIX processes whose service ended: the service ends before
 # it registers (xtask posix-orphans).
 exit-early = []
@@ -21,7 +29,10 @@ exit-early = []
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }
 proto-init = { path = "../../proto/init" }
+posix-credentials = { path = "../../lib/posix-credentials" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
 process-client = { path = "../../lib/process-client" }
 rt = { path = "../../lib/rt" }
-posix-credentials = { path = "../../lib/posix-credentials" }
-posix-heap = { path = "../../lib/posix-heap" }

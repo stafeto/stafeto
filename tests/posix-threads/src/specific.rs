@@ -76,8 +76,6 @@ pub(super) fn run() -> bool {
     GATE.store(gate.raw().0, Ordering::Release);
     READY.store(ready.raw().0, Ordering::Release);
     let mut key = 0;
-    // CREATE, GET, SET, TAKE and DELETE each commit before a real interruption.
-    probe_interrupt_replies();
     if unsafe { pthread_key_create(&mut key, Some(destructor)) } != 0
         || !pthread_getspecific(key).is_null()
     {

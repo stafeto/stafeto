@@ -673,3 +673,197 @@ pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, 
         status => Err(status),
     }
 }
+
+/// The most long operations of one session that wait (spec 2, 3.4).
+pub const LONG_SESSION_MAX: usize = 16;
+
+/// A long operation that waits: its client, the handle with NOTIFY that
+/// tells the client once its result is ready, and its neighbours in the
+/// list of its session's operations.
+struct LongOp {
+    label: u64,
+    notify: Option<Handle<Channel>>,
+    told: bool,
+    previous: Option<u16>,
+    next: Option<u16>,
+}
+
+/// What `LongOps` keeps for one session, in the session's data: the count
+/// of its operations that wait and the first of them, so that a start
+/// counts and a session that goes is taken back in O(LONG_SESSION_MAX).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LongSession {
+    count: u8,
+    head: Option<u16>,
+}
+
+/// The long operations of a service in two steps (proto_wire::long): N at
+/// most, LONG_SESSION_MAX of each session; each under its key k, the
+/// index of its place and the generation of the place, so that a key that
+/// went is never taken for a new one. Starting and finding an operation
+/// are O(1) (a list of free places), taking back a session's
+/// O(LONG_SESSION_MAX) (the list of the session's operations, whose head
+/// the session keeps: `LongSession`). An operation lives until "take k"
+/// gives its result, "cancel k", or its session goes. The service keeps
+/// the operation's state itself; this keeps who waits and the handle to
+/// tell them.
+pub struct LongOps<const N: usize> {
+    ops: [Option<LongOp>; N],
+    generations: [u32; N],
+    /// The free places, the last freed on top.
+    free: [u16; N],
+    free_len: usize,
+}
+
+impl<const N: usize> Default for LongOps<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> LongOps<N> {
+    pub const fn new() -> Self {
+        assert!(N <= u16::MAX as usize, "places fit u16");
+        let mut free = [0; N];
+        let mut i = 0;
+        while i < N {
+            free[i] = (N - 1 - i) as u16;
+            i += 1;
+        }
+        LongOps {
+            ops: [const { None }; N],
+            generations: [0; N],
+            free,
+            free_len: N,
+        }
+    }
+
+    /// A new operation of the client `label`, whose session keeps
+    /// `session`: its key; LIMIT_REACHED when the session or the service
+    /// holds its most (the client gets EAGAIN). O(1).
+    pub fn start(&mut self, session: &mut LongSession, label: u64) -> Result<u64, Error> {
+        if usize::from(session.count) >= LONG_SESSION_MAX || self.free_len == 0 {
+            return Err(Error::LimitReached);
+        }
+        self.free_len -= 1;
+        let index = usize::from(self.free[self.free_len]);
+        self.generations[index] = self.generations[index].wrapping_add(1).max(1);
+        self.ops[index] = Some(LongOp {
+            label,
+            notify: None,
+            told: false,
+            previous: None,
+            next: session.head,
+        });
+        if let Some(head) = session.head {
+            self.ops[usize::from(head)]
+                .as_mut()
+                .expect("the head of a session")
+                .previous = Some(index as u16);
+        }
+        session.head = Some(index as u16);
+        session.count += 1;
+        Ok((u64::from(self.generations[index]) << 32) | (index as u64 + 1))
+    }
+
+    /// The place of the operation `key` of the client `label`.
+    fn place(&self, label: u64, key: u64) -> Option<usize> {
+        let index = (key & 0xffff_ffff).checked_sub(1)? as usize;
+        let op = self.ops.get(index)?.as_ref()?;
+        (op.label == label && u64::from(self.generations[index]) == key >> 32).then_some(index)
+    }
+
+    /// The operation in `index` goes with its handle: out of its session's
+    /// list and back to the free places. O(1).
+    fn free_place(&mut self, session: &mut LongSession, index: usize) {
+        let op = self.ops[index].take().expect("a live operation");
+        match op.previous {
+            Some(p) => self.ops[usize::from(p)].as_mut().expect("a neighbour").next = op.next,
+            None => session.head = op.next,
+        }
+        if let Some(n) = op.next {
+            self.ops[usize::from(n)]
+                .as_mut()
+                .expect("a neighbour")
+                .previous = op.previous;
+        }
+        session.count -= 1;
+        self.free[self.free_len] = index as u16;
+        self.free_len += 1;
+    }
+
+    /// Whether the operation `key` of `label` waits.
+    pub fn waits(&self, label: u64, key: u64) -> bool {
+        self.place(label, key).is_some()
+    }
+
+    /// Keeps `notify`, which the client's "take" brought, for the operation;
+    /// BAD_STATE for none.
+    pub fn arm(&mut self, label: u64, key: u64, notify: Handle<Channel>) -> Result<(), Error> {
+        let index = self.place(label, key).ok_or(Error::BadState)?;
+        let op = self.ops[index].as_mut().expect("a placed operation");
+        op.notify = Some(notify);
+        op.told = false;
+        Ok(())
+    }
+
+    /// Tells the client of the operation that its result is ready: bit 0
+    /// through its handle, once; nothing before it armed.
+    pub fn tell(&mut self, label: u64, key: u64) {
+        let Some(index) = self.place(label, key) else {
+            return;
+        };
+        let op = self.ops[index].as_mut().expect("a placed operation");
+        if let Some(notify) = op.notify.as_ref()
+            && !op.told
+        {
+            op.told = true;
+            // A client that went closed its end: nothing to tell then.
+            let _ = sys::notify(notify, 1);
+        }
+    }
+
+    /// The operation is over (taken or cancelled): it goes with its handle.
+    pub fn finish(&mut self, session: &mut LongSession, label: u64, key: u64) -> bool {
+        match self.place(label, key) {
+            Some(index) => {
+                self.free_place(session, index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The client of `session` went: its operations go with their handles.
+    /// O(LONG_SESSION_MAX).
+    pub fn gone(&mut self, session: &mut LongSession) {
+        while let Some(head) = session.head {
+            self.free_place(session, usize::from(head));
+        }
+    }
+
+    /// The operations that wait, and the handles they hold.
+    pub fn counts(&self) -> (usize, usize) {
+        let live = self.ops.iter().flatten().count();
+        let held = self
+            .ops
+            .iter()
+            .flatten()
+            .filter(|o| o.notify.is_some())
+            .count();
+        (live, held)
+    }
+
+    /// The labels and keys of the operations that wait, for a service that
+    /// finishes them when their result comes.
+    pub fn keys(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ops.iter().enumerate().filter_map(|(index, op)| {
+            op.as_ref().map(|op| {
+                (
+                    op.label,
+                    (u64::from(self.generations[index]) << 32) | (index as u64 + 1),
+                )
+            })
+        })
+    }
+}

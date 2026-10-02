@@ -27,6 +27,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use core::mem::MaybeUninit;
+
 use abi::{Error, MESSAGE_MAX};
 use core::fmt;
 
@@ -253,16 +255,18 @@ impl<'a> Reader<'a> {
 
 /// Writes the fields of a message in order into a buffer of
 /// abi::MESSAGE_MAX bytes, the most a message holds. A write past it is
-/// BAD_SIZE and writes nothing.
+/// BAD_SIZE and writes nothing. The buffer is not cleared when the writer
+/// is made: only the bytes written so far are ever read (`as_bytes`), so a
+/// reply of a few bytes costs a few stores.
 pub struct Writer {
-    buffer: [u8; MESSAGE_MAX],
+    buffer: [MaybeUninit<u8>; MESSAGE_MAX],
     len: usize,
 }
 
 impl Writer {
     pub const fn new() -> Writer {
         Writer {
-            buffer: [0; MESSAGE_MAX],
+            buffer: [const { MaybeUninit::uninit() }; MESSAGE_MAX],
             len: 0,
         }
     }
@@ -270,7 +274,9 @@ impl Writer {
     pub fn bytes(&mut self, bytes: &[u8]) -> Result<(), Status> {
         let end = self.len + bytes.len();
         let room = self.buffer.get_mut(self.len..end).ok_or(Status::BadSize)?;
-        room.copy_from_slice(bytes);
+        for (slot, byte) in room.iter_mut().zip(bytes) {
+            slot.write(*byte);
+        }
         self.len = end;
         Ok(())
     }
@@ -294,13 +300,91 @@ impl Writer {
 
     /// The message written so far.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.buffer[..self.len]
+        let written = &self.buffer[..self.len];
+        // SAFETY: `bytes` initialized every byte below `len`, and
+        // MaybeUninit<u8> has the layout of u8.
+        unsafe { core::slice::from_raw_parts(written.as_ptr().cast::<u8>(), written.len()) }
     }
 }
 
 impl Default for Writer {
     fn default() -> Writer {
         Writer::new()
+    }
+}
+
+/// The replies of a long operation in two steps (spec 2, 3.4): a request
+/// "start" without a handle; a result ready at once comes in its reply
+/// (READY); otherwise WAIT with the key k of the operation, which the
+/// service keeps. The client then sends "take k" with a handle with NOTIFY
+/// to its own channel, labelled k: READY when the result came meanwhile,
+/// otherwise ARMED, and the service holds the handle until the operation
+/// ends, putting bit 0 into that slot once the result is ready; the client
+/// then sends "take k" without a handle. "Cancel k" gives CANCELLED, with
+/// no effect of the operation, or READY with a result that was ready:
+/// nothing is lost or done twice. The service frees the operation and its
+/// handle on take with READY, on cancel and when the client goes.
+///
+/// | Bytes | Field |
+/// |---|---|
+/// | 0..4 | status 0 |
+/// | 4..8 | READY, WAIT, ARMED or CANCELLED |
+/// | 8.. | READY: the bytes of the result; WAIT: k, u64; others: nothing |
+pub mod long {
+    use super::{Reader, Status, Writer};
+
+    pub const READY: u32 = 1;
+    pub const WAIT: u32 = 2;
+    pub const ARMED: u32 = 3;
+    pub const CANCELLED: u32 = 4;
+
+    /// A reply of a long operation.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Reply<'a> {
+        Ready(&'a [u8]),
+        Wait(u64),
+        Armed,
+        Cancelled,
+    }
+
+    impl<'a> Reply<'a> {
+        pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+            w.u32(Status::Ok.code())?;
+            match *self {
+                Reply::Ready(bytes) => {
+                    w.u32(READY)?;
+                    w.bytes(bytes)
+                }
+                Reply::Wait(key) => {
+                    w.u32(WAIT)?;
+                    w.u64(key)
+                }
+                Reply::Armed => w.u32(ARMED),
+                Reply::Cancelled => w.u32(CANCELLED),
+            }
+        }
+
+        /// The reply in `bytes`: the status when it is a refusal, BAD_SIZE
+        /// for a layout of none of the four, or a WAIT with key 0.
+        pub fn read(bytes: &'a [u8]) -> Result<Reply<'a>, Status> {
+            let mut r = Reader::new(bytes);
+            match Status::from_code(r.u32()?) {
+                Status::Ok => {}
+                status => return Err(status),
+            }
+            let reply = match r.u32()? {
+                READY => Reply::Ready(r.bytes(r.left())?),
+                WAIT => match r.u64()? {
+                    0 => return Err(Status::BadSize),
+                    key => Reply::Wait(key),
+                },
+                ARMED => Reply::Armed,
+                CANCELLED => Reply::Cancelled,
+                _ => return Err(Status::BadSize),
+            };
+            r.finish()?;
+            Ok(reply)
+        }
     }
 }
 
@@ -420,5 +504,63 @@ mod tests {
         let mut first = [0; NAME_LEN];
         first[1] = b'x';
         assert_eq!(Name::from_field(first), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn long_replies_go_and_come_back() {
+        for reply in [
+            long::Reply::Ready(b"abc"),
+            long::Reply::Ready(b""),
+            long::Reply::Wait(0x1_0000_0002),
+            long::Reply::Armed,
+            long::Reply::Cancelled,
+        ] {
+            let mut w = Writer::new();
+            reply.write(&mut w).unwrap();
+            assert_eq!(long::Reply::read(w.as_bytes()), Ok(reply));
+        }
+        let mut w = Writer::new();
+        w.u32(0).unwrap();
+        w.u32(long::WAIT).unwrap();
+        w.u64(0).unwrap();
+        assert_eq!(long::Reply::read(w.as_bytes()), Err(Status::BadSize));
+        assert_eq!(
+            long::Reply::read(&reply(Status::Kernel(Error::LimitReached))),
+            Err(Status::Kernel(Error::LimitReached))
+        );
+    }
+
+    /// The bytes of replies as services write them, which went out the
+    /// same before the writer stopped clearing its buffer: exactly the
+    /// fields written, nothing of what lay in the buffer past them, also
+    /// for a writer whose memory held another message before.
+    #[test]
+    fn replies_carry_their_fields_and_nothing_more() {
+        let write = |f: &dyn Fn(&mut Writer)| {
+            // A writer made again where a longer message lay before.
+            let mut w = Writer::new();
+            w.bytes(&[0xee; MESSAGE_MAX]).unwrap();
+            assert_eq!(w.as_bytes().len(), MESSAGE_MAX);
+            w = Writer::new();
+            f(&mut w);
+            w.as_bytes().to_vec()
+        };
+        assert_eq!(
+            write(&|w| w.u32(Status::Ok.code()).unwrap()),
+            reply(Status::Ok)[..4]
+        );
+        assert_eq!(
+            write(&|w| long::Reply::Wait(0x1_0000_0002).write(w).unwrap()),
+            [0, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(
+            write(&|w| long::Reply::Ready(b"ab").write(w).unwrap()),
+            [0, 0, 0, 0, 1, 0, 0, 0, b'a', b'b']
+        );
+        assert_eq!(
+            write(&|w| Header::new(7, 2).write(w).unwrap()),
+            Header::new(7, 2).bytes()
+        );
+        assert_eq!(write(&|_| {}), [0u8; 0]);
     }
 }

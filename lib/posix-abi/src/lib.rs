@@ -12,6 +12,7 @@ pub mod clock;
 pub mod constants;
 pub mod directory;
 pub mod locale;
+pub mod long;
 pub mod metadata;
 pub mod ordering;
 pub mod process;
@@ -27,6 +28,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
 use posix_request::{MESSAGE_MAX, Reply, Request};
+use rt::handle::{Channel, Handle};
 
 const _: () = {
     assert!(core::mem::size_of::<usize>() == 8);
@@ -36,25 +38,36 @@ const _: () = {
 
 static CEILING: AtomicU8 = AtomicU8::new(0);
 
-/// The process's ceiling (spec 6.6), found once at startup. The thread owner,
-/// the heap and file workers and the sleep timer run there, so no application
-/// thread at main's level delays them between a reply and the next receive.
-/// object_info does not report the ceiling and a denied priority allocates
-/// nothing, so the first caller probes channel_create from the top down.
+/// The process's ceiling (spec 6.6): one level above the main thread's
+/// base, as init's POSIX record gives it (audit 3, decision 1.5), set once
+/// at startup (`set_ceiling`). The locks of the layer raise their holders
+/// there, and the exit channels of pthreads post at it.
 fn ceiling() -> Result<u8, rt::abi::Error> {
-    let known = CEILING.load(Ordering::Relaxed);
-    if known != 0 {
-        return Ok(known);
+    match CEILING.load(Ordering::Relaxed) {
+        0 => Err(rt::abi::Error::BadState),
+        known => Ok(known),
     }
-    let level = (1..rt::abi::PRIORITY_LEVELS)
-        .rev()
-        .find_map(|level| match rt::sys::channel_create(level) {
-            Err(rt::abi::Error::AccessDenied) => None,
-            result => Some(result.map(|_| level)),
-        })
-        .ok_or(rt::abi::Error::AccessDenied)??;
+}
+
+/// The ceiling one above `main_level`; when the process may not use it
+/// (a record whose ceiling is main's level), main's level, which the
+/// caller says. One `channel_create` checks it.
+fn set_ceiling(main_level: u8) -> u8 {
+    let above = main_level
+        .saturating_add(1)
+        .min(rt::abi::PRIORITY_LEVELS - 1);
+    let level = match rt::sys::channel_create(above) {
+        Ok(_) => above,
+        Err(_) => main_level,
+    };
     CEILING.store(level, Ordering::Relaxed);
-    Ok(level)
+    level
+}
+
+/// The process's ceiling, for the guest probes.
+#[cfg(feature = "thread-probe")]
+pub fn probe_ceiling() -> u8 {
+    ceiling().expect("the ceiling")
 }
 
 fn error(error: FsError) -> c_int {
@@ -192,22 +205,67 @@ unsafe fn read_inner(number: c_int, buffer: *mut u8, count: usize) -> isize {
                 if extent as usize > count {
                     return Err(EIO);
                 }
-                let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
-                let mut bytes = [0; posix_request::MAX_READ];
-                threads::cancel::console_wait();
-                let length = input
-                    .read(&mut bytes[..extent as usize])
-                    .map_err(|status| error(status.into()))?;
-                if length != 0 {
-                    // SAFETY: the transport returned at most the validated extent.
-                    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
-                }
-                Ok(length)
+                // SAFETY: as the caller of read promises.
+                unsafe { console_read(uart, extent, buffer) }
             }
             _ => Err(EIO),
         }
     });
     result.map_or_else(|code| fail(code) as isize, |length| length as isize)
+}
+
+/// The console's branch of `read`, in its own frame: its buffers stay off
+/// the stack of reads of files, which go on under the lock of the files.
+///
+/// # Safety
+/// `buffer` supplies `extent` writable bytes.
+#[inline(never)]
+unsafe fn console_read(uart: Option<u64>, extent: u32, buffer: *mut u8) -> Result<usize, i32> {
+    let input = rt::fs::Input::from_uart(uart.map(rt::abi::Handle));
+    let uart = Handle::<Channel>::borrowed(uart.map(rt::abi::Handle).ok_or(EBADF)?);
+    let mut bytes = [0; posix_request::MAX_READ];
+    threads::cancel::console_wait();
+    // A thread the layer did not attach has no channel of its
+    // own: a plain read waits for input.
+    // SAFETY: the block, when there is one, is this thread's.
+    let attached = unsafe { posix_thread::block().as_ref() }
+        .is_some_and(|b| b.channel.load(Ordering::Relaxed) != 0);
+    if !attached {
+        let length = input
+            .read(&mut bytes[..extent as usize])
+            .map_err(|status| error(status.into()))?;
+        if length != 0 {
+            // SAFETY: the transport returned at most the validated extent.
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+        }
+        return Ok(length);
+    }
+    // A read in two steps waits on the thread's own channel: a
+    // signal or a request of cancellation ends it at once.
+    let mut start = proto_wire::Writer::new();
+    proto_uart::ReadRequest { max: extent }
+        .write_start(&mut start)
+        .map_err(|_| EINVAL)?;
+    let mut raw = [0; posix_request::MAX_READ];
+    let got = long::run(
+        &uart,
+        start.as_bytes(),
+        |cancel, key, w| {
+            let method = if cancel {
+                proto_uart::Method::ReadCancel
+            } else {
+                proto_uart::Method::ReadTake
+            };
+            proto_uart::ReadKey { key }.write(method, w)
+        },
+        &mut raw[..extent as usize],
+    )?;
+    let length = input.deliver(&raw[..got], &mut bytes[..extent as usize]);
+    if length != 0 {
+        // SAFETY: the transport returned at most the validated extent.
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
+    }
+    Ok(length)
 }
 
 /// # Safety

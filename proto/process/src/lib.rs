@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Process protocol v2 (spec 2, section 3.1). The service gives every
+//! Process protocol v3 (spec 2, section 3.1). The service gives every
 //! session it serves: the label of the session names the caller's record
 //! (`Label`), never the body. Create comes only through the service's
 //! channel with no label, from the service's own thread that takes the
@@ -12,13 +12,14 @@
 //! (PERMISSION otherwise). Both reply
 //! with the snapshot and one handle, the new record's session. Query has no
 //! body or handles. Snapshot reply: status u32, pid u32, parent u32,
-//! uid/euid/suid/gid/egid/sgid u32. Change: nonce u64, operation u32, id
-//! u32. Change/ACK reply status alone; ACK body nonce u64. Changes are
-//! retained by session and nonce until ACK or the session's end, with body
-//! matching. A record goes when the last copy of its session closes.
+//! uid/euid/suid/gid/egid/sgid u32. Change: operation u32, id u32; reply
+//! status alone. The kernel answers an accepted request once (spec 6.1):
+//! a client sends a Change again only when its send came back INTERRUPTED,
+//! which the service never saw, so a Change takes effect once with no
+//! journal. A record goes when the last copy of its session closes.
 #![cfg_attr(not(test), no_std)]
 use proto_wire::Header;
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -129,7 +130,6 @@ pub enum Method {
     Create = 1,
     Query = 2,
     Change = 3,
-    Ack = 4,
     Child = 5,
 }
 impl Method {
@@ -140,7 +140,7 @@ impl Method {
         }
     }
 }
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5];
+pub const METHODS: &[u16] = &[1, 2, 3, 5];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Change {
@@ -168,18 +168,12 @@ mod tests {
         let value = Credentials::from_words([1, 2, 3, 4, 5, 6]);
         assert_eq!(value.words(), [1, 2, 3, 4, 5, 6]);
         assert_eq!(Credentials::ROOT.words(), [0; 6]);
-        for (i, m) in [
-            Method::Create,
-            Method::Query,
-            Method::Change,
-            Method::Ack,
-            Method::Child,
-        ]
-        .iter()
-        .enumerate()
+        for (i, m) in [Method::Create, Method::Query, Method::Change, Method::Child]
+            .iter()
+            .enumerate()
         {
             assert_eq!(*m as u16, METHODS[i]);
-            assert_eq!(m.header().version, 2);
+            assert_eq!(m.header().version, 3);
         }
         for i in 1..=4 {
             assert_eq!(Change::from_number(i).unwrap() as u32, i);

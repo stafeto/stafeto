@@ -22,33 +22,35 @@ use rt::{
 };
 
 #[cfg(not(feature = "cancel-input"))]
+mod blocks;
+#[cfg(not(feature = "cancel-input"))]
 mod borrow_guards;
 #[cfg(not(feature = "cancel-input"))]
 mod cancellation;
 #[cfg(not(feature = "cancel-input"))]
 mod capacity;
 #[cfg(not(feature = "cancel-input"))]
-mod clock_replies;
-#[cfg(not(feature = "cancel-input"))]
 mod clocks;
 #[cfg(not(feature = "cancel-input"))]
 mod credentials;
 #[cfg(not(feature = "cancel-input"))]
-mod file_replies;
+mod futex;
 #[cfg(not(feature = "cancel-input"))]
-mod heap_replies;
+mod heap_lock;
 #[cfg(feature = "cancel-input")]
 mod input;
+#[cfg(not(feature = "cancel-input"))]
+mod long;
 #[cfg(not(feature = "cancel-input"))]
 mod mutex;
 #[cfg(not(feature = "cancel-input"))]
 mod once;
 #[cfg(not(feature = "cancel-input"))]
+mod one_thread;
+#[cfg(not(feature = "cancel-input"))]
 mod reentry;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_context;
-#[cfg(not(feature = "cancel-input"))]
-mod signal_timed;
 #[cfg(not(feature = "cancel-input"))]
 mod signal_wait;
 #[cfg(not(feature = "cancel-input"))]
@@ -58,7 +60,7 @@ mod sleep;
 #[cfg(not(feature = "cancel-input"))]
 mod specific;
 #[cfg(not(feature = "cancel-input"))]
-mod thread_replies;
+mod tcb;
 #[cfg(not(feature = "cancel-input"))]
 mod timed;
 #[cfg(not(feature = "cancel-input"))]
@@ -114,8 +116,13 @@ fn waiting_registered(thread: &Handle<Thread>, registered: impl Fn() -> bool) ->
     let wake = sys::channel_create(30).expect("poll wake channel");
     let timer = sys::timer_create(&wake, 30).expect("poll timer");
     for _ in 0..100 {
-        if sys::thread_info(thread).is_ok_and(|info| info.state == ThreadState::AwaitingReply)
-            && registered()
+        // In a request of a service, or in receive on a channel of its own.
+        if sys::thread_info(thread).is_ok_and(|info| {
+            matches!(
+                info.state,
+                ThreadState::AwaitingReply | ThreadState::Receiving
+            )
+        }) && registered()
         {
             return true;
         }
@@ -125,6 +132,48 @@ fn waiting_registered(thread: &Handle<Thread>, registered: impl Fn() -> bool) ->
         sys::receive(&wake).expect("poll wake");
     }
     false
+}
+
+/// Whether pthread `id` waits by address within 100 ms (its node linked
+/// in a bucket, posix-sync).
+#[cfg(not(feature = "cancel-input"))]
+fn futex_blocked(id: u64) -> bool {
+    let wake = sys::channel_create(30).expect("poll wake channel");
+    let timer = sys::timer_create(&wake, 30).expect("poll timer");
+    for _ in 0..100 {
+        if threads::probe_futex_waiting(id) {
+            return true;
+        }
+        sys::timer_set(&timer, sys::clock_now().expect("poll clock") + 1_000_000)
+            .expect("poll deadline");
+        sys::receive(&wake).expect("poll wake");
+    }
+    false
+}
+
+#[cfg(not(feature = "cancel-input"))]
+static REUSED_SIGNALLED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(feature = "cancel-input"))]
+unsafe extern "C" fn reused_signal(_: i32) {
+    REUSED_SIGNALLED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Made after main was joined: waits up to 1 s for its signal, then
+/// returns 0x55.
+#[cfg(not(feature = "cancel-input"))]
+unsafe extern "C" fn after_main(_: *mut c_void) -> *mut c_void {
+    let pause = abi::metadata::Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    for _ in 0..1000 {
+        if REUSED_SIGNALLED.load(Ordering::SeqCst) != 0 {
+            break;
+        }
+        let _ = unsafe { threads::sleep::nanosleep(&pause, ptr::null_mut()) };
+    }
+    0x55 as *mut c_void
 }
 
 #[cfg(not(feature = "cancel-input"))]
@@ -144,9 +193,76 @@ unsafe extern "C" fn last_thread(_: *mut c_void) -> *mut c_void {
     if unsafe { abi::open(c"/etc/motd".as_ptr(), O_RDONLY) } < 0 {
         sys::process_exit(72);
     }
+    // A thread made after main was joined has a block of its own: its
+    // signal and its value are its, not main's.
+    let action = abi::signals::SigAction {
+        handler: reused_signal as *const () as u64,
+        mask: 0,
+        flags: 0,
+    };
+    let mut reused = 0;
+    let mut value = ptr::null_mut();
+    if unsafe { abi::signals::sigaction(SIGUSR2, &action, ptr::null_mut()) } != 0
+        || unsafe {
+            threads::pthread_create(&mut reused, ptr::null(), Some(after_main), ptr::null_mut())
+        } != 0
+        || abi::signals::pthread_kill(reused, SIGUSR2) != 0
+        || unsafe { threads::pthread_join(reused, &mut value) } != 0
+        || value as usize != 0x55
+        || REUSED_SIGNALLED.load(Ordering::SeqCst) != 1
+    {
+        rt::println!(
+            "posix-thread-probe: after main, value {:#x}, signalled {}",
+            value as usize,
+            REUSED_SIGNALLED.load(Ordering::SeqCst)
+        );
+        sys::process_exit(73);
+    }
     rt::println!("posix-thread-probe: main exit and last application thread ok");
     rt::println!("posix-thread-probe: ok");
     ptr::null_mut()
+}
+
+/// The channels that fill the table of handles (`fill_handles`).
+#[cfg(not(feature = "cancel-input"))]
+static HELD: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+
+/// The table of handles filled with channels until `channel_create`
+/// fails; they close when it drops.
+#[cfg(not(feature = "cancel-input"))]
+struct Filled(usize);
+#[cfg(not(feature = "cancel-input"))]
+impl Filled {
+    /// Whether the table filled before the room of HELD did.
+    fn full(&self) -> bool {
+        self.0 != 0 && self.0 != HELD.len()
+    }
+    /// Gives back the last channel.
+    fn release_last(&mut self) {
+        self.0 -= 1;
+        let raw = HELD[self.0].swap(0, Ordering::Relaxed);
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    }
+}
+#[cfg(not(feature = "cancel-input"))]
+impl Drop for Filled {
+    fn drop(&mut self) {
+        while self.0 != 0 {
+            self.release_last();
+        }
+    }
+}
+#[cfg(not(feature = "cancel-input"))]
+fn fill_handles() -> Filled {
+    let mut count = 0;
+    while count < HELD.len() {
+        let Ok(channel) = sys::channel_create(1) else {
+            break;
+        };
+        HELD[count].store(channel.into_raw().0, Ordering::Relaxed);
+        count += 1;
+    }
+    Filled(count)
 }
 
 fn failed(stage: usize) -> bool {
@@ -154,26 +270,27 @@ fn failed(stage: usize) -> bool {
     false
 }
 
-/// The thread owner, the heap and file workers and the sleep timer all sit
-/// at the process ceiling, which the init table puts one above main.
+/// The holders of the locks of the heap and of the files run at the
+/// process ceiling, which the init table puts one above main; the process
+/// has no helper thread.
 #[cfg(not(feature = "cancel-input"))]
 fn priorities() -> bool {
     let main = MAIN_BASE.load(Ordering::Acquire) as u8;
-    let (owner, timer) = threads::probe_owner_levels();
-    let heap = abi::allocation::probe_worker_base();
-    let files = abi::shared::probe_worker_base();
-    if owner != main + 1 || timer != owner || heap != owner || files != owner {
+    let me = unsafe { threads::probe_native(threads::pthread_self()) }.expect("own handle");
+    let level = || sys::thread_info(&me).map_or(0, |info| info.base);
+    let (mut heap, mut files) = (0, 0);
+    abi::allocation::probe_hold(|| heap = level());
+    abi::shared::probe_hold(|| files = level());
+    if heap != main + 1 || files != heap || level() != main {
         rt::println!(
-            "posix-thread-probe: main {} owner {} timer {} heap {} files {}",
+            "posix-thread-probe: main {} heap {} files {}",
             main,
-            owner,
-            timer,
             heap,
             files
         );
         return failed(451);
     }
-    rt::println!("priority-probe: owner, heap, files and sleep timer at the ceiling above main");
+    rt::println!("priority-probe: heap and files at the ceiling above main, no helper thread");
     true
 }
 
@@ -195,6 +312,9 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     rt::println!(
         "process-identity-probe: Rust PID/PPID match the process service's record and preserve errno"
     );
+    if !one_thread::run() {
+        return false;
+    }
     if !priorities() {
         return false;
     }
@@ -205,9 +325,6 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let mut value = ptr::null_mut();
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 123 };
-    // Interrupt after CREATE committed, after JOIN produced its value, and
-    // after JOIN_ACK released the ID. Retries must preserve exactly one child.
-    threads::probe_interrupt_replies(true, true, true);
     if unsafe {
         threads::pthread_create(
             &mut child,
@@ -226,7 +343,7 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     if unsafe { threads::pthread_join(child, ptr::null_mut()) } != ESRCH {
         return failed(2);
     }
-    rt::println!("posix-thread-probe: interrupted committed replies preserve result and identity");
+    rt::println!("posix-thread-probe: a joined thread gives its value and keeps errno");
     // A thread that ends past the library is joined once the kernel tells
     // the owner of its end: the owner polls no thread state on a timer.
     let mut past = 0;
@@ -254,23 +371,13 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     let baseline = sys::process_handles(&process)
         .expect("handle baseline")
         .live;
-    let mut held: [Option<Handle<Channel>>; 128] = core::array::from_fn(|_| None);
-    let mut count = 0;
-    while count < held.len() {
-        match sys::channel_create(1) {
-            Ok(channel) => {
-                held[count] = Some(channel);
-                count += 1;
-            }
-            Err(_) => break,
-        }
-    }
-    if count == 0 || count == held.len() {
+    let mut held = fill_handles();
+    if !held.full() {
         return failed(3);
     }
     // Leave one handle slot for the stack memory, forcing thread_create to
     // fail after the stack has actually been mapped by the real owner.
-    held[count - 1] = None;
+    held.release_last();
     let occupied = sys::process_handles(&process)
         .expect("occupied handles")
         .live;
@@ -356,7 +463,12 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
     }
     rt::println!("posix-thread-probe: live join interruption retries without EINTR");
 
-    if !clocks::run(clocks)
+    if !tcb::run()
+        || !futex::run()
+        || !blocks::run()
+        || !heap_lock::run()
+        || !long::run(parent)
+        || !clocks::run(clocks)
         || !capacity::run()
         || !specific::run()
         || !once::run()
@@ -366,19 +478,28 @@ fn run(clocks: &clocks::Peers, parent: &Handle<Channel>) -> bool {
         || !upcall::run()
         || !borrow_guards::run(parent)
         || !reentry::run()
-        || !file_replies::run()
-        || !thread_replies::run()
-        || !clock_replies::run(parent)
-        || !heap_replies::run()
         || !signals::run()
         || !signal_context::run()
         || !signal_wait::run()
-        || !signal_timed::run()
         || !cancellation::run()
     {
         return false;
     }
 
+    // A thread that ends past the library and that nobody joins: the
+    // process still ends with its last application thread.
+    let mut unjoined = 0;
+    if unsafe {
+        threads::pthread_create(
+            &mut unjoined,
+            ptr::null(),
+            Some(past_the_library),
+            ptr::null_mut(),
+        )
+    } != 0
+    {
+        return failed(14);
+    }
     if unsafe {
         threads::pthread_create(&mut child, ptr::null(), Some(last_thread), ptr::null_mut())
     } != 0
@@ -424,22 +545,20 @@ fn main(_: u64) -> u64 {
             return 6;
         }
     }
-    if unsafe { abi::shared::init(&start.process, files) }.is_err()
+    if unsafe { abi::shared::init(files) }.is_err()
         || unsafe { abi::allocation::init(start.process) }.is_err()
         || unsafe { threads::init(start.thread) }.is_err()
     {
         return 3;
     }
-    let passed = tls::with_thread(1, || {
-        #[cfg(feature = "cancel-input")]
-        {
-            input::run()
-        }
-        #[cfg(not(feature = "cancel-input"))]
-        {
-            run(&clocks, &start.parent)
-        }
-    });
+    // SAFETY: the main page is this thread's for its life.
+    if unsafe { threads::attach(tls::main_page(), posix_thread::PAGE_SIZE, 1) }.is_err() {
+        return 3;
+    }
+    #[cfg(feature = "cancel-input")]
+    let passed = input::run();
+    #[cfg(not(feature = "cancel-input"))]
+    let passed = run(&clocks, &start.parent);
     if !passed {
         rt::println!("posix-thread-probe: failed");
         return 4;

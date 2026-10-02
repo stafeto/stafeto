@@ -2344,6 +2344,241 @@ pub fn upcall_request_refuses_a_stopped_thread(_: &Boot) -> Result<(), &'static 
     })
 }
 
+/// A client of `client` whose request a receiver of `service` accepted and
+/// which waits for the reply (spec 6.1): what the reply-wait tests use.
+struct ReplyWait {
+    service: NonNull<Process>,
+    client: NonNull<Process>,
+    channel: NonNull<Channel>,
+    /// The receiver that took the request, and one more that waits.
+    r: NonNull<Thread>,
+    spare: NonNull<Thread>,
+    /// The client, and the token of its request.
+    t: NonNull<Thread>,
+    token: u64,
+}
+
+/// The words of a reply in x2-x9 of its sender.
+const REPLY_WORDS: [u64; 8] = [
+    0x5e_0002, 0x5e_0003, 0x5e_0004, 0x5e_0005, 0x5e_0006, 0x5e_0007, 0x5e_0008, 0x5e_0009,
+];
+
+impl ReplyWait {
+    /// Whether the client still waits for the reply from the service.
+    fn waits(&self, t: NonNull<Thread>) -> bool {
+        // SAFETY: the test holds the thread.
+        let t = unsafe { t.as_ref() };
+        t.sched.state() == State::Waiting && t.waits == Some(channel::Wait::Reply(self.service))
+    }
+
+    /// The call `reply` of `from` with REPLY_WORDS to `token`, as from
+    /// EL0 (syscall::dispatch).
+    fn reply(&self, from: NonNull<Thread>, token: u64) -> Result<(), Error> {
+        // SAFETY: the test holds the thread, which does not run.
+        let x = unsafe { &mut (*from.as_ptr()).regs.x };
+        x[0] = token;
+        x[1] = abi::INLINE_MAX as u64;
+        x[2..10].copy_from_slice(&REPLY_WORDS);
+        syscall::dispatch(from, Call::Reply.number());
+        // SAFETY: as above.
+        match unsafe { from.as_ref() }.regs.x[0] {
+            0 => Ok(()),
+            code => Err(Error::from_code(code).expect("an error of the call")),
+        }
+    }
+
+    /// Whether `t` is ready with the whole reply in x0-x9.
+    fn has_reply(&self, t: NonNull<Thread>) -> bool {
+        // SAFETY: the test holds the thread.
+        let t = unsafe { t.as_ref() };
+        t.sched.state() == State::Ready
+            && t.regs.x[0] == 0
+            && t.regs.x[1] == abi::INLINE_MAX as u64
+            && t.regs.x[2..10] == REPLY_WORDS
+    }
+}
+
+/// Builds a ReplyWait, with the client's entry bound and enabled when
+/// `entry`, runs `body` on it and lets everything go.
+fn with_reply_wait(
+    entry: bool,
+    body: impl FnOnce(&ReplyWait) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let counts = (process::in_use(), thread::in_use(), channel::in_use());
+    let made = [0; 2].map(|_| process::create_root(QUOTA, 16, CEILING));
+    let mut threads = [None; 3];
+    let result = match made {
+        [Ok(service), Ok(client)] => (|| {
+            let channel = owned_channel(service)?;
+            let r = *threads[0].insert(waiting(service, channel)?);
+            let spare = *threads[1].insert(waiting(service, channel)?);
+            let t = *threads[2].insert(running(client)?);
+            if entry {
+                // SAFETY: the thread is the test's and runs no code.
+                let upcall = unsafe { &mut (*t.as_ptr()).upcall };
+                upcall.bind(USER_VA as u64).map_err(|_| "bind failed")?;
+                upcall
+                    .control(abi::UpcallControl::Enable.raw())
+                    .map_err(|_| "enable failed")?;
+            }
+            let sent = channel::send(
+                t,
+                Via::Channel(channel),
+                Desc::from_send(0).expect("a send"),
+                &[],
+            );
+            check(sent == Ok(Some(r)), "the receiver did not take the request")?;
+            // SAFETY: the test holds the receiver.
+            let token = unsafe { r.as_ref() }.regs.x[11];
+            let w = ReplyWait {
+                service,
+                client,
+                channel,
+                r,
+                spare,
+                t,
+                token,
+            };
+            check(w.waits(t), "the client does not wait for its reply")?;
+            body(&w)
+        })(),
+        _ => Err("no process"),
+    };
+    for t in threads.into_iter().flatten() {
+        // SAFETY: the test's references go, the kernel's first.
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    for p in made.into_iter().flatten() {
+        // SAFETY: the test's reference goes.
+        unsafe { process::release(p, CAUSE) };
+    }
+    cleanup::drain();
+    result?;
+    check(
+        (process::in_use(), thread::in_use(), channel::in_use()) == counts,
+        "a process, a thread or a channel of the reply wait stayed",
+    )
+}
+
+/// thread_interrupt of a thread whose request a service accepted
+/// (sched::interrupt, spec 6.1, 11): BAD_STATE, as for a thread that waits
+/// for nothing; the thread still waits, and the reply comes whole.
+pub fn interrupt_leaves_an_accepted_request(_: &Boot) -> Result<(), &'static str> {
+    with_reply_wait(false, |w| {
+        // SAFETY: the test holds the client.
+        let result = unsafe { sched::interrupt(w.t, CAUSE) };
+        check(
+            result == Err(Error::BadState),
+            "thread_interrupt of a thread that waits for a reply was not BAD_STATE",
+        )?;
+        check(w.waits(w.t), "the interrupt took back an accepted request")?;
+        check(w.reply(w.r, w.token) == Ok(()), "the reply did not go")?;
+        check(w.has_reply(w.t), "the reply did not come whole")
+    })
+}
+
+/// thread_upcall_request of a thread that waits for a reply, its entry
+/// enabled (sched::request_upcall, spec 6.1, 11): the request stays
+/// pending and the wait goes on; the reply comes whole, and the entry comes
+/// after it, on the way to EL0, with the reply's registers as they are.
+pub fn upcall_request_waits_for_the_reply(_: &Boot) -> Result<(), &'static str> {
+    with_reply_wait(true, |w| {
+        // SAFETY: the test holds the client.
+        let result = unsafe { sched::request_upcall(w.t, CAUSE) };
+        check(result == Ok(()), "the request was refused")?;
+        check(w.waits(w.t), "the request took back an accepted request")?;
+        check(w.reply(w.r, w.token) == Ok(()), "the reply did not go")?;
+        check(w.has_reply(w.t), "the reply did not come whole")?;
+        // SAFETY: as above; the thread does not run.
+        let t = unsafe { &mut *w.t.as_ptr() };
+        let pc = t.regs.elr;
+        check(
+            t.upcall.prepare(pc, 0, false) == Some(USER_VA as u64),
+            "no entry came after the reply",
+        )?;
+        check(w.has_reply(w.t), "the entry changed the reply's registers")
+    })
+}
+
+/// A client that ends while it waits for its reply (sched::exit, spec 6.8,
+/// 7.7): its request leaves the queue of accepted requests and is marked
+/// dead, so the reply gets PEER_CLOSED, each time; once a new thread has
+/// the client's number and a request of its own accepted, the old token
+/// names nothing: BAD_STATE, and the new request waits for its own reply.
+pub fn reply_to_a_client_that_ended(_: &Boot) -> Result<(), &'static str> {
+    with_reply_wait(false, |w| {
+        let index = thread::index(w.t);
+        // SAFETY: the test holds the client; the kernel's reference goes.
+        unsafe { sched::exit(w.t, CAUSE) };
+        for _ in 0..2 {
+            check(
+                w.reply(w.r, w.token) == Err(Error::PeerClosed),
+                "the reply to a client that ended was not PEER_CLOSED",
+            )?;
+        }
+        // Every free number but the client's is taken, so the next thread
+        // gets it.
+        let mut taken = [0u16; THREADS];
+        let n = sched::locked(|k| {
+            let mut n = 0;
+            while k.tokens.available() > 1 {
+                taken[n] = k.tokens.alloc(NonNull::dangling()).expect("a free number");
+                n += 1;
+            }
+            n
+        });
+        let reused = reuse_number(w, index);
+        sched::locked(|k| taken[..n].iter().for_each(|&i| k.tokens.free(i)));
+        reused
+    })
+}
+
+/// A new thread of the client's process at 10 with number `index`: its
+/// request goes to the spare receiver, and the old token of `w` does not
+/// reach it.
+fn reuse_number(w: &ReplyWait, index: u16) -> Result<(), &'static str> {
+    let t =
+        thread::create(w.client, USER_VA, USER_VA, 0, 10, Policy::Fifo).map_err(|_| "no thread")?;
+    let result = (|| {
+        check(
+            thread::index(t) == index,
+            "the new thread did not get the number",
+        )?;
+        thread::start(t).map_err(|_| "the thread did not start")?;
+        // SAFETY: the scheduler's threads are alive.
+        let picked = sched::locked(|k| unsafe { k.s.pick(timer::now(), None) });
+        check(
+            matches!(picked, kcore::sched::Decision::Run(r) if r == t),
+            "the new thread did not run",
+        )?;
+        let desc = Desc::from_send(0).expect("a send");
+        let sent = channel::send(t, Via::Channel(w.channel), desc, &[]);
+        check(
+            sent == Ok(Some(w.spare)),
+            "the spare receiver did not take the request",
+        )?;
+        check(
+            w.reply(w.r, w.token) == Err(Error::BadState) && w.waits(t),
+            "the old token reached the new owner of the number",
+        )?;
+        // SAFETY: the test holds the spare receiver.
+        let token = unsafe { w.spare.as_ref() }.regs.x[11];
+        check(
+            token != w.token && w.reply(w.spare, token) == Ok(()) && w.has_reply(t),
+            "the new request did not get its own reply",
+        )
+    })();
+    // SAFETY: the test's references go, the kernel's first.
+    unsafe {
+        sched::exit(t, CAUSE);
+        thread::release(t, CAUSE);
+    }
+    result
+}
+
 /// thread_upcall_return takes only the flags this processor implements
 /// (kcore::upcall::user_pstate, read once at boot): a context with DIT,
 /// TCO, SSBS or BTYPE set where ID_AA64PFR0_EL1 or ID_AA64PFR1_EL1 has no

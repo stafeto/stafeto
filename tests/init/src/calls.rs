@@ -1966,12 +1966,52 @@ fn normal_build_costs() -> Outcome {
     close(c)?;
     let [null, clock, yielded, notify, round_trip] = costs?;
     check(stopped, "the thread that replies did not stop")?;
+    let through_rt = rt_round_trip()?;
     if under_icount() {
         println!(
             "normal build ticks: null={null} clock={clock} yield={yielded} notify={notify} round_trip={round_trip}"
         );
+        println!("rt round trip ticks: round_trip={through_rt}");
     }
     Ok(())
+}
+
+/// The round trip of `normal_build_costs` through the code of rt on both
+/// sides, as a client and a service make it: sys::send and the bytes of
+/// its reply; sys::receive, a Writer for the reply and Token::reply. The
+/// difference from the raw row is what rt costs on a round trip.
+fn rt_round_trip() -> Result<u64, &'static str> {
+    let s = channel(QUIET)?;
+    let t = spawn(0, rt_echo_until_empty, s.raw().0, HIGH, Policy::Fifo)?;
+    let empty = least(&mut || true)?;
+    let mut buffer = [0; abi::MESSAGE_MAX];
+    let row = least(&mut || {
+        sys::send(&s, &COST_BYTES).is_ok_and(|reply| reply.bytes(&mut buffer) == COST_BYTES)
+    });
+    let stopped = sys::send(&s, &[]).is_ok();
+    close(t)?;
+    close(s)?;
+    check(stopped, "the thread that replies through rt did not stop")?;
+    Ok(row?.saturating_sub(empty))
+}
+
+/// As `echo_until_empty`, through the code of rt: receive, a Writer with
+/// the request's bytes, reply.
+extern "C" fn rt_echo_until_empty(h: u64) -> ! {
+    let channel = Handle::<Channel>::borrowed(abi::Handle(h));
+    while let Ok(sys::Received::Message {
+        len, words, token, ..
+    }) = sys::receive(&channel)
+    {
+        let mut reply = proto_wire::Writer::new();
+        if reply.bytes(&abi::inline_bytes(&words)[..len]).is_err()
+            || token.reply(reply.as_bytes()).is_err()
+            || len == 0
+        {
+            break;
+        }
+    }
+    sys::thread_exit()
 }
 
 /// The rows of `normal_build_costs`, in the order of its line, through

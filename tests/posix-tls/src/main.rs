@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Native guest threads retain distinct errno and share a process heap.
+//! Native guest threads retain distinct errno and share a process heap. A
+//! thread the layer did not attach gets a TCB in relibc's layout for its
+//! outermost scope (posix-thread): the register names its ABI word, the
+//! word the TCB, errno lies in the block 32 bytes on, and the register is
+//! 0 again after the scope; a nested scope keeps the block and gives the
+//! outer errno back.
 
 #![no_std]
 #![no_main]
@@ -18,6 +23,24 @@ static POINTER: AtomicUsize = AtomicUsize::new(0);
 static DONE: AtomicUsize = AtomicUsize::new(0);
 static FAILURE: AtomicUsize = AtomicUsize::new(0);
 
+/// Whether the register, the ABI word, the TCB and the block chain up,
+/// errno in the block.
+fn chained() -> bool {
+    let word = posix_thread::thread_pointer();
+    if word == 0 {
+        return false;
+    }
+    // SAFETY: the register names this thread's ABI word.
+    let tcb = unsafe { *(word as *const usize) };
+    // SAFETY: the word names the TCB; relibc owns its first four words.
+    let generic = unsafe { *(tcb as *const [usize; 4]) };
+    let errno = unsafe { __errno_location() } as usize;
+    tcb == word + posix_thread::TCB_OFFSET
+        && generic[..3] == [tcb, 0, tcb]
+        && errno
+            == tcb + posix_thread::BLOCK_OFFSET + core::mem::offset_of!(posix_thread::Block, errno)
+}
+
 fn failed(code: usize) -> bool {
     FAILURE.store(code, Ordering::Release);
     false
@@ -28,6 +51,9 @@ static RETURNED: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" fn worker(done_channel: u64) -> ! {
     let passed = tls::with_errno(|| {
+        if !chained() {
+            return failed(19);
+        }
         // SAFETY: this worker's TLS scope is live for all accesses.
         let pointer = unsafe { __errno_location() };
         POINTER.store(pointer as usize, Ordering::Release);
@@ -91,7 +117,13 @@ fn main(_: u64) -> u64 {
     {
         return 3;
     }
+    if posix_thread::thread_pointer() != 0 {
+        return 4;
+    }
     let passed = tls::with_errno(|| {
+        if !chained() {
+            return failed(20);
+        }
         // SAFETY: the initial thread's errno exists in this scope.
         let pointer = unsafe { __errno_location() };
         unsafe { *pointer = constants::EIO };
@@ -103,10 +135,13 @@ fn main(_: u64) -> u64 {
             unsafe { transfer.add(index).write(index as u8) };
         }
         TRANSFER.store(transfer as usize, Ordering::Release);
+        // A nested scope keeps the block; its errno starts at 0 and the
+        // outer value comes back after it.
         let nested = tls::with_errno(|| {
             let other = unsafe { __errno_location() };
+            let fresh = unsafe { *other } == 0;
             unsafe { *other = constants::ENOENT };
-            other != pointer
+            other == pointer && fresh
         });
         if !nested
             || unsafe { __errno_location() } != pointer
@@ -170,6 +205,10 @@ fn main(_: u64) -> u64 {
         unsafe { free(output) };
         (unsafe { *pointer }) == constants::EIO
     });
+    if passed && posix_thread::thread_pointer() != 0 {
+        rt::println!("posix-tls-probe: the register stays set after the scope");
+        return 5;
+    }
     if passed {
         rt::println!("posix-tls-probe: ok");
         0

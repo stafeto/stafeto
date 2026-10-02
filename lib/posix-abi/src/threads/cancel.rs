@@ -3,13 +3,17 @@
 
 //! Deferred cancellation at C ABI boundaries. Rust operations return and drop
 //! their owned resources before cancellation invokes user cleanup handlers.
+//! The request and the state live in the thread's block (posix-thread:
+//! CANCEL_PENDING, CANCEL_DISABLED, EXITING); a point checks before it waits
+//! and after a wait that ended by an entry or bit CANCEL of its channel.
 
 use crate::constants::*;
 use core::{
     ffi::c_void,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
+use posix_thread::flag;
 
 pub const CANCELED: *mut c_void = usize::MAX as *mut c_void;
 type Routine = unsafe extern "C" fn(*mut c_void);
@@ -40,56 +44,56 @@ const _: () = {
 };
 
 pub(super) struct State {
-    pub(super) pending: AtomicBool,
-    pub(super) enabled: AtomicBool,
     pub(super) active: AtomicU64,
     generation: AtomicU64,
-    exiting: AtomicBool,
     cleanup: AtomicPtr<Cleanup>,
-    #[cfg(feature = "transport-probe")]
-    pub(super) console: AtomicBool,
+    #[cfg(feature = "thread-probe")]
+    pub(super) console: core::sync::atomic::AtomicBool,
 }
 impl State {
     pub(super) const fn new() -> Self {
         Self {
-            pending: AtomicBool::new(false),
-            enabled: AtomicBool::new(true),
             active: AtomicU64::new(0),
             generation: AtomicU64::new(0),
-            exiting: AtomicBool::new(false),
             cleanup: AtomicPtr::new(ptr::null_mut()),
-            #[cfg(feature = "transport-probe")]
-            console: AtomicBool::new(false),
+            #[cfg(feature = "thread-probe")]
+            console: core::sync::atomic::AtomicBool::new(false),
         }
     }
     pub(super) fn reset(&self) {
-        self.pending.store(false, Ordering::Relaxed);
-        self.enabled.store(true, Ordering::Relaxed);
         self.active.store(0, Ordering::Relaxed);
         self.generation.store(0, Ordering::Relaxed);
-        self.exiting.store(false, Ordering::Relaxed);
         self.cleanup.store(ptr::null_mut(), Ordering::Relaxed);
-        #[cfg(feature = "transport-probe")]
+        #[cfg(feature = "thread-probe")]
         self.console.store(false, Ordering::Relaxed);
     }
     fn requested(&self) -> bool {
-        self.pending.load(Ordering::SeqCst) && self.enabled.load(Ordering::SeqCst)
+        requested()
     }
+}
+
+fn flags() -> Option<&'static core::sync::atomic::AtomicU32> {
+    // SAFETY: a managed thread's block lives as long as the thread.
+    unsafe { posix_thread::block().as_ref() }.map(|block| &block.flags)
 }
 
 fn state() -> Option<&'static State> {
     super::current_launch().map(|launch| &launch.cancel)
 }
 
-pub(super) fn requested() -> bool {
-    state().is_some_and(State::requested)
+/// Whether cancellation was asked for and is enabled.
+pub fn requested() -> bool {
+    flags().is_some_and(|flags| {
+        flags.load(Ordering::SeqCst) & (flag::CANCEL_PENDING | flag::CANCEL_DISABLED)
+            == flag::CANCEL_PENDING
+    })
 }
 
 /// Stack-owned prior state for an interrupted caller's cancellation window.
 struct Frame {
     state: &'static State,
     previous: u64,
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "thread-probe")]
     console: bool,
 }
 /// An explicit cancellation window. Close windows in nesting order at the C
@@ -106,7 +110,7 @@ impl Point {
             // A signal handler may enter another cancellation point on this
             // thread. Its return must retain the interrupted caller's window.
             let previous = state.active.swap(generation, Ordering::SeqCst);
-            #[cfg(feature = "transport-probe")]
+            #[cfg(feature = "thread-probe")]
             let console = state.console.swap(false, Ordering::AcqRel);
             if state.requested() {
                 terminate();
@@ -114,7 +118,7 @@ impl Point {
             Frame {
                 state,
                 previous,
-                #[cfg(feature = "transport-probe")]
+                #[cfg(feature = "thread-probe")]
                 console,
             }
         });
@@ -125,7 +129,7 @@ impl Point {
     }
     pub(crate) fn end(self) {
         if let Some(frame) = self.0 {
-            #[cfg(feature = "transport-probe")]
+            #[cfg(feature = "thread-probe")]
             frame.state.console.store(frame.console, Ordering::Release);
             frame.state.active.store(frame.previous, Ordering::SeqCst);
         }
@@ -149,9 +153,10 @@ pub(super) fn terminate() -> ! {
 /// Every linked node and callback remains live until removed by this thread.
 pub(super) unsafe fn exit_cleanup() {
     let state = state().expect("managed exit cleanup");
-    state.enabled.store(false, Ordering::SeqCst);
+    flags()
+        .expect("managed exit cleanup")
+        .fetch_or(flag::CANCEL_DISABLED | flag::EXITING, Ordering::SeqCst);
     state.active.store(0, Ordering::SeqCst);
-    state.exiting.store(true, Ordering::Release);
     loop {
         let node = state.cleanup.load(Ordering::Relaxed);
         if node.is_null() {
@@ -171,20 +176,22 @@ pub(super) unsafe fn exit_cleanup() {
 /// The current thread is initialized; old is null or writable for one int.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_setcancelstate(value: i32, old: *mut i32) -> i32 {
-    let Some(state) = state() else {
+    let Some(flags) = flags() else {
         return EINVAL;
     };
     if !matches!(value, PTHREAD_CANCEL_ENABLE | PTHREAD_CANCEL_DISABLE)
-        || (value == PTHREAD_CANCEL_ENABLE && state.exiting.load(Ordering::Acquire))
+        || (value == PTHREAD_CANCEL_ENABLE && flags.load(Ordering::Acquire) & flag::EXITING != 0)
     {
         return EINVAL;
     }
-    let was = state
-        .enabled
-        .swap(value == PTHREAD_CANCEL_ENABLE, Ordering::SeqCst);
+    let was = if value == PTHREAD_CANCEL_ENABLE {
+        flags.fetch_and(!flag::CANCEL_DISABLED, Ordering::SeqCst)
+    } else {
+        flags.fetch_or(flag::CANCEL_DISABLED, Ordering::SeqCst)
+    };
     if !old.is_null() {
         unsafe {
-            old.write(if was {
+            old.write(if was & flag::CANCEL_DISABLED == 0 {
                 PTHREAD_CANCEL_ENABLE
             } else {
                 PTHREAD_CANCEL_DISABLE
@@ -267,7 +274,7 @@ pub unsafe extern "C" fn __stafeto_cleanup_pop(node: *mut Cleanup, execute: i32)
 
 /// Observe the console phase only in guest probes; regular builds contain no hook.
 pub(crate) fn console_wait() {
-    #[cfg(feature = "transport-probe")]
+    #[cfg(feature = "thread-probe")]
     if let Some(state) = state() {
         state.console.store(true, Ordering::Release);
     }

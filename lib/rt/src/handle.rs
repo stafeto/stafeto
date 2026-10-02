@@ -160,6 +160,9 @@ impl Incoming {
     /// The `count` handles the kernel wrote into the calling thread's
     /// message buffer with the message that came last (msgbuf::handle).
     pub(crate) fn from_buffer(count: usize) -> Incoming {
+        if count == 0 {
+            return Incoming::none();
+        }
         let mut incoming = Incoming::none();
         incoming.count = count.min(MESSAGE_HANDLES);
         for i in 0..incoming.count {

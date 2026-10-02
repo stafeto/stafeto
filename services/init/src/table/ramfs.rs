@@ -58,10 +58,10 @@ pub const TABLE: &[Record] = &[
 ];
 
 /// A POSIX process: main at the probe's level, the ceiling one above it,
-/// room for the helper threads of `posix-abi`: its thread owner, heap and
-/// file workers and sleep timer run at the ceiling, so an application
-/// thread at main's level never delays them. Programs on `posix-bridge`
-/// (`cprobe`, `busybox-probe`) have no such threads and leave it empty.
+/// where the holders of the locks of `posix-abi` (buckets, heap, files,
+/// threads, actions) run, so an application thread at main's level never
+/// delays them. Programs on `posix-bridge` (`cprobe`, `busybox-probe`)
+/// share the record and its ceiling.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
     ..TABLE[1]
@@ -102,8 +102,7 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix",
         program: "posix-process-service",
         quota: 256 * PAGE,
-        // A process handle for each of its 256 records, and a session of
-        // each besides in the probe of its bound (transport-probe).
+        // A process handle for each of its 256 records.
         handle_limit: 1024,
         restart: Restart::Never,
         ..TABLE[0]
@@ -127,10 +126,79 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
         name: "posix-abi-probe",
         program: "posix-abi-probe",
         args: b"posix-abi-probe\0argument\0",
-        connects: &["ramfs", "clock", "clock-peer", "posix"],
+        connects: &["ramfs", "clock", "clock-peer", "posix", "long"],
         quota: 2048 * PAGE,
-        handle_limit: 128,
+        // Each pthread holds five handles: its thread, its own copy with
+        // MANAGE, its channel, its timer (posix-sync) and its exit channel;
+        // two more while set_level makes the new channel and timer. 63
+        // pthreads take 315 besides main's and the layer's.
+        handle_limit: 512,
         root: true,
         ..POSIX
     },
+    // The service of long operations in two steps (tests/svc, role `l`)
+    // for the probe of reads in two steps; at 50, above the clock service,
+    // so that what the clock tells it (STORM) runs it before the clock's
+    // reply.
+    Record {
+        name: "long",
+        priority: 50,
+        ceiling: 50,
+        ..LONG
+    },
+];
+
+/// The service of long operations of rtbench 2 (tests/svc, role `l`)
+/// under the name of the console's driver: standard input of the
+/// benchmark reads from it. Above the benchmark's ceiling, as a service.
+pub const LONG: Record = Record {
+    name: "uart",
+    program: "svc",
+    quota: 16 * PAGE,
+    handle_limit: 16,
+    restart: Restart::Never,
+    args: b"l",
+    ..TABLE[0]
+};
+
+/// The hostile load of rtbench 2 (tests/rtbench-load): a service whose
+/// worker at level 5 makes and kills processes of 128 threads and large
+/// memory objects; the benchmark asks it for its rounds at its end.
+pub const LOAD: Record = Record {
+    name: "rtbench-load",
+    program: "rtbench-load",
+    quota: 2048 * PAGE,
+    handle_limit: 32,
+    restart: Restart::Never,
+    connects: &[],
+    ..TABLE[0]
+};
+
+/// rtbench 2 (tests/rtbench-posix): a POSIX process with main at 30, its
+/// threads from 10 to 30 under the ceiling 31 of the layer's helpers.
+pub const RTBENCH: Record = Record {
+    name: "rtbench-posix",
+    program: "rtbench-posix",
+    args: b"rtbench-posix\0",
+    connects: &["ramfs", "clock", "posix", "uart", "rtbench-load"],
+    quota: 2048 * PAGE,
+    handle_limit: 512,
+    root: true,
+    ..POSIX
+};
+
+/// The image of rtbench 2 on QEMU: the PL011's driver under another name,
+/// for the console alone, the RAM files, the process and clock services,
+/// the service of long operations, the load and the benchmark.
+pub const RTBENCH_POSIX_TABLE: &[Record] = &[
+    Record {
+        name: "console",
+        ..super::normal::TABLE[0]
+    },
+    TABLE[0],
+    POSIX_ABI_TABLE[1],
+    POSIX_ABI_TABLE[2],
+    LONG,
+    LOAD,
+    RTBENCH,
 ];

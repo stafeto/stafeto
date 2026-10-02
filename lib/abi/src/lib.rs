@@ -278,8 +278,10 @@ pub enum Call {
     // 29 went with console_poll (the Virtio console of the VZ build moved
     // into a service); a retired number is never given again and fails
     // with INVALID_ARGS as an unknown one does (spec 11).
-    /// Interrupt the current IPC wait of x0, a thread with MANAGE.
-    /// Wakes it with Interrupted; BadState if it is not waiting in IPC.
+    /// Interrupt the current send or receive of x0, a thread with MANAGE:
+    /// wakes it with Interrupted. BadState if it waits in neither; a wait
+    /// for the reply to an accepted request is not taken back, and the
+    /// reply comes once (spec 6.1).
     ThreadInterrupt = 30,
     /// Register the current thread's upcall entry (zero disables it).
     ThreadUpcallBind = 31,
@@ -288,7 +290,10 @@ pub enum Call {
     /// execution. x1 returns the previous mask; TAKE returns PC in x2 and
     /// PSTATE in x3.
     ThreadUpcallControl = 32,
-    /// Request an upcall through a MANAGE thread handle.
+    /// Request an upcall through a MANAGE thread handle. An enabled
+    /// request ends a send or receive as ThreadInterrupt does; a wait for
+    /// the reply to an accepted request is not taken back, and the entry
+    /// comes after the reply.
     ThreadUpcallRequest = 33,
     /// Restore the current EL0 context from its reserved message-buffer area.
     ThreadUpcallReturn = 34,
@@ -386,10 +391,16 @@ pub const INLINE_MAX: usize = 64;
 pub fn inline_words(bytes: &[u8]) -> [u64; 8] {
     assert!(bytes.len() <= INLINE_MAX, "x2-x9 carry at most 64 bytes");
     let mut words = [0; 8];
-    for (i, chunk) in bytes.chunks(8).enumerate() {
-        let mut word = [0; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        words[i] = u64::from_le_bytes(word);
+    let (whole, tail) = bytes.as_chunks::<8>();
+    // Whole words as loads, the tail byte by byte: no call of memcpy for
+    // a few bytes.
+    for (word, chunk) in words.iter_mut().zip(whole) {
+        *word = u64::from_le_bytes(*chunk);
+    }
+    if let Some(word) = words.get_mut(whole.len()) {
+        for (i, byte) in tail.iter().enumerate() {
+            *word |= u64::from(*byte) << (8 * i);
+        }
     }
     words
 }
@@ -397,8 +408,8 @@ pub fn inline_words(bytes: &[u8]) -> [u64; 8] {
 /// The bytes that x2-x9 carry, in the order of `inline_words`.
 pub fn inline_bytes(words: &[u64; 8]) -> [u8; INLINE_MAX] {
     let mut bytes = [0; INLINE_MAX];
-    for (chunk, word) in bytes.chunks_mut(8).zip(words) {
-        chunk.copy_from_slice(&word.to_le_bytes());
+    for (chunk, word) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(words) {
+        *chunk = word.to_le_bytes();
     }
     bytes
 }

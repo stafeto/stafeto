@@ -6,7 +6,6 @@
 //! gave (proto_process): init puts it in the start data of a process under
 //! the name `posix`, and Child gives one for a native child.
 #![no_std]
-use core::sync::atomic::{AtomicU64, Ordering};
 use proto_process::{Change, Credentials, Method};
 use proto_wire::{Reader, Status, Writer};
 use rt::{
@@ -14,7 +13,6 @@ use rt::{
     handle::{Channel, Handle, Process},
     sys,
 };
-static NEXT: AtomicU64 = AtomicU64::new(1);
 /// The name of the session in the start data of a process: the name of
 /// the service, since `process` names the process's own handle.
 pub const START_NAME: &str = "posix";
@@ -154,24 +152,11 @@ impl Client {
         let mut buffer = [0; 64];
         Self::snapshot(self.call(&Method::Query.header().bytes(), &mut buffer)?)
     }
+    /// Change: the service changes the record's credentials once, whatever
+    /// signals come while the caller waits for the reply.
     pub fn change(&self, operation: Change, id: u32) -> Result<(), Status> {
-        let nonce = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Status::from_code(proto_process::FULL))?;
-        let result = self.change_retained(nonce, operation, id);
-        // Error outcomes are also retained; acknowledge before returning the status.
-        if !matches!(
-            result,
-            Err(Status::Kernel(_) | Status::BadSize | Status::BadVersion | Status::UnknownMethod)
-        ) {
-            self.ack(nonce)?;
-        }
-        result
-    }
-    pub fn change_retained(&self, nonce: u64, operation: Change, id: u32) -> Result<(), Status> {
         let mut w = Writer::new();
         Method::Change.header().write(&mut w)?;
-        w.u64(nonce)?;
         w.u32(operation as u32)?;
         w.u32(id)?;
         let mut buffer = [0; 64];
@@ -181,144 +166,13 @@ impl Client {
         }
         Ok(())
     }
-    pub fn ack(&self, nonce: u64) -> Result<(), Status> {
-        let mut w = Writer::new();
-        Method::Ack.header().write(&mut w)?;
-        w.u64(nonce)?;
-        let mut buffer = [0; 64];
-        let bytes = self.call(w.as_bytes(), &mut buffer)?;
-        if bytes != proto_wire::reply(Status::Ok) {
-            return Err(Status::BadSize);
-        }
-        Ok(())
-    }
-    #[cfg(feature = "transport-probe")]
-    pub fn interrupt(
-        &self,
-        thread: &Handle<rt::handle::Thread>,
-        method: Method,
-    ) -> Result<(), Status> {
-        let mut w = Writer::new();
-        proto_wire::Header {
-            version: proto_process::VERSION,
-            method: 6,
-        }
-        .write(&mut w)?;
-        w.u32(method as u32)?;
-        let copy = sys::handle_duplicate(thread, Rights::MANAGE | Rights::TRANSFER)?;
-        let reply = sys::send_handles(&self.channel, w.as_bytes(), [copy.erase()])
-            .map_err(|e| Status::Kernel(e.error))?;
-        let mut buffer = [0; 64];
-        if reply.len > 64 {
-            return Err(Status::BadSize);
-        }
-        buffer.copy_from_slice(&rt::abi::inline_bytes(&reply.words));
-        let bytes = &buffer[..reply.len];
-        if !reply.handles.is_empty() || bytes != proto_wire::reply(Status::Ok) {
-            return Err(Status::BadSize);
-        }
-        Ok(())
-    }
-    /// Child with a copy of `child` with `rights` and TRANSFER (the probe
-    /// of the right the service checks).
-    #[cfg(feature = "transport-probe")]
+    /// Child with a copy of `child` with `rights` and TRANSFER: the service
+    /// takes one with MANAGE alone.
     pub fn child_with(
         &self,
         child: &Handle<Process>,
         rights: Rights,
     ) -> Result<(Snapshot, Handle<Channel>), Status> {
         self.register_with(Method::Child, &[], child, rights)
-    }
-    /// A session of the service with `label`, which names no record (the
-    /// probe of a session the service did not give).
-    #[cfg(feature = "transport-probe")]
-    pub fn forge(&self, label: u64) -> Result<Handle<Channel>, Status> {
-        let mut w = Writer::new();
-        proto_wire::Header {
-            version: proto_process::VERSION,
-            method: 10,
-        }
-        .write(&mut w)?;
-        w.u64(label)?;
-        let mut reply = sys::send(&self.channel, w.as_bytes())?;
-        let mut buffer = [0; 64];
-        if reply.len > 64 {
-            return Err(Status::BadSize);
-        }
-        buffer.copy_from_slice(&rt::abi::inline_bytes(&reply.words));
-        let bytes = &buffer[..reply.len];
-        let status = Status::from_code(Reader::new(bytes).u32()?);
-        if status != Status::Ok {
-            return Err(status);
-        }
-        reply.handles.take(0).map_err(|_| Status::BadSize)
-    }
-    /// With `process`, the service fills its free records with copies of
-    /// it and keeps their sessions; without, it lets them go. The records
-    /// it made, 0 for a release.
-    #[cfg(feature = "transport-probe")]
-    pub fn fill(&self, process: Option<&Handle<Process>>) -> Result<u32, Status> {
-        let mut w = Writer::new();
-        proto_wire::Header {
-            version: proto_process::VERSION,
-            method: 11,
-        }
-        .write(&mut w)?;
-        w.u32(u32::from(process.is_some()))?;
-        let reply = match process {
-            Some(p) => {
-                let rights = Rights::DUPLICATE | Rights::MANAGE | Rights::TRANSFER;
-                let copy = sys::handle_duplicate(p, rights)?;
-                sys::send_handles(&self.channel, w.as_bytes(), [copy.erase()])
-                    .map_err(|e| Status::Kernel(e.error))?
-            }
-            None => sys::send(&self.channel, w.as_bytes())?,
-        };
-        let mut buffer = [0; 64];
-        if reply.len > 64 || !reply.handles.is_empty() {
-            return Err(Status::BadSize);
-        }
-        buffer.copy_from_slice(&rt::abi::inline_bytes(&reply.words));
-        let mut r = Reader::new(&buffer[..reply.len]);
-        match Status::from_code(r.u32()?) {
-            Status::Ok => {}
-            status => return Err(status),
-        }
-        let made = r.u32()?;
-        r.finish()?;
-        Ok(made)
-    }
-    #[cfg(feature = "transport-probe")]
-    pub fn stats(&self) -> Result<[u64; 5], Status> {
-        let w = proto_wire::Header {
-            version: proto_process::VERSION,
-            method: 7,
-        }
-        .bytes();
-        let mut buffer = [0; 64];
-        let mut r = Reader::new(self.call(&w, &mut buffer)?);
-        r.u32()?;
-        let mut values = [0; 5];
-        for value in &mut values {
-            *value = r.u64()?;
-        }
-        r.finish()?;
-        Ok(values)
-    }
-    #[cfg(feature = "transport-probe")]
-    pub fn control(&self, method: u16, on: bool) -> Result<(), Status> {
-        let mut w = Writer::new();
-        proto_wire::Header {
-            version: proto_process::VERSION,
-            method,
-        }
-        .write(&mut w)?;
-        w.u32(u32::from(on))?;
-        let mut buffer = [0; 64];
-        let bytes = self.call(w.as_bytes(), &mut buffer)?;
-        if bytes != proto_wire::reply(Status::Ok) {
-            return Err(Status::BadSize);
-        }
-        Ok(())
     }
 }

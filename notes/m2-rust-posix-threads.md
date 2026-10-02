@@ -75,12 +75,13 @@ Another 32 create/join cycles verify complete native resource reclamation.
 A live joiner is interrupted three times while its target waits on a gate;
 it must keep waiting, then return the original result after target release.
 Main exits first; the remaining child joins main, uses files and allocation,
-and exits. Init must observe process exit code 0 despite the internal owners.
+and exits. Init must observe process exit code 0; the layer has no helper threads.
 
 cargo xtask posix-threads-vz runs this probe on Apple Virtualization.framework.
 The QEMU lifecycle probe is also included in cargo xtask test and ci.
-Probe-only native-handle access and reply interruption use transport-probe;
-they are absent from the normal sysroot library.
+Probe-only native-handle access uses the thread-probe feature of posix-abi;
+it is absent from the normal sysroot library. The reply-interruption hooks
+went with the reply journals: the kernel answers an accepted request once.
 
 ## Remaining standard work
 

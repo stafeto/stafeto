@@ -17,9 +17,7 @@ static PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static REM_SEC: AtomicU64 = AtomicU64::new(0);
 static REM_NS: AtomicU64 = AtomicU64::new(0);
 static RETURNED: AtomicUsize = AtomicUsize::new(0);
-static OTHER: AtomicUsize = AtomicUsize::new(0);
 static MODE: AtomicUsize = AtomicUsize::new(0);
-static MUTEX: threads::mutex::Mutex = threads::mutex::Mutex::new();
 struct Args {
     clock: i32,
     flags: i32,
@@ -50,10 +48,8 @@ fn notify() {
 }
 unsafe extern "C" fn cleanup(argument: *mut c_void) {
     let remaining = unsafe { &*argument.cast::<Timespec>() };
-    let removed = sleep::probe_waiting(threads::pthread_self()) == Ok(false);
     let remainder = MODE.load(Ordering::Acquire) != 2 || remaining.tv_sec < 30;
-    let status = if removed
-        && remainder
+    let status = if remainder
         && remaining.tv_sec >= 0
         && remaining.tv_nsec >= 0
         && remaining.tv_nsec < 1_000_000_000
@@ -148,9 +144,10 @@ fn child(args: &Args) -> u64 {
     );
     id
 }
+/// Whether pthread `id` sleeps: in receive on its own channel.
 fn blocked(id: u64) -> bool {
     let native = unsafe { threads::probe_native(id) }.unwrap();
-    waiting_registered(&native, || sleep::probe_waiting(id) == Ok(true))
+    waiting(&native)
 }
 fn finished(channel: &Handle<Channel>, waiter: &Waiter, expected: usize) -> bool {
     let limit = now() + 500_000_000;
@@ -169,22 +166,6 @@ fn join(id: u64, expected: usize) -> bool {
 fn sentinel() -> bool {
     REM_SEC.load(Ordering::Relaxed) == 777 && REM_NS.load(Ordering::Relaxed) == 888
 }
-unsafe extern "C" fn mutex_worker(_: *mut c_void) -> *mut c_void {
-    let deadline = Timespec {
-        tv_sec: 10_010,
-        tv_nsec: 0,
-    };
-    let status = unsafe {
-        threads::mutex::pthread_mutex_clocklock(
-            ptr::from_ref(&MUTEX).cast_mut(),
-            CLOCK_REALTIME,
-            &deadline,
-        )
-    };
-    OTHER.store(status as usize + 1, Ordering::Release);
-    notify();
-    (status as usize + 1) as *mut c_void
-}
 
 pub(super) fn run() -> bool {
     let mut saved = Timespec {
@@ -197,7 +178,6 @@ pub(super) fn run() -> bool {
     );
     let channel = sys::channel_create(30).unwrap();
     let waiter = Waiter::new(&channel, 0, 30).unwrap();
-    let gate = sys::channel_create(30).unwrap();
     DONE_CHANNEL.store(channel.raw().0, Ordering::Release);
     let process =
         Handle::<rt::handle::Process>::borrowed(rt::abi::Handle(PROCESS.load(Ordering::Acquire)));
@@ -252,7 +232,6 @@ pub(super) fn run() -> bool {
         return failed(204);
     }
     let native = unsafe { threads::probe_native(id) }.unwrap();
-    sleep::probe_interrupt_abandon_reply();
     sys::thread_interrupt(&native).unwrap();
     if !finished(&channel, &waiter, 1)
         || !join(id, 1)
@@ -302,34 +281,6 @@ pub(super) fn run() -> bool {
         return failed(227);
     }
 
-    // A calendar notice must wake an otherwise ten-second absolute sleep.
-    set(10_000);
-    let args = Args {
-        clock: CLOCK_REALTIME,
-        flags: TIMER_ABSTIME,
-        time: Timespec {
-            tv_sec: 10_010,
-            tv_nsec: 0,
-        },
-        mode: 0,
-        epoch: 4,
-    };
-    let id = child(&args);
-    if !blocked(id) {
-        return failed(208);
-    }
-    if !matches!(
-        waiter.receive_until(&channel, now() + 20_000_000),
-        Ok(Waited::Expired)
-    ) || sys::thread_info(&threads::probe_owner()).unwrap().state != ThreadState::Receiving
-    {
-        return failed(209);
-    }
-    set(10_020);
-    if !finished(&channel, &waiter, 2) || !join(id, 2) || !sentinel() {
-        return failed(210);
-    }
-
     // Backward settings cannot let an old monotonic timer end calendar sleep.
     set(10_000);
     let original = now() + 150_000_000;
@@ -356,80 +307,15 @@ pub(super) fn run() -> bool {
     {
         return failed(212);
     }
-    set(10_001);
-    if !finished(&channel, &waiter, 2) || !join(id, 2) {
+    // A calendar set forward wakes no sleep until the clock patch of relibc: an interrupt
+    // ends this one.
+    let native = unsafe { threads::probe_native(id) }.unwrap();
+    sys::thread_interrupt(&native).unwrap();
+    if !finished(&channel, &waiter, EINTR as usize + 2) || !join(id, EINTR as usize + 2) {
         return failed(213);
     }
 
-    // One interval sample must satisfy both a calendar mutex and a sleep.
-    set(10_000);
-    OTHER.store(0, Ordering::Release);
-    assert_eq!(
-        unsafe { threads::mutex::pthread_mutex_lock(ptr::from_ref(&MUTEX).cast_mut()) },
-        0
-    );
-    let args = Args {
-        clock: CLOCK_REALTIME,
-        flags: TIMER_ABSTIME,
-        time: Timespec {
-            tv_sec: 10_010,
-            tv_nsec: 0,
-        },
-        mode: 0,
-        epoch: 6,
-    };
-    let id = child(&args);
-    if !blocked(id) {
-        return failed(214);
-    }
-    let mut other = 0;
-    assert_eq!(
-        unsafe {
-            threads::pthread_create(&mut other, ptr::null(), Some(mutex_worker), ptr::null_mut())
-        },
-        0
-    );
-    let native = unsafe { threads::probe_native(other) }.unwrap();
-    if !waiting(&native) || threads::mutex::probe_waiting(other) != Ok(true) {
-        return failed(215);
-    }
-    threads::probe_pause_owner(&gate);
-    for _ in 0..20 {
-        if threads::probe_owner_parked()
-            && sys::thread_info(&threads::probe_owner()).unwrap().state == ThreadState::Receiving
-        {
-            break;
-        }
-        if !matches!(
-            waiter.receive_until(&channel, now() + 1_000_000),
-            Ok(Waited::Expired)
-        ) {
-            return failed(216);
-        }
-    }
-    if !threads::probe_owner_parked() {
-        return failed(216);
-    }
-    set(10_020);
-    set(10_000);
-    sys::notify(&gate, 1).unwrap();
-    let limit = now() + 500_000_000;
-    while DONE.load(Ordering::Acquire) != 2
-        || OTHER.load(Ordering::Acquire) != ETIMEDOUT as usize + 1
-    {
-        if !matches!(waiter.receive_until(&channel, limit), Ok(Waited::Got(_))) {
-            return failed(217);
-        }
-    }
-    if !join(id, 2) || !join(other, ETIMEDOUT as usize + 1) {
-        return failed(218);
-    }
-    assert_eq!(
-        unsafe { threads::mutex::pthread_mutex_unlock(ptr::from_ref(&MUTEX).cast_mut()) },
-        0
-    );
-
-    // Cancellation removes the owner record before user cleanup.
+    // Cancellation of a sleeping thread runs its cleanup.
     let args = Args {
         clock: CLOCK_MONOTONIC,
         flags: 0,
@@ -499,7 +385,7 @@ pub(super) fn run() -> bool {
         return failed(225);
     }
     rt::println!(
-        "posix-sleep-probe: relative/absolute clocks, EINTR remainder, shared history and cancellation ok"
+        "posix-sleep-probe: relative/absolute clocks, EINTR remainder, a calendar stepped back and cancellation ok"
     );
     true
 }

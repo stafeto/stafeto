@@ -10,9 +10,6 @@ license = "MIT"
 test = false
 bench = false
 
-[features]
-transport-probe = []
-
 [dependencies]
 proto-process = { path = "../../proto/process" }
 proto-wire = { path = "../../proto/wire" }

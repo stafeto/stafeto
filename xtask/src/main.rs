@@ -9,6 +9,7 @@ mod measure;
 mod qemu;
 mod ring;
 mod rtbench;
+mod rtbench2;
 mod symbolize;
 mod vz;
 
@@ -27,6 +28,9 @@ const INIT_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a child of the test init (tests/child), which its loader
 /// maps (rt::loader).
 const CHILD_STACK_SIZE: u32 = 16 * 1024;
+/// The main stack of a POSIX program: its requests on its files run on its
+/// own stack, under the lock of the layer, with no file worker.
+const POSIX_STACK_SIZE: u32 = 32 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
@@ -59,13 +63,48 @@ const VZ_PROGRAMS: [ImageProgram; 3] = [
     ("shell", "shell", SHELL_STACK_SIZE, &[]),
 ];
 const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE, &[])];
+/// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
+/// process and clock services, the service of long operations (`svc`,
+/// role `l`, under the name `uart`), the load, and the PL011's driver for
+/// the console.
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
+    ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+];
+/// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
+    ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
+    ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
-const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -76,11 +115,12 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
-    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+    ("posix-abi-probe", "posix-abi-probe", POSIX_STACK_SIZE, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 /// The POSIX ABI image whose process service ends before it registers:
 /// each POSIX process fails its load (`posix_orphans`).
-const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -91,30 +131,27 @@ const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
-    ("posix-abi-probe", "posix-abi-probe", CHILD_STACK_SIZE, &[]),
+    ("posix-abi-probe", "posix-abi-probe", POSIX_STACK_SIZE, &[]),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
-const POSIX_THREAD_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &["transport-probe"],
+        &["adoption-refusals"],
     ),
-    (
-        "posix-clock-service",
-        "posix-clock-service",
-        64 * 1024,
-        &["transport-probe"],
-    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &[],
     ),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
@@ -123,7 +160,7 @@ const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["cancel-input"],
     ),
 ];
@@ -172,11 +209,11 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["cancel-input"],
     ),
 ];
-const POSIX_SHARED_PROGRAMS: [ImageProgram; 6] = [
+const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
     (
@@ -190,9 +227,10 @@ const POSIX_SHARED_PROGRAMS: [ImageProgram; 6] = [
     (
         "posix-abi-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &[],
     ),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_STACK_SIZE, &[])];
 const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
@@ -202,7 +240,7 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
@@ -218,7 +256,7 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["input-probe"],
     ),
 ];
@@ -229,7 +267,7 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
 ];
@@ -245,11 +283,11 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "posix-shared-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["interrupt-probe"],
     ),
 ];
-const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
@@ -257,31 +295,27 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 7] = [
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &["transport-probe"],
+        &["adoption-refusals"],
     ),
-    (
-        "posix-clock-service",
-        "posix-clock-service",
-        64 * 1024,
-        &["transport-probe"],
-    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-clock-peer", "posix-clock-peer", 32 * 1024, &[]),
     (
         "posix-abi-probe",
         "posix-thread-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &[],
     ),
+    ("svc", "test-svc", SVC_STACK_SIZE, &[]),
 ];
 const CPROBE_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-cprobe"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
-    ("cprobe", "cprobe", CHILD_STACK_SIZE, &[]),
+    ("cprobe", "cprobe", POSIX_STACK_SIZE, &[]),
 ];
 const BUSYBOX_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
     ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
-    ("busybox-probe", "busybox-probe", CHILD_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", POSIX_STACK_SIZE, &[]),
 ];
 const ASH_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
@@ -289,7 +323,7 @@ const ASH_PROGRAMS: [ImageProgram; 3] = [
     (
         "busybox-probe",
         "busybox-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["ash-probe"],
     ),
 ];
@@ -300,7 +334,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 4] = [
     (
         "busybox-probe",
         "busybox-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["ash-interactive"],
     ),
 ];
@@ -310,7 +344,7 @@ const LS_PROGRAMS: [ImageProgram; 3] = [
     (
         "busybox-probe",
         "busybox-probe",
-        CHILD_STACK_SIZE,
+        POSIX_STACK_SIZE,
         &["ls-probe"],
     ),
 ];
@@ -695,7 +729,9 @@ commands:
             under HVF on a Mac with Apple silicon, on Apple's GICv3 and
             QEMU's GICv2; skips elsewhere
   vz        boot the shell through Apple Virtualization.framework
-  rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ
+  rtbench   measure RTOS throughput and timer wakeups on TCG, HVF and VZ;
+            with --minutes N, the POSIX scenarios of rtbench 2 on HVF and VZ;
+            with --short, one round of them on TCG, as ci runs it
   ext4ro    read an e2fsprogs ext4 image inside the QEMU guest
   ramfs     exercise the RAM file service and descriptors in QEMU
   posix-cancel-input verify cancelled UART reads and cleanup handlers
@@ -735,13 +771,23 @@ fn main() {
             qemu::machine(args.get(1)).and_then(|m| kernel_tests(m, variant).map(|_| ()))
         }
         Some("init-test") => {
-            qemu::machine(args.get(1)).and_then(|m| init_tests(m, false).map(|_| ()))
+            let icount = args.get(2).is_some_and(|a| a == "icount");
+            qemu::machine(args.get(1)).and_then(|m| init_tests(m, icount).map(|_| ()))
         }
         Some("gdb") => gdb(),
         Some("ci") => ci(),
         Some("hvf") => hvf(),
         Some("vz") => vz::run(),
-        Some("rtbench") => rtbench::run(&args[1..]),
+        Some("rtbench") => match &args[1..] {
+            [flag, minutes] if flag == "--minutes" => minutes
+                .parse::<u64>()
+                .ok()
+                .filter(|&minutes| (1..=600).contains(&minutes))
+                .ok_or_else(|| "rtbench --minutes expects 1..=600".to_owned())
+                .and_then(rtbench2::run),
+            [flag] if flag == "--short" => rtbench2::short(),
+            rest => rtbench::run(rest),
+        },
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("cprobe") => cprobe(),
@@ -970,7 +1016,19 @@ fn write_boot_image(
     programs: &[ImageProgram],
     profile: Profile,
 ) -> Result<PathBuf, String> {
+    write_boot_image_with(name, programs, profile, &[])
+}
+
+/// `write_boot_image` with the variables `env` set for the build of the
+/// programs (rtbench 2 takes the length of its run so).
+fn write_boot_image_with(
+    name: &str,
+    programs: &[ImageProgram],
+    profile: Profile,
+    env: &[(&str, &str)],
+) -> Result<PathBuf, String> {
     let mut cmd = cargo();
+    cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
     cmd.args(["--target", PROGRAM_TARGET]);
     for (_, package, _, features) in programs {
@@ -1249,7 +1307,12 @@ fn posix_abi_probe() -> Result<(), String> {
                 image_elf(&target, "boot-posix-abi.img", "posix-clock-peer"),
                 32 * 1024,
             ),
-            ("posix-abi-probe", PathBuf::from(linked), CHILD_STACK_SIZE),
+            ("posix-abi-probe", PathBuf::from(linked), POSIX_STACK_SIZE),
+            (
+                "svc",
+                image_elf(&target, "boot-posix-abi.img", "test-svc"),
+                SVC_STACK_SIZE,
+            ),
         ],
     )?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -1329,7 +1392,7 @@ fn posix_thread_probe(vz: bool) -> Result<(), String> {
         qemu::expect_marker(&output, "posix-thread-probe: ok")?;
         qemu::expect_marker(
             &output,
-            "priority-probe: owner, heap, files and sleep timer at the ceiling above main",
+            "priority-probe: heap and files at the ceiling above main, no helper thread",
         )?;
         qemu::expect_marker(&output, "posix-process: adoption refusals ok")
     });
@@ -1454,10 +1517,7 @@ fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
     // Inject no input until cleanup and recovery have completed.
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
-        run.expect(
-            "posix-interrupt-probe: interrupted before cleanup",
-            BOOT_TIMEOUT,
-        )?;
+        run.expect("posix-interrupt-probe: read waits armed", BOOT_TIMEOUT)?;
         run.send("r")?;
         run.expect("posix-interrupt-probe: retry waiting", BOOT_TIMEOUT)?;
         run.send("q")?;
@@ -1679,6 +1739,7 @@ fn test() -> Result<(), String> {
     ext4ro_probe()?;
     ramfs_probe()?;
     posix_abi_probe()?;
+    rtbench2::short()?;
     boot_smoke(&qemu::VIRT, GIC_V2_LINE)?;
     boot_smoke(&qemu::VIRT_V3, GIC_V3_LINE)?;
     boot_smoke(&qemu::VIRT_EL2, GIC_V2_LINE)?;
@@ -1748,6 +1809,8 @@ fn host_tests() -> Result<(), String> {
         "posix-credentials",
         "--package",
         "proto-process",
+        "--package",
+        "posix-process-service",
         "--package",
         "init",
         "--package",
@@ -3106,8 +3169,40 @@ fn hvf_host() -> Result<(), String> {
     )
 }
 
+/// The test hooks of the reply journals went with the journals (spec 6.1):
+/// no Cargo.toml of the workspace names the feature `transport-probe`.
+fn no_transport_probe() -> Result<(), String> {
+    let mut found = Vec::new();
+    let mut paths = vec![root()];
+    while let Some(path) = paths.pop() {
+        if path.is_dir() {
+            if path
+                .file_name()
+                .is_some_and(|n| n == "target" || n == ".git")
+            {
+                continue;
+            }
+            let entries = std::fs::read_dir(&path).map_err(|e| format!("{path:?}: {e}"))?;
+            for entry in entries {
+                paths.push(entry.map_err(|e| format!("{path:?}: {e}"))?.path());
+            }
+        } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("{path:?}: {e}"))?;
+            if text.contains("transport-probe") {
+                found.push(path);
+            }
+        }
+    }
+    if !found.is_empty() {
+        return Err(format!("the feature transport-probe is back in {found:?}"));
+    }
+    println!("no Cargo.toml names transport-probe");
+    Ok(())
+}
+
 fn ci() -> Result<(), String> {
     run_cmd(Command::new("python3").arg(root().join("tools/check-posix-licenses.py")))?;
+    no_transport_probe()?;
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(cargo().args([
         "clippy",
@@ -3172,6 +3267,8 @@ fn ci() -> Result<(), String> {
         "uart",
         "--package",
         "virtio-console",
+        "--package",
+        "posix-process-service",
         "--lib",
         "--tests",
         "--",
@@ -3240,6 +3337,10 @@ fn ci() -> Result<(), String> {
         "--package",
         "posix-tls-probe",
         "--package",
+        "posix-thread",
+        "--package",
+        "posix-sync",
+        "--package",
         "posix-thread-probe",
         "--package",
         "posix-shared-probe",
@@ -3256,7 +3357,7 @@ fn ci() -> Result<(), String> {
         "--package",
         "virtio-console",
         "--features",
-        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/transport-probe",
+        "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/adoption-refusals,posix-abi/rtbench",
         "--package",
         "test-init",
         "--package",
@@ -3269,6 +3370,10 @@ fn ci() -> Result<(), String> {
         "test-svc",
         "--package",
         "rtbench",
+        "--package",
+        "rtbench-posix",
+        "--package",
+        "rtbench-load",
         "--target",
         PROGRAM_TARGET,
         "--",

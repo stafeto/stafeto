@@ -1,0 +1,19 @@
+[package]
+name = "rtbench-load"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The hostile load beside rtbench 2: processes of 128 threads made and killed, large memory objects"
+
+[[bin]]
+name = "rtbench-load"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

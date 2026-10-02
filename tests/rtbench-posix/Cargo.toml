@@ -1,0 +1,23 @@
+[package]
+name = "rtbench-posix"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "rtbench 2: real-time scenarios in C through pthread and POSIX on the Rust POSIX layer"
+build = "build.rs"
+
+[[bin]]
+name = "rtbench-posix"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+posix-abi = { path = "../../lib/posix-abi", features = ["rtbench"] }
+posix-sync = { path = "../../lib/posix-sync" }
+posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
+proto-uart = { path = "../../proto/uart" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt", features = ["count-calls"] }

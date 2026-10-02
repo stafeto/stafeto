@@ -110,7 +110,6 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     let mut passed = true;
     if mode <= 2 || mode == 6 {
         passed &= mask() == 0;
-        threads::probe_interrupt_signal_reply(40);
         let mut old = posix_signals::INITIAL;
         passed &= unsafe {
             api::sigaction(
@@ -125,8 +124,6 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
                 &mut old,
             )
         } == 0;
-        threads::probe_ack_interrupt();
-        threads::probe_interrupt_signal_reply(42);
         passed &= api::raise(SIGUSR1) == 0;
         passed &= COUNT.load(Ordering::Acquire) == if mode == 1 || mode == 2 { 2 } else { 1 };
         passed &= MAX_DEPTH.load(Ordering::Acquire) == if mode == 2 { 2 } else { 1 };
@@ -151,7 +148,9 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
     } else if mode == 3 || mode == 4 {
         let native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
         NATIVE.store(native.raw().0, Ordering::Release);
-        sys::thread_set_priority(&native, 10, rt::abi::Policy::Fifo).unwrap();
+        // Through the layer, which keeps the level the holders of its locks
+        // come back to.
+        threads::set_level(10).unwrap();
         let drain = sys::channel_create(10).unwrap();
         assert_eq!(sys::try_receive(&drain), Err(rt::abi::Error::WouldBlock));
         drop(drain);
@@ -170,7 +169,6 @@ unsafe extern "C" fn worker(_: *mut c_void) -> *mut c_void {
             && pending() == bit(SIGUSR1)
             && COUNT.load(Ordering::Acquire) == 0;
         if mode == 5 {
-            threads::probe_interrupt_signal_reply(41);
             passed &=
                 unsafe { api::pthread_sigmask(SIG_UNBLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
             passed &= COUNT.load(Ordering::Acquire) == 1 && pending() == 0 && mask() == 0;
@@ -266,7 +264,6 @@ pub(super) fn run() -> bool {
                 {
                     return failed(378);
                 }
-                threads::probe_interrupt_signal_reply(42);
                 if api::pthread_kill(id, SIGUSR1) != 0 {
                     return failed(379);
                 }
@@ -321,11 +318,6 @@ pub(super) fn run() -> bool {
     true
 }
 
-struct Held(core::cell::UnsafeCell<[Option<Handle<Channel>>; 128]>);
-// SAFETY: the pressure worker owns these handles until main confirms kernel
-// Ended and acquires its completion publication. Handlers never access HELD.
-unsafe impl Sync for Held {}
-static HELD: Held = Held(core::cell::UnsafeCell::new([const { None }; 128]));
 static PRESSURE_RESULT: AtomicUsize = AtomicUsize::new(0);
 static PRESSURE_WAIT: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" fn pressure_info_handler(signal: i32, info: *mut api::SigInfo, raw: *mut c_void) {
@@ -345,28 +337,6 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     ID.store(threads::pthread_self(), Ordering::Release);
     let errno = unsafe { abi::__errno_location() };
     unsafe { *errno = 777 };
-    // SAFETY: this sole worker owns the array until confirmed ended.
-    let held = unsafe { &mut *HELD.0.get() };
-    let mut handles = 0;
-    for slot in held.iter_mut() {
-        let Ok(handle) = sys::channel_create(1) else {
-            break;
-        };
-        *slot = Some(handle);
-        handles += 1;
-    }
-    let mut count = 0;
-    while count < 2000 {
-        match threads::probe_leave_reply() {
-            Ok(_) => count += 1,
-            Err(ENOMEM) => break,
-            _ => return ptr::null_mut(),
-        }
-    }
-    if handles == 0 || handles == held.len() || !(400..2000).contains(&count) {
-        return ptr::null_mut();
-    }
-    threads::probe_interrupt_signal_reply(40);
     let mut old = posix_signals::INITIAL;
     let info_action = SigAction {
         handler: pressure_info_handler as *const () as u64,
@@ -374,12 +344,8 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     };
     let mut passed = unsafe { api::sigaction(SIGUSR1, &info_action, &mut old) } == 0;
     passed &= unsafe { api::pthread_sigmask(SIG_BLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
-    threads::probe_interrupt_signal_reply(42);
     passed &= api::raise(SIGUSR1) == 0 && api::raise(SIGUSR1) == 0;
     passed &= pending() == bit(SIGUSR1) && COUNT.load(Ordering::Acquire) == 0;
-    threads::probe_interrupt_signal_reply(41);
-    threads::probe_ack_interrupt();
-    threads::probe_interrupt_signal_reply(44);
     passed &= unsafe { api::pthread_sigmask(SIG_UNBLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
     passed &= COUNT.load(Ordering::Acquire) == 1
         && mask() == 0
@@ -389,8 +355,6 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
     passed &= unsafe { api::pthread_sigmask(SIG_BLOCK, &bit(SIGUSR1), ptr::null_mut()) } == 0;
     passed &= api::raise(SIGUSR1) == 0 && api::raise(SIGUSR1) == 0;
     let mut info = api::SigInfo::thread(777);
-    threads::probe_interrupt_signal_reply(46);
-    threads::probe_ack_interrupt();
     passed &= unsafe { api::sigwaitinfo(&bit(SIGUSR1), &mut info) } == SIGUSR1
         && info == api::SigInfo::thread(SIGUSR1)
         && pending() == 0
@@ -412,8 +376,6 @@ unsafe extern "C" fn pressure(_: *mut c_void) -> *mut c_void {
         tv_sec: 0,
         tv_nsec: 2_000_000,
     };
-    threads::probe_interrupt_signal_reply(46);
-    threads::probe_ack_interrupt();
     passed &= unsafe { api::sigtimedwait(&bit(SIGUSR1), &mut info, &timeout) } == -1
         && unsafe { *errno } == EAGAIN
         && info == api::SigInfo::thread(777)
@@ -451,7 +413,7 @@ fn under_pressure() -> bool {
     while sys::thread_info(&retained).unwrap().state != ThreadState::Ended {
         if !delivered
             && PRESSURE_WAIT.load(Ordering::Acquire)
-            && sys::thread_info(&retained).unwrap().state == ThreadState::AwaitingReply
+            && abi::signals::probe_waiting(id) == Ok(true)
         {
             if api::pthread_kill(id, SIGUSR1) != 0 {
                 return failed(398);
@@ -467,15 +429,12 @@ fn under_pressure() -> bool {
     }
     // Native Ended and the release/acquire publication precede all reclamation.
     let passed = delivered && PRESSURE_RESULT.load(Ordering::Acquire) == 1;
-    for slot in unsafe { &mut *HELD.0.get() } {
-        *slot = None;
-    }
     let mut result = ptr::null_mut();
     if !passed || unsafe { threads::pthread_join(id, &mut result) } != 0 || result as usize != 1 {
         return failed(397);
     }
     rt::println!(
-        "signal-action-probe: full journal/handles permit actions, mask, coalesced SA_SIGINFO, signal-safe I/O, pending/live sigwaitinfo/sigtimedwait and timeout, interrupted replies and managed exit"
+        "signal-action-probe: actions, mask, coalesced SA_SIGINFO, signal-safe I/O, pending/live sigwaitinfo/sigtimedwait and timeout, and managed exit"
     );
     true
 }

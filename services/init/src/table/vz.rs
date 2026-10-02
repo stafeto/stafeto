@@ -128,9 +128,10 @@ pub const POSIX_ABI_TABLE: &[Record] = &[
     super::ramfs::POSIX_ABI_TABLE[2],
     super::ramfs::POSIX_ABI_TABLE[3],
     Record {
-        connects: &["ramfs", "clock", "clock-peer", "posix", "uart"],
+        connects: &["ramfs", "clock", "clock-peer", "posix", "long", "uart"],
         ..super::ramfs::POSIX_ABI_TABLE[4]
     },
+    super::ramfs::POSIX_ABI_TABLE[5],
 ];
 
 /// The RAM file service and a probe that reads the console, as
@@ -157,4 +158,19 @@ pub const RTBENCH_TABLE: &[Record] = &[
         trace: false,
         ..super::normal::TABLE[1]
     },
+];
+
+/// rtbench 2 on VZ: the image of `ramfs::RTBENCH_POSIX_TABLE` with the
+/// Virtio console's driver for the console.
+pub const RTBENCH_POSIX_TABLE: &[Record] = &[
+    Record {
+        name: "console",
+        ..CONSOLE
+    },
+    super::ramfs::TABLE[0],
+    super::ramfs::POSIX_ABI_TABLE[1],
+    super::ramfs::POSIX_ABI_TABLE[2],
+    super::ramfs::LONG,
+    super::ramfs::LOAD,
+    super::ramfs::RTBENCH,
 ];

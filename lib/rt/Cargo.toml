@@ -13,6 +13,11 @@ description = "The runtime of stafeto programs: entry point, system calls, outpu
 test = false
 bench = false
 
+# One count of each kernel call the process makes (sys::calls), for the
+# images of measurements and tests only (rtbench 2).
+[features]
+count-calls = []
+
 [dependencies]
 abi = { path = "../abi" }
 bootimg = { path = "../bootimg" }

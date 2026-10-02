@@ -8,12 +8,13 @@
 //! LABEL, ARGS, GATE and OPEN (echo.rs), `d` a service with a window and
 //! a binding (device.rs), `x` a service that faults right after its start
 //! (`crash`), `s` a service that hangs on HANG (silent.rs), `k` a service
-//! that keeps init's STATS from a kill (sink.rs), `m` a service that never
-//! registers (`mute`), `c` the client that runs the tests of init as a
-//! service manager (checker.rs). A service registers its channel with
-//! init (rt::service::register) and serves it with its heartbeat
-//! (rt::service::run). The program ends with the code of its role, or
-//! FAILED when its start data did not come.
+//! that keeps init's STATS from a kill (sink.rs), `l` a service of long
+//! operations under the console's protocol (long.rs, rtbench 2), `m` a
+//! service that never registers (`mute`), `c` the client that runs the
+//! tests of init as a service manager (checker.rs). A service registers
+//! its channel with init (rt::service::register) and serves it with its
+//! heartbeat (rt::service::run). The program ends with the code of its
+//! role, or FAILED when its start data did not come.
 
 #![no_std]
 #![no_main]
@@ -21,6 +22,7 @@
 mod checker;
 mod device;
 mod echo;
+mod long;
 mod silent;
 mod sink;
 
@@ -41,6 +43,7 @@ const DEVICE: u8 = b'd';
 const CRASH: u8 = b'x';
 const SILENT: u8 = b's';
 const SINK: u8 = b'k';
+const LONG: u8 = b'l';
 const MUTE: u8 = b'm';
 const CHECKER: u8 = b'c';
 
@@ -85,6 +88,7 @@ fn main(_: u64) -> u64 {
         Some(&CRASH) => crash(),
         Some(&SILENT) => silent::run(s),
         Some(&SINK) => sink::run(s),
+        Some(&LONG) => long::run(s),
         Some(&MUTE) => mute(&s),
         Some(&CHECKER) => checker::run(s),
         _ => FAILED,

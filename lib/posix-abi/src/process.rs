@@ -106,14 +106,6 @@ pub extern "C" fn setegid(id: u32) -> i32 {
     change(Change::EffectiveGid, id)
 }
 
-#[cfg(feature = "transport-probe")]
-pub fn probe_interrupt(
-    thread: &Handle<rt::handle::Thread>,
-    method: proto_process::Method,
-) -> Result<(), Status> {
-    client().interrupt(thread, method)
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn getpid() -> i32 {
     i32::try_from(PID.load(Ordering::Acquire)).expect("positive signed process namespace")

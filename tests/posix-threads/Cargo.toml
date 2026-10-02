@@ -15,14 +15,17 @@ bench = false
 cancel-input = []
 
 [dependencies]
-posix-abi = { path = "../../lib/posix-abi", features = ["transport-probe"] }
+posix-abi = { path = "../../lib/posix-abi", features = ["thread-probe"] }
 posix-fs = { path = "../../lib/posix-fs" }
-rt = { path = "../../lib/rt" }
-posix-clock = { path = "../../lib/posix-clock", features = ["transport-probe"] }
+rt = { path = "../../lib/rt", features = ["count-calls"] }
+posix-sync = { path = "../../lib/posix-sync" }
+posix-clock = { path = "../../lib/posix-clock" }
+posix-thread = { path = "../../lib/posix-thread" }
 posix-time = { path = "../../lib/posix-time" }
 proto-clock = { path = "../../proto/clock" }
 proto-wire = { path = "../../proto/wire" }
+proto-uart = { path = "../../proto/uart" }
 posix-request = { path = "../../lib/posix-request" }
 posix-signals = { path = "../../lib/posix-signals" }
-process-client = { path = "../../lib/process-client", features = ["transport-probe"] }
+process-client = { path = "../../lib/process-client" }
 proto-process = { path = "../../proto/process" }

@@ -51,7 +51,7 @@ fn console_waiting(id: u64, native: &Handle<Thread>) -> bool {
     let timer = sys::timer_create(&wake, 30).expect("console poll timer");
     for _ in 0..100 {
         if threads::probe_console_waiting(id)
-            && sys::thread_info(native).is_ok_and(|info| info.state == ThreadState::AwaitingReply)
+            && sys::thread_info(native).is_ok_and(|info| info.state == ThreadState::Receiving)
         {
             return true;
         }
@@ -79,6 +79,11 @@ pub fn run() -> bool {
     {
         return failed(30);
     }
+    // A read in two steps labels a copy of the reader's channel: the page
+    // of the pool of sessions it takes stays with the process. Warm it.
+    let warm = sys::channel_create(30).expect("session pool warm channel");
+    drop(sys::handle_label(&warm, rt::abi::Rights::NOTIFY, 1, 30).expect("session pool warm"));
+    drop(warm);
     let handles = sys::process_handles(&process)
         .expect("console baseline handles")
         .live;

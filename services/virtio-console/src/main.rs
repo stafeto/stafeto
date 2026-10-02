@@ -36,10 +36,8 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use proto_init::ServiceArgs;
-use proto_uart::{
-    CancelRead, CancelableRead, Method, ReadReply, ReadRequest, VERSION, WriteReply, WriteRequest,
-};
-use proto_wire::{Status, Writer};
+use proto_uart::{Method, ReadKey, ReadReply, ReadRequest, VERSION, WriteReply, WriteRequest};
+use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::{Handle, mmio, sys, time};
@@ -253,7 +251,7 @@ unsafe impl Hal for Host {
 struct State {
     output: Output,
     writes: Writes<Pending>,
-    input: Input<Pending>,
+    input: Input<Pending, Handle<Channel>>,
     records: [[u8; LOG_RECORD]; LOG_BATCH],
     read: [u8; RX_RING],
 }
@@ -519,6 +517,7 @@ impl Driver {
             input.push(u32::from(b));
         }
         self.answer_read();
+        self.tell();
         if self.port.input_ended() && !self.ended_said {
             self.ended_said = true;
             self.say(format_args!("virtio-console: the host's input ended\n"));
@@ -610,28 +609,16 @@ impl Driver {
     /// READ (spec 13.5, 13.8), as the PL011's driver answers it; input the
     /// device kept while the ring was full comes in once bytes went.
     fn read(&mut self, r: &mut Request<'_>) -> Answer {
-        let (max, id) = if r.method() == Method::ReadCancelable.number() {
-            match CancelableRead::read(r.body()) {
-                Ok(request) => (request.max as usize, request.id),
-                Err(status) => return Answer::Status(status),
-            }
-        } else {
-            match ReadRequest::read(r.body()) {
-                Ok(request) => (request.max as usize, 0),
-                Err(status) => return Answer::Status(status),
-            }
+        let max = match ReadRequest::read(r.body()) {
+            Ok(request) => request.max as usize,
+            Err(status) => return Answer::Status(status),
         };
         let label = r.label();
         let Some(pending) = r.defer() else {
             return Answer::Deferred;
         };
         let State { input, read, .. } = &mut *self.state;
-        let taken = if id == 0 {
-            input.read(label, max, pending, read)
-        } else {
-            input.read_cancelable(label, max, id, pending, read)
-        };
-        match taken {
+        match input.read(label, max, pending, read) {
             input::Taken::Now(n, pending) => {
                 if !answer_read(pending, &read[..n]) {
                     input.restore(&read[..n]);
@@ -644,15 +631,64 @@ impl Driver {
         Answer::Deferred
     }
 
-    fn cancel_read(&mut self, r: &Request<'_>) -> Answer {
-        let cancel = match CancelRead::read(r.body()) {
-            Ok(cancel) => cancel,
+    /// READ_START (proto_uart, proto_wire::long): the bytes there are, or
+    /// WAIT with the key of the read, which waits holding no reply.
+    fn read_start(&mut self, r: &mut Request<'_>) -> Answer {
+        let max = match ReadRequest::read(r.body()) {
+            Ok(request) => request.max as usize,
             Err(status) => return Answer::Status(status),
         };
-        if let Some(pending) = self.state.input.cancel(r.label(), cancel.id) {
-            refuse(pending, Error::Interrupted);
+        let State { input, read, .. } = &mut *self.state;
+        let reply = match input.start(r.label(), max, read) {
+            input::Start::Now(n) => long::Reply::Ready(&read[..n]),
+            input::Start::Wait(key) => long::Reply::Wait(key),
+            input::Start::Refused => return Answer::Status(Status::Kernel(Error::BadState)),
+        };
+        let answer = long_answer(r, reply);
+        self.pull();
+        answer
+    }
+
+    /// READ_TAKE and READ_CANCEL: the bytes that came, or ARMED (keeping
+    /// the handle with NOTIFY the first READ_TAKE brings), or CANCELLED.
+    fn read_take(&mut self, r: &mut Request<'_>, cancel: bool) -> Answer {
+        let key = match ReadKey::read(r.body()) {
+            Ok(key) => key.key,
+            Err(status) => return Answer::Status(status),
+        };
+        let notify = if cancel || r.handles.is_empty() {
+            None
+        } else {
+            match r.handles.take::<Channel>(0) {
+                Ok(handle) => Some(handle),
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            }
+        };
+        let label = r.label();
+        let State { input, read, .. } = &mut *self.state;
+        let taken = if cancel {
+            input.cancel(label, key, read)
+        } else {
+            input.take(label, key, notify, read)
+        };
+        let reply = match taken {
+            input::Taken2::Ready(n) => long::Reply::Ready(&read[..n]),
+            input::Taken2::Armed => long::Reply::Armed,
+            input::Taken2::Cancelled => long::Reply::Cancelled,
+            input::Taken2::Unknown => return Answer::Status(Status::Kernel(Error::BadState)),
+        };
+        let answer = long_answer(r, reply);
+        self.pull();
+        answer
+    }
+
+    /// Tells the waiting read in two steps that input came: bit 0 in its
+    /// slot, once.
+    fn tell(&mut self) {
+        if let Some(notify) = self.state.input.to_tell() {
+            // A client that went closed it: nothing to tell then.
+            let _ = sys::notify(notify, 1);
         }
-        Answer::Status(Status::Ok)
     }
 }
 
@@ -661,16 +697,18 @@ impl Driver {
 const METHODS: &[u16] = &[
     Method::Write.number(),
     Method::Read.number(),
-    Method::ReadCancelable.number(),
-    Method::CancelRead.number(),
+    Method::ReadStart.number(),
+    Method::ReadTake.number(),
+    Method::ReadCancel.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
 const METHODS: &[u16] = &[
     Method::Write.number(),
     Method::Read.number(),
-    Method::ReadCancelable.number(),
-    Method::CancelRead.number(),
+    Method::ReadStart.number(),
+    Method::ReadTake.number(),
+    Method::ReadCancel.number(),
 ];
 
 #[cfg(feature = "crash")]
@@ -702,8 +740,10 @@ impl Service<HELD> for Driver {
     fn request(&mut self, _: &mut Session<(), HELD>, r: &mut Request<'_>) -> Answer {
         match Method::from_number(r.method()) {
             Some(Method::Write) => self.write(r),
-            Some(Method::Read | Method::ReadCancelable) => self.read(r),
-            Some(Method::CancelRead) => self.cancel_read(r),
+            Some(Method::Read) => self.read(r),
+            Some(Method::ReadStart) => self.read_start(r),
+            Some(Method::ReadTake) => self.read_take(r, false),
+            Some(Method::ReadCancel) => self.read_take(r, true),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => {
                 self.drain();
@@ -765,6 +805,14 @@ fn answer_read(pending: Pending, bytes: &[u8]) -> bool {
     let mut w = Writer::new();
     let _ = ReadReply { bytes }.write(&mut w);
     pending.answer(w.as_bytes(), Outgoing::new()).is_ok()
+}
+
+/// The reply of a long operation, through the request's reply buffer.
+fn long_answer(r: &mut Request<'_>, reply: long::Reply<'_>) -> Answer {
+    match reply.write(r.reply()) {
+        Ok(()) => Answer::Reply(Outgoing::new()),
+        Err(status) => Answer::Status(status),
+    }
 }
 
 /// A reply that is the status of `error` alone.

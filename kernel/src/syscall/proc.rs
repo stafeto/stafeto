@@ -291,9 +291,11 @@ pub(super) fn thread_set_priority(thread: NonNull<Thread>, a: &Args) -> Result<V
     Ok(Values::none())
 }
 
-/// thread_interrupt(x0 thread with MANAGE): abandon its current IPC wait
-/// and wake it with INTERRUPTED. BAD_STATE for any thread without such a
-/// wait. Stopped, runnable, ended and long-call threads are unaffected.
+/// thread_interrupt(x0 thread with MANAGE): withdraw its current send or
+/// receive and wake it with INTERRUPTED. BAD_STATE for any thread without
+/// such a wait, a thread that waits for the reply to an accepted request
+/// included, whose reply comes once (spec 6.1). Stopped, runnable, ended
+/// and long-call threads are unaffected.
 pub(super) fn thread_interrupt(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
     let target = lookup(thread, a[0], Rights::MANAGE, Object::thread)?;
     // SAFETY: the caller's handle holds the target through interruption.

@@ -2,14 +2,14 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Credentials in the process service: the shared state of a record,
-//! retained transitions, Child snapshots, the records' bound, a record that
-//! goes with its session and its PID one generation on, Create refused
-//! through a session, and sessions the service did not give.
+//! Child snapshots and the right Child takes, Create refused through a
+//! session. The records' bound, the children of a record, a record that
+//! goes with its session and its PID one generation on, and labels the
+//! service did not give are the service's host tests (records.rs).
 use super::*;
 use process_client::Client;
-use proto_process::{Change, Credentials, Label, Method, RECORDS};
+use proto_process::{Change, Credentials};
 use proto_wire::{Header, Reader, Status};
-const BASE: u64 = 1 << 61;
 static HANDLED: AtomicUsize = AtomicUsize::new(0);
 extern "C" fn handler(_: i32) {
     if abi::process::getuid() == 0 && abi::process::geteuid() == 1000 {
@@ -25,25 +25,6 @@ unsafe extern "C" fn reader(_: *mut c_void) -> *mut c_void {
         && abi::process::getegid() == 0
         && unsafe { *errno } == 733;
     usize::from(passed) as *mut c_void
-}
-unsafe extern "C" fn interrupted(_: *mut c_void) -> *mut c_void {
-    let native = unsafe { threads::probe_native(threads::pthread_self()) }.unwrap();
-    let errno = unsafe { abi::__errno_location() };
-    unsafe { *errno = 744 };
-    for method in [Method::Change, Method::Ack] {
-        abi::process::probe_interrupt(&native, method).unwrap();
-        if abi::process::seteuid(1000) != 0
-            || abi::process::getuid() != 0
-            || abi::process::geteuid() != 1000
-            || unsafe { *errno } != 744
-        {
-            return ptr::null_mut();
-        }
-        if abi::process::seteuid(0) != 0 {
-            return ptr::null_mut();
-        }
-    }
-    ptr::dangling_mut::<c_void>()
 }
 fn joined(entry: unsafe extern "C" fn(*mut c_void) -> *mut c_void) -> bool {
     let mut thread = 0;
@@ -93,85 +74,10 @@ fn peer(parent: &Handle<Channel>, own: &Handle<rt::handle::Process>) -> bool {
     let bytes = reply.bytes(&mut buffer);
     bytes == proto_wire::reply(Status::from_code(proto_process::PERMISSION))
 }
-/// Whether the service holds `count` records: the CLIENT_GONE of a closed
-/// session comes to it as a notification, so a few yields at most.
-fn settled(c: &Client, count: u64) -> bool {
-    (0..1000).any(|_| {
-        let now = c.stats().unwrap()[4] == count;
-        if !now {
-            let _ = sys::yield_now();
-        }
-        now
-    })
-}
 /// A native child with no thread, as the parent of a POSIX child makes it
 /// before it starts.
 fn native() -> Handle<rt::handle::Process> {
     sys::process_create(65536, 16, 30).unwrap()
-}
-/// The raw values of the sessions `children` holds.
-static CHILDREN: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
-/// 32 Child of one record succeed, the 33rd is FULL though records are
-/// free, and once the sessions closed the records are free again. The
-/// failed stage, if any.
-#[inline(never)]
-fn children(c: &Client, child: &Handle<rt::handle::Process>, baseline: u64) -> Option<usize> {
-    let mut made = 0;
-    let mut full = false;
-    for slot in &CHILDREN {
-        match c.child(child) {
-            Ok((_, session)) => {
-                slot.store(session.into_raw().0, Ordering::Relaxed);
-                made += 1;
-            }
-            Err(status) => {
-                full = status.code() == proto_process::FULL;
-                break;
-            }
-        }
-    }
-    let count = c.stats().unwrap()[4];
-    for slot in &CHILDREN {
-        let raw = slot.swap(0, Ordering::Relaxed);
-        if raw != 0 {
-            drop(core::mem::ManuallyDrop::into_inner(
-                Handle::<Channel>::borrowed(rt::abi::Handle(raw)),
-            ));
-        }
-    }
-    if made != 32 || !full || count != baseline + 32 {
-        return Some(514);
-    }
-    if !settled(c, baseline) {
-        return Some(515);
-    }
-    None
-}
-/// The records' bound: the service fills its free records with copies of
-/// one native child, keeping their sessions (transport-probe), up to
-/// RECORDS in all; Child is FULL then, and once the service let the
-/// sessions go the records are free again. The failed stage, if any.
-#[inline(never)]
-fn bound(c: &Client, baseline: u64) -> Option<usize> {
-    let child = native();
-    let Ok(count) = c.fill(Some(&child)) else {
-        return Some(500);
-    };
-    if u64::from(count) + baseline != RECORDS as u64
-        || c.stats().unwrap()[4] != RECORDS as u64
-        || c.child(&child).err() != Some(Status::from_code(proto_process::FULL))
-    {
-        return Some(501);
-    }
-    if c.fill(None) != Ok(0) {
-        return Some(502);
-    }
-    sys::process_kill(&child).unwrap();
-    drop(child);
-    if !settled(c, baseline) {
-        return Some(502);
-    }
-    None
 }
 #[inline(never)]
 pub(super) fn run(parent: &Handle<Channel>) -> bool {
@@ -201,57 +107,15 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
     {
         return failed(492);
     }
-    // Create only through the channel with no label; a session the
-    // service did not give, with a label of init's space or of a gone
-    // generation of this record, names no record.
-    let stale = Label {
-        index: (original.pid % RECORDS as u32) as u16,
-        generation: original.pid / RECORDS as u32 + 1,
-    };
-    let foreign = [0x1234, stale.raw()].map(|label| c.forge(label).map(Client::new));
+    // Create only through the channel with no label.
     if c.create(&own, true).err() != Some(Status::from_code(proto_process::PERMISSION))
-        || foreign.iter().any(|f| {
-            f.as_ref().map_or(true, |f| {
-                f.query().err() != Some(Status::from_code(proto_process::UNREGISTERED))
-            })
-        })
+        || abi::process::seteuid(0) != 0
+        || c.query().unwrap() != original
     {
         return failed(493);
     }
-    drop(foreign);
-    if abi::process::seteuid(0) != 0 || !joined(interrupted) || c.query().unwrap() != original {
-        return failed(494);
-    }
-    // A saved successful result must not apply again over a later credential state.
-    c.change_retained(BASE, Change::EffectiveUid, 1000).unwrap();
-    c.change(Change::EffectiveUid, 0).unwrap();
-    if c.change_retained(BASE, Change::EffectiveUid, 1000).is_err()
-        || c.query().unwrap() != original
-        || c.change_retained(BASE, Change::EffectiveUid, 1001)
-            != Err(Status::from_code(proto_process::INVALID))
-    {
-        return failed(495);
-    }
-    c.ack(BASE).unwrap();
-    c.ack(BASE).unwrap();
-    // An old permission error stays an error even after root privileges return.
-    c.change(Change::EffectiveUid, 1000).unwrap();
-    if c.change_retained(BASE + 1, Change::EffectiveGid, 42)
-        != Err(Status::from_code(proto_process::PERMISSION))
-    {
-        return failed(496);
-    }
-    c.change(Change::EffectiveUid, 0).unwrap();
-    if c.change_retained(BASE + 1, Change::EffectiveGid, 42)
-        != Err(Status::from_code(proto_process::PERMISSION))
-        || c.query().unwrap() != original
-    {
-        return failed(497);
-    }
-    c.ack(BASE + 1).unwrap();
     // A stopped native child gets a snapshot of the caller's credentials,
     // which later changes of the caller leave alone.
-    let baseline = c.stats().unwrap()[4];
     let child = native();
     let (first, first_session) = c.child(&child).unwrap();
     if first.parent != original.pid
@@ -271,96 +135,22 @@ pub(super) fn run(parent: &Handle<Channel>) -> bool {
         return failed(510);
     }
     c.change(Change::EffectiveUid, 0).unwrap();
-    // A record goes with its session; its index comes back with the next
-    // generation, so its PID is new.
     drop(inherited_session);
     sys::process_kill(&unprivileged).unwrap();
     drop(unprivileged);
     drop(first_client);
     sys::process_kill(&child).unwrap();
     drop(child);
-    if !settled(c, baseline) {
-        return failed(511);
-    }
-    let child = native();
-    let (fresh, fresh_session) = c.child(&child).unwrap();
-    if fresh.pid != first.pid + RECORDS as u32 || fresh.credentials != Credentials::ROOT {
-        return failed(499);
-    }
-    drop(fresh_session);
-    sys::process_kill(&child).unwrap();
-    drop(child);
-    // The records' bound is checked before insertion, and records whose
-    // sessions closed are free again.
-    if !settled(c, baseline) {
-        return failed(512);
-    }
-    // Child takes a process handle with MANAGE alone, and one record makes
-    // CHILDREN_MAX (32) live records at most; its end gives them back.
+    // Child takes a process handle with MANAGE alone.
     let child = native();
     let weak = c.child_with(&child, rt::abi::Rights::DUPLICATE);
     if weak.err() != Some(Status::from_code(proto_process::PERMISSION)) {
         return failed(513);
     }
-    if let Some(stage) = children(c, &child, baseline) {
-        return failed(stage);
-    }
     sys::process_kill(&child).unwrap();
     drop(child);
-    if let Some(stage) = bound(c, baseline) {
-        return failed(stage);
-    }
-    // Grow retained storage, then reject new reservation with all handle slots full.
-    let empty = c.stats().unwrap();
-    for n in 0..2000 {
-        c.change_retained(BASE + 100 + n, Change::EffectiveUid, 0)
-            .unwrap();
-    }
-    let full = c.stats().unwrap();
-    if full[0] <= empty[0] || full[1] < 131072 {
-        return failed(503);
-    }
-    c.control(8, true).unwrap();
-    c.control(9, true).unwrap();
-    if c.change_retained(BASE + 3000, Change::EffectiveUid, 1000)
-        != Err(Status::from_code(proto_process::FULL))
-        || c.query().unwrap() != original
-    {
-        return failed(504);
-    }
-    for n in 0..2000 {
-        if c.change_retained(BASE + 100 + n, Change::EffectiveUid, 0)
-            .is_err()
-        {
-            return failed(505);
-        }
-        c.ack(BASE + 100 + n).unwrap();
-    }
-    if c.stats().unwrap()[0] != empty[0] {
-        return failed(506);
-    }
-    c.control(9, false).unwrap();
-    c.control(8, false).unwrap();
-    // The end of a record takes its retained replies with it.
-    let child = native();
-    let (_, session) = c.child(&child).unwrap();
-    let other = Client::new(session);
-    for n in 0..100 {
-        other
-            .change_retained(BASE + 4000 + n, Change::EffectiveUid, 0)
-            .unwrap();
-    }
-    if c.stats().unwrap()[0] <= empty[0] {
-        return failed(507);
-    }
-    drop(other);
-    sys::process_kill(&child).unwrap();
-    drop(child);
-    if !settled(c, baseline) || c.stats().unwrap()[0] != empty[0] {
-        return failed(508);
-    }
     rt::println!(
-        "credential-probe: shared UID/GID, saved IDs, sessions by label, child snapshots, retry/ACK, limits and resource pressure ok"
+        "credential-probe: shared UID/GID, saved IDs, sessions by label, child snapshots and rights ok"
     );
     true
 }

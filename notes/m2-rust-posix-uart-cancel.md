@@ -1,5 +1,7 @@
 # Rust POSIX console cancellation recovery
 
+History: READ_CANCELABLE and CANCEL_READ are gone: the console is read in two steps (notes/m5a-transport.md). This note records the earlier design.
+
 ## Result
 
 UART protocol version 1 gains ReadCancelable (5) and CancelRead (6).
