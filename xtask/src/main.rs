@@ -1070,12 +1070,48 @@ fn write_boot_image(
 
 /// `write_boot_image` with the variables `env` set for the build of the
 /// programs (rtbench 2 takes the length of its run so).
+/// The programs whose C names come from relibc (or that have the feature
+/// `relibc`), and those whose come from the layer (posix-abi without the
+/// feature `libc-backend`). One `cargo build` builds the programs of an
+/// image with the union of their features, so with both in one image
+/// posix-abi loses its C names for all (5a′ removes them for good).
+const RELIBC_C_PROGRAMS: [&str; 2] = ["relibc-hello", "relibc-threads"];
+const LAYER_C_PROGRAMS: [&str; 6] = [
+    "posix-abi-probe",
+    "posix-tls-probe",
+    "posix-shared-probe",
+    "posix-thread-probe",
+    "ramfs-probe",
+    "rtbench-posix",
+];
+
+/// Refuses an image of programs on relibc and programs on the layer's C
+/// names together.
+fn one_c_library(name: &str, programs: &[ImageProgram]) -> Result<(), String> {
+    let relibc = |(_, package, _, features): &&ImageProgram| {
+        RELIBC_C_PROGRAMS.contains(package) || features.contains(&"relibc")
+    };
+    let on_relibc: Vec<_> = programs.iter().filter(relibc).map(|p| p.1).collect();
+    let on_layer: Vec<_> = programs
+        .iter()
+        .filter(|program| !relibc(program) && LAYER_C_PROGRAMS.contains(&program.1))
+        .map(|p| p.1)
+        .collect();
+    if !on_relibc.is_empty() && !on_layer.is_empty() {
+        return Err(format!(
+            "{name}: {on_relibc:?} on relibc and {on_layer:?} on the layer's C names in one image"
+        ));
+    }
+    Ok(())
+}
+
 fn write_boot_image_with(
     name: &str,
     programs: &[ImageProgram],
     profile: Profile,
     env: &[(&str, &str)],
 ) -> Result<PathBuf, String> {
+    one_c_library(name, programs)?;
     let mut cmd = cargo();
     cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
@@ -1598,17 +1634,33 @@ fn relibc_hello_probe() -> Result<(), String> {
     let image = build_boot_image("boot-relibc.img", &RELIBC_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
-    const ENDED: &str = "init: relibc-hello ended: exit code 0, not restarted";
-    let output = run_until(cmd, BOOT_TIMEOUT, Some(ENDED), &kernel.elf)?;
-    qemu::expect_stopped_on(&output, ENDED)?;
+    let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
+    // The four runs end in any order: the program, then abort, a failed
+    // assert and a panic of relibc, each with SIGABRT's status.
+    let ended = (|| {
+        for line in [
+            "init: relibc-hello ended: exit code 0, not restarted",
+            "init: relibc-abort ended: exit code 134, not restarted",
+            "init: relibc-assert ended: exit code 134, not restarted",
+            "init: relibc-panic ended: exit code 134, not restarted",
+        ] {
+            run.expect_seen(line, BOOT_TIMEOUT)?;
+        }
+        Ok::<(), String>(())
+    })();
+    let outcome = run.stop();
+    symbolize::backtrace(&outcome.lines, &kernel.elf);
+    ended?;
     for marker in [
         "relibc-hello: printf argc=1 argv0=relibc-hello pi=3.142",
         "relibc-hello: malloc heap x",
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: ok",
+        "Assertion `how == NULL` failed.",
+        "RELIBC PANIC: ",
     ] {
-        qemu::expect_marker(&output, marker)?;
+        qemu::expect_marker(&outcome, marker)?;
     }
     println!("relibc C-program guest probe passed");
     Ok(())
@@ -3568,6 +3620,29 @@ fn ci() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An image takes programs of one C library: relibc's or the layer's.
+    #[test]
+    fn an_image_has_one_c_library() {
+        assert!(one_c_library("a", &RELIBC_PROGRAMS).is_ok());
+        assert!(one_c_library("b", &POSIX_ABI_PROGRAMS).is_ok());
+        assert!(one_c_library("c", &RTBENCH_POSIX_RELIBC_PROGRAMS).is_ok());
+        let mixed = [
+            ("relibc-hello", "relibc-hello", 4096, &[] as &[&str]),
+            ("posix-abi-probe", "posix-abi-probe", 4096, &[]),
+        ];
+        assert!(one_c_library("d", &mixed).is_err());
+        let mixed = [
+            (
+                "rtbench-posix",
+                "rtbench-posix",
+                4096,
+                &["relibc"] as &[&str],
+            ),
+            ("ramfs-probe", "ramfs-probe", 4096, &[]),
+        ];
+        assert!(one_c_library("e", &mixed).is_err());
+    }
 
     #[test]
     fn kill_itself_is_what_an_assembler_makes() {

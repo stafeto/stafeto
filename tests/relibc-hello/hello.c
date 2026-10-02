@@ -4,7 +4,9 @@
 /* The first C program on relibc over the Rust POSIX layer: stdio with a
  * float, malloc, a file of the RAM file service through fopen and fread,
  * ENOENT, clock_gettime, and errno in the static TLS relibc built. */
+#include <assert.h>
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +31,32 @@ static int errno_in_tls(void) {
            at + sizeof errno <= tcb->tls_end;
 }
 
+static void *exits_at_once(void *arg) { return arg; }
+
+/* The ways a C program ends badly: each ends the process with status
+ * 134, as SIGABRT would, after a word on fd 2 where there is one. */
+static int end_badly(const char *how) {
+    if (strcmp(how, "abort") == 0) abort();
+    if (strcmp(how, "assert") == 0) assert(how == NULL);
+    if (strcmp(how, "panic") == 0) {
+        /* A broken attribute object: relibc's pthread_create panics on a
+         * detach state it does not know. */
+        pthread_attr_t attr, detached;
+        pthread_t thread;
+        pthread_attr_init(&attr);
+        pthread_attr_init(&detached);
+        pthread_attr_setdetachstate(&detached, PTHREAD_CREATE_DETACHED);
+        /* The byte the detach state changes is the state. */
+        for (size_t i = 0; i < sizeof attr; i++)
+            if (((unsigned char *)&attr)[i] != ((unsigned char *)&detached)[i])
+                ((unsigned char *)&attr)[i] = 99;
+        pthread_create(&thread, &attr, exits_at_once, NULL);
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1) return end_badly(argv[1]);
     printf("relibc-hello: printf argc=%d argv0=%s pi=%.3f\n", argc, argv[0], 3.14159);
     if (!errno_in_tls()) {
         printf("relibc-hello: errno at %p is outside the static TLS\n", (void *)&errno);

@@ -11,6 +11,7 @@ BusyBox apart from bare GPLv3 code, and the crates of the drivers. Runs in
 licence files of relibc's closure."""
 
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
@@ -21,7 +22,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RELIBC = ROOT / "target" / "relibc" / "source"
 NOTICES = ROOT / "target" / "relibc" / "THIRD-PARTY-NOTICES"
-TOOLCHAIN = "nightly-2026-05-24"
+
+def build_relibc():
+    """tools/build-relibc.py, which pins the fork's commit and the toolchain."""
+    spec = importlib.util.spec_from_file_location(
+        "build_relibc", Path(__file__).resolve().parent / "build-relibc.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+BUILD = build_relibc()
+TOOLCHAIN = BUILD.TOOLCHAIN
 
 GPL = "GPL-3.0-or-later"
 EXCEPTION = "GPL-3.0-or-later WITH GCC-exception-3.1"
@@ -159,8 +171,9 @@ def workspace() -> None:
             if license_name not in ("MIT", EXCEPTION):
                 fail(f"{package['name']} is linked into programs under {license_name!r},"
                      f" not MIT or {EXCEPTION}")
-        elif "GPL" in license_name:
-            fail(f"programs link {package['name']} under {license_name}")
+        elif not allowed(license_name):
+            # The layer is for programs under any licence, GPL-2.0-only too.
+            fail(f"programs link {package['name']} under {license_name!r}")
     # 2: the exception goes to the closure alone; the rest of POSIX and
     # the services stay GPL-3.0-or-later.
     for package_id in members - linked:
@@ -238,6 +251,13 @@ def relibc() -> None:
     builds, openlibm's headers."""
     if not (RELIBC / "Cargo.lock").exists():
         fail(f"no relibc at {RELIBC}; run cargo xtask relibc first")
+    # The fork as build-relibc.py pins it, with no change in the tree.
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=RELIBC, text=True).strip()
+    if head != BUILD.COMMIT:
+        fail(f"{RELIBC} is at {head}, build-relibc.py pins {BUILD.COMMIT}")
+    changed = subprocess.check_output(["git", "status", "--porcelain"], cwd=RELIBC, text=True)
+    if changed.strip():
+        fail(f"{RELIBC} has local changes:\n{changed}")
     data = metadata(RELIBC, "--offline", "--filter-platform", "aarch64-unknown-linux-gnu",
                     toolchain=TOOLCHAIN)
     packages = {package["id"]: package for package in data["packages"]}
@@ -269,6 +289,12 @@ def relibc() -> None:
         if not allowed(license_name):
             fail(f"relibc links {package['name']} under {license_name!r}")
         files = licence_files(library / manifest.split("/")[0])
+        if not files:
+            # core and alloc: the toolchain's MIT text and its copyright file.
+            files = [Path(sysroot) / "share/doc/rust/licenses/MIT.txt",
+                     Path(sysroot) / "share/doc/rust/COPYRIGHT-library.html"]
+            if not all(path.exists() for path in files):
+                fail(f"no licence text of {package['name']} in {sysroot}/share/doc/rust")
         notices.append((f"{package['name']} ({TOOLCHAIN})", license_name, files))
     path, digest, license_name = OPENLIBM
     if sha256(RELIBC / path) != digest:
@@ -290,9 +316,6 @@ def write_notices(notices) -> None:
     seen = {}
     for title, license_name, files in notices:
         parts.append(f"\n{'=' * 72}\n{title}: {license_name}\n{'=' * 72}\n")
-        if not files:
-            parts.append("\nThe licence texts are in https://github.com/rust-lang/rust"
-                         " (LICENSE-MIT, LICENSE-APACHE).\n")
         for path in files:
             text = path.read_text(errors="replace").rstrip()
             digest = hashlib.sha256(text.encode()).hexdigest()

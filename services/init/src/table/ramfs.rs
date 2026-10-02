@@ -162,7 +162,34 @@ pub const RELIBC_TABLE: &[Record] = &[
         quota: 512 * PAGE,
         ..POSIX
     },
+    // The same program ending by abort, a failed assert and a panic of
+    // relibc: each ends with status 134.
+    Record {
+        name: "relibc-abort",
+        args: b"relibc-hello\0abort\0",
+        ..RELIBC_HELLO
+    },
+    Record {
+        name: "relibc-assert",
+        args: b"relibc-hello\0assert\0",
+        ..RELIBC_HELLO
+    },
+    Record {
+        name: "relibc-panic",
+        args: b"relibc-hello\0panic\0",
+        ..RELIBC_HELLO
+    },
 ];
+
+/// relibc-hello's record, for the records of its other runs.
+const RELIBC_HELLO: Record = Record {
+    name: "relibc-hello",
+    program: "relibc-hello",
+    args: b"relibc-hello\0",
+    connects: &["ramfs", "clock", "posix"],
+    quota: 512 * PAGE,
+    ..POSIX
+};
 
 /// The threads of relibc (5a′): as RELIBC_TABLE, with room for 64
 /// threads (four handles each, their stacks and TCBs).
