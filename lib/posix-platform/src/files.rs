@@ -469,6 +469,8 @@ const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
 const TIOCSCTTY: c_ulong = 0x540E;
 const TIOCNOTTY: c_ulong = 0x5422;
+const TIOCGWINSZ: c_ulong = 0x5413;
+const TIOCSWINSZ: c_ulong = 0x5414;
 const TIOCGPTN: c_ulong = 0x80045430;
 const TIOCSPTLCK: c_ulong = 0x40045431;
 const TIOCGPGRP: c_ulong = 0x540F;
@@ -509,6 +511,24 @@ fn terminal_ioctl(
             // SAFETY: the caller's promise: readable for a struct termios.
             let settings = unsafe { argument.cast::<Termios>().read() }.settings();
             terminal::set_attr(transport, terminal, (request - TCSETS) as u32, settings)?;
+            Ok(0)
+        }
+        TIOCGWINSZ => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            let size = terminal::get_winsize(transport, terminal)?;
+            // SAFETY: the caller supplies a writable Linux winsize (8 bytes).
+            unsafe { argument.cast::<proto_tty::Winsize>().write(size) };
+            Ok(0)
+        }
+        TIOCSWINSZ => {
+            if argument.is_null() {
+                return Err(EFAULT);
+            }
+            // SAFETY: the caller supplies a readable Linux winsize (8 bytes).
+            let size = unsafe { argument.cast::<proto_tty::Winsize>().read() };
+            terminal::set_winsize(transport, terminal, size)?;
             Ok(0)
         }
         TCFLSH => {

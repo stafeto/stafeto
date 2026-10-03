@@ -92,7 +92,7 @@
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 /// The side tag of an opaque open description.
 pub const MASTER: u32 = 1 << 31;
 pub const BAD_DESCRIPTION: u32 = 809;
@@ -322,10 +322,12 @@ pub enum Method {
     GetFlags = 42,
     SetFlags = 43,
     Stat = 44,
+    GetWinsize = 45,
+    SetWinsize = 46,
 }
 
 impl Method {
-    pub const ALL: [Method; 39] = [
+    pub const ALL: [Method; 41] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -365,6 +367,8 @@ impl Method {
         Method::GetFlags,
         Method::SetFlags,
         Method::Stat,
+        Method::GetWinsize,
+        Method::SetWinsize,
     ];
 
     pub const fn number(self) -> u16 {
@@ -382,8 +386,70 @@ impl Method {
 
 pub const METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26, 27, 28, 31,
-    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
 ];
+
+/// Linux winsize ABI: the two POSIX dimensions and the pixel fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Winsize {
+    pub row: u16,
+    pub column: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+impl Winsize {
+    pub const fn new() -> Self {
+        Self {
+            row: 0,
+            column: 0,
+            xpixel: 0,
+            ypixel: 0,
+        }
+    }
+    pub fn write(self, w: &mut Writer) -> Result<(), Status> {
+        for field in [self.row, self.column, self.xpixel, self.ypixel] {
+            w.u16(field)?;
+        }
+        Ok(())
+    }
+    pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
+        Ok(Self {
+            row: r.u16()?,
+            column: r.u16()?,
+            xpixel: r.u16()?,
+            ypixel: r.u16()?,
+        })
+    }
+}
+const _: () = assert!(core::mem::size_of::<Winsize>() == 8);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetWinsize {
+    pub description: u32,
+    pub blocked: u32,
+    pub size: Winsize,
+}
+impl SetWinsize {
+    pub fn write(self, w: &mut Writer) -> Result<(), Status> {
+        Method::SetWinsize.header().write(w)?;
+        w.u32(self.description)?;
+        w.u32(self.blocked)?;
+        self.size.write(w)
+    }
+    pub fn parse(mut r: Reader<'_>) -> Result<Self, Status> {
+        let result = Self {
+            description: r.u32()?,
+            blocked: r.u32()?,
+            size: Winsize::read(&mut r)?,
+        };
+        r.finish()?;
+        if result.blocked > 1 {
+            return Err(Status::BadSize);
+        }
+        Ok(result)
+    }
+}
 
 /// Open a fresh description; controlling opens select the caller's exact link.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -868,7 +934,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=45u16 {
+        for number in 0..=47u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {
@@ -1056,6 +1122,39 @@ mod tests {
         }
         assert_eq!(
             control.write(Method::GetAttr, &mut Writer::new()),
+            Err(Status::BadSize)
+        );
+    }
+}
+
+#[cfg(test)]
+mod winsize_tests {
+    use super::*;
+    #[test]
+    fn winsize_has_exact_linux_width_and_request_bounds() {
+        let set = SetWinsize {
+            description: 0x8000_0112,
+            blocked: 1,
+            size: Winsize {
+                row: 37,
+                column: 91,
+                xpixel: 640,
+                ypixel: 480,
+            },
+        };
+        let mut w = Writer::new();
+        set.write(&mut w).unwrap();
+        assert_eq!(w.as_bytes().len(), 20);
+        assert_eq!(SetWinsize::parse(Reader::new(&w.as_bytes()[4..])), Ok(set));
+        assert_eq!(&w.as_bytes()[12..], &[37, 0, 91, 0, 128, 2, 224, 1]);
+        assert_eq!(
+            SetWinsize::parse(Reader::new(&w.as_bytes()[4..19])),
+            Err(Status::BadSize)
+        );
+        let mut malformed = w.as_bytes().to_vec();
+        malformed[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            SetWinsize::parse(Reader::new(&malformed[4..])),
             Err(Status::BadSize)
         );
     }
