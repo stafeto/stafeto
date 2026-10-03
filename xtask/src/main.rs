@@ -302,6 +302,43 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
         &["input-probe"],
     ),
 ];
+/// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
+/// console's driver, the terminal service, the RAM files, the pipes, the
+/// process and clock services, the loader (the probe forks) and the probe.
+const POSIX_TTY_PROGRAMS: [ImageProgram; 9] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-tty"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
+    ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
+];
+/// The same over the Virtio console's driver on Apple VZ (xtask
+/// posix-tty-vz).
+const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 9] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-tty-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &[],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
+    ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
+];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -939,6 +976,9 @@ commands:
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
             --one NAME, one test in a boot of its own, with its log
+  posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
+            names of terminals through the terminal service, with typed input
+  posix-tty-vz the same over the Virtio console on Apple VZ
   tty       check the terminal service in QEMU under -icount: line editing,
             echo, INTR, raw reads with VMIN 1, output that waits for the
             driver, and each step of the service under term B
@@ -1034,6 +1074,8 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
+        Some("posix-tty") => posix_tty_probe(false),
+        Some("posix-tty-vz") => posix_tty_probe(true),
         Some("tty") => tty_probe(false),
         Some("tty-vz") => tty_probe(true),
         Some("help") | None => {
@@ -1826,6 +1868,108 @@ fn posix_input_probe(vz: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// The probe of the terminal in C (tests/posix-tty): the termios functions,
+/// isatty, ttyname and the names of terminals through the terminal
+/// service. It asks for input and xtask types it: three single bytes in
+/// raw mode (no echo), a line in canonical mode, bytes for the flushes
+/// that must not be read, and one byte that must.
+fn posix_tty_probe(vz: bool) -> Result<(), String> {
+    relibc()?;
+    let image = if vz {
+        build_boot_image(
+            "boot-posix-tty-vz.img",
+            &POSIX_TTY_VZ_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    } else {
+        build_boot_image("boot-posix-tty.img", &POSIX_TTY_PROGRAMS, BOOT_PROFILE)?
+    };
+    let (cmd, _) = probe_command(&image, vz)?;
+    const ENDED: &str = "init: posix-tty ended: exit code 0, not restarted";
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect("posix-tty: settings ok", BOOT_TIMEOUT)?;
+        for (i, byte) in b"xyz".iter().copied().enumerate() {
+            run.expect(&format!("posix-tty: raw read {i} waits"), DIALOG_STEP)?;
+            run.type_raw(&[byte])?;
+            run.expect(
+                &format!("posix-tty: raw read {i} gave 0x{byte:02x}"),
+                DIALOG_STEP,
+            )?;
+        }
+        run.expect("posix-tty: attributes restored", DIALOG_STEP)?;
+        run.expect("posix-tty: canonical read waits", DIALOG_STEP)?;
+        run.send("hi")?;
+        run.expect("posix-tty: canonical read gave 3 bytes", DIALOG_STEP)?;
+        for (ask, typed, done) in [
+            ("type junk", &b"junk"[..], "tcflush dropped the input"),
+            ("type more junk", b"more", "TCSAFLUSH dropped the input"),
+            ("type k", b"k", "input after a flush is read"),
+        ] {
+            run.expect(&format!("posix-tty: {ask}"), DIALOG_STEP)?;
+            run.type_raw(typed)?;
+            run.expect(&format!("posix-tty: {done}"), DIALOG_STEP)?;
+        }
+        // STOP and START go out between the bytes written.
+        run.expect("<\x13>(\x11)", DIALOG_STEP)?;
+        run.expect("posix-tty: output flushed", DIALOG_STEP)?;
+        run.expect("posix-tty: output ok", DIALOG_STEP)?;
+        run.expect("posix-tty: written through /dev/console", DIALOG_STEP)?;
+        run.expect("posix-tty: child wrote through /dev/console", DIALOG_STEP)?;
+        run.expect(
+            "posix-tty: spawned child wrote through the inherited descriptor",
+            DIALOG_STEP,
+        )?;
+        run.expect(
+            "posix-tty: spawned child wrote through the descriptor of a file action",
+            DIALOG_STEP,
+        )?;
+        run.expect("posix-tty: ok", DIALOG_STEP)?;
+        run.expect(ENDED, DIALOG_STEP)
+    })();
+    let output = run.stop();
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
+    // No echo in raw mode: a byte typed would show before the line that
+    // follows its read.
+    for line in output
+        .lines
+        .iter()
+        .filter(|l| l.contains("posix-tty: raw read"))
+    {
+        if !line.starts_with("posix-tty: raw read") {
+            return Err(format!("a raw read's line came with an echo: {line:?}"));
+        }
+    }
+    // What tcflush dropped never shows, and what tcflow held shows once.
+    if output
+        .lines
+        .iter()
+        .any(|l| l.contains("posix-tty: dropped by tcflush"))
+    {
+        return Err("the output tcflush had to drop reached the console".to_owned());
+    }
+    let held = output
+        .lines
+        .iter()
+        .filter(|l| l.contains("posix-tty: held by tcflow"))
+        .count();
+    if held != 1 {
+        return Err(format!("the output tcflow held came {held} times"));
+    }
+    if output.lines.iter().any(|l| l.contains("check failed")) {
+        return Err("a check of the probe failed".to_owned());
+    }
+    println!(
+        "POSIX terminal guest probe passed on {}",
+        if vz { "the Virtio console" } else { "the UART" }
+    );
+    Ok(())
+}
+
 fn posix_interrupt_probe(vz: bool) -> Result<(), String> {
     let image = if vz {
         build_boot_image(
@@ -2528,6 +2672,18 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("echo abx\x08 \x08c", DIALOG_STEP)?;
         run.expect_line("abc", |line| line == "abc", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        // The name of the terminal is the layer's to resolve (5f): the
+        // shell opens /dev/console for a redirection, and a file of /bin
+        // that the shell forks and execs writes to the descriptor it
+        // inherits (the terminal moves through exec).
+        run.send("echo console >/dev/console")?;
+        run.expect("echo console >/dev/console", DIALOG_STEP)?;
+        run.expect_line("console", |line| line == "console", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ls -1 /etc >/dev/console")?;
+        run.expect("/bin/ls -1 /etc >/dev/console", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
         run.send("ls -1 /")?;
         run.expect("ls -1 /", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
@@ -2742,7 +2898,7 @@ fn ash_dialog() -> Result<(), String> {
 
 /// The kinds of the lines of the terminal service (tag 5), by the
 /// numbers of proto_tty::Method.
-const TTY_STEP_KINDS: [(usize, &str); 12] = [
+const TTY_STEP_KINDS: [(usize, &str); 17] = [
     (1, "ReadStart"),
     (2, "ReadTake"),
     (3, "ReadCancel"),
@@ -2753,6 +2909,11 @@ const TTY_STEP_KINDS: [(usize, &str); 12] = [
     (8, "GetAttr"),
     (9, "SetAttr"),
     (10, "Abandon"),
+    (11, "DrainStart"),
+    (12, "DrainTake"),
+    (13, "DrainCancel"),
+    (14, "FlushQueues"),
+    (15, "Flow"),
     (64, "heartbeat: a send to init and its reply"),
     (
         65,
@@ -2871,7 +3032,7 @@ fn tty_steps() -> Result<(), String> {
     print!("terminal service steps under icount:\n{table}");
     // Each method and the service's own notifications made a step, each
     // under term B; the heartbeat, which waits for init, has its own bound.
-    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65] {
+    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 65] {
         let ticks = steps.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
         if ticks == 0 || ticks > RAM_STEP_MAX {
             return Err(format!(
@@ -2994,6 +3155,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-shared", posix_shared_probe),
         job("posix-input", || posix_input_probe(false)),
         job("posix-interrupt", || posix_interrupt_probe(false)),
+        job("posix-tty", || posix_tty_probe(false)),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),

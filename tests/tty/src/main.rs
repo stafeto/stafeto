@@ -282,7 +282,8 @@ fn main(_: u64) -> u64 {
     };
     let probe = Probe { tty, own, level };
     let done = match role {
-        Some(b's') => steps::run(&probe, &start.parent),
+        Some(b's') => steps::run(&probe, &start.parent)
+            .and_then(|()| steps::drain_flush_flow(&probe, &start.parent)),
         _ => run(&probe),
     };
     match done {

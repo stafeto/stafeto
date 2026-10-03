@@ -30,7 +30,8 @@ pub trait Driver {
 /// How a run of the pump ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pumped {
-    /// The terminal has no output left.
+    /// The terminal has no output to give now: none left, or it is
+    /// stopped (`Terminal::stopped`).
     Idle,
     /// The driver's notification of room is armed: no write until it
     /// comes (`Pump::room_came`).
@@ -71,6 +72,9 @@ impl Pump {
         writes: usize,
     ) -> Result<Pumped, D::Error> {
         for _ in 0..writes {
+            if terminal.stopped() {
+                return Ok(Pumped::Idle);
+            }
             if self.waits_room {
                 return Ok(Pumped::WaitsRoom);
             }
@@ -280,6 +284,42 @@ mod tests {
         assert_eq!(d.ring.len(), WRITE_MAX);
         assert_eq!(pump.run(&mut t, &mut d, 8), Ok(Pumped::Idle));
         assert_eq!(d.ring.len(), 3000);
+    }
+
+    /// Stopped output stays in the terminal: the pump gives the driver
+    /// nothing, and every byte goes once the output starts again (tcflow
+    /// with TCOOFF and TCOON).
+    #[test]
+    fn stopped_output_waits_in_the_terminal() {
+        let mut t = Terminal::new();
+        t.write(b"abc");
+        t.set_stopped(true);
+        let mut d = Fake::new(100);
+        let mut pump = Pump::new();
+        assert_eq!(pump.run(&mut t, &mut d, 2), Ok(Pumped::Idle));
+        assert_eq!((d.writes, t.output_len()), (0, 3));
+        t.set_stopped(false);
+        assert_eq!(pump.run(&mut t, &mut d, 2), Ok(Pumped::Idle));
+        assert_eq!((d.writes, t.output_len()), (1, 0));
+        d.drain(usize::MAX);
+        assert_eq!(d.port, b"abc");
+    }
+
+    /// The output the driver did not take goes at a flush (tcflush with
+    /// TCOFLUSH), and the bytes the driver took stay its own.
+    #[test]
+    fn a_flush_drops_the_output_the_driver_did_not_take() {
+        let mut t = Terminal::new();
+        t.write(&[b'x'; 300]);
+        let mut d = Fake::new(100);
+        let mut pump = Pump::new();
+        assert_eq!(pump.run(&mut t, &mut d, 1), Ok(Pumped::WaitsRoom));
+        assert_eq!((d.ring.len(), t.output_len()), (100, 200));
+        t.flush_output();
+        assert_eq!(t.output_len(), 0);
+        assert_eq!(d.ring.len(), 100);
+        assert_eq!(t.write(b"after"), 5);
+        assert_eq!(t.output(), b"after");
     }
 
     #[test]

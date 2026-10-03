@@ -105,6 +105,10 @@ pub enum Names {
     /// service the child gets, which holds it (5e). The loader takes the
     /// kind only with a session in the slot Pipes.
     Pipe(u32),
+    /// The terminal of this number of the terminal service, which the
+    /// child's session in the slot Terminal serves (5f); the loader takes
+    /// the kind only with that session.
+    Terminal(u32),
 }
 
 /// A descriptor the child starts with.
@@ -122,6 +126,7 @@ impl Descriptor {
             Names::Error => (2, 0),
             Names::File(n) => (3, n),
             Names::Pipe(n) => (4, n),
+            Names::Terminal(n) => (5, n),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -141,6 +146,7 @@ impl Descriptor {
             (2, 0) => Names::Error,
             (3, n) => Names::File(n),
             (4, n) => Names::Pipe(n),
+            (5, n) => Names::Terminal(n),
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -322,11 +328,17 @@ impl<'a> Block<'a> {
     }
 
     /// The descriptors the child starts with.
-    /// Whether a descriptor names the end of a pipe, which only a session
-    /// of the pipe service holds (the loader needs one in the slot Pipes).
-    pub fn names_pipes(&self) -> bool {
-        self.descriptors()
-            .any(|d| matches!(d.names, Names::Pipe(_)))
+    /// Whether the block's descriptors need a session in `slot` to mean
+    /// anything: the end of a pipe needs Pipes (5e), a terminal needs
+    /// Terminal (5f). The loader answers a Handles that leaves such a
+    /// slot empty with BAD_SIZE.
+    pub fn needs(&self, slot: Slot) -> bool {
+        self.descriptors().any(|d| {
+            matches!(
+                (slot, d.names),
+                (Slot::Pipes, Names::Pipe(_)) | (Slot::Terminal, Names::Terminal(_))
+            )
+        })
     }
 
     pub fn descriptors(&self) -> impl Iterator<Item = Descriptor> + 'a {
@@ -1335,6 +1347,10 @@ mod tests {
                 fd: 5,
                 names: Names::Pipe(9),
             },
+            Descriptor {
+                fd: 6,
+                names: Names::Terminal(0),
+            },
         ];
         let mut out = vec![0; BLOCK_MAX];
         let argv: [&[u8]; 1] = [b"ls"];
@@ -1351,7 +1367,7 @@ mod tests {
         let read = Block::read(&out[..len]).unwrap();
         assert_eq!(read.descriptors().collect::<Vec<_>>(), list);
         assert_eq!(read.strings(), b"ls\0");
-        assert!(read.names_pipes());
+        assert!(read.needs(Slot::Pipes) && read.needs(Slot::Terminal) && !read.needs(Slot::Files));
         let mut plain = vec![0; BLOCK_MAX];
         let plain_len = Block::write_with(
             &mut plain,
@@ -1363,7 +1379,8 @@ mod tests {
             &list[..2],
         )
         .unwrap();
-        assert!(!Block::read(&plain[..plain_len]).unwrap().names_pipes());
+        let plain = Block::read(&plain[..plain_len]).unwrap();
+        assert!(!plain.needs(Slot::Pipes) && !plain.needs(Slot::Terminal));
         let mut twice = out[..len].to_vec();
         let at = HEADER + 7 + 1;
         twice[at + DESCRIPTOR..at + DESCRIPTOR + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -1378,9 +1395,9 @@ mod tests {
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
-        assert_eq!(start.descriptor_count, 3);
+        assert_eq!(start.descriptor_count, 4);
         let at = (start.descriptors - START_AREA) as usize;
-        let back: Vec<_> = area[at..at + 3 * DESCRIPTOR]
+        let back: Vec<_> = area[at..at + 4 * DESCRIPTOR]
             .as_chunks::<DESCRIPTOR>()
             .0
             .iter()

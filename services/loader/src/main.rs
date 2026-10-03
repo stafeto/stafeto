@@ -320,8 +320,8 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut loaded: Option<(u64, Handle<Channel>, Maps)> = None;
     let mut fork: Option<(Fork, &'static mut Scratch)> = None;
     let mut copied = false;
-    // Whether the block names the end of a pipe.
-    let mut pipes_named = false;
+    // The sessions the block's descriptors need (Block::needs).
+    let mut needed = [false; SLOTS];
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
     let mut ready = false;
     let mut buffer = [0; MESSAGE_MAX];
@@ -438,12 +438,14 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             reply(token, Status::BadSize.code());
                             return None;
                         };
-                        let named = block.names_pipes();
+                        let needs = Slot::GIVEN.map(|slot| (slot, block.needs(slot)));
                         match load(own, &block).and_then(|done| tell_ready(session).map(|()| done))
                         {
                             Ok(done) => {
                                 loaded = Some(done);
-                                pipes_named = named;
+                                for (slot, needs) in needs {
+                                    needed[slot as usize] = needs;
+                                }
                                 0
                             }
                             Err(code) => {
@@ -456,9 +458,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     }
                     Some(Method::Handles) if loaded.is_some() || fork.is_some() => {
                         match take_given(r, &mut handles, &mut given) {
-                            // The end of a pipe the block names needs the
-                            // session of the pipe service that holds it.
-                            Ok(()) if pipes_named && given[Slot::Pipes as usize].is_none() => {
+                            // The end of a pipe or a terminal the block names
+                            // needs the session of the service that serves it.
+                            Ok(()) if (0..SLOTS).any(|i| needed[i] && given[i].is_none()) => {
                                 Status::BadSize.code()
                             }
                             Ok(()) => 0,

@@ -49,6 +49,9 @@ table-posix-dialog-vz = []
 table-tty = []
 table-tty-vz = []
 table-tty-steps = []
+# The probe of the terminal in C (xtask posix-tty, posix-tty-vz).
+table-posix-tty = []
+table-posix-tty-vz = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

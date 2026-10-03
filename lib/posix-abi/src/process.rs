@@ -541,6 +541,7 @@ impl Shadow {
                 posix_fs::Target::Error => Names::Error,
                 posix_fs::Target::Ram(n) => Names::File(n),
                 posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                posix_fs::Target::Tty(n) => Names::Terminal(n),
             };
             out[count] = Descriptor {
                 fd: fd as u32,

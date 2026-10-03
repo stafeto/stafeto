@@ -118,6 +118,31 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
 /// The quota of the launcher, which the shell and its children get too.
 const DIALOG_QUOTA: u64 = 512 * PAGE;
 
+/// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
+/// console's driver, the terminal service, the RAM files, the process,
+/// clock and pipe services, and the probe, which forks a child of its own
+/// size (the pool of the process service holds it, and its reserve).
+pub const POSIX_TTY_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TABLE[0],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 2 * DIALOG_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
+    POSIX_ABI_TABLE[2],
+    PIPE,
+    Record {
+        name: "posix-tty",
+        program: "posix-tty",
+        args: b"posix-tty\0",
+        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
+        quota: DIALOG_QUOTA,
+        root: true,
+        ..POSIX
+    },
+    TTY,
+];
+
 /// The probes of console input and interruption (posix-threads with
 /// cancel-input, posix-shared): the console's driver, the RAM files, the
 /// process and clock services, and the probe under the name

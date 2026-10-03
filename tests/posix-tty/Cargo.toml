@@ -1,0 +1,17 @@
+[package]
+name = "posix-tty"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The probe of the terminal in C on relibc: termios, isatty, ttyname, the names of terminals"
+build = "build.rs"
+
+[[bin]]
+name = "posix-tty"
+test = false
+bench = false
+
+[dependencies]
+posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }

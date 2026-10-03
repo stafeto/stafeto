@@ -147,6 +147,18 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::TTY,
 ];
 
+/// The probe of the terminal in C over the Virtio console's driver, as
+/// `ramfs::POSIX_TTY_TABLE` on QEMU.
+pub const POSIX_TTY_TABLE: &[Record] = &[
+    CONSOLE,
+    super::ramfs::POSIX_TTY_TABLE[1],
+    super::ramfs::POSIX_TTY_TABLE[2],
+    super::ramfs::POSIX_TTY_TABLE[3],
+    super::ramfs::POSIX_TTY_TABLE[4],
+    super::ramfs::POSIX_TTY_TABLE[5],
+    super::ramfs::TTY,
+];
+
 /// The probes of console input and interruption, as
 /// `ramfs::POSIX_DIALOG_TABLE` on QEMU.
 pub const POSIX_DIALOG_TABLE: &[Record] = &[

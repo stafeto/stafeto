@@ -30,9 +30,25 @@
 //! - ABANDON: no body: the session's long operations that wait go, as
 //!   when the session goes (the threads of an old image at exec). Reply:
 //!   status.
+//! - DRAIN_START: body the terminal u32 (tcdrain). A long operation in two
+//!   steps: READY with no bytes once the service has given the driver all
+//!   the output of the terminal, or WAIT k while some is left (output
+//!   that is stopped, FLOW, keeps it left). DRAIN_TAKE: body k u64, then
+//!   the body of DRAIN_START again (and, the first time, a handle with
+//!   NOTIFY labelled k). DRAIN_CANCEL: body k u64, the terminal u32:
+//!   CANCELLED.
+//! - FLUSH_QUEUES: body the terminal u32, the queue u32 (QUEUE_IN: the
+//!   input not read, QUEUE_OUT: the output the driver did not take,
+//!   QUEUE_BOTH). The writes and drains that wait look again. Reply:
+//!   status.
+//! - FLOW: body the terminal u32, the action u32 (FLOW_OUT_OFF stops the
+//!   terminal's output, FLOW_OUT_ON lets it go on, FLOW_IN_OFF and
+//!   FLOW_IN_ON put the STOP and the START character in the output).
+//!   Reply: status.
 //!
 //! BAD_TERMINAL for a terminal the service does not have, INVALID for an
-//! action past FLUSH. A start past the WAITERS operations that wait on a
+//! action past FLUSH, a queue past QUEUE_BOTH or an action past
+//! FLOW_IN_ON. A start past the WAITERS operations that wait on a
 //! terminal, or past the long operations of a session or of the service,
 //! gets LIMIT_REACHED (EAGAIN).
 
@@ -72,6 +88,17 @@ pub const OWN: u64 = 1 << 63;
 pub const NOW: u32 = 0;
 pub const DRAIN: u32 = 1;
 pub const FLUSH: u32 = 2;
+
+/// FLUSH_QUEUES' queues (TCIFLUSH, TCOFLUSH, TCIOFLUSH).
+pub const QUEUE_IN: u32 = 0;
+pub const QUEUE_OUT: u32 = 1;
+pub const QUEUE_BOTH: u32 = 2;
+
+/// FLOW's actions (TCOOFF, TCOON, TCIOFF, TCION).
+pub const FLOW_OUT_OFF: u32 = 0;
+pub const FLOW_OUT_ON: u32 = 1;
+pub const FLOW_IN_OFF: u32 = 2;
+pub const FLOW_IN_ON: u32 = 3;
 
 /// The control characters of `Termios::cc` (relibc's Linux values).
 pub const NCCS: usize = 32;
@@ -204,10 +231,15 @@ pub enum Method {
     GetAttr = 8,
     SetAttr = 9,
     Abandon = 10,
+    DrainStart = 11,
+    DrainTake = 12,
+    DrainCancel = 13,
+    FlushQueues = 14,
+    Flow = 15,
 }
 
 impl Method {
-    pub const ALL: [Method; 10] = [
+    pub const ALL: [Method; 15] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -218,6 +250,11 @@ impl Method {
         Method::GetAttr,
         Method::SetAttr,
         Method::Abandon,
+        Method::DrainStart,
+        Method::DrainTake,
+        Method::DrainCancel,
+        Method::FlushQueues,
+        Method::Flow,
     ];
 
     pub const fn number(self) -> u16 {
@@ -233,7 +270,7 @@ impl Method {
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 /// READ_START or READ_TAKE: the key of a take, the terminal and the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -328,7 +365,7 @@ impl<'a> Write<'a> {
     }
 }
 
-/// READ_CANCEL or WRITE_CANCEL: the key and the terminal.
+/// READ_CANCEL, WRITE_CANCEL or DRAIN_CANCEL: the key and the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancel {
     pub key: u64,
@@ -337,7 +374,12 @@ pub struct Cancel {
 
 impl Cancel {
     pub fn write(&self, method: Method, w: &mut Writer) -> Result<(), Status> {
-        if self.key == 0 || !matches!(method, Method::ReadCancel | Method::WriteCancel) {
+        if self.key == 0
+            || !matches!(
+                method,
+                Method::ReadCancel | Method::WriteCancel | Method::DrainCancel
+            )
+        {
             return Err(Status::BadSize);
         }
         method.header().write(w)?;
@@ -352,6 +394,64 @@ impl Cancel {
             return Err(Status::BadSize);
         }
         Ok(Cancel { key, terminal })
+    }
+}
+
+/// DRAIN_START or DRAIN_TAKE: the key of a take and the terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Drain {
+    pub key: Option<u64>,
+    pub terminal: u32,
+}
+
+impl Drain {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        match self.key {
+            None => Method::DrainStart.header().write(w)?,
+            Some(0) => return Err(Status::BadSize),
+            Some(key) => {
+                Method::DrainTake.header().write(w)?;
+                w.u64(key)?;
+            }
+        }
+        w.u32(self.terminal)
+    }
+
+    /// The body of DRAIN_START (`take` false) or DRAIN_TAKE: BAD_SIZE for
+    /// a key of 0.
+    pub fn parse(mut body: Reader<'_>, take: bool) -> Result<Drain, Status> {
+        let key = if take { Some(body.u64()?) } else { None };
+        let terminal = body.u32()?;
+        body.finish()?;
+        if key == Some(0) {
+            return Err(Status::BadSize);
+        }
+        Ok(Drain { key, terminal })
+    }
+}
+
+/// FLUSH_QUEUES (`Method::FlushQueues`) or FLOW (`Method::Flow`): the
+/// terminal and one word, the queue or the action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Control {
+    pub terminal: u32,
+    pub word: u32,
+}
+
+impl Control {
+    pub fn write(&self, method: Method, w: &mut Writer) -> Result<(), Status> {
+        if !matches!(method, Method::FlushQueues | Method::Flow) {
+            return Err(Status::BadSize);
+        }
+        method.header().write(w)?;
+        w.u32(self.terminal)?;
+        w.u32(self.word)
+    }
+
+    pub fn parse(mut body: Reader<'_>) -> Result<Control, Status> {
+        let (terminal, word) = (body.u32()?, body.u32()?);
+        body.finish()?;
+        Ok(Control { terminal, word })
     }
 }
 
@@ -409,13 +509,31 @@ pub fn written(result: &[u8]) -> Result<u32, Status> {
     Ok(count)
 }
 
+/// The numbers of the interface are Linux's (relibc's termios.h and
+/// sys/ioctl.h, whose const assertions hold the same on its side).
+const _: () = {
+    assert!(NCCS == 32 && TERMIOS_LEN == 56);
+    assert!(VINTR == 0 && VQUIT == 1 && VERASE == 2 && VKILL == 3 && VEOF == 4);
+    assert!(VTIME == 5 && VMIN == 6 && VSTART == 8 && VSTOP == 9);
+    assert!(VSUSP == 10 && VEOL == 11 && VWERASE == 14);
+    assert!(ISTRIP == 0o40 && INLCR == 0o100 && IGNCR == 0o200 && ICRNL == 0o400);
+    assert!(OPOST == 1 && ONLCR == 4 && OCRNL == 0o10);
+    assert!(ISIG == 1 && ICANON == 2 && ECHO == 0o10 && ECHOE == 0o20);
+    assert!(ECHOK == 0o40 && ECHONL == 0o100 && NOFLSH == 0o200 && TOSTOP == 0o400);
+    assert!(ECHOCTL == 0o1000 && ECHOKE == 0o4000 && IEXTEN == 0o100000);
+    assert!(B38400 == 0o17 && CS8_CREAD_B38400 == 0o277);
+    assert!(NOW == 0 && DRAIN == 1 && FLUSH == 2);
+    assert!(QUEUE_IN == 0 && QUEUE_OUT == 1 && QUEUE_BOTH == 2);
+    assert!(FLOW_OUT_OFF == 0 && FLOW_OUT_ON == 1 && FLOW_IN_OFF == 2 && FLOW_IN_ON == 3);
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=11u16 {
+        for number in 0..=16u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {
@@ -547,5 +665,51 @@ mod tests {
         let refused = proto_wire::reply(Status::Unknown(BAD_TERMINAL));
         assert_eq!(attr_reply(&refused), Err(Status::Unknown(BAD_TERMINAL)));
         assert_eq!(written(&3u32.to_le_bytes()), Ok(3));
+        for drain in [
+            Drain {
+                key: None,
+                terminal: 0,
+            },
+            Drain {
+                key: Some(5),
+                terminal: 0,
+            },
+        ] {
+            let mut w = Writer::new();
+            drain.write(&mut w).unwrap();
+            let body = Reader::new(&w.as_bytes()[HEADER_LEN..]);
+            assert_eq!(Drain::parse(body, drain.key.is_some()), Ok(drain));
+        }
+        let zero = Drain {
+            key: Some(0),
+            terminal: 0,
+        };
+        assert_eq!(zero.write(&mut Writer::new()), Err(Status::BadSize));
+        let cancel = Cancel {
+            key: 4,
+            terminal: 0,
+        };
+        let mut w = Writer::new();
+        cancel.write(Method::DrainCancel, &mut w).unwrap();
+        assert_eq!(
+            Cancel::parse(Reader::new(&w.as_bytes()[HEADER_LEN..])),
+            Ok(cancel)
+        );
+        let control = Control {
+            terminal: 0,
+            word: QUEUE_BOTH,
+        };
+        for method in [Method::FlushQueues, Method::Flow] {
+            let mut w = Writer::new();
+            control.write(method, &mut w).unwrap();
+            assert_eq!(
+                Control::parse(Reader::new(&w.as_bytes()[HEADER_LEN..])),
+                Ok(control)
+            );
+        }
+        assert_eq!(
+            control.write(Method::GetAttr, &mut Writer::new()),
+            Err(Status::BadSize)
+        );
     }
 }

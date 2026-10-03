@@ -264,6 +264,7 @@ dependencies = [
  "posix-path",
  "proto-fs",
  "proto-pipe",
+ "proto-tty",
  "proto-wire",
  "rt",
 ]
@@ -304,6 +305,7 @@ dependencies = [
  "posix-thread",
  "posix-types",
  "proto-process",
+ "proto-tty",
  "rt",
 ]
 
@@ -412,6 +414,13 @@ dependencies = [
  "posix-abi",
  "posix-thread",
  "rt",
+]
+
+[[package]]
+name = "posix-tty"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
 ]
 
 [[package]]

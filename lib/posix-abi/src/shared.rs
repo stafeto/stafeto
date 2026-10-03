@@ -228,10 +228,15 @@ fn pipe_reply(transport: Transport, end: u32, count: u32, out: &mut Writer) -> R
 /// The reply of a read of the console through the terminal service (5f),
 /// its bytes once they came.
 #[inline(never)]
-fn terminal_reply(transport: Transport, count: u32, out: &mut Writer) -> Result<(), i32> {
+fn terminal_reply(
+    transport: Transport,
+    number: u32,
+    count: u32,
+    out: &mut Writer,
+) -> Result<(), i32> {
     let mut bytes = [0; posix_fs::MAX_READ];
     let extent = (count as usize).min(bytes.len());
-    let n = crate::terminal::read(transport, &mut bytes[..extent])?;
+    let n = crate::terminal::read(transport, number, &mut bytes[..extent])?;
     Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
 }
 
@@ -243,10 +248,19 @@ fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
     held(fd, |transport, target| match target {
         Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
         Target::Input if transport.terminal().is_some() => {
-            terminal_reply(transport, count, &mut *out)
+            terminal_reply(transport, proto_tty::CONSOLE, count, &mut *out)
         }
+        Target::Tty(number) => terminal_reply(transport, number, count, &mut *out),
         target => file_reply(transport, target, count, &mut *out),
     })
+}
+
+/// What an open of a name gave: a description of the RAM file service, or
+/// a terminal of the terminal service.
+#[derive(Clone, Copy)]
+enum Opened {
+    File(u32),
+    Terminal(u32),
 }
 
 /// Open: the path resolved under the lock, the service's open outside it,
@@ -272,18 +286,32 @@ fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
             return Err(ENOTDIR);
         }
         let name = path.as_str().map_err(crate::error)?;
+        // The names of terminals are the layer's to resolve (5f): the
+        // process's session with the terminal service serves them, and no
+        // request goes to the RAM files.
+        if let Some(terminal) = transport.terminal_of(path).map_err(crate::error)? {
+            if flags & O_DIRECTORY != 0 {
+                return Err(ENOTDIR);
+            }
+            return Ok((transport, Opened::Terminal(terminal)));
+        }
         let opened = transport
             .open(name, (flags & O_ACCMODE) as u32 | directory)
             .map_err(crate::error)?;
-        Ok((transport, opened))
+        Ok((transport, Opened::File(opened)))
     })?;
     let inserted = process_state(|files| {
-        files
-            .insert(opened, crate::descriptor_flags(flags))
-            .map_err(crate::error)
+        let flags = crate::descriptor_flags(flags);
+        match opened {
+            Opened::File(fd) => files.insert(fd, flags),
+            Opened::Terminal(number) => files.insert_terminal(number, flags),
+        }
+        .map_err(crate::error)
     });
-    if inserted.is_err() {
-        let _ = transport.release(Some(Target::Ram(opened)));
+    if inserted.is_err()
+        && let Opened::File(fd) = opened
+    {
+        let _ = transport.release(Some(Target::Ram(fd)));
     }
     inserted.map(u64::from)
 }
@@ -298,7 +326,10 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             match target {
                 // The write of the terminal waits here, outside the lock.
                 Target::Output | Target::Error if transport.terminal().is_some() => {
-                    crate::terminal::write(transport, bytes).map(|n| n as u64)
+                    crate::terminal::write(transport, proto_tty::CONSOLE, bytes).map(|n| n as u64)
+                }
+                Target::Tty(number) => {
+                    crate::terminal::write(transport, number, bytes).map(|n| n as u64)
                 }
                 Target::Output | Target::Error => transport
                     .input()

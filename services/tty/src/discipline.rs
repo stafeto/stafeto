@@ -180,6 +180,9 @@ pub struct Terminal {
     signals: u8,
     /// The bytes of input dropped for a full queue or line.
     dropped: u64,
+    /// The output is stopped (tcflow with TCOOFF): none of it goes to the
+    /// device until it is started again.
+    stopped: bool,
 }
 
 impl Default for Terminal {
@@ -198,6 +201,7 @@ impl Terminal {
             last_input: 0,
             signals: 0,
             dropped: 0,
+            stopped: false,
         }
     }
 
@@ -261,6 +265,32 @@ impl Terminal {
     pub fn flush_input(&mut self) {
         self.queue.clear();
         self.cooked = 0;
+    }
+
+    /// The output not taken by the device goes (tcflush with TCOFLUSH).
+    pub fn flush_output(&mut self) {
+        self.output.clear();
+    }
+
+    /// The output stops, or goes on (tcflow with TCOOFF, TCOON).
+    pub fn set_stopped(&mut self, stopped: bool) {
+        self.stopped = stopped;
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// The control character `index` (VSTOP, VSTART) goes to the output as
+    /// it is, past the output processing (tcflow with TCIOFF, TCION); false
+    /// when it is off or the ring is full.
+    pub fn send_control(&mut self, index: usize) -> bool {
+        let c = self.termios.cc[index];
+        if c == DISABLED || self.output.len == OUTPUT {
+            return false;
+        }
+        self.output.push(c);
+        true
     }
 
     /// The signals the input asked for since the last call, one bit each,
@@ -652,6 +682,22 @@ mod tests {
             out.extend(piece);
         }
         out
+    }
+
+    /// tcflow's TCIOFF and TCION put the STOP and the START character of
+    /// the settings in the output as they are; a character that is off
+    /// goes nowhere.
+    #[test]
+    fn the_stop_and_start_characters_go_out_as_they_are() {
+        let mut t = Terminal::new();
+        assert!(t.send_control(proto_tty::VSTOP));
+        assert!(t.send_control(proto_tty::VSTART));
+        assert_eq!(drain(&mut t), [0x13, 0x11]);
+        let mut settings = *t.termios();
+        settings.cc[proto_tty::VSTART] = DISABLED;
+        t.set_termios(settings, false);
+        assert!(!t.send_control(proto_tty::VSTART));
+        assert_eq!(t.output_len(), 0);
     }
 
     fn read(t: &mut Terminal, count: usize) -> Read {

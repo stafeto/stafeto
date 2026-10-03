@@ -226,6 +226,18 @@ fn procs() -> Vec<RootFile> {
     ]
 }
 
+/// The probe of the terminal (5f): itself as the file its "run" and
+/// "spawned" roles start from, and the null device, a character device
+/// that is no terminal.
+fn posix_tty() -> Vec<RootFile> {
+    vec![
+        dir("/bin"),
+        file("/bin/posix-tty", 0o755, ROOT, "posix-tty"),
+        dir("/dev"),
+        null_device(),
+    ]
+}
+
 /// The probe of the longest step of the process service (5c): the probe
 /// itself as the file its children run.
 fn steps() -> Vec<RootFile> {
@@ -322,6 +334,8 @@ pub const IMAGES: &[&str] = &[
     "boot-ash-dialog.img",
     "boot-posix-procs.img",
     "boot-posix-steps.img",
+    "boot-posix-tty.img",
+    "boot-posix-tty-vz.img",
     "rtbench-posix.img",
     "rtbench-posix-vz.img",
     "rtbench-posix-short.img",
@@ -334,6 +348,7 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" => procs(),
         "boot-posix-steps.img" => steps(),
+        "boot-posix-tty.img" | "boot-posix-tty-vz.img" => posix_tty(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
     }
@@ -435,6 +450,8 @@ mod tests {
                 "boot-ash-dialog.img" => &crate::ASH_INTERACTIVE_PROGRAMS,
                 "boot-posix-procs.img" => &crate::POSIX_PROCS_PROGRAMS,
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
+                "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
+                "boot-posix-tty-vz.img" => &crate::POSIX_TTY_VZ_PROGRAMS,
                 "rtbench-posix.img" | "rtbench-posix-short.img" => &crate::RTBENCH_POSIX_PROGRAMS,
                 "rtbench-posix-vz.img" => &crate::RTBENCH_POSIX_VZ_PROGRAMS,
                 other => panic!("no programs known for {other}"),

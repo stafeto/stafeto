@@ -26,8 +26,9 @@ use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use proto_init::ServiceArgs;
 use proto_tty::{
-    BAD_TERMINAL, CONSOLE, Cancel, FLUSH, INVALID, MAX_READ, Method, OWN, Read, SetAttr, VERSION,
-    WAITERS, Write,
+    BAD_TERMINAL, CONSOLE, Cancel, Control, Drain, FLOW_IN_OFF, FLOW_IN_ON, FLOW_OUT_OFF,
+    FLOW_OUT_ON, FLUSH, INVALID, MAX_READ, Method, OWN, QUEUE_BOTH, QUEUE_IN, QUEUE_OUT, Read,
+    SetAttr, VERSION, VSTART, VSTOP, WAITERS, Write,
 };
 use proto_uart::{ReadKey, ReadRequest, RoomReply, WriteReply, WriteRequest};
 use proto_wire::clones::Clones;
@@ -141,6 +142,7 @@ fn main(_: u64) -> u64 {
         input: Input::Idle,
         readers: Waiters::new(),
         writers: Waiters::new(),
+        drainers: Waiters::new(),
         timer,
         _view: view,
         armed: None,
@@ -162,6 +164,15 @@ fn main(_: u64) -> u64 {
     rt::service::report_steps(5);
     let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
     STOPPED
+}
+
+/// What a long operation that waits is.
+#[derive(Clone, Copy)]
+enum Wait {
+    /// A read, with the deadline of its VTIME.
+    Read(Option<u64>),
+    Write,
+    Drain,
 }
 
 /// Where the read of input from the driver stands.
@@ -193,6 +204,8 @@ struct Tty {
     input: Input,
     readers: Waiters<WAITERS>,
     writers: Waiters<WAITERS>,
+    /// The drains (tcdrain) that wait for the output to go.
+    drainers: Waiters<WAITERS>,
     /// The timer of VTIME and the deadline it is armed for.
     timer: Handle<Timer>,
     _view: Handle<Channel>,
@@ -346,9 +359,20 @@ impl Tty {
                 self.kick();
             }
         }
+        self.tell_output();
+    }
+
+    /// The writes that wait hear of room, and the drains of an output that
+    /// went.
+    fn tell_output(&mut self) {
         if self.console.writable() {
             for w in self.writers.iter() {
                 self.ops.tell(w.label, w.key);
+            }
+        }
+        if self.console.output_len() == 0 {
+            for d in self.drainers.iter() {
+                self.ops.tell(d.label, d.key);
             }
         }
     }
@@ -483,24 +507,29 @@ impl Tty {
             .map_err(|e| Answer::Status(Status::Kernel(e)))
     }
 
-    /// A read or write with nothing to do: a start makes the operation
-    /// and has it wait in `readers` or `writers` (WAIT k); a take keeps
-    /// the handle it brought (ARMED) or waits on with the one it has.
+    /// A read, write or drain with nothing to do: a start makes the
+    /// operation and has it wait in `readers`, `writers` or `drainers`
+    /// (WAIT k); a take keeps the handle it brought (ARMED) or waits on
+    /// with the one it has.
     fn wait(
         &mut self,
         s: &mut Session<Client, 0>,
         r: &mut Request<'_>,
         key: Option<u64>,
-        reader: Option<Option<u64>>,
+        kind: Wait,
         notify: Option<Handle<Channel>>,
     ) -> Answer {
         let label = s.label();
+        let reader = match kind {
+            Wait::Read(deadline) => Some(deadline),
+            Wait::Write | Wait::Drain => None,
+        };
         match key {
             None => {
-                let list = if reader.is_some() {
-                    &mut self.readers
-                } else {
-                    &mut self.writers
+                let list = match kind {
+                    Wait::Read(_) => &mut self.readers,
+                    Wait::Write => &mut self.writers,
+                    Wait::Drain => &mut self.drainers,
                 };
                 if list.len() == WAITERS {
                     return Answer::Status(Status::Kernel(Error::LimitReached));
@@ -545,6 +574,7 @@ impl Tty {
             self.ops.finish(&mut s.data.long, label, key);
             self.readers.remove(label, key);
             self.writers.remove(label, key);
+            self.drainers.remove(label, key);
             self.arm_timer();
         }
     }
@@ -579,7 +609,9 @@ impl Tty {
                 self.finish(s, read.key);
                 long_answer(r, long::Reply::Ready(&out[..n]))
             }
-            discipline::Read::Wait(deadline) => self.wait(s, r, read.key, Some(deadline), notify),
+            discipline::Read::Wait(deadline) => {
+                self.wait(s, r, read.key, Wait::Read(deadline), notify)
+            }
         }
     }
 
@@ -604,7 +636,7 @@ impl Tty {
         let part = &write.bytes[..write.bytes.len().min(WRITE_STEP)];
         let n = self.console.write(part);
         if n == 0 {
-            return self.wait(s, r, write.key, None, notify);
+            return self.wait(s, r, write.key, Wait::Write, notify);
         }
         self.finish(s, write.key);
         // The output goes to the driver in the next step.
@@ -612,7 +644,36 @@ impl Tty {
         long_answer(r, long::Reply::Ready(&(n as u32).to_le_bytes()))
     }
 
-    /// READ_CANCEL or WRITE_CANCEL: the operation goes, with no effect.
+    /// DRAIN_START (`take` false) or DRAIN_TAKE: READY once no output is
+    /// left for the driver.
+    fn drain(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>, take: bool) -> Answer {
+        let drain = match Drain::parse(r.body(), take) {
+            Ok(drain) => drain,
+            Err(status) => return Answer::Status(status),
+        };
+        let notify = match Self::notify_of(r, take) {
+            Ok(notify) => notify,
+            Err(answer) => return answer,
+        };
+        if drain.terminal != CONSOLE {
+            return status(BAD_TERMINAL);
+        }
+        if let Some(key) = drain.key
+            && self.drainers.find(s.label(), key).is_none()
+        {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        }
+        if self.console.output_len() == 0 {
+            self.finish(s, drain.key);
+            return long_answer(r, long::Reply::Ready(&[]));
+        }
+        // The output goes to the driver in the step, which tells the drain.
+        self.kick();
+        self.wait(s, r, drain.key, Wait::Drain, notify)
+    }
+
+    /// READ_CANCEL, WRITE_CANCEL or DRAIN_CANCEL: the operation goes, with
+    /// no effect.
     fn cancel(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         let cancel = match Cancel::parse(r.body()) {
             Ok(cancel) => cancel,
@@ -670,6 +731,60 @@ impl Tty {
         Answer::Reply(Outgoing::new())
     }
 
+    /// FLUSH_QUEUES: the input not read, or the output the driver did not
+    /// take, goes.
+    fn flush_queues(&mut self, r: &mut Request<'_>) -> Answer {
+        let control = match Control::parse(r.body()) {
+            Ok(control) => control,
+            Err(status) => return Answer::Status(status),
+        };
+        if control.terminal != CONSOLE {
+            return status(BAD_TERMINAL);
+        }
+        if !matches!(control.word, QUEUE_IN | QUEUE_OUT | QUEUE_BOTH) {
+            return status(INVALID);
+        }
+        if control.word != QUEUE_OUT {
+            self.console.flush_input();
+            self.tell_readers();
+        }
+        if control.word != QUEUE_IN {
+            self.console.flush_output();
+            self.tell_output();
+        }
+        Answer::Status(Status::Ok)
+    }
+
+    /// FLOW: the output stops or goes on, or the STOP or START character
+    /// goes out.
+    fn flow(&mut self, r: &mut Request<'_>) -> Answer {
+        let control = match Control::parse(r.body()) {
+            Ok(control) => control,
+            Err(status) => return Answer::Status(status),
+        };
+        if control.terminal != CONSOLE {
+            return status(BAD_TERMINAL);
+        }
+        match control.word {
+            FLOW_OUT_OFF => self.console.set_stopped(true),
+            FLOW_OUT_ON => {
+                self.console.set_stopped(false);
+                self.kick();
+            }
+            FLOW_IN_OFF | FLOW_IN_ON => {
+                let index = if control.word == FLOW_IN_OFF {
+                    VSTOP
+                } else {
+                    VSTART
+                };
+                self.console.send_control(index);
+                self.kick();
+            }
+            _ => return status(INVALID),
+        }
+        Answer::Status(Status::Ok)
+    }
+
     /// SET_ATTR: new settings at once (DRAIN as NOW, FLUSH dropping the
     /// input not read); the reads that wait look again.
     fn set_attr(&mut self, r: &mut Request<'_>) -> Answer {
@@ -701,7 +816,13 @@ impl Service<0> for Tty {
             Some(Method::ReadTake) => self.read(s, r, true),
             Some(Method::WriteStart) => self.write(s, r, false),
             Some(Method::WriteTake) => self.write(s, r, true),
-            Some(Method::ReadCancel | Method::WriteCancel) => self.cancel(s, r),
+            Some(Method::DrainStart) => self.drain(s, r, false),
+            Some(Method::DrainTake) => self.drain(s, r, true),
+            Some(Method::FlushQueues) => self.flush_queues(r),
+            Some(Method::Flow) => self.flow(r),
+            Some(Method::ReadCancel | Method::WriteCancel | Method::DrainCancel) => {
+                self.cancel(s, r)
+            }
             Some(Method::Clone) => self.clone_session(r),
             Some(Method::GetAttr) => self.get_attr(r),
             Some(Method::SetAttr) => self.set_attr(r),
@@ -722,6 +843,7 @@ impl Service<0> for Tty {
         self.ops.gone(&mut s.data.long);
         self.readers.remove_all(label);
         self.writers.remove_all(label);
+        self.drainers.remove_all(label);
         self.arm_timer();
     }
 

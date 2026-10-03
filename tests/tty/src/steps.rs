@@ -13,6 +13,9 @@
 //!   holds its output, until one waits; the driver's notification of room
 //!   then wakes it, and one more waits and is cancelled;
 //! - SET_ATTR, GET_ATTR, CLONE, ABANDON, the timer of VTIME;
+//! - tcdrain, tcflush and tcflow: a drain that waits for the output the
+//!   driver holds (start, take, cancel), FLOW in its four actions,
+//!   FLUSH_QUEUES of each queue, and a drain that ends at once;
 //! - at the end the driver took every byte of echo and output: none was
 //!   lost on the way through WRITE_SOME and ROOM.
 
@@ -20,7 +23,9 @@ use crate::stub::{FEED, HOLD, TAKEN};
 use crate::{Probe, Step, read_request, status_of, write_request};
 use abi::MESSAGE_MAX;
 use proto_tty::{
-    CONSOLE, Cancel, FLUSH, ICANON, MAX_READ, MAX_WRITE, Method, NOW, Termios, VMIN, VTIME, WAITERS,
+    CONSOLE, Cancel, Control, Drain, FLOW_IN_OFF, FLOW_IN_ON, FLOW_OUT_OFF, FLOW_OUT_ON, FLUSH,
+    ICANON, MAX_READ, MAX_WRITE, Method, NOW, QUEUE_BOTH, QUEUE_IN, QUEUE_OUT, Termios, VMIN,
+    VTIME, WAITERS,
 };
 use proto_wire::{Header, Reader, Status, Writer};
 use rt::Handle;
@@ -231,5 +236,93 @@ pub fn run(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> 
     if taken != want {
         return Err("bytes were lost on the way to the driver");
     }
+    Ok(())
+}
+
+/// A request that answers with a status alone.
+fn status_call(probe: &Probe, request: &[u8]) -> Result<(), &'static str> {
+    let mut buffer = [0; MESSAGE_MAX];
+    status_of(Probe::call_on(&probe.tty, request, None, &mut buffer).map_err(fail)?).map_err(fail)
+}
+
+/// tcdrain, tcflush and tcflow with output in the terminal: the driver
+/// holds it, so a drain waits, and a flush drops it. It runs after `run`
+/// returned, on the small stack of the probe.
+pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
+    let stub = &rt::service::connect(parent, "uart").map_err(|_| "no session with the driver")?;
+    let mut out = [0u8; 16];
+    stub_call(stub, HOLD, &1u32.to_le_bytes()).map_err(fail)?;
+    let mut w = Writer::new();
+    write_request(None, b"drain\n", &mut w).map_err(fail)?;
+    let mut count = [0; 4];
+    if probe.step_on(&probe.tty, w.as_bytes(), None, &mut count) != Ok(Step::Ready(4)) {
+        return Err("a write for the drain");
+    }
+    // The drain waits while the output is there: start, take (armed),
+    // cancel.
+    let mut w = Writer::new();
+    Drain {
+        key: None,
+        terminal: CONSOLE,
+    }
+    .write(&mut w)
+    .map_err(fail)?;
+    let Ok(Step::Wait(key)) = probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) else {
+        return Err("a drain with output left did not wait");
+    };
+    let mut w = Writer::new();
+    Drain {
+        key: Some(key),
+        terminal: CONSOLE,
+    }
+    .write(&mut w)
+    .map_err(fail)?;
+    let handle = probe.labelled(key).map_err(fail)?;
+    if probe.step_on(&probe.tty, w.as_bytes(), Some(handle), &mut out) != Ok(Step::Armed) {
+        return Err("a take of a drain did not arm");
+    }
+    let mut w = Writer::new();
+    Cancel {
+        key,
+        terminal: CONSOLE,
+    }
+    .write(Method::DrainCancel, &mut w)
+    .map_err(fail)?;
+    if probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) != Ok(Step::Cancelled) {
+        return Err("a cancel of a drain");
+    }
+    // The four actions of FLOW, the output stopped and started last, and
+    // each queue of FLUSH_QUEUES.
+    for (method, word) in [
+        (Method::Flow, FLOW_OUT_OFF),
+        (Method::Flow, FLOW_IN_OFF),
+        (Method::Flow, FLOW_IN_ON),
+        (Method::Flow, FLOW_OUT_ON),
+        (Method::FlushQueues, QUEUE_IN),
+        (Method::FlushQueues, QUEUE_OUT),
+        (Method::FlushQueues, QUEUE_BOTH),
+    ] {
+        let mut w = Writer::new();
+        Control {
+            terminal: CONSOLE,
+            word,
+        }
+        .write(method, &mut w)
+        .map_err(fail)?;
+        status_call(probe, w.as_bytes())?;
+    }
+    // Nothing is left: a drain ends at once.
+    let mut w = Writer::new();
+    Drain {
+        key: None,
+        terminal: CONSOLE,
+    }
+    .write(&mut w)
+    .map_err(fail)?;
+    if probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) != Ok(Step::Ready(0)) {
+        return Err("a drain with no output left did not end");
+    }
+    stub_call(stub, HOLD, &0u32.to_le_bytes()).map_err(fail)?;
+    rt::println!("tty-probe: tcdrain, tcflush and tcflow steps made");
     Ok(())
 }

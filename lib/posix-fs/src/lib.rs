@@ -136,8 +136,10 @@ pub const MAX_CWD: usize = MAX_PATH;
 
 /// What a descriptor names: the console's input, output or error, an
 /// open description of the RAM file service by its number in the
-/// process's session, or an end of a pipe of the pipe service by its
-/// number there (5e).
+/// process's session, an end of a pipe of the pipe service by its
+/// number there (5e), or a terminal of the terminal service that the
+/// process opened by name (5f): its number, `proto_tty::CONSOLE` for
+/// `/dev/console` and `/dev/tty`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
     Input,
@@ -145,6 +147,24 @@ pub enum Target {
     Error,
     Ram(u32),
     Pipe(u32),
+    Tty(u32),
+}
+
+/// The name `ttyname` gives the terminal `terminal`.
+pub fn terminal_path(terminal: u32) -> Option<&'static str> {
+    (terminal == proto_tty::CONSOLE).then_some("/dev/console")
+}
+
+/// The terminal a path names, as the layer resolves it itself (5f,
+/// decision 5): `path` is absolute and normalised. The names of the
+/// terminal service go to its session and never to the RAM file
+/// service. `/dev/tty` is the controlling terminal of the caller's
+/// session, which the console is until sessions come (5f, T3).
+pub fn terminal_named(path: &str) -> Option<u32> {
+    match path {
+        "/dev/console" | "/dev/tty" => Some(proto_tty::CONSOLE),
+        _ => None,
+    }
 }
 
 /// One process's file state, mutated by one owner: the table of
@@ -413,7 +433,39 @@ impl Transport {
         })
     }
 
+    /// The terminal a descriptor's `target` is: the console's standard
+    /// descriptors when the process has a session with the terminal
+    /// service, and the terminals opened by name; None for the rest.
+    pub fn terminal_number(&self, target: Target) -> Option<u32> {
+        match target {
+            Target::Tty(number) => Some(number),
+            Target::Input | Target::Output | Target::Error if self.terminal().is_some() => {
+                Some(proto_tty::CONSOLE)
+            }
+            _ => None,
+        }
+    }
+
+    /// The terminal `path` names, when the process has a session with the
+    /// terminal service to open it through (`terminal_named`).
+    pub fn terminal_of(&self, path: &Resolved) -> Result<Option<u32>, FsError> {
+        if self.terminal().is_none() {
+            return Ok(None);
+        }
+        let named = terminal_named(path.as_str()?);
+        if named.is_some() && path.trailing_slash {
+            return Err(FsError::NotDirectory);
+        }
+        Ok(named)
+    }
+
     pub fn stat(&self, path: &Resolved) -> Result<Metadata, FsError> {
+        if self.terminal_of(path)?.is_some() {
+            return Ok(Metadata {
+                kind: FileKind::Character,
+                size: 0,
+            });
+        }
         let meta = self.files().lookup(path.as_str()?).map_err(FsError::from)?;
         let kind = FileKind::from_wire(meta.kind)?;
         if path.trailing_slash && kind == FileKind::Regular {
@@ -426,6 +478,9 @@ impl Transport {
     }
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
+        if self.terminal_of(path)?.is_some() {
+            return Ok(CONSOLE_INFO);
+        }
         let info = self
             .files()
             .node_information(path.as_str()?)
@@ -709,6 +764,18 @@ impl PosixFs {
     pub fn insert(&mut self, fd: u32, flags: DescriptorFlags) -> Result<u32, FsError> {
         self.descriptors
             .insert(Target::Ram(fd), flags)
+            .map_err(FsError::from)
+    }
+
+    /// The lowest free descriptor for terminal `terminal` of the terminal
+    /// service (an open of its name, `terminal_named`).
+    pub fn insert_terminal(
+        &mut self,
+        terminal: u32,
+        flags: DescriptorFlags,
+    ) -> Result<u32, FsError> {
+        self.descriptors
+            .insert(Target::Tty(terminal), flags)
             .map_err(FsError::from)
     }
 

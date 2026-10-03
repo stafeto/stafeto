@@ -733,7 +733,9 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-rtbench-posix-vz") as usize
     + cfg!(feature = "table-tty") as usize
     + cfg!(feature = "table-tty-vz") as usize
-    + cfg!(feature = "table-tty-steps") as usize;
+    + cfg!(feature = "table-tty-steps") as usize
+    + cfg!(feature = "table-posix-tty") as usize
+    + cfg!(feature = "table-posix-tty-vz") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -765,7 +767,9 @@ const _: () = assert!(
     feature = "table-rtbench-posix-vz",
     feature = "table-tty",
     feature = "table-tty-vz",
-    feature = "table-tty-steps"
+    feature = "table-tty-steps",
+    feature = "table-posix-tty",
+    feature = "table-posix-tty-vz"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -814,6 +818,10 @@ pub const TABLE: &[Record] = ramfs::TTY_TABLE;
 pub const TABLE: &[Record] = vz::TTY_TABLE;
 #[cfg(feature = "table-tty-steps")]
 pub const TABLE: &[Record] = ramfs::TTY_STEPS_TABLE;
+#[cfg(feature = "table-posix-tty")]
+pub const TABLE: &[Record] = ramfs::POSIX_TTY_TABLE;
+#[cfg(feature = "table-posix-tty-vz")]
+pub const TABLE: &[Record] = vz::POSIX_TTY_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1473,6 +1481,20 @@ mod tests {
                     "clock",
                     "pipe",
                     "busybox-probe"
+                ]
+            );
+        }
+        for table in [vz::POSIX_TTY_TABLE, ramfs::POSIX_TTY_TABLE] {
+            assert_eq!(
+                order_of(table),
+                [
+                    "uart",
+                    "tty",
+                    "ramfs",
+                    "posix",
+                    "clock",
+                    "pipe",
+                    "posix-tty"
                 ]
             );
         }
