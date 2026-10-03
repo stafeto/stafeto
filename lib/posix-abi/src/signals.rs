@@ -719,7 +719,7 @@ static PARKING: [AtomicU64; crate::relibc::PLACES] =
 const LOOK_AGAIN_NS: u64 = 1_000_000;
 
 /// Stops every other thread of the process for an exec or a fork (spec 2,
-/// 3.2 step 1, mya2.V6). A thread with its entry of signals is asked for
+/// 3.2 step 1). A thread with its entry of signals is asked for
 /// it and parks there, outside every critical section of the layer, so it
 /// holds no lock of the layer; one that waits in the kernel outside a
 /// critical section counts as stopped, since its entry, asked for, comes

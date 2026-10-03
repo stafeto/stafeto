@@ -2246,7 +2246,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         ));
     }
     // ForkStart makes a process as SpawnStart does and stays within it
-    // (design 5d, T6); the copy of a fork has run, in steps of the loader.
+    // (5d); the copy of a fork has run, in steps of the loader.
     let longest = |kind: usize| rows.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
     let (spawn, fork_start, fork_commit) = (longest(22), longest(34), longest(35));
     if fork_start == 0 || fork_commit == 0 || fork_start > spawn {

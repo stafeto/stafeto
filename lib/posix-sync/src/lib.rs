@@ -184,7 +184,9 @@ fn raised(block: &Block) -> bool {
 /// Moves the thread of `block` to `level` through its own handle.
 fn set_level(block: &Block, level: u8) {
     if let Some(thread) = own_thread(block) {
-        let _ = sys::thread_set_priority(&thread, level, Policy::Fifo);
+        let policy =
+            Policy::from_raw(block.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
+        let _ = sys::thread_set_priority(&thread, level, policy);
     }
 }
 

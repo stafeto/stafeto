@@ -77,6 +77,12 @@ pub unsafe fn after_fork(own: Handle<Thread>) -> Result<(), i32> {
     use posix_thread::flag;
     let block = own_block();
     let base = sys::thread_info(&own).map_err(|_| EIO)?.base;
+    // The loader's thread runs round robin: the parent's thread's policy
+    // comes back (FIFO for one that asked for it).
+    let policy = rt::abi::Policy::from_raw(block.policy.load(Ordering::Relaxed));
+    if let Some(rt::abi::Policy::Fifo) = policy {
+        let _ = sys::thread_set_priority(&own, base, rt::abi::Policy::Fifo);
+    }
     let channel = sys::channel_create(base).map_err(|_| EAGAIN)?;
     let timer = sys::timer_create(&channel, base).map_err(|_| EAGAIN)?;
     let id = block.thread_id;
@@ -161,7 +167,7 @@ fn close_raw(raw: u64) {
     }
 }
 
-/// Moves the calling thread to kernel level `level` under FIFO (1 to one
+/// Moves the calling thread to kernel level `level` with its policy (1 to one
 /// below the process's ceiling; EINVAL otherwise) through its own handle in
 /// its block, and makes it the thread's base level, which the lock of a
 /// bucket returns to. A Rust call for the measurements of rtbench 2
@@ -177,7 +183,11 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     if level == 0 || level >= crate::ceiling().map_err(|_| EIO)? {
         return Err(EINVAL);
     }
-    sys::thread_set_priority(&thread, level, Policy::Fifo).map_err(|_| EINVAL)?;
+    // The thread keeps its policy: round robin (SCHED_OTHER) unless it
+    // asked for FIFO, which comes with the scheduling attributes of 5h.
+    let policy =
+        Policy::from_raw(block.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
+    sys::thread_set_priority(&thread, level, policy).map_err(|_| EINVAL)?;
     block.base_level.store(u32::from(level), Ordering::Relaxed);
     // A wakeup through the channel or the timer works at their level until
     // the next receive: they follow the thread's. Cancellation reaches the

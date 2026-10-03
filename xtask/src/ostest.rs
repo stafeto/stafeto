@@ -156,8 +156,9 @@ fn needs_pipes(source: &str) -> bool {
 }
 
 /// The time `ci` gives the boots of the suites, counted from the first
-/// one's start (about 150 s on TCG one boot after the other).
-const BUDGET: Duration = Duration::from_secs(300);
+/// one's start: about 230 s on TCG since the suites of `fork` (5d), up to
+/// 241 s seen, with room for the variance of a loaded host.
+const BUDGET: Duration = Duration::from_secs(420);
 
 /// The tests that pass on stafeto: `ci` fails when one of them does not.
 const PASSING: &str = "tests/os-test/pass.txt";

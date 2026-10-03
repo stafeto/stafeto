@@ -94,7 +94,7 @@ thread at every step (73 / 7, 250 / 24, 322 / 31): the stop is linear.
 thread that has not parked for its entry of signals (`thread_upcall_request`
 once, `thread_info` at every look). A thread in a wait of the kernel counts
 as stopped at the first look; a running thread parks, and every parking
-wakes the stopper for another walk. The question of fix wave T4 was
+wakes the stopper for another walk. The question of the review was
 whether the walks grow as N squared.
 
 | N other threads | 1 | 8 | 32 | 63 |
@@ -127,30 +127,38 @@ number it still waits for, which makes the walks O(N) in all. It saves at
 most 120 us at 63 running threads, so it belongs with the work of 5h on the
 service's steps and the lending of levels.
 
-**A limit found here.** A thread that spins without a call at a level that
-the scheduler runs first-in first-out starves the threads behind it at the
-same level: they never run, never reach their entry of signals and never
-park, and the stop for `fork` or `exec` waits for them without end. The
-first version of the S17 spinners (a loop with no call, eight threads at
-level 10) hung `fork` on HVF and on TCG. A thread that yields (the rows
-use `sched_yield`) or sleeps parks at once. This is the priority inversion
-that 5h addresses with the lending of levels; until then a program with
-CPU-bound threads at the same level must yield in them if it forks.
+**Threads run round robin.** The first version of the S17 spinners (a
+loop with no call, eight threads at level 10, then first-in first-out)
+hung on HVF and on TCG. The stop itself ended: the kernel enters every
+thread on its way back to EL0, a spinner too once an interrupt or its
+quantum ends its turn, and the parent got its PID after ForkCommit. The
+child hung: its thread ran at the parent's level behind the spinners,
+which first-in first-out never let go, at its first request to the process
+service (`process::after_fork`). Spec 2 gives POSIX threads SCHED_OTHER,
+round robin with the 4 ms quantum at the process's base level, and 5d had
+made them all FIFO; they are round robin now (the first thread of a
+program, the loader's thread that a forked child goes on, and each
+pthread, which takes its creator's policy), and `rtbench --short` with
+spinners that never yield passes. The rows keep their `sched_yield`, as
+measured. A thread that asks for FIFO (the scheduling attributes of 5h)
+and spins without a call still starves its level, the child of a fork
+among it; posix-procs checks a spinner with the default policy (role
+`forkspin`).
 
 ### The steps of the process service and of the loader under `-icount`
 
 `cargo xtask process-steps` (in `ci`) boots the probe in its steps mode
 with a crowd of 248 children, a child that forks five times among them
-(role `stepfork`, a parent whose heap grew by 256 KiB), and the loader with
+(role `stepfork`, a parent whose heap grew by 128 KiB), and the loader with
 its feature `steps`. Ticks under `-icount`, the unit of term B (20,536):
 
 | Step | Ticks |
 |---|---|
-| ForkStart | 51,079 |
+| ForkStart | 50,596 |
 | ForkCommit | 2,296 |
-| SpawnStart in the same run (the longest step of the service) | 89,347 |
-| ExecStart, Create | 48,227, 59,609 |
-| RAM file service, Clone of a fork's descriptions | 17,446 |
+| SpawnStart in the same run (the longest step of the service) | 89,344 |
+| ExecStart, Create | 47,963, 59,716 |
+| RAM file service, Clone of a fork's descriptions | 17,437 |
 
 ForkStart is a step above term B, as SpawnStart, ExecStart and Create are,
 and constant in the number of processes; it is shorter than SpawnStart, and
@@ -159,13 +167,13 @@ under term B, and `process-steps` fails when it passes it. Splitting the
 four steps into pieces no longer than B waits for 5h, as decided.
 
 The loader's steps are the kernel calls of the copy, each with the ticks of
-its longest call in the run (a copy of up to 70 pages in one call here):
-`mem_create` 68,209 (about 974 a page, 7,800 for a portion of 8 pages),
-`mem_map` of the new object 11,100, `mem_map` of a piece of the parent's
-object 10,315 (about 4,700 for a portion of 32), `memcpy` of a piece
-143,389 (user code, preemptible), `mem_unmap` 4,421, a remap of code with
-its access 55,130 (`mem_unmap` and `mem_map` with the instruction cache
-cleaned), `handle_duplicate` 455, Regions 2,566 and the whole Go 682,365.
+its longest call in the run (a copy of up to 82 pages in one call here):
+`mem_create` 80,108 (about 977 a page, 7,800 for a portion of 8 pages),
+`mem_map` of the new object 13,078, `mem_map` of a piece of the parent's
+object 10,308 (about 4,700 for a portion of 32), `memcpy` of a piece
+143,797 (user code, preemptible), `mem_unmap` 4,414, a remap of code with
+its access 55,102 (`mem_unmap` and `mem_map` with the instruction cache
+cleaned), `handle_duplicate` 457, Regions 2,719 and the whole Go 858,824.
 Every kernel call works in the portions that the table of paths already
 holds, each at most B, and preempts between them, so the copy adds no path
 and the table of paths gets no new row. The full list is in
@@ -187,14 +195,14 @@ repository (the rtbench files of both machines, the steps table and log).
   exists to share. A program that `init` starts itself has no segments in
   its map and `fork` gives ENOSYS (the dialog's `ash` is a process from
   `/bin/ash`).
-- **Service step above term B until 5h.** ForkStart takes 51,079 ticks,
+- **Service step above term B until 5h.** ForkStart takes 50,596 ticks,
   2.5 times B, and every thread below the service's level waits for at most
   one such step (the ceiling protocol); nothing of real time runs there
   yet. Splitting waits for 5h.
 - **Other threads.** The child has one thread. The stacks and TCBs of the
   parent's other threads are in its copy and stay in its heap, unfreed.
-  A spinning thread at the forker's level that never yields starves the
-  stop (above).
+  A spinning thread with FIFO at the forker's level that never yields
+  starves the child (above); with the default round robin it does not.
 - **Limits of the service.** 32 live children a process, 256 records in
   all, 16 loads at once with 2 for a parent: `fork` gives EAGAIN past
   them, ENOMEM when the pool or the child's quota is short. The child's
@@ -203,9 +211,9 @@ repository (the rtbench files of both machines, the steps table and log).
   during its `fork`, which the design listed for this task; S15 gives the
   copy's length for the same sizes.
 - **os-test budget.** The suites `process` and the `basic` tests that call
-  `fork` raised the boots of `cargo xtask os-test` from 150 s to 229 s of
-  the 300 s budget; 71 s are left. Past it the budget rises or the `basic`
-  suite splits in two.
+  `fork` raised the boots of `cargo xtask os-test` from 150 s to 226-241 s
+  (runs of the branch). The budget is 420 s since, which leaves about 180
+  s; past it the `basic` suite splits in two.
 
 ## Readiness criteria of 5d
 
@@ -213,33 +221,33 @@ From the table of steps in spec 2 (5d: "`ash` runs an external `ls`
 through `fork` and `exec`; rows of the cost of `fork`, `exec` and `waitpid`
 by memory size") and the design of the step.
 
-1. **`ash` runs external programs through `fork`.** Met (T5): `ash-dialog`
+1. **`ash` runs external programs through `fork`.** Met: `ash-dialog`
    in `ci` and under `hvf` runs `/bin/ls -la`, `echo hi && ls -1 /etc`,
    `/bin/ash -c 'exit 3'` with `$?` 3, a nested `ash` and "not found" with
    status 127.
-2. **Rows of `fork`, `exec` and `waitpid` by memory size.** Met (T6): S15
+2. **Rows of `fork`, `exec` and `waitpid` by memory size.** Met: S15
    at three sizes, S16, S17 and S18, 10 minutes on HVF and VZ, the raw
    files kept; `exec` and `posix_spawn` rows come from 5c (S13, S14).
-3. **Full copy by the child's loader; the kernel unchanged.** Met (T2):
+3. **Full copy by the child's loader; the kernel unchanged.** Met:
    `ci` prints term B 20,536 as before and the kernel tests pass.
-4. **Every call of the copy bounded.** Met (T6): the loader's steps under
+4. **Every call of the copy bounded.** Met: the loader's steps under
    `-icount` are calls in portions of the table of paths; ForkStart and
-   ForkCommit are steps of the service (51,079 and 2,296), ForkStart above
+   ForkCommit are steps of the service (50,596 and 2,296), ForkStart above
    B and shorter than SpawnStart, as decided for 5h.
-5. **A multithreaded parent.** Met (T4 and its fix wave): 40 forks with
-   five busy threads, pairs of forks with no wait, a thread in a long read
+5. **A multithreaded parent.** Met: 40 forks with
+   six busy threads, pairs of forks with no wait, a thread in a long read
    and in `waitpid` carry on, the child has one thread; the cost of the
    stop is measured (linear, a small quadratic part).
-6. **Signals.** Met (T2, T3): classes on the child's page before it is a
+6. **Signals.** Met: classes on the child's page before it is a
    target, a signal to the group during the copy reaches both, pending
    signals do not carry over, the mask and the handlers do.
-7. **Descriptors and sessions.** Met (T3): shared offsets, `FD_CLOFORK`
+7. **Descriptors and sessions.** Met: shared offsets, `FD_CLOFORK`
    closed, `FD_CLOEXEC` open, clones of the file, clock and console
    sessions.
-8. **`vfork` and `pthread_atfork`.** Met (T3, T4): `vfork` is `fork`;
+8. **`vfork` and `pthread_atfork`.** Met: `vfork` is `fork`;
    prepare handlers run in the opposite order of registration, parent and
    child handlers in order, from any thread.
-9. **os-test.** Met (T5): the `process` suite and the `basic` tests that
+9. **os-test.** Met: the `process` suite and the `basic` tests that
    call `fork` run in `ci`; 78 pass, 74 fail, 26 need pipes (5e) of 178,
    and `ci` fails when a test of `pass.txt` stops passing.
 10. **Limits written down.** Met: the section above.

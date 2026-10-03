@@ -891,9 +891,9 @@ static struct histogram s15[3], s16, s17[2][THREAD_COUNTS], s18[THREAD_COUNTS];
 static void sleep_forever(void);
 
 /* The other threads of a forker: asleep, or running below its level and
- * yielding to each other (a spinner that never yields starves the threads
- * behind it at its level: they never reach their entry of signals, and a
- * stop for fork waits for them without end, as the notes say). */
+ * yielding to each other, as the rows were measured. They run round robin
+ * (SCHED_OTHER), so a spinner that never yields lets the stop and the
+ * child run too, its quantum over. */
 static void *stand_by(void *spin) {
     if (spin) {
         rtbench_level(10);

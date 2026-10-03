@@ -51,6 +51,9 @@ fn main() {
             "-fno-pic",
             "-std=c11",
             "-O2",
+            // malloc and the others are calls: a probe's allocation is never
+            // folded away.
+            "-fno-builtin",
             "-Wall",
             "-Wextra",
             "-Werror",

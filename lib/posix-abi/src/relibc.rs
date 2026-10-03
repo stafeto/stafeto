@@ -385,6 +385,9 @@ pub unsafe fn create(
         place.state.store(FREE, Ordering::Release);
     };
     let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    // The creator's policy: round robin unless it asked for FIFO.
+    let policy_raw = me.policy.load(Ordering::Relaxed);
+    let policy = Policy::from_raw(policy_raw).unwrap_or(Policy::RoundRobin);
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync); made at its level.
     let Ok(channel) = sys::channel_create(base) else {
@@ -403,7 +406,7 @@ pub unsafe fn create(
             stack,
             id,
             base,
-            Policy::Fifo,
+            policy,
             BUFFERS + index * PAGE,
             Some((&borrowed::<Channel>(exits), ceiling)),
         )
@@ -432,6 +435,7 @@ pub unsafe fn create(
         block.timer.store(timer.into_raw().0, Ordering::Relaxed);
         block.channel.store(channel.into_raw().0, Ordering::Relaxed);
         block.thread_id = id;
+        block.policy.store(policy_raw, Ordering::Relaxed);
         block.cancel_point.store(0, Ordering::Relaxed);
     }
     place.tcb.store(tcb, Ordering::Relaxed);

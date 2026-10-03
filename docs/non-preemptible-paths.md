@@ -441,15 +441,15 @@ step of each kind, with 32, 128 and 248 children:
 | WaitStart, WaitTake | 6,432, 7,141 | 6,634, 7,122 | 7,518, 7,137 |
 | Boot, Take | 6,853, 4,917 | 7,241, 5,128 | 6,882, 5,439 |
 | ExecCommit, SpawnCommit | 4,200, 2,610 | 4,200, 2,222 | 4,360, 2,588 |
-| ForkStart, ForkCommit | | | 51,079, 2,296 |
+| ForkStart, ForkCommit | | | 50,596, 2,296 |
 | Vouch | 2,837 | 2,837 | 2,798 |
 | Kill (one step of its walk) | 1,204 | 1,204 | 1,188 |
 
 The `fork` rows come from the same probe with a forking child among the
-248 (role `stepfork`: five forks of a parent whose heap grew by 256 KiB).
+248 (role `stepfork`: five forks of a parent whose heap grew by 128 KiB).
 ForkStart makes a process in the kernel as SpawnStart does but starts no
-loader program from a file, so it stays within SpawnStart (51,079 against
-89,347 in that run; `process-steps` fails when it does not) and does not
+loader program from a file, so it stays within SpawnStart (50,596 against
+89,344 in that run; `process-steps` fails when it does not) and does not
 grow with the processes either; ForkCommit is a constant 2,296 ticks.
 ForkAbort has no row: no probe takes the path in this crowd.
 
@@ -497,15 +497,15 @@ group; the loader's printing and the timing are in the feature alone):
 
 | Step | Ticks | Pages or detail |
 |---|---|---|
-| `mem_create` of a group | 68,209 | 70 pages (about 974 a page, 7,800 for a portion of 8) |
-| `mem_map` of the new object, writable | 11,100 | 70 pages |
-| `mem_map` of a piece of the parent's object | 10,315 | 70 pages (147 a page, 4,700 for a portion of 32) |
-| `memcpy` of a piece | 143,389 | 286,720 bytes, user code at the forking level |
-| `mem_unmap` of a piece | 4,421 | 70 pages |
-| remap of code or read-only data with its access | 55,130 | 70 pages (`mem_unmap` and `mem_map` with the cache clean) |
-| `handle_duplicate` of the new object | 455 | constant |
-| Regions (the parent's handles into the loader's scratch) | 2,566 | 4 handles |
-| Go, the whole copy | 682,365 | 7 regions |
+| `mem_create` of a group | 80,108 | 82 pages (about 977 a page, 7,800 for a portion of 8) |
+| `mem_map` of the new object, writable | 13,078 | 82 pages |
+| `mem_map` of a piece of the parent's object | 10,308 | 70 pages (147 a page, 4,700 for a portion of 32) |
+| `memcpy` of a piece | 143,797 | 286,720 bytes, user code at the forking level |
+| `mem_unmap` of a piece | 4,414 | 70 pages |
+| remap of code or read-only data with its access | 55,102 | 70 pages (`mem_unmap` and `mem_map` with the cache clean) |
+| `handle_duplicate` of the new object | 457 | constant |
+| Regions (the parent's handles into the loader's scratch) | 2,719 | 4 handles |
+| Go, the whole copy | 858,824 | 8 regions |
 
 Each call is bounded in portions and the copy of a piece is user code, so
 no row adds a path to the table above and B stays 20,536. A parent with
@@ -525,7 +525,7 @@ the service maps the object, copies, unmaps and answers. Longest steps under
 |---|---|
 | ReadInto, 12 KiB | 18,212 |
 | OpenExec (path lookup, the Vouch round trip, the set-ID message) | 28,241 |
-| Clone | 17,446 (a fork's, with the descriptions of the table; 10,659 for a spawn's in the first run) |
+| Clone | 17,437 (a fork's, with the descriptions of the table; 10,659 for a spawn's in the first run) |
 | ReadAt (up to 1,016 bytes) | 8,545 |
 | Open | 5,488 |
 | a notification | 4,424 |

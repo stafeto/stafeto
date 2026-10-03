@@ -245,7 +245,7 @@ Bounded kernel paths and their costs:
 | POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
 | POSIX: process service | process service, `posix_spawn` from the boot image, `waitpid`, `kill`, process groups and sessions | ✅ [#76](https://github.com/stafeto/stafeto/pull/76) |
 | POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | ✅ [#78](https://github.com/stafeto/stafeto/pull/78) |
-| POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | 🚧 (pull request to come) |
+| POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | 🚧 [#79](https://github.com/stafeto/stafeto/pull/79) |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |

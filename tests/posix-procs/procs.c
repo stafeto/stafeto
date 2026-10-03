@@ -749,11 +749,16 @@ static void steps_setup(void) {
 }
 
 /* The role stepfork: five forks, each child ends, after the heap grew by
- * 256 KiB (the child's quota is the steps probe's, 1 MiB). */
+ * 128 KiB (the child's quota is the steps probe's, 1 MiB, of which the
+ * program takes about 800 KiB). */
 static int steps_fork(void) {
-    char *heap = malloc(256 * 1024);
-    if (!heap) return 60;
-    memset(heap, 1, 256 * 1024);
+    char *heap = malloc(128 * 1024);
+    if (!heap) {
+        printf("posix-procs: steps: malloc of 128 KiB gave %d with %llu bytes used\n", errno,
+               stafeto_probe_memory_used());
+        return 60;
+    }
+    memset(heap, 1, 128 * 1024);
     for (int i = 0; i < 5; i++) {
         pid_t pid = fork();
         if (pid == 0) _exit(7);
@@ -878,7 +883,7 @@ static int steps_run(void) {
     return failed;
 }
 
-/* The layer's memory map (5d, T1): the regions it keeps handles of, three
+/* The layer's memory map (5d): the regions it keeps handles of, three
  * words each (address, pages, access: 1 R, 3 RW, 5 RX). */
 #define MAP_MAX 64
 #define PAGE 4096ull
@@ -1088,7 +1093,7 @@ static int fork_pool(void) {
 }
 
 
-/* Role forkfull: fork with the layer bound in the child (5d, T3). */
+/* Role forkfull: fork with the layer bound in the child (5d). */
 static volatile int full_data = 1234;
 static volatile int ints, usr1s, alrms;
 static void count_int(int signal) { (void)signal; ints++; }
@@ -1591,7 +1596,7 @@ static int fork_malloc(void) {
     fflush(stdout);
     pid_t pid = fork();
     if (pid == 0) {
-        char *p = malloc(64 * 1024);
+        char *p = malloc(64);
         _exit(p != NULL ? 0 : 1);
     }
     /* The prepare handler waited for the allocator's lock: the slow
@@ -1602,6 +1607,34 @@ static int fork_malloc(void) {
     pthread_join(slow, &got);
     expect("the slow malloc", got != NULL, 1);
     free(got);
+    return failures;
+}
+
+
+/* Role forkspin: a thread that spins with no call at all, at the forker's
+ * level and with the default policy (SCHED_OTHER, round robin with its
+ * quantum), lets a fork stop it: the quantum ends its turn, its entry
+ * comes, and it parks. */
+static volatile int spin_stop;
+static void *spin_hard(void *arg) {
+    (void)arg;
+    while (!spin_stop) {
+    }
+    return NULL;
+}
+
+static int fork_spin(void) {
+    pthread_t t;
+    expect("the spinner", pthread_create(&t, NULL, spin_hard, NULL), 0);
+    pause_ms(10);
+    for (int i = 0; i < 3; i++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) _exit(stafeto_probe_threads() == 1 ? 0 : 1);
+        reap("a fork beside a spinner", pid, 0, 0);
+    }
+    spin_stop = 1;
+    pthread_join(t, NULL);
     return failures;
 }
 
@@ -1653,6 +1686,7 @@ static int role(const char *name) {
     if (strcmp(name, "forkthreads") == 0) return fork_threads();
     if (strcmp(name, "forkthread") == 0) return fork_thread();
     if (strcmp(name, "forkwaits") == 0) return fork_waits();
+    if (strcmp(name, "forkspin") == 0) return fork_spin();
     if (strcmp(name, "forkmalloc") == 0) return fork_malloc();
     if (strcmp(name, "forkmany") == 0) return fork_many();
     if (strcmp(name, "forkdie") == 0) return fork_die(0);
@@ -2160,7 +2194,7 @@ static void files_nobody(void) {
     refused("spawn under a directory without search", "/sbin/procs-child", child, EACCES);
 }
 
-/* The layer's memory map and mmap (5d, T1). */
+/* The layer's memory map and mmap (5d). */
 static void memory(void) {
     /* A shared anonymous mapping must stay shared with a forked child, and
      * the layer has no shared memory: mmap says it does not support it
@@ -2187,6 +2221,7 @@ static void forks(void) {
     run_role("/bin/procs-child", "forkthreads", NULL);
     run_role("/bin/procs-child", "forkthread", NULL);
     run_role("/bin/procs-child", "forkwaits", NULL);
+    run_role("/bin/procs-child", "forkspin", NULL);
     run_role("/bin/procs-child", "forkmalloc", NULL);
     run_role("/bin/procs-child", "forkmany", NULL);
     /* A parent that dies in the window of its fork leaves nothing: its
