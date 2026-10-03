@@ -137,9 +137,9 @@ pub const MAX_CWD: usize = MAX_PATH;
 /// What a descriptor names: the console's input, output or error, an
 /// open description of the RAM file service by its number in the
 /// process's session, an end of a pipe of the pipe service by its
-/// number there (5e), or a terminal of the terminal service that the
-/// process opened by name (5f): its number, `proto_tty::CONSOLE` for
-/// `/dev/console` and `/dev/tty`.
+/// number there (5e), or an opaque open description of the terminal
+/// service (5f). The implicit standard console uses CONSOLE (0); an
+/// explicit terminal open has its own generation and description ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
     Input,
@@ -852,8 +852,9 @@ impl PosixFs {
         self.descriptors.get(fd).map_err(FsError::from)
     }
 
-    /// What `fd` names, held for a request outside the owner's lock: a
-    /// close meanwhile leaves the service's description until `unhold`.
+    /// What `fd` names, held for a request outside the owner's lock.
+    /// RAM and pipe close waits for `unhold`; terminal last-fd close
+    /// releases its real hold immediately, while armed I/O keeps a pin.
     pub fn hold(&mut self, fd: u32) -> Result<Target, FsError> {
         self.descriptors.hold(fd).map_err(FsError::from)
     }
