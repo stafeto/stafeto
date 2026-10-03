@@ -119,6 +119,12 @@ pub fn probe_hold(run: impl FnOnce()) {
     heap(|_| run());
 }
 
+/// Runs `run` holding the heap's lock, for the probes of a fork while
+/// another thread holds it.
+pub(crate) fn hold(run: impl FnOnce()) {
+    heap(|_| run());
+}
+
 fn config() -> &'static Config {
     // SAFETY: called after successful startup, which wrote it once.
     unsafe { (*CONFIG.0.get()).as_ref().expect("heap initialized") }

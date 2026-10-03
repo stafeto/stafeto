@@ -74,6 +74,13 @@ pub fn kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
     process_state(|files| Ok(files.kept_by_fork(out)))
 }
 
+/// Runs `run` holding the lock of the process's files, for the probes of
+/// a fork while another thread holds it.
+pub(crate) fn hold(run: impl FnOnce()) {
+    let _guard = FILES_LOCK.lock();
+    run();
+}
+
 /// Runs `f` on the process's files under their lock.
 fn process_state<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
     if !READY.load(Ordering::Acquire) {

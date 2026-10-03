@@ -112,8 +112,13 @@
  * heap by 1 MiB, signals its parent, forks a grandchild and execs /bin/ls
  * of /etc, whose status its parent's waitpid gets. A SIGINT the parent
  * sends its group while the copy goes on reaches both; pthread_atfork's
- * handlers run in POSIX's order, and vfork is fork. BusyBox ash from its
- * file runs `/bin/ls /etc && exit 3`, which forks.
+ * handlers run in POSIX's order, and vfork is fork. The role forkthreads
+ * forks 40 times from a parent whose five other threads churn the heap
+ * and files, make threads and hold the layer's locks: the fork stops them
+ * all for its copy, and each child has one thread, mallocs, opens a file
+ * and takes a mutex. An exec while a thread makes threads parks the
+ * newborn ones too. BusyBox ash from its file runs `/bin/ls /etc && exit
+ * 3`, which forks.
  *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
@@ -163,6 +168,8 @@ int stafeto_probe_fork_abort(int *pid);
 unsigned long long stafeto_probe_map_mappings(void);
 void stafeto_probe_fork_window(void (*window)(void));
 int stafeto_probe_set_clofork(int fd);
+int stafeto_probe_hold(int which, unsigned long long us);
+int stafeto_probe_threads(void);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
@@ -1188,6 +1195,164 @@ static int fork_full(void) {
     return failures;
 }
 
+
+/* Role forkthreads: fork from a parent with five more threads, at its
+ * level under FIFO, so each yields after a turn, which mallocs with no
+ * lock of its own, and
+ * churn the heap under a mutex, open and close files, make and join
+ * threads, and hold the layer's locks of the heap, the files and a bucket
+ * of the table of waits in turn. Each fork stops them all: in its window
+ * (between Go and ForkCommit) none of them moves `ticks`. The child has
+ * one thread, mallocs, opens a file and takes the mutex, whose
+ * pthread_atfork handlers make it the forking thread's. */
+static volatile int churn_stop;
+static unsigned long ticks;
+static pthread_mutex_t churn_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int moved_in_window;
+static void tick(void) { __atomic_fetch_add(&ticks, 1, __ATOMIC_SEQ_CST); }
+static void lock_churn(void) { pthread_mutex_lock(&churn_mutex); }
+static void unlock_churn(void) { pthread_mutex_unlock(&churn_mutex); }
+
+static void *churn_heap(void *arg) {
+    (void)arg;
+    for (unsigned n = 0; !churn_stop; n++) {
+        pthread_mutex_lock(&churn_mutex);
+        char *p = malloc(64 + n % 8192);
+        if (p) memset(p, 1, 64);
+        free(p);
+        pthread_mutex_unlock(&churn_mutex);
+        tick();
+        sched_yield();
+    }
+    return NULL;
+}
+
+/* malloc and free with no lock of the probe's: relibc's allocator's own
+ * lock is the forking thread's through its handlers. */
+static void *churn_malloc(void *arg) {
+    (void)arg;
+    for (unsigned n = 0; !churn_stop; n++) {
+        free(malloc(16 + n % 300000));
+        if (n % 64 == 0) {
+            tick();
+            sched_yield();
+        }
+    }
+    return NULL;
+}
+
+static void *churn_files(void *arg) {
+    (void)arg;
+    while (!churn_stop) {
+        int fd = open("/etc/motd", O_RDONLY);
+        char b[4];
+        if (fd >= 0) {
+            read(fd, b, sizeof b);
+            close(fd);
+        }
+        tick();
+        sched_yield();
+    }
+    return NULL;
+}
+
+static void *short_thread(void *arg) {
+    tick();
+    return arg;
+}
+
+static void *churn_threads(void *arg) {
+    (void)arg;
+    while (!churn_stop) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, short_thread, NULL) == 0) pthread_join(t, NULL);
+        tick();
+        sched_yield();
+    }
+    return NULL;
+}
+
+static void *hold_locks(void *arg) {
+    (void)arg;
+    for (int which = 0; !churn_stop; which = (which + 1) % 3) {
+        stafeto_probe_hold(which, 2000);
+        tick();
+        pause_ms(1);
+    }
+    return NULL;
+}
+
+static void threads_window(void) {
+    unsigned long before = __atomic_load_n(&ticks, __ATOMIC_SEQ_CST);
+    pause_ms(3);
+    if (__atomic_load_n(&ticks, __ATOMIC_SEQ_CST) != before) moved_in_window++;
+}
+
+static int threads_child(const char *kept) {
+    int bad = 0;
+    if (stafeto_probe_threads() != 1) bad |= 1;
+    char *p = malloc(256 * 1024);
+    if (!p) bad |= 2;
+    else {
+        memset(p, 7, 256 * 1024);
+        free(p);
+    }
+    int fd = open("/etc/motd", O_RDONLY);
+    char b[7];
+    if (fd < 0 || read(fd, b, 7) != 7 || memcmp(b, "stafeto", 7) != 0) bad |= 4;
+    close(fd);
+    if (pthread_mutex_lock(&churn_mutex) != 0 || pthread_mutex_unlock(&churn_mutex) != 0) bad |= 8;
+    if (strcmp(kept, "kept") != 0) bad |= 16;
+    return bad;
+}
+
+static int fork_threads(void) {
+    pthread_atfork(lock_churn, unlock_churn, unlock_churn);
+    char *kept = strdup("kept");
+    pthread_t t[5];
+    void *(*bodies[5])(void *) = {churn_heap, churn_malloc, churn_files, churn_threads, hold_locks};
+    for (int i = 0; i < 5; i++) {
+        expect("a churning thread", pthread_create(&t[i], NULL, bodies[i], NULL), 0);
+    }
+    pause_ms(20);
+    stafeto_probe_fork_window(threads_window);
+    int forks = 0;
+    for (; forks < 40; forks++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) _exit(threads_child(kept));
+        if (pid < 0) {
+            printf("posix-procs: fork %d of a multithreaded parent gave %d\n", forks, errno);
+            failures++;
+            break;
+        }
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            printf("posix-procs: the child of fork %d ended with status %#x\n", forks, status);
+            failures++;
+            break;
+        }
+    }
+    stafeto_probe_fork_window(NULL);
+    churn_stop = 1;
+    for (int i = 0; i < 5; i++) pthread_join(t[i], NULL);
+    expect("threads that moved in a fork's window", moved_in_window, 0);
+    if (failures == 0) printf("posix-procs: %d forks of a parent with five threads\n", forks);
+    return failures;
+}
+
+/* Role execmaking: an exec while another thread makes threads, which
+ * start in the window of the exec and park there. */
+static int exec_making(void) {
+    pthread_t t;
+    expect("the maker", pthread_create(&t, NULL, churn_threads, NULL), 0);
+    pause_ms(10);
+    char *next[] = {"procs-child", "exit7", NULL};
+    char *env[] = {NULL};
+    execve("/bin/procs-child", next, env);
+    return 100 + errno;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -1232,6 +1397,8 @@ static int role(const char *name) {
     if (strcmp(name, "forkbare") == 0) return fork_bare();
     if (strcmp(name, "forkpool") == 0) return fork_pool();
     if (strcmp(name, "forkfull") == 0) return fork_full();
+    if (strcmp(name, "forkthreads") == 0) return fork_threads();
+    if (strcmp(name, "execmaking") == 0) return exec_making();
     if (strcmp(name, "memmap") == 0) {
         int bad = map_start();
         return bad != 0 ? bad : 10 * map_growth("child");
@@ -1758,6 +1925,12 @@ static void forks(void) {
     expect("a fork of a program init started", stafeto_probe_fork_bare(bare_park, NULL, NULL), -ENOSYS);
     run_role("/bin/procs-child", "forkbare", NULL);
     run_role("/bin/procs-child", "forkfull", NULL);
+    run_role("/bin/procs-child", "forkthreads", NULL);
+    char *making[] = {"procs-child", "execmaking", NULL};
+    char *none[] = {NULL};
+    pid_t maker = -1;
+    expect("spawn of execmaking", posix_spawn(&maker, "/bin/procs-child", NULL, NULL, making, none), 0);
+    reap("an exec while a thread makes threads", maker, 7, 0);
     /* BusyBox ash from its file (/bin/ls, BusyBox, as `ash`) runs an
      * external program that is not its last command: it forks, and the
      * shell goes on to exit 3 once ls succeeded. */

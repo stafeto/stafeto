@@ -13,12 +13,14 @@
 //! the registers back from the copy of CONTEXT and returns 0 from `point`
 //! on the copy of the caller's stack. A program init started has no
 //! segments in its map, and gets ENOSYS. No copy on write: the child pays
-//! for every page it gets. `fork` gives the child clones of the process's
-//! sessions too, and the child binds every part of the layer to its own
-//! handles (`child`) before it returns. The other threads of a parent are
-//! not stopped yet: a fork of a process with more threads copies what
-//! they were doing, and a lock of the layer one of them held stays held
-//! in the child.
+//! for every page it gets. `fork` stops the process's other threads first
+//! (crate::signals::stop_others, as exec does): each parks outside every
+//! critical section of the layer, so no lock of the layer is held in the
+//! copy, and the child has the calling thread alone. relibc's lock of its
+//! allocator is the calling thread's through its pthread_atfork handlers.
+//! `fork` gives the child clones of the process's sessions too, and the
+//! child binds every part of the layer to its own handles (`child`)
+//! before it returns.
 
 use crate::constants::*;
 use crate::process::{ask, ask_loader, client, load_errno, request, start_errno};
@@ -482,14 +484,29 @@ pub fn probe_mappings() -> u64 {
 /// parent, 0 in the child; EAGAIN, ENOMEM or ENOSYS as `copy` says, and
 /// for a service out of clones.
 pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
+    // A program init started has no code in its map: nothing to stop for.
+    let at = resume as *const () as u64;
+    let code = crate::allocation::regions(|map| {
+        map.iter().any(|r| {
+            r.access == Access::ReadExec
+                && (r.address as u64..r.address as u64 + r.pages as u64 * 4096).contains(&at)
+        })
+    });
+    if !code {
+        return Err(ENOSYS);
+    }
     let block = crate::threads::own_block();
     let mask = block.mask.swap(!0, Ordering::SeqCst);
-    let result = sessions().and_then(|sessions| copy(window, sessions));
-    if result == Ok(Forked::Child)
-        && let Err(why) = child()
-    {
-        rt::println!("posix-abi: a forked child could not bind {}", why);
-        rt::sys::process_exit(127);
+    let result = crate::signals::stop_others()
+        .and_then(|()| sessions())
+        .and_then(|sessions| copy(window, sessions));
+    if result == Ok(Forked::Child) {
+        if let Err(why) = child() {
+            rt::println!("posix-abi: a forked child could not bind {}", why);
+            rt::sys::process_exit(127);
+        }
+    } else {
+        crate::signals::resume_others();
     }
     block.mask.store(mask, Ordering::SeqCst);
     crate::signals::route();
@@ -614,4 +631,27 @@ fn child() -> Result<(), &'static str> {
         hook();
     }
     Ok(())
+}
+
+/// Holds a lock of the layer for `ns` nanoseconds, spinning on the
+/// counter inside its critical section: 0 the heap's, 1 the files', 2 the
+/// bucket of the table of waits by address of `probe_hold`'s own word;
+/// EINVAL for another. For the probes of a fork while other threads hold
+/// the layer's locks: the fork waits for the end of each section.
+pub fn probe_hold(which: u32, ns: u64) -> i32 {
+    static WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let end = rt::time::ticks_to_ns(rt::time::now()) + ns;
+    let spin = || while !rt::time::reached(end) {};
+    match which {
+        0 => crate::allocation::hold(spin),
+        1 => crate::shared::hold(spin),
+        2 => posix_sync::hold_bucket(WORD.as_ptr() as usize, spin),
+        _ => return EINVAL,
+    }
+    0
+}
+
+/// How many places of the table of threads hold a thread.
+pub fn probe_threads() -> usize {
+    crate::relibc::occupied()
 }

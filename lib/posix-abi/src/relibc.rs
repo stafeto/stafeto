@@ -213,6 +213,21 @@ pub fn each_block(mut f: impl FnMut(&Block)) {
     }
 }
 
+/// Runs `f` on the place, native handle and block of every live thread,
+/// under the lock of the table, so that no block is freed meanwhile.
+pub fn each_live(mut f: impl FnMut(usize, u64, &Block)) {
+    let _guard = TABLE_LOCK.lock();
+    for (index, place) in TABLE.iter().enumerate() {
+        if place.state.load(Ordering::Acquire) & LIVE != 0 {
+            let native = place.native.load(Ordering::Relaxed);
+            // SAFETY: as in `target`.
+            f(index, native, unsafe {
+                &*(place.block.load(Ordering::Relaxed) as *const Block)
+            });
+        }
+    }
+}
+
 /// How many places hold a thread, for the probes and their measurements.
 pub fn occupied() -> usize {
     TABLE

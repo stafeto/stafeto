@@ -130,6 +130,13 @@ pub fn after_fork() {
     }
 }
 
+/// Runs `run` holding the lock of the bucket of `address`, for the probes
+/// of a fork while another thread holds it.
+pub fn hold_bucket(address: usize, run: impl FnOnce()) {
+    let _held = lock(bucket(address));
+    run();
+}
+
 /// A bucket: the count of its waiters, the word of its lock and its list.
 #[repr(C, align(32))]
 struct Bucket {

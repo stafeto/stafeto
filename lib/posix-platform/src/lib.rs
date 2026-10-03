@@ -748,6 +748,20 @@ pub unsafe extern "C" fn stafeto_probe_fork_abort(pid: *mut c_int) -> c_int {
     result
 }
 
+/// Holds a lock of the layer for `us` microseconds
+/// (posix_abi::fork::probe_hold): 0 the heap's, 1 the files', 2 a bucket's.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_hold(which: c_int, us: u64) -> c_int {
+    posix_abi::fork::probe_hold(which as u32, us.saturating_mul(1000))
+}
+
+/// How many threads the process's table holds
+/// (posix_abi::fork::probe_threads).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_threads() -> c_int {
+    posix_abi::fork::probe_threads() as c_int
+}
+
 /// The most mappings an object of the layer's map has
 /// (posix_abi::fork::probe_mappings).
 #[unsafe(no_mangle)]
