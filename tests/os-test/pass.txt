@@ -182,3 +182,5 @@ basic/termios/tcgetattr
 basic/termios/tcgetsid
 basic/termios/tcsendbreak
 basic/termios/tcsetattr
+basic/termios/tcgetwinsize
+basic/termios/tcsetwinsize
