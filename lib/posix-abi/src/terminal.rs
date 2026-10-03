@@ -22,11 +22,72 @@ use rt::handle::{Channel, Handle};
 
 pub const ENOTTY: i32 = 25;
 
+/// The repaired counterfeit endpoint is one clone of the loader root.
+/// Keep its other 254 clones in the old image until exec commits: the
+/// inherited true endpoint must move without allocating clone 256.
+pub fn probe_full_exec() -> i32 {
+    let result = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)));
+    let Ok(Some(terminal)) = result else {
+        return EIO;
+    };
+    for _ in 0..254 {
+        let Ok(channel) = clone(terminal) else {
+            return EIO;
+        };
+        let _ = channel.into_raw();
+    }
+    if clone(terminal).is_err() { 0 } else { EIO }
+}
+
+pub fn probe_edge(group: u32) -> i32 {
+    let result = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)));
+    let Ok(Some(terminal)) = result else {
+        return EIO;
+    };
+    let mut w = Writer::new();
+    let _ = proto_wire::Header::new(23, proto_tty::VERSION).write(&mut w);
+    let _ = w.u32(group);
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let Ok(reply) = rt::sys::send(&Handle::<Channel>::borrowed(terminal), w.as_bytes()) else {
+        return EIO;
+    };
+    if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0) {
+        0
+    } else {
+        EIO
+    }
+}
+
+/// Diagnostic requests are served only by the special terminal probe
+/// image. Production services return UNKNOWN_METHOD for these numbers.
+pub fn probe_trusted(target: u32, newborn: bool) -> i32 {
+    let result = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)));
+    let Ok(Some(terminal)) = result else {
+        return EIO;
+    };
+    let mut w = Writer::new();
+    let _ =
+        proto_wire::Header::new(if newborn { 22 } else { 21 }, proto_tty::VERSION).write(&mut w);
+    let _ = w.u32(target);
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let Ok(reply) = rt::sys::send(&Handle::<Channel>::borrowed(terminal), w.as_bytes()) else {
+        return EIO;
+    };
+    let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+    match r.u32() {
+        Ok(0) if !newborn => 0,
+        Ok(0) if r.u32() == Ok(1) => 0,
+        Ok(proto_process::PERMISSION) => EPERM,
+        _ => EIO,
+    }
+}
+
 /// The errno of a refusal of the terminal service.
 fn refusal(status: Status) -> Option<i32> {
     match status.code() {
         proto_tty::BAD_TERMINAL => Some(ENOTTY),
         proto_tty::INVALID => Some(EINVAL),
+        _ if status == Status::Kernel(rt::abi::Error::LimitReached) => Some(EAGAIN),
         _ => None,
     }
 }

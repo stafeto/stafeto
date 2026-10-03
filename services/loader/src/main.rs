@@ -324,6 +324,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut needed = [false; SLOTS];
     let mut given: [Option<Handle<Channel>>; SLOTS] = Default::default();
     let mut ready = false;
+    let mut early_given = false;
+    let mut terminal_actions = false;
+    let mut trusted_terminal = None;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
         if ready && let Some((entry, image, maps)) = loaded.take() {
@@ -418,6 +421,15 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         None => Status::Kernel(Error::BadState).code(),
                     },
                     Some(Method::Go) if !copied && fork.is_some() => {
+                        if trusted_terminal.is_none() {
+                            trusted_terminal = match loader_terminal(session) {
+                                Ok(terminal) => terminal,
+                                Err(code) => {
+                                    reply(token, code);
+                                    return None;
+                                }
+                            };
+                        }
                         let (body, scratch) = fork.as_mut()?;
                         let regions = scratch.count as u64;
                         match steps::timed(kind::GO, regions, || copy(own, body, scratch))
@@ -434,11 +446,28 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                     }
                     Some(Method::Go) if block_len.is_some() && loaded.is_none() => {
+                        if trusted_terminal.is_none() {
+                            trusted_terminal = match loader_terminal(session) {
+                                Ok(terminal) => terminal,
+                                Err(code) => {
+                                    reply(token, code);
+                                    return None;
+                                }
+                            };
+                        }
                         let Ok(block) = Block::read(staged(block_len?)) else {
                             reply(token, Status::BadSize.code());
                             return None;
                         };
                         let needs = Slot::GIVEN.map(|slot| (slot, block.needs(slot)));
+                        if early_given
+                            && needs
+                                .iter()
+                                .any(|(slot, needs)| *needs && given[*slot as usize].is_none())
+                        {
+                            reply(token, Status::BadSize.code());
+                            return None;
+                        }
                         match load(own, &block).and_then(|done| tell_ready(session).map(|()| done))
                         {
                             Ok(done) => {
@@ -456,14 +485,58 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             }
                         }
                     }
-                    Some(Method::Handles) if loaded.is_some() || fork.is_some() => {
+                    Some(Method::TerminalActions)
+                        if block_len.is_some() && loaded.is_none() && !terminal_actions =>
+                    {
+                        terminal_actions = true;
+                        if trusted_terminal.is_none() {
+                            trusted_terminal = match loader_terminal(session) {
+                                Ok(terminal) => terminal,
+                                Err(code) => {
+                                    reply(token, code);
+                                    return None;
+                                }
+                            };
+                        }
+                        match open_terminals(own, trusted_terminal.as_ref(), r) {
+                            Ok(()) => 0,
+                            Err(code) => {
+                                reply(token, code);
+                                return None;
+                            }
+                        }
+                    }
+                    Some(Method::Handles) if block_len.is_some() || fork.is_some() => {
+                        early_given |= loaded.is_none() && block_len.is_some();
                         match take_given(r, &mut handles, &mut given) {
                             // The end of a pipe or a terminal the block names
                             // needs the session of the service that serves it.
                             Ok(()) if (0..SLOTS).any(|i| needed[i] && given[i].is_none()) => {
                                 Status::BadSize.code()
                             }
-                            Ok(()) => 0,
+                            Ok(()) => {
+                                if let Some(offered) = given[Slot::Terminal as usize].take() {
+                                    if trusted_terminal.is_none() {
+                                        trusted_terminal = match loader_terminal(session) {
+                                            Ok(terminal) => terminal,
+                                            Err(code) => {
+                                                reply(token, code);
+                                                return None;
+                                            }
+                                        };
+                                    }
+                                    match verify_terminal(trusted_terminal.as_ref(), offered) {
+                                        Ok(terminal) => {
+                                            given[Slot::Terminal as usize] = Some(terminal)
+                                        }
+                                        Err(code) => {
+                                            reply(token, code);
+                                            return None;
+                                        }
+                                    }
+                                }
+                                0
+                            }
                             Err(status) => status.code(),
                         }
                     }
@@ -474,6 +547,84 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
             }
         }
     }
+}
+
+/// Every request carries the current LoaderOf identity from Boot. No
+/// authenticated child identity or credential is returned to the parent.
+fn open_terminals(own: &Own, tty: Option<&Handle<Channel>>, mut r: Reader<'_>) -> Result<(), u32> {
+    let count = r.u32().map_err(|s| s.code())? as usize;
+    if count == 0 || count > pl::TERMINAL_ACTIONS {
+        return Err(Status::BadSize.code());
+    }
+    let mut actions = [pl::TerminalOpen::default(); pl::TERMINAL_ACTIONS];
+    for action in &mut actions[..count] {
+        *action = pl::TerminalOpen::read(&mut r).map_err(|s| s.code())?;
+    }
+    r.finish().map_err(|s| s.code())?;
+    // The parent supplied Slot::Terminal, so it must never receive our
+    // identity. The active loader gets this endpoint from the process
+    // service, which received it from tty's authenticated Register.
+    let tty = tty.ok_or(pl::IO)?;
+    for action in &actions[..count] {
+        if !action.controlling && action.no_ctty {
+            continue;
+        }
+        let method = if action.controlling {
+            proto_tty::Method::Controlling
+        } else {
+            proto_tty::Method::Acquire
+        };
+        let mut w = Writer::new();
+        method.header().write(&mut w).map_err(|s| s.code())?;
+        w.u32(action.terminal).map_err(|s| s.code())?;
+        let identity = sys::handle_duplicate(&own.identity, Rights::NOTIFY | Rights::TRANSFER)
+            .map_err(code)?;
+        let reply = sys::send_handles(tty, w.as_bytes(), [identity.erase()])
+            .map_err(|refused| code(refused.error))?;
+        let mut buffer = [0; MESSAGE_MAX];
+        let status = Reader::new(reply.bytes(&mut buffer))
+            .u32()
+            .map_err(|_| pl::IO)?;
+        if action.controlling && status != 0 {
+            return Err(if status == proto_tty::NOT_CONTROLLING {
+                pl::NO_CONTROLLING
+            } else {
+                pl::PERMISSION
+            });
+        }
+        // Like open(), failure to acquire a busy terminal does not fail
+        // an ordinary terminal open. A later /dev/tty still verifies it.
+    }
+    Ok(())
+}
+
+fn loader_terminal(session: &Handle<Channel>) -> Result<Option<Handle<Channel>>, u32> {
+    let request = proto_process::Method::LoaderTerminal.header().bytes();
+    let mut reply = sys::send(session, &request).map_err(code)?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match Reader::new(reply.bytes(&mut buffer)).u32() {
+        Ok(0) => reply.handles.take::<Channel>(0).map(Some).map_err(code),
+        Ok(proto_process::UNREGISTERED) => Ok(None),
+        _ => Err(pl::IO),
+    }
+}
+
+/// Verify before a parent can commit SetId. True tty descriptions and
+/// their clone root move unchanged; a counterfeit is replaced without a
+/// single request or identity sent through it.
+fn verify_terminal(
+    tty: Option<&Handle<Channel>>,
+    offered: Handle<Channel>,
+) -> Result<Handle<Channel>, u32> {
+    let tty = tty.ok_or(pl::IO)?;
+    let request = proto_tty::Method::VerifySession.header().bytes();
+    let mut reply = sys::send_handles(tty, &request, [offered.erase()])
+        .map_err(|refused| code(refused.error))?;
+    let mut buffer = [0; MESSAGE_MAX];
+    if Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        return Err(pl::IO);
+    }
+    reply.handles.take::<Channel>(0).map_err(code)
 }
 
 /// Regions: an entry for each handle, a memory object of the parent's

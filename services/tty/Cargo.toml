@@ -21,6 +21,8 @@ bench = false
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask tty, under -icount).
 steps = ["rt/step-stats"]
+# Trusted terminal and newborn probes, in the posix-tty image alone.
+trust-probe = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

@@ -94,6 +94,18 @@ struct Walking {
 /// The walks of the service that wait for an earlier walk of their sender
 /// at most; past them kill is EAGAIN.
 const LATER: usize = 64;
+#[cfg(feature = "tty-probe")]
+const PROBE_METHODS: [u16; proto_process::METHODS.len() + 2] = {
+    let mut methods = [0; proto_process::METHODS.len() + 2];
+    let mut i = 0;
+    while i < proto_process::METHODS.len() {
+        methods[i] = proto_process::METHODS[i];
+        i += 1;
+    }
+    methods[i] = 42;
+    methods[i + 1] = 44;
+    methods
+};
 /// The label of the service's own place for the notification that makes
 /// the next step of a walk: a service label no record has (its index
 /// is past RECORDS).
@@ -167,6 +179,10 @@ struct Processes {
     /// The walk of a TtySignal, one at a time: the terminal service waits
     /// for its reply (5f).
     tty_walk: Option<Walking>,
+    #[cfg(feature = "tty-probe")]
+    tty_probe: Option<(usize, u32)>,
+    terminal_notice: Option<Handle<Channel>>,
+    loader_terminal: Option<Handle<Channel>>,
     /// The controlling terminals of the sessions (5f).
     terminals: Terminals,
     /// The place of the service's channel that tells it of the next step
@@ -202,6 +218,10 @@ impl Processes {
             walking: Queue::new(),
             later: [const { None }; LATER],
             tty_walk: None,
+            #[cfg(feature = "tty-probe")]
+            tty_probe: None,
+            terminal_notice: None,
+            loader_terminal: None,
             terminals: Terminals::new(),
             step: None,
             step_told: false,
@@ -728,10 +748,40 @@ impl Processes {
     /// Nothing else (PERMISSION).
     fn notary(&mut self, r: &mut Request<'_>) -> Answer {
         let method = r.method();
+        #[cfg(feature = "tty-probe")]
+        if method == 44 {
+            if !proto_process::is_terminal(r.label()) {
+                return refuse(proto_process::PERMISSION);
+            }
+            let mut body = r.body();
+            let (Ok(group), Ok(sid), Ok(())) = (body.u32(), body.u32(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            if self.records.get(RECORDS - 1).is_some() || self.terminals.session(0) != Some(sid) {
+                return refuse(proto_process::PERMISSION);
+            }
+            self.generations
+                .set_groups(RECORDS - 1, (group != 0).then_some((group, sid)));
+            return Answer::Status(Status::Ok);
+        }
+        #[cfg(feature = "tty-probe")]
+        if method == 42 {
+            return if proto_process::is_terminal(r.label()) {
+                self.probe_newborn(r)
+            } else {
+                refuse(proto_process::PERMISSION)
+            };
+        }
         if method == Method::SetId as u16 {
             return self.set_id(r);
         }
-        let terminal = [Method::TtySignal, Method::SetCtty, Method::DropCtty];
+        let terminal = [
+            Method::TtySignal,
+            Method::SetCtty,
+            Method::DropCtty,
+            Method::TtyEvents,
+            Method::AckCtty,
+        ];
         if terminal.map(|m| m as u16).contains(&method) {
             if !proto_process::is_terminal(r.label()) {
                 return refuse(proto_process::PERMISSION);
@@ -741,12 +791,26 @@ impl Processes {
         if r.body().finish().is_err() {
             return Answer::Status(Status::BadSize);
         }
-        if method == Method::Register as u16 && r.handles.is_empty() {
+        if method == Method::Register as u16
+            && (r.handles.is_empty()
+                || proto_process::is_terminal(r.label()) && r.handles.len() == 2)
+        {
+            if !r.handles.is_empty() {
+                let notice = matches!(r.handles.info(0), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::NOTIFY));
+                let loader = matches!(r.handles.info(1), Some((ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::DUPLICATE));
+                if !notice || !loader {
+                    return Answer::Status(Status::BadSize);
+                }
+            }
             let Ok(copy) = self.generations.copy() else {
                 return Answer::Status(Status::Kernel(abi::Error::NoMemory));
             };
             if r.reply().u32(0).is_err() {
                 return Answer::Status(Status::BadSize);
+            }
+            if proto_process::is_terminal(r.label()) && r.handles.len() == 2 {
+                self.terminal_notice = r.handles.take::<Channel>(0).ok();
+                self.loader_terminal = r.handles.take::<Channel>(1).ok();
             }
             return Answer::Reply([copy.erase()].into());
         }
@@ -1016,6 +1080,7 @@ impl Processes {
         // A walk of the terminal goes first: the terminal service waits
         // for it, and its input with it.
         if self.tty_walk.is_some() {
+            rt::service::step_own();
             self.tty_walk_step();
             self.kick();
             return;
@@ -1063,6 +1128,20 @@ impl Processes {
     /// that spawns while kill(-pgid) or kill(-1) is on leaves no child
     /// behind the cursor. Only while walks are on: RECORDS looks then.
     fn signal_newborn(&mut self, index: usize) {
+        let pgid = self.records.get(index).map_or(0, |r| r.pgid);
+        if let Some(w) = self.tty_walk.as_ref()
+            && w.walk.takes_newborn(index, pgid)
+        {
+            let signal = w.signal;
+            let delivery = self.deliver_terminal(index, signal);
+            if let Some(w) = self.tty_walk.as_mut() {
+                match delivery {
+                    Delivery::Done => w.delivered = true,
+                    Delivery::Denied => w.denied = true,
+                    Delivery::Refused => w.refused = true,
+                }
+            }
+        }
         if self.walking.is_empty() {
             return;
         }
@@ -1101,11 +1180,39 @@ impl Processes {
             return Answer::Status(Status::BadSize);
         };
         let terminal = terminal as usize;
+        if terminal >= proto_process::TERMINALS {
+            return refuse(proto_process::PERMISSION);
+        }
+        if method == Method::TtyEvents as u16 {
+            if body.finish().is_err() {
+                return Answer::Status(Status::BadSize);
+            }
+            let w = r.reply();
+            let e = self.terminals.event(terminal);
+            if w.u32(0)
+                .and_then(|()| w.u32(e.map_or(0, |e| e.sid)))
+                .and_then(|()| w.u64(e.map_or(0, |e| e.generation)))
+                .is_err()
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            return Answer::Reply(Outgoing::new());
+        }
+        if method == Method::AckCtty as u16 {
+            let (Ok(generation), Ok(())) = (body.u64(), body.finish()) else {
+                return Answer::Status(Status::BadSize);
+            };
+            self.terminals.ack(terminal, generation);
+            return Answer::Status(Status::Ok);
+        }
         if method == Method::DropCtty as u16 {
             if body.finish().is_err() {
                 return Answer::Status(Status::BadSize);
             }
             self.terminals.drop_terminal(terminal);
+            if let Some(notice) = self.terminal_notice.as_ref() {
+                let _ = sys::notify(notice, 1);
+            }
             return Answer::Status(Status::Ok);
         }
         if method == Method::SetCtty as u16 {
@@ -1115,13 +1222,22 @@ impl Processes {
             let records = &self.records;
             let lives = |sid: u32| {
                 records.find_pid(sid).is_some_and(|i| {
-                    records
-                        .get(i)
-                        .is_some_and(|r| r.sid == sid && r.state == State::Alive)
+                    records.get(i).is_some_and(|r| {
+                        r.sid == sid && matches!(r.state, State::Alive | State::Loading)
+                    })
                 })
             };
             return match self.terminals.set(terminal, sid, lives) {
-                Ok(()) => Answer::Status(Status::Ok),
+                Ok(generation) => {
+                    if r.reply()
+                        .u32(0)
+                        .and_then(|()| r.reply().u64(generation))
+                        .is_err()
+                    {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    Answer::Reply(Outgoing::new())
+                }
                 Err(code) => refuse(code),
             };
         }
@@ -1149,7 +1265,7 @@ impl Processes {
         let Some(session) = self.records.session_of(pgid) else {
             return refuse(proto_process::NO_PROCESS);
         };
-        if self.terminals.session(terminal) != Some(session) {
+        if !self.terminals.permits(terminal, session, signal) {
             return refuse(proto_process::PERMISSION);
         }
         if self.tty_walk.is_some() {
@@ -1173,6 +1289,12 @@ impl Processes {
     /// A signal of the terminal to the record in `target` (XBD 11.1.9):
     /// as `deliver`, with no check of permission and the code SI_KERNEL.
     fn deliver_terminal(&mut self, target: usize, signal: u8) -> Delivery {
+        #[cfg(feature = "tty-probe")]
+        if let Some((index, count)) = self.tty_probe.as_mut()
+            && *index == target
+        {
+            *count += 1;
+        }
         let record = self.records.get(target).expect("a target");
         if matches!(record.state, State::Zombie(_)) {
             return Delivery::Done;
@@ -1211,6 +1333,14 @@ impl Processes {
             Step::Looked => {}
             Step::Done => {
                 let code = walk::outcome(w.delivered, w.refused, w.denied);
+                #[cfg(feature = "tty-probe")]
+                if let Some((_, count)) = self.tty_probe.take() {
+                    let mut reply = Writer::new();
+                    let _ = reply.u32(code);
+                    let _ = reply.u32(count);
+                    let _ = w.pending.answer(reply.as_bytes(), Outgoing::new());
+                    return;
+                }
                 let _ = w
                     .pending
                     .answer(&proto_wire::reply(Status::from_code(code)), Outgoing::new());
@@ -1218,6 +1348,40 @@ impl Processes {
             }
         }
         self.tty_walk = Some(w);
+    }
+
+    #[cfg(feature = "tty-probe")]
+    fn probe_newborn(&mut self, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(pid), Ok(())) = (body.u32(), body.finish()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let Some(index) = self.records.find_pid(pid) else {
+            return refuse(proto_process::NO_PROCESS);
+        };
+        let record = self.records.get(index).expect("the probe's target");
+        let pgid = record.pgid;
+        if !self.terminals.permits(0, record.sid, 28) {
+            return refuse(proto_process::PERMISSION);
+        }
+        if self.tty_walk.is_some() {
+            return refuse(proto_process::AGAIN);
+        }
+        let Some(pending) = r.defer() else {
+            return Answer::Status(Status::BadSize);
+        };
+        self.tty_walk = Some(Walking {
+            walk: Walk::passed(Target::Group(pgid), index),
+            pending,
+            signal: 28,
+            delivered: false,
+            refused: false,
+            denied: false,
+        });
+        self.tty_probe = Some((index, 0));
+        self.signal_newborn(index);
+        self.kick();
+        Answer::Deferred
     }
 
     /// Publishes the group and session of the record in `index` on its
@@ -1244,13 +1408,13 @@ impl Processes {
         }
         match self.records.set_pgid(index, pid, pgid) {
             Ok(()) => {
-                self.publish_group(index);
                 let target = if pid == 0 {
                     Some(index)
                 } else {
                     self.records.find_pid(pid)
                 };
                 if let Some(target) = target {
+                    self.publish_group(target);
                     self.publish_groups(target);
                 }
                 // A child moved: the caller's waits; the caller itself: its
@@ -1830,6 +1994,24 @@ impl Processes {
             return Answer::Status(Status::Kernel(abi::Error::BadState));
         };
         match r.method() {
+            m if m == Method::LoaderTerminal as u16 => {
+                if self.loaders.get(slot).map(|p| p.stage) != Some(Stage::Loading)
+                    || !r.handles.is_empty()
+                {
+                    return refuse(proto_process::PERMISSION);
+                }
+                let Some(terminal) = self.loader_terminal.as_ref() else {
+                    return refuse(proto_process::UNREGISTERED);
+                };
+                let copy = match sys::handle_duplicate(terminal, Rights::SEND | Rights::TRANSFER) {
+                    Ok(copy) => copy,
+                    Err(e) => return kernel(e),
+                };
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply([copy.erase()].into())
+            }
             m if m == Method::Boot as u16 => self.boot(child, slot, r),
             m if m == Method::Ready as u16 => self.ready(child, r),
             m if m == Method::Take as u16 => self.take(child, slot, r),
@@ -2063,7 +2245,16 @@ impl Processes {
 }
 impl Service<0> for Processes {
     const VERSION: u16 = proto_process::VERSION;
-    const METHODS: &'static [u16] = proto_process::METHODS;
+    const METHODS: &'static [u16] = {
+        #[cfg(feature = "tty-probe")]
+        {
+            &PROBE_METHODS
+        }
+        #[cfg(not(feature = "tty-probe"))]
+        {
+            proto_process::METHODS
+        }
+    };
     const PLACED: usize = PLACED;
     type Data = LongSession;
     fn place(&self, label: u64) -> Option<usize> {
@@ -2101,14 +2292,26 @@ impl Service<0> for Processes {
         }
         // The signals and controlling terminals of the terminal service
         // come through its notary session alone (5f).
-        let terminal = [Method::TtySignal, Method::SetCtty, Method::DropCtty];
+        let terminal = [
+            Method::TtySignal,
+            Method::SetCtty,
+            Method::DropCtty,
+            Method::TtyEvents,
+            Method::AckCtty,
+        ];
         if terminal.map(|m| m as u16).contains(&method) {
             return refuse(proto_process::PERMISSION);
         }
         if let Some(child) = self.records.find_loader(r.label()) {
             return self.loader_request(child, r);
         }
-        let loaders_own = [Method::Boot, Method::Ready, Method::Take, Method::SetId];
+        let loaders_own = [
+            Method::Boot,
+            Method::Ready,
+            Method::Take,
+            Method::SetId,
+            Method::LoaderTerminal,
+        ];
         if loaders_own.map(|m| m as u16).contains(&method) {
             return refuse(proto_process::PERMISSION);
         }
@@ -2245,6 +2448,9 @@ impl Service<0> for Processes {
             && r.label.pid() == r.sid
         {
             self.terminals.leader_ended(r.sid);
+            if let Some(notice) = self.terminal_notice.as_ref() {
+                let _ = sys::notify(notice, 1);
+            }
         }
         let (exit, orphans) = self.records.exited(index, end);
         // An exec that waited for init goes on: its new image is dead.

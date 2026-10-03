@@ -48,6 +48,15 @@ pub struct Walk {
 }
 
 impl Walk {
+    #[cfg(feature = "tty-probe")]
+    pub fn passed(target: Target, index: usize) -> Self {
+        Self {
+            target,
+            sender: RECORDS,
+            cursor: index + 1,
+        }
+    }
+
     pub const fn new(target: Target, sender: usize) -> Self {
         Self {
             target,

@@ -20,6 +20,52 @@ pub struct Caller {
     pub sid: u32,
 }
 
+/// A departed connection's foreground is kept until its exact AckCtty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Departed {
+    pub generation: u64,
+    pub sid: u32,
+    pub foreground: Option<u32>,
+}
+
+pub struct Departures([Option<Departed>; proto_process::CTTY_EVENTS]);
+
+impl Default for Departures {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Departures {
+    pub const fn new() -> Self {
+        Self([None; proto_process::CTTY_EVENTS])
+    }
+    pub fn keep(&mut self, old: Departed) -> bool {
+        if self.find(old.generation).is_some() {
+            return true;
+        }
+        let Some(slot) = self.0.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(old);
+        true
+    }
+    pub fn find(&self, generation: u64) -> Option<Departed> {
+        self.0
+            .iter()
+            .flatten()
+            .find(|old| old.generation == generation)
+            .copied()
+    }
+    pub fn forget(&mut self, generation: u64) {
+        for old in &mut self.0 {
+            if old.is_some_and(|old| old.generation == generation) {
+                *old = None;
+            }
+        }
+    }
+}
+
 /// The session a terminal is the controlling terminal of, and its
 /// foreground process group.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,6 +181,40 @@ mod tests {
         pgid: 400,
         sid: 400,
     };
+
+    #[test]
+    fn departures_keep_old_foregrounds_until_their_exact_ack() {
+        let mut history = Departures::new();
+        let old = Departed {
+            generation: 1,
+            sid: 300,
+            foreground: Some(301),
+        };
+        assert!(history.keep(old));
+        let next = Departed {
+            generation: 2,
+            sid: 400,
+            foreground: Some(401),
+        };
+        assert!(history.keep(next));
+        assert_eq!(history.find(1), Some(old));
+        // Retries retain the first foreground captured for this generation.
+        assert!(history.keep(Departed {
+            foreground: Some(999),
+            ..old
+        }));
+        assert_eq!(history.find(1), Some(old));
+        history.forget(1);
+        assert_eq!(history.find(2), Some(next));
+        for generation in 3..=9 {
+            assert!(history.keep(Departed { generation, ..old }));
+        }
+        assert!(!history.keep(Departed {
+            generation: 10,
+            ..old
+        }));
+        assert_eq!(history.find(2), Some(next));
+    }
 
     #[test]
     fn a_leader_acquires_and_a_member_does_not() {

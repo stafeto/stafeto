@@ -44,7 +44,9 @@
 //! - FLOW: body the terminal u32, the action u32 (FLOW_OUT_OFF stops the
 //!   terminal's output, FLOW_OUT_ON lets it go on, FLOW_IN_OFF and
 //!   FLOW_IN_ON put the STOP and the START character in the output).
-//!   Reply: status.
+//!   Reply: status. With an enabled STOP or START character and a full
+//!   output ring, LIMIT_REACHED (EAGAIN) has no effect; the caller can retry
+//!   after room becomes available.
 //!
 //! The controlling terminal (XBD 11.1.3; 5f, T3). Each request below has
 //! the body the terminal u32 (and a word where named) and brings a copy of
@@ -94,7 +96,7 @@ pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 12;
 pub const MAX_CANON: usize = 255;
 /// {MAX_INPUT}: the bytes of input a terminal keeps that were not read.
 pub const MAX_INPUT: usize = 1024;
-/// The reads, and the writes, that wait on one terminal at most.
+/// The reads, writes and drains that wait on one terminal together at most.
 pub const WAITERS: usize = 8;
 
 /// ENOTTY: no such terminal.
@@ -272,10 +274,11 @@ pub enum Method {
     GetPgrp = 18,
     GetSid = 19,
     Controlling = 20,
+    VerifySession = 24,
 }
 
 impl Method {
-    pub const ALL: [Method; 20] = [
+    pub const ALL: [Method; 21] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -296,6 +299,7 @@ impl Method {
         Method::GetPgrp,
         Method::GetSid,
         Method::Controlling,
+        Method::VerifySession,
     ];
 
     pub const fn number(self) -> u16 {
@@ -312,7 +316,7 @@ impl Method {
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24,
 ];
 
 /// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,
@@ -600,7 +604,7 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed_and_listed() {
-        for number in 0..=21u16 {
+        for number in 0..=25u16 {
             let method = Method::from_number(number);
             assert_eq!(method.is_some(), METHODS.contains(&number), "{number}");
             if let Some(m) = method {

@@ -354,3 +354,106 @@ pub fn drain_flush_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &
     rt::println!("tty-probe: tcdrain, tcflush and tcflow steps made");
     Ok(())
 }
+
+/// Full control-character output and mixed waits exercise shared limits.
+pub fn mixed_waits_and_flow(probe: &Probe, parent: &Handle<Channel>) -> Result<(), &'static str> {
+    let stub = rt::service::connect(parent, "uart").map_err(|_| "no driver")?;
+    let before = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
+    let mut out = [0; 16];
+    let mut w = Writer::new();
+    Control {
+        terminal: CONSOLE,
+        word: FLOW_OUT_OFF,
+    }
+    .write(Method::Flow, &mut w)
+    .map_err(fail)?;
+    status_call(probe, w.as_bytes())?;
+    let mut w = Writer::new();
+    Control {
+        terminal: CONSOLE,
+        word: FLOW_IN_OFF,
+    }
+    .write(Method::Flow, &mut w)
+    .map_err(fail)?;
+    // Every success must have queued one enabled VSTOP, up to OUTPUT.
+    for _ in 0..4096 {
+        status_call(probe, w.as_bytes())?;
+    }
+    let mut buffer = [0; MESSAGE_MAX];
+    let refused = Probe::call_on(&probe.tty, w.as_bytes(), None, &mut buffer).map_err(fail)?;
+    if status_of(refused) != Err(Status::Kernel(abi::Error::LimitReached)) {
+        return Err("a full tcflow succeeded without queuing the character");
+    }
+    let opened = probe.get_attr().map_err(fail)?;
+    let mut disabled = opened;
+    disabled.cc[proto_tty::VSTOP] = proto_tty::DISABLED;
+    probe.set_attr(disabled, NOW).map_err(fail)?;
+    status_call(probe, w.as_bytes())?;
+    probe.set_attr(opened, NOW).map_err(fail)?;
+    let mut reads = [0; 6];
+    for key in &mut reads {
+        let mut w = Writer::new();
+        read_request(None, 1, &mut w).map_err(fail)?;
+        let Ok(Step::Wait(k)) = probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) else {
+            return Err("a mixed read");
+        };
+        *key = k;
+    }
+    let mut w = Writer::new();
+    write_request(None, b"x", &mut w).map_err(fail)?;
+    let Ok(Step::Wait(write)) = probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) else {
+        return Err("a mixed write");
+    };
+    let mut w = Writer::new();
+    Drain {
+        key: None,
+        terminal: CONSOLE,
+    }
+    .write(&mut w)
+    .map_err(fail)?;
+    let Ok(Step::Wait(drain)) = probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) else {
+        return Err("a mixed drain");
+    };
+    let refused = Probe::call_on(&probe.tty, w.as_bytes(), None, &mut buffer).map_err(fail)?;
+    if status_of(refused) != Err(Status::Kernel(abi::Error::LimitReached)) {
+        return Err("a ninth mixed wait was admitted");
+    }
+    for (method, key) in [(Method::WriteCancel, write), (Method::DrainCancel, drain)] {
+        let mut w = Writer::new();
+        Cancel {
+            key,
+            terminal: CONSOLE,
+        }
+        .write(method, &mut w)
+        .map_err(fail)?;
+        if probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) != Ok(Step::Cancelled) {
+            return Err("a mixed cancellation");
+        }
+    }
+    for key in reads {
+        let mut w = Writer::new();
+        Cancel {
+            key,
+            terminal: CONSOLE,
+        }
+        .write(Method::ReadCancel, &mut w)
+        .map_err(fail)?;
+        if probe.step_on(&probe.tty, w.as_bytes(), None, &mut out) != Ok(Step::Cancelled) {
+            return Err("a mixed read cancellation");
+        }
+    }
+    let mut w = Writer::new();
+    Control {
+        terminal: CONSOLE,
+        word: FLOW_OUT_ON,
+    }
+    .write(Method::Flow, &mut w)
+    .map_err(fail)?;
+    status_call(probe, w.as_bytes())?;
+    let after = stub_call(&stub, TAKEN, &[]).map_err(fail)?;
+    if after - before != 4096 {
+        return Err("accepted flow characters or cancelled writes changed the output count");
+    }
+    rt::println!("tty-probe: mixed waits and full tcflow ok");
+    Ok(())
+}

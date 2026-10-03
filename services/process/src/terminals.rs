@@ -8,64 +8,146 @@
 //! takes the terminal from a session whose leader ended. A terminal
 //! belongs to one session at most and a session has one terminal at most.
 
-use proto_process::{ACCESS, PERMISSION, TERMINALS};
+use proto_process::{ACCESS, AGAIN, PERMISSION, TERMINALS};
 
-#[derive(Default)]
+pub const EVENTS: usize = proto_process::CTTY_EVENTS;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub sid: u32,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Terminal {
+    link: Option<Link>,
+    next: u64,
+    events: [Option<Link>; EVENTS],
+}
+
+impl Terminal {
+    const fn new() -> Self {
+        Self {
+            link: None,
+            next: 1,
+            events: [None; EVENTS],
+        }
+    }
+
+    fn end(&mut self) {
+        if let Some(link) = self.link.take() {
+            let place = self
+                .events
+                .iter_mut()
+                .find(|e| e.is_none())
+                .expect("SetCtty reserved a departure");
+            *place = Some(link);
+        }
+    }
+}
+
 pub struct Terminals {
-    sessions: [Option<u32>; TERMINALS],
+    terminals: [Terminal; TERMINALS],
+}
+
+impl Default for Terminals {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Terminals {
     pub const fn new() -> Self {
         Self {
-            sessions: [None; TERMINALS],
+            terminals: [Terminal::new(); TERMINALS],
         }
     }
 
-    /// The session of `terminal`, if one has it.
     pub fn session(&self, terminal: usize) -> Option<u32> {
-        self.sessions.get(terminal).copied().flatten()
+        self.link(terminal).map(|l| l.sid)
     }
 
-    /// SetCtty: `terminal` becomes the controlling terminal of the session
-    /// `sid`, whose leader `lives` says lives (PERMISSION otherwise), when
-    /// the terminal has no session with a live leader and the session no
-    /// other terminal (ACCESS otherwise). A session that has the terminal
-    /// already keeps it.
+    pub fn link(&self, terminal: usize) -> Option<Link> {
+        self.terminals.get(terminal)?.link
+    }
+
+    /// One slot is reserved for the current owner's eventual departure.
     pub fn set(
         &mut self,
         terminal: usize,
         sid: u32,
         lives: impl Fn(u32) -> bool,
-    ) -> Result<(), u32> {
+    ) -> Result<u64, u32> {
         if terminal >= TERMINALS || !lives(sid) {
             return Err(PERMISSION);
         }
-        match self.sessions[terminal] {
-            Some(held) if held == sid => return Ok(()),
-            Some(held) if lives(held) => return Err(ACCESS),
-            _ => {}
+        if let Some(held) = self.link(terminal) {
+            if held.sid == sid {
+                return Ok(held.generation);
+            }
+            if lives(held.sid) {
+                return Err(ACCESS);
+            }
+            self.terminals[terminal].end();
         }
-        if self.sessions.contains(&Some(sid)) {
+        if self
+            .terminals
+            .iter()
+            .any(|t| t.link.is_some_and(|l| l.sid == sid))
+        {
             return Err(ACCESS);
         }
-        self.sessions[terminal] = Some(sid);
-        Ok(())
+        let t = &mut self.terminals[terminal];
+        if t.events.iter().all(Option::is_some) {
+            return Err(AGAIN);
+        }
+        let generation = t.next;
+        t.next = t.next.checked_add(1).ok_or(AGAIN)?;
+        t.link = Some(Link { sid, generation });
+        Ok(generation)
     }
 
-    /// DropCtty: `terminal` is no session's.
-    pub fn drop_terminal(&mut self, terminal: usize) {
-        if let Some(place) = self.sessions.get_mut(terminal) {
-            *place = None;
+    /// The oldest event stays present, and HUP remains authorized, until Ack.
+    pub fn event(&self, terminal: usize) -> Option<Link> {
+        self.terminals
+            .get(terminal)?
+            .events
+            .iter()
+            .flatten()
+            .min_by_key(|e| e.generation)
+            .copied()
+    }
+
+    pub fn ack(&mut self, terminal: usize, generation: u64) {
+        if let Some(t) = self.terminals.get_mut(terminal) {
+            for e in &mut t.events {
+                if e.is_some_and(|e| e.generation == generation) {
+                    *e = None;
+                }
+            }
         }
     }
 
-    /// The leader of the session `sid` ended: its terminal is no longer
-    /// the session's (XBD 11.1.3).
+    /// Ordinary signals use the active link; HUP can use a pending departure.
+    pub fn permits(&self, terminal: usize, sid: u32, signal: u8) -> bool {
+        self.session(terminal) == Some(sid)
+            || signal == 1
+                && self
+                    .terminals
+                    .get(terminal)
+                    .is_some_and(|t| t.events.iter().flatten().any(|e| e.sid == sid))
+    }
+
+    pub fn drop_terminal(&mut self, terminal: usize) {
+        if let Some(t) = self.terminals.get_mut(terminal) {
+            t.end();
+        }
+    }
+
     pub fn leader_ended(&mut self, sid: u32) {
-        for place in &mut self.sessions {
-            if *place == Some(sid) {
-                *place = None;
+        for t in &mut self.terminals {
+            if t.link.is_some_and(|l| l.sid == sid) {
+                t.end();
             }
         }
     }
@@ -79,19 +161,65 @@ mod tests {
     fn a_terminal_belongs_to_one_live_session() {
         let mut t = Terminals::new();
         let alive = |sid| sid == 300 || sid == 400;
-        assert_eq!(t.set(0, 500, alive), Err(PERMISSION), "no live leader");
-        assert_eq!(t.set(0, 300, alive), Ok(()));
-        assert_eq!(t.set(0, 300, alive), Ok(()), "again");
-        assert_eq!(t.set(0, 400, alive), Err(ACCESS), "taken");
-        assert_eq!(t.set(1, 300, alive), Err(ACCESS), "a second terminal");
+        assert_eq!(t.set(0, 500, alive), Err(PERMISSION));
+        let generation = t.set(0, 300, alive).unwrap();
+        assert_eq!(t.set(0, 300, alive), Ok(generation));
+        assert_eq!(t.set(0, 400, alive), Err(ACCESS));
+        assert_eq!(t.set(1, 300, alive), Err(ACCESS));
         assert_eq!(t.set(TERMINALS, 400, alive), Err(PERMISSION));
         assert_eq!(t.session(0), Some(300));
-        // The holder's leader is gone: another session takes it.
-        assert_eq!(t.set(0, 400, |sid| sid == 400), Ok(()));
+        assert!(t.set(0, 400, |sid| sid == 400).is_ok());
         t.leader_ended(400);
         assert_eq!(t.session(0), None);
-        assert_eq!(t.set(0, 300, alive), Ok(()));
+        assert!(t.set(0, 300, alive).is_ok());
         t.drop_terminal(0);
         assert_eq!(t.session(0), None);
+    }
+
+    #[test]
+    fn a_late_ack_keeps_the_new_owner_and_hup_has_a_departure_right() {
+        let mut t = Terminals::new();
+        let old = t.set(0, 300, |_| true).unwrap();
+        t.leader_ended(300);
+        assert!(!t.permits(0, 300, 2));
+        assert!(t.permits(0, 300, 1));
+        let new = t.set(0, 400, |_| true).unwrap();
+        assert!(new > old);
+        assert_eq!(
+            t.event(0),
+            Some(Link {
+                sid: 300,
+                generation: old
+            })
+        );
+        t.ack(0, old);
+        assert_eq!(
+            t.link(0),
+            Some(Link {
+                sid: 400,
+                generation: new
+            })
+        );
+        assert!(!t.permits(0, 300, 1));
+        assert!(t.permits(0, 400, 2));
+    }
+
+    #[test]
+    fn events_have_a_reserved_slot_and_do_not_get_lost() {
+        let mut t = Terminals::new();
+        for sid in 300..300 + EVENTS as u32 {
+            t.set(0, sid, |_| true).unwrap();
+            t.leader_ended(sid);
+        }
+        assert_eq!(t.set(0, 400, |_| true), Err(AGAIN));
+        let event = t.event(0).unwrap();
+        t.ack(0, event.generation);
+        t.set(0, 400, |_| true).unwrap();
+        t.leader_ended(400);
+        for _ in 0..EVENTS {
+            let event = t.event(0).unwrap();
+            t.ack(0, event.generation);
+        }
+        assert_eq!(t.event(0), None);
     }
 }

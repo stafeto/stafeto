@@ -353,7 +353,9 @@ static int names(const struct termios *saved) {
     char *args[] = {"posix-tty", "spawned", inherited, "5", NULL};
     char *no_environment[] = {NULL};
     pid_t spawned;
-    CHECK(posix_spawn(&spawned, "/bin/posix-tty", &actions, NULL, args, no_environment) == 0);
+    int spawn_error = posix_spawn(&spawned, "/bin/posix-tty", &actions, NULL, args, no_environment);
+    if (spawn_error != 0) say("posix-tty: terminal spawn error %d\n", spawn_error);
+    CHECK(spawn_error == 0);
     CHECK(waitpid(spawned, &status, 0) == spawned && WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == 0);
     CHECK(posix_spawn_file_actions_destroy(&actions) == 0);
@@ -368,6 +370,54 @@ static int names(const struct termios *saved) {
 /* TtySignal through the process's own session: the process service takes
  * it from the terminal service alone. */
 extern int stafeto_probe_tty_signal(int pgid, int signal);
+extern int stafeto_probe_trusted_terminal(int target, int newborn);
+extern int stafeto_probe_terminal_edge(unsigned group);
+static volatile sig_atomic_t winches;
+static void winch(int number) { (void)number; ++winches; }
+static int catch_winch(void) {
+    struct sigaction action = {0};
+    action.sa_handler = winch;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    return sigaction(SIGWINCH, &action, NULL);
+}
+
+/* Sixteen live members have distinct signal pages and routers. A walk
+ * delivers to one member per step and scans at most sixteen empty slots. */
+static int terminal_crowd(void) {
+    enum { MEMBERS = 16 };
+    int ready[2];
+    if (pipe(ready) != 0) return 117;
+    pid_t children[MEMBERS];
+    for (int i = 0; i < MEMBERS; ++i) {
+        children[i] = fork();
+        if (children[i] < 0) return 118;
+        if (children[i] == 0) {
+            winches = 0;
+            if (catch_winch() != 0 || write(ready[1], "r", 1) != 1) _exit(119);
+            for (int waited = 0; winches == 0 && waited < 2000; ++waited) pause_ms(1);
+            if (winches != 1) say("posix-tty: crowd handler count %d\n", (int)winches);
+            _exit(winches == 1 ? 0 : 121);
+        }
+    }
+    char byte;
+    for (int i = 0; i < MEMBERS; ++i)
+        if (read(ready[0], &byte, 1) != 1 || byte != 'r') return 122;
+    if (stafeto_probe_trusted_terminal(getpgrp(), 0) != 0) return 123;
+    for (int i = 0; i < MEMBERS; ++i) {
+        int status;
+        if (waitpid(children[i], &status, 0) != children[i] ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            say("posix-tty: crowd child %d status %d\n", i, status);
+            return 125;
+        }
+    }
+    for (int i = 0; i < 2; ++i)
+        if (close(ready[i]) != 0) return 126;
+    say("posix-tty: terminal signal reached sixteen members\n");
+    return 0;
+}
+
 
 /* The leader A of a new session, a child of "run" (XBD 11.1.3,
  * tcsetpgrp, tcgetpgrp, tcgetsid): a member of its session that opens the
@@ -415,6 +465,9 @@ static int leader(pid_t other_group) {
     if (tcsetpgrp(tty, other_group) != -1 || errno != EPERM) return 75;
     errno = 0;
     if (tcsetpgrp(tty, 0) != -1 || errno != EINVAL) return 76;
+    /* The real TERMINAL notary refuses a group from another session. */
+    if (stafeto_probe_trusted_terminal(other_group, 0) != EPERM) return 95;
+
     /* A group of the session: a child in a group of its own. */
     int ready[2], go[2];
     if (pipe(ready) != 0 || pipe(go) != 0) return 77;
@@ -422,20 +475,41 @@ static int leader(pid_t other_group) {
     if (child < 0) return 78;
     if (child == 0) {
         char c = 0;
-        if (setpgid(0, 0) != 0) _exit(1);
+        if (catch_winch() != 0) _exit(1);
+        winches = 0;
         if (write(ready[1], "r", 1) != 1) _exit(2);
         if (read(go[0], &c, 1) != 1 || c != 'g') _exit(3);
+        if (getpgrp() != getpid()) _exit(4);
+        if (winches != 1) _exit(5);
         _exit(0);
     }
     char c = 0;
     if (read(ready[0], &c, 1) != 1 || c != 'r') return 79;
+    /* Parent setpgid must publish both of the child's pages before reply. */
+    if (setpgid(child, child) != 0) return 96;
+    /* Real signal_newborn with the child's index behind a controlled
+     * cursor. The special service also counts actual delivery calls. */
+    if (stafeto_probe_trusted_terminal(child, 1) != 0) return 97;
     if (tcsetpgrp(tty, child) != 0) return 80;
     if (tcgetpgrp(tty) != child) return 81;
     if (tcsetpgrp(tty, getpgrp()) != 0) return 82;
     if (tcgetpgrp(tty) != getpgrp()) return 83;
+    /* Successful last-slot lookup and an absent group use all 256 words.
+     * Only the special process image supplies the synthetic final word. */
+    const pid_t edge = 0x7ffffffe;
+    if (stafeto_probe_terminal_edge(edge) != 0) return 98;
+    if (tcsetpgrp(tty, edge) != 0 || tcgetpgrp(tty) != edge) return 99;
+    if (stafeto_probe_terminal_edge(0) != 0) return 100;
+    errno = 0;
+    if (tcsetpgrp(tty, edge) != -1 || errno != EPERM) return 106;
+    if (tcsetpgrp(tty, getpgrp()) != 0) return 107;
+    if (stafeto_probe_trusted_terminal(getpgrp(), 0) != 0) return 108;
+
     if (write(go[1], "g", 1) != 1) return 84;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 85;
     if (WEXITSTATUS(status) != 0) return 90 + WEXITSTATUS(status);
+    int crowd_error = terminal_crowd();
+    if (crowd_error != 0) return crowd_error;
     return 0;
 }
 
@@ -443,6 +517,11 @@ static int leader(pid_t other_group) {
  * (`leader`) makes a session and takes the console; a process cannot
  * send a signal as the terminal. */
 static int sessions(void) {
+    CHECK(catch_winch() == 0);
+    winches = 0;
+    CHECK(kill(getpid(), SIGWINCH) == 0);
+    CHECK(winches == 1); /* Positive control of the foreign target. */
+    winches = 0;
     CHECK(stafeto_probe_tty_signal(getpgrp(), SIGTERM) == EPERM);
     errno = 0;
     CHECK(tcgetpgrp(0) == -1 && errno == ENOTTY);
@@ -456,7 +535,151 @@ static int sessions(void) {
     int code = WEXITSTATUS(status);
     if (code != 0) say("posix-tty: the leader failed with %d\n", code);
     CHECK(code == 0);
+    CHECK(winches == 0);
+    sigset_t pending;
+    CHECK(sigpending(&pending) == 0 && sigismember(&pending, SIGWINCH) == 0);
     say("posix-tty: sessions ok\n");
+    return 0;
+}
+
+/* Spawn terminal actions run with the child's attributes and identity.
+ * Each child ends before the next acquires; the parent keeps no terminal. */
+extern int stafeto_probe_terminal_full_exec(void);
+static int terminal_child(int has_terminal, int descriptor, int again) {
+    if (geteuid() != 0) return 109;
+    if (getsid(0) != getpid()) return 101;
+    errno = 0;
+    int tty = open("/dev/tty", O_RDWR);
+    if (!has_terminal) {
+        if (tty != -1 || errno != ENXIO) return 102;
+    } else {
+        if (tty < 0 || tcgetsid(tty) != getpid()) return 103;
+        if (close(tty) != 0) return 104;
+    }
+    if ((fcntl(5, F_GETFD) >= 0) != descriptor) return 105;
+    if (again) {
+        if (getuid() == 65534 && stafeto_probe_terminal_full_exec() != 0) return 116;
+        execl("/bin/posix-tty", "posix-tty", "terminal-exec", has_terminal ? "1" : "0", descriptor ? "1" : "0", (char *)NULL);
+        int error = errno;
+        say("posix-tty: terminal exec error %d\n", error); tcdrain(1);
+        return 110;
+    }
+    return 0;
+}
+
+extern int stafeto_probe_terminal_fake_start(void);
+extern int stafeto_probe_terminal_fake_control(void);
+extern unsigned stafeto_probe_terminal_fake_listen(void);
+extern int stafeto_probe_terminal_fake_stop(void);
+extern void stafeto_probe_terminal_fake_close(void);
+static void *fake_terminal(void *unused) {
+    (void)unused;
+    return (void *)(size_t)stafeto_probe_terminal_fake_listen();
+}
+
+static int terminal_spawn_parent(void) {
+    CHECK(setsid() == getpid());
+    for (int test = 0; test < 8; ++test) {
+        posix_spawn_file_actions_t actions;
+        posix_spawnattr_t attr;
+        CHECK(posix_spawn_file_actions_init(&actions) == 0);
+        CHECK(posix_spawnattr_init(&attr) == 0);
+        CHECK(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID) == 0); /* SETSID */
+        int flags = O_RDWR;
+        if (test == 2) flags |= O_NOCTTY;
+        if (test == 4) flags |= O_CLOEXEC;
+        const char *path = test == 0 ? "/dev/tty" : "/dev/../dev/console";
+        if (test == 5) path = "/dev/console/";
+        CHECK(posix_spawn_file_actions_addopen(&actions, 5, path, flags, 0) == 0);
+        if (test == 1 || test == 7) CHECK(posix_spawn_file_actions_addopen(&actions, 6, "/dev/tty", O_RDWR, 0) == 0);
+        if (test == 3) CHECK(posix_spawn_file_actions_addclose(&actions, 5) == 0);
+        if (test == 6) for (int i = 0; i < 32; ++i)
+            CHECK(posix_spawn_file_actions_addopen(&actions, 5, "/dev/console", O_RDWR, 0) == 0);
+        char *args[] = {"posix-tty", "terminal-child", test == 2 ? "0" : "1",
+            test == 3 || test == 4 ? "0" : "1", NULL};
+        char *env[] = {NULL};
+        pthread_t listener;
+        if (test == 7) {
+            CHECK(setuid(65534) == 0 && geteuid() == 65534);
+            CHECK(stafeto_probe_terminal_fake_start() == 0);
+            CHECK(pthread_create(&listener, NULL, fake_terminal, NULL) == 0);
+            CHECK(stafeto_probe_terminal_fake_control() == 0); /* Positive control. */
+        }
+        pid_t child;
+        int error = posix_spawn(&child, test == 7 ? "/bin/posix-tty-suid" : "/bin/posix-tty", &actions, &attr, args, env);
+        if (test == 0) CHECK(error == ENXIO);
+        else if (test == 5) CHECK(error == ENOTDIR);
+        else if (test == 6) CHECK(error == EMFILE);
+        else {
+            CHECK(error == 0);
+            int status;
+            CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status));
+            if (WEXITSTATUS(status)) say("posix-tty: terminal child failed %d\n", WEXITSTATUS(status));
+            CHECK(WEXITSTATUS(status) == 0);
+        }
+        if (test == 7) {
+            CHECK(stafeto_probe_terminal_fake_stop() == 0);
+            void *received = NULL;
+            CHECK(pthread_join(listener, &received) == 0);
+            CHECK((size_t)received == 1); /* Only our positive control. */
+            stafeto_probe_terminal_fake_close();
+        }
+        CHECK(posix_spawn_file_actions_destroy(&actions) == 0);
+        CHECK(posix_spawnattr_destroy(&attr) == 0);
+        errno = 0;
+        CHECK(open("/dev/tty", O_RDWR) == -1 && errno == ENXIO);
+        errno = 0;
+        CHECK(tcgetsid(0) == -1 && errno == ENOTTY);
+    }
+    return 0;
+}
+
+static int spawn_terminal_actions(void) {
+    pid_t parent = fork();
+    CHECK(parent >= 0);
+    if (parent == 0) _exit(terminal_spawn_parent());
+    int status;
+    CHECK(waitpid(parent, &status, 0) == parent && WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+    say("posix-tty: child terminal actions ok\n");
+    return 0;
+}
+
+/* The survivor receives permission to inspect only after the outer
+ * process has reaped the leader. Pipes establish both dependencies. */
+static int departed_leader(void) {
+    int ready[2], go[2], result[2];
+    CHECK(pipe(ready) == 0 && pipe(go) == 0 && pipe(result) == 0);
+    pid_t leader_pid = fork();
+    CHECK(leader_pid >= 0);
+    if (leader_pid == 0) {
+        if (setsid() != getpid()) _exit(111);
+        int fd = open("/dev/console", O_RDWR);
+        if (fd < 0 || open("/dev/tty", O_RDWR) < 0) _exit(112);
+        pid_t survivor = fork();
+        if (survivor < 0) _exit(113);
+        if (survivor == 0) {
+            char byte;
+            if (write(ready[1], "r", 1) != 1 || read(go[0], &byte, 1) != 1) _exit(114);
+            errno = 0;
+            int ok = open("/dev/tty", O_RDWR) == -1 && errno == ENXIO;
+            errno = 0;
+            ok &= tcgetsid(fd) == -1 && errno == ENOTTY;
+            if (write(result[1], ok ? "y" : "n", 1) != 1) _exit(115);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1 && byte == 'r');
+    int status;
+    CHECK(waitpid(leader_pid, &status, 0) == leader_pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(write(go[1], "g", 1) == 1);
+    CHECK(read(result[0], &byte, 1) == 1 && byte == 'y');
+    for (int i = 0; i < 2; ++i) {
+        CHECK(close(ready[i]) == 0 && close(go[i]) == 0 && close(result[i]) == 0);
+    }
+    say("posix-tty: departed leader ok\n");
     return 0;
 }
 
@@ -489,18 +712,23 @@ static int run(void) {
     if ((status = flushing(&saved)) != 0) return status;
     if ((status = output()) != 0) return status;
     if ((status = names(&saved)) != 0) return status;
+    if ((status = spawn_terminal_actions()) != 0) return status;
     if ((status = sessions()) != 0) return status;
+    if ((status = departed_leader()) != 0) return status;
     say("posix-tty: ok\n");
     return 0;
 }
 
 int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "terminal-child") == 0) return terminal_child(atoi(argv[2]), atoi(argv[3]), 1);
+    if (argc == 4 && strcmp(argv[1], "terminal-exec") == 0) return terminal_child(atoi(argv[2]), atoi(argv[3]), 0);
     if (argc == 4 && strcmp(argv[1], "spawned") == 0) return spawned(atoi(argv[2]), atoi(argv[3]));
     if (argc == 2 && strcmp(argv[1], "run") == 0) return run();
     char *args[] = {"posix-tty", "run", NULL};
     char *no_environment[] = {NULL};
     pid_t child;
-    if (posix_spawn(&child, "/bin/posix-tty", NULL, NULL, args, no_environment) != 0) return 10;
+    int error = posix_spawn(&child, "/bin/posix-tty", NULL, NULL, args, no_environment);
+    if (error != 0) { say("posix-tty: launcher spawn error %d\n", error); tcdrain(1); return 10; }
     int status = 0;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 11;
     return WEXITSTATUS(status);

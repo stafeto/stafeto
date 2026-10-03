@@ -305,39 +305,47 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the pipes, the
 /// process and clock services, the loader (the probe forks) and the probe.
-const POSIX_TTY_PROGRAMS: [ImageProgram; 9] = [
+const POSIX_TTY_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-tty"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &["trust-probe"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &[],
+        &["tty-probe"],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
     ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
+    ("posix-tty-suid", "posix-tty", POSIX_STACK_SIZE, &[]),
 ];
+const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_TTY_PROGRAMS;
+    programs[2].3 = &["trust-probe", "steps"];
+    programs[5].3 = &["tty-probe", "steps"];
+    programs
+};
 /// The same over the Virtio console's driver on Apple VZ (xtask
 /// posix-tty-vz).
-const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 9] = [
+const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-tty-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &["trust-probe"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &[],
+        &["tty-probe"],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
     ("posix-tty", "posix-tty", POSIX_STACK_SIZE, &[]),
+    ("posix-tty-suid", "posix-tty", POSIX_STACK_SIZE, &[]),
 ];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
@@ -978,6 +986,8 @@ commands:
             --one NAME, one test in a boot of its own, with its log
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
+  posix-tty-steps measure controlling terminal, last-slot groups and full walks
+            under -icount; startup dependency waits are printed separately
   posix-tty-vz the same over the Virtio console on Apple VZ
   tty       check the terminal service in QEMU under -icount: line editing,
             echo, INTR, raw reads with VMIN 1, output that waits for the
@@ -1074,8 +1084,9 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
-        Some("posix-tty") => posix_tty_probe(false),
-        Some("posix-tty-vz") => posix_tty_probe(true),
+        Some("posix-tty") => posix_tty_probe(false, false),
+        Some("posix-tty-vz") => posix_tty_probe(true, false),
+        Some("posix-tty-steps") => posix_tty_probe(false, true),
         Some("tty") => tty_probe(false),
         Some("tty-vz") => tty_probe(true),
         Some("help") | None => {
@@ -1873,9 +1884,15 @@ fn posix_input_probe(vz: bool) -> Result<(), String> {
 /// service. It asks for input and xtask types it: three single bytes in
 /// raw mode (no echo), a line in canonical mode, bytes for the flushes
 /// that must not be read, and one byte that must.
-fn posix_tty_probe(vz: bool) -> Result<(), String> {
+fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
     relibc()?;
-    let image = if vz {
+    let image = if measure {
+        build_boot_image(
+            "boot-posix-tty-steps.img",
+            &POSIX_TTY_STEPS_PROGRAMS,
+            BOOT_PROFILE,
+        )?
+    } else if vz {
         build_boot_image(
             "boot-posix-tty-vz.img",
             &POSIX_TTY_VZ_PROGRAMS,
@@ -1884,7 +1901,10 @@ fn posix_tty_probe(vz: bool) -> Result<(), String> {
     } else {
         build_boot_image("boot-posix-tty.img", &POSIX_TTY_PROGRAMS, BOOT_PROFILE)?
     };
-    let (cmd, _) = probe_command(&image, vz)?;
+    let (mut cmd, _) = probe_command(&image, vz)?;
+    if measure {
+        cmd.args(qemu::ICOUNT);
+    }
     const ENDED: &str = "init: posix-tty ended: exit code 0, not restarted";
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
     let result = (|| {
@@ -1933,6 +1953,64 @@ fn posix_tty_probe(vz: bool) -> Result<(), String> {
         vz::stop_hint(result)?;
     } else {
         result?;
+    }
+    if measure {
+        let dir = target_dir().join("measure");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(
+            dir.join("posix-tty-steps.log"),
+            output.lines.join("\n") + "\n",
+        )
+        .map_err(|e| e.to_string())?;
+        for tag in ["5", "1"] {
+            println!(
+                "POSIX terminal steps tag {tag}: {:?}",
+                longest_steps(&output.lines, tag)
+            );
+        }
+        let tty = longest_steps(&output.lines, "5");
+        for kind in 16..=20 {
+            let ticks = tty.iter().find(|row| row.0 == kind).map_or(0, |row| row.1);
+            if ticks == 0 {
+                return Err(format!(
+                    "terminal control kind {kind} made no measured request"
+                ));
+            }
+        }
+        let mut edge_codes = Vec::new();
+        for line in &output.lines {
+            let Some(scan) = line.strip_prefix("tty group scan: group ") else {
+                continue;
+            };
+            let fields: Vec<_> = scan.split_whitespace().collect();
+            let [group, ticks, "ticks", "code", code] = fields.as_slice() else {
+                return Err(format!("malformed terminal group scan: {line}"));
+            };
+            let ticks: u64 = ticks.parse().map_err(|_| line.clone())?;
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "terminal group scan exceeded {RAM_STEP_MAX}: {line}"
+                ));
+            }
+            if *group == "2147483646" {
+                edge_codes.push(code.parse::<u32>().map_err(|_| line.clone())?);
+            }
+        }
+        if !edge_codes.contains(&0) || !edge_codes.iter().any(|code| *code != 0) {
+            return Err(format!(
+                "terminal group scans missed last-slot or absent group: {edge_codes:?}"
+            ));
+        }
+        let process = longest_steps(&output.lines, "1");
+        let walk = process
+            .iter()
+            .find(|row| row.0 == 65)
+            .map_or(0, |row| row.1);
+        if walk == 0 || walk > RAM_STEP_MAX {
+            return Err(format!(
+                "terminal group walk step took {walk} ticks, bound {RAM_STEP_MAX}"
+            ));
+        }
     }
     // No echo in raw mode: a byte typed would show before the line that
     // follows its read.
@@ -3171,7 +3249,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-shared", posix_shared_probe),
         job("posix-input", || posix_input_probe(false)),
         job("posix-interrupt", || posix_interrupt_probe(false)),
-        job("posix-tty", || posix_tty_probe(false)),
+        job("posix-tty", || posix_tty_probe(false, false)),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),

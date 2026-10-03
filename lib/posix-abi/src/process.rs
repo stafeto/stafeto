@@ -360,6 +360,90 @@ pub fn probe_decoy(on: bool) {
     DECOY.store(on, Ordering::Relaxed);
 }
 
+/// A live counterfeit terminal endpoint used by the C terminal probe.
+static FAKE_TERMINAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn probe_terminal_fake_start() -> i32 {
+    match rt::sys::channel_create(1) {
+        Ok(channel) => {
+            FAKE_TERMINAL.store(channel.into_raw().0, Ordering::Release);
+            0
+        }
+        Err(_) => crate::constants::EIO,
+    }
+}
+
+pub fn probe_terminal_fake_control() -> i32 {
+    let fake = Handle::<Channel>::borrowed(rt::abi::Handle(FAKE_TERMINAL.load(Ordering::Acquire)));
+    let Some(identity) = identity().and_then(|identity| {
+        rt::sys::handle_duplicate(
+            identity,
+            rt::abi::Rights::NOTIFY | rt::abi::Rights::TRANSFER,
+        )
+        .ok()
+    }) else {
+        return crate::constants::EIO;
+    };
+    if rt::sys::send_handles(
+        &fake,
+        &proto_tty::Method::Controlling.header().bytes(),
+        [identity.erase()],
+    )
+    .is_ok()
+    {
+        0
+    } else {
+        crate::constants::EIO
+    }
+}
+
+pub fn probe_terminal_fake_listen() -> u32 {
+    let fake = Handle::<Channel>::borrowed(rt::abi::Handle(FAKE_TERMINAL.load(Ordering::Acquire)));
+    let mut identities = 0;
+    loop {
+        let Ok(received) = rt::sys::receive(&fake) else {
+            return u32::MAX;
+        };
+        if let rt::sys::Received::Message {
+            token,
+            words,
+            handles,
+            ..
+        } = received
+        {
+            let stop = u16::from_le_bytes(rt::abi::inline_bytes(&words)[..2].try_into().unwrap())
+                == u16::MAX;
+            for i in 0..handles.len() {
+                if matches!(handles.info(i), Some((rt::abi::ObjectKind::Channel, rights)) if rights.contains(rt::abi::Rights::NOTIFY))
+                {
+                    identities += 1;
+                }
+            }
+            let _ = token.reply(&proto_wire::reply(proto_wire::Status::Ok));
+            if stop {
+                return identities;
+            }
+        }
+    }
+}
+
+pub fn probe_terminal_fake_stop() -> i32 {
+    let fake = Handle::<Channel>::borrowed(rt::abi::Handle(FAKE_TERMINAL.load(Ordering::Acquire)));
+    let request = proto_wire::Header::new(u16::MAX, proto_tty::VERSION).bytes();
+    if rt::sys::send(&fake, &request).is_ok() {
+        0
+    } else {
+        crate::constants::EIO
+    }
+}
+
+pub fn probe_terminal_fake_close() {
+    let raw = FAKE_TERMINAL.swap(0, Ordering::AcqRel);
+    if raw != 0 {
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    }
+}
+
 /// The probe of the loader's refusal of the end of a pipe with no session
 /// of the pipe service to give (5e): with it set, a spawn's Handles brings
 /// no Pipes session.
@@ -398,6 +482,8 @@ struct Shadow {
     opened: [Option<u32>; posix_fs::OPEN_MAX],
     cwd: [u8; proto_loader::PATH_MAX],
     cwd_len: usize,
+    terminal_opens: [proto_loader::TerminalOpen; proto_loader::TERMINAL_ACTIONS],
+    terminal_count: usize,
 }
 
 impl Shadow {
@@ -409,6 +495,8 @@ impl Shadow {
             opened: [None; posix_fs::OPEN_MAX],
             cwd: [0; proto_loader::PATH_MAX],
             cwd_len: 0,
+            terminal_opens: [proto_loader::TerminalOpen::default(); proto_loader::TERMINAL_ACTIONS],
+            terminal_count: 0,
         };
         crate::shared::with_files(|files| {
             let mut open = [None; posix_fs::OPEN_MAX];
@@ -486,6 +574,38 @@ impl Shadow {
                 let place = slot(fd)?;
                 let mut full = [0; proto_loader::PATH_MAX];
                 let full = self.absolute(path, &mut full)?;
+                use crate::constants::{
+                    EINVAL, EMFILE, O_ACCMODE, O_CHANGES, O_CLOEXEC, O_CLOFORK, O_DIRECTORY,
+                    O_NOCTTY,
+                };
+                if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY)
+                    != 0
+                    || flags & O_ACCMODE == O_ACCMODE
+                {
+                    return Err(EINVAL);
+                }
+                let terminal = crate::shared::resolved(full, |transport, path| {
+                    let named = transport.terminal_of(path).map_err(crate::error)?;
+                    Ok(named
+                        .map(|number| (number, path.as_str().is_ok_and(|name| name == "/dev/tty"))))
+                })?;
+                if let Some((number, controlling)) = terminal {
+                    if flags & O_DIRECTORY != 0 {
+                        return Err(ENOTDIR);
+                    }
+                    if self.terminal_count == proto_loader::TERMINAL_ACTIONS {
+                        return Err(EMFILE);
+                    }
+                    self.terminal_opens[self.terminal_count] = proto_loader::TerminalOpen {
+                        terminal: number,
+                        controlling,
+                        no_ctty: flags & O_NOCTTY != 0,
+                    };
+                    self.terminal_count += 1;
+                    self.entries[place] =
+                        Some((posix_fs::Target::Tty(number), flags & O_CLOEXEC != 0));
+                    return Ok(());
+                }
                 // The caller's own descriptor lives only for the spawn: with
                 // FD_CLOEXEC, so that an exec or spawn of another thread in
                 // the meantime does not inherit it. The child's flag is the
@@ -637,6 +757,7 @@ pub(crate) fn load_errno(code: u32) -> i32 {
         proto_loader::NAME_TOO_LONG => ENAMETOOLONG,
         proto_loader::PERMISSION => EPERM,
         proto_loader::NOT_DIRECTORY => ENOTDIR,
+        proto_loader::NO_CONTROLLING => ENXIO,
         _ => EIO,
     }
 }
@@ -1171,12 +1292,6 @@ fn commit(
         return Err(EIO);
     }
     drop(object);
-    let mut w = Writer::new();
-    Method::Go.header().write(&mut w).map_err(|_| EIO)?;
-    let code = ask_loader(c, &w, None);
-    if code != 0 {
-        return Err(load_errno(code));
-    }
     // The child's own sessions: clones of the caller's, the one of the
     // RAM files sharing the descriptions the child starts with.
     let clock = crate::clock::session().ok_or(EIO)?;
@@ -1226,6 +1341,18 @@ fn commit(
         Some(terminal) => Some(crate::terminal::clone(terminal)?),
         None => None,
     };
+    let fake = FAKE_TERMINAL.load(Ordering::Acquire);
+    let terminal = if fake != 0 {
+        Some(
+            rt::sys::handle_duplicate(
+                &Handle::<Channel>::borrowed(rt::abi::Handle(fake)),
+                rt::abi::Rights::SEND | rt::abi::Rights::TRANSFER,
+            )
+            .map_err(|_| EIO)?,
+        )
+    } else {
+        terminal
+    };
     let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
@@ -1235,6 +1362,27 @@ fn commit(
     ];
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);
+    }
+    if shadow.terminal_count != 0 {
+        let mut w = Writer::new();
+        Method::TerminalActions
+            .header()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        w.u32(shadow.terminal_count as u32).map_err(|_| EIO)?;
+        for action in &shadow.terminal_opens[..shadow.terminal_count] {
+            action.write(&mut w).map_err(|_| EIO)?;
+        }
+        let code = ask_loader(c, &w, None);
+        if code != 0 {
+            return Err(load_errno(code));
+        }
+    }
+    let mut w = Writer::new();
+    Method::Go.header().write(&mut w).map_err(|_| EIO)?;
+    let code = ask_loader(c, &w, None);
+    if code != 0 {
+        return Err(load_errno(code));
     }
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)
 }

@@ -127,6 +127,7 @@ dependencies = [
  "proto-fs",
  "proto-loader",
  "proto-process",
+ "proto-tty",
  "proto-wire",
  "rt",
 ]
@@ -420,6 +421,7 @@ dependencies = [
 name = "posix-tty"
 version = "0.1.0"
 dependencies = [
+ "posix-abi",
  "posix-crt",
 ]
 

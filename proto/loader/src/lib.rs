@@ -176,6 +176,7 @@ pub enum Method {
     Handles = 3,
     Fork = 4,
     Regions = 5,
+    TerminalActions = 6,
 }
 
 impl Method {
@@ -193,6 +194,7 @@ impl Method {
             3 => Some(Method::Handles),
             4 => Some(Method::Fork),
             5 => Some(Method::Regions),
+            6 => Some(Method::TerminalActions),
             _ => None,
         }
     }
@@ -213,6 +215,38 @@ pub const NAME_TOO_LONG: u32 = 605;
 pub const PERMISSION: u32 = 606;
 pub const IO: u32 = 607;
 pub const NOT_DIRECTORY: u32 = 608;
+pub const NO_CONTROLLING: u32 = 609;
+
+/// Terminal opens run in the loader after SpawnStart and before OpenExec.
+/// Keep all accepted opens, including those later closed or CLOEXEC.
+/// Terminal numbers reserve this path for future PTY names as well.
+pub const TERMINAL_ACTIONS: usize = 32;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalOpen {
+    pub terminal: u32,
+    pub controlling: bool,
+    pub no_ctty: bool,
+}
+
+impl TerminalOpen {
+    pub fn write(self, w: &mut proto_wire::Writer) -> Result<(), Status> {
+        w.u32(self.terminal)?;
+        w.u32(u32::from(self.controlling) | u32::from(self.no_ctty) << 1)
+    }
+
+    pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
+        let terminal = r.u32()?;
+        let flags = r.u32()?;
+        if flags & !3 != 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Self {
+            terminal,
+            controlling: flags & 1 != 0,
+            no_ctty: flags & 2 != 0,
+        })
+    }
+}
 
 /// The handles of the start area, by their place in `Start::handles`; the
 /// sessions the parent gives with Handles are Files, Clock, Driver (the

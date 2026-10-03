@@ -121,12 +121,13 @@ const DIALOG_QUOTA: u64 = 512 * PAGE;
 /// The probe of the terminal in C (tests/posix-tty, xtask posix-tty): the
 /// console's driver, the terminal service, the RAM files, the process,
 /// clock and pipe services, and the probe, which forks a child of its own
-/// size (the pool of the process service holds it, and its reserve).
+/// size. Eighteen child quotas hold run, the session leader and sixteen
+/// live members for the terminal-signal walk. Spawn and exec run separately.
 pub const POSIX_TTY_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
     Record {
-        quota: POSIX_ABI_TABLE[1].quota + 2 * DIALOG_QUOTA + 384 * PAGE,
+        quota: POSIX_ABI_TABLE[1].quota + 18 * DIALOG_QUOTA + 384 * PAGE,
         ..POSIX_ABI_TABLE[1]
     },
     POSIX_ABI_TABLE[2],

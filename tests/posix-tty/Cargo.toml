@@ -15,3 +15,4 @@ bench = false
 
 [dependencies]
 posix-crt = { path = "../../lib/posix-crt", features = ["uart-input"] }
+posix-abi = { path = "../../lib/posix-abi" }

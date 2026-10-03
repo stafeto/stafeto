@@ -40,7 +40,7 @@ use rt::service::{
 };
 use rt::{sys, time};
 use tty::discipline::{self, Signal, Terminal};
-use tty::jobs::{self, Caller, Jobs};
+use tty::jobs::{self, Caller, Departed, Departures, Jobs};
 use tty::{Driver, Pump, Pumped, Waiter, Waiters};
 
 rt::entry!(main);
@@ -68,6 +68,8 @@ const WRITE_STEP: usize = 256;
 const STEP: u64 = OWN | 1 << 62 | 1;
 const DRIVER_IN: u64 = OWN | 1 << 62 | 2;
 const DRIVER_ROOM: u64 = OWN | 1 << 62 | 3;
+const DEPARTURES: u64 = OWN | 1 << 62 | 5;
+const LOADERS: u64 = OWN | 1 << 62 | 6;
 /// The label of the copy of the channel the timer of VTIME posts through.
 const TIMER: u64 = 1;
 
@@ -101,6 +103,7 @@ struct Who {
     index: usize,
     pid: u32,
     generation: u64,
+    loader: bool,
 }
 
 /// Where the service maps the page of the generations (proto_process
@@ -143,6 +146,16 @@ fn main(_: u64) -> u64 {
     let Ok(driver) = rt::service::connect(&start.parent, "uart") else {
         return NO_DRIVER;
     };
+    #[cfg(feature = "steps")]
+    let connect_began = time::now();
+    // Startup may wait for the process service to register. It finishes
+    // before client work; registration and mapping are separate own steps.
+    let notary = rt::service::connect(&start.parent, "posix").ok();
+    #[cfg(feature = "steps")]
+    rt::println!(
+        "tty preparation: Connect {} ticks (including startup wait)",
+        time::now().saturating_sub(connect_began)
+    );
     let place = |label| sys::handle_label(&channel, Rights::NOTIFY, label, level);
     let (Ok(step), Ok(view)) = (
         place(STEP),
@@ -177,9 +190,13 @@ fn main(_: u64) -> u64 {
         step_told: false,
         step_due: false,
         process: Handle::borrowed(start.process.raw()),
-        notary: None,
+        preparation: if notary.is_some() { 1 } else { 3 },
+        notary,
         generations: None,
         jobs: Jobs::new(),
+
+        job_generation: 0,
+        departed: Departures::new(),
     };
     let config = Config {
         issued: 0,
@@ -189,6 +206,18 @@ fn main(_: u64) -> u64 {
             priority: level,
         }),
     };
+    for phase in [1, 2] {
+        if service.preparation == phase {
+            #[cfg(feature = "steps")]
+            let began = time::now();
+            service.prepare();
+            #[cfg(feature = "steps")]
+            rt::println!(
+                "tty preparation: phase {phase} {} ticks (including dependency wait)",
+                time::now().saturating_sub(began)
+            );
+        }
+    }
     let _ = service.pull();
     rt::println!("tty: ready");
     #[cfg(feature = "steps")]
@@ -256,6 +285,9 @@ struct Tty {
     generations: Option<Handle<Memory>>,
     /// The console as a controlling terminal (5f, T3).
     jobs: Jobs,
+    preparation: u8,
+    job_generation: u64,
+    departed: Departures,
 }
 
 /// The time on the scale of timer_set.
@@ -340,6 +372,123 @@ impl Driver for Port<'_> {
 }
 
 impl Tty {
+    fn tell_place(&self, label: u64) {
+        if let Ok(place) = sys::handle_label(&self.channel, Rights::NOTIFY, label, self.level) {
+            let _ = sys::notify(&place, 1);
+        }
+    }
+
+    /// Registration and mapping finish during measured startup preparation.
+    fn prepare(&mut self) {
+        match self.preparation {
+            0 => self.notary = rt::service::connect(&self.parent, "posix").ok(),
+            1 => {
+                let Some(notary) = self.notary.as_ref() else {
+                    return;
+                };
+                let Ok(notice) = sys::handle_label(
+                    &self.channel,
+                    Rights::NOTIFY | Rights::TRANSFER,
+                    DEPARTURES,
+                    self.level,
+                ) else {
+                    return;
+                };
+                let request = proto_process::Method::Register.header().bytes();
+                let Ok(loaders) = sys::handle_label(
+                    &self.channel,
+                    Rights::SEND | Rights::DUPLICATE | Rights::TRANSFER,
+                    LOADERS,
+                    self.level,
+                ) else {
+                    return;
+                };
+                let Ok(mut reply) =
+                    sys::send_handles(notary, &request, [notice.erase(), loaders.erase()])
+                else {
+                    return;
+                };
+                let mut buffer = [0; MESSAGE_MAX];
+                if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+                    return;
+                }
+                self.generations = reply.handles.take::<Memory>(0).ok();
+            }
+            2 => {
+                let Some(memory) = self.generations.as_ref() else {
+                    return;
+                };
+                if sys::mem_map(
+                    &self.process,
+                    memory,
+                    0,
+                    4096,
+                    GENERATIONS_AT,
+                    rt::abi::Access::Read,
+                )
+                .is_err()
+                {
+                    return;
+                }
+            }
+            _ => return,
+        }
+        self.preparation += 1;
+    }
+
+    /// One old connection per step; its foreground remains available
+    /// until acknowledgement even when a new generation has acquired.
+    fn departure(&mut self) {
+        let Some(notary) = self.notary.as_ref() else {
+            return;
+        };
+        let mut w = Writer::new();
+        let _ = proto_process::Method::TtyEvents.header().write(&mut w);
+        let _ = w.u32(CONSOLE);
+        let Ok(reply) = sys::send(notary, w.as_bytes()) else {
+            return;
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+        if r.u32() != Ok(0) {
+            return;
+        }
+        let (Ok(sid), Ok(generation)) = (r.u32(), r.u64()) else {
+            return;
+        };
+        if generation == 0 {
+            return;
+        }
+        if self.job_generation == generation {
+            let old = Departed {
+                generation,
+                sid,
+                foreground: self.jobs.foreground(),
+            };
+            if !self.departed.keep(old) {
+                return;
+            }
+            self.jobs.release();
+            self.job_generation = 0;
+        }
+        let old = self.departed.find(generation);
+        // T5 sends SIGHUP here, before AckCtty, to old.foreground. The
+        // process service still authorizes that departed sid at this point.
+        if let Some(old) = old {
+            let _ = (old.sid, old.foreground);
+        }
+        let mut w = Writer::new();
+        let _ = proto_process::Method::AckCtty.header().write(&mut w);
+        let _ = w.u32(CONSOLE);
+        let _ = w.u64(generation);
+        if let Ok(reply) = sys::send(notary, w.as_bytes())
+            && proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() == Ok(0)
+        {
+            self.departed.forget(generation);
+        }
+        self.tell_place(DEPARTURES);
+    }
+
     /// Tells the loop of a step, unless one is told already; a refused
     /// notification leaves the step due for the next request or
     /// notification (`due`).
@@ -573,6 +722,9 @@ impl Tty {
         };
         match key {
             None => {
+                if self.readers.len() + self.writers.len() + self.drainers.len() >= WAITERS {
+                    return Answer::Status(Status::Kernel(Error::LimitReached));
+                }
                 let list = match kind {
                     Wait::Read(_) => &mut self.readers,
                     Wait::Write => &mut self.writers,
@@ -739,6 +891,10 @@ impl Tty {
         if r.body().finish().is_err() || !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
         }
+        self.new_clone(root, r)
+    }
+
+    fn new_clone(&mut self, root: u64, r: &mut Request<'_>) -> Answer {
         if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
@@ -824,7 +980,11 @@ impl Tty {
                 } else {
                     VSTART
                 };
-                self.console.send_control(index);
+                if self.console.termios().cc[index] != proto_tty::DISABLED
+                    && !self.console.send_control(index)
+                {
+                    return Answer::Status(Status::Kernel(Error::LimitReached));
+                }
                 self.kick();
             }
             _ => return status(INVALID),
@@ -855,28 +1015,54 @@ impl Tty {
 const SIGINT: u32 = 2;
 const SIGQUIT: u32 = 3;
 const SIGTSTP: u32 = 20;
+#[cfg(feature = "trust-probe")]
+const PROBE_METHODS: &[u16] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+];
 
 impl Tty {
+    #[cfg(feature = "trust-probe")]
+    fn trust_probe(&mut self, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let (Ok(target), Ok(())) = (body.u32(), body.finish()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        let sid = self.jobs.session().unwrap_or(0);
+        let Some(notary) = self.notary() else {
+            return status(NO_IDENTITY);
+        };
+        let mut w = Writer::new();
+        if r.method() == 21 {
+            let _ = proto_process::Method::TtySignal.header().write(&mut w);
+            let _ = w.u32(CONSOLE);
+            let _ = w.u32(target);
+            let _ = w.u32(28);
+        } else if r.method() == 22 {
+            let _ = proto_wire::Header::new(42, proto_process::VERSION).write(&mut w);
+            let _ = w.u32(target);
+        } else {
+            let _ = proto_wire::Header::new(44, proto_process::VERSION).write(&mut w);
+            let _ = w.u32(target);
+            let _ = w.u32(sid);
+        }
+        let Ok(reply) = sys::send(notary, w.as_bytes()) else {
+            return status(PERMISSION);
+        };
+        let mut buffer = [0; MESSAGE_MAX];
+        if r.reply().bytes(reply.bytes(&mut buffer)).is_err() {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
+    }
+
     /// The notary session and the page of the generations, asked for once
     /// (none in an image without the process service).
     fn notary(&mut self) -> Option<&Handle<Channel>> {
-        if self.notary.is_none() {
-            self.notary = rt::service::connect(&self.parent, "posix").ok();
+        if self.preparation == 3 {
+            self.notary.as_ref()
+        } else {
+            None
         }
-        let notary = self.notary.as_ref()?;
-        if self.generations.is_none() {
-            let request = proto_process::Method::Register.header().bytes();
-            let mut reply = sys::send(notary, &request).ok()?;
-            let mut buffer = [0; MESSAGE_MAX];
-            if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
-                return None;
-            }
-            let memory = reply.handles.take::<Memory>(0).ok()?;
-            let access = rt::abi::Access::Read;
-            sys::mem_map(&self.process, &memory, 0, 4096, GENERATIONS_AT, access).ok()?;
-            self.generations = Some(memory);
-        }
-        self.notary.as_ref()
     }
 
     /// The word at byte `at` of the page of the generations, once mapped.
@@ -903,7 +1089,7 @@ impl Tty {
         let current = s
             .data
             .who
-            .filter(|w| self.word(w.index * 8) == w.generation);
+            .filter(|w| !w.loader && self.word(w.index * 8) == w.generation);
         let who = match (current, offered) {
             (Some(who), _) => who,
             (None, Some(identity)) => {
@@ -914,18 +1100,16 @@ impl Tty {
                 let mut buffer = [0; MESSAGE_MAX];
                 let said = proto_process::WhoReply::read(reply.bytes(&mut buffer))
                     .map_err(|_| NO_IDENTITY)?;
-                if said.loader.is_some() {
-                    return Err(NO_IDENTITY);
-                }
                 Who {
                     index: said.index as usize,
                     pid: said.pid,
                     generation: said.generation,
+                    loader: said.loader.is_some(),
                 }
             }
             (None, None) => return Err(NO_IDENTITY),
         };
-        s.data.who = Some(who);
+        s.data.who = (!who.loader).then_some(who);
         let word = self.word(proto_process::GROUPS_AT + who.index * 8);
         let (pgid, sid) = proto_process::groups_of(word).ok_or(NO_IDENTITY)?;
         Ok(Caller {
@@ -963,6 +1147,8 @@ impl Tty {
         let result = match method {
             Method::Acquire => self.acquire(caller).map(|()| None),
             Method::SetPgrp => {
+                #[cfg(feature = "steps")]
+                let began = time::now();
                 let in_session = |pgid, sid| {
                     jobs::group_in_session(
                         proto_process::RECORDS,
@@ -974,6 +1160,12 @@ impl Tty {
                 let mut jobs = self.jobs;
                 let set = jobs.set_foreground(caller, group, in_session);
                 self.jobs = jobs;
+                #[cfg(feature = "steps")]
+                rt::println!(
+                    "tty group scan: group {group} {} ticks code {}",
+                    time::now().saturating_sub(began),
+                    set.as_ref().err().copied().unwrap_or(0)
+                );
                 set.map(|()| None)
             }
             Method::GetPgrp => self.jobs.get_foreground(caller).map(Some),
@@ -1011,9 +1203,21 @@ impl Tty {
         }
         let reply = sys::send(notary, w.as_bytes()).map_err(|_| PERMISSION)?;
         let mut buffer = [0; MESSAGE_MAX];
-        if proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() != Ok(0) {
+        let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+        if r.u32() != Ok(0) {
             return Err(PERMISSION);
         }
+        let generation = r.u64().map_err(|_| PERMISSION)?;
+        if self.job_generation != 0 {
+            if !self.departed.keep(Departed {
+                generation: self.job_generation,
+                sid: self.jobs.session().unwrap_or(0),
+                foreground: self.jobs.foreground(),
+            }) {
+                return Err(PERMISSION);
+            }
+        }
+        self.job_generation = generation;
         self.jobs.acquired(caller);
         Ok(())
     }
@@ -1043,20 +1247,30 @@ impl Tty {
         let code = proto_wire::Reader::new(reply.bytes(&mut buffer))
             .u32()
             .unwrap_or(0);
-        if code == proto_process::PERMISSION {
-            // The session's leader ended: the console is no session's.
-            self.jobs.release();
-        }
+        let _ = code;
     }
 }
 
 impl Service<0> for Tty {
     const VERSION: u16 = VERSION;
-    const METHODS: &'static [u16] = proto_tty::METHODS;
+    const METHODS: &'static [u16] = {
+        #[cfg(feature = "trust-probe")]
+        {
+            PROBE_METHODS
+        }
+        #[cfg(not(feature = "trust-probe"))]
+        {
+            proto_tty::METHODS
+        }
+    };
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.due();
+        #[cfg(feature = "trust-probe")]
+        if (21..=23).contains(&r.method()) {
+            return self.trust_probe(r);
+        }
         if s.data.root == 0 {
             let label = r.label();
             s.data.root = self.clones.client_of(label).unwrap_or(label);
@@ -1074,6 +1288,29 @@ impl Service<0> for Tty {
                 self.cancel(s, r)
             }
             Some(Method::Clone) => self.clone_session(s.data.root, r),
+            Some(Method::VerifySession) => {
+                if r.body().finish().is_err() || r.handles.len() != 1 {
+                    return Answer::Status(Status::BadSize);
+                }
+                if !matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Channel, rights)) if rights.contains(Rights::SEND | Rights::TRANSFER))
+                {
+                    return Answer::Status(Status::BadSize);
+                }
+                let Ok(offered) = r.handles.take::<Channel>(0) else {
+                    return Answer::Status(Status::BadSize);
+                };
+                if sys::copy_label(&self.channel, &offered).is_ok() {
+                    if r.reply().u32(0).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    Answer::Reply([offered.erase()].into())
+                } else {
+                    // The counterfeit endpoint receives no request or
+                    // identity. Return an ordinary unique trusted clone.
+                    drop(offered);
+                    self.new_clone(s.data.root, r)
+                }
+            }
             Some(Method::GetAttr) => self.get_attr(r),
             Some(Method::SetAttr) => self.set_attr(r),
             Some(
@@ -1113,6 +1350,10 @@ impl Service<0> for Tty {
     /// the work left (STEP), and the timer of VTIME.
     fn notification(&mut self, n: Notice) {
         match (n.source, n.label) {
+            (Source::Session, DEPARTURES) => {
+                rt::service::step_own();
+                self.departure();
+            }
             (Source::Session, DRIVER_IN) => {
                 rt::service::step_own();
                 let _ = self.pull();
