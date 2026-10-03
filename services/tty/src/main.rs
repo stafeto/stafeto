@@ -612,8 +612,8 @@ impl Tty {
         if request.flags & !(3 | tty::endpoints::NONBLOCK) != 0 || request.flags & 3 == 3 {
             return status(INVALID);
         }
-        let caller = match self.caller(s, r) {
-            Ok(caller) => caller,
+        let (caller, who) = match self.caller_identity(s, r) {
+            Ok(identity) => identity,
             Err(code) => return status(code),
         };
         let flags = request.flags & (3 | 0o4000);
@@ -635,8 +635,7 @@ impl Tty {
                 result
             }
             proto_tty::OPEN_SLAVE => {
-                if let Some(who) = s.data.who
-                    && who.euid != 0
+                if who.euid != 0
                     && let Some(instance) = self.endpoints.instance(request.number as usize + 1)
                 {
                     let permissions = if who.euid == instance.uid {
@@ -770,12 +769,12 @@ impl Tty {
                 .number(&self.holdsets[s.data.holding].holds, id)
                 .map(|number| value = Some(number)),
             Method::Grant => {
-                if let Err(code) = self.caller(s, r) {
-                    return status(code);
-                }
-                let uid = s.data.who.map_or(0, |who| who.uid);
+                let (_, who) = match self.caller_identity(s, r) {
+                    Ok(identity) => identity,
+                    Err(code) => return status(code),
+                };
                 self.endpoints
-                    .grant(&self.holdsets[s.data.holding].holds, id, uid)
+                    .grant(&self.holdsets[s.data.holding].holds, id, who.uid)
             }
             Method::GetFlags => {
                 value = Some(endpoint.flags);
@@ -2116,14 +2115,30 @@ impl Tty {
     /// Who sent `r` through `s`: the process service vouches for the
     /// identity the request brought, once and again when the record's
     /// generation moved; its group and session come from the page.
-    fn caller(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Result<Caller, u32> {
+    fn caller_identity(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+    ) -> Result<(Caller, Who), u32> {
         if self.notary().is_none() && self.devices[self.active].job_generation == 0 {
-            return Ok(Caller {
-                pid: 0,
-                pgid: 0,
-                sid: 0,
-                ctty: None,
-            });
+            return Ok((
+                Caller {
+                    pid: 0,
+                    pgid: 0,
+                    sid: 0,
+                    ctty: None,
+                },
+                Who {
+                    index: 0,
+                    pid: 0,
+                    generation: 0,
+                    loader: false,
+                    ctty: None,
+                    uid: 0,
+                    euid: 0,
+                    egid: 0,
+                },
+            ));
         }
         let offered = if r.handles.is_empty() {
             None
@@ -2161,12 +2176,19 @@ impl Tty {
         s.data.who = (!who.loader).then_some(who);
         let word = self.word(proto_process::GROUPS_AT + who.index * 8);
         let (pgid, sid) = proto_process::groups_of(word).ok_or(NO_IDENTITY)?;
-        Ok(Caller {
-            pid: who.pid,
-            pgid,
-            sid,
-            ctty: who.ctty,
-        })
+        Ok((
+            Caller {
+                pid: who.pid,
+                pgid,
+                sid,
+                ctty: who.ctty,
+            },
+            who,
+        ))
+    }
+
+    fn caller(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Result<Caller, u32> {
+        self.caller_identity(s, r).map(|(caller, _)| caller)
     }
 
     /// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,
