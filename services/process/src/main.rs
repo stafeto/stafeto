@@ -784,6 +784,7 @@ impl Processes {
             Method::DetachCtty,
             Method::TtyEvents,
             Method::AckCtty,
+            Method::DisconnectCtty,
         ];
         if terminal.map(|m| m as u16).contains(&method) {
             if !proto_process::is_terminal(r.label()) {
@@ -1218,11 +1219,33 @@ impl Processes {
             if w.u32(0)
                 .and_then(|()| w.u32(e.map_or(0, |e| e.sid)))
                 .and_then(|()| w.u64(e.map_or(0, |e| e.generation)))
+                .and_then(|()| w.u32(u32::from(e.is_some_and(|e| e.disconnect))))
                 .is_err()
             {
                 return Answer::Status(Status::BadSize);
             }
             return Answer::Reply(Outgoing::new());
+        }
+        if method == Method::DisconnectCtty as u16 {
+            let (Ok(sid), Ok(generation), Ok(hup), Ok(())) =
+                (body.u32(), body.u64(), body.u32(), body.finish())
+            else {
+                return Answer::Status(Status::BadSize);
+            };
+            if hup > 1 {
+                return refuse(proto_process::INVALID);
+            }
+            if self.terminals.disconnect(terminal, sid, generation) {
+                if hup != 0
+                    && let Some(index) = self.records.find_pid(sid)
+                {
+                    let _ = self.deliver_terminal(index, proto_process::SIGHUP);
+                }
+                if let Some(notice) = self.terminal_notice.as_ref() {
+                    let _ = sys::notify(notice, 1);
+                }
+            }
+            return Answer::Status(Status::Ok);
         }
         if method == Method::AckCtty as u16 {
             let (Ok(generation), Ok(())) = (body.u64(), body.finish()) else {
@@ -2394,6 +2417,7 @@ impl Service<0> for Processes {
             Method::DetachCtty,
             Method::TtyEvents,
             Method::AckCtty,
+            Method::DisconnectCtty,
         ];
         if terminal.map(|m| m as u16).contains(&method) {
             return refuse(proto_process::PERMISSION);

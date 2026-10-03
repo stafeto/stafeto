@@ -334,6 +334,47 @@ impl Terminal {
         }
     }
 
+    /// PTY input applies back pressure at the queue boundary. Editing and
+    /// signal characters can still free a full queue.
+    pub fn input_some(&mut self, bytes: &[u8], now: u64) -> usize {
+        let mut accepted = 0;
+        for &b in bytes {
+            let mut c = if self.termios.iflag & ISTRIP != 0 {
+                b & 0x7f
+            } else {
+                b
+            };
+            if c == b'\r' && self.termios.iflag & ICRNL != 0 {
+                c = b'\n';
+            }
+            let signal = self.local(ISIG) && [VINTR, VQUIT, VSUSP].iter().any(|&i| self.is(c, i));
+            let edit = self.canonical() && [VERASE, VKILL, VWERASE].iter().any(|&i| self.is(c, i));
+            if self.queue.len == MAX_INPUT && !signal && !edit {
+                break;
+            }
+            if self.canonical()
+                && self.queue.len + 1 >= MAX_INPUT
+                && c != b'\n'
+                && !self.is(c, VEOL)
+                && !self.is(c, VEOF)
+                && !signal
+                && !edit
+            {
+                break;
+            }
+            self.byte(b);
+            accepted += 1;
+        }
+        if accepted != 0 {
+            self.last_input = now;
+        }
+        accepted
+    }
+
+    pub fn input_room(&self) -> bool {
+        self.queue.len < MAX_INPUT
+    }
+
     /// One byte of input (XBD 11.2.2, 11.1.9, 11.1.6).
     fn byte(&mut self, mut b: u8) {
         let iflag = self.termios.iflag;

@@ -18,11 +18,18 @@ pub struct Link {
     pub generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Event {
+    pub sid: u32,
+    pub generation: u64,
+    pub disconnect: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Terminal {
     link: Option<Link>,
     next: u64,
-    events: [Option<Link>; EVENTS],
+    events: [Option<Event>; EVENTS],
 }
 
 impl Terminal {
@@ -34,14 +41,18 @@ impl Terminal {
         }
     }
 
-    fn end(&mut self) {
+    fn end(&mut self, disconnect: bool) {
         if let Some(link) = self.link.take() {
             let place = self
                 .events
                 .iter_mut()
                 .find(|e| e.is_none())
                 .expect("SetCtty reserved a departure");
-            *place = Some(link);
+            *place = Some(Event {
+                sid: link.sid,
+                generation: link.generation,
+                disconnect,
+            });
         }
     }
 }
@@ -88,7 +99,7 @@ impl Terminals {
             if lives(held.sid) {
                 return Err(ACCESS);
             }
-            self.terminals[terminal].end();
+            self.terminals[terminal].end(false);
         }
         if self
             .terminals
@@ -108,7 +119,7 @@ impl Terminals {
     }
 
     /// The oldest event stays present, and HUP remains authorized, until Ack.
-    pub fn event(&self, terminal: usize) -> Option<Link> {
+    pub fn event(&self, terminal: usize) -> Option<Event> {
         self.terminals
             .get(terminal)?
             .events
@@ -137,20 +148,32 @@ impl Terminals {
                     t.events
                         .iter()
                         .flatten()
-                        .any(|e| e.sid == sid && e.generation == generation)
+                        .any(|e| !e.disconnect && e.sid == sid && e.generation == generation)
                 })
+    }
+
+    /// A stale request has no effect on a later connection.
+    pub fn disconnect(&mut self, terminal: usize, sid: u32, generation: u64) -> bool {
+        let Some(t) = self.terminals.get_mut(terminal) else {
+            return false;
+        };
+        if t.link != Some(Link { sid, generation }) {
+            return false;
+        }
+        t.end(true);
+        true
     }
 
     pub fn drop_terminal(&mut self, terminal: usize) {
         if let Some(t) = self.terminals.get_mut(terminal) {
-            t.end();
+            t.end(false);
         }
     }
 
     pub fn leader_ended(&mut self, sid: u32) {
         for t in &mut self.terminals {
             if t.link.is_some_and(|l| l.sid == sid) {
-                t.end();
+                t.end(false);
             }
         }
     }
@@ -159,6 +182,30 @@ impl Terminals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_invalidates_exact_link_without_departure_group_signals() {
+        let mut t = Terminals::new();
+        let old = t.set(1, 300, |_| true).unwrap();
+        assert!(!t.disconnect(1, 300, old + 1));
+        assert!(t.disconnect(1, 300, old));
+        assert_eq!(t.link(1), None);
+        assert!(t.event(1).unwrap().disconnect);
+        for signal in [1, 18] {
+            assert!(!t.permits_exact(1, 300, old, signal));
+        }
+        let new = t.set(1, 400, |_| true).unwrap();
+        assert!(!t.disconnect(1, 300, old));
+        t.ack(1, old);
+        assert_eq!(
+            t.link(1),
+            Some(Link {
+                sid: 400,
+                generation: new
+            })
+        );
+        assert!(t.permits_exact(1, 400, new, 2));
+    }
 
     #[test]
     fn a_terminal_belongs_to_one_live_session() {
@@ -193,9 +240,10 @@ mod tests {
         assert!(!t.permits_exact(0, 300, new, 1));
         assert_eq!(
             t.event(0),
-            Some(Link {
+            Some(Event {
                 sid: 300,
-                generation: old
+                generation: old,
+                disconnect: false
             })
         );
         t.ack(0, old);

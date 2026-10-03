@@ -86,6 +86,9 @@ pub fn probe_trusted(target: u32, newborn: bool) -> i32 {
 fn refusal(status: Status) -> Option<i32> {
     match status.code() {
         proto_tty::BAD_TERMINAL => Some(ENOTTY),
+        proto_tty::BAD_DESCRIPTION => Some(EBADF),
+        proto_tty::PERMISSION => Some(EACCES),
+        proto_tty::NOT_CONTROLLING => Some(ENXIO),
         proto_tty::INVALID => Some(EINVAL),
         proto_tty::IO_ERROR => Some(EIO),
         proto_tty::RESTART => Some(JOB_RESTART),
@@ -102,13 +105,28 @@ pub(crate) fn abandon(terminal: rt::abi::Handle) {
     while rt::sys::send(&session, &request) == Err(rt::abi::Error::Interrupted) {}
 }
 
-/// Clone of the session `terminal` for a child (proto_tty CLONE).
+/// Clone all descriptions, for diagnostic clients of the layer.
 pub(crate) fn clone(terminal: rt::abi::Handle) -> Result<Handle<Channel>, i32> {
-    rt::service::clone_session(
-        &Handle::<Channel>::borrowed(terminal),
-        &Method::Clone.header().bytes(),
-    )
-    .map_err(crate::process::clone_errno)
+    clone_kept(terminal, None)
+}
+
+pub(crate) fn clone_kept(
+    terminal: rt::abi::Handle,
+    ids: Option<&[u32]>,
+) -> Result<Handle<Channel>, i32> {
+    let mut request = Writer::new();
+    Method::Clone
+        .header()
+        .write(&mut request)
+        .map_err(|_| EIO)?;
+    if let Some(ids) = ids {
+        request.u32(ids.len() as u32).map_err(|_| EIO)?;
+        for &id in ids {
+            request.u32(id).map_err(|_| EIO)?;
+        }
+    }
+    rt::service::clone_session(&Handle::<Channel>::borrowed(terminal), request.as_bytes())
+        .map_err(crate::process::clone_errno)
 }
 
 // Internal retry result: the service posted TTIN/TTOU before any effect.
@@ -158,6 +176,7 @@ pub fn read(transport: Transport, number: u32, out: &mut [u8]) -> Result<usize, 
     }
     let terminal = transport.terminal().ok_or(EBADF)?;
     let count = out.len().min(MAX_READ) as u32;
+    let master = number & proto_tty::MASTER != 0;
     retry(|| {
         let mut start = Writer::new();
         Read {
@@ -166,9 +185,10 @@ pub fn read(transport: Transport, number: u32, out: &mut [u8]) -> Result<usize, 
             blocked: blocked(proto_process::SIGTTIN),
             count,
         }
-        .write(&mut start)
+        .write_side(&mut start, master)
         .map_err(|_| EIO)?;
-        crate::long::run_with_identity(
+        crate::long::run_terminal(
+            master,
             &terminal,
             start.as_bytes(),
             |cancel, key, w| {
@@ -177,7 +197,14 @@ pub fn read(transport: Transport, number: u32, out: &mut [u8]) -> Result<usize, 
                         key,
                         terminal: number,
                     }
-                    .write(Method::ReadCancel, w)
+                    .write(
+                        if master {
+                            Method::MasterReadCancel
+                        } else {
+                            Method::ReadCancel
+                        },
+                        w,
+                    )
                 } else {
                     Read {
                         key: Some(key),
@@ -185,7 +212,7 @@ pub fn read(transport: Transport, number: u32, out: &mut [u8]) -> Result<usize, 
                         blocked: blocked(proto_process::SIGTTIN),
                         count,
                     }
-                    .write(w)
+                    .write_side(w, master)
                 }
             },
             &mut out[..count as usize],
@@ -198,6 +225,7 @@ pub fn read(transport: Transport, number: u32, out: &mut [u8]) -> Result<usize, 
 /// service took.
 #[inline(never)]
 fn write_once(terminal: &Handle<Channel>, number: u32, bytes: &[u8]) -> Result<usize, i32> {
+    let master = number & proto_tty::MASTER != 0;
     retry(|| {
         let mut start = Writer::new();
         Write {
@@ -206,10 +234,11 @@ fn write_once(terminal: &Handle<Channel>, number: u32, bytes: &[u8]) -> Result<u
             blocked: blocked(proto_process::SIGTTOU),
             bytes,
         }
-        .write(&mut start)
+        .write_side(&mut start, master)
         .map_err(|_| EIO)?;
         let mut result = [0; 4];
-        let n = crate::long::run_with_identity(
+        let n = crate::long::run_terminal(
+            master,
             terminal,
             start.as_bytes(),
             |cancel, key, w| {
@@ -218,7 +247,14 @@ fn write_once(terminal: &Handle<Channel>, number: u32, bytes: &[u8]) -> Result<u
                         key,
                         terminal: number,
                     }
-                    .write(Method::WriteCancel, w)
+                    .write(
+                        if master {
+                            Method::MasterWriteCancel
+                        } else {
+                            Method::WriteCancel
+                        },
+                        w,
+                    )
                 } else {
                     Write {
                         key: Some(key),
@@ -226,7 +262,7 @@ fn write_once(terminal: &Handle<Channel>, number: u32, bytes: &[u8]) -> Result<u
                         blocked: blocked(proto_process::SIGTTOU),
                         bytes,
                     }
-                    .write(w)
+                    .write_side(w, master)
                 }
             },
             &mut result,
@@ -300,6 +336,56 @@ fn status_of(reply: &[u8]) -> Result<(), i32> {
         Status::Ok => Ok(()),
         status => Err(refusal(status).unwrap_or(EIO)),
     }
+}
+
+/// Open through the process's own service session.
+pub fn open(transport: Transport, kind: u32, flags: u32, number: u32) -> Result<u32, i32> {
+    let mut w = Writer::new();
+    proto_tty::Open {
+        kind,
+        flags,
+        number,
+    }
+    .write(&mut w)
+    .map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let reply = call(transport, w.as_bytes(), true, &mut buffer)?;
+    status_of(reply)?;
+    let mut r = proto_wire::Reader::new(reply);
+    r.u32().map_err(|_| EIO)?;
+    let id = r.u32().map_err(|_| EIO)?;
+    r.finish().map_err(|_| EIO)?;
+    Ok(id)
+}
+
+pub fn description(
+    transport: Transport,
+    id: u32,
+    method: Method,
+    word: Option<u32>,
+) -> Result<u32, i32> {
+    let mut w = Writer::new();
+    proto_tty::description(method, id, word, &mut w).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let reply = call(
+        transport,
+        w.as_bytes(),
+        method == Method::Grant,
+        &mut buffer,
+    )?;
+    status_of(reply)?;
+    let mut r = proto_wire::Reader::new(reply);
+    r.u32().map_err(|_| EIO)?;
+    Ok(r.u32().unwrap_or(0))
+}
+
+pub fn stat(transport: Transport, id: u32) -> Result<proto_tty::Stat, i32> {
+    let mut w = Writer::new();
+    proto_tty::description(Method::Stat, id, None, &mut w).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let reply = call(transport, w.as_bytes(), false, &mut buffer)?;
+    status_of(reply)?;
+    proto_tty::Stat::read(proto_wire::Reader::new(&reply[4..])).map_err(|_| EIO)
 }
 
 /// GET_ATTR (tcgetattr): the settings of the terminal `number`.

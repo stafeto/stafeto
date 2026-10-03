@@ -6,8 +6,9 @@
 //! ownership ends after the last local reference: a close or a replacement
 //! hands the backend back to the caller to release, which it does after it
 //! let go of the owner (spec 2, 3.4; 5c). A backend an operation holds
-//! (`hold`) outside the owner's lock goes only once the last hold ends
-//! (`unhold`), so that its number is never reused under a request in flight.
+//! (`hold`) outside the owner's lock ordinarily goes at its last `unhold`.
+//! Early release backends keep operation references at their service; the
+//! local hold records their released generation until the request ends.
 
 #![no_std]
 
@@ -133,7 +134,8 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
 
     /// `backend` lost a descriptor: the caller releases it when no other
     /// descriptor names it and no operation holds it; a held one goes at
-    /// its last `unhold`.
+    /// its last `unhold`. An early release backend goes at this close,
+    /// and the hold remembers that the release already happened.
     fn left(&mut self, backend: T) -> Option<T> {
         if self.referenced(backend) {
             return None;
@@ -158,8 +160,9 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
     }
 
     /// The backend of `fd`, held for an operation the caller makes outside
-    /// the owner's lock: no close or replacement releases it until
-    /// `unhold`. TooManyOpenFiles with N backends held.
+    /// the owner's lock. Ordinary backends remain open until `unhold`;
+    /// early release backends keep their armed operations in the service.
+    /// TooManyOpenFiles with N backends held.
     pub fn hold(&mut self, fd: u32) -> Result<T, Error> {
         let backend = self.get(fd)?;
         if let Some(hold) = self
@@ -217,7 +220,8 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
     }
 
     /// Close: the descriptor goes at once; the backend to release, when it
-    /// was the last that named it and nothing holds it.
+    /// was the last that named it and either nothing holds it or its
+    /// service retains armed operation references independently.
     pub fn close(&mut self, fd: u32) -> Result<Option<T>, Error> {
         let backend = self.get(fd)?;
         self.entries[fd as usize] = None;

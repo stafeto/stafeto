@@ -283,7 +283,30 @@ impl Transport {
         match target {
             Some(Target::Ram(fd) | Target::Random(fd)) => self.close_file(fd),
             Some(Target::Pipe(end)) => self.close_pipe(end),
+            Some(Target::Tty(id)) => self.close_terminal(id),
             _ => Ok(()),
+        }
+    }
+
+    fn close_terminal(&self, id: u32) -> Result<(), FsError> {
+        let mut request = proto_wire::Writer::new();
+        proto_tty::description(proto_tty::Method::Close, id, None, &mut request)
+            .map_err(FsError::from)?;
+        let terminal = self.terminal().ok_or(FsError::BadFileDescriptor)?;
+        let reply = loop {
+            match rt::sys::send(&terminal, request.as_bytes()) {
+                Err(rt::abi::Error::Interrupted) => continue,
+                result => break result.map_err(|_| FsError::Io)?,
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let code = proto_wire::Reader::new(reply.bytes(&mut buffer))
+            .u32()
+            .map_err(FsError::from)?;
+        match code {
+            0 => Ok(()),
+            proto_tty::BAD_DESCRIPTION => Err(FsError::BadFileDescriptor),
+            _ => Err(FsError::Io),
         }
     }
 
@@ -415,12 +438,53 @@ impl Transport {
         }
     }
 
+    fn terminal_information(&self, id: u32, physical: Option<u32>) -> Result<NodeInfo, FsError> {
+        let mut w = proto_wire::Writer::new();
+        proto_tty::Method::Stat
+            .header()
+            .write(&mut w)
+            .map_err(FsError::from)?;
+        w.u32(id).map_err(FsError::from)?;
+        if let Some(terminal) = physical {
+            w.u32(terminal).map_err(FsError::from)?;
+        }
+        let channel = self.terminal().ok_or(FsError::BadFileDescriptor)?;
+        let reply = loop {
+            match rt::sys::send(&channel, w.as_bytes()) {
+                Err(rt::abi::Error::Interrupted) => continue,
+                result => break result.map_err(|_| FsError::Io)?,
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let bytes = reply.bytes(&mut buffer);
+        let mut r = proto_wire::Reader::new(bytes);
+        match r.u32().map_err(FsError::from)? {
+            0 => {}
+            proto_tty::BAD_DESCRIPTION => return Err(FsError::BadFileDescriptor),
+            proto_tty::NO_ENTRY => return Err(FsError::NoEntry),
+            _ => return Err(FsError::Io),
+        }
+        let info =
+            proto_tty::Stat::read(proto_wire::Reader::new(&bytes[4..])).map_err(FsError::from)?;
+        Ok(NodeInfo {
+            kind: 3,
+            uid: info.uid,
+            gid: info.gid,
+            permissions: info.mode & 0o7777,
+            device: 4,
+            special_device: u64::from(info.terminal) + (u64::from(info.side) << 32),
+            inode: u64::from(info.terminal) + 1,
+            ..CONSOLE_INFO
+        })
+    }
+
     pub fn descriptor_information(&self, target: Target) -> Result<NodeInfo, FsError> {
         match target {
             Target::Ram(fd) | Target::Random(fd) => self
                 .files()
                 .descriptor_information(fd)
                 .map_err(FsError::from),
+            Target::Tty(id) => self.terminal_information(id, None),
             Target::Pipe(end) => {
                 let [pipe, _] = self.pipe_call(proto_pipe::Method::Stat, end, None)?;
                 Ok(NodeInfo {
@@ -494,6 +558,22 @@ impl Transport {
     }
 
     pub fn stat_information(&self, path: &Resolved) -> Result<NodeInfo, FsError> {
+        let name = path.as_str()?;
+        if self.terminal().is_some() {
+            let physical = if name == "/dev/ptmx" {
+                Some(proto_tty::STAT_PATH)
+            } else {
+                name.strip_prefix("/dev/pts/")
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .and_then(|n| n.checked_add(1))
+            };
+            if let Some(physical) = physical {
+                if path.trailing_slash {
+                    return Err(FsError::NotDirectory);
+                }
+                return self.terminal_information(proto_tty::STAT_PATH, Some(physical));
+            }
+        }
         if self.terminal_of(path)?.is_some() {
             return Ok(CONSOLE_INFO);
         }
@@ -677,9 +757,22 @@ impl PosixFs {
         count
     }
 
-    /// The ends of pipes a forked child's session shares with its
-    /// parent's: those of the descriptors without FD_CLOFORK, each once,
-    /// into `out`; how many.
+    /// The terminal descriptions retained by a forked child, each once.
+    pub fn terminals_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, flags) in self.descriptors.open() {
+            if !flags.close_on_fork
+                && let Target::Tty(id) = target
+                && !out[..count].contains(&id)
+            {
+                out[count] = id;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Pipe ends retained by a forked child, each once.
     pub fn pipes_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
