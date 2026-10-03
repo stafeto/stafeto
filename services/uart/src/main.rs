@@ -57,7 +57,7 @@ const CHANNEL_PRIORITY: u8 = 1;
 const SESSIONS: usize = 8;
 /// The clones the service keeps alive at most, for all its clients: room
 /// for the 32 children of rtbench's S12 and the probes beside them, as the
-/// RAM file service's 128 (sp5.V5).
+/// RAM file service's 128.
 const CLONES: usize = 128;
 const HELD: usize = 2;
 /// Batches of the kernel log one read takes in a row at most, while each

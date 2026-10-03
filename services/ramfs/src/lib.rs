@@ -41,6 +41,29 @@ pub fn directory_entry(path: &str, index: u32) -> Result<Option<(&'static str, u
     Ok(entries.get(index as usize).copied())
 }
 
+/// Whether a READ_INTO may run: file descriptor 0, a count within
+/// `proto_fs::READ_INTO_MAX`, a place on a page boundary, exactly one handle
+/// that is a memory object with `MAP_READ` and `MAP_WRITE` (`writable`), and
+/// room for the count's pages in the object from the place (`size`, its
+/// bytes). The copy is one step of the service's loop, so the count bounds
+/// that step.
+pub fn read_into_valid(
+    fd: u32,
+    count: usize,
+    at: u64,
+    handles: usize,
+    writable: bool,
+    size: u64,
+) -> bool {
+    let len = (count as u64).next_multiple_of(4096);
+    fd == 0
+        && count <= proto_fs::READ_INTO_MAX
+        && at.is_multiple_of(4096)
+        && handles == 1
+        && writable
+        && at.checked_add(len).is_some_and(|end| end <= size)
+}
+
 /// The effective IDs an exec is checked with (proto_process Vouch of the
 /// loader: those of the record it loads).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -872,6 +895,33 @@ impl<'a> Ram<'a> {
 mod tests {
     use super::*;
     use proto_fs::READ_WRITE;
+
+    /// The checks of READ_INTO, one at a time: each refusal is its own
+    /// (dropping any check lets its case through).
+    #[test]
+    fn read_into_checks_each_argument() {
+        let ok = |fd, count, at, handles, writable, size| {
+            read_into_valid(fd, count, at, handles, writable, size)
+        };
+        let max = proto_fs::READ_INTO_MAX;
+        assert!(ok(0, max, 0, 1, true, max as u64));
+        assert!(ok(0, 1, 4096, 1, true, 8192));
+        assert!(!ok(1, 10, 0, 1, true, 4096), "fd other than 0");
+        assert!(!ok(0, max + 1, 0, 1, true, 1 << 20), "count past the limit");
+        assert!(!ok(0, 10, 100, 1, true, 8192), "place off a page boundary");
+        assert!(!ok(0, 10, 0, 0, true, 4096), "no object");
+        assert!(!ok(0, 10, 0, 2, true, 4096), "two handles");
+        assert!(!ok(0, 10, 0, 1, false, 4096), "no MAP_WRITE");
+        assert!(
+            !ok(0, 4097, 0, 1, true, 4096),
+            "object shorter than the count"
+        );
+        assert!(!ok(0, 10, 4096, 1, true, 4096), "place at the object's end");
+        assert!(
+            !ok(0, 10, u64::MAX - 4095, 1, true, u64::MAX),
+            "place that wraps"
+        );
+    }
 
     #[test]
     fn directory_descriptions_keep_positions_identity_and_access_times() {

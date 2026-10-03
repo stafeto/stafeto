@@ -108,6 +108,8 @@ fn main(_: u64) -> u64 {
         births: &mut tables.births,
         clones: Clones::new(),
     };
+    #[cfg(feature = "steps")]
+    rt::service::report_steps(2);
     let _ = rt::service::run_in(&channel, &mut fs, config, &mut tables.sessions);
     4
 }
@@ -272,18 +274,17 @@ impl Fs {
                 };
                 let rights = Rights::MAP_READ | Rights::MAP_WRITE;
                 let writable = matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Memory, got)) if got.contains(rights));
-                if body.finish().is_err()
-                    || fd != 0
-                    || count as usize > proto_fs::READ_INTO_MAX
-                    || at % 4096 != 0
-                    || r.handles.len() != 1
-                    || !writable
-                {
+                let handles = r.handles.len();
+                if body.finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
                 let Ok(memory) = r.handles.take::<Memory>(0) else {
                     return Answer::Status(Status::BadSize);
                 };
+                let size = sys::memory_info(&memory).map_or(0, |i| i.size);
+                if !ramfs::read_into_valid(fd, count as usize, at, handles, writable, size) {
+                    return Answer::Status(Status::BadSize);
+                }
                 match self.read_into(entry, offset, count as usize, &memory, at) {
                     Ok(n) => value(r, n as u32),
                     Err(answer) => answer,

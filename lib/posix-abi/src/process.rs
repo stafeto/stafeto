@@ -450,7 +450,11 @@ impl Shadow {
                 let place = slot(fd)?;
                 let mut full = [0; proto_loader::PATH_MAX];
                 let full = self.absolute(path, &mut full)?;
-                let own = crate::open(full, flags & !crate::constants::O_CLOEXEC)?;
+                // The caller's own descriptor lives only for the spawn: with
+                // FD_CLOEXEC, so that an exec or spawn of another thread in
+                // the meantime does not inherit it. The child's flag is the
+                // action's.
+                let own = crate::open(full, flags | crate::constants::O_CLOEXEC)?;
                 let own = own as u32;
                 let target =
                     crate::shared::with_files(|files| files.target(own).map_err(crate::error));
@@ -879,7 +883,7 @@ enum Probe {
 }
 
 /// The old image of the probe `Probe::Outlive` after ExecCommit: the
-/// service should have killed it (sp5.K1). It says so on the console and
+/// service should have killed it. It says so on the console and
 /// asks the clock service to set the time with its own identity through
 /// the clone of the clock session it kept; then it ends.
 fn outlived(clock: Handle<Channel>) -> ! {
@@ -982,7 +986,7 @@ fn move_files(c: &Handle<Channel>) {
     // A stopped thread never ends the request it holds a description
     // for: a description whose last descriptor went meanwhile closes
     // here, or the new image would keep it in the service with no
-    // descriptor (sp5.V3).
+    // descriptor.
     crate::shared::abandon_holds();
     let sessions = crate::shared::with_files(|files| {
         let (files, uart) = files.sessions();
@@ -1142,7 +1146,7 @@ fn start_bare() -> Result<(u32, Handle<Channel>), i32> {
     Ok((pid, c))
 }
 
-/// The probe of a commit before the loader's image is ready (sp5.V1): a
+/// The probe of a commit before the loader's image is ready: a
 /// SpawnStart whose loader never gets a block, SpawnCommit at once, then
 /// SpawnAbort; the child's PID in `pid`, and the errno SpawnCommit came
 /// back with (0 had it been taken).
@@ -1158,7 +1162,7 @@ pub fn probe_commit_early(pid: &mut i32) -> i32 {
     committed.err().unwrap_or(0)
 }
 
-/// The probe of the loads a record may have at once (sp5.V2): up to
+/// The probe of the loads a record may have at once: up to
 /// three SpawnStarts that wait together, then SpawnAbort of each; how
 /// many the service took (LOADERS_OF_PARENT, 2, when no load of the
 /// record was left behind).
@@ -1194,6 +1198,39 @@ pub fn probe_pool() -> u64 {
         (Ok(0), Ok(pool)) => pool,
         _ => 0,
     }
+}
+
+/// The probe of `addopen`: the descriptor an open action makes in the
+/// caller's table while the spawn goes on has FD_CLOEXEC whatever the
+/// action's flags say. 1 when it does, 0 when it does not, the negated
+/// errno of a failure.
+pub fn probe_addopen_cloexec(path: &[u8]) -> i32 {
+    let Ok(mut shadow) = Shadow::take() else {
+        return -crate::constants::EIO;
+    };
+    let result = match shadow.apply(FileAction::Open {
+        fd: 20,
+        path,
+        flags: 0,
+    }) {
+        Ok(()) => {
+            let own = shadow.opened.iter().flatten().next().copied();
+            let seen = crate::shared::with_files(|files| {
+                Ok(own.map(|own| {
+                    files
+                        .descriptors()
+                        .any(|(fd, _, flags)| fd == own && flags.close_on_exec)
+                }))
+            });
+            match seen {
+                Ok(Some(found)) => i32::from(found),
+                _ => -crate::constants::EIO,
+            }
+        }
+        Err(errno) => -errno,
+    };
+    shadow.finish();
+    result
 }
 
 /// Arms the notification of the process's identity session in the process

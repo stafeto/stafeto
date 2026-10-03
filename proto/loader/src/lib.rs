@@ -383,7 +383,7 @@ impl<'a> Block<'a> {
     }
 
     /// The block in `bytes`, all of them: the loader reads it from its own
-    /// copy, never from the parent's object (sp3.M6).
+    /// copy, never from the parent's object.
     pub fn read(bytes: &'a [u8]) -> Result<Block<'a>, BlockError> {
         let header = bytes.get(..HEADER).ok_or(BlockError::Malformed)?;
         if header[..8] != MAGIC {
@@ -504,7 +504,7 @@ impl<'a> Block<'a> {
 
 /// The block of the parent's `len` bytes, which `source` gives byte by
 /// byte: each is read once, into `copy`, and the block is read from the
-/// copy alone (sp3.M6), so a parent that writes its object meanwhile
+/// copy alone, so a parent that writes its object meanwhile
 /// changes nothing the loader checked. Malformed for a `copy` too short.
 pub fn copy_block<'a>(
     source: impl Fn(usize) -> u8,

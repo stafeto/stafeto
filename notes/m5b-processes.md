@@ -58,7 +58,7 @@ one live child.
 - **Vouch is bounded, and measured in 5c.** Vouch (a service asking who a
   client is) emptied the identity channel before it notified through the
   copy it was given: 539 ticks an entry under `-icount`, 140,188 ticks with
-  252 entries. Since the fix wave after step 5c's T6 it reads the copy's
+  252 entries. Later in step 5c it reads the copy's
   label from the kernel (`object_info` LABEL) in O(1), about 2,800 ticks
   with any number of processes (see [m5c-spawn-exec](m5c-spawn-exec.md)).
 - **Limits of the moment.** A second walk of one sender waits in a queue

@@ -123,6 +123,7 @@ static int failures;
 void stafeto_start_handles(unsigned long *out);
 int stafeto_probe_open_exec(const char *path);
 int stafeto_probe_notify_identity(void);
+int stafeto_probe_addopen_cloexec(const char *path);
 int stafeto_probe_exec_commit(void);
 int stafeto_probe_exec_then_exit(const char *path, char *const argv[], int code);
 int stafeto_probe_exec_outlive(const char *path, char *const argv[]);
@@ -1119,6 +1120,10 @@ static void thirty_two(void) {
 
 /* Stage 7, as root. */
 static void files(void) {
+    /* An open action makes its descriptor in the parent with FD_CLOEXEC, so
+     * that another thread's spawn or exec does not inherit it meanwhile. */
+    expect("the parent's descriptor of addopen has FD_CLOEXEC",
+           stafeto_probe_addopen_cloexec("/etc/motd"), 1);
     thirty_two();
     /* The first goal of 5c: ls of /etc from a file, waited for. */
     char *ls[] = {"ls", "/etc", NULL};

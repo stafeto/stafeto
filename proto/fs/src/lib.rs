@@ -72,7 +72,7 @@ pub const MAX_READ: usize = MESSAGE_MAX - 8;
 pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 4;
 /// The bytes of one READ_INTO at most: the copy one request of an image
 /// session makes in the service's step.
-pub const READ_INTO_MAX: usize = 64 * 1024;
+pub const READ_INTO_MAX: usize = 12 * 1024;
 
 pub const READ_ONLY: u32 = 0;
 pub const WRITE_ONLY: u32 = 1;

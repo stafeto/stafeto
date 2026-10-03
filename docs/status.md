@@ -219,9 +219,9 @@ still make no kernel call; S4 `malloc`/`free` of 64 bytes falls from 335
 size (level `s`) had S4 `dup`/`close` at 671 / 751 ns and S6 at 2,175 /
 3,583 ns.
 
-10 minutes at step 5c (HVF / VZ, p50 / p99): S13 `posix_spawn` of a file to
-the child's `main` 221 / 303 and 221 / 295 us (step 5b, from a boot-image
-record: 55 us p50); S14 `exec` to the new image's `main` 229 / 270 us on
-both; S12 `killpg` to a group of 32 639 / 918 and 655 / 918 us. After the
-loader reads its segments by `ReadInto` (one minute, HVF / VZ): S13 88 /
-152 and 88 / 139 us, S14 102 / 125 and 102 / 139 us.
+10 minutes on the head of step 5c (HVF / VZ, p50 / p99, 4,500 samples a
+row): S13 `posix_spawn` of a file to the child's `main` 102 / 152 and 102 /
+156 us (step 5b, from a boot-image record: 55 us p50; the first loader, that
+read with `ReadAt`, took 221 us); S14 `exec` to the new image's `main` 113 /
+143 and 113 / 147 us; S12 `killpg` to a group of 32 623 / 918 and 639 / 934
+us.

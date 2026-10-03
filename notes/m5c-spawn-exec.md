@@ -44,42 +44,41 @@ files, a boot for each suite.
 
 ### rtbench, 10 minutes (HVF and VZ)
 
-10 minutes, 222 rounds, 4,440 samples each (11,100 for S10), p50 / p99 / max in microseconds (the counter ticks 41.7 ns):
+On the head of the step: 10 minutes, 225 rounds, 4,500 samples a row
+(11,250 for S10), p50 / p99 / max in microseconds (the counter ticks 41.7 ns):
 
 | Row | HVF | VZ |
 |---|---|---|
-| S13 `posix_spawn` of a file to the child's `main` | 221 / 303 / 1,159 | 221 / 295 / 1,189 |
-| S14 `exec` to the new image's `main` | 229 / 270 / 878 | 229 / 270 / 901 |
-| S12 `killpg` to a group of 32, to the last `waitpid` | 639 / 918 / 1,047 | 655 / 918 / 1,074 |
-| S11 `waitpid` of a ready zombie | 1.2 / 2.0 / 5.1 | 1.2 / 1.9 / 5.0 |
-| S10 `kill` of a process, target sleeping | 1.4 / 3.5 / 16 | 1.4 / 3.3 / 11 |
+| S13 `posix_spawn` of a file to the child's `main` | 102 / 152 / 1,037 | 102 / 156 / 1,039 |
+| S14 `exec` to the new image's `main` | 113 / 143 / 1,062 | 113 / 147 / 1,033 |
+| S12 `killpg` to a group of 32, to the last `waitpid` | 623 / 918 / 1,064 | 639 / 934 / 1,031 |
+| S11 `waitpid` of a ready zombie | 1.2 / 1.9 / 9.3 | 1.2 / 2.0 / 11.6 |
+| S10 `kill` of a process, target sleeping | 1.5 / 3.4 / 11 | 1.4 / 3.4 / 12.5 |
 
-Step 5b measured `posix_spawn` from a boot-image record at 55 us p50.
-From a file the same call took 221 us: a spawn makes the loader's
-process, runs its boot and the OpenExec round trip, reads the image, and
-clones three sessions. An `exec` costs about the same, since it makes the
-new process under the same record. Both stay within 1.4 ms in the 4,440
-samples of each run. The run is at the commit's tree with documents
-(`+changes` in the file header). Raw files are in the closed reports
-folder.
+Step 5b measured `posix_spawn` from a boot-image record at 55 us p50. From
+a file the call takes 102 us. An `exec` costs a little more, since it makes
+the new process under the same record. Both stay within 1.1 ms in the 4,500
+samples of each run.
 
-### Where the 221 us went (fix wave after T6)
+### Where the time went
 
-One-minute runs of `cargo xtask rtbench --minutes 1` (460 samples a row),
-p50 / p99 in microseconds, HVF and VZ:
+The first loader read its image with `ReadAt` and took 221 us (S13, HVF p50;
+S14 229 us). One-minute runs (460 samples a row), p50 / p99 in microseconds,
+HVF and VZ:
 
 | Tree | S13 HVF | S13 VZ | S14 HVF | S14 VZ |
 |---|---|---|---|---|
-| reads by `ReadAt` (the loader of T6) | 221 / 287 | 225 / 270 | 233 / 270 | 238 / 270 |
-| reads by `ReadInto` | 88 / 152 | 88 / 139 | 102 / 125 | 102 / 139 |
+| reads by `ReadAt` (the first loader) | 221 / 287 | 225 / 270 | 233 / 270 | 238 / 270 |
+| reads by `ReadInto`, 64 KiB a request | 88 / 152 | 88 / 139 | 102 / 125 | 102 / 139 |
 
 The child, `rtbench-posix`, has 198,764 bytes in its segments (39,412,
 157,568 and 1,784). `ReadAt` carries at most 1,016 bytes in the reply
 through the message buffers, so the loader made 196 round trips with the
 file service: 133 us of the 221, about 0.68 us a request. `ReadInto`
-takes a copy of the segment's object and the service copies up to 64 KiB
-from its mapping of the boot image straight into it: five requests for
-the three segments. The remaining 88 us are the steps no boot-image spawn
+takes a copy of the segment's object and the service copies up to 12 KiB
+(64 KiB in the one-minute run above; the limit fell to 12 KiB to keep the
+service's step under term B) from its mapping of the boot image straight
+into it: 17 requests for the three segments. The remaining 88 us are the steps no boot-image spawn
 (55 us in 5b) had: the loader's process with its code, data and stack
 (SpawnStart, about 88,000 ticks under `-icount`, the longest step of the
 service), Boot, the copy of the block, OpenExec with the file service's
@@ -97,17 +96,16 @@ the counter's tick, the unit of term B of the kernel (20,536). The crowd:
 branches of 32 children (`kill(-1)` twenty times, spawns and `exec` among
 them, volleys of `SIGUSR1` that arm every identity session, `kill(-1,
 SIGKILL)` and a spawn after the ends), then `seteuid` and `clock_settime`
-make the clock service ask Vouch with every identity session in the
-identity channel. The table with 32, 128 and 248 children is in
+make the clock service ask Vouch while every identity session has a
+notification waiting for its thread. The table with 32, 128 and 248 children is in
 [docs/non-preemptible-paths.md](../docs/non-preemptible-paths.md); no
 step grows with the number of processes.
 
-T6 measured the steps with a Vouch that emptied the identity channel,
+The first measurement of the steps had a Vouch that emptied the identity channel,
 539 ticks an entry and about 4,360 fixed: 23,764 ticks with 36 entries,
 75,508 with 132 and 140,188 with 252, about 279,000 extrapolated to 510,
 13.6 times term B; SpawnStart, ExecStart and Create emptied it too
-(SpawnStart 261,532 ticks with 248 entries). The fix wave after T6 gave
-the kernel `object_info` LABEL: the owner of a channel, which holds it
+(SpawnStart 261,532 ticks with 248 entries). The cure is the kernel `object_info` LABEL: the owner of a channel, which holds it
 with RECEIVE, reads the label of a labelled copy of it in O(1). Vouch now
 takes the label of the copy a client gave from the kernel and looks at
 nothing in the channel: 2,837 ticks with 32 children, 2,798 with 248. A
@@ -150,7 +148,16 @@ channel, and the answer no longer depends on one processor.
   image a MiB, and the latency of `kill` to a parent that waits for
   "image ready" are left to the next measurement run.
 - **Measurement builds.** The steps image enables `rt/step-stats` and the
-  features `steps` of the RAM file and clock services; no other image does.
+  features `steps` of the process and RAM file services; no other image
+  does.
+- **Threads at `exec`.** A thread that has not yet published its signal
+  state (`SIGNALS_READY`) is not stopped when its process execs.
+- **Descriptions held by a spawn.** A spawn holds up to 32 open
+  descriptions of its caller (the table's size) until the child's session
+  shares them.
+- **Reading images.** One READ_INTO copies up to 12 KiB, so the RAM file
+  service's step stays under term B (18,212 ticks); a loader reads a
+  198 KB image in 17 requests.
 
 ## Readiness criteria
 
@@ -166,7 +173,7 @@ From the table of steps in spec 2 and the first goals of the design.
    the PID. The probe checks the child's side (it holds no handle of its
    loader); no probe walks the parent's table.
 3. **Checks run from files.** Met: `cargo xtask os-test` starts every test
-   from `/os-test/<suite>/<name>`, a boot for each suite, 150 s of 300.
+   from `/os-test/<suite>/<name>`, a boot for each suite, 157 s of 300.
 4. **Set-ID through the file service.** Met: OpenExec, SetId tied to the
    loader's place, probes of the forged channel and of a failed load.
 5. **The 5b debts.** The group of 32 (met, row S12), the Vouch limit

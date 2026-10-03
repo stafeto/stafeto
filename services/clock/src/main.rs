@@ -195,7 +195,7 @@ impl Clocks {
     /// session the request brought, which the session keeps in place of
     /// the one before: after an exec the session moved to the new image,
     /// whose identity is another, and the old one vouches for nothing
-    /// (sp5.K1). The process service vouches for it through
+    ///. The process service vouches for it through
     /// the notary session, and what it said is remembered with the
     /// generation of the credentials and asked again only when the
     /// generation on the page moved: no call to the process service

@@ -9,7 +9,7 @@
 //! reply its process, its thread, the session of the loaders with the RAM
 //! file service and its identity: the only handles it uses for its own
 //! requests (condition O2). Through C the parent gives the block (Start), which the
-//! loader copies before it reads it (sp3.M6), and says Go: the loader opens
+//! loader copies before it reads it, and says Go: the loader opens
 //! the program through the session of the loaders with a copy of its
 //! identity (OpenExec, condition O1), has the file service copy its ELF file into objects
 //! of the new process, which pays for them, tells the service the image
@@ -273,7 +273,7 @@ fn stage(own: &Own, memory: &Handle<Memory>, len: usize) -> Result<usize, Status
         // loader's alone.
         let into = unsafe { core::slice::from_raw_parts_mut(STAGING as *mut u8, len) };
         // Each byte of the parent's object, mapped read-only at BORROWED,
-        // is read once; the checks run on the copy alone (sp3.M6).
+        // is read once; the checks run on the copy alone.
         // An atomic load each: the parent may write its object meanwhile.
         // SAFETY: BORROWED maps `pages` bytes, and `i` stays below `len`.
         let source = |i: usize| unsafe {

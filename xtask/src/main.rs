@@ -378,7 +378,7 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
 /// that prints each new longest step.
 const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
-    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -1963,7 +1963,7 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     {
         return Err("an exec ran after its old image ended".into());
     }
-    // The old image of an exec ends at ExecCommit (sp5.K1).
+    // The old image of an exec ends at ExecCommit.
     if outcome
         .lines
         .iter()
@@ -2018,13 +2018,28 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     Ok(())
 }
 
-/// The kinds of the lines `service step: kind K N ticks detail D` of the
-/// process service, by the numbers of proto_process::Method.
 /// The longest Vouch the measurement takes, in ticks under -icount: about
 /// 3,000 with 32 or with 248 children, so a step that grows with the
 /// processes fails it at once (5b's Vouch took 539 ticks an entry).
 const VOUCH_TICKS_MAX: u64 = 6_000;
 
+/// The most one READ_INTO of up to proto_fs::READ_INTO_MAX bytes may take in
+/// the RAM file service's loop: term B of the kernel, in ticks under -icount.
+const RAM_STEP_MAX: u64 = 20_536;
+
+/// The kinds of the lines of the RAM file service (tag 2), by the numbers
+/// of proto_fs::Method.
+const RAM_STEP_KINDS: [(usize, &str); 6] = [
+    (1, "Open"),
+    (13, "ReadAt"),
+    (14, "OpenExec"),
+    (15, "Clone"),
+    (17, "ReadInto"),
+    (64, "notification"),
+];
+
+/// The kinds of the lines `service step: T kind K N ticks detail D` of the
+/// process service (tag 1), by the numbers of proto_process::Method.
 const STEP_KINDS: [(usize, &str); 12] = [
     (1, "Create"),
     (13, "Kill"),
@@ -2043,13 +2058,14 @@ const STEP_KINDS: [(usize, &str); 12] = [
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
 /// last line of a kind being its longest, since each prints only when it
 /// grows.
-fn longest_steps(lines: &[String]) -> Vec<(usize, u64, u64)> {
+fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
     let mut out: Vec<(usize, u64, u64)> = Vec::new();
     for line in lines {
         let words: Vec<&str> = line.split_whitespace().collect();
         let [
             "service",
             "step:",
+            line_tag,
             "kind",
             kind,
             ticks,
@@ -2060,6 +2076,9 @@ fn longest_steps(lines: &[String]) -> Vec<(usize, u64, u64)> {
         else {
             continue;
         };
+        if *line_tag != tag {
+            continue;
+        }
         let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
         else {
             continue;
@@ -2103,7 +2122,8 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     std::fs::write(&log, outcome.lines.join("\n") + "\n")
         .map_err(|e| format!("{}: {e}", log.display()))?;
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
-    let rows = longest_steps(&outcome.lines);
+    let rows = longest_steps(&outcome.lines, "1");
+    let ram = longest_steps(&outcome.lines, "2");
     if rows.is_empty() {
         return Err("the process service printed no step".into());
     }
@@ -2118,7 +2138,24 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
         ));
     }
+    // One READ_INTO is a step of the RAM file service at level 40 whose
+    // copy is bounded by READ_INTO_MAX; it stays under term B.
+    let read_into = ram.iter().find(|(k, ..)| *k == 17).map_or(0, |r| r.1);
+    if read_into == 0 || read_into > RAM_STEP_MAX {
+        return Err(format!(
+            "the RAM file service: READ_INTO took {read_into} ticks, past {RAM_STEP_MAX}: {ram:?}"
+        ));
+    }
     let mut text = String::from("kind method ticks detail\n");
+    for (kind, name, ticks, detail) in ram.iter().map(|(k, t, d)| {
+        let name = RAM_STEP_KINDS
+            .iter()
+            .find(|(n, _)| n == k)
+            .map_or("other", |(_, n)| n);
+        (k, name, t, d)
+    }) {
+        text += &format!("ramfs {kind} {name} {ticks} {detail}\n");
+    }
     for (kind, ticks, detail) in &rows {
         let name = STEP_KINDS
             .iter()

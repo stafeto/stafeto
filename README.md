@@ -104,7 +104,9 @@ PID and status to `sigwaitinfo`. Process groups and sessions follow
 `setpgid`, `setsid`, `getpgid` and `getsid`; orphans go to PID 1, which
 the service itself plays. The clock service asks the process service for
 the effective UID before `clock_settime`. The C probe `posix-procs`,
-`cargo xtask process-steps` and `rtbench` rows S10 to S14 check it. `fork`
+`cargo xtask process-steps` and `rtbench` rows S10 to S14 check it; on HVF a
+`posix_spawn` of a file takes 102 us p50 to the child's `main` and an
+`exec` 113 us (10-minute run). `fork`
 is not there yet; [notes/m5b-processes.md](notes/m5b-processes.md) and
 [notes/m5c-spawn-exec.md](notes/m5c-spawn-exec.md) list the limits.
 
@@ -221,7 +223,7 @@ Bounded kernel paths and their costs:
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
 | POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
 | POSIX: process service | process service, `posix_spawn` from the boot image, `waitpid`, `kill`, process groups and sessions | ✅ [#76](https://github.com/stafeto/stafeto/pull/76) |
-| POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | 🚧 branch `m5c-spawn-exec`, pull request to come |
+| POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | 🚧 [#78](https://github.com/stafeto/stafeto/pull/78) |
 | POSIX: fork | `fork` with the loader copying the parent | ⬜ |
 | POSIX: shell | pipes, `SA_RESTART`, `SIGCHLD`, a terminal service with `termios` and job control; `ash` runs `ls \| cat` | ⬜ |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |

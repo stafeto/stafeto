@@ -279,7 +279,7 @@ fn main(_: u64) -> u64 {
     };
     owner.step = Some(step);
     #[cfg(feature = "steps")]
-    rt::service::report_steps();
+    rt::service::report_steps(1);
     rt::println!("posix-process: ready (records with their processes, root by init's table)");
     rt::println!(
         "posix-process: loader {}",
@@ -1288,7 +1288,7 @@ impl Processes {
         }
         let (label, image, ceiling) = (record.label, record.tried + 1, record.ceiling);
         let (quota, handle_limit) = (record.quota, record.handle_limit);
-        // The number goes to this attempt whatever comes of it (sp5.M1).
+        // The number goes to this attempt whatever comes of it.
         self.records.get_mut(index).expect("the caller").tried = image;
         let priority = start.level.clamp(1, ceiling);
         let rights = Rights::SEND | Rights::TRANSFER;
@@ -1355,10 +1355,10 @@ impl Processes {
     /// from here on), the set-ID its loader's place kept applies (the
     /// saved IDs follow the effective ones), the generation of its
     /// credentials grows before the reply, its caught signals are the
-    /// default on the page (sp4.M3), the new main thread routes its
+    /// default on the page, the new main thread routes its
     /// signals, the loads of children the old image started and did not
     /// commit stop (their parent's copy of C goes with it), the service
-    /// kills the old process (process_kill_at, O(1) for the caller, sp5.K1)
+    /// kills the old process (process_kill_at, O(1) for the caller)
     /// and the loader hears that the record is ready. For a record of
     /// init's table the loader's notification and the kill wait until init
     /// took the new process for the record's end line (`replace`).
@@ -1402,7 +1402,7 @@ impl Processes {
             page.caught.store(0, core::sync::atomic::Ordering::Release);
         }
         // The loads the old image started: nobody gives their loaders a
-        // block once it is gone (sp5.V2).
+        // block once it is gone.
         let mut children = [0u16; loaders::LOADERS];
         let mut count = 0;
         for child in self.loaders.uncommitted_of(index) {
@@ -1642,7 +1642,7 @@ impl Processes {
     }
 
     /// Ready of the loader of the record in `child`: its image is loaded,
-    /// and the parent may commit the place from now on (sp5.V1).
+    /// and the parent may commit the place from now on.
     fn ready(&mut self, child: usize, r: &mut Request<'_>) -> Answer {
         if !r.handles.is_empty() {
             return Answer::Status(Status::BadSize);
@@ -1714,7 +1714,7 @@ impl Processes {
     /// the IDs SetId kept for its loader's place, and the loader hears that
     /// the record is ready. BAD_STATE until the loader said its image is
     /// ready (Ready): a parent that commits before, or after a failed
-    /// load, gets no child that waits for a block (sp5.V1).
+    /// load, gets no child that waits for a block.
     fn spawn_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let Some(child) = self.loading_child(index, r) else {
             return refuse(proto_process::NO_PROCESS);
@@ -1939,7 +1939,7 @@ impl Service<0> for Processes {
         // A loader that ended: its place and SetId go, and a SpawnStart
         // that waited for its Boot gets AGAIN. An old image that ended
         // before its ExecCommit, by itself or by SIGKILL, takes the new
-        // process with it, whose quota comes back to the pool (sp5.K2).
+        // process with it, whose quota comes back to the pool.
         self.abort_load(index, Status::from_code(proto_process::AGAIN));
         let (exit, orphans) = self.records.exited(index, end);
         // An exec that waited for init goes on: its new image is dead.

@@ -429,7 +429,7 @@ for the service waits for the steps ahead of it. `cargo xtask
 process-steps` (4 branches in `ci`) measures them under -icount with a
 crowd of children from files (the same ticks as B; `rt` feature
 `step-stats` and the process service's feature `steps` in that image
-only; the RAM file and clock services are the shipping ones). The longest
+only, and the RAM file service's feature `steps`; the clock service is the shipping one). The longest
 step of each kind, with 32, 128 and 248 children:
 
 | Step | 32 | 128 | 248 |
@@ -437,7 +437,7 @@ step of each kind, with 32, 128 and 248 children:
 | SpawnStart | 87,579 | 87,784 | 87,950 |
 | Create | 59,806 | 59,806 | 59,605 |
 | ExecStart | 46,721 | 47,001 | 47,402 |
-| a notification (an end, a step of the walk of `kill(-1)`) | 5,336 | 5,336 | 11,768 |
+| a notification (an end, a step of the walk of `kill(-1)`) | up to 11,768 | up to 11,768 | up to 11,768 |
 | WaitStart, WaitTake | 6,432, 7,141 | 6,634, 7,122 | 7,518, 7,137 |
 | Boot, Take | 6,853, 4,917 | 7,241, 5,128 | 6,882, 5,439 |
 | ExecCommit, SpawnCommit | 4,200, 2,610 | 4,200, 2,222 | 4,360, 2,588 |
@@ -453,9 +453,41 @@ step of the loop empties that channel (until step 5c's fix wave, Vouch,
 SpawnStart, ExecStart and Create did, 539 ticks an entry: a Vouch with 252
 entries took 140,188 ticks, about 279,000 extrapolated to 510). The end of
 a process walks the children of its record, 32 at most: the notification
-row grows with them and stops there. SpawnStart, Create and ExecStart are
+row grows with them and stops at 11,768 ticks, the walk of a record with 32 children. SpawnStart, Create and ExecStart are
 fixed costs above B: they make a process in the kernel, a call at a time
 (its space, the record's page, the loader's code, data and stack and its
 thread), each call bounded on its own. `process-steps` fails when the
 longest Vouch passes 6,000 ticks. Details are in
 [notes/m5c-spawn-exec.md](../notes/m5c-spawn-exec.md).
+
+A thread below the service's level waits for at most one step that has
+begun, whatever the thread asks of the service (the ceiling protocol), so
+the longest step is a blocking time for every thread below level 52: 87,950
+ticks, 4.3 times B, and it does not grow with the number of processes.
+Nothing of real time runs below level 52 yet; SpawnStart, ExecStart and
+Create are to be split into steps no longer than B before step 5h.
+
+### The RAM file service
+
+Its steps run at level 40 with a copy in them. READ_INTO fills a memory
+object of the caller from the service's read-only mapping of the boot image
+(the loader reads an image in pieces of `proto_fs::READ_INTO_MAX`, 12 KiB);
+the service maps the object, copies, unmaps and answers. Longest steps under
+-icount with 128 children, ticks:
+
+| Step | Ticks |
+|---|---|
+| ReadInto, 12 KiB | 18,212 |
+| OpenExec (path lookup, the Vouch round trip, the set-ID message) | 28,241 |
+| Clone | 10,659 |
+| ReadAt (up to 1,016 bytes) | 8,545 |
+| Open | 5,488 |
+| a notification | 4,424 |
+
+One READ_INTO stays under B by its limit: at 64 KiB it took 46,982 ticks
+(2.3 B) and at 16 KiB 20,407; the fixed part is about 11,600 ticks and each
+KiB takes about 550. `process-steps` fails when a READ_INTO passes
+20,536. The checks of a READ_INTO (descriptor 0, count within the limit,
+place on a page boundary, one memory object with `MAP_READ` and `MAP_WRITE`,
+room in the object) are `ramfs::read_into_valid`, with a host test that
+fails when any check goes.

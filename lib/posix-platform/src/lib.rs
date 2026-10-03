@@ -574,6 +574,18 @@ pub extern "C" fn stafeto_probe_pool() -> u64 {
     posix_abi::process::probe_pool()
 }
 
+/// The probe of `addopen` (posix_abi::process::probe_addopen_cloexec):
+/// 1 when the caller's own descriptor of an open action has FD_CLOEXEC.
+///
+/// # Safety
+/// `path` is a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_addopen_cloexec(path: *const c_char) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+    posix_abi::process::probe_addopen_cloexec(path)
+}
+
 /// Arms the notification of the process's identity session
 /// (posix_abi::process::probe_notify_identity): 0 or EIO.
 #[unsafe(no_mangle)]

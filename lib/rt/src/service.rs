@@ -462,12 +462,12 @@ pub fn run_in<S: Service<K>, const K: usize>(
 /// images of measurements and tests turn on): the ticks from the return of
 /// `receive` to the handler's end and its reply, for each method of the
 /// protocol and for notifications. A new longest of a kind goes to the
-/// console as a line `service step: kind K N ticks detail D` after the step, so that
-/// the print does not count in it (`report_steps` turns it on); K is the
+/// console as a line `service step: T kind K N ticks detail D` after the step, so that
+/// the print does not count in it (`report_steps` turns it on and gives the tag T); K is the
 /// method, or `NOTICE`.
 #[cfg(feature = "step-stats")]
 mod steps {
-    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
     /// The kinds: methods below this number, and the notifications.
     pub const NOTICE: usize = 64;
@@ -476,11 +476,11 @@ mod steps {
     /// A number the handler of the step gives (`super::step_detail`), for
     /// the line a new longest prints.
     static DETAIL: AtomicU64 = AtomicU64::new(0);
-    /// Whether a new longest goes to the console: the service that asked.
-    static REPORT: AtomicBool = AtomicBool::new(false);
+    /// The tag a new longest prints with: the service that asked (0: none).
+    static REPORT: AtomicU8 = AtomicU8::new(0);
 
-    pub fn report() {
-        REPORT.store(true, Ordering::Relaxed);
+    pub fn report(tag: u8) {
+        REPORT.store(tag, Ordering::Relaxed);
     }
 
     pub fn detail(value: u64) {
@@ -503,9 +503,9 @@ mod steps {
     pub fn end(began: u64, kind: usize) {
         let took = super::time::now().saturating_sub(began);
         let detail = DETAIL.swap(0, Ordering::Relaxed);
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && REPORT.load(Ordering::Relaxed)
-        {
-            crate::println!("service step: kind {kind} {took} ticks detail {detail}");
+        let tag = REPORT.load(Ordering::Relaxed);
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && tag != 0 {
+            crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
         }
     }
 }
@@ -521,14 +521,14 @@ mod steps {
     }
     pub fn end(_: u64, _: usize) {}
     pub fn detail(_: u64) {}
-    pub fn report() {}
+    pub fn report(_: u8) {}
 }
 
 /// Makes the loop of this service print each new longest step (feature
 /// `step-stats`; nothing without it): the images with several services
 /// that count their steps get the lines of the one that asked.
-pub fn report_steps() {
-    steps::report();
+pub fn report_steps(tag: u8) {
+    steps::report(tag);
 }
 
 /// Tells the line of the longest step a number of this step, such as the
