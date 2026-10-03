@@ -40,6 +40,32 @@ impl Held {
         self.bits.count_ones() as usize
     }
 
+    /// The exact subset of live descriptions this session already holds.
+    /// A pipe place cannot be reused while any session holds either end.
+    pub fn select(&self, descriptions: impl IntoIterator<Item = u32>) -> Result<Self, u32> {
+        let mut selected = Self::default();
+        for description in descriptions {
+            if !self.holds(description) {
+                return Err(BAD_FD);
+            }
+            selected.bits |= 1u128 << description;
+        }
+        Ok(selected)
+    }
+
+    /// Each held end once. Original watch items retain their individual masks.
+    pub fn descriptions(self) -> impl Iterator<Item = u32> {
+        let mut bits = self.bits;
+        core::iter::from_fn(move || {
+            if bits == 0 {
+                return None;
+            }
+            let description = bits.trailing_zeros();
+            bits &= bits - 1;
+            Some(description)
+        })
+    }
+
     fn add(&mut self, description: usize) {
         self.bits |= 1 << description;
     }
@@ -68,6 +94,8 @@ struct End {
     refs: u16,
     nonblock: bool,
     waiters: [Option<Waiter>; WAITERS],
+    /// Exactly the occupied FIFO prefix; all remaining places are free.
+    count: u8,
 }
 
 /// A pipe: its creator's label and root, where its bytes start in the ring and how
@@ -83,32 +111,58 @@ struct Pipe {
 }
 
 impl End {
-    /// The waiters `keep` keeps, in the order they came: the list stays
-    /// a queue, its free places at its tail, so a new waiter queues behind
-    /// those that wait already and is told after them.
+    fn check(&self) {
+        debug_assert!(usize::from(self.count) <= WAITERS);
+        debug_assert!(
+            self.waiters[..usize::from(self.count)]
+                .iter()
+                .all(Option::is_some)
+        );
+        debug_assert!(
+            self.waiters[usize::from(self.count)..]
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    /// Keep the live FIFO prefix; insertion then uses its exact free tail.
+    #[inline]
     fn keep(&mut self, keep: impl Fn(Waiter) -> bool) {
+        self.check();
+        let previous = usize::from(self.count);
         let mut at = 0;
-        for i in 0..WAITERS {
-            if let Some(w) = self.waiters[i]
-                && keep(w)
-            {
+        for i in 0..previous {
+            let w = self.waiters[i].expect("an occupied FIFO place");
+            if keep(w) {
                 if at != i {
                     self.waiters[at] = Some(w);
                 }
                 at += 1;
             }
         }
-        for slot in &mut self.waiters[at..] {
-            if slot.is_some() {
-                *slot = None;
-            }
+        self.waiters[at..previous].fill(None);
+        self.count = at as u8;
+        self.check();
+    }
+
+    #[inline]
+    fn push(&mut self, waiter: Waiter) -> Result<(), u32> {
+        self.check();
+        let at = usize::from(self.count);
+        if at == WAITERS {
+            return Err(AGAIN);
         }
+        self.waiters[at] = Some(waiter);
+        self.count += 1;
+        self.check();
+        Ok(())
     }
 
     const NONE: End = End {
         refs: 0,
         nonblock: false,
         waiters: [None; WAITERS],
+        count: 0,
     };
 }
 
@@ -192,6 +246,7 @@ impl Pipes {
             refs: 1,
             nonblock,
             waiters: [None; WAITERS],
+            count: 0,
         };
         self.pipes[index] = Pipe {
             live: true,
@@ -292,13 +347,11 @@ impl Pipes {
             .get_mut(index)
             .map(|p| &mut p.ends[is_write as usize])
             .ok_or(BAD_FD)?;
-        if end.waiters.contains(&Some(waiter)) {
+        if end.waiters[..usize::from(end.count)].contains(&Some(waiter)) {
             return Ok(());
         }
         end.keep(alive);
-        let free = end.waiters.iter_mut().find(|w| w.is_none()).ok_or(AGAIN)?;
-        *free = Some(waiter);
-        Ok(())
+        end.push(waiter)
     }
 
     /// Register a freshly allocated generation key, once per description.
@@ -316,9 +369,7 @@ impl Pipes {
             .map(|p| &mut p.ends[is_write as usize])
             .ok_or(BAD_FD)?;
         end.keep(alive);
-        let free = end.waiters.iter_mut().find(|w| w.is_none()).ok_or(AGAIN)?;
-        *free = Some(waiter);
-        Ok(())
+        end.push(waiter)
     }
 
     /// Readiness consumes no data and ignores the description's NONBLOCK.
@@ -383,6 +434,8 @@ impl Pipes {
             return;
         }
         end.waiters = [None; WAITERS];
+        end.count = 0;
+        end.check();
         wakes.list = pipe.ends[!is_write as usize].waiters;
         if pipe.ends.iter().all(|e| e.refs == 0)
             && self.dropping[2 * index] == 0
@@ -554,6 +607,46 @@ mod tests {
 
     fn woke(w: &Wakes) -> Vec<Waiter> {
         w.iter().collect()
+    }
+
+    #[test]
+    fn selected_ends_deduplicate_and_cover_the_last_pipe_place() {
+        let mut p = pipes();
+        let mut owners = [Held::default(); 4];
+        let mut last = (0, 0);
+        for (index, held) in owners.iter_mut().enumerate() {
+            for _ in 0..CREATED_MAX {
+                last = p
+                    .create(held, index as u64 + 1, index as u64 + 1, 0)
+                    .unwrap();
+            }
+        }
+        assert_eq!(last, (126, 127));
+        let selected = owners[3].select([127, 126, 127]).unwrap();
+        assert_eq!(selected.descriptions().collect::<Vec<_>>(), [126, 127]);
+        assert_eq!(owners[3].select([128]), Err(BAD_FD));
+        assert_eq!(owners[0].select([127]), Err(BAD_FD));
+    }
+
+    #[test]
+    fn reused_pipe_place_keeps_the_new_generation_subscription() {
+        let mut p = pipes();
+        let mut held = Held::default();
+        let old = (1, 0x100000001);
+        let fresh = (1, 0x200000001);
+        let (rd, wr) = p.create(&mut held, 1, 1, 0).unwrap();
+        p.wait_new(rd, old, |_| true).unwrap();
+        p.close(&mut held, rd, &mut Wakes::default()).unwrap();
+        p.close(&mut held, wr, &mut Wakes::default()).unwrap();
+        let (newrd, newwr) = p.create(&mut held, 1, 1, 0).unwrap();
+        assert_eq!((newrd, newwr), (rd, wr));
+        for end in held.select([newrd, newrd]).unwrap().descriptions() {
+            p.wait_new(end, fresh, |key| key == fresh).unwrap();
+        }
+        p.unwait(rd, old);
+        let mut wakes = Wakes::default();
+        p.write(&held, newwr, b"x", &mut wakes).unwrap();
+        assert_eq!(woke(&wakes), [fresh]);
     }
 
     #[test]
@@ -812,6 +905,43 @@ mod tests {
         }
         assert_eq!(c.count(), HELD_MAX);
         assert_eq!(p.create(&mut c, 77, 77, 0), Err(MFILE));
+    }
+
+    /// Full queues reject a ninth waiter; removing a middle key leaves
+    /// the remaining FIFO prefix intact and the next key joins its tail.
+    #[test]
+    fn a_full_queue_reuses_its_middle_place_at_the_tail() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let (rd, wr) = p.create(&mut a, 1, 1, 0).unwrap();
+        for key in 1..=WAITERS as u64 {
+            p.wait_new(rd, (1, key), |_| true).unwrap();
+        }
+        assert_eq!(p.wait_new(rd, (1, 9), |_| true), Err(AGAIN));
+        p.unwait(rd, (1, 4));
+        p.wait_new(rd, (1, 9), |_| true).unwrap();
+        let mut wakes = Wakes::default();
+        p.write(&a, wr, b"x", &mut wakes).unwrap();
+        assert_eq!(
+            woke(&wakes),
+            [
+                (1, 1),
+                (1, 2),
+                (1, 3),
+                (1, 5),
+                (1, 6),
+                (1, 7),
+                (1, 8),
+                (1, 9)
+            ]
+        );
+        let end = &p.pipes[(rd / 2) as usize].ends[0];
+        end.check();
+        assert_eq!(end.count as usize, WAITERS);
+        p.close(&mut a, rd, &mut Wakes::default()).unwrap();
+        let end = &p.pipes[(rd / 2) as usize].ends[0];
+        end.check();
+        assert_eq!(end.count, 0);
     }
 
     /// The waiters of an end are a queue: after a read the writer that

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -33,7 +34,9 @@ static int service_watches(void) {
     CHECK(pipe(first) == 0 && pipe(second) == 0);
     uint32_t fds[32], events[32], ready[32];
     uint64_t key, keys[8];
-    for (unsigned i = 0; i < 32; i++) { fds[i] = first[0]; events[i] = i % 2 ? 0 : IN; }
+    int alias = dup(first[0]);
+    CHECK(alias >= 0);
+    for (unsigned i = 0; i < 32; i++) { fds[i] = i % 2 ? alias : first[0]; events[i] = i % 4 == 1 ? OUT : (i % 2 ? 0 : IN); }
     CHECK(stafeto_watch_start(fds, events, 32, &key, ready) == 1 && key != 0);
     CHECK(stafeto_watch_keyed(first[0], key, 0, 1, ready, 32) == 1);
     CHECK(write(first[1], "x", 1) == 1);
@@ -46,7 +49,18 @@ static int service_watches(void) {
     CHECK(stafeto_watch_keyed(first[0], key, 1, 0, ready, 32) < 0);
     char byte;
     CHECK(read(first[0], &byte, 1) == 1 && byte == 'x');
-    CHECK(close(first[0]) == 0);
+    int reused_fd = first[0];
+    uint64_t old_key = key;
+    CHECK(close(alias) == 0 && close(first[0]) == 0);
+    CHECK(pipe(first) == 0 && first[0] == reused_fd);
+    fds[0] = first[0]; events[0] = IN;
+    CHECK(stafeto_watch_start(fds, events, 1, &key, ready) == 1);
+    CHECK((uint32_t)key == (uint32_t)old_key && (key >> 32) != (old_key >> 32));
+    CHECK(stafeto_watch_keyed(first[0], key, 0, 1, ready, 1) == 1);
+    CHECK(write(first[1], "n", 1) == 1 && stafeto_watch_bit(key) == 0);
+    CHECK(stafeto_watch_keyed(first[0], key, 1, 0, ready, 1) == 0 && ready[0] == IN);
+    CHECK(read(first[0], &byte, 1) == 1 && byte == 'n');
+    CHECK(close(first[0]) == 0 && close(first[1]) == 0);
 
     fds[0] = second[0]; events[0] = IN;
     for (unsigned i = 0; i < 8; i++) CHECK(stafeto_watch_start(fds, events, 1, &keys[i], ready) == 1);
@@ -116,6 +130,30 @@ static uint64_t monotonic_ns(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &t) != 0) return 0;
     return (uint64_t)t.tv_sec * 1000000000u + t.tv_nsec;
 }
+static volatile int cleanup_mask_restored;
+struct masked_wait { struct pollfd *fds; int select_call; };
+static void cancelled_mask(void *unused) {
+    (void)unused;
+    sigset_t after;
+    cleanup_mask_restored = pthread_sigmask(SIG_SETMASK, NULL, &after) == 0 && sigismember(&after, SIGUSR1) == 1;
+}
+static void *masked_wait(void *arg) {
+    struct masked_wait *input = arg;
+    sigset_t block, empty;
+    sigemptyset(&block); sigaddset(&block, SIGUSR1); sigemptyset(&empty);
+    if (pthread_sigmask(SIG_BLOCK, &block, NULL) != 0) return (void *)1;
+    pthread_cleanup_push(cancelled_mask, NULL);
+    if (input->select_call) {
+        fd_set reads; FD_ZERO(&reads);
+        int max = 0;
+        for (int i = 0; i < 2; i++) { FD_SET(input->fds[i].fd, &reads); if (input->fds[i].fd > max) max = input->fds[i].fd; }
+        pselect(max + 1, &reads, NULL, NULL, NULL, &empty);
+    } else ppoll(input->fds, 2, NULL, &empty);
+    pthread_cleanup_pop(0);
+    return (void *)2;
+}
+
+
 static int frontends(void) {
     int ends[2];
     CHECK(pipe(ends) == 0);
@@ -251,6 +289,15 @@ static int frontends(void) {
     CHECK(pthread_create(&worker, NULL, blocking_wait, p) == 0);
     ns = (struct timespec){0, 2000000}; CHECK(nanosleep(&ns, NULL) == 0);
     CHECK(pthread_cancel(worker) == 0 && pthread_join(worker, &result) == 0 && result == PTHREAD_CANCELED);
+    struct masked_wait masked = {p, 0};
+    for (int variant = 0; variant < 2; variant++) {
+        masked.select_call = variant; cleanup_mask_restored = 0;
+        CHECK(pthread_create(&worker, NULL, masked_wait, &masked) == 0);
+        CHECK(nanosleep(&ns, NULL) == 0);
+        CHECK(pthread_cancel(worker) == 0 && pthread_join(worker, &result) == 0 && result == PTHREAD_CANCELED);
+        CHECK(cleanup_mask_restored == 1);
+    }
+
     fds[0] = ends[0];
     for (unsigned i = 0; i < 8; i++) CHECK(stafeto_watch_start(fds, events, 1, &pipe_keys[i], ready) == 1);
     fds[0] = tty;
@@ -287,14 +334,73 @@ static int frontends(void) {
     return 0;
 }
 
+
+
+static void *lifecycle_wait(void *arg) {
+    return (void *)(intptr_t)poll(arg, 3, -1);
+}
+static int watch_capacity(int readfd, int tty, unsigned limit) {
+    uint32_t fds[1], events[1] = {IN}, ready[1];
+    uint64_t pipekeys[8], ttykeys[8];
+    fds[0] = (uint32_t)readfd;
+    for (unsigned i = 0; i < limit; i++) CHECK(stafeto_watch_start(fds, events, 1, &pipekeys[i], ready) == 1);
+    fds[0] = (uint32_t)tty;
+    for (unsigned i = 0; i < limit; i++) CHECK(stafeto_watch_start(fds, events, 1, &ttykeys[i], ready) == 1);
+    for (unsigned i = 0; i < limit; i++) {
+        CHECK(stafeto_watch_keyed(readfd, pipekeys[i], 1, 0, ready, 1) == 0);
+        CHECK(stafeto_watch_keyed(tty, ttykeys[i], 1, 0, ready, 1) == 0);
+    }
+    return 0;
+}
+static int lifecycle_start(void) {
+    int keep[2], held[2], tty = open("/dev/console", O_RDWR | O_NOCTTY);
+    CHECK(tty >= 0 && pipe(keep) == 0 && pipe(held) == 0);
+    struct termios raw;
+    CHECK(tcgetattr(tty, &raw) == 0);
+    raw.c_lflag &= ~ICANON; raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 1;
+    CHECK(tcsetattr(tty, TCSANOW, &raw) == 0);
+    struct pollfd pending[3] = {{keep[0], POLLIN, 0}, {held[0], POLLIN, 0}, {tty, POLLIN, 0}};
+    pthread_t worker;
+    CHECK(pthread_create(&worker, NULL, lifecycle_wait, pending) == 0);
+    struct timespec delay = {0, 10000000};
+    CHECK(nanosleep(&delay, NULL) == 0);
+    CHECK(close(held[0]) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) _exit(watch_capacity(keep[0], tty, 7));
+    int status;
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char a[20], b[20], c[20], d[20];
+    CHECK(snprintf(a, sizeof a, "%d", keep[0]) > 0 && snprintf(b, sizeof b, "%d", keep[1]) > 0);
+    CHECK(snprintf(c, sizeof c, "%d", held[1]) > 0 && snprintf(d, sizeof d, "%d", tty) > 0);
+    char *next[] = {"posix-poll", "lifecycle-resume", a, b, c, d, NULL}, *env[] = {NULL};
+    execve("/bin/posix-poll", next, env);
+    CHECK(0);
+    return 0;
+}
+static int lifecycle_resume(char **argv) {
+    int readfd = atoi(argv[2]), writefd = atoi(argv[3]), heldwrite = atoi(argv[4]), tty = atoi(argv[5]);
+    CHECK(watch_capacity(readfd, tty, 8) == 0);
+    struct pollfd closed_reader = {heldwrite, 0, 0};
+    CHECK(poll(&closed_reader, 1, 0) == 1 && closed_reader.revents == POLLERR);
+    struct termios raw;
+    CHECK(tcgetattr(tty, &raw) == 0);
+    raw.c_lflag |= ICANON; raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+    CHECK(tcsetattr(tty, TCSANOW, &raw) == 0);
+    CHECK(close(readfd) == 0 && close(writefd) == 0 && close(heldwrite) == 0 && close(tty) == 0);
+    printf("posix-poll: exec/fork watch cleanup ok\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    (void)argv;
     /* A file-loaded image supplies the region map required by fork. */
     if (argc == 1) {
         char *next[] = {"posix-poll", "loaded", NULL}, *env[] = {NULL};
         execve("/bin/posix-poll", next, env);
         CHECK(0);
     }
+    if (argc == 2) return lifecycle_start();
+    CHECK(argc == 6 && lifecycle_resume(argv) == 0);
     int result = frontends();
     if (result != 0) return result;
     result = service_watches();
