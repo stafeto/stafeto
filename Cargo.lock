@@ -43,6 +43,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "entropy-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-entropy",
+ "proto-init",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "enumn"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -446,6 +457,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-entropy"
+version = "0.1.0"
+dependencies = [
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-fs"
 version = "0.1.0"
 dependencies = [
@@ -718,6 +736,7 @@ dependencies = [
  "rt",
  "uart",
  "virtio-drivers",
+ "virtio-pci",
 ]
 
 [[package]]
@@ -732,6 +751,23 @@ dependencies = [
  "safe-mmio",
  "thiserror",
  "zerocopy",
+]
+
+[[package]]
+name = "virtio-pci"
+version = "0.1.0"
+
+[[package]]
+name = "virtio-rng"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-entropy",
+ "proto-init",
+ "proto-wire",
+ "rt",
+ "virtio-drivers",
+ "virtio-pci",
 ]
 
 [[package]]

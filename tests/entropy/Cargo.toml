@@ -1,0 +1,20 @@
+[package]
+name = "entropy-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "Guest probe of the entropy device's driver"
+
+[[bin]]
+name = "entropy-probe"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-entropy = { path = "../../proto/entropy" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

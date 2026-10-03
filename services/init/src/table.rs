@@ -705,6 +705,7 @@ fn order(table: &[Record]) -> Order {
 
 pub mod ceiling;
 pub mod cycle;
+pub mod entropy;
 pub mod normal;
 pub mod ramfs;
 pub mod test;
@@ -730,7 +731,9 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
     + cfg!(feature = "table-rtbench-posix") as usize
-    + cfg!(feature = "table-rtbench-posix-vz") as usize;
+    + cfg!(feature = "table-rtbench-posix-vz") as usize
+    + cfg!(feature = "table-entropy") as usize
+    + cfg!(feature = "table-entropy-vz") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -759,7 +762,9 @@ const _: () = assert!(
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
     feature = "table-rtbench-posix",
-    feature = "table-rtbench-posix-vz"
+    feature = "table-rtbench-posix-vz",
+    feature = "table-entropy",
+    feature = "table-entropy-vz"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -802,6 +807,10 @@ pub const TABLE: &[Record] = test::TABLE;
 pub const TABLE: &[Record] = cycle::TABLE;
 #[cfg(feature = "table-ceiling")]
 pub const TABLE: &[Record] = ceiling::TABLE;
+#[cfg(feature = "table-entropy")]
+pub const TABLE: &[Record] = entropy::TABLE;
+#[cfg(feature = "table-entropy-vz")]
+pub const TABLE: &[Record] = entropy::VZ_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1504,6 +1513,11 @@ mod tests {
                 "sink", "echo", "slow", "device", "hog", "crash", "oneshot", "silent", "mute",
                 "checker", "private"
             ]
+        );
+        assert_eq!(order_of(entropy::TABLE), ["rng", "entropy-probe"]);
+        assert_eq!(
+            order_of(entropy::VZ_TABLE),
+            ["uart", "rng", "entropy-probe"]
         );
         assert_eq!(
             refused(cycle::TABLE),

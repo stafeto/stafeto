@@ -45,6 +45,9 @@ table-busybox = []
 table-busybox-dialog = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
+# The probes of the entropy device's driver (xtask entropy, entropy-vz).
+table-entropy = []
+table-entropy-vz = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }

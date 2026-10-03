@@ -1,11 +1,11 @@
 [package]
-name = "virtio-console"
+name = "virtio-rng"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "GPL-3.0-or-later"
-description = "The driver of the Virtio PCI console of Apple's Virtualization.framework"
+description = "The driver of the Virtio entropy device: virtio-mmio on QEMU, Virtio PCI on Apple VZ"
 
 # What the driver decides, apart from the device and the calls: tested on
 # the host.
@@ -13,28 +13,28 @@ description = "The driver of the Virtio PCI console of Apple's Virtualization.fr
 bench = false
 
 [[bin]]
-name = "virtio-console"
+name = "virtio-rng"
 test = false
 bench = false
 
-# `crash`: the method CRASH of proto_uart, as the PL011's driver has it;
-# xtask builds the VZ boot image with it, for the restart probe.
+# `crash`: the method CRASH of proto_entropy, for the restart probes.
+# `steps`: each new longest step of the loop goes to the console (rt's
+# feature step-stats), for the measurement under -icount.
 [features]
 crash = []
-# The probe of a stop before decoding (console-early-exit-vz): the first
-# instance ends after BAR 1, with decoding off.
-exit-before-decoding = []
+steps = ["rt/step-stats"]
 
 [dependencies]
 abi = { path = "../../lib/abi" }
+proto-entropy = { path = "../../proto/entropy" }
 proto-init = { path = "../../proto/init" }
-proto-uart = { path = "../../proto/uart" }
 proto-wire = { path = "../../proto/wire" }
-uart = { path = "../uart" }
 virtio-pci = { path = "../../lib/virtio-pci" }
 
 # The program alone runs on stafeto: the host tests of the library build
 # without rt and without the device's crate (virtio-drivers, MIT).
 [target.'cfg(target_os = "none")'.dependencies]
 rt = { path = "../../lib/rt" }
+# `alloc` as the console's driver takes it: one build of the boot image
+# unifies the crate's features, and the driver never allocates.
 virtio-drivers = { version = "0.13", default-features = false, features = ["alloc"] }

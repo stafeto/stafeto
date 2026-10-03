@@ -7,6 +7,7 @@
 mod out;
 
 mod disasm;
+mod entropy;
 mod image;
 mod jobs;
 mod measure;
@@ -912,6 +913,10 @@ commands:
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
             --one NAME, one test in a boot of its own, with its log
+  entropy [--hvf] run the probe of the entropy device's driver in QEMU
+            under -icount: fills, a restart of the driver, its longest
+            steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
+  entropy-vz run the probe of the entropy device's driver on Apple VZ
   help      this text";
 
 fn main() {
@@ -1003,6 +1008,15 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
+        Some("entropy") => match args.get(1).map(String::as_str) {
+            None => entropy::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                entropy::probe(&qemu::HVF_V3)?;
+                entropy::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("entropy [--hvf]".to_owned()),
+        },
+        Some("entropy-vz") => entropy::probe_vz(),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -2869,6 +2883,8 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("kernel tests 2G icount", || {
             kernel_tests(&qemu::VIRT_2G, Variant::TestIcount).map(drop)
         }),
+        // The entropy device's driver under -icount, its steps measured.
+        job("entropy", || entropy::probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -2946,6 +2962,12 @@ fn host_tests() -> Result<(), String> {
         "virtio-console",
         "--package",
         "xtask",
+        "--package",
+        "virtio-pci",
+        "--package",
+        "proto-entropy",
+        "--package",
+        "virtio-rng",
     ]))
 }
 
@@ -4231,6 +4253,8 @@ fn hvf() -> Result<(), String> {
             relibc_threads_probe(m)?;
             posix_procs_probe(m)?;
         }
+        // The entropy device's DMA through the real processor's caches.
+        entropy::probe(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -4252,7 +4276,7 @@ fn hvf() -> Result<(), String> {
         }
         write_measures()?;
         println!(
-            "hvf on {}: boot ok, console dialog ok, relibc threads and POSIX processes ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
+            "hvf on {}: boot ok, console dialog ok, entropy ok, relibc threads and POSIX processes ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
@@ -4525,6 +4549,10 @@ fn ci(jobs: usize) -> Result<(), String> {
         "proto-loader",
         "--package",
         "xtask",
+        "--package",
+        "virtio-pci",
+        "--package",
+        "proto-entropy",
         "--all-targets",
         "--",
         "-D",
@@ -4548,6 +4576,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "virtio-console",
         "--package",
         "posix-process-service",
+        "--package",
+        "virtio-rng",
         "--lib",
         "--tests",
         "--",
@@ -4659,6 +4689,12 @@ fn ci(jobs: usize) -> Result<(), String> {
         "rtbench-posix",
         "--package",
         "rtbench-load",
+        "--package",
+        "virtio-rng",
+        "--package",
+        "entropy-probe",
+        "--features",
+        "virtio-rng/crash,virtio-rng/steps",
         "--target",
         PROGRAM_TARGET,
         "--",

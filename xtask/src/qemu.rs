@@ -167,11 +167,24 @@ pub fn machine(name: Option<&String>) -> Result<&'static Machine, String> {
         })
 }
 
+/// The Virtio entropy device every run has (services/virtio-rng): modern
+/// virtio-mmio, as the Virtio PCI of Apple VZ is; QEMU puts it on the last
+/// transport, 31 (init's table, `entropy.rs`). An idle device raises no
+/// interrupt, and a driver only the images of the entropy probes start.
+pub const ENTROPY: &[&str] = &[
+    "-global",
+    "virtio-mmio.force-legacy=false",
+    "-device",
+    "virtio-rng-device",
+];
+
 pub fn args(m: &Machine, kernel: &Path, boot_image: Option<&Path>) -> Vec<String> {
     let mut a: Vec<String> = [
-        "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory, "-kernel",
+        "-machine", m.machine, "-accel", m.accel, "-cpu", m.cpu, "-m", m.memory,
     ]
     .iter()
+    .chain(ENTROPY)
+    .chain(&["-kernel"])
     .map(|s| s.to_string())
     .collect();
     a.push(kernel.display().to_string());
@@ -965,6 +978,9 @@ mod tests {
         assert!(joined.contains("-m 512M"));
         assert!(joined.contains("-kernel k.img"));
         assert!(joined.contains("-initrd b.img"));
+        assert!(
+            joined.contains("-global virtio-mmio.force-legacy=false -device virtio-rng-device")
+        );
         assert!(
             !args(&VIRT, Path::new("k.elf"), None)
                 .join(" ")
