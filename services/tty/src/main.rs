@@ -2117,6 +2117,7 @@ impl Tty {
         let (Ok(target), Ok(())) = (body.u32(), body.finish()) else {
             return Answer::Status(Status::BadSize);
         };
+        let terminal = self.active as u32;
         let sid = self.devices[self.active].jobs.session().unwrap_or(0);
         let generation = self.devices[self.active].job_generation;
         let Some(notary) = self.notary() else {
@@ -2125,7 +2126,7 @@ impl Tty {
         let mut w = Writer::new();
         if r.method() == 21 {
             let _ = proto_process::Method::TtySignal.header().write(&mut w);
-            let _ = w.u32(self.active as u32);
+            let _ = w.u32(terminal);
             let _ = w.u32(target);
             let _ = w.u32(28);
             let _ = w.u64(generation);
