@@ -265,14 +265,14 @@ mod tests {
     #[test]
     fn epoch_exhaustion_preserves_both_classes() {
         let p = page();
-        let (mut stop, mut cont) = (u64::MAX & !7, 6);
+        let (mut stop, mut cont) = (!7u64, 6);
         p.stop_word.store(stop | 3, Ordering::Relaxed);
         p.cont_word.store(cont | 1, Ordering::Relaxed);
         assert_eq!(generation(&mut stop, &mut cont, &p, SIGCONT), None);
-        assert_eq!(p.stop_word.load(Ordering::Acquire), u64::MAX & !7 | 3);
+        assert_eq!(p.stop_word.load(Ordering::Acquire), !7u64 | 3);
         assert_eq!(p.cont_word.load(Ordering::Acquire), 7);
         stop = 16;
-        cont = u64::MAX & !1;
+        cont = !1u64;
         assert_eq!(generation(&mut stop, &mut cont, &p, SIGSTOP), None);
         assert_eq!(stop, 16);
     }
