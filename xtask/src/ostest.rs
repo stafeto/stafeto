@@ -10,8 +10,8 @@
 //! output, then `exit: N` when the output is empty or the status is 2 or
 //! more. A test passes when one of its expectations
 //! (<suite>.expect/<test>.*) is that text; a test of the basic suite, which
-//! has none, when the outcome is `exit: 0`. A test that needs `poll` or
-//! `select` (5f) is UNSUPPORTED and does not run. A test that faults, is killed or gives
+//! has none, when the outcome is `exit: 0`. The bounded readiness groups
+//! basic/poll, basic/sys_select and signal/ppoll run explicitly (5f). A test that faults, is killed or gives
 //! no end within the runner's 10 s FAILs, and the run goes on. The
 //! table goes to target/measure/os-test.txt; `ci` fails when a test of
 //! tests/os-test/pass.txt does not pass. `cargo xtask os-test --one NAME`
@@ -163,12 +163,18 @@ pub fn expected(expect: &Path, test: &str, outcome: &str) -> Result<bool, String
     Ok(false)
 }
 
-/// Whether the test's source needs what stafeto has not yet: `poll` or
-/// `select` (5f), which `ppoll` and `pselect` contain.
+/// Finds readiness calls, including ppoll and pselect.
 fn needs_poll(source: &str) -> bool {
     ["poll(", "select("]
         .iter()
         .any(|call| source.contains(call))
+}
+
+/// Readiness coverage is enabled explicitly for the accepted groups.
+fn readiness_group(name: &str) -> bool {
+    name.starts_with("basic/poll/")
+        || name.starts_with("basic/sys_select/")
+        || name.starts_with("signal/ppoll-")
 }
 
 /// The time `ci` gives the boots of the suites, counted from the first
@@ -215,7 +221,9 @@ pub struct Plan {
 /// The suites as jobs (a boot a suite, the tests started from files), after
 /// the build of os-test's tests. `ci` puts them among its own jobs.
 pub fn plan() -> Result<(Vec<Job>, Plan), String> {
-    crate::relibc()?;
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        crate::relibc()?;
+    }
     crate::run_cmd(
         std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
     )?;
@@ -225,11 +233,11 @@ pub fn plan() -> Result<(Vec<Job>, Plan), String> {
     let mut places: Vec<Option<Row>> = Vec::new();
     for test in &tests {
         let source = source_of(&work, test)?;
-        places.push(if needs_poll(&source) {
+        places.push(if needs_poll(&source) && !readiness_group(&test.name) {
             Some((
                 test.name.clone(),
                 Verdict::Unsupported,
-                "needs poll or select (5f)".to_owned(),
+                "readiness test awaits explicit coverage".to_owned(),
             ))
         } else if let Some(failed) = test.built.strip_prefix('!') {
             // A test that did not compile: os-test's outcome for it.
@@ -510,7 +518,9 @@ fn suite_jobs(
 /// time (a hung test is killed after a second).
 pub fn runner_check_job() -> Job {
     crate::jobs::job("os-test runner check", || {
-        crate::relibc()?;
+        if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+            crate::relibc()?;
+        }
         runner_check(&build(Variant::Normal)?)
     })
 }
@@ -518,7 +528,9 @@ pub fn runner_check_job() -> Job {
 /// `cargo xtask os-test --one NAME`: the test `NAME` alone in a boot of
 /// its own, with the whole log of the boot.
 pub fn run_one(name: &str) -> Result<(), String> {
-    crate::relibc()?;
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        crate::relibc()?;
+    }
     crate::run_cmd(
         std::process::Command::new("python3").arg(crate::root().join("tools/build-os-test.py")),
     )?;
@@ -716,7 +728,11 @@ mod tests {
     }
 
     #[test]
-    fn poll_and_select_are_unsupported() {
+    fn readiness_calls_and_explicit_groups() {
+        assert!(readiness_group("basic/poll/poll"));
+        assert!(readiness_group("basic/sys_select/select"));
+        assert!(readiness_group("signal/ppoll-block-raise"));
+        assert!(!readiness_group("signal/other-poll"));
         assert!(needs_poll("int n = poll(fds, 1, 0);"));
         assert!(needs_poll("int n = ppoll(fds, 1, NULL, NULL);"));
         assert!(needs_poll("int n = select(1, &set, NULL, NULL, &tv);"));

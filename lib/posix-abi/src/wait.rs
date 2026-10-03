@@ -266,7 +266,7 @@ fn run(
         if selecting && ready[index] == watch::NVAL {
             return Err(EBADF);
         }
-        if selecting && matches!(target, Some(Target::Ram(_))) {
+        if selecting && requested & watch::PRI != 0 && matches!(target, Some(Target::Ram(_))) {
             let target = (*target).ok_or(EIO)?;
             let regular =
                 transport.fstat(target).map_err(crate::error)?.kind == posix_fs::FileKind::Regular;

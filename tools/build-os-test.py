@@ -17,6 +17,7 @@ suite has none of: its tests pass with the outcome `exit: 0`. A stamp of
 both commits makes a second run do nothing."""
 
 import importlib.util
+import os
 from pathlib import Path
 import re
 import shutil
@@ -27,13 +28,12 @@ REPOSITORY = "https://gitlab.com/sortix/os-test.git"
 COMMIT = "f8144f0215ea265fd46281e29271d8e857a6856e"
 SUITES = ("io", "malloc", "process", "signal")
 # The parts of the basic suite and which of their tests run: a glob, or
-# None for the tests that call fork (5d) or pipe (5e). Tests that need
-# poll or select stay in: `cargo xtask os-test` marks them unsupported
-# until those come (5f).
+# None for the tests that call fork (5d) or pipe (5e). Readiness groups
+# poll and sys_select include every test explicitly (5f).
 BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"), ("unistd", "getentropy.c"),
          ("unistd", None),
-         ("nl_types", None), ("poll", None), ("pthread", None), ("signal", None),
-         ("stdlib", None), ("sys_select", None), ("sys_wait", None), ("termios", None),
+         ("nl_types", None), ("poll", "*.c"), ("pthread", None), ("signal", None),
+         ("stdlib", None), ("sys_select", "*.c"), ("sys_wait", None), ("termios", None),
          ("fmtmsg", None), ("stdio", None), ("wchar", None))
 FORK = re.compile(r"(^|[^_\w])(v?fork|pipe2?)\(")
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,7 +42,7 @@ SOURCE = WORK / "source"
 OBJECTS = WORK / "objects"
 LIST = WORK / "tests.txt"
 STAMP = WORK / "stamp"
-INCLUDE = ROOT / "target" / "relibc" / "sysroot" / "include"
+INCLUDE = Path(os.environ.get("STAFETO_RELIBC_SYSROOT", ROOT / "target" / "relibc" / "sysroot")) / "include"
 # os-test's compile.sh, with the C ABI relibc's headers describe.
 FLAGS = ("--target=aarch64-linux-gnu", "-nostdinc", "-isystem", str(INCLUDE),
          "-mno-outline-atomics", "-mfix-cortex-a53-835769", "-fno-stack-protector",

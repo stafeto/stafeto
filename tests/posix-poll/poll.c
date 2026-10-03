@@ -90,11 +90,12 @@ static int service_watches(void) {
     return 0;
 }
 
-struct writer { int fd; int signal; pthread_t target; };
+struct writer { int fd; int signal; pthread_t target; int close_fd; };
 static void *wake_writer(void *arg) {
     struct writer *w = arg;
     struct timespec pause = {0, 2000000};
     if (nanosleep(&pause, NULL) != 0) return (void *)1;
+    if (w->close_fd >= 0 && close(w->close_fd) != 0) return (void *)1;
     if (w->signal) return (void *)(intptr_t)pthread_kill(w->target, w->signal);
     return write(w->fd, "p", 1) == 1 ? NULL : (void *)1;
 }
@@ -122,16 +123,37 @@ static int frontends(void) {
     CHECK(poll(p, 4, 0) == 1 && p[3].revents == POLLNVAL && p[0].revents == 0 && p[2].revents == 0);
     p[3].fd = -1;
     pthread_t worker;
-    struct writer w = {ends[1], 0, pthread_self()};
+    struct writer w = {ends[1], 0, pthread_self(), -1};
     CHECK(pthread_create(&worker, NULL, wake_writer, &w) == 0);
     CHECK(poll(p, 4, 100) == 1 && p[0].revents == POLLIN && p[1].revents == 0);
     void *result;
     CHECK(pthread_join(worker, &result) == 0 && result == NULL);
     char byte;
     CHECK(read(ends[0], &byte, 1) == 1 && byte == 'p');
+    CHECK(pthread_create(&worker, NULL, wake_writer, &w) == 0);
+    fd_set ready_read; FD_ZERO(&ready_read); FD_SET(ends[0], &ready_read);
+    struct timeval remaining = {0, 100000};
+    CHECK(select(ends[0] + 1, &ready_read, NULL, NULL, &remaining) == 1 && FD_ISSET(ends[0], &ready_read));
+    CHECK(remaining.tv_sec == 0 && remaining.tv_usec > 0 && remaining.tv_usec < 100000);
+    CHECK(pthread_join(worker, &result) == 0 && result == NULL);
+    CHECK(read(ends[0], &byte, 1) == 1 && byte == 'p');
     CHECK(close(ends[1]) == 0);
     CHECK(poll(p, 4, 0) == 2 && (p[0].revents & POLLHUP) && p[1].revents == POLLHUP);
     CHECK(close(ends[0]) == 0);
+    CHECK(pipe(ends) == 0 && close(ends[0]) == 0);
+    struct pollfd broken = {ends[1], 0, 77};
+    CHECK(poll(&broken, 1, 0) == 1 && broken.revents == POLLERR);
+    CHECK(close(ends[1]) == 0);
+    CHECK(pipe(ends) == 0);
+    p[0] = (struct pollfd){ends[0], POLLIN, 77};
+    w.fd = ends[1]; w.close_fd = ends[0];
+    CHECK(pthread_create(&worker, NULL, wake_writer, &w) == 0);
+    CHECK(poll(p, 1, 100) == 1 && p[0].revents == POLLIN);
+    CHECK(pthread_join(worker, &result) == 0 && result == NULL);
+    broken = (struct pollfd){ends[1], 0, 77};
+    CHECK(poll(&broken, 1, 0) == 1 && broken.revents == POLLERR);
+    CHECK(close(ends[1]) == 0);
+    w.close_fd = -1;
     int file = open("/bin/posix-poll", O_RDONLY);
     CHECK(file >= 0);
     fd_set readset, writeset, exceptset;
