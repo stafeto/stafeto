@@ -437,6 +437,11 @@ pub fn probe_decoy(on: bool) {
 /// Malformed own-loader packets for the terminal C probe. No foreign
 /// endpoint or credential participates in these refusal paths.
 static TERMINAL_PACKET_PROBE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static TERMINAL_PACKET_RESULT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub fn probe_terminal_packet_result() -> u64 {
+    TERMINAL_PACKET_RESULT.load(Ordering::Acquire)
+}
 pub fn probe_terminal_packet(mode: u32) {
     TERMINAL_PACKET_PROBE.store(mode, Ordering::Release);
 }
@@ -942,9 +947,17 @@ pub(crate) fn ask_loader(
             Err(rt::abi::Error::Interrupted) => continue,
             Err(_) => return proto_loader::IO,
             Ok(reply) => {
-                return proto_wire::Reader::new(reply.bytes(&mut buffer))
+                let status = proto_wire::Reader::new(reply.bytes(&mut buffer))
                     .u32()
                     .unwrap_or(proto_loader::IO);
+                if TERMINAL_PACKET_PROBE.load(Ordering::Relaxed) != 0 {
+                    let method =
+                        proto_wire::Header::read(&mut proto_wire::Reader::new(w.as_bytes()))
+                            .map_or(0, |h| h.method);
+                    TERMINAL_PACKET_RESULT
+                        .store((method as u64) << 32 | status as u64, Ordering::Release);
+                }
+                return status;
             }
         }
     }
