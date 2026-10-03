@@ -122,21 +122,33 @@ pub(crate) fn publish_initial() {
     });
 }
 
-/// The sender's information of each process signal a thread took from the
-/// page and has pending (Block::process): the service keeps one sending of
-/// a signal on the page, so one slot a signal serves the process.
+/// Sender information belongs to one assignment in one thread place.
+/// The short lock orders table -> INFO; INFO is released before actions,
+/// routing, entry requests and RPC, so no opposite nesting is possible.
+static INFO_LOCK: LayerLock = LayerLock::raising();
 struct Taken {
-    code: AtomicU64,
+    code_status: AtomicU64,
     from: AtomicU64,
-    status: AtomicU64,
 }
-static TAKEN: [Taken; 31] = [const {
-    Taken {
-        code: AtomicU64::new(0),
-        from: AtomicU64::new(0),
-        status: AtomicU64::new(0),
+static TAKEN: [[Taken; 31]; crate::relibc::PLACES + 1] = [const {
+    [const {
+        Taken {
+            code_status: AtomicU64::new(0),
+            from: AtomicU64::new(0),
+        }
+    }; 31]
+}; crate::relibc::PLACES + 1];
+const _: () = assert!(core::mem::size_of_val(&TAKEN) == 32_240);
+
+fn taken_row(block: &Block) -> &[Taken; 31] {
+    &TAKEN[usize::try_from(block.thread_id).expect("a bounded thread place")]
+}
+fn clear_taken(row: &[Taken; 31]) {
+    for slot in row {
+        slot.code_status.store(0, Ordering::Relaxed);
+        slot.from.store(0, Ordering::Relaxed);
     }
-}; 31];
+}
 
 /// Process signals that still belong to the currently published epochs.
 pub(crate) fn process_pending() -> u64 {
@@ -278,33 +290,41 @@ fn page_info(signal: i32) -> Option<SigInfo> {
     }
 }
 
-/// Keeps `info` of a process signal a thread took (`TAKEN`).
-fn keep_taken(signal: i32, info: &SigInfo) {
-    let slot = &TAKEN[signal as usize - 1];
-    slot.code
-        .store(info.si_code as u32 as u64, Ordering::Relaxed);
-    slot.from.store(
-        u64::from(info.si_pid as u32) | u64::from(info.si_uid) << 32,
+/// Keep the claimed sender before publishing its thread bit, under INFO_LOCK.
+fn keep_taken(block: &Block, signal: i32, info: &SigInfo) {
+    let slot = &taken_row(block)[signal as usize - 1];
+    slot.code_status.store(
+        u64::from(info.si_code as u32) | u64::from(info.si_status as u32) << 32,
         Ordering::Relaxed,
     );
-    slot.status
-        .store(info.si_status as u32 as u64, Ordering::Release);
+    slot.from.store(
+        u64::from(info.si_pid as u32) | u64::from(info.si_uid) << 32,
+        Ordering::Release,
+    );
 }
 
-/// The information `keep_taken` kept for `signal`.
-fn taken(signal: i32) -> SigInfo {
-    let slot = &TAKEN[signal as usize - 1];
+/// Copy one owned sender under INFO_LOCK before a new assignment can replace it.
+fn taken(block: &Block, signal: i32) -> SigInfo {
+    let slot = &taken_row(block)[signal as usize - 1];
     let from = slot.from.load(Ordering::Acquire);
+    let code_status = slot.code_status.load(Ordering::Relaxed);
     SigInfo {
         si_signo: signal,
         si_errno: 0,
-        si_code: slot.code.load(Ordering::Acquire) as u32 as i32,
+        si_code: code_status as u32 as i32,
         si_pid: from as u32 as i32,
         si_uid: (from >> 32) as u32,
-        si_status: slot.status.load(Ordering::Acquire) as u32 as i32,
+        si_status: (code_status >> 32) as u32 as i32,
         si_addr: 0,
         si_value: 0,
     }
+}
+
+fn claim_thread_info(block: &Block, signal: i32) -> Option<(u64, Option<SigInfo>)> {
+    let _guard = INFO_LOCK.lock();
+    let ticket = claim_thread(block, signal)?;
+    let info = process_origin(block, signal, ticket).then(|| taken(block, signal));
+    Some((ticket, info))
 }
 
 // A kernel wait inside a return RPC is not an exec parking boundary yet.
@@ -330,7 +350,12 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
     let mut back = (block.process.load(Ordering::SeqCst) | origins) & bits;
     // The ordinary mask path stays in memory. Only job returns need entry
     // deferral for an acknowledged RPC, outside every table or action lock.
-    let returning = 1u64 << (block.thread_id - 1);
+    let returning = block
+        .thread_id
+        .checked_sub(1)
+        .filter(|&id| id < crate::relibc::PLACES as u64)
+        .map(|id| 1u64 << id)
+        .unwrap_or(0);
     let guard = (back & proto_process::job::MASK != 0).then(|| {
         let guard = rt::upcall::defer_entries().expect("signal return entry deferral");
         RETURNING.fetch_or(returning, Ordering::SeqCst);
@@ -340,13 +365,9 @@ fn give_back(block: &Block, bits: u64) -> Result<(), i32> {
         let bit = back.isolate_lowest_one();
         back &= !bit;
         let signal = bit.trailing_zeros() as i32 + 1;
-        let Some(ticket) = claim_thread(block, signal) else {
+        let Some((ticket, Some(info))) = claim_thread_info(block, signal) else {
             continue;
         };
-        if !process_origin(block, signal, ticket) {
-            continue;
-        }
-        let info = taken(signal);
         if class(signal as u8).is_some() {
             if let Err(error) = crate::process::return_job_signal(signal, ticket, &info) {
                 // A failed request did not transfer ownership. Epoch CAS
@@ -426,6 +447,10 @@ pub(crate) fn route() {
             {
                 return;
             }
+            let guard = INFO_LOCK.lock();
+            if thread_pending(block) & bit != 0 {
+                return;
+            }
             let Some(info) = page_info(signal) else {
                 entry = Some(None);
                 return;
@@ -435,13 +460,14 @@ pub(crate) fn route() {
                 entry = Some(None);
                 return;
             };
-            keep_taken(signal, &info);
+            keep_taken(block, signal, &info);
             if !assign(block, signal, ticket, true) {
                 entry = Some(None);
                 return;
             }
             entry =
                 Some((!core::ptr::eq(block, own)).then(|| block.thread.load(Ordering::Relaxed)));
+            drop(guard);
         });
         if let Some(Some(thread)) = entry {
             let native = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(thread));
@@ -757,14 +783,8 @@ fn wait(
         }
         let bit = eligible.isolate_lowest_one();
         let signal = bit.trailing_zeros() as i32 + 1;
-        if let Some(ticket) = claim_thread(block, signal) {
-            let from_process = process_origin(block, signal, ticket);
-            let info = if from_process {
-                taken(signal)
-            } else {
-                SigInfo::thread(signal)
-            };
-            return Some((signal, info));
+        if let Some((_, info)) = claim_thread_info(block, signal) {
+            return Some((signal, info.unwrap_or_else(|| SigInfo::thread(signal))));
         }
     };
     block.wait_set.store(set, Ordering::SeqCst);
@@ -999,6 +1019,9 @@ pub(crate) unsafe fn after_fork() -> Result<(), i32> {
         place.store(0, Ordering::Relaxed);
     }
     CARRIED.store(0, Ordering::Release);
+    for row in &TAKEN {
+        clear_taken(row);
+    }
     attach()
 }
 
@@ -1072,6 +1095,10 @@ fn stopped_by_other() -> bool {
 /// Binds and enables the calling thread's entry, then delivers what came
 /// before it.
 pub(crate) fn attach() -> Result<(), i32> {
+    {
+        let _guard = INFO_LOCK.lock();
+        clear_taken(taken_row(own()));
+    }
     // SAFETY: the dispatcher holds no interrupted Rust references or locks
     // and enters only caller-supplied C code.
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
@@ -1138,10 +1165,9 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>, u64)> {
         }
         let bit = eligible.isolate_lowest_one();
         let signal = bit.trailing_zeros() as i32 + 1;
-        let Some(ticket) = claim_thread(block, signal) else {
+        let Some((ticket, from_process)) = claim_thread_info(block, signal) else {
             continue;
         };
-        let from_process = process_origin(block, signal, ticket).then(|| taken(signal));
         // Read without the lock; SA_RESETHAND alone writes, under it.
         let read = action(signal);
         let action = if ignored(signal, &read) {
@@ -1452,18 +1478,44 @@ pub fn probe_assign_job(signal: i32) -> i32 {
     if proto_process::job::class(signal as u8).is_none() {
         return EINVAL;
     }
+    probe_assign_signal(signal)
+}
+
+pub fn probe_assign_signal(signal: i32) -> i32 {
+    let _guard = INFO_LOCK.lock();
+    let bit = posix_signals::bit(signal).unwrap_or(0);
+    if thread_pending(own()) & bit != 0 {
+        return EAGAIN;
+    }
+    if bit == 0 || bit & posix_signals::UNBLOCKABLE != 0 {
+        return EINVAL;
+    }
     let Some(info) = page_info(signal) else {
         return EAGAIN;
     };
     let Some(ticket) = claim_page(signal) else {
         return EAGAIN;
     };
-    keep_taken(signal, &info);
+    keep_taken(own(), signal, &info);
     if assign(own(), signal, ticket, true) {
         0
     } else {
         EAGAIN
     }
+}
+
+/// Exercise router selection while an existing job assignment stays undelivered.
+pub fn probe_route_job(signal: i32) -> i32 {
+    let Some(bit) = posix_signals::bit(signal).ok() else {
+        return EINVAL;
+    };
+    let guard = rt::upcall::defer_entries().expect("router probe entry deferral");
+    let block = own();
+    let before = block.mask.fetch_and(!bit, Ordering::SeqCst);
+    route();
+    block.mask.store(before, Ordering::SeqCst);
+    drop(guard);
+    0
 }
 
 pub fn probe_return_job_info(signal: i32, ticket: u64, pid: i32, code: i32) -> i32 {
@@ -1486,4 +1538,9 @@ pub fn probe_return_job(signal: i32, ticket: u64) -> i32 {
 
 pub fn probe_return_failure() {
     crate::process::probe_return_failure();
+}
+
+/// A pre-attachment block has no table place and no return bitmap bit.
+pub fn probe_zero_return() -> i32 {
+    give_back(&Block::new(), 0).err().unwrap_or(0)
 }
