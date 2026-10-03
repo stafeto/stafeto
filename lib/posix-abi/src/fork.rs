@@ -263,23 +263,40 @@ fn regions() -> Result<Regions, i32> {
         regions: [const { None }; REGIONS_MAX],
     };
     let at = resume as *const () as u64;
-    let mut code = false;
-    crate::allocation::regions(|map| {
-        for region in map.iter() {
-            let region_of = Region {
-                address: region.address as u64,
-                pages: u32::try_from(region.pages).map_err(|_| ENOMEM)?,
-                access: region.access,
-            };
-            code |= region.access == Access::ReadExec && region_of.holds(at);
-            let copy =
-                rt::sys::handle_duplicate(&region.handle, Rights::MAP_READ | Rights::TRANSFER)
-                    .map_err(|_| ENOMEM)?;
-            out.regions[out.count] = Some((region_of, copy));
-            out.count += 1;
+    // The values under the heap's lock, the copies of the handles out of
+    // it: the map only grows, so each value stays its region's.
+    let mut seen = [(
+        Region {
+            address: 0,
+            pages: 0,
+            access: Access::Read,
+        },
+        0u64,
+    ); REGIONS_MAX];
+    let count = crate::allocation::regions(|map| {
+        let mut count = 0;
+        for (place, region) in seen.iter_mut().zip(map.iter()) {
+            *place = (
+                Region {
+                    address: region.address as u64,
+                    pages: u32::try_from(region.pages).map_err(|_| ENOMEM)?,
+                    access: region.access,
+                },
+                region.handle.raw().0,
+            );
+            count += 1;
         }
-        Ok::<(), i32>(())
+        Ok::<usize, i32>(count)
     })?;
+    let mut code = false;
+    for (region, raw) in &seen[..count] {
+        code |= region.access == Access::ReadExec && region.holds(at);
+        let held = Handle::<Memory>::borrowed(rt::abi::Handle(*raw));
+        let copy = rt::sys::handle_duplicate(&*held, Rights::MAP_READ | Rights::TRANSFER)
+            .map_err(|_| ENOMEM)?;
+        out.regions[out.count] = Some((*region, copy));
+        out.count += 1;
+    }
     if code { Ok(out) } else { Err(ENOSYS) }
 }
 
@@ -382,6 +399,12 @@ fn make(
         }
         if ask_loader(c, &w, Some(handles)) != 0 {
             return Err(EIO);
+        }
+        let early = EARLY.swap(0, Ordering::AcqRel);
+        if early != 0 {
+            // SAFETY: only `probe_early_window` stores a value, a `fn()`.
+            let early: fn() = unsafe { core::mem::transmute::<usize, fn()>(early) };
+            early();
         }
     }
     let mut w = Writer::new();
@@ -511,10 +534,17 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
     block.mask.store(mask, Ordering::SeqCst);
     crate::signals::route();
     crate::signals::deliver_now();
-    result.map(|forked| match forked {
-        Forked::Parent(pid) => pid,
-        Forked::Child => 0,
-    })
+    // fork's errors are EAGAIN and ENOMEM (and ENOSYS above): a refusal
+    // of the loader or of a service is a limit of the moment.
+    result
+        .map(|forked| match forked {
+            Forked::Parent(pid) => pid,
+            Forked::Child => 0,
+        })
+        .map_err(|errno| match errno {
+            ENOMEM | ENOSYS => errno,
+            _ => EAGAIN,
+        })
 }
 
 /// Clones of the process's sessions for a child (Clone): the RAM files'
@@ -566,6 +596,16 @@ fn sessions() -> Result<Sessions, i32> {
             Err(errno)
         }
     }
+}
+
+/// The function the next fork runs in the parent once the loader took the
+/// first message of Regions (a probe of a parent that dies there), 0 for
+/// none.
+static EARLY: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the function the next fork runs after its first Regions.
+pub fn probe_early_window(window: Option<fn()>) {
+    EARLY.store(window.map_or(0, |f| f as usize), Ordering::Release);
 }
 
 /// What the child runs once at its start, set by the program's start

@@ -56,7 +56,10 @@ const BORROWED: u64 = LOADER_BASE + (6 << 20);
 /// Where it maps a piece of an object of the parent's memory to copy it
 /// (Fork), WINDOW bytes at most.
 const WINDOW: u64 = LOADER_BASE + (8 << 20);
+#[cfg(not(feature = "small-pieces"))]
 const PIECE: u64 = 4 << 20;
+#[cfg(feature = "small-pieces")]
+const PIECE: u64 = 64 << 10;
 /// The exit code of a loader that gave up: the parent hears why through C
 /// first, or its wait reports 127 (posix_spawn's fallback, [MUSL-SPAWN]).
 const GAVE_UP: u64 = 127;
@@ -408,7 +411,9 @@ fn take_regions(
     let mut regions = [None; abi::MESSAGE_HANDLES];
     for (i, region) in regions.iter_mut().enumerate().take(count) {
         let read = Region::read(&mut r)?;
-        let reads = matches!(handles.info(i), Some((abi::ObjectKind::Memory, rights)) if rights.contains(Rights::MAP_READ));
+        let reads = handles
+            .info(i)
+            .is_some_and(|(kind, rights)| pl::region_object(kind, rights));
         if !reads {
             return Err(Status::BadSize);
         }

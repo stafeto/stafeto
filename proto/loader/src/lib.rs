@@ -827,6 +827,16 @@ pub fn admit(held: &[Region], region: &Region) -> Result<(), Status> {
     Ok(())
 }
 
+/// Whether a handle of Regions names what a region may be copied from: a
+/// memory object with MAP_READ. A window on a device's registers, any
+/// other kind and a memory object the loader may not read are refused.
+/// (A buffer of a device made with MEM_CONTIGUOUS is a memory object the
+/// kernel shows as any other; a POSIX process has none: it holds no device
+/// resource.)
+pub fn region_object(kind: abi::ObjectKind, rights: abi::Rights) -> bool {
+    kind == abi::ObjectKind::Memory && rights.contains(abi::Rights::MAP_READ)
+}
+
 /// The body of Fork: where the copy goes on, the address `pc` of the
 /// layer's code it jumps to with the stack pointer `sp` and x0 = 0, the
 /// address `transfer` of TRANSFER_SIZE bytes of the layer's data the
@@ -1416,6 +1426,25 @@ mod tests {
             sp: abi::INIT_STACK_TOP - 0x400,
             transfer: 0x22_0100,
             regions: regions as u32,
+        }
+    }
+
+    /// Regions takes memory objects with MAP_READ alone.
+    #[test]
+    fn a_region_comes_from_a_readable_memory_object() {
+        use abi::{ObjectKind, Rights};
+        assert!(region_object(
+            ObjectKind::Memory,
+            Rights::MAP_READ | Rights::TRANSFER
+        ));
+        for (kind, rights) in [
+            (ObjectKind::DeviceWindow, Rights::MAP_READ),
+            (ObjectKind::Channel, Rights::MAP_READ),
+            (ObjectKind::Process, Rights::MAP_READ),
+            (ObjectKind::Memory, Rights::MAP_WRITE | Rights::TRANSFER),
+            (ObjectKind::Unknown(9), Rights::MAP_READ),
+        ] {
+            assert!(!region_object(kind, rights), "{kind:?}");
         }
     }
 

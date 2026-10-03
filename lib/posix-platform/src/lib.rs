@@ -127,6 +127,8 @@ const O_DIRECTORY: c_int = 0o40000;
 const O_NOFOLLOW: c_int = 0o100000;
 const O_LARGEFILE: c_int = 0o400000;
 const O_CLOEXEC: c_int = 0o2000000;
+/// relibc's O_CLOFORK of stafeto (POSIX 2024; Linux has none).
+const O_CLOFORK: c_int = 0o1_0000_0000;
 
 /// Opens `path`, relative to the current directory or absolute (any
 /// `dirfd` then). The layer opens files of the RAM file service: the
@@ -147,7 +149,8 @@ pub unsafe extern "C" fn stafeto_openat(
     flags: c_int,
     _mode: u32,
 ) -> c_int {
-    let known = O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC;
+    let known =
+        O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC | O_CLOFORK;
     let changes = O_CREAT | O_TRUNC | O_APPEND;
     // SAFETY: the caller's promise.
     let absolute = !path.is_null() && unsafe { *path } == b'/' as c_char;
@@ -176,6 +179,9 @@ pub unsafe extern "C" fn stafeto_openat(
     }
     if flags & O_CLOEXEC != 0 {
         ours |= posix_abi::constants::O_CLOEXEC;
+    }
+    if flags & O_CLOFORK != 0 {
+        ours |= posix_abi::constants::O_CLOFORK;
     }
     value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
 }
@@ -676,25 +682,30 @@ pub extern "C" fn stafeto_probe_fork_window(window: Option<extern "C" fn()>) {
     );
 }
 
-/// Sets FD_CLOFORK of `fd` (relibc's headers have no FD_CLOFORK yet):
-/// 0 or the negated errno, for the probes.
-#[unsafe(no_mangle)]
-pub extern "C" fn stafeto_probe_set_clofork(fd: c_int) -> c_int {
-    let fd = match u32::try_from(fd) {
-        Ok(fd) => fd,
-        Err(_) => return -posix_abi::constants::EBADF,
-    };
-    let set = posix_abi::shared::with_files(|files| {
-        let mut flags = files.descriptor_flags(fd).map_err(posix_abi::error)?;
-        flags.close_on_fork = true;
-        files
-            .set_descriptor_flags(fd, flags)
-            .map_err(posix_abi::error)
-    });
-    match set {
-        Ok(()) => 0,
-        Err(errno) => -errno,
+/// The C function an early window of the next fork runs
+/// (posix_abi::fork::probe_early_window), once the loader took the first
+/// message of Regions.
+static EARLY_WINDOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn early_window() {
+    let hook = EARLY_WINDOW.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `stafeto_probe_fork_early` stores a value, a C
+        // function of no arguments.
+        let hook: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(hook) };
+        hook();
     }
+}
+
+/// The C function the next fork runs in the parent once its loader took
+/// the first message of Regions, for the probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_fork_early(window: Option<extern "C" fn()>) {
+    EARLY_WINDOW.store(
+        window.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+    posix_abi::fork::probe_early_window(window.map(|_| early_window as fn()));
 }
 
 /// A word of the process's page (proto_process::Page): 0 the pending

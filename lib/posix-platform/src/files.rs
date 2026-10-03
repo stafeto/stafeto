@@ -315,17 +315,22 @@ const F_SETFL: c_int = 4;
 /// The status flags F_SETFL cannot take yet (Linux's O_APPEND, O_NONBLOCK).
 const UNSUPPORTED_STATUS: u64 = 0o2000 | 0o4000;
 const F_DUPFD_CLOEXEC: c_int = 1030;
+/// relibc's F_DUPFD_CLOFORK of stafeto (POSIX 2024; Linux has none).
+const F_DUPFD_CLOFORK: c_int = 1100;
 /// relibc's FD_CLOEXEC (its fcntl.h), which differs from Linux's 1: both
 /// are taken, relibc's comes back.
 const FD_CLOEXEC: c_int = 0x8_0000;
 const LINUX_FD_CLOEXEC: c_int = 1;
+/// relibc's FD_CLOFORK of stafeto (POSIX 2024; Linux has none).
+const FD_CLOFORK: c_int = 0x100_0000;
 /// Access modes for F_GETFL.
 const O_RDONLY: c_int = 0;
 const O_WRONLY: c_int = 1;
 const O_RDWR: c_int = 2;
 
-/// fcntl: F_DUPFD and F_DUPFD_CLOEXEC (the lowest free number from the
-/// argument), F_GETFD and F_SETFD (close-on-exec), F_GETFL (the access
+/// fcntl: F_DUPFD, F_DUPFD_CLOEXEC and F_DUPFD_CLOFORK (the lowest free
+/// number from the argument), F_GETFD and F_SETFD (close-on-exec and
+/// close-on-fork), F_GETFL (the access
 /// mode by the descriptor's kind: the console's input reads, its output
 /// writes, a file of the service reads and writes as the service allows),
 /// F_SETFL with no flag to change (0; O_APPEND and O_NONBLOCK are
@@ -336,11 +341,11 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
         let error = posix_abi::error;
         let fd = number(fd)?;
         match command {
-            F_DUPFD | F_DUPFD_CLOEXEC => {
+            F_DUPFD | F_DUPFD_CLOEXEC | F_DUPFD_CLOFORK => {
                 let minimum = u32::try_from(argument).map_err(|_| EINVAL)?;
                 let flags = DescriptorFlags {
                     close_on_exec: command == F_DUPFD_CLOEXEC,
-                    close_on_fork: false,
+                    close_on_fork: command == F_DUPFD_CLOFORK,
                 };
                 files
                     .dup_from(fd, minimum, flags)
@@ -349,11 +354,14 @@ pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_i
             }
             F_GETFD => {
                 let flags = files.descriptor_flags(fd).map_err(error)?;
-                Ok(if flags.close_on_exec { FD_CLOEXEC } else { 0 })
+                let exec = if flags.close_on_exec { FD_CLOEXEC } else { 0 };
+                let fork = if flags.close_on_fork { FD_CLOFORK } else { 0 };
+                Ok(exec | fork)
             }
             F_SETFD => {
                 let mut flags = files.descriptor_flags(fd).map_err(error)?;
                 flags.close_on_exec = argument as c_int & (FD_CLOEXEC | LINUX_FD_CLOEXEC) != 0;
+                flags.close_on_fork = argument as c_int & FD_CLOFORK != 0;
                 files.set_descriptor_flags(fd, flags).map_err(error)?;
                 Ok(0)
             }

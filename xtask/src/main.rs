@@ -374,7 +374,8 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
+    // Pieces of 64 KiB: the probe's forks copy regions past one piece.
+    ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 /// The probe of the longest step of the process service (xtask

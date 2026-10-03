@@ -117,7 +117,12 @@
  * and files, make threads and hold the layer's locks: the fork stops them
  * all for its copy, and each child has one thread, mallocs, opens a file
  * and takes a mutex. An exec while a thread makes threads parks the
- * newborn ones too. BusyBox ash from its file runs `/bin/ls /etc && exit
+ * newborn ones too. A fork from a second thread gives a child with that
+ * one thread, which forks a grandchild; 20 children of fork killed give
+ * the service's pool back, and so does a parent that dies in the window
+ * of its fork, after Go or after its first Regions. The bare child checks
+ * 512 KiB of the parent's heap, past the 64 KiB pieces of the probes'
+ * loader (feature small-pieces). BusyBox ash from its file runs `/bin/ls /etc && exit
  * 3`, which forks.
  *
  * Stage 10: the probe is a record of init's table, and its end is init's
@@ -167,9 +172,9 @@ void stafeto_probe_park(void);
 int stafeto_probe_fork_abort(int *pid);
 unsigned long long stafeto_probe_map_mappings(void);
 void stafeto_probe_fork_window(void (*window)(void));
-int stafeto_probe_set_clofork(int fd);
 int stafeto_probe_hold(int which, unsigned long long us);
 int stafeto_probe_threads(void);
+void stafeto_probe_fork_early(void (*window)(void));
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
@@ -934,6 +939,10 @@ static int map_start(void) {
 static volatile int bare_data = 1234;
 static volatile int bare_later;
 static volatile int *bare_heap;
+/* 512 KiB, past the 64 KiB pieces of the probes' loader: its copy maps the
+ * parent's object at offsets into it. */
+#define BARE_BIG (512 * 1024 / sizeof(unsigned))
+static volatile unsigned *bare_big;
 
 /* The child of `fork_bare`: the parent's .data, heap and stack as they
  * were at the fork, its own copies of them, a page that ignores what the
@@ -945,6 +954,11 @@ static int bare_child(void *arg) {
     if (bare_data != 5678) bad |= 1;
     if (bare_heap[0] != 0x5a5a || bare_heap[1023] != 0x6b6b) bad |= 2;
     if (*stack != 77) bad |= 4;
+    for (unsigned i = 0; i < BARE_BIG; i++)
+        if (bare_big[i] != i * 2654435761u) {
+            bad |= 128;
+            break;
+        }
     bare_data = 1;
     bare_heap[0] = 2;
     *stack = 3;
@@ -975,6 +989,8 @@ static int fork_bare(void) {
     expect("setpgid of forkbare", setpgid(0, 0), 0);
     signal(SIGUSR2, SIG_IGN);
     bare_heap = malloc(4096 * sizeof(int));
+    bare_big = malloc(BARE_BIG * sizeof(unsigned));
+    for (unsigned i = 0; i < BARE_BIG; i++) bare_big[i] = i * 2654435761u;
     volatile int stack = 77;
     bare_data = 5678;
     bare_heap[0] = 0x5a5a;
@@ -1149,8 +1165,11 @@ static int fork_full(void) {
     char bytes[4];
     expect("a read before the fork", (int)read(fd, bytes, 3), 3);
     int cloexec = open("/etc/motd", O_RDONLY | O_CLOEXEC);
-    int clofork = open("/etc/motd", O_RDONLY);
-    expect("FD_CLOFORK set", stafeto_probe_set_clofork(clofork), 0);
+    int clofork = open("/etc/motd", O_RDONLY | O_CLOFORK);
+    int dupfork = fcntl(fd, F_DUPFD_CLOFORK, 0);
+    expect("F_GETFD of O_CLOFORK", fcntl(clofork, F_GETFD), FD_CLOFORK);
+    expect("F_SETFD of FD_CLOFORK", fcntl(dupfork, F_SETFD, FD_CLOFORK | FD_CLOEXEC), 0);
+    expect("F_GETFD of F_SETFD", fcntl(dupfork, F_GETFD), FD_CLOFORK | FD_CLOEXEC);
     volatile int stack = 77;
     full_data = 5678;
     stafeto_probe_fork_window(full_window);
@@ -1353,6 +1372,74 @@ static int exec_making(void) {
     return 100 + errno;
 }
 
+
+/* Role forkthread: a fork from a thread other than the main one. The
+ * child keeps the caller's place and number, has that one thread, opens
+ * a file and forks a grandchild of its own. */
+static void *fork_from_thread(void *arg) {
+    (void)arg;
+    pid_t parent = getpid();
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int bad = 0;
+        if (stafeto_probe_threads() != 1 || getppid() != parent) bad |= 1;
+        int fd = open("/etc/motd", O_RDONLY);
+        char b[7];
+        if (fd < 0 || read(fd, b, 7) != 7) bad |= 2;
+        pid_t grandchild = fork();
+        if (grandchild == 0) _exit(9);
+        int status = -1;
+        if (waitpid(grandchild, &status, 0) != grandchild || !WIFEXITED(status) ||
+            WEXITSTATUS(status) != 9)
+            bad |= 4;
+        _exit(bad ? bad : 9);
+    }
+    int status = -1;
+    if (pid < 0 || waitpid(pid, &status, 0) != pid) return (void *)1;
+    return (void *)(long)(WIFEXITED(status) ? WEXITSTATUS(status) : 100);
+}
+
+static int fork_thread(void) {
+    pthread_t t;
+    void *got = NULL;
+    expect("the forking thread", pthread_create(&t, NULL, fork_from_thread, NULL), 0);
+    pthread_join(t, &got);
+    expect("the status of the child of a second thread", (int)(long)got, 9);
+    return failures;
+}
+
+/* Role forkmany: 20 bare children killed give the service's pool back. */
+static int fork_many(void) {
+    unsigned long long before = stafeto_probe_pool();
+    int pids[20], live = 0;
+    for (; live < 20; live++) {
+        pids[live] = stafeto_probe_fork_bare(bare_park, NULL, NULL);
+        if (pids[live] <= 0) break;
+    }
+    expect("20 bare children", live, 20);
+    for (int i = 0; i < live; i++) kill(pids[i], SIGKILL);
+    for (int i = 0; i < live; i++) reap("one of 20 bare children", pids[i], 0, SIGKILL);
+    expect("the pool after 20 children of fork", stafeto_probe_pool() == before, 1);
+    return failures;
+}
+
+/* Roles forkdie and forkdieearly: the parent ends by its own SIGKILL in
+ * the window of a fork, after Go or after the first Regions; its parent
+ * sees the pool come back whole. */
+static void die_now(void) { kill(getpid(), SIGKILL); }
+
+static int fork_die(int early) {
+    char *big = malloc(600 * 1024);
+    if (big) memset(big, 3, 600 * 1024);
+    if (early)
+        stafeto_probe_fork_early(die_now);
+    else
+        stafeto_probe_fork_window(die_now);
+    fork();
+    return 1;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -1398,6 +1485,10 @@ static int role(const char *name) {
     if (strcmp(name, "forkpool") == 0) return fork_pool();
     if (strcmp(name, "forkfull") == 0) return fork_full();
     if (strcmp(name, "forkthreads") == 0) return fork_threads();
+    if (strcmp(name, "forkthread") == 0) return fork_thread();
+    if (strcmp(name, "forkmany") == 0) return fork_many();
+    if (strcmp(name, "forkdie") == 0) return fork_die(0);
+    if (strcmp(name, "forkdieearly") == 0) return fork_die(1);
     if (strcmp(name, "execmaking") == 0) return exec_making();
     if (strcmp(name, "memmap") == 0) {
         int bad = map_start();
@@ -1926,6 +2017,28 @@ static void forks(void) {
     run_role("/bin/procs-child", "forkbare", NULL);
     run_role("/bin/procs-child", "forkfull", NULL);
     run_role("/bin/procs-child", "forkthreads", NULL);
+    run_role("/bin/procs-child", "forkthread", NULL);
+    run_role("/bin/procs-child", "forkmany", NULL);
+    /* A parent that dies in the window of its fork leaves nothing: its
+     * loading child and that child's loader go, and the pool is whole. */
+    const char *dying[] = {"forkdie", "forkdieearly"};
+    for (int i = 0; i < 2; i++) {
+        unsigned long long before = stafeto_probe_pool();
+        char *argv[] = {"procs-child", (char *)dying[i], NULL};
+        char *env[] = {NULL};
+        pid_t pid = -1;
+        expect(dying[i], posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, env), 0);
+        reap(dying[i], pid, 0, SIGKILL);
+        unsigned long long after = stafeto_probe_pool();
+        for (int n = 0; n < 100 && after != before; n++) {
+            pause_ms(5);
+            after = stafeto_probe_pool();
+        }
+        if (after != before) {
+            printf("posix-procs: the pool after %s: %llu before, %llu after\n", dying[i], before, after);
+            failures++;
+        }
+    }
     char *making[] = {"procs-child", "execmaking", NULL};
     char *none[] = {NULL};
     pid_t maker = -1;
