@@ -587,3 +587,21 @@ pub const LOADER_CHANNELS_TABLE: &[Record] = &[
     POSIX_PROCS_TABLE[5],
     POSIX_PROCS_TABLE[6],
 ];
+
+/// The readiness probe uses the loader probe's ordinary services and pool.
+pub const POSIX_POLL_TABLE: &[Record] = &[
+    LOADER_CHANNELS_TABLE[0],
+    LOADER_CHANNELS_TABLE[1],
+    LOADER_CHANNELS_TABLE[2],
+    LOADER_CHANNELS_TABLE[3],
+    LOADER_CHANNELS_TABLE[4],
+    LOADER_CHANNELS_TABLE[5],
+    Record {
+        name: "posix-poll",
+        program: "posix-poll",
+        args: b"posix-poll\0",
+        ..LOADER_CHANNELS_TABLE[6]
+    },
+    LOADER_CHANNELS_TABLE[7],
+    LOADER_CHANNELS_TABLE[8],
+];

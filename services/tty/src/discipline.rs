@@ -679,6 +679,20 @@ impl Terminal {
 
     /// Whether a client's write finds room for any byte, a newline that
     /// goes out as two among them.
+    /// Readiness is independent of a future read's VTIME timer. T7 can
+    /// supply a hung-up peer when applying this discipline to a PTY.
+    pub fn readiness(&self, hung_up: bool) -> u32 {
+        use proto_wire::watch;
+        let readable = if self.canonical() {
+            self.cooked != 0
+        } else {
+            self.queue.len != 0 || (self.termios.cc[VMIN] == 0 && self.termios.cc[VTIME] == 0)
+        };
+        (if readable || hung_up { watch::READ } else { 0 })
+            | (if self.writable() { watch::WRITE } else { 0 })
+            | (if hung_up { watch::HUP } else { 0 })
+    }
+
     pub fn writable(&self) -> bool {
         OUTPUT - self.output.len >= ECHO_RESERVE + 3
     }
@@ -689,6 +703,35 @@ mod tests {
     use super::*;
     use proto_tty::VMIN;
     use std::vec::Vec;
+
+    #[test]
+    fn readiness_observes_lines_bytes_and_empty_reads_without_consuming() {
+        use proto_wire::watch;
+        let mut terminal = Terminal::new();
+        assert_eq!(terminal.readiness(false) & watch::READ, 0);
+        terminal.input(b"a", 0);
+        assert_eq!(terminal.readiness(false) & watch::READ, 0);
+        terminal.input(b"\n", 0);
+        assert_ne!(terminal.readiness(false) & watch::READ, 0);
+        let mut out = [0; 8];
+        assert_eq!(terminal.read(&mut out, 0, 0), Read::Ready(2));
+        assert_eq!(terminal.readiness(false) & watch::READ, 0);
+        terminal.input(&[terminal.termios.cc[proto_tty::VEOF]], 0);
+        assert_ne!(terminal.readiness(false) & watch::READ, 0);
+        assert_eq!(terminal.read(&mut out, 0, 0), Read::Ready(0));
+        terminal.termios.lflag &= !proto_tty::ICANON;
+        terminal.termios.cc[VMIN] = 5;
+        terminal.termios.cc[proto_tty::VTIME] = 9;
+        assert_eq!(terminal.readiness(false) & watch::READ, 0);
+        terminal.input(b"x", 0);
+        assert_ne!(terminal.readiness(false) & watch::READ, 0);
+        terminal.flush_input();
+        terminal.termios.cc[VMIN] = 0;
+        assert_eq!(terminal.readiness(false) & watch::READ, 0);
+        terminal.termios.cc[proto_tty::VTIME] = 0;
+        assert_ne!(terminal.readiness(false) & watch::READ, 0);
+        assert_ne!(terminal.readiness(true) & watch::HUP, 0);
+    }
 
     /// Everything for the device, as it went out.
     fn drain(t: &mut Terminal) -> Vec<u8> {

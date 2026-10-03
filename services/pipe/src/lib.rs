@@ -92,12 +92,16 @@ impl End {
             if let Some(w) = self.waiters[i]
                 && keep(w)
             {
-                self.waiters[at] = Some(w);
+                if at != i {
+                    self.waiters[at] = Some(w);
+                }
                 at += 1;
             }
         }
         for slot in &mut self.waiters[at..] {
-            *slot = None;
+            if slot.is_some() {
+                *slot = None;
+            }
         }
     }
 
@@ -295,6 +299,54 @@ impl Pipes {
         let free = end.waiters.iter_mut().find(|w| w.is_none()).ok_or(AGAIN)?;
         *free = Some(waiter);
         Ok(())
+    }
+
+    /// Register a freshly allocated generation key, once per description.
+    /// Its caller canonicalizes the list, so this key cannot already be queued.
+    pub fn wait_new(
+        &mut self,
+        description: u32,
+        waiter: Waiter,
+        alive: impl Fn(Waiter) -> bool,
+    ) -> Result<(), u32> {
+        let (index, is_write) = proto_pipe::end_of(description);
+        let end = self
+            .pipes
+            .get_mut(index)
+            .map(|p| &mut p.ends[is_write as usize])
+            .ok_or(BAD_FD)?;
+        end.keep(alive);
+        let free = end.waiters.iter_mut().find(|w| w.is_none()).ok_or(AGAIN)?;
+        *free = Some(waiter);
+        Ok(())
+    }
+
+    /// Readiness consumes no data and ignores the description's NONBLOCK.
+    /// EOF is readable; peer closure is reported even with no requested events.
+    pub fn readiness(&self, held: &Held, description: u32) -> u32 {
+        use proto_wire::watch;
+        let Ok((index, end)) = split(held, description, None) else {
+            return watch::NVAL;
+        };
+        let pipe = &self.pipes[index];
+        if end == 0 {
+            let closed = pipe.ends[1].refs == 0;
+            (if pipe.len != 0 || closed {
+                watch::READ
+            } else {
+                0
+            }) | (if closed { watch::HUP } else { 0 })
+        } else {
+            (if usize::from(pipe.len) < CAPACITY {
+                watch::WRITE
+            } else {
+                0
+            }) | (if pipe.ends[0].refs == 0 {
+                watch::ERR
+            } else {
+                0
+            })
+        }
     }
 
     /// The operation `waiter` waits at `description` no more.
@@ -502,6 +554,28 @@ mod tests {
 
     fn woke(w: &Wakes) -> Vec<Waiter> {
         w.iter().collect()
+    }
+
+    #[test]
+    fn readiness_preserves_data_and_reports_peer_closure() {
+        use proto_wire::watch;
+        let mut p = pipes();
+        let mut held = Held::default();
+        let (rd, wr) = p.create(&mut held, 1, 1, NONBLOCK).unwrap();
+        assert_eq!(p.readiness(&held, rd), 0);
+        assert_eq!(p.readiness(&held, wr), watch::WRITE);
+        let mut wakes = Wakes::default();
+        p.write(&held, wr, b"x", &mut wakes).unwrap();
+        assert_eq!(p.readiness(&held, rd), watch::READ);
+        p.close(&mut held, wr, &mut wakes).unwrap();
+        assert_eq!(p.readiness(&held, rd), watch::READ | watch::HUP);
+        let mut out = [0];
+        assert_eq!(p.read(&held, rd, &mut out, &mut wakes), Ok(Some(1)));
+        assert_eq!(out, *b"x");
+        assert_eq!(p.readiness(&held, rd), watch::READ | watch::HUP);
+        let (rd2, wr2) = p.create(&mut held, 1, 1, 0).unwrap();
+        p.close(&mut held, rd2, &mut wakes).unwrap();
+        assert_eq!(p.readiness(&held, wr2), watch::WRITE | watch::ERR);
     }
 
     /// The writer in one session, the reader in another (a clone): the

@@ -390,7 +390,11 @@ pub fn run_in<S: Service<K>, const K: usize>(
     // the next request.
     let mut buffer = [0; MESSAGE_MAX];
     loop {
-        let notice = match sys::receive(channel) {
+        #[cfg(feature = "step-stats")]
+        let (began, incoming) = sys::receive_measured(channel);
+        #[cfg(not(feature = "step-stats"))]
+        let incoming = sys::receive(channel);
+        let notice = match incoming {
             Err(e) => return e,
             Ok(Received::Message {
                 label,
@@ -406,6 +410,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                     msgbuf::read(0, bytes);
                 }
                 let kind = steps::kind_of(bytes);
+                #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
                 request(service, table, config.issued, label, bytes, handles, token);
                 steps::end(began, kind);
@@ -423,6 +428,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 count,
             },
         };
+        #[cfg(not(feature = "step-stats"))]
         let began = steps::begin();
         match (notice.source, notice.label, &mut beat) {
             (Source::Timer, 0, Some(beat)) => beat.expired(),
@@ -460,7 +466,9 @@ pub fn run_in<S: Service<K>, const K: usize>(
 
 /// The longest step of the loop (feature `step-stats`, which only the
 /// images of measurements and tests turn on): the ticks from the return of
-/// `receive` to the handler's end and its reply, for each method of the
+/// the Receive SVC to the handler's end and its reply, including register
+/// decode, message copying, header and session lookup. Kernel receive and
+/// idle before its return are outside the interval. For each method of the
 /// protocol and for notifications. A new longest of a kind goes to the
 /// console as a line `service step: T kind K N ticks detail D` after the step, so that
 /// the print does not count in it (`report_steps` turns it on and gives the tag T); K is the
@@ -477,6 +485,9 @@ mod steps {
     /// Whether the step in progress counts as `OWN`.
     static OWNED: AtomicBool = AtomicBool::new(false);
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static FULL: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static QUIET: AtomicBool = AtomicBool::new(false);
     /// A number the handler of the step gives (`super::step_detail`), for
     /// the line a new longest prints.
     static DETAIL: AtomicU64 = AtomicU64::new(0);
@@ -485,6 +496,20 @@ mod steps {
 
     pub fn report(tag: u8) {
         REPORT.store(tag, Ordering::Relaxed);
+    }
+
+    pub fn quiet() {
+        QUIET.store(true, Ordering::Relaxed);
+    }
+    pub fn maximum(kind: usize) -> Option<(u64, u64)> {
+        Some((
+            LONGEST.get(kind)?.load(Ordering::Relaxed),
+            DETAILS[kind].load(Ordering::Relaxed),
+        ))
+    }
+
+    pub fn full(kind: usize) -> Option<(u64, u64)> {
+        Some((FULL.get(kind)?.load(Ordering::Relaxed), 32))
     }
 
     pub fn detail(value: u64) {
@@ -500,10 +525,6 @@ mod steps {
         }
     }
 
-    pub fn begin() -> u64 {
-        super::time::now()
-    }
-
     pub fn own() {
         OWNED.store(true, Ordering::Relaxed);
     }
@@ -516,9 +537,15 @@ mod steps {
             kind
         };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
+        if detail == 32 {
+            FULL[kind].fetch_max(took, Ordering::Relaxed);
+        }
         let tag = REPORT.load(Ordering::Relaxed);
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && tag != 0 {
-            crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
+            DETAILS[kind].store(detail, Ordering::Relaxed);
+            if tag != 0 && !QUIET.load(Ordering::Relaxed) {
+                crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+            }
         }
     }
 }
@@ -543,6 +570,49 @@ mod steps {
 /// that count their steps get the lines of the one that asked.
 pub fn report_steps(tag: u8) {
     steps::report(tag);
+}
+
+/// Records complete steps without printing between requests. Measurement
+/// images read the bounded maxima after their workload, with the same clocks.
+#[cfg(feature = "step-stats")]
+pub fn quiet_steps() {
+    steps::quiet();
+}
+
+/// One measurement maximum and its own detail, including notification kinds.
+#[cfg(feature = "step-stats")]
+pub fn step_maximum(kind: usize) -> Option<(u64, u64)> {
+    steps::maximum(kind)
+}
+
+/// Measurement-only request: kind u32, optional detail u64 (32), then maximum.
+#[cfg(feature = "step-stats")]
+pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
+    let mut body = r.body();
+    let kind = match body.u32() {
+        Ok(kind) if r.handles.is_empty() => kind as usize,
+        _ => return Answer::Status(Status::BadSize),
+    };
+    let maximum = if body.left() == 0 {
+        step_maximum(kind)
+    } else {
+        match body.u64() {
+            Ok(32) => steps::full(kind),
+            _ => None,
+        }
+    };
+    let Some((ticks, detail)) = maximum.filter(|_| body.finish().is_ok()) else {
+        return Answer::Status(Status::BadSize);
+    };
+    if r.reply()
+        .u32(0)
+        .and_then(|()| r.reply().u64(ticks))
+        .and_then(|()| r.reply().u64(detail))
+        .is_err()
+    {
+        return Answer::Status(Status::BadSize);
+    }
+    Answer::Reply(Outgoing::new())
 }
 
 /// Counts the notification step in progress apart from the others (feature

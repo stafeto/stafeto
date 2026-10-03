@@ -159,6 +159,15 @@ impl<const N: usize> Waiters<N> {
         }
     }
 
+    /// Stale generation keys are discarded before a new subscription.
+    pub fn retain(&mut self, mut alive: impl FnMut(u64, u64) -> bool) {
+        for place in &mut self.list {
+            if place.is_some_and(|w| !alive(w.label, w.key)) {
+                *place = None;
+            }
+        }
+    }
+
     /// Every waiter of `label` goes.
     pub fn remove_all(&mut self, label: u64) {
         for place in &mut self.list {
