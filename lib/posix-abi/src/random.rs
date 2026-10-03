@@ -121,7 +121,7 @@ fn key(nonblock: bool) -> Result<[u8; KEY], i32> {
         _ => None,
     };
     let mut out = [0; KEY];
-    let n = crate::long::run_with(&service, start.as_bytes(), keyed, &mut out, &refusal)?;
+    let n = crate::long::run_no_point(&service, start.as_bytes(), keyed, &mut out, &refusal)?;
     if n != KEY {
         posix_random::erase(&mut out);
         return Err(EIO);
@@ -136,20 +136,17 @@ const PAUSE_MOST_MS: i64 = 50;
 /// A key of the service (`key`). EAGAIN of a request that may wait means
 /// every place for a waiting seed in the service, or of the process's
 /// session, is taken: the request goes again after a pause by the clock,
-/// 1, 2, 4 ms and so on up to 50 ms, which lets every level run. The
-/// pause is a point of cancellation, and a caught signal ends it with
-/// EINTR, as the wait in the service does.
+/// 1, 2, 4 ms and so on up to 50 ms, which lets every level run. Neither
+/// the pause nor the wait in the service is a point of cancellation
+/// (getentropy, getrandom and arc4random are none, XSH 2.9.5): a request
+/// of cancellation stays for the thread's next point; a caught signal ends
+/// either with EINTR.
 fn key_waiting(nonblock: bool) -> Result<[u8; KEY], i32> {
     let mut pause = PAUSE_FIRST_MS;
     loop {
         match key(nonblock) {
             Err(EAGAIN) if !nonblock => {
-                let time = posix_types::Timespec {
-                    tv_sec: 0,
-                    tv_nsec: pause * 1_000_000,
-                };
-                crate::threads::sleep::clock_nanosleep(crate::clock::CLOCK_MONOTONIC, 0, time)
-                    .map_err(|(errno, _)| errno)?;
+                crate::threads::sleep::pause(pause * 1_000_000)?;
                 pause = (pause * 2).min(PAUSE_MOST_MS);
             }
             other => return other,

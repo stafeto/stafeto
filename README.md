@@ -195,6 +195,10 @@ Apple silicon.
   `init` started has 48 of them (`ENFILE`), 96 of the 128 blocking reads
   and writes that may wait (`EAGAIN` past them, and past 8 at one end or
   16 in one process) and 255 sessions of the service's 320.
+- Random numbers come from the Virtio entropy device alone. After a
+  restart of the entropy service the processes that ran before keep their
+  generators but not their session: their children get `ENOSYS` from
+  `getentropy`, and `arc4random` ends them.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 

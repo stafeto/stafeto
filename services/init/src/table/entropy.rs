@@ -54,7 +54,10 @@ const DMA: &[Dma] = &[Dma {
     uncached: true,
 }];
 
-/// The driver on QEMU: level 45, above the entropy service, its client.
+/// The driver on QEMU: level 37, above the entropy service, its client.
+/// Both stay below the services at 40 (RAM files, processes, pipes), which
+/// never call them: at 45 and 44 the service's CLONE for each child ran
+/// inside their steps (READ_INTO 23,664 ticks against term B 20,536).
 pub const RNG: Record = Record {
     name: "rng",
     program: "virtio-rng",
@@ -62,8 +65,8 @@ pub const RNG: Record = Record {
         period_ns: 250 * MS,
         deadline_ns: 1000 * MS,
     }),
-    priority: 45,
-    ceiling: 45,
+    priority: 37,
+    ceiling: 37,
     quota: 48 * PAGE,
     handle_limit: 32,
     restart: Restart::Always,
@@ -143,8 +146,8 @@ pub const RNG_VZ: Record = Record {
     ..RNG
 };
 
-/// The entropy service: level 44, under its driver and above every POSIX
-/// process (whose ceilings stay at 39 or below).
+/// The entropy service: level 36, under its driver and above every POSIX
+/// process (whose ceilings stay at 31 in the tables).
 pub const ENTROPY: Record = Record {
     name: "entropy",
     program: "entropy",
@@ -152,8 +155,8 @@ pub const ENTROPY: Record = Record {
         period_ns: 250 * MS,
         deadline_ns: 1000 * MS,
     }),
-    priority: 44,
-    ceiling: 44,
+    priority: 36,
+    ceiling: 36,
     quota: 64 * PAGE,
     // A handle for each of the 64 seeds that may wait (the copy each
     // brings), beside the service's own.
@@ -198,11 +201,13 @@ const PROBE: Record = Record {
 };
 
 /// A second client of the service: its key differs from the first's; on
-/// QEMU it seeds again after the service's reseed (roles `psw`).
+/// QEMU it seeds again after the service's reseed, then fills the service's
+/// table of clones (roles `pswx`), with room for their handles.
 const PROBE_B: Record = Record {
     name: "entropy-probe-b",
     connects: &["entropy"],
-    args: b"psw",
+    args: b"pswx",
+    handle_limit: 512,
     ..PROBE
 };
 

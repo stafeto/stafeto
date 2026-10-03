@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -252,10 +253,45 @@ static void pause_ms(long ms) {
     }
 }
 
+/*
+ * Beside the main thread's wait before the first seed: a thread in
+ * arc4random gets SIGUSR2, whose handler has no SA_RESTART, and goes on
+ * (arc4random has no way to fail); a thread in getentropy gets a request
+ * of cancellation, and getentropy, no point of cancellation, returns its
+ * bytes; the request waits for the thread's next point.
+ */
+static volatile sig_atomic_t usr2_ran, arc4_done, cancel_returned;
+static pthread_t arc4_thread, cancel_thread;
+static uint32_t arc4_value;
+
+static void on_usr2(int sig) {
+    (void)sig;
+    usr2_ran = 1;
+}
+
+static void *in_arc4random(void *arg) {
+    (void)arg;
+    arc4_value = arc4random();
+    arc4_done = 1;
+    return NULL;
+}
+
+static void *in_getentropy(void *arg) {
+    (void)arg;
+    unsigned char bytes[32];
+    if (getentropy(bytes, sizeof bytes) == 0 && !all_zero(bytes, sizeof bytes)) cancel_returned = 1;
+    pthread_testcancel();
+    return NULL;
+}
+
 static void *poker(void *arg) {
     (void)arg;
     pause_ms(100);
     pthread_kill(main_thread, SIGUSR1);
+    if (nested_mode == 0) {
+        pthread_kill(arc4_thread, SIGUSR2);
+        pthread_cancel(cancel_thread);
+    }
     if (nested_mode == 1) {
         pause_ms(100);
         if (write(outer_pipe[1], "o", 1) != 1) return (void *)1;
@@ -263,6 +299,29 @@ static void *poker(void *arg) {
         if (write(inner_pipe[1], "i", 1) != 1) return (void *)2;
     }
     return NULL;
+}
+
+/* Two threads read /dev/urandom at once, each through its own descriptor. */
+static unsigned char urandom_bytes[2][4096];
+
+static void *read_urandom(void *arg) {
+    unsigned char *out = urandom_bytes[(long)arg];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return (void *)1;
+    ssize_t n = read_all(fd, out, sizeof urandom_bytes[0]);
+    close(fd);
+    return n == (ssize_t)sizeof urandom_bytes[0] ? NULL : (void *)2;
+}
+
+static int urandom_threads(void) {
+    pthread_t t[2];
+    void *ended[2] = {(void *)9, (void *)9};
+    for (long i = 0; i < 2; i++) CHECK(pthread_create(&t[i], NULL, read_urandom, (void *)i) == 0);
+    for (int i = 0; i < 2; i++) CHECK(pthread_join(t[i], &ended[i]) == 0 && ended[i] == NULL);
+    CHECK(memcmp(urandom_bytes[0], urandom_bytes[1], sizeof urandom_bytes[0]) != 0);
+    CHECK(!all_zero(urandom_bytes[0], 4096) && !all_zero(urandom_bytes[1], 4096));
+    printf("posix-random: two threads read 4096 bytes of /dev/urandom at once, all different\n");
+    return 0;
 }
 
 static int nested(void) {
@@ -280,14 +339,29 @@ static int nested(void) {
     CHECK(getrandom(outer, sizeof outer, GRND_NONBLOCK) == -1);
     CHECK(errno == EAGAIN);
     printf("posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN\n");
+    struct sigaction quiet;
+    memset(&quiet, 0, sizeof quiet);
+    quiet.sa_handler = on_usr2;
+    CHECK(sigaction(SIGUSR2, &quiet, NULL) == 0);
     nested_mode = 0;
     nested_done = 0;
+    CHECK(pthread_create(&arc4_thread, NULL, in_arc4random, NULL) == 0);
+    CHECK(pthread_create(&cancel_thread, NULL, in_getentropy, NULL) == 0);
     CHECK(pthread_create(&t, NULL, poker, NULL) == 0);
     CHECK(getentropy(outer, sizeof outer) == 0);
     CHECK(pthread_join(t, &poked) == 0 && poked == NULL);
     CHECK(nested_done == 1);
     CHECK(!all_zero(outer, sizeof outer));
     printf("posix-random: getentropy waited for the first seed with another inside a handler\n");
+    void *ended = NULL;
+    CHECK(pthread_join(arc4_thread, &ended) == 0 && ended == NULL);
+    CHECK(usr2_ran == 1 && arc4_done == 1);
+    printf("posix-random: arc4random went on after a handler without SA_RESTART (%08x)\n",
+           (unsigned)arc4_value);
+    CHECK(pthread_join(cancel_thread, &ended) == 0);
+    CHECK(ended == PTHREAD_CANCELED && cancel_returned == 1);
+    printf("posix-random: getentropy is no point of cancellation: it returned, the next point "
+           "cancelled\n");
     CHECK(pipe(outer_pipe) == 0 && pipe(inner_pipe) == 0);
     nested_mode = 1;
     nested_done = 0;
@@ -300,7 +374,7 @@ static int nested(void) {
     CHECK(close(outer_pipe[0]) == 0 && close(outer_pipe[1]) == 0);
     CHECK(close(inner_pipe[0]) == 0 && close(inner_pipe[1]) == 0);
     printf("posix-random: a pipe read went on after another inside a handler\n");
-    return 0;
+    return urandom_threads();
 }
 
 static int first(void) {

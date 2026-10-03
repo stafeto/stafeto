@@ -16,6 +16,9 @@
 //!   and a fill.
 //! - `w`: a wait of 61 s, past the service's reseed, then a SEED with
 //!   NONBLOCK.
+//! - `x`: CLONE until the service refuses: the clones of a session, then
+//!   those of its clones, until its table of live clones is full, so that
+//!   its step of CLONE is measured with the table full.
 //! - `p`: WAITERS SEED at once, on two sessions, before the device's first bytes (the
 //!   service's build `slow-start` delays them), each WAIT k, each armed
 //!   with a labelled copy; the service tells them all once the bytes come,
@@ -87,6 +90,7 @@ fn main(_: u64) -> u64 {
             b'c' => probe.crash(),
             b'w' => probe.later(),
             b'p' => probe.waiters(),
+            b'x' => probe.clones(),
             _ => Err("an unknown role"),
         };
     }
@@ -297,6 +301,54 @@ impl Probe<'_> {
             }
         }
         rt::println!("entropy-probe: {WAITERS} seeds waited for the first bytes, {armed} told");
+        Ok(())
+    }
+
+    /// Role `x`: clones of the service's sessions, each kept, until the
+    /// service refuses with LIMIT_REACHED (48 a client, 320 in all); the
+    /// line gives how many.
+    fn clones(&mut self) -> Result<(), &'static str> {
+        const MOST: usize = 400;
+        let mut sessions: [Option<Handle<Channel>>; MOST] = [const { None }; MOST];
+        sessions[0] =
+            Some(rt::service::connect(self.parent, "entropy").map_err(|_| "connect to entropy")?);
+        let mut made = 1;
+        let request = Method::Clone.header().bytes();
+        // Each session clones PER_CLIENT times (proto_wire::clones), then
+        // the next clone clones; a refusal of a session below that count
+        // is the service's table full.
+        const PER_CLIENT: usize = 48;
+        let mut from = 0;
+        let mut of_from = 0;
+        let full = loop {
+            if made == MOST || from >= made {
+                break false;
+            }
+            if of_from == PER_CLIENT {
+                from += 1;
+                of_from = 0;
+                continue;
+            }
+            let Some(parent) = sessions[from].as_ref() else {
+                break false;
+            };
+            match rt::service::clone_session(parent, &request) {
+                Ok(clone) => {
+                    sessions[made] = Some(clone);
+                    made += 1;
+                    of_from += 1;
+                }
+                Err(Status::Kernel(Error::LimitReached)) => break true,
+                Err(_) => return Err("a refusal of CLONE"),
+            }
+        };
+        if !full {
+            return Err("the table of clones never filled");
+        }
+        rt::println!(
+            "entropy-probe: the service's table of clones is full: {} clones",
+            made - 1
+        );
         Ok(())
     }
 

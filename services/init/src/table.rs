@@ -1471,24 +1471,24 @@ mod tests {
             order_of(ramfs::BUSYBOX_DIALOG_TABLE),
             [
                 "uart",
-                "rng",
-                "entropy",
                 "ramfs",
                 "posix",
                 "clock",
                 "pipe",
+                "rng",
+                "entropy",
                 "busybox-probe"
             ]
         );
         assert_eq!(
             order_of(ramfs::OS_TEST_TABLE),
             [
-                "rng",
-                "entropy",
                 "ramfs",
                 "posix",
                 "clock",
                 "pipe",
+                "rng",
+                "entropy",
                 "os-test-run"
             ]
         );
@@ -1512,12 +1512,12 @@ mod tests {
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),
             [
-                "rng",
-                "entropy",
                 "ramfs",
                 "posix",
                 "clock",
                 "pipe",
+                "rng",
+                "entropy",
                 "posix-procs"
             ]
         );
@@ -1526,14 +1526,14 @@ mod tests {
                 order_of(table),
                 [
                     "console",
-                    "rng",
-                    "entropy",
                     "ramfs",
                     "posix",
                     "clock",
                     "pipe",
                     "uart",
                     "rtbench-load",
+                    "rng",
+                    "entropy",
                     "rtbench-posix"
                 ]
             );

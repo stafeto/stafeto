@@ -96,9 +96,11 @@ impl Drop for OuterRestart {
 }
 
 /// Whether the wait of the operation ends with "cancel k": a request of
-/// cancellation, or a handler without SA_RESTART ran since it started.
-fn ending(flags: &core::sync::atomic::AtomicU32) -> bool {
-    crate::threads::cancel::requested() || flags.load(Ordering::SeqCst) & flag::NO_RESTART != 0
+/// cancellation when the operation is a point of cancellation (`point`),
+/// or a handler without SA_RESTART ran since it started.
+fn ending(flags: &core::sync::atomic::AtomicU32, point: bool) -> bool {
+    (point && crate::threads::cancel::requested())
+        || flags.load(Ordering::SeqCst) & flag::NO_RESTART != 0
 }
 
 /// Runs a long operation on `service`: `start` is its first request,
@@ -129,6 +131,31 @@ pub fn run_with(
     keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
     out: &mut [u8],
     refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(service, start, keyed, out, refusal, true)
+}
+
+/// `run_with` for an operation that is no point of cancellation
+/// (getentropy, getrandom, arc4random; XSH 2.9.5 allows no new points): a
+/// request of cancellation leaves the wait alone and stays for the next
+/// point; a handler without SA_RESTART still ends it with EINTR.
+pub fn run_no_point(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(service, start, keyed, out, refusal, false)
+}
+
+fn run_in(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+    point: bool,
 ) -> Result<usize, i32> {
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
@@ -163,7 +190,7 @@ pub fn run_with(
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => {}
                 Ok(_) => break 'wait Some(EIO),
-                Err(EINTR) if ending(&block.flags) => break 'wait None,
+                Err(EINTR) if ending(&block.flags, point) => break 'wait None,
                 Err(EINTR) => armed = false,
                 Err(error) => break 'wait Some(error),
             }
@@ -180,7 +207,7 @@ pub fn run_with(
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => armed = true,
                 Ok(_) => break 'wait Some(EIO),
-                Err(EINTR) if ending(&block.flags) => break 'wait None,
+                Err(EINTR) if ending(&block.flags, point) => break 'wait None,
                 Err(EINTR) => continue,
                 Err(error) => break 'wait Some(error),
             }
@@ -189,7 +216,7 @@ pub fn run_with(
         // blocks; one that comes from here on stays pending and makes
         // `receive` return at once.
         let guard = rt::upcall::defer_entries().map_err(|_| EIO)?;
-        if ending(&block.flags) {
+        if ending(&block.flags, point) {
             drop(guard);
             break 'wait None;
         }
@@ -211,7 +238,7 @@ pub fn run_with(
                     Ok((long::READY, n, _)) => return Ok(n),
                     Ok((long::ARMED, _, _)) => {}
                     Ok(_) => break 'wait Some(EIO),
-                    Err(EINTR) if ending(&block.flags) => break 'wait None,
+                    Err(EINTR) if ending(&block.flags, point) => break 'wait None,
                     // The service told once and keeps the result for the
                     // next "take"; it tells no second time, so the take
                     // goes again with a new copy and does not wait.
@@ -223,12 +250,15 @@ pub fn run_with(
                 source: Source::Unlabeled,
                 bits,
                 ..
-            }) if bits & posix_sync::bit::CANCEL != 0 && crate::threads::cancel::requested() => {
+            }) if point
+                && bits & posix_sync::bit::CANCEL != 0
+                && crate::threads::cancel::requested() =>
+            {
                 break 'wait None;
             }
             Ok(_) => {}
             Err(Error::Interrupted) => {
-                if ending(&block.flags) {
+                if ending(&block.flags, point) {
                     break 'wait None;
                 }
                 // Every handler that ran had SA_RESTART: wait on.

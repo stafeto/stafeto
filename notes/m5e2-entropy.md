@@ -77,15 +77,19 @@ not separated.
 | Step | Ticks |
 |---|---|
 | entropy service, SEED | 5,623 |
-| entropy service, a seed with 32 waiting | 10,208 |
-| entropy service, the feeder's bytes | 5,452 |
-| entropy service, heartbeat | 5,064 |
+| entropy service, SEED_TAKE | 3,990 |
+| entropy service, own step with 64 seeds waiting (8 told a step) | 10,684 |
+| entropy service, CLONE with its table of 320 live clones full | 14,398 |
+| entropy service, heartbeat | 5,261 |
 | virtio-rng, FILL_START | 1,948 |
 | virtio-rng, FILL_TAKE | 4,444 |
 | virtio-rng, interrupt | 1,934 |
 
-Every step is below B. Reads of the devices add no step: the layer serves
-them. The services run beside the RAM and process services in the images
+Every step is below B. CLONE grows with the live clones (a walk of the
+table of 320 places in `proto_wire::clones`, as in the clock and pipe
+services); the number above is its longest, with the table full (role `x`
+of the probe). Splitting it into O(1) for the three services is a task of
+its own. Reads of the devices add no step: the layer serves them. The services run beside the RAM and process services in the images
 of the dialog, `posix-procs`, os-test and rtbench; `ci` ran in 6 min 33 s,
 `hvf` in 3 min 23 s, and the seven probes of VZ passed.
 
@@ -147,24 +151,29 @@ Each was applied, the affected set run, then reverted.
 - **Reads wait for the first key.** A read, `getrandom` without
   `GRND_NONBLOCK` and `getentropy` wait for the entropy service's first
   bytes (a few milliseconds after boot); `O_NONBLOCK` of a device has no
-  effect, and a signal handler without `SA_RESTART` ends the wait with
-  `EINTR`. `/dev/random` and `/dev/urandom` are the same generator and never
-  block after the first key.
+  effect. A signal handler without `SA_RESTART` ends the wait of a read
+  and of `getrandom` with `EINTR`; `getentropy` and `arc4random` wait on.
+  None of them is a point of cancellation: a request of cancellation waits
+  for the thread's next point. `/dev/random` and `/dev/urandom` are the
+  same generator and never block after the first key.
 - **No `pread` and `pwrite` on the devices** (`ESPIPE`); `lseek` takes any
   offset and has no effect.
 - **Without the service**: a read of a node and `getrandom` give `ENOSYS`,
   `arc4random` ends the process. Images other than those listed above (for
   instance the POSIX probes of Apple VZ other than rtbench, which have no
   table of files) have no nodes.
-- **The steps image runs the driver and the service at 37 and 36**, below
-  the services at 40. `process-steps` measures a step from the service's
-  receive to its reply under -icount; at their own levels (45, 44) the
-  entropy service's CLONE for each child of the crowd ran inside the RAM
-  service's READ_INTO and showed there (23,664 ticks). With them below it
-  READ_INTO reads 19,513 ticks (19,369 with no entropy service at all), so
-  the difference was their work, no cost of the RAM service. Their own
-  steps are measured in the same run: CLONE grows with the live clones and
-  reads 13,414 ticks with the crowd, under term B.
+- **The driver and the service run at 37 and 36 in every image**, below
+  the services at 40, which never call them, and above the POSIX processes
+  (ceilings 30 and 31). At 45 and 44 the service's CLONE for each child of
+  the crowd ran inside the RAM service's READ_INTO in `process-steps` and
+  showed there (23,664 ticks); below it READ_INTO reads 19,513 ticks
+  (19,369 with no entropy service at all), so the difference was their
+  work, no cost of the RAM service. CLONE reads 13,414 ticks with the crowd
+  and 14,398 with the table of clones full.
+- **A restart of the entropy service** leaves the old processes with a
+  dead session: their generators go on with their keys, a child they start
+  gets no session (`getentropy` gives ENOSYS there and `arc4random` ends
+  the process). The layer connects again in a later step.
 - **The nodes' mode** is 0666 and the service checks no permission at open.
 - **The reads of the devices do not reach the RAM service**, so its access
   time of them does not move.
@@ -179,7 +188,7 @@ Each was applied, the affected set run, then reverted.
 - **Interface 13** of the platform and the loader slot 10 may meet step
   5e's numbers when the branches merge; the second to merge raises them.
 
-## Readiness criteria of 5e' (issue #175)
+## Readiness criteria of 5e'
 
 1. **The entropy service, a Virtio entropy driver in user space (QEMU and
    VZ), `RNDR` checked under HVF**: done. The driver runs on QEMU's

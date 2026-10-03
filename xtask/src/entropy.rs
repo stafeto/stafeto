@@ -101,11 +101,16 @@ const RNG_STEP_KINDS: [(usize, &str); 3] = [(1, "FillStart"), (2, "FillTake"), (
 /// the seeds that waited for the first bytes (the service's build
 /// `slow-start`), and its own steps: the feeder's bytes (a seed or a
 /// reseed) and each part of the seeds that waited, told.
-const ENTROPY_STEP_KINDS: [(usize, &str); 3] = [
+const ENTROPY_STEP_KINDS: [(usize, &str); 4] = [
     (5, "Seed"),
     (6, "SeedTake"),
+    (8, "Clone, the table of clones full"),
     (65, "the feeder's bytes and the tells"),
 ];
+/// The line of the probe's role `x` (QEMU): CLONE with the service's
+/// table of live clones full, so the measured CLONE (kind 8) is its
+/// longest: the walk of the table grows with the live clones.
+const CLONES_FULL: &str = "entropy-probe: the service's table of clones is full: 320 clones";
 
 /// What a run of the probe printed, judged: the driver started twice, each
 /// time with the device's status 0 (`driver`), the fills came before and
@@ -138,6 +143,7 @@ pub fn verdict(lines: &[String], driver: &str, reseed: bool) -> Result<(), Strin
     if reseed {
         wanted.push((LATER, 1));
         wanted.push((WAITED, 2));
+        wanted.push((CLONES_FULL, 1));
     }
     for (marker, n) in wanted {
         if count(marker) != n {
@@ -296,10 +302,13 @@ pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 15] = [
+const RANDOM_LINES: [&str; 18] = [
     "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
     "posix-random: getentropy waited for the first seed with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
+    "posix-random: arc4random went on after a handler without SA_RESTART",
+    "posix-random: getentropy is no point of cancellation: it returned, the next point cancelled",
+    "posix-random: two threads read 4096 bytes of /dev/urandom at once, all different",
     "posix-random: getentropy gave 256 bytes twice, they differ",
     "posix-random: getentropy of 257 bytes gave EINVAL",
     "posix-random: getrandom: GRND_NONBLOCK and GRND_RANDOM give every byte, bad flags EINVAL",
@@ -351,7 +360,7 @@ mod tests {
     const B: &str =
         "entropy-probe: key 0202020202020202020202020202020202020202020202020202020202020202";
 
-    const GOOD: [&str; 20] = [
+    const GOOD: [&str; 21] = [
         DRIVER_LINE,
         SEEDED,
         WAITED,
@@ -370,6 +379,7 @@ mod tests {
         OK,
         "entropy: reseeded from the device (1)",
         LATER,
+        CLONES_FULL,
         OK,
         ENDED_B,
     ];
@@ -380,7 +390,7 @@ mod tests {
         // On VZ the second client takes no key after the reseed.
         let vz: Vec<_> = GOOD
             .iter()
-            .filter(|l| **l != LATER && **l != WAITED)
+            .filter(|l| **l != LATER && **l != WAITED && **l != CLONES_FULL)
             .copied()
             .collect();
         assert_eq!(verdict(&lines(&vz), DRIVER_LINE, false), Ok(()));
@@ -407,7 +417,7 @@ mod tests {
     fn the_service_must_give_two_clients_two_keys_and_keys_at_once() {
         assert!(verdict(&with(7, A), DRIVER_LINE, true).is_err());
         assert!(verdict(&with(7, "entropy-probe: key 02"), DRIVER_LINE, true).is_err());
-        for i in [1, 2, 4, 5, 6, 12, 16, 17, 18] {
+        for i in [1, 2, 4, 5, 6, 12, 16, 17, 18, 19] {
             assert!(verdict(&without(i), DRIVER_LINE, true).is_err(), "line {i}");
         }
     }
@@ -436,11 +446,12 @@ mod tests {
             step(10, 64, 90_000),
             step(11, 5, 1200),
             step(11, 6, 1300),
+            step(11, 8, 9000),
             step(11, 65, 2000),
         ];
         assert_eq!(
             steps_verdict(&good).map(|[a, b]| (a.len(), b.len())),
-            Ok((4, 3))
+            Ok((4, 4))
         );
         let mut long = good.clone();
         long.push(step(11, 6, RAM_STEP_MAX + 1));
@@ -448,7 +459,7 @@ mod tests {
         let mut long = good.clone();
         long.push(step(10, 65, RAM_STEP_MAX + 1));
         assert!(steps_verdict(&long).is_err());
-        for i in [0, 1, 2, 4, 5, 6] {
+        for i in [0, 1, 2, 4, 5, 6, 7] {
             let mut missing = good.clone();
             missing.remove(i);
             assert!(steps_verdict(&missing).is_err(), "row {i}");
