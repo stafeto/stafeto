@@ -2126,7 +2126,7 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
-const PIPE_STEP_KINDS: [(usize, &str); 13] = [
+const PIPE_STEP_KINDS: [(usize, &str); 15] = [
     (1, "Create"),
     (2, "ReadStart"),
     (3, "ReadTake"),
@@ -2136,10 +2136,12 @@ const PIPE_STEP_KINDS: [(usize, &str); 13] = [
     (7, "WriteCancel"),
     (8, "Close"),
     (9, "Clone"),
+    (10, "GetFlags"),
+    (11, "SetFlags"),
     (12, "Stat"),
     (13, "Abandon"),
     (64, "notification"),
-    (65, "own step"),
+    (65, "own step: a description let go of, a session gone"),
 ];
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
@@ -2298,9 +2300,10 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     }
     // Every step of the pipe service (5e) stays under term B: a copy of
     // one message and up to 8 notifications, one description of a session
-    // that went, a Clone of up to 32 ends. The probe's role steppipes
-    // makes each of them at its longest.
-    for kind in [2, 3, 5, 6, 9, 65] {
+    // that went, a Clone of up to 32 ends, the cancels, the flags, Stat
+    // and Abandon. The probe's role steppipes makes each of them, the
+    // first ones at their longest.
+    for kind in [2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 65] {
         let ticks = pipe.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
         if ticks == 0 || ticks > RAM_STEP_MAX {
             return Err(format!(
@@ -2308,10 +2311,12 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             ));
         }
     }
-    // The heartbeats and the departures of sessions (64) come whenever the
-    // clock and the sessions do, and a volley of the crowd's processes at a
-    // higher level may run in the middle of one: they are not the pipe
-    // service's work, whose own steps the kind 65 counts.
+    // The kind 64 holds the loop's heartbeat alone: the pipe service
+    // counts each of its own notifications (the step of a description, the
+    // departure of a session or of a clone that never sent) as 65. A
+    // heartbeat waits for init's reply, and a volley of the crowd's
+    // processes at a higher level may run in the middle of it: its ticks
+    // are no work of the pipe service.
     if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
     }

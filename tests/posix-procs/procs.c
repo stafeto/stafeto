@@ -782,16 +782,16 @@ static void steps_setup(void) {
 }
 
 /* The role stepfork: five forks, each child ends, after the heap grew by
- * 128 KiB (the child's quota is the steps probe's, 1 MiB, of which the
+ * 64 KiB (the child's quota is the steps probe's, 1 MiB, of which the
  * program takes about 800 KiB). */
 static int steps_fork(void) {
-    char *heap = malloc(128 * 1024);
+    char *heap = malloc(64 * 1024);
     if (!heap) {
-        printf("posix-procs: steps: malloc of 128 KiB gave %d with %llu bytes used\n", errno,
+        printf("posix-procs: steps: malloc of 64 KiB gave %d with %llu bytes used\n", errno,
                stafeto_probe_memory_used());
         return 60;
     }
-    memset(heap, 1, 128 * 1024);
+    memset(heap, 1, 64 * 1024);
     for (int i = 0; i < 5; i++) {
         pid_t pid = fork();
         if (pid == 0) _exit(7);
@@ -821,6 +821,14 @@ static void keep_one(int keep) {
             if (ends_of_steps[i][e] != keep) close(ends_of_steps[i][e]);
         }
     }
+}
+
+/* Waits at the read end `arg` until its end of the data. */
+static void *step_waiter(void *arg) {
+    char byte;
+    while (read(*(int *)arg, &byte, 1) > 0) {
+    }
+    return NULL;
 }
 
 static int steps_pipes(void) {
@@ -879,6 +887,46 @@ static int steps_pipes(void) {
     for (int t = 0; t < 8; t++) {
         if (waitpid(writers[t], &status, 0) != writers[t] || status != 0) return 78;
     }
+    /* The flags and the node of an end. */
+    struct stat st;
+    if (fcntl(ends_of_steps[2][0], F_SETFL, O_NONBLOCK) != 0 || fcntl(ends_of_steps[2][0], F_GETFL) < 0 ||
+        fcntl(ends_of_steps[2][0], F_SETFL, 0) != 0 || fstat(ends_of_steps[2][0], &st) != 0)
+        return 79;
+    /* A read and a write that SIGUSR1 ends: their cancels. A child sends
+     * the signal 50 ms after its fork. */
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = on_usr1;
+    sigaction(SIGUSR1, &action, NULL);
+    char full_again[4096] = {0};
+    if (write(ends_of_steps[3][1], full_again, sizeof full_again) != (ssize_t)sizeof full_again) return 80;
+    for (int k = 0; k < 2; k++) {
+        pid_t poker = fork();
+        if (poker == 0) {
+            pause_ms(50);
+            kill(getppid(), SIGUSR1);
+            _exit(0);
+        }
+        char byte = 0;
+        int n = k == 0 ? (int)read(ends_of_steps[2][0], &byte, 1)
+                       : (int)write(ends_of_steps[3][1], full_again, 512);
+        if (n != -1 || errno != EINTR) return 81;
+        if (waitpid(poker, &status, 0) != poker) return 82;
+    }
+    /* An exec while a thread waits at an end: Abandon. */
+    pid_t execer = fork();
+    if (execer == 0) {
+        pthread_t waiter;
+        if (pthread_create(&waiter, NULL, step_waiter, &ends_of_steps[2][0]) != 0) _exit(90);
+        pause_ms(50);
+        char *next[] = {"procs-child", "exit7", NULL};
+        char *env[] = {NULL};
+        execve("/bin/procs-child", next, env);
+        _exit(91);
+    }
+    if (execer < 0 || waitpid(execer, &status, 0) != execer || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 7)
+        return 83;
     return failures;
 }
 
@@ -2422,6 +2470,30 @@ static void *write_later(void *arg) {
     return NULL;
 }
 
+/* A pipe's read end and a count for the thread that reads it later. */
+struct drain_later {
+    int fd;
+    long ms;
+    int count;
+};
+
+/* Reads `count` bytes of a pipe `ms` after its start. */
+static void *read_later(void *arg) {
+    struct drain_later *l = arg;
+    char bytes[1024];
+    pause_ms(l->ms);
+    int got = 0;
+    while (got < l->count) {
+        int n = (int)read(l->fd, bytes, (size_t)(l->count - got) < sizeof bytes ? (size_t)(l->count - got) : sizeof bytes);
+        if (n <= 0) {
+            failures++;
+            break;
+        }
+        got += n;
+    }
+    return NULL;
+}
+
 /* Fills the empty pipe `fd` but `room` bytes; the bytes written. */
 static int fill(int fd, int room) {
     char bytes[4096];
@@ -2533,6 +2605,20 @@ static void pipes(void) {
     pthread_join(helper, NULL);
     expect("a write of 8 KiB in a signal gives a part", n > 0 && n < (int)sizeof block, 1);
     expect("the part is in the pipe", drain(p[0], n), n);
+    /* With SA_RESTART the write of 512 into a full pipe goes on after the
+     * handler, and ends whole once a reader made room. */
+    expect("the pipe filled", fill(p[1], 0), 4096);
+    usr1_in(SA_RESTART);
+    struct drain_later room = {p[0], 150, 1024};
+    pthread_t reader;
+    pthread_create(&helper, NULL, poke, NULL);
+    pthread_create(&reader, NULL, read_later, &room);
+    n = (int)write(p[1], block, 512);
+    pthread_join(helper, NULL);
+    pthread_join(reader, NULL);
+    expect("a write of 512 in a signal with SA_RESTART", n, 512);
+    expect("the handler in the write with SA_RESTART", handled, 1);
+    expect("the bytes after it", drain(p[0], 4096 - 1024 + 512), 4096 - 1024 + 512);
 
     /* No reader: SIGPIPE comes to the writing thread before its EPIPE. */
     struct sigaction action;
@@ -2549,6 +2635,19 @@ static void pipes(void) {
     n = (int)write(p[1], "x", 1);
     expect("a write without a reader, SIGPIPE ignored", n == -1 ? errno : 0, EPIPE);
     expect("no handler with SIG_IGN", pipe_signals, 1);
+    /* SIGPIPE blocked: EPIPE, and the signal waits on the thread. */
+    sigaction(SIGPIPE, &action, NULL);
+    sigset_t pipe_set, pending;
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    sigprocmask(SIG_BLOCK, &pipe_set, NULL);
+    n = (int)write(p[1], "x", 1);
+    expect("a write without a reader, SIGPIPE blocked", n == -1 ? errno : 0, EPIPE);
+    sigpending(&pending);
+    expect("SIGPIPE pending while blocked", sigismember(&pending, SIGPIPE), 1);
+    expect("no handler while blocked", pipe_signals, 1);
+    sigprocmask(SIG_UNBLOCK, &pipe_set, NULL);
+    expect("the handler once unblocked", pipe_signals, 2);
     signal(SIGPIPE, SIG_DFL);
     close(p[1]);
 
@@ -2933,6 +3032,24 @@ static int pipe_fork(void) {
     expect("the end of the data after SIGKILL", (int)read(p[0], got, sizeof got), 0);
     close(p[0]);
     reap("the killed writer", child, 0, SIGKILL);
+    /* SIGKILL in the middle of a write of 8 KiB: the 4 KiB that went stay,
+     * then the end of the data. */
+    expect("pipe of the writer killed in a write", pipe(p), 0);
+    child = fork();
+    if (child == 0) {
+        char big[8192];
+        memset(big, 'k', sizeof big);
+        (void)write(p[1], big, sizeof big);
+        _exit(0);
+    }
+    close(p[1]);
+    pause_ms(100);
+    expect("SIGKILL of the writer in its write", kill(child, SIGKILL), 0);
+    reap("the writer killed in its write", child, 0, SIGKILL);
+    int records_k[256] = {0};
+    expect("the bytes before SIGKILL", read_to_end(p[0], records_k, 512), 4096);
+    expect("their records", records_k['k'], 8);
+    close(p[0]);
 
     /* Three writers of 16 records of {PIPE_BUF} bytes each into a pipe
      * that fills before the reader starts, which then frees 100 bytes at
@@ -2961,6 +3078,43 @@ static int pipe_fork(void) {
     expect("mixed records", records[0], 0);
     close(p[0]);
     for (int w = 0; w < 3; w++) reap("a writer of records", writers[w], 0, 0);
+
+    /* A tree of processes has 16 live pipes at most in all (the root of
+     * the pipe service's chain of clones): a child takes what is left,
+     * the parent then gets EMFILE, and once the child is gone it gets one
+     * again. */
+    int sync[2];
+    expect("pipe of the tree's count", pipe(sync), 0);
+    child = fork();
+    if (child == 0) {
+        int made = 0, mine[2];
+        while (pipe(mine) == 0) {
+            close(mine[0]);
+            made++;
+        }
+        unsigned char count = (unsigned char)made;
+        if (errno != EMFILE || write(sync[1], &count, 1) != 1) _exit(1);
+        for (;;) pause_ms(1000);
+    }
+    unsigned char made = 0;
+    expect("the count of the child's pipes", (int)read(sync[0], &made, 1), 1);
+    expect("the pipes a child has beside the parent's one", made, 15);
+    int more[2];
+    expect("a pipe of the parent with the tree at 16", pipe(more) == -1 ? errno : 0, EMFILE);
+    kill(child, SIGKILL);
+    reap("the child of 15 pipes", child, 0, SIGKILL);
+    int again = -1;
+    for (int i = 0; i < 100 && again != 0; i++) {
+        again = pipe(more);
+        if (again != 0) pause_ms(2);
+    }
+    expect("a pipe once the child is gone", again, 0);
+    if (again == 0) {
+        close(more[0]);
+        close(more[1]);
+    }
+    close(sync[0]);
+    close(sync[1]);
 
     /* The reader ends: a write is EPIPE, SIGPIPE ignored. */
     expect("pipe of the leaving reader", pipe(p), 0);

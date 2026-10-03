@@ -19,7 +19,9 @@
 //!   image is ready", or one of the codes below.
 //! - Handles: body the slot of each handle u32 (`Slot::Files`, `Clock`,
 //!   `Uart`, `Pipes`, each once) and as many handles, sessions with SEND, after
-//!   "the image is ready" (after Fork for a copy); reply its status.
+//!   "the image is ready" (after Fork for a copy); reply its status. The
+//!   four sessions take all abi::MESSAGE_HANDLES of one message: a fifth
+//!   slot needs a second Handles.
 //! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
 //!   the parent's memory the loader makes for a `fork`; reply its status,
 //!   BAD_SIZE past REGIONS_MAX regions or a second Fork or Start.

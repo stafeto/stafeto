@@ -82,6 +82,24 @@ struct Pipe {
 }
 
 impl End {
+    /// The waiters `keep` keeps, in the order they came: the list stays
+    /// a queue, its free places at its tail, so a new waiter queues behind
+    /// those that wait already and is told after them.
+    fn keep(&mut self, keep: impl Fn(Waiter) -> bool) {
+        let mut at = 0;
+        for i in 0..WAITERS {
+            if let Some(w) = self.waiters[i]
+                && keep(w)
+            {
+                self.waiters[at] = Some(w);
+                at += 1;
+            }
+        }
+        for slot in &mut self.waiters[at..] {
+            *slot = None;
+        }
+    }
+
     const NONE: End = End {
         refs: 0,
         nonblock: false,
@@ -139,7 +157,7 @@ impl Pipes {
         }
     }
 
-    /// A new pipe of the session `held` of `creator`: its read end and its
+    /// A new pipe of the session `held` of the root `creator`: its read end and its
     /// write end, which the session holds; NFILE with all pipes in use,
     /// MFILE past CREATED_MAX live pipes of `creator` or HELD_MAX held.
     pub fn create(&mut self, held: &mut Held, creator: u64, flags: u32) -> Result<(u32, u32), u32> {
@@ -264,11 +282,7 @@ impl Pipes {
         if end.waiters.contains(&Some(waiter)) {
             return Ok(());
         }
-        for slot in end.waiters.iter_mut() {
-            if slot.is_some_and(|w| !alive(w)) {
-                *slot = None;
-            }
-        }
+        end.keep(alive);
         let free = end.waiters.iter_mut().find(|w| w.is_none()).ok_or(AGAIN)?;
         *free = Some(waiter);
         Ok(())
@@ -278,11 +292,7 @@ impl Pipes {
     pub fn unwait(&mut self, description: u32, waiter: Waiter) {
         let (index, is_write) = proto_pipe::end_of(description);
         if let Some(pipe) = self.pipes.get_mut(index) {
-            for slot in pipe.ends[is_write as usize].waiters.iter_mut() {
-                if *slot == Some(waiter) {
-                    *slot = None;
-                }
-            }
+            pipe.ends[is_write as usize].keep(|w| w != waiter);
         }
     }
 
@@ -306,6 +316,7 @@ impl Pipes {
         let (index, is_write) = proto_pipe::end_of(description as u32);
         let pipe = &mut self.pipes[index];
         let end = &mut pipe.ends[is_write as usize];
+        debug_assert!(end.refs >= count, "the references of a description");
         end.refs = end.refs.saturating_sub(count);
         if end.refs != 0 {
             return;
@@ -397,6 +408,74 @@ impl Pipes {
     /// The pipes in use.
     pub fn live(&self) -> usize {
         self.pipes.iter().filter(|p| p.live).count()
+    }
+}
+
+/// The long operations that wait for the sessions of one root at most: a
+/// client of init's and the clones of its chain (the processes it forked
+/// and spawned), so that one process tree cannot take all OPERATIONS of
+/// the service; past them, AGAIN.
+pub const ROOT_OPERATIONS: u16 = 32;
+
+/// The operations that wait, counted for each root that has some: N
+/// places, one for each operation the service may keep at most, so a root
+/// with an operation always finds its place. O(N).
+pub struct Roots<const N: usize> {
+    list: [Option<(u64, u16)>; N],
+}
+
+impl<const N: usize> Default for Roots<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> Roots<N> {
+    pub const fn new() -> Self {
+        Self { list: [None; N] }
+    }
+
+    /// One operation more for `root`: AGAIN at ROOT_OPERATIONS or with
+    /// every place taken.
+    pub fn take(&mut self, root: u64) -> Result<(), u32> {
+        if let Some((_, count)) = self.list.iter_mut().flatten().find(|(r, _)| *r == root) {
+            if *count >= ROOT_OPERATIONS {
+                return Err(AGAIN);
+            }
+            *count += 1;
+            return Ok(());
+        }
+        let free = self.list.iter_mut().find(|e| e.is_none()).ok_or(AGAIN)?;
+        *free = Some((root, 1));
+        Ok(())
+    }
+
+    /// `n` operations of `root` are over.
+    pub fn give(&mut self, root: u64, n: u16) {
+        if n == 0 {
+            return;
+        }
+        if let Some(entry) = self
+            .list
+            .iter_mut()
+            .find(|e| e.is_some_and(|(r, _)| r == root))
+        {
+            let (_, count) = entry.as_mut().expect("a found entry");
+            debug_assert!(*count >= n, "the operations of a root");
+            *count = count.saturating_sub(n);
+            if *count == 0 {
+                *entry = None;
+            }
+        }
+    }
+
+    /// The operations `root` has that wait.
+    pub fn of(&self, root: u64) -> u16 {
+        self.list
+            .iter()
+            .flatten()
+            .find(|(r, _)| *r == root)
+            .map_or(0, |(_, c)| *c)
     }
 }
 
@@ -642,6 +721,56 @@ mod tests {
         }
         assert_eq!(c.count(), HELD_MAX);
         assert_eq!(p.create(&mut c, 77, 0), Err(MFILE));
+    }
+
+    /// The waiters of an end are a queue: after a read the writer that
+    /// waited first is told first, and one that waits again (a part of
+    /// its write went) queues behind the others.
+    #[test]
+    fn waiters_are_told_in_the_order_they_came() {
+        let mut p = pipes();
+        let mut a = Held::default();
+        let (rd, wr) = p.create(&mut a, 1, 0).unwrap();
+        assert_eq!(
+            p.write(&a, wr, &[0; CAPACITY], &mut Wakes::default()),
+            Ok(Some(CAPACITY))
+        );
+        for k in 1..=3 {
+            p.wait(wr, (7, k), |_| true).unwrap();
+        }
+        let mut w = Wakes::default();
+        let mut out = [0; 100];
+        p.read(&a, rd, &mut out, &mut w).unwrap();
+        assert_eq!(woke(&w), [(7, 1), (7, 2), (7, 3)]);
+        // The first went with a part, and waits again with a new key.
+        p.unwait(wr, (7, 1));
+        p.wait(wr, (7, 4), |_| true).unwrap();
+        let mut w = Wakes::default();
+        p.read(&a, rd, &mut out, &mut w).unwrap();
+        assert_eq!(woke(&w), [(7, 2), (7, 3), (7, 4)]);
+        // Those that went are left out, and the queue keeps its order.
+        p.wait(wr, (7, 5), |k| k.1 != 3).unwrap();
+        let mut w = Wakes::default();
+        p.read(&a, rd, &mut out, &mut w).unwrap();
+        assert_eq!(woke(&w), [(7, 2), (7, 4), (7, 5)]);
+    }
+
+    /// A root has ROOT_OPERATIONS that wait at most, others have theirs.
+    #[test]
+    fn roots_bound_the_operations_of_a_tree() {
+        let mut r = Roots::<128>::new();
+        for _ in 0..ROOT_OPERATIONS {
+            r.take(5).unwrap();
+        }
+        assert_eq!(r.take(5), Err(AGAIN));
+        assert_eq!(r.take(6), Ok(()));
+        r.give(5, 2);
+        assert_eq!(r.of(5), ROOT_OPERATIONS - 2);
+        assert_eq!(r.take(5), Ok(()));
+        r.give(5, ROOT_OPERATIONS - 1);
+        r.give(6, 1);
+        assert_eq!((r.of(5), r.of(6)), (0, 0));
+        assert!(r.list.iter().all(Option::is_none), "places go back");
     }
 
     /// `dup` in a process and the close of one of its descriptors leave

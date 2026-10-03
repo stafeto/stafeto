@@ -16,7 +16,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
-use pipe::{Held, Pipes, Wakes};
+use pipe::{Held, Pipes, Roots, Wakes};
 use proto_init::ServiceArgs;
 use proto_pipe::{Cancel, HELD_MAX, MAX_READ, Method, OWN, Read, VERSION, Write};
 use proto_wire::clones::Clones;
@@ -33,11 +33,14 @@ rt::entry!(main);
 /// The sessions: room for the 255 records of the process service and the
 /// services beside them, as the RAM file service has.
 const SESSIONS: usize = 320;
-/// Clones whose sessions sent nothing yet, at most: past them, Clone is
-/// LIMIT_REACHED.
-const BIRTHS: usize = 256;
-/// The clones the service keeps alive at most.
+/// The clones the service keeps alive at most, and so the clones whose
+/// sessions sent nothing yet (births).
 const CLONES: usize = 320;
+const BIRTHS: usize = CLONES;
+/// The live clones of one root at most: one for each record of the process
+/// service, so that a tree of processes has a session each, and the
+/// others' roots keep CLONES - ROOT_CLONES of them.
+const ROOT_CLONES: usize = 255;
 /// The long operations that wait in the service at most.
 const OPERATIONS: usize = 128;
 /// The label of the service's own place for the notification of the next
@@ -46,22 +49,33 @@ const OPERATIONS: usize = 128;
 const STEP: u64 = OWN | 1 << 62;
 
 /// What the service keeps for a client: the descriptions it holds, its
-/// long operations, and whether the session took the descriptions Clone
-/// made it with.
+/// long operations and how many wait, whether the session took the
+/// descriptions Clone made it with, and the root of its chain of clones:
+/// the label of init's client whose process forked or spawned it, or its
+/// own label for such a client. The limits of pipes, waiting operations
+/// and clones count by the root, so that one process tree cannot take
+/// the service from the others.
 #[derive(Default)]
 struct Client {
     held: Held,
     long: LongSession,
+    waiting: u16,
     claimed: bool,
+    root: u64,
 }
+
+/// A clone that sent nothing yet: its label, its descriptions and the
+/// root of its chain.
+type Birth = (u64, Held, u64);
 
 /// The tables of the sessions, births, clones and long operations, and
 /// the pipes with their rings, in `.bss`: too big for the stack.
 struct Tables {
     sessions: [Option<Session<Client, 0>>; SESSIONS],
-    births: [Option<(u64, Held)>; BIRTHS],
+    births: [Option<Birth>; BIRTHS],
     pipes: Pipes,
     ops: LongOps<OPERATIONS>,
+    roots: Roots<OPERATIONS>,
     clones: Clones<CLONES>,
 }
 struct Bss(UnsafeCell<Tables>);
@@ -72,6 +86,7 @@ static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     births: [None; BIRTHS],
     pipes: Pipes::new(),
     ops: LongOps::new(),
+    roots: Roots::new(),
     clones: Clones::new(),
 }));
 
@@ -106,6 +121,7 @@ fn main(_: u64) -> u64 {
     let mut service = PipeService {
         pipes: &mut tables.pipes,
         ops: &mut tables.ops,
+        roots: &mut tables.roots,
         channel: Handle::borrowed(channel.raw()),
         level,
         given: 0,
@@ -113,6 +129,7 @@ fn main(_: u64) -> u64 {
         clones: &mut tables.clones,
         step,
         step_told: false,
+        step_due: false,
     };
     rt::println!("pipe: ready");
     #[cfg(feature = "steps")]
@@ -124,6 +141,8 @@ fn main(_: u64) -> u64 {
 struct PipeService {
     pipes: &'static mut Pipes,
     ops: &'static mut LongOps<OPERATIONS>,
+    /// The operations that wait, for each root.
+    roots: &'static mut Roots<OPERATIONS>,
     /// The service's channel, which its own sessions are copies of.
     channel: ManuallyDrop<Handle<Channel>>,
     level: u8,
@@ -132,12 +151,15 @@ struct PipeService {
     /// The descriptions of the sessions Clone made that sent nothing yet,
     /// by their labels: the session's first request takes them, and the
     /// end of its last copy lets go of them.
-    births: &'static mut [Option<(u64, Held)>; BIRTHS],
+    births: &'static mut [Option<Birth>; BIRTHS],
     clones: &'static mut Clones<CLONES>,
     /// The copy of the service's channel with NOTIFY, label STEP, and
     /// whether a step was told and not taken.
     step: Handle<Channel>,
     step_told: bool,
+    /// A step is due that no notification told: the next request or
+    /// notification makes it and tries to tell again.
+    step_due: bool,
 }
 
 fn status(code: u32) -> Answer {
@@ -161,23 +183,49 @@ impl PipeService {
 
     /// Tells the loop of a step of the descriptions that sessions which
     /// went let go of, unless one is told already. Were the notification
-    /// refused, the steps run at once.
+    /// refused, the step is due all the same: the next request or
+    /// notification makes one and tells again (`due`), so no step grows.
     fn kick(&mut self) {
         if self.step_told {
             return;
         }
         if sys::notify(&self.step, 1).is_ok() {
             self.step_told = true;
-            return;
+            self.step_due = false;
+        } else {
+            self.step_due = true;
         }
-        loop {
+    }
+
+    /// The step a refused notification left due, after a request or
+    /// another notification.
+    fn due(&mut self) {
+        if self.step_due && !self.step_told {
+            self.step_due = false;
+            rt::service::step_own();
             let mut wakes = Wakes::default();
             let more = self.pipes.step(&mut wakes);
             self.tell(&wakes);
-            if !more {
-                break;
+            if more {
+                self.kick();
             }
         }
+    }
+
+    /// One operation of the session `s` is over (`finished`): it waits no
+    /// more for its root.
+    fn over(&mut self, s: &mut Session<Client, 0>, finished: bool) {
+        if finished {
+            s.data.waiting -= 1;
+            self.roots.give(s.data.root, 1);
+        }
+    }
+
+    /// Every operation of the session `s` goes (it went, or Abandon).
+    fn abandon(&mut self, s: &mut Session<Client, 0>) {
+        self.ops.gone(&mut s.data.long);
+        self.roots
+            .give(s.data.root, core::mem::take(&mut s.data.waiting));
     }
 
     /// The handle with NOTIFY a take brought, the first time.
@@ -195,7 +243,8 @@ impl PipeService {
     fn finish(&mut self, s: &mut Session<Client, 0>, key: Option<u64>, end: u32) {
         if let Some(key) = key {
             let label = s.label();
-            self.ops.finish(&mut s.data.long, label, key);
+            let finished = self.ops.finish(&mut s.data.long, label, key);
+            self.over(s, finished);
             self.pipes.unwait(end, (label, key));
         }
     }
@@ -214,13 +263,21 @@ impl PipeService {
         let label = s.label();
         match key {
             None => {
+                if let Err(code) = self.roots.take(s.data.root) {
+                    return status(code);
+                }
                 let key = match self.ops.start(&mut s.data.long, label) {
                     Ok(key) => key,
-                    Err(e) => return Answer::Status(Status::Kernel(e)),
+                    Err(e) => {
+                        self.roots.give(s.data.root, 1);
+                        return Answer::Status(Status::Kernel(e));
+                    }
                 };
+                s.data.waiting += 1;
                 let ops = &self.ops;
                 if let Err(code) = self.pipes.wait(end, (label, key), |(l, k)| ops.waits(l, k)) {
-                    self.ops.finish(&mut s.data.long, label, key);
+                    let finished = self.ops.finish(&mut s.data.long, label, key);
+                    self.over(s, finished);
                     return status(code);
                 }
                 long_answer(r, long::Reply::Wait(key))
@@ -319,15 +376,19 @@ impl PipeService {
         if !self.ops.finish(&mut s.data.long, label, cancel.key) {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
+        self.over(s, true);
+        // The end the operation waits at is the one its start named; a
+        // cancel that names the other leaves no waiter behind either.
         self.pipes.unwait(cancel.end, (label, cancel.key));
+        self.pipes.unwait(cancel.end ^ 1, (label, cancel.key));
         long_answer(r, long::Reply::Cancelled)
     }
 
     /// CLONE with a list of the session's descriptions (count u32, then
     /// each u32): a session of the service's own label that holds them;
     /// BAD_FD for one it does not hold, LIMIT_REACHED with BIRTHS clones
-    /// that sent nothing yet or the client's clones at their most.
-    fn clone_session(&mut self, held: &Held, r: &mut Request<'_>) -> Answer {
+    /// that sent nothing yet or the clones of its root at their most.
+    fn clone_session(&mut self, held: &Held, root: u64, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let mut list = [0u32; HELD_MAX];
         let count = body.u32().unwrap_or(u32::MAX) as usize;
@@ -346,7 +407,7 @@ impl PipeService {
         let Some(free) = self.births.iter().position(Option::is_none) else {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         };
-        if self.clones.room(r.label()).is_err() {
+        if self.clones.room_within(root, ROOT_CLONES).is_err() {
             return Answer::Status(Status::Kernel(Error::LimitReached));
         }
         let mut child = match self.pipes.clone_held(held, &list[..count]) {
@@ -363,8 +424,8 @@ impl PipeService {
         );
         match session {
             Ok(session) if r.reply().u32(0).is_ok() => {
-                self.births[free] = Some((label, child));
-                let _ = self.clones.add(label, r.label());
+                self.births[free] = Some((label, child, root));
+                let _ = self.clones.add_within(label, root, ROOT_CLONES);
                 Answer::Reply([session.erase()].into())
             }
             other => {
@@ -408,16 +469,20 @@ impl Service<0> for PipeService {
     type Data = Client;
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        self.due();
         if !s.data.claimed {
             // The first request of a session Clone made takes its
-            // descriptions.
+            // descriptions and its root; init's client is its own root.
             let label = r.label();
+            s.data.root = label;
             if let Some(birth) = self
                 .births
                 .iter_mut()
-                .find(|b| b.is_some_and(|(l, _)| l == label))
+                .find(|b| b.is_some_and(|(l, ..)| l == label))
             {
-                s.data.held = birth.take().expect("a birth").1;
+                let (_, held, root) = birth.take().expect("a birth");
+                s.data.held = held;
+                s.data.root = root;
             }
             s.data.claimed = true;
         }
@@ -427,7 +492,7 @@ impl Service<0> for PipeService {
                     Ok(body) => body,
                     Err(answer) => return answer,
                 };
-                match self.pipes.create(&mut s.data.held, r.label(), flags) {
+                match self.pipes.create(&mut s.data.held, s.data.root, flags) {
                     Ok((read, write)) => words(r, &[read, write]),
                     Err(code) => status(code),
                 }
@@ -451,8 +516,8 @@ impl Service<0> for PipeService {
                 }
             }
             Some(Method::Clone) => {
-                let held = s.data.held;
-                self.clone_session(&held, r)
+                let (held, root) = (s.data.held, s.data.root);
+                self.clone_session(&held, root, r)
             }
             Some(Method::GetFlags) => match end_body(r, false) {
                 Ok((end, _)) => match self.pipes.flags(&s.data.held, end) {
@@ -479,7 +544,7 @@ impl Service<0> for PipeService {
                 if r.body().finish().is_err() {
                     return Answer::Status(Status::BadSize);
                 }
-                self.ops.gone(&mut s.data.long);
+                self.abandon(s);
                 Answer::Status(Status::Ok)
             }
             None => Answer::Status(Status::UnknownMethod),
@@ -490,7 +555,7 @@ impl Service<0> for PipeService {
     /// are let go of in steps.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         rt::service::step_own();
-        self.ops.gone(&mut s.data.long);
+        self.abandon(s);
         if self.pipes.gone(&mut s.data.held) {
             self.kick();
         }
@@ -504,8 +569,8 @@ impl Service<0> for PipeService {
         if let Some(birth) = self
             .births
             .iter_mut()
-            .find(|b| b.is_some_and(|(l, _)| l == label))
-            && let Some((_, mut held)) = birth.take()
+            .find(|b| b.is_some_and(|(l, ..)| l == label))
+            && let Some((_, mut held, _)) = birth.take()
             && self.pipes.gone(&mut held)
         {
             self.kick();
@@ -516,6 +581,7 @@ impl Service<0> for PipeService {
     /// (STEP): one description, the operations it wakes told.
     fn notification(&mut self, n: Notice) {
         if n.source != Source::Session || n.label != STEP {
+            self.due();
             return;
         }
         self.step_told = false;
