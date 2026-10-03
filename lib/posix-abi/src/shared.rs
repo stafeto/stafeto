@@ -129,10 +129,9 @@ fn window() {
     }
 }
 
-/// Runs `run` with the transports and what `fd` names, held: outside the
-/// lock, and a close meanwhile releases the service's description once
-/// `run` is over. Terminal last-fd close releases the real description
-/// immediately; an armed operation retains its own service pin.
+/// Runs `run` with the transports and what `fd` names, outside the lock.
+/// RAM and pipe close waits until `run` is over. Terminal last-fd close
+/// releases the real hold immediately; armed I/O retains a service pin.
 pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
     let (transport, target) =
         process_state(|files| Ok((files.transport(), files.hold(fd).map_err(crate::error)?)))?;
