@@ -339,21 +339,19 @@ impl Terminal {
     pub fn input_some(&mut self, bytes: &[u8], now: u64) -> usize {
         let mut accepted = 0;
         for &b in bytes {
-            let mut c = if self.termios.iflag & ISTRIP != 0 {
-                b & 0x7f
-            } else {
-                b
+            let Some(c) = self.mapped_input(b) else {
+                accepted += 1;
+                continue;
             };
-            if c == b'\r' && self.termios.iflag & ICRNL != 0 {
-                c = b'\n';
-            }
             let signal = self.local(ISIG) && [VINTR, VQUIT, VSUSP].iter().any(|&i| self.is(c, i));
-            let edit = self.canonical() && [VERASE, VKILL, VWERASE].iter().any(|&i| self.is(c, i));
+            let edit = self.canonical()
+                && ([VERASE, VKILL].iter().any(|&i| self.is(c, i))
+                    || (self.local(IEXTEN) && self.is(c, VWERASE)));
             if self.queue.len == MAX_INPUT && !signal && !edit {
                 break;
             }
             if self.canonical()
-                && self.queue.len + 1 >= MAX_INPUT
+                && (self.queue.len + 1 >= MAX_INPUT || self.line_len() + 1 >= MAX_CANON)
                 && c != b'\n'
                 && !self.is(c, VEOL)
                 && !self.is(c, VEOF)
@@ -362,7 +360,7 @@ impl Terminal {
             {
                 break;
             }
-            self.byte(b);
+            self.mapped_byte(c);
             accepted += 1;
         }
         if accepted != 0 {
@@ -373,17 +371,19 @@ impl Terminal {
 
     pub fn input_room(&self) -> bool {
         self.queue.len < MAX_INPUT
+            && (!self.canonical()
+                || (self.queue.len + 1 < MAX_INPUT && self.line_len() + 1 < MAX_CANON))
     }
 
-    /// One byte of input (XBD 11.2.2, 11.1.9, 11.1.6).
-    fn byte(&mut self, mut b: u8) {
+    /// The mapping precedes both capacity checks and the line discipline.
+    fn mapped_input(&self, mut b: u8) -> Option<u8> {
         let iflag = self.termios.iflag;
         if iflag & ISTRIP != 0 {
             b &= 0x7f;
         }
         if b == b'\r' {
             if iflag & IGNCR != 0 {
-                return;
+                return None;
             }
             if iflag & ICRNL != 0 {
                 b = b'\n';
@@ -391,6 +391,17 @@ impl Terminal {
         } else if b == b'\n' && iflag & INLCR != 0 {
             b = b'\r';
         }
+        Some(b)
+    }
+
+    /// One byte of input (XBD 11.2.2, 11.1.9, 11.1.6).
+    fn byte(&mut self, b: u8) {
+        if let Some(b) = self.mapped_input(b) {
+            self.mapped_byte(b);
+        }
+    }
+
+    fn mapped_byte(&mut self, b: u8) {
         if self.local(ISIG) {
             let signal = if self.is(b, VINTR) {
                 Some(Signal::Interrupt)
@@ -1163,5 +1174,41 @@ mod tests {
         assert_eq!(t.output_len(), taken + 1);
         t.sent(100);
         assert!(t.writable());
+    }
+}
+
+#[cfg(test)]
+mod independent_pty_review {
+    use super::*;
+    fn almost_full() -> Terminal {
+        let mut terminal = Terminal::new();
+        for _ in 0..511 {
+            assert_eq!(terminal.input_some(b"x\n", 0), 2);
+        }
+        assert_eq!(terminal.input_some(b"a", 0), 1);
+        terminal
+    }
+    #[test]
+    fn canonical_master_readiness_matches_ordinary_write_room() {
+        let mut terminal = almost_full();
+        assert_eq!(terminal.input_some(b"a", 0), 0);
+        assert!(
+            !terminal.input_room(),
+            "master poll OUT must not promise ordinary-byte room at the reserved delimiter boundary"
+        );
+    }
+    #[test]
+    fn inlcr_mapping_is_applied_before_pty_capacity_check() {
+        let mut terminal = almost_full();
+        let mut settings = *terminal.termios();
+        settings.iflag |= INLCR;
+        terminal.set_termios(settings, false);
+        let before = terminal.dropped();
+        let accepted = terminal.input_some(b"\n", 0);
+        assert_eq!(
+            (accepted, terminal.dropped() - before),
+            (0, 0),
+            "INLCR maps NL to an ordinary CR; back pressure must preserve the byte"
+        );
     }
 }

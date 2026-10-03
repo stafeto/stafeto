@@ -434,6 +434,13 @@ pub fn probe_decoy(on: bool) {
     DECOY.store(on, Ordering::Relaxed);
 }
 
+/// Malformed own-loader packets for the terminal C probe. No foreign
+/// endpoint or credential participates in these refusal paths.
+static TERMINAL_PACKET_PROBE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub fn probe_terminal_packet(mode: u32) {
+    TERMINAL_PACKET_PROBE.store(mode, Ordering::Release);
+}
+
 /// A live counterfeit terminal endpoint used by the C terminal probe.
 static FAKE_TERMINAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -556,8 +563,10 @@ struct Shadow {
     opened: [Option<u32>; posix_fs::OPEN_MAX],
     cwd: [u8; proto_loader::PATH_MAX],
     cwd_len: usize,
-    terminal_opens: [proto_loader::TerminalOpen; proto_loader::TERMINAL_ACTIONS],
+    terminal_opens: [proto_loader::TerminalAction; proto_loader::TERMINAL_ACTIONS],
     terminal_count: usize,
+    terminal_open_count: usize,
+    pending: [Option<u32>; posix_fs::OPEN_MAX],
 }
 
 impl Shadow {
@@ -569,8 +578,11 @@ impl Shadow {
             opened: [None; posix_fs::OPEN_MAX],
             cwd: [0; proto_loader::PATH_MAX],
             cwd_len: 0,
-            terminal_opens: [proto_loader::TerminalOpen::default(); proto_loader::TERMINAL_ACTIONS],
+            terminal_opens: [proto_loader::TerminalAction::default();
+                proto_loader::TERMINAL_ACTIONS],
             terminal_count: 0,
+            terminal_open_count: 0,
+            pending: [None; posix_fs::OPEN_MAX],
         };
         crate::shared::with_files(|files| {
             let mut open = [None; posix_fs::OPEN_MAX];
@@ -626,6 +638,38 @@ impl Shadow {
         Ok(&out[..len])
     }
 
+    /// The final alias of a temporary open closes at this point in the
+    /// action sequence, before any following Open takes effect.
+    fn replace_entry(
+        &mut self,
+        fd: usize,
+        entry: Option<(posix_fs::Target, bool)>,
+        pending: Option<u32>,
+    ) -> Result<(), i32> {
+        if let Some(token) = self.pending[fd]
+            && pending != Some(token)
+            && !self
+                .pending
+                .iter()
+                .enumerate()
+                .any(|(i, &p)| i != fd && p == Some(token))
+        {
+            if self.terminal_count == proto_loader::TERMINAL_ACTIONS {
+                return Err(crate::constants::EMFILE);
+            }
+            self.terminal_opens[self.terminal_count] = proto_loader::TerminalAction {
+                token,
+                kind: proto_loader::TERMINAL_CLOSE,
+                number: 0,
+                flags: 0,
+            };
+            self.terminal_count += 1;
+        }
+        self.entries[fd] = entry;
+        self.pending[fd] = pending;
+        Ok(())
+    }
+
     /// One file action, in order ([P24-SPAWN]).
     fn apply(&mut self, action: FileAction<'_>) -> Result<(), i32> {
         use crate::constants::{EBADF, ENOSYS, ENOTDIR};
@@ -636,13 +680,13 @@ impl Shadow {
         };
         match action {
             FileAction::Close(fd) => {
-                self.entries[slot(fd)?] = None;
+                self.replace_entry(slot(fd)?, None, None)?;
             }
             FileAction::Dup2(fd, new) => {
                 let (target, _) = self.entries[slot(fd)?].ok_or(EBADF)?;
                 // The copy has no FD_CLOEXEC, and so has the descriptor
                 // dup2 names twice ([P24-SPAWN]).
-                self.entries[slot(new)?] = Some((target, false));
+                self.replace_entry(slot(new)?, Some((target, false)), self.pending[slot(fd)?])?;
             }
             FileAction::Open { fd, path, flags } => {
                 let place = slot(fd)?;
@@ -650,36 +694,55 @@ impl Shadow {
                 let full = self.absolute(path, &mut full)?;
                 use crate::constants::{
                     EINVAL, EMFILE, O_ACCMODE, O_CHANGES, O_CLOEXEC, O_CLOFORK, O_DIRECTORY,
-                    O_NOCTTY,
+                    O_NOCTTY, O_NONBLOCK,
                 };
-                if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK | O_CHANGES | O_NOCTTY)
+                if flags
+                    & !(O_ACCMODE
+                        | O_DIRECTORY
+                        | O_CLOEXEC
+                        | O_CLOFORK
+                        | O_CHANGES
+                        | O_NOCTTY
+                        | O_NONBLOCK)
                     != 0
                     || flags & O_ACCMODE == O_ACCMODE
                 {
                     return Err(EINVAL);
                 }
                 let terminal = crate::shared::resolved(full, |transport, path| {
-                    let named = transport.terminal_of(path).map_err(crate::error)?;
-                    Ok(named
-                        .map(|number| (number, path.as_str().is_ok_and(|name| name == "/dev/tty"))))
+                    if transport.terminal().is_none() {
+                        return Ok(None);
+                    }
+                    let named = crate::shared::terminal_name(path.as_str().map_err(crate::error)?);
+                    if named.is_some() && path.trailing_slash {
+                        return Err(ENOTDIR);
+                    }
+                    Ok(named)
                 })?;
-                if let Some((number, controlling)) = terminal {
+                if let Some((kind, number)) = terminal {
                     if flags & O_DIRECTORY != 0 {
                         return Err(ENOTDIR);
                     }
-                    if self.terminal_count == proto_loader::TERMINAL_ACTIONS {
+                    if self.terminal_open_count == proto_loader::TERMINAL_OPENS
+                        || self.terminal_count == proto_loader::TERMINAL_ACTIONS
+                    {
                         return Err(EMFILE);
                     }
-                    self.terminal_opens[self.terminal_count] = proto_loader::TerminalOpen {
-                        terminal: number,
-                        controlling,
-                        no_ctty: flags & O_NOCTTY != 0,
+                    self.replace_entry(place, None, None)?;
+                    let token = self.terminal_open_count as u32;
+                    self.terminal_opens[self.terminal_count] = proto_loader::TerminalAction {
+                        token,
+                        kind,
+                        number,
+                        flags: (flags & (O_ACCMODE | O_NONBLOCK | O_NOCTTY)) as u32,
                     };
                     self.terminal_count += 1;
-                    self.entries[place] =
-                        Some((posix_fs::Target::Tty(number), flags & O_CLOEXEC != 0));
+                    self.terminal_open_count += 1;
+                    self.entries[place] = Some((posix_fs::Target::Tty(0), flags & O_CLOEXEC != 0));
+                    self.pending[place] = Some(token);
                     return Ok(());
                 }
+                self.replace_entry(place, None, None)?;
                 // The caller's own descriptor lives only for the spawn: with
                 // FD_CLOEXEC, so that an exec or spawn of another thread in
                 // the meantime does not inherit it. The child's flag is the
@@ -729,14 +792,18 @@ impl Shadow {
             let Some((target, false)) = entry else {
                 continue;
             };
-            let names = match *target {
-                posix_fs::Target::Input => Names::Input,
-                posix_fs::Target::Output => Names::Output,
-                posix_fs::Target::Error => Names::Error,
-                posix_fs::Target::Ram(n) => Names::File(n),
-                posix_fs::Target::Pipe(n) => Names::Pipe(n),
-                posix_fs::Target::Tty(n) => Names::Terminal(n),
-                posix_fs::Target::Random(n) => Names::Random(n),
+            let names = if let Some(token) = self.pending[fd] {
+                Names::PendingTerminal(token)
+            } else {
+                match *target {
+                    posix_fs::Target::Input => Names::Input,
+                    posix_fs::Target::Output => Names::Output,
+                    posix_fs::Target::Error => Names::Error,
+                    posix_fs::Target::Ram(n) => Names::File(n),
+                    posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                    posix_fs::Target::Tty(n) => Names::Terminal(n),
+                    posix_fs::Target::Random(n) => Names::Random(n),
+                }
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -745,6 +812,22 @@ impl Shadow {
             count += 1;
         }
         (out, count)
+    }
+
+    fn shared_terminals(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
+        let (list, count) = self.descriptors();
+        let mut ids = [0; posix_fs::OPEN_MAX];
+        let mut n = 0;
+        for descriptor in &list[..count] {
+            if let proto_loader::Names::Terminal(id) = descriptor.names
+                && id != 0
+                && !ids[..n].contains(&id)
+            {
+                ids[n] = id;
+                n += 1;
+            }
+        }
+        (ids, n)
     }
 
     /// The service's descriptions the child's session shares, each once.
@@ -1452,7 +1535,10 @@ fn commit(
     // The child's session with the terminal service: a clone of the
     // caller's.
     let terminal = match crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))? {
-        Some(terminal) => Some(crate::terminal::clone(terminal)?),
+        Some(terminal) => {
+            let (ids, count) = shadow.shared_terminals();
+            Some(crate::terminal::clone_kept(terminal, Some(&ids[..count]))?)
+        }
         None => None,
     };
     let fake = FAKE_TERMINAL.load(Ordering::Acquire);
@@ -1479,16 +1565,48 @@ fn commit(
     if give_sessions(c, sessions) != 0 {
         return Err(EIO);
     }
-    if shadow.terminal_count != 0 {
+    let packet_probe = TERMINAL_PACKET_PROBE.load(Ordering::Acquire);
+    for (packet_index, packet) in shadow.terminal_opens[..shadow.terminal_count]
+        .chunks(proto_loader::TERMINAL_PACKET)
+        .enumerate()
+    {
+        if packet_probe == 4 {
+            break;
+        }
         let mut w = Writer::new();
         Method::TerminalActions
             .header()
             .write(&mut w)
             .map_err(|_| EIO)?;
-        w.u32(shadow.terminal_count as u32).map_err(|_| EIO)?;
-        for action in &shadow.terminal_opens[..shadow.terminal_count] {
+        w.u32(packet.len() as u32).map_err(|_| EIO)?;
+        for (i, &action) in packet.iter().enumerate() {
+            let action = if packet_probe == 1 && packet_index == 0 && i == 1 {
+                packet[0]
+            } else if packet_probe == 2 && packet_index == 1 && i == 0 {
+                proto_loader::TerminalAction {
+                    flags: u32::MAX,
+                    ..action
+                }
+            } else {
+                action
+            };
             action.write(&mut w).map_err(|_| EIO)?;
         }
+        let code = ask_loader(c, &w, None);
+        if code != 0 {
+            return Err(load_errno(code));
+        }
+    }
+    if packet_probe == 3 {
+        let mut w = Writer::new();
+        Method::TerminalActions
+            .header()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        w.u32(1).map_err(|_| EIO)?;
+        proto_loader::TerminalAction::default()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
         let code = ask_loader(c, &w, None);
         if code != 0 {
             return Err(load_errno(code));
