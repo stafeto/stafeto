@@ -1208,14 +1208,14 @@ impl Tty {
             return Err(PERMISSION);
         }
         let generation = r.u64().map_err(|_| PERMISSION)?;
-        if self.job_generation != 0 {
-            if !self.departed.keep(Departed {
+        if self.job_generation != 0
+            && !self.departed.keep(Departed {
                 generation: self.job_generation,
                 sid: self.jobs.session().unwrap_or(0),
                 foreground: self.jobs.foreground(),
-            }) {
-                return Err(PERMISSION);
-            }
+            })
+        {
+            return Err(PERMISSION);
         }
         self.job_generation = generation;
         self.jobs.acquired(caller);
