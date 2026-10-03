@@ -405,7 +405,7 @@ static int terminal_crowd(void) {
         if (read(ready[0], &byte, 1) != 1 || byte != 'r') return 122;
     if (stafeto_probe_trusted_terminal(getpgrp(), 0) != 0) return 123;
     for (int i = 0; i < MEMBERS; ++i) {
-        int status;
+        int status = 0;
         if (waitpid(children[i], &status, 0) != children[i] ||
             !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
             say("posix-tty: crowd child %d status %d\n", i, status);
