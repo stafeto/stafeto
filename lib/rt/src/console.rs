@@ -24,6 +24,13 @@ pub fn set(resource: Handle<Resource>) {
     CONSOLE.store(resource.into_raw().0, Ordering::Relaxed);
 }
 
+/// Output goes nowhere until the next `set`, and the handle `set` gave
+/// goes without a close: in a forked child its value is the parent's,
+/// which names nothing of the child's.
+pub fn forget() {
+    CONSOLE.store(abi::Handle::INVALID.0, Ordering::Relaxed);
+}
+
 /// A view of the handle `set` gave; BAD_HANDLE before it.
 fn resource() -> Result<ManuallyDrop<Handle<Resource>>, Error> {
     match abi::Handle(CONSOLE.load(Ordering::Relaxed)) {

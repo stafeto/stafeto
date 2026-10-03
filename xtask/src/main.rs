@@ -2056,6 +2056,9 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: memory map ",
         // fork's copy (5d).
         "posix-procs: a bare fork copied the parent",
+        "posix-procs: fork with the layer bound",
+        "posix-procs: a forked child execs ls",
+        "posix-procs: ash -c ran /bin/ls",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }

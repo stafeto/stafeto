@@ -13,7 +13,12 @@
 //! the registers back from the copy of CONTEXT and returns 0 from `point`
 //! on the copy of the caller's stack. A program init started has no
 //! segments in its map, and gets ENOSYS. No copy on write: the child pays
-//! for every page it gets.
+//! for every page it gets. `fork` gives the child clones of the process's
+//! sessions too, and the child binds every part of the layer to its own
+//! handles (`child`) before it returns. The other threads of a parent are
+//! not stopped yet: a fork of a process with more threads copies what
+//! they were doing, and a lock of the layer one of them held stays held
+//! in the child.
 
 use crate::constants::*;
 use crate::process::{ask, ask_loader, client, load_errno, request, start_errno};
@@ -146,15 +151,40 @@ pub enum Forked {
 }
 
 /// What the parent's work came to, in the frame of `copy`'s caller.
+/// The sessions for the child are raw values: a copy of them in the
+/// child names nothing of its own, and nothing there may close them.
 struct Work {
     window: Option<fn()>,
+    sessions: Sessions,
     result: Result<i32, i32>,
+}
+
+/// The values of the sessions a fork gives the child's loader (Handles),
+/// by proto_loader::Slot: Files, Clock and Uart; 0 for none.
+#[derive(Clone, Copy, Default)]
+pub struct Sessions {
+    pub files: u64,
+    pub clock: u64,
+    pub uart: u64,
+}
+
+impl Sessions {
+    /// The parent's own sessions go: those of a fork that never came to
+    /// its loader.
+    fn close(self) {
+        for raw in [self.files, self.clock, self.uart] {
+            if raw != 0 {
+                drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+            }
+        }
+    }
 }
 
 extern "C" fn work(arg: u64) -> i64 {
     // SAFETY: `copy` passes its own Work, which lives across `point`.
     let work = unsafe { &mut *(arg as *mut Work) };
-    work.result = parent(work.window);
+    let sessions = core::mem::take(&mut work.sessions);
+    work.result = parent(work.window, sessions);
     1
 }
 
@@ -164,14 +194,17 @@ extern "C" fn work(arg: u64) -> i64 {
 /// segments in its map, EAGAIN past the service's limits or while another
 /// fork of the process goes on, ENOMEM past the pool or the child's quota.
 /// `window` runs in the parent once the copy is ready, before ForkCommit
-/// (the probes). In the child nothing of the layer is bound to it: the
-/// caller binds it before it calls anything of the layer.
-pub fn copy(window: Option<fn()>) -> Result<Forked, i32> {
+/// (the probes). The child's loader gets `sessions` (Handles), which the
+/// parent has no more afterwards. In the child nothing of the layer is
+/// bound to it: the caller binds it before it calls anything of the layer.
+pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
     if FORKING.swap(true, Ordering::AcqRel) {
+        sessions.close();
         return Err(EAGAIN);
     }
     let mut w = Work {
         window,
+        sessions,
         result: Err(EIO),
     };
     // SAFETY: one fork at a time (FORKING); `work` writes only `w`.
@@ -183,6 +216,33 @@ pub fn copy(window: Option<fn()>) -> Result<Forked, i32> {
     }
     FORKING.store(false, Ordering::Release);
     w.result.map(Forked::Parent)
+}
+
+/// Handles: the sessions for the child to its loader `c`, each that is
+/// there; they move whatever comes of it.
+fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
+    use proto_loader::Slot;
+    let mut w = Writer::new();
+    Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
+    let mut handles = Outgoing::new();
+    for (slot, raw) in [
+        (Slot::Files, sessions.files),
+        (Slot::Clock, sessions.clock),
+        (Slot::Uart, sessions.uart),
+    ] {
+        if raw != 0 {
+            let session = Handle::<Channel>::from_raw(rt::abi::Handle(raw));
+            w.u32(slot as u32).map_err(|_| EIO)?;
+            handles.push(session.erase()).map_err(|_| EIO)?;
+        }
+    }
+    if handles.is_empty() {
+        return Ok(());
+    }
+    match ask_loader(c, &w, Some(handles)) {
+        0 => Ok(()),
+        _ => Err(EIO),
+    }
 }
 
 /// The regions of the memory map as the child's loader takes them, with
@@ -224,8 +284,14 @@ fn regions() -> Result<Regions, i32> {
 /// The parent's side of a fork: ForkStart, then Fork, Regions and Go
 /// through the child's loader, the window and ForkCommit; ForkAbort when
 /// anything fails after ForkStart.
-fn parent(window: Option<fn()>) -> Result<i32, i32> {
-    let regions = regions()?;
+fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
+    let regions = match regions() {
+        Ok(regions) => regions,
+        Err(errno) => {
+            sessions.close();
+            return Err(errno);
+        }
+    };
     let level = crate::threads::own_block()
         .base_level
         .load(Ordering::Relaxed) as u8;
@@ -246,18 +312,29 @@ fn parent(window: Option<fn()>) -> Result<i32, i32> {
     let mut reply = loop {
         match rt::sys::send(client().session(), w.as_bytes()) {
             Err(rt::abi::Error::Interrupted) => continue,
-            Err(_) => return Err(EAGAIN),
+            Err(_) => {
+                sessions.close();
+                return Err(EAGAIN);
+            }
             Ok(reply) => break reply,
         }
     };
     let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
-    let status = Status::from_code(r.u32().map_err(|_| EIO)?);
-    if status != Status::Ok {
-        return Err(start_errno(status));
-    }
-    let pid = r.u32().map_err(|_| EIO)?;
-    let c = reply.handles.take::<Channel>(0).map_err(|_| EIO)?;
-    let made = make(&c, regions, window);
+    let status = Status::from_code(r.u32().unwrap_or(proto_wire::BAD_SIZE));
+    let pid = r.u32().unwrap_or(0);
+    let c = reply.handles.take::<Channel>(0);
+    let c = match (status, c) {
+        (Status::Ok, Ok(c)) => c,
+        (status, _) => {
+            sessions.close();
+            return Err(if status == Status::Ok {
+                EIO
+            } else {
+                start_errno(status)
+            });
+        }
+    };
+    let made = make(&c, regions, sessions, window);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
         Err(_) => proto_process::Method::ForkAbort,
@@ -266,8 +343,14 @@ fn parent(window: Option<fn()>) -> Result<i32, i32> {
     made.and(told).map(|_| pid as i32)
 }
 
-/// Fork, Regions and Go through the child's loader `c`, then `window`.
-fn make(c: &Handle<Channel>, regions: Regions, window: Option<fn()>) -> Result<(), i32> {
+/// Fork, Regions, Handles with `sessions` and Go through the child's
+/// loader `c`, then `window`.
+fn make(
+    c: &Handle<Channel>,
+    regions: Regions,
+    sessions: Sessions,
+    window: Option<fn()>,
+) -> Result<(), i32> {
     // SAFETY: only CONTEXT's address and its stack pointer, which `point`
     // wrote before this ran.
     let sp = unsafe { (*CONTEXT.0.get()).sp };
@@ -281,8 +364,10 @@ fn make(c: &Handle<Channel>, regions: Regions, window: Option<fn()>) -> Result<(
     Method::Fork.header().write(&mut w).map_err(|_| EIO)?;
     fork.write(&mut w).map_err(|_| EIO)?;
     if ask_loader(c, &w, None) != 0 {
+        sessions.close();
         return Err(EIO);
     }
+    give(c, sessions)?;
     let Regions { count, regions } = regions;
     let mut list = regions.into_iter().take(count).flatten().peekable();
     while list.peek().is_some() {
@@ -316,7 +401,7 @@ fn make(c: &Handle<Channel>, regions: Regions, window: Option<fn()>) -> Result<(
 pub fn probe_bare(child: impl FnOnce() -> i32, window: Option<fn()>) -> Result<i32, i32> {
     let block = crate::threads::own_block();
     let mask = block.mask.swap(!0, Ordering::SeqCst);
-    match copy(window) {
+    match copy(window, Sessions::default()) {
         Ok(Forked::Child) => rt::sys::process_exit(child() as u64 & 0xFF),
         result => {
             block.mask.store(mask, Ordering::SeqCst);
@@ -383,4 +468,150 @@ pub fn probe_mappings() -> u64 {
             .max()
             .unwrap_or(0)
     })
+}
+
+/// fork ([P24-FORK]; spec 2, 3.2): the calling thread holds every signal
+/// from here to its return, so a signal to the process waits on its page
+/// and one to its group reaches the child's page too (ForkStart writes
+/// the classes before the child's record is a target). The child gets
+/// clones of the process's sessions with the RAM files (sharing the
+/// descriptions of the descriptors without FD_CLOFORK, and so their
+/// offsets), the clock and the console's input, and binds every part of
+/// the layer to its own handles (`child`) before its return; its thread
+/// keeps its mask and has no pending signal. The child's PID in the
+/// parent, 0 in the child; EAGAIN, ENOMEM or ENOSYS as `copy` says, and
+/// for a service out of clones.
+pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
+    let block = crate::threads::own_block();
+    let mask = block.mask.swap(!0, Ordering::SeqCst);
+    let result = sessions().and_then(|sessions| copy(window, sessions));
+    if result == Ok(Forked::Child)
+        && let Err(why) = child()
+    {
+        rt::println!("posix-abi: a forked child could not bind {}", why);
+        rt::sys::process_exit(127);
+    }
+    block.mask.store(mask, Ordering::SeqCst);
+    crate::signals::route();
+    crate::signals::deliver_now();
+    result.map(|forked| match forked {
+        Forked::Parent(pid) => pid,
+        Forked::Child => 0,
+    })
+}
+
+/// Clones of the process's sessions for a child (Clone): the RAM files'
+/// with the descriptions of the descriptors without FD_CLOFORK, the
+/// clock's and the console input's, each the process has.
+fn sessions() -> Result<Sessions, i32> {
+    use crate::process::clone_errno;
+    let mut out = Sessions::default();
+    let made = (|| {
+        if let Some(clock) = crate::clock::session() {
+            let clone =
+                rt::service::clone_session(clock, &proto_clock::Method::Clone.header().bytes())
+                    .map_err(clone_errno)?;
+            out.clock = clone.into_raw().0;
+        }
+        let mut kept = [0; posix_fs::OPEN_MAX];
+        let count = crate::shared::kept_by_fork(&mut kept)?;
+        let (files, uart) = crate::shared::with_files(|fs| {
+            let (files, uart) = fs.sessions();
+            Ok((files.raw(), uart.map(Handle::raw)))
+        })?;
+        let mut w = Writer::new();
+        proto_fs::Method::Clone
+            .header()
+            .write(&mut w)
+            .map_err(|_| EIO)?;
+        w.u32(count as u32).map_err(|_| EIO)?;
+        for n in &kept[..count] {
+            w.u32(*n).map_err(|_| EIO)?;
+        }
+        // The sessions live as long as the process's files.
+        let clone = rt::service::clone_session(&Handle::<Channel>::borrowed(files), w.as_bytes())
+            .map_err(clone_errno)?;
+        out.files = clone.into_raw().0;
+        if let Some(uart) = uart {
+            let clone = rt::service::clone_session(
+                &Handle::<Channel>::borrowed(uart),
+                &proto_uart::Method::Clone.header().bytes(),
+            )
+            .map_err(clone_errno)?;
+            out.uart = clone.into_raw().0;
+        }
+        Ok(())
+    })();
+    match made {
+        Ok(()) => Ok(out),
+        Err(errno) => {
+            out.close();
+            Err(errno)
+        }
+    }
+}
+
+/// What the child runs once at its start, set by the program's start
+/// (posix-crt): its own state of the start goes.
+static AT_CHILD: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `hook` runs in each forked child once the layer is bound to it.
+pub fn at_child(hook: fn()) {
+    AT_CHILD.store(hook as usize, Ordering::Release);
+}
+
+/// The child binds every part of the layer to the handles its loader
+/// wrote into TRANSFER (spec 2, 3.2): its heap and map, its thread with a
+/// new channel and timer and its place in the table, the table of waits
+/// by address empty, its record and identity, its files, its clock and
+/// its page of the anchor, the console, its entry of signals and its
+/// router; then AT_CHILD. What fails is named.
+fn child() -> Result<(), &'static str> {
+    use proto_loader::Slot;
+    // SAFETY: the loader wrote the transfer before it jumped to `resume`,
+    // and nothing writes it in the child.
+    let bytes = unsafe { &*TRANSFER.0.get() };
+    let transfer = proto_loader::Transfer::read(bytes).ok_or("its transfer")?;
+    let raw = |slot: Slot| transfer.handles[slot as usize];
+    fn handle<K>(raw: u64) -> Option<Handle<K>> {
+        (raw != 0).then(|| Handle::from_raw(rt::abi::Handle(raw)))
+    }
+    rt::console::forget();
+    if let Some(console) = handle(raw(Slot::Console)) {
+        rt::console::set(console);
+    }
+    let process = handle(raw(Slot::Process)).ok_or("its process")?;
+    let thread = handle(raw(Slot::Thread)).ok_or("its thread")?;
+    let posix = handle(raw(Slot::Posix)).ok_or("its record")?;
+    let map = transfer.map().map(|entry| {
+        (
+            entry.address as usize,
+            entry.pages as usize,
+            entry.access,
+            Handle::from_raw(rt::abi::Handle(entry.handle)),
+        )
+    });
+    // SAFETY: the child's only thread, before anything else of the layer.
+    unsafe {
+        crate::allocation::after_fork(process, map).map_err(|_| "its memory map")?;
+        crate::threads::after_fork(thread).map_err(|_| "its thread")?;
+        posix_sync::after_fork();
+        crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
+        if let Some(files) = handle(raw(Slot::Files)) {
+            crate::shared::after_fork(files, handle(raw(Slot::Uart)));
+        }
+        crate::clock::after_fork(handle(raw(Slot::Clock)), crate::allocation::process())
+            .map_err(|_| "its clock")?;
+        crate::signals::after_fork().map_err(|_| "its signals")?;
+    }
+    let id = crate::threads::thread_number();
+    let (_, native) = crate::relibc::target(id).map_err(|_| "its place")?;
+    crate::process::register_router(&native).map_err(|_| "its router")?;
+    let hook = AT_CHILD.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `at_child` stores a value, a `fn()`.
+        let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(hook) };
+        hook();
+    }
+    Ok(())
 }

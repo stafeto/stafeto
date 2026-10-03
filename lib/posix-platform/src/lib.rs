@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 10;
+pub const PLATFORM_INTERFACE: u64 = 11;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -507,6 +507,19 @@ pub unsafe extern "C" fn stafeto_exec(
     }
 }
 
+/// fork (posix_abi::fork::fork): the child's PID in the parent, 0 in the
+/// child, or the negated errno. The window a probe set
+/// (`stafeto_probe_fork_window`) runs in the parent before ForkCommit.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fork() -> c_int {
+    let set = FORK_WINDOW.load(core::sync::atomic::Ordering::Acquire) != 0;
+    let window = set.then_some(fork_window as fn());
+    match call(|| posix_abi::fork::fork(window)) {
+        Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
+}
+
 /// The probes of the window of exec (posix_abi::process): ExecCommit
 /// with no exec gives its errno; an exec whose old image ends with `code`
 /// before ExecCommit (by its own SIGKILL for 137) returns only on an
@@ -649,6 +662,37 @@ pub unsafe extern "C" fn stafeto_probe_fork_bare(
     let hook: Option<fn()> = window.map(|_| fork_window as fn());
     match call(|| posix_abi::fork::probe_bare(|| child(arg), hook)) {
         Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
+}
+
+/// The C function the next forks run in the parent between Go and
+/// ForkCommit (`stafeto_fork`), None for none: for the probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_fork_window(window: Option<extern "C" fn()>) {
+    FORK_WINDOW.store(
+        window.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Sets FD_CLOFORK of `fd` (relibc's headers have no FD_CLOFORK yet):
+/// 0 or the negated errno, for the probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_set_clofork(fd: c_int) -> c_int {
+    let fd = match u32::try_from(fd) {
+        Ok(fd) => fd,
+        Err(_) => return -posix_abi::constants::EBADF,
+    };
+    let set = posix_abi::shared::with_files(|files| {
+        let mut flags = files.descriptor_flags(fd).map_err(posix_abi::error)?;
+        flags.close_on_fork = true;
+        files
+            .set_descriptor_flags(fd, flags)
+            .map_err(posix_abi::error)
+    });
+    match set {
+        Ok(()) => 0,
         Err(errno) => -errno,
     }
 }

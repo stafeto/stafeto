@@ -49,6 +49,31 @@ pub unsafe fn init(session: Handle<Channel>) -> Result<(), Status> {
     Ok(())
 }
 
+/// The record of a forked child (spec 2, 3.2): its own session `session`
+/// and identity session `identity`, which its loader took (Take), in place
+/// of the parent's, which name nothing of the child's and go without a
+/// close; its PID from the service. The page's classes of signals are
+/// the service's from ForkStart, and the actions the copy of the parent's.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(
+    session: Handle<Channel>,
+    identity: Option<Handle<Channel>>,
+) -> Result<(), Status> {
+    // SAFETY: the caller's promise gives these borrows alone.
+    let (state, own) = unsafe { (&mut *STATE.0.get(), &mut *IDENTITY.0.get()) };
+    if let Some(parent) = state.replace(Client::new(session)) {
+        core::mem::forget(parent);
+    }
+    if let Some(parent) = core::mem::replace(own, identity) {
+        core::mem::forget(parent);
+    }
+    let snapshot = client().query()?;
+    PID.store(snapshot.pid, Ordering::Release);
+    Ok(())
+}
+
 /// The service's answer to a request through the session of the process's
 /// record: the number its reply carries (0 for a status alone), or the
 /// errno of its status. A send that came back INTERRUPTED was never seen

@@ -115,6 +115,13 @@ impl<H> Map<H> {
     pub fn pages(&self) -> usize {
         self.iter().map(|region| region.pages).sum()
     }
+
+    /// The map is empty again, and its handles go without a drop: in a
+    /// forked child they are its parent's values, which name nothing of
+    /// the child's (spec 2, 3.2).
+    pub fn forget(&mut self) {
+        self.len = 0;
+    }
 }
 
 impl<H> Drop for Map<H> {
@@ -205,6 +212,35 @@ mod tests {
         assert_eq!(Rc::strong_count(&handle), 3);
         drop(map);
         assert_eq!(Rc::strong_count(&handle), 1);
+    }
+
+    /// A forgotten map is empty, drops none of its handles and takes new
+    /// regions where the old lay.
+    #[test]
+    fn a_forgotten_map_drops_nothing() {
+        use std::rc::Rc;
+        let handle = Rc::new(());
+        let mut map = Map::new();
+        for i in 0..3 {
+            map.push(Region {
+                address: 0x1000 * (i + 1),
+                pages: 1,
+                access: Access::Read,
+                handle: handle.clone(),
+            })
+            .unwrap();
+        }
+        map.forget();
+        assert_eq!((map.len(), map.pages()), (0, 0));
+        assert_eq!(Rc::strong_count(&handle), 4);
+        map.push(Region {
+            address: 0x1000,
+            pages: 1,
+            access: Access::Read,
+            handle: Rc::new(()),
+        })
+        .unwrap();
+        assert_eq!(map.len(), 1);
     }
 
     #[test]

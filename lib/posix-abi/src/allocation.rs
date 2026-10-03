@@ -147,6 +147,36 @@ pub unsafe fn adopt(
     })
 }
 
+/// The heap of a forked child (spec 2, 3.2): its own process `process`,
+/// and the objects of its map in `map`, which its loader made at the
+/// parent's addresses; the parent's handles in the copy of the map and of
+/// the configuration go without a close (they name nothing of the
+/// child's). The allocator's state is the parent's at the fork, so the
+/// heap goes on where the parent's was.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(
+    process: Handle<Process>,
+    map: impl Iterator<Item = (usize, usize, Access, Handle<Memory>)>,
+) -> Result<(), Refused> {
+    // SAFETY: the caller's promise gives these borrows alone.
+    let (config, state) = unsafe { (&mut *CONFIG.0.get(), &mut *HEAP.0.get()) };
+    if let Some(parent) = config.replace(Config { process }) {
+        core::mem::forget(parent);
+    }
+    state.map.forget();
+    for (address, pages, access, handle) in map {
+        state.map.push(Region {
+            address,
+            pages,
+            access,
+            handle,
+        })?;
+    }
+    Ok(())
+}
+
 /// Runs `f` on the regions of the memory map, in the order they were added
 /// (the loader's, then the heap's chunks), under the heap's lock.
 pub fn regions<R>(f: impl FnOnce(&Map<Handle<Memory>>) -> R) -> R {

@@ -19,6 +19,7 @@ use posix_fs::{PosixFs, Resolved, Target, Transport};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
+use rt::handle::Handle;
 
 struct State {
     files: Option<PosixFs>,
@@ -47,6 +48,30 @@ pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
     unsafe { (*STATE.0.get()).files = Some(files) };
     READY.store(true, Ordering::Release);
     Ok(())
+}
+
+/// The files of a forked child (posix_fs::PosixFs::after_fork): its own
+/// sessions `files` and `uart`.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(
+    files: Handle<rt::handle::Channel>,
+    uart: Option<Handle<rt::handle::Channel>>,
+) {
+    if !READY.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: the caller's promise gives this borrow alone.
+    if let Some(own) = unsafe { (*STATE.0.get()).files.as_mut() } {
+        own.after_fork(files, uart);
+    }
+}
+
+/// The descriptions of the RAM file service a forked child's session
+/// shares (posix_fs::PosixFs::kept_by_fork), into `out`; how many.
+pub fn kept_by_fork(out: &mut [u32; posix_fs::OPEN_MAX]) -> Result<usize, i32> {
+    process_state(|files| Ok(files.kept_by_fork(out)))
 }
 
 /// Runs `f` on the process's files under their lock.

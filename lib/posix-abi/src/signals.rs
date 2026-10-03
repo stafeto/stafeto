@@ -741,6 +741,25 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     Ok(())
 }
 
+/// The signals of a forked child (spec 2, 3.2): no stop of an exec is on,
+/// no pending signal an exec carried, and the child's only thread gets
+/// its entry of signals (`attach`); the actions are the copy of the
+/// parent's, and the classes on the page the service's from ForkStart.
+///
+/// # Safety
+/// The child's only thread, once its block has its handles
+/// (crate::threads::after_fork).
+pub(crate) unsafe fn after_fork() -> Result<(), i32> {
+    STOPPING.store(0, Ordering::Release);
+    PARKED.store(0, Ordering::Release);
+    STOPPER.store(0, Ordering::Release);
+    for place in &PARKING {
+        place.store(0, Ordering::Relaxed);
+    }
+    CARRIED.store(0, Ordering::Release);
+    attach()
+}
+
 /// The other threads go on: the exec failed before its commit.
 pub(crate) fn resume_others() {
     STOPPING.store(0, Ordering::Release);

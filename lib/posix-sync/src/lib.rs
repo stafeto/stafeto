@@ -118,6 +118,18 @@ pub fn defer_entry() -> bool {
     }
 }
 
+/// The table of waits by address is empty again, its locks free: in a
+/// forked child the nodes of its parent's other threads are not threads
+/// of the child (spec 2, 3.2). The child's only thread waits in none.
+pub fn after_fork() {
+    for bucket in &TABLE {
+        bucket.head.store(ptr::null_mut(), Ordering::Relaxed);
+        bucket.tail.store(ptr::null_mut(), Ordering::Relaxed);
+        bucket.waiters.store(0, Ordering::Relaxed);
+        bucket.lock.store(0, Ordering::Release);
+    }
+}
+
 /// A bucket: the count of its waiters, the word of its lock and its list.
 #[repr(C, align(32))]
 struct Bucket {

@@ -47,6 +47,30 @@ pub unsafe fn init_with(session: Handle<Channel>) -> Result<(), Status> {
     Ok(())
 }
 
+/// The clock of a forked child (spec 2, 3.2): its own session `session`,
+/// a clone of its parent's, in place of the parent's, which names nothing
+/// of the child's and goes without a close, and the page of the anchor
+/// mapped again into its process `process`, which its loader did not copy.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(
+    session: Option<Handle<Channel>>,
+    process: &Handle<rt::handle::Process>,
+) -> Result<(), Status> {
+    // SAFETY: the caller's promise gives this borrow alone.
+    let slot = unsafe { &mut *STATE.0.get() };
+    if let Some(parent) = core::mem::replace(slot, session.map(Client::from_session)) {
+        core::mem::forget(parent);
+    }
+    let attached = PAGE.swap(false, Ordering::AcqRel);
+    if attached && slot.is_some() {
+        // SAFETY: the caller's promise; the copy left PAGE_ADDRESS free.
+        unsafe { attach_page(process) }?;
+    }
+    Ok(())
+}
+
 /// The process's session with the clock service.
 pub fn session() -> Option<&'static Handle<Channel>> {
     client().ok().map(Client::session)

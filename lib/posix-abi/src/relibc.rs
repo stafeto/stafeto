@@ -144,6 +144,36 @@ pub unsafe fn attach_main(block: *mut Block) {
     unsafe { (*block).thread_id = 1 };
 }
 
+/// The table of a forked child (spec 2, 3.2): its only thread, number
+/// `id` with the native handle `native`, keeps its place; every other
+/// place is free, its handles and memory the parent's (the copies of the
+/// other threads' TCBs and stacks stay in the child's heap); the exit
+/// channel comes anew when a thread is made, and the child's thread routes
+/// the process's signals.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(id: u64, native: u64) {
+    for (index, place) in TABLE.iter().enumerate() {
+        if index as u64 + 1 == id {
+            place.native.store(native, Ordering::Relaxed);
+            place.stack.store(0, Ordering::Relaxed);
+            place.stack_len.store(0, Ordering::Relaxed);
+            place.state.store(LIVE, Ordering::Release);
+            continue;
+        }
+        place.native.store(0, Ordering::Relaxed);
+        place.block.store(0, Ordering::Relaxed);
+        place.tcb.store(0, Ordering::Relaxed);
+        place.tcb_len.store(0, Ordering::Relaxed);
+        place.stack.store(0, Ordering::Relaxed);
+        place.stack_len.store(0, Ordering::Relaxed);
+        place.state.store(FREE, Ordering::Release);
+    }
+    EXITS.store(0, Ordering::Release);
+    ROUTER.store(id, Ordering::Release);
+}
+
 /// The block and the handle of live thread `id`, for a signal or a
 /// request of cancellation; ESRCH for none. A thread stays in its place
 /// until relibc released it, which relibc does after the last use of its

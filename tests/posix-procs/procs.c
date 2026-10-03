@@ -103,7 +103,17 @@
  * children of fork at most (the 33rd is EAGAIN), the pool of the service
  * gives no quota past its own (ENOMEM), and a ForkStart that never got
  * its copy takes neither SpawnCommit nor an early ForkCommit, and leaves
- * no zombie after ForkAbort.
+ * no zombie after ForkAbort. The role forkfull forks with the layer bound
+ * in the child: it sees the parent's PID as its PPID, the parent's memory
+ * and its own copies of it, its mask, a caught and an ignored action, and
+ * no pending signal of the parent's; it shares the offset of an open file
+ * with its parent, keeps a descriptor with FD_CLOEXEC and loses one with
+ * FD_CLOFORK; it opens a file, reads both clocks, makes a thread, grows its
+ * heap by 1 MiB, signals its parent, forks a grandchild and execs /bin/ls
+ * of /etc, whose status its parent's waitpid gets. A SIGINT the parent
+ * sends its group while the copy goes on reaches both; pthread_atfork's
+ * handlers run in POSIX's order, and vfork is fork. BusyBox ash from its
+ * file runs `/bin/ls /etc && exit 3`, which forks.
  *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
@@ -151,6 +161,8 @@ void stafeto_probe_yield(void);
 void stafeto_probe_park(void);
 int stafeto_probe_fork_abort(int *pid);
 unsigned long long stafeto_probe_map_mappings(void);
+void stafeto_probe_fork_window(void (*window)(void));
+int stafeto_probe_set_clofork(int fd);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
@@ -1021,6 +1033,161 @@ static int fork_pool(void) {
     return failures;
 }
 
+
+/* Role forkfull: fork with the layer bound in the child (5d, T3). */
+static volatile int full_data = 1234;
+static volatile int ints, usr1s, alrms;
+static void count_int(int signal) { (void)signal; ints++; }
+static void count_usr1(int signal) { (void)signal; usr1s++; }
+static void count_alrm(int signal) { (void)signal; alrms++; }
+static void full_window(void) { kill(0, SIGINT); }
+static void *full_thread(void *arg) { return (char *)arg + 1; }
+
+/* The order of pthread_atfork's handlers: prepare in the opposite order of
+ * their establishment, parent and child in it. */
+static char order[16];
+static int order_len;
+static void note(char c) {
+    if (order_len < (int)sizeof order - 1) order[order_len++] = c;
+}
+static void prepare_a(void) { note('A'); }
+static void prepare_b(void) { note('B'); }
+static void parent_a(void) { note('a'); }
+static void parent_b(void) { note('b'); }
+static void child_a(void) { note('1'); }
+static void child_b(void) { note('2'); }
+
+/* What the child checks before it execs /bin/ls; the count of failures. */
+static int full_child(pid_t parent, int fd, int cloexec, int clofork, volatile int *stack) {
+    expect("getppid in the child", getppid(), parent);
+    expect("the child's own PID", getpid() != parent, 1);
+    expect("the handlers' order in the child", strcmp(order, "BA12"), 0);
+    expect("the parent's .data", full_data, 5678);
+    expect("the parent's stack", *stack, 77);
+    full_data = 1;
+    *stack = 3;
+    sigset_t mask, pending;
+    sigprocmask(SIG_BLOCK, NULL, &mask);
+    expect("the mask holds SIGUSR1", sigismember(&mask, SIGUSR1), 1);
+    expect("the mask holds SIGHUP", sigismember(&mask, SIGHUP), 1);
+    sigpending(&pending);
+    expect("no pending SIGUSR1 in the child", sigismember(&pending, SIGUSR1), 0);
+    struct sigaction action;
+    sigaction(SIGUSR1, NULL, &action);
+    expect("a caught SIGUSR1 stays caught", action.sa_handler == count_usr1, 1);
+    sigaction(SIGUSR2, NULL, &action);
+    expect("an ignored SIGUSR2 stays ignored", action.sa_handler == SIG_IGN, 1);
+    expect("the group's SIGINT of the window in the child", ints, 1);
+    char bytes[16];
+    expect("a read of the shared description", (int)read(fd, bytes, 10), 10);
+    struct stat st;
+    expect("FD_CLOEXEC stays open", fstat(cloexec, &st), 0);
+    expect("FD_CLOFORK is closed", fstat(clofork, &st) == -1 ? errno : 0, EBADF);
+    /* The child's table has the number of FD_CLOFORK free: the lowest. */
+    int motd = open("/etc/motd", O_RDONLY);
+    expect("an open in the child takes FD_CLOFORK's number", motd, clofork);
+    expect("an open in the child", motd >= 0 && read(motd, bytes, 7) == 7 &&
+                                         memcmp(bytes, "stafeto", 7) == 0, 1);
+    close(motd);
+    struct timespec now;
+    expect("CLOCK_REALTIME in the child", clock_gettime(CLOCK_REALTIME, &now), 0);
+    expect("CLOCK_MONOTONIC in the child", clock_gettime(CLOCK_MONOTONIC, &now), 0);
+    pause_ms(5);
+    pthread_t thread;
+    void *back = NULL;
+    expect("pthread_create in the child", pthread_create(&thread, NULL, full_thread, (void *)41), 0);
+    expect("pthread_join in the child", pthread_join(thread, &back), 0);
+    expect("the thread's value", back == (void *)42, 1);
+    size_t grow = 1024 * 1024;
+    char *more = malloc(grow);
+    expect("1 MiB more heap in the child", more != NULL, 1);
+    if (more) {
+        memset(more, 0x5a, grow);
+        free(more);
+    }
+    expect("kill of the parent", kill(parent, SIGALRM), 0);
+    /* A grandchild. */
+    fflush(stdout);
+    pid_t grandchild = fork();
+    if (grandchild == 0) _exit(getppid() == getpid() ? 1 : 7);
+    int status = -1;
+    expect("waitpid of the grandchild", waitpid(grandchild, &status, 0), grandchild);
+    expect("the grandchild's status", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 7);
+    return failures;
+}
+
+static int fork_full(void) {
+    expect("setpgid of forkfull", setpgid(0, 0), 0);
+    pid_t me = getpid();
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = count_int;
+    sigaction(SIGINT, &action, NULL);
+    action.sa_handler = count_usr1;
+    sigaction(SIGUSR1, &action, NULL);
+    /* The child's SIGALRM comes while the parent waits for it. */
+    action.sa_handler = count_alrm;
+    action.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &action, NULL);
+    signal(SIGUSR2, SIG_IGN);
+    sigset_t block;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigaddset(&block, SIGHUP);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    raise(SIGUSR1);
+    pthread_atfork(prepare_a, parent_a, child_a);
+    pthread_atfork(prepare_b, parent_b, child_b);
+    int fd = open("/etc/motd", O_RDONLY);
+    char bytes[4];
+    expect("a read before the fork", (int)read(fd, bytes, 3), 3);
+    int cloexec = open("/etc/motd", O_RDONLY | O_CLOEXEC);
+    int clofork = open("/etc/motd", O_RDONLY);
+    expect("FD_CLOFORK set", stafeto_probe_set_clofork(clofork), 0);
+    volatile int stack = 77;
+    full_data = 5678;
+    stafeto_probe_fork_window(full_window);
+    fflush(stdout);
+    pid_t pid = fork();
+    stafeto_probe_fork_window(NULL);
+    if (pid == 0) {
+        if (full_child(me, fd, cloexec, clofork, &stack) != 0) _exit(1);
+        printf("posix-procs: a forked child execs ls\n");
+        fflush(stdout);
+        char *ls[] = {"ls", "/etc", NULL};
+        char *env[] = {"PATH=/bin", NULL};
+        execve("/bin/ls", ls, env);
+        _exit(100 + errno);
+    }
+    if (pid < 0) {
+        printf("posix-procs: fork gave %d (%s)\n", errno, strerror(errno));
+        return 1;
+    }
+    expect("the handlers' order in the parent", strcmp(order, "BAab"), 0);
+    expect("the group's SIGINT of the window in the parent", ints, 1);
+    int status = -1;
+    expect("waitpid of the forked child", waitpid(pid, &status, 0), pid);
+    expect("the forked child's ls", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 0);
+    expect("the shared offset", (int)lseek(fd, 0, SEEK_CUR), 13);
+    expect("the child's SIGALRM", alrms, 1);
+    expect("the parent's .data after the child", full_data, 5678);
+    expect("the parent's stack after the child", stack, 77);
+    sigset_t pending;
+    sigpending(&pending);
+    expect("the parent's pending SIGUSR1", sigismember(&pending, SIGUSR1), 1);
+    /* vfork is fork. */
+    fflush(stdout);
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    pid_t v = vfork();
+#pragma clang diagnostic pop
+    if (v == 0) _exit(5);
+    expect("waitpid of a vfork child", waitpid(v, &status, 0), v);
+    expect("the vfork child's status", WIFEXITED(status) ? WEXITSTATUS(status) : -1, 5);
+    if (failures == 0) printf("posix-procs: fork with the layer bound\n");
+    return failures;
+}
+
 /* The roles of the children. */
 static int role(const char *name) {
     if (strcmp(name, "steps") == 0) return steps_run();
@@ -1064,6 +1231,7 @@ static int role(const char *name) {
     }
     if (strcmp(name, "forkbare") == 0) return fork_bare();
     if (strcmp(name, "forkpool") == 0) return fork_pool();
+    if (strcmp(name, "forkfull") == 0) return fork_full();
     if (strcmp(name, "memmap") == 0) {
         int bad = map_start();
         return bad != 0 ? bad : 10 * map_growth("child");
@@ -1589,6 +1757,22 @@ static void forks(void) {
     /* A program init started has no segments in its map. */
     expect("a fork of a program init started", stafeto_probe_fork_bare(bare_park, NULL, NULL), -ENOSYS);
     run_role("/bin/procs-child", "forkbare", NULL);
+    run_role("/bin/procs-child", "forkfull", NULL);
+    /* BusyBox ash from its file (/bin/ls, BusyBox, as `ash`) runs an
+     * external program that is not its last command: it forks, and the
+     * shell goes on to exit 3 once ls succeeded. */
+    char *ash[] = {"ash", "-c", "/bin/ls /etc && exit 3", NULL};
+    char *env[] = {"PATH=/bin", NULL};
+    pid_t shell = -1;
+    expect("spawn of ash -c", posix_spawn(&shell, "/bin/ls", NULL, NULL, ash, env), 0);
+    int status = -1;
+    if (shell > 0 && waitpid(shell, &status, 0) == shell && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 3) {
+        printf("posix-procs: ash -c ran /bin/ls\n");
+    } else {
+        printf("posix-procs: ash -c ended with status %#x\n", status);
+        failures++;
+    }
     pid_t sleeper = start("sleep");
     run_role("/bin/procs-child", "forkpool", NULL);
     if (sleeper > 0) {

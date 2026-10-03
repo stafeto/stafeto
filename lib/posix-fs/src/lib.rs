@@ -414,6 +414,45 @@ impl PosixFs {
         Ok(fs)
     }
 
+    /// The files of a forked child (spec 2, 3.2), whose table is a copy of
+    /// its parent's: its own sessions `files` and `uart`, clones of its
+    /// parent's that share the descriptions of the descriptors without
+    /// FD_CLOFORK, in place of the parent's, which name nothing of the
+    /// child's and go without a close; the descriptors with FD_CLOFORK go
+    /// with no word to the service, which gave the child's session none of
+    /// theirs, and so do the holds of the parent's requests.
+    pub fn after_fork(&mut self, files: Handle<Channel>, uart: Option<Handle<Channel>>) {
+        let parent = core::mem::replace(&mut self.files, Files::from_sessions(files, uart));
+        core::mem::forget(parent);
+        while self.descriptors.abandon_hold().is_some() {}
+        let mut closing = [false; OPEN_MAX];
+        for (fd, _, flags) in self.descriptors.open() {
+            closing[fd as usize] = flags.close_on_fork;
+        }
+        for (fd, close) in closing.iter().enumerate() {
+            if *close {
+                let _ = self.descriptors.close(fd as u32);
+            }
+        }
+    }
+
+    /// The service's descriptions a forked child's session shares with
+    /// its parent's: those of the descriptors without FD_CLOFORK, each
+    /// once, into `out`; how many.
+    pub fn kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, flags) in self.descriptors.open() {
+            if let Target::Ram(n) = target
+                && !flags.close_on_fork
+                && !out[..count].contains(&n)
+            {
+                out[count] = n;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// The session with the RAM file service and the console's driver's,
     /// which a child gets clones of.
     pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {

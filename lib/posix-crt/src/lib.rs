@@ -152,6 +152,12 @@ pub fn parent() -> ManuallyDrop<Handle<Channel>> {
     Handle::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)))
 }
 
+/// A forked child's start channel is its parent's value, which names
+/// nothing of its own: it has none (posix_abi::fork::at_child).
+fn forked() {
+    PARENT.store(0, Ordering::Release);
+}
+
 /// The live handles of the process at the start of a program its loader
 /// started, and the handles its start area names (its slots and the
 /// objects of its memory map): the loader closed all that was its own when
@@ -315,6 +321,7 @@ fn loaded_main() -> u64 {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(Handle::from_raw(identity)) };
     }
+    posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };
     // The auxiliary vector's pairs lie in the area, after the NULL of envp.
@@ -391,5 +398,6 @@ pub extern "C" fn crt_main(arg: u64) -> u64 {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(identity) };
     }
+    posix_abi::fork::at_child(forked);
     start_relibc(&arguments[..count])
 }
