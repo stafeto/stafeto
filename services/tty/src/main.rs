@@ -153,6 +153,7 @@ struct Tables {
 
 struct Device {
     console: Terminal,
+    winsize: proto_tty::Winsize,
     readers: Waiters<WAITERS>,
     writers: Waiters<WAITERS>,
     drainers: Waiters<WAITERS>,
@@ -168,6 +169,7 @@ impl Device {
     const fn new() -> Self {
         Self {
             console: Terminal::new(),
+            winsize: proto_tty::Winsize::new(),
             readers: Waiters::new(),
             writers: Waiters::new(),
             drainers: Waiters::new(),
@@ -1944,6 +1946,60 @@ impl Tty {
         Answer::Reply(Outgoing::new())
     }
 
+    fn get_winsize(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let mut body = r.body();
+        let description = match body.u32().and_then(|id| body.finish().map(|()| id)) {
+            Ok(id) => id,
+            Err(status) => return Answer::Status(status),
+        };
+        if let Err(code) = self.select_description(s, description) {
+            return status(code);
+        }
+        if let Err(code) = self.caller(s, r) {
+            return status(code);
+        }
+        let size = self.devices[self.active].winsize;
+        if r.reply()
+            .u32(0)
+            .and_then(|()| size.write(r.reply()))
+            .is_err()
+        {
+            return Answer::Status(Status::BadSize);
+        }
+        Answer::Reply(Outgoing::new())
+    }
+
+    fn set_winsize(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let set = match proto_tty::SetWinsize::parse(r.body()) {
+            Ok(set) => set,
+            Err(status) => return Answer::Status(status),
+        };
+        let endpoint = match self.select_description(s, set.description) {
+            Ok(endpoint) => endpoint,
+            Err(code) => return status(code),
+        };
+        let caller = match self.caller(s, r) {
+            Ok(caller) => caller,
+            Err(code) => return status(code),
+        };
+        if endpoint.side == Side::Slave
+            && let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, set.blocked)
+        {
+            return status(code);
+        }
+        let before = self.devices[self.active].winsize;
+        if before != set.size {
+            self.devices[self.active].winsize = set.size;
+            if let Some(group) = self.devices[self.active].jobs.foreground()
+                && let Err(code) = self.try_signal_group(group, 28)
+            {
+                self.devices[self.active].winsize = before;
+                return status(code);
+            }
+        }
+        Answer::Status(Status::Ok)
+    }
+
     /// FLUSH_QUEUES: the input not read, or the output the driver did not
     /// take, goes.
     fn flush_queues(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
@@ -2051,7 +2107,7 @@ const SIGTSTP: u32 = 20;
 #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
 const PROBE_METHODS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+    27, 28, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
 ];
 
 impl Tty {
@@ -2413,10 +2469,14 @@ impl Tty {
     /// (TtySignal) and answers at the walk's end. A group of a session
     /// the console is no longer the controlling terminal of gets none.
     fn signal_group(&mut self, group: u32, number: u32) {
+        let _ = self.try_signal_group(group, number);
+    }
+
+    fn try_signal_group(&mut self, group: u32, number: u32) -> Result<(), u32> {
         let generation = self.devices[self.active].job_generation;
         let terminal = self.active as u32;
         let Some(notary) = self.notary() else {
-            return;
+            return Err(NO_IDENTITY);
         };
         let mut w = Writer::new();
         let written = proto_process::Method::TtySignal
@@ -2427,16 +2487,20 @@ impl Tty {
             .and_then(|()| w.u32(number))
             .and_then(|()| w.u64(generation));
         if written.is_err() {
-            return;
+            return Err(INVALID);
         }
-        let Ok(reply) = sys::send(notary, w.as_bytes()) else {
-            return;
+        let reply = loop {
+            match sys::send(notary, w.as_bytes()) {
+                Err(Error::Interrupted) => continue,
+                Err(_) => return Err(proto_tty::IO_ERROR),
+                Ok(reply) => break reply,
+            }
         };
         let mut buffer = [0; MESSAGE_MAX];
-        let code = proto_wire::Reader::new(reply.bytes(&mut buffer))
-            .u32()
-            .unwrap_or(0);
-        let _ = code;
+        match proto_wire::Reader::new(reply.bytes(&mut buffer)).u32() {
+            Ok(0 | proto_process::NO_PROCESS) => Ok(()),
+            _ => Err(proto_tty::IO_ERROR),
+        }
     }
 }
 
@@ -2464,7 +2528,8 @@ impl Service<0> for Tty {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+                24, 25, 26, 27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45,
+                46,
             ]
         }
         #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
@@ -2475,7 +2540,7 @@ impl Service<0> for Tty {
         {
             &[
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26,
-                27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44,
+                27, 28, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
             ]
         }
         #[cfg(all(not(feature = "trust-probe"), not(feature = "steps")))]
@@ -2572,6 +2637,8 @@ impl Service<0> for Tty {
                 }
             }
             Some(Method::GetAttr) => self.get_attr(s, r),
+            Some(Method::GetWinsize) => self.get_winsize(s, r),
+            Some(Method::SetWinsize) => self.set_winsize(s, r),
             Some(Method::SetAttr) => self.set_attr(s, r),
             Some(
                 m @ (Method::Acquire

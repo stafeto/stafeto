@@ -398,6 +398,38 @@ pub fn get_attr(transport: Transport, number: u32) -> Result<Termios, i32> {
     proto_tty::attr_reply(reply).map_err(|status| refusal(status).unwrap_or(EIO))
 }
 
+pub fn get_winsize(transport: Transport, description: u32) -> Result<proto_tty::Winsize, i32> {
+    let mut w = Writer::new();
+    Method::GetWinsize.header().write(&mut w).map_err(|_| EIO)?;
+    w.u32(description).map_err(|_| EIO)?;
+    let mut buffer = [0; rt::abi::MESSAGE_MAX];
+    let reply = call(transport, w.as_bytes(), true, &mut buffer)?;
+    status_of(reply)?;
+    let mut r = proto_wire::Reader::new(&reply[4..]);
+    let size = proto_tty::Winsize::read(&mut r).map_err(|_| EIO)?;
+    r.finish().map_err(|_| EIO)?;
+    Ok(size)
+}
+
+pub fn set_winsize(
+    transport: Transport,
+    description: u32,
+    size: proto_tty::Winsize,
+) -> Result<(), i32> {
+    retry(|| {
+        let mut w = Writer::new();
+        proto_tty::SetWinsize {
+            description,
+            blocked: blocked(proto_process::SIGTTOU),
+            size,
+        }
+        .write(&mut w)
+        .map_err(|_| EIO)?;
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        status_of(call(transport, w.as_bytes(), true, &mut buffer)?)
+    })
+}
+
 /// tcdrain: returns once the service has given the driver all the output
 /// of the terminal `number`; a signal ends the wait with EINTR.
 #[inline(never)]
