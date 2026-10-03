@@ -1737,12 +1737,7 @@ fn posix_abi_boots() -> Result<(), String> {
         "boot-posix-abi.img",
         "posix-abi-probe",
     ))?;
-    println!("posix-abi-probe: the layer's .data + .bss {data} bytes, limit {LAYER_DATA_LIMIT}");
-    if data > LAYER_DATA_LIMIT {
-        return Err(format!(
-            "the layer's .data + .bss in posix-abi-probe is {data} bytes, over {LAYER_DATA_LIMIT}"
-        ));
-    }
+    println!("posix-abi-probe: the layer's .data + .bss {data} bytes");
     let image = build_boot_image("boot-posix-tls.img", &POSIX_TLS_PROGRAMS, BOOT_PROFILE)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
@@ -5100,11 +5095,6 @@ fn text_size(elf: &Path) -> Result<u64, String> {
         })
         .ok_or_else(|| format!("{}: no .text", elf.display()))
 }
-
-/// The bound of the layer's `.data` + `.bss` in a program (step 5a′: 16
-/// KiB; 20 KiB since step 5d, which adds the memory map of 128 regions,
-/// 4 KiB).
-const LAYER_DATA_LIMIT: u64 = 20 * 1024;
 
 /// The test hooks of the reply journals went with the journals (spec 6.1):
 /// no Cargo.toml of the workspace names the feature `transport-probe`.

@@ -87,10 +87,29 @@ pub fn insert(word: &AtomicU64, authority: &AtomicU64, signal: u8, ticket: u64) 
 /// Take a bit together with its epoch; a cancelled assignment disappears.
 pub fn take(word: &AtomicU64, authority: &AtomicU64, signal: u8) -> Option<u64> {
     let c = class(signal)?;
+    take_ticket(
+        word,
+        authority,
+        signal,
+        word.load(Ordering::Acquire) & !c.low,
+    )
+}
+
+/// Claim only the captured epoch, so a local fast path cannot take a new
+/// process-origin assignment after cancellation and publication.
+pub fn take_ticket(
+    word: &AtomicU64,
+    authority: &AtomicU64,
+    signal: u8,
+    ticket: u64,
+) -> Option<u64> {
+    let c = class(signal)?;
     let mut before = word.load(Ordering::Acquire);
     loop {
-        let ticket = before & !c.low;
-        if before & c.bit == 0 || authority.load(Ordering::Acquire) & !c.low != ticket {
+        if before & !c.low != ticket
+            || before & c.bit == 0
+            || authority.load(Ordering::Acquire) & !c.low != ticket
+        {
             return None;
         }
         match word.compare_exchange(before, before & !c.bit, Ordering::AcqRel, Ordering::Acquire) {
@@ -116,6 +135,8 @@ mod tests {
         assert_eq!(take(&thread, &page, SIGTTIN), None);
         assert!(!insert(&page, &page, SIGTTIN, 0));
         assert!(insert(&thread, &page, SIGTSTP, 8));
+        assert_eq!(take_ticket(&thread, &page, SIGTSTP, 0), None);
+        assert_eq!(thread.load(Ordering::Acquire), 9);
         assert!(insert(&thread, &page, SIGTTOU, 8));
         assert_eq!(take(&thread, &page, SIGTSTP), Some(8));
         assert_eq!(take(&thread, &page, SIGTTOU), Some(8));

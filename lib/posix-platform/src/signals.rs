@@ -281,3 +281,20 @@ pub extern "C" fn stafeto_probe_zero_return() -> c_int {
 pub extern "C" fn stafeto_probe_assign_signal(signal: c_int) -> c_int {
     posix_abi::signals::probe_assign_signal(signal)
 }
+
+/// Publish a sender assignment before the next new thread starts.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_thread_start(hook: Option<extern "C" fn(u64)>) {
+    posix_abi::relibc::probe_start_window(hook);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_route_newborn(id: u64, signal: c_int) -> c_int {
+    posix_abi::signals::probe_route_newborn(id, signal)
+}
+
+/// Replace a local pending signal inside its origin snapshot and claim.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_local_claim(hook: Option<extern "C" fn(c_int)>) {
+    posix_abi::signals::probe_local_claim_window(hook);
+}
