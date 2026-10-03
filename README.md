@@ -260,15 +260,15 @@ Bounded kernel paths and their costs:
 | Step | What it brings | State |
 |---|---|---|
 | Cleanup after kernel audit 3 | small kernel fixes, Cortex-A53 erratum 835769 workaround, EL2 boot in tests, fresh worst-case measurements | ✅ [#70](https://github.com/stafeto/stafeto/pull/70) |
-| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | 🚧 |
+| Subproject 2 design | process model, IPC transport for POSIX, libc choice and the licence of the in-process layer | ✅ |
 | Kernel | a DMA memory objects, the Virtio console as a user-space service · b process IDs out of the kernel, thread end notifications, teardown in portions | ✅ [#71](https://github.com/stafeto/stafeto/pull/71), [#72](https://github.com/stafeto/stafeto/pull/72) |
 | POSIX: transport | mutex and heap without IPC on the fast path, no helper threads per process | ✅ [#74](https://github.com/stafeto/stafeto/pull/74) |
 | POSIX: C library | relibc on top of the Rust system layer; BusyBox builds with it; the first os-test row | ✅ [#75](https://github.com/stafeto/stafeto/pull/75) |
 | POSIX: process service | process service, `posix_spawn` from the boot image, `waitpid`, `kill`, process groups and sessions | ✅ [#76](https://github.com/stafeto/stafeto/pull/76) |
 | POSIX: spawn and exec | boot image files in the RAM service, a loader, `posix_spawn` and `exec` from files, set-ID through the file service, os-test from files, measured steps of the process service | ✅ [#78](https://github.com/stafeto/stafeto/pull/78) |
-| POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | 🚧 [#79](https://github.com/stafeto/stafeto/pull/79) |
-| POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | 🚧 pull request to follow (branch `m5e-pipes`) |
-| POSIX: terminal | a terminal service with `termios` and job control, `poll` and `select` | ⬜ |
+| POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | ✅ [#79](https://github.com/stafeto/stafeto/pull/79) |
+| POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
+| POSIX: terminal | a terminal service with `termios` and job control, `poll` and `select`, Ctrl-C to the foreground group | 🚧 |
 | POSIX: conformance | os-test and Open POSIX in `ci`; then timers, `sigqueue` | ⬜ |
 | PinePhone bring-up | U-Boot `booti`, 16550 UART driver, Allwinner A64 device tree, `ash` on the serial port | ⬜ |
 

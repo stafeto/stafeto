@@ -106,14 +106,17 @@ memory. The table of kernel paths is unchanged; the steps are recorded in
   that `init` started share 48 (`ENFILE`). The service holds 64 pipes in
   all.
 - **A ring of 4 KiB; `PIPE_BUF` is 512.** A write of at most 512 bytes
-  goes in whole or waits for room; a longer one is cut into pieces of at
-  most 1,004 bytes, and the pieces of two writers may mix. The pipe's size
+  goes in whole or waits for room, and so does a `writev` of at most 512
+  bytes in all, which relibc gathers into one write; a longer one is cut
+  into pieces of at most 1,004 bytes, and the pieces of two writers may mix.
+  `readv` makes one read, as `read` does, and spreads its bytes over the
+  parts. The pipe's size
   cannot be changed (`F_SETPIPE_SZ` is not there).
 - **Waits.** At most 8 blocked operations at one end, 16 in one process, 96
   of the 128 that the service holds; `EAGAIN` past them (see the
   conformance list).
-- **Sessions and records.** 255 clones of the service's 320 sessions;
-  `Clone` gives `EAGAIN` past them.
+- **Sessions and records.** 255 clones per tree of processes, of the
+  service's 320 sessions; `Clone` gives `EAGAIN` past them.
 - **No `poll`, `ppoll`, `select`, `pselect`.** relibc builds them on
   `epoll`, which the platform answers with `ENOSYS`; the 11 tests of os-test
   that call them are UNSUPPORTED. They come with the terminal service in the

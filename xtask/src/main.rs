@@ -2080,9 +2080,9 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: 40 forks of a parent with six threads",
         // Pipes (5e): within a process and across fork.
         "posix-procs: pipes within a process and across fork",
-        // The signals of the shell and setpgid of a child of fork (5e, T4).
+        // The signals of the shell and setpgid of a child of fork (5e).
         "posix-procs: shell signals and setpgid of a child",
-        // /dev/null (5e, T5): 1 MiB written, nothing kept.
+        // /dev/null (5e): 1 MiB written, nothing kept.
         "posix-procs: /dev/null drops 1 MiB",
         // Across spawn, fork and exec: cat on two pipes, the ends' numbers,
         // the waiters of an old image, the loader's refusal, ash's pipeline.

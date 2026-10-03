@@ -197,6 +197,7 @@
 #include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2587,6 +2588,22 @@ static void pipes(void) {
     expect("the end of the data", (int)read(p[0], got, sizeof got), 0);
     close(p[0]);
 
+    /* readv gives what is there at once: 4 bytes for parts of 4 and 8,
+     * with no wait for the byte a thread writes 300 ms later. */
+    expect("pipe of readv", pipe(p), 0);
+    expect("4 bytes for readv", (int)write(p[1], "abcd", 4), 4);
+    struct later late = {p[1], 300, 'e'};
+    pthread_t late_writer;
+    pthread_create(&late_writer, NULL, write_later, &late);
+    char first[4] = {0}, second[8] = {0};
+    struct iovec parts[2] = {{first, sizeof first}, {second, sizeof second}};
+    expect("readv of what is there", (int)readv(p[0], parts, 2), 4);
+    expect("its bytes", memcmp(first, "abcd", 4), 0);
+    pthread_join(late_writer, NULL);
+    expect("the late byte", (int)read(p[0], got, sizeof got), 1);
+    close(p[0]);
+    close(p[1]);
+
     /* A thread blocked in read takes what another writes. */
     expect("pipe of the threads", pipe(p), 0);
     struct later later = {p[1], 50, 'z'};
@@ -3105,31 +3122,58 @@ static int pipe_fork(void) {
 
     /* Three writers of 16 records of {PIPE_BUF} bytes each into a pipe
      * that fills before the reader starts, which then frees 100 bytes at
-     * a time: no record of one mixes with another's. */
-    expect("pipe of three writers", pipe(p), 0);
-    pid_t writers[3];
-    for (int w = 0; w < 3; w++) {
-        writers[w] = fork();
-        if (writers[w] == 0) {
-            close(p[0]);
-            memset(block, 'x' + w, sizeof block);
-            for (int i = 0; i < 16; i++) {
-                if (write(p[1], block, sizeof block) != (ssize_t)sizeof block) _exit(1);
+     * a time: no record of one mixes with another's, whether write gives
+     * it whole or writev in two parts of 256 bytes. */
+    for (int vector = 0; vector < 2; vector++) {
+        expect("pipe of three writers", pipe(p), 0);
+        pid_t writers[3];
+        for (int w = 0; w < 3; w++) {
+            writers[w] = fork();
+            if (writers[w] == 0) {
+                close(p[0]);
+                memset(block, 'x' + w, sizeof block);
+                struct iovec halves[2] = {{block, 256}, {block + 256, 256}};
+                for (int i = 0; i < 16; i++) {
+                    ssize_t n = vector ? writev(p[1], halves, 2) : write(p[1], block, sizeof block);
+                    if (n != (ssize_t)sizeof block) _exit(1);
+                }
+                _exit(0);
             }
-            _exit(0);
         }
+        close(p[1]);
+        pause_ms(100);
+        int records[256] = {0};
+        int total = read_to_end(p[0], records, 100);
+        expect(vector ? "the bytes of three writers of writev" : "the bytes of three writers", total,
+               3 * 16 * 512);
+        expect("records of x", records['x'], 16);
+        expect("records of y", records['y'], 16);
+        expect("records of z", records['z'], 16);
+        expect(vector ? "mixed records of writev" : "mixed records", records[0], 0);
+        close(p[0]);
+        for (int w = 0; w < 3; w++) reap("a writer of records", writers[w], 0, 0);
     }
-    close(p[1]);
-    pause_ms(100);
-    int records[256] = {0};
-    int total = read_to_end(p[0], records, 100);
-    expect("the bytes of three writers", total, 3 * 16 * 512);
-    expect("records of x", records['x'], 16);
-    expect("records of y", records['y'], 16);
-    expect("records of z", records['z'], 16);
-    expect("mixed records", records[0], 0);
-    close(p[0]);
-    for (int w = 0; w < 3; w++) reap("a writer of records", writers[w], 0, 0);
+
+    /* A pipe's end with FD_CLOFORK is not the child's: once the parent
+     * closed its write end, its reader sees the end of the data while the
+     * child still lives. */
+    int clofork[2];
+    expect("pipe2 with O_CLOFORK", pipe2(clofork, O_CLOFORK), 0);
+    child = fork();
+    if (child == 0) {
+        pause_ms(500);
+        _exit(0);
+    }
+    close(clofork[1]);
+    fcntl(clofork[0], F_SETFL, O_NONBLOCK);
+    int eof = -1;
+    for (int i = 0; i < 100 && eof != 0; i++) {
+        eof = (int)read(clofork[0], got, sizeof got);
+        if (eof != 0) pause_ms(2);
+    }
+    expect("the end of the data with the child's end closed by FD_CLOFORK", eof, 0);
+    close(clofork[0]);
+    reap("the child of O_CLOFORK", child, 0, 0);
 
     /* A session has 16 live pipes (EMFILE); a tree of processes, the root
      * of the pipe service's chain of clones, 48 in all, three quarters of
@@ -3232,7 +3276,7 @@ static int pipe_fork(void) {
     return failures;
 }
 
-/* Stage shell signals (5e, T4): what BusyBox ash relies on. */
+/* Stage shell signals (5e): what BusyBox ash relies on. */
 static volatile int chld_handled;
 static void on_chld(int signal) {
     (void)signal;
@@ -3258,7 +3302,7 @@ static void shell_signals(void) {
     sigemptyset(&chld);
     sigaddset(&chld, SIGCHLD);
     /* A thread's own SIGCHLD with SIG_DFL, blocked: it waits on the
-     * thread and sigtimedwait takes it (pс2.1.7); with SIG_IGN it goes. */
+     * thread and sigtimedwait takes it; with SIG_IGN it goes. */
     signal(SIGCHLD, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
     sigprocmask(SIG_BLOCK, &chld, NULL);
@@ -3392,7 +3436,7 @@ static int setpgid_fork(void) {
     return failures;
 }
 
-/* /dev/null (5e, T5): writes are dropped, reads end at once. */
+/* /dev/null (5e): writes are dropped, reads end at once. */
 static void null_device(void) {
     char null_block[4096];
     memset(null_block, 'x', sizeof null_block);

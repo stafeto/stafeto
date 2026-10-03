@@ -565,11 +565,16 @@ that goes with 28 ends. Longest steps under -icount, ticks, with 128 and
 Every step of the service is below B, and none grows with the number of
 processes: the Clone and own-step rows differ between the columns by the
 spread of the volleys of the crowd (they interleave with the step in
-progress), and `process-steps` fails when any of them passes 20,536. The
+progress), and `process-steps` fails when any of them passes 20,536. Clone has the least
+margin: 17,382 ticks with 248 children, 85 % of B, since it goes through
+the 320 places of the births and of the clones; it is the first to split
+when the tables grow (with the steps of the process service, 5h). The
 heartbeat is the loop's wait for init's reply, in which processes of higher
 levels run (the volley of 248 children); it is no work of the service, and
 the check bounds it at 500,000 ticks apart from B. A thread below level 40
-waits for at most one step that has begun. No step allocates memory: the
+waits for at most one step of the service's own work that has begun; the
+wait for init's reply goes to threads above the client's level, so it adds
+nothing to the client's delay. No step allocates memory: the
 rings, the descriptions, the sessions and the waiters live in the
 service's `.bss`. The kernel did not change, and B stays 20,536. Details
 are in [notes/m5e-pipes.md](../notes/m5e-pipes.md).
