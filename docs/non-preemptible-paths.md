@@ -433,22 +433,32 @@ The scheduler link holds the parked ring; priority changes and IPC inheritance
 change its level while it stays in that ring. No new object is allocated.
 
 The 128-thread measurement uses 64 threads per portion over all 63 legal
-levels, with one repeat. `kernel-test 512M icount` measures stop=33,
-park=80, continue=96 and resume_64=3733 instructions. The continuation is
-below B=20,538. The previous B=20,536 grew by two instructions in the
-Handles chunk when the process-cleanup dispatch acquired its continuation
-case. The process shell is 1264 bytes and keeps three slots per pool page.
-The normal build reports null=262, clock=315, yield=380, notify=1018,
-round_trip=2004 ticks in `init-test 512M icount` after the new EL0 gate.
-The same command on the base commit reports 254, 310, 375, 1010 and 1993;
+levels, with one repeat. `kernel-test 512M icount` measures the scoped
+components below. The control scopes call `process::control` directly and
+exclude syscall validation, exception entry and EL0 return. The parking
+scope locks the scheduler, calls `pick` and then `park_selected`; the
+surrounding exit-loop poll and decision setup are excluded. The first
+stop has no queued continuation. A separate stop cancels the remaining
+queued portion and releases its process reference.
+
+The continuation stays below B=20,538. The previous B=20,536 grew by two
+instructions in the Handles chunk when the process-cleanup dispatch
+acquired its continuation case. The process shell is 1264 bytes and keeps
+three slots per pool page. The normal build reports null=262, clock=315,
+yield=380, notify=1018, round_trip=2004 ticks in `init-test 512M icount`
+after the EL0 gate. The base commit reports 254, 310, 375, 1010 and 1993;
 the increases are 8, 5, 5, 8 and 11 ticks, respectively.
 
-| Path | Work between interrupt polls | Instructions under -icount |
+| Operation | Measured scope | Instructions under -icount |
 |---|---|---|
-| process stop, 128 threads | one flag write and cancellation of an existing item | 33 |
-| one selected suspended thread | remove CPU state and insert its existing link in the process ring | 80 |
-| process continue, 128 threads | one flag write and enqueue its existing item | 96 |
-| continuation portion | 64 removals and ready inserts over levels 1–63 | 3733 |
+| first stop, 128 threads | internal `process::control`, no queued continuation | 33 |
+| stop with a queued continuation | internal `process::control`, item removal and queue reference release | 99 |
+| select and park one suspended thread | locked `pick` + `park_selected` test scope | 80 |
+| continue, 128 threads | internal `process::control`, flag write and enqueue | 96 |
+| continuation portion | `cleanup::portion`, 64 removals and ready inserts over levels 1–63 | 3731 |
+
+These readings cover the specified test scopes. The complete exception
+entry, syscall or exit-loop interval requires its own measurement boundaries.
 
 ## Steps of the process service
 

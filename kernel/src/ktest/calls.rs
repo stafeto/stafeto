@@ -6050,7 +6050,8 @@ pub fn process_control_checks_its_arguments(_: &Boot) -> Result<(), &'static str
     })
 }
 
-/// Pick each ready suspended thread exactly once, as the EL0 exit gate does.
+/// Measure the locked pick + park_selected test scope for each ready thread.
+/// The surrounding exit-loop poll, decision setup and EL0 return are excluded.
 fn park_crowd(count: usize) -> Result<u64, &'static str> {
     let mut longest = 0;
     for _ in 0..count {
@@ -6083,7 +6084,7 @@ pub fn suspended_crowds_stop_again_and_die(_: &Boot) -> Result<(), &'static str>
 
 /// 128 threads, using every legal priority on the ready path. A timer wait
 /// is a receive: its channel and timer belong to that same process.
-fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 5], &'static str> {
+fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 6], &'static str> {
     let counts = (
         process::in_use(),
         thread::in_use(),
@@ -6213,8 +6214,13 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 5], &'static str
                 "the measured continuation missed a legal priority level",
             )?;
         }
+        let mut stop_cancel = 0;
         if stop_again {
+            // The remaining portion holds one queued process reference.
+            // This scope includes removing its item and releasing that reference.
+            let start = timer::now();
             process::control(p, true, CAUSE).map_err(|_| "second stop failed")?;
+            stop_cancel = timer::now() - start;
             check(
                 cleanup::len() == 0,
                 "second stop left a continuation queued",
@@ -6262,7 +6268,14 @@ fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 5], &'static str
             core::mem::size_of::<Process>(),
             kcore::slab::Pool::<Process>::PER_PAGE
         );
-        Ok([stop, park, continue_call, portion, cleanup::take_longest()])
+        Ok([
+            stop,
+            park,
+            continue_call,
+            portion,
+            stop_cancel,
+            cleanup::take_longest(),
+        ])
     })();
     for tm in alarms.into_iter().flatten() {
         unsafe {
@@ -6317,12 +6330,12 @@ pub fn suspended_reply_keeps_its_result(_: &Boot) -> Result<(), &'static str> {
 
 #[cfg(feature = "icount")]
 pub fn suspension_paths_are_measured(_: &Boot) -> Result<(), &'static str> {
-    let [stop, park, continue_call, portion, longest] = suspension_crowd(0, false)?;
+    let [stop, park, continue_call, portion, stop_cancel, longest] = suspension_crowd(0, true)?;
     kprintln!(
-        "suspension ticks: stop={stop} park={park} continue={continue_call} resume_64={portion}"
+        "suspension scopes ticks: control_stop_no_queue={stop} control_stop_cancel={stop_cancel} pick_park_selected={park} control_continue={continue_call} resume_64={portion}"
     );
     check(
-        longest <= 20_538 && portion <= 20_538,
-        "a continuation portion exceeded B",
+        longest <= 20_538 && portion <= 20_538 && stop_cancel <= 20_538,
+        "a suspension scope exceeded B",
     )
 }

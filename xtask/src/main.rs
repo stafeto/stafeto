@@ -653,9 +653,16 @@ const TEARDOWN_ROWS: [&str; 9] = [
     "session_handles",
     "threads",
 ];
+/// Scoped direct-control, pick + park and continuation measurements.
+const SUSPENSION_ROWS: [&str; 5] = [
+    "control_stop_no_queue",
+    "control_stop_cancel",
+    "pick_park_selected",
+    "control_continue",
+    "resume_64",
+];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
-const SUSPENSION_ROWS: [&str; 4] = ["stop", "park", "continue", "resume_64"];
 const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
 /// The line the shell of the normal build says once it connected to the
 /// UART driver (spec 13.6): the driver registered, its output goes by
@@ -4266,7 +4273,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             ("device window", &WINDOW_ROWS[..]),
             ("upcall", &UPCALL_ROWS[..]),
             ("teardown portions", &TEARDOWN_ROWS[..]),
-            ("suspension", &SUSPENSION_ROWS[..]),
+            ("suspension scopes", &SUSPENSION_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
@@ -4284,9 +4291,9 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
     Ok(r.passed.len())
 }
 
-/// The lines whose rows are each one stretch of the kernel between two
-/// polls for interrupts: a portion of a long call, of the timer queue or
-/// of the cleanup, or a whole short call (spec 15.3).
+/// Measured portions and scoped components compared against B (spec 15.3).
+/// Suspension control and pick rows exclude the surrounding syscall and
+/// exit-loop work; their boundaries are documented with the path table.
 const PORTION_LINES: [&str; 7] = [
     "memory portions",
     "timer portions",
@@ -4294,7 +4301,7 @@ const PORTION_LINES: [&str; 7] = [
     "device window",
     "upcall",
     "teardown portions",
-    "suspension",
+    "suspension scopes",
 ];
 
 /// The longest row of the PORTION_LINES among the `measured` lines (name,
