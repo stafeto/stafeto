@@ -29,7 +29,9 @@
 //!   both Go and HandlesDone succeeded, before the parent's final reply.
 //! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
 //!   the parent's memory the loader makes for a `fork`; reply its status,
-//!   BAD_SIZE past REGIONS_MAX regions or a second Fork or Start.
+//!   required_mask declares the original layer's session slots before Go
+//!   or HandlesDone. BAD_SIZE for a bit outside Slot::GIVEN, past
+//!   REGIONS_MAX regions or a second Fork or Start.
 //! - Regions, after Fork: body an entry (`Region`, REGION bytes) for each
 //!   of its handles, one to four memory objects of the parent's memory map
 //!   with MAP_READ, each at least the entry's pages long; the loader takes
@@ -65,7 +67,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -293,6 +295,22 @@ impl Slot {
         Slot::Terminal,
         Slot::Entropy,
     ];
+
+    /// The bit of this slot in Fork's required session mask.
+    pub const fn bit(self) -> u32 {
+        1 << self as u32
+    }
+
+    /// Every session slot a parent may declare required for a fork.
+    pub const GIVEN_MASK: u32 = {
+        let mut mask = 0;
+        let mut i = 0;
+        while i < Self::GIVEN.len() {
+            mask |= Self::GIVEN[i].bit();
+            i += 1;
+        }
+        mask
+    };
 
     /// The slot of a handle Handles brings: Files, Clock, Driver, Pipes or
     /// Terminal or Entropy.
@@ -938,13 +956,15 @@ pub fn region_object(kind: abi::ObjectKind, rights: abi::Rights) -> bool {
 /// layer's code it jumps to with the stack pointer `sp` and x0 = 0, the
 /// address `transfer` of TRANSFER_SIZE bytes of the layer's data the
 /// loader writes the child's handles into (`write_transfer`), and how many
-/// regions Regions brings.
+/// regions Regions brings. `required_mask` names the sessions the copied
+/// layer needs, using Slot bits; HandlesDone checks all of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fork {
     pub pc: u64,
     pub sp: u64,
     pub transfer: u64,
     pub regions: u32,
+    pub required_mask: u32,
 }
 
 impl Fork {
@@ -952,14 +972,18 @@ impl Fork {
         w.u64(self.pc)?;
         w.u64(self.sp)?;
         w.u64(self.transfer)?;
-        w.u32(self.regions)
+        w.u32(self.regions)?;
+        w.u32(self.required_mask)
     }
 
-    /// BAD_SIZE out of the layout, for no regions or past REGIONS_MAX.
+    /// BAD_SIZE out of the layout, for no regions, past REGIONS_MAX or
+    /// a required slot outside Slot::GIVEN.
     pub fn read(mut r: Reader<'_>) -> Result<Fork, Status> {
-        let (pc, sp, transfer, regions) = (r.u64()?, r.u64()?, r.u64()?, r.u32()?);
+        let (pc, sp, transfer, regions, required_mask) =
+            (r.u64()?, r.u64()?, r.u64()?, r.u32()?, r.u32()?);
         r.finish()?;
-        if regions == 0 || regions as usize > REGIONS_MAX {
+        if regions == 0 || regions as usize > REGIONS_MAX || required_mask & !Slot::GIVEN_MASK != 0
+        {
             return Err(Status::BadSize);
         }
         Ok(Fork {
@@ -967,6 +991,7 @@ impl Fork {
             sp,
             transfer,
             regions,
+            required_mask,
         })
     }
 }
@@ -1578,6 +1603,7 @@ mod tests {
             sp: abi::INIT_STACK_TOP - 0x400,
             transfer: 0x22_0100,
             regions: regions as u32,
+            required_mask: 0,
         }
     }
 
@@ -1621,6 +1647,41 @@ mod tests {
             Err(Status::BadSize),
             "W and X together"
         );
+    }
+
+    /// Required sessions are declared independently of offered Handles.
+    #[test]
+    fn fork_accepts_only_given_session_bits() {
+        for mask in core::iter::once(0)
+            .chain(core::iter::once(Slot::GIVEN_MASK))
+            .chain(Slot::GIVEN.map(Slot::bit))
+        {
+            let f = Fork {
+                required_mask: mask,
+                ..fork(8)
+            };
+            let mut w = Writer::new();
+            f.write(&mut w).unwrap();
+            assert_eq!(Fork::read(Reader::new(w.as_bytes())), Ok(f));
+        }
+        for mask in [
+            Slot::Process.bit(),
+            Slot::Thread.bit(),
+            Slot::Posix.bit(),
+            Slot::PosixId.bit(),
+            Slot::Console.bit(),
+            1 << SLOTS,
+            u32::MAX,
+        ] {
+            let mut w = Writer::new();
+            Fork {
+                required_mask: mask,
+                ..fork(8)
+            }
+            .write(&mut w)
+            .unwrap();
+            assert_eq!(Fork::read(Reader::new(w.as_bytes())), Err(Status::BadSize));
+        }
     }
 
     /// A copy takes regions inside the rooms of a program alone, each apart

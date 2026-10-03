@@ -3540,6 +3540,49 @@ static int channel_child(const char *name) {
         execv("/bin/procs-child", next);
         return 16;
     }
+    if (strcmp(name, "channels_missing_fork") == 0) {
+        int file = open("/etc/motd", O_RDONLY);
+        int ends[2];
+        if (file < 0 || pipe(ends) != 0 || write(ends[1], "p", 1) != 1) return 20;
+        const unsigned modes[] = {2, 5, 6, 7};
+        const char *slots[] = {"Terminal", "Files", "Clock", "Pipes"};
+        for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+            stafeto_probe_loader_bundle(modes[i]);
+            errno = 0;
+            pid_t child = fork();
+            int error = errno;
+            if (child == 0) _exit(21);
+            if (child > 0) {
+                int status = 0;
+                waitpid(child, &status, 0);
+                printf("loader-channels: missing fork %s accepted PID %d errno %d child %d\n",
+                       slots[i], (int)child, error, status);
+                return 22;
+            }
+            if (error != EAGAIN) {
+                printf("loader-channels: missing fork %s failed PID %d errno %d, expected EAGAIN\n",
+                       slots[i], (int)child, error);
+                return 23;
+            }
+            printf("loader-channels: missing fork %s refused before Commit\n", slots[i]);
+        }
+        stafeto_probe_loader_bundle(0);
+        pid_t child = fork();
+        if (child == 0) {
+            char byte = 0;
+            struct timespec now;
+            if (isatty(3) != 1 || read(file, &byte, 1) != 1 || byte != 's' ||
+                read(ends[0], &byte, 1) != 1 || byte != 'p' ||
+                clock_gettime(CLOCK_MONOTONIC, &now) != 0) _exit(24);
+            _exit(0);
+        }
+        int status = 0;
+        char byte = 0;
+        if (child < 0 || waitpid(child, &status, 0) != child || status != 0 ||
+            read(file, &byte, 1) != 1 || byte != 't') return 25;
+        if (close(file) != 0 || close(ends[0]) != 0 || close(ends[1]) != 0) return 26;
+        return 0;
+    }
     if (strcmp(name, "channels_terminal_fork") == 0) {
         stafeto_probe_loader_bundle(3);
         pid_t child = fork();
@@ -3676,6 +3719,9 @@ static int loader_channels(void) {
     exec_missing = -1;
     expect("spawn incomplete exec bundle probe", spawn(&exec_missing, "channels_no_done_exec", NULL, NULL), 0);
     if (exec_missing > 0) reap("Commit before Done is refused", exec_missing, 126, 0);
+    pid_t fork_missing = -1;
+    expect("spawn missing fork bundle probe", spawn(&fork_missing, "channels_missing_fork", NULL, NULL), 0);
+    if (fork_missing > 0) reap("fork slots checked before Commit, then descriptors preserved", fork_missing, 0, 0);
     expect("close the packet terminal", close(terminal), 0);
     if (failures) return 1;
     printf("loader-channels: packets 4+1, final slot and repeated completion checked\n");

@@ -408,6 +408,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                     Some(Method::Fork) if first => match Fork::read(r) {
                         Ok(body) if handles.is_empty() => match scratch(own) {
                             Ok(scratch) => {
+                                for slot in Slot::GIVEN {
+                                    needed[slot as usize] = body.required_mask & slot.bit() != 0;
+                                }
                                 fork = Some((body, scratch));
                                 0
                             }

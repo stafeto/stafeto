@@ -175,6 +175,28 @@ pub struct Sessions {
 }
 
 impl Sessions {
+    /// Declare the original session snapshot before any transfer probe can
+    /// remove an offered handle. A bound layer also needs Files and Clock.
+    fn required_mask(self) -> u32 {
+        use proto_loader::Slot;
+        let mut mask = 0;
+        for (slot, raw) in [
+            (Slot::Files, self.files),
+            (Slot::Clock, self.clock),
+            (Slot::Driver, self.uart),
+            (Slot::Pipes, self.pipes),
+            (Slot::Terminal, self.terminal),
+        ] {
+            if raw != 0 {
+                mask |= slot.bit();
+            }
+        }
+        if self.files != 0 || self.clock != 0 {
+            mask |= Slot::Files.bit() | Slot::Clock.bit();
+        }
+        mask
+    }
+
     /// The parent's own sessions go: those of a fork that never came to
     /// its loader.
     fn close(self) {
@@ -382,6 +404,7 @@ fn make(
         sp,
         transfer: TRANSFER.0.get() as u64,
         regions: regions.count as u32,
+        required_mask: sessions.required_mask(),
     };
     let mut w = Writer::new();
     Method::Fork.header().write(&mut w).map_err(|_| EIO)?;
