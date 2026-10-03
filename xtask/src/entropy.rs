@@ -302,12 +302,13 @@ pub const RANDOM_PROGRAMS: [ImageProgram; 9] = [
 ];
 
 /// The lines of the C probe, each a check that passed.
-const RANDOM_LINES: [&str; 18] = [
+const RANDOM_LINES: [&str; 19] = [
     "posix-random: getrandom with GRND_NONBLOCK before the first seed gave EAGAIN",
     "posix-random: getentropy waited for the first seed with another inside a handler",
     "posix-random: a pipe read went on after another inside a handler",
     "posix-random: arc4random went on after a handler without SA_RESTART",
     "posix-random: getentropy is no point of cancellation: it returned, the next point cancelled",
+    "posix-random: cancellation left the first seed wait bounded",
     "posix-random: two threads read 4096 bytes of /dev/urandom at once, all different",
     "posix-random: getentropy gave 256 bytes twice, they differ",
     "posix-random: getentropy of 257 bytes gave EINVAL",

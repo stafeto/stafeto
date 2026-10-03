@@ -364,6 +364,7 @@ name = "posix-random-probe"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
+ "rt",
 ]
 
 [[package]]
