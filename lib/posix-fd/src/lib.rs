@@ -38,11 +38,13 @@ struct Hold<T> {
     backend: T,
     count: u16,
     closed: bool,
+    released: bool,
 }
 
 pub struct Table<T: Copy + Eq, const N: usize> {
     entries: [Option<Entry<T>>; N],
     holds: [Option<Hold<T>>; N],
+    release_early: fn(T) -> bool,
 }
 
 impl<T: Copy + Eq, const N: usize> Default for Table<T, N> {
@@ -50,11 +52,21 @@ impl<T: Copy + Eq, const N: usize> Default for Table<T, N> {
         Self {
             entries: [None; N],
             holds: [None; N],
+            release_early: |_| false,
         }
     }
 }
 
 impl<T: Copy + Eq, const N: usize> Table<T, N> {
+    /// Release the real backend when its last fd closes. Operations retain
+    /// their own generation references at the service.
+    pub fn with_early_release(release_early: fn(T) -> bool) -> Self {
+        Self {
+            release_early,
+            ..Self::default()
+        }
+    }
+
     fn entry(&self, fd: u32) -> Result<Entry<T>, Error> {
         self.entries
             .get(fd as usize)
@@ -134,7 +146,12 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         {
             Some(hold) => {
                 hold.closed = true;
-                None
+                if (self.release_early)(backend) {
+                    hold.released = true;
+                    Some(backend)
+                } else {
+                    None
+                }
             }
             None => Some(backend),
         }
@@ -163,6 +180,7 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
             backend,
             count: 1,
             closed: false,
+            released: false,
         });
         Ok(backend)
     }
@@ -179,7 +197,7 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         if hold.count > 0 {
             return None;
         }
-        let closed = hold.closed;
+        let closed = hold.closed && !hold.released;
         *slot = None;
         (closed && !self.referenced(backend)).then_some(backend)
     }
@@ -191,7 +209,7 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
     pub fn abandon_hold(&mut self) -> Option<T> {
         while let Some(slot) = self.holds.iter_mut().find(|h| h.is_some()) {
             let hold = slot.take().expect("a hold");
-            if hold.closed && !self.referenced(hold.backend) {
+            if hold.closed && !hold.released && !self.referenced(hold.backend) {
                 return Some(hold.backend);
             }
         }
@@ -265,6 +283,25 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_fd_releases_early_once_while_generation_hold_survives() {
+        let mut table = Table::<u32, 4>::with_early_release(|backend| backend >= 100);
+        let fd = table.insert(100, Flags::default()).unwrap();
+        let copy = table.duplicate(fd, 0, Flags::default()).unwrap();
+        assert_eq!(table.hold(fd), Ok(100));
+        assert_eq!(table.close(fd), Ok(None));
+        assert_eq!(table.close(copy), Ok(Some(100)));
+        let fresh = table.insert(101, Flags::default()).unwrap();
+        assert_eq!(fresh, fd);
+        assert_eq!(table.unhold(100), None);
+        assert_eq!(table.get(fresh), Ok(101));
+        assert_eq!(table.close(fresh), Ok(Some(101)));
+        let ram = table.insert(7, Flags::default()).unwrap();
+        table.hold(ram).unwrap();
+        assert_eq!(table.close(ram), Ok(None));
+        assert_eq!(table.unhold(7), Some(7));
+    }
 
     #[test]
     fn allocation_reuses_lowest_slot_and_enforces_limit() {

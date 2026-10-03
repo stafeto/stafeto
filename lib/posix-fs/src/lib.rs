@@ -602,7 +602,9 @@ impl PosixFs {
                     pipes: None,
                     terminal: None,
                     paths: PathState::new(),
-                    descriptors: Table::default(),
+                    descriptors: Table::with_early_release(|target| {
+                        matches!(target, Target::Tty(_))
+                    }),
                 };
                 for d in list {
                     fs.descriptors
@@ -709,7 +711,7 @@ impl PosixFs {
     }
 
     fn from_files(files: Files) -> Result<Self, FsError> {
-        let mut descriptors = Table::default();
+        let mut descriptors = Table::with_early_release(|target| matches!(target, Target::Tty(_)));
         for target in [Target::Input, Target::Output, Target::Error] {
             descriptors.insert(target, DescriptorFlags::default())?;
         }
