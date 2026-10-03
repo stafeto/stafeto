@@ -669,6 +669,14 @@ pub extern "C" fn stafeto_probe_decoy(on: c_int) {
     posix_abi::process::probe_decoy(on != 0);
 }
 
+/// The probe of the loader's refusal of a pipe's end with no session of
+/// the pipe service (posix_abi::process::probe_no_pipes_session): the
+/// next spawns give the loader none.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_no_pipes_session(on: c_int) {
+    posix_abi::process::probe_no_pipes_session(on != 0);
+}
+
 /// The C function a probe of fork runs in the parent between Go and
 /// ForkCommit (`stafeto_probe_fork_bare`), 0 for none.
 static FORK_WINDOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);

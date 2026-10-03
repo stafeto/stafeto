@@ -360,6 +360,17 @@ pub fn probe_decoy(on: bool) {
     DECOY.store(on, Ordering::Relaxed);
 }
 
+/// The probe of the loader's refusal of the end of a pipe with no session
+/// of the pipe service to give (5e): with it set, a spawn's Handles brings
+/// no Pipes session.
+static NO_PIPES_SESSION: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Sets the probe of the loader's refusal of a pipe's end with no session.
+pub fn probe_no_pipes_session(on: bool) {
+    NO_PIPES_SESSION.store(on, Ordering::Relaxed);
+}
+
 /// The window where the layer writes the block of a spawn (5c); one
 /// spawn of the process writes there at a time (SPAWN_LOCK).
 const SPAWN_WINDOW: usize = 0x3000_0000;
@@ -529,8 +540,7 @@ impl Shadow {
                 posix_fs::Target::Output => Names::Output,
                 posix_fs::Target::Error => Names::Error,
                 posix_fs::Target::Ram(n) => Names::File(n),
-                // The ends of pipes cross spawn and exec with step 5e's T3.
-                posix_fs::Target::Pipe(_) => continue,
+                posix_fs::Target::Pipe(n) => Names::Pipe(n),
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -554,6 +564,22 @@ impl Shadow {
             }
             _ => None,
         })
+    }
+
+    /// The ends of pipes the child's session shares, each once.
+    fn shared_pipes(&self) -> ([u32; posix_fs::OPEN_MAX], usize) {
+        let (list, count) = self.descriptors();
+        let mut ends = [0; posix_fs::OPEN_MAX];
+        let mut found = 0;
+        for d in &list[..count] {
+            if let proto_loader::Names::Pipe(n) = d.names
+                && !ends[..found].contains(&n)
+            {
+                ends[found] = n;
+                found += 1;
+            }
+        }
+        (ends, found)
     }
 
     /// The caller lets go: its holds end and the descriptors the actions
@@ -1027,13 +1053,19 @@ fn move_files(c: &Handle<Channel>) {
     let Ok((files, uart)) = sessions else {
         return;
     };
-    // The new image gets a session of its own with the pipe service, which
-    // holds no end yet: this image's session lets go of its ends as it
-    // ends.
+    // The session with the pipe service moves as it is, with the ends of
+    // the descriptors that stay. The operations that wait in it for the
+    // threads of this image go first, or they would wait on in the new
+    // image's session, and count against its limits: the stopped threads
+    // never end them. The sessions of the RAM files and the clock keep no
+    // waiting operation, so a general Abandon of long operations has
+    // nothing else to do here.
     let pipes = crate::shared::with_files(|files| Ok(files.pipes().map(Handle::raw)))
         .ok()
-        .flatten()
-        .and_then(|pipes| crate::fork::pipes_clone(pipes, &[]).ok());
+        .flatten();
+    if let Some(pipes) = pipes {
+        crate::pipes::abandon(pipes);
+    }
     let mut w = Writer::new();
     if Method::Handles.header().write(&mut w).is_err() {
         return;
@@ -1051,10 +1083,10 @@ fn move_files(c: &Handle<Channel>) {
             let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
         }
     }
-    if let Some(pipes) = pipes
+    if let Some(raw) = pipes
         && w.u32(Slot::Pipes as u32).is_ok()
     {
-        let _ = handles.push(pipes.erase());
+        let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
     }
     let _ = ask_loader(c, &w, Some(handles));
 }
@@ -1140,10 +1172,15 @@ fn commit(
         ),
         None => None,
     };
-    // A session of its own with the pipe service, which holds no end yet:
-    // the ends of pipes cross spawn with step 5e's T3.
+    // The child's session with the pipe service: a clone of the caller's
+    // that holds the ends the child starts with (none the probe of the
+    // loader's refusal gives).
     let pipes = match crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
-        Some(pipes) => Some(crate::fork::pipes_clone(pipes, &[])?),
+        Some(_) if NO_PIPES_SESSION.load(Ordering::Relaxed) => None,
+        Some(pipes) => {
+            let (ends, count) = shadow.shared_pipes();
+            Some(crate::fork::pipes_clone(pipes, &ends[..count])?)
+        }
         None => None,
     };
     let mut w = Writer::new();

@@ -99,6 +99,10 @@ pub enum Names {
     /// The open description of this number in the session of the RAM file
     /// service the child gets (Clone shares it).
     File(u32),
+    /// The end of a pipe of this number in the session of the pipe
+    /// service the child gets, which holds it (5e). The loader takes the
+    /// kind only with a session in the slot Pipes.
+    Pipe(u32),
 }
 
 /// A descriptor the child starts with.
@@ -115,6 +119,7 @@ impl Descriptor {
             Names::Output => (1, 0),
             Names::Error => (2, 0),
             Names::File(n) => (3, n),
+            Names::Pipe(n) => (4, n),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -133,6 +138,7 @@ impl Descriptor {
             (1, 0) => Names::Output,
             (2, 0) => Names::Error,
             (3, n) => Names::File(n),
+            (4, n) => Names::Pipe(n),
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -302,6 +308,13 @@ impl<'a> Block<'a> {
     }
 
     /// The descriptors the child starts with.
+    /// Whether a descriptor names the end of a pipe, which only a session
+    /// of the pipe service holds (the loader needs one in the slot Pipes).
+    pub fn names_pipes(&self) -> bool {
+        self.descriptors()
+            .any(|d| matches!(d.names, Names::Pipe(_)))
+    }
+
     pub fn descriptors(&self) -> impl Iterator<Item = Descriptor> + 'a {
         self.descriptors
             .as_chunks::<DESCRIPTOR>()
@@ -1293,6 +1306,10 @@ mod tests {
                 fd: 4,
                 names: Names::File(7),
             },
+            Descriptor {
+                fd: 5,
+                names: Names::Pipe(9),
+            },
         ];
         let mut out = vec![0; BLOCK_MAX];
         let argv: [&[u8]; 1] = [b"ls"];
@@ -1309,6 +1326,19 @@ mod tests {
         let read = Block::read(&out[..len]).unwrap();
         assert_eq!(read.descriptors().collect::<Vec<_>>(), list);
         assert_eq!(read.strings(), b"ls\0");
+        assert!(read.names_pipes());
+        let mut plain = vec![0; BLOCK_MAX];
+        let plain_len = Block::write_with(
+            &mut plain,
+            b"/bin/ls",
+            b"/",
+            0,
+            [&b"ls"[..]].into_iter(),
+            [].into_iter(),
+            &list[..2],
+        )
+        .unwrap();
+        assert!(!Block::read(&plain[..plain_len]).unwrap().names_pipes());
         let mut twice = out[..len].to_vec();
         let at = HEADER + 7 + 1;
         twice[at + DESCRIPTOR..at + DESCRIPTOR + 4].copy_from_slice(&0u32.to_le_bytes());
@@ -1323,9 +1353,9 @@ mod tests {
         let mut area = vec![0; area_len(&read)];
         write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
-        assert_eq!(start.descriptor_count, 2);
+        assert_eq!(start.descriptor_count, 3);
         let at = (start.descriptors - START_AREA) as usize;
-        let back: Vec<_> = area[at..at + 2 * DESCRIPTOR]
+        let back: Vec<_> = area[at..at + 3 * DESCRIPTOR]
             .as_chunks::<DESCRIPTOR>()
             .0
             .iter()

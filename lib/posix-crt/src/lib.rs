@@ -206,6 +206,7 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
             Names::Output => Target::Output,
             Names::Error => Target::Error,
             Names::File(n) => Target::Ram(n),
+            Names::Pipe(n) => Target::Pipe(n),
         };
         *place = Inherited { fd: d.fd, target };
     }

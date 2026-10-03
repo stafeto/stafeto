@@ -29,6 +29,17 @@ fn refusal(status: Status) -> Option<i32> {
     }
 }
 
+/// ABANDON through the session `pipes`: the operations of its threads
+/// that wait go, as when the session goes. An exec asks it of the session
+/// it hands to the new image, whose stopped threads never end their
+/// waits; a send that comes back INTERRUPTED goes again, the service
+/// never saw it. The reply says nothing more than the session answered.
+pub(crate) fn abandon(pipes: rt::abi::Handle) {
+    let session = rt::handle::Handle::<rt::handle::Channel>::borrowed(pipes);
+    let request = Method::Abandon.header().bytes();
+    while rt::sys::send(&session, &request) == Err(rt::abi::Error::Interrupted) {}
+}
+
 /// A read of up to `out.len()` bytes (MAX_READ at most) of the read end
 /// `end`: the count, 0 at the end of the data.
 #[inline(never)]

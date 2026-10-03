@@ -148,6 +148,19 @@
  * longest steps of the pipe service: eight waiters woken at once at either
  * end, a Clone of 28 ends and a session of 28 that goes.
  *
+ * Stage pipes, spawn and exec (5e): the ends of pipes cross posix_spawn,
+ * fork and exec. The parent writes to /bin/cat through a pipe on its
+ * stdin and reads the answer from a second pipe on its stdout: with
+ * adddup2 of FD_CLOEXEC ends, with adddup2 and addclose of plain ends, and
+ * by fork, dup2 and exec; cat sees the end of the data only when the ends
+ * with FD_CLOEXEC are gone from the new image. A plain end keeps its number
+ * in a spawned child, an FD_CLOEXEC one is closed. Threads of an image
+ * that wait in a pipe when it execs leave no waiter behind in the service
+ * (role pipeghost, then pipeghost2: eight readers wait, the new image's
+ * reader would be the ninth). A spawn that names a pipe's end with no
+ * session of the pipe service to give is refused by the loader. BusyBox ash
+ * runs `/bin/ls /etc | /bin/cat`.
+ *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
  * reports that status (REPLACED), never the old image's 0.
@@ -202,6 +215,7 @@ void stafeto_probe_fork_early(void (*window)(void));
 void stafeto_probe_mmap_sleep(unsigned long long us);
 unsigned long long stafeto_probe_pool(void);
 void stafeto_probe_decoy(int on);
+void stafeto_probe_no_pipes_session(int on);
 size_t stafeto_probe_memory_map(unsigned long long *out, size_t max);
 unsigned long long stafeto_probe_memory_used(void);
 
@@ -1740,6 +1754,10 @@ static int fork_spin(void) {
 
 static int pipe_fork(void);
 static int sigpipe_default(void);
+static int pipe_child(void);
+static int cat_fork(void);
+static int pipe_ghosts(void);
+static int pipe_ghosts_after(void);
 
 /* The roles of the children. */
 static int role(const char *name) {
@@ -1795,6 +1813,10 @@ static int role(const char *name) {
     if (strcmp(name, "forkmany") == 0) return fork_many();
     if (strcmp(name, "pipefork") == 0) return pipe_fork();
     if (strcmp(name, "sigpipe") == 0) return sigpipe_default();
+    if (strcmp(name, "pipechild") == 0) return pipe_child();
+    if (strcmp(name, "catfork") == 0) return cat_fork();
+    if (strcmp(name, "pipeghost") == 0) return pipe_ghosts();
+    if (strcmp(name, "pipeghost2") == 0) return pipe_ghosts_after();
     if (strcmp(name, "forkdie") == 0) return fork_die(0);
     if (strcmp(name, "forkdieearly") == 0) return fork_die(1);
     if (strcmp(name, "execmaking") == 0) return exec_making();
@@ -2433,6 +2455,7 @@ static void usr1_in(int flags) {
     main_thread = pthread_self();
 }
 
+static void pipes_inherited(void);
 static void pipes(void) {
     _Static_assert(PIPE_BUF == 512, "{PIPE_BUF} of the pipe service");
     int p[2];
@@ -2555,6 +2578,279 @@ static void pipes(void) {
     pid_t killed = start("sigpipe");
     reap("a write without a reader and SIGPIPE's default", killed, 0, SIGPIPE);
     if (failures == 0) printf("posix-procs: pipes within a process and across fork\n");
+    pipes_inherited();
+    if (failures == 0) printf("posix-procs: pipes across spawn and exec\n");
+}
+
+/* Reads the non-blocking `fd` to its end within `ms`, up to size - 1
+ * bytes into `out`, which gets its NUL: the count, -1 when the end did
+ * not come in time, -2 for a failure of read. */
+static int read_by_deadline(int fd, char *out, int size, long ms) {
+    int got = 0;
+    for (long waited = 0; waited <= ms;) {
+        int n = (int)read(fd, out + got, (size_t)(size - 1 - got));
+        if (n > 0) {
+            got += n;
+            continue;
+        }
+        if (n == 0) {
+            out[got] = 0;
+            return got;
+        }
+        if (errno != EAGAIN) return -2;
+        pause_ms(5);
+        waited += 5;
+    }
+    out[got] = 0;
+    return -1;
+}
+
+static const char CAT_TEXT[] = "hello through two pipes\n";
+
+/* The parent's part of a cat on two pipes: `in` is the cat's stdin and
+ * `out` its stdout. The parent's ends of the cat's go; the text goes in,
+ * the write end closes, and the answer comes back whole before the end of
+ * the data, which waits for every writer of `in` to be gone. */
+static void cat_exchange(const char *what, pid_t pid, int in[2], int out[2]) {
+    close(in[0]);
+    close(out[1]);
+    fcntl(out[0], F_SETFL, O_NONBLOCK);
+    expect(what, (int)write(in[1], CAT_TEXT, sizeof CAT_TEXT - 1), (int)sizeof CAT_TEXT - 1);
+    close(in[1]);
+    char answer[64];
+    int n = read_by_deadline(out[0], answer, sizeof answer, 5000);
+    if (n != (int)sizeof CAT_TEXT - 1 || strcmp(answer, CAT_TEXT) != 0) {
+        printf("posix-procs: %s: the answer is %d bytes [%s]\n", what, n, n > 0 ? answer : "");
+        failures++;
+        if (n == -1) kill(pid, SIGKILL);
+    }
+    close(out[0]);
+    reap(what, pid, 0, 0);
+}
+
+/* A cat through two pipes, started `how`: 0, posix_spawn with adddup2 of
+ * ends with FD_CLOEXEC; 1, posix_spawn with adddup2 and addclose of plain
+ * ends; 2, fork, dup2 and exec of ends with FD_CLOEXEC (from a process
+ * a loader started: role catfork). */
+static void cat_through_pipes(int how) {
+    static const char *const names[] = {
+        "cat by posix_spawn, adddup2 of FD_CLOEXEC ends",
+        "cat by posix_spawn, adddup2 and addclose",
+        "cat by fork, dup2 and exec",
+    };
+    int in[2], out[2];
+    int flags = how == 1 ? 0 : O_CLOEXEC;
+    expect("pipe for the cat's stdin", pipe2(in, flags), 0);
+    expect("pipe for the cat's stdout", pipe2(out, flags), 0);
+    char *argv[] = {"cat", NULL};
+    char *envp[] = {NULL};
+    pid_t pid = -1;
+    if (how == 2) {
+        pid = fork();
+        if (pid == 0) {
+            if (dup2(in[0], 0) != 0 || dup2(out[1], 1) != 1) _exit(120);
+            execve("/bin/cat", argv, envp);
+            _exit(121);
+        }
+    } else {
+        posix_spawn_file_actions_t actions;
+        posix_spawn_file_actions_init(&actions);
+        posix_spawn_file_actions_adddup2(&actions, in[0], 0);
+        posix_spawn_file_actions_adddup2(&actions, out[1], 1);
+        if (how == 1) {
+            posix_spawn_file_actions_addclose(&actions, in[0]);
+            posix_spawn_file_actions_addclose(&actions, in[1]);
+            posix_spawn_file_actions_addclose(&actions, out[0]);
+            posix_spawn_file_actions_addclose(&actions, out[1]);
+        }
+        expect(names[how], posix_spawn(&pid, "/bin/cat", &actions, NULL, argv, envp), 0);
+        posix_spawn_file_actions_destroy(&actions);
+    }
+    if (pid <= 0) {
+        printf("posix-procs: %s gave pid %d (%s)\n", names[how], (int)pid, strerror(errno));
+        failures++;
+        return;
+    }
+    cat_exchange(names[how], pid, in, out);
+}
+
+/* The dup2 of the ends of a pipe between descriptors of one process: the
+ * copy is the same pipe, the end of the data waits for it. */
+static void pipe_dup2(void) {
+    int p[2];
+    expect("pipe for dup2", pipe(p), 0);
+    expect("dup2 of a write end", dup2(p[1], 9), 9);
+    expect("FD_CLOEXEC of the copy", fcntl(9, F_GETFD) & FD_CLOEXEC, 0);
+    close(p[1]);
+    expect("a byte through the copy", (int)write(9, "k", 1), 1);
+    char got[4];
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    expect("the byte comes out", (int)read(p[0], got, sizeof got), 1);
+    int n = (int)read(p[0], got, sizeof got);
+    expect("no end of the data while the copy lives", n == -1 ? errno : n, EAGAIN);
+    close(9);
+    expect("the end of the data once the copy closed", (int)read(p[0], got, sizeof got), 0);
+    close(p[0]);
+    /* dup2 onto a descriptor that holds the last write end of another
+     * pipe closes that end. */
+    int q[2];
+    expect("a second pipe for dup2", pipe(q), 0);
+    expect("a pipe to copy", pipe(p), 0);
+    expect("dup2 over a write end", dup2(p[1], q[1]), q[1]);
+    fcntl(q[0], F_SETFL, O_NONBLOCK);
+    expect("the end of the data once dup2 closed the last writer", (int)read(q[0], got, sizeof got), 0);
+    close(q[0]);
+    close(q[1]);
+    close(p[0]);
+    close(p[1]);
+}
+
+/* A plain end keeps its number across posix_spawn and an end with
+ * FD_CLOEXEC is gone: the child (role pipechild) reads the end the
+ * argument names to its end. */
+static void pipe_numbers(void) {
+    int p[2];
+    expect("pipe for the numbers", pipe(p), 0);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    char number[16];
+    snprintf(number, sizeof number, "%d", p[0]);
+    char *argv[] = {"procs-child", "pipechild", number, NULL};
+    char *envp[] = {NULL};
+    pid_t pid = -1;
+    expect("spawn of pipechild", posix_spawn(&pid, "/bin/procs-child", NULL, NULL, argv, envp), 0);
+    if (pid <= 0) {
+        failures++;
+        return;
+    }
+    expect("the child's bytes", (int)write(p[1], "abc", 3), 3);
+    close(p[1]);
+    close(p[0]);
+    reap("a child that reads an inherited end", pid, 0, 0);
+}
+
+/* Role pipechild: the end of the number in argv[2] gives "abc" and then
+ * the end of the data, and the number after it is no descriptor. */
+static int pipe_child(void) {
+    int fd = atoi(argv_seen[2]);
+    char got[8];
+    int total = 0, n;
+    while ((n = (int)read(fd, got + total, sizeof got - (size_t)total)) > 0) total += n;
+    if (n != 0 || total != 3 || memcmp(got, "abc", 3) != 0) return 1;
+    return fcntl(fd + 1, F_GETFD) == -1 && errno == EBADF ? 0 : 2;
+}
+
+/* A spawn that names the end of a pipe, with no session of the pipe
+ * service to give the child: the loader refuses the block, and the pipe
+ * is as it was. */
+static void pipe_without_session(void) {
+    int p[2];
+    expect("pipe for the refused spawn", pipe(p), 0);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, p[0], 0);
+    char *argv[] = {"cat", NULL};
+    char *envp[] = {NULL};
+    pid_t pid = -1;
+    stafeto_probe_no_pipes_session(1);
+    int e = posix_spawn(&pid, "/bin/cat", &actions, NULL, argv, envp);
+    stafeto_probe_no_pipes_session(0);
+    posix_spawn_file_actions_destroy(&actions);
+    expect("a spawn that names a pipe's end with no session", e, EIO);
+    if (e == 0) reap("the child of the spawn that should fail", pid, 0, 0);
+    expect("a byte after the refused spawn", (int)write(p[1], "r", 1), 1);
+    char got[2];
+    expect("the byte comes back", (int)read(p[0], got, sizeof got), 1);
+    close(p[1]);
+    expect("the end of the data after the refused spawn", (int)read(p[0], got, sizeof got), 0);
+    close(p[0]);
+}
+
+/* Role catfork: a cat started by fork, dup2 and exec. */
+static int cat_fork(void) {
+    cat_through_pipes(2);
+    return failures;
+}
+
+/* The readers role pipeghost starts. */
+static int ghost_fd;
+static void *ghost_reader(void *arg) {
+    (void)arg;
+    char c;
+    (void)read(ghost_fd, &c, 1);
+    return NULL;
+}
+
+/* Role pipeghost: eight threads wait in a read of one pipe, which is the
+ * most the service lets wait at an end, and the process execs. */
+static int pipe_ghosts(void) {
+    int p[2];
+    if (pipe(p) != 0) return 1;
+    ghost_fd = p[0];
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32768);
+    pthread_t readers[8];
+    for (int i = 0; i < 8; i++) {
+        if (pthread_create(&readers[i], &attr, ghost_reader, NULL) != 0) return 2;
+    }
+    pause_ms(200);
+    char rd[16], wr[16];
+    snprintf(rd, sizeof rd, "%d", p[0]);
+    snprintf(wr, sizeof wr, "%d", p[1]);
+    char *argv[] = {"procs-child", "pipeghost2", rd, wr, NULL};
+    char *envp[] = {NULL};
+    execve("/bin/procs-child", argv, envp);
+    return 3;
+}
+
+/* Role pipeghost2: the new image reads the pipe and a thread writes it
+ * 100 ms later. Had the old image's readers stayed in the service, this
+ * would be the ninth waiter at the end and get EAGAIN. */
+static int pipe_ghosts_after(void) {
+    int rd = atoi(argv_seen[2]), wr = atoi(argv_seen[3]);
+    struct later l = {wr, 100, 'g'};
+    pthread_t t;
+    if (pthread_create(&t, NULL, write_later, &l) != 0) return 1;
+    char c = 0;
+    int n = (int)read(rd, &c, 1);
+    expect("a read after the exec of eight waiting readers", n == -1 ? errno : n, 1);
+    pthread_join(t, NULL);
+    return failures;
+}
+
+/* The pipes across spawn, fork and exec. */
+static void pipes_inherited(void) {
+    pipe_dup2();
+    for (int how = 0; how < 2; how++) cat_through_pipes(how);
+    run_role("/bin/procs-child", "catfork", NULL);
+    pipe_numbers();
+    pipe_without_session();
+    run_role("/bin/procs-child", "pipeghost", NULL);
+    /* BusyBox ash runs two programs of a pipeline: its stdout goes into a
+     * pipe, and the listing of /etc comes out of cat. */
+    int out[2];
+    expect("pipe for ash's stdout", pipe2(out, O_CLOEXEC), 0);
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, out[1], 1);
+    char *ash[] = {"ash", "-c", "/bin/ls /etc | /bin/cat", NULL};
+    char *env[] = {"PATH=/bin", NULL};
+    pid_t shell = -1;
+    expect("spawn of ash -c with a pipeline", posix_spawn(&shell, "/bin/ls", &actions, NULL, ash, env), 0);
+    posix_spawn_file_actions_destroy(&actions);
+    close(out[1]);
+    fcntl(out[0], F_SETFL, O_NONBLOCK);
+    char listing[256];
+    int n = read_by_deadline(out[0], listing, sizeof listing, 20000);
+    close(out[0]);
+    if (n == -1 && shell > 0) kill(shell, SIGKILL);
+    if (shell > 0) reap("ash -c with ls | cat", shell, 0, 0);
+    if (n != 5 || strcmp(listing, "motd\n") != 0) {
+        printf("posix-procs: the pipeline of ash printed %d bytes [%s]\n", n, n > 0 ? listing : "");
+        failures++;
+    } else {
+        printf("posix-procs: ash -c ran ls | cat\n");
+    }
 }
 
 /* Role sigpipe: a write without a reader; SIGPIPE's default ends it. */

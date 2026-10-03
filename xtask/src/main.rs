@@ -2074,6 +2074,10 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: 40 forks of a parent with six threads",
         // Pipes (5e): within a process and across fork.
         "posix-procs: pipes within a process and across fork",
+        // Across spawn, fork and exec: cat on two pipes, the ends' numbers,
+        // the waiters of an old image, the loader's refusal, ash's pipeline.
+        "posix-procs: ash -c ran ls | cat",
+        "posix-procs: pipes across spawn and exec",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -2122,7 +2126,7 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
 
 /// The kinds of the lines of the pipe service (tag 4), by the numbers of
 /// proto_pipe::Method.
-const PIPE_STEP_KINDS: [(usize, &str); 12] = [
+const PIPE_STEP_KINDS: [(usize, &str); 13] = [
     (1, "Create"),
     (2, "ReadStart"),
     (3, "ReadTake"),
@@ -2135,6 +2139,7 @@ const PIPE_STEP_KINDS: [(usize, &str); 12] = [
     (12, "Stat"),
     (13, "Abandon"),
     (64, "notification"),
+    (65, "own step"),
 ];
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
@@ -2295,7 +2300,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     // one message and up to 8 notifications, one description of a session
     // that went, a Clone of up to 32 ends. The probe's role steppipes
     // makes each of them at its longest.
-    for kind in [2, 3, 5, 6, 9, 64] {
+    for kind in [2, 3, 5, 6, 9, 65] {
         let ticks = pipe.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
         if ticks == 0 || ticks > RAM_STEP_MAX {
             return Err(format!(
@@ -2303,7 +2308,11 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             ));
         }
     }
-    if let Some(row) = pipe.iter().find(|r| r.1 > RAM_STEP_MAX) {
+    // The heartbeats and the departures of sessions (64) come whenever the
+    // clock and the sessions do, and a volley of the crowd's processes at a
+    // higher level may run in the middle of one: they are not the pipe
+    // service's work, whose own steps the kind 65 counts.
+    if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
     }
     let mut text = String::from("kind method ticks detail\n");

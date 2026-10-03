@@ -489,6 +489,7 @@ impl Service<0> for PipeService {
     /// The client of `s` went: its operations go, and its descriptions
     /// are let go of in steps.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
+        rt::service::step_own();
         self.ops.gone(&mut s.data.long);
         if self.pipes.gone(&mut s.data.held) {
             self.kick();
@@ -498,6 +499,7 @@ impl Service<0> for PipeService {
     /// The last copy of a session Clone made went before it sent anything:
     /// the descriptions it was born with are let go of in steps.
     fn closed(&mut self, label: u64) {
+        rt::service::step_own();
         self.clones.gone(label);
         if let Some(birth) = self
             .births
@@ -520,6 +522,7 @@ impl Service<0> for PipeService {
         let mut wakes = Wakes::default();
         let more = self.pipes.step(&mut wakes);
         self.tell(&wakes);
+        rt::service::step_own();
         rt::service::step_detail(u64::from(more));
         if more {
             self.kick();

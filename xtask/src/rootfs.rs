@@ -172,6 +172,7 @@ fn procs() -> Vec<RootFile> {
     vec![
         dir("/bin"),
         file("/bin/ls", 0o755, ROOT, "busybox-probe"),
+        file("/bin/cat", 0o755, ROOT, "busybox-probe"),
         file("/bin/procs-child", 0o755, ROOT, "posix-procs"),
         of(
             "/bin/procs-setid",
