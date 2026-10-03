@@ -67,7 +67,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -120,6 +120,9 @@ pub enum Names {
     /// the same session of the RAM file service as `File`; the child's
     /// layer serves its reads from its own generator.
     Random(u32),
+    /// A terminal action's temporary token; the loader replaces every
+    /// alias before writing the start area. Never a service description.
+    PendingTerminal(u32),
 }
 
 /// A descriptor the child starts with.
@@ -139,6 +142,7 @@ impl Descriptor {
             Names::Pipe(n) => (4, n),
             Names::Terminal(n) => (5, n),
             Names::Random(n) => (6, n),
+            Names::PendingTerminal(n) => (7, n),
         };
         let mut out = [0; DESCRIPTOR];
         out[..4].copy_from_slice(&self.fd.to_le_bytes());
@@ -160,6 +164,7 @@ impl Descriptor {
             (4, n) => Names::Pipe(n),
             (5, n) => Names::Terminal(n),
             (6, n) => Names::Random(n),
+            (7, n) if (n as usize) < TERMINAL_OPENS => Names::PendingTerminal(n),
             _ => return None,
         };
         ((fd as usize) < DESCRIPTORS).then_some(Descriptor { fd, names })
@@ -232,34 +237,89 @@ pub const IO: u32 = 607;
 pub const NOT_DIRECTORY: u32 = 608;
 pub const NO_CONTROLLING: u32 = 609;
 
-/// Terminal opens run in the loader after SpawnStart and before OpenExec.
-/// Keep all accepted opens, including those later closed or CLOEXEC.
-/// Terminal numbers reserve this path for future PTY names as well.
-pub const TERMINAL_ACTIONS: usize = 32;
+/// Terminal effects run in order through the child's verified session.
+pub const TERMINAL_OPENS: usize = 32;
+pub const TERMINAL_ACTIONS: usize = 64;
+pub const TERMINAL_PACKET: usize = 32;
+pub const TERMINAL_CLOSE: u32 = 4;
+/// Access mode, O_NONBLOCK and O_NOCTTY (the layer's Linux ABI values).
+pub const TERMINAL_FLAGS: u32 = 3 | 0o4000 | 0o400;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TerminalOpen {
-    pub terminal: u32,
-    pub controlling: bool,
-    pub no_ctty: bool,
+pub struct TerminalAction {
+    pub token: u32,
+    /// 0 console, 1 controlling, 2 master, 3 slave, 4 close.
+    pub kind: u32,
+    pub number: u32,
+    pub flags: u32,
 }
 
-impl TerminalOpen {
+impl TerminalAction {
     pub fn write(self, w: &mut proto_wire::Writer) -> Result<(), Status> {
-        w.u32(self.terminal)?;
-        w.u32(u32::from(self.controlling) | u32::from(self.no_ctty) << 1)
+        w.u32(self.token)?;
+        w.u32(self.kind)?;
+        w.u32(self.number)?;
+        w.u32(self.flags)
     }
 
     pub fn read(r: &mut Reader<'_>) -> Result<Self, Status> {
-        let terminal = r.u32()?;
-        let flags = r.u32()?;
-        if flags & !3 != 0 {
+        let action = Self {
+            token: r.u32()?,
+            kind: r.u32()?,
+            number: r.u32()?,
+            flags: r.u32()?,
+        };
+        if action.token as usize >= TERMINAL_OPENS
+            || action.kind > TERMINAL_CLOSE
+            || action.flags & !TERMINAL_FLAGS != 0
+            || action.flags & 3 == 3
+            || (action.kind != 3 && action.number != 0)
+            || (action.kind == TERMINAL_CLOSE && action.flags != 0)
+        {
             return Err(Status::BadSize);
         }
-        Ok(Self {
-            terminal,
-            controlling: flags & 1 != 0,
-            no_ctty: flags & 2 != 0,
-        })
+        Ok(action)
+    }
+}
+
+/// Validation of the complete packet precedes its first effect. Tokens
+/// cannot be reused, including after Close or in a later packet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalPlan {
+    opened: u32,
+    live: u32,
+    count: usize,
+}
+
+impl TerminalPlan {
+    pub fn validate(&self, actions: &[TerminalAction], exported: u32) -> Result<Self, Status> {
+        if actions.is_empty()
+            || actions.len() > TERMINAL_PACKET
+            || self.count + actions.len() > TERMINAL_ACTIONS
+        {
+            return Err(Status::BadSize);
+        }
+        let mut next = *self;
+        for &action in actions {
+            // The same checks protect callers building actions directly.
+            let mut w = proto_wire::Writer::new();
+            action.write(&mut w)?;
+            TerminalAction::read(&mut Reader::new(w.as_bytes()))?;
+            let bit = 1 << action.token;
+            if action.kind == TERMINAL_CLOSE {
+                if next.live & bit == 0 || exported & bit != 0 {
+                    return Err(Status::BadSize);
+                }
+                next.live &= !bit;
+            } else {
+                if next.opened & bit != 0 {
+                    return Err(Status::BadSize);
+                }
+                next.opened |= bit;
+                next.live |= bit;
+            }
+            next.count += 1;
+        }
+        Ok(next)
     }
 }
 
@@ -360,7 +420,7 @@ pub enum BlockError {
 }
 
 const MAGIC: [u8; 8] = *b"STAFSPWN";
-const BLOCK_VERSION: u32 = 1;
+const BLOCK_VERSION: u32 = 2;
 
 /// The bytes of `argv` and `envp` as {ARG_MAX} counts them: their
 /// strings with the NULs and a pointer for each and for the two NULLs.
@@ -408,7 +468,10 @@ impl<'a> Block<'a> {
                 (Slot::Files, Names::File(_) | Names::Random(_))
                     | (Slot::Entropy, Names::Random(_))
                     | (Slot::Pipes, Names::Pipe(_))
-                    | (Slot::Terminal, Names::Terminal(_))
+                    | (
+                        Slot::Terminal,
+                        Names::Terminal(_) | Names::PendingTerminal(_)
+                    )
             )
         })
     }
@@ -419,6 +482,40 @@ impl<'a> Block<'a> {
             .0
             .iter()
             .filter_map(|chunk| Descriptor::read(chunk))
+    }
+
+    pub fn pending_terminals(&self) -> u32 {
+        self.descriptors().fold(0, |mask, d| match d.names {
+            Names::PendingTerminal(token) => mask | 1 << token,
+            _ => mask,
+        })
+    }
+
+    /// Replace all aliases in a validated private staging copy.
+    pub fn replace_terminal(
+        bytes: &mut [u8],
+        token: u32,
+        description: u32,
+    ) -> Result<(), BlockError> {
+        let (at, count) = {
+            let block = Block::read(bytes)?;
+            (
+                HEADER + block.path.len() + block.cwd.len(),
+                block.descriptors.len() / DESCRIPTOR,
+            )
+        };
+        for chunk in bytes[at..at + count * DESCRIPTOR]
+            .as_chunks_mut::<DESCRIPTOR>()
+            .0
+            .iter_mut()
+        {
+            let mut descriptor = Descriptor::read(chunk).ok_or(BlockError::Malformed)?;
+            if descriptor.names == Names::PendingTerminal(token) {
+                descriptor.names = Names::Terminal(description);
+                chunk.copy_from_slice(&descriptor.bytes());
+            }
+        }
+        Ok(())
     }
 
     /// `write` with the descriptors `descriptors` (DESCRIPTORS at most).
@@ -762,6 +859,9 @@ pub fn write_area(
     handles: [u64; SLOTS],
     maps: &[MapEntry],
 ) -> Result<(), BlockError> {
+    if block.pending_terminals() != 0 {
+        return Err(BlockError::Malformed);
+    }
     let len = area_len(block);
     let area = area.get_mut(..len).ok_or(BlockError::Malformed)?;
     if maps.len() > MAP_ENTRIES {
@@ -1161,7 +1261,7 @@ mod tests {
         assert_eq!(Block::read(&good[..len - 1]), Err(BlockError::Malformed));
         for (at, value) in [
             (0, b'x'),
-            (8, 2),
+            (8, (BLOCK_VERSION + 1) as u8),
             (12, 0xFF),
             (20, 2),
             (24, 1),
@@ -1871,5 +1971,117 @@ mod tests {
         assert_eq!(Transfer::read(&out).unwrap().map().count(), 2);
         out[0] = b'x';
         assert_eq!(Transfer::read(&out), None);
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+
+    fn open(token: u32) -> TerminalAction {
+        TerminalAction {
+            token,
+            kind: 2,
+            number: 0,
+            flags: 2 | 0o400,
+        }
+    }
+    fn close(token: u32) -> TerminalAction {
+        TerminalAction {
+            token,
+            kind: TERMINAL_CLOSE,
+            number: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn packets_validate_before_effects_and_preserve_order() {
+        let plan = TerminalPlan::default();
+        assert_eq!(
+            plan.validate(&[open(0), close(0), open(1)], 0)
+                .unwrap()
+                .live,
+            2
+        );
+        assert_eq!(plan.validate(&[open(0), open(0)], 0), Err(Status::BadSize));
+        let first = plan.validate(&[open(0)], 0).unwrap();
+        assert_eq!(
+            first.validate(&[close(0), open(0)], 0),
+            Err(Status::BadSize)
+        );
+        assert_eq!(first.live, 1);
+        assert_eq!(first.validate(&[close(0)], 1), Err(Status::BadSize));
+        let bad = TerminalAction {
+            flags: u32::MAX,
+            ..open(1)
+        };
+        assert_eq!(first.validate(&[close(0), bad], 0), Err(Status::BadSize));
+        assert_eq!(first.live, 1);
+        let opens: Vec<_> = (0..32).map(open).collect();
+        let closes: Vec<_> = (0..32).map(close).collect();
+        let full = plan
+            .validate(&opens, 0)
+            .unwrap()
+            .validate(&closes, 0)
+            .unwrap();
+        assert_eq!((full.count, full.live), (64, 0));
+        assert_eq!(full.validate(&[open(0)], 0), Err(Status::BadSize));
+        assert_eq!(plan.validate(&[open(0); 33], 0), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn every_pending_alias_is_rewritten_and_cannot_reach_start() {
+        let mut bytes = [0; 512];
+        let descriptors = [
+            Descriptor {
+                fd: 0,
+                names: Names::PendingTerminal(7),
+            },
+            Descriptor {
+                fd: 2,
+                names: Names::PendingTerminal(7),
+            },
+            Descriptor {
+                fd: 3,
+                names: Names::PendingTerminal(8),
+            },
+        ];
+        let len = Block::write_with(
+            &mut bytes,
+            b"/bin/ash",
+            b"/",
+            0,
+            [b"ash".as_slice()].into_iter(),
+            [].into_iter(),
+            &descriptors,
+        )
+        .unwrap();
+        let block = Block::read(&bytes[..len]).unwrap();
+        assert!(block.needs(Slot::Terminal));
+        assert_eq!(block.pending_terminals(), (1 << 7) | (1 << 8));
+        let mut area = vec![0; area_len(&block)];
+        assert_eq!(
+            write_area(&mut area, START_AREA, &block, 0, [0; SLOTS], &[]),
+            Err(BlockError::Malformed)
+        );
+        Block::replace_terminal(&mut bytes[..len], 7, 0x80000112).unwrap();
+        let names: Vec<_> = Block::read(&bytes[..len])
+            .unwrap()
+            .descriptors()
+            .map(|d| d.names)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Names::Terminal(0x80000112),
+                Names::Terminal(0x80000112),
+                Names::PendingTerminal(8)
+            ]
+        );
+        Block::replace_terminal(&mut bytes[..len], 8, 0x123).unwrap();
+        let block = Block::read(&bytes[..len]).unwrap();
+        assert_eq!(block.pending_terminals(), 0);
+        write_area(&mut area, START_AREA, &block, 0, [0; SLOTS], &[]).unwrap();
     }
 }

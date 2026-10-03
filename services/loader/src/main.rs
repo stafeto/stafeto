@@ -247,7 +247,8 @@ fn keep_region(
 /// The bytes of the copy of the block.
 fn staged(len: usize) -> &'static [u8] {
     // SAFETY: the copy lies at STAGING, mapped read and write for the
-    // loader's life (`stage`), and nothing writes it after Start.
+    // loader's life (`stage`). TerminalActions rewrites it only between
+    // requests, with no outstanding borrow used across that rewrite.
     unsafe { core::slice::from_raw_parts(STAGING as *const u8, len) }
 }
 
@@ -328,7 +329,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     let mut ready = false;
     let mut early_given = false;
     let mut completed = false;
-    let mut terminal_actions = false;
+    let mut terminal_actions: Option<TerminalLoads> = None;
     let mut trusted_terminal = None;
     let mut buffer = [0; MESSAGE_MAX];
     loop {
@@ -390,7 +391,7 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                 };
                 let first = block_len.is_none() && fork.is_none();
                 let status = match method {
-                    Some(Method::Start) if first => {
+                    Some(Method::Start) if first && terminal_actions.is_none() => {
                         let memory = handles.take::<Memory>(0).ok();
                         match (r.u32(), memory, r.finish()) {
                             (Ok(len), Some(memory), Ok(())) => {
@@ -470,10 +471,20 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                                 }
                             };
                         }
+                        if let Some(terminals) = terminal_actions.as_mut()
+                            && let Err(code) = terminals.finish()
+                        {
+                            reply(token, code);
+                            return None;
+                        }
                         let Ok(block) = Block::read(staged(block_len?)) else {
                             reply(token, Status::BadSize.code());
                             return None;
                         };
+                        if block.pending_terminals() != 0 {
+                            reply(token, Status::BadSize.code());
+                            return None;
+                        }
                         let needs = Slot::GIVEN.map(|slot| (slot, block.needs(slot)));
                         if early_given && !completed {
                             reply(token, Status::Kernel(Error::BadState).code());
@@ -494,6 +505,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                             Ok(done)
                         }) {
                             Ok(done) => {
+                                if let Some(terminals) = terminal_actions.as_mut() {
+                                    terminals.committed = true;
+                                }
                                 loaded = Some(done);
                                 for (slot, needs) in needs {
                                     needed[slot as usize] = needs;
@@ -509,19 +523,32 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                     }
                     Some(Method::TerminalActions)
-                        if block_len.is_some() && loaded.is_none() && !terminal_actions =>
+                        if block_len.is_some()
+                            && loaded.is_none()
+                            && completed
+                            && handles.is_empty() =>
                     {
-                        terminal_actions = true;
-                        if trusted_terminal.is_none() {
-                            trusted_terminal = match loader_terminal(session) {
-                                Ok(terminal) => terminal,
-                                Err(code) => {
-                                    reply(token, code);
+                        if terminal_actions.is_none() {
+                            let Ok(block) = Block::read(staged(block_len?)) else {
+                                reply(token, Status::BadSize.code());
+                                return None;
+                            };
+                            let Some(tty) = given[Slot::Terminal as usize].as_ref() else {
+                                reply(token, Status::BadSize.code());
+                                return None;
+                            };
+                            match sys::handle_duplicate(tty, Rights::SEND) {
+                                Ok(tty) => {
+                                    terminal_actions =
+                                        Some(TerminalLoads::new(tty, block.pending_terminals()))
+                                }
+                                Err(error) => {
+                                    reply(token, code(error));
                                     return None;
                                 }
-                            };
+                            }
                         }
-                        match open_terminals(own, trusted_terminal.as_ref(), r) {
+                        match terminal_actions.as_mut()?.run(own, block_len?, r) {
                             Ok(()) => 0,
                             Err(code) => {
                                 reply(token, code);
@@ -530,7 +557,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                     }
                     Some(Method::HandlesDone)
-                        if !completed && (block_len.is_some() || fork.is_some()) =>
+                        if !completed
+                            && terminal_actions.is_none()
+                            && (block_len.is_some() || fork.is_some()) =>
                     {
                         if r.finish().is_err() || !handles.is_empty() {
                             Status::BadSize.code()
@@ -559,7 +588,9 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
                         }
                     }
                     Some(Method::Handles)
-                        if !completed && (block_len.is_some() || fork.is_some()) =>
+                        if !completed
+                            && terminal_actions.is_none()
+                            && (block_len.is_some() || fork.is_some()) =>
                     {
                         early_given |= loaded.is_none() && block_len.is_some();
                         match take_given(r, &mut handles, &mut given) {
@@ -614,53 +645,150 @@ fn serve(session: &Handle<Channel>, start: &Handle<Channel>, own: &Own) -> Optio
     }
 }
 
-/// Every request carries the current LoaderOf identity from Boot. No
-/// authenticated child identity or credential is returned to the parent.
-fn open_terminals(own: &Own, tty: Option<&Handle<Channel>>, mut r: Reader<'_>) -> Result<(), u32> {
-    let count = r.u32().map_err(|s| s.code())? as usize;
-    if count == 0 || count > pl::TERMINAL_ACTIONS {
-        return Err(Status::BadSize.code());
-    }
-    let mut actions = [pl::TerminalOpen::default(); pl::TERMINAL_ACTIONS];
-    for action in &mut actions[..count] {
-        *action = pl::TerminalOpen::read(&mut r).map_err(|s| s.code())?;
-    }
-    r.finish().map_err(|s| s.code())?;
-    // The parent supplied Slot::Terminal, so it must never receive our
-    // identity. The active loader gets this endpoint from the process
-    // service, which received it from tty's authenticated Register.
-    let tty = tty.ok_or(pl::IO)?;
-    for action in &actions[..count] {
-        if !action.controlling && action.no_ctty {
-            continue;
+/// Only the verified child session sees LoaderOf. It owns the new
+/// descriptions; every failed attempt releases its successful opens.
+struct TerminalLoads {
+    tty: Handle<Channel>,
+    plan: pl::TerminalPlan,
+    descriptions: [Option<u32>; pl::TERMINAL_OPENS],
+    exported: u32,
+    committed: bool,
+}
+
+impl TerminalLoads {
+    fn new(tty: Handle<Channel>, exported: u32) -> Self {
+        Self {
+            tty,
+            plan: pl::TerminalPlan::default(),
+            descriptions: [None; pl::TERMINAL_OPENS],
+            exported,
+            committed: false,
         }
-        let method = if action.controlling {
-            proto_tty::Method::Controlling
-        } else {
-            proto_tty::Method::Acquire
-        };
-        let mut w = Writer::new();
-        method.header().write(&mut w).map_err(|s| s.code())?;
-        w.u32(action.terminal).map_err(|s| s.code())?;
+    }
+
+    fn run(&mut self, own: &Own, len: usize, mut r: Reader<'_>) -> Result<(), u32> {
+        let count = r.u32().map_err(|s| s.code())? as usize;
+        if count == 0 || count > pl::TERMINAL_PACKET {
+            return Err(Status::BadSize.code());
+        }
+        let mut actions = [pl::TerminalAction::default(); pl::TERMINAL_PACKET];
+        for action in &mut actions[..count] {
+            *action = pl::TerminalAction::read(&mut r).map_err(|s| s.code())?;
+        }
+        r.finish().map_err(|s| s.code())?;
+        let next = self
+            .plan
+            .validate(&actions[..count], self.exported)
+            .map_err(|s| s.code())?;
+        for action in &actions[..count] {
+            let place = action.token as usize;
+            if action.kind == pl::TERMINAL_CLOSE {
+                let id = self.descriptions[place].ok_or(pl::IO)?;
+                close_terminal(&self.tty, id)?;
+                self.descriptions[place] = None;
+                continue;
+            }
+            let mut w = Writer::new();
+            proto_tty::Open {
+                kind: action.kind,
+                flags: action.flags & !0o400,
+                number: action.number,
+            }
+            .write(&mut w)
+            .map_err(|s| s.code())?;
+            let id = terminal_request(own, &self.tty, &w)?;
+            self.descriptions[place] = Some(id);
+            // SAFETY: STAGING is the loader's private mapped copy; no
+            // Block borrow survives this point, and only serve writes it.
+            let bytes = unsafe { core::slice::from_raw_parts_mut(STAGING as *mut u8, len) };
+            Block::replace_terminal(bytes, action.token, id).map_err(|_| Status::BadSize.code())?;
+            if action.kind != proto_tty::OPEN_MASTER
+                && action.kind != proto_tty::OPEN_CONTROLLING
+                && action.flags & 0o400 == 0
+            {
+                let mut w = Writer::new();
+                proto_tty::Method::Acquire
+                    .header()
+                    .write(&mut w)
+                    .map_err(|s| s.code())?;
+                w.u32(id).map_err(|s| s.code())?;
+                // A busy controlling terminal does not fail ordinary open.
+                let _ = terminal_request(own, &self.tty, &w);
+            }
+        }
+        self.plan = next;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), u32> {
+        for (token, description) in self.descriptions.iter_mut().enumerate() {
+            if self.exported & 1 << token == 0
+                && let Some(id) = *description
+            {
+                close_terminal(&self.tty, id)?;
+                *description = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalLoads {
+    fn drop(&mut self) {
+        if !self.committed {
+            for id in self.descriptions.iter_mut().filter_map(Option::take) {
+                let _ = close_terminal(&self.tty, id);
+            }
+        }
+    }
+}
+
+fn terminal_request(own: &Own, tty: &Handle<Channel>, request: &Writer) -> Result<u32, u32> {
+    loop {
         let identity = sys::handle_duplicate(&own.identity, Rights::NOTIFY | Rights::TRANSFER)
             .map_err(code)?;
-        let reply = sys::send_handles(tty, w.as_bytes(), [identity.erase()])
-            .map_err(|refused| code(refused.error))?;
-        let mut buffer = [0; MESSAGE_MAX];
-        let status = Reader::new(reply.bytes(&mut buffer))
-            .u32()
-            .map_err(|_| pl::IO)?;
-        if action.controlling && status != 0 {
-            return Err(if status == proto_tty::NOT_CONTROLLING {
-                pl::NO_CONTROLLING
-            } else {
-                pl::PERMISSION
-            });
+        match sys::send_handles(tty, request.as_bytes(), [identity.erase()]) {
+            Err(refused) if refused.error == Error::Interrupted => continue,
+            Err(refused) => return Err(code(refused.error)),
+            Ok(reply) => {
+                let mut buffer = [0; MESSAGE_MAX];
+                let mut r = Reader::new(reply.bytes(&mut buffer));
+                let status = r.u32().map_err(|_| pl::IO)?;
+                return if status == 0 {
+                    Ok(r.u32().unwrap_or(0))
+                } else {
+                    Err(match status {
+                        proto_tty::NOT_CONTROLLING => pl::NO_CONTROLLING,
+                        proto_tty::PERMISSION => pl::ACCESS,
+                        proto_tty::NO_ENTRY => pl::NO_ENTRY,
+                        _ => status,
+                    })
+                };
+            }
         }
-        // Like open(), failure to acquire a busy terminal does not fail
-        // an ordinary terminal open. A later /dev/tty still verifies it.
     }
-    Ok(())
+}
+
+fn close_terminal(tty: &Handle<Channel>, id: u32) -> Result<(), u32> {
+    let mut w = Writer::new();
+    proto_tty::Method::Close
+        .header()
+        .write(&mut w)
+        .map_err(|s| s.code())?;
+    w.u32(id).map_err(|s| s.code())?;
+    loop {
+        match sys::send(tty, w.as_bytes()) {
+            Err(Error::Interrupted) => continue,
+            Err(error) => return Err(code(error)),
+            Ok(reply) => {
+                let mut buffer = [0; MESSAGE_MAX];
+                return match Reader::new(reply.bytes(&mut buffer)).u32() {
+                    Ok(0) => Ok(()),
+                    _ => Err(pl::IO),
+                };
+            }
+        }
+    }
 }
 
 fn loader_clock(session: &Handle<Channel>) -> Result<Handle<Channel>, u32> {
