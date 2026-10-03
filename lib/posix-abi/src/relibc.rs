@@ -138,10 +138,11 @@ pub unsafe fn attach_main(block: *mut Block) {
     place
         .native
         .store(crate::threads::main_handle().raw().0, Ordering::Relaxed);
-    place.block.store(block as usize, Ordering::Relaxed);
-    place.state.store(LIVE, Ordering::Release);
     // SAFETY: the caller's promise.
     unsafe { (*block).thread_id = 1 };
+    crate::signals::reset_taken_before_live(1);
+    place.block.store(block as usize, Ordering::Relaxed);
+    place.state.store(LIVE, Ordering::Release);
 }
 
 /// The table of a forked child (spec 2, 3.2): its only thread, number
@@ -445,7 +446,14 @@ pub unsafe fn create(
     place.stack.store(0, Ordering::Relaxed);
     place.stack_len.store(0, Ordering::Relaxed);
     place.floating.store(floating(), Ordering::Relaxed);
+    crate::signals::reset_taken_before_live(id);
     place.state.store(LIVE, Ordering::Release);
+    let hook = START_WINDOW.swap(0, Ordering::AcqRel);
+    if hook != 0 {
+        // SAFETY: only probe_start_window stores a C function with this signature.
+        let hook = unsafe { core::mem::transmute::<usize, extern "C" fn(u64)>(hook) };
+        hook(id);
+    }
     if sys::thread_start(&native).is_err() {
         // SAFETY: the block is the new thread's, which never ran.
         let block = unsafe { &*block };
@@ -460,6 +468,11 @@ pub unsafe fn create(
     }
     core::mem::forget(native);
     Ok(id)
+}
+
+static START_WINDOW: AtomicUsize = AtomicUsize::new(0);
+pub fn probe_start_window(hook: Option<extern "C" fn(u64)>) {
+    START_WINDOW.store(hook.map_or(0, |f| f as usize), Ordering::Release);
 }
 
 /// The new thread's part of its start, once relibc installed its TCB: its

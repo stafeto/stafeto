@@ -10,6 +10,9 @@ extern void stafeto_probe_return_failure(void);
 extern int stafeto_probe_route_job(int);
 extern int stafeto_probe_zero_return(void);
 extern int stafeto_probe_assign_signal(int);
+extern void stafeto_probe_thread_start(void (*)(unsigned long long));
+extern int stafeto_probe_route_newborn(unsigned long long, int);
+extern void stafeto_probe_local_claim(void (*)(int));
 
 extern int stafeto_probe_loading_pid(void);
 extern void stafeto_probe_fork_early(void (*window)(void));
@@ -152,6 +155,64 @@ static void job_info_two_owners(int signal) {
     expect("job info unblock jobs", sigprocmask(SIG_UNBLOCK, &jobs, NULL), 0);
 }
 
+static int job_newborn_signal, job_newborn_result;
+static void job_before_thread_start(unsigned long long id) {
+    job_newborn_result = kill(getpid(), job_newborn_signal);
+    if (job_newborn_result == 0) job_newborn_result = stafeto_probe_route_newborn(id, job_newborn_signal);
+}
+static void *job_newborn_owner(void *unused) {
+    (void)unused;
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, job_newborn_signal);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    if (sigtimedwait(&signals, &info, &zero) != job_newborn_signal
+        || info.si_pid != getpid() || info.si_code != 0) return (void *)1;
+    return NULL;
+}
+static void job_newborn_information(int signal) {
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, signal);
+    expect("block newborn signal", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+    job_newborn_signal = signal;
+    job_newborn_result = -1;
+    stafeto_probe_thread_start(job_before_thread_start);
+    pthread_t owner;
+    expect("newborn owner created", pthread_create(&owner, NULL, job_newborn_owner, NULL), 0);
+    expect("assignment before thread start", job_newborn_result, 0);
+    void *result = (void *)1;
+    expect("newborn owner joined", pthread_join(owner, &result), 0);
+    expect("newborn keeps assigned sender through attach", result == NULL, 1);
+    expect("unblock newborn signal", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
+}
+
+static int job_local_window_result;
+static void job_replace_local_claim(int signal_number) {
+    signal(signal_number, SIG_IGN);
+    signal(signal_number, SIG_DFL);
+    job_local_window_result = kill(getpid(), signal_number);
+    if (job_local_window_result == 0)
+        job_local_window_result = stafeto_probe_route_job(signal_number);
+}
+static void job_local_claim_information(void) {
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGUSR1);
+    expect("local claim block", sigprocmask(SIG_BLOCK, &signals, NULL), 0);
+    expect("local claim initial raise", raise(SIGUSR1), 0);
+    job_local_window_result = -1;
+    stafeto_probe_local_claim(job_replace_local_claim);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    expect("local claim takes fresh process signal", sigtimedwait(&signals, &info, &zero), SIGUSR1);
+    expect("local claim replacement routed", job_local_window_result, 0);
+    expect("local claim process code", info.si_code, 0);
+    expect("local claim process sender", info.si_pid, getpid());
+    expect("local claim unblock", sigprocmask(SIG_UNBLOCK, &signals, NULL), 0);
+}
+
 static int job_control(void) {
     expect("zero thread return", stafeto_probe_zero_return(), 0);
     expect("linked job-control group", setpgid(0, 0), 0);
@@ -233,6 +294,22 @@ static int job_control(void) {
 
     job_info_two_owners(SIGTSTP);
     job_info_two_owners(SIGUSR1);
+    job_newborn_information(SIGTSTP);
+    job_newborn_information(SIGUSR1);
+    job_local_claim_information();
+    sigset_t ignored_set;
+    sigemptyset(&ignored_set); sigaddset(&ignored_set, SIGUSR1);
+    expect("ignore origin block", sigprocmask(SIG_BLOCK, &ignored_set, NULL), 0);
+    expect("ignore origin process send", kill(getpid(), SIGUSR1), 0);
+    expect("ignore origin assignment", stafeto_probe_assign_signal(SIGUSR1), 0);
+    signal(SIGUSR1, SIG_IGN);
+    signal(SIGUSR1, SIG_DFL);
+    expect("ignore origin fresh local raise", raise(SIGUSR1), 0);
+    struct timespec ignored_zero = {0, 0};
+    siginfo_t ignored_info;
+    expect("ignore origin consume fresh local", sigtimedwait(&ignored_set, &ignored_info, &ignored_zero), SIGUSR1);
+    expect("ignore origin local code", ignored_info.si_code, -6);
+    expect("ignore origin unblock", sigprocmask(SIG_UNBLOCK, &ignored_set, NULL), 0);
 
     for (int local = 0; local < 4; local++) {
         pid_t image = fork();

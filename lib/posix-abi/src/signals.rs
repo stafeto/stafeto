@@ -23,7 +23,7 @@
 //! implementation.
 use crate::{constants::*, threads};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
@@ -139,10 +139,57 @@ static TAKEN: [[Taken; 31]; crate::relibc::PLACES + 1] = [const {
     }; 31]
 }; crate::relibc::PLACES + 1];
 const _: () = assert!(core::mem::size_of_val(&TAKEN) == 32_240);
+// A local claim keeps routing away from this number until its origin snapshot
+// and removal are complete. Router acquisition is a try-lock under TABLE.
+static CLAIMING: [AtomicU32; crate::relibc::PLACES + 1] =
+    [const { AtomicU32::new(0) }; crate::relibc::PLACES + 1];
+const CLAIM_WAITING: u32 = 1 << 31;
+
+struct AssignmentClaim {
+    row: usize,
+    bit: u32,
+}
+impl AssignmentClaim {
+    fn try_new(block: &Block, bit: u64) -> Option<Self> {
+        let row = block.thread_id as usize;
+        let bit = bit as u32;
+        let word = &CLAIMING[row];
+        let mut before = word.load(Ordering::Acquire);
+        loop {
+            if before & bit != 0 {
+                return None;
+            }
+            match word.compare_exchange_weak(
+                before,
+                before | bit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self { row, bit }),
+                Err(now) => before = now,
+            }
+        }
+    }
+}
+impl Drop for AssignmentClaim {
+    fn drop(&mut self) {
+        let word = &CLAIMING[self.row];
+        if word.fetch_and(!(self.bit | CLAIM_WAITING), Ordering::SeqCst) & CLAIM_WAITING != 0 {
+            posix_sync::futex_wake(core::ptr::from_ref(word), u32::MAX);
+        }
+    }
+}
 
 fn taken_row(block: &Block) -> &[Taken; 31] {
     &TAKEN[usize::try_from(block.thread_id).expect("a bounded thread place")]
 }
+/// Clear a reused place while it is still MAKING, before route can see it.
+pub(crate) fn reset_taken_before_live(id: u64) {
+    let _guard = INFO_LOCK.lock();
+    clear_taken(&TAKEN[id as usize]);
+    CLAIMING[id as usize].store(0, Ordering::Relaxed);
+}
+
 fn clear_taken(row: &[Taken; 31]) {
     for slot in row {
         slot.code_status.store(0, Ordering::Relaxed);
@@ -320,7 +367,67 @@ fn taken(block: &Block, signal: i32) -> SigInfo {
     }
 }
 
+struct ClaimCritical;
+impl Drop for ClaimCritical {
+    fn drop(&mut self) {
+        posix_sync::leave();
+    }
+}
+
+static LOCAL_CLAIM_WINDOW: AtomicUsize = AtomicUsize::new(0);
+pub fn probe_local_claim_window(hook: Option<extern "C" fn(i32)>) {
+    LOCAL_CLAIM_WINDOW.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+fn local_claim_window(signal: i32) {
+    let hook = LOCAL_CLAIM_WINDOW.swap(0, Ordering::AcqRel);
+    if hook != 0 {
+        // SAFETY: probe_local_claim_window stores a C function of this signature.
+        let hook = unsafe { core::mem::transmute::<usize, extern "C" fn(i32)>(hook) };
+        hook(signal);
+    }
+}
+
 fn claim_thread_info(block: &Block, signal: i32) -> Option<(u64, Option<SigInfo>)> {
+    // Defer nested entries through the snapshot and claim using the existing
+    // in-memory depth; local delivery needs no kernel call or level change.
+    posix_sync::enter();
+    let _critical = ClaimCritical;
+    let bit = posix_signals::bit(signal).ok()?;
+    let _assignment = loop {
+        if let Some(claim) = AssignmentClaim::try_new(block, bit) {
+            break claim;
+        }
+        let word = &CLAIMING[block.thread_id as usize];
+        let before = word.fetch_or(CLAIM_WAITING, Ordering::SeqCst) | CLAIM_WAITING;
+        if before & bit as u32 != 0 {
+            // A contested claim sleeps on the existing address queue. The
+            // uncontested local path neither raises its level nor enters SVC.
+            if posix_sync::futex_wait(word, before, crate::clock::CLOCK_MONOTONIC as u32, None)
+                == Err(EINVAL)
+            {
+                let _ = sys::yield_now();
+            }
+        }
+    };
+    if let Some(c) = proto_process::job::class(signal as u8) {
+        let ticket = job_word(block, signal).load(Ordering::Acquire) & !c.low;
+        let origin = origin_word(block, signal).load(Ordering::Acquire);
+        if origin & !c.low != ticket || origin & c.bit == 0 {
+            local_claim_window(signal);
+            return proto_process::job::take_ticket(
+                job_word(block, signal),
+                page_word(signal),
+                signal as u8,
+                ticket,
+            )
+            .map(|ticket| (ticket, None));
+        }
+    } else if block.process.load(Ordering::SeqCst) & bit == 0 {
+        // The assignment claim excludes routing through snapshot and removal.
+        // This path leaves later process origins to their own assignment.
+        local_claim_window(signal);
+        return claim_thread(block, signal).map(|ticket| (ticket, None));
+    }
     let _guard = INFO_LOCK.lock();
     let ticket = claim_thread(block, signal)?;
     let info = process_origin(block, signal, ticket).then(|| taken(block, signal));
@@ -447,6 +554,12 @@ pub(crate) fn route() {
             {
                 return;
             }
+            let Some(_assignment) = AssignmentClaim::try_new(block, bit) else {
+                // Its short claim's final leave reroutes this still-pending
+                // process signal after clearing the assignment exclusion.
+                block.flags.fetch_or(flag::ENTRY_DEFERRED, Ordering::SeqCst);
+                return;
+            };
             let guard = INFO_LOCK.lock();
             if thread_pending(block) & bit != 0 {
                 return;
@@ -557,11 +670,13 @@ pub fn sigaction(signal: i32, act: Option<SigAction>) -> Result<SigAction, i32> 
                 // An ignored signal pending in any thread is discarded.
                 let bit = posix_signals::bit(signal).expect("valid signal");
                 threads::each_block(|block| {
+                    let _guard = INFO_LOCK.lock();
                     if let Some(c) = proto_process::job::class(signal as u8) {
                         job_word(block, signal).fetch_and(!c.bit, Ordering::SeqCst);
                         origin_word(block, signal).fetch_and(!c.bit, Ordering::SeqCst);
                     } else {
                         block.pending.fetch_and(!bit, Ordering::SeqCst);
+                        block.process.fetch_and(!bit, Ordering::SeqCst);
                     }
                 });
             }
@@ -1022,6 +1137,9 @@ pub(crate) unsafe fn after_fork() -> Result<(), i32> {
     for row in &TAKEN {
         clear_taken(row);
     }
+    for word in &CLAIMING {
+        word.store(0, Ordering::Relaxed);
+    }
     attach()
 }
 
@@ -1095,10 +1213,6 @@ fn stopped_by_other() -> bool {
 /// Binds and enables the calling thread's entry, then delivers what came
 /// before it.
 pub(crate) fn attach() -> Result<(), i32> {
-    {
-        let _guard = INFO_LOCK.lock();
-        clear_taken(taken_row(own()));
-    }
     // SAFETY: the dispatcher holds no interrupted Rust references or locks
     // and enters only caller-supplied C code.
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
@@ -1482,13 +1596,16 @@ pub fn probe_assign_job(signal: i32) -> i32 {
 }
 
 pub fn probe_assign_signal(signal: i32) -> i32 {
-    let _guard = INFO_LOCK.lock();
     let bit = posix_signals::bit(signal).unwrap_or(0);
-    if thread_pending(own()) & bit != 0 {
-        return EAGAIN;
-    }
     if bit == 0 || bit & posix_signals::UNBLOCKABLE != 0 {
         return EINVAL;
+    }
+    let Some(_assignment) = AssignmentClaim::try_new(own(), bit) else {
+        return EAGAIN;
+    };
+    let _guard = INFO_LOCK.lock();
+    if thread_pending(own()) & bit != 0 {
+        return EAGAIN;
     }
     let Some(info) = page_info(signal) else {
         return EAGAIN;
@@ -1512,8 +1629,10 @@ pub fn probe_route_job(signal: i32) -> i32 {
     let guard = rt::upcall::defer_entries().expect("router probe entry deferral");
     let block = own();
     let before = block.mask.fetch_and(!bit, Ordering::SeqCst);
+    let waiting = block.flags.fetch_and(!flag::SIGNAL_WAIT, Ordering::SeqCst) & flag::SIGNAL_WAIT;
     route();
     block.mask.store(before, Ordering::SeqCst);
+    block.flags.fetch_or(waiting, Ordering::SeqCst);
     drop(guard);
     0
 }
@@ -1543,4 +1662,21 @@ pub fn probe_return_failure() {
 /// A pre-attachment block has no table place and no return bitmap bit.
 pub fn probe_zero_return() -> i32 {
     give_back(&Block::new(), 0).err().unwrap_or(0)
+}
+
+/// Route to a published thread before it starts or enables its entry.
+pub fn probe_route_newborn(id: u64, signal: i32) -> i32 {
+    let Ok((block, _)) = crate::relibc::target(id) else {
+        return ESRCH;
+    };
+    if block.flags.load(Ordering::SeqCst) & flag::SIGNALS_READY != 0 {
+        return EINVAL;
+    }
+    let Ok(bit) = posix_signals::bit(signal) else {
+        return EINVAL;
+    };
+    let mask = block.mask.fetch_and(!bit, Ordering::SeqCst);
+    route();
+    block.mask.store(mask, Ordering::SeqCst);
+    0
 }
