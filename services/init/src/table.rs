@@ -705,6 +705,7 @@ fn order(table: &[Record]) -> Order {
 
 pub mod ceiling;
 pub mod cycle;
+pub mod entropy;
 pub mod normal;
 pub mod ramfs;
 pub mod test;
@@ -730,7 +731,10 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
     + cfg!(feature = "table-rtbench-posix") as usize
-    + cfg!(feature = "table-rtbench-posix-vz") as usize;
+    + cfg!(feature = "table-rtbench-posix-vz") as usize
+    + cfg!(feature = "table-entropy") as usize
+    + cfg!(feature = "table-entropy-vz") as usize
+    + cfg!(feature = "table-posix-random") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -759,7 +763,10 @@ const _: () = assert!(
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
     feature = "table-rtbench-posix",
-    feature = "table-rtbench-posix-vz"
+    feature = "table-rtbench-posix-vz",
+    feature = "table-entropy",
+    feature = "table-entropy-vz",
+    feature = "table-posix-random"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -802,6 +809,12 @@ pub const TABLE: &[Record] = test::TABLE;
 pub const TABLE: &[Record] = cycle::TABLE;
 #[cfg(feature = "table-ceiling")]
 pub const TABLE: &[Record] = ceiling::TABLE;
+#[cfg(feature = "table-entropy")]
+pub const TABLE: &[Record] = entropy::TABLE;
+#[cfg(feature = "table-entropy-vz")]
+pub const TABLE: &[Record] = entropy::VZ_TABLE;
+#[cfg(feature = "table-posix-random")]
+pub const TABLE: &[Record] = ramfs::POSIX_RANDOM_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1456,11 +1469,28 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "posix", "clock", "pipe", "busybox-probe"]
+            [
+                "uart",
+                "ramfs",
+                "posix",
+                "clock",
+                "pipe",
+                "rng",
+                "entropy",
+                "busybox-probe"
+            ]
         );
         assert_eq!(
             order_of(ramfs::OS_TEST_TABLE),
-            ["ramfs", "posix", "clock", "pipe", "os-test-run"]
+            [
+                "ramfs",
+                "posix",
+                "clock",
+                "pipe",
+                "rng",
+                "entropy",
+                "os-test-run"
+            ]
         );
         assert_eq!(order_of(vz::RTBENCH_TABLE), ["uart", "rtbench"]);
         assert_eq!(
@@ -1481,7 +1511,15 @@ mod tests {
         );
         assert_eq!(
             order_of(ramfs::POSIX_PROCS_TABLE),
-            ["ramfs", "posix", "clock", "pipe", "posix-procs"]
+            [
+                "ramfs",
+                "posix",
+                "clock",
+                "pipe",
+                "rng",
+                "entropy",
+                "posix-procs"
+            ]
         );
         for table in [ramfs::RTBENCH_POSIX_TABLE, vz::RTBENCH_POSIX_TABLE] {
             assert_eq!(
@@ -1494,6 +1532,8 @@ mod tests {
                     "pipe",
                     "uart",
                     "rtbench-load",
+                    "rng",
+                    "entropy",
                     "rtbench-posix"
                 ]
             );
@@ -1504,6 +1544,14 @@ mod tests {
                 "sink", "echo", "slow", "device", "hog", "crash", "oneshot", "silent", "mute",
                 "checker", "private"
             ]
+        );
+        assert_eq!(
+            order_of(entropy::TABLE),
+            ["rng", "entropy", "entropy-probe", "entropy-probe-b"]
+        );
+        assert_eq!(
+            order_of(entropy::VZ_TABLE),
+            ["uart", "rng", "entropy", "entropy-probe", "entropy-probe-b"]
         );
         assert_eq!(
             refused(cycle::TABLE),
@@ -1532,6 +1580,7 @@ mod tests {
             vz::BUSYBOX_DIALOG_TABLE,
             ramfs::RTBENCH_POSIX_TABLE,
             vz::RTBENCH_POSIX_TABLE,
+            ramfs::POSIX_RANDOM_TABLE,
         ];
         for table in tables {
             assert!(check(table).is_ok());
@@ -1544,6 +1593,7 @@ mod tests {
                     "relibc-threads",
                     "os-test-run",
                     "rtbench-posix",
+                    "posix-random",
                 ]
                 .contains(&r.program)
             });

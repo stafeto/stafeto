@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 12;
+pub const PLATFORM_INTERFACE: u64 = 13;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -81,6 +81,27 @@ pub unsafe extern "C" fn stafeto_init(tcb: *mut c_void) -> c_int {
         }
         Err(errno) => -errno,
     }
+}
+
+/// getrandom (posix_abi::random::getrandom): `len` bytes of the
+/// process's generator into `buf`, with GRND_NONBLOCK, GRND_RANDOM and
+/// GRND_INSECURE; relibc's getentropy calls it with no flag and its limit
+/// checked.
+///
+/// # Safety
+/// `buf` is writable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_getrandom(buf: *mut u8, len: usize, flags: u32) -> isize {
+    if buf.is_null() && len != 0 {
+        return -(EFAULT as isize);
+    }
+    let bytes = if len == 0 {
+        &mut [][..]
+    } else {
+        // SAFETY: the caller's promise.
+        unsafe { core::slice::from_raw_parts_mut(buf, len) }
+    };
+    value(call(|| posix_abi::random::getrandom(bytes, flags)).map(|n| n as i64)) as isize
 }
 
 /// # Safety

@@ -36,6 +36,9 @@ Thread.detachNewThread {
     }
 }
 configuration.serialPorts = [serial]
+// A Virtio entropy device: the driver of services/virtio-rng finds it at
+// device 6 of bus 0, after the console.
+configuration.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
 do {
     try configuration.validate()

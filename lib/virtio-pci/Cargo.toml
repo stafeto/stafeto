@@ -1,0 +1,11 @@
+[package]
+name = "virtio-pci"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The PCI configuration a Virtio PCI driver of stafeto writes on Apple VZ, shared by the drivers"
+
+[lib]
+bench = false

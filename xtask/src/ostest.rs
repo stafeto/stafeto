@@ -31,7 +31,7 @@ use crate::{
 
 /// The image of a suite: the RAM files with the tests, the pipes, the process and
 /// clock services, the loader and the runner.
-const PROGRAMS: [ImageProgram; 7] = [
+const PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
@@ -44,6 +44,18 @@ const PROGRAMS: [ImageProgram; 7] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("os-test-run", "os-test-run", crate::POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &[]),
+    (
+        "virtio-rng",
+        "virtio-rng",
+        crate::entropy::RNG_STACK_SIZE,
+        &[],
+    ),
+    (
+        "entropy",
+        "entropy",
+        crate::entropy::ENTROPY_STACK_SIZE,
+        &[],
+    ),
 ];
 
 /// The end of the runner in the log, when it ended.

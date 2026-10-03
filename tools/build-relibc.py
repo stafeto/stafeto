@@ -21,7 +21,7 @@ import sys
 
 
 REPOSITORY = "https://github.com/stafeto/relibc.git"
-COMMIT = "dcb1abba93e03a29eaf0a0a06f14ae9a79b079ac"
+COMMIT = "a5f8c48140499fec787ba4db1671075dda8d5089"
 TOOLCHAIN = "nightly-2026-05-24"
 CBINDGEN = "0.29.4"
 TARGET = "aarch64-unknown-linux-gnu"

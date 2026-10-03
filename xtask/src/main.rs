@@ -7,6 +7,7 @@
 mod out;
 
 mod disasm;
+mod entropy;
 mod image;
 mod jobs;
 mod measure;
@@ -82,7 +83,7 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 /// the console; the loader, which starts the benchmark's children from the
 /// files of the image (5c); the pipe service and BusyBox, whose `ls` and
 /// `cat` are the stages of S22 (5e).
-const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 11] = [
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 13] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -99,9 +100,11 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 11] = [
     ("loader", "loader", 0, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
-const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 11] = [
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 13] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -118,6 +121,8 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 11] = [
     ("loader", "loader", 0, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
@@ -371,7 +376,7 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
 /// The probe of POSIX processes (5b) and the services it needs, the loader
 /// and BusyBox with its applets, which the table of files names (5c): the
 /// probe's children are files of it.
-const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
@@ -386,11 +391,13 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 8] = [
     // Pieces of 64 KiB: the probe's forks copy regions past one piece.
     ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 /// The probe of the longest step of the process service (xtask
 /// process-steps): the probe in its steps mode, and the process service
 /// that prints each new longest step.
-const POSIX_STEPS_PROGRAMS: [ImageProgram; 7] = [
+const POSIX_STEPS_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
     ("pipe", "pipe", PIPE_STACK_SIZE, &["steps"]),
@@ -403,6 +410,8 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 7] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
     ("loader", "loader", 0, &["steps"]),
+    ("virtio-rng", "virtio-rng", 32 * 1024, &["steps"]),
+    ("entropy", "entropy", 32 * 1024, &["steps"]),
 ];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
@@ -449,7 +458,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 8] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 10] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -468,6 +477,8 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 8] = [
         POSIX_STACK_SIZE,
         &["ash-interactive"],
     ),
+    ("virtio-rng", "virtio-rng", entropy::RNG_STACK_SIZE, &[]),
+    ("entropy", "entropy", entropy::ENTROPY_STACK_SIZE, &[]),
 ];
 const LS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
@@ -912,6 +923,11 @@ commands:
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
             --one NAME, one test in a boot of its own, with its log
+  entropy [--hvf] run the probe of the entropy device's driver in QEMU
+            under -icount: fills, a restart of the driver, its longest
+            steps; with --hvf under HVF on Apple's GICv3 and QEMU's GICv2
+  entropy-vz run the probe of the entropy device's driver on Apple VZ
+  posix-random run the C probe of getentropy, getrandom and fork in QEMU
   help      this text";
 
 fn main() {
@@ -1003,6 +1019,16 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
+        Some("entropy") => match args.get(1).map(String::as_str) {
+            None => entropy::probe(&qemu::VIRT),
+            Some("--hvf") => hvf_host().and_then(|()| {
+                entropy::probe(&qemu::HVF_V3)?;
+                entropy::probe(&qemu::HVF_V2)
+            }),
+            Some(_) => Err("entropy [--hvf]".to_owned()),
+        },
+        Some("entropy-vz") => entropy::probe_vz(),
+        Some("posix-random") => entropy::random_probe(&qemu::VIRT),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -1990,6 +2016,7 @@ fn relibc_hello_probe() -> Result<(), String> {
         "relibc-hello: fread ",
         "relibc-hello: monotonic ",
         "relibc-hello: directories, stat, descriptors, mmap, math",
+        "relibc-hello: getentropy without the service: ENOSYS",
         "relibc-hello: ok",
         "Assertion `how == NULL` failed.",
         "RELIBC PANIC: ",
@@ -2336,6 +2363,17 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     if let Some(row) = pipe.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
         return Err(format!("the pipe service: a step past term B: {row:?}"));
     }
+    // The entropy service (tag 11): CLONE for each child of the crowd,
+    // whose cost grows with the live clones (a walk of its table of 320),
+    // and its own steps; every one under term B but the heartbeat.
+    let entropy = longest_steps(&outcome.lines, "11");
+    let clone = entropy.iter().find(|(k, ..)| *k == 8).map_or(0, |r| r.1);
+    if clone == 0 {
+        return Err(format!("the entropy service gave no CLONE: {entropy:?}"));
+    }
+    if let Some(row) = entropy.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+        return Err(format!("the entropy service: a step past term B: {row:?}"));
+    }
     // The heartbeat has its own bound, so that a growth of that wait shows:
     // the service answers no client while it waits for init.
     let heartbeat = pipe.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
@@ -2466,11 +2504,13 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "5", "ash", busybox.clone()),
-        ("-rwxr-xr-x", "5", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "5", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "5", "ls", busybox.clone()),
-        ("-rwxr-xr-x", "5", "wc", busybox),
+        ("-rwxr-xr-x", "7", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "7", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "7", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "7", "head", busybox.clone()),
+        ("-rwxr-xr-x", "7", "ls", busybox.clone()),
+        ("-rwxr-xr-x", "7", "mktemp", busybox.clone()),
+        ("-rwxr-xr-x", "7", "wc", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     // The entries of /bin: the table of the image lists them (rootfs.rs).
@@ -2661,6 +2701,56 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("# ", DIALOG_STEP)?;
         run.send("cat < /dev/null; echo null $?")?;
         run.expect_line("null 0", |line| line == "null 0", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The random devices (5e'): character devices by `ls -l`, read
+        // through pipelines by the children of the shell (the layer of
+        // each serves the bytes from its own generator), a write taken.
+        for name in ["null", "random", "urandom"] {
+            let command = format!("ls -l /dev/{name}");
+            run.send(&command)?;
+            run.expect(&command, DIALOG_STEP)?;
+            run.expect_line(
+                name,
+                |line| {
+                    line.starts_with("crw-rw-rw-")
+                        && line.split_whitespace().last() == Some(format!("/dev/{name}").as_str())
+                },
+                DIALOG_STEP,
+            )?;
+            run.expect("# ", DIALOG_STEP)?;
+        }
+        run.send("head -c 4096 /dev/urandom | wc -c")?;
+        run.expect("head -c 4096 /dev/urandom | wc -c", DIALOG_STEP)?;
+        run.expect_line("4096 bytes", |line| line.trim() == "4096", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("head -c 100 /dev/random | wc -c")?;
+        run.expect("head -c 100 /dev/random | wc -c", DIALOG_STEP)?;
+        run.expect_line("100 bytes", |line| line.trim() == "100", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // The writer never ends: the reader's exit closes the pipe.
+        run.send("cat /dev/urandom | head -c 100 | wc -c")?;
+        run.expect("cat /dev/urandom | head -c 100 | wc -c", DIALOG_STEP)?;
+        run.expect_line("100 bytes by cat", |line| line.trim() == "100", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo lost > /dev/urandom && echo taken")?;
+        run.expect_line("taken", |line| line == "taken", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // ash's $RANDOM is a generator of the shell (seeded with the
+        // process number and the time); a seed given repeats it.
+        run.send(
+            "a=$RANDOM; b=$RANDOM; case $a in $b) echo same-random;; *) echo differ-random;; esac",
+        )?;
+        run.expect_line("differ-random", |line| line == "differ-random", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("RANDOM=7; a=$RANDOM; RANDOM=7; b=$RANDOM; case $a in $b) echo repeats;; *) echo no-repeat;; esac")?;
+        run.expect_line("repeats", |line| line == "repeats", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // mktemp takes its names from the generator (mkstemp of relibc);
+        // no file can be created yet (5i), so every try meets the same
+        // refusal and it gives up with EEXIST, status 1.
+        run.send("mktemp /tmp/dialog.XXXXXX; echo mktemp $?")?;
+        run.expect("File exists", DIALOG_STEP)?;
+        run.expect_line("mktemp 1", |line| line == "mktemp 1", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("exit")?;
         run.expect("exit", DIALOG_STEP)?;
@@ -2869,6 +2959,9 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("kernel tests 2G icount", || {
             kernel_tests(&qemu::VIRT_2G, Variant::TestIcount).map(drop)
         }),
+        // The entropy device's driver under -icount, its steps measured.
+        job("entropy", || entropy::probe(&qemu::VIRT)),
+        job("posix-random", || entropy::random_probe(&qemu::VIRT)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -2946,6 +3039,16 @@ fn host_tests() -> Result<(), String> {
         "virtio-console",
         "--package",
         "xtask",
+        "--package",
+        "virtio-pci",
+        "--package",
+        "proto-entropy",
+        "--package",
+        "virtio-rng",
+        "--package",
+        "posix-random",
+        "--package",
+        "entropy",
     ]))
 }
 
@@ -4231,6 +4334,10 @@ fn hvf() -> Result<(), String> {
             relibc_threads_probe(m)?;
             posix_procs_probe(m)?;
         }
+        // The entropy device's DMA through the real processor's caches,
+        // and the layer's generator across fork.
+        entropy::probe(m)?;
+        entropy::random_probe(m)?;
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
         let mut kernel = 0;
@@ -4252,7 +4359,7 @@ fn hvf() -> Result<(), String> {
         }
         write_measures()?;
         println!(
-            "hvf on {}: boot ok, console dialog ok, relibc threads and POSIX processes ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
+            "hvf on {}: boot ok, console dialog ok, entropy ok, relibc threads and POSIX processes ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
@@ -4525,6 +4632,12 @@ fn ci(jobs: usize) -> Result<(), String> {
         "proto-loader",
         "--package",
         "xtask",
+        "--package",
+        "virtio-pci",
+        "--package",
+        "proto-entropy",
+        "--package",
+        "posix-random",
         "--all-targets",
         "--",
         "-D",
@@ -4548,6 +4661,10 @@ fn ci(jobs: usize) -> Result<(), String> {
         "virtio-console",
         "--package",
         "posix-process-service",
+        "--package",
+        "virtio-rng",
+        "--package",
+        "entropy",
         "--lib",
         "--tests",
         "--",
@@ -4659,6 +4776,14 @@ fn ci(jobs: usize) -> Result<(), String> {
         "rtbench-posix",
         "--package",
         "rtbench-load",
+        "--package",
+        "virtio-rng",
+        "--package",
+        "entropy-probe",
+        "--package",
+        "entropy",
+        "--features",
+        "virtio-rng/crash,virtio-rng/steps,entropy/steps,entropy/report",
         "--target",
         PROGRAM_TARGET,
         "--",
@@ -4702,6 +4827,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-procs",
         "--package",
         "os-test-run",
+        "--package",
+        "posix-random-probe",
         "--target",
         PROGRAM_TARGET,
         "--",

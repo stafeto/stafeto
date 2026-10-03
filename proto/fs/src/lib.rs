@@ -2,7 +2,10 @@
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 //! Version 2 of the RAM file service protocol. All numbers are little endian.
-//! OPEN: header, flags u32, UTF-8 absolute path bytes. Reply: status, fd u32.
+//! OPEN: header, flags u32, UTF-8 absolute path bytes. Reply: status, fd u32,
+//! and for a random device (`/dev/random`, `/dev/urandom`, step 5e') a third
+//! word, RANDOM_DEVICE: the client's layer serves the reads of such a
+//! description from its own generator, and the service refuses them.
 //! READ: header, fd u32, count u32. Reply: status, count u32, bytes.
 //! WRITE: header, fd u32, bytes. Reply: status, count u32.
 //! SEEK: header, fd u32, absolute offset u32. Reply: status, offset u32.
@@ -83,6 +86,8 @@ pub const DIRECTORY_ONLY: u32 = 4;
 /// them (it has no contents to create, cut or follow), any other file
 /// answers INVALID_ARGUMENT.
 pub const CHANGES: u32 = 8;
+/// The third word of the reply to an OPEN of a random device.
+pub const RANDOM_DEVICE: u32 = 1;
 
 pub const NO_ENTRY: u32 = 300;
 pub const BAD_FD: u32 = 301;

@@ -145,13 +145,26 @@ bytes and 432 MB/s in writes of 4 KiB (S20), and `ls /etc | cat` as two
 [notes/m5e-pipes.md](notes/m5e-pipes.md) has the rows, the limits and the
 conformance list.
 
+**Random numbers.** A driver for the Virtio entropy device
+(`services/virtio-rng`) feeds the entropy service (`services/entropy`), which
+gives each POSIX process a key of 32 bytes; the layer of the process runs a
+ChaCha20 generator with fast key erasure on it, so `getentropy`, `getrandom`,
+`arc4random`, the reads of `/dev/random` and `/dev/urandom` (character
+devices of the RAM service) and the names of `mkstemp` need no request once
+the key is there, and a child of `fork` takes a key of its own. On HVF and
+Apple VZ (10 minutes, p50) `getentropy` of 32 and of 256 bytes takes 0.21 and
+0.93 us with two kernel calls (S23, S24), and a read of 4 KiB of
+`/dev/urandom` 12.3 us (S25). Creating the temporary file waits for 5i.
+[notes/m5e2-entropy.md](notes/m5e2-entropy.md) has the rows, the steps of
+the services and the limits.
+
 **C library.** relibc (MIT) is the C library of every POSIX program,
 BusyBox included; its platform is the layer's `stafeto_*` functions.
 os-test's io, malloc, process and signal suites, `basic/spawn`, `basic/unistd`
 `exec*` and the `basic` tests that call `fork` run on it in `ci` from files,
-one boot a suite: 120 pass, 73 fail (`mkstemp`, `access`, `sigaltstack`,
+one boot a suite: 121 pass, 73 fail (`mkstemp`, `access`, `sigaltstack`,
 `posix_openpt`: the RAM service creates no file yet and the terminal and
-job control wait for 5f) and 11 need `poll` or `select` (5f) of 204; `ci`
+job control wait for 5f) and 11 need `poll` or `select` (5f) of 205; `ci`
 fails when a test that passed stops passing. relibc
 builds at its own level 3: user-space programs have no size limit, only
 the kernel has one. Details are in
@@ -182,6 +195,10 @@ Apple silicon.
   `init` started has 48 of them (`ENFILE`), 96 of the 128 blocking reads
   and writes that may wait (`EAGAIN` past them, and past 8 at one end or
   16 in one process) and 255 sessions of the service's 320.
+- Random numbers come from the Virtio entropy device alone. After a
+  restart of the entropy service the processes that ran before keep their
+  generators but not their session: their children get `ENOSYS` from
+  `getentropy`, and `arc4random` ends them.
 - Files live in RAM; ext4 is read from an image inside the guest, with no
   block driver.
 
@@ -269,7 +286,7 @@ Bounded kernel paths and their costs:
 | POSIX: fork | `fork` with the loader copying the parent; the other threads stop for it; `ash` runs external programs; rtbench rows by memory size | ✅ [#79](https://github.com/stafeto/stafeto/pull/79) |
 | POSIX: pipes | a pipe service, `pipe`, ends across `fork`, `posix_spawn` and `exec`, `SA_RESTART` and `SIGCHLD` in the shell, `setpgid` of a child, `/dev/null`; `ash` runs `ls \| cat`; rtbench rows of pipes | ✅ [#80](https://github.com/stafeto/stafeto/pull/80) |
 | POSIX: terminal | a terminal service with `termios`, pseudo-terminals, job control, `poll` and `select`, Ctrl-C to the foreground group, the missing `ash` built-ins | 🚧 |
-| POSIX: random numbers | an entropy service on Virtio entropy, a ChaCha20 generator in the layer, `getentropy`, `/dev/random` and `/dev/urandom` | 🚧 |
+| POSIX: random numbers | a Virtio entropy driver and an entropy service, a ChaCha20 generator in the layer, `getentropy`, `getrandom`, `arc4random`, `/dev/random` and `/dev/urandom`, names of `mkstemp` from the generator; rtbench rows of the generator | 🚧 |
 | POSIX: files with writing | the RAM file service creates files and directories, `/tmp`, `fcntl` locks, FIFOs | ⬜ |
 | POSIX: conformance | the full os-test suite and Open POSIX in `ci`, honest headers and `sysconf`, `cargo xtask coverage` checking the standard's interface list against the C library at every step | ⬜ |
 | POSIX: timers and scheduling | POSIX timers, CPU time, `SCHED_FIFO` and `SCHED_RR`, queued signals | ⬜ |

@@ -162,20 +162,22 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Uart and Pipes; 0 for none.
+/// by proto_loader::Slot: Files, Clock, Uart, Pipes and Entropy; 0 for
+/// none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
     pub files: u64,
     pub clock: u64,
     pub uart: u64,
     pub pipes: u64,
+    pub entropy: u64,
 }
 
 impl Sessions {
     /// The parent's own sessions go: those of a fork that never came to
     /// its loader.
     fn close(self) {
-        for raw in [self.files, self.clock, self.uart, self.pipes] {
+        for raw in [self.files, self.clock, self.uart, self.pipes, self.entropy] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
             }
@@ -222,18 +224,31 @@ pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
 }
 
 /// Handles: the sessions for the child to its loader `c`, each that is
-/// there; they move whatever comes of it.
+/// there; they move whatever comes of it. Four go in one message, the
+/// entropy service's in a second.
 fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
     use proto_loader::Slot;
+    give_slots(
+        c,
+        &[
+            (Slot::Files, sessions.files),
+            (Slot::Clock, sessions.clock),
+            (Slot::Uart, sessions.uart),
+            (Slot::Pipes, sessions.pipes),
+        ],
+    )
+    .and(give_slots(c, &[(Slot::Entropy, sessions.entropy)]))
+}
+
+/// One Handles of the sessions `slots` (four at most) that are there.
+pub(crate) fn give_slots(
+    c: &Handle<Channel>,
+    slots: &[(proto_loader::Slot, u64)],
+) -> Result<(), i32> {
     let mut w = Writer::new();
     Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
     let mut handles = Outgoing::new();
-    for (slot, raw) in [
-        (Slot::Files, sessions.files),
-        (Slot::Clock, sessions.clock),
-        (Slot::Uart, sessions.uart),
-        (Slot::Pipes, sessions.pipes),
-    ] {
+    for &(slot, raw) in slots {
         if raw != 0 {
             let session = Handle::<Channel>::from_raw(rt::abi::Handle(raw));
             w.u32(slot as u32).map_err(|_| EIO)?;
@@ -551,8 +566,9 @@ pub fn fork(window: Option<fn()>) -> Result<i32, i32> {
 
 /// Clones of the process's sessions for a child (Clone): the RAM files'
 /// with the descriptions of the descriptors without FD_CLOFORK, the
-/// clock's, the console input's, and the pipe service's with the ends of
-/// the descriptors without FD_CLOFORK, each the process has.
+/// clock's, the console input's, the pipe service's with the ends of the
+/// descriptors without FD_CLOFORK, and the entropy service's, each the
+/// process has.
 fn sessions() -> Result<Sessions, i32> {
     use crate::process::clone_errno;
     let mut out = Sessions::default();
@@ -596,6 +612,9 @@ fn sessions() -> Result<Sessions, i32> {
             let clone = pipes_clone(pipes, &ends[..count])?;
             out.pipes = clone.into_raw().0;
         }
+        if let Some(clone) = entropy_clone() {
+            out.entropy = clone.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -603,6 +622,26 @@ fn sessions() -> Result<Sessions, i32> {
         Err(errno) => {
             out.close();
             Err(errno)
+        }
+    }
+}
+
+/// A clone of the process's session with the entropy service for a child
+/// (proto_entropy CLONE), when it has one. A refusal (a service that ended
+/// or restarts, or is at its limit) fails no fork or spawn: the child gets
+/// no session, and its getentropy gives ENOSYS; the line says so.
+pub(crate) fn entropy_clone() -> Option<Handle<Channel>> {
+    let entropy = crate::random::session()?;
+    match rt::service::clone_session(
+        &Handle::<Channel>::borrowed(entropy),
+        &proto_entropy::Method::Clone.header().bytes(),
+    ) {
+        Ok(clone) => Some(clone),
+        Err(status) => {
+            rt::println!(
+                "posix: the entropy service refused a session for a child ({status:?}); the child has none"
+            );
+            None
         }
     }
 }
@@ -686,6 +725,9 @@ fn child() -> Result<(), &'static str> {
         }
         crate::clock::after_fork(handle(raw(Slot::Clock)), crate::allocation::process())
             .map_err(|_| "its clock")?;
+        // The parent's key and buffer go: the child asks for a key of its
+        // own at its first use.
+        crate::random::after_fork(handle(raw(Slot::Entropy)));
         crate::signals::after_fork().map_err(|_| "its signals")?;
     }
     let id = crate::threads::thread_number();

@@ -541,6 +541,7 @@ impl Shadow {
                 posix_fs::Target::Error => Names::Error,
                 posix_fs::Target::Ram(n) => Names::File(n),
                 posix_fs::Target::Pipe(n) => Names::Pipe(n),
+                posix_fs::Target::Random(n) => Names::Random(n),
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -555,10 +556,11 @@ impl Shadow {
     fn shared(&self) -> impl Iterator<Item = u32> + Clone + '_ {
         let (list, count) = self.descriptors();
         (0..count).filter_map(move |i| match list[i].names {
-            proto_loader::Names::File(n)
-                if !list[..i]
-                    .iter()
-                    .any(|d| d.names == proto_loader::Names::File(n)) =>
+            proto_loader::Names::File(n) | proto_loader::Names::Random(n)
+                if !list[..i].iter().any(|d| {
+                    matches!(d.names, proto_loader::Names::File(m)
+                        | proto_loader::Names::Random(m) if m == n)
+                }) =>
             {
                 Some(n)
             }
@@ -1094,7 +1096,13 @@ fn move_files(c: &Handle<Channel>) -> bool {
     {
         let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
     }
-    ask_loader(c, &w, Some(handles)) == 0
+    if ask_loader(c, &w, Some(handles)) != 0 {
+        return false;
+    }
+    // The session with the entropy service moves too, in a second Handles;
+    // the new image's generator starts with no key.
+    let entropy = crate::random::session().map_or(0, |raw| raw.0);
+    crate::fork::give_slots(c, &[(Slot::Entropy, entropy)]).is_ok()
 }
 
 /// The errno of a refused Clone: EAGAIN for a service at its limit of
@@ -1206,6 +1214,9 @@ fn commit(
     if ask_loader(c, &w, Some(handles)) != 0 {
         return Err(EIO);
     }
+    // The child's session with the entropy service, in a second Handles.
+    let entropy = crate::fork::entropy_clone();
+    crate::fork::give_slots(c, &[(Slot::Entropy, entropy.map_or(0, |e| e.into_raw().0))])?;
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)
 }
 

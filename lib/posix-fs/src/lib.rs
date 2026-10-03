@@ -145,6 +145,10 @@ pub enum Target {
     Error,
     Ram(u32),
     Pipe(u32),
+    /// A random device (`/dev/random`, `/dev/urandom`, 5e'): the service's
+    /// open description of this number takes the writes, the closes and
+    /// the `fstat`, and the layer serves the reads from its generator.
+    Random(u32),
 }
 
 /// One process's file state, mutated by one owner: the table of
@@ -249,7 +253,7 @@ impl Transport {
     /// requests before the heap run it on a small stack.
     pub fn release(&self, target: Option<Target>) -> Result<(), FsError> {
         match target {
-            Some(Target::Ram(fd)) => self.close_file(fd),
+            Some(Target::Ram(fd) | Target::Random(fd)) => self.close_file(fd),
             Some(Target::Pipe(end)) => self.close_pipe(end),
             _ => Ok(()),
         }
@@ -311,8 +315,20 @@ impl Transport {
         Ok((read, write))
     }
 
-    pub fn open(&self, path: &str, flags: u32) -> Result<u32, FsError> {
-        self.files().open(path, flags).map_err(FsError::from)
+    /// OPEN: the service's description, as a random device when the
+    /// service says so and the description reads: one opened for writing
+    /// alone stays a file of the service, which refuses its reads with
+    /// BAD_FD.
+    pub fn open(&self, path: &str, flags: u32) -> Result<Target, FsError> {
+        let (fd, random) = self
+            .files()
+            .open_marked(path, flags)
+            .map_err(FsError::from)?;
+        Ok(if random && flags & 3 != proto_fs::WRITE_ONLY {
+            Target::Random(fd)
+        } else {
+            Target::Ram(fd)
+        })
     }
 
     /// The console's input route of the process.
@@ -355,7 +371,7 @@ impl Transport {
         let fd = match target {
             Target::Output => 1,
             Target::Error => 2,
-            Target::Ram(fd) => fd,
+            Target::Ram(fd) | Target::Random(fd) => fd,
             _ => return Err(FsError::BadFileDescriptor),
         };
         self.files().write(fd, bytes).map_err(FsError::from)
@@ -363,7 +379,7 @@ impl Transport {
 
     pub fn lseek(&self, target: Target, offset: i64, origin: SeekFrom) -> Result<i64, FsError> {
         match target {
-            Target::Ram(fd) => self
+            Target::Ram(fd) | Target::Random(fd) => self
                 .files()
                 .seek_from(fd, offset, origin)
                 .map_err(FsError::from),
@@ -373,7 +389,7 @@ impl Transport {
 
     pub fn descriptor_information(&self, target: Target) -> Result<NodeInfo, FsError> {
         match target {
-            Target::Ram(fd) => self
+            Target::Ram(fd) | Target::Random(fd) => self
                 .files()
                 .descriptor_information(fd)
                 .map_err(FsError::from),
@@ -574,7 +590,7 @@ impl PosixFs {
     pub fn kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
         let mut count = 0;
         for (_, target, flags) in self.descriptors.open() {
-            if let Target::Ram(n) = target
+            if let Target::Ram(n) | Target::Random(n) = target
                 && !flags.close_on_fork
                 && !out[..count].contains(&n)
             {
@@ -675,11 +691,12 @@ impl PosixFs {
         self.descriptors.abandon_hold()
     }
 
-    /// A descriptor of the service's description `fd` with `flags`, the
-    /// lowest free one: the caller closes `fd` on an error.
-    pub fn insert(&mut self, fd: u32, flags: DescriptorFlags) -> Result<u32, FsError> {
+    /// A descriptor of the service's description `target` (a file or a
+    /// random device) with `flags`, the lowest free one: the caller
+    /// closes it on an error.
+    pub fn insert(&mut self, target: Target, flags: DescriptorFlags) -> Result<u32, FsError> {
         self.descriptors
-            .insert(Target::Ram(fd), flags)
+            .insert(target, flags)
             .map_err(FsError::from)
     }
 
@@ -742,11 +759,11 @@ impl PosixFs {
         let resolved = self.resolve(path)?;
         self.descriptors.vacant(0)?;
         let transport = self.transport();
-        let fd = transport.open(resolved.as_str()?, flags)?;
-        match self.insert(fd, DescriptorFlags::default()) {
+        let opened = transport.open(resolved.as_str()?, flags)?;
+        match self.insert(opened, DescriptorFlags::default()) {
             Ok(fd) => Ok(fd),
             Err(error) => {
-                let _ = transport.release(Some(Target::Ram(fd)));
+                let _ = transport.release(Some(opened));
                 Err(error)
             }
         }
