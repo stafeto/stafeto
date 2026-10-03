@@ -333,6 +333,15 @@ const POSIX_TTY_STEPS_PROGRAMS: [ImageProgram; 10] = {
     programs[5].3 = &["tty-probe", "steps"];
     programs
 };
+/// Full terminal control steps with sixteen live POSIX clients over a PTY.
+const POSIX_TTY_CONTROL_PROGRAMS: [ImageProgram; 10] = {
+    let mut programs = POSIX_TTY_STEPS_PROGRAMS;
+    programs[2].3 = &["quiet-steps"];
+    programs[5].3 = &["tty-probe"];
+    programs[8].3 = &["quiet-control"];
+    programs[9].3 = &["quiet-control"];
+    programs
+};
 /// The same over the Virtio console's driver on Apple VZ (xtask
 /// posix-tty-vz).
 const POSIX_TTY_VZ_PROGRAMS: [ImageProgram; 10] = [
@@ -1008,6 +1017,7 @@ commands:
             --one NAME, one test in a boot of its own, with its log
   posix-tty run the C probe of the terminal: termios, isatty, ttyname and the
             names of terminals through the terminal service, with typed input
+  posix-tty-control-steps measure full terminal control with sixteen live clients
   posix-tty-steps measure controlling terminal, last-slot groups and full walks
             under -icount; startup dependency waits are printed separately
   posix-tty-vz the same over the Virtio console on Apple VZ
@@ -1083,6 +1093,7 @@ fn main() {
         Some("loader-channels") => loader_channels_probe(),
         Some("posix-poll") => posix_poll_probe(),
         Some("posix-pty") => posix_pty_probe(),
+        Some("posix-tty-control-steps") => posix_tty_control_steps(),
         Some("posix-jobs") => posix_jobs_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
@@ -1919,11 +1930,54 @@ fn posix_input_probe(vz: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The probe of the terminal in C (tests/posix-tty): the termios functions,
-/// isatty, ttyname and the names of terminals through the terminal
-/// service. It asks for input and xtask types it: three single bytes in
-/// raw mode (no echo), a line in canonical mode, bytes for the flushes
-/// that must not be read, and one byte that must.
+/// Measures the full terminal control interval against a PTY in memory.
+fn posix_tty_control_steps() -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = build_boot_image(
+        "boot-posix-tty-control-steps.img",
+        &POSIX_TTY_CONTROL_PROGRAMS,
+        BOOT_PROFILE,
+    )?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let outcome = qemu::run_until(cmd, Duration::from_secs(180), Some("init: posix-tty ended"))?;
+    let dir = target_dir().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("posix-tty-control-steps.log"),
+        outcome.lines.join("\n") + "\n",
+    )
+    .map_err(|e| e.to_string())?;
+    if !outcome
+        .lines
+        .iter()
+        .any(|line| line == "posix-tty: quiet controls sixteen clients ok")
+        || !outcome
+            .lines
+            .iter()
+            .any(|line| line == "init: posix-tty ended: exit code 0, not restarted")
+    {
+        return Err(
+            "quiet terminal controls failed; see target/measure/posix-tty-control-steps.log".into(),
+        );
+    }
+    let maxima = longest_steps(&outcome.lines, "5");
+    for kind in 16..=20 {
+        let ticks = maxima
+            .iter()
+            .find(|row| row.0 == kind)
+            .map_or(0, |row| row.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "terminal control kind {kind}: {ticks} ticks, limit {RAM_STEP_MAX}"
+            ));
+        }
+    }
+    println!("Quiet terminal controls, sixteen live clients: {maxima:?}");
+    Ok(())
+}
+
 fn posix_tty_probe(vz: bool, measure: bool) -> Result<(), String> {
     relibc()?;
     let image = if measure {
@@ -3596,6 +3650,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-input", || posix_input_probe(false)),
         job("posix-interrupt", || posix_interrupt_probe(false)),
         job("posix-tty", || posix_tty_probe(false, false)),
+        job("posix-tty-control-steps", posix_tty_control_steps),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
         job("posix-procs", || posix_procs_probe(&qemu::VIRT)),

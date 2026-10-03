@@ -2239,7 +2239,7 @@ impl Tty {
                 if let Err(code) = self.background(caller, proto_tty::CHANGE_ACCESS, blocked) {
                     return status(code);
                 }
-                #[cfg(feature = "steps")]
+                #[cfg(all(feature = "steps", not(feature = "quiet-steps")))]
                 let began = time::now();
                 let in_session = |pgid, sid| {
                     jobs::group_in_session(
@@ -2252,7 +2252,7 @@ impl Tty {
                 let mut jobs = self.devices[self.active].jobs;
                 let set = jobs.set_foreground(caller, group, in_session);
                 self.devices[self.active].jobs = jobs;
-                #[cfg(feature = "steps")]
+                #[cfg(all(feature = "steps", not(feature = "quiet-steps")))]
                 rt::println!(
                     "tty group scan: group {group} {} ticks code {}",
                     time::now().saturating_sub(began),

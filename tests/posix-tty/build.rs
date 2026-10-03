@@ -15,6 +15,7 @@ fn run(cmd: &mut Command) {
 
 fn main() {
     println!("cargo:rerun-if-changed=tty.c");
+    println!("cargo:rerun-if-changed=quiet.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
     let manifest =
@@ -60,6 +61,11 @@ fn main() {
             "-isystem",
         ])
         .arg(sysroot.join("include"))
+        .args(if env::var_os("CARGO_FEATURE_QUIET_CONTROL").is_some() {
+            vec!["-DSTAFETO_QUIET_CONTROL"]
+        } else {
+            vec![]
+        })
         .args(["-c", "tty.c", "-o"])
         .arg(out.join("tty.o")));
     run(Command::new(tools.join("llvm-ar"))

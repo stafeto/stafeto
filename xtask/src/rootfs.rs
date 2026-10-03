@@ -364,6 +364,7 @@ pub const IMAGES: &[&str] = &[
     "boot-posix-steps.img",
     "boot-posix-tty.img",
     "boot-posix-tty-steps.img",
+    "boot-posix-tty-control-steps.img",
     "boot-posix-tty-vz.img",
     "rtbench-posix.img",
     "rtbench-posix-vz.img",
@@ -413,7 +414,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
             files
         }
         "boot-posix-steps.img" => steps(),
-        "boot-posix-tty.img" | "boot-posix-tty-steps.img" | "boot-posix-tty-vz.img" => posix_tty(),
+        "boot-posix-tty.img"
+        | "boot-posix-tty-steps.img"
+        | "boot-posix-tty-control-steps.img"
+        | "boot-posix-tty-vz.img" => posix_tty(),
         "rtbench-posix.img" | "rtbench-posix-vz.img" | "rtbench-posix-short.img" => rtbench(),
         _ => Vec::new(),
     }
@@ -517,6 +521,7 @@ mod tests {
                 "boot-posix-steps.img" => &crate::POSIX_STEPS_PROGRAMS,
                 "boot-posix-tty.img" => &crate::POSIX_TTY_PROGRAMS,
                 "boot-posix-tty-steps.img" => &crate::POSIX_TTY_STEPS_PROGRAMS,
+                "boot-posix-tty-control-steps.img" => &crate::POSIX_TTY_CONTROL_PROGRAMS,
                 "boot-posix-tty-vz.img" => &crate::POSIX_TTY_VZ_PROGRAMS,
                 "rtbench-posix.img" | "rtbench-posix-short.img" => &crate::RTBENCH_POSIX_PROGRAMS,
                 "rtbench-posix-vz.img" => &crate::RTBENCH_POSIX_VZ_PROGRAMS,
