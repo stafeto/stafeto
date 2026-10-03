@@ -259,6 +259,13 @@ pub fn process_kill_at(process: &Handle<Process>, level: u8) -> Result<(), Error
     call::<{ Call::ProcessKill.number() }>(&[process.raw().0, level.into()]).map(drop)
 }
 
+/// Suspend or continue a process through MANAGE. Level 0 uses the caller's
+/// effective priority; continuation returns parked threads in portions.
+pub fn process_control(process: &Handle<Process>, suspend: bool, level: u8) -> Result<(), Error> {
+    call::<{ Call::ProcessControl.number() }>(&[process.raw().0, u64::from(!suspend), level.into()])
+        .map(drop)
+}
+
 /// process_exit: the caller's process ends with `code`.
 pub fn process_exit(code: u64) -> ! {
     // SAFETY: the call ends the process and does not return.

@@ -265,6 +265,22 @@ const TESTS: &[(&str, TestFn)] = &[
         calls::buffer_that_does_not_map_goes_back,
     ),
     (
+        "process_control_checks_its_arguments",
+        calls::process_control_checks_its_arguments,
+    ),
+    (
+        "suspended_crowds_keep_waits_and_continue",
+        calls::suspended_crowds_keep_waits_and_continue,
+    ),
+    (
+        "suspended_crowds_stop_again_and_die",
+        calls::suspended_crowds_stop_again_and_die,
+    ),
+    (
+        "suspended_reply_keeps_its_result",
+        calls::suspended_reply_keeps_its_result,
+    ),
+    (
         "process_kill_ends_threads_in_every_state",
         calls::process_kill_ends_threads_in_every_state,
     ),
@@ -533,7 +549,7 @@ pub const CHILD_QUOTA: u64 = 64 << 10;
 /// of the long calls of memory objects, the timers of programs, device
 /// windows, the calls of upcalls and process_kill with a level, whose
 /// counts mean instructions only there (spec 15.3).
-const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 7 } else { 0 };
+const ICOUNT_ONLY: usize = if cfg!(feature = "icount") { 8 } else { 0 };
 
 pub fn run(boot: &Boot) -> ! {
     #[cfg(feature = "icount")]
@@ -573,6 +589,11 @@ pub fn run(boot: &Boot) -> ! {
     report(
         "process_kill_with_a_level_is_measured",
         calls::process_kill_with_a_level_is_measured(boot),
+    );
+    #[cfg(feature = "icount")]
+    report(
+        "suspension_paths_are_measured",
+        calls::suspension_paths_are_measured(boot),
     );
     el0::run()
 }

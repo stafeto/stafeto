@@ -299,11 +299,14 @@ pub enum Call {
     ThreadUpcallReturn = 34,
     // 35 went with request_identity: the process service names its
     // clients by the labels of the sessions it gives (spec 11).
+    /// x0 process with MANAGE, x1 action (0 suspend, 1 continue), x2 level.
+    /// Level 0 uses the caller priority; 1-63 stays at or below it.
+    ProcessControl = 36,
 }
 
 impl Call {
     /// Every call, in the order of its number.
-    pub const ALL: [Call; 33] = [
+    pub const ALL: [Call; 34] = [
         Call::HandleClose,
         Call::HandleDuplicate,
         Call::CreateChannel,
@@ -337,6 +340,7 @@ impl Call {
         Call::ThreadUpcallControl,
         Call::ThreadUpcallRequest,
         Call::ThreadUpcallReturn,
+        Call::ProcessControl,
     ];
 
     pub const fn number(self) -> u16 {
@@ -349,16 +353,17 @@ impl Call {
         match number {
             1..=28 => Some(Self::ALL[number as usize - 1]),
             30..=34 => Some(Self::ALL[number as usize - 2]),
+            36 => Some(Self::ProcessControl),
             _ => None,
         }
     }
 
     /// The highest number of a call.
-    pub const HIGHEST: u16 = Call::ThreadUpcallReturn.number();
+    pub const HIGHEST: u16 = Call::ProcessControl.number();
 }
 
 /// Numbers of calls that went, never given again (spec 11): 29,
-/// console_poll, and 35, request_identity. The next new call takes 36.
+/// console_poll, and 35, request_identity. The next new call takes 37.
 pub const RETIRED_CALLS: [u16; 2] = [29, 35];
 
 /// System call numbers that belong to the kernel's test builds (spec 11):
@@ -894,13 +899,15 @@ pub enum ThreadState {
     AwaitingReply,
     /// Ended; it never runs again.
     Ended,
+    /// Suspended by the process, awaiting continuation.
+    Parked,
     /// A state this abi does not know, which a later kernel may return:
     /// its code. The kernel this abi comes with never returns one.
     Unknown(u64),
 }
 
 impl ThreadState {
-    /// The code in x1 of `object_info`: 0 to 6 in the order above.
+    /// The code in x1 of `object_info`: 0 to 7 in the order above.
     pub const fn code(self) -> u64 {
         match self {
             ThreadState::Stopped => 0,
@@ -910,6 +917,7 @@ impl ThreadState {
             ThreadState::Sending => 4,
             ThreadState::AwaitingReply => 5,
             ThreadState::Ended => 6,
+            ThreadState::Parked => 7,
             ThreadState::Unknown(code) => code,
         }
     }
@@ -925,6 +933,7 @@ impl ThreadState {
             4 => ThreadState::Sending,
             5 => ThreadState::AwaitingReply,
             6 => ThreadState::Ended,
+            7 => ThreadState::Parked,
             _ => ThreadState::Unknown(code),
         }
     }
@@ -1364,7 +1373,7 @@ mod tests {
 
     #[test]
     fn call_numbers_are_dense_from_one_but_the_retired() {
-        assert_eq!(Call::ALL.len(), 33);
+        assert_eq!(Call::ALL.len(), 34);
         let numbers = (1..=Call::HIGHEST).filter(|n| !RETIRED_CALLS.contains(n));
         for (call, n) in Call::ALL.iter().zip(numbers) {
             assert_eq!(call.number(), n);
@@ -1375,14 +1384,14 @@ mod tests {
             0,
             29,
             35,
-            36,
+            37,
             0xFEFF,
             *TEST_CALLS.start(),
             *TEST_CALLS.end(),
         ] {
             assert_eq!(Call::from_number(n), None);
         }
-        assert_eq!(KERNEL_CALL_SLOTS, 35);
+        assert_eq!(KERNEL_CALL_SLOTS, 37);
     }
 
     #[test]
@@ -1697,12 +1706,13 @@ mod tests {
             ThreadState::Sending,
             ThreadState::AwaitingReply,
             ThreadState::Ended,
+            ThreadState::Parked,
         ];
         for (code, state) in states.into_iter().enumerate() {
             assert_eq!(state.code(), code as u64);
             assert_eq!(ThreadState::from_code(code as u64), state);
         }
-        assert_eq!(ThreadState::from_code(7), ThreadState::Unknown(7));
+        assert_eq!(ThreadState::from_code(8), ThreadState::Unknown(8));
         let info = ThreadInfo {
             state: ThreadState::Sending,
             base: 5,

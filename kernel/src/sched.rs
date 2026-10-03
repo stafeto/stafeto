@@ -212,6 +212,10 @@ pub unsafe fn exit(t: NonNull<Thread>, cause: u8) {
     let (held, waited) = locked(|k| {
         // SAFETY: `t` is alive; its node is read before the scheduler takes it.
         let state = unsafe { t.as_ref() }.sched.state();
+        if state == State::Parked {
+            // SAFETY: a parked thread belongs to its process list.
+            unsafe { crate::process::unlist_parked(t, k) };
+        }
         // SAFETY: `t` and the scheduler's threads are alive; the queue
         // gives up the thread before the scheduler ends it.
         let waited = unsafe { channel::cancel(t, k) };
@@ -464,14 +468,15 @@ extern "C" fn exit_loop() -> ! {
             crate::interrupt::handle(ack);
         }
         match decide() {
-            Decision::Run(t) => thread::run(t),
+            Some(Decision::Run(t)) => thread::run(t),
             // Another line of the same priority shows only after the EOI
             // of the one just handled (GICv2 running priority): poll again
             // first. Deciding again costs nothing: the running thread went
             // to the head of its level already.
-            Decision::Clean if arch::irq_pending() => {}
-            Decision::Clean => cleanup::portion(),
-            Decision::Idle => sleep(),
+            Some(Decision::Clean) if arch::irq_pending() => {}
+            Some(Decision::Clean) => cleanup::portion(),
+            Some(Decision::Idle) => sleep(),
+            None => {}
         }
     }
 }
@@ -482,7 +487,7 @@ extern "C" fn exit_loop() -> ! {
 /// timer for a FIFO thread, for cleanup or while idle (spec 8, 10). The
 /// lock of the timers goes before the scheduler's is taken. A thread chosen
 /// after a timer's interrupt ends that interrupt's latency.
-fn decide() -> Decision<Thread> {
+fn decide() -> Option<Decision<Thread>> {
     #[cfg(feature = "locked-decide")]
     let cleanup = cleanup::top();
     #[cfg(not(feature = "locked-decide"))]
@@ -496,6 +501,16 @@ fn decide() -> Decision<Thread> {
     let g = &mut *g;
     // SAFETY: the scheduler's threads are alive.
     let decision = unsafe { g.s.pick(now, cleanup) };
+    if let Decision::Run(t) = decision {
+        let mut k = Locked {
+            s: &mut g.s,
+            // SAFETY: the scheduler lock guards the table.
+            tokens: unsafe { &mut *TOKENS.0.get() },
+        };
+        if crate::process::park_selected(t, &mut k) {
+            return None;
+        }
+    }
     if let Decision::Run(_) = decision
         && let Some((deadline, woke)) = g.fired.take()
     {
@@ -514,7 +529,7 @@ fn decide() -> Decision<Thread> {
     }
     let deadline = g.s.deadline(next_timer);
     g.armed.set(&mut VirtualTimer, deadline);
-    decision
+    Some(decision)
 }
 
 /// Nothing to do: sleeps in `wfi` with interrupts masked until one is

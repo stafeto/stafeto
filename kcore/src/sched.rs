@@ -53,6 +53,8 @@ pub enum State {
     Waiting,
     /// Ended; it never runs again.
     Dead,
+    /// Suspended by its process, in its process list through the node link.
+    Parked,
 }
 
 /// Where an item of a `ReadyQueue` stands: its level and its neighbours
@@ -99,6 +101,69 @@ impl<T> Link<T> {
 /// at, valid as long as that object lives.
 pub unsafe trait Linked: Sized {
     fn link(this: NonNull<Self>) -> NonNull<Link<Self>>;
+}
+
+/// A ring of parked threads, sharing their scheduler links. Membership is
+/// separate from ready queues, so a parked thread can change its level.
+pub struct ParkedList<T> {
+    head: Option<NonNull<T>>,
+}
+
+impl<T: Linked> ParkedList<T> {
+    pub const fn new() -> Self {
+        Self { head: None }
+    }
+
+    pub fn first(&self) -> Option<NonNull<T>> {
+        self.head
+    }
+
+    /// # Safety
+    /// `t` is alive, in no list, and stays in place until removed.
+    pub unsafe fn push(&mut self, t: NonNull<T>) {
+        // SAFETY: the caller's promise; neighbours stay in this ring.
+        unsafe {
+            let l = link(t);
+            assert!(!l.queued && l.next.is_none(), "a parked link is occupied");
+            if let Some(h) = self.head {
+                let tail = link(h).prev.expect("a parked ring");
+                l.prev = Some(tail);
+                l.next = Some(h);
+                link(tail).next = Some(t);
+                link(h).prev = Some(t);
+            } else {
+                l.prev = Some(t);
+                l.next = Some(t);
+                self.head = Some(t);
+            }
+        }
+    }
+
+    /// # Safety
+    /// `t` is alive and in this list.
+    pub unsafe fn remove(&mut self, t: NonNull<T>) {
+        // SAFETY: the caller's promise; each link borrow ends before the next.
+        unsafe {
+            let l = link(t);
+            let prev = l.prev.take().expect("a parked ring");
+            let next = l.next.take().expect("a parked ring");
+            if next == t {
+                self.head = None;
+            } else {
+                link(prev).next = Some(next);
+                link(next).prev = Some(prev);
+                if self.head == Some(t) {
+                    self.head = Some(next);
+                }
+            }
+        }
+    }
+}
+
+impl<T: Linked> Default for ParkedList<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// What the scheduler keeps in each thread.
@@ -740,6 +805,31 @@ impl<T: Schedulable> Scheduler<T> {
         }
     }
 
+    /// Parks the running thread before EL0. The caller owns its parked list.
+    ///
+    /// # Safety
+    /// The scheduler's threads are alive; `t` is the running thread.
+    pub unsafe fn park(&mut self, t: NonNull<T>) {
+        assert!(self.running == Some(t), "parking a thread off the CPU");
+        self.running = None;
+        // SAFETY: the caller holds the running thread.
+        unsafe { node(t) }.state = State::Parked;
+    }
+
+    /// Continues a parked thread at its current level with a new quantum.
+    ///
+    /// # Safety
+    /// `t` is alive, parked, and has left its process list.
+    pub unsafe fn unpark(&mut self, t: NonNull<T>) {
+        // SAFETY: the caller's promise.
+        unsafe {
+            let n = node(t);
+            assert!(n.state == State::Parked, "continuing an active thread");
+            n.state = State::Waiting;
+            self.wake(t);
+        }
+    }
+
     /// The fast path of `send` (spec 6.4): `t`, which waits, runs at once
     /// in place of the thread that just began to wait (`block`), with a new
     /// quantum from `now`: the state `wake` and then `pick` at `now` leave
@@ -790,7 +880,7 @@ impl<T: Schedulable> Scheduler<T> {
             }
             // SAFETY: a ready thread is in the queue.
             State::Ready => unsafe { self.ready.remove(t) },
-            State::Waiting => assert!(!queued, "a waiting thread ends in a queue"),
+            State::Waiting | State::Parked => assert!(!queued, "a waiting thread ends in a queue"),
             State::Stopped | State::Dead => {}
         }
         // SAFETY: the caller's promise.
@@ -851,6 +941,55 @@ mod tests {
     use crate::sync::Lock;
     use crate::time::Clock;
     use abi::RR_QUANTUM_NS;
+
+    #[test]
+    fn parked_priorities_preserve_the_list_and_continue_with_new_quanta() {
+        let mut w = World::new();
+        let threads = [
+            w.started('a', 10, RR),
+            w.started('b', 20, RR),
+            w.started('c', 30, RR),
+        ];
+        let mut parked = ParkedList::new();
+        for _ in 0..3 {
+            // SAFETY: the world owns each thread, and park removes its CPU state.
+            unsafe {
+                let Decision::Run(t) = w.s.pick(0, None) else {
+                    panic!("no thread")
+                };
+                w.s.park(t);
+                parked.push(t);
+            }
+        }
+        w.set(threads[0], 40, FIFO, 0);
+        w.boost(threads[1], 60, 63);
+        w.set(threads[1], 5, RR, 0);
+        w.unboost(threads[1]);
+        w.boost(threads[2], 63, 45);
+        w.set(threads[2], 45, FIFO, 0);
+        w.unboost(threads[2]);
+        w.set(threads[2], 45, RR, 0);
+        assert_eq!(w.s.ready().top(), None);
+        assert_eq!(w.s.running(), None);
+        assert_eq!(w.s.deadline(None), None);
+        // Remove a middle member after level changes; its neighbours stay linked.
+        unsafe {
+            parked.remove(threads[1]);
+        }
+        w.exit(threads[1]);
+        while let Some(t) = parked.first() {
+            // SAFETY: the list holds the thread until remove; unpark queues it.
+            unsafe {
+                parked.remove(t);
+                w.s.unpark(t);
+            }
+        }
+        assert_eq!(w.pick(100), 'c');
+        assert_eq!(w.s.deadline(None), Some(100 + Q));
+        assert_eq!(w.level(40), "a");
+        assert_eq!(node(threads[1]).state(), State::Dead);
+        assert_eq!(unsafe { w.s.start(threads[0]) }, Err(Error::BadState));
+    }
 
     /// Counter ticks per millisecond at QEMU's 62.5 MHz.
     const MS: u64 = 62_500;

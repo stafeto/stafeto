@@ -591,7 +591,7 @@ const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
 /// left or on where a timer fires, which only -icount makes repeatable;
 /// and the teardown of a big process in hundreds of portions with
 /// interrupts between them.
-const ICOUNT_TESTS: [&str; 16] = [
+const ICOUNT_TESTS: [&str; 17] = [
     "virtual_time_counts_instructions",
     "memory_portions_are_measured",
     "teardown_portions_are_measured",
@@ -608,6 +608,7 @@ const ICOUNT_TESTS: [&str; 16] = [
     "device_windows_are_measured",
     "upcall_calls_are_measured",
     "process_kill_with_a_level_is_measured",
+    "suspension_paths_are_measured",
 ];
 /// The rows of the line of `ipc_round_trip_is_measured`, in its order
 /// (spec 15.3).
@@ -654,6 +655,7 @@ const TEARDOWN_ROWS: [&str; 9] = [
 ];
 /// The rows of the line of the test init's `normal_build_costs`, in its
 /// order: the costs of the build that ships (spec 15.3).
+const SUSPENSION_ROWS: [&str; 4] = ["stop", "park", "continue", "resume_64"];
 const NORMAL_BUILD_ROWS: [&str; 5] = ["null", "clock", "yield", "notify", "round_trip"];
 /// The line the shell of the normal build says once it connected to the
 /// UART driver (spec 13.6): the driver registered, its output goes by
@@ -792,7 +794,7 @@ const _: () = assert!(
 );
 /// Tests the test init has (tests/init): its own count in `TESTS DONE`
 /// could drop a test with the line.
-const INIT_TESTS: u32 = 228;
+const INIT_TESTS: u32 = 229;
 /// The lines of the test init's
 /// `window_over_the_console_sends_debug_write_to_the_log` (spec 3.2): the
 /// first, written behind a window over the console's page, goes into the
@@ -2299,7 +2301,7 @@ const VOUCH_TICKS_MAX: u64 = 6_000;
 
 /// The most one READ_INTO of up to proto_fs::READ_INTO_MAX bytes may take in
 /// the RAM file service's loop: term B of the kernel, in ticks under -icount.
-const RAM_STEP_MAX: u64 = 20_536;
+const RAM_STEP_MAX: u64 = 20_538;
 
 /// The kinds of the lines of the RAM file service (tag 2), by the numbers
 /// of proto_fs::Method.
@@ -4264,6 +4266,7 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
             ("device window", &WINDOW_ROWS[..]),
             ("upcall", &UPCALL_ROWS[..]),
             ("teardown portions", &TEARDOWN_ROWS[..]),
+            ("suspension", &SUSPENSION_ROWS[..]),
         ] {
             let ticks = ticks_of(&o.lines, what, rows)?;
             println!("{what} ticks on {}: {}", m.name, rows_of(rows, &ticks));
@@ -4284,13 +4287,14 @@ fn kernel_tests(m: &qemu::Machine, variant: Variant) -> Result<usize, String> {
 /// The lines whose rows are each one stretch of the kernel between two
 /// polls for interrupts: a portion of a long call, of the timer queue or
 /// of the cleanup, or a whole short call (spec 15.3).
-const PORTION_LINES: [&str; 6] = [
+const PORTION_LINES: [&str; 7] = [
     "memory portions",
     "timer portions",
     "interrupt path",
     "device window",
     "upcall",
     "teardown portions",
+    "suspension",
 ];
 
 /// The longest row of the PORTION_LINES among the `measured` lines (name,

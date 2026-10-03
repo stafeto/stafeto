@@ -202,7 +202,8 @@ pub(super) unsafe fn queue_shell(process: NonNull<Process>, cause: u8) {
 /// Replies otherwise (`stage_level`). It takes the scheduler's lock.
 ///
 /// # Safety
-/// `process` is alive, whole, and in no queue; `stopped`, if any, is a
+/// `process` is alive and whole; a continuation may own its cleanup item.
+/// `stopped`, if any, is a
 /// thread of it that left the scheduler.
 pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option<NonNull<Thread>>) {
     // SAFETY: the caller's promise; only the fields are touched.
@@ -221,9 +222,12 @@ pub(super) unsafe fn begin(process: NonNull<Process>, cause: u8, stopped: Option
             (*p).threads_next = (*t.as_ptr()).siblings.and_then(|s| s.next);
         }
         (*p).stage = with_work(p, Stage::Threads);
+        let continued = control::cancel(process);
         // The queue's own reference. `retain` refuses a count of 0, which
         // it is when the last reference ended the process (`release`).
-        refs(process).take();
+        if !continued {
+            refs(process).take();
+        }
         let item = NonNull::new_unchecked(&raw mut (*p).cleanup);
         cleanup::enqueue(item, Object::Process(process), stage_level(process));
     }
@@ -318,7 +322,11 @@ pub unsafe fn clean(process: NonNull<Process>, level: u8) {
     // The child that goes in front of the process at the stage Children.
     let mut first = None;
     let done = match stage {
-        Stage::Whole => unreachable!("a whole process in the cleanup queue"),
+        Stage::Whole => {
+            // SAFETY: the continuation owns the item and its reference.
+            unsafe { control::portion(process, level) };
+            return;
+        }
         // SAFETY: the process is alive, and so are the threads in its list.
         Stage::Threads => unsafe { stop_threads(process, r) },
         // SAFETY: the process is alive, and its children in the list too.

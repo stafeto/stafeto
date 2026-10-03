@@ -6011,3 +6011,318 @@ fn heap_ticks(
     check(woke, "a receiver of the heap's timers did not wake")?;
     Ok([interrupt, fire, set, cancel])
 }
+
+/// The process-control contract, including check order and unchanged results.
+pub fn process_control_checks_its_arguments(_: &Boot) -> Result<(), &'static str> {
+    with_caller(|c| {
+        let n = Call::ProcessControl.number();
+        let p = process::create_root(QUOTA, 16, CEILING).map_err(|_| "no target")?;
+        let result = (|| {
+            let h = c.insert(Object::Process(p), Rights::MANAGE)?;
+            let denied = c.insert(Object::Process(p), Rights::NONE)?;
+            let wrong = c.insert(Object::Thread(c.thread), Rights::MANAGE)?;
+            c.fails(n, &[0, 2, 64], Error::InvalidArgs)?;
+            c.fails(n, &[0, 0, 64], Error::InvalidArgs)?;
+            c.fails(n, &[0, 0, 0], Error::BadHandle)?;
+            c.fails(n, &[wrong.0, 0, 0], Error::WrongType)?;
+            c.fails(n, &[denied.0, 0, 11], Error::AccessDenied)?;
+            c.fails(n, &[h.0, 0, 11], Error::AccessDenied)?;
+            for action in [0, 0, 1, 1] {
+                c.succeeds(n, &[h.0, action, 0], &[])?;
+            }
+            // SAFETY: the handle and test hold the target.
+            unsafe {
+                process::end(p, ProcessState::Killed, CAUSE);
+            }
+            c.fails(n, &[h.0, 0, 0], Error::BadState)?;
+            c.fails(n, &[h.0, 1, 0], Error::BadState)?;
+            for handle in [h, denied, wrong] {
+                c.close(handle)?;
+            }
+            Ok(())
+        })();
+        // SAFETY: the test's reference goes.
+        unsafe {
+            process::release(p, CAUSE);
+        }
+        cleanup::drain();
+        result
+    })
+}
+
+/// Pick each ready suspended thread exactly once, as the EL0 exit gate does.
+fn park_crowd(count: usize) -> Result<u64, &'static str> {
+    let mut longest = 0;
+    for _ in 0..count {
+        let start = timer::now();
+        let parked = sched::locked(|k| {
+            // SAFETY: the scheduler owns its threads.
+            let kcore::sched::Decision::Run(t) = (unsafe { k.s.pick(timer::now(), None) }) else {
+                return false;
+            };
+            process::park_selected(t, k)
+        });
+        longest = longest.max(timer::now() - start);
+        check(parked, "a suspended thread escaped its EL0 gate")?;
+    }
+    Ok(longest)
+}
+
+/// Ready, IPC and timer waiters retain their results while suspended.
+pub fn suspended_crowds_keep_waits_and_continue(_: &Boot) -> Result<(), &'static str> {
+    for kind in 0..4 {
+        suspension_crowd(kind, false)?;
+    }
+    Ok(())
+}
+
+/// A new stop cancels remaining continuation work; kill reuses its item.
+pub fn suspended_crowds_stop_again_and_die(_: &Boot) -> Result<(), &'static str> {
+    suspension_crowd(0, true).map(drop)
+}
+
+/// 128 threads, using every legal priority on the ready path. A timer wait
+/// is a receive: its channel and timer belong to that same process.
+fn suspension_crowd(kind: u8, stop_again: bool) -> Result<[u64; 5], &'static str> {
+    let counts = (
+        process::in_use(),
+        thread::in_use(),
+        timers::in_use(),
+        channel::in_use(),
+    );
+    let p = process::create_root(QUOTA, 512, CEILING).map_err(|_| "no crowd process")?;
+    let mut threads = [None; abi::MAX_THREADS as usize];
+    let mut channels = [None; abi::MAX_THREADS as usize];
+    let mut alarms = [None; abi::MAX_THREADS as usize];
+    let result = (|| {
+        for i in 0..threads.len() {
+            let t = if kind == 0 {
+                let t = thread::create(p, USER_VA, USER_VA, 0, 10, Policy::RoundRobin)
+                    .map_err(|_| "no crowd thread")?;
+                thread::start(t).map_err(|_| "crowd start failed")?;
+                t
+            } else {
+                let ch = owned_channel(p)?;
+                channels[i] = Some(ch);
+                let t = if kind == 3 {
+                    let t = running(p)?;
+                    check(
+                        channel::send(t, Via::Channel(ch), Desc::from_send(0).unwrap(), &[])
+                            == Ok(None),
+                        "crowd sender failed to wait",
+                    )?;
+                    t
+                } else {
+                    waiting(p, ch)?
+                };
+                if kind == 2 {
+                    let tm =
+                        timers::create(p, ch, i as u64 + 1, 5).map_err(|_| "no crowd timer")?;
+                    alarms[i] = Some(tm);
+                    timers::set(tm, timer::now() + 1_000_000_000, CAUSE)
+                        .map_err(|_| "timer set failed")?;
+                }
+                t
+            };
+            threads[i] = Some(t);
+        }
+        let start = timer::now();
+        process::control(p, true, CAUSE).map_err(|_| "crowd stop failed")?;
+        let stop = timer::now() - start;
+        check(cleanup::len() == 0, "stop queued work")?;
+        if kind != 0 {
+            check(
+                threads
+                    .iter()
+                    .flatten()
+                    .all(|t| unsafe { t.as_ref().sched.state() == State::Waiting }),
+                "stop changed a wait",
+            )?;
+            for i in 0..threads.len() {
+                if kind == 1 {
+                    channel::notify(channels[i].unwrap(), 1, CAUSE)
+                        .map_err(|_| "crowd notify failed")?;
+                } else if kind == 3 {
+                    unsafe { sched::interrupt(threads[i].unwrap(), CAUSE) }
+                        .map_err(|_| "sender interruption failed")?;
+                } else {
+                    let tm = alarms[i].unwrap();
+                    timers::set(tm, 0, CAUSE).map_err(|_| "expired timer failed")?;
+                }
+            }
+        }
+        let park = park_crowd(threads.len())?;
+        if kind == 0 {
+            // Change levels after parking so the first continuation portion
+            // spans all 63 legal levels, with one repeated level.
+            for (i, t) in threads.iter().flatten().enumerate() {
+                sched::set_priority(*t, (i % 63 + 1) as u8, Policy::RoundRobin)
+                    .map_err(|_| "parked spread priority failed")?;
+            }
+        }
+        check(
+            threads
+                .iter()
+                .flatten()
+                .all(|t| thread::info(*t).state == abi::ThreadState::Parked),
+            "object_info lost Parked",
+        )?;
+        let t = threads[0].unwrap();
+        // SAFETY: the test holds the parked thread, with no IPC wait.
+        check(
+            unsafe { sched::interrupt(t, CAUSE) } == Err(Error::BadState),
+            "interrupt took a parked thread",
+        )?;
+        unsafe {
+            (*t.as_ptr()).upcall.bind(USER_VA as u64).unwrap();
+            (*t.as_ptr())
+                .upcall
+                .control(abi::UpcallControl::Enable.raw())
+                .unwrap();
+        }
+        check(
+            unsafe { sched::request_upcall(t, CAUSE) } == Ok(()),
+            "upcall refused a parked thread",
+        )?;
+        sched::set_priority(t, 40, Policy::Fifo).map_err(|_| "parked priority failed")?;
+        sched::locked(|k| unsafe {
+            k.s.boost(t, 60, 63);
+            k.s.unboost(t);
+        });
+        let start = timer::now();
+        process::control(p, false, CAUSE).map_err(|_| "crowd continue failed")?;
+        let continue_call = timer::now() - start;
+        cleanup::take_longest();
+        let start = timer::now();
+        cleanup::portion();
+        let portion = timer::now() - start;
+        let ready = || {
+            threads
+                .iter()
+                .flatten()
+                .filter(|t| unsafe { t.as_ref().sched.state() == State::Ready })
+                .count()
+        };
+        check(
+            ready() == 64 && cleanup::len() == 1,
+            "continuation exceeded its portion or lost its rest",
+        )?;
+        if kind == 0 {
+            check(
+                sched::locked(|k| (1..=63).all(|level| k.s.ready().first(level).is_some())),
+                "the measured continuation missed a legal priority level",
+            )?;
+        }
+        if stop_again {
+            process::control(p, true, CAUSE).map_err(|_| "second stop failed")?;
+            check(
+                cleanup::len() == 0,
+                "second stop left a continuation queued",
+            )?;
+            park_crowd(64)?;
+            check(ready() == 0, "a thread ran after the second stop")?;
+            process::control(p, false, CAUSE).map_err(|_| "second continue failed")?;
+            cleanup::portion();
+            // Kill while 64 parked and 64 ready share a continuation item.
+            unsafe {
+                process::end(p, ProcessState::Killed, CAUSE);
+            }
+            check(
+                cleanup::len() == 1 && cleanup::top() == Some(63),
+                "kill failed to replace continuation at S",
+            )?;
+            cleanup::drain();
+            check(
+                threads
+                    .iter()
+                    .flatten()
+                    .all(|t| unsafe { t.as_ref().sched.state() == State::Dead }),
+                "kill left a parked thread",
+            )?;
+        } else {
+            cleanup::portion();
+            check(
+                ready() == 128 && cleanup::len() == 0,
+                "continuation failed to finish",
+            )?;
+            if kind != 0 {
+                for t in threads.iter().flatten() {
+                    let x = unsafe { &t.as_ref().regs.x };
+                    let preserved = if kind == 3 {
+                        x[0] == Error::Interrupted.code()
+                    } else {
+                        x[0] == 0 && x[2] == 1
+                    };
+                    check(preserved, "an IPC result changed while parked")?;
+                }
+            }
+        }
+        kprintln!(
+            "suspension layout: process={} slots={}",
+            core::mem::size_of::<Process>(),
+            kcore::slab::Pool::<Process>::PER_PAGE
+        );
+        Ok([stop, park, continue_call, portion, cleanup::take_longest()])
+    })();
+    for tm in alarms.into_iter().flatten() {
+        unsafe {
+            timers::release(tm, CAUSE);
+        }
+    }
+    for t in threads.into_iter().flatten() {
+        unsafe {
+            sched::exit(t, CAUSE);
+            thread::release(t, CAUSE);
+        }
+    }
+    unsafe {
+        process::release(p, CAUSE);
+    }
+    cleanup::drain();
+    result.and_then(|ticks| {
+        check(
+            counts
+                == (
+                    process::in_use(),
+                    thread::in_use(),
+                    timers::in_use(),
+                    channel::in_use(),
+                ),
+            "a suspension object stayed",
+        )?;
+        Ok(ticks)
+    })
+}
+
+/// Accepted replies are delivered whole; the client parks before EL0.
+pub fn suspended_reply_keeps_its_result(_: &Boot) -> Result<(), &'static str> {
+    with_reply_wait(true, |w| {
+        process::control(w.client, true, CAUSE).map_err(|_| "stop failed")?;
+        check(w.waits(w.t), "suspension withdrew the accepted request")?;
+        check(
+            w.reply(w.r, w.token) == Ok(()),
+            "reply blocked on suspension",
+        )?;
+        check(w.has_reply(w.t), "suspended reply was incomplete")?;
+        // End the receiver, leaving the client as the sole ready thread.
+        unsafe {
+            sched::exit(w.r, CAUSE);
+        }
+        park_crowd(1)?;
+        process::control(w.client, false, CAUSE).map_err(|_| "continue failed")?;
+        cleanup::portion();
+        check(w.has_reply(w.t), "continuation changed the reply")
+    })
+}
+
+#[cfg(feature = "icount")]
+pub fn suspension_paths_are_measured(_: &Boot) -> Result<(), &'static str> {
+    let [stop, park, continue_call, portion, longest] = suspension_crowd(0, false)?;
+    kprintln!(
+        "suspension ticks: stop={stop} park={park} continue={continue_call} resume_64={portion}"
+    );
+    check(
+        longest <= 20_538 && portion <= 20_538,
+        "a continuation portion exceeded B",
+    )
+}

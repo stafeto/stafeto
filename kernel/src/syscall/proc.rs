@@ -132,6 +132,24 @@ fn new_child(
     })
 }
 
+/// process_control(x0 process with MANAGE, x1 action, x2 level), spec 7.7.
+pub(super) fn process_control(thread: NonNull<Thread>, a: &Args) -> Result<Values, Error> {
+    let suspend = match a[1] {
+        0 => true,
+        1 => false,
+        _ => return Err(Error::InvalidArgs),
+    };
+    let level = match a[2] {
+        0 => None,
+        l => Some(kcore::args::priority_arg(l)?),
+    };
+    let target = lookup(thread, a[0], Rights::MANAGE, Object::process)?;
+    let cause = level.unwrap_or_else(|| cause(thread));
+    under_ceilings(cause, &[self::cause(thread)])?;
+    process::control(target, suspend, cause)?;
+    Ok(Values::none())
+}
+
 /// process_kill(x0 process with MANAGE, x1 level): the process ends, reason
 /// «killed» (spec 11): its threads stop in whatever state they are and its
 /// descendants in a wave, both at S, and the cleanup queue takes what it

@@ -52,8 +52,8 @@ use info::{debug_write, object_info};
 use mem::{change, go_on, mem_create, mem_map, mem_protect, mem_unmap};
 use messages::{channel_create, notify, receive, reply, send};
 use proc::{
-    process_create, process_exit, process_kill, thread_create, thread_exit, thread_interrupt,
-    thread_set_priority, thread_start, yield_now,
+    process_control, process_create, process_exit, process_kill, thread_create, thread_exit,
+    thread_interrupt, thread_set_priority, thread_start, yield_now,
 };
 use time::{clock_now, timer_cancel, timer_create, timer_set};
 use upcall::{
@@ -188,6 +188,7 @@ fn dispatch_inner(thread: NonNull<Thread>, number: u16) {
         Some(Call::MemProtect) => return change(thread, &args, mem_protect),
         Some(Call::ProcessCreate) => process_create(thread, &args),
         Some(Call::ProcessKill) => process_kill(thread, &args),
+        Some(Call::ProcessControl) => process_control(thread, &args),
         Some(Call::ProcessExit) => process_exit(thread, &args),
         Some(Call::ThreadCreate) => thread_create(thread, &args),
         Some(Call::ThreadStart) => thread_start(thread, &args),
