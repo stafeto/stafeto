@@ -2350,11 +2350,14 @@ fn posix_poll_probe() -> Result<(), String> {
                 ));
             }
         }
-        if !steps
-            .iter()
-            .any(|&(kind, ticks, _)| kind == 65 && ticks != 0)
-        {
-            return Err(format!("watch service {tag} has no Gone measurement"));
+        if ![64, 65].iter().all(|wanted| {
+            steps
+                .iter()
+                .any(|&(kind, ticks, _)| kind == *wanted && ticks != 0)
+        }) {
+            return Err(format!(
+                "watch service {tag} has no heartbeat/notification or Gone measurement"
+            ));
         }
     }
     Ok(())

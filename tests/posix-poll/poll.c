@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 int stafeto_watch_start(const uint32_t *, const uint32_t *, uint32_t, uint64_t *, uint32_t *);
@@ -87,6 +88,9 @@ int main(void) {
     if (result != 0) return result;
     int ends[2], tty = open("/dev/console", O_RDWR | O_NOCTTY);
     CHECK(tty >= 0 && pipe(ends) == 0);
+    /* Cover the services' 250 ms heartbeat, including init reply and rearm. */
+    struct timespec heartbeat = { .tv_sec = 0, .tv_nsec = 300000000 };
+    CHECK(nanosleep(&heartbeat, NULL) == 0);
     CHECK(stafeto_watch_stats(ends[0], tty) == 0);
     CHECK(close(ends[0]) == 0 && close(ends[1]) == 0 && close(tty) == 0);
     stafeto_watch_close_channel();

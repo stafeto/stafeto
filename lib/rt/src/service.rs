@@ -390,7 +390,11 @@ pub fn run_in<S: Service<K>, const K: usize>(
     // the next request.
     let mut buffer = [0; MESSAGE_MAX];
     loop {
-        let notice = match sys::receive(channel) {
+        #[cfg(feature = "step-stats")]
+        let (began, incoming) = sys::receive_measured(channel);
+        #[cfg(not(feature = "step-stats"))]
+        let incoming = sys::receive(channel);
+        let notice = match incoming {
             Err(e) => return e,
             Ok(Received::Message {
                 label,
@@ -406,6 +410,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                     msgbuf::read(0, bytes);
                 }
                 let kind = steps::kind_of(bytes);
+                #[cfg(not(feature = "step-stats"))]
                 let began = steps::begin();
                 request(service, table, config.issued, label, bytes, handles, token);
                 steps::end(began, kind);
@@ -423,6 +428,7 @@ pub fn run_in<S: Service<K>, const K: usize>(
                 count,
             },
         };
+        #[cfg(not(feature = "step-stats"))]
         let began = steps::begin();
         match (notice.source, notice.label, &mut beat) {
             (Source::Timer, 0, Some(beat)) => beat.expired(),
@@ -460,7 +466,9 @@ pub fn run_in<S: Service<K>, const K: usize>(
 
 /// The longest step of the loop (feature `step-stats`, which only the
 /// images of measurements and tests turn on): the ticks from the return of
-/// `receive` to the handler's end and its reply, for each method of the
+/// the Receive SVC to the handler's end and its reply, including register
+/// decode, message copying, header and session lookup. Kernel receive and
+/// idle before its return are outside the interval. For each method of the
 /// protocol and for notifications. A new longest of a kind goes to the
 /// console as a line `service step: T kind K N ticks detail D` after the step, so that
 /// the print does not count in it (`report_steps` turns it on and gives the tag T); K is the
@@ -510,10 +518,6 @@ mod steps {
             Ok(header) if (header.method as usize) < NOTICE => header.method as usize,
             _ => NOTICE - 1,
         }
-    }
-
-    pub fn begin() -> u64 {
-        super::time::now()
     }
 
     pub fn own() {
