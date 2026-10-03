@@ -334,7 +334,13 @@ pub extern "C" fn stafeto_getppid() -> c_int {
 pub unsafe extern "C" fn stafeto_waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int {
     match call(|| posix_abi::process::waitpid(pid, options)) {
         Ok(waited) => {
-            let word = waited.end.map_or(0, proto_process::End::wait_status);
+            let word = if let Some(signal) = waited.stopped {
+                (i32::from(signal) << 8) | 0x7f
+            } else if waited.continued {
+                0xffff
+            } else {
+                waited.end.map_or(0, proto_process::End::wait_status)
+            };
             // SAFETY: the caller's promise.
             unsafe { status.write(word) };
             waited.pid
@@ -388,10 +394,16 @@ pub unsafe extern "C" fn stafeto_waitid(
     match call(|| posix_abi::process::wait(selector, options)) {
         Ok(waited) => {
             let mut words = [0i32; SIGINFO_LEN / 4];
-            if let Some(end) = waited.end {
-                let (code, status) = match end {
-                    End::Exited(code) => (CLD_EXITED, i32::from(code)),
-                    End::Signaled(n) => (CLD_KILLED, i32::from(n)),
+            if waited.pid != 0 {
+                let (code, status) = if let Some(signal) = waited.stopped {
+                    (proto_process::CLD_STOPPED, i32::from(signal))
+                } else if waited.continued {
+                    (proto_process::CLD_CONTINUED, proto_process::SIGCONT as i32)
+                } else {
+                    match waited.end.expect("a wait report") {
+                        End::Exited(code) => (CLD_EXITED, i32::from(code)),
+                        End::Signaled(n) => (CLD_KILLED, i32::from(n)),
+                    }
                 };
                 words[0] = SIGCHLD;
                 words[2] = code;
@@ -761,6 +773,12 @@ pub extern "C" fn stafeto_probe_fork_window(window: Option<extern "C" fn()>) {
         window.map_or(0, |f| f as usize),
         core::sync::atomic::Ordering::Release,
     );
+}
+
+/// PID at an explicitly installed fork loader window, for regression probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loading_pid() -> c_int {
+    posix_abi::fork::probe_loading_pid() as c_int
 }
 
 /// The C function an early window of the next fork runs

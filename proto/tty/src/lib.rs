@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! Version 1 of the protocol of the terminal service (5f; spec 2, 2, 3.4
+//! Version 2 of the protocol of the terminal service (5f; spec 2, 2, 3.4
 //! and 3.8; XBD chapter 11). The service keeps the terminals: the console
 //! (terminal CONSOLE) over the console's driver, its line discipline, its
 //! settings (`Termios`, the layout of relibc's struct termios less its
 //! line byte) and the reads and writes that wait. A request names its
 //! terminal; this version serves the console alone. Every number goes
-//! low byte first.
+//! low byte first. Read/Write/Drain Start and Take, SetAttr, Flow and
+//! FlushQueues carry blocked u32 after terminal (0/1: applicable TTIN or
+//! TTOU is blocked or ignored by the caller thread), plus its identity in
+//! handle slot 0. A Take's optional notification uses slot 1. SetPgrp adds
+//! blocked after its group. The service checks the current foreground
+//! before each actual effect, returns RESTART after posting a job signal,
+//! or IO_ERROR for a blocked background read or an orphan group. Cancel
+//! only removes the owning operation. Watch requests create no job signal.
 //!
 //! - READ_START: body the terminal u32, the count u32 (1 to MAX_READ). A
 //!   long operation in two steps (proto_wire::long): READY with at most
@@ -81,7 +88,7 @@
 use abi::MESSAGE_MAX;
 use proto_wire::{HEADER_LEN, Header, Reader, Status, Writer};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The terminal of the console.
 pub const CONSOLE: u32 = 0;
@@ -90,7 +97,7 @@ pub const CONSOLE: u32 = 0;
 pub const MAX_READ: usize = MESSAGE_MAX - 8;
 /// The most bytes one write carries: WRITE_TAKE's header, key and
 /// terminal come before them.
-pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 12;
+pub const MAX_WRITE: usize = MESSAGE_MAX - HEADER_LEN - 16;
 /// {MAX_CANON}: the bytes of one line of canonical input, its delimiter
 /// among them (relibc's value).
 pub const MAX_CANON: usize = 255;
@@ -111,6 +118,12 @@ pub const NOT_CONTROLLING: u32 = 805;
 /// No identity the service could vouch for came with the request.
 pub const NO_IDENTITY: u32 = 806;
 /// What GET_PGRP gives with no foreground group: a number no group has.
+pub const RESTART: u32 = 807;
+pub const IO_ERROR: u32 = 808;
+pub const READ_ACCESS: u32 = 0;
+pub const WRITE_ACCESS: u32 = 1;
+pub const CHANGE_ACCESS: u32 = 2;
+
 pub const NO_FOREGROUND: u32 = i32::MAX as u32;
 
 /// The labels the service gives itself: bit 63, which no label of init
@@ -275,10 +288,11 @@ pub enum Method {
     GetSid = 19,
     Controlling = 20,
     VerifySession = 24,
+    Detach = 28,
 }
 
 impl Method {
-    pub const ALL: [Method; 21] = [
+    pub const ALL: [Method; 22] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -300,6 +314,7 @@ impl Method {
         Method::GetSid,
         Method::Controlling,
         Method::VerifySession,
+        Method::Detach,
     ];
 
     pub const fn number(self) -> u16 {
@@ -316,7 +331,7 @@ impl Method {
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 28,
 ];
 
 /// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,
@@ -330,7 +345,12 @@ pub fn job(
 ) -> Result<(), Status> {
     if !matches!(
         method,
-        Method::Acquire | Method::SetPgrp | Method::GetPgrp | Method::GetSid | Method::Controlling
+        Method::Acquire
+            | Method::SetPgrp
+            | Method::GetPgrp
+            | Method::GetSid
+            | Method::Controlling
+            | Method::Detach
     ) || (method == Method::SetPgrp) != group.is_some()
     {
         return Err(Status::BadSize);
@@ -348,6 +368,8 @@ pub fn job(
 pub struct Read {
     pub key: Option<u64>,
     pub terminal: u32,
+    /// Caller thread blocks or ignores the applicable job-control signal.
+    pub blocked: u32,
     pub count: u32,
 }
 
@@ -370,17 +392,22 @@ impl Read {
             }
         }
         w.u32(self.terminal)?;
+        w.u32(self.blocked)?;
         w.u32(self.count)
     }
 
     /// The body of READ_START (`take` false) or READ_TAKE.
     pub fn parse(mut body: Reader<'_>, take: bool) -> Result<Read, Status> {
         let key = if take { Some(body.u64()?) } else { None };
-        let (terminal, count) = (body.u32()?, body.u32()?);
+        let (terminal, blocked, count) = (body.u32()?, body.u32()?, body.u32()?);
         body.finish()?;
+        if blocked > 1 {
+            return Err(Status::BadSize);
+        }
         let read = Read {
             key,
             terminal,
+            blocked,
             count,
         };
         if !read.valid() {
@@ -396,6 +423,8 @@ impl Read {
 pub struct Write<'a> {
     pub key: Option<u64>,
     pub terminal: u32,
+    /// Caller thread blocks or ignores the applicable job-control signal.
+    pub blocked: u32,
     pub bytes: &'a [u8],
 }
 
@@ -416,21 +445,27 @@ impl<'a> Write<'a> {
             }
         }
         w.u32(self.terminal)?;
+        w.u32(self.blocked)?;
         w.bytes(self.bytes)
     }
 
     pub fn parse(mut body: Reader<'a>, take: bool) -> Result<Write<'a>, Status> {
         let key = if take { Some(body.u64()?) } else { None };
         let terminal = body.u32()?;
+        let blocked = body.u32()?;
         let len = body.left();
         if !Write::valid(len, key) {
             return Err(Status::BadSize);
         }
         let bytes = body.bytes(len)?;
         body.finish()?;
+        if blocked > 1 {
+            return Err(Status::BadSize);
+        }
         Ok(Write {
             key,
             terminal,
+            blocked,
             bytes,
         })
     }
@@ -473,6 +508,8 @@ impl Cancel {
 pub struct Drain {
     pub key: Option<u64>,
     pub terminal: u32,
+    /// Caller thread blocks or ignores the applicable job-control signal.
+    pub blocked: u32,
 }
 
 impl Drain {
@@ -485,7 +522,8 @@ impl Drain {
                 w.u64(key)?;
             }
         }
-        w.u32(self.terminal)
+        w.u32(self.terminal)?;
+        w.u32(self.blocked)
     }
 
     /// The body of DRAIN_START (`take` false) or DRAIN_TAKE: BAD_SIZE for
@@ -493,11 +531,19 @@ impl Drain {
     pub fn parse(mut body: Reader<'_>, take: bool) -> Result<Drain, Status> {
         let key = if take { Some(body.u64()?) } else { None };
         let terminal = body.u32()?;
+        let blocked = body.u32()?;
         body.finish()?;
+        if blocked > 1 {
+            return Err(Status::BadSize);
+        }
         if key == Some(0) {
             return Err(Status::BadSize);
         }
-        Ok(Drain { key, terminal })
+        Ok(Drain {
+            key,
+            terminal,
+            blocked,
+        })
     }
 }
 
@@ -506,6 +552,8 @@ impl Drain {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Control {
     pub terminal: u32,
+    /// Caller thread blocks or ignores the applicable job-control signal.
+    pub blocked: u32,
     pub word: u32,
 }
 
@@ -516,13 +564,21 @@ impl Control {
         }
         method.header().write(w)?;
         w.u32(self.terminal)?;
+        w.u32(self.blocked)?;
         w.u32(self.word)
     }
 
     pub fn parse(mut body: Reader<'_>) -> Result<Control, Status> {
-        let (terminal, word) = (body.u32()?, body.u32()?);
+        let (terminal, blocked, word) = (body.u32()?, body.u32()?, body.u32()?);
         body.finish()?;
-        Ok(Control { terminal, word })
+        if blocked > 1 {
+            return Err(Status::BadSize);
+        }
+        Ok(Control {
+            terminal,
+            blocked,
+            word,
+        })
     }
 }
 
@@ -530,6 +586,8 @@ impl Control {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetAttr {
     pub terminal: u32,
+    /// Caller thread blocks or ignores the applicable job-control signal.
+    pub blocked: u32,
     pub action: u32,
     pub termios: Termios,
 }
@@ -538,16 +596,21 @@ impl SetAttr {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
         Method::SetAttr.header().write(w)?;
         w.u32(self.terminal)?;
+        w.u32(self.blocked)?;
         w.u32(self.action)?;
         self.termios.write(w)
     }
 
     pub fn parse(mut body: Reader<'_>) -> Result<SetAttr, Status> {
-        let (terminal, action) = (body.u32()?, body.u32()?);
+        let (terminal, blocked, action) = (body.u32()?, body.u32()?, body.u32()?);
         let termios = Termios::read(&mut body)?;
         body.finish()?;
+        if blocked > 1 {
+            return Err(Status::BadSize);
+        }
         Ok(SetAttr {
             terminal,
+            blocked,
             action,
             termios,
         })
@@ -617,19 +680,20 @@ mod tests {
 
     #[test]
     fn sizes_fit_a_message() {
-        assert_eq!((MAX_READ, MAX_WRITE), (1016, 1004));
+        assert_eq!((MAX_READ, MAX_WRITE), (1016, 1000));
         assert_eq!(TERMIOS_LEN, 56);
         const { assert!(MAX_CANON < MAX_INPUT) };
         // SET_ATTR's request fits one message.
         let mut w = Writer::new();
         SetAttr {
             terminal: CONSOLE,
+            blocked: 0,
             action: FLUSH,
             termios: Termios::default(),
         }
         .write(&mut w)
         .unwrap();
-        assert_eq!(w.as_bytes().len(), HEADER_LEN + 8 + TERMIOS_LEN);
+        assert_eq!(w.as_bytes().len(), HEADER_LEN + 12 + TERMIOS_LEN);
     }
 
     /// The settings a terminal opens with are those relibc's layer gave
@@ -652,11 +716,13 @@ mod tests {
             Read {
                 key: None,
                 terminal: 0,
+                blocked: 0,
                 count: 1,
             },
             Read {
                 key: Some(0x1_0000_0002),
                 terminal: 0,
+                blocked: 0,
                 count: MAX_READ as u32,
             },
         ] {
@@ -669,6 +735,7 @@ mod tests {
             let read = Read {
                 key: None,
                 terminal: 0,
+                blocked: 0,
                 count,
             };
             assert_eq!(read.write(&mut Writer::new()), Err(Status::BadSize));
@@ -678,11 +745,13 @@ mod tests {
             Write {
                 key: None,
                 terminal: 0,
+                blocked: 0,
                 bytes: b"a",
             },
             Write {
                 key: Some(7),
                 terminal: 0,
+                blocked: 0,
                 bytes: &bytes,
             },
         ] {
@@ -697,6 +766,7 @@ mod tests {
             let write = Write {
                 key: None,
                 terminal: 0,
+                blocked: 0,
                 bytes: bad,
             };
             assert_eq!(write.write(&mut Writer::new()), Err(Status::BadSize));
@@ -720,6 +790,7 @@ mod tests {
         t.cc[VMIN] = 3;
         let set = SetAttr {
             terminal: 0,
+            blocked: 0,
             action: DRAIN,
             termios: t,
         };
@@ -740,10 +811,12 @@ mod tests {
             Drain {
                 key: None,
                 terminal: 0,
+                blocked: 0,
             },
             Drain {
                 key: Some(5),
                 terminal: 0,
+                blocked: 0,
             },
         ] {
             let mut w = Writer::new();
@@ -754,6 +827,7 @@ mod tests {
         let zero = Drain {
             key: Some(0),
             terminal: 0,
+            blocked: 0,
         };
         assert_eq!(zero.write(&mut Writer::new()), Err(Status::BadSize));
         let cancel = Cancel {
@@ -768,6 +842,7 @@ mod tests {
         );
         let control = Control {
             terminal: 0,
+            blocked: 0,
             word: QUEUE_BOTH,
         };
         for method in [Method::FlushQueues, Method::Flow] {

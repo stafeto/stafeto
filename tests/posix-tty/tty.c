@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -419,6 +420,167 @@ static int terminal_crowd(void) {
 }
 
 
+static volatile sig_atomic_t hups;
+static void on_hup(int signal) { if (signal == SIGHUP) ++hups; }
+
+static int job_foreground(int fd, pid_t group) {
+    sigset_t block, old;
+    sigemptyset(&block);
+    sigaddset(&block, SIGTTOU);
+    if (sigprocmask(SIG_BLOCK, &block, &old) != 0) return -1;
+    int result = tcsetpgrp(fd, group);
+    if (sigprocmask(SIG_SETMASK, &old, NULL) != 0) return -1;
+    return result;
+}
+
+/* An already armed read rechecks foreground on Take before consuming input. */
+static int foreground_recheck(int fd) {
+    int gate[2], ready[2], status;
+    CHECK(pipe(gate) == 0 && pipe(ready) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        char byte, line[4];
+        if (setpgid(0, 0) != 0 || write(ready[1], "r", 1) != 1
+            || read(gate[0], &byte, 1) != 1) _exit(141);
+        if (read(fd, line, sizeof line) != 2 || line[0] != 'r' || line[1] != '\n') _exit(142);
+        _exit(0);
+    }
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1);
+    CHECK(job_foreground(fd, child) == 0 && write(gate[1], "g", 1) == 1);
+    pause_ms(80);
+    CHECK(job_foreground(fd, getpgrp()) == 0);
+    say("posix-tty: foreground changed during read\n");
+    CHECK(waitpid(child, &status, WUNTRACED) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGTTIN);
+    CHECK(job_foreground(fd, child) == 0 && kill(child, SIGCONT) == 0);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(job_foreground(fd, getpgrp()) == 0);
+    CHECK(close(gate[0]) == 0 && close(gate[1]) == 0 && close(ready[0]) == 0 && close(ready[1]) == 0);
+    return 0;
+}
+
+static int terminal_detach(int fd) {
+    struct sigaction ignore = {0}, saved;
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    CHECK(sigaction(SIGHUP, &ignore, &saved) == 0);
+    int ready[2], gate[2], status;
+    CHECK(pipe(ready) == 0 && pipe(gate) == 0);
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        char line[4];
+        winches = 0;
+        if (setpgid(0, 0) != 0 || catch_winch() != 0 || ioctl(fd, TIOCNOTTY, 0) != 0) _exit(143);
+        errno = 0;
+        if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) _exit(144);
+        errno = 0;
+        if (tcgetsid(fd) != -1 || errno != ENOTTY || getpgrp() != getpid()) _exit(145);
+        if (write(ready[1], "r", 1) != 1 || read(gate[0], line, 1) != 1 || winches != 1) _exit(146);
+        if (read(fd, line, sizeof line) != 2 || line[0] != 'd' || line[1] != '\n') _exit(147);
+        _exit(0);
+    }
+    char byte;
+    CHECK(read(ready[0], &byte, 1) == 1 && kill(-child, SIGWINCH) == 0 && write(gate[1], "g", 1) == 1);
+    say("posix-tty: detached reader still uses open fd\n");
+    CHECK(waitpid(child, &status, 0) == child);
+    if (status != 0) say("posix-tty: detached child status %x\n", status);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (open("/dev/tty", O_RDWR) < 0 || write(ready[1], "r", 1) != 1 || read(gate[0], &byte, 1) != 1) _exit(148);
+        errno = 0;
+        if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) _exit(149);
+        errno = 0;
+        if (tcgetsid(fd) != -1 || errno != ENOTTY) _exit(150);
+        _exit(0);
+    }
+    CHECK(read(ready[0], &byte, 1) == 1);
+    CHECK(ioctl(fd, TIOCNOTTY, 0) == 0);
+    errno = 0;
+    CHECK(open("/dev/tty", O_RDWR) == -1 && errno == ENXIO);
+    CHECK(ioctl(fd, TIOCSCTTY, 0) == 0 && tcgetsid(fd) == getpid());
+    CHECK(write(gate[1], "g", 1) == 1);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) _exit(open("/dev/tty", O_RDWR) >= 0 && tcgetsid(fd) == getsid(0) ? 0 : 151);
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(close(ready[0]) == 0 && close(ready[1]) == 0 && close(gate[0]) == 0 && close(gate[1]) == 0);
+    CHECK(sigaction(SIGHUP, &saved, NULL) == 0);
+    say("posix-tty: personal detach and fresh attachment ok\n");
+    return 0;
+}
+
+static int terminal_jobs(int fd) {
+    struct termios saved, settings;
+    CHECK(tcgetattr(fd, &saved) == 0);
+    settings = saved;
+    settings.c_lflag |= ICANON | ISIG;
+    CHECK(tcsetattr(fd, TCSANOW, &settings) == 0);
+    int recheck = foreground_recheck(fd);
+    if (recheck) return recheck;
+    pid_t child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        if (setpgid(0, 0) != 0) _exit(131);
+        char bytes[4];
+        if (read(fd, bytes, sizeof bytes) != 2 || bytes[0] != 'j' || bytes[1] != '\n') _exit(132);
+        _exit(0);
+    }
+    int status;
+    CHECK(waitpid(child, &status, WUNTRACED) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGTTIN);
+    CHECK(job_foreground(fd, child) == 0);
+    CHECK(kill(child, SIGCONT) == 0);
+    /* The same pending terminal operation proceeds after the default stop. */
+    CHECK(kill(child, SIGSTOP) == 0);
+    CHECK(waitpid(child, &status, WUNTRACED) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    CHECK(kill(child, SIGCONT) == 0);
+    say("posix-tty: stopped reader resumed\n");
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(job_foreground(fd, getpgrp()) == 0);
+
+    settings.c_lflag |= TOSTOP;
+    CHECK(tcsetattr(fd, TCSANOW, &settings) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        sigset_t block;
+        sigemptyset(&block);
+        sigaddset(&block, SIGTTIN);
+        if (setpgid(0, 0) != 0 || sigprocmask(SIG_BLOCK, &block, NULL) != 0) _exit(158);
+        char byte;
+        errno = 0;
+        if (read(fd, &byte, 1) != -1 || errno != EIO) _exit(159);
+        /* TTOU was inherited blocked: TOSTOP permits this background write. */
+        if (write(fd, "blocked-TTOU\n", 13) != 13) _exit(160);
+        _exit(0);
+    }
+    CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    for (int change = 0; change < 2; ++change) {
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            sigset_t block;
+            sigemptyset(&block);
+            sigaddset(&block, SIGTTOU);
+            if (sigprocmask(SIG_UNBLOCK, &block, NULL) != 0 || setpgid(0, 0) != 0) _exit(133);
+            int result = change ? tcsetattr(fd, TCSANOW, &settings) : (int)write(fd, "job-output\n", 11);
+            _exit(result == (change ? 0 : 11) ? 0 : 134);
+        }
+        CHECK(waitpid(child, &status, WUNTRACED) == child && WIFSTOPPED(status) && WSTOPSIG(status) == SIGTTOU);
+        CHECK(job_foreground(fd, child) == 0);
+        CHECK(kill(child, SIGCONT) == 0);
+        CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        CHECK(job_foreground(fd, getpgrp()) == 0);
+    }
+    CHECK(tcsetattr(fd, TCSANOW, &saved) == 0);
+    say("posix-tty: job control ok\n");
+    return 0;
+}
+
 /* The leader A of a new session, a child of "run" (XBD 11.1.3,
  * tcsetpgrp, tcgetpgrp, tcgetsid): a member of its session that opens the
  * console takes nothing; A's open with O_NOCTTY takes nothing either; its
@@ -450,6 +612,17 @@ static int leader(pid_t other_group) {
     if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) return 57;
     errno = 0;
     if (tcgetpgrp(quiet) != -1 || errno != ENOTTY) return 58;
+    int early_gate[2];
+    if (pipe(early_gate) != 0) return 152;
+    pid_t early = fork();
+    if (early < 0) return 153;
+    if (early == 0) {
+        char byte;
+        if (read(early_gate[0], &byte, 1) != 1) _exit(154);
+        errno = 0;
+        if (open("/dev/tty", O_RDWR) != -1 || errno != ENXIO) _exit(155);
+        _exit(0);
+    }
     /* The leader's open takes the console. */
     int console = open("/dev/console", O_RDWR);
     if (console < 0) return 70;
@@ -458,6 +631,13 @@ static int leader(pid_t other_group) {
     if (tcgetpgrp(tty) != getpgrp()) return 72;
     if (tcgetsid(tty) != getpid()) return 73;
     if (tcgetpgrp(0) != getpgrp()) return 74;
+    if (write(early_gate[1], "g", 1) != 1 || waitpid(early, &status, 0) != early
+        || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 156;
+    if (close(early_gate[0]) != 0 || close(early_gate[1]) != 0) return 157;
+    sigset_t quiet_background;
+    sigemptyset(&quiet_background);
+    sigaddset(&quiet_background, SIGTTOU);
+    if (sigprocmask(SIG_BLOCK, &quiet_background, NULL) != 0) return 135;
     /* A process cannot send a signal as the terminal, not even to the
      * foreground group of its own terminal's session. */
     if (stafeto_probe_tty_signal(getpgrp(), SIGWINCH) != EPERM) return 59;
@@ -508,6 +688,10 @@ static int leader(pid_t other_group) {
     if (write(go[1], "g", 1) != 1) return 84;
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 85;
     if (WEXITSTATUS(status) != 0) return 90 + WEXITSTATUS(status);
+    int job_error = terminal_jobs(tty);
+    if (job_error != 0) return job_error;
+    int detach_error = terminal_detach(tty);
+    if (detach_error != 0) return detach_error;
     int crowd_error = terminal_crowd();
     if (crowd_error != 0) return crowd_error;
     return 0;
@@ -656,18 +840,25 @@ static int departed_leader(void) {
         if (setsid() != getpid()) _exit(111);
         int fd = open("/dev/console", O_RDWR);
         if (fd < 0 || open("/dev/tty", O_RDWR) < 0) _exit(112);
+        int installed[2];
+        if (pipe(installed) != 0) _exit(136);
         pid_t survivor = fork();
         if (survivor < 0) _exit(113);
         if (survivor == 0) {
+            hups = 0;
+            if (signal(SIGHUP, on_hup) == SIG_ERR || write(installed[1], "i", 1) != 1) _exit(137);
             char byte;
             if (write(ready[1], "r", 1) != 1 || read(go[0], &byte, 1) != 1) _exit(114);
             errno = 0;
             int ok = open("/dev/tty", O_RDWR) == -1 && errno == ENXIO;
             errno = 0;
             ok &= tcgetsid(fd) == -1 && errno == ENOTTY;
+            ok &= hups == 1;
             if (write(result[1], ok ? "y" : "n", 1) != 1) _exit(115);
             _exit(0);
         }
+        char installed_byte;
+        if (read(installed[0], &installed_byte, 1) != 1) _exit(138);
         _exit(0);
     }
     char byte;

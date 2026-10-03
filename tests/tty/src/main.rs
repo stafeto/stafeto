@@ -185,6 +185,7 @@ impl Probe {
         let mut w = Writer::new();
         SetAttr {
             terminal: CONSOLE,
+            blocked: 0,
             action,
             termios,
         }
@@ -220,6 +221,7 @@ pub fn read_request(key: Option<u64>, count: u32, w: &mut Writer) -> Result<(), 
     Read {
         key,
         terminal: CONSOLE,
+        blocked: 0,
         count,
     }
     .write(w)
@@ -230,6 +232,7 @@ pub fn write_request(key: Option<u64>, bytes: &[u8], w: &mut Writer) -> Result<(
     Write {
         key,
         terminal: CONSOLE,
+        blocked: 0,
         bytes,
     }
     .write(w)

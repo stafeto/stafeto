@@ -468,6 +468,7 @@ const TCSBRK: c_ulong = 0x5409;
 const TCXONC: c_ulong = 0x540A;
 const TCFLSH: c_ulong = 0x540B;
 const TIOCSCTTY: c_ulong = 0x540E;
+const TIOCNOTTY: c_ulong = 0x5422;
 const TIOCGPGRP: c_ulong = 0x540F;
 const TIOCSPGRP: c_ulong = 0x5410;
 const TIOCGSID: c_ulong = 0x5429;
@@ -546,6 +547,7 @@ fn terminal_ioctl(
             unsafe { argument.cast::<i32>().write(number as i32) };
             Ok(0)
         }
+        TIOCNOTTY => terminal::job(transport, terminal, proto_tty::Method::Detach, None).map(|_| 0),
         TIOCSCTTY => {
             terminal::job(transport, terminal, proto_tty::Method::Acquire, None).map(|_| 0)
         }

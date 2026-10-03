@@ -33,10 +33,26 @@ fn call(
     handle: Option<Handle<Channel>>,
     out: &mut [u8],
     refusal: Refusal<'_>,
+    authenticated: bool,
 ) -> Result<(u32, usize, u64), i32> {
-    let reply = match handle {
-        None => sys::send(service, request).map_err(|e| e.into_errno())?,
-        Some(handle) => sys::send_handles(service, request, [handle.erase()])
+    let identity = authenticated
+        .then(|| {
+            crate::process::identity()
+                .and_then(|identity| {
+                    sys::handle_duplicate(identity, Rights::NOTIFY | Rights::TRANSFER).ok()
+                })
+                .ok_or(EIO)
+        })
+        .transpose()?;
+    let reply = match (identity, handle) {
+        (Some(identity), Some(handle)) => {
+            sys::send_handles(service, request, [identity.erase(), handle.erase()])
+                .map_err(|refused| refused.error.into_errno())?
+        }
+        (Some(identity), None) => sys::send_handles(service, request, [identity.erase()])
+            .map_err(|refused| refused.error.into_errno())?,
+        (None, None) => sys::send(service, request).map_err(|e| e.into_errno())?,
+        (None, Some(handle)) => sys::send_handles(service, request, [handle.erase()])
             .map_err(|refused| refused.error.into_errno())?,
     };
     let mut buffer = [0; MESSAGE_MAX];
@@ -132,7 +148,7 @@ pub fn run_with(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, start, keyed, out, refusal, true)
+    run_in(service, start, keyed, out, refusal, true, false)
 }
 
 /// `run_with` for an operation that is no point of cancellation
@@ -146,7 +162,20 @@ pub fn run_no_point(
     out: &mut [u8],
     refusal: Refusal<'_>,
 ) -> Result<usize, i32> {
-    run_in(service, start, keyed, out, refusal, false)
+    run_in(service, start, keyed, out, refusal, false, false)
+}
+
+/// A terminal operation authenticates every actual request. The identity
+/// precedes the optional notification handle; cancellation still only
+/// removes the operation and does not check foreground access.
+pub fn run_with_identity(
+    service: &Handle<Channel>,
+    start: &[u8],
+    keyed: impl Fn(bool, u64, &mut Writer) -> Result<(), Status>,
+    out: &mut [u8],
+    refusal: Refusal<'_>,
+) -> Result<usize, i32> {
+    run_in(service, start, keyed, out, refusal, true, true)
 }
 
 fn run_in(
@@ -156,12 +185,13 @@ fn run_in(
     out: &mut [u8],
     refusal: Refusal<'_>,
     point: bool,
+    authenticated: bool,
 ) -> Result<usize, i32> {
     // From before the first request: a handler that ran on the way back
     // from a reply, outside `receive`, leaves its mark for the wait.
     let block = crate::threads::own_block();
     let _outer = OuterRestart::enter(&block.flags);
-    let key = match call(service, start, None, out, refusal)? {
+    let key = match call(service, start, None, out, refusal, authenticated)? {
         (long::READY, n, _) => return Ok(n),
         (long::WAIT, _, key) => key,
         _ => return Err(EIO),
@@ -170,7 +200,6 @@ fn run_in(
         let mut w = Writer::new();
         keyed(cancel, key, &mut w).map(|()| w)
     };
-    let take = request(false).map_err(|_| EIO)?;
     let channel =
         Handle::<Channel>::borrowed(rt::abi::Handle(block.channel.load(Ordering::Relaxed)));
     let level = block.base_level.load(Ordering::Relaxed) as u8;
@@ -186,7 +215,14 @@ fn run_in(
     let cancel = 'wait: loop {
         if armed && block.handled.load(Ordering::SeqCst) != handled {
             handled = block.handled.load(Ordering::SeqCst);
-            match call(service, take.as_bytes(), None, out, refusal) {
+            match call(
+                service,
+                request(false).map_err(|_| EIO)?.as_bytes(),
+                None,
+                out,
+                refusal,
+                authenticated,
+            ) {
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => {}
                 Ok(_) => break 'wait Some(EIO),
@@ -203,7 +239,14 @@ fn run_in(
             else {
                 break 'wait Some(EAGAIN);
             };
-            match call(service, take.as_bytes(), Some(labelled), out, refusal) {
+            match call(
+                service,
+                request(false).map_err(|_| EIO)?.as_bytes(),
+                Some(labelled),
+                out,
+                refusal,
+                authenticated,
+            ) {
                 Ok((long::READY, n, _)) => return Ok(n),
                 Ok((long::ARMED, _, _)) => armed = true,
                 Ok(_) => break 'wait Some(EIO),
@@ -234,7 +277,14 @@ fn run_in(
                 bits,
                 ..
             }) if label == key && bits & 1 != 0 => {
-                match call(service, take.as_bytes(), None, out, refusal) {
+                match call(
+                    service,
+                    request(false).map_err(|_| EIO)?.as_bytes(),
+                    None,
+                    out,
+                    refusal,
+                    authenticated,
+                ) {
                     Ok((long::READY, n, _)) => return Ok(n),
                     Ok((long::ARMED, _, _)) => {}
                     Ok(_) => break 'wait Some(EIO),
@@ -270,7 +320,14 @@ fn run_in(
     // error of the way out, EINTR for an entry or a cancellation.
     let request = request(true).map_err(|_| EIO)?;
     loop {
-        match call(service, request.as_bytes(), None, out, refusal) {
+        match call(
+            service,
+            request.as_bytes(),
+            None,
+            out,
+            refusal,
+            authenticated,
+        ) {
             Ok((long::READY, n, _)) => return Ok(n),
             Ok((long::CANCELLED, _, _)) => return Err(cancel.unwrap_or(EINTR)),
             Err(EINTR) => {}

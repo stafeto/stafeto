@@ -29,7 +29,7 @@
 
 use proto_process::{
     Create, Credentials, End, INIT_PID, Label, Place, RECORDS, SPAWN_SETPGROUP, SPAWN_SETSID,
-    Selector,
+    Selector, WCONTINUED, WEXITED, WSTOPPED, WaitResult,
 };
 
 /// The children of one record at most, its zombies among them, until
@@ -80,6 +80,16 @@ pub struct Record<P> {
     pub parent: u32,
     pub credentials: Credentials,
     pub state: State,
+    /// Suspension is independent of image loading and process lifetime.
+    pub stopped: Option<u8>,
+    pub stop_epoch: u64,
+    pub cont_epoch: u64,
+    stop_report: Option<u8>,
+    cont_report: bool,
+    first_ready: Option<u16>,
+    ready_previous: Option<u16>,
+    ready_next: Option<u16>,
+    ready: bool,
     /// The ceiling of its process.
     pub ceiling: u8,
     /// The quota and the room for handles of its process, which a child
@@ -96,6 +106,7 @@ pub struct Record<P> {
     /// for a record of init's table.
     pub pgid: u32,
     pub sid: u32,
+    pub ctty: Option<(u32, u64)>,
     /// The index of its parent's record while the parent lives.
     pub parent_index: Option<u16>,
     /// Whether it counts in `Numbers::links` of its group: its parent is
@@ -124,6 +135,7 @@ pub struct Records<P> {
     listed: [bool; RECORDS],
     /// The group and the session each place's PID names.
     numbers: [Numbers; RECORDS],
+    orphaned: crate::queue::Queue,
 }
 
 /// What a place keeps of the group and the session its PID names.
@@ -131,6 +143,7 @@ pub struct Records<P> {
 struct Numbers {
     /// The records whose group it is, zombies too.
     members: u16,
+    stopped: u16,
     /// Of those, the records whose parent is in another group of their
     /// session.
     links: u16,
@@ -187,10 +200,12 @@ impl<P> Records<P> {
             listed: [true; RECORDS],
             numbers: [Numbers {
                 members: 0,
+                stopped: 0,
                 links: 0,
                 sessions: 0,
                 session: 0,
             }; RECORDS],
+            orphaned: crate::queue::Queue::new(),
         }
     }
 
@@ -309,6 +324,15 @@ impl<P> Records<P> {
             parent: pid,
             credentials,
             state: State::Loading,
+            stopped: None,
+            stop_epoch: 0,
+            cont_epoch: 0,
+            stop_report: None,
+            cont_report: false,
+            first_ready: None,
+            ready_previous: None,
+            ready_next: None,
+            ready: false,
             ceiling,
             quota: 0,
             handle_limit: 0,
@@ -316,6 +340,7 @@ impl<P> Records<P> {
             tried: proto_process::IMAGE,
             pgid,
             sid,
+            ctty: None,
             parent_index: parent.map(|p| p as u16),
             linked,
             execed: false,
@@ -365,6 +390,7 @@ impl<P> Records<P> {
         let g = &mut self.numbers[group];
         g.members -= 1;
         g.links -= u16::from(linked);
+        self.mark_orphan(group, linked);
         self.numbers[session].sessions -= 1;
         self.settle(group);
         self.settle(session);
@@ -374,6 +400,7 @@ impl<P> Records<P> {
     /// and no group or session carries its number.
     fn settle(&mut self, index: usize) {
         if self.records[index].is_none() && self.numbers[index].unused() && !self.listed[index] {
+            self.orphaned.remove(index);
             self.listed[index] = true;
             self.free[self.free_len] = index as u16;
             self.free_len += 1;
@@ -515,6 +542,7 @@ impl<P> Records<P> {
         if self.members(own) > 0 {
             return Err(GroupError::Permission);
         }
+        self.records[caller].as_mut().expect("caller").ctty = None;
         self.regroup(caller, own, own);
         Ok(own)
     }
@@ -529,7 +557,14 @@ impl<P> Records<P> {
         let linked = record
             .parent_index
             .is_some_and(|p| self.separates(usize::from(p), pgid, sid));
+        let stopped = record.stopped.is_some();
         self.enter(pgid, sid, linked);
+        if stopped {
+            let old = self.place_of(old_pgid).expect("the old group");
+            let new = self.place_of(pgid).expect("the new group");
+            self.numbers[old].stopped -= 1;
+            self.numbers[new].stopped += 1;
+        }
         let record = self.records[index].as_mut().expect("a record");
         (record.pgid, record.sid, record.linked) = (pgid, sid, linked);
         let mut child = record.first_child;
@@ -550,6 +585,7 @@ impl<P> Records<P> {
                 let links = &mut self.numbers[place].links;
                 *links = if now { *links + 1 } else { *links - 1 };
                 self.records[c].as_mut().expect("a child").linked = now;
+                self.mark_orphan(place, c_linked && !now);
             }
             child = next;
         }
@@ -613,11 +649,14 @@ impl<P> Records<P> {
     /// at once without one or when it was still LOADING. CHILDREN_MAX
     /// steps.
     pub fn exited(&mut self, index: usize, end: End) -> (Exit, Orphans) {
+        self.ready_remove(index);
+        self.set_stopped(index, None);
         let mut orphans = Orphans::default();
         let mut child = self.records[index]
             .as_mut()
             .and_then(|r| r.first_child.take());
         while let Some(c) = child {
+            self.ready_remove(usize::from(c));
             let orphan = self.records[usize::from(c)].as_mut().expect("a child");
             child = orphan.next;
             orphan.parent = INIT_PID;
@@ -645,7 +684,10 @@ impl<P> Records<P> {
         // for: its Spawn failed.
         let loaded = record.state != State::Loading;
         record.state = State::Zombie(end);
+        record.stop_report = None;
+        record.cont_report = false;
         self.unlink(pgid, linked);
+        self.ready_add(index);
         let record = self.records[index].as_mut().expect("an ended record");
         let exit = match record.parent_index.filter(|_| loaded) {
             Some(parent) => Exit::Zombie {
@@ -667,6 +709,7 @@ impl<P> Records<P> {
             return None;
         }
         let (previous, next, parent) = (record.previous, record.next, record.parent_index);
+        self.ready_remove(index);
         match previous {
             Some(p) => {
                 self.records[usize::from(p)]
@@ -697,12 +740,17 @@ impl<P> Records<P> {
         if linked {
             let place = self.place_of(pgid).expect("a group with a place");
             self.numbers[place].links -= 1;
+            self.mark_orphan(place, true);
         }
     }
 
     /// The record in `index` leaves the table and its group and session;
     /// its place is free unless a group or a session carries its number.
     fn free_index(&mut self, index: usize) -> Option<Record<P>> {
+        self.ready_remove(index);
+        if self.get(index).is_some_and(|r| r.stopped.is_some()) {
+            self.set_stopped(index, None);
+        }
         let record = self.records[index].take()?;
         self.leave(record.pgid, record.sid, record.linked);
         self.settle(index);
@@ -719,6 +767,154 @@ impl<P> Records<P> {
                 Selector::Any => true,
                 Selector::Group(pgid) => r.pgid == pgid,
             })
+    }
+
+    /// A link removal that makes a stopped group orphaned schedules its signals.
+    fn mark_orphan(&mut self, group: usize, removed_link: bool) {
+        let g = &self.numbers[group];
+        if removed_link && g.links == 0 && g.stopped != 0 && g.members != 0 {
+            self.orphaned.push(group);
+        }
+    }
+
+    pub fn has_orphans(&self) -> bool {
+        !self.orphaned.is_empty()
+    }
+
+    /// One group whose parent links disappeared, with its current PID generation.
+    pub fn take_orphan(&mut self) -> Option<u32> {
+        let group = self.orphaned.pop()?;
+        let g = &self.numbers[group];
+        (g.members != 0 && g.links == 0 && g.stopped != 0)
+            .then_some(self.generations[group] * RECORDS as u32 + group as u32)
+    }
+
+    /// Change suspension and its group count without changing Loading/Alive.
+    pub fn set_stopped(&mut self, index: usize, signal: Option<u8>) -> bool {
+        let r = self.records[index].as_mut().expect("a record");
+        let was = r.stopped.is_some();
+        let now = signal.is_some();
+        if was == now {
+            return false;
+        }
+        r.stopped = signal;
+        let group = r.pgid;
+        let place = self.place_of(group).expect("a group");
+        let count = &mut self.numbers[place].stopped;
+        if now {
+            *count += 1
+        } else {
+            *count -= 1
+        }
+        true
+    }
+
+    fn ready_add(&mut self, index: usize) {
+        let r = self.records[index].as_ref().expect("a child");
+        if r.ready || r.state == State::Loading {
+            return;
+        }
+        let Some(parent) = r.parent_index else { return };
+        let first = self.records[usize::from(parent)]
+            .as_mut()
+            .expect("a parent")
+            .first_ready
+            .replace(index as u16);
+        if let Some(first) = first {
+            self.records[usize::from(first)]
+                .as_mut()
+                .expect("a ready child")
+                .ready_previous = Some(index as u16);
+        }
+        let r = self.records[index].as_mut().expect("a child");
+        r.ready = true;
+        r.ready_previous = None;
+        r.ready_next = first;
+    }
+
+    fn ready_remove(&mut self, index: usize) {
+        let Some(r) = self.records[index].as_mut() else {
+            return;
+        };
+        if !core::mem::take(&mut r.ready) {
+            return;
+        }
+        let (previous, next, parent) =
+            (r.ready_previous.take(), r.ready_next.take(), r.parent_index);
+        if let Some(previous) = previous {
+            self.records[usize::from(previous)]
+                .as_mut()
+                .expect("a ready sibling")
+                .ready_next = next;
+        } else if let Some(parent) = parent {
+            self.records[usize::from(parent)]
+                .as_mut()
+                .expect("a parent")
+                .first_ready = next;
+        }
+        if let Some(next) = next {
+            self.records[usize::from(next)]
+                .as_mut()
+                .expect("a ready sibling")
+                .ready_previous = previous;
+        }
+    }
+
+    /// Keep a child's stop or continuation for wait, linking it once in O(1).
+    pub fn report(&mut self, index: usize, signal: Option<u8>) {
+        let r = self.records[index].as_mut().expect("a child");
+        if let Some(signal) = signal {
+            r.stop_report = Some(signal);
+            r.cont_report = false;
+        } else {
+            r.stop_report = None;
+            r.cont_report = true
+        }
+        self.ready_add(index);
+    }
+
+    pub fn reported(
+        &self,
+        parent: usize,
+        selector: Selector,
+        options: u32,
+    ) -> Option<(usize, WaitResult)> {
+        let mut next = self.get(parent)?.first_ready;
+        while let Some(child) = next {
+            let child = usize::from(child);
+            let r = self.get(child)?;
+            next = r.ready_next;
+            if !self.takes(child, selector) {
+                continue;
+            }
+            let (pid, uid) = (r.label.pid(), r.credentials.uid);
+            if let State::Zombie(end) = r.state
+                && options & WEXITED != 0
+            {
+                return Some((child, WaitResult::Ended { pid, end, uid }));
+            }
+            if options & WSTOPPED != 0
+                && let Some(signal) = r.stop_report
+            {
+                return Some((child, WaitResult::Stopped { pid, signal, uid }));
+            }
+            if options & WCONTINUED != 0 && r.cont_report {
+                return Some((child, WaitResult::Continued { pid, uid }));
+            }
+        }
+        None
+    }
+
+    pub fn consume_report(&mut self, child: usize, result: WaitResult) {
+        let r = self.records[child].as_mut().expect("a child");
+        match result {
+            WaitResult::Stopped { .. } => r.stop_report = None,
+            WaitResult::Continued { .. } => r.cont_report = false,
+            _ => return,
+        }
+        if r.stop_report.is_none() && !r.cont_report {
+            self.ready_remove(child)
+        }
     }
 
     /// The first zombie child of the record in `parent` that `selector`
@@ -799,6 +995,37 @@ mod tests {
 
     fn state(t: &Records<u32>, label: Label) -> Option<State> {
         t.find(label.raw()).map(|i| t.get(i).unwrap().state)
+    }
+
+    #[test]
+    fn new_status_replaces_wnowait_stop_continue_and_exit() {
+        let mut t = Records::<u32>::new();
+        let parent_label = add(&mut t).unwrap();
+        let child_label = child(&mut t, parent_label);
+        let (parent, child) = (
+            usize::from(parent_label.index),
+            usize::from(child_label.index),
+        );
+        let selector = Selector::Any;
+        t.report(child, Some(proto_process::SIGSTOP));
+        assert!(matches!(
+            t.reported(parent, selector, WSTOPPED),
+            Some((_, WaitResult::Stopped { .. }))
+        ));
+        t.report(child, None);
+        assert_eq!(t.reported(parent, selector, WSTOPPED), None);
+        assert!(matches!(
+            t.reported(parent, selector, WCONTINUED),
+            Some((_, WaitResult::Continued { .. }))
+        ));
+        t.report(child, Some(proto_process::SIGTSTP));
+        assert_eq!(t.reported(parent, selector, WCONTINUED), None);
+        t.exited(child, End::Exited(7));
+        assert_eq!(t.reported(parent, selector, WSTOPPED | WCONTINUED), None);
+        assert!(matches!(
+            t.reported(parent, selector, WEXITED),
+            Some((_, WaitResult::Ended { .. }))
+        ));
     }
 
     #[test]

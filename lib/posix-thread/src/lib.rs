@@ -107,7 +107,10 @@ pub struct Block {
     pub result: AtomicUsize,
     /// Room that kept the fields after it in their places when errno and
     /// the file state left (5a′).
-    unused: [u64; 3],
+    /// Process-origin job assignments, tagged with their epoch.
+    pub stop_origin: AtomicU64,
+    pub cont_origin: AtomicU64,
+    unused: u64,
     /// The pthread number of the thread; 0 for a thread pthread does not
     /// know. Under relibc, the thread's number in the layer's table of
     /// threads plus 1 (its OsTid).
@@ -129,7 +132,9 @@ pub struct Block {
     /// robin, by default (spec 2: SCHED_OTHER); FIFO when asked for. The
     /// raising locks of the layer move the thread with it.
     pub policy: AtomicU64,
-    reserved: [u64; 2],
+    /// Epoch and pending bits for job stops and continuation.
+    pub stop_word: AtomicU64,
+    pub cont_word: AtomicU64,
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -219,14 +224,17 @@ impl Block {
             level: AtomicU32::new(0),
             end: AtomicU32::new(0),
             result: AtomicUsize::new(0),
-            unused: [0; 3],
+            stop_origin: AtomicU64::new(0),
+            cont_origin: AtomicU64::new(0),
+            unused: 0,
             thread_id: 0,
             cancel_point: AtomicU64::new(0),
             probe: AtomicU64::new(0),
             process: AtomicU64::new(0),
             handled: AtomicU64::new(0),
             policy: AtomicU64::new(0),
-            reserved: [0; 2],
+            stop_word: AtomicU64::new(0),
+            cont_word: AtomicU64::new(0),
         }
     }
 }

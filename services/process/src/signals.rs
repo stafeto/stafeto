@@ -37,15 +37,27 @@ pub const fn bit(signal: u8) -> u64 {
 }
 
 /// Whether the service refuses `signal` for the target of `page` (EINVAL,
-/// [P24-KILL] "unsupported signal"): past SIGNAL_MAX, SIGSTOP, and
-/// SIGTSTP, SIGTTIN, SIGTTOU unless the target catches or ignores them,
-/// until stops come (5e).
-pub fn refused(signal: u8, page: &Page) -> bool {
-    if signal > SIGNAL_MAX || signal == SIGSTOP {
-        return true;
+/// [P24-KILL] "unsupported signal"): past SIGNAL_MAX. Job signals have
+/// their normal mask, disposition and process suspension effects.
+pub fn refused(signal: u8, _page: &Page) -> bool {
+    signal > SIGNAL_MAX
+}
+
+/// Cancel the opposite class before any effect; exhaustion changes nothing.
+pub fn generation(stop: &mut u64, cont: &mut u64, page: &Page, signal: u8) -> Option<u64> {
+    if signal == SIGCONT {
+        let next = stop.checked_add(8)?;
+        *stop = next;
+        page.stop_word.store(next, Ordering::Release);
+        Some(*cont)
+    } else if matches!(signal, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU) {
+        let next = cont.checked_add(2)?;
+        *cont = next;
+        page.cont_word.store(next, Ordering::Release);
+        Some(*stop)
+    } else {
+        None
     }
-    let handled = page.caught.load(Ordering::Acquire) | page.ignored.load(Ordering::Acquire);
-    matches!(signal, SIGTSTP | SIGTTIN | SIGTTOU) && handled & bit(signal) == 0
 }
 
 /// What became of a signal sent to a process (`post`).
@@ -79,7 +91,12 @@ pub fn post(page: &Page, signal: u8, info: Info) -> Posted {
     if page.ignored.load(Ordering::Acquire) & bit != 0 {
         return Posted::Ignored;
     }
-    if page.pending.load(Ordering::Acquire) & bit != 0 {
+    let pending = page.pending.load(Ordering::Acquire)
+        | proto_process::job::bits(
+            page.stop_word.load(Ordering::Acquire),
+            page.cont_word.load(Ordering::Acquire),
+        );
+    if pending & bit != 0 {
         return Posted::Merged;
     }
     let slot = &page.info[usize::from(signal - 1)];
@@ -87,10 +104,40 @@ pub fn post(page: &Page, signal: u8, info: Info) -> Posted {
     slot.pid.store(info.pid, Ordering::Relaxed);
     slot.uid.store(info.uid, Ordering::Relaxed);
     slot.status.store(info.status, Ordering::Relaxed);
-    if page.pending.fetch_or(bit, Ordering::Release) & bit != 0 {
+    let previous = if let Some(c) = proto_process::job::class(signal) {
+        let word = if signal == SIGCONT {
+            &page.cont_word
+        } else {
+            &page.stop_word
+        };
+        if word.fetch_or(c.bit, Ordering::Release) & c.bit != 0 {
+            bit
+        } else {
+            0
+        }
+    } else {
+        page.pending.fetch_or(bit, Ordering::Release)
+    };
+    if previous & bit != 0 {
         return Posted::Merged;
     }
     Posted::Pending
+}
+
+/// Return an assignment only while its epoch is live. This service also
+/// serializes new generations, so no cancellation or new sender can replace
+/// the information between this check and publication. A pending sender wins.
+pub fn return_job(page: &Page, signal: u8, ticket: u64, info: Info) -> Option<Posted> {
+    let c = proto_process::job::class(signal)?;
+    let word = if signal == SIGCONT {
+        &page.cont_word
+    } else {
+        &page.stop_word
+    };
+    if word.load(Ordering::Acquire) & !c.low != ticket || ticket & c.low != 0 {
+        return None;
+    }
+    Some(post(page, signal, info))
 }
 
 /// The page of a new child: a spawned one's main thread starts with
@@ -204,21 +251,66 @@ mod tests {
         assert_eq!(slot.pid.load(Ordering::Relaxed), 302);
     }
 
-    /// SIGSTOP always, the job-control stops unless handled, and numbers
-    /// past 64 are refused.
+    /// Stop and continuation signals are supported with every disposition;
+    /// numbers past 64 are refused.
     #[test]
-    fn stops_are_refused_until_5e() {
+    fn job_stops_are_supported() {
         let p = page();
-        assert!(refused(SIGSTOP, &p));
-        assert!(refused(SIGTSTP, &p));
+        for signal in [SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGCONT] {
+            assert!(!refused(signal, &p));
+        }
         assert!(refused(65, &p));
-        assert!(!refused(SIGUSR1, &p));
-        p.caught.store(bit(SIGTSTP), Ordering::Relaxed);
-        p.ignored.store(bit(SIGTTIN), Ordering::Relaxed);
-        assert!(!refused(SIGTSTP, &p));
-        assert!(!refused(SIGTTIN, &p));
-        assert!(refused(SIGTTOU, &p));
-        assert!(!refused(SIGCONT, &p));
+    }
+
+    #[test]
+    fn epoch_exhaustion_preserves_both_classes() {
+        let p = page();
+        let (mut stop, mut cont) = (u64::MAX & !7, 6);
+        p.stop_word.store(stop | 3, Ordering::Relaxed);
+        p.cont_word.store(cont | 1, Ordering::Relaxed);
+        assert_eq!(generation(&mut stop, &mut cont, &p, SIGCONT), None);
+        assert_eq!(p.stop_word.load(Ordering::Acquire), u64::MAX & !7 | 3);
+        assert_eq!(p.cont_word.load(Ordering::Acquire), 7);
+        stop = 16;
+        cont = u64::MAX & !1;
+        assert_eq!(generation(&mut stop, &mut cont, &p, SIGSTOP), None);
+        assert_eq!(stop, 16);
+    }
+
+    /// Return never changes generations or overwrites a newer/coalesced sender.
+    #[test]
+    fn returned_job_keeps_live_epoch_and_first_information() {
+        let p = page();
+        let old = Info {
+            code: 0,
+            pid: 300,
+            uid: 1000,
+            status: 0,
+        };
+        let fresh = Info { pid: 301, ..old };
+        let (mut stop, mut cont) = (0, 0);
+        assert_eq!(return_job(&p, SIGTSTP, 0, old), Some(Posted::Pending));
+        p.stop_word.fetch_and(!1, Ordering::Relaxed);
+        assert_eq!(generation(&mut stop, &mut cont, &p, SIGCONT), Some(0));
+        assert_eq!(generation(&mut stop, &mut cont, &p, SIGTSTP), Some(8));
+        assert_eq!(post(&p, SIGTSTP, fresh), Posted::Pending);
+        assert_eq!(return_job(&p, SIGTSTP, 0, old), None);
+        assert_eq!(return_job(&p, SIGTSTP, 8, old), Some(Posted::Merged));
+        assert_eq!(
+            p.info[usize::from(SIGTSTP - 1)].pid.load(Ordering::Relaxed),
+            301
+        );
+        assert_eq!(p.stop_word.load(Ordering::Relaxed), 9);
+        p.stop_word.fetch_and(!1, Ordering::Relaxed);
+        assert_eq!(return_job(&p, SIGTSTP, 8, old), Some(Posted::Pending));
+        assert_eq!(
+            p.info[usize::from(SIGTSTP - 1)].pid.load(Ordering::Relaxed),
+            300
+        );
+        assert_eq!(p.stop_word.load(Ordering::Relaxed), 9);
+        p.ignored.store(bit(SIGTSTP), Ordering::Relaxed);
+        p.stop_word.fetch_and(!1, Ordering::Relaxed);
+        assert_eq!(return_job(&p, SIGTSTP, 8, old), Some(Posted::Ignored));
     }
 
     /// A forked child's page has its parent's classes from its start, so

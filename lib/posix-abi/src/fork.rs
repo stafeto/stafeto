@@ -31,6 +31,13 @@ use proto_wire::{Status, Writer};
 use rt::abi::{Access, Rights};
 use rt::handle::{Channel, Handle, Memory, Outgoing};
 
+static PROBE_LOADING_PID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// The child whose loader is at an explicitly installed fork window.
+pub fn probe_loading_pid() -> u32 {
+    PROBE_LOADING_PID.load(Ordering::Acquire)
+}
+
 /// The registers of the callee the calling thread had at `point`: x19 to
 /// x30, the stack pointer, d8 to d15, FPCR, FPSR and TPIDR_EL0.
 #[repr(C)]
@@ -380,6 +387,7 @@ fn parent(window: Option<fn()>, sessions: Sessions) -> Result<i32, i32> {
             });
         }
     };
+    PROBE_LOADING_PID.store(pid, Ordering::Release);
     let made = make(&c, regions, sessions, window);
     let method = match made {
         Ok(()) => proto_process::Method::ForkCommit,
