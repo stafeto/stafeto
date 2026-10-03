@@ -407,7 +407,7 @@ pub const RTBENCH: Record = Record {
     name: "rtbench-posix",
     program: "rtbench-posix",
     args: b"rtbench-posix\0",
-    connects: &["ramfs", "clock", "posix", "uart", "rtbench-load"],
+    connects: &["ramfs", "clock", "posix", "pipe", "uart", "rtbench-load"],
     // Room for a heap of 8 MiB, which a child of fork copies (S15).
     quota: 3072 * PAGE,
     handle_limit: 512,
@@ -427,6 +427,7 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     TABLE[0],
     RTBENCH_POOL,
     POSIX_ABI_TABLE[2],
+    PIPE,
     LONG,
     LOAD,
     RTBENCH,

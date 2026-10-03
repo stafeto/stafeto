@@ -80,8 +80,9 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
 /// the console; the loader, which starts the benchmark's children from the
-/// files of the image (5c).
-const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 9] = [
+/// files of the image (5c); the pipe service and BusyBox, whose `ls` and
+/// `cat` are the stages of S22 (5e).
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -96,9 +97,11 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 9] = [
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
-const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 9] = [
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -113,6 +116,8 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 9] = [
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
     ("loader", "loader", 0, &[]),
+    ("pipe", "pipe", PIPE_STACK_SIZE, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [

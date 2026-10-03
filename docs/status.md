@@ -3,7 +3,7 @@
 The README gives the short status. This page keeps the details that are
 useful when working on the code: what the kernel offers, what the Rust
 POSIX layer covers, and which commands check each piece. It describes
-`main` at a2eb60a (step 5c, `posix_spawn` and `exec` from files) with step 5d (`fork`) on top.
+`main` at a2eb60a (step 5c, `posix_spawn` and `exec` from files) with step 5d (`fork`) and step 5e (pipes) on top.
 
 ## Kernel
 
@@ -131,12 +131,13 @@ provides the C side of each.
 | Processes | `getpid`, `getppid`, `getpgrp` and `getsid(0)` read the process's page of its record; real, effective and saved UID/GID (eight calls) go through the session of the process service | [identity](../notes/m2-rust-posix-process-identity.md), [credentials](../notes/m2-rust-posix-credentials.md) |
 | Spawn and `exec` | `posix_spawn` and `exec` of a file of the RAM service through a loader in the new process: `argv`, `envp`, the current directory, file actions (`adddup2`, `addclose`, `addopen`, `addchdir`), `SETPGROUP`, `SETSID`, `SETSIGMASK`, `SETSIGDEF`, `RESETIDS`, set-ID files, descriptions shared with the child, `FD_CLOEXEC`, a failed `exec` that leaves the old image whole | [m5c](../notes/m5c-spawn-exec.md) |
 | `fork` | a full copy of the parent's memory by the child's loader, at the forking thread's level; the other threads stop first; the child has one thread, its descriptions shared with the parent's and its layer bound to its own handles; `vfork` is `fork`; `pthread_atfork` in POSIX's order | [m5d](../notes/m5d-fork.md) |
+| Pipes | `pipe`, `pipe2` (`O_NONBLOCK`, `O_CLOEXEC`, `O_CLOFORK`) through the pipe service: a ring of 4 KiB per pipe, `PIPE_BUF` 512, blocking reads and writes as long operations in two steps that a signal cancels (`SA_RESTART`), `SIGPIPE` before `EPIPE`, `fstat` as a FIFO, `ESPIPE`; ends cross `fork`, `posix_spawn` (`adddup2`) and `exec`; `/dev/null` as a null device of the RAM service (`O_CHANGES`) | [m5e](../notes/m5e-pipes.md) |
 | Memory map | the layer keeps the handle of every memory object of the process: the loader hands over narrowed copies for the segments, the stack and the start area, and each chunk of the heap adds one; at most 128 regions, no device window or DMA object; `mmap` refuses `MAP_SHARED` with `ENOTSUP` (no shared memory yet). A mapping made past the layer by a direct kernel call is not in the map | `lib/posix-map`, `posix_abi::allocation::regions` |
 | Process lifetime | `waitpid`, `waitid`, `WNOHANG`, `WIFSIGNALED` apart from `exit(143)`, `kill`, `killpg`, `kill(0)`, `kill(-1)`, `SIGKILL` through the kernel, `SIGCHLD` to `sigwaitinfo`, `setpgid`, `setsid`, `getpgid`, `getsid`, orphans to PID 1 | [m5b](../notes/m5b-processes.md) |
 
 relibc gives conditions, semaphores and stdio over the layer
 (`relibc-threads` checks the first two). Not there yet: `fexecve`,
-pipes, queued signals (`sigqueue`), stop and continue signals,
+`poll` and `select` (5f), named pipes, queued signals (`sigqueue`), stop and continue signals,
 `SA_RESTART` beyond console reads and `waitpid`, POSIX timers, `termios`, asynchronous cancellation,
 general ELF TLS. BusyBox
 runs on relibc since 5a′; see [m2-ram-posix](../notes/m2-ram-posix.md) for
@@ -158,7 +159,7 @@ cancellation, shared-state, input and interruption probes as well, and
 | `posix-abi` | a C program on relibc against relibc's headers: files, directories, threads, cancellation, keys, mutexes, clocks, signals, credentials; the layer's `.data` + `.bss` within 20 KiB |
 | `relibc-hello`, `relibc-threads` | relibc's start, files, `mmap`, `fcntl`, `writev`; its pthreads over the layer, `siglongjmp`, the clock's page (`relibc-threads-hvf` on HVF) |
 | `posix-procs` | the C probe of processes on relibc: `fork` (a copy of the parent's memory, descriptors, signals, threads, `vfork`, `pthread_atfork`), `posix_spawn` and `exec` from files (`/bin/ls /etc`, `argv`, `envp`, set-ID, 32 live children, 1,100 in a row, descriptors, a failed `exec`), exit status, `WIFSIGNALED`, `SIGKILL` of a child that blocks everything, a handler that exits with 42, a fault as `SIGSEGV`, `SIGCHLD` with `si_pid`, groups, sessions, `killpg`, `kill(0)`, `kill(-1)`, `clock_settime` by effective UID; the children end as `init` reports |
-| `os-test` | os-test (Sortix, ISC, pinned) io, malloc, process and signal suites, `basic/spawn`, `basic/unistd` `exec*` and the `basic` tests that call `fork` on relibc, a boot a suite with the tests started from files; PASS, FAIL and UNSUPPORTED (needs pipes) in `target/measure/os-test.txt`; a test that runs 10 s is killed, the run stops after 420 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
+| `os-test` | os-test (Sortix, ISC, pinned) io, malloc, process and signal suites, `basic/spawn`, `basic/unistd` `exec*` and the `basic` tests that call `fork` on relibc, a boot a suite with the tests started from files; PASS, FAIL and UNSUPPORTED (needs `poll` or `select`) in `target/measure/os-test.txt`; a test that runs 10 s is killed, the run stops after 420 s, and it fails when a test of `tests/os-test/pass.txt` does not pass |
 | `process-steps` [branches] | the longest step of the process service under `-icount` with a crowd of children (128 with 4 branches, in `ci`; 248 with 7), a child that forks among them, and the longest step of each kind of the loader's copy; it fails when the longest Vouch passes 6,000 ticks, a ForkStart passes the longest SpawnStart or a Clone of the RAM file service passes term B; the table is in `target/measure/process-steps.txt` and in [non-preemptible-paths](non-preemptible-paths.md) |
 | `posix-threads`, `posix-cancel-input`, `posix-shared`, `posix-input`, `posix-interrupt` | single POSIX probes on QEMU |
 | `posix-threads-vz`, `posix-cancel-input-vz`, `posix-input-vz`, `posix-interrupt-vz` | the same on Apple Virtualization.framework, through the Virtio console's driver; a stop of the machine before the end fails with a hint to rerun under HVF |
@@ -202,7 +203,10 @@ child's `_exit` to the return of `waitpid`, S12 `killpg` to a group of
 S14 `exec` to the new image's `main`, S15 `fork` to the child's first
 statement with a heap of the start size, 1 MiB and 8 MiB, S16 `fork`, `exec`
 and `waitpid` of a small file, S17 `fork` with 1, 8, 32 and 63 other threads
-(asleep or running below the forker), S18 `exec` with the same threads.
+(asleep or running below the forker), S18 `exec` with the same threads,
+S19 a byte through two pipes to another process and back, S20 1 MiB through
+a pipe in writes of 512 bytes and of 4 KiB, S22 `ls /etc | cat` as two
+`fork`s, two `exec`s and two pipes.
 Each row
 gives n, min, p50, p99, max in ns and kernel calls per operation, with a
 histogram, in `target/measure/rtbench-<machine>.txt`.
@@ -240,3 +244,11 @@ threads 541 / 754 and 524 / 721 us, with 63 running 639 / 885 and 639 / 819
 us; S18 `exec` with 63 running threads 442 / 606 and 442 / 622 us. The
 same run gave S13 121 / 205 and 117 / 209 us, S14 139 / 176 and 129 / 168
 us. [notes/m5d-fork.md](../notes/m5d-fork.md) has every row.
+
+10 minutes on the head of step 5e (HVF / VZ, p50 / p99, 125 rounds; 125,000
+samples of S19, 375 of S20, 1,250 of S22): S19 a byte through two pipes and
+back 5.5 / 6.4 and 5.5 / 6.3 us with 12 kernel calls (S9, an empty round
+trip to a service, 0.42 us with one call); S20 1 MiB in writes of 512 bytes
+250 / 222 and 250 / 221 MB/s (p50 / p99 of the time), in writes of 4 KiB
+432 / 381 and 432 / 385 MB/s; S22 `ls /etc | cat` 623 / 770 and 623 / 770
+us. [notes/m5e-pipes.md](../notes/m5e-pipes.md) has every row.

@@ -1491,6 +1491,7 @@ mod tests {
                     "ramfs",
                     "posix",
                     "clock",
+                    "pipe",
                     "uart",
                     "rtbench-load",
                     "rtbench-posix"

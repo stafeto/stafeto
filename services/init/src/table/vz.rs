@@ -184,6 +184,7 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::ramfs::TABLE[0],
     super::ramfs::RTBENCH_POOL,
     super::ramfs::POSIX_ABI_TABLE[2],
+    super::ramfs::PIPE,
     super::ramfs::LONG,
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,

@@ -22,7 +22,7 @@ use crate::{
 
 /// The rows of a run, in its order: each comes once, as numbers or as
 /// `none` with the reason the layer has no such operation yet.
-pub const ROWS: [&str; 43] = [
+pub const ROWS: [&str; 47] = [
     "s1_mutex_alone",
     "s2_futex_wake_idle",
     "s3_mutex_rival_10",
@@ -62,6 +62,10 @@ pub const ROWS: [&str; 43] = [
     "s18_exec_spinners_8",
     "s18_exec_spinners_32",
     "s18_exec_spinners_63",
+    "s19_pipe_ping_pong",
+    "s20_pipe_1m_w512",
+    "s20_pipe_1m_w4k",
+    "s22_ls_etc_cat",
     "timer_1ms",
     "inheritance_chain",
     "s7_missed",
@@ -318,6 +322,9 @@ pub enum Placing {
 pub fn run(minutes: u64, placing: Placing) -> Result<(), String> {
     hvf_host().map_err(|why| format!("rtbench 2 runs on HVF and VZ: {why}"))?;
     let seconds = minutes * 60;
+    // The `ls` and `cat` of S22 are BusyBox's.
+    crate::relibc()?;
+    crate::busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image_qemu = image("rtbench-posix.img", &RTBENCH_POSIX_PROGRAMS, seconds)?;
     let image_vz = image("rtbench-posix-vz.img", &RTBENCH_POSIX_VZ_PROGRAMS, seconds)?;
@@ -351,6 +358,8 @@ pub fn run(minutes: u64, placing: Placing) -> Result<(), String> {
 /// One round on QEMU TCG (`ci`): the scenarios run and their rows are
 /// whole; its numbers compare nothing.
 pub fn short() -> Result<(), String> {
+    crate::relibc()?;
+    crate::busybox_build()?;
     let kernel = build(Variant::Normal)?;
     let image = image("rtbench-posix-short.img", &RTBENCH_POSIX_PROGRAMS, 0)?;
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));

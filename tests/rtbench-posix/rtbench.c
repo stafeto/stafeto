@@ -54,7 +54,16 @@
  * other threads that sleep or spin (N = 1, 8, 32, 63): the cost of
  * stopping them (the rows of sleepers count the kernel calls of the
  * process, which grow as the stop's cost does); S18 execve with N spinning other threads, to the first
- * statement of the new image's main.
+ * statement of the new image's main. The scenarios of 5e (pipes, through
+ * the pipe service; the program is built with -fno-builtin): S19 a byte
+ * through two pipes to a child (role echo) and back, one round trip of
+ * the pair; S20 1 MiB written in writes of 512 B and of 4 KiB to a child
+ * (role sink) that reads to the end, from the first write to the sink's
+ * stamp at the end of the file, in nanoseconds a MiB; S22 a forker's
+ * `ls /etc | cat` (fork, exec of /bin/ls and /bin/cat, two pipes, the read
+ * to the end and two waitpid), from before the first pipe to the last
+ * waitpid. The time from a write into an empty pipe to the return of the
+ * waiting read is half of a round trip of S19 and has no row of its own.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -914,12 +923,61 @@ static void number_text(char *out, uint64_t value) {
     *out = 0;
 }
 
+/* `ls /etc | cat` as a shell does it: two pipes, a fork and an exec for
+ * each stage, the output read to its end here, both stages waited for.
+ * FORK_SAMPLES times; the ticks and the kernel calls into /tmp/probe. */
+static int pipeline(int fd) {
+    for (int i = 0; i < FORK_SAMPLES; i++) {
+        uint64_t calls = rtbench_calls();
+        uint64_t t0 = ticks();
+        int up[2], down[2];
+        if (pipe2(up, O_CLOEXEC) || pipe2(down, O_CLOEXEC)) return 10;
+        char *envp[] = { NULL };
+        pid_t lister = fork();
+        if (lister == 0) {
+            char *ls[] = { "ls", "/etc", NULL };
+            if (dup2(up[1], 1) != 1) _exit(11);
+            execve("/bin/ls", ls, envp);
+            _exit(12);
+        }
+        pid_t copier = lister < 0 ? -1 : fork();
+        if (copier == 0) {
+            char *cat[] = { "cat", NULL };
+            if (dup2(up[0], 0) != 0 || dup2(down[1], 1) != 1) _exit(13);
+            execve("/bin/cat", cat, envp);
+            _exit(14);
+        }
+        if (lister < 0 || copier < 0) return 15;
+        close(up[0]);
+        close(up[1]);
+        close(down[1]);
+        char text[256];
+        uint64_t total = 0;
+        for (;;) {
+            ssize_t n = read(down[0], text, sizeof text);
+            if (n < 0) return 16;
+            if (n == 0) break;
+            total += (uint64_t)n;
+        }
+        close(down[0]);
+        int status = -1;
+        if (waitpid(lister, &status, 0) != lister || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 17;
+        if (waitpid(copier, &status, 0) != copier || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 18;
+        uint64_t t1 = ticks();
+        uint64_t used = rtbench_calls() - calls;
+        if (total == 0) return 19;
+        if (put_stamp(fd, SAMPLES_AT + 8 * i, t1 - t0) || put_stamp(fd, CALLS_AT + 8 * i, used)) return 8;
+    }
+    return 0;
+}
+
 /* The role forker MODE KIB THREADS SPIN: grows its heap by KIB KiB, makes
  * THREADS other threads (SPIN: they spin), and then, MODE 0: forks
  * FORK_SAMPLES times and leaves the ticks from the call to the child's
  * first statement; MODE 1: the ticks from the call to the return of
  * waitpid for a child that execs /bin/rtbench-posix `true`; MODE 2:
- * execs `quick` (the parent reads the stamps S14 reads). */
+ * execs `quick` (the parent reads the stamps S14 reads); MODE 3: the ticks
+ * of `ls /etc | cat` (S22), the pipeline's output read to its end. */
 static int forker(uint64_t entered, char **argv) {
     (void)entered;
     int mode = atoi(argv[2]), spin = atoi(argv[5]), threads = atoi(argv[4]);
@@ -949,6 +1007,7 @@ static int forker(uint64_t entered, char **argv) {
         execve("/bin/rtbench-posix", quick, envp);
         return 5;
     }
+    if (mode == 3) return pipeline(fd);
     for (int i = 0; i < FORK_SAMPLES; i++) {
         uint64_t calls = rtbench_calls();
         uint64_t t0 = ticks();
@@ -1033,6 +1092,120 @@ static int forks(void) {
     return 0;
 }
 
+/* --- S19, S20, S22: pipes ---------------------------------------------- */
+
+#define PIPE_ROUNDS 1000
+#define PIPE_MIB (1024 * 1024)
+#define PIPE_TRIALS 3
+#define PIPE_SIZES 2
+
+static const size_t pipe_chunks[PIPE_SIZES] = { 512, 4096 };
+static struct histogram s19, s20[PIPE_SIZES], s22;
+static char pipe_data[4096];
+
+/* Spawns /bin/rtbench-posix in `role` with `in` as its standard input and,
+ * when `out` is not -1, `out` as its standard output. */
+static int spawn_piped(pid_t *pid, const char *role, int in, int out) {
+    char *argv[] = { "rtbench-posix", (char *)role, NULL };
+    char *envp[] = { NULL };
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    int error = posix_spawn_file_actions_adddup2(&actions, in, 0);
+    if (!error && out >= 0) error = posix_spawn_file_actions_adddup2(&actions, out, 1);
+    if (!error) error = posix_spawn(pid, "/bin/rtbench-posix", &actions, NULL, argv, envp);
+    posix_spawn_file_actions_destroy(&actions);
+    if (error) fail(role, error);
+    return error;
+}
+
+/* S19: 1000 round trips of one byte through two pipes to the role echo. */
+static int pipe_ping_pong(void) {
+    int up[2], down[2];
+    pid_t pid = -1;
+    if (pipe2(up, O_CLOEXEC) || pipe2(down, O_CLOEXEC)) {
+        fail("S19 pipe", errno);
+        return 1;
+    }
+    int error = spawn_piped(&pid, "echo", up[0], down[1]);
+    close(up[0]);
+    close(down[1]);
+    if (error) return 1;
+    char byte = 'x';
+    /* The first round trip waits for the child's start. */
+    if (write(up[1], &byte, 1) != 1 || read(down[0], &byte, 1) != 1) {
+        fail("S19 first byte", errno);
+        return 1;
+    }
+    uint64_t calls = rtbench_calls();
+    for (int i = 0; i < PIPE_ROUNDS; i++) {
+        uint64_t t0 = ticks();
+        ssize_t sent = write(up[1], &byte, 1);
+        ssize_t got = read(down[0], &byte, 1);
+        uint64_t t1 = ticks();
+        if (sent != 1 || got != 1) {
+            fail("S19 byte", errno);
+            return 1;
+        }
+        record(&s19, ticks_ns(t1 - t0));
+    }
+    s19.calls += rtbench_calls() - calls;
+    close(up[1]);
+    if (read(down[0], &byte, 1) != 0) {
+        fail("S19 end of file", errno);
+        return 1;
+    }
+    close(down[0]);
+    return reaped(pid, 0, 0, "S19 echo") == 1 ? 0 : 1;
+}
+
+/* S20: PIPE_TRIALS times 1 MiB in writes of `chunk` bytes to the role sink,
+ * which says it is ready on its standard output and stamps the end of the
+ * file. */
+static int pipe_throughput(struct histogram *h, size_t chunk) {
+    for (int trial = 0; trial < PIPE_TRIALS; trial++) {
+        int data[2], ready[2];
+        pid_t pid = -1;
+        if (clear_stamps()) return 1;
+        if (pipe2(data, O_CLOEXEC) || pipe2(ready, O_CLOEXEC)) {
+            fail("S20 pipe", errno);
+            return 1;
+        }
+        int error = spawn_piped(&pid, "sink", data[0], ready[1]);
+        close(data[0]);
+        close(ready[1]);
+        char go = 0;
+        if (error || read(ready[0], &go, 1) != 1 || go != 'g') {
+            fail("S20 sink", errno);
+            return 1;
+        }
+        close(ready[0]);
+        uint64_t t0 = ticks();
+        for (size_t sent = 0; sent < PIPE_MIB; sent += chunk) {
+            if ((size_t)write(data[1], pipe_data, chunk) != chunk) {
+                fail("S20 write", errno);
+                return 1;
+            }
+        }
+        close(data[1]);
+        if (reaped(pid, 0, 0, "S20 sink") != 1) return 1;
+        uint64_t end = get_stamp(STAMP_EXIT);
+        if (end <= t0) {
+            fail("S20 stamp", 0);
+            return 1;
+        }
+        record(h, ticks_ns(end - t0));
+    }
+    return 0;
+}
+
+static int pipes(void) {
+    if (pipe_ping_pong()) return 1;
+    for (int i = 0; i < PIPE_SIZES; i++)
+        if (pipe_throughput(&s20[i], pipe_chunks[i])) return 1;
+    /* S22 is made by a forker (role forker, mode 3), as S16 is. */
+    return run_forker(&s22, 3, 0, 0, 0);
+}
+
 static int processes(void) {
     probe_fd = open("/tmp/probe", O_RDWR);
     if (probe_fd < 0) {
@@ -1047,6 +1220,7 @@ static int processes(void) {
     if (!error) error = exit_to_wait();
     if (!error) error = kill_group();
     if (!error) error = forks();
+    if (!error) error = pipes();
     error |= rtbench_level(MAIN_LEVEL);
     close(probe_fd);
     return error;
@@ -1071,8 +1245,27 @@ static int child(uint64_t entered, char **argv) {
     const char *role = argv[1];
     if (strcmp(role, "true") == 0) return 0;
     if (strcmp(role, "forker") == 0) return forker(entered, argv);
+    if (strcmp(role, "echo") == 0) {
+        char byte;
+        while (read(0, &byte, 1) == 1)
+            if (write(1, &byte, 1) != 1) return 2;
+        return 0;
+    }
     int fd = open("/tmp/probe", O_WRONLY);
     if (fd < 0) return 2;
+    if (strcmp(role, "sink") == 0) {
+        static char buffer[4096];
+        uint64_t total = 0;
+        if (write(1, "g", 1) != 1) return 2;
+        for (;;) {
+            ssize_t n = read(0, buffer, sizeof buffer);
+            if (n < 0) return 3;
+            if (n == 0) break;
+            total += (uint64_t)n;
+        }
+        if (put_stamp(fd, STAMP_EXIT, ticks())) return 4;
+        return total == PIPE_MIB ? 0 : 5;
+    }
     if (strcmp(role, "quick") == 0) return put_stamp(fd, STAMP_MAIN, entered) ? 3 : 0;
     if (strcmp(role, "execer") == 0) {
         char *argv[] = { "rtbench-posix", "quick", NULL };
@@ -1151,6 +1344,10 @@ static void report(void) {
     for (int i = 0; i < THREAD_COUNTS; i++) row(sleepers[i], &s17[0][i], 1);
     for (int i = 0; i < THREAD_COUNTS; i++) row(spinners[i], &s17[1][i], 0);
     for (int i = 0; i < THREAD_COUNTS; i++) row(execs[i], &s18[i], 0);
+    row("s19_pipe_ping_pong", &s19, 1);
+    row("s20_pipe_1m_w512", &s20[0], 0);
+    row("s20_pipe_1m_w4k", &s20[1], 0);
+    row("s22_ls_etc_cat", &s22, 1);
     none("timer_1ms", "POSIX timers come with 5h");
     none("inheritance_chain", "priority inheritance comes with 5h");
     struct line l = { .length = 0 };

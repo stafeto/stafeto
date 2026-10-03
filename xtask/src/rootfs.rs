@@ -238,11 +238,14 @@ fn steps() -> Vec<RootFile> {
 }
 
 /// rtbench 2 (5c): the benchmark's children are files of it, the program
-/// itself under a role its first argument names.
+/// itself under a role its first argument names; BusyBox gives the `ls` and
+/// the `cat` of the pipeline of S22 (5e).
 fn rtbench() -> Vec<RootFile> {
     vec![
         dir("/bin"),
         file("/bin/rtbench-posix", 0o755, ROOT, "rtbench-posix"),
+        file("/bin/ls", 0o755, ROOT, "busybox-probe"),
+        file("/bin/cat", 0o755, ROOT, "busybox-probe"),
     ]
 }
 
