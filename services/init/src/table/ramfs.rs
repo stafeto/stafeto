@@ -355,7 +355,7 @@ const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
-/// files with the tests of the image, the process and clock services, and
+/// files with the tests of the image, the terminal, process and clock services, and
 /// the runner, whose children are the tests, started from their files
 /// (5c), one at a time, with room for one more for the exec of a test
 /// that execs, for the processes of a test of groups (a test, its unreaped
@@ -363,6 +363,8 @@ const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
 /// of an emptied group leave alive for good: their child holds both ends of
 /// its pipe and reads one (5e).
 pub const OS_TEST_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TTY,
     TABLE[0],
     Record {
         quota: POSIX_ABI_TABLE[1].quota + 10 * OS_TEST_QUOTA + 384 * PAGE,
@@ -374,7 +376,7 @@ pub const OS_TEST_TABLE: &[Record] = &[
         name: "os-test-run",
         program: "os-test-run",
         args: b"os-test-run\0",
-        connects: &["ramfs", "pipe", "clock", "posix", "entropy"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix", "entropy"],
         root: true,
         quota: OS_TEST_QUOTA,
         ..POSIX

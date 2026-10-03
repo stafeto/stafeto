@@ -1604,6 +1604,8 @@ mod tests {
         assert_eq!(
             order_of(ramfs::OS_TEST_TABLE),
             [
+                "uart",
+                "tty",
                 "ramfs",
                 "clock",
                 "posix",

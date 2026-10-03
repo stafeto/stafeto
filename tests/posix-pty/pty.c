@@ -215,7 +215,9 @@ static int controller_disconnect(int local) {
         CHECK(tcsetpgrp(p.slave, fg) == 0 && tcgetpgrp(p.slave) == fg);
         CHECK(write(ready[1], "r", 1) == 1);
         char c; CHECK(read_byte(command[0], &c) == 0);
-        CHECK(pause_ms(20) == 0 && hup_count == (local ? 0 : 1) && cont_count == 0);
+        CHECK(pause_ms(20) == 0);
+        printf("posix-pty: controller %d SID %d fg %d local %d HUP %d CONT %d\n", getpid(), getsid(0), fg, local, hup_count, cont_count);
+        CHECK(hup_count == (local ? 0 : 1) && cont_count == 0);
         CHECK(write(foreground_command[1], "q", 1) == 1 && wait_ok(fg) == 0);
         errno = 0; CHECK(tcgetsid(p.slave) == -1 && errno == ENOTTY);
         _exit(0);

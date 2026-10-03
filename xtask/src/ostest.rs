@@ -29,10 +29,12 @@ use crate::{
     llvm_tool, qemu, rootfs, target_dir, write_boot_image_files,
 };
 
-/// The image of a suite: the RAM files with the tests, the pipes, the process and
-/// clock services, the loader and the runner.
-const PROGRAMS: [ImageProgram; 9] = [
+/// The image of a suite: the RAM files with the tests, pipes, the console
+/// and terminal, process and clock services, the loader and the runner.
+const PROGRAMS: [ImageProgram; 11] = [
     ("init", "init", crate::INIT_STACK_SIZE, &["table-os-test"]),
+    ("uart", "uart", crate::UART_STACK_SIZE, &[]),
+    ("tty", "tty", crate::TTY_STACK_SIZE, &[]),
     ("ramfs", "ramfs", crate::RAMFS_STACK_SIZE, &[]),
     ("pipe", "pipe", crate::PIPE_STACK_SIZE, &[]),
     (
