@@ -181,6 +181,9 @@ static int frontends(void) {
     CHECK(select(bad + 1, &readset, NULL, NULL, &time) == -1 && errno == EBADF);
     CHECK(memcmp(&readset, &before, sizeof before) == 0 && memcmp(&time, &saved, sizeof time) == 0);
     CHECK(select(-1, NULL, NULL, NULL, &zero) == -1 && errno == EINVAL);
+    FD_ZERO(&readset); for (int i = 0; i <= 32; i++) FD_SET(i, &readset); before = readset;
+    CHECK(select(33, &readset, NULL, NULL, &time) == -1 && errno == EBADF);
+    CHECK(memcmp(&readset, &before, sizeof before) == 0 && memcmp(&time, &saved, sizeof time) == 0);
     struct timespec ns = {0, 1234567}, ns_before = ns;
     uint64_t start = monotonic_ns();
     CHECK(ppoll(NULL, 0, &ns, NULL) == 0 && monotonic_ns() - start >= 1234567);
