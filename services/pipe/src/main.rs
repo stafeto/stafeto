@@ -418,12 +418,14 @@ impl PipeService {
             Ok(set) if r.handles.is_empty() => set,
             _ => return Answer::Status(Status::BadSize),
         };
-        if set.items[..set.len]
-            .iter()
-            .any(|item| !s.data.held.holds(item.description))
+        let descriptions = match s
+            .data
+            .held
+            .select(set.items[..set.len].iter().map(|item| item.description))
         {
-            return status(proto_pipe::BAD_FD);
-        }
+            Ok(descriptions) => descriptions,
+            Err(code) => return status(code),
+        };
         rt::service::step_detail(set.len as u64);
         let ready = set.ready(|end| self.pipes.readiness(&s.data.held, end));
         if ready.any() {
@@ -448,7 +450,7 @@ impl PipeService {
             Some(proto_pipe::AGAIN)
         };
         if registered {
-            for description in set.descriptions() {
+            for description in descriptions.descriptions() {
                 let ops = &self.ops;
                 if let Err(code) = self
                     .pipes
@@ -460,7 +462,7 @@ impl PipeService {
             }
         }
         if let Some(code) = refusal {
-            for description in set.descriptions() {
+            for description in descriptions.descriptions() {
                 self.pipes.unwait(description, (label, key));
             }
             self.watches.remove(label, key);
