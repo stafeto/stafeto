@@ -345,12 +345,14 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
 /// each, and 24 of its own (tests/posix-procs STEPS_BRANCHES).
 const STEPS_CHILDREN: u64 = 7 * 32 + 24;
 
-/// The quota of the steps probe, which each child it spawns gets too.
-const STEPS_QUOTA: u64 = 256 * PAGE;
+/// The steps probe and each spawned child: the enlarged image plus its
+/// checked 64 KiB malloc, including the allocator mapping and alignment.
+const STEPS_QUOTA: u64 = (256 + 16) * PAGE;
 
 /// The quota of the probe of POSIX processes, which each child it spawns
-/// from a file gets too (5c).
-const PROCS_QUOTA: u64 = 512 * PAGE;
+/// from a file gets too (5c), with 16 pages for the enlarged signal layer
+/// while the fork probe still allocates its additional 1 MiB.
+const PROCS_QUOTA: u64 = (512 + 16) * PAGE;
 
 /// The runner of os-test (cargo xtask os-test, tests/os-test-run): the RAM
 /// files with the tests of the image, the process and clock services, and

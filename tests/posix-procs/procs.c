@@ -1829,12 +1829,16 @@ static int pipe_ghosts_after(void);
 static int loader_channels(void);
 static int channel_child(const char *name);
 
+#if JOB_CONTROL_PROBE
 #include "jobs.c"
+#endif
 
 static int role(const char *name) {
+#if JOB_CONTROL_PROBE
     if (strcmp(name, "jobcontrol") == 0) return job_control();
     if (strcmp(name, "jobexec-local") == 0) return job_after_exec(0);
     if (strcmp(name, "jobexec-process") == 0) return job_after_exec(1);
+#endif
     if (strcmp(name, "loaderchannels") == 0) return loader_channels();
     if (strncmp(name, "channels_", 9) == 0) return channel_child(name);
     if (strcmp(name, "steps") == 0) return steps_run();

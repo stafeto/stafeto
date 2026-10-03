@@ -7,6 +7,9 @@ extern int stafeto_probe_assign_job(int);
 extern int stafeto_probe_return_job(int, unsigned long long);
 extern int stafeto_probe_return_job_info(int, unsigned long long, int, int);
 extern void stafeto_probe_return_failure(void);
+extern int stafeto_probe_route_job(int);
+extern int stafeto_probe_zero_return(void);
+extern int stafeto_probe_assign_signal(int);
 
 extern int stafeto_probe_loading_pid(void);
 extern void stafeto_probe_fork_early(void (*window)(void));
@@ -73,7 +76,84 @@ static void job_hup(int signal) {
     handled = signal;
 }
 
+static int job_info_owner_gate[2], job_info_sender_gate[2], job_info_owner_ready, job_info_signal;
+static void *job_info_owner(void *unused) {
+    (void)unused;
+    int assigned = stafeto_probe_assign_signal(job_info_signal);
+    __atomic_store_n(&job_info_owner_ready, assigned == 0 ? 1 : -1, __ATOMIC_SEQ_CST);
+    char byte;
+    if (read(job_info_owner_gate[0], &byte, 1) != 1) return (void *)1;
+    sigset_t jobs;
+    job_set(&jobs);
+    sigaddset(&jobs, SIGUSR1);
+    return (void *)(long)sigprocmask(SIG_BLOCK, &jobs, NULL);
+}
+static void *job_info_local_owner(void *unused) {
+    (void)unused;
+    sigset_t jobs;
+    job_set(&jobs);
+    sigaddset(&jobs, SIGUSR1);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    if (raise(job_info_signal) != 0 || sigtimedwait(&jobs, &info, &zero) != job_info_signal
+        || info.si_code != -6) return (void *)1;
+    return NULL;
+}
+
+static void job_info_two_owners(int signal) {
+    job_info_signal = signal;
+    job_info_owner_ready = 0;
+    sigset_t jobs;
+    job_set(&jobs);
+    sigaddset(&jobs, SIGUSR1);
+    expect("job info block jobs", sigprocmask(SIG_BLOCK, &jobs, NULL), 0);
+    expect("job info owner gate", pipe(job_info_owner_gate), 0);
+    expect("job info sender gate", pipe(job_info_sender_gate), 0);
+    pid_t parent = getpid(), sender = fork();
+    if (sender == 0) {
+        char byte;
+        if (read(job_info_sender_gate[0], &byte, 1) != 1) _exit(1);
+        _exit(kill(parent, job_info_signal) == 0 ? 0 : 2);
+    }
+    expect("job info sender exists", sender > 0, 1);
+    expect("job info first sender", kill(parent, job_info_signal), 0);
+    pthread_t owner;
+    expect("job info owner thread", pthread_create(&owner, NULL, job_info_owner, NULL), 0);
+    while (__atomic_load_n(&job_info_owner_ready, __ATOMIC_SEQ_CST) == 0) sched_yield();
+    expect("job info first assignment", job_info_owner_ready, 1);
+    expect("job info release second sender", write(job_info_sender_gate[1], "s", 1), 1);
+    reap("job info second sender exits", sender, 0, 0);
+    expect("job info second assignment", stafeto_probe_assign_signal(job_info_signal), 0);
+    expect("job info third sender", kill(parent, job_info_signal), 0);
+    expect("job info keep live assignment", stafeto_probe_assign_signal(job_info_signal), EAGAIN);
+    expect("job info route keeps first assignment", stafeto_probe_route_job(job_info_signal), 0);
+    struct timespec zero = {0, 0};
+    siginfo_t info;
+    expect("job info consume second assignment", sigtimedwait(&jobs, &info, &zero), job_info_signal);
+    expect("job info second sender info", info.si_pid, sender);
+    expect("job info second sender code", info.si_code, 0);
+    expect("job info consume third pending", sigtimedwait(&jobs, &info, &zero), job_info_signal);
+    expect("job info third sender info", info.si_pid, parent);
+    expect("job info release first owner", write(job_info_owner_gate[1], "r", 1), 1);
+    void *result = (void *)1;
+    expect("job info join first owner", pthread_join(owner, &result), 0);
+    expect("job info first owner return", result == NULL, 1);
+    expect("job info consume first assignment", sigtimedwait(&jobs, &info, &zero), job_info_signal);
+    expect("job info first sender survives second owner", info.si_pid, parent);
+    expect("job info first sender code", info.si_code, 0);
+    for (int reused = 0; reused < 4; reused++) {
+        expect("job info reuse owner", pthread_create(&owner, NULL, job_info_local_owner, NULL), 0);
+        result = (void *)1;
+        expect("job info join reused owner", pthread_join(owner, &result), 0);
+        expect("job info reused slot has fresh local information", result == NULL, 1);
+    }
+    close(job_info_owner_gate[0]); close(job_info_owner_gate[1]);
+    close(job_info_sender_gate[0]); close(job_info_sender_gate[1]);
+    expect("job info unblock jobs", sigprocmask(SIG_UNBLOCK, &jobs, NULL), 0);
+}
+
 static int job_control(void) {
+    expect("zero thread return", stafeto_probe_zero_return(), 0);
     expect("linked job-control group", setpgid(0, 0), 0);
     sigset_t jobs, pending, chld;
     job_set(&jobs);
@@ -150,6 +230,9 @@ static int job_control(void) {
     expect("stale return preserves sender", info.si_pid, sender);
     expect("stale return preserves code", info.si_code, 0);
     expect("unblock return information", sigprocmask(SIG_UNBLOCK, &jobs, NULL), 0);
+
+    job_info_two_owners(SIGTSTP);
+    job_info_two_owners(SIGUSR1);
 
     for (int local = 0; local < 4; local++) {
         pid_t image = fork();

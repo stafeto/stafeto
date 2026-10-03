@@ -263,3 +263,21 @@ pub extern "C" fn stafeto_probe_return_job_info(
 pub extern "C" fn stafeto_probe_return_failure() {
     posix_abi::signals::probe_return_failure();
 }
+
+/// Route while a pending assignment of the same number remains in the caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_route_job(signal: c_int) -> c_int {
+    posix_abi::signals::probe_route_job(signal)
+}
+
+/// Exercise the pre-attachment block without a relibc thread number.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_zero_return() -> c_int {
+    posix_abi::signals::probe_zero_return()
+}
+
+/// Assign a process signal for the sender-information regression.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_assign_signal(signal: c_int) -> c_int {
+    posix_abi::signals::probe_assign_signal(signal)
+}
