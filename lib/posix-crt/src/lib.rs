@@ -303,6 +303,10 @@ fn loaded_main() -> u64 {
                     Some(&inherited[..count.min(inherited.len())]),
                     secure,
                 )
+                .map(|mut fs| {
+                    fs.set_pipes(one(Slot::Pipes).map(Handle::from_raw));
+                    fs
+                })
                 .map_err(|_| "files failed")
             })
             .and_then(|files| posix_abi::shared::init(files).map_err(|_| "files failed"))

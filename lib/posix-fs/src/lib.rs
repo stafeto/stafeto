@@ -32,6 +32,12 @@ pub enum FsError {
     InvalidArgument,
     UnsupportedEncoding,
     Interrupted,
+    /// A pipe that would wait with O_NONBLOCK, or a wait past the limits.
+    Again,
+    /// A write to a pipe with no reader.
+    Broken,
+    /// Every pipe of the service in use.
+    TooManyInSystem,
     Io,
 }
 
@@ -80,7 +86,11 @@ pub enum FileKind {
     Directory,
     Regular,
     Character,
+    Fifo,
 }
+
+/// The kind of a pipe's node information (NodeInfo::kind).
+pub const FIFO: u32 = 4;
 
 impl FileKind {
     fn from_wire(kind: u32) -> Result<Self, FsError> {
@@ -88,6 +98,7 @@ impl FileKind {
             1 => Ok(Self::Directory),
             2 => Ok(Self::Regular),
             3 => Ok(Self::Character),
+            FIFO => Ok(Self::Fifo),
             _ => Err(FsError::Io),
         }
     }
@@ -123,15 +134,17 @@ pub const OPEN_MAX: usize = 32;
 /// The longest current directory, in bytes.
 pub const MAX_CWD: usize = MAX_PATH;
 
-/// What a descriptor names: the console's input, output or error, or an
+/// What a descriptor names: the console's input, output or error, an
 /// open description of the RAM file service by its number in the
-/// process's session.
+/// process's session, or an end of a pipe of the pipe service by its
+/// number there (5e).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Target {
     Input,
     Output,
     Error,
     Ram(u32),
+    Pipe(u32),
 }
 
 /// One process's file state, mutated by one owner: the table of
@@ -142,6 +155,8 @@ pub enum Target {
 /// service descriptor, hence the same offset and file access mode.
 pub struct PosixFs {
     files: Files,
+    /// The session with the pipe service, when the process has one.
+    pipes: Option<Handle<Channel>>,
     paths: PathState,
     descriptors: Table<Target, OPEN_MAX>,
 }
@@ -150,7 +165,7 @@ pub struct PosixFs {
 /// stays alive while a transport is used: what a request needs outside
 /// the owner's lock.
 #[derive(Clone, Copy)]
-pub struct Transport(View);
+pub struct Transport(View, Option<rt::abi::Handle>);
 
 /// A path the owner resolved against its current directory, for a
 /// request outside its lock.
@@ -222,12 +237,78 @@ impl Transport {
         self.0.files()
     }
 
+    /// The session with the pipe service: BadFileDescriptor without one.
+    pub fn pipes(&self) -> Result<ManuallyDrop<Handle<Channel>>, FsError> {
+        self.1
+            .map(Handle::borrowed)
+            .ok_or(FsError::BadFileDescriptor)
+    }
+
     /// Close of the service's description `fd` that the table handed back.
+    /// The console's targets take no frame of the requests: the probes of
+    /// requests before the heap run it on a small stack.
     pub fn release(&self, target: Option<Target>) -> Result<(), FsError> {
         match target {
-            Some(Target::Ram(fd)) => self.files().close(fd).map_err(FsError::from),
+            Some(Target::Ram(fd)) => self.close_file(fd),
+            Some(Target::Pipe(end)) => self.close_pipe(end),
             _ => Ok(()),
         }
+    }
+
+    #[inline(never)]
+    fn close_file(&self, fd: u32) -> Result<(), FsError> {
+        self.files().close(fd).map_err(FsError::from)
+    }
+
+    #[inline(never)]
+    fn close_pipe(&self, end: u32) -> Result<(), FsError> {
+        self.pipe_call(proto_pipe::Method::Close, end, None)
+            .map(drop)
+    }
+
+    /// A request of one end of a pipe (CLOSE, GET_FLAGS, SET_FLAGS, STAT)
+    /// and the words of its reply after the status. Its buffers stay out
+    /// of the frames of its callers (`release` runs on small stacks too).
+    #[inline(never)]
+    pub fn pipe_call(
+        &self,
+        method: proto_pipe::Method,
+        end: u32,
+        word: Option<u32>,
+    ) -> Result<[u32; 2], FsError> {
+        let mut w = proto_wire::Writer::new();
+        proto_pipe::end_request(method, end, word, &mut w).map_err(|_| FsError::Io)?;
+        self.pipe_send(w.as_bytes())
+    }
+
+    /// A request to the pipe service and up to two words of its reply.
+    #[inline(never)]
+    fn pipe_send(&self, request: &[u8]) -> Result<[u32; 2], FsError> {
+        let pipes = self.pipes()?;
+        let reply = loop {
+            match rt::sys::send(&pipes, request) {
+                Err(rt::abi::Error::Interrupted) => continue,
+                other => break other.map_err(|_| FsError::Io)?,
+            }
+        };
+        let mut buffer = [0; rt::abi::MESSAGE_MAX];
+        let mut r = proto_wire::Reader::new(reply.bytes(&mut buffer));
+        match Status::from_code(r.u32().map_err(|_| FsError::Io)?) {
+            Status::Ok => Ok([r.u32().unwrap_or(0), r.u32().unwrap_or(0)]),
+            status => Err(pipe_error(status)),
+        }
+    }
+
+    /// CREATE: a new pipe, its read end and its write end.
+    pub fn pipe_create(&self, nonblock: bool) -> Result<(u32, u32), FsError> {
+        let mut w = proto_wire::Writer::new();
+        proto_pipe::Method::Create
+            .header()
+            .write(&mut w)
+            .and_then(|()| w.u32(if nonblock { proto_pipe::NONBLOCK } else { 0 }))
+            .map_err(|_| FsError::Io)?;
+        let [read, write] = self.pipe_send(w.as_bytes())?;
+        Ok((read, write))
     }
 
     pub fn open(&self, path: &str, flags: u32) -> Result<u32, FsError> {
@@ -296,6 +377,20 @@ impl Transport {
                 .files()
                 .descriptor_information(fd)
                 .map_err(FsError::from),
+            Target::Pipe(end) => {
+                let [pipe, _] = self.pipe_call(proto_pipe::Method::Stat, end, None)?;
+                Ok(NodeInfo {
+                    kind: FIFO,
+                    permissions: 0o600,
+                    device: 3,
+                    special_device: 0,
+                    inode: u64::from(pipe) + 1,
+                    links: 1,
+                    size: 0,
+                    block_size: proto_pipe::CAPACITY as u32,
+                    ..CONSOLE_INFO
+                })
+            }
             // Unnamed console transport; richer terminal metadata comes with
             // the terminal service and its namespace entry.
             _ => Ok(CONSOLE_INFO),
@@ -361,13 +456,43 @@ pub struct Inherited {
     pub target: Target,
 }
 
+/// The errno-like error of a refusal of the pipe service.
+pub fn pipe_error(status: Status) -> FsError {
+    match status.code() {
+        proto_pipe::BAD_FD => FsError::BadFileDescriptor,
+        proto_pipe::AGAIN => FsError::Again,
+        proto_pipe::BROKEN => FsError::Broken,
+        proto_pipe::NFILE => FsError::TooManyInSystem,
+        proto_pipe::MFILE => FsError::TooManyOpenFiles,
+        proto_pipe::INVALID => FsError::InvalidArgument,
+        _ => match status {
+            Status::Kernel(rt::abi::Error::LimitReached) => FsError::Again,
+            Status::Kernel(rt::abi::Error::Interrupted) => FsError::Interrupted,
+            _ => FsError::Io,
+        },
+    }
+}
+
 impl PosixFs {
+    /// The files of a program init started, through `parent`: the RAM
+    /// files and, when init's table gives it one, a session with the pipe
+    /// service.
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, FsError> {
-        Self::from_files(Files::connect(parent).map_err(FsError::from)?)
+        let mut fs = Self::from_files(Files::connect(parent).map_err(FsError::from)?)?;
+        fs.pipes = rt::service::connect(parent, "pipe").ok();
+        Ok(fs)
     }
 
     pub fn connect_with_uart(parent: &Handle<Channel>) -> Result<Self, FsError> {
-        Self::from_files(Files::connect_with_uart(parent).map_err(FsError::from)?)
+        let mut fs = Self::from_files(Files::connect_with_uart(parent).map_err(FsError::from)?)?;
+        fs.pipes = rt::service::connect(parent, "pipe").ok();
+        Ok(fs)
+    }
+
+    /// The session with the pipe service the program was given (its
+    /// loader's start, the slot Pipes).
+    pub fn set_pipes(&mut self, pipes: Option<Handle<Channel>>) {
+        self.pipes = pipes;
     }
 
     /// The files through sessions the program was given (its loader's
@@ -388,6 +513,7 @@ impl PosixFs {
             Some(list) => {
                 let mut fs = Self {
                     files: Files::from_sessions(files, uart),
+                    pipes: None,
                     paths: PathState::new(),
                     descriptors: Table::default(),
                 };
@@ -421,9 +547,15 @@ impl PosixFs {
     /// child's and go without a close; the descriptors with FD_CLOFORK go
     /// with no word to the service, which gave the child's session none of
     /// theirs, and so do the holds of the parent's requests.
-    pub fn after_fork(&mut self, files: Handle<Channel>, uart: Option<Handle<Channel>>) {
+    pub fn after_fork(
+        &mut self,
+        files: Handle<Channel>,
+        uart: Option<Handle<Channel>>,
+        pipes: Option<Handle<Channel>>,
+    ) {
         let parent = core::mem::replace(&mut self.files, Files::from_sessions(files, uart));
         core::mem::forget(parent);
+        core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
         for (fd, _, flags) in self.descriptors.open() {
@@ -453,10 +585,32 @@ impl PosixFs {
         count
     }
 
+    /// The ends of pipes a forked child's session shares with its
+    /// parent's: those of the descriptors without FD_CLOFORK, each once,
+    /// into `out`; how many.
+    pub fn pipes_kept_by_fork(&self, out: &mut [u32; OPEN_MAX]) -> usize {
+        let mut count = 0;
+        for (_, target, flags) in self.descriptors.open() {
+            if let Target::Pipe(n) = target
+                && !flags.close_on_fork
+                && !out[..count].contains(&n)
+            {
+                out[count] = n;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// The session with the RAM file service and the console's driver's,
     /// which a child gets clones of.
     pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
         self.files.sessions()
+    }
+
+    /// The session with the pipe service, when the process has one.
+    pub fn pipes(&self) -> Option<&Handle<Channel>> {
+        self.pipes.as_ref()
     }
 
     fn from_files(files: Files) -> Result<Self, FsError> {
@@ -466,6 +620,7 @@ impl PosixFs {
         }
         Ok(Self {
             files,
+            pipes: None,
             paths: PathState::new(),
             descriptors,
         })
@@ -473,7 +628,7 @@ impl PosixFs {
 
     /// The transports, for a request outside the owner's lock.
     pub fn transport(&self) -> Transport {
-        Transport(self.files.view())
+        Transport(self.files.view(), self.pipes.as_ref().map(Handle::raw))
     }
 
     pub fn cwd(&self) -> &[u8] {
@@ -526,6 +681,25 @@ impl PosixFs {
         self.descriptors
             .insert(Target::Ram(fd), flags)
             .map_err(FsError::from)
+    }
+
+    /// The two descriptors of a new pipe, its ends `read` and `write`,
+    /// the lowest free numbers, both with `flags`: both or neither; the
+    /// caller closes the ends in the service on an error.
+    pub fn insert_pipe(
+        &mut self,
+        read: u32,
+        write: u32,
+        flags: DescriptorFlags,
+    ) -> Result<(u32, u32), FsError> {
+        let first = self.descriptors.insert(Target::Pipe(read), flags)?;
+        match self.descriptors.insert(Target::Pipe(write), flags) {
+            Ok(second) => Ok((first, second)),
+            Err(error) => {
+                let _ = self.descriptors.close(first);
+                Err(error.into())
+            }
+        }
     }
 
     /// Close: the descriptor goes; what to release outside the lock.

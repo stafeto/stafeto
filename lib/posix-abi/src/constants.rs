@@ -73,3 +73,7 @@ pub const PTHREAD_MUTEX_NORMAL: i32 = 0;
 pub const PTHREAD_MUTEX_ERRORCHECK: i32 = 1;
 pub const PTHREAD_MUTEX_RECURSIVE: i32 = 2;
 pub const PTHREAD_MUTEX_DEFAULT: i32 = 3;
+pub const ENFILE: i32 = 23;
+pub const EPIPE: i32 = 32;
+/// Linux's O_NONBLOCK on AArch64, relibc's.
+pub const O_NONBLOCK: i32 = 0o4000;

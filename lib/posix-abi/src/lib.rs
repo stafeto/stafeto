@@ -15,6 +15,7 @@ pub mod constants;
 pub mod fork;
 pub mod long;
 pub mod metadata;
+pub mod pipes;
 pub mod process;
 pub mod relibc;
 pub mod shared;
@@ -86,6 +87,9 @@ pub fn error(error: FsError) -> c_int {
         FsError::InvalidArgument => EINVAL,
         FsError::UnsupportedEncoding => EILSEQ,
         FsError::Interrupted => EINTR,
+        FsError::Again => EAGAIN,
+        FsError::Broken => EPIPE,
+        FsError::TooManyInSystem => ENFILE,
         FsError::Io => EIO,
     }
 }
@@ -225,14 +229,18 @@ fn console_read(uart: Option<u64>, buffer: &mut [u8]) -> Result<usize, i32> {
     Ok(length)
 }
 
-/// Writes `bytes` (at most the transport's extent): a point of
-/// cancellation.
+/// Writes `bytes`: to a file or the console at most the transport's
+/// extent, to a pipe all of them unless a signal or O_NONBLOCK stops it
+/// (pipes::write). EPIPE comes after SIGPIPE went to the calling thread,
+/// and its handler ran ([write]). A point of cancellation.
 pub fn write(number: c_int, bytes: &[u8]) -> Result<usize, c_int> {
     let point = threads::cancel::Point::begin();
-    let bytes = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
     let result = fd(number)
         .and_then(|fd| shared::number(Request::Write { fd, bytes }))
         .map(|n| n as usize);
+    if result == Err(EPIPE) {
+        let _ = signals::raise(SIGPIPE);
+    }
     if result.is_ok_and(|n| n > 0) {
         point.end();
     } else {
@@ -252,6 +260,48 @@ pub fn lseek(number: c_int, offset: i64, origin: c_int) -> Result<i64, c_int> {
         _ => return Err(EINVAL),
     };
     shared::number(Request::Seek { fd, offset, origin }).map(|offset| offset as i64)
+}
+
+/// pipe2 ([P24-PIPE]): a new pipe of the pipe service, its read end and
+/// its write end at the two lowest free descriptors, with O_NONBLOCK on
+/// both descriptions and FD_CLOEXEC and FD_CLOFORK as `flags` say;
+/// EINVAL for another flag, ENOSYS for a process without a session with
+/// the pipe service, ENFILE and EMFILE past the service's limits or the
+/// table's.
+pub fn pipe2(flags: c_int) -> Result<[c_int; 2], c_int> {
+    if flags & !(O_NONBLOCK | O_CLOEXEC | O_CLOFORK) != 0 {
+        return Err(EINVAL);
+    }
+    let transport = shared::with_files(|files| {
+        files.pipes().ok_or(ENOSYS)?;
+        Ok(files.transport())
+    })?;
+    let (read, write) = pipes::create(transport, flags & O_NONBLOCK != 0)?;
+    let inserted = shared::with_files(|files| {
+        files
+            .insert_pipe(read, write, descriptor_flags(flags))
+            .map_err(error)
+    });
+    match inserted {
+        Ok((read, write)) => Ok([read as c_int, write as c_int]),
+        Err(errno) => {
+            let _ = transport.release(Some(posix_fs::Target::Pipe(read)));
+            let _ = transport.release(Some(posix_fs::Target::Pipe(write)));
+            Err(errno)
+        }
+    }
+}
+
+/// F_GETFL (`set` None) or F_SETFL of `number` when it names a pipe: its
+/// flags, or 0 once set; None for a descriptor of another kind.
+pub fn pipe_status_flags(number: c_int, set: Option<c_int>) -> Result<Option<c_int>, c_int> {
+    shared::held(fd(number)?, |transport, target| match target {
+        posix_fs::Target::Pipe(end) => match set {
+            None => pipes::status_flags(transport, end).map(Some),
+            Some(flags) => pipes::set_status_flags(transport, end, flags).map(|()| Some(0)),
+        },
+        _ => Ok(None),
+    })
 }
 
 pub fn dup(number: c_int) -> Result<c_int, c_int> {

@@ -48,7 +48,9 @@ const _: () = {
 const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFCHR: u32 = 0o020_000;
+const S_IFIFO: u32 = 0o010_000;
 /// Linux's dirent64 d_type.
+const DT_FIFO: u8 = 1;
 const DT_CHR: u8 = 2;
 const DT_DIR: u8 = 4;
 const DT_REG: u8 = 8;
@@ -64,6 +66,7 @@ fn linux_stat(info: &NodeInfo) -> LinuxStat {
     let kind = match info.kind {
         1 => S_IFDIR,
         2 => S_IFREG,
+        posix_fs::FIFO => S_IFIFO,
         _ => S_IFCHR,
     };
     LinuxStat {
@@ -180,6 +183,7 @@ fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Resul
             FileKind::Directory => DT_DIR,
             FileKind::Regular => DT_REG,
             FileKind::Character => DT_CHR,
+            FileKind::Fifo => DT_FIFO,
         };
         let name = &name[..entry.name_len.min(name.len())];
         match record(&mut out[used..], entry.inode, after, kind, name) {
@@ -312,7 +316,8 @@ const F_GETFD: c_int = 1;
 const F_SETFD: c_int = 2;
 const F_GETFL: c_int = 3;
 const F_SETFL: c_int = 4;
-/// The status flags F_SETFL cannot take yet (Linux's O_APPEND, O_NONBLOCK).
+/// The status flags F_SETFL cannot take yet (Linux's O_APPEND, O_NONBLOCK)
+/// but on a pipe, whose O_NONBLOCK it sets.
 const UNSUPPORTED_STATUS: u64 = 0o2000 | 0o4000;
 const F_DUPFD_CLOEXEC: c_int = 1030;
 /// relibc's F_DUPFD_CLOFORK of stafeto (POSIX 2024; Linux has none).
@@ -332,11 +337,23 @@ const O_RDWR: c_int = 2;
 /// number from the argument), F_GETFD and F_SETFD (close-on-exec and
 /// close-on-fork), F_GETFL (the access
 /// mode by the descriptor's kind: the console's input reads, its output
-/// writes, a file of the service reads and writes as the service allows),
+/// writes, a file of the service reads and writes as the service allows,
+/// an end of a pipe reads or writes with its O_NONBLOCK),
 /// F_SETFL with no flag to change (0; O_APPEND and O_NONBLOCK are
-/// EINVAL); EINVAL for the rest.
+/// EINVAL) and O_NONBLOCK of a pipe's end (O_APPEND ignored there); EINVAL
+/// for the rest.
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_fcntl(fd: c_int, command: c_int, argument: u64) -> c_int {
+    // A pipe's status flags are its description's, in the pipe service:
+    // the request goes outside the lock of the files.
+    if command == F_GETFL || command == F_SETFL {
+        let set = (command == F_SETFL).then_some(argument as c_int);
+        match call(|| posix_abi::pipe_status_flags(fd, set)) {
+            Ok(Some(flags)) => return flags,
+            Ok(None) => {}
+            Err(errno) => return -errno,
+        }
+    }
     let result = posix_abi::shared::with_files(|files| {
         let error = posix_abi::error;
         let fd = number(fd)?;

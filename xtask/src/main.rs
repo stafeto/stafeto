@@ -2072,6 +2072,8 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: a forked child execs ls",
         "posix-procs: ash -c ran /bin/ls",
         "posix-procs: 40 forks of a parent with six threads",
+        // Pipes (5e): within a process and across fork.
+        "posix-procs: pipes within a process and across fork",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -2115,6 +2117,23 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
     (14, "OpenExec"),
     (15, "Clone"),
     (17, "ReadInto"),
+    (64, "notification"),
+];
+
+/// The kinds of the lines of the pipe service (tag 4), by the numbers of
+/// proto_pipe::Method.
+const PIPE_STEP_KINDS: [(usize, &str); 12] = [
+    (1, "Create"),
+    (2, "ReadStart"),
+    (3, "ReadTake"),
+    (4, "ReadCancel"),
+    (5, "WriteStart"),
+    (6, "WriteTake"),
+    (7, "WriteCancel"),
+    (8, "Close"),
+    (9, "Clone"),
+    (12, "Stat"),
+    (13, "Abandon"),
     (64, "notification"),
 ];
 
@@ -2222,6 +2241,7 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
+    let pipe = longest_steps(&outcome.lines, "4");
     // The loader's lines, as the services' with the tag 3.
     let loader_lines: Vec<String> = outcome
         .lines
@@ -2271,6 +2291,21 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the RAM file service: Clone took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
+    // Every step of the pipe service (5e) stays under term B: a copy of
+    // one message and up to 8 notifications, one description of a session
+    // that went, a Clone of up to 32 ends. The probe's role steppipes
+    // makes each of them at its longest.
+    for kind in [2, 3, 5, 6, 9, 64] {
+        let ticks = pipe.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "the pipe service: kind {kind} took {ticks} ticks, past {RAM_STEP_MAX} or none: {pipe:?}"
+            ));
+        }
+    }
+    if let Some(row) = pipe.iter().find(|r| r.1 > RAM_STEP_MAX) {
+        return Err(format!("the pipe service: a step past term B: {row:?}"));
+    }
     let mut text = String::from("kind method ticks detail\n");
     for (kind, ticks, detail) in &loader {
         let name = LOADER_STEP_KINDS
@@ -2287,6 +2322,13 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
         (k, name, t, d)
     }) {
         text += &format!("ramfs {kind} {name} {ticks} {detail}\n");
+    }
+    for (kind, ticks, detail) in &pipe {
+        let name = PIPE_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("pipe {kind} {name} {ticks} {detail}\n");
     }
     for (kind, ticks, detail) in &rows {
         let name = STEP_KINDS

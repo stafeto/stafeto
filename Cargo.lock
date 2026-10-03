@@ -181,6 +181,7 @@ dependencies = [
  "proto-clock",
  "proto-fs",
  "proto-loader",
+ "proto-pipe",
  "proto-process",
  "proto-uart",
  "proto-wire",
@@ -261,6 +262,7 @@ dependencies = [
  "posix-fd",
  "posix-path",
  "proto-fs",
+ "proto-pipe",
  "proto-wire",
  "rt",
 ]

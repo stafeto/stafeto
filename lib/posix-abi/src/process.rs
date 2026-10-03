@@ -529,6 +529,8 @@ impl Shadow {
                 posix_fs::Target::Output => Names::Output,
                 posix_fs::Target::Error => Names::Error,
                 posix_fs::Target::Ram(n) => Names::File(n),
+                // The ends of pipes cross spawn and exec with step 5e's T3.
+                posix_fs::Target::Pipe(_) => continue,
             };
             out[count] = Descriptor {
                 fd: fd as u32,
@@ -559,8 +561,8 @@ impl Shadow {
     fn finish(&mut self) {
         for target in self.held.iter_mut().filter_map(Option::take) {
             let release = crate::shared::with_files(|files| Ok(files.unhold(target)));
-            if let Ok(Some(posix_fs::Target::Ram(n))) = release {
-                let _ = crate::shared::release(n);
+            if let Ok(Some(target)) = release {
+                let _ = crate::shared::release_target(target);
             }
         }
         for fd in self.opened.iter_mut().filter_map(Option::take) {
@@ -1025,6 +1027,13 @@ fn move_files(c: &Handle<Channel>) {
     let Ok((files, uart)) = sessions else {
         return;
     };
+    // The new image gets a session of its own with the pipe service, which
+    // holds no end yet: this image's session lets go of its ends as it
+    // ends.
+    let pipes = crate::shared::with_files(|files| Ok(files.pipes().map(Handle::raw)))
+        .ok()
+        .flatten()
+        .and_then(|pipes| crate::fork::pipes_clone(pipes, &[]).ok());
     let mut w = Writer::new();
     if Method::Handles.header().write(&mut w).is_err() {
         return;
@@ -1041,6 +1050,11 @@ fn move_files(c: &Handle<Channel>) {
             // The handle moves: this image's owner never uses it again.
             let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
         }
+    }
+    if let Some(pipes) = pipes
+        && w.u32(Slot::Pipes as u32).is_ok()
+    {
+        let _ = handles.push(pipes.erase());
     }
     let _ = ask_loader(c, &w, Some(handles));
 }
@@ -1126,6 +1140,12 @@ fn commit(
         ),
         None => None,
     };
+    // A session of its own with the pipe service, which holds no end yet:
+    // the ends of pipes cross spawn with step 5e's T3.
+    let pipes = match crate::shared::with_files(|fs| Ok(fs.pipes().map(Handle::raw)))? {
+        Some(pipes) => Some(crate::fork::pipes_clone(pipes, &[])?),
+        None => None,
+    };
     let mut w = Writer::new();
     Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
     let mut handles = rt::handle::Outgoing::new();
@@ -1133,6 +1153,7 @@ fn commit(
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
         (Slot::Uart, uart),
+        (Slot::Pipes, pipes),
     ] {
         if let Some(session) = session {
             w.u32(slot as u32).map_err(|_| EIO)?;

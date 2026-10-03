@@ -18,7 +18,7 @@
 //!   stack and start area, all paid by the new process; reply 0 for "the
 //!   image is ready", or one of the codes below.
 //! - Handles: body the slot of each handle u32 (`Slot::Files`, `Clock`,
-//!   `Uart`, each once) and as many handles, sessions with SEND, after
+//!   `Uart`, `Pipes`, each once) and as many handles, sessions with SEND, after
 //!   "the image is ready" (after Fork for a copy); reply its status.
 //! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
 //!   the parent's memory the loader makes for a `fork`; reply its status,
@@ -201,7 +201,8 @@ pub const IO: u32 = 607;
 pub const NOT_DIRECTORY: u32 = 608;
 
 /// The handles of the start area, by their place in `Start::handles`; the
-/// sessions the parent gives with Handles are Files, Clock and Uart.
+/// sessions the parent gives with Handles are Files, Clock, Uart and
+/// Pipes (5e).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Slot {
@@ -213,18 +214,20 @@ pub enum Slot {
     Clock = 5,
     Uart = 6,
     Console = 7,
+    Pipes = 8,
 }
 
 /// The handles a start area names.
-pub const SLOTS: usize = 8;
+pub const SLOTS: usize = 9;
 
 impl Slot {
-    /// The slot of a handle Handles brings: Files, Clock or Uart.
+    /// The slot of a handle Handles brings: Files, Clock, Uart or Pipes.
     pub const fn given(n: u32) -> Option<Slot> {
         match n {
             4 => Some(Slot::Files),
             5 => Some(Slot::Clock),
             6 => Some(Slot::Uart),
+            8 => Some(Slot::Pipes),
             _ => None,
         }
     }
@@ -570,16 +573,18 @@ pub struct Start {
     pub timers: u64,
     pub alarm: u64,
     pub map: u64,
+    /// Zero: the initial stack after the header stays on 16 bytes.
+    pub reserved: u64,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 2;
+pub const START_VERSION: u32 = 3;
 pub const SECURE: u32 = 1;
 /// The pairs of the auxiliary vector the start may fill.
 pub const AUXV_PAIRS: usize = 8;
 /// The bytes of the header.
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
-const _: () = assert!(START_SIZE == 160);
+const _: () = assert!(START_SIZE == 176);
 
 /// The entries of the memory map the loader hands over at most: the three
 /// segments of a program, its stack and the start area itself.
@@ -716,6 +721,7 @@ pub fn write_area(
         timers: block.carried.timers,
         alarm: block.carried.alarm,
         map: at + maps_at as u64,
+        reserved: 0,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -1127,8 +1133,8 @@ mod tests {
         assert_eq!(read.full_path(&mut path), Err(BlockError::NameTooLong));
     }
 
-    /// Handles takes Files, Clock and Uart, each once, four handles at
-    /// most: a fifth, a slot twice, another slot are refused.
+    /// Handles takes Files, Clock, Uart and Pipes, each once, four handles
+    /// at most: a fifth, a slot twice, another slot are refused.
     #[test]
     fn handles_name_given_slots_once() {
         let body = |slots: &[u32]| {
@@ -1143,8 +1149,19 @@ mod tests {
             handle_slots(Reader::new(w.as_bytes()), 3),
             Ok([Some(Slot::Files), Some(Slot::Clock), Some(Slot::Uart), None])
         );
+        let w = body(&[8, 4, 5, 6]);
+        assert_eq!(
+            handle_slots(Reader::new(w.as_bytes()), 4),
+            Ok([
+                Some(Slot::Pipes),
+                Some(Slot::Files),
+                Some(Slot::Clock),
+                Some(Slot::Uart)
+            ])
+        );
         for (slots, count) in [
-            (&[4, 5, 6, 4, 5][..], 5),
+            (&[4, 5, 6, 8, 5][..], 5),
+            (&[8, 8][..], 2),
             (&[4, 4][..], 2),
             (&[2][..], 1),
             (&[7][..], 1),
@@ -1224,7 +1241,7 @@ mod tests {
             let read = Block::read(&out[..len]).unwrap();
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
-            let handles = [1, 2, 3, 4, 5, 6, 0, 8];
+            let handles = [1, 2, 3, 4, 5, 6, 0, 8, 9];
             write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
             assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
@@ -1627,7 +1644,7 @@ mod tests {
                 handle: 100 + i,
             })
             .collect();
-        let handles = [1, 2, 3, 4, 5, 0, 7, 8];
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8, 9];
         let mut out = vec![0xAA; TRANSFER_SIZE];
         write_transfer(&mut out, handles, &map).unwrap();
         let t = Transfer::read(&out).unwrap();

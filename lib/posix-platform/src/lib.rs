@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 11;
+pub const PLATFORM_INTERFACE: u64 = 12;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -129,6 +129,7 @@ const O_LARGEFILE: c_int = 0o400000;
 const O_CLOEXEC: c_int = 0o2000000;
 /// relibc's O_CLOFORK of stafeto (POSIX 2024; Linux has none).
 const O_CLOFORK: c_int = 0o1_0000_0000;
+const O_NONBLOCK: c_int = 0o4000;
 
 /// Opens `path`, relative to the current directory or absolute (any
 /// `dirfd` then). The layer opens files of the RAM file service: the
@@ -190,6 +191,42 @@ pub unsafe extern "C" fn stafeto_openat(
 fn is_directory(name: &[u8]) -> bool {
     call(|| posix_abi::open(name, posix_abi::constants::O_DIRECTORY).and_then(posix_abi::close))
         .is_ok()
+}
+
+/// pipe2: the read end into `fds[0]` and the write end into `fds[1]`
+/// (posix_abi::pipe2: O_NONBLOCK, O_CLOEXEC and O_CLOFORK).
+///
+/// # Safety
+/// `fds` is writable for two ints.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_pipe2(fds: *mut c_int, flags: c_int) -> c_int {
+    if fds.is_null() {
+        return -EFAULT;
+    }
+    let mut ours = 0;
+    for (theirs, layer) in [
+        (O_CLOEXEC, posix_abi::constants::O_CLOEXEC),
+        (O_CLOFORK, posix_abi::constants::O_CLOFORK),
+        (O_NONBLOCK, posix_abi::constants::O_NONBLOCK),
+    ] {
+        if flags & theirs != 0 {
+            ours |= layer;
+        }
+    }
+    if flags & !(O_CLOEXEC | O_CLOFORK | O_NONBLOCK) != 0 {
+        return -EINVAL;
+    }
+    match call(|| posix_abi::pipe2(ours)) {
+        Ok(ends) => {
+            // SAFETY: the caller's promise.
+            unsafe {
+                fds.write(ends[0]);
+                fds.add(1).write(ends[1]);
+            }
+            0
+        }
+        Err(errno) => -errno,
+    }
 }
 
 #[unsafe(no_mangle)]

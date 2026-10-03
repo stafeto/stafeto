@@ -265,7 +265,7 @@ pub const POSIX_PROCS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix"],
         root: true,
         // A child from a file gets its parent's quota: room for BusyBox.
         quota: PROCS_QUOTA,
@@ -296,7 +296,7 @@ pub const POSIX_STEPS_TABLE: &[Record] = &[
         name: "posix-procs",
         program: "posix-procs",
         args: b"posix-procs\0steps\0",
-        connects: &["ramfs", "clock", "posix"],
+        connects: &["ramfs", "pipe", "clock", "posix"],
         root: true,
         quota: STEPS_QUOTA,
         ..POSIX
