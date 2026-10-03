@@ -52,14 +52,17 @@ use kcore::notify::Slot;
 use kcore::paging::Attrs;
 use kcore::process::Life;
 use kcore::quota::Account;
-use kcore::sched::{ReadyQueue, Scheduler};
+use kcore::sched::{ParkedList, ReadyQueue, Scheduler};
 use kcore::slab::{PageLog, PaidPages, Pool};
 use kcore::sync::Lock;
 
+pub(crate) mod control;
 mod maps;
 mod table;
 mod teardown;
 
+pub(crate) use control::unlist as unlist_parked;
+pub use control::{control, park_if_suspended, park_selected};
 #[cfg(feature = "icount")]
 pub use maps::EXEC_PORTION;
 #[cfg(feature = "ktest")]
@@ -145,6 +148,12 @@ pub struct Process {
     threads: Option<NonNull<Thread>>,
     /// Threads in `threads`, at most abi::MAX_THREADS.
     thread_count: u32,
+    /// Guarded by the scheduler lock; tested before every EL0 return.
+    suspended: bool,
+    /// Parked threads use their scheduler links, with changing levels.
+    parked: ParkedList<Thread>,
+    /// Nonzero while a continuation owns the cleanup item and a reference.
+    resume_level: u8,
     /// The process that made it (process_create, `create_child`), whose
     /// shell it holds until its own shell goes (`shell_refs`) and which its
     /// quota came from; None for init and the other processes `create`
@@ -321,6 +330,9 @@ fn create(
         life: Life::new(),
         threads: None,
         thread_count: 0,
+        suspended: false,
+        parked: ParkedList::new(),
+        resume_level: 0,
         parent: None,
         children: None,
         child_siblings: None,

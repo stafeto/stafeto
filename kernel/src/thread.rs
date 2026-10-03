@@ -718,6 +718,7 @@ pub fn info(thread: NonNull<Thread>) -> ThreadInfo {
                 Wait::Reply(_) => ThreadState::AwaitingReply,
             },
             State::Dead => ThreadState::Ended,
+            State::Parked => ThreadState::Parked,
         };
         ThreadInfo {
             state,
@@ -777,6 +778,9 @@ pub fn current() -> Option<NonNull<Thread>> {
 /// entry, and no value on the caller's stack is ever dropped, so the caller
 /// holds none with a `Drop`: no lock guard, `AddressSpace` or the like.
 pub fn run(next: NonNull<Thread>) -> ! {
+    if process::park_if_suspended(next) {
+        sched::resume();
+    }
     let prev = current();
     #[cfg(feature = "trace")]
     if prev != Some(next) {

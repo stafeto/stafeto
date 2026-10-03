@@ -14,6 +14,8 @@
 .equ SVC_SLOW, 0xFF03                   // ktest::el0::SVC_SLOW
 .equ SVC_RELEASE, 0xFF04                // ktest::el0::SVC_RELEASE
 .equ SVC_PENDING, 0xFF05                // ktest::el0::SVC_PENDING
+.equ SVC_SUSPEND_SEND, 0xFF07
+.equ SVC_CONTINUE_CROWD, 0xFF08
 .equ SVC_PEND, 0xFF06                   // ktest::el0::SVC_PEND
 .equ CALL_HANDLE_CLOSE, 1               // abi::Call::HandleClose
 .equ CALL_SEND, 4                       // abi::Call::Send
@@ -779,6 +781,18 @@ el0_receive_then_count:
 .global el0_pend
 el0_pend:
     svc     #SVC_PEND
+    svc     #SVC_DONE
+
+// Send after the test suspends the waiting receiver.
+.global el0_suspend_send
+el0_suspend_send:
+    svc     #SVC_SUSPEND_SEND
+    svc     #SVC_DONE
+
+// Continue a completely parked crowd, then check its EL0 thread exits.
+.global el0_continue_crowd
+el0_continue_crowd:
+    svc     #SVC_CONTINUE_CROWD
     svc     #SVC_DONE
 
 el0_programs_end:

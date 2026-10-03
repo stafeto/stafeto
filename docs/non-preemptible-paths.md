@@ -362,7 +362,7 @@ window that goes.
 | a chunk of the Replies stage (`process::clean`, `wake_clients`) | up to 32 clients of the top level of the queue of requests the process's threads accepted, under one hold of the scheduler's lock: each leaves the queue and gets `PEER_CLOSED` in `x0`, and goes to the tail of its level with a new quantum; with clients left, the process goes to the head of the higher of R and their new top level, otherwise on to the Children stage at the head of level R; with no client, one chunk that only moves on. The stage stands at the higher of R and the top client | up to 32 clients at O(1) each | 2,686 (test build): 32 clients |
 | a chunk of the Children stage (`process::clean`) | the first child in the list, terminated by the Stop stage: the process goes to the head of level R, and the child to the head of its stage's level right before it (`process::hasten`) | constant: an insertion at the head and a raise |  |
 | `process::hasten` (the Children stage, `process_kill` of a terminated process) | R grows to the level of the call; a process in its stages goes to the head of its stage's level (`cleanup::raise`); a shell has nothing to raise | constant: a removal from a list and an insertion at the head |  |
-| a chunk of the Handles stage (`process::clean`) | `HandleTable::release_step`: one table chunk; each entry's object is released in O(1): the last copy of a session posts `CLIENT_GONE` as `notify` does, and the last handle with `RECEIVE` closes its channel; the chunk directory goes with the last chunk | up to 64 entries, each no costlier than `notify` | 20,536 (test build, `session_handles`): 64 last copies of sessions, each `CLIENT_GONE` waking a receiver of its own channel; 19,960 after stage 1.3 by the out-of-tree measurement after stage 1.3; 8,166 when nobody waits |
+| a chunk of the Handles stage (`process::clean`) | `HandleTable::release_step`: one table chunk; each entry's object is released in O(1): the last copy of a session posts `CLIENT_GONE` as `notify` does, and the last handle with `RECEIVE` closes its channel; the chunk directory goes with the last chunk | up to 64 entries, each no costlier than `notify` | 20,538 (test build, `session_handles`, since process suspension): 64 last copies of sessions, each `CLIENT_GONE` waking a receiver of its own channel; 19,960 after stage 1.3 by the out-of-tree measurement after stage 1.3; 8,166 when nobody waits |
 | a chunk of the Space stage (`process::clean`) | the first chunk takes the space away from the process and does `AddressSpace::retire`; each following one does `SpaceRelease::step` | see the `AddressSpace::retire` row | 4,264 (test build): a step |
 | a chunk of the Buffers stage (`process::clean`) | returns the message-buffer frames of threads stopped by termination, releases the handles of the requests of those that waited in `send`, up to 4 each, as `handle_close` does (the last copy of a session posts `CLIENT_GONE` as `notify` does), and what a long call a thread was making held: the object of a `mem_create`, whose last reference puts it on the cleanup queue, or a mapping a change left midway, which keeps what its chunks did; and removes the threads from the process's list; 64 units of work a chunk, a frame two and each handle or object one more, a thread going into a chunk only when its units fit, so the frames of 32 threads with no handles take one chunk | up to 32 frames, each through merging free blocks in `FRAMES` up to the highest order and returning the frame to the quota, and with handles up to 64 units, since a thread goes into a chunk only when its units fit, each handle no costlier than `notify`: under -icount within 3 % of a Handles chunk of 64 last copies of sessions, the longest teardown chunk measured; the first measurement on hardware should record which stage set the longest time (the `KERNEL_STATS` kind in `x5`), so the limit of 64 units in Buffers is tuned separately from the handle-table chunk size | 19,354 (test build): 32 frames, each merging up to the highest order; 20,079 (test build, `session_buffers`): 11 frames, each merging up to the highest order, and 42 handles, each the last copy of a session whose `CLIENT_GONE` wakes a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3) |
 | a chunk of the Mappings stage (`process::clean`, `maps::release_all`) | every mapping of the process's table, busy or not, leaves it and releases its memory object, whose last reference puts it on the cleanup queue; the paid table page stays in the page log until shell cleanup | up to 128 mappings at O(1) each | 4,221 (test build): 64 mappings, 62 of them the last references to their objects |
@@ -419,7 +419,46 @@ window that goes.
 | the last reference to a binding (`irq::release`: the last handle, or `receive` or the Close stage that took its slot) | puts the binding at the tail of the cleanup queue at the level of the cause | constant |  |
 | a binding chunk (`irq::clean`) | returns its slot to the channel's limit and its place to its payer's pool of bindings (nothing goes back to the quota), and releases the references to the channel and to the payer's shell | constant | 252 (test build) |
 | a teardown that a thread at a high level starts (`process_kill`, the last handle to a big process or to a channel with many waiters) | runs at the level of its cause (spec 7.7), the Close and Replies stages at the higher of the cause and their top waiter: the chunks of the whole teardown follow one another at that level, with interrupt polls between them, and no thread at or below that level runs until they end | each chunk as in its row; in all, the sum of the object's chunks | no single number since stage 3, which took the end into chunks: the call part, 350 (`end_call`), then the Threads chunks at S, the longest 13,213 (`threads_ready`), then the chunks of the later stages, each at most B (the rows above); in stage 1.3c, when the call stopped the threads, `process_kill` of a child with 64 threads that never ran took 42,961 with its whole teardown; closing a channel with 60 waiting receivers is no single path: two chunks of the Close stage at their level, the longer 3,844 (test build), then each of the 60 receivers it wakes runs above the closer and exits on its own, about 1,100 instructions each |
-| B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 20,536 under -icount (test build) after stage 3: a Handles chunk of 64 last copies of sessions each waking a receiver (42,539 after the cleanup of audit 3, the end of a process with 128 threads waiting in `send` through the last copies of sessions, until the Threads stage took that end into chunks); of the chunks, 20,536, a Handles chunk of 64 last copies of sessions each waking a receiver, then 20,079, a Buffers chunk whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3), and 19,354, a Buffers chunk of 32 frames; printing costs nothing there; B does not grow with the number of timers, bindings, slots or threads of an ending process; the longest Threads chunk is 13,213; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 13,276 since the timer heap of 8,192 timers (depth 13), stays below it |
+| B, the blocking time of any thread, level 63 included (spec 15.3) | the longest row above, which a pending interrupt waits for; firings of timers are chunks of their levels, and no series of them blocks a higher level | the longest row | 20,538 under -icount (test build) since process suspension (20,536 after stage 3): a Handles chunk of 64 last copies of sessions each waking a receiver (42,539 after the cleanup of audit 3, the end of a process with 128 threads waiting in `send` through the last copies of sessions, until the Threads stage took that end into chunks); of the chunks, 20,536, a Handles chunk of 64 last copies of sessions each waking a receiver, then 20,079, a Buffers chunk whose 11 frames each merge up to the highest order and whose 42 handles each wake a receiver (20,069 after stage 1.3 by the out-of-tree measurement after stage 1.3), and 19,354, a Buffers chunk of 32 frames; printing costs nothing there; B does not grow with the number of timers, bindings, slots or threads of an ending process; the longest Threads chunk is 13,213; on hardware `debug_write` and the fault line are longer (their rows); a chunk of firings, 13,276 since the timer heap of 8,192 timers (depth 13), stays below it |
+
+## Process suspension
+
+`process_control` (call 36, MANAGE) sets or clears the process flag in O(1).
+Every selected suspended thread parks before EL0, including fast `send`;
+the exit loop polls interrupts again after that single thread. A continuation
+uses the process's cleanup item and returns at most 64 parked threads to
+the tails of their current levels with fresh quanta. A new stop cancels the
+queued work, and process termination gives the same item to the Threads stage.
+The scheduler link holds the parked ring; priority changes and IPC inheritance
+change its level while it stays in that ring. No new object is allocated.
+
+The 128-thread measurement uses 64 threads per portion over all 63 legal
+levels, with one repeat. `kernel-test 512M icount` measures the scoped
+components below. The control scopes call `process::control` directly and
+exclude syscall validation, exception entry and EL0 return. The parking
+scope locks the scheduler, calls `pick` and then `park_selected`; the
+surrounding exit-loop poll and decision setup are excluded. The first
+stop has no queued continuation. A separate stop cancels the remaining
+queued portion and releases its process reference.
+
+The continuation stays below B=20,538. The previous B=20,536 grew by two
+instructions in the Handles chunk when the process-cleanup dispatch
+acquired its continuation case. The process shell is 1264 bytes and keeps
+three slots per pool page. The normal build reports null=262, clock=315,
+yield=380, notify=1018, round_trip=2004 ticks in `init-test 512M icount`
+after the EL0 gate. The base commit reports 254, 310, 375, 1010 and 1993;
+the increases are 8, 5, 5, 8 and 11 ticks, respectively.
+
+| Operation | Measured scope | Instructions under -icount |
+|---|---|---|
+| first stop, 128 threads | internal `process::control`, no queued continuation | 33 |
+| stop with a queued continuation | internal `process::control`, item removal and queue reference release | 99 |
+| select and park one suspended thread | locked `pick` + `park_selected` test scope | 80 |
+| continue, 128 threads | internal `process::control`, flag write and enqueue | 96 |
+| continuation portion | `cleanup::portion`, 64 removals and ready inserts over levels 1–63 | 3731 |
+
+These readings cover the specified test scopes. The complete exception
+entry, syscall or exit-loop interval requires its own measurement boundaries.
 
 ## Steps of the process service
 
