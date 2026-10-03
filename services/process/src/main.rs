@@ -24,14 +24,14 @@ use core::cell::UnsafeCell;
 use posix_process_service::loaders::{self, LOADERS, Loaders, Stage};
 use posix_process_service::queue::Queue;
 use posix_process_service::records::{self, Exit, GroupError, Join, Record, Records, State};
-use posix_process_service::signals::{self, Info, Posted};
+use posix_process_service::signals::{self, Info, PageStart, Posted};
 use posix_process_service::waits::{WAITS_OF_RECORD, Wait, Waits};
 use posix_process_service::walk::{self, Step, Target, Walk};
 use proto_process::{
-    CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, INIT_PID, Label, LoaderOf, Method,
-    PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_USER, SIGCHLD, SIGKILL, SIGNAL_MAX,
-    SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG, WNOWAIT,
-    WSTOPPED, WaitResult, WaitStart,
+    CLD_EXITED, CLD_KILLED, Change, Create, Credentials, End, ForkStart, INIT_PID, Label, LoaderOf,
+    Method, PAGE_CHLD_IGNORED, PAGE_NOCLDWAIT, Place, RECORDS, SI_USER, SIGCHLD, SIGKILL,
+    SIGNAL_MAX, SIGSTOP, SPAWN_FLAGS, Selector, SetId, SpawnStart, WCONTINUED, WEXITED, WNOHANG,
+    WNOWAIT, WSTOPPED, WaitResult, WaitStart,
 };
 use proto_wire::{Status, Writer, long};
 use rt::{
@@ -107,6 +107,18 @@ struct Held {
     start: Option<Pending>,
     /// The new process of an exec, which ExecCommit gives the record.
     incoming: Option<Handle<Process>>,
+    /// The load is a copy of ForkStart: only ForkCommit and ForkAbort
+    /// take it.
+    fork: bool,
+}
+/// What a child of SpawnStart or ForkStart starts with: its spawn-flags
+/// and group, the level of its loader, its credentials and its page.
+struct Birth {
+    flags: u32,
+    pgroup: u32,
+    level: u8,
+    credentials: Credentials,
+    page: PageStart,
 }
 /// What one delivery of a signal to one process came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1113,11 +1125,8 @@ fn free_quota() -> u64 {
 }
 impl Processes {
     /// SpawnStart of the record in `index` (5c, spec 2, 3.2): a child from
-    /// a file. The record of the child (LOADING, as Create makes it), its
-    /// process with the parent's quota, room for handles and ceiling, the
-    /// loader's session in its entry 0, the loader mapped and its thread
-    /// started at the caller's level; the reply waits for Boot. O(1) but
-    /// for the copy of the loader's data, a page.
+    /// a file (`start_child`), with the credentials of an exec and the
+    /// mask and signals SpawnStart names.
     fn spawn_start(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let Ok(start) = SpawnStart::read(r.body()) else {
             return Answer::Status(Status::BadSize);
@@ -1128,6 +1137,57 @@ impl Processes {
         if start.flags & !SPAWN_FLAGS != 0 {
             return refuse(proto_process::INVALID);
         }
+        let parent = self.records.get(index).expect("the caller");
+        let birth = Birth {
+            flags: start.flags,
+            pgroup: start.pgroup,
+            level: start.level,
+            credentials: loaders::child_credentials(parent.credentials, start.flags),
+            page: PageStart::Spawn {
+                mask: start.mask,
+                default: start.default,
+            },
+        };
+        self.start_child(index, birth, r)
+    }
+
+    /// ForkStart of the record in `index` (5d, spec 2, 3.2): a child whose
+    /// loader copies the caller's memory (`start_child`), in the caller's
+    /// group and session with the caller's credentials, its page with the
+    /// classes of the caller's actions before any walk may find it.
+    fn fork_start(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+        let Ok(start) = ForkStart::read(r.body()) else {
+            return Answer::Status(Status::BadSize);
+        };
+        if !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        let parent = self.records.get(index).expect("the caller");
+        let birth = Birth {
+            flags: 0,
+            pgroup: 0,
+            level: start.level,
+            credentials: parent.credentials,
+            page: PageStart::Fork {
+                ignored: start.ignored,
+                caught: start.caught,
+                flags: start.flags,
+            },
+        };
+        self.start_child(index, birth, r)
+    }
+
+    /// The child of SpawnStart or ForkStart of the record in `index`: its
+    /// record (LOADING, as Create makes it), its process with the parent's
+    /// quota, room for handles and ceiling, the loader's session in its
+    /// entry 0, its page as `birth` says before the record is a target of
+    /// a walk, the loader mapped and its thread started at the caller's
+    /// level; the reply waits for Boot. AGAIN while a load of the record
+    /// waits, past CHILDREN_MAX children or the 16 places of loaders;
+    /// PERMISSION for a group setpgid would refuse; NOT_FOUND without a
+    /// loader or a session of the loaders; NO_MEMORY past the pool. O(1)
+    /// but for the copy of the loader's data, a page.
+    fn start_child(&mut self, index: usize, birth: Birth, r: &mut Request<'_>) -> Answer {
         // A RAM file service that started again closed the session of
         // the loaders: the service asks init for the new one (init answers
         // once the service registered).
@@ -1150,7 +1210,7 @@ impl Processes {
         };
         let Some(join) = self
             .records
-            .joining(index, start.flags, start.pgroup, label.pid())
+            .joining(index, birth.flags, birth.pgroup, label.pid())
         else {
             return refuse(proto_process::PERMISSION);
         };
@@ -1159,11 +1219,10 @@ impl Processes {
             quota: parent.quota,
             handle_limit: parent.handle_limit,
             ceiling: parent.ceiling,
-            priority: start.level.clamp(1, parent.ceiling),
+            priority: birth.level.clamp(1, parent.ceiling),
             root: false,
             ticket: 0,
         };
-        let credentials = loaders::child_credentials(parent.credentials, start.flags);
         // The child's quota comes from the service's: the pool, past which
         // the service keeps a reserve for its own records and loaders.
         if !loaders::pool_allows(free_quota(), create.quota) {
@@ -1196,7 +1255,7 @@ impl Processes {
             label,
             process,
             Some(index),
-            credentials,
+            birth.credentials,
             create.ceiling,
             join,
         );
@@ -1210,16 +1269,10 @@ impl Processes {
         let paged = self
             .pages
             .give(&make::own(), child, &record.process, identity);
-        // The child's main thread starts with the mask SpawnStart names;
-        // the parent's SIG_IGN pass but those POSIX_SPAWN_SETSIGDEF sets
-        // to the default ([P24-SPAWN]).
         if let (Ok(()), Some(page), Some(from)) =
             (&paged, self.pages.page(child), self.pages.page(index))
         {
-            use core::sync::atomic::Ordering::{Acquire, Release};
-            page.start_mask.store(start.mask, Release);
-            let ignored = from.ignored.load(Acquire) & !start.default;
-            page.ignored.store(ignored, Release);
+            birth.page.write(page, from);
         }
         if paged.is_ok() {
             self.signal_newborn(child);
@@ -1244,6 +1297,7 @@ impl Processes {
             ready: None,
             start: Some(pending),
             incoming: None,
+            fork: matches!(birth.page, PageStart::Fork { .. }),
         };
         let Some(slot) = self.loaders.take(child, index, proto_process::IMAGE, held) else {
             let _ = sys::process_kill(&record.process);
@@ -1339,6 +1393,7 @@ impl Processes {
             ready: None,
             start: Some(pending),
             incoming: Some(process),
+            fork: false,
         };
         if self.loaders.take(index, index, image, held).is_none() {
             return Answer::Deferred;
@@ -1698,8 +1753,8 @@ impl Processes {
     }
 
     /// The LOADING child of the record in `parent` whose PID the body
-    /// names.
-    fn loading_child(&self, parent: usize, r: &Request<'_>) -> Option<usize> {
+    /// names, a child of ForkStart for `fork` and of SpawnStart otherwise.
+    fn loading_child(&self, parent: usize, r: &Request<'_>, fork: bool) -> Option<usize> {
         let mut body = r.body();
         let pid = body.u32().ok()?;
         body.finish().ok()?;
@@ -1707,6 +1762,11 @@ impl Processes {
             self.records
                 .get(c)
                 .is_some_and(|c| c.state == State::Loading && c.parent_index == Some(parent as u16))
+                && self
+                    .loaders
+                    .of(c)
+                    .and_then(|slot| self.loaders.get(slot))
+                    .is_some_and(|p| p.held.fork == fork)
         })
     }
 
@@ -1715,8 +1775,10 @@ impl Processes {
     /// the record is ready. BAD_STATE until the loader said its image is
     /// ready (Ready): a parent that commits before, or after a failed
     /// load, gets no child that waits for a block.
-    fn spawn_commit(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
-        let Some(child) = self.loading_child(index, r) else {
+    /// ForkCommit (`fork`) takes a child of ForkStart alone, SpawnCommit
+    /// one of SpawnStart.
+    fn spawn_commit(&mut self, index: usize, r: &mut Request<'_>, fork: bool) -> Answer {
+        let Some(child) = self.loading_child(index, r, fork) else {
             return refuse(proto_process::NO_PROCESS);
         };
         let Ok(set_id) = self.loaders.commit(child) else {
@@ -1742,8 +1804,10 @@ impl Processes {
 
     /// SpawnAbort of the record in `index`: its LOADING child is killed,
     /// and the SetId of its loader's place goes with the place at once.
-    fn spawn_abort(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
-        let Some(child) = self.loading_child(index, r) else {
+    /// ForkAbort (`fork`) takes a child of ForkStart alone, SpawnAbort one
+    /// of SpawnStart.
+    fn spawn_abort(&mut self, index: usize, r: &mut Request<'_>, fork: bool) -> Answer {
+        let Some(child) = self.loading_child(index, r, fork) else {
             return refuse(proto_process::NO_PROCESS);
         };
         self.abort_load(child, Status::from_code(proto_process::AGAIN));
@@ -1861,8 +1925,11 @@ impl Service<0> for Processes {
                 Answer::Status(status(result))
             }
             n if n == Method::SpawnStart as u16 => self.spawn_start(index, r),
-            n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r),
-            n if n == Method::SpawnAbort as u16 => self.spawn_abort(index, r),
+            n if n == Method::SpawnCommit as u16 => self.spawn_commit(index, r, false),
+            n if n == Method::SpawnAbort as u16 => self.spawn_abort(index, r, false),
+            n if n == Method::ForkStart as u16 => self.fork_start(index, r),
+            n if n == Method::ForkCommit as u16 => self.spawn_commit(index, r, true),
+            n if n == Method::ForkAbort as u16 => self.spawn_abort(index, r, true),
             n if n == Method::ExecStart as u16 => self.exec_start(index, r),
             n if n == Method::ExecCommit as u16 => self.exec_commit(index, r),
             n if n == Method::ExecAbort as u16 => self.exec_abort(index, r),

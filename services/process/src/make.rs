@@ -254,7 +254,8 @@ pub unsafe fn make(
             &program,
             window,
             create.priority,
-            abi::Policy::Fifo,
+            // The program's first thread: SCHED_OTHER, round robin (spec 2).
+            abi::Policy::RoundRobin,
         )
     };
     let _ = sys::thread_set_priority(thread, self::level(), abi::Policy::Fifo);

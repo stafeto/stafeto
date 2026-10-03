@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 10;
+pub const PLATFORM_INTERFACE: u64 = 11;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -127,6 +127,8 @@ const O_DIRECTORY: c_int = 0o40000;
 const O_NOFOLLOW: c_int = 0o100000;
 const O_LARGEFILE: c_int = 0o400000;
 const O_CLOEXEC: c_int = 0o2000000;
+/// relibc's O_CLOFORK of stafeto (POSIX 2024; Linux has none).
+const O_CLOFORK: c_int = 0o1_0000_0000;
 
 /// Opens `path`, relative to the current directory or absolute (any
 /// `dirfd` then). The layer opens files of the RAM file service: the
@@ -147,7 +149,8 @@ pub unsafe extern "C" fn stafeto_openat(
     flags: c_int,
     _mode: u32,
 ) -> c_int {
-    let known = O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC;
+    let known =
+        O_ACCMODE | O_NOCTTY | O_DIRECTORY | O_NOFOLLOW | O_LARGEFILE | O_CLOEXEC | O_CLOFORK;
     let changes = O_CREAT | O_TRUNC | O_APPEND;
     // SAFETY: the caller's promise.
     let absolute = !path.is_null() && unsafe { *path } == b'/' as c_char;
@@ -176,6 +179,9 @@ pub unsafe extern "C" fn stafeto_openat(
     }
     if flags & O_CLOEXEC != 0 {
         ours |= posix_abi::constants::O_CLOEXEC;
+    }
+    if flags & O_CLOFORK != 0 {
+        ours |= posix_abi::constants::O_CLOFORK;
     }
     value(call(|| posix_abi::open(name, ours)).map(i64::from)) as c_int
 }
@@ -507,6 +513,19 @@ pub unsafe extern "C" fn stafeto_exec(
     }
 }
 
+/// fork (posix_abi::fork::fork): the child's PID in the parent, 0 in the
+/// child, or the negated errno. The window a probe set
+/// (`stafeto_probe_fork_window`) runs in the parent before ForkCommit.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_fork() -> c_int {
+    let set = FORK_WINDOW.load(core::sync::atomic::Ordering::Acquire) != 0;
+    let window = set.then_some(fork_window as fn());
+    match call(|| posix_abi::fork::fork(window)) {
+        Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
+}
+
 /// The probes of the window of exec (posix_abi::process): ExecCommit
 /// with no exec gives its errno; an exec whose old image ends with `code`
 /// before ExecCommit (by its own SIGKILL for 137) returns only on an
@@ -611,6 +630,192 @@ pub unsafe extern "C" fn stafeto_probe_open_exec(path: *const c_char) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn stafeto_probe_decoy(on: c_int) {
     posix_abi::process::probe_decoy(on != 0);
+}
+
+/// The C function a probe of fork runs in the parent between Go and
+/// ForkCommit (`stafeto_probe_fork_bare`), 0 for none.
+static FORK_WINDOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn fork_window() {
+    let hook = FORK_WINDOW.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `stafeto_probe_fork_bare` stores a value, a C
+        // function of no arguments.
+        let hook: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
+/// A bare fork for the probes of 5d (posix_abi::fork::probe_bare): the
+/// child runs `child(arg)` on its copy with nothing of the layer bound,
+/// and exits with its value; `window`, when given, runs in the parent
+/// once the copy is ready, before ForkCommit. The child's PID, or the
+/// negated errno.
+///
+/// # Safety
+/// `child` touches memory alone, and calls nothing of the layer but the
+/// probes that say so; `window` is a C function of no arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_fork_bare(
+    child: extern "C" fn(*mut c_void) -> c_int,
+    arg: *mut c_void,
+    window: Option<extern "C" fn()>,
+) -> c_int {
+    FORK_WINDOW.store(
+        window.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+    let hook: Option<fn()> = window.map(|_| fork_window as fn());
+    match call(|| posix_abi::fork::probe_bare(|| child(arg), hook)) {
+        Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
+}
+
+/// The C function the next forks run in the parent between Go and
+/// ForkCommit (`stafeto_fork`), None for none: for the probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_fork_window(window: Option<extern "C" fn()>) {
+    FORK_WINDOW.store(
+        window.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The C function an early window of the next fork runs
+/// (posix_abi::fork::probe_early_window), once the loader took the first
+/// message of Regions.
+static EARLY_WINDOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn early_window() {
+    let hook = EARLY_WINDOW.load(core::sync::atomic::Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `stafeto_probe_fork_early` stores a value, a C
+        // function of no arguments.
+        let hook: extern "C" fn() = unsafe { core::mem::transmute::<usize, extern "C" fn()>(hook) };
+        hook();
+    }
+}
+
+/// The C function the next fork runs in the parent once its loader took
+/// the first message of Regions, for the probes.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_fork_early(window: Option<extern "C" fn()>) {
+    EARLY_WINDOW.store(
+        window.map_or(0, |f| f as usize),
+        core::sync::atomic::Ordering::Release,
+    );
+    posix_abi::fork::probe_early_window(window.map(|_| early_window as fn()));
+}
+
+/// A word of the process's page (proto_process::Page): 0 the pending
+/// signals, 1 those it ignores, 2 those it catches, 3 its flags of
+/// SIGCHLD. A bare child may call it.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_page(word: c_int) -> u64 {
+    use core::sync::atomic::Ordering::Acquire;
+    let page = posix_abi::process::page();
+    match word {
+        0 => page.pending.load(Acquire),
+        1 => page.ignored.load(Acquire),
+        2 => page.caught.load(Acquire),
+        3 => page.flags.load(Acquire),
+        _ => 0,
+    }
+}
+
+/// The processor to the next thread ready at the caller's level; a bare
+/// child may call it.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_yield() {
+    let _ = rt::sys::yield_now();
+}
+
+/// Waits for good on a channel of its own, for a bare child that lives
+/// until it is killed.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_park() -> ! {
+    if let Ok(channel) = rt::sys::channel_create(1) {
+        loop {
+            let _ = rt::sys::receive(&channel);
+        }
+    }
+    rt::sys::process_exit(1)
+}
+
+/// A ForkStart whose child never gets its copy
+/// (posix_abi::fork::probe_abort): 0 when SpawnCommit and an early
+/// ForkCommit were refused, the child's PID in `pid`.
+///
+/// # Safety
+/// `pid` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_fork_abort(pid: *mut c_int) -> c_int {
+    let mut child = 0;
+    let result =
+        call(|| Ok::<_, c_int>(posix_abi::fork::probe_abort(&mut child))).unwrap_or(EINVAL);
+    // SAFETY: the caller's promise.
+    unsafe { pid.write(child) };
+    result
+}
+
+/// Holds a lock of the layer for `us` microseconds
+/// (posix_abi::fork::probe_hold): 0 the heap's, 1 the files', 2 a bucket's.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_hold(which: c_int, us: u64) -> c_int {
+    posix_abi::fork::probe_hold(which as u32, us.saturating_mul(1000))
+}
+
+/// The next anonymous mapping of the layer sleeps `us` microseconds first
+/// (posix_abi::allocation::probe_sleep_next), for the probe of relibc's
+/// allocator across a fork.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_mmap_sleep(us: u64) {
+    posix_abi::allocation::probe_sleep_next(us.saturating_mul(1000));
+}
+
+/// How many threads the process's table holds
+/// (posix_abi::fork::probe_threads).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_threads() -> c_int {
+    posix_abi::fork::probe_threads() as c_int
+}
+
+/// The most mappings an object of the layer's map has
+/// (posix_abi::fork::probe_mappings).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_map_mappings() -> u64 {
+    posix_abi::fork::probe_mappings()
+}
+
+/// The layer's memory map for the probes (posix_abi::allocation::regions):
+/// the address, the pages and the access (1 R, 3 RW, 5 RX) of each region,
+/// three words each, into `out` for `max` regions at most; the number of
+/// regions the map holds, which may exceed `max`.
+///
+/// # Safety
+/// `out` has room for `3 * max` words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_memory_map(out: *mut u64, max: usize) -> usize {
+    posix_abi::allocation::regions(|map| {
+        for (i, region) in map.iter().take(max).enumerate() {
+            let words = [
+                region.address as u64,
+                region.pages as u64,
+                region.access.raw(),
+            ];
+            // SAFETY: the caller gives room for `3 * max` words.
+            unsafe { out.add(3 * i).copy_from_nonoverlapping(words.as_ptr(), 3) };
+        }
+        map.len()
+    })
+}
+
+/// The bytes charged to the process (object_info PROCESS_MEMORY), for the
+/// probe that compares them with the memory map; 0 when the call fails.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_memory_used() -> u64 {
+    rt::sys::process_memory(posix_abi::allocation::process()).map_or(0, |memory| memory.used)
 }
 
 const PAGE: usize = 4096;

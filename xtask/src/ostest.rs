@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! `cargo xtask os-test`: the io, malloc and signal suites of os-test and
-//! the spawn and exec tests of its basic suite (tools/build-os-test.py) on
-//! relibc. The tests of a suite are files of one boot's RAM service, and
+//! `cargo xtask os-test`: the io, malloc, process and signal suites of
+//! os-test and the tests of its basic suite that start programs (spawn,
+//! exec, fork; tools/build-os-test.py) on relibc. The tests of a suite are files of one boot's RAM service, and
 //! the runner (tests/os-test-run) starts each as misc/run.sh does and marks
 //! its output (`@@os-test begin NAME`, `@@os-test end NAME exit N`); `ci`
 //! reads a test's outcome between the marks: what misc/run.sh writes, its
 //! output, then `exit: N` when the output is empty or the status is 2 or
 //! more. A test passes when one of its expectations
 //! (<suite>.expect/<test>.*) is that text; a test of the basic suite, which
-//! has none, when the outcome is `exit: 0`. A test that needs fork or
-//! pipes is UNSUPPORTED and does not run. A test that faults, is killed or
-//! gives no end within the runner's 10 s FAILs, and the run goes on. The
+//! has none, when the outcome is `exit: 0`. A test that needs pipes (5e)
+//! is UNSUPPORTED and does not run. A test that faults, is killed or gives
+//! no end within the runner's 10 s FAILs, and the run goes on. The
 //! table goes to target/measure/os-test.txt; `ci` fails when a test of
 //! tests/os-test/pass.txt does not pass. `cargo xtask os-test --one NAME`
 //! runs one test in a boot of its own and shows its log, to look at a
@@ -150,15 +150,15 @@ pub fn expected(expect: &Path, test: &str, outcome: &str) -> Result<bool, String
     Ok(false)
 }
 
-/// Whether the test's source needs what stafeto has not yet: fork (5d)
-/// and pipes (5d).
-fn needs_processes(source: &str) -> bool {
-    ["fork(", "pipe("].iter().any(|call| source.contains(call))
+/// Whether the test's source needs what stafeto has not yet: pipes (5e).
+fn needs_pipes(source: &str) -> bool {
+    ["pipe(", "pipe2("].iter().any(|call| source.contains(call))
 }
 
 /// The time `ci` gives the boots of the suites, counted from the first
-/// one's start (about 150 s on TCG one boot after the other).
-const BUDGET: Duration = Duration::from_secs(300);
+/// one's start: about 230 s on TCG since the suites of `fork` (5d), up to
+/// 241 s seen, with room for the variance of a loaded host.
+const BUDGET: Duration = Duration::from_secs(420);
 
 /// The tests that pass on stafeto: `ci` fails when one of them does not.
 const PASSING: &str = "tests/os-test/pass.txt";
@@ -209,11 +209,11 @@ pub fn plan() -> Result<(Vec<Job>, Plan), String> {
     let mut places: Vec<Option<Row>> = Vec::new();
     for test in &tests {
         let source = source_of(&work, test)?;
-        places.push(if needs_processes(&source) {
+        places.push(if needs_pipes(&source) {
             Some((
                 test.name.clone(),
                 Verdict::Unsupported,
-                "needs fork or pipes".to_owned(),
+                "needs pipes (5e)".to_owned(),
             ))
         } else if let Some(failed) = test.built.strip_prefix('!') {
             // A test that did not compile: os-test's outcome for it.
@@ -301,7 +301,7 @@ fn compare(list: &str, rows: &[Row]) -> (Vec<String>, Vec<String>) {
 /// of the source tree its source and expectations are in.
 struct Test {
     name: String,
-    /// The suite of the name: `io`, `malloc`, `signal` or `basic`.
+    /// The suite of the name: `io`, `malloc`, `process`, `signal` or `basic`.
     suite: String,
     /// The name without the suite.
     test: String,
@@ -419,7 +419,7 @@ fn runner_check(kernel: &crate::Artifacts) -> Result<(), String> {
 }
 
 /// The suites as jobs, a boot for each: the rows of its tests go into
-/// `rows` when its job ends. The tests that need fork or pipes, or did not
+/// `rows` when its job ends. The tests that need pipes, or did not
 /// compile, get their rows before any boot.
 fn suite_jobs(
     work: &Path,
@@ -571,7 +571,7 @@ fn write(rows: &[Row]) -> Result<PathBuf, String> {
     let dir = target_dir().join("measure");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut text = format!(
-        "os-test io, malloc, signal and basic spawn and exec on relibc (commit {}): {}\n\n| test | result | outcome |\n|---|---|---|\n",
+        "os-test io, malloc, process, signal and basic spawn, exec and fork on relibc (commit {}): {}\n\n| test | result | outcome |\n|---|---|---|\n",
         crate::rtbench2::commit(),
         score(rows)
     );
@@ -700,13 +700,14 @@ mod tests {
     }
 
     #[test]
-    fn fork_and_pipes_are_unsupported() {
-        assert!(needs_processes("pid_t child = fork();"));
-        assert!(needs_processes("if (pipe(fds) < 0)"));
-        assert!(!needs_processes("int fd = open(path, O_RDWR);"));
-        // Programs started from files run (5c).
-        assert!(!needs_processes("execlp(argv[0], argv[0], \"2\", NULL);"));
-        assert!(!needs_processes(
+    fn pipes_are_unsupported() {
+        assert!(needs_pipes("if (pipe(fds) < 0)"));
+        assert!(needs_pipes("if (pipe2(fds, O_CLOEXEC) < 0)"));
+        assert!(!needs_pipes("int fd = open(path, O_RDWR);"));
+        // Programs started from files run (5c), and fork (5d).
+        assert!(!needs_pipes("execlp(argv[0], argv[0], \"2\", NULL);"));
+        assert!(!needs_pipes("pid_t child = fork();"));
+        assert!(!needs_pipes(
             "posix_spawn(&pid, program, NULL, NULL, argv, environ);"
         ));
     }

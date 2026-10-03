@@ -122,7 +122,14 @@ pub struct Block {
     /// their sender's information is the layer's, and they go back to the
     /// page when the thread blocks them or leaves.
     pub process: AtomicU64,
-    reserved: [u64; 4],
+    /// How many handlers of signals ran on the thread: a wait that an
+    /// entry ended looks whether one ran (EINTR) or none (it goes on).
+    pub handled: AtomicU64,
+    /// The thread's policy of scheduling (abi::Policy as a number): 0, round
+    /// robin, by default (spec 2: SCHED_OTHER); FIFO when asked for. The
+    /// raising locks of the layer move the thread with it.
+    pub policy: AtomicU64,
+    reserved: [u64; 2],
 }
 
 /// The TCB: relibc's `Tcb` starts so, its `os_specific` the block.
@@ -217,7 +224,9 @@ impl Block {
             cancel_point: AtomicU64::new(0),
             probe: AtomicU64::new(0),
             process: AtomicU64::new(0),
-            reserved: [0; 4],
+            handled: AtomicU64::new(0),
+            policy: AtomicU64::new(0),
+            reserved: [0; 2],
         }
     }
 }

@@ -374,7 +374,8 @@ const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
+    // Pieces of 64 KiB: the probe's forks copy regions past one piece.
+    ("loader", "loader", 0, &["small-pieces"]),
     ("busybox-probe", "busybox-probe", 0, &["applets"]),
 ];
 /// The probe of the longest step of the process service (xtask
@@ -391,7 +392,7 @@ const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
-    ("loader", "loader", 0, &[]),
+    ("loader", "loader", 0, &["steps"]),
 ];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
@@ -435,7 +436,10 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
         &["ash-probe"],
     ),
 ];
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
+/// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
+/// through the process service and the loader, the way every child starts
+/// (5d); the files of /bin are BusyBox's applets build.
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -446,6 +450,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
         &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
     (
         "busybox-probe",
         "busybox-probe",
@@ -890,8 +895,8 @@ commands:
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
-  os-test [--jobs N] run os-test's io, malloc, signal and basic spawn and exec
-            tests on relibc, a boot a suite with the tests started from
+  os-test [--jobs N] run os-test's io, malloc, process, signal and basic spawn,
+            exec and fork tests on relibc, a boot a suite with the tests started from
             files, N boots at a time;
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
@@ -2052,6 +2057,14 @@ fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
         "posix-procs: the child's directory is /bin",
         // Stage 9: exec keeps the PID.
         "posix-procs: after exec pid",
+        // The memory map of a program from a file (5d).
+        "posix-procs: memory map ",
+        // fork's copy (5d).
+        "posix-procs: a bare fork copied the parent",
+        "posix-procs: fork with the layer bound",
+        "posix-procs: a forked child execs ls",
+        "posix-procs: ash -c ran /bin/ls",
+        "posix-procs: 40 forks of a parent with six threads",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -2100,7 +2113,7 @@ const RAM_STEP_KINDS: [(usize, &str); 6] = [
 
 /// The kinds of the lines `service step: T kind K N ticks detail D` of the
 /// process service (tag 1), by the numbers of proto_process::Method.
-const STEP_KINDS: [(usize, &str); 12] = [
+const STEP_KINDS: [(usize, &str); 15] = [
     (1, "Create"),
     (13, "Kill"),
     (21, "Vouch"),
@@ -2111,8 +2124,26 @@ const STEP_KINDS: [(usize, &str); 12] = [
     (28, "ExecStart"),
     (29, "ExecCommit"),
     (31, "Replace"),
+    (34, "ForkStart"),
+    (35, "ForkCommit"),
+    (36, "ForkAbort"),
     (10, "WaitStart"),
     (64, "notification"),
+];
+
+/// The kinds of the lines `loader step: kind K N ticks detail D` of a
+/// loader that copies a fork (services/loader, feature `steps`), each a
+/// kernel call or the copy of one piece.
+const LOADER_STEP_KINDS: [(usize, &str); 9] = [
+    (1, "mem_create"),
+    (2, "map of the new object"),
+    (3, "mem_map of a piece"),
+    (4, "copy of a piece"),
+    (5, "mem_unmap of a piece"),
+    (6, "remap with the access"),
+    (7, "handle_duplicate"),
+    (8, "Regions"),
+    (9, "Go, the whole copy"),
 ];
 
 /// The longest step of each kind in `lines`: (kind, ticks, detail), the
@@ -2184,6 +2215,14 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
     qemu::expect_marker(&outcome, "posix-procs: steps done")?;
     let rows = longest_steps(&outcome.lines, "1");
     let ram = longest_steps(&outcome.lines, "2");
+    // The loader's lines, as the services' with the tag 3.
+    let loader_lines: Vec<String> = outcome
+        .lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("loader step: "))
+        .map(|l| format!("service step: 3 {l}"))
+        .collect();
+    let loader = longest_steps(&loader_lines, "3");
     if rows.is_empty() {
         return Err("the process service printed no step".into());
     }
@@ -2206,7 +2245,33 @@ fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
             "the RAM file service: READ_INTO took {read_into} ticks, past {RAM_STEP_MAX}: {ram:?}"
         ));
     }
+    // ForkStart makes a process as SpawnStart does and stays within it
+    // (5d); the copy of a fork has run, in steps of the loader.
+    let longest = |kind: usize| rows.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+    let (spawn, fork_start, fork_commit) = (longest(22), longest(34), longest(35));
+    if fork_start == 0 || fork_commit == 0 || fork_start > spawn {
+        return Err(format!(
+            "ForkStart took {fork_start} ticks and ForkCommit {fork_commit}, SpawnStart {spawn}"
+        ));
+    }
+    if !loader.iter().any(|(k, ..)| *k == 9) {
+        return Err("no loader step of a copy: the forks did not run".into());
+    }
+    // The Clone of a fork copies the descriptions of the whole table.
+    let clone = ram.iter().find(|(k, ..)| *k == 15).map_or(0, |r| r.1);
+    if clone == 0 || clone > RAM_STEP_MAX {
+        return Err(format!(
+            "the RAM file service: Clone took {clone} ticks, past {RAM_STEP_MAX}: {ram:?}"
+        ));
+    }
     let mut text = String::from("kind method ticks detail\n");
+    for (kind, ticks, detail) in &loader {
+        let name = LOADER_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("loader {kind} {name} {ticks} {detail}\n");
+    }
     for (kind, name, ticks, detail) in ram.iter().map(|(k, t, d)| {
         let name = RAM_STEP_KINDS
             .iter()
@@ -2314,9 +2379,10 @@ fn ash_dialog() -> Result<(), String> {
     };
     let busybox = elf_size("busybox-probe")?;
     let bin_listing = [
-        ("-rwxr-xr-x", "3", "busybox", busybox.clone()),
-        ("-rwxr-xr-x", "3", "cat", busybox.clone()),
-        ("-rwxr-xr-x", "3", "ls", busybox),
+        ("-rwxr-xr-x", "4", "ash", busybox.clone()),
+        ("-rwxr-xr-x", "4", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "4", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "4", "ls", busybox),
         ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
     ];
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
@@ -2346,7 +2412,7 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("dr-xr-xr-x", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         // The files of the boot image's table: the modes and the sizes of
-        // the ELF files (three links of BusyBox, a set-user-ID file), one
+        // the ELF files (four names of BusyBox, a set-user-ID file), one
         // command each.
         for (mode, links, name, size) in &bin_listing {
             let command = format!("ls -l /bin/{name}");
@@ -2373,11 +2439,46 @@ fn ash_dialog() -> Result<(), String> {
         run.expect("le /?", DIALOG_STEP)?;
         run.expect("ash: le: not found", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
-        // A command with a path is no applet: ash forks for it, which
-        // stafeto refuses (ENOSYS until 5b), and the shell goes on.
+        // A command with a path is no applet: ash forks for it (5d) and
+        // the child execs the file. A file that is missing ends the child
+        // with 127 and the shell goes on.
         run.send("/bin/x")?;
         run.expect("/bin/x", DIALOG_STEP)?;
-        run.expect("ash: can't fork: Function not implemented", DIALOG_STEP)?;
+        run.expect("ash: /bin/x: not found", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect("echo $?", DIALOG_STEP)?;
+        run.expect_line("127", |line| line == "127", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        // External programs: fork and exec of a file of /bin, alone, in a
+        // list and with a status.
+        run.send("/bin/ls -la")?;
+        run.expect("/bin/ls -la", DIALOG_STEP)?;
+        run.expect("dr-xr-xr-x", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ls -1 /etc")?;
+        run.expect("/bin/ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo hi && ls -1 /etc")?;
+        run.expect("echo hi && ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("hi", |line| line == "hi", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo hi && /bin/ls -1 /etc")?;
+        run.expect("echo hi && /bin/ls -1 /etc", DIALOG_STEP)?;
+        run.expect_line("hi", |line| line == "hi", DIALOG_STEP)?;
+        run.expect_line("motd", |line| line == "motd", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ash -c 'exit 3'")?;
+        run.expect("/bin/ash -c 'exit 3'", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("echo $?")?;
+        run.expect("echo $?", DIALOG_STEP)?;
+        run.expect_line("3", |line| line == "3", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
+        run.send("/bin/ash -c '/bin/ash -c \"exit 4\"; echo inner $?'")?;
+        run.expect_line("inner 4", |line| line == "inner 4", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
         run.send("ls /missing")?;
         run.expect("ls /missing", DIALOG_STEP)?;
@@ -2661,6 +2762,8 @@ fn host_tests() -> Result<(), String> {
         "posix-types",
         "--package",
         "posix-heap",
+        "--package",
+        "posix-map",
         "--package",
         "posix-order",
         "--package",
@@ -4189,8 +4292,10 @@ fn text_size(elf: &Path) -> Result<u64, String> {
         .ok_or_else(|| format!("{}: no .text", elf.display()))
 }
 
-/// The bound of the layer's `.data` + `.bss` in a program (step 5a′).
-const LAYER_DATA_LIMIT: u64 = 16 * 1024;
+/// The bound of the layer's `.data` + `.bss` in a program (step 5a′: 16
+/// KiB; 20 KiB since step 5d, which adds the memory map of 128 regions,
+/// 4 KiB).
+const LAYER_DATA_LIMIT: u64 = 20 * 1024;
 
 /// The test hooks of the reply journals went with the journals (spec 6.1):
 /// no Cargo.toml of the workspace names the feature `transport-probe`.
@@ -4246,6 +4351,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "posix-types",
         "--package",
         "posix-heap",
+        "--package",
+        "posix-map",
         "--package",
         "posix-order",
         "--package",

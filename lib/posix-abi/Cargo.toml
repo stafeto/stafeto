@@ -25,6 +25,7 @@ posix-types = { path = "../posix-types" }
 posix-fs = { path = "../posix-fs" }
 rt = { path = "../rt" }
 posix-heap = { path = "../posix-heap" }
+posix-map = { path = "../posix-map" }
 posix-order = { path = "../posix-order" }
 posix-request = { path = "../posix-request" }
 proto-wire = { path = "../../proto/wire" }

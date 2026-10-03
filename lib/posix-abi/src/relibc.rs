@@ -144,6 +144,36 @@ pub unsafe fn attach_main(block: *mut Block) {
     unsafe { (*block).thread_id = 1 };
 }
 
+/// The table of a forked child (spec 2, 3.2): its only thread, number
+/// `id` with the native handle `native`, keeps its place; every other
+/// place is free, its handles and memory the parent's (the copies of the
+/// other threads' TCBs and stacks stay in the child's heap); the exit
+/// channel comes anew when a thread is made, and the child's thread routes
+/// the process's signals.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(id: u64, native: u64) {
+    for (index, place) in TABLE.iter().enumerate() {
+        if index as u64 + 1 == id {
+            place.native.store(native, Ordering::Relaxed);
+            place.stack.store(0, Ordering::Relaxed);
+            place.stack_len.store(0, Ordering::Relaxed);
+            place.state.store(LIVE, Ordering::Release);
+            continue;
+        }
+        place.native.store(0, Ordering::Relaxed);
+        place.block.store(0, Ordering::Relaxed);
+        place.tcb.store(0, Ordering::Relaxed);
+        place.tcb_len.store(0, Ordering::Relaxed);
+        place.stack.store(0, Ordering::Relaxed);
+        place.stack_len.store(0, Ordering::Relaxed);
+        place.state.store(FREE, Ordering::Release);
+    }
+    EXITS.store(0, Ordering::Release);
+    ROUTER.store(id, Ordering::Release);
+}
+
 /// The block and the handle of live thread `id`, for a signal or a
 /// request of cancellation; ESRCH for none. A thread stays in its place
 /// until relibc released it, which relibc does after the last use of its
@@ -179,6 +209,21 @@ pub fn each_block(mut f: impl FnMut(&Block)) {
         if place.state.load(Ordering::Acquire) & LIVE != 0 {
             // SAFETY: as in `target`.
             f(unsafe { &*(place.block.load(Ordering::Relaxed) as *const Block) });
+        }
+    }
+}
+
+/// Runs `f` on the place, native handle and block of every live thread,
+/// under the lock of the table, so that no block is freed meanwhile.
+pub fn each_live(mut f: impl FnMut(usize, u64, &Block)) {
+    let _guard = TABLE_LOCK.lock();
+    for (index, place) in TABLE.iter().enumerate() {
+        if place.state.load(Ordering::Acquire) & LIVE != 0 {
+            let native = place.native.load(Ordering::Relaxed);
+            // SAFETY: as in `target`.
+            f(index, native, unsafe {
+                &*(place.block.load(Ordering::Relaxed) as *const Block)
+            });
         }
     }
 }
@@ -340,6 +385,9 @@ pub unsafe fn create(
         place.state.store(FREE, Ordering::Release);
     };
     let ceiling = crate::ceiling().map_err(|_| EIO)?;
+    // The creator's policy: round robin unless it asked for FIFO.
+    let policy_raw = me.policy.load(Ordering::Relaxed);
+    let policy = Policy::from_raw(policy_raw).unwrap_or(Policy::RoundRobin);
     // Its channel takes the wakes of its waits and its timer their
     // deadlines (posix-sync); made at its level.
     let Ok(channel) = sys::channel_create(base) else {
@@ -358,7 +406,7 @@ pub unsafe fn create(
             stack,
             id,
             base,
-            Policy::Fifo,
+            policy,
             BUFFERS + index * PAGE,
             Some((&borrowed::<Channel>(exits), ceiling)),
         )
@@ -387,6 +435,7 @@ pub unsafe fn create(
         block.timer.store(timer.into_raw().0, Ordering::Relaxed);
         block.channel.store(channel.into_raw().0, Ordering::Relaxed);
         block.thread_id = id;
+        block.policy.store(policy_raw, Ordering::Relaxed);
         block.cancel_point.store(0, Ordering::Relaxed);
     }
     place.tcb.store(tcb, Ordering::Relaxed);

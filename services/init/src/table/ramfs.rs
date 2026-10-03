@@ -62,9 +62,13 @@ pub const TABLE: &[Record] = &[
 /// A POSIX process: main at the probe's level, the ceiling one above it,
 /// where the holders of the locks of `posix-abi` (buckets, heap, files,
 /// threads, actions) run, so an application thread at main's level never
-/// delays them. BusyBox shares the record and its ceiling.
+/// delays them. BusyBox shares the record and its ceiling. The room for
+/// handles holds the layer's memory map, one handle for each object of the
+/// process's memory (at most 128), beside those of its threads and files; a
+/// table grows by chunks only as far as the process uses it.
 const POSIX: Record = Record {
     ceiling: TABLE[1].priority + 1,
+    handle_limit: 512,
     ..TABLE[1]
 };
 
@@ -85,17 +89,30 @@ pub const BUSYBOX_TABLE: &[Record] = &[
     },
 ];
 
-/// BUSYBOX_TABLE with the console's driver, which the program reads.
+/// The dialog: the console's driver, the RAM files, the process and clock
+/// services and the launcher (the program of `busybox-probe`, whose
+/// argument `ash-launch` makes it start `/bin/ash` from its file, 5d). The
+/// shell is a child, and so is each command it forks: the pool of the
+/// process service holds the quota of three more processes of the
+/// launcher's size, and the reserve of its loaders.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
-    POSIX_ABI_TABLE[1],
+    Record {
+        quota: POSIX_ABI_TABLE[1].quota + 3 * DIALOG_QUOTA + 384 * PAGE,
+        ..POSIX_ABI_TABLE[1]
+    },
     POSIX_ABI_TABLE[2],
     Record {
+        args: b"ash-launch\0",
         connects: &["ramfs", "uart", "clock", "posix"],
+        quota: DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
 ];
+
+/// The quota of the launcher, which the shell and its children get too.
+const DIALOG_QUOTA: u64 = 512 * PAGE;
 
 /// The probes of console input and interruption (posix-threads with
 /// cancel-input, posix-shared): the console's driver, the RAM files, the
@@ -368,7 +385,8 @@ pub const RTBENCH: Record = Record {
     program: "rtbench-posix",
     args: b"rtbench-posix\0",
     connects: &["ramfs", "clock", "posix", "uart", "rtbench-load"],
-    quota: 2048 * PAGE,
+    // Room for a heap of 8 MiB, which a child of fork copies (S15).
+    quota: 3072 * PAGE,
     handle_limit: 512,
     root: true,
     ..POSIX

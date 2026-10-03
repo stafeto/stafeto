@@ -3,9 +3,10 @@
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 """Compile os-test's suites for stafeto (`cargo xtask os-test`): Sortix's
-os-test (ISC) at a pinned commit, its io, malloc and signal suites and
-the spawn and exec parts of its basic suite (basic/spawn, and the tests
-of basic/unistd named exec*), each test with relibc's headers
+os-test (ISC) at a pinned commit, its io, malloc, process and signal
+suites and the parts of its basic suite that start programs: basic/spawn,
+the tests of basic/unistd named exec*, and the tests of every part of
+basic/ that call fork; each test with relibc's headers
 (target/relibc/sysroot, cargo xtask relibc) into an object of its own
 under target/os-test/objects. A test that does not compile gets os-test's
 outcome for it (compile.sh: missing_header, undeclared, ...). Writes
@@ -24,9 +25,14 @@ import subprocess
 
 REPOSITORY = "https://gitlab.com/sortix/os-test.git"
 COMMIT = "f8144f0215ea265fd46281e29271d8e857a6856e"
-SUITES = ("io", "malloc", "signal")
-# The parts of the basic suite and which of their tests run.
-BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"))
+SUITES = ("io", "malloc", "process", "signal")
+# The parts of the basic suite and which of their tests run: a glob, or
+# None for the tests that call fork (5d). Tests that need pipes stay in:
+# `cargo xtask os-test` marks them unsupported until pipes come (5e).
+BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"), ("unistd", None),
+         ("nl_types", None), ("poll", None), ("pthread", None), ("signal", None),
+         ("stdlib", None), ("sys_select", None), ("sys_wait", None), ("termios", None))
+FORK = re.compile(r"(^|[^_\w])v?fork\(")
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "os-test"
 SOURCE = WORK / "source"
@@ -81,18 +87,21 @@ def outcome(errors: str, source: str) -> str:
 
 
 def fetch() -> None:
-    if SOURCE.exists() and all((SOURCE / suite).exists() for suite in SUITES) \
-            and all((SOURCE / "basic" / part).exists() for part, _ in BASIC) and subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=SOURCE, capture_output=True,
-            text=True).stdout.strip() == COMMIT:
+    at_commit = SOURCE.exists() and subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=SOURCE, capture_output=True,
+        text=True).stdout.strip() == COMMIT
+    if at_commit and all((SOURCE / suite).exists() for suite in SUITES) \
+            and all((SOURCE / "basic" / part).exists() for part, _ in BASIC):
         return
-    if SOURCE.exists():
-        shutil.rmtree(SOURCE)
-    WORK.mkdir(parents=True, exist_ok=True)
+    if not at_commit:
+        if SOURCE.exists():
+            shutil.rmtree(SOURCE)
+        WORK.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "--quiet", "--no-checkout", REPOSITORY, str(SOURCE)],
+                       check=True)
     # The suites, their expectations and misc/ alone: the other suites'
-    # file names collide on a case-insensitive file system.
-    subprocess.run(["git", "clone", "--quiet", "--no-checkout", REPOSITORY, str(SOURCE)],
-                   check=True)
+    # file names collide on a case-insensitive file system. A clone at the
+    # commit with fewer parts takes the new ones.
     subprocess.run(["git", "sparse-checkout", "set", "--no-cone", "/misc/", "/LICENSE",
                     "/basic/basic.h", *(f"/basic/{part}/" for part, _ in BASIC),
                     *(f"/{suite}/" for suite in SUITES),
@@ -118,10 +127,16 @@ def main() -> None:
     lines = []
     parts = [(suite, suite, "*.c") for suite in SUITES]
     parts += [(f"basic/{part}", f"basic/{part}", pattern) for part, pattern in BASIC]
+    seen = set()
     for suite, directory, pattern in parts:
-        (OBJECTS / directory).mkdir(parents=True)
-        for test in sorted((SOURCE / directory).glob(pattern)):
+        (OBJECTS / directory).mkdir(parents=True, exist_ok=True)
+        for test in sorted((SOURCE / directory).glob(pattern or "*.c")):
+            if pattern is None and not FORK.search(test.read_text()):
+                continue
             name = f"{suite}/{test.stem}"
+            if name in seen:
+                continue
+            seen.add(name)
             target = OBJECTS / directory / f"{test.stem}.o"
             result = subprocess.run([compiler, *FLAGS, "-c", str(test), "-o", str(target)],
                                     cwd=SOURCE / directory, capture_output=True, text=True)

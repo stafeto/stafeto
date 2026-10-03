@@ -49,12 +49,37 @@ pub unsafe fn init(session: Handle<Channel>) -> Result<(), Status> {
     Ok(())
 }
 
+/// The record of a forked child (spec 2, 3.2): its own session `session`
+/// and identity session `identity`, which its loader took (Take), in place
+/// of the parent's, which name nothing of the child's and go without a
+/// close; its PID from the service. The page's classes of signals are
+/// the service's from ForkStart, and the actions the copy of the parent's.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(
+    session: Handle<Channel>,
+    identity: Option<Handle<Channel>>,
+) -> Result<(), Status> {
+    // SAFETY: the caller's promise gives these borrows alone.
+    let (state, own) = unsafe { (&mut *STATE.0.get(), &mut *IDENTITY.0.get()) };
+    if let Some(parent) = state.replace(Client::new(session)) {
+        core::mem::forget(parent);
+    }
+    if let Some(parent) = core::mem::replace(own, identity) {
+        core::mem::forget(parent);
+    }
+    let snapshot = client().query()?;
+    PID.store(snapshot.pid, Ordering::Release);
+    Ok(())
+}
+
 /// The service's answer to a request through the session of the process's
 /// record: the number its reply carries (0 for a status alone), or the
 /// errno of its status. A send that came back INTERRUPTED was never seen
 /// by the service and goes again; an accepted request that waits for its
 /// reply (a walk of a group) is not taken back by a signal.
-fn ask(w: &Writer) -> Result<u32, i32> {
+pub(crate) fn ask(w: &Writer) -> Result<u32, i32> {
     use crate::constants::{EACCES, EAGAIN, EINVAL, EIO, EPERM, ESRCH};
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let (status, value) = loop {
@@ -80,7 +105,7 @@ fn ask(w: &Writer) -> Result<u32, i32> {
 }
 
 /// A request of `method` with the numbers `words` as its body.
-fn request(method: proto_process::Method, words: &[u32]) -> Result<Writer, i32> {
+pub(crate) fn request(method: proto_process::Method, words: &[u32]) -> Result<Writer, i32> {
     let mut w = Writer::new();
     method
         .header()
@@ -558,7 +583,7 @@ pub struct SpawnAttributes {
 }
 
 /// The errno of a refusal of SpawnStart.
-fn start_errno(status: Status) -> i32 {
+pub(crate) fn start_errno(status: Status) -> i32 {
     use crate::constants::{EAGAIN, EINVAL, ENOENT, ENOMEM, EPERM};
     match status {
         Status::Kernel(rt::abi::Error::NoMemory) => ENOMEM,
@@ -572,7 +597,7 @@ fn start_errno(status: Status) -> i32 {
 }
 
 /// The errno of a loader's answer to Go other than "the image is ready".
-fn load_errno(code: u32) -> i32 {
+pub(crate) fn load_errno(code: u32) -> i32 {
     use crate::constants::*;
     match code {
         proto_loader::NO_ENTRY => ENOENT,
@@ -589,7 +614,11 @@ fn load_errno(code: u32) -> i32 {
 
 /// A request through C, sent again while it comes back INTERRUPTED (the
 /// loader never saw it): its status.
-fn ask_loader(c: &Handle<Channel>, w: &Writer, handles: Option<rt::handle::Outgoing>) -> u32 {
+pub(crate) fn ask_loader(
+    c: &Handle<Channel>,
+    w: &Writer,
+    handles: Option<rt::handle::Outgoing>,
+) -> u32 {
     let mut buffer = [0; rt::abi::MESSAGE_MAX];
     let mut handles = handles;
     loop {
@@ -1018,7 +1047,7 @@ fn move_files(c: &Handle<Channel>) {
 
 /// The errno of a refused Clone: EAGAIN for a service at its limit of
 /// clones or sessions (a limit of the moment), ENOMEM, EIO otherwise.
-fn clone_errno(status: Status) -> i32 {
+pub(crate) fn clone_errno(status: Status) -> i32 {
     use crate::constants::{EAGAIN, EIO, ENOMEM};
     match status {
         Status::Kernel(rt::abi::Error::LimitReached) => EAGAIN,

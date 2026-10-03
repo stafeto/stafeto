@@ -1,0 +1,11 @@
+[package]
+name = "posix-map"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later WITH GCC-exception-3.1"
+description = "The memory map of the Rust stafeto POSIX layer: the handles of its mapped objects"
+
+[dependencies]
+abi = { path = "../abi" }

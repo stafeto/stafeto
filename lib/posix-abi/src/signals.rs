@@ -514,10 +514,16 @@ pub fn suspend(mask: SigSet) -> i32 {
         }
         // An entry between the check and `receive` stays pending and makes
         // `receive` return at once; it runs when the guard goes.
+        let handled = block.handled.load(Ordering::SeqCst);
         let guard = rt::upcall::defer_entries().expect("sigsuspend entry deferral");
         let got = sys::receive(&channel);
         drop(guard);
         match got {
+            // An entry that ran no handler (a stop of exec or fork parked
+            // the thread) leaves the wait on.
+            Err(Error::Interrupted)
+                if block.handled.load(Ordering::SeqCst) == handled
+                    && !threads::cancel::requested() => {}
             Err(Error::Interrupted) => break,
             Ok(sys::Received::Notification {
                 source: Source::Unlabeled,
@@ -698,42 +704,86 @@ pub fn carry_pending(bits: u64) {
     CARRIED.store(bits, Ordering::Release);
 }
 
-/// The thread that stops the others for an exec (its block's address), 0
-/// for none; how many parked; the channel the stopper waits on; and the
-/// channels the parked threads wait on until they go on.
+/// The thread that stops the others for an exec or a fork (its block's
+/// address), 0 for none; the channel the stopper waits on; and, by place
+/// of the table of threads, the channel of each parked thread, its own
+/// (0 for a thread that is not parked).
 static STOPPING: AtomicUsize = AtomicUsize::new(0);
-static PARKED: AtomicUsize = AtomicUsize::new(0);
 static STOPPER: AtomicU64 = AtomicU64::new(0);
-static PARKING: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+static PARKING: [AtomicU64; crate::relibc::PLACES] =
+    [const { AtomicU64::new(0) }; crate::relibc::PLACES];
 
-/// Stops every other attached thread of the process for an exec (spec 2,
-/// 3.2 step 1, mya2.V6): each is asked for its entry and parks in it,
-/// outside every critical section of the layer, so that it holds no lock
-/// of the layer; a thread that waits for a reply of a service parks once
-/// the reply came. The process's signals wait on its page meanwhile. The
-/// caller has every signal blocked.
+/// How often the stopper looks at the table again while a thread it waits
+/// for neither parked nor said so: a thread that ends, or one in a wait of
+/// the kernel, tells it nothing.
+const LOOK_AGAIN_NS: u64 = 1_000_000;
+
+/// Stops every other thread of the process for an exec or a fork (spec 2,
+/// 3.2 step 1). A thread with its entry of signals is asked for
+/// it and parks there, outside every critical section of the layer, so it
+/// holds no lock of the layer; one that waits in the kernel outside a
+/// critical section counts as stopped, since its entry, asked for, comes
+/// before any code of its own runs again. A thread that has no entry yet
+/// (made, its start not done) parks in `attach` once it has one; one made
+/// and not started, and one that ended, count as stopped. The stopper
+/// looks at the table under its lock, again whenever a thread parks and
+/// every LOOK_AGAIN_NS, until all others are stopped. A thread that finds
+/// another stopper at work parks first. The process's signals wait on its
+/// page meanwhile. The caller has every signal blocked.
 pub(crate) fn stop_others() -> Result<(), i32> {
+    use rt::abi::ThreadState;
     let level = own().base_level.load(Ordering::Relaxed) as u8;
-    let own = own() as *const Block as usize;
+    let me = own() as *const Block as usize;
     let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
+    let timer = sys::timer_create(&channel, level.max(1)).map_err(|_| EAGAIN)?;
+    while STOPPING
+        .compare_exchange(0, me, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        park();
+        let _ = sys::yield_now();
+    }
     STOPPER.store(channel.raw().0, Ordering::Release);
-    PARKED.store(0, Ordering::Release);
-    STOPPING.store(own, Ordering::Release);
-    let mut others = 0;
-    threads::each_block(|block| {
-        let ready = block.flags.load(Ordering::SeqCst) & flag::SIGNALS_READY != 0;
-        if core::ptr::from_ref(block) as usize != own && ready {
-            let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
-                block.thread.load(Ordering::Relaxed),
-            ));
-            if sys::thread_upcall_request(&thread).is_ok() {
-                others += 1;
+    let mut asked = 0u64;
+    loop {
+        let mut waiting = false;
+        crate::relibc::each_live(|index, native, block| {
+            if core::ptr::from_ref(block) as usize == me
+                || PARKING[index].load(Ordering::Acquire) != 0
+            {
+                return;
             }
-        }
-    });
-    while PARKED.load(Ordering::Acquire) < others {
-        if sys::receive(&channel).is_err() {
+            let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(native));
+            let state = sys::thread_info(&thread).map_or(ThreadState::Ended, |i| i.state);
+            if matches!(state, ThreadState::Ended | ThreadState::Stopped) {
+                return;
+            }
+            let flags = block.flags.load(Ordering::SeqCst);
+            if flags & flag::SIGNALS_READY == 0 {
+                waiting = true;
+                return;
+            }
+            if asked & 1 << index == 0 {
+                asked |= 1 << index;
+                let _ = sys::thread_upcall_request(&thread);
+            }
+            let in_kernel = matches!(
+                state,
+                ThreadState::Receiving | ThreadState::Sending | ThreadState::AwaitingReply
+            );
+            if !(in_kernel && flags >> flag::DEPTH_SHIFT == 0) {
+                waiting = true;
+            }
+        });
+        if !waiting {
             break;
+        }
+        let deadline = rt::time::ticks_to_ns(rt::time::now()) + LOOK_AGAIN_NS;
+        let _ = sys::timer_set(&timer, deadline);
+        // An interrupted wait looks again: the stop holds until every
+        // other thread is stopped.
+        if sys::receive(&channel).is_err() {
+            let _ = sys::yield_now();
         }
     }
     // The stopper's channel lives as long as the stop.
@@ -741,9 +791,37 @@ pub(crate) fn stop_others() -> Result<(), i32> {
     Ok(())
 }
 
-/// The other threads go on: the exec failed before its commit.
-pub(crate) fn resume_others() {
+/// The signals of a forked child (spec 2, 3.2): no stop is on, no pending
+/// signal an exec carried, and the child's only thread gets its entry of
+/// signals (`attach`); the actions are the copy of the parent's, and the
+/// classes on the page the service's from ForkStart. The parent's channels
+/// of the stop in the copy go without a close.
+///
+/// # Safety
+/// The child's only thread, once its block has its handles
+/// (crate::threads::after_fork).
+pub(crate) unsafe fn after_fork() -> Result<(), i32> {
     STOPPING.store(0, Ordering::Release);
+    STOPPER.store(0, Ordering::Release);
+    for place in &PARKING {
+        place.store(0, Ordering::Relaxed);
+    }
+    CARRIED.store(0, Ordering::Release);
+    attach()
+}
+
+/// The other threads go on: the exec failed before its commit, or the
+/// fork's copy is made.
+pub(crate) fn resume_others() {
+    // Only the stopper ends its stop: a caller whose stop never began
+    // leaves another's as it is.
+    let me = own() as *const Block as usize;
+    if STOPPING
+        .compare_exchange(me, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     for place in &PARKING {
         let raw = place.swap(0, Ordering::AcqRel);
         if raw != 0 {
@@ -756,35 +834,40 @@ pub(crate) fn resume_others() {
     }
 }
 
-/// Parks the calling thread while an exec of another thread stops the
-/// process: its process signals go back to the page, it says so to the
-/// stopper and waits on a channel of its own until the exec failed; a
-/// successful exec ends the process meanwhile.
+/// Parks the calling thread while another thread stops the process for
+/// an exec or a fork: its process signals go back to the page, it puts its
+/// own channel in its place of PARKING, says so to the stopper and waits
+/// there until the stopper takes the place back (`resume_others`). A new
+/// stop that began before the thread ran again finds it parked for that
+/// one too: it puts its channel back and tells the new stopper. Its place
+/// is empty when it goes on. A successful exec ends the process meanwhile.
 fn park() {
     let block = own();
     give_back(block, block.process.load(Ordering::SeqCst));
-    let level = block.base_level.load(Ordering::Relaxed) as u8;
-    let Ok(channel) = sys::channel_create(level.max(1)) else {
+    let raw = block.channel.load(Ordering::Relaxed);
+    let place = (block.thread_id as usize)
+        .checked_sub(1)
+        .and_then(|i| PARKING.get(i));
+    let (Some(place), false) = (place, raw == 0) else {
         return;
     };
-    let raw = channel.raw().0;
-    let placed = PARKING.iter().find(|p| {
-        p.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    });
-    PARKED.fetch_add(1, Ordering::AcqRel);
-    let stopper = STOPPER.load(Ordering::Acquire);
-    if stopper != 0 {
-        let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
-    }
-    while placed.is_some() && STOPPING.load(Ordering::Acquire) != 0 {
-        if sys::receive(&channel).is_err() {
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(raw));
+    loop {
+        place.store(raw, Ordering::SeqCst);
+        if STOPPING.load(Ordering::SeqCst) == 0 {
             break;
         }
+        let stopper = STOPPER.load(Ordering::Acquire);
+        if stopper != 0 {
+            let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
+        }
+        while place.load(Ordering::SeqCst) == raw && STOPPING.load(Ordering::SeqCst) != 0 {
+            if sys::receive(&channel).is_err() {
+                let _ = sys::yield_now();
+            }
+        }
     }
-    if let Some(place) = placed {
-        let _ = place.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
-    }
+    let _ = place.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Whether the calling thread is to park: another thread stops the
@@ -802,6 +885,11 @@ pub(crate) fn attach() -> Result<(), i32> {
     unsafe { upcall::bind(entry) }.map_err(|_| EIO)?;
     own().flags.fetch_or(flag::SIGNALS_READY, Ordering::SeqCst);
     unsafe { upcall::enable() }.map_err(|_| EIO)?;
+    // A thread whose start ends while another stops the process parks
+    // now: the stopper waits for it (`stop_others`).
+    if stopped_by_other() {
+        park();
+    }
     let block = own();
     if block.pending.load(Ordering::SeqCst) & !block.mask.load(Ordering::SeqCst) != 0 {
         deliver_now();
@@ -969,6 +1057,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal, &raw mut info, (&raw mut context).cast()) };
+            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }
@@ -986,6 +1075,7 @@ unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
                 unsafe { upcall::enable() }.expect("nested signal entry");
             }
             unsafe { callback(signal) };
+            block.handled.fetch_add(1, Ordering::SeqCst);
             if entered {
                 upcall::mask().expect("signal handler mask restoration");
             }

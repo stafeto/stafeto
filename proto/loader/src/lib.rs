@@ -19,7 +19,20 @@
 //!   image is ready", or one of the codes below.
 //! - Handles: body the slot of each handle u32 (`Slot::Files`, `Clock`,
 //!   `Uart`, each once) and as many handles, sessions with SEND, after
-//!   "the image is ready"; reply its status.
+//!   "the image is ready" (after Fork for a copy); reply its status.
+//! - Fork, in place of Start (spec 2, 3.2; 5d): body `Fork`, the copy of
+//!   the parent's memory the loader makes for a `fork`; reply its status,
+//!   BAD_SIZE past REGIONS_MAX regions or a second Fork or Start.
+//! - Regions, after Fork: body an entry (`Region`, REGION bytes) for each
+//!   of its handles, one to four memory objects of the parent's memory map
+//!   with MAP_READ, each at least the entry's pages long; the loader takes
+//!   an entry only inside the layout of a program (`room_of`) and apart
+//!   from those it has; reply its status. Go after Fork copies every
+//!   region into objects of the new process, which pays for them, at the
+//!   parent's addresses with the parent's access, adjacent writable ones
+//!   in one object (`groups`), once the regions are all there and
+//!   `check_fork` holds; reply 0 for "the copy is ready", NO_MEMORY or
+//!   BAD_SIZE.
 //!
 //! The loader trusts no handle of C for its own requests: its session with
 //! the process service, the session of the loaders and its identity come
@@ -27,7 +40,9 @@
 //! asks the service for the program's sessions (proto_process Take),
 //! writes the start area (`Start`), closes everything that was its own,
 //! unmaps its data and stack and jumps to the program's entry with x0 =
-//! START_AREA. The program's start (posix-crt) reads the area.
+//! START_AREA. The program's start (posix-crt) reads the area. The end of
+//! a copy writes the transfer (`write_transfer`) at the address Fork named
+//! and jumps to Fork's `pc` with its `sp` and x0 = 0.
 //!
 //! The conditions of OpenExec (spec 2, 3.2), which the code names O1 to
 //! O8: O1 only the loaders' session and a loader's identity open; O2 the
@@ -43,7 +58,7 @@
 use core::ops::Range;
 use proto_wire::{Header, Reader, Status};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// The region of the loader: 16 MiB under the top of a process's lower
 /// half (spec 2, 3.2), which no program's segment may take.
@@ -145,6 +160,8 @@ pub enum Method {
     Start = 1,
     Go = 2,
     Handles = 3,
+    Fork = 4,
+    Regions = 5,
 }
 
 impl Method {
@@ -160,6 +177,8 @@ impl Method {
             1 => Some(Method::Start),
             2 => Some(Method::Go),
             3 => Some(Method::Handles),
+            4 => Some(Method::Fork),
+            5 => Some(Method::Regions),
             _ => None,
         }
     }
@@ -543,16 +562,18 @@ pub struct Start {
     /// bytes each) and their count.
     pub descriptors: u64,
     pub descriptor_count: u32,
-    _reserved: u32,
+    /// The entries of the memory map the loader hands over (`MapEntry`,
+    /// MAP_ENTRY bytes each) and their count, at most MAP_ENTRIES.
+    pub map_count: u32,
     /// What an exec carried (`Carried`), all 0 for a spawn.
     pub pending: u64,
     pub timers: u64,
     pub alarm: u64,
-    _pad: u64,
+    pub map: u64,
 }
 
 pub const START_MAGIC: [u8; 8] = *b"STAFSTRT";
-pub const START_VERSION: u32 = 1;
+pub const START_VERSION: u32 = 2;
 pub const SECURE: u32 = 1;
 /// The pairs of the auxiliary vector the start may fill.
 pub const AUXV_PAIRS: usize = 8;
@@ -560,30 +581,84 @@ pub const AUXV_PAIRS: usize = 8;
 pub const START_SIZE: usize = core::mem::size_of::<Start>();
 const _: () = assert!(START_SIZE == 160);
 
-/// The bytes of the start area of `block`: the header, the initial stack
-/// and the strings, rounded up to 16.
+/// The entries of the memory map the loader hands over at most: the three
+/// segments of a program, its stack and the start area itself.
+pub const MAP_ENTRIES: usize = 5;
+/// The bytes of an entry: the address u64, the pages u32, the access u32
+/// (abi::Access) and the handle's value u64.
+pub const MAP_ENTRY: usize = 24;
+
+/// One mapped memory object the loader hands the program (spec 2, 3.2):
+/// `pages` whole pages at `address` mapped with `access`, and the value of
+/// a handle to the object that holds MAP_READ, DUPLICATE and TRANSFER
+/// (and MAP_WRITE for a writable part) for the layer's map (posix-map). A
+/// handle never has MAP_EXEC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    pub address: u64,
+    pub pages: u32,
+    pub access: abi::Access,
+    pub handle: u64,
+}
+
+impl MapEntry {
+    pub fn to_bytes(self) -> [u8; MAP_ENTRY] {
+        let mut out = [0; MAP_ENTRY];
+        out[..8].copy_from_slice(&self.address.to_le_bytes());
+        out[8..12].copy_from_slice(&self.pages.to_le_bytes());
+        out[12..16].copy_from_slice(&(self.access.raw() as u32).to_le_bytes());
+        out[16..].copy_from_slice(&self.handle.to_le_bytes());
+        out
+    }
+
+    /// The entry of `bytes`; None for no pages or an access that is none.
+    pub fn read(bytes: &[u8; MAP_ENTRY]) -> Option<MapEntry> {
+        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let long = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let access = abi::Access::from_raw(word(12).into())?;
+        (word(8) > 0).then_some(MapEntry {
+            address: long(0),
+            pages: word(8),
+            access,
+            handle: long(16),
+        })
+    }
+}
+
+/// The bytes of the start area of `block`: the header, the initial stack,
+/// room for MAP_ENTRIES entries of the map and the strings, rounded up to
+/// 16.
 pub const fn area_len(block: &Block<'_>) -> usize {
     let stack = 8 * (1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS);
     let strings = block.cwd.len() + 1 + block.strings.len() + block.descriptors.len();
-    (START_SIZE + stack + strings).next_multiple_of(16)
+    (START_SIZE + stack + MAP_ENTRIES * MAP_ENTRY + strings).next_multiple_of(16)
 }
 
 /// Writes the start area of `block` into `area`, which lies at `at` in the
 /// program's space: the header with `flags` and `handles`, the initial
-/// stack and the strings it points to. Malformed when `area` is shorter
-/// than `area_len`.
+/// stack, the `maps` entries and the strings it points to. Malformed when
+/// `area` is shorter than `area_len` or `maps` holds more than MAP_ENTRIES.
 pub fn write_area(
     area: &mut [u8],
     at: u64,
     block: &Block<'_>,
     flags: u32,
     handles: [u64; SLOTS],
+    maps: &[MapEntry],
 ) -> Result<(), BlockError> {
     let len = area_len(block);
     let area = area.get_mut(..len).ok_or(BlockError::Malformed)?;
+    if maps.len() > MAP_ENTRIES {
+        return Err(BlockError::Malformed);
+    }
     let stack_at = START_SIZE;
     let words = 1 + block.argc + 1 + block.envc + 1 + 2 * AUXV_PAIRS;
-    let strings_at = stack_at + 8 * words;
+    let maps_at = stack_at + 8 * words;
+    for (i, entry) in maps.iter().enumerate() {
+        area[maps_at + i * MAP_ENTRY..maps_at + (i + 1) * MAP_ENTRY]
+            .copy_from_slice(&entry.to_bytes());
+    }
+    let strings_at = maps_at + MAP_ENTRIES * MAP_ENTRY;
     // The strings: the current directory, then those of the block.
     let cwd_at = strings_at;
     area[cwd_at..cwd_at + block.cwd.len()].copy_from_slice(block.cwd);
@@ -636,11 +711,11 @@ pub fn write_area(
         handles,
         descriptors: at + descriptors_at as u64,
         descriptor_count: (block.descriptors.len() / DESCRIPTOR) as u32,
-        _reserved: 0,
+        map_count: maps.len() as u32,
         pending: block.carried.pending,
         timers: block.carried.timers,
         alarm: block.carried.alarm,
-        _pad: 0,
+        map: at + maps_at as u64,
     };
     // SAFETY: Start is repr(C) of integers and bytes with no padding
     // (START_SIZE is the sum of its fields), so its bytes are its value.
@@ -658,6 +733,265 @@ impl Start {
         // bytes alone.
         let start: Start = unsafe { core::mem::transmute(bytes) };
         (start.magic == START_MAGIC && start.version == START_VERSION).then_some(start)
+    }
+}
+
+/// The regions a copy takes at most: the kernel's mappings of a process
+/// (abi::MAX_MAPPINGS), which the layer's map holds at most (posix-map).
+pub const REGIONS_MAX: usize = abi::MAX_MAPPINGS as usize;
+/// The bytes of an entry of Regions: the address u64, the pages u32 and
+/// the access u32 (abi::Access).
+pub const REGION: usize = 16;
+/// The heap of the POSIX layer, where the chunks of its map lie.
+pub const HEAP_ROOM: Range<u64> = 0x1000_0000..0x2000_0000;
+/// The rooms of a program's layout a region of a copy lies in, each whole
+/// in one: the segments, the layer's heap, the start area and the main
+/// stack. The loader's region, the page of the record, the clock's page
+/// and the buffers of the threads lie in none.
+pub const ROOMS: [Range<u64>; 4] = [
+    PROGRAM_ROOM,
+    HEAP_ROOM,
+    START_AREA..START_AREA + AREA_MAX,
+    abi::INIT_STACK_TOP - STACK_SIZE..abi::INIT_STACK_TOP,
+];
+
+/// One region of the parent's memory a copy takes: `pages` whole pages
+/// from `address`, mapped with `access`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub address: u64,
+    pub pages: u32,
+    pub access: abi::Access,
+}
+
+impl Region {
+    /// The first address past the region.
+    pub const fn end(&self) -> u64 {
+        self.address.saturating_add(self.pages as u64 * PAGE)
+    }
+
+    pub fn write(&self, w: &mut proto_wire::Writer) -> Result<(), Status> {
+        w.u64(self.address)?;
+        w.u32(self.pages)?;
+        w.u32(self.access.raw() as u32)
+    }
+
+    /// BAD_SIZE out of the layout, for no pages or an access that is
+    /// none.
+    pub fn read(r: &mut Reader<'_>) -> Result<Region, Status> {
+        let (address, pages, access) = (r.u64()?, r.u32()?, r.u32()?);
+        let access = abi::Access::from_raw(access.into()).ok_or(Status::BadSize)?;
+        if pages == 0 {
+            return Err(Status::BadSize);
+        }
+        Ok(Region {
+            address,
+            pages,
+            access,
+        })
+    }
+
+    /// Whether `address` lies in the region.
+    pub const fn holds(&self, address: u64) -> bool {
+        self.address <= address && address < self.end()
+    }
+}
+
+const PAGE: u64 = 4096;
+
+/// The room of ROOMS that holds all of `region`, which starts on a page;
+/// None for none.
+pub fn room_of(region: &Region) -> Option<usize> {
+    if !region.address.is_multiple_of(PAGE) {
+        return None;
+    }
+    let end = region.address.checked_add(region.pages as u64 * PAGE)?;
+    ROOMS
+        .iter()
+        .position(|room| room.start <= region.address && end <= room.end)
+}
+
+/// Whether a copy that holds `held` takes `region` too: inside a room
+/// (`room_of`), apart from every region it holds, and fewer than
+/// REGIONS_MAX before it; BAD_SIZE otherwise.
+pub fn admit(held: &[Region], region: &Region) -> Result<(), Status> {
+    if held.len() >= REGIONS_MAX || room_of(region).is_none() {
+        return Err(Status::BadSize);
+    }
+    if held
+        .iter()
+        .any(|h| h.address < region.end() && region.address < h.end())
+    {
+        return Err(Status::BadSize);
+    }
+    Ok(())
+}
+
+/// Whether a handle of Regions names what a region may be copied from: a
+/// memory object with MAP_READ. A window on a device's registers, any
+/// other kind and a memory object the loader may not read are refused.
+/// (A buffer of a device made with MEM_CONTIGUOUS is a memory object the
+/// kernel shows as any other; a POSIX process has none: it holds no device
+/// resource.)
+pub fn region_object(kind: abi::ObjectKind, rights: abi::Rights) -> bool {
+    kind == abi::ObjectKind::Memory && rights.contains(abi::Rights::MAP_READ)
+}
+
+/// The body of Fork: where the copy goes on, the address `pc` of the
+/// layer's code it jumps to with the stack pointer `sp` and x0 = 0, the
+/// address `transfer` of TRANSFER_SIZE bytes of the layer's data the
+/// loader writes the child's handles into (`write_transfer`), and how many
+/// regions Regions brings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fork {
+    pub pc: u64,
+    pub sp: u64,
+    pub transfer: u64,
+    pub regions: u32,
+}
+
+impl Fork {
+    pub fn write(&self, w: &mut proto_wire::Writer) -> Result<(), Status> {
+        w.u64(self.pc)?;
+        w.u64(self.sp)?;
+        w.u64(self.transfer)?;
+        w.u32(self.regions)
+    }
+
+    /// BAD_SIZE out of the layout, for no regions or past REGIONS_MAX.
+    pub fn read(mut r: Reader<'_>) -> Result<Fork, Status> {
+        let (pc, sp, transfer, regions) = (r.u64()?, r.u64()?, r.u64()?, r.u32()?);
+        r.finish()?;
+        if regions == 0 || regions as usize > REGIONS_MAX {
+            return Err(Status::BadSize);
+        }
+        Ok(Fork {
+            pc,
+            sp,
+            transfer,
+            regions,
+        })
+    }
+}
+
+/// Whether the copy of `fork` may go with the regions `held`, all of
+/// them come: `pc` in code (ReadExec) on an instruction, `sp` in or at the
+/// top of a writable region and 16-byte aligned, and the transfer whole in
+/// one writable region and 8-byte aligned; BAD_SIZE otherwise.
+pub fn check_fork(fork: &Fork, held: &[Region]) -> Result<(), Status> {
+    use abi::Access::{ReadExec, ReadWrite};
+    let fits = held.len() == fork.regions as usize
+        && fork.pc.is_multiple_of(4)
+        && held
+            .iter()
+            .any(|r| r.access == ReadExec && r.holds(fork.pc))
+        && fork.sp.is_multiple_of(16)
+        && held
+            .iter()
+            .any(|r| r.access == ReadWrite && r.address < fork.sp && fork.sp <= r.end())
+        && fork.transfer.is_multiple_of(8)
+        && fork
+            .transfer
+            .checked_add(TRANSFER_SIZE as u64)
+            .is_some_and(|end| {
+                held.iter()
+                    .any(|r| r.access == ReadWrite && r.address <= fork.transfer && end <= r.end())
+            });
+    if fits { Ok(()) } else { Err(Status::BadSize) }
+}
+
+/// The objects of a copy of `sorted`, regions sorted by address: the
+/// range of the regions each takes, adjacent writable regions one object
+/// (the chunks of the layer's heap), any other region one of its own.
+pub fn groups(sorted: &[Region]) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut at = 0;
+    core::iter::from_fn(move || {
+        let first = sorted.get(at)?;
+        let start = at;
+        at += 1;
+        if first.access == abi::Access::ReadWrite {
+            while let Some(next) = sorted.get(at) {
+                if next.access != abi::Access::ReadWrite || next.address != sorted[at - 1].end() {
+                    break;
+                }
+                at += 1;
+            }
+        }
+        Some(start..at)
+    })
+}
+
+/// The signature of a transfer.
+pub const TRANSFER_MAGIC: [u8; 8] = *b"STAFFORK";
+/// The bytes of a transfer: the signature, the child's handles by `Slot`
+/// (u64 each, 0 for none), the count u32 of the entries of its memory
+/// map and 4 zero bytes, then REGIONS_MAX entries (`MapEntry`).
+pub const TRANSFER_SIZE: usize = 8 + 8 * SLOTS + 8 + REGIONS_MAX * MAP_ENTRY;
+
+/// Writes the transfer of a copy into `out`: the child's `handles` by
+/// `Slot` and the objects of its memory map, `map`, REGIONS_MAX at most;
+/// Malformed otherwise or for `out` short of TRANSFER_SIZE.
+pub fn write_transfer(
+    out: &mut [u8],
+    handles: [u64; SLOTS],
+    map: &[MapEntry],
+) -> Result<(), BlockError> {
+    let out = out.get_mut(..TRANSFER_SIZE).ok_or(BlockError::Malformed)?;
+    if map.len() > REGIONS_MAX {
+        return Err(BlockError::Malformed);
+    }
+    out.fill(0);
+    out[..8].copy_from_slice(&TRANSFER_MAGIC);
+    for (i, h) in handles.iter().enumerate() {
+        out[8 + 8 * i..16 + 8 * i].copy_from_slice(&h.to_le_bytes());
+    }
+    let count = 8 + 8 * SLOTS;
+    out[count..count + 4].copy_from_slice(&(map.len() as u32).to_le_bytes());
+    for (i, entry) in map.iter().enumerate() {
+        let at = count + 8 + i * MAP_ENTRY;
+        out[at..at + MAP_ENTRY].copy_from_slice(&entry.to_bytes());
+    }
+    Ok(())
+}
+
+/// The transfer a copy's loader wrote: the child's handles by `Slot` and
+/// the objects of its memory map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transfer<'a> {
+    pub handles: [u64; SLOTS],
+    map: &'a [u8],
+}
+
+impl<'a> Transfer<'a> {
+    /// The transfer in `bytes`, with its signature and a count up to
+    /// REGIONS_MAX; None otherwise.
+    pub fn read(bytes: &'a [u8]) -> Option<Transfer<'a>> {
+        let bytes = bytes.get(..TRANSFER_SIZE)?;
+        if bytes[..8] != TRANSFER_MAGIC {
+            return None;
+        }
+        let mut handles = [0; SLOTS];
+        for (i, h) in handles.iter_mut().enumerate() {
+            *h = u64::from_le_bytes(bytes[8 + 8 * i..16 + 8 * i].try_into().ok()?);
+        }
+        let at = 8 + 8 * SLOTS;
+        let count = u32::from_le_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
+        if count > REGIONS_MAX {
+            return None;
+        }
+        Some(Transfer {
+            handles,
+            map: &bytes[at + 8..at + 8 + count * MAP_ENTRY],
+        })
+    }
+
+    /// The entries of the child's memory map; a malformed one is left out.
+    pub fn map(&self) -> impl Iterator<Item = MapEntry> + 'a {
+        self.map
+            .as_chunks::<MAP_ENTRY>()
+            .0
+            .iter()
+            .filter_map(MapEntry::read)
     }
 }
 
@@ -891,8 +1225,8 @@ mod tests {
             let at = START_AREA;
             let mut area = vec![0xAA; area_len(&read)];
             let handles = [1, 2, 3, 4, 5, 6, 0, 8];
-            write_area(&mut area, at, &read, SECURE, handles).unwrap();
-            assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles).is_err());
+            write_area(&mut area, at, &read, SECURE, handles, &[]).unwrap();
+            assert!(write_area(&mut vec![0; area.len() - 1], at, &read, 0, handles, &[]).is_err());
             let start = Start::read(&area).unwrap();
             assert_eq!(
                 (start.flags, start.umask, start.handles),
@@ -970,7 +1304,7 @@ mod tests {
         far[at..at + 4].copy_from_slice(&32u32.to_le_bytes());
         assert_eq!(Block::read(&far), Err(BlockError::Malformed), "fd 32");
         let mut area = vec![0; area_len(&read)];
-        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS]).unwrap();
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
         assert_eq!(start.descriptor_count, 2);
         let at = (start.descriptors - START_AREA) as usize;
@@ -1002,11 +1336,310 @@ mod tests {
         let read = Block::read(&out[..len]).unwrap();
         assert_eq!(read.carried, carried);
         let mut area = vec![0; area_len(&read)];
-        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS]).unwrap();
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &[]).unwrap();
         let start = Start::read(&area).unwrap();
         assert_eq!(
             (start.pending, start.timers, start.alarm),
             (1 << 9, 3, 12_345)
         );
+    }
+
+    /// The memory map the loader hands over reaches the start area: each
+    /// entry with its address, pages, access and handle, inside the area and
+    /// before the strings; MAP_ENTRIES at most.
+    #[test]
+    fn the_memory_map_rides_in_the_start_area() {
+        use abi::Access;
+        let mut out = vec![0; BLOCK_MAX];
+        let len = block(&mut out, &[b"ls", b"-l"], &[b"X=1"]);
+        let read = Block::read(&out[..len]).unwrap();
+        let entry = |i: u32, access| MapEntry {
+            address: 0x1000 * (i as u64 + 1),
+            pages: i + 1,
+            access,
+            handle: 40 + i as u64,
+        };
+        let list = [
+            entry(0, Access::ReadExec),
+            entry(1, Access::Read),
+            entry(2, Access::ReadWrite),
+            entry(3, Access::ReadWrite),
+            entry(4, Access::ReadWrite),
+        ];
+        let mut area = vec![0xAA; area_len(&read)];
+        write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &list).unwrap();
+        let start = Start::read(&area).unwrap();
+        assert_eq!(start.map_count as usize, MAP_ENTRIES);
+        let at = (start.map - START_AREA) as usize;
+        assert!(at + MAP_ENTRIES * MAP_ENTRY <= (start.cwd - START_AREA) as usize);
+        let back: Vec<_> = area[at..at + MAP_ENTRIES * MAP_ENTRY]
+            .as_chunks::<MAP_ENTRY>()
+            .0
+            .iter()
+            .filter_map(MapEntry::read)
+            .collect();
+        assert_eq!(back, list);
+        let mut few = vec![0; area_len(&read)];
+        write_area(&mut few, START_AREA, &read, 0, [0; SLOTS], &list[..3]).unwrap();
+        assert_eq!(Start::read(&few).unwrap().map_count, 3);
+        let mut too_many = list.to_vec();
+        too_many.push(entry(5, Access::Read));
+        assert_eq!(
+            write_area(&mut area, START_AREA, &read, 0, [0; SLOTS], &too_many),
+            Err(BlockError::Malformed)
+        );
+        let mut bytes = list[0].to_bytes();
+        bytes[8..12].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(MapEntry::read(&bytes), None, "no pages");
+        let mut bytes = list[0].to_bytes();
+        bytes[12..16].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(MapEntry::read(&bytes), None, "W and X together");
+    }
+
+    fn region(address: u64, pages: u32, access: abi::Access) -> Region {
+        Region {
+            address,
+            pages,
+            access,
+        }
+    }
+
+    /// The regions of a program from a file: its code, read-only data and
+    /// data, three chunks of the heap, its start area and its stack.
+    fn program() -> Vec<Region> {
+        use abi::Access::{Read, ReadExec, ReadWrite};
+        vec![
+            region(0x20_0000, 16, ReadExec),
+            region(0x21_0000, 4, Read),
+            region(0x22_0000, 2, ReadWrite),
+            region(0x1000_0000, 16, ReadWrite),
+            region(0x1001_0000, 32, ReadWrite),
+            region(0x1003_0000, 16, ReadWrite),
+            region(START_AREA, 1, ReadWrite),
+            region(abi::INIT_STACK_TOP - STACK_SIZE, 16, ReadWrite),
+        ]
+    }
+
+    fn fork(regions: usize) -> Fork {
+        Fork {
+            pc: 0x20_0100,
+            sp: abi::INIT_STACK_TOP - 0x400,
+            transfer: 0x22_0100,
+            regions: regions as u32,
+        }
+    }
+
+    /// Regions takes memory objects with MAP_READ alone.
+    #[test]
+    fn a_region_comes_from_a_readable_memory_object() {
+        use abi::{ObjectKind, Rights};
+        assert!(region_object(
+            ObjectKind::Memory,
+            Rights::MAP_READ | Rights::TRANSFER
+        ));
+        for (kind, rights) in [
+            (ObjectKind::DeviceWindow, Rights::MAP_READ),
+            (ObjectKind::Channel, Rights::MAP_READ),
+            (ObjectKind::Process, Rights::MAP_READ),
+            (ObjectKind::Memory, Rights::MAP_WRITE | Rights::TRANSFER),
+            (ObjectKind::Unknown(9), Rights::MAP_READ),
+        ] {
+            assert!(!region_object(kind, rights), "{kind:?}");
+        }
+    }
+
+    /// Fork round-trips; no regions or more than REGIONS_MAX are refused.
+    #[test]
+    fn fork_round_trips_and_counts_its_regions() {
+        let f = fork(8);
+        let mut w = Writer::new();
+        f.write(&mut w).unwrap();
+        assert_eq!(Fork::read(Reader::new(w.as_bytes())), Ok(f));
+        for n in [0, REGIONS_MAX + 1] {
+            let mut w = Writer::new();
+            fork(n).write(&mut w).unwrap();
+            assert_eq!(Fork::read(Reader::new(w.as_bytes())), Err(Status::BadSize));
+        }
+        let mut w = Writer::new();
+        region(0x1000, 1, abi::Access::Read).write(&mut w).unwrap();
+        let mut bytes = w.as_bytes().to_vec();
+        bytes[12] = 7;
+        assert_eq!(
+            Region::read(&mut Reader::new(&bytes)),
+            Err(Status::BadSize),
+            "W and X together"
+        );
+    }
+
+    /// A copy takes regions inside the rooms of a program alone, each apart
+    /// from the others, REGIONS_MAX at most.
+    #[test]
+    fn a_copy_takes_regions_of_the_layout_alone() {
+        use abi::Access::{Read, ReadWrite};
+        let mut held = Vec::new();
+        for r in program() {
+            assert_eq!(admit(&held, &r), Ok(()), "{r:?}");
+            held.push(r);
+        }
+        let refused = [
+            region(0x22_1000, 1, ReadWrite),               // meets the data
+            region(0x1000_8000, 4, ReadWrite),             // inside a chunk
+            region(0x0FFF_F000, 2, ReadWrite),             // across the heap's edge
+            region(LOADER_BASE, 1, Read),                  // the loader's region
+            region(LOADER_BASE + (8 << 20), 1, ReadWrite), // its window
+            region(0x0D00_0000, 1, ReadWrite),             // the page of the record
+            region(0x0E00_0000, 1, Read),                  // the clock's page
+            region(0x0200_0000, 1, ReadWrite),             // a buffer of a thread
+            region(abi::INIT_MSGBUF, 1, ReadWrite),        // the main buffer
+            region(0x3000_0000, 1, ReadWrite),             // the window of spawn
+            region(0x1F_F800, 1, ReadWrite),               // off a page
+            region(0x1F00_0000, u32::MAX, ReadWrite),      // past the heap
+            region(!0xFFF, 2, ReadWrite),                  // wraps
+        ];
+        for r in refused {
+            assert_eq!(admit(&held, &r), Err(Status::BadSize), "{r:?}");
+        }
+        let mut full: Vec<_> = (0..REGIONS_MAX as u64)
+            .map(|i| region(0x1000_0000 + i * 0x1000, 1, ReadWrite))
+            .collect();
+        let last = full.pop().unwrap();
+        assert_eq!(admit(&full, &last), Ok(()));
+        full.push(last);
+        assert_eq!(
+            admit(&full, &region(0x1100_0000, 1, ReadWrite)),
+            Err(Status::BadSize),
+            "a region past REGIONS_MAX"
+        );
+    }
+
+    /// The copy goes on in code, on a stack and with a transfer in writable
+    /// regions it took, once all of them came.
+    #[test]
+    fn a_copy_jumps_into_code_with_a_stack_it_took() {
+        let held = program();
+        assert_eq!(check_fork(&fork(held.len()), &held), Ok(()));
+        // The stack pointer at the top of the stack is in it.
+        let top = Fork {
+            sp: abi::INIT_STACK_TOP,
+            ..fork(held.len())
+        };
+        assert_eq!(check_fork(&top, &held), Ok(()));
+        let bad = [
+            ("a region missing", fork(held.len() + 1)),
+            (
+                "pc in data",
+                Fork {
+                    pc: 0x22_0000,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "pc in read-only data",
+                Fork {
+                    pc: 0x21_0000,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "pc off an instruction",
+                Fork {
+                    pc: 0x20_0102,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "sp in code",
+                Fork {
+                    sp: 0x20_0100,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "sp nowhere",
+                Fork {
+                    sp: 0x3000_0000,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "sp at the bottom of the stack",
+                Fork {
+                    sp: abi::INIT_STACK_TOP - STACK_SIZE,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "sp unaligned",
+                Fork {
+                    sp: abi::INIT_STACK_TOP - 0x408,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "transfer across the data's end",
+                Fork {
+                    transfer: 0x22_2000 - 64,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "transfer in read-only data",
+                Fork {
+                    transfer: 0x21_0000,
+                    ..fork(held.len())
+                },
+            ),
+            (
+                "transfer unaligned",
+                Fork {
+                    transfer: 0x22_0104,
+                    ..fork(held.len())
+                },
+            ),
+        ];
+        for (what, f) in bad {
+            assert_eq!(check_fork(&f, &held), Err(Status::BadSize), "{what}");
+        }
+    }
+
+    /// Adjacent writable regions make one object; code, read-only data and
+    /// regions apart make their own.
+    #[test]
+    fn adjacent_writable_regions_are_one_object() {
+        let held = program();
+        let objects: Vec<_> = groups(&held).collect();
+        assert_eq!(objects, [0..1, 1..2, 2..3, 3..6, 6..7, 7..8]);
+        assert_eq!(groups(&[]).count(), 0);
+        use abi::Access::ReadExec;
+        let code = [region(0x1000, 1, ReadExec), region(0x2000, 1, ReadExec)];
+        assert_eq!(groups(&code).collect::<Vec<_>>(), [0..1, 1..2]);
+    }
+
+    /// The transfer carries the child's handles and its map.
+    #[test]
+    fn the_transfer_round_trips() {
+        use abi::Access;
+        let map: Vec<_> = (0..REGIONS_MAX as u64)
+            .map(|i| MapEntry {
+                address: 0x1000_0000 + i * 0x1000,
+                pages: 1,
+                access: Access::ReadWrite,
+                handle: 100 + i,
+            })
+            .collect();
+        let handles = [1, 2, 3, 4, 5, 0, 7, 8];
+        let mut out = vec![0xAA; TRANSFER_SIZE];
+        write_transfer(&mut out, handles, &map).unwrap();
+        let t = Transfer::read(&out).unwrap();
+        assert_eq!(t.handles, handles);
+        assert_eq!(t.map().collect::<Vec<_>>(), map);
+        assert!(write_transfer(&mut out[..TRANSFER_SIZE - 1], handles, &map).is_err());
+        let mut more = map.clone();
+        more.push(map[0]);
+        assert!(write_transfer(&mut out, handles, &more).is_err());
+        write_transfer(&mut out, handles, &map[..2]).unwrap();
+        assert_eq!(Transfer::read(&out).unwrap().map().count(), 2);
+        out[0] = b'x';
+        assert_eq!(Transfer::read(&out), None);
     }
 }

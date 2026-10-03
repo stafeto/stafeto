@@ -152,9 +152,16 @@ pub fn parent() -> ManuallyDrop<Handle<Channel>> {
     Handle::borrowed(rt::abi::Handle(PARENT.load(Ordering::Acquire)))
 }
 
+/// A forked child's start channel is its parent's value, which names
+/// nothing of its own: it has none (posix_abi::fork::at_child).
+fn forked() {
+    PARENT.store(0, Ordering::Release);
+}
+
 /// The live handles of the process at the start of a program its loader
-/// started, and the handles its start area names: the loader closed all
-/// that was its own when the two agree (spec 2, 3.2, condition O6).
+/// started, and the handles its start area names (its slots and the
+/// objects of its memory map): the loader closed all that was its own when
+/// the two agree (spec 2, 3.2, condition O6).
 static START_HANDLES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The handles of the process at its start and those its start area
@@ -205,6 +212,37 @@ fn inherited(area: &proto_loader::Start) -> [posix_fs::Inherited; proto_loader::
     list
 }
 
+/// The memory map the loader handed over (proto_loader::MapEntry in the
+/// start area) goes to the layer's map (posix_abi::allocation::adopt).
+///
+/// # Safety
+/// Runs once at startup, after the heap's `init`, on the only thread.
+unsafe fn adopt_map(area: &proto_loader::Start) -> Result<(), &'static str> {
+    use proto_loader::{MAP_ENTRIES, MAP_ENTRY, MapEntry};
+    let count = area.map_count as usize;
+    if count > MAP_ENTRIES {
+        return Err("memory map too long");
+    }
+    // SAFETY: the loader wrote `count` entries at `map` in the area, which
+    // stays mapped.
+    let bytes = unsafe { core::slice::from_raw_parts(area.map as *const u8, count * MAP_ENTRY) };
+    for chunk in bytes.as_chunks::<MAP_ENTRY>().0 {
+        let entry = MapEntry::read(chunk).ok_or("memory map entry malformed")?;
+        // SAFETY: the loader gave the handle to this process for the
+        // layer's map; the caller's promise for the rest.
+        unsafe {
+            posix_abi::allocation::adopt(
+                entry.address as usize,
+                entry.pages as usize,
+                entry.access,
+                Handle::from_raw(rt::abi::Handle(entry.handle)),
+            )
+        }
+        .map_err(|_| "memory map entry refused")?;
+    }
+    Ok(())
+}
+
 /// The start of a program its loader started: the area at
 /// proto_loader::START_AREA names its handles, its current directory, its
 /// umask and its initial stack, whose auxiliary vector this fills.
@@ -217,7 +255,7 @@ fn loaded_main() -> u64 {
         return 125;
     };
     let value = |slot: Slot| rt::abi::Handle(area.handles[slot as usize]);
-    let named = area.handles.iter().filter(|&&h| h != 0).count() as u64;
+    let named = (area.handles.iter().filter(|&&h| h != 0).count() + area.map_count as usize) as u64;
     let one = |slot: Slot| (value(slot) != rt::abi::Handle::INVALID).then(|| value(slot));
     if let Some(console) = one(Slot::Console) {
         rt::console::set(Handle::<Resource>::from_raw(console));
@@ -269,6 +307,7 @@ fn loaded_main() -> u64 {
             })
             .and_then(|files| posix_abi::shared::init(files).map_err(|_| "files failed"))
             .and_then(|()| posix_abi::allocation::init(process).map_err(|_| "heap failed"))
+            .and_then(|()| adopt_map(&area))
             .and_then(|()| {
                 let _ = posix_abi::clock::attach_page(posix_abi::allocation::process());
                 posix_abi::threads::init(Handle::from_raw(thread)).map_err(|_| "threads failed")
@@ -282,6 +321,7 @@ fn loaded_main() -> u64 {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(Handle::from_raw(identity)) };
     }
+    posix_abi::fork::at_child(forked);
     // SAFETY: the platform's umask takes any mask.
     unsafe { stafeto_umask(area.umask) };
     // The auxiliary vector's pairs lie in the area, after the NULL of envp.
@@ -358,5 +398,6 @@ pub extern "C" fn crt_main(arg: u64) -> u64 {
         // SAFETY: still single-threaded, after the process service's init.
         unsafe { posix_abi::process::set_identity(identity) };
     }
+    posix_abi::fork::at_child(forked);
     start_relibc(&arguments[..count])
 }

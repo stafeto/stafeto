@@ -60,6 +60,21 @@ fn passed(deadline: Sleep) -> Result<bool, i32> {
     }
 }
 
+/// Sleeps `ns` nanoseconds of CLOCK_MONOTONIC, no point of cancellation,
+/// for the probes inside the layer.
+pub(crate) fn probe_pause(ns: u64) {
+    let start = now();
+    if let Ok(deadline) = Sleep::new(
+        proto_clock::MONOTONIC,
+        false,
+        (ns / 1_000_000_000) as i64,
+        (ns % 1_000_000_000) as i64,
+        start,
+    ) {
+        let _ = sleep_until(deadline);
+    }
+}
+
 /// Sleeps on the calling thread's timer until `deadline`: EINTR when an
 /// entry or a request of cancellation ended it before.
 pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
@@ -80,6 +95,7 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
         // An entry between the timer and `receive` stays pending and makes
         // `receive` return at once; a handler that sleeps itself cannot
         // take this wait's timer meanwhile.
+        let handled = block.handled.load(Ordering::SeqCst);
         let guard = rt::upcall::defer_entries().expect("sleep entry deferral");
         let _ = sys::timer_set(&timer, at);
         let got = sys::receive(&channel);
@@ -93,6 +109,10 @@ pub(crate) fn sleep_until(deadline: Sleep) -> Result<(), i32> {
                 break Err(EINTR);
             }
             Ok(_) => {}
+            // An entry that ran no handler (a stop of exec or fork parked
+            // the thread) leaves the sleep on: EINTR is for a caught signal.
+            Err(Error::Interrupted)
+                if block.handled.load(Ordering::SeqCst) == handled && !cancel::requested() => {}
             Err(Error::Interrupted) => break Err(EINTR),
             Err(error) => panic!("sleep receive: {error:?}"),
         }

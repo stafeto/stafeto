@@ -3,7 +3,8 @@
 #
 # The os-test tests that pass on stafeto (cargo xtask os-test): `ci`
 # fails when one of them does not. A test that starts to pass joins it.
-# Those of basic/ and the exec tests of signal/ run from files (5c).
+# Those of basic/ and the exec tests of signal/ run from files (5c); the
+# tests of process/ and the others that call fork run on fork (5d).
 io/open-tmpdir-rdonly-append
 io/open-tmpdir-rdonly-creat
 io/open-tmpdir-rdonly-directory
@@ -67,3 +68,18 @@ basic/unistd/execlp
 basic/unistd/execv
 basic/unistd/execve
 basic/unistd/execvp
+process/fork-exec-setpgid-in-child
+process/fork-setpgid
+process/fork-setpgid-invalid
+process/fork-setpgid-on-parent
+process/fork-setpgid-on-parent-move
+process/fork-setsid-setpgid
+process/zombie-getpgid
+basic/unistd/fork
+basic/unistd/pause
+basic/unistd/setpgid
+basic/unistd/setsid
+basic/pthread/pthread_atfork
+basic/sys_wait/wait
+basic/sys_wait/waitid
+basic/sys_wait/waitpid

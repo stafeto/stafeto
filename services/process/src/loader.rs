@@ -159,7 +159,9 @@ impl Image {
             self.data_at + self.data_len,
             priority.into(),
             priority,
-            Policy::Fifo,
+            // The program's first thread: SCHED_OTHER, round robin (spec
+            // 2), as a forked child's thread goes on.
+            Policy::RoundRobin,
         )
     }
 

@@ -23,6 +23,21 @@ struct Args {
     mode: u8,
     epoch: u64,
 }
+unsafe extern "C" fn caught(_signal: c_int) {}
+
+/// Interrupts the sleep of thread `id` with a caught SIGUSR1: EINTR is for
+/// a caught signal (an interrupt with no handler leaves a sleep on).
+fn interrupt(id: u64) {
+    use crate::layer::signals::{self as api, SigAction};
+    let action = SigAction {
+        handler: caught as *const () as u64,
+        mask: 0,
+        flags: 0,
+    };
+    unsafe { api::sigaction(posix_abi::constants::SIGUSR1, &action, ptr::null_mut()) };
+    let _ = ffi::pthread_kill(id, posix_abi::constants::SIGUSR1);
+}
+
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -228,8 +243,7 @@ pub(super) fn run() -> bool {
     ) {
         return failed(204);
     }
-    let native = unsafe { threads::probe_native(id) }.unwrap();
-    sys::thread_interrupt(&native).unwrap();
+    interrupt(id);
     if !finished(&channel, &waiter, 1)
         || !join(id, 1)
         || REM_SEC.load(Ordering::Relaxed) != 0
@@ -251,8 +265,7 @@ pub(super) fn run() -> bool {
     if !blocked(id) {
         return failed(206);
     }
-    let native = unsafe { threads::probe_native(id) }.unwrap();
-    sys::thread_interrupt(&native).unwrap();
+    interrupt(id);
     if !finished(&channel, &waiter, EINTR as usize + 2)
         || !join(id, EINTR as usize + 2)
         || !sentinel()
@@ -304,10 +317,9 @@ pub(super) fn run() -> bool {
     {
         return failed(212);
     }
-    // A calendar set forward wakes no sleep until the clock patch of relibc: an interrupt
-    // ends this one.
-    let native = unsafe { threads::probe_native(id) }.unwrap();
-    sys::thread_interrupt(&native).unwrap();
+    // A calendar set forward wakes no sleep until the clock patch of relibc: a caught
+    // signal ends this one.
+    interrupt(id);
     if !finished(&channel, &waiter, EINTR as usize + 2) || !join(id, EINTR as usize + 2) {
         return failed(213);
     }

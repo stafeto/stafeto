@@ -63,6 +63,68 @@ pub unsafe fn init(main: Handle<Thread>) -> Result<(), Error> {
     Ok(())
 }
 
+/// The thread of a forked child (spec 2, 3.2), which goes on in the copy
+/// of the TCB of its parent's thread that called fork: its own handle
+/// `own` (the loader's thread, MANAGE), a new channel and timer, its
+/// signals' word in the block cleared but the mask, which the caller
+/// gives back, and no wait by address; the parent's handles in the copy
+/// go without a close. Its place in the table of threads stays
+/// (crate::relibc::after_fork), so relibc's number of the thread holds.
+///
+/// # Safety
+/// The child's only thread, before anything else of the layer runs.
+pub unsafe fn after_fork(own: Handle<Thread>) -> Result<(), i32> {
+    use posix_thread::flag;
+    let block = own_block();
+    let base = sys::thread_info(&own).map_err(|_| EIO)?.base;
+    // The loader's thread runs round robin: the parent's thread's policy
+    // comes back (FIFO for one that asked for it).
+    let policy = rt::abi::Policy::from_raw(block.policy.load(Ordering::Relaxed));
+    if let Some(rt::abi::Policy::Fifo) = policy {
+        let _ = sys::thread_set_priority(&own, base, rt::abi::Policy::Fifo);
+    }
+    let channel = sys::channel_create(base).map_err(|_| EAGAIN)?;
+    let timer = sys::timer_create(&channel, base).map_err(|_| EAGAIN)?;
+    let id = block.thread_id;
+    let native = own.into_raw().0;
+    // The main thread's block names its native handle; another place's a
+    // copy with MANAGE, which `collect` closes apart from the native one.
+    let thread = if id == 1 {
+        MAIN_SELF.store(native, Ordering::Release);
+        native
+    } else {
+        let borrowed = Handle::<Thread>::borrowed(rt::abi::Handle(native));
+        sys::handle_duplicate(&*borrowed, rt::abi::Rights::MANAGE)
+            .map_err(|_| EAGAIN)?
+            .into_raw()
+            .0
+    };
+    block.thread.store(thread, Ordering::Relaxed);
+    block.base_level.store(u32::from(base), Ordering::Relaxed);
+    block.timer.store(timer.into_raw().0, Ordering::Relaxed);
+    block.channel.store(channel.into_raw().0, Ordering::Relaxed);
+    block.waker.store(0, Ordering::Relaxed);
+    block.pending.store(0, Ordering::Relaxed);
+    block.process.store(0, Ordering::Relaxed);
+    block.wait_set.store(0, Ordering::Relaxed);
+    block.previous.store(0, Ordering::Relaxed);
+    block.next.store(0, Ordering::Relaxed);
+    block.address.store(0, Ordering::Relaxed);
+    block.cancel_point.store(0, Ordering::Relaxed);
+    block.flags.fetch_and(
+        !(flag::SIGNAL_WAIT
+            | flag::BUCKET
+            | flag::ENTRY_DEFERRED
+            | flag::SIGNALS_READY
+            | flag::NO_RESTART
+            | flag::WAITING),
+        Ordering::SeqCst,
+    );
+    // SAFETY: the caller's promise.
+    unsafe { crate::relibc::after_fork(id, native) };
+    Ok(())
+}
+
 /// The calling thread's channel, timer and own handle `own` (MANAGE) in its
 /// block, and its entry of signals.
 fn attach_resources(own: u64) -> Result<(), i32> {
@@ -105,7 +167,7 @@ fn close_raw(raw: u64) {
     }
 }
 
-/// Moves the calling thread to kernel level `level` under FIFO (1 to one
+/// Moves the calling thread to kernel level `level` with its policy (1 to one
 /// below the process's ceiling; EINVAL otherwise) through its own handle in
 /// its block, and makes it the thread's base level, which the lock of a
 /// bucket returns to. A Rust call for the measurements of rtbench 2
@@ -121,7 +183,11 @@ pub fn set_level(level: u8) -> Result<(), i32> {
     if level == 0 || level >= crate::ceiling().map_err(|_| EIO)? {
         return Err(EINVAL);
     }
-    sys::thread_set_priority(&thread, level, Policy::Fifo).map_err(|_| EINVAL)?;
+    // The thread keeps its policy: round robin (SCHED_OTHER) unless it
+    // asked for FIFO, which comes with the scheduling attributes of 5h.
+    let policy =
+        Policy::from_raw(block.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
+    sys::thread_set_priority(&thread, level, policy).map_err(|_| EINVAL)?;
     block.base_level.store(u32::from(level), Ordering::Relaxed);
     // A wakeup through the channel or the timer works at their level until
     // the next receive: they follow the thread's. Cancellation reaches the

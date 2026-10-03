@@ -118,6 +118,25 @@ pub fn defer_entry() -> bool {
     }
 }
 
+/// The table of waits by address is empty again, its locks free: in a
+/// forked child the nodes of its parent's other threads are not threads
+/// of the child (spec 2, 3.2). The child's only thread waits in none.
+pub fn after_fork() {
+    for bucket in &TABLE {
+        bucket.head.store(ptr::null_mut(), Ordering::Relaxed);
+        bucket.tail.store(ptr::null_mut(), Ordering::Relaxed);
+        bucket.waiters.store(0, Ordering::Relaxed);
+        bucket.lock.store(0, Ordering::Release);
+    }
+}
+
+/// Runs `run` holding the lock of the bucket of `address`, for the probes
+/// of a fork while another thread holds it.
+pub fn hold_bucket(address: usize, run: impl FnOnce()) {
+    let _held = lock(bucket(address));
+    run();
+}
+
 /// A bucket: the count of its waiters, the word of its lock and its list.
 #[repr(C, align(32))]
 struct Bucket {
@@ -165,7 +184,9 @@ fn raised(block: &Block) -> bool {
 /// Moves the thread of `block` to `level` through its own handle.
 fn set_level(block: &Block, level: u8) {
     if let Some(thread) = own_thread(block) {
-        let _ = sys::thread_set_priority(&thread, level, Policy::Fifo);
+        let policy =
+            Policy::from_raw(block.policy.load(Ordering::Relaxed)).unwrap_or(Policy::RoundRobin);
+        let _ = sys::thread_set_priority(&thread, level, policy);
     }
 }
 
