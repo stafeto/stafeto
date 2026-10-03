@@ -29,6 +29,17 @@ impl Client {
             vouched: core::sync::atomic::AtomicBool::new(false),
         })
     }
+    /// A client through `channel`, a session the program was given.
+    pub fn from_session(channel: Handle<Channel>) -> Self {
+        Self {
+            channel,
+            vouched: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    /// The session, which a child gets a clone of.
+    pub fn session(&self) -> &Handle<Channel> {
+        &self.channel
+    }
     fn call<'a>(
         &self,
         request: &[u8],
@@ -180,7 +191,7 @@ impl Client {
     /// SET: the service sets the date once, whatever signals come while
     /// the caller waits for the reply. `identity` is the caller's identity
     /// session of the process service (a copy of it goes with the request:
-    /// the service keeps the first for the session); without one the
+    /// the service keeps the last one offered for the session); without one the
     /// service answers PERMISSION.
     pub fn set(&self, time: Time, identity: Option<&Handle<Channel>>) -> Result<(), Status> {
         time.value()

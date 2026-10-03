@@ -17,6 +17,16 @@ use rt::service::{Answer, Config, Heartbeat, Request, Service, Session};
 use rt::sys;
 rt::entry!(main);
 
+/// The sessions: the POSIX processes init starts and their children, each
+/// with a session of its own (Clone): the 255 records of the process
+/// service and the services beside them.
+const SESSIONS: usize = 320;
+/// The clones the service keeps alive at most, for all its clients: one
+/// for each record of the process service and room beside them.
+const CLONES: usize = 320;
+/// The mark of the labels the service gives itself (Clone): bit 63, which
+/// no label of init has.
+const OWN: u64 = 1 << 63;
 fn now() -> u64 {
     rt::time::ticks_to_ns(rt::time::now())
 }
@@ -51,9 +61,13 @@ fn main(_: u64) -> u64 {
         }),
     };
     rt::println!("clock: ready (unsynchronized epoch)");
-    let _ = rt::service::run::<Clocks, 8, 0>(
+    let _ = rt::service::run::<Clocks, SESSIONS, 0>(
         &channel,
         &mut Clocks {
+            channel: Handle::borrowed(channel.raw()),
+            level,
+            given: 0,
+            clones: proto_wire::clones::Clones::new(),
             clock,
             page,
             watches: core::array::from_fn(|_| None),
@@ -83,6 +97,13 @@ struct Identity {
     known: Known,
 }
 struct Clocks {
+    /// The service's channel, which the sessions Clone gives are copies
+    /// of, at the loop's level, and how many it gave.
+    channel: ManuallyDrop<Handle<Channel>>,
+    level: u8,
+    given: u64,
+    /// The sessions Clone gave that live, bounded for each client.
+    clones: proto_wire::clones::Clones<CLONES>,
     clock: Clock,
     page: Page,
     watches: [Option<Watch>; 8],
@@ -171,8 +192,10 @@ impl Clocks {
 
     /// Whether the process behind the session `label` may set the clock:
     /// its effective UID is 0 (spec 2, 3.1). `offered` is the identity
-    /// session the request brought; the first one of a session is kept and
-    /// the later ones close. The process service vouches for it through
+    /// session the request brought, which the session keeps in place of
+    /// the one before: after an exec the session moved to the new image,
+    /// whose identity is another, and the old one vouches for nothing
+    ///. The process service vouches for it through
     /// the notary session, and what it said is remembered with the
     /// generation of the credentials and asked again only when the
     /// generation on the page moved: no call to the process service
@@ -188,7 +211,15 @@ impl Clocks {
             .iter()
             .position(|i| i.as_ref().is_some_and(|i| i.label == label));
         let slot = match (found, offered) {
-            (Some(slot), _) => slot,
+            (Some(slot), None) => slot,
+            (Some(slot), Some(channel)) => {
+                self.identities[slot] = Some(Identity {
+                    label,
+                    channel,
+                    known: Known::new(),
+                });
+                slot
+            }
             (None, Some(channel)) => {
                 // A free place, or else each in turn: the session whose
                 // place went brings its copy with its next SET again.
@@ -348,6 +379,27 @@ impl Service<0> for Clocks {
             });
             return Answer::Status(Status::Ok);
         }
+        if r.method() == Method::Clone as u16 {
+            if r.body().finish().is_err() || !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+            if self.clones.room(r.label()).is_err() {
+                return Answer::Status(Status::Kernel(rt::abi::Error::LimitReached));
+            }
+            self.given += 1;
+            let rights = rt::abi::Rights::SEND.union(rt::abi::Rights::TRANSFER);
+            let label = OWN | self.given;
+            return match sys::handle_label(&self.channel, rights, label, self.level) {
+                Ok(session) => {
+                    if r.reply().u32(0).is_err() {
+                        return Answer::Status(Status::BadSize);
+                    }
+                    let _ = self.clones.add(label, r.label());
+                    Answer::Reply([session.erase()].into())
+                }
+                Err(e) => Answer::Status(Status::Kernel(e)),
+            };
+        }
         if r.handles.len() > usize::from(r.method() == Method::Set as u16) {
             return Answer::Status(Status::BadSize);
         }
@@ -456,8 +508,12 @@ impl Service<0> for Clocks {
                 }
                 Answer::Reply(handles)
             }
-            Some(Method::Watch) | None => Answer::Status(Status::UnknownMethod),
+            Some(Method::Watch | Method::Clone) | None => Answer::Status(Status::UnknownMethod),
         }
+    }
+    /// The last copy of a session Clone gave went.
+    fn closed(&mut self, label: u64) {
+        self.clones.gone(label);
     }
     fn gone(&mut self, s: &mut Session<(), 0>) {
         for slot in &mut self.identities {

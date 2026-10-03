@@ -17,6 +17,9 @@ fn main() {
     println!("cargo:rerun-if-changed=procs.c");
     println!("cargo:rerun-if-env-changed=STAFETO_RELIBC_SYSROOT");
     println!("cargo:rerun-if-env-changed=STAFETO_C_TOOL_DIR");
+    // The branches of the steps mode (xtask process-steps N).
+    println!("cargo:rerun-if-env-changed=STEPS_BRANCHES");
+    let branches = env::var("STEPS_BRANCHES").unwrap_or_else(|_| "7".to_owned());
     let manifest =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"));
     let sysroot = env::var_os("STAFETO_RELIBC_SYSROOT")
@@ -41,6 +44,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", lib.join("libc.a").display());
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
     run(Command::new(tools.join("clang"))
+        .arg(format!("-DSTEPS_BRANCHES={branches}"))
         .args([
             // The Linux C ABI relibc's headers describe.
             "--target=aarch64-linux-gnu",

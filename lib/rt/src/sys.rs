@@ -510,6 +510,15 @@ pub fn channel_info(channel: &Handle<Channel>) -> Result<ChannelInfo, Error> {
     Ok(ChannelInfo::from_words([x[1], x[2], x[3], x[4]]))
 }
 
+/// object_info(LABEL): the label of `copy`, a labelled copy of the channel
+/// `own`, which the caller receives on (RECEIVE); ACCESS_DENIED for a copy
+/// of another channel, WRONG_TYPE for one without a label. O(1).
+pub fn copy_label(own: &Handle<Channel>, copy: &Handle<Channel>) -> Result<u64, Error> {
+    let args = [copy.raw().0, abi::INFO_LABEL, own.raw().0];
+    let x = call::<{ Call::ObjectInfo.number() }>(&args)?;
+    Ok(x[1])
+}
+
 /// object_info(IRQ): the binding's line, whether it is masked until
 /// `irq_ack`, and whether it is edge-triggered.
 pub fn irq_info(irq: &Handle<Interrupt>) -> Result<IrqInfo, Error> {

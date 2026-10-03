@@ -11,7 +11,7 @@ use core::ffi::{c_char, c_int, c_ulong, c_void};
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, Ordering};
 use posix_abi::constants::{EBADF, EFAULT, EINVAL, ENOSYS, ESPIPE};
-use posix_fs::{DescriptorFlags, FileKind, NodeInfo, PosixFs, SeekFrom};
+use posix_fs::{DescriptorFlags, FileKind, NodeInfo, SeekFrom, Target, Transport};
 
 /// relibc's struct stat on AArch64 Linux (asm-generic/stat.h).
 #[repr(C)]
@@ -116,18 +116,26 @@ pub unsafe extern "C" fn stafeto_fstatat(
     }
     // SAFETY: the caller's promise.
     let path = (!path.is_null()).then(|| unsafe { bytes(path) });
-    let info = posix_abi::shared::with_files(|files| match path {
+    use posix_abi::shared::{held, resolved};
+    let info = match path {
         Some(path) if !path.is_empty() => {
             if fd != AT_FDCWD && path.first() != Some(&b'/') {
-                return Err(ENOSYS);
+                Err(ENOSYS)
+            } else {
+                resolved(path, |transport, path| {
+                    transport.stat_information(path).map_err(posix_abi::error)
+                })
             }
-            files.stat_information(path).map_err(posix_abi::error)
         }
-        _ if path.is_none() || flags & AT_EMPTY_PATH != 0 => files
-            .descriptor_information(number(fd)?)
-            .map_err(posix_abi::error),
+        _ if path.is_none() || flags & AT_EMPTY_PATH != 0 => number(fd).and_then(|fd| {
+            held(fd, |transport, target| {
+                transport
+                    .descriptor_information(target)
+                    .map_err(posix_abi::error)
+            })
+        }),
         _ => Err(posix_abi::constants::ENOENT),
-    });
+    };
     match info {
         Ok(info) => {
             // SAFETY: the caller's promise.
@@ -153,16 +161,18 @@ fn record(out: &mut [u8], inode: u64, next: i64, kind: u8, name: &[u8]) -> Optio
     Some(length)
 }
 
-fn entries(files: &mut PosixFs, fd: u32, out: &mut [u8], position: u64) -> Result<usize, c_int> {
+fn entries(files: Transport, fd: Target, out: &mut [u8], position: u64) -> Result<usize, c_int> {
     let error = posix_abi::error;
-    let mut directory = files.fdopendir(fd).map_err(error)?;
+    if files.fstat(fd).map_err(error)?.kind != FileKind::Directory {
+        return Err(posix_abi::error(posix_fs::FsError::NotDirectory));
+    }
     let position = i64::try_from(position).map_err(|_| EINVAL)?;
     files.lseek(fd, position, SeekFrom::Start).map_err(error)?;
     let mut used = 0;
     loop {
         let before = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
         let mut name = [0u8; 256];
-        let Some(entry) = files.readdir(&mut directory, &mut name).map_err(error)? else {
+        let Some(entry) = files.readdir(fd, &mut name).map_err(error)? else {
             break;
         };
         let after = files.lseek(fd, 0, SeekFrom::Current).map_err(error)?;
@@ -202,27 +212,33 @@ pub unsafe extern "C" fn stafeto_getdents(
 ) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    match posix_abi::shared::with_files(|files| entries(files, number(fd)?, out, position)) {
+    let result = number(fd).and_then(|fd| {
+        posix_abi::shared::held(fd, |transport, target| {
+            entries(transport, target, out, position)
+        })
+    });
+    match result {
         Ok(used) => used as isize,
         Err(errno) => -(errno as isize),
     }
 }
 
-/// pread and pwrite: at `offset`, the descriptor's own offset as before.
+/// pread and pwrite: at `offset`, the description's own offset as it
+/// was (READ_AT and WRITE_AT of the service), outside the lock.
 fn at_offset(
     fd: c_int,
     offset: i64,
-    run: impl FnOnce(&PosixFs, u32) -> Result<usize, posix_fs::FsError>,
+    run: impl FnOnce(Transport, u32, u64) -> Result<usize, posix_fs::FsError>,
 ) -> isize {
-    let result = posix_abi::shared::with_files(|files| {
-        let fd = number(fd)?;
-        let error = posix_abi::error;
-        // The console has no offset: ESPIPE.
-        let before = files.lseek(fd, 0, SeekFrom::Current).map_err(|_| ESPIPE)?;
-        files.lseek(fd, offset, SeekFrom::Start).map_err(error)?;
-        let done = run(files, fd).map_err(error);
-        files.lseek(fd, before, SeekFrom::Start).map_err(error)?;
-        done
+    let result = number(fd).and_then(|fd| {
+        posix_abi::shared::held(fd, |transport, target| {
+            // The console has no offset: ESPIPE.
+            let Target::Ram(fd) = target else {
+                return Err(ESPIPE);
+            };
+            let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
+            run(transport, fd, offset).map_err(posix_abi::error)
+        })
     });
     match result {
         Ok(count) => count as isize,
@@ -236,7 +252,7 @@ fn at_offset(
 pub unsafe extern "C" fn stafeto_pread(fd: c_int, buf: *mut u8, len: usize, offset: i64) -> isize {
     // SAFETY: the caller's promise.
     let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    at_offset(fd, offset, |files, fd| files.read(fd, out))
+    at_offset(fd, offset, |files, fd, at| files.read_at(fd, at, out))
 }
 
 /// # Safety
@@ -250,7 +266,7 @@ pub unsafe extern "C" fn stafeto_pwrite(
 ) -> isize {
     // SAFETY: the caller's promise.
     let bytes = unsafe { core::slice::from_raw_parts(buf, len) };
-    at_offset(fd, offset, |files, fd| files.write(fd, bytes))
+    at_offset(fd, offset, |files, fd, at| files.write_at(fd, at, bytes))
 }
 
 /// # Safety
@@ -397,11 +413,13 @@ pub unsafe extern "C" fn stafeto_ioctl(
     request: c_ulong,
     argument: *mut c_void,
 ) -> c_int {
-    let console = posix_abi::shared::with_files(|files| {
-        let info = files
-            .descriptor_information(number(fd)?)
-            .map_err(posix_abi::error)?;
-        Ok(info.kind == 3)
+    let console = number(fd).and_then(|fd| {
+        posix_abi::shared::held(fd, |transport, target| {
+            let info = transport
+                .descriptor_information(target)
+                .map_err(posix_abi::error)?;
+            Ok(info.kind == 3)
+        })
     });
     match (request, console) {
         (_, Err(errno)) => -errno,
@@ -487,6 +505,11 @@ pub extern "C" fn stafeto_setresgid(real: u32, effective: u32, saved: u32) -> c_
 }
 
 static UMASK: AtomicU32 = AtomicU32::new(0o022);
+
+/// The process's umask, which a child spawned from a file inherits.
+pub(crate) fn umask() -> u32 {
+    UMASK.load(Ordering::Relaxed)
+}
 
 /// umask: the process's mask (no file the layer creates reads it yet).
 #[unsafe(no_mangle)]

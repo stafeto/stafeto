@@ -23,7 +23,7 @@
 //! implementation.
 use crate::{constants::*, threads};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering, fence};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 pub use posix_signals::{DEFAULT, IGNORE};
 use posix_sync::LayerLock;
 use posix_thread::{Block, flag};
@@ -233,6 +233,11 @@ fn give_back(block: &Block, bits: u64) {
 /// caller, which delivers after. A signal no thread takes stays on the
 /// page.
 pub(crate) fn route() {
+    // While an exec stops the process, the signals of the process wait on
+    // the page for the new image's router (spec 2, 3.2 step 1).
+    if STOPPING.load(Ordering::Acquire) != 0 {
+        return;
+    }
     let page = crate::process::page();
     let mut pending = page.pending.load(Ordering::Acquire);
     let own = own() as *const Block;
@@ -306,6 +311,11 @@ pub fn take_waiting() {
         mask & posix_signals::VALID & !posix_signals::UNBLOCKABLE,
         Ordering::SeqCst,
     );
+    // The calling thread's pending signals an exec carried, under that
+    // mask ([P24-EXEC]).
+    own()
+        .pending
+        .fetch_or(CARRIED.swap(0, Ordering::AcqRel), Ordering::SeqCst);
     route();
     deliver_now();
 }
@@ -678,6 +688,112 @@ unsafe extern "C" {
     fn relibc_errno_location() -> *mut core::ffi::c_int;
 }
 
+/// The calling thread's own signals an exec carried to this image
+/// (proto_loader::Carried), which the main thread takes as pending once
+/// its mask is set (`take_waiting`).
+static CARRIED: AtomicU64 = AtomicU64::new(0);
+
+/// Keeps the pending signals an exec carried for the main thread.
+pub fn carry_pending(bits: u64) {
+    CARRIED.store(bits, Ordering::Release);
+}
+
+/// The thread that stops the others for an exec (its block's address), 0
+/// for none; how many parked; the channel the stopper waits on; and the
+/// channels the parked threads wait on until they go on.
+static STOPPING: AtomicUsize = AtomicUsize::new(0);
+static PARKED: AtomicUsize = AtomicUsize::new(0);
+static STOPPER: AtomicU64 = AtomicU64::new(0);
+static PARKING: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+/// Stops every other attached thread of the process for an exec (spec 2,
+/// 3.2 step 1, mya2.V6): each is asked for its entry and parks in it,
+/// outside every critical section of the layer, so that it holds no lock
+/// of the layer; a thread that waits for a reply of a service parks once
+/// the reply came. The process's signals wait on its page meanwhile. The
+/// caller has every signal blocked.
+pub(crate) fn stop_others() -> Result<(), i32> {
+    let level = own().base_level.load(Ordering::Relaxed) as u8;
+    let own = own() as *const Block as usize;
+    let channel = sys::channel_create(level.max(1)).map_err(|_| EAGAIN)?;
+    STOPPER.store(channel.raw().0, Ordering::Release);
+    PARKED.store(0, Ordering::Release);
+    STOPPING.store(own, Ordering::Release);
+    let mut others = 0;
+    threads::each_block(|block| {
+        let ready = block.flags.load(Ordering::SeqCst) & flag::SIGNALS_READY != 0;
+        if core::ptr::from_ref(block) as usize != own && ready {
+            let thread = Handle::<rt::handle::Thread>::borrowed(rt::abi::Handle(
+                block.thread.load(Ordering::Relaxed),
+            ));
+            if sys::thread_upcall_request(&thread).is_ok() {
+                others += 1;
+            }
+        }
+    });
+    while PARKED.load(Ordering::Acquire) < others {
+        if sys::receive(&channel).is_err() {
+            break;
+        }
+    }
+    // The stopper's channel lives as long as the stop.
+    core::mem::forget(channel);
+    Ok(())
+}
+
+/// The other threads go on: the exec failed before its commit.
+pub(crate) fn resume_others() {
+    STOPPING.store(0, Ordering::Release);
+    for place in &PARKING {
+        let raw = place.swap(0, Ordering::AcqRel);
+        if raw != 0 {
+            let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(raw)), 1);
+        }
+    }
+    let stopper = STOPPER.swap(0, Ordering::AcqRel);
+    if stopper != 0 {
+        drop(Handle::<Channel>::from_raw(rt::abi::Handle(stopper)));
+    }
+}
+
+/// Parks the calling thread while an exec of another thread stops the
+/// process: its process signals go back to the page, it says so to the
+/// stopper and waits on a channel of its own until the exec failed; a
+/// successful exec ends the process meanwhile.
+fn park() {
+    let block = own();
+    give_back(block, block.process.load(Ordering::SeqCst));
+    let level = block.base_level.load(Ordering::Relaxed) as u8;
+    let Ok(channel) = sys::channel_create(level.max(1)) else {
+        return;
+    };
+    let raw = channel.raw().0;
+    let placed = PARKING.iter().find(|p| {
+        p.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    });
+    PARKED.fetch_add(1, Ordering::AcqRel);
+    let stopper = STOPPER.load(Ordering::Acquire);
+    if stopper != 0 {
+        let _ = sys::notify(&Handle::<Channel>::borrowed(rt::abi::Handle(stopper)), 1);
+    }
+    while placed.is_some() && STOPPING.load(Ordering::Acquire) != 0 {
+        if sys::receive(&channel).is_err() {
+            break;
+        }
+    }
+    if let Some(place) = placed {
+        let _ = place.compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// Whether the calling thread is to park: another thread stops the
+/// process for an exec.
+fn stopped_by_other() -> bool {
+    let stopping = STOPPING.load(Ordering::Acquire);
+    stopping != 0 && stopping != own() as *const Block as usize
+}
+
 /// Binds and enables the calling thread's entry, then delivers what came
 /// before it.
 pub(crate) fn attach() -> Result<(), i32> {
@@ -783,6 +899,9 @@ fn take(block: &Block) -> Option<(i32, SigAction, Option<SigInfo>)> {
 /// no call. `native` is the entry's frame, or null for a direct delivery,
 /// which leaves a handler with SA_SIGINFO to the thread's entry.
 unsafe fn deliver(native: *mut upcall::Context, entered: bool) {
+    if stopped_by_other() {
+        park();
+    }
     // The process's signals first: one of them may be this thread's.
     route();
     let block = own();

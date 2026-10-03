@@ -58,6 +58,7 @@ mod tests {
             pid: 300,
             credentials,
             generation,
+            loader: None,
         }
     }
 

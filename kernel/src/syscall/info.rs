@@ -9,7 +9,7 @@ use crate::mm::{pages, phys};
 use crate::object::Object;
 use crate::process;
 use crate::thread::{self, Thread};
-use crate::{channel, cleanup, irq, sched, timer};
+use crate::{channel, cleanup, irq, sched, session, timer};
 use abi::{Error, KernelStats, ProcessHandles, ProcessMemory, Rights};
 use core::ptr::NonNull;
 use kcore::args::{inline_len_arg, reserved_arg};
@@ -24,7 +24,11 @@ use kcore::args::{inline_len_arg, reserved_arg};
 /// rights and returns abi::MemoryInfo in x1-x3; THREAD_STATE a thread's and
 /// returns abi::ThreadInfo in x1-x4; CHANNEL a channel's, a labelled copy
 /// too, and returns abi::ChannelInfo in x1-x4; IRQ an interrupt binding's
-/// and returns abi::IrqInfo in x1-x3. LOG takes the system resource with
+/// and returns abi::IrqInfo in x1-x3. LABEL takes a labelled copy of a
+/// channel and in x2 a handle of that channel with RECEIVE, and returns the
+/// copy's label in x1, O(1): ACCESS_DENIED for a copy of another channel,
+/// WRONG_TYPE for a channel handle without a label (the lookup of x2 comes
+/// first). LOG takes the system resource with
 /// KSTATS, takes up to abi::LOG_BATCH records of the kernel log into the
 /// start of the caller's message buffer and returns abi::LogBatch in
 /// x1-x3 (spec 16.3, crate::log::take).
@@ -33,7 +37,7 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         if a[2] > 1 {
             return Err(Error::InvalidArgs);
         }
-    } else if a[1] != abi::INFO_LOG {
+    } else if a[1] != abi::INFO_LOG && a[1] != abi::INFO_LABEL {
         reserved_arg(a[2])?;
     }
     let target = || lookup(thread, a[0], Rights::NONE, Object::process);
@@ -91,6 +95,14 @@ pub(super) fn object_info(thread: NonNull<Thread>, a: &Args) -> Result<Values, E
         abi::INFO_IRQ => {
             let b = lookup(thread, a[0], Rights::NONE, Object::irq)?;
             Ok(Values::new(&irq::info(b).to_words()))
+        }
+        abi::INFO_LABEL => {
+            let own = lookup(thread, a[2], Rights::RECEIVE, Object::channel)?;
+            let s = lookup(thread, a[0], Rights::NONE, Object::session)?;
+            if session::channel(s) != own {
+                return Err(Error::AccessDenied);
+            }
+            Ok(Values::new(&[session::label(s)]))
         }
         abi::INFO_LOG => {
             lookup(thread, a[0], Rights::KSTATS, Object::resource)?;

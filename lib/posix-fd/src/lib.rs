@@ -3,7 +3,11 @@
 
 //! Process-local descriptors sharing backend open descriptions. The owner
 //! serializes mutations; the table deliberately cannot be cloned. Backend
-//! ownership ends after the last local reference, through a release callback.
+//! ownership ends after the last local reference: a close or a replacement
+//! hands the backend back to the caller to release, which it does after it
+//! let go of the owner (spec 2, 3.4; 5c). A backend an operation holds
+//! (`hold`) outside the owner's lock goes only once the last hold ends
+//! (`unhold`), so that its number is never reused under a request in flight.
 
 #![no_std]
 
@@ -27,13 +31,26 @@ struct Entry<T> {
     flags: Flags,
 }
 
+/// A backend held by operations outside the owner's lock: how many hold
+/// it, and whether its last descriptor went meanwhile.
+#[derive(Clone, Copy)]
+struct Hold<T> {
+    backend: T,
+    count: u16,
+    closed: bool,
+}
+
 pub struct Table<T: Copy + Eq, const N: usize> {
     entries: [Option<Entry<T>>; N],
+    holds: [Option<Hold<T>>; N],
 }
 
 impl<T: Copy + Eq, const N: usize> Default for Table<T, N> {
     fn default() -> Self {
-        Self { entries: [None; N] }
+        Self {
+            entries: [None; N],
+            holds: [None; N],
+        }
     }
 }
 
@@ -58,6 +75,14 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         self.entry(fd)?;
         self.entries[fd as usize].as_mut().unwrap().flags = flags;
         Ok(())
+    }
+
+    /// The descriptors that are open, with their backends and flags.
+    pub fn open(&self) -> impl Iterator<Item = (u32, T, Flags)> + '_ {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(fd, e)| e.map(|e| (fd as u32, e.backend, e.flags)))
     }
 
     /// Return the lowest free descriptor at least `minimum` without allocating it.
@@ -90,35 +115,99 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         Ok(fd)
     }
 
-    fn last_reference(&self, backend: T) -> bool {
-        self.entries
-            .iter()
-            .flatten()
-            .filter(|entry| entry.backend == backend)
-            .count()
-            == 1
+    fn referenced(&self, backend: T) -> bool {
+        self.entries.iter().flatten().any(|e| e.backend == backend)
     }
 
-    pub fn close(
-        &mut self,
-        fd: u32,
-        release: impl FnOnce(T) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        let backend = self.get(fd)?;
-        if self.last_reference(backend) {
-            release(backend)?;
+    /// `backend` lost a descriptor: the caller releases it when no other
+    /// descriptor names it and no operation holds it; a held one goes at
+    /// its last `unhold`.
+    fn left(&mut self, backend: T) -> Option<T> {
+        if self.referenced(backend) {
+            return None;
         }
-        self.entries[fd as usize] = None;
-        Ok(())
+        match self
+            .holds
+            .iter_mut()
+            .flatten()
+            .find(|h| h.backend == backend)
+        {
+            Some(hold) => {
+                hold.closed = true;
+                None
+            }
+            None => Some(backend),
+        }
     }
 
-    pub fn dup2(
-        &mut self,
-        source: u32,
-        target: u32,
-        release: impl FnOnce(T) -> Result<(), Error>,
-    ) -> Result<u32, Error> {
-        self.replace(source, target, Flags::default(), true, release)
+    /// The backend of `fd`, held for an operation the caller makes outside
+    /// the owner's lock: no close or replacement releases it until
+    /// `unhold`. TooManyOpenFiles with N backends held.
+    pub fn hold(&mut self, fd: u32) -> Result<T, Error> {
+        let backend = self.get(fd)?;
+        if let Some(hold) = self
+            .holds
+            .iter_mut()
+            .flatten()
+            .find(|h| h.backend == backend)
+        {
+            hold.count += 1;
+            return Ok(backend);
+        }
+        let free = self
+            .holds
+            .iter_mut()
+            .find(|h| h.is_none())
+            .ok_or(Error::TooManyOpenFiles)?;
+        *free = Some(Hold {
+            backend,
+            count: 1,
+            closed: false,
+        });
+        Ok(backend)
+    }
+
+    /// An operation's hold of `backend` ends: the backend to release when
+    /// it was the last and the backend's last descriptor went meanwhile.
+    pub fn unhold(&mut self, backend: T) -> Option<T> {
+        let slot = self
+            .holds
+            .iter_mut()
+            .find(|h| h.is_some_and(|h| h.backend == backend))?;
+        let hold = slot.as_mut().expect("a hold");
+        hold.count -= 1;
+        if hold.count > 0 {
+            return None;
+        }
+        let closed = hold.closed;
+        *slot = None;
+        (closed && !self.referenced(backend)).then_some(backend)
+    }
+
+    /// The holds of operations that never end go (the other threads of a
+    /// process that execs, stopped for good), one call at a time: the next
+    /// backend whose last descriptor went meanwhile, to release; None once
+    /// no hold is left.
+    pub fn abandon_hold(&mut self) -> Option<T> {
+        while let Some(slot) = self.holds.iter_mut().find(|h| h.is_some()) {
+            let hold = slot.take().expect("a hold");
+            if hold.closed && !self.referenced(hold.backend) {
+                return Some(hold.backend);
+            }
+        }
+        None
+    }
+
+    /// Close: the descriptor goes at once; the backend to release, when it
+    /// was the last that named it and nothing holds it.
+    pub fn close(&mut self, fd: u32) -> Result<Option<T>, Error> {
+        let backend = self.get(fd)?;
+        self.entries[fd as usize] = None;
+        Ok(self.left(backend))
+    }
+
+    pub fn dup2(&mut self, source: u32, target: u32) -> Result<(u32, Option<T>), Error> {
+        self.replace(source, target, Flags::default(), true)
     }
 
     pub fn dup3(
@@ -126,39 +215,50 @@ impl<T: Copy + Eq, const N: usize> Table<T, N> {
         source: u32,
         target: u32,
         flags: Flags,
-        release: impl FnOnce(T) -> Result<(), Error>,
-    ) -> Result<u32, Error> {
-        self.replace(source, target, flags, false, release)
+    ) -> Result<(u32, Option<T>), Error> {
+        self.replace(source, target, flags, false)
     }
 
+    /// `target` names `source`'s backend with `flags`: the target and the
+    /// backend it named before to release (as `close`).
     fn replace(
         &mut self,
         source: u32,
         target: u32,
         flags: Flags,
         allow_same: bool,
-        release: impl FnOnce(T) -> Result<(), Error>,
-    ) -> Result<u32, Error> {
+    ) -> Result<(u32, Option<T>), Error> {
         let backend = self.get(source)?;
         if target as usize >= N {
             return Err(Error::BadFileDescriptor);
         }
         if source == target {
             return if allow_same {
-                Ok(target)
+                Ok((target, None))
             } else {
                 Err(Error::InvalidArgument)
             };
         }
-        if let Some(old) = self.entries[target as usize]
-            && old.backend != backend
-            && self.last_reference(old.backend)
-        {
-            // Keep both descriptors and flags intact if releasing fails.
-            release(old.backend)?;
+        let old = self.entries[target as usize].replace(Entry { backend, flags });
+        let release = old
+            .filter(|old| old.backend != backend)
+            .and_then(|old| self.left(old.backend));
+        Ok((target, release))
+    }
+
+    /// A descriptor at `fd` of `backend` with `flags`, for a table a
+    /// process starts with (its parent's, spec 2, 3.2): BadFileDescriptor
+    /// past N or for a number already open.
+    pub fn place(&mut self, fd: u32, backend: T, flags: Flags) -> Result<(), Error> {
+        let slot = self
+            .entries
+            .get_mut(fd as usize)
+            .ok_or(Error::BadFileDescriptor)?;
+        if slot.is_some() {
+            return Err(Error::BadFileDescriptor);
         }
-        self.entries[target as usize] = Some(Entry { backend, flags });
-        Ok(target)
+        *slot = Some(Entry { backend, flags });
+        Ok(())
     }
 }
 
@@ -180,12 +280,7 @@ mod tests {
             table.duplicate(0, 3, Flags::default()),
             Err(Error::InvalidArgument)
         );
-        table
-            .close(1, |backend| {
-                assert_eq!(backend, 11);
-                Ok(())
-            })
-            .unwrap();
+        assert_eq!(table.close(1), Ok(Some(11)));
         assert_eq!(table.duplicate(0, 1, Flags::default()), Ok(1));
         assert_eq!(table.get(1), Ok(10));
     }
@@ -195,28 +290,57 @@ mod tests {
         let mut table = Table::<u32, 3>::default();
         let source = table.insert(40, Flags::default()).unwrap();
         let copy = table.duplicate(source, 0, Flags::default()).unwrap();
-        table
-            .close(source, |_| panic!("shared backend released early"))
-            .unwrap();
+        assert_eq!(table.close(source), Ok(None), "the copy names it");
         assert_eq!(table.get(source), Err(Error::BadFileDescriptor));
         assert_eq!(table.get(copy), Ok(40));
-        let mut releases = 0;
-        table
-            .close(copy, |backend| {
-                assert_eq!(backend, 40);
-                releases += 1;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(releases, 1);
-        assert_eq!(
-            table.close(copy, |_| panic!("closed twice")),
-            Err(Error::BadFileDescriptor)
-        );
+        assert_eq!(table.close(copy), Ok(Some(40)));
+        assert_eq!(table.close(copy), Err(Error::BadFileDescriptor));
+    }
+
+    /// A backend held outside the owner's lock goes at its last unhold
+    /// once its descriptors went, and never while a hold remains; a backend
+    /// held with a descriptor left stays.
+    #[test]
+    fn a_held_backend_goes_after_the_last_hold() {
+        let mut table = Table::<u32, 4>::default();
+        let fd = table.insert(40, Flags::default()).unwrap();
+        assert_eq!(table.hold(fd), Ok(40));
+        assert_eq!(table.hold(fd), Ok(40));
+        assert_eq!(table.close(fd), Ok(None), "held: not yet");
+        assert_eq!(table.get(fd), Err(Error::BadFileDescriptor));
+        assert_eq!(table.unhold(40), None, "a second hold remains");
+        assert_eq!(table.unhold(40), Some(40));
+        assert_eq!(table.unhold(40), None, "no hold left");
+        let fd = table.insert(50, Flags::default()).unwrap();
+        assert_eq!(table.hold(fd), Ok(50));
+        assert_eq!(table.unhold(50), None, "the descriptor stays");
+        assert_eq!(table.close(fd), Ok(Some(50)));
+        let a = table.insert(60, Flags::default()).unwrap();
+        let b = table.insert(61, Flags::default()).unwrap();
+        assert_eq!(table.hold(b), Ok(61));
+        assert_eq!(table.dup2(a, b), Ok((b, None)), "the replaced one is held");
+        assert_eq!(table.unhold(61), Some(61));
+    }
+
+    /// Holds nobody will end go: a held backend whose descriptors went is
+    /// handed back to release, once; one with a descriptor left stays.
+    #[test]
+    fn abandoned_holds_hand_back_what_was_closed() {
+        let mut table = Table::<u32, 4>::default();
+        let a = table.insert(70, Flags::default()).unwrap();
+        let b = table.insert(71, Flags::default()).unwrap();
+        assert_eq!(table.hold(a), Ok(70));
+        assert_eq!(table.hold(a), Ok(70));
+        assert_eq!(table.hold(b), Ok(71));
+        assert_eq!(table.close(a), Ok(None), "held");
+        assert_eq!(table.abandon_hold(), Some(70));
+        assert_eq!(table.abandon_hold(), None, "71 has its descriptor");
+        assert_eq!(table.unhold(70), None, "no hold left");
+        assert_eq!(table.close(b), Ok(Some(71)), "no hold keeps it now");
     }
 
     #[test]
-    fn replacement_errors_preserve_target_and_flags() {
+    fn replacement_hands_back_the_old_backend() {
         let mut table = Table::<u32, 3>::default();
         let flags = Flags {
             close_on_exec: true,
@@ -224,37 +348,23 @@ mod tests {
         };
         table.insert(10, flags).unwrap();
         table.insert(11, flags).unwrap();
-        assert_eq!(
-            table.dup2(9, 1, |_| panic!("invalid source released target")),
-            Err(Error::BadFileDescriptor)
-        );
-        assert_eq!(
-            table.dup2(0, 3, |_| panic!("invalid target")),
-            Err(Error::BadFileDescriptor)
-        );
-        assert_eq!(table.dup2(0, 1, |_| Err(Error::Io)), Err(Error::Io));
+        assert_eq!(table.dup2(9, 1), Err(Error::BadFileDescriptor));
+        assert_eq!(table.dup2(0, 3), Err(Error::BadFileDescriptor));
         assert_eq!(table.get(1), Ok(11));
         assert_eq!(table.flags(1), Ok(flags));
-        assert_eq!(
-            table.dup2(0, 0, |_| panic!("self dup closed source")),
-            Ok(0)
-        );
+        assert_eq!(table.dup2(0, 0), Ok((0, None)));
         assert_eq!(table.flags(0), Ok(flags));
         assert_eq!(
-            table.dup3(0, 0, Flags::default(), |_| panic!("self dup3")),
+            table.dup3(0, 0, Flags::default()),
             Err(Error::InvalidArgument)
         );
-        table
-            .dup2(0, 1, |backend| {
-                assert_eq!(backend, 11);
-                Ok(())
-            })
-            .unwrap();
+        assert_eq!(table.dup2(0, 1), Ok((1, Some(11))));
         assert_eq!(table.get(1), Ok(10));
         assert_eq!(table.flags(1), Ok(Flags::default()));
-        table
-            .dup2(0, 1, |_| panic!("same backend released"))
-            .unwrap();
+        assert_eq!(table.dup2(0, 1), Ok((1, None)), "the same backend");
+        assert_eq!(table.place(1, 12, flags), Err(Error::BadFileDescriptor));
+        assert_eq!(table.place(2, 12, flags), Ok(()));
+        assert_eq!(table.open().count(), 3);
     }
 
     #[test]
@@ -277,9 +387,7 @@ mod tests {
                 },
             )
             .unwrap();
-        table
-            .dup3(0, 3, flags, |_| panic!("free target released"))
-            .unwrap();
+        assert_eq!(table.dup3(0, 3, flags), Ok((3, None)));
         assert_eq!(table.flags(3), Ok(flags));
         assert_eq!(table.flags(0), Ok(flags));
         assert_eq!(table.set_flags(9, flags), Err(Error::BadFileDescriptor));

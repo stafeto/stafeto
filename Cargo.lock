@@ -84,6 +84,7 @@ version = "0.1.0"
 dependencies = [
  "abi",
  "bootimg",
+ "proto-fs",
  "proto-init",
  "proto-process",
  "proto-wire",
@@ -118,6 +119,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
 
 [[package]]
+name = "loader"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "bootimg",
+ "proto-fs",
+ "proto-loader",
+ "proto-process",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -125,6 +139,13 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "os-test-probe"
+version = "0.1.0"
+dependencies = [
+ "posix-crt",
+]
+
+[[package]]
+name = "os-test-run"
 version = "0.1.0"
 dependencies = [
  "posix-crt",
@@ -146,6 +167,8 @@ dependencies = [
  "posix-types",
  "process-client",
  "proto-clock",
+ "proto-fs",
+ "proto-loader",
  "proto-process",
  "proto-uart",
  "proto-wire",
@@ -211,6 +234,7 @@ dependencies = [
  "posix-platform",
  "posix-thread",
  "proto-init",
+ "proto-loader",
  "rt",
 ]
 
@@ -268,6 +292,7 @@ dependencies = [
  "bootimg",
  "posix-credentials",
  "proto-init",
+ "proto-loader",
  "proto-process",
  "proto-wire",
  "rt",
@@ -416,6 +441,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-loader"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-process"
 version = "0.1.0"
 dependencies = [
@@ -452,8 +485,10 @@ name = "ramfs"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "bootimg",
  "proto-fs",
  "proto-init",
+ "proto-process",
  "proto-wire",
  "rt",
 ]

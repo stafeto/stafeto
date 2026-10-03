@@ -32,7 +32,6 @@ const fn service(name: &'static str, connects: &'static [&'static str]) -> Recor
         quiesce: &[],
         trusted: false,
         root: false,
-        on_demand: false,
     }
 }
 

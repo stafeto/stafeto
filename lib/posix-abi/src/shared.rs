@@ -1,18 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH GCC-exception-3.1
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The process's file state under a lock of the layer (spec
-//! 2, 3.4): the calling thread performs its request itself, its holder at
-//! the ceiling of the process (LayerLock::raising). No helper thread. The
-//! lock is held through the request to the file service, since the state
-//! of a descriptor and its session go together in posix-fs.
+//! The process's file state under a lock of the layer (spec 2, 3.4): the
+//! calling thread performs its request itself, its holder at the ceiling
+//! of the process (LayerLock::raising). No helper thread. The lock covers
+//! the table of descriptors and the current directory alone: a request
+//! snapshots what a descriptor names and holds it, or resolves its path,
+//! lets go of the lock, and only then sends to the service (5c, the end
+//! of the exception of 5a); a close meanwhile releases the service's
+//! description after the last request that holds it.
 
 use crate::constants::*;
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, Ordering},
 };
-use posix_fs::PosixFs;
+use posix_fs::{PosixFs, Resolved, Target, Transport};
 use posix_request::{MESSAGE_MAX, Reply, Request};
 use posix_sync::LayerLock;
 use proto_wire::Writer;
@@ -58,12 +61,99 @@ fn process_state<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R,
     f(files)
 }
 
+/// The hook a thread probe runs in each request outside the lock, between
+/// its snapshot and its request to the service: a request under the lock
+/// would hold the lock through the hook.
+#[cfg(feature = "thread-probe")]
+static WINDOW: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Sets the hook of the requests outside the lock (None for none).
+#[cfg(feature = "thread-probe")]
+pub fn probe_window(hook: Option<fn()>) {
+    WINDOW.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+
+fn window() {
+    #[cfg(feature = "thread-probe")]
+    {
+        let hook = WINDOW.load(Ordering::Acquire);
+        if hook != 0 {
+            // SAFETY: only probe_window stores a value, a `fn()`.
+            let hook: fn() = unsafe { core::mem::transmute::<usize, fn()>(hook) };
+            hook();
+        }
+    }
+}
+
+/// Runs `run` with the transports and what `fd` names, held: outside the
+/// lock, and a close meanwhile releases the service's description once
+/// `run` is over.
+pub fn held<R>(fd: u32, run: impl FnOnce(Transport, Target) -> Result<R, i32>) -> Result<R, i32> {
+    let (transport, target) =
+        process_state(|files| Ok((files.transport(), files.hold(fd).map_err(crate::error)?)))?;
+    window();
+    let result = run(transport, target);
+    let release = process_state(|files| Ok(files.unhold(target)))?;
+    let _ = transport.release(release);
+    result
+}
+
+/// Runs `run` with the transports and `path` resolved against the
+/// current directory, outside the lock.
+pub fn resolved<R>(
+    path: &[u8],
+    run: impl FnOnce(Transport, &Resolved) -> Result<R, i32>,
+) -> Result<R, i32> {
+    let (transport, resolved) = process_state(|files| {
+        Ok((
+            files.transport(),
+            files.resolve(path).map_err(crate::error)?,
+        ))
+    })?;
+    window();
+    run(transport, &resolved)
+}
+
+/// Runs `change` on the table under the lock, then releases what it
+/// handed back outside it.
+fn releasing<R>(
+    change: impl FnOnce(&mut PosixFs) -> Result<(R, Option<Target>), i32>,
+) -> Result<R, i32> {
+    let (value, transport, release) = process_state(|files| {
+        let (value, release) = change(files)?;
+        Ok((value, files.transport(), release))
+    })?;
+    transport.release(release).map_err(crate::error)?;
+    Ok(value)
+}
+
+/// The holds of the threads an exec stopped go, and the descriptions
+/// whose last descriptor went while one was held close in the service.
+pub fn abandon_holds() {
+    while let Ok(Some((transport, target))) =
+        process_state(|files| Ok(files.abandon_hold().map(|t| (files.transport(), t))))
+    {
+        let _ = transport.release(Some(target));
+    }
+}
+
+/// Close of the service's open description `fd`, which the table handed
+/// back to release, outside the lock.
+pub fn release(fd: u32) -> Result<(), i32> {
+    let transport = process_state(|files| Ok(files.transport()))?;
+    transport
+        .release(Some(Target::Ram(fd)))
+        .map_err(crate::error)
+}
+
 // Keep read buffers out of the frames of the other requests.
 #[inline(never)]
-fn read_reply(files: &mut PosixFs, fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
-    let read = files
-        .prepare_read(fd, count as usize)
-        .map_err(crate::error)?;
+fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
+    let read = held(fd, |transport, target| {
+        transport
+            .prepare_read(target, count as usize)
+            .map_err(crate::error)
+    })?;
     if let Some((input, extent)) = read.input() {
         Reply::Input {
             uart: input.uart().map(|h| h.0),
@@ -77,51 +167,75 @@ fn read_reply(files: &mut PosixFs, fd: u32, count: u32, out: &mut Writer) -> Res
     }
 }
 
-// Separate transport-sized write buffers from other numeric operations.
-#[inline(never)]
-fn write_number(files: &PosixFs, fd: u32, bytes: &[u8]) -> Result<u64, i32> {
-    files
-        .write(fd, bytes)
-        .map(|value| value as u64)
-        .map_err(crate::error)
+/// Open: the path resolved under the lock, the service's open outside it,
+/// then the descriptor under it again.
+fn open(path: &[u8], flags: i32) -> Result<u64, i32> {
+    if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
+        || flags & O_ACCMODE == O_ACCMODE
+    {
+        return Err(EINVAL);
+    }
+    let directory = if flags & O_DIRECTORY != 0 {
+        posix_fs::DIRECTORY_ONLY
+    } else {
+        0
+    };
+    let (transport, opened) = resolved(path, |transport, path| {
+        if path.trailing_slash
+            && transport.stat(path).map_err(crate::error)?.kind == posix_fs::FileKind::Regular
+        {
+            return Err(ENOTDIR);
+        }
+        let name = path.as_str().map_err(crate::error)?;
+        let opened = transport
+            .open(name, (flags & O_ACCMODE) as u32 | directory)
+            .map_err(crate::error)?;
+        Ok((transport, opened))
+    })?;
+    let inserted = process_state(|files| {
+        files
+            .insert(opened, crate::descriptor_flags(flags))
+            .map_err(crate::error)
+    });
+    if inserted.is_err() {
+        let _ = transport.release(Some(Target::Ram(opened)));
+    }
+    inserted.map(u64::from)
 }
 
-fn number_operation(request: Request<'_>, files: &mut PosixFs) -> Result<u64, i32> {
+fn number_operation(request: Request<'_>) -> Result<u64, i32> {
     use Request::*;
     match request {
-        Open { path, flags } => {
-            let flags = flags as i32;
-            if flags & !(O_ACCMODE | O_DIRECTORY | O_CLOEXEC | O_CLOFORK) != 0
-                || flags & O_ACCMODE == O_ACCMODE
-            {
-                return Err(EINVAL);
-            }
-            let directory = if flags & O_DIRECTORY != 0 {
-                posix_fs::DIRECTORY_ONLY
-            } else {
-                0
-            };
-            let fd = files
-                .open(path, (flags & O_ACCMODE) as u32 | directory)
-                .map_err(crate::error)?;
+        Open { path, flags } => open(path, flags as i32),
+        Write { fd, bytes } => held(fd, |transport, target| match target {
+            Target::Output | Target::Error => transport
+                .input()
+                .write(bytes)
+                .map(|n| n as u64)
+                .map_err(|status| crate::error(posix_fs::FsError::from(status))),
+            target => transport
+                .write(target, bytes)
+                .map(|n| n as u64)
+                .map_err(crate::error),
+        }),
+        Seek { fd, offset, origin } => held(fd, |transport, target| {
+            transport
+                .lseek(target, offset, origin)
+                .map(|value| value as u64)
+                .map_err(crate::error)
+        }),
+        Dup { fd } => process_state(|files| {
             files
-                .set_descriptor_flags(fd, crate::descriptor_flags(flags))
-                .map_err(crate::error)?;
-            Ok(fd as u64)
-        }
-        Write { fd, bytes } => write_number(files, fd, bytes),
-        Seek { fd, offset, origin } => files
-            .lseek(fd, offset, origin)
-            .map(|value| value as u64)
-            .map_err(crate::error),
-        Dup { fd } => files
-            .dup(fd)
-            .map(|value| value as u64)
-            .map_err(crate::error),
-        Dup2 { source, target } => files
-            .dup2(source, target)
-            .map(|value| value as u64)
-            .map_err(crate::error),
+                .dup(fd)
+                .map(|value| value as u64)
+                .map_err(crate::error)
+        }),
+        Dup2 { source, target } => releasing(|files| {
+            files
+                .take_dup3(source, target, None)
+                .map(|(fd, release)| (fd as u64, release))
+                .map_err(crate::error)
+        }),
         Dup3 {
             source,
             target,
@@ -130,48 +244,79 @@ fn number_operation(request: Request<'_>, files: &mut PosixFs) -> Result<u64, i3
             if flags & !((O_CLOEXEC | O_CLOFORK) as u32) != 0 {
                 return Err(EINVAL);
             }
-            files
-                .dup3(source, target, crate::descriptor_flags(flags as i32))
-                .map(|value| value as u64)
-                .map_err(crate::error)
+            let flags = crate::descriptor_flags(flags as i32);
+            releasing(|files| {
+                files
+                    .take_dup3(source, target, Some(flags))
+                    .map(|(fd, release)| (fd as u64, release))
+                    .map_err(crate::error)
+            })
         }
         // Directory streams are relibc's (getdents on a descriptor).
         _ => Err(ENOSYS),
     }
 }
 
-fn perform(request: Request<'_>, files: &mut PosixFs, out: &mut Writer) -> Result<(), i32> {
+fn perform(request: Request<'_>, out: &mut Writer) -> Result<(), i32> {
     use Request::*;
     let write = |reply: Reply<'_>, out: &mut Writer| reply.write(out).map_err(|_| EIO);
     match request {
         Close { fd } => {
-            files.close(fd).map_err(crate::error)?;
+            releasing(|files| {
+                files
+                    .take_close(fd)
+                    .map(|release| ((), release))
+                    .map_err(crate::error)
+            })?;
             write(Reply::Unit, out)
         }
-        Read { fd, count } => read_reply(files, fd, count, out),
+        Read { fd, count } => read_reply(fd, count, out),
         Chdir { path } => {
-            files.chdir(path).map_err(crate::error)?;
+            let directory = resolved(path, |transport, path| {
+                Ok(transport.stat(path).map_err(crate::error)?.kind
+                    == posix_fs::FileKind::Directory)
+            })?;
+            if !directory {
+                return Err(ENOTDIR);
+            }
+            process_state(|files| files.set_cwd(path).map_err(crate::error))?;
             write(Reply::Unit, out)
         }
-        Cwd => write(Reply::Bytes(files.cwd()), out),
+        Cwd => {
+            let mut cwd = [0u8; posix_fs::MAX_CWD];
+            let len = process_state(|files| {
+                let own = files.cwd();
+                cwd[..own.len()].copy_from_slice(own);
+                Ok(own.len())
+            })?;
+            write(Reply::Bytes(&cwd[..len]), out)
+        }
         Stat { path } => write(
-            Reply::Info(files.stat_information(path).map_err(crate::error)?),
+            Reply::Info(resolved(path, |transport, path| {
+                transport.stat_information(path).map_err(crate::error)
+            })?),
             out,
         ),
         Fstat { fd } => write(
-            Reply::Info(files.descriptor_information(fd).map_err(crate::error)?),
+            Reply::Info(held(fd, |transport, target| {
+                transport
+                    .descriptor_information(target)
+                    .map_err(crate::error)
+            })?),
             out,
         ),
         Cleanup => {
             for fd in 0..posix_fs::OPEN_MAX as u32 {
-                match files.close(fd) {
-                    Ok(()) | Err(posix_fs::FsError::BadFileDescriptor) => (),
-                    Err(error) => return Err(crate::error(error)),
-                }
+                let closed = releasing(|files| match files.take_close(fd) {
+                    Ok(release) => Ok(((), release)),
+                    Err(posix_fs::FsError::BadFileDescriptor) => Ok(((), None)),
+                    Err(error) => Err(crate::error(error)),
+                });
+                closed?;
             }
             write(Reply::Unit, out)
         }
-        number => write(Reply::Number(number_operation(number, files)?), out),
+        number => write(Reply::Number(number_operation(number)?), out),
     }
 }
 
@@ -192,8 +337,9 @@ fn request_error(error: proto_wire::Status) -> i32 {
     }
 }
 
-/// Runs `f` on the process's files under their lock (relibc's platform:
-/// every thread of a program on relibc uses the process's files).
+/// Runs `f` on the process's files under their lock: the table and the
+/// current directory; a request to a service goes through `held` or
+/// `resolved` outside it.
 pub fn with_files<R>(f: impl FnOnce(&mut PosixFs) -> Result<R, i32>) -> Result<R, i32> {
     process_state(f)
 }
@@ -203,7 +349,7 @@ pub(crate) fn dispatch<'a>(
     buffer: &'a mut [u8; MESSAGE_MAX],
 ) -> Result<Reply<'a>, i32> {
     let mut encoded = Writer::new();
-    process_state(|files| perform(request, files, &mut encoded))?;
+    perform(request, &mut encoded)?;
     let bytes = encoded.as_bytes();
     buffer[..bytes.len()].copy_from_slice(bytes);
     match Reply::read(&buffer[..bytes.len()]).map_err(|_| EIO)? {
@@ -213,17 +359,10 @@ pub(crate) fn dispatch<'a>(
 }
 
 pub(crate) fn number(request: Request<'_>) -> Result<u64, i32> {
-    // A write to the console leaves the section: the driver answers a
-    // write into a full ring only once it drained.
-    if let Request::Write { fd, bytes } = request
-        && let Some(console) = process_state(|files| files.console_route(fd).map_err(crate::error))?
-    {
-        return console
-            .write(bytes)
-            .map(|n| n as u64)
-            .map_err(|status| crate::error(posix_fs::FsError::from(status)));
+    if !READY.load(Ordering::Acquire) {
+        return Err(ENOSYS);
     }
-    process_state(|files| number_operation(request, files))
+    number_operation(request)
 }
 
 pub(crate) fn unit(request: Request<'_>) -> Result<(), i32> {
@@ -249,7 +388,7 @@ pub fn probe(request: &[u8], buffer: &mut [u8; MESSAGE_MAX]) -> Result<usize, rt
     let mut encoded = Writer::new();
     let result = Request::read(request)
         .map_err(request_error)
-        .and_then(|request| process_state(|files| perform(request, files, &mut encoded)));
+        .and_then(|request| perform(request, &mut encoded));
     if let Err(code) = result {
         encoded = error_reply(code);
     }

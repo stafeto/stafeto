@@ -368,12 +368,23 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
     service: &mut S,
     config: Config<'_>,
 ) -> Error {
+    let mut table: [Option<Session<S::Data, K>>; N] = core::array::from_fn(|_| None);
+    run_in(channel, service, config, &mut table)
+}
+
+/// `run` with the table of sessions the caller gives, all of them free:
+/// a service with a table too big for its stack keeps it in its `.bss`.
+pub fn run_in<S: Service<K>, const K: usize>(
+    channel: &Handle<Channel>,
+    service: &mut S,
+    config: Config<'_>,
+    table: &mut [Option<Session<S::Data, K>>],
+) -> Error {
     let mut beat = match config.heartbeat.map(|h| Beat::start(channel, h)) {
         None => None,
         Some(Ok(beat)) => Some(beat),
         Some(Err(e)) => return e,
     };
-    let mut table: [Option<Session<S::Data, K>>; N] = core::array::from_fn(|_| None);
     // Zeroed once: a request reads only its first `len` bytes, and both
     // paths fill all `len` bytes, so no byte of an earlier client reaches
     // the next request.
@@ -394,15 +405,10 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 } else {
                     msgbuf::read(0, bytes);
                 }
-                request(
-                    service,
-                    &mut table,
-                    config.issued,
-                    label,
-                    bytes,
-                    handles,
-                    token,
-                );
+                let kind = steps::kind_of(bytes);
+                let began = steps::begin();
+                request(service, table, config.issued, label, bytes, handles, token);
+                steps::end(began, kind);
                 continue;
             }
             Ok(Received::Notification {
@@ -417,6 +423,7 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
                 count,
             },
         };
+        let began = steps::begin();
         match (notice.source, notice.label, &mut beat) {
             (Source::Timer, 0, Some(beat)) => beat.expired(),
             (Source::Session, label, _) if notice.bits & CLIENT_GONE != 0 => {
@@ -447,7 +454,88 @@ pub fn run<S: Service<K>, const N: usize, const K: usize>(
             }
             _ => service.notification(notice),
         }
+        steps::end(began, steps::NOTICE);
     }
+}
+
+/// The longest step of the loop (feature `step-stats`, which only the
+/// images of measurements and tests turn on): the ticks from the return of
+/// `receive` to the handler's end and its reply, for each method of the
+/// protocol and for notifications. A new longest of a kind goes to the
+/// console as a line `service step: T kind K N ticks detail D` after the step, so that
+/// the print does not count in it (`report_steps` turns it on and gives the tag T); K is the
+/// method, or `NOTICE`.
+#[cfg(feature = "step-stats")]
+mod steps {
+    use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    /// The kinds: methods below this number, and the notifications.
+    pub const NOTICE: usize = 64;
+    const KINDS: usize = NOTICE + 1;
+    static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// A number the handler of the step gives (`super::step_detail`), for
+    /// the line a new longest prints.
+    static DETAIL: AtomicU64 = AtomicU64::new(0);
+    /// The tag a new longest prints with: the service that asked (0: none).
+    static REPORT: AtomicU8 = AtomicU8::new(0);
+
+    pub fn report(tag: u8) {
+        REPORT.store(tag, Ordering::Relaxed);
+    }
+
+    pub fn detail(value: u64) {
+        DETAIL.store(value, Ordering::Relaxed);
+    }
+
+    /// The kind of a request: its method, or the last place for a request
+    /// whose header is short or whose method is past the table.
+    pub fn kind_of(bytes: &[u8]) -> usize {
+        match super::Header::read(&mut super::Reader::new(bytes)) {
+            Ok(header) if (header.method as usize) < NOTICE => header.method as usize,
+            _ => NOTICE - 1,
+        }
+    }
+
+    pub fn begin() -> u64 {
+        super::time::now()
+    }
+
+    pub fn end(began: u64, kind: usize) {
+        let took = super::time::now().saturating_sub(began);
+        let detail = DETAIL.swap(0, Ordering::Relaxed);
+        let tag = REPORT.load(Ordering::Relaxed);
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && tag != 0 {
+            crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+        }
+    }
+}
+
+#[cfg(not(feature = "step-stats"))]
+mod steps {
+    pub const NOTICE: usize = 0;
+    pub fn kind_of(_: &[u8]) -> usize {
+        0
+    }
+    pub fn begin() -> u64 {
+        0
+    }
+    pub fn end(_: u64, _: usize) {}
+    pub fn detail(_: u64) {}
+    pub fn report(_: u8) {}
+}
+
+/// Makes the loop of this service print each new longest step (feature
+/// `step-stats`; nothing without it): the images with several services
+/// that count their steps get the lines of the one that asked.
+pub fn report_steps(tag: u8) {
+    steps::report(tag);
+}
+
+/// Tells the line of the longest step a number of this step, such as the
+/// entries a handler took off a channel (feature `step-stats`; nothing
+/// without it).
+pub fn step_detail(value: u64) {
+    steps::detail(value);
 }
 
 /// Hands the request in `bytes` of the client `label` to `service`, and
@@ -684,6 +772,25 @@ pub fn connect(parent: &Handle<Channel>, name: &str) -> Result<Handle<Channel>, 
     let mut w = Writer::new();
     Connect { name }.write(&mut w)?;
     let mut reply = sys::send(parent, w.as_bytes())?;
+    let mut buffer = [0; MESSAGE_MAX];
+    match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
+        Status::Ok => reply.handles.take(0).map_err(|_| Status::BadSize),
+        status => Err(status),
+    }
+}
+
+/// CLONE of a service through `session`, the request `request` (its
+/// header and the body its protocol gives): the new session (SEND, TRANSFER) the service made for a child of
+/// the caller (spec 2, 3.7; 5c). A send that came back INTERRUPTED goes
+/// again: the service never saw it. The errors: send's, the service's
+/// status, BAD_SIZE for a reply without the session.
+pub fn clone_session(session: &Handle<Channel>, request: &[u8]) -> Result<Handle<Channel>, Status> {
+    let mut reply = loop {
+        match sys::send(session, request) {
+            Err(Error::Interrupted) => continue,
+            other => break other?,
+        }
+    };
     let mut buffer = [0; MESSAGE_MAX];
     match Status::from_code(Reader::new(reply.bytes(&mut buffer)).u32()?) {
         Status::Ok => reply.handles.take(0).map_err(|_| Status::BadSize),

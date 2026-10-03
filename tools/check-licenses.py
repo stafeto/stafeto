@@ -38,8 +38,10 @@ TOOLCHAIN = BUILD.TOOLCHAIN
 
 GPL = "GPL-3.0-or-later"
 EXCEPTION = "GPL-3.0-or-later WITH GCC-exception-3.1"
-# The programs link these and all they take (item 1).
-LINK_ROOTS = ("posix-crt", "posix-platform")
+# The programs link these and all they take (item 1); the loader runs in
+# every POSIX program's process before it (spec 2, 3.2), so it takes the
+# programs' terms too.
+LINK_ROOTS = ("posix-crt", "posix-platform", "loader")
 # The exception's text from the SPDX licence list (spec 2, 5), unchanged.
 EXCEPTION_FILE = ROOT / "LICENSE-GCC-exception-3.1"
 EXCEPTION_SHA256 = "7103d4f7f7e2f8ce10d282a05e0689637f8d6d9ef7b399d808d1da313e69b960"

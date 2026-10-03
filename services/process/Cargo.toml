@@ -24,9 +24,9 @@ adoption-refusals = []
 # The probe of POSIX processes whose service ended: the service ends before
 # it registers (xtask posix-orphans).
 exit-early = []
-# The probe of POSIX processes: four children of a record at most, so that
-# the guest reaches the limit (tests/posix-procs).
-children-max-4 = []
+# The longest step of the loop for each method, printed when it grows (rt
+# feature step-stats; xtask process-steps, under -icount).
+steps = ["rt/step-stats"]
 
 [dependencies]
 proto-process = { path = "../../proto/process" }
@@ -38,4 +38,5 @@ posix-credentials = { path = "../../lib/posix-credentials" }
 # without rt.
 [target.'cfg(target_os = "none")'.dependencies]
 bootimg = { path = "../../lib/bootimg" }
+proto-loader = { path = "../../proto/loader" }
 rt = { path = "../../lib/rt" }

@@ -281,8 +281,113 @@ fn scenario(process: rt::abi::Handle) -> bool {
     if abi::close(motd).is_err() || abi::close(alias).is_err() {
         return fail(25);
     }
+    if !outside_lock(&process) {
+        return false;
+    }
     if shared::cleanup().is_err() {
         return fail(25);
+    }
+    true
+}
+
+/// The state of the hook of `outside_lock`: 1 armed, 2 a request waits in
+/// it; RELEASED once the other thread's open and close came back, and
+/// LATE when the hook gave up waiting for that.
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static ARMED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static RELEASED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static LATE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+static HOLDER_STACK: Stack<16384> = Stack::new();
+
+/// The hook between a request's snapshot and its request to the service:
+/// the first request after arming waits there until the other thread's
+/// open and close came back, or 200 ms.
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+fn hook() {
+    if ARMED
+        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let deadline = rt::time::now() + rt::time::frequency() / 5;
+    while RELEASED.load(Ordering::Acquire) == 0 {
+        if rt::time::now() > deadline {
+            LATE.store(1, Ordering::Release);
+            return;
+        }
+        let _ = sys::yield_now();
+    }
+}
+
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+extern "C" fn holder(completion: u64) -> ! {
+    let passed = tls::with_process(|| {
+        let fd = FD.load(Ordering::Acquire) as i32;
+        abi::lseek(fd, 0, SEEK_CUR) == Ok(0)
+    });
+    DONE.store(if passed { 4 } else { 5 }, Ordering::Release);
+    let channel = Handle::<Channel>::borrowed(rt::abi::Handle(completion));
+    let _ = sys::notify(&channel, 1);
+    sys::thread_exit()
+}
+
+/// 5c: the lock of the files covers the table alone. A thread whose
+/// request to the service waits between its snapshot and its send (the
+/// hook) leaves the lock free: another thread opens and closes a file
+/// meanwhile, and closes the very descriptor of the waiting request,
+/// whose description stays until that request is over.
+#[cfg(not(any(feature = "input-probe", feature = "interrupt-probe")))]
+fn outside_lock(process: &Handle<rt::handle::Process>) -> bool {
+    let Ok(fd) = abi::open(b"/etc/motd", O_RDONLY) else {
+        return fail(30);
+    };
+    FD.store(fd as usize, Ordering::Release);
+    let Ok(completion) = sys::channel_create(30) else {
+        return fail(31);
+    };
+    shared::probe_window(Some(hook));
+    ARMED.store(1, Ordering::Release);
+    // SAFETY: the static stack is used once; this message page is disjoint
+    // from the other threads'.
+    let Ok(thread) = (unsafe {
+        sys::thread_create(
+            process,
+            holder,
+            HOLDER_STACK.top(),
+            completion.raw().0,
+            30,
+            rt::abi::Policy::Fifo,
+            0xc02000,
+        )
+    }) else {
+        return fail(31);
+    };
+    if sys::thread_start(&thread).is_err() {
+        return fail(31);
+    }
+    while ARMED.load(Ordering::Acquire) != 2 {
+        let _ = sys::yield_now();
+    }
+    // The other thread's open and close, and the close of the descriptor
+    // the waiting request holds: its description stays for that request.
+    let other = abi::open(b"/etc/motd", O_RDONLY)
+        .and_then(abi::close)
+        .and_then(|()| abi::close(fd));
+    RELEASED.store(1, Ordering::Release);
+    if other.is_err() || sys::receive(&completion).is_err() {
+        return fail(32);
+    }
+    shared::probe_window(None);
+    if LATE.load(Ordering::Acquire) != 0 {
+        rt::println!("posix-shared-probe: an open waited for a request of another thread");
+        return fail(33);
+    }
+    if DONE.load(Ordering::Acquire) != 4 || abi::lseek(fd, 0, SEEK_CUR) != Err(EBADF) {
+        return fail(34);
     }
     true
 }

@@ -55,6 +55,10 @@ const IDLE_NS: u64 = 10_000_000;
 const CHANNEL_PRIORITY: u8 = 1;
 /// The sessions of the driver's channel, and what each holds at most.
 const SESSIONS: usize = 8;
+/// The clones the service keeps alive at most, for all its clients: room
+/// for the 32 children of rtbench's S12 and the probes beside them, as the
+/// RAM file service's 128.
+const CLONES: usize = 128;
 const HELD: usize = 2;
 /// Batches of the kernel log one read takes in a row at most, while each
 /// goes out whole at once: the whole ring of the kernel.
@@ -156,6 +160,10 @@ fn main(_: u64) -> u64 {
         return NOT_REGISTERED;
     };
     let mut uart = Uart {
+        channel: Handle::borrowed(channel.raw()),
+        level,
+        given: 0,
+        clones: proto_wire::clones::Clones::new(),
         regs: Regs(REGS_AT),
         irq,
         log,
@@ -192,6 +200,13 @@ fn main(_: u64) -> u64 {
 /// The driver: the registers, the binding of the line, `log`, the timer
 /// of the reads of the log, the copy of IMSC and the state.
 struct Uart {
+    /// The driver's channel, which the sessions of CLONE are copies of,
+    /// the level of its loop, and how many it gave.
+    channel: core::mem::ManuallyDrop<Handle<Channel>>,
+    level: u8,
+    given: u64,
+    /// The sessions CLONE gave that live, bounded for each client.
+    clones: proto_wire::clones::Clones<CLONES>,
     regs: Regs,
     irq: Handle<Interrupt>,
     log: Handle<Resource>,
@@ -493,6 +508,7 @@ const METHODS: &[u16] = &[
     Method::ReadStart.number(),
     Method::ReadTake.number(),
     Method::ReadCancel.number(),
+    Method::Clone.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -502,6 +518,7 @@ const METHODS: &[u16] = &[
     Method::ReadStart.number(),
     Method::ReadTake.number(),
     Method::ReadCancel.number(),
+    Method::Clone.number(),
 ];
 
 impl Service<HELD> for Uart {
@@ -516,6 +533,7 @@ impl Service<HELD> for Uart {
             Some(Method::ReadStart) => self.read_start(r),
             Some(Method::ReadTake) => self.read_take(r, false),
             Some(Method::ReadCancel) => self.read_take(r, true),
+            Some(Method::Clone) => self.clone_session(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
@@ -531,6 +549,11 @@ impl Service<HELD> for Uart {
         drop(input.gone(label));
     }
 
+    /// The last copy of a session CLONE gave went.
+    fn closed(&mut self, label: u64) {
+        self.clones.gone(label);
+    }
+
     /// The interrupt of the line, and the timer of the reads of the log:
     /// a stale expiry, before its deadline, changes nothing.
     fn notification(&mut self, n: Notice) {
@@ -541,6 +564,32 @@ impl Service<HELD> for Uart {
                 self.arm();
             }
             _ => {}
+        }
+    }
+}
+
+impl Uart {
+    /// CLONE: a session of the driver's own label (bit 63, which no label
+    /// of init has) for a child of the client.
+    fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        if self.clones.room(r.label()).is_err() {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        self.given += 1;
+        let rights = abi::Rights::SEND.union(abi::Rights::TRANSFER);
+        let label = 1 << 63 | self.given;
+        match sys::handle_label(&self.channel, rights, label, self.level) {
+            Ok(session) => {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                let _ = self.clones.add(label, r.label());
+                Answer::Reply([session.erase()].into())
+            }
+            Err(e) => Answer::Status(Status::Kernel(e)),
         }
     }
 }

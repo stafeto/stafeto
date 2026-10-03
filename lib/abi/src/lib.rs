@@ -724,6 +724,13 @@ pub const INFO_IRQ: u64 = 8;
 pub const INFO_LOG: u64 = 9;
 // Kind 10 went with PROCESS_IDENTITY: process IDs live in the process
 // service (spec 11); a retired kind fails with INVALID_ARGS.
+/// LABEL takes a labelled copy of a channel, with no right needed, and in
+/// x2 a handle of the same channel with RECEIVE, and returns the copy's
+/// label in x1: the owner of a channel learns which of its labels a copy
+/// it was given carries, in O(1), with no notification through it
+/// (spec 5.3, 11). WRONG_TYPE for a copy without a label, ACCESS_DENIED
+/// for a copy of another channel.
+pub const INFO_LABEL: u64 = 11;
 
 /// A record of the kernel log (spec 16.3), in the ring of the kernel and
 /// in the message buffer alike, numbers least significant byte first:
@@ -1750,6 +1757,7 @@ mod tests {
     #[test]
     fn log_layout_is_fixed() {
         assert_eq!(INFO_LOG, 9);
+        assert_eq!(INFO_LABEL, 11);
         assert_eq!((LOG_RECORD, LOG_TEXT, LOG_BATCH), (80, 64, 12));
         assert_eq!((LOG_KIND_AT, LOG_LEN_AT, LOG_TEXT_AT), (8, 9, 16));
         assert_eq!((LOG_TEXT_KIND, LOG_KERNEL_KIND), (1, 2));

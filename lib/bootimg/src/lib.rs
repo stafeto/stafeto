@@ -32,6 +32,7 @@
 extern crate alloc;
 
 pub mod elf;
+pub mod rootfs;
 
 use abi::INIT_STACK_TOP;
 use core::fmt;
@@ -235,6 +236,20 @@ impl<'a> BootImage<'a> {
             Some(f) if f.name == "init" => Ok(f.data),
             _ => Err(Error::NoInit),
         }
+    }
+
+    /// File `n` of the table, which is below the number of files.
+    pub fn file_at(self, n: u32) -> Option<File<'a>> {
+        if n < self.count {
+            self.file(n).ok()
+        } else {
+            None
+        }
+    }
+
+    /// The number of files.
+    pub fn count(self) -> u32 {
+        self.count
     }
 
     /// File `n` of the table, with its name and place checked; `parse` adds

@@ -3,14 +3,17 @@
 # Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
 """Compile os-test's suites for stafeto (`cargo xtask os-test`): Sortix's
-os-test (ISC) at a pinned commit, its io, malloc and signal suites, each test with
-relibc's headers (target/relibc/sysroot, cargo xtask relibc) into an
-object of its own under target/os-test/objects. A test that does not
-compile gets os-test's outcome for it (compile.sh: missing_header,
-undeclared, ...). Writes target/os-test/tests.txt, a line a test:
-`suite/test object-path` or `suite/test !outcome`; the expectations stay in
-target/os-test/source/<suite>.expect. A stamp of both commits makes a
-second run do nothing."""
+os-test (ISC) at a pinned commit, its io, malloc and signal suites and
+the spawn and exec parts of its basic suite (basic/spawn, and the tests
+of basic/unistd named exec*), each test with relibc's headers
+(target/relibc/sysroot, cargo xtask relibc) into an object of its own
+under target/os-test/objects. A test that does not compile gets os-test's
+outcome for it (compile.sh: missing_header, undeclared, ...). Writes
+target/os-test/tests.txt, a line a test: `suite/test object-path` or
+`suite/test !outcome` (basic tests are named basic/<part>/<test>); the
+expectations stay in target/os-test/source/<suite>.expect, which the basic
+suite has none of: its tests pass with the outcome `exit: 0`. A stamp of
+both commits makes a second run do nothing."""
 
 import importlib.util
 from pathlib import Path
@@ -22,6 +25,8 @@ import subprocess
 REPOSITORY = "https://gitlab.com/sortix/os-test.git"
 COMMIT = "f8144f0215ea265fd46281e29271d8e857a6856e"
 SUITES = ("io", "malloc", "signal")
+# The parts of the basic suite and which of their tests run.
+BASIC = (("spawn", "*.c"), ("unistd", "*exec*.c"))
 ROOT = Path(__file__).resolve().parents[1]
 WORK = ROOT / "target" / "os-test"
 SOURCE = WORK / "source"
@@ -76,7 +81,8 @@ def outcome(errors: str, source: str) -> str:
 
 
 def fetch() -> None:
-    if SOURCE.exists() and all((SOURCE / suite).exists() for suite in SUITES) and subprocess.run(
+    if SOURCE.exists() and all((SOURCE / suite).exists() for suite in SUITES) \
+            and all((SOURCE / "basic" / part).exists() for part, _ in BASIC) and subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=SOURCE, capture_output=True,
             text=True).stdout.strip() == COMMIT:
         return
@@ -88,6 +94,7 @@ def fetch() -> None:
     subprocess.run(["git", "clone", "--quiet", "--no-checkout", REPOSITORY, str(SOURCE)],
                    check=True)
     subprocess.run(["git", "sparse-checkout", "set", "--no-cone", "/misc/", "/LICENSE",
+                    "/basic/basic.h", *(f"/basic/{part}/" for part, _ in BASIC),
                     *(f"/{suite}/" for suite in SUITES),
                     *(f"/{suite}.expect/" for suite in SUITES)], cwd=SOURCE, check=True)
     subprocess.run(["git", "checkout", "--quiet", COMMIT], cwd=SOURCE, check=True)
@@ -100,7 +107,7 @@ def fetch() -> None:
 def main() -> None:
     if not (INCLUDE / "stdio.h").exists():
         raise SystemExit("build relibc with cargo xtask relibc first")
-    config = f"{COMMIT} {SUITES} relibc {relibc_commit()} {' '.join(FLAGS)}\n"
+    config = f"{COMMIT} {SUITES} {BASIC} relibc {relibc_commit()} {' '.join(FLAGS)}\n"
     if STAMP.exists() and STAMP.read_text() == config and LIST.exists():
         print(f"os-test objects ready: {LIST}")
         return
@@ -109,13 +116,15 @@ def main() -> None:
         shutil.rmtree(OBJECTS)
     compiler = clang()
     lines = []
-    for suite in SUITES:
-        (OBJECTS / suite).mkdir(parents=True)
-        for test in sorted((SOURCE / suite).glob("*.c")):
+    parts = [(suite, suite, "*.c") for suite in SUITES]
+    parts += [(f"basic/{part}", f"basic/{part}", pattern) for part, pattern in BASIC]
+    for suite, directory, pattern in parts:
+        (OBJECTS / directory).mkdir(parents=True)
+        for test in sorted((SOURCE / directory).glob(pattern)):
             name = f"{suite}/{test.stem}"
-            target = OBJECTS / suite / f"{test.stem}.o"
+            target = OBJECTS / directory / f"{test.stem}.o"
             result = subprocess.run([compiler, *FLAGS, "-c", str(test), "-o", str(target)],
-                                    cwd=SOURCE / suite, capture_output=True, text=True)
+                                    cwd=SOURCE / directory, capture_output=True, text=True)
             if result.returncode == 0:
                 lines.append(f"{name} {target}")
             else:

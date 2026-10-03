@@ -77,7 +77,7 @@ extern "C" fn receiver(_: u64) -> ! {
             ceiling: adoption.ceiling,
             priority: adoption.priority,
             root: adoption.root,
-            parent: 0,
+            ticket: adoption.ticket,
         };
         let handed = (
             reply.handles.take::<Channel>(0),
@@ -100,7 +100,7 @@ extern "C" fn receiver(_: u64) -> ! {
                 label: None,
             }),
         };
-        make::adopted(adoption.ticket, made, 0);
+        make::adopted(adoption.ticket, made);
     }
 }
 

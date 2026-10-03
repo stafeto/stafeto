@@ -330,6 +330,8 @@ impl Default for Writer {
 /// | 0..4 | status 0 |
 /// | 4..8 | READY, WAIT, ARMED or CANCELLED |
 /// | 8.. | READY: the bytes of the result; WAIT: k, u64; others: nothing |
+pub mod clones;
+
 pub mod long {
     use super::{Reader, Status, Writer};
 

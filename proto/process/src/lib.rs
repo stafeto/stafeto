@@ -15,14 +15,9 @@
 //! TRANSFER) for the load, the record's session, and its identity session
 //! (SEND, TRANSFER, DUPLICATE). Loaded, body label
 //! u64 and one handle, the first thread (MANAGE), the router of the
-//! process's signals: the process was loaded and runs; reply its status, and the parent
-//! whose Spawn made it gets its PID. Abandon, body label u64 (0 for no
-//! record), parent label u64 (0 for none) and status u32: the process,
-//! if any, is killed, and the record goes with its end; the parent's
-//! Spawn gets the status; reply its own status. Next: no body; the reply,
-//! once a Spawn waits, is status u32, zero u32, the parent's label u64,
-//! the name of the record of init's table, 16 bytes, and the level of the
-//! parent's Spawn u32 (`Next`).
+//! process's signals: the process was loaded and runs; reply its status.
+//! Abandon, body label u64 (0 for no record): the process, if any, is
+//! killed, and the record goes with its end; reply its status.
 //!
 //! WaitStart, WaitTake and WaitCancel, through a session: wait for a child
 //! in two steps (proto_wire::long, spec 2, 3.4). WaitStart: body
@@ -45,16 +40,16 @@
 //! first thread; reply its status.
 //!
 //! The identity session of a record (label bit 62, `Label::identity`) is
-//! a copy of a channel of the service that no loop receives on, with
-//! NOTIFY, TRANSFER and DUPLICATE: the service gives it with Create, init
+//! a copy of a channel of the service that no loop serves, with NOTIFY,
+//! TRANSFER and DUPLICATE: the service gives it with Create, init
 //! puts it in the process's start data under `posix-id`, and the process
 //! gives a copy to a service it asks something of, such as the clock. It
 //! carries no request: it proves who brought it. Through a notary session
 //! (a label with NOTARY and no bit 63, which only init gives, on CONNECT,
 //! to the services of its table's VOUCHERS): Vouch, no body and one
-//! handle, a copy a client gave; the service notifies through it and looks
-//! which identity place of its channel the notification reached, so a
-//! channel of anyone else proves nothing (PERMISSION); the reply
+//! handle, a copy a client gave; the kernel tells the service the copy's
+//! label (object_info LABEL, which answers the owner of the channel alone,
+//! O(1)), so a channel of anyone else proves nothing (PERMISSION); the reply
 //! (`WhoReply`) is that record's PID, its six credentials and the
 //! generation of its credentials. Register, no body; the reply is a copy
 //! of the page of the credentials generations with MAP_READ and TRANSFER
@@ -75,10 +70,81 @@
 //! The page of the record (`Page`) lies at PAGE_ADDRESS of the process,
 //! the service's to write but for the fields the process writes.
 //!
-//! Spawn, through a session: body `Spawn`; the reply, once the child was
-//! loaded and init took it (Loaded), is status u32 and the child's PID
-//! u32, or the status of why not. One Spawn of a record waits at a time
-//! and CHILDREN_MAX children live (AGAIN past either).
+//! SpawnStart, through a session (spec 2, 3.2; 5c): body `SpawnStart`.
+//! The service makes the child's record (LOADING), its process with the
+//! loader mapped in the loader's region (proto_loader) and the loader's
+//! session in entry 0, and starts the loader at the caller's level; the
+//! reply waits for the loader's Boot: status u32, the child's PID u32 and
+//! one handle, the parent's copy of the loader's start channel C. AGAIN
+//! while a spawn of the record waits, past CHILDREN_MAX children or the
+//! 16 places of loaders; INVALID for a flag past SPAWN_FLAGS; PERMISSION
+//! for a group setpgid would refuse; NOT_FOUND without a loader in the
+//! boot image or a session of the loaders. SpawnCommit, body the child's
+//! PID u32: the LOADING child of the caller is alive, with the set-ID of
+//! its place (SetId) applied and its credentials' generation raised
+//! before the reply, and the loader is told through C that the record is
+//! ready; reply its status. SpawnAbort, body the child's PID u32: the
+//! LOADING child is killed and the SetId of its place wiped; reply its
+//! status. NO_PROCESS for a PID of no LOADING child of the caller.
+//!
+//! ExecStart, through a session (spec 2, 3.2; 5c): body `SpawnStart` with
+//! no flags and no group. The service makes a new process for the record,
+//! image number one past its own (AGAIN past IMAGE_MAX), with the loader
+//! and the record's page, as SpawnStart; the reply waits for Boot: status
+//! u32, the record's PID u32 and the copy of C. One exec of a record at a
+//! time. ExecCommit, no body, once the loader said "the image is ready":
+//! the record moves to the new process in one step (its image number +1,
+//! the set-ID of the loader's place, the generation of its credentials
+//! raised, its caught signals the default on the page), the loads of
+//! children the record started and not committed stop, the service kills
+//! the old process and the loader hears that the record is ready. For a
+//! record of init's table the loader hears it, and the old process is
+//! killed, only once init took the new process for its end line (Replace,
+//! below). ExecAbort, no body: the new process is killed and the place
+//! goes. The end of the old process before ExecCommit, by itself or by
+//! SIGKILL, kills the new one and its quota comes back to the service;
+//! the end of the old one after ExecCommit carries the old image number
+//! and ends nothing. The identity session carries the image number too:
+//! a copy of an old image's identity vouches for nothing.
+//!
+//! Pool, through a session, no body: status u32 and the bytes u64 of the
+//! service's quota left for the children past its reserve, what a probe
+//! reads to see that ended loads gave their quota back.
+//!
+//! Replace, through the channel with no label, from the service's own
+//! thread that tells init of an exec (replace.rs): body the session label
+//! u64, at its new image, of the record whose exec init heard of (0 for
+//! none yet); the reply waits for an ExecCommit of a record of init's
+//! table: status u32, zero u32, that label u64, the ticket init gave the
+//! record u64, and one handle, the new process (DUPLICATE, TRANSFER). The
+//! thread gives init the process (proto_init REPLACED) and names the label
+//! in its next Replace, on which the loader and the old image hear the
+//! exec is done.
+//!
+//! Through the session of a loader (label `Label::loader` on the
+//! service's channel, entry 0 of its process): Ready, no body, once the
+//! image is loaded and before the loader answers Go: the place may be
+//! committed from then on, and SpawnCommit or ExecCommit before it is
+//! BAD_STATE, so a parent that commits a load it never let finish holds
+//! no place. Boot, no body and two
+//! handles, the copies of C for the parent (SEND) and for the service
+//! (NOTIFY); reply status u32, the address and the length u64 of the
+//! loader's data and stack, which it unmaps at its end, and four handles:
+//! the process and the
+//! loader's thread (MANAGE, DUPLICATE, TRANSFER), the session of the
+//! loaders with the RAM file service (SEND) and the loader's identity
+//! (NOTIFY, DUPLICATE, TRANSFER, label `Label::loader` on the identity
+//! channel). Take, no body, once the record is ready: reply status u32,
+//! the six credentials u32 and the program's session, its identity
+//! session and a console (DEBUG) when the service has one; the place of
+//! the loader goes with it. BAD_STATE out of that order.
+//!
+//! SetId, through a notary session whose label has SET_ID (init gives it
+//! to the file services of its table): body `SetId`; the place of the
+//! loader the ticket names, while it loads (from Boot until Ready) and
+//! has no SetId yet, keeps the IDs; PERMISSION otherwise. Vouch of a
+//! loader's identity, of the image its place loads, answers with the
+//! image and the ticket of its place (`LoaderOf`) only while it loads.
 //!
 //! Through a session: Query has no body or handles. Snapshot reply:
 //! status u32, pid u32, parent u32, uid/euid/suid/gid/egid/sgid u32.
@@ -89,8 +155,8 @@
 #![cfg_attr(not(test), no_std)]
 use abi::ProcessState;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64};
-use proto_wire::{Header, Name, Reader, Status, Writer};
-pub const VERSION: u16 = 4;
+use proto_wire::{Header, Reader, Status, Writer};
+pub const VERSION: u16 = 5;
 pub const INVALID: u32 = 500;
 pub const PERMISSION: u32 = 501;
 pub const FULL: u32 = 502;
@@ -109,6 +175,12 @@ pub const NOT_FOUND: u32 = 508;
 /// The flags of Spawn: those of posix_spawnattr_setflags (Linux values).
 pub const SPAWN_SETPGROUP: u32 = 0x02;
 pub const SPAWN_SETSID: u32 = 0x80;
+pub const SPAWN_RESETIDS: u32 = 0x01;
+pub const SPAWN_SETSIGDEF: u32 = 0x04;
+pub const SPAWN_SETSIGMASK: u32 = 0x08;
+/// The flags SpawnStart takes; the scheduling flags wait for step 5h.
+pub const SPAWN_FLAGS: u32 =
+    SPAWN_SETPGROUP | SPAWN_SETSID | SPAWN_RESETIDS | SPAWN_SETSIGDEF | SPAWN_SETSIGMASK;
 
 /// Records of the service at most: PID = index + RECORDS * generation.
 pub const RECORDS: usize = 256;
@@ -118,17 +190,22 @@ pub const GENERATION_MAX: u32 = (1 << 23) - 1;
 /// The parent PID of a record that init created, and of an orphan: the
 /// service itself, the system process that adopts them.
 pub const INIT_PID: u32 = 1;
-/// The image number of a label until exec comes (5c).
+/// The image number of a record's first process; each exec gives the next
+/// (5c), up to IMAGE_MAX, past which exec is AGAIN: a number never names
+/// two images of one record.
 pub const IMAGE: u32 = 1;
+pub const IMAGE_MAX: u32 = (1 << 21) - 1;
 
-/// Which of the record's three places of the service's channel a label
-/// names: its session, its identity session (bit 62), the place of
-/// the notification of its end (bit 61).
+/// Which place of the service a label names: the record's session, its
+/// identity session (bit 62), the place of the notification of its end
+/// (bit 61), or, with both bits, the session and the identity of the
+/// loader of the record's image (5c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
     Work,
     Identity,
     Exit,
+    Loader,
 }
 
 /// The label of a place the service gave (spec 2, section 3.1): bit 63
@@ -148,28 +225,65 @@ impl Label {
     const IMAGE_SHIFT: u32 = 40;
     const IMAGE_MASK: u64 = (1 << 21) - 1;
 
-    /// The label of the record's session.
+    /// The label of the record's session of its first image.
     pub const fn raw(self) -> u64 {
+        self.raw_at(IMAGE)
+    }
+
+    /// The label of the record's session of image `image` (5c: `exec`
+    /// gives a record one image after another, IMAGE first).
+    pub const fn raw_at(self, image: u32) -> u64 {
         Self::SERVICE
-            | (IMAGE as u64) << Self::IMAGE_SHIFT
+            | (image as u64 & Self::IMAGE_MASK) << Self::IMAGE_SHIFT
             | (self.generation as u64) << 16
             | self.index as u64
     }
 
-    /// The label of the record's exit place.
+    /// The label of the record's exit place of its first image.
     pub const fn exit(self) -> u64 {
-        self.raw() | Self::EXIT
+        self.exit_at(IMAGE)
     }
 
-    /// The label of the record's identity session.
+    /// The label of the exit place of the process of image `image`.
+    pub const fn exit_at(self, image: u32) -> u64 {
+        self.raw_at(image) | Self::EXIT
+    }
+
+    /// The label of the session and of the identity of the loader of
+    /// image `image` of the record.
+    pub const fn loader_at(self, image: u32) -> u64 {
+        self.raw_at(image) | Self::IDENTITY | Self::EXIT
+    }
+
+    /// The label of the identity session of the record's first image.
     pub const fn identity(self) -> u64 {
-        self.raw() | Self::IDENTITY
+        self.identity_at(IMAGE)
+    }
+
+    /// The label of the identity session of image `image` of the record:
+    /// it vouches for the record only while that image is the record's.
+    pub const fn identity_at(self, image: u32) -> u64 {
+        self.raw_at(image) | Self::IDENTITY
+    }
+
+    /// The label of the session and of the identity of the loader of the
+    /// record's image: both of bits 62 and 61.
+    pub const fn loader(self) -> u64 {
+        self.raw() | Self::IDENTITY | Self::EXIT
     }
 
     /// The record and the place `raw` names, when it is a label the
-    /// service gives: bit 63, at most one of bits 62 and 61, the image IMAGE,
-    /// an index below RECORDS and a generation of 1 to GENERATION_MAX.
+    /// service gives: bit 63, an image of 1 to IMAGE_MAX, an index below
+    /// RECORDS and a generation of 1 to GENERATION_MAX.
     pub const fn parse(raw: u64) -> Option<(Self, Place)> {
+        match Self::parse_image(raw) {
+            Some((label, place, _)) => Some((label, place)),
+            None => None,
+        }
+    }
+
+    /// `parse` with the image the label names.
+    pub const fn parse_image(raw: u64) -> Option<(Self, Place, u32)> {
         let index = (raw & 0xFFFF) as u16;
         let generation = ((raw >> 16) & 0xFF_FFFF) as u32;
         let image = (raw >> Self::IMAGE_SHIFT) & Self::IMAGE_MASK;
@@ -177,17 +291,17 @@ impl Label {
             (false, false) => Place::Work,
             (true, false) => Place::Identity,
             (false, true) => Place::Exit,
-            (true, true) => return None,
+            (true, true) => Place::Loader,
         };
         if raw & Self::SERVICE == 0
-            || image != IMAGE as u64
+            || image == 0
             || index as usize >= RECORDS
             || generation == 0
             || generation > GENERATION_MAX
         {
             return None;
         }
-        Some((Self { index, generation }, place))
+        Some((Self { index, generation }, place, image as u32))
     }
 
     /// The record whose session has the label `raw`.
@@ -263,8 +377,6 @@ pub enum Method {
     Change = 3,
     Loaded = 6,
     Abandon = 7,
-    Spawn = 8,
-    Next = 9,
     WaitStart = 10,
     WaitTake = 11,
     WaitCancel = 12,
@@ -276,6 +388,18 @@ pub enum Method {
     GetSid = 18,
     Register = 20,
     Vouch = 21,
+    SpawnStart = 22,
+    Boot = 23,
+    Take = 24,
+    SpawnCommit = 25,
+    SpawnAbort = 26,
+    SetId = 27,
+    ExecStart = 28,
+    ExecCommit = 29,
+    ExecAbort = 30,
+    Replace = 31,
+    Ready = 32,
+    Pool = 33,
 }
 impl Method {
     pub const fn header(self) -> Header {
@@ -286,7 +410,8 @@ impl Method {
     }
 }
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21,
+    1, 2, 3, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32, 33,
 ];
 
 /// The mark of a notary session's label: bit 62 with bit 63 clear, which
@@ -297,6 +422,16 @@ pub const NOTARY: u64 = 1 << 62;
 /// Whether `label` is that of a notary session.
 pub const fn is_notary(label: u64) -> bool {
     label & (1 << 63) == 0 && label & NOTARY != 0
+}
+
+/// The mark of the notary session of a service that may say a file is
+/// set-ID (SetId): bit 61 with NOTARY, which init gives only to the file
+/// services its table names.
+pub const SET_ID: u64 = 1 << 61;
+
+/// Whether `label` is that of a notary session that may send SetId.
+pub const fn may_set_id(label: u64) -> bool {
+    is_notary(label) && label & SET_ID != 0
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -320,8 +455,9 @@ impl Change {
 
 /// The body of Create: the process as init's table has it (proto_init
 /// ADOPT), its quota in bytes, room for handles, ceiling and the priority
-/// of its first thread, root credentials when `root`, and the label of the
-/// parent whose Spawn asked for it, 0 for a record init's table starts.
+/// of its first thread, root credentials when `root`, and the ticket init
+/// gave the record (proto_init Adoption), which Replace names the record's
+/// new process by after an exec; 0 for a process init knows nothing of.
 ///
 /// | Bytes | Field |
 /// |---|---|
@@ -331,7 +467,7 @@ impl Change {
 /// | 13 | priority |
 /// | 14 | root: 0 or 1 |
 /// | 15 | zero |
-/// | 16..24 | parent |
+/// | 16..24 | ticket |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Create {
     pub quota: u64,
@@ -339,7 +475,7 @@ pub struct Create {
     pub ceiling: u8,
     pub priority: u8,
     pub root: bool,
-    pub parent: u64,
+    pub ticket: u64,
 }
 
 impl Create {
@@ -347,7 +483,7 @@ impl Create {
         w.u64(self.quota)?;
         w.u32(self.handle_limit)?;
         w.bytes(&[self.ceiling, self.priority, u8::from(self.root), 0])?;
-        w.u64(self.parent)
+        w.u64(self.ticket)
     }
 
     /// BAD_SIZE out of the layout; a ceiling or priority past 63, a
@@ -356,7 +492,7 @@ impl Create {
         let quota = r.u64()?;
         let handle_limit = r.u32()?;
         let b = r.bytes(4)?;
-        let parent = r.u64()?;
+        let ticket = r.u64()?;
         r.finish()?;
         let (ceiling, priority) = (b[0], b[1]);
         if ceiling > 63 || priority == 0 || priority > ceiling || b[2] > 1 || b[3] != 0 {
@@ -368,7 +504,7 @@ impl Create {
             ceiling,
             priority,
             root: b[2] == 1,
-            parent,
+            ticket,
         })
     }
 }
@@ -378,12 +514,23 @@ impl Create {
 pub const GENERATIONS_SIZE: usize = RECORDS * 8;
 
 /// The reply to Vouch: status u32 (0), the record's PID u32, the six
-/// credentials u32 and the generation of the credentials u64: 40 bytes.
+/// credentials u32, the generation of the credentials u64, then 1 u32
+/// for the identity of a loader (0 for a process's), the image u32 and the
+/// ticket of the loader's place u64 (zeros for a process): 56 bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WhoReply {
     pub pid: u32,
     pub credentials: Credentials,
     pub generation: u64,
+    pub loader: Option<LoaderOf>,
+}
+
+/// What Vouch says of a loader's identity: the image of the record it
+/// loads, and the ticket of its place, which SetId names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoaderOf {
+    pub image: u32,
+    pub ticket: u64,
 }
 
 impl WhoReply {
@@ -393,7 +540,11 @@ impl WhoReply {
         for id in self.credentials.words() {
             w.u32(id)?;
         }
-        w.u64(self.generation)
+        w.u64(self.generation)?;
+        let (mark, image, ticket) = self.loader.map_or((0, 0, 0), |l| (1, l.image, l.ticket));
+        w.u32(mark)?;
+        w.u32(image)?;
+        w.u64(ticket)
     }
 
     /// BAD_SIZE out of the layout, for a PID of 0 or past the signed range,
@@ -409,14 +560,21 @@ impl WhoReply {
             *w = r.u32()?;
         }
         let generation = r.u64()?;
+        let (mark, image, ticket) = (r.u32()?, r.u32()?, r.u64()?);
         r.finish()?;
         if pid == 0 || pid > i32::MAX as u32 || words.contains(&u32::MAX) {
             return Err(Status::BadSize);
         }
+        let loader = match (mark, image, ticket) {
+            (0, 0, 0) => None,
+            (1, image, ticket) => Some(LoaderOf { image, ticket }),
+            _ => return Err(Status::BadSize),
+        };
         Ok(Self {
             pid,
             credentials: Credentials::from_words(words),
             generation,
+            loader,
         })
     }
 }
@@ -605,79 +763,86 @@ pub const SI_USER: i32 = 0;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 
-/// The body of Spawn: the name of the record of init's table, 16 bytes,
-/// the spawn-flags u32, the process group u32, the caller's level u32,
-/// which the copy of the child's program runs at least at, and the
-/// caller's signal mask u64, which the child's main thread starts with.
+/// The body of SpawnStart: the spawn-flags u32 (SPAWN_FLAGS), the
+/// process group u32, the caller's level u32, at which the loader runs,
+/// the signal mask u64 the child's main thread starts with (the caller's,
+/// or that of POSIX_SPAWN_SETSIGMASK) and the signals u64 whose action
+/// POSIX_SPAWN_SETSIGDEF sets to the default (bit n - 1 for signal n).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Spawn {
-    pub name: Name,
+pub struct SpawnStart {
     pub flags: u32,
     pub pgroup: u32,
     pub level: u8,
     pub mask: u64,
+    pub default: u64,
 }
 
-impl Spawn {
+impl SpawnStart {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        w.name(Some(self.name))?;
         w.u32(self.flags)?;
         w.u32(self.pgroup)?;
         w.u32(self.level.into())?;
-        w.u64(self.mask)
+        w.u64(self.mask)?;
+        w.u64(self.default)
     }
 
-    /// BAD_SIZE out of the layout, without a name or with a level past 63.
+    /// BAD_SIZE out of the layout or with a level past 63.
     pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
-        let name = r.name()?.ok_or(Status::BadSize)?;
-        let (flags, pgroup, level, mask) = (r.u32()?, r.u32()?, r.u32()?, r.u64()?);
+        let (flags, pgroup, level) = (r.u32()?, r.u32()?, r.u32()?);
+        let (mask, default) = (r.u64()?, r.u64()?);
         r.finish()?;
         let level = u8::try_from(level)
             .ok()
             .filter(|&l| l <= 63)
             .ok_or(Status::BadSize)?;
         Ok(Self {
-            name,
             flags,
             pgroup,
             level,
             mask,
+            default,
         })
     }
 }
 
-/// The reply to Next that is no refusal: the spawn the spawning thread
-/// makes next, and the level of the parent's Spawn.
+/// The body of SetId: the ticket of the loader's place u64 (Vouch's
+/// `LoaderOf`), the record's PID u32 and image u32, the user ID u32 and
+/// the group ID u32 the file sets (NO_ID for none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Next {
-    pub parent: u64,
-    pub name: Name,
-    pub level: u8,
+pub struct SetId {
+    pub ticket: u64,
+    pub pid: u32,
+    pub image: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
-impl Next {
+/// An ID SetId leaves as it is.
+pub const NO_ID: u32 = u32::MAX;
+
+impl SetId {
     pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
-        w.u32(0)?;
-        w.u32(0)?;
-        w.u64(self.parent)?;
-        w.name(Some(self.name))?;
-        w.u32(self.level.into())
+        w.u64(self.ticket)?;
+        w.u32(self.pid)?;
+        w.u32(self.image)?;
+        w.u32(self.uid)?;
+        w.u32(self.gid)
     }
 
-    /// BAD_SIZE unless `bytes` hold status 0 and the fields.
-    pub fn read(bytes: &[u8]) -> Result<Self, Status> {
-        let mut r = Reader::new(bytes);
-        if r.u32()? != 0 || r.u32()? != 0 {
+    /// BAD_SIZE out of the layout or with neither ID.
+    pub fn read(mut r: Reader<'_>) -> Result<Self, Status> {
+        let ticket = r.u64()?;
+        let (pid, image, uid, gid) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+        r.finish()?;
+        if uid == NO_ID && gid == NO_ID {
             return Err(Status::BadSize);
         }
-        let parent = r.u64()?;
-        let name = r.name()?.ok_or(Status::BadSize)?;
-        let level = u8::try_from(r.u32()?).map_err(|_| Status::BadSize)?;
-        r.finish()?;
         Ok(Self {
-            parent,
-            name,
-            level,
+            ticket,
+            pid,
+            image,
+            uid,
+            gid,
         })
     }
 }
@@ -820,8 +985,6 @@ mod tests {
             Method::Change,
             Method::Loaded,
             Method::Abandon,
-            Method::Spawn,
-            Method::Next,
             Method::WaitStart,
             Method::WaitTake,
             Method::WaitCancel,
@@ -833,11 +996,23 @@ mod tests {
             Method::GetSid,
             Method::Register,
             Method::Vouch,
+            Method::SpawnStart,
+            Method::Boot,
+            Method::Take,
+            Method::SpawnCommit,
+            Method::SpawnAbort,
+            Method::SetId,
+            Method::ExecStart,
+            Method::ExecCommit,
+            Method::ExecAbort,
+            Method::Replace,
+            Method::Ready,
+            Method::Pool,
         ];
         assert_eq!(methods.len(), METHODS.len());
         for (i, m) in methods.iter().enumerate() {
             assert_eq!(*m as u16, METHODS[i]);
-            assert_eq!(m.header().version, 4);
+            assert_eq!(m.header().version, 5);
         }
         for i in 1..=4 {
             assert_eq!(Change::from_number(i).unwrap() as u32, i);
@@ -861,6 +1036,8 @@ mod tests {
             Some((label, Place::Identity))
         );
         assert_eq!(Label::from_raw(label.exit()), None, "no session's label");
+        assert_eq!(Label::parse(label.loader()), Some((label, Place::Loader)));
+        assert_eq!(Label::from_raw(label.loader()), None, "no record's session");
         assert_eq!(label.pid(), 5 + 256 * 3);
         // Labels of init, both place bits, other image numbers, an index
         // past the records and generation 0 name no record.
@@ -868,9 +1045,8 @@ mod tests {
             0,
             7,
             3 << 16 | 5,
-            label.raw() | 1 << 62 | 1 << 61,
+            label.loader() & !(1 << 63),
             label.raw() & !(1 << 40),
-            label.raw() | 1 << 41,
             1 << 63 | 1 << 40 | 3 << 16 | 256,
             1 << 63 | 1 << 40 | 5,
             1 << 63 | 1 << 40 | u64::from(GENERATION_MAX + 1) << 16,
@@ -895,11 +1071,7 @@ mod tests {
             ceiling: 31,
             priority: 30,
             root: true,
-            parent: Label {
-                index: 2,
-                generation: 1,
-            }
-            .raw(),
+            ticket: 0x1234,
         };
         let mut w = Writer::new();
         create.write(&mut w).unwrap();
@@ -920,65 +1092,34 @@ mod tests {
     }
 
     #[test]
-    fn spawn_and_next_round_trip() {
-        let name = Name::new(b"procs-child").unwrap();
-        let spawn = Spawn {
-            name,
-            flags: SPAWN_SETPGROUP,
-            pgroup: 0,
-            level: 30,
-            mask: 1 << 9,
-        };
-        let mut w = Writer::new();
-        spawn.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 36);
-        assert_eq!(Spawn::read(Reader::new(w.as_bytes())), Ok(spawn));
-        assert_eq!(
-            Spawn::read(Reader::new(&w.as_bytes()[..35])),
-            Err(Status::BadSize)
-        );
-        assert_eq!(
-            Spawn::read(Reader::new(&[0; 36])),
-            Err(Status::BadSize),
-            "no name"
-        );
-        let mut high = w.as_bytes().to_vec();
-        high[24] = 64;
-        assert_eq!(
-            Spawn::read(Reader::new(&high)),
-            Err(Status::BadSize),
-            "level 64"
-        );
-        let next = Next {
-            parent: 7,
-            name,
-            level: 30,
-        };
-        let mut w = Writer::new();
-        next.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 36);
-        assert_eq!(Next::read(w.as_bytes()), Ok(next));
-        assert_eq!(
-            Next::read(&proto_wire::reply(Status::BadSize)),
-            Err(Status::BadSize)
-        );
-    }
-
-    #[test]
     fn who_round_trips_and_refuses_what_is_no_identity() {
         let reply = WhoReply {
             pid: 300,
             credentials: Credentials::NOBODY,
             generation: 1 << 40 | 7,
+            loader: None,
         };
         let mut w = Writer::new();
         reply.write(&mut w).unwrap();
-        assert_eq!(w.as_bytes().len(), 40);
+        assert_eq!(w.as_bytes().len(), 56);
         assert_eq!(WhoReply::read(w.as_bytes()), Ok(reply));
         let mut bytes = w.as_bytes().to_vec();
         bytes[4..8].fill(0);
         assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "pid 0");
-        assert_eq!(WhoReply::read(&w.as_bytes()[..39]), Err(Status::BadSize));
+        assert_eq!(WhoReply::read(&w.as_bytes()[..55]), Err(Status::BadSize));
+        let loader = WhoReply {
+            loader: Some(LoaderOf {
+                image: 1,
+                ticket: 3 << 8 | 5,
+            }),
+            ..reply
+        };
+        let mut w = Writer::new();
+        loader.write(&mut w).unwrap();
+        assert_eq!(WhoReply::read(w.as_bytes()), Ok(loader));
+        let mut bytes = w.as_bytes().to_vec();
+        bytes[40] = 2;
+        assert_eq!(WhoReply::read(&bytes), Err(Status::BadSize), "mark 2");
         assert_eq!(GENERATIONS_SIZE, 2048);
     }
 
@@ -1064,5 +1205,41 @@ mod tests {
         assert_eq!(signal_name(6), "SIGABRT");
         assert_eq!(signal_name(15), "SIGTERM");
         assert_eq!(signal_name(40), "SIGRT");
+    }
+
+    #[test]
+    fn spawn_start_and_set_id_round_trip() {
+        let start = SpawnStart {
+            flags: SPAWN_SETSIGMASK | SPAWN_RESETIDS,
+            pgroup: 0,
+            level: 30,
+            mask: 1 << 9,
+            default: 1 << 14,
+        };
+        let mut w = Writer::new();
+        start.write(&mut w).unwrap();
+        assert_eq!(SpawnStart::read(Reader::new(w.as_bytes())), Ok(start));
+        let mut high = w.as_bytes().to_vec();
+        high[8] = 64;
+        assert_eq!(SpawnStart::read(Reader::new(&high)), Err(Status::BadSize));
+        let set = SetId {
+            ticket: 7 << 8 | 2,
+            pid: 300,
+            image: 1,
+            uid: 0,
+            gid: NO_ID,
+        };
+        let mut w = Writer::new();
+        set.write(&mut w).unwrap();
+        assert_eq!(SetId::read(Reader::new(w.as_bytes())), Ok(set));
+        let none = SetId { uid: NO_ID, ..set };
+        let mut w = Writer::new();
+        none.write(&mut w).unwrap();
+        assert_eq!(SetId::read(Reader::new(w.as_bytes())), Err(Status::BadSize));
+        // Only a notary label with SET_ID may send SetId.
+        assert!(may_set_id(NOTARY | SET_ID | 7));
+        assert!(!may_set_id(NOTARY | 7));
+        assert!(!may_set_id(1 << 63 | NOTARY | SET_ID));
+        assert!(is_notary(NOTARY | SET_ID | 7));
     }
 }

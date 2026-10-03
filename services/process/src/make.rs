@@ -21,9 +21,9 @@ use rt::{abi, loader, sys};
 /// The boot image the service maps read-only at its start (`set_image`).
 static IMAGE: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 /// The service's channel with no label, its own process, init's channel
-/// the level of its loop and the channel of the identity sessions, which
-/// the main thread keeps for good (`set_handles`).
-static OWN: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// and the level of its loop, which the main thread keeps for good
+/// (`set_handles`).
+static OWN: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// The boot image, `len` bytes mapped at `addr` for as long as the
 /// service lives.
@@ -40,12 +40,10 @@ pub fn set_handles(
     own: &Handle<Process>,
     init: &Handle<Channel>,
     level: u8,
-    identities: &Handle<Channel>,
 ) {
     OWN[0].store(channel.raw().0, Ordering::Relaxed);
     OWN[1].store(own.raw().0, Ordering::Relaxed);
     OWN[2].store(init.raw().0, Ordering::Relaxed);
-    OWN[4].store(identities.raw().0, Ordering::Relaxed);
     OWN[3].store(level.into(), Ordering::Release);
 }
 
@@ -97,7 +95,7 @@ pub struct Made {
     pub thread: Handle<Thread>,
 }
 
-/// Why no process was made: the status for init or the parent, and the
+/// Why no process was made: the status for init, and the
 /// label of the record when one was made, which Abandon then ends.
 pub struct Failed {
     pub status: Status,
@@ -132,15 +130,11 @@ pub fn loaded(label: u64, thread: Handle<Thread>) -> Result<(), Status> {
     ask(&w, [thread.erase()].into(), &mut buffer).map(drop)
 }
 
-/// Abandon of the record of `label` (0 for none), whose process is killed,
-/// and of the Spawn of the record of `parent` (0 for none), which gets
-/// `status`.
-pub fn abandon(label: u64, parent: u64, status: Status) -> Result<(), Status> {
+/// Abandon of the record of `label` (0 for none), whose process is killed.
+pub fn abandon(label: u64) -> Result<(), Status> {
     let mut w = Writer::new();
     Method::Abandon.header().write(&mut w)?;
     w.u64(label)?;
-    w.u64(parent)?;
-    w.u32(status.code())?;
     let mut buffer = [0; abi::MESSAGE_MAX];
     ask(&w, rt::handle::Outgoing::new(), &mut buffer).map(drop)
 }
@@ -152,10 +146,8 @@ pub fn status(bytes: &[u8]) -> Result<Status, Status> {
 
 /// ADOPTED for `ticket` with what `made` gave: the session, the process,
 /// a copy of its thread and the identity session, then thread_start and Loaded once init took
-/// them; a refusal of init, or no process, ends the record and the Spawn
-/// of `parent` (0 for none) with Abandon. `buffer` is the calling
-/// thread's.
-pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
+/// them; a refusal of init, or no process, ends the record with Abandon.
+pub fn adopted(ticket: u64, made: Result<Made, Failed>) {
     let mut w = Writer::new();
     if proto_init::Method::Adopted.header().write(&mut w).is_err() || w.u64(ticket).is_err() {
         return;
@@ -170,7 +162,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
             // channel's end.
             let _ = w.u32(failed.status.code().max(1));
             let _ = sys::send(&init, w.as_bytes());
-            let _ = abandon(failed.label.unwrap_or(0), parent, failed.status);
+            let _ = abandon(failed.label.unwrap_or(0));
             return;
         }
     };
@@ -200,7 +192,7 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
     if taken && sys::thread_start(&thread).is_ok() {
         let _ = loaded(label, thread);
     } else {
-        let _ = abandon(label, parent, Status::from_code(proto_process::AGAIN));
+        let _ = abandon(label);
     }
 }
 
@@ -208,10 +200,8 @@ pub fn adopted(ticket: u64, made: Result<Made, Failed>, parent: u64) {
 /// `start` (proto_init Adoption) from the
 /// program `name` of the boot image, loading it through `window` of the
 /// service's space, which only the calling thread uses, while `thread`,
-/// the caller's own, runs at `level`: the process's priority, or that of
-/// the parent whose Spawn waits for it when higher, so that a parent
-/// waits for no copy below its own level; never above the loop's. The
-/// record stays LOADING until `loaded`.
+/// the caller's own, runs at `level`: the process's priority, never above
+/// the loop's. The record stays LOADING until `loaded`.
 ///
 /// # Safety
 /// Only the calling thread maps and uses `window`, a range as big as the
@@ -229,13 +219,6 @@ pub unsafe fn make(
         label: None,
     };
     let program = program(name).ok_or(refused(Status::from_code(proto_process::INVALID)))?;
-    // The end of an identity session waits in its channel, which no loop
-    // receives on, and the session stays until it is received: this thread
-    // empties the channel before each Create, so that the sessions of the
-    // processes that went do not fill it and no step of the loop grows
-    // with their number.
-    let identities = Handle::<Channel>::borrowed(abi::Handle(OWN[4].load(Ordering::Acquire)));
-    while sys::try_receive(&identities).is_ok() {}
     let mut w = Writer::new();
     Method::Create.header().write(&mut w).map_err(refused)?;
     create.write(&mut w).map_err(refused)?;

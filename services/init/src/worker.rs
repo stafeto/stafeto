@@ -27,7 +27,7 @@ use bootimg::Program;
 use core::cell::UnsafeCell;
 use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use init::table::{BOOT_IMAGE, Gate, MAX_DMA, PROCESS_SERVICE, Record, TABLE};
+use init::table::{BOOT_IMAGE, Gate, MAX_DMA, PROCESS_SERVICE, RAM_SERVICE, Record, TABLE};
 use init::work::{WORKER_IDLE, WORKER_MAX};
 use proto_init::{OWN_ARGS_MAX, ServiceArgs};
 use proto_wire::Writer;
@@ -351,14 +351,15 @@ fn load(record: &Record, label: u64, program: &Program<'static>, quota: u64) -> 
 /// The start data of an instance of `record` besides its process and
 /// thread (spec 13.3): the copies of the system resource of `resources`;
 /// a copy of each of its DMA objects, made here (`dma`), under its name;
-/// the boot image, read-only, for the process service (BOOT_IMAGE); and
+/// the boot image, read-only, for the process service and the RAM file
+/// service (BOOT_IMAGE); and
 /// the arguments (`set_args`) with the physical address of each DMA
 /// object, 8 bytes little-endian, before the record's. Returns init's own
 /// handles to the DMA objects.
 fn start_data(record: &Record, spawned: &mut Spawned) -> Result<Kept, Error> {
     let resource = view::<Resource>(RESOURCE);
     resources(record, &mut spawned.giver, &resource)?;
-    if record.name == PROCESS_SERVICE {
+    if record.name == PROCESS_SERVICE || record.name == RAM_SERVICE {
         let image =
             sys::handle_duplicate(&view::<Memory>(BOOT), Rights::MAP_READ | Rights::TRANSFER)?;
         // The checks of the table keep the name apart from the others.
@@ -396,7 +397,14 @@ pub fn resources(
         (record.trace, "trace", Rights::KSTATS),
     ] {
         if wanted {
-            let copy = sys::handle_duplicate(resource, right | Rights::TRANSFER)?;
+            // The process service gives the programs its loaders start a
+            // console of their own (5c): its copy may be copied.
+            let copy_right = if name == "console" && record.name == PROCESS_SERVICE {
+                Rights::DUPLICATE
+            } else {
+                Rights::NONE
+            };
+            let copy = sys::handle_duplicate(resource, right | Rights::TRANSFER | copy_right)?;
             // The names of the start data fit the giver (NAMES_MAX).
             let _ = giver.give(name, copy.erase());
         }

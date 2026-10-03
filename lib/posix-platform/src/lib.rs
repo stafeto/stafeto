@@ -27,7 +27,7 @@ use posix_types::Timespec;
 
 /// The version of the interface of the functions `stafeto_*`; relibc
 /// expects the same.
-pub const PLATFORM_INTERFACE: u64 = 7;
+pub const PLATFORM_INTERFACE: u64 = 10;
 
 /// The ABI word relibc checks at start: the size of the block in bits 0
 /// to 15, its offset in the TCB in bits 16 to 31, the interface in bits 32
@@ -335,19 +335,282 @@ pub unsafe extern "C" fn stafeto_waitid(
     }
 }
 
-/// posix_spawn of the program at `path` (posix_abi::process::spawn): the
-/// child's PID, or the negated errno.
+/// What relibc's posix_spawn gives of its attributes: the spawn-flags
+/// and the process group, the masks of POSIX_SPAWN_SETSIGMASK and
+/// POSIX_SPAWN_SETSIGDEF (bit n - 1 for signal n).
+#[repr(C)]
+pub struct SpawnAttributes {
+    flags: c_int,
+    pgroup: c_int,
+    mask: u64,
+    default: u64,
+}
+
+/// A file action as relibc's posix_spawn gives it: OPEN (1) of `path`
+/// with `flags` at `fd`, CLOSE (2) of `fd`, DUP2 (3) of `fd` to `newfd`,
+/// CHDIR (4) to `path`, FCHDIR (5) to `fd`.
+#[repr(C)]
+pub struct SpawnAction {
+    kind: c_int,
+    fd: c_int,
+    newfd: c_int,
+    flags: c_int,
+    mode: u32,
+    path: *const c_char,
+}
+
+/// The file actions of `list`, `count` of them, as the layer takes them;
+/// a kind it does not know is a close of a number past the table, which
+/// fails with EBADF.
+///
+/// # Safety
+/// `list` is null or holds `count` actions whose paths are C strings that
+/// live through the call.
+unsafe fn actions<'a>(
+    list: *const SpawnAction,
+    count: usize,
+) -> impl Iterator<Item = posix_abi::process::FileAction<'a>> + Clone {
+    use posix_abi::process::FileAction;
+    let count = if list.is_null() { 0 } else { count };
+    (0..count).map(move |i| {
+        // SAFETY: the caller's promise.
+        let a = unsafe { &*list.add(i) };
+        let number = |n: c_int| u32::try_from(n).unwrap_or(u32::MAX);
+        // SAFETY: as above, for the paths of OPEN and CHDIR.
+        let path = || unsafe { bytes_of(a.path) };
+        match a.kind {
+            1 => FileAction::Open {
+                fd: number(a.fd),
+                path: path(),
+                flags: a.flags,
+            },
+            2 => FileAction::Close(number(a.fd)),
+            3 => FileAction::Dup2(number(a.fd), number(a.newfd)),
+            4 => FileAction::Chdir(path()),
+            5 => FileAction::Fchdir(number(a.fd)),
+            _ => FileAction::Close(u32::MAX),
+        }
+    })
+}
+
+/// The bytes of the C string `path`, without its NUL; empty for null.
+///
+/// # Safety
+/// `path` is null or a C string that lives as long as `'a`.
+unsafe fn bytes_of<'a>(path: *const c_char) -> &'a [u8] {
+    if path.is_null() {
+        return &[];
+    }
+    // SAFETY: the caller's promise.
+    unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes()
+}
+
+/// The strings of the NULL-ended list `list` of C strings, without NULs.
+///
+/// # Safety
+/// `list` is null or a NULL-ended array of C strings that live through
+/// the call.
+unsafe fn strings<'a>(list: *const *const c_char) -> impl Iterator<Item = &'a [u8]> + Clone {
+    let mut i = 0;
+    core::iter::from_fn(move || {
+        if list.is_null() {
+            return None;
+        }
+        // SAFETY: the caller's promise: the array ends with NULL.
+        let p = unsafe { *list.add(i) };
+        if p.is_null() {
+            return None;
+        }
+        i += 1;
+        // SAFETY: as above, each entry is a C string.
+        Some(unsafe { core::ffi::CStr::from_ptr(p) }.to_bytes())
+    })
+}
+
+/// posix_spawn of the program at `path` with `argv`, `envp` and the
+/// attributes at `attributes` (null for none): from its file through the
+/// loader (posix_abi::process::spawn_file, 5c). The child's PID, or the
+/// negated errno.
+///
+/// # Safety
+/// `path` is a C string; `argv` and `envp` are null or NULL-ended arrays
+/// of C strings; `attributes` is null or points to SpawnAttributes;
+/// `file_actions` is null or holds `count` SpawnAction.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_spawn(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+    attributes: *const SpawnAttributes,
+    file_actions: *const SpawnAction,
+    count: usize,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+    // SAFETY: as above.
+    let attributes = unsafe { attributes.as_ref() };
+    let (flags, pgroup) = attributes.map_or((0, 0), |a| (a.flags, a.pgroup));
+    let (Ok(flags), Ok(pgroup)) = (u32::try_from(flags), u32::try_from(pgroup)) else {
+        return -posix_abi::constants::EINVAL;
+    };
+    let mask = attributes
+        .filter(|_| flags & proto_process::SPAWN_SETSIGMASK != 0)
+        .map(|a| a.mask);
+    let default = attributes
+        .filter(|_| flags & proto_process::SPAWN_SETSIGDEF != 0)
+        .map_or(0, |a| a.default);
+    let umask = files::umask();
+    let attributes = posix_abi::process::SpawnAttributes {
+        flags,
+        pgroup,
+        mask,
+        default,
+        umask,
+    };
+    // SAFETY: the caller's promise for argv, envp and the file actions.
+    let (argv, envp, file_actions) =
+        unsafe { (strings(argv), strings(envp), actions(file_actions, count)) };
+    match call(|| {
+        posix_abi::process::spawn_file(
+            path,
+            argv.clone(),
+            envp.clone(),
+            attributes,
+            file_actions.clone(),
+        )
+    }) {
+        Ok(pid) => pid,
+        Err(errno) => -errno,
+    }
+}
+
+/// execve of the program in the file at `path` with `argv` and `envp`
+/// (posix_abi::process::exec): it returns only with the negated errno.
+///
+/// # Safety
+/// `path` is a C string; `argv` and `envp` are null or NULL-ended arrays
+/// of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_exec(
+    path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { bytes_of(path) };
+    // SAFETY: as above.
+    let (argv, envp) = unsafe { (strings(argv), strings(envp)) };
+    let umask = files::umask();
+    match call(|| posix_abi::process::exec(path, argv.clone(), envp.clone(), umask)) {
+        Ok(never) => match never {},
+        Err(errno) => -errno,
+    }
+}
+
+/// The probes of the window of exec (posix_abi::process): ExecCommit
+/// with no exec gives its errno; an exec whose old image ends with `code`
+/// before ExecCommit (by its own SIGKILL for 137) returns only on an
+/// error.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_exec_commit() -> c_int {
+    posix_abi::process::probe_exec_commit()
+}
+
+/// # Safety
+/// `path` is a C string; `argv` a NULL-ended array of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_exec_then_exit(
+    path: *const c_char,
+    argv: *const *const c_char,
+    code: c_int,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let (path, argv) = unsafe { (bytes_of(path), strings(argv)) };
+    posix_abi::process::probe_exec_then_exit(path, argv, code as u64)
+}
+
+/// The probe of an exec whose old image outlives its ExecCommit and asks
+/// the clock service to set the time (posix_abi::process::probe_exec_outlive):
+/// returns only on an error, with its errno.
+///
+/// # Safety
+/// `path` is a C string; `argv` a NULL-ended array of C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_exec_outlive(
+    path: *const c_char,
+    argv: *const *const c_char,
+) -> c_int {
+    // SAFETY: the caller's promise.
+    let (path, argv) = unsafe { (bytes_of(path), strings(argv)) };
+    posix_abi::process::probe_exec_outlive(path, argv)
+}
+
+/// The probe of a SpawnCommit before the loader's image is ready
+/// (posix_abi::process::probe_commit_early): its errno, and the child's
+/// PID in `pid` to reap.
+///
+/// # Safety
+/// `pid` points to an int.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_commit_early(pid: *mut c_int) -> c_int {
+    let mut child = -1;
+    let errno = posix_abi::process::probe_commit_early(&mut child);
+    // SAFETY: the caller's promise.
+    unsafe { pid.write(child) };
+    errno
+}
+
+/// The loads the calling record may have at once
+/// (posix_abi::process::probe_loads).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_loads() -> c_int {
+    posix_abi::process::probe_loads()
+}
+
+/// The bytes of the process service's quota left for children (Pool),
+/// for the probe that the ends of loads give theirs back.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_pool() -> u64 {
+    posix_abi::process::probe_pool()
+}
+
+/// The probe of `addopen` (posix_abi::process::probe_addopen_cloexec):
+/// 1 when the caller's own descriptor of an open action has FD_CLOEXEC.
 ///
 /// # Safety
 /// `path` is a C string.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn stafeto_spawn(path: *const c_char, flags: c_int, pgroup: c_int) -> c_int {
+pub unsafe extern "C" fn stafeto_probe_addopen_cloexec(path: *const c_char) -> c_int {
     // SAFETY: the caller's promise.
     let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
-    match call(|| posix_abi::process::spawn(path, flags, pgroup)) {
-        Ok(pid) => pid,
-        Err(errno) => -errno,
-    }
+    posix_abi::process::probe_addopen_cloexec(path)
+}
+
+/// Arms the notification of the process's identity session
+/// (posix_abi::process::probe_notify_identity): 0 or EIO.
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_notify_identity() -> c_int {
+    posix_abi::process::probe_notify_identity()
+}
+
+/// OPEN_EXEC through the process's own session with the RAM file
+/// service (posix_abi::process::probe_open_exec): 0 or the errno, for the
+/// probes of 5c.
+///
+/// # Safety
+/// `path` is a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn stafeto_probe_open_exec(path: *const c_char) -> c_int {
+    // SAFETY: the caller's promise.
+    let path = unsafe { core::ffi::CStr::from_ptr(path) }.to_bytes();
+    posix_abi::process::probe_open_exec(path)
+}
+
+/// The probe of condition O2 of 5c: Start of the next spawns carries a
+/// channel of the caller's (posix_abi::process::probe_decoy).
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_probe_decoy(on: c_int) {
+    posix_abi::process::probe_decoy(on != 0);
 }
 
 const PAGE: usize = 4096;

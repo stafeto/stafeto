@@ -331,11 +331,34 @@ fn first_thread(
     priority: u8,
     policy: Policy,
 ) -> Result<Handle<Thread>, Error> {
-    let x = [
-        process.raw().0,
+    thread_at(
+        process,
         entry,
         INIT_STACK_TOP,
         START_CHANNEL.0,
+        priority,
+        policy,
+    )
+}
+
+/// thread_create in `process`, another process the caller made, at
+/// `entry` with its stack pointer at `stack` and `x0`, its message buffer
+/// at INIT_MSGBUF: the first thread of a program, or of the loader the
+/// POSIX process service maps into a new process (spec 2, 3.2). The
+/// thread does not run until thread_start.
+pub fn thread_at(
+    process: &Handle<Process>,
+    entry: u64,
+    stack: u64,
+    x0: u64,
+    priority: u8,
+    policy: Policy,
+) -> Result<Handle<Thread>, Error> {
+    let x = [
+        process.raw().0,
+        entry,
+        stack,
+        x0,
         priority.into(),
         policy as u64,
         INIT_MSGBUF,

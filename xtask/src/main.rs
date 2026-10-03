@@ -13,6 +13,7 @@ mod measure;
 mod ostest;
 mod qemu;
 mod ring;
+mod rootfs;
 mod rtbench;
 mod rtbench2;
 mod symbolize;
@@ -38,6 +39,10 @@ const CHILD_STACK_SIZE: u32 = 16 * 1024;
 const POSIX_STACK_SIZE: u32 = 64 * 1024;
 /// The stack of a test service (tests/svc), which init's loader maps.
 const SVC_STACK_SIZE: u32 = 16 * 1024;
+/// The stack of the RAM file service: its start reads the table of the boot
+/// image (services/ramfs/src/tree.rs) on top of the start data, and its
+/// loop holds the table of its sessions.
+const RAMFS_STACK_SIZE: u32 = 48 * 1024;
 /// The stacks of the UART driver (services/uart) and of the shell
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
@@ -71,11 +76,12 @@ const RTBENCH_PROGRAMS: [ImageProgram; 1] = [("init", "rtbench", INIT_STACK_SIZE
 /// rtbench 2 (rtbench2.rs): the POSIX benchmark with the RAM files, the
 /// process and clock services, the service of long operations (`svc`,
 /// role `l`, under the name `uart`), the load, and the PL011's driver for
-/// the console.
-const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
+/// the console; the loader, which starts the benchmark's children from the
+/// files of the image (5c).
+const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -86,12 +92,13 @@ const RTBENCH_POSIX_PROGRAMS: [ImageProgram; 8] = [
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
 ];
 /// rtbench 2 on Apple VZ: the Virtio console's driver for the console.
-const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
+const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-rtbench-posix-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -102,16 +109,17 @@ const RTBENCH_POSIX_VZ_PROGRAMS: [ImageProgram; 8] = [
     ("svc", "test-svc", SVC_STACK_SIZE, &[]),
     ("rtbench-load", "rtbench-load", CHILD_STACK_SIZE, &[]),
     ("rtbench-posix", "rtbench-posix", 64 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
 ];
 const EXT4RO_PROGRAMS: [ImageProgram; 1] = [("init", "ext4ro-probe", INIT_STACK_SIZE, &[])];
 const RAMFS_PROGRAMS: [ImageProgram; 3] = [
     ("init", "init", INIT_STACK_SIZE, &["table-ramfs"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     ("ramfs-probe", "ramfs-probe", CHILD_STACK_SIZE, &[]),
 ];
 const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -127,7 +135,7 @@ const POSIX_ABI_PROGRAMS: [ImageProgram; 7] = [
 /// each POSIX process fails its load (`posix_orphans`).
 const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -141,7 +149,7 @@ const POSIX_ORPHAN_PROGRAMS: [ImageProgram; 7] = [
 ];
 const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -161,7 +169,7 @@ const POSIX_THREAD_PROGRAMS: [ImageProgram; 7] = [
 const POSIX_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -212,7 +220,7 @@ const RTBENCH_VZ_PROGRAMS: [ImageProgram; 3] = [
 const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -229,7 +237,7 @@ const POSIX_VZ_CANCEL_INPUT_PROGRAMS: [ImageProgram; 6] = [
 ];
 const POSIX_SHARED_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -250,7 +258,7 @@ const POSIX_TLS_PROGRAMS: [ImageProgram; 1] = [("init", "posix-tls-probe", INIT_
 const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
     ("uart", "uart", SVC_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -268,7 +276,7 @@ const POSIX_INPUT_PROGRAMS: [ImageProgram; 6] = [
 const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -285,7 +293,7 @@ const POSIX_VZ_INPUT_PROGRAMS: [ImageProgram; 6] = [
 ];
 const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -303,7 +311,7 @@ const POSIX_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
 ];
 const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-dialog-vz"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -322,7 +330,7 @@ const POSIX_VZ_INTERRUPT_PROGRAMS: [ImageProgram; 6] = [
 const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-abi-vz"]),
     ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -342,7 +350,7 @@ const POSIX_VZ_THREAD_PROGRAMS: [ImageProgram; 8] = [
 /// The first C program on relibc (5a′) and the services it needs.
 const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -352,26 +360,43 @@ const RELIBC_PROGRAMS: [ImageProgram; 5] = [
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("relibc-hello", "relibc-hello", POSIX_STACK_SIZE, &[]),
 ];
-/// The probe of POSIX processes (5b) and the services it needs: the same
-/// program a second time with a stack of 32 MiB, which the 15 pages of
-/// quota of its record cannot map (procs-big).
-const POSIX_PROCS_PROGRAMS: [ImageProgram; 6] = [
+/// The probe of POSIX processes (5b) and the services it needs, the loader
+/// and BusyBox with its applets, which the table of files names (5c): the
+/// probe's children are files of it.
+const POSIX_PROCS_PROGRAMS: [ImageProgram; 7] = [
     ("init", "init", INIT_STACK_SIZE, &["table-posix-procs"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
         64 * 1024,
-        &["children-max-4"],
+        &[],
     ),
     ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
     ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
-    ("posix-procs-big", "posix-procs", 32 * 1024 * 1024, &[]),
+    ("loader", "loader", 0, &[]),
+    ("busybox-probe", "busybox-probe", 0, &["applets"]),
+];
+/// The probe of the longest step of the process service (xtask
+/// process-steps): the probe in its steps mode, and the process service
+/// that prints each new longest step.
+const POSIX_STEPS_PROGRAMS: [ImageProgram; 6] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-posix-steps"]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &["steps"]),
+    (
+        "posix-process-service",
+        "posix-process-service",
+        64 * 1024,
+        &["steps"],
+    ),
+    ("posix-clock-service", "posix-clock-service", 64 * 1024, &[]),
+    ("posix-procs", "posix-procs", POSIX_STACK_SIZE, &[]),
+    ("loader", "loader", 0, &[]),
 ];
 /// The threads of relibc (5a′) and the services they need.
 const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-relibc-threads"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -383,7 +408,7 @@ const RELIBC_THREADS_PROGRAMS: [ImageProgram; 5] = [
 ];
 const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -395,7 +420,7 @@ const BUSYBOX_PROGRAMS: [ImageProgram; 5] = [
 ];
 const ASH_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -413,7 +438,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -430,7 +455,7 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 6] = [
 ];
 const LS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
-    ("ramfs", "ramfs", SVC_STACK_SIZE, &[]),
+    ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
     (
         "posix-process-service",
         "posix-process-service",
@@ -474,6 +499,8 @@ const KERNEL_LIMIT: u64 = 200 * 1024;
 /// limit of their own still catches a runaway growth.
 const TEST_KERNEL_LIMIT: u64 = 512 * 1024;
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The crowd of the steps probe under -icount, on the host's clock.
+const STEPS_TIMEOUT: Duration = Duration::from_secs(600);
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The overflow probe's recursive function, as `llvm-nm -C` names it.
 const OVERFLOW_PROBE_FN: &str = "kernel::arch::aarch64::probe::recurse";
@@ -853,7 +880,9 @@ commands:
   relibc-threads run relibc's pthreads, waits, cancellation and signals
             over the Rust POSIX layer
   posix-procs run the C probe of POSIX processes: posix_spawn from the
-            boot image through the process service
+            boot image and from files through the process service
+  process-steps run the probe of the longest step of the process service
+            under -icount with a crowd of children
   relibc-threads-hvf the same on the host's processor (Hypervisor framework)
   busybox   run BusyBox cat from the boot image against ramfs in QEMU
   ash       run a BusyBox ash builtin script in QEMU
@@ -861,10 +890,12 @@ commands:
   ash-dialog  check an interactive BusyBox ash dialog in QEMU
   ls        run BusyBox ls against the RAM file service in QEMU
   layer-names  check that the layer's libraries export no C name
-  os-test [--jobs N] run os-test's io and malloc suites on relibc, one test
-            a boot, N boots at a time;
+  os-test [--jobs N] run os-test's io, malloc, signal and basic spawn and exec
+            tests on relibc, a boot a suite with the tests started from
+            files, N boots at a time;
             the table goes to target/measure/os-test.txt; fails when a
-            test of tests/os-test/pass.txt does not pass
+            test of tests/os-test/pass.txt does not pass; with
+            --one NAME, one test in a boot of its own, with its log
   help      this text";
 
 fn main() {
@@ -914,10 +945,23 @@ fn main() {
         Some("ext4ro") => ext4ro_probe(),
         Some("ramfs") => ramfs_probe(),
         Some("relibc") => relibc(),
-        Some("os-test") => jobs::parse_jobs("os-test", &args[1..]).and_then(ostest::run_in_budget),
+        Some("os-test") => match &args[1..] {
+            [flag, name] if flag == "--one" => ostest::run_one(name),
+            rest => jobs::parse_jobs("os-test", rest).and_then(ostest::run_in_budget),
+        },
         Some("layer-names") => layer_c_names(),
         Some("relibc-hello") => relibc_hello_probe(),
-        Some("posix-procs") => posix_procs_probe(),
+        Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
+        Some("process-steps") => match &args[1..] {
+            [] => process_steps(&qemu::VIRT, 7),
+            [n] => n
+                .parse()
+                .ok()
+                .filter(|n| (1..=7).contains(n))
+                .ok_or_else(|| "process-steps expects 1..=7 branches".to_owned())
+                .and_then(|n| process_steps(&qemu::VIRT, n)),
+            _ => Err("process-steps [branches]".to_owned()),
+        },
         Some("relibc-threads") => relibc_threads_probe(&qemu::VIRT),
         Some("relibc-threads-hvf") => match hvf_host() {
             Ok(()) => relibc_threads_probe(&qemu::HVF_V3),
@@ -1178,6 +1222,18 @@ fn write_boot_image_with(
     profile: Profile,
     env: &[(&str, &str)],
 ) -> Result<PathBuf, String> {
+    write_boot_image_files(name, programs, profile, env, Vec::new())
+}
+
+/// `write_boot_image_with` with `extra` files in the image's table of
+/// files after those `rootfs::files_of(name)` lists (os-test's tests).
+fn write_boot_image_files(
+    name: &str,
+    programs: &[ImageProgram],
+    profile: Profile,
+    env: &[(&str, &str)],
+    extra: Vec<rootfs::RootFile>,
+) -> Result<PathBuf, String> {
     let mut cmd = cargo();
     cmd.envs(env.iter().copied());
     cmd.arg("build").args(profile.args());
@@ -1204,19 +1260,28 @@ fn write_boot_image_with(
             sources.push((file, elf, stack));
         }
     }
-    write_elf_image(name, &sources)
+    write_elf_image(name, &sources, extra)
 }
 
-fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathBuf, String> {
+fn write_elf_image(
+    name: &str,
+    sources: &[(&str, PathBuf, u32)],
+    extra: Vec<rootfs::RootFile>,
+) -> Result<PathBuf, String> {
     let target = target_dir();
     let objdump = llvm_tool("llvm-objdump")?;
     let mut files = Vec::new();
     for (file, elf, stack) in sources {
         let why = |e: String| format!("{}: {e}", elf.display());
+        disasm::erratum_835769(elf, &objdump)?;
+        // A program of stack 0 goes into the image as its ELF file alone:
+        // the loader, and the programs only files of the table name.
+        if *stack == 0 {
+            continue;
+        }
         let bytes = std::fs::read(elf).map_err(|e| why(e.to_string()))?;
         let program = bootimg::elf::program(&bytes, *stack).map_err(|e| why(e.to_string()))?;
         let written = bootimg::write::program(&program).map_err(|e| why(e.to_string()))?;
-        disasm::erratum_835769(elf, &objdump)?;
         files.push((*file, written, elf.clone()));
     }
     let mut list: Vec<_> = files.iter().map(|(f, b, _)| (*f, b.as_slice())).collect();
@@ -1253,7 +1318,7 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     // An image with a test of os-test (ISC) carries os-test's licence.
     let os_test = sources
         .iter()
-        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "os-test-probe"));
+        .any(|(_, elf, _)| elf.file_name().is_some_and(|n| n == "os-test-run"));
     let os_test_licence = if os_test {
         Some(ostest::licence()?)
     } else {
@@ -1261,6 +1326,45 @@ fn write_elf_image(name: &str, sources: &[(&str, PathBuf, u32)]) -> Result<PathB
     };
     if let Some(licence) = &os_test_licence {
         list.push((ostest::LICENCE, licence.as_slice()));
+    }
+    // The files of the RAM file service: the files its table names, the
+    // ELF files of programs as the linker wrote them among them, then the
+    // ELF files of the other programs of stack 0 (the loader, `loader.elf`),
+    // then the table (rootfs.rs).
+    let mut listed = rootfs::files_of(name);
+    listed.extend(extra);
+    let wanted = rootfs::sources(&listed);
+    let read_elf = |program: &str| -> Result<Vec<u8>, String> {
+        let (_, elf, _) = sources
+            .iter()
+            .find(|(file, _, _)| *file == program)
+            .ok_or_else(|| format!("{name}: no program {program} for its rootfs"))?;
+        std::fs::read(elf).map_err(|e| format!("{}: {e}", elf.display()))
+    };
+    let mut elf_names = Vec::new();
+    let mut elf_bytes = Vec::new();
+    for source in &wanted {
+        elf_bytes.push(source.bytes(read_elf)?);
+        elf_names.push(source.file_name());
+    }
+    for (file, _, stack) in sources {
+        let raw = rootfs::elf_name(file);
+        if *stack == 0 && !elf_names.contains(&raw) {
+            elf_bytes.push(read_elf(file)?);
+            elf_names.push(raw);
+        }
+    }
+    let first = list.len() as u32;
+    for (file, bytes) in elf_names.iter().zip(&elf_bytes) {
+        list.push((file.as_str(), bytes.as_slice()));
+    }
+    let table = if listed.is_empty() {
+        None
+    } else {
+        Some(rootfs::table(&listed, first, list.len() as u32 + 1)?)
+    };
+    if let Some(table) = &table {
+        list.push(("rootfs", table.as_slice()));
     }
     let image = bootimg::write::image(&list).map_err(|e| format!("{name}: {e}"))?;
     let path = target.join(name);
@@ -1446,6 +1550,20 @@ fn ramfs_probe() -> Result<(), String> {
     cmd.args(qemu::HEADLESS);
     let output = run_until(cmd, BOOT_TIMEOUT, Some("ramfs-probe: ok"), &kernel.elf)?;
     qemu::expect_stopped_on(&output, "ramfs-probe: ok")?;
+    // The service reports the size of the ELF file the image carries: the
+    // guest's `wc -c` of it is the host's file length.
+    let elf = image_elf(&target_dir(), "boot-ramfs.img", "ramfs-probe");
+    let host = std::fs::metadata(&elf)
+        .map_err(|e| format!("{}: {e}", elf.display()))?
+        .len();
+    match qemu::number_after(&output.lines, "ramfs-probe: image file size ") {
+        Some(guest) if guest == host => {}
+        guest => {
+            return Err(format!(
+                "the guest reads {guest:?} bytes of /bin/ramfs-probe, the ELF file has {host}"
+            ));
+        }
+    }
     println!("RAM file service guest probe passed");
     Ok(())
 }
@@ -1869,42 +1987,71 @@ fn relibc_hello_probe() -> Result<(), String> {
 /// The probe of POSIX processes (tests/posix-procs): its checks pass, its
 /// child says the PID the parent's posix_spawn gave and the parent's PID,
 /// and the child that did not load got no process.
-fn posix_procs_probe() -> Result<(), String> {
+fn posix_procs_probe(machine: &qemu::Machine) -> Result<(), String> {
     relibc()?;
+    // BusyBox is /bin/ls of the image's files (5c).
+    run_cmd(Command::new("python3").arg(root().join("tools/build-busybox.py")))?;
     let kernel = build(Variant::Normal)?;
     let image = build_boot_image("boot-posix-procs.img", &POSIX_PROCS_PROGRAMS, BOOT_PROFILE)?;
-    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Null)?;
-    // The parent and its child end in either order.
-    let ended = (|| {
-        for line in [
-            "init: posix-procs ended: exit code 0, not restarted",
-            "init: procs-child ended: exit code 0, not restarted",
-            "init: procs-big did not load: no process of the process service, not restarted",
-            "init: procs-exit7 ended: exit code 7, not restarted",
-            "init: procs-middle ended: exit code 0, not restarted",
-            "init: procs-orphan ended: exit code 0, not restarted",
-            "init: procs-sleeper ended: signal 15 (SIGTERM), not restarted",
-            "init: procs-block ended: killed, not restarted",
-            "init: procs-catch ended: exit code 42, not restarted",
-            "init: procs-catch ended: signal 15 (SIGTERM), not restarted",
-            "init: procs-sleep2 ended: signal 15 (SIGTERM), not restarted",
-            "init: procs-ids ended: exit code 0, not restarted",
-        ] {
-            run.expect_seen(line, BOOT_TIMEOUT)?;
-        }
-        Ok::<(), String>(())
-    })();
+    // The probe is the table's only record: its end is init's line, and
+    // its children are processes of the service that init never hears of.
+    // It ends in an exec (stage 10) of the role that exits with 42: init
+    // reports the new image's end.
+    let ended = run.expect_seen(
+        "init: posix-procs ended: exit code 42, not restarted",
+        BOOT_TIMEOUT,
+    );
     let outcome = run.stop();
     symbolize::backtrace(&outcome.lines, &kernel.elf);
     ended?;
     qemu::expect_marker(&outcome, "posix-procs: ok")?;
+    qemu::expect_marker(&outcome, "posix-procs: the last image ran")?;
     qemu::expect_marker(&outcome, "posix-procs: orphan saw ppid 1")?;
+    // The first goal of 5c: /bin/ls from a file lists /etc, a line alone,
+    // from a spawn and from an exec.
+    if outcome.lines.iter().filter(|l| l.trim() == "motd").count() < 2 {
+        return Err("ls of /etc printed `motd` fewer than twice".into());
+    }
+    // The new image of an exec whose old image ended first never runs.
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("the image of a dead exec ran"))
+    {
+        return Err("an exec ran after its old image ended".into());
+    }
+    // The old image of an exec ends at ExecCommit.
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("the old image lived past ExecCommit"))
+    {
+        return Err("an old image lived past its ExecCommit".into());
+    }
+    if outcome
+        .lines
+        .iter()
+        .any(|l| l.contains("the old image set the clock"))
+    {
+        return Err("an old image set the clock with its record's new rights".into());
+    }
     for marker in [
         "posix-procs: a child inherits the mask and SIG_IGN",
         "posix-procs: a thread took SIGUSR1 after main left",
         "posix-procs: the last thread ran atexit",
+        // Stage 7 (5c): ls of /etc from a file, argv and envp, set-ID.
+        "posix-process: loader ready",
+        "posix-procs: ls of /etc ended with 0",
+        "posix-procs: args 4 [one two] [three] X=1",
+        "posix-procs: setid uid 65534 euid 0 secure 1 fd 3",
+        "posix-procs: nobody uid 65534 euid 65534",
+        // Stage 8: the file actions' current directory.
+        "posix-procs: the child's directory is /bin",
+        // Stage 9: exec keeps the PID.
+        "posix-procs: after exec pid",
     ] {
         qemu::expect_marker(&outcome, marker)?;
     }
@@ -1927,7 +2074,162 @@ fn posix_procs_probe() -> Result<(), String> {
             "the child says {child:?}, the parent {parent:?}: no child of that parent"
         ));
     }
-    println!("C POSIX process probe passed: posix_spawn from the boot image");
+    println!("C POSIX process probe passed: posix_spawn and exec from files");
+    Ok(())
+}
+
+/// The longest Vouch the measurement takes, in ticks under -icount: about
+/// 3,000 with 32 or with 248 children, so a step that grows with the
+/// processes fails it at once (5b's Vouch took 539 ticks an entry).
+const VOUCH_TICKS_MAX: u64 = 6_000;
+
+/// The most one READ_INTO of up to proto_fs::READ_INTO_MAX bytes may take in
+/// the RAM file service's loop: term B of the kernel, in ticks under -icount.
+const RAM_STEP_MAX: u64 = 20_536;
+
+/// The kinds of the lines of the RAM file service (tag 2), by the numbers
+/// of proto_fs::Method.
+const RAM_STEP_KINDS: [(usize, &str); 6] = [
+    (1, "Open"),
+    (13, "ReadAt"),
+    (14, "OpenExec"),
+    (15, "Clone"),
+    (17, "ReadInto"),
+    (64, "notification"),
+];
+
+/// The kinds of the lines `service step: T kind K N ticks detail D` of the
+/// process service (tag 1), by the numbers of proto_process::Method.
+const STEP_KINDS: [(usize, &str); 12] = [
+    (1, "Create"),
+    (13, "Kill"),
+    (21, "Vouch"),
+    (22, "SpawnStart"),
+    (23, "Boot"),
+    (24, "Take"),
+    (25, "SpawnCommit"),
+    (28, "ExecStart"),
+    (29, "ExecCommit"),
+    (31, "Replace"),
+    (10, "WaitStart"),
+    (64, "notification"),
+];
+
+/// The longest step of each kind in `lines`: (kind, ticks, detail), the
+/// last line of a kind being its longest, since each prints only when it
+/// grows.
+fn longest_steps(lines: &[String], tag: &str) -> Vec<(usize, u64, u64)> {
+    let mut out: Vec<(usize, u64, u64)> = Vec::new();
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let [
+            "service",
+            "step:",
+            line_tag,
+            "kind",
+            kind,
+            ticks,
+            "ticks",
+            "detail",
+            detail,
+        ] = words.as_slice()
+        else {
+            continue;
+        };
+        if *line_tag != tag {
+            continue;
+        }
+        let (Ok(kind), Ok(ticks), Ok(detail)) = (kind.parse(), ticks.parse(), detail.parse())
+        else {
+            continue;
+        };
+        match out.iter_mut().find(|(k, ..)| *k == kind) {
+            Some(row) => *row = (kind, ticks, detail),
+            None => out.push((kind, ticks, detail)),
+        }
+    }
+    out
+}
+
+/// The longest step of the process service under -icount with the crowd
+/// of children of tests/posix-procs in its steps mode: kill(-1), spawn,
+/// exec, the ends of all, and a Vouch with the identity channel full.
+/// The crowd is `branches` branches of 32 children each (up to 7; with 7,
+/// 24 children of the probe's own beside them).
+/// Prints a row for each kind of step, checks that the longest Vouch stays
+/// under VOUCH_TICKS_MAX, and the numbers go to `target/measure`.
+fn process_steps(machine: &qemu::Machine, branches: u32) -> Result<(), String> {
+    relibc()?;
+    let kernel = build(Variant::Normal)?;
+    let image = write_boot_image_with(
+        "boot-posix-steps.img",
+        &POSIX_STEPS_PROGRAMS,
+        BOOT_PROFILE,
+        &[("STEPS_BRANCHES", &branches.to_string())],
+    )?;
+    let mut cmd = qemu::command(machine, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS);
+    cmd.args(qemu::ICOUNT);
+    let outcome = run_until(
+        cmd,
+        STEPS_TIMEOUT,
+        Some("init: posix-procs ended"),
+        &kernel.elf,
+    )?;
+    let dir = target_dir().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let log = dir.join("process-steps.log");
+    std::fs::write(&log, outcome.lines.join("\n") + "\n")
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    qemu::expect_marker(&outcome, "posix-procs: steps done")?;
+    let rows = longest_steps(&outcome.lines, "1");
+    let ram = longest_steps(&outcome.lines, "2");
+    if rows.is_empty() {
+        return Err("the process service printed no step".into());
+    }
+    // The volleys armed the crowd, and the clock asked Vouch with every
+    // identity session in the channel: Vouch reads the label of the copy
+    // from the kernel (object_info LABEL) and stays as short as with no
+    // crowd at all.
+    let live = qemu::number_after(&outcome.lines, "posix-procs: steps ").unwrap_or(0);
+    let vouch = rows.iter().find(|(k, ..)| *k == 21).map_or(0, |r| r.1);
+    if vouch == 0 || vouch > VOUCH_TICKS_MAX {
+        return Err(format!(
+            "the longest Vouch took {vouch} ticks with {live} children, past {VOUCH_TICKS_MAX}"
+        ));
+    }
+    // One READ_INTO is a step of the RAM file service at level 40 whose
+    // copy is bounded by READ_INTO_MAX; it stays under term B.
+    let read_into = ram.iter().find(|(k, ..)| *k == 17).map_or(0, |r| r.1);
+    if read_into == 0 || read_into > RAM_STEP_MAX {
+        return Err(format!(
+            "the RAM file service: READ_INTO took {read_into} ticks, past {RAM_STEP_MAX}: {ram:?}"
+        ));
+    }
+    let mut text = String::from("kind method ticks detail\n");
+    for (kind, name, ticks, detail) in ram.iter().map(|(k, t, d)| {
+        let name = RAM_STEP_KINDS
+            .iter()
+            .find(|(n, _)| n == k)
+            .map_or("other", |(_, n)| n);
+        (k, name, t, d)
+    }) {
+        text += &format!("ramfs {kind} {name} {ticks} {detail}\n");
+    }
+    for (kind, ticks, detail) in &rows {
+        let name = STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        text += &format!("{kind} {name} {ticks} {detail}\n");
+    }
+    let path = dir.join("process-steps.txt");
+    std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
+    print!(
+        "process steps under icount on {}, {live} children live:\n{text}",
+        machine.name
+    );
+    println!("C process steps passed: {}", log.display());
     Ok(())
 }
 
@@ -2003,6 +2305,20 @@ fn ash_dialog() -> Result<(), String> {
         &ASH_INTERACTIVE_PROGRAMS,
         BOOT_PROFILE,
     )?;
+    // What `ls -l` shows of the files of /bin: the mode, the links and the
+    // size of the ELF file of the program the file holds (rootfs.rs).
+    let elf_size = |program: &str| -> Result<String, String> {
+        let elf = image_elf(&target_dir(), "boot-ash-dialog.img", program);
+        let meta = std::fs::metadata(&elf).map_err(|e| format!("{}: {e}", elf.display()))?;
+        Ok(meta.len().to_string())
+    };
+    let busybox = elf_size("busybox-probe")?;
+    let bin_listing = [
+        ("-rwxr-xr-x", "3", "busybox", busybox.clone()),
+        ("-rwxr-xr-x", "3", "cat", busybox.clone()),
+        ("-rwxr-xr-x", "3", "ls", busybox),
+        ("-rwsr-x---", "1", "ramfs", elf_size("ramfs")?),
+    ];
     let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
     cmd.args(qemu::HEADLESS);
     let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
@@ -2029,6 +2345,26 @@ fn ash_dialog() -> Result<(), String> {
         // The directories show as such: st_mode of a directory.
         run.expect("dr-xr-xr-x", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
+        // The files of the boot image's table: the modes and the sizes of
+        // the ELF files (three links of BusyBox, a set-user-ID file), one
+        // command each.
+        for (mode, links, name, size) in &bin_listing {
+            let command = format!("ls -l /bin/{name}");
+            run.send(&command)?;
+            run.expect(&command, DIALOG_STEP)?;
+            run.expect_line(
+                name,
+                |line| {
+                    let words: Vec<_> = line.split_whitespace().collect();
+                    line.starts_with(mode)
+                        && words.get(1) == Some(links)
+                        && words.contains(&size.as_str())
+                        && words.last() == Some(&format!("/bin/{name}").as_str())
+                },
+                DIALOG_STEP,
+            )?;
+            run.expect("# ", DIALOG_STEP)?;
+        }
         run.send("ls --help")?;
         run.expect("ls --help", DIALOG_STEP)?;
         run.expect("Usage: ls", DIALOG_STEP)?;
@@ -2195,6 +2531,8 @@ fn test(jobs: usize) -> Result<(), String> {
 fn timing_jobs() -> Vec<jobs::Job> {
     use jobs::job;
     vec![
+        // A hung test is killed after a second of the host's time.
+        ostest::runner_check_job(),
         job(
             "elf boot without a device tree",
             elf_boot_reports_missing_device_tree,
@@ -2230,7 +2568,10 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("posix-interrupt", || posix_interrupt_probe(false)),
         job("relibc-hello", relibc_hello_probe),
         job("relibc-threads", || relibc_threads_probe(&qemu::VIRT)),
-        job("posix-procs", posix_procs_probe),
+        job("posix-procs", || posix_procs_probe(&qemu::VIRT)),
+        // The longest step of the process service with 128 children, under
+        // -icount: the host's time changes none of its numbers.
+        job("process-steps", || process_steps(&qemu::VIRT, 4)),
         // BusyBox on relibc guards the C surface (5a').
         job("busybox", busybox_probe),
         job("ash", ash_probe),
@@ -2292,7 +2633,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
             kernel_tests(&qemu::VIRT_2G, Variant::TestIcount).map(drop)
         }),
     ];
-    // os-test (io and malloc) within its time budget; its passing tests
+    // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
     // come after `ls`.
     let at = list
@@ -2334,6 +2675,8 @@ fn host_tests() -> Result<(), String> {
         "posix-credentials",
         "--package",
         "proto-process",
+        "--package",
+        "proto-loader",
         "--package",
         "posix-process-service",
         "--package",
@@ -3639,9 +3982,11 @@ fn hvf() -> Result<(), String> {
         }
         console_dialog(m)?;
         trace_dialog(m)?;
-        // relibc's pthreads on the real processor: about a second.
+        // relibc's pthreads and the POSIX processes, the loader of files
+        // among them, on the real processor.
         if m.name == qemu::HVF_V3.name {
             relibc_threads_probe(m)?;
+            posix_procs_probe(m)?;
         }
         let init = init_tests(m, false)?;
         let svc = svc_tests(m)?;
@@ -3664,7 +4009,7 @@ fn hvf() -> Result<(), String> {
         }
         write_measures()?;
         println!(
-            "hvf on {}: boot ok, console dialog ok, relibc threads ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
+            "hvf on {}: boot ok, console dialog ok, relibc threads and POSIX processes ok on GICv3, init tests {init} passed (hole reads zero), service tests {svc} passed, kernel tests {kernel} passed",
             m.name
         );
     }
@@ -3928,6 +4273,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--package",
         "proto-clock",
         "--package",
+        "proto-loader",
+        "--package",
         "xtask",
         "--all-targets",
         "--",
@@ -4040,6 +4387,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "--features",
         "uart/crash,virtio-console/crash,init/dma-watch,posix-shared-probe/input-probe,posix-process-service/adoption-refusals,posix-abi/rtbench",
         "--package",
+        "loader",
+        "--package",
         "test-init",
         "--package",
         "test-child",
@@ -4096,6 +4445,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "relibc-threads",
         "--package",
         "posix-procs",
+        "--package",
+        "os-test-run",
         "--target",
         PROGRAM_TARGET,
         "--",

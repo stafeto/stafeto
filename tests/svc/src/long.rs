@@ -36,7 +36,7 @@
 //! LongOps keeps 16 operations of a session and 24 in all; the state is
 //! static, off the service's 16 KiB stack.
 
-use crate::{FAILED, base, serve};
+use crate::{FAILED, LONG_SESSIONS, base, serve_with};
 use abi::{Error, Rights};
 use proto_uart::{Method, ReadKey, ReadRequest, VERSION, WriteReply};
 use proto_wire::{HEADER_LEN, Status, long};
@@ -101,6 +101,7 @@ pub fn run(s: Startup) -> u64 {
         pause,
         pause_timer,
         seen: 0,
+        given: 0,
         requested: 0,
         awaiting: 0,
         timer,
@@ -110,7 +111,7 @@ pub fn run(s: Startup) -> u64 {
         fed: None,
     });
     // SAFETY: written just above.
-    serve(&s, &channel, unsafe { long.assume_init_mut() })
+    serve_with::<_, LONG_SESSIONS>(&s, &channel, unsafe { long.assume_init_mut() })
 }
 
 struct State(core::cell::UnsafeCell<core::mem::MaybeUninit<Long>>);
@@ -145,6 +146,8 @@ struct Long {
     pause: Handle<Channel>,
     pause_timer: Handle<Timer>,
     seen: u64,
+    /// The sessions CLONE gave (the labels 1 << 63 | n).
+    given: u64,
     requested: u32,
     awaiting: u32,
     timer: Handle<Timer>,
@@ -155,6 +158,26 @@ struct Long {
 }
 
 impl Long {
+    /// CLONE as the console's driver does it: a session of a label of the
+    /// service's own (bit 63) for a child of the client.
+    fn clone_session(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || !r.handles.is_empty() {
+            return Answer::Status(Status::BadSize);
+        }
+        self.given += 1;
+        let label = 1 << 63 | self.given;
+        let channel = Handle::<Channel>::borrowed(self.channel);
+        match sys::handle_label(&channel, Rights::SEND | Rights::TRANSFER, label, self.level) {
+            Ok(session) => {
+                if r.reply().u32(0).is_err() {
+                    return Answer::Status(Status::BadSize);
+                }
+                Answer::Reply([session.erase()].into())
+            }
+            Err(e) => Answer::Status(Status::Kernel(e)),
+        }
+    }
+
     fn op(&mut self, label: u64, key: u64) -> Option<usize> {
         self.data
             .iter()
@@ -307,6 +330,7 @@ impl Service<1> for Long {
         Method::ReadStart.number(),
         Method::ReadTake.number(),
         Method::ReadCancel.number(),
+        Method::Clone.number(),
         PING,
         STATS,
         FEED,
@@ -320,6 +344,7 @@ impl Service<1> for Long {
             n if n == Method::ReadStart.number() => self.start(&mut s.data, r),
             n if n == Method::ReadTake.number() => self.take(&mut s.data, r, false),
             n if n == Method::ReadCancel.number() => self.take(&mut s.data, r, true),
+            n if n == Method::Clone.number() => self.clone_session(r),
             n if n == Method::Write.number() => {
                 let written = (r.bytes().len() - HEADER_LEN) as u32;
                 match (WriteReply { written }).write(r.reply()) {

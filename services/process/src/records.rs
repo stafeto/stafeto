@@ -33,13 +33,9 @@ use proto_process::{
 };
 
 /// The children of one record at most, its zombies among them, until
-/// RLIMIT_NPROC (5b design, question 3): Spawn past them is EAGAIN. Four
-/// in the image of the probe of POSIX processes, which reaches the limit.
-pub const CHILDREN_MAX: u32 = if cfg!(feature = "children-max-4") {
-    4
-} else {
-    32
-};
+/// RLIMIT_NPROC (5b design, question 3): Spawn past them is EAGAIN. The
+/// probe of POSIX processes reaches it with children from files (5c).
+pub const CHILDREN_MAX: u32 = 32;
 
 /// Where a record is in its life.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +82,16 @@ pub struct Record<P> {
     pub state: State,
     /// The ceiling of its process.
     pub ceiling: u8,
+    /// The quota and the room for handles of its process, which a child
+    /// it spawns from a file gets too (5c).
+    pub quota: u64,
+    pub handle_limit: u32,
+    /// The image number of its process: IMAGE, then that of each exec
+    /// that committed (5c). Its session, exit place and identity carry it.
+    pub image: u32,
+    /// The last image number an exec of the record took, committed or
+    /// not: the next exec takes one more, so no number names two attempts.
+    pub tried: u32,
     /// Its process group and session: those of its parent, or its own PID
     /// for a record of init's table.
     pub pgid: u32,
@@ -184,15 +190,26 @@ impl<P> Records<P> {
         }
     }
 
-    /// The index of the live record that `raw` names in `place`.
+    /// The index of the live record that `raw` names in `place`: a
+    /// session, an exit place and an identity of its present image, a
+    /// loader of any (the service checks the image of its place). A copy
+    /// of an old image's identity vouches for nothing after the exec.
     fn named(&self, raw: u64, place: Place) -> Option<usize> {
-        let (label, got) = Label::parse(raw)?;
+        let (label, got, image) = Label::parse_image(raw)?;
         let index = usize::from(label.index);
+        let any_image = place == Place::Loader;
         (got == place
             && self.records[index]
                 .as_ref()
-                .is_some_and(|r| r.label == label))
+                .is_some_and(|r| r.label == label && (any_image || r.image == image)))
         .then_some(index)
+    }
+
+    /// The label of the session of the record in `index`, of its present
+    /// image.
+    pub fn session_label(&self, index: usize) -> Option<u64> {
+        let r = self.get(index)?;
+        Some(r.label.raw_at(r.image))
     }
 
     /// The index of the record whose session has `label`, if it lives.
@@ -289,6 +306,10 @@ impl<P> Records<P> {
             credentials,
             state: State::Loading,
             ceiling,
+            quota: 0,
+            handle_limit: 0,
+            image: proto_process::IMAGE,
+            tried: proto_process::IMAGE,
             pgid,
             sid,
             parent_index: parent.map(|p| p as u16),
@@ -533,6 +554,23 @@ impl<P> Records<P> {
         self.named(label, Place::Identity)
     }
 
+    /// The index of the record whose loader's session or identity has
+    /// `label`, while the record is in the table.
+    pub fn find_loader(&self, label: u64) -> Option<usize> {
+        self.named(label, Place::Loader)
+    }
+
+    /// The index of the record whose exit place of any image has `label`
+    /// and that image, while its process lives (an exec's old process or
+    /// new one, 5c). O(1).
+    pub fn find_exit_any(&self, label: u64) -> Option<(usize, u32)> {
+        let (named, place, image) = Label::parse_image(label)?;
+        let index = usize::from(named.index);
+        let record = self.records[index].as_ref()?;
+        (place == Place::Exit && record.label == named && !matches!(record.state, State::Zombie(_)))
+            .then_some((index, image))
+    }
+
     /// The index of the record whose exit place has `label`, while its
     /// process lives: a label of another place, of a gone generation, of
     /// no record or of a zombie names none. O(1).
@@ -548,7 +586,10 @@ impl<P> Records<P> {
             index,
             generation: pid / RECORDS as u32,
         };
-        self.find(label.raw())
+        self.records[usize::from(index)]
+            .as_ref()
+            .is_some_and(|r| r.label == label)
+            .then_some(usize::from(index))
     }
 
     /// The process of the record in `index` ended with `end` (the
@@ -861,7 +902,7 @@ mod tests {
                 ceiling,
                 priority: ceiling,
                 root: false,
-                parent: 0,
+                ticket: 0,
             };
             let place = exit_place(label, &create, loop_level);
             assert_eq!(place.label, label.exit());
@@ -1303,5 +1344,29 @@ mod tests {
         assert_eq!(t.joining(pi, group, 4242, own), None, "no such group");
         assert_eq!(t.joining(pi, sess, 0, own), Some(Join::NewSession));
         assert_eq!(t.joining(pi, sess | group, 0, own), None);
+    }
+
+    /// After an exec (5c) the session and the exit place of the old image
+    /// name no record, those of the new one do, and the identity of either
+    /// names the same record; the PID stays.
+    #[test]
+    fn an_exec_moves_the_session_and_the_identity() {
+        let mut t = Records::<u32>::new();
+        let live = add(&mut t).unwrap();
+        let i = at(live);
+        t.get_mut(i).unwrap().image = 2;
+        assert_eq!(t.find(live.raw()), None, "the old image's session");
+        assert_eq!(t.find_exit(live.exit()), None, "the old image's end");
+        assert_eq!(t.find(live.raw_at(2)), Some(i));
+        assert_eq!(t.session_label(i), Some(live.raw_at(2)));
+        assert_eq!(t.find_exit(live.exit_at(2)), Some(i));
+        assert_eq!(
+            t.find_identity(live.identity()),
+            None,
+            "the old image's identity"
+        );
+        assert_eq!(t.find_identity(live.identity_at(2)), Some(i));
+        assert_eq!(t.find_loader(live.loader_at(3)), Some(i));
+        assert_eq!(t.find_pid(live.pid()), Some(i));
     }
 }

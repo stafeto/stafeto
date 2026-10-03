@@ -114,13 +114,13 @@
 //! witness closed. Once init answered 0, the service starts the thread; on
 //! any other answer it kills the process.
 //!
-//! SPAWN, also from the process service alone, for posix_spawn of a
-//! POSIX process (5b, until the loader of 5c): the header and the name of
-//! a record of init's table that starts on demand, 16 bytes; the reply
-//! that is no refusal is that of ADOPT for that record (`Adoption`), whose
-//! process the service makes as for ADOPT and gives with ADOPTED.
-//! ACCESS_DENIED for a name of no record that starts on demand,
-//! LIMIT_REACHED while an instance of it lives or ends.
+//! REPLACED, also from the process service alone, once the record of a
+//! process init started made an exec: the header, the ticket u64 of the
+//! record's instance and one handle, the new process (DUPLICATE, TRANSFER).
+//! Init keeps a copy of it with no rights in place of the old one, so that
+//! the end it reports is the new process's; the reply is its status.
+//! INVALID_ARGS for a ticket no running instance has. The service lets the
+//! new image run only after the answer.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -142,7 +142,7 @@ pub enum Method {
     Ping = 7,
     Adopt = 8,
     Adopted = 9,
-    Spawn = 10,
+    Replaced = 11,
 }
 
 impl Method {
@@ -156,7 +156,7 @@ impl Method {
         Method::Ping,
         Method::Adopt,
         Method::Adopted,
-        Method::Spawn,
+        Method::Replaced,
     ];
 
     pub const fn number(self) -> u16 {
@@ -1087,13 +1087,14 @@ mod tests {
     #[test]
     fn method_numbers_are_fixed() {
         let numbers = Method::ALL.map(Method::number);
-        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 11]);
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
         }
         assert_eq!(Method::from_number(0), None);
-        assert_eq!(Method::from_number(11), None);
+        assert_eq!(Method::from_number(10), None);
+        assert_eq!(Method::from_number(12), None);
         assert_eq!(VERSION, 1);
         assert_eq!(Method::Start.header().bytes(), [1, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(START_PIECE_MAX, 952);

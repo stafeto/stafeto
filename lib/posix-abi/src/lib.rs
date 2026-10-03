@@ -25,7 +25,7 @@ use constants::*;
 use core::ffi::{c_char, c_int};
 use core::sync::atomic::{AtomicU8, Ordering};
 use posix_fs::{DescriptorFlags, FsError, SeekFrom};
-use posix_request::{MESSAGE_MAX, Reply, Request};
+use posix_request::{MAX_PATH, MESSAGE_MAX, Reply, Request};
 use rt::handle::{Channel, Handle};
 
 const _: () = {
@@ -100,7 +100,7 @@ fn descriptor_flags(flags: c_int) -> DescriptorFlags {
     }
 }
 
-/// The bytes of the C string at `pointer`, at most 128 of them.
+/// The bytes of the C string at `pointer`, at most `MAX_PATH` of them.
 ///
 /// # Safety
 /// `pointer` is null or a readable, terminated C string.
@@ -108,7 +108,7 @@ pub unsafe fn path<'a>(pointer: *const c_char) -> Result<&'a [u8], c_int> {
     if pointer.is_null() {
         return Err(EFAULT);
     }
-    for length in 0..=128 {
+    for length in 0..=MAX_PATH {
         // SAFETY: the caller supplies a readable, terminated C string.
         if unsafe { *pointer.add(length) } == 0 {
             // SAFETY: these bytes were readable and precede the terminator.

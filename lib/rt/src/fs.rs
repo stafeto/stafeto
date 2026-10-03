@@ -102,6 +102,25 @@ pub struct Files {
     uart: Option<Handle<Channel>>,
 }
 
+/// The transports of a Files, borrowed: what a request needs outside the
+/// lock of the Files' owner (spec 2, 3.4). The owner keeps the Files open
+/// while any view is used; a view closes nothing.
+#[derive(Clone, Copy)]
+pub struct View {
+    channel: abi::Handle,
+    uart: Option<abi::Handle>,
+}
+
+impl View {
+    /// The Files of the view, which closes nothing when it goes.
+    pub fn files(&self) -> core::mem::ManuallyDrop<Files> {
+        core::mem::ManuallyDrop::new(Files {
+            channel: Handle::from_raw(self.channel),
+            uart: self.uart.map(Handle::from_raw),
+        })
+    }
+}
+
 impl Files {
     pub fn connect(parent: &Handle<Channel>) -> Result<Self, Status> {
         Ok(Self {
@@ -115,6 +134,26 @@ impl Files {
             channel: service::connect(parent, "ramfs")?,
             uart: Some(service::connect(parent, "uart")?),
         })
+    }
+
+    /// Files through sessions the program was given: its own session with
+    /// the RAM file service and, for input, with the console's driver (a
+    /// POSIX program its loader started, spec 2, 3.2).
+    pub fn from_sessions(channel: Handle<Channel>, uart: Option<Handle<Channel>>) -> Self {
+        Self { channel, uart }
+    }
+
+    /// A borrowed view of the transports (`View`).
+    pub fn view(&self) -> View {
+        View {
+            channel: self.channel.raw(),
+            uart: self.uart.as_ref().map(Handle::raw),
+        }
+    }
+
+    /// The session with the RAM file service and the console's driver's.
+    pub fn sessions(&self) -> (&Handle<Channel>, Option<&Handle<Channel>>) {
+        (&self.channel, self.uart.as_ref())
     }
 
     /// Snapshot the input endpoint; this Files retains its UART session.
@@ -204,6 +243,52 @@ impl Files {
         }
         out[..n].copy_from_slice(r.bytes(n)?);
         r.finish()?;
+        Ok(n)
+    }
+
+    /// Reads from `offset` of the file; the position of the description
+    /// stays (READ_AT). Only a file of the RAM service reads so.
+    pub fn read_at(&self, fd: u32, offset: u64, out: &mut [u8]) -> Result<usize, Status> {
+        let mut w = Writer::new();
+        Method::ReadAt.header().write(&mut w)?;
+        w.u32(fd)?;
+        w.u64(offset)?;
+        w.u32(out.len().min(MAX_READ) as u32)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let bytes = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(bytes);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let n = r.u32()? as usize;
+        if n > out.len() || n > MAX_READ {
+            return Err(Status::BadSize);
+        }
+        out[..n].copy_from_slice(r.bytes(n)?);
+        r.finish()?;
+        Ok(n)
+    }
+
+    /// WRITE_AT: `bytes` at `offset` of the file of `fd`, the open
+    /// description's position as it was; the count written.
+    pub fn write_at(&self, fd: u32, offset: u64, bytes: &[u8]) -> Result<usize, Status> {
+        let bytes = &bytes[..bytes.len().min(MAX_WRITE - 8)];
+        let mut w = Writer::new();
+        Method::WriteAt.header().write(&mut w)?;
+        w.u32(fd)?;
+        w.u64(offset)?;
+        w.bytes(bytes)?;
+        let mut reply = [0; MESSAGE_MAX];
+        let got = self.call(w.as_bytes(), &mut reply)?;
+        let mut r = Reader::new(got);
+        if r.u32()? != 0 {
+            return Err(Status::BadSize);
+        }
+        let n = r.u32()? as usize;
+        r.finish()?;
+        if n > bytes.len() {
+            return Err(Status::BadSize);
+        }
         Ok(n)
     }
 
