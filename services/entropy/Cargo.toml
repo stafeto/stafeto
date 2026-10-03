@@ -1,0 +1,36 @@
+[package]
+name = "entropy"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The entropy service of stafeto: keys of a generator with fast key erasure, fed by the entropy device's driver"
+
+# What the service decides, apart from the calls: tested on the host.
+[lib]
+bench = false
+
+[[bin]]
+name = "entropy"
+test = false
+bench = false
+
+# `steps`: each new longest step of the loop goes to the console (rt's
+# feature step-stats), for the measurement under -icount. `report`: a line
+# at each reseed, for the probes.
+[features]
+steps = ["rt/step-stats"]
+report = []
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+posix-random = { path = "../../lib/posix-random" }
+proto-entropy = { path = "../../proto/entropy" }
+proto-init = { path = "../../proto/init" }
+proto-wire = { path = "../../proto/wire" }
+
+# The program alone runs on stafeto: the host tests of the library build
+# without rt.
+[target.'cfg(target_os = "none")'.dependencies]
+rt = { path = "../../lib/rt" }

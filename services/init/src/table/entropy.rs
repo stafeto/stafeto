@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The driver of the Virtio entropy device (services/virtio-rng) and the
-//! images of its probe (tests/entropy): `RNG` on QEMU's virtio-mmio,
-//! `RNG_VZ` on the Virtio PCI of Apple VZ.
+//! The driver of the Virtio entropy device (services/virtio-rng), the
+//! entropy service (services/entropy) and the images of their probe
+//! (tests/entropy): `RNG` on QEMU's virtio-mmio, `RNG_VZ` on the Virtio PCI
+//! of Apple VZ, `ENTROPY` on both. The service holds no window and no DMA;
+//! its feeder is the driver's client, and every POSIX process may be the
+//! service's.
 //!
 //! QEMU's `virt` has 32 virtio-mmio transports of 0x200 bytes from
 //! 0xa000000, transport i at SPI 16 + i (INTID 48 + i), and puts the first
@@ -51,8 +54,7 @@ const DMA: &[Dma] = &[Dma {
     uncached: true,
 }];
 
-/// The driver on QEMU: level 45, above the entropy service that will be
-/// its client.
+/// The driver on QEMU: level 45, above the entropy service, its client.
 pub const RNG: Record = Record {
     name: "rng",
     program: "virtio-rng",
@@ -141,7 +143,35 @@ pub const RNG_VZ: Record = Record {
     ..RNG
 };
 
-/// The probe: two fills, CRASH, a fill after the restart (role `fc`).
+/// The entropy service: level 44, under its driver and above every POSIX
+/// process (whose ceilings stay at 39 or below).
+pub const ENTROPY: Record = Record {
+    name: "entropy",
+    program: "entropy",
+    kind: Kind::Service(Watch {
+        period_ns: 250 * MS,
+        deadline_ns: 1000 * MS,
+    }),
+    priority: 44,
+    ceiling: 44,
+    quota: 64 * PAGE,
+    handle_limit: 64,
+    restart: Restart::Always,
+    console: true,
+    log: false,
+    trace: false,
+    windows: &[],
+    bindings: &[],
+    connects: &["rng"],
+    args: &[],
+    dma: &[],
+    quiesce: &[],
+    trusted: false,
+    root: false,
+};
+
+/// The probe: a seed and the seeds at once, two fills, CRASH with seeds
+/// while the driver restarts and a fill after it (roles `sfc`).
 const PROBE: Record = Record {
     name: "entropy-probe",
     program: "entropy-probe",
@@ -156,16 +186,35 @@ const PROBE: Record = Record {
     trace: false,
     windows: &[],
     bindings: &[],
-    connects: &["rng"],
-    args: b"fc",
+    connects: &["rng", "entropy"],
+    args: b"sfc",
     dma: &[],
     quiesce: &[],
     trusted: false,
     root: false,
 };
 
-/// The probe's image on QEMU.
-pub const TABLE: &[Record] = &[RNG, PROBE];
+/// A second client of the service: its key differs from the first's; on
+/// QEMU it seeds again after the service's reseed (roles `sw`).
+const PROBE_B: Record = Record {
+    name: "entropy-probe-b",
+    connects: &["entropy"],
+    args: b"sw",
+    ..PROBE
+};
 
-/// The probe's image on VZ, with the console's driver for the console.
-pub const VZ_TABLE: &[Record] = &[super::vz::CONSOLE, RNG_VZ, PROBE];
+/// The probe's image on QEMU.
+pub const TABLE: &[Record] = &[RNG, ENTROPY, PROBE, PROBE_B];
+
+/// The probe's image on VZ, with the console's driver for the console;
+/// the second client does not wait for the reseed.
+pub const VZ_TABLE: &[Record] = &[
+    super::vz::CONSOLE,
+    RNG_VZ,
+    ENTROPY,
+    PROBE,
+    Record {
+        args: b"s",
+        ..PROBE_B
+    },
+];

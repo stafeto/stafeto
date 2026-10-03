@@ -5,10 +5,11 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "MIT"
-description = "The protocol of the entropy device's driver of stafeto: its method numbers and the bodies of its requests"
+description = "The protocols of the entropy device's driver and of the entropy service of stafeto: their method numbers and the bodies of their requests"
 
 [lib]
 bench = false
 
 [dependencies]
+abi = { path = "../../lib/abi" }
 proto-wire = { path = "../wire" }

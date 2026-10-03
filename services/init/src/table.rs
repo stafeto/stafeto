@@ -1514,10 +1514,13 @@ mod tests {
                 "checker", "private"
             ]
         );
-        assert_eq!(order_of(entropy::TABLE), ["rng", "entropy-probe"]);
+        assert_eq!(
+            order_of(entropy::TABLE),
+            ["rng", "entropy", "entropy-probe", "entropy-probe-b"]
+        );
         assert_eq!(
             order_of(entropy::VZ_TABLE),
-            ["uart", "rng", "entropy-probe"]
+            ["uart", "rng", "entropy", "entropy-probe", "entropy-probe-b"]
         );
         assert_eq!(
             refused(cycle::TABLE),

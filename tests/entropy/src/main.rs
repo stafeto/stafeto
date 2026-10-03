@@ -1,28 +1,46 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Sergey Subbotin <ssubbotin@gmail.com>
 
-//! The guest probe of the entropy device's driver (services/virtio-rng):
-//! a client of init, whose role the first byte of its own arguments names.
-//! `f`: two fills of 64 bytes through `rng`, each in two steps
-//! (proto_entropy): they differ and neither is all zero; with `c` as the
-//! second byte the probe then sends CRASH, connects again once init
-//! restarted the driver, and fills once more. Each check prints its line,
-//! and the last says `entropy-probe: ok`; xtask reads them.
+//! The guest probe of the source of entropy: the entropy device's driver
+//! (`rng`, services/virtio-rng) and the entropy service (`entropy`,
+//! services/entropy). A client of init, whose roles the bytes of its own
+//! arguments name, done in their order:
+//!
+//! - `s`: a SEED, which waits for the device's first bytes when they did
+//!   not come yet; the key's line; 16 SEED with NONBLOCK, all answered at
+//!   once and all distinct; a SEED with an unknown flag is refused.
+//! - `f`: two fills of 64 bytes through `rng`: they differ and neither is
+//!   all zero.
+//! - `c`: CRASH of the driver; 32 SEED with NONBLOCK while init restarts
+//!   it, all answered at once (after `s`); a new session with the driver,
+//!   and a fill.
+//! - `w`: a wait of 61 s, past the service's reseed, then a SEED with
+//!   NONBLOCK.
+//!
+//! Each operation goes in two steps (proto_entropy, proto_wire::long).
+//! Each check prints its line, and the last says `entropy-probe: ok`;
+//! xtask reads them.
 
 #![no_std]
 #![no_main]
 
 use abi::{Error, MESSAGE_MAX, Rights, Source};
-use proto_entropy::{Fill, Key, Method};
+use proto_entropy::{Fill, Key, Method, NONBLOCK, NOT_READY, SEED_LEN, Seed};
 use proto_init::ServiceArgs;
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Resource};
-use rt::{Handle, sys};
+use rt::wait::Waiter;
+use rt::{Handle, sys, time};
 
 rt::entry!(main);
 
 /// The bytes of each fill.
 const N: usize = 64;
+/// The seeds at once after the first, and while the driver restarts.
+const AT_ONCE: usize = 16;
+const DURING_RESTART: usize = 32;
+/// The wait of `w`: past the service's period of 60 s.
+const WAIT_NS: u64 = 61_000_000_000;
 
 fn main(_: u64) -> u64 {
     let Ok(mut start) = rt::startup() else {
@@ -32,20 +50,36 @@ fn main(_: u64) -> u64 {
         rt::console::set(console);
     }
     let own = ServiceArgs::read(start.args()).map_or(&[][..], |a| a.own);
-    let (role, then) = (own.first().copied(), own.get(1).copied());
     let level = sys::thread_info(&start.thread).map_or(1, |info| info.base);
     let Ok(channel) = sys::channel_create(level) else {
         return 1;
     };
-    let probe = Probe {
+    let mut probe = Probe {
         parent: &start.parent,
         channel,
         level,
+        rng: None,
+        entropy: None,
+        seen: [[0; SEED_LEN]; 1 + AT_ONCE + DURING_RESTART + 1],
+        seen_len: 0,
     };
-    let result = match role {
-        Some(b'f') => probe.fills(then == Some(b'c')),
-        _ => Err("no role"),
+    let mut result = if own.is_empty() {
+        Err("no role")
+    } else {
+        Ok(())
     };
+    for &role in own {
+        if result.is_err() {
+            break;
+        }
+        result = match role {
+            b's' => probe.seeds(),
+            b'f' => probe.fills().map(drop),
+            b'c' => probe.crash(),
+            b'w' => probe.later(),
+            _ => Err("an unknown role"),
+        };
+    }
     match result {
         Ok(()) => {
             rt::println!("entropy-probe: ok");
@@ -60,9 +94,14 @@ fn main(_: u64) -> u64 {
 
 struct Probe<'a> {
     parent: &'a Handle<Channel>,
-    /// The probe's own channel, which the driver notifies through a copy.
+    /// The probe's own channel, which the services notify through a copy.
     channel: Handle<Channel>,
     level: u8,
+    rng: Option<Handle<Channel>>,
+    entropy: Option<Handle<Channel>>,
+    /// The keys the service gave so far.
+    seen: [[u8; SEED_LEN]; 1 + AT_ONCE + DURING_RESTART + 1],
+    seen_len: usize,
 }
 
 /// The first 8 bytes of `bytes` as a number, for the lines.
@@ -72,15 +111,78 @@ fn head(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(word)
 }
 
+fn zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&x| x == 0)
+}
+
 impl Probe<'_> {
-    /// Role `f`: two fills that differ, none all zero; with `crash`, CRASH,
-    /// a new session once init restarted the driver, and a third fill.
-    fn fills(&self, crash: bool) -> Result<(), &'static str> {
-        let rng = rt::service::connect(self.parent, "rng").map_err(|_| "connect to rng")?;
+    fn rng(&mut self) -> Result<&Handle<Channel>, &'static str> {
+        if self.rng.is_none() {
+            let rng = rt::service::connect(self.parent, "rng").map_err(|_| "connect to rng")?;
+            self.rng = Some(rng);
+        }
+        self.rng.as_ref().ok_or("no rng")
+    }
+
+    /// A key of the service, waiting for it unless `nonblock`; it must
+    /// differ from every key before it.
+    fn seed(&mut self, nonblock: bool) -> Result<[u8; SEED_LEN], &'static str> {
+        if self.entropy.is_none() {
+            let entropy =
+                rt::service::connect(self.parent, "entropy").map_err(|_| "connect to entropy")?;
+            self.entropy = Some(entropy);
+        }
+        let service = self.entropy.as_ref().ok_or("no entropy")?;
+        let flags = if nonblock { NONBLOCK } else { 0 };
+        let mut w = Writer::new();
+        Seed { flags }.write(&mut w).map_err(|_| "seed request")?;
+        let mut key = [0; SEED_LEN];
+        self.long(service, w.as_bytes(), Method::SeedTake, &mut key)?;
+        if zero(&key) || self.seen[..self.seen_len].contains(&key) {
+            return Err("a key all zero or given before");
+        }
+        if self.seen_len < self.seen.len() {
+            self.seen[self.seen_len] = key;
+            self.seen_len += 1;
+        }
+        Ok(key)
+    }
+
+    /// Role `s`.
+    fn seeds(&mut self) -> Result<(), &'static str> {
+        let key = self.seed(false)?;
+        // The whole key, which xtask compares with another client's.
+        let mut text = [0u8; 2 * SEED_LEN];
+        for (i, b) in key.iter().enumerate() {
+            let digits = b"0123456789abcdef";
+            text[2 * i] = digits[usize::from(b >> 4)];
+            text[2 * i + 1] = digits[usize::from(b & 15)];
+        }
+        let text = core::str::from_utf8(&text).map_err(|_| "hex")?;
+        rt::println!("entropy-probe: key {text}");
+        for _ in 0..AT_ONCE {
+            self.seed(true)?;
+        }
+        rt::println!("entropy-probe: {AT_ONCE} seeds at once, all distinct");
+        let service = self.entropy.as_ref().ok_or("no entropy")?;
+        let mut w = Writer::new();
+        Method::Seed.header().write(&mut w).map_err(|_| "header")?;
+        w.u32(2).map_err(|_| "flags")?;
+        w.u32(0).map_err(|_| "zero")?;
+        let mut key = [0; SEED_LEN];
+        match call(service, w.as_bytes(), None, &mut key) {
+            Err(Status::Kernel(Error::InvalidArgs)) => {}
+            _ => return Err("a seed with an unknown flag was not refused"),
+        }
+        rt::println!("entropy-probe: an unknown flag is refused");
+        Ok(())
+    }
+
+    /// Role `f`: two fills that differ, none all zero.
+    fn fills(&mut self) -> Result<[[u8; N]; 2], &'static str> {
         let (mut a, mut b) = ([0; N], [0; N]);
-        self.fill(&rng, &mut a)?;
-        self.fill(&rng, &mut b)?;
-        let zero = |bytes: &[u8]| bytes.iter().all(|&x| x == 0);
+        self.fill(&mut a)?;
+        self.fill(&mut b)?;
         if a == b || zero(&a) || zero(&b) {
             return Err("two fills alike or all zero");
         }
@@ -89,20 +191,28 @@ impl Probe<'_> {
             head(&a),
             head(&b)
         );
-        if !crash {
-            return Ok(());
-        }
+        Ok([a, b])
+    }
+
+    /// Role `c`: CRASH, seeds while the driver restarts, a fill from the
+    /// new instance.
+    fn crash(&mut self) -> Result<(), &'static str> {
         rt::println!("entropy-probe: crashing rng");
         let request = Method::Crash.header().bytes();
         // The driver never replies: its end gives PEER_CLOSED.
-        if sys::send(&rng, &request).is_ok() {
+        if sys::send(self.rng()?, &request).is_ok() {
             return Err("CRASH answered");
         }
-        drop(rng);
-        let rng = rt::service::connect(self.parent, "rng").map_err(|_| "connect again")?;
+        self.rng = None;
+        if self.entropy.is_some() {
+            for _ in 0..DURING_RESTART {
+                self.seed(true)?;
+            }
+            rt::println!("entropy-probe: {DURING_RESTART} seeds while the driver restarts");
+        }
         let mut c = [0; N];
-        self.fill(&rng, &mut c)?;
-        if zero(&c) || c == a || c == b {
+        self.fill(&mut c)?;
+        if zero(&c) {
             return Err("the fill after the restart");
         }
         rt::println!(
@@ -112,26 +222,53 @@ impl Probe<'_> {
         Ok(())
     }
 
-    /// A fill of `out.len()` bytes through `rng` in two steps: FILL_START
-    /// gives WAIT k; FILL_TAKE with a copy of the probe's channel labelled
-    /// k, then, once bit 0 came in that slot, FILL_TAKE again.
-    fn fill(&self, rng: &Handle<Channel>, out: &mut [u8]) -> Result<(), &'static str> {
+    /// Role `w`: a seed with NONBLOCK after WAIT_NS.
+    fn later(&mut self) -> Result<(), &'static str> {
+        let timer = Waiter::new(&self.channel, 0, self.level).map_err(|_| "timer")?;
+        let deadline = time::ticks_to_ns(time::now()).saturating_add(WAIT_NS);
+        while let Ok(rt::wait::Waited::Got(_)) = timer.receive_until(&self.channel, deadline) {}
+        self.seed(true)?;
+        rt::println!("entropy-probe: a seed after 61 s");
+        Ok(())
+    }
+
+    /// A fill of `out.len()` bytes through `rng`.
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), &'static str> {
         let mut w = Writer::new();
         Fill {
             n: out.len() as u32,
         }
         .write(&mut w)
         .map_err(|_| "fill request")?;
-        let key = match call(rng, w.as_bytes(), None, out)? {
-            Got::Wait(key) => key,
-            _ => return Err("FILL_START gave no WAIT"),
+        let rng = self.rng()?;
+        let rng = Handle::<Channel>::borrowed(rng.raw());
+        self.long(&rng, w.as_bytes(), Method::FillTake, out)
+    }
+
+    /// A long operation of `service` (proto_wire::long): `start` gives
+    /// READY or WAIT k; then `take` with a copy of the probe's channel
+    /// labelled k, and, once bit 0 came in that slot, `take` again.
+    fn long(
+        &self,
+        service: &Handle<Channel>,
+        start: &[u8],
+        take: Method,
+        out: &mut [u8],
+    ) -> Result<(), &'static str> {
+        let key = match call(service, start, None, out) {
+            Ok(Got::Ready) => return Ok(()),
+            Ok(Got::Wait(key)) => key,
+            Ok(Got::Armed) => return Err("ARMED to a start"),
+            Err(status) if status == NOT_READY => return Err("NOT_READY"),
+            Err(Status::Kernel(Error::LimitReached)) => return Err("LIMIT_REACHED"),
+            Err(_) => return Err("a refusal of a start"),
         };
-        let mut take = Writer::new();
+        let mut w = Writer::new();
         Key { key }
-            .write(Method::FillTake, &mut take)
+            .write(take, &mut w)
             .map_err(|_| "take request")?;
-        // The first FILL_TAKE brings the labelled copy, which the driver
-        // keeps while the fill waits.
+        // The first take brings the labelled copy, which the service keeps
+        // while the operation waits.
         let mut notify = Some(
             sys::handle_label(
                 &self.channel,
@@ -142,10 +279,11 @@ impl Probe<'_> {
             .map_err(|_| "labelled copy")?,
         );
         loop {
-            match call(rng, take.as_bytes(), notify.take(), out)? {
-                Got::Ready => return Ok(()),
-                Got::Armed => {}
-                Got::Wait(_) => return Err("FILL_TAKE gave WAIT"),
+            match call(service, w.as_bytes(), notify.take(), out) {
+                Ok(Got::Ready) => return Ok(()),
+                Ok(Got::Armed) => {}
+                Ok(Got::Wait(_)) => return Err("WAIT to a take"),
+                Err(_) => return Err("a refusal of a take"),
             }
             loop {
                 match sys::receive(&self.channel) {
@@ -163,38 +301,33 @@ impl Probe<'_> {
     }
 }
 
-/// What a request of a fill gave.
+/// What a request of a long operation gave.
 enum Got {
     Ready,
     Wait(u64),
     Armed,
 }
 
-/// One request to `rng`, with `notify` when there is one, and its long
-/// reply; READY bytes go into `out`, all of them.
+/// One request to `service`, with `notify` when there is one, and its long
+/// reply; READY bytes go into `out`, all of them; a refusal as its status.
 fn call(
-    rng: &Handle<Channel>,
+    service: &Handle<Channel>,
     request: &[u8],
     notify: Option<Handle<Channel>>,
     out: &mut [u8],
-) -> Result<Got, &'static str> {
+) -> Result<Got, Status> {
     let reply = match notify {
-        None => sys::send(rng, request).map_err(|_| "send")?,
-        Some(n) => {
-            sys::send_handles(rng, request, [n.erase()]).map_err(|_| "send with a handle")?
-        }
+        None => sys::send(service, request)?,
+        Some(n) => sys::send_handles(service, request, [n.erase()]).map_err(|r| r.error)?,
     };
     let mut buffer = [0; MESSAGE_MAX];
-    match long::Reply::read(reply.bytes(&mut buffer)) {
-        Ok(long::Reply::Ready(bytes)) if bytes.len() == out.len() => {
+    match long::Reply::read(reply.bytes(&mut buffer))? {
+        long::Reply::Ready(bytes) if bytes.len() == out.len() => {
             out.copy_from_slice(bytes);
             Ok(Got::Ready)
         }
-        Ok(long::Reply::Ready(_)) => Err("READY of another length"),
-        Ok(long::Reply::Wait(key)) => Ok(Got::Wait(key)),
-        Ok(long::Reply::Armed) => Ok(Got::Armed),
-        Ok(long::Reply::Cancelled) => Err("CANCELLED"),
-        Err(Status::Kernel(Error::LimitReached)) => Err("LIMIT_REACHED"),
-        Err(_) => Err("a refusal"),
+        long::Reply::Ready(_) | long::Reply::Cancelled => Err(Status::BadSize),
+        long::Reply::Wait(key) => Ok(Got::Wait(key)),
+        long::Reply::Armed => Ok(Got::Armed),
     }
 }
