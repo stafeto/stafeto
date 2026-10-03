@@ -1053,9 +1053,14 @@ impl Tty {
             {
                 return Answer::Status(Status::BadSize);
             }
-            let notify = match Self::notify_of(r, true) {
-                Ok(notify) => notify,
-                Err(answer) => return answer,
+            // Watch carries no identity; its only handle is Notify in slot 0.
+            let notify = if r.handles.is_empty() {
+                None
+            } else {
+                match r.handles.take::<Channel>(0) {
+                    Ok(handle) => Some(handle),
+                    Err(error) => return Answer::Status(Status::Kernel(error)),
+                }
             };
             match notify {
                 Some(handle) => {
