@@ -1076,6 +1076,7 @@ fn main() {
         Some("relibc-hello") => relibc_hello_probe(),
         Some("posix-procs") => posix_procs_probe(&qemu::VIRT),
         Some("loader-channels") => loader_channels_probe(),
+        Some("posix-poll") => posix_poll_probe(),
         Some("process-steps") => match &args[1..] {
             [] => process_steps(&qemu::VIRT, 7),
             [n] => n
@@ -2297,6 +2298,68 @@ fn relibc_hello_probe() -> Result<(), String> {
 /// The probe of POSIX processes (tests/posix-procs): its checks pass, its
 /// child says the PID the parent's posix_spawn gave and the parent's PID,
 /// and the child that did not load got no process.
+fn posix_poll_probe() -> Result<(), String> {
+    if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
+        relibc()?;
+    }
+    let kernel = build(Variant::Normal)?;
+    const PROGRAMS: [ImageProgram; 11] = [
+        ("init", "init", INIT_STACK_SIZE, &["table-posix-poll"]),
+        ("uart", "uart", UART_STACK_SIZE, &[]),
+        ("tty", "tty", TTY_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[1],
+        ("pipe", "pipe", PIPE_STACK_SIZE, &["quiet-steps"]),
+        POSIX_PROCS_PROGRAMS[3],
+        POSIX_PROCS_PROGRAMS[4],
+        ("posix-poll", "posix-poll", POSIX_STACK_SIZE, &[]),
+        POSIX_PROCS_PROGRAMS[6],
+        POSIX_PROCS_PROGRAMS[8],
+        POSIX_PROCS_PROGRAMS[9],
+    ];
+    let image = build_boot_image("boot-posix-poll.img", &PROGRAMS, BOOT_PROFILE)?;
+    let mut cmd = qemu::command(&qemu::VIRT, &kernel.image, Some(&image));
+    cmd.args(qemu::HEADLESS).args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: posix-poll ended: "),
+        &kernel.elf,
+    )?;
+    qemu::expect_marker(&output, "posix-poll: ok")?;
+    qemu::expect_stopped_on(
+        &output,
+        "init: posix-poll ended: exit code 0, not restarted",
+    )?;
+    let lines = &output.lines;
+    for (tag, methods) in [("4", [14, 15, 16]), ("5", [25, 26, 27])] {
+        let steps = longest_steps(lines, tag);
+        for &(kind, ticks, _) in &steps {
+            if ticks == 0 || ticks > RAM_STEP_MAX {
+                return Err(format!(
+                    "watch service {tag}, kind {kind} exceeded {RAM_STEP_MAX}: {ticks}"
+                ));
+            }
+        }
+        for method in methods {
+            if !steps
+                .iter()
+                .any(|&(kind, ticks, detail)| kind == method && ticks != 0 && detail == 32)
+            {
+                return Err(format!(
+                    "watch method {method} has no full 32-element measurement: {steps:?}"
+                ));
+            }
+        }
+        if !steps
+            .iter()
+            .any(|&(kind, ticks, _)| kind == 65 && ticks != 0)
+        {
+            return Err(format!("watch service {tag} has no Gone measurement"));
+        }
+    }
+    Ok(())
+}
+
 fn loader_channels_probe() -> Result<(), String> {
     if std::env::var_os("STAFETO_RELIBC_SYSROOT").is_none() {
         relibc()?;

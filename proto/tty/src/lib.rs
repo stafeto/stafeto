@@ -70,6 +70,10 @@
 //!   controlling terminal of the caller's session; NOT_CONTROLLING
 //!   otherwise.
 //!
+//! WatchStart/Take/Cancel use proto_wire::watch: at most 32 descriptions,
+//! one registration per actual description, READY through Cancel, which
+//! recomputes every original element and frees the registration.
+//!
 //! BAD_TERMINAL for a terminal the service does not have, INVALID for an
 //! action past FLUSH, a queue past QUEUE_BOTH or an action past
 //! FLOW_IN_ON. A start past the WAITERS operations that wait on a
@@ -275,10 +279,13 @@ pub enum Method {
     GetSid = 19,
     Controlling = 20,
     VerifySession = 24,
+    WatchStart = 25,
+    WatchTake = 26,
+    WatchCancel = 27,
 }
 
 impl Method {
-    pub const ALL: [Method; 21] = [
+    pub const ALL: [Method; 24] = [
         Method::ReadStart,
         Method::ReadTake,
         Method::ReadCancel,
@@ -300,6 +307,9 @@ impl Method {
         Method::GetSid,
         Method::Controlling,
         Method::VerifySession,
+        Method::WatchStart,
+        Method::WatchTake,
+        Method::WatchCancel,
     ];
 
     pub const fn number(self) -> u16 {
@@ -316,7 +326,7 @@ impl Method {
 }
 
 pub const METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26, 27,
 ];
 
 /// A request of the controlling terminal (ACQUIRE, SET_PGRP, GET_PGRP,

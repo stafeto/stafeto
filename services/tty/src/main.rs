@@ -32,7 +32,7 @@ use proto_tty::{
 };
 use proto_uart::{ReadKey, ReadRequest, RoomReply, WriteReply, WriteRequest};
 use proto_wire::clones::Clones;
-use proto_wire::{Status, Writer, long};
+use proto_wire::{Status, Writer, long, watch};
 use rt::abi::{Error, MESSAGE_MAX, Rights, Source};
 use rt::handle::{Channel, Handle, Memory, Outgoing, Process, Timer};
 use rt::service::{
@@ -115,6 +115,7 @@ const GENERATIONS_AT: usize = 0x41_0000_0000;
 struct Tables {
     sessions: [Option<Session<Client, 0>>; SESSIONS],
     ops: LongOps<OPERATIONS>,
+    watches: watch::Pool<OPERATIONS>,
     clones: Clones<CLONES>,
     console: Terminal,
 }
@@ -124,6 +125,7 @@ unsafe impl Sync for Bss {}
 static TABLES: Bss = Bss(UnsafeCell::new(Tables {
     sessions: [const { None }; SESSIONS],
     ops: LongOps::new(),
+    watches: watch::Pool::new(),
     clones: Clones::new(),
     console: Terminal::new(),
 }));
@@ -175,6 +177,8 @@ fn main(_: u64) -> u64 {
         given: 0,
         clones: &mut tables.clones,
         ops: &mut tables.ops,
+        watches: &mut tables.watches,
+        watchers: Waiters::new(),
         driver,
         room_given: false,
         console: &mut tables.console,
@@ -222,6 +226,8 @@ fn main(_: u64) -> u64 {
     rt::println!("tty: ready");
     #[cfg(feature = "steps")]
     rt::service::report_steps(5);
+    #[cfg(feature = "quiet-steps")]
+    rt::service::quiet_steps();
     let _ = rt::service::run_in(&channel, &mut service, config, &mut tables.sessions);
     STOPPED
 }
@@ -255,6 +261,8 @@ struct Tty {
     given: u64,
     clones: &'static mut Clones<CLONES>,
     ops: &'static mut LongOps<OPERATIONS>,
+    watches: &'static mut watch::Pool<OPERATIONS>,
+    watchers: Waiters<WAITERS>,
     /// The session with the console's driver, and whether it keeps the
     /// handle of ROOM.
     driver: Handle<Channel>,
@@ -515,6 +523,12 @@ impl Tty {
     /// waits armed, or else a piece of output; a step that took input
     /// leaves the output to the next.
     fn work(&mut self) {
+        if let Some((label, key, _)) = self.watches.cleanup() {
+            self.watchers.remove(label, key);
+        }
+        if self.watches.cleanup_due() {
+            self.kick();
+        }
         if !matches!(self.input, Input::Waiting { armed: true, .. }) && self.pull() {
             return;
         }
@@ -555,6 +569,7 @@ impl Tty {
     /// The writes that wait hear of room, and the drains of an output that
     /// went.
     fn tell_output(&mut self) {
+        self.tell_watches();
         if self.console.writable() {
             for w in self.writers.iter() {
                 self.ops.tell(w.label, w.key);
@@ -669,8 +684,19 @@ impl Tty {
     /// Every read that waits looks again: input came, or the settings
     /// changed.
     fn tell_readers(&mut self) {
+        self.tell_watches();
         for reader in self.readers.iter() {
             self.ops.tell(reader.label, reader.key);
+        }
+    }
+
+    fn tell_watches(&mut self) {
+        for waiter in self.watchers.iter() {
+            if let Some(set) = self.watches.get(waiter.label, waiter.key)
+                && set.ready(|_| self.console.readiness(false)).any()
+            {
+                self.ops.tell(waiter.label, waiter.key);
+            }
         }
     }
 
@@ -722,7 +748,14 @@ impl Tty {
         };
         match key {
             None => {
-                if self.readers.len() + self.writers.len() + self.drainers.len() >= WAITERS {
+                let ops = &self.ops;
+                self.watchers.retain(|label, key| ops.waits(label, key));
+                if self.readers.len()
+                    + self.writers.len()
+                    + self.drainers.len()
+                    + self.watchers.len()
+                    >= WAITERS
+                {
                     return Answer::Status(Status::Kernel(Error::LimitReached));
                 }
                 let list = match kind {
@@ -878,11 +911,123 @@ impl Tty {
             Ok(cancel) => cancel,
             Err(status) => return Answer::Status(status),
         };
-        if !self.ops.waits(s.label(), cancel.key) {
+        if !self.ops.waits(s.label(), cancel.key)
+            || self.watches.get(s.label(), cancel.key).is_some()
+        {
             return Answer::Status(Status::Kernel(Error::BadState));
         }
         self.finish(s, Some(cancel.key));
         long_answer(r, long::Reply::Cancelled)
+    }
+
+    fn watch_ready(r: &mut Request<'_>, ready: watch::Ready) -> Answer {
+        let mut body = Writer::new();
+        if let Err(status) = ready.write(&mut body) {
+            return Answer::Status(status);
+        }
+        long_answer(r, long::Reply::Ready(body.as_bytes()))
+    }
+
+    fn watch_start(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
+        let set = match watch::Set::parse(r.body()) {
+            Ok(set) if r.handles.is_empty() => set,
+            _ => return Answer::Status(Status::BadSize),
+        };
+        if set
+            .unique()
+            .any(|item| item.description != proto_tty::CONSOLE)
+        {
+            return status(proto_tty::BAD_TERMINAL);
+        }
+        rt::service::step_detail(set.len as u64);
+        let ready = set.ready(|_| self.console.readiness(false));
+        if ready.any() {
+            return Self::watch_ready(r, ready);
+        }
+        let ops = &self.ops;
+        self.watchers.retain(|label, key| ops.waits(label, key));
+        if self.readers.len() + self.writers.len() + self.drainers.len() + self.watchers.len()
+            >= WAITERS
+        {
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        let label = s.label();
+        let key = match self.ops.start(&mut s.data.long, label) {
+            Ok(key) => key,
+            Err(error) => return Answer::Status(Status::Kernel(error)),
+        };
+        if !self.watches.insert(label, key, set) {
+            self.ops.finish(&mut s.data.long, label, key);
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        if !self.watchers.add(Waiter {
+            label,
+            key,
+            started: now(),
+            deadline: None,
+        }) {
+            self.watches.remove(label, key);
+            self.ops.finish(&mut s.data.long, label, key);
+            return Answer::Status(Status::Kernel(Error::LimitReached));
+        }
+        long_answer(r, long::Reply::Wait(key))
+    }
+
+    fn watch_keyed(
+        &mut self,
+        s: &mut Session<Client, 0>,
+        r: &mut Request<'_>,
+        cancel: bool,
+    ) -> Answer {
+        let key = match watch::key(r.body()) {
+            Ok(key) => key,
+            Err(status) => return Answer::Status(status),
+        };
+        let label = s.label();
+        let Some(set) = self
+            .watches
+            .get(label, key)
+            .copied()
+            .filter(|_| self.ops.waits(label, key))
+        else {
+            return Answer::Status(Status::Kernel(Error::BadState));
+        };
+        if cancel {
+            if !r.handles.is_empty() {
+                return Answer::Status(Status::BadSize);
+            }
+        } else {
+            if r.handles.len() > 1
+                || (!r.handles.is_empty()
+                    && !matches!(r.handles.info(0), Some((rt::abi::ObjectKind::Channel, rights)) if rights.contains(Rights::NOTIFY)))
+            {
+                return Answer::Status(Status::BadSize);
+            }
+            let notify = match Self::notify_of(r, true) {
+                Ok(notify) => notify,
+                Err(answer) => return answer,
+            };
+            match notify {
+                Some(handle) => {
+                    if let Err(error) = self.ops.arm(label, key, handle) {
+                        return Answer::Status(Status::Kernel(error));
+                    }
+                }
+                None => self.ops.untell(label, key),
+            }
+        }
+        rt::service::step_detail(set.len as u64);
+        let ready = set.ready(|_| self.console.readiness(false));
+        if cancel {
+            self.watchers.remove(label, key);
+            self.watches.remove(label, key);
+            self.ops.finish(&mut s.data.long, label, key);
+            Self::watch_ready(r, ready)
+        } else if ready.any() {
+            Self::watch_ready(r, ready)
+        } else {
+            long_answer(r, long::Reply::Armed)
+        }
     }
 
     /// CLONE: a session of the service's own label for a child of the
@@ -1015,9 +1160,10 @@ impl Tty {
 const SIGINT: u32 = 2;
 const SIGQUIT: u32 = 3;
 const SIGTSTP: u32 = 20;
-#[cfg(feature = "trust-probe")]
+#[cfg(all(feature = "trust-probe", not(feature = "steps")))]
 const PROBE_METHODS: &[u16] = &[
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+    27,
 ];
 
 impl Tty {
@@ -1254,11 +1400,25 @@ impl Tty {
 impl Service<0> for Tty {
     const VERSION: u16 = VERSION;
     const METHODS: &'static [u16] = {
-        #[cfg(feature = "trust-probe")]
+        #[cfg(all(feature = "trust-probe", feature = "steps"))]
+        {
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26, 27, 30,
+            ]
+        }
+        #[cfg(all(feature = "trust-probe", not(feature = "steps")))]
         {
             PROBE_METHODS
         }
-        #[cfg(not(feature = "trust-probe"))]
+        #[cfg(all(not(feature = "trust-probe"), feature = "steps"))]
+        {
+            &[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 25, 26,
+                27, 30,
+            ]
+        }
+        #[cfg(all(not(feature = "trust-probe"), not(feature = "steps")))]
         {
             proto_tty::METHODS
         }
@@ -1267,6 +1427,10 @@ impl Service<0> for Tty {
 
     fn request(&mut self, s: &mut Session<Client, 0>, r: &mut Request<'_>) -> Answer {
         self.due();
+        #[cfg(feature = "steps")]
+        if r.method() == 30 {
+            return rt::service::step_snapshot(r);
+        }
         #[cfg(feature = "trust-probe")]
         if (21..=23).contains(&r.method()) {
             return self.trust_probe(r);
@@ -1276,6 +1440,9 @@ impl Service<0> for Tty {
             s.data.root = self.clones.client_of(label).unwrap_or(label);
         }
         match Method::from_number(r.method()) {
+            Some(Method::WatchStart) => self.watch_start(s, r),
+            Some(Method::WatchTake) => self.watch_keyed(s, r, false),
+            Some(Method::WatchCancel) => self.watch_keyed(s, r, true),
             Some(Method::ReadStart) => self.read(s, r, false),
             Some(Method::ReadTake) => self.read(s, r, true),
             Some(Method::WriteStart) => self.write(s, r, false),
@@ -1334,6 +1501,10 @@ impl Service<0> for Tty {
     /// The client of `s` went, or abandoned its operations: they go.
     fn gone(&mut self, s: &mut Session<Client, 0>) {
         let label = s.label();
+        self.watches.retire(label);
+        if self.watches.cleanup_due() {
+            self.kick();
+        }
         self.ops.gone(&mut s.data.long);
         self.readers.remove_all(label);
         self.writers.remove_all(label);

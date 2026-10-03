@@ -373,6 +373,10 @@ pub fn files_of(name: &str) -> Vec<RootFile> {
         "boot-ramfs.img" => ramfs(),
         "boot-ash-dialog.img" => dialog(),
         "boot-posix-procs.img" => procs(),
+        "boot-posix-poll.img" => vec![
+            dir("/bin"),
+            file("/bin/posix-poll", 0o755, ROOT, "posix-poll"),
+        ],
         "boot-posix-random.img" => {
             let mut files = vec![
                 dir("/bin"),

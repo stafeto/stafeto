@@ -477,6 +477,8 @@ mod steps {
     /// Whether the step in progress counts as `OWN`.
     static OWNED: AtomicBool = AtomicBool::new(false);
     static LONGEST: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static DETAILS: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    static QUIET: AtomicBool = AtomicBool::new(false);
     /// A number the handler of the step gives (`super::step_detail`), for
     /// the line a new longest prints.
     static DETAIL: AtomicU64 = AtomicU64::new(0);
@@ -485,6 +487,16 @@ mod steps {
 
     pub fn report(tag: u8) {
         REPORT.store(tag, Ordering::Relaxed);
+    }
+
+    pub fn quiet() {
+        QUIET.store(true, Ordering::Relaxed);
+    }
+    pub fn maximum(kind: usize) -> Option<(u64, u64)> {
+        Some((
+            LONGEST.get(kind)?.load(Ordering::Relaxed),
+            DETAILS[kind].load(Ordering::Relaxed),
+        ))
     }
 
     pub fn detail(value: u64) {
@@ -517,8 +529,11 @@ mod steps {
         };
         let detail = DETAIL.swap(0, Ordering::Relaxed);
         let tag = REPORT.load(Ordering::Relaxed);
-        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) && tag != 0 {
-            crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+        if took > LONGEST[kind].fetch_max(took, Ordering::Relaxed) {
+            DETAILS[kind].store(detail, Ordering::Relaxed);
+            if tag != 0 && !QUIET.load(Ordering::Relaxed) {
+                crate::println!("service step: {tag} kind {kind} {took} ticks detail {detail}");
+            }
         }
     }
 }
@@ -543,6 +558,41 @@ mod steps {
 /// that count their steps get the lines of the one that asked.
 pub fn report_steps(tag: u8) {
     steps::report(tag);
+}
+
+/// Records complete steps without printing between requests. Measurement
+/// images read the bounded maxima after their workload, with the same clocks.
+#[cfg(feature = "step-stats")]
+pub fn quiet_steps() {
+    steps::quiet();
+}
+
+/// One measurement maximum and its own detail, including notification kinds.
+#[cfg(feature = "step-stats")]
+pub fn step_maximum(kind: usize) -> Option<(u64, u64)> {
+    steps::maximum(kind)
+}
+
+/// Measurement-only request: one kind u32, returning ticks and detail u64.
+#[cfg(feature = "step-stats")]
+pub fn step_snapshot(r: &mut Request<'_>) -> Answer {
+    let mut body = r.body();
+    let kind = match body.u32() {
+        Ok(kind) if r.handles.is_empty() => kind as usize,
+        _ => return Answer::Status(Status::BadSize),
+    };
+    let Some((ticks, detail)) = step_maximum(kind).filter(|_| body.finish().is_ok()) else {
+        return Answer::Status(Status::BadSize);
+    };
+    if r.reply()
+        .u32(0)
+        .and_then(|()| r.reply().u64(ticks))
+        .and_then(|()| r.reply().u64(detail))
+        .is_err()
+    {
+        return Answer::Status(Status::BadSize);
+    }
+    Answer::Reply(Outgoing::new())
 }
 
 /// Counts the notification step in progress apart from the others (feature

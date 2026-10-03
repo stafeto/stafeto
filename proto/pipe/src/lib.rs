@@ -47,6 +47,10 @@
 //! - ABANDON: no body: the session's long operations that wait go, as when
 //!   the session goes (the threads of an old image at exec). Reply: status.
 //!
+//! WatchStart/Take/Cancel use proto_wire::watch: at most 32 descriptions,
+//! one registration per actual description, READY through Cancel, which
+//! recomputes every original element and frees the registration.
+//!
 //! BAD_FD for an end the session does not hold or of the wrong kind.
 //! An end goes when its last session lets go of it: by CLOSE, or when the
 //! session ends (CLIENT_GONE), in steps of one description each.
@@ -120,10 +124,13 @@ pub enum Method {
     SetFlags = 11,
     Stat = 12,
     Abandon = 13,
+    WatchStart = 14,
+    WatchTake = 15,
+    WatchCancel = 16,
 }
 
 impl Method {
-    pub const ALL: [Method; 13] = [
+    pub const ALL: [Method; 16] = [
         Method::Create,
         Method::ReadStart,
         Method::ReadTake,
@@ -137,6 +144,9 @@ impl Method {
         Method::SetFlags,
         Method::Stat,
         Method::Abandon,
+        Method::WatchStart,
+        Method::WatchTake,
+        Method::WatchCancel,
     ];
 
     pub const fn number(self) -> u16 {
@@ -152,7 +162,7 @@ impl Method {
     }
 }
 
-pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+pub const METHODS: &[u16] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// READ_START or READ_TAKE: the key of a take, the end and the count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

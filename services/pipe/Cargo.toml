@@ -21,6 +21,8 @@ bench = false
 # The longest step of the loop for each method, printed when it grows (rt
 # feature step-stats; xtask process-steps, under -icount).
 steps = ["rt/step-stats"]
+# Buffer maxima until the measurement client reads its snapshot.
+quiet-steps = ["steps"]
 
 [dependencies]
 abi = { path = "../../lib/abi" }
