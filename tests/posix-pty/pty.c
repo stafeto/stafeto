@@ -64,7 +64,9 @@ static int read_byte(int fd, char *byte) {
 }
 static int wait_ok(pid_t pid) {
     int status;
-    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    pid_t got;
+    do { got = waitpid(pid, &status, 0); } while (got < 0 && errno == EINTR);
+    CHECK(got == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     return 0;
 }
 
@@ -190,12 +192,18 @@ static int ring_and_input(void) {
     return 0;
 }
 
-static volatile sig_atomic_t hup_count, cont_count;
-static void caught(int signal) { if (signal == SIGHUP) hup_count++; if (signal == SIGCONT) cont_count++; }
+static volatile sig_atomic_t hup_count, cont_count, winch_count, ttou_count;
+static void caught(int signal) {
+    if (signal == SIGHUP) hup_count++;
+    if (signal == SIGCONT) cont_count++;
+    if (signal == SIGWINCH) winch_count++;
+    if (signal == SIGTTOU) ttou_count++;
+}
 static int install_signals(void) {
     struct sigaction a = {.sa_handler = caught}; sigemptyset(&a.sa_mask);
     CHECK(sigaction(SIGHUP, &a, NULL) == 0 && sigaction(SIGCONT, &a, NULL) == 0);
-    hup_count = 0; cont_count = 0; return 0;
+    CHECK(sigaction(SIGWINCH, &a, NULL) == 0 && sigaction(SIGTTOU, &a, NULL) == 0);
+    hup_count = 0; cont_count = 0; winch_count = 0; ttou_count = 0; return 0;
 }
 static int controller_disconnect(int local) {
     struct pair p; CHECK(make_pair(&p) == 0 && raw_slave(p.slave, local) == 0);
@@ -251,6 +259,69 @@ static int limits_and_generation(void) {
     CHECK(tcgetattr(fresh.slave, &(struct termios){0}) == 0);
     CHECK(close_pair(&fresh) == 0);
     printf("posix-pty: eight instances, description reuse and stale status %u ok\n", stale);
+    return 0;
+}
+
+static int same_size(struct winsize a, struct winsize b) {
+    return a.ws_row == b.ws_row && a.ws_col == b.ws_col && a.ws_xpixel == b.ws_xpixel && a.ws_ypixel == b.ws_ypixel;
+}
+
+static int window_sizes(void) {
+    struct pair p; CHECK(make_pair(&p) == 0);
+    struct winsize size = {0}, got;
+    CHECK(tcgetwinsize(p.master, &got) == 0 && same_size(got, size));
+    size = (struct winsize){24, 80, 640, 480};
+    CHECK(tcsetwinsize(p.master, &size) == 0 && tcgetwinsize(p.slave, &got) == 0 && same_size(got, size));
+    size = (struct winsize){32, 100, 65535, 65534};
+    CHECK(tcsetwinsize(p.slave, &size) == 0 && tcgetwinsize(p.master, &got) == 0 && same_size(got, size));
+    errno = 0; CHECK(tcgetwinsize(-1, &got) == -1 && errno == EBADF);
+    errno = 0; CHECK(tcsetwinsize(-1, &size) == -1 && errno == EBADF);
+    int fds[2]; CHECK(pipe(fds) == 0);
+    errno = 0; CHECK(tcgetwinsize(fds[0], &got) == -1 && errno == ENOTTY);
+    errno = 0; CHECK(tcsetwinsize(fds[1], &size) == -1 && errno == ENOTTY);
+    CHECK(close(fds[0]) == 0 && close(fds[1]) == 0 && close_pair(&p) == 0);
+    CHECK(make_pair(&p) == 0 && tcgetwinsize(p.slave, &got) == 0 && same_size(got, (struct winsize){0}));
+    CHECK(close_pair(&p) == 0);
+
+    CHECK(make_pair(&p) == 0 && raw_slave(p.slave, 1) == 0);
+    int ready[2], command[2]; CHECK(pipe(ready) == 0 && pipe(command) == 0);
+    pid_t controller = fork(); CHECK(controller >= 0);
+    if (controller == 0) {
+        CHECK(close(p.master) == 0 && close(ready[0]) == 0 && close(command[1]) == 0);
+        CHECK(setsid() == getpid() && install_signals() == 0 && ioctl(p.slave, TIOCSCTTY, 0) == 0);
+        CHECK(tcsetpgrp(p.slave, getpgrp()) == 0);
+        int start[2]; CHECK(pipe(start) == 0);
+        pid_t bg = fork(); CHECK(bg >= 0);
+        if (bg == 0) {
+            CHECK(setpgid(0, 0) == 0 && install_signals() == 0 && close(start[1]) == 0);
+            char c; CHECK(read_byte(start[0], &c) == 0);
+            sigset_t blocked, old; sigemptyset(&blocked); sigaddset(&blocked, SIGTTOU);
+            CHECK(sigprocmask(SIG_BLOCK, &blocked, &old) == 0);
+            struct winsize changed = {32, 100, 0, 0}, observed;
+            CHECK(tcsetwinsize(p.slave, &changed) == 0 && ttou_count == 0);
+            CHECK(sigprocmask(SIG_SETMASK, &old, NULL) == 0);
+            struct winsize refused = {33, 101, 0, 0};
+            errno = 0; CHECK(tcsetwinsize(p.slave, &refused) == -1 && errno == EINTR && ttou_count == 1);
+            CHECK(tcgetwinsize(p.slave, &observed) == 0 && same_size(observed, changed));
+            CHECK(winch_count == 0 && hup_count == 0 && cont_count == 0);
+            _exit(0);
+        }
+        CHECK(close(start[0]) == 0 && setpgid(bg, bg) == 0);
+        CHECK(write(ready[1], "r", 1) == 1);
+        char c; CHECK(read_byte(command[0], &c) == 0);
+        CHECK(winch_count == 1 && ttou_count == 0);
+        CHECK(write(start[1], "q", 1) == 1 && wait_ok(bg) == 0);
+        CHECK(winch_count == 2 && ttou_count == 0 && hup_count == 0 && cont_count == 0);
+        _exit(0);
+    }
+    CHECK(close(ready[1]) == 0 && close(command[0]) == 0);
+    char c; CHECK(read_byte(ready[0], &c) == 0);
+    size = (struct winsize){24, 80, 0, 0};
+    CHECK(tcsetwinsize(p.master, &size) == 0 && pause_ms(20) == 0);
+    CHECK(tcsetwinsize(p.master, &size) == 0 && pause_ms(20) == 0);
+    CHECK(write(command[1], "q", 1) == 1 && wait_ok(controller) == 0);
+    CHECK(close(ready[0]) == 0 && close(command[1]) == 0 && close_pair(&p) == 0);
+    printf("posix-pty: window size roundtrip, exact WINCH target and background setters ok\n");
     return 0;
 }
 
@@ -351,6 +422,7 @@ int main(int argc, char **argv) {
     CHECK(ring_and_input() == 0 && controller_disconnect(0) == 0 && controller_disconnect(1) == 0);
     CHECK(limits_and_generation() == 0);
     CHECK(spawn_actions() == 0);
+    CHECK(window_sizes() == 0);
     printf("posix-pty: ok\n");
     return 0;
 }
