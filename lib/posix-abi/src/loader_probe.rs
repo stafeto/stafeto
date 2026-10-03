@@ -213,9 +213,9 @@ pub fn full(slot: u32) -> i32 {
 
 static BUNDLE: AtomicU32 = AtomicU32::new(0);
 
-/// Forces a fifth Driver channel; mode 2 omits the required Terminal,
+/// Adds a Driver channel to force another packet; mode 2 omits Terminal,
 /// mode 3 checks refusal of requests after HandlesDone, and mode 4 omits it.
-/// Modes 5, 6 and 7 omit Files, Clock and Pipes from the original snapshot.
+/// Modes 5, 6, 7 and 8 omit Files, Clock, Pipes and Entropy from the snapshot.
 pub fn bundle_mode(mode: u32) {
     BUNDLE.store(mode, Ordering::Release);
 }
@@ -236,7 +236,11 @@ pub(crate) fn bundle<const N: usize>(mut sessions: Bundle<N>) -> Result<Bundle<N
         }
         if matches!(
             (mode, *slot),
-            (2, Slot::Terminal) | (5, Slot::Files) | (6, Slot::Clock) | (7, Slot::Pipes)
+            (2, Slot::Terminal)
+                | (5, Slot::Files)
+                | (6, Slot::Clock)
+                | (7, Slot::Pipes)
+                | (8, Slot::Entropy)
         ) {
             *channel = None;
         }

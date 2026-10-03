@@ -186,6 +186,7 @@ impl Sessions {
             (Slot::Driver, self.uart),
             (Slot::Pipes, self.pipes),
             (Slot::Terminal, self.terminal),
+            (Slot::Entropy, self.entropy),
         ] {
             if raw != 0 {
                 mask |= slot.bit();

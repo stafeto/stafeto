@@ -398,13 +398,15 @@ impl<'a> Block<'a> {
     /// The descriptors the child starts with.
     /// Whether the block's descriptors need a session in `slot` to mean
     /// anything: a RAM file needs Files, a pipe needs Pipes (5e), and a
-    /// terminal needs Terminal (5f). HandlesDone answers BAD_SIZE for a
+    /// terminal needs Terminal (5f). A random device needs Files for its
+    /// description and Entropy for reads. HandlesDone answers BAD_SIZE for a
     /// required slot left empty.
     pub fn needs(&self, slot: Slot) -> bool {
         self.descriptors().any(|d| {
             matches!(
                 (slot, d.names),
-                (Slot::Files, Names::File(_))
+                (Slot::Files, Names::File(_) | Names::Random(_))
+                    | (Slot::Entropy, Names::Random(_))
                     | (Slot::Pipes, Names::Pipe(_))
                     | (Slot::Terminal, Names::Terminal(_))
             )
@@ -1469,6 +1471,21 @@ mod tests {
         .unwrap();
         let plain = Block::read(&plain[..plain_len]).unwrap();
         assert!(!plain.needs(Slot::Pipes) && !plain.needs(Slot::Terminal));
+        let mut random = vec![0; BLOCK_MAX];
+        let random_len = Block::write_with(
+            &mut random,
+            b"/bin/ls",
+            b"/",
+            0,
+            [&b"ls"[..]].into_iter(),
+            [].into_iter(),
+            &list[list.len() - 1..],
+        )
+        .unwrap();
+        let random = Block::read(&random[..random_len]).unwrap();
+        assert!(random.needs(Slot::Files) && random.needs(Slot::Entropy));
+        assert!(!random.needs(Slot::Pipes) && !random.needs(Slot::Terminal));
+        assert!(!plain.needs(Slot::Entropy));
         let mut twice = out[..len].to_vec();
         let at = HEADER + 7 + 1;
         twice[at + DESCRIPTOR..at + DESCRIPTOR + 4].copy_from_slice(&0u32.to_le_bytes());

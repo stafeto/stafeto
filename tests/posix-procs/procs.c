@@ -3527,6 +3527,10 @@ static int channel_io(int inherited, char expected) {
 }
 
 static int channel_child(const char *name) {
+    if (strcmp(name, "channels_random") == 0) {
+        unsigned char bytes[32];
+        return read(3, bytes, sizeof bytes) == sizeof bytes ? 0 : 27;
+    }
     if (strcmp(name, "channels_terminal") == 0) return isatty(3) == 1 ? 0 : 15;
     if (strcmp(name, "channels_missing_exec") == 0 || strcmp(name, "channels_no_done_exec") == 0) {
         stafeto_probe_loader_bundle(strcmp(name, "channels_missing_exec") == 0 ? 2 : 4);
@@ -3542,10 +3546,11 @@ static int channel_child(const char *name) {
     }
     if (strcmp(name, "channels_missing_fork") == 0) {
         int file = open("/etc/motd", O_RDONLY);
+        int random = open("/dev/urandom", O_RDONLY);
         int ends[2];
-        if (file < 0 || pipe(ends) != 0 || write(ends[1], "p", 1) != 1) return 20;
-        const unsigned modes[] = {2, 5, 6, 7};
-        const char *slots[] = {"Terminal", "Files", "Clock", "Pipes"};
+        if (file < 0 || random < 0 || pipe(ends) != 0 || write(ends[1], "p", 1) != 1) return 20;
+        const unsigned modes[] = {2, 5, 6, 7, 8};
+        const char *slots[] = {"Terminal", "Files", "Clock", "Pipes", "Entropy"};
         for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
             stafeto_probe_loader_bundle(modes[i]);
             errno = 0;
@@ -3571,7 +3576,8 @@ static int channel_child(const char *name) {
         if (child == 0) {
             char byte = 0;
             struct timespec now;
-            if (isatty(3) != 1 || read(file, &byte, 1) != 1 || byte != 's' ||
+            unsigned char bytes[32];
+            if (read(random, bytes, sizeof bytes) != sizeof bytes || isatty(3) != 1 || read(file, &byte, 1) != 1 || byte != 's' ||
                 read(ends[0], &byte, 1) != 1 || byte != 'p' ||
                 clock_gettime(CLOCK_MONOTONIC, &now) != 0) _exit(24);
             _exit(0);
@@ -3580,7 +3586,7 @@ static int channel_child(const char *name) {
         char byte = 0;
         if (child < 0 || waitpid(child, &status, 0) != child || status != 0 ||
             read(file, &byte, 1) != 1 || byte != 't') return 25;
-        if (close(file) != 0 || close(ends[0]) != 0 || close(ends[1]) != 0) return 26;
+        if (close(file) != 0 || close(random) != 0 || close(ends[0]) != 0 || close(ends[1]) != 0) return 26;
         return 0;
     }
     if (strcmp(name, "channels_terminal_fork") == 0) {
@@ -3703,7 +3709,7 @@ static int loader_channels(void) {
     for (unsigned i = 0; i < 3; i++) {
         stafeto_probe_loader_bundle(i == 2 ? 0 : 3);
         pid_t part = -1;
-        expect("five channels in two Handles packets", spawn(&part,
+        expect("six channels in two Handles packets", spawn(&part,
                i == 0 ? "channels_terminal" : i == 1 ? "channels_terminal_exec" : "channels_terminal_fork", NULL, NULL), 0);
         if (part > 0) reap("Terminal in the last packet", part, 0, 0);
     }
@@ -3723,8 +3729,23 @@ static int loader_channels(void) {
     expect("spawn missing fork bundle probe", spawn(&fork_missing, "channels_missing_fork", NULL, NULL), 0);
     if (fork_missing > 0) reap("fork slots checked before Commit, then descriptors preserved", fork_missing, 0, 0);
     expect("close the packet terminal", close(terminal), 0);
+    int random = open("/dev/urandom", O_RDONLY);
+    expect("random description for loader requirements", random, 3);
+    for (unsigned mode = 5; mode <= 8; mode += 3) {
+        stafeto_probe_loader_bundle(mode);
+        pid_t random_child = -1;
+        expect("random description requires Files and Entropy", spawn(&random_child, "channels_random", NULL, NULL), EIO);
+    }
+    stafeto_probe_loader_bundle(0);
+    expect("replace Files with a closed endpoint for random", stafeto_probe_loader_start(3), 0);
+    pid_t random_child = -1;
+    expect("random description refuses the wrong Files endpoint", spawn(&random_child, "channels_random", NULL, NULL), EIO);
+    expect("close random replacement endpoint", stafeto_probe_loader_stop(), 0);
+    expect("spawn keeps a random description", spawn(&random_child, "channels_random", NULL, NULL), 0);
+    if (random_child > 0) reap("inherited random description reads", random_child, 0, 0);
+    expect("close loader random description", close(random), 0);
     if (failures) return 1;
-    printf("loader-channels: packets 4+1, final slot and repeated completion checked\n");
+    printf("loader-channels: packets 4+2, final slots and repeated completion checked\n");
     printf("loader-channels: ok (spawn exec fork, RAM/Clock 48, inherited offsets, closed endpoints)\n");
     return 0;
 }
