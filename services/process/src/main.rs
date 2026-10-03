@@ -1447,6 +1447,7 @@ impl Processes {
         let old = core::mem::replace(&mut record.process, incoming);
         let ceiling = record.ceiling;
         record.image = image;
+        record.execed = true;
         let mut credentials = loaders::child_credentials(record.credentials, 0);
         if let Some(ids) = set_id {
             credentials = loaders::set_ids(credentials, ids);
@@ -1786,6 +1787,9 @@ impl Processes {
         };
         let record = self.records.get_mut(child).expect("a loading record");
         record.state = State::Alive;
+        // A child of posix_spawn runs its own program from the start; one
+        // of fork runs its parent's copy until it execs.
+        record.execed = !fork;
         if let Some(ids) = set_id {
             record.credentials = loaders::set_ids(record.credentials, ids);
         }

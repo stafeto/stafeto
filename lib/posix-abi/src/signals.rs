@@ -482,6 +482,13 @@ pub fn kill_relibc_thread(id: u64, signal: i32) -> i32 {
         Ok(target) => target,
         Err(code) => return code,
     };
+    // A signal ignored by default that the target thread blocks stays
+    // pending on it, for sigwait or a later change of its action
+    // ([P24-XSH2] 2.4.1); SIG_IGN discards it at once.
+    let action = action.map(|(act, ignored)| {
+        let blocked = block.mask.load(Ordering::SeqCst) & bit != 0;
+        (act, ignored && (act.handler == IGNORE || !blocked))
+    });
     if core::ptr::eq(block, own()) {
         if let Some((_, false)) = action {
             own().pending.fetch_or(bit, Ordering::SeqCst);

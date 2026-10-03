@@ -75,6 +75,9 @@ process/fork-setpgid-on-parent
 process/fork-setpgid-on-parent-move
 process/fork-setsid-setpgid
 process/zombie-getpgid
+process/zombie-setpgid
+process/zombie-setpgid-leader
+process/zombie-setpgid-move
 basic/unistd/fork
 basic/unistd/pause
 basic/unistd/setpgid

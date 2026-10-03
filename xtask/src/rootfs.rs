@@ -207,6 +207,10 @@ fn procs() -> Vec<RootFile> {
             Source::Bytes("script", b"#!/bin/sh\necho no\n"),
         ),
         of("/bin/data", 0o644, ROOT, Source::Bytes("data", b"data\n")),
+        // ash's job in the background reads /dev/null (an empty file until
+        // the device namespace comes).
+        dir("/dev"),
+        of("/dev/null", 0o666, ROOT, Source::Bytes("null", b"")),
         RootFile {
             mode: NOBODY_DIR,
             ..dir("/sbin")

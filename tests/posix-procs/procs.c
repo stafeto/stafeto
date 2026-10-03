@@ -161,6 +161,15 @@
  * session of the pipe service to give is refused by the loader. BusyBox ash
  * runs `/bin/ls /etc | /bin/cat`.
  *
+ * Stage shell signals (5e): a SIGCHLD the thread raises while it blocks
+ * it and SIG_DFL ignores it waits for sigtimedwait, SIG_IGN discards it;
+ * signal() installs a handler with SA_RESTART; another child's end ends
+ * waitpid with EINTR when SIGCHLD's handler has no SA_RESTART, as ash has
+ * it; sigsuspend and pause wake for SIGCHLD; ash's `& wait` waits for its
+ * job. The role setpgidfork: setpgid moves a child of fork and its zombie,
+ * gives EACCES once the child execed or for a child of posix_spawn, and
+ * EPERM for a child that leads its own session.
+ *
  * Stage 10: the probe is a record of init's table, and its end is init's
  * line: the probe execs a child's role that exits with 42, and init
  * reports that status (REPLACED), never the old image's 0.
@@ -1801,6 +1810,7 @@ static int fork_spin(void) {
 }
 
 static int pipe_fork(void);
+static int setpgid_fork(void);
 static int sigpipe_default(void);
 static int pipe_child(void);
 static int cat_fork(void);
@@ -1860,6 +1870,7 @@ static int role(const char *name) {
     if (strcmp(name, "forkmalloc") == 0) return fork_malloc();
     if (strcmp(name, "forkmany") == 0) return fork_many();
     if (strcmp(name, "pipefork") == 0) return pipe_fork();
+    if (strcmp(name, "setpgidfork") == 0) return setpgid_fork();
     if (strcmp(name, "sigpipe") == 0) return sigpipe_default();
     if (strcmp(name, "pipechild") == 0) return pipe_child();
     if (strcmp(name, "catfork") == 0) return cat_fork();
@@ -3129,6 +3140,166 @@ static int pipe_fork(void) {
     return failures;
 }
 
+/* Stage shell signals (5e, T4): what BusyBox ash relies on. */
+static volatile int chld_handled;
+static void on_chld(int signal) {
+    (void)signal;
+    chld_handled++;
+}
+
+/* SIGCHLD's action `handler` with `flags`; SIGCHLD unblocked. */
+static void chld_action(void (*handler)(int), int flags) {
+    struct sigaction action;
+    memset(&action, 0, sizeof action);
+    action.sa_handler = handler;
+    action.sa_flags = flags;
+    sigaction(SIGCHLD, &action, NULL);
+    sigset_t chld;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_UNBLOCK, &chld, NULL);
+    chld_handled = 0;
+}
+
+static void shell_signals(void) {
+    sigset_t chld, pending;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    /* A thread's own SIGCHLD with SIG_DFL, blocked: it waits on the
+     * thread and sigtimedwait takes it (pс2.1.7); with SIG_IGN it goes. */
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGCHLD, SIG_DFL);
+    sigprocmask(SIG_BLOCK, &chld, NULL);
+    expect("raise of a blocked SIGCHLD", raise(SIGCHLD), 0);
+    sigpending(&pending);
+    expect("a blocked SIGCHLD ignored by default stays pending", sigismember(&pending, SIGCHLD), 1);
+    struct timespec soon = {0, 100000000L};
+    siginfo_t info;
+    expect("sigtimedwait takes it", sigtimedwait(&chld, &info, &soon), SIGCHLD);
+    expect("raise of a blocked SIGCHLD again", raise(SIGCHLD), 0);
+    signal(SIGCHLD, SIG_IGN);
+    sigpending(&pending);
+    expect("SIG_IGN discards the pending SIGCHLD", sigismember(&pending, SIGCHLD), 0);
+    expect("raise of a blocked SIGCHLD with SIG_IGN", raise(SIGCHLD), 0);
+    sigpending(&pending);
+    expect("SIG_IGN never keeps it", sigismember(&pending, SIGCHLD), 0);
+    signal(SIGCHLD, SIG_DFL);
+    sigprocmask(SIG_UNBLOCK, &chld, NULL);
+
+    /* signal() installs a handler with SA_RESTART: a read of a pipe goes
+     * on after it until its byte comes. */
+    int p[2];
+    expect("pipe of signal()", pipe(p), 0);
+    signal(SIGUSR1, on_usr1);
+    handled = 0;
+    main_thread = pthread_self();
+    struct later later = {p[1], 150, 's'};
+    pthread_t helper, writer;
+    pthread_create(&helper, NULL, poke, NULL);
+    pthread_create(&writer, NULL, write_later, &later);
+    char got = 0;
+    expect("a read with signal()'s handler", (int)read(p[0], &got, 1), 1);
+    expect("its byte", got, 's');
+    pthread_join(helper, NULL);
+    pthread_join(writer, NULL);
+    expect("signal()'s handler ran", handled, 1);
+    close(p[0]);
+    close(p[1]);
+
+    /* ash: SIGCHLD caught without SA_RESTART; another child's end ends a
+     * waitpid with EINTR, and the waitpid repeated takes its child. */
+    chld_action(on_chld, 0);
+    pid_t nap = start("nap");
+    pid_t quick = start("exit7");
+    int status = -1;
+    pid_t gotpid = waitpid(nap, &status, 0);
+    expect("waitpid in another child's SIGCHLD", gotpid == -1 ? errno : 0, EINTR);
+    expect("the SIGCHLD handler ran", chld_handled >= 1, 1);
+    reap("the child that waitpid waited for", nap, 3, 0);
+    reap("the child whose end interrupted it", quick, 7, 0);
+
+    /* sigsuspend: SIGCHLD blocked until the wait, a child's end wakes it. */
+    sigprocmask(SIG_BLOCK, &chld, NULL);
+    chld_handled = 0;
+    sigprocmask(SIG_BLOCK, &chld, NULL);
+    quick = start("exit7");
+    sigset_t none;
+    sigemptyset(&none);
+    int r = sigsuspend(&none);
+    expect("sigsuspend woken by SIGCHLD", r == -1 ? errno : 0, EINTR);
+    expect("its handler", chld_handled, 1);
+    sigprocmask(SIG_UNBLOCK, &chld, NULL);
+    reap("the child of sigsuspend", quick, 7, 0);
+    /* pause: a child that ends 300 ms later wakes it. */
+    chld_handled = 0;
+    nap = start("nap");
+    r = pause();
+    expect("pause woken by SIGCHLD", r == -1 ? errno : 0, EINTR);
+    expect("its handler after pause", chld_handled, 1);
+    reap("the child of pause", nap, 3, 0);
+    signal(SIGCHLD, SIG_DFL);
+
+    /* ash's builtin wait waits in sigsuspend for a job in the background. */
+    char *ash[] = {"ash", "-c", "/bin/ls /etc & wait; exit 5", NULL};
+    char *env[] = {"PATH=/bin", NULL};
+    pid_t shell = -1;
+    expect("spawn of ash with a job", posix_spawn(&shell, "/bin/ls", NULL, NULL, ash, env), 0);
+    reap("ash with `& wait`", shell, 5, 0);
+
+    run_role("/bin/procs-child", "setpgidfork", NULL);
+    if (failures == 0) printf("posix-procs: shell signals and setpgid of a child\n");
+}
+
+/* Role setpgidfork: setpgid of a child of fork moves it until it execs
+ * (EACCES then); a child that leads its own session is EPERM. */
+static int setpgid_fork(void) {
+    pid_t child = fork();
+    if (child == 0) {
+        for (;;) pause_ms(1000);
+    }
+    expect("setpgid of a child of fork", setpgid(child, child), 0);
+    expect("its group", getpgid(child), child);
+    expect("setpgid of it back", setpgid(child, getpgid(0)), 0);
+    expect("its group back", getpgid(child), getpgid(0));
+    kill(child, SIGKILL);
+    reap("the child of fork that moved", child, 0, SIGKILL);
+    child = fork();
+    if (child == 0) {
+        char *next[] = {"procs-child", "sleep", NULL};
+        char *env[] = {NULL};
+        execve("/bin/procs-child", next, env);
+        _exit(1);
+    }
+    pause_ms(300);
+    expect("setpgid of a child after exec", setpgid(child, child) == -1 ? errno : 0, EACCES);
+    kill(child, SIGKILL);
+    reap("the child that execed", child, 0, SIGKILL);
+    pid_t spawned = -1;
+    char *argv[] = {"procs-child", "sleep", NULL};
+    char *envp[] = {NULL};
+    expect("spawn for setpgid", posix_spawn(&spawned, "/bin/procs-child", NULL, NULL, argv, envp), 0);
+    expect("setpgid of a child of posix_spawn", setpgid(spawned, spawned) == -1 ? errno : 0, EACCES);
+    kill(spawned, SIGKILL);
+    reap("the child of posix_spawn", spawned, 0, SIGKILL);
+    child = fork();
+    if (child == 0) {
+        if (setsid() < 0) _exit(1);
+        for (;;) pause_ms(1000);
+    }
+    pause_ms(100);
+    expect("setpgid of a child that leads its session", setpgid(child, child) == -1 ? errno : 0, EPERM);
+    kill(child, SIGKILL);
+    reap("the leader child", child, 0, SIGKILL);
+    /* A zombie of fork moves too (os-test process/zombie-setpgid). */
+    child = fork();
+    if (child == 0) _exit(0);
+    siginfo_t info;
+    expect("waitid WNOWAIT of the zombie", waitid(P_PID, child, &info, WEXITED | WNOWAIT), 0);
+    expect("setpgid of a zombie of fork", setpgid(child, child), 0);
+    reap("the zombie", child, 0, 0);
+    return failures;
+}
+
 int main(int argc, char **argv) {
     argc_seen = argc;
     argv_seen = argv;
@@ -3173,6 +3344,8 @@ int main(int argc, char **argv) {
     forks();
     printf("posix-procs: stage pipes\n");
     pipes();
+    printf("posix-procs: stage shell signals\n");
+    shell_signals();
     printf("posix-procs: stage wave\n");
     wave();
     if (failures != 0) return 1;
