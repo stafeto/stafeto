@@ -2945,6 +2945,45 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
+        // Each builtin produces an observed result. The numeric false cases
+        // also check exit status, and command bypasses the function named echo.
+        let builtin_cases: &[(&str, &[&str])] = &[
+            ("echo arithmetic:$((6 * 7))", &["arithmetic:42"]),
+            (
+                "test 7 -eq 7; echo test-true:$?; test 7 -eq 8; echo test-false:$?",
+                &["test-true:0", "test-false:1"],
+            ),
+            (
+                "[ word = word ]; echo bracket-true:$?; [ word = other ]; echo bracket-false:$?",
+                &["bracket-true:0", "bracket-false:1"],
+            ),
+            (
+                "printf 'formatted:%04d:%s\\n' 7 word",
+                &["formatted:0007:word"],
+            ),
+            (
+                "set -- -a -b value; while getopts 'ab:' opt; do echo option:$opt:$OPTARG; done; echo option-index:$OPTIND",
+                &["option:a:", "option:b:value", "option-index:4"],
+            ),
+            ("alias hello='echo alias-ready'", &[]),
+            ("hello", &["alias-ready"]),
+            (
+                "unalias hello; command -v hello >/dev/null; echo unalias:$?",
+                &["unalias:127"],
+            ),
+            (
+                "echo() { printf 'function:%s\\n' \"$1\"; }; echo called; command echo bypassed; unset -f echo",
+                &["function:called", "bypassed"],
+            ),
+            ("command -v printf", &["printf"]),
+        ];
+        for (command, expected) in builtin_cases {
+            run.send(command)?;
+            for expected_line in *expected {
+                run.expect_line(expected_line, |line| line == *expected_line, DIALOG_STEP)?;
+            }
+            run.expect("# ", DIALOG_STEP)?;
+        }
         // The terminal service edits the line before ash reads it (5f):
         // DEL erases the "x" and its echo, and ash gets "echo abc".
         run.send("echo abx\x7fc")?;
