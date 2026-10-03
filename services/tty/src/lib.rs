@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod discipline;
+pub mod endpoints;
 #[cfg(test)]
 mod fuzz;
 pub mod jobs;
