@@ -118,8 +118,8 @@ impl Processes {
     }
 
     /// Only the current image can return its assignment. The service remains
-    /// the sole publisher of job information, including this slow path.
-    pub(super) fn return_job_signal(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
+    /// the sole publisher of process information, including this slow path.
+    pub(super) fn return_signal(&mut self, index: usize, r: &mut Request<'_>) -> Answer {
         let mut body = r.body();
         let (Ok(signal), Ok(ticket), Ok(code), Ok(pid), Ok(uid), Ok(status), Ok(())) = (
             body.u32(),
@@ -135,13 +135,16 @@ impl Processes {
         let Ok(signal) = u8::try_from(signal) else {
             return refuse(proto_process::INVALID);
         };
-        if proto_process::job::class(signal).is_none() {
+        if !(1..=31).contains(&signal)
+            || matches!(signal, proto_process::SIGKILL | proto_process::SIGSTOP)
+            || (proto_process::job::class(signal).is_none() && ticket != 0)
+        {
             return refuse(proto_process::INVALID);
         }
         let Some(page) = self.pages.page(index) else {
             return refuse(proto_process::NO_PROCESS);
         };
-        if signals::return_job(
+        if signals::return_signal(
             page,
             signal,
             ticket,
