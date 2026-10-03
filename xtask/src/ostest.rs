@@ -119,10 +119,10 @@ pub fn outcome(log: &str, name: &str) -> Ended {
     let service = |line: &str| {
         line.starts_with("init: ")
             || line.starts_with("ramfs: ")
-            || line.starts_with("pipe: ")
-            || line.starts_with("tty: ")
-            || line.starts_with("virtio-rng: ")
-            || line.starts_with("entropy: ")
+            || line == "pipe: ready"
+            || line == "tty: ready"
+            || line == "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0"
+            || line == "entropy: seeded from the device"
             || line.starts_with("posix-process: ")
             || line.starts_with("clock: ")
             || line.starts_with("process fault: ")
@@ -698,7 +698,7 @@ mod tests {
             "@@os-test begin io/open",
             "pipe: ready",
             "tty: ready",
-            "virtio-rng: ready",
+            "virtio-rng: virtio-mmio at 0xa003e00, line 79, status 0x0",
             "entropy: seeded from the device",
             "open: EISDIR",
             "@@os-test end io/open exit 1",
@@ -707,6 +707,9 @@ mod tests {
             "@@os-test begin io/aborted",
             "NULL",
             "@@os-test end io/aborted exit 134",
+            "@@os-test begin io/unexpected",
+            "tty: unexpected failure",
+            "@@os-test end io/unexpected exit 1",
         ]);
         assert_eq!(
             outcome(&log, "io/open"),
@@ -719,6 +722,10 @@ mod tests {
         assert_eq!(
             outcome(&log, "io/aborted"),
             Ended::Exited("NULL\nexit: 134\n".to_owned())
+        );
+        assert_eq!(
+            outcome(&log, "io/unexpected"),
+            Ended::Exited("tty: unexpected failure\n".to_owned())
         );
     }
 
