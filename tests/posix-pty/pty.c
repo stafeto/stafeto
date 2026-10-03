@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +23,8 @@
     return 1; } } while (0)
 extern uint32_t stafeto_pty_description(uint32_t fd);
 extern uint32_t stafeto_pty_query(uint32_t fd, uint32_t description);
+extern void stafeto_pty_action_packet(uint32_t mode);
+extern uint64_t stafeto_pty_action_result(void);
 
 struct pair { int master, slave; char name[32]; };
 static int make_pair(struct pair *p) {
@@ -251,8 +254,94 @@ static int limits_and_generation(void) {
     return 0;
 }
 
+static int spawned_slave(void) {
+    struct stat st;
+    CHECK(isatty(10) == 1 && fstat(10, &st) == 0 && S_ISCHR(st.st_mode));
+    CHECK(st.st_uid == getuid() && (st.st_mode & 0777) == 0620);
+    errno = 0; CHECK(fcntl(9, F_GETFD) == -1 && errno == EBADF);
+    char c; CHECK(read_byte(10, &c) == 0 && c == 's');
+    CHECK(write(10, "r", 1) == 1 && close(10) == 0);
+    return 0;
+}
+
+static int all_master_places(void) {
+    int masters[8];
+    for (unsigned i = 0; i < 8; i++) { masters[i] = posix_openpt(O_RDWR | O_NOCTTY); CHECK(masters[i] >= 0); }
+    for (unsigned i = 0; i < 8; i++) CHECK(close(masters[i]) == 0);
+    return 0;
+}
+
+static int refused_actions(posix_spawn_file_actions_t *actions, uint32_t mode) {
+    char *args[] = {"posix-pty", "spawn-empty", NULL}, *env[] = {NULL};
+    pid_t child;
+    stafeto_pty_action_packet(mode);
+    int error = posix_spawn(&child, "/bin/posix-pty", actions, NULL, args, env);
+    uint64_t response = stafeto_pty_action_result();
+    stafeto_pty_action_packet(0);
+    printf("posix-pty: action mode %u returned %d, method %u status %u\n", mode, error, (uint32_t)(response >> 32), (uint32_t)response);
+    CHECK(error == EIO && all_master_places() == 0);
+    return 0;
+}
+
+static int spawn_actions(void) {
+    struct pair p; CHECK(make_pair(&p) == 0 && raw_slave(p.slave, 1) == 0);
+    posix_spawn_file_actions_t actions;
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    CHECK(posix_spawn_file_actions_addclose(&actions, p.master) == 0);
+    CHECK(posix_spawn_file_actions_addclose(&actions, p.slave) == 0);
+    CHECK(posix_spawn_file_actions_addopen(&actions, 9, p.name, O_RDWR | O_NOCTTY, 0) == 0);
+    CHECK(posix_spawn_file_actions_adddup2(&actions, 9, 10) == 0);
+    CHECK(posix_spawn_file_actions_addclose(&actions, 9) == 0);
+    char *slave_args[] = {"posix-pty", "spawn-slave", NULL}, *env[] = {NULL};
+    pid_t child;
+    CHECK(write(p.master, "s", 1) == 1);
+    stafeto_pty_action_packet(5);
+    int spawned = posix_spawn(&child, "/bin/posix-pty", &actions, NULL, slave_args, env);
+    uint64_t response = stafeto_pty_action_result();
+    stafeto_pty_action_packet(0);
+    printf("posix-pty: slave action spawn returned %d, method %u status %u\n", spawned, (uint32_t)(response >> 32), (uint32_t)response);
+    CHECK(spawned == 0);
+    CHECK(posix_spawn_file_actions_destroy(&actions) == 0 && wait_ok(child) == 0);
+    char c; CHECK(read_byte(p.master, &c) == 0 && c == 'r');
+    CHECK(close_pair(&p) == 0);
+
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    for (unsigned i = 0; i < 32; i++) {
+        CHECK(posix_spawn_file_actions_addopen(&actions, 9, "/dev/ptmx", O_RDWR | O_NOCTTY, 0) == 0);
+        CHECK(posix_spawn_file_actions_addclose(&actions, 9) == 0);
+    }
+    char *empty_args[] = {"posix-pty", "spawn-empty", NULL};
+    CHECK(posix_spawn(&child, "/bin/posix-pty", &actions, NULL, empty_args, env) == 0);
+    CHECK(wait_ok(child) == 0 && all_master_places() == 0);
+    CHECK(refused_actions(&actions, 1) == 0 && refused_actions(&actions, 3) == 0);
+    CHECK(posix_spawn_file_actions_destroy(&actions) == 0);
+
+    /* A temporary master remains live when packet two is rejected. */
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    CHECK(posix_spawn_file_actions_addopen(&actions, 11, "/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC, 0) == 0);
+    for (unsigned i = 0; i < 31; i++) {
+        CHECK(posix_spawn_file_actions_addopen(&actions, 9, "/dev/console", O_RDWR | O_NOCTTY, 0) == 0);
+        CHECK(posix_spawn_file_actions_addclose(&actions, 9) == 0);
+    }
+    CHECK(refused_actions(&actions, 2) == 0);
+    CHECK(posix_spawn_file_actions_destroy(&actions) == 0);
+
+    /* A missing action packet must leave an unresolved exported token. */
+    CHECK(posix_spawn_file_actions_init(&actions) == 0);
+    CHECK(posix_spawn_file_actions_addopen(&actions, 9, "/dev/ptmx", O_RDWR | O_NOCTTY, 0) == 0);
+    CHECK(refused_actions(&actions, 4) == 0);
+    CHECK(posix_spawn_file_actions_destroy(&actions) == 0);
+    printf("posix-pty: spawn alias and 32 transient master actions ok\n");
+    printf("posix-pty: four invalid own action packets reject and release all master places\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    (void)argv;
+    if (argc == 2 && strcmp(argv[1], "spawn-slave") == 0) return spawned_slave();
+    if (argc == 2 && strcmp(argv[1], "spawn-empty") == 0) {
+        errno = 0; CHECK(fcntl(9, F_GETFD) == -1 && errno == EBADF);
+        return 0;
+    }
     /* The file-loaded image supplies the region map used by fork. */
     if (argc == 1) {
         char *next[] = {"posix-pty", "loaded", NULL}, *env[] = {NULL};
@@ -261,6 +350,7 @@ int main(int argc, char **argv) {
     CHECK(names_grants() == 0 && flags_refs() == 0 && discard_disconnect() == 0 && armed_disconnect() == 0);
     CHECK(ring_and_input() == 0 && controller_disconnect(0) == 0 && controller_disconnect(1) == 0);
     CHECK(limits_and_generation() == 0);
+    CHECK(spawn_actions() == 0);
     printf("posix-pty: ok\n");
     return 0;
 }

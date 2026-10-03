@@ -8,6 +8,16 @@ use proto_wire::{Header, Reader, Writer};
 use rt::sys;
 
 #[unsafe(no_mangle)]
+pub extern "C" fn stafeto_pty_action_packet(mode: u32) {
+    posix_abi::process::probe_terminal_packet(mode);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stafeto_pty_action_result() -> u64 {
+    posix_abi::process::probe_terminal_packet_result()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn stafeto_pty_description(fd: u32) -> u32 {
     posix_abi::shared::held(fd, |_, target| match target {
         Target::Tty(id) => Ok(id),
