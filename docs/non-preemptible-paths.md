@@ -645,15 +645,15 @@ SetPgrp, GetPgrp, GetSid and Controlling while all sixteen clients remain
 alive. Pipe gates keep at most eight waiting readers per pipe. The
 maxima persist across both phases. The C probe uses `-fno-builtin`.
 
-On wiring `9b47841`, all complete intervals remain below B=20,538:
+On integrated wiring `11275b9`, all complete intervals remain below B=20,538:
 
 | Terminal method | Full interval under -icount |
 |---|---:|
-| Acquire (16) | 7,330 |
-| SetPgrp (17) | 3,429 |
-| GetPgrp (18) | 3,363 |
-| GetSid (19) | 9,528 |
-| Controlling (20) | 3,312 |
+| Acquire (16) | 7,410 |
+| SetPgrp (17) | 3,506 |
+| GetPgrp (18) | 3,440 |
+| GetSid (19) | 9,600 |
+| Controlling (20) | 3,389 |
 
 Omitting Controlling deliberately produces a zero snapshot and fails the
 probe. The restored probe passes. Its log is
