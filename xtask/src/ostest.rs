@@ -117,6 +117,7 @@ pub fn outcome(log: &str, name: &str) -> Ended {
     };
     let how = rest[end + mark.len()..].lines().next().unwrap_or("");
     let service = |line: &str| {
+        let line = line.strip_suffix('\n').unwrap_or(line);
         line.starts_with("init: ")
             || line.starts_with("ramfs: ")
             || line == "pipe: ready"
