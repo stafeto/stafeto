@@ -45,6 +45,18 @@
 //! new session (SEND, TRANSFER) with a label of the driver's own, for a
 //! child of the client (spec 2, 3.7; 5c).
 //!
+//! WRITE_SOME (11) is WRITE that never waits (5f): the driver takes as
+//! many of the bytes as its ring has room for, none while a WRITE waits,
+//! and answers at once with their count (`WriteReply`). ROOM (12): the
+//! header alone, and the first time a handle with NOTIFY; the reply that is
+//! no refusal (`RoomReply`) is status 0, the room of the ring u32 and
+//! whether the driver armed u32 (1) or not (0). Below ROOM_MARK bytes of
+//! room, or while a WRITE waits, the driver arms: it sets bit 0 through the
+//! handle once ROOM_MARK bytes are free and no WRITE waits, once; ROOMS
+//! clients at most keep a handle (LIMIT_REACHED past them). A client of the
+//! terminal kind (the terminal service) writes so and never waits for the
+//! port.
+//!
 //! Number 4 belongs to TRACE, which comes with milestone 1.4e; 5 and 6
 //! (READ_CANCELABLE, CANCEL_READ of version 1) are retired.
 
@@ -65,6 +77,10 @@ pub const WRITE_MAX: usize = MESSAGE_MAX - HEADER_LEN;
 pub const READ_MAX: usize = MESSAGE_MAX - HEADER_LEN;
 /// The bytes of a reply to READ before its bytes.
 pub const READ_FIXED: usize = 8;
+/// The room of the ring of output below which ROOM arms.
+pub const ROOM_MARK: usize = 1024;
+/// The clients that keep a handle of ROOM at most.
+pub const ROOMS: usize = 4;
 
 /// The methods of the driver with their numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,10 +92,12 @@ pub enum Method {
     ReadTake = 8,
     ReadCancel = 9,
     Clone = 10,
+    WriteSome = 11,
+    Room = 12,
 }
 
 impl Method {
-    pub const ALL: [Method; 7] = [
+    pub const ALL: [Method; 9] = [
         Method::Write,
         Method::Read,
         Method::Crash,
@@ -87,6 +105,8 @@ impl Method {
         Method::ReadTake,
         Method::ReadCancel,
         Method::Clone,
+        Method::WriteSome,
+        Method::Room,
     ];
 
     pub const fn number(self) -> u16 {
@@ -116,6 +136,15 @@ impl<'a> WriteRequest<'a> {
             return Err(Status::BadSize);
         }
         Method::Write.header().write(w)?;
+        w.bytes(self.bytes)
+    }
+
+    /// WRITE_SOME of the bytes: BAD_SIZE past WRITE_MAX.
+    pub fn write_some(&self, w: &mut Writer) -> Result<(), Status> {
+        if self.bytes.len() > WRITE_MAX {
+            return Err(Status::BadSize);
+        }
+        Method::WriteSome.header().write(w)?;
         w.bytes(self.bytes)
     }
 
@@ -154,6 +183,41 @@ impl WriteReply {
             return Err(Status::BadSize);
         }
         Ok(WriteReply { written })
+    }
+}
+
+/// A reply to ROOM that is no refusal: the room of the ring, and whether
+/// the driver armed its notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomReply {
+    pub room: u32,
+    pub armed: bool,
+}
+
+impl RoomReply {
+    pub fn write(&self, w: &mut Writer) -> Result<(), Status> {
+        w.u32(Status::Ok.code())?;
+        w.u32(self.room)?;
+        w.u32(u32::from(self.armed))
+    }
+
+    /// The reply in `bytes`: the status of a refusal, BAD_SIZE unless it
+    /// is 12 bytes with an armed word of 0 or 1.
+    pub fn read(bytes: &[u8]) -> Result<RoomReply, Status> {
+        let mut r = Reader::new(bytes);
+        match Status::from_code(r.u32()?) {
+            Status::Ok => {}
+            status => return Err(status),
+        }
+        let (room, armed) = (r.u32()?, r.u32()?);
+        r.finish()?;
+        if armed > 1 {
+            return Err(Status::BadSize);
+        }
+        Ok(RoomReply {
+            room,
+            armed: armed == 1,
+        })
     }
 }
 
@@ -269,7 +333,10 @@ mod tests {
 
     #[test]
     fn method_numbers_are_fixed() {
-        assert_eq!(Method::ALL.map(Method::number), [1, 2, 3, 7, 8, 9, 10]);
+        assert_eq!(
+            Method::ALL.map(Method::number),
+            [1, 2, 3, 7, 8, 9, 10, 11, 12]
+        );
         for m in Method::ALL {
             assert_eq!(Method::from_number(m.number()), Some(m));
             assert_eq!(m.header(), Header::new(m.number(), VERSION));
@@ -336,6 +403,46 @@ mod tests {
         let refused = proto_wire::reply(Status::Kernel(abi::Error::LimitReached));
         assert_eq!(WriteReply::read(&refused), Err(Status::BadSize));
         assert_eq!(WriteReply::read(&[0; 7]), Err(Status::BadSize));
+    }
+
+    #[test]
+    fn write_some_and_room_round_trip() {
+        let mut w = Writer::new();
+        WriteRequest { bytes: b"part" }.write_some(&mut w).unwrap();
+        assert_eq!(w.as_bytes()[..8], Method::WriteSome.header().bytes());
+        assert_eq!(
+            WriteRequest::read(Reader::new(&w.as_bytes()[HEADER_LEN..])),
+            Ok(WriteRequest { bytes: b"part" })
+        );
+        let long = [b'x'; WRITE_MAX + 1];
+        assert_eq!(
+            WriteRequest { bytes: &long }.write_some(&mut Writer::new()),
+            Err(Status::BadSize)
+        );
+        for reply in [
+            RoomReply {
+                room: 3,
+                armed: true,
+            },
+            RoomReply {
+                room: 4096,
+                armed: false,
+            },
+        ] {
+            let mut w = Writer::new();
+            reply.write(&mut w).unwrap();
+            assert_eq!(w.as_bytes().len(), 12);
+            assert_eq!(RoomReply::read(w.as_bytes()), Ok(reply));
+        }
+        assert_eq!(
+            RoomReply::read(&[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]),
+            Err(Status::BadSize)
+        );
+        let refused = proto_wire::reply(Status::Kernel(abi::Error::LimitReached));
+        assert_eq!(
+            RoomReply::read(&refused),
+            Err(Status::Kernel(abi::Error::LimitReached))
+        );
     }
 
     #[test]

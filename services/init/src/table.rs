@@ -730,7 +730,10 @@ const TABLE_FEATURES: usize = cfg!(feature = "table-test") as usize
     + cfg!(feature = "table-busybox-dialog-vz") as usize
     + cfg!(feature = "table-rtbench-vz") as usize
     + cfg!(feature = "table-rtbench-posix") as usize
-    + cfg!(feature = "table-rtbench-posix-vz") as usize;
+    + cfg!(feature = "table-rtbench-posix-vz") as usize
+    + cfg!(feature = "table-tty") as usize
+    + cfg!(feature = "table-tty-vz") as usize
+    + cfg!(feature = "table-tty-steps") as usize;
 const _: () = assert!(
     matches!(TABLE_FEATURES, 0 | 1),
     "init builds with one table feature at a time"
@@ -759,7 +762,10 @@ const _: () = assert!(
     feature = "table-busybox-dialog-vz",
     feature = "table-rtbench-vz",
     feature = "table-rtbench-posix",
-    feature = "table-rtbench-posix-vz"
+    feature = "table-rtbench-posix-vz",
+    feature = "table-tty",
+    feature = "table-tty-vz",
+    feature = "table-tty-steps"
 )))]
 pub const TABLE: &[Record] = normal::TABLE;
 #[cfg(feature = "table-ramfs")]
@@ -802,6 +808,12 @@ pub const TABLE: &[Record] = test::TABLE;
 pub const TABLE: &[Record] = cycle::TABLE;
 #[cfg(feature = "table-ceiling")]
 pub const TABLE: &[Record] = ceiling::TABLE;
+#[cfg(feature = "table-tty")]
+pub const TABLE: &[Record] = ramfs::TTY_TABLE;
+#[cfg(feature = "table-tty-vz")]
+pub const TABLE: &[Record] = vz::TTY_TABLE;
+#[cfg(feature = "table-tty-steps")]
+pub const TABLE: &[Record] = ramfs::TTY_STEPS_TABLE;
 
 #[cfg(test)]
 mod tests {
@@ -1450,14 +1462,23 @@ mod tests {
                 "posix-sender"
             ]
         );
-        assert_eq!(
-            order_of(vz::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "posix", "clock", "pipe", "busybox-probe"]
-        );
-        assert_eq!(
-            order_of(ramfs::BUSYBOX_DIALOG_TABLE),
-            ["uart", "ramfs", "posix", "clock", "pipe", "busybox-probe"]
-        );
+        for table in [vz::BUSYBOX_DIALOG_TABLE, ramfs::BUSYBOX_DIALOG_TABLE] {
+            assert_eq!(
+                order_of(table),
+                [
+                    "uart",
+                    "tty",
+                    "ramfs",
+                    "posix",
+                    "clock",
+                    "pipe",
+                    "busybox-probe"
+                ]
+            );
+        }
+        for table in [ramfs::TTY_TABLE, vz::TTY_TABLE, ramfs::TTY_STEPS_TABLE] {
+            assert_eq!(order_of(table), ["uart", "tty", "tty-probe"]);
+        }
         assert_eq!(
             order_of(ramfs::OS_TEST_TABLE),
             ["ramfs", "posix", "clock", "pipe", "os-test-run"]

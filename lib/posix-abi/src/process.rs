@@ -669,6 +669,39 @@ pub(crate) fn ask_loader(
     }
 }
 
+/// Handles of the sessions `sessions` that are there, by their slots, to
+/// the loader `c`: abi::MESSAGE_HANDLES of them a message, so a fifth goes
+/// in a second Handles. The sessions move whatever comes of it; the
+/// loader's code of the first message that failed, 0 once all went.
+pub(crate) fn give_sessions(
+    c: &Handle<Channel>,
+    sessions: [(proto_loader::Slot, Option<Handle<Channel>>); 5],
+) -> u32 {
+    use proto_loader::Method;
+    let mut left = sessions
+        .into_iter()
+        .filter_map(|(slot, s)| s.map(|s| (slot, s)));
+    loop {
+        let mut w = Writer::new();
+        if Method::Handles.header().write(&mut w).is_err() {
+            return proto_loader::IO;
+        }
+        let mut handles = rt::handle::Outgoing::new();
+        for (slot, session) in left.by_ref().take(rt::abi::MESSAGE_HANDLES) {
+            if w.u32(slot as u32).is_err() || handles.push(session.erase()).is_err() {
+                return proto_loader::IO;
+            }
+        }
+        if handles.is_empty() {
+            return 0;
+        }
+        let code = ask_loader(c, &w, Some(handles));
+        if code != 0 {
+            return code;
+        }
+    }
+}
+
 /// The block of a spawn of `path` in a new object of the caller's: its
 /// length and the object (5c, spec 2, 3.2). E2BIG past {ARG_MAX},
 /// ENAMETOOLONG for a path past the limit, ENOMEM.
@@ -1035,7 +1068,7 @@ fn image_ready(
 /// labels. Nothing of this image uses them afterwards. Whether the loader
 /// took them.
 fn move_files(c: &Handle<Channel>) -> bool {
-    use proto_loader::{Method, Slot};
+    use proto_loader::Slot;
     for fd in 0..posix_fs::OPEN_MAX as u32 {
         let close_on_exec = crate::shared::with_files(|files| {
             Ok(files
@@ -1066,35 +1099,32 @@ fn move_files(c: &Handle<Channel>) -> bool {
     // never end them. The sessions of the RAM files and the clock keep no
     // waiting operation, so a general Abandon of long operations has
     // nothing else to do here.
-    let pipes = crate::shared::with_files(|files| Ok(files.pipes().map(Handle::raw)))
-        .ok()
-        .flatten();
+    let (pipes, terminal) = crate::shared::with_files(|files| {
+        Ok((
+            files.pipes().map(Handle::raw),
+            files.terminal().map(Handle::raw),
+        ))
+    })
+    .unwrap_or((None, None));
     if let Some(pipes) = pipes {
         crate::pipes::abandon(pipes);
     }
-    let mut w = Writer::new();
-    if Method::Handles.header().write(&mut w).is_err() {
-        return false;
+    // The terminal's session moves too, its waiting operations gone.
+    if let Some(terminal) = terminal {
+        crate::terminal::abandon(terminal);
     }
-    let mut handles = rt::handle::Outgoing::new();
-    for (slot, session) in [
-        (Slot::Files, Some(files)),
-        (Slot::Clock, clock),
-        (Slot::Uart, uart),
-    ] {
-        if let Some(raw) = session
-            && w.u32(slot as u32).is_ok()
-        {
-            // The handle moves: this image's owner never uses it again.
-            let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
-        }
-    }
-    if let Some(raw) = pipes
-        && w.u32(Slot::Pipes as u32).is_ok()
-    {
-        let _ = handles.push(Handle::<Channel>::from_raw(raw).erase());
-    }
-    ask_loader(c, &w, Some(handles)) == 0
+    // The handles move: this image's owner never uses them again.
+    let moved = |raw: Option<rt::abi::Handle>| raw.map(Handle::<Channel>::from_raw);
+    give_sessions(
+        c,
+        [
+            (Slot::Files, moved(Some(files))),
+            (Slot::Clock, moved(clock)),
+            (Slot::Driver, moved(uart)),
+            (Slot::Pipes, moved(pipes)),
+            (Slot::Terminal, moved(terminal)),
+        ],
+    ) == 0
 }
 
 /// The errno of a refused Clone: EAGAIN for a service at its limit of
@@ -1189,21 +1219,20 @@ fn commit(
         }
         None => None,
     };
-    let mut w = Writer::new();
-    Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
-    let mut handles = rt::handle::Outgoing::new();
-    for (slot, session) in [
+    // The child's session with the terminal service: a clone of the
+    // caller's.
+    let terminal = match crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))? {
+        Some(terminal) => Some(crate::terminal::clone(terminal)?),
+        None => None,
+    };
+    let sessions = [
         (Slot::Files, Some(files)),
         (Slot::Clock, Some(clock)),
-        (Slot::Uart, uart),
+        (Slot::Driver, uart),
         (Slot::Pipes, pipes),
-    ] {
-        if let Some(session) = session {
-            w.u32(slot as u32).map_err(|_| EIO)?;
-            handles.push(session.erase()).map_err(|_| EIO)?;
-        }
-    }
-    if ask_loader(c, &w, Some(handles)) != 0 {
+        (Slot::Terminal, terminal),
+    ];
+    if give_sessions(c, sessions) != 0 {
         return Err(EIO);
     }
     ask(&request(proto_process::Method::SpawnCommit, &[pid as u32])?).map(drop)

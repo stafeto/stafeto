@@ -20,6 +20,7 @@ pub mod process;
 pub mod relibc;
 pub mod shared;
 pub mod signals;
+pub mod terminal;
 pub mod threads;
 pub mod tls;
 

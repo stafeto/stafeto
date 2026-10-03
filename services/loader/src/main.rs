@@ -995,7 +995,7 @@ fn finish(
     handles[Slot::Posix as usize] = keep(taken.posix);
     handles[Slot::PosixId as usize] = keep(taken.identity);
     handles[Slot::Console as usize] = taken.console.map_or(0, keep);
-    for slot in [Slot::Files, Slot::Clock, Slot::Uart, Slot::Pipes] {
+    for slot in Slot::GIVEN {
         handles[slot as usize] = given[slot as usize].take().map_or(0, keep);
     }
     let mut entries = [MapEntry {
@@ -1061,7 +1061,7 @@ fn finish_fork(
     handles[Slot::Posix as usize] = keep(taken.posix);
     handles[Slot::PosixId as usize] = keep(taken.identity);
     handles[Slot::Console as usize] = taken.console.map_or(0, keep);
-    for slot in [Slot::Files, Slot::Clock, Slot::Uart, Slot::Pipes] {
+    for slot in Slot::GIVEN {
         handles[slot as usize] = given[slot as usize].take().map_or(0, keep);
     }
     // SAFETY: `check_fork` put the transfer whole in a writable region,

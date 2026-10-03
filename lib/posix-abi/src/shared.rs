@@ -51,7 +51,7 @@ pub unsafe fn init(files: PosixFs) -> Result<(), rt::abi::Error> {
 }
 
 /// The files of a forked child (posix_fs::PosixFs::after_fork): its own
-/// sessions `files`, `uart` and `pipes`.
+/// sessions `files`, `uart`, `pipes` and `terminal`.
 ///
 /// # Safety
 /// The child's only thread, before anything else of the layer runs.
@@ -59,13 +59,14 @@ pub unsafe fn after_fork(
     files: Handle<rt::handle::Channel>,
     uart: Option<Handle<rt::handle::Channel>>,
     pipes: Option<Handle<rt::handle::Channel>>,
+    terminal: Option<Handle<rt::handle::Channel>>,
 ) {
     if !READY.load(Ordering::Acquire) {
         return;
     }
     // SAFETY: the caller's promise gives this borrow alone.
     if let Some(own) = unsafe { (*STATE.0.get()).files.as_mut() } {
-        own.after_fork(files, uart, pipes);
+        own.after_fork(files, uart, pipes, terminal);
     }
 }
 
@@ -224,12 +225,26 @@ fn pipe_reply(transport: Transport, end: u32, count: u32, out: &mut Writer) -> R
     Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
 }
 
+/// The reply of a read of the console through the terminal service (5f),
+/// its bytes once they came.
+#[inline(never)]
+fn terminal_reply(transport: Transport, count: u32, out: &mut Writer) -> Result<(), i32> {
+    let mut bytes = [0; posix_fs::MAX_READ];
+    let extent = (count as usize).min(bytes.len());
+    let n = crate::terminal::read(transport, &mut bytes[..extent])?;
+    Reply::Bytes(&bytes[..n]).write(out).map_err(|_| EIO)
+}
+
 /// A read of `fd`: what it names held, outside the lock; the read of a
-/// pipe waits here. Each kind has its own frame: the reads of files stay
-/// as deep as they were (threads with small stacks read files).
+/// pipe or of the terminal waits here. Each kind has its own frame: the
+/// reads of files stay as deep as they were (threads with small stacks
+/// read files).
 fn read_reply(fd: u32, count: u32, out: &mut Writer) -> Result<(), i32> {
     held(fd, |transport, target| match target {
         Target::Pipe(end) => pipe_reply(transport, end, count, &mut *out),
+        Target::Input if transport.terminal().is_some() => {
+            terminal_reply(transport, count, &mut *out)
+        }
         target => file_reply(transport, target, count, &mut *out),
     })
 }
@@ -281,6 +296,10 @@ fn number_operation(request: Request<'_>) -> Result<u64, i32> {
             // A file or the console takes at most one message of it.
             let extent = &bytes[..bytes.len().min(posix_request::MAX_WRITE)];
             match target {
+                // The write of the terminal waits here, outside the lock.
+                Target::Output | Target::Error if transport.terminal().is_some() => {
+                    crate::terminal::write(transport, bytes).map(|n| n as u64)
+                }
                 Target::Output | Target::Error => transport
                     .input()
                     .write(extent)

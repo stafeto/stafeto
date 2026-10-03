@@ -96,7 +96,7 @@ pub const BUSYBOX_TABLE: &[Record] = &[
 /// process service holds the quota of five more processes of the
 /// launcher's size (the shell, the three of a pipeline of three, and a
 /// nested shell's command), and the reserve of its loaders. The pipe service (5e)
-/// serves the shell's pipelines.
+/// serves the shell's pipelines, the terminal service (5f) its console.
 pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::normal::TABLE[0],
     TABLE[0],
@@ -108,10 +108,11 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     PIPE,
     Record {
         args: b"ash-launch\0",
-        connects: &["ramfs", "uart", "pipe", "clock", "posix"],
+        connects: &["ramfs", "tty", "pipe", "clock", "posix"],
         quota: DIALOG_QUOTA,
         ..BUSYBOX_TABLE[3]
     },
+    TTY,
 ];
 
 /// The quota of the launcher, which the shell and its children get too.
@@ -441,3 +442,55 @@ pub const RTBENCH_POOL: Record = Record {
     quota: POSIX_ABI_TABLE[1].quota + 33 * RTBENCH.quota + 384 * PAGE,
     ..POSIX_ABI_TABLE[1]
 };
+
+/// The terminal service (5f): the console as a terminal over the
+/// console's driver, at 50, below the driver and above the POSIX
+/// processes; its segments, a stack of 32 KiB, its 320 sessions, 128 long
+/// operations and the console's discipline in `.bss`; a handle for each
+/// long operation that waits.
+pub const TTY: Record = Record {
+    name: "tty",
+    program: "tty",
+    priority: 50,
+    ceiling: 50,
+    quota: 64 * PAGE,
+    handle_limit: 192,
+    restart: Restart::Never,
+    connects: &["uart"],
+    ..TABLE[0]
+};
+
+/// The probe of the terminal service (tests/tty, xtask tty): the console's
+/// driver, the service and the probe, a client of it.
+pub const TTY_TABLE: &[Record] = &[
+    super::normal::TABLE[0],
+    TTY,
+    Record {
+        name: "tty-probe",
+        program: "tty-probe",
+        connects: &["tty"],
+        ..TABLE[1]
+    },
+];
+
+/// The measure of the terminal service's steps (xtask tty, under
+/// -icount): the probe's program as a quiet driver under the driver's
+/// name (its role `S`, no device, no interrupt), the service, and the
+/// probe in its role `s`, which feeds the driver its input.
+pub const TTY_STEPS_TABLE: &[Record] = &[
+    Record {
+        program: "tty-probe",
+        windows: &[],
+        bindings: &[],
+        log: false,
+        args: b"S",
+        restart: Restart::Never,
+        ..super::normal::TABLE[0]
+    },
+    TTY,
+    Record {
+        args: b"s",
+        connects: &["tty", "uart"],
+        ..TTY_TABLE[2]
+    },
+];

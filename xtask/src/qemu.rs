@@ -500,6 +500,18 @@ impl Run {
             .map_err(|e| format!("typing {line:?}: {e}"))
     }
 
+    /// Types `bytes` as they are, with no Enter after them.
+    pub fn type_raw(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or("the run has no pipe on its stdin")?;
+        stdin
+            .write_all(bytes)
+            .and_then(|()| stdin.flush())
+            .map_err(|e| format!("typing {bytes:?}: {e}"))
+    }
+
     /// Stops the run: its child is killed unless it exited, and the reader
     /// ends with the output and is joined; gives the lines.
     pub fn stop(self) -> Outcome {

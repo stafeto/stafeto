@@ -183,6 +183,7 @@ dependencies = [
  "proto-loader",
  "proto-pipe",
  "proto-process",
+ "proto-tty",
  "proto-uart",
  "proto-wire",
  "rt",
@@ -486,6 +487,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "proto-tty"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-wire",
+]
+
+[[package]]
 name = "proto-uart"
 version = "0.1.0"
 dependencies = [
@@ -688,6 +697,30 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "tty"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-tty",
+ "proto-uart",
+ "proto-wire",
+ "rt",
+]
+
+[[package]]
+name = "tty-probe"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "proto-init",
+ "proto-tty",
+ "proto-uart",
+ "proto-wire",
+ "rt",
 ]
 
 [[package]]

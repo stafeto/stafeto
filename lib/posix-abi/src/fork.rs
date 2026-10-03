@@ -162,20 +162,22 @@ struct Work {
 }
 
 /// The values of the sessions a fork gives the child's loader (Handles),
-/// by proto_loader::Slot: Files, Clock, Uart and Pipes; 0 for none.
+/// by proto_loader::Slot: Files, Clock, Driver, Pipes and Terminal; 0 for
+/// none.
 #[derive(Clone, Copy, Default)]
 pub struct Sessions {
     pub files: u64,
     pub clock: u64,
     pub uart: u64,
     pub pipes: u64,
+    pub terminal: u64,
 }
 
 impl Sessions {
     /// The parent's own sessions go: those of a fork that never came to
     /// its loader.
     fn close(self) {
-        for raw in [self.files, self.clock, self.uart, self.pipes] {
+        for raw in [self.files, self.clock, self.uart, self.pipes, self.terminal] {
             if raw != 0 {
                 drop(Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
             }
@@ -225,25 +227,15 @@ pub fn copy(window: Option<fn()>, sessions: Sessions) -> Result<Forked, i32> {
 /// there; they move whatever comes of it.
 fn give(c: &Handle<Channel>, sessions: Sessions) -> Result<(), i32> {
     use proto_loader::Slot;
-    let mut w = Writer::new();
-    Method::Handles.header().write(&mut w).map_err(|_| EIO)?;
-    let mut handles = Outgoing::new();
-    for (slot, raw) in [
-        (Slot::Files, sessions.files),
-        (Slot::Clock, sessions.clock),
-        (Slot::Uart, sessions.uart),
-        (Slot::Pipes, sessions.pipes),
-    ] {
-        if raw != 0 {
-            let session = Handle::<Channel>::from_raw(rt::abi::Handle(raw));
-            w.u32(slot as u32).map_err(|_| EIO)?;
-            handles.push(session.erase()).map_err(|_| EIO)?;
-        }
-    }
-    if handles.is_empty() {
-        return Ok(());
-    }
-    match ask_loader(c, &w, Some(handles)) {
+    let session = |raw: u64| (raw != 0).then(|| Handle::<Channel>::from_raw(rt::abi::Handle(raw)));
+    let given = [
+        (Slot::Files, session(sessions.files)),
+        (Slot::Clock, session(sessions.clock)),
+        (Slot::Driver, session(sessions.uart)),
+        (Slot::Pipes, session(sessions.pipes)),
+        (Slot::Terminal, session(sessions.terminal)),
+    ];
+    match crate::process::give_sessions(c, given) {
         0 => Ok(()),
         _ => Err(EIO),
     }
@@ -596,6 +588,10 @@ fn sessions() -> Result<Sessions, i32> {
             let clone = pipes_clone(pipes, &ends[..count])?;
             out.pipes = clone.into_raw().0;
         }
+        if let Some(terminal) = crate::shared::with_files(|fs| Ok(fs.terminal().map(Handle::raw)))?
+        {
+            out.terminal = crate::terminal::clone(terminal)?.into_raw().0;
+        }
         Ok(())
     })();
     match made {
@@ -682,7 +678,12 @@ fn child() -> Result<(), &'static str> {
         posix_sync::after_fork();
         crate::process::after_fork(posix, handle(raw(Slot::PosixId))).map_err(|_| "its record")?;
         if let Some(files) = handle(raw(Slot::Files)) {
-            crate::shared::after_fork(files, handle(raw(Slot::Uart)), handle(raw(Slot::Pipes)));
+            crate::shared::after_fork(
+                files,
+                handle(raw(Slot::Driver)),
+                handle(raw(Slot::Pipes)),
+                handle(raw(Slot::Terminal)),
+            );
         }
         crate::clock::after_fork(handle(raw(Slot::Clock)), crate::allocation::process())
             .map_err(|_| "its clock")?;

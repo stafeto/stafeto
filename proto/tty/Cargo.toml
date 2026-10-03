@@ -1,0 +1,12 @@
+[package]
+name = "proto-tty"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "MIT"
+description = "The protocol of the terminal service"
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-wire = { path = "../wire" }

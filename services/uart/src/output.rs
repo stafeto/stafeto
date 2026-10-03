@@ -9,7 +9,8 @@
 //! bytes and the other has some, a CR LF ends it and the other goes on;
 //! the part of a line of the clients cut short this way, up to REPEAT_MAX
 //! bytes, goes out again once the log has ended its line and has no more.
-//! A CR goes before each LF.
+//! A CR goes before each LF that has none: the output of the terminal
+//! service has its own (ONLCR).
 
 /// The bytes of the ring of the clients.
 pub const TX_RING: usize = 4096;
@@ -53,6 +54,8 @@ pub struct Output {
     cut: bool,
     /// The bytes of `line` that went out again so far, while they go.
     repeat: Option<usize>,
+    /// The last byte of the clients was a CR.
+    cr: bool,
 }
 
 impl Output {
@@ -72,6 +75,7 @@ impl Output {
             long: false,
             cut: false,
             repeat: None,
+            cr: false,
         }
     }
 
@@ -205,13 +209,17 @@ impl Output {
         }
     }
 
-    /// Byte `b` of the clients as it goes out: a CR before an LF, which
-    /// ends the line; any other byte joins the line.
+    /// Byte `b` of the clients as it goes out: a CR before an LF that has
+    /// none, which ends the line; any other byte joins the line.
     fn client_byte(&mut self, b: u8) -> u8 {
+        let cr = core::mem::replace(&mut self.cr, b == b'\r');
         if b == b'\n' {
             self.at = At::Start;
             self.line_len = 0;
             self.long = false;
+            if cr {
+                return b'\n';
+            }
             self.pending = b"\n";
             return b'\r';
         }
@@ -264,6 +272,15 @@ mod tests {
         assert!(o.put_log(b"k1\nk2\n"));
         assert_eq!(drain(&mut o), b"k1\r\nk2\r\n");
         assert!(o.log_done());
+    }
+
+    /// A client that sends CR LF itself (the terminal service, ONLCR)
+    /// gets no second CR; a CR alone stays one.
+    #[test]
+    fn a_cr_lf_of_a_client_stays_whole() {
+        let mut o = Output::new();
+        assert!(o.put(b"one\r\ntwo\r\r\nx\ry\n"));
+        assert_eq!(drain(&mut o), b"one\r\ntwo\r\r\nx\ry\r\n");
     }
 
     #[test]

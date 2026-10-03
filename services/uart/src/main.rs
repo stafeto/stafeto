@@ -24,7 +24,9 @@ use core::fmt::{self, Write};
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 use proto_init::ServiceArgs;
-use proto_uart::{Method, ReadKey, ReadReply, ReadRequest, VERSION, WriteReply, WriteRequest};
+use proto_uart::{
+    Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply, WriteRequest,
+};
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
@@ -36,7 +38,7 @@ use uart::regs::{
     ALL, CR, CR_ON, DR, FR, FR_BUSY, FR_RXFE, FR_TXFF, ICR, IFLS, IFLS_HALF, IMSC, LCR_H,
     LCR_H_FEN, LCR_H_WLEN_8, MIS,
 };
-use uart::writes::{self, Writes};
+use uart::writes::{self, Armed, Rooms, Writes};
 
 rt::entry!(main);
 
@@ -73,11 +75,12 @@ const NOT_MAPPED: u64 = 4;
 const STOPPED: u64 = 5;
 
 /// What the driver keeps in its data segment (spec 13.5): the rings of
-/// output and input, the writes that wait, a batch of the kernel log and
-/// the bytes of a reply to READ.
+/// output and input, the writes that wait, the clients of ROOM, a batch of
+/// the kernel log and the bytes of a reply to READ.
 struct State {
     output: Output,
     writes: Writes<Pending>,
+    rooms: Rooms<Handle<Channel>>,
     input: Input<Pending, Handle<Channel>>,
     records: [[u8; LOG_RECORD]; LOG_BATCH],
     read: [u8; RX_RING],
@@ -103,6 +106,7 @@ fn state() -> Option<&'static mut State> {
     Some(place.write(State {
         output: Output::new(),
         writes: Writes::new(),
+        rooms: Rooms::new(),
         input: Input::new(),
         records: [[0; LOG_RECORD]; LOG_BATCH],
         read: [0; RX_RING],
@@ -287,10 +291,20 @@ impl Uart {
     }
 
     /// The writes that wait go into the ring in their order while they
-    /// fit; each that went gets its reply.
+    /// fit; each that went gets its reply; the clients of ROOM hear of room
+    /// once there is.
     fn flush(&mut self) {
-        let State { output, writes, .. } = &mut *self.state;
+        let State {
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
         writes.flush(output, answer_write);
+        rooms.to_tell(writes.roomy(output), |notify| {
+            // A client that went closed it: nothing to tell then.
+            let _ = sys::notify(notify, 1);
+        });
     }
 
     /// An interrupt of the line (spec 9, 13.5): the kernel masked it at
@@ -401,6 +415,57 @@ impl Uart {
         Answer::Deferred
     }
 
+    /// WRITE_SOME (5f): the part of the bytes that fits goes into the ring,
+    /// and the reply goes at once with its count.
+    fn write_some(&mut self, r: &mut Request<'_>) -> Answer {
+        let bytes = match WriteRequest::read(r.body()) {
+            Ok(request) => request.bytes,
+            Err(status) => return Answer::Status(status),
+        };
+        let State { output, writes, .. } = &mut *self.state;
+        let n = writes.write_some(output, bytes);
+        let reply = WriteReply { written: n as u32 }.write(r.reply());
+        self.kick();
+        match reply {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// ROOM (5f): the room of the ring, and the notification armed below
+    /// ROOM_MARK, through the handle the client's first ROOM brought.
+    fn room(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() > 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let notify = if r.handles.is_empty() {
+            None
+        } else {
+            match r.handles.take::<Channel>(0) {
+                Ok(handle) => Some(handle),
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            }
+        };
+        let label = r.label();
+        let State {
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
+        let roomy = writes.roomy(output);
+        let armed = match rooms.room(label, notify, roomy) {
+            Armed::Now => false,
+            Armed::Armed => true,
+            Armed::Refused => return Answer::Status(Status::Kernel(Error::LimitReached)),
+        };
+        let room = output.room() as u32;
+        match (RoomReply { room, armed }).write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
     /// READ (spec 13.5, 13.8): the first client that reads owns the
     /// console; the bytes that came go at once, or the reply waits for
     /// input (Input::read); another client, or a second read that would
@@ -509,6 +574,8 @@ const METHODS: &[u16] = &[
     Method::ReadTake.number(),
     Method::ReadCancel.number(),
     Method::Clone.number(),
+    Method::WriteSome.number(),
+    Method::Room.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -519,6 +586,8 @@ const METHODS: &[u16] = &[
     Method::ReadTake.number(),
     Method::ReadCancel.number(),
     Method::Clone.number(),
+    Method::WriteSome.number(),
+    Method::Room.number(),
 ];
 
 impl Service<HELD> for Uart {
@@ -534,18 +603,27 @@ impl Service<HELD> for Uart {
             Some(Method::ReadTake) => self.read_take(r, false),
             Some(Method::ReadCancel) => self.read_take(r, true),
             Some(Method::Clone) => self.clone_session(r),
+            Some(Method::WriteSome) => self.write_some(r),
+            Some(Method::Room) => self.room(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => crash(r),
             _ => Answer::Status(Status::UnknownMethod),
         }
     }
 
-    /// The client went: its writes that wait leave, and when it owned the
-    /// console, the console is free and its read that waits goes.
+    /// The client went: its writes that wait leave, its handle of ROOM
+    /// goes, and when it owned the console, the console is free and its
+    /// read that waits goes.
     fn gone(&mut self, s: &mut Session<(), HELD>) {
         let label = s.label();
-        let State { writes, input, .. } = &mut *self.state;
+        let State {
+            writes,
+            input,
+            rooms,
+            ..
+        } = &mut *self.state;
         writes.gone(label, drop);
+        rooms.gone(label);
         drop(input.gone(label));
     }
 

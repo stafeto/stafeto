@@ -157,6 +157,9 @@ pub struct PosixFs {
     files: Files,
     /// The session with the pipe service, when the process has one.
     pipes: Option<Handle<Channel>>,
+    /// The session with the terminal service, when the process has one:
+    /// the console's input, output and error go there (5f).
+    terminal: Option<Handle<Channel>>,
     paths: PathState,
     descriptors: Table<Target, OPEN_MAX>,
 }
@@ -165,7 +168,7 @@ pub struct PosixFs {
 /// stays alive while a transport is used: what a request needs outside
 /// the owner's lock.
 #[derive(Clone, Copy)]
-pub struct Transport(View, Option<rt::abi::Handle>);
+pub struct Transport(View, Option<rt::abi::Handle>, Option<rt::abi::Handle>);
 
 /// A path the owner resolved against its current directory, for a
 /// request outside its lock.
@@ -242,6 +245,11 @@ impl Transport {
         self.1
             .map(Handle::borrowed)
             .ok_or(FsError::BadFileDescriptor)
+    }
+
+    /// The session with the terminal service, when the process has one.
+    pub fn terminal(&self) -> Option<ManuallyDrop<Handle<Channel>>> {
+        self.2.map(Handle::borrowed)
     }
 
     /// Close of the service's description `fd` that the table handed back.
@@ -495,6 +503,13 @@ impl PosixFs {
         self.pipes = pipes;
     }
 
+    /// The session with the terminal service the program was given (from
+    /// init, or its loader's start, the slot Terminal): the console's
+    /// targets go to it.
+    pub fn set_terminal(&mut self, terminal: Option<Handle<Channel>>) {
+        self.terminal = terminal;
+    }
+
     /// The files through sessions the program was given (its loader's
     /// start, spec 2, 3.2), with `cwd` its current directory and the
     /// descriptors of `inherited` (the console's 0, 1 and 2 when None).
@@ -514,6 +529,7 @@ impl PosixFs {
                 let mut fs = Self {
                     files: Files::from_sessions(files, uart),
                     pipes: None,
+                    terminal: None,
                     paths: PathState::new(),
                     descriptors: Table::default(),
                 };
@@ -541,7 +557,8 @@ impl PosixFs {
     }
 
     /// The files of a forked child (spec 2, 3.2), whose table is a copy of
-    /// its parent's: its own sessions `files` and `uart`, clones of its
+    /// its parent's: its own sessions `files`, `uart`, `pipes` and
+    /// `terminal`, clones of its
     /// parent's that share the descriptions of the descriptors without
     /// FD_CLOFORK, in place of the parent's, which name nothing of the
     /// child's and go without a close; the descriptors with FD_CLOFORK go
@@ -552,10 +569,12 @@ impl PosixFs {
         files: Handle<Channel>,
         uart: Option<Handle<Channel>>,
         pipes: Option<Handle<Channel>>,
+        terminal: Option<Handle<Channel>>,
     ) {
         let parent = core::mem::replace(&mut self.files, Files::from_sessions(files, uart));
         core::mem::forget(parent);
         core::mem::forget(core::mem::replace(&mut self.pipes, pipes));
+        core::mem::forget(core::mem::replace(&mut self.terminal, terminal));
         while self.descriptors.abandon_hold().is_some() {}
         let mut closing = [false; OPEN_MAX];
         for (fd, _, flags) in self.descriptors.open() {
@@ -613,6 +632,11 @@ impl PosixFs {
         self.pipes.as_ref()
     }
 
+    /// The session with the terminal service, when the process has one.
+    pub fn terminal(&self) -> Option<&Handle<Channel>> {
+        self.terminal.as_ref()
+    }
+
     fn from_files(files: Files) -> Result<Self, FsError> {
         let mut descriptors = Table::default();
         for target in [Target::Input, Target::Output, Target::Error] {
@@ -621,6 +645,7 @@ impl PosixFs {
         Ok(Self {
             files,
             pipes: None,
+            terminal: None,
             paths: PathState::new(),
             descriptors,
         })
@@ -628,7 +653,11 @@ impl PosixFs {
 
     /// The transports, for a request outside the owner's lock.
     pub fn transport(&self) -> Transport {
-        Transport(self.files.view(), self.pipes.as_ref().map(Handle::raw))
+        Transport(
+            self.files.view(),
+            self.pipes.as_ref().map(Handle::raw),
+            self.terminal.as_ref().map(Handle::raw),
+        )
     }
 
     pub fn cwd(&self) -> &[u8] {

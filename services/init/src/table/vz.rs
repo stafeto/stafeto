@@ -144,6 +144,7 @@ pub const BUSYBOX_DIALOG_TABLE: &[Record] = &[
     super::ramfs::BUSYBOX_DIALOG_TABLE[3],
     super::ramfs::BUSYBOX_DIALOG_TABLE[4],
     super::ramfs::BUSYBOX_DIALOG_TABLE[5],
+    super::ramfs::TTY,
 ];
 
 /// The probes of console input and interruption, as
@@ -189,3 +190,7 @@ pub const RTBENCH_POSIX_TABLE: &[Record] = &[
     super::ramfs::LOAD,
     super::ramfs::RTBENCH,
 ];
+
+/// The probe of the terminal service over the Virtio console's driver, as
+/// `ramfs::TTY_TABLE` on QEMU.
+pub const TTY_TABLE: &[Record] = &[CONSOLE, super::ramfs::TTY, super::ramfs::TTY_TABLE[2]];

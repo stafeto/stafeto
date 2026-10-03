@@ -12,8 +12,10 @@ crate-type = ["rlib", "staticlib"]
 test = false
 bench = false
 
-# Standard input and output through the console's driver, the service
-# `uart` (rt::fs::Files::connect_with_uart), besides the RAM files.
+# Standard input and output through the terminal service `tty` when
+# init's table gives the program a session with it (5f), through the
+# console's driver, the service `uart`, otherwise
+# (rt::fs::Files::connect_with_uart); the RAM files beside them.
 [features]
 uart-input = []
 

@@ -50,6 +50,9 @@ const PIPE_STACK_SIZE: u32 = 32 * 1024;
 /// (apps/shell), which init's loader maps.
 const UART_STACK_SIZE: u32 = 16 * 1024;
 const SHELL_STACK_SIZE: u32 = 16 * 1024;
+/// The terminal service's stack: its state lies in its `.bss`, and a
+/// request copies up to 1 KiB.
+const TTY_STACK_SIZE: u32 = 32 * 1024;
 /// A program of a boot image: its file's name in the image, the package
 /// that builds it for EL0, the size of its stack and the features of the
 /// package it builds with.
@@ -449,7 +452,7 @@ const ASH_PROGRAMS: [ImageProgram; 5] = [
 /// The dialog: BusyBox's launcher mode starts `/bin/ash` from its file
 /// through the process service and the loader, the way every child starts
 /// (5d); the files of /bin are BusyBox's applets build.
-const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 8] = [
+const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 9] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox-dialog"]),
     ("uart", "uart", UART_STACK_SIZE, &[]),
     ("ramfs", "ramfs", RAMFS_STACK_SIZE, &[]),
@@ -468,6 +471,30 @@ const ASH_INTERACTIVE_PROGRAMS: [ImageProgram; 8] = [
         POSIX_STACK_SIZE,
         &["ash-interactive"],
     ),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+];
+/// The probe of the terminal service (xtask tty): the PL011's driver, the
+/// service, which prints each new longest step, and the probe.
+const TTY_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-tty"]),
+    ("uart", "uart", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+];
+/// The measure of the service's steps (xtask tty, under -icount): the
+/// service prints each new longest step, the probe drives it, and its
+/// program is the quiet driver too.
+const TTY_STEPS_PROGRAMS: [ImageProgram; 3] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-tty-steps"]),
+    ("tty", "tty", TTY_STACK_SIZE, &["steps"]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
+];
+/// The same over the Virtio console's driver on Apple VZ (xtask tty-vz).
+const TTY_VZ_PROGRAMS: [ImageProgram; 4] = [
+    ("init", "init", INIT_STACK_SIZE, &["table-tty-vz"]),
+    ("virtio-console", "virtio-console", UART_STACK_SIZE, &[]),
+    ("tty", "tty", TTY_STACK_SIZE, &[]),
+    ("tty-probe", "tty-probe", SVC_STACK_SIZE, &[]),
 ];
 const LS_PROGRAMS: [ImageProgram; 5] = [
     ("init", "init", INIT_STACK_SIZE, &["table-busybox"]),
@@ -912,6 +939,10 @@ commands:
             the table goes to target/measure/os-test.txt; fails when a
             test of tests/os-test/pass.txt does not pass; with
             --one NAME, one test in a boot of its own, with its log
+  tty       check the terminal service in QEMU under -icount: line editing,
+            echo, INTR, raw reads with VMIN 1, output that waits for the
+            driver, and each step of the service under term B
+  tty-vz    the same checks over the Virtio console on Apple VZ
   help      this text";
 
 fn main() {
@@ -1003,6 +1034,8 @@ fn main() {
         Some("ash-shell") => ash_shell(),
         Some("ash-dialog") => ash_dialog(),
         Some("ls") => ls_probe(),
+        Some("tty") => tty_probe(false),
+        Some("tty-vz") => tty_probe(true),
         Some("help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -2489,6 +2522,12 @@ fn ash_dialog() -> Result<(), String> {
             DIALOG_STEP,
         )?;
         run.expect("# ", DIALOG_STEP)?;
+        // The terminal service edits the line before ash reads it (5f):
+        // DEL erases the "x" and its echo, and ash gets "echo abc".
+        run.send("echo abx\x7fc")?;
+        run.expect("echo abx\x08 \x08c", DIALOG_STEP)?;
+        run.expect_line("abc", |line| line == "abc", DIALOG_STEP)?;
+        run.expect("# ", DIALOG_STEP)?;
         run.send("ls -1 /")?;
         run.expect("ls -1 /", DIALOG_STEP)?;
         run.expect("# ", DIALOG_STEP)?;
@@ -2701,6 +2740,158 @@ fn ash_dialog() -> Result<(), String> {
     Ok(())
 }
 
+/// The kinds of the lines of the terminal service (tag 5), by the
+/// numbers of proto_tty::Method.
+const TTY_STEP_KINDS: [(usize, &str); 12] = [
+    (1, "ReadStart"),
+    (2, "ReadTake"),
+    (3, "ReadCancel"),
+    (4, "WriteStart"),
+    (5, "WriteTake"),
+    (6, "WriteCancel"),
+    (7, "Clone"),
+    (8, "GetAttr"),
+    (9, "SetAttr"),
+    (10, "Abandon"),
+    (64, "heartbeat: a send to init and its reply"),
+    (
+        65,
+        "own step: input, room, the next step, the timer of VTIME",
+    ),
+];
+
+/// The probe of the terminal service (tests/tty) on QEMU, or over the
+/// Virtio console on Apple VZ (`vz`): xtask types INTR after "lost", then
+/// "ab", DEL, "c" and Enter, and the probe's canonical read gives "ac\n"
+/// while the console shows the echo of the erase; with VMIN 1 each byte
+/// typed comes alone; 200 lines of output come whole and in order. On QEMU
+/// the measure of the steps follows (`tty_steps`).
+const ENDED_TTY: &str = "init: tty-probe ended: exit code 0, not restarted";
+
+fn tty_probe(vz: bool) -> Result<(), String> {
+    let image = if vz {
+        build_boot_image("boot-tty-vz.img", &TTY_VZ_PROGRAMS, BOOT_PROFILE)?
+    } else {
+        build_boot_image("boot-tty.img", &TTY_PROGRAMS, BOOT_PROFILE)?
+    };
+    let (cmd, _) = probe_command(&image, vz)?;
+    let mut run = qemu::Run::start(cmd, qemu::Input::Pipe)?;
+    let result = (|| {
+        run.expect("tty-probe: canonical read waits", BOOT_TIMEOUT)?;
+        // INTR drops what was typed before it and asks for SIGINT.
+        run.type_raw(b"lost\x03")?;
+        run.expect("^C", DIALOG_STEP)?;
+        run.expect("tty: SIGINT for the foreground process group", DIALOG_STEP)?;
+        run.send("ab\x7fc")?;
+        // The echo: the erase of the "b" and Enter as CR LF.
+        run.expect("ab\x08 \x08c\r\n", DIALOG_STEP)?;
+        run.expect("tty-probe: read ac and a newline", DIALOG_STEP)?;
+        for (i, b) in ["x", "y", "z"].iter().enumerate() {
+            run.expect(&format!("tty-probe: raw read {i} waits"), DIALOG_STEP)?;
+            run.type_raw(b.as_bytes())?;
+            run.expect(&format!("tty-probe: raw read {i} gave {b}"), DIALOG_STEP)?;
+        }
+        run.expect("tty-probe: raw reads gave each byte", DIALOG_STEP)?;
+        run.expect("tty-probe: wrote", DIALOG_STEP)?;
+        run.expect("tty-probe: ok", DIALOG_STEP)?;
+        run.expect(ENDED_TTY, DIALOG_STEP)
+    })();
+    let output = run.stop();
+    if vz {
+        vz::stop_hint(result)?;
+    } else {
+        result?;
+    }
+    // The lines of the output come whole, each once, in their order. A
+    // line of the kernel's log may cut one short: the driver shows the
+    // part that went out again after it (uart::output), so a part of a
+    // line comes before the line whole.
+    let text = " abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    let want: Vec<String> = (0..200)
+        .map(|n| format!("tty-probe line {n:03}{text}"))
+        .collect();
+    let mut next = 0;
+    for line in output
+        .lines
+        .iter()
+        .filter(|l| l.starts_with("tty-probe line "))
+    {
+        let Some(wanted) = want.get(next) else {
+            return Err(format!("a line past the probe's {}: {line:?}", want.len()));
+        };
+        if line == wanted {
+            next += 1;
+        } else if !wanted.starts_with(line.as_str()) {
+            return Err(format!("line {next} of the probe came as {line:?}"));
+        }
+    }
+    if next != want.len() {
+        return Err(format!("{next} lines of the probe's {} came", want.len()));
+    }
+    println!(
+        "terminal service guest probe passed on {}",
+        if vz { "the Virtio console" } else { "the UART" }
+    );
+    if vz { Ok(()) } else { tty_steps() }
+}
+
+/// The measure of the terminal service's steps under -icount, against a
+/// quiet driver (tests/tty, roles `S` and `s`): every step stays under
+/// term B (a chunk of input through the discipline with the longest echo,
+/// a message of output to the driver, WAITERS notifications), and every
+/// byte of echo and output reached the driver.
+fn tty_steps() -> Result<(), String> {
+    let image = build_boot_image("boot-tty-steps.img", &TTY_STEPS_PROGRAMS, BOOT_PROFILE)?;
+    let (mut cmd, kernel) = probe_command(&image, false)?;
+    cmd.args(qemu::ICOUNT);
+    let output = run_until(
+        cmd,
+        BOOT_TIMEOUT,
+        Some("init: tty-probe ended"),
+        &kernel.elf,
+    )?;
+    let dir = target_dir().join("measure");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let log = dir.join("tty-steps.log");
+    std::fs::write(&log, output.lines.join("\n") + "\n")
+        .map_err(|e| format!("{}: {e}", log.display()))?;
+    qemu::expect_stopped_on(&output, ENDED_TTY)?;
+    qemu::expect_marker(&output, "tty-probe: ok")?;
+    let steps = longest_steps(&output.lines, "5");
+    let mut table = String::from("kind method ticks detail\n");
+    for (kind, ticks, detail) in &steps {
+        let name = TTY_STEP_KINDS
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map_or("other", |(_, n)| n);
+        table += &format!("tty {kind} {name} {ticks} {detail}\n");
+    }
+    let path = dir.join("tty-steps.txt");
+    std::fs::write(&path, &table).map_err(|e| format!("{}: {e}", path.display()))?;
+    print!("terminal service steps under icount:\n{table}");
+    // Each method and the service's own notifications made a step, each
+    // under term B; the heartbeat, which waits for init, has its own bound.
+    for kind in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 65] {
+        let ticks = steps.iter().find(|(k, ..)| *k == kind).map_or(0, |r| r.1);
+        if ticks == 0 || ticks > RAM_STEP_MAX {
+            return Err(format!(
+                "the terminal service: kind {kind} took {ticks} ticks, past {RAM_STEP_MAX} or none: {steps:?}"
+            ));
+        }
+    }
+    if let Some(row) = steps.iter().find(|r| r.0 != 64 && r.1 > RAM_STEP_MAX) {
+        return Err(format!("the terminal service: a step past term B: {row:?}"));
+    }
+    let heartbeat = steps.iter().find(|(k, ..)| *k == 64).map_or(0, |r| r.1);
+    if heartbeat > HEARTBEAT_STEP_MAX {
+        return Err(format!(
+            "the terminal service: a heartbeat took {heartbeat} ticks, past {HEARTBEAT_STEP_MAX}"
+        ));
+    }
+    println!("terminal service steps passed: {}", log.display());
+    Ok(())
+}
+
 fn ash_shell() -> Result<(), String> {
     relibc()?;
     busybox_build()?;
@@ -2869,6 +3060,7 @@ fn boot_jobs(os_test: Vec<jobs::Job>) -> Vec<jobs::Job> {
         job("kernel tests 2G icount", || {
             kernel_tests(&qemu::VIRT_2G, Variant::TestIcount).map(drop)
         }),
+        job("tty", || tty_probe(false)),
     ];
     // os-test (a boot a suite) within its time budget; its passing tests
     // (tests/os-test/pass.txt) still pass (`ostest::finish`). Its boots
@@ -2946,6 +3138,10 @@ fn host_tests() -> Result<(), String> {
         "virtio-console",
         "--package",
         "xtask",
+        "--package",
+        "proto-tty",
+        "--package",
+        "tty",
     ]))
 }
 
@@ -4525,6 +4721,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "proto-loader",
         "--package",
         "xtask",
+        "--package",
+        "proto-tty",
         "--all-targets",
         "--",
         "-D",
@@ -4548,6 +4746,8 @@ fn ci(jobs: usize) -> Result<(), String> {
         "virtio-console",
         "--package",
         "posix-process-service",
+        "--package",
+        "tty",
         "--lib",
         "--tests",
         "--",
@@ -4659,6 +4859,10 @@ fn ci(jobs: usize) -> Result<(), String> {
         "rtbench-posix",
         "--package",
         "rtbench-load",
+        "--package",
+        "tty",
+        "--package",
+        "tty-probe",
         "--target",
         PROGRAM_TARGET,
         "--",

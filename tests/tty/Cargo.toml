@@ -1,0 +1,21 @@
+[package]
+name = "tty-probe"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0-or-later"
+description = "The guest probe of the terminal service: line editing, echo, raw reads and output that waits"
+
+[[bin]]
+name = "tty-probe"
+test = false
+bench = false
+
+[dependencies]
+abi = { path = "../../lib/abi" }
+proto-init = { path = "../../proto/init" }
+proto-tty = { path = "../../proto/tty" }
+proto-uart = { path = "../../proto/uart" }
+proto-wire = { path = "../../proto/wire" }
+rt = { path = "../../lib/rt" }

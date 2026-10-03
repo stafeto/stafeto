@@ -36,14 +36,16 @@ use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use proto_init::ServiceArgs;
-use proto_uart::{Method, ReadKey, ReadReply, ReadRequest, VERSION, WriteReply, WriteRequest};
+use proto_uart::{
+    Method, ReadKey, ReadReply, ReadRequest, RoomReply, VERSION, WriteReply, WriteRequest,
+};
 use proto_wire::{Status, Writer, long};
 use rt::handle::{Channel, Interrupt, Memory, Outgoing, Resource, Timer};
 use rt::service::{Answer, Config, Heartbeat, Notice, Pending, Request, Service, Session};
 use rt::{Handle, mmio, sys, time};
 use uart::input::{self, Input, RX_RING};
 use uart::output::Output;
-use uart::writes::{self, Writes};
+use uart::writes::{self, Armed, Rooms, Writes};
 use virtio_console::dma::{Bounce, DMA_PAGES, PAGE, Queues};
 use virtio_console::pci;
 use virtio_drivers::transport::pci::PciTransport;
@@ -246,11 +248,13 @@ unsafe impl Hal for Host {
 }
 
 /// What the driver keeps in its data segment: the rings of output and
-/// input, the writes that wait, a batch of the kernel log and the bytes of
-/// a reply to READ, as the PL011's driver keeps them (spec 13.5).
+/// input, the writes that wait, the clients of ROOM, a batch of the kernel
+/// log and the bytes of a reply to READ, as the PL011's driver keeps them
+/// (spec 13.5).
 struct State {
     output: Output,
     writes: Writes<Pending>,
+    rooms: Rooms<Handle<Channel>>,
     input: Input<Pending, Handle<Channel>>,
     records: [[u8; LOG_RECORD]; LOG_BATCH],
     read: [u8; RX_RING],
@@ -274,6 +278,7 @@ fn state() -> Option<&'static mut State> {
     Some(place.write(State {
         output: Output::new(),
         writes: Writes::new(),
+        rooms: Rooms::new(),
         input: Input::new(),
         records: [[0; LOG_RECORD]; LOG_BATCH],
         read: [0; RX_RING],
@@ -491,7 +496,12 @@ impl Driver {
     /// waits for the host: the interrupt that shows the buffer used starts
     /// the next transmission (`interrupt`).
     fn kick(&mut self) {
-        let State { output, writes, .. } = &mut *self.state;
+        let State {
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
         writes.flush(output, answer_write);
         self.port.send(|buf| {
             let mut n = 0;
@@ -503,6 +513,10 @@ impl Driver {
             n
         });
         writes.flush(output, answer_write);
+        rooms.to_tell(writes.roomy(output), |notify| {
+            // A client that went closed it: nothing to tell then.
+            let _ = sys::notify(notify, 1);
+        });
     }
 
     /// Takes the input the device holds into the ring while it has room,
@@ -606,6 +620,55 @@ impl Driver {
         Answer::Deferred
     }
 
+    /// WRITE_SOME (5f), as the PL011's driver answers it.
+    fn write_some(&mut self, r: &mut Request<'_>) -> Answer {
+        let bytes = match WriteRequest::read(r.body()) {
+            Ok(request) => request.bytes,
+            Err(status) => return Answer::Status(status),
+        };
+        let State { output, writes, .. } = &mut *self.state;
+        let n = writes.write_some(output, bytes);
+        let reply = WriteReply { written: n as u32 }.write(r.reply());
+        self.kick();
+        match reply {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
+    /// ROOM (5f), as the PL011's driver answers it.
+    fn room(&mut self, r: &mut Request<'_>) -> Answer {
+        if r.body().finish().is_err() || r.handles.len() > 1 {
+            return Answer::Status(Status::BadSize);
+        }
+        let notify = if r.handles.is_empty() {
+            None
+        } else {
+            match r.handles.take::<Channel>(0) {
+                Ok(handle) => Some(handle),
+                Err(error) => return Answer::Status(Status::Kernel(error)),
+            }
+        };
+        let label = r.label();
+        let State {
+            output,
+            writes,
+            rooms,
+            ..
+        } = &mut *self.state;
+        let roomy = writes.roomy(output);
+        let armed = match rooms.room(label, notify, roomy) {
+            Armed::Now => false,
+            Armed::Armed => true,
+            Armed::Refused => return Answer::Status(Status::Kernel(Error::LimitReached)),
+        };
+        let room = output.room() as u32;
+        match (RoomReply { room, armed }).write(r.reply()) {
+            Ok(()) => Answer::Reply(Outgoing::new()),
+            Err(status) => Answer::Status(status),
+        }
+    }
+
     /// READ (spec 13.5, 13.8), as the PL011's driver answers it; input the
     /// device kept while the ring was full comes in once bytes went.
     fn read(&mut self, r: &mut Request<'_>) -> Answer {
@@ -700,6 +763,8 @@ const METHODS: &[u16] = &[
     Method::ReadStart.number(),
     Method::ReadTake.number(),
     Method::ReadCancel.number(),
+    Method::WriteSome.number(),
+    Method::Room.number(),
     Method::Crash.number(),
 ];
 #[cfg(not(feature = "crash"))]
@@ -709,6 +774,8 @@ const METHODS: &[u16] = &[
     Method::ReadStart.number(),
     Method::ReadTake.number(),
     Method::ReadCancel.number(),
+    Method::WriteSome.number(),
+    Method::Room.number(),
 ];
 
 #[cfg(feature = "crash")]
@@ -744,6 +811,8 @@ impl Service<HELD> for Driver {
             Some(Method::ReadStart) => self.read_start(r),
             Some(Method::ReadTake) => self.read_take(r, false),
             Some(Method::ReadCancel) => self.read_take(r, true),
+            Some(Method::WriteSome) => self.write_some(r),
+            Some(Method::Room) => self.room(r),
             #[cfg(feature = "crash")]
             Some(Method::Crash) => {
                 self.drain();
@@ -755,8 +824,14 @@ impl Service<HELD> for Driver {
 
     fn gone(&mut self, s: &mut Session<(), HELD>) {
         let label = s.label();
-        let State { writes, input, .. } = &mut *self.state;
+        let State {
+            writes,
+            input,
+            rooms,
+            ..
+        } = &mut *self.state;
         writes.gone(label, drop);
+        rooms.gone(label);
         drop(input.gone(label));
     }
 

@@ -45,6 +45,10 @@ table-busybox = []
 table-busybox-dialog = []
 table-posix-dialog = []
 table-posix-dialog-vz = []
+# The probe of the terminal service (xtask tty, tty-vz).
+table-tty = []
+table-tty-vz = []
+table-tty-steps = []
 
 [dependencies]
 abi = { path = "../../lib/abi" }
